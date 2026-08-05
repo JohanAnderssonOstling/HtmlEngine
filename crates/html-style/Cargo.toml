@@ -1,0 +1,16 @@
+[package]
+name = "html-style"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+html-dom = { path = "../html-dom" }
+html-style-model = { path = "../html-style-model" }
+lightningcss.workspace = true
+parcel_selectors.workspace = true
+rustc_data_structures = "0.1.2"
+
+[dev-dependencies]
+html-parse = { path = "../html-parse" }
+html-wpt-test-support = { path = "../../test-support/html-wpt" }

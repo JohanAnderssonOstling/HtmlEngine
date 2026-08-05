@@ -1,0 +1,23 @@
+[package]
+name = "html-engine"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "html"
+
+[features]
+testing = ["dep:html-wpt-test-support"]
+
+[dependencies]
+html-dom = { path = "../html-dom" }
+html-layout = { path = "../html-layout" }
+html-parse = { path = "../html-parse" }
+html-pipeline = { path = "../html-pipeline" }
+html-render-core = { path = "../html-render-core" }
+html-resources = { path = "../html-resources" }
+html-source = { path = "../html-source" }
+html-style = { path = "../html-style" }
+html-style-model = { path = "../html-style-model" }
+html-wpt-test-support = { path = "../../test-support/html-wpt", optional = true }

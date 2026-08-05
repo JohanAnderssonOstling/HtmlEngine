@@ -1,0 +1,13 @@
+[package]
+name = "html-resources"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+html-dom = { path = "../html-dom" }
+html-source = { path = "../html-source" }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+peniko.workspace = true
+quick-xml = "0.38"
+sha2 = "0.10"

@@ -1,0 +1,10 @@
+[package]
+name = "html-style-model"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+html-dom = { path = "../html-dom" }
+kurbo.workspace = true
+rustc_data_structures = "0.1.2"

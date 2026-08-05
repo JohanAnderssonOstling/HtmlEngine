@@ -1,0 +1,27 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/html",
+    "crates/html-dom",
+    "crates/html-layout",
+    "crates/html-parse",
+    "crates/html-pipeline",
+    "crates/html-render-core",
+    "crates/html-resources",
+    "crates/html-source",
+    "crates/html-style",
+    "crates/html-style-model",
+    "test-support/html-wpt",
+]
+
+[workspace.dependencies]
+kurbo = "0.11.3"
+peniko = "0.2.0"
+lightningcss = { version = "1.0.0-alpha.72", features = ["substitute_variables"] }
+taffy = { version = "0.10.1", default-features = false, features = ["std", "taffy_tree", "flexbox", "grid"] }
+parcel_selectors = "0.28.2"
+scraper = "0.27"
+html5ever = "0.39"
+quick-xml = { version = "0.41", features = ["escape-html"] }
+encoding_rs = "0.8"
+ego-tree = "0.11"

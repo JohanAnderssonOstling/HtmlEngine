@@ -1,0 +1,13 @@
+[package]
+name = "html-pipeline"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+html-dom = { path = "../html-dom" }
+html-style = { path = "../html-style" }
+html-parse = { path = "../html-parse" }
+html-layout = { path = "../html-layout" }
+html-resources = { path = "../html-resources" }
+encoding_rs.workspace = true

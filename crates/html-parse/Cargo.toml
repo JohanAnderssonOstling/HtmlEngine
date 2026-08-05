@@ -1,0 +1,16 @@
+[package]
+name = "html-parse"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+html-dom = { path = "../html-dom" }
+scraper.workspace = true
+html5ever.workspace = true
+quick-xml.workspace = true
+ego-tree.workspace = true
+encoding_rs.workspace = true
+
+[dev-dependencies]
+html-wpt-test-support = { path = "../../test-support/html-wpt" }

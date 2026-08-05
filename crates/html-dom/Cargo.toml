@@ -1,0 +1,9 @@
+[package]
+name = "html-dom"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+kurbo.workspace = true
+rustc_data_structures = "0.1.2"
