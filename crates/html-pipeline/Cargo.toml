@@ -6,9 +6,9 @@ publish = false
 
 [dependencies]
 html-dom = { path = "../html-dom" }
-html-style = { path = "../html-style" }
-html-parse = { path = "../html-parse" }
-html-layout = { path = "../html-layout" }
+html-style = { path = "../03-html-style" }
+html-parse = { path = "../02-html-parse" }
+html-layout = { path = "../04-html-layout" }
 html-resources = { path = "../html-resources" }
 encoding_rs.workspace = true
 

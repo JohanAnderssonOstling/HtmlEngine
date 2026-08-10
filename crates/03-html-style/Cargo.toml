@@ -12,5 +12,5 @@ parcel_selectors.workspace = true
 rustc_data_structures = "0.1.2"
 
 [dev-dependencies]
-html-parse = { path = "../html-parse" }
+html-parse = { path = "../02-html-parse" }
 html-wpt-test-support = { path = "../../test-support/html-wpt" }

@@ -15,8 +15,8 @@ unicode_categories = "0.1"
 unicode-segmentation = "1.13"
 
 [dev-dependencies]
-html-parse = { path = "../html-parse" }
-html-style = { path = "../html-style" }
+html-parse = { path = "../02-html-parse" }
+html-style = { path = "../03-html-style" }
 lightningcss.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

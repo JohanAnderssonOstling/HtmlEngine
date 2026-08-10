@@ -1,15 +1,15 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/01-html-source",
+    "crates/02-html-parse",
+    "crates/03-html-style",
+    "crates/04-html-layout",
+    "crates/05-html-render-core",
     "crates/html",
     "crates/html-dom",
-    "crates/html-layout",
-    "crates/html-parse",
     "crates/html-pipeline",
-    "crates/html-render-core",
     "crates/html-resources",
-    "crates/html-source",
-    "crates/html-style",
     "crates/html-style-model",
     "test-support/html-wpt",
 ]

@@ -17,6 +17,14 @@
       <sourceFolder url="file://$MODULE_DIR$/crates/html-style/tests" isTestSource="true" />
       <sourceFolder url="file://$MODULE_DIR$/crates/html/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/test-support/html-wpt/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/01-html-source/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/02-html-parse/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/02-html-parse/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/03-html-style/examples" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/03-html-style/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/03-html-style/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/04-html-layout/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/05-html-render-core/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>
     <orderEntry type="inheritedJdk" />

@@ -19,7 +19,7 @@ mod semantics;
 
 pub use lifecycle::{ImageSizingPolicy, LaidOutDocument, LayoutConstraintError, LayoutConstraints, NoteFlow, PrepareError, PreparedDocument, ShapedDocument, TextCompositionPolicy};
 pub(crate) use lifecycle::{PreparedInputs, ShapedText};
-pub(crate) use semantics::element_is_note_target;
+pub(crate) use html_dom::element_is_note_target;
 use semantics::{LinkGlyphTarget, box_id, collect_anchor_glyphs, collect_link_glyph_targets};
 
 #[derive(Clone, Debug, Eq, PartialEq)]

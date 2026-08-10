@@ -5,9 +5,8 @@ edition = "2024"
 publish = false
 
 [dependencies]
-html-layout = { path = "../html-layout" }
+html-layout = { path = "../04-html-layout" }
 html-pipeline = { path = "../html-pipeline" }
 html-resources = { path = "../html-resources" }
 kurbo.workspace = true
 peniko.workspace = true
-

@@ -6,7 +6,7 @@ publish = false
 
 [dependencies]
 html-dom = { path = "../html-dom" }
-html-source = { path = "../html-source" }
+html-source = { path = "../01-html-source" }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 peniko.workspace = true
 quick-xml = "0.38"

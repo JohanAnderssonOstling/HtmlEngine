@@ -7,7 +7,7 @@
 pub mod document {
     pub use html_dom::*;
     pub use html_parse::{
-        HtmlFragmentContext, HtmlParserOptions, HtmlQuirksMode, HtmlScriptingMode, HtmlSyntaxAttribute, HtmlSyntaxElement, HtmlSyntaxNode, HtmlSyntaxTree, MarkupSyntax, ParsedHtml, ParsedHtmlFragment, StylesheetReference, XmlParseError,
+        DocumentTextIndex, HtmlFragmentContext, HtmlParserOptions, HtmlQuirksMode, HtmlScriptingMode, HtmlSyntaxAttribute, HtmlSyntaxElement, HtmlSyntaxNode, HtmlSyntaxTree, MarkupSyntax, ParsedHtml, ParsedHtmlFragment, SourceTextPosition, StylesheetReference, XmlParseError,
         build_dom_document, decode_html_bytes, parse_document, parse_dom_document, parse_html_document, parse_html_document_bytes, parse_html_document_with_options, parse_html_fragment, parse_xml_document, plain_text_from_fragment,
     };
 }

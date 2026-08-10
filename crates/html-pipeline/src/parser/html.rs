@@ -488,7 +488,7 @@ mod tests {
     }
 
     #[test]
-    fn handles_self_closing_anchor_without_leaking_link_scope() {
+    fn follows_html_anchor_scope_for_ignored_self_closing_flags() {
         let html = "<html><body><p><a id=\"p77\"/>After</p></body></html>";
         let mut factory = DocumentFactory::new();
         let document = factory.parse_to_dom(html);
@@ -497,9 +497,10 @@ mod tests {
         let p = child_element_by_tag(&document, body, "p");
         let children: Vec<_> = p.children().collect();
 
-        assert_eq!(children.len(), 2, "self-closed anchor should not wrap following text");
-        assert_eq!(document.element_ref(children[0]).expect("first child should be anchor").tag(), "a");
-        assert!(matches!(document.node_ref(children[1]), Some(NodeRef::Text(text)) if text.text() == "After"));
+        assert_eq!(children.len(), 1);
+        let anchor = document.element_ref(children[0]).expect("paragraph child should be an anchor");
+        assert_eq!(anchor.tag(), "a");
+        assert!(matches!(anchor.children().next().and_then(|node| document.node_ref(node)), Some(NodeRef::Text(text)) if text.text() == "After"));
     }
 
     #[test]

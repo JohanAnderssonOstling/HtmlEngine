@@ -1,6 +1,7 @@
 //! DOM-to-layout semantic indexing for links, notes, and anchors.
 
 use super::*;
+use html_dom::element_is_note_reference;
 
 #[derive(Clone, Copy)]
 pub(super) struct LinkGlyphTarget {
@@ -38,21 +39,6 @@ fn block_ancestor(layout_tree: &LayoutTree, box_idx: usize) -> Option<usize> {
         current = parent(layout_tree, idx);
     }
     None
-}
-
-const EPUB_NAMESPACE: &str = "http://www.idpf.org/2007/ops";
-
-fn element_has_token(element: html_dom::ElementRef<'_>, attribute: &str, namespace: Option<&str>, local_name: &str, expected: &str) -> bool {
-    element.attr(attribute).or_else(|| element.attr_expanded(namespace, local_name)).is_some_and(|value| value.split_ascii_whitespace().any(|token| token.eq_ignore_ascii_case(expected)))
-}
-
-fn element_is_note_reference(element: html_dom::ElementRef<'_>) -> bool {
-    element_has_token(element, "epub:type", Some(EPUB_NAMESPACE), "type", "noteref") || element_has_token(element, "role", None, "role", "doc-noteref")
-}
-
-pub(crate) fn element_is_note_target(element: html_dom::ElementRef<'_>) -> bool {
-    ["footnote", "endnote", "rearnote"].iter().any(|kind| element_has_token(element, "epub:type", Some(EPUB_NAMESPACE), "type", kind))
-        || ["doc-footnote", "doc-endnote"].iter().any(|role| element_has_token(element, "role", None, "role", role))
 }
 
 pub(super) fn collect_link_glyph_targets(document: &Document, layout_tree: &LayoutTree, inline_content: &InlineContent) -> Vec<(u32, LinkGlyphTarget)> {
