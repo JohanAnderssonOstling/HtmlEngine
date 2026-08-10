@@ -92,11 +92,11 @@ impl DecorationEmitter<'_, '_, '_> {
             if let Some((border_width, border_color)) = uniform_border.filter(|_| !radii.is_zero()) {
                 self.push_decoration(rect, border_color, true, Some(RoundedDecoration { radii, border_width: Some(border_width as f32) }));
             } else {
-                emit_border_fragments(self.fragments.decorations_mut(), rect, top_border, right_border, bottom_border, left_border, true);
+                emit_border_fragments(self.fragments.decoration_store_mut(), rect, top_border, right_border, bottom_border, left_border, true);
             }
         }
         if is_inline_box && outline.style != BorderStyle::None && outline.width() > 0.0 {
-            emit_outline_fragments(self.fragments.decorations_mut(), rect, outline.width() as f64, outline_color, outline.style, true);
+            emit_outline_fragments(self.fragments.decoration_store_mut(), rect, outline.width() as f64, outline_color, outline.style, true);
         }
         if !text_decoration.lines.is_empty() && text_decoration_color & 0xFF != 0 {
             let thickness = text_decoration.thickness.resolve(font_size) as f64;
@@ -105,7 +105,7 @@ impl DecorationEmitter<'_, '_, '_> {
                 let font_metrics = self.reader.font_metrics(box_idx);
                 let ascent = font_metrics.ascent_ratio().map_or(line.baseline, |ratio| f64::from(font_size * ratio));
                 let x_height = f64::from(font_size * font_metrics.x_height_ratio());
-                let fragments = self.fragments.decorations_mut();
+                let fragments = self.fragments.decoration_store_mut();
                 if text_decoration.lines.underline() {
                     let y = baseline + thickness * 0.5;
                     emit_horizontal_pattern(fragments, Rect::new(start_x, y, end_x, y + thickness), text_decoration_color, text_decoration.style, true, false, false);

@@ -1,4 +1,4 @@
-use crate::layout_model::{DecorationFragment, LayoutState, RoundedDecoration};
+use crate::layout_model::{DecorationFragment, DecorationStore, LayoutState, RoundedDecoration};
 use kurbo::Rect;
 use std::ops::Range;
 
@@ -165,8 +165,8 @@ impl<'out> FragmentWriter<'out> {
         self.state.fragment_output.decorations.len()
     }
 
-    pub(crate) fn decorations_mut(&mut self) -> &mut Vec<DecorationFragment> {
-        self.state.fragment_output.decorations.fragments_mut()
+    pub(crate) fn decoration_store_mut(&mut self) -> &mut DecorationStore {
+        &mut self.state.fragment_output.decorations
     }
 
     pub(crate) fn push_decoration(&mut self, decoration: DecorationFragment) {

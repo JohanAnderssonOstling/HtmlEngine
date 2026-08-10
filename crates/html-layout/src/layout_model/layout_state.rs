@@ -282,7 +282,7 @@ impl DecorationStore {
         &self.fragments
     }
 
-    pub(crate) fn fragments_mut(&mut self) -> &mut Vec<DecorationFragment> {
+    pub(crate) fn fragments_mut(&mut self) -> &mut [DecorationFragment] {
         &mut self.fragments
     }
 

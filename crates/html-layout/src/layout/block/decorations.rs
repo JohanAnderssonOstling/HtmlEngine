@@ -62,16 +62,16 @@ impl DecorationEmitter<'_, '_, '_> {
             let rect = self.block_border_box_rect(box_idx);
             let radii = style.border_radii().resolve(rect.width(), rect.height());
             if let Some((width, color, border_style)) = uniform_3d {
-                emit_uniform_3d_border(self.fragments.decorations_mut(), rect, width, color, border_style, false);
+                emit_uniform_3d_border(self.fragments.decoration_store_mut(), rect, width, color, border_style, false);
             } else if let Some((width, color)) = uniform_border.filter(|_| !radii.is_zero()) {
                 self.push_decoration(rect, color, false, Some(RoundedDecoration { radii, border_width: Some(width as f32) }));
             } else {
-                emit_border_fragments(self.fragments.decorations_mut(), rect, top_border, right_border, bottom_border, left_border, false);
+                emit_border_fragments(self.fragments.decoration_store_mut(), rect, top_border, right_border, bottom_border, left_border, false);
             }
         }
         if outline.style != BorderStyle::None && outline.width() > 0.0 {
             let rect = self.block_border_box_rect(box_idx);
-            emit_outline_fragments(self.fragments.decorations_mut(), rect, outline.width() as f64, outline_color, outline.style, false);
+            emit_outline_fragments(self.fragments.decoration_store_mut(), rect, outline.width() as f64, outline_color, outline.style, false);
         }
         self.record_block_decoration_owners(box_idx, start);
     }

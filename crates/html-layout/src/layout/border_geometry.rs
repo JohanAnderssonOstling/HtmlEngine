@@ -1,4 +1,4 @@
-use crate::layout_model::{DecorationFragment, DecorationPattern};
+use crate::layout_model::{DecorationFragment, DecorationPattern, DecorationStore};
 use html_style_model::{BorderStyle, TextDecorationStyle, UsedStyleView};
 use kurbo::Rect;
 
@@ -32,7 +32,7 @@ pub(crate) fn physical_borders(style: &UsedStyleView<'_>) -> PhysicalBorders {
     }
 }
 
-fn emit_border_rect_layer(fragments: &mut Vec<DecorationFragment>, rect: Rect, border_width: f64, color: u32, is_inline: bool, foreground: bool) {
+fn emit_border_rect_layer(fragments: &mut DecorationStore, rect: Rect, border_width: f64, color: u32, is_inline: bool, foreground: bool) {
     let bw = border_width.min(rect.width().min(rect.height()));
     let x0 = rect.x0;
     let x1 = rect.x1;
@@ -47,7 +47,7 @@ fn emit_border_rect_layer(fragments: &mut Vec<DecorationFragment>, rect: Rect, b
     }
 }
 
-pub(super) fn emit_horizontal_pattern(fragments: &mut Vec<DecorationFragment>, rect: Rect, color: u32, style: TextDecorationStyle, is_inline: bool, foreground: bool, is_border: bool) {
+pub(super) fn emit_horizontal_pattern(fragments: &mut DecorationStore, rect: Rect, color: u32, style: TextDecorationStyle, is_inline: bool, foreground: bool, is_border: bool) {
     if rect.width() <= 0.0 || rect.height() <= 0.0 {
         return;
     }
@@ -61,7 +61,7 @@ pub(super) fn emit_horizontal_pattern(fragments: &mut Vec<DecorationFragment>, r
     fragments.push(if is_border { DecorationFragment::border_patterned(rect, color, is_inline, foreground, pattern) } else { DecorationFragment::patterned(rect, color, is_inline, foreground, pattern) });
 }
 
-fn emit_vertical_pattern(fragments: &mut Vec<DecorationFragment>, rect: Rect, color: u32, style: BorderStyle, is_inline: bool, foreground: bool) {
+fn emit_vertical_pattern(fragments: &mut DecorationStore, rect: Rect, color: u32, style: BorderStyle, is_inline: bool, foreground: bool) {
     if rect.width() <= 0.0 || rect.height() <= 0.0 {
         return;
     }
@@ -81,7 +81,7 @@ pub(crate) fn border_pattern(style: BorderStyle, horizontal: bool) -> Option<Dec
     }
 }
 
-pub(super) fn emit_outline_fragments(fragments: &mut Vec<DecorationFragment>, rect: Rect, width: f64, color: u32, style: BorderStyle, is_inline: bool) {
+pub(super) fn emit_outline_fragments(fragments: &mut DecorationStore, rect: Rect, width: f64, color: u32, style: BorderStyle, is_inline: bool) {
     if width <= 0.0 || style == BorderStyle::None || color & 0xFF == 0 {
         return;
     }
@@ -100,7 +100,7 @@ pub(super) fn emit_outline_fragments(fragments: &mut Vec<DecorationFragment>, re
     }
 }
 
-pub(crate) fn emit_uniform_3d_border(fragments: &mut Vec<DecorationFragment>, rect: Rect, width: f64, color: u32, style: BorderStyle, is_inline: bool) {
+pub(crate) fn emit_uniform_3d_border(fragments: &mut DecorationStore, rect: Rect, width: f64, color: u32, style: BorderStyle, is_inline: bool) {
     let half = (width * 0.5).max(0.5);
     let (r, g, b, a) = (((color >> 24) & 0xff) as u8, ((color >> 16) & 0xff) as u8, ((color >> 8) & 0xff) as u8, (color & 0xff) as u8);
     let light_channel = |channel: u8| channel.saturating_add((255 - channel) / 2);
@@ -123,7 +123,7 @@ pub(super) fn uniform_solid_border(style: &UsedStyleView<'_>) -> Option<(f64, u3
     .then_some((width as f64, color))
 }
 
-pub(super) fn emit_border_fragments(fragments: &mut Vec<DecorationFragment>, rect: Rect, top: Option<(f64, u32)>, right: Option<(f64, u32)>, bottom: Option<(f64, u32)>, left: Option<(f64, u32)>, is_inline: bool) {
+pub(super) fn emit_border_fragments(fragments: &mut DecorationStore, rect: Rect, top: Option<(f64, u32)>, right: Option<(f64, u32)>, bottom: Option<(f64, u32)>, left: Option<(f64, u32)>, is_inline: bool) {
     if let Some((w, c)) = top {
         let h = w.min(rect.height());
         if h > 0.0 {
