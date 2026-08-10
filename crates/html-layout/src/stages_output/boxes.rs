@@ -40,6 +40,7 @@ pub struct RenderTable {
     box_idx: usize,
     rows: Vec<RenderTableRow>,
     column_count: usize,
+    authored_html: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,6 +66,14 @@ impl RenderTable {
 
     pub fn rows(&self) -> &[RenderTableRow] {
         &self.rows
+    }
+
+    /// Sanitized authored markup for rich table export. This preserves
+    /// classes, inline styles, and structural attributes while dropping event
+    /// handlers; consumers that want portable structure without styling can
+    /// generate it from `rows()` instead.
+    pub fn authored_html(&self) -> &str {
+        &self.authored_html
     }
 
     pub fn column_count(&self) -> usize {
@@ -199,6 +208,52 @@ impl<'a> RenderBoxView<'a> {
             }
         }
 
+        fn escape_html(value: &str, attribute: bool) -> String {
+            let mut escaped = String::with_capacity(value.len());
+            for character in value.chars() {
+                match character {
+                    '&' => escaped.push_str("&amp;"),
+                    '<' => escaped.push_str("&lt;"),
+                    '>' => escaped.push_str("&gt;"),
+                    '"' if attribute => escaped.push_str("&quot;"),
+                    _ => escaped.push(character),
+                }
+            }
+            escaped
+        }
+
+        fn serialize_authored_html(document: &Document, node: html_dom::DomNodeId, output: &mut String) {
+            match document.node_ref(node) {
+                Some(NodeRef::Text(text)) => output.push_str(&escape_html(text.text(), false)),
+                Some(NodeRef::Element(element)) => {
+                    let tag = element.tag();
+                    output.push('<');
+                    output.push_str(tag);
+                    for attribute in element.attributes() {
+                        let name = attribute.name();
+                        // Event handlers are dropped: exported markup is data,
+                        // not behaviour.
+                        if name.get(..2).is_some_and(|prefix| prefix.eq_ignore_ascii_case("on")) {
+                            continue;
+                        }
+                        output.push(' ');
+                        output.push_str(name);
+                        output.push_str("=\"");
+                        output.push_str(&escape_html(attribute.value(), true));
+                        output.push('"');
+                    }
+                    output.push('>');
+                    for child in element.children() {
+                        serialize_authored_html(document, child, output);
+                    }
+                    output.push_str("</");
+                    output.push_str(tag);
+                    output.push('>');
+                }
+                None => {}
+            }
+        }
+
         fn collect_text(document: &Document, node: html_dom::DomNodeId, text: &mut String) {
             match document.node_ref(node) {
                 Some(NodeRef::Text(value)) => {
@@ -271,7 +326,9 @@ impl<'a> RenderBoxView<'a> {
             column_count = column_count.max(occupied_until.len()).max(column);
             rows.push(RenderTableRow { cells });
         }
-        (!rows.is_empty() && column_count > 0).then_some(RenderTable { box_idx, rows, column_count })
+        let mut authored_html = String::new();
+        serialize_authored_html(document, table_element.node_id(), &mut authored_html);
+        (!rows.is_empty() && column_count > 0).then_some(RenderTable { box_idx, rows, column_count, authored_html })
     }
 
     pub fn is_table_row(self, box_idx: usize) -> bool {
