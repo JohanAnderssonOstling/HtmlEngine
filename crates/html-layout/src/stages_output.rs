@@ -1543,17 +1543,7 @@ impl<'a> RenderBoxView<'a> {
     }
 
     fn used_style(self, box_idx: usize) -> Option<html_style_model::UsedStyleView<'a>> {
-        let indices = self.doc.box_style_indices(box_idx)?;
-        let metrics = self.doc.shaped.font_metrics.for_box(box_idx);
-        self.doc.inputs.styles.used_view_with_root(
-            indices,
-            metrics.x_height_ratio(),
-            metrics.ch_advance_ratio(),
-            metrics.cap_height_ratio(),
-            self.doc.shaped.font_metrics.root_ch_px(),
-            self.doc.shaped.font_metrics.root_cap_height_px(),
-            self.doc.shaped.font_metrics.root_line_height_px(),
-        )
+        self.doc.box_used_style(box_idx)
     }
 }
 

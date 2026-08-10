@@ -34,17 +34,11 @@ impl<'input> LayoutReader<'input> {
 
     pub(crate) fn style(&self, box_idx: usize) -> UsedStyleView<'input> {
         let indices = self.topology.get_box_style_indices(box_idx).unwrap_or_else(|| self.styles.default_indices());
-        let metrics = self.font_metrics.for_box(box_idx);
-        self.styles
-            .used_view_with_root(indices, metrics.x_height_ratio(), metrics.ch_advance_ratio(), metrics.cap_height_ratio(), self.font_metrics.root_ch_px(), self.font_metrics.root_cap_height_px(), self.font_metrics.root_line_height_px())
-            .expect("validated style handle")
+        self.font_metrics.used_style(self.styles, indices, box_idx).expect("validated style handle")
     }
 
     pub(crate) fn used_style(&self, indices: StyleIndices) -> UsedStyleView<'input> {
-        let metrics = self.font_metrics.for_non_box_style(indices);
-        self.styles
-            .used_view_with_root(indices, metrics.x_height_ratio(), metrics.ch_advance_ratio(), metrics.cap_height_ratio(), self.font_metrics.root_ch_px(), self.font_metrics.root_cap_height_px(), self.font_metrics.root_line_height_px())
-            .expect("validated style handle")
+        self.font_metrics.used_non_box_style(self.styles, indices).expect("validated style handle")
     }
 
     pub(crate) fn font_metrics(&self, box_idx: usize) -> FontRelativeMetrics {

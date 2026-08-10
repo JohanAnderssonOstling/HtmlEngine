@@ -832,22 +832,13 @@ impl LaidOutDocument {
         self.inputs.layout_tree.box_at(box_idx)?.style()
     }
 
-    pub(crate) fn box_text_format(&self, box_idx: usize) -> BoxTextFormat {
+    pub(crate) fn box_used_style(&self, box_idx: usize) -> Option<html_style_model::UsedStyleView<'_>> {
         let indices = self.box_style_indices(box_idx).unwrap_or_else(|| self.inputs.styles.default_indices());
-        let metrics = self.shaped.font_metrics.for_box(box_idx);
-        let style = self
-            .inputs
-            .styles
-            .used_view_with_root(
-                indices,
-                metrics.x_height_ratio(),
-                metrics.ch_advance_ratio(),
-                metrics.cap_height_ratio(),
-                self.shaped.font_metrics.root_ch_px(),
-                self.shaped.font_metrics.root_cap_height_px(),
-                self.shaped.font_metrics.root_line_height_px(),
-            )
-            .expect("shaping stores valid font metrics for every layout box");
+        self.shaped.font_metrics.used_style(&self.inputs.styles, indices, box_idx)
+    }
+
+    pub(crate) fn box_text_format(&self, box_idx: usize) -> BoxTextFormat {
+        let style = self.box_used_style(box_idx).expect("shaping stores valid font metrics for every layout box");
         BoxTextFormat {
             font_size: style.font_size(),
             font_weight: style.font_weight(),

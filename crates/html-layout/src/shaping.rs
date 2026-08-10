@@ -1,6 +1,6 @@
 use crate::layout_model::{GlyphId, GlyphMetric, GlyphMetricError, GlyphMetrics, InlineContent, InlineItemKind, LayoutMode, LayoutTree, WhitespaceWrapOverride};
 use html_dom::Document;
-use html_style_model::{BorderStyle, ComputedStyles, FontStyle, OpenTypeFeature, StyleIndices, StyleView, TextOverflow, TextTransform, VerticalAlignValue};
+use html_style_model::{BorderStyle, ComputedStyles, FontStyle, OpenTypeFeature, StyleIndices, StyleView, TextOverflow, TextTransform, UsedStyleView, VerticalAlignValue};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use std::fmt;
 use std::ops::Range;
@@ -311,15 +311,31 @@ impl ShapedFontMetrics {
         }
     }
 
-    pub(crate) fn root_ch_px(&self) -> f32 {
-        self.root_ch_px
-    }
-    pub(crate) fn root_cap_height_px(&self) -> f32 {
-        self.root_cap_height_px
+    pub(crate) fn used_style<'styles>(&self, styles: &'styles ComputedStyles, indices: StyleIndices, box_idx: usize) -> Option<UsedStyleView<'styles>> {
+        self.used_style_with_metrics(styles, indices, self.for_box(box_idx))
     }
 
-    pub(crate) fn root_line_height_px(&self) -> f32 {
-        self.root_line_height_px
+    pub(crate) fn used_non_box_style<'styles>(&self, styles: &'styles ComputedStyles, indices: StyleIndices) -> Option<UsedStyleView<'styles>> {
+        self.used_style_with_metrics(styles, indices, self.for_non_box_style(indices))
+    }
+
+    pub(crate) fn resolved_font_size(&self, style: StyleView<'_>, box_idx: usize) -> f32 {
+        let metrics = self.for_box(box_idx);
+        style
+            .resolved_font_size_with_root(metrics.x_height_ratio(), metrics.ch_advance_ratio(), metrics.cap_height_ratio(), self.root_ch_px, self.root_cap_height_px, self.root_line_height_px)
+            .unwrap_or_else(|| style.font_size())
+    }
+
+    fn used_style_with_metrics<'styles>(&self, styles: &'styles ComputedStyles, indices: StyleIndices, metrics: FontRelativeMetrics) -> Option<UsedStyleView<'styles>> {
+        styles.used_view_with_root(
+            indices,
+            metrics.x_height_ratio(),
+            metrics.ch_advance_ratio(),
+            metrics.cap_height_ratio(),
+            self.root_ch_px,
+            self.root_cap_height_px,
+            self.root_line_height_px,
+        )
     }
 
     pub(crate) fn memory_usage_bytes(&self) -> usize {
@@ -905,10 +921,7 @@ pub(crate) fn shape_document(
         let contiguous_range = span.contiguous_range();
         let style_override = span.style_override;
         let style = style_override.and_then(|indices| styles.view(indices)).unwrap_or_else(|| get_style(styles, layout_tree, box_idx));
-        let metrics = font_metrics.for_box(box_idx);
-        let font_size = style
-            .resolved_font_size_with_root(metrics.x_height_ratio(), metrics.ch_advance_ratio(), metrics.cap_height_ratio(), font_metrics.root_ch_px(), font_metrics.root_cap_height_px(), font_metrics.root_line_height_px())
-            .unwrap_or_else(|| style.font_size());
+        let font_size = font_metrics.resolved_font_size(style, box_idx);
         let font_weight = style.font_weight();
         let font_style = style.font_style();
         let color = style.color();
@@ -1000,10 +1013,7 @@ pub(crate) fn shape_document(
     for box_idx in ellipsis_boxes {
         let style = get_style(styles, layout_tree, box_idx);
         let family = box_family[box_idx].as_deref();
-        let metrics = font_metrics.for_box(box_idx);
-        let font_size = style
-            .resolved_font_size_with_root(metrics.x_height_ratio(), metrics.ch_advance_ratio(), metrics.cap_height_ratio(), font_metrics.root_ch_px(), font_metrics.root_cap_height_px(), font_metrics.root_line_height_px())
-            .unwrap_or_else(|| style.font_size());
+        let font_size = font_metrics.resolved_font_size(style, box_idx);
         let glyph = glyph_shaper.shape_glyph(&mut glyph_metrics, '\u{2026}', font_size, style.font_weight(), style.font_style().into(), style.color(), family)?;
         if !glyph_metrics.contains(glyph) {
             return Err(ShapeError::unregistered_glyph_id(glyph, glyph_metrics.len()));
@@ -1016,10 +1026,7 @@ pub(crate) fn shape_document(
     for box_idx in hyphen_boxes {
         let style = get_style(styles, layout_tree, box_idx);
         let family = box_family[box_idx].as_deref();
-        let metrics = font_metrics.for_box(box_idx);
-        let font_size = style
-            .resolved_font_size_with_root(metrics.x_height_ratio(), metrics.ch_advance_ratio(), metrics.cap_height_ratio(), font_metrics.root_ch_px(), font_metrics.root_cap_height_px(), font_metrics.root_line_height_px())
-            .unwrap_or_else(|| style.font_size());
+        let font_size = font_metrics.resolved_font_size(style, box_idx);
         let glyph = glyph_shaper.shape_glyph(&mut glyph_metrics, '\u{2010}', font_size, style.font_weight(), style.font_style().into(), style.color(), family)?;
         if !glyph_metrics.contains(glyph) {
             return Err(ShapeError::unregistered_glyph_id(glyph, glyph_metrics.len()));
@@ -1747,10 +1754,7 @@ fn plan_shaping_spans(styles: &ComputedStyles, layout_tree: &LayoutTree, inline_
 
 fn inline_boundary_breaks_shaping(styles: &ComputedStyles, layout_tree: &LayoutTree, font_metrics: &ShapedFontMetrics, box_idx: usize, inline_start: bool, inline_end: bool) -> bool {
     let indices = layout_tree.get_box_style_indices(box_idx).unwrap_or_else(|| styles.default_indices());
-    let metrics = font_metrics.for_box(box_idx);
-    let style = styles
-        .used_view_with_root(indices, metrics.x_height_ratio(), metrics.ch_advance_ratio(), metrics.cap_height_ratio(), font_metrics.root_ch_px(), font_metrics.root_cap_height_px(), font_metrics.root_line_height_px())
-        .expect("validated inline-boundary style");
+    let style = font_metrics.used_style(styles, indices, box_idx).expect("validated inline-boundary style");
     if vertical_align_breaks_shaping(style.vertical_align()) {
         return true;
     }
@@ -1796,14 +1800,8 @@ fn shaping_styles_are_equivalent(styles: &ComputedStyles, layout_tree: &LayoutTr
         return false;
     }
 
-    let left_metrics = font_metrics.for_box(left_box);
-    let right_metrics = font_metrics.for_box(right_box);
-    let left_size = left
-        .resolved_font_size_with_root(left_metrics.x_height_ratio(), left_metrics.ch_advance_ratio(), left_metrics.cap_height_ratio(), font_metrics.root_ch_px(), font_metrics.root_cap_height_px(), font_metrics.root_line_height_px())
-        .unwrap_or_else(|| left.font_size());
-    let right_size = right
-        .resolved_font_size_with_root(right_metrics.x_height_ratio(), right_metrics.ch_advance_ratio(), right_metrics.cap_height_ratio(), font_metrics.root_ch_px(), font_metrics.root_cap_height_px(), font_metrics.root_line_height_px())
-        .unwrap_or_else(|| right.font_size());
+    let left_size = font_metrics.resolved_font_size(left, left_box);
+    let right_size = font_metrics.resolved_font_size(right, right_box);
 
     left_size.to_bits() == right_size.to_bits()
         && left.font_weight() == right.font_weight()
