@@ -29,6 +29,8 @@ pub(crate) struct LayoutTree {
     pub(super) body_box: Option<u32>,
     /// Generated markers keyed by their list-item box index.
     pub(super) list_markers: FxHashMap<u32, ListItemMarker>,
+    /// Decoded images keyed by their principal layout box index.
+    pub(super) image_indices: FxHashMap<u32, u32>,
     /// Inline-axis endpoints for block-in-inline fragments. Ordinary inline
     /// boxes implicitly own both endpoints.
     pub(super) inline_fragment_edges: FxHashMap<u32, (bool, bool)>,
@@ -45,6 +47,7 @@ impl LayoutTree {
             report.extend_prefixed("LayoutTree.boxes", layout_box.memory_usage_report());
         }
         report.add_slice_storage::<(u32, ListItemMarker)>("LayoutTree.list_markers.storage", self.list_markers.capacity(), self.list_markers.len());
+        report.add_slice_storage::<(u32, u32)>("LayoutTree.image_indices.storage", self.image_indices.capacity(), self.image_indices.len());
         report.add_slice_storage::<(u32, (bool, bool))>("LayoutTree.inline_fragment_edges.storage", self.inline_fragment_edges.capacity(), self.inline_fragment_edges.len());
         report.add_slice_storage::<(u32, Box<[StyleIndices]>)>("LayoutTree.split_inline_position_ancestors.storage", self.split_inline_position_ancestors.capacity(), self.split_inline_position_ancestors.len());
         for ancestors in self.split_inline_position_ancestors.values() {
@@ -89,6 +92,10 @@ impl LayoutTree {
 
     pub(crate) fn get_box_dom_element(&self, box_idx: usize) -> Option<u32> {
         self.boxes.get(box_idx)?.dom_element()
+    }
+
+    pub(crate) fn get_box_image_idx(&self, box_idx: usize) -> Option<u32> {
+        self.image_indices.get(&(box_idx as u32)).copied()
     }
 
     pub(crate) fn get_box_parent(&self, box_idx: usize) -> Option<usize> {
@@ -166,6 +173,10 @@ impl LayoutTree {
 
     pub(crate) fn set_list_marker(&mut self, list_item_box: u32, marker: ListItemMarker) {
         self.list_markers.insert(list_item_box, marker);
+    }
+
+    pub(crate) fn set_box_image_idx(&mut self, box_idx: u32, image_idx: u32) {
+        self.image_indices.insert(box_idx, image_idx);
     }
 
     pub(crate) fn list_marker(&self, list_item_box: usize) -> Option<ListItemMarker> {

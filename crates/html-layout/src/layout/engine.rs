@@ -10,7 +10,6 @@ use super::geometry_writer::GeometryWriter;
 use super::inline_reader::InlineReader;
 use super::measurement::MeasurementScratch;
 use super::read_context::LayoutReader;
-use super::replaced_reader::ReplacedReader;
 use super::{
     absolute_positioning::AbsolutePositioningState,
     block::{FloatState, MarginAnalysis},
@@ -25,13 +24,12 @@ pub(crate) fn layout_with_timings(inputs: LayoutInputs<'_>, outputs: LayoutOutpu
     // was approximating.
     let collected_timings = timings.as_deref().cloned().map(RefCell::new);
     let LayoutOutputs { geometry, state, inline_token_cache, scratch } = outputs;
-    let reader = LayoutReader::new(inputs.styles, inputs.topology, inputs.inline_content, inputs.glyph_metrics, inputs.font_metrics);
+    let reader = LayoutReader::new(inputs.document, inputs.styles, inputs.topology, inputs.inline_content, inputs.glyph_metrics, inputs.font_metrics, inputs.image_metrics);
     let track_overflow_clips = (0..reader.box_count()).any(|idx| {
         let style = reader.style(idx);
         style.overflow_x().clips() || style.overflow_y().clips()
     });
     let text = InlineReader::new(inputs.inline_content, inputs.glyph_metrics, inputs.text_geometry, inputs.ellipsis_glyphs, inputs.hyphen_glyphs);
-    let replaced = ReplacedReader::new(inputs.document, inputs.image_metrics);
     let mut context = LayoutEngine {
         config: LayoutConfig::new(constraints),
         floats: std::mem::take(&mut scratch.floats),
@@ -43,7 +41,6 @@ pub(crate) fn layout_with_timings(inputs: LayoutInputs<'_>, outputs: LayoutOutpu
         track_overflow_clips,
         reader,
         text,
-        replaced,
         geometry: GeometryWriter::new(geometry),
         fragments: FragmentWriter::new(state, std::mem::take(&mut scratch.line_owners), std::mem::take(&mut scratch.block_decoration_owners)),
         inline_token_cache,
@@ -154,7 +151,6 @@ pub(crate) struct LayoutEngine<'a, 'out> {
     fragmentation_suppression_depth: usize,
     pub(crate) reader: LayoutReader<'a>,
     pub(crate) text: InlineReader<'a>,
-    pub(crate) replaced: ReplacedReader<'a>,
     pub(crate) geometry: GeometryWriter<'out>,
     pub(crate) fragments: FragmentWriter<'out>,
     timings: Option<RefCell<LayoutTimings>>,

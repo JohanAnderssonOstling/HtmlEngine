@@ -21,7 +21,6 @@ mod list_marker;
 mod measurement;
 mod read_context;
 mod replaced;
-mod replaced_reader;
 
 pub(super) use block::{FloatBand, FloatContext, FloatSide};
 pub(crate) use border_geometry::{PhysicalBorderEdge, border_pattern, physical_borders};
@@ -36,7 +35,7 @@ pub(crate) use engine::layout_with_timings;
 pub(crate) use engine::{LayoutInputs, LayoutOutputs, LayoutScratch};
 pub(crate) use fragment_writer::{FragmentWriter, OutputRanges};
 pub(crate) use inline::InlineTokenCache;
-pub(crate) use intrinsic_sizing::{box_content_intrinsic_widths, box_intrinsic_widths};
+pub(crate) use intrinsic_sizing::{box_content_intrinsic_widths, box_intrinsic_widths, percentage_height_image_width};
 pub(crate) use measurement::{measure_box_and_baselines_isolated, measure_box_isolated, measure_box_width_and_baselines_isolated, measure_intrinsic_block_size_isolated, measure_resolved_box_isolated, with_isolated_measurement};
 pub(crate) use read_context::LayoutReader;
 pub(crate) use replaced::{ReplacedFlexAutoMinInput, ReplacedMainAxis, clamp_replaced_definite_size_by_intrinsic_constraints, measure_replaced_content, resolve_replaced_flex_auto_min_main_size, resolve_replaced_intrinsic_constraint};

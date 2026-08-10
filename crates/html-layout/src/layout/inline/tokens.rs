@@ -764,8 +764,8 @@ fn create_image_token(
     let border_top = style.border_top_width() as f64;
     let horizontal_border = border_left + style.border_right_width() as f64;
     let vertical_border = border_top + style.border_bottom_width() as f64;
-    let intrinsic = engine.replaced.intrinsic_size(&engine.reader, box_idx as usize).unwrap_or_else(|| {
-        let (width, height) = engine.replaced.image_display_size(image_idx);
+    let intrinsic = engine.reader.image_intrinsic_size(box_idx as usize).unwrap_or_else(|| {
+        let (width, height) = engine.reader.image_display_size(image_idx);
         Size::new(width, height)
     });
     if self_owned_replaced {
@@ -791,10 +791,9 @@ fn create_image_token(
         );
     }
     let authored_ratio = style.aspect_ratio();
-    let intrinsic_ratio = engine.replaced.intrinsic_ratio(&engine.reader, box_idx as usize, intrinsic);
+    let intrinsic_ratio = engine.reader.image_intrinsic_ratio(box_idx as usize, intrinsic);
     let aspect_ratio = if authored_ratio.uses_intrinsic() { intrinsic_ratio.or_else(|| authored_ratio.preferred().map(f64::from)) } else { authored_ratio.preferred().map(f64::from) };
-    let smart_width = engine.replaced.smart_standalone_image_width(
-        &engine.reader,
+    let smart_width = engine.reader.smart_standalone_image_width(
         engine.config.image_sizing_policy(),
         box_idx as usize,
         intrinsic,
@@ -1136,9 +1135,9 @@ fn create_atomic_box_token(
     // `display` is not `inline-table`; participation in this atomic inline
     // context is represented authoritatively by the layout mode instead.
     let is_inline_table = matches!(engine.reader.box_layout_mode(box_idx as usize), Some(crate::layout_model::LayoutMode::Table(_)));
-    let (border_size, first_baseline, last_baseline) = if let Some(intrinsic) = engine.replaced.intrinsic_size(&engine.reader, box_idx as usize) {
+    let (border_size, first_baseline, last_baseline) = if let Some(intrinsic) = engine.reader.image_intrinsic_size(box_idx as usize) {
         let authored_ratio = style.aspect_ratio();
-        let intrinsic_ratio = (intrinsic.height > 0.0).then_some(intrinsic.width / intrinsic.height);
+        let intrinsic_ratio = engine.reader.image_intrinsic_ratio(box_idx as usize, intrinsic);
         let aspect_ratio = if authored_ratio.uses_intrinsic() { intrinsic_ratio.or_else(|| authored_ratio.preferred().map(f64::from)) } else { authored_ratio.preferred().map(f64::from) };
         let content = resolve_replaced_content_size(ReplacedSizeInput {
             intrinsic,

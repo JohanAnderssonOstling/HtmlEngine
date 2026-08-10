@@ -35,8 +35,11 @@ impl<'styles, 'out> BoxTreeWriter<'styles, 'out> {
         self.tree.box_at(box_idx as usize).and_then(LayoutBox::style).and_then(|style| self.styles.anonymous_box_indices(style))
     }
 
-    pub(super) fn push_dom_box(&mut self, dom_element: u32, parent: Option<u32>, style: Option<StyleIndices>, layout_mode: LayoutMode, is_body: bool) -> u32 {
+    pub(super) fn push_dom_box(&mut self, dom_element: u32, image_idx: Option<u32>, parent: Option<u32>, style: Option<StyleIndices>, layout_mode: LayoutMode, is_body: bool) -> u32 {
         let box_idx = self.tree.push_box(LayoutBox { layout_mode, dom_element: Some(dom_element), parent, style });
+        if let Some(image_idx) = image_idx {
+            self.tree.set_box_image_idx(box_idx, image_idx);
+        }
         if is_body {
             self.tree.set_body_box(box_idx);
         }

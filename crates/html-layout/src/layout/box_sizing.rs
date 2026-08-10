@@ -160,11 +160,11 @@ fn resolve_box_sizing(engine: &LayoutEngine<'_, '_>, request: BoxLayoutRequest) 
     let style = engine.reader.style(box_idx);
     let box_model = resolve_box_model(engine, request, style);
     let is_float = matches!(style.float(), Float::Left | Float::Right);
-    let replaced_intrinsic = engine.replaced.intrinsic_size(&engine.reader, box_idx);
+    let replaced_intrinsic = engine.reader.image_intrinsic_size(box_idx);
     let is_replaced = replaced_intrinsic.is_some();
     let inline_alignment = effective_inline_alignment(engine, box_idx);
     let authored_aspect_ratio = style.aspect_ratio();
-    let intrinsic_aspect_ratio = replaced_intrinsic.and_then(|size| engine.replaced.intrinsic_ratio(&engine.reader, box_idx, size));
+    let intrinsic_aspect_ratio = replaced_intrinsic.and_then(|size| engine.reader.image_intrinsic_ratio(box_idx, size));
     let used_aspect_ratio = if authored_aspect_ratio.uses_intrinsic() { intrinsic_aspect_ratio.or_else(|| authored_aspect_ratio.preferred().map(f64::from)) } else { authored_aspect_ratio.preferred().map(f64::from) };
     let vertical = resolve_vertical_sizing(engine, style, request, box_model);
     let (horizontal, replaced_size) = resolve_horizontal_sizing(engine, style, request, box_model, vertical, replaced_intrinsic, used_aspect_ratio, is_float, inline_alignment);
@@ -361,7 +361,7 @@ fn resolve_intrinsic_widths(
     // definite while the float's shrink-to-fit width is being measured. Its
     // intrinsic aspect ratio therefore contributes the transferred width,
     // rather than the child's unscaled intrinsic width.
-    if shrink_to_fit && let Some(transferred_width) = vertical.authored_explicit.and_then(|height| engine.replaced.percentage_height_width(&engine.reader, request.box_idx, height)) {
+    if shrink_to_fit && let Some(transferred_width) = vertical.authored_explicit.and_then(|height| crate::layout::percentage_height_image_width(engine, request.box_idx, height)) {
         measured = Some((transferred_width, transferred_width));
     }
     ResolvedIntrinsicWidths { measured, shrink_to_fit }
@@ -380,8 +380,7 @@ fn resolve_width_constraints(
     let margin_padding = horizontal_margin + box_model.horizontal_padding();
     let horizontal_padding_border = box_model.horizontal_padding() + box_model.horizontal_border();
     let smart_width = replaced_intrinsic.and_then(|intrinsic| {
-        engine.replaced.smart_standalone_image_width(
-            &engine.reader,
+        engine.reader.smart_standalone_image_width(
             engine.config.image_sizing_policy(),
             request.box_idx,
             intrinsic,

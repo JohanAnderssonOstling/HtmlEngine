@@ -242,7 +242,7 @@ fn outer_preferred_width(session: &LayoutEngine<'_, '_>, box_idx: usize, value: 
 }
 
 fn measure_item(session: &LayoutEngine<'_, '_>, box_idx: usize, known: TaffySize<Option<f32>>, available: TaffySize<AvailableSpace>) -> TaffySize<f32> {
-    if let Some(intrinsic) = session.replaced.intrinsic_size(&session.reader, box_idx) {
+    if let Some(intrinsic) = session.reader.image_intrinsic_size(box_idx) {
         return measure_replaced_content(intrinsic, preferred_aspect_ratio(session, box_idx, intrinsic), known, available);
     }
     let style = session.reader.style(box_idx);
@@ -258,7 +258,7 @@ fn measure_item(session: &LayoutEngine<'_, '_>, box_idx: usize, known: TaffySize
             AvailableSpace::MinContent | AvailableSpace::MaxContent => None,
         })
         .map(|value| finite_f32((f64::from(value) - vertical_inset).max(0.0)));
-    if let Some(width) = available_height.and_then(|height| session.replaced.percentage_height_width(&session.reader, box_idx, f64::from(height))) {
+    if let Some(width) = available_height.and_then(|height| crate::layout::percentage_height_image_width(session, box_idx, f64::from(height))) {
         min_width = width;
         max_width = width;
     }

@@ -12,6 +12,29 @@ pub(crate) fn box_intrinsic_widths(engine: &LayoutEngine<'_, '_>, box_idx: usize
     box_intrinsic_widths_with_available(engine, box_idx, None)
 }
 
+/// Width transferred from direct percentage-height image children when a
+/// container receives a definite block size during shrink-to-fit measurement.
+pub(crate) fn percentage_height_image_width(engine: &LayoutEngine<'_, '_>, box_idx: usize, content_height: f64) -> Option<f64> {
+    let node = engine.reader.box_dom_element(box_idx).and_then(|raw| engine.reader.document().node_id_from_raw(raw))?;
+    let element = engine.reader.document().element_ref(node)?;
+    let mut width: Option<f64> = None;
+    for child_id in element.children() {
+        let child_raw = child_id.raw();
+        let Some(child_box_idx) = (0..engine.reader.box_count()).find(|&candidate| engine.reader.box_dom_element(candidate) == Some(child_raw)) else { continue };
+        let Some(intrinsic) = engine.reader.image_intrinsic_size(child_box_idx) else { continue };
+        let child_style = engine.reader.style(child_box_idx);
+        let PreferredSize::Percent(percent) = child_style.height() else { continue };
+        if intrinsic.height <= 0.0 {
+            continue;
+        }
+        let used_height = content_height * percent.max(0.0) as f64;
+        let content_width = used_height * intrinsic.width / intrinsic.height;
+        let outer_width = content_width + child_style.get_horizontal_margin_padding(0.0) + child_style.border_left_width() as f64 + child_style.border_right_width() as f64;
+        width = Some(width.map_or(outer_width, |current| current.max(outer_width)));
+    }
+    width
+}
+
 fn box_intrinsic_widths_with_available(engine: &LayoutEngine<'_, '_>, box_idx: usize, available_width: Option<f64>) -> (f64, f64) {
     // Intrinsic sizing: percentage padding/margin count as zero.
     let style = engine.reader.style(box_idx);
@@ -65,7 +88,7 @@ pub(crate) fn box_content_intrinsic_widths_with_available(engine: &LayoutEngine<
 }
 
 fn box_content_intrinsic_widths_impl(engine: &LayoutEngine<'_, '_>, box_idx: usize, available_width: Option<f64>) -> (f64, f64) {
-    if let Some(size) = engine.replaced.intrinsic_size(&engine.reader, box_idx) {
+    if let Some(size) = engine.reader.image_intrinsic_size(box_idx) {
         return (size.width, size.width);
     }
     match engine.reader.box_layout_mode(box_idx) {
@@ -266,7 +289,7 @@ fn runs_intrinsic_widths(engine: &LayoutEngine<'_, '_>, run_range: Range<u32>, c
                 }
             }
             InlineItemKind::Image { image_idx } => {
-                let (mut width, _) = engine.replaced.image_display_size(*image_idx);
+                let (mut width, _) = engine.reader.image_display_size(*image_idx);
                 if width <= 1.0 {
                     // A resource without decoded intrinsic metrics can still
                     // have a definite authored inline size (for example an

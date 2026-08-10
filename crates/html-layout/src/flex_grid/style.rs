@@ -159,10 +159,10 @@ pub(super) fn taffy_item_style(
     let style = session.reader.style(box_idx);
     let box_model = ResolvedBoxModel::new(style, containing_width);
     let layout = layout_style(session, box_idx);
-    let replaced_intrinsic = session.replaced.intrinsic_size(&session.reader, box_idx);
+    let replaced_intrinsic = session.reader.image_intrinsic_size(box_idx);
     let both_replaced_axes_auto = replaced_intrinsic.is_some() && matches!(style.width(), PreferredSize::Auto) && matches!(style.height(), PreferredSize::Auto);
     let authored_aspect_ratio = style.aspect_ratio();
-    let intrinsic_aspect_ratio = replaced_intrinsic.and_then(|size| (both_replaced_axes_auto && size.height > 0.0).then_some(finite_f32(size.width / size.height)));
+    let intrinsic_aspect_ratio = if both_replaced_axes_auto { replaced_intrinsic.and_then(|size| session.reader.image_intrinsic_ratio(box_idx, size)).map(finite_f32) } else { None };
     let aspect_ratio = if kind == TaffyContainerKind::Flex && replaced_intrinsic.is_some() && layout.flex_grow > 0.0 {
         // A flexible replaced item may grow its main axis independently
         // of a constrained cross axis. Its measure callback transfers the
@@ -249,7 +249,7 @@ pub(super) fn taffy_item_style(
         && let Some(containing_height) = containing_height
     {
         let item_cross_inset = box_model.vertical_padding_border();
-        if let Some(width) = session.replaced.percentage_height_width(&session.reader, box_idx, (containing_height - item_cross_inset).max(0.0)) {
+        if let Some(width) = crate::layout::percentage_height_image_width(session, box_idx, (containing_height - item_cross_inset).max(0.0)) {
             min_width = Dimension::length(finite_f32(width));
         }
     }
@@ -484,7 +484,7 @@ fn flex_automatic_min_content_width(session: &LayoutEngine<'_, '_>, box_idx: usi
 /// first converts a definite (including stretched) cross size and cross
 /// min/max constraints through the preferred aspect ratio.
 fn flex_replaced_automatic_minimum(session: &LayoutEngine<'_, '_>, box_idx: usize, containing_width: f64, containing_height: Option<f64>, horizontal_main_axis: bool) -> Option<f64> {
-    let intrinsic = session.replaced.intrinsic_size(&session.reader, box_idx)?;
+    let intrinsic = session.reader.image_intrinsic_size(box_idx)?;
     let style = session.reader.style(box_idx);
     let layout = layout_style(session, box_idx);
     let scrollable_main = if horizontal_main_axis { style.overflow_x() } else { style.overflow_y() };

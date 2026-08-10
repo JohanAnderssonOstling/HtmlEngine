@@ -120,6 +120,7 @@ mod tests {
 
         let svg_idx = (0..document.box_count()).find(|&idx| document.get_tag(idx).eq_ignore_ascii_case("svg")).expect("SVG replaced box");
         assert!(matches!(document.box_at(svg_idx).map(|box_| box_.layout_mode()), Some(LayoutMode::Block(block)) if matches!(block.children, Children::InlineItems(_))));
+        assert!(document.layout_tree().get_box_image_idx(svg_idx).is_some(), "image identity must be retained by the layout topology");
         assert!(document.inline_content().inline_items().iter().any(|run| run.box_idx as usize == svg_idx && matches!(run.kind, InlineItemKind::Image { .. })));
         assert!(!(0..document.box_count()).any(|idx| document.get_tag(idx).eq_ignore_ascii_case("rect")), "SVG descendants must not enter the CSS box tree");
     }

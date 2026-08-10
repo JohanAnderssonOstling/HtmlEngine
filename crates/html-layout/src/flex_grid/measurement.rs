@@ -48,7 +48,7 @@ impl FlexGridState {
 
 pub(super) fn measure_item_with_baseline(session: &mut LayoutEngine<'_, '_>, box_idx: usize, known: TaffySize<Option<f32>>, available: TaffySize<AvailableSpace>) -> MeasuredItem {
     let timing_started = Instant::now();
-    if let Some(intrinsic) = session.replaced.intrinsic_size(&session.reader, box_idx) {
+    if let Some(intrinsic) = session.reader.image_intrinsic_size(box_idx) {
         let result = measure_replaced_content(intrinsic, preferred_aspect_ratio(session, box_idx, intrinsic), known, available);
         session.record_timing(|timings| timings.measure_flex_grid_item += timing_started.elapsed());
         return MeasuredItem { size: result, first_baseline: None };
@@ -73,7 +73,7 @@ pub(super) fn measure_item_with_baseline(session: &mut LayoutEngine<'_, '_>, box
             AvailableSpace::MinContent | AvailableSpace::MaxContent => None,
         })
         .map(|value| finite_f32((f64::from(value) - vertical_inset).max(0.0)));
-    if let Some(width) = available_height.and_then(|height| session.replaced.percentage_height_width(&session.reader, box_idx, f64::from(height))) {
+    if let Some(width) = available_height.and_then(|height| crate::layout::percentage_height_image_width(session, box_idx, f64::from(height))) {
         min_width = width;
         max_width = width;
     }
@@ -100,7 +100,7 @@ pub(super) fn measure_item_with_baseline(session: &mut LayoutEngine<'_, '_>, box
 
 pub(super) fn preferred_aspect_ratio(session: &LayoutEngine<'_, '_>, box_idx: usize, intrinsic: Size) -> Option<f64> {
     let authored = session.reader.style(box_idx).aspect_ratio();
-    let intrinsic_ratio = (intrinsic.height > 0.0).then_some(intrinsic.width / intrinsic.height);
+    let intrinsic_ratio = session.reader.image_intrinsic_ratio(box_idx, intrinsic);
     if authored.uses_intrinsic() { intrinsic_ratio.or_else(|| authored.preferred().map(f64::from)) } else { authored.preferred().map(f64::from) }
 }
 

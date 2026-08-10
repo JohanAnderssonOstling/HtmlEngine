@@ -471,7 +471,7 @@ fn first_line_color(engine: &crate::layout::LayoutEngine<'_, '_>, container_box_
     let styles = engine.reader.styles();
     let tree = engine.reader.layout_tree();
     let root = crate::shaping::whitespace_context_root(tree, container_box_idx);
-    crate::shaping::first_line_style_for_inline_root(engine.replaced.document(), styles, tree, engine.text.content(), root).and_then(|style| styles.view(style)).map(|style| style.color())
+    crate::shaping::first_line_style_for_inline_root(engine.reader.document(), styles, tree, engine.text.content(), root).and_then(|style| styles.view(style)).map(|style| style.color())
 }
 
 /// Returns pseudo-element line heights for the element that establishes
@@ -485,8 +485,8 @@ pub(super) fn pseudo_line_heights(engine: &crate::layout::LayoutEngine<'_, '_>, 
     let resolve = |style: html_style_model::StyleView<'_>| {
         if style.line_height_is_normal() { style.font_size() as f64 * 1.2 } else { style.line_height().max(0.0) as f64 }
     };
-    let line = crate::shaping::first_line_style_for_inline_root(engine.replaced.document(), styles, tree, engine.text.content(), root).and_then(|style| styles.view(style)).map(resolve);
-    let letter = crate::shaping::first_letter_style_for_inline_root(engine.replaced.document(), styles, tree, engine.text.content(), root).and_then(|style| styles.view(style)).map(resolve);
+    let line = crate::shaping::first_line_style_for_inline_root(engine.reader.document(), styles, tree, engine.text.content(), root).and_then(|style| styles.view(style)).map(resolve);
+    let letter = crate::shaping::first_letter_style_for_inline_root(engine.reader.document(), styles, tree, engine.text.content(), root).and_then(|style| styles.view(style)).map(resolve);
     (line, letter)
 }
 

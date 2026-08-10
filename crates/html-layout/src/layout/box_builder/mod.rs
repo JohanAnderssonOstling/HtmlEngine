@@ -1058,7 +1058,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
     fn push_layout_box(&mut self, dom_node_id: DomNodeId, parent: Option<u32>, style: Option<StyleIndices>, layout_mode: LayoutMode) -> u32 {
         let element = self.document.element_ref(dom_node_id).expect("layout boxes are only created for element nodes");
         let is_body = element.tag().eq_ignore_ascii_case("body");
-        self.output.push_dom_box(dom_node_id.raw(), parent, style, layout_mode, is_body)
+        self.output.push_dom_box(dom_node_id.raw(), element.image_idx(), parent, style, layout_mode, is_body)
     }
 }
 
