@@ -1,7 +1,7 @@
 use super::style::{grid_definite_inline_minimum_exceeds_track_limit, layout_style, taffy_container_style, taffy_item_style};
 use super::tracks::template_tracks_have_percentage_calc;
 use super::{TaffyContainerKind, ensure_grid_algorithm_root, finite_f32};
-use crate::layout::{LayoutEngine, measure_replaced_content, preferred_aspect_ratio};
+use crate::layout::{LayoutEngine, measure_replaced_content, preferred_aspect_ratio, resolve_definite_content_size};
 use html_style_model::{GridRepeatCount, OverflowMode, PositionMode, UsedGridTemplateTrack, UsedGridTrackBreadth, UsedGridTrackSize, UsedPreferredSize as PreferredSize};
 use taffy::geometry::Size as TaffySize;
 use taffy::prelude::{AvailableSpace, Dimension, TaffyTree};
@@ -224,19 +224,10 @@ fn outer_preferred_width(session: &LayoutEngine<'_, '_>, box_idx: usize, value: 
     let style = session.reader.style(box_idx);
     let margin = style.get_horizontal_margin(0.0);
     let padding_border = style.get_horizontal_padding(0.0) + style.border_left_width() as f64 + style.border_right_width() as f64;
-    let specified = |width: f64| match style.box_sizing() {
-        html_style_model::BoxSizing::ContentBox => width.max(0.0) + margin + padding_border,
-        html_style_model::BoxSizing::BorderBox => width.max(padding_border) + margin,
-    };
     match value {
-        PreferredSize::Auto | PreferredSize::Percent(_) | PreferredSize::Stretch => None,
-        PreferredSize::Px(width) => Some(specified(width as f64)),
-        PreferredSize::Calc { absolute_px, percentage_dependent: false, .. } => Some(specified(absolute_px as f64)),
-        PreferredSize::Calc { percentage_dependent: true, .. } => None,
-        PreferredSize::Comparison { .. } if value.percentage_dependent() => None,
-        PreferredSize::Comparison { .. } => Some(specified(html_style_model::resolve_used_preferred_size(value, 0.0, 0.0))),
         PreferredSize::MinContent => Some(raw_min),
         PreferredSize::MaxContent | PreferredSize::FitContent => Some(raw_max),
+        _ => resolve_definite_content_size(value, None, margin, padding_border, style.box_sizing()).map(|content| content + padding_border + margin),
     }
 }
 

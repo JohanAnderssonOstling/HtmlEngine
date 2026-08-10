@@ -1,7 +1,7 @@
 use super::tracks::{fixed_auto_track_limit, length_percentage_auto, line_names as grid_line_names, placement as grid_placement, template_track as grid_template_track, track_size as grid_track_size, used_length_percentage};
 use super::{TaffyContainerKind, finite_f32};
 use crate::layout::{
-    LayoutEngine, ReplacedFlexAutoMinInput, ReplacedMainAxis, ResolvedBoxModel, clamp_replaced_definite_size_by_intrinsic_constraints, measure_box_isolated, preferred_aspect_ratio, resolve_replaced_flex_auto_min_main_size, resolve_replaced_intrinsic_constraint,
+    LayoutEngine, ReplacedFlexAutoMinInput, ReplacedMainAxis, ResolvedBoxModel, clamp_replaced_definite_size_by_intrinsic_constraints, measure_box_isolated, preferred_aspect_ratio, resolve_definite_content_size, resolve_replaced_flex_auto_min_main_size, resolve_replaced_intrinsic_constraint,
 };
 use html_style_model::{ContentAlignment, GridAutoFlow, ItemAlignment, LayoutStyle, OverflowMode, PositionMode, UsedPreferredSize as PreferredSize};
 use taffy::geometry::{Line, Point as TaffyPoint, Rect, Size as TaffySize};
@@ -455,27 +455,18 @@ fn flex_automatic_min_content_width(session: &LayoutEngine<'_, '_>, box_idx: usi
 
     let content_min = crate::layout::box_content_intrinsic_widths(session, box_idx).0.max(0.0);
     let padding_border = style.get_horizontal_padding(containing_width) + style.border_left_width() as f64 + style.border_right_width() as f64;
-    let as_content_width = |outer_or_content: f64| match style.box_sizing() {
-        html_style_model::BoxSizing::ContentBox => outer_or_content.max(0.0),
-        html_style_model::BoxSizing::BorderBox => (outer_or_content - padding_border).max(0.0),
-    };
+    let horizontal_margin = style.get_horizontal_margin(containing_width);
+    let resolve_definite = |value| resolve_definite_content_size(value, Some(containing_width), horizontal_margin, padding_border, style.box_sizing());
     let preferred = match style.width() {
-        PreferredSize::Px(value) => Some(as_content_width(value as f64)),
-        PreferredSize::Percent(value) => Some(as_content_width(containing_width * value as f64)),
-        PreferredSize::Calc { absolute_px, percentage, .. } => Some(as_content_width(absolute_px as f64 + containing_width * percentage as f64)),
-        PreferredSize::Comparison { .. } => Some(as_content_width(html_style_model::resolve_used_preferred_size(style.width(), 0.0, containing_width))),
         PreferredSize::MinContent => Some(content_min),
         PreferredSize::MaxContent | PreferredSize::FitContent => Some(crate::layout::box_content_intrinsic_widths(session, box_idx).1.max(content_min)),
-        PreferredSize::Stretch => Some((containing_width - style.get_horizontal_margin(containing_width) - padding_border).max(0.0)),
-        PreferredSize::Auto => None,
+        value => resolve_definite(value),
     };
     let mut automatic_min = preferred.map_or(content_min, |preferred| content_min.min(preferred));
-    if let PreferredSize::Px(value) = style.max_width() {
-        automatic_min = automatic_min.min(as_content_width(value as f64));
-    } else if let PreferredSize::Percent(value) = style.max_width() {
-        automatic_min = automatic_min.min(as_content_width(containing_width * value as f64));
-    } else if matches!(style.max_width(), PreferredSize::Stretch) {
-        automatic_min = automatic_min.min((containing_width - style.get_horizontal_margin(containing_width) - padding_border).max(0.0));
+    if matches!(style.max_width(), PreferredSize::Px(_) | PreferredSize::Percent(_) | PreferredSize::Stretch)
+        && let Some(maximum) = resolve_definite(style.max_width())
+    {
+        automatic_min = automatic_min.min(maximum);
     }
     automatic_min.max(0.0)
 }

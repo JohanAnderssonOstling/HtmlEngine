@@ -9,47 +9,48 @@ pub(crate) fn resolve_vertical_size(size: PreferredSize, parent_content_height: 
 }
 
 pub(crate) fn resolve_vertical_size_with_stretch_inset(size: PreferredSize, parent_content_height: Option<f64>, border_box_inset: f64, stretch_inset: f64) -> Option<f64> {
+    resolve_definite_content_size_with_insets(size, parent_content_height, border_box_inset, stretch_inset)
+}
+
+/// Resolve a numeric CSS size whose percentage basis may be indefinite.
+/// Keywords whose meaning belongs to a formatting context remain unresolved.
+pub(crate) fn resolve_definite_size_value(size: PreferredSize, percentage_basis: Option<f64>) -> Option<f64> {
     match size {
-        PreferredSize::Auto | PreferredSize::MinContent | PreferredSize::MaxContent | PreferredSize::FitContent => None,
-        // Unlike a percentage, stretch fits the margin box into the
-        // containing block. The result stored by layout is a content size.
-        PreferredSize::Stretch => parent_content_height.map(|height| (height - stretch_inset).max(0.0)),
-        PreferredSize::Px(px) => Some((px as f64 - border_box_inset).max(0.0)),
-        PreferredSize::Percent(pct) => parent_content_height.map(|height| (height * pct as f64 - border_box_inset).max(0.0)),
+        PreferredSize::Px(value) => Some(value as f64),
+        PreferredSize::Percent(value) => percentage_basis.map(|basis| basis * value as f64),
         PreferredSize::Calc { absolute_px, percentage, percentage_dependent } => {
-            if percentage_dependent {
-                parent_content_height.map(|height| (absolute_px as f64 + height * percentage as f64 - border_box_inset).max(0.0))
-            } else {
-                Some((absolute_px as f64 - border_box_inset).max(0.0))
-            }
+            if percentage_dependent { percentage_basis.map(|basis| absolute_px as f64 + basis * percentage as f64) } else { Some(absolute_px as f64) }
         }
         PreferredSize::Comparison { .. } => {
-            if size.percentage_dependent() {
-                parent_content_height.map(|height| (resolve_used_preferred_size(size, 0.0, height) - border_box_inset).max(0.0))
-            } else {
-                Some((resolve_used_preferred_size(size, 0.0, 0.0) - border_box_inset).max(0.0))
-            }
+            if size.percentage_dependent() { percentage_basis.map(|basis| resolve_used_preferred_size(size, 0.0, basis)) } else { Some(resolve_used_preferred_size(size, 0.0, 0.0)) }
         }
+        PreferredSize::Auto | PreferredSize::MinContent | PreferredSize::MaxContent | PreferredSize::FitContent | PreferredSize::Stretch => None,
     }
+}
+
+/// Resolve a content-box size from a CSS size and explicit box-model insets.
+/// `stretch` fits the margin box, so its inset may differ from the inset used
+/// to convert a border-box authored size.
+pub(crate) fn resolve_definite_content_size_with_insets(size: PreferredSize, percentage_basis: Option<f64>, border_box_inset: f64, stretch_inset: f64) -> Option<f64> {
+    if matches!(size, PreferredSize::Stretch) {
+        return percentage_basis.map(|basis| (basis - stretch_inset).max(0.0));
+    }
+    resolve_definite_size_value(size, percentage_basis).map(|value| (value - border_box_inset).max(0.0))
+}
+
+/// Resolve a content-box size when the caller has margins, padding, borders,
+/// and `box-sizing` rather than precomputed conversion insets.
+pub(crate) fn resolve_definite_content_size(size: PreferredSize, percentage_basis: Option<f64>, margin: f64, padding_border: f64, box_sizing: BoxSizing) -> Option<f64> {
+    let border_box_inset = if matches!(box_sizing, BoxSizing::BorderBox) { padding_border } else { 0.0 };
+    resolve_definite_content_size_with_insets(size, percentage_basis, border_box_inset, margin + padding_border)
 }
 
 /// Resolve an inline size that is independent of its containing block and
 /// convert it to an outer size. Formatting contexts can share this conversion
 /// while retaining ownership of their own auto/percentage sizing algorithms.
 pub(crate) fn resolve_definite_outer_inline_size(size: PreferredSize, box_sizing: BoxSizing, padding_border: f64, margin: f64) -> Option<f64> {
-    if size.percentage_dependent() {
-        return None;
-    }
-    let specified = match size {
-        PreferredSize::Px(px) => px as f64,
-        PreferredSize::Calc { .. } | PreferredSize::Comparison { .. } => resolve_used_preferred_size(size, 0.0, 0.0),
-        PreferredSize::Auto | PreferredSize::Percent(_) | PreferredSize::MinContent | PreferredSize::MaxContent | PreferredSize::FitContent | PreferredSize::Stretch => return None,
-    };
-    let border_box = match box_sizing {
-        BoxSizing::ContentBox => specified.max(0.0) + padding_border,
-        BoxSizing::BorderBox => specified.max(padding_border),
-    };
-    Some(border_box + margin)
+    let content = resolve_definite_content_size(size, None, margin, padding_border, box_sizing)?;
+    Some(content + padding_border + margin)
 }
 
 /// Resolve a block-axis minimum. Unlike `height` and `max-height`, an
@@ -233,7 +234,7 @@ impl BoxLayoutRequest {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_definite_outer_inline_size;
+    use super::{resolve_definite_content_size, resolve_definite_outer_inline_size, resolve_definite_size_value};
     use html_style_model::{BoxSizing, UsedPreferredSize as PreferredSize};
 
     #[test]
@@ -250,5 +251,14 @@ mod tests {
             Some(15.0)
         );
         assert_eq!(resolve_definite_outer_inline_size(PreferredSize::Percent(0.5), BoxSizing::ContentBox, 6.0, 4.0), None);
+    }
+
+    #[test]
+    fn definite_size_resolution_keeps_context_keywords_outside_the_shared_core() {
+        assert_eq!(resolve_definite_size_value(PreferredSize::Percent(0.5), Some(200.0)), Some(100.0));
+        assert_eq!(resolve_definite_size_value(PreferredSize::Percent(0.5), None), None);
+        assert_eq!(resolve_definite_size_value(PreferredSize::Stretch, Some(200.0)), None);
+        assert_eq!(resolve_definite_content_size(PreferredSize::Px(80.0), Some(200.0), 10.0, 12.0, BoxSizing::BorderBox), Some(68.0));
+        assert_eq!(resolve_definite_content_size(PreferredSize::Stretch, Some(200.0), 10.0, 12.0, BoxSizing::ContentBox), Some(178.0));
     }
 }

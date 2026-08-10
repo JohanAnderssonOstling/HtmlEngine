@@ -25,7 +25,7 @@ mod replaced;
 pub(super) use block::{FloatBand, FloatContext, FloatSide};
 pub(crate) use border_geometry::{PhysicalBorderEdge, border_pattern, physical_borders};
 pub(crate) use box_builder::{build_layout_inputs, build_layout_inputs_from};
-pub(crate) use box_constraints::{BoxLayoutRequest, resolve_definite_outer_inline_size, resolve_vertical_size};
+pub(crate) use box_constraints::{BoxLayoutRequest, resolve_definite_content_size, resolve_definite_outer_inline_size, resolve_definite_size_value, resolve_vertical_size};
 pub(crate) use box_model::{ResolvedBoxModel, UsedBorderInsets};
 pub(crate) use box_positioning::translate_laid_out_subtree_output;
 pub(crate) use decorations::{emit_block_background, emit_block_border_and_outline, emit_block_decorations, emit_color_rect_for_owner};

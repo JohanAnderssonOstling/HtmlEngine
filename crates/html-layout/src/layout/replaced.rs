@@ -3,6 +3,8 @@ use kurbo::Size;
 use taffy::geometry::Size as TaffySize;
 use taffy::prelude::AvailableSpace;
 
+use super::box_constraints::resolve_definite_content_size;
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ReplacedSizeInput {
     pub intrinsic: Size,
@@ -108,7 +110,7 @@ pub(crate) fn resolve_replaced_flex_auto_min_main_size(input: ReplacedFlexAutoMi
     };
     let ratio = input.aspect_ratio.filter(|ratio| ratio.is_finite() && *ratio > 0.0);
     let effective_cross_size = if input.stretch_cross_size && matches!(input.cross_size, PreferredSize::Auto | PreferredSize::Stretch) { PreferredSize::Stretch } else { input.cross_size };
-    let tentative_cross = resolve_definite(effective_cross_size, input.cross_basis, input.cross_margin, input.cross_padding_border, input.box_sizing).unwrap_or(intrinsic_cross.max(0.0));
+    let tentative_cross = resolve_definite_content_size(effective_cross_size, input.cross_basis, input.cross_margin, input.cross_padding_border, input.box_sizing).unwrap_or(intrinsic_cross.max(0.0));
     let cross_min = resolve_bound(input.min_cross_size, 0.0, intrinsic_cross.max(0.0), input.cross_basis, input.cross_margin, input.cross_padding_border, input.box_sizing);
     let cross_max = resolve_bound(input.max_cross_size, f64::INFINITY, intrinsic_cross.max(0.0), input.cross_basis, input.cross_margin, input.cross_padding_border, input.box_sizing).max(cross_min);
     let cross = tentative_cross.clamp(cross_min, cross_max);
@@ -120,7 +122,7 @@ pub(crate) fn resolve_replaced_flex_auto_min_main_size(input: ReplacedFlexAutoMi
     let main_min = resolve_bound(input.min_main_size, 0.0, intrinsic_main.max(0.0), input.main_basis, input.main_margin, input.main_padding_border, input.box_sizing);
     let main_max = resolve_bound(input.max_main_size, f64::INFINITY, intrinsic_main.max(0.0), input.main_basis, input.main_margin, input.main_padding_border, input.box_sizing).max(main_min);
     let mut automatic_minimum = transferred_main.clamp(main_min, main_max);
-    if let Some(specified) = resolve_definite(input.main_size, input.main_basis, input.main_margin, input.main_padding_border, input.box_sizing) {
+    if let Some(specified) = resolve_definite_content_size(input.main_size, input.main_basis, input.main_margin, input.main_padding_border, input.box_sizing) {
         automatic_minimum = automatic_minimum.min(specified.clamp(main_min, main_max));
     }
 
@@ -164,8 +166,8 @@ pub(crate) fn clamp_replaced_definite_size_by_intrinsic_constraints(preferred: P
 /// margin box, regardless of `box-sizing`.
 pub(crate) fn resolve_replaced_content_size(input: ReplacedSizeInput) -> Size {
     let ratio = input.aspect_ratio.filter(|ratio| ratio.is_finite() && *ratio > 0.0);
-    let definite_width = resolve_definite(input.width, Some(input.available_width), input.horizontal_margin, input.horizontal_padding_border, input.box_sizing);
-    let definite_height = resolve_definite(input.height, input.available_height, input.vertical_margin, input.vertical_padding_border, input.box_sizing);
+    let definite_width = resolve_definite_content_size(input.width, Some(input.available_width), input.horizontal_margin, input.horizontal_padding_border, input.box_sizing);
+    let definite_height = resolve_definite_content_size(input.height, input.available_height, input.vertical_margin, input.vertical_padding_border, input.box_sizing);
 
     let (mut width, mut height) = match (definite_width, definite_height, ratio) {
         (Some(width), Some(height), _) => (width, height),
@@ -193,38 +195,11 @@ pub(crate) fn resolve_replaced_content_size(input: ReplacedSizeInput) -> Size {
     Size::new(width.max(0.0), height.max(0.0))
 }
 
-fn resolve_definite(value: PreferredSize, basis: Option<f64>, margin: f64, padding_border: f64, box_sizing: BoxSizing) -> Option<f64> {
-    let border_box_to_content = |value: f64| match box_sizing {
-        BoxSizing::ContentBox => value.max(0.0),
-        BoxSizing::BorderBox => (value - padding_border).max(0.0),
-    };
-    match value {
-        PreferredSize::Px(value) => Some(border_box_to_content(value as f64)),
-        PreferredSize::Percent(value) => basis.map(|basis| border_box_to_content(basis * value as f64)),
-        PreferredSize::Calc { absolute_px, percentage, percentage_dependent } => {
-            if percentage_dependent {
-                basis.map(|basis| border_box_to_content(absolute_px as f64 + basis * percentage as f64))
-            } else {
-                Some(border_box_to_content(absolute_px as f64))
-            }
-        }
-        PreferredSize::Comparison { .. } => {
-            if value.percentage_dependent() {
-                basis.map(|basis| border_box_to_content(html_style_model::resolve_used_preferred_size(value, 0.0, basis)))
-            } else {
-                Some(border_box_to_content(html_style_model::resolve_used_preferred_size(value, 0.0, 0.0)))
-            }
-        }
-        PreferredSize::Stretch => basis.map(|basis| (basis - margin - padding_border).max(0.0)),
-        PreferredSize::Auto | PreferredSize::MinContent | PreferredSize::MaxContent | PreferredSize::FitContent => None,
-    }
-}
-
 fn resolve_bound(value: PreferredSize, auto: f64, intrinsic: f64, basis: Option<f64>, margin: f64, padding_border: f64, box_sizing: BoxSizing) -> f64 {
     match value {
         PreferredSize::Auto => auto,
         PreferredSize::MinContent | PreferredSize::MaxContent | PreferredSize::FitContent => intrinsic,
-        _ => resolve_definite(value, basis, margin, padding_border, box_sizing).unwrap_or(auto),
+        _ => resolve_definite_content_size(value, basis, margin, padding_border, box_sizing).unwrap_or(auto),
     }
 }
 

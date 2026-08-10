@@ -1,8 +1,9 @@
-use html_style_model::{BoxSizing, PositionMode, TextDirection, UsedPreferredSize as PreferredSize, resolve_used_preferred_size};
+use html_style_model::{BoxSizing, PositionMode, TextDirection, UsedPreferredSize as PreferredSize};
 use kurbo::{Point, Size, Vec2};
 
 use super::LayoutEngine;
 use super::box_model::ResolvedBoxModel;
+use super::box_constraints::resolve_definite_size_value;
 
 #[derive(Clone, Copy, Debug)]
 struct PendingAbsoluteBox {
@@ -133,7 +134,8 @@ fn constrain_border_width(style: html_style_model::UsedStyleView<'_>, model: &Re
         let specified = match value {
             PreferredSize::Auto => return fallback,
             PreferredSize::Stretch => containing_width,
-            _ => resolve_used_preferred_size(value, fallback, containing_width),
+            PreferredSize::MinContent | PreferredSize::MaxContent | PreferredSize::FitContent => return fallback,
+            _ => resolve_definite_size_value(value, Some(containing_width)).unwrap_or(fallback),
         };
         match style.box_sizing() {
             BoxSizing::ContentBox => specified + inset,
@@ -151,11 +153,8 @@ fn constrain_border_height(style: html_style_model::UsedStyleView<'_>, model: &R
         let specified = match value {
             PreferredSize::Auto => return fallback,
             PreferredSize::Stretch => containing_height,
-            PreferredSize::Px(px) => px as f64,
-            PreferredSize::Percent(percent) => containing_height * percent as f64,
-            PreferredSize::Calc { absolute_px, percentage, .. } => absolute_px as f64 + containing_height * percentage as f64,
-            PreferredSize::Comparison { .. } => resolve_used_preferred_size(value, fallback, containing_height),
             PreferredSize::MinContent | PreferredSize::MaxContent | PreferredSize::FitContent => return fallback,
+            _ => resolve_definite_size_value(value, Some(containing_height)).unwrap_or(fallback),
         };
         match style.box_sizing() {
             BoxSizing::ContentBox => specified + inset,

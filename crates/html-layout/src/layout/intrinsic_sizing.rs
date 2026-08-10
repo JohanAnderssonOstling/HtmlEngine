@@ -295,11 +295,7 @@ fn runs_intrinsic_widths(engine: &LayoutEngine<'_, '_>, run_range: Range<u32>, c
                     // have a definite authored inline size (for example an
                     // HTML `width` attribute). Preserve that contribution in
                     // shrink-to-fit and table intrinsic sizing.
-                    width = match engine.reader.style(run.box_idx as usize).width() {
-                        PreferredSize::Px(width) => f64::from(width.max(0.0)),
-                        PreferredSize::Calc { absolute_px, percentage_dependent: false, .. } => f64::from(absolute_px.max(0.0)),
-                        _ => 1.0,
-                    };
+                    width = super::resolve_definite_size_value(engine.reader.style(run.box_idx as usize).width(), None).unwrap_or(1.0).max(0.0);
                 }
                 apply_max_indent(&mut current_line, &mut max_indent_applied, max_starts_indented_line);
                 apply_min_indent(&mut segment, &mut min_indent_applied, min_starts_indented_line);
