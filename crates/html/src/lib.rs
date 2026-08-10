@@ -118,7 +118,7 @@ pub mod engine {
 
         /// Lays out one note body under its own constraints, for embedders
         /// that hold notes out of the reading flow and present them elsewhere.
-        pub fn layout_note(&self, id: &str, constraints: crate::layout::LayoutConstraints, glyph_shaper: &mut impl GlyphShaper) -> Option<LaidOutDocument> {
+        pub fn layout_note(&mut self, id: &str, constraints: crate::layout::LayoutConstraints, glyph_shaper: &mut impl GlyphShaper) -> Option<LaidOutDocument> {
             self.session.layout_note(id, constraints, glyph_shaper)
         }
 

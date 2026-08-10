@@ -530,6 +530,20 @@ pub fn paint_line_ellipsis(document: &LaidOutDocument, line_idx: usize, origin: 
     }
 }
 
+impl RenderScene {
+    /// Builds a scene for a document that is already laid out, for callers that
+    /// produced one themselves rather than rendering a fragment from source.
+    ///
+    /// A reader laying out a note keeps the containing document's computed
+    /// styles, so it cannot go through [`FragmentRenderer::render`], which
+    /// re-renders from source in a session of its own. It still wants this:
+    /// natural height over lines, decorations and images, content in paint
+    /// order, and clipping to the height the caller can show.
+    pub fn for_document(document: &LaidOutDocument, options: &FragmentRenderOptions) -> Self {
+        build_fragment_scene(document, options)
+    }
+}
+
 fn build_fragment_scene(document: &LaidOutDocument, options: &FragmentRenderOptions) -> RenderScene {
     let view = document.render_view();
     let text = view.text();

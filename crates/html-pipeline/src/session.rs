@@ -53,12 +53,17 @@ pub struct PipelineSession {
     cached_resource_key: Option<(ResourceRevision, StylesheetRevision)>,
     factory: DocumentFactory,
     cache: PipelineCacheState,
+    /// Resources as the shaper currently holds them, once notes have been
+    /// appended. Each note continues past the last, so the next one has to be
+    /// seeded from this rather than from the page, whose table stops short.
+    /// Cleared whenever the page is reshaped and the store starts over.
+    notes_shaped: Option<ShapedDocument>,
 }
 
 impl PipelineSession {
     pub fn new(provider: Arc<dyn ResourceProvider>) -> Self {
         let cached_provider = Arc::new(RevisionCachedResourceProvider::new(provider.clone()));
-        Self { cached_provider, cached_resource_key: None, factory: DocumentFactory::new(), cache: PipelineCacheState::default() }
+        Self { cached_provider, cached_resource_key: None, factory: DocumentFactory::new(), cache: PipelineCacheState::default(), notes_shaped: None }
     }
 
     pub fn update(&mut self, requested_inputs: PipelineInputs, glyph_shaper: &mut impl LayoutGlyphShaper) -> Result<PipelineUpdate, PipelineError> {
@@ -416,6 +421,9 @@ impl PipelineSession {
             debug_assert_eq!(self.cache.shaped_key.as_ref(), Some(requested_shaped_key));
             return self.cache.shaped.clone().ok_or_else(|| PipelineError("cached shaped document missing".to_owned()));
         }
+        // Reshaping the page replaces the shaper's resources, so anything notes
+        // appended to the old ones is gone with them.
+        self.notes_shaped = None;
         self.shape(prepared, glyph_shaper)
     }
 
@@ -488,14 +496,17 @@ impl PipelineSession {
     ///
     /// Returns `None` before the first successful update, or when `id` names no
     /// element.
-    pub fn layout_note(&self, id: &str, constraints: LayoutConstraintsOutput, glyph_shaper: &mut impl LayoutGlyphShaper) -> Option<LaidOutDocument> {
+    pub fn layout_note(&mut self, id: &str, constraints: LayoutConstraintsOutput, glyph_shaper: &mut impl LayoutGlyphShaper) -> Option<LaidOutDocument> {
         let inputs = self.cache.inputs.as_ref()?;
         let scoped = self.cache.prepared.as_ref()?.scoped_to_element_id(id)?;
         // Appended to the page's renderer resources rather than shaped as a
         // document of its own: a note's glyphs have to coexist with the page's,
-        // which are still referenced by what is on screen.
-        let base = self.cache.shaped.as_ref()?;
-        scoped.shape_and_layout_into_active_resources(base, constraints, &inputs.image_metrics, glyph_shaper).ok().map(|(_, laid_out)| laid_out)
+        // which are still referenced by what is on screen. Every note appends,
+        // so the seed is whatever the last one left behind.
+        let base = self.notes_shaped.as_ref().or(self.cache.shaped.as_ref())?;
+        let (shaped, laid_out) = scoped.shape_and_layout_into_active_resources(base, constraints, &inputs.image_metrics, glyph_shaper).ok()?;
+        self.notes_shaped = Some(shaped);
+        Some(laid_out)
     }
 
     /// Ids of the note bodies in the current document, in document order.
