@@ -6,9 +6,8 @@ use kurbo::Size;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ImageIntrinsic {
-    pub(crate) image_idx: u32,
     pub(crate) size: Size,
-    pub(crate) ratio: Option<f64>,
+    pub(crate) aspect_ratio: Option<f64>,
 }
 
 /// Shared read-only access to the document, styled layout topology, and
@@ -73,7 +72,7 @@ impl<'input> LayoutReader<'input> {
         let image_idx = self.image_idx(box_idx)?;
         let (width, height) = self.image_display_size(image_idx);
         let size = Size::new(width, height);
-        Some(ImageIntrinsic { image_idx, size, ratio: self.image_intrinsic_ratio(box_idx, size) })
+        Some(ImageIntrinsic { size, aspect_ratio: self.image_intrinsic_ratio(box_idx, size) })
     }
 
     fn image_intrinsic_ratio(&self, box_idx: usize, intrinsic: Size) -> Option<f64> {
@@ -95,11 +94,11 @@ impl<'input> LayoutReader<'input> {
     /// Returns a renderer-supplied column-filling width for an eligible
     /// standalone image, capped so its outer height fits the viewport.
     pub(crate) fn smart_standalone_image_width(
-        &self, policy: crate::ImageSizingPolicy, box_idx: usize, intrinsic: ImageIntrinsic, available_width: f64, viewport_height: Option<f64>, horizontal_padding_border: f64, vertical_outer_inset: f64, standalone: bool,
+        &self, policy: crate::ImageSizingPolicy, box_idx: usize, intrinsic: Size, available_width: f64, viewport_height: Option<f64>, horizontal_padding_border: f64, vertical_outer_inset: f64, standalone: bool,
     ) -> Option<html_style_model::UsedPreferredSize> {
         const MIN_SOURCE_WIDTH: f64 = 96.0;
 
-        if policy != crate::ImageSizingPolicy::SmartStandalone || !standalone || intrinsic.size.width < MIN_SOURCE_WIDTH {
+        if policy != crate::ImageSizingPolicy::SmartStandalone || !standalone || intrinsic.width < MIN_SOURCE_WIDTH {
             return None;
         }
         let style = self.style(box_idx);
@@ -114,11 +113,11 @@ impl<'input> LayoutReader<'input> {
         }
 
         let mut expanded_content_width = (available_width - horizontal_padding_border).max(0.0);
-        if intrinsic.size.height > 0.0
+        if intrinsic.height > 0.0
             && let Some(viewport_height) = viewport_height
         {
             let available_content_height = (viewport_height - vertical_outer_inset).max(0.0);
-            expanded_content_width = expanded_content_width.min(available_content_height * intrinsic.size.width / intrinsic.size.height);
+            expanded_content_width = expanded_content_width.min(available_content_height * intrinsic.width / intrinsic.height);
         }
         let preferred = match style.box_sizing() {
             html_style_model::BoxSizing::ContentBox => expanded_content_width,

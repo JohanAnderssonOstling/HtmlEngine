@@ -23,7 +23,6 @@ fn create_image_token(
     let horizontal_border = border_left + style.border_right_width() as f64;
     let vertical_border = border_top + style.border_bottom_width() as f64;
     let image_intrinsic = engine.reader.image_intrinsic(box_idx as usize).expect("image token owner must retain image identity in the layout topology");
-    debug_assert_eq!(image_intrinsic.image_idx, image_idx);
     let intrinsic = image_intrinsic.size;
     if self_owned_replaced {
         let content_height = containing_block_height.unwrap_or_else(|| if intrinsic.width > 0.0 { max_width * intrinsic.height / intrinsic.width } else { intrinsic.height });
@@ -47,11 +46,11 @@ fn create_image_token(
             ReplacedToken::Image { image_idx, box_idx, content_size, border_size: content_size, content_inset: Point::ZERO, margin_left: 0.0, margin_top: 0.0, position_offset: Vec2::ZERO, set_box_geometry: false },
         );
     }
-    let aspect_ratio = preferred_aspect_ratio(style.aspect_ratio(), image_intrinsic.ratio);
+    let aspect_ratio = preferred_aspect_ratio(style.aspect_ratio(), image_intrinsic.aspect_ratio);
     let smart_width = engine.reader.smart_standalone_image_width(
         engine.config.image_sizing_policy(),
         box_idx as usize,
-        image_intrinsic,
+        intrinsic,
         max_width,
         engine.config.viewport_height(),
         horizontal_padding + horizontal_border,
@@ -384,7 +383,7 @@ fn create_atomic_box_token(
     let is_inline_table = matches!(engine.reader.box_layout_mode(box_idx as usize), Some(crate::layout_model::LayoutMode::Table(_)));
     let (border_size, first_baseline, last_baseline) = if let Some(intrinsic) = engine.reader.image_intrinsic(box_idx as usize) {
         let content = resolve_replaced_content_size(
-            ReplacedSizeInput::from_style(style, intrinsic.size, preferred_aspect_ratio(style.aspect_ratio(), intrinsic.ratio), max_width, containing_block_height)
+            ReplacedSizeInput::from_style(style, intrinsic.size, preferred_aspect_ratio(style.aspect_ratio(), intrinsic.aspect_ratio), max_width, containing_block_height)
                 .with_box_model(margin_left + margin_right, margin_top + margin_bottom, resolved_padding + horizontal_border, vertical_padding + vertical_border),
         );
         (Size::new(content.width + resolved_padding + horizontal_border, content.height + vertical_padding + vertical_border), None, None)

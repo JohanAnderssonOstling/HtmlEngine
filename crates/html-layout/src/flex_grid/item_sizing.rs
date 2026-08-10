@@ -75,7 +75,7 @@ pub(super) fn flex_replaced_automatic_minimum(session: &LayoutEngine<'_, '_>, bo
         return Some(0.0);
     }
 
-    let ratio = preferred_aspect_ratio(style.aspect_ratio(), image_intrinsic.ratio).filter(|ratio| ratio.is_finite() && *ratio > 0.0);
+    let ratio = preferred_aspect_ratio(style.aspect_ratio(), image_intrinsic.aspect_ratio).filter(|ratio| ratio.is_finite() && *ratio > 0.0);
 
     let horizontal_padding_border = style.get_horizontal_padding(containing_width) + style.border_left_width() as f64 + style.border_right_width() as f64;
     let vertical_padding_border = style.get_vertical_padding(containing_width) + style.border_top_width() as f64 + style.border_bottom_width() as f64;

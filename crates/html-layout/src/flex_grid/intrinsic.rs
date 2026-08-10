@@ -233,7 +233,7 @@ fn outer_preferred_width(session: &LayoutEngine<'_, '_>, box_idx: usize, value: 
 
 fn measure_item(session: &LayoutEngine<'_, '_>, box_idx: usize, known: TaffySize<Option<f32>>, available: TaffySize<AvailableSpace>) -> TaffySize<f32> {
     if let Some(intrinsic) = session.reader.image_intrinsic(box_idx) {
-        return measure_replaced_content(intrinsic.size, preferred_aspect_ratio(session.reader.style(box_idx).aspect_ratio(), intrinsic.ratio), known, available);
+        return measure_replaced_content(intrinsic.size, preferred_aspect_ratio(session.reader.style(box_idx).aspect_ratio(), intrinsic.aspect_ratio), known, available);
     }
     let style = session.reader.style(box_idx);
     let (outer_min_width, outer_max_width) = crate::layout::box_intrinsic_widths(session, box_idx);

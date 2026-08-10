@@ -48,7 +48,7 @@ impl FlexGridState {
 pub(super) fn measure_item_with_baseline(session: &mut LayoutEngine<'_, '_>, box_idx: usize, known: TaffySize<Option<f32>>, available: TaffySize<AvailableSpace>) -> MeasuredItem {
     let timing_started = Instant::now();
     if let Some(intrinsic) = session.reader.image_intrinsic(box_idx) {
-        let result = measure_replaced_content(intrinsic.size, preferred_aspect_ratio(session.reader.style(box_idx).aspect_ratio(), intrinsic.ratio), known, available);
+        let result = measure_replaced_content(intrinsic.size, preferred_aspect_ratio(session.reader.style(box_idx).aspect_ratio(), intrinsic.aspect_ratio), known, available);
         session.record_timing(|timings| timings.measure_flex_grid_item += timing_started.elapsed());
         return MeasuredItem { size: result, first_baseline: None };
     }

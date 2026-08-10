@@ -166,7 +166,7 @@ fn resolve_box_sizing(engine: &LayoutEngine<'_, '_>, request: BoxLayoutRequest) 
     let is_replaced = replaced_intrinsic.is_some();
     let inline_alignment = effective_inline_alignment(engine, box_idx);
     let authored_aspect_ratio = style.aspect_ratio();
-    let used_aspect_ratio = preferred_aspect_ratio(authored_aspect_ratio, image_intrinsic.and_then(|intrinsic| intrinsic.ratio));
+    let used_aspect_ratio = preferred_aspect_ratio(authored_aspect_ratio, image_intrinsic.and_then(|intrinsic| intrinsic.aspect_ratio));
     let vertical = resolve_vertical_sizing(engine, style, request, box_model);
     let (horizontal, replaced_size) = resolve_horizontal_sizing(engine, style, request, box_model, vertical, image_intrinsic, used_aspect_ratio, is_float, inline_alignment);
 
@@ -386,7 +386,7 @@ fn resolve_width_constraints(
         engine.reader.smart_standalone_image_width(
             engine.config.image_sizing_policy(),
             request.box_idx,
-            intrinsic,
+            intrinsic.size,
             request.available_width,
             engine.config.viewport_height(),
             horizontal_padding_border,

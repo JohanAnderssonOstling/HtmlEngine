@@ -164,7 +164,7 @@ pub(super) fn taffy_item_style(
     let replaced_intrinsic = image_intrinsic.map(|intrinsic| intrinsic.size);
     let both_replaced_axes_auto = replaced_intrinsic.is_some() && matches!(style.width(), PreferredSize::Auto) && matches!(style.height(), PreferredSize::Auto);
     let authored_aspect_ratio = style.aspect_ratio();
-    let intrinsic_aspect_ratio = if both_replaced_axes_auto { image_intrinsic.and_then(|intrinsic| intrinsic.ratio).map(finite_f32) } else { None };
+    let intrinsic_aspect_ratio = if both_replaced_axes_auto { image_intrinsic.and_then(|intrinsic| intrinsic.aspect_ratio).map(finite_f32) } else { None };
     let aspect_ratio = if kind == TaffyContainerKind::Flex && replaced_intrinsic.is_some() && layout.flex_grow > 0.0 {
         // A flexible replaced item may grow its main axis independently
         // of a constrained cross axis. Its measure callback transfers the
