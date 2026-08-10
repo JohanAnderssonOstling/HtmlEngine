@@ -47,7 +47,7 @@ pub use shaping::{CharacterPlacement, FontMetricsRequest, FontRelativeMetrics, F
 pub use stages::{
     BoxTextFormat, ImageMetrics, ImageSizingPolicy, LaidOutDocument, LayoutConstraintError, LayoutConstraints, PrepareError, PreparedDocument, RenderAddressingView, RenderAllImageFragments, RenderAnchorPosition, RenderAnchorPositions,
     RenderAuthoritativeTextRun, RenderBoxView, RenderDecoration, RenderDecorationPattern, RenderDecorations, RenderEllipsisFragment, RenderForcedBreak, RenderFragmentView, RenderGlyphAdvanceRun, RenderGlyphAdvanceRuns,
-    RenderGlyphOffsetRun, RenderGlyphOffsetRuns, RenderHyphenFragment, RenderImageFragment, RenderImageFragments, RenderLine, RenderLineDecorations, RenderLineTextFragment, RenderLineTextFragments, RenderLines, RenderListItemMarker,
+    NoteFlow, RenderGlyphOffsetRun, RenderGlyphOffsetRuns, RenderHyphenFragment, RenderImageFragment, RenderImageFragments, RenderLine, RenderLineDecorations, RenderLineTextFragment, RenderLineTextFragments, RenderLines, RenderListItemMarker,
     RenderOverflowClip, RenderTable, RenderTableCell, RenderTableRow, RenderTextRun, RenderTextRuns, RenderTextView, RenderView, ShapedDocument, SourceElementStep, SourcePosition, TextCompositionPolicy,
 };
 

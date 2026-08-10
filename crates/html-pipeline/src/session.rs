@@ -70,6 +70,7 @@ impl PipelineSession {
         self.factory.set_root_font_size(to_root_font_size(requested_inputs.style_environment.root_font_size));
         self.factory.set_media_environment(requested_inputs.style_environment.media);
         self.factory.set_reader_overrides(requested_inputs.reader_overrides.clone());
+        self.factory.set_note_flow(requested_inputs.note_flow);
 
         let media_match_changed = self.media_match_changed(&requested_inputs);
         let mut timings = PipelineTimings::default();
@@ -750,6 +751,7 @@ mod tests {
             markup_syntax: MarkupSyntax::Html,
             user_styles: Vec::new(),
             reader_overrides: Default::default(),
+            note_flow: Default::default(),
             source_revision,
             base_uri: "index.html".to_owned(),
             resource_revision: ResourceRevision::INITIAL,

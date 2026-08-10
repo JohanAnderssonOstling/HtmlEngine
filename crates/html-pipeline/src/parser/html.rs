@@ -17,6 +17,7 @@ pub struct DocumentFactory {
     resources: Option<ResourceContext>,
     stylesheet_cache: Option<BookStylesheetCache>,
     reader_overrides: html_layout::ReaderStyleOverrides,
+    note_flow: html_layout::NoteFlow,
 }
 
 struct ResourceContext {
@@ -73,7 +74,7 @@ impl Default for DocumentFactory {
 
 impl DocumentFactory {
     pub fn new() -> Self {
-        Self { root_font_size: RootFontSize::default(), media_environment: html_style::MediaEnvironment::default(), title: None, resources: None, stylesheet_cache: None, reader_overrides: Default::default() }
+        Self { root_font_size: RootFontSize::default(), media_environment: html_style::MediaEnvironment::default(), title: None, resources: None, stylesheet_cache: None, reader_overrides: Default::default(), note_flow: Default::default() }
     }
 
     pub fn set_resource_context(&mut self, provider: Arc<dyn ResourceProvider>, base_uri: impl Into<String>) {
@@ -90,6 +91,10 @@ impl DocumentFactory {
 
     pub fn set_media_environment(&mut self, media_environment: html_style::MediaEnvironment) {
         self.media_environment = media_environment;
+    }
+
+    pub fn set_note_flow(&mut self, note_flow: html_layout::NoteFlow) {
+        self.note_flow = note_flow;
     }
 
     pub fn set_reader_overrides(&mut self, overrides: html_layout::ReaderStyleOverrides) {
@@ -219,7 +224,7 @@ impl DocumentFactory {
         let layout_started = Instant::now();
         let (document, styles) = styled.into_parts();
         let styles = styles.with_reader_overrides(&document, &self.reader_overrides).expect("reader overrides must preserve complete computed styles");
-        let prepared = PreparedDocument::try_new(document, styles).expect("style resolver must produce complete styles for its document");
+        let prepared = PreparedDocument::try_new_with_note_flow(document, styles, self.note_flow).expect("style resolver must produce complete styles for its document");
         if let Some(timings) = timings {
             timings.build_layout_inputs += layout_started.elapsed();
         }

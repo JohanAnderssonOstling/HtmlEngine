@@ -137,6 +137,65 @@ mod stage_tests {
         assert_eq!(error.reason(), ComputedStylesValidationError::WrongDocument);
     }
 
+    fn prepare_with_notes(source: &str, note_flow: crate::NoteFlow) -> PreparedDocument {
+        let document = html_parse::parse_dom_document(source).expect("valid HTML");
+        let (document, styles) = html_style::style_document(document, &[]).into_parts();
+        PreparedDocument::try_new_with_note_flow(document, styles, note_flow).expect("valid styles must prepare")
+    }
+
+    #[test]
+    fn excluded_notes_generate_no_boxes_while_ordinary_markup_is_untouched() {
+        const WITH_NOTE: &str = "<html><body><p>Reading</p><aside id='n' epub:type='footnote'><p>note body</p></aside><p>Continues</p></body></html>";
+        // Same shape, but the aside carries no note semantics.
+        const WITHOUT_NOTE: &str = "<html><body><p>Reading</p><aside id='n'><p>note body</p></aside><p>Continues</p></body></html>";
+
+        let in_flow = prepare_with_notes(WITH_NOTE, crate::NoteFlow::InFlow).box_count();
+        let excluded = prepare_with_notes(WITH_NOTE, crate::NoteFlow::Excluded).box_count();
+        assert!(excluded < in_flow, "an excluded note must stop generating boxes ({excluded} boxes vs {in_flow} in flow)");
+
+        // Exclusion is driven by note semantics alone, so markup the predicate
+        // does not recognise lays out the same either way.
+        assert_eq!(
+            prepare_with_notes(WITHOUT_NOTE, crate::NoteFlow::Excluded).box_count(),
+            prepare_with_notes(WITHOUT_NOTE, crate::NoteFlow::InFlow).box_count(),
+            "markup without note semantics is unaffected by the note flow setting"
+        );
+    }
+
+    #[test]
+    fn note_exclusion_resolves_a_non_epub_prefix_only_under_xml_parsing() {
+        // The predicate tries the literal `epub:type` attribute first and the
+        // EPUB-namespaced `type` second. Namespace resolution is a property of
+        // the parser, not the predicate: XHTML binds `e:` to the EPUB namespace
+        // and the note is recognised, while the same bytes parsed as HTML leave
+        // `e:type` an ordinary attribute name that matches nothing.
+        const PREFIXED: &str = r#"<html xmlns="http://www.w3.org/1999/xhtml" xmlns:e="http://www.idpf.org/2007/ops"><body><p>Reading</p><aside id="n" e:type="footnote"><p>note body</p></aside></body></html>"#;
+
+        let prepare_xml = |note_flow| {
+            let document = html_parse::parse_xml_document(PREFIXED).expect("valid XHTML").build_dom();
+            let (document, styles) = html_style::style_document(document, &[]).into_parts();
+            PreparedDocument::try_new_with_note_flow(document, styles, note_flow).expect("valid styles must prepare").box_count()
+        };
+        assert!(prepare_xml(crate::NoteFlow::Excluded) < prepare_xml(crate::NoteFlow::InFlow), "XHTML binds the prefix to the EPUB namespace, so the note is recognised");
+
+        assert_eq!(
+            prepare_with_notes(PREFIXED, crate::NoteFlow::Excluded).box_count(),
+            prepare_with_notes(PREFIXED, crate::NoteFlow::InFlow).box_count(),
+            "parsed as HTML the same markup carries no EPUB semantics, so nothing is held back"
+        );
+    }
+
+    #[test]
+    fn note_flow_defaults_to_laying_notes_out_as_authored() {
+        const WITH_NOTE: &str = "<html><body><p>Reading</p><aside id='n' epub:type='footnote'><p>note body</p></aside></body></html>";
+        let document = html_parse::parse_dom_document(WITH_NOTE).expect("valid HTML");
+        let (document, styles) = html_style::style_document(document, &[]).into_parts();
+
+        let default_boxes = PreparedDocument::try_new(document, styles).expect("valid styles must prepare").box_count();
+
+        assert_eq!(default_boxes, prepare_with_notes(WITH_NOTE, crate::NoteFlow::InFlow).box_count(), "embedders that ask for nothing keep authored layout");
+    }
+
     #[test]
     fn style_to_layout_boundary_moves_storage_without_cloning() {
         let document = html_parse::parse_dom_document("<html><body><p>text</p></body></html>").expect("valid HTML");

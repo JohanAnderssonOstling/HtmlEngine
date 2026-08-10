@@ -36,6 +36,23 @@ pub enum ImageSizingPolicy {
     SmartStandalone,
 }
 
+/// Whether note bodies generate boxes in the reading flow.
+///
+/// Notes are recognised by the same predicate that answers
+/// [`RenderAddressingView::is_note_target`], so an embedder that holds notes
+/// back for its own presentation never has to restate what a note is. Excluding
+/// them suppresses box generation exactly as `display: none` would, leaving the
+/// subtree in the DOM so link targets and scoped layout still resolve.
+///
+/// In-flow is the default: markup lays out as authored unless an embedder asks
+/// otherwise.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NoteFlow {
+    #[default]
+    InFlow,
+    Excluded,
+}
+
 /// Selects browser-compatible first-fit wrapping or paragraph-wide book
 /// composition. Web-compatible wrapping remains the public default so layout
 /// tests and embedders do not silently acquire different line breaks.
@@ -212,10 +229,14 @@ pub struct ShapedDocument {
 
 impl PreparedDocument {
     pub fn try_new(document: Document, styles: ComputedStyles) -> Result<Self, PrepareError> {
+        Self::try_new_with_note_flow(document, styles, NoteFlow::default())
+    }
+
+    pub fn try_new_with_note_flow(document: Document, styles: ComputedStyles, note_flow: NoteFlow) -> Result<Self, PrepareError> {
         styles.validate_for(&document).map_err(PrepareError)?;
         let mut layout_tree = LayoutTree::default();
         let mut inline_content = InlineContent::default();
-        crate::layout::build_layout_inputs(&document, &styles, &mut layout_tree, &mut inline_content);
+        crate::layout::build_layout_inputs(&document, &styles, &mut layout_tree, &mut inline_content, note_flow);
         Ok(Self { inputs: std::sync::Arc::new(PreparedInputs { document: std::sync::Arc::new(document), styles: std::sync::Arc::new(styles), layout_tree: std::sync::Arc::new(layout_tree), inline_content }) })
     }
 
@@ -939,7 +960,7 @@ fn element_is_note_reference(element: html_dom::ElementRef<'_>) -> bool {
     element_has_token(element, "epub:type", Some(EPUB_NAMESPACE), "type", "noteref") || element_has_token(element, "role", None, "role", "doc-noteref")
 }
 
-fn element_is_note_target(element: html_dom::ElementRef<'_>) -> bool {
+pub(crate) fn element_is_note_target(element: html_dom::ElementRef<'_>) -> bool {
     ["footnote", "endnote", "rearnote"].iter().any(|kind| element_has_token(element, "epub:type", Some(EPUB_NAMESPACE), "type", kind))
         || ["doc-footnote", "doc-endnote"].iter().any(|role| element_has_token(element, "role", None, "role", role))
 }

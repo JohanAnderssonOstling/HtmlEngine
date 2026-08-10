@@ -369,6 +369,9 @@ pub struct PipelineInputs {
     /// Reader-authored CSS applied after the publication stylesheets.
     pub user_styles: Vec<String>,
     pub reader_overrides: html_layout::ReaderStyleOverrides,
+    /// Whether note bodies generate boxes. Changing it rebuilds the prepared
+    /// stage, since it decides box generation rather than geometry.
+    pub note_flow: html_layout::NoteFlow,
     pub source_revision: SourceRevision,
     pub base_uri: String,
     pub resource_revision: ResourceRevision,
@@ -396,6 +399,7 @@ pub struct PreparedCacheKey {
     pub style_environment: StyleCacheEnvironment,
     pub user_styles: Vec<String>,
     pub reader_overrides: html_layout::ReaderStyleOverrides,
+    pub note_flow: html_layout::NoteFlow,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -495,6 +499,7 @@ impl PipelineInputs {
             style_environment: self.style_environment.cache_key(),
             user_styles: self.user_styles.clone(),
             reader_overrides: self.reader_overrides.clone(),
+            note_flow: self.note_flow,
         }
     }
 

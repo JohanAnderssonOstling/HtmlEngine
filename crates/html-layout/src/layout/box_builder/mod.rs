@@ -1,4 +1,5 @@
 use crate::layout_model::{BlockBox, Children, InlineContent, InlineItemKind, LayoutMode, LayoutTree};
+use crate::stages::{NoteFlow, element_is_note_target};
 use html_dom::{Document, DomNodeId, NodeRef};
 use html_style_model::{ComputedStyles, Display, Float, ListStyleType, StyleIndices};
 use rustc_data_structures::fx::FxHashMap;
@@ -29,6 +30,7 @@ struct LayoutTreeBuilder<'a, 'out> {
     list_item_ordinals: ListItemOrdinals,
     floated_first_letter: Option<FloatedFirstLetterCapture>,
     contents_text_styles: FxHashMap<DomNodeId, StyleIndices>,
+    note_flow: NoteFlow,
 }
 
 struct InlineFragmentFrame {
@@ -64,7 +66,7 @@ fn is_first_letter_punctuation(character: char) -> bool {
 }
 
 impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
-    fn new(document: &'a Document, styles: &'a ComputedStyles, layout_tree: &'out mut LayoutTree, inline_content: &'out mut InlineContent) -> Self {
+    fn new(document: &'a Document, styles: &'a ComputedStyles, layout_tree: &'out mut LayoutTree, inline_content: &'out mut InlineContent, note_flow: NoteFlow) -> Self {
         let mut contents_text_styles = FxHashMap::default();
         if let Some(root) = document.dom_root() {
             collect_contents_text_styles(document, styles, root, None, &mut contents_text_styles);
@@ -77,6 +79,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
             list_item_ordinals: ListItemOrdinals::new(document, styles),
             floated_first_letter: None,
             contents_text_styles,
+            note_flow,
         }
     }
 
@@ -98,6 +101,15 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
         let element = self.document.element_ref(elem_id)?;
         let style_indices = self.styles.style_for_node(element.node_id())?;
         let mut display = display_for_element(self.styles, element);
+
+        // A note held back for the embedder's own presentation generates no
+        // boxes, exactly as `display: none` would. The subtree stays in the DOM
+        // so link targets still resolve and a scoped layout can lay the note
+        // out on its own terms. Suppression is skipped when this element is
+        // itself the build root, which is how that scoped layout reaches it.
+        if self.note_flow == NoteFlow::Excluded && parent_box.is_some() && element_is_note_target(element) {
+            display = Display::None;
+        }
 
         // The document root must continue to establish the initial containing
         // block. CSS Display gives `contents` on the root a block-level used
@@ -1066,8 +1078,8 @@ fn collect_contents_text_styles(document: &Document, styles: &ComputedStyles, no
     }
 }
 
-pub(crate) fn build_layout_inputs(document: &Document, styles: &ComputedStyles, layout_tree: &mut LayoutTree, inline_content: &mut InlineContent) {
-    LayoutTreeBuilder::new(document, styles, layout_tree, inline_content).build();
+pub(crate) fn build_layout_inputs(document: &Document, styles: &ComputedStyles, layout_tree: &mut LayoutTree, inline_content: &mut InlineContent, note_flow: NoteFlow) {
+    LayoutTreeBuilder::new(document, styles, layout_tree, inline_content, note_flow).build();
 }
 
 include!("tests.rs");

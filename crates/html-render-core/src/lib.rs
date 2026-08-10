@@ -329,6 +329,7 @@ impl FragmentRenderer {
             markup_syntax: html_pipeline::MarkupSyntax::Html,
             user_styles: options.user_styles.clone(),
             reader_overrides: Default::default(),
+            note_flow: Default::default(),
             source_revision: SourceRevision::INITIAL,
             base_uri: options.base_uri.clone(),
             resource_revision: self.resource_revision,
