@@ -1,7 +1,6 @@
 pub(crate) struct LayoutConfig {
     viewport_width: f64,
     viewport_height: Option<f64>,
-    line_height: f64,
     image_sizing_policy: crate::ImageSizingPolicy,
     text_composition_policy: crate::TextCompositionPolicy,
     force_justify: bool,
@@ -12,7 +11,6 @@ impl LayoutConfig {
         Self {
             viewport_width: constraints.viewport_width(),
             viewport_height: constraints.viewport_height(),
-            line_height: constraints.line_height(),
             image_sizing_policy: constraints.image_sizing_policy(),
             text_composition_policy: constraints.text_composition_policy(),
             force_justify: false,
@@ -24,9 +22,6 @@ impl LayoutConfig {
     }
     pub(crate) fn viewport_height(&self) -> Option<f64> {
         self.viewport_height
-    }
-    pub(crate) fn default_line_height(&self) -> f64 {
-        self.line_height
     }
     pub(crate) fn force_justify(&self) -> bool {
         self.force_justify

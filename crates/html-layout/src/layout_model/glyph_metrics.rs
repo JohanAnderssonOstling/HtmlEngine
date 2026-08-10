@@ -101,10 +101,6 @@ impl GlyphMetrics {
         Ok(id)
     }
 
-    pub(crate) fn push(&mut self, metric: GlyphMetric) -> GlyphId {
-        self.register(metric).expect("glyph metrics registry capacity exhausted")
-    }
-
     pub(crate) fn get_checked(&self, glyph: GlyphId) -> Option<GlyphMetric> {
         self.0.get(glyph as usize).copied()
     }
@@ -112,11 +108,6 @@ impl GlyphMetrics {
     #[inline]
     pub(crate) fn len(&self) -> usize {
         self.0.len()
-    }
-
-    #[inline]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.0.is_empty()
     }
 
     pub(crate) fn memory_usage_report(&self) -> MemoryUsageReport {

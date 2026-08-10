@@ -180,9 +180,6 @@ pub(crate) mod test_support {
             Self { glyphs: HashMap::new(), x_height_ratio, ch_advance_ratio, cap_height_ratio: 0.8, ascent_ratio: None, font_metric_calls: 0 }
         }
 
-        pub(crate) fn with_cap_height_ratio(cap_height_ratio: f32) -> Self {
-            Self { cap_height_ratio, ..Self::default() }
-        }
     }
 
     impl GlyphShaper for TestGlyphShaper {

@@ -76,6 +76,9 @@ impl LayoutState {
     pub(crate) fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
         report.add_slice_storage::<Line>("LayoutState.line_output.lines.storage", self.line_output.lines.capacity(), self.line_output.lines.len());
+        for line in &self.line_output.lines {
+            report.extend_prefixed("LayoutState.line_output.lines", line.memory_usage_report());
+        }
         report.add_slice_storage::<u32>("LayoutState.line_output.paint_order_indices.storage", self.line_output.paint_order_indices.capacity(), self.line_output.paint_order_indices.len());
         report.add_slice_storage::<LineInlineBoxFragment>("LayoutState.line_output.inline_box_fragments.storage", self.line_output.inline_box_fragments.capacity(), self.line_output.inline_box_fragments.len());
         report.add_slice_storage::<bool>("LayoutState.line_output.positioned_layers.storage", self.line_output.positioned_layers.capacity(), self.line_output.positioned_layers.len());
@@ -138,12 +141,6 @@ pub(crate) struct OverflowClip {
 pub(crate) struct AnchorPosition {
     pub y: f64,
     pub order: u32,
-}
-
-impl AnchorPosition {
-    pub(crate) fn memory_usage_report(&self) -> MemoryUsageReport {
-        MemoryUsageReport::new()
-    }
 }
 
 #[derive(Clone)]
@@ -256,18 +253,6 @@ pub(crate) struct HyphenFragment {
     pub offset: Point,
 }
 
-impl GlyphAdvanceRun {
-    pub(crate) fn memory_usage_report(&self) -> MemoryUsageReport {
-        MemoryUsageReport::new()
-    }
-}
-
-impl GlyphOffsetRun {
-    pub(crate) fn memory_usage_report(&self) -> MemoryUsageReport {
-        MemoryUsageReport::new()
-    }
-}
-
 #[derive(Clone)]
 pub(crate) struct DecorationFragment {
     pub rect: Rect,
@@ -362,6 +347,7 @@ impl DecorationFragment {
     const PATTERN_MASK: u32 = 0b111 << Self::PATTERN_SHIFT;
     const FLAG_BITS: u32 = Self::INLINE_BIT | Self::FOREGROUND_BIT | Self::BACKGROUND_BIT | Self::BORDER_BIT | Self::PATTERN_MASK;
 
+    #[cfg(test)]
     pub(crate) fn rect(rect: Rect, color: u32, is_inline: bool) -> Self {
         Self { rect, color, metadata: if is_inline { Self::INLINE_BIT } else { 0 } }
     }
@@ -374,6 +360,7 @@ impl DecorationFragment {
         Self { rect, color, metadata: Self::BORDER_BIT | if is_inline { Self::INLINE_BIT } else { 0 } | if foreground { Self::FOREGROUND_BIT } else { 0 } }
     }
 
+    #[cfg(test)]
     pub(crate) fn foreground_rect(rect: Rect, color: u32, is_inline: bool) -> Self {
         Self { rect, color, metadata: Self::FOREGROUND_BIT | if is_inline { Self::INLINE_BIT } else { 0 } }
     }
@@ -386,6 +373,7 @@ impl DecorationFragment {
         Self { rect, color, metadata: Self::BORDER_BIT | ((pattern as u32) << Self::PATTERN_SHIFT) | if is_inline { Self::INLINE_BIT } else { 0 } | if foreground { Self::FOREGROUND_BIT } else { 0 } }
     }
 
+    #[cfg(test)]
     pub(crate) fn rounded(rect: Rect, color: u32, is_inline: bool, rounded_index: usize) -> Self {
         assert!(rounded_index < ((1 << 25) - 1) as usize, "too many rounded decorations");
         Self { rect, color, metadata: (rounded_index as u32 + 1) | if is_inline { Self::INLINE_BIT } else { 0 } }
@@ -433,9 +421,6 @@ impl DecorationFragment {
         }
     }
 
-    pub(crate) fn memory_usage_report(&self) -> MemoryUsageReport {
-        MemoryUsageReport::new()
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -452,12 +437,6 @@ pub(crate) struct ImageFragment {
     pub offset: Point,
     pub size: Size,
     pub paint_order: u32,
-}
-
-impl ImageFragment {
-    pub(crate) fn memory_usage_report(&self) -> MemoryUsageReport {
-        MemoryUsageReport::new()
-    }
 }
 
 #[cfg(test)]

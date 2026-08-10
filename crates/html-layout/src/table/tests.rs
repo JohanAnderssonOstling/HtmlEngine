@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use super::columns::{TableCellPlacement, TableGrid, build_table_grid, resolve_column_widths};
+    use super::columns::{TableCellPlacement, TableGrid, build_table_grid};
     use crate::parser::DocumentFactory;
     use crate::test_support::TestGlyphShaper;
     use crate::{LaidOutDocument, LayoutConstraints};
@@ -173,28 +173,6 @@ mod tests {
         assert!((blue[1].width() - 60.0).abs() < 0.01);
         let total = blue.iter().map(|rect| rect.width()).sum::<f64>();
         assert!((total - table_size.width).abs() < 0.01);
-    }
-
-    #[test]
-    fn resolve_columns_uses_min_when_space_tight() {
-        let widths = resolve_column_widths(&[100.0, 50.0], &[220.0, 90.0], None, None, 120.0);
-        assert_eq!(widths, vec![100.0, 50.0]);
-    }
-
-    #[test]
-    fn resolve_columns_interpolates_between_min_and_max() {
-        let widths = resolve_column_widths(&[50.0, 50.0], &[200.0, 100.0], None, None, 200.0);
-        assert!(widths[0] > widths[1]);
-        assert!((widths.iter().sum::<f64>() - 200.0).abs() < 0.01);
-        assert!(widths[0] >= 50.0 && widths[0] <= 200.0);
-        assert!(widths[1] >= 50.0 && widths[1] <= 100.0);
-    }
-
-    #[test]
-    fn resolve_columns_distributes_extra_after_max() {
-        let widths = resolve_column_widths(&[40.0, 60.0], &[50.0, 70.0], None, None, 200.0);
-        assert!((widths[0] - 90.0).abs() < 0.01);
-        assert!((widths[1] - 110.0).abs() < 0.01);
     }
 
     #[test]

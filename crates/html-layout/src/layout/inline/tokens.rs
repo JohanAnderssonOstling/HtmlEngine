@@ -35,6 +35,7 @@ pub(super) fn compute_baseline(max_ascent: f64, max_descent: f64, min_height: f6
 
 /// Converts a computed vertical-alignment value into the upward offset used by
 /// the fragment writer.
+#[cfg(test)]
 pub(super) fn vertical_align_offset(token: &InlineToken, runs: &[InlineTokenMetrics], line_height: f64, baseline: f64) -> f64 {
     let metrics = token.run_metrics(runs);
     let ascent = metrics.ascent as f64;

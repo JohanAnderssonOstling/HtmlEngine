@@ -123,12 +123,6 @@ pub(crate) struct InlineItem {
     pub dom_text_node: Option<u32>, // DOM text node that produced this item (None for synthetic/non-text items)
 }
 
-impl InlineItem {
-    pub(crate) fn memory_usage_report(&self) -> MemoryUsageReport {
-        MemoryUsageReport::new()
-    }
-}
-
 #[derive(Clone)]
 pub(crate) enum InlineItemKind {
     Text {
@@ -169,10 +163,4 @@ pub(crate) enum InlineItemKind {
     Marker {
         glyphs: Range<u32>,
     },
-}
-
-impl InlineItemKind {
-    pub(crate) fn memory_usage_report(&self) -> MemoryUsageReport {
-        MemoryUsageReport::new()
-    }
 }

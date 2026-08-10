@@ -1,5 +1,5 @@
 use html_dom::{Document, ElementRef, MemoryUsageReport};
-use html_style_model::{ComputedStyles, ListStylePosition, StyleIndices};
+use html_style_model::{ListStylePosition, StyleIndices};
 use rustc_data_structures::fx::FxHashMap;
 use std::ops::Range;
 
@@ -11,12 +11,6 @@ use std::ops::Range;
 pub(crate) struct ListItemMarker {
     pub marker_box: u32,
     pub position: ListStylePosition,
-}
-
-impl ListItemMarker {
-    pub(crate) fn memory_usage_report(&self) -> MemoryUsageReport {
-        MemoryUsageReport::new()
-    }
 }
 
 /// Output of the box-construction phase: the box tree plus the inline text
@@ -104,65 +98,6 @@ impl LayoutTree {
 
     pub(crate) fn get_box_layout_mode(&self, box_idx: usize) -> Option<&LayoutMode> {
         self.boxes.get(box_idx).map(|layout_box| layout_box.layout_mode())
-    }
-
-    pub(crate) fn is_empty(&self) -> bool {
-        self.boxes.is_empty()
-    }
-
-    pub(crate) fn print_box_tree(&self, doc: &Document, styles: &ComputedStyles) {
-        if !self.boxes.is_empty() {
-            self.print_box_node(doc, styles, 0, 0);
-        }
-    }
-
-    fn print_box_node(&self, doc: &Document, styles: &ComputedStyles, idx: usize, depth: usize) {
-        let indent = "  ".repeat(depth);
-        let b = &self.boxes[idx];
-        let tag = b.get_element(doc).map(|element| element.tag()).unwrap_or("");
-        let dom_id = b.dom_element().map(|i| i.to_string()).unwrap_or("-".into());
-        let display = b.style().and_then(|indices| styles.box_model_style(indices)).map(|style| format!("{:?}", style.display)).unwrap_or("none".into());
-        let mode = match &b.layout_mode {
-            LayoutMode::Block(bb) => format!("Block({:?})", bb.children),
-            LayoutMode::Table(tb) => format!("Table(rows={})", tb.rows.len()),
-            LayoutMode::TableRow(tr) => format!("TableRow(cells={})", tr.cells.len()),
-            LayoutMode::TableCell(tc) => format!("TableCell(colspan={}, rowspan={}, {:?})", tc.colspan, tc.rowspan, tc.children),
-            LayoutMode::Flex(container) => format!("Flex(items={})", container.children.len()),
-            LayoutMode::Grid(container) => format!("Grid(items={})", container.children.len()),
-            LayoutMode::Inline(r) => format!("Inline({}..{})", r.start, r.end),
-            LayoutMode::Anonymous(r) => format!("Anon({}..{})", r.start, r.end),
-        };
-        println!("{}[{}] <{}> dom={} display={} {}", indent, idx, tag, dom_id, display, mode);
-        match &b.layout_mode {
-            LayoutMode::Block(bb) => {
-                if let Children::Blocks(indices) = &bb.children {
-                    for &i in indices {
-                        self.print_box_node(doc, styles, i as usize, depth + 1);
-                    }
-                }
-            }
-            LayoutMode::Table(tb) => {
-                for &i in &tb.rows {
-                    self.print_box_node(doc, styles, i as usize, depth + 1);
-                }
-            }
-            LayoutMode::TableRow(tr) => {
-                for &i in &tr.cells {
-                    self.print_box_node(doc, styles, i as usize, depth + 1);
-                }
-            }
-            LayoutMode::Flex(container) => {
-                for &i in &container.children {
-                    self.print_box_node(doc, styles, i as usize, depth + 1);
-                }
-            }
-            LayoutMode::Grid(container) => {
-                for &i in &container.children {
-                    self.print_box_node(doc, styles, i as usize, depth + 1);
-                }
-            }
-            _ => {}
-        }
     }
 
     pub(crate) fn push_box(&mut self, layout_box: LayoutBox) -> u32 {
@@ -263,17 +198,10 @@ impl LayoutBox {
         self.dom_element
     }
 
-    pub(crate) fn set_dom_element(&mut self, dom_element: Option<u32>) {
-        self.dom_element = dom_element;
-    }
-
     pub(crate) fn parent(&self) -> Option<u32> {
         self.parent
     }
 
-    pub(crate) fn set_parent(&mut self, parent: Option<u32>) {
-        self.parent = parent;
-    }
 }
 
 #[derive(Clone)]

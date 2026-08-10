@@ -57,9 +57,6 @@ impl ShapedTextRun {
         self.ascent
     }
 
-    pub(crate) fn memory_usage_bytes(&self) -> usize {
-        self.advances.len() * std::mem::size_of::<f32>() + self.cluster_boundaries.len() * std::mem::size_of::<bool>() + self.caret_stops.as_ref().map_or(0, |stops| stops.len() * std::mem::size_of::<f32>())
-    }
 }
 
 /// A request to measure one already-normalized, single-style logical run.
@@ -137,6 +134,7 @@ impl ShapedTextGeometry {
         &self.authoritative_runs
     }
 
+    #[cfg(test)]
     pub(crate) fn update_range(&mut self, range: Range<u32>, shaped: &ShapedTextRun) -> bool {
         let start = range.start as usize;
         let end = range.end as usize;

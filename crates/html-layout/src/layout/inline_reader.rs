@@ -27,14 +27,6 @@ impl<'input> InlineReader<'input> {
         self.content
     }
 
-    pub(crate) fn glyph_metrics(&self) -> &'input GlyphMetrics {
-        self.glyph_metrics
-    }
-
-    pub(crate) fn text_geometry(&self) -> Option<&'input crate::shaping::ShapedTextGeometry> {
-        self.text_geometry
-    }
-
     pub(crate) fn inline_item(&self, run_idx: usize) -> Option<&InlineItem> {
         self.content.inline_item(run_idx)
     }
