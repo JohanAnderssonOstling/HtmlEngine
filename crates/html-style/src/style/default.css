@@ -579,13 +579,11 @@ object[usemap] {
  * of clip to such elements and set their overflow-clip-margin to content-box.
  *
  * NOTE(emilio): This rule is very hand-wavy, for now the
- * <embed>/<iframe>/<object> cases are !important to match Blink, but see
+ * <embed>/<object> cases are !important to match Blink, but see
  * https://github.com/whatwg/html/issues/11986 for some discussion about making
  * it explicit.
  */
-canvas,
-img,
-video {
+img {
     overflow-clip-margin: content-box;
     overflow: clip;
 }
@@ -602,16 +600,11 @@ frame {
     border-radius: 0 !important;
 }
 
-iframe {
-    border: 2px inset;
-}
-
 spacer {
     position: static !important;
     float: none !important;
 }
 
-iframe:focus-visible,
 body:focus-visible,
 html:focus-visible {
     /* These elements historically don't show outlines when focused by default.

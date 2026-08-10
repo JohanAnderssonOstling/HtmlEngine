@@ -18,7 +18,7 @@ fn contents_computes_to_none(element: ElementRef<'_>) -> bool {
     if element.image_idx().is_some() {
         return true;
     }
-    element.is_html_element_in_html_document() && ["br", "wbr", "meter", "progress", "canvas", "embed", "object", "audio", "iframe", "img", "video", "input", "textarea", "select"].iter().any(|tag| element.tag().eq_ignore_ascii_case(tag))
+    element.is_html_element_in_html_document() && ["br", "wbr", "meter", "progress", "embed", "object", "audio", "img", "input", "textarea", "select"].iter().any(|tag| element.tag().eq_ignore_ascii_case(tag))
 }
 
 pub(super) fn display_for_style(styles: &ComputedStyles, style: StyleIndices) -> Display {

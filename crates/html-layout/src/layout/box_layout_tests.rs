@@ -52,14 +52,6 @@ fn shrink_to_fit_intrinsic_widths_include_text_indent_on_the_applicable_line() {
 }
 
 #[test]
-fn definite_float_height_transfers_percentage_replaced_height_to_intrinsic_width() {
-    let html = "<!doctype html><html><body style='margin:0'><div id='float' style='float:left;height:100px'><canvas width='10' height='10' style='height:100%'></canvas></div></body></html>";
-    let document = layout_html(html, 600.0);
-
-    assert_eq!(id_geometry(&document, "float").1, Size::new(100.0, 100.0));
-}
-
-#[test]
 fn content_box_width_adds_padding_and_border() {
     let html = "<html><body><div style=\"width:100px; height:50px; padding:10px; border:5px solid black;\">x</div></body></html>";
     let size = div_size(&layout_html(html, 600.0));
@@ -201,30 +193,6 @@ fn resolved_logical_box_properties_reach_layout_as_physical_geometry() {
 
     assert_eq!(size.width, 140.0, "inline size plus resolved left/right padding and borders");
     assert_eq!(size.height, 70.0, "block size plus resolved top/bottom padding and borders");
-}
-
-#[test]
-fn replaced_stretch_fills_its_margin_box_and_preserves_ratio() {
-    let html = "<html><body><div style='width:200px;height:100px'><canvas width='100' height='100' style='width:stretch;margin:5px;padding:2px;border:3px solid'></canvas></div></body></html>";
-    let size = tag_size(&layout_html(html, 600.0), "canvas");
-
-    assert_eq!(size, Size::new(190.0, 190.0));
-}
-
-#[test]
-fn replaced_intrinsic_keyword_transfers_a_definite_opposite_size() {
-    let html = "<html><body><canvas width='100' height='100' style='width:min-content;height:50px;padding:2px;border:3px solid'></canvas></body></html>";
-    let size = tag_size(&layout_html(html, 600.0), "canvas");
-
-    assert_eq!(size, Size::new(60.0, 60.0));
-}
-
-#[test]
-fn flex_replaced_border_box_ratio_uses_the_content_box() {
-    let html = "<html><body><div style='display:flex;width:40px;height:40px;align-items:flex-start'><canvas width='16' height='16' style='box-sizing:border-box;width:30px;min-width:0;min-height:0;padding:1px 2px 3px 4px'></canvas></div></body></html>";
-    let size = tag_size(&layout_html(html, 600.0), "canvas");
-
-    assert_eq!(size, Size::new(30.0, 28.0));
 }
 
 #[test]

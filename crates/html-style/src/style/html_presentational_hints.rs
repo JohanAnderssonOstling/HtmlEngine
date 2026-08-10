@@ -40,7 +40,7 @@ pub(super) fn apply(doc: &Document, node_idx: DomNodeId, style: &mut WorkingStyl
         style.box_model.display = Display::None;
     }
 
-    if matches!(tag.to_ascii_lowercase().as_str(), "img" | "object" | "embed" | "iframe" | "input" | "video") {
+    if matches!(tag.to_ascii_lowercase().as_str(), "img" | "object" | "embed" | "input") {
         apply_replaced_dimensions(doc, node_idx, style);
     }
     if matches!(tag.to_ascii_lowercase().as_str(), "table" | "td" | "th" | "col" | "colgroup" | "hr")
@@ -90,7 +90,7 @@ pub(super) fn apply(doc: &Document, node_idx: DomNodeId, style: &mut WorkingStyl
     {
         style.box_model.clear = clear;
     }
-    if matches!(tag.to_ascii_lowercase().as_str(), "img" | "object" | "input" | "iframe" | "embed") {
+    if matches!(tag.to_ascii_lowercase().as_str(), "img" | "object" | "input" | "embed") {
         apply_html_replaced_alignment_hint(doc, node_idx, style);
         apply_html_replaced_spacing_hints(doc, node_idx, style);
     }
@@ -298,7 +298,7 @@ fn html_hr_width_hint(value: &str) -> Option<PreferredSize> {
 
 fn apply_html_align_hint(tag: &str, value: &str, style: &mut WorkingStyle) {
     let value = value.trim();
-    if matches!(tag.to_ascii_lowercase().as_str(), "img" | "object" | "input" | "iframe" | "embed") {
+    if matches!(tag.to_ascii_lowercase().as_str(), "img" | "object" | "input" | "embed") {
         return;
     }
     if tag.eq_ignore_ascii_case("table") {

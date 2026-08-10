@@ -113,11 +113,6 @@ impl<'input> ReplacedReader<'input> {
             let (width, height) = self.image_display_size(image_idx);
             return Some(Size::new(width, height));
         }
-        if !element.tag().eq_ignore_ascii_case("canvas") {
-            return None;
-        }
-        let width = element.attr("width").and_then(|value| value.parse::<u32>().ok()).unwrap_or(300);
-        let height = element.attr("height").and_then(|value| value.parse::<u32>().ok()).unwrap_or(150);
-        Some(Size::new(width as f64, height as f64))
+        None
     }
 }
