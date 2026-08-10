@@ -517,12 +517,7 @@ mod tests {
 
     #[test]
     fn first_html_base_resolves_stylesheets_and_images_once() {
-        let provider = Arc::new(MemoryProvider {
-            resources: HashMap::from([
-                ("book/resources/style.css".to_owned(), b"p { color: green; }".to_vec()),
-                ("book/resources/cat.png".to_owned(), Vec::new()),
-            ]),
-        });
+        let provider = Arc::new(MemoryProvider { resources: HashMap::from([("book/resources/style.css".to_owned(), b"p { color: green; }".to_vec()), ("book/resources/cat.png".to_owned(), Vec::new())]) });
         let html = r#"
             <html><head>
                 <base href="resources/">

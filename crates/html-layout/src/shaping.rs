@@ -1384,8 +1384,12 @@ pub(crate) fn first_letter_style_overrides(document: &Document, styles: &Compute
     let mut consumed_owners = FxHashSet::<u32>::default();
     for (root, content) in content_by_root {
         let Some(mut start) = content.iter().position(|(_, character, _)| !character.is_whitespace()) else { continue };
-        let Some((owner, pseudo_style)) = pseudo_style_owner(document, styles, layout_tree, root, PseudoStyleKind::FirstLetter) else { continue };
+        consume_blocked_first_letter_owners(document, styles, layout_tree, root, &mut consumed_owners);
+        let Some((owner, pseudo_style, eligible)) = pseudo_style_owner(document, styles, layout_tree, root, PseudoStyleKind::FirstLetter) else { continue };
         if !consumed_owners.insert(owner.raw()) {
+            continue;
+        }
+        if !eligible {
             continue;
         }
 
@@ -1418,6 +1422,43 @@ pub(crate) fn first_letter_style_overrides(document: &Document, styles: &Compute
     overrides
 }
 
+/// A flex or grid container does not expose a first formatted letter from its
+/// items to its own (or an ancestor's) `::first-letter`. Those blocked owners
+/// still have to be consumed in source order: otherwise an ancestor pseudo
+/// incorrectly skips the container and styles text in a later sibling.
+fn consume_blocked_first_letter_owners(document: &Document, styles: &ComputedStyles, layout_tree: &LayoutTree, mut root: usize, consumed_owners: &mut FxHashSet<u32>) {
+    let mut crossed_flex_or_grid = false;
+    loop {
+        if crossed_flex_or_grid {
+            if let Some(node) = layout_tree.get_box_dom_element(root).and_then(|raw| document.node_id_from_raw(raw)) {
+                if styles.first_letter_style_for_node(node).is_some() {
+                    consumed_owners.insert(node.raw());
+                }
+            }
+        }
+
+        let Some(parent) = layout_tree.get_box_parent(root) else { break };
+        if matches!(layout_tree.box_at(parent).map(|box_| box_.layout_mode()), Some(LayoutMode::Flex(_) | LayoutMode::Grid(_))) {
+            crossed_flex_or_grid = true;
+        }
+        root = parent;
+    }
+}
+
+fn pseudo_owner_is_blocked_at_root(layout_tree: &LayoutTree, mut root: usize, owner: html_dom::DomNodeId) -> bool {
+    let mut crossed_flex_or_grid = false;
+    loop {
+        if crossed_flex_or_grid && layout_tree.get_box_dom_element(root) == Some(owner.raw()) {
+            return true;
+        }
+        let Some(parent) = layout_tree.get_box_parent(root) else { return false };
+        if matches!(layout_tree.box_at(parent).map(|box_| box_.layout_mode()), Some(LayoutMode::Flex(_) | LayoutMode::Grid(_))) {
+            crossed_flex_or_grid = true;
+        }
+        root = parent;
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum PseudoStyleKind {
     FirstLine,
@@ -1428,7 +1469,8 @@ pub(crate) enum PseudoStyleKind {
 /// inline formatting context. Walking layout ancestry is essential because
 /// CSS defines the first formatted line/letter through in-flow block
 /// descendants, not only through text directly owned by the styled element.
-pub(crate) fn pseudo_style_owner(document: &Document, styles: &ComputedStyles, layout_tree: &LayoutTree, mut root: usize, kind: PseudoStyleKind) -> Option<(html_dom::DomNodeId, StyleIndices)> {
+pub(crate) fn pseudo_style_owner(document: &Document, styles: &ComputedStyles, layout_tree: &LayoutTree, mut root: usize, kind: PseudoStyleKind) -> Option<(html_dom::DomNodeId, StyleIndices, bool)> {
+    let mut eligible = true;
     loop {
         if let Some(node) = layout_tree.get_box_dom_element(root).and_then(|raw| document.node_id_from_raw(raw)) {
             let style = match kind {
@@ -1436,10 +1478,18 @@ pub(crate) fn pseudo_style_owner(document: &Document, styles: &ComputedStyles, l
                 PseudoStyleKind::FirstLetter => styles.first_letter_style_for_node(node),
             };
             if let Some(style) = style {
-                return Some((node, style));
+                return Some((node, style, eligible));
             }
         }
-        root = layout_tree.get_box_parent(root)?;
+        let parent = layout_tree.get_box_parent(root)?;
+        // Pseudos on an item itself remain eligible, but crossing into its
+        // flex/grid container blocks pseudos found on that container or any
+        // ancestor. Keep searching so the blocked owner is still consumed in
+        // source order instead of incorrectly applying to a later sibling.
+        if matches!(layout_tree.box_at(parent).map(|box_| box_.layout_mode()), Some(LayoutMode::Flex(_) | LayoutMode::Grid(_))) {
+            eligible = false;
+        }
+        root = parent;
     }
 }
 
@@ -1448,32 +1498,41 @@ pub(crate) fn pseudo_style_owner(document: &Document, styles: &ComputedStyles, l
 /// in-flow block descendant. Only the first text-contributing root owned by a
 /// pseudo-element is eligible.
 pub(crate) fn first_line_style_for_inline_root(document: &Document, styles: &ComputedStyles, layout_tree: &LayoutTree, inline_content: &InlineContent, root: usize) -> Option<StyleIndices> {
-    let (owner, style) = pseudo_style_owner(document, styles, layout_tree, root, PseudoStyleKind::FirstLine)?;
+    let (owner, style, eligible) = pseudo_style_owner(document, styles, layout_tree, root, PseudoStyleKind::FirstLine)?;
+    if !eligible {
+        return None;
+    }
     for run in inline_content.inline_items() {
         let (InlineItemKind::Text { glyphs } | InlineItemKind::Marker { glyphs }) = &run.kind else { continue };
         if glyphs.start >= glyphs.end {
             continue;
         }
         let candidate_root = whitespace_context_root(layout_tree, run.box_idx as usize);
-        let Some((candidate_owner, _)) = pseudo_style_owner(document, styles, layout_tree, candidate_root, PseudoStyleKind::FirstLine) else { continue };
+        let Some((candidate_owner, _, candidate_eligible)) = pseudo_style_owner(document, styles, layout_tree, candidate_root, PseudoStyleKind::FirstLine) else { continue };
         if candidate_owner == owner {
-            return (candidate_root == root).then_some(style);
+            return (candidate_root == root && candidate_eligible).then_some(style);
         }
     }
     None
 }
 
 pub(crate) fn first_letter_style_for_inline_root(document: &Document, styles: &ComputedStyles, layout_tree: &LayoutTree, inline_content: &InlineContent, root: usize) -> Option<StyleIndices> {
-    let (owner, style) = pseudo_style_owner(document, styles, layout_tree, root, PseudoStyleKind::FirstLetter)?;
+    let (owner, style, eligible) = pseudo_style_owner(document, styles, layout_tree, root, PseudoStyleKind::FirstLetter)?;
+    if !eligible {
+        return None;
+    }
     for run in inline_content.inline_items() {
         let InlineItemKind::Text { glyphs } = &run.kind else { continue };
         if glyphs.start >= glyphs.end {
             continue;
         }
         let candidate_root = whitespace_context_root(layout_tree, run.box_idx as usize);
-        let Some((candidate_owner, _)) = pseudo_style_owner(document, styles, layout_tree, candidate_root, PseudoStyleKind::FirstLetter) else { continue };
+        if pseudo_owner_is_blocked_at_root(layout_tree, candidate_root, owner) {
+            return None;
+        }
+        let Some((candidate_owner, _, candidate_eligible)) = pseudo_style_owner(document, styles, layout_tree, candidate_root, PseudoStyleKind::FirstLetter) else { continue };
         if candidate_owner == owner {
-            return (candidate_root == root).then_some(style);
+            return (candidate_root == root && candidate_eligible).then_some(style);
         }
     }
     None

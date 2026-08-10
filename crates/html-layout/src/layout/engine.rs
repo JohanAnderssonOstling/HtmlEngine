@@ -87,7 +87,7 @@ impl Clone for LayoutScratch {
 
 impl LayoutScratch {
     #[cfg(test)]
-    pub(crate) fn allocation_capacities(&self) -> ((usize, usize), (usize, usize, usize, usize, usize)) {
+    pub(crate) fn allocation_capacities(&self) -> ((usize, usize), (usize, usize, usize, usize, usize, usize)) {
         ((self.line_owners.capacity(), self.block_decoration_owners.capacity()), self.finalization.allocation_capacities())
     }
 }

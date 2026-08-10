@@ -59,6 +59,19 @@ pub(crate) fn measure_box_isolated(session: &mut LayoutEngine<'_, '_>, box_idx: 
     measured
 }
 
+/// Measures the natural border-box block size without allowing authored
+/// height/min/max-height to turn the probe into a specified-size measurement.
+/// Flexbox uses this for a non-replaced item's content-size suggestion.
+pub(crate) fn measure_intrinsic_block_size_isolated(session: &mut LayoutEngine<'_, '_>, box_idx: usize, available_width: f64) -> Size {
+    let (measured, float_bottom) = with_isolated_measurement(session, |session| {
+        session.geometry.set_point(box_idx, Point::ZERO);
+        session.layout_box(crate::layout::BoxLayoutRequest::normal(box_idx, available_width.max(0.0), None).for_intrinsic_block_measurement())
+    });
+    let mut measured = measured.size;
+    measured.height = measured.height.max(float_bottom);
+    measured
+}
+
 /// Measures an already-resolved box without repeating style, intrinsic, or
 /// replaced-size resolution in the disposable pass.
 pub(crate) fn measure_resolved_box_isolated(session: &mut LayoutEngine<'_, '_>, resolved: super::box_sizing::ResolvedBoxSizing) -> Size {
@@ -76,10 +89,24 @@ pub(crate) fn measure_resolved_box_isolated(session: &mut LayoutEngine<'_, '_>, 
 /// in-flow line baselines it publishes. Inline tables use the first baseline;
 /// inline-blocks use the last when overflow remains visible.
 pub(crate) fn measure_box_width_and_baselines_isolated(session: &mut LayoutEngine<'_, '_>, box_idx: usize, containing_width: f64, assigned_width: f64, parent_content_height: Option<f64>) -> (Size, Option<f64>, Option<f64>) {
+    measure_box_with_baselines_isolated(
+        session,
+        box_idx,
+        crate::layout::BoxLayoutRequest::width_assigned(box_idx, containing_width.max(0.0), assigned_width.max(0.0), parent_content_height),
+    )
+}
+
+/// Measures an atomic box using its normal formatting-context sizing while
+/// retaining the baselines needed by inline placement.
+pub(crate) fn measure_box_and_baselines_isolated(session: &mut LayoutEngine<'_, '_>, box_idx: usize, available_width: f64, parent_content_height: Option<f64>) -> (Size, Option<f64>, Option<f64>) {
+    measure_box_with_baselines_isolated(session, box_idx, crate::layout::BoxLayoutRequest::normal(box_idx, available_width.max(0.0), parent_content_height))
+}
+
+fn measure_box_with_baselines_isolated(session: &mut LayoutEngine<'_, '_>, box_idx: usize, request: crate::layout::BoxLayoutRequest) -> (Size, Option<f64>, Option<f64>) {
     with_isolated_measurement(session, |session| {
         session.geometry.set_point(box_idx, Point::ZERO);
-        let layout = session.layout_box(crate::layout::BoxLayoutRequest::width_assigned(box_idx, containing_width.max(0.0), assigned_width.max(0.0), parent_content_height));
-        let first_baseline = session.fragments.first_baseline_offset(layout.output.lines.clone(), 0.0).or_else(|| {
+        let layout = session.layout_box(request);
+        let first_baseline = session.fragments.first_baseline_offset(layout.output.lines.clone(), 0.0).or_else(|| session.flex_grid.container_first_baseline(box_idx)).or_else(|| {
             // An inline-table exposes the first row baseline. If that row has
             // no in-flow line box, CSS synthesizes it at the row's bottom
             // content edge. Capture it while isolated table geometry is still

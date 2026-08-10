@@ -1,0 +1,43 @@
+# Mismatches under an exact prefix remain exercised through the ordinary known
+# failure ledger, but are classified as unsupported dependency syntax rather
+# than renderer conformance failures. Passing assertions under the same prefix
+# remain active.
+css-align/parsing/column-gap-invalid.html|reason=pinned Lightning CSS accepts unitless and negative gap values that CSS Box Alignment rejects; the typed renderer boundary discards negative values without adding a second parser
+css-align/parsing/gap-invalid.html|reason=pinned Lightning CSS accepts negative gap values that CSS Box Alignment rejects; the typed renderer boundary discards them without adding a second parser
+css-align/parsing/row-gap-invalid.html|reason=pinned Lightning CSS accepts negative gap values that CSS Box Alignment rejects; the typed renderer boundary discards them without adding a second parser
+css-align/parsing/justify-items-computed.html|reason=pinned Lightning CSS does not represent the bare legacy justify-items value; html-style does not implement a second CSS parser
+css-align/parsing/justify-items-valid.html|reason=pinned Lightning CSS does not represent the bare legacy justify-items value; html-style does not implement a second CSS parser
+css-align/parsing/place-items-computed.html|reason=pinned Lightning CSS does not represent the bare legacy justify-items component; html-style does not implement a second CSS parser
+css-align/parsing/place-items-valid.html|reason=pinned Lightning CSS does not represent the bare legacy justify-items component; html-style does not implement a second CSS parser
+css-color/|reason=modern color syntax not represented reliably by pinned Lightning CSS; html-style does not implement a second CSS parser
+css-flexbox/|reason=remaining intrinsic flex-basis keywords, nonnegative length grammar, and modern calc functions are not represented reliably by pinned Lightning CSS; the renderer consumes only typed values and does not implement a second CSS parser
+css-grid/|reason=remaining Grid Level 2, subgrid, and grammar divergences are not represented reliably by pinned Lightning CSS; html-style consumes only typed values and does not implement a second CSS parser
+css-lists/parsing/list-style-type-invalid.html|reason=pinned Lightning CSS accepts symbols() arities that CSS Counter Styles rejects; unsupported marker algorithms are discarded at the typed renderer boundary without adding a second parser
+css-logical/|reason=remaining negative logical size and border-width grammar mismatches are accepted by pinned Lightning CSS; html-style discards invalid typed values at its boundary and does not implement a second CSS parser
+css-tables/parsing/border-spacing-invalid.html|reason=pinned Lightning CSS accepts negative and unitless border-spacing lengths; the typed renderer boundary discards negative values without adding a second parser
+css-text/|reason=remaining modern text-transform and word-break values, advanced calc functions, legacy text-justify aliasing, and unitless length validation are not represented reliably by pinned Lightning CSS; unsupported typed values are discarded without adding a second parser
+css-masking/|reason=CSS clipping and masking are not implemented by the style, layout, or paint pipeline
+css-transforms/|reason=CSS transforms are intentionally outside the document renderer scope and no transformed paint or interaction geometry is implemented
+css-inline/parsing/vertical-align-|reason=CSS Inline Level 3 vertical-align grammar is not exposed by pinned Lightning CSS; unsupported values are not represented downstream
+css-overflow/parsing/text-overflow-|reason=custom text-overflow string markers are not exposed by pinned Lightning CSS; clip and ellipsis remain active and are rendered
+css-backgrounds/parsing/background-image|reason=background images are not implemented
+css-backgrounds/parsing/background-clip|reason=background clipping is not implemented
+css-backgrounds/parsing/background-position|reason=background image positioning is not implemented
+css-backgrounds/parsing/background-size|reason=background image sizing is not implemented
+css-backgrounds/parsing/background-computed.html|reason=the mismatches exercise unimplemented background clipping layers
+css-backgrounds/parsing/background-valid.html|reason=the mismatches exercise unimplemented background clipping values
+css-backgrounds/parsing/border-radius|reason=remaining parsing and serialization mismatches belong to the pinned LightningCSS grammar
+css-backgrounds/parsing/webkit-border-radius|reason=remaining prefixed parsing and serialization mismatches belong to the pinned LightningCSS grammar
+css-backgrounds/parsing/border-image|reason=border images are not implemented
+css-backgrounds/parsing/box-shadow|reason=box shadow painting is not implemented
+filter-effects/|reason=filter and backdrop-filter require an unimplemented offscreen paint and compositing pipeline
+css-transitions/|reason=the noninteractive renderer has no animation clock, interpolated style state, or frame-driven restyling
+css-animations/|reason=the noninteractive renderer has no animation clock, keyframe state, or frame-driven restyling
+css-break/parsing/break-after-invalid.html|reason=pinned Lightning CSS accepts invalid break-after combinations; html-style consumes the dependency grammar and does not implement a second CSS parser
+css-break/parsing/break-before-invalid.html|reason=pinned Lightning CSS accepts invalid break-before combinations; html-style consumes the dependency grammar and does not implement a second CSS parser
+css-break/parsing/break-inside-invalid.html|reason=pinned Lightning CSS accepts invalid break-inside combinations; html-style consumes the dependency grammar and does not implement a second CSS parser
+css-break/parsing/orphans-invalid.html|reason=pinned Lightning CSS accepts zero, negative, fractional, and calculated orphans values rejected by the CSS grammar; html-style does not implement a second parser
+css-break/parsing/widows-invalid.html|reason=pinned Lightning CSS accepts zero, negative, fractional, and calculated widows values rejected by the CSS grammar; html-style does not implement a second parser
+css-fonts/parsing/font-feature-settings-invalid.html|reason=pinned Lightning CSS alpha.72 accepts malformed font-feature-settings values; html-style consumes only its typed grammar and does not implement a second parser
+css-fonts/parsing/font-variant-ligatures-invalid.html|reason=pinned Lightning CSS alpha.72 accepts mutually contradictory or duplicated font-variant-ligatures values; html-style does not implement a second parser
+css-fonts/parsing/font-variant-numeric-invalid.html|reason=pinned Lightning CSS alpha.72 accepts mutually contradictory or duplicated font-variant-numeric values; html-style does not implement a second parser

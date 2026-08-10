@@ -1,5 +1,6 @@
 pub mod box_syntax;
 pub mod capabilities;
+pub(crate) mod contain;
 pub mod declarations;
 pub mod imports;
 pub mod media;

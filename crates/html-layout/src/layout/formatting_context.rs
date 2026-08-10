@@ -39,7 +39,7 @@ pub(super) fn layout_taffy_container(
     shrink_to_fit: bool, available_width: f64, horizontal_noncontent: f64, min_width: PreferredSize, max_width: PreferredSize, border_box_inset: f64,
 ) -> Size {
     let layout_width = if shrink_to_fit {
-        let (min_content, max_content) = crate::flex_grid::intrinsic_widths(engine, box_idx, children, kind);
+        let (min_content, max_content) = crate::flex_grid::intrinsic_widths_with_constraints(engine, box_idx, children, kind, None, percentage_height_basis);
         let available_content = (available_width - horizontal_noncontent).max(0.0);
         constrain_content_width(max_content.min(available_content.max(min_content)), min_width, max_width, available_width, border_box_inset)
     } else {

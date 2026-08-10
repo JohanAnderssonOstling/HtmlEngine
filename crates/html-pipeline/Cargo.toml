@@ -11,3 +11,6 @@ html-parse = { path = "../html-parse" }
 html-layout = { path = "../html-layout" }
 html-resources = { path = "../html-resources" }
 encoding_rs.workspace = true
+
+[dev-dependencies]
+html-wpt-test-support = { path = "../../test-support/html-wpt" }

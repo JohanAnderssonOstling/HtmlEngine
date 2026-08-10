@@ -6,6 +6,7 @@ pub(super) struct TableCellPlacement {
     pub(super) row: usize,
     pub(super) col: usize,
     pub(super) colspan: usize,
+    pub(super) source_colspan: usize,
     pub(super) rowspan: usize,
 }
 
@@ -60,7 +61,7 @@ pub(super) fn build_table_grid(rows: impl IntoIterator<Item = Vec<(usize, usize,
             for covered_col in col..end_col {
                 carry_rowspans[covered_col] = carry_rowspans[covered_col].max(rowspan);
             }
-            placements.push(TableCellPlacement { cell_idx, row: row_idx, col, colspan, rowspan });
+            placements.push(TableCellPlacement { cell_idx, row: row_idx, col, colspan, source_colspan: colspan, rowspan });
             col = end_col;
             max_columns = max_columns.max(end_col);
         }
@@ -123,40 +124,6 @@ pub(super) fn resolve_column_widths(min_widths: &[f64], max_widths: &[f64], pref
         widths[index] += extra;
     }
     widths
-}
-
-pub(super) fn distribute_deficit(widths: &mut [f64], start: usize, end: usize, deficit: f64) {
-    if deficit <= 0.0 || start >= end {
-        return;
-    }
-    let weight_sum = widths[start..end].iter().map(|width| width.max(1.0)).sum::<f64>();
-    if weight_sum <= 0.0 {
-        let add = deficit / (end - start) as f64;
-        for width in &mut widths[start..end] {
-            *width += add;
-        }
-        return;
-    }
-    for width in &mut widths[start..end] {
-        *width += deficit * (width.max(1.0) / weight_sum);
-    }
-}
-
-pub(super) fn distribute_surplus(widths: &mut [f64], mins: &[f64], start: usize, end: usize, surplus: f64) {
-    if surplus <= 0.0 || start >= end {
-        return;
-    }
-    let shrink_capacity = (start..end).map(|index| (widths[index] - mins[index]).max(0.0)).sum::<f64>();
-    if shrink_capacity <= 0.0 {
-        return;
-    }
-    let shrink = surplus.min(shrink_capacity);
-    for index in start..end {
-        let capacity = (widths[index] - mins[index]).max(0.0);
-        if capacity > 0.0 {
-            widths[index] -= shrink * (capacity / shrink_capacity);
-        }
-    }
 }
 
 enum DistributionWeight<'a> {

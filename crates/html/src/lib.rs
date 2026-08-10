@@ -55,6 +55,36 @@ pub mod render {
 #[cfg(feature = "testing")]
 pub mod testing {
     pub use html_wpt_test_support::*;
+
+    pub use html_parse::HtmlQuirksMode as QuirksMode;
+
+    /// Classifies an HTML document without exposing parser implementation
+    /// packages to adapter-level conformance suites.
+    pub fn document_quirks_mode(bytes: &[u8]) -> QuirksMode {
+        html_parse::parse_html_document_bytes(bytes, None).quirks_mode()
+    }
+
+    /// Reports whether a WPT document carries the server-dependent `http`
+    /// flag. Static UI adapters use this to maintain an explicit unsupported
+    /// ledger without depending on parser syntax-tree types.
+    pub fn document_requires_http(bytes: &[u8], uri: &str) -> Result<bool, String> {
+        let source = String::from_utf8_lossy(bytes);
+        let parsed = html_parse::parse_document(&source, html_parse::MarkupSyntax::from_uri(uri)).map_err(|error| error.to_string())?;
+        Ok(syntax_nodes_have_http_flag(&parsed.syntax_tree().nodes))
+    }
+
+    fn syntax_nodes_have_http_flag(nodes: &[html_parse::HtmlSyntaxNode]) -> bool {
+        nodes.iter().any(|node| match node {
+            html_parse::HtmlSyntaxNode::Element(element) => {
+                let is_http_flag = element.local_name.eq_ignore_ascii_case("meta")
+                    && element.attributes.iter().any(|attribute| attribute.local_name.eq_ignore_ascii_case("name") && attribute.value.eq_ignore_ascii_case("flags"))
+                    && element.attributes.iter().find(|attribute| attribute.local_name.eq_ignore_ascii_case("content")).is_some_and(|attribute| attribute.value.split_ascii_whitespace().any(|flag| flag.eq_ignore_ascii_case("http")));
+                is_http_flag || syntax_nodes_have_http_flag(&element.children)
+            }
+            html_parse::HtmlSyntaxNode::TemplateContents(children) => syntax_nodes_have_http_flag(children),
+            _ => false,
+        })
+    }
 }
 
 pub mod engine {

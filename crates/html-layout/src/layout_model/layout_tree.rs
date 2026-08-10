@@ -365,6 +365,7 @@ pub(crate) struct TableColumnGroupSpan {
 #[derive(Clone, Copy)]
 pub(crate) struct TableColumnWidthHint {
     pub style: StyleIndices,
+    pub fallback_style: Option<StyleIndices>,
 }
 
 impl TableBox {

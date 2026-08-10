@@ -18,7 +18,7 @@ members = [
 kurbo = "0.11.3"
 peniko = "0.2.0"
 lightningcss = { version = "1.0.0-alpha.72", features = ["substitute_variables"] }
-taffy = { version = "0.10.1", default-features = false, features = ["std", "taffy_tree", "flexbox", "grid"] }
+taffy = { version = "0.13.0", default-features = false, features = ["std", "taffy_tree", "flexbox", "grid"] }
 parcel_selectors = "0.28.2"
 scraper = "0.27"
 html5ever = "0.39"

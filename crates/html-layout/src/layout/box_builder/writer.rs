@@ -1,5 +1,5 @@
 use crate::layout_model::{Children, GlyphId, InlineContent, InlineItem, InlineItemKind, LayoutBox, LayoutMode, LayoutTree, ListItemMarker, TableCellBox, TableColumnGroupSpan, TableColumnTrack, TableColumnWidthHint, TableRowBox};
-use html_style_model::{ComputedStyles, ListStylePosition, StyleIndices, StyleView};
+use html_style_model::{ComputedStyles, Display, ListStylePosition, StyleIndices, StyleView};
 use std::ops::Range;
 
 use super::inline::GeneratedInlinePlan;
@@ -204,6 +204,20 @@ impl<'styles, 'out> BoxTreeWriter<'styles, 'out> {
 
     pub(super) fn emit_generated_inline(&mut self, parent: u32, plan: GeneratedInlinePlan) {
         let GeneratedInlinePlan { content, start_edge, end_edge } = plan;
+        if content.display == Display::InlineBlock {
+            // Generated inline-blocks are atomic inline-level boxes. Keeping
+            // them as text-only inline fragments would discard their authored
+            // width, height, and baseline contribution when `content` is empty.
+            let pseudo_box = self.tree.push_box(LayoutBox {
+                layout_mode: LayoutMode::Block(crate::layout_model::BlockBox { children: Children::Empty }),
+                dom_element: None,
+                parent: Some(parent),
+                style: Some(content.style),
+            });
+            self.set_generated_text_children(pseudo_box, content.style, &content.text, false);
+            self.push_item(InlineItemKind::AtomicBox { box_idx: pseudo_box }, pseudo_box, None);
+            return;
+        }
         let start = self.item_position();
         let style = if content.display == html_style_model::Display::Contents { self.styles.anonymous_box_indices(content.style) } else { Some(content.style) };
         let pseudo_box = self.tree.push_box(LayoutBox { layout_mode: LayoutMode::Inline(Range::default()), dom_element: None, parent: Some(parent), style });

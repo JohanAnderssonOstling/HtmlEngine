@@ -1,6 +1,6 @@
 use crate::layout_model::{Children, GlyphMetrics, InlineContent, InlineItemKind, LayoutBox, LayoutMode, LayoutTree, ListItemMarker};
 use crate::shaping::{FontRelativeMetrics, ShapedFontMetrics};
-use html_style_model::{ComputedStyles, Float, PositionMode, StyleIndices, UsedStyleView};
+use html_style_model::{ComputedStyles, Float, LayoutStyle, PositionMode, StyleIndices, UsedStyleView};
 
 /// Shared read-only access to styled layout topology. Specialized layout
 /// contexts compose this capability instead of reimplementing style lookup and
@@ -51,6 +51,11 @@ impl<'input> LayoutReader<'input> {
 
     pub(crate) fn box_style_indices(&self, box_idx: usize) -> Option<StyleIndices> {
         self.topology.get_box_style_indices(box_idx)
+    }
+
+    pub(crate) fn layout_style(&self, box_idx: usize) -> &'input LayoutStyle {
+        let indices = self.box_style_indices(box_idx).unwrap_or_else(|| self.styles.default_indices());
+        self.styles.layout_style(indices).expect("validated style handle")
     }
 
     pub(crate) fn inline_fragment_edges(&self, box_idx: usize) -> (bool, bool) {
@@ -142,6 +147,24 @@ impl<'input> LayoutReader<'input> {
         self.topology.body_box()
     }
 
+    /// CSS Overflow propagates the HTML body element's overflow to the
+    /// viewport when both root axes are `visible`. The body's used overflow
+    /// then becomes `visible`, so it must not create a block formatting
+    /// context or clip its own descendants.
+    pub(crate) fn effective_overflow_modes(&self, box_idx: usize) -> (html_style_model::OverflowMode, html_style_model::OverflowMode) {
+        let style = self.style(box_idx);
+        if self.body_box() == Some(box_idx)
+            && self.root_box().is_some_and(|root_idx| {
+                let root = self.style(root_idx);
+                root.overflow_x() == html_style_model::OverflowMode::Visible && root.overflow_y() == html_style_model::OverflowMode::Visible
+            })
+        {
+            (html_style_model::OverflowMode::Visible, html_style_model::OverflowMode::Visible)
+        } else {
+            (style.overflow_x(), style.overflow_y())
+        }
+    }
+
     /// Whether this box supplies the canvas background instead of painting a
     /// separate element background. CSS propagates the root background to the
     /// canvas; for HTML documents whose root has no background, the body
@@ -195,12 +218,13 @@ impl<'input> LayoutReader<'input> {
 
     pub(crate) fn box_uses_float_context(&self, box_idx: usize) -> bool {
         let style = self.style(box_idx);
+        let (overflow_x, overflow_y) = self.effective_overflow_modes(box_idx);
         let is_flex_grid_item = self.get_parent(box_idx).is_some_and(|parent| self.is_flex_grid_box(parent));
         self.is_table_box(box_idx)
             || super::block::establishes_formatting_context(
                 style.display(),
-                style.overflow_x(),
-                style.overflow_y(),
+                overflow_x,
+                overflow_y,
                 matches!(style.float(), Float::Left | Float::Right),
                 self.root_box() == Some(box_idx),
                 self.is_table_cell_box(box_idx),

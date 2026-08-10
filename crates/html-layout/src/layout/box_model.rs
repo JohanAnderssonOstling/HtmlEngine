@@ -78,7 +78,7 @@ impl ResolvedBoxModel {
         self.margin_left + self.margin_right
     }
 
-    pub(super) fn vertical_margin(self) -> f64 {
+    pub(crate) fn vertical_margin(self) -> f64 {
         self.margin_top + self.margin_bottom
     }
 
@@ -104,9 +104,5 @@ impl ResolvedBoxModel {
 
     pub(crate) fn vertical_padding_border(self) -> f64 {
         self.vertical_padding() + self.vertical_border()
-    }
-
-    pub(crate) fn horizontal_noncontent(self) -> f64 {
-        self.horizontal_margin() + self.horizontal_padding_border()
     }
 }

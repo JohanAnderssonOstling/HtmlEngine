@@ -1,5 +1,5 @@
 use html_style::{PropertyCapability, PropertyValueSyntax, UnsupportedStyleFeature, declaration_support, property_value_syntax, selector_syntax_is_valid, stylesheet_syntax_is_valid};
-use html_wpt_test_support::{CssParsingTestKind, extract_css_parsing_tests_with_prelude, relative_script_references};
+use html_wpt_test_support::{CssParsingTestKind, extract_css_parsing_tests_with_prelude, relative_script_references, wpt_root};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -11,7 +11,7 @@ const IGNORED_RUNS: &str = include_str!("../../../testdata/wpt/ignored-css-parsi
 
 #[test]
 fn runs_vendored_declarative_css_parsing_tests_directly() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/wpt/css");
+    let root = wpt_root().join("css");
     let mut files = Vec::new();
     collect_html_files(&root, &mut files);
     files.sort();

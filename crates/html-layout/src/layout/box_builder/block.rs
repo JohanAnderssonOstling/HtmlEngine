@@ -51,14 +51,7 @@ pub(super) fn plan_block_children(document: &Document, styles: &ComputedStyles, 
 }
 
 fn append_children(
-    document: &Document,
-    styles: &ComputedStyles,
-    element: html_dom::ElementRef<'_>,
-    wrap_table_internals: bool,
-    before_pending: &mut bool,
-    inline_segment: &mut Vec<u32>,
-    table_segment: &mut Vec<u32>,
-    actions: &mut Vec<BlockChildAction>,
+    document: &Document, styles: &ComputedStyles, element: html_dom::ElementRef<'_>, wrap_table_internals: bool, before_pending: &mut bool, inline_segment: &mut Vec<u32>, table_segment: &mut Vec<u32>, actions: &mut Vec<BlockChildAction>,
 ) {
     for child_id in element.children() {
         match document.node_ref(child_id) {

@@ -1,13 +1,19 @@
 use super::box_model::UsedBorderInsets;
-use html_style_model::{TextDirection, UsedPreferredSize as PreferredSize, UsedStyleView, resolve_used_preferred_size};
+use html_style_model::{BoxSizing, TextDirection, UsedPreferredSize as PreferredSize, UsedStyleView, resolve_used_preferred_size};
 use kurbo::Size;
 
 /// `border_box_inset` is the padding+border to subtract from a specified size
 /// under `box-sizing: border-box` (0 for `content-box`); `auto` is unaffected.
 pub(crate) fn resolve_vertical_size(size: PreferredSize, parent_content_height: Option<f64>, border_box_inset: f64) -> Option<f64> {
+    resolve_vertical_size_with_stretch_inset(size, parent_content_height, border_box_inset, border_box_inset)
+}
+
+pub(crate) fn resolve_vertical_size_with_stretch_inset(size: PreferredSize, parent_content_height: Option<f64>, border_box_inset: f64, stretch_inset: f64) -> Option<f64> {
     match size {
         PreferredSize::Auto | PreferredSize::MinContent | PreferredSize::MaxContent | PreferredSize::FitContent => None,
-        PreferredSize::Stretch => parent_content_height.map(|height| (height - border_box_inset).max(0.0)),
+        // Unlike a percentage, stretch fits the margin box into the
+        // containing block. The result stored by layout is a content size.
+        PreferredSize::Stretch => parent_content_height.map(|height| (height - stretch_inset).max(0.0)),
         PreferredSize::Px(px) => Some((px as f64 - border_box_inset).max(0.0)),
         PreferredSize::Percent(pct) => parent_content_height.map(|height| (height * pct as f64 - border_box_inset).max(0.0)),
         PreferredSize::Calc { absolute_px, percentage, percentage_dependent } => {
@@ -27,16 +33,39 @@ pub(crate) fn resolve_vertical_size(size: PreferredSize, parent_content_height: 
     }
 }
 
+/// Resolve an inline size that is independent of its containing block and
+/// convert it to an outer size. Formatting contexts can share this conversion
+/// while retaining ownership of their own auto/percentage sizing algorithms.
+pub(crate) fn resolve_definite_outer_inline_size(size: PreferredSize, box_sizing: BoxSizing, padding_border: f64, margin: f64) -> Option<f64> {
+    if size.percentage_dependent() {
+        return None;
+    }
+    let specified = match size {
+        PreferredSize::Px(px) => px as f64,
+        PreferredSize::Calc { .. } | PreferredSize::Comparison { .. } => resolve_used_preferred_size(size, 0.0, 0.0),
+        PreferredSize::Auto | PreferredSize::Percent(_) | PreferredSize::MinContent | PreferredSize::MaxContent | PreferredSize::FitContent | PreferredSize::Stretch => return None,
+    };
+    let border_box = match box_sizing {
+        BoxSizing::ContentBox => specified.max(0.0) + padding_border,
+        BoxSizing::BorderBox => specified.max(padding_border),
+    };
+    Some(border_box + margin)
+}
+
 /// Resolve a block-axis minimum. Unlike `height` and `max-height`, an
 /// unresolved percentage in `min-height` contributes zero rather than making
 /// the entire value behave as `auto`. A mixed calc therefore retains its
 /// absolute component when the containing block has an indefinite height.
 pub(crate) fn resolve_vertical_min_size(size: PreferredSize, parent_content_height: Option<f64>, border_box_inset: f64) -> Option<f64> {
+    resolve_vertical_min_size_with_stretch_inset(size, parent_content_height, border_box_inset, border_box_inset)
+}
+
+pub(crate) fn resolve_vertical_min_size_with_stretch_inset(size: PreferredSize, parent_content_height: Option<f64>, border_box_inset: f64, stretch_inset: f64) -> Option<f64> {
     match (size, parent_content_height) {
         (PreferredSize::Percent(_), None) => Some(0.0),
         (PreferredSize::Calc { absolute_px, percentage_dependent: true, .. }, None) => Some((absolute_px as f64 - border_box_inset).max(0.0)),
         (PreferredSize::Comparison { .. }, None) if size.percentage_dependent() => Some(0.0),
-        _ => resolve_vertical_size(size, parent_content_height, border_box_inset),
+        _ => resolve_vertical_size_with_stretch_inset(size, parent_content_height, border_box_inset, stretch_inset),
     }
 }
 
@@ -107,11 +136,13 @@ pub(crate) struct BoxLayoutRequest {
     pub(super) first_line_indent: f64,
     pub(super) assigned_border_size: Option<AssignedBorderSize>,
     pub(super) used_borders: Option<UsedBorderInsets>,
+    pub(super) suppress_authored_height_basis: bool,
+    pub(super) intrinsic_block_measurement: bool,
 }
 
 impl BoxLayoutRequest {
     pub(crate) fn normal(box_idx: usize, available_width: f64, parent_content_height: Option<f64>) -> Self {
-        Self { box_idx, available_width, auto_width_limit: None, parent_content_height, first_line_indent: 0.0, assigned_border_size: None, used_borders: None }
+        Self { box_idx, available_width, auto_width_limit: None, parent_content_height, first_line_indent: 0.0, assigned_border_size: None, used_borders: None, suppress_authored_height_basis: false, intrinsic_block_measurement: false }
     }
 
     pub(crate) fn with_auto_width_limit(mut self, auto_width_limit: f64) -> Self {
@@ -123,15 +154,37 @@ impl BoxLayoutRequest {
         Self { used_borders: Some(used_borders), ..Self::normal(box_idx, available_width, parent_content_height) }
     }
 
-    pub(crate) fn assigned(box_idx: usize, containing_width: f64, assigned: Size) -> Self {
+    pub(crate) fn for_table_intrinsic_measurement(mut self) -> Self {
+        self.suppress_authored_height_basis = true;
+        self
+    }
+
+    pub(crate) fn for_intrinsic_block_measurement(mut self) -> Self {
+        self.suppress_authored_height_basis = true;
+        self.intrinsic_block_measurement = true;
+        self
+    }
+
+    pub(crate) fn with_assigned_border_height(mut self, height: f64) -> Self {
+        self.parent_content_height = Some(height.max(0.0));
+        self.assigned_border_size = Some(AssignedBorderSize { width: None, height: Some(height.max(0.0)), height_is_definite: true });
+        self
+    }
+
+    /// Final geometry for an atomic inline box. A measured height fixes the
+    /// box geometry without necessarily establishing a definite percentage
+    /// basis for its descendants.
+    pub(crate) fn atomic_assigned(box_idx: usize, containing_width: f64, containing_height: Option<f64>, assigned: Size, height_is_definite: bool) -> Self {
         Self {
             box_idx,
             available_width: containing_width,
             auto_width_limit: None,
-            parent_content_height: Some(assigned.height),
+            parent_content_height: containing_height,
             first_line_indent: 0.0,
-            assigned_border_size: Some(AssignedBorderSize { width: Some(assigned.width), height: Some(assigned.height), height_is_definite: true }),
+            assigned_border_size: Some(AssignedBorderSize { width: Some(assigned.width), height: Some(assigned.height), height_is_definite }),
             used_borders: None,
+            suppress_authored_height_basis: false,
+            intrinsic_block_measurement: false,
         }
     }
 
@@ -144,6 +197,8 @@ impl BoxLayoutRequest {
             first_line_indent: 0.0,
             assigned_border_size: Some(AssignedBorderSize { width: Some(assigned.width), height: Some(assigned.height), height_is_definite }),
             used_borders: None,
+            suppress_authored_height_basis: false,
+            intrinsic_block_measurement: false,
         }
     }
 
@@ -156,6 +211,8 @@ impl BoxLayoutRequest {
             first_line_indent: 0.0,
             assigned_border_size: Some(AssignedBorderSize { width: Some(assigned_width), height: None, height_is_definite: false }),
             used_borders: None,
+            suppress_authored_height_basis: false,
+            intrinsic_block_measurement: false,
         }
     }
 
@@ -168,6 +225,30 @@ impl BoxLayoutRequest {
             first_line_indent: 0.0,
             assigned_border_size: Some(AssignedBorderSize { width: assigned_width, height: assigned_height, height_is_definite: assigned_height.is_some() }),
             used_borders: None,
+            suppress_authored_height_basis: false,
+            intrinsic_block_measurement: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_definite_outer_inline_size;
+    use html_style_model::{BoxSizing, UsedPreferredSize as PreferredSize};
+
+    #[test]
+    fn definite_outer_inline_size_is_shared_across_formatting_contexts() {
+        assert_eq!(resolve_definite_outer_inline_size(PreferredSize::Px(20.0), BoxSizing::ContentBox, 6.0, 4.0), Some(30.0));
+        assert_eq!(resolve_definite_outer_inline_size(PreferredSize::Px(4.0), BoxSizing::BorderBox, 6.0, 4.0), Some(10.0));
+        assert_eq!(
+            resolve_definite_outer_inline_size(
+                PreferredSize::Calc { absolute_px: 12.0, percentage: 0.0, percentage_dependent: false },
+                BoxSizing::ContentBox,
+                3.0,
+                0.0,
+            ),
+            Some(15.0)
+        );
+        assert_eq!(resolve_definite_outer_inline_size(PreferredSize::Percent(0.5), BoxSizing::ContentBox, 6.0, 4.0), None);
     }
 }

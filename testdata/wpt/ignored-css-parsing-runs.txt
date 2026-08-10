@@ -1,0 +1,9 @@
+# Explicitly ignored CSS parsing assertion-runs
+# path|line=N|ordinal=N|kind=Kind|reason=capability
+selectors/parsing/parse-has.html|line=39|ordinal=0|kind=InvalidSelector|reason=parcel_selectors treats an invalid member of the unforgiving :has list as recoverable
+selectors/parsing/parse-is-where.html|line=58|ordinal=0|kind=InvalidSelector|reason=lightningcss accepts malformed bad-token input in a forgiving selector list
+selectors/parsing/parse-part.html|line=27|ordinal=0|kind=ValidSelector|reason=parcel_selectors rejects a valid Shadow DOM ::part and :lang combination
+selectors/parsing/parse-part.html|line=28|ordinal=0|kind=ValidSelector|reason=parcel_selectors rejects a valid Shadow DOM ::part and :dir combination
+selectors/parsing/parse-state.html|line=17|ordinal=0|kind=ValidSelector|reason=parcel_selectors rejects valid :state after ::part
+selectors/parsing/parse-state.html|line=20|ordinal=0|kind=ValidSelector|reason=parcel_selectors rejects a valid ::part :state ::before chain
+selectors/parsing/parse-state.html|line=21|ordinal=0|kind=ValidSelector|reason=parcel_selectors rejects a valid ::part :state ::after chain

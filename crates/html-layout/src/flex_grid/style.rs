@@ -3,12 +3,12 @@ use super::{TaffyContainerKind, finite_f32};
 use crate::layout::{
     LayoutEngine, ReplacedFlexAutoMinInput, ReplacedMainAxis, ResolvedBoxModel, clamp_replaced_definite_size_by_intrinsic_constraints, measure_box_isolated, resolve_replaced_flex_auto_min_main_size, resolve_replaced_intrinsic_constraint,
 };
-use html_style_model::{ContentAlignment, GridAutoFlow, ItemAlignment, LayoutStyle, OverflowMode, UsedPreferredSize as PreferredSize};
+use html_style_model::{ContentAlignment, GridAutoFlow, ItemAlignment, LayoutStyle, OverflowMode, PositionMode, UsedPreferredSize as PreferredSize};
 use taffy::geometry::{Line, Point as TaffyPoint, Rect, Size as TaffySize};
 use taffy::prelude::{Dimension, LengthPercentage, Style};
 use taffy::style::{
     AlignContent as TaffyAlignContent, AlignItems as TaffyAlignItems, BoxSizing as TaffyBoxSizing, Display as TaffyDisplay, FlexDirection as TaffyFlexDirection, FlexWrap as TaffyFlexWrap, GridAutoFlow as TaffyGridAutoFlow,
-    GridTemplateArea as TaffyGridTemplateArea, Overflow as TaffyOverflow,
+    GridTemplateArea as TaffyGridTemplateArea, GridTemplateAreas as TaffyGridTemplateAreas, Overflow as TaffyOverflow, Position as TaffyPosition,
 };
 
 pub(super) fn dimension(value: PreferredSize) -> Dimension {
@@ -28,12 +28,12 @@ pub(super) fn dimension(value: PreferredSize) -> Dimension {
     }
 }
 pub(super) fn layout_style<'a>(session: &LayoutEngine<'a, '_>, box_idx: usize) -> &'a LayoutStyle {
-    let indices = session.reader.box_style_indices(box_idx).unwrap_or_else(|| session.reader.styles().default_indices());
-    session.reader.styles().layout_style(indices).expect("validated style handle")
+    session.reader.layout_style(box_idx)
 }
 
 pub(super) fn taffy_container_style(
     session: &LayoutEngine<'_, '_>, box_idx: usize, content_width: f64, explicit_height: Option<f64>, min_height: Option<f64>, max_height: Option<f64>, kind: TaffyContainerKind, floor_fixed_grid_column_maxima: bool,
+    intrinsic_inline_sizing: bool,
 ) -> Style {
     let source = layout_style(session, box_idx);
     let used = session.reader.style(box_idx);
@@ -65,17 +65,23 @@ pub(super) fn taffy_container_style(
             html_style_model::FlexWrap::WrapReverse => TaffyFlexWrap::WrapReverse,
         },
         justify_items: item_alignment(source.justify_items, true),
-        grid_template_rows: grid_template_rows.map(|track| grid_template_track(session.reader.styles(), &track, false)).collect(),
-        grid_template_columns: grid_template_columns.map(|track| grid_template_track(session.reader.styles(), &track, floor_fixed_grid_column_maxima)).collect(),
+        grid_template_rows: grid_template_rows.map(|track| grid_template_track(session.reader.styles(), &track, false, explicit_height, intrinsic_inline_sizing)).collect(),
+        grid_template_columns: grid_template_columns
+            .map(|track| grid_template_track(session.reader.styles(), &track, floor_fixed_grid_column_maxima, (!intrinsic_inline_sizing).then_some(content_width), intrinsic_inline_sizing))
+            .collect(),
         grid_template_row_names: grid_line_names(session.reader.styles(), &source.grid_template_row_names),
         grid_template_column_names: grid_line_names(session.reader.styles(), &source.grid_template_column_names),
-        grid_template_areas: source
-            .grid_template_areas
-            .iter()
-            .filter_map(|area| Some(TaffyGridTemplateArea { name: session.reader.styles().string(area.name)?.into(), row_start: area.row_start, row_end: area.row_end, column_start: area.column_start, column_end: area.column_end }))
-            .collect(),
-        grid_auto_rows: grid_auto_rows.map(|track| grid_track_size(&track, false)).collect(),
-        grid_auto_columns: grid_auto_columns.map(|track| grid_track_size(&track, floor_fixed_grid_column_maxima)).collect(),
+        grid_template_areas: (source.grid_template_area_rows > 0 && source.grid_template_area_columns > 0).then(|| TaffyGridTemplateAreas {
+            areas: source
+                .grid_template_areas
+                .iter()
+                .filter_map(|area| Some(TaffyGridTemplateArea { name: session.reader.styles().string(area.name)?.into(), row_start: area.row_start, row_end: area.row_end, column_start: area.column_start, column_end: area.column_end }))
+                .collect(),
+            row_count: source.grid_template_area_rows,
+            column_count: source.grid_template_area_columns,
+        }),
+        grid_auto_rows: grid_auto_rows.map(|track| grid_track_size(&track, false, explicit_height, intrinsic_inline_sizing)).collect(),
+        grid_auto_columns: grid_auto_columns.map(|track| grid_track_size(&track, floor_fixed_grid_column_maxima, (!intrinsic_inline_sizing).then_some(content_width), intrinsic_inline_sizing)).collect(),
         grid_auto_flow: match source.grid_auto_flow {
             GridAutoFlow::Row => TaffyGridAutoFlow::Row,
             GridAutoFlow::Column => TaffyGridAutoFlow::Column,
@@ -94,14 +100,28 @@ pub(super) fn grid_definite_inline_minimum_exceeds_track_limit(session: &LayoutE
     if kind != TaffyContainerKind::Grid {
         return false;
     }
+    let size_contained_intrinsic_minimum = containing_width <= 0.01
+        && session.reader.style(container_idx).size_containment()
+        && session.reader.style(container_idx).grid_template_columns().any(|component| match component {
+            html_style_model::UsedGridTemplateTrack::Single(track) => intrinsic_minimum_has_definite_maximum(track),
+            html_style_model::UsedGridTemplateTrack::Repeat { tracks, .. } => tracks.iter().any(intrinsic_minimum_has_definite_maximum),
+        });
+    if size_contained_intrinsic_minimum {
+        return true;
+    }
     let Some(track_limit) = fixed_auto_track_limit(session.reader.style(container_idx).grid_template_columns(), containing_width) else {
         return false;
     };
     children.iter().any(|&child| {
         let style = session.reader.style(child as usize);
-        let box_model = ResolvedBoxModel::new(style, containing_width);
-        let margin = box_model.horizontal_margin();
-        let padding_border = box_model.horizontal_padding_border();
+        // Percentage item insets are cyclic at this track-sizing stage: their
+        // definite lower-bound contribution is zero until the grid area is
+        // known. Resolving them against the whole container would incorrectly
+        // turn `minmax(auto, fixed)` into a fit-content track. A zero basis
+        // retains fixed and calc-absolute terms without inventing a percentage
+        // contribution from the container rather than the item grid area.
+        let margin = style.get_horizontal_margin(0.0);
+        let padding_border = style.get_horizontal_padding(0.0) + style.border_left_width() as f64 + style.border_right_width() as f64;
         let outer = |width: f32| match style.box_sizing() {
             html_style_model::BoxSizing::ContentBox => width.max(0.0) as f64 + padding_border + margin,
             html_style_model::BoxSizing::BorderBox => (width.max(0.0) as f64).max(padding_border) + margin,
@@ -123,7 +143,19 @@ pub(super) fn grid_definite_inline_minimum_exceeds_track_limit(session: &LayoutE
     })
 }
 
-pub(super) fn taffy_item_style(session: &LayoutEngine<'_, '_>, box_idx: usize, containing_width: f64, containing_height: Option<f64>, kind: TaffyContainerKind, resolved_flex_basis: Option<Dimension>) -> Style {
+fn intrinsic_minimum_has_definite_maximum(track: html_style_model::UsedGridTrackSize) -> bool {
+    matches!(
+        track,
+        html_style_model::UsedGridTrackSize::MinMax {
+            min: html_style_model::UsedGridTrackBreadth::MinContent | html_style_model::UsedGridTrackBreadth::MaxContent,
+            max: html_style_model::UsedGridTrackBreadth::Length(_),
+        }
+    )
+}
+
+pub(super) fn taffy_item_style(
+    session: &LayoutEngine<'_, '_>, box_idx: usize, containing_width: f64, containing_height: Option<f64>, kind: TaffyContainerKind, resolved_flex_basis: Option<Dimension>, intrinsic_block_size: Option<f64>, stretch_height_basis: Option<f64>, intrinsic_inline_sizing: bool,
+) -> Style {
     let style = session.reader.style(box_idx);
     let box_model = ResolvedBoxModel::new(style, containing_width);
     let layout = layout_style(session, box_idx);
@@ -141,17 +173,75 @@ pub(super) fn taffy_item_style(session: &LayoutEngine<'_, '_>, box_idx: usize, c
     } else {
         authored_aspect_ratio.preferred()
     };
-    let width = if grid_percentage_width_is_stretch_equivalent(session, box_idx, kind) { Dimension::auto() } else { taffy_item_width_dimension(session, box_idx, style.width(), containing_width) };
     let horizontal_main_axis = session.reader.get_parent(box_idx).map(|parent| matches!(layout_style(session, parent).flex_direction, html_style_model::FlexDirection::Row | html_style_model::FlexDirection::RowReverse)).unwrap_or(true);
-    let mut min_width = if kind == TaffyContainerKind::Flex && horizontal_main_axis && matches!(style.min_width(), PreferredSize::Auto) {
+    let stretch_dimension = |basis: Option<f64>, horizontal: bool| {
+        let basis = basis?;
+        let (margin, padding_border) = if horizontal {
+            (box_model.horizontal_margin(), box_model.horizontal_padding_border())
+        } else {
+            (box_model.vertical_margin(), box_model.vertical_padding_border())
+        };
+        let border_size = (basis - margin).max(padding_border);
+        let specified = match style.box_sizing() {
+            html_style_model::BoxSizing::ContentBox => (border_size - padding_border).max(0.0),
+            html_style_model::BoxSizing::BorderBox => border_size,
+        };
+        Some(Dimension::length(finite_f32(specified)))
+    };
+    let intrinsic_block_dimension = || {
+        intrinsic_block_size.map(|border_size| match style.box_sizing() {
+            html_style_model::BoxSizing::ContentBox => (border_size - box_model.vertical_padding_border()).max(0.0),
+            html_style_model::BoxSizing::BorderBox => border_size.max(box_model.vertical_padding_border()),
+        })
+        .map(finite_f32)
+        .map(Dimension::length)
+    };
+    let taffy_handles_absolute_grid_item = kind == TaffyContainerKind::Grid
+        && style.position() == PositionMode::Absolute
+        && session.reader.get_parent(box_idx).is_some_and(|parent| matches!(session.reader.style(parent).width(), PreferredSize::MinContent | PreferredSize::MaxContent | PreferredSize::FitContent));
+    let taffy_handles_absolute_flex_item = kind == TaffyContainerKind::Flex && style.position() == PositionMode::Absolute;
+    let taffy_handles_absolute_item = taffy_handles_absolute_grid_item || taffy_handles_absolute_flex_item;
+    let percentage_width_is_grid_area_stretch = grid_percentage_width_is_stretch_equivalent(session, box_idx, kind)
+        && (taffy_handles_absolute_grid_item || grid_percentage_width_needs_intrinsic_track_workaround(session, box_idx));
+    let absolute_percentage_width_is_grid_area_stretch = taffy_handles_absolute_grid_item && percentage_width_is_grid_area_stretch;
+    let percentage_height_is_grid_area_stretch = grid_percentage_height_is_stretch_equivalent(session, box_idx, kind);
+    let width = if percentage_width_is_grid_area_stretch {
+        Dimension::auto()
+    } else if intrinsic_inline_sizing && style.width().percentage_dependent() {
+        // A cyclic percentage cross size is auto while finding a flex
+        // container's intrinsic inline size. Leaving it as a percentage lets
+        // the eventual container width feed back into its own contribution.
+        Dimension::auto()
+    } else if kind == TaffyContainerKind::Flex && horizontal_main_axis && matches!(style.width(), PreferredSize::Stretch) {
+        stretch_dimension(Some(containing_width), true).unwrap_or_else(Dimension::auto)
+    } else if kind == TaffyContainerKind::Flex && !horizontal_main_axis && matches!(style.width(), PreferredSize::Stretch) && containing_width > 0.0 {
+        let intrinsic_outer = crate::layout::box_intrinsic_widths(session, box_idx).0;
+        // If this item's intrinsic contribution established the column flex
+        // container's min-content width, `stretch` is definite during the
+        // measure pass. Leaving it auto makes Taffy establish the line from
+        // that border box and then add the same border once more while
+        // stretching. A line made wider by another item stays auto so the
+        // final cross-size can still enlarge this item.
+        if (containing_width - intrinsic_outer).abs() <= 0.01 { stretch_dimension(Some(containing_width), true).unwrap_or_else(Dimension::auto) } else { Dimension::auto() }
+    } else {
+        taffy_item_width_dimension(session, box_idx, style.width(), containing_width, intrinsic_inline_sizing)
+    };
+    let mut min_width = if kind == TaffyContainerKind::Flex && !horizontal_main_axis && matches!(style.width(), PreferredSize::Stretch) {
+        // A wrapped column flex line may grow wider than its container. The
+        // stretch size is therefore a floor during line measurement, not a
+        // definite preferred width.
+        stretch_dimension(Some(containing_width), true).unwrap_or_else(Dimension::auto)
+    } else if matches!(style.min_width(), PreferredSize::Stretch) {
+        stretch_dimension(Some(containing_width), true).unwrap_or_else(Dimension::auto)
+    } else if kind == TaffyContainerKind::Flex && horizontal_main_axis && matches!(style.min_width(), PreferredSize::Auto) {
         Dimension::length(finite_f32(flex_replaced_automatic_minimum(session, box_idx, containing_width, containing_height, true).unwrap_or_else(|| flex_automatic_min_content_width(session, box_idx, containing_width))))
     } else if kind == TaffyContainerKind::Grid && matches!(style.width(), PreferredSize::FitContent) && matches!(style.min_width(), PreferredSize::Auto) {
         // A fit-content preferred size is neither auto nor dependent on
         // the containing block. CSS Grid therefore uses the min-content
         // contribution, even when it exceeds a fixed track maximum.
-        taffy_item_width_dimension(session, box_idx, PreferredSize::MinContent, containing_width)
+        taffy_item_width_dimension(session, box_idx, PreferredSize::MinContent, containing_width, intrinsic_inline_sizing)
     } else {
-        taffy_item_width_dimension(session, box_idx, style.min_width(), containing_width)
+        taffy_item_width_dimension(session, box_idx, style.min_width(), containing_width, intrinsic_inline_sizing)
     };
     if kind == TaffyContainerKind::Flex
         && horizontal_main_axis
@@ -166,19 +256,44 @@ pub(super) fn taffy_item_style(session: &LayoutEngine<'_, '_>, box_idx: usize, c
     let intrinsic_height_constraint = |value| replaced_intrinsic.and_then(|intrinsic| resolve_replaced_intrinsic_constraint(value, intrinsic.height, box_model.vertical_padding_border(), style.box_sizing()));
     let intrinsic_min_height = intrinsic_height_constraint(style.min_height());
     let intrinsic_max_height = intrinsic_height_constraint(style.max_height());
-    let height = clamp_replaced_definite_size_by_intrinsic_constraints(style.height(), intrinsic_min_height, intrinsic_max_height).map(finite_f32).map(Dimension::length).unwrap_or_else(|| dimension(style.height()));
+    let height = if percentage_height_is_grid_area_stretch {
+        Dimension::auto()
+    } else if matches!(style.height(), PreferredSize::MinContent | PreferredSize::MaxContent | PreferredSize::FitContent) {
+        intrinsic_block_dimension().unwrap_or_else(Dimension::auto)
+    } else if kind == TaffyContainerKind::Flex && !horizontal_main_axis && matches!(style.height(), PreferredSize::Stretch) {
+        stretch_dimension(stretch_height_basis, false).unwrap_or_else(Dimension::auto)
+    } else {
+        clamp_replaced_definite_size_by_intrinsic_constraints(style.height(), intrinsic_min_height, intrinsic_max_height).map(finite_f32).map(Dimension::length).unwrap_or_else(|| dimension(style.height()))
+    };
     let mut min_height = if let Some(value) = intrinsic_min_height {
         Dimension::length(finite_f32(value))
     } else if kind == TaffyContainerKind::Flex && !horizontal_main_axis && matches!(style.min_height(), PreferredSize::Auto) {
-        flex_replaced_automatic_minimum(session, box_idx, containing_width, containing_height, false).map(finite_f32).map(Dimension::length).unwrap_or_else(Dimension::auto)
+        if matches!(style.overflow_y(), OverflowMode::Hidden | OverflowMode::Scroll | OverflowMode::Auto) {
+            Dimension::length(0.0)
+        } else {
+            flex_replaced_automatic_minimum(session, box_idx, containing_width, containing_height, false)
+                .map(finite_f32)
+                .map(Dimension::length)
+                .or_else(intrinsic_block_dimension)
+                .unwrap_or_else(Dimension::auto)
+        }
     } else {
         match style.min_height() {
+            PreferredSize::MinContent | PreferredSize::MaxContent | PreferredSize::FitContent => intrinsic_block_dimension().unwrap_or_else(Dimension::auto),
+            PreferredSize::Stretch => stretch_dimension(stretch_height_basis, false).unwrap_or_else(Dimension::auto),
             PreferredSize::Percent(_) if containing_height.is_none() => Dimension::length(0.0),
             value => dimension(value),
         }
     };
-    let mut max_width = taffy_item_width_dimension(session, box_idx, style.max_width(), containing_width);
-    let mut max_height = intrinsic_max_height.map(finite_f32).map(Dimension::length).unwrap_or_else(|| dimension(style.max_height()));
+    let mut max_width = taffy_item_width_dimension(session, box_idx, style.max_width(), containing_width, intrinsic_inline_sizing);
+    if matches!(style.max_width(), PreferredSize::Stretch) {
+        max_width = stretch_dimension(Some(containing_width), true).unwrap_or_else(Dimension::auto);
+    }
+    let mut max_height = intrinsic_max_height.map(finite_f32).map(Dimension::length).unwrap_or_else(|| match style.max_height() {
+        PreferredSize::MinContent | PreferredSize::MaxContent | PreferredSize::FitContent => intrinsic_block_dimension().unwrap_or_else(Dimension::auto),
+        PreferredSize::Stretch => stretch_dimension(stretch_height_basis, false).unwrap_or_else(Dimension::auto),
+        value => dimension(value),
+    });
     let parent_alignment = session.reader.get_parent(box_idx).map(|parent| layout_style(session, parent).align_items).unwrap_or(ItemAlignment::Normal);
     let effective_alignment = if layout.align_self == ItemAlignment::Auto { parent_alignment } else { layout.align_self };
     let cross_auto_margins = if horizontal_main_axis { layout.margin_top_auto || layout.margin_bottom_auto } else { layout.margin_left_auto || layout.margin_right_auto };
@@ -235,7 +350,29 @@ pub(super) fn taffy_item_style(session: &LayoutEngine<'_, '_>, box_idx: usize, c
             }
         }
     }
+    let intrinsic_column_ratio_basis = (kind == TaffyContainerKind::Flex
+        && intrinsic_inline_sizing
+        && !horizontal_main_axis
+        && matches!(style.flex_basis(), PreferredSize::Auto)
+        && matches!(style.height(), PreferredSize::Auto)
+        && style.width().percentage_dependent())
+    .then(|| {
+        let ratio = aspect_ratio?;
+        let (_, max_content_width) = crate::layout::box_content_intrinsic_widths(session, box_idx);
+        (ratio > 0.0).then(|| Dimension::length(finite_f32(max_content_width / f64::from(ratio))))
+    })
+    .flatten();
     Style {
+        // Absolute grid items still belong in Taffy's local tree: Taffy
+        // excludes them from track sizing, then resolves their containing
+        // area from grid-row/grid-column during its positioning pass.
+        position: if taffy_handles_absolute_item { TaffyPosition::Absolute } else { TaffyPosition::Relative },
+        inset: Rect {
+            left: absolute_grid_inset(style.inset_left(), containing_width, taffy_handles_absolute_item, absolute_percentage_width_is_grid_area_stretch),
+            right: absolute_grid_inset(style.inset_right(), containing_width, taffy_handles_absolute_item, absolute_percentage_width_is_grid_area_stretch),
+            top: absolute_grid_inset(style.inset_top(), containing_height.unwrap_or(containing_width), taffy_handles_absolute_item, percentage_height_is_grid_area_stretch),
+            bottom: absolute_grid_inset(style.inset_bottom(), containing_height.unwrap_or(containing_width), taffy_handles_absolute_item, percentage_height_is_grid_area_stretch),
+        },
         box_sizing: match style.box_sizing() {
             html_style_model::BoxSizing::ContentBox => TaffyBoxSizing::ContentBox,
             html_style_model::BoxSizing::BorderBox => TaffyBoxSizing::BorderBox,
@@ -268,9 +405,12 @@ pub(super) fn taffy_item_style(session: &LayoutEngine<'_, '_>, box_idx: usize, c
         overflow: TaffyPoint { x: overflow(style.overflow_x()), y: overflow(style.overflow_y()) },
         flex_grow: layout.flex_grow,
         flex_shrink: layout.flex_shrink,
-        flex_basis: resolved_flex_basis.unwrap_or_else(|| dimension(style.flex_basis())),
-        align_self: item_alignment(layout.align_self, false),
-        justify_self: item_alignment(layout.justify_self, true),
+        flex_basis: resolved_flex_basis.or(intrinsic_column_ratio_basis).unwrap_or_else(|| dimension(style.flex_basis())),
+        // Taffy resolves percentage sizes of absolute grid items against the
+        // whole container. A bare 100% size is exactly the grid-area stretch
+        // size, so express that equivalence explicitly on the affected axis.
+        align_self: if percentage_height_is_grid_area_stretch { item_alignment(ItemAlignment::Stretch, false) } else { item_alignment(layout.align_self, false) },
+        justify_self: if percentage_width_is_grid_area_stretch { item_alignment(ItemAlignment::Stretch, true) } else { item_alignment(layout.justify_self, true) },
         grid_row: Line { start: grid_placement(session.reader.styles(), layout.grid_row.start), end: grid_placement(session.reader.styles(), layout.grid_row.end) },
         grid_column: Line { start: grid_placement(session.reader.styles(), layout.grid_column.start), end: grid_placement(session.reader.styles(), layout.grid_column.end) },
         ..Style::default()
@@ -286,7 +426,7 @@ pub(super) fn resolve_intrinsic_flex_basis(session: &mut LayoutEngine<'_, '_>, b
         return None;
     }
     if horizontal_main_axis {
-        return Some(taffy_item_width_dimension(session, box_idx, basis, containing_width));
+        return Some(taffy_item_width_dimension(session, box_idx, basis, containing_width, false));
     }
 
     // Intrinsic block-axis sizes are measured with the item's allocated
@@ -325,7 +465,7 @@ fn flex_automatic_min_content_width(session: &LayoutEngine<'_, '_>, box_idx: usi
         PreferredSize::Comparison { .. } => Some(as_content_width(html_style_model::resolve_used_preferred_size(style.width(), 0.0, containing_width))),
         PreferredSize::MinContent => Some(content_min),
         PreferredSize::MaxContent | PreferredSize::FitContent => Some(crate::layout::box_content_intrinsic_widths(session, box_idx).1.max(content_min)),
-        PreferredSize::Stretch => Some(as_content_width(containing_width)),
+        PreferredSize::Stretch => Some((containing_width - style.get_horizontal_margin(containing_width) - padding_border).max(0.0)),
         PreferredSize::Auto => None,
     };
     let mut automatic_min = preferred.map_or(content_min, |preferred| content_min.min(preferred));
@@ -333,6 +473,8 @@ fn flex_automatic_min_content_width(session: &LayoutEngine<'_, '_>, box_idx: usi
         automatic_min = automatic_min.min(as_content_width(value as f64));
     } else if let PreferredSize::Percent(value) = style.max_width() {
         automatic_min = automatic_min.min(as_content_width(containing_width * value as f64));
+    } else if matches!(style.max_width(), PreferredSize::Stretch) {
+        automatic_min = automatic_min.min((containing_width - style.get_horizontal_margin(containing_width) - padding_border).max(0.0));
     }
     automatic_min.max(0.0)
 }
@@ -423,11 +565,9 @@ fn flex_replaced_automatic_minimum(session: &LayoutEngine<'_, '_>, box_idx: usiz
     }))
 }
 
-/// Taffy currently resolves a percentage grid-item width against the
-/// entire grid container while sizing tracks. For an otherwise
-/// unconstrained 100% item with no horizontal box-model additions, that
-/// width is equivalent to the grid item's default stretch behavior. Using
-/// stretch keeps the percentage from inflating every fractional track.
+/// An otherwise unconstrained 100% grid item is equivalent to the grid
+/// item's default stretch behavior when the adapter needs to avoid a cyclic
+/// percentage contribution.
 fn grid_percentage_width_is_stretch_equivalent(session: &LayoutEngine<'_, '_>, box_idx: usize, kind: TaffyContainerKind) -> bool {
     if kind != TaffyContainerKind::Grid {
         return false;
@@ -447,7 +587,60 @@ fn grid_percentage_width_is_stretch_equivalent(session: &LayoutEngine<'_, '_>, b
         && style.border_right_width() == 0.0
 }
 
-fn taffy_item_width_dimension(session: &LayoutEngine<'_, '_>, box_idx: usize, value: PreferredSize, containing_width: f64) -> Dimension {
+/// Taffy 0.13 resolves percentages correctly for fixed and flexible tracks.
+/// A percentage item in `minmax(auto, <fixed>)` still feeds the unresolved
+/// percentage back into the intrinsic minimum, however. Keep the old
+/// stretch-equivalent encoding only for that remaining Taffy cycle.
+fn grid_percentage_width_needs_intrinsic_track_workaround(session: &LayoutEngine<'_, '_>, box_idx: usize) -> bool {
+    let Some(parent) = session.reader.get_parent(box_idx) else {
+        return false;
+    };
+    session.reader.style(parent).grid_template_columns().any(|track| {
+        matches!(
+            track,
+            html_style_model::UsedGridTemplateTrack::Single(html_style_model::UsedGridTrackSize::MinMax {
+                min: html_style_model::UsedGridTrackBreadth::Auto,
+                max: html_style_model::UsedGridTrackBreadth::Length(_),
+            })
+        )
+    })
+}
+
+fn grid_percentage_height_is_stretch_equivalent(session: &LayoutEngine<'_, '_>, box_idx: usize, kind: TaffyContainerKind) -> bool {
+    if kind != TaffyContainerKind::Grid {
+        return false;
+    }
+    let style = session.reader.style(box_idx);
+    let layout = layout_style(session, box_idx);
+    matches!(style.height(), PreferredSize::Percent(value) if (value - 1.0).abs() <= f32::EPSILON)
+        && matches!(style.min_height(), PreferredSize::Auto)
+        && matches!(style.max_height(), PreferredSize::Auto)
+        && !layout.margin_top_auto
+        && !layout.margin_bottom_auto
+        && style.margin_top().is_zero()
+        && style.margin_bottom().is_zero()
+        && style.padding_top().is_zero()
+        && style.padding_bottom().is_zero()
+        && style.border_top_width() == 0.0
+        && style.border_bottom_width() == 0.0
+}
+
+fn optional_length_percentage_auto(value: Option<html_style_model::UsedLengthPct>, percentage_basis: f64) -> taffy::prelude::LengthPercentageAuto {
+    value.map_or_else(taffy::prelude::LengthPercentageAuto::auto, |value| length_percentage_auto(value, false, percentage_basis))
+}
+
+fn absolute_grid_inset(value: Option<html_style_model::UsedLengthPct>, percentage_basis: f64, taffy_handles_absolute: bool, stretch_area: bool) -> taffy::prelude::LengthPercentageAuto {
+    if !taffy_handles_absolute {
+        return taffy::prelude::LengthPercentageAuto::auto();
+    }
+    if stretch_area && value.is_none() {
+        taffy::prelude::LengthPercentageAuto::length(0.0)
+    } else {
+        optional_length_percentage_auto(value, percentage_basis)
+    }
+}
+
+fn taffy_item_width_dimension(session: &LayoutEngine<'_, '_>, box_idx: usize, value: PreferredSize, containing_width: f64, intrinsic_inline_sizing: bool) -> Dimension {
     if let PreferredSize::Calc { absolute_px, percentage, .. } = value {
         return Dimension::length(finite_f32((absolute_px as f64 + containing_width * percentage as f64).max(0.0)));
     }
@@ -460,6 +653,7 @@ fn taffy_item_width_dimension(session: &LayoutEngine<'_, '_>, box_idx: usize, va
     let content = match value {
         PreferredSize::MinContent => min,
         PreferredSize::MaxContent => max,
+        PreferredSize::FitContent if intrinsic_inline_sizing => max,
         PreferredSize::FitContent => max.min(available.max(min)),
         _ => unreachable!(),
     };
@@ -481,30 +675,30 @@ pub(super) fn overflow(value: OverflowMode) -> TaffyOverflow {
 
 pub(super) fn content_alignment(value: ContentAlignment, kind: TaffyContainerKind, main_axis: bool) -> Option<TaffyAlignContent> {
     Some(match value {
-        ContentAlignment::Normal if kind == TaffyContainerKind::Flex && main_axis => TaffyAlignContent::FlexStart,
-        ContentAlignment::Normal => TaffyAlignContent::Stretch,
-        ContentAlignment::Start => TaffyAlignContent::Start,
-        ContentAlignment::End => TaffyAlignContent::End,
-        ContentAlignment::FlexStart => TaffyAlignContent::FlexStart,
-        ContentAlignment::FlexEnd => TaffyAlignContent::FlexEnd,
-        ContentAlignment::Center => TaffyAlignContent::Center,
-        ContentAlignment::Stretch => TaffyAlignContent::Stretch,
-        ContentAlignment::SpaceBetween => TaffyAlignContent::SpaceBetween,
-        ContentAlignment::SpaceAround => TaffyAlignContent::SpaceAround,
-        ContentAlignment::SpaceEvenly => TaffyAlignContent::SpaceEvenly,
+        ContentAlignment::Normal if kind == TaffyContainerKind::Flex && main_axis => TaffyAlignContent::FLEX_START,
+        ContentAlignment::Normal => TaffyAlignContent::STRETCH,
+        ContentAlignment::Start => TaffyAlignContent::START,
+        ContentAlignment::End => TaffyAlignContent::END,
+        ContentAlignment::FlexStart => TaffyAlignContent::FLEX_START,
+        ContentAlignment::FlexEnd => TaffyAlignContent::FLEX_END,
+        ContentAlignment::Center => TaffyAlignContent::CENTER,
+        ContentAlignment::Stretch => TaffyAlignContent::STRETCH,
+        ContentAlignment::SpaceBetween => TaffyAlignContent::SPACE_BETWEEN,
+        ContentAlignment::SpaceAround => TaffyAlignContent::SPACE_AROUND,
+        ContentAlignment::SpaceEvenly => TaffyAlignContent::SPACE_EVENLY,
     })
 }
 
 pub(super) fn item_alignment(value: ItemAlignment, _grid_inline_axis: bool) -> Option<TaffyAlignItems> {
     match value {
         ItemAlignment::Auto => None,
-        ItemAlignment::Normal => Some(TaffyAlignItems::Stretch),
-        ItemAlignment::Start | ItemAlignment::SelfStart => Some(TaffyAlignItems::Start),
-        ItemAlignment::End | ItemAlignment::SelfEnd => Some(TaffyAlignItems::End),
-        ItemAlignment::FlexStart => Some(TaffyAlignItems::FlexStart),
-        ItemAlignment::FlexEnd => Some(TaffyAlignItems::FlexEnd),
-        ItemAlignment::Center => Some(TaffyAlignItems::Center),
-        ItemAlignment::Stretch => Some(TaffyAlignItems::Stretch),
-        ItemAlignment::Baseline => Some(TaffyAlignItems::Baseline),
+        ItemAlignment::Normal => Some(TaffyAlignItems::STRETCH),
+        ItemAlignment::Start | ItemAlignment::SelfStart | ItemAlignment::Left => Some(TaffyAlignItems::START),
+        ItemAlignment::End | ItemAlignment::SelfEnd | ItemAlignment::Right => Some(TaffyAlignItems::END),
+        ItemAlignment::FlexStart => Some(TaffyAlignItems::FLEX_START),
+        ItemAlignment::FlexEnd => Some(TaffyAlignItems::FLEX_END),
+        ItemAlignment::Center => Some(TaffyAlignItems::CENTER),
+        ItemAlignment::Stretch => Some(TaffyAlignItems::STRETCH),
+        ItemAlignment::Baseline => Some(TaffyAlignItems::BASELINE),
     }
 }

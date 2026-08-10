@@ -197,7 +197,8 @@ pub(crate) fn layout_block_children(engine: &mut LayoutEngine<'_, '_>, parent_id
         // remains pending in normal flow. Floats and absolute descendants
         // must therefore agree on the same source position.
         let relative_collapse_through_offset = if item.profile.collapses_through && child_style.position() == PositionMode::Relative { pending_margin.resolve() } else { 0.0 };
-        let mut child_pos = position + Vec2::new(horizontal.left, y_offset + relative_collapse_through_offset);
+        let inline_offset = crate::layout::box_sizing::block_inline_alignment_offset(engine, &resolved);
+        let mut child_pos = position + Vec2::new(inline_offset, y_offset + relative_collapse_through_offset);
         if engine.reader.box_uses_float_context(child_idx)
             && let Some(float_context) = engine.floats.current_float_context().filter(|context| !context.is_empty()).cloned()
         {

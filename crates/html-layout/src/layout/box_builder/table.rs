@@ -130,7 +130,7 @@ pub(super) fn plan_table_children(document: &Document, styles: &ComputedStyles, 
             Display::TableColumn => {
                 flush_anonymous_action(&mut anonymous, &mut actions);
                 let style = style.unwrap_or_else(|| styles.default_indices());
-                append_columns(&mut columns, &mut column_width_hints, style, parse_span(document, node), Some(style));
+                append_columns(&mut columns, &mut column_width_hints, style, parse_span(document, node), Some(style), None);
             }
             Display::TableColumnGroup => {
                 flush_anonymous_action(&mut anonymous, &mut actions);
@@ -143,12 +143,12 @@ pub(super) fn plan_table_children(document: &Document, styles: &ComputedStyles, 
                     }
                     let style = styles.style_for_node(child.node_id()).unwrap_or_else(|| styles.default_indices());
                     let span = parse_span(document, child.node_id());
-                    append_columns(&mut columns, &mut column_width_hints, style, span, Some(style));
+                    append_columns(&mut columns, &mut column_width_hints, style, span, Some(style), Some(group_style));
                     group_span += span;
                 }
                 if group_span == 0 {
                     group_span = parse_span(document, node);
-                    append_columns(&mut columns, &mut column_width_hints, group_style, group_span, None);
+                    append_columns(&mut columns, &mut column_width_hints, group_style, group_span, None, None);
                 }
                 if group_span > 0 {
                     column_groups.push(TableColumnGroupSpan { style: group_style, start, span: group_span });
@@ -288,10 +288,12 @@ fn flattened_contents_children(document: &Document, styles: &ComputedStyles, chi
     flattened
 }
 
-fn append_columns(columns: &mut Vec<TableColumnTrack>, hints: &mut Vec<TableColumnWidthHint>, width_style: html_style_model::StyleIndices, span: usize, background_style: Option<html_style_model::StyleIndices>) {
+fn append_columns(
+    columns: &mut Vec<TableColumnTrack>, hints: &mut Vec<TableColumnWidthHint>, width_style: html_style_model::StyleIndices, span: usize, background_style: Option<html_style_model::StyleIndices>, fallback_style: Option<html_style_model::StyleIndices>,
+) {
     for _ in 0..span {
         columns.push(TableColumnTrack { width_style, background_style });
-        hints.push(TableColumnWidthHint { style: width_style });
+        hints.push(TableColumnWidthHint { style: width_style, fallback_style });
     }
 }
 

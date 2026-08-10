@@ -1,6 +1,6 @@
 use super::borders::CollapsedBorderGrid;
 use super::columns::{TableCellPlacement, TableColumnLayout, span_extent};
-use crate::layout::{LayoutEngine, resolve_vertical_size};
+use crate::layout::LayoutEngine;
 use crate::layout_model::{Children, LayoutMode};
 use html_style_model::VerticalAlignValue;
 use kurbo::{Point, Size, Vec2};
@@ -8,57 +8,13 @@ use std::time::Instant;
 
 pub(super) struct TableCellMeasurements {
     pub(super) baseline_offsets: Vec<Option<f64>>,
-    pub(super) row_heights: Vec<f64>,
+    pub(super) cell_heights: Vec<f64>,
     pub(super) row_baselines: Vec<Option<f64>>,
-}
-
-pub(super) fn distribute_row_growth(heights: &mut [f64], constrained: &[bool], candidates: &[usize], extra: f64) {
-    if extra <= 0.0 || candidates.is_empty() {
-        return;
-    }
-    let mut recipients = candidates.iter().copied().filter(|&row| !constrained[row]).collect::<Vec<_>>();
-    if recipients.is_empty() {
-        recipients.extend_from_slice(candidates);
-    }
-    let add = extra / recipients.len() as f64;
-    for row in recipients {
-        heights[row] += add;
-    }
-}
-
-pub(super) fn resolve_row_heights(session: &LayoutEngine<'_, '_>, rows: &[u32], row_groups: &[u32], mut row_heights: Vec<f64>, v_spacing: f64, explicit_table_height: Option<f64>, caption_height: f64, outer_border_height: f64) -> Vec<f64> {
-    let mut constrained = vec![false; rows.len()];
-    for (row, &row_box_idx) in rows.iter().enumerate() {
-        if let Some(height) = resolve_vertical_size(session.reader.style(row_box_idx as usize).height(), explicit_table_height, 0.0) {
-            row_heights[row] = row_heights[row].max(height);
-            constrained[row] = true;
-        }
-    }
-
-    for &group_idx in row_groups {
-        let Some(group_height) = resolve_vertical_size(session.reader.style(group_idx as usize).height(), explicit_table_height, 0.0) else {
-            continue;
-        };
-        let group_rows = rows.iter().enumerate().filter_map(|(row, &row_idx)| (session.reader.get_parent(row_idx as usize) == Some(group_idx as usize)).then_some(row)).collect::<Vec<_>>();
-        if group_rows.is_empty() {
-            continue;
-        }
-        let current = group_rows.iter().map(|&row| row_heights[row]).sum::<f64>() + v_spacing * group_rows.len().saturating_sub(1) as f64;
-        distribute_row_growth(&mut row_heights, &constrained, &group_rows, (group_height - current).max(0.0));
-    }
-
-    if let Some(explicit_height) = explicit_table_height {
-        let target_grid_height = (explicit_height - caption_height).max(0.0);
-        let natural_grid_height = row_heights.iter().sum::<f64>() + v_spacing * (rows.len() as f64 + 1.0) + outer_border_height;
-        let all_rows = (0..row_heights.len()).collect::<Vec<_>>();
-        distribute_row_growth(&mut row_heights, &constrained, &all_rows, (target_grid_height - natural_grid_height).max(0.0));
-    }
-    row_heights
 }
 
 pub(super) fn measure_cells(
     session: &mut LayoutEngine<'_, '_>, placements: &[TableCellPlacement], row_count: usize, columns: &TableColumnLayout, table_content_pos: Point, v_spacing: f64, parent_content_height: Option<f64>,
-    collapsed_grid: Option<&CollapsedBorderGrid>,
+    collapsed_grid: Option<&CollapsedBorderGrid>, definite_row_area_height: Option<f64>,
 ) -> TableCellMeasurements {
     let mut heights = vec![0.0; placements.len()];
     let mut baseline_offsets = vec![None; placements.len()];
@@ -67,11 +23,20 @@ pub(super) fn measure_cells(
         let ((cell_size, baseline), _) = crate::layout::with_isolated_measurement(session, |session| {
             session.without_fragmentation(|session| {
                 session.geometry.set_point(placement.cell_idx, Point::new(table_content_pos.x + columns.starts[placement.col], table_content_pos.y + v_spacing));
-                let cell_layout = if let Some(grid) = collapsed_grid {
-                    session.layout_box(crate::layout::BoxLayoutRequest::collapsed_table_cell(placement.cell_idx, span_width, parent_content_height, grid.cell_insets(*placement)))
+                let mut request = if let Some(grid) = collapsed_grid {
+                    crate::layout::BoxLayoutRequest::collapsed_table_cell(placement.cell_idx, span_width, parent_content_height, grid.cell_insets(*placement))
                 } else {
-                    session.layout_box(crate::layout::BoxLayoutRequest::normal(placement.cell_idx, span_width, parent_content_height))
+                    crate::layout::BoxLayoutRequest::normal(placement.cell_idx, span_width, parent_content_height)
                 };
+                if cell_has_restricted_percentage_height_descendant(session, placement.cell_idx)
+                    && let Some(row_area_height) = definite_row_area_height
+                {
+                    let provisional_span_height = row_area_height * placement.rowspan.min(row_count) as f64 / row_count.max(1) as f64;
+                    request = request.with_assigned_border_height(provisional_span_height);
+                } else {
+                    request = request.for_table_intrinsic_measurement();
+                }
+                let cell_layout = session.layout_box(request);
                 let baseline = session.fragments.first_baseline_offset(cell_layout.output.lines, session.geometry.point(placement.cell_idx).y);
                 (cell_layout.size, baseline)
             })
@@ -80,28 +45,49 @@ pub(super) fn measure_cells(
         baseline_offsets[index] = baseline;
     }
 
-    let mut row_heights = vec![0.0f64; row_count];
     let mut row_baselines = vec![None::<f64>; row_count];
     for (index, placement) in placements.iter().enumerate().filter(|(_, placement)| placement.rowspan == 1) {
-        row_heights[placement.row] = row_heights[placement.row].max(heights[index]);
         if cell_uses_baseline_alignment(session, placement.cell_idx)
             && let Some(cell_baseline) = baseline_offsets[index]
         {
             row_baselines[placement.row] = Some(row_baselines[placement.row].map_or(cell_baseline, |current| current.max(cell_baseline)));
         }
     }
-    for (index, placement) in placements.iter().enumerate().filter(|(_, placement)| placement.rowspan > 1) {
-        let end_row = placement.row.saturating_add(placement.rowspan).min(row_count);
-        let current = row_heights[placement.row..end_row].iter().sum::<f64>();
-        let deficit = (heights[index] - current).max(0.0);
-        if deficit > 0.0 {
-            let add = deficit / (end_row - placement.row) as f64;
-            for height in &mut row_heights[placement.row..end_row] {
-                *height += add;
-            }
+    TableCellMeasurements { baseline_offsets, cell_heights: heights, row_baselines }
+}
+
+pub(super) fn cell_has_restricted_percentage_height_descendant(session: &LayoutEngine<'_, '_>, cell_idx: usize) -> bool {
+    fn children_contain(session: &LayoutEngine<'_, '_>, children: &Children) -> bool {
+        match children {
+            Children::Blocks(children) => children.iter().any(|&child| box_contains(session, child as usize)),
+            Children::InlineItems(range) => range.clone().any(|item_idx| {
+                session.text.inline_item(item_idx as usize).is_some_and(|item| match item.kind {
+                    crate::layout_model::InlineItemKind::AtomicBox { box_idx } => box_contains(session, box_idx as usize),
+                    _ => false,
+                })
+            }),
+            Children::Empty => false,
         }
     }
-    TableCellMeasurements { baseline_offsets, row_heights, row_baselines }
+
+    fn box_contains(session: &LayoutEngine<'_, '_>, box_idx: usize) -> bool {
+        let style = session.reader.style(box_idx);
+        if style.height().percentage_dependent() && style.overflow_y().clips() {
+            return true;
+        }
+        match session.reader.box_layout_mode(box_idx) {
+            Some(LayoutMode::Block(block)) => children_contain(session, &block.children),
+            Some(LayoutMode::TableCell(cell)) => children_contain(session, &cell.children),
+            Some(LayoutMode::Flex(container)) => container.children.iter().any(|&child| box_contains(session, child as usize)),
+            Some(LayoutMode::Grid(container)) => container.children.iter().any(|&child| box_contains(session, child as usize)),
+            _ => false,
+        }
+    }
+
+    match session.reader.box_layout_mode(cell_idx) {
+        Some(LayoutMode::TableCell(cell)) => children_contain(session, &cell.children),
+        _ => false,
+    }
 }
 
 pub(crate) fn layout_table_row(session: &mut LayoutEngine<'_, '_>, _row_box_idx: usize, cells: Vec<u32>, out_of_flow: Vec<u32>, content_pos: Point, content_width: f64, parent_content_height: Option<f64>) -> Size {

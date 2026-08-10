@@ -5,6 +5,21 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::path::PathBuf;
+
+/// Upstream WPT revision expected by this test adapter and the owning suites.
+pub const WPT_REVISION: &str = "7ea3d665ff9ae1df1f742433d51bd1e9c6499a3b";
+
+/// Returns the external checkout containing the pinned upstream WPT files.
+///
+/// Project-owned manifests and failure ledgers remain in their owning
+/// repositories; only unchanged upstream inputs are read through this path.
+pub fn wpt_root() -> PathBuf {
+    let root = std::env::var_os("HTML_WPT_ROOT").map(PathBuf::from).expect("set HTML_WPT_ROOT to the pinned Web Platform Tests checkout");
+    assert!(root.is_absolute(), "HTML_WPT_ROOT must be an absolute path: {}", root.display());
+    assert!(root.is_dir(), "HTML_WPT_ROOT is not a directory: {}", root.display());
+    root
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReftestRelation {

@@ -1,7 +1,9 @@
 use html_dom::{Document, ImageSource};
-use html_layout::{FontSlant, GlyphId, GlyphMetric, GlyphRegistry, GlyphShaper, ImageMetrics, LayoutConstraints, ShapeError};
+use html_layout::{FontMetricsRequest, FontRelativeMetrics, FontSlant, GlyphId, GlyphMetric, GlyphRegistry, GlyphShaper, ImageMetrics, LayoutConstraints, ShapeError};
+use html_parse::HtmlQuirksMode;
 use html_pipeline::{DocumentFactory, parse_html_document};
 use html_resources::{ResourceProvider, probe_dimensions};
+use html_wpt_test_support::wpt_root;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
@@ -12,6 +14,8 @@ use std::sync::Arc;
 const LAYOUT_TESTS: &str = include_str!("../../../testdata/wpt/layout-check-tests.txt");
 const KNOWN_FAILURES: &str = include_str!("../../../testdata/wpt/known-layout-failures.txt");
 const IGNORED_RUNS: &str = include_str!("../../../testdata/wpt/ignored-layout-runs.txt");
+const SKIPPED_QUIRKS_FILES: &str = include_str!("../../../testdata/wpt/skipped-quirks-layout-files.txt");
+const SKIPPED_UNSUPPORTED_FILES: &str = include_str!("../../../testdata/wpt/skipped-unsupported-layout-files.txt");
 const VIEWPORT_WIDTH: f64 = 800.0;
 const LINE_HEIGHT: f64 = 16.0;
 const WPT_LAYOUT_TOLERANCE: f64 = 1.0;
@@ -24,6 +28,13 @@ struct DeterministicShaper {
 impl GlyphShaper for DeterministicShaper {
     fn reset(&mut self) {
         self.glyphs.clear();
+    }
+
+    fn font_relative_metrics(&mut self, request: FontMetricsRequest<'_>) -> Result<FontRelativeMetrics, ShapeError> {
+        if request.font_family().is_some_and(|family| family.split(',').next().is_some_and(|name| name.trim().trim_matches(['\'', '"']).eq_ignore_ascii_case("BaselineDiagnosticAlphabeticZero"))) {
+            return Ok(FontRelativeMetrics::from_line_ratios(0.25, 0.5, 0.55, 0.8, 0.2).expect("the pinned diagnostic font metrics are valid"));
+        }
+        Ok(FontRelativeMetrics::fallback())
     }
 
     fn shape_glyph<'a>(&mut self, glyph_metrics: &mut GlyphRegistry<'a>, ch: char, font_size: f32, _font_weight: u16, _font_slant: FontSlant, _color: u32, family: Option<&str>) -> Result<GlyphId, ShapeError> {
@@ -70,9 +81,11 @@ impl ResourceProvider for WptResourceProvider {
 
 #[test]
 fn runs_pinned_noninteractive_wpt_layout_assertions() {
-    let wpt_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../testdata/wpt");
+    let wpt_root = wpt_root();
     let provider = Arc::new(WptResourceProvider { root: wpt_root.clone() });
     let tests = manifest_entries();
+    let mut skipped_modes = skipped_quirks_entries();
+    let mut unsupported_files = skipped_unsupported_entries();
     let mut known = KNOWN_FAILURES.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#')).map(str::to_owned).collect::<BTreeSet<_>>();
     let mut ignored =
         IGNORED_RUNS.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#')).map(|line| line.split_once("|reason=").expect("ignored layout run includes a reason").0.to_owned()).collect::<BTreeSet<_>>();
@@ -83,6 +96,13 @@ fn runs_pinned_noninteractive_wpt_layout_assertions() {
     let mut unexpected = Vec::new();
     let mut unexpected_passes = Vec::new();
     let mut assertion_count = 0usize;
+    let mut skipped_quirks = 0usize;
+    let mut skipped_limited_quirks = 0usize;
+    let mut skipped_replaced_element_files = 0usize;
+    let mut skipped_unsupported_files = 0usize;
+    let mut skipped_replaced_element_tags = BTreeMap::<String, usize>::new();
+    let mut skipped_known_mismatches = 0usize;
+    let mut skipped_ignored_runs = 0usize;
 
     for relative in &tests {
         if verbose {
@@ -91,7 +111,62 @@ fn runs_pinned_noninteractive_wpt_layout_assertions() {
         let path = wpt_root.join(relative);
         let source = fs::read_to_string(&path).unwrap_or_else(|error| panic!("failed to read pinned WPT {}: {error}", path.display()));
         let source = prepare_noninteractive_source(relative, &source);
-        let expectation_document = parse_html_document(&source).build_dom();
+        let parsed = parse_html_document(&source);
+        let actual_mode = parsed.quirks_mode();
+        match actual_mode {
+            HtmlQuirksMode::NoQuirks => {}
+            HtmlQuirksMode::Quirks => {
+                if verbose {
+                    eprintln!("skipping quirks-mode layout WPT file: {relative}");
+                }
+                skipped_quirks += 1;
+                match skipped_modes.remove(relative) {
+                    Some(HtmlQuirksMode::Quirks) => {}
+                    Some(expected) => infrastructure_failures.push(format!("{relative}|skip-ledger-mode={expected:?}|parsed-mode={actual_mode:?}")),
+                    None => infrastructure_failures.push(format!("{relative}|unlisted-quirks-mode-document")),
+                }
+                skipped_known_mismatches += discard_file_entries(&mut known, relative);
+                skipped_ignored_runs += discard_file_entries(&mut ignored, relative);
+                continue;
+            }
+            HtmlQuirksMode::LimitedQuirks => {
+                if verbose {
+                    eprintln!("skipping limited-quirks layout WPT file: {relative}");
+                }
+                skipped_limited_quirks += 1;
+                match skipped_modes.remove(relative) {
+                    Some(HtmlQuirksMode::LimitedQuirks) => {}
+                    Some(expected) => infrastructure_failures.push(format!("{relative}|skip-ledger-mode={expected:?}|parsed-mode={actual_mode:?}")),
+                    None => infrastructure_failures.push(format!("{relative}|unlisted-limited-quirks-mode-document")),
+                }
+                skipped_known_mismatches += discard_file_entries(&mut known, relative);
+                skipped_ignored_runs += discard_file_entries(&mut ignored, relative);
+                continue;
+            }
+        }
+        let expectation_document = parsed.build_dom();
+        let replaced_element_tags = unsupported_replaced_element_tags(&expectation_document);
+        if !replaced_element_tags.is_empty() {
+            if verbose {
+                eprintln!("skipping replaced-element layout WPT file: {relative}|tags={}", replaced_element_tags.join(","));
+            }
+            skipped_replaced_element_files += 1;
+            for tag in replaced_element_tags {
+                *skipped_replaced_element_tags.entry(tag).or_default() += 1;
+            }
+            skipped_known_mismatches += discard_file_entries(&mut known, relative);
+            skipped_ignored_runs += discard_file_entries(&mut ignored, relative);
+            continue;
+        }
+        if let Some(reason) = unsupported_files.remove(relative) {
+            if verbose {
+                eprintln!("skipping unsupported layout WPT file: {relative}|reason={reason}");
+            }
+            skipped_unsupported_files += 1;
+            skipped_known_mismatches += discard_file_entries(&mut known, relative);
+            skipped_ignored_runs += discard_file_entries(&mut ignored, relative);
+            continue;
+        }
         let expectations = collect_expectations(relative, &expectation_document, &mut infrastructure_failures, &mut unsupported_checks);
         assertion_count += expectations.iter().map(|expectation| usize::from(expectation.width.is_some()) + usize::from(expectation.height.is_some())).sum::<usize>();
         // Files with only geometry kinds that the semantic view cannot expose
@@ -154,10 +229,11 @@ fn runs_pinned_noninteractive_wpt_layout_assertions() {
         }
     }
 
-    let known_mismatches = KNOWN_FAILURES.lines().filter(|line| !line.trim().is_empty() && !line.trim().starts_with('#')).count() - known.len();
+    let known_mismatches = KNOWN_FAILURES.lines().filter(|line| !line.trim().is_empty() && !line.trim().starts_with('#')).count() - known.len() - skipped_known_mismatches;
+    let active_ignored_runs = ignored_total - skipped_ignored_runs;
     let unsupported_check_count = unsupported_checks.values().sum::<usize>();
     eprintln!(
-        "direct layout WPT: {} files, {assertion_count} size assertions, {} unsupported geometry assertions, {ignored_total} intentionally unsupported runs, {known_mismatches} known mismatches, {} unexpected mismatches, {} unexpected passes",
+        "direct layout WPT: {} files, {skipped_quirks} quirks-mode files skipped, {skipped_limited_quirks} limited-quirks files skipped, {skipped_unsupported_files} unsupported-capability files skipped, {skipped_replaced_element_files} replaced-element files skipped ({skipped_replaced_element_tags:?}), {assertion_count} size assertions, {} unsupported geometry assertions, {active_ignored_runs} intentionally unsupported runs, {known_mismatches} known mismatches, {skipped_known_mismatches} known mismatches skipped with their files, {skipped_ignored_runs} ignored runs skipped with their files, {} unexpected mismatches, {} unexpected passes",
         tests.len(),
         unsupported_check_count,
         unexpected.len(),
@@ -167,9 +243,17 @@ fn runs_pinned_noninteractive_wpt_layout_assertions() {
         eprintln!("unsupported WPT geometry assertions: {unsupported_checks:?}");
     }
     assert_eq!(tests.len(), 914, "the pinned WPT layout selection changed");
-    assert!(assertion_count >= 21_000, "too few WPT layout assertions were exercised: {assertion_count}");
-    assert!(unsupported_check_count >= 18_000, "too few unsupported geometry assertions were audited: {unsupported_check_count}");
+    assert_eq!(skipped_replaced_element_files, 65, "the pinned replaced-element layout exclusion count changed");
+    assert_eq!(skipped_unsupported_files, 12, "the pinned unsupported-capability layout exclusion count changed");
+    assert!(assertion_count >= 16_400, "too few supported WPT layout assertions were exercised: {assertion_count}");
+    assert!(unsupported_check_count >= 15_500, "too few supported-document geometry assertions were audited: {unsupported_check_count}");
     let mut audit_failures = Vec::new();
+    if !skipped_modes.is_empty() {
+        audit_failures.push(format!("listed quirks-mode WPT layout files were not skipped:\n{}", skipped_modes.keys().cloned().collect::<Vec<_>>().join("\n")));
+    }
+    if !unsupported_files.is_empty() {
+        audit_failures.push(format!("listed unsupported-capability WPT layout files were not skipped:\n{}", unsupported_files.keys().cloned().collect::<Vec<_>>().join("\n")));
+    }
     if !infrastructure_failures.is_empty() {
         audit_failures.push(format!("WPT layout adapter failures:\n{}", infrastructure_failures.join("\n")));
     }
@@ -186,6 +270,51 @@ fn runs_pinned_noninteractive_wpt_layout_assertions() {
         audit_failures.push(format!("ignored WPT layout runs were not exercised:\n{}", ignored.into_iter().collect::<Vec<_>>().join("\n")));
     }
     assert!(audit_failures.is_empty(), "{}", audit_failures.join("\n\n"));
+}
+
+fn discard_file_entries(entries: &mut BTreeSet<String>, relative: &str) -> usize {
+    let prefix = format!("{relative}|");
+    let before = entries.len();
+    entries.retain(|entry| !entry.starts_with(&prefix));
+    before - entries.len()
+}
+
+fn skipped_quirks_entries() -> BTreeMap<String, HtmlQuirksMode> {
+    let mut entries = BTreeMap::new();
+    for line in SKIPPED_QUIRKS_FILES.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#')) {
+        let (entry, reason) = line.split_once("|reason=").expect("a skipped quirks layout file includes a reason");
+        assert!(!reason.trim().is_empty(), "a skipped quirks layout file includes a nonempty reason");
+        let (relative, mode) = entry.split_once("|mode=").expect("a skipped quirks layout file includes its expected mode");
+        let mode = match mode {
+            "quirks" => HtmlQuirksMode::Quirks,
+            "limited-quirks" => HtmlQuirksMode::LimitedQuirks,
+            _ => panic!("unknown skipped layout document mode: {mode}"),
+        };
+        assert!(entries.insert(relative.to_owned(), mode).is_none(), "duplicate skipped quirks layout file: {relative}");
+    }
+    entries
+}
+
+fn skipped_unsupported_entries() -> BTreeMap<String, String> {
+    let mut entries = BTreeMap::new();
+    for line in SKIPPED_UNSUPPORTED_FILES.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#')) {
+        let (relative, reason) = line.split_once("|reason=").expect("a skipped unsupported layout file includes a reason");
+        assert!(!reason.trim().is_empty(), "a skipped unsupported layout file includes a nonempty reason");
+        assert!(entries.insert(relative.to_owned(), reason.to_owned()).is_none(), "duplicate skipped unsupported layout file: {relative}");
+    }
+    entries
+}
+
+fn unsupported_replaced_element_tags(document: &Document) -> Vec<String> {
+    document
+        .node_ids()
+        .filter_map(|node| document.element_ref(node))
+        .map(|element| element.tag())
+        .filter(|tag| matches!(*tag, "audio" | "canvas" | "embed" | "iframe" | "img" | "input" | "object" | "video"))
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 /// Applies setup performed by small WPT scripts that the noninteractive

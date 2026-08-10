@@ -1408,14 +1408,7 @@ mod tests {
         );
         let metadata = document.head_metadata();
         assert_eq!(metadata.title.as_deref(), Some("Example"));
-        assert_eq!(
-            metadata.stylesheets,
-            vec![
-                StylesheetReference::External("base.css?v=1".to_owned()),
-                StylesheetReference::Inline("p { color: blue; }".to_owned()),
-                StylesheetReference::Inline("p { background: green; }".to_owned()),
-            ]
-        );
+        assert_eq!(metadata.stylesheets, vec![StylesheetReference::External("base.css?v=1".to_owned()), StylesheetReference::Inline("p { color: blue; }".to_owned()), StylesheetReference::Inline("p { background: green; }".to_owned()),]);
     }
 
     #[test]

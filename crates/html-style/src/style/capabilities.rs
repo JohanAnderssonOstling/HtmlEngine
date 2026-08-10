@@ -146,6 +146,7 @@ pub(crate) fn is_supported_property_name(name: &str) -> bool {
             | "overflow-wrap"
             | "word-wrap"
             | "box-sizing"
+            | "contain"
             | "break-before"
             | "break-after"
             | "break-inside"
@@ -206,6 +207,14 @@ pub fn property_name_is_supported(name: &str) -> bool {
 }
 
 pub(crate) fn declaration_capability(name: &str, value: &str) -> PropertyCapability {
+    if name.eq_ignore_ascii_case("contain") {
+        let css_wide = matches!(value.trim().to_ascii_lowercase().as_str(), "inherit" | "initial" | "unset" | "revert" | "revert-layer");
+        return if css_wide || crate::style::contain::parse(value).is_some_and(|contain| contain.fully_supported) {
+            PropertyCapability::Supported
+        } else {
+            PropertyCapability::Unsupported(UnsupportedStyleFeature::Value)
+        };
+    }
     if is_border_image_property_name(name) {
         return PropertyCapability::Unsupported(UnsupportedStyleFeature::BorderImage);
     }
@@ -446,12 +455,21 @@ mod tests {
         assert!(property_name_is_supported("border-block-color"));
         assert!(property_name_is_supported("border-radius"));
         assert!(property_name_is_supported("border-start-start-radius"));
+        assert!(property_name_is_supported("contain"));
         assert!(!property_name_is_supported("writing-mode"));
         assert!(!property_name_is_supported("inset-inline-start"));
         assert!(property_name_is_supported("break-inside"));
         assert!(property_name_is_supported("page-break-after"));
         assert!(property_name_is_supported("widows"));
         assert!(!property_name_is_supported("opacity"));
+    }
+
+    #[test]
+    fn contain_capabilities_cover_only_the_implemented_size_subset() {
+        assert_eq!(declaration_capability("contain", "none"), PropertyCapability::Supported);
+        assert_eq!(declaration_capability("contain", "size"), PropertyCapability::Supported);
+        assert_eq!(declaration_capability("contain", "layout size"), PropertyCapability::Unsupported(UnsupportedStyleFeature::Value));
+        assert_eq!(declaration_capability("contain", "strict"), PropertyCapability::Unsupported(UnsupportedStyleFeature::Value));
     }
 
     #[test]

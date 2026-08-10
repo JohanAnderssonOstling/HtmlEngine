@@ -115,8 +115,14 @@ mod tests {
         let low_ascent = layout_html_with_font_metrics(html, 0.5, 0.5);
         let high_ascent = layout_html_with_font_metrics(html, 0.5, 0.7);
         let overline_y = |document: &LaidOutDocument| document.render_view().fragments().decorations().iter().find(|fragment| fragment.color() == 0x123456FF).expect("overline fragment").rect().y0;
+        let baseline_y = |document: &LaidOutDocument| {
+            let line = document.render_view().text().line(0).expect("decorated line");
+            line.point().y + line.baseline()
+        };
 
-        assert!((overline_y(&low_ascent) - overline_y(&high_ascent) - 4.0).abs() < 0.001);
+        let low_offset = baseline_y(&low_ascent) - overline_y(&low_ascent);
+        let high_offset = baseline_y(&high_ascent) - overline_y(&high_ascent);
+        assert!((high_offset - low_offset - 4.0).abs() < 0.001, "low-ascent offset={low_offset}, high-ascent offset={high_offset}");
     }
 
     #[test]

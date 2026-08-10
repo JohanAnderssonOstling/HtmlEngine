@@ -130,8 +130,23 @@ pub(super) fn positioned_inline_box_fragments(
                 let (fragment_top, fragment_bottom) = if is_inline {
                     let style = engine.reader.style(box_idx);
                     let font_size = style.font_size() as f64;
-                    let (ascent, descent) = engine.reader.font_metrics(box_idx).line_box_ratios().map_or((font_size * 0.8, font_size * 0.2), |(ascent, descent)| (font_size * ascent as f64, font_size * descent as f64));
-                    (fragment_baseline - ascent as f32, fragment_baseline + descent as f32)
+                    let font_metrics = engine.reader.font_metrics(box_idx);
+                    let (ascent, descent) = font_metrics.line_box_ratios().map_or((font_size * 0.8, font_size * 0.2), |(ascent, descent)| (font_size * ascent as f64, font_size * descent as f64));
+                    let mut top = fragment_baseline - ascent as f32;
+                    let mut bottom = fragment_baseline + descent as f32;
+                    let trim = style.text_box_trim();
+                    let edge = style.text_box_edge();
+                    if matches!(trim, TextBoxTrim::Start | TextBoxTrim::Both) {
+                        top = match edge.over {
+                            TextBoxOverEdge::Text => top,
+                            TextBoxOverEdge::Cap => fragment_baseline - font_size as f32 * font_metrics.cap_height_ratio(),
+                            TextBoxOverEdge::Ex => fragment_baseline - font_size as f32 * font_metrics.x_height_ratio(),
+                        };
+                    }
+                    if matches!(trim, TextBoxTrim::End | TextBoxTrim::Both) && matches!(edge.under, TextBoxUnderEdge::Alphabetic) {
+                        bottom = fragment_baseline;
+                    }
+                    (top, bottom)
                 } else {
                     (token_top, token_bottom)
                 };
@@ -1248,9 +1263,11 @@ pub(super) fn write_line_fragments(
         || span.iter().any(|token| match token.kind() {
             InlineTokenKind::FloatAnchor { .. } | InlineTokenKind::AbsoluteAnchor { .. } | InlineTokenKind::Opportunity => false,
             InlineTokenKind::InlineBoundary { payload_idx } => match replaced.get(payload_idx as usize) {
-                Some(ReplacedToken::InlineBoundary { box_idx, .. }) => {
+                Some(ReplacedToken::InlineBoundary { box_idx, inline_start, inline_end, .. }) => {
                     let style = engine.reader.style(*box_idx as usize);
                     token.width != 0.0
+                        || (*inline_start && (!style.padding_left().is_zero() || style.border_left_width() != 0.0))
+                        || (*inline_end && (!style.padding_right().is_zero() || style.border_right_width() != 0.0))
                         || !style.margin_top().is_zero()
                         || !style.margin_bottom().is_zero()
                         || !style.padding_top().is_zero()
@@ -1320,13 +1337,24 @@ pub(super) fn write_line_fragments(
             engine.fragments.state_mut().fragment_output.image_fragments.push(ImageFragment { line_idx, image_idx: *image_idx, offset: border_offset + content_inset.to_vec2(), size: *content_size, paint_order });
         } else if let InlineTokenKind::AtomicBox { payload_idx } = token.kind() {
             debug_assert!(publishes_line);
-            let ReplacedToken::AtomicBox { box_idx, border_size, containing_width, margin_left, margin_top } = replaced.get(payload_idx as usize).expect("atomic token payload index in bounds") else {
+            let ReplacedToken::AtomicBox { box_idx, border_size, containing_width, containing_height, margin_left, margin_top } = replaced.get(payload_idx as usize).expect("atomic token payload index in bounds") else {
                 unreachable!("atomic token must reference an atomic payload")
             };
             let border_point = Point::new(point.x + placement.x + placement.relative_offset.x + *margin_left, point.y + line.baseline - ascent - offset + *margin_top);
             engine.geometry.set_point(*box_idx as usize, border_point);
             let decoration_start = engine.fragments.decoration_len();
-            let _ = engine.layout_box(crate::layout::BoxLayoutRequest::assigned(*box_idx as usize, *containing_width, *border_size));
+            let height = engine.reader.style(*box_idx as usize).height();
+            let authored_height_is_definite = match height {
+                html_style_model::UsedPreferredSize::Px(_) => true,
+                html_style_model::UsedPreferredSize::Percent(_) | html_style_model::UsedPreferredSize::Stretch => containing_height.is_some(),
+                html_style_model::UsedPreferredSize::Calc { .. } | html_style_model::UsedPreferredSize::Comparison { .. } => !height.percentage_dependent() || containing_height.is_some(),
+                html_style_model::UsedPreferredSize::Auto
+                | html_style_model::UsedPreferredSize::MinContent
+                | html_style_model::UsedPreferredSize::MaxContent
+                | html_style_model::UsedPreferredSize::FitContent => false,
+            };
+            let request = crate::layout::BoxLayoutRequest::atomic_assigned(*box_idx as usize, *containing_width, *containing_height, *border_size, authored_height_is_definite);
+            let _ = engine.layout_box(request);
             // CSS paints an inline-block (and the non-positioned contents it
             // establishes) atomically at this point in the owning line. Keep
             // its block decorations with that line instead of replaying them

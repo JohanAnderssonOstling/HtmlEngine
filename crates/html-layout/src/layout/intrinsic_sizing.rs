@@ -9,6 +9,10 @@ use std::ops::Range;
 /// Container-specific algorithms contribute through the dispatch in
 /// `box_content_intrinsic_widths`; table track solving remains table-owned.
 pub(crate) fn box_intrinsic_widths(engine: &LayoutEngine<'_, '_>, box_idx: usize) -> (f64, f64) {
+    box_intrinsic_widths_with_available(engine, box_idx, None)
+}
+
+fn box_intrinsic_widths_with_available(engine: &LayoutEngine<'_, '_>, box_idx: usize, available_width: Option<f64>) -> (f64, f64) {
     // Intrinsic sizing: percentage padding/margin count as zero.
     let style = engine.reader.style(box_idx);
     let mut box_model = ResolvedBoxModel::new(style, 0.0);
@@ -21,28 +25,22 @@ pub(crate) fn box_intrinsic_widths(engine: &LayoutEngine<'_, '_>, box_idx: usize
     let margins = if engine.reader.is_table_cell_box(box_idx) { 0.0 } else { box_model.horizontal_margin() };
     let padding_border = box_model.horizontal_padding_border();
     let extras = margins + padding_border;
-    let (content_min, content_max) = box_content_intrinsic_widths(engine, box_idx);
+    let available_content = available_width.map(|available| (available - extras).max(0.0));
+    let (content_min, content_max) = box_content_intrinsic_widths_impl(engine, box_idx, available_content);
     let outer_min = content_min + extras;
     let outer_max = content_max + extras;
-    let authored_outer = |width: f32| {
-        let width = width.max(0.0) as f64;
-        match style.box_sizing() {
-            html_style_model::BoxSizing::ContentBox => width + padding_border + margins,
-            html_style_model::BoxSizing::BorderBox => width.max(padding_border) + margins,
-        }
-    };
     let intrinsic_value = |size: PreferredSize, auto: f64| match size {
         PreferredSize::Auto | PreferredSize::Percent(_) | PreferredSize::Stretch => auto,
         PreferredSize::MinContent => outer_min,
         PreferredSize::MaxContent => outer_max,
-        PreferredSize::FitContent => outer_max,
-        PreferredSize::Px(width) => authored_outer(width),
+        PreferredSize::FitContent => available_width.map_or(outer_max, |available| outer_max.min(available.max(outer_min))),
+        PreferredSize::Px(_) => super::resolve_definite_outer_inline_size(size, style.box_sizing(), padding_border, margins).expect("pixel sizes are definite"),
         // During intrinsic sizing the percentage has an indefinite basis;
         // preserve the definite length contribution of a linear calc.
-        PreferredSize::Calc { absolute_px, percentage_dependent: false, .. } => authored_outer(absolute_px),
+        PreferredSize::Calc { percentage_dependent: false, .. } => super::resolve_definite_outer_inline_size(size, style.box_sizing(), padding_border, margins).expect("percentage-independent calc is definite"),
         PreferredSize::Calc { percentage_dependent: true, .. } => auto,
         PreferredSize::Comparison { .. } if size.percentage_dependent() => auto,
-        PreferredSize::Comparison { .. } => authored_outer(html_style_model::resolve_used_preferred_size(size, auto, 0.0) as f32),
+        PreferredSize::Comparison { .. } => super::resolve_definite_outer_inline_size(size, style.box_sizing(), padding_border, margins).expect("percentage-independent comparison is definite"),
     };
 
     let mut preferred_min = intrinsic_value(style.width(), outer_min);
@@ -55,12 +53,24 @@ pub(crate) fn box_intrinsic_widths(engine: &LayoutEngine<'_, '_>, box_idx: usize
 }
 
 pub(crate) fn box_content_intrinsic_widths(engine: &LayoutEngine<'_, '_>, box_idx: usize) -> (f64, f64) {
+    box_content_intrinsic_widths_impl(engine, box_idx, None)
+}
+
+/// Intrinsic content contributions when the formatting context already knows
+/// the available inline size. This is the context required by `fit-content`:
+/// unlike min/max-content, its contribution is not meaningful without the
+/// stretch-fit limit supplied by the containing block.
+pub(crate) fn box_content_intrinsic_widths_with_available(engine: &LayoutEngine<'_, '_>, box_idx: usize, available_width: f64) -> (f64, f64) {
+    box_content_intrinsic_widths_impl(engine, box_idx, Some(available_width.max(0.0)))
+}
+
+fn box_content_intrinsic_widths_impl(engine: &LayoutEngine<'_, '_>, box_idx: usize, available_width: Option<f64>) -> (f64, f64) {
     if let Some(size) = engine.replaced.intrinsic_size(&engine.reader, box_idx) {
         return (size.width, size.width);
     }
     match engine.reader.box_layout_mode(box_idx) {
-        Some(LayoutMode::Block(block)) => children_intrinsic_widths(engine, &block.children, box_idx),
-        Some(LayoutMode::TableCell(cell)) => children_intrinsic_widths(engine, &cell.children, box_idx),
+        Some(LayoutMode::Block(block)) => children_intrinsic_widths(engine, &block.children, box_idx, available_width),
+        Some(LayoutMode::TableCell(cell)) => children_intrinsic_widths(engine, &cell.children, box_idx, available_width),
         Some(LayoutMode::Inline(range)) | Some(LayoutMode::Anonymous(range)) => runs_intrinsic_widths(engine, range.clone(), box_idx),
         Some(LayoutMode::Table(_)) => crate::table::table_intrinsic_widths(engine, box_idx),
         Some(LayoutMode::TableRow(row)) => {
@@ -74,7 +84,7 @@ pub(crate) fn box_content_intrinsic_widths(engine: &LayoutEngine<'_, '_>, box_id
             (min_w, max_w)
         }
         Some(LayoutMode::Flex(container)) => crate::flex_grid::intrinsic_widths(engine, box_idx, &container.children, TaffyContainerKind::Flex),
-        Some(LayoutMode::Grid(container)) => crate::flex_grid::intrinsic_widths(engine, box_idx, &container.children, TaffyContainerKind::Grid),
+        Some(LayoutMode::Grid(container)) => crate::flex_grid::intrinsic_widths_with_available(engine, box_idx, &container.children, TaffyContainerKind::Grid, available_width),
         None => (0.0, 0.0),
     }
 }
@@ -118,7 +128,7 @@ pub(crate) fn contains_full_width_percentage_table(engine: &LayoutEngine<'_, '_>
     }
 }
 
-fn children_intrinsic_widths(engine: &LayoutEngine<'_, '_>, children: &Children, container_box_idx: usize) -> (f64, f64) {
+fn children_intrinsic_widths(engine: &LayoutEngine<'_, '_>, children: &Children, container_box_idx: usize, available_width: Option<f64>) -> (f64, f64) {
     match children {
         Children::InlineItems(range) => runs_intrinsic_widths(engine, range.clone(), container_box_idx),
         Children::Blocks(indices) => {
@@ -134,7 +144,7 @@ fn children_intrinsic_widths(engine: &LayoutEngine<'_, '_>, children: &Children,
                 if engine.reader.style(child_idx as usize).position() == html_style_model::PositionMode::Absolute {
                     continue;
                 }
-                let (child_min, child_max) = box_intrinsic_widths(engine, child_idx as usize);
+                let (child_min, child_max) = box_intrinsic_widths_with_available(engine, child_idx as usize, available_width);
                 min_w = min_w.max(child_min);
                 if matches!(engine.reader.style(child_idx as usize).float(), Float::Left | Float::Right) {
                     float_line_max += child_max;
@@ -185,8 +195,8 @@ fn runs_intrinsic_widths(engine: &LayoutEngine<'_, '_>, run_range: Range<u32>, c
     };
 
     for run in &engine.text.inline_items()[run_range.start as usize..run_range.end as usize] {
-        if !matches!(run.kind, InlineItemKind::AtomicBox { .. } | InlineItemKind::FloatAnchor { .. } | InlineItemKind::AbsoluteAnchor { .. }) && !super::inline::run_belongs_to_inline_context(engine, run.box_idx as usize, container_box_idx)
-        {
+        let ownership_box = super::inline::tokens::inline_item_ownership_box(engine, run);
+        if !ownership_box.is_some_and(|box_idx| super::inline::run_belongs_to_inline_context(engine, box_idx, container_box_idx)) {
             continue;
         }
         let style = engine.reader.style(run.box_idx as usize);
@@ -277,10 +287,23 @@ fn runs_intrinsic_widths(engine: &LayoutEngine<'_, '_>, run_range: Range<u32>, c
             InlineItemKind::AtomicBox { box_idx } => {
                 let (atomic_min, atomic_max) = box_intrinsic_widths(engine, *box_idx as usize);
                 apply_max_indent(&mut current_line, &mut max_indent_applied, max_starts_indented_line);
+                // Atomic inline boxes admit a soft wrap on either side. They
+                // remain adjacent for max-content sizing, but each atomic box
+                // is its own unbreakable segment for min-content sizing.
+                if segment != 0.0 || min_indent_applied {
+                    min_content = min_content.max(segment.max(0.0));
+                    segment = 0.0;
+                    min_starts_indented_line = false;
+                    min_indent_applied = false;
+                }
                 apply_min_indent(&mut segment, &mut min_indent_applied, min_starts_indented_line);
                 current_line += pending_collapsible_space + atomic_max;
                 pending_collapsible_space = 0.0;
                 segment += atomic_min;
+                min_content = min_content.max(segment.max(0.0));
+                segment = 0.0;
+                min_starts_indented_line = false;
+                min_indent_applied = false;
             }
             InlineItemKind::Break { .. } => {
                 min_content = min_content.max(segment.max(0.0));

@@ -10,8 +10,8 @@ use html_style_model::{
     AspectRatio as ComputedAspectRatio, Background, Border, BorderCollapseMode, BorderRadii, BorderStyle, BoxModel, BoxSizing, BreakBetween, BreakInside, CaptionSide, Clear, ComputedSizeComponent, ComputedStyleValueError, ComputedStyles,
     ComputedStylesBuilder, ContentAlignment, CornerRadius, CounterDirective, CounterDirectives, CounterStyle, DecorationColor, Display, EmptyCellsMode, FlexDirection, FlexWrap, Float, Font, FontRelativeLength, FontStyle, GeneratedContent,
     GeneratedContentItem, GridAutoFlow, GridPlacement, GridPlacementRange, GridRepeatCount, GridTemplateArea, GridTemplateTrack, GridTrackBreadth, GridTrackSize, Hyphens, InheritedText, ItemAlignment, LayoutStyle, LengthPct,
-    LogicalTextAlign, OpenTypeFeature, OverflowMode, OverflowWrap, PositionMode, PreferredSize, QuoteStyle, SizeComparison, StyleIndices, StyleStringId, TabSize, TextAlign, TextDecorationLines, TextDecorationStyle, TextDecorationThickness,
-    TextDirection, TextOverflow, TextSpacing, TextTransform, VerticalAlignValue, WhiteSpace, WordBreak,
+    LogicalTextAlign, OpenTypeFeature, OverflowMode, OverflowWrap, PositionMode, PreferredSize, QuoteStyle, SizeComparison, StyleIndices, StyleStringId, TabSize, TableLayoutMode, TextAlign, TextDecorationLines, TextDecorationStyle, TextDecorationThickness,
+    TextBoxEdge, TextBoxOverEdge, TextBoxTrim, TextBoxUnderEdge, TextDirection, TextOverflow, TextSpacing, TextTransform, VerticalAlignValue, WhiteSpace, WordBreak,
 };
 use lightningcss::printer::{Printer, PrinterOptions};
 use lightningcss::properties::border::{BorderSideWidth, LineStyle};
@@ -737,6 +737,10 @@ fn apply_property<'a>(doc: &Document, styles: &mut ComputedStylesBuilder, style:
     if let Some((name, tokens)) = raw_property {
         let normalized_name = name.to_ascii_lowercase();
         match normalized_name.as_str() {
+            "text-box" | "text-box-trim" | "text-box-edge" => {
+                let _ = apply_text_box_property(style, &normalized_name, tokens);
+                return;
+            }
             "font-feature-settings" => {
                 if let Some(value) = token_list_to_css_string(tokens).as_deref().and_then(parse_font_feature_settings) {
                     style.font.font_feature_settings = value;
@@ -788,6 +792,12 @@ fn apply_property<'a>(doc: &Document, styles: &mut ComputedStylesBuilder, style:
             "orphans" => {
                 if let Some(value) = single_positive_integer(tokens) {
                     style.text.orphans = value;
+                }
+                return;
+            }
+            "contain" => {
+                if let Some(value) = crate::style::contain::parse_tokens(tokens) {
+                    style.box_model.size_containment = value.size;
                 }
                 return;
             }
@@ -1715,11 +1725,13 @@ fn apply_property<'a>(doc: &Document, styles: &mut ComputedStylesBuilder, style:
         }
         Property::GridAutoFlow(value) => style.layout.grid_auto_flow = grid_auto_flow(*value),
         Property::GridTemplateAreas(value) => {
-            let Some(value) = grid_template_areas(styles, value) else { return };
-            style.layout.grid_template_areas = value;
+            let Some((areas, rows, columns)) = grid_template_areas(styles, value) else { return };
+            style.layout.grid_template_areas = areas;
+            style.layout.grid_template_area_rows = rows;
+            style.layout.grid_template_area_columns = columns;
         }
         Property::GridTemplate(value) => {
-            let (Some((rows, row_names)), Some((columns, column_names)), Some(areas)) =
+            let (Some((rows, row_names)), Some((columns, column_names)), Some((areas, area_rows, area_columns))) =
                 (grid_template_tracks(styles, &value.rows, style.font.font_size, doc.root_font_size()), grid_template_tracks(styles, &value.columns, style.font.font_size, doc.root_font_size()), grid_template_areas(styles, &value.areas))
             else {
                 return;
@@ -1729,9 +1741,11 @@ fn apply_property<'a>(doc: &Document, styles: &mut ComputedStylesBuilder, style:
             style.layout.grid_template_columns = columns;
             style.layout.grid_template_column_names = column_names;
             style.layout.grid_template_areas = areas;
+            style.layout.grid_template_area_rows = area_rows;
+            style.layout.grid_template_area_columns = area_columns;
         }
         Property::Grid(value) => {
-            let (Some((rows, row_names)), Some((columns, column_names)), Some(areas), Some(auto_rows), Some(auto_columns)) = (
+            let (Some((rows, row_names)), Some((columns, column_names)), Some((areas, area_rows, area_columns)), Some(auto_rows), Some(auto_columns)) = (
                 grid_template_tracks(styles, &value.rows, style.font.font_size, doc.root_font_size()),
                 grid_template_tracks(styles, &value.columns, style.font.font_size, doc.root_font_size()),
                 grid_template_areas(styles, &value.areas),
@@ -1745,6 +1759,8 @@ fn apply_property<'a>(doc: &Document, styles: &mut ComputedStylesBuilder, style:
             style.layout.grid_template_columns = columns;
             style.layout.grid_template_column_names = column_names;
             style.layout.grid_template_areas = areas;
+            style.layout.grid_template_area_rows = area_rows;
+            style.layout.grid_template_area_columns = area_columns;
             style.layout.grid_auto_rows = auto_rows;
             style.layout.grid_auto_columns = auto_columns;
             style.layout.grid_auto_flow = grid_auto_flow(value.auto_flow);
@@ -1836,6 +1852,9 @@ fn apply_property<'a>(doc: &Document, styles: &mut ComputedStylesBuilder, style:
 
         _ => {
             if let Property::Unparsed(unparsed) = property {
+                if apply_custom_box_keyword(style, unparsed.property_id.name(), &unparsed.value) {
+                    return;
+                }
                 match unparsed.property_id.name() {
                     "page-break-before" | "page-break-after" | "page-break-inside" | "break-before" | "break-after" | "break-inside" => {
                         // Not supported yet.
@@ -1928,6 +1947,13 @@ fn apply_custom_box_keyword(style: &mut WorkingStyle, name: &str, tokens: &Token
     match name.to_ascii_lowercase().as_str() {
         "float" => style.box_model.float = logical_float(&value, style.text.direction, style.box_model.float),
         "clear" => style.box_model.clear = logical_clear(&value, style.text.direction, style.box_model.clear),
+        "table-layout" => {
+            style.box_model.table_layout = match value.as_str() {
+                "auto" => TableLayoutMode::Auto,
+                "fixed" => TableLayoutMode::Fixed,
+                _ => return false,
+            }
+        }
         "border-collapse" => {
             style.box_model.border_collapse = match value.as_str() {
                 "collapse" => BorderCollapseMode::Collapse,
@@ -1952,6 +1978,76 @@ fn apply_custom_box_keyword(style: &mut WorkingStyle, name: &str, tokens: &Token
         _ => return false,
     }
     true
+}
+
+fn apply_text_box_property(style: &mut WorkingStyle, name: &str, tokens: &TokenList<'_>) -> bool {
+    let words = significant_tokens(tokens).into_iter().map(|token| token_ident(token).map(str::to_ascii_lowercase)).collect::<Option<Vec<_>>>();
+    let Some(words) = words else { return false };
+    match name {
+        "text-box-trim" => {
+            let [word] = words.as_slice() else { return false };
+            let Some(trim) = parse_text_box_trim(word) else { return false };
+            style.box_model.text_box_trim = trim;
+        }
+        "text-box-edge" => {
+            let Some(edge) = parse_text_box_edge(&words) else { return false };
+            style.text.text_box_edge = edge;
+        }
+        "text-box" => {
+            if words.as_slice() == ["normal"] {
+                style.box_model.text_box_trim = TextBoxTrim::None;
+                style.text.text_box_edge = TextBoxEdge::default();
+                return true;
+            }
+            let mut trim = None;
+            let mut edge_words = Vec::with_capacity(2);
+            for word in &words {
+                if let Some(value) = parse_text_box_trim(word) {
+                    if trim.replace(value).is_some() {
+                        return false;
+                    }
+                } else {
+                    edge_words.push(word.clone());
+                }
+            }
+            if edge_words.len() > 2 {
+                return false;
+            }
+            let edge = if edge_words.is_empty() { TextBoxEdge::default() } else if let Some(edge) = parse_text_box_edge(&edge_words) { edge } else { return false };
+            style.box_model.text_box_trim = trim.unwrap_or(TextBoxTrim::Both);
+            style.text.text_box_edge = edge;
+        }
+        _ => return false,
+    }
+    true
+}
+
+fn parse_text_box_trim(word: &str) -> Option<TextBoxTrim> {
+    match word {
+        "none" => Some(TextBoxTrim::None),
+        "trim-start" => Some(TextBoxTrim::Start),
+        "trim-end" => Some(TextBoxTrim::End),
+        "trim-both" => Some(TextBoxTrim::Both),
+        _ => None,
+    }
+}
+
+fn parse_text_box_edge(words: &[String]) -> Option<TextBoxEdge> {
+    if words == ["auto"] {
+        return Some(TextBoxEdge::default());
+    }
+    let over = match words.first()?.as_str() {
+        "text" | "ideographic" | "ideographic-ink" => TextBoxOverEdge::Text,
+        "cap" => TextBoxOverEdge::Cap,
+        "ex" => TextBoxOverEdge::Ex,
+        _ => return None,
+    };
+    let under = match words.get(1).map(String::as_str).unwrap_or("text") {
+        "text" | "ideographic" | "ideographic-ink" => TextBoxUnderEdge::Text,
+        "alphabetic" => TextBoxUnderEdge::Alphabetic,
+        _ => return None,
+    };
+    Some(TextBoxEdge { over, under })
 }
 
 /// Parse the CSS 2.1 generated-content forms that do not require counter or
@@ -2105,51 +2201,70 @@ fn parse_quotes(styles: &mut ComputedStylesBuilder, tokens: &TokenList<'_>) -> O
 /// declarations. Resolve them with the canonical Box Alignment grammar while
 /// keeping their independent place in cascade order.
 fn try_apply_legacy_grid_gap_alias(doc: &Document, style: &mut WorkingStyle, property: &Property<'_>, parent: &ParentStyle) -> bool {
+    #[derive(Clone, Copy)]
+    enum Axis {
+        Row,
+        Column,
+        Both,
+    }
+
     let (name, tokens) = match property {
         Property::Custom(custom) => (custom.name.as_ref(), &custom.value),
         Property::Unparsed(unparsed) => (unparsed.property_id.name(), &unparsed.value),
         _ => return false,
     };
-    let row_axis = match name {
-        "grid-row-gap" => true,
-        "grid-column-gap" => false,
+    let axis = match name {
+        "grid-row-gap" => Axis::Row,
+        "grid-column-gap" => Axis::Column,
+        "grid-gap" => Axis::Both,
         _ => return false,
     };
 
     if let Some(keyword) = single_ident_keyword(tokens).map(str::to_ascii_lowercase) {
-        let inherited = if row_axis { parent.layout.row_gap } else { parent.layout.column_gap };
-        let value = match keyword.as_str() {
-            "inherit" => Some(inherited),
-            "initial" | "unset" => Some(LengthPct::Px(0.0)),
-            "revert" | "revert-layer" => None,
+        let values = match keyword.as_str() {
+            "inherit" => Some((parent.layout.row_gap, parent.layout.column_gap)),
+            "initial" | "unset" => Some((LengthPct::Px(0.0), LengthPct::Px(0.0))),
+            "revert" | "revert-layer" => return true,
             _ => None,
         };
-        if let Some(value) = value {
-            if row_axis {
-                style.layout.row_gap = value;
-            } else {
-                style.layout.column_gap = value;
+        if let Some((row, column)) = values {
+            match axis {
+                Axis::Row => style.layout.row_gap = row,
+                Axis::Column => style.layout.column_gap = column,
+                Axis::Both => {
+                    style.layout.row_gap = row;
+                    style.layout.column_gap = column;
+                }
             }
-            return true;
-        }
-        if matches!(keyword.as_str(), "revert" | "revert-layer") {
             return true;
         }
     }
 
     let Some(css) = token_list_to_css_string(tokens) else { return true };
-    let canonical = if row_axis { "row-gap" } else { "column-gap" };
-    let Ok(property) = Property::parse_string(PropertyId::from(canonical), &css, ParserOptions::default()) else { return true };
-    let parsed = match property {
-        Property::RowGap(value) | Property::ColumnGap(value) => gap_value(&value, style.font.font_size, doc.root_font_size()),
-        _ => None,
+    let canonical = match axis {
+        Axis::Row => "row-gap",
+        Axis::Column => "column-gap",
+        Axis::Both => "gap",
     };
-    if let Some(value) = parsed {
-        if row_axis {
-            style.layout.row_gap = value;
-        } else {
-            style.layout.column_gap = value;
+    let Ok(property) = Property::parse_string(PropertyId::from(canonical), &css, ParserOptions::default()) else { return true };
+    match (axis, property) {
+        (Axis::Row, Property::RowGap(value)) => {
+            if let Some(value) = gap_value(&value, style.font.font_size, doc.root_font_size()) {
+                style.layout.row_gap = value;
+            }
         }
+        (Axis::Column, Property::ColumnGap(value)) => {
+            if let Some(value) = gap_value(&value, style.font.font_size, doc.root_font_size()) {
+                style.layout.column_gap = value;
+            }
+        }
+        (Axis::Both, Property::Gap(value)) => {
+            if let (Some(row), Some(column)) = (gap_value(&value.row, style.font.font_size, doc.root_font_size()), gap_value(&value.column, style.font.font_size, doc.root_font_size())) {
+                style.layout.row_gap = row;
+                style.layout.column_gap = column;
+            }
+        }
+        _ => {}
     }
     true
 }
@@ -2178,6 +2293,7 @@ fn is_inherited_property(name: &str) -> bool {
             | "text-align-last"
             | "text-indent"
             | "text-transform"
+            | "text-box-edge"
             | "white-space"
             | "word-break"
             | "overflow-wrap"
@@ -2352,6 +2468,12 @@ fn apply_css_wide_keyword_with_rollback(style: &mut WorkingStyle, name: &str, ke
         "overflow-x" => style.box_model.overflow_x = src.box_model.overflow_x,
         "overflow-y" => style.box_model.overflow_y = src.box_model.overflow_y,
         "text-overflow" => style.box_model.text_overflow = src.box_model.text_overflow,
+        "text-box" => {
+            style.box_model.text_box_trim = src.box_model.text_box_trim;
+            style.text.text_box_edge = src.text.text_box_edge;
+        }
+        "text-box-trim" => style.box_model.text_box_trim = src.box_model.text_box_trim,
+        "text-box-edge" => style.text.text_box_edge = src.text.text_box_edge,
         "box-sizing" => style.box_model.box_sizing = src.box_model.box_sizing,
         "list-style" => {
             style.text.list_style_type = src.text.list_style_type;
@@ -2385,6 +2507,7 @@ fn apply_css_wide_keyword_with_rollback(style: &mut WorkingStyle, name: &str, ke
             style.background.background_image_present = src.background.background_image_present;
         }
         "vertical-align" => style.box_model.vertical_align = src.box_model.vertical_align,
+        "contain" => style.box_model.size_containment = src.box_model.size_containment,
         "display" => style.box_model.display = src.box_model.display,
         "position" => style.layout.position = src.layout.position,
         "break-before" | "page-break-before" => style.layout.break_before = src.layout.break_before,
@@ -2450,13 +2573,19 @@ fn apply_css_wide_keyword_with_rollback(style: &mut WorkingStyle, name: &str, ke
             style.layout.grid_template_columns = src.layout.grid_template_columns.clone();
             style.layout.grid_template_column_names = src.layout.grid_template_column_names.clone();
         }
-        "grid-template-areas" => style.layout.grid_template_areas = src.layout.grid_template_areas.clone(),
+        "grid-template-areas" => {
+            style.layout.grid_template_areas = src.layout.grid_template_areas.clone();
+            style.layout.grid_template_area_rows = src.layout.grid_template_area_rows;
+            style.layout.grid_template_area_columns = src.layout.grid_template_area_columns;
+        }
         "grid-template" => {
             style.layout.grid_template_rows = src.layout.grid_template_rows.clone();
             style.layout.grid_template_columns = src.layout.grid_template_columns.clone();
             style.layout.grid_template_row_names = src.layout.grid_template_row_names.clone();
             style.layout.grid_template_column_names = src.layout.grid_template_column_names.clone();
             style.layout.grid_template_areas = src.layout.grid_template_areas.clone();
+            style.layout.grid_template_area_rows = src.layout.grid_template_area_rows;
+            style.layout.grid_template_area_columns = src.layout.grid_template_area_columns;
         }
         "grid-auto-rows" => style.layout.grid_auto_rows = src.layout.grid_auto_rows.clone(),
         "grid-auto-columns" => style.layout.grid_auto_columns = src.layout.grid_auto_columns.clone(),
@@ -2477,12 +2606,15 @@ fn apply_css_wide_keyword_with_rollback(style: &mut WorkingStyle, name: &str, ke
             style.layout.grid_template_row_names = src.layout.grid_template_row_names.clone();
             style.layout.grid_template_column_names = src.layout.grid_template_column_names.clone();
             style.layout.grid_template_areas = src.layout.grid_template_areas.clone();
+            style.layout.grid_template_area_rows = src.layout.grid_template_area_rows;
+            style.layout.grid_template_area_columns = src.layout.grid_template_area_columns;
             style.layout.grid_auto_rows = src.layout.grid_auto_rows.clone();
             style.layout.grid_auto_columns = src.layout.grid_auto_columns.clone();
             style.layout.grid_auto_flow = src.layout.grid_auto_flow;
         }
         "float" => style.box_model.float = src.box_model.float,
         "clear" => style.box_model.clear = src.box_model.clear,
+        "table-layout" => style.box_model.table_layout = src.box_model.table_layout,
         "border-collapse" => style.box_model.border_collapse = src.box_model.border_collapse,
         "border-spacing" => {
             style.box_model.border_spacing_horizontal = src.box_model.border_spacing_horizontal;
@@ -3184,10 +3316,10 @@ fn justify_items(value: &lightningcss::properties::align::JustifyItems) -> Optio
         JustifyItems::BaselinePosition(BaselinePosition::First) => ItemAlignment::Baseline,
         JustifyItems::BaselinePosition(BaselinePosition::Last) => return None,
         JustifyItems::SelfPosition { value, .. } => self_position(value),
-        JustifyItems::Left { .. } => ItemAlignment::Start,
-        JustifyItems::Right { .. } => ItemAlignment::End,
-        JustifyItems::Legacy(LegacyJustify::Left) => ItemAlignment::Start,
-        JustifyItems::Legacy(LegacyJustify::Right) => ItemAlignment::End,
+        JustifyItems::Left { .. } => ItemAlignment::Left,
+        JustifyItems::Right { .. } => ItemAlignment::Right,
+        JustifyItems::Legacy(LegacyJustify::Left) => ItemAlignment::Left,
+        JustifyItems::Legacy(LegacyJustify::Right) => ItemAlignment::Right,
         JustifyItems::Legacy(LegacyJustify::Center) => ItemAlignment::Center,
     })
 }
@@ -3201,8 +3333,8 @@ fn justify_self(value: &lightningcss::properties::align::JustifySelf) -> Option<
         JustifySelf::BaselinePosition(BaselinePosition::First) => ItemAlignment::Baseline,
         JustifySelf::BaselinePosition(BaselinePosition::Last) => return None,
         JustifySelf::SelfPosition { value, .. } => self_position(value),
-        JustifySelf::Left { .. } => ItemAlignment::Start,
-        JustifySelf::Right { .. } => ItemAlignment::End,
+        JustifySelf::Left { .. } => ItemAlignment::Left,
+        JustifySelf::Right { .. } => ItemAlignment::Right,
     })
 }
 
@@ -3311,10 +3443,10 @@ fn grid_placement(styles: &mut ComputedStylesBuilder, value: &lightningcss::prop
     })
 }
 
-fn grid_template_areas(styles: &mut ComputedStylesBuilder, value: &lightningcss::properties::grid::GridTemplateAreas) -> Option<Vec<GridTemplateArea>> {
+fn grid_template_areas(styles: &mut ComputedStylesBuilder, value: &lightningcss::properties::grid::GridTemplateAreas) -> Option<(Vec<GridTemplateArea>, u16, u16)> {
     use lightningcss::properties::grid::GridTemplateAreas;
     let GridTemplateAreas::Areas { columns, areas } = value else {
-        return Some(Vec::new());
+        return Some((Vec::new(), 0, 0));
     };
     let columns = usize::try_from(*columns).ok()?;
     if columns == 0 || areas.len() % columns != 0 {
@@ -3355,7 +3487,7 @@ fn grid_template_areas(styles: &mut ComputedStylesBuilder, value: &lightningcss:
             column_end: u16::try_from(column_end + 1).ok()?,
         });
     }
-    Some(output)
+    Some((output, u16::try_from(rows).ok()?, u16::try_from(columns).ok()?))
 }
 
 /// The unitless multiplier of a `line-height` value (0.0 for lengths,
@@ -4906,7 +5038,7 @@ fn collect_inline_style_custom_properties<'a>(
 #[cfg(test)]
 mod tests {
     use super::MatchedRule;
-    use crate::document::{BorderCollapseMode, BorderStyle, CaptionSide, Clear, Display, Document, ElementRef, EmptyCellsMode, Float, FontRelativeLength, LengthPct, PositionMode, PreferredSize, TextAlign, TextDirection, WhiteSpace};
+    use crate::document::{BorderCollapseMode, BorderStyle, CaptionSide, Clear, Display, Document, ElementRef, EmptyCellsMode, Float, FontRelativeLength, LengthPct, PositionMode, PreferredSize, TableLayoutMode, TextAlign, TextDirection, WhiteSpace};
     use crate::parser::DocumentFactory;
 
     #[test]
@@ -5637,6 +5769,34 @@ mod tests {
     }
 
     #[test]
+    fn table_layout_is_resolved_from_stylesheets_and_is_not_inherited_by_default() {
+        let html = "<html><body><table id='table'><tr style='table-layout:fixed'><td id='reset'>A</td><td id='inherited' style='table-layout:inherit'>B</td></tr></table></body></html>";
+        let mut factory = DocumentFactory::new();
+        let document = factory.parse_with_new_pipeline(html, Some("#table { table-layout: fixed; }"));
+        let by_id = |id| document.document().node_ids().find(|&node| document.document().element_ref(node).and_then(|element| element.attr("id")) == Some(id)).expect("element by id");
+        let mode = |id| document.box_model_style(document.style_for_node(by_id(id)).expect("computed style")).expect("box model").table_layout;
+
+        assert_eq!(mode("table"), TableLayoutMode::Fixed);
+        assert_eq!(mode("reset"), TableLayoutMode::Auto);
+        assert_eq!(mode("inherited"), TableLayoutMode::Fixed);
+    }
+
+    #[test]
+    fn size_containment_is_resolved_as_a_reset_property() {
+        let html = "<html><body><div id='parent' style='contain:size'><div id='reset'></div><div id='inherited' style='contain:inherit'></div></div><div id='strict' style='contain:strict'></div><div id='content' style='contain:content'></div></body></html>";
+        let mut factory = DocumentFactory::new();
+        let document = factory.parse_with_new_pipeline(html, None);
+        let by_id = |id| document.document().node_ids().find(|&node| document.document().element_ref(node).and_then(|element| element.attr("id")) == Some(id)).expect("element by id");
+        let contained = |id| document.box_model_style(document.style_for_node(by_id(id)).expect("computed style")).expect("box model").size_containment;
+
+        assert!(contained("parent"));
+        assert!(!contained("reset"));
+        assert!(contained("inherited"));
+        assert!(contained("strict"));
+        assert!(!contained("content"));
+    }
+
+    #[test]
     fn absolute_positioning_blockifies_table_internal_displays() {
         let displays = ["table-row-group", "table-header-group", "table-footer-group", "table-row", "table-column-group", "table-column", "table-cell", "table-caption"];
         let children = displays.iter().enumerate().map(|(index, display)| format!("<div id='d{index}' style='display:{display};position:absolute'></div>")).collect::<String>();
@@ -6006,6 +6166,25 @@ mod tests {
     }
 
     #[test]
+    fn physical_justify_alignment_remains_distinct_from_logical_alignment() {
+        use crate::document::ItemAlignment;
+        let html = "<html><body><div id='left' style='justify-self:left;justify-items:right'></div><div id='right' style='justify-self:right;justify-items:left'></div></body></html>";
+        let mut factory = DocumentFactory::new();
+        let document = factory.parse_with_new_pipeline(html, None);
+        let body = find_body(document.document());
+        let mut children = body.children();
+        let left = children.next().expect("left alignment element");
+        let right = children.next().expect("right alignment element");
+        let left_layout = document.styles().layout_style(document.style_for_node(left).expect("left computed style")).expect("left layout style");
+        let right_layout = document.styles().layout_style(document.style_for_node(right).expect("right computed style")).expect("right layout style");
+
+        assert_eq!(left_layout.justify_self, ItemAlignment::Left);
+        assert_eq!(left_layout.justify_items, ItemAlignment::Right);
+        assert_eq!(right_layout.justify_self, ItemAlignment::Right);
+        assert_eq!(right_layout.justify_items, ItemAlignment::Left);
+    }
+
+    #[test]
     fn negative_typed_gap_does_not_override_the_last_valid_gap() {
         use crate::document::LengthPct;
         let html = "<html><body><div style='display:grid;gap:12px 14px;gap:5px -10px'></div></body></html>";
@@ -6022,7 +6201,7 @@ mod tests {
     #[test]
     fn legacy_grid_gap_aliases_share_the_canonical_computed_values() {
         use crate::document::LengthPct;
-        let html = "<html><body><div id='parent' style='grid-row-gap:12px;grid-column-gap:14px'><div id='child' style='grid-row-gap:inherit;grid-column-gap:inherit'></div></div></body></html>";
+        let html = "<html><body><div id='parent' style='grid-row-gap:12px;grid-column-gap:14px'><div id='child' style='grid-row-gap:inherit;grid-column-gap:inherit'></div></div><div id='shorthand' style='grid-gap:6px 9px'></div></body></html>";
         let mut factory = DocumentFactory::new();
         let document = factory.parse_with_new_pipeline(html, None);
 
@@ -6033,6 +6212,12 @@ mod tests {
             assert_eq!(layout.row_gap, LengthPct::Px(12.0));
             assert_eq!(layout.column_gap, LengthPct::Px(14.0));
         }
+
+        let shorthand = document.document().node_ids().find(|&node| document.document().element_ref(node).and_then(|element| element.attr("id")) == Some("shorthand")).expect("grid-gap shorthand element");
+        let indices = document.style_for_node(shorthand).expect("computed grid-gap shorthand style");
+        let layout = document.styles().layout_style(indices).expect("layout style");
+        assert_eq!(layout.row_gap, LengthPct::Px(6.0));
+        assert_eq!(layout.column_gap, LengthPct::Px(9.0));
     }
 
     #[test]

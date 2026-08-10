@@ -15,6 +15,12 @@ mod tests {
         factory.parse_with_new_pipeline(html, None).shape(&mut shaper).expect("test shaper registers every glyph").layout(LayoutConstraints::new(width, 16.0).unwrap())
     }
 
+    fn layout_html_with_css(html: &str, css: &str, width: f64) -> LaidOutDocument {
+        let mut factory = DocumentFactory::new();
+        let mut shaper = TestGlyphShaper::new();
+        factory.parse_with_new_pipeline(html, Some(css)).shape(&mut shaper).expect("test shaper registers every glyph").layout(LayoutConstraints::new(width, 16.0).unwrap())
+    }
+
     fn box_index(document: &LaidOutDocument, id: &str) -> usize {
         let view = document.render_view();
         (0..view.boxes().len()).find(|&idx| view.boxes().id(idx).map(|value| view.string(value)) == Some(id)).unwrap_or_else(|| panic!("missing box #{id}"))
@@ -93,12 +99,106 @@ mod tests {
     }
 
     #[test]
+    fn absolute_flex_children_do_not_consume_main_axis_space() {
+        let document = layout_html(
+            "<html><body style='margin:0'>
+                <div style='display:flex;width:800px'>
+                    <div style='position:absolute;width:510px'></div>
+                    <div id='capped' style='width:800px;max-width:150px;overflow:auto'></div>
+                    <div id='growing' style='flex:.8 0 0'></div>
+                </div>
+                <div style='display:flex;width:800px'>
+                    <div style='position:absolute;width:150px;max-width:150px'></div>
+                    <div id='alone' style='flex:.8 0 0'></div>
+                </div>
+            </body></html>",
+            900.0,
+        );
+
+        close(geometry(&document, "capped").1.width, 150.0);
+        close(geometry(&document, "growing").1.width, 520.0);
+        close(geometry(&document, "alone").1.width, 640.0);
+    }
+
+    #[test]
     fn flex_grow_distributes_free_space() {
         let document = layout_html("<html><body><div id='c' style='display:flex;width:300px'><div id='a' style='flex:1 1 0;height:10px'></div><div id='b' style='flex:2 1 0;height:10px'></div></div></body></html>", 500.0);
         let (_, a) = geometry(&document, "a");
         let (_, b) = geometry(&document, "b");
         close(a.width, 100.0);
         close(b.width, 200.0);
+    }
+
+    #[test]
+    fn fractional_flex_factors_leave_unclaimed_free_space() {
+        let document = layout_html(
+            "<html><body style='margin:0'>
+                <div style='display:flex;width:100px'>
+                    <div id='grow-half' style='flex-grow:.5'></div>
+                </div>
+                <div style='display:flex;width:100px'>
+                    <div id='grow-a' style='flex-grow:.5'></div>
+                    <div id='grow-b' style='flex-grow:.25'></div>
+                </div>
+                <div style='display:flex;width:100px'>
+                    <div id='shrink-half' style='width:200px;flex-shrink:.5'></div>
+                </div>
+                <div style='display:flex;width:100px'>
+                    <div id='shrink-a' style='width:200px;flex-shrink:.5'></div>
+                    <div id='shrink-b' style='width:200px;flex-shrink:.25'></div>
+                </div>
+                <div style='display:flex;flex-direction:column;height:100px'>
+                    <div id='column-shrink-a' style='height:200px;flex-shrink:.5'></div>
+                    <div id='column-shrink-b' style='height:200px;flex-shrink:.25'></div>
+                </div>
+            </body></html>",
+            300.0,
+        );
+
+        close(geometry(&document, "grow-half").1.width, 50.0);
+        close(geometry(&document, "grow-a").1.width, 50.0);
+        close(geometry(&document, "grow-b").1.width, 25.0);
+        close(geometry(&document, "shrink-half").1.width, 150.0);
+        close(geometry(&document, "shrink-a").1.width, 50.0);
+        close(geometry(&document, "shrink-b").1.width, 125.0);
+        close(geometry(&document, "column-shrink-a").1.height, 50.0);
+        close(geometry(&document, "column-shrink-b").1.height, 125.0);
+    }
+
+    #[test]
+    fn auto_column_uses_a_definite_pixel_flex_basis_for_its_compatible_main_size() {
+        let document = layout_html(
+            "<html><body style='margin:0'>
+                <div style='display:flex;flex-direction:column'><div id='half' style='font-size:14px;line-height:1;min-height:0;flex:.5 1 0px'>text</div></div>
+                <div style='display:flex;flex-direction:column'><div id='one' style='font-size:14px;line-height:1;min-height:0;flex:1 1 0px'>text</div></div>
+            </body></html>",
+            300.0,
+        );
+
+        close(geometry(&document, "half").1.height, 0.0);
+        close(geometry(&document, "one").1.height, 0.0);
+    }
+
+    #[test]
+    fn intrinsic_block_constraints_use_the_flex_containers_natural_height() {
+        let document = layout_html(
+            "<html><body style='margin:0'>
+                <div id='minimum' style='display:flex;height:0;min-height:max-content;border:5px solid'>
+                    <div style='height:25px;border:5px solid'></div>
+                </div>
+                <div id='maximum' style='display:flex;height:200px;max-height:min-content;border:5px solid'>
+                    <div style='height:25px;border:5px solid'></div>
+                </div>
+                <div id='wrapped-column' style='display:flex;flex-flow:column wrap;height:0;min-height:max-content'>
+                    <div style='height:25px'></div><div style='height:25px'></div>
+                </div>
+            </body></html>",
+            300.0,
+        );
+
+        close(geometry(&document, "minimum").1.height, 45.0);
+        close(geometry(&document, "maximum").1.height, 45.0);
+        close(geometry(&document, "wrapped-column").1.height, 25.0);
     }
 
     #[test]
@@ -372,6 +472,23 @@ mod tests {
     }
 
     #[test]
+    fn percentage_dependent_flex_basis_uses_min_content_in_a_min_content_contribution() {
+        let document = layout_html(
+            "<html><body style='margin:0'><div style='display:grid;grid-template-columns:repeat(4,1fr);width:800px'>
+                <div id='a' style='display:flex;width:100%'><div style='flex:1 0 calc(70% - 10.5px)'>Some News Headline</div><div style='width:50px'></div></div>
+                <div id='b' style='display:flex;width:100%'><div style='flex:1 0 calc(70% - 10.5px)'>Some Other News Headline 2</div><div style='width:50px'></div></div>
+                <div id='c' style='display:flex;width:100%'><div style='flex:1 0 calc(70% - 10.5px)'>Even another Headline 3</div><div style='width:50px'></div></div>
+                <div id='d' style='display:flex;width:100%'><div style='flex:1 0 calc(70% - 10.5px)'>Peets Coffee announces plans to move Oakland</div><div style='width:50px'></div></div>
+            </div></body></html>",
+            900.0,
+        );
+
+        for id in ["a", "b", "c", "d"] {
+            close(geometry(&document, id).1.width, 200.0);
+        }
+    }
+
+    #[test]
     fn flex_intrinsic_widths_include_floated_descendants() {
         let document = layout_html(
             "<html><body style='margin:0'>
@@ -486,6 +603,29 @@ mod tests {
     }
 
     #[test]
+    fn ancestor_first_letter_does_not_skip_a_grid_container_to_reach_a_later_sibling() {
+        let html = "<html><body>
+                <div class='outer'>
+                    <div class='grid'><div>Grid item.</div></div>
+                    <div id='sibling'>Outside grid.</div>
+                </div>
+            </body></html>";
+        let css = "body { margin: 0; line-height: 20px; }
+            .grid { display: grid; }
+            .outer::first-letter { line-height: 200px; }
+            .grid::first-letter { line-height: 100px; }";
+        let mut factory = DocumentFactory::new();
+        let mut shaper = TestGlyphShaper::new();
+        let document = factory
+            .parse_with_new_pipeline(html, Some(css))
+            .shape(&mut shaper)
+            .expect("test shaper registers every glyph")
+            .layout(LayoutConstraints::new(300.0, 16.0).unwrap());
+
+        close(geometry(&document, "sibling").1.height, 20.0);
+    }
+
+    #[test]
     fn flex_auto_margin_absorbs_free_space() {
         let document = layout_html("<html><body><div id='c' style='display:flex;width:300px'><div id='a' style='margin-left:auto;width:50px;height:10px'></div></div></body></html>", 500.0);
         let (container, _) = geometry(&document, "c");
@@ -567,6 +707,27 @@ mod tests {
         assert!(baseline_for('C') > baseline_for('A') + 5.0, "the second grid row must remain below the first");
     }
 
+    // Reduced from WPT css/css-grid/layout-algorithm/
+    // grid-minimum-contribution-baseline-shim.html.
+    #[test]
+    fn generated_inline_block_pseudos_supply_grid_item_baselines() {
+        let document = layout_html_with_css(
+            "<html><body style='margin:0'>
+                <div style='display:grid;position:relative;font-size:0;height:0;width:0;grid-template-columns:50px 50px;grid-template-rows:minmax(auto,0);align-items:baseline'>
+                    <div id='first-item' class='item' style='padding-top:25px'></div>
+                    <div id='second-item' class='item second' style='padding-bottom:25px'></div>
+                </div>
+            </body></html>",
+            ".item::before { content:'';display:inline-block;width:25px;height:25px;vertical-align:bottom }
+                .second::before { vertical-align:top }",
+            200.0,
+        );
+
+        close(geometry(&document, "first-item").1.height, 50.0);
+        close(geometry(&document, "second-item").1.height, 50.0);
+        close(geometry(&document, "second-item").0.y - geometry(&document, "first-item").0.y, 50.0);
+    }
+
     #[test]
     fn wrapping_flex_moves_items_to_the_next_line() {
         let document =
@@ -617,6 +778,110 @@ mod tests {
         close(a_size.width, 100.0);
         close(b.x, container.x + 110.0);
         close(b_size.width, 190.0);
+    }
+
+    #[test]
+    fn legacy_grid_gap_shorthand_reaches_taffy_track_sizing() {
+        let document = layout_html(
+            "<html><body style='margin:0'><div style='display:grid;width:200px;height:100px;grid-gap:10px 20px;grid:50px 1fr / 100px 1fr'><div id='a'></div><div id='b'></div><div id='c'></div><div id='d'></div></div></body></html>",
+            300.0,
+        );
+
+        close(geometry(&document, "a").1.width, 100.0);
+        close(geometry(&document, "b").1.width, 80.0);
+        close(geometry(&document, "c").1.height, 40.0);
+        close(geometry(&document, "d").1.height, 40.0);
+    }
+
+    #[test]
+    // Reduced from WPT css/css-grid/grid-model/grid-gutters-as-percentage-001.html.
+    // Auto tracks with equal max-content contributions must stretch equally,
+    // regardless of differences in their min-content contributions.
+    fn percentage_gap_auto_tracks_stretch_equally() {
+        let document = layout_html(
+            "<html><body style='margin:0'>
+                <div style='display:grid;width:400px;column-gap:10%;font-size:10px;line-height:10px'>
+                    <div id='a' style='grid-column:1;grid-row:1'>XXX X XX X</div>
+                    <div id='b' style='grid-column:2;grid-row:1'>XX XXX X X</div>
+                    <div id='c' style='grid-column:1;grid-row:2'>X XX XXX X</div>
+                    <div id='d' style='grid-column:2;grid-row:2'>XXXXX X XX</div>
+                </div>
+            </body></html>",
+            800.0,
+        );
+
+        for id in ["a", "b", "c", "d"] {
+            close(geometry(&document, id).1.width, 180.0);
+        }
+    }
+
+    // Reduced from WPT css/css-grid/grid-items/grid-items-percentage-margins-001.html.
+    // A definite track gives a percentage item a definite basis even when
+    // the parent disables the item's default stretch alignment.
+    #[test]
+    fn percentage_grid_item_uses_fixed_track_under_start_alignment() {
+        let document = layout_html(
+            "<html><body style='margin:0'>
+                <div style='display:grid;grid-template-columns:100px;width:500px;justify-items:start'>
+                    <div id='item' style='width:100%;height:10px'></div>
+                </div>
+            </body></html>",
+            800.0,
+        );
+
+        close(geometry(&document, "item").1.width, 100.0);
+    }
+
+    #[test]
+    fn percentage_padding_uses_grid_area_width_without_shrinking_measured_content_twice() {
+        let document = layout_html(
+            "<html><body style='margin:0'><div style='display:grid;width:500px;grid-template-columns:minmax(auto,100px);justify-items:start;font-size:20px'><div id='item' style='padding-left:50%'>X</div><div id='fill' style='width:100%;height:10px'></div></div></body></html>",
+            800.0,
+        );
+
+        close(geometry(&document, "item").1.width, 60.0);
+        close(geometry(&document, "fill").1.width, 100.0);
+    }
+
+    #[test]
+    fn grid_auto_repeat_intrinsic_width_preserves_definite_minimum() {
+        let document = layout_html(
+            "<html><body style='margin:0'><div id='grid' style='display:grid;float:left;box-sizing:border-box;min-width:300px;border:10px solid;grid-template-columns:repeat(auto-fill,100px)'><div style='grid-column:-2'></div></div></body></html>",
+            600.0,
+        );
+
+        close(geometry(&document, "grid").1.width, 320.0);
+    }
+
+    #[test]
+    fn grid_auto_repeat_intrinsic_width_resolves_percentage_maximum() {
+        let document = layout_html(
+            "<html><body style='margin:0'><div style='width:600px'><div id='grid' style='display:grid;width:min-content;max-width:50%;grid-template-columns:repeat(auto-fill,100px)'><div style='grid-column:-2'></div></div></div></body></html>",
+            700.0,
+        );
+
+        close(geometry(&document, "grid").1.width, 300.0);
+    }
+
+    #[test]
+    fn grid_auto_repeat_intrinsic_width_uses_fixed_maximum() {
+        let document = layout_html(
+            "<html><body style='margin:0'><div id='grid' style='display:grid;max-width:300px;grid-template-columns:repeat(auto-fill,100px)'><div style='grid-column:-2'></div></div></body></html>",
+            800.0,
+        );
+
+        close(geometry(&document, "grid").1.width, 300.0);
+    }
+
+    #[test]
+    fn intrinsic_border_box_auto_repeat_reserves_percentage_padding_from_maximum() {
+        let document = layout_html(
+            "<html><body style='margin:0'><div id='wrapper' style='width:min-content'><div id='grid' style='display:grid;box-sizing:border-box;width:min-content;max-width:300px;padding:10%;grid-template-columns:repeat(auto-fill,100px)'><div style='grid-column:-2'></div></div></div></body></html>",
+            800.0,
+        );
+
+        close(geometry(&document, "wrapper").1.width, 300.0);
+        close(geometry(&document, "grid").1.width, 260.0);
     }
 
     // Reduced from WPT css/css-grid/layout-algorithm/
@@ -681,6 +946,51 @@ mod tests {
         );
 
         close(geometry(&document, "grid").1.height, 100.0);
+    }
+
+    // Reduced from WPT css/css-grid/grid-definition/
+    // flex-content-resolution-rows-002.html.
+    #[test]
+    fn percentage_height_grid_items_stretch_within_their_rows() {
+        let document = layout_html(
+            "<html><body style='margin:0'><div style='height:40px'><div style='display:grid;height:100%;grid-template-columns:50px;grid-template-rows:minmax(10px,max-content) minmax(10px,1fr)'><div id='first' style='height:100%;font:10px/1 serif'>XXXXX</div><div id='second' style='height:100%;grid-row:2'></div></div></div></body></html>",
+            800.0,
+        );
+
+        close(geometry(&document, "first").1.height, 10.0);
+        close(geometry(&document, "second").1.height, 30.0);
+    }
+
+    // Reduced from WPT css/css-grid/grid-definition/
+    // grid-percentage-rows-indefinite-height-001.html.
+    #[test]
+    fn indefinite_grid_height_resolves_percentage_rows_against_intrinsic_height() {
+        let document = layout_html(
+            "<html><body style='margin:0'><div id='grid' style='display:grid;grid-template-rows:60%;font:25px/1 serif'><div id='item'>X<br>X</div></div></body></html>",
+            200.0,
+        );
+
+        close(geometry(&document, "grid").1.height, 50.0);
+        close(geometry(&document, "item").1.height, 30.0);
+    }
+
+    // Reduced from WPT css/css-grid/grid-definition/
+    // grid-percentage-rows-indefinite-height-002.html.
+    #[test]
+    fn indefinite_grid_height_reruns_mixed_percentage_row_sizing() {
+        let document = layout_html(
+            "<html><body style='margin:0'><div id='grid' style='display:grid;border:5px solid;grid-template-rows:auto 60% auto;font:25px/1 serif'>
+                <div id='first' style='grid-row:1;grid-column:1'></div>
+                <div id='spanning' style='grid-row:1 / 4;grid-column:2'>X</div>
+                <div id='last' style='grid-row:3;grid-column:3'></div>
+            </div></body></html>",
+            200.0,
+        );
+
+        close(geometry(&document, "grid").1.height, 35.0);
+        close(geometry(&document, "first").1.height, 5.0);
+        close(geometry(&document, "spanning").1.height, 25.0);
+        close(geometry(&document, "last").1.height, 5.0);
     }
 
     // Reduced from WPT css/css-grid/grid-definition/grid-auto-repeat-min-size-004.html.
@@ -875,7 +1185,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_taffy_percentage_grid_items_inflate_fractional_tracks() {
+    fn raw_taffy_percentage_grid_items_resolve_against_fractional_tracks() {
         let mut taffy = TaffyTree::<()>::new();
         taffy.disable_rounding();
         let children = (0..4).map(|_| taffy.new_leaf(Style { size: TaffySize { width: Dimension::percent(1.0), height: Dimension::auto() }, ..Style::default() }).expect("raw Taffy grid item")).collect::<Vec<_>>();
@@ -889,8 +1199,8 @@ mod tests {
 
         for (column, child) in children.into_iter().enumerate() {
             let layout = taffy.layout(child).expect("raw Taffy child layout");
-            close(layout.location.x as f64, column as f64 * 800.0);
-            close(layout.size.width as f64, 800.0);
+            close(layout.location.x as f64, column as f64 * 200.0);
+            close(layout.size.width as f64, 200.0);
         }
     }
 
@@ -949,11 +1259,84 @@ mod tests {
     }
 
     #[test]
+    fn wrapped_column_inline_flex_intrinsic_width_uses_its_definite_height() {
+        let document = layout_html(
+            "<html><body style='margin:0'><span id='c' style='display:inline-flex;flex-flow:column wrap;align-content:flex-start;height:35px'>
+                <span style='flex:none;width:10px;height:20px'></span>
+                <span style='flex:none;width:50px;height:10px'></span>
+                <span style='flex:none;width:80px;height:10px'></span>
+                <span style='flex:none;width:40px;height:20px'></span>
+            </span></body></html>",
+            300.0,
+        );
+
+        close(geometry(&document, "c").1.width, 130.0);
+        close(geometry(&document, "c").1.height, 35.0);
+    }
+
+    #[test]
+    fn column_wrap_intrinsic_sizing_transfers_an_auto_cross_size_through_ratio() {
+        let document = layout_html(
+            "<html><body style='margin:0'><div id='c' style='display:flex;flex-flow:column wrap;width:max-content;height:100px'>
+                <div id='ratio' style='width:10%;aspect-ratio:1/5;min-height:0;flex:0 0 auto'>
+                    <span style='float:left;width:10px;height:200px'></span><span style='float:left;width:10px;height:200px'></span>
+                </div>
+                <div style='width:80px;flex:0 0 1px;min-height:0'></div>
+            </div></body></html>",
+            500.0,
+        );
+
+        close(geometry(&document, "c").1.width, 100.0);
+        close(geometry(&document, "ratio").1.height, 50.0);
+    }
+
+    #[test]
     fn inline_grid_intrinsic_width_includes_explicit_tracks_and_gap() {
         let document = layout_html("<html><body><p><span id='c' style='display:inline-grid;grid-template-columns:100px 100px;column-gap:10px'><span></span><span></span></span></p></body></html>", 400.0);
         let (_, size) = geometry(&document, "c");
 
         close(size.width, 210.0);
+    }
+
+    #[test]
+    fn empty_inline_grid_intrinsic_width_includes_explicit_tracks_and_gap() {
+        let document = layout_html("<html><body><p><span id='c' style='display:inline-grid;grid-template-columns:100px 100px;column-gap:10px'></span></p></body></html>", 400.0);
+        let (_, size) = geometry(&document, "c");
+
+        close(size.width, 210.0);
+    }
+
+    #[test]
+    fn size_contained_grid_uses_empty_intrinsic_size_but_lays_out_its_item() {
+        let document = layout_html(
+            "<html><body style='margin:0'><div id='grid' style='display:grid;contain:size;width:min-content;height:min-content;grid:calc(100px + 50%) / calc(100px + 200%)'><div id='item'></div></div></body></html>",
+            400.0,
+        );
+
+        assert_eq!(geometry(&document, "grid").1, Size::ZERO);
+        assert_eq!(geometry(&document, "item").1, Size::new(100.0, 100.0));
+    }
+
+    #[test]
+    fn definite_grid_axes_resolve_calc_track_percentages() {
+        let document = layout_html(
+            "<html><body style='margin:0'><div id='grid' style='display:grid;contain:size;width:100px;height:100px;grid:calc(100px + 50%) / calc(100px + 200%)'><div id='item'></div></div></body></html>",
+            400.0,
+        );
+
+        assert_eq!(geometry(&document, "grid").1, Size::new(100.0, 100.0));
+        assert_eq!(geometry(&document, "item").1, Size::new(300.0, 150.0));
+    }
+
+    #[test]
+    fn contained_zero_width_grid_floors_percentage_track_maximum_by_intrinsic_minimum() {
+        let document = layout_html(
+            "<html><body style='margin:0'><div id='grid' style='display:grid;contain:size;width:min-content;grid-template-columns:minmax(min-content,200%)'><div id='item' style='width:300px;height:10px'></div></div></body></html>",
+            400.0,
+        );
+
+        close(geometry(&document, "grid").1.width, 0.0);
+        close(geometry(&document, "item").1.width, 300.0);
     }
 
     #[test]
@@ -1009,6 +1392,29 @@ mod tests {
     }
 
     #[test]
+    fn nested_floated_grid_container_shrink_wraps_fixed_tracks() {
+        let html = "<html><body style='margin:0'>
+                <div class='container'>
+                    <div id='grid' class='grid'>
+                        <div></div><div></div><div></div><div></div>
+                    </div>
+                </div>
+            </body></html>";
+        let css = ".grid { display:grid; grid-template-columns:200px 200px; grid-template-rows:200px 200px; }
+            .container { width:600px; height:600px; }
+            #grid { float:left; }";
+        let mut factory = DocumentFactory::new();
+        let mut shaper = TestGlyphShaper::new();
+        let document = factory
+            .parse_with_new_pipeline(html, Some(css))
+            .shape(&mut shaper)
+            .expect("test shaper registers every glyph")
+            .layout(LayoutConstraints::new(800.0, 16.0).unwrap());
+
+        close(geometry(&document, "grid").1.width, 400.0);
+    }
+
+    #[test]
     fn floated_flex_grid_shrink_to_fit_honors_min_and_max_width() {
         let min_document = layout_html("<html><body style='margin:0'><div id='c' style='float:left;display:flex;min-width:100px'><div style='width:20px;height:10px'></div></div></body></html>", 300.0);
         let max_document = layout_html("<html><body style='margin:0'><div id='c' style='float:left;display:grid;max-width:10px;grid-template-columns:20px'><div style='height:10px'></div></div></body></html>", 300.0);
@@ -1034,6 +1440,35 @@ mod tests {
 
         close(item.width, 70.0);
         close(item.height, 55.0);
+    }
+
+    #[test]
+    fn column_flex_stretch_height_is_auto_under_an_indefinite_max_height() {
+        let document = layout_html(
+            "<html><body style='margin:0'><div style='display:inline-flex;flex-direction:column;width:100px;max-height:100px'>
+                <div id='item' style='flex:none;height:stretch;margin:5px;padding:2px;border:3px solid;font:20px/1 serif'>X</div>
+                <div style='flex:none;height:30px'></div>
+                <div style='flex:none;height:30px'></div>
+                <div style='flex:none;height:30px'></div>
+            </div></body></html>",
+            300.0,
+        );
+
+        assert_eq!(geometry(&document, "item").1.height, 30.0);
+    }
+
+    #[test]
+    fn row_flex_stretch_constraints_use_the_max_constrained_line_size() {
+        let document = layout_html(
+            "<html><body style='margin:0'><div style='display:flex;width:100px;max-height:100px'>
+                <div id='minimum' style='flex:none;height:0;min-height:stretch;margin:5px;padding:2px;border:3px solid'></div>
+                <div id='maximum' style='flex:none;height:500px;max-height:stretch;margin:5px;padding:2px;border:3px solid'></div>
+            </div></body></html>",
+            300.0,
+        );
+
+        assert_eq!(geometry(&document, "minimum").1.height, 90.0);
+        assert_eq!(geometry(&document, "maximum").1.height, 90.0);
     }
 
     #[test]

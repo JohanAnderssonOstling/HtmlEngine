@@ -1,11 +1,11 @@
 use crate::layout::LayoutEngine;
 use crate::layout::replaced::{ReplacedSizeInput, resolve_replaced_content_size};
 use crate::layout_model::LayoutMode;
-use html_style_model::{BorderCollapseMode, BoxSizing, Float, PositionMode, UsedPreferredSize as PreferredSize, UsedStyleView};
+use html_style_model::{BorderCollapseMode, BoxSizing, Float, ItemAlignment, OverflowMode, PositionMode, TextDirection, UsedPreferredSize as PreferredSize, UsedStyleView};
 use kurbo::Size;
 use std::time::Instant;
 
-use super::box_constraints::{BoxLayoutRequest, constrain_content_width, resolve_block_margin_left, resolve_content_width, resolve_vertical_min_size, resolve_vertical_size};
+use super::box_constraints::{BoxLayoutRequest, constrain_content_width, resolve_block_margin_left, resolve_content_width, resolve_vertical_min_size_with_stretch_inset, resolve_vertical_size_with_stretch_inset};
 use super::box_model::{ResolvedBoxModel, UsedBorderInsets};
 
 #[derive(Clone, Copy)]
@@ -27,6 +27,9 @@ pub(super) struct ResolvedVerticalSizing {
     pub(super) descendant_basis: Option<f64>,
     pub(super) min: Option<f64>,
     pub(super) max: Option<f64>,
+    pub(super) intrinsic_min: bool,
+    pub(super) intrinsic_max: bool,
+    pub(super) ratio_auto_min_uses_content: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -70,6 +73,7 @@ pub(crate) struct ResolvedBoxSizing {
     pub(super) replaced_size: Option<Size>,
     pub(super) is_float: bool,
     pub(super) fills_available_width: bool,
+    pub(super) inline_alignment: ItemAlignment,
     horizontal_margins: ResolvedHorizontalMargins,
     pub(super) text_indent: f64,
 }
@@ -91,6 +95,48 @@ impl ResolvedBoxSizing {
         self.request.first_line_indent = first_line_indent;
         self
     }
+}
+
+/// Resolve normal-flow block alignment after width calculation. Alignment is
+/// applied to the margin box, and automatic margins continue to take
+/// precedence over `justify-self`.
+pub(super) fn block_inline_alignment_offset(engine: &LayoutEngine<'_, '_>, resolved: &ResolvedBoxSizing) -> f64 {
+    let request = resolved.request;
+    let style = engine.reader.style(request.box_idx);
+    if !engine.reader.is_block_box(request.box_idx) || resolved.is_float || style.position() == PositionMode::Absolute {
+        return resolved.horizontal_margins.left;
+    }
+
+    let border_width = resolved.replaced_size.map_or(resolved.horizontal.content, |size| size.width) + resolved.box_model.horizontal_padding() + resolved.box_model.horizontal_border();
+    let left = style.margin_left().resolve(request.available_width);
+    let right = style.margin_right().resolve(request.available_width);
+    let left_auto = style.margin_left_auto();
+    let right_auto = style.margin_right_auto();
+    if left_auto || right_auto {
+        let remaining = request.available_width - border_width - if left_auto { 0.0 } else { left } - if right_auto { 0.0 } else { right };
+        return match (left_auto, right_auto) {
+            (true, true) if remaining > 0.0 => remaining / 2.0,
+            (true, false) if remaining > 0.0 => remaining,
+            _ => left,
+        };
+    }
+
+    let free_space = request.available_width - border_width - left - right;
+    let containing_direction = engine.reader.get_parent(request.box_idx).map(|parent| engine.reader.style(parent).direction()).unwrap_or(TextDirection::Ltr);
+    let subject_direction = style.direction();
+    let start_offset = |direction| if direction == TextDirection::Rtl { free_space } else { 0.0 };
+    let end_offset = |direction| if direction == TextDirection::Rtl { 0.0 } else { free_space };
+    let alignment_offset = match resolved.inline_alignment {
+        ItemAlignment::Start | ItemAlignment::FlexStart => start_offset(containing_direction),
+        ItemAlignment::End | ItemAlignment::FlexEnd => end_offset(containing_direction),
+        ItemAlignment::SelfStart | ItemAlignment::Baseline => start_offset(subject_direction),
+        ItemAlignment::SelfEnd => end_offset(subject_direction),
+        ItemAlignment::Left => 0.0,
+        ItemAlignment::Right => free_space,
+        ItemAlignment::Center => free_space / 2.0,
+        ItemAlignment::Auto | ItemAlignment::Normal | ItemAlignment::Stretch => return resolved.horizontal_margins.left,
+    };
+    left + alignment_offset
 }
 
 impl<'a, 'out> LayoutEngine<'a, 'out> {
@@ -116,14 +162,18 @@ fn resolve_box_sizing(engine: &LayoutEngine<'_, '_>, request: BoxLayoutRequest) 
     let is_float = matches!(style.float(), Float::Left | Float::Right);
     let replaced_intrinsic = engine.replaced.intrinsic_size(&engine.reader, box_idx);
     let is_replaced = replaced_intrinsic.is_some();
+    let inline_alignment = effective_inline_alignment(engine, box_idx);
     let authored_aspect_ratio = style.aspect_ratio();
     let intrinsic_aspect_ratio = replaced_intrinsic.and_then(|size| engine.replaced.intrinsic_ratio(&engine.reader, box_idx, size));
     let used_aspect_ratio = if authored_aspect_ratio.uses_intrinsic() { intrinsic_aspect_ratio.or_else(|| authored_aspect_ratio.preferred().map(f64::from)) } else { authored_aspect_ratio.preferred().map(f64::from) };
-    let vertical = resolve_vertical_sizing(style, request, box_model);
-    let (horizontal, replaced_size) = resolve_horizontal_sizing(engine, style, request, box_model, vertical, replaced_intrinsic, used_aspect_ratio, is_float);
+    let vertical = resolve_vertical_sizing(engine, style, request, box_model);
+    let (horizontal, replaced_size) = resolve_horizontal_sizing(engine, style, request, box_model, vertical, replaced_intrinsic, used_aspect_ratio, is_float, inline_alignment);
 
     let layout_mode = engine.reader.box_layout_mode(box_idx).expect("layout box should exist").clone();
-    let fills_available_width = !is_replaced && !is_float && (engine.reader.is_block_box(box_idx) || engine.reader.is_anonymous_box(box_idx) || matches!(style.display(), html_style_model::Display::Flex | html_style_model::Display::Grid));
+    let fills_available_width = !is_replaced
+        && !is_float
+        && !horizontal.shrink_to_fit
+        && (engine.reader.is_block_box(box_idx) || engine.reader.is_anonymous_box(box_idx) || matches!(style.display(), html_style_model::Display::Flex | html_style_model::Display::Grid));
     let horizontal_margins = resolve_horizontal_margins(engine, style, request, box_model, horizontal, replaced_size, fills_available_width, is_float);
 
     ResolvedBoxSizing {
@@ -137,9 +187,20 @@ fn resolve_box_sizing(engine: &LayoutEngine<'_, '_>, request: BoxLayoutRequest) 
         replaced_size,
         is_float,
         fills_available_width,
+        inline_alignment,
         horizontal_margins,
         text_indent: style.text_indent().resolve(horizontal.content),
     }
+}
+
+fn effective_inline_alignment(engine: &LayoutEngine<'_, '_>, box_idx: usize) -> ItemAlignment {
+    let alignment = engine.reader.layout_style(box_idx).justify_self;
+    let alignment = if alignment == ItemAlignment::Auto {
+        engine.reader.get_parent(box_idx).map(|parent| engine.reader.layout_style(parent).justify_items).unwrap_or(ItemAlignment::Normal)
+    } else {
+        alignment
+    };
+    if alignment == ItemAlignment::Auto { ItemAlignment::Normal } else { alignment }
 }
 
 fn resolve_horizontal_margins(
@@ -189,34 +250,64 @@ fn resolve_box_model(engine: &LayoutEngine<'_, '_>, request: BoxLayoutRequest, s
     box_model
 }
 
-fn resolve_vertical_sizing(style: UsedStyleView<'_>, request: BoxLayoutRequest, box_model: ResolvedBoxModel) -> ResolvedVerticalSizing {
+fn resolve_vertical_sizing(engine: &LayoutEngine<'_, '_>, style: UsedStyleView<'_>, request: BoxLayoutRequest, box_model: ResolvedBoxModel) -> ResolvedVerticalSizing {
     let padding_border = box_model.vertical_padding() + box_model.vertical_border();
     let border_box_inset = match style.box_sizing() {
         BoxSizing::ContentBox => 0.0,
         BoxSizing::BorderBox => padding_border,
     };
-    let authored_explicit = resolve_vertical_size(style.height(), request.parent_content_height, border_box_inset);
+    let stretch_inset = super::block::stretch_margin_inset(&engine.reader, request.box_idx, request.available_width) + padding_border;
+    let authored_explicit = (!request.intrinsic_block_measurement)
+        .then(|| resolve_vertical_size_with_stretch_inset(style.height(), request.parent_content_height, border_box_inset, stretch_inset))
+        .flatten();
     let assigned_content = request.assigned_border_size.and_then(|size| size.height.map(|height| (height - padding_border).max(0.0)));
     let explicit = assigned_content.or(authored_explicit);
-    let min = resolve_vertical_min_size(style.min_height(), request.parent_content_height, border_box_inset);
-    let max = resolve_vertical_size(style.max_height(), request.parent_content_height, border_box_inset).map(|maximum| maximum.max(min.unwrap_or(0.0)));
+    let min = (!request.intrinsic_block_measurement)
+        .then(|| resolve_vertical_min_size_with_stretch_inset(style.min_height(), request.parent_content_height, border_box_inset, stretch_inset))
+        .flatten();
+    let max = (!request.intrinsic_block_measurement)
+        .then(|| resolve_vertical_size_with_stretch_inset(style.max_height(), request.parent_content_height, border_box_inset, stretch_inset))
+        .flatten()
+        .map(|maximum| maximum.max(min.unwrap_or(0.0)));
+    let intrinsic_min = !request.intrinsic_block_measurement && matches!(style.min_height(), PreferredSize::MinContent | PreferredSize::MaxContent | PreferredSize::FitContent);
+    let intrinsic_max = !request.intrinsic_block_measurement && matches!(style.max_height(), PreferredSize::MinContent | PreferredSize::MaxContent | PreferredSize::FitContent);
+    // A preferred aspect ratio can turn an automatic block size into a
+    // transferred size. Its automatic minimum remains content-based unless
+    // this axis is a scroll container; `clip` deliberately is not scrollable.
+    let ratio_auto_min_uses_content = matches!(style.height(), PreferredSize::Auto)
+        && matches!(style.min_height(), PreferredSize::Auto)
+        && !matches!(style.overflow_y(), OverflowMode::Hidden | OverflowMode::Scroll | OverflowMode::Auto);
     let descendant_basis = match (request.assigned_border_size, assigned_content) {
         (Some(assigned), Some(height)) if assigned.height_is_definite => Some(height),
+        _ if request.suppress_authored_height_basis => None,
         _ => authored_explicit.map(|height| {
             let height = max.map_or(height, |maximum| height.min(maximum));
             min.map_or(height, |minimum| height.max(minimum))
         }),
     };
-    ResolvedVerticalSizing { authored_explicit, explicit, descendant_basis, min, max }
+    ResolvedVerticalSizing { authored_explicit, explicit, descendant_basis, min, max, intrinsic_min, intrinsic_max, ratio_auto_min_uses_content }
 }
 
 fn resolve_horizontal_sizing(
-    engine: &LayoutEngine<'_, '_>, style: UsedStyleView<'_>, request: BoxLayoutRequest, box_model: ResolvedBoxModel, vertical: ResolvedVerticalSizing, replaced_intrinsic: Option<Size>, aspect_ratio: Option<f64>, is_float: bool,
+    engine: &LayoutEngine<'_, '_>, style: UsedStyleView<'_>, request: BoxLayoutRequest, box_model: ResolvedBoxModel, vertical: ResolvedVerticalSizing, replaced_intrinsic: Option<Size>, aspect_ratio: Option<f64>, is_float: bool, inline_alignment: ItemAlignment,
 ) -> (ResolvedHorizontalSizing, Option<Size>) {
-    let intrinsic_widths = resolve_intrinsic_widths(engine, style, request, vertical, replaced_intrinsic, is_float);
+    let intrinsic_widths = resolve_intrinsic_widths(engine, style, request, vertical, replaced_intrinsic, is_float, inline_alignment);
     let constraints = resolve_width_constraints(engine, style, request, box_model, replaced_intrinsic, intrinsic_widths.measured);
     let replaced_size = resolve_replaced_size(style, request, box_model, constraints, replaced_intrinsic, aspect_ratio);
-    let content = resolve_used_content_width(request, box_model, constraints, vertical, replaced_intrinsic, replaced_size, intrinsic_widths);
+    let ratio_stretch_width = (replaced_intrinsic.is_none() && matches!(style.width(), PreferredSize::Auto) && matches!(style.height(), PreferredSize::Stretch))
+        .then(|| {
+            let height = vertical.authored_explicit?;
+            let ratio = aspect_ratio?;
+            Some(match style.box_sizing() {
+                BoxSizing::ContentBox => height * ratio,
+                BoxSizing::BorderBox => {
+                    let vertical_border_box = height + box_model.vertical_padding_border();
+                    (vertical_border_box * ratio - box_model.horizontal_padding_border()).max(0.0)
+                }
+            })
+        })
+        .flatten();
+    let content = resolve_used_content_width(request, box_model, constraints, vertical, replaced_intrinsic, replaced_size, intrinsic_widths, ratio_stretch_width);
     (
         ResolvedHorizontalSizing {
             preferred: constraints.preferred,
@@ -232,15 +323,40 @@ fn resolve_horizontal_sizing(
     )
 }
 
-fn resolve_intrinsic_widths(engine: &LayoutEngine<'_, '_>, style: UsedStyleView<'_>, request: BoxLayoutRequest, vertical: ResolvedVerticalSizing, replaced_intrinsic: Option<Size>, is_float: bool) -> ResolvedIntrinsicWidths {
+fn resolve_intrinsic_widths(
+    engine: &LayoutEngine<'_, '_>,
+    style: UsedStyleView<'_>,
+    request: BoxLayoutRequest,
+    vertical: ResolvedVerticalSizing,
+    replaced_intrinsic: Option<Size>,
+    is_float: bool,
+    inline_alignment: ItemAlignment,
+) -> ResolvedIntrinsicWidths {
     let is_table_cell = engine.reader.is_table_cell_box(request.box_idx);
     let preferred = if is_table_cell { PreferredSize::Auto } else { style.width() };
     let min = if is_table_cell { PreferredSize::Auto } else { style.min_width() };
     let max = if is_table_cell { PreferredSize::Auto } else { style.max_width() };
     let uses_intrinsic_keyword = replaced_intrinsic.is_none() && [preferred, min, max].into_iter().any(|size| matches!(size, PreferredSize::MinContent | PreferredSize::MaxContent | PreferredSize::FitContent));
     let is_absolute_shrink_to_fit = style.position() == PositionMode::Absolute && !(style.inset_left().is_some() && style.inset_right().is_some());
-    let shrink_to_fit = replaced_intrinsic.is_none() && request.assigned_border_size.and_then(|assigned| assigned.width).is_none() && (is_float || is_absolute_shrink_to_fit) && matches!(preferred, PreferredSize::Auto);
-    let mut measured = (uses_intrinsic_keyword || shrink_to_fit).then(|| super::intrinsic_sizing::box_content_intrinsic_widths(engine, request.box_idx));
+    let is_alignment_shrink_to_fit = engine.reader.is_block_box(request.box_idx)
+        && style.position() != PositionMode::Absolute
+        && !matches!(inline_alignment, ItemAlignment::Auto | ItemAlignment::Normal | ItemAlignment::Stretch);
+    let shrink_to_fit = replaced_intrinsic.is_none()
+        && request.assigned_border_size.and_then(|assigned| assigned.width).is_none()
+        && (is_float || is_absolute_shrink_to_fit || is_alignment_shrink_to_fit)
+        && matches!(preferred, PreferredSize::Auto);
+    let mut measured = if shrink_to_fit {
+        let model = ResolvedBoxModel::new(style, request.available_width);
+        let available_content = (request.auto_width_limit.unwrap_or(request.available_width) - model.horizontal_margin() - model.horizontal_padding_border()).max(0.0);
+        Some(super::intrinsic_sizing::box_content_intrinsic_widths_with_available(engine, request.box_idx, available_content))
+    } else if uses_intrinsic_keyword
+        && (style.max_width().percentage_dependent()
+            || (style.box_sizing() == BoxSizing::BorderBox && (style.padding_left().has_percentage() || style.padding_right().has_percentage())))
+    {
+        Some(super::intrinsic_sizing::box_content_intrinsic_widths_with_available(engine, request.box_idx, request.available_width))
+    } else {
+        uses_intrinsic_keyword.then(|| super::intrinsic_sizing::box_content_intrinsic_widths(engine, request.box_idx))
+    };
     // A definite float height makes a percentage-height replaced child
     // definite while the float's shrink-to-fit width is being measured. Its
     // intrinsic aspect ratio therefore contributes the transferred width,
@@ -300,6 +416,17 @@ fn resolve_width_constraints(
         min = resolve_intrinsic(min);
         max = resolve_intrinsic(max);
     }
+    let parent_owns_item_sizing = engine.reader.get_parent(request.box_idx).is_some_and(|parent| matches!(engine.reader.box_layout_mode(parent), Some(LayoutMode::Flex(_) | LayoutMode::Grid(_))));
+    let resolve_stretch = |size| match size {
+        // Stretch sizes the margin box to the available space. Store a
+        // specified size that resolves back to the already box-model-adjusted
+        // content size in the common width constraint path.
+        PreferredSize::Stretch if !parent_owns_item_sizing => PreferredSize::Px((available_content + border_box_inset) as f32),
+        _ => size,
+    };
+    preferred = resolve_stretch(preferred);
+    min = resolve_stretch(min);
+    max = resolve_stretch(max);
     ResolvedWidthConstraints { preferred, min, max, horizontal_margin, margin_padding, border_box_inset, available_content, smart_width: smart_width.is_some() }
 }
 
@@ -326,7 +453,7 @@ fn resolve_replaced_size(style: UsedStyleView<'_>, request: BoxLayoutRequest, bo
 }
 
 fn resolve_used_content_width(
-    request: BoxLayoutRequest, box_model: ResolvedBoxModel, constraints: ResolvedWidthConstraints, vertical: ResolvedVerticalSizing, replaced_intrinsic: Option<Size>, replaced_size: Option<Size>, intrinsic_widths: ResolvedIntrinsicWidths,
+    request: BoxLayoutRequest, box_model: ResolvedBoxModel, constraints: ResolvedWidthConstraints, vertical: ResolvedVerticalSizing, replaced_intrinsic: Option<Size>, replaced_size: Option<Size>, intrinsic_widths: ResolvedIntrinsicWidths, ratio_stretch_width: Option<f64>,
 ) -> f64 {
     let replaced_auto_width =
         replaced_intrinsic.map(|intrinsic| vertical.authored_explicit.and_then(|height| (intrinsic.height > 0.0).then_some(height * intrinsic.width / intrinsic.height)).unwrap_or(intrinsic.width).min(constraints.available_content));
@@ -339,6 +466,9 @@ fn resolve_used_content_width(
     if intrinsic_widths.shrink_to_fit {
         let (intrinsic_min, intrinsic_max) = intrinsic_widths.measured.expect("shrink-to-fit width requires measured intrinsic widths");
         content = constrain_content_width(intrinsic_max.min(constraints.available_content.max(intrinsic_min)), constraints.min, constraints.max, request.available_width, constraints.border_box_inset);
+    }
+    if let Some(ratio_width) = ratio_stretch_width {
+        content = constrain_content_width(ratio_width, constraints.min, constraints.max, request.available_width, constraints.border_box_inset);
     }
     content
 }

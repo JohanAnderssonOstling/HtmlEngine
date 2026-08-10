@@ -255,6 +255,9 @@ pub struct InheritedText {
     pub hyphens: Hyphens,
     pub word_break: WordBreak,
     pub overflow_wrap: OverflowWrap,
+    /// Font metrics selected for `text-box-trim`. The edge is inherited even
+    /// though the trimming operation itself is a reset property.
+    pub text_box_edge: TextBoxEdge,
     /// Minimum lines retained at the top and bottom of a fragmentainer.
     pub widows: u8,
     pub orphans: u8,
@@ -343,9 +346,12 @@ pub struct BoxModel {
     pub overflow_x: OverflowMode,
     pub overflow_y: OverflowMode,
     pub text_overflow: TextOverflow,
+    pub text_box_trim: TextBoxTrim,
+    pub size_containment: bool,
     pub vertical_align: VerticalAlignValue,
     pub float: Float,
     pub clear: Clear,
+    pub table_layout: TableLayoutMode,
     pub border_collapse: BorderCollapseMode,
     pub border_spacing_horizontal: f32,
     pub border_spacing_vertical: f32,
@@ -366,6 +372,36 @@ pub struct BoxModel {
     pub padding_bottom: LengthPct,
     pub padding_left: LengthPct,
     pub padding_right: LengthPct,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum TextBoxTrim {
+    #[default]
+    None,
+    Start,
+    End,
+    Both,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum TextBoxOverEdge {
+    #[default]
+    Text,
+    Cap,
+    Ex,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum TextBoxUnderEdge {
+    #[default]
+    Text,
+    Alphabetic,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct TextBoxEdge {
+    pub over: TextBoxOverEdge,
+    pub under: TextBoxUnderEdge,
 }
 
 /// Reset properties consumed by flexbox and grid layout. This is interned in a
@@ -405,6 +441,8 @@ pub struct LayoutStyle {
     pub grid_template_row_names: Vec<Vec<StyleStringId>>,
     pub grid_template_column_names: Vec<Vec<StyleStringId>>,
     pub grid_template_areas: Vec<GridTemplateArea>,
+    pub grid_template_area_rows: u16,
+    pub grid_template_area_columns: u16,
     pub grid_auto_rows: Vec<GridTrackSize>,
     pub grid_auto_columns: Vec<GridTrackSize>,
     pub grid_auto_flow: GridAutoFlow,
@@ -721,10 +759,10 @@ impl_style_key!(Font {
 } floats { font_size, font_size_x_height_px, font_size_ch_advance_px, font_size_cap_height_px, font_size_root_ch, font_size_root_cap_height, font_size_root_line_height });
 impl_style_key!(InheritedText {
     color, language, direction, letter_spacing, word_spacing, tab_size, text_align, text_align_logical, text_align_last, text_align_last_logical, text_align_last_explicit, text_indent, text_indent_hanging, text_indent_each_line, white_space, hyphens, word_break, overflow_wrap, widows, orphans, text_transform,
-    quotes, list_style_type, list_style_position, list_style_image, line_height_normal
+    quotes, list_style_type, list_style_position, list_style_image, line_height_normal, text_box_edge
 } floats { line_height, line_height_x_height_px, line_height_number });
 impl_style_key!(BoxModel {
-    layout_idx, display, box_sizing, overflow_x, overflow_y, text_overflow, vertical_align, float, clear, border_collapse, empty_cells, caption_side,
+    layout_idx, display, box_sizing, overflow_x, overflow_y, text_overflow, text_box_trim, size_containment, vertical_align, float, clear, table_layout, border_collapse, empty_cells, caption_side,
     width, height, min_width, min_height, max_width, max_height, aspect_ratio,
     margin_top, margin_bottom, margin_left, margin_right,
     padding_top, padding_bottom, padding_left, padding_right
@@ -738,6 +776,7 @@ impl_style_key!(LayoutStyle {
     align_content, justify_content, align_items, align_self, justify_items, justify_self,
     row_gap, column_gap, grid_template_rows, grid_template_columns,
     grid_template_row_names, grid_template_column_names, grid_template_areas,
+    grid_template_area_rows, grid_template_area_columns,
     grid_auto_rows, grid_auto_columns, grid_auto_flow, grid_row, grid_column
 } floats { flex_grow, flex_shrink });
 impl_style_key!(Border {
@@ -2238,6 +2277,9 @@ impl<'a> StyleView<'a> {
     pub fn overflow_wrap(&self) -> OverflowWrap {
         self.text.overflow_wrap
     }
+    pub fn text_box_edge(&self) -> TextBoxEdge {
+        self.text.text_box_edge
+    }
     pub fn widows(&self) -> u8 {
         self.text.widows
     }
@@ -2273,6 +2315,12 @@ impl<'a> StyleView<'a> {
     pub fn text_overflow(&self) -> TextOverflow {
         self.box_model.text_overflow
     }
+    pub fn text_box_trim(&self) -> TextBoxTrim {
+        self.box_model.text_box_trim
+    }
+    pub fn size_containment(&self) -> bool {
+        self.box_model.size_containment
+    }
     pub fn vertical_align(&self) -> VerticalAlignValue {
         self.box_model.vertical_align
     }
@@ -2281,6 +2329,9 @@ impl<'a> StyleView<'a> {
     }
     pub fn clear(&self) -> Clear {
         self.box_model.clear
+    }
+    pub fn table_layout(&self) -> TableLayoutMode {
+        self.box_model.table_layout
     }
     pub fn border_collapse(&self) -> BorderCollapseMode {
         self.box_model.border_collapse
@@ -2439,7 +2490,8 @@ impl<'a> StyleView<'a> {
         let radii = [self.radii.top_left, self.radii.top_right, self.radii.bottom_right, self.radii.bottom_left].into_iter().any(|radius| length(radius.x) || length(radius.y));
         let decoration = matches!(self.background.text_decoration.thickness, TextDecorationThickness::Length(value) if length(value));
 
-        self.font.font_size_x_height_px != 0.0
+        !matches!(self.text.text_box_edge.over, TextBoxOverEdge::Text)
+            || self.font.font_size_x_height_px != 0.0
             || self.font.font_size_ch_advance_px != 0.0
             || self.font.font_size_cap_height_px != 0.0
             || self.font.font_size_root_ch != 0.0
@@ -2541,6 +2593,9 @@ impl<'a> UsedStyleView<'a> {
     pub fn overflow_wrap(&self) -> OverflowWrap {
         self.computed.overflow_wrap()
     }
+    pub fn text_box_edge(&self) -> TextBoxEdge {
+        self.computed.text_box_edge()
+    }
     pub fn widows(&self) -> u8 {
         self.computed.widows()
     }
@@ -2574,6 +2629,12 @@ impl<'a> UsedStyleView<'a> {
     pub fn text_overflow(&self) -> TextOverflow {
         self.computed.text_overflow()
     }
+    pub fn text_box_trim(&self) -> TextBoxTrim {
+        self.computed.text_box_trim()
+    }
+    pub fn size_containment(&self) -> bool {
+        self.computed.size_containment()
+    }
     pub fn vertical_align(&self) -> VerticalAlignValue {
         match self.computed.vertical_align() {
             VerticalAlignValue::Calc { absolute_px, line_height_fraction, x_height_px } => VerticalAlignValue::Calc { absolute_px: absolute_px + x_height_px * self.font_relative.x_height, line_height_fraction, x_height_px: 0.0 },
@@ -2585,6 +2646,9 @@ impl<'a> UsedStyleView<'a> {
     }
     pub fn clear(&self) -> Clear {
         self.computed.clear()
+    }
+    pub fn table_layout(&self) -> TableLayoutMode {
+        self.computed.table_layout()
     }
     pub fn border_collapse(&self) -> BorderCollapseMode {
         self.computed.border_collapse()
@@ -2850,6 +2914,7 @@ impl Default for InheritedText {
             hyphens: Hyphens::Manual,
             word_break: WordBreak::Normal,
             overflow_wrap: OverflowWrap::Normal,
+            text_box_edge: TextBoxEdge::default(),
             widows: 2,
             orphans: 2,
             text_transform: TextTransform::None,
@@ -2870,9 +2935,12 @@ impl Default for BoxModel {
             overflow_x: OverflowMode::Visible,
             overflow_y: OverflowMode::Visible,
             text_overflow: TextOverflow::Clip,
+            text_box_trim: TextBoxTrim::None,
+            size_containment: false,
             vertical_align: VerticalAlignValue::Baseline,
             float: Float::None,
             clear: Clear::None,
+            table_layout: TableLayoutMode::Auto,
             border_collapse: BorderCollapseMode::Separate,
             border_spacing_horizontal: 0.0,
             border_spacing_vertical: 0.0,
@@ -2932,6 +3000,8 @@ impl Default for LayoutStyle {
             grid_template_row_names: Vec::new(),
             grid_template_column_names: Vec::new(),
             grid_template_areas: Vec::new(),
+            grid_template_area_rows: 0,
+            grid_template_area_columns: 0,
             grid_auto_rows: Vec::new(),
             grid_auto_columns: Vec::new(),
             grid_auto_flow: GridAutoFlow::Row,
@@ -2970,9 +3040,12 @@ pub const DEFAULT_BOX_MODEL: BoxModel = BoxModel {
     overflow_x: OverflowMode::Visible,
     overflow_y: OverflowMode::Visible,
     text_overflow: TextOverflow::Clip,
+    text_box_trim: TextBoxTrim::None,
+    size_containment: false,
     vertical_align: VerticalAlignValue::Baseline,
     float: Float::None,
     clear: Clear::None,
+    table_layout: TableLayoutMode::Auto,
     border_collapse: BorderCollapseMode::Separate,
     border_spacing_horizontal: 0.0,
     border_spacing_vertical: 0.0,
@@ -3544,6 +3617,8 @@ pub enum ItemAlignment {
     SelfEnd,
     FlexStart,
     FlexEnd,
+    Left,
+    Right,
     Center,
     Stretch,
     Baseline,
@@ -3804,6 +3879,13 @@ pub enum BorderCollapseMode {
     Collapse,
     #[default]
     Separate,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum TableLayoutMode {
+    #[default]
+    Auto,
+    Fixed,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]

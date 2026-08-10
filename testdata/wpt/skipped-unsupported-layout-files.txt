@@ -1,0 +1,13 @@
+# Whole WPT layout files outside the horizontal, non-rendering layout scope.
+css/css-sizing/stretch/block-height-008.html|reason=vertical writing-mode matrix is intentionally outside the horizontal layout pipeline
+css/css-grid/alignment/grid-self-baseline-not-applied-if-sizing-cyclic-dependency-002.html|reason=every case depends on an orthogonal item or vertical grid writing mode
+css/css-grid/grid-items/grid-minimum-size-grid-items-023.html|reason=every case depends on an orthogonal item or vertical grid writing mode
+css/css-grid/grid-items/grid-minimum-size-grid-items-025.html|reason=every case depends on an orthogonal item or vertical grid writing mode
+css/css-grid/grid-items/grid-items-percentage-margins-vertical-lr-001.html|reason=vertical writing-mode is intentionally outside the horizontal layout pipeline
+css/css-grid/grid-items/grid-items-percentage-margins-vertical-lr-002.html|reason=vertical writing-mode is intentionally outside the horizontal layout pipeline
+css/css-grid/grid-items/grid-items-percentage-margins-vertical-rl-001.html|reason=vertical writing-mode is intentionally outside the horizontal layout pipeline
+css/css-grid/grid-items/grid-items-percentage-margins-vertical-rl-002.html|reason=vertical writing-mode is intentionally outside the horizontal layout pipeline
+css/css-grid/grid-items/grid-items-percentage-paddings-vertical-lr-001.html|reason=vertical writing-mode is intentionally outside the horizontal layout pipeline
+css/css-grid/grid-items/grid-items-percentage-paddings-vertical-lr-002.html|reason=vertical writing-mode is intentionally outside the horizontal layout pipeline
+css/css-grid/grid-items/grid-items-percentage-paddings-vertical-rl-001.html|reason=vertical writing-mode is intentionally outside the horizontal layout pipeline
+css/css-grid/grid-items/grid-items-percentage-paddings-vertical-rl-002.html|reason=vertical writing-mode is intentionally outside the horizontal layout pipeline

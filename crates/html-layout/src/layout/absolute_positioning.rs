@@ -78,7 +78,7 @@ fn layout_one(engine: &mut LayoutEngine<'_, '_>, pending: PendingAbsoluteBox, co
     // descendant fragment, decoration, and image as one subtree.
     engine.geometry.set_point(pending.box_idx, pending.static_position);
 
-    let stretch_width = if matches!(style.width(), PreferredSize::Auto) {
+    let stretch_width = if matches!(style.width(), PreferredSize::Auto | PreferredSize::Stretch) {
         match (left, right) {
             (Some(left), Some(right)) if engine.replaced.intrinsic_size(&engine.reader, pending.box_idx).is_none() => {
                 Some(constrain_border_width(style, &model, containing_size.width, (containing_size.width - left - right - model.horizontal_margin()).max(0.0)))
@@ -88,7 +88,7 @@ fn layout_one(engine: &mut LayoutEngine<'_, '_>, pending: PendingAbsoluteBox, co
     } else {
         None
     };
-    let stretch_height = if matches!(style.height(), PreferredSize::Auto) {
+    let stretch_height = if matches!(style.height(), PreferredSize::Auto | PreferredSize::Stretch) {
         match (top, bottom) {
             (Some(top), Some(bottom)) if engine.replaced.intrinsic_size(&engine.reader, pending.box_idx).is_none() => {
                 Some(constrain_border_height(style, &model, containing_size.height, (containing_size.height - top - bottom - model.vertical_margin()).max(0.0)))

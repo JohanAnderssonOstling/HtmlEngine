@@ -198,7 +198,7 @@ mod stage_tests {
         assert_eq!(relayout_timings.build_inline_tokens_from_runs, std::time::Duration::ZERO, "pure-text relayout should not rebuild token plans");
 
         let cloned = document.clone();
-        assert_eq!(cloned.layout_scratch.allocation_capacities(), ((0, 0), (0, 0, 0, 0, 0)), "cloning semantic layout state must not duplicate transient scratch allocations");
+        assert_eq!(cloned.layout_scratch.allocation_capacities(), ((0, 0), (0, 0, 0, 0, 0, 0)), "cloning semantic layout state must not duplicate transient scratch allocations");
     }
 
     #[test]

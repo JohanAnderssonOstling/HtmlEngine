@@ -1,0 +1,5 @@
+# Known WPT tree-construction mismatches
+#
+# Format: file|one-based case number|HtmlScriptingMode.
+# Every entry must still mismatch; an unexpected pass fails the audit so this
+# ledger cannot silently retain fixed behavior.

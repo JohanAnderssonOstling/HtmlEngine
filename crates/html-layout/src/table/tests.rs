@@ -237,6 +237,82 @@ mod tests {
     }
 
     #[test]
+    fn auto_colspan_distributes_percentage_and_minimum_across_empty_columns() {
+        let document = layout_html(
+            "<html><body style='margin:0'><table id='table' style='border-spacing:8px'><tr><td id='a' style='padding:0'></td><td style='padding:0'></td><td style='padding:0'>x</td></tr><tr><td colspan='2' style='width:20%;padding:0'><div style='width:100px'></div></td></tr></table></body></html>",
+            800.0,
+        );
+
+        assert!((box_size_by_id(&document, "table").width - 492.0).abs() < 0.01);
+        assert!((box_size_by_id(&document, "a").width - 46.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn auto_colspan_minimum_uses_percentage_column_weights() {
+        let document = layout_html(
+            "<html><body style='margin:0'><table id='table' style='border-spacing:8px'><tr><td id='a' style='width:25%;padding:0'><div style='width:50px'></div></td><td id='b' style='width:25%;padding:0'><div style='width:30px'></div></td><td style='padding:0'>x</td></tr><tr><td colspan='2' style='padding:0'><div style='width:300px'></div></td></tr></table></body></html>",
+            800.0,
+        );
+
+        assert!((box_size_by_id(&document, "table").width - 616.0).abs() < 0.01);
+        assert!((box_size_by_id(&document, "a").width - 146.0).abs() < 0.01);
+        assert!((box_size_by_id(&document, "b").width - 146.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn full_percentage_auto_columns_make_the_table_use_available_width() {
+        let document = layout_html(
+            "<html><body style='margin:0'><div style='width:500px'><table id='table' style='border-spacing:8px'><tr><td id='a' style='width:50%;padding:0'><div style='width:100px'></div></td><td id='b' style='width:50%;padding:0'><div style='width:100px'></div></td><td style='width:100px;padding:0'><div style='width:100px'></div></td></tr></table></div></body></html>",
+            800.0,
+        );
+
+        assert!((box_size_by_id(&document, "table").width - 500.0).abs() < 0.01);
+        assert!((box_size_by_id(&document, "a").width - 184.0).abs() < 0.01);
+        assert!((box_size_by_id(&document, "b").width - 184.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn rows_without_columns_fill_the_inner_table_width_and_share_its_height() {
+        let document = layout_html(
+            "<html><body style='margin:0'>
+                <table style='box-sizing:border-box;width:60px;height:60px;border-spacing:10px'><tr id='one'></tr></table>
+                <table style='box-sizing:border-box;width:60px;height:60px;border:5px solid;border-spacing:10px'><tr id='first'></tr><tr id='second'></tr></table>
+            </body></html>",
+            800.0,
+        );
+
+        assert_eq!(box_size_by_id(&document, "one"), kurbo::Size::new(60.0, 40.0));
+        assert_eq!(box_size_by_id(&document, "first"), kurbo::Size::new(50.0, 10.0));
+        assert_eq!(box_size_by_id(&document, "second"), kurbo::Size::new(50.0, 10.0));
+    }
+
+    #[test]
+    fn empty_row_group_keeps_its_authored_height() {
+        let document = layout_html(
+            "<html><body style='margin:0'><table id='table' style='border-collapse:collapse'><tbody id='group' style='height:75px'></tbody></table></body></html>",
+            800.0,
+        );
+
+        assert_eq!(box_size_by_id(&document, "group").height, 75.0);
+        assert_eq!(box_size_by_id(&document, "table").height, 75.0);
+    }
+
+    #[test]
+    fn auto_layout_merges_empty_tracks_but_fixed_layout_retains_authored_columns() {
+        let document = layout_html(
+            "<html><body style='margin:0'>
+                <table id='auto' style='border:10px solid;border-spacing:20px'><tr><td id='span' colspan='10' style='width:50px;height:10px;padding:0'></td><td style='width:50px;padding:0'></td></tr></table>
+                <table id='fixed' style='box-sizing:border-box;table-layout:fixed;width:130px;border:10px solid;border-spacing:20px'><col span='10'><tr><td style='width:50px;padding:0'></td><td style='width:50px;padding:0'></td></tr></table>
+            </body></html>",
+            800.0,
+        );
+
+        assert_eq!(box_size_by_id(&document, "auto").width, 180.0);
+        assert_eq!(box_size_by_id(&document, "span").width, 50.0);
+        assert_eq!(box_size_by_id(&document, "fixed").width, 340.0);
+    }
+
+    #[test]
     fn table_intrinsic_width_trims_collapsible_inline_edge_whitespace() {
         let document = layout_html(
             "<html><body style='margin:0'>
@@ -359,6 +435,17 @@ mod tests {
         let blue = decoration_rects_by_color(&document, 0x0000ffff);
         assert_eq!(blue.iter().map(|rect| rect.x0).fold(f64::INFINITY, f64::min), box_point_by_id(&document, "table").x);
         assert_eq!(blue.iter().map(|rect| rect.x1).fold(f64::NEG_INFINITY, f64::max), box_point_by_id(&document, "table").x + 100.0);
+    }
+
+    #[test]
+    fn collapsed_content_box_table_adds_its_outer_border_halves() {
+        let document = layout_html(
+            "<html><body style='margin:0'><table id='block' style='box-sizing:content-box;border-collapse:collapse;width:100px;height:100px;border-style:solid;border-width:20px 40px 40px 20px'><tr><td></td></tr></table><span id='inline' style='display:inline-table;box-sizing:content-box;border-collapse:collapse;width:100px;height:100px;border-style:solid;border-width:20px 40px 40px 20px'><span style='display:table-cell'></span></span></body></html>",
+            500.0,
+        );
+
+        assert_eq!(box_size_by_id(&document, "block"), kurbo::Size::new(130.0, 130.0));
+        assert_eq!(box_size_by_id(&document, "inline"), kurbo::Size::new(130.0, 130.0));
     }
 
     #[test]
@@ -514,6 +601,118 @@ mod tests {
     }
 
     #[test]
+    fn fixed_layout_ignores_later_rows_while_auto_layout_measures_them() {
+        let document = layout_html(
+            "<html><body style='margin:0'>
+                <table style='table-layout:fixed;width:100px;border-spacing:0'><tr><td id='fixed' style='padding:0'></td><td style='padding:0'></td></tr><tr><td style='padding:0'><div style='width:200px'></div></td><td></td></tr></table>
+                <table style='table-layout:auto;width:100px;border-spacing:0'><tr><td id='auto-mode' style='padding:0'></td><td style='padding:0'></td></tr><tr><td style='padding:0'><div style='width:200px'></div></td><td></td></tr></table>
+                <table style='table-layout:fixed;border-spacing:0'><tr><td id='fixed-auto-width' style='padding:0'></td><td style='padding:0'></td></tr><tr><td style='padding:0'><div style='width:200px'></div></td><td></td></tr></table>
+            </body></html>",
+            500.0,
+        );
+
+        assert!((box_size_by_id(&document, "fixed").width - 50.0).abs() < 0.01);
+        assert!(box_size_by_id(&document, "auto-mode").width >= 200.0);
+        assert!(box_size_by_id(&document, "fixed-auto-width").width >= 200.0, "fixed layout with auto table width falls back to auto layout");
+    }
+
+    #[test]
+    fn auto_width_redistribution_uses_atomic_minimums_and_percentage_guesses() {
+        let document = layout_html_css(
+            "<html><body style='margin:0'>
+                <table id='tight' style='width:50px'><tr>
+                    <td id='tight-a' style='width:100px'><div style='width:50px'></div><div style='width:50px'></div></td>
+                    <td id='tight-b' style='width:100px'><div style='width:50px'></div><div style='width:25px'></div></td>
+                </tr></table>
+                <table id='maximum' style='width:max-content'><tr>
+                    <td id='maximum-auto'><div style='width:50px'></div><div style='width:50px'></div></td>
+                    <td style='width:100px'><div style='width:50px'></div><div style='width:25px'></div></td>
+                    <td id='maximum-percent' style='width:20%'><div style='width:50px'></div><div style='width:25px'></div></td>
+                </tr></table>
+            </body></html>",
+            Some("table{border-spacing:8px}td{padding:0}td>div{display:inline-block}"),
+            800.0,
+        );
+
+        assert_eq!(box_size_by_id(&document, "tight").width, 124.0);
+        assert_eq!(box_size_by_id(&document, "tight-a").width, 50.0);
+        assert_eq!(box_size_by_id(&document, "tight-b").width, 50.0);
+        assert_eq!(box_size_by_id(&document, "maximum").width, 307.0);
+        assert!((box_size_by_id(&document, "maximum-auto").width - 120.0).abs() < 0.01);
+        assert!((box_size_by_id(&document, "maximum-percent").width - 55.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn fixed_width_redistribution_uses_fixed_percentage_auto_priority() {
+        let document = layout_html_css(
+            "<html><body style='margin:0'>
+                <table style='width:500px'><tr>
+                    <td id='auto-1'><div style='width:10px'></div></td><td id='auto-2'><div style='width:20px'></div></td>
+                    <td id='auto-3'><div style='width:30px'></div></td><td id='auto-4'><div style='width:40px'></div></td>
+                    <td id='auto-5'><div style='width:120px'></div></td>
+                </tr></table>
+                <table style='width:100px'><tr>
+                    <td id='percent-2' style='width:200%'></td><td id='percent-3' style='width:300%'></td><td id='percent-5' style='width:500%'></td>
+                </tr></table>
+                <table style='width:100px'><tr><td id='zero' style='width:0'></td><td id='ordinary-auto'></td></tr></table>
+            </body></html>",
+            Some("table{table-layout:fixed;border-spacing:0}td{padding:0}td>div{display:inline-block}"),
+            800.0,
+        );
+
+        for id in ["auto-1", "auto-2", "auto-3", "auto-4", "auto-5"] {
+            assert!((box_size_by_id(&document, id).width - 100.0).abs() < 0.01, "{id}");
+        }
+        assert!((box_size_by_id(&document, "percent-2").width - 20.0).abs() < 0.01);
+        assert!((box_size_by_id(&document, "percent-3").width - 30.0).abs() < 0.01);
+        assert!((box_size_by_id(&document, "percent-5").width - 50.0).abs() < 0.01);
+        assert_eq!(box_size_by_id(&document, "zero").width, 0.0);
+        assert_eq!(box_size_by_id(&document, "ordinary-auto").width, 100.0);
+    }
+
+    #[test]
+    fn fixed_percentage_colspan_does_not_duplicate_its_padding_into_tracks() {
+        let document = layout_html_css(
+            "<html><body style='margin:0'><table style='width:448px'><tr>
+                <td id='span-40' colspan='2' style='width:40%'></td><td id='span-20' colspan='2' style='width:20%'></td><td id='single-40' style='width:40%;box-sizing:border-box'></td>
+                </tr><tr><td id='track-1'></td><td id='track-2'></td><td id='track-3'></td><td id='track-4'></td><td id='track-5'></td></tr></table></body></html>",
+            Some("table{table-layout:fixed;border-spacing:8px}td{padding:6px;box-sizing:content-box}"),
+            800.0,
+        );
+
+        assert_eq!(box_size_by_id(&document, "span-40").width, 168.0);
+        assert_eq!(box_size_by_id(&document, "span-20").width, 88.0);
+        assert_eq!(box_size_by_id(&document, "single-40").width, 160.0);
+        for (id, expected) in [("track-1", 80.0), ("track-2", 80.0), ("track-3", 40.0), ("track-4", 40.0), ("track-5", 160.0)] {
+            assert!((box_size_by_id(&document, id).width - expected).abs() < 0.01, "{id}");
+        }
+    }
+
+    #[test]
+    fn row_group_height_grows_auto_rows_in_proportion_to_natural_height() {
+        let document = layout_html(
+            "<html><body style='margin:0'><table style='border-spacing:0'><tbody id='group' style='height:100px'><tr id='short'><td style='padding:0'><div style='height:10px'></div></td></tr><tr id='tall'><td style='padding:0'><div style='height:30px'></div></td></tr></tbody></table></body></html>",
+            300.0,
+        );
+
+        assert!((box_size_by_id(&document, "group").height - 100.0).abs() < 0.01);
+        assert!((box_size_by_id(&document, "short").height - 25.0).abs() < 0.01);
+        assert!((box_size_by_id(&document, "tall").height - 75.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn percentage_rows_resolve_against_their_definite_row_group_height() {
+        let document = layout_html(
+            "<html><body style='margin:0'><table style='border-spacing:0'><tbody style='height:100px'><tr id='quarter' style='height:25%'><td style='padding:0'></td></tr><tr id='half' style='height:50%'><td style='padding:0'></td></tr><tr id='remainder'><td style='padding:0'></td></tr></tbody></table></body></html>",
+            300.0,
+        );
+
+        assert!((box_size_by_id(&document, "quarter").height - 25.0).abs() < 0.01);
+        assert!((box_size_by_id(&document, "half").height - 50.0).abs() < 0.01);
+        assert!((box_size_by_id(&document, "remainder").height - 25.0).abs() < 0.01);
+    }
+
+    #[test]
     fn mixed_length_percentage_calc_is_not_a_table_cell_width_hint() {
         let document = layout_html(
             "<html><body style='margin:0'>
@@ -658,6 +857,21 @@ mod tests {
     }
 
     #[test]
+    fn rowspan_is_clamped_at_its_row_group_boundary() {
+        let document = layout_html(
+            "<html><body style='margin:0'><table style='border-spacing:0'><tbody id='first-group'><tr><td id='first' style='padding:0'><div style='height:10px'></div></td><td id='span' rowspan='5' style='padding:0'><div style='height:100px'></div></td></tr><tr><td id='second' style='padding:0'><div style='height:10px'></div></td></tr><tr id='empty'></tr></tbody><tbody><tr id='next-group'><td style='padding:0'><div style='height:20px'></div></td></tr></tbody></table></body></html>",
+            300.0,
+        );
+
+        assert!((box_size_by_id(&document, "first-group").height - 100.0).abs() < 0.01);
+        assert!((box_size_by_id(&document, "first").height - 50.0).abs() < 0.01);
+        assert!((box_size_by_id(&document, "second").height - 50.0).abs() < 0.01);
+        assert!((box_size_by_id(&document, "empty").height - 0.0).abs() < 0.01);
+        assert!((box_size_by_id(&document, "span").height - 100.0).abs() < 0.01);
+        assert!((box_size_by_id(&document, "next-group").height - 20.0).abs() < 0.01);
+    }
+
+    #[test]
     fn vertical_align_bottom_offsets_short_cell_content() {
         let document = layout_html(
             "<html><body><table style='border-spacing:0'><tr><td style='padding:0'><div style='width:10px;height:20px'></div></td><td id='cell' style='padding:0;vertical-align:bottom'><div id='content' style='width:10px;height:5px'></div></td></tr></table></body></html>",
@@ -680,14 +894,101 @@ mod tests {
     }
 
     #[test]
-    fn wider_caption_expands_the_wrapper_without_expanding_table_grid_paint() {
+    fn caption_minimum_width_expands_the_table_grid() {
         let document = layout_html(
             "<html><body style='margin:0'><table id='table' style='border-spacing:0;background:#800080'><caption style='width:190px;height:30px'></caption><tr><td style='padding:0'><div style='width:100px;height:30px'></div></td></tr></table></body></html>",
             300.0,
         );
 
         assert_eq!(box_size_by_id(&document, "table"), kurbo::Size::new(190.0, 60.0));
-        assert_eq!(decoration_rects_by_color(&document, 0x800080ff), vec![kurbo::Rect::new(0.0, 30.0, 100.0, 60.0)]);
+        assert_eq!(decoration_rects_by_color(&document, 0x800080ff), vec![kurbo::Rect::new(0.0, 30.0, 190.0, 60.0)]);
+    }
+
+    #[test]
+    fn table_borders_satisfy_a_narrower_caption_minimum() {
+        let document = layout_html(
+            "<html><body style='margin:0'><table id='table' style='border:50px solid;border-spacing:10px'><caption><span style='display:inline-block;width:50px'></span><span style='display:inline-block;width:50px'></span></caption></table></body></html>",
+            300.0,
+        );
+
+        assert_eq!(box_size_by_id(&document, "table").width, 100.0);
+    }
+
+    #[test]
+    fn percentage_cell_padding_does_not_create_a_cyclic_track_minimum() {
+        let document = layout_html(
+            "<html><body style='margin:0'><table id='table' style='border-spacing:0'><caption><div style='width:300px'></div></caption><tr><td id='first' style='box-sizing:content-box;width:100px;border:10px solid;padding:30%'><div style='width:50px'></div></td><td style='box-sizing:content-box;width:100px;border:10px solid;padding:30%'><div style='width:50px'></div></td></tr></table></body></html>",
+            800.0,
+        );
+
+        assert_eq!(box_size_by_id(&document, "table").width, 300.0);
+        assert_eq!(box_size_by_id(&document, "first").width, 150.0);
+    }
+
+    #[test]
+    fn percentage_height_child_resolves_after_cell_intrinsic_measurement() {
+        let document = layout_html(
+            "<html><body style='margin:0'><table style='border-spacing:0'><tr><td id='cell' style='padding:0;height:100px;font:50px/1 monospace'>y<span id='child' style='display:inline-block;height:100%;width:50px'></span></td></tr></table></body></html>",
+            300.0,
+        );
+
+        assert_eq!(box_size_by_id(&document, "cell").height, 100.0);
+        assert_eq!(box_size_by_id(&document, "child").height, 100.0);
+    }
+
+    #[test]
+    fn zero_percent_columns_do_not_enlarge_an_auto_table() {
+        let document = layout_html_css(
+            "<html><body style='margin:0'><table id='table'><col style='width:0%'><col style='width:0%'><tr><td id='first' style='padding:0'><span id='outer' style='display:inline-block'><span id='inner' style='display:inline-block;width:100px'></span></span></td><td id='second' style='padding:0'><span style='display:inline-block'></span></td></tr></table></body></html>",
+            Some("table { border-spacing:2px }"),
+            400.0,
+        );
+
+        assert_eq!(box_size_by_id(&document, "inner").width, 100.0);
+        assert_eq!(box_size_by_id(&document, "outer").width, 100.0);
+        assert_eq!(
+            (
+                box_size_by_id(&document, "first").width,
+                box_size_by_id(&document, "second").width,
+                box_size_by_id(&document, "table").width,
+            ),
+            (100.0, 0.0, 106.0),
+        );
+    }
+
+    #[test]
+    fn float_with_full_percentage_column_uses_its_available_width() {
+        let document = layout_html(
+            "<html><body style='margin:0'><div style='box-sizing:border-box;width:600px;border:5px solid'><table id='table' style='float:left;border-spacing:10px'><tr><td style='width:100%;padding:0'><div style='width:30px'></div></td><td style='padding:0'><div style='width:100px'></div></td></tr></table></div></body></html>",
+            800.0,
+        );
+
+        assert_eq!(box_size_by_id(&document, "table").width, 590.0);
+    }
+
+    #[test]
+    fn nested_table_ignores_cell_percentage_for_outer_intrinsic_ratio_but_fills_its_cell() {
+        let document = layout_html(
+            "<html><body style='margin:0'><table id='outer' style='width:300px;border-spacing:0'><tr><td id='outer-first' style='padding:0'><table id='inner' style='border-spacing:0'><tr><td id='inner-cell' style='padding:0;width:1%'><div style='width:20px;height:10px'></div></td></tr></table></td><td id='outer-second' style='padding:0'><div style='width:40px;height:10px'></div></td></tr></table></body></html>",
+            500.0,
+        );
+
+        assert_eq!(box_size_by_id(&document, "outer-first").width, 100.0);
+        assert_eq!(box_size_by_id(&document, "outer-second").width, 200.0);
+        assert_eq!(box_size_by_id(&document, "inner").width, 100.0);
+        assert_eq!(box_size_by_id(&document, "inner-cell").width, 100.0);
+    }
+
+    #[test]
+    fn restricted_percentage_height_cell_descendant_uses_definite_table_height() {
+        let document = layout_html_css(
+            "<html><body style='margin:0'><div id='table' class='table'><div id='scroller' class='cell'><div style='width:100px;height:500px'></div></div></div></body></html>",
+            Some(".table{display:table;height:100px}.cell{overflow:auto;width:100px;height:100%}"),
+            300.0,
+        );
+
+        assert_eq!(box_size_by_id(&document, "table").height, 100.0);
+        assert_eq!(box_size_by_id(&document, "scroller").height, 100.0);
     }
 
     #[test]

@@ -111,7 +111,10 @@ impl DecorationEmitter<'_, '_, '_> {
                     emit_horizontal_pattern(fragments, Rect::new(start_x, y, end_x, y + thickness), text_decoration_color, text_decoration.style, true, false, false);
                 }
                 if text_decoration.lines.overline() {
-                    let y = (baseline - ascent).max(line.point.y);
+                    // The overline follows the selected font's ascent from
+                    // the fragment baseline. It may sit above the nominal
+                    // line top when the font metrics exceed the line-height.
+                    let y = baseline - ascent;
                     emit_horizontal_pattern(fragments, Rect::new(start_x, y, end_x, y + thickness), text_decoration_color, text_decoration.style, true, false, false);
                 }
                 if text_decoration.lines.line_through() {

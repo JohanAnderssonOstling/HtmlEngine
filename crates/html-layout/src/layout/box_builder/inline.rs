@@ -350,8 +350,10 @@ fn node_has_renderable_inline_content(document: &Document, styles: &ComputedStyl
             if element.tag().eq_ignore_ascii_case("br") || element.image_idx().is_some() {
                 return true;
             }
-            let (start_edge, end_edge) = inline_edges_for_view(&style);
-            if display == Display::Inline && (start_edge || end_edge) {
+            // CSS 2 line-height calculation includes empty inline boxes even
+            // when they have no painted edge or text. Retaining the element
+            // lets its zero-width boundary contribute the selected font strut.
+            if display == Display::Inline {
                 return true;
             }
             element.children().any(|child| node_has_renderable_inline_content(document, styles, child))

@@ -205,6 +205,18 @@ fn declaration_syntax_impl(normalized_name: &str, value: &str) -> PropertySyntax
             PropertySyntax::Invalid
         };
     }
+    if normalized_name == "contain" {
+        let normalized_value = value.trim().to_ascii_lowercase();
+        return if style::contain::parse(value).is_some()
+            || matches!(normalized_value.as_str(), "inherit" | "initial" | "unset" | "revert" | "revert-layer")
+            || value.contains("var(")
+            || value.contains("env(")
+        {
+            PropertySyntax::Valid
+        } else {
+            PropertySyntax::Invalid
+        };
+    }
     if let Some(valid) = style::box_syntax::property_value_is_valid(normalized_name, value) {
         return if valid { PropertySyntax::Valid } else { PropertySyntax::Invalid };
     }

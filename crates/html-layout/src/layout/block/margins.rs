@@ -133,11 +133,12 @@ pub(super) struct ParentCollapseContext {
 
 pub(super) fn parent_collapse_context(reader: &crate::layout::read_context::LayoutReader<'_>, parent_idx: usize) -> ParentCollapseContext {
     let style = reader.style(parent_idx);
+    let (overflow_x, overflow_y) = reader.effective_overflow_modes(parent_idx);
     let is_flex_grid_item = reader.get_parent(parent_idx).is_some_and(|ancestor| matches!(reader.box_layout_mode(ancestor), Some(BoxType::Flex(_) | BoxType::Grid(_))));
     let establishes_context = establishes_formatting_context(
         style.display(),
-        style.overflow_x(),
-        style.overflow_y(),
+        overflow_x,
+        overflow_y,
         matches!(style.float(), Float::Left | Float::Right),
         reader.root_box() == Some(parent_idx),
         reader.is_table_cell_box(parent_idx),
@@ -147,6 +148,51 @@ pub(super) fn parent_collapse_context(reader: &crate::layout::read_context::Layo
         top_open: !establishes_context && style.padding_top().is_zero() && style.border_top_width() == 0.0,
         bottom_open: !establishes_context && style.padding_bottom().is_zero() && style.border_bottom_width() == 0.0 && matches!(style.height(), PreferredSize::Auto),
     }
+}
+
+/// Returns the vertical margins that participate in stretch-fit sizing.
+///
+/// CSS Sizing treats a margin adjoining an open containing-block edge as
+/// zero for this calculation. Inline formatting roots, floats, flex/grid
+/// items, and formatting-context roots keep both margins because their
+/// margins cannot adjoin the parent's content edges.
+pub(in crate::layout) fn stretch_margin_inset(reader: &crate::layout::read_context::LayoutReader<'_>, box_idx: usize, cb_width: f64) -> f64 {
+    let style = reader.style(box_idx);
+    let before = style.margin_top().resolve(cb_width);
+    let after = style.margin_bottom().resolve(cb_width);
+    let both = before + after;
+    if participation(style.float(), style.position()) != FlowParticipation::InFlow
+        || matches!(style.display(), Display::InlineBlock | Display::InlineTable | Display::InlineFlex | Display::InlineGrid)
+    {
+        return both;
+    }
+
+    let Some(parent_idx) = reader.get_parent(box_idx) else {
+        return both;
+    };
+    if matches!(reader.box_layout_mode(parent_idx), Some(BoxType::Flex(_) | BoxType::Grid(_))) {
+        return both;
+    }
+
+    let parent = reader.style(parent_idx);
+    let (parent_overflow_x, parent_overflow_y) = reader.effective_overflow_modes(parent_idx);
+    let parent_is_flex_grid_item = reader.get_parent(parent_idx).is_some_and(|ancestor| matches!(reader.box_layout_mode(ancestor), Some(BoxType::Flex(_) | BoxType::Grid(_))));
+    let parent_establishes_context = establishes_formatting_context(
+        parent.display(),
+        parent_overflow_x,
+        parent_overflow_y,
+        matches!(parent.float(), Float::Left | Float::Right),
+        reader.root_box() == Some(parent_idx),
+        reader.is_table_cell_box(parent_idx),
+        parent_is_flex_grid_item,
+    );
+    if parent_establishes_context {
+        return both;
+    }
+
+    let before = if parent.padding_top().is_zero() && parent.border_top_width() == 0.0 { 0.0 } else { before };
+    let after = if parent.padding_bottom().is_zero() && parent.border_bottom_width() == 0.0 { 0.0 } else { after };
+    before + after
 }
 
 pub(super) fn collapse_before_child(pending: &mut MarginStrut, profile: MarginProfile, started_flow: bool, has_clearance: bool, clearance_consumed_before_margin: bool, parent: ParentCollapseContext, is_anonymous: bool) -> (bool, f64) {
@@ -283,10 +329,11 @@ impl MarginAnalysis {
         }
 
         let is_flex_grid_item = reader.get_parent(box_idx).is_some_and(|parent_idx| matches!(reader.box_layout_mode(parent_idx), Some(BoxType::Flex(_) | BoxType::Grid(_))));
+        let (overflow_x, overflow_y) = reader.effective_overflow_modes(box_idx);
         let establishes_context = establishes_formatting_context(
             style.display(),
-            style.overflow_x(),
-            style.overflow_y(),
+            overflow_x,
+            overflow_y,
             matches!(style.float(), Float::Left | Float::Right),
             reader.root_box() == Some(box_idx),
             reader.is_table_cell_box(box_idx),
@@ -458,10 +505,11 @@ impl MarginAnalysis {
         let style = reader.style(box_idx);
         let own_after = style.margin_bottom().resolve(cb_width);
         let is_flex_grid_item = reader.get_parent(box_idx).is_some_and(|parent_idx| matches!(reader.box_layout_mode(parent_idx), Some(BoxType::Flex(_) | BoxType::Grid(_))));
+        let (overflow_x, overflow_y) = reader.effective_overflow_modes(box_idx);
         let establishes_context = establishes_formatting_context(
             style.display(),
-            style.overflow_x(),
-            style.overflow_y(),
+            overflow_x,
+            overflow_y,
             matches!(style.float(), Float::Left | Float::Right),
             reader.root_box() == Some(box_idx),
             reader.is_table_cell_box(box_idx),

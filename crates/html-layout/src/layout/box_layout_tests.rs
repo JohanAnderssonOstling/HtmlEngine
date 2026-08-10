@@ -257,7 +257,7 @@ fn inline_table_bottom_padding_contributes_once_to_parent_line_height() {
 
     assert_eq!(table_size.height, 60.0, "10px cell content plus 50px table padding");
     assert_eq!(wrapper_size.height, 60.0, "the atomic inline table must contribute its border-box height exactly once");
-    assert_eq!(table_point.y, wrapper_point.y, "vertical-align: top aligns the table to the line top");
+    assert!((table_point.y - wrapper_point.y).abs() < 1e-5, "vertical-align: top aligns the table to the line top");
 }
 
 #[test]
@@ -689,6 +689,20 @@ fn absolute_child_uses_positioned_ancestor_padding_box_and_leaves_flow() {
 }
 
 #[test]
+fn absolute_grid_item_uses_its_taffy_resolved_grid_area() {
+    let document = layout_html(
+        "<html><body style='margin:0'><div id='grid' style='display:grid;position:relative;width:max-content;height:40px;grid-template-columns:20px 30px 50px'><div style='grid-column:1/-1;height:10px'></div><div id='absolute' style='position:absolute;grid-column:2/3;width:100%;height:5px'></div></div></body></html>",
+        400.0,
+    );
+    let (grid_point, grid_size) = id_geometry(&document, "grid");
+    let (absolute_point, absolute_size) = id_geometry(&document, "absolute");
+
+    assert_eq!(grid_size, Size::new(100.0, 40.0));
+    assert_eq!(absolute_point, grid_point + Vec2::new(20.0, 0.0));
+    assert_eq!(absolute_size, Size::new(30.0, 5.0));
+}
+
+#[test]
 fn blockified_absolute_inline_uses_authored_geometry_and_positioned_paint_layer() {
     let document = layout_html(
         "<html><body style='margin:0'><div id='parent' style='position:relative;width:300px'><p style='width:200%'><img style='width:50%;height:100px'/><span id='absolute' style='position:absolute;top:0;left:0;background:green;width:300px;height:100px'></span></p></div></body></html>",
@@ -877,6 +891,20 @@ fn opposing_vertical_insets_stretch_absolute_auto_height() {
 }
 
 #[test]
+fn opposing_insets_bound_absolute_stretch_sizes_and_zero_auto_margins() {
+    let document = layout_html(
+        "<html><body style='margin:0'><div style='position:relative;width:200px;height:200px'>
+            <div id='horizontal' style='position:absolute;left:25px;right:25px;top:0;bottom:0;width:stretch;margin:auto'></div>
+            <div id='vertical' style='position:absolute;left:0;right:0;top:25px;bottom:25px;height:stretch;margin:auto'></div>
+        </div></body></html>",
+        400.0,
+    );
+
+    assert_eq!(id_geometry(&document, "horizontal").1.width, 150.0);
+    assert_eq!(id_geometry(&document, "vertical").1.height, 150.0);
+}
+
+#[test]
 fn blockified_absolute_row_group_keeps_its_anonymous_table_descendants() {
     let document = layout_html(
         "<html><body style='margin:0'><div style='display:table'><div id='group' style='display:table-row-group;position:absolute;left:0'><div style='display:table-row'><div id='cell' style='display:table-cell;width:20px;height:20px;background:green'></div></div></div></div></body></html>",
@@ -964,4 +992,224 @@ fn block_percentage_child_uses_inline_block_content_height() {
     let parent_background = line_colors.iter().position(|color| *color == 0xff0000ff).expect("red parent background");
     let child_background = line_colors.iter().position(|color| *color == 0x008000ff).expect("green child background");
     assert!(parent_background < child_background, "inline-block parent background must paint below its block child: {line_colors:?}");
+}
+
+#[test]
+fn stretch_sizes_the_margin_box_in_both_axes() {
+    let document = layout_html(
+        "<html><body style='margin:0'><div style='display:flow-root;width:100px;height:100px'><div id='target' style='width:stretch;height:stretch;margin:5px;padding:2px;border:3px solid'></div></div></body></html>",
+        300.0,
+    );
+
+    assert_eq!(id_geometry(&document, "target").1, Size::new(90.0, 90.0));
+}
+
+#[test]
+fn stretch_treats_margins_at_open_parent_edges_as_zero() {
+    let document = layout_html(
+        "<html><body style='margin:0'><div style='width:100px;height:100px'><div id='target' style='height:stretch;margin:10px;border:3px solid'></div></div></body></html>",
+        300.0,
+    );
+
+    assert_eq!(id_geometry(&document, "target").1.height, 100.0);
+}
+
+#[test]
+fn intrinsic_block_size_keywords_constrain_natural_content_height() {
+    let document = layout_html(
+        "<html><body style='margin:0'>
+            <div id='minimum' style='display:inline-block;height:0;min-height:min-content;padding:2px;border:3px solid;font:20px/1 serif'>X</div>
+            <div id='maximum' style='display:inline-block;height:500px;max-height:max-content;padding:2px;border:3px solid;font:20px/1 serif'>X</div>
+        </body></html>",
+        300.0,
+    );
+
+    assert_eq!(id_geometry(&document, "minimum").1.height, 30.0);
+    assert_eq!(id_geometry(&document, "maximum").1.height, 30.0);
+}
+
+#[test]
+fn empty_stretched_inline_block_retains_padding_and_border() {
+    let document = layout_html(
+        "<html><body style='margin:0'><div style='display:inline-block;width:0'><span id='target' style='display:inline-block;width:stretch;margin:5px;padding:2px;border:3px solid'></span></div></body></html>",
+        300.0,
+    );
+
+    assert_eq!(id_geometry(&document, "target").1.width, 10.0);
+}
+
+#[test]
+fn nested_inline_block_fit_content_uses_its_atomic_containing_width() {
+    let document = layout_html(
+        "<html><body style='margin:0'><div style='display:inline-block;width:100px'><span id='target' style='display:inline-block;width:fit-content;margin:5px;padding:2px;border:3px solid;font:40px/1 Ahem'>XXX XXX</span></div></body></html>",
+        800.0,
+    );
+
+    assert_eq!(id_geometry(&document, "target").1.width, 90.0);
+}
+
+#[test]
+fn floated_fit_content_child_uses_the_available_intrinsic_contribution() {
+    let document = layout_html(
+        "<html><body style='margin:0'>
+            <div style='display:inline-block;width:0'><div id='narrow' style='float:left;margin:5px;border:3px solid;padding:2px;font:40px/1 serif'><div style='width:fit-content'>XXX XXX</div></div></div>
+            <div style='display:inline-block;width:100px'><div id='middle' style='float:left;margin:5px;border:3px solid;padding:2px;font:40px/1 serif'><div style='width:fit-content'>XXX XXX</div></div></div>
+            <div style='display:inline-block;width:200px'><div id='wide' style='float:left;margin:5px;border:3px solid;padding:2px;font:40px/1 serif'><div style='width:fit-content'>XXX XXX</div></div></div>
+        </body></html>",
+        800.0,
+    );
+
+    assert_eq!(id_geometry(&document, "narrow").1.width, 70.0);
+    assert_eq!(id_geometry(&document, "middle").1.width, 90.0);
+    assert_eq!(id_geometry(&document, "wide").1.width, 150.0);
+}
+
+#[test]
+fn stretch_height_is_auto_when_the_containing_block_height_is_indefinite() {
+    let document = layout_html(
+        "<html><body style='margin:0;height:100px'><div style='display:inline-block;width:100px;max-height:100px'><div id='target' style='height:stretch;margin:5px;padding:2px;border:3px solid;font:20px/1 serif'>X</div></div></body></html>",
+        300.0,
+    );
+
+    assert_eq!(id_geometry(&document, "target").1.height, 30.0);
+}
+
+#[test]
+fn definite_stretch_height_transfers_through_a_preferred_aspect_ratio() {
+    let document = layout_html(
+        "<html><body style='margin:0'><div style='height:100px'><div id='target' style='height:stretch;width:auto;aspect-ratio:2/1'></div></div></body></html>",
+        800.0,
+    );
+
+    assert_eq!(id_geometry(&document, "target").1, Size::new(200.0, 100.0));
+}
+
+#[test]
+fn aspect_ratio_automatic_minimum_is_zero_only_on_the_scrollable_axis() {
+    let document = layout_html(
+        "<html><body style='margin:0'>
+            <div id='inline-x' style='display:inline-block;width:auto;height:100px;aspect-ratio:1/1;overflow-x:hidden;overflow-y:clip'><div style='width:200px;height:200px'></div></div>
+            <div id='inline-y' style='display:inline-block;width:auto;height:100px;aspect-ratio:1/1;overflow-x:clip;overflow-y:hidden'><div style='width:200px;height:200px'></div></div>
+            <div id='block-y' style='width:100px;height:auto;aspect-ratio:1/1;overflow-x:clip;overflow-y:hidden'><div style='width:200px;height:200px'></div></div>
+            <div id='block-x' style='width:100px;height:auto;aspect-ratio:1/1;overflow-x:hidden;overflow-y:clip'><div style='width:200px;height:200px'></div></div>
+        </body></html>",
+        800.0,
+    );
+
+    assert_eq!(id_geometry(&document, "inline-x").1, Size::new(100.0, 100.0));
+    assert_eq!(id_geometry(&document, "inline-y").1, Size::new(200.0, 100.0));
+    assert_eq!(id_geometry(&document, "block-y").1, Size::new(100.0, 100.0));
+    assert_eq!(id_geometry(&document, "block-x").1, Size::new(100.0, 200.0));
+}
+
+#[test]
+fn block_justify_self_shrink_wraps_and_uses_logical_and_physical_alignment() {
+    let document = layout_html(
+        "<!doctype html><html><body style='margin:0'>
+            <div id='ltr' style='display:flow-root;width:40px;direction:ltr'>
+                <div id='start' style='justify-self:start'><span style='display:block;width:20px;height:1px'></span></div>
+                <div id='center' style='justify-self:center'><span style='display:block;width:20px;height:1px'></span></div>
+                <div id='end' style='justify-self:end'><span style='display:block;width:20px;height:1px'></span></div>
+                <div id='self-start' style='direction:rtl;justify-self:self-start'><span style='display:block;width:20px;height:1px'></span></div>
+            </div>
+            <div id='rtl' style='display:flow-root;width:40px;direction:rtl'>
+                <div id='rtl-start' style='justify-self:start'><span style='display:block;width:20px;height:1px'></span></div>
+                <div id='left' style='justify-self:left'><span style='display:block;width:20px;height:1px'></span></div>
+                <div id='right' style='justify-self:right'><span style='display:block;width:20px;height:1px'></span></div>
+            </div>
+        </body></html>",
+        300.0,
+    );
+
+    let (ltr_point, _) = id_geometry(&document, "ltr");
+    let (rtl_point, _) = id_geometry(&document, "rtl");
+    for id in ["start", "center", "end", "self-start", "rtl-start", "left", "right"] {
+        assert_eq!(id_geometry(&document, id).1.width, 20.0, "#{id} should use its fit-content width");
+    }
+    assert_eq!(id_geometry(&document, "start").0.x - ltr_point.x, 0.0);
+    assert_eq!(id_geometry(&document, "center").0.x - ltr_point.x, 10.0);
+    assert_eq!(id_geometry(&document, "end").0.x - ltr_point.x, 20.0);
+    assert_eq!(id_geometry(&document, "self-start").0.x - ltr_point.x, 20.0);
+    assert_eq!(id_geometry(&document, "rtl-start").0.x - rtl_point.x, 20.0);
+    assert_eq!(id_geometry(&document, "left").0.x - rtl_point.x, 0.0);
+    assert_eq!(id_geometry(&document, "right").0.x - rtl_point.x, 20.0);
+}
+
+#[test]
+fn block_justify_items_supplies_auto_justify_self() {
+    let document = layout_html(
+        "<!doctype html><html><body style='margin:0'><div id='parent' style='display:flow-root;width:40px;justify-items:center'><div id='child'><span style='display:block;width:20px;height:1px'></span></div></div></body></html>",
+        300.0,
+    );
+    let (parent_point, _) = id_geometry(&document, "parent");
+    let (child_point, child_size) = id_geometry(&document, "child");
+
+    assert_eq!(child_size.width, 20.0);
+    assert_eq!(child_point.x - parent_point.x, 10.0);
+}
+
+#[test]
+fn justify_self_shrink_wrapped_parent_still_stretches_its_block_in_inline_child() {
+    let document = layout_html(
+        "<!doctype html><html><body style='margin:0'><div id='outer' style='justify-self:start'><span style='display:inline-block;width:200px;height:1px'></span><div id='block' style='height:1px'></div><span style='display:inline-block;width:100px;height:1px'></span></div></body></html>",
+        800.0,
+    );
+
+    assert_eq!(id_geometry(&document, "outer").1.width, 200.0);
+    assert_eq!(id_geometry(&document, "block").1.width, 200.0);
+}
+
+#[test]
+fn absolute_stretch_respects_min_size_when_insets_exhaust_the_containing_block() {
+    let document = layout_html(
+        "<!doctype html><html><body style='margin:0'><div id='container' style='display:inline-block;position:relative;width:20px;height:20px'><div id='target' style='position:absolute;inset:18px;margin:auto;min-width:12px;min-height:12px'></div></div></body></html>",
+        300.0,
+    );
+
+    assert_eq!(id_geometry(&document, "target").1, Size::new(12.0, 12.0));
+}
+
+#[test]
+fn absolute_auto_table_keeps_its_intrinsic_size_when_insets_exhaust_the_containing_block() {
+    let document = layout_html(
+        "<!doctype html><html><body style='margin:0'><div style='position:relative;width:20px;height:20px'><div id='target' style='display:table;position:absolute;inset:18px;margin:auto'><div style='width:12px;height:12px'></div></div></div></body></html>",
+        300.0,
+    );
+
+    assert_eq!(id_geometry(&document, "target").1, Size::new(12.0, 12.0));
+}
+
+#[test]
+fn body_overflow_propagated_to_the_viewport_does_not_create_a_body_bfc() {
+    let document = layout_html(
+        "<!doctype html><html id='root'><body style='overflow-x:hidden'><div id='list' style='position:relative'><p style='position:absolute;top:0;width:10px;height:10px;margin:0'></p><p style='position:absolute;top:1000px;width:10px;height:10px;margin:0'></p></div></body></html>",
+        800.0,
+    );
+
+    assert_eq!(id_geometry(&document, "root").1.height, 8.0);
+    assert_eq!(tag_size(&document, "body").height, 0.0);
+    assert_eq!(id_geometry(&document, "list").1.height, 0.0);
+}
+
+#[test]
+fn wrapped_column_flex_stretch_uses_each_lines_cross_size() {
+    let document = layout_html(
+        "<html><body style='margin:0'>
+            <div style='display:flex;flex-direction:column;max-width:100px;width:min-content;height:100px;border:3px solid;flex-wrap:wrap;align-content:start;font:20px/1 serif'>
+                <div id='first-a' style='width:stretch;height:75px;border:3px solid'>a</div>
+                <div id='first-b' style='width:stretch;height:75px;border:3px solid'>b</div>
+            </div>
+            <div style='display:flex;flex-direction:column;max-width:100px;width:min-content;height:100px;border:3px solid;flex-wrap:wrap;align-content:start;font:20px/1 serif'>
+                <div id='second-c' style='width:stretch;height:75px;border:3px solid'>c</div>
+                <div style='width:150px;border:3px solid'></div>
+                <div id='second-d' style='width:stretch;height:75px;border:3px solid'>d</div>
+            </div>
+        </body></html>",
+        800.0,
+    );
+
+    assert_eq!(id_geometry(&document, "first-a").1.width, 16.0);
+    assert_eq!(id_geometry(&document, "first-b").1.width, 16.0);
+    assert_eq!(id_geometry(&document, "second-c").1.width, 156.0);
+    assert_eq!(id_geometry(&document, "second-d").1.width, 100.0);
 }

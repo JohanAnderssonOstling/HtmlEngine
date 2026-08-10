@@ -291,8 +291,8 @@ mod tests {
         let candidate_line = candidate.render_view().text().line(0).expect("candidate line");
         let reference_line = reference.render_view().text().line(0).expect("reference line");
 
-        assert!((candidate_line.height() - reference_line.height()).abs() < 1e-5);
-        assert!((candidate_line.baseline() - reference_line.baseline()).abs() < 1e-5);
+        assert!((candidate_line.height() - reference_line.height()).abs() < 1e-5, "candidate={candidate_line:?}, reference={reference_line:?}");
+        assert!((candidate_line.baseline() - reference_line.baseline()).abs() < 1e-5, "candidate={candidate_line:?}, reference={reference_line:?}");
     }
 
     #[test]

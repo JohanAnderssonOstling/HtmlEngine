@@ -7,5 +7,5 @@ library as `html`. The other workspace crates are implementation details.
 
 ```toml
 [dependencies]
-html = { package = "html-engine", git = "https://github.com/<owner>/<repository>" }
+html = { package = "html-engine", git = "https://github.com/JohanAnderssonOstling/HtmlEngine" }
 ```

@@ -1,0 +1,4 @@
+# Known WPT parse-error count mismatches
+#
+# Format: file|case|HtmlScriptingMode|expected=N|actual=N.
+# This ledger is intentionally empty. New mismatches fail the audit.
