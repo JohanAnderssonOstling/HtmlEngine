@@ -491,7 +491,11 @@ impl PipelineSession {
     pub fn layout_note(&self, id: &str, constraints: LayoutConstraintsOutput, glyph_shaper: &mut impl LayoutGlyphShaper) -> Option<LaidOutDocument> {
         let inputs = self.cache.inputs.as_ref()?;
         let scoped = self.cache.prepared.as_ref()?.scoped_to_element_id(id)?;
-        self.shape_and_layout(&scoped, constraints, &inputs.image_metrics, glyph_shaper).ok().map(|(_, laid_out)| laid_out)
+        // Appended to the page's renderer resources rather than shaped as a
+        // document of its own: a note's glyphs have to coexist with the page's,
+        // which are still referenced by what is on screen.
+        let base = self.cache.shaped.as_ref()?;
+        scoped.shape_and_layout_into_active_resources(base, constraints, &inputs.image_metrics, glyph_shaper).ok().map(|(_, laid_out)| laid_out)
     }
 
     /// Ids of the note bodies in the current document, in document order.

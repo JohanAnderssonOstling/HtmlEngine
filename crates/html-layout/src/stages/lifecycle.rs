@@ -341,9 +341,35 @@ impl PreparedDocument {
         result
     }
 
+    /// Shapes and lays out a subtree of the document whose renderer resources
+    /// are already active, appending to them instead of opening a transaction.
+    ///
+    /// A document shaping transaction *replaces* the shaper's glyphs and runs
+    /// on commit. That is right for a new document and wrong for a note, which
+    /// belongs to the document it was taken from: committing the note's
+    /// resources strands every glyph the page still refers to, and rolling
+    /// them back discards the note's own. Appending leaves both usable.
+    ///
+    /// Glyph ids continue past `base`'s, because the shaper keeps appending to
+    /// one store, so metrics start from `base`'s table -- indexed by id, a
+    /// fresh table would put every id this produces out of range.
+    ///
+    /// There is no rollback. A failure can leave the note's glyphs behind,
+    /// which is harmless: they are unreferenced and the page's are untouched.
+    pub fn shape_and_layout_into_active_resources(
+        &self, base: &ShapedDocument, constraints: LayoutConstraints, image_metrics: &ImageMetrics, glyph_shaper: &mut impl crate::GlyphShaper,
+    ) -> Result<(ShapedDocument, LaidOutDocument), crate::ShapeError> {
+        let shaped = self.shape_active_document_with_metrics(base.glyph_metrics().clone(), glyph_shaper)?;
+        let laid_out = shaped.clone().layout_with_metrics_and_shaper(constraints, image_metrics, glyph_shaper)?;
+        Ok((shaped, laid_out))
+    }
+
     fn shape_active_document(&self, glyph_shaper: &mut impl crate::GlyphShaper) -> Result<ShapedDocument, crate::ShapeError> {
+        self.shape_active_document_with_metrics(GlyphMetrics::default(), glyph_shaper)
+    }
+
+    fn shape_active_document_with_metrics(&self, mut glyph_metrics: GlyphMetrics, glyph_shaper: &mut impl crate::GlyphShaper) -> Result<ShapedDocument, crate::ShapeError> {
         let mut inline_content = self.inputs.inline_content.clone();
-        let mut glyph_metrics = GlyphMetrics::default();
         let (ellipsis_glyphs, hyphen_glyphs, text_geometry, font_metrics) = crate::shaping::shape_document(&self.inputs.document, &self.inputs.styles, &self.inputs.layout_tree, &mut inline_content, glyph_shaper, &mut glyph_metrics)?;
         let link_glyph_targets = collect_link_glyph_targets(&self.inputs.document, &self.inputs.layout_tree, &inline_content).into_iter().collect();
         let anchor_glyphs = collect_anchor_glyphs(&self.inputs.document, &self.inputs.layout_tree, &inline_content).into_iter().collect();
@@ -363,7 +389,6 @@ impl ShapedDocument {
         self.shaped.inline_content.glyphs()
     }
 
-    #[cfg(test)]
     pub(crate) fn glyph_metrics(&self) -> &GlyphMetrics {
         &self.shaped.glyph_metrics
     }
