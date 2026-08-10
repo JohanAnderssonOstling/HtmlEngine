@@ -1,7 +1,7 @@
 use super::tracks::{fixed_auto_track_limit, length_percentage_auto, line_names as grid_line_names, placement as grid_placement, template_track as grid_template_track, track_size as grid_track_size, used_length_percentage};
 use super::{TaffyContainerKind, finite_f32};
 use crate::layout::{
-    LayoutEngine, ReplacedFlexAutoMinInput, ReplacedMainAxis, ResolvedBoxModel, clamp_replaced_definite_size_by_intrinsic_constraints, measure_box_isolated, resolve_replaced_flex_auto_min_main_size, resolve_replaced_intrinsic_constraint,
+    LayoutEngine, ReplacedFlexAutoMinInput, ReplacedMainAxis, ResolvedBoxModel, clamp_replaced_definite_size_by_intrinsic_constraints, measure_box_isolated, preferred_aspect_ratio, resolve_replaced_flex_auto_min_main_size, resolve_replaced_intrinsic_constraint,
 };
 use html_style_model::{ContentAlignment, GridAutoFlow, ItemAlignment, LayoutStyle, OverflowMode, PositionMode, UsedPreferredSize as PreferredSize};
 use taffy::geometry::{Line, Point as TaffyPoint, Rect, Size as TaffySize};
@@ -159,10 +159,11 @@ pub(super) fn taffy_item_style(
     let style = session.reader.style(box_idx);
     let box_model = ResolvedBoxModel::new(style, containing_width);
     let layout = layout_style(session, box_idx);
-    let replaced_intrinsic = session.reader.image_intrinsic_size(box_idx);
+    let image_intrinsic = session.reader.image_intrinsic(box_idx);
+    let replaced_intrinsic = image_intrinsic.map(|intrinsic| intrinsic.size);
     let both_replaced_axes_auto = replaced_intrinsic.is_some() && matches!(style.width(), PreferredSize::Auto) && matches!(style.height(), PreferredSize::Auto);
     let authored_aspect_ratio = style.aspect_ratio();
-    let intrinsic_aspect_ratio = if both_replaced_axes_auto { replaced_intrinsic.and_then(|size| session.reader.image_intrinsic_ratio(box_idx, size)).map(finite_f32) } else { None };
+    let intrinsic_aspect_ratio = if both_replaced_axes_auto { image_intrinsic.and_then(|intrinsic| intrinsic.ratio).map(finite_f32) } else { None };
     let aspect_ratio = if kind == TaffyContainerKind::Flex && replaced_intrinsic.is_some() && layout.flex_grow > 0.0 {
         // A flexible replaced item may grow its main axis independently
         // of a constrained cross axis. Its measure callback transfers the
@@ -484,7 +485,8 @@ fn flex_automatic_min_content_width(session: &LayoutEngine<'_, '_>, box_idx: usi
 /// first converts a definite (including stretched) cross size and cross
 /// min/max constraints through the preferred aspect ratio.
 fn flex_replaced_automatic_minimum(session: &LayoutEngine<'_, '_>, box_idx: usize, containing_width: f64, containing_height: Option<f64>, horizontal_main_axis: bool) -> Option<f64> {
-    let intrinsic = session.reader.image_intrinsic_size(box_idx)?;
+    let image_intrinsic = session.reader.image_intrinsic(box_idx)?;
+    let intrinsic = image_intrinsic.size;
     let style = session.reader.style(box_idx);
     let layout = layout_style(session, box_idx);
     let scrollable_main = if horizontal_main_axis { style.overflow_x() } else { style.overflow_y() };
@@ -492,9 +494,7 @@ fn flex_replaced_automatic_minimum(session: &LayoutEngine<'_, '_>, box_idx: usiz
         return Some(0.0);
     }
 
-    let intrinsic_ratio = (intrinsic.height > 0.0).then_some(intrinsic.width / intrinsic.height);
-    let authored_ratio = style.aspect_ratio();
-    let ratio = if authored_ratio.uses_intrinsic() { intrinsic_ratio.or_else(|| authored_ratio.preferred().map(f64::from)) } else { authored_ratio.preferred().map(f64::from) }.filter(|ratio| ratio.is_finite() && *ratio > 0.0);
+    let ratio = preferred_aspect_ratio(style.aspect_ratio(), image_intrinsic.ratio).filter(|ratio| ratio.is_finite() && *ratio > 0.0);
 
     let horizontal_padding_border = style.get_horizontal_padding(containing_width) + style.border_left_width() as f64 + style.border_right_width() as f64;
     let vertical_padding_border = style.get_vertical_padding(containing_width) + style.border_top_width() as f64 + style.border_bottom_width() as f64;

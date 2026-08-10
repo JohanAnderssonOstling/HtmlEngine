@@ -1,5 +1,5 @@
 use crate::layout::LayoutEngine;
-use crate::layout::replaced::{ReplacedSizeInput, resolve_replaced_content_size};
+use crate::layout::replaced::{ReplacedSizeInput, preferred_aspect_ratio, resolve_replaced_content_size};
 use crate::layout_model::LayoutMode;
 use html_style_model::{BorderCollapseMode, BoxSizing, Float, ItemAlignment, OverflowMode, PositionMode, TextDirection, UsedPreferredSize as PreferredSize, UsedStyleView};
 use kurbo::Size;
@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use super::box_constraints::{BoxLayoutRequest, constrain_content_width, resolve_block_margin_left, resolve_content_width, resolve_vertical_min_size_with_stretch_inset, resolve_vertical_size_with_stretch_inset};
 use super::box_model::{ResolvedBoxModel, UsedBorderInsets};
+use super::read_context::ImageIntrinsic;
 
 #[derive(Clone, Copy)]
 pub(super) struct ResolvedHorizontalSizing {
@@ -160,14 +161,14 @@ fn resolve_box_sizing(engine: &LayoutEngine<'_, '_>, request: BoxLayoutRequest) 
     let style = engine.reader.style(box_idx);
     let box_model = resolve_box_model(engine, request, style);
     let is_float = matches!(style.float(), Float::Left | Float::Right);
-    let replaced_intrinsic = engine.reader.image_intrinsic_size(box_idx);
+    let image_intrinsic = engine.reader.image_intrinsic(box_idx);
+    let replaced_intrinsic = image_intrinsic.map(|intrinsic| intrinsic.size);
     let is_replaced = replaced_intrinsic.is_some();
     let inline_alignment = effective_inline_alignment(engine, box_idx);
     let authored_aspect_ratio = style.aspect_ratio();
-    let intrinsic_aspect_ratio = replaced_intrinsic.and_then(|size| engine.reader.image_intrinsic_ratio(box_idx, size));
-    let used_aspect_ratio = if authored_aspect_ratio.uses_intrinsic() { intrinsic_aspect_ratio.or_else(|| authored_aspect_ratio.preferred().map(f64::from)) } else { authored_aspect_ratio.preferred().map(f64::from) };
+    let used_aspect_ratio = preferred_aspect_ratio(authored_aspect_ratio, image_intrinsic.and_then(|intrinsic| intrinsic.ratio));
     let vertical = resolve_vertical_sizing(engine, style, request, box_model);
-    let (horizontal, replaced_size) = resolve_horizontal_sizing(engine, style, request, box_model, vertical, replaced_intrinsic, used_aspect_ratio, is_float, inline_alignment);
+    let (horizontal, replaced_size) = resolve_horizontal_sizing(engine, style, request, box_model, vertical, image_intrinsic, used_aspect_ratio, is_float, inline_alignment);
 
     let layout_mode = engine.reader.box_layout_mode(box_idx).expect("layout box should exist").clone();
     let fills_available_width = !is_replaced
@@ -289,10 +290,11 @@ fn resolve_vertical_sizing(engine: &LayoutEngine<'_, '_>, style: UsedStyleView<'
 }
 
 fn resolve_horizontal_sizing(
-    engine: &LayoutEngine<'_, '_>, style: UsedStyleView<'_>, request: BoxLayoutRequest, box_model: ResolvedBoxModel, vertical: ResolvedVerticalSizing, replaced_intrinsic: Option<Size>, aspect_ratio: Option<f64>, is_float: bool, inline_alignment: ItemAlignment,
+    engine: &LayoutEngine<'_, '_>, style: UsedStyleView<'_>, request: BoxLayoutRequest, box_model: ResolvedBoxModel, vertical: ResolvedVerticalSizing, image_intrinsic: Option<ImageIntrinsic>, aspect_ratio: Option<f64>, is_float: bool, inline_alignment: ItemAlignment,
 ) -> (ResolvedHorizontalSizing, Option<Size>) {
+    let replaced_intrinsic = image_intrinsic.map(|intrinsic| intrinsic.size);
     let intrinsic_widths = resolve_intrinsic_widths(engine, style, request, vertical, replaced_intrinsic, is_float, inline_alignment);
-    let constraints = resolve_width_constraints(engine, style, request, box_model, replaced_intrinsic, intrinsic_widths.measured);
+    let constraints = resolve_width_constraints(engine, style, request, box_model, image_intrinsic, intrinsic_widths.measured);
     let replaced_size = resolve_replaced_size(style, request, box_model, constraints, replaced_intrinsic, aspect_ratio);
     let ratio_stretch_width = (replaced_intrinsic.is_none() && matches!(style.width(), PreferredSize::Auto) && matches!(style.height(), PreferredSize::Stretch))
         .then(|| {
@@ -368,8 +370,9 @@ fn resolve_intrinsic_widths(
 }
 
 fn resolve_width_constraints(
-    engine: &LayoutEngine<'_, '_>, style: UsedStyleView<'_>, request: BoxLayoutRequest, box_model: ResolvedBoxModel, replaced_intrinsic: Option<Size>, intrinsic_widths: Option<(f64, f64)>,
+    engine: &LayoutEngine<'_, '_>, style: UsedStyleView<'_>, request: BoxLayoutRequest, box_model: ResolvedBoxModel, image_intrinsic: Option<ImageIntrinsic>, intrinsic_widths: Option<(f64, f64)>,
 ) -> ResolvedWidthConstraints {
+    let replaced_intrinsic = image_intrinsic.map(|intrinsic| intrinsic.size);
     let is_table_cell = engine.reader.is_table_cell_box(request.box_idx);
     let authored_width = if is_table_cell { PreferredSize::Auto } else { style.width() };
     let mut min = if is_table_cell { PreferredSize::Auto } else { style.min_width() };
@@ -379,7 +382,7 @@ fn resolve_width_constraints(
     let horizontal_margin = if is_table_cell { 0.0 } else { box_model.horizontal_margin() };
     let margin_padding = horizontal_margin + box_model.horizontal_padding();
     let horizontal_padding_border = box_model.horizontal_padding() + box_model.horizontal_border();
-    let smart_width = replaced_intrinsic.and_then(|intrinsic| {
+    let smart_width = image_intrinsic.and_then(|intrinsic| {
         engine.reader.smart_standalone_image_width(
             engine.config.image_sizing_policy(),
             request.box_idx,
@@ -431,23 +434,20 @@ fn resolve_width_constraints(
 
 fn resolve_replaced_size(style: UsedStyleView<'_>, request: BoxLayoutRequest, box_model: ResolvedBoxModel, constraints: ResolvedWidthConstraints, intrinsic: Option<Size>, aspect_ratio: Option<f64>) -> Option<Size> {
     intrinsic.filter(|_| request.assigned_border_size.is_none()).map(|intrinsic| {
-        resolve_replaced_content_size(ReplacedSizeInput {
-            intrinsic,
-            aspect_ratio,
-            width: constraints.preferred,
-            height: style.height(),
-            min_width: if constraints.smart_width { PreferredSize::Auto } else { constraints.min },
-            min_height: style.min_height(),
-            max_width: if constraints.smart_width { PreferredSize::Auto } else { constraints.max },
-            max_height: style.max_height(),
-            available_width: request.available_width,
-            available_height: request.parent_content_height,
-            horizontal_margin: if constraints.smart_width { 0.0 } else { constraints.horizontal_margin },
-            vertical_margin: box_model.vertical_margin(),
-            horizontal_padding_border: box_model.horizontal_padding() + box_model.horizontal_border(),
-            vertical_padding_border: box_model.vertical_padding() + box_model.vertical_border(),
-            box_sizing: style.box_sizing(),
-        })
+        resolve_replaced_content_size(
+            ReplacedSizeInput::from_style(style, intrinsic, aspect_ratio, request.available_width, request.parent_content_height)
+                .with_box_model(
+                    if constraints.smart_width { 0.0 } else { constraints.horizontal_margin },
+                    box_model.vertical_margin(),
+                    box_model.horizontal_padding() + box_model.horizontal_border(),
+                    box_model.vertical_padding() + box_model.vertical_border(),
+                )
+                .with_width_constraints(
+                    constraints.preferred,
+                    if constraints.smart_width { PreferredSize::Auto } else { constraints.min },
+                    if constraints.smart_width { PreferredSize::Auto } else { constraints.max },
+                ),
+        )
     })
 }
 

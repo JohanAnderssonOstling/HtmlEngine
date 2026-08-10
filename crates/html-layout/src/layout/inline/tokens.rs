@@ -764,10 +764,9 @@ fn create_image_token(
     let border_top = style.border_top_width() as f64;
     let horizontal_border = border_left + style.border_right_width() as f64;
     let vertical_border = border_top + style.border_bottom_width() as f64;
-    let intrinsic = engine.reader.image_intrinsic_size(box_idx as usize).unwrap_or_else(|| {
-        let (width, height) = engine.reader.image_display_size(image_idx);
-        Size::new(width, height)
-    });
+    let image_intrinsic = engine.reader.image_intrinsic(box_idx as usize).expect("image token owner must retain image identity in the layout topology");
+    debug_assert_eq!(image_intrinsic.image_idx, image_idx);
+    let intrinsic = image_intrinsic.size;
     if self_owned_replaced {
         let content_height = containing_block_height.unwrap_or_else(|| if intrinsic.width > 0.0 { max_width * intrinsic.height / intrinsic.width } else { intrinsic.height });
         let content_size = Size::new(max_width, content_height.max(0.0));
@@ -790,13 +789,11 @@ fn create_image_token(
             ReplacedToken::Image { image_idx, box_idx, content_size, border_size: content_size, content_inset: Point::ZERO, margin_left: 0.0, margin_top: 0.0, position_offset: Vec2::ZERO, set_box_geometry: false },
         );
     }
-    let authored_ratio = style.aspect_ratio();
-    let intrinsic_ratio = engine.reader.image_intrinsic_ratio(box_idx as usize, intrinsic);
-    let aspect_ratio = if authored_ratio.uses_intrinsic() { intrinsic_ratio.or_else(|| authored_ratio.preferred().map(f64::from)) } else { authored_ratio.preferred().map(f64::from) };
+    let aspect_ratio = preferred_aspect_ratio(style.aspect_ratio(), image_intrinsic.ratio);
     let smart_width = engine.reader.smart_standalone_image_width(
         engine.config.image_sizing_policy(),
         box_idx as usize,
-        intrinsic,
+        image_intrinsic,
         max_width,
         engine.config.viewport_height(),
         horizontal_padding + horizontal_border,
@@ -805,23 +802,15 @@ fn create_image_token(
     );
     let (margin_left, margin_right) = if smart_width.is_some() { (0.0, 0.0) } else { (authored_margin_left, authored_margin_right) };
     let preferred_width = smart_width.unwrap_or_else(|| style.width());
-    let content_size = resolve_replaced_content_size(ReplacedSizeInput {
-        intrinsic,
-        aspect_ratio,
-        width: preferred_width,
-        height: style.height(),
-        min_width: if smart_width.is_some() { PreferredSize::Auto } else { style.min_width() },
-        min_height: style.min_height(),
-        max_width: if smart_width.is_some() { PreferredSize::Auto } else { style.max_width() },
-        max_height: style.max_height(),
-        available_width: max_width,
-        available_height: containing_block_height,
-        horizontal_margin: margin_left + margin_right,
-        vertical_margin: margin_top + margin_bottom,
-        horizontal_padding_border: horizontal_padding + horizontal_border,
-        vertical_padding_border: vertical_padding + vertical_border,
-        box_sizing: style.box_sizing(),
-    });
+    let content_size = resolve_replaced_content_size(
+        ReplacedSizeInput::from_style(style, intrinsic, aspect_ratio, max_width, containing_block_height)
+            .with_box_model(margin_left + margin_right, margin_top + margin_bottom, horizontal_padding + horizontal_border, vertical_padding + vertical_border)
+            .with_width_constraints(
+                preferred_width,
+                if smart_width.is_some() { PreferredSize::Auto } else { style.min_width() },
+                if smart_width.is_some() { PreferredSize::Auto } else { style.max_width() },
+            ),
+    );
     let border_size = Size::new(content_size.width + horizontal_padding + horizontal_border, content_size.height + vertical_padding + vertical_border);
     let outer_width = (border_size.width + margin_left + margin_right).max(0.0);
     let outer_height = (border_size.height + margin_top + margin_bottom).max(0.0);
@@ -1135,27 +1124,11 @@ fn create_atomic_box_token(
     // `display` is not `inline-table`; participation in this atomic inline
     // context is represented authoritatively by the layout mode instead.
     let is_inline_table = matches!(engine.reader.box_layout_mode(box_idx as usize), Some(crate::layout_model::LayoutMode::Table(_)));
-    let (border_size, first_baseline, last_baseline) = if let Some(intrinsic) = engine.reader.image_intrinsic_size(box_idx as usize) {
-        let authored_ratio = style.aspect_ratio();
-        let intrinsic_ratio = engine.reader.image_intrinsic_ratio(box_idx as usize, intrinsic);
-        let aspect_ratio = if authored_ratio.uses_intrinsic() { intrinsic_ratio.or_else(|| authored_ratio.preferred().map(f64::from)) } else { authored_ratio.preferred().map(f64::from) };
-        let content = resolve_replaced_content_size(ReplacedSizeInput {
-            intrinsic,
-            aspect_ratio,
-            width: style.width(),
-            height: style.height(),
-            min_width: style.min_width(),
-            min_height: style.min_height(),
-            max_width: style.max_width(),
-            max_height: style.max_height(),
-            available_width: max_width,
-            available_height: containing_block_height,
-            horizontal_margin: margin_left + margin_right,
-            vertical_margin: margin_top + margin_bottom,
-            horizontal_padding_border: resolved_padding + horizontal_border,
-            vertical_padding_border: vertical_padding + vertical_border,
-            box_sizing: style.box_sizing(),
-        });
+    let (border_size, first_baseline, last_baseline) = if let Some(intrinsic) = engine.reader.image_intrinsic(box_idx as usize) {
+        let content = resolve_replaced_content_size(
+            ReplacedSizeInput::from_style(style, intrinsic.size, preferred_aspect_ratio(style.aspect_ratio(), intrinsic.ratio), max_width, containing_block_height)
+                .with_box_model(margin_left + margin_right, margin_top + margin_bottom, resolved_padding + horizontal_border, vertical_padding + vertical_border),
+        );
         (Size::new(content.width + resolved_padding + horizontal_border, content.height + vertical_padding + vertical_border), None, None)
     } else if is_inline_table && matches!(style.border_collapse(), html_style_model::BorderCollapseMode::Collapse) {
         // The collapsed edge grid, not the authored full borders, determines

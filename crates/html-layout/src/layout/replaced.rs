@@ -1,4 +1,4 @@
-use html_style_model::{BoxSizing, UsedPreferredSize as PreferredSize};
+use html_style_model::{AspectRatio, BoxSizing, UsedPreferredSize as PreferredSize, UsedStyleView};
 use kurbo::Size;
 use taffy::geometry::Size as TaffySize;
 use taffy::prelude::AvailableSpace;
@@ -20,6 +20,47 @@ pub(crate) struct ReplacedSizeInput {
     pub horizontal_padding_border: f64,
     pub vertical_padding_border: f64,
     pub box_sizing: BoxSizing,
+}
+
+impl ReplacedSizeInput {
+    pub(crate) fn from_style(style: UsedStyleView<'_>, intrinsic: Size, aspect_ratio: Option<f64>, available_width: f64, available_height: Option<f64>) -> Self {
+        Self {
+            intrinsic,
+            aspect_ratio,
+            width: style.width(),
+            height: style.height(),
+            min_width: style.min_width(),
+            min_height: style.min_height(),
+            max_width: style.max_width(),
+            max_height: style.max_height(),
+            available_width,
+            available_height,
+            horizontal_margin: 0.0,
+            vertical_margin: 0.0,
+            horizontal_padding_border: 0.0,
+            vertical_padding_border: 0.0,
+            box_sizing: style.box_sizing(),
+        }
+    }
+
+    pub(crate) fn with_box_model(mut self, horizontal_margin: f64, vertical_margin: f64, horizontal_padding_border: f64, vertical_padding_border: f64) -> Self {
+        self.horizontal_margin = horizontal_margin;
+        self.vertical_margin = vertical_margin;
+        self.horizontal_padding_border = horizontal_padding_border;
+        self.vertical_padding_border = vertical_padding_border;
+        self
+    }
+
+    pub(crate) fn with_width_constraints(mut self, width: PreferredSize, min_width: PreferredSize, max_width: PreferredSize) -> Self {
+        self.width = width;
+        self.min_width = min_width;
+        self.max_width = max_width;
+        self
+    }
+}
+
+pub(crate) fn preferred_aspect_ratio(authored: AspectRatio, intrinsic: Option<f64>) -> Option<f64> {
+    if authored.uses_intrinsic() { intrinsic.or_else(|| authored.preferred().map(f64::from)) } else { authored.preferred().map(f64::from) }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -302,6 +343,16 @@ mod tests {
             vertical_padding_border: 10.0,
             box_sizing: BoxSizing::ContentBox,
         }
+    }
+
+    #[test]
+    fn preferred_ratio_selects_intrinsic_and_authored_sources_once() {
+        let explicit = AspectRatio::new(false, Some((4.0, 3.0))).expect("valid ratio");
+        let auto_with_fallback = AspectRatio::new(true, Some((4.0, 3.0))).expect("valid ratio");
+
+        assert_eq!(preferred_aspect_ratio(AspectRatio::AUTO, Some(2.0)), Some(2.0));
+        assert_eq!(preferred_aspect_ratio(explicit, Some(2.0)), explicit.preferred().map(f64::from));
+        assert_eq!(preferred_aspect_ratio(auto_with_fallback, None), auto_with_fallback.preferred().map(f64::from));
     }
 
     #[test]

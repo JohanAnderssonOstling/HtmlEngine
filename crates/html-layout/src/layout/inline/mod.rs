@@ -1,5 +1,5 @@
 use crate::layout::FloatSide;
-use crate::layout::replaced::{ReplacedSizeInput, resolve_replaced_content_size};
+use crate::layout::replaced::{ReplacedSizeInput, preferred_aspect_ratio, resolve_replaced_content_size};
 use crate::layout_model::{EllipsisFragment, GlyphAdvanceRun, GlyphOffsetRun, HyphenFragment, ImageFragment, InlineItem, InlineItemKind, Line};
 use html_style_model::{BoxSizing, Float, OverflowWrap, TabSizeKind, TextAlign, TextBoxOverEdge, TextBoxTrim, TextBoxUnderEdge, TextOverflow, UsedPreferredSize as PreferredSize, VerticalAlignValue, WhiteSpace, WordBreak, resolve_used_preferred_size};
 use kurbo::{Point, Size, Vec2};

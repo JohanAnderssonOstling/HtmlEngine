@@ -1,8 +1,7 @@
-use super::measurement::preferred_aspect_ratio;
 use super::style::{grid_definite_inline_minimum_exceeds_track_limit, layout_style, taffy_container_style, taffy_item_style};
 use super::tracks::template_tracks_have_percentage_calc;
 use super::{TaffyContainerKind, ensure_grid_algorithm_root, finite_f32};
-use crate::layout::{LayoutEngine, measure_replaced_content};
+use crate::layout::{LayoutEngine, measure_replaced_content, preferred_aspect_ratio};
 use html_style_model::{GridRepeatCount, OverflowMode, PositionMode, UsedGridTemplateTrack, UsedGridTrackBreadth, UsedGridTrackSize, UsedPreferredSize as PreferredSize};
 use taffy::geometry::Size as TaffySize;
 use taffy::prelude::{AvailableSpace, Dimension, TaffyTree};
@@ -242,8 +241,8 @@ fn outer_preferred_width(session: &LayoutEngine<'_, '_>, box_idx: usize, value: 
 }
 
 fn measure_item(session: &LayoutEngine<'_, '_>, box_idx: usize, known: TaffySize<Option<f32>>, available: TaffySize<AvailableSpace>) -> TaffySize<f32> {
-    if let Some(intrinsic) = session.reader.image_intrinsic_size(box_idx) {
-        return measure_replaced_content(intrinsic, preferred_aspect_ratio(session, box_idx, intrinsic), known, available);
+    if let Some(intrinsic) = session.reader.image_intrinsic(box_idx) {
+        return measure_replaced_content(intrinsic.size, preferred_aspect_ratio(session.reader.style(box_idx).aspect_ratio(), intrinsic.ratio), known, available);
     }
     let style = session.reader.style(box_idx);
     let (outer_min_width, outer_max_width) = crate::layout::box_intrinsic_widths(session, box_idx);

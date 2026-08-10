@@ -21,14 +21,14 @@ pub(crate) fn percentage_height_image_width(engine: &LayoutEngine<'_, '_>, box_i
     for child_id in element.children() {
         let child_raw = child_id.raw();
         let Some(child_box_idx) = (0..engine.reader.box_count()).find(|&candidate| engine.reader.box_dom_element(candidate) == Some(child_raw)) else { continue };
-        let Some(intrinsic) = engine.reader.image_intrinsic_size(child_box_idx) else { continue };
+        let Some(intrinsic) = engine.reader.image_intrinsic(child_box_idx) else { continue };
         let child_style = engine.reader.style(child_box_idx);
         let PreferredSize::Percent(percent) = child_style.height() else { continue };
-        if intrinsic.height <= 0.0 {
+        if intrinsic.size.height <= 0.0 {
             continue;
         }
         let used_height = content_height * percent.max(0.0) as f64;
-        let content_width = used_height * intrinsic.width / intrinsic.height;
+        let content_width = used_height * intrinsic.size.width / intrinsic.size.height;
         let outer_width = content_width + child_style.get_horizontal_margin_padding(0.0) + child_style.border_left_width() as f64 + child_style.border_right_width() as f64;
         width = Some(width.map_or(outer_width, |current| current.max(outer_width)));
     }
@@ -88,8 +88,8 @@ pub(crate) fn box_content_intrinsic_widths_with_available(engine: &LayoutEngine<
 }
 
 fn box_content_intrinsic_widths_impl(engine: &LayoutEngine<'_, '_>, box_idx: usize, available_width: Option<f64>) -> (f64, f64) {
-    if let Some(size) = engine.reader.image_intrinsic_size(box_idx) {
-        return (size.width, size.width);
+    if let Some(intrinsic) = engine.reader.image_intrinsic(box_idx) {
+        return (intrinsic.size.width, intrinsic.size.width);
     }
     match engine.reader.box_layout_mode(box_idx) {
         Some(LayoutMode::Block(block)) => children_intrinsic_widths(engine, &block.children, box_idx, available_width),
