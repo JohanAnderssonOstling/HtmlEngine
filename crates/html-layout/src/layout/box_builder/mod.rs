@@ -90,6 +90,11 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
         }
     }
 
+    fn build_from(&mut self, root: DomNodeId) {
+        let root_box = self.build_box_for_node(root, None);
+        self.output.set_root_box(root_box);
+    }
+
     fn build_box_for_node(&mut self, node_id: DomNodeId, parent_box: Option<u32>) -> Option<u32> {
         match self.document.node_ref(node_id)? {
             NodeRef::Element(_) => self.build_box_for_element(node_id, parent_box),
@@ -1080,6 +1085,13 @@ fn collect_contents_text_styles(document: &Document, styles: &ComputedStyles, no
 
 pub(crate) fn build_layout_inputs(document: &Document, styles: &ComputedStyles, layout_tree: &mut LayoutTree, inline_content: &mut InlineContent, note_flow: NoteFlow) {
     LayoutTreeBuilder::new(document, styles, layout_tree, inline_content, note_flow).build();
+}
+
+/// Builds a box tree rooted at `root` rather than at the document root, reusing
+/// the document's computed styles. Inherited values are already resolved, so a
+/// subtree laid out this way keeps the typography it would have had in place.
+pub(crate) fn build_layout_inputs_from(document: &Document, styles: &ComputedStyles, layout_tree: &mut LayoutTree, inline_content: &mut InlineContent, note_flow: NoteFlow, root: DomNodeId) {
+    LayoutTreeBuilder::new(document, styles, layout_tree, inline_content, note_flow).build_from(root);
 }
 
 include!("tests.rs");

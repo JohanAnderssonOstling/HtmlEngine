@@ -477,6 +477,29 @@ impl PipelineSession {
         }
     }
 
+    /// Lays out one note body under constraints of the caller's choosing, for
+    /// embedders that present notes outside the reading flow.
+    ///
+    /// This session's parse and computed styles are reused, so the cost is a
+    /// box tree, shaping and layout over a single subtree rather than a second
+    /// document. The note lays out whatever [`PipelineInputs::note_flow`] asked
+    /// for the containing document: holding notes back from the flow is what
+    /// creates the need for this call.
+    ///
+    /// Returns `None` before the first successful update, or when `id` names no
+    /// element.
+    pub fn layout_note(&self, id: &str, constraints: LayoutConstraintsOutput, glyph_shaper: &mut impl LayoutGlyphShaper) -> Option<LaidOutDocument> {
+        let inputs = self.cache.inputs.as_ref()?;
+        let scoped = self.cache.prepared.as_ref()?.scoped_to_element_id(id)?;
+        self.shape_and_layout(&scoped, constraints, &inputs.image_metrics, glyph_shaper).ok().map(|(_, laid_out)| laid_out)
+    }
+
+    /// Ids of the note bodies in the current document, in document order.
+    /// Empty before the first successful update.
+    pub fn note_ids(&self) -> Vec<&str> {
+        self.cache.prepared.as_ref().map(PreparedDocument::note_ids).unwrap_or_default()
+    }
+
     pub fn document(&self) -> Option<&LaidOutDocument> {
         self.cache.laid_out.as_ref()
     }
@@ -769,6 +792,36 @@ mod tests {
             image_metrics: Default::default(),
             paint: PaintSettingsRevision::INITIAL,
         }
+    }
+
+    fn glyph_text(document: &LaidOutDocument) -> String {
+        let text = document.render_view().text();
+        (0..text.glyph_count()).filter_map(|index| text.glyph_at(index).and_then(|glyph| text.glyph_metric(glyph)).map(|metric| metric.ch())).collect()
+    }
+
+    #[test]
+    fn an_excluded_note_is_absent_from_the_flow_and_available_through_scoped_layout() {
+        const SOURCE: &str = "<html><body><p>Reading</p><aside id='n' epub:type='footnote'><p>zebra</p></aside><p>Continues</p></body></html>";
+        let mut session = PipelineSession::new(Arc::new(MockProvider));
+        let mut shaper = TracingShaper::default();
+        let mut inputs = base_inputs(SOURCE, SourceRevision::INITIAL);
+        inputs.note_flow = html_layout::NoteFlow::Excluded;
+        session.update(inputs, &mut shaper).expect("pipeline update should succeed");
+
+        let flow = glyph_text(session.document().expect("a document"));
+        assert!(flow.contains("Reading") && flow.contains("Continues"));
+        assert!(!flow.contains("zebra"), "an excluded note must not consume the reading flow");
+
+        assert_eq!(session.note_ids(), vec!["n"]);
+
+        // The note is still reachable: scoped layout gives an embedder the
+        // content it held back, under its own width.
+        let constraints = html_layout::LayoutConstraints::new(200.0, 20.0).expect("valid constraints");
+        let note = session.layout_note("n", constraints, &mut shaper).expect("the held-back note must lay out on demand");
+        assert!(glyph_text(&note).contains("zebra"), "scoped layout produces the note's own content");
+        assert!(!glyph_text(&note).contains("Reading"), "a scoped note is only its own subtree");
+
+        assert!(session.layout_note("absent", constraints, &mut shaper).is_none(), "an id that names nothing lays out nothing");
     }
 
     #[test]

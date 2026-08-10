@@ -186,6 +186,32 @@ mod stage_tests {
     }
 
     #[test]
+    fn a_note_excluded_from_the_flow_still_lays_out_when_scoped_to() {
+        const WITH_NOTE: &str = "<html><body><p>Reading</p><aside id='n' epub:type='footnote'><p>note body</p></aside><p>Continues</p></body></html>";
+        let prepared = prepare_with_notes(WITH_NOTE, crate::NoteFlow::Excluded);
+
+        let scoped = prepared.scoped_to_element_id("n").expect("the note element must be scopable");
+
+        assert!(scoped.box_count() > 0, "scoping to a note lays it out even though the containing document holds it back");
+        assert!(scoped.box_count() < prepared_in_flow_box_count(WITH_NOTE), "a scoped note is only its own subtree, not the whole document");
+        assert!(prepared.scoped_to_element_id("absent").is_none(), "an id that names nothing cannot be scoped to");
+    }
+
+    fn prepared_in_flow_box_count(source: &str) -> usize {
+        prepare_with_notes(source, crate::NoteFlow::InFlow).box_count()
+    }
+
+    #[test]
+    fn note_ids_lists_only_referenceable_note_bodies() {
+        const MIXED: &str = "<html><body><aside id='a' epub:type='footnote'>one</aside><aside epub:type='footnote'>unreferenceable</aside><aside id='c' role='doc-endnote'>three</aside><aside id='d'>not a note</aside></body></html>";
+
+        let prepared = prepare_with_notes(MIXED, crate::NoteFlow::Excluded);
+        let ids = prepared.note_ids();
+
+        assert_eq!(ids, vec!["a", "c"], "notes are listed in document order; one without an id and one without note semantics are not notes to a reference");
+    }
+
+    #[test]
     fn note_flow_defaults_to_laying_notes_out_as_authored() {
         const WITH_NOTE: &str = "<html><body><p>Reading</p><aside id='n' epub:type='footnote'><p>note body</p></aside></body></html>";
         let document = html_parse::parse_dom_document(WITH_NOTE).expect("valid HTML");

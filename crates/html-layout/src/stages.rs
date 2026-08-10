@@ -240,6 +240,44 @@ impl PreparedDocument {
         Ok(Self { inputs: std::sync::Arc::new(PreparedInputs { document: std::sync::Arc::new(document), styles: std::sync::Arc::new(styles), layout_tree: std::sync::Arc::new(layout_tree), inline_content }) })
     }
 
+    /// Prepares the subtree rooted at the element carrying `id` as a document
+    /// in its own right, so it can be shaped and laid out under constraints of
+    /// the caller's choosing -- a popup's width rather than the column's.
+    ///
+    /// The parse and the computed styles are shared with `self` rather than
+    /// recomputed, so this costs a box tree over one subtree. Inherited values
+    /// are already resolved, so the subtree keeps the typography it would have
+    /// had in place. Notes are in flow here whatever the containing document
+    /// asked for: the caller has explicitly asked for this one.
+    pub fn scoped_to_element_id(&self, id: &str) -> Option<Self> {
+        let document = &self.inputs.document;
+        let root = document.node_ids().find(|node| document.get_dom_id(*node) == Some(id))?;
+        document.element_ref(root)?;
+
+        let mut layout_tree = LayoutTree::default();
+        let mut inline_content = InlineContent::default();
+        crate::layout::build_layout_inputs_from(document, &self.inputs.styles, &mut layout_tree, &mut inline_content, NoteFlow::InFlow, root);
+        Some(Self {
+            inputs: std::sync::Arc::new(PreparedInputs {
+                document: std::sync::Arc::clone(&self.inputs.document),
+                styles: std::sync::Arc::clone(&self.inputs.styles),
+                layout_tree: std::sync::Arc::new(layout_tree),
+                inline_content,
+            }),
+        })
+    }
+
+    /// Ids of this document's note bodies, in document order. A note without an
+    /// id cannot be referenced, so it is not listed.
+    pub fn note_ids(&self) -> Vec<&str> {
+        let document = &self.inputs.document;
+        document
+            .node_ids()
+            .filter(|node| document.element_ref(*node).is_some_and(element_is_note_target))
+            .filter_map(|node| document.get_dom_id(node))
+            .collect()
+    }
+
     pub(crate) fn document(&self) -> &Document {
         self.inputs.document.as_ref()
     }
