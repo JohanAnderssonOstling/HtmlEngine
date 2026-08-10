@@ -7,13 +7,15 @@ use taffy::prelude::{AvailableSpace, Style, TaffyTree};
 use taffy::style::Display as TaffyDisplay;
 
 mod intrinsic;
+mod item_sizing;
 mod measurement;
 mod style;
 mod taffy_layout;
 mod tracks;
 pub(crate) use intrinsic::{intrinsic_widths, intrinsic_widths_with_available, intrinsic_widths_with_constraints};
 pub(crate) use measurement::FlexGridState;
-use style::{grid_definite_inline_minimum_exceeds_track_limit, layout_style, resolve_intrinsic_flex_basis, taffy_container_style, taffy_item_style};
+use item_sizing::resolve_intrinsic_flex_basis;
+use style::{grid_definite_inline_minimum_exceeds_track_limit, layout_style, taffy_container_style, taffy_item_style};
 use taffy_layout::TaffyLayoutTree;
 use tracks::template_tracks_use_percentage;
 
