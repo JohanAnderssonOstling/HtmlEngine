@@ -7,7 +7,7 @@ use html_style_model::{ComputedStyles, ComputedStylesValidationError, StyleIndic
 use rustc_data_structures::fx::FxHashMap;
 use std::fmt;
 
-#[path = "stages_output.rs"]
+#[path = "stages_output/mod.rs"]
 mod output;
 pub use output::{
     BoxTextFormat, ImageMetrics, RenderAddressingView, RenderAllImageFragments, RenderAnchorPosition, RenderAnchorPositions, RenderAuthoritativeTextRun, RenderBoxView, RenderDecoration, RenderDecorationPattern, RenderDecorations,
