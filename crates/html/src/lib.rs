@@ -116,6 +116,17 @@ pub mod engine {
             self.session.rehydrate_glyphs(glyph_shaper)
         }
 
+        /// Lays out one note body under its own constraints, for embedders
+        /// that hold notes out of the reading flow and present them elsewhere.
+        pub fn layout_note(&self, id: &str, constraints: crate::layout::LayoutConstraints, glyph_shaper: &mut impl GlyphShaper) -> Option<LaidOutDocument> {
+            self.session.layout_note(id, constraints, glyph_shaper)
+        }
+
+        /// Ids of the current document's note bodies, in document order.
+        pub fn note_ids(&self) -> Vec<&str> {
+            self.session.note_ids()
+        }
+
         pub fn document(&self) -> Option<&LaidOutDocument> {
             self.session.document()
         }
