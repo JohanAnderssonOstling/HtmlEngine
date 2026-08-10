@@ -1,5 +1,5 @@
 use super::{AncestorIter, LaidOutDocument};
-use crate::layout_model::{AnchorPosition, DecorationFragment, EllipsisFragment, GlyphAdvanceRun, GlyphId, GlyphOffsetRun, HyphenFragment, ImageFragment, InlineItem, InlineItemKind, LayoutMode, Line, ListItemMarker, RoundedDecoration};
+use crate::layout_model::{AnchorPosition, DecorationFragment, DecorationStore, EllipsisFragment, GlyphAdvanceRun, GlyphId, GlyphOffsetRun, HyphenFragment, ImageFragment, InlineItem, InlineItemKind, LayoutMode, Line, ListItemMarker};
 use html_dom::{Document, ImageResource, NodeRef};
 use html_style_model::{ListStylePosition, TextDecorationLines, UsedBorderRadii};
 use kurbo::{Point, Size};
@@ -13,7 +13,7 @@ mod text;
 
 pub use addressing::{RenderAddressingView, RenderAnchorPosition, RenderAnchorPositions, SourceElementStep, SourcePosition};
 pub use boxes::{BoxTextFormat, RenderBoxView, RenderForcedBreak, RenderListItemMarker, RenderTable, RenderTableCell, RenderTableRow};
-pub use fragments::{RenderAllImageFragments, RenderDecoration, RenderDecorationPattern, RenderDecorations, RenderFragmentView, RenderImageFragment, RenderImageFragments, RenderLineDecorations, RenderOverflowClip};
+pub use fragments::{RenderDecoration, RenderDecorationPattern, RenderDecorations, RenderFragmentView, RenderImageFragment, RenderImageFragments, RenderOverflowClip};
 pub use text::{
     RenderAuthoritativeTextRun, RenderEllipsisFragment, RenderGlyphAdvanceRun, RenderGlyphAdvanceRuns, RenderGlyphOffsetRun, RenderGlyphOffsetRuns, RenderHyphenFragment, RenderLine, RenderLineTextFragment, RenderLineTextFragments,
     RenderLines, RenderTextRun, RenderTextRuns, RenderTextView,
@@ -103,7 +103,7 @@ impl<'a> RenderView<'a> {
     }
 
     pub fn root_font_size(&self) -> f32 {
-        self.doc.root_font_size()
+        self.doc.inputs.document.root_font_size()
     }
 
     /// The CSS canvas background color, after root/body propagation.
@@ -112,39 +112,39 @@ impl<'a> RenderView<'a> {
     /// drawable layer is an image that this renderer cannot paint yet.
     pub fn canvas_background_color(&self) -> Option<u32> {
         let root_box = self.doc.inputs.layout_tree.root_box()?;
-        let root_indices = self.doc.box_style_indices(root_box)?;
+        let root_indices = self.doc.inputs.layout_tree.get_box_style_indices(root_box)?;
         let root = self.doc.inputs.styles.view(root_indices)?;
         if root.background_image_present() || root.background_color() & 0xFF != 0 {
             return (root.background_color() & 0xFF != 0).then_some(root.background_color());
         }
 
         let body_box = self.doc.inputs.layout_tree.body_box()?;
-        let body_indices = self.doc.box_style_indices(body_box)?;
+        let body_indices = self.doc.inputs.layout_tree.get_box_style_indices(body_box)?;
         let body = self.doc.inputs.styles.view(body_indices)?;
         (body.background_color() & 0xFF != 0).then_some(body.background_color())
     }
 
     pub fn title(&self) -> Option<&'a str> {
-        self.doc.title()
+        self.doc.inputs.document.title()
     }
 
     pub fn images(&self) -> &'a [html_dom::ImageResource] {
-        self.doc.images()
+        self.doc.inputs.document.images()
     }
 
     pub fn image_uri(&self, image_idx: u32) -> Option<&'a str> {
-        match &self.doc.images().get(image_idx as usize)?.source {
+        match &self.doc.inputs.document.images().get(image_idx as usize)?.source {
             html_dom::ImageSource::Uri(uri) => Some(uri.as_str()),
             html_dom::ImageSource::Inline(_) => None,
         }
     }
 
     pub fn document_toc_entries(&self) -> &'a [html_dom::DocumentTocNode] {
-        self.doc.document_toc_entries()
+        self.doc.inputs.document.document_toc_entries()
     }
 
     pub fn string(&self, index: u16) -> &'a str {
-        self.doc.string(index)
+        self.doc.inputs.document.string(index)
     }
 
     pub fn style_string(&self, index: html_style_model::StyleStringId) -> Option<&'a str> {
@@ -152,6 +152,6 @@ impl<'a> RenderView<'a> {
     }
 
     pub fn lookup_string(&self, value: &str) -> Option<u16> {
-        self.doc.lookup_string(value)
+        self.doc.inputs.document.lookup_string(value)
     }
 }

@@ -40,7 +40,7 @@ pub(crate) struct LineOutput {
 
 #[derive(Default, Clone)]
 pub(crate) struct FragmentOutput {
-    pub decorations: Vec<DecorationFragment>,
+    pub decorations: DecorationStore,
     /// Owning line for inline decorations, or `u32::MAX` for block and
     /// line-independent fragments. Renderers must not infer this relationship
     /// from decoration geometry.
@@ -63,8 +63,6 @@ pub(crate) struct FragmentOutput {
     /// Sparse resolved ancestor-overflow clips, indexed by decoration. Empty
     /// when the document does not establish an overflow clip.
     pub decoration_clips: Vec<Option<OverflowClip>>,
-    /// Geometry only allocated for decorations that actually use rounded corners.
-    pub rounded_decorations: Vec<RoundedDecoration>,
     pub image_fragments: Vec<ImageFragment>,
     pub image_fragments_by_line: Vec<Vec<usize>>,
 }
@@ -95,7 +93,7 @@ impl LayoutState {
         }
         report.add_slice_storage::<EllipsisFragment>("LayoutState.line_output.ellipsis_fragments.storage", self.line_output.ellipsis_fragments.capacity(), self.line_output.ellipsis_fragments.len());
         report.add_slice_storage::<HyphenFragment>("LayoutState.line_output.hyphen_fragments.storage", self.line_output.hyphen_fragments.capacity(), self.line_output.hyphen_fragments.len());
-        report.add_slice_storage::<DecorationFragment>("LayoutState.fragment_output.decorations.storage", self.fragment_output.decorations.capacity(), self.fragment_output.decorations.len());
+        report.add_slice_storage::<DecorationFragment>("LayoutState.fragment_output.decorations.storage", self.fragment_output.decorations.fragment_capacity(), self.fragment_output.decorations.len());
         report.add_slice_storage::<u32>("LayoutState.fragment_output.decoration_line_indices.storage", self.fragment_output.decoration_line_indices.capacity(), self.fragment_output.decoration_line_indices.len());
         report.add_slice_storage::<u32>("LayoutState.fragment_output.decoration_paint_orders.storage", self.fragment_output.decoration_paint_orders.capacity(), self.fragment_output.decoration_paint_orders.len());
         report.add_slice_storage::<Vec<usize>>("LayoutState.fragment_output.decoration_fragments_by_line.storage", self.fragment_output.decoration_fragments_by_line.capacity(), self.fragment_output.decoration_fragments_by_line.len());
@@ -115,7 +113,7 @@ impl LayoutState {
         );
         report.add_slice_storage::<Range<u32>>("LayoutState.fragment_output.block_paint_ranges.storage", self.fragment_output.block_paint_ranges.capacity(), self.fragment_output.block_paint_ranges.len());
         report.add_slice_storage::<Option<OverflowClip>>("LayoutState.fragment_output.decoration_clips.storage", self.fragment_output.decoration_clips.capacity(), self.fragment_output.decoration_clips.len());
-        report.add_slice_storage::<RoundedDecoration>("LayoutState.fragment_output.rounded_decorations.storage", self.fragment_output.rounded_decorations.capacity(), self.fragment_output.rounded_decorations.len());
+        report.add_slice_storage::<RoundedDecoration>("LayoutState.fragment_output.decorations.rounded_storage", self.fragment_output.decorations.rounded_capacity(), self.fragment_output.decorations.rounded_len());
         report.add_slice_storage::<ImageFragment>("LayoutState.fragment_output.image_fragments.storage", self.fragment_output.image_fragments.capacity(), self.fragment_output.image_fragments.len());
         report.add_slice_storage::<Vec<usize>>("LayoutState.fragment_output.image_fragments_by_line.storage", self.fragment_output.image_fragments_by_line.capacity(), self.fragment_output.image_fragments_by_line.len());
         for fragments in &self.fragment_output.image_fragments_by_line {
@@ -277,6 +275,69 @@ pub(crate) struct DecorationFragment {
     metadata: u32,
 }
 
+/// Compact decoration storage. Rounded geometry is a sparse implementation
+/// detail rather than a second collection that callers must keep synchronized.
+#[derive(Clone, Default)]
+pub(crate) struct DecorationStore {
+    fragments: Vec<DecorationFragment>,
+    rounded: Vec<RoundedDecoration>,
+}
+
+impl DecorationStore {
+    pub(crate) fn len(&self) -> usize {
+        self.fragments.len()
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.fragments.clear();
+        self.rounded.clear();
+    }
+
+    pub(crate) fn fragments(&self) -> &[DecorationFragment] {
+        &self.fragments
+    }
+
+    pub(crate) fn fragments_mut(&mut self) -> &mut Vec<DecorationFragment> {
+        &mut self.fragments
+    }
+
+    pub(crate) fn push(&mut self, fragment: DecorationFragment) {
+        self.fragments.push(fragment);
+    }
+
+    pub(crate) fn push_rounded_border(&mut self, rect: Rect, color: u32, is_inline: bool, rounded: RoundedDecoration) {
+        let index = self.push_rounded(rounded);
+        self.fragments.push(DecorationFragment::rounded_border(rect, color, is_inline, index));
+    }
+
+    pub(crate) fn push_rounded_background(&mut self, rect: Rect, color: u32, is_inline: bool, rounded: RoundedDecoration) {
+        let index = self.push_rounded(rounded);
+        self.fragments.push(DecorationFragment::rounded_background(rect, color, is_inline, index));
+    }
+
+    pub(crate) fn rounded_for(&self, fragment: &DecorationFragment) -> Option<&RoundedDecoration> {
+        fragment.rounded_index().and_then(|index| self.rounded.get(index))
+    }
+
+    fn push_rounded(&mut self, rounded: RoundedDecoration) -> usize {
+        let index = self.rounded.len();
+        self.rounded.push(rounded);
+        index
+    }
+
+    fn fragment_capacity(&self) -> usize {
+        self.fragments.capacity()
+    }
+
+    fn rounded_capacity(&self) -> usize {
+        self.rounded.capacity()
+    }
+
+    fn rounded_len(&self) -> usize {
+        self.rounded.len()
+    }
+}
+
 /// Semantic decoration execution retained across the layout/render boundary.
 /// Layout resolves the occupied geometry; render core expands patterned
 /// strokes into painter primitives.
@@ -433,6 +494,19 @@ mod tests {
         assert_eq!(patterned.pattern(), DecorationPattern::DashedHorizontal);
         assert!(patterned.is_inline());
         assert!(patterned.is_foreground());
+    }
+
+    #[test]
+    fn decoration_store_owns_sparse_rounded_geometry() {
+        let mut decorations = DecorationStore::default();
+        decorations.push(DecorationFragment::background_rect(Rect::ZERO, 1, false));
+        let radii = UsedBorderRadii { top_left: (4.0, 5.0), ..UsedBorderRadii::default() };
+        decorations.push_rounded_background(Rect::ZERO, 2, false, RoundedDecoration { radii, border_width: None });
+
+        assert!(decorations.rounded_for(&decorations.fragments()[0]).is_none());
+        let rounded = decorations.rounded_for(&decorations.fragments()[1]).expect("rounded details");
+        assert_eq!(rounded.radii, radii);
+        assert_eq!(rounded.border_width, None);
     }
 
     #[test]

@@ -1,7 +1,4 @@
-use crate::layout_model::{
-    AnchorPosition, BoxGeometry, DecorationFragment, EllipsisFragment, GlyphAdvanceRun, GlyphId, GlyphMetrics, GlyphOffsetRun, HyphenFragment, ImageFragment, InlineContent, InlineItem, InlineItemKind, LayoutMode, LayoutState, LayoutTree,
-    Line, RoundedDecoration,
-};
+use crate::layout_model::{AnchorPosition, BoxGeometry, GlyphId, GlyphMetrics, InlineContent, InlineItemKind, LayoutMode, LayoutState, LayoutTree};
 use html_dom::{Document, MemoryUsageReport};
 use html_style_model::{ComputedStyles, ComputedStylesValidationError, StyleIndices};
 use rustc_data_structures::fx::FxHashMap;
@@ -10,9 +7,9 @@ use std::fmt;
 #[path = "stages_output/mod.rs"]
 mod output;
 pub use output::{
-    BoxTextFormat, ImageMetrics, RenderAddressingView, RenderAllImageFragments, RenderAnchorPosition, RenderAnchorPositions, RenderAuthoritativeTextRun, RenderBoxView, RenderDecoration, RenderDecorationPattern, RenderDecorations,
+    BoxTextFormat, ImageMetrics, RenderAddressingView, RenderAnchorPosition, RenderAnchorPositions, RenderAuthoritativeTextRun, RenderBoxView, RenderDecoration, RenderDecorationPattern, RenderDecorations,
     RenderEllipsisFragment, RenderForcedBreak, RenderFragmentView, RenderGlyphAdvanceRun, RenderGlyphAdvanceRuns, RenderGlyphOffsetRun, RenderGlyphOffsetRuns, RenderHyphenFragment, RenderImageFragment, RenderImageFragments, RenderLine,
-    RenderLineDecorations, RenderLineTextFragment, RenderLineTextFragments, RenderLines, RenderListItemMarker, RenderOverflowClip, RenderTable, RenderTableCell, RenderTableRow, RenderTextRun, RenderTextRuns, RenderTextView, RenderView,
+    RenderLineTextFragment, RenderLineTextFragments, RenderLines, RenderListItemMarker, RenderOverflowClip, RenderTable, RenderTableCell, RenderTableRow, RenderTextRun, RenderTextRuns, RenderTextView, RenderView,
     SourceElementStep, SourcePosition,
 };
 #[path = "stages/lifecycle.rs"]

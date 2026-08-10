@@ -14,7 +14,7 @@ mod layout_model {
     pub use inline::GlyphId;
     pub(crate) use inline::{InlineContent, InlineItem, InlineItemKind, WhitespaceWrapOverride};
     pub(crate) use layout_state::{
-        AnchorPosition, DecorationFragment, DecorationPattern, EllipsisFragment, GlyphAdvanceRun, GlyphOffsetRun, HyphenFragment, ImageFragment, LayoutState, Line, LineInlineBoxFragment, LineTextFragment, OverflowClip, RoundedDecoration,
+        AnchorPosition, DecorationFragment, DecorationPattern, DecorationStore, EllipsisFragment, GlyphAdvanceRun, GlyphOffsetRun, HyphenFragment, ImageFragment, LayoutState, Line, LineInlineBoxFragment, LineTextFragment, OverflowClip, RoundedDecoration,
     };
     pub(crate) use layout_tree::{BlockBox, BoxType, Children, FlexBox, GridBox, LayoutBox, LayoutMode, LayoutTree, ListItemMarker, TableBox, TableCellBox, TableColumnGroupSpan, TableColumnTrack, TableColumnWidthHint, TableRowBox};
 }
@@ -45,9 +45,9 @@ pub use html_style_model::OpenTypeFeature;
 pub use html_style_model::{FontStyle, ListStylePosition, ReaderStyleOverrides, StyleStringId, TextAlign, TextDecorationLines, UsedBorderRadii};
 pub use shaping::{CharacterPlacement, FontMetricsRequest, FontRelativeMetrics, FontSlant, GlyphRegistry, GlyphShaper, ShapeError, ShapedLine, ShapedTextRun, TextRunId, TextRunShapeRequest, TextShapeRequest, TextStyleSpan};
 pub use stages::{
-    BoxTextFormat, ImageMetrics, ImageSizingPolicy, LaidOutDocument, LayoutConstraintError, LayoutConstraints, PrepareError, PreparedDocument, RenderAddressingView, RenderAllImageFragments, RenderAnchorPosition, RenderAnchorPositions,
+    BoxTextFormat, ImageMetrics, ImageSizingPolicy, LaidOutDocument, LayoutConstraintError, LayoutConstraints, PrepareError, PreparedDocument, RenderAddressingView, RenderAnchorPosition, RenderAnchorPositions,
     RenderAuthoritativeTextRun, RenderBoxView, RenderDecoration, RenderDecorationPattern, RenderDecorations, RenderEllipsisFragment, RenderForcedBreak, RenderFragmentView, RenderGlyphAdvanceRun, RenderGlyphAdvanceRuns,
-    NoteFlow, RenderGlyphOffsetRun, RenderGlyphOffsetRuns, RenderHyphenFragment, RenderImageFragment, RenderImageFragments, RenderLine, RenderLineDecorations, RenderLineTextFragment, RenderLineTextFragments, RenderLines, RenderListItemMarker,
+    NoteFlow, RenderGlyphOffsetRun, RenderGlyphOffsetRuns, RenderHyphenFragment, RenderImageFragment, RenderImageFragments, RenderLine, RenderLineTextFragment, RenderLineTextFragments, RenderLines, RenderListItemMarker,
     RenderOverflowClip, RenderTable, RenderTableCell, RenderTableRow, RenderTextRun, RenderTextRuns, RenderTextView, RenderView, ShapedDocument, SourceElementStep, SourcePosition, TextCompositionPolicy,
 };
 

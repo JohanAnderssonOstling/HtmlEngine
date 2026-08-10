@@ -363,6 +363,7 @@ impl ShapedDocument {
         self.shaped.inline_content.glyphs()
     }
 
+    #[cfg(test)]
     pub(crate) fn glyph_metrics(&self) -> &GlyphMetrics {
         &self.shaped.glyph_metrics
     }
@@ -596,30 +597,6 @@ impl LaidOutDocument {
         &self.inputs.document
     }
 
-    pub(crate) fn root_font_size(&self) -> f32 {
-        self.inputs.document.root_font_size()
-    }
-
-    pub(crate) fn title(&self) -> Option<&str> {
-        self.inputs.document.title()
-    }
-
-    pub(crate) fn images(&self) -> &[html_dom::ImageResource] {
-        self.inputs.document.images()
-    }
-
-    pub(crate) fn document_toc_entries(&self) -> &[html_dom::DocumentTocNode] {
-        self.inputs.document.document_toc_entries()
-    }
-
-    pub(crate) fn string(&self, index: u16) -> &str {
-        self.inputs.document.string(index)
-    }
-
-    pub(crate) fn lookup_string(&self, value: &str) -> Option<u16> {
-        self.inputs.document.lookup_string(value)
-    }
-
     pub(crate) fn glyph_metrics(&self) -> &GlyphMetrics {
         &self.shaped.glyph_metrics
     }
@@ -650,12 +627,9 @@ impl LaidOutDocument {
         crate::GlyphRegistry::new(&mut std::sync::Arc::make_mut(&mut self.shaped).glyph_metrics)
     }
 
+    #[cfg(test)]
     pub(crate) fn glyphs(&self) -> &[GlyphId] {
         self.shaped.inline_content.glyphs()
-    }
-
-    pub(crate) fn glyph_at(&self, glyph_idx: usize) -> Option<GlyphId> {
-        self.shaped.inline_content.glyph_at(glyph_idx)
     }
 
     /// Returns the DOM text node and UTF-16 source offset for the glyph.
@@ -719,52 +693,9 @@ impl LaidOutDocument {
         matches!(self.box_layout_mode(box_idx), Some(LayoutMode::Block(_) | LayoutMode::Table(_) | LayoutMode::TableCell(_)))
     }
 
-    pub(crate) fn inline_items(&self) -> &[InlineItem] {
-        self.shaped.inline_content.inline_items()
-    }
-
-    pub(crate) fn lines(&self) -> &[Line] {
-        self.layout_state.line_output.lines.as_slice()
-    }
-
-    pub(crate) fn line(&self, idx: usize) -> Option<&Line> {
-        self.layout_state.line_output.lines.get(idx)
-    }
-
+    #[cfg(test)]
     pub(crate) fn line_count(&self) -> usize {
         self.layout_state.line_output.lines.len()
-    }
-
-    pub(crate) fn line_glyph_offsets(&self) -> &[Vec<GlyphOffsetRun>] {
-        self.layout_state.line_output.line_glyph_offsets.as_slice()
-    }
-
-    pub(crate) fn line_glyph_advances(&self) -> &[Vec<GlyphAdvanceRun>] {
-        self.layout_state.line_output.line_glyph_advances.as_slice()
-    }
-
-    pub(crate) fn ellipsis_fragments(&self) -> &[EllipsisFragment] {
-        self.layout_state.line_output.ellipsis_fragments.as_slice()
-    }
-
-    pub(crate) fn hyphen_fragments(&self) -> &[HyphenFragment] {
-        self.layout_state.line_output.hyphen_fragments.as_slice()
-    }
-
-    pub(crate) fn decorations(&self) -> &[DecorationFragment] {
-        self.layout_state.fragment_output.decorations.as_slice()
-    }
-
-    pub(crate) fn rounded_decorations(&self) -> &[RoundedDecoration] {
-        self.layout_state.fragment_output.rounded_decorations.as_slice()
-    }
-
-    pub(crate) fn image_fragments(&self) -> &[ImageFragment] {
-        self.layout_state.fragment_output.image_fragments.as_slice()
-    }
-
-    pub(crate) fn image_fragments_by_line(&self) -> &[Vec<usize>] {
-        self.layout_state.fragment_output.image_fragments_by_line.as_slice()
     }
 
     pub fn memory_usage_report(&self) -> MemoryUsageReport {

@@ -50,7 +50,7 @@ pub(crate) fn translate_laid_out_subtree_output(engine: &mut LayoutEngine<'_, '_
     for line in &mut engine.fragments.state_mut().line_output.lines[output.lines.clone()] {
         line.point += offset;
     }
-    for decoration in &mut engine.fragments.state_mut().fragment_output.decorations[output.decorations.clone()] {
+    for decoration in &mut engine.fragments.state_mut().fragment_output.decorations.fragments_mut()[output.decorations.clone()] {
         decoration.rect = decoration.rect + offset;
     }
     // Image offsets are line-relative. Their owning line was translated above,

@@ -67,7 +67,6 @@ impl<'out> FragmentWriter<'out> {
         state.fragment_output.block_paint_ranges.clear();
         state.fragment_output.block_decoration_count = 0;
         state.fragment_output.decoration_clips.clear();
-        state.fragment_output.rounded_decorations.clear();
         state.fragment_output.image_fragments.clear();
         for fragments in &mut state.fragment_output.image_fragments_by_line {
             fragments.clear();
@@ -119,7 +118,7 @@ impl<'out> FragmentWriter<'out> {
                 // lines. Keep them in that final traversal so overlapping
                 // inline and absolute borders retain source order; only the
                 // independently positioned background needs a later sublayer.
-                if !self.state.fragment_output.decorations[decoration_idx].is_foreground() {
+                if !self.state.fragment_output.decorations.fragments()[decoration_idx].is_foreground() {
                     self.state.fragment_output.decoration_independent_positioned_layers[decoration_idx] = true;
                 }
             }
@@ -167,7 +166,7 @@ impl<'out> FragmentWriter<'out> {
     }
 
     pub(crate) fn decorations_mut(&mut self) -> &mut Vec<DecorationFragment> {
-        &mut self.state.fragment_output.decorations
+        self.state.fragment_output.decorations.fragments_mut()
     }
 
     pub(crate) fn push_decoration(&mut self, decoration: DecorationFragment) {
@@ -175,15 +174,11 @@ impl<'out> FragmentWriter<'out> {
     }
 
     pub(crate) fn push_rounded_decoration(&mut self, rect: Rect, color: u32, is_inline: bool, rounded: RoundedDecoration) {
-        let index = self.state.fragment_output.rounded_decorations.len();
-        self.state.fragment_output.rounded_decorations.push(rounded);
-        self.state.fragment_output.decorations.push(DecorationFragment::rounded_border(rect, color, is_inline, index));
+        self.state.fragment_output.decorations.push_rounded_border(rect, color, is_inline, rounded);
     }
 
     pub(crate) fn push_rounded_background(&mut self, rect: Rect, color: u32, is_inline: bool, rounded: RoundedDecoration) {
-        let index = self.state.fragment_output.rounded_decorations.len();
-        self.state.fragment_output.rounded_decorations.push(rounded);
-        self.state.fragment_output.decorations.push(DecorationFragment::rounded_background(rect, color, is_inline, index));
+        self.state.fragment_output.decorations.push_rounded_background(rect, color, is_inline, rounded);
     }
 
     pub(crate) fn record_decoration_owner_since(&mut self, owner: u32, start: usize) {

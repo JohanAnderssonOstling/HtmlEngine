@@ -63,7 +63,7 @@ impl RenderOverflowClip {
 impl RenderDecoration {
     fn from_fragment(
         fragment: &DecorationFragment,
-        rounded: &[RoundedDecoration],
+        decorations: &DecorationStore,
         clip: Option<crate::layout_model::OverflowClip>,
         positioned_layer: bool,
         negative_positioned_layer: bool,
@@ -71,7 +71,7 @@ impl RenderDecoration {
         line_idx: Option<u32>,
         paint_order: u32,
     ) -> Self {
-        let rounded = fragment.rounded_index().and_then(|index| rounded.get(index));
+        let rounded = decorations.rounded_for(fragment);
         Self {
             rect: fragment.rect,
             color: fragment.color,
@@ -161,22 +161,65 @@ impl RenderDecoration {
 }
 
 pub struct RenderDecorations<'a> {
-    decorations: &'a [DecorationFragment],
-    rounded: &'a [RoundedDecoration],
+    decorations: &'a DecorationStore,
     clips: &'a [Option<crate::layout_model::OverflowClip>],
-    block_paint_ranges: &'a [Range<u32>],
-    block_decoration_count: usize,
     positioned_layers: &'a [bool],
     negative_positioned_layers: &'a [bool],
     independent_positioned_layers: &'a [bool],
     line_indices: &'a [u32],
     paint_orders: &'a [u32],
+    selection: DecorationSelection<'a>,
+}
+
+enum DecorationSelection<'a> {
+    All { block_paint_ranges: &'a [Range<u32>], block_decoration_count: usize },
+    Indexes(&'a [usize]),
+}
+
+enum DecorationIndexes<'a> {
+    All { ranges: std::slice::Iter<'a, Range<u32>>, current: Range<u32>, trailing: Range<usize> },
+    Selected(std::slice::Iter<'a, usize>),
+}
+
+impl Iterator for DecorationIndexes<'_> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Selected(indexes) => indexes.next().copied(),
+            Self::All { ranges, current, trailing } => loop {
+                if let Some(index) = current.next() {
+                    return Some(index as usize);
+                }
+                if let Some(range) = ranges.next() {
+                    *current = range.clone();
+                } else {
+                    return trailing.next();
+                }
+            },
+        }
+    }
+}
+
+impl DecorationSelection<'_> {
+    fn indexes(&self, decoration_count: usize) -> DecorationIndexes<'_> {
+        match self {
+            Self::All { block_paint_ranges, block_decoration_count } => DecorationIndexes::All { ranges: block_paint_ranges.iter(), current: 0..0, trailing: *block_decoration_count..decoration_count },
+            Self::Indexes(indexes) => DecorationIndexes::Selected(indexes.iter()),
+        }
+    }
+
+    fn len(&self, decoration_count: usize) -> usize {
+        match self {
+            Self::All { .. } => decoration_count,
+            Self::Indexes(indexes) => indexes.len(),
+        }
+    }
 }
 
 impl<'a> RenderDecorations<'a> {
-    fn new(
-        decorations: &'a [DecorationFragment],
-        rounded: &'a [RoundedDecoration],
+    fn all(
+        decorations: &'a DecorationStore,
         clips: &'a [Option<crate::layout_model::OverflowClip>],
         block_paint_ranges: &'a [Range<u32>],
         block_decoration_count: usize,
@@ -186,50 +229,11 @@ impl<'a> RenderDecorations<'a> {
         line_indices: &'a [u32],
         paint_orders: &'a [u32],
     ) -> Self {
-        Self { decorations, rounded, clips, block_paint_ranges, block_decoration_count, positioned_layers, negative_positioned_layers, independent_positioned_layers, line_indices, paint_orders }
+        Self { decorations, clips, positioned_layers, negative_positioned_layers, independent_positioned_layers, line_indices, paint_orders, selection: DecorationSelection::All { block_paint_ranges, block_decoration_count } }
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = RenderDecoration> + '_ {
-        let render = |index: usize| {
-            RenderDecoration::from_fragment(
-                &self.decorations[index],
-                self.rounded,
-                self.clips.get(index).copied().flatten(),
-                self.positioned_layers.get(index).copied().unwrap_or(false),
-                self.negative_positioned_layers.get(index).copied().unwrap_or(false),
-                self.independent_positioned_layers.get(index).copied().unwrap_or(false),
-                self.line_indices.get(index).copied(),
-                self.paint_orders.get(index).copied().unwrap_or(u32::MAX),
-            )
-        };
-        self.block_paint_ranges.iter().flat_map(|range| range.clone().map(|index| index as usize)).map(render).chain((self.block_decoration_count..self.decorations.len()).map(render))
-    }
-
-    pub fn len(&self) -> usize {
-        self.decorations.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.decorations.is_empty()
-    }
-}
-
-pub struct RenderLineDecorations<'a> {
-    decorations: &'a [DecorationFragment],
-    rounded: &'a [RoundedDecoration],
-    clips: &'a [Option<crate::layout_model::OverflowClip>],
-    positioned_layers: &'a [bool],
-    negative_positioned_layers: &'a [bool],
-    independent_positioned_layers: &'a [bool],
-    line_indices: &'a [u32],
-    paint_orders: &'a [u32],
-    indexes: &'a [usize],
-}
-
-impl<'a> RenderLineDecorations<'a> {
-    fn new(
-        decorations: &'a [DecorationFragment],
-        rounded: &'a [RoundedDecoration],
+    fn selected(
+        decorations: &'a DecorationStore,
         clips: &'a [Option<crate::layout_model::OverflowClip>],
         positioned_layers: &'a [bool],
         negative_positioned_layers: &'a [bool],
@@ -238,28 +242,31 @@ impl<'a> RenderLineDecorations<'a> {
         paint_orders: &'a [u32],
         indexes: &'a [usize],
     ) -> Self {
-        Self { decorations, rounded, clips, positioned_layers, negative_positioned_layers, independent_positioned_layers, line_indices, paint_orders, indexes }
+        Self { decorations, clips, positioned_layers, negative_positioned_layers, independent_positioned_layers, line_indices, paint_orders, selection: DecorationSelection::Indexes(indexes) }
     }
 
     pub fn iter(&self) -> impl Iterator<Item = RenderDecoration> + '_ {
-        self.indexes.iter().filter_map(move |&index| {
-            self.decorations.get(index).map(|fragment| {
-                RenderDecoration::from_fragment(
-                    fragment,
-                    self.rounded,
-                    self.clips.get(index).copied().flatten(),
-                    self.positioned_layers.get(index).copied().unwrap_or(false),
-                    self.negative_positioned_layers.get(index).copied().unwrap_or(false),
-                    self.independent_positioned_layers.get(index).copied().unwrap_or(false),
-                    self.line_indices.get(index).copied(),
-                    self.paint_orders.get(index).copied().unwrap_or(u32::MAX),
-                )
-            })
-        })
+        let render = |index: usize| {
+            RenderDecoration::from_fragment(
+                &self.decorations.fragments()[index],
+                self.decorations,
+                self.clips.get(index).copied().flatten(),
+                self.positioned_layers.get(index).copied().unwrap_or(false),
+                self.negative_positioned_layers.get(index).copied().unwrap_or(false),
+                self.independent_positioned_layers.get(index).copied().unwrap_or(false),
+                self.line_indices.get(index).copied(),
+                self.paint_orders.get(index).copied().unwrap_or(u32::MAX),
+            )
+        };
+        self.selection.indexes(self.decorations.len()).map(render)
+    }
+
+    pub fn len(&self) -> usize {
+        self.selection.len(self.decorations.len())
     }
 
     pub fn is_empty(&self) -> bool {
-        self.indexes.is_empty()
+        self.len() == 0
     }
 }
 
@@ -300,46 +307,31 @@ impl RenderImageFragment {
 
 pub struct RenderImageFragments<'a> {
     fragments: &'a [ImageFragment],
-    indexes: &'a [usize],
+    indexes: Option<&'a [usize]>,
 }
 
 impl<'a> RenderImageFragments<'a> {
-    fn new(fragments: &'a [ImageFragment], indexes: &'a [usize]) -> Self {
-        Self { fragments, indexes }
+    fn all(fragments: &'a [ImageFragment]) -> Self {
+        Self { fragments, indexes: None }
+    }
+
+    fn selected(fragments: &'a [ImageFragment], indexes: &'a [usize]) -> Self {
+        Self { fragments, indexes: Some(indexes) }
     }
 
     pub fn len(&self) -> usize {
-        self.indexes.len()
+        self.indexes.map_or(self.fragments.len(), <[usize]>::len)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.indexes.is_empty()
+        self.len() == 0
     }
 
     pub fn iter(&self) -> impl Iterator<Item = RenderImageFragment> + '_ {
-        self.indexes.iter().filter_map(move |&idx| self.fragments.get(idx).map(RenderImageFragment::from_fragment))
-    }
-}
-
-pub struct RenderAllImageFragments<'a> {
-    fragments: &'a [ImageFragment],
-}
-
-impl<'a> RenderAllImageFragments<'a> {
-    fn new(fragments: &'a [ImageFragment]) -> Self {
-        Self { fragments }
-    }
-
-    pub fn len(&self) -> usize {
-        self.fragments.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.fragments.is_empty()
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = RenderImageFragment> + '_ {
-        self.fragments.iter().map(RenderImageFragment::from_fragment)
+        (0..self.len()).filter_map(move |position| {
+            let index = self.indexes.map_or(position, |indexes| indexes[position]);
+            self.fragments.get(index).map(RenderImageFragment::from_fragment)
+        })
     }
 }
 
@@ -361,9 +353,8 @@ pub struct RenderFragmentView<'a> {
 
 impl<'a> RenderFragmentView<'a> {
     pub fn decorations(self) -> RenderDecorations<'a> {
-        RenderDecorations::new(
-            self.doc.decorations(),
-            self.doc.rounded_decorations(),
+        RenderDecorations::all(
+            &self.doc.layout_state.fragment_output.decorations,
             &self.doc.layout_state.fragment_output.decoration_clips,
             &self.doc.layout_state.fragment_output.block_paint_ranges,
             self.doc.layout_state.fragment_output.block_decoration_count as usize,
@@ -376,15 +367,14 @@ impl<'a> RenderFragmentView<'a> {
     }
 
     pub fn images_for_line(self, line_idx: usize) -> RenderImageFragments<'a> {
-        let indexes = self.doc.image_fragments_by_line().get(line_idx).map_or(&[] as &'a [usize], |indexes| indexes.as_slice());
-        RenderImageFragments::new(self.doc.image_fragments(), indexes)
+        let indexes = self.doc.layout_state.fragment_output.image_fragments_by_line.get(line_idx).map_or(&[] as &'a [usize], |indexes| indexes.as_slice());
+        RenderImageFragments::selected(&self.doc.layout_state.fragment_output.image_fragments, indexes)
     }
 
-    pub fn decorations_for_line(self, line_idx: usize) -> RenderLineDecorations<'a> {
+    pub fn decorations_for_line(self, line_idx: usize) -> RenderDecorations<'a> {
         let indexes = self.doc.layout_state.fragment_output.decoration_fragments_by_line.get(line_idx).map_or(&[] as &'a [usize], |indexes| indexes.as_slice());
-        RenderLineDecorations::new(
-            self.doc.decorations(),
-            self.doc.rounded_decorations(),
+        RenderDecorations::selected(
+            &self.doc.layout_state.fragment_output.decorations,
             &self.doc.layout_state.fragment_output.decoration_clips,
             &self.doc.layout_state.fragment_output.decoration_positioned_layers,
             &self.doc.layout_state.fragment_output.decoration_negative_positioned_layers,
@@ -395,7 +385,7 @@ impl<'a> RenderFragmentView<'a> {
         )
     }
 
-    pub fn images(self) -> RenderAllImageFragments<'a> {
-        RenderAllImageFragments::new(self.doc.image_fragments())
+    pub fn images(self) -> RenderImageFragments<'a> {
+        RenderImageFragments::all(&self.doc.layout_state.fragment_output.image_fragments)
     }
 }

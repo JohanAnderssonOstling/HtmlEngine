@@ -492,21 +492,21 @@ impl<'a> RenderTextView<'a> {
     }
 
     pub fn glyph_count(self) -> usize {
-        self.doc.glyphs().len()
+        self.doc.shaped.inline_content.glyphs().len()
     }
 
     pub fn glyph_at(self, glyph_idx: usize) -> Option<GlyphId> {
-        self.doc.glyph_at(glyph_idx)
+        self.doc.shaped.inline_content.glyph_at(glyph_idx)
     }
 
     pub fn glyph_slice(self, range: Range<u32>) -> Option<&'a [GlyphId]> {
         let start = usize::try_from(range.start).ok()?;
         let end = usize::try_from(range.end).ok()?;
-        self.doc.glyphs().get(start..end)
+        self.doc.shaped.inline_content.glyphs().get(start..end)
     }
 
     pub fn glyph_metric(self, glyph: GlyphId) -> Option<crate::GlyphMetric> {
-        self.doc.glyph_metrics().get_checked(glyph)
+        self.doc.shaped.glyph_metrics.get_checked(glyph)
     }
 
     /// Natural shaped advance for one logical character.
@@ -539,15 +539,15 @@ impl<'a> RenderTextView<'a> {
     }
 
     pub fn line_count(self) -> usize {
-        self.doc.line_count()
+        self.doc.layout_state.line_output.lines.len()
     }
 
     pub fn lines(self) -> RenderLines<'a> {
-        RenderLines::new(self.doc.lines(), &self.doc.layout_state.line_output.positioned_layers, &self.doc.layout_state.line_output.negative_positioned_layers, &self.doc.layout_state.line_output.independent_positioned_layers)
+        RenderLines::new(&self.doc.layout_state.line_output.lines, &self.doc.layout_state.line_output.positioned_layers, &self.doc.layout_state.line_output.negative_positioned_layers, &self.doc.layout_state.line_output.independent_positioned_layers)
     }
 
     pub fn line(self, idx: usize) -> Option<RenderLine> {
-        self.doc.line(idx).map(|line| {
+        self.doc.layout_state.line_output.lines.get(idx).map(|line| {
             RenderLine::from_line(
                 idx,
                 line,
@@ -570,35 +570,35 @@ impl<'a> RenderTextView<'a> {
     }
 
     pub fn line_glyph_offsets(self, line_idx: usize) -> Option<RenderGlyphOffsetRuns<'a>> {
-        self.doc.line_glyph_offsets().get(line_idx).map(|runs| RenderGlyphOffsetRuns::new(runs))
+        self.doc.layout_state.line_output.line_glyph_offsets.get(line_idx).map(|runs| RenderGlyphOffsetRuns::new(runs))
     }
 
     pub fn line_glyph_advances(self, line_idx: usize) -> Option<RenderGlyphAdvanceRuns<'a>> {
-        self.doc.line_glyph_advances().get(line_idx).map(|runs| RenderGlyphAdvanceRuns::new(runs))
+        self.doc.layout_state.line_output.line_glyph_advances.get(line_idx).map(|runs| RenderGlyphAdvanceRuns::new(runs))
     }
 
     pub fn line_text_fragments(self, line_idx: usize) -> Option<RenderLineTextFragments<'a>> {
-        let line = self.doc.lines().get(line_idx)?;
+        let line = self.doc.layout_state.line_output.lines.get(line_idx)?;
         Some(RenderLineTextFragments { line, index: 0, implicit_emitted: false })
     }
 
     pub fn ellipsis_for_line(self, line_idx: usize) -> Option<RenderEllipsisFragment> {
-        let fragments = self.doc.ellipsis_fragments();
+        let fragments = &self.doc.layout_state.line_output.ellipsis_fragments;
         let idx = fragments.binary_search_by_key(&line_idx, |fragment| fragment.line_idx).ok()?;
         fragments.get(idx).map(RenderEllipsisFragment::from_fragment)
     }
 
     pub fn hyphen_for_line(self, line_idx: usize) -> Option<RenderHyphenFragment> {
-        let fragments = self.doc.hyphen_fragments();
+        let fragments = &self.doc.layout_state.line_output.hyphen_fragments;
         let idx = fragments.binary_search_by_key(&line_idx, |fragment| fragment.line_idx).ok()?;
         fragments.get(idx).map(RenderHyphenFragment::from_fragment)
     }
 
     pub fn text_runs(self) -> RenderTextRuns<'a> {
-        RenderTextRuns::new(self.doc.inline_items(), Some(TextRunKind::Text))
+        RenderTextRuns::new(self.doc.shaped.inline_content.inline_items(), Some(TextRunKind::Text))
     }
 
     pub fn marker_runs(self) -> RenderTextRuns<'a> {
-        RenderTextRuns::new(self.doc.inline_items(), Some(TextRunKind::Marker))
+        RenderTextRuns::new(self.doc.shaped.inline_content.inline_items(), Some(TextRunKind::Marker))
     }
 }
