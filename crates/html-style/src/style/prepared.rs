@@ -52,6 +52,7 @@ pub(crate) struct RulePriority {
 }
 
 impl RulePriority {
+    #[cfg(test)]
     pub(crate) fn source_order(self) -> u32 {
         self.source_order
     }
@@ -60,6 +61,7 @@ impl RulePriority {
         self.origin
     }
 
+    #[cfg(test)]
     pub(crate) fn layer(self) -> LayerOrder {
         self.layer
     }
@@ -210,6 +212,7 @@ pub(crate) struct ParsedStylesheetSet<'sheet, 'css> {
 }
 
 impl<'sheet, 'css> ParsedStylesheetSet<'sheet, 'css> {
+    #[cfg(test)]
     pub(crate) fn new(user_agent: &'sheet StyleSheet<'css>, authors: &'sheet [StyleSheet<'css>]) -> Self {
         Self { user_agent, authors, author_roots: &[] }
     }

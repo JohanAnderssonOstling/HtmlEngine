@@ -4988,11 +4988,6 @@ fn selector_might_match_dom(selector: &lightningcss::selector::Selector, ancesto
     selector_might_match_with_filter(selector, ancestor_filter)
 }
 
-fn selector_matches_dom(selector: &lightningcss::selector::Selector, doc: &Document, node_idx: DomNodeId) -> bool {
-    use crate::style::selectors_dom::selector_matches_dom_node;
-    selector_matches_dom_node(selector, doc, node_idx)
-}
-
 fn inline_style_attribute(doc: &Document, node_idx: DomNodeId) -> Option<String> {
     let style_attr = doc.get_dom_attr(node_idx, "style")?;
     if style_attr.trim().is_empty() {

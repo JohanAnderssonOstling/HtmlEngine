@@ -17,16 +17,13 @@ pub(crate) enum PseudoTarget {
     FirstLetter,
 }
 
+#[cfg(test)]
 pub fn selector_matches_dom_node(selector: &Selector, doc: &Document, node_idx: DomNodeId) -> bool {
     match_from_position_dom(selector.iter_raw_match_order().as_slice(), doc, node_idx, None, MatchContext::default())
 }
 
 pub(crate) fn selector_matches_dom_node_in_scope(selector: &Selector, doc: &Document, node_idx: DomNodeId, scope: DomNodeId) -> bool {
     match_from_position_dom(selector.iter_raw_match_order().as_slice(), doc, node_idx, None, MatchContext { scope: Some(scope), exclusive_ancestor_floor: None })
-}
-
-pub(crate) fn selector_matches_dom_pseudo(selector: &Selector, doc: &Document, node_idx: DomNodeId, pseudo: PseudoTarget) -> bool {
-    selector_matches_dom_pseudo_with_context(selector, doc, node_idx, pseudo, MatchContext::default())
 }
 
 pub(crate) fn selector_matches_dom_pseudo_in_scope(selector: &Selector, doc: &Document, node_idx: DomNodeId, pseudo: PseudoTarget, scope: DomNodeId) -> bool {
