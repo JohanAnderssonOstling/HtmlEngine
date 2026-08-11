@@ -6,6 +6,50 @@ fn matched_rule_hot_path_record_stays_compact() {
 }
 
 #[test]
+fn style_sharing_keeps_parent_inheritance_in_the_cache_key() {
+    let html = "<html><body><div class='red'><span id='red' class='child'>x</span></div><div class='green'><span id='green' class='child'>x</span></div></body></html>";
+    let mut factory = DocumentFactory::new();
+    let document = factory.parse_with_new_pipeline(html, Some(".red { color: red } .green { color: green } .child { color: inherit }"));
+    let color = |id| {
+        let node = document.document().node_ids().find(|&node| document.document().get_dom_id(node) == Some(id)).unwrap();
+        document.text_style(document.style_for_node(node).unwrap()).unwrap().color
+    };
+
+    assert_eq!(color("red"), 0xff0000ff);
+    assert_eq!(color("green"), 0x008000ff);
+}
+
+#[test]
+fn style_sharing_keeps_structural_selector_results_distinct() {
+    let html = "<html><body><p id='first' class='item'>x</p><p id='second' class='item'>x</p></body></html>";
+    let mut factory = DocumentFactory::new();
+    let document = factory.parse_with_new_pipeline(html, Some(".item { color: green } .item:first-child { color: red }"));
+    let color = |id| {
+        let node = document.document().node_ids().find(|&node| document.document().get_dom_id(node) == Some(id)).unwrap();
+        document.text_style(document.style_for_node(node).unwrap()).unwrap().color
+    };
+
+    assert_eq!(color("first"), 0xff0000ff);
+    assert_eq!(color("second"), 0x008000ff);
+}
+
+#[test]
+fn style_sharing_reuses_custom_maps_and_copies_counter_directives() {
+    let html = "<html><body><div class='item'><span id='first'>x</span></div><div class='item'><span id='second'>x</span></div></body></html>";
+    let mut factory = DocumentFactory::new();
+    let document = factory.parse_with_new_pipeline(html, Some(".item { --tone: green; counter-reset: chapter 3 } .item span { color: var(--tone) }"));
+    let nodes = ["first", "second"].map(|id| document.document().node_ids().find(|&node| document.document().get_dom_id(node) == Some(id)).unwrap());
+    for node in nodes {
+        let style = document.style_for_node(node).unwrap();
+        assert_eq!(document.text_style(style).unwrap().color, 0x008000ff);
+        let parent = document.document().get_dom_parent(node).unwrap();
+        let counters = document.styles().counter_directives_for_node(parent).expect("shared parent keeps counter directives");
+        assert_eq!(counters.resets.len(), 1);
+        assert_eq!(counters.resets[0].value, 3);
+    }
+}
+
+#[test]
 fn inline_style_attribute_overrides_computed_style() {
     let html = "<html><body><p style=\"display: inline; color: red;\">Hello</p></body></html>";
     let mut factory = DocumentFactory::new();

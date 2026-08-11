@@ -3,7 +3,7 @@
 use super::*;
 
 /// Matched rule with specificity for cascade sorting
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub(super) struct MatchedRule {
     pub(super) specificity: u32,
     pub(super) id: EffectiveRuleId,

@@ -70,6 +70,7 @@ mod properties;
 mod runner;
 mod specified;
 mod state;
+mod style_sharing;
 mod traversal;
 mod values;
 mod wide_keywords;
@@ -80,6 +81,7 @@ use plan::*;
 use properties::{apply_property_in_phase, property_is_computable};
 use runner::{CascadeInputs, CascadePhase};
 use state::{WorkingStyle, initial_border, initial_box_model};
+use style_sharing::{SharedElementStyle, StyleSharingCache, StyleSharingProbe, StyleSharingSignature};
 use traversal::*;
 pub(crate) use values::parse_font_kerning;
 use values::*;
@@ -110,6 +112,7 @@ pub(super) struct StyleResolverContext<'a, 'sheet, 'css> {
     important_rule_scratch: &'a mut Vec<MatchedRule>,
     property_targets: &'a mut specified::PropertyTargetState,
     cascade_scratch: &'a mut specified::CascadeScratch<'a, 'css>,
+    style_sharing_cache: &'a mut StyleSharingCache,
     validation_style: &'a mut WorkingStyle,
     pub(super) timings: &'a mut ResolveStyleTimings,
 }
@@ -120,6 +123,15 @@ enum CustomMapResult<'css> {
     New {
         values: FxHashMap<String, TokenList<'css>>,
         cache_signature: Option<CustomCascadeSignature>,
+    },
+}
+
+enum ElementStyleResult<'css> {
+    Shared(SharedElementStyle),
+    Computed {
+        style: WorkingStyle,
+        custom_map: CustomMapResult<'css>,
+        sharing_signature: Option<StyleSharingSignature>,
     },
 }
 
@@ -158,6 +170,7 @@ pub(crate) fn resolve_styles_for_dom_timed<'sheet, 'css>(
     let mut custom_maps = Vec::with_capacity(16);
     custom_maps.push(FxHashMap::<String, TokenList<'css>>::default());
     let mut custom_cascade_cache = CustomCascadeCache::default();
+    let mut style_sharing_cache = StyleSharingCache::default();
     let mut computed_styles = ComputedStylesBuilder::new(doc);
     let mut candidate_scratch = Vec::new();
     let mut candidate_seen = rustc_data_structures::fx::FxHashSet::default();
@@ -181,6 +194,7 @@ pub(crate) fn resolve_styles_for_dom_timed<'sheet, 'css>(
             important_rule_scratch: &mut important_rule_scratch,
             property_targets: &mut property_targets,
             cascade_scratch: &mut cascade_scratch,
+            style_sharing_cache: &mut style_sharing_cache,
             validation_style: &mut validation_style,
             timings: &mut timings,
         };
@@ -202,7 +216,7 @@ pub(crate) fn resolve_styles_for_dom_timed<'sheet, 'css>(
                 .get_dom_parent(node_idx)
                 .map_or(0, |parent_idx| node_custom_map_ids[parent_idx.index()] as usize);
 
-            let (mut style, custom_map) = resolver.compute_style_for_dom_element(
+            let style_result = resolver.compute_style_for_dom_element(
                 node_idx,
                 parent_custom_id as u32,
                 &custom_maps,
@@ -210,40 +224,46 @@ pub(crate) fn resolve_styles_for_dom_timed<'sheet, 'css>(
                 &ancestor_filter,
                 inline_styles.get(node_idx),
             );
-            let custom_map_id = match custom_map {
-                CustomMapResult::Inherited => parent_custom_id as u32,
-                CustomMapResult::Reused(map_id) => map_id,
-                CustomMapResult::New { values, cache_signature } => {
-                    custom_maps.push(values);
-                    let map_id = u32::try_from(custom_maps.len() - 1)
-                        .expect("custom property map count fits in u32");
-                    if let Some(signature) = cache_signature {
-                        custom_cascade_cache.insert(signature, map_id);
-                    }
-                    map_id
-                }
-            };
-            let custom_map = &custom_maps[custom_map_id as usize];
             let candidate_pseudo_mask = resolver
                 .candidate_scratch
                 .iter()
                 .fold(0, |mask, id| mask | prepared.pseudo_mask(*id));
 
             let started = Instant::now();
-            let counters = std::mem::take(&mut style.counters);
-            let style_indices = style
-                .intern(resolver.styles)
-                .expect("resolver built style values should pass style validation");
+            let (style_indices, custom_map_id, counters, sharing_signature) = match style_result {
+                ElementStyleResult::Shared(shared) => (shared.style, shared.custom_map_id, shared.counters, None),
+                ElementStyleResult::Computed { mut style, custom_map, sharing_signature } => {
+                    let custom_map_id = match custom_map {
+                        CustomMapResult::Inherited => parent_custom_id as u32,
+                        CustomMapResult::Reused(map_id) => map_id,
+                        CustomMapResult::New { values, cache_signature } => {
+                            custom_maps.push(values);
+                            let map_id = u32::try_from(custom_maps.len() - 1).expect("custom property map count fits in u32");
+                            if let Some(signature) = cache_signature {
+                                custom_cascade_cache.insert(signature, map_id);
+                            }
+                            map_id
+                        }
+                    };
+                    let counters = std::mem::take(&mut style.counters);
+                    let style_indices = style.intern(resolver.styles).expect("resolver built style values should pass style validation");
+                    (style_indices, custom_map_id, counters, sharing_signature)
+                }
+            };
             resolver
                 .styles
                 .set_node_style(node_idx, style_indices)
                 .expect("resolver only assigns styles to nodes from its source document");
+            if let Some(signature) = sharing_signature {
+                resolver.style_sharing_cache.insert(signature, style_indices, custom_map_id, counters.clone());
+            }
             if !counters.is_empty() {
                 resolver
                     .styles
                     .set_counter_directives(node_idx, counters)
                     .expect("counter directives belong to their originating element");
             }
+            let custom_map = &custom_maps[custom_map_id as usize];
             let first_line = if candidate_pseudo_mask & PseudoTarget::FirstLine.mask() != 0 {
                 resolver
                     .compute_pseudo_style_for_dom_element(
@@ -504,7 +524,7 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
         custom_cascade_cache: &CustomCascadeCache,
         ancestor_filter: &AncestorFilter,
         inline_style: Option<&StyleAttribute<'css>>,
-    ) -> (WorkingStyle, CustomMapResult<'css>) {
+    ) -> ElementStyleResult<'css> {
         let doc = self.doc;
         let prepared = self.prepared;
         let index = self.index;
@@ -565,6 +585,24 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
 
         // Build computed style from matched rules (same as box-based version)
         let cascade_started = Instant::now();
+        let parent_style_indices = doc.get_dom_parent(node_idx).and_then(|parent| self.styles.style_for_node(parent));
+        let sharing_signature = match self.style_sharing_cache.probe(
+            doc,
+            node_idx,
+            inline_style.is_some(),
+            parent_style_indices,
+            parent_custom_id,
+            &matched_rules,
+        ) {
+            StyleSharingProbe::Hit(shared) => {
+                *self.matched_rule_scratch = matched_rules;
+                *self.important_rule_scratch = important_rules;
+                self.timings.cascade += cascade_started.elapsed();
+                return ElementStyleResult::Shared(shared);
+            }
+            StyleSharingProbe::Miss(signature) => Some(signature),
+            StyleSharingProbe::Uncacheable => None,
+        };
         let mut style = get_inherited_style_dom(doc, self.styles, node_idx);
         let parent_font_size = style.font.font_size;
         let mut cascade_scratch = std::mem::take(self.cascade_scratch);
@@ -720,7 +758,7 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
                 .map(CustomMapResult::Reused)
                 .unwrap_or(CustomMapResult::Inherited),
         };
-        (style, custom_map)
+        ElementStyleResult::Computed { style, custom_map, sharing_signature }
     }
 }
 
