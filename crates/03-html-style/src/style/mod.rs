@@ -1,15 +1,18 @@
-pub mod box_syntax;
-pub mod capabilities;
-pub(crate) mod contain;
-pub mod declarations;
-pub mod imports;
-pub mod media;
-pub mod prepared;
-pub mod resolver;
-pub mod selectors;
-pub mod selectors_dom;
-pub mod tab_size;
-pub mod text_spacing;
-pub mod white_space;
+//! Internal CSS pipeline, ordered by the lifetime of style data.
+//!
+//! `source` normalizes stylesheet text, `syntax` validates declarations,
+//! `rules` prepares effective rules, `matching` finds DOM targets, and
+//! `cascade` produces renderer-owned computed styles.
 
-pub const DEFAULT_CSS: &str = include_str!("default.css");
+#[path = "05-cascade/mod.rs"]
+pub mod cascade;
+#[path = "04-matching/mod.rs"]
+pub mod matching;
+#[path = "03-rules/mod.rs"]
+pub mod rules;
+#[path = "01-source/mod.rs"]
+pub mod source;
+#[path = "02-syntax/mod.rs"]
+pub mod syntax;
+
+pub use source::DEFAULT_CSS;

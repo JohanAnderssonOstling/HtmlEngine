@@ -1,4 +1,4 @@
-use crate::style::prepared::{EffectiveRuleId, PreparedRuleSet};
+use crate::style::rules::prepared::{EffectiveRuleId, PreparedRuleSet};
 use lightningcss::properties::custom::{Token, TokenList, TokenOrValue};
 use lightningcss::selector::{Component, PseudoClass, PseudoElement, Selector, SelectorList};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};

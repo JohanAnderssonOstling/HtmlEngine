@@ -7,7 +7,7 @@
 //! `PreparedRuleSet` and its private `EffectiveRuleId` values.
 
 use super::media::{CompiledMediaList, MediaEnvironment, MediaQuerySet};
-use super::selectors::selector_list_is_web_valid;
+use crate::style::matching::selectors::selector_list_is_web_valid;
 use crate::{PropertyCapability, PropertySyntax, declaration_support, supports_selector_syntax_is_valid};
 use html_dom::{Document, DomNodeId};
 use lightningcss::rules::layer::LayerName;
@@ -438,7 +438,7 @@ impl<'sheet, 'css> PreparedRuleSet<'sheet, 'css> {
         let match_for_root = |root| {
             let mut proximity = 0u32;
             for candidate in std::iter::once(subject).chain(document.dom_ancestors(subject)) {
-                if descriptor.end.as_ref().is_some_and(|end| end.0.iter().any(|selector| crate::style::selectors_dom::selector_matches_dom_node_in_scope(selector, document, candidate, root))) {
+                if descriptor.end.as_ref().is_some_and(|end| end.0.iter().any(|selector| crate::style::matching::dom::selector_matches_dom_node_in_scope(selector, document, candidate, root))) {
                     return None;
                 }
                 if candidate == root {
@@ -452,7 +452,7 @@ impl<'sheet, 'css> PreparedRuleSet<'sheet, 'css> {
             std::iter::once(subject)
                 .chain(document.dom_ancestors(subject))
                 .take_while(|candidate| inside_parent(*candidate))
-                .filter(|candidate| start.0.iter().any(|selector| crate::style::selectors_dom::selector_matches_dom_node_in_scope(selector, document, *candidate, parent.root)))
+                .filter(|candidate| start.0.iter().any(|selector| crate::style::matching::dom::selector_matches_dom_node_in_scope(selector, document, *candidate, parent.root)))
                 .find_map(match_for_root)
         } else {
             let root = descriptor.implicit_root?;

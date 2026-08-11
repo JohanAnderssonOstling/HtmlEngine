@@ -1,4 +1,4 @@
-use crate::style::selectors::AncestorFilter;
+use super::selectors::AncestorFilter;
 use html_dom::{Document, DomNodeId};
 use lightningcss::selector::{Combinator, Component, Direction, PseudoClass, PseudoElement, Selector};
 use parcel_selectors::attr::{AttrSelectorOperator, CaseSensitivity, NamespaceConstraint, ParsedAttrSelectorOperation, ParsedCaseSensitivity};
@@ -374,7 +374,7 @@ mod tests {
     fn has_child_matches_only_elements_with_a_direct_matching_child() {
         let document = html_parse::parse_dom_document("<!doctype html><div id='match'><span></span></div><div id='miss'></div>").expect("valid standards HTML");
         let selector = SelectorList::parse_string_with_options(":has(> span)", ParserOptions::default()).expect("selector parses");
-        assert!(crate::style::selectors::selector_list_is_web_valid(&selector));
+        assert!(crate::style::matching::selectors::selector_list_is_web_valid(&selector));
         assert!(selector_might_match_with_filter(selector.0.first().expect("selector"), &AncestorFilter::default()));
         let matching_tags_and_ids = document
             .nodes()

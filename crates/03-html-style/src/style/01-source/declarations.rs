@@ -4,7 +4,8 @@
 //! declaration lists. Property modules own only their individual syntax and
 //! lowering rules.
 
-use super::{box_syntax, tab_size, text_spacing, white_space};
+use crate::style::syntax::box_syntax;
+use crate::style::syntax::values::{tab_size, text_spacing, white_space};
 
 pub(crate) fn normalize(input: &str) -> String {
     let mut output = String::with_capacity(input.len());

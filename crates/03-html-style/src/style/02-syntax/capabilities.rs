@@ -209,7 +209,7 @@ pub fn property_name_is_supported(name: &str) -> bool {
 pub(crate) fn declaration_capability(name: &str, value: &str) -> PropertyCapability {
     if name.eq_ignore_ascii_case("contain") {
         let css_wide = matches!(value.trim().to_ascii_lowercase().as_str(), "inherit" | "initial" | "unset" | "revert" | "revert-layer");
-        return if css_wide || crate::style::contain::parse(value).is_some_and(|contain| contain.fully_supported) {
+        return if css_wide || crate::style::syntax::contain::parse(value).is_some_and(|contain| contain.fully_supported) {
             PropertyCapability::Supported
         } else {
             PropertyCapability::Unsupported(UnsupportedStyleFeature::Value)

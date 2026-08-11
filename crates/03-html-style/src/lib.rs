@@ -32,8 +32,8 @@ pub(crate) mod parser {
 mod style;
 
 pub use style::DEFAULT_CSS;
-pub use style::capabilities::property_name_is_supported;
-pub use style::imports::{ImportLayer, StylesheetEntry, StylesheetImport, stylesheet_entries};
+pub use style::source::imports::{ImportLayer, StylesheetEntry, StylesheetImport, stylesheet_entries};
+pub use style::syntax::capabilities::property_name_is_supported;
 
 use html_dom::{Document, DomNodeId};
 use html_style_model::{Background, Border, BorderRadii, BoxModel, ComputedStyles, Font, InheritedText, StyleIndices, StyleView};
@@ -43,7 +43,7 @@ use lightningcss::stylesheet::{ParserOptions, StyleSheet};
 use lightningcss::traits::ParseWithOptions;
 use std::time::{Duration, Instant};
 
-pub use style::media::{MediaEnvironment, MediaMatchKey, MediaQuerySet, MediaType};
+pub use style::rules::media::{MediaEnvironment, MediaMatchKey, MediaQuerySet, MediaType};
 
 #[cfg(test)]
 mod allocation_test_support {
@@ -152,7 +152,7 @@ pub struct DeclarationSupport {
 pub fn declaration_support(property_name: &str, value: &str) -> DeclarationSupport {
     let normalized_name = property_name.to_ascii_lowercase();
     let syntax = declaration_syntax_impl(&normalized_name, value);
-    let capability = style::capabilities::declaration_capability(&normalized_name, value);
+    let capability = style::syntax::capabilities::declaration_capability(&normalized_name, value);
     DeclarationSupport { syntax, capability }
 }
 
@@ -163,7 +163,7 @@ pub fn declaration_syntax(property_name: &str, value: &str) -> PropertySyntax {
 pub fn property_value_syntax(property_name: &str, value: &str) -> PropertyValueSyntax {
     let normalized_name = property_name.to_ascii_lowercase();
     let property_id = PropertyId::from(normalized_name.as_str());
-    if matches!(property_id, PropertyId::Custom(_)) && !normalized_name.starts_with("--") && !style::capabilities::is_supported_property_name(&normalized_name) {
+    if matches!(property_id, PropertyId::Custom(_)) && !normalized_name.starts_with("--") && !style::syntax::capabilities::is_supported_property_name(&normalized_name) {
         return PropertyValueSyntax::UnsupportedProperty;
     }
     match declaration_syntax_impl(&normalized_name, value) {
@@ -178,12 +178,12 @@ fn declaration_syntax_impl(normalized_name: &str, value: &str) -> PropertySyntax
     // the surrounding grammar with finite stand-ins at this boundary.
     let finite_math_value = finite_css_math_surrogate(value);
     let value = finite_math_value.as_deref().unwrap_or(value);
-    if normalized_name == "white-space" && style::white_space::parse_shorthand(value).is_some() {
+    if normalized_name == "white-space" && style::syntax::values::white_space::parse_shorthand(value).is_some() {
         return PropertySyntax::Valid;
     }
     if matches!(normalized_name, "letter-spacing" | "word-spacing") {
         let normalized_value = value.trim().to_ascii_lowercase();
-        return if style::text_spacing::parse(value).is_some() || matches!(normalized_value.as_str(), "inherit" | "initial" | "unset" | "revert" | "revert-layer") || value.contains("var(") || value.contains("env(") {
+        return if style::syntax::values::text_spacing::parse(value).is_some() || matches!(normalized_value.as_str(), "inherit" | "initial" | "unset" | "revert" | "revert-layer") || value.contains("var(") || value.contains("env(") {
             PropertySyntax::Valid
         } else {
             PropertySyntax::Invalid
@@ -191,7 +191,7 @@ fn declaration_syntax_impl(normalized_name: &str, value: &str) -> PropertySyntax
     }
     if normalized_name == "tab-size" {
         let normalized_value = value.trim().to_ascii_lowercase();
-        return if style::tab_size::parse(value).is_some() || matches!(normalized_value.as_str(), "inherit" | "initial" | "unset" | "revert" | "revert-layer") || value.contains("var(") || value.contains("env(") {
+        return if style::syntax::values::tab_size::parse(value).is_some() || matches!(normalized_value.as_str(), "inherit" | "initial" | "unset" | "revert" | "revert-layer") || value.contains("var(") || value.contains("env(") {
             PropertySyntax::Valid
         } else {
             PropertySyntax::Invalid
@@ -199,7 +199,7 @@ fn declaration_syntax_impl(normalized_name: &str, value: &str) -> PropertySyntax
     }
     if normalized_name == "font-kerning" {
         let normalized_value = value.trim().to_ascii_lowercase();
-        return if style::resolver::parse_font_kerning(value).is_some() || matches!(normalized_value.as_str(), "inherit" | "initial" | "unset" | "revert" | "revert-layer") || value.contains("var(") || value.contains("env(") {
+        return if style::cascade::resolver::parse_font_kerning(value).is_some() || matches!(normalized_value.as_str(), "inherit" | "initial" | "unset" | "revert" | "revert-layer") || value.contains("var(") || value.contains("env(") {
             PropertySyntax::Valid
         } else {
             PropertySyntax::Invalid
@@ -207,7 +207,7 @@ fn declaration_syntax_impl(normalized_name: &str, value: &str) -> PropertySyntax
     }
     if normalized_name == "contain" {
         let normalized_value = value.trim().to_ascii_lowercase();
-        return if style::contain::parse(value).is_some()
+        return if style::syntax::contain::parse(value).is_some()
             || matches!(normalized_value.as_str(), "inherit" | "initial" | "unset" | "revert" | "revert-layer")
             || value.contains("var(")
             || value.contains("env(")
@@ -217,7 +217,7 @@ fn declaration_syntax_impl(normalized_name: &str, value: &str) -> PropertySyntax
             PropertySyntax::Invalid
         };
     }
-    if let Some(valid) = style::box_syntax::property_value_is_valid(normalized_name, value) {
+    if let Some(valid) = style::syntax::box_syntax::property_value_is_valid(normalized_name, value) {
         return if valid { PropertySyntax::Valid } else { PropertySyntax::Invalid };
     }
     // `grid-row-gap` and `grid-column-gap` are legacy aliases retained by
@@ -237,7 +237,7 @@ fn declaration_syntax_impl(normalized_name: &str, value: &str) -> PropertySyntax
         _ => normalized_name,
     };
     let property_id = PropertyId::from(parsed_name);
-    let unknown_property = matches!(property_id, PropertyId::Custom(_)) && !normalized_name.starts_with("--") && !style::capabilities::is_supported_property_name(normalized_name);
+    let unknown_property = matches!(property_id, PropertyId::Custom(_)) && !normalized_name.starts_with("--") && !style::syntax::capabilities::is_supported_property_name(normalized_name);
 
     match Property::parse_string(property_id, value, ParserOptions::default()) {
         // Lightning CSS deliberately preserves values it cannot validate as
@@ -288,11 +288,11 @@ fn css_identifier_boundary(bytes: &[u8], start: usize, end: usize) -> bool {
 /// Parse selector syntax without exposing Lightning CSS types across the
 /// style-stage boundary.
 pub fn selector_syntax_is_valid(selector: &str) -> bool {
-    SelectorList::parse_string_with_options(selector, ParserOptions::default()).is_ok_and(|selectors| style::selectors::selector_list_is_web_valid(&selectors))
+    SelectorList::parse_string_with_options(selector, ParserOptions::default()).is_ok_and(|selectors| style::matching::selectors::selector_list_is_web_valid(&selectors))
 }
 
 fn supports_selector_syntax_is_valid(selector: &str) -> bool {
-    SelectorList::parse_string_with_options(selector, ParserOptions::default()).is_ok_and(|selectors| style::selectors::selector_list_is_web_valid_for_supports(&selectors))
+    SelectorList::parse_string_with_options(selector, ParserOptions::default()).is_ok_and(|selectors| style::matching::selectors::selector_list_is_web_valid_for_supports(&selectors))
 }
 
 /// Parse a complete stylesheet/rule string without exposing the parser's AST.
@@ -411,7 +411,7 @@ pub fn style_document_with_author_stylesheets_and_environment_and_timings(docume
     // Lightning CSS stylesheets are invariant over their source lifetime, so
     // the UA source must live alongside normalized reader CSS.
     let default_css = DEFAULT_CSS.to_owned();
-    let normalized_chunks = inputs.iter().map(|input| style::declarations::normalize(input.css)).collect::<Vec<_>>();
+    let normalized_chunks = inputs.iter().map(|input| style::source::declarations::normalize(input.css)).collect::<Vec<_>>();
     let mut stylesheets = Vec::with_capacity(inputs.len());
     let mut author_roots = Vec::with_capacity(inputs.len());
     let started = Instant::now();
@@ -435,11 +435,11 @@ pub fn style_document_with_author_stylesheets_and_environment_and_timings(docume
     timings.parse_author_css = started.elapsed();
 
     let started = Instant::now();
-    let prepared = style::prepared::ParsedStylesheetSet::with_author_roots(&user_agent, &stylesheets, &author_roots).prepare(environment, f64::from(document.root_font_size()));
+    let prepared = style::rules::prepared::ParsedStylesheetSet::with_author_roots(&user_agent, &stylesheets, &author_roots).prepare(environment, f64::from(document.root_font_size()));
     timings.prepare_rules = started.elapsed();
 
     let started = Instant::now();
-    let (styles, resolution) = style::resolver::resolve_styles_for_dom_timed(&document, &prepared);
+    let (styles, resolution) = style::cascade::resolver::resolve_styles_for_dom_timed(&document, &prepared);
     let media_queries = prepared.media_queries().clone();
     timings.resolve_styles = started.elapsed();
     timings.selector_index = resolution.selector_index;
