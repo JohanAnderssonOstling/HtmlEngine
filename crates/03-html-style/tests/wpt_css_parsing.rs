@@ -33,10 +33,18 @@ fn runs_vendored_declarative_css_parsing_tests_directly() {
     let mut executed = 0usize;
     let mut known_mismatches = 0usize;
     let mut unsupported_dependency_mismatches = 0usize;
+    let mut non_utf8_files = Vec::new();
 
     for file in &files {
-        let source = fs::read_to_string(file).unwrap_or_else(|error| panic!("failed to read {}: {error}", file.display()));
         let relative = file.strip_prefix(&root).expect("file is under WPT CSS root").to_string_lossy().replace('\\', "/");
+        let bytes = fs::read(file).unwrap_or_else(|error| panic!("failed to read {}: {error}", file.display()));
+        let Ok(source) = String::from_utf8(bytes) else {
+            // WPT deliberately contains non-UTF-8 encoding fixtures. They do
+            // not contain declarative JavaScript parser assertions and cannot
+            // be interpreted as Rust UTF-8 strings.
+            non_utf8_files.push(relative);
+            continue;
+        };
         let mut script_prelude = String::new();
         for reference in relative_script_references(&source) {
             let script = file.parent().expect("WPT file has a parent").join(&reference);
@@ -160,8 +168,9 @@ fn runs_vendored_declarative_css_parsing_tests_directly() {
     }
 
     eprintln!(
-        "direct CSS WPT parsing: {} files, {extracted} literal calls, {executed} supported assertions, {} unsupported property/feature assertions, {unsupported_calls} dynamic/unimplemented calls, {unusable_literal_calls} unusable literal calls, {known_mismatches} known mismatches, {ignored_total} explicitly ignored, {} unexpected mismatches, {} unexpected passes",
+        "direct CSS WPT parsing: {} files, {} non-UTF-8 encoding fixtures, {extracted} literal calls, {executed} supported assertions, {} unsupported property/feature assertions, {unsupported_calls} dynamic/unimplemented calls, {unusable_literal_calls} unusable literal calls, {known_mismatches} known mismatches, {ignored_total} explicitly ignored, {} unexpected mismatches, {} unexpected passes",
         files.len(),
+        non_utf8_files.len(),
         unsupported_declarations + unsupported_dependency_mismatches,
         unexpected.len(),
         unexpected_passes.len()
@@ -172,7 +181,8 @@ fn runs_vendored_declarative_css_parsing_tests_directly() {
         }
     }
 
-    assert_eq!(files.len(), 22_977, "the pinned CSS corpus changed");
+    assert_eq!(files.len(), 35_417, "the pinned CSS corpus changed");
+    assert_eq!(non_utf8_files.len(), 4, "the pinned non-UTF-8 fixture set changed: {non_utf8_files:?}");
     assert!(extracted >= 31_000, "too few direct CSS WPT calls were extracted: {extracted}");
     assert!(unusable_literal_calls == 0, "literal calls with unusable signatures: {unusable_literal_calls}");
     assert!(unexpected.is_empty(), "unexpected CSS parsing mismatches:\n{}", unexpected.join("\n"));

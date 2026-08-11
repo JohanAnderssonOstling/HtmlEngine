@@ -41,3 +41,7 @@ css-break/parsing/widows-invalid.html|reason=pinned Lightning CSS accepts zero, 
 css-fonts/parsing/font-feature-settings-invalid.html|reason=pinned Lightning CSS alpha.72 accepts malformed font-feature-settings values; html-style consumes only its typed grammar and does not implement a second parser
 css-fonts/parsing/font-variant-ligatures-invalid.html|reason=pinned Lightning CSS alpha.72 accepts mutually contradictory or duplicated font-variant-ligatures values; html-style does not implement a second parser
 css-fonts/parsing/font-variant-numeric-invalid.html|reason=pinned Lightning CSS alpha.72 accepts mutually contradictory or duplicated font-variant-numeric values; html-style does not implement a second parser
+css-cascade/at-scope-parsing.html|reason=pinned Lightning CSS accepts invalid @scope preludes; html-style uses its typed scope representation and does not implement a second CSS parser
+css-properties-values-api/at-property-cssom.html|reason=registered custom properties and CSSPropertyRule are not implemented, and pinned Lightning CSS accepts incomplete @property rules
+css-values/getComputedStyle-calc-mixed-units-003.html|reason=pinned Lightning CSS does not represent the tested mixed-unit calc products and quotients reliably
+mediaqueries/at-custom-media-parsing.html|reason=custom media queries are not implemented, and pinned Lightning CSS accepts invalid @custom-media preludes

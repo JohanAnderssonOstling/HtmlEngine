@@ -7,3 +7,4 @@ selectors/parsing/parse-part.html|line=28|ordinal=0|kind=ValidSelector|reason=pa
 selectors/parsing/parse-state.html|line=17|ordinal=0|kind=ValidSelector|reason=parcel_selectors rejects valid :state after ::part
 selectors/parsing/parse-state.html|line=20|ordinal=0|kind=ValidSelector|reason=parcel_selectors rejects a valid ::part :state ::before chain
 selectors/parsing/parse-state.html|line=21|ordinal=0|kind=ValidSelector|reason=parcel_selectors rejects a valid ::part :state ::after chain
+cssom/selectorSerialize.html|line=127|ordinal=0|kind=ValidSelector|reason=the assertion requires an @namespace stylesheet prelude that the standalone selector adapter cannot represent
