@@ -1,0 +1,440 @@
+/* $Id: epub.css 288450 2019-06-25 11:05:08Z martin $ */ 
+
+/* Titelsida */
+
+#titelsida img {
+    max-width: 100%;
+}
+
+#kolofon .title-div h2 {
+	margin: 1em 0 2em 0;
+	font-size: 1.4em;
+	-webkit-hyphens: none;
+	hyphens: none;
+	text-align: left;
+}
+#kolofon .title-div {
+	margin-bottom: 2em;
+}
+#kolofon h3, #kolofon h2 {
+	font-weight: normal;
+}
+#kolofon .edition-title {
+	font-size: 1.2em;
+	margin: 0.5em 0;
+}
+#kolofon .editor .edition-title {
+	display: inline;
+	font-size: 1em;
+	margin: 0;
+}
+#kolofon .editor .editor-content {
+	display: inline;
+	margin-bottom: 0;
+}
+
+#kolofon .translator .edition-title {
+	display: inline;
+	font-size: 1em;
+	margin: 0;
+}
+#kolofon .translator .translator-content {
+	display: inline;
+}
+
+#kolofon .edition-content {
+	margin-right: 1em;
+	margin-left: 1em;
+	margin-bottom: 1.5em;
+}
+
+#kolofon .epub p {
+    /*font-style: italic;*/
+    margin-top: 0;
+}
+
+.edition-content-epub {
+	font-style: italic;
+}
+
+.created {
+	font-style: normal;
+}
+.klassiker {
+	font-size: 1.2em;
+}
+.english {
+	margin-top: 2em;
+	font-size: 1.2em;
+	hyphens: none;
+	-epub-hyphens: none;
+}
+
+/* Slut på titelsida */
+
+h1, h2, h3, h4, ._head {
+	-webkit-hyphens: none;
+	hyphens: none;
+	-epub-hyphens: none;
+	page-break-inside: avoid;
+}
+
+div.part, div.chapter {
+	page-break-before: always;
+}
+
+div.chaptername {
+	display: block;
+	width: 100%;
+	margin-top: 1em;
+	margin-bottom: 1em;
+	font-weight: bold;
+	
+}
+
+a#start + span.pagename {
+	left: 0em;
+}
+
+div.pagename > div[role = "cont"] {
+	display: inline;
+}
+
+.pagename {
+	color: #999999;
+}
+
+.pagename.blank {
+	display: block;
+	margin: 1em 0;
+	text-align: center;
+}
+
+.center {
+	text-align: center;
+}
+
+/* Nedan återfinns inlagda element från allmän etextvisning */
+
+div.indfirst {
+	text-indent: 1.2em;
+}
+
+div.imgdiv {
+	text-align: center;
+}
+
+
+.bildtext {
+	font-size: 0.9em;
+	text-align: center;
+}
+
+div.literal_separator { /* Behövs för att separator-entiteter inte ska ge radbrytning */
+	display: inline;
+}
+
+.center > .literal_separator {
+	display: block;
+	margin-top: 1.2em;
+	margin-bottom: 1.2em;
+}
+
+.chapterenumeration {
+	font-size: 1.2em;
+	margin-top: 1em;
+	margin-bottom: 1em;
+}
+
+.spaced {
+	letter-spacing: 0.1em;
+}
+
+div.decorInit	{
+	font-size: 1.6em; 
+}
+
+span.decorInit	{
+	font-size: 1.6em; 
+}
+
+div.sansserif	{
+	font-family: "Helvetica", sans-serif; 
+}
+
+span.sansserif	{
+	font-family: "Helvetica", sans-serif; 
+}
+
+.chaptername {
+	font-size: 1.4em;
+	margin-bottom: 2em;
+}
+
+.innehallssida > .chaptername {
+	position: static;
+}
+
+.innehallssida > .innehall {
+  width: 90%;
+}
+
+div.poem > div.poem {
+	margin-left: 0%;
+}
+
+.poemname {
+	margin-top: 2em;
+	font-size: 1.4em;
+}
+
+div.poem {
+	margin-left: 7%;
+	text-align: left;
+}
+
+div.poem div._lg {
+    left: 0em;
+}
+
+._lg {
+	margin-bottom: 1em;
+	margin-top: 3em;
+	margin-left: 5%;
+}
+
+._lg > ._lg {
+	margin-left: 0;
+}
+
+.big {
+	font-size: larger;
+}
+
+div.hang	{
+	padding-left: 1.2em;
+	text-indent: -1.2em;
+}
+
+span.hang	{
+	padding-left: 1.2em;
+	text-indent: -1.2em;
+}
+
+div.ind {
+	padding-left: 4%;
+}
+
+div.ind2 {
+	padding-left: 8%;
+}
+
+div.ind4 {
+	padding-left: 12%;
+}
+
+div.ind5 {
+	padding-left: 14%;
+}
+
+div.ind6 {
+	padding-left: 16%;
+}
+
+div.ind8 {
+	padding-left: 18%;
+}
+
+div.ind10 {
+    padding-left: 20%;
+}
+
+div.ind12 {
+    padding-left: 22%;
+}
+
+/* Ta bort .smallcaps */
+.ca, .smallcaps {
+	font-variant: small-caps;
+}
+
+.blank {
+	display: block;
+	text-align: center;
+	margin: 2em 0;
+}
+
+.small {
+	font-size: smaller;
+}
+
+.title-body {
+	font-family: georgia, serif;
+	font-size: 0.8em;
+}
+
+a {
+	color: #990000;
+	text-decoration: none;
+}
+
+a:hover {
+	color: #6D2525;
+}
+
+div.partenumeration {
+	font-size: 1.3em;
+	text-align: center;
+}
+
+div.partenumeration.big {
+	font-size: 2em;
+}
+
+div.partname {
+	font-size: 2em;
+	text-align: center;
+}
+
+.forord2 {
+	margin-top: 1em;
+	font-size: 1em;
+}
+
+._speaker {
+	margin-top: 1em;
+}
+
+._stage {
+	display: inline;
+}
+
+/*._head {
+	margin: 2em 0 1em 0;
+	font-size: 1.5em;
+}*/
+
+p.small.ind {
+	margin: 1em 5%;
+}
+
+span._ptr {
+	display: inline;
+	font-size: 0.62em;
+	font-weight: bold;
+	vertical-align: super;
+}
+
+div.note_contents {
+    display: inline;
+}
+      
+.notesheader {
+    font-size: 1.3em;
+    font-style: italic;
+    text-align: center;
+    margin-bottom: 1em;
+    margin-top: 2em;
+}
+
+
+.notes_parent {
+	/*border-collapse: separate;*/
+	/*border-spacing: 0.1em 1em;*/
+	/*display: table;*/
+}
+
+div._note {
+	margin-bottom: 1em;	
+}
+	/*margin-top: 0.4em;*/
+	/*margin-bottom: 0.4em;*/
+	/*display: table-row;*/
+/*}*/
+div._note > a {
+	display: none;
+}
+
+.notenumber {
+	/*display: table-cell;*/
+	display: inline-block;
+	text-align: right;
+    vertical-align: top;
+    max-width: 19%;
+}
+.notelink {
+    padding: 0.3em;
+    white-space: nowrap;
+    text-align: right;
+}
+
+/*._note_body:only-child::before {
+	content: "";
+	display: table-cell;
+}*/
+._note_body {
+	/*display: table-cell;*/
+	display: inline-block;
+	vertical-align: top;
+	font-size: 0.9em;
+	margin-left: 0.5em;
+	width: 80%;
+	/*vertical-align: text-top;*/
+	/*padding-bottom: 1em;*/
+
+}
+._notecont_body {
+	display: inline;
+}
+
+.rubrik {
+	margin-top: 3em;
+	margin-bottom: 2em;
+}
+
+div.h3 {
+	font-size: 1.2em;
+}
+
+div.sectionname {
+	font-size: 1.2em;
+}
+
+/* Fix för nationalupplaga 15, dikter på vers och prosa */
+big:after {
+	content: " ";
+}
+
+p.center > .ornament {
+	margin-top: 1em;	
+}
+
+.inline {
+  display: inline;
+}
+
+[content="❦"]::after {
+   content: "❦";
+}
+
+[content="❦"] img {
+	display: none;
+}
+
+/* Fix för samlade verk ii, karta sida 379 */
+td .lineNum._fw:first-child {
+    margin-right: 1em;
+}
+.lineNum._fw {
+    display: inline;
+}
+
+.upsidedown {
+	-webkit-transform:rotate(-180deg);
+	    -ms-transform:rotate(-180deg);
+	        transform:rotate(-180deg);
+}
+
+table.columns, table.columns tbody, table.columns tr, table.columns td {
+    display: block;
+}

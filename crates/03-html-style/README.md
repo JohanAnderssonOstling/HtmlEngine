@@ -45,3 +45,10 @@ unmodified checkout of that revision:
 ```sh
 HTML_WPT_ROOT=/absolute/path/to/wpt cargo test -p html-style --test wpt_css_cascade
 ```
+
+For a broader end-to-end workload, run the CSS-only EPUB corpus benchmark. Its
+arguments are measured iterations and the number of synthetic page copies:
+
+```sh
+cargo run -p html-style --release --example epub_css_benchmark -- 15 4
+```
