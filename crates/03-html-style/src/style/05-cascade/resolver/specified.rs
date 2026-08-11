@@ -105,6 +105,63 @@ pub(super) struct EventScratch<'sheet, 'css> {
     pub(super) events: Vec<DeclarationEvent<'sheet, 'css>>,
     normal_ranks: FxHashMap<EffectiveRuleId, usize>,
     layer_starts: Vec<usize>,
+    skipped_rules: Vec<bool>,
+    shadow_epochs: Vec<u32>,
+    shadow_epoch: u32,
+}
+
+fn mark_fully_shadowed_rules(prepared: &PreparedRuleSet<'_, '_>, rules: &[MatchedRule], important: bool, origin: Option<CascadeOrigin>, skipped_rules: &mut Vec<bool>, shadow_epochs: &mut Vec<u32>, shadow_epoch: &mut u32) {
+    skipped_rules.clear();
+    skipped_rules.resize(rules.len(), false);
+    let mut group_end = rules.len();
+    while group_end != 0 {
+        let priority = prepared.get(rules[group_end - 1].id).priority();
+        let mut group_start = group_end - 1;
+        while group_start != 0 && prepared.get(rules[group_start - 1].id).priority().same_origin_and_layer(priority) {
+            group_start -= 1;
+        }
+        if origin.is_some_and(|origin| priority.origin() != origin) {
+            group_end = group_start;
+            continue;
+        }
+        // Sparse mixed-property groups cost more to inspect than they can
+        // save. Only activate when safe whole-rule candidates are dense.
+        let candidate_count = rules[group_start..group_end].iter().filter(|matched| prepared.rule_shadow_declarations(matched.id, important).1).count();
+        if candidate_count < 2 || candidate_count * 2 < group_end - group_start {
+            group_end = group_start;
+            continue;
+        }
+        if shadow_epochs.len() < prepared.property_slot_count() {
+            shadow_epochs.resize(prepared.property_slot_count(), 0);
+        }
+        *shadow_epoch = shadow_epoch.wrapping_add(1);
+        if *shadow_epoch == 0 {
+            shadow_epochs.fill(0);
+            *shadow_epoch = 1;
+        }
+        for rule_index in (group_start..group_end).rev() {
+            let matched = &rules[rule_index];
+            let (declaration_mask, all_shadowable) = prepared.rule_shadow_declarations(matched.id, important);
+            let mut covered = all_shadowable;
+            let mut declarations = declaration_mask;
+            while covered && declarations != 0 {
+                let index = declarations.trailing_zeros() as usize;
+                declarations &= declarations - 1;
+                covered = prepared.declaration_targets(matched.id, important, index).iter().all(|target| shadow_epochs.get(target.slot as usize).copied() == Some(*shadow_epoch));
+            }
+            skipped_rules[rule_index] = covered;
+            let mut declarations = declaration_mask;
+            while declarations != 0 {
+                let index = declarations.trailing_zeros() as usize;
+                declarations &= declarations - 1;
+                for target in prepared.declaration_targets(matched.id, important, index) {
+                    let slot = target.slot as usize;
+                    shadow_epochs[slot] = *shadow_epoch;
+                }
+            }
+        }
+        group_end = group_start;
+    }
 }
 
 #[derive(Default)]
@@ -136,7 +193,11 @@ pub(super) fn build_cascade_events<'prepared, 'sheet, 'css>(prepared: &'prepared
         }
         layer_starts.push(layer_start);
     }
+    mark_fully_shadowed_rules(prepared, normal_rules, false, None, &mut scratch.skipped_rules, &mut scratch.shadow_epochs, &mut scratch.shadow_epoch);
     for (normal_rank, matched) in normal_rules.iter().enumerate() {
+        if scratch.skipped_rules[normal_rank] {
+            continue;
+        }
         let rule = prepared.get(matched.id);
         if hints_sequence.is_none() && rule.priority().origin() == CascadeOrigin::Author {
             hints_sequence = Some(events.len());
@@ -159,7 +220,11 @@ pub(super) fn build_cascade_events<'prepared, 'sheet, 'css>(prepared: &'prepared
             boundary: CascadeBoundary::Inline { important: false, normal_rank: normal_rules.len() },
         }));
     }
-    for matched in important_rules.iter().filter(|matched| prepared.get(matched.id).priority().origin() == CascadeOrigin::Author) {
+    mark_fully_shadowed_rules(prepared, important_rules, true, Some(CascadeOrigin::Author), &mut scratch.skipped_rules, &mut scratch.shadow_epochs, &mut scratch.shadow_epoch);
+    for (rule_index, matched) in important_rules.iter().enumerate().filter(|(_, matched)| prepared.get(matched.id).priority().origin() == CascadeOrigin::Author) {
+        if scratch.skipped_rules[rule_index] {
+            continue;
+        }
         let rule = prepared.get(matched.id);
         let normal_rank = normal_ranks.get(&matched.id).copied().unwrap_or(normal_rules.len());
         events.extend(rule.style_rule().declarations.important_declarations.iter().enumerate().map(|(index, property)| DeclarationEvent {
@@ -179,7 +244,11 @@ pub(super) fn build_cascade_events<'prepared, 'sheet, 'css>(prepared: &'prepared
             boundary: CascadeBoundary::Inline { important: true, normal_rank: normal_rules.len() },
         }));
     }
-    for matched in important_rules.iter().filter(|matched| prepared.get(matched.id).priority().origin() == CascadeOrigin::UserAgent) {
+    mark_fully_shadowed_rules(prepared, important_rules, true, Some(CascadeOrigin::UserAgent), &mut scratch.skipped_rules, &mut scratch.shadow_epochs, &mut scratch.shadow_epoch);
+    for (rule_index, matched) in important_rules.iter().enumerate().filter(|(_, matched)| prepared.get(matched.id).priority().origin() == CascadeOrigin::UserAgent) {
+        if scratch.skipped_rules[rule_index] {
+            continue;
+        }
         let rule = prepared.get(matched.id);
         let normal_rank = normal_ranks.get(&matched.id).copied().unwrap_or(normal_rules.len());
         events.extend(rule.style_rule().declarations.important_declarations.iter().enumerate().map(|(index, property)| DeclarationEvent {
@@ -434,5 +503,24 @@ mod tests {
 
         let (_, allocations) = count_allocations(|| select_specified_values(&events, &prepared, Some(&inline), &mut target_state, &mut selected));
         assert_eq!(allocations, 0);
+    }
+
+    #[test]
+    fn event_construction_skips_only_safely_shadowed_whole_rules() {
+        fn event_count(css: &str) -> usize {
+            let user_agent = StyleSheet::parse("", ParserOptions::default()).unwrap();
+            let author = StyleSheet::parse(css, ParserOptions::default()).unwrap();
+            let authors = [author];
+            let prepared = ParsedStylesheetSet::new(&user_agent, &authors).prepare(MediaEnvironment::default(), 16.0);
+            let rules = prepared.iter().map(|(id, _)| MatchedRule { specificity: 1, id, scope_proximity: u32::MAX }).collect::<Vec<_>>();
+            let mut scratch = EventScratch::default();
+            build_cascade_events(&prepared, &rules, &[], None, &mut scratch);
+            scratch.events.len()
+        }
+
+        assert_eq!(event_count("p { color: red } p { color: blue }"), 1);
+        assert_eq!(event_count("@layer a { p { color: red } } @layer b { p { color: blue } }"), 2);
+        assert_eq!(event_count("p { width: 10px } p { width: -1px }"), 2);
+        assert_eq!(event_count("p { color: red; --keep: yes } p { color: blue }"), 3);
     }
 }

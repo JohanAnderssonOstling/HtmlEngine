@@ -203,6 +203,31 @@ struct PreparedTargetRange {
     len_and_flags: u32,
 }
 
+#[derive(Clone, Copy)]
+struct PreparedRuleDeclarations {
+    normal_start: u32,
+    important_start: u32,
+    normal_shadow_mask: u64,
+    important_shadow_mask: u64,
+}
+
+const ALL_DECLARATIONS_SHADOWABLE: u64 = 1 << 63;
+
+fn shadow_mask(declarations: &[Property<'_>]) -> u64 {
+    // One flag plus 63 declaration bits keeps the hot rule metadata inline.
+    // Larger rules simply retain the normal event path.
+    let mut mask = 0;
+    let mut all_shadowable = declarations.len() < 63;
+    for (index, property) in declarations.iter().enumerate() {
+        let shadowable = property_is_always_computable(property);
+        all_shadowable &= shadowable;
+        if shadowable && index < 63 {
+            mask |= 1 << index;
+        }
+    }
+    mask | if all_shadowable { ALL_DECLARATIONS_SHADOWABLE } else { 0 }
+}
+
 impl PreparedTargetRange {
     const ALWAYS_COMPUTABLE: u32 = 1 << 31;
 
@@ -360,7 +385,12 @@ impl<'sheet, 'css> ParsedStylesheetSet<'sheet, 'css> {
                 let len = u32::try_from(property_targets.len() - start as usize).expect("one declaration's property targets fit in u32");
                 declaration_target_ranges.push(PreparedTargetRange::new(start, len, property_is_always_computable(property)));
             }
-            rule_target_starts.push((normal_start, important_start));
+            rule_target_starts.push(PreparedRuleDeclarations {
+                normal_start,
+                important_start,
+                normal_shadow_mask: shadow_mask(&rule.style_rule.declarations.declarations),
+                important_shadow_mask: shadow_mask(&rule.style_rule.declarations.important_declarations),
+            });
         }
 
         PreparedRuleSet {
@@ -541,7 +571,7 @@ pub(crate) struct PreparedRuleSet<'sheet, 'css> {
     rules: Vec<EffectiveRule<'sheet, 'css>>,
     rule_pseudo_masks: Vec<u8>,
     scopes: Vec<ScopeDescriptor<'sheet, 'css>>,
-    rule_target_starts: Vec<(u32, u32)>,
+    rule_target_starts: Vec<PreparedRuleDeclarations>,
     declaration_target_ranges: Vec<PreparedTargetRange>,
     property_targets: Vec<PreparedPropertyTarget>,
     property_slots: FxHashMap<Rc<str>, u32>,
@@ -578,19 +608,29 @@ impl<'sheet, 'css> PreparedRuleSet<'sheet, 'css> {
 
     pub(crate) fn declaration_targets(&self, id: EffectiveRuleId, important: bool, index: usize) -> &[PreparedPropertyTarget] {
         let starts = self.rule_target_starts[id.0 as usize];
-        let ranges_start = if important { starts.1 } else { starts.0 } as usize;
+        let ranges_start = if important { starts.important_start } else { starts.normal_start } as usize;
         let range = self.declaration_target_ranges[ranges_start + index];
         &self.property_targets[range.start as usize..range.start as usize + range.len()]
     }
 
     pub(crate) fn declaration_is_always_computable(&self, id: EffectiveRuleId, important: bool, index: usize) -> bool {
         let starts = self.rule_target_starts[id.0 as usize];
-        let ranges_start = if important { starts.1 } else { starts.0 } as usize;
+        let ranges_start = if important { starts.important_start } else { starts.normal_start } as usize;
         self.declaration_target_ranges[ranges_start + index].is_always_computable()
+    }
+
+    pub(crate) fn rule_shadow_declarations(&self, id: EffectiveRuleId, important: bool) -> (u64, bool) {
+        let starts = self.rule_target_starts[id.0 as usize];
+        let mask = if important { starts.important_shadow_mask } else { starts.normal_shadow_mask };
+        (mask & !ALL_DECLARATIONS_SHADOWABLE, mask & ALL_DECLARATIONS_SHADOWABLE != 0)
     }
 
     pub(crate) fn clone_property_slots(&self) -> FxHashMap<Rc<str>, u32> {
         self.property_slots.clone()
+    }
+
+    pub(crate) fn property_slot_count(&self) -> usize {
+        self.property_slots.len()
     }
 
     pub(crate) fn scope_match(&self, scope: ScopeId, document: &Document, subject: DomNodeId) -> Option<ScopeMatch> {
