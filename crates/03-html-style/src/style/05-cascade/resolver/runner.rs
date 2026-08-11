@@ -2,7 +2,7 @@
 
 use super::*;
 use specified::{
-    PropertyTarget, SelectedDeclaration, SpecifiedSelection, build_cascade_events,
+    DeclarationEvent, PropertyTarget, SelectedDeclaration, SpecifiedSelection,
     declaration_is_custom_property, select_specified_values,
 };
 
@@ -13,13 +13,12 @@ pub(super) enum CascadePhase {
     Remaining,
 }
 
-pub(super) struct CascadeInputs<'a, 'css> {
-    pub(super) normal_rules: &'a [MatchedRule],
-    pub(super) important_rules: &'a [MatchedRule],
+pub(super) struct CascadeInputs<'a, 'event, 'css> {
+    pub(super) events: &'a [DeclarationEvent<'event, 'css>],
+    pub(super) hints_sequence: usize,
     pub(super) parent_font_size: f32,
     pub(super) custom_properties: &'a FxHashMap<String, TokenList<'css>>,
     pub(super) parent: &'a ParentStyle,
-    pub(super) inline_style: Option<&'a StyleAttribute<'css>>,
     pub(super) presentational_hints_node: Option<DomNodeId>,
 }
 
@@ -305,23 +304,19 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
     pub(super) fn apply_cascade(
         &mut self,
         style: &mut WorkingStyle,
-        inputs: CascadeInputs<'_, 'css>,
+        inputs: CascadeInputs<'_, '_, 'css>,
     ) {
         let CascadeInputs {
-            normal_rules,
-            important_rules,
+            events,
+            hints_sequence,
             parent_font_size,
             custom_properties,
             parent,
-            inline_style,
             presentational_hints_node,
         } = inputs;
-        let (events, hints_sequence) =
-            build_cascade_events(self.prepared, normal_rules, important_rules, inline_style);
-
         let mut valid_events = Vec::with_capacity(events.len());
         let mut valid_hints_sequence = 0;
-        for (sequence, event) in events.into_iter().enumerate() {
+        for (sequence, event) in events.iter().copied().enumerate() {
             if self.declaration_is_eligible(event.property) {
                 if sequence < hints_sequence {
                     valid_hints_sequence += 1;

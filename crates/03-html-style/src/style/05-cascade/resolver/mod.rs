@@ -395,23 +395,18 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
         // override this initial value.
         style.box_model.display = Display::Inline;
         let parent_font_size = style.font.font_size;
-        let custom_properties = cascade_custom_properties(
-            prepared,
-            &matched_rules,
-            &important_rules,
-            None,
-            inherited_custom_properties,
-        );
+        let (events, hints_sequence) =
+            specified::build_cascade_events(prepared, &matched_rules, &important_rules, None);
+        let custom_properties = cascade_custom_properties(&events, inherited_custom_properties);
 
         self.apply_cascade(
             &mut style,
             CascadeInputs {
-                normal_rules: &matched_rules,
-                important_rules: &important_rules,
+                events: &events,
+                hints_sequence,
                 parent_font_size,
                 custom_properties: &custom_properties,
                 parent: &inherited,
-                inline_style: None,
                 presentational_hints_node: None,
             },
         );
@@ -490,24 +485,23 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
         let parent_font_size = style.font.font_size;
         let parent_custom = parent_custom.unwrap_or_default();
         let inline_style = parse_inline_style_attribute(doc, node_idx);
-        let mut custom_properties = cascade_custom_properties(
+        let (events, hints_sequence) = specified::build_cascade_events(
             prepared,
             &matched_rules,
             &important_rules,
             inline_style.as_ref(),
-            &parent_custom,
         );
+        let mut custom_properties = cascade_custom_properties(&events, &parent_custom);
 
         let parent_style = ParentStyle::for_node(doc, self.styles, node_idx);
         self.apply_cascade(
             &mut style,
             CascadeInputs {
-                normal_rules: &matched_rules,
-                important_rules: &important_rules,
+                events: &events,
+                hints_sequence,
                 parent_font_size,
                 custom_properties: &custom_properties,
                 parent: &parent_style,
-                inline_style: inline_style.as_ref(),
                 presentational_hints_node: Some(node_idx),
             },
         );

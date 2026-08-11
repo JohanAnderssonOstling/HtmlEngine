@@ -1,7 +1,7 @@
 //! Custom-property collection, cycle detection, inheritance, and substitution.
 
 use super::*;
-use specified::{CascadeBoundary, build_cascade_events};
+use specified::{CascadeBoundary, DeclarationEvent};
 
 fn custom_declaration<'property, 'css>(
     property: &'property Property<'css>,
@@ -20,14 +20,10 @@ fn custom_declaration<'property, 'css>(
 /// Cascade custom properties as specified token values. Rollback discards
 /// candidates by origin/layer rather than cloning the whole map at every
 /// boundary.
-pub(super) fn cascade_custom_properties<'sheet, 'css>(
-    prepared: &PreparedRuleSet<'sheet, 'css>,
-    normal_rules: &[MatchedRule],
-    important_rules: &[MatchedRule],
-    inline_style: Option<&StyleAttribute<'css>>,
+pub(super) fn cascade_custom_properties<'css>(
+    events: &[DeclarationEvent<'_, 'css>],
     parent: &FxHashMap<String, TokenList<'css>>,
 ) -> FxHashMap<String, TokenList<'css>> {
-    let (events, _) = build_cascade_events(prepared, normal_rules, important_rules, inline_style);
     let mut values = parent.clone();
     let mut decided = HashSet::new();
     let mut rollbacks = FxHashMap::<String, Vec<(CascadeBoundary, bool)>>::default();

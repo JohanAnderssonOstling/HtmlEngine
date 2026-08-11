@@ -61,6 +61,7 @@ impl CascadeBoundary {
     }
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct DeclarationEvent<'event, 'css> {
     pub(super) property: &'event Property<'css>,
     pub(super) boundary: CascadeBoundary,
