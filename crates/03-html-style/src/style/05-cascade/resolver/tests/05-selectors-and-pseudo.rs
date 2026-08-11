@@ -298,6 +298,20 @@ fn resolves_before_and_after_content_into_typed_pseudo_styles() {
 }
 
 #[test]
+fn unsupported_generated_content_does_not_displace_a_renderable_declaration() {
+    use html_style_model::{GeneratedContentItem, StyleStringId};
+
+    let html = "<html><body><div></div></body></html>";
+    let mut factory = DocumentFactory::new();
+    let document = factory.parse_with_new_pipeline(html, Some("div::before{content:'fallback';content:url('marker.svg')}"));
+    let div = find_body(document.document()).children().next().expect("div should be a child of body");
+    let (_, before, _) = document.styles.before_style_for_node(div).expect("supported fallback should generate the pseudo");
+    let string = |id: StyleStringId| document.styles.string(id).expect("generated string should belong to style result");
+
+    assert!(matches!(before.items.as_slice(), [GeneratedContentItem::Text(text)] if string(*text) == "fallback"));
+}
+
+#[test]
 fn pseudo_display_inherit_copies_the_originating_elements_display() {
     let html = "<html><body><div></div></body></html>";
     let mut factory = DocumentFactory::new();

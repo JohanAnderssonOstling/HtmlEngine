@@ -118,7 +118,13 @@ fn runs_vendored_declarative_css_parsing_tests_directly() {
                         continue;
                     };
                     let Ok(syntax) = catch_unwind(AssertUnwindSafe(|| {
-                        if matches!(declaration_support(property, value).capability, PropertyCapability::Unsupported(UnsupportedStyleFeature::Gradient)) {
+                        if matches!(
+                            declaration_support(property, value).capability,
+                            PropertyCapability::Unsupported(
+                                UnsupportedStyleFeature::Gradient
+                                    | UnsupportedStyleFeature::GeneratedContent
+                            )
+                        ) {
                             return None;
                         }
                         Some(property_value_syntax(property, value))

@@ -133,6 +133,7 @@ pub enum UnsupportedStyleFeature {
     Property,
     Value,
     Gradient,
+    GeneratedContent,
     BackgroundImage,
     BorderImage,
     BoxShadow,
@@ -212,6 +213,24 @@ fn declaration_syntax_impl(normalized_name: &str, value: &str) -> PropertySyntax
             || value.contains("var(")
             || value.contains("env(")
         {
+            PropertySyntax::Valid
+        } else {
+            PropertySyntax::Invalid
+        };
+    }
+    if matches!(
+        normalized_name,
+        "content" | "counter-reset" | "counter-increment" | "quotes"
+    ) {
+        let support = match normalized_name {
+            "content" => style::syntax::generated_content::content(value),
+            "counter-reset" | "counter-increment" => {
+                style::syntax::generated_content::counter_directive(normalized_name, value)
+            }
+            "quotes" => style::syntax::generated_content::quotes(value),
+            _ => unreachable!(),
+        };
+        return if support.is_valid() || value.contains("var(") || value.contains("env(") {
             PropertySyntax::Valid
         } else {
             PropertySyntax::Invalid
@@ -496,6 +515,19 @@ mod boundary_tests {
         assert_eq!(declaration_support("background", "linear-gradient(red, blue)"), DeclarationSupport { syntax: PropertySyntax::Valid, capability: PropertyCapability::Unsupported(UnsupportedStyleFeature::Gradient) });
         assert_eq!(declaration_support("background", "red"), DeclarationSupport { syntax: PropertySyntax::Valid, capability: PropertyCapability::Supported });
         assert_eq!(declaration_support("background", "url('paper.png') blue"), DeclarationSupport { syntax: PropertySyntax::Valid, capability: PropertyCapability::Unsupported(UnsupportedStyleFeature::BackgroundImage) });
+    }
+
+    #[test]
+    fn generated_content_support_is_value_aware() {
+        assert_eq!(declaration_support("content", "'Chapter ' attr(title) counter(chapter, upper-roman)"), DeclarationSupport { syntax: PropertySyntax::Valid, capability: PropertyCapability::Supported });
+        assert_eq!(declaration_support("counter-reset", "chapter 1 section"), DeclarationSupport { syntax: PropertySyntax::Valid, capability: PropertyCapability::Supported });
+        assert_eq!(declaration_support("counter-increment", "chapter -1"), DeclarationSupport { syntax: PropertySyntax::Valid, capability: PropertyCapability::Supported });
+        assert_eq!(declaration_support("quotes", "'«' '»' '‹' '›'"), DeclarationSupport { syntax: PropertySyntax::Valid, capability: PropertyCapability::Supported });
+        assert_eq!(declaration_support("content", "url('marker.svg')"), DeclarationSupport { syntax: PropertySyntax::Valid, capability: PropertyCapability::Unsupported(UnsupportedStyleFeature::GeneratedContent) });
+        assert_eq!(declaration_support("content", "'label' / counter(chapter)"), DeclarationSupport { syntax: PropertySyntax::Valid, capability: PropertyCapability::Unsupported(UnsupportedStyleFeature::GeneratedContent) });
+        assert_eq!(declaration_support("content", "attr(title string)"), DeclarationSupport { syntax: PropertySyntax::Valid, capability: PropertyCapability::Unsupported(UnsupportedStyleFeature::GeneratedContent) });
+        assert_eq!(declaration_support("counter-reset", "reversed(chapter)"), DeclarationSupport { syntax: PropertySyntax::Valid, capability: PropertyCapability::Unsupported(UnsupportedStyleFeature::GeneratedContent) });
+        assert_eq!(declaration_support("content", "counter()"), DeclarationSupport { syntax: PropertySyntax::Invalid, capability: PropertyCapability::Supported });
     }
 
     #[test]

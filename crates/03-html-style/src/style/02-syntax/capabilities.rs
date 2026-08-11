@@ -198,6 +198,10 @@ pub(crate) fn is_supported_property_name(name: &str) -> bool {
             | "grid-row"
             | "grid-column"
             | "grid-area"
+            | "content"
+            | "counter-reset"
+            | "counter-increment"
+            | "quotes"
     )
 }
 
@@ -207,6 +211,26 @@ pub fn property_name_is_supported(name: &str) -> bool {
 }
 
 pub(crate) fn declaration_capability(name: &str, value: &str) -> PropertyCapability {
+    if name.eq_ignore_ascii_case("content") {
+        return match super::generated_content::content(value) {
+            super::generated_content::ValueSupport::Unsupported => {
+                PropertyCapability::Unsupported(UnsupportedStyleFeature::GeneratedContent)
+            }
+            super::generated_content::ValueSupport::Supported
+            | super::generated_content::ValueSupport::Invalid => PropertyCapability::Supported,
+        };
+    }
+    if name.eq_ignore_ascii_case("counter-reset")
+        || name.eq_ignore_ascii_case("counter-increment")
+    {
+        return match super::generated_content::counter_directive(name, value) {
+            super::generated_content::ValueSupport::Unsupported => {
+                PropertyCapability::Unsupported(UnsupportedStyleFeature::GeneratedContent)
+            }
+            super::generated_content::ValueSupport::Supported
+            | super::generated_content::ValueSupport::Invalid => PropertyCapability::Supported,
+        };
+    }
     if name.eq_ignore_ascii_case("contain") {
         let css_wide = matches!(value.trim().to_ascii_lowercase().as_str(), "inherit" | "initial" | "unset" | "revert" | "revert-layer");
         return if css_wide || crate::style::syntax::contain::parse(value).is_some_and(|contain| contain.fully_supported) {

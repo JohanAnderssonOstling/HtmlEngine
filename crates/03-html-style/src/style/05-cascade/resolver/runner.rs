@@ -115,6 +115,7 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
                     support.capability,
                     crate::PropertyCapability::Unsupported(
                         crate::UnsupportedStyleFeature::Gradient
+                            | crate::UnsupportedStyleFeature::GeneratedContent
                     )
                 )
             {
