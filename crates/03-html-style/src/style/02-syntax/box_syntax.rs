@@ -2,7 +2,7 @@ use lightningcss::properties::size::{MaxSize, Size};
 use lightningcss::properties::{Property, PropertyId};
 use lightningcss::stylesheet::ParserOptions;
 use lightningcss::traits::{Parse, TrySign};
-use lightningcss::values::length::{LengthPercentage, LengthPercentageOrAuto};
+use lightningcss::values::length::{Length, LengthPercentage, LengthPercentageOrAuto};
 
 /// Strict web-syntax validation for box properties where Lightning CSS either
 /// treats an unknown property as a custom declaration (`float`/`clear`) or
@@ -24,6 +24,7 @@ pub fn property_value_is_valid(property_name: &str, value: &str) -> Option<bool>
             let top_level_components = top_level_component_count(value);
             return Some(top_level_components != 3 && lightningcss::values::position::Position::parse_string(value).is_ok());
         }
+        "outline-offset" => return Some(lower == "inset" || Length::parse_string(value).is_ok()),
         "flex-basis" if matches!(lower.as_str(), "content" | "fit-content" | "min-content" | "max-content") => return Some(true),
         _ if !targeted_property(&name) => return None,
         _ => {}
@@ -89,6 +90,7 @@ fn targeted_property(name: &str) -> bool {
             | "aspect-ratio"
             | "object-fit"
             | "object-position"
+            | "outline-offset"
             | "min-width"
             | "min-height"
             | "max-width"
@@ -175,6 +177,9 @@ mod tests {
         assert_eq!(property_value_is_valid("object-fit", "contain cover"), Some(false));
         assert_eq!(property_value_is_valid("object-position", "right 10px bottom 20%"), Some(true));
         assert_eq!(property_value_is_valid("object-position", "left right"), Some(false));
+        assert_eq!(property_value_is_valid("outline-offset", "-2px"), Some(true));
+        assert_eq!(property_value_is_valid("outline-offset", "inset"), Some(true));
+        assert_eq!(property_value_is_valid("outline-offset", "20%"), Some(false));
         assert_eq!(property_value_is_valid("color", "red"), None);
     }
 }

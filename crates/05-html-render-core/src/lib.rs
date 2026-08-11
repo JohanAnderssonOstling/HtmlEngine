@@ -388,6 +388,9 @@ pub fn paint_line_glyphs(document: &LaidOutDocument, line_idx: usize, origin: Po
     let mut advance_index = 0usize;
     let mut current_advance = advances.as_ref().and_then(|runs| runs.get(0));
     for fragment in text.line_text_fragments(line_idx).into_iter().flatten() {
+        if !fragment.visible() {
+            continue;
+        }
         let mut current_x = origin.x + line.optical_offset_x() + fragment.offset_x();
         for index in fragment.glyphs() {
             let glyph = text.glyph_at(index as usize).unwrap_or_default();
@@ -424,6 +427,9 @@ pub fn paint_line_glyphs(document: &LaidOutDocument, line_idx: usize, origin: Po
 /// Paints one sparse text fragment from a line that requires source-ordered
 /// interleaving with inline decorations or replaced content.
 pub fn paint_line_glyph_fragment(document: &LaidOutDocument, line_idx: usize, fragment: &html_layout::RenderLineTextFragment, origin: Point, scale: f64, color: Option<u32>, painter: &mut impl Painter) {
+    if !fragment.visible() {
+        return;
+    }
     let text = document.render_view().text();
     let Some(line) = text.line(line_idx) else { return };
     let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
@@ -482,6 +488,9 @@ pub fn paint_line_text_runs(document: &LaidOutDocument, line_idx: usize, origin:
     let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
     let snap = |value: f64| (value * scale).round() / scale;
     for fragment in fragments {
+        if !fragment.visible() {
+            continue;
+        }
         let mut x = origin.x + line.optical_offset_x() + fragment.offset_x();
         for run in text.authoritative_runs(fragment.glyphs()) {
             // Preserve the fractional line and inline offsets: independently
@@ -509,6 +518,7 @@ pub fn paint_line_ellipsis(document: &LaidOutDocument, line_idx: usize, origin: 
     let snap = |value: f64| (value * scale).round() / scale;
     let baseline_y = origin.y + line.baseline();
     if let Some(ellipsis) = text.ellipsis_for_line(line_idx)
+        && ellipsis.visible()
         && let Some(metric) = text.glyph_metric(ellipsis.glyph())
     {
         let offset = ellipsis.offset();
@@ -519,6 +529,7 @@ pub fn paint_line_ellipsis(document: &LaidOutDocument, line_idx: usize, origin: 
         }
     }
     if let Some(hyphen) = text.hyphen_for_line(line_idx)
+        && hyphen.visible()
         && let Some(metric) = text.glyph_metric(hyphen.glyph())
     {
         let offset = hyphen.offset();
@@ -937,6 +948,49 @@ mod tests {
             .expect("fixture emits a glyph");
 
         assert!((origin.x.fract() - 0.5).abs() < 0.01, "fractional inline origin was lost: {}", origin.x);
+    }
+
+    #[test]
+    fn visibility_hides_paint_but_allows_visible_descendants_and_preserves_advance() {
+        let mut renderer = FragmentRenderer::new();
+        let mut shaper = TestShaper::default();
+        let options = FragmentRenderOptions::new(240.0, None).unwrap();
+        let rendered = renderer
+            .render("<p style='visibility:hidden;margin:0'>hidden <span style='visibility:visible;background:#123456'>shown</span> hidden</p><p style='margin:0'>after</p>", &options, &mut shaper)
+            .unwrap();
+        let text = rendered.document().render_view().text();
+        let painted = rendered
+            .scene()
+            .commands()
+            .iter()
+            .filter_map(|command| match command {
+                RenderCommand::Glyph { glyph, .. } => text.glyph_metric(*glyph).map(|metric| metric.ch()),
+                _ => None,
+            })
+            .collect::<String>();
+
+        assert_eq!(painted, "shownafter");
+        assert!(rendered.scene().commands().iter().any(|command| matches!(command, RenderCommand::Fill { color, .. } if color.r == 0x12 && color.g == 0x34 && color.b == 0x56)));
+        let shown_x = rendered.scene().commands().iter().find_map(|command| match command {
+            RenderCommand::Glyph { glyph, origin, .. } if text.glyph_metric(*glyph).is_some_and(|metric| metric.ch() == 's') => Some(origin.x),
+            _ => None,
+        }).expect("visible descendant glyph");
+        assert!(shown_x > 40.0, "hidden prefix must still consume inline width: {shown_x}");
+    }
+
+    #[test]
+    fn hidden_replaced_image_keeps_its_inline_advance_without_painting() {
+        let mut renderer = FragmentRenderer::new();
+        let mut shaper = TestShaper::default();
+        let options = FragmentRenderOptions::new(240.0, None).unwrap().with_image_policy(FragmentImagePolicy::Reference);
+        let rendered = renderer.render("<p style='margin:0'>a<img src='cover.png' style='visibility:hidden;width:20px;height:10px'>b</p>", &options, &mut shaper).unwrap();
+        assert!(!rendered.scene().commands().iter().any(|command| matches!(command, RenderCommand::ResourceImage { .. })));
+        let text = rendered.document().render_view().text();
+        let positions = rendered.scene().commands().iter().filter_map(|command| match command {
+            RenderCommand::Glyph { glyph, origin, .. } => Some((text.glyph_metric(*glyph)?.ch(), origin.x)),
+            _ => None,
+        }).collect::<HashMap<_, _>>();
+        assert!(positions[&'b'] - positions[&'a'] >= 28.0, "the hidden image must retain its 20px inline advance");
     }
 
     #[test]

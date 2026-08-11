@@ -55,6 +55,8 @@ pub(crate) fn is_supported_property_name(name: &str) -> bool {
             | "aspect-ratio"
             | "object-fit"
             | "object-position"
+            | "visibility"
+            | "outline-offset"
             | "min-width"
             | "min-height"
             | "max-width"
@@ -296,6 +298,12 @@ pub(crate) fn declaration_capability(name: &str, value: &str) -> PropertyCapabil
         if parsed.as_ref().is_some_and(|property| {
             !matches!(property, Property::Position(lightningcss::properties::position::Position::Static | lightningcss::properties::position::Position::Relative | lightningcss::properties::position::Position::Absolute))
         }) {
+            return PropertyCapability::Unsupported(UnsupportedStyleFeature::Value);
+        }
+    }
+    if name.eq_ignore_ascii_case("visibility") {
+        let parsed = Property::parse_string(PropertyId::from(name), value, ParserOptions::default()).ok();
+        if matches!(parsed, Some(Property::Visibility(lightningcss::properties::display::Visibility::Collapse))) {
             return PropertyCapability::Unsupported(UnsupportedStyleFeature::Value);
         }
     }
@@ -573,7 +581,9 @@ mod tests {
         assert_eq!(declaration_capability("text-decoration-line", "blink"), PropertyCapability::Unsupported(UnsupportedStyleFeature::Value));
         assert_eq!(declaration_capability("outline", "2px dotted red"), PropertyCapability::Supported);
         assert_eq!(declaration_capability("outline", "2px double red"), PropertyCapability::Unsupported(UnsupportedStyleFeature::Value));
-        assert_eq!(declaration_capability("outline-offset", "2px"), PropertyCapability::Unsupported(UnsupportedStyleFeature::Property));
+        assert_eq!(declaration_capability("outline-offset", "2px"), PropertyCapability::Supported);
+        assert_eq!(declaration_capability("visibility", "hidden"), PropertyCapability::Supported);
+        assert_eq!(declaration_capability("visibility", "collapse"), PropertyCapability::Unsupported(UnsupportedStyleFeature::Value));
     }
 
     #[test]

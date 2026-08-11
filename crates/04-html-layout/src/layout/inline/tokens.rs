@@ -151,6 +151,7 @@ pub(super) struct InlineTokenMetrics {
     pub(super) font_size: f32,
     pub(super) vertical_align: VerticalAlignValue,
     pub(super) white_space: WhiteSpace,
+    pub(super) visible: bool,
     pub(super) placement_required: bool,
 }
 

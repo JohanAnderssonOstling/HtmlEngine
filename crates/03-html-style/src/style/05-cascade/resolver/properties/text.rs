@@ -170,6 +170,14 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             };
             style.background.text_decoration.thickness = thickness;
         }
+        Property::Visibility(value) => {
+            use lightningcss::properties::display::Visibility as CssVisibility;
+            style.text.visibility = match value {
+                CssVisibility::Visible => Visibility::Visible,
+                CssVisibility::Hidden => Visibility::Hidden,
+                CssVisibility::Collapse => return ApplyResult::Invalid,
+            };
+        }
         Property::Outline(outline) => {
             let Some(outline_style) = outline_style(&outline.style) else {
                 return ApplyResult::Invalid;

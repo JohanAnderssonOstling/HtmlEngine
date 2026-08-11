@@ -27,6 +27,7 @@ fn is_inherited_property(name: &str) -> bool {
             | "text-transform"
             | "text-box-edge"
             | "white-space"
+            | "visibility"
             | "word-break"
             | "overflow-wrap"
             | "word-wrap"
@@ -197,6 +198,7 @@ fn apply_css_wide_keyword_with_rollback(
 
     match name {
         "color" => style.text.color = src.text.color,
+        "visibility" => style.text.visibility = src.text.visibility,
         "direction" => style.text.direction = src.text.direction,
         "font" => {
             style.font = src.font.clone();
@@ -447,6 +449,13 @@ fn apply_css_wide_keyword_with_rollback(
         "aspect-ratio" => style.box_model.aspect_ratio = src.box_model.aspect_ratio,
         "object-fit" => style.box_model.object_fit = src.box_model.object_fit,
         "object-position" => style.box_model.object_position = src.box_model.object_position,
+        "outline-offset" => {
+            if src.background.outline.offset_is_inset() {
+                style.background.outline.set_offset_inset();
+            } else {
+                style.background.outline.set_offset(src.background.outline.offset());
+            }
+        }
         "min-width" | "min-inline-size" => style.box_model.min_width = src.box_model.min_width,
         "min-height" | "min-block-size" => style.box_model.min_height = src.box_model.min_height,
         "max-width" | "max-inline-size" => style.box_model.max_width = src.box_model.max_width,

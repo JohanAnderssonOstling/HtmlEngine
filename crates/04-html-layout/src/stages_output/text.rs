@@ -37,6 +37,7 @@ pub struct RenderLineTextFragment {
     glyphs: Range<u32>,
     offset_x: f64,
     paint_order: u32,
+    visible: bool,
 }
 
 impl RenderLineTextFragment {
@@ -50,6 +51,10 @@ impl RenderLineTextFragment {
 
     pub fn paint_order(&self) -> u32 {
         self.paint_order
+    }
+
+    pub fn visible(&self) -> bool {
+        self.visible
     }
 }
 
@@ -97,13 +102,13 @@ impl<'a> Iterator for RenderLineTextFragments<'a> {
         if let Some(fragments) = &self.line.text_fragments {
             let fragment = fragments.get(self.index)?;
             self.index += 1;
-            return Some(RenderLineTextFragment { glyphs: fragment.glyphs.clone(), offset_x: fragment.offset_x, paint_order: fragment.paint_order });
+            return Some(RenderLineTextFragment { glyphs: fragment.glyphs.clone(), offset_x: fragment.offset_x, paint_order: fragment.paint_order, visible: fragment.visible });
         }
         if self.implicit_emitted || self.line.glyphs.is_empty() {
             return None;
         }
         self.implicit_emitted = true;
-        Some(RenderLineTextFragment { glyphs: self.line.glyphs.clone(), offset_x: 0.0, paint_order: 0 })
+        Some(RenderLineTextFragment { glyphs: self.line.glyphs.clone(), offset_x: 0.0, paint_order: 0, visible: true })
     }
 }
 
@@ -310,17 +315,19 @@ pub struct RenderGlyphAdvanceRuns<'a> {
 pub struct RenderEllipsisFragment {
     glyph: GlyphId,
     offset: Point,
+    visible: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct RenderHyphenFragment {
     glyph: GlyphId,
     offset: Point,
+    visible: bool,
 }
 
 impl RenderHyphenFragment {
     fn from_fragment(fragment: &HyphenFragment) -> Self {
-        Self { glyph: fragment.glyph, offset: fragment.offset }
+        Self { glyph: fragment.glyph, offset: fragment.offset, visible: fragment.visible }
     }
 
     pub fn glyph(&self) -> GlyphId {
@@ -329,12 +336,16 @@ impl RenderHyphenFragment {
 
     pub fn offset(&self) -> Point {
         self.offset
+    }
+
+    pub fn visible(&self) -> bool {
+        self.visible
     }
 }
 
 impl RenderEllipsisFragment {
     fn from_fragment(fragment: &EllipsisFragment) -> Self {
-        Self { glyph: fragment.glyph, offset: fragment.offset }
+        Self { glyph: fragment.glyph, offset: fragment.offset, visible: fragment.visible }
     }
 
     pub fn glyph(&self) -> GlyphId {
@@ -343,6 +354,10 @@ impl RenderEllipsisFragment {
 
     pub fn offset(&self) -> Point {
         self.offset
+    }
+
+    pub fn visible(&self) -> bool {
+        self.visible
     }
 }
 

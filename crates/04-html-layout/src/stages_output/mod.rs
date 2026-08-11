@@ -115,13 +115,13 @@ impl<'a> RenderView<'a> {
         let root_indices = self.doc.inputs.layout_tree.get_box_style_indices(root_box)?;
         let root = self.doc.inputs.styles.view(root_indices)?;
         if root.background_image_present() || root.background_color() & 0xFF != 0 {
-            return (root.background_color() & 0xFF != 0).then_some(root.background_color());
+            return (root.visibility() == html_style_model::Visibility::Visible && root.background_color() & 0xFF != 0).then_some(root.background_color());
         }
 
         let body_box = self.doc.inputs.layout_tree.body_box()?;
         let body_indices = self.doc.inputs.layout_tree.get_box_style_indices(body_box)?;
         let body = self.doc.inputs.styles.view(body_indices)?;
-        (body.background_color() & 0xFF != 0).then_some(body.background_color())
+        (body.visibility() == html_style_model::Visibility::Visible && body.background_color() & 0xFF != 0).then_some(body.background_color())
     }
 
     pub fn title(&self) -> Option<&'a str> {

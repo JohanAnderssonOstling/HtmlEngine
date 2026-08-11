@@ -455,6 +455,17 @@ mod tests {
     }
 
     #[test]
+    fn hidden_collapsed_borders_retain_table_geometry_without_painting() {
+        let source = |visibility| format!("<html><body style='margin:0'><table id='table' style='visibility:{visibility};border-collapse:collapse;border:8px solid blue'><tr><td style='width:20px;height:10px;padding:0;border:4px solid red'>A</td></tr></table></body></html>");
+        let visible = layout_html(&source("visible"), 200.0);
+        let hidden = layout_html(&source("hidden"), 200.0);
+
+        assert_eq!(box_size_by_id(&visible, "table"), box_size_by_id(&hidden, "table"));
+        assert!(decoration_rects_by_color(&hidden, 0x0000ffff).is_empty());
+        assert!(decoration_rects_by_color(&hidden, 0xff0000ff).is_empty());
+    }
+
+    #[test]
     fn anonymous_collapsed_table_emits_cell_border_grid() {
         let document = layout_html(
             "<html><body style='margin:0'><div style='border-collapse:collapse'><div style='display:table-row-group'><div style='display:table-row'><div style='display:table-cell;width:16px;height:16px;padding:0;border:8px solid green'>A</div></div></div></div></body></html>",

@@ -50,6 +50,9 @@ pub(super) fn emit_table_layers(
         }
         let x = table_content_pos.x + columns.starts[start];
         let color = session.reader.used_style(group.style).background_color();
+        if session.reader.used_style(group.style).visibility() == html_style_model::Visibility::Hidden {
+            continue;
+        }
         emit_table_background_rect(session, table_box_idx, Rect::new(x, table_grid.y0, x + span_width, table_grid.y1), color);
     }
 
@@ -61,6 +64,9 @@ pub(super) fn emit_table_layers(
             continue;
         };
         let x = table_content_pos.x + start;
+        if session.reader.used_style(style_idx).visibility() == html_style_model::Visibility::Hidden {
+            continue;
+        }
         emit_table_background_rect(session, table_box_idx, Rect::new(x, table_grid.y0, x + width, table_grid.y1), session.reader.used_style(style_idx).background_color());
     }
 }

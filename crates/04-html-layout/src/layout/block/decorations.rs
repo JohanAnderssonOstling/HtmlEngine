@@ -20,6 +20,9 @@ impl DecorationEmitter<'_, '_, '_> {
             return;
         }
         let style = self.reader.style(box_idx);
+        if style.visibility() == html_style_model::Visibility::Hidden {
+            return;
+        }
         let background_color = style.background_color();
         if background_color & 0xFF == 0 {
             return;
@@ -38,6 +41,9 @@ impl DecorationEmitter<'_, '_, '_> {
 
     pub(in crate::layout) fn emit_block_border_and_outline(&mut self, box_idx: usize) {
         let style = self.reader.style(box_idx);
+        if style.visibility() == html_style_model::Visibility::Hidden {
+            return;
+        }
         let borders = physical_borders(&style);
         let top_border = borders.top.solid();
         let right_border = borders.right.solid();
@@ -71,13 +77,13 @@ impl DecorationEmitter<'_, '_, '_> {
         }
         if outline.style != BorderStyle::None && outline.width() > 0.0 {
             let rect = self.block_border_box_rect(box_idx);
-            emit_outline_fragments(self.fragments.decoration_store_mut(), rect, outline.width() as f64, outline_color, outline.style, false);
+            emit_outline_fragments(self.fragments.decoration_store_mut(), rect, outline.width() as f64, outline.offset() as f64, outline_color, outline.style, false);
         }
         self.record_block_decoration_owners(box_idx, start);
     }
 
     pub(in crate::layout) fn emit_color_rect_for_owner(&mut self, owner_box_idx: usize, rect: Rect, color: u32) {
-        if color & 0xFF == 0 {
+        if color & 0xFF == 0 || self.reader.style(owner_box_idx).visibility() == html_style_model::Visibility::Hidden {
             return;
         }
         let start = self.fragments.decoration_len();

@@ -118,6 +118,7 @@ pub(super) fn append_text_tokens(
             font_size,
             vertical_align,
             white_space,
+            visible: style.visibility() == html_style_model::Visibility::Visible,
             placement_required: letter_spacing != 0.0 || word_spacing != 0.0 || has_aligned_inline_ancestor(engine, box_idx),
         };
         previous_run_idx = Some(InlineTokens::bind_metrics_in(runs, previous_run_idx, &mut token, metrics));
@@ -149,6 +150,7 @@ fn create_ellipsis_token(engine: &crate::layout::LayoutEngine<'_, '_>, glyph: cr
             font_size: style.font_size(),
             vertical_align: VerticalAlignValue::Baseline,
             white_space: style.white_space(),
+            visible: style.visibility() == html_style_model::Visibility::Visible,
             placement_required: style.letter_spacing() != 0.0,
         },
     )

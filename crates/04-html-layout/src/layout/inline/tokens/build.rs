@@ -41,6 +41,7 @@ fn create_image_token(
                 font_size,
                 vertical_align,
                 white_space: style.white_space(),
+                visible: style.visibility() == html_style_model::Visibility::Visible,
                 placement_required: false,
             },
             ReplacedToken::Image { image_idx, box_idx, content_size, border_size: content_size, content_inset: Point::ZERO, margin_left: 0.0, margin_top: 0.0, position_offset: Vec2::ZERO, set_box_geometry: false },
@@ -76,7 +77,7 @@ fn create_image_token(
     let position_offset = if style.position() == html_style_model::PositionMode::Relative { crate::layout::box_positioning::relative_position_offset(&style, max_width, containing_block_height) } else { Vec2::ZERO };
     (
         InlineToken::new(InlineTokenKind::Image { payload_idx: u32::MAX }, outer_width, BreakKind::None, TokenWrap::Normal, true),
-        InlineTokenMetrics { owner_box_idx: box_idx, ascent: outer_height as f32, descent: 0.0, line_height, tab_interval: -1.0, tab_min_advance: 0.0, font_size, vertical_align, white_space: style.white_space(), placement_required: false },
+        InlineTokenMetrics { owner_box_idx: box_idx, ascent: outer_height as f32, descent: 0.0, line_height, tab_interval: -1.0, tab_min_advance: 0.0, font_size, vertical_align, white_space: style.white_space(), visible: style.visibility() == html_style_model::Visibility::Visible, placement_required: false },
         ReplacedToken::Image { image_idx, box_idx, content_size, border_size, content_inset: Point::new(padding_left + border_left, padding_top + border_top), margin_left, margin_top, position_offset, set_box_geometry: true },
     )
 }
@@ -95,6 +96,7 @@ fn create_break_token(box_idx: u32, clear: html_style_model::Clear, style: html_
             font_size: style.font_size(),
             vertical_align,
             white_space: style.white_space(),
+            visible: style.visibility() == html_style_model::Visibility::Visible,
             placement_required: false,
         },
     )
@@ -114,6 +116,7 @@ fn create_float_anchor_token(box_idx: u32, style: html_style_model::UsedStyleVie
             font_size: style.font_size(),
             vertical_align,
             white_space: style.white_space(),
+            visible: style.visibility() == html_style_model::Visibility::Visible,
             placement_required: false,
         },
     )
@@ -133,6 +136,7 @@ fn create_absolute_anchor_token(box_idx: u32, style: html_style_model::UsedStyle
             font_size: style.font_size(),
             vertical_align,
             white_space: style.white_space(),
+            visible: style.visibility() == html_style_model::Visibility::Visible,
             placement_required: false,
         },
     )
@@ -165,6 +169,7 @@ fn create_inline_boundary_token(
         font_size: font_size as f32,
         vertical_align,
         white_space: style.white_space(),
+        visible: style.visibility() == html_style_model::Visibility::Visible,
         placement_required: false,
     };
     (token, metrics, ReplacedToken::InlineBoundary { box_idx, margin_left, left_inset: left, inline_start, inline_end })
@@ -482,6 +487,7 @@ fn create_atomic_box_token(
             font_size: style.font_size(),
             vertical_align,
             white_space: style.white_space(),
+            visible: style.visibility() == html_style_model::Visibility::Visible,
             placement_required: false,
         },
         ReplacedToken::AtomicBox { box_idx, border_size, containing_width: max_width, containing_height: containing_block_height, margin_left, margin_top },

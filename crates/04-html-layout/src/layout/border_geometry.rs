@@ -81,11 +81,15 @@ pub(crate) fn border_pattern(style: BorderStyle, horizontal: bool) -> Option<Dec
     }
 }
 
-pub(super) fn emit_outline_fragments(fragments: &mut DecorationStore, rect: Rect, width: f64, color: u32, style: BorderStyle, is_inline: bool) {
+pub(super) fn emit_outline_fragments(fragments: &mut DecorationStore, rect: Rect, width: f64, offset: f64, color: u32, style: BorderStyle, is_inline: bool) {
     if width <= 0.0 || style == BorderStyle::None || color & 0xFF == 0 {
         return;
     }
-    let outer = Rect::new(rect.x0 - width, rect.y0 - width, rect.x1 + width, rect.y1 + width);
+    let offset_rect = Rect::new(rect.x0 - offset, rect.y0 - offset, rect.x1 + offset, rect.y1 + offset);
+    if offset_rect.width() <= 0.0 || offset_rect.height() <= 0.0 {
+        return;
+    }
+    let outer = Rect::new(offset_rect.x0 - width, offset_rect.y0 - width, offset_rect.x1 + width, offset_rect.y1 + width);
     match style {
         BorderStyle::Solid => emit_border_rect_layer(fragments, outer, width, color, is_inline, true),
         BorderStyle::Dotted | BorderStyle::Dashed => {

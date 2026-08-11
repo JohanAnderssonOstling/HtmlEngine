@@ -16,7 +16,10 @@ pub(super) fn positioned_text_fragments(span: &[InlineToken], placements: &[Toke
             }
             _ => false,
         };
-        discontinuous || matches!(token.kind(), InlineTokenKind::Image { .. } | InlineTokenKind::AtomicBox { .. } | InlineTokenKind::InlineBoundary { .. }) || token.run_metrics(runs).placement_required
+        discontinuous
+            || matches!(token.kind(), InlineTokenKind::Image { .. } | InlineTokenKind::AtomicBox { .. } | InlineTokenKind::InlineBoundary { .. })
+            || token.run_metrics(runs).placement_required
+            || !token.run_metrics(runs).visible
     });
     if !split {
         return None;
@@ -30,12 +33,18 @@ pub(super) fn positioned_text_fragments(span: &[InlineToken], placements: &[Toke
             if let Some(index) = current_fragment
                 && fragments[index].glyphs.end == glyph_idx
                 && current_run_idx == Some(token.run_idx)
+                && fragments[index].visible == token.run_metrics(runs).visible
                 && !token.run_metrics(runs).placement_required
             {
                 fragments[index].glyphs.end += 1;
                 continue;
             }
-            fragments.push(LineTextFragment { glyphs: glyph_idx..glyph_idx + 1, offset_x: placement.x + placement.relative_offset.x, paint_order: paint_order as u32 });
+            fragments.push(LineTextFragment {
+                glyphs: glyph_idx..glyph_idx + 1,
+                offset_x: placement.x + placement.relative_offset.x,
+                paint_order: paint_order as u32,
+                visible: token.run_metrics(runs).visible,
+            });
             current_fragment = Some(fragments.len() - 1);
             current_run_idx = Some(token.run_idx);
         } else {
@@ -307,7 +316,11 @@ pub(super) fn write_line_fragments(
     let point = Point::new(origin.x + line.x_offset, origin.y);
     let line_idx = engine.fragments.state().line_output.lines.len();
     let has_fragment_owners = has_inline_fragment_owners(engine, span, runs, replaced);
-    let needs_ordered_fragments = has_fragment_owners || span.iter().any(|token| matches!(token.kind(), InlineTokenKind::Image { .. } | InlineTokenKind::AtomicBox { .. } | InlineTokenKind::InlineBoundary { .. }));
+    let needs_ordered_fragments = has_fragment_owners
+        || span.iter().any(|token| {
+            matches!(token.kind(), InlineTokenKind::Image { .. } | InlineTokenKind::AtomicBox { .. } | InlineTokenKind::InlineBoundary { .. })
+                || !token.run_metrics(runs).visible
+        });
     let fallback_placements;
     let placements = if let Some(placements) = line.placements.as_deref() {
         Some(placements)
@@ -371,7 +384,12 @@ pub(super) fn write_line_fragments(
         layout.line_output.line_glyph_advances.push(Vec::new());
         layout.line_output.line_glyph_advances[line_idx].extend(line.punctuation_space_advances.iter().map(|&(glyph_idx, advance)| GlyphAdvanceRun { range: glyph_idx..glyph_idx + 1, advance }));
         if let Some((glyph, x)) = line.hyphen {
-            layout.line_output.hyphen_fragments.push(HyphenFragment { line_idx, glyph, offset: Point::new(x, 0.0) });
+            let visible = span
+                .iter()
+                .rev()
+                .find(|token| matches!(token.kind(), InlineTokenKind::Glyph { .. }))
+                .is_none_or(|token| token.run_metrics(runs).visible);
+            layout.line_output.hyphen_fragments.push(HyphenFragment { line_idx, glyph, offset: Point::new(x, 0.0), visible });
         }
         // Ownership is also the transient stacking-order key. Finalization
         // drops it after sorting when overflow clips are not needed.
@@ -405,6 +423,9 @@ pub(super) fn write_line_fragments(
             let content_offset = border_offset + content_inset.to_vec2();
             let intrinsic = engine.reader.image_intrinsic(*box_idx as usize).expect("image fragment owner must retain intrinsic geometry").size;
             let style = engine.reader.style(*box_idx as usize);
+            if style.visibility() == html_style_model::Visibility::Hidden {
+                continue;
+            }
             let object = crate::layout::replaced::replaced_object_geometry(*content_size, intrinsic, style.object_fit(), style.object_position());
             engine.fragments.state_mut().fragment_output.image_fragments.push(ImageFragment {
                 line_idx,
@@ -446,7 +467,12 @@ pub(super) fn write_line_fragments(
             }
         } else if let InlineTokenKind::Ellipsis { glyph } = token.kind() {
             debug_assert!(publishes_line);
-            engine.fragments.state_mut().line_output.ellipsis_fragments.push(EllipsisFragment { line_idx, glyph, offset: Point::new(placement.x, offset) });
+            engine.fragments.state_mut().line_output.ellipsis_fragments.push(EllipsisFragment {
+                line_idx,
+                glyph,
+                offset: Point::new(placement.x, offset),
+                visible: token.run_metrics(runs).visible,
+            });
         } else if let InlineTokenKind::AbsoluteAnchor { box_idx } = token.kind() {
             let static_y = engine.floats.current_float_context().map_or(point.y, |context| context.source_position_at_or_after(point.y));
             engine.defer_absolute_box(box_idx as usize, Point::new(point.x + placement.x, static_y));

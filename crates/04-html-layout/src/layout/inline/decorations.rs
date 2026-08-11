@@ -41,6 +41,9 @@ impl DecorationEmitter<'_, '_, '_> {
         }
         let is_inline_box = matches!(self.reader.box_layout_mode(box_idx), Some(LayoutMode::Inline(_)));
         let style = self.reader.style(box_idx);
+        if style.visibility() == html_style_model::Visibility::Hidden {
+            return;
+        }
         let background_color = style.background_color();
         let color_alpha = background_color & 0xFF;
         let top_border = matches!(style.border_top_style(), BorderStyle::Solid).then_some((style.border_top_width() as f64, style.border_top_color()));
@@ -96,7 +99,7 @@ impl DecorationEmitter<'_, '_, '_> {
             }
         }
         if is_inline_box && outline.style != BorderStyle::None && outline.width() > 0.0 {
-            emit_outline_fragments(self.fragments.decoration_store_mut(), rect, outline.width() as f64, outline_color, outline.style, true);
+            emit_outline_fragments(self.fragments.decoration_store_mut(), rect, outline.width() as f64, outline.offset() as f64, outline_color, outline.style, true);
         }
         if !text_decoration.lines.is_empty() && text_decoration_color & 0xFF != 0 {
             let thickness = text_decoration.thickness.resolve(font_size) as f64;

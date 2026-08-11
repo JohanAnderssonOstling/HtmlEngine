@@ -33,7 +33,7 @@ use html_style_model::{
     OpenTypeFeature, OverflowMode, OverflowWrap, PositionMode, PreferredSize,
     QuoteStyle, SizeComparison, StyleIndices, StyleStringId, TabSize, TextAlign,
     TextDecorationLines, TextDecorationStyle, TextDecorationThickness, TextDirection,
-    TextOverflow, TextSpacing, TextTransform, VerticalAlignValue, WhiteSpace, WordBreak,
+    TextOverflow, TextSpacing, TextTransform, VerticalAlignValue, Visibility, WhiteSpace, WordBreak,
 };
 use lightningcss::printer::{Printer, PrinterOptions};
 use lightningcss::properties::border::{BorderSideWidth, LineStyle};

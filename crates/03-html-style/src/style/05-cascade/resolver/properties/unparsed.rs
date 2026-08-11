@@ -26,6 +26,15 @@ pub(super) fn apply_unparsed_property(
                 }
                 return true;
             }
+            "outline-offset" => {
+                if let Some(value) = parse_outline_offset(tokens, style.font.font_size, root_font_size) {
+                    match value {
+                        ParsedOutlineOffset::Length(value) => style.background.outline.set_offset(value),
+                        ParsedOutlineOffset::Inset => style.background.outline.set_offset_inset(),
+                    }
+                }
+                return true;
+            }
             "text-box" | "text-box-trim" | "text-box-edge" => {
                 let _ = apply_text_box_property(style, &normalized_name, tokens);
                 return true;
@@ -173,7 +182,26 @@ fn parse_object_position(tokens: &TokenList<'_>, font_size: f32, root_font_size:
     })
 }
 
-pub(super) fn unparsed_object_property_is_computable(property: &Property<'_>, font_size: f32, root_font_size: f32) -> Option<bool> {
+enum ParsedOutlineOffset {
+    Length(LengthPct),
+    Inset,
+}
+
+fn parse_outline_offset(tokens: &TokenList<'_>, font_size: f32, root_font_size: f32) -> Option<ParsedOutlineOffset> {
+    use lightningcss::values::length::{Length, LengthPercentage};
+
+    let css = token_list_to_css_string(tokens)?;
+    if css.eq_ignore_ascii_case("inset") {
+        return Some(ParsedOutlineOffset::Inset);
+    }
+    Length::parse_string(&css).ok()?;
+    match computed_length_pct(&LengthPercentage::parse_string(&css).ok()?, font_size, root_font_size)? {
+        LengthPct::Pct(_) | LengthPct::Calc { percentage_dependent: true, .. } => None,
+        value => Some(ParsedOutlineOffset::Length(value)),
+    }
+}
+
+pub(super) fn unparsed_renderer_property_is_computable(property: &Property<'_>, font_size: f32, root_font_size: f32) -> Option<bool> {
     let (name, tokens) = match property {
         Property::Custom(custom) => (custom.name.as_ref(), &custom.value),
         Property::Unparsed(unparsed) => (unparsed.property_id.name(), &unparsed.value),
@@ -183,6 +211,8 @@ pub(super) fn unparsed_object_property_is_computable(property: &Property<'_>, fo
         Some(parse_object_fit(tokens).is_some())
     } else if name.eq_ignore_ascii_case("object-position") {
         Some(parse_object_position(tokens, font_size, root_font_size).is_some())
+    } else if name.eq_ignore_ascii_case("outline-offset") {
+        Some(parse_outline_offset(tokens, font_size, root_font_size).is_some())
     } else {
         None
     }

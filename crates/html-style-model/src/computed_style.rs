@@ -216,6 +216,7 @@ impl Font {
 #[derive(Clone, Debug)]
 pub struct InheritedText {
     pub color: u32,
+    pub visibility: Visibility,
     /// Inherited BCP 47 language tag sourced from `lang`/`xml:lang`.
     pub language: Option<StyleStringId>,
     /// Computed inline base direction. Logical box properties are resolved to
@@ -268,6 +269,16 @@ pub struct InheritedText {
     /// Interned URL string of `list-style-image` (`None` for `none`). Resolved to
     /// an image resource when the marker box is built.
     pub list_style_image: Option<StyleStringId>,
+}
+
+/// Whether an element's generated boxes are painted. Unlike `display: none`,
+/// hidden boxes still participate fully in layout, and descendants may opt
+/// back into painting with `visibility: visible`.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum Visibility {
+    #[default]
+    Visible,
+    Hidden,
 }
 
 /// Computed `quotes`: automatic language quotes, suppression, or an authored
@@ -741,6 +752,8 @@ impl TextDecoration {
 #[derive(Clone, Copy, Debug)]
 pub struct Outline {
     width: FontRelativeLength,
+    offset: LengthPct,
+    offset_inset: bool,
     pub style: BorderStyle,
     pub color: DecorationColor,
 }
@@ -753,11 +766,30 @@ impl Outline {
     pub fn set_width(&mut self, width: FontRelativeLength) {
         self.width = width;
     }
+
+    pub fn offset(self) -> LengthPct {
+        self.offset
+    }
+
+    pub fn set_offset(&mut self, offset: LengthPct) {
+        self.offset = offset;
+        self.offset_inset = false;
+    }
+
+    pub fn offset_is_inset(self) -> bool {
+        self.offset_inset
+    }
+
+    pub fn set_offset_inset(&mut self) {
+        self.offset = LengthPct::Px(0.0);
+        self.offset_inset = true;
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct UsedOutline {
     width: f32,
+    offset: f32,
     pub style: BorderStyle,
     pub color: DecorationColor,
 }
@@ -766,15 +798,19 @@ impl UsedOutline {
     pub fn width(self) -> f32 {
         self.width
     }
+
+    pub fn offset(self) -> f32 {
+        self.offset
+    }
 }
 
 impl Default for Outline {
     fn default() -> Self {
-        Self { width: FontRelativeLength(3.0), style: BorderStyle::None, color: DecorationColor::CurrentColor }
+        Self { width: FontRelativeLength(3.0), offset: LengthPct::Px(0.0), offset_inset: false, style: BorderStyle::None, color: DecorationColor::CurrentColor }
     }
 }
 
-impl_style_key!(Outline { width, style, color } floats {});
+impl_style_key!(Outline { width, offset, offset_inset, style, color } floats {});
 
 /// Background and non-layout-affecting paint properties (reset).
 #[derive(Clone, Debug, Default)]
@@ -796,7 +832,7 @@ impl_style_key!(Font {
     font_variant_ligature_features, font_kerning_features, font_feature_settings
 } floats { font_size, font_size_x_height_px, font_size_ch_advance_px, font_size_cap_height_px, font_size_root_ch, font_size_root_cap_height, font_size_root_line_height });
 impl_style_key!(InheritedText {
-    color, language, direction, letter_spacing, word_spacing, tab_size, text_align, text_align_logical, text_align_last, text_align_last_logical, text_align_last_explicit, text_indent, text_indent_hanging, text_indent_each_line, white_space, hyphens, word_break, overflow_wrap, widows, orphans, text_transform,
+    color, visibility, language, direction, letter_spacing, word_spacing, tab_size, text_align, text_align_logical, text_align_last, text_align_last_logical, text_align_last_explicit, text_indent, text_indent_hanging, text_indent_each_line, white_space, hyphens, word_break, overflow_wrap, widows, orphans, text_transform,
     quotes, list_style_type, list_style_position, list_style_image, line_height_normal, text_box_edge
 } floats { line_height, line_height_x_height_px, line_height_number });
 impl_style_key!(BoxModel {
@@ -1256,6 +1292,7 @@ impl Border {
 impl Background {
     pub fn validate(&self, _store_id: NonZeroU32) -> Result<(), ComputedStyleValueError> {
         self.outline.width.validate("Outline", "width")?;
+        self.outline.offset.validate("Outline", "offset", true)?;
         if let TextDecorationThickness::Length(value) = self.text_decoration.thickness {
             value.validate("TextDecoration", "thickness", false)?;
         }
@@ -2263,6 +2300,9 @@ impl<'a> StyleView<'a> {
     pub fn color(&self) -> u32 {
         self.text.color
     }
+    pub fn visibility(&self) -> Visibility {
+        self.text.visibility
+    }
     pub fn language(&self) -> Option<StyleStringId> {
         self.text.language
     }
@@ -2566,6 +2606,7 @@ impl<'a> StyleView<'a> {
             || radii
             || decoration
             || self.background.outline.width.requires_font_metrics()
+            || length(self.background.outline.offset)
             || self.layout.grid_template_rows.iter().chain(&self.layout.grid_template_columns).any(template)
             || self.layout.grid_auto_rows.iter().chain(&self.layout.grid_auto_columns).copied().any(track)
     }
@@ -2593,6 +2634,9 @@ impl<'a> UsedStyleView<'a> {
     }
     pub fn color(&self) -> u32 {
         self.computed.color()
+    }
+    pub fn visibility(&self) -> Visibility {
+        self.computed.visibility()
     }
     pub fn language(&self) -> Option<StyleStringId> {
         self.computed.language()
@@ -2776,7 +2820,12 @@ impl<'a> UsedStyleView<'a> {
     }
     pub fn outline(&self) -> UsedOutline {
         let outline = self.computed.outline();
-        UsedOutline { width: outline.width.resolve(self.font_relative), style: outline.style, color: outline.color }
+        UsedOutline {
+            width: outline.width.resolve(self.font_relative),
+            offset: if outline.offset_inset { -outline.width.resolve(self.font_relative) } else { outline.offset.resolve_font_relative(self.font_relative).resolve(0.0) as f32 },
+            style: outline.style,
+            color: outline.color,
+        }
     }
     pub fn outline_color(&self) -> u32 {
         self.computed.outline_color()
@@ -2948,6 +2997,7 @@ impl Default for InheritedText {
     fn default() -> Self {
         Self {
             color: 0x000000FF,
+            visibility: Visibility::Visible,
             language: None,
             direction: TextDirection::Ltr,
             line_height: 0.0,
@@ -3149,7 +3199,7 @@ pub const DEFAULT_BACKGROUND: Background = Background {
     background_color_current_color: false,
     background_image_present: false,
     text_decoration: TextDecoration { lines: TextDecorationLines(0), style: TextDecorationStyle::Solid, color: DecorationColor::CurrentColor, thickness: TextDecorationThickness::Auto },
-    outline: Outline { width: FontRelativeLength(3.0), style: BorderStyle::None, color: DecorationColor::CurrentColor },
+    outline: Outline { width: FontRelativeLength(3.0), offset: LengthPct::Px(0.0), offset_inset: false, style: BorderStyle::None, color: DecorationColor::CurrentColor },
 };
 
 /// A box-model length (margin, padding, or text-indent) that may be a fixed

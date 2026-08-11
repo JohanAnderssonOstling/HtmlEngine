@@ -188,6 +188,7 @@ pub(crate) struct LineTextFragment {
     /// already split at every inline boundary and replaced item, making this
     /// sufficient to merge paint without retaining the dense token stream.
     pub paint_order: u32,
+    pub visible: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -242,6 +243,7 @@ pub(crate) struct EllipsisFragment {
     pub line_idx: usize,
     pub glyph: crate::GlyphId,
     pub offset: Point,
+    pub visible: bool,
 }
 
 /// Synthetic hyphen painted only when an automatic discretionary break wins.
@@ -251,6 +253,7 @@ pub(crate) struct HyphenFragment {
     pub line_idx: usize,
     pub glyph: crate::GlyphId,
     pub offset: Point,
+    pub visible: bool,
 }
 
 #[derive(Clone)]

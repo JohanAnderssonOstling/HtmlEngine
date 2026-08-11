@@ -592,6 +592,7 @@ mod tests {
             font_size: 16.0,
             vertical_align,
             white_space: WhiteSpace::Normal,
+            visible: true,
             placement_required: false,
         }];
         (token, metrics)

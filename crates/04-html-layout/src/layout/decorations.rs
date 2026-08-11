@@ -195,6 +195,60 @@ mod tests {
     }
 
     #[test]
+    fn outline_offset_moves_block_and_inline_outline_without_affecting_layout() {
+        let block_zero = layout_html("<html><body><div style='width:50px;height:20px;outline:2px solid #abcdef'>A</div></body></html>");
+        let block_offset = layout_html("<html><body><div style='width:50px;height:20px;outline:2px solid #abcdef;outline-offset:5px'>A</div></body></html>");
+        let bounds = |document: &LaidOutDocument| {
+            document
+                .render_view()
+                .fragments()
+                .decorations()
+                .iter()
+                .filter(|fragment| fragment.color() == 0xABCDEFFF)
+                .map(|fragment| fragment.rect())
+                .reduce(|a, b| a.union(b))
+                .expect("outline fragments")
+        };
+        assert_eq!(block_zero.render_view().text().lines().get(0).unwrap().point(), block_offset.render_view().text().lines().get(0).unwrap().point());
+        let zero = bounds(&block_zero);
+        let positive = bounds(&block_offset);
+        assert_eq!(positive.x0, zero.x0 - 5.0);
+        assert_eq!(positive.x1, zero.x1 + 5.0);
+
+        let inline_zero = layout_html("<html><body><span style='outline:2px solid #123456'>text</span></body></html>");
+        let inline_inset = layout_html("<html><body><span style='outline:2px solid #123456;outline-offset:-1px'>text</span></body></html>");
+        let inline_bounds = |document: &LaidOutDocument| {
+            document
+                .render_view()
+                .fragments()
+                .decorations()
+                .iter()
+                .filter(|fragment| fragment.color() == 0x123456FF)
+                .map(|fragment| fragment.rect())
+                .reduce(|a, b| a.union(b))
+                .expect("inline outline fragments")
+        };
+        let zero = inline_bounds(&inline_zero);
+        let inset = inline_bounds(&inline_inset);
+        assert_eq!(inset.x0, zero.x0 + 1.0);
+        assert_eq!(inset.x1, zero.x1 - 1.0);
+        assert_eq!(inline_zero.render_view().text().lines().get(0).unwrap().height(), inline_inset.render_view().text().lines().get(0).unwrap().height());
+
+        let keyword = layout_html("<html><body><div style='width:50px;height:20px;outline:2px solid #abcdef;outline-offset:inset'>A</div></body></html>");
+        let numeric = layout_html("<html><body><div style='width:50px;height:20px;outline:2px solid #abcdef;outline-offset:-2px'>A</div></body></html>");
+        assert_eq!(bounds(&keyword), bounds(&numeric), "inset is the negative used outline width");
+    }
+
+    #[test]
+    fn hidden_boxes_keep_layout_but_emit_no_owned_decorations() {
+        let visible = layout_html("<html><body><div style='width:50px;height:20px;background:#123456;border:2px solid #abcdef;outline:1px solid #fedcba'>A</div></body></html>");
+        let hidden = layout_html("<html><body><div style='visibility:hidden;width:50px;height:20px;background:#123456;border:2px solid #abcdef;outline:1px solid #fedcba'>A</div></body></html>");
+        assert_eq!(visible.render_view().text().lines().get(0).unwrap().point(), hidden.render_view().text().lines().get(0).unwrap().point());
+        assert_eq!(visible.render_view().text().lines().get(0).unwrap().height(), hidden.render_view().text().lines().get(0).unwrap().height());
+        assert!(!hidden.render_view().fragments().decorations().iter().any(|fragment| matches!(fragment.color(), 0x123456FF | 0xABCDEFFF | 0xFEDCBAFF)));
+    }
+
+    #[test]
     fn dotted_outline_is_four_semantic_foreground_edges() {
         let document = layout_html("<html><body><div style='width:80px;height:20px;outline:2px dotted #13579b'>A</div></body></html>");
         let fragments = document.render_view().fragments().decorations().iter().filter(|fragment| fragment.color() == 0x13579BFF).collect::<Vec<_>>();
@@ -283,6 +337,9 @@ mod tests {
         let contents_body = layout_html("<html><body style='display:contents;background:#2468ac'><div></div></body></html>");
         assert_eq!(contents_body.render_view().canvas_background_color(), None, "a body without a principal box cannot propagate its background to the canvas");
         assert!(image_root.render_view().fragments().decorations().iter().any(|fragment| fragment.color() == 0x13579BFF));
+
+        let hidden_root = layout_html("<html style='visibility:hidden;background:#123456'><body></body></html>");
+        assert_eq!(hidden_root.render_view().canvas_background_color(), None, "the propagated root background still obeys visibility");
     }
 
     #[test]

@@ -281,6 +281,46 @@ fn invalid_variable_object_values_compute_to_their_initial_values() {
 }
 
 #[test]
+fn visibility_inherits_and_descendants_can_become_visible_again() {
+    let html = "<html><body><div style='visibility:hidden'><span id='inherited'>A</span><span id='visible' style='visibility:visible'>B</span></div></body></html>";
+    let mut factory = DocumentFactory::new();
+    let document = factory.parse_with_new_pipeline(html, None);
+    let visibility_for = |id| {
+        let node = document.document().node_ids().find(|&node| document.document().get_dom_id(node) == Some(id)).expect("element by id");
+        document.text_style(document.style_for_node(node).expect("computed style")).expect("text style").visibility
+    };
+
+    assert_eq!(visibility_for("inherited"), html_style_model::Visibility::Hidden);
+    assert_eq!(visibility_for("visible"), html_style_model::Visibility::Visible);
+}
+
+#[test]
+fn outline_offset_accepts_signed_lengths_and_rejects_percentages() {
+    let html = "<html><body><div id='negative' style='outline-offset:-4px'></div><div id='em' style='font-size:10px;outline-offset:2em'></div><div id='invalid' style='outline-offset:7px;outline-offset:25%'></div></body></html>";
+    let mut factory = DocumentFactory::new();
+    let document = factory.parse_with_new_pipeline(html, None);
+    let offset_for = |id| {
+        let node = document.document().node_ids().find(|&node| document.document().get_dom_id(node) == Some(id)).expect("element by id");
+        document.background_style(document.style_for_node(node).expect("computed style")).expect("background style").outline.offset()
+    };
+
+    assert_eq!(offset_for("negative"), LengthPct::Px(-4.0));
+    assert_eq!(offset_for("em"), LengthPct::Px(20.0));
+    assert_eq!(offset_for("invalid"), LengthPct::Px(7.0));
+}
+
+#[test]
+fn invalid_variable_outline_offset_computes_to_initial() {
+    let html = "<html><body><div style='--bad:25%;outline-offset:7px;outline-offset:var(--bad)'></div></body></html>";
+    let mut factory = DocumentFactory::new();
+    let document = factory.parse_with_new_pipeline(html, None);
+    let node = find_body(document.document()).children().next().expect("test element");
+    let outline = document.background_style(document.style_for_node(node).expect("computed style")).expect("background style").outline;
+
+    assert_eq!(outline.offset(), LengthPct::Px(0.0));
+}
+
+#[test]
 fn image_spacing_attributes_preserve_pixel_and_percentage_margins() {
     let html = "<html><body><img id='hinted' src='x' hspace='10%' vspace='7'><img id='overridden' src='x' hspace='10%' style='margin-left:3px'></body></html>";
     let mut factory = DocumentFactory::new();

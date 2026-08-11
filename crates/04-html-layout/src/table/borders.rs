@@ -11,11 +11,12 @@ struct CollapsedBorder {
     color: u32,
     source_priority: u8,
     order: u32,
+    visible: bool,
 }
 
 impl CollapsedBorder {
-    fn from_edge(edge: PhysicalBorderEdge, source_priority: u8, order: u32) -> Option<Self> {
-        (edge.style == BorderStyle::Hidden || (edge.style != BorderStyle::None && edge.width > 0.0)).then_some(Self { style: edge.style, width: edge.width, color: edge.color, source_priority, order })
+    fn from_edge(edge: PhysicalBorderEdge, source_priority: u8, order: u32, visible: bool) -> Option<Self> {
+        (edge.style == BorderStyle::Hidden || (edge.style != BorderStyle::None && edge.width > 0.0)).then_some(Self { style: edge.style, width: edge.width, color: edge.color, source_priority, order, visible })
     }
 
     fn style_priority(self) -> u8 {
@@ -128,35 +129,39 @@ impl CollapsedBorderGrid {
 
     fn register_table(&mut self, style: UsedStyleView<'_>, priority: u8) {
         let borders = physical_borders(&style);
-        self.register_horizontal(0, 0, self.columns, borders.top, priority);
-        self.register_horizontal(self.rows, 0, self.columns, borders.bottom, priority);
-        self.register_vertical(0, self.rows, 0, borders.left, priority);
-        self.register_vertical(0, self.rows, self.columns, borders.right, priority);
+        let visible = style.visibility() == html_style_model::Visibility::Visible;
+        self.register_horizontal(0, 0, self.columns, borders.top, priority, visible);
+        self.register_horizontal(self.rows, 0, self.columns, borders.bottom, priority, visible);
+        self.register_vertical(0, self.rows, 0, borders.left, priority, visible);
+        self.register_vertical(0, self.rows, self.columns, borders.right, priority, visible);
     }
 
     fn register_row_group(&mut self, style: UsedStyleView<'_>, start: usize, end: usize, priority: u8) {
         let borders = physical_borders(&style);
-        self.register_horizontal(start, 0, self.columns, borders.top, priority);
-        self.register_horizontal(end.min(self.rows), 0, self.columns, borders.bottom, priority);
-        self.register_vertical(start, end.min(self.rows), 0, borders.left, priority);
-        self.register_vertical(start, end.min(self.rows), self.columns, borders.right, priority);
+        let visible = style.visibility() == html_style_model::Visibility::Visible;
+        self.register_horizontal(start, 0, self.columns, borders.top, priority, visible);
+        self.register_horizontal(end.min(self.rows), 0, self.columns, borders.bottom, priority, visible);
+        self.register_vertical(start, end.min(self.rows), 0, borders.left, priority, visible);
+        self.register_vertical(start, end.min(self.rows), self.columns, borders.right, priority, visible);
     }
 
     fn register_row(&mut self, style: UsedStyleView<'_>, row: usize, priority: u8) {
         let borders = physical_borders(&style);
-        self.register_horizontal(row, 0, self.columns, borders.top, priority);
-        self.register_horizontal((row + 1).min(self.rows), 0, self.columns, borders.bottom, priority);
-        self.register_vertical(row, row + 1, 0, borders.left, priority);
-        self.register_vertical(row, row + 1, self.columns, borders.right, priority);
+        let visible = style.visibility() == html_style_model::Visibility::Visible;
+        self.register_horizontal(row, 0, self.columns, borders.top, priority, visible);
+        self.register_horizontal((row + 1).min(self.rows), 0, self.columns, borders.bottom, priority, visible);
+        self.register_vertical(row, row + 1, 0, borders.left, priority, visible);
+        self.register_vertical(row, row + 1, self.columns, borders.right, priority, visible);
     }
 
     fn register_column_group(&mut self, style: UsedStyleView<'_>, start: usize, span: usize, priority: u8) {
         let end = start.saturating_add(span).min(self.columns);
         let borders = physical_borders(&style);
-        self.register_vertical(0, self.rows, start.min(self.columns), borders.left, priority);
-        self.register_vertical(0, self.rows, end, borders.right, priority);
-        self.register_horizontal(0, start, end, borders.top, priority);
-        self.register_horizontal(self.rows, start, end, borders.bottom, priority);
+        let visible = style.visibility() == html_style_model::Visibility::Visible;
+        self.register_vertical(0, self.rows, start.min(self.columns), borders.left, priority, visible);
+        self.register_vertical(0, self.rows, end, borders.right, priority, visible);
+        self.register_horizontal(0, start, end, borders.top, priority, visible);
+        self.register_horizontal(self.rows, start, end, borders.bottom, priority, visible);
     }
 
     fn register_column(&mut self, style: UsedStyleView<'_>, column: usize, priority: u8) {
@@ -164,34 +169,36 @@ impl CollapsedBorderGrid {
             return;
         }
         let borders = physical_borders(&style);
-        self.register_vertical(0, self.rows, column, borders.left, priority);
-        self.register_vertical(0, self.rows, column + 1, borders.right, priority);
-        self.register_horizontal(0, column, column + 1, borders.top, priority);
-        self.register_horizontal(self.rows, column, column + 1, borders.bottom, priority);
+        let visible = style.visibility() == html_style_model::Visibility::Visible;
+        self.register_vertical(0, self.rows, column, borders.left, priority, visible);
+        self.register_vertical(0, self.rows, column + 1, borders.right, priority, visible);
+        self.register_horizontal(0, column, column + 1, borders.top, priority, visible);
+        self.register_horizontal(self.rows, column, column + 1, borders.bottom, priority, visible);
     }
 
     fn register_cell(&mut self, style: UsedStyleView<'_>, placement: TableCellPlacement, priority: u8) {
         let row_end = placement.row.saturating_add(placement.rowspan).min(self.rows);
         let col_end = placement.col.saturating_add(placement.colspan).min(self.columns);
         let borders = physical_borders(&style);
-        self.register_horizontal(placement.row, placement.col, col_end, borders.top, priority);
-        self.register_horizontal(row_end, placement.col, col_end, borders.bottom, priority);
-        self.register_vertical(placement.row, row_end, placement.col, borders.left, priority);
-        self.register_vertical(placement.row, row_end, col_end, borders.right, priority);
+        let visible = style.visibility() == html_style_model::Visibility::Visible;
+        self.register_horizontal(placement.row, placement.col, col_end, borders.top, priority, visible);
+        self.register_horizontal(row_end, placement.col, col_end, borders.bottom, priority, visible);
+        self.register_vertical(placement.row, row_end, placement.col, borders.left, priority, visible);
+        self.register_vertical(placement.row, row_end, col_end, borders.right, priority, visible);
     }
 
-    fn register_horizontal(&mut self, boundary: usize, start: usize, end: usize, edge: PhysicalBorderEdge, priority: u8) {
+    fn register_horizontal(&mut self, boundary: usize, start: usize, end: usize, edge: PhysicalBorderEdge, priority: u8, visible: bool) {
         let order = self.take_order();
-        let Some(candidate) = CollapsedBorder::from_edge(edge, priority, order) else { return };
+        let Some(candidate) = CollapsedBorder::from_edge(edge, priority, order, visible) else { return };
         for column in start.min(self.columns)..end.min(self.columns) {
             let index = boundary.min(self.rows) * self.columns + column;
             register(&mut self.horizontal[index], candidate);
         }
     }
 
-    fn register_vertical(&mut self, start: usize, end: usize, boundary: usize, edge: PhysicalBorderEdge, priority: u8) {
+    fn register_vertical(&mut self, start: usize, end: usize, boundary: usize, edge: PhysicalBorderEdge, priority: u8, visible: bool) {
         let order = self.take_order();
-        let Some(candidate) = CollapsedBorder::from_edge(edge, priority, order) else { return };
+        let Some(candidate) = CollapsedBorder::from_edge(edge, priority, order, visible) else { return };
         for row in start.min(self.rows)..end.min(self.rows) {
             let index = row * (self.columns + 1) + boundary.min(self.columns);
             register(&mut self.vertical[index], candidate);
@@ -246,6 +253,9 @@ fn boundary_anchor(starts: &[f64], sizes: &[f64], boundary: usize) -> Option<f64
 }
 
 fn edge_fragment(rect: Rect, edge: CollapsedBorder, horizontal: bool) -> Option<DecorationFragment> {
+    if !edge.visible {
+        return None;
+    }
     if rect.width() <= 0.0 || rect.height() <= 0.0 || edge.color & 0xFF == 0 {
         return None;
     }
