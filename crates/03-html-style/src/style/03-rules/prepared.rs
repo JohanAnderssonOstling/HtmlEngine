@@ -7,7 +7,7 @@
 //! `PreparedRuleSet` and its private `EffectiveRuleId` values.
 
 use super::media::{CompiledMediaList, MediaEnvironment, MediaQuerySet};
-use crate::style::matching::selectors::selector_list_is_web_valid;
+use crate::style::matching::selectors::{selector_list_is_web_valid, selector_list_pseudo_mask};
 use crate::{PropertyCapability, PropertySyntax, declaration_support, supports_selector_syntax_is_valid};
 use html_dom::{Document, DomNodeId};
 use lightningcss::properties::{Property, PropertyId};
@@ -297,6 +297,11 @@ impl<'sheet, 'css> ParsedStylesheetSet<'sheet, 'css> {
         let authors = self.authors.iter().enumerate().map(|(index, stylesheet)| (stylesheet, self.author_roots.get(index).copied().flatten()));
         prepare_origin(authors, CascadeOrigin::Author, &mut rules, &mut scopes, &mut source_order, environment, initial_font_size, &mut media_queries, &mut media_path);
 
+        let rule_pseudo_masks = rules
+            .iter()
+            .map(|rule| selector_list_pseudo_mask(&rule.style_rule.selectors))
+            .collect();
+
         let declaration_capacity = rules.iter().map(|rule| rule.style_rule.declarations.declarations.len() + rule.style_rule.declarations.important_declarations.len()).sum();
         // Compile Lightning CSS declaration expansion once. Per-element
         // cascade work then follows dense ranges instead of rebuilding and
@@ -325,6 +330,7 @@ impl<'sheet, 'css> ParsedStylesheetSet<'sheet, 'css> {
 
         PreparedRuleSet {
             rules,
+            rule_pseudo_masks,
             scopes,
             rule_target_starts,
             declaration_target_ranges,
@@ -498,6 +504,7 @@ fn supports_declaration_value(value: &str) -> Option<&str> {
 
 pub(crate) struct PreparedRuleSet<'sheet, 'css> {
     rules: Vec<EffectiveRule<'sheet, 'css>>,
+    rule_pseudo_masks: Vec<u8>,
     scopes: Vec<ScopeDescriptor<'sheet, 'css>>,
     rule_target_starts: Vec<(u32, u32)>,
     declaration_target_ranges: Vec<PreparedTargetRange>,
@@ -528,6 +535,10 @@ impl<'sheet, 'css> PreparedRuleSet<'sheet, 'css> {
 
     pub(crate) fn get(&self, id: EffectiveRuleId) -> EffectiveRule<'sheet, 'css> {
         self.rules[id.0 as usize]
+    }
+
+    pub(crate) fn pseudo_mask(&self, id: EffectiveRuleId) -> u8 {
+        self.rule_pseudo_masks[id.0 as usize]
     }
 
     pub(crate) fn declaration_targets(&self, id: EffectiveRuleId, important: bool, index: usize) -> &[PreparedPropertyTarget] {
@@ -593,7 +604,7 @@ mod tests {
         let authors = [author];
         let (prepared, allocations) = count_allocations(|| ParsedStylesheetSet::new(&user_agent, &authors).prepare(MediaEnvironment::default(), 16.0));
 
-        assert_eq!(allocations, 6, "preparation should allocate only its dense rule and declaration metadata");
+        assert_eq!(allocations, 7, "preparation should allocate only its dense rule and declaration metadata");
         assert_eq!(prepared.len(), 1);
         let (_, rule) = prepared.iter().next().unwrap();
         assert_eq!(rule.style_rule() as *const _, expected);

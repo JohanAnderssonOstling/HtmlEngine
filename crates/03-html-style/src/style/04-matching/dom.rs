@@ -1,4 +1,7 @@
-use super::selectors::AncestorFilter;
+use super::selectors::{
+    AncestorFilter, PSEUDO_AFTER_MASK, PSEUDO_BEFORE_MASK, PSEUDO_FIRST_LETTER_MASK,
+    PSEUDO_FIRST_LINE_MASK,
+};
 use html_dom::{Document, DomNodeId};
 use lightningcss::selector::{Combinator, Component, Direction, PseudoClass, PseudoElement, Selector};
 use parcel_selectors::attr::{AttrSelectorOperator, CaseSensitivity, NamespaceConstraint, ParsedAttrSelectorOperation, ParsedCaseSensitivity};
@@ -15,6 +18,17 @@ pub(crate) enum PseudoTarget {
     After,
     FirstLine,
     FirstLetter,
+}
+
+impl PseudoTarget {
+    pub(crate) const fn mask(self) -> u8 {
+        match self {
+            Self::Before => PSEUDO_BEFORE_MASK,
+            Self::After => PSEUDO_AFTER_MASK,
+            Self::FirstLine => PSEUDO_FIRST_LINE_MASK,
+            Self::FirstLetter => PSEUDO_FIRST_LETTER_MASK,
+        }
+    }
 }
 
 #[cfg(test)]

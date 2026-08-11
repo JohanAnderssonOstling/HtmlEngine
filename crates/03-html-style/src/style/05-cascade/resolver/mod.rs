@@ -224,6 +224,10 @@ pub(crate) fn resolve_styles_for_dom_timed<'sheet, 'css>(
                 }
             };
             let custom_map = &custom_maps[custom_map_id as usize];
+            let candidate_pseudo_mask = resolver
+                .candidate_scratch
+                .iter()
+                .fold(0, |mask, id| mask | prepared.pseudo_mask(*id));
 
             let started = Instant::now();
             let counters = std::mem::take(&mut style.counters);
@@ -240,18 +244,22 @@ pub(crate) fn resolve_styles_for_dom_timed<'sheet, 'css>(
                     .set_counter_directives(node_idx, counters)
                     .expect("counter directives belong to their originating element");
             }
-            let first_line = resolver
-                .compute_pseudo_style_for_dom_element(
-                    node_idx,
-                    style_indices,
-                    PseudoTarget::FirstLine,
-                    custom_map,
-                )
-                .map(|style| {
-                    style
-                        .intern(resolver.styles)
-                        .expect("pseudo style values should pass validation")
-                });
+            let first_line = if candidate_pseudo_mask & PseudoTarget::FirstLine.mask() != 0 {
+                resolver
+                    .compute_pseudo_style_for_dom_element(
+                        node_idx,
+                        style_indices,
+                        PseudoTarget::FirstLine,
+                        custom_map,
+                    )
+                    .map(|style| {
+                        style
+                            .intern(resolver.styles)
+                            .expect("pseudo style values should pass validation")
+                    })
+            } else {
+                None
+            };
             if let Some(style) = first_line {
                 resolver
                     .styles
@@ -259,12 +267,14 @@ pub(crate) fn resolve_styles_for_dom_timed<'sheet, 'css>(
                     .expect("pseudo style belongs to its originating element");
             }
             let mut before_first_letter_parent = None;
-            if let Some(mut style) = resolver.compute_pseudo_style_for_dom_element(
-                node_idx,
-                style_indices,
-                PseudoTarget::Before,
-                custom_map,
-            ) && let Some(content) = style.generated_content.take()
+            if candidate_pseudo_mask & PseudoTarget::Before.mask() != 0
+                && let Some(mut style) = resolver.compute_pseudo_style_for_dom_element(
+                    node_idx,
+                    style_indices,
+                    PseudoTarget::Before,
+                    custom_map,
+                )
+                && let Some(content) = style.generated_content.take()
             {
                 let counters = std::mem::take(&mut style.counters);
                 let style = style
@@ -294,25 +304,30 @@ pub(crate) fn resolve_styles_for_dom_timed<'sheet, 'css>(
                 };
             }
             let first_letter_parent = first_line.unwrap_or(style_indices);
-            let first_letter = resolver
-                .compute_pseudo_style_for_dom_element(
-                    node_idx,
-                    first_letter_parent,
-                    PseudoTarget::FirstLetter,
-                    custom_map,
-                )
-                .map(|style| {
-                    style
-                        .intern(resolver.styles)
-                        .expect("pseudo style values should pass validation")
-                });
+            let first_letter = if candidate_pseudo_mask & PseudoTarget::FirstLetter.mask() != 0 {
+                resolver
+                    .compute_pseudo_style_for_dom_element(
+                        node_idx,
+                        first_letter_parent,
+                        PseudoTarget::FirstLetter,
+                        custom_map,
+                    )
+                    .map(|style| {
+                        style
+                            .intern(resolver.styles)
+                            .expect("pseudo style values should pass validation")
+                    })
+            } else {
+                None
+            };
             if let Some(style) = first_letter {
                 resolver
                     .styles
                     .set_first_letter_style(node_idx, style)
                     .expect("pseudo style belongs to its originating element");
             }
-            if let Some(parent) = before_first_letter_parent
+            if candidate_pseudo_mask & PseudoTarget::FirstLetter.mask() != 0
+                && let Some(parent) = before_first_letter_parent
                 && let Some(style) = resolver
                     .compute_pseudo_style_for_dom_element(
                         node_idx,
@@ -331,12 +346,14 @@ pub(crate) fn resolve_styles_for_dom_timed<'sheet, 'css>(
                     .set_before_first_letter_style(node_idx, style)
                     .expect("pseudo style belongs to its originating element");
             }
-            if let Some(mut style) = resolver.compute_pseudo_style_for_dom_element(
-                node_idx,
-                style_indices,
-                PseudoTarget::After,
-                custom_map,
-            ) && let Some(content) = style.generated_content.take()
+            if candidate_pseudo_mask & PseudoTarget::After.mask() != 0
+                && let Some(mut style) = resolver.compute_pseudo_style_for_dom_element(
+                    node_idx,
+                    style_indices,
+                    PseudoTarget::After,
+                    custom_map,
+                )
+                && let Some(content) = style.generated_content.take()
             {
                 let counters = std::mem::take(&mut style.counters);
                 let style = style
@@ -375,6 +392,9 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
         let mut matched_rules = std::mem::take(self.matched_rule_scratch);
         matched_rules.clear();
         for id in self.candidate_scratch.iter().copied() {
+            if prepared.pseudo_mask(id) & pseudo.mask() == 0 {
+                continue;
+            }
             let style_rule = prepared.get(id).style_rule();
             let Some(scope_match) = prepared.scope_match(prepared.get(id).scope(), doc, node_idx)
             else {

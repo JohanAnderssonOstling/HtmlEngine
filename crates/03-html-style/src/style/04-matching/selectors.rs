@@ -3,6 +3,11 @@ use lightningcss::properties::custom::{Token, TokenList, TokenOrValue};
 use lightningcss::selector::{Component, PseudoClass, PseudoElement, Selector, SelectorList};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 
+pub(crate) const PSEUDO_BEFORE_MASK: u8 = 1 << 0;
+pub(crate) const PSEUDO_AFTER_MASK: u8 = 1 << 1;
+pub(crate) const PSEUDO_FIRST_LINE_MASK: u8 = 1 << 2;
+pub(crate) const PSEUDO_FIRST_LETTER_MASK: u8 = 1 << 3;
+
 // ============================================================================
 // Bloom Filter for fast ancestor rejection
 // ============================================================================
@@ -188,6 +193,20 @@ impl Default for SelectorContext {
 
 fn selector_is_web_valid(selector: &Selector<'_>, context: SelectorContext) -> bool {
     selector.iter_raw_match_order().all(|component| component_is_web_valid(component, context))
+}
+
+pub(crate) fn selector_list_pseudo_mask(selectors: &SelectorList<'_>) -> u8 {
+    selectors.0.iter().fold(0, |mask, selector| {
+        selector.iter_raw_match_order().fold(mask, |mask, component| {
+            mask | match component {
+                Component::PseudoElement(PseudoElement::Before) => PSEUDO_BEFORE_MASK,
+                Component::PseudoElement(PseudoElement::After) => PSEUDO_AFTER_MASK,
+                Component::PseudoElement(PseudoElement::FirstLine) => PSEUDO_FIRST_LINE_MASK,
+                Component::PseudoElement(PseudoElement::FirstLetter) => PSEUDO_FIRST_LETTER_MASK,
+                _ => 0,
+            }
+        })
+    })
 }
 
 fn component_is_web_valid(component: &Component<'_>, context: SelectorContext) -> bool {
