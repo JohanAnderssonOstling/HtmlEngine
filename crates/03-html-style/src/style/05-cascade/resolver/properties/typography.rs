@@ -1,7 +1,7 @@
 use super::*;
 
 #[allow(unused_variables)]
-pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'_>) -> bool {
+pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'_>) -> ApplyResult {
     let doc = context.doc;
     let styles = &mut *context.styles;
     let style = &mut *context.style;
@@ -29,7 +29,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 environment,
             )
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.font.font_size = font_size;
             style.font.font_size_x_height_px = x_height_px;
@@ -54,7 +54,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
         }
         Property::FontWeight(weight) => {
             let Some(weight) = checked_font_weight(weight, parent_font_weight) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.font.font_weight = weight;
         }
@@ -77,7 +77,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 doc.root_font_size(),
                 environment,
             ) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.font.font_size = values.font_size;
             style.font.font_size_x_height_px = 0.0;
@@ -105,7 +105,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             style.font.font_kerning_features.clear();
             style.font.font_feature_settings.clear();
         }
-        _ => return false,
+        _ => return ApplyResult::Unhandled,
     }
-    true
+    ApplyResult::Applied
 }

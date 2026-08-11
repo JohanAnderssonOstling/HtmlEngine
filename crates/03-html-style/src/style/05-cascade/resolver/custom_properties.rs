@@ -1,45 +1,81 @@
 //! Custom-property collection, cycle detection, inheritance, and substitution.
 
 use super::*;
+use specified::{CascadeBoundary, build_cascade_events};
 
-pub(super) fn collect_custom_properties<'a>(
-    custom_properties: &mut FxHashMap<String, TokenList<'a>>,
-    parent_custom: &FxHashMap<String, TokenList<'a>>,
-    declarations: &[Property<'a>],
-    revert_basis: &FxHashMap<String, TokenList<'a>>,
-    revert_layer_basis: &FxHashMap<String, TokenList<'a>>,
-) {
-    for property in declarations {
-        let (name, value) = match property {
-            Property::Custom(custom) => {
-                let raw_name = custom.name.as_ref();
-                if !raw_name.starts_with("--") {
-                    continue;
-                }
-                (raw_name.to_string(), &custom.value)
-            }
-            Property::Unparsed(unparsed) if unparsed.property_id.name().starts_with("--") => {
-                (unparsed.property_id.name().to_string(), &unparsed.value)
-            }
-            _ => continue,
-        };
-        if let Some(keyword) = single_ident_keyword(value)
-            && apply_custom_keyword(
-                custom_properties,
-                parent_custom,
-                revert_basis,
-                revert_layer_basis,
-                &name,
-                keyword,
-            )
-        {
-            continue;
+fn custom_declaration<'property, 'css>(
+    property: &'property Property<'css>,
+) -> Option<(String, &'property TokenList<'css>)> {
+    match property {
+        Property::Custom(custom) if custom.name.as_ref().starts_with("--") => {
+            Some((custom.name.as_ref().to_string(), &custom.value))
         }
-        custom_properties.insert(name, value.clone());
+        Property::Unparsed(unparsed) if unparsed.property_id.name().starts_with("--") => {
+            Some((unparsed.property_id.name().to_string(), &unparsed.value))
+        }
+        _ => None,
     }
 }
 
-pub(super) fn single_ident_keyword<'a>(tokens: &'a TokenList<'a>) -> Option<&'a str> {
+/// Cascade custom properties as specified token values. Rollback discards
+/// candidates by origin/layer rather than cloning the whole map at every
+/// boundary.
+pub(super) fn cascade_custom_properties<'sheet, 'css>(
+    prepared: &PreparedRuleSet<'sheet, 'css>,
+    normal_rules: &[MatchedRule],
+    important_rules: &[MatchedRule],
+    inline_style: Option<&StyleAttribute<'css>>,
+    parent: &FxHashMap<String, TokenList<'css>>,
+) -> FxHashMap<String, TokenList<'css>> {
+    let (events, _) = build_cascade_events(prepared, normal_rules, important_rules, inline_style);
+    let mut values = parent.clone();
+    let mut decided = HashSet::new();
+    let mut rollbacks = FxHashMap::<String, Vec<(CascadeBoundary, bool)>>::default();
+
+    for event in events.iter().rev() {
+        let Some((name, value)) = custom_declaration(event.property) else {
+            continue;
+        };
+        if decided.contains(&name)
+            || rollbacks.get(&name).is_some_and(|entries| {
+                entries
+                    .iter()
+                    .any(|(boundary, layer)| boundary.rollback_excludes(event.boundary, *layer))
+            })
+        {
+            continue;
+        }
+        let keyword = single_ident_keyword(value).map(str::to_ascii_lowercase);
+        match keyword.as_deref() {
+            Some("revert") => rollbacks
+                .entry(name)
+                .or_default()
+                .push((event.boundary, false)),
+            Some("revert-layer") => rollbacks
+                .entry(name)
+                .or_default()
+                .push((event.boundary, true)),
+            Some("initial") => {
+                values.remove(&name);
+                decided.insert(name);
+            }
+            Some("inherit" | "unset") => {
+                // `values` began as the inherited map.
+                decided.insert(name);
+            }
+            _ => {
+                values.insert(name.clone(), value.clone());
+                decided.insert(name);
+            }
+        }
+    }
+    resolve_custom_properties(&mut values, parent);
+    values
+}
+
+pub(super) fn single_ident_keyword<'tokens, 'css>(
+    tokens: &'tokens TokenList<'css>,
+) -> Option<&'tokens str> {
     let mut iter = tokens.0.iter().filter(|token| !is_ignorable_token(token));
     let first = iter.next()?;
     if iter.next().is_some() {
@@ -56,45 +92,6 @@ pub(super) fn is_ignorable_token(token: &TokenOrValue) -> bool {
         token,
         TokenOrValue::Token(Token::WhiteSpace(_)) | TokenOrValue::Token(Token::Comment(_))
     )
-}
-
-pub(super) fn apply_custom_keyword<'a>(
-    custom_properties: &mut FxHashMap<String, TokenList<'a>>,
-    parent_custom: &FxHashMap<String, TokenList<'a>>,
-    revert_basis: &FxHashMap<String, TokenList<'a>>,
-    revert_layer_basis: &FxHashMap<String, TokenList<'a>>,
-    name: &str,
-    keyword: &str,
-) -> bool {
-    let keyword = keyword.to_ascii_lowercase();
-    match keyword.as_str() {
-        "inherit" | "unset" => {
-            if let Some(value) = parent_custom.get(name) {
-                custom_properties.insert(name.to_string(), value.clone());
-            } else {
-                custom_properties.remove(name);
-            }
-        }
-        "initial" => {
-            custom_properties.remove(name);
-        }
-        "revert" => {
-            if let Some(value) = revert_basis.get(name) {
-                custom_properties.insert(name.to_string(), value.clone());
-            } else {
-                custom_properties.remove(name);
-            }
-        }
-        "revert-layer" => {
-            if let Some(value) = revert_layer_basis.get(name) {
-                custom_properties.insert(name.to_string(), value.clone());
-            } else {
-                custom_properties.remove(name);
-            }
-        }
-        _ => return false,
-    }
-    true
 }
 
 struct CustomPropertyDependencyCollector {

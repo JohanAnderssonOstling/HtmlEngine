@@ -304,6 +304,17 @@ mod tests {
     }
 
     #[test]
+    fn important_inline_revert_layer_keeps_author_stylesheet_rules() {
+        let html = "<html><body><div id='target' style='background-color: red !important; background-color: revert-layer !important'></div></body></html>";
+        let mut factory = DocumentFactory::new();
+        let document = factory.parse_with_new_pipeline(html, Some("#target { background-color: green !important }"));
+        let node = document.document().node_ids().find(|&node| document.document().get_dom_id(node) == Some("target")).expect("target");
+        let style = document.style_for_node(node).expect("computed style");
+
+        assert_eq!(document.background_style(style).expect("background").background_color, 0x008000FF);
+    }
+
+    #[test]
     fn all_revert_layer_restores_every_property_from_the_previous_layer() {
         let html = "<html><body><div id='target'></div></body></html>";
         let css = "@layer { #target { width: 100px; height: 100px; background-color: green } } @layer { #target { width: 200px; height: 200px; background-color: red } #target { all: revert-layer } }";
@@ -641,6 +652,40 @@ mod tests {
 
         let cell_style = document.style_for_node(node_by_id("cell")).expect("computed cell style");
         assert_eq!(document.background_style(cell_style).expect("cell background style").background_color, 0x0000FFFF, "author CSS should override the bgcolor hint");
+    }
+
+    #[test]
+    fn author_revert_also_rolls_back_the_presentational_hint_origin() {
+        let html = "<html><body><table><tr><td id='target' bgcolor='red' style='background-color:revert'>Cell</td></tr></table></body></html>";
+        let mut factory = DocumentFactory::new();
+        let document = factory.parse_with_new_pipeline(html, None);
+        let node = document.document().node_ids().find(|&node| document.document().get_dom_id(node) == Some("target")).expect("target");
+        let style = document.style_for_node(node).expect("computed style");
+
+        assert_eq!(document.background_style(style).expect("background").background_color, 0x00000000);
+    }
+
+    #[test]
+    fn revert_layer_can_expose_the_presentational_hint_origin() {
+        let html = "<html><body><img id='target' width='123' style='width:revert-layer'></body></html>";
+        let mut factory = DocumentFactory::new();
+        let document = factory.parse_with_new_pipeline(html, None);
+        let node = document.document().node_ids().find(|&node| document.document().get_dom_id(node) == Some("target")).expect("target");
+        let style = document.style_for_node(node).expect("computed style");
+
+        assert_eq!(document.box_model_style(style).expect("box style").width, PreferredSize::Px(123.0));
+    }
+
+    #[test]
+    fn all_revert_removes_hints_except_direction() {
+        let html = "<html><body><table><tr><td id='target' dir='rtl' bgcolor='red' style='all:revert'>Cell</td></tr></table></body></html>";
+        let mut factory = DocumentFactory::new();
+        let document = factory.parse_with_new_pipeline(html, None);
+        let node = document.document().node_ids().find(|&node| document.document().get_dom_id(node) == Some("target")).expect("target");
+        let style = document.style_for_node(node).expect("computed style");
+
+        assert_eq!(document.background_style(style).expect("background").background_color, 0x00000000);
+        assert_eq!(document.text_style(style).expect("text style").direction, TextDirection::Rtl);
     }
 
     #[test]

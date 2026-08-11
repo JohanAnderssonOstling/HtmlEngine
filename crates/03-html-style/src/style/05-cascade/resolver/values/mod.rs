@@ -33,14 +33,6 @@ pub(super) fn parse_line_height(
     }
 }
 
-pub(super) fn checked_line_height(
-    lh: &lightningcss::properties::font::LineHeight,
-    font_size: f32,
-    root_font_size: f32,
-) -> Option<f32> {
-    checked_line_height_components(lh, font_size, root_font_size).map(|components| components.0)
-}
-
 pub(super) fn checked_line_height_components(
     lh: &lightningcss::properties::font::LineHeight,
     font_size: f32,

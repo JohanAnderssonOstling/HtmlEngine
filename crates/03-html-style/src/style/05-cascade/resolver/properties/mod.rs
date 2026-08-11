@@ -18,6 +18,13 @@ use legacy::*;
 use raw::*;
 use unparsed::apply_unparsed_property;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ApplyResult {
+    Applied,
+    Invalid,
+    Unhandled,
+}
+
 pub(super) struct PropertyContext<'a, 'doc> {
     pub(super) doc: &'a ResolutionDocument<'doc>,
     pub(super) styles: &'a mut ComputedStylesBuilder,
@@ -38,8 +45,6 @@ pub(super) fn apply_property_in_phase<'a>(
     environment: crate::MediaEnvironment,
     phase: CascadePhase,
     parent: &ParentStyle,
-    revert_basis: &WorkingStyle,
-    revert_layer_basis: &WorkingStyle,
 ) {
     set_line_height_resolution_bases(doc, styles, property, style, parent);
     // Preserve whether the winning background establishes an image layer even
@@ -89,20 +94,12 @@ pub(super) fn apply_property_in_phase<'a>(
                 let basis = parent.unset_working_style(doc.root_font_size());
                 apply_all_from_basis(style, &basis, phase);
             }
-            CSSWideKeyword::Revert => apply_all_from_basis(style, revert_basis, phase),
-            CSSWideKeyword::RevertLayer => apply_all_from_basis(style, revert_layer_basis, phase),
+            // Winner selection consumes rollback keywords before conversion.
+            CSSWideKeyword::Revert | CSSWideKeyword::RevertLayer => {}
         }
         return;
     }
-    if try_apply_css_wide_keyword(
-        style,
-        property,
-        parent,
-        doc.root_font_size(),
-        phase,
-        revert_basis,
-        revert_layer_basis,
-    ) {
+    if try_apply_css_wide_keyword(style, property, parent, doc.root_font_size(), phase) {
         return;
     }
     match phase {
@@ -115,16 +112,18 @@ pub(super) fn apply_property_in_phase<'a>(
                 };
                 resolve_logical_text_alignments(&mut style.text);
             }
-            Property::FontSize(_) | Property::LineHeight(_) | Property::Color(_) => apply_property(
-                doc,
-                styles,
-                style,
-                property,
-                parent_font_size,
-                parent.font.font_weight,
-                parent.text.color,
-                environment,
-            ),
+            Property::FontSize(_) | Property::LineHeight(_) | Property::Color(_) => {
+                let _ = apply_property(
+                    doc,
+                    styles,
+                    style,
+                    property,
+                    parent_font_size,
+                    parent.font.font_weight,
+                    parent.text.color,
+                    environment,
+                );
+            }
             Property::Font(font) => {
                 let Some(values) = checked_font_shorthand(
                     font,
@@ -175,7 +174,7 @@ pub(super) fn apply_property_in_phase<'a>(
                     style.text.line_height_x_height_px,
                     style.text.line_height_normal,
                 );
-                apply_property(
+                let _ = apply_property(
                     doc,
                     styles,
                     style,
@@ -208,16 +207,18 @@ pub(super) fn apply_property_in_phase<'a>(
                     }
                 }
             }
-            _ => apply_property(
-                doc,
-                styles,
-                style,
-                property,
-                parent_font_size,
-                parent.font.font_weight,
-                parent.text.color,
-                environment,
-            ),
+            _ => {
+                let _ = apply_property(
+                    doc,
+                    styles,
+                    style,
+                    property,
+                    parent_font_size,
+                    parent.font.font_weight,
+                    parent.text.color,
+                    environment,
+                );
+            }
         },
     }
 }
@@ -231,7 +232,7 @@ fn apply_property<'a>(
     parent_font_weight: u16,
     parent_color: u32,
     environment: crate::MediaEnvironment,
-) {
+) -> ApplyResult {
     let resolved_root_font_size = root_font_size_for_resolution(doc, styles);
     let resolved_document = ResolutionDocument {
         document: doc,
@@ -239,7 +240,7 @@ fn apply_property<'a>(
     };
     let doc = &resolved_document;
     if apply_unparsed_property(styles, style, property) {
-        return;
+        return ApplyResult::Applied;
     }
     let mut context = PropertyContext {
         doc,
@@ -251,13 +252,50 @@ fn apply_property<'a>(
         parent_color,
         environment,
     };
-    if typography::apply(&mut context, property)
-        || text::apply(&mut context, property)
-        || paint::apply(&mut context, property)
-        || box_model::apply(&mut context, property)
-        || layout::apply(&mut context, property)
-        || misc::apply(&mut context, property)
-    {
-        return;
+    for result in [
+        typography::apply(&mut context, property),
+        text::apply(&mut context, property),
+    ] {
+        if result != ApplyResult::Unhandled {
+            return result;
+        }
     }
+    if paint::apply(&mut context, property) {
+        return ApplyResult::Applied;
+    }
+    for result in [
+        box_model::apply(&mut context, property),
+        layout::apply(&mut context, property),
+    ] {
+        if result != ApplyResult::Unhandled {
+            return result;
+        }
+    }
+    if misc::apply(&mut context, property) {
+        return ApplyResult::Applied;
+    }
+    ApplyResult::Unhandled
+}
+
+pub(super) fn property_is_computable(
+    doc: &Document,
+    styles: &mut ComputedStylesBuilder,
+    base: &WorkingStyle,
+    property: &Property<'_>,
+    parent_font_size: f32,
+    parent: &ParentStyle,
+    environment: crate::MediaEnvironment,
+) -> bool {
+    let mut scratch = base.clone();
+    set_line_height_resolution_bases(doc, styles, property, &scratch, parent);
+    apply_property(
+        doc,
+        styles,
+        &mut scratch,
+        property,
+        parent_font_size,
+        parent.font.font_weight,
+        parent.text.color,
+        environment,
+    ) != ApplyResult::Invalid
 }

@@ -1,7 +1,7 @@
 use super::*;
 
 #[allow(unused_variables)]
-pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'_>) -> bool {
+pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'_>) -> ApplyResult {
     let doc = context.doc;
     let styles = &mut *context.styles;
     let style = &mut *context.style;
@@ -33,7 +33,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                     DisplayKeyword::RubyBase
                     | DisplayKeyword::RubyText
                     | DisplayKeyword::RubyBaseContainer
-                    | DisplayKeyword::RubyTextContainer => return true,
+                    | DisplayKeyword::RubyTextContainer => return ApplyResult::Invalid,
                 },
                 LcDisplay::Pair(pair)
                     if pair.is_list_item
@@ -49,7 +49,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 {
                     Display::FlowRootListItem
                 }
-                LcDisplay::Pair(pair) if pair.is_list_item => return true,
+                LcDisplay::Pair(pair) if pair.is_list_item => return ApplyResult::Invalid,
                 LcDisplay::Pair(pair) => match (&pair.outside, &pair.inside) {
                     (DisplayOutside::Block, DisplayInside::Table) => Display::Table,
                     (DisplayOutside::Inline, DisplayInside::Table) => Display::InlineTable,
@@ -63,7 +63,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                     (DisplayOutside::Inline, DisplayInside::Grid) => Display::InlineGrid,
                     // Flow-root, ruby, run-in, and legacy box layout are not
                     // silently approximated by normal flow.
-                    _ => return true,
+                    _ => return ApplyResult::Invalid,
                 },
             };
             style.box_model.display = display;
@@ -76,32 +76,32 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
         }
         Property::FlexGrow(value, _) => {
             let Some(value) = checked_flex_factor(*value) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.layout.flex_grow = value;
         }
         Property::FlexShrink(value, _) => {
             let Some(value) = checked_flex_factor(*value) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.layout.flex_shrink = value;
         }
         Property::FlexBasis(value, _) => {
             let Some(value) = flex_basis(value, &style.font, doc.root_font_size(), styles) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.layout.flex_basis = value;
         }
         Property::Flex(value, _) => {
             let Some(basis) = flex_basis(&value.basis, &style.font, doc.root_font_size(), styles)
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             let (Some(grow), Some(shrink)) = (
                 checked_flex_factor(value.grow),
                 checked_flex_factor(value.shrink),
             ) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.layout.flex_grow = grow;
             style.layout.flex_shrink = shrink;
@@ -110,38 +110,38 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
         Property::Order(value, _) => style.layout.order = *value,
         Property::AlignContent(value, _) => {
             let Some(value) = content_alignment(value) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.layout.align_content = value;
         }
         Property::JustifyContent(value, _) => style.layout.justify_content = justify_content(value),
         Property::AlignItems(value, _) => {
             let Some(value) = align_items(value) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.layout.align_items = value;
         }
         Property::AlignSelf(value, _) => {
             let Some(value) = align_self(value) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.layout.align_self = value;
         }
         Property::JustifyItems(value) => {
             let Some(value) = justify_items(value) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.layout.justify_items = value;
         }
         Property::JustifySelf(value) => {
             let Some(value) = justify_self(value) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.layout.justify_self = value;
         }
         Property::PlaceContent(value) => {
             let Some(align) = content_alignment(&value.align) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.layout.align_content = align;
             style.layout.justify_content = justify_content(&value.justify);
@@ -150,7 +150,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             let (Some(align), Some(justify)) =
                 (align_items(&value.align), justify_items(&value.justify))
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.layout.align_items = align;
             style.layout.justify_items = justify;
@@ -159,20 +159,20 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             let (Some(align), Some(justify)) =
                 (align_self(&value.align), justify_self(&value.justify))
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.layout.align_self = align;
             style.layout.justify_self = justify;
         }
         Property::RowGap(value) => {
             let Some(value) = gap_value(value, style.font.font_size, doc.root_font_size()) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.layout.row_gap = value;
         }
         Property::ColumnGap(value) => {
             let Some(value) = gap_value(value, style.font.font_size, doc.root_font_size()) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.layout.column_gap = value;
         }
@@ -181,7 +181,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 gap_value(&value.row, style.font.font_size, doc.root_font_size()),
                 gap_value(&value.column, style.font.font_size, doc.root_font_size()),
             ) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.layout.row_gap = row;
             style.layout.column_gap = column;
@@ -190,7 +190,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             let Some((tracks, names)) =
                 grid_template_tracks(styles, value, style.font.font_size, doc.root_font_size())
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.layout.grid_template_rows = tracks;
             style.layout.grid_template_row_names = names;
@@ -199,7 +199,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             let Some((tracks, names)) =
                 grid_template_tracks(styles, value, style.font.font_size, doc.root_font_size())
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.layout.grid_template_columns = tracks;
             style.layout.grid_template_column_names = names;
@@ -207,21 +207,21 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
         Property::GridAutoRows(value) => {
             let Some(value) = grid_auto_tracks(value, style.font.font_size, doc.root_font_size())
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.layout.grid_auto_rows = value;
         }
         Property::GridAutoColumns(value) => {
             let Some(value) = grid_auto_tracks(value, style.font.font_size, doc.root_font_size())
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.layout.grid_auto_columns = value;
         }
         Property::GridAutoFlow(value) => style.layout.grid_auto_flow = grid_auto_flow(*value),
         Property::GridTemplateAreas(value) => {
             let Some((areas, rows, columns)) = grid_template_areas(styles, value) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.layout.grid_template_areas = areas;
             style.layout.grid_template_area_rows = rows;
@@ -248,7 +248,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 grid_template_areas(styles, &value.areas),
             )
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.layout.grid_template_rows = rows;
             style.layout.grid_template_row_names = row_names;
@@ -287,7 +287,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 ),
             )
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.layout.grid_template_rows = rows;
             style.layout.grid_template_row_names = row_names;
@@ -302,25 +302,25 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
         }
         Property::GridRowStart(value) => {
             let Some(value) = grid_placement(styles, value) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.layout.grid_row.start = value;
         }
         Property::GridRowEnd(value) => {
             let Some(value) = grid_placement(styles, value) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.layout.grid_row.end = value;
         }
         Property::GridColumnStart(value) => {
             let Some(value) = grid_placement(styles, value) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.layout.grid_column.start = value;
         }
         Property::GridColumnEnd(value) => {
             let Some(value) = grid_placement(styles, value) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.layout.grid_column.end = value;
         }
@@ -329,7 +329,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 grid_placement(styles, &value.start),
                 grid_placement(styles, &value.end),
             ) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.layout.grid_row = GridPlacementRange { start, end };
         }
@@ -338,7 +338,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 grid_placement(styles, &value.start),
                 grid_placement(styles, &value.end),
             ) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.layout.grid_column = GridPlacementRange { start, end };
         }
@@ -349,7 +349,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 grid_placement(styles, &value.row_end),
                 grid_placement(styles, &value.column_end),
             ) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.layout.grid_row = GridPlacementRange {
                 start: row_start,
@@ -360,7 +360,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 end: column_end,
             };
         }
-        _ => return false,
+        _ => return ApplyResult::Unhandled,
     }
-    true
+    ApplyResult::Applied
 }

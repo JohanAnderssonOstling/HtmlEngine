@@ -1,7 +1,7 @@
 use super::*;
 
 #[allow(unused_variables)]
-pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'_>) -> bool {
+pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'_>) -> ApplyResult {
     let doc = context.doc;
     let styles = &mut *context.styles;
     let style = &mut *context.style;
@@ -16,7 +16,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             let Some(value) = size_to_preferred(size, &style.font, resolved_root_font_size, styles)
                 .and_then(non_negative_preferred_size)
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.box_model.width = value;
         }
@@ -24,14 +24,14 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             let Some(value) = size_to_preferred(size, &style.font, resolved_root_font_size, styles)
                 .and_then(non_negative_preferred_size)
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.box_model.height = value;
         }
         Property::AspectRatio(value) => {
             let components = value.ratio.as_ref().map(|ratio| (ratio.0, ratio.1));
             let Some(value) = ComputedAspectRatio::new(value.auto, components) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.box_model.aspect_ratio = value;
         }
@@ -39,19 +39,19 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             let Some(horizontal) =
                 length_to_px_from_length(&spacing.0, style.font.font_size, doc.root_font_size())
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             let Some(vertical) =
                 length_to_px_from_length(&spacing.1, style.font.font_size, doc.root_font_size())
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             if !horizontal.is_finite()
                 || !vertical.is_finite()
                 || horizontal < 0.0
                 || vertical < 0.0
             {
-                return true;
+                return ApplyResult::Invalid;
             }
             style.box_model.border_spacing_horizontal = horizontal;
             style.box_model.border_spacing_vertical = vertical;
@@ -60,7 +60,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             let Some(value) = size_to_preferred(size, &style.font, doc.root_font_size(), styles)
                 .and_then(non_negative_preferred_size)
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.box_model.min_width = value;
         }
@@ -68,7 +68,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             let Some(value) = size_to_preferred(size, &style.font, doc.root_font_size(), styles)
                 .and_then(non_negative_preferred_size)
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.box_model.min_height = value;
         }
@@ -77,7 +77,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 max_size_to_preferred(max_size, &style.font, doc.root_font_size(), styles)
                     .and_then(non_negative_preferred_size)
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.box_model.max_width = value;
         }
@@ -86,7 +86,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 max_size_to_preferred(max_size, &style.font, doc.root_font_size(), styles)
                     .and_then(non_negative_preferred_size)
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.box_model.max_height = value;
         }
@@ -94,7 +94,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             let Some(value) = size_to_preferred(size, &style.font, doc.root_font_size(), styles)
                 .and_then(non_negative_preferred_size)
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.box_model.width = value;
         }
@@ -102,7 +102,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             let Some(value) = size_to_preferred(size, &style.font, doc.root_font_size(), styles)
                 .and_then(non_negative_preferred_size)
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.box_model.height = value;
         }
@@ -110,7 +110,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             let Some(value) = size_to_preferred(size, &style.font, doc.root_font_size(), styles)
                 .and_then(non_negative_preferred_size)
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.box_model.min_width = value;
         }
@@ -118,7 +118,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             let Some(value) = size_to_preferred(size, &style.font, doc.root_font_size(), styles)
                 .and_then(non_negative_preferred_size)
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.box_model.min_height = value;
         }
@@ -127,7 +127,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 max_size_to_preferred(size, &style.font, doc.root_font_size(), styles)
                     .and_then(non_negative_preferred_size)
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.box_model.max_width = value;
         }
@@ -136,7 +136,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 max_size_to_preferred(size, &style.font, doc.root_font_size(), styles)
                     .and_then(non_negative_preferred_size)
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.box_model.max_height = value;
         }
@@ -149,7 +149,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 Position::Static => PositionMode::Static,
                 Position::Relative => PositionMode::Relative,
                 Position::Absolute => PositionMode::Absolute,
-                Position::Fixed | Position::Sticky(_) => return true,
+                Position::Fixed | Position::Sticky(_) => return ApplyResult::Invalid,
             };
         }
         Property::ZIndex(value) => {
@@ -161,25 +161,25 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
         }
         Property::Top(value) => {
             let Some(value) = inset_value(value, style.font.font_size, doc.root_font_size()) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.layout.inset_top = value;
         }
         Property::Right(value) => {
             let Some(value) = inset_value(value, style.font.font_size, doc.root_font_size()) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.layout.inset_right = value;
         }
         Property::Bottom(value) => {
             let Some(value) = inset_value(value, style.font.font_size, doc.root_font_size()) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.layout.inset_bottom = value;
         }
         Property::Left(value) => {
             let Some(value) = inset_value(value, style.font.font_size, doc.root_font_size()) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.layout.inset_left = value;
         }
@@ -190,7 +190,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 inset_value(&value.bottom, style.font.font_size, doc.root_font_size()),
                 inset_value(&value.left, style.font.font_size, doc.root_font_size()),
             ) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.layout.inset_top = top;
             style.layout.inset_right = right;
@@ -201,13 +201,13 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
         // Margin
         Property::MarginTop(m) => {
             let Some(value) = margin_value(m, style.font.font_size, doc.root_font_size()) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             (style.box_model.margin_top, style.layout.margin_top_auto) = value;
         }
         Property::MarginBottom(m) => {
             let Some(value) = margin_value(m, style.font.font_size, doc.root_font_size()) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             (
                 style.box_model.margin_bottom,
@@ -216,13 +216,13 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
         }
         Property::MarginLeft(m) => {
             let Some(value) = margin_value(m, style.font.font_size, doc.root_font_size()) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             (style.box_model.margin_left, style.layout.margin_left_auto) = value;
         }
         Property::MarginRight(m) => {
             let Some(value) = margin_value(m, style.font.font_size, doc.root_font_size()) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             (style.box_model.margin_right, style.layout.margin_right_auto) = value;
         }
@@ -233,7 +233,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 margin_value(&m.left, style.font.font_size, doc.root_font_size()),
                 margin_value(&m.right, style.font.font_size, doc.root_font_size()),
             ) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             (style.box_model.margin_top, style.layout.margin_top_auto) = top;
             (
@@ -248,20 +248,20 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 margin_value(&m.block_start, style.font.font_size, doc.root_font_size()),
                 margin_value(&m.block_end, style.font.font_size, doc.root_font_size()),
             ) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             set_margin_side(style, 0, start);
             set_margin_side(style, 2, end);
         }
         Property::MarginBlockStart(m) => {
             let Some(value) = margin_value(m, style.font.font_size, doc.root_font_size()) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             set_margin_side(style, 0, value);
         }
         Property::MarginBlockEnd(m) => {
             let Some(value) = margin_value(m, style.font.font_size, doc.root_font_size()) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             set_margin_side(style, 2, value);
         }
@@ -271,7 +271,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 margin_value(&m.inline_start, style.font.font_size, doc.root_font_size()),
                 margin_value(&m.inline_end, style.font.font_size, doc.root_font_size()),
             ) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             set_margin_side(style, start, start_value);
             set_margin_side(style, end, end_value);
@@ -279,14 +279,14 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
         Property::MarginInlineStart(m) => {
             let (start, _) = inline_sides(style.text.direction);
             let Some(value) = margin_value(m, style.font.font_size, doc.root_font_size()) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             set_margin_side(style, start, value);
         }
         Property::MarginInlineEnd(m) => {
             let (_, end) = inline_sides(style.text.direction);
             let Some(value) = margin_value(m, style.font.font_size, doc.root_font_size()) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             set_margin_side(style, end, value);
         }
@@ -297,7 +297,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 length_or_auto_to_lengthpct(p, style.font.font_size, doc.root_font_size())
                     .and_then(non_negative_length_pct)
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.box_model.padding_top = value;
         }
@@ -306,7 +306,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 length_or_auto_to_lengthpct(p, style.font.font_size, doc.root_font_size())
                     .and_then(non_negative_length_pct)
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.box_model.padding_bottom = value;
         }
@@ -315,7 +315,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 length_or_auto_to_lengthpct(p, style.font.font_size, doc.root_font_size())
                     .and_then(non_negative_length_pct)
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.box_model.padding_left = value;
         }
@@ -324,7 +324,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 length_or_auto_to_lengthpct(p, style.font.font_size, doc.root_font_size())
                     .and_then(non_negative_length_pct)
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.box_model.padding_right = value;
         }
@@ -339,7 +339,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 length_or_auto_to_lengthpct(&p.left, style.font.font_size, doc.root_font_size())
                     .and_then(non_negative_length_pct),
             ) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.box_model.padding_top = top;
             style.box_model.padding_right = right;
@@ -361,7 +361,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 )
                 .and_then(non_negative_length_pct),
             ) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             set_padding_side(style, 0, start);
             set_padding_side(style, 2, end);
@@ -371,7 +371,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 length_or_auto_to_lengthpct(p, style.font.font_size, doc.root_font_size())
                     .and_then(non_negative_length_pct)
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             set_padding_side(style, 0, value);
         }
@@ -380,7 +380,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 length_or_auto_to_lengthpct(p, style.font.font_size, doc.root_font_size())
                     .and_then(non_negative_length_pct)
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             set_padding_side(style, 2, value);
         }
@@ -399,7 +399,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 )
                 .and_then(non_negative_length_pct),
             ) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             let (start, end) = inline_sides(style.text.direction);
             set_padding_side(style, start, start_value);
@@ -410,7 +410,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 length_or_auto_to_lengthpct(p, style.font.font_size, doc.root_font_size())
                     .and_then(non_negative_length_pct)
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             let (start, _) = inline_sides(style.text.direction);
             set_padding_side(style, start, value);
@@ -420,7 +420,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 length_or_auto_to_lengthpct(p, style.font.font_size, doc.root_font_size())
                     .and_then(non_negative_length_pct)
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             let (_, end) = inline_sides(style.text.direction);
             set_padding_side(style, end, value);
@@ -434,7 +434,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 checked_border_width(&bw.bottom, style.font.font_size, doc.root_font_size()),
                 checked_border_width(&bw.left, style.font.font_size, doc.root_font_size()),
             ) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.border.border_top_width = top;
             style.border.border_right_width = right;
@@ -444,28 +444,28 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
         Property::BorderTopWidth(w) => {
             let Some(width) = checked_border_width(w, style.font.font_size, doc.root_font_size())
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.border.border_top_width = width;
         }
         Property::BorderRightWidth(w) => {
             let Some(width) = checked_border_width(w, style.font.font_size, doc.root_font_size())
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.border.border_right_width = width;
         }
         Property::BorderBottomWidth(w) => {
             let Some(width) = checked_border_width(w, style.font.font_size, doc.root_font_size())
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.border.border_bottom_width = width;
         }
         Property::BorderLeftWidth(w) => {
             let Some(width) = checked_border_width(w, style.font.font_size, doc.root_font_size())
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.border.border_left_width = width;
         }
@@ -509,7 +509,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             let Some(width) =
                 checked_border_width(&b.width, style.font.font_size, doc.root_font_size())
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             let border_style = line_style_to_border_style(&b.style);
             style.border.border_top_width = width;
@@ -529,7 +529,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             let Some(width) =
                 checked_border_width(&b.width, style.font.font_size, doc.root_font_size())
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.border.border_top_width = width;
             set_border_css_color(style, 0, &b.color);
@@ -539,7 +539,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             let Some(width) =
                 checked_border_width(&b.width, style.font.font_size, doc.root_font_size())
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.border.border_right_width = width;
             set_border_css_color(style, 1, &b.color);
@@ -549,7 +549,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             let Some(width) =
                 checked_border_width(&b.width, style.font.font_size, doc.root_font_size())
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.border.border_bottom_width = width;
             set_border_css_color(style, 2, &b.color);
@@ -559,7 +559,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             let Some(width) =
                 checked_border_width(&b.width, style.font.font_size, doc.root_font_size())
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.border.border_left_width = width;
             set_border_css_color(style, 3, &b.color);
@@ -580,7 +580,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                     doc.root_font_size(),
                 ),
             ) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.radii.top_left = top_left;
             style.radii.top_right = top_right;
@@ -590,35 +590,35 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
         Property::BorderTopLeftRadius(value, _) => {
             let Some(value) = corner_radius(value, style.font.font_size, doc.root_font_size())
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.radii.top_left = value;
         }
         Property::BorderTopRightRadius(value, _) => {
             let Some(value) = corner_radius(value, style.font.font_size, doc.root_font_size())
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.radii.top_right = value;
         }
         Property::BorderBottomRightRadius(value, _) => {
             let Some(value) = corner_radius(value, style.font.font_size, doc.root_font_size())
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.radii.bottom_right = value;
         }
         Property::BorderBottomLeftRadius(value, _) => {
             let Some(value) = corner_radius(value, style.font.font_size, doc.root_font_size())
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.radii.bottom_left = value;
         }
         Property::BorderStartStartRadius(value) => {
             let Some(value) = corner_radius(value, style.font.font_size, doc.root_font_size())
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             set_corner_radius(
                 style,
@@ -633,7 +633,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
         Property::BorderStartEndRadius(value) => {
             let Some(value) = corner_radius(value, style.font.font_size, doc.root_font_size())
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             set_corner_radius(
                 style,
@@ -648,7 +648,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
         Property::BorderEndStartRadius(value) => {
             let Some(value) = corner_radius(value, style.font.font_size, doc.root_font_size())
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             set_corner_radius(
                 style,
@@ -663,7 +663,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
         Property::BorderEndEndRadius(value) => {
             let Some(value) = corner_radius(value, style.font.font_size, doc.root_font_size())
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             set_corner_radius(
                 style,
@@ -682,7 +682,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             let Some(value) =
                 checked_border_width(value, style.font.font_size, doc.root_font_size())
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             set_border_width(style, 0, value);
         }
@@ -690,7 +690,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             let Some(value) =
                 checked_border_width(value, style.font.font_size, doc.root_font_size())
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             set_border_width(style, 2, value);
         }
@@ -698,7 +698,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             let Some(value) =
                 checked_border_width(value, style.font.font_size, doc.root_font_size())
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             set_border_width(style, inline_sides(style.text.direction).0, value);
         }
@@ -706,7 +706,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             let Some(value) =
                 checked_border_width(value, style.font.font_size, doc.root_font_size())
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             set_border_width(style, inline_sides(style.text.direction).1, value);
         }
@@ -715,7 +715,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 checked_border_width(&value.start, style.font.font_size, doc.root_font_size()),
                 checked_border_width(&value.end, style.font.font_size, doc.root_font_size()),
             ) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             set_border_width(style, 0, start);
             set_border_width(style, 2, end);
@@ -725,7 +725,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 checked_border_width(&value.start, style.font.font_size, doc.root_font_size()),
                 checked_border_width(&value.end, style.font.font_size, doc.root_font_size()),
             ) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             let (start_side, end_side) = inline_sides(style.text.direction);
             set_border_width(style, start_side, start);
@@ -795,7 +795,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             if checked_border_width(&value.width, style.font.font_size, doc.root_font_size())
                 .is_none()
             {
-                return true;
+                return ApplyResult::Invalid;
             }
             apply_logical_border(style, 0, value, doc.root_font_size());
             apply_logical_border(style, 2, value, doc.root_font_size());
@@ -804,13 +804,13 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             if checked_border_width(&value.width, style.font.font_size, doc.root_font_size())
                 .is_none()
             {
-                return true;
+                return ApplyResult::Invalid;
             }
             let (start, end) = inline_sides(style.text.direction);
             apply_logical_border(style, start, value, doc.root_font_size());
             apply_logical_border(style, end, value, doc.root_font_size());
         }
-        _ => return false,
+        _ => return ApplyResult::Unhandled,
     }
-    true
+    ApplyResult::Applied
 }

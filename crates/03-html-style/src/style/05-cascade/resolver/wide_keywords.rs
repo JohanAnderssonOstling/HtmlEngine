@@ -1,4 +1,4 @@
-//! CSS-wide keyword application, including origin and layer rollback.
+//! CSS-wide keyword application after cascade winner selection.
 
 use super::*;
 
@@ -55,8 +55,6 @@ pub(super) fn try_apply_css_wide_keyword(
     parent: &ParentStyle,
     root_font_size: f32,
     phase: CascadePhase,
-    revert_basis: &WorkingStyle,
-    revert_layer_basis: &WorkingStyle,
 ) -> bool {
     let (name, value) = match property {
         Property::Unparsed(unparsed) => (unparsed.property_id.name(), &unparsed.value),
@@ -76,8 +74,8 @@ pub(super) fn try_apply_css_wide_keyword(
         parent,
         root_font_size,
         phase,
-        Some(revert_basis),
-        Some(revert_layer_basis),
+        None,
+        None,
     )
 }
 

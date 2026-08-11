@@ -67,6 +67,7 @@ mod parent_style;
 mod plan;
 mod properties;
 mod runner;
+mod specified;
 mod state;
 mod traversal;
 mod values;
@@ -75,7 +76,7 @@ mod wide_keywords;
 use custom_properties::*;
 use parent_style::ParentStyle;
 use plan::*;
-use properties::apply_property_in_phase;
+use properties::{apply_property_in_phase, property_is_computable};
 use runner::{CascadeInputs, CascadePhase};
 use state::{WorkingStyle, initial_border, initial_box_model};
 use traversal::*;
@@ -366,8 +367,6 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
         let CascadePlan {
             normal: matched_rules,
             important: important_rules,
-            rollback_layers,
-            rollback_origins,
         } = CascadePlan::build(matched_rules, prepared);
 
         let inherited = ParentStyle::from_indices(self.styles, inherited_from);
@@ -390,90 +389,19 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
         // override this initial value.
         style.box_model.display = Display::Inline;
         let parent_font_size = style.font.font_size;
-        let mut custom_properties = inherited_custom_properties.clone();
-        let unused_custom_rollback_basis = FxHashMap::default();
-        let mut normal_custom_origin_baselines = Vec::new();
-        let mut normal_custom_baselines = Vec::new();
-        for matched in &matched_rules {
-            let rule = prepared.get(matched.id);
-            let priority = rule.priority();
-            if origin_needs_rollback(&rollback_origins, priority.origin())
-                && !normal_custom_origin_baselines.iter().any(
-                    |(previous, _): &(CascadeOrigin, FxHashMap<String, TokenList<'css>>)| {
-                        *previous == priority.origin()
-                    },
-                )
-            {
-                normal_custom_origin_baselines.push((priority.origin(), custom_properties.clone()));
-            }
-            if layer_needs_rollback(&rollback_layers, priority)
-                && !normal_custom_baselines.iter().any(
-                    |(previous, _): &(RulePriority, FxHashMap<String, TokenList<'css>>)| {
-                        previous.same_origin_and_layer(priority)
-                    },
-                )
-            {
-                normal_custom_baselines.push((priority, custom_properties.clone()));
-            }
-            let origin_basis = normal_custom_origin_baselines
-                .iter()
-                .find_map(|(candidate, basis)| (*candidate == priority.origin()).then_some(basis))
-                .unwrap_or(&unused_custom_rollback_basis);
-            let layer_basis = normal_custom_baselines
-                .iter()
-                .find_map(|(candidate, basis)| {
-                    candidate.same_origin_and_layer(priority).then_some(basis)
-                })
-                .unwrap_or(&unused_custom_rollback_basis);
-            collect_custom_properties(
-                &mut custom_properties,
-                inherited_custom_properties,
-                &rule.style_rule().declarations.declarations,
-                origin_basis,
-                layer_basis,
-            );
-        }
-        for origin in [
-            crate::style::rules::prepared::CascadeOrigin::Author,
-            crate::style::rules::prepared::CascadeOrigin::UserAgent,
-        ] {
-            for matched in important_rules
-                .iter()
-                .filter(|matched| prepared.get(matched.id).priority().origin() == origin)
-            {
-                let rule = prepared.get(matched.id);
-                let origin_basis = normal_custom_origin_baselines
-                    .iter()
-                    .find_map(|(origin, basis)| {
-                        (*origin == rule.priority().origin()).then_some(basis)
-                    })
-                    .unwrap_or(&unused_custom_rollback_basis);
-                let layer_basis = normal_custom_baselines
-                    .iter()
-                    .find_map(|(priority, basis)| {
-                        priority
-                            .same_origin_and_layer(rule.priority())
-                            .then_some(basis)
-                    })
-                    .unwrap_or(&unused_custom_rollback_basis);
-                collect_custom_properties(
-                    &mut custom_properties,
-                    inherited_custom_properties,
-                    &rule.style_rule().declarations.important_declarations,
-                    origin_basis,
-                    layer_basis,
-                );
-            }
-        }
-        resolve_custom_properties(&mut custom_properties, inherited_custom_properties);
+        let custom_properties = cascade_custom_properties(
+            prepared,
+            &matched_rules,
+            &important_rules,
+            None,
+            inherited_custom_properties,
+        );
 
         self.apply_cascade(
             &mut style,
             CascadeInputs {
                 normal_rules: &matched_rules,
                 important_rules: &important_rules,
-                rollback_layers: &rollback_layers,
-                rollback_origins: &rollback_origins,
                 parent_font_size,
                 custom_properties: &custom_properties,
                 parent: &inherited,
@@ -547,8 +475,6 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
         let CascadePlan {
             normal: matched_rules,
             important: important_rules,
-            rollback_layers,
-            mut rollback_origins,
         } = CascadePlan::build(matched_rules, prepared);
         self.timings.selector_matching += matching_started.elapsed();
 
@@ -556,199 +482,15 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
         let cascade_started = Instant::now();
         let mut style = get_inherited_style_dom(doc, self.styles, node_idx);
         let parent_font_size = style.font.font_size;
-        let mut custom_properties = parent_custom.clone().unwrap_or_default();
         let parent_custom = parent_custom.unwrap_or_default();
-        let inline_style_attr = inline_style_attribute(doc, node_idx);
         let inline_style = parse_inline_style_attribute(doc, node_idx);
-        if inline_style.as_ref().is_some_and(|style| {
-            declarations_use_revert(&style.declarations.declarations)
-                || declarations_use_revert(&style.declarations.important_declarations)
-        }) && !rollback_origins.contains(&CascadeOrigin::Author)
-        {
-            rollback_origins.push(CascadeOrigin::Author);
-        }
-        let unused_custom_rollback_basis = FxHashMap::default();
-        let mut ancestor_indices: Vec<_> = doc.dom_ancestors(node_idx).collect();
-        ancestor_indices.reverse();
-        for ancestor_idx in ancestor_indices {
-            if let Some(style_attr) = inline_style_attribute(doc, ancestor_idx) {
-                let lower_origin_basis = style_attr
-                    .to_ascii_lowercase()
-                    .contains("revert")
-                    .then(|| custom_properties.clone());
-                let layer_basis = style_attr
-                    .to_ascii_lowercase()
-                    .contains("revert-layer")
-                    .then(|| custom_properties.clone());
-                collect_inline_style_custom_properties(
-                    &mut custom_properties,
-                    &parent_custom,
-                    lower_origin_basis
-                        .as_ref()
-                        .unwrap_or(&unused_custom_rollback_basis),
-                    layer_basis
-                        .as_ref()
-                        .unwrap_or(&unused_custom_rollback_basis),
-                    &style_attr,
-                );
-            }
-        }
-
-        // Collect custom properties
-        let mut normal_custom_origin_baselines = Vec::new();
-        let mut normal_custom_baselines = Vec::new();
-        for matched in &matched_rules {
-            let rule = prepared.get(matched.id);
-            let priority = rule.priority();
-            if origin_needs_rollback(&rollback_origins, priority.origin())
-                && !normal_custom_origin_baselines.iter().any(
-                    |(previous, _): &(CascadeOrigin, FxHashMap<String, TokenList<'css>>)| {
-                        *previous == priority.origin()
-                    },
-                )
-            {
-                normal_custom_origin_baselines.push((priority.origin(), custom_properties.clone()));
-            }
-            if layer_needs_rollback(&rollback_layers, priority)
-                && !normal_custom_baselines.iter().any(
-                    |(previous, _): &(RulePriority, FxHashMap<String, TokenList<'css>>)| {
-                        previous.same_origin_and_layer(priority)
-                    },
-                )
-            {
-                normal_custom_baselines.push((priority, custom_properties.clone()));
-            }
-            let origin_basis = normal_custom_origin_baselines
-                .iter()
-                .find_map(|(origin, basis)| (*origin == priority.origin()).then_some(basis))
-                .unwrap_or(&unused_custom_rollback_basis);
-            let layer_basis = normal_custom_baselines
-                .iter()
-                .find_map(|(candidate, basis)| {
-                    candidate.same_origin_and_layer(priority).then_some(basis)
-                })
-                .unwrap_or(&unused_custom_rollback_basis);
-            collect_custom_properties(
-                &mut custom_properties,
-                &parent_custom,
-                &rule.style_rule().declarations.declarations,
-                origin_basis,
-                layer_basis,
-            );
-        }
-        if rollback_origins.contains(&CascadeOrigin::Author)
-            && !normal_custom_origin_baselines
-                .iter()
-                .any(|(origin, _)| *origin == CascadeOrigin::Author)
-        {
-            normal_custom_origin_baselines.push((CascadeOrigin::Author, custom_properties.clone()));
-        }
-        if let Some(inline_style) = &inline_style {
-            let origin_basis = normal_custom_origin_baselines
-                .iter()
-                .find_map(|(origin, basis)| (*origin == CascadeOrigin::Author).then_some(basis))
-                .unwrap_or(&unused_custom_rollback_basis);
-            let layer_basis =
-                declarations_use_revert_layer(&inline_style.declarations.declarations)
-                    .then(|| custom_properties.clone());
-            collect_custom_properties(
-                &mut custom_properties,
-                &parent_custom,
-                &inline_style.declarations.declarations,
-                origin_basis,
-                layer_basis
-                    .as_ref()
-                    .unwrap_or(&unused_custom_rollback_basis),
-            );
-        }
-        if let Some(inline_style_attr) = &inline_style_attr {
-            let origin_basis = normal_custom_origin_baselines
-                .iter()
-                .find_map(|(origin, basis)| (*origin == CascadeOrigin::Author).then_some(basis))
-                .unwrap_or(&unused_custom_rollback_basis);
-            let layer_basis = inline_style_attr
-                .to_ascii_lowercase()
-                .contains("revert-layer")
-                .then(|| custom_properties.clone());
-            collect_inline_style_custom_properties(
-                &mut custom_properties,
-                &parent_custom,
-                origin_basis,
-                layer_basis
-                    .as_ref()
-                    .unwrap_or(&unused_custom_rollback_basis),
-                inline_style_attr,
-            );
-        }
-        for matched in important_rules.iter().filter(|matched| {
-            prepared.get(matched.id).priority().origin()
-                == crate::style::rules::prepared::CascadeOrigin::Author
-        }) {
-            let rule = prepared.get(matched.id);
-            let origin_basis = normal_custom_origin_baselines
-                .iter()
-                .find_map(|(origin, basis)| (*origin == rule.priority().origin()).then_some(basis))
-                .unwrap_or(&unused_custom_rollback_basis);
-            let layer_basis = normal_custom_baselines
-                .iter()
-                .find_map(|(priority, basis)| {
-                    priority
-                        .same_origin_and_layer(rule.priority())
-                        .then_some(basis)
-                })
-                .unwrap_or(&unused_custom_rollback_basis);
-            collect_custom_properties(
-                &mut custom_properties,
-                &parent_custom,
-                &rule.style_rule().declarations.important_declarations,
-                origin_basis,
-                layer_basis,
-            );
-        }
-        if let Some(inline_style) = &inline_style {
-            let origin_basis = normal_custom_origin_baselines
-                .iter()
-                .find_map(|(origin, basis)| (*origin == CascadeOrigin::Author).then_some(basis))
-                .unwrap_or(&unused_custom_rollback_basis);
-            let layer_basis =
-                declarations_use_revert_layer(&inline_style.declarations.important_declarations)
-                    .then(|| custom_properties.clone());
-            collect_custom_properties(
-                &mut custom_properties,
-                &parent_custom,
-                &inline_style.declarations.important_declarations,
-                origin_basis,
-                layer_basis
-                    .as_ref()
-                    .unwrap_or(&unused_custom_rollback_basis),
-            );
-        }
-        for matched in important_rules.iter().filter(|matched| {
-            prepared.get(matched.id).priority().origin()
-                == crate::style::rules::prepared::CascadeOrigin::UserAgent
-        }) {
-            let rule = prepared.get(matched.id);
-            let origin_basis = normal_custom_origin_baselines
-                .iter()
-                .find_map(|(origin, basis)| (*origin == rule.priority().origin()).then_some(basis))
-                .unwrap_or(&unused_custom_rollback_basis);
-            let layer_basis = normal_custom_baselines
-                .iter()
-                .find_map(|(priority, basis)| {
-                    priority
-                        .same_origin_and_layer(rule.priority())
-                        .then_some(basis)
-                })
-                .unwrap_or(&unused_custom_rollback_basis);
-            collect_custom_properties(
-                &mut custom_properties,
-                &parent_custom,
-                &rule.style_rule().declarations.important_declarations,
-                origin_basis,
-                layer_basis,
-            );
-        }
-        resolve_custom_properties(&mut custom_properties, &parent_custom);
+        let mut custom_properties = cascade_custom_properties(
+            prepared,
+            &matched_rules,
+            &important_rules,
+            inline_style.as_ref(),
+            &parent_custom,
+        );
 
         let parent_style = ParentStyle::for_node(doc, self.styles, node_idx);
         self.apply_cascade(
@@ -756,8 +498,6 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
             CascadeInputs {
                 normal_rules: &matched_rules,
                 important_rules: &important_rules,
-                rollback_layers: &rollback_layers,
-                rollback_origins: &rollback_origins,
                 parent_font_size,
                 custom_properties: &custom_properties,
                 parent: &parent_style,

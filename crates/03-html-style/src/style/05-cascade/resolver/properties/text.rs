@@ -1,7 +1,7 @@
 use super::*;
 
 #[allow(unused_variables)]
-pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'_>) -> bool {
+pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'_>) -> ApplyResult {
     let doc = context.doc;
     let styles = &mut *context.styles;
     let style = &mut *context.style;
@@ -16,7 +16,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             let Some((line_height, x_height_px)) =
                 checked_line_height_components(lh, style.font.font_size, doc.root_font_size())
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.line_height_spec = Some(lh.clone());
             style.text.line_height_number = line_height_number(lh);
@@ -28,7 +28,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             let Some(value) =
                 spacing_to_text_spacing(spacing, style.font.font_size, doc.root_font_size())
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.text.letter_spacing = value;
         }
@@ -36,7 +36,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             let Some(value) =
                 spacing_to_text_spacing(spacing, style.font.font_size, doc.root_font_size())
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.text.word_spacing = value;
         }
@@ -93,7 +93,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 style.font.font_size,
                 doc.root_font_size(),
             ) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.text.text_indent = value;
             style.text.text_indent_hanging = ti.hanging;
@@ -102,7 +102,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
         Property::TextTransform(tt) => {
             use lightningcss::properties::text::TextTransformCase;
             if !tt.other.is_empty() {
-                return true;
+                return ApplyResult::Invalid;
             }
             style.text.text_transform = match tt.case {
                 TextTransformCase::Uppercase => TextTransform::Uppercase,
@@ -116,7 +116,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
         }
         Property::ListStyleType(lst) => {
             let Some(value) = map_list_style_type(lst) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.text.list_style_type = value;
         }
@@ -128,7 +128,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
         }
         Property::ListStyle(ls) => {
             let Some(list_style_type) = map_list_style_type(&ls.list_style_type) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.text.list_style_type = list_style_type;
             style.text.list_style_position = map_list_style_position(&ls.position);
@@ -139,14 +139,14 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
         }
         Property::TextDecoration(td, _) => {
             let Some(decoration_style) = text_decoration_style(&td.style) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             let Some(thickness) = text_decoration_thickness(
                 &td.thickness,
                 style.font.font_size,
                 doc.root_font_size(),
             ) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.background.text_decoration.lines = text_decoration_lines(&td.line);
             style.background.text_decoration.style = decoration_style;
@@ -158,7 +158,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
         }
         Property::TextDecorationStyle(decoration_style, _) => {
             let Some(decoration_style) = text_decoration_style(decoration_style) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.background.text_decoration.style = decoration_style;
         }
@@ -166,18 +166,18 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             let Some(thickness) =
                 text_decoration_thickness(thickness, style.font.font_size, doc.root_font_size())
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.background.text_decoration.thickness = thickness;
         }
         Property::Outline(outline) => {
             let Some(outline_style) = outline_style(&outline.style) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             let Some(width) =
                 border_width(&outline.width, style.font.font_size, doc.root_font_size())
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.background.outline.set_width(width);
             style.background.outline.style = outline_style;
@@ -186,13 +186,13 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
         Property::OutlineWidth(width) => {
             let Some(width) = border_width(width, style.font.font_size, doc.root_font_size())
             else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.background.outline.set_width(width);
         }
         Property::OutlineStyle(value) => {
             let Some(value) = outline_style(value) else {
-                return true;
+                return ApplyResult::Invalid;
             };
             style.background.outline.style = value;
         }
@@ -214,7 +214,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 VerticalAlign::Length(lp) => {
                     match vertical_align_value(lp, style.font.font_size, doc.root_font_size()) {
                         Some(value) => value,
-                        None => return true,
+                        None => return ApplyResult::Invalid,
                     }
                 }
             };
@@ -247,7 +247,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 LcWhiteSpace::BreakSpaces => WhiteSpace::BreakSpaces,
             };
         }
-        _ => return false,
+        _ => return ApplyResult::Unhandled,
     }
-    true
+    ApplyResult::Applied
 }
