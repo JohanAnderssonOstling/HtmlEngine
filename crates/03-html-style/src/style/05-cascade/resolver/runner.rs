@@ -3,7 +3,7 @@
 use super::*;
 use specified::{
     PropertyTarget, SelectedDeclaration, SpecifiedSelection, build_cascade_events,
-    select_specified_values,
+    declaration_is_custom_property, select_specified_values,
 };
 
 /// The cascade computes dependency roots before values that consume them.
@@ -25,7 +25,7 @@ pub(super) struct CascadeInputs<'a, 'css> {
 
 fn target_phase(target: &PropertyTarget) -> CascadePhase {
     if matches!(
-        target.name.as_str(),
+        &*target.name,
         "direction" | "font-size" | "line-height" | "color"
     ) {
         CascadePhase::Prerequisites
@@ -87,6 +87,9 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
     }
 
     fn declaration_is_eligible(&self, property: &Property<'_>) -> bool {
+        if declaration_is_custom_property(property) {
+            return false;
+        }
         if matches!(property, Property::All(_)) || wide_keyword(property).is_some() {
             return true;
         }
@@ -138,6 +141,7 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
         property_is_computable(
             self.doc,
             self.styles,
+            self.validation_style,
             style,
             property,
             parent_font_size,
@@ -155,7 +159,7 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
         phase: CascadePhase,
         parent: &ParentStyle,
     ) {
-        if target.name != "all" && target_phase(target) != phase {
+        if &*target.name != "all" && target_phase(target) != phase {
             return;
         }
         if let Some(keyword) = wide_keyword(property) {
@@ -221,7 +225,7 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
                     .or_else(|| resolve_single_var_property(unparsed, var_map));
                 let Some(property) = resolved_unparsed.as_ref() else {
                     for target in &declaration.targets {
-                        if target.name == "all" || target_phase(target) == phase {
+                        if &*target.name == "all" || target_phase(target) == phase {
                             let _ = apply_css_wide_keyword_in_phase(
                                 style,
                                 &target.name,
@@ -247,7 +251,7 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
                 value.value.substitute_variables(var_map);
                 if token_list_contains_var(&value.value) {
                     for target in &declaration.targets {
-                        if target.name == "all" || target_phase(target) == phase {
+                        if &*target.name == "all" || target_phase(target) == phase {
                             let _ = apply_css_wide_keyword_in_phase(
                                 style,
                                 &target.name,
@@ -278,7 +282,7 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
                 || !self.declaration_is_computable(style, resolved, parent_font_size, parent))
         {
             for target in &declaration.targets {
-                if target.name == "all" || target_phase(target) == phase {
+                if &*target.name == "all" || target_phase(target) == phase {
                     let _ = apply_css_wide_keyword_in_phase(
                         style,
                         &target.name,
@@ -331,7 +335,7 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
         // Ordinary cascades therefore avoid dry-running every overridden
         // declaration.
         let selection = loop {
-            let selection = select_specified_values(&valid_events);
+            let selection = select_specified_values(&valid_events, self.property_targets);
             let mut invalid: Vec<_> = selection
                 .declarations
                 .iter()

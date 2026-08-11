@@ -27,3 +27,20 @@ are four bytes, prepared metadata is capped by tests at 24 bytes per effective
 rule, and matched-rule hot-path records are capped at 12 bytes. The preparation
 timing is reported separately by `StyleTimings::prepare_rules` and propagated
 through the pipeline profiler.
+
+## Cascade validation
+
+Run the reproducible resolver benchmark in release mode. Its arguments are the
+element count, measured iterations, and number of overriding rules:
+
+```sh
+cargo run -p html-style --release --example cascade_benchmark -- 1500 25 48
+```
+
+The focused cascade integration tests use the repository's pinned Web Platform
+Tests revision from `testdata/wpt-revision.txt`. Point `HTML_WPT_ROOT` at an
+unmodified checkout of that revision:
+
+```sh
+HTML_WPT_ROOT=/absolute/path/to/wpt cargo test -p html-style --test wpt_css_cascade
+```

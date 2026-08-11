@@ -5,6 +5,7 @@
 //! `revert` and `revert-layer` discard candidates from their cascade scope.
 
 use super::*;
+use std::sync::Arc;
 
 #[derive(Clone, Copy)]
 pub(super) enum CascadeBoundary {
@@ -139,10 +140,43 @@ pub(super) fn build_cascade_events<'event, 'sheet, 'css>(prepared: &'event Prepa
 pub(super) struct PropertyTarget {
     /// Canonical cascade slot. Aliases that affect the same computed property
     /// intentionally share this name.
-    pub(super) name: String,
+    pub(super) name: Arc<str>,
+    /// Document-local numeric identity used by the hot-path winner tables.
+    slot: u32,
     /// Present when a shorthand must be materialized as one longhand before
     /// computed-value conversion.
-    pub(super) longhand: Option<PropertyId<'static>>,
+    pub(super) longhand: Option<Arc<PropertyId<'static>>>,
+}
+
+#[derive(Default)]
+pub(super) struct PropertyTargetState {
+    cache: FxHashMap<usize, Arc<[PropertyTarget]>>,
+    slot_ids: FxHashMap<Arc<str>, u32>,
+    claim_epochs: Vec<u32>,
+    epoch: u32,
+}
+
+impl PropertyTargetState {
+    fn begin_selection(&mut self) -> u32 {
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            self.claim_epochs.fill(0);
+            self.epoch = 1;
+        }
+        self.epoch
+    }
+
+    fn is_claimed(&self, slot: u32, epoch: u32) -> bool {
+        self.claim_epochs.get(slot as usize).copied() == Some(epoch)
+    }
+
+    fn claim(&mut self, slot: u32, epoch: u32) {
+        let slot = slot as usize;
+        if self.claim_epochs.len() <= slot {
+            self.claim_epochs.resize(slot + 1, 0);
+        }
+        self.claim_epochs[slot] = epoch;
+    }
 }
 
 pub(super) struct SelectedDeclaration<'event, 'css> {
@@ -155,7 +189,7 @@ pub(super) struct SpecifiedSelection<'event, 'css> {
     pub(super) declarations: Vec<SelectedDeclaration<'event, 'css>>,
     /// Presentational hints cascade as a distinct origin, but `revert` in the
     /// author origin also rolls that origin back.
-    pub(super) reverted_hint_targets: HashSet<String>,
+    pub(super) reverted_hint_targets: rustc_data_structures::fx::FxHashSet<Arc<str>>,
     pub(super) reverted_all_hints: bool,
 }
 
@@ -209,18 +243,36 @@ fn canonical_slot(name: &str) -> &str {
     }
 }
 
-fn property_targets(property: &Property<'_>) -> Vec<PropertyTarget> {
+fn property_target(name: &str, longhand: Option<Arc<PropertyId<'static>>>, slot_ids: &mut FxHashMap<Arc<str>, u32>) -> PropertyTarget {
+    if let Some((name, slot)) = slot_ids.get_key_value(name) {
+        return PropertyTarget { name: name.clone(), slot: *slot, longhand };
+    }
+    let name: Arc<str> = Arc::from(name);
+    let slot = u32::try_from(slot_ids.len()).expect("CSS property slot count fits in u32");
+    slot_ids.insert(name.clone(), slot);
+    PropertyTarget { name, slot, longhand }
+}
+
+fn property_targets(property: &Property<'_>, slot_ids: &mut FxHashMap<Arc<str>, u32>) -> Vec<PropertyTarget> {
     if matches!(property, Property::All(_)) {
-        return vec![PropertyTarget { name: "all".into(), longhand: None }];
+        return vec![property_target("all", None, slot_ids)];
     }
     let property_id = property.property_id();
     if let Some(longhands) = property_id.longhands() {
-        return longhands.into_iter().filter(|longhand| !crate::style::syntax::capabilities::property_uses_gradient(property) || longhand.name() == "background-image").map(|longhand| PropertyTarget { name: canonical_slot(longhand.name()).to_string(), longhand: Some(longhand) }).collect();
+        return longhands
+            .into_iter()
+            .filter(|longhand| !crate::style::syntax::capabilities::property_uses_gradient(property) || longhand.name() == "background-image")
+            .map(|longhand| {
+                let mut target = property_target(canonical_slot(longhand.name()), None, slot_ids);
+                target.longhand = Some(Arc::new(longhand));
+                target
+            })
+            .collect();
     }
-    vec![PropertyTarget { name: canonical_slot(property_id.name()).to_string(), longhand: None }]
+    vec![property_target(canonical_slot(property_id.name()), None, slot_ids)]
 }
 
-fn declaration_is_custom_property(property: &Property<'_>) -> bool {
+pub(super) fn declaration_is_custom_property(property: &Property<'_>) -> bool {
     match property {
         Property::Custom(value) => value.name.as_ref().starts_with("--"),
         Property::Unparsed(value) => value.property_id.name().starts_with("--"),
@@ -231,20 +283,26 @@ fn declaration_is_custom_property(property: &Property<'_>) -> bool {
 /// Return only the declarations that win at least one longhand. The output is
 /// restored to low-to-high order so computed-value conversion remains ordered
 /// for logical/physical aliases that share renderer storage.
-pub(super) fn select_specified_values<'event, 'css>(events: &[DeclarationEvent<'event, 'css>]) -> SpecifiedSelection<'event, 'css> {
-    let mut claimed = HashSet::<String>::new();
-    let mut rollbacks = FxHashMap::<String, Vec<Rollback>>::default();
+pub(super) fn select_specified_values<'event, 'css>(events: &[DeclarationEvent<'event, 'css>], target_state: &mut PropertyTargetState) -> SpecifiedSelection<'event, 'css> {
+    let claim_epoch = target_state.begin_selection();
+    let mut rollbacks = FxHashMap::<u32, Vec<Rollback>>::default();
     let mut global_rollbacks = Vec::<Rollback>::new();
     let mut all_claimed = false;
     let mut selected = Vec::new();
-    let mut reverted_hint_targets = HashSet::new();
+    let mut reverted_hint_targets = rustc_data_structures::fx::FxHashSet::default();
     let mut reverted_all_hints = false;
 
     for (sequence, event) in events.iter().enumerate().rev() {
         if declaration_is_custom_property(event.property) {
             continue;
         }
-        let targets = property_targets(event.property);
+        let targets = if matches!(event.boundary, CascadeBoundary::Rule { .. }) {
+            let key = event.property as *const Property<'css> as usize;
+            let (cache, slot_ids) = (&mut target_state.cache, &mut target_state.slot_ids);
+            cache.entry(key).or_insert_with(|| Arc::from(property_targets(event.property, slot_ids))).clone()
+        } else {
+            Arc::from(property_targets(event.property, &mut target_state.slot_ids))
+        };
         let is_all = matches!(event.property, Property::All(_));
         let rollback_kind = rollback(event.property);
 
@@ -261,34 +319,34 @@ pub(super) fn select_specified_values<'event, 'css>(events: &[DeclarationEvent<'
                     RollbackKind::Layer => Rollback::Layer(event.boundary),
                 });
             } else if !all_claimed {
-                selected.push(SelectedDeclaration { property: event.property, targets, sequence });
+                selected.push(SelectedDeclaration { property: event.property, targets: targets.to_vec(), sequence });
                 all_claimed = true;
             }
             continue;
         }
 
         let mut winning_targets = Vec::new();
-        for target in targets {
+        for target in targets.iter().cloned() {
             // `all` deliberately excludes direction and custom properties.
-            if (target.name != "direction" && all_claimed) || claimed.contains(&target.name) {
+            if (&*target.name != "direction" && all_claimed) || target_state.is_claimed(target.slot, claim_epoch) {
                 continue;
             }
-            if target.name != "direction" && global_rollbacks.iter().copied().any(|rollback| rollback.excludes(event.boundary)) {
+            if &*target.name != "direction" && global_rollbacks.iter().copied().any(|rollback| rollback.excludes(event.boundary)) {
                 continue;
             }
-            if rollbacks.get(&target.name).is_some_and(|rollbacks| rollbacks.iter().copied().any(|rollback| rollback.excludes(event.boundary))) {
+            if rollbacks.get(&target.slot).is_some_and(|rollbacks| rollbacks.iter().copied().any(|rollback| rollback.excludes(event.boundary))) {
                 continue;
             }
             if let Some(kind) = rollback_kind {
                 if matches!(kind, RollbackKind::Origin) && event.boundary.origin() == CascadeOrigin::Author {
                     reverted_hint_targets.insert(target.name.clone());
                 }
-                rollbacks.entry(target.name).or_default().push(match kind {
+                rollbacks.entry(target.slot).or_default().push(match kind {
                     RollbackKind::Origin => Rollback::Origin(event.boundary.origin()),
                     RollbackKind::Layer => Rollback::Layer(event.boundary),
                 });
             } else {
-                claimed.insert(target.name.clone());
+                target_state.claim(target.slot, claim_epoch);
                 winning_targets.push(target);
             }
         }
@@ -319,9 +377,9 @@ mod tests {
                 boundary: CascadeBoundary::Inline { important: false, normal_rank: 0 },
             },
         ];
-        let selected = select_specified_values(&events);
+        let selected = select_specified_values(&events, &mut PropertyTargetState::default());
         assert_eq!(selected.declarations.len(), 2);
-        assert!(!selected.declarations[0].targets.iter().any(|target| target.name == "margin-left"));
-        assert_eq!(selected.declarations[1].targets[0].name, "margin-left");
+        assert!(!selected.declarations[0].targets.iter().any(|target| &*target.name == "margin-left"));
+        assert_eq!(&*selected.declarations[1].targets[0].name, "margin-left");
     }
 }

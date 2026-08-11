@@ -105,6 +105,8 @@ pub(super) struct StyleResolverContext<'a, 'sheet, 'css> {
     pub(super) styles: &'a mut ComputedStylesBuilder,
     pub(super) candidate_scratch: &'a mut Vec<EffectiveRuleId>,
     pub(super) candidate_seen: &'a mut rustc_data_structures::fx::FxHashSet<EffectiveRuleId>,
+    property_targets: &'a mut specified::PropertyTargetState,
+    validation_style: &'a mut WorkingStyle,
     pub(super) timings: &'a mut ResolveStyleTimings,
 }
 
@@ -144,6 +146,8 @@ pub(crate) fn resolve_styles_for_dom_timed<'sheet, 'css>(
     let mut computed_styles = ComputedStylesBuilder::new(doc);
     let mut candidate_scratch = Vec::new();
     let mut candidate_seen = rustc_data_structures::fx::FxHashSet::default();
+    let mut property_targets = specified::PropertyTargetState::default();
+    let mut validation_style = WorkingStyle::default();
     let mut ancestor_filters = vec![AncestorFilter::default(); doc.node_count()];
     timings.resolver_setup = started.elapsed();
     {
@@ -154,6 +158,8 @@ pub(crate) fn resolve_styles_for_dom_timed<'sheet, 'css>(
             styles: &mut computed_styles,
             candidate_scratch: &mut candidate_scratch,
             candidate_seen: &mut candidate_seen,
+            property_targets: &mut property_targets,
+            validation_style: &mut validation_style,
             timings: &mut timings,
         };
         for node_idx in doc.node_ids() {

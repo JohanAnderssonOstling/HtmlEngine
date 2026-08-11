@@ -280,18 +280,19 @@ fn apply_property<'a>(
 pub(super) fn property_is_computable(
     doc: &Document,
     styles: &mut ComputedStylesBuilder,
+    scratch: &mut WorkingStyle,
     base: &WorkingStyle,
     property: &Property<'_>,
     parent_font_size: f32,
     parent: &ParentStyle,
     environment: crate::MediaEnvironment,
 ) -> bool {
-    let mut scratch = base.clone();
+    scratch.clone_from(base);
     set_line_height_resolution_bases(doc, styles, property, &scratch, parent);
     apply_property(
         doc,
         styles,
-        &mut scratch,
+        scratch,
         property,
         parent_font_size,
         parent.font.font_weight,
