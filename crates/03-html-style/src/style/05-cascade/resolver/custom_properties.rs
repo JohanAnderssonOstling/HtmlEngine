@@ -5,13 +5,13 @@ use specified::{CascadeBoundary, DeclarationEvent};
 
 fn custom_declaration<'property, 'css>(
     property: &'property Property<'css>,
-) -> Option<(String, &'property TokenList<'css>)> {
+) -> Option<(&'property str, &'property TokenList<'css>)> {
     match property {
         Property::Custom(custom) if custom.name.as_ref().starts_with("--") => {
-            Some((custom.name.as_ref().to_string(), &custom.value))
+            Some((custom.name.as_ref(), &custom.value))
         }
         Property::Unparsed(unparsed) if unparsed.property_id.name().starts_with("--") => {
-            Some((unparsed.property_id.name().to_string(), &unparsed.value))
+            Some((unparsed.property_id.name(), &unparsed.value))
         }
         _ => None,
     }
@@ -26,8 +26,8 @@ pub(super) fn cascade_custom_properties<'sheet, 'css>(
     parent: &FxHashMap<String, TokenList<'css>>,
 ) -> FxHashMap<String, TokenList<'css>> {
     let mut values = parent.clone();
-    let mut decided = HashSet::new();
-    let mut rollbacks = FxHashMap::<String, Vec<(CascadeBoundary, bool)>>::default();
+    let mut decided = HashSet::<&str>::new();
+    let mut rollbacks = FxHashMap::<&str, Vec<(CascadeBoundary, bool)>>::default();
 
     for event in events.iter().rev() {
         let Some((name, value)) = custom_declaration(event.property(inline_style)) else {
@@ -53,7 +53,7 @@ pub(super) fn cascade_custom_properties<'sheet, 'css>(
                 .or_default()
                 .push((event.boundary, true)),
             Some("initial") => {
-                values.remove(&name);
+                values.remove(name);
                 decided.insert(name);
             }
             Some("inherit" | "unset") => {
@@ -61,7 +61,7 @@ pub(super) fn cascade_custom_properties<'sheet, 'css>(
                 decided.insert(name);
             }
             _ => {
-                values.insert(name.clone(), value.clone());
+                values.insert(name.to_string(), value.clone());
                 decided.insert(name);
             }
         }
@@ -272,6 +272,18 @@ pub(super) fn resolve_custom_properties<'a>(
     custom_properties: &mut FxHashMap<String, TokenList<'a>>,
     parent_custom: &FxHashMap<String, TokenList<'a>>,
 ) {
+    // The common EPUB case is a flat set of literal custom properties. Those
+    // values are already final after the cascade above: inherited entries came
+    // from the parent's resolved map, and CSS-wide keywords were handled while
+    // selecting each winner. Building a dependency graph and running Tarjan's
+    // algorithm for such a map only clones every name and token list several
+    // times per element.
+    if custom_properties
+        .values()
+        .all(|value| !token_list_contains_var(value))
+    {
+        return;
+    }
     let specified = custom_properties.clone();
     let (dependencies, cyclic) = cyclic_custom_properties(&specified);
     let mut resolving = HashSet::new();

@@ -17,16 +17,24 @@ pub(super) struct CascadePlan {
 }
 
 impl CascadePlan {
-    pub(super) fn build(mut normal: Vec<MatchedRule>, prepared: &PreparedRuleSet<'_, '_>) -> Self {
-        let mut important = normal.clone();
-        important.retain(|matched| {
+    pub(super) fn build(
+        mut normal: Vec<MatchedRule>,
+        important_scratch: &mut Vec<MatchedRule>,
+        prepared: &PreparedRuleSet<'_, '_>,
+    ) -> Self {
+        // Preserve this buffer's capacity between elements. Cloning `normal`
+        // allocated and copied every matching rule even when only a small
+        // subset (usually none) carried important declarations.
+        let mut important = std::mem::take(important_scratch);
+        important.clear();
+        important.extend(normal.iter().copied().filter(|matched| {
             !prepared
                 .get(matched.id)
                 .style_rule()
                 .declarations
                 .important_declarations
                 .is_empty()
-        });
+        }));
         normal.sort_by(|a, b| {
             prepared.get(a.id).priority().compare_normal(
                 a.specificity,

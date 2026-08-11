@@ -309,6 +309,7 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
         style: &mut WorkingStyle,
         inputs: CascadeInputs<'_, 'event, 'inline, 'css>,
         valid_events: &mut Vec<DeclarationEvent<'event, 'css>>,
+        invalid_sequences: &mut Vec<usize>,
         selection: &mut SpecifiedSelection,
     ) {
         let CascadeInputs {
@@ -344,25 +345,22 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
                 self.property_targets,
                 selection,
             );
-            let mut invalid: Vec<_> = selection
-                .declarations
-                .iter()
-                .filter(|declaration| {
-                    !self.declaration_is_computable(
-                        style,
-                        valid_events[declaration.sequence].property(inline_style),
-                        parent_font_size,
-                        parent,
-                    )
-                })
-                .map(|declaration| declaration.sequence)
-                .collect();
-            if invalid.is_empty() {
+            invalid_sequences.clear();
+            invalid_sequences.extend(selection.declarations.iter().filter_map(|declaration| {
+                (!self.declaration_is_computable(
+                    style,
+                    valid_events[declaration.sequence].property(inline_style),
+                    parent_font_size,
+                    parent,
+                ))
+                .then_some(declaration.sequence)
+            }));
+            if invalid_sequences.is_empty() {
                 break;
             }
-            invalid.sort_unstable();
-            invalid.dedup();
-            for sequence in invalid.into_iter().rev() {
+            invalid_sequences.sort_unstable();
+            invalid_sequences.dedup();
+            for sequence in invalid_sequences.iter().copied().rev() {
                 if sequence < valid_hints_sequence {
                     valid_hints_sequence -= 1;
                 }

@@ -106,6 +106,8 @@ pub(super) struct StyleResolverContext<'a, 'sheet, 'css> {
     pub(super) styles: &'a mut ComputedStylesBuilder,
     pub(super) candidate_scratch: &'a mut Vec<EffectiveRuleId>,
     pub(super) candidate_seen: &'a mut rustc_data_structures::fx::FxHashSet<EffectiveRuleId>,
+    matched_rule_scratch: &'a mut Vec<MatchedRule>,
+    important_rule_scratch: &'a mut Vec<MatchedRule>,
     property_targets: &'a mut specified::PropertyTargetState,
     cascade_scratch: &'a mut specified::CascadeScratch<'a, 'css>,
     validation_style: &'a mut WorkingStyle,
@@ -148,6 +150,8 @@ pub(crate) fn resolve_styles_for_dom_timed<'sheet, 'css>(
     let mut computed_styles = ComputedStylesBuilder::new(doc);
     let mut candidate_scratch = Vec::new();
     let mut candidate_seen = rustc_data_structures::fx::FxHashSet::default();
+    let mut matched_rule_scratch = Vec::new();
+    let mut important_rule_scratch = Vec::new();
     let mut property_targets = specified::PropertyTargetState::default();
     let mut cascade_scratch = specified::CascadeScratch::default();
     let mut validation_style = WorkingStyle::default();
@@ -161,6 +165,8 @@ pub(crate) fn resolve_styles_for_dom_timed<'sheet, 'css>(
             styles: &mut computed_styles,
             candidate_scratch: &mut candidate_scratch,
             candidate_seen: &mut candidate_seen,
+            matched_rule_scratch: &mut matched_rule_scratch,
+            important_rule_scratch: &mut important_rule_scratch,
             property_targets: &mut property_targets,
             cascade_scratch: &mut cascade_scratch,
             validation_style: &mut validation_style,
@@ -182,8 +188,7 @@ pub(crate) fn resolve_styles_for_dom_timed<'sheet, 'css>(
             ancestor_filters[node_idx.index()] = ancestor_filter;
             let parent_custom = doc
                 .get_dom_parent(node_idx)
-                .and_then(|parent_idx| custom_maps.get(parent_idx.index()))
-                .cloned();
+                .and_then(|parent_idx| custom_maps.get(parent_idx.index()));
 
             let (mut style, custom_map) =
                 resolver.compute_style_for_dom_element(node_idx, parent_custom, &ancestor_filter);
@@ -337,7 +342,8 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
     ) -> Option<WorkingStyle> {
         let doc = self.doc;
         let prepared = self.prepared;
-        let mut matched_rules = Vec::new();
+        let mut matched_rules = std::mem::take(self.matched_rule_scratch);
+        matched_rules.clear();
         for id in self.candidate_scratch.iter().copied() {
             let style_rule = prepared.get(id).style_rule();
             let Some(scope_match) = prepared.scope_match(prepared.get(id).scope(), doc, node_idx)
@@ -371,13 +377,14 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
             }
         }
         if matched_rules.is_empty() {
+            *self.matched_rule_scratch = matched_rules;
             return None;
         }
 
         let CascadePlan {
             normal: matched_rules,
             important: important_rules,
-        } = CascadePlan::build(matched_rules, prepared);
+        } = CascadePlan::build(matched_rules, self.important_rule_scratch, prepared);
 
         let inherited = ParentStyle::from_indices(self.styles, inherited_from);
         let mut style = WorkingStyle {
@@ -407,6 +414,8 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
             None,
             &mut cascade_scratch.events,
         );
+        *self.matched_rule_scratch = matched_rules;
+        *self.important_rule_scratch = important_rules;
         let custom_properties = cascade_custom_properties(
             &cascade_scratch.events.events,
             None,
@@ -425,6 +434,7 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
                 presentational_hints_node: None,
             },
             &mut cascade_scratch.valid_events,
+            &mut cascade_scratch.invalid_sequences,
             &mut cascade_scratch.selection,
         );
         *self.cascade_scratch = cascade_scratch;
@@ -437,14 +447,15 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
     fn compute_style_for_dom_element(
         &mut self,
         node_idx: DomNodeId,
-        parent_custom: Option<FxHashMap<String, TokenList<'css>>>,
+        parent_custom: Option<&FxHashMap<String, TokenList<'css>>>,
         ancestor_filter: &AncestorFilter,
     ) -> (WorkingStyle, FxHashMap<String, TokenList<'css>>) {
         let doc = self.doc;
         let prepared = self.prepared;
         let index = self.index;
         let matching_started = Instant::now();
-        let mut matched_rules: Vec<MatchedRule> = Vec::new();
+        let mut matched_rules = std::mem::take(self.matched_rule_scratch);
+        matched_rules.clear();
 
         // Get element info for candidate lookup
         let tag = doc.get_dom_tag(node_idx).unwrap_or("");
@@ -494,14 +505,15 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
         let CascadePlan {
             normal: matched_rules,
             important: important_rules,
-        } = CascadePlan::build(matched_rules, prepared);
+        } = CascadePlan::build(matched_rules, self.important_rule_scratch, prepared);
         self.timings.selector_matching += matching_started.elapsed();
 
         // Build computed style from matched rules (same as box-based version)
         let cascade_started = Instant::now();
         let mut style = get_inherited_style_dom(doc, self.styles, node_idx);
         let parent_font_size = style.font.font_size;
-        let parent_custom = parent_custom.unwrap_or_default();
+        let empty_parent = FxHashMap::default();
+        let parent_custom = parent_custom.unwrap_or(&empty_parent);
         let inline_style = parse_inline_style_attribute(doc, node_idx);
         let mut cascade_scratch = std::mem::take(self.cascade_scratch);
         let hints_sequence = specified::build_cascade_events(
@@ -511,10 +523,12 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
             inline_style.as_ref(),
             &mut cascade_scratch.events,
         );
+        *self.matched_rule_scratch = matched_rules;
+        *self.important_rule_scratch = important_rules;
         let mut custom_properties = cascade_custom_properties(
             &cascade_scratch.events.events,
             inline_style.as_ref(),
-            &parent_custom,
+            parent_custom,
         );
 
         let parent_style = ParentStyle::for_node(doc, self.styles, node_idx);
@@ -530,6 +544,7 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
                 presentational_hints_node: Some(node_idx),
             },
             &mut cascade_scratch.valid_events,
+            &mut cascade_scratch.invalid_sequences,
             &mut cascade_scratch.selection,
         );
         *self.cascade_scratch = cascade_scratch;

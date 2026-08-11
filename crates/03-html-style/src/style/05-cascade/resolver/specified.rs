@@ -107,6 +107,7 @@ pub(super) struct EventScratch<'sheet, 'css> {
 pub(super) struct CascadeScratch<'sheet, 'css> {
     pub(super) events: EventScratch<'sheet, 'css>,
     pub(super) valid_events: Vec<DeclarationEvent<'sheet, 'css>>,
+    pub(super) invalid_sequences: Vec<usize>,
     pub(super) selection: SpecifiedSelection,
 }
 
