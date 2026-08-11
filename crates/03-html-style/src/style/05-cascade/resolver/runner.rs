@@ -209,22 +209,29 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
         property: &Property<'css>,
         targets: &[PropertyTarget],
         parent_font_size: f32,
+        custom_properties: &FxHashMap<String, TokenList<'css>>,
         var_map: &HashMap<&str, TokenList<'css>>,
         phase: CascadePhase,
         parent: &ParentStyle,
     ) {
+        if !targets
+            .iter()
+            .any(|target| &*target.name == "all" || target_phase(target) == phase)
+        {
+            return;
+        }
         let resolved_unparsed;
         let resolved_custom;
         let substituted = matches!(property, Property::Unparsed(value) if token_list_contains_var(&value.value))
             || matches!(property, Property::Custom(value) if token_list_contains_var(&value.value));
         let resolved = match property {
             Property::Unparsed(unparsed) if token_list_contains_var(&unparsed.value) => {
-                let mut substitutable = unparsed.clone();
-                mark_var_substitution_boundaries(&mut substitutable.value);
-                resolved_unparsed = substitutable
-                    .substitute_variables(var_map)
-                    .ok()
-                    .or_else(|| resolve_single_var_property(unparsed, var_map));
+                resolved_unparsed = resolve_single_var_property(unparsed, custom_properties)
+                    .or_else(|| {
+                        let mut substitutable = unparsed.clone();
+                        mark_var_substitution_boundaries(&mut substitutable.value);
+                        substitutable.substitute_variables(var_map).ok()
+                    });
                 let Some(property) = resolved_unparsed.as_ref() else {
                     for target in targets {
                         if &*target.name == "all" || target_phase(target) == phase {
@@ -369,7 +376,10 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
         }
         let needs_var_map = selection.declarations.iter().any(|declaration| {
             match valid_events[declaration.sequence].property(inline_style) {
-                Property::Unparsed(value) => token_list_contains_var(&value.value),
+                Property::Unparsed(value) => {
+                    token_list_contains_var(&value.value)
+                        && !single_var_property_is_resolvable(value, custom_properties)
+                }
                 Property::Custom(value) => token_list_contains_var(&value.value),
                 _ => false,
             }
@@ -396,6 +406,7 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
                     valid_events[declaration.sequence].property(inline_style),
                     selection.targets_for(declaration),
                     parent_font_size,
+                    custom_properties,
                     &var_map,
                     phase,
                     parent,

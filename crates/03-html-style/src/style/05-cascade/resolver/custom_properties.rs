@@ -2,6 +2,7 @@
 
 use super::*;
 use specified::{CascadeBoundary, DeclarationEvent};
+use static_self::IntoOwned;
 
 fn custom_declaration<'property, 'css>(
     property: &'property Property<'css>,
@@ -341,28 +342,52 @@ pub(super) fn mark_var_substitution_boundaries(tokens: &mut TokenList<'_>) {
     tokens.0 = marked;
 }
 
+pub(super) fn single_var_property_is_resolvable(
+    unparsed: &lightningcss::properties::custom::UnparsedProperty<'_>,
+    custom_properties: &FxHashMap<String, TokenList<'_>>,
+) -> bool {
+    let [TokenOrValue::Var(var)] = unparsed.value.0.as_slice() else {
+        return false;
+    };
+    custom_properties
+        .get(var.name.ident.as_ref())
+        .is_some_and(token_list_is_serializable)
+}
+
 pub(super) fn resolve_single_var_property<'a>(
     unparsed: &lightningcss::properties::custom::UnparsedProperty<'a>,
-    var_map: &HashMap<&str, TokenList<'a>>,
+    custom_properties: &FxHashMap<String, TokenList<'a>>,
 ) -> Option<Property<'a>> {
     let [TokenOrValue::Var(var)] = unparsed.value.0.as_slice() else {
         return None;
     };
-    let replacement = var_map.get(var.name.ident.as_ref())?;
+    let replacement = custom_properties.get(var.name.ident.as_ref())?;
     let css = token_list_to_css_string(replacement)?;
-    let leaked: &'a str = Box::leak(css.into_boxed_str());
     Property::parse_string(
         unparsed.property_id.clone(),
-        leaked,
+        &css,
         ParserOptions::default(),
     )
     .ok()
+    .map(IntoOwned::into_owned)
 }
 
 pub(super) fn token_list_to_css_string(tokens: &TokenList<'_>) -> Option<String> {
     let mut out = String::new();
     write_token_list(tokens, &mut out)?;
     Some(out)
+}
+
+fn token_list_is_serializable(tokens: &TokenList<'_>) -> bool {
+    tokens.0.iter().all(|token| match token {
+        TokenOrValue::Color(_)
+        | TokenOrValue::Length(_)
+        | TokenOrValue::DashedIdent(_)
+        | TokenOrValue::AnimationName(_)
+        | TokenOrValue::Token(_) => true,
+        TokenOrValue::Function(function) => token_list_is_serializable(&function.arguments),
+        _ => false,
+    })
 }
 
 fn write_token_list(tokens: &TokenList<'_>, out: &mut String) -> Option<()> {
