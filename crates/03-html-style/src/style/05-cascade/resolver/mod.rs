@@ -145,8 +145,9 @@ pub(crate) fn resolve_styles_for_dom_timed<'sheet, 'css>(
 
     // Process each DOM element
     let started = Instant::now();
-    let mut custom_maps: Vec<FxHashMap<String, TokenList<'css>>> =
-        vec![FxHashMap::default(); doc.node_count()];
+    let mut node_custom_map_ids = vec![0u32; doc.node_count()];
+    let mut custom_maps = Vec::with_capacity(16);
+    custom_maps.push(FxHashMap::<String, TokenList<'css>>::default());
     let mut computed_styles = ComputedStylesBuilder::new(doc);
     let mut candidate_scratch = Vec::new();
     let mut candidate_seen = rustc_data_structures::fx::FxHashSet::default();
@@ -187,16 +188,23 @@ pub(crate) fn resolve_styles_for_dom_timed<'sheet, 'css>(
                 AncestorFilter::default()
             };
             ancestor_filters[node_idx.index()] = ancestor_filter;
-            let parent_custom = doc
+            let parent_custom_id = doc
                 .get_dom_parent(node_idx)
-                .and_then(|parent_idx| custom_maps.get(parent_idx.index()));
+                .map_or(0, |parent_idx| node_custom_map_ids[parent_idx.index()] as usize);
 
             let (mut style, custom_map) = resolver.compute_style_for_dom_element(
                 node_idx,
-                parent_custom,
+                &custom_maps[parent_custom_id],
                 &ancestor_filter,
                 inline_styles.get(node_idx),
             );
+            let custom_map_id = if let Some(custom_map) = custom_map {
+                custom_maps.push(custom_map);
+                u32::try_from(custom_maps.len() - 1).expect("custom property map count fits in u32")
+            } else {
+                parent_custom_id as u32
+            };
+            let custom_map = &custom_maps[custom_map_id as usize];
 
             let started = Instant::now();
             let counters = std::mem::take(&mut style.counters);
@@ -218,7 +226,7 @@ pub(crate) fn resolve_styles_for_dom_timed<'sheet, 'css>(
                     node_idx,
                     style_indices,
                     PseudoTarget::FirstLine,
-                    &custom_map,
+                    custom_map,
                 )
                 .map(|style| {
                     style
@@ -236,7 +244,7 @@ pub(crate) fn resolve_styles_for_dom_timed<'sheet, 'css>(
                 node_idx,
                 style_indices,
                 PseudoTarget::Before,
-                &custom_map,
+                custom_map,
             ) && let Some(content) = style.generated_content.take()
             {
                 let counters = std::mem::take(&mut style.counters);
@@ -253,7 +261,7 @@ pub(crate) fn resolve_styles_for_dom_timed<'sheet, 'css>(
                             node_idx,
                             first_line,
                             PseudoTarget::Before,
-                            &custom_map,
+                            custom_map,
                         )
                         .and_then(|mut style| {
                             style.generated_content.take().map(|_| {
@@ -272,7 +280,7 @@ pub(crate) fn resolve_styles_for_dom_timed<'sheet, 'css>(
                     node_idx,
                     first_letter_parent,
                     PseudoTarget::FirstLetter,
-                    &custom_map,
+                    custom_map,
                 )
                 .map(|style| {
                     style
@@ -291,7 +299,7 @@ pub(crate) fn resolve_styles_for_dom_timed<'sheet, 'css>(
                         node_idx,
                         parent,
                         PseudoTarget::FirstLetter,
-                        &custom_map,
+                        custom_map,
                     )
                     .map(|style| {
                         style
@@ -308,7 +316,7 @@ pub(crate) fn resolve_styles_for_dom_timed<'sheet, 'css>(
                 node_idx,
                 style_indices,
                 PseudoTarget::After,
-                &custom_map,
+                custom_map,
             ) && let Some(content) = style.generated_content.take()
             {
                 let counters = std::mem::take(&mut style.counters);
@@ -320,9 +328,7 @@ pub(crate) fn resolve_styles_for_dom_timed<'sheet, 'css>(
                     .set_after_style(node_idx, style, content, counters)
                     .expect("pseudo style belongs to its originating element");
             }
-            if let Some(slot) = custom_maps.get_mut(node_idx.index()) {
-                *slot = custom_map;
-            }
+            node_custom_map_ids[node_idx.index()] = custom_map_id;
             resolver.timings.style_store += started.elapsed();
         }
     }
@@ -426,6 +432,8 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
             None,
             inherited_custom_properties,
         );
+        let custom_properties =
+            effective_custom_properties(&custom_properties, inherited_custom_properties);
 
         self.apply_cascade(
             &mut style,
@@ -434,7 +442,7 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
                 inline_style: None,
                 hints_sequence,
                 parent_font_size,
-                custom_properties: &custom_properties,
+                custom_properties,
                 parent: &inherited,
                 presentational_hints_node: None,
             },
@@ -452,10 +460,10 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
     fn compute_style_for_dom_element(
         &mut self,
         node_idx: DomNodeId,
-        parent_custom: Option<&FxHashMap<String, TokenList<'css>>>,
+        parent_custom: &FxHashMap<String, TokenList<'css>>,
         ancestor_filter: &AncestorFilter,
         inline_style: Option<&StyleAttribute<'css>>,
-    ) -> (WorkingStyle, FxHashMap<String, TokenList<'css>>) {
+    ) -> (WorkingStyle, Option<FxHashMap<String, TokenList<'css>>>) {
         let doc = self.doc;
         let prepared = self.prepared;
         let index = self.index;
@@ -518,8 +526,6 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
         let cascade_started = Instant::now();
         let mut style = get_inherited_style_dom(doc, self.styles, node_idx);
         let parent_font_size = style.font.font_size;
-        let empty_parent = FxHashMap::default();
-        let parent_custom = parent_custom.unwrap_or(&empty_parent);
         let mut cascade_scratch = std::mem::take(self.cascade_scratch);
         let hints_sequence = specified::build_cascade_events(
             prepared,
@@ -544,7 +550,10 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
                 inline_style,
                 hints_sequence,
                 parent_font_size,
-                custom_properties: &custom_properties,
+                custom_properties: effective_custom_properties(
+                    &custom_properties,
+                    parent_custom,
+                ),
                 parent: &parent_style,
                 presentational_hints_node: Some(node_idx),
             },
@@ -554,7 +563,7 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
         );
         *self.cascade_scratch = cascade_scratch;
 
-        if let Some(white_space) = custom_properties
+        if let Some(white_space) = effective_custom_properties(&custom_properties, parent_custom)
             .get(WHITE_SPACE_CASCADE_MARKER)
             .and_then(from_marker_tokens)
         {
@@ -564,7 +573,7 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
             (LETTER_SPACING_MARKER, &mut style.text.letter_spacing),
             (WORD_SPACING_MARKER, &mut style.text.word_spacing),
         ] {
-            let Some(spacing) = custom_properties
+            let Some(spacing) = effective_custom_properties(&custom_properties, parent_custom)
                 .get(marker)
                 .and_then(token_list_to_css_string)
                 .as_deref()
@@ -582,10 +591,10 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
             };
             *target = spacing;
             if let Some(tokens) = canonical_text_spacing_tokens(spacing) {
-                custom_properties.insert(marker.to_string(), tokens);
+                update_custom_property(&mut custom_properties, parent_custom, marker, tokens);
             }
         }
-        if let Some(tab_size) = custom_properties
+        if let Some(tab_size) = effective_custom_properties(&custom_properties, parent_custom)
             .get(TAB_SIZE_CASCADE_MARKER)
             .and_then(token_list_to_css_string)
             .as_deref()
@@ -597,7 +606,12 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
         {
             style.text.tab_size = tab_size;
             if let Some(tokens) = canonical_tab_size_tokens(tab_size) {
-                custom_properties.insert(TAB_SIZE_CASCADE_MARKER.to_string(), tokens);
+                update_custom_property(
+                    &mut custom_properties,
+                    parent_custom,
+                    TAB_SIZE_CASCADE_MARKER,
+                    tokens,
+                );
             }
         }
 

@@ -76,6 +76,7 @@ fn workload(
     use_vars: bool,
     inline_every: usize,
     unique_inline: bool,
+    inherited_custom_properties: usize,
 ) -> (String, String) {
     let mut html = String::from("<!doctype html><html><body>");
     for index in 0..nodes {
@@ -97,9 +98,20 @@ fn workload(
     }
     html.push_str("</body></html>");
 
-    let mut css = String::from(
-        "@layer base, components, theme;\n@layer base { .item { --space:3px; display:block; margin:1px; padding:2px; border:1px solid black; color:#123456; font-size:14px; line-height:1.4; width:100px; height:20px } }\n",
-    );
+    let mut css = String::from("@layer base, components, theme;\n");
+    if inherited_custom_properties > 0 {
+        css.push_str("body {");
+        for property in 0..inherited_custom_properties {
+            css.push_str(&format!("--inherited-{property}:{}px;", property + 1));
+        }
+        css.push_str("--space:3px;}\n");
+    }
+    let base_space = if inherited_custom_properties == 0 {
+        "--space:3px;"
+    } else {
+        ""
+    };
+    css.push_str(&format!("@layer base {{ .item {{ {base_space} display:block; margin:1px; padding:2px; border:1px solid black; color:#123456; font-size:14px; line-height:1.4; width:100px; height:20px }} }}\n"));
     for rule in 0..overriding_rules {
         let layer = match rule % 3 {
             0 => "base",
@@ -111,7 +123,12 @@ fn workload(
         } else {
             ""
         };
-        css.push_str(&format!("@layer {layer} {{ .item {{ --space:{}px; margin:{}px; padding:{}px; border-width:{}px; color:rgb({} 20 30){important}; font-size:{}px; line-height:1.5; width:{}px; height:{}px; min-width:{}px; max-width:{}px; flex:{} 1 auto; background-color:#{:06x}; }} }}\n", rule % 9 + 1, rule % 7, rule % 5, rule % 4 + 1, rule % 255, rule % 6 + 12, rule + 100, rule % 20 + 20, rule % 15, rule + 300, rule % 4 + 1, rule * 123_457 % 0x00ff_ffff));
+        let local_space = if inherited_custom_properties == 0 {
+            format!("--space:{}px;", rule % 9 + 1)
+        } else {
+            String::new()
+        };
+        css.push_str(&format!("@layer {layer} {{ .item {{ {local_space} margin:{}px; padding:{}px; border-width:{}px; color:rgb({} 20 30){important}; font-size:{}px; line-height:1.5; width:{}px; height:{}px; min-width:{}px; max-width:{}px; flex:{} 1 auto; background-color:#{:06x}; }} }}\n", rule % 7, rule % 5, rule % 4 + 1, rule % 255, rule % 6 + 12, rule + 100, rule % 20 + 20, rule % 15, rule + 300, rule % 4 + 1, rule * 123_457 % 0x00ff_ffff));
     }
     for group in 0..8 {
         let padding = if use_vars { "var(--space)" } else { "3px" };
@@ -151,6 +168,10 @@ fn main() {
         .and_then(|value| value.parse().ok())
         .unwrap_or(10);
     let unique_inline = arguments.next().is_some_and(|value| value != "0");
+    let inherited_custom_properties = arguments
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
     assert!(nodes > 0 && iterations > 0);
     let (html, css) = workload(
         nodes,
@@ -159,6 +180,7 @@ fn main() {
         use_vars,
         inline_every,
         unique_inline,
+        inherited_custom_properties,
     );
 
     for _ in 0..3 {
@@ -191,7 +213,7 @@ fn main() {
     resolve.sort_unstable();
 
     println!(
-        "nodes={nodes} iterations={iterations} overriding_rules={overriding_rules} important_every={important_every} use_vars={use_vars} inline_every={inline_every} unique_inline={unique_inline}"
+        "nodes={nodes} iterations={iterations} overriding_rules={overriding_rules} important_every={important_every} use_vars={use_vars} inline_every={inline_every} unique_inline={unique_inline} inherited_custom_properties={inherited_custom_properties}"
     );
     println!(
         "cascade_median_us={}",

@@ -25,7 +25,13 @@ pub(super) fn cascade_custom_properties<'sheet, 'css>(
     events: &[DeclarationEvent<'sheet, 'css>],
     inline_style: Option<&StyleAttribute<'css>>,
     parent: &FxHashMap<String, TokenList<'css>>,
-) -> FxHashMap<String, TokenList<'css>> {
+) -> Option<FxHashMap<String, TokenList<'css>>> {
+    if !events
+        .iter()
+        .any(|event| custom_declaration(event.property(inline_style)).is_some())
+    {
+        return None;
+    }
     let mut values = parent.clone();
     let mut decided = HashSet::<&str>::new();
     let mut rollbacks = FxHashMap::<&str, Vec<(CascadeBoundary, bool)>>::default();
@@ -68,7 +74,28 @@ pub(super) fn cascade_custom_properties<'sheet, 'css>(
         }
     }
     resolve_custom_properties(&mut values, parent);
-    values
+    Some(values)
+}
+
+pub(super) fn effective_custom_properties<'map, 'css>(
+    properties: &'map Option<FxHashMap<String, TokenList<'css>>>,
+    parent: &'map FxHashMap<String, TokenList<'css>>,
+) -> &'map FxHashMap<String, TokenList<'css>> {
+    properties.as_ref().unwrap_or(parent)
+}
+
+pub(super) fn update_custom_property<'css>(
+    properties: &mut Option<FxHashMap<String, TokenList<'css>>>,
+    parent: &FxHashMap<String, TokenList<'css>>,
+    name: &str,
+    value: TokenList<'css>,
+) {
+    if effective_custom_properties(properties, parent).get(name) == Some(&value) {
+        return;
+    }
+    properties
+        .get_or_insert_with(|| parent.clone())
+        .insert(name.to_string(), value);
 }
 
 pub(super) fn single_ident_keyword<'tokens, 'css>(
