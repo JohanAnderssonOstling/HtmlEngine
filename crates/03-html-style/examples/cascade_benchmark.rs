@@ -5,8 +5,10 @@
 //!
 //! Arguments are element count, measured iterations, overriding rule count,
 //! the interval at which generated rules contain an important declaration,
-//! and whether winning declarations use `var()` (`1` or `0`). Use zero for
-//! the important interval to generate no important declarations.
+//! whether winning declarations use `var()` (`1` or `0`), and the interval
+//! between inline style attributes. Use zero for the important interval to
+//! generate no important declarations, or zero for the inline interval to
+//! generate no inline styles.
 
 use html_style::style_document_with_timings;
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -49,12 +51,14 @@ fn workload(
     overriding_rules: usize,
     important_every: usize,
     use_vars: bool,
+    inline_every: usize,
 ) -> (String, String) {
     let mut html = String::from("<!doctype html><html><body>");
     for index in 0..nodes {
-        let inline = if index % 10 == 0 && use_vars {
+        let has_inline = inline_every > 0 && index % inline_every == 0;
+        let inline = if has_inline && use_vars {
             " style='width:321px; padding-left:var(--space); color:revert-layer'"
-        } else if index % 10 == 0 {
+        } else if has_inline {
             " style='width:321px; padding-left:3px; color:revert-layer'"
         } else {
             ""
@@ -115,8 +119,18 @@ fn main() {
         .and_then(|value| value.parse().ok())
         .unwrap_or(0);
     let use_vars = arguments.next().is_none_or(|value| value != "0");
+    let inline_every = arguments
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(10);
     assert!(nodes > 0 && iterations > 0);
-    let (html, css) = workload(nodes, overriding_rules, important_every, use_vars);
+    let (html, css) = workload(
+        nodes,
+        overriding_rules,
+        important_every,
+        use_vars,
+        inline_every,
+    );
 
     for _ in 0..3 {
         let document = html_parse::parse_dom_document(&html).expect("benchmark HTML parses");
@@ -144,7 +158,7 @@ fn main() {
     resolve.sort_unstable();
 
     println!(
-        "nodes={nodes} iterations={iterations} overriding_rules={overriding_rules} important_every={important_every} use_vars={use_vars}"
+        "nodes={nodes} iterations={iterations} overriding_rules={overriding_rules} important_every={important_every} use_vars={use_vars} inline_every={inline_every}"
     );
     println!(
         "cascade_median_us={}",

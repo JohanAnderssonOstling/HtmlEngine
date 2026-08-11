@@ -3,6 +3,58 @@ use super::*;
 // Helper functions for DOM-based style resolution
 use crate::style::matching::selectors::AncestorFilter;
 
+pub(super) struct InlineStyleCache<'css> {
+    node_style_ids: Vec<Option<u32>>,
+    styles: Vec<StyleAttribute<'css>>,
+}
+
+impl<'css> InlineStyleCache<'css> {
+    pub(super) fn new(doc: &Document) -> Self {
+        let mut node_style_ids = vec![None; doc.node_count()];
+        let mut styles = Vec::new();
+        let mut parsed = FxHashMap::<&str, Option<u32>>::default();
+        for node_idx in doc.node_ids() {
+            let Some(source) = doc
+                .get_dom_attr(node_idx, "style")
+                .filter(|source| !source.trim().is_empty())
+            else {
+                continue;
+            };
+            let style_id = if let Some(style_id) = parsed.get(source) {
+                *style_id
+            } else {
+                let normalized = normalize_declarations(source);
+                let normalized: &'css str = Box::leak(normalized.into_boxed_str());
+                let style_id = StyleAttribute::parse(
+                    normalized,
+                    ParserOptions {
+                        error_recovery: true,
+                        ..ParserOptions::default()
+                    },
+                )
+                .ok()
+                .map(|style| {
+                    let id = u32::try_from(styles.len()).expect("inline style count fits in u32");
+                    styles.push(style);
+                    id
+                });
+                parsed.insert(source, style_id);
+                style_id
+            };
+            node_style_ids[node_idx.index()] = style_id;
+        }
+        Self {
+            node_style_ids,
+            styles,
+        }
+    }
+
+    pub(super) fn get(&self, node_idx: DomNodeId) -> Option<&StyleAttribute<'css>> {
+        let id = self.node_style_ids.get(node_idx.index()).copied().flatten()?;
+        self.styles.get(id as usize)
+    }
+}
+
 /// Build the starting style for an element: inherited groups (`font`, `text`)
 /// copied from the parent, reset groups (`box_model`, `border`, `background`)
 /// left at their defaults.
@@ -121,28 +173,4 @@ pub(super) fn selector_might_match_dom(
 ) -> bool {
     use crate::style::matching::dom::selector_might_match_with_filter;
     selector_might_match_with_filter(selector, ancestor_filter)
-}
-
-pub(super) fn inline_style_attribute(doc: &Document, node_idx: DomNodeId) -> Option<String> {
-    let style_attr = doc.get_dom_attr(node_idx, "style")?;
-    if style_attr.trim().is_empty() {
-        return None;
-    }
-    Some(normalize_declarations(style_attr))
-}
-
-pub(super) fn parse_inline_style_attribute<'a>(
-    doc: &Document,
-    node_idx: DomNodeId,
-) -> Option<StyleAttribute<'a>> {
-    let style_attr = inline_style_attribute(doc, node_idx)?;
-    let leaked: &'a str = Box::leak(style_attr.into_boxed_str());
-    StyleAttribute::parse(
-        leaked,
-        ParserOptions {
-            error_recovery: true,
-            ..ParserOptions::default()
-        },
-    )
-    .ok()
 }
