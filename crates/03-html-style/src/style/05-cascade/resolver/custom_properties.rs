@@ -1,8 +1,133 @@
 //! Custom-property collection, cycle detection, inheritance, and substitution.
 
 use super::*;
+use rustc_data_structures::fx::FxHasher;
 use specified::{CascadeBoundary, DeclarationEvent};
 use static_self::IntoOwned;
+use std::hash::{Hash, Hasher};
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+struct CustomDeclarationIdentity {
+    property_address: usize,
+    boundary: CascadeBoundary,
+}
+
+pub(super) struct CustomCascadeSignature {
+    hash: u64,
+    parent_map_id: u32,
+    declarations: Box<[CustomDeclarationIdentity]>,
+}
+
+struct CustomCascadeCacheEntry {
+    parent_map_id: u32,
+    declarations: Box<[CustomDeclarationIdentity]>,
+    map_id: u32,
+}
+
+#[derive(Default)]
+pub(super) struct CustomCascadeCache {
+    buckets: FxHashMap<u64, Vec<CustomCascadeCacheEntry>>,
+    entry_count: usize,
+}
+
+pub(super) enum CustomCascadeProbe {
+    NoDeclarations,
+    UncachedDeclarations,
+    Hit(u32),
+    Miss(CustomCascadeSignature),
+}
+
+// Bound retained signatures for documents whose elements genuinely have many
+// unique inline or selector-driven custom-property cascades.
+const MAX_CUSTOM_CASCADE_CACHE_ENTRIES: usize = 256;
+
+fn custom_declaration_identity<'sheet, 'css>(
+    event: &DeclarationEvent<'sheet, 'css>,
+    inline_style: Option<&StyleAttribute<'css>>,
+) -> Option<CustomDeclarationIdentity> {
+    let property = event.property(inline_style);
+    custom_declaration(property)?;
+    Some(CustomDeclarationIdentity {
+        property_address: property as *const Property<'css> as usize,
+        boundary: event.boundary,
+    })
+}
+
+impl CustomCascadeCache {
+    /// Look up a prior cascade without allocating on a hit. The hash narrows
+    /// candidates only; declaration identity and ordering are compared again
+    /// so hash collisions cannot reuse the wrong custom-property map.
+    pub(super) fn probe<'sheet, 'css>(
+        &self,
+        events: &[DeclarationEvent<'sheet, 'css>],
+        inline_style: Option<&StyleAttribute<'css>>,
+        parent_map_id: u32,
+    ) -> CustomCascadeProbe {
+        let mut hasher = FxHasher::default();
+        parent_map_id.hash(&mut hasher);
+        let mut declaration_count = 0usize;
+        for identity in events
+            .iter()
+            .filter_map(|event| custom_declaration_identity(event, inline_style))
+        {
+            identity.hash(&mut hasher);
+            declaration_count += 1;
+        }
+        if declaration_count == 0 {
+            return CustomCascadeProbe::NoDeclarations;
+        }
+        declaration_count.hash(&mut hasher);
+        let hash = hasher.finish();
+
+        if let Some(entries) = self.buckets.get(&hash) {
+            for entry in entries {
+                if entry.parent_map_id == parent_map_id
+                    && events
+                        .iter()
+                        .filter_map(|event| custom_declaration_identity(event, inline_style))
+                        .eq(entry.declarations.iter().copied())
+                {
+                    return CustomCascadeProbe::Hit(entry.map_id);
+                }
+            }
+        }
+        if self.entry_count >= MAX_CUSTOM_CASCADE_CACHE_ENTRIES {
+            return CustomCascadeProbe::UncachedDeclarations;
+        }
+
+        let declarations = events
+            .iter()
+            .filter_map(|event| custom_declaration_identity(event, inline_style))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        CustomCascadeProbe::Miss(CustomCascadeSignature {
+            hash,
+            parent_map_id,
+            declarations,
+        })
+    }
+
+    pub(super) fn insert(&mut self, signature: CustomCascadeSignature, map_id: u32) {
+        self.buckets
+            .entry(signature.hash)
+            .or_default()
+            .push(CustomCascadeCacheEntry {
+                parent_map_id: signature.parent_map_id,
+                declarations: signature.declarations,
+                map_id,
+            });
+        self.entry_count += 1;
+    }
+}
+
+pub(super) fn custom_map_is_cacheable(values: &FxHashMap<String, TokenList<'_>>) -> bool {
+    // Renderer-owned compatibility markers may be rewritten using this
+    // element's computed font metrics. Keep those maps element-local.
+    !values.contains_key(WHITE_SPACE_CASCADE_MARKER)
+        && !values.contains_key(LETTER_SPACING_MARKER)
+        && !values.contains_key(WORD_SPACING_MARKER)
+        && !values.contains_key(TAB_SIZE_CASCADE_MARKER)
+}
 
 fn custom_declaration<'property, 'css>(
     property: &'property Property<'css>,

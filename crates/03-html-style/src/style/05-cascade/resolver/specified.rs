@@ -7,7 +7,7 @@
 use super::*;
 use std::rc::Rc;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub(super) enum CascadeBoundary {
     Rule { priority: RulePriority, important: bool, normal_rank: usize, layer_start: usize },
     Inline { important: bool, normal_rank: usize },

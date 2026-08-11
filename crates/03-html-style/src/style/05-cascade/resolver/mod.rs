@@ -114,6 +114,15 @@ pub(super) struct StyleResolverContext<'a, 'sheet, 'css> {
     pub(super) timings: &'a mut ResolveStyleTimings,
 }
 
+enum CustomMapResult<'css> {
+    Inherited,
+    Reused(u32),
+    New {
+        values: FxHashMap<String, TokenList<'css>>,
+        cache_signature: Option<CustomCascadeSignature>,
+    },
+}
+
 thread_local! {
     /// Length conversion is a synchronous part of one style-resolution pass.
     /// Keeping its immutable media environment thread-local avoids threading
@@ -148,6 +157,7 @@ pub(crate) fn resolve_styles_for_dom_timed<'sheet, 'css>(
     let mut node_custom_map_ids = vec![0u32; doc.node_count()];
     let mut custom_maps = Vec::with_capacity(16);
     custom_maps.push(FxHashMap::<String, TokenList<'css>>::default());
+    let mut custom_cascade_cache = CustomCascadeCache::default();
     let mut computed_styles = ComputedStylesBuilder::new(doc);
     let mut candidate_scratch = Vec::new();
     let mut candidate_seen = rustc_data_structures::fx::FxHashSet::default();
@@ -194,15 +204,24 @@ pub(crate) fn resolve_styles_for_dom_timed<'sheet, 'css>(
 
             let (mut style, custom_map) = resolver.compute_style_for_dom_element(
                 node_idx,
-                &custom_maps[parent_custom_id],
+                parent_custom_id as u32,
+                &custom_maps,
+                &custom_cascade_cache,
                 &ancestor_filter,
                 inline_styles.get(node_idx),
             );
-            let custom_map_id = if let Some(custom_map) = custom_map {
-                custom_maps.push(custom_map);
-                u32::try_from(custom_maps.len() - 1).expect("custom property map count fits in u32")
-            } else {
-                parent_custom_id as u32
+            let custom_map_id = match custom_map {
+                CustomMapResult::Inherited => parent_custom_id as u32,
+                CustomMapResult::Reused(map_id) => map_id,
+                CustomMapResult::New { values, cache_signature } => {
+                    custom_maps.push(values);
+                    let map_id = u32::try_from(custom_maps.len() - 1)
+                        .expect("custom property map count fits in u32");
+                    if let Some(signature) = cache_signature {
+                        custom_cascade_cache.insert(signature, map_id);
+                    }
+                    map_id
+                }
             };
             let custom_map = &custom_maps[custom_map_id as usize];
 
@@ -460,10 +479,12 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
     fn compute_style_for_dom_element(
         &mut self,
         node_idx: DomNodeId,
-        parent_custom: &FxHashMap<String, TokenList<'css>>,
+        parent_custom_id: u32,
+        custom_maps: &[FxHashMap<String, TokenList<'css>>],
+        custom_cascade_cache: &CustomCascadeCache,
         ancestor_filter: &AncestorFilter,
         inline_style: Option<&StyleAttribute<'css>>,
-    ) -> (WorkingStyle, Option<FxHashMap<String, TokenList<'css>>>) {
+    ) -> (WorkingStyle, CustomMapResult<'css>) {
         let doc = self.doc;
         let prepared = self.prepared;
         let index = self.index;
@@ -536,11 +557,37 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
         );
         *self.matched_rule_scratch = matched_rules;
         *self.important_rule_scratch = important_rules;
-        let mut custom_properties = cascade_custom_properties(
-            &cascade_scratch.events.events,
-            inline_style,
-            parent_custom,
-        );
+        let parent_custom = &custom_maps[parent_custom_id as usize];
+        let (mut custom_properties, reused_custom_id, cache_signature) =
+            match custom_cascade_cache.probe(
+                &cascade_scratch.events.events,
+                inline_style,
+                parent_custom_id,
+            ) {
+                CustomCascadeProbe::NoDeclarations => (None, None, None),
+                CustomCascadeProbe::UncachedDeclarations => (
+                    cascade_custom_properties(
+                        &cascade_scratch.events.events,
+                        inline_style,
+                        parent_custom,
+                    ),
+                    None,
+                    None,
+                ),
+                CustomCascadeProbe::Hit(map_id) => (None, Some(map_id), None),
+                CustomCascadeProbe::Miss(signature) => (
+                    cascade_custom_properties(
+                        &cascade_scratch.events.events,
+                        inline_style,
+                        parent_custom,
+                    ),
+                    None,
+                    Some(signature),
+                ),
+            };
+        let custom_base = reused_custom_id
+            .map(|map_id| &custom_maps[map_id as usize])
+            .unwrap_or(parent_custom);
 
         let parent_style = ParentStyle::for_node(doc, self.styles, node_idx);
         self.apply_cascade(
@@ -552,7 +599,7 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
                 parent_font_size,
                 custom_properties: effective_custom_properties(
                     &custom_properties,
-                    parent_custom,
+                    custom_base,
                 ),
                 parent: &parent_style,
                 presentational_hints_node: Some(node_idx),
@@ -563,7 +610,7 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
         );
         *self.cascade_scratch = cascade_scratch;
 
-        if let Some(white_space) = effective_custom_properties(&custom_properties, parent_custom)
+        if let Some(white_space) = effective_custom_properties(&custom_properties, custom_base)
             .get(WHITE_SPACE_CASCADE_MARKER)
             .and_then(from_marker_tokens)
         {
@@ -573,7 +620,7 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
             (LETTER_SPACING_MARKER, &mut style.text.letter_spacing),
             (WORD_SPACING_MARKER, &mut style.text.word_spacing),
         ] {
-            let Some(spacing) = effective_custom_properties(&custom_properties, parent_custom)
+            let Some(spacing) = effective_custom_properties(&custom_properties, custom_base)
                 .get(marker)
                 .and_then(token_list_to_css_string)
                 .as_deref()
@@ -591,10 +638,10 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
             };
             *target = spacing;
             if let Some(tokens) = canonical_text_spacing_tokens(spacing) {
-                update_custom_property(&mut custom_properties, parent_custom, marker, tokens);
+                update_custom_property(&mut custom_properties, custom_base, marker, tokens);
             }
         }
-        if let Some(tab_size) = effective_custom_properties(&custom_properties, parent_custom)
+        if let Some(tab_size) = effective_custom_properties(&custom_properties, custom_base)
             .get(TAB_SIZE_CASCADE_MARKER)
             .and_then(token_list_to_css_string)
             .as_deref()
@@ -608,7 +655,7 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
             if let Some(tokens) = canonical_tab_size_tokens(tab_size) {
                 update_custom_property(
                     &mut custom_properties,
-                    parent_custom,
+                    custom_base,
                     TAB_SIZE_CASCADE_MARKER,
                     tokens,
                 );
@@ -643,7 +690,17 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
         }
 
         self.timings.cascade += cascade_started.elapsed();
-        (style, custom_properties)
+        let custom_map = match custom_properties {
+            Some(values) => {
+                let cache_signature = cache_signature
+                    .filter(|_| custom_map_is_cacheable(&values));
+                CustomMapResult::New { values, cache_signature }
+            }
+            None => reused_custom_id
+                .map(CustomMapResult::Reused)
+                .unwrap_or(CustomMapResult::Inherited),
+        };
+        (style, custom_map)
     }
 }
 

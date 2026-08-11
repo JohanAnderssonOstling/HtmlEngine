@@ -21,7 +21,7 @@ use rustc_data_structures::fx::FxHashMap;
 use std::cmp::Ordering;
 use std::rc::Rc;
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
 pub(crate) enum CascadeOrigin {
     UserAgent = 0,
@@ -31,7 +31,7 @@ pub(crate) enum CascadeOrigin {
 /// Integer layer order. Unlayered rules currently share the sentinel rank;
 /// layer expansion can assign concrete ranks without changing selector or
 /// resolver APIs.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct LayerOrder(u32);
 
 impl LayerOrder {
@@ -46,7 +46,7 @@ impl LayerOrder {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct RulePriority {
     origin: CascadeOrigin,
     layer: LayerOrder,
