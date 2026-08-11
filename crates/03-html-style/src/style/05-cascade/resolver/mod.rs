@@ -4,7 +4,7 @@
 //! the shared cascade runner, property-family application, and style interning.
 
 use crate::style::matching::dom::{PseudoTarget, selector_matches_dom_pseudo_in_scope};
-use crate::style::matching::selectors::{AncestorFilter, CandidateDeduper, SelectorIndex, selector_might_match_ancestors};
+use crate::style::matching::selectors::{AncestorFilter, CandidateDeduper, SelectorIndex};
 use crate::style::rules::prepared::{
     CascadeOrigin, EffectiveRuleId, PreparedPropertyTarget, PreparedRuleSet, RulePriority,
     compile_property_targets,
@@ -104,7 +104,7 @@ pub(crate) struct ResolveStyleTimings {
 pub(super) struct StyleResolverContext<'a, 'sheet, 'css> {
     pub(super) doc: &'a Document,
     pub(super) prepared: &'a PreparedRuleSet<'sheet, 'css>,
-    pub(super) index: &'a SelectorIndex,
+    pub(super) index: &'a SelectorIndex<'css>,
     pub(super) styles: &'a mut ComputedStylesBuilder,
     pub(super) candidate_scratch: &'a mut Vec<EffectiveRuleId>,
     pub(super) candidate_seen: &'a mut CandidateDeduper,
@@ -423,21 +423,13 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
             // Parcel selectors represents the pseudo-to-originating-element hop as
             // a synthetic combinator. The ancestor bloom filter treats that as a
             // real tree hop, so it cannot safely prefilter pseudo selectors.
-            let specificity = style_rule
-                .selectors
-                .0
-                .iter()
-                .filter(|selector| {
-                    selector_matches_dom_pseudo_in_scope(
-                        selector,
-                        doc,
-                        node_idx,
-                        pseudo,
-                        scope_match.root,
-                    )
-                })
-                .map(crate::style::matching::dom::selector_specificity)
-                .max();
+            let mut specificity = None;
+            for (selector, prepared_selector) in style_rule.selectors.0.iter().zip(self.index.prepared_selectors(id)) {
+                if selector_matches_dom_pseudo_in_scope(selector, doc, node_idx, pseudo, scope_match.root) {
+                    let matched = self.index.selector_specificity(*prepared_selector);
+                    specificity = Some(specificity.map_or(matched, |current: u32| current.max(matched)));
+                }
+            }
             if let Some(specificity) = specificity {
                 matched_rules.push(MatchedRule {
                     specificity,
@@ -553,22 +545,19 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
             else {
                 continue;
             };
-            let specificity = style_rule
-                .selectors
-                .0
-                .iter()
-                .zip(index.ancestor_requirements(id))
-                .filter(|(selector, requirements)| {
-                    selector_might_match_ancestors(**requirements, ancestor_filter)
-                        && crate::style::matching::dom::selector_matches_dom_node_in_scope(
-                            selector,
-                            doc,
-                            node_idx,
-                            scope_match.root,
-                        )
-                })
-                .map(|(selector, _)| crate::style::matching::dom::selector_specificity(selector))
-                .max();
+            let mut specificity = None;
+            for (selector, prepared_selector) in style_rule.selectors.0.iter().zip(index.prepared_selectors(id)) {
+                if !index.selector_might_match(*prepared_selector, ancestor_filter) {
+                    continue;
+                }
+                let matches = index.matches_fast_selector(*prepared_selector, doc, node_idx).unwrap_or_else(|| {
+                    crate::style::matching::dom::selector_matches_dom_node_in_scope(selector, doc, node_idx, scope_match.root)
+                });
+                if matches {
+                    let matched = index.selector_specificity(*prepared_selector);
+                    specificity = Some(specificity.map_or(matched, |current: u32| current.max(matched)));
+                }
+            }
             if let Some(specificity) = specificity {
                 matched_rules.push(MatchedRule {
                     specificity,

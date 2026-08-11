@@ -1,4 +1,6 @@
+use super::compiled::{CompiledSelectors, PreparedSelector};
 use crate::style::rules::prepared::{EffectiveRuleId, PreparedRuleSet};
+use html_dom::{Document, DomNodeId};
 use lightningcss::properties::custom::{Token, TokenList, TokenOrValue};
 use lightningcss::selector::{Component, PseudoClass, PseudoElement, Selector, SelectorList};
 use rustc_data_structures::fx::FxHashMap;
@@ -19,7 +21,7 @@ pub struct AncestorFilter {
 
 impl AncestorFilter {
     #[inline]
-    fn hash(s: &str) -> u64 {
+    pub(super) fn hash(s: &str) -> u64 {
         let h = s.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
         1u64 << (h % 64)
     }
@@ -54,13 +56,12 @@ impl AncestorFilter {
 // ============================================================================
 
 /// Index of rule keys, keyed by selector target (tag/class/id)
-pub struct SelectorIndex {
+pub struct SelectorIndex<'css> {
     by_tag: FxHashMap<String, Vec<EffectiveRuleId>>,
     by_class: FxHashMap<String, Vec<EffectiveRuleId>>,
     by_id: FxHashMap<String, Vec<EffectiveRuleId>>,
     universal: Vec<EffectiveRuleId>, // *, [attr], :pseudo with no tag/class/id
-    ancestor_requirement_starts: Vec<u32>,
-    ancestor_requirements: Vec<u64>,
+    compiled: CompiledSelectors<'css>,
 }
 
 /// Dense duplicate suppression for candidate rule IDs. Prepared IDs are
@@ -96,36 +97,44 @@ impl CandidateDeduper {
     }
 }
 
-impl SelectorIndex {
+impl<'css> SelectorIndex<'css> {
     pub fn new() -> Self {
-        Self { by_tag: FxHashMap::default(), by_class: FxHashMap::default(), by_id: FxHashMap::default(), universal: Vec::new(), ancestor_requirement_starts: Vec::new(), ancestor_requirements: Vec::new() }
+        Self { by_tag: FxHashMap::default(), by_class: FxHashMap::default(), by_id: FxHashMap::default(), universal: Vec::new(), compiled: CompiledSelectors::empty() }
     }
 
     /// Build an index only from rules admitted by stylesheet preparation.
-    pub fn from_prepared(prepared: &PreparedRuleSet<'_, '_>) -> Self {
+    pub fn from_prepared(prepared: &PreparedRuleSet<'_, 'css>) -> Self {
         let mut index = Self::new();
-        let rule_count = prepared.iter().count();
-        index.ancestor_requirement_starts.reserve(rule_count + 1);
-        index.ancestor_requirements.reserve(rule_count);
+        index.compiled = CompiledSelectors::from_prepared(prepared);
         for (id, rule) in prepared.iter() {
-            index.ancestor_requirement_starts.push(u32::try_from(index.ancestor_requirements.len()).expect("prepared selector count fits in u32"));
-            index.ancestor_requirements.extend(rule.style_rule().selectors.0.iter().map(selector_ancestor_requirement_mask));
             for selector in &rule.style_rule().selectors.0 {
                 index.add_selector(selector, id);
             }
         }
-        index.ancestor_requirement_starts.push(u32::try_from(index.ancestor_requirements.len()).expect("prepared selector count fits in u32"));
         index
     }
 
     pub(crate) fn rule_count(&self) -> usize {
-        self.ancestor_requirement_starts.len().saturating_sub(1)
+        self.compiled.rule_count()
     }
 
-    pub(crate) fn ancestor_requirements(&self, id: EffectiveRuleId) -> &[u64] {
-        let start = self.ancestor_requirement_starts[id.index()] as usize;
-        let end = self.ancestor_requirement_starts[id.index() + 1] as usize;
-        &self.ancestor_requirements[start..end]
+    pub(crate) fn prepared_selectors(&self, id: EffectiveRuleId) -> &[PreparedSelector] {
+        self.compiled.for_rule(id)
+    }
+
+    #[inline]
+    pub(crate) fn selector_might_match(&self, selector: PreparedSelector, ancestor_filter: &AncestorFilter) -> bool {
+        ancestor_filter.bits & selector.ancestor_requirements == selector.ancestor_requirements
+    }
+
+    #[inline]
+    pub(crate) fn selector_specificity(&self, selector: PreparedSelector) -> u32 {
+        self.compiled.specificity(selector)
+    }
+
+    #[inline]
+    pub(crate) fn matches_fast_selector(&self, selector: PreparedSelector, doc: &Document, node: DomNodeId) -> Option<bool> {
+        self.compiled.matches(selector, doc, node)
     }
 
     /// Add a selector to the index
@@ -211,36 +220,6 @@ impl SelectorIndex {
             }
         }
     }
-}
-
-/// Compile the ancestor-only Bloom prefilter once per selector. A zero mask
-/// disables rejection for sibling combinators, which are not in the filter.
-fn selector_ancestor_requirement_mask(selector: &Selector<'_>) -> u64 {
-    use lightningcss::selector::Combinator;
-    let mut iter = selector.iter();
-    for _ in iter.by_ref() {}
-    let mut requirements = 0;
-    while let Some(combinator) = iter.next_sequence() {
-        if !matches!(combinator, Combinator::Child | Combinator::Descendant) {
-            return 0;
-        }
-        for component in iter.by_ref() {
-            let value = match component {
-                Component::LocalName(name) => Some(name.lower_name.0.as_ref()),
-                Component::Class(class) => Some(class.0.as_ref()),
-                Component::ID(id) => Some(id.0.as_ref()),
-                _ => None,
-            };
-            if let Some(value) = value {
-                requirements |= AncestorFilter::hash(value);
-            }
-        }
-    }
-    requirements
-}
-
-pub(crate) fn selector_might_match_ancestors(requirements: u64, ancestor_filter: &AncestorFilter) -> bool {
-    ancestor_filter.bits & requirements == requirements
 }
 
 /// Validate browser-facing selector semantics that Lightning CSS deliberately
