@@ -1,10 +1,7 @@
 //! Winner selection and dependency-ordered computed-value conversion.
 
 use super::*;
-use specified::{
-    DeclarationEvent, PropertyTarget, SpecifiedSelection, declaration_is_custom_property,
-    select_specified_values,
-};
+use specified::{DeclarationEvent, PropertyTarget, SpecifiedSelection, select_specified_values};
 
 /// The cascade computes dependency roots before values that consume them.
 #[derive(Clone, Copy, PartialEq)]
@@ -84,45 +81,6 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
                 Some(&before),
             );
         }
-    }
-
-    fn declaration_is_eligible(&self, property: &Property<'_>) -> bool {
-        if declaration_is_custom_property(property) {
-            return false;
-        }
-        if matches!(property, Property::All(_)) || wide_keyword(property).is_some() {
-            return true;
-        }
-        if matches!(property, Property::Unparsed(value) if token_list_contains_var(&value.value))
-            || matches!(property, Property::Custom(value) if token_list_contains_var(&value.value))
-        {
-            return true;
-        }
-        if crate::style::syntax::capabilities::property_uses_unsupported_text_decoration_style(
-            property,
-        ) || crate::style::syntax::capabilities::property_uses_unsupported_outline_style(
-            property,
-        ) {
-            return false;
-        }
-        if matches!(property, Property::Unparsed(_) | Property::Custom(_)) {
-            let Ok(value) = property.value_to_css_string(PrinterOptions::default()) else {
-                return false;
-            };
-            let support = crate::declaration_support(property.property_id().name(), &value);
-            if support.syntax == crate::PropertySyntax::Invalid
-                || matches!(
-                    support.capability,
-                    crate::PropertyCapability::Unsupported(
-                        crate::UnsupportedStyleFeature::Gradient
-                            | crate::UnsupportedStyleFeature::GeneratedContent
-                    )
-                )
-            {
-                return false;
-            }
-        }
-        true
     }
 
     fn declaration_is_computable(
@@ -287,7 +245,7 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
         if substituted
             && wide_keyword(resolved).is_none()
             && (matches!(resolved, Property::Unparsed(_))
-                || !self.declaration_is_eligible(resolved)
+                || !crate::style::syntax::capabilities::declaration_is_renderer_eligible(resolved)
                 || !self.declaration_is_computable(style, resolved, parent_font_size, parent))
         {
             for target in targets {
@@ -332,7 +290,7 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
         valid_events.reserve(events.len());
         let mut valid_hints_sequence = 0;
         for (sequence, event) in events.iter().copied().enumerate() {
-            if self.declaration_is_eligible(event.property(inline_style)) {
+            if event.prepared_renderer_eligibility().unwrap_or_else(|| crate::style::syntax::capabilities::declaration_is_renderer_eligible(event.property(inline_style))) {
                 if sequence < hints_sequence {
                     valid_hints_sequence += 1;
                 }

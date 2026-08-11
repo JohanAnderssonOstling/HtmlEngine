@@ -7,9 +7,19 @@
 use super::*;
 use std::rc::Rc;
 
+const ALWAYS_COMPUTABLE: u8 = 1 << 0;
+const ELIGIBILITY_KNOWN: u8 = 1 << 1;
+const RENDERER_ELIGIBLE: u8 = 1 << 2;
+
+fn declaration_flags(always_computable: bool, renderer_eligibility: Option<bool>) -> u8 {
+    u8::from(always_computable) * ALWAYS_COMPUTABLE
+        | u8::from(renderer_eligibility.is_some()) * ELIGIBILITY_KNOWN
+        | u8::from(renderer_eligibility == Some(true)) * RENDERER_ELIGIBLE
+}
+
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub(super) enum CascadeBoundary {
-    Rule { priority: RulePriority, important: bool, always_computable: bool, normal_rank: usize, layer_start: usize },
+    Rule { priority: RulePriority, important: bool, declaration_flags: u8, normal_rank: usize, layer_start: usize },
     Inline { important: bool, normal_rank: usize },
 }
 
@@ -96,7 +106,15 @@ impl<'sheet, 'css> DeclarationEvent<'sheet, 'css> {
     }
 
     pub(super) fn is_always_computable(&self) -> bool {
-        matches!(self.boundary, CascadeBoundary::Rule { always_computable: true, .. })
+        matches!(self.boundary, CascadeBoundary::Rule { declaration_flags, .. } if declaration_flags & ALWAYS_COMPUTABLE != 0)
+    }
+
+    pub(super) fn prepared_renderer_eligibility(&self) -> Option<bool> {
+        match self.boundary {
+            CascadeBoundary::Rule { declaration_flags, .. } if declaration_flags & ELIGIBILITY_KNOWN != 0 => Some(declaration_flags & RENDERER_ELIGIBLE != 0),
+            CascadeBoundary::Rule { .. } => None,
+            CascadeBoundary::Inline { .. } => None,
+        }
     }
 }
 
@@ -202,16 +220,18 @@ pub(super) fn build_cascade_events<'prepared, 'sheet, 'css>(prepared: &'prepared
         if hints_sequence.is_none() && rule.priority().origin() == CascadeOrigin::Author {
             hints_sequence = Some(events.len());
         }
-        events.extend(rule.style_rule().declarations.declarations.iter().enumerate().map(|(index, property)| DeclarationEvent {
-            source: DeclarationSource::Rule { property, targets: prepared.declaration_targets(matched.id, false, index) },
+        events.extend(rule.style_rule().declarations.declarations.iter().enumerate().map(|(index, property)| {
+            let (targets, always_computable, renderer_eligibility) = prepared.declaration_metadata(matched.id, false, index);
+            DeclarationEvent {
+            source: DeclarationSource::Rule { property, targets },
             boundary: CascadeBoundary::Rule {
                 priority: rule.priority(),
                 important: false,
-                always_computable: prepared.declaration_is_always_computable(matched.id, false, index),
+                declaration_flags: declaration_flags(always_computable, renderer_eligibility),
                 normal_rank,
                 layer_start: layer_starts[normal_rank],
             },
-        }));
+        } }));
     }
     let hints_sequence = hints_sequence.unwrap_or(events.len());
     if let Some(inline) = inline_style {
@@ -227,16 +247,18 @@ pub(super) fn build_cascade_events<'prepared, 'sheet, 'css>(prepared: &'prepared
         }
         let rule = prepared.get(matched.id);
         let normal_rank = normal_ranks.get(&matched.id).copied().unwrap_or(normal_rules.len());
-        events.extend(rule.style_rule().declarations.important_declarations.iter().enumerate().map(|(index, property)| DeclarationEvent {
-            source: DeclarationSource::Rule { property, targets: prepared.declaration_targets(matched.id, true, index) },
+        events.extend(rule.style_rule().declarations.important_declarations.iter().enumerate().map(|(index, property)| {
+            let (targets, always_computable, renderer_eligibility) = prepared.declaration_metadata(matched.id, true, index);
+            DeclarationEvent {
+            source: DeclarationSource::Rule { property, targets },
             boundary: CascadeBoundary::Rule {
                 priority: rule.priority(),
                 important: true,
-                always_computable: prepared.declaration_is_always_computable(matched.id, true, index),
+                declaration_flags: declaration_flags(always_computable, renderer_eligibility),
                 normal_rank,
                 layer_start: layer_starts.get(normal_rank).copied().unwrap_or(normal_rank),
             },
-        }));
+        } }));
     }
     if let Some(inline) = inline_style {
         events.extend(inline.declarations.important_declarations.iter().enumerate().map(|(index, _)| DeclarationEvent {
@@ -251,16 +273,18 @@ pub(super) fn build_cascade_events<'prepared, 'sheet, 'css>(prepared: &'prepared
         }
         let rule = prepared.get(matched.id);
         let normal_rank = normal_ranks.get(&matched.id).copied().unwrap_or(normal_rules.len());
-        events.extend(rule.style_rule().declarations.important_declarations.iter().enumerate().map(|(index, property)| DeclarationEvent {
-            source: DeclarationSource::Rule { property, targets: prepared.declaration_targets(matched.id, true, index) },
+        events.extend(rule.style_rule().declarations.important_declarations.iter().enumerate().map(|(index, property)| {
+            let (targets, always_computable, renderer_eligibility) = prepared.declaration_metadata(matched.id, true, index);
+            DeclarationEvent {
+            source: DeclarationSource::Rule { property, targets },
             boundary: CascadeBoundary::Rule {
                 priority: rule.priority(),
                 important: true,
-                always_computable: prepared.declaration_is_always_computable(matched.id, true, index),
+                declaration_flags: declaration_flags(always_computable, renderer_eligibility),
                 normal_rank,
                 layer_start: layer_starts.get(normal_rank).copied().unwrap_or(normal_rank),
             },
-        }));
+        } }));
     }
     hints_sequence
 }

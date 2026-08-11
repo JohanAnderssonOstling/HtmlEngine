@@ -4,10 +4,67 @@
 //! declaration such as `opacity: 0.5` can be valid CSS while still being a
 //! feature this renderer does not implement.
 
-use crate::{PropertyCapability, UnsupportedStyleFeature};
+use crate::{PropertyCapability, PropertySyntax, UnsupportedStyleFeature};
+use lightningcss::printer::PrinterOptions;
+use lightningcss::properties::custom::{Token, TokenList, TokenOrValue};
 use lightningcss::properties::{Property, PropertyId};
 use lightningcss::stylesheet::ParserOptions;
 use lightningcss::values::image::Image;
+
+pub(crate) fn declaration_is_custom_property(property: &Property<'_>) -> bool {
+    match property {
+        Property::Custom(value) => value.name.as_ref().starts_with("--"),
+        Property::Unparsed(value) => value.property_id.name().starts_with("--"),
+        _ => false,
+    }
+}
+
+fn token_list_contains_var(tokens: &TokenList<'_>) -> bool {
+    tokens.0.iter().any(|token| match token {
+        TokenOrValue::Var(_) => true,
+        TokenOrValue::Function(function) => token_list_contains_var(&function.arguments),
+        _ => false,
+    })
+}
+
+fn token_list_is_css_wide_keyword(tokens: &TokenList<'_>) -> bool {
+    let mut tokens = tokens.0.iter().filter(|token| !matches!(token, TokenOrValue::Token(Token::WhiteSpace(_) | Token::Comment(_))));
+    let Some(TokenOrValue::Token(Token::Ident(keyword))) = tokens.next() else { return false };
+    tokens.next().is_none() && ["inherit", "initial", "unset", "revert", "revert-layer"].iter().any(|candidate| keyword.eq_ignore_ascii_case(candidate))
+}
+
+/// Target-independent eligibility that can be decided without serializing the
+/// parsed value. Raw declarations retain the runtime fallback.
+pub(crate) fn declaration_renderer_eligibility(property: &Property<'_>) -> Option<bool> {
+    if declaration_is_custom_property(property) {
+        return Some(false);
+    }
+    if matches!(property, Property::All(_))
+        || matches!(property, Property::Unparsed(value) if token_list_is_css_wide_keyword(&value.value) || token_list_contains_var(&value.value))
+        || matches!(property, Property::Custom(value) if token_list_is_css_wide_keyword(&value.value) || token_list_contains_var(&value.value))
+    {
+        return Some(true);
+    }
+    if property_uses_unsupported_text_decoration_style(property) || property_uses_unsupported_outline_style(property) {
+        return Some(false);
+    }
+    if matches!(property, Property::Unparsed(_) | Property::Custom(_)) {
+        return None;
+    }
+    Some(true)
+}
+
+/// Complete predicate for inline, substituted, and raw declarations whose
+/// eligibility cannot be cached without allocating during preparation.
+pub(crate) fn declaration_is_renderer_eligible(property: &Property<'_>) -> bool {
+    if let Some(eligible) = declaration_renderer_eligibility(property) {
+        return eligible;
+    }
+    let Ok(value) = property.value_to_css_string(PrinterOptions::default()) else { return false };
+    let support = crate::declaration_support(property.property_id().name(), &value);
+    support.syntax != PropertySyntax::Invalid
+        && !matches!(support.capability, PropertyCapability::Unsupported(UnsupportedStyleFeature::Gradient | UnsupportedStyleFeature::GeneratedContent))
+}
 
 pub(crate) fn is_supported_property_name(name: &str) -> bool {
     matches!(
@@ -480,8 +537,22 @@ fn contains_gradient_function(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{declaration_capability, property_name_is_supported};
+    use super::{declaration_capability, declaration_is_renderer_eligible, declaration_renderer_eligibility, property_name_is_supported};
     use crate::{PropertyCapability, UnsupportedStyleFeature};
+    use lightningcss::properties::{Property, PropertyId};
+    use lightningcss::stylesheet::ParserOptions;
+
+    #[test]
+    fn renderer_eligibility_caches_only_allocation_free_decisions() {
+        let color = Property::parse_string(PropertyId::from("color"), "red", ParserOptions::default()).unwrap();
+        let custom = Property::parse_string(PropertyId::from("--accent"), "red", ParserOptions::default()).unwrap();
+        let content = Property::parse_string(PropertyId::from("content"), "url('marker.svg')", ParserOptions::default()).unwrap();
+
+        assert_eq!(declaration_renderer_eligibility(&color), Some(true));
+        assert_eq!(declaration_renderer_eligibility(&custom), Some(false));
+        assert_eq!(declaration_renderer_eligibility(&content), None);
+        assert!(!declaration_is_renderer_eligible(&content));
+    }
 
     #[test]
     fn capability_queries_do_not_require_parser_ast_types() {

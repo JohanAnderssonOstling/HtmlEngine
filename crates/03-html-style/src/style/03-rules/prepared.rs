@@ -230,18 +230,27 @@ fn shadow_mask(declarations: &[Property<'_>]) -> u64 {
 
 impl PreparedTargetRange {
     const ALWAYS_COMPUTABLE: u32 = 1 << 31;
+    const RENDERER_ELIGIBLE: u32 = 1 << 30;
+    const ELIGIBILITY_KNOWN: u32 = 1 << 29;
+    const FLAGS: u32 = Self::ALWAYS_COMPUTABLE | Self::RENDERER_ELIGIBLE | Self::ELIGIBILITY_KNOWN;
 
-    fn new(start: u32, len: u32, always_computable: bool) -> Self {
-        assert!(len < Self::ALWAYS_COMPUTABLE, "one declaration's property target count fits in 31 bits");
-        Self { start, len_and_flags: len | if always_computable { Self::ALWAYS_COMPUTABLE } else { 0 } }
+    fn new(start: u32, len: u32, property: &Property<'_>) -> Self {
+        assert!(len < Self::ELIGIBILITY_KNOWN, "one declaration's property target count fits in 29 bits");
+        let always_computable = property_is_always_computable(property);
+        let renderer_eligibility = crate::style::syntax::capabilities::declaration_renderer_eligibility(property);
+        Self { start, len_and_flags: len | if always_computable { Self::ALWAYS_COMPUTABLE } else { 0 } | if renderer_eligibility == Some(true) { Self::RENDERER_ELIGIBLE } else { 0 } | if renderer_eligibility.is_some() { Self::ELIGIBILITY_KNOWN } else { 0 } }
     }
 
     fn len(self) -> usize {
-        (self.len_and_flags & !Self::ALWAYS_COMPUTABLE) as usize
+        (self.len_and_flags & !Self::FLAGS) as usize
     }
 
     fn is_always_computable(self) -> bool {
         self.len_and_flags & Self::ALWAYS_COMPUTABLE != 0
+    }
+
+    fn renderer_eligibility(self) -> Option<bool> {
+        (self.len_and_flags & Self::ELIGIBILITY_KNOWN != 0).then_some(self.len_and_flags & Self::RENDERER_ELIGIBLE != 0)
     }
 }
 
@@ -376,14 +385,14 @@ impl<'sheet, 'css> ParsedStylesheetSet<'sheet, 'css> {
                 let start = u32::try_from(property_targets.len()).expect("prepared property targets fit in u32");
                 append_property_targets(property, &mut property_slots, &mut property_targets);
                 let len = u32::try_from(property_targets.len() - start as usize).expect("one declaration's property targets fit in u32");
-                declaration_target_ranges.push(PreparedTargetRange::new(start, len, property_is_always_computable(property)));
+                declaration_target_ranges.push(PreparedTargetRange::new(start, len, property));
             }
             let important_start = u32::try_from(declaration_target_ranges.len()).expect("prepared declaration target ranges fit in u32");
             for property in &rule.style_rule.declarations.important_declarations {
                 let start = u32::try_from(property_targets.len()).expect("prepared property targets fit in u32");
                 append_property_targets(property, &mut property_slots, &mut property_targets);
                 let len = u32::try_from(property_targets.len() - start as usize).expect("one declaration's property targets fit in u32");
-                declaration_target_ranges.push(PreparedTargetRange::new(start, len, property_is_always_computable(property)));
+                declaration_target_ranges.push(PreparedTargetRange::new(start, len, property));
             }
             rule_target_starts.push(PreparedRuleDeclarations {
                 normal_start,
@@ -607,12 +616,17 @@ impl<'sheet, 'css> PreparedRuleSet<'sheet, 'css> {
     }
 
     pub(crate) fn declaration_targets(&self, id: EffectiveRuleId, important: bool, index: usize) -> &[PreparedPropertyTarget] {
+        self.declaration_metadata(id, important, index).0
+    }
+
+    pub(crate) fn declaration_metadata(&self, id: EffectiveRuleId, important: bool, index: usize) -> (&[PreparedPropertyTarget], bool, Option<bool>) {
         let starts = self.rule_target_starts[id.0 as usize];
         let ranges_start = if important { starts.important_start } else { starts.normal_start } as usize;
         let range = self.declaration_target_ranges[ranges_start + index];
-        &self.property_targets[range.start as usize..range.start as usize + range.len()]
+        (&self.property_targets[range.start as usize..range.start as usize + range.len()], range.is_always_computable(), range.renderer_eligibility())
     }
 
+    #[cfg(test)]
     pub(crate) fn declaration_is_always_computable(&self, id: EffectiveRuleId, important: bool, index: usize) -> bool {
         let starts = self.rule_target_starts[id.0 as usize];
         let ranges_start = if important { starts.important_start } else { starts.normal_start } as usize;
