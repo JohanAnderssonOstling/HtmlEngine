@@ -1095,6 +1095,33 @@ mod tests {
     }
 
     #[test]
+    fn image_fragment_separates_object_paint_geometry_from_the_css_box() {
+        let contain = layout_html_with_images(
+            "<html><body style='margin:0'><img src='wide.png' style='width:100px;height:100px;object-fit:contain;object-position:center'></body></html>",
+            200.0,
+            &[(200, 100)],
+            crate::ImageSizingPolicy::WebCompatible,
+        );
+        let contain = contain.render_view().fragments().images().iter().next().expect("contained image fragment");
+        assert_eq!(contain.size(), kurbo::Size::new(100.0, 50.0));
+        assert_eq!(contain.offset().x, contain.clip().x0);
+        assert_eq!(contain.offset().y, contain.clip().y0 + 25.0);
+        assert_eq!(contain.clip().size(), kurbo::Size::new(100.0, 100.0));
+
+        let cover = layout_html_with_images(
+            "<html><body style='margin:0'><img src='wide.png' style='width:100px;height:100px;object-fit:cover;object-position:center'></body></html>",
+            200.0,
+            &[(200, 100)],
+            crate::ImageSizingPolicy::WebCompatible,
+        );
+        let cover = cover.render_view().fragments().images().iter().next().expect("covered image fragment");
+        assert_eq!(cover.size(), kurbo::Size::new(200.0, 100.0));
+        assert_eq!(cover.offset().x, cover.clip().x0 - 50.0);
+        assert_eq!(cover.offset().y, cover.clip().y0);
+        assert_eq!(cover.clip().size(), kurbo::Size::new(100.0, 100.0));
+    }
+
+    #[test]
     fn inline_image_line_height_does_not_resize_or_shift_the_replaced_box() {
         let document = layout_html_with_images(
             "<html><body style='margin:0'><div><img src='square.png' style='width:96px;height:96px;line-height:192px'></div></body></html>",

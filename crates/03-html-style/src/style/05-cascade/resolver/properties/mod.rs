@@ -16,7 +16,7 @@ mod unparsed;
 use generated::*;
 use legacy::*;
 use raw::*;
-use unparsed::apply_unparsed_property;
+use unparsed::{apply_unparsed_property, unparsed_object_property_is_computable};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ApplyResult {
@@ -239,7 +239,7 @@ fn apply_property<'a>(
         root_font_size: resolved_root_font_size,
     };
     let doc = &resolved_document;
-    if apply_unparsed_property(styles, style, property) {
+    if apply_unparsed_property(styles, style, property, resolved_root_font_size) {
         return ApplyResult::Applied;
     }
     let mut context = PropertyContext {
@@ -287,6 +287,9 @@ pub(super) fn property_is_computable(
     parent: &ParentStyle,
     environment: crate::MediaEnvironment,
 ) -> bool {
+    if unparsed_object_property_is_computable(property, base.font.font_size, root_font_size_for_resolution(doc, styles)).is_some_and(|valid| !valid) {
+        return false;
+    }
     scratch.clone_from(base);
     set_line_height_resolution_bases(doc, styles, property, &scratch, parent);
     apply_property(

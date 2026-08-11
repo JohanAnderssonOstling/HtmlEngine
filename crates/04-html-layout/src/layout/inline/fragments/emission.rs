@@ -402,7 +402,18 @@ pub(super) fn write_line_fragments(
                 engine.geometry.set_point(*box_idx as usize, point + border_offset.to_vec2());
                 engine.geometry.set_size(*box_idx as usize, *border_size);
             }
-            engine.fragments.state_mut().fragment_output.image_fragments.push(ImageFragment { line_idx, image_idx: *image_idx, offset: border_offset + content_inset.to_vec2(), size: *content_size, paint_order });
+            let content_offset = border_offset + content_inset.to_vec2();
+            let intrinsic = engine.reader.image_intrinsic(*box_idx as usize).expect("image fragment owner must retain intrinsic geometry").size;
+            let style = engine.reader.style(*box_idx as usize);
+            let object = crate::layout::replaced::replaced_object_geometry(*content_size, intrinsic, style.object_fit(), style.object_position());
+            engine.fragments.state_mut().fragment_output.image_fragments.push(ImageFragment {
+                line_idx,
+                image_idx: *image_idx,
+                offset: content_offset + object.rect.origin().to_vec2(),
+                size: object.rect.size(),
+                clip: object.clip + content_offset.to_vec2(),
+                paint_order,
+            });
         } else if let InlineTokenKind::AtomicBox { payload_idx } = token.kind() {
             debug_assert!(publishes_line);
             let ReplacedToken::AtomicBox { box_idx, border_size, containing_width, containing_height, margin_left, margin_top } = replaced.get(payload_idx as usize).expect("atomic token payload index in bounds") else {

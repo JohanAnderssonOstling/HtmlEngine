@@ -364,6 +364,8 @@ pub struct BoxModel {
     pub max_width: PreferredSize,
     pub max_height: PreferredSize,
     pub aspect_ratio: AspectRatio,
+    pub object_fit: ObjectFit,
+    pub object_position: ObjectPosition,
     pub margin_top: LengthPct,
     pub margin_bottom: LengthPct,
     pub margin_left: LengthPct,
@@ -372,6 +374,42 @@ pub struct BoxModel {
     pub padding_bottom: LengthPct,
     pub padding_left: LengthPct,
     pub padding_right: LengthPct,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub enum ObjectFit {
+    #[default]
+    Fill,
+    Contain,
+    Cover,
+    CoverScaleDown,
+    None,
+    ScaleDown,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ObjectPositionOrigin {
+    Start,
+    End,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ObjectPositionAxis {
+    pub origin: ObjectPositionOrigin,
+    pub offset: LengthPct,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ObjectPosition {
+    pub x: ObjectPositionAxis,
+    pub y: ObjectPositionAxis,
+}
+
+impl Default for ObjectPosition {
+    fn default() -> Self {
+        let center = ObjectPositionAxis { origin: ObjectPositionOrigin::Start, offset: LengthPct::Pct(0.5) };
+        Self { x: center, y: center }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
@@ -763,7 +801,7 @@ impl_style_key!(InheritedText {
 } floats { line_height, line_height_x_height_px, line_height_number });
 impl_style_key!(BoxModel {
     layout_idx, display, box_sizing, overflow_x, overflow_y, text_overflow, text_box_trim, size_containment, vertical_align, float, clear, table_layout, border_collapse, empty_cells, caption_side,
-    width, height, min_width, min_height, max_width, max_height, aspect_ratio,
+    width, height, min_width, min_height, max_width, max_height, aspect_ratio, object_fit, object_position,
     margin_top, margin_bottom, margin_left, margin_right,
     padding_top, padding_bottom, padding_left, padding_right
 } floats {
@@ -1087,6 +1125,8 @@ impl BoxModel {
         self.min_height.validate("BoxModel", "min_height", false)?;
         self.max_width.validate("BoxModel", "max_width", false)?;
         self.max_height.validate("BoxModel", "max_height", false)?;
+        self.object_position.x.offset.validate("BoxModel", "object_position.x", true)?;
+        self.object_position.y.offset.validate("BoxModel", "object_position.y", true)?;
         must_be_non_negative("BoxModel", "border_spacing_horizontal", self.border_spacing_horizontal)?;
         must_be_non_negative("BoxModel", "border_spacing_vertical", self.border_spacing_vertical)?;
         self.margin_top.validate("BoxModel", "margin_top", true)?;
@@ -2369,6 +2409,12 @@ impl<'a> StyleView<'a> {
     pub fn aspect_ratio(&self) -> AspectRatio {
         self.box_model.aspect_ratio
     }
+    pub fn object_fit(&self) -> ObjectFit {
+        self.box_model.object_fit
+    }
+    pub fn object_position(&self) -> ObjectPosition {
+        self.box_model.object_position
+    }
     pub fn margin_top(&self) -> LengthPct {
         self.box_model.margin_top
     }
@@ -2756,6 +2802,15 @@ impl<'a> UsedStyleView<'a> {
     pub fn max_height(&self) -> UsedPreferredSize {
         self.computed.box_model.max_height.resolve_font_relative(self.font_relative, self.computed.size_expressions)
     }
+    pub fn object_fit(&self) -> ObjectFit {
+        self.computed.box_model.object_fit
+    }
+    pub fn object_position(&self) -> UsedObjectPosition {
+        UsedObjectPosition {
+            x: UsedObjectPositionAxis { origin: self.computed.box_model.object_position.x.origin, offset: self.computed.box_model.object_position.x.offset.resolve_font_relative(self.font_relative) },
+            y: UsedObjectPositionAxis { origin: self.computed.box_model.object_position.y.origin, offset: self.computed.box_model.object_position.y.offset.resolve_font_relative(self.font_relative) },
+        }
+    }
     pub fn text_indent(&self) -> UsedLengthPct {
         self.computed.text.text_indent.resolve_font_relative(self.font_relative)
     }
@@ -2953,6 +3008,8 @@ impl Default for BoxModel {
             max_width: PreferredSize::Auto,
             max_height: PreferredSize::Auto,
             aspect_ratio: AspectRatio::AUTO,
+            object_fit: ObjectFit::Fill,
+            object_position: ObjectPosition::default(),
             margin_top: LengthPct::Px(0.0),
             margin_bottom: LengthPct::Px(0.0),
             margin_left: LengthPct::Px(0.0),
@@ -3058,6 +3115,8 @@ pub const DEFAULT_BOX_MODEL: BoxModel = BoxModel {
     max_width: PreferredSize::Auto,
     max_height: PreferredSize::Auto,
     aspect_ratio: AspectRatio::AUTO,
+    object_fit: ObjectFit::Fill,
+    object_position: ObjectPosition { x: ObjectPositionAxis { origin: ObjectPositionOrigin::Start, offset: LengthPct::Pct(0.5) }, y: ObjectPositionAxis { origin: ObjectPositionOrigin::Start, offset: LengthPct::Pct(0.5) } },
     margin_top: LengthPct::Px(0.0),
     margin_bottom: LengthPct::Px(0.0),
     margin_left: LengthPct::Px(0.0),
@@ -3155,6 +3214,28 @@ impl LengthPct {
             }
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct UsedObjectPositionAxis {
+    pub origin: ObjectPositionOrigin,
+    pub offset: UsedLengthPct,
+}
+
+impl UsedObjectPositionAxis {
+    pub fn resolve(self, free_space: f64) -> f64 {
+        let offset = self.offset.resolve(free_space);
+        match self.origin {
+            ObjectPositionOrigin::Start => offset,
+            ObjectPositionOrigin::End => free_space - offset,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct UsedObjectPosition {
+    pub x: UsedObjectPositionAxis,
+    pub y: UsedObjectPositionAxis,
 }
 
 /// A length-percentage accepted by layout. Font-relative units cannot be

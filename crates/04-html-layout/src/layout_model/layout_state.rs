@@ -436,6 +436,7 @@ pub(crate) struct ImageFragment {
     pub image_idx: u32,
     pub offset: Point,
     pub size: Size,
+    pub clip: Rect,
     pub paint_order: u32,
 }
 

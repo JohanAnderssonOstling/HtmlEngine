@@ -29,7 +29,8 @@ use html_style_model::{
     FontRelativeLength, FontStyle, GeneratedContent, GeneratedContentItem, GridAutoFlow,
     GridPlacement, GridPlacementRange, GridRepeatCount, GridTemplateArea, GridTemplateTrack,
     GridTrackBreadth, GridTrackSize, Hyphens, InheritedText, ItemAlignment, LayoutStyle, LengthPct,
-    LogicalTextAlign, OpenTypeFeature, OverflowMode, OverflowWrap, PositionMode, PreferredSize,
+    LogicalTextAlign, ObjectFit, ObjectPosition, ObjectPositionAxis, ObjectPositionOrigin,
+    OpenTypeFeature, OverflowMode, OverflowWrap, PositionMode, PreferredSize,
     QuoteStyle, SizeComparison, StyleIndices, StyleStringId, TabSize, TextAlign,
     TextDecorationLines, TextDecorationStyle, TextDecorationThickness, TextDirection,
     TextOverflow, TextSpacing, TextTransform, VerticalAlignValue, WhiteSpace, WordBreak,
@@ -47,7 +48,7 @@ use lightningcss::properties::size::{MaxSize, Size};
 use lightningcss::properties::text::Spacing;
 use lightningcss::properties::{CSSWideKeyword, Property, PropertyId};
 use lightningcss::stylesheet::{ParserOptions, StyleAttribute};
-use lightningcss::traits::{ParseWithOptions, ToCss};
+use lightningcss::traits::{Parse, ParseWithOptions, ToCss};
 use lightningcss::values::calc::{Calc, MathFunction};
 use lightningcss::values::color::{CssColor, SystemColor};
 use lightningcss::values::length::{Length, LengthPercentage, LengthPercentageOrAuto, LengthValue};

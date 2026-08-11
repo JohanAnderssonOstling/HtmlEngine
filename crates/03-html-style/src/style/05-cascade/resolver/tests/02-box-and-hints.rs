@@ -255,6 +255,32 @@ fn image_dimension_attributes_are_presentational_hints_below_author_css() {
 }
 
 #[test]
+fn object_fit_and_position_cross_the_raw_parser_boundary_as_typed_values() {
+    use crate::document::{ObjectFit, ObjectPositionAxis, ObjectPositionOrigin};
+    let html = "<html><body><img src='x' style='object-fit:cover;object-position:right 10px bottom 25%'></body></html>";
+    let mut factory = DocumentFactory::new();
+    let document = factory.parse_with_new_pipeline(html, None);
+    let node = find_body(document.document()).children().next().expect("image");
+    let style = document.box_model_style(document.style_for_node(node).expect("computed image style")).expect("box model");
+    assert_eq!(style.object_fit, ObjectFit::Cover);
+    assert_eq!(style.object_position.x, ObjectPositionAxis { origin: ObjectPositionOrigin::End, offset: LengthPct::Px(10.0) });
+    assert_eq!(style.object_position.y, ObjectPositionAxis { origin: ObjectPositionOrigin::End, offset: LengthPct::Pct(0.25) });
+}
+
+#[test]
+fn invalid_variable_object_values_compute_to_their_initial_values() {
+    use crate::document::{ObjectFit, ObjectPosition};
+
+    let html = "<html><body><img src='x' style='--bad:nonsense;object-fit:cover;object-fit:var(--bad);object-position:left;object-position:var(--bad)'></body></html>";
+    let mut factory = DocumentFactory::new();
+    let document = factory.parse_with_new_pipeline(html, None);
+    let node = find_body(document.document()).children().next().expect("image");
+    let style = document.box_model_style(document.style_for_node(node).expect("computed image style")).expect("box model");
+    assert_eq!(style.object_fit, ObjectFit::Fill);
+    assert_eq!(style.object_position, ObjectPosition::default());
+}
+
+#[test]
 fn image_spacing_attributes_preserve_pixel_and_percentage_margins() {
     let html = "<html><body><img id='hinted' src='x' hspace='10%' vspace='7'><img id='overridden' src='x' hspace='10%' style='margin-left:3px'></body></html>";
     let mut factory = DocumentFactory::new();

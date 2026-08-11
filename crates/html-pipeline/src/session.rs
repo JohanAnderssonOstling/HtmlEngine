@@ -1074,13 +1074,20 @@ mod tests {
             images: fragments
                 .images()
                 .iter()
-                .map(|image| ImageSnapshot {
-                    line_idx: image.line_idx(),
-                    image_idx: image.image_idx(),
-                    offset_x_bits: image.offset().x.to_bits(),
-                    offset_y_bits: image.offset().y.to_bits(),
-                    width_bits: image.size().width.to_bits(),
-                    height_bits: image.size().height.to_bits(),
+                .map(|image| {
+                    let clip = image.clip();
+                    ImageSnapshot {
+                        line_idx: image.line_idx(),
+                        image_idx: image.image_idx(),
+                        offset_x_bits: image.offset().x.to_bits(),
+                        offset_y_bits: image.offset().y.to_bits(),
+                        width_bits: image.size().width.to_bits(),
+                        height_bits: image.size().height.to_bits(),
+                        clip_x0_bits: clip.x0.to_bits(),
+                        clip_y0_bits: clip.y0.to_bits(),
+                        clip_x1_bits: clip.x1.to_bits(),
+                        clip_y1_bits: clip.y1.to_bits(),
+                    }
                 })
                 .collect(),
             anchor_glyphs: {
@@ -1121,6 +1128,10 @@ mod tests {
         offset_y_bits: u64,
         width_bits: u64,
         height_bits: u64,
+        clip_x0_bits: u64,
+        clip_y0_bits: u64,
+        clip_x1_bits: u64,
+        clip_y1_bits: u64,
     }
 
     #[derive(Debug, PartialEq, Eq)]

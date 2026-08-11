@@ -445,6 +445,8 @@ fn apply_css_wide_keyword_with_rollback(
         "width" | "inline-size" => style.box_model.width = src.box_model.width,
         "height" | "block-size" => style.box_model.height = src.box_model.height,
         "aspect-ratio" => style.box_model.aspect_ratio = src.box_model.aspect_ratio,
+        "object-fit" => style.box_model.object_fit = src.box_model.object_fit,
+        "object-position" => style.box_model.object_position = src.box_model.object_position,
         "min-width" | "min-inline-size" => style.box_model.min_width = src.box_model.min_width,
         "min-height" | "min-block-size" => style.box_model.min_height = src.box_model.min_height,
         "max-width" | "max-inline-size" => style.box_model.max_width = src.box_model.max_width,

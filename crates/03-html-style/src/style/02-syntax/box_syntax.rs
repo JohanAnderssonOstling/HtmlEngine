@@ -1,7 +1,7 @@
 use lightningcss::properties::size::{MaxSize, Size};
 use lightningcss::properties::{Property, PropertyId};
 use lightningcss::stylesheet::ParserOptions;
-use lightningcss::traits::TrySign;
+use lightningcss::traits::{Parse, TrySign};
 use lightningcss::values::length::{LengthPercentage, LengthPercentageOrAuto};
 
 /// Strict web-syntax validation for box properties where Lightning CSS either
@@ -19,6 +19,11 @@ pub fn property_value_is_valid(property_name: &str, value: &str) -> Option<bool>
     match name.as_str() {
         "float" => return Some(matches!(lower.as_str(), "left" | "right" | "none" | "inline-start" | "inline-end")),
         "clear" => return Some(matches!(lower.as_str(), "left" | "right" | "both" | "none" | "inline-start" | "inline-end")),
+        "object-fit" => return Some(matches!(lower.as_str(), "fill" | "contain" | "cover" | "none" | "scale-down" | "contain scale-down" | "scale-down contain" | "cover scale-down" | "scale-down cover")),
+        "object-position" => {
+            let top_level_components = top_level_component_count(value);
+            return Some(top_level_components != 3 && lightningcss::values::position::Position::parse_string(value).is_ok());
+        }
         "flex-basis" if matches!(lower.as_str(), "content" | "fit-content" | "min-content" | "max-content") => return Some(true),
         _ if !targeted_property(&name) => return None,
         _ => {}
@@ -36,6 +41,43 @@ pub fn property_value_is_valid(property_name: &str, value: &str) -> Option<bool>
     Some(property_has_valid_range(&property))
 }
 
+fn top_level_component_count(value: &str) -> usize {
+    let mut depth = 0usize;
+    let mut in_component = false;
+    let mut count = 0usize;
+    let mut characters = value.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '/' && characters.peek() == Some(&'*') {
+            let _ = characters.next();
+            let mut previous = '\0';
+            for comment in characters.by_ref() {
+                if previous == '*' && comment == '/' {
+                    break;
+                }
+                previous = comment;
+            }
+            continue;
+        }
+        match character {
+            '(' => {
+                if depth == 0 && !in_component {
+                    count += 1;
+                    in_component = true;
+                }
+                depth += 1;
+            }
+            ')' => depth = depth.saturating_sub(1),
+            c if c.is_ascii_whitespace() && depth == 0 => in_component = false,
+            _ if !in_component => {
+                count += 1;
+                in_component = true;
+            }
+            _ => {}
+        }
+    }
+    count
+}
+
 fn targeted_property(name: &str) -> bool {
     matches!(
         name,
@@ -45,6 +87,8 @@ fn targeted_property(name: &str) -> bool {
             | "width"
             | "height"
             | "aspect-ratio"
+            | "object-fit"
+            | "object-position"
             | "min-width"
             | "min-height"
             | "max-width"
@@ -127,6 +171,10 @@ mod tests {
         assert_eq!(property_value_is_valid("width", "20%"), Some(true));
         assert_eq!(property_value_is_valid("padding", "auto"), Some(false));
         assert_eq!(property_value_is_valid("padding", "10px 20%"), Some(true));
+        assert_eq!(property_value_is_valid("object-fit", "scale-down"), Some(true));
+        assert_eq!(property_value_is_valid("object-fit", "contain cover"), Some(false));
+        assert_eq!(property_value_is_valid("object-position", "right 10px bottom 20%"), Some(true));
+        assert_eq!(property_value_is_valid("object-position", "left right"), Some(false));
         assert_eq!(property_value_is_valid("color", "red"), None);
     }
 }

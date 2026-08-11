@@ -276,12 +276,13 @@ pub struct RenderImageFragment {
     image_idx: u32,
     offset: Point,
     size: Size,
+    clip: kurbo::Rect,
     paint_order: u32,
 }
 
 impl RenderImageFragment {
     fn from_fragment(fragment: &ImageFragment) -> Self {
-        Self { line_idx: fragment.line_idx, image_idx: fragment.image_idx, offset: fragment.offset, size: fragment.size, paint_order: fragment.paint_order }
+        Self { line_idx: fragment.line_idx, image_idx: fragment.image_idx, offset: fragment.offset, size: fragment.size, clip: fragment.clip, paint_order: fragment.paint_order }
     }
 
     pub fn line_idx(&self) -> usize {
@@ -298,6 +299,10 @@ impl RenderImageFragment {
 
     pub fn size(&self) -> Size {
         self.size
+    }
+
+    pub fn clip(&self) -> kurbo::Rect {
+        self.clip
     }
 
     pub fn paint_order(&self) -> u32 {

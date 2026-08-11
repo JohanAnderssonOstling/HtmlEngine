@@ -551,7 +551,7 @@ fn build_fragment_scene(document: &LaidOutDocument, options: &FragmentRenderOpti
     let mut natural_height = text.lines().iter().map(|line| line.point().y + line.height()).fold(0.0_f64, f64::max);
     natural_height = fragments.decorations().iter().map(|decoration| decoration.rect().y1).fold(natural_height, f64::max);
     for (line_idx, line) in text.lines().iter().enumerate() {
-        natural_height = fragments.images_for_line(line_idx).iter().map(|image| line.point().y + image.offset().y + image.size().height).fold(natural_height, f64::max);
+        natural_height = fragments.images_for_line(line_idx).iter().map(|image| line.point().y + image.clip().y1).fold(natural_height, f64::max);
     }
     let height = options.maximum_height.map(|maximum| natural_height.min(maximum)).unwrap_or(natural_height);
     let clip = Rect::new(0.0, 0.0, options.viewport_width, height);
@@ -571,14 +571,20 @@ fn build_fragment_scene(document: &LaidOutDocument, options: &FragmentRenderOpti
             recorder.push_clip(overflow_clip);
         }
         for image in fragments.images_for_line(line_idx).iter() {
-            let rect = Rect::from_origin_size(line.point() + image.offset().to_vec2(), image.size()).intersect(clip);
-            if rect.width() <= 0.0 || rect.height() <= 0.0 {
+            let rect = Rect::from_origin_size(line.point() + image.offset().to_vec2(), image.size());
+            let image_clip = (image.clip() + line.point().to_vec2()).intersect(clip);
+            if rect.intersect(image_clip).is_zero_area() {
                 continue;
             }
             match options.image_policy {
                 FragmentImagePolicy::Omit => {}
-                FragmentImagePolicy::Placeholder(color) => recorder.fill_rect(rect, color_from_u32(color)),
-                FragmentImagePolicy::Reference => recorder.draw_resource_image(image.image_idx(), view.image_uri(image.image_idx()), rect),
+                FragmentImagePolicy::Placeholder(color) => recorder.fill_rect(rect.intersect(image_clip), color_from_u32(color)),
+                FragmentImagePolicy::Reference if rect.intersect(image_clip) == rect => recorder.draw_resource_image(image.image_idx(), view.image_uri(image.image_idx()), rect),
+                FragmentImagePolicy::Reference => {
+                    recorder.push_clip(image_clip);
+                    recorder.draw_resource_image(image.image_idx(), view.image_uri(image.image_idx()), rect);
+                    recorder.pop_clip();
+                }
             }
         }
         paint_line_glyphs(document, line_idx, line.point(), 1.0, None, &mut recorder);

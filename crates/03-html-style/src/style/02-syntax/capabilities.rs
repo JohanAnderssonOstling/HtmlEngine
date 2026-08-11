@@ -53,6 +53,8 @@ pub(crate) fn is_supported_property_name(name: &str) -> bool {
             | "width"
             | "height"
             | "aspect-ratio"
+            | "object-fit"
+            | "object-position"
             | "min-width"
             | "min-height"
             | "max-width"

@@ -4,6 +4,7 @@ pub(super) fn apply_unparsed_property(
     styles: &mut ComputedStylesBuilder,
     style: &mut WorkingStyle,
     property: &Property<'_>,
+    root_font_size: f32,
 ) -> bool {
     let raw_property = match property {
         Property::Custom(custom) => Some((custom.name.as_ref(), &custom.value)),
@@ -13,6 +14,18 @@ pub(super) fn apply_unparsed_property(
     if let Some((name, tokens)) = raw_property {
         let normalized_name = name.to_ascii_lowercase();
         match normalized_name.as_str() {
+            "object-fit" => {
+                if let Some(value) = parse_object_fit(tokens) {
+                    style.box_model.object_fit = value;
+                }
+                return true;
+            }
+            "object-position" => {
+                if let Some(value) = parse_object_position(tokens, style.font.font_size, root_font_size) {
+                    style.box_model.object_position = value;
+                }
+                return true;
+            }
             "text-box" | "text-box-trim" | "text-box-edge" => {
                 let _ = apply_text_box_property(style, &normalized_name, tokens);
                 return true;
@@ -120,4 +133,57 @@ pub(super) fn apply_unparsed_property(
         }
     }
     false
+}
+
+fn parse_object_fit(tokens: &TokenList<'_>) -> Option<ObjectFit> {
+    let css = token_list_to_css_string(tokens)?.to_ascii_lowercase();
+    let words = css.split_ascii_whitespace().collect::<Vec<_>>();
+    match words.as_slice() {
+        ["fill"] => Some(ObjectFit::Fill),
+        ["contain"] => Some(ObjectFit::Contain),
+        ["cover"] => Some(ObjectFit::Cover),
+        ["none"] => Some(ObjectFit::None),
+        ["scale-down"] | ["contain", "scale-down"] | ["scale-down", "contain"] => Some(ObjectFit::ScaleDown),
+        ["cover", "scale-down"] | ["scale-down", "cover"] => Some(ObjectFit::CoverScaleDown),
+        _ => None,
+    }
+}
+
+fn parse_object_position(tokens: &TokenList<'_>, font_size: f32, root_font_size: f32) -> Option<ObjectPosition> {
+    use lightningcss::values::position::{HorizontalPositionKeyword, Position, PositionComponent, VerticalPositionKeyword};
+
+    let css = token_list_to_css_string(tokens)?;
+    let position = Position::parse_string(&css).ok()?;
+    fn axis<S>(component: PositionComponent<S>, end: S, font_size: f32, root_font_size: f32) -> Option<ObjectPositionAxis>
+    where
+        S: Copy + PartialEq,
+    {
+        match component {
+            PositionComponent::Center => Some(ObjectPositionAxis { origin: ObjectPositionOrigin::Start, offset: LengthPct::Pct(0.5) }),
+            PositionComponent::Length(value) => Some(ObjectPositionAxis { origin: ObjectPositionOrigin::Start, offset: computed_length_pct(&value, font_size, root_font_size)? }),
+            PositionComponent::Side { side, offset } => Some(ObjectPositionAxis {
+                origin: if side == end { ObjectPositionOrigin::End } else { ObjectPositionOrigin::Start },
+                offset: offset.as_ref().map_or(Some(LengthPct::Px(0.0)), |value| computed_length_pct(value, font_size, root_font_size))?,
+            }),
+        }
+    }
+    Some(ObjectPosition {
+        x: axis(position.x, HorizontalPositionKeyword::Right, font_size, root_font_size)?,
+        y: axis(position.y, VerticalPositionKeyword::Bottom, font_size, root_font_size)?,
+    })
+}
+
+pub(super) fn unparsed_object_property_is_computable(property: &Property<'_>, font_size: f32, root_font_size: f32) -> Option<bool> {
+    let (name, tokens) = match property {
+        Property::Custom(custom) => (custom.name.as_ref(), &custom.value),
+        Property::Unparsed(unparsed) => (unparsed.property_id.name(), &unparsed.value),
+        _ => return None,
+    };
+    if name.eq_ignore_ascii_case("object-fit") {
+        Some(parse_object_fit(tokens).is_some())
+    } else if name.eq_ignore_ascii_case("object-position") {
+        Some(parse_object_position(tokens, font_size, root_font_size).is_some())
+    } else {
+        None
+    }
 }

@@ -1,5 +1,5 @@
-use html_style_model::{AspectRatio, BoxSizing, UsedPreferredSize as PreferredSize, UsedStyleView};
-use kurbo::Size;
+use html_style_model::{AspectRatio, BoxSizing, ObjectFit, UsedObjectPosition, UsedPreferredSize as PreferredSize, UsedStyleView};
+use kurbo::{Point, Rect, Size};
 use taffy::geometry::Size as TaffySize;
 use taffy::prelude::AvailableSpace;
 
@@ -63,6 +63,37 @@ impl ReplacedSizeInput {
 
 pub(crate) fn preferred_aspect_ratio(authored: AspectRatio, intrinsic: Option<f64>) -> Option<f64> {
     if authored.uses_intrinsic() { intrinsic.or_else(|| authored.preferred().map(f64::from)) } else { authored.preferred().map(f64::from) }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ReplacedObjectGeometry {
+    /// Painted image rectangle relative to the content-box origin.
+    pub rect: Rect,
+    /// The replaced content is always clipped to its content box.
+    pub clip: Rect,
+}
+
+pub(crate) fn replaced_object_geometry(content: Size, intrinsic: Size, fit: ObjectFit, position: UsedObjectPosition) -> ReplacedObjectGeometry {
+    let content = Size::new(content.width.max(0.0), content.height.max(0.0));
+    let valid_intrinsic = intrinsic.width.is_finite() && intrinsic.height.is_finite() && intrinsic.width > 0.0 && intrinsic.height > 0.0;
+    let fitted = if !valid_intrinsic || matches!(fit, ObjectFit::Fill) {
+        content
+    } else {
+        let contain_scale = (content.width / intrinsic.width).min(content.height / intrinsic.height);
+        let cover_scale = (content.width / intrinsic.width).max(content.height / intrinsic.height);
+        match fit {
+            ObjectFit::Fill => content,
+            ObjectFit::Contain => intrinsic * contain_scale,
+            ObjectFit::Cover => intrinsic * cover_scale,
+            ObjectFit::CoverScaleDown if cover_scale >= 1.0 => intrinsic,
+            ObjectFit::CoverScaleDown => intrinsic * cover_scale,
+            ObjectFit::None => intrinsic,
+            ObjectFit::ScaleDown if intrinsic.width <= content.width && intrinsic.height <= content.height => intrinsic,
+            ObjectFit::ScaleDown => intrinsic * contain_scale,
+        }
+    };
+    let offset = Point::new(position.x.resolve(content.width - fitted.width), position.y.resolve(content.height - fitted.height));
+    ReplacedObjectGeometry { rect: Rect::from_origin_size(offset, fitted), clip: Rect::from_origin_size(Point::ZERO, content) }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -299,6 +330,42 @@ fn finite_f32(value: f64) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use html_style_model::{ObjectPositionOrigin, UsedLengthPct, UsedObjectPositionAxis};
+
+    fn position(x: f32, y: f32) -> UsedObjectPosition {
+        UsedObjectPosition {
+            x: UsedObjectPositionAxis { origin: ObjectPositionOrigin::Start, offset: UsedLengthPct::Pct(x) },
+            y: UsedObjectPositionAxis { origin: ObjectPositionOrigin::Start, offset: UsedLengthPct::Pct(y) },
+        }
+    }
+
+    #[test]
+    fn object_fit_preserves_ratio_and_positions_in_free_space() {
+        let contain = replaced_object_geometry(Size::new(100.0, 100.0), Size::new(200.0, 100.0), ObjectFit::Contain, position(0.5, 0.5));
+        assert_eq!(contain.rect, Rect::new(0.0, 25.0, 100.0, 75.0));
+        assert_eq!(contain.clip, Rect::new(0.0, 0.0, 100.0, 100.0));
+
+        let cover = replaced_object_geometry(Size::new(100.0, 100.0), Size::new(200.0, 100.0), ObjectFit::Cover, position(0.5, 0.5));
+        assert_eq!(cover.rect, Rect::new(-50.0, 0.0, 150.0, 100.0));
+        assert_eq!(cover.clip, Rect::new(0.0, 0.0, 100.0, 100.0));
+    }
+
+    #[test]
+    fn object_fit_none_and_scale_down_choose_the_correct_concrete_size() {
+        let none = replaced_object_geometry(Size::new(100.0, 100.0), Size::new(40.0, 20.0), ObjectFit::None, position(1.0, 1.0));
+        assert_eq!(none.rect, Rect::new(60.0, 80.0, 100.0, 100.0));
+        let smaller = replaced_object_geometry(Size::new(100.0, 100.0), Size::new(40.0, 20.0), ObjectFit::ScaleDown, position(0.5, 0.5));
+        assert_eq!(smaller.rect.size(), Size::new(40.0, 20.0));
+        let reduced = replaced_object_geometry(Size::new(100.0, 100.0), Size::new(200.0, 100.0), ObjectFit::ScaleDown, position(0.5, 0.5));
+        assert_eq!(reduced.rect.size(), Size::new(100.0, 50.0));
+
+        let from_end = UsedObjectPosition {
+            x: UsedObjectPositionAxis { origin: ObjectPositionOrigin::End, offset: UsedLengthPct::Px(10.0) },
+            y: UsedObjectPositionAxis { origin: ObjectPositionOrigin::End, offset: UsedLengthPct::Px(5.0) },
+        };
+        let positioned = replaced_object_geometry(Size::new(100.0, 100.0), Size::new(40.0, 20.0), ObjectFit::None, from_end);
+        assert_eq!(positioned.rect, Rect::new(50.0, 75.0, 90.0, 95.0));
+    }
 
     fn base_input() -> ReplacedSizeInput {
         ReplacedSizeInput {
