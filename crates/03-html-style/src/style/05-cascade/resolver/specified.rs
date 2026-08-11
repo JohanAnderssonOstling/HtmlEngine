@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub(super) enum CascadeBoundary {
-    Rule { priority: RulePriority, important: bool, normal_rank: usize, layer_start: usize },
+    Rule { priority: RulePriority, important: bool, always_computable: bool, normal_rank: usize, layer_start: usize },
     Inline { important: bool, normal_rank: usize },
 }
 
@@ -94,6 +94,10 @@ impl<'sheet, 'css> DeclarationEvent<'sheet, 'css> {
             DeclarationSource::Inline { .. } => None,
         }
     }
+
+    pub(super) fn is_always_computable(&self) -> bool {
+        matches!(self.boundary, CascadeBoundary::Rule { always_computable: true, .. })
+    }
 }
 
 #[derive(Default)]
@@ -142,6 +146,7 @@ pub(super) fn build_cascade_events<'prepared, 'sheet, 'css>(prepared: &'prepared
             boundary: CascadeBoundary::Rule {
                 priority: rule.priority(),
                 important: false,
+                always_computable: prepared.declaration_is_always_computable(matched.id, false, index),
                 normal_rank,
                 layer_start: layer_starts[normal_rank],
             },
@@ -162,6 +167,7 @@ pub(super) fn build_cascade_events<'prepared, 'sheet, 'css>(prepared: &'prepared
             boundary: CascadeBoundary::Rule {
                 priority: rule.priority(),
                 important: true,
+                always_computable: prepared.declaration_is_always_computable(matched.id, true, index),
                 normal_rank,
                 layer_start: layer_starts.get(normal_rank).copied().unwrap_or(normal_rank),
             },
@@ -181,6 +187,7 @@ pub(super) fn build_cascade_events<'prepared, 'sheet, 'css>(prepared: &'prepared
             boundary: CascadeBoundary::Rule {
                 priority: rule.priority(),
                 important: true,
+                always_computable: prepared.declaration_is_always_computable(matched.id, true, index),
                 normal_rank,
                 layer_start: layer_starts.get(normal_rank).copied().unwrap_or(normal_rank),
             },

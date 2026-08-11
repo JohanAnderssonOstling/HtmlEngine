@@ -200,7 +200,43 @@ pub(crate) struct PreparedPropertyTarget {
 #[derive(Clone, Copy)]
 struct PreparedTargetRange {
     start: u32,
-    len: u32,
+    len_and_flags: u32,
+}
+
+impl PreparedTargetRange {
+    const ALWAYS_COMPUTABLE: u32 = 1 << 31;
+
+    fn new(start: u32, len: u32, always_computable: bool) -> Self {
+        assert!(len < Self::ALWAYS_COMPUTABLE, "one declaration's property target count fits in 31 bits");
+        Self { start, len_and_flags: len | if always_computable { Self::ALWAYS_COMPUTABLE } else { 0 } }
+    }
+
+    fn len(self) -> usize {
+        (self.len_and_flags & !Self::ALWAYS_COMPUTABLE) as usize
+    }
+
+    fn is_always_computable(self) -> bool {
+        self.len_and_flags & Self::ALWAYS_COMPUTABLE != 0
+    }
+}
+
+/// Properties whose renderer conversion cannot reject a parsed value.
+/// False keeps the normal scratch validation, so this stays conservative.
+fn property_is_always_computable(property: &Property<'_>) -> bool {
+    matches!(property,
+        Property::Color(_) | Property::BackgroundColor(_) | Property::Background(_) | Property::BackgroundImage(_)
+        | Property::FontStyle(_) | Property::FontFamily(_)
+        | Property::TextAlign(_) | Property::TextAlignLast(_, _) | Property::FontVariantCaps(_)
+        | Property::ListStylePosition(_) | Property::ListStyleImage(_)
+        | Property::TextDecorationLine(_, _) | Property::TextDecorationColor(_, _) | Property::OutlineColor(_)
+        | Property::Overflow(_) | Property::OverflowX(_) | Property::OverflowY(_) | Property::TextOverflow(_, _) | Property::WhiteSpace(_)
+        | Property::Hyphens(_, _) | Property::WordBreak(_) | Property::OverflowWrap(_) | Property::WordWrap(_) | Property::BoxSizing(_, _)
+        | Property::ZIndex(_)
+        | Property::BorderColor(_) | Property::BorderTopColor(_) | Property::BorderRightColor(_) | Property::BorderBottomColor(_) | Property::BorderLeftColor(_)
+        | Property::BorderStyle(_) | Property::BorderTopStyle(_) | Property::BorderRightStyle(_) | Property::BorderBottomStyle(_) | Property::BorderLeftStyle(_)
+        | Property::FlexDirection(_, _) | Property::FlexWrap(_, _) | Property::FlexFlow(_, _) | Property::Order(_, _) | Property::JustifyContent(_, _)
+        | Property::GridAutoFlow(_)
+    )
 }
 
 fn canonical_slot(name: &str) -> &str {
@@ -316,14 +352,14 @@ impl<'sheet, 'css> ParsedStylesheetSet<'sheet, 'css> {
                 let start = u32::try_from(property_targets.len()).expect("prepared property targets fit in u32");
                 append_property_targets(property, &mut property_slots, &mut property_targets);
                 let len = u32::try_from(property_targets.len() - start as usize).expect("one declaration's property targets fit in u32");
-                declaration_target_ranges.push(PreparedTargetRange { start, len });
+                declaration_target_ranges.push(PreparedTargetRange::new(start, len, property_is_always_computable(property)));
             }
             let important_start = u32::try_from(declaration_target_ranges.len()).expect("prepared declaration target ranges fit in u32");
             for property in &rule.style_rule.declarations.important_declarations {
                 let start = u32::try_from(property_targets.len()).expect("prepared property targets fit in u32");
                 append_property_targets(property, &mut property_slots, &mut property_targets);
                 let len = u32::try_from(property_targets.len() - start as usize).expect("one declaration's property targets fit in u32");
-                declaration_target_ranges.push(PreparedTargetRange { start, len });
+                declaration_target_ranges.push(PreparedTargetRange::new(start, len, property_is_always_computable(property)));
             }
             rule_target_starts.push((normal_start, important_start));
         }
@@ -545,7 +581,13 @@ impl<'sheet, 'css> PreparedRuleSet<'sheet, 'css> {
         let starts = self.rule_target_starts[id.0 as usize];
         let ranges_start = if important { starts.1 } else { starts.0 } as usize;
         let range = self.declaration_target_ranges[ranges_start + index];
-        &self.property_targets[range.start as usize..range.start as usize + range.len as usize]
+        &self.property_targets[range.start as usize..range.start as usize + range.len()]
+    }
+
+    pub(crate) fn declaration_is_always_computable(&self, id: EffectiveRuleId, important: bool, index: usize) -> bool {
+        let starts = self.rule_target_starts[id.0 as usize];
+        let ranges_start = if important { starts.1 } else { starts.0 } as usize;
+        self.declaration_target_ranges[ranges_start + index].is_always_computable()
     }
 
     pub(crate) fn clone_property_slots(&self) -> FxHashMap<Rc<str>, u32> {
@@ -587,7 +629,7 @@ impl<'sheet, 'css> PreparedRuleSet<'sheet, 'css> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CascadeOrigin, EffectiveRule, EffectiveRuleId, ParsedStylesheetSet};
+    use super::{CascadeOrigin, EffectiveRule, EffectiveRuleId, ParsedStylesheetSet, PreparedTargetRange};
     use crate::MediaEnvironment;
     use crate::allocation_test_support::count_allocations;
     use lightningcss::rules::CssRule;
@@ -619,6 +661,7 @@ mod tests {
     fn hot_path_handles_stay_compact() {
         assert_eq!(std::mem::size_of::<EffectiveRuleId>(), 4);
         assert!(std::mem::size_of::<EffectiveRule<'_, '_>>() <= 24);
+        assert_eq!(std::mem::size_of::<PreparedTargetRange>(), 8);
     }
 
     #[test]
@@ -633,10 +676,12 @@ mod tests {
         assert_eq!(normal_names.len(), 4);
         assert!(normal_names.contains(&"margin-left"));
         assert_eq!(allocations, 1, "only the test's collected result should allocate");
+        assert!(!prepared.declaration_is_always_computable(id, false, 0));
 
         let important = prepared.declaration_targets(id, true, 0);
         assert_eq!(important.len(), 1);
         assert_eq!(important[0].name.as_ref(), "color");
+        assert!(prepared.declaration_is_always_computable(id, true, 0));
     }
 
     #[test]

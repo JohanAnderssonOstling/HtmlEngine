@@ -354,12 +354,14 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
             );
             invalid_sequences.clear();
             invalid_sequences.extend(selection.declarations.iter().filter_map(|declaration| {
-                (!self.declaration_is_computable(
-                    style,
-                    valid_events[declaration.sequence].property(inline_style),
-                    parent_font_size,
-                    parent,
-                ))
+                let event = &valid_events[declaration.sequence];
+                (!event.is_always_computable()
+                    && !self.declaration_is_computable(
+                        style,
+                        event.property(inline_style),
+                        parent_font_size,
+                        parent,
+                    ))
                 .then_some(declaration.sequence)
             }));
             if invalid_sequences.is_empty() {
