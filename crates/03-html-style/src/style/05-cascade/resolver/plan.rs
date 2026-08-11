@@ -19,6 +19,14 @@ pub(super) struct CascadePlan {
 impl CascadePlan {
     pub(super) fn build(mut normal: Vec<MatchedRule>, prepared: &PreparedRuleSet<'_, '_>) -> Self {
         let mut important = normal.clone();
+        important.retain(|matched| {
+            !prepared
+                .get(matched.id)
+                .style_rule()
+                .declarations
+                .important_declarations
+                .is_empty()
+        });
         normal.sort_by(|a, b| {
             prepared.get(a.id).priority().compare_normal(
                 a.specificity,

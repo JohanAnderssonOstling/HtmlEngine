@@ -1,9 +1,11 @@
 //! Reproducible micro-benchmark for the style resolver's cascade stage.
 //!
 //! Run with:
-//! `cargo run -p html-style --release --example cascade_benchmark -- 1500 25 48`
+//! `cargo run -p html-style --release --example cascade_benchmark -- 1500 25 48 8`
 //!
-//! Arguments are element count, measured iterations, and overriding rule count.
+//! Arguments are element count, measured iterations, overriding rule count,
+//! and the interval at which generated rules contain an important declaration.
+//! Use zero for the last argument to generate no important declarations.
 
 use html_style::style_document_with_timings;
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -41,7 +43,7 @@ unsafe impl GlobalAlloc for TrackingAllocator {
 #[global_allocator]
 static ALLOCATOR: TrackingAllocator = TrackingAllocator;
 
-fn workload(nodes: usize, overriding_rules: usize) -> (String, String) {
+fn workload(nodes: usize, overriding_rules: usize, important_every: usize) -> (String, String) {
     let mut html = String::from("<!doctype html><html><body>");
     for index in 0..nodes {
         let inline = if index % 10 == 0 {
@@ -65,7 +67,12 @@ fn workload(nodes: usize, overriding_rules: usize) -> (String, String) {
             1 => "components",
             _ => "theme",
         };
-        css.push_str(&format!("@layer {layer} {{ .item {{ --space:{}px; margin:{}px; padding:{}px; border-width:{}px; color:rgb({} 20 30); font-size:{}px; line-height:1.5; width:{}px; height:{}px; min-width:{}px; max-width:{}px; flex:{} 1 auto; background-color:#{:06x}; }} }}\n", rule % 9 + 1, rule % 7, rule % 5, rule % 4 + 1, rule % 255, rule % 6 + 12, rule + 100, rule % 20 + 20, rule % 15, rule + 300, rule % 4 + 1, rule * 123_457 % 0x00ff_ffff));
+        let important = if important_every > 0 && rule % important_every == 0 {
+            " !important"
+        } else {
+            ""
+        };
+        css.push_str(&format!("@layer {layer} {{ .item {{ --space:{}px; margin:{}px; padding:{}px; border-width:{}px; color:rgb({} 20 30){important}; font-size:{}px; line-height:1.5; width:{}px; height:{}px; min-width:{}px; max-width:{}px; flex:{} 1 auto; background-color:#{:06x}; }} }}\n", rule % 9 + 1, rule % 7, rule % 5, rule % 4 + 1, rule % 255, rule % 6 + 12, rule + 100, rule % 20 + 20, rule % 15, rule + 300, rule % 4 + 1, rule * 123_457 % 0x00ff_ffff));
     }
     for group in 0..8 {
         css.push_str(&format!(".group{group} {{ width:{}px; padding-left:var(--space); background-color:rgb({} 40 50); }}\n", 200 + group, group * 20));
@@ -94,8 +101,12 @@ fn main() {
         .next()
         .and_then(|value| value.parse().ok())
         .unwrap_or(48);
+    let important_every = arguments
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
     assert!(nodes > 0 && iterations > 0);
-    let (html, css) = workload(nodes, overriding_rules);
+    let (html, css) = workload(nodes, overriding_rules, important_every);
 
     for _ in 0..3 {
         let document = html_parse::parse_dom_document(&html).expect("benchmark HTML parses");
@@ -122,7 +133,9 @@ fn main() {
     cascade.sort_unstable();
     resolve.sort_unstable();
 
-    println!("nodes={nodes} iterations={iterations} overriding_rules={overriding_rules}");
+    println!(
+        "nodes={nodes} iterations={iterations} overriding_rules={overriding_rules} important_every={important_every}"
+    );
     println!(
         "cascade_median_us={}",
         percentile(&cascade, 1, 2).as_micros()

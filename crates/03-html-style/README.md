@@ -31,10 +31,11 @@ through the pipeline profiler.
 ## Cascade validation
 
 Run the reproducible resolver benchmark in release mode. Its arguments are the
-element count, measured iterations, and number of overriding rules:
+element count, measured iterations, number of overriding rules, and important
+declaration interval (`0` disables important declarations):
 
 ```sh
-cargo run -p html-style --release --example cascade_benchmark -- 1500 25 48
+cargo run -p html-style --release --example cascade_benchmark -- 1500 25 48 8
 ```
 
 The focused cascade integration tests use the repository's pinned Web Platform
