@@ -14,6 +14,24 @@ use std::time::{Duration, Instant};
 
 thread_local! {
     static ALLOCATIONS: Cell<Option<usize>> = const { Cell::new(None) };
+    static ALLOCATION_BYTES: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
+}
+
+fn allocated(size: usize) {
+    ALLOCATION_BYTES.with(|bytes| {
+        if let Some((current, peak)) = bytes.get() {
+            let current = current + size;
+            bytes.set(Some((current, peak.max(current))));
+        }
+    });
+}
+
+fn deallocated(size: usize) {
+    ALLOCATION_BYTES.with(|bytes| {
+        if let Some((current, peak)) = bytes.get() {
+            bytes.set(Some((current.saturating_sub(size), peak)));
+        }
+    });
 }
 
 struct TrackingAllocator;
@@ -21,20 +39,25 @@ struct TrackingAllocator;
 unsafe impl GlobalAlloc for TrackingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         ALLOCATIONS.with(|count| count.set(count.get().map(|value| value + 1)));
+        allocated(layout.size());
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         ALLOCATIONS.with(|count| count.set(count.get().map(|value| value + 1)));
+        allocated(layout.size());
         unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         ALLOCATIONS.with(|count| count.set(count.get().map(|value| value + 1)));
+        deallocated(layout.size());
+        allocated(new_size);
         unsafe { System.realloc(pointer, layout, new_size) }
     }
 
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        deallocated(layout.size());
         unsafe { System.dealloc(pointer, layout) }
     }
 }
@@ -184,6 +207,7 @@ fn run(sample: &Sample, iterations: usize, page_copies: usize) {
 
     let mut samples = Samples::default();
     let mut style_allocations = 0;
+    let mut style_peak_bytes = 0;
     let mut node_count = 0;
     for iteration in 0..iterations {
         let started = Instant::now();
@@ -193,6 +217,7 @@ fn run(sample: &Sample, iterations: usize, page_copies: usize) {
 
         if iteration == 0 {
             ALLOCATIONS.with(|count| count.set(Some(0)));
+            ALLOCATION_BYTES.with(|bytes| bytes.set(Some((0, 0))));
         }
         let started = Instant::now();
         let (styled, timings) = style_document_with_timings(document, sample.css);
@@ -200,6 +225,8 @@ fn run(sample: &Sample, iterations: usize, page_copies: usize) {
         if iteration == 0 {
             style_allocations =
                 ALLOCATIONS.with(|count| count.take().expect("allocation counter enabled"));
+            style_peak_bytes = ALLOCATION_BYTES
+                .with(|bytes| bytes.take().expect("byte tracking enabled").1);
         }
         black_box(styled);
         samples.push(html_parse, total_style, timings);
@@ -208,7 +235,7 @@ fn run(sample: &Sample, iterations: usize, page_copies: usize) {
 
     let css_bytes = sample.css.iter().map(|css| css.len()).sum::<usize>();
     println!(
-        "sample={} css_bytes={} classes={} nodes={} html_parse_us={} style_total_us={} css_parse_us={} prepare_us={} index_us={} matching_us={} cascade_us={} style_allocations={}",
+        "sample={} css_bytes={} classes={} nodes={} html_parse_us={} style_total_us={} css_parse_us={} prepare_us={} index_us={} matching_us={} cascade_us={} style_allocations={} style_peak_bytes={}",
         sample.name,
         css_bytes,
         class_count,
@@ -221,6 +248,7 @@ fn run(sample: &Sample, iterations: usize, page_copies: usize) {
         median(&samples.selector_matching),
         median(&samples.cascade),
         style_allocations,
+        style_peak_bytes,
     );
 }
 

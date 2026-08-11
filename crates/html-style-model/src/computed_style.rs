@@ -1,6 +1,6 @@
 use html_dom::{Document, DocumentLineage, DomNodeId, MemoryUsageReport, NodeRef};
 use kurbo::Vec2;
-use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::fx::{FxHashMap, FxHasher};
 use std::hash::{Hash, Hasher};
 use std::num::{NonZeroI16, NonZeroU16, NonZeroU32};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -1957,14 +1957,20 @@ struct StyleStore {
     // Dedup maps: identical computed sub-styles share one index, so runs of
     // similarly-styled elements (and inherited groups shared down subtrees)
     // collapse to a single stored entry.
-    font_dedup: FxHashMap<Font, u32>,
-    text_dedup: FxHashMap<InheritedText, u32>,
-    box_dedup: FxHashMap<BoxModel, u32>,
-    border_dedup: FxHashMap<Border, u32>,
-    border_radii_dedup: FxHashMap<BorderRadii, u32>,
-    bg_dedup: FxHashMap<Background, u32>,
-    layout_dedup: FxHashMap<LayoutStyle, u32>,
-    size_expression_dedup: FxHashMap<ComputedSizeExpression, u32>,
+    font_dedup: StyleDedup,
+    text_dedup: StyleDedup,
+    box_dedup: StyleDedup,
+    border_dedup: StyleDedup,
+    border_radii_dedup: StyleDedup,
+    bg_dedup: StyleDedup,
+    layout_dedup: StyleDedup,
+    size_expression_dedup: StyleDedup,
+}
+
+#[derive(Default)]
+struct StyleDedup {
+    indices: FxHashMap<u64, u32>,
+    collisions: FxHashMap<u64, Vec<u32>>,
 }
 
 static NEXT_STYLE_STORE_ID: AtomicU32 = AtomicU32::new(1);
@@ -1975,13 +1981,30 @@ fn next_style_store_id() -> NonZeroU32 {
 }
 
 /// Append `value` unless an identical one already exists, returning its index.
-fn intern_style<T: Clone + Eq + Hash>(values: &mut Vec<T>, dedup: &mut FxHashMap<T, u32>, value: T) -> u32 {
-    if let Some(&idx) = dedup.get(&value) {
+/// The index stores hashes rather than cloned style values; equality is checked
+/// against the canonical value vector, with a side table for true hash
+/// collisions.
+fn intern_style<T: Eq + Hash>(values: &mut Vec<T>, dedup: &mut StyleDedup, value: T) -> u32 {
+    let mut hasher = FxHasher::default();
+    value.hash(&mut hasher);
+    let hash = hasher.finish();
+    if let Some(&idx) = dedup.indices.get(&hash) {
+        if values[idx as usize] == value {
+            return idx;
+        }
+        if let Some(indices) = dedup.collisions.get(&hash)
+            && let Some(&idx) = indices.iter().find(|&&idx| values[idx as usize] == value)
+        {
+            return idx;
+        }
+        let idx = u32::try_from(values.len()).expect("computed style count fits in u32");
+        values.push(value);
+        dedup.collisions.entry(hash).or_default().push(idx);
         return idx;
     }
-    let idx = values.len() as u32;
-    dedup.insert(value.clone(), idx);
+    let idx = u32::try_from(values.len()).expect("computed style count fits in u32");
     values.push(value);
+    dedup.indices.insert(hash, idx);
     idx
 }
 
@@ -1997,14 +2020,14 @@ impl StyleStore {
             bg_styles: Vec::new(),
             layout_styles: Vec::new(),
             size_expressions: Vec::new(),
-            font_dedup: FxHashMap::default(),
-            text_dedup: FxHashMap::default(),
-            box_dedup: FxHashMap::default(),
-            border_dedup: FxHashMap::default(),
-            border_radii_dedup: FxHashMap::default(),
-            bg_dedup: FxHashMap::default(),
-            layout_dedup: FxHashMap::default(),
-            size_expression_dedup: FxHashMap::default(),
+            font_dedup: StyleDedup::default(),
+            text_dedup: StyleDedup::default(),
+            box_dedup: StyleDedup::default(),
+            border_dedup: StyleDedup::default(),
+            border_radii_dedup: StyleDedup::default(),
+            bg_dedup: StyleDedup::default(),
+            layout_dedup: StyleDedup::default(),
+            size_expression_dedup: StyleDedup::default(),
         }
     }
 
@@ -2097,14 +2120,14 @@ impl StyleStore {
     }
 
     fn discard_deduplication_maps(&mut self) {
-        self.font_dedup = FxHashMap::default();
-        self.text_dedup = FxHashMap::default();
-        self.box_dedup = FxHashMap::default();
-        self.border_dedup = FxHashMap::default();
-        self.border_radii_dedup = FxHashMap::default();
-        self.bg_dedup = FxHashMap::default();
-        self.layout_dedup = FxHashMap::default();
-        self.size_expression_dedup = FxHashMap::default();
+        self.font_dedup = StyleDedup::default();
+        self.text_dedup = StyleDedup::default();
+        self.box_dedup = StyleDedup::default();
+        self.border_dedup = StyleDedup::default();
+        self.border_radii_dedup = StyleDedup::default();
+        self.bg_dedup = StyleDedup::default();
+        self.layout_dedup = StyleDedup::default();
+        self.size_expression_dedup = StyleDedup::default();
     }
 
     fn validate_values(&self) -> Result<(), ComputedStyleValueError> {
@@ -2208,14 +2231,22 @@ impl StyleStore {
         report.add_slice_storage::<Background>("StyleStore.bg_styles.storage", self.bg_styles.capacity(), self.bg_styles.len());
         report.add_slice_storage::<LayoutStyle>("StyleStore.layout_styles.storage", self.layout_styles.capacity(), self.layout_styles.len());
         report.add_slice_storage::<ComputedSizeExpression>("StyleStore.size_expressions.storage", self.size_expressions.capacity(), self.size_expressions.len());
-        report.add_slice_storage::<(Font, u32)>("StyleStore.font_dedup.storage", self.font_dedup.capacity(), self.font_dedup.len());
-        report.add_slice_storage::<(InheritedText, u32)>("StyleStore.text_dedup.storage", self.text_dedup.capacity(), self.text_dedup.len());
-        report.add_slice_storage::<(BoxModel, u32)>("StyleStore.box_dedup.storage", self.box_dedup.capacity(), self.box_dedup.len());
-        report.add_slice_storage::<(Border, u32)>("StyleStore.border_dedup.storage", self.border_dedup.capacity(), self.border_dedup.len());
-        report.add_slice_storage::<(BorderRadii, u32)>("StyleStore.border_radii_dedup.storage", self.border_radii_dedup.capacity(), self.border_radii_dedup.len());
-        report.add_slice_storage::<(Background, u32)>("StyleStore.bg_dedup.storage", self.bg_dedup.capacity(), self.bg_dedup.len());
-        report.add_slice_storage::<(LayoutStyle, u32)>("StyleStore.layout_dedup.storage", self.layout_dedup.capacity(), self.layout_dedup.len());
-        report.add_slice_storage::<(ComputedSizeExpression, u32)>("StyleStore.size_expression_dedup.storage", self.size_expression_dedup.capacity(), self.size_expression_dedup.len());
+        for (label, dedup) in [
+            ("font", &self.font_dedup),
+            ("text", &self.text_dedup),
+            ("box", &self.box_dedup),
+            ("border", &self.border_dedup),
+            ("border_radii", &self.border_radii_dedup),
+            ("background", &self.bg_dedup),
+            ("layout", &self.layout_dedup),
+            ("size_expression", &self.size_expression_dedup),
+        ] {
+            report.add_slice_storage::<(u64, u32)>(format!("StyleStore.{label}_dedup.storage"), dedup.indices.capacity(), dedup.indices.len());
+            report.add_slice_storage::<(u64, Vec<u32>)>(format!("StyleStore.{label}_dedup_collisions.storage"), dedup.collisions.capacity(), dedup.collisions.len());
+            for indices in dedup.collisions.values() {
+                report.add_slice_storage::<u32>(format!("StyleStore.{label}_dedup_collisions.indices"), indices.capacity(), indices.len());
+            }
+        }
         report
     }
 }
@@ -4287,9 +4318,29 @@ impl Hash for PreferredSize {
 
 #[cfg(test)]
 mod boundary_tests {
-    use super::{ComputedStyleValueError, ComputedStylesBuilder, Font, InheritedText, StyleIndices, StyleStringId, VerticalAlignValue};
+    use super::{ComputedStyleValueError, ComputedStylesBuilder, Font, InheritedText, StyleDedup, StyleIndices, StyleStringId, VerticalAlignValue, intern_style};
     use html_dom::Document;
+    use std::hash::{Hash, Hasher};
     use std::mem::size_of;
+
+    #[derive(Eq, PartialEq)]
+    struct CollidingStyle(u32);
+
+    impl Hash for CollidingStyle {
+        fn hash<H: Hasher>(&self, state: &mut H) {
+            0u8.hash(state);
+        }
+    }
+
+    #[test]
+    fn style_interner_resolves_hash_collisions_by_value() {
+        let mut values = Vec::new();
+        let mut dedup = StyleDedup::default();
+        assert_eq!(intern_style(&mut values, &mut dedup, CollidingStyle(1)), 0);
+        assert_eq!(intern_style(&mut values, &mut dedup, CollidingStyle(2)), 1);
+        assert_eq!(intern_style(&mut values, &mut dedup, CollidingStyle(1)), 0);
+        assert_eq!(values.len(), 2);
+    }
 
     #[test]
     fn style_handles_are_branded_by_their_store() {

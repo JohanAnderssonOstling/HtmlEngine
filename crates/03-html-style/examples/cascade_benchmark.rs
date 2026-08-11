@@ -18,6 +18,24 @@ use std::time::Duration;
 
 thread_local! {
     static ALLOCATIONS: Cell<Option<usize>> = const { Cell::new(None) };
+    static ALLOCATION_BYTES: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
+}
+
+fn allocated(size: usize) {
+    ALLOCATION_BYTES.with(|bytes| {
+        if let Some((current, peak)) = bytes.get() {
+            let current = current + size;
+            bytes.set(Some((current, peak.max(current))));
+        }
+    });
+}
+
+fn deallocated(size: usize) {
+    ALLOCATION_BYTES.with(|bytes| {
+        if let Some((current, peak)) = bytes.get() {
+            bytes.set(Some((current.saturating_sub(size), peak)));
+        }
+    });
 }
 
 struct TrackingAllocator;
@@ -25,20 +43,25 @@ struct TrackingAllocator;
 unsafe impl GlobalAlloc for TrackingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         ALLOCATIONS.with(|count| count.set(count.get().map(|value| value + 1)));
+        allocated(layout.size());
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         ALLOCATIONS.with(|count| count.set(count.get().map(|value| value + 1)));
+        allocated(layout.size());
         unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         ALLOCATIONS.with(|count| count.set(count.get().map(|value| value + 1)));
+        deallocated(layout.size());
+        allocated(new_size);
         unsafe { System.realloc(pointer, layout, new_size) }
     }
 
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        deallocated(layout.size());
         unsafe { System.dealloc(pointer, layout) }
     }
 }
@@ -52,16 +75,20 @@ fn workload(
     important_every: usize,
     use_vars: bool,
     inline_every: usize,
+    unique_inline: bool,
 ) -> (String, String) {
     let mut html = String::from("<!doctype html><html><body>");
     for index in 0..nodes {
         let has_inline = inline_every > 0 && index % inline_every == 0;
-        let inline = if has_inline && use_vars {
-            " style='width:321px; padding-left:var(--space); color:revert-layer'"
+        let inline = if has_inline && unique_inline {
+            let padding = if use_vars { "var(--space)" } else { "3px" };
+            format!(" style=\"width:{}px; padding-left:{padding}; color:revert-layer; font-feature-settings:'kern' {}\"", index + 1, index + 1)
+        } else if has_inline && use_vars {
+            " style='width:321px; padding-left:var(--space); color:revert-layer'".to_owned()
         } else if has_inline {
-            " style='width:321px; padding-left:3px; color:revert-layer'"
+            " style='width:321px; padding-left:3px; color:revert-layer'".to_owned()
         } else {
-            ""
+            String::new()
         };
         html.push_str(&format!(
             "<div class='item group{}' data-index='{index}'{inline}>text</div>",
@@ -123,6 +150,7 @@ fn main() {
         .next()
         .and_then(|value| value.parse().ok())
         .unwrap_or(10);
+    let unique_inline = arguments.next().is_some_and(|value| value != "0");
     assert!(nodes > 0 && iterations > 0);
     let (html, css) = workload(
         nodes,
@@ -130,6 +158,7 @@ fn main() {
         important_every,
         use_vars,
         inline_every,
+        unique_inline,
     );
 
     for _ in 0..3 {
@@ -140,15 +169,19 @@ fn main() {
     let mut cascade = Vec::with_capacity(iterations);
     let mut resolve = Vec::with_capacity(iterations);
     let mut measured_allocations = 0;
+    let mut measured_peak_bytes = 0;
     for iteration in 0..iterations {
         let document = html_parse::parse_dom_document(&html).expect("benchmark HTML parses");
         if iteration == 0 {
             ALLOCATIONS.with(|count| count.set(Some(0)));
+            ALLOCATION_BYTES.with(|bytes| bytes.set(Some((0, 0))));
         }
         let (styled, timings) = style_document_with_timings(document, &[&css]);
         if iteration == 0 {
             measured_allocations =
                 ALLOCATIONS.with(|count| count.take().expect("allocation counter enabled"));
+            measured_peak_bytes = ALLOCATION_BYTES
+                .with(|bytes| bytes.take().expect("byte tracking enabled").1);
         }
         black_box(styled);
         cascade.push(timings.cascade);
@@ -158,7 +191,7 @@ fn main() {
     resolve.sort_unstable();
 
     println!(
-        "nodes={nodes} iterations={iterations} overriding_rules={overriding_rules} important_every={important_every} use_vars={use_vars} inline_every={inline_every}"
+        "nodes={nodes} iterations={iterations} overriding_rules={overriding_rules} important_every={important_every} use_vars={use_vars} inline_every={inline_every} unique_inline={unique_inline}"
     );
     println!(
         "cascade_median_us={}",
@@ -177,4 +210,5 @@ fn main() {
         percentile(&resolve, 95, 100).as_micros()
     );
     println!("style_pipeline_allocations={measured_allocations}");
+    println!("style_pipeline_peak_bytes={measured_peak_bytes}");
 }
