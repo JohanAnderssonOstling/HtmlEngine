@@ -1,6 +1,6 @@
 use html_dom::DomNodeId;
 use html_style::StyledDocument;
-use html_style_model::{Display, StyleIndices};
+use html_style_model::{Display, PreferredSize, StyleIndices};
 use html_wpt_test_support::wpt_root;
 use std::fs;
 
@@ -79,6 +79,7 @@ fn pinned_wpt_revert_layer_cases_resolve_to_green() {
     for relative in [
         "revert-layer-001.html",
         "revert-layer-002.html",
+        "revert-layer-003.html",
         "revert-layer-005.html",
         "revert-layer-007.html",
         "revert-layer-009.html",
@@ -98,8 +99,28 @@ fn pinned_wpt_revert_layer_cases_resolve_to_green() {
 }
 
 #[test]
+fn pinned_wpt_revert_layer_falls_back_to_the_ua_display() {
+    let document = styled_upstream("revert-layer-006.html");
+    let style = style_by_id(&document, "inner");
+    assert_eq!(
+        document.box_model_style(style).expect("box style").display,
+        Display::Block
+    );
+}
+
+#[test]
 fn pinned_wpt_revert_restores_the_div_ua_display() {
     let document = styled_upstream("revert-val-001.html");
+    let style = style_by_id(&document, "inner");
+    assert_eq!(
+        document.box_model_style(style).expect("box style").display,
+        Display::Block
+    );
+}
+
+#[test]
+fn pinned_wpt_important_beats_revert() {
+    let document = styled_upstream("revert-val-002.html");
     let style = style_by_id(&document, "inner");
     assert_eq!(
         document.box_model_style(style).expect("box style").display,
@@ -119,4 +140,47 @@ fn pinned_wpt_important_font_size_controls_em_line_height() {
         document.text_style(style).expect("text style").line_height,
         36.0
     );
+}
+
+#[test]
+fn pinned_wpt_author_styles_beat_presentational_width_hints() {
+    let document = styled_upstream("presentational-hints-cascade.html");
+    for id in ["target1", "target2", "target3"] {
+        let style = style_by_id(&document, id);
+        assert_eq!(
+            document.box_model_style(style).expect("box style").width,
+            PreferredSize::Px(100.0),
+            "{id}"
+        );
+    }
+}
+
+#[test]
+fn pinned_wpt_revert_layer_restores_presentational_hints() {
+    let document = styled_upstream("presentational-hints-rollback.html");
+    for node in document.document().node_ids().filter(|&node| {
+        document
+            .document()
+            .get_dom_classes(node)
+            .any(|class| matches!(class, "revert-layer-1" | "revert-layer-2"))
+    }) {
+        let style = document.style_for_node(node).expect("computed WPT style");
+        let box_model = document.box_model_style(style).expect("box style");
+        let tag = document.document().get_dom_tag(node).unwrap_or("unknown");
+        let classes = document
+            .document()
+            .get_dom_classes(node)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(
+            box_model.width,
+            PreferredSize::Px(44.0),
+            "{tag}.{classes} width"
+        );
+        assert_eq!(
+            box_model.height,
+            PreferredSize::Px(33.0),
+            "{tag}.{classes} height"
+        );
+    }
 }

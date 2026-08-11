@@ -577,7 +577,7 @@ mod tests {
 
     #[test]
     fn image_dimension_attributes_are_presentational_hints_below_author_css() {
-        let html = "<html><body><img id='percentage' src='x' width='50%' height='25%'><img id='pixels' src='x' width='80' height='3'><img id='overridden' src='x' width='50%' style='width:75%'><svg id='svg' width='40' height='50%'></svg></body></html>";
+        let html = "<html><body><img id='percentage' src='x' width='50%' height='25%'><img id='pixels' src='x' width='80' height='3'><img id='overridden' src='x' width='50%' style='width:75%'><iframe id='frame' width='44' height='33'></iframe><svg id='svg' width='40' height='50%'></svg></body></html>";
         let mut factory = DocumentFactory::new();
         let document = factory.parse_with_new_pipeline(html, None);
         let style_for = |id| {
@@ -592,6 +592,8 @@ mod tests {
         assert_eq!(pixels.width, PreferredSize::Px(80.0));
         assert_eq!(pixels.height, PreferredSize::Px(3.0));
         assert_eq!(style_for("overridden").width, PreferredSize::Percent(0.75));
+        assert_eq!(style_for("frame").width, PreferredSize::Px(44.0));
+        assert_eq!(style_for("frame").height, PreferredSize::Px(33.0));
         assert_eq!(style_for("svg").width, PreferredSize::Px(40.0));
         assert_eq!(style_for("svg").height, PreferredSize::Percent(0.5));
     }

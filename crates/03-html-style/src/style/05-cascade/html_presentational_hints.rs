@@ -40,7 +40,7 @@ pub(super) fn apply(doc: &Document, node_idx: DomNodeId, style: &mut WorkingStyl
         style.box_model.display = Display::None;
     }
 
-    if matches!(tag.to_ascii_lowercase().as_str(), "img" | "object" | "embed" | "input") {
+    if matches!(tag.to_ascii_lowercase().as_str(), "img" | "object" | "embed" | "iframe" | "input") {
         apply_replaced_dimensions(doc, node_idx, style);
     }
     if matches!(tag.to_ascii_lowercase().as_str(), "table" | "td" | "th" | "col" | "colgroup" | "hr")
