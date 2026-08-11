@@ -164,13 +164,3 @@ pub(super) fn extend_ancestor_filter_dom(
         filter.insert(class);
     }
 }
-
-pub(super) fn selector_might_match_dom(
-    selector: &lightningcss::selector::Selector,
-    ancestor_filter: &AncestorFilter,
-    _doc: &Document,
-    _node_idx: DomNodeId,
-) -> bool {
-    use crate::style::matching::dom::selector_might_match_with_filter;
-    selector_might_match_with_filter(selector, ancestor_filter)
-}

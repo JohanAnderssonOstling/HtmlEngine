@@ -827,6 +827,7 @@ fn specificity_for_components(components: &[Component<'_>]) -> Specificity {
 
 /// Fast pre-check using bloom filter - can reject selectors that definitely won't match
 /// This is an optimization to avoid expensive full matching for selectors targeting ancestors
+#[allow(dead_code)]
 pub fn selector_might_match_with_filter(selector: &Selector, ancestor_filter: &AncestorFilter) -> bool {
     let mut iter = selector.iter();
 

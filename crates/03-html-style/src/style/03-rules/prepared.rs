@@ -163,6 +163,12 @@ impl LayerRegistry {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct EffectiveRuleId(u32);
 
+impl EffectiveRuleId {
+    pub(crate) fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ScopeId(u32);
 

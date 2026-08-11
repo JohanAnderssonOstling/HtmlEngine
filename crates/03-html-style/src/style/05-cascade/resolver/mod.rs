@@ -4,7 +4,7 @@
 //! the shared cascade runner, property-family application, and style interning.
 
 use crate::style::matching::dom::{PseudoTarget, selector_matches_dom_pseudo_in_scope};
-use crate::style::matching::selectors::{AncestorFilter, SelectorIndex};
+use crate::style::matching::selectors::{AncestorFilter, CandidateDeduper, SelectorIndex, selector_might_match_ancestors};
 use crate::style::rules::prepared::{
     CascadeOrigin, EffectiveRuleId, PreparedPropertyTarget, PreparedRuleSet, RulePriority,
     compile_property_targets,
@@ -107,7 +107,7 @@ pub(super) struct StyleResolverContext<'a, 'sheet, 'css> {
     pub(super) index: &'a SelectorIndex,
     pub(super) styles: &'a mut ComputedStylesBuilder,
     pub(super) candidate_scratch: &'a mut Vec<EffectiveRuleId>,
-    pub(super) candidate_seen: &'a mut rustc_data_structures::fx::FxHashSet<EffectiveRuleId>,
+    pub(super) candidate_seen: &'a mut CandidateDeduper,
     matched_rule_scratch: &'a mut Vec<MatchedRule>,
     important_rule_scratch: &'a mut Vec<MatchedRule>,
     property_targets: &'a mut specified::PropertyTargetState,
@@ -173,7 +173,7 @@ pub(crate) fn resolve_styles_for_dom_timed<'sheet, 'css>(
     let mut style_sharing_cache = StyleSharingCache::default();
     let mut computed_styles = ComputedStylesBuilder::new(doc);
     let mut candidate_scratch = Vec::new();
-    let mut candidate_seen = rustc_data_structures::fx::FxHashSet::default();
+    let mut candidate_seen = CandidateDeduper::new(index.rule_count());
     let mut matched_rule_scratch = Vec::new();
     let mut important_rule_scratch = Vec::new();
     let mut property_targets = specified::PropertyTargetState::default();
@@ -557,8 +557,9 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
                 .selectors
                 .0
                 .iter()
-                .filter(|selector| {
-                    selector_might_match_dom(selector, ancestor_filter, doc, node_idx)
+                .zip(index.ancestor_requirements(id))
+                .filter(|(selector, requirements)| {
+                    selector_might_match_ancestors(**requirements, ancestor_filter)
                         && crate::style::matching::dom::selector_matches_dom_node_in_scope(
                             selector,
                             doc,
@@ -566,7 +567,7 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
                             scope_match.root,
                         )
                 })
-                .map(crate::style::matching::dom::selector_specificity)
+                .map(|(selector, _)| crate::style::matching::dom::selector_specificity(selector))
                 .max();
             if let Some(specificity) = specificity {
                 matched_rules.push(MatchedRule {
@@ -577,10 +578,6 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
             }
         }
 
-        let CascadePlan {
-            normal: matched_rules,
-            important: important_rules,
-        } = CascadePlan::build(matched_rules, self.important_rule_scratch, prepared);
         self.timings.selector_matching += matching_started.elapsed();
 
         // Build computed style from matched rules (same as box-based version)
@@ -596,13 +593,18 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
         ) {
             StyleSharingProbe::Hit(shared) => {
                 *self.matched_rule_scratch = matched_rules;
-                *self.important_rule_scratch = important_rules;
                 self.timings.cascade += cascade_started.elapsed();
                 return ElementStyleResult::Shared(shared);
             }
             StyleSharingProbe::Miss(signature) => Some(signature),
             StyleSharingProbe::Uncacheable => None,
         };
+        // A sharing hit needs neither cascade ordering nor the important-rule
+        // split. The exact deterministic match sequence is already the key.
+        let CascadePlan {
+            normal: matched_rules,
+            important: important_rules,
+        } = CascadePlan::build(matched_rules, self.important_rule_scratch, prepared);
         let mut style = get_inherited_style_dom(doc, self.styles, node_idx);
         let parent_font_size = style.font.font_size;
         let mut cascade_scratch = std::mem::take(self.cascade_scratch);

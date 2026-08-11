@@ -1,7 +1,7 @@
 use crate::style::rules::prepared::{EffectiveRuleId, PreparedRuleSet};
 use lightningcss::properties::custom::{Token, TokenList, TokenOrValue};
 use lightningcss::selector::{Component, PseudoClass, PseudoElement, Selector, SelectorList};
-use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use rustc_data_structures::fx::FxHashMap;
 
 pub(crate) const PSEUDO_BEFORE_MASK: u8 = 1 << 0;
 pub(crate) const PSEUDO_AFTER_MASK: u8 = 1 << 1;
@@ -59,22 +59,73 @@ pub struct SelectorIndex {
     by_class: FxHashMap<String, Vec<EffectiveRuleId>>,
     by_id: FxHashMap<String, Vec<EffectiveRuleId>>,
     universal: Vec<EffectiveRuleId>, // *, [attr], :pseudo with no tag/class/id
+    ancestor_requirement_starts: Vec<u32>,
+    ancestor_requirements: Vec<u64>,
+}
+
+/// Dense duplicate suppression for candidate rule IDs. Prepared IDs are
+/// contiguous, so advancing an epoch is cheaper than clearing a hash table.
+pub(crate) struct CandidateDeduper {
+    generations: Vec<u32>,
+    generation: u32,
+}
+
+impl CandidateDeduper {
+    pub(crate) fn new(rule_count: usize) -> Self {
+        Self { generations: vec![0; rule_count], generation: 0 }
+    }
+
+    fn begin_element(&mut self) {
+        if self.generation == u32::MAX {
+            self.generations.fill(0);
+            self.generation = 1;
+        } else {
+            self.generation += 1;
+        }
+    }
+
+    #[inline]
+    fn insert(&mut self, id: EffectiveRuleId) -> bool {
+        let generation = &mut self.generations[id.index()];
+        if *generation == self.generation {
+            false
+        } else {
+            *generation = self.generation;
+            true
+        }
+    }
 }
 
 impl SelectorIndex {
     pub fn new() -> Self {
-        Self { by_tag: FxHashMap::default(), by_class: FxHashMap::default(), by_id: FxHashMap::default(), universal: Vec::new() }
+        Self { by_tag: FxHashMap::default(), by_class: FxHashMap::default(), by_id: FxHashMap::default(), universal: Vec::new(), ancestor_requirement_starts: Vec::new(), ancestor_requirements: Vec::new() }
     }
 
     /// Build an index only from rules admitted by stylesheet preparation.
     pub fn from_prepared(prepared: &PreparedRuleSet<'_, '_>) -> Self {
         let mut index = Self::new();
+        let rule_count = prepared.iter().count();
+        index.ancestor_requirement_starts.reserve(rule_count + 1);
+        index.ancestor_requirements.reserve(rule_count);
         for (id, rule) in prepared.iter() {
+            index.ancestor_requirement_starts.push(u32::try_from(index.ancestor_requirements.len()).expect("prepared selector count fits in u32"));
+            index.ancestor_requirements.extend(rule.style_rule().selectors.0.iter().map(selector_ancestor_requirement_mask));
             for selector in &rule.style_rule().selectors.0 {
                 index.add_selector(selector, id);
             }
         }
+        index.ancestor_requirement_starts.push(u32::try_from(index.ancestor_requirements.len()).expect("prepared selector count fits in u32"));
         index
+    }
+
+    pub(crate) fn rule_count(&self) -> usize {
+        self.ancestor_requirement_starts.len().saturating_sub(1)
+    }
+
+    pub(crate) fn ancestor_requirements(&self, id: EffectiveRuleId) -> &[u64] {
+        let start = self.ancestor_requirement_starts[id.index()] as usize;
+        let end = self.ancestor_requirement_starts[id.index() + 1] as usize;
+        &self.ancestor_requirements[start..end]
     }
 
     /// Add a selector to the index
@@ -118,9 +169,9 @@ impl SelectorIndex {
     }
 
     /// Get candidate rule indices for an element
-    pub fn collect_candidates<'a>(&self, tag: &str, id: Option<&str>, classes: impl IntoIterator<Item = &'a str>, candidates: &mut Vec<EffectiveRuleId>, seen: &mut FxHashSet<EffectiveRuleId>) {
+    pub fn collect_candidates<'a>(&self, tag: &str, id: Option<&str>, classes: impl IntoIterator<Item = &'a str>, candidates: &mut Vec<EffectiveRuleId>, seen: &mut CandidateDeduper) {
         candidates.clear();
-        seen.clear();
+        seen.begin_element();
 
         // Add by tag
         if let Some(indices) = self.by_tag.get(tag) {
@@ -160,6 +211,36 @@ impl SelectorIndex {
             }
         }
     }
+}
+
+/// Compile the ancestor-only Bloom prefilter once per selector. A zero mask
+/// disables rejection for sibling combinators, which are not in the filter.
+fn selector_ancestor_requirement_mask(selector: &Selector<'_>) -> u64 {
+    use lightningcss::selector::Combinator;
+    let mut iter = selector.iter();
+    for _ in iter.by_ref() {}
+    let mut requirements = 0;
+    while let Some(combinator) = iter.next_sequence() {
+        if !matches!(combinator, Combinator::Child | Combinator::Descendant) {
+            return 0;
+        }
+        for component in iter.by_ref() {
+            let value = match component {
+                Component::LocalName(name) => Some(name.lower_name.0.as_ref()),
+                Component::Class(class) => Some(class.0.as_ref()),
+                Component::ID(id) => Some(id.0.as_ref()),
+                _ => None,
+            };
+            if let Some(value) = value {
+                requirements |= AncestorFilter::hash(value);
+            }
+        }
+    }
+    requirements
+}
+
+pub(crate) fn selector_might_match_ancestors(requirements: u64, ancestor_filter: &AncestorFilter) -> bool {
+    ancestor_filter.bits & requirements == requirements
 }
 
 /// Validate browser-facing selector semantics that Lightning CSS deliberately
