@@ -68,7 +68,9 @@ pub(super) struct DeclarationEvent<'event, 'css> {
 }
 
 pub(super) fn build_cascade_events<'event, 'sheet, 'css>(prepared: &'event PreparedRuleSet<'sheet, 'css>, normal_rules: &[MatchedRule], important_rules: &[MatchedRule], inline_style: Option<&'event StyleAttribute<'css>>) -> (Vec<DeclarationEvent<'event, 'css>>, usize) {
-    let mut events = Vec::new();
+    let inline_capacity = inline_style.map_or(0, |inline| inline.declarations.declarations.len() + inline.declarations.important_declarations.len());
+    let event_capacity = normal_rules.iter().map(|matched| prepared.get(matched.id).style_rule().declarations.declarations.len()).sum::<usize>() + important_rules.iter().map(|matched| prepared.get(matched.id).style_rule().declarations.important_declarations.len()).sum::<usize>() + inline_capacity;
+    let mut events = Vec::with_capacity(event_capacity);
     let mut hints_sequence = None;
     let mut normal_ranks = FxHashMap::default();
     let mut layer_starts = Vec::with_capacity(normal_rules.len());
@@ -182,16 +184,24 @@ impl PropertyTargetState {
 
 pub(super) struct SelectedDeclaration<'event, 'css> {
     pub(super) property: &'event Property<'css>,
-    pub(super) targets: Vec<PropertyTarget>,
+    target_start: usize,
+    target_len: usize,
     pub(super) sequence: usize,
 }
 
 pub(super) struct SpecifiedSelection<'event, 'css> {
     pub(super) declarations: Vec<SelectedDeclaration<'event, 'css>>,
+    targets: Vec<PropertyTarget>,
     /// Presentational hints cascade as a distinct origin, but `revert` in the
     /// author origin also rolls that origin back.
     pub(super) reverted_hint_targets: rustc_data_structures::fx::FxHashSet<Rc<str>>,
     pub(super) reverted_all_hints: bool,
+}
+
+impl SpecifiedSelection<'_, '_> {
+    pub(super) fn targets_for(&self, declaration: &SelectedDeclaration<'_, '_>) -> &[PropertyTarget] {
+        &self.targets[declaration.target_start..declaration.target_start + declaration.target_len]
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -289,7 +299,8 @@ pub(super) fn select_specified_values<'event, 'css>(events: &[DeclarationEvent<'
     let mut rollbacks = FxHashMap::<u32, Vec<Rollback>>::default();
     let mut global_rollbacks = Vec::<Rollback>::new();
     let mut all_claimed = false;
-    let mut selected = Vec::new();
+    let mut selected = Vec::with_capacity(events.len());
+    let mut selected_targets = Vec::with_capacity(events.len());
     let mut reverted_hint_targets = rustc_data_structures::fx::FxHashSet::default();
     let mut reverted_all_hints = false;
 
@@ -320,13 +331,15 @@ pub(super) fn select_specified_values<'event, 'css>(events: &[DeclarationEvent<'
                     RollbackKind::Layer => Rollback::Layer(event.boundary),
                 });
             } else if !all_claimed {
-                selected.push(SelectedDeclaration { property: event.property, targets: targets.to_vec(), sequence });
+                let target_start = selected_targets.len();
+                selected_targets.extend(targets.iter().cloned());
+                selected.push(SelectedDeclaration { property: event.property, target_start, target_len: targets.len(), sequence });
                 all_claimed = true;
             }
             continue;
         }
 
-        let mut winning_targets = Vec::new();
+        let target_start = selected_targets.len();
         for target in targets.iter() {
             // `all` deliberately excludes direction and custom properties.
             if (&*target.name != "direction" && all_claimed) || target_state.is_claimed(target.slot, claim_epoch) {
@@ -348,16 +361,22 @@ pub(super) fn select_specified_values<'event, 'css>(events: &[DeclarationEvent<'
                 });
             } else {
                 target_state.claim(target.slot, claim_epoch);
-                winning_targets.push(target.clone());
+                selected_targets.push(target.clone());
             }
         }
-        if !winning_targets.is_empty() {
-            selected.push(SelectedDeclaration { property: event.property, targets: winning_targets, sequence });
+        let target_len = selected_targets.len() - target_start;
+        if target_len != 0 {
+            selected.push(SelectedDeclaration { property: event.property, target_start, target_len, sequence });
         }
     }
 
     selected.sort_by_key(|declaration| declaration.sequence);
-    SpecifiedSelection { declarations: selected, reverted_hint_targets, reverted_all_hints }
+    SpecifiedSelection {
+        declarations: selected,
+        targets: selected_targets,
+        reverted_hint_targets,
+        reverted_all_hints,
+    }
 }
 
 #[cfg(test)]
@@ -380,7 +399,7 @@ mod tests {
         ];
         let selected = select_specified_values(&events, &mut PropertyTargetState::default());
         assert_eq!(selected.declarations.len(), 2);
-        assert!(!selected.declarations[0].targets.iter().any(|target| &*target.name == "margin-left"));
-        assert_eq!(&*selected.declarations[1].targets[0].name, "margin-left");
+        assert!(!selected.targets_for(&selected.declarations[0]).iter().any(|target| &*target.name == "margin-left"));
+        assert_eq!(&*selected.targets_for(&selected.declarations[1])[0].name, "margin-left");
     }
 }

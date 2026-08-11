@@ -205,6 +205,7 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
         &mut self,
         style: &mut WorkingStyle,
         declaration: &SelectedDeclaration<'event, 'css>,
+        targets: &[PropertyTarget],
         parent_font_size: f32,
         var_map: &HashMap<&str, TokenList<'css>>,
         phase: CascadePhase,
@@ -223,7 +224,7 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
                     .ok()
                     .or_else(|| resolve_single_var_property(unparsed, var_map));
                 let Some(property) = resolved_unparsed.as_ref() else {
-                    for target in &declaration.targets {
+                    for target in targets {
                         if &*target.name == "all" || target_phase(target) == phase {
                             let _ = apply_css_wide_keyword_in_phase(
                                 style,
@@ -249,7 +250,7 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
                 mark_var_substitution_boundaries(&mut value.value);
                 value.value.substitute_variables(var_map);
                 if token_list_contains_var(&value.value) {
-                    for target in &declaration.targets {
+                    for target in targets {
                         if &*target.name == "all" || target_phase(target) == phase {
                             let _ = apply_css_wide_keyword_in_phase(
                                 style,
@@ -280,7 +281,7 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
                 || !self.declaration_is_eligible(resolved)
                 || !self.declaration_is_computable(style, resolved, parent_font_size, parent))
         {
-            for target in &declaration.targets {
+            for target in targets {
                 if &*target.name == "all" || target_phase(target) == phase {
                     let _ = apply_css_wide_keyword_in_phase(
                         style,
@@ -296,7 +297,7 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
             }
             return;
         }
-        for target in &declaration.targets {
+        for target in targets {
             self.apply_computed_property(style, resolved, target, parent_font_size, phase, parent);
         }
     }
@@ -372,6 +373,7 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
                 self.apply_selected_declaration(
                     style,
                     declaration,
+                    selection.targets_for(declaration),
                     parent_font_size,
                     &var_map,
                     phase,
