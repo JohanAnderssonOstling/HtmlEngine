@@ -6,7 +6,8 @@
 use crate::style::matching::dom::{PseudoTarget, selector_matches_dom_pseudo_in_scope};
 use crate::style::matching::selectors::{AncestorFilter, SelectorIndex};
 use crate::style::rules::prepared::{
-    CascadeOrigin, EffectiveRuleId, PreparedRuleSet, RulePriority,
+    CascadeOrigin, EffectiveRuleId, PreparedPropertyTarget, PreparedRuleSet, RulePriority,
+    compile_property_targets,
 };
 use crate::style::source::declarations::normalize as normalize_declarations;
 use crate::style::syntax::values::tab_size::{
@@ -106,6 +107,7 @@ pub(super) struct StyleResolverContext<'a, 'sheet, 'css> {
     pub(super) candidate_scratch: &'a mut Vec<EffectiveRuleId>,
     pub(super) candidate_seen: &'a mut rustc_data_structures::fx::FxHashSet<EffectiveRuleId>,
     property_targets: &'a mut specified::PropertyTargetState,
+    cascade_scratch: &'a mut specified::CascadeScratch<'a, 'css>,
     validation_style: &'a mut WorkingStyle,
     pub(super) timings: &'a mut ResolveStyleTimings,
 }
@@ -147,6 +149,7 @@ pub(crate) fn resolve_styles_for_dom_timed<'sheet, 'css>(
     let mut candidate_scratch = Vec::new();
     let mut candidate_seen = rustc_data_structures::fx::FxHashSet::default();
     let mut property_targets = specified::PropertyTargetState::default();
+    let mut cascade_scratch = specified::CascadeScratch::default();
     let mut validation_style = WorkingStyle::default();
     let mut ancestor_filters = vec![AncestorFilter::default(); doc.node_count()];
     timings.resolver_setup = started.elapsed();
@@ -159,6 +162,7 @@ pub(crate) fn resolve_styles_for_dom_timed<'sheet, 'css>(
             candidate_scratch: &mut candidate_scratch,
             candidate_seen: &mut candidate_seen,
             property_targets: &mut property_targets,
+            cascade_scratch: &mut cascade_scratch,
             validation_style: &mut validation_style,
             timings: &mut timings,
         };
@@ -395,21 +399,35 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
         // override this initial value.
         style.box_model.display = Display::Inline;
         let parent_font_size = style.font.font_size;
-        let (events, hints_sequence) =
-            specified::build_cascade_events(prepared, &matched_rules, &important_rules, None);
-        let custom_properties = cascade_custom_properties(&events, inherited_custom_properties);
+        let mut cascade_scratch = std::mem::take(self.cascade_scratch);
+        let hints_sequence = specified::build_cascade_events(
+            prepared,
+            &matched_rules,
+            &important_rules,
+            None,
+            &mut cascade_scratch.events,
+        );
+        let custom_properties = cascade_custom_properties(
+            &cascade_scratch.events.events,
+            None,
+            inherited_custom_properties,
+        );
 
         self.apply_cascade(
             &mut style,
             CascadeInputs {
-                events: &events,
+                events: &cascade_scratch.events.events,
+                inline_style: None,
                 hints_sequence,
                 parent_font_size,
                 custom_properties: &custom_properties,
                 parent: &inherited,
                 presentational_hints_node: None,
             },
+            &mut cascade_scratch.valid_events,
+            &mut cascade_scratch.selection,
         );
+        *self.cascade_scratch = cascade_scratch;
         Some(style)
     }
 }
@@ -485,26 +503,36 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
         let parent_font_size = style.font.font_size;
         let parent_custom = parent_custom.unwrap_or_default();
         let inline_style = parse_inline_style_attribute(doc, node_idx);
-        let (events, hints_sequence) = specified::build_cascade_events(
+        let mut cascade_scratch = std::mem::take(self.cascade_scratch);
+        let hints_sequence = specified::build_cascade_events(
             prepared,
             &matched_rules,
             &important_rules,
             inline_style.as_ref(),
+            &mut cascade_scratch.events,
         );
-        let mut custom_properties = cascade_custom_properties(&events, &parent_custom);
+        let mut custom_properties = cascade_custom_properties(
+            &cascade_scratch.events.events,
+            inline_style.as_ref(),
+            &parent_custom,
+        );
 
         let parent_style = ParentStyle::for_node(doc, self.styles, node_idx);
         self.apply_cascade(
             &mut style,
             CascadeInputs {
-                events: &events,
+                events: &cascade_scratch.events.events,
+                inline_style: inline_style.as_ref(),
                 hints_sequence,
                 parent_font_size,
                 custom_properties: &custom_properties,
                 parent: &parent_style,
                 presentational_hints_node: Some(node_idx),
             },
+            &mut cascade_scratch.valid_events,
+            &mut cascade_scratch.selection,
         );
+        *self.cascade_scratch = cascade_scratch;
 
         if let Some(white_space) = custom_properties
             .get(WHITE_SPACE_CASCADE_MARKER)

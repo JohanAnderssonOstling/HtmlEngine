@@ -10,6 +10,7 @@ use super::media::{CompiledMediaList, MediaEnvironment, MediaQuerySet};
 use crate::style::matching::selectors::selector_list_is_web_valid;
 use crate::{PropertyCapability, PropertySyntax, declaration_support, supports_selector_syntax_is_valid};
 use html_dom::{Document, DomNodeId};
+use lightningcss::properties::{Property, PropertyId};
 use lightningcss::rules::layer::LayerName;
 use lightningcss::rules::style::StyleRule;
 use lightningcss::rules::supports::SupportsCondition;
@@ -18,6 +19,7 @@ use lightningcss::selector::SelectorList;
 use lightningcss::stylesheet::StyleSheet;
 use rustc_data_structures::fx::FxHashMap;
 use std::cmp::Ordering;
+use std::rc::Rc;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
@@ -188,6 +190,67 @@ pub(crate) struct EffectiveRule<'sheet, 'css> {
     scope: ScopeId,
 }
 
+#[derive(Clone)]
+pub(crate) struct PreparedPropertyTarget {
+    pub(crate) name: Rc<str>,
+    pub(crate) slot: u32,
+    pub(crate) longhand: Option<PropertyId<'static>>,
+}
+
+#[derive(Clone, Copy)]
+struct PreparedTargetRange {
+    start: u32,
+    len: u32,
+}
+
+fn canonical_slot(name: &str) -> &str {
+    match name {
+        "word-wrap" => "overflow-wrap",
+        "page-break-before" => "break-before",
+        "page-break-after" => "break-after",
+        "page-break-inside" => "break-inside",
+        "grid-row-gap" => "row-gap",
+        "grid-column-gap" => "column-gap",
+        _ => name,
+    }
+}
+
+fn intern_target(name: &str, longhand: Option<PropertyId<'static>>, slot_ids: &mut FxHashMap<Rc<str>, u32>) -> PreparedPropertyTarget {
+    if let Some((name, slot)) = slot_ids.get_key_value(name) {
+        return PreparedPropertyTarget { name: name.clone(), slot: *slot, longhand };
+    }
+    let name: Rc<str> = Rc::from(name);
+    let slot = u32::try_from(slot_ids.len()).expect("CSS property slot count fits in u32");
+    slot_ids.insert(name.clone(), slot);
+    PreparedPropertyTarget { name, slot, longhand }
+}
+
+fn append_property_targets(property: &Property<'_>, slot_ids: &mut FxHashMap<Rc<str>, u32>, output: &mut Vec<PreparedPropertyTarget>) {
+    if matches!(property, Property::Custom(value) if value.name.as_ref().starts_with("--")) || matches!(property, Property::Unparsed(value) if value.property_id.name().starts_with("--")) {
+        return;
+    }
+    if matches!(property, Property::All(_)) {
+        output.push(intern_target("all", None, slot_ids));
+        return;
+    }
+    let property_id = property.property_id();
+    if let Some(longhands) = property_id.longhands() {
+        output.extend(longhands.into_iter().filter(|longhand| !crate::style::syntax::capabilities::property_uses_gradient(property) || longhand.name() == "background-image").map(|longhand| {
+            let mut target = intern_target(canonical_slot(longhand.name()), None, slot_ids);
+            target.longhand = Some(longhand);
+            target
+        }));
+        return;
+    }
+    output.push(intern_target(canonical_slot(property_id.name()), None, slot_ids));
+}
+
+pub(crate) fn compile_property_targets(property: &Property<'_>, slot_ids: &mut FxHashMap<Rc<str>, u32>) -> Vec<PreparedPropertyTarget> {
+    let mut targets = Vec::new();
+    append_property_targets(property, slot_ids, &mut targets);
+    targets
+}
+
 impl<'sheet, 'css> EffectiveRule<'sheet, 'css> {
     pub(crate) fn style_rule(self) -> &'sheet StyleRule<'css> {
         self.style_rule
@@ -234,7 +297,42 @@ impl<'sheet, 'css> ParsedStylesheetSet<'sheet, 'css> {
         let authors = self.authors.iter().enumerate().map(|(index, stylesheet)| (stylesheet, self.author_roots.get(index).copied().flatten()));
         prepare_origin(authors, CascadeOrigin::Author, &mut rules, &mut scopes, &mut source_order, environment, initial_font_size, &mut media_queries, &mut media_path);
 
-        PreparedRuleSet { rules, scopes, media_queries, environment }
+        let declaration_capacity = rules.iter().map(|rule| rule.style_rule.declarations.declarations.len() + rule.style_rule.declarations.important_declarations.len()).sum();
+        // Compile Lightning CSS declaration expansion once. Per-element
+        // cascade work then follows dense ranges instead of rebuilding and
+        // caching one target vector for every encountered AST declaration.
+        let mut declaration_target_ranges = Vec::with_capacity(declaration_capacity);
+        let mut property_targets = Vec::with_capacity(declaration_capacity);
+        let mut property_slots = FxHashMap::default();
+        let mut rule_target_starts = Vec::with_capacity(rules.len());
+        for rule in &rules {
+            let normal_start = u32::try_from(declaration_target_ranges.len()).expect("prepared declaration target ranges fit in u32");
+            for property in &rule.style_rule.declarations.declarations {
+                let start = u32::try_from(property_targets.len()).expect("prepared property targets fit in u32");
+                append_property_targets(property, &mut property_slots, &mut property_targets);
+                let len = u32::try_from(property_targets.len() - start as usize).expect("one declaration's property targets fit in u32");
+                declaration_target_ranges.push(PreparedTargetRange { start, len });
+            }
+            let important_start = u32::try_from(declaration_target_ranges.len()).expect("prepared declaration target ranges fit in u32");
+            for property in &rule.style_rule.declarations.important_declarations {
+                let start = u32::try_from(property_targets.len()).expect("prepared property targets fit in u32");
+                append_property_targets(property, &mut property_slots, &mut property_targets);
+                let len = u32::try_from(property_targets.len() - start as usize).expect("one declaration's property targets fit in u32");
+                declaration_target_ranges.push(PreparedTargetRange { start, len });
+            }
+            rule_target_starts.push((normal_start, important_start));
+        }
+
+        PreparedRuleSet {
+            rules,
+            scopes,
+            rule_target_starts,
+            declaration_target_ranges,
+            property_targets,
+            property_slots,
+            media_queries,
+            environment,
+        }
     }
 }
 
@@ -401,6 +499,10 @@ fn supports_declaration_value(value: &str) -> Option<&str> {
 pub(crate) struct PreparedRuleSet<'sheet, 'css> {
     rules: Vec<EffectiveRule<'sheet, 'css>>,
     scopes: Vec<ScopeDescriptor<'sheet, 'css>>,
+    rule_target_starts: Vec<(u32, u32)>,
+    declaration_target_ranges: Vec<PreparedTargetRange>,
+    property_targets: Vec<PreparedPropertyTarget>,
+    property_slots: FxHashMap<Rc<str>, u32>,
     media_queries: MediaQuerySet,
     environment: MediaEnvironment,
 }
@@ -426,6 +528,17 @@ impl<'sheet, 'css> PreparedRuleSet<'sheet, 'css> {
 
     pub(crate) fn get(&self, id: EffectiveRuleId) -> EffectiveRule<'sheet, 'css> {
         self.rules[id.0 as usize]
+    }
+
+    pub(crate) fn declaration_targets(&self, id: EffectiveRuleId, important: bool, index: usize) -> &[PreparedPropertyTarget] {
+        let starts = self.rule_target_starts[id.0 as usize];
+        let ranges_start = if important { starts.1 } else { starts.0 } as usize;
+        let range = self.declaration_target_ranges[ranges_start + index];
+        &self.property_targets[range.start as usize..range.start as usize + range.len as usize]
+    }
+
+    pub(crate) fn clone_property_slots(&self) -> FxHashMap<Rc<str>, u32> {
+        self.property_slots.clone()
     }
 
     pub(crate) fn scope_match(&self, scope: ScopeId, document: &Document, subject: DomNodeId) -> Option<ScopeMatch> {
@@ -480,7 +593,7 @@ mod tests {
         let authors = [author];
         let (prepared, allocations) = count_allocations(|| ParsedStylesheetSet::new(&user_agent, &authors).prepare(MediaEnvironment::default(), 16.0));
 
-        assert_eq!(allocations, 1, "preparation should allocate only its dense metadata vector");
+        assert_eq!(allocations, 6, "preparation should allocate only its dense rule and declaration metadata");
         assert_eq!(prepared.len(), 1);
         let (_, rule) = prepared.iter().next().unwrap();
         assert_eq!(rule.style_rule() as *const _, expected);
@@ -498,10 +611,27 @@ mod tests {
     }
 
     #[test]
+    fn preparation_flattens_declaration_targets_for_all_priorities() {
+        let user_agent = StyleSheet::parse("", ParserOptions::default()).unwrap();
+        let author = StyleSheet::parse("p { margin: 1px; color: red !important }", ParserOptions::default()).unwrap();
+        let authors = [author];
+        let prepared = ParsedStylesheetSet::new(&user_agent, &authors).prepare(MediaEnvironment::default(), 16.0);
+        let (id, _) = prepared.iter().next().unwrap();
+
+        let (normal_names, allocations) = count_allocations(|| prepared.declaration_targets(id, false, 0).iter().map(|target| target.name.as_ref()).collect::<Vec<_>>());
+        assert_eq!(normal_names.len(), 4);
+        assert!(normal_names.contains(&"margin-left"));
+        assert_eq!(allocations, 1, "only the test's collected result should allocate");
+
+        let important = prepared.declaration_targets(id, true, 0);
+        assert_eq!(important.len(), 1);
+        assert_eq!(important[0].name.as_ref(), "color");
+    }
+
+    #[test]
     fn preparation_flattens_active_rules_and_assigns_layer_ranks() {
         let user_agent = StyleSheet::parse("", ParserOptions::default()).unwrap();
-        let author =
-            StyleSheet::parse("@layer early, late; @layer late { p { color: red } } @supports (width: 1px) { @layer early { p { color: green } } } @media print { p { color: blue } } p { color: black }", ParserOptions::default()).unwrap();
+        let author = StyleSheet::parse("@layer early, late; @layer late { p { color: red } } @supports (width: 1px) { @layer early { p { color: green } } } @media print { p { color: blue } } p { color: black }", ParserOptions::default()).unwrap();
         let authors = [author];
         let prepared = ParsedStylesheetSet::new(&user_agent, &authors).prepare(MediaEnvironment::default(), 16.0);
         let rules = prepared.iter().map(|(_, rule)| rule.priority()).collect::<Vec<_>>();
@@ -535,8 +665,7 @@ mod tests {
     #[test]
     fn supports_selector_uses_the_unforgiving_single_selector_grammar() {
         let user_agent = StyleSheet::parse("", ParserOptions::default()).unwrap();
-        let author =
-            StyleSheet::parse("@supports selector(div) { html { color: green } } @supports selector(div, div) { html { color: red } } @supports selector(:is(.ok, :unknown)) { html { background: red } }", ParserOptions::default()).unwrap();
+        let author = StyleSheet::parse("@supports selector(div) { html { color: green } } @supports selector(div, div) { html { color: red } } @supports selector(:is(.ok, :unknown)) { html { background: red } }", ParserOptions::default()).unwrap();
         let authors = [author];
         let prepared = ParsedStylesheetSet::new(&user_agent, &authors).prepare(MediaEnvironment::default(), 16.0);
 

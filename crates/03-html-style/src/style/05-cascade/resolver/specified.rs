@@ -62,18 +62,67 @@ impl CascadeBoundary {
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct DeclarationEvent<'event, 'css> {
-    pub(super) property: &'event Property<'css>,
+enum DeclarationSource<'sheet, 'css> {
+    Rule { property: &'sheet Property<'css>, targets: &'sheet [PreparedPropertyTarget] },
+    Inline { important: bool, index: u32 },
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct DeclarationEvent<'sheet, 'css> {
+    source: DeclarationSource<'sheet, 'css>,
     pub(super) boundary: CascadeBoundary,
 }
 
-pub(super) fn build_cascade_events<'event, 'sheet, 'css>(prepared: &'event PreparedRuleSet<'sheet, 'css>, normal_rules: &[MatchedRule], important_rules: &[MatchedRule], inline_style: Option<&'event StyleAttribute<'css>>) -> (Vec<DeclarationEvent<'event, 'css>>, usize) {
+impl<'sheet, 'css> DeclarationEvent<'sheet, 'css> {
+    pub(super) fn property<'a>(&self, inline_style: Option<&'a StyleAttribute<'css>>) -> &'a Property<'css>
+    where
+        'sheet: 'a,
+    {
+        let (declarations, index) = match self.source {
+            DeclarationSource::Rule { property, .. } => return property,
+            DeclarationSource::Inline { important, index } => {
+                let declarations = &inline_style.expect("inline declaration events require their parsed style attribute").declarations;
+                (if important { &declarations.important_declarations } else { &declarations.declarations }, index)
+            }
+        };
+        &declarations[index as usize]
+    }
+
+    fn prepared_targets(&self) -> Option<&'sheet [PreparedPropertyTarget]> {
+        match self.source {
+            DeclarationSource::Rule { targets, .. } => Some(targets),
+            DeclarationSource::Inline { .. } => None,
+        }
+    }
+}
+
+#[derive(Default)]
+pub(super) struct EventScratch<'sheet, 'css> {
+    pub(super) events: Vec<DeclarationEvent<'sheet, 'css>>,
+    normal_ranks: FxHashMap<EffectiveRuleId, usize>,
+    layer_starts: Vec<usize>,
+}
+
+#[derive(Default)]
+pub(super) struct CascadeScratch<'sheet, 'css> {
+    pub(super) events: EventScratch<'sheet, 'css>,
+    pub(super) valid_events: Vec<DeclarationEvent<'sheet, 'css>>,
+    pub(super) selection: SpecifiedSelection,
+}
+
+pub(super) fn build_cascade_events<'prepared, 'sheet, 'css>(prepared: &'prepared PreparedRuleSet<'sheet, 'css>, normal_rules: &[MatchedRule], important_rules: &[MatchedRule], inline_style: Option<&StyleAttribute<'css>>, scratch: &mut EventScratch<'prepared, 'css>) -> usize {
     let inline_capacity = inline_style.map_or(0, |inline| inline.declarations.declarations.len() + inline.declarations.important_declarations.len());
     let event_capacity = normal_rules.iter().map(|matched| prepared.get(matched.id).style_rule().declarations.declarations.len()).sum::<usize>() + important_rules.iter().map(|matched| prepared.get(matched.id).style_rule().declarations.important_declarations.len()).sum::<usize>() + inline_capacity;
-    let mut events = Vec::with_capacity(event_capacity);
+    let events = &mut scratch.events;
+    events.clear();
+    events.reserve(event_capacity);
     let mut hints_sequence = None;
-    let mut normal_ranks = FxHashMap::default();
-    let mut layer_starts = Vec::with_capacity(normal_rules.len());
+    let normal_ranks = &mut scratch.normal_ranks;
+    normal_ranks.clear();
+    normal_ranks.reserve(normal_rules.len());
+    let layer_starts = &mut scratch.layer_starts;
+    layer_starts.clear();
+    layer_starts.reserve(normal_rules.len());
     let mut layer_start = 0;
     for (rank, matched) in normal_rules.iter().enumerate() {
         normal_ranks.insert(matched.id, rank);
@@ -87,8 +136,8 @@ pub(super) fn build_cascade_events<'event, 'sheet, 'css>(prepared: &'event Prepa
         if hints_sequence.is_none() && rule.priority().origin() == CascadeOrigin::Author {
             hints_sequence = Some(events.len());
         }
-        events.extend(rule.style_rule().declarations.declarations.iter().map(|property| DeclarationEvent {
-            property,
+        events.extend(rule.style_rule().declarations.declarations.iter().enumerate().map(|(index, property)| DeclarationEvent {
+            source: DeclarationSource::Rule { property, targets: prepared.declaration_targets(matched.id, false, index) },
             boundary: CascadeBoundary::Rule {
                 priority: rule.priority(),
                 important: false,
@@ -99,16 +148,16 @@ pub(super) fn build_cascade_events<'event, 'sheet, 'css>(prepared: &'event Prepa
     }
     let hints_sequence = hints_sequence.unwrap_or(events.len());
     if let Some(inline) = inline_style {
-        events.extend(inline.declarations.declarations.iter().map(|property| DeclarationEvent {
-            property,
+        events.extend(inline.declarations.declarations.iter().enumerate().map(|(index, _)| DeclarationEvent {
+            source: DeclarationSource::Inline { important: false, index: u32::try_from(index).expect("declaration indices fit in u32") },
             boundary: CascadeBoundary::Inline { important: false, normal_rank: normal_rules.len() },
         }));
     }
     for matched in important_rules.iter().filter(|matched| prepared.get(matched.id).priority().origin() == CascadeOrigin::Author) {
         let rule = prepared.get(matched.id);
         let normal_rank = normal_ranks.get(&matched.id).copied().unwrap_or(normal_rules.len());
-        events.extend(rule.style_rule().declarations.important_declarations.iter().map(|property| DeclarationEvent {
-            property,
+        events.extend(rule.style_rule().declarations.important_declarations.iter().enumerate().map(|(index, property)| DeclarationEvent {
+            source: DeclarationSource::Rule { property, targets: prepared.declaration_targets(matched.id, true, index) },
             boundary: CascadeBoundary::Rule {
                 priority: rule.priority(),
                 important: true,
@@ -118,16 +167,16 @@ pub(super) fn build_cascade_events<'event, 'sheet, 'css>(prepared: &'event Prepa
         }));
     }
     if let Some(inline) = inline_style {
-        events.extend(inline.declarations.important_declarations.iter().map(|property| DeclarationEvent {
-            property,
+        events.extend(inline.declarations.important_declarations.iter().enumerate().map(|(index, _)| DeclarationEvent {
+            source: DeclarationSource::Inline { important: true, index: u32::try_from(index).expect("declaration indices fit in u32") },
             boundary: CascadeBoundary::Inline { important: true, normal_rank: normal_rules.len() },
         }));
     }
     for matched in important_rules.iter().filter(|matched| prepared.get(matched.id).priority().origin() == CascadeOrigin::UserAgent) {
         let rule = prepared.get(matched.id);
         let normal_rank = normal_ranks.get(&matched.id).copied().unwrap_or(normal_rules.len());
-        events.extend(rule.style_rule().declarations.important_declarations.iter().map(|property| DeclarationEvent {
-            property,
+        events.extend(rule.style_rule().declarations.important_declarations.iter().enumerate().map(|(index, property)| DeclarationEvent {
+            source: DeclarationSource::Rule { property, targets: prepared.declaration_targets(matched.id, true, index) },
             boundary: CascadeBoundary::Rule {
                 priority: rule.priority(),
                 important: true,
@@ -136,25 +185,14 @@ pub(super) fn build_cascade_events<'event, 'sheet, 'css>(prepared: &'event Prepa
             },
         }));
     }
-    (events, hints_sequence)
+    hints_sequence
 }
 
-#[derive(Clone)]
-pub(super) struct PropertyTarget {
-    /// Canonical cascade slot. Aliases that affect the same computed property
-    /// intentionally share this name.
-    pub(super) name: Rc<str>,
-    /// Document-local numeric identity used by the hot-path winner tables.
-    slot: u32,
-    /// Present when a shorthand must be materialized as one longhand before
-    /// computed-value conversion.
-    pub(super) longhand: Option<Rc<PropertyId<'static>>>,
-}
+pub(super) type PropertyTarget = PreparedPropertyTarget;
 
 #[derive(Default)]
 pub(super) struct PropertyTargetState {
-    cache: FxHashMap<usize, Rc<[PropertyTarget]>>,
-    slot_ids: FxHashMap<Rc<str>, u32>,
+    slot_ids: Option<FxHashMap<Rc<str>, u32>>,
     claim_epochs: Vec<u32>,
     epoch: u32,
 }
@@ -182,15 +220,15 @@ impl PropertyTargetState {
     }
 }
 
-pub(super) struct SelectedDeclaration<'event, 'css> {
-    pub(super) property: &'event Property<'css>,
+pub(super) struct SelectedDeclaration {
     target_start: usize,
     target_len: usize,
     pub(super) sequence: usize,
 }
 
-pub(super) struct SpecifiedSelection<'event, 'css> {
-    pub(super) declarations: Vec<SelectedDeclaration<'event, 'css>>,
+#[derive(Default)]
+pub(super) struct SpecifiedSelection {
+    pub(super) declarations: Vec<SelectedDeclaration>,
     targets: Vec<PropertyTarget>,
     /// Presentational hints cascade as a distinct origin, but `revert` in the
     /// author origin also rolls that origin back.
@@ -198,8 +236,8 @@ pub(super) struct SpecifiedSelection<'event, 'css> {
     pub(super) reverted_all_hints: bool,
 }
 
-impl SpecifiedSelection<'_, '_> {
-    pub(super) fn targets_for(&self, declaration: &SelectedDeclaration<'_, '_>) -> &[PropertyTarget] {
+impl SpecifiedSelection {
+    pub(super) fn targets_for(&self, declaration: &SelectedDeclaration) -> &[PropertyTarget] {
         &self.targets[declaration.target_start..declaration.target_start + declaration.target_len]
     }
 }
@@ -242,47 +280,6 @@ enum RollbackKind {
     Layer,
 }
 
-fn canonical_slot(name: &str) -> &str {
-    match name {
-        "word-wrap" => "overflow-wrap",
-        "page-break-before" => "break-before",
-        "page-break-after" => "break-after",
-        "page-break-inside" => "break-inside",
-        "grid-row-gap" => "row-gap",
-        "grid-column-gap" => "column-gap",
-        _ => name,
-    }
-}
-
-fn property_target(name: &str, longhand: Option<Rc<PropertyId<'static>>>, slot_ids: &mut FxHashMap<Rc<str>, u32>) -> PropertyTarget {
-    if let Some((name, slot)) = slot_ids.get_key_value(name) {
-        return PropertyTarget { name: name.clone(), slot: *slot, longhand };
-    }
-    let name: Rc<str> = Rc::from(name);
-    let slot = u32::try_from(slot_ids.len()).expect("CSS property slot count fits in u32");
-    slot_ids.insert(name.clone(), slot);
-    PropertyTarget { name, slot, longhand }
-}
-
-fn property_targets(property: &Property<'_>, slot_ids: &mut FxHashMap<Rc<str>, u32>) -> Vec<PropertyTarget> {
-    if matches!(property, Property::All(_)) {
-        return vec![property_target("all", None, slot_ids)];
-    }
-    let property_id = property.property_id();
-    if let Some(longhands) = property_id.longhands() {
-        return longhands
-            .into_iter()
-            .filter(|longhand| !crate::style::syntax::capabilities::property_uses_gradient(property) || longhand.name() == "background-image")
-            .map(|longhand| {
-                let mut target = property_target(canonical_slot(longhand.name()), None, slot_ids);
-                target.longhand = Some(Rc::new(longhand));
-                target
-            })
-            .collect();
-    }
-    vec![property_target(canonical_slot(property_id.name()), None, slot_ids)]
-}
-
 pub(super) fn declaration_is_custom_property(property: &Property<'_>) -> bool {
     match property {
         Property::Custom(value) => value.name.as_ref().starts_with("--"),
@@ -294,29 +291,33 @@ pub(super) fn declaration_is_custom_property(property: &Property<'_>) -> bool {
 /// Return only the declarations that win at least one longhand. The output is
 /// restored to low-to-high order so computed-value conversion remains ordered
 /// for logical/physical aliases that share renderer storage.
-pub(super) fn select_specified_values<'event, 'css>(events: &[DeclarationEvent<'event, 'css>], target_state: &mut PropertyTargetState) -> SpecifiedSelection<'event, 'css> {
+pub(super) fn select_specified_values<'sheet, 'css>(events: &[DeclarationEvent<'sheet, 'css>], prepared: &PreparedRuleSet<'_, 'css>, inline_style: Option<&StyleAttribute<'css>>, target_state: &mut PropertyTargetState, selected: &mut SpecifiedSelection) {
     let claim_epoch = target_state.begin_selection();
     let mut rollbacks = FxHashMap::<u32, Vec<Rollback>>::default();
     let mut global_rollbacks = Vec::<Rollback>::new();
     let mut all_claimed = false;
-    let mut selected = Vec::with_capacity(events.len());
-    let mut selected_targets = Vec::with_capacity(events.len());
-    let mut reverted_hint_targets = rustc_data_structures::fx::FxHashSet::default();
+    selected.declarations.clear();
+    selected.declarations.reserve(events.len());
+    selected.targets.clear();
+    selected.targets.reserve(events.len());
+    selected.reverted_hint_targets.clear();
     let mut reverted_all_hints = false;
 
     for (sequence, event) in events.iter().enumerate().rev() {
-        if declaration_is_custom_property(event.property) {
+        let property = event.property(inline_style);
+        if declaration_is_custom_property(property) {
             continue;
         }
-        let targets = if matches!(event.boundary, CascadeBoundary::Rule { .. }) {
-            let key = event.property as *const Property<'css> as usize;
-            let (cache, slot_ids) = (&mut target_state.cache, &mut target_state.slot_ids);
-            cache.entry(key).or_insert_with(|| Rc::from(property_targets(event.property, slot_ids))).clone()
+        let inline_targets;
+        let targets = if let Some(targets) = event.prepared_targets() {
+            targets
         } else {
-            Rc::from(property_targets(event.property, &mut target_state.slot_ids))
+            let slot_ids = target_state.slot_ids.get_or_insert_with(|| prepared.clone_property_slots());
+            inline_targets = compile_property_targets(property, slot_ids);
+            &inline_targets
         };
-        let is_all = matches!(event.property, Property::All(_));
-        let rollback_kind = rollback(event.property);
+        let is_all = matches!(property, Property::All(_));
+        let rollback_kind = rollback(property);
 
         if is_all {
             if global_rollbacks.iter().copied().any(|rollback| rollback.excludes(event.boundary)) {
@@ -331,15 +332,15 @@ pub(super) fn select_specified_values<'event, 'css>(events: &[DeclarationEvent<'
                     RollbackKind::Layer => Rollback::Layer(event.boundary),
                 });
             } else if !all_claimed {
-                let target_start = selected_targets.len();
-                selected_targets.extend(targets.iter().cloned());
-                selected.push(SelectedDeclaration { property: event.property, target_start, target_len: targets.len(), sequence });
+                let target_start = selected.targets.len();
+                selected.targets.extend(targets.iter().cloned());
+                selected.declarations.push(SelectedDeclaration { target_start, target_len: targets.len(), sequence });
                 all_claimed = true;
             }
             continue;
         }
 
-        let target_start = selected_targets.len();
+        let target_start = selected.targets.len();
         for target in targets.iter() {
             // `all` deliberately excludes direction and custom properties.
             if (&*target.name != "direction" && all_claimed) || target_state.is_claimed(target.slot, claim_epoch) {
@@ -353,7 +354,7 @@ pub(super) fn select_specified_values<'event, 'css>(events: &[DeclarationEvent<'
             }
             if let Some(kind) = rollback_kind {
                 if matches!(kind, RollbackKind::Origin) && event.boundary.origin() == CascadeOrigin::Author {
-                    reverted_hint_targets.insert(target.name.clone());
+                    selected.reverted_hint_targets.insert(target.name.clone());
                 }
                 rollbacks.entry(target.slot).or_default().push(match kind {
                     RollbackKind::Origin => Rollback::Origin(event.boundary.origin()),
@@ -361,43 +362,43 @@ pub(super) fn select_specified_values<'event, 'css>(events: &[DeclarationEvent<'
                 });
             } else {
                 target_state.claim(target.slot, claim_epoch);
-                selected_targets.push(target.clone());
+                selected.targets.push(target.clone());
             }
         }
-        let target_len = selected_targets.len() - target_start;
+        let target_len = selected.targets.len() - target_start;
         if target_len != 0 {
-            selected.push(SelectedDeclaration { property: event.property, target_start, target_len, sequence });
+            selected.declarations.push(SelectedDeclaration { target_start, target_len, sequence });
         }
     }
 
-    selected.sort_by_key(|declaration| declaration.sequence);
-    SpecifiedSelection {
-        declarations: selected,
-        targets: selected_targets,
-        reverted_hint_targets,
-        reverted_all_hints,
-    }
+    selected.declarations.sort_by_key(|declaration| declaration.sequence);
+    selected.reverted_all_hints = reverted_all_hints;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MediaEnvironment;
+    use crate::style::rules::prepared::ParsedStylesheetSet;
+    use lightningcss::stylesheet::StyleSheet;
 
     #[test]
     fn shorthand_and_longhand_select_independent_winners() {
-        let shorthand = Property::parse_string(PropertyId::from("margin"), "1px", ParserOptions::default()).unwrap();
-        let longhand = Property::parse_string(PropertyId::from("margin-left"), "2px", ParserOptions::default()).unwrap();
+        let stylesheet = StyleSheet::parse("", ParserOptions::default()).unwrap();
+        let prepared = ParsedStylesheetSet::new(&stylesheet, &[]).prepare(MediaEnvironment::default(), 16.0);
+        let inline = StyleAttribute::parse("margin: 1px; margin-left: 2px", ParserOptions::default()).unwrap();
         let events = [
             DeclarationEvent {
-                property: &shorthand,
+                source: DeclarationSource::Inline { important: false, index: 0 },
                 boundary: CascadeBoundary::Inline { important: false, normal_rank: 0 },
             },
             DeclarationEvent {
-                property: &longhand,
+                source: DeclarationSource::Inline { important: false, index: 1 },
                 boundary: CascadeBoundary::Inline { important: false, normal_rank: 0 },
             },
         ];
-        let selected = select_specified_values(&events, &mut PropertyTargetState::default());
+        let mut selected = SpecifiedSelection::default();
+        select_specified_values(&events, &prepared, Some(&inline), &mut PropertyTargetState::default(), &mut selected);
         assert_eq!(selected.declarations.len(), 2);
         assert!(!selected.targets_for(&selected.declarations[0]).iter().any(|target| &*target.name == "margin-left"));
         assert_eq!(&*selected.targets_for(&selected.declarations[1])[0].name, "margin-left");

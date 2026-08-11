@@ -2,8 +2,8 @@
 
 use super::*;
 use specified::{
-    DeclarationEvent, PropertyTarget, SelectedDeclaration, SpecifiedSelection,
-    declaration_is_custom_property, select_specified_values,
+    DeclarationEvent, PropertyTarget, SpecifiedSelection, declaration_is_custom_property,
+    select_specified_values,
 };
 
 /// The cascade computes dependency roots before values that consume them.
@@ -13,8 +13,9 @@ pub(super) enum CascadePhase {
     Remaining,
 }
 
-pub(super) struct CascadeInputs<'a, 'event, 'css> {
-    pub(super) events: &'a [DeclarationEvent<'event, 'css>],
+pub(super) struct CascadeInputs<'a, 'sheet, 'inline, 'css> {
+    pub(super) events: &'a [DeclarationEvent<'sheet, 'css>],
+    pub(super) inline_style: Option<&'inline StyleAttribute<'css>>,
     pub(super) hints_sequence: usize,
     pub(super) parent_font_size: f32,
     pub(super) custom_properties: &'a FxHashMap<String, TokenList<'css>>,
@@ -53,7 +54,7 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
         style: &mut WorkingStyle,
         node: DomNodeId,
         phase: CascadePhase,
-        selection: &SpecifiedSelection<'_, '_>,
+        selection: &SpecifiedSelection,
         parent: &ParentStyle,
     ) {
         if selection.reverted_hint_targets.is_empty() && !selection.reverted_all_hints {
@@ -201,10 +202,10 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
         );
     }
 
-    fn apply_selected_declaration<'event>(
+    fn apply_selected_declaration(
         &mut self,
         style: &mut WorkingStyle,
-        declaration: &SelectedDeclaration<'event, 'css>,
+        property: &Property<'css>,
         targets: &[PropertyTarget],
         parent_font_size: f32,
         var_map: &HashMap<&str, TokenList<'css>>,
@@ -213,9 +214,9 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
     ) {
         let resolved_unparsed;
         let resolved_custom;
-        let substituted = matches!(declaration.property, Property::Unparsed(value) if token_list_contains_var(&value.value))
-            || matches!(declaration.property, Property::Custom(value) if token_list_contains_var(&value.value));
-        let resolved = match declaration.property {
+        let substituted = matches!(property, Property::Unparsed(value) if token_list_contains_var(&value.value))
+            || matches!(property, Property::Custom(value) if token_list_contains_var(&value.value));
+        let resolved = match property {
             Property::Unparsed(unparsed) if token_list_contains_var(&unparsed.value) => {
                 let mut substitutable = unparsed.clone();
                 mark_var_substitution_boundaries(&mut substitutable.value);
@@ -302,23 +303,27 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
         }
     }
 
-    pub(super) fn apply_cascade(
+    pub(super) fn apply_cascade<'event, 'inline>(
         &mut self,
         style: &mut WorkingStyle,
-        inputs: CascadeInputs<'_, '_, 'css>,
+        inputs: CascadeInputs<'_, 'event, 'inline, 'css>,
+        valid_events: &mut Vec<DeclarationEvent<'event, 'css>>,
+        selection: &mut SpecifiedSelection,
     ) {
         let CascadeInputs {
             events,
+            inline_style,
             hints_sequence,
             parent_font_size,
             custom_properties,
             parent,
             presentational_hints_node,
         } = inputs;
-        let mut valid_events = Vec::with_capacity(events.len());
+        valid_events.clear();
+        valid_events.reserve(events.len());
         let mut valid_hints_sequence = 0;
         for (sequence, event) in events.iter().copied().enumerate() {
-            if self.declaration_is_eligible(event.property) {
+            if self.declaration_is_eligible(event.property(inline_style)) {
                 if sequence < hints_sequence {
                     valid_hints_sequence += 1;
                 }
@@ -330,15 +335,21 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
         // conversion rejects one, remove it and expose the next candidate.
         // Ordinary cascades therefore avoid dry-running every overridden
         // declaration.
-        let selection = loop {
-            let selection = select_specified_values(&valid_events, self.property_targets);
+        loop {
+            select_specified_values(
+                valid_events,
+                self.prepared,
+                inline_style,
+                self.property_targets,
+                selection,
+            );
             let mut invalid: Vec<_> = selection
                 .declarations
                 .iter()
                 .filter(|declaration| {
                     !self.declaration_is_computable(
                         style,
-                        declaration.property,
+                        valid_events[declaration.sequence].property(inline_style),
                         parent_font_size,
                         parent,
                     )
@@ -346,7 +357,7 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
                 .map(|declaration| declaration.sequence)
                 .collect();
             if invalid.is_empty() {
-                break selection;
+                break;
             }
             invalid.sort_unstable();
             invalid.dedup();
@@ -356,7 +367,7 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
                 }
                 valid_events.remove(sequence);
             }
-        };
+        }
         let var_map = custom_properties
             .iter()
             .map(|(name, value)| (name.as_str(), value.clone()))
@@ -372,7 +383,7 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
                 }
                 self.apply_selected_declaration(
                     style,
-                    declaration,
+                    valid_events[declaration.sequence].property(inline_style),
                     selection.targets_for(declaration),
                     parent_font_size,
                     &var_map,

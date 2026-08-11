@@ -20,8 +20,9 @@ fn custom_declaration<'property, 'css>(
 /// Cascade custom properties as specified token values. Rollback discards
 /// candidates by origin/layer rather than cloning the whole map at every
 /// boundary.
-pub(super) fn cascade_custom_properties<'css>(
-    events: &[DeclarationEvent<'_, 'css>],
+pub(super) fn cascade_custom_properties<'sheet, 'css>(
+    events: &[DeclarationEvent<'sheet, 'css>],
+    inline_style: Option<&StyleAttribute<'css>>,
     parent: &FxHashMap<String, TokenList<'css>>,
 ) -> FxHashMap<String, TokenList<'css>> {
     let mut values = parent.clone();
@@ -29,7 +30,7 @@ pub(super) fn cascade_custom_properties<'css>(
     let mut rollbacks = FxHashMap::<String, Vec<(CascadeBoundary, bool)>>::default();
 
     for event in events.iter().rev() {
-        let Some((name, value)) = custom_declaration(event.property) else {
+        let Some((name, value)) = custom_declaration(event.property(inline_style)) else {
             continue;
         };
         if decided.contains(&name)
