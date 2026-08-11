@@ -236,13 +236,34 @@ fn declaration_syntax_impl(normalized_name: &str, value: &str) -> PropertySyntax
             PropertySyntax::Invalid
         };
     }
+    if matches!(
+        normalized_name,
+        "table-layout"
+            | "border-collapse"
+            | "caption-side"
+            | "empty-cells"
+            | "text-box"
+            | "text-box-trim"
+            | "text-box-edge"
+    ) {
+        return if style::syntax::renderer_owned::value_is_css_wide_keyword(value)
+            || value.contains("var(")
+            || value.contains("env(")
+            || style::syntax::renderer_owned::property_value_is_valid(normalized_name, value)
+                == Some(true)
+        {
+            PropertySyntax::Valid
+        } else {
+            PropertySyntax::Invalid
+        };
+    }
     if let Some(valid) = style::syntax::box_syntax::property_value_is_valid(normalized_name, value) {
         return if valid { PropertySyntax::Valid } else { PropertySyntax::Invalid };
     }
-    // `grid-row-gap` and `grid-column-gap` are legacy aliases retained by
-    // CSS Box Alignment. Lightning CSS does not expose typed IDs for them, so
-    // validate their values with the canonical property grammar.
-    if matches!(normalized_name, "grid-row-gap" | "grid-column-gap") {
+    // The legacy `grid-*-gap` aliases are retained by CSS Box Alignment.
+    // Lightning CSS does not expose typed IDs for them, so validate their
+    // values with the canonical property grammar.
+    if matches!(normalized_name, "grid-row-gap" | "grid-column-gap" | "grid-gap") {
         let direct = value.trim();
         let is_unitless_number = direct.parse::<f64>().is_ok_and(|number| number != 0.0);
         let is_direct_negative = direct.strip_prefix('-').and_then(|rest| rest.chars().next()).is_some_and(|next| next.is_ascii_digit() || next == '.');
@@ -253,6 +274,7 @@ fn declaration_syntax_impl(normalized_name: &str, value: &str) -> PropertySyntax
     let parsed_name = match normalized_name {
         "grid-row-gap" => "row-gap",
         "grid-column-gap" => "column-gap",
+        "grid-gap" => "gap",
         _ => normalized_name,
     };
     let property_id = PropertyId::from(parsed_name);
@@ -528,6 +550,35 @@ mod boundary_tests {
         assert_eq!(declaration_support("content", "attr(title string)"), DeclarationSupport { syntax: PropertySyntax::Valid, capability: PropertyCapability::Unsupported(UnsupportedStyleFeature::GeneratedContent) });
         assert_eq!(declaration_support("counter-reset", "reversed(chapter)"), DeclarationSupport { syntax: PropertySyntax::Valid, capability: PropertyCapability::Unsupported(UnsupportedStyleFeature::GeneratedContent) });
         assert_eq!(declaration_support("content", "counter()"), DeclarationSupport { syntax: PropertySyntax::Invalid, capability: PropertyCapability::Supported });
+    }
+
+    #[test]
+    fn rendered_raw_and_typed_properties_are_reported_as_supported() {
+        for (name, value) in [
+            ("all", "initial"),
+            ("overflow", "hidden auto"),
+            ("z-index", "2"),
+            ("order", "-1"),
+            ("grid-gap", "10px 20%"),
+            ("table-layout", "fixed"),
+            ("border-collapse", "collapse"),
+            ("caption-side", "bottom"),
+            ("empty-cells", "hide"),
+            ("text-box-trim", "trim-start"),
+            ("text-box-edge", "cap alphabetic"),
+            ("text-box", "trim-start cap alphabetic"),
+        ] {
+            assert_eq!(declaration_support(name, value), DeclarationSupport { syntax: PropertySyntax::Valid, capability: PropertyCapability::Supported }, "{name}: {value}");
+        }
+
+        for (name, value) in [
+            ("table-layout", "auto fixed"),
+            ("border-collapse", "none"),
+            ("text-box-edge", "text cap"),
+            ("text-box", "cap none alphabetic"),
+        ] {
+            assert_eq!(declaration_support(name, value).syntax, PropertySyntax::Invalid, "{name}: {value}");
+        }
     }
 
     #[test]

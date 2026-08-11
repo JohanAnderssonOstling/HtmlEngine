@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use super::{MAX_COMPUTED_FLEX_FACTOR, MatchedRule, system_color_to_u32};
-    use crate::document::{BorderCollapseMode, BorderStyle, CaptionSide, Clear, Display, Document, ElementRef, EmptyCellsMode, Float, FontRelativeLength, LengthPct, PositionMode, PreferredSize, TableLayoutMode, TextAlign, TextDirection, WhiteSpace};
+    use crate::document::{BorderCollapseMode, BorderStyle, CaptionSide, Clear, Display, Document, ElementRef, EmptyCellsMode, Float, FontRelativeLength, LengthPct, PositionMode, PreferredSize, TableLayoutMode, TextAlign, TextBoxOverEdge, TextBoxTrim, TextBoxUnderEdge, TextDirection, WhiteSpace};
     use crate::parser::DocumentFactory;
 
     #[path = "02-box-and-hints.rs"]

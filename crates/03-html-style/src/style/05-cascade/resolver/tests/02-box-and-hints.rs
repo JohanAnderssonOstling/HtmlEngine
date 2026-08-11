@@ -448,6 +448,25 @@ fn table_layout_is_resolved_from_stylesheets_and_is_not_inherited_by_default() {
 }
 
 #[test]
+fn renderer_owned_text_box_grammar_matches_computed_behavior() {
+    let html = "<html><body><p id='alphabetic' style='text-box-edge:alphabetic'>A</p><p id='fallback' style='text-box:trim-start cap alphabetic;text-box:cap none alphabetic'>B</p></body></html>";
+    let mut factory = DocumentFactory::new();
+    let document = factory.parse_with_new_pipeline(html, None);
+    let by_id = |id| document.document().node_ids().find(|&node| document.document().element_ref(node).and_then(|element| element.attr("id")) == Some(id)).expect("element by id");
+    let styles = |id| document.style_for_node(by_id(id)).expect("computed style");
+
+    let alphabetic = document.text_style(styles("alphabetic")).expect("text style").text_box_edge;
+    assert_eq!(alphabetic.over, TextBoxOverEdge::Text);
+    assert_eq!(alphabetic.under, TextBoxUnderEdge::Alphabetic);
+
+    let fallback = styles("fallback");
+    assert_eq!(document.box_model_style(fallback).expect("box style").text_box_trim, TextBoxTrim::Start);
+    let edge = document.text_style(fallback).expect("text style").text_box_edge;
+    assert_eq!(edge.over, TextBoxOverEdge::Cap);
+    assert_eq!(edge.under, TextBoxUnderEdge::Alphabetic);
+}
+
+#[test]
 fn size_containment_is_resolved_as_a_reset_property() {
     let html = "<html><body><div id='parent' style='contain:size'><div id='reset'></div><div id='inherited' style='contain:inherit'></div></div><div id='strict' style='contain:strict'></div><div id='content' style='contain:content'></div></body></html>";
     let mut factory = DocumentFactory::new();

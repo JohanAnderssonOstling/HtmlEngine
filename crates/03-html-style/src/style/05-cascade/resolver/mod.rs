@@ -21,19 +21,18 @@ use crate::style::syntax::values::white_space::{
 };
 use html_dom::{Document, DomNodeId};
 use html_style_model::{
-    AspectRatio as ComputedAspectRatio, Background, Border, BorderCollapseMode, BorderRadii,
-    BorderStyle, BoxModel, BoxSizing, BreakBetween, BreakInside, CaptionSide, Clear,
+    AspectRatio as ComputedAspectRatio, Background, Border, BorderRadii, BorderStyle, BoxModel,
+    BoxSizing, BreakBetween, BreakInside, Clear,
     ComputedSizeComponent, ComputedStyleValueError, ComputedStyles, ComputedStylesBuilder,
     ContentAlignment, CornerRadius, CounterDirective, CounterDirectives, CounterStyle,
-    DecorationColor, Display, EmptyCellsMode, FlexDirection, FlexWrap, Float, Font,
+    DecorationColor, Display, FlexDirection, FlexWrap, Float, Font,
     FontRelativeLength, FontStyle, GeneratedContent, GeneratedContentItem, GridAutoFlow,
     GridPlacement, GridPlacementRange, GridRepeatCount, GridTemplateArea, GridTemplateTrack,
     GridTrackBreadth, GridTrackSize, Hyphens, InheritedText, ItemAlignment, LayoutStyle, LengthPct,
     LogicalTextAlign, OpenTypeFeature, OverflowMode, OverflowWrap, PositionMode, PreferredSize,
-    QuoteStyle, SizeComparison, StyleIndices, StyleStringId, TabSize, TableLayoutMode, TextAlign,
-    TextBoxEdge, TextBoxOverEdge, TextBoxTrim, TextBoxUnderEdge, TextDecorationLines,
-    TextDecorationStyle, TextDecorationThickness, TextDirection, TextOverflow, TextSpacing,
-    TextTransform, VerticalAlignValue, WhiteSpace, WordBreak,
+    QuoteStyle, SizeComparison, StyleIndices, StyleStringId, TabSize, TextAlign,
+    TextDecorationLines, TextDecorationStyle, TextDecorationThickness, TextDirection,
+    TextOverflow, TextSpacing, TextTransform, VerticalAlignValue, WhiteSpace, WordBreak,
 };
 use lightningcss::printer::{Printer, PrinterOptions};
 use lightningcss::properties::border::{BorderSideWidth, LineStyle};

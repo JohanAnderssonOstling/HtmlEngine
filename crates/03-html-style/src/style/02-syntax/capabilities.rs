@@ -12,7 +12,8 @@ use lightningcss::values::image::Image;
 pub(crate) fn is_supported_property_name(name: &str) -> bool {
     matches!(
         name,
-        "font-size"
+        "all"
+            | "font-size"
             | "font-weight"
             | "font-style"
             | "font-family"
@@ -25,6 +26,9 @@ pub(crate) fn is_supported_property_name(name: &str) -> bool {
             | "text-align-last"
             | "text-indent"
             | "text-overflow"
+            | "text-box"
+            | "text-box-trim"
+            | "text-box-edge"
             | "text-transform"
             | "direction"
             | "font-variant-caps"
@@ -135,6 +139,10 @@ pub(crate) fn is_supported_property_name(name: &str) -> bool {
             | "border-end-start-radius"
             | "border-end-end-radius"
             | "border-spacing"
+            | "table-layout"
+            | "border-collapse"
+            | "caption-side"
+            | "empty-cells"
             | "outline"
             | "outline-width"
             | "outline-style"
@@ -145,6 +153,9 @@ pub(crate) fn is_supported_property_name(name: &str) -> bool {
             | "word-break"
             | "overflow-wrap"
             | "word-wrap"
+            | "overflow"
+            | "overflow-x"
+            | "overflow-y"
             | "box-sizing"
             | "contain"
             | "break-before"
@@ -157,6 +168,7 @@ pub(crate) fn is_supported_property_name(name: &str) -> bool {
             | "orphans"
             | "display"
             | "position"
+            | "z-index"
             | "top"
             | "right"
             | "bottom"
@@ -169,6 +181,7 @@ pub(crate) fn is_supported_property_name(name: &str) -> bool {
             | "flex-shrink"
             | "flex-basis"
             | "flex"
+            | "order"
             | "align-content"
             | "justify-content"
             | "align-items"
@@ -182,6 +195,7 @@ pub(crate) fn is_supported_property_name(name: &str) -> bool {
             | "column-gap"
             | "grid-row-gap"
             | "grid-column-gap"
+            | "grid-gap"
             | "gap"
             | "grid-template-rows"
             | "grid-template-columns"
@@ -462,6 +476,7 @@ mod tests {
     #[test]
     fn capability_queries_do_not_require_parser_ast_types() {
         assert!(property_name_is_supported("WIDTH"));
+        assert!(property_name_is_supported("all"));
         assert!(property_name_is_supported("--book-accent"));
         assert!(property_name_is_supported("border-spacing"));
         assert!(property_name_is_supported("text-overflow"));
@@ -470,7 +485,9 @@ mod tests {
         assert!(property_name_is_supported("grid-template-columns"));
         assert!(property_name_is_supported("grid-row-gap"));
         assert!(property_name_is_supported("grid-column-gap"));
+        assert!(property_name_is_supported("grid-gap"));
         assert!(property_name_is_supported("flex"));
+        assert!(property_name_is_supported("order"));
         assert!(property_name_is_supported("direction"));
         assert!(property_name_is_supported("inline-size"));
         assert!(property_name_is_supported("margin-inline-start"));
@@ -480,6 +497,10 @@ mod tests {
         assert!(property_name_is_supported("border-radius"));
         assert!(property_name_is_supported("border-start-start-radius"));
         assert!(property_name_is_supported("contain"));
+        assert!(property_name_is_supported("overflow"));
+        assert!(property_name_is_supported("z-index"));
+        assert!(property_name_is_supported("border-collapse"));
+        assert!(property_name_is_supported("text-box-edge"));
         assert!(!property_name_is_supported("writing-mode"));
         assert!(!property_name_is_supported("inset-inline-start"));
         assert!(property_name_is_supported("break-inside"));
