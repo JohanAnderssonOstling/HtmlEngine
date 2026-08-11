@@ -238,6 +238,7 @@ pub(super) struct SelectedDeclaration {
 pub(super) struct SpecifiedSelection {
     pub(super) declarations: Vec<SelectedDeclaration>,
     targets: Vec<PropertyTarget>,
+    inline_targets: Vec<PropertyTarget>,
     /// Presentational hints cascade as a distinct origin, but `revert` in the
     /// author origin also rolls that origin back.
     pub(super) reverted_hint_targets: rustc_data_structures::fx::FxHashSet<Rc<str>>,
@@ -316,13 +317,12 @@ pub(super) fn select_specified_values<'sheet, 'css>(events: &[DeclarationEvent<'
         if declaration_is_custom_property(property) {
             continue;
         }
-        let inline_targets;
         let targets = if let Some(targets) = event.prepared_targets() {
             targets
         } else {
             let slot_ids = target_state.slot_ids.get_or_insert_with(|| prepared.clone_property_slots());
-            inline_targets = compile_property_targets(property, slot_ids);
-            &inline_targets
+            compile_property_targets(property, slot_ids, &mut selected.inline_targets);
+            &selected.inline_targets
         };
         let is_all = matches!(property, Property::All(_));
         let rollback_kind = rollback(property);
@@ -387,6 +387,7 @@ pub(super) fn select_specified_values<'sheet, 'css>(events: &[DeclarationEvent<'
 mod tests {
     use super::*;
     use crate::MediaEnvironment;
+    use crate::allocation_test_support::count_allocations;
     use crate::style::rules::prepared::ParsedStylesheetSet;
     use lightningcss::stylesheet::StyleSheet;
 
@@ -410,5 +411,28 @@ mod tests {
         assert_eq!(selected.declarations.len(), 2);
         assert!(!selected.targets_for(&selected.declarations[0]).iter().any(|target| &*target.name == "margin-left"));
         assert_eq!(&*selected.targets_for(&selected.declarations[1])[0].name, "margin-left");
+    }
+
+    #[test]
+    fn repeated_inline_target_selection_reuses_its_scratch_buffer() {
+        let stylesheet = StyleSheet::parse("", ParserOptions::default()).unwrap();
+        let prepared = ParsedStylesheetSet::new(&stylesheet, &[]).prepare(MediaEnvironment::default(), 16.0);
+        let inline = StyleAttribute::parse("width: 1px; color: red", ParserOptions::default()).unwrap();
+        let events = [
+            DeclarationEvent {
+                source: DeclarationSource::Inline { important: false, index: 0 },
+                boundary: CascadeBoundary::Inline { important: false, normal_rank: 0 },
+            },
+            DeclarationEvent {
+                source: DeclarationSource::Inline { important: false, index: 1 },
+                boundary: CascadeBoundary::Inline { important: false, normal_rank: 0 },
+            },
+        ];
+        let mut target_state = PropertyTargetState::default();
+        let mut selected = SpecifiedSelection::default();
+        select_specified_values(&events, &prepared, Some(&inline), &mut target_state, &mut selected);
+
+        let (_, allocations) = count_allocations(|| select_specified_values(&events, &prepared, Some(&inline), &mut target_state, &mut selected));
+        assert_eq!(allocations, 0);
     }
 }

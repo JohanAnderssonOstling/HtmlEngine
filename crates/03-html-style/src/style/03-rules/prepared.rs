@@ -281,10 +281,9 @@ fn append_property_targets(property: &Property<'_>, slot_ids: &mut FxHashMap<Rc<
     output.push(intern_target(canonical_slot(property_id.name()), None, slot_ids));
 }
 
-pub(crate) fn compile_property_targets(property: &Property<'_>, slot_ids: &mut FxHashMap<Rc<str>, u32>) -> Vec<PreparedPropertyTarget> {
-    let mut targets = Vec::new();
-    append_property_targets(property, slot_ids, &mut targets);
-    targets
+pub(crate) fn compile_property_targets(property: &Property<'_>, slot_ids: &mut FxHashMap<Rc<str>, u32>, targets: &mut Vec<PreparedPropertyTarget>) {
+    targets.clear();
+    append_property_targets(property, slot_ids, targets);
 }
 
 impl<'sheet, 'css> EffectiveRule<'sheet, 'css> {
