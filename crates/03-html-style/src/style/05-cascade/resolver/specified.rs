@@ -5,7 +5,7 @@
 //! `revert` and `revert-layer` discard candidates from their cascade scope.
 
 use super::*;
-use std::sync::Arc;
+use std::rc::Rc;
 
 #[derive(Clone, Copy)]
 pub(super) enum CascadeBoundary {
@@ -140,18 +140,18 @@ pub(super) fn build_cascade_events<'event, 'sheet, 'css>(prepared: &'event Prepa
 pub(super) struct PropertyTarget {
     /// Canonical cascade slot. Aliases that affect the same computed property
     /// intentionally share this name.
-    pub(super) name: Arc<str>,
+    pub(super) name: Rc<str>,
     /// Document-local numeric identity used by the hot-path winner tables.
     slot: u32,
     /// Present when a shorthand must be materialized as one longhand before
     /// computed-value conversion.
-    pub(super) longhand: Option<Arc<PropertyId<'static>>>,
+    pub(super) longhand: Option<Rc<PropertyId<'static>>>,
 }
 
 #[derive(Default)]
 pub(super) struct PropertyTargetState {
-    cache: FxHashMap<usize, Arc<[PropertyTarget]>>,
-    slot_ids: FxHashMap<Arc<str>, u32>,
+    cache: FxHashMap<usize, Rc<[PropertyTarget]>>,
+    slot_ids: FxHashMap<Rc<str>, u32>,
     claim_epochs: Vec<u32>,
     epoch: u32,
 }
@@ -189,7 +189,7 @@ pub(super) struct SpecifiedSelection<'event, 'css> {
     pub(super) declarations: Vec<SelectedDeclaration<'event, 'css>>,
     /// Presentational hints cascade as a distinct origin, but `revert` in the
     /// author origin also rolls that origin back.
-    pub(super) reverted_hint_targets: rustc_data_structures::fx::FxHashSet<Arc<str>>,
+    pub(super) reverted_hint_targets: rustc_data_structures::fx::FxHashSet<Rc<str>>,
     pub(super) reverted_all_hints: bool,
 }
 
@@ -243,17 +243,17 @@ fn canonical_slot(name: &str) -> &str {
     }
 }
 
-fn property_target(name: &str, longhand: Option<Arc<PropertyId<'static>>>, slot_ids: &mut FxHashMap<Arc<str>, u32>) -> PropertyTarget {
+fn property_target(name: &str, longhand: Option<Rc<PropertyId<'static>>>, slot_ids: &mut FxHashMap<Rc<str>, u32>) -> PropertyTarget {
     if let Some((name, slot)) = slot_ids.get_key_value(name) {
         return PropertyTarget { name: name.clone(), slot: *slot, longhand };
     }
-    let name: Arc<str> = Arc::from(name);
+    let name: Rc<str> = Rc::from(name);
     let slot = u32::try_from(slot_ids.len()).expect("CSS property slot count fits in u32");
     slot_ids.insert(name.clone(), slot);
     PropertyTarget { name, slot, longhand }
 }
 
-fn property_targets(property: &Property<'_>, slot_ids: &mut FxHashMap<Arc<str>, u32>) -> Vec<PropertyTarget> {
+fn property_targets(property: &Property<'_>, slot_ids: &mut FxHashMap<Rc<str>, u32>) -> Vec<PropertyTarget> {
     if matches!(property, Property::All(_)) {
         return vec![property_target("all", None, slot_ids)];
     }
@@ -264,7 +264,7 @@ fn property_targets(property: &Property<'_>, slot_ids: &mut FxHashMap<Arc<str>, 
             .filter(|longhand| !crate::style::syntax::capabilities::property_uses_gradient(property) || longhand.name() == "background-image")
             .map(|longhand| {
                 let mut target = property_target(canonical_slot(longhand.name()), None, slot_ids);
-                target.longhand = Some(Arc::new(longhand));
+                target.longhand = Some(Rc::new(longhand));
                 target
             })
             .collect();
@@ -299,9 +299,9 @@ pub(super) fn select_specified_values<'event, 'css>(events: &[DeclarationEvent<'
         let targets = if matches!(event.boundary, CascadeBoundary::Rule { .. }) {
             let key = event.property as *const Property<'css> as usize;
             let (cache, slot_ids) = (&mut target_state.cache, &mut target_state.slot_ids);
-            cache.entry(key).or_insert_with(|| Arc::from(property_targets(event.property, slot_ids))).clone()
+            cache.entry(key).or_insert_with(|| Rc::from(property_targets(event.property, slot_ids))).clone()
         } else {
-            Arc::from(property_targets(event.property, &mut target_state.slot_ids))
+            Rc::from(property_targets(event.property, &mut target_state.slot_ids))
         };
         let is_all = matches!(event.property, Property::All(_));
         let rollback_kind = rollback(event.property);
@@ -326,7 +326,7 @@ pub(super) fn select_specified_values<'event, 'css>(events: &[DeclarationEvent<'
         }
 
         let mut winning_targets = Vec::new();
-        for target in targets.iter().cloned() {
+        for target in targets.iter() {
             // `all` deliberately excludes direction and custom properties.
             if (&*target.name != "direction" && all_claimed) || target_state.is_claimed(target.slot, claim_epoch) {
                 continue;
@@ -347,7 +347,7 @@ pub(super) fn select_specified_values<'event, 'css>(events: &[DeclarationEvent<'
                 });
             } else {
                 target_state.claim(target.slot, claim_epoch);
-                winning_targets.push(target);
+                winning_targets.push(target.clone());
             }
         }
         if !winning_targets.is_empty() {
