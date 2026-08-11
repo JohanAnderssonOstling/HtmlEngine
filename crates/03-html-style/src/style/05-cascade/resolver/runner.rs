@@ -367,10 +367,21 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
                 valid_events.remove(sequence);
             }
         }
-        let var_map = custom_properties
-            .iter()
-            .map(|(name, value)| (name.as_str(), value.clone()))
-            .collect();
+        let needs_var_map = selection.declarations.iter().any(|declaration| {
+            match valid_events[declaration.sequence].property(inline_style) {
+                Property::Unparsed(value) => token_list_contains_var(&value.value),
+                Property::Custom(value) => token_list_contains_var(&value.value),
+                _ => false,
+            }
+        });
+        let var_map: HashMap<_, _> = if needs_var_map {
+            custom_properties
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.clone()))
+                .collect()
+        } else {
+            HashMap::new()
+        };
         for phase in [CascadePhase::Prerequisites, CascadePhase::Remaining] {
             let mut hints_applied = false;
             for declaration in &selection.declarations {
