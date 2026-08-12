@@ -2,6 +2,7 @@ use html_style_model::{Display, Float, PositionMode};
 use std::ops::Range;
 
 use super::{FinalizationScratch, FragmentWriter, LayoutReader};
+use crate::layout::PlacementState;
 
 type PaintOrderKey = (u8, i32, usize, u8, usize);
 
@@ -72,6 +73,7 @@ fn paint_order_key(reader: &LayoutReader<'_>, box_idx: usize, ordinary_layer: u8
 pub(super) fn sort_lines_and_remap_images(
     reader: &LayoutReader<'_>,
     fragments: &mut FragmentWriter<'_>,
+    placement: &mut PlacementState,
     scratch: &mut FinalizationScratch,
 ) {
     let (layout, line_owners, _) = fragments.finalization_parts();
@@ -152,6 +154,7 @@ pub(super) fn sort_lines_and_remap_images(
     for (new_idx, (_, _, _, old_idx)) in line_pairs.iter().enumerate() {
         index_map[*old_idx] = new_idx;
     }
+    placement.remap_lines(&index_map);
     for line_idx in &mut layout.line_output.paint_order_indices {
         *line_idx = u32::try_from(index_map[*line_idx as usize])
             .expect("line index exceeds paint traversal capacity");

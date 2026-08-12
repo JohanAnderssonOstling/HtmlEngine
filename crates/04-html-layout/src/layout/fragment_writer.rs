@@ -232,12 +232,15 @@ impl<'out> FragmentWriter<'out> {
 
     pub(super) fn materialize_absolute_positions(
         &mut self,
+        local_line_points: &[Point],
+        local_decoration_rects: &[Rect],
         line_groups: &[u32],
         decoration_groups: &[u32],
         resolved_offsets: &[Vec2],
     ) {
         for (index, line) in self.state.line_output.lines.iter_mut().enumerate() {
-            line.point += resolved_offsets[line_groups[index] as usize];
+            line.point = local_line_points[index]
+                + resolved_offsets[line_groups[index] as usize];
         }
         for (index, decoration) in self
             .state
@@ -248,8 +251,26 @@ impl<'out> FragmentWriter<'out> {
             .enumerate()
         {
             let offset = resolved_offsets[decoration_groups[index] as usize];
-            decoration.rect = decoration.rect + offset;
+            decoration.rect = local_decoration_rects[index] + offset;
         }
+    }
+
+    pub(super) fn capture_local_positions(
+        &self,
+        line_points: &mut Vec<Point>,
+        decoration_rects: &mut Vec<Rect>,
+    ) {
+        line_points.clear();
+        line_points.extend(self.state.line_output.lines.iter().map(|line| line.point));
+        decoration_rects.clear();
+        decoration_rects.extend(
+            self.state
+                .fragment_output
+                .decorations
+                .fragments()
+                .iter()
+                .map(|decoration| decoration.rect),
+        );
     }
 
     pub(super) fn push_line_owner(&mut self, placement: &mut PlacementState, owner: u32) {

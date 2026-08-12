@@ -6,7 +6,6 @@ use crate::layout_model::{BoxGeometry, Children, LayoutMode, LayoutState};
 use html_style_model::{Float, PositionMode};
 use kurbo::{Point, Size};
 
-#[derive(Default)]
 struct PassOutput {
     geometry: BoxGeometry,
     state: LayoutState,
@@ -16,6 +15,21 @@ struct PassOutput {
     last_inline_fragments: Vec<u32>,
     floats: FloatState,
     absolute_positioning: AbsolutePositioningState,
+}
+
+impl Default for PassOutput {
+    fn default() -> Self {
+        Self {
+            geometry: BoxGeometry::lazy(),
+            state: LayoutState::default(),
+            placement: PlacementState::default(),
+            line_owners: Vec::new(),
+            block_decoration_owners: Vec::new(),
+            last_inline_fragments: Vec::new(),
+            floats: FloatState::default(),
+            absolute_positioning: AbsolutePositioningState::default(),
+        }
+    }
 }
 
 impl PassOutput {

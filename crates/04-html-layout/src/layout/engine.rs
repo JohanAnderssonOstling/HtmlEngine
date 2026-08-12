@@ -34,6 +34,7 @@ pub(crate) fn layout_with_timings(
     let LayoutOutputs {
         geometry,
         state,
+        placement,
         scratch,
     } = outputs;
     let reader = LayoutReader::new(
@@ -70,7 +71,7 @@ pub(crate) fn layout_with_timings(
             std::mem::take(&mut scratch.line_owners),
             std::mem::take(&mut scratch.block_decoration_owners),
         ),
-        placement: std::mem::take(&mut scratch.placement),
+        placement: std::mem::take(placement),
         inline_plans: inputs.inline_plans,
         fragmentation_suppression_depth: 0,
         timings: collected_timings,
@@ -83,7 +84,7 @@ pub(crate) fn layout_with_timings(
         &mut scratch.line_owners,
         &mut scratch.block_decoration_owners,
     );
-    scratch.placement = std::mem::take(&mut context.placement);
+    *placement = std::mem::take(&mut context.placement);
     scratch.floats = std::mem::take(&mut context.floats);
     scratch.margins = std::mem::take(&mut context.margins);
     scratch.absolute_positioning = std::mem::take(&mut context.absolute_positioning);
@@ -96,7 +97,6 @@ pub(crate) fn layout_with_timings(
 /// from published geometry so render consumers cannot observe or depend on it.
 #[derive(Default)]
 pub(crate) struct LayoutScratch {
-    placement: PlacementState,
     floats: FloatState,
     margins: MarginAnalysis,
     absolute_positioning: AbsolutePositioningState,
@@ -147,6 +147,7 @@ pub(crate) struct LayoutInputs<'a> {
 pub(crate) struct LayoutOutputs<'out> {
     pub(crate) geometry: &'out mut BoxGeometry,
     pub(crate) state: &'out mut LayoutState,
+    pub(crate) placement: &'out mut PlacementState,
     pub(crate) scratch: &'out mut LayoutScratch,
 }
 
@@ -314,8 +315,13 @@ impl<'a, 'out> LayoutEngine<'a, 'out> {
     }
 
     pub(super) fn clear_layout_output(&mut self) {
+        let measurement_output = self.geometry.as_ref().uses_lazy_reset();
         self.geometry.reset(self.reader.box_count());
         self.fragments.reset();
-        self.placement.reset(self.reader.box_count());
+        if measurement_output {
+            self.placement.reset_for_measurement();
+        } else {
+            self.placement.reset(self.reader.box_count());
+        }
     }
 }

@@ -668,6 +668,7 @@ impl ShapedDocument {
     ) -> LaidOutDocument {
         let mut layout_state = LayoutState::default();
         let mut geometry = BoxGeometry::default();
+        let mut placement = crate::layout::PlacementState::default();
         let mut layout_scratch = crate::layout::LayoutScratch::default();
         crate::layout::layout_with_timings(
             crate::layout::LayoutInputs {
@@ -686,6 +687,7 @@ impl ShapedDocument {
             crate::layout::LayoutOutputs {
                 geometry: &mut geometry,
                 state: &mut layout_state,
+                placement: &mut placement,
                 scratch: &mut layout_scratch,
             },
             constraints,
@@ -694,6 +696,7 @@ impl ShapedDocument {
         let mut laid_out = LaidOutDocument {
             inputs: self.inputs,
             geometry,
+            placement,
             base_shaped: self.shaped.clone(),
             shaped: self.shaped,
             layout_state,
@@ -715,6 +718,9 @@ impl ShapedDocument {
 pub struct LaidOutDocument {
     pub(super) inputs: std::sync::Arc<PreparedInputs>,
     pub(super) geometry: BoxGeometry,
+    /// Authoritative local coordinates and the retained placement tree. The
+    /// renderer-facing geometry and fragments remain absolute snapshots.
+    pub(super) placement: crate::layout::PlacementState,
     /// Viewport-independent shaping retained so a width change can recompute
     /// the dynamic extent of `::first-line` without accumulating old styles.
     pub(super) base_shaped: std::sync::Arc<ShapedText>,
@@ -838,6 +844,7 @@ impl LaidOutDocument {
             crate::layout::LayoutOutputs {
                 geometry: &mut self.geometry,
                 state: &mut self.layout_state,
+                placement: &mut self.placement,
                 scratch: &mut self.layout_scratch,
             },
             constraints,
@@ -1054,6 +1061,11 @@ impl LaidOutDocument {
         report.extend_prefixed(
             "LaidOutDocument.geometry",
             self.geometry.memory_usage_report(),
+        );
+        report.add(
+            "LaidOutDocument.local_placement",
+            self.placement.memory_usage_bytes(),
+            self.box_count(),
         );
         report.extend_prefixed(
             "LaidOutDocument.inline_content",

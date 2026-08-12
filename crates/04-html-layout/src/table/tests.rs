@@ -1104,8 +1104,10 @@ mod tests {
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(50);
-        let with_captions = std::env::var("HTML_LAYOUT_BENCH_CASE")
-            .is_ok_and(|value| value == "captioned");
+        let case = std::env::var("HTML_LAYOUT_BENCH_CASE")
+            .unwrap_or_else(|_| "ordinary".to_owned());
+        let with_captions = case == "captioned";
+        let dependent_cells = case == "dependent-cells";
 
         let mut html = String::from("<html><body style='margin:0;font:16px monospace'>");
         for table in 0..16 {
@@ -1116,7 +1118,11 @@ mod tests {
             for row in 0..8 {
                 html.push_str("<tr>");
                 for column in 0..6 {
-                    html.push_str(&format!("<td style='padding:2px;border:1px solid'>T{table} R{row} C{column}</td>"));
+                    if dependent_cells {
+                        html.push_str(&format!("<td style='padding:2px;border:1px solid'><div style='height:50%;overflow:hidden'>T{table} R{row} C{column}</div></td>"));
+                    } else {
+                        html.push_str(&format!("<td style='padding:2px;border:1px solid'>T{table} R{row} C{column}</td>"));
+                    }
                 }
                 html.push_str("</tr>");
             }
@@ -1144,7 +1150,7 @@ mod tests {
         std::hint::black_box(checksum);
         println!(
             "TABLE_BENCH case={} iterations={} total_ns={} ns_per_relayout={} checksum={checksum}",
-            if with_captions { "captioned" } else { "ordinary" },
+            case,
             iterations,
             elapsed.as_nanos(),
             elapsed.as_nanos() / iterations.max(1) as u128,

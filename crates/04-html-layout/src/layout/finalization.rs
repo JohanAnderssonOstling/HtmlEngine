@@ -54,7 +54,12 @@ impl LayoutEngine<'_, '_> {
             .publish_absolute(&mut self.geometry, &mut self.fragments);
 
         let start = self.start_timing();
-        sort_lines_and_remap_images(&self.reader, &mut self.fragments, &mut self.finalization);
+        sort_lines_and_remap_images(
+            &self.reader,
+            &mut self.fragments,
+            &mut self.placement,
+            &mut self.finalization,
+        );
         self.record_timing(|timings| timings.sort_lines_and_remap_images += start.elapsed());
 
         prepare_line_text_runs(&self.text, &mut self.fragments);

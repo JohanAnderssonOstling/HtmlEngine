@@ -43,6 +43,7 @@ pub(crate) use engine::layout_with_timings;
 pub(crate) use engine::{LayoutInputs, LayoutOutputs, LayoutScratch};
 pub(crate) use fragment_writer::{FragmentWriter, OutputRanges};
 pub(crate) use inline::PreparedInlinePlans;
+pub(crate) use placement::PlacementState;
 pub(crate) use intrinsic_sizing::{
     box_content_intrinsic_widths, box_intrinsic_widths, contains_full_width_percentage_table,
     percentage_height_image_width,
