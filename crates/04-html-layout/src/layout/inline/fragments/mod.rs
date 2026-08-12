@@ -96,7 +96,7 @@ pub(super) fn emit_lines(
     first_letter_height: Option<f64>,
     lines: &[BrokenLine],
 ) -> Size {
-    let timing_started = Instant::now();
+    let timing_started = engine.start_timing();
     let context = LineEmissionContext::new(tokens, input, overflow, first_line_height, first_letter_height);
     let mut y = 0.0;
     let mut max_width = 0.0f64;

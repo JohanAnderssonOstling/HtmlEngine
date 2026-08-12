@@ -1,6 +1,8 @@
 use crate::layout_model::{DecorationFragment, DecorationStore, LayoutState, RoundedDecoration};
-use kurbo::Rect;
+use kurbo::{Point, Rect, Vec2};
 use std::ops::Range;
+
+use super::placement::{BoxPlacement, PlacementState};
 
 #[derive(Clone, Copy)]
 pub(crate) struct OutputCursor {
@@ -11,6 +13,7 @@ pub(crate) struct OutputCursor {
 
 #[derive(Clone)]
 pub(crate) struct OutputRanges {
+    pub placement: BoxPlacement,
     pub lines: Range<usize>,
     pub decorations: Range<usize>,
     pub images: Range<usize>,
@@ -32,8 +35,17 @@ pub(crate) struct FragmentWriter<'out> {
 }
 
 impl<'out> FragmentWriter<'out> {
-    pub(crate) fn new(state: &'out mut LayoutState, line_owners: Vec<u32>, block_decoration_owners: Vec<u32>) -> Self {
-        Self { state, line_owners, block_decoration_owners, last_inline_fragments: Vec::new() }
+    pub(super) fn new(
+        state: &'out mut LayoutState,
+        line_owners: Vec<u32>,
+        block_decoration_owners: Vec<u32>,
+    ) -> Self {
+        Self {
+            state,
+            line_owners,
+            block_decoration_owners,
+            last_inline_fragments: Vec::new(),
+        }
     }
 
     /// Resets all published fragment state while retaining reusable allocation.
@@ -62,8 +74,14 @@ impl<'out> FragmentWriter<'out> {
             fragments.clear();
         }
         state.fragment_output.decoration_positioned_layers.clear();
-        state.fragment_output.decoration_negative_positioned_layers.clear();
-        state.fragment_output.decoration_independent_positioned_layers.clear();
+        state
+            .fragment_output
+            .decoration_negative_positioned_layers
+            .clear();
+        state
+            .fragment_output
+            .decoration_independent_positioned_layers
+            .clear();
         state.fragment_output.block_paint_ranges.clear();
         state.fragment_output.block_decoration_count = 0;
         state.fragment_output.decoration_clips.clear();
@@ -83,20 +101,56 @@ impl<'out> FragmentWriter<'out> {
     }
 
     pub(crate) fn output_cursor(&self) -> OutputCursor {
-        OutputCursor { lines: self.state.line_output.lines.len(), decorations: self.state.fragment_output.decorations.len(), images: self.state.fragment_output.image_fragments.len() }
+        OutputCursor {
+            lines: self.state.line_output.lines.len(),
+            decorations: self.state.fragment_output.decorations.len(),
+            images: self.state.fragment_output.image_fragments.len(),
+        }
     }
 
-    pub(crate) fn output_since(&self, cursor: OutputCursor) -> OutputRanges {
-        OutputRanges { lines: cursor.lines..self.state.line_output.lines.len(), decorations: cursor.decorations..self.state.fragment_output.decorations.len(), images: cursor.images..self.state.fragment_output.image_fragments.len() }
+    pub(crate) fn output_since(
+        &self,
+        cursor: OutputCursor,
+        placement: BoxPlacement,
+    ) -> OutputRanges {
+        OutputRanges {
+            placement,
+            lines: cursor.lines..self.state.line_output.lines.len(),
+            decorations: cursor.decorations..self.state.fragment_output.decorations.len(),
+            images: cursor.images..self.state.fragment_output.image_fragments.len(),
+        }
     }
 
-    pub(crate) fn mark_positioned_layer(&mut self, output: &OutputRanges, negative: bool, independent: bool) {
-        self.state.line_output.positioned_layers.resize(self.state.line_output.lines.len(), false);
-        self.state.line_output.negative_positioned_layers.resize(self.state.line_output.lines.len(), false);
-        self.state.line_output.independent_positioned_layers.resize(self.state.line_output.lines.len(), false);
-        self.state.fragment_output.decoration_positioned_layers.resize(self.state.fragment_output.decorations.len(), false);
-        self.state.fragment_output.decoration_negative_positioned_layers.resize(self.state.fragment_output.decorations.len(), false);
-        self.state.fragment_output.decoration_independent_positioned_layers.resize(self.state.fragment_output.decorations.len(), false);
+    pub(crate) fn mark_positioned_layer(
+        &mut self,
+        output: &OutputRanges,
+        negative: bool,
+        independent: bool,
+    ) {
+        self.state
+            .line_output
+            .positioned_layers
+            .resize(self.state.line_output.lines.len(), false);
+        self.state
+            .line_output
+            .negative_positioned_layers
+            .resize(self.state.line_output.lines.len(), false);
+        self.state
+            .line_output
+            .independent_positioned_layers
+            .resize(self.state.line_output.lines.len(), false);
+        self.state
+            .fragment_output
+            .decoration_positioned_layers
+            .resize(self.state.fragment_output.decorations.len(), false);
+        self.state
+            .fragment_output
+            .decoration_negative_positioned_layers
+            .resize(self.state.fragment_output.decorations.len(), false);
+        self.state
+            .fragment_output
+            .decoration_independent_positioned_layers
+            .resize(self.state.fragment_output.decorations.len(), false);
         self.state.line_output.positioned_layers[output.lines.clone()].fill(true);
         // A positioned ancestor owns the whole emitted subtree, but it must
         // not erase a negative stacking layer already established by a nested
@@ -108,9 +162,13 @@ impl<'out> FragmentWriter<'out> {
         if independent {
             self.state.line_output.independent_positioned_layers[output.lines.clone()].fill(true);
         }
-        self.state.fragment_output.decoration_positioned_layers[output.decorations.clone()].fill(true);
+        self.state.fragment_output.decoration_positioned_layers[output.decorations.clone()]
+            .fill(true);
         if negative {
-            self.state.fragment_output.decoration_negative_positioned_layers[output.decorations.clone()].fill(true);
+            self.state
+                .fragment_output
+                .decoration_negative_positioned_layers[output.decorations.clone()]
+            .fill(true);
         }
         if independent {
             for decoration_idx in output.decorations.clone() {
@@ -118,46 +176,121 @@ impl<'out> FragmentWriter<'out> {
                 // lines. Keep them in that final traversal so overlapping
                 // inline and absolute borders retain source order; only the
                 // independently positioned background needs a later sublayer.
-                if !self.state.fragment_output.decorations.fragments()[decoration_idx].is_foreground() {
-                    self.state.fragment_output.decoration_independent_positioned_layers[decoration_idx] = true;
+                if !self.state.fragment_output.decorations.fragments()[decoration_idx]
+                    .is_foreground()
+                {
+                    self.state
+                        .fragment_output
+                        .decoration_independent_positioned_layers[decoration_idx] = true;
                 }
             }
         }
     }
 
     pub(crate) fn first_baseline_offset(&self, lines: Range<usize>, origin_y: f64) -> Option<f64> {
-        self.state.line_output.lines[lines].iter().filter(|line| line.point.y >= origin_y - 0.01).min_by(|left, right| left.point.y.total_cmp(&right.point.y)).map(|line| line.point.y + line.baseline - origin_y)
+        let mut first: Option<(Point, f64)> = None;
+        for line_idx in lines {
+            let line = &self.state.line_output.lines[line_idx];
+            let point = line.point;
+            if point.y >= origin_y - 0.01 && first.is_none_or(|(current, _)| point.y < current.y) {
+                first = Some((point, line.baseline));
+            }
+        }
+        first.map(|(point, baseline)| point.y + baseline - origin_y)
     }
 
     pub(crate) fn last_baseline_offset(&self, lines: Range<usize>, origin_y: f64) -> Option<f64> {
-        self.state.line_output.lines[lines].iter().filter(|line| line.point.y >= origin_y - 0.01).max_by(|left, right| left.point.y.total_cmp(&right.point.y)).map(|line| line.point.y + line.baseline - origin_y)
+        let mut last: Option<(Point, f64)> = None;
+        for line_idx in lines {
+            let line = &self.state.line_output.lines[line_idx];
+            let point = line.point;
+            if point.y >= origin_y - 0.01 && last.is_none_or(|(current, _)| point.y > current.y) {
+                last = Some((point, line.baseline));
+            }
+        }
+        last.map(|(point, baseline)| point.y + baseline - origin_y)
     }
 
-    pub(crate) fn push_line_owner(&mut self, owner: u32) {
+    pub(crate) fn line_point(&self, line_idx: usize) -> Point {
+        self.state.line_output.lines[line_idx].point
+    }
+
+    pub(crate) fn lines_before_y(&self, lines: Range<usize>, y: f64) -> usize {
+        lines
+            .filter(|&line_idx| self.line_point(line_idx).y < y)
+            .count()
+    }
+
+    pub(super) fn line_len(&self) -> usize {
+        self.state.line_output.lines.len()
+    }
+
+    pub(super) fn materialize_absolute_positions(
+        &mut self,
+        line_groups: &[u32],
+        decoration_groups: &[u32],
+        resolved_offsets: &[Vec2],
+    ) {
+        for (index, line) in self.state.line_output.lines.iter_mut().enumerate() {
+            line.point += resolved_offsets[line_groups[index] as usize];
+        }
+        for (index, decoration) in self
+            .state
+            .fragment_output
+            .decorations
+            .fragments_mut()
+            .iter_mut()
+            .enumerate()
+        {
+            let offset = resolved_offsets[decoration_groups[index] as usize];
+            decoration.rect = decoration.rect + offset;
+        }
+    }
+
+    pub(super) fn push_line_owner(&mut self, placement: &mut PlacementState, owner: u32) {
         self.line_owners.push(owner);
+        placement.record_line();
     }
 
     /// Publishes one line's inline fragments and links continuations without
     /// adding per-line allocations.
-    pub(crate) fn push_inline_box_fragments(&mut self, fragments: Vec<crate::layout_model::LineInlineBoxFragment>, box_count: usize) -> Range<u32> {
+    pub(crate) fn push_inline_box_fragments(
+        &mut self,
+        fragments: Vec<crate::layout_model::LineInlineBoxFragment>,
+        box_count: usize,
+    ) -> Range<u32> {
         const NONE: u32 = u32::MAX;
         self.last_inline_fragments.resize(box_count, NONE);
-        let start = u32::try_from(self.state.line_output.inline_box_fragments.len()).expect("inline fragment arena exhausted");
+        let start = u32::try_from(self.state.line_output.inline_box_fragments.len())
+            .expect("inline fragment arena exhausted");
         for mut fragment in fragments {
             let previous = self.last_inline_fragments[fragment.box_idx as usize];
-            if previous != NONE && (previous as usize) < self.state.line_output.inline_box_fragments.len() {
-                self.state.line_output.inline_box_fragments[previous as usize].flags &= !crate::layout_model::LineInlineBoxFragment::INLINE_END;
+            if previous != NONE
+                && (previous as usize) < self.state.line_output.inline_box_fragments.len()
+            {
+                self.state.line_output.inline_box_fragments[previous as usize].flags &=
+                    !crate::layout_model::LineInlineBoxFragment::INLINE_END;
                 fragment.flags &= !crate::layout_model::LineInlineBoxFragment::INLINE_START;
             }
-            let current = u32::try_from(self.state.line_output.inline_box_fragments.len()).expect("inline fragment arena exhausted");
+            let current = u32::try_from(self.state.line_output.inline_box_fragments.len())
+                .expect("inline fragment arena exhausted");
             self.last_inline_fragments[fragment.box_idx as usize] = current;
             self.state.line_output.inline_box_fragments.push(fragment);
         }
-        start..u32::try_from(self.state.line_output.inline_box_fragments.len()).expect("inline fragment arena exhausted")
+        start
+            ..u32::try_from(self.state.line_output.inline_box_fragments.len())
+                .expect("inline fragment arena exhausted")
     }
 
-    pub(crate) fn push_block_decoration(&mut self, owner: u32, decoration: DecorationFragment) {
+    pub(super) fn push_block_decoration(
+        &mut self,
+        placement: &mut PlacementState,
+        owner: u32,
+        decoration: DecorationFragment,
+    ) {
+        let start = self.decoration_len();
         self.state.fragment_output.decorations.push(decoration);
+        placement.record_decorations_since(start, self.decoration_len());
         self.block_decoration_owners.push(owner);
     }
 
@@ -169,28 +302,73 @@ impl<'out> FragmentWriter<'out> {
         &mut self.state.fragment_output.decorations
     }
 
-    pub(crate) fn push_decoration(&mut self, decoration: DecorationFragment) {
+    pub(super) fn push_decoration(
+        &mut self,
+        placement: &mut PlacementState,
+        decoration: DecorationFragment,
+    ) {
+        let start = self.decoration_len();
         self.state.fragment_output.decorations.push(decoration);
+        placement.record_decorations_since(start, self.decoration_len());
     }
 
-    pub(crate) fn push_rounded_decoration(&mut self, rect: Rect, color: u32, is_inline: bool, rounded: RoundedDecoration) {
-        self.state.fragment_output.decorations.push_rounded_border(rect, color, is_inline, rounded);
+    pub(super) fn push_rounded_decoration(
+        &mut self,
+        placement: &mut PlacementState,
+        rect: Rect,
+        color: u32,
+        is_inline: bool,
+        rounded: RoundedDecoration,
+    ) {
+        let start = self.decoration_len();
+        self.state
+            .fragment_output
+            .decorations
+            .push_rounded_border(rect, color, is_inline, rounded);
+        placement.record_decorations_since(start, self.decoration_len());
     }
 
-    pub(crate) fn push_rounded_background(&mut self, rect: Rect, color: u32, is_inline: bool, rounded: RoundedDecoration) {
-        self.state.fragment_output.decorations.push_rounded_background(rect, color, is_inline, rounded);
+    pub(super) fn push_rounded_background(
+        &mut self,
+        placement: &mut PlacementState,
+        rect: Rect,
+        color: u32,
+        is_inline: bool,
+        rounded: RoundedDecoration,
+    ) {
+        let start = self.decoration_len();
+        self.state
+            .fragment_output
+            .decorations
+            .push_rounded_background(rect, color, is_inline, rounded);
+        placement.record_decorations_since(start, self.decoration_len());
     }
 
-    pub(crate) fn record_decoration_owner_since(&mut self, owner: u32, start: usize) {
-        let added = self.decoration_len().checked_sub(start).expect("decoration cursor must precede emitted output");
-        self.block_decoration_owners.extend(std::iter::repeat_n(owner, added));
+    pub(super) fn record_decoration_owner_since(
+        &mut self,
+        placement: &mut PlacementState,
+        owner: u32,
+        start: usize,
+    ) {
+        let added = self
+            .decoration_len()
+            .checked_sub(start)
+            .expect("decoration cursor must precede emitted output");
+        placement.record_decorations_since(start, self.decoration_len());
+        self.block_decoration_owners
+            .extend(std::iter::repeat_n(owner, added));
     }
 
     pub(crate) fn record_decoration_line_since(&mut self, line_idx: usize, start: usize) {
         const NO_LINE: u32 = u32::MAX;
         let end = self.decoration_len();
-        self.state.fragment_output.decoration_line_indices.resize(end, NO_LINE);
-        self.state.fragment_output.decoration_line_indices[start..end].fill(u32::try_from(line_idx).expect("line index exceeds decoration traversal capacity"));
+        self.state
+            .fragment_output
+            .decoration_line_indices
+            .resize(end, NO_LINE);
+        self.state.fragment_output.decoration_line_indices[start..end].fill(
+            u32::try_from(line_idx).expect("line index exceeds decoration traversal capacity"),
+        );
     }
 
     /// Inline decorations are materialized after positioned subtree ranges
@@ -198,40 +376,96 @@ impl<'out> FragmentWriter<'out> {
     /// those late decorations so they can continue to be replayed with that
     /// line (especially after relative positioning moves them away from its
     /// unshifted flow geometry).
-    pub(crate) fn inherit_line_layer_for_decorations_since(&mut self, line_idx: usize, start: usize) {
+    pub(crate) fn inherit_line_layer_for_decorations_since(
+        &mut self,
+        line_idx: usize,
+        start: usize,
+    ) {
         let end = self.state.fragment_output.decorations.len();
         if start >= end {
             return;
         }
-        let positioned = self.state.line_output.positioned_layers.get(line_idx).copied().unwrap_or(false);
-        let negative = self.state.line_output.negative_positioned_layers.get(line_idx).copied().unwrap_or(false);
-        let independent = self.state.line_output.independent_positioned_layers.get(line_idx).copied().unwrap_or(false);
-        self.state.fragment_output.decoration_positioned_layers.resize(end, false);
-        self.state.fragment_output.decoration_negative_positioned_layers.resize(end, false);
-        self.state.fragment_output.decoration_independent_positioned_layers.resize(end, false);
+        let positioned = self
+            .state
+            .line_output
+            .positioned_layers
+            .get(line_idx)
+            .copied()
+            .unwrap_or(false);
+        let negative = self
+            .state
+            .line_output
+            .negative_positioned_layers
+            .get(line_idx)
+            .copied()
+            .unwrap_or(false);
+        let independent = self
+            .state
+            .line_output
+            .independent_positioned_layers
+            .get(line_idx)
+            .copied()
+            .unwrap_or(false);
+        self.state
+            .fragment_output
+            .decoration_positioned_layers
+            .resize(end, false);
+        self.state
+            .fragment_output
+            .decoration_negative_positioned_layers
+            .resize(end, false);
+        self.state
+            .fragment_output
+            .decoration_independent_positioned_layers
+            .resize(end, false);
         self.state.fragment_output.decoration_positioned_layers[start..end].fill(positioned);
-        self.state.fragment_output.decoration_negative_positioned_layers[start..end].fill(negative);
-        self.state.fragment_output.decoration_independent_positioned_layers[start..end].fill(independent);
+        self.state
+            .fragment_output
+            .decoration_negative_positioned_layers[start..end]
+            .fill(negative);
+        self.state
+            .fragment_output
+            .decoration_independent_positioned_layers[start..end]
+            .fill(independent);
     }
 
     pub(crate) fn record_decoration_paint_order_since(&mut self, paint_order: u32, start: usize) {
         let end = self.decoration_len();
-        self.state.fragment_output.decoration_paint_orders.resize(end, u32::MAX);
+        self.state
+            .fragment_output
+            .decoration_paint_orders
+            .resize(end, u32::MAX);
         self.state.fragment_output.decoration_paint_orders[start..end].fill(paint_order);
     }
 
-    pub(crate) fn finalization_parts(&mut self) -> (&mut LayoutState, &mut Vec<u32>, &mut Vec<u32>) {
-        (self.state, &mut self.line_owners, &mut self.block_decoration_owners)
+    pub(crate) fn finalization_parts(
+        &mut self,
+    ) -> (&mut LayoutState, &mut Vec<u32>, &mut Vec<u32>) {
+        (
+            self.state,
+            &mut self.line_owners,
+            &mut self.block_decoration_owners,
+        )
     }
 
-    pub(crate) fn swap_scratch(&mut self, state: &mut LayoutState, line_owners: &mut Vec<u32>, block_decoration_owners: &mut Vec<u32>, last_inline_fragments: &mut Vec<u32>) {
+    pub(super) fn swap_scratch(
+        &mut self,
+        state: &mut LayoutState,
+        line_owners: &mut Vec<u32>,
+        block_decoration_owners: &mut Vec<u32>,
+        last_inline_fragments: &mut Vec<u32>,
+    ) {
         std::mem::swap(self.state, state);
         std::mem::swap(&mut self.line_owners, line_owners);
         std::mem::swap(&mut self.block_decoration_owners, block_decoration_owners);
         std::mem::swap(&mut self.last_inline_fragments, last_inline_fragments);
     }
 
-    pub(crate) fn recycle_owner_storage(&mut self, line_owners: &mut Vec<u32>, block_decoration_owners: &mut Vec<u32>) {
+    pub(crate) fn recycle_owner_storage(
+        &mut self,
+        line_owners: &mut Vec<u32>,
+        block_decoration_owners: &mut Vec<u32>,
+    ) {
         self.line_owners.clear();
         self.block_decoration_owners.clear();
         std::mem::swap(&mut self.line_owners, line_owners);

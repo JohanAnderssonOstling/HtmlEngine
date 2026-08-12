@@ -259,7 +259,7 @@ mod stage_tests {
         let advances_ptr = document.layout_state.line_output.line_glyph_advances.as_ptr();
         let image_lines_ptr = document.layout_state.fragment_output.image_fragments_by_line.as_ptr();
         let glyphs_ptr = document.glyphs().as_ptr();
-        let cached_text_plans = document.inline_token_cache.len();
+        let cached_text_plans = document.shaped.inline_plans.len();
         let scratch_capacities = document.layout_scratch.allocation_capacities();
         assert!(cached_text_plans > 0, "initial layout should retain width-independent text plans");
         assert!(scratch_capacities.0.0 > 0, "initial layout should retain line-owner storage");
@@ -275,15 +275,35 @@ mod stage_tests {
         assert_eq!(document.layout_state.line_output.line_glyph_offsets.as_ptr(), offsets_ptr);
         assert_eq!(document.layout_state.line_output.line_glyph_advances.as_ptr(), advances_ptr);
         assert_eq!(document.layout_state.fragment_output.image_fragments_by_line.as_ptr(), image_lines_ptr);
-        assert_eq!(document.inline_token_cache.len(), cached_text_plans);
+        assert_eq!(document.shaped.inline_plans.len(), cached_text_plans);
         let retained_scratch_capacities = document.layout_scratch.allocation_capacities();
         assert_eq!(retained_scratch_capacities.0.0 + retained_scratch_capacities.1.2, scratch_capacities.0.0 + scratch_capacities.1.2, "the two rotating line-owner buffers must retain their combined allocation");
         assert_eq!(retained_scratch_capacities.1.0, scratch_capacities.1.0, "line-sort storage must be recycled");
         assert_eq!(retained_scratch_capacities.1.1, scratch_capacities.1.1, "line-remapping storage must be recycled");
+        assert!(!relayout_timings.root_box_layout.is_zero(), "explicit timing must still read and report the clock");
+        assert!(relayout_timings.layout_tree_traversal >= relayout_timings.root_box_layout, "tree timing must include root layout");
         assert_eq!(relayout_timings.build_inline_tokens_from_runs, std::time::Duration::ZERO, "pure-text relayout should not rebuild token plans");
 
         let cloned = document.clone();
         assert_eq!(cloned.layout_scratch.allocation_capacities(), ((0, 0), (0, 0, 0, 0, 0, 0)), "cloning semantic layout state must not duplicate transient scratch allocations");
+    }
+
+    #[test]
+    fn shaped_inline_plans_are_shared_for_short_text_contexts() {
+        let mut factory = DocumentFactory::new();
+        let mut shaper = TestGlyphShaper::new();
+        let shaped = factory
+            .parse_with_new_pipeline("<html><body><p>tiny</p></body></html>", None)
+            .shape(&mut shaper)
+            .expect("short text shapes");
+
+        let first = shaped.clone().layout(LayoutConstraints::new(100.0, 16.0).unwrap());
+        let prepared_plan_count = first.shaped.inline_plans.len();
+        assert!(prepared_plan_count > 0, "short contexts must enter the shaped plan arena");
+
+        let (second, timings) = shaped.layout_with_timings(LayoutConstraints::new(80.0, 16.0).unwrap());
+        assert_eq!(second.shaped.inline_plans.len(), prepared_plan_count);
+        assert_eq!(timings.build_inline_tokens_from_runs, std::time::Duration::ZERO, "a second layout from the same shaped document must not rebuild short text tokens");
     }
 
     #[test]
@@ -377,5 +397,27 @@ mod stage_tests {
         });
 
         assert_eq!(allocations, 0, "render views must stay allocation-free");
+    }
+
+    #[test]
+    fn viewport_height_dependency_is_reported_from_used_layout_values() {
+        let mut factory = DocumentFactory::new();
+        let mut shaper = TestGlyphShaper::new();
+        let ordinary = factory
+            .parse_with_new_pipeline("<html><body><p>ordinary book text</p></body></html>", None)
+            .shape(&mut shaper)
+            .expect("ordinary document shapes")
+            .layout(LayoutConstraints::new(300.0, 20.0).unwrap().with_viewport_height(Some(600.0)).unwrap());
+        assert!(!ordinary.layout_depends_on_viewport_height());
+
+        let percentage = factory
+            .parse_with_new_pipeline(
+                "<html><body><main>height-sensitive</main></body></html>",
+                Some("html, body, main { height: 100%; }"),
+            )
+            .shape(&mut shaper)
+            .expect("percentage-height document shapes")
+            .layout(LayoutConstraints::new(300.0, 20.0).unwrap().with_viewport_height(Some(600.0)).unwrap());
+        assert!(percentage.layout_depends_on_viewport_height());
     }
 }

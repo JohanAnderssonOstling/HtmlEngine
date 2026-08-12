@@ -75,54 +75,170 @@ pub(crate) struct SemanticIndexes {
 impl LayoutState {
     pub(crate) fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
-        report.add_slice_storage::<Line>("LayoutState.line_output.lines.storage", self.line_output.lines.capacity(), self.line_output.lines.len());
+        report.add_slice_storage::<Line>(
+            "LayoutState.line_output.lines.storage",
+            self.line_output.lines.capacity(),
+            self.line_output.lines.len(),
+        );
         for line in &self.line_output.lines {
             report.extend_prefixed("LayoutState.line_output.lines", line.memory_usage_report());
         }
-        report.add_slice_storage::<u32>("LayoutState.line_output.paint_order_indices.storage", self.line_output.paint_order_indices.capacity(), self.line_output.paint_order_indices.len());
-        report.add_slice_storage::<LineInlineBoxFragment>("LayoutState.line_output.inline_box_fragments.storage", self.line_output.inline_box_fragments.capacity(), self.line_output.inline_box_fragments.len());
-        report.add_slice_storage::<bool>("LayoutState.line_output.positioned_layers.storage", self.line_output.positioned_layers.capacity(), self.line_output.positioned_layers.len());
-        report.add_slice_storage::<bool>("LayoutState.line_output.negative_positioned_layers.storage", self.line_output.negative_positioned_layers.capacity(), self.line_output.negative_positioned_layers.len());
-        report.add_slice_storage::<bool>("LayoutState.line_output.independent_positioned_layers.storage", self.line_output.independent_positioned_layers.capacity(), self.line_output.independent_positioned_layers.len());
-        report.add_slice_storage::<Option<OverflowClip>>("LayoutState.line_output.line_clips.storage", self.line_output.line_clips.capacity(), self.line_output.line_clips.len());
-        report.add_slice_storage::<u32>("LayoutState.line_output.glyph_line_indices.storage", self.line_output.glyph_line_indices.capacity(), self.line_output.glyph_line_indices.len());
-        report.add_slice_storage::<Vec<GlyphOffsetRun>>("LayoutState.line_output.line_glyph_offsets.storage", self.line_output.line_glyph_offsets.capacity(), self.line_output.line_glyph_offsets.len());
+        report.add_slice_storage::<u32>(
+            "LayoutState.line_output.paint_order_indices.storage",
+            self.line_output.paint_order_indices.capacity(),
+            self.line_output.paint_order_indices.len(),
+        );
+        report.add_slice_storage::<LineInlineBoxFragment>(
+            "LayoutState.line_output.inline_box_fragments.storage",
+            self.line_output.inline_box_fragments.capacity(),
+            self.line_output.inline_box_fragments.len(),
+        );
+        report.add_slice_storage::<bool>(
+            "LayoutState.line_output.positioned_layers.storage",
+            self.line_output.positioned_layers.capacity(),
+            self.line_output.positioned_layers.len(),
+        );
+        report.add_slice_storage::<bool>(
+            "LayoutState.line_output.negative_positioned_layers.storage",
+            self.line_output.negative_positioned_layers.capacity(),
+            self.line_output.negative_positioned_layers.len(),
+        );
+        report.add_slice_storage::<bool>(
+            "LayoutState.line_output.independent_positioned_layers.storage",
+            self.line_output.independent_positioned_layers.capacity(),
+            self.line_output.independent_positioned_layers.len(),
+        );
+        report.add_slice_storage::<Option<OverflowClip>>(
+            "LayoutState.line_output.line_clips.storage",
+            self.line_output.line_clips.capacity(),
+            self.line_output.line_clips.len(),
+        );
+        report.add_slice_storage::<u32>(
+            "LayoutState.line_output.glyph_line_indices.storage",
+            self.line_output.glyph_line_indices.capacity(),
+            self.line_output.glyph_line_indices.len(),
+        );
+        report.add_slice_storage::<Vec<GlyphOffsetRun>>(
+            "LayoutState.line_output.line_glyph_offsets.storage",
+            self.line_output.line_glyph_offsets.capacity(),
+            self.line_output.line_glyph_offsets.len(),
+        );
         for offsets in &self.line_output.line_glyph_offsets {
-            report.add_slice_storage::<GlyphOffsetRun>("LayoutState.line_output.line_glyph_offsets.items.storage", offsets.capacity(), offsets.len());
+            report.add_slice_storage::<GlyphOffsetRun>(
+                "LayoutState.line_output.line_glyph_offsets.items.storage",
+                offsets.capacity(),
+                offsets.len(),
+            );
         }
-        report.add_slice_storage::<Vec<GlyphAdvanceRun>>("LayoutState.line_output.line_glyph_advances.storage", self.line_output.line_glyph_advances.capacity(), self.line_output.line_glyph_advances.len());
+        report.add_slice_storage::<Vec<GlyphAdvanceRun>>(
+            "LayoutState.line_output.line_glyph_advances.storage",
+            self.line_output.line_glyph_advances.capacity(),
+            self.line_output.line_glyph_advances.len(),
+        );
         for advances in &self.line_output.line_glyph_advances {
-            report.add_slice_storage::<GlyphAdvanceRun>("LayoutState.line_output.line_glyph_advances.items.storage", advances.capacity(), advances.len());
+            report.add_slice_storage::<GlyphAdvanceRun>(
+                "LayoutState.line_output.line_glyph_advances.items.storage",
+                advances.capacity(),
+                advances.len(),
+            );
         }
-        report.add_slice_storage::<EllipsisFragment>("LayoutState.line_output.ellipsis_fragments.storage", self.line_output.ellipsis_fragments.capacity(), self.line_output.ellipsis_fragments.len());
-        report.add_slice_storage::<HyphenFragment>("LayoutState.line_output.hyphen_fragments.storage", self.line_output.hyphen_fragments.capacity(), self.line_output.hyphen_fragments.len());
-        report.add_slice_storage::<DecorationFragment>("LayoutState.fragment_output.decorations.storage", self.fragment_output.decorations.fragment_capacity(), self.fragment_output.decorations.len());
-        report.add_slice_storage::<u32>("LayoutState.fragment_output.decoration_line_indices.storage", self.fragment_output.decoration_line_indices.capacity(), self.fragment_output.decoration_line_indices.len());
-        report.add_slice_storage::<u32>("LayoutState.fragment_output.decoration_paint_orders.storage", self.fragment_output.decoration_paint_orders.capacity(), self.fragment_output.decoration_paint_orders.len());
-        report.add_slice_storage::<Vec<usize>>("LayoutState.fragment_output.decoration_fragments_by_line.storage", self.fragment_output.decoration_fragments_by_line.capacity(), self.fragment_output.decoration_fragments_by_line.len());
+        report.add_slice_storage::<EllipsisFragment>(
+            "LayoutState.line_output.ellipsis_fragments.storage",
+            self.line_output.ellipsis_fragments.capacity(),
+            self.line_output.ellipsis_fragments.len(),
+        );
+        report.add_slice_storage::<HyphenFragment>(
+            "LayoutState.line_output.hyphen_fragments.storage",
+            self.line_output.hyphen_fragments.capacity(),
+            self.line_output.hyphen_fragments.len(),
+        );
+        report.add_slice_storage::<DecorationFragment>(
+            "LayoutState.fragment_output.decorations.storage",
+            self.fragment_output.decorations.fragment_capacity(),
+            self.fragment_output.decorations.len(),
+        );
+        report.add_slice_storage::<u32>(
+            "LayoutState.fragment_output.decoration_line_indices.storage",
+            self.fragment_output.decoration_line_indices.capacity(),
+            self.fragment_output.decoration_line_indices.len(),
+        );
+        report.add_slice_storage::<u32>(
+            "LayoutState.fragment_output.decoration_paint_orders.storage",
+            self.fragment_output.decoration_paint_orders.capacity(),
+            self.fragment_output.decoration_paint_orders.len(),
+        );
+        report.add_slice_storage::<Vec<usize>>(
+            "LayoutState.fragment_output.decoration_fragments_by_line.storage",
+            self.fragment_output.decoration_fragments_by_line.capacity(),
+            self.fragment_output.decoration_fragments_by_line.len(),
+        );
         for fragments in &self.fragment_output.decoration_fragments_by_line {
-            report.add_slice_storage::<usize>("LayoutState.fragment_output.decoration_fragments_by_line.items.storage", fragments.capacity(), fragments.len());
+            report.add_slice_storage::<usize>(
+                "LayoutState.fragment_output.decoration_fragments_by_line.items.storage",
+                fragments.capacity(),
+                fragments.len(),
+            );
         }
-        report.add_slice_storage::<bool>("LayoutState.fragment_output.decoration_positioned_layers.storage", self.fragment_output.decoration_positioned_layers.capacity(), self.fragment_output.decoration_positioned_layers.len());
+        report.add_slice_storage::<bool>(
+            "LayoutState.fragment_output.decoration_positioned_layers.storage",
+            self.fragment_output.decoration_positioned_layers.capacity(),
+            self.fragment_output.decoration_positioned_layers.len(),
+        );
         report.add_slice_storage::<bool>(
             "LayoutState.fragment_output.decoration_negative_positioned_layers.storage",
-            self.fragment_output.decoration_negative_positioned_layers.capacity(),
-            self.fragment_output.decoration_negative_positioned_layers.len(),
+            self.fragment_output
+                .decoration_negative_positioned_layers
+                .capacity(),
+            self.fragment_output
+                .decoration_negative_positioned_layers
+                .len(),
         );
         report.add_slice_storage::<bool>(
             "LayoutState.fragment_output.decoration_independent_positioned_layers.storage",
-            self.fragment_output.decoration_independent_positioned_layers.capacity(),
-            self.fragment_output.decoration_independent_positioned_layers.len(),
+            self.fragment_output
+                .decoration_independent_positioned_layers
+                .capacity(),
+            self.fragment_output
+                .decoration_independent_positioned_layers
+                .len(),
         );
-        report.add_slice_storage::<Range<u32>>("LayoutState.fragment_output.block_paint_ranges.storage", self.fragment_output.block_paint_ranges.capacity(), self.fragment_output.block_paint_ranges.len());
-        report.add_slice_storage::<Option<OverflowClip>>("LayoutState.fragment_output.decoration_clips.storage", self.fragment_output.decoration_clips.capacity(), self.fragment_output.decoration_clips.len());
-        report.add_slice_storage::<RoundedDecoration>("LayoutState.fragment_output.decorations.rounded_storage", self.fragment_output.decorations.rounded_capacity(), self.fragment_output.decorations.rounded_len());
-        report.add_slice_storage::<ImageFragment>("LayoutState.fragment_output.image_fragments.storage", self.fragment_output.image_fragments.capacity(), self.fragment_output.image_fragments.len());
-        report.add_slice_storage::<Vec<usize>>("LayoutState.fragment_output.image_fragments_by_line.storage", self.fragment_output.image_fragments_by_line.capacity(), self.fragment_output.image_fragments_by_line.len());
+        report.add_slice_storage::<Range<u32>>(
+            "LayoutState.fragment_output.block_paint_ranges.storage",
+            self.fragment_output.block_paint_ranges.capacity(),
+            self.fragment_output.block_paint_ranges.len(),
+        );
+        report.add_slice_storage::<Option<OverflowClip>>(
+            "LayoutState.fragment_output.decoration_clips.storage",
+            self.fragment_output.decoration_clips.capacity(),
+            self.fragment_output.decoration_clips.len(),
+        );
+        report.add_slice_storage::<RoundedDecoration>(
+            "LayoutState.fragment_output.decorations.rounded_storage",
+            self.fragment_output.decorations.rounded_capacity(),
+            self.fragment_output.decorations.rounded_len(),
+        );
+        report.add_slice_storage::<ImageFragment>(
+            "LayoutState.fragment_output.image_fragments.storage",
+            self.fragment_output.image_fragments.capacity(),
+            self.fragment_output.image_fragments.len(),
+        );
+        report.add_slice_storage::<Vec<usize>>(
+            "LayoutState.fragment_output.image_fragments_by_line.storage",
+            self.fragment_output.image_fragments_by_line.capacity(),
+            self.fragment_output.image_fragments_by_line.len(),
+        );
         for fragments in &self.fragment_output.image_fragments_by_line {
-            report.add_slice_storage::<usize>("LayoutState.fragment_output.image_fragments_by_line.items.storage", fragments.capacity(), fragments.len());
+            report.add_slice_storage::<usize>(
+                "LayoutState.fragment_output.image_fragments_by_line.items.storage",
+                fragments.capacity(),
+                fragments.len(),
+            );
         }
-        report.add_slice_storage::<(u16, AnchorPosition)>("LayoutState.semantic_indexes.anchor_positions.storage", self.semantic_indexes.anchor_positions.capacity(), self.semantic_indexes.anchor_positions.len());
+        report.add_slice_storage::<(u16, AnchorPosition)>(
+            "LayoutState.semantic_indexes.anchor_positions.storage",
+            self.semantic_indexes.anchor_positions.capacity(),
+            self.semantic_indexes.anchor_positions.len(),
+        );
         report
     }
 }
@@ -145,11 +261,15 @@ pub(crate) struct AnchorPosition {
 
 #[derive(Clone)]
 pub(crate) struct Line {
+    /// Block formatting context that emitted this line. Retained with the
+    /// line so consumers can inspect semantics for a visible range without
+    /// walking every box or text run in the document.
+    pub owner_box_idx: u32,
     pub glyphs: Range<u32>,
     pub point: Point,
     pub height: f64,
     pub baseline: f64,
-    pub word_spacing: f64,   // extra space to add after each space (for justification)
+    pub word_spacing: f64, // extra space to add after each space (for justification)
     pub letter_spacing: f64, // micro-tracking after eligible shaped-cluster boundaries
     /// Paint-only horizontal shift used for optical margin alignment. This is
     /// deliberately excluded from logical line width and line breaking.
@@ -174,7 +294,11 @@ impl Line {
     pub(crate) fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
         if let Some(fragments) = &self.text_fragments {
-            report.add_slice_storage::<LineTextFragment>("Line.text_fragments.storage", fragments.len(), fragments.len());
+            report.add_slice_storage::<LineTextFragment>(
+                "Line.text_fragments.storage",
+                fragments.len(),
+                fragments.len(),
+            );
         }
         report
     }
@@ -293,18 +417,36 @@ impl DecorationStore {
         self.fragments.push(fragment);
     }
 
-    pub(crate) fn push_rounded_border(&mut self, rect: Rect, color: u32, is_inline: bool, rounded: RoundedDecoration) {
+    pub(crate) fn push_rounded_border(
+        &mut self,
+        rect: Rect,
+        color: u32,
+        is_inline: bool,
+        rounded: RoundedDecoration,
+    ) {
         let index = self.push_rounded(rounded);
-        self.fragments.push(DecorationFragment::rounded_border(rect, color, is_inline, index));
+        self.fragments.push(DecorationFragment::rounded_border(
+            rect, color, is_inline, index,
+        ));
     }
 
-    pub(crate) fn push_rounded_background(&mut self, rect: Rect, color: u32, is_inline: bool, rounded: RoundedDecoration) {
+    pub(crate) fn push_rounded_background(
+        &mut self,
+        rect: Rect,
+        color: u32,
+        is_inline: bool,
+        rounded: RoundedDecoration,
+    ) {
         let index = self.push_rounded(rounded);
-        self.fragments.push(DecorationFragment::rounded_background(rect, color, is_inline, index));
+        self.fragments.push(DecorationFragment::rounded_background(
+            rect, color, is_inline, index,
+        ));
     }
 
     pub(crate) fn rounded_for(&self, fragment: &DecorationFragment) -> Option<&RoundedDecoration> {
-        fragment.rounded_index().and_then(|index| self.rounded.get(index))
+        fragment
+            .rounded_index()
+            .and_then(|index| self.rounded.get(index))
     }
 
     fn push_rounded(&mut self, rounded: RoundedDecoration) -> usize {
@@ -348,48 +490,130 @@ impl DecorationFragment {
     const BORDER_BIT: u32 = 1 << 25;
     const PATTERN_SHIFT: u32 = 26;
     const PATTERN_MASK: u32 = 0b111 << Self::PATTERN_SHIFT;
-    const FLAG_BITS: u32 = Self::INLINE_BIT | Self::FOREGROUND_BIT | Self::BACKGROUND_BIT | Self::BORDER_BIT | Self::PATTERN_MASK;
+    const FLAG_BITS: u32 = Self::INLINE_BIT
+        | Self::FOREGROUND_BIT
+        | Self::BACKGROUND_BIT
+        | Self::BORDER_BIT
+        | Self::PATTERN_MASK;
 
     #[cfg(test)]
     pub(crate) fn rect(rect: Rect, color: u32, is_inline: bool) -> Self {
-        Self { rect, color, metadata: if is_inline { Self::INLINE_BIT } else { 0 } }
+        Self {
+            rect,
+            color,
+            metadata: if is_inline { Self::INLINE_BIT } else { 0 },
+        }
     }
 
     pub(crate) fn background_rect(rect: Rect, color: u32, is_inline: bool) -> Self {
-        Self { rect, color, metadata: Self::BACKGROUND_BIT | if is_inline { Self::INLINE_BIT } else { 0 } }
+        Self {
+            rect,
+            color,
+            metadata: Self::BACKGROUND_BIT | if is_inline { Self::INLINE_BIT } else { 0 },
+        }
     }
 
     pub(crate) fn border_rect(rect: Rect, color: u32, is_inline: bool, foreground: bool) -> Self {
-        Self { rect, color, metadata: Self::BORDER_BIT | if is_inline { Self::INLINE_BIT } else { 0 } | if foreground { Self::FOREGROUND_BIT } else { 0 } }
+        Self {
+            rect,
+            color,
+            metadata: Self::BORDER_BIT
+                | if is_inline { Self::INLINE_BIT } else { 0 }
+                | if foreground { Self::FOREGROUND_BIT } else { 0 },
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn foreground_rect(rect: Rect, color: u32, is_inline: bool) -> Self {
-        Self { rect, color, metadata: Self::FOREGROUND_BIT | if is_inline { Self::INLINE_BIT } else { 0 } }
+        Self {
+            rect,
+            color,
+            metadata: Self::FOREGROUND_BIT | if is_inline { Self::INLINE_BIT } else { 0 },
+        }
     }
 
-    pub(crate) fn patterned(rect: Rect, color: u32, is_inline: bool, foreground: bool, pattern: DecorationPattern) -> Self {
-        Self { rect, color, metadata: ((pattern as u32) << Self::PATTERN_SHIFT) | if is_inline { Self::INLINE_BIT } else { 0 } | if foreground { Self::FOREGROUND_BIT } else { 0 } }
+    pub(crate) fn patterned(
+        rect: Rect,
+        color: u32,
+        is_inline: bool,
+        foreground: bool,
+        pattern: DecorationPattern,
+    ) -> Self {
+        Self {
+            rect,
+            color,
+            metadata: ((pattern as u32) << Self::PATTERN_SHIFT)
+                | if is_inline { Self::INLINE_BIT } else { 0 }
+                | if foreground { Self::FOREGROUND_BIT } else { 0 },
+        }
     }
 
-    pub(crate) fn border_patterned(rect: Rect, color: u32, is_inline: bool, foreground: bool, pattern: DecorationPattern) -> Self {
-        Self { rect, color, metadata: Self::BORDER_BIT | ((pattern as u32) << Self::PATTERN_SHIFT) | if is_inline { Self::INLINE_BIT } else { 0 } | if foreground { Self::FOREGROUND_BIT } else { 0 } }
+    pub(crate) fn border_patterned(
+        rect: Rect,
+        color: u32,
+        is_inline: bool,
+        foreground: bool,
+        pattern: DecorationPattern,
+    ) -> Self {
+        Self {
+            rect,
+            color,
+            metadata: Self::BORDER_BIT
+                | ((pattern as u32) << Self::PATTERN_SHIFT)
+                | if is_inline { Self::INLINE_BIT } else { 0 }
+                | if foreground { Self::FOREGROUND_BIT } else { 0 },
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn rounded(rect: Rect, color: u32, is_inline: bool, rounded_index: usize) -> Self {
-        assert!(rounded_index < ((1 << 25) - 1) as usize, "too many rounded decorations");
-        Self { rect, color, metadata: (rounded_index as u32 + 1) | if is_inline { Self::INLINE_BIT } else { 0 } }
+        assert!(
+            rounded_index < ((1 << 25) - 1) as usize,
+            "too many rounded decorations"
+        );
+        Self {
+            rect,
+            color,
+            metadata: (rounded_index as u32 + 1) | if is_inline { Self::INLINE_BIT } else { 0 },
+        }
     }
 
-    pub(crate) fn rounded_border(rect: Rect, color: u32, is_inline: bool, rounded_index: usize) -> Self {
-        assert!(rounded_index < ((1 << 25) - 1) as usize, "too many rounded decorations");
-        Self { rect, color, metadata: Self::BORDER_BIT | (rounded_index as u32 + 1) | if is_inline { Self::INLINE_BIT } else { 0 } }
+    pub(crate) fn rounded_border(
+        rect: Rect,
+        color: u32,
+        is_inline: bool,
+        rounded_index: usize,
+    ) -> Self {
+        assert!(
+            rounded_index < ((1 << 25) - 1) as usize,
+            "too many rounded decorations"
+        );
+        Self {
+            rect,
+            color,
+            metadata: Self::BORDER_BIT
+                | (rounded_index as u32 + 1)
+                | if is_inline { Self::INLINE_BIT } else { 0 },
+        }
     }
 
-    pub(crate) fn rounded_background(rect: Rect, color: u32, is_inline: bool, rounded_index: usize) -> Self {
-        assert!(rounded_index < ((1 << 25) - 1) as usize, "too many rounded decorations");
-        Self { rect, color, metadata: Self::BACKGROUND_BIT | (rounded_index as u32 + 1) | if is_inline { Self::INLINE_BIT } else { 0 } }
+    pub(crate) fn rounded_background(
+        rect: Rect,
+        color: u32,
+        is_inline: bool,
+        rounded_index: usize,
+    ) -> Self {
+        assert!(
+            rounded_index < ((1 << 25) - 1) as usize,
+            "too many rounded decorations"
+        );
+        Self {
+            rect,
+            color,
+            metadata: Self::BACKGROUND_BIT
+                | (rounded_index as u32 + 1)
+                | if is_inline { Self::INLINE_BIT } else { 0 },
+        }
     }
 
     pub(crate) fn is_inline(&self) -> bool {
@@ -423,7 +647,6 @@ impl DecorationFragment {
             _ => DecorationPattern::Solid,
         }
     }
-
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -473,7 +696,13 @@ mod tests {
         let rounded_border = DecorationFragment::rounded_border(Rect::ZERO, 0, true, 9);
         assert!(rounded_border.is_border());
         assert_eq!(rounded_border.rounded_index(), Some(9));
-        let patterned = DecorationFragment::patterned(Rect::ZERO, 0, true, true, DecorationPattern::DashedHorizontal);
+        let patterned = DecorationFragment::patterned(
+            Rect::ZERO,
+            0,
+            true,
+            true,
+            DecorationPattern::DashedHorizontal,
+        );
         assert_eq!(patterned.pattern(), DecorationPattern::DashedHorizontal);
         assert!(patterned.is_inline());
         assert!(patterned.is_foreground());
@@ -483,11 +712,28 @@ mod tests {
     fn decoration_store_owns_sparse_rounded_geometry() {
         let mut decorations = DecorationStore::default();
         decorations.push(DecorationFragment::background_rect(Rect::ZERO, 1, false));
-        let radii = UsedBorderRadii { top_left: (4.0, 5.0), ..UsedBorderRadii::default() };
-        decorations.push_rounded_background(Rect::ZERO, 2, false, RoundedDecoration { radii, border_width: None });
+        let radii = UsedBorderRadii {
+            top_left: (4.0, 5.0),
+            ..UsedBorderRadii::default()
+        };
+        decorations.push_rounded_background(
+            Rect::ZERO,
+            2,
+            false,
+            RoundedDecoration {
+                radii,
+                border_width: None,
+            },
+        );
 
-        assert!(decorations.rounded_for(&decorations.fragments()[0]).is_none());
-        let rounded = decorations.rounded_for(&decorations.fragments()[1]).expect("rounded details");
+        assert!(
+            decorations
+                .rounded_for(&decorations.fragments()[0])
+                .is_none()
+        );
+        let rounded = decorations
+            .rounded_for(&decorations.fragments()[1])
+            .expect("rounded details");
         assert_eq!(rounded.radii, radii);
         assert_eq!(rounded.border_width, None);
     }

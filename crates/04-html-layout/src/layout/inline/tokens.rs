@@ -16,9 +16,10 @@ use unicode_segmentation::UnicodeSegmentation;
 pub(super) const KP_TOLERANCE: f64 = 1.0;
 pub(super) const HYPHEN_PENALTY: f64 = 50.0;
 
-/// Sharing tiny plans costs more allocation and hashing than rebuilding them.
-/// Retain only text contexts large enough to amortize their shared buffers.
-pub(super) const INLINE_TOKEN_CACHE_MIN_GLYPHS: usize = 64;
+/// Knuth--Plass planning is useful for substantial paragraphs, but allocating
+/// its two lazy plan slots for tiny inline contexts costs more than rebuilding
+/// the plan if such a context ever requests optimal wrapping.
+pub(super) const INLINE_KP_CACHE_MIN_GLYPHS: usize = 64;
 pub(super) const INLINE_SUMMARY_BLOCK_TOKENS: usize = 16;
 
 /// Derives a final line box from ascent, descent, and a minimum height.
@@ -680,41 +681,69 @@ impl std::ops::Deref for InlineTokens {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) struct InlineTokenCacheKey {
+pub(super) struct PreparedInlinePlanKey {
     pub(super) run_start: u32,
     pub(super) run_end: u32,
     pub(super) container_box_idx: u32,
+    pub(super) high_quality_hyphenation: bool,
 }
 
-/// Width-independent token plans retained by a laid-out document. Only pure
-/// text/marker formatting contexts enter this cache; replaced content and
-/// other layout-sensitive runs continue through the ordinary builder.
-#[derive(Clone, Default)]
-pub(crate) struct InlineTokenCache {
-    text_plans: rustc_data_structures::fx::FxHashMap<InlineTokenCacheKey, InlineTokens>,
+#[derive(Clone)]
+struct PreparedInlinePlan {
+    key: PreparedInlinePlanKey,
+    tokens: InlineTokens,
 }
 
-impl InlineTokenCache {
-    fn get(&self, key: InlineTokenCacheKey) -> Option<InlineTokens> {
-        self.text_plans.get(&key).cloned()
+/// Width-independent text plans owned by the shaped document and shared by
+/// every layout derived from it.
+///
+/// A layout box owns at most one inline formatting-context range, so topology
+/// order is already the ideal cache index. Dense `OnceLock` slots avoid a hash
+/// lookup and allow the first layout to prepare plans lazily without making
+/// immutable shaping data depend on viewport constraints. Replaced and other
+/// layout-sensitive contexts never enter these slots.
+#[derive(Clone)]
+pub(crate) struct PreparedInlinePlans {
+    slots: std::sync::Arc<[std::sync::OnceLock<PreparedInlinePlan>]>,
+}
+
+impl PreparedInlinePlans {
+    pub(crate) fn new(box_count: usize) -> Self {
+        Self { slots: (0..box_count).map(|_| std::sync::OnceLock::new()).collect::<Vec<_>>().into() }
     }
 
-    fn insert(&mut self, key: InlineTokenCacheKey, tokens: InlineTokens) {
-        self.text_plans.insert(key, tokens);
+    fn get(&self, key: PreparedInlinePlanKey) -> Option<InlineTokens> {
+        let plan = self.slots.get(key.container_box_idx as usize)?.get()?;
+        (plan.key == key).then(|| plan.tokens.clone())
+    }
+
+    fn insert(&self, key: PreparedInlinePlanKey, tokens: InlineTokens) -> InlineTokens {
+        let Some(slot) = self.slots.get(key.container_box_idx as usize) else { return tokens };
+        if let Some(plan) = slot.get() {
+            return if plan.key == key { plan.tokens.clone() } else { tokens };
+        }
+        match slot.set(PreparedInlinePlan { key, tokens }) {
+            Ok(()) => slot.get().expect("prepared inline plan was just initialized").tokens.clone(),
+            Err(candidate) => slot.get().filter(|plan| plan.key == key).map_or(candidate.tokens, |plan| plan.tokens.clone()),
+        }
     }
 
     pub(crate) fn memory_usage_bytes(&self) -> usize {
-        self.text_plans
-            .values()
+        self.slots.len() * std::mem::size_of::<std::sync::OnceLock<PreparedInlinePlan>>()
+            + self
+            .slots
+            .iter()
+            .filter_map(std::sync::OnceLock::get)
             .map(|tokens| {
+                let tokens = &tokens.tokens;
                 let kp_plan_bytes = tokens.kp_plan.as_deref().map_or(0, |plans| plans.iter().filter_map(std::sync::OnceLock::get).map(KpPlan::memory_usage_bytes).sum());
                 tokens.dense.capacity() * std::mem::size_of::<InlineToken>() + tokens.runs.capacity() * std::mem::size_of::<InlineTokenMetrics>() + tokens.summary_blocks.capacity() * std::mem::size_of::<InlineSummaryBlock>() + kp_plan_bytes
             })
-            .sum()
+            .sum::<usize>()
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.text_plans.len()
+        self.slots.iter().filter(|slot| slot.get().is_some()).count()
     }
 }
 

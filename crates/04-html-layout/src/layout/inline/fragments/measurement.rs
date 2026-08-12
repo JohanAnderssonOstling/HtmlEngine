@@ -13,7 +13,7 @@ pub(super) fn measure_line(
     container_box_idx: usize,
     containing_width: f64,
 ) -> LineLayout {
-    let timing_started = Instant::now();
+    let timing_started = engine.start_timing();
     let hyphen = tokens.last().and_then(|token| match token.kind() {
         InlineTokenKind::Discretionary { glyph } => Some((glyph, token.discretionary_width())),
         _ => None,

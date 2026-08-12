@@ -20,11 +20,40 @@ pub(crate) struct LayoutReader<'input> {
     glyph_metrics: &'input GlyphMetrics,
     font_metrics: &'input ShapedFontMetrics,
     image_metrics: &'input crate::ImageMetrics,
+    box_styles: BoxStyleSnapshot<'input>,
+}
+
+/// Layout-ready styles for boxes in topology order.
+///
+/// Computed styles and selected font metrics are immutable for the lifetime of
+/// a shaped document. Joining them at every property read made the boundary
+/// between shaping and layout needlessly expensive. Build that join once when
+/// a layout session starts. This does not move value resolution: percentages
+/// and other containing-block-dependent values remain symbolic inside
+/// `UsedStyleView` until the owning layout algorithm supplies their basis.
+struct BoxStyleSnapshot<'input> {
+    styles: Vec<UsedStyleView<'input>>,
+    tracks_overflow_clips: bool,
+}
+
+impl<'input> BoxStyleSnapshot<'input> {
+    fn new(styles: &'input ComputedStyles, topology: &'input LayoutTree, font_metrics: &'input ShapedFontMetrics) -> Self {
+        let mut resolved = Vec::with_capacity(topology.box_count());
+        let mut tracks_overflow_clips = false;
+        for box_idx in 0..topology.box_count() {
+            let indices = topology.get_box_style_indices(box_idx).unwrap_or_else(|| styles.default_indices());
+            let style = font_metrics.used_style(styles, indices, box_idx).expect("validated style handle");
+            tracks_overflow_clips |= style.overflow_x().clips() || style.overflow_y().clips();
+            resolved.push(style);
+        }
+        Self { styles: resolved, tracks_overflow_clips }
+    }
 }
 
 impl<'input> LayoutReader<'input> {
     pub(crate) fn new(document: &'input Document, styles: &'input ComputedStyles, topology: &'input LayoutTree, inline_content: &'input InlineContent, glyph_metrics: &'input GlyphMetrics, font_metrics: &'input ShapedFontMetrics, image_metrics: &'input crate::ImageMetrics) -> Self {
-        Self { document, styles, topology, inline_content, glyph_metrics, font_metrics, image_metrics }
+        let box_styles = BoxStyleSnapshot::new(styles, topology, font_metrics);
+        Self { document, styles, topology, inline_content, glyph_metrics, font_metrics, image_metrics, box_styles }
     }
 
     pub(crate) fn document(&self) -> &'input Document {
@@ -32,8 +61,11 @@ impl<'input> LayoutReader<'input> {
     }
 
     pub(crate) fn style(&self, box_idx: usize) -> UsedStyleView<'input> {
-        let indices = self.topology.get_box_style_indices(box_idx).unwrap_or_else(|| self.styles.default_indices());
-        self.font_metrics.used_style(self.styles, indices, box_idx).expect("validated style handle")
+        self.box_styles.styles[box_idx]
+    }
+
+    pub(crate) fn tracks_overflow_clips(&self) -> bool {
+        self.box_styles.tracks_overflow_clips
     }
 
     pub(crate) fn used_style(&self, indices: StyleIndices) -> UsedStyleView<'input> {

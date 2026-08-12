@@ -6,7 +6,7 @@ use super::*;
 /// breaks them into logical lines, and then emits fragments from those
 /// lines in a separate pass.
 pub(in crate::layout) fn layout_inline_content(engine: &mut crate::layout::LayoutEngine<'_, '_>, input: InlineFormattingInput) -> Size {
-    let timing_started = Instant::now();
+    let timing_started = engine.start_timing();
     let run_range = &input.run_range;
     if run_range.start >= run_range.end {
         engine.record_timing(|t| t.layout_runs += timing_started.elapsed());

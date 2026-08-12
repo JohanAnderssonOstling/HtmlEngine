@@ -2,7 +2,6 @@ use crate::layout::LayoutEngine;
 use crate::layout_model::BoxType;
 use html_style_model::{Float, PositionMode};
 use kurbo::{Point, Size, Vec2};
-use std::time::Instant;
 
 use super::floats::{clearance_offset, layout_float};
 use super::fragmentation::{PreviousBlock, make_previous_block, offset_after_layout, offset_before_layout, offset_for_forced_break_after};
@@ -17,7 +16,7 @@ struct BlockFlowItem {
 /// block inline-size for the children, against which their margin percentages
 /// resolve. `parent_cb_width` is the parent's own containing-block width.
 pub(crate) fn layout_block_children(engine: &mut LayoutEngine<'_, '_>, parent_idx: usize, children: &[u32], available_width: f64, parent_cb_width: f64, parent_content_height: Option<f64>, first_line_indent: f64) -> Size {
-    let timing_started = Instant::now();
+    let timing_started = engine.start_timing();
     let mut y_offset = 0.0;
     let mut max_width = 0.0f64;
     let mut pending_margin = MarginStrut::default();

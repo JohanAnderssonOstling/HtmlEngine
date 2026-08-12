@@ -9,6 +9,7 @@ use super::fragment_writer::FragmentWriter;
 use super::geometry_writer::GeometryWriter;
 use super::inline_reader::InlineReader;
 use super::measurement::MeasurementScratch;
+use super::placement::PlacementState;
 use super::read_context::LayoutReader;
 use super::{
     absolute_positioning::AbsolutePositioningState,
@@ -23,12 +24,9 @@ pub(crate) fn layout_with_timings(inputs: LayoutInputs<'_>, outputs: LayoutOutpu
     // mutability provides the narrow safe capability that the old raw pointer
     // was approximating.
     let collected_timings = timings.as_deref().cloned().map(RefCell::new);
-    let LayoutOutputs { geometry, state, inline_token_cache, scratch } = outputs;
+    let LayoutOutputs { geometry, state, scratch } = outputs;
     let reader = LayoutReader::new(inputs.document, inputs.styles, inputs.topology, inputs.inline_content, inputs.glyph_metrics, inputs.font_metrics, inputs.image_metrics);
-    let track_overflow_clips = (0..reader.box_count()).any(|idx| {
-        let style = reader.style(idx);
-        style.overflow_x().clips() || style.overflow_y().clips()
-    });
+    let track_overflow_clips = reader.tracks_overflow_clips();
     let text = InlineReader::new(inputs.inline_content, inputs.glyph_metrics, inputs.text_geometry, inputs.ellipsis_glyphs, inputs.hyphen_glyphs);
     let mut context = LayoutEngine {
         config: LayoutConfig::new(constraints),
@@ -43,7 +41,8 @@ pub(crate) fn layout_with_timings(inputs: LayoutInputs<'_>, outputs: LayoutOutpu
         text,
         geometry: GeometryWriter::new(geometry),
         fragments: FragmentWriter::new(state, std::mem::take(&mut scratch.line_owners), std::mem::take(&mut scratch.block_decoration_owners)),
-        inline_token_cache,
+        placement: std::mem::take(&mut scratch.placement),
+        inline_plans: inputs.inline_plans,
         fragmentation_suppression_depth: 0,
         timings: collected_timings,
     };
@@ -52,6 +51,7 @@ pub(crate) fn layout_with_timings(inputs: LayoutInputs<'_>, outputs: LayoutOutpu
         *destination = collected.into_inner();
     }
     context.fragments.recycle_owner_storage(&mut scratch.line_owners, &mut scratch.block_decoration_owners);
+    scratch.placement = std::mem::take(&mut context.placement);
     scratch.floats = std::mem::take(&mut context.floats);
     scratch.margins = std::mem::take(&mut context.margins);
     scratch.absolute_positioning = std::mem::take(&mut context.absolute_positioning);
@@ -64,6 +64,7 @@ pub(crate) fn layout_with_timings(inputs: LayoutInputs<'_>, outputs: LayoutOutpu
 /// from published geometry so render consumers cannot observe or depend on it.
 #[derive(Default)]
 pub(crate) struct LayoutScratch {
+    placement: PlacementState,
     floats: FloatState,
     margins: MarginAnalysis,
     absolute_positioning: AbsolutePositioningState,
@@ -99,13 +100,13 @@ pub(crate) struct LayoutInputs<'a> {
     pub(crate) text_geometry: Option<&'a crate::shaping::ShapedTextGeometry>,
     pub(crate) ellipsis_glyphs: &'a rustc_data_structures::fx::FxHashMap<u32, GlyphId>,
     pub(crate) hyphen_glyphs: &'a rustc_data_structures::fx::FxHashMap<u32, GlyphId>,
+    pub(crate) inline_plans: &'a crate::layout::PreparedInlinePlans,
     pub(crate) image_metrics: &'a crate::ImageMetrics,
 }
 
 pub(crate) struct LayoutOutputs<'out> {
     pub(crate) geometry: &'out mut BoxGeometry,
     pub(crate) state: &'out mut LayoutState,
-    pub(crate) inline_token_cache: &'out mut crate::layout::InlineTokenCache,
     pub(crate) scratch: &'out mut LayoutScratch,
 }
 
@@ -138,12 +139,26 @@ pub struct LayoutTimings {
     pub measure_flex_grid_item: Duration,
 }
 
+/// Start time for optional layout telemetry.
+///
+/// Normal layout does not request [`LayoutTimings`], so keeping the absence in
+/// the token prevents hot layout paths from reading the system clock merely to
+/// discard the result.
+#[derive(Clone, Copy)]
+pub(crate) struct LayoutTimingStart(Option<Instant>);
+
+impl LayoutTimingStart {
+    pub(crate) fn elapsed(self) -> Duration {
+        self.0.map_or(Duration::ZERO, |started| started.elapsed())
+    }
+}
+
 pub(crate) struct LayoutEngine<'a, 'out> {
     pub(crate) config: LayoutConfig,
     pub(super) floats: FloatState,
     pub(super) margins: MarginAnalysis,
     pub(super) absolute_positioning: AbsolutePositioningState,
-    pub(super) inline_token_cache: &'out mut crate::layout::InlineTokenCache,
+    pub(super) inline_plans: &'a crate::layout::PreparedInlinePlans,
     pub(crate) flex_grid: crate::flex_grid::FlexGridState,
     pub(super) measurement: MeasurementScratch,
     pub(super) finalization: FinalizationScratch,
@@ -153,10 +168,27 @@ pub(crate) struct LayoutEngine<'a, 'out> {
     pub(crate) text: InlineReader<'a>,
     pub(crate) geometry: GeometryWriter<'out>,
     pub(crate) fragments: FragmentWriter<'out>,
+    pub(super) placement: PlacementState,
     timings: Option<RefCell<LayoutTimings>>,
 }
 
 impl<'a, 'out> LayoutEngine<'a, 'out> {
+    pub(crate) fn start_timing(&self) -> LayoutTimingStart {
+        LayoutTimingStart(self.timings.as_ref().map(|_| Instant::now()))
+    }
+
+    pub(crate) fn select_placement_group(&mut self, group: super::placement::PlacementId) {
+        self.placement.select(group);
+    }
+
+    pub(crate) fn push_line_owner(&mut self, owner: u32) {
+        self.fragments.push_line_owner(&mut self.placement, owner);
+    }
+
+    pub(crate) fn push_block_decoration(&mut self, owner: u32, decoration: crate::layout_model::DecorationFragment) {
+        self.fragments.push_block_decoration(&mut self.placement, owner, decoration);
+    }
+
     pub(crate) fn natural_content_height(&self, box_idx: usize) -> f64 {
         self.margins.natural_content_height(box_idx)
     }
@@ -179,10 +211,10 @@ impl<'a, 'out> LayoutEngine<'a, 'out> {
     }
 
     fn run(&mut self) {
-        let start = Instant::now();
+        let start = self.start_timing();
         self.clear_layout_output();
         self.record_timing(|t| t.clear_layout_output += start.elapsed());
-        let start = Instant::now();
+        let start = self.start_timing();
         self.floats.reset();
         self.margins.reset();
         self.absolute_positioning.clear();
@@ -190,7 +222,7 @@ impl<'a, 'out> LayoutEngine<'a, 'out> {
         self.record_timing(|t| t.layout_tree_traversal += start.elapsed());
 
         if let Some(root_box) = self.reader.root_box() {
-            let start = Instant::now();
+            let start = self.start_timing();
             // The root element establishes the initial block formatting
             // context, so its margins never collapse with its descendants.
             // Unlike ordinary boxes, it has no parent flow to consume those
@@ -209,7 +241,7 @@ impl<'a, 'out> LayoutEngine<'a, 'out> {
             self.record_timing(|t| t.root_box_layout += elapsed);
         }
 
-        let start = Instant::now();
+        let start = self.start_timing();
         self.floats.clear();
         self.record_timing(|t| t.layout_tree_traversal += start.elapsed());
         self.finalize(self.track_overflow_clips);
@@ -224,5 +256,6 @@ impl<'a, 'out> LayoutEngine<'a, 'out> {
     pub(super) fn clear_layout_output(&mut self) {
         self.geometry.reset(self.reader.box_count());
         self.fragments.reset();
+        self.placement.reset(self.reader.box_count());
     }
 }

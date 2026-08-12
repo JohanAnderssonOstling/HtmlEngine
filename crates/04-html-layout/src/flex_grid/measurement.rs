@@ -1,6 +1,5 @@
 use super::finite_f32;
 use crate::layout::{LayoutEngine, measure_box_and_baselines_isolated, measure_replaced_content, preferred_aspect_ratio};
-use std::time::Instant;
 use taffy::geometry::Size as TaffySize;
 use taffy::prelude::AvailableSpace;
 
@@ -46,7 +45,7 @@ impl FlexGridState {
 }
 
 pub(super) fn measure_item_with_baseline(session: &mut LayoutEngine<'_, '_>, box_idx: usize, known: TaffySize<Option<f32>>, available: TaffySize<AvailableSpace>) -> MeasuredItem {
-    let timing_started = Instant::now();
+    let timing_started = session.start_timing();
     if let Some(intrinsic) = session.reader.image_intrinsic(box_idx) {
         let result = measure_replaced_content(intrinsic.size, preferred_aspect_ratio(session.reader.style(box_idx).aspect_ratio(), intrinsic.aspect_ratio), known, available);
         session.record_timing(|timings| timings.measure_flex_grid_item += timing_started.elapsed());

@@ -4,15 +4,23 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use html_dom::RootFontSize;
-use html_layout::{GlyphShaper as LayoutGlyphShaper, LaidOutDocument, LayoutConstraints as LayoutConstraintsOutput, PreparedDocument, ShapedDocument};
+use html_layout::{
+    GlyphShaper as LayoutGlyphShaper, LaidOutDocument,
+    LayoutConstraints as LayoutConstraintsOutput, PreparedDocument, ShapedDocument,
+};
 use html_parse::{MarkupSyntax, ParsedHtml, parse_document};
 use html_resources::ResourceProvider;
 use html_style::{MediaMatchKey, MediaQuerySet};
 
 use crate::parser::DocumentFactory;
-use crate::types::{LayoutCacheKey, ParsedCacheKey, PreparedCacheKey, RenderOnlyCacheKey, ShapedCacheKey};
+use crate::types::{
+    LayoutCacheKey, ParsedCacheKey, PreparedCacheKey, RenderOnlyCacheKey, ShapedCacheKey,
+};
 use crate::types::{LayoutConstraints, ResourceRevision, StylesheetRevision};
-use crate::{EarliestStage, PipelineError, PipelineInputs, PipelineRetainedBytes, PipelineStageCounts, PipelineTimings, PipelineUpdate, Reuse, ReuseReport};
+use crate::{
+    EarliestStage, PipelineError, PipelineInputs, PipelineRetainedBytes, PipelineStageCounts,
+    PipelineTimings, PipelineUpdate, Reuse, ReuseReport,
+};
 
 #[derive(Default)]
 pub struct PipelineCacheState {
@@ -63,18 +71,40 @@ pub struct PipelineSession {
 impl PipelineSession {
     pub fn new(provider: Arc<dyn ResourceProvider>) -> Self {
         let cached_provider = Arc::new(RevisionCachedResourceProvider::new(provider.clone()));
-        Self { cached_provider, cached_resource_key: None, factory: DocumentFactory::new(), cache: PipelineCacheState::default(), notes_shaped: None }
+        Self {
+            cached_provider,
+            cached_resource_key: None,
+            factory: DocumentFactory::new(),
+            cache: PipelineCacheState::default(),
+            notes_shaped: None,
+        }
     }
 
-    pub fn update(&mut self, requested_inputs: PipelineInputs, glyph_shaper: &mut impl LayoutGlyphShaper) -> Result<PipelineUpdate, PipelineError> {
+    pub fn update(
+        &mut self,
+        requested_inputs: PipelineInputs,
+        glyph_shaper: &mut impl LayoutGlyphShaper,
+    ) -> Result<PipelineUpdate, PipelineError> {
         let update_started = Instant::now();
         let decision_started = Instant::now();
-        self.refresh_resource_cache(requested_inputs.resource_revision, requested_inputs.stylesheet_revision);
-        let base_uri = if requested_inputs.base_uri.is_empty() { "index.html".to_string() } else { requested_inputs.base_uri.clone() };
-        self.factory.set_resource_context(self.cached_provider.clone(), base_uri);
-        self.factory.set_root_font_size(to_root_font_size(requested_inputs.style_environment.root_font_size));
-        self.factory.set_media_environment(requested_inputs.style_environment.media);
-        self.factory.set_reader_overrides(requested_inputs.reader_overrides.clone());
+        self.refresh_resource_cache(
+            requested_inputs.resource_revision,
+            requested_inputs.stylesheet_revision,
+        );
+        let base_uri = if requested_inputs.base_uri.is_empty() {
+            "index.html".to_string()
+        } else {
+            requested_inputs.base_uri.clone()
+        };
+        self.factory
+            .set_resource_context(self.cached_provider.clone(), base_uri);
+        self.factory.set_root_font_size(to_root_font_size(
+            requested_inputs.style_environment.root_font_size,
+        ));
+        self.factory
+            .set_media_environment(requested_inputs.style_environment.media);
+        self.factory
+            .set_reader_overrides(requested_inputs.reader_overrides.clone());
         self.factory.set_note_flow(requested_inputs.note_flow);
 
         let media_match_changed = self.media_match_changed(&requested_inputs);
@@ -86,7 +116,8 @@ impl PipelineSession {
             timings.change_cause.style_environment_changed = true;
         }
 
-        let requested_stage = self.normalized_earliest_stage(&requested_inputs, media_match_changed);
+        let requested_stage =
+            self.normalized_earliest_stage(&requested_inputs, media_match_changed);
         println!("HTML_PIPELINE_UPDATE phase=begin stage={requested_stage:?}");
         let layout_constraints = to_layout_constraints(requested_inputs.layout);
         let parsed_key = requested_inputs.parsed_cache_key();
@@ -102,10 +133,22 @@ impl PipelineSession {
 
         match requested_stage {
             EarliestStage::Parse => {
-                let parsed = self.parse(&requested_inputs.source, requested_inputs.markup_syntax)?;
-                let user_styles = requested_inputs.user_styles.iter().map(String::as_str).collect::<Vec<_>>();
-                let (prepared, media_queries) = self.factory.build_pipeline_from_parsed_with_media_queries(&parsed, &user_styles);
-                let (shaped, laid_out) = self.shape_and_layout(&prepared, layout_constraints, &requested_inputs.image_metrics, glyph_shaper)?;
+                let parsed =
+                    self.parse(&requested_inputs.source, requested_inputs.markup_syntax)?;
+                let user_styles = requested_inputs
+                    .user_styles
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
+                let (prepared, media_queries) = self
+                    .factory
+                    .build_pipeline_from_parsed_with_media_queries(&parsed, &user_styles);
+                let (shaped, laid_out) = self.shape_and_layout(
+                    &prepared,
+                    layout_constraints,
+                    &requested_inputs.image_metrics,
+                    glyph_shaper,
+                )?;
                 rebuilt_media_queries = Some(media_queries);
 
                 self.cache.parsed = Some(parsed.clone());
@@ -131,10 +174,21 @@ impl PipelineSession {
             }
             EarliestStage::Style | EarliestStage::Prepare => {
                 let parsed = self.parse_cached(&parsed_key, &requested_inputs.source)?;
-                let user_styles = requested_inputs.user_styles.iter().map(String::as_str).collect::<Vec<_>>();
-                let (prepared, media_queries) = self.factory.build_pipeline_from_parsed_with_media_queries(&parsed, &user_styles);
+                let user_styles = requested_inputs
+                    .user_styles
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>();
+                let (prepared, media_queries) = self
+                    .factory
+                    .build_pipeline_from_parsed_with_media_queries(&parsed, &user_styles);
 
-                let (shaped, laid_out) = self.shape_and_layout(&prepared, layout_constraints, &requested_inputs.image_metrics, glyph_shaper)?;
+                let (shaped, laid_out) = self.shape_and_layout(
+                    &prepared,
+                    layout_constraints,
+                    &requested_inputs.image_metrics,
+                    glyph_shaper,
+                )?;
                 rebuilt_media_queries = Some(media_queries);
 
                 self.cache.parsed = Some(parsed);
@@ -161,8 +215,17 @@ impl PipelineSession {
             EarliestStage::Shape => {
                 let parsed = self.parse_cached(&parsed_key, &requested_inputs.source)?;
                 let prepared_reused = self.cache.prepared_matches(&prepared_key);
-                let (prepared, media_queries) = self.prepare_from_cache_or_rebuild(&parsed, &prepared_key, &requested_inputs.user_styles);
-                let (shaped, laid_out) = self.shape_and_layout(&prepared, layout_constraints, &requested_inputs.image_metrics, glyph_shaper)?;
+                let (prepared, media_queries) = self.prepare_from_cache_or_rebuild(
+                    &parsed,
+                    &prepared_key,
+                    &requested_inputs.user_styles,
+                );
+                let (shaped, laid_out) = self.shape_and_layout(
+                    &prepared,
+                    layout_constraints,
+                    &requested_inputs.image_metrics,
+                    glyph_shaper,
+                )?;
                 rebuilt_media_queries = media_queries;
 
                 self.cache.parsed = Some(parsed);
@@ -186,17 +249,33 @@ impl PipelineSession {
 
                 report.parsed = Reuse::reused(EarliestStage::Shape);
                 report.styled = Reuse::reused(EarliestStage::Shape);
-                report.prepared = if prepared_reused { Reuse::reused(EarliestStage::Shape) } else { Reuse::recomputed(EarliestStage::Shape) };
+                report.prepared = if prepared_reused {
+                    Reuse::reused(EarliestStage::Shape)
+                } else {
+                    Reuse::recomputed(EarliestStage::Shape)
+                };
                 report.shaped = Reuse::recomputed(EarliestStage::Shape);
                 report.laid_out = Reuse::recomputed(EarliestStage::Shape);
             }
             EarliestStage::Layout => {
                 let parsed = self.parse_cached(&parsed_key, &requested_inputs.source)?;
                 let prepared_reused = self.cache.prepared_matches(&prepared_key);
-                let (prepared, media_queries) = self.prepare_from_cache_or_rebuild(&parsed, &prepared_key, &requested_inputs.user_styles);
+                let (prepared, media_queries) = self.prepare_from_cache_or_rebuild(
+                    &parsed,
+                    &prepared_key,
+                    &requested_inputs.user_styles,
+                );
                 let shaped_reused = self.cache.shaped_matches(&shaped_key);
-                let shaped = self.shape_from_cache_or_rebuild(&prepared, &shaped_key, glyph_shaper)?;
-                self.relayout_laid_out(layout_constraints, &requested_inputs.image_metrics, &shaped_key, &layout_key, &shaped, glyph_shaper)?;
+                let shaped =
+                    self.shape_from_cache_or_rebuild(&prepared, &shaped_key, glyph_shaper)?;
+                self.relayout_laid_out(
+                    layout_constraints,
+                    &requested_inputs.image_metrics,
+                    &shaped_key,
+                    &layout_key,
+                    &shaped,
+                    glyph_shaper,
+                )?;
                 rebuilt_media_queries = media_queries;
 
                 self.cache.parsed = Some(parsed);
@@ -222,12 +301,23 @@ impl PipelineSession {
 
                 report.parsed = Reuse::reused(EarliestStage::Layout);
                 report.styled = Reuse::reused(EarliestStage::Layout);
-                report.prepared = if prepared_reused { Reuse::reused(EarliestStage::Layout) } else { Reuse::recomputed(EarliestStage::Layout) };
-                report.shaped = if shaped_reused { Reuse::reused(EarliestStage::Layout) } else { Reuse::recomputed(EarliestStage::Layout) };
+                report.prepared = if prepared_reused {
+                    Reuse::reused(EarliestStage::Layout)
+                } else {
+                    Reuse::recomputed(EarliestStage::Layout)
+                };
+                report.shaped = if shaped_reused {
+                    Reuse::reused(EarliestStage::Layout)
+                } else {
+                    Reuse::recomputed(EarliestStage::Layout)
+                };
                 report.laid_out = Reuse::recomputed(EarliestStage::Layout);
             }
             EarliestStage::Paint => {
-                debug_assert_eq!(self.cache.laid_out_key.as_ref(), Some(&render_only_key.layout));
+                debug_assert_eq!(
+                    self.cache.laid_out_key.as_ref(),
+                    Some(&render_only_key.layout)
+                );
                 stage_reuses.parsed += 1;
                 stage_reuses.styled += 1;
                 stage_reuses.prepared += 1;
@@ -258,9 +348,20 @@ impl PipelineSession {
         if let Some(media_queries) = rebuilt_media_queries {
             self.cache.media_queries = Some(media_queries);
         }
-        self.cache.media_match_key = self.cache.media_queries.as_ref().map(|queries| queries.match_key(requested_inputs.style_environment.media, f64::from(requested_inputs.style_environment.root_font_size)));
+        self.cache.media_match_key = self.cache.media_queries.as_ref().map(|queries| {
+            queries.match_key(
+                requested_inputs.style_environment.media,
+                f64::from(requested_inputs.style_environment.root_font_size),
+            )
+        });
 
-        self.validate_cache_against_requested(&parsed_key, &prepared_key, &shaped_key, &layout_key, &render_only_key);
+        self.validate_cache_against_requested(
+            &parsed_key,
+            &prepared_key,
+            &shaped_key,
+            &layout_key,
+            &render_only_key,
+        );
         self.cache.inputs = Some(requested_inputs);
         if !matches!(requested_stage, EarliestStage::Paint | EarliestStage::None) {
             self.cache.retained_bytes = self.retained_bytes();
@@ -276,7 +377,18 @@ impl PipelineSession {
             timings.decision_time.as_millis(),
             timings.retained_bytes.total(),
         );
-        Ok(PipelineUpdate { stage: requested_stage, timings, report, anchors_preserved: !matches!(requested_stage, EarliestStage::Parse | EarliestStage::Style | EarliestStage::Prepare | EarliestStage::Shape) })
+        Ok(PipelineUpdate {
+            stage: requested_stage,
+            timings,
+            report,
+            anchors_preserved: !matches!(
+                requested_stage,
+                EarliestStage::Parse
+                    | EarliestStage::Style
+                    | EarliestStage::Prepare
+                    | EarliestStage::Shape
+            ),
+        })
     }
 
     /// Rebuild the shaped and laid-out stages for a cached document.
@@ -285,10 +397,24 @@ impl PipelineSession {
     /// data is reset whenever another document is shaped, so restoring a cached
     /// document must rehydrate it even when its parse and style inputs are still
     /// valid.
-    pub fn rehydrate_glyphs(&mut self, glyph_shaper: &mut impl LayoutGlyphShaper) -> Result<LaidOutDocument, PipelineError> {
-        let inputs = self.cache.inputs.clone().ok_or_else(|| PipelineError("cannot rehydrate an empty pipeline session".to_owned()))?;
-        let prepared = self.cache.prepared.clone().ok_or_else(|| PipelineError("cannot rehydrate a pipeline session without a prepared document".to_owned()))?;
-        let (shaped, laid_out) = self.shape_and_layout(&prepared, to_layout_constraints(inputs.layout), &inputs.image_metrics, glyph_shaper)?;
+    pub fn rehydrate_glyphs(
+        &mut self,
+        glyph_shaper: &mut impl LayoutGlyphShaper,
+    ) -> Result<LaidOutDocument, PipelineError> {
+        let inputs = self.cache.inputs.clone().ok_or_else(|| {
+            PipelineError("cannot rehydrate an empty pipeline session".to_owned())
+        })?;
+        let prepared = self.cache.prepared.clone().ok_or_else(|| {
+            PipelineError(
+                "cannot rehydrate a pipeline session without a prepared document".to_owned(),
+            )
+        })?;
+        let (shaped, laid_out) = self.shape_and_layout(
+            &prepared,
+            to_layout_constraints(inputs.layout),
+            &inputs.image_metrics,
+            glyph_shaper,
+        )?;
 
         self.cache.shaped = Some(shaped);
         self.cache.shaped_key = Some(inputs.shaped_cache_key());
@@ -298,9 +424,22 @@ impl PipelineSession {
         Ok(laid_out)
     }
 
-    fn normalized_earliest_stage(&self, requested_inputs: &PipelineInputs, media_match_changed: bool) -> EarliestStage {
-        let input_stage = self.cache.inputs.as_ref().map(|previous| requested_inputs.earliest_stage(previous)).unwrap_or(EarliestStage::Parse);
-        let base_stage = input_stage.coalesce(if media_match_changed { EarliestStage::Style } else { EarliestStage::None });
+    fn normalized_earliest_stage(
+        &self,
+        requested_inputs: &PipelineInputs,
+        media_match_changed: bool,
+    ) -> EarliestStage {
+        let input_stage = self
+            .cache
+            .inputs
+            .as_ref()
+            .map(|previous| requested_inputs.earliest_stage(previous))
+            .unwrap_or(EarliestStage::Parse);
+        let base_stage = input_stage.coalesce(if media_match_changed {
+            EarliestStage::Style
+        } else {
+            EarliestStage::None
+        });
         let parsed_key = requested_inputs.parsed_cache_key();
         let prepared_key = requested_inputs.prepared_cache_key();
         let shaped_key = requested_inputs.shaped_cache_key();
@@ -358,9 +497,17 @@ impl PipelineSession {
         }
     }
 
-    fn parse_cached(&mut self, key: &ParsedCacheKey, source: &str) -> Result<Arc<ParsedHtml>, PipelineError> {
+    fn parse_cached(
+        &mut self,
+        key: &ParsedCacheKey,
+        source: &str,
+    ) -> Result<Arc<ParsedHtml>, PipelineError> {
         if self.cache.parsed_matches(key) {
-            return Ok(self.cache.parsed.clone().expect("parsed html should exist when parsed key matches"));
+            return Ok(self
+                .cache
+                .parsed
+                .clone()
+                .expect("parsed html should exist when parsed key matches"));
         }
         let parsed = self.parse(source, key.markup_syntax)?;
         self.cache.parsed = Some(parsed.clone());
@@ -368,7 +515,11 @@ impl PipelineSession {
         Ok(parsed)
     }
 
-    fn refresh_resource_cache(&mut self, resource_revision: ResourceRevision, stylesheet_revision: StylesheetRevision) {
+    fn refresh_resource_cache(
+        &mut self,
+        resource_revision: ResourceRevision,
+        stylesheet_revision: StylesheetRevision,
+    ) {
         let cache_key = (resource_revision, stylesheet_revision);
         if self.cached_resource_key.as_ref() != Some(&cache_key) {
             self.cached_provider.clear();
@@ -378,48 +529,128 @@ impl PipelineSession {
 
     fn retained_bytes(&self) -> PipelineRetainedBytes {
         PipelineRetainedBytes {
-            parsed: self.cache.inputs.as_ref().map_or(0, |inputs| inputs.source.len()),
-            styled: self.cache.prepared.as_ref().map_or(0, |prepared| prepared.memory_usage_bytes()),
-            shaped: self.cache.shaped.as_ref().map_or(0, |shaped| shaped.memory_usage_bytes()),
-            laid_out: self.cache.laid_out.as_ref().map_or(0, |laid_out| laid_out.memory_usage_bytes()),
+            parsed: self
+                .cache
+                .inputs
+                .as_ref()
+                .map_or(0, |inputs| inputs.source.len()),
+            styled: self
+                .cache
+                .prepared
+                .as_ref()
+                .map_or(0, |prepared| prepared.memory_usage_bytes()),
+            shaped: self
+                .cache
+                .shaped
+                .as_ref()
+                .map_or(0, |shaped| shaped.memory_usage_bytes()),
+            laid_out: self
+                .cache
+                .laid_out
+                .as_ref()
+                .map_or(0, |laid_out| laid_out.memory_usage_bytes()),
         }
     }
 
-    fn parse(&mut self, source: &str, syntax: MarkupSyntax) -> Result<Arc<ParsedHtml>, PipelineError> {
+    fn parse(
+        &mut self,
+        source: &str,
+        syntax: MarkupSyntax,
+    ) -> Result<Arc<ParsedHtml>, PipelineError> {
         let started = Instant::now();
-        let result = parse_document(source, syntax).map(Arc::new).map_err(|error| PipelineError(error.to_string()));
-        println!("HTML_PIPELINE_PARSE bytes={} duration_ms={}", source.len(), started.elapsed().as_millis());
+        let result = parse_document(source, syntax)
+            .map(Arc::new)
+            .map_err(|error| PipelineError(error.to_string()));
+        println!(
+            "HTML_PIPELINE_PARSE bytes={} duration_ms={}",
+            source.len(),
+            started.elapsed().as_millis()
+        );
         result
     }
 
     fn media_match_changed(&self, requested_inputs: &PipelineInputs) -> bool {
-        let Some(previous_inputs) = self.cache.inputs.as_ref() else { return false };
+        let Some(previous_inputs) = self.cache.inputs.as_ref() else {
+            return false;
+        };
         if previous_inputs.style_environment.media == requested_inputs.style_environment.media {
             return false;
         }
-        let (Some(media_queries), Some(previous_key)) = (self.cache.media_queries.as_ref(), self.cache.media_match_key.as_ref()) else {
+        let (Some(media_queries), Some(previous_key)) = (
+            self.cache.media_queries.as_ref(),
+            self.cache.media_match_key.as_ref(),
+        ) else {
             return true;
         };
         if media_queries.uses_viewport_units() {
             return true;
         }
-        media_queries.match_key(requested_inputs.style_environment.media, f64::from(requested_inputs.style_environment.root_font_size)) != *previous_key
+        media_queries.match_key(
+            requested_inputs.style_environment.media,
+            f64::from(requested_inputs.style_environment.root_font_size),
+        ) != *previous_key
     }
 
-    fn prepare_from_cache_or_rebuild(&mut self, parsed: &Arc<ParsedHtml>, requested_prepared_key: &PreparedCacheKey, user_styles: &[String]) -> (PreparedDocument, Option<MediaQuerySet>) {
+    pub fn media_environment_change_affects_style(
+        &self,
+        media: crate::MediaEnvironment,
+        root_font_size: u32,
+    ) -> bool {
+        let Some(previous_inputs) = self.cache.inputs.as_ref() else {
+            return true;
+        };
+        if previous_inputs.style_environment.media == media {
+            return false;
+        }
+        let (Some(media_queries), Some(previous_key)) = (
+            self.cache.media_queries.as_ref(),
+            self.cache.media_match_key.as_ref(),
+        ) else {
+            return true;
+        };
+        media_queries.uses_viewport_units()
+            || media_queries.match_key(media, f64::from(root_font_size)) != *previous_key
+    }
+
+    fn prepare_from_cache_or_rebuild(
+        &mut self,
+        parsed: &Arc<ParsedHtml>,
+        requested_prepared_key: &PreparedCacheKey,
+        user_styles: &[String],
+    ) -> (PreparedDocument, Option<MediaQuerySet>) {
         if self.cache.prepared_matches(requested_prepared_key) {
-            debug_assert_eq!(self.cache.prepared_key.as_ref(), Some(requested_prepared_key));
-            return (self.cache.prepared.clone().expect("prepared document should exist when prepared key matches"), None);
+            debug_assert_eq!(
+                self.cache.prepared_key.as_ref(),
+                Some(requested_prepared_key)
+            );
+            return (
+                self.cache
+                    .prepared
+                    .clone()
+                    .expect("prepared document should exist when prepared key matches"),
+                None,
+            );
         }
         let user_styles = user_styles.iter().map(String::as_str).collect::<Vec<_>>();
-        let (prepared, media_queries) = self.factory.build_pipeline_from_parsed_with_media_queries(parsed.as_ref(), &user_styles);
+        let (prepared, media_queries) = self
+            .factory
+            .build_pipeline_from_parsed_with_media_queries(parsed.as_ref(), &user_styles);
         (prepared, Some(media_queries))
     }
 
-    fn shape_from_cache_or_rebuild(&mut self, prepared: &PreparedDocument, requested_shaped_key: &ShapedCacheKey, glyph_shaper: &mut impl LayoutGlyphShaper) -> Result<ShapedDocument, PipelineError> {
+    fn shape_from_cache_or_rebuild(
+        &mut self,
+        prepared: &PreparedDocument,
+        requested_shaped_key: &ShapedCacheKey,
+        glyph_shaper: &mut impl LayoutGlyphShaper,
+    ) -> Result<ShapedDocument, PipelineError> {
         if self.cache.shaped_matches(requested_shaped_key) {
             debug_assert_eq!(self.cache.shaped_key.as_ref(), Some(requested_shaped_key));
-            return self.cache.shaped.clone().ok_or_else(|| PipelineError("cached shaped document missing".to_owned()));
+            return self
+                .cache
+                .shaped
+                .clone()
+                .ok_or_else(|| PipelineError("cached shaped document missing".to_owned()));
         }
         // Reshaping the page replaces the shaper's resources, so anything notes
         // appended to the old ones is gone with them.
@@ -428,18 +659,27 @@ impl PipelineSession {
     }
 
     fn relayout_laid_out(
-        &mut self, constraints: LayoutConstraintsOutput, image_metrics: &html_layout::ImageMetrics, requested_shaped_key: &ShapedCacheKey, requested_layout_key: &LayoutCacheKey, shaped: &ShapedDocument,
+        &mut self,
+        constraints: LayoutConstraintsOutput,
+        image_metrics: &html_layout::ImageMetrics,
+        requested_shaped_key: &ShapedCacheKey,
+        requested_layout_key: &LayoutCacheKey,
+        shaped: &ShapedDocument,
         glyph_shaper: &mut impl LayoutGlyphShaper,
     ) -> Result<(), PipelineError> {
-        let can_relayout = self.cache.laid_out.is_some() && self.cache.shaped_matches(requested_shaped_key);
+        let can_relayout =
+            self.cache.laid_out.is_some() && self.cache.shaped_matches(requested_shaped_key);
         match self.cache.laid_out.as_mut() {
             Some(laid_out) if can_relayout => {
                 debug_assert_eq!(self.cache.shaped_key.as_ref(), Some(requested_shaped_key));
-                laid_out.relayout_with_metrics_and_shaper(constraints, image_metrics, glyph_shaper).map_err(|error| PipelineError(error.to_string()))?;
+                laid_out
+                    .relayout_with_metrics_and_shaper(constraints, image_metrics, glyph_shaper)
+                    .map_err(|error| PipelineError(error.to_string()))?;
                 self.cache.laid_out_key = Some(requested_layout_key.clone());
             }
             _ => {
-                let laid_out = self.layout_exact(shaped.clone(), constraints, image_metrics, glyph_shaper)?;
+                let laid_out =
+                    self.layout_exact(shaped.clone(), constraints, image_metrics, glyph_shaper)?;
                 self.cache.laid_out = Some(laid_out);
                 self.cache.laid_out_key = Some(requested_layout_key.clone());
             }
@@ -447,21 +687,48 @@ impl PipelineSession {
         Ok(())
     }
 
-    fn layout_exact(&self, shaped: ShapedDocument, constraints: LayoutConstraintsOutput, image_metrics: &html_layout::ImageMetrics, glyph_shaper: &mut impl LayoutGlyphShaper) -> Result<LaidOutDocument, PipelineError> {
-        shaped.layout_with_metrics_and_shaper(constraints, image_metrics, glyph_shaper).map_err(|error| PipelineError(error.to_string()))
+    fn layout_exact(
+        &self,
+        shaped: ShapedDocument,
+        constraints: LayoutConstraintsOutput,
+        image_metrics: &html_layout::ImageMetrics,
+        glyph_shaper: &mut impl LayoutGlyphShaper,
+    ) -> Result<LaidOutDocument, PipelineError> {
+        shaped
+            .layout_with_metrics_and_shaper(constraints, image_metrics, glyph_shaper)
+            .map_err(|error| PipelineError(error.to_string()))
     }
 
-    fn shape(&mut self, prepared: &PreparedDocument, glyph_shaper: &mut impl LayoutGlyphShaper) -> Result<ShapedDocument, PipelineError> {
-        prepared.shape(glyph_shaper).map_err(|error| PipelineError(error.to_string()))
+    fn shape(
+        &mut self,
+        prepared: &PreparedDocument,
+        glyph_shaper: &mut impl LayoutGlyphShaper,
+    ) -> Result<ShapedDocument, PipelineError> {
+        prepared
+            .shape(glyph_shaper)
+            .map_err(|error| PipelineError(error.to_string()))
     }
 
     fn shape_and_layout(
-        &self, prepared: &PreparedDocument, constraints: LayoutConstraintsOutput, image_metrics: &html_layout::ImageMetrics, glyph_shaper: &mut impl LayoutGlyphShaper,
+        &self,
+        prepared: &PreparedDocument,
+        constraints: LayoutConstraintsOutput,
+        image_metrics: &html_layout::ImageMetrics,
+        glyph_shaper: &mut impl LayoutGlyphShaper,
     ) -> Result<(ShapedDocument, LaidOutDocument), PipelineError> {
-        prepared.shape_and_layout_with_metrics_and_shaper(constraints, image_metrics, glyph_shaper).map_err(|error| PipelineError(error.to_string()))
+        prepared
+            .shape_and_layout_with_metrics_and_shaper(constraints, image_metrics, glyph_shaper)
+            .map_err(|error| PipelineError(error.to_string()))
     }
 
-    fn validate_cache_against_requested(&self, parsed_key: &ParsedCacheKey, prepared_key: &PreparedCacheKey, shaped_key: &ShapedCacheKey, layout_key: &LayoutCacheKey, render_only_key: &RenderOnlyCacheKey) {
+    fn validate_cache_against_requested(
+        &self,
+        parsed_key: &ParsedCacheKey,
+        prepared_key: &PreparedCacheKey,
+        shaped_key: &ShapedCacheKey,
+        layout_key: &LayoutCacheKey,
+        render_only_key: &RenderOnlyCacheKey,
+    ) {
         if self.cache.inputs.is_none() {
             return;
         }
@@ -481,7 +748,10 @@ impl PipelineSession {
             debug_assert_eq!(self.cache.laid_out_key.as_ref(), Some(layout_key));
         }
         if self.cache.laid_out.is_some() {
-            debug_assert_eq!(self.cache.laid_out_key.as_ref(), Some(&render_only_key.layout));
+            debug_assert_eq!(
+                self.cache.laid_out_key.as_ref(),
+                Some(&render_only_key.layout)
+            );
         }
     }
 
@@ -496,7 +766,12 @@ impl PipelineSession {
     ///
     /// Returns `None` before the first successful update, or when `id` names no
     /// element.
-    pub fn layout_note(&mut self, id: &str, constraints: LayoutConstraintsOutput, glyph_shaper: &mut impl LayoutGlyphShaper) -> Option<LaidOutDocument> {
+    pub fn layout_note(
+        &mut self,
+        id: &str,
+        constraints: LayoutConstraintsOutput,
+        glyph_shaper: &mut impl LayoutGlyphShaper,
+    ) -> Option<LaidOutDocument> {
         let inputs = self.cache.inputs.as_ref()?;
         let scoped = self.cache.prepared.as_ref()?.scoped_to_element_id(id)?;
         // Appended to the page's renderer resources rather than shaped as a
@@ -504,7 +779,14 @@ impl PipelineSession {
         // which are still referenced by what is on screen. Every note appends,
         // so the seed is whatever the last one left behind.
         let base = self.notes_shaped.as_ref().or(self.cache.shaped.as_ref())?;
-        let (shaped, laid_out) = scoped.shape_and_layout_into_active_resources(base, constraints, &inputs.image_metrics, glyph_shaper).ok()?;
+        let (shaped, laid_out) = scoped
+            .shape_and_layout_into_active_resources(
+                base,
+                constraints,
+                &inputs.image_metrics,
+                glyph_shaper,
+            )
+            .ok()?;
         self.notes_shaped = Some(shaped);
         Some(laid_out)
     }
@@ -512,7 +794,11 @@ impl PipelineSession {
     /// Ids of the note bodies in the current document, in document order.
     /// Empty before the first successful update.
     pub fn note_ids(&self) -> Vec<&str> {
-        self.cache.prepared.as_ref().map(PreparedDocument::note_ids).unwrap_or_default()
+        self.cache
+            .prepared
+            .as_ref()
+            .map(PreparedDocument::note_ids)
+            .unwrap_or_default()
     }
 
     pub fn document(&self) -> Option<&LaidOutDocument> {
@@ -535,31 +821,56 @@ struct RevisionCachedResourceProvider {
 
 impl RevisionCachedResourceProvider {
     fn new(inner: Arc<dyn ResourceProvider>) -> Self {
-        Self { inner, bytes: Mutex::new(HashMap::new()), strings: Mutex::new(HashMap::new()) }
+        Self {
+            inner,
+            bytes: Mutex::new(HashMap::new()),
+            strings: Mutex::new(HashMap::new()),
+        }
     }
 
     fn clear(&self) {
         self.bytes.lock().expect("resource byte cache lock").clear();
-        self.strings.lock().expect("resource string cache lock").clear();
+        self.strings
+            .lock()
+            .expect("resource string cache lock")
+            .clear();
     }
 }
 
 impl ResourceProvider for RevisionCachedResourceProvider {
     fn read_bytes(&self, uri: &str) -> io::Result<Vec<u8>> {
-        if let Some(bytes) = self.bytes.lock().expect("resource byte cache lock").get(uri).cloned() {
+        if let Some(bytes) = self
+            .bytes
+            .lock()
+            .expect("resource byte cache lock")
+            .get(uri)
+            .cloned()
+        {
             return Ok(bytes);
         }
         let bytes = self.inner.read_bytes(uri)?;
-        self.bytes.lock().expect("resource byte cache lock").insert(uri.to_owned(), bytes.clone());
+        self.bytes
+            .lock()
+            .expect("resource byte cache lock")
+            .insert(uri.to_owned(), bytes.clone());
         Ok(bytes)
     }
 
     fn read_string(&self, uri: &str) -> io::Result<String> {
-        if let Some(string) = self.strings.lock().expect("resource string cache lock").get(uri).cloned() {
+        if let Some(string) = self
+            .strings
+            .lock()
+            .expect("resource string cache lock")
+            .get(uri)
+            .cloned()
+        {
             return Ok(string);
         }
         let string = self.inner.read_string(uri)?;
-        self.strings.lock().expect("resource string cache lock").insert(uri.to_owned(), string.clone());
+        self.strings
+            .lock()
+            .expect("resource string cache lock")
+            .insert(uri.to_owned(), string.clone());
         Ok(string)
     }
 
@@ -601,8 +912,10 @@ fn to_layout_constraints(requested: LayoutConstraints) -> LayoutConstraintsOutpu
 mod tests {
     use super::{PipelineSession, to_layout_constraints};
     use crate::{
-        EarliestStage, FontEnvironmentRevision, FontEnvironmentRevision as FontEnv, ImageMetricsRevision, LayoutConstraints, MarkupSyntax, MediaEnvironment, PaintSettingsRevision, PipelineChange, PipelineError, PipelineInputs,
-        ResourceRevision, Reuse, SourceRevision, StyleEnvironment, StylesheetRevision,
+        EarliestStage, FontEnvironmentRevision, FontEnvironmentRevision as FontEnv,
+        ImageMetricsRevision, LayoutConstraints, MarkupSyntax, MediaEnvironment,
+        PaintSettingsRevision, PipelineChange, PipelineError, PipelineInputs, ResourceRevision,
+        Reuse, SourceRevision, StyleEnvironment, StylesheetRevision,
     };
     use html_layout::{GlyphId, GlyphMetric, GlyphShaper as LayoutGlyphShaper, LaidOutDocument};
     use html_resources::ResourceProvider;
@@ -617,7 +930,10 @@ mod tests {
 
     impl ResourceProvider for MockProvider {
         fn read_bytes(&self, _uri: &str) -> io::Result<Vec<u8>> {
-            Err(io::Error::new(io::ErrorKind::NotFound, "no resources in mock provider"))
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no resources in mock provider",
+            ))
         }
 
         fn exists(&self, _uri: &str) -> bool {
@@ -641,7 +957,10 @@ mod tests {
 
     impl MutableProvider {
         fn put_bytes(&self, path: &str, bytes: Vec<u8>) {
-            self.resources.lock().expect("resource lock").insert(path.to_owned(), bytes);
+            self.resources
+                .lock()
+                .expect("resource lock")
+                .insert(path.to_owned(), bytes);
         }
 
         fn read_count(&self) -> usize {
@@ -653,11 +972,17 @@ mod tests {
         fn read_bytes(&self, uri: &str) -> io::Result<Vec<u8>> {
             *self.reads.lock().expect("read count lock") += 1;
             let resources = self.resources.lock().expect("resource lock");
-            resources.get(uri).cloned().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, uri.to_owned()))
+            resources
+                .get(uri)
+                .cloned()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, uri.to_owned()))
         }
 
         fn exists(&self, uri: &str) -> bool {
-            self.resources.lock().expect("resource lock").contains_key(uri)
+            self.resources
+                .lock()
+                .expect("resource lock")
+                .contains_key(uri)
         }
 
         fn resolve(&self, _base: &str, href: &str) -> String {
@@ -681,7 +1006,14 @@ mod tests {
         }
 
         fn shape_glyph<'a>(
-            &mut self, glyph_metrics: &mut html_layout::GlyphRegistry<'a>, ch: char, font_size: f32, _font_weight: u16, _font_slant: html_layout::FontSlant, _color: u32, _family: Option<&str>,
+            &mut self,
+            glyph_metrics: &mut html_layout::GlyphRegistry<'a>,
+            ch: char,
+            font_size: f32,
+            _font_weight: u16,
+            _font_slant: html_layout::FontSlant,
+            _color: u32,
+            _family: Option<&str>,
         ) -> Result<GlyphId, html_layout::ShapeError> {
             let _ = glyph_metrics;
             self.calls += 1;
@@ -692,8 +1024,11 @@ mod tests {
 
             let idx = u32::try_from(self.cache.len()).expect("glyph ids must fit");
             let glyph = idx;
-            let metric = GlyphMetric::try_new(ch, 1.0, 1.0, 0.0, 0.0).expect("deterministic metrics must be valid");
-            glyph_metrics.register(metric).expect("glyph metrics registry capacity should not be exceeded");
+            let metric = GlyphMetric::try_new(ch, 1.0, 1.0, 0.0, 0.0)
+                .expect("deterministic metrics must be valid");
+            glyph_metrics
+                .register(metric)
+                .expect("glyph metrics registry capacity should not be exceeded");
             self.cache.insert(key, glyph);
             Ok(glyph)
         }
@@ -710,7 +1045,14 @@ mod tests {
         }
 
         fn shape_glyph<'a>(
-            &mut self, glyph_metrics: &mut html_layout::GlyphRegistry<'a>, ch: char, font_size: f32, _font_weight: u16, _font_slant: html_layout::FontSlant, _color: u32, _family: Option<&str>,
+            &mut self,
+            glyph_metrics: &mut html_layout::GlyphRegistry<'a>,
+            ch: char,
+            font_size: f32,
+            _font_weight: u16,
+            _font_slant: html_layout::FontSlant,
+            _color: u32,
+            _family: Option<&str>,
         ) -> Result<GlyphId, html_layout::ShapeError> {
             let key = (ch, font_size.to_bits());
             if let Some(&glyph) = self.cache.get(&key) {
@@ -720,8 +1062,11 @@ mod tests {
             let idx = u32::try_from(self.cache.len()).expect("glyph ids must fit");
             let glyph = idx;
             let width = font_size.max(1.0) * 0.75;
-            let metric = GlyphMetric::try_new(ch, width, font_size, font_size * 0.2, 0.0).expect("deterministic metrics must be valid");
-            glyph_metrics.register(metric).expect("glyph metrics registry capacity should not be exceeded");
+            let metric = GlyphMetric::try_new(ch, width, font_size, font_size * 0.2, 0.0)
+                .expect("deterministic metrics must be valid");
+            glyph_metrics
+                .register(metric)
+                .expect("glyph metrics registry capacity should not be exceeded");
             self.cache.insert(key, glyph);
             Ok(glyph)
         }
@@ -743,8 +1088,14 @@ mod tests {
         }
 
         fn begin_document_shaping(&mut self) {
-            assert!(self.previous_document.is_none(), "document shaping transactions cannot be nested");
-            self.previous_document = Some((std::mem::take(&mut self.cache), std::mem::take(&mut self.resources)));
+            assert!(
+                self.previous_document.is_none(),
+                "document shaping transactions cannot be nested"
+            );
+            self.previous_document = Some((
+                std::mem::take(&mut self.cache),
+                std::mem::take(&mut self.resources),
+            ));
         }
 
         fn commit_document_shaping(&mut self) {
@@ -759,25 +1110,42 @@ mod tests {
         }
 
         fn shape_glyph<'a>(
-            &mut self, glyph_metrics: &mut html_layout::GlyphRegistry<'a>, ch: char, font_size: f32, _font_weight: u16, _font_slant: html_layout::FontSlant, _color: u32, _family: Option<&str>,
+            &mut self,
+            glyph_metrics: &mut html_layout::GlyphRegistry<'a>,
+            ch: char,
+            font_size: f32,
+            _font_weight: u16,
+            _font_slant: html_layout::FontSlant,
+            _color: u32,
+            _family: Option<&str>,
         ) -> Result<GlyphId, html_layout::ShapeError> {
             if self.fail_on == Some(ch) {
-                return Err(html_layout::ShapeError::unregistered_glyph_id(u32::MAX, glyph_metrics.len()));
+                return Err(html_layout::ShapeError::unregistered_glyph_id(
+                    u32::MAX,
+                    glyph_metrics.len(),
+                ));
             }
             let key = (ch, font_size.to_bits());
             if let Some(&glyph) = self.cache.get(&key) {
                 return Ok(glyph);
             }
-            let metric = GlyphMetric::try_new(ch, 1.0, 1.0, 0.0, 0.0).expect("test metrics must be valid");
+            let metric =
+                GlyphMetric::try_new(ch, 1.0, 1.0, 0.0, 0.0).expect("test metrics must be valid");
             let glyph = glyph_metrics.register(metric)?;
             self.cache.insert(key, glyph);
             self.resources.push(ch);
             Ok(glyph)
         }
 
-        fn measure_line(&mut self, request: html_layout::TextShapeRequest<'_>) -> Result<Option<html_layout::ShapedTextRun>, html_layout::ShapeError> {
+        fn measure_line(
+            &mut self,
+            request: html_layout::TextShapeRequest<'_>,
+        ) -> Result<Option<html_layout::ShapedTextRun>, html_layout::ShapeError> {
             if self.fail_measurement {
-                return Err(html_layout::ShapeError::unregistered_glyph_id(u32::MAX, request.text_range().len()));
+                return Err(html_layout::ShapeError::unregistered_glyph_id(
+                    u32::MAX,
+                    request.text_range().len(),
+                ));
             }
             Ok(None)
         }
@@ -811,7 +1179,13 @@ mod tests {
 
     fn glyph_text(document: &LaidOutDocument) -> String {
         let text = document.render_view().text();
-        (0..text.glyph_count()).filter_map(|index| text.glyph_at(index).and_then(|glyph| text.glyph_metric(glyph)).map(|metric| metric.ch())).collect()
+        (0..text.glyph_count())
+            .filter_map(|index| {
+                text.glyph_at(index)
+                    .and_then(|glyph| text.glyph_metric(glyph))
+                    .map(|metric| metric.ch())
+            })
+            .collect()
     }
 
     #[test]
@@ -821,39 +1195,63 @@ mod tests {
         let mut shaper = TracingShaper::default();
         let mut inputs = base_inputs(SOURCE, SourceRevision::INITIAL);
         inputs.note_flow = html_layout::NoteFlow::Excluded;
-        session.update(inputs, &mut shaper).expect("pipeline update should succeed");
+        session
+            .update(inputs, &mut shaper)
+            .expect("pipeline update should succeed");
 
         let flow = glyph_text(session.document().expect("a document"));
         assert!(flow.contains("Reading") && flow.contains("Continues"));
-        assert!(!flow.contains("zebra"), "an excluded note must not consume the reading flow");
+        assert!(
+            !flow.contains("zebra"),
+            "an excluded note must not consume the reading flow"
+        );
 
         assert_eq!(session.note_ids(), vec!["n"]);
 
         // The note is still reachable: scoped layout gives an embedder the
         // content it held back, under its own width.
-        let constraints = html_layout::LayoutConstraints::new(200.0, 20.0).expect("valid constraints");
-        let note = session.layout_note("n", constraints, &mut shaper).expect("the held-back note must lay out on demand");
-        assert!(glyph_text(&note).contains("zebra"), "scoped layout produces the note's own content");
-        assert!(!glyph_text(&note).contains("Reading"), "a scoped note is only its own subtree");
+        let constraints =
+            html_layout::LayoutConstraints::new(200.0, 20.0).expect("valid constraints");
+        let note = session
+            .layout_note("n", constraints, &mut shaper)
+            .expect("the held-back note must lay out on demand");
+        assert!(
+            glyph_text(&note).contains("zebra"),
+            "scoped layout produces the note's own content"
+        );
+        assert!(
+            !glyph_text(&note).contains("Reading"),
+            "a scoped note is only its own subtree"
+        );
 
-        assert!(session.layout_note("absent", constraints, &mut shaper).is_none(), "an id that names nothing lays out nothing");
+        assert!(
+            session
+                .layout_note("absent", constraints, &mut shaper)
+                .is_none(),
+            "an id that names nothing lays out nothing"
+        );
     }
 
     #[test]
     fn pipeline_selects_strict_xml_for_xhtml_uris() {
         let mut session = PipelineSession::new(Arc::new(MockProvider));
         let mut shaper = TracingShaper::default();
-        let malformed = "<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><p>broken</body></html>";
+        let malformed =
+            "<html xmlns=\"http://www.w3.org/1999/xhtml\"><body><p>broken</body></html>";
 
         let mut xhtml_inputs = base_inputs(malformed, SourceRevision::INITIAL);
         xhtml_inputs.base_uri = "reference.xht".to_owned();
         xhtml_inputs.markup_syntax = MarkupSyntax::Xml;
-        let error = session.update(xhtml_inputs, &mut shaper).expect_err("XHTML must not use HTML recovery");
+        let error = session
+            .update(xhtml_inputs, &mut shaper)
+            .expect_err("XHTML must not use HTML recovery");
         assert!(error.to_string().contains("XML parse error"));
 
         let mut html_inputs = base_inputs(malformed, SourceRevision::INITIAL.next());
         html_inputs.base_uri = "reference.html".to_owned();
-        session.update(html_inputs, &mut shaper).expect("HTML continues to use html5ever recovery");
+        session
+            .update(html_inputs, &mut shaper)
+            .expect("HTML continues to use html5ever recovery");
     }
 
     #[test]
@@ -866,11 +1264,30 @@ mod tests {
         );
         inputs.base_uri = "reference.xhtml".to_owned();
         inputs.markup_syntax = MarkupSyntax::Xml;
-        session.update(inputs, &mut shaper).expect("well-formed XHTML pipeline");
-        let colors = session.document().expect("the XML pipeline produced a document").render_view().fragments().decorations().iter().map(|fragment| fragment.color()).collect::<Vec<_>>();
-        assert!(colors.contains(&0x008000FF), "CDATA rules must reach computed paint values");
-        assert!(colors.contains(&0x0000FFFF), "the first sibling must retain the type-selector background");
-        assert!(colors.contains(&0xFFA500FF), "the adjacent-sibling selector must style the second sibling; colors={colors:#x?}");
+        session
+            .update(inputs, &mut shaper)
+            .expect("well-formed XHTML pipeline");
+        let colors = session
+            .document()
+            .expect("the XML pipeline produced a document")
+            .render_view()
+            .fragments()
+            .decorations()
+            .iter()
+            .map(|fragment| fragment.color())
+            .collect::<Vec<_>>();
+        assert!(
+            colors.contains(&0x008000FF),
+            "CDATA rules must reach computed paint values"
+        );
+        assert!(
+            colors.contains(&0x0000FFFF),
+            "the first sibling must retain the type-selector background"
+        );
+        assert!(
+            colors.contains(&0xFFA500FF),
+            "the adjacent-sibling selector must style the second sibling; colors={colors:#x?}"
+        );
     }
 
     #[test]
@@ -889,11 +1306,15 @@ mod tests {
         inputs.markup_syntax = MarkupSyntax::Xml;
         inputs.layout.viewport_width = 800.0;
         inputs.layout.viewport_height = Some(600.0);
-        session.update(inputs, &mut shaper).expect("well-formed XHTML pipeline");
+        session
+            .update(inputs, &mut shaper)
+            .expect("well-formed XHTML pipeline");
 
         let view = session.document().expect("XHTML document").render_view();
         let size_for = |id| {
-            let index = (0..view.boxes().len()).find(|&idx| view.boxes().id(idx).map(|value| view.string(value)) == Some(id)).expect("identified layout box");
+            let index = (0..view.boxes().len())
+                .find(|&idx| view.boxes().id(idx).map(|value| view.string(value)) == Some(id))
+                .expect("identified layout box");
             view.boxes().size(index).expect("box geometry")
         };
         assert_eq!(size_for("inner").width, 120.0);
@@ -911,19 +1332,34 @@ mod tests {
         inputs.base_uri = "reference.xht".to_owned();
         inputs.markup_syntax = MarkupSyntax::Xml;
         inputs.layout.viewport_width = 300.0;
-        session.update(inputs.clone(), &mut shaper).expect("initial XHTML pipeline");
+        session
+            .update(inputs.clone(), &mut shaper)
+            .expect("initial XHTML pipeline");
         inputs.layout.viewport_height = Some(600.0);
-        inputs.style_environment.media = MediaEnvironment::screen(300.0, Some(600.0)).expect("valid viewport");
-        session.update(inputs, &mut shaper).expect("viewport relayout");
+        inputs.style_environment.media =
+            MediaEnvironment::screen(300.0, Some(600.0)).expect("valid viewport");
+        session
+            .update(inputs, &mut shaper)
+            .expect("viewport relayout");
 
-        let view = session.document().expect("the XML pipeline produced a document").render_view();
+        let view = session
+            .document()
+            .expect("the XML pipeline produced a document")
+            .render_view();
         let size_for = |id| {
-            let index = (0..view.boxes().len()).find(|&idx| view.boxes().id(idx).map(|value| view.string(value)) == Some(id)).expect("identified layout box");
+            let index = (0..view.boxes().len())
+                .find(|&idx| view.boxes().id(idx).map(|value| view.string(value)) == Some(id))
+                .expect("identified layout box");
             view.boxes().size(index).expect("box geometry")
         };
         assert_eq!(size_for("body").height, 600.0);
         assert_eq!(size_for("child").height, 600.0);
-        let green = view.fragments().decorations().iter().find(|fragment| fragment.color() == 0x008000FF).expect("green child background");
+        let green = view
+            .fragments()
+            .decorations()
+            .iter()
+            .find(|fragment| fragment.color() == 0x008000FF)
+            .expect("green child background");
         assert_eq!(green.rect().height(), 600.0);
     }
 
@@ -939,12 +1375,31 @@ mod tests {
         inputs.markup_syntax = MarkupSyntax::Xml;
         inputs.layout.viewport_width = 800.0;
         inputs.layout.viewport_height = Some(600.0);
-        session.update(inputs, &mut shaper).expect("well-formed XHTML pipeline");
+        session
+            .update(inputs, &mut shaper)
+            .expect("well-formed XHTML pipeline");
 
-        let lines = session.document().expect("XHTML document").render_view().text().lines().iter().map(|line| line.point()).collect::<Vec<_>>();
-        let min_y = lines.iter().map(|point| point.y).fold(f64::INFINITY, f64::min);
-        let max_y = lines.iter().map(|point| point.y).fold(f64::NEG_INFINITY, f64::max);
-        assert!((max_y - min_y).abs() < 0.01, "top:0 XHTML text must translate to the earlier table content: {lines:?}");
+        let lines = session
+            .document()
+            .expect("XHTML document")
+            .render_view()
+            .text()
+            .lines()
+            .iter()
+            .map(|line| line.point())
+            .collect::<Vec<_>>();
+        let min_y = lines
+            .iter()
+            .map(|point| point.y)
+            .fold(f64::INFINITY, f64::min);
+        let max_y = lines
+            .iter()
+            .map(|point| point.y)
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!(
+            (max_y - min_y).abs() < 0.01,
+            "top:0 XHTML text must translate to the earlier table content: {lines:?}"
+        );
     }
 
     #[test]
@@ -959,10 +1414,17 @@ mod tests {
         inputs.markup_syntax = MarkupSyntax::Xml;
         inputs.layout.viewport_width = 500.0;
         inputs.image_metrics.set(0, 96, 96);
-        session.update(inputs, &mut shaper).expect("well-formed XHTML pipeline");
+        session
+            .update(inputs, &mut shaper)
+            .expect("well-formed XHTML pipeline");
 
-        let view = session.document().expect("the XML pipeline produced a document").render_view();
-        let target = (0..view.boxes().len()).find(|&idx| view.boxes().id(idx).map(|value| view.string(value)) == Some("target")).expect("image layout box");
+        let view = session
+            .document()
+            .expect("the XML pipeline produced a document")
+            .render_view();
+        let target = (0..view.boxes().len())
+            .find(|&idx| view.boxes().id(idx).map(|value| view.string(value)) == Some("target"))
+            .expect("image layout box");
         let size = view.boxes().size(target).expect("image box size");
         assert_eq!((size.width, size.height), (500.0, 1.0));
     }
@@ -971,19 +1433,38 @@ mod tests {
     fn failed_document_shaping_restores_cached_document_and_renderer_resources() {
         let mut session = PipelineSession::new(Arc::new(MockProvider));
         let mut shaper = TransactionalShaper::default();
-        let original_inputs = base_inputs("<html><body><p>original document</p></body></html>", SourceRevision::INITIAL);
-        session.update(original_inputs.clone(), &mut shaper).expect("initial update");
+        let original_inputs = base_inputs(
+            "<html><body><p>original document</p></body></html>",
+            SourceRevision::INITIAL,
+        );
+        session
+            .update(original_inputs.clone(), &mut shaper)
+            .expect("initial update");
         let original_document = build_snapshot(session.document().expect("initial document"));
         let original_resources = shaper.resources.clone();
         let original_layout_key = session.cache.laid_out_key.clone();
 
         shaper.fail_on = Some('!');
-        let replacement = base_inputs("<html><body><p>replacement!</p></body></html>", SourceRevision::INITIAL.next());
-        session.update(replacement, &mut shaper).expect_err("replacement shaping must fail");
+        let replacement = base_inputs(
+            "<html><body><p>replacement!</p></body></html>",
+            SourceRevision::INITIAL.next(),
+        );
+        session
+            .update(replacement, &mut shaper)
+            .expect_err("replacement shaping must fail");
 
-        assert_eq!(build_snapshot(session.document().expect("cached document must remain")), original_document);
-        assert_eq!(shaper.resources, original_resources, "renderer resources must roll back with the document");
-        assert!(shaper.previous_document.is_none(), "the failed transaction must be closed");
+        assert_eq!(
+            build_snapshot(session.document().expect("cached document must remain")),
+            original_document
+        );
+        assert_eq!(
+            shaper.resources, original_resources,
+            "renderer resources must roll back with the document"
+        );
+        assert!(
+            shaper.previous_document.is_none(),
+            "the failed transaction must be closed"
+        );
         assert_eq!(session.cache.inputs.as_ref(), Some(&original_inputs));
         assert_eq!(session.cache.laid_out_key, original_layout_key);
     }
@@ -992,18 +1473,35 @@ mod tests {
     fn width_only_relayout_does_not_invoke_backend_line_measurement() {
         let mut session = PipelineSession::new(Arc::new(MockProvider));
         let mut shaper = TransactionalShaper::default();
-        let original_inputs = base_inputs("<html><body><p>text that wraps across several words</p></body></html>", SourceRevision::INITIAL);
-        session.update(original_inputs.clone(), &mut shaper).expect("initial update");
+        let original_inputs = base_inputs(
+            "<html><body><p>text that wraps across several words</p></body></html>",
+            SourceRevision::INITIAL,
+        );
+        session
+            .update(original_inputs.clone(), &mut shaper)
+            .expect("initial update");
         let original_document = build_snapshot(session.document().expect("initial document"));
         shaper.fail_measurement = true;
         let mut narrower = original_inputs.clone();
         narrower.layout.viewport_width = 10.0;
         let mut changed_layout = session.document().expect("initial document").clone();
-        changed_layout.relayout_with_metrics(to_layout_constraints(narrower.layout), &narrower.image_metrics);
-        assert_ne!(build_snapshot(&changed_layout), original_document, "the request must exercise geometry that differs from the cached layout");
-        session.update(narrower.clone(), &mut shaper).expect("layout must reuse authoritative document shaping");
+        changed_layout.relayout_with_metrics(
+            to_layout_constraints(narrower.layout),
+            &narrower.image_metrics,
+        );
+        assert_ne!(
+            build_snapshot(&changed_layout),
+            original_document,
+            "the request must exercise geometry that differs from the cached layout"
+        );
+        session
+            .update(narrower.clone(), &mut shaper)
+            .expect("layout must reuse authoritative document shaping");
 
-        assert_eq!(build_snapshot(session.document().expect("updated document")), build_snapshot(&changed_layout));
+        assert_eq!(
+            build_snapshot(session.document().expect("updated document")),
+            build_snapshot(&changed_layout)
+        );
         assert_eq!(session.cache.inputs.as_ref(), Some(&narrower));
     }
 
@@ -1015,14 +1513,28 @@ mod tests {
         let mut shaper = TracingShaper::default();
         let html = "<html><head><link rel=\"stylesheet\" href=\"theme.css\"></head><body><p>cached stylesheet</p></body></html>";
 
-        session.update(base_inputs(html, SourceRevision::INITIAL), &mut shaper).expect("initial update");
+        session
+            .update(base_inputs(html, SourceRevision::INITIAL), &mut shaper)
+            .expect("initial update");
         let mut source_changed = base_inputs(html, SourceRevision::INITIAL.next());
-        session.update(source_changed.clone(), &mut shaper).expect("source-only update");
-        assert_eq!(provider.read_count(), 1, "same resource and stylesheet revisions reuse CSS bytes");
+        session
+            .update(source_changed.clone(), &mut shaper)
+            .expect("source-only update");
+        assert_eq!(
+            provider.read_count(),
+            1,
+            "same resource and stylesheet revisions reuse CSS bytes"
+        );
 
         source_changed.resource_revision = ResourceRevision::INITIAL.next();
-        session.update(source_changed, &mut shaper).expect("resource revision update");
-        assert_eq!(provider.read_count(), 2, "resource revision invalidates CSS bytes");
+        session
+            .update(source_changed, &mut shaper)
+            .expect("resource revision update");
+        assert_eq!(
+            provider.read_count(),
+            2,
+            "resource revision invalidates CSS bytes"
+        );
     }
 
     fn build_snapshot(document: &LaidOutDocument) -> RenderSnapshot {
@@ -1052,7 +1564,9 @@ mod tests {
             glyphs,
             glyph_advances: (0..text.line_count())
                 .map(|line_idx| {
-                    let Some(runs) = text.line_glyph_advances(line_idx) else { return Vec::new() };
+                    let Some(runs) = text.line_glyph_advances(line_idx) else {
+                        return Vec::new();
+                    };
                     runs.iter()
                         .map(|run| {
                             let range = run.range();
@@ -1061,14 +1575,23 @@ mod tests {
                         .collect()
                 })
                 .collect(),
-            line_links: (0..text.glyph_count() as u32).map(|glyph_idx| addressing.link_for_glyph(glyph_idx)).collect(),
+            line_links: (0..text.glyph_count() as u32)
+                .map(|glyph_idx| addressing.link_for_glyph(glyph_idx))
+                .collect(),
             lines,
             decorations: fragments
                 .decorations()
                 .iter()
                 .map(|decoration| {
                     let rect = decoration.rect();
-                    DecorationSnapshot { x0_bits: rect.x0.to_bits(), y0_bits: rect.y0.to_bits(), x1_bits: rect.x1.to_bits(), y1_bits: rect.y1.to_bits(), color: decoration.color(), is_inline: decoration.is_inline() }
+                    DecorationSnapshot {
+                        x0_bits: rect.x0.to_bits(),
+                        y0_bits: rect.y0.to_bits(),
+                        x1_bits: rect.x1.to_bits(),
+                        y1_bits: rect.y1.to_bits(),
+                        color: decoration.color(),
+                        is_inline: decoration.is_inline(),
+                    }
                 })
                 .collect(),
             images: fragments
@@ -1160,20 +1683,41 @@ mod tests {
         let mut shaper = TracingShaper::default();
         let mut session = PipelineSession::new(Arc::new(MockProvider));
 
-        let mut baseline = base_inputs("<html><body><p>Hello world</p></body></html>", SourceRevision::INITIAL);
+        let mut baseline = base_inputs(
+            "<html><body><p>Hello world</p></body></html>",
+            SourceRevision::INITIAL,
+        );
         let update = session.update(baseline.clone(), &mut shaper).unwrap();
         assert_eq!(update.stage, EarliestStage::Parse);
-        assert_eq!(update.report.parsed, Reuse::recomputed(EarliestStage::Parse));
+        assert_eq!(
+            update.report.parsed,
+            Reuse::recomputed(EarliestStage::Parse)
+        );
 
         let shape_calls = shaper.calls;
         baseline.layout.viewport_width = 420.0;
         let layout_only = session.update(baseline.clone(), &mut shaper).unwrap();
         assert_eq!(layout_only.stage, EarliestStage::Layout);
-        assert_eq!(layout_only.report.parsed, Reuse::reused(EarliestStage::Layout));
-        assert_eq!(layout_only.report.styled, Reuse::reused(EarliestStage::Layout));
-        assert_eq!(layout_only.report.prepared, Reuse::reused(EarliestStage::Layout));
-        assert_eq!(layout_only.report.shaped, Reuse::reused(EarliestStage::Layout));
-        assert_eq!(layout_only.report.laid_out, Reuse::recomputed(EarliestStage::Layout));
+        assert_eq!(
+            layout_only.report.parsed,
+            Reuse::reused(EarliestStage::Layout)
+        );
+        assert_eq!(
+            layout_only.report.styled,
+            Reuse::reused(EarliestStage::Layout)
+        );
+        assert_eq!(
+            layout_only.report.prepared,
+            Reuse::reused(EarliestStage::Layout)
+        );
+        assert_eq!(
+            layout_only.report.shaped,
+            Reuse::reused(EarliestStage::Layout)
+        );
+        assert_eq!(
+            layout_only.report.laid_out,
+            Reuse::recomputed(EarliestStage::Layout)
+        );
         assert_eq!(shaper.calls, shape_calls);
     }
 
@@ -1182,18 +1726,36 @@ mod tests {
         let mut shaper = TracingShaper::default();
         let mut session = PipelineSession::new(Arc::new(MockProvider));
 
-        let mut update_inputs = base_inputs("<html><body><p>Glyphs: abcdef</p></body></html>", SourceRevision::INITIAL);
+        let mut update_inputs = base_inputs(
+            "<html><body><p>Glyphs: abcdef</p></body></html>",
+            SourceRevision::INITIAL,
+        );
         let _ = session.update(update_inputs.clone(), &mut shaper).unwrap();
         let before_calls = shaper.calls;
 
         update_inputs.font_environment = FontEnv::INITIAL.next();
         let font_update = session.update(update_inputs, &mut shaper).unwrap();
         assert_eq!(font_update.stage, EarliestStage::Shape);
-        assert_eq!(font_update.report.parsed, Reuse::reused(EarliestStage::Shape));
-        assert_eq!(font_update.report.styled, Reuse::reused(EarliestStage::Shape));
-        assert_eq!(font_update.report.prepared, Reuse::reused(EarliestStage::Shape));
-        assert_eq!(font_update.report.shaped, Reuse::recomputed(EarliestStage::Shape));
-        assert_eq!(font_update.report.laid_out, Reuse::recomputed(EarliestStage::Shape));
+        assert_eq!(
+            font_update.report.parsed,
+            Reuse::reused(EarliestStage::Shape)
+        );
+        assert_eq!(
+            font_update.report.styled,
+            Reuse::reused(EarliestStage::Shape)
+        );
+        assert_eq!(
+            font_update.report.prepared,
+            Reuse::reused(EarliestStage::Shape)
+        );
+        assert_eq!(
+            font_update.report.shaped,
+            Reuse::recomputed(EarliestStage::Shape)
+        );
+        assert_eq!(
+            font_update.report.laid_out,
+            Reuse::recomputed(EarliestStage::Shape)
+        );
         assert!(shaper.calls > before_calls);
     }
 
@@ -1207,25 +1769,44 @@ mod tests {
         };
         let changed_inputs = {
             let mut inputs = baseline_inputs.clone();
-            inputs.font_environment = FontEnvironmentRevision::next(baseline_inputs.font_environment);
+            inputs.font_environment =
+                FontEnvironmentRevision::next(baseline_inputs.font_environment);
             inputs
         };
 
         let mut shaper = SizedShaper::default();
         let mut session = PipelineSession::new(Arc::new(MockProvider));
-        let _ = session.update(baseline_inputs.clone(), &mut shaper).unwrap();
+        let _ = session
+            .update(baseline_inputs.clone(), &mut shaper)
+            .unwrap();
 
         let update = session.update(changed_inputs.clone(), &mut shaper).unwrap();
         assert_eq!(update.stage, EarliestStage::Shape);
         assert_eq!(update.report.styled, Reuse::reused(EarliestStage::Shape));
         assert_eq!(update.report.prepared, Reuse::reused(EarliestStage::Shape));
-        assert_eq!(update.report.shaped, Reuse::recomputed(EarliestStage::Shape));
-        assert_eq!(update.report.laid_out, Reuse::recomputed(EarliestStage::Shape));
-        let incremental = build_snapshot(session.document().expect("document should exist after backend-generation update"));
+        assert_eq!(
+            update.report.shaped,
+            Reuse::recomputed(EarliestStage::Shape)
+        );
+        assert_eq!(
+            update.report.laid_out,
+            Reuse::recomputed(EarliestStage::Shape)
+        );
+        let incremental = build_snapshot(
+            session
+                .document()
+                .expect("document should exist after backend-generation update"),
+        );
         let mut fresh_shaper = SizedShaper::default();
         let mut fresh_session = PipelineSession::new(Arc::new(MockProvider));
-        let _ = fresh_session.update(changed_inputs.clone(), &mut fresh_shaper).unwrap();
-        let fresh = build_snapshot(fresh_session.document().expect("document should exist after full rebuild"));
+        let _ = fresh_session
+            .update(changed_inputs.clone(), &mut fresh_shaper)
+            .unwrap();
+        let fresh = build_snapshot(
+            fresh_session
+                .document()
+                .expect("document should exist after full rebuild"),
+        );
 
         assert_eq!(incremental, fresh);
     }
@@ -1260,7 +1841,8 @@ mod tests {
             },
         ];
 
-        let incremental = update_and_snapshot(&updates).expect("incremental pipeline should succeed");
+        let incremental =
+            update_and_snapshot(&updates).expect("incremental pipeline should succeed");
         let fresh = {
             let mut shaper = TracingShaper::default();
             let mut session = PipelineSession::new(Arc::new(MockProvider));
@@ -1278,7 +1860,10 @@ mod tests {
         let mut shaper = TracingShaper::default();
         let mut session = PipelineSession::new(Arc::new(MockProvider));
 
-        let input = base_inputs("<html><body><p>layout stability test</p></body></html>", SourceRevision::INITIAL);
+        let input = base_inputs(
+            "<html><body><p>layout stability test</p></body></html>",
+            SourceRevision::INITIAL,
+        );
         let update = session.update(input.clone(), &mut shaper).unwrap();
         assert_eq!(update.stage, EarliestStage::Parse);
 
@@ -1315,16 +1900,28 @@ mod tests {
         inputs.style_environment.media = MediaEnvironment::screen(450.0, Some(800.0)).unwrap();
         let below_breakpoint = session.update(inputs.clone(), &mut shaper).unwrap();
         assert_eq!(below_breakpoint.stage, EarliestStage::Layout);
-        assert_eq!(below_breakpoint.report.styled, Reuse::reused(EarliestStage::Layout));
-        assert_eq!(below_breakpoint.report.prepared, Reuse::reused(EarliestStage::Layout));
+        assert_eq!(
+            below_breakpoint.report.styled,
+            Reuse::reused(EarliestStage::Layout)
+        );
+        assert_eq!(
+            below_breakpoint.report.prepared,
+            Reuse::reused(EarliestStage::Layout)
+        );
         assert_eq!(shaper.calls, initial_shape_calls);
 
         inputs.layout.viewport_width = 600.0;
         inputs.style_environment.media = MediaEnvironment::screen(600.0, Some(800.0)).unwrap();
         let crossing_breakpoint = session.update(inputs.clone(), &mut shaper).unwrap();
         assert_eq!(crossing_breakpoint.stage, EarliestStage::Style);
-        assert_eq!(crossing_breakpoint.report.styled, Reuse::recomputed(EarliestStage::Style));
-        assert_eq!(crossing_breakpoint.report.prepared, Reuse::recomputed(EarliestStage::Style));
+        assert_eq!(
+            crossing_breakpoint.report.styled,
+            Reuse::recomputed(EarliestStage::Style)
+        );
+        assert_eq!(
+            crossing_breakpoint.report.prepared,
+            Reuse::recomputed(EarliestStage::Style)
+        );
         assert!(shaper.calls > initial_shape_calls);
         let after_crossing_calls = shaper.calls;
 
@@ -1332,7 +1929,10 @@ mod tests {
         inputs.style_environment.media = MediaEnvironment::screen(650.0, Some(800.0)).unwrap();
         let above_breakpoint = session.update(inputs, &mut shaper).unwrap();
         assert_eq!(above_breakpoint.stage, EarliestStage::Layout);
-        assert_eq!(above_breakpoint.report.styled, Reuse::reused(EarliestStage::Layout));
+        assert_eq!(
+            above_breakpoint.report.styled,
+            Reuse::reused(EarliestStage::Layout)
+        );
         assert_eq!(shaper.calls, after_crossing_calls);
     }
 
@@ -1354,7 +1954,10 @@ mod tests {
         let update = session.update(inputs, &mut shaper).unwrap();
 
         assert_eq!(update.stage, EarliestStage::Style);
-        assert_eq!(update.report.styled, Reuse::recomputed(EarliestStage::Style));
+        assert_eq!(
+            update.report.styled,
+            Reuse::recomputed(EarliestStage::Style)
+        );
         assert!(shaper.calls > initial_shape_calls);
     }
 
@@ -1363,22 +1966,34 @@ mod tests {
         let mut shaper = TracingShaper::default();
         let mut session = PipelineSession::new(Arc::new(MockProvider));
 
-        let mut inputs = base_inputs("<html><body><p>one</p></body></html>", SourceRevision::INITIAL);
+        let mut inputs = base_inputs(
+            "<html><body><p>one</p></body></html>",
+            SourceRevision::INITIAL,
+        );
         let _ = session.update(inputs.clone(), &mut shaper).unwrap();
 
         inputs.stylesheet_revision = StylesheetRevision::next(inputs.stylesheet_revision);
         inputs.layout.viewport_width = 420.0;
         let update = session.update(inputs, &mut shaper).unwrap();
         assert_eq!(update.stage, EarliestStage::Prepare);
-        assert_eq!(update.report.styled, Reuse::recomputed(EarliestStage::Style));
-        assert_eq!(update.report.prepared, Reuse::recomputed(EarliestStage::Style));
+        assert_eq!(
+            update.report.styled,
+            Reuse::recomputed(EarliestStage::Style)
+        );
+        assert_eq!(
+            update.report.prepared,
+            Reuse::recomputed(EarliestStage::Style)
+        );
     }
 
     #[test]
     fn reader_user_styles_rebuild_prepared_document_without_reparsing() {
         let mut shaper = SizedShaper::default();
         let mut session = PipelineSession::new(Arc::new(MockProvider));
-        let mut inputs = base_inputs("<html><body><p>Text that wraps differently when enlarged.</p></body></html>", SourceRevision::INITIAL);
+        let mut inputs = base_inputs(
+            "<html><body><p>Text that wraps differently when enlarged.</p></body></html>",
+            SourceRevision::INITIAL,
+        );
         session.update(inputs.clone(), &mut shaper).unwrap();
         let baseline = build_snapshot(session.document().unwrap());
 
@@ -1395,7 +2010,10 @@ mod tests {
     fn typed_reader_overrides_apply_without_injecting_css() {
         let mut shaper = SizedShaper::default();
         let mut session = PipelineSession::new(Arc::new(MockProvider));
-        let mut inputs = base_inputs("<html><body><p style='font-size: 9px; line-height: 1'>Text that wraps after reader overrides.</p></body></html>", SourceRevision::INITIAL);
+        let mut inputs = base_inputs(
+            "<html><body><p style='font-size: 9px; line-height: 1'>Text that wraps after reader overrides.</p></body></html>",
+            SourceRevision::INITIAL,
+        );
         session.update(inputs.clone(), &mut shaper).unwrap();
         let baseline = build_snapshot(session.document().unwrap());
 
@@ -1416,7 +2034,8 @@ mod tests {
     }
 
     #[test]
-    fn stylesheet_replacement_and_restoration_maps_to_style_stage_and_preserves_fresh_rebuild_equivalence() {
+    fn stylesheet_replacement_and_restoration_maps_to_style_stage_and_preserves_fresh_rebuild_equivalence()
+     {
         let mut shaper = SizedShaper::default();
         let provider = MutableProvider::default();
         provider.put_bytes("style.css", b"p { font-size: 9px; }".to_vec());
@@ -1431,17 +2050,25 @@ mod tests {
         update_inputs.stylesheet_revision = StylesheetRevision::INITIAL;
 
         let mut session = PipelineSession::new(Arc::new(provider.clone()));
-        session.update(update_inputs.clone(), &mut shaper).expect("baseline update should succeed");
+        session
+            .update(update_inputs.clone(), &mut shaper)
+            .expect("baseline update should succeed");
         let baseline = {
             let document = session.document().expect("document should exist");
             build_snapshot(document)
         };
 
         provider.put_bytes("style.css", b"p { font-size: 36px; }".to_vec());
-        update_inputs.stylesheet_revision = StylesheetRevision::next(update_inputs.stylesheet_revision);
-        let style_update = session.update(update_inputs.clone(), &mut shaper).expect("style replacement update should succeed");
+        update_inputs.stylesheet_revision =
+            StylesheetRevision::next(update_inputs.stylesheet_revision);
+        let style_update = session
+            .update(update_inputs.clone(), &mut shaper)
+            .expect("style replacement update should succeed");
         assert_eq!(style_update.stage, EarliestStage::Prepare);
-        assert_eq!(style_update.report.styled, Reuse::recomputed(EarliestStage::Style));
+        assert_eq!(
+            style_update.report.styled,
+            Reuse::recomputed(EarliestStage::Style)
+        );
         let replaced = {
             let document = session.document().expect("document should exist");
             build_snapshot(document)
@@ -1449,8 +2076,11 @@ mod tests {
         assert_ne!(baseline, replaced);
 
         provider.put_bytes("style.css", b"p { font-size: 9px; }".to_vec());
-        update_inputs.stylesheet_revision = StylesheetRevision::next(update_inputs.stylesheet_revision);
-        let restore = session.update(update_inputs, &mut shaper).expect("stylesheet restoration update should succeed");
+        update_inputs.stylesheet_revision =
+            StylesheetRevision::next(update_inputs.stylesheet_revision);
+        let restore = session
+            .update(update_inputs, &mut shaper)
+            .expect("stylesheet restoration update should succeed");
         assert_eq!(restore.stage, EarliestStage::Prepare);
         let restored = {
             let document = session.document().expect("document should exist");
@@ -1462,7 +2092,10 @@ mod tests {
 
     #[test]
     fn pipeline_changes_map_to_expected_earliest_stage() {
-        let previous = base_inputs("<html><body><p>x</p></body></html>", SourceRevision::INITIAL);
+        let previous = base_inputs(
+            "<html><body><p>x</p></body></html>",
+            SourceRevision::INITIAL,
+        );
         let mut next = previous.clone();
         next.source = "<html><body><p>y</p></body></html>".to_owned();
         assert_eq!(next.earliest_stage(&previous), EarliestStage::Parse);
@@ -1500,12 +2133,30 @@ mod tests {
         assert_eq!(next.earliest_stage(&previous), EarliestStage::Paint);
 
         let changes = [
-            (PipelineChange::SourceChanged(SourceRevision::INITIAL), EarliestStage::Parse),
-            (PipelineChange::ResourceBaseChanged(ResourceRevision::INITIAL), EarliestStage::Parse),
-            (PipelineChange::StylesheetsChanged(StylesheetRevision::INITIAL), EarliestStage::Style),
-            (PipelineChange::StyleEnvironmentChanged(StyleEnvironment::default()), EarliestStage::Style),
-            (PipelineChange::FontEnvironmentChanged(FontEnv::INITIAL), EarliestStage::Shape),
-            (PipelineChange::ImageMetricsChanged(ImageMetricsRevision::INITIAL), EarliestStage::Layout),
+            (
+                PipelineChange::SourceChanged(SourceRevision::INITIAL),
+                EarliestStage::Parse,
+            ),
+            (
+                PipelineChange::ResourceBaseChanged(ResourceRevision::INITIAL),
+                EarliestStage::Parse,
+            ),
+            (
+                PipelineChange::StylesheetsChanged(StylesheetRevision::INITIAL),
+                EarliestStage::Style,
+            ),
+            (
+                PipelineChange::StyleEnvironmentChanged(StyleEnvironment::default()),
+                EarliestStage::Style,
+            ),
+            (
+                PipelineChange::FontEnvironmentChanged(FontEnv::INITIAL),
+                EarliestStage::Shape,
+            ),
+            (
+                PipelineChange::ImageMetricsChanged(ImageMetricsRevision::INITIAL),
+                EarliestStage::Layout,
+            ),
             (
                 PipelineChange::LayoutConstraintsChanged(LayoutConstraints {
                     viewport_width: 600.0,
@@ -1516,7 +2167,10 @@ mod tests {
                 }),
                 EarliestStage::Layout,
             ),
-            (PipelineChange::PaintSettingsChanged(PaintSettingsRevision::INITIAL), EarliestStage::Paint),
+            (
+                PipelineChange::PaintSettingsChanged(PaintSettingsRevision::INITIAL),
+                EarliestStage::Paint,
+            ),
         ];
         for (change, expected) in changes {
             assert_eq!(change.invalidated_stage(), expected);
@@ -1525,16 +2179,25 @@ mod tests {
 
     #[test]
     fn pipeline_input_equality_includes_source_and_base_uri() {
-        let inputs = base_inputs("<html><body><p>x</p></body></html>", SourceRevision::INITIAL);
+        let inputs = base_inputs(
+            "<html><body><p>x</p></body></html>",
+            SourceRevision::INITIAL,
+        );
         assert_eq!(inputs, inputs.clone());
 
         let mut different_source = inputs.clone();
         different_source.source = "<html><body><p>y</p></body></html>".to_owned();
-        assert_ne!(different_source, inputs, "source text must remain part of input identity even when its revision is unchanged");
+        assert_ne!(
+            different_source, inputs,
+            "source text must remain part of input identity even when its revision is unchanged"
+        );
 
         let mut different_base = inputs.clone();
         different_base.base_uri = "other/chapter.xhtml".to_owned();
-        assert_ne!(different_base, inputs, "resource resolution base must remain part of input identity even when its revision is unchanged");
+        assert_ne!(
+            different_base, inputs,
+            "resource resolution base must remain part of input identity even when its revision is unchanged"
+        );
     }
 
     #[test]
@@ -1547,21 +2210,44 @@ mod tests {
         );
         inputs.base_uri = "absolute-inline.xhtml".to_owned();
         inputs.markup_syntax = MarkupSyntax::Xml;
-        session.update(inputs, &mut shaper).expect("well-formed XHTML pipeline");
+        session
+            .update(inputs, &mut shaper)
+            .expect("well-formed XHTML pipeline");
 
         let document = session.document().expect("laid out document");
-        let green = document.render_view().fragments().decorations().iter().find(|fragment| fragment.color() == 0x008000FF).expect("absolute green background");
+        let green = document
+            .render_view()
+            .fragments()
+            .decorations()
+            .iter()
+            .find(|fragment| fragment.color() == 0x008000FF)
+            .expect("absolute green background");
         assert!(green.is_in_positioned_layer());
         assert!(!green.is_in_negative_positioned_layer());
-        assert!(!green.is_in_independent_positioned_layer(), "auto-z absolute and relative boxes share the source-ordered positioned stream");
+        assert!(
+            !green.is_in_independent_positioned_layer(),
+            "auto-z absolute and relative boxes share the source-ordered positioned stream"
+        );
         assert!(green.line_idx().is_none());
         let root = document.render_view();
         let images = root.fragments().images().iter().collect::<Vec<_>>();
-        assert!(!images.is_empty(), "the regression fixture must produce a replaced-image fragment");
+        assert!(
+            !images.is_empty(),
+            "the regression fixture must produce a replaced-image fragment"
+        );
         for image in images {
-            let line = root.text().line(image.line_idx()).expect("image owning line");
-            assert!(line.is_in_positioned_layer(), "the relative ancestor keeps its normal descendants in positioned paint");
-            assert!(!line.is_in_independent_positioned_layer(), "the preceding image remains in the common source-ordered positioned stream");
+            let line = root
+                .text()
+                .line(image.line_idx())
+                .expect("image owning line");
+            assert!(
+                line.is_in_positioned_layer(),
+                "the relative ancestor keeps its normal descendants in positioned paint"
+            );
+            assert!(
+                !line.is_in_independent_positioned_layer(),
+                "the preceding image remains in the common source-ordered positioned stream"
+            );
         }
     }
 }

@@ -104,6 +104,7 @@ fn shape_first_line_ranges(
     let retained_metrics = seed.glyph_metrics.clone();
     let mut shaped = (**base).clone();
     shaped.glyph_metrics = retained_metrics;
+    shaped.inline_plans = crate::layout::PreparedInlinePlans::new(inputs.layout_tree.box_count());
     for range in ranges {
         crate::shaping::reshape_range_with_style(&inputs.styles, &mut shaped.inline_content, &mut shaped.glyph_metrics, &mut shaped.text_geometry, range.glyphs.clone(), range.style, range.base_style, glyph_shaper)?;
     }

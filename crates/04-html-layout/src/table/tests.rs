@@ -1086,4 +1086,68 @@ mod tests {
         assert!((table.height - 50.0).abs() < 0.01, "table={table:?}, cell={cell:?}");
         assert!((wrapper.height - 50.0).abs() < 0.01, "wrapper={wrapper:?}, table={table:?}, cell={cell:?}");
     }
+
+    /// Manual release-mode benchmark for table layout architecture changes.
+    ///
+    /// Run with:
+    /// `cargo test --release -p html-layout benchmark_table_relayout -- --ignored --exact --nocapture`
+    #[test]
+    #[ignore = "manual performance benchmark"]
+    fn benchmark_table_relayout() {
+        use std::time::Instant;
+
+        let iterations = std::env::var("HTML_LAYOUT_BENCH_ITERATIONS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1_000);
+        let warmup = std::env::var("HTML_LAYOUT_BENCH_WARMUP")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(50);
+        let with_captions = std::env::var("HTML_LAYOUT_BENCH_CASE")
+            .is_ok_and(|value| value == "captioned");
+
+        let mut html = String::from("<html><body style='margin:0;font:16px monospace'>");
+        for table in 0..16 {
+            html.push_str("<table style='width:760px;border-collapse:collapse'>");
+            if with_captions {
+                html.push_str("<caption style='margin:3px 0'>Measured caption text</caption>");
+            }
+            for row in 0..8 {
+                html.push_str("<tr>");
+                for column in 0..6 {
+                    html.push_str(&format!("<td style='padding:2px;border:1px solid'>T{table} R{row} C{column}</td>"));
+                }
+                html.push_str("</tr>");
+            }
+            html.push_str("</table>");
+        }
+        html.push_str("</body></html>");
+
+        let mut document = layout_html(&html, 800.0);
+        for iteration in 0..warmup {
+            let width = if iteration % 2 == 0 { 800.0 } else { 801.0 };
+            document.relayout(LayoutConstraints::new(width, 16.0).unwrap());
+        }
+
+        let started = Instant::now();
+        for iteration in 0..iterations {
+            let width = if iteration % 2 == 0 { 800.0 } else { 801.0 };
+            document.relayout(LayoutConstraints::new(width, 16.0).unwrap());
+        }
+        let elapsed = started.elapsed();
+        let view = document.render_view();
+        let checksum = view.boxes().len()
+            + view.text().lines().len()
+            + view.fragments().decorations().len()
+            + view.fragments().images().len();
+        std::hint::black_box(checksum);
+        println!(
+            "TABLE_BENCH case={} iterations={} total_ns={} ns_per_relayout={} checksum={checksum}",
+            if with_captions { "captioned" } else { "ordinary" },
+            iterations,
+            elapsed.as_nanos(),
+            elapsed.as_nanos() / iterations.max(1) as u128,
+        );
+    }
 }

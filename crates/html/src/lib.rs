@@ -7,8 +7,12 @@
 pub mod document {
     pub use html_dom::*;
     pub use html_parse::{
-        DocumentTextIndex, HtmlFragmentContext, HtmlParserOptions, HtmlQuirksMode, HtmlScriptingMode, HtmlSyntaxAttribute, HtmlSyntaxElement, HtmlSyntaxNode, HtmlSyntaxTree, MarkupSyntax, ParsedHtml, ParsedHtmlFragment, SourceTextPosition, StylesheetReference, XmlParseError,
-        build_dom_document, decode_html_bytes, parse_document, parse_dom_document, parse_html_document, parse_html_document_bytes, parse_html_document_with_options, parse_html_fragment, parse_xml_document, plain_text_from_fragment,
+        DocumentTextIndex, HtmlFragmentContext, HtmlParserOptions, HtmlQuirksMode,
+        HtmlScriptingMode, HtmlSyntaxAttribute, HtmlSyntaxElement, HtmlSyntaxNode, HtmlSyntaxTree,
+        MarkupSyntax, ParsedHtml, ParsedHtmlFragment, SourceTextPosition, StylesheetReference,
+        XmlParseError, build_dom_document, decode_html_bytes, parse_document, parse_dom_document,
+        parse_html_document, parse_html_document_bytes, parse_html_document_with_options,
+        parse_html_fragment, parse_xml_document, plain_text_from_fragment,
     };
 }
 
@@ -33,8 +37,9 @@ pub mod style {
 
 pub mod text {
     pub use html_layout::{
-        CharacterPlacement, FontMetricsRequest, FontRelativeMetrics, FontSlant, GlyphId, GlyphMetric, GlyphMetricError, GlyphRegistry, GlyphShaper, OpenTypeFeature, ShapeError, ShapedLine, ShapedTextRun, TextRunId, TextRunShapeRequest,
-        TextShapeRequest, TextStyleSpan,
+        CharacterPlacement, FontMetricsRequest, FontRelativeMetrics, FontSlant, GlyphId,
+        GlyphMetric, GlyphMetricError, GlyphRegistry, GlyphShaper, OpenTypeFeature, ShapeError,
+        ShapedLine, ShapedTextRun, TextRunId, TextRunShapeRequest, TextShapeRequest, TextStyleSpan,
     };
 }
 
@@ -69,7 +74,8 @@ pub mod testing {
     /// ledger without depending on parser syntax-tree types.
     pub fn document_requires_http(bytes: &[u8], uri: &str) -> Result<bool, String> {
         let source = String::from_utf8_lossy(bytes);
-        let parsed = html_parse::parse_document(&source, html_parse::MarkupSyntax::from_uri(uri)).map_err(|error| error.to_string())?;
+        let parsed = html_parse::parse_document(&source, html_parse::MarkupSyntax::from_uri(uri))
+            .map_err(|error| error.to_string())?;
         Ok(syntax_nodes_have_http_flag(&parsed.syntax_tree().nodes))
     }
 
@@ -77,11 +83,25 @@ pub mod testing {
         nodes.iter().any(|node| match node {
             html_parse::HtmlSyntaxNode::Element(element) => {
                 let is_http_flag = element.local_name.eq_ignore_ascii_case("meta")
-                    && element.attributes.iter().any(|attribute| attribute.local_name.eq_ignore_ascii_case("name") && attribute.value.eq_ignore_ascii_case("flags"))
-                    && element.attributes.iter().find(|attribute| attribute.local_name.eq_ignore_ascii_case("content")).is_some_and(|attribute| attribute.value.split_ascii_whitespace().any(|flag| flag.eq_ignore_ascii_case("http")));
+                    && element.attributes.iter().any(|attribute| {
+                        attribute.local_name.eq_ignore_ascii_case("name")
+                            && attribute.value.eq_ignore_ascii_case("flags")
+                    })
+                    && element
+                        .attributes
+                        .iter()
+                        .find(|attribute| attribute.local_name.eq_ignore_ascii_case("content"))
+                        .is_some_and(|attribute| {
+                            attribute
+                                .value
+                                .split_ascii_whitespace()
+                                .any(|flag| flag.eq_ignore_ascii_case("http"))
+                        });
                 is_http_flag || syntax_nodes_have_http_flag(&element.children)
             }
-            html_parse::HtmlSyntaxNode::TemplateContents(children) => syntax_nodes_have_http_flag(children),
+            html_parse::HtmlSyntaxNode::TemplateContents(children) => {
+                syntax_nodes_have_http_flag(children)
+            }
             _ => false,
         })
     }
@@ -105,20 +125,43 @@ pub mod engine {
 
     impl Engine {
         pub fn new(provider: Arc<dyn ResourceProvider>) -> Self {
-            Self { session: PipelineSession::new(provider) }
+            Self {
+                session: PipelineSession::new(provider),
+            }
         }
 
-        pub fn update(&mut self, inputs: PipelineInputs, glyph_shaper: &mut impl GlyphShaper) -> Result<PipelineUpdate, PipelineError> {
+        pub fn update(
+            &mut self,
+            inputs: PipelineInputs,
+            glyph_shaper: &mut impl GlyphShaper,
+        ) -> Result<PipelineUpdate, PipelineError> {
             self.session.update(inputs, glyph_shaper)
         }
 
-        pub fn rehydrate_glyphs(&mut self, glyph_shaper: &mut impl GlyphShaper) -> Result<LaidOutDocument, PipelineError> {
+        pub fn media_environment_change_affects_style(
+            &self,
+            media: crate::pipeline::MediaEnvironment,
+            root_font_size: u32,
+        ) -> bool {
+            self.session
+                .media_environment_change_affects_style(media, root_font_size)
+        }
+
+        pub fn rehydrate_glyphs(
+            &mut self,
+            glyph_shaper: &mut impl GlyphShaper,
+        ) -> Result<LaidOutDocument, PipelineError> {
             self.session.rehydrate_glyphs(glyph_shaper)
         }
 
         /// Lays out one note body under its own constraints, for embedders
         /// that hold notes out of the reading flow and present them elsewhere.
-        pub fn layout_note(&mut self, id: &str, constraints: crate::layout::LayoutConstraints, glyph_shaper: &mut impl GlyphShaper) -> Option<LaidOutDocument> {
+        pub fn layout_note(
+            &mut self,
+            id: &str,
+            constraints: crate::layout::LayoutConstraints,
+            glyph_shaper: &mut impl GlyphShaper,
+        ) -> Option<LaidOutDocument> {
             self.session.layout_note(id, constraints, glyph_shaper)
         }
 
@@ -136,5 +179,7 @@ pub mod engine {
         }
     }
 
-    pub use crate::pipeline::{PipelineError as Error, PipelineInputs as Input, PipelineUpdate as Update};
+    pub use crate::pipeline::{
+        PipelineError as Error, PipelineInputs as Input, PipelineUpdate as Update,
+    };
 }

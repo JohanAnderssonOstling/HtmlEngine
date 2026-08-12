@@ -7,7 +7,7 @@ pub(crate) struct GeometryWriter<'out> {
 }
 
 impl<'out> GeometryWriter<'out> {
-    pub(crate) fn new(geometry: &'out mut BoxGeometry) -> Self {
+    pub(super) fn new(geometry: &'out mut BoxGeometry) -> Self {
         Self { geometry }
     }
 
@@ -31,15 +31,23 @@ impl<'out> GeometryWriter<'out> {
         self.geometry.set_size(box_idx, size);
     }
 
+    pub(super) fn len(&self) -> usize {
+        self.geometry.len()
+    }
+
     pub(crate) fn set_decoration_rect(&mut self, box_idx: usize, rect: Rect) {
         self.geometry.set_decoration_rect(box_idx, rect);
     }
 
-    pub(crate) fn as_ref(&self) -> &BoxGeometry {
+    pub(crate) fn decoration_rect(&self, box_idx: usize) -> Option<Rect> {
+        self.geometry.decoration_rect(box_idx)
+    }
+
+    pub(super) fn as_ref(&self) -> &BoxGeometry {
         self.geometry
     }
 
-    pub(crate) fn swap_storage(&mut self, scratch: &mut BoxGeometry) {
+    pub(super) fn swap_storage(&mut self, scratch: &mut BoxGeometry) {
         std::mem::swap(self.geometry, scratch);
     }
 }

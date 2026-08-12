@@ -4,7 +4,7 @@ use super::*;
 pub(in crate::layout::inline) fn break_lines_knuth(
     engine: &crate::layout::LayoutEngine<'_, '_>, tokens: &[InlineToken], runs: &[InlineTokenMetrics], paragraph: ParagraphLayout, available_width: f64, cached_plan: Option<&KpPlan>, ragged: bool,
 ) -> Vec<BrokenLine> {
-    let timing_started = Instant::now();
+    let timing_started = engine.start_timing();
     use super::knuth_plass as kp;
     let fallback_plan;
     let plan = if let Some(plan) = cached_plan {

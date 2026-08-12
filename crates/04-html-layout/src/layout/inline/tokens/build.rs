@@ -180,20 +180,23 @@ fn create_inline_boundary_token(
 /// Each token carries the geometry and break metadata needed by the line
 /// breaker plus the placement inputs needed later by line measurement.
 pub(in crate::layout::inline) fn build_inline_tokens(engine: &mut crate::layout::LayoutEngine<'_, '_>, run_range: Range<u32>, container_box_idx: usize, max_width: f64, containing_block_height: Option<f64>) -> InlineTokens {
-    let timing_started = Instant::now();
-    let cache_key = InlineTokenCacheKey { run_start: run_range.start, run_end: run_range.end, container_box_idx: u32::try_from(container_box_idx).expect("inline token-cache box index exhausted") };
+    let timing_started = engine.start_timing();
+    let plan_key = PreparedInlinePlanKey {
+        run_start: run_range.start,
+        run_end: run_range.end,
+        container_box_idx: u32::try_from(container_box_idx).expect("inline-plan box index exhausted"),
+        high_quality_hyphenation: engine.config.hyphenation_quality(),
+    };
     let source_runs = &engine.text.inline_items()[run_range.start as usize..run_range.end as usize];
-    let cacheable = !engine.config.sentence_per_line()
-        && source_runs.iter().all(|run| matches!(run.kind, InlineItemKind::Text { .. } | InlineItemKind::Marker { .. }))
-        && source_runs
-            .iter()
-            .map(|run| match &run.kind {
-                InlineItemKind::Text { glyphs } | InlineItemKind::Marker { glyphs } => glyphs.len(),
-                _ => 0,
-            })
-            .sum::<usize>()
-            >= INLINE_TOKEN_CACHE_MIN_GLYPHS;
-    if cacheable && let Some(tokens) = engine.inline_token_cache.get(cache_key) {
+    let cacheable = !engine.config.sentence_per_line() && source_runs.iter().all(|run| matches!(run.kind, InlineItemKind::Text { .. } | InlineItemKind::Marker { .. }));
+    let glyph_count = source_runs
+        .iter()
+        .map(|run| match &run.kind {
+            InlineItemKind::Text { glyphs } | InlineItemKind::Marker { glyphs } => glyphs.len(),
+            _ => 0,
+        })
+        .sum::<usize>();
+    if cacheable && let Some(tokens) = engine.inline_plans.get(plan_key) {
         engine.record_timing(|t| t.build_inline_tokens += timing_started.elapsed());
         return tokens;
     }
@@ -209,11 +212,13 @@ pub(in crate::layout::inline) fn build_inline_tokens(engine: &mut crate::layout:
         tokens.rebuild_summary_blocks();
     }
     if cacheable {
-        if engine.config.force_justify() || engine.reader.style(container_box_idx).text_align() == TextAlign::Justify || (engine.config.book_optimized_text() && engine.reader.style(container_box_idx).text_align() == TextAlign::Left) {
+        if glyph_count >= INLINE_KP_CACHE_MIN_GLYPHS
+            && (engine.config.force_justify() || engine.reader.style(container_box_idx).text_align() == TextAlign::Justify || (engine.config.book_optimized_text() && engine.reader.style(container_box_idx).text_align() == TextAlign::Left))
+        {
             tokens.enable_kp_plan_cache();
         }
         tokens.share();
-        engine.inline_token_cache.insert(cache_key, tokens.clone());
+        tokens = engine.inline_plans.insert(plan_key, tokens);
     }
     // Nested timing is measured in build_inline_tokens_from_runs; this captures the outer wrapper.
     engine.record_timing(|t| t.build_inline_tokens += timing_started.elapsed());
@@ -223,7 +228,7 @@ pub(in crate::layout::inline) fn build_inline_tokens(engine: &mut crate::layout:
 pub(super) fn build_inline_tokens_from_runs(
     engine: &mut crate::layout::LayoutEngine<'_, '_>, runs: &[InlineItem], container_box_idx: usize, max_width: f64, containing_block_height: Option<f64>, standalone_image: Option<u32>,
 ) -> InlineTokens {
-    let timing_started = Instant::now();
+    let timing_started = engine.start_timing();
     let glyph_capacity = runs
         .iter()
         .map(|run| match &run.kind {

@@ -1,7 +1,6 @@
 use crate::layout_model::{GlyphAdvanceRun, GlyphOffsetRun, Line, OverflowClip};
 use kurbo::Rect;
 use std::ops::Range;
-use std::time::Instant;
 
 use super::engine::LayoutEngine;
 use super::fragment_writer::FragmentWriter;
@@ -13,7 +12,10 @@ mod ordering;
 mod overflow;
 
 use geometry::publish_inline_box_geometry;
-use ordering::{build_block_decoration_traversal, rebuild_decoration_fragments_by_line, rebuild_glyph_line_indices, rebuild_image_fragments_by_line, sort_lines_and_remap_images};
+use ordering::{
+    build_block_decoration_traversal, rebuild_decoration_fragments_by_line,
+    rebuild_glyph_line_indices, rebuild_image_fragments_by_line, sort_lines_and_remap_images,
+};
 use overflow::rebuild_overflow_clips;
 
 #[derive(Default)]
@@ -28,34 +30,58 @@ pub(super) struct FinalizationScratch {
 impl FinalizationScratch {
     #[cfg(test)]
     pub(super) fn allocation_capacities(&self) -> (usize, usize, usize, usize, usize, usize) {
-        (self.line_pairs.capacity(), self.index_map.capacity(), self.sorted_line_owners.capacity(), self.block_groups.capacity(), self.content_clips.capacity(), self.inline_bounds.capacity())
+        (
+            self.line_pairs.capacity(),
+            self.index_map.capacity(),
+            self.sorted_line_owners.capacity(),
+            self.block_groups.capacity(),
+            self.content_clips.capacity(),
+            self.inline_bounds.capacity(),
+        )
     }
 }
 
 impl LayoutEngine<'_, '_> {
     pub(super) fn finalize(&mut self, track_overflow_clips: bool) {
-        let finalization_started = Instant::now();
+        let finalization_started = self.start_timing();
 
-        let start = Instant::now();
+        // Recursive layout retains subtree placement transforms so moving a
+        // container is independent of descendant count. Public layout output
+        // deliberately remains absolute; flatten it once at this boundary.
+        self.placement
+            .publish_absolute(&mut self.geometry, &mut self.fragments);
+
+        let start = self.start_timing();
         sort_lines_and_remap_images(&self.reader, &mut self.fragments, &mut self.finalization);
         self.record_timing(|timings| timings.sort_lines_and_remap_images += start.elapsed());
 
         rebuild_glyph_line_indices(self.text.glyphs().len(), &mut self.fragments);
         build_block_decoration_traversal(&self.reader, &mut self.fragments, &mut self.finalization);
 
-        let start = Instant::now();
+        let start = self.start_timing();
         super::decorations::collect_inline_decorations(self);
         self.record_timing(|timings| timings.collect_inline_decorations += start.elapsed());
 
-        publish_inline_box_geometry(&self.reader, &mut self.geometry, &self.fragments, &mut self.finalization);
+        publish_inline_box_geometry(
+            &self.reader,
+            &mut self.geometry,
+            &self.fragments,
+            &mut self.finalization,
+        );
 
         rebuild_decoration_fragments_by_line(&mut self.fragments);
 
-        let start = Instant::now();
+        let start = self.start_timing();
         rebuild_image_fragments_by_line(&mut self.fragments);
         self.record_timing(|timings| timings.rebuild_image_fragments_by_line += start.elapsed());
 
-        rebuild_overflow_clips(&self.reader, &self.geometry, &mut self.fragments, &mut self.finalization, track_overflow_clips);
+        rebuild_overflow_clips(
+            &self.reader,
+            &self.geometry,
+            &mut self.fragments,
+            &mut self.finalization,
+            track_overflow_clips,
+        );
         self.record_timing(|timings| timings.finalize_layout += finalization_started.elapsed());
     }
 }

@@ -4,7 +4,6 @@ use crate::layout_model::{EllipsisFragment, GlyphAdvanceRun, GlyphOffsetRun, Hyp
 use html_style_model::{BoxSizing, Float, OverflowWrap, TabSizeKind, TextAlign, TextBoxOverEdge, TextBoxTrim, TextBoxUnderEdge, TextOverflow, UsedPreferredSize as PreferredSize, VerticalAlignValue, WhiteSpace, WordBreak, resolve_used_preferred_size};
 use kurbo::{Point, Size, Vec2};
 use std::ops::Range;
-use std::time::Instant;
 
 mod algorithm;
 mod decorations;
@@ -23,7 +22,7 @@ use wrapping::*;
 
 pub(in crate::layout) use algorithm::layout_inline_content;
 pub(super) use paragraph::{InlineFormattingInput, InlineLayoutArea, ParagraphLayout, ResolvedTextIndent};
-pub(crate) use tokens::InlineTokenCache;
+pub(crate) use tokens::PreparedInlinePlans;
 pub(in crate::layout) use tokens::{BreakKind, canonical_text_unit, preserved_tab_metrics, run_belongs_to_inline_context, tab_reference_style};
 
 include!("tests.rs");

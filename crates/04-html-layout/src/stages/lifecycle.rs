@@ -60,7 +60,12 @@ pub enum TextCompositionPolicy {
 
 impl TextCompositionPolicy {
     pub fn is_book_optimized(self) -> bool {
-        matches!(self, Self::BookOptimized | Self::BookOptimizedUnrestrictedHyphenation | Self::SentencePerLine)
+        matches!(
+            self,
+            Self::BookOptimized
+                | Self::BookOptimizedUnrestrictedHyphenation
+                | Self::SentencePerLine
+        )
     }
 
     pub fn uses_hyphenation_quality(self) -> bool {
@@ -87,14 +92,23 @@ impl LayoutConstraints {
         if !line_height.is_finite() || line_height <= 0.0 {
             return Err(LayoutConstraintError::InvalidLineHeight);
         }
-        Ok(Self { viewport_width, viewport_height: None, line_height, image_sizing_policy: ImageSizingPolicy::WebCompatible, text_composition_policy: TextCompositionPolicy::WebCompatible })
+        Ok(Self {
+            viewport_width,
+            viewport_height: None,
+            line_height,
+            image_sizing_policy: ImageSizingPolicy::WebCompatible,
+            text_composition_policy: TextCompositionPolicy::WebCompatible,
+        })
     }
 
     pub fn viewport_width(self) -> f64 {
         self.viewport_width
     }
 
-    pub fn with_viewport_height(mut self, viewport_height: Option<f64>) -> Result<Self, LayoutConstraintError> {
+    pub fn with_viewport_height(
+        mut self,
+        viewport_height: Option<f64>,
+    ) -> Result<Self, LayoutConstraintError> {
         if viewport_height.is_some_and(|height| !height.is_finite() || height < 0.0) {
             return Err(LayoutConstraintError::InvalidViewportHeight);
         }
@@ -132,9 +146,15 @@ impl LayoutConstraints {
 impl fmt::Display for LayoutConstraintError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidViewportWidth => formatter.write_str("viewport width must be finite and non-negative"),
-            Self::InvalidViewportHeight => formatter.write_str("viewport height must be finite and non-negative"),
-            Self::InvalidLineHeight => formatter.write_str("line height must be finite and positive"),
+            Self::InvalidViewportWidth => {
+                formatter.write_str("viewport width must be finite and non-negative")
+            }
+            Self::InvalidViewportHeight => {
+                formatter.write_str("viewport height must be finite and non-negative")
+            }
+            Self::InvalidLineHeight => {
+                formatter.write_str("line height must be finite and positive")
+            }
         }
     }
 }
@@ -200,6 +220,7 @@ pub(crate) struct ShapedText {
     pub(super) hyphen_glyphs: FxHashMap<u32, GlyphId>,
     pub(super) link_glyph_targets: FxHashMap<u32, LinkGlyphTarget>,
     pub(super) anchor_glyphs: FxHashMap<u16, u32>,
+    pub(super) inline_plans: crate::layout::PreparedInlinePlans,
 }
 
 #[derive(Clone)]
@@ -213,12 +234,29 @@ impl PreparedDocument {
         Self::try_new_with_note_flow(document, styles, NoteFlow::default())
     }
 
-    pub fn try_new_with_note_flow(document: Document, styles: ComputedStyles, note_flow: NoteFlow) -> Result<Self, PrepareError> {
+    pub fn try_new_with_note_flow(
+        document: Document,
+        styles: ComputedStyles,
+        note_flow: NoteFlow,
+    ) -> Result<Self, PrepareError> {
         styles.validate_for(&document).map_err(PrepareError)?;
         let mut layout_tree = LayoutTree::default();
         let mut inline_content = InlineContent::default();
-        crate::layout::build_layout_inputs(&document, &styles, &mut layout_tree, &mut inline_content, note_flow);
-        Ok(Self { inputs: std::sync::Arc::new(PreparedInputs { document: std::sync::Arc::new(document), styles: std::sync::Arc::new(styles), layout_tree: std::sync::Arc::new(layout_tree), inline_content }) })
+        crate::layout::build_layout_inputs(
+            &document,
+            &styles,
+            &mut layout_tree,
+            &mut inline_content,
+            note_flow,
+        );
+        Ok(Self {
+            inputs: std::sync::Arc::new(PreparedInputs {
+                document: std::sync::Arc::new(document),
+                styles: std::sync::Arc::new(styles),
+                layout_tree: std::sync::Arc::new(layout_tree),
+                inline_content,
+            }),
+        })
     }
 
     /// Prepares the subtree rooted at the element carrying `id` as a document
@@ -232,20 +270,44 @@ impl PreparedDocument {
     /// asked for: the caller has explicitly asked for this one.
     pub fn scoped_to_element_id(&self, id: &str) -> Option<Self> {
         let document = &self.inputs.document;
-        let root = document.node_ids().find(|node| document.get_dom_id(*node) == Some(id))?;
+        let root = document
+            .node_ids()
+            .find(|node| document.get_dom_id(*node) == Some(id))?;
         document.element_ref(root)?;
 
         let mut layout_tree = LayoutTree::default();
         let mut inline_content = InlineContent::default();
-        crate::layout::build_layout_inputs_from(document, &self.inputs.styles, &mut layout_tree, &mut inline_content, NoteFlow::InFlow, root);
-        Some(Self { inputs: std::sync::Arc::new(PreparedInputs { document: std::sync::Arc::clone(&self.inputs.document), styles: std::sync::Arc::clone(&self.inputs.styles), layout_tree: std::sync::Arc::new(layout_tree), inline_content }) })
+        crate::layout::build_layout_inputs_from(
+            document,
+            &self.inputs.styles,
+            &mut layout_tree,
+            &mut inline_content,
+            NoteFlow::InFlow,
+            root,
+        );
+        Some(Self {
+            inputs: std::sync::Arc::new(PreparedInputs {
+                document: std::sync::Arc::clone(&self.inputs.document),
+                styles: std::sync::Arc::clone(&self.inputs.styles),
+                layout_tree: std::sync::Arc::new(layout_tree),
+                inline_content,
+            }),
+        })
     }
 
     /// Ids of this document's note bodies, in document order. A note without an
     /// id cannot be referenced, so it is not listed.
     pub fn note_ids(&self) -> Vec<&str> {
         let document = &self.inputs.document;
-        document.node_ids().filter(|node| document.element_ref(*node).is_some_and(element_is_note_target)).filter_map(|node| document.get_dom_id(node)).collect()
+        document
+            .node_ids()
+            .filter(|node| {
+                document
+                    .element_ref(*node)
+                    .is_some_and(element_is_note_target)
+            })
+            .filter_map(|node| document.get_dom_id(node))
+            .collect()
     }
 
     pub(crate) fn document(&self) -> &Document {
@@ -259,7 +321,10 @@ impl PreparedDocument {
 
     #[cfg(test)]
     pub(crate) fn style_view(&self, indices: StyleIndices) -> html_style_model::StyleView<'_> {
-        self.inputs.styles.view(indices).expect("validated style handle")
+        self.inputs
+            .styles
+            .view(indices)
+            .expect("validated style handle")
     }
 
     #[cfg(test)]
@@ -284,10 +349,22 @@ impl PreparedDocument {
     /// Report bytes retained for the prepared stage cache.
     pub fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
-        report.extend_prefixed("PreparedDocument.document", self.document().memory_usage_report());
-        report.extend_prefixed("PreparedDocument.styles", self.inputs.styles.memory_usage_report());
-        report.extend_prefixed("PreparedDocument.layout_tree", self.inputs.layout_tree.memory_usage_report());
-        report.extend_prefixed("PreparedDocument.inline_content", self.inputs.inline_content.memory_usage_report());
+        report.extend_prefixed(
+            "PreparedDocument.document",
+            self.document().memory_usage_report(),
+        );
+        report.extend_prefixed(
+            "PreparedDocument.styles",
+            self.inputs.styles.memory_usage_report(),
+        );
+        report.extend_prefixed(
+            "PreparedDocument.layout_tree",
+            self.inputs.layout_tree.memory_usage_report(),
+        );
+        report.extend_prefixed(
+            "PreparedDocument.inline_content",
+            self.inputs.inline_content.memory_usage_report(),
+        );
         report
     }
 
@@ -297,11 +374,21 @@ impl PreparedDocument {
     }
 
     pub fn get_tag(&self, box_idx: usize) -> &str {
-        self.inputs.layout_tree.box_at(box_idx).and_then(|layout_box| layout_box.get_element(self.document())).map(|element| element.tag()).unwrap_or("")
+        self.inputs
+            .layout_tree
+            .box_at(box_idx)
+            .and_then(|layout_box| layout_box.get_element(self.document()))
+            .map(|element| element.tag())
+            .unwrap_or("")
     }
 
     pub fn get_id(&self, box_idx: usize) -> Option<&str> {
-        self.inputs.layout_tree.box_at(box_idx)?.get_element(self.document())?.id_idx().map(|id| self.document().string(id))
+        self.inputs
+            .layout_tree
+            .box_at(box_idx)?
+            .get_element(self.document())?
+            .id_idx()
+            .map(|id| self.document().string(id))
     }
 
     pub(crate) fn box_style_indices(&self, box_idx: usize) -> Option<StyleIndices> {
@@ -313,7 +400,10 @@ impl PreparedDocument {
         Some(self.inputs.styles.text_style(indices)?.color)
     }
 
-    pub fn shape(&self, glyph_shaper: &mut impl crate::GlyphShaper) -> Result<ShapedDocument, crate::ShapeError> {
+    pub fn shape(
+        &self,
+        glyph_shaper: &mut impl crate::GlyphShaper,
+    ) -> Result<ShapedDocument, crate::ShapeError> {
         glyph_shaper.begin_document_shaping();
         let result = self.shape_active_document(glyph_shaper);
         if result.is_ok() {
@@ -327,10 +417,19 @@ impl PreparedDocument {
     /// Shapes and lays out a document as one renderer-resource transaction.
     /// A shaping or exact-line-refinement failure leaves the previous renderer
     /// resources active.
-    pub fn shape_and_layout_with_metrics_and_shaper(&self, constraints: LayoutConstraints, image_metrics: &ImageMetrics, glyph_shaper: &mut impl crate::GlyphShaper) -> Result<(ShapedDocument, LaidOutDocument), crate::ShapeError> {
+    pub fn shape_and_layout_with_metrics_and_shaper(
+        &self,
+        constraints: LayoutConstraints,
+        image_metrics: &ImageMetrics,
+        glyph_shaper: &mut impl crate::GlyphShaper,
+    ) -> Result<(ShapedDocument, LaidOutDocument), crate::ShapeError> {
         glyph_shaper.begin_document_shaping();
         let result = self.shape_active_document(glyph_shaper).and_then(|shaped| {
-            let laid_out = shaped.clone().layout_with_metrics_and_shaper(constraints, image_metrics, glyph_shaper)?;
+            let laid_out = shaped.clone().layout_with_metrics_and_shaper(
+                constraints,
+                image_metrics,
+                glyph_shaper,
+            )?;
             Ok((shaped, laid_out))
         });
         if result.is_ok() {
@@ -357,23 +456,72 @@ impl PreparedDocument {
     /// There is no rollback. A failure can leave the note's glyphs behind,
     /// which is harmless: they are unreferenced and the page's are untouched.
     pub fn shape_and_layout_into_active_resources(
-        &self, base: &ShapedDocument, constraints: LayoutConstraints, image_metrics: &ImageMetrics, glyph_shaper: &mut impl crate::GlyphShaper,
+        &self,
+        base: &ShapedDocument,
+        constraints: LayoutConstraints,
+        image_metrics: &ImageMetrics,
+        glyph_shaper: &mut impl crate::GlyphShaper,
     ) -> Result<(ShapedDocument, LaidOutDocument), crate::ShapeError> {
-        let shaped = self.shape_active_document_with_metrics(base.glyph_metrics().clone(), glyph_shaper)?;
-        let laid_out = shaped.clone().layout_with_metrics_and_shaper(constraints, image_metrics, glyph_shaper)?;
+        let shaped =
+            self.shape_active_document_with_metrics(base.glyph_metrics().clone(), glyph_shaper)?;
+        let laid_out = shaped.clone().layout_with_metrics_and_shaper(
+            constraints,
+            image_metrics,
+            glyph_shaper,
+        )?;
         Ok((shaped, laid_out))
     }
 
-    fn shape_active_document(&self, glyph_shaper: &mut impl crate::GlyphShaper) -> Result<ShapedDocument, crate::ShapeError> {
+    fn shape_active_document(
+        &self,
+        glyph_shaper: &mut impl crate::GlyphShaper,
+    ) -> Result<ShapedDocument, crate::ShapeError> {
         self.shape_active_document_with_metrics(GlyphMetrics::default(), glyph_shaper)
     }
 
-    fn shape_active_document_with_metrics(&self, mut glyph_metrics: GlyphMetrics, glyph_shaper: &mut impl crate::GlyphShaper) -> Result<ShapedDocument, crate::ShapeError> {
+    fn shape_active_document_with_metrics(
+        &self,
+        mut glyph_metrics: GlyphMetrics,
+        glyph_shaper: &mut impl crate::GlyphShaper,
+    ) -> Result<ShapedDocument, crate::ShapeError> {
         let mut inline_content = self.inputs.inline_content.clone();
-        let (ellipsis_glyphs, hyphen_glyphs, text_geometry, font_metrics) = crate::shaping::shape_document(&self.inputs.document, &self.inputs.styles, &self.inputs.layout_tree, &mut inline_content, glyph_shaper, &mut glyph_metrics)?;
-        let link_glyph_targets = collect_link_glyph_targets(&self.inputs.document, &self.inputs.layout_tree, &inline_content).into_iter().collect();
-        let anchor_glyphs = collect_anchor_glyphs(&self.inputs.document, &self.inputs.layout_tree, &inline_content).into_iter().collect();
-        Ok(ShapedDocument { inputs: self.inputs.clone(), shaped: std::sync::Arc::new(ShapedText { inline_content, glyph_metrics, font_metrics, text_geometry, ellipsis_glyphs, hyphen_glyphs, link_glyph_targets, anchor_glyphs }) })
+        let (ellipsis_glyphs, hyphen_glyphs, text_geometry, font_metrics) =
+            crate::shaping::shape_document(
+                &self.inputs.document,
+                &self.inputs.styles,
+                &self.inputs.layout_tree,
+                &mut inline_content,
+                glyph_shaper,
+                &mut glyph_metrics,
+            )?;
+        let link_glyph_targets = collect_link_glyph_targets(
+            &self.inputs.document,
+            &self.inputs.layout_tree,
+            &inline_content,
+        )
+        .into_iter()
+        .collect();
+        let anchor_glyphs = collect_anchor_glyphs(
+            &self.inputs.document,
+            &self.inputs.layout_tree,
+            &inline_content,
+        )
+        .into_iter()
+        .collect();
+        Ok(ShapedDocument {
+            inputs: self.inputs.clone(),
+            shaped: std::sync::Arc::new(ShapedText {
+                inline_content,
+                glyph_metrics,
+                font_metrics,
+                text_geometry,
+                ellipsis_glyphs,
+                hyphen_glyphs,
+                link_glyph_targets,
+                anchor_glyphs,
+                inline_plans: crate::layout::PreparedInlinePlans::new(self.inputs.layout_tree.box_count()),
+            }),
+        })
     }
 }
 
@@ -401,17 +549,61 @@ impl ShapedDocument {
     /// Report bytes retained for the shaped stage cache.
     pub fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
-        report.extend_prefixed("ShapedDocument.document", self.document().memory_usage_report());
-        report.extend_prefixed("ShapedDocument.styles", self.inputs.styles.memory_usage_report());
-        report.extend_prefixed("ShapedDocument.layout_tree", self.inputs.layout_tree.memory_usage_report());
-        report.extend_prefixed("ShapedDocument.inline_content", self.shaped.inline_content.memory_usage_report());
-        report.extend_prefixed("ShapedDocument.glyph_metrics", self.shaped.glyph_metrics.memory_usage_report());
-        report.add("ShapedDocument.text_geometry", self.shaped.text_geometry.memory_usage_bytes(), self.shaped.inline_content.glyphs().len());
-        report.add("ShapedDocument.font_metrics", self.shaped.font_metrics.memory_usage_bytes(), self.inputs.layout_tree.box_count());
-        report.add_slice_storage::<(u32, GlyphId)>("ShapedDocument.ellipsis_glyphs.storage", self.shaped.ellipsis_glyphs.capacity(), self.shaped.ellipsis_glyphs.len());
-        report.add_slice_storage::<(u32, GlyphId)>("ShapedDocument.hyphen_glyphs.storage", self.shaped.hyphen_glyphs.capacity(), self.shaped.hyphen_glyphs.len());
-        report.add_slice_storage::<(u32, LinkGlyphTarget)>("ShapedDocument.link_glyph_targets.storage", self.shaped.link_glyph_targets.capacity(), self.shaped.link_glyph_targets.len());
-        report.add_slice_storage::<(u16, u32)>("ShapedDocument.anchor_glyphs.storage", self.shaped.anchor_glyphs.capacity(), self.shaped.anchor_glyphs.len());
+        report.extend_prefixed(
+            "ShapedDocument.document",
+            self.document().memory_usage_report(),
+        );
+        report.extend_prefixed(
+            "ShapedDocument.styles",
+            self.inputs.styles.memory_usage_report(),
+        );
+        report.extend_prefixed(
+            "ShapedDocument.layout_tree",
+            self.inputs.layout_tree.memory_usage_report(),
+        );
+        report.extend_prefixed(
+            "ShapedDocument.inline_content",
+            self.shaped.inline_content.memory_usage_report(),
+        );
+        report.extend_prefixed(
+            "ShapedDocument.glyph_metrics",
+            self.shaped.glyph_metrics.memory_usage_report(),
+        );
+        report.add(
+            "ShapedDocument.text_geometry",
+            self.shaped.text_geometry.memory_usage_bytes(),
+            self.shaped.inline_content.glyphs().len(),
+        );
+        report.add(
+            "ShapedDocument.font_metrics",
+            self.shaped.font_metrics.memory_usage_bytes(),
+            self.inputs.layout_tree.box_count(),
+        );
+        report.add(
+            "ShapedDocument.inline_plans",
+            self.shaped.inline_plans.memory_usage_bytes(),
+            self.shaped.inline_plans.len(),
+        );
+        report.add_slice_storage::<(u32, GlyphId)>(
+            "ShapedDocument.ellipsis_glyphs.storage",
+            self.shaped.ellipsis_glyphs.capacity(),
+            self.shaped.ellipsis_glyphs.len(),
+        );
+        report.add_slice_storage::<(u32, GlyphId)>(
+            "ShapedDocument.hyphen_glyphs.storage",
+            self.shaped.hyphen_glyphs.capacity(),
+            self.shaped.hyphen_glyphs.len(),
+        );
+        report.add_slice_storage::<(u32, LinkGlyphTarget)>(
+            "ShapedDocument.link_glyph_targets.storage",
+            self.shaped.link_glyph_targets.capacity(),
+            self.shaped.link_glyph_targets.len(),
+        );
+        report.add_slice_storage::<(u16, u32)>(
+            "ShapedDocument.anchor_glyphs.storage",
+            self.shaped.anchor_glyphs.capacity(),
+            self.shaped.anchor_glyphs.len(),
+        );
         report
     }
 
@@ -420,33 +612,60 @@ impl ShapedDocument {
         self.layout_with_metrics(constraints, &image_metrics)
     }
 
-    pub fn layout_with_timings(self, constraints: LayoutConstraints) -> (LaidOutDocument, crate::LayoutTimings) {
+    pub fn layout_with_timings(
+        self,
+        constraints: LayoutConstraints,
+    ) -> (LaidOutDocument, crate::LayoutTimings) {
         let image_metrics = ImageMetrics::from_document(self.inputs.document.as_ref());
         self.layout_with_timings_and_metrics(constraints, &image_metrics)
     }
 
-    pub fn layout_with_metrics(self, constraints: LayoutConstraints, image_metrics: &ImageMetrics) -> LaidOutDocument {
+    pub fn layout_with_metrics(
+        self,
+        constraints: LayoutConstraints,
+        image_metrics: &ImageMetrics,
+    ) -> LaidOutDocument {
         self.layout_impl(constraints, image_metrics, None)
     }
 
     /// Compatibility entry point. Document shaping is authoritative, so width
     /// changes only invoke the backend shaper for width-dependent pseudo text.
-    pub fn layout_with_metrics_and_shaper(self, constraints: LayoutConstraints, image_metrics: &ImageMetrics, glyph_shaper: &mut impl crate::GlyphShaper) -> Result<LaidOutDocument, crate::ShapeError> {
+    pub fn layout_with_metrics_and_shaper(
+        self,
+        constraints: LayoutConstraints,
+        image_metrics: &ImageMetrics,
+        glyph_shaper: &mut impl crate::GlyphShaper,
+    ) -> Result<LaidOutDocument, crate::ShapeError> {
         let base_shaped = self.shaped.clone();
         let initial = self.layout_impl(constraints, image_metrics, None);
-        refine_first_lines(initial, base_shaped.clone(), base_shaped, constraints, image_metrics, glyph_shaper)
+        refine_first_lines(
+            initial,
+            base_shaped.clone(),
+            base_shaped,
+            constraints,
+            image_metrics,
+            glyph_shaper,
+        )
     }
 
-    pub fn layout_with_timings_and_metrics(self, constraints: LayoutConstraints, image_metrics: &ImageMetrics) -> (LaidOutDocument, crate::LayoutTimings) {
+    pub fn layout_with_timings_and_metrics(
+        self,
+        constraints: LayoutConstraints,
+        image_metrics: &ImageMetrics,
+    ) -> (LaidOutDocument, crate::LayoutTimings) {
         let mut timings = crate::LayoutTimings::default();
         let document = self.layout_impl(constraints, image_metrics, Some(&mut timings));
         (document, timings)
     }
 
-    pub(super) fn layout_impl(self, constraints: LayoutConstraints, image_metrics: &ImageMetrics, timings: Option<&mut crate::LayoutTimings>) -> LaidOutDocument {
+    pub(super) fn layout_impl(
+        self,
+        constraints: LayoutConstraints,
+        image_metrics: &ImageMetrics,
+        timings: Option<&mut crate::LayoutTimings>,
+    ) -> LaidOutDocument {
         let mut layout_state = LayoutState::default();
         let mut geometry = BoxGeometry::default();
-        let mut inline_token_cache = crate::layout::InlineTokenCache::default();
         let mut layout_scratch = crate::layout::LayoutScratch::default();
         crate::layout::layout_with_timings(
             crate::layout::LayoutInputs {
@@ -459,9 +678,14 @@ impl ShapedDocument {
                 text_geometry: Some(&self.shaped.text_geometry),
                 ellipsis_glyphs: &self.shaped.ellipsis_glyphs,
                 hyphen_glyphs: &self.shaped.hyphen_glyphs,
+                inline_plans: &self.shaped.inline_plans,
                 image_metrics,
             },
-            crate::layout::LayoutOutputs { geometry: &mut geometry, state: &mut layout_state, inline_token_cache: &mut inline_token_cache, scratch: &mut layout_scratch },
+            crate::layout::LayoutOutputs {
+                geometry: &mut geometry,
+                state: &mut layout_state,
+                scratch: &mut layout_scratch,
+            },
             constraints,
             timings,
         );
@@ -471,7 +695,6 @@ impl ShapedDocument {
             base_shaped: self.shaped.clone(),
             shaped: self.shaped,
             layout_state,
-            inline_token_cache,
             layout_scratch,
             last_constraints: constraints,
             last_image_metrics: image_metrics.clone(),
@@ -495,13 +718,28 @@ pub struct LaidOutDocument {
     pub(super) base_shaped: std::sync::Arc<ShapedText>,
     pub(super) shaped: std::sync::Arc<ShapedText>,
     pub(super) layout_state: LayoutState,
-    pub(super) inline_token_cache: crate::layout::InlineTokenCache,
     pub(super) layout_scratch: crate::layout::LayoutScratch,
     pub(super) last_constraints: LayoutConstraints,
     pub(super) last_image_metrics: ImageMetrics,
 }
 
 impl LaidOutDocument {
+    /// Whether changing only the viewport height can alter document geometry.
+    /// Viewport-relative style values are tracked by the style pipeline; this
+    /// covers layout-time dependencies that remain percentage based.
+    pub fn layout_depends_on_viewport_height(&self) -> bool {
+        (0..self.box_count()).any(|box_idx| {
+            let Some(style) = self.box_used_style(box_idx) else {
+                return false;
+            };
+            style.height().percentage_dependent()
+                || style.min_height().percentage_dependent()
+                || style.max_height().percentage_dependent()
+                || (style.position() == html_style_model::PositionMode::Absolute
+                    && style.inset_bottom().is_some())
+        })
+    }
+
     pub fn render_view(&self) -> RenderView<'_> {
         RenderView { doc: self }
     }
@@ -517,7 +755,10 @@ impl LaidOutDocument {
         self.last_image_metrics = image_metrics;
     }
 
-    pub fn relayout_with_timings(&mut self, constraints: LayoutConstraints) -> crate::LayoutTimings {
+    pub fn relayout_with_timings(
+        &mut self,
+        constraints: LayoutConstraints,
+    ) -> crate::LayoutTimings {
         let mut timings = crate::LayoutTimings::default();
         let image_metrics = ImageMetrics::from_document(self.document());
         self.relayout_impl(constraints, &image_metrics, Some(&mut timings));
@@ -526,24 +767,44 @@ impl LaidOutDocument {
         timings
     }
 
-    pub fn relayout_with_metrics(&mut self, constraints: LayoutConstraints, image_metrics: &ImageMetrics) {
+    pub fn relayout_with_metrics(
+        &mut self,
+        constraints: LayoutConstraints,
+        image_metrics: &ImageMetrics,
+    ) {
         self.relayout_impl(constraints, image_metrics, None);
         self.last_constraints = constraints;
         self.last_image_metrics = image_metrics.clone();
     }
 
-    pub fn relayout_with_metrics_and_shaper(&mut self, constraints: LayoutConstraints, image_metrics: &ImageMetrics, glyph_shaper: &mut impl crate::GlyphShaper) -> Result<(), crate::ShapeError> {
+    pub fn relayout_with_metrics_and_shaper(
+        &mut self,
+        constraints: LayoutConstraints,
+        image_metrics: &ImageMetrics,
+        glyph_shaper: &mut impl crate::GlyphShaper,
+    ) -> Result<(), crate::ShapeError> {
         let shaping_seed = self.shaped.clone();
         self.shaped = self.base_shaped.clone();
         self.relayout_impl(constraints, image_metrics, None);
         let initial = self.clone();
-        *self = refine_first_lines(initial, self.base_shaped.clone(), shaping_seed, constraints, image_metrics, glyph_shaper)?;
+        *self = refine_first_lines(
+            initial,
+            self.base_shaped.clone(),
+            shaping_seed,
+            constraints,
+            image_metrics,
+            glyph_shaper,
+        )?;
         self.last_constraints = constraints;
         self.last_image_metrics = image_metrics.clone();
         Ok(())
     }
 
-    pub fn relayout_with_metrics_and_timings(&mut self, constraints: LayoutConstraints, image_metrics: &ImageMetrics) -> crate::LayoutTimings {
+    pub fn relayout_with_metrics_and_timings(
+        &mut self,
+        constraints: LayoutConstraints,
+        image_metrics: &ImageMetrics,
+    ) -> crate::LayoutTimings {
         let mut timings = crate::LayoutTimings::default();
         self.relayout_impl(constraints, image_metrics, Some(&mut timings));
         self.last_constraints = constraints;
@@ -551,7 +812,12 @@ impl LaidOutDocument {
         timings
     }
 
-    fn relayout_impl(&mut self, constraints: LayoutConstraints, image_metrics: &ImageMetrics, timings: Option<&mut crate::LayoutTimings>) {
+    fn relayout_impl(
+        &mut self,
+        constraints: LayoutConstraints,
+        image_metrics: &ImageMetrics,
+        timings: Option<&mut crate::LayoutTimings>,
+    ) {
         let text_geometry = &self.shaped.text_geometry;
         crate::layout::layout_with_timings(
             crate::layout::LayoutInputs {
@@ -564,9 +830,14 @@ impl LaidOutDocument {
                 text_geometry: Some(text_geometry),
                 ellipsis_glyphs: &self.shaped.ellipsis_glyphs,
                 hyphen_glyphs: &self.shaped.hyphen_glyphs,
+                inline_plans: &self.shaped.inline_plans,
                 image_metrics,
             },
-            crate::layout::LayoutOutputs { geometry: &mut self.geometry, state: &mut self.layout_state, inline_token_cache: &mut self.inline_token_cache, scratch: &mut self.layout_scratch },
+            crate::layout::LayoutOutputs {
+                geometry: &mut self.geometry,
+                state: &mut self.layout_state,
+                scratch: &mut self.layout_scratch,
+            },
             constraints,
             timings,
         );
@@ -580,11 +851,19 @@ impl LaidOutDocument {
                 continue;
             };
             let mut y = self.anchor_glyph(id_idx).and_then(|glyph| {
-                let line_idx = *self.layout_state.line_output.glyph_line_indices.get(glyph as usize)?;
+                let line_idx = *self
+                    .layout_state
+                    .line_output
+                    .glyph_line_indices
+                    .get(glyph as usize)?;
                 if line_idx == u32::MAX {
                     return None;
                 }
-                self.layout_state.line_output.lines.get(line_idx as usize).map(|line| line.point.y)
+                self.layout_state
+                    .line_output
+                    .lines
+                    .get(line_idx as usize)
+                    .map(|line| line.point.y)
             });
             if y.is_none() {
                 let mut current = Some(box_idx);
@@ -627,15 +906,25 @@ impl LaidOutDocument {
     }
 
     pub(crate) fn link_href_for_glyph(&self, glyph_idx: u32) -> Option<u16> {
-        self.shaped.link_glyph_targets.get(&glyph_idx).map(|target| target.href)
+        self.shaped
+            .link_glyph_targets
+            .get(&glyph_idx)
+            .map(|target| target.href)
     }
 
     pub(crate) fn glyph_is_note_reference(&self, glyph_idx: u32) -> bool {
-        self.shaped.link_glyph_targets.get(&glyph_idx).is_some_and(|target| target.note_reference)
+        self.shaped
+            .link_glyph_targets
+            .get(&glyph_idx)
+            .is_some_and(|target| target.note_reference)
     }
 
     pub(crate) fn target_is_note(&self, id: &str) -> bool {
-        self.document().node_ids().find(|node| self.document().get_dom_id(*node) == Some(id)).and_then(|node| self.document().element_ref(node)).is_some_and(element_is_note_target)
+        self.document()
+            .node_ids()
+            .find(|node| self.document().get_dom_id(*node) == Some(id))
+            .and_then(|node| self.document().element_ref(node))
+            .is_some_and(element_is_note_target)
     }
 
     pub(crate) fn anchor_glyph(&self, id_idx: u16) -> Option<u32> {
@@ -664,7 +953,10 @@ impl LaidOutDocument {
                 && glyphs.contains(&glyph_idx)
             {
                 let node_idx = run.dom_text_node?;
-                let source_offset = self.shaped.inline_content.glyph_source_offset(glyph_idx as usize)? as usize;
+                let source_offset =
+                    self.shaped
+                        .inline_content
+                        .glyph_source_offset(glyph_idx as usize)? as usize;
                 return Some((node_idx, source_offset));
             }
         }
@@ -672,7 +964,9 @@ impl LaidOutDocument {
     }
 
     pub(crate) fn glyph_source_offset(&self, glyph_idx: u32) -> Option<u32> {
-        self.shaped.inline_content.glyph_source_offset(glyph_idx as usize)
+        self.shaped
+            .inline_content
+            .glyph_source_offset(glyph_idx as usize)
     }
 
     pub(crate) fn box_dom_element_idx(&self, box_idx: usize) -> Option<u32> {
@@ -680,20 +974,32 @@ impl LaidOutDocument {
     }
 
     pub(crate) fn box_layout_mode(&self, box_idx: usize) -> Option<&LayoutMode> {
-        self.inputs.layout_tree.box_at(box_idx).map(|layout_box| layout_box.layout_mode())
+        self.inputs
+            .layout_tree
+            .box_at(box_idx)
+            .map(|layout_box| layout_box.layout_mode())
     }
 
     pub(crate) fn box_style_indices(&self, box_idx: usize) -> Option<StyleIndices> {
         self.inputs.layout_tree.box_at(box_idx)?.style()
     }
 
-    pub(crate) fn box_used_style(&self, box_idx: usize) -> Option<html_style_model::UsedStyleView<'_>> {
-        let indices = self.box_style_indices(box_idx).unwrap_or_else(|| self.inputs.styles.default_indices());
-        self.shaped.font_metrics.used_style(&self.inputs.styles, indices, box_idx)
+    pub(crate) fn box_used_style(
+        &self,
+        box_idx: usize,
+    ) -> Option<html_style_model::UsedStyleView<'_>> {
+        let indices = self
+            .box_style_indices(box_idx)
+            .unwrap_or_else(|| self.inputs.styles.default_indices());
+        self.shaped
+            .font_metrics
+            .used_style(&self.inputs.styles, indices, box_idx)
     }
 
     pub(crate) fn box_text_format(&self, box_idx: usize) -> BoxTextFormat {
-        let style = self.box_used_style(box_idx).expect("shaping stores valid font metrics for every layout box");
+        let style = self
+            .box_used_style(box_idx)
+            .expect("shaping stores valid font metrics for every layout box");
         BoxTextFormat {
             font_size: style.font_size(),
             font_weight: style.font_weight(),
@@ -707,7 +1013,10 @@ impl LaidOutDocument {
     }
 
     pub(crate) fn list_marker(&self, box_idx: usize) -> Option<RenderListItemMarker> {
-        self.inputs.layout_tree.list_marker(box_idx).map(RenderListItemMarker::from_model)
+        self.inputs
+            .layout_tree
+            .list_marker(box_idx)
+            .map(RenderListItemMarker::from_model)
     }
 
     pub(crate) fn box_count(&self) -> usize {
@@ -715,7 +1024,10 @@ impl LaidOutDocument {
     }
 
     pub(crate) fn is_block_container_box(&self, box_idx: usize) -> bool {
-        matches!(self.box_layout_mode(box_idx), Some(LayoutMode::Block(_) | LayoutMode::Table(_) | LayoutMode::TableCell(_)))
+        matches!(
+            self.box_layout_mode(box_idx),
+            Some(LayoutMode::Block(_) | LayoutMode::Table(_) | LayoutMode::TableCell(_))
+        )
     }
 
     #[cfg(test)]
@@ -725,17 +1037,54 @@ impl LaidOutDocument {
 
     pub fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
-        report.extend_prefixed("LaidOutDocument.document", self.document().memory_usage_report());
-        report.extend_prefixed("LaidOutDocument.styles", self.inputs.styles.memory_usage_report());
-        report.extend_prefixed("LaidOutDocument.layout_tree", self.inputs.layout_tree.memory_usage_report());
-        report.extend_prefixed("LaidOutDocument.geometry", self.geometry.memory_usage_report());
-        report.extend_prefixed("LaidOutDocument.inline_content", self.shaped.inline_content.memory_usage_report());
-        report.extend_prefixed("LaidOutDocument.layout_state", self.layout_state.memory_usage_report());
-        report.extend_prefixed("LaidOutDocument.glyph_metrics", self.glyph_metrics().memory_usage_report());
-        report.add("LaidOutDocument.inline_token_cache", self.inline_token_cache.memory_usage_bytes(), self.inline_token_cache.len());
-        report.add("LaidOutDocument.rollback_image_metrics", self.last_image_metrics.memory_usage_bytes(), self.last_image_metrics.len());
-        report.add_slice_storage::<(u32, LinkGlyphTarget)>("LaidOutDocument.link_glyph_targets.storage", self.shaped.link_glyph_targets.capacity(), self.shaped.link_glyph_targets.len());
-        report.add_slice_storage::<(u16, u32)>("LaidOutDocument.anchor_glyphs.storage", self.shaped.anchor_glyphs.capacity(), self.shaped.anchor_glyphs.len());
+        report.extend_prefixed(
+            "LaidOutDocument.document",
+            self.document().memory_usage_report(),
+        );
+        report.extend_prefixed(
+            "LaidOutDocument.styles",
+            self.inputs.styles.memory_usage_report(),
+        );
+        report.extend_prefixed(
+            "LaidOutDocument.layout_tree",
+            self.inputs.layout_tree.memory_usage_report(),
+        );
+        report.extend_prefixed(
+            "LaidOutDocument.geometry",
+            self.geometry.memory_usage_report(),
+        );
+        report.extend_prefixed(
+            "LaidOutDocument.inline_content",
+            self.shaped.inline_content.memory_usage_report(),
+        );
+        report.extend_prefixed(
+            "LaidOutDocument.layout_state",
+            self.layout_state.memory_usage_report(),
+        );
+        report.extend_prefixed(
+            "LaidOutDocument.glyph_metrics",
+            self.glyph_metrics().memory_usage_report(),
+        );
+        report.add(
+            "LaidOutDocument.inline_plans",
+            self.shaped.inline_plans.memory_usage_bytes(),
+            self.shaped.inline_plans.len(),
+        );
+        report.add(
+            "LaidOutDocument.rollback_image_metrics",
+            self.last_image_metrics.memory_usage_bytes(),
+            self.last_image_metrics.len(),
+        );
+        report.add_slice_storage::<(u32, LinkGlyphTarget)>(
+            "LaidOutDocument.link_glyph_targets.storage",
+            self.shaped.link_glyph_targets.capacity(),
+            self.shaped.link_glyph_targets.len(),
+        );
+        report.add_slice_storage::<(u16, u32)>(
+            "LaidOutDocument.anchor_glyphs.storage",
+            self.shaped.anchor_glyphs.capacity(),
+            self.shaped.anchor_glyphs.len(),
+        );
         report
     }
 

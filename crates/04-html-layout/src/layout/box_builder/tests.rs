@@ -1165,4 +1165,5 @@ mod tests {
             assert!(current.is_none(), "box {start} participates in a parent cycle");
         }
     }
+
 }

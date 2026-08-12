@@ -14,6 +14,10 @@ pub(crate) struct BoxGeometry {
 }
 
 impl BoxGeometry {
+    pub(crate) fn len(&self) -> usize {
+        self.points.len()
+    }
+
     pub(crate) fn reset(&mut self, box_count: usize) {
         self.points.resize(box_count, Point::ZERO);
         self.sizes.resize(box_count, Size::ZERO);
@@ -55,9 +59,21 @@ impl BoxGeometry {
 
     pub(crate) fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
-        report.add_slice_storage::<Point>("BoxGeometry.points.storage", self.points.capacity(), self.points.len());
-        report.add_slice_storage::<Size>("BoxGeometry.sizes.storage", self.sizes.capacity(), self.sizes.len());
-        report.add_slice_storage::<Option<Rect>>("BoxGeometry.decoration_rects.storage", self.decoration_rects.capacity(), self.decoration_rects.len());
+        report.add_slice_storage::<Point>(
+            "BoxGeometry.points.storage",
+            self.points.capacity(),
+            self.points.len(),
+        );
+        report.add_slice_storage::<Size>(
+            "BoxGeometry.sizes.storage",
+            self.sizes.capacity(),
+            self.sizes.len(),
+        );
+        report.add_slice_storage::<Option<Rect>>(
+            "BoxGeometry.decoration_rects.storage",
+            self.decoration_rects.capacity(),
+            self.decoration_rects.len(),
+        );
         report
     }
 }

@@ -19,6 +19,7 @@ use super::*;
 #[derive(Clone, Debug)]
 pub struct RenderLine {
     index: usize,
+    owner_box_idx: usize,
     glyphs: Range<u32>,
     point: Point,
     height: f64,
@@ -102,20 +103,37 @@ impl<'a> Iterator for RenderLineTextFragments<'a> {
         if let Some(fragments) = &self.line.text_fragments {
             let fragment = fragments.get(self.index)?;
             self.index += 1;
-            return Some(RenderLineTextFragment { glyphs: fragment.glyphs.clone(), offset_x: fragment.offset_x, paint_order: fragment.paint_order, visible: fragment.visible });
+            return Some(RenderLineTextFragment {
+                glyphs: fragment.glyphs.clone(),
+                offset_x: fragment.offset_x,
+                paint_order: fragment.paint_order,
+                visible: fragment.visible,
+            });
         }
         if self.implicit_emitted || self.line.glyphs.is_empty() {
             return None;
         }
         self.implicit_emitted = true;
-        Some(RenderLineTextFragment { glyphs: self.line.glyphs.clone(), offset_x: 0.0, paint_order: 0, visible: true })
+        Some(RenderLineTextFragment {
+            glyphs: self.line.glyphs.clone(),
+            offset_x: 0.0,
+            paint_order: 0,
+            visible: true,
+        })
     }
 }
 
 impl RenderLine {
-    fn from_line(index: usize, line: &Line, positioned_layer: bool, negative_positioned_layer: bool, independent_positioned_layer: bool) -> Self {
+    fn from_line(
+        index: usize,
+        line: &Line,
+        positioned_layer: bool,
+        negative_positioned_layer: bool,
+        independent_positioned_layer: bool,
+    ) -> Self {
         Self {
             index,
+            owner_box_idx: line.owner_box_idx as usize,
             glyphs: line.glyphs.clone(),
             point: line.point,
             height: line.height,
@@ -132,6 +150,11 @@ impl RenderLine {
 
     pub fn index(&self) -> usize {
         self.index
+    }
+
+    /// Block box that emitted this line.
+    pub fn owner_box_idx(&self) -> usize {
+        self.owner_box_idx
     }
 
     pub fn glyphs(&self) -> Range<u32> {
@@ -207,8 +230,18 @@ pub struct RenderLines<'a> {
 }
 
 impl<'a> RenderLines<'a> {
-    fn new(lines: &'a [Line], positioned_layers: &'a [bool], negative_positioned_layers: &'a [bool], independent_positioned_layers: &'a [bool]) -> Self {
-        Self { lines, positioned_layers, negative_positioned_layers, independent_positioned_layers }
+    fn new(
+        lines: &'a [Line],
+        positioned_layers: &'a [bool],
+        negative_positioned_layers: &'a [bool],
+        independent_positioned_layers: &'a [bool],
+    ) -> Self {
+        Self {
+            lines,
+            positioned_layers,
+            negative_positioned_layers,
+            independent_positioned_layers,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -225,15 +258,33 @@ impl<'a> RenderLines<'a> {
                 idx,
                 line,
                 self.positioned_layers.get(idx).copied().unwrap_or(false),
-                self.negative_positioned_layers.get(idx).copied().unwrap_or(false),
-                self.independent_positioned_layers.get(idx).copied().unwrap_or(false),
+                self.negative_positioned_layers
+                    .get(idx)
+                    .copied()
+                    .unwrap_or(false),
+                self.independent_positioned_layers
+                    .get(idx)
+                    .copied()
+                    .unwrap_or(false),
             )
         })
     }
 
     pub fn first(&self) -> Option<RenderLine> {
         self.lines.first().map(|line| {
-            RenderLine::from_line(0, line, self.positioned_layers.first().copied().unwrap_or(false), self.negative_positioned_layers.first().copied().unwrap_or(false), self.independent_positioned_layers.first().copied().unwrap_or(false))
+            RenderLine::from_line(
+                0,
+                line,
+                self.positioned_layers.first().copied().unwrap_or(false),
+                self.negative_positioned_layers
+                    .first()
+                    .copied()
+                    .unwrap_or(false),
+                self.independent_positioned_layers
+                    .first()
+                    .copied()
+                    .unwrap_or(false),
+            )
         })
     }
 
@@ -244,8 +295,14 @@ impl<'a> RenderLines<'a> {
                 index,
                 line,
                 self.positioned_layers.get(index).copied().unwrap_or(false),
-                self.negative_positioned_layers.get(index).copied().unwrap_or(false),
-                self.independent_positioned_layers.get(index).copied().unwrap_or(false),
+                self.negative_positioned_layers
+                    .get(index)
+                    .copied()
+                    .unwrap_or(false),
+                self.independent_positioned_layers
+                    .get(index)
+                    .copied()
+                    .unwrap_or(false),
             )
         })
     }
@@ -256,8 +313,14 @@ impl<'a> RenderLines<'a> {
                 index,
                 line,
                 self.positioned_layers.get(index).copied().unwrap_or(false),
-                self.negative_positioned_layers.get(index).copied().unwrap_or(false),
-                self.independent_positioned_layers.get(index).copied().unwrap_or(false),
+                self.negative_positioned_layers
+                    .get(index)
+                    .copied()
+                    .unwrap_or(false),
+                self.independent_positioned_layers
+                    .get(index)
+                    .copied()
+                    .unwrap_or(false),
             )
         })
     }
@@ -271,7 +334,10 @@ pub struct RenderGlyphOffsetRun {
 
 impl RenderGlyphOffsetRun {
     fn from_run(run: &GlyphOffsetRun) -> Self {
-        Self { range: run.range.clone(), offset: run.offset }
+        Self {
+            range: run.range.clone(),
+            offset: run.offset,
+        }
     }
 
     pub fn range(&self) -> Range<u32> {
@@ -295,7 +361,10 @@ pub struct RenderGlyphAdvanceRun {
 
 impl RenderGlyphAdvanceRun {
     fn from_run(run: &GlyphAdvanceRun) -> Self {
-        Self { range: run.range.clone(), advance: run.advance }
+        Self {
+            range: run.range.clone(),
+            advance: run.advance,
+        }
     }
 
     pub fn range(&self) -> Range<u32> {
@@ -327,7 +396,11 @@ pub struct RenderHyphenFragment {
 
 impl RenderHyphenFragment {
     fn from_fragment(fragment: &HyphenFragment) -> Self {
-        Self { glyph: fragment.glyph, offset: fragment.offset, visible: fragment.visible }
+        Self {
+            glyph: fragment.glyph,
+            offset: fragment.offset,
+            visible: fragment.visible,
+        }
     }
 
     pub fn glyph(&self) -> GlyphId {
@@ -345,7 +418,11 @@ impl RenderHyphenFragment {
 
 impl RenderEllipsisFragment {
     fn from_fragment(fragment: &EllipsisFragment) -> Self {
-        Self { glyph: fragment.glyph, offset: fragment.offset, visible: fragment.visible }
+        Self {
+            glyph: fragment.glyph,
+            offset: fragment.offset,
+            visible: fragment.visible,
+        }
     }
 
     pub fn glyph(&self) -> GlyphId {
@@ -444,7 +521,12 @@ pub struct RenderTextRuns<'a> {
 
 impl<'a> RenderTextRuns<'a> {
     fn new(runs: &'a [InlineItem], kind_filter: Option<TextRunKind>) -> Self {
-        Self { runs, idx: 0, kind_filter, only_box: None }
+        Self {
+            runs,
+            idx: 0,
+            kind_filter,
+            only_box: None,
+        }
     }
 
     pub fn only_box(mut self, box_idx: usize) -> Self {
@@ -466,17 +548,30 @@ impl<'a> Iterator for RenderTextRuns<'a> {
             self.idx += 1;
 
             let run = self.runs.get(idx)?;
-            if self.only_box.is_some_and(|box_idx| box_idx != run.box_idx as usize) {
+            if self
+                .only_box
+                .is_some_and(|box_idx| box_idx != run.box_idx as usize)
+            {
                 continue;
             }
 
             if let Some(kind_filter) = self.kind_filter {
                 match (&run.kind, kind_filter) {
                     (InlineItemKind::Text { glyphs }, TextRunKind::Text) => {
-                        return Some(RenderTextRun { kind: TextRunKind::Text, box_idx: run.box_idx as usize, dom_text_node: run.dom_text_node, glyphs: glyphs.clone() });
+                        return Some(RenderTextRun {
+                            kind: TextRunKind::Text,
+                            box_idx: run.box_idx as usize,
+                            dom_text_node: run.dom_text_node,
+                            glyphs: glyphs.clone(),
+                        });
                     }
                     (InlineItemKind::Marker { glyphs }, TextRunKind::Marker) => {
-                        return Some(RenderTextRun { kind: TextRunKind::Marker, box_idx: run.box_idx as usize, dom_text_node: run.dom_text_node, glyphs: glyphs.clone() });
+                        return Some(RenderTextRun {
+                            kind: TextRunKind::Marker,
+                            box_idx: run.box_idx as usize,
+                            dom_text_node: run.dom_text_node,
+                            glyphs: glyphs.clone(),
+                        });
                     }
                     _ => continue,
                 }
@@ -484,10 +579,20 @@ impl<'a> Iterator for RenderTextRuns<'a> {
 
             match &run.kind {
                 InlineItemKind::Text { glyphs } => {
-                    return Some(RenderTextRun { kind: TextRunKind::Text, box_idx: run.box_idx as usize, dom_text_node: run.dom_text_node, glyphs: glyphs.clone() });
+                    return Some(RenderTextRun {
+                        kind: TextRunKind::Text,
+                        box_idx: run.box_idx as usize,
+                        dom_text_node: run.dom_text_node,
+                        glyphs: glyphs.clone(),
+                    });
                 }
                 InlineItemKind::Marker { glyphs } => {
-                    return Some(RenderTextRun { kind: TextRunKind::Marker, box_idx: run.box_idx as usize, dom_text_node: run.dom_text_node, glyphs: glyphs.clone() });
+                    return Some(RenderTextRun {
+                        kind: TextRunKind::Marker,
+                        box_idx: run.box_idx as usize,
+                        dom_text_node: run.dom_text_node,
+                        glyphs: glyphs.clone(),
+                    });
                 }
                 _ => continue,
             }
@@ -530,27 +635,36 @@ impl<'a> RenderTextView<'a> {
     }
 
     pub fn is_character_cluster_boundary(self, character_boundary: u32) -> bool {
-        self.doc.text_geometry().is_cluster_boundary(character_boundary as usize)
+        self.doc
+            .text_geometry()
+            .is_cluster_boundary(character_boundary as usize)
     }
 
-    pub fn authoritative_runs(self, requested: Range<u32>) -> impl Iterator<Item = RenderAuthoritativeTextRun> + 'a {
-        self.doc.text_geometry().authoritative_runs().iter().filter_map(move |run| {
-            let start = requested.start.max(run.source_range.start);
-            let end = requested.end.min(run.source_range.end);
-            if start >= end {
-                return None;
-            }
-            let local_start = start - run.source_range.start;
-            let local_end = end - run.source_range.start;
-            Some(RenderAuthoritativeTextRun {
-                source_range: start..end,
-                run_range: local_start..local_end,
-                run: run.backend_run,
-                natural_offset: *run.caret_stops.get(local_start as usize)?,
-                ascent: run.ascent,
-                placement_required: run.placement_required,
+    pub fn authoritative_runs(
+        self,
+        requested: Range<u32>,
+    ) -> impl Iterator<Item = RenderAuthoritativeTextRun> + 'a {
+        self.doc
+            .text_geometry()
+            .authoritative_runs()
+            .iter()
+            .filter_map(move |run| {
+                let start = requested.start.max(run.source_range.start);
+                let end = requested.end.min(run.source_range.end);
+                if start >= end {
+                    return None;
+                }
+                let local_start = start - run.source_range.start;
+                let local_end = end - run.source_range.start;
+                Some(RenderAuthoritativeTextRun {
+                    source_range: start..end,
+                    run_range: local_start..local_end,
+                    run: run.backend_run,
+                    natural_offset: *run.caret_stops.get(local_start as usize)?,
+                    ascent: run.ascent,
+                    placement_required: run.placement_required,
+                })
             })
-        })
     }
 
     pub fn line_count(self) -> usize {
@@ -558,62 +672,132 @@ impl<'a> RenderTextView<'a> {
     }
 
     pub fn lines(self) -> RenderLines<'a> {
-        RenderLines::new(&self.doc.layout_state.line_output.lines, &self.doc.layout_state.line_output.positioned_layers, &self.doc.layout_state.line_output.negative_positioned_layers, &self.doc.layout_state.line_output.independent_positioned_layers)
+        RenderLines::new(
+            &self.doc.layout_state.line_output.lines,
+            &self.doc.layout_state.line_output.positioned_layers,
+            &self.doc.layout_state.line_output.negative_positioned_layers,
+            &self
+                .doc
+                .layout_state
+                .line_output
+                .independent_positioned_layers,
+        )
     }
 
     pub fn line(self, idx: usize) -> Option<RenderLine> {
-        self.doc.layout_state.line_output.lines.get(idx).map(|line| {
-            RenderLine::from_line(
-                idx,
-                line,
-                self.doc.layout_state.line_output.positioned_layers.get(idx).copied().unwrap_or(false),
-                self.doc.layout_state.line_output.negative_positioned_layers.get(idx).copied().unwrap_or(false),
-                self.doc.layout_state.line_output.independent_positioned_layers.get(idx).copied().unwrap_or(false),
-            )
-        })
+        self.doc
+            .layout_state
+            .line_output
+            .lines
+            .get(idx)
+            .map(|line| {
+                RenderLine::from_line(
+                    idx,
+                    line,
+                    self.doc
+                        .layout_state
+                        .line_output
+                        .positioned_layers
+                        .get(idx)
+                        .copied()
+                        .unwrap_or(false),
+                    self.doc
+                        .layout_state
+                        .line_output
+                        .negative_positioned_layers
+                        .get(idx)
+                        .copied()
+                        .unwrap_or(false),
+                    self.doc
+                        .layout_state
+                        .line_output
+                        .independent_positioned_layers
+                        .get(idx)
+                        .copied()
+                        .unwrap_or(false),
+                )
+            })
     }
 
     /// Resolved overflow clip for the line's formatting context.
     pub fn line_overflow_clip(self, idx: usize) -> Option<RenderOverflowClip> {
-        self.doc.layout_state.line_output.line_clips.get(idx).copied().flatten().map(RenderOverflowClip::from_clip)
+        self.doc
+            .layout_state
+            .line_output
+            .line_clips
+            .get(idx)
+            .copied()
+            .flatten()
+            .map(RenderOverflowClip::from_clip)
     }
 
     /// Returns the line that owns a source glyph.
     pub fn line_index_for_glyph(self, glyph_idx: u32) -> Option<usize> {
-        let encoded = *self.doc.layout_state.line_output.glyph_line_indices.get(glyph_idx as usize)?;
+        let encoded = *self
+            .doc
+            .layout_state
+            .line_output
+            .glyph_line_indices
+            .get(glyph_idx as usize)?;
         (encoded != u32::MAX).then_some(encoded as usize)
     }
 
     pub fn line_glyph_offsets(self, line_idx: usize) -> Option<RenderGlyphOffsetRuns<'a>> {
-        self.doc.layout_state.line_output.line_glyph_offsets.get(line_idx).map(|runs| RenderGlyphOffsetRuns::new(runs))
+        self.doc
+            .layout_state
+            .line_output
+            .line_glyph_offsets
+            .get(line_idx)
+            .map(|runs| RenderGlyphOffsetRuns::new(runs))
     }
 
     pub fn line_glyph_advances(self, line_idx: usize) -> Option<RenderGlyphAdvanceRuns<'a>> {
-        self.doc.layout_state.line_output.line_glyph_advances.get(line_idx).map(|runs| RenderGlyphAdvanceRuns::new(runs))
+        self.doc
+            .layout_state
+            .line_output
+            .line_glyph_advances
+            .get(line_idx)
+            .map(|runs| RenderGlyphAdvanceRuns::new(runs))
     }
 
     pub fn line_text_fragments(self, line_idx: usize) -> Option<RenderLineTextFragments<'a>> {
         let line = self.doc.layout_state.line_output.lines.get(line_idx)?;
-        Some(RenderLineTextFragments { line, index: 0, implicit_emitted: false })
+        Some(RenderLineTextFragments {
+            line,
+            index: 0,
+            implicit_emitted: false,
+        })
     }
 
     pub fn ellipsis_for_line(self, line_idx: usize) -> Option<RenderEllipsisFragment> {
         let fragments = &self.doc.layout_state.line_output.ellipsis_fragments;
-        let idx = fragments.binary_search_by_key(&line_idx, |fragment| fragment.line_idx).ok()?;
-        fragments.get(idx).map(RenderEllipsisFragment::from_fragment)
+        let idx = fragments
+            .binary_search_by_key(&line_idx, |fragment| fragment.line_idx)
+            .ok()?;
+        fragments
+            .get(idx)
+            .map(RenderEllipsisFragment::from_fragment)
     }
 
     pub fn hyphen_for_line(self, line_idx: usize) -> Option<RenderHyphenFragment> {
         let fragments = &self.doc.layout_state.line_output.hyphen_fragments;
-        let idx = fragments.binary_search_by_key(&line_idx, |fragment| fragment.line_idx).ok()?;
+        let idx = fragments
+            .binary_search_by_key(&line_idx, |fragment| fragment.line_idx)
+            .ok()?;
         fragments.get(idx).map(RenderHyphenFragment::from_fragment)
     }
 
     pub fn text_runs(self) -> RenderTextRuns<'a> {
-        RenderTextRuns::new(self.doc.shaped.inline_content.inline_items(), Some(TextRunKind::Text))
+        RenderTextRuns::new(
+            self.doc.shaped.inline_content.inline_items(),
+            Some(TextRunKind::Text),
+        )
     }
 
     pub fn marker_runs(self) -> RenderTextRuns<'a> {
-        RenderTextRuns::new(self.doc.shaped.inline_content.inline_items(), Some(TextRunKind::Marker))
+        RenderTextRuns::new(
+            self.doc.shaped.inline_content.inline_items(),
+            Some(TextRunKind::Marker),
+        )
     }
 }
