@@ -1121,26 +1121,41 @@ pub(in crate::layout) fn canonical_text_unit(
 ) -> CanonicalTextUnit {
     let glyph = engine.text.glyph_at(glyph_idx as usize).unwrap_or_default();
     let metric = engine.text.glyph_metric(glyph);
-    let character = metric.ch();
+    canonical_text_unit_from_facts(
+        engine,
+        glyph_idx,
+        metric.ch(),
+        metric.advance(),
+        style.font_size(),
+        style.letter_spacing() as f64,
+        style.word_spacing() as f64,
+        white_space,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn canonical_text_unit_from_facts(
+    engine: &crate::layout::LayoutEngine<'_, '_>,
+    glyph_idx: u32,
+    character: char,
+    glyph_advance: f32,
+    font_size: f32,
+    letter_spacing: f64,
+    word_spacing: f64,
+    white_space: WhiteSpace,
+) -> CanonicalTextUnit {
     let break_kind = match engine.text.whitespace_wrap_before(glyph_idx as usize) {
         crate::layout_model::WhitespaceWrapOverride::Style => break_kind(character, white_space),
         crate::layout_model::WhitespaceWrapOverride::Allow => BreakKind::Soft,
         crate::layout_model::WhitespaceWrapOverride::Suppress => BreakKind::None,
     };
-    let natural_advance =
-        if matches!(character, '\u{00ad}' | '\u{200b}') || style.font_size() <= 0.0 {
-            0.0
-        } else {
-            engine
-                .text
-                .text_advance(glyph_idx as usize, metric.advance()) as f64
-                + style.letter_spacing() as f64
-                + if character == ' ' {
-                    style.word_spacing() as f64
-                } else {
-                    0.0
-                }
-        };
+    let natural_advance = if matches!(character, '\u{00ad}' | '\u{200b}') || font_size <= 0.0 {
+        0.0
+    } else {
+        engine.text.text_advance(glyph_idx as usize, glyph_advance) as f64
+            + letter_spacing
+            + if character == ' ' { word_spacing } else { 0.0 }
+    };
     CanonicalTextUnit {
         character,
         break_kind,

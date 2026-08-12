@@ -167,7 +167,16 @@ pub(super) fn append_text_tokens(
         } else {
             font_size as f64 * 1.2
         };
-        let unit = canonical_text_unit(engine, glyph_idx, style, white_space);
+        let unit = canonical_text_unit_from_facts(
+            engine,
+            glyph_idx,
+            metric.ch(),
+            metric.advance(),
+            font_size,
+            letter_spacing,
+            word_spacing,
+            white_space,
+        );
         let character = unit.character;
         let width = unit.natural_advance;
         let tab_advance = if character == '\t' && white_space.preserves_spaces() {
