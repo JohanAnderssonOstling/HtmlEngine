@@ -355,23 +355,38 @@ impl<'sheet, 'css> EffectiveRule<'sheet, 'css> {
 /// effective rules.
 pub(crate) struct ParsedStylesheetSet<'sheet, 'css> {
     user_agent: &'sheet StyleSheet<'css>,
-    authors: &'sheet [StyleSheet<'css>],
+    authors: AuthorStylesheets<'sheet, 'css>,
     author_root_indices: &'sheet [u32],
+}
+
+#[derive(Clone, Copy)]
+enum AuthorStylesheets<'sheet, 'css> {
+    Contiguous(&'sheet [StyleSheet<'css>]),
+    References(&'sheet [&'sheet StyleSheet<'css>]),
 }
 
 impl<'sheet, 'css> ParsedStylesheetSet<'sheet, 'css> {
     #[cfg(test)]
     pub(crate) fn new(user_agent: &'sheet StyleSheet<'css>, authors: &'sheet [StyleSheet<'css>]) -> Self {
-        Self { user_agent, authors, author_root_indices: &[] }
+        Self { user_agent, authors: AuthorStylesheets::Contiguous(authors), author_root_indices: &[] }
     }
 
-    pub(crate) fn with_author_root_indices(user_agent: &'sheet StyleSheet<'css>, authors: &'sheet [StyleSheet<'css>], author_root_indices: &'sheet [u32]) -> Self {
+    pub(crate) fn with_contiguous_author_root_indices(user_agent: &'sheet StyleSheet<'css>, authors: &'sheet [StyleSheet<'css>], author_root_indices: &'sheet [u32]) -> Self {
         debug_assert_eq!(authors.len(), author_root_indices.len());
-        Self { user_agent, authors, author_root_indices }
+        Self { user_agent, authors: AuthorStylesheets::Contiguous(authors), author_root_indices }
+    }
+
+    pub(crate) fn with_author_root_indices(user_agent: &'sheet StyleSheet<'css>, authors: &'sheet [&'sheet StyleSheet<'css>], author_root_indices: &'sheet [u32]) -> Self {
+        debug_assert_eq!(authors.len(), author_root_indices.len());
+        Self { user_agent, authors: AuthorStylesheets::References(authors), author_root_indices }
     }
 
     pub(crate) fn prepare(self, environment: MediaEnvironment, initial_font_size: f64) -> PreparedRuleSet<'css> {
-        let capacity = self.user_agent.rules.0.len() + self.authors.iter().map(|stylesheet| stylesheet.rules.0.len()).sum::<usize>();
+        let author_capacity = match self.authors {
+            AuthorStylesheets::Contiguous(stylesheets) => stylesheets.iter().map(|stylesheet| stylesheet.rules.0.len()).sum::<usize>(),
+            AuthorStylesheets::References(stylesheets) => stylesheets.iter().map(|stylesheet| stylesheet.rules.0.len()).sum::<usize>(),
+        };
+        let capacity = self.user_agent.rules.0.len() + author_capacity;
         let mut rules = Vec::with_capacity(capacity);
         let mut source_order = 0u32;
         let mut media_queries = MediaQuerySet::default();
@@ -379,11 +394,22 @@ impl<'sheet, 'css> ParsedStylesheetSet<'sheet, 'css> {
         let mut scopes = Vec::new();
 
         prepare_origin(std::iter::once((self.user_agent, None)), CascadeOrigin::UserAgent, &mut rules, &mut scopes, &mut source_order, environment, initial_font_size, &mut media_queries, &mut media_path);
-        let authors = self.authors.iter().enumerate().map(|(index, stylesheet)| {
-            let root_index = self.author_root_indices.get(index).copied().unwrap_or_else(|| u32::try_from(index).expect("author stylesheet count fits in u32"));
-            (stylesheet, Some(root_index))
-        });
-        prepare_origin(authors, CascadeOrigin::Author, &mut rules, &mut scopes, &mut source_order, environment, initial_font_size, &mut media_queries, &mut media_path);
+        match self.authors {
+            AuthorStylesheets::Contiguous(stylesheets) => {
+                let authors = stylesheets.iter().enumerate().map(|(index, stylesheet)| {
+                    let root_index = self.author_root_indices.get(index).copied().unwrap_or_else(|| u32::try_from(index).expect("author stylesheet count fits in u32"));
+                    (stylesheet, Some(root_index))
+                });
+                prepare_origin(authors, CascadeOrigin::Author, &mut rules, &mut scopes, &mut source_order, environment, initial_font_size, &mut media_queries, &mut media_path);
+            }
+            AuthorStylesheets::References(stylesheets) => {
+                let authors = stylesheets.iter().copied().enumerate().map(|(index, stylesheet)| {
+                    let root_index = self.author_root_indices.get(index).copied().unwrap_or_else(|| u32::try_from(index).expect("author stylesheet count fits in u32"));
+                    (stylesheet, Some(root_index))
+                });
+                prepare_origin(authors, CascadeOrigin::Author, &mut rules, &mut scopes, &mut source_order, environment, initial_font_size, &mut media_queries, &mut media_path);
+            }
+        }
 
         let rule_pseudo_masks = rules
             .iter()

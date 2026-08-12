@@ -26,6 +26,9 @@ pub struct StyleProgramCacheStats {
     pub entries: usize,
     pub hits: u64,
     pub misses: u64,
+    pub parsed_entries: usize,
+    pub parsed_hits: u64,
+    pub parsed_misses: u64,
 }
 
 struct StyleProgramCacheKey {
@@ -41,6 +44,11 @@ struct CachedStyleProgram {
     program: Arc<StyleProgram>,
 }
 
+struct CachedParsedStylesheet {
+    css: String,
+    stylesheet: Option<Arc<StyleSheet<'static>>>,
+}
+
 /// Small in-process cache intended to live for the lifetime of an open book.
 /// Entries are bounded and oldest-first evicted.
 pub struct StyleProgramCache {
@@ -48,6 +56,10 @@ pub struct StyleProgramCache {
     capacity: usize,
     hits: u64,
     misses: u64,
+    parsed_entries: VecDeque<CachedParsedStylesheet>,
+    parsed_capacity: usize,
+    parsed_hits: u64,
+    parsed_misses: u64,
 }
 
 impl Default for StyleProgramCache {
@@ -57,6 +69,10 @@ impl Default for StyleProgramCache {
             capacity: 8,
             hits: 0,
             misses: 0,
+            parsed_entries: VecDeque::new(),
+            parsed_capacity: 64,
+            parsed_hits: 0,
+            parsed_misses: 0,
         }
     }
 }
@@ -66,6 +82,9 @@ impl StyleProgramCache {
         self.entries.clear();
         self.hits = 0;
         self.misses = 0;
+        self.parsed_entries.clear();
+        self.parsed_hits = 0;
+        self.parsed_misses = 0;
     }
 
     pub fn stats(&self) -> StyleProgramCacheStats {
@@ -73,7 +92,36 @@ impl StyleProgramCache {
             entries: self.entries.len(),
             hits: self.hits,
             misses: self.misses,
+            parsed_entries: self.parsed_entries.len(),
+            parsed_hits: self.parsed_hits,
+            parsed_misses: self.parsed_misses,
         }
+    }
+
+    fn get_or_parse(&mut self, css: &str, index: usize) -> Option<Arc<StyleSheet<'static>>> {
+        if let Some(position) = self.parsed_entries.iter().position(|entry| entry.css == css) {
+            self.parsed_hits += 1;
+            if position + 1 != self.parsed_entries.len() {
+                let entry = self.parsed_entries.remove(position).expect("located parsed stylesheet exists");
+                self.parsed_entries.push_back(entry);
+            }
+            return self.parsed_entries.back().expect("cached parsed stylesheet exists").stylesheet.clone();
+        }
+        self.parsed_misses += 1;
+        let normalized = crate::style::source::declarations::normalize(css);
+        let stylesheet = if normalized.trim().is_empty() {
+            None
+        } else {
+            StyleSheet::parse(&normalized, ParserOptions { error_recovery: true, ..ParserOptions::default() })
+                .map(|stylesheet| Arc::new(stylesheet.into_owned()))
+                .map_err(|error| eprintln!("Skipping CSS chunk {index}: {error}"))
+                .ok()
+        };
+        if self.parsed_entries.len() == self.parsed_capacity {
+            self.parsed_entries.pop_front();
+        }
+        self.parsed_entries.push_back(CachedParsedStylesheet { css: css.to_owned(), stylesheet: stylesheet.clone() });
+        stylesheet
     }
 
     pub fn get_or_compile(
@@ -126,12 +174,11 @@ impl StyleProgramCache {
             viewport_height,
             initial_font_size,
         };
-        let css = inputs.iter().map(|input| input.css).collect::<Vec<_>>();
-        let (program, timings) = StyleProgram::compile_with_timings(
-            &css,
-            environment,
-            f32::from_bits(initial_font_size),
-        );
+        let parse_started = Instant::now();
+        let stylesheets = inputs.iter().enumerate().filter_map(|(index, input)| self.get_or_parse(input.css, index).map(|stylesheet| (stylesheet, index))).collect::<Vec<_>>();
+        let parse_author_css = parse_started.elapsed();
+        let (program, mut timings) = StyleProgram::compile_parsed_with_timings(inputs.len(), &stylesheets, environment, f32::from_bits(initial_font_size));
+        timings.parse_author_css = parse_author_css;
         if self.entries.len() == self.capacity {
             self.entries.pop_front();
         }
@@ -160,11 +207,8 @@ impl StyleProgram {
     ) -> (Self, StyleTimings) {
         let mut timings = StyleTimings::default();
         let started = Instant::now();
-        let user_agent = StyleSheet::parse(DEFAULT_CSS, ParserOptions::default())
-            .expect("default CSS must parse")
-            .into_owned();
+        let user_agent = StyleSheet::parse(DEFAULT_CSS, ParserOptions::default()).expect("default CSS must parse").into_owned();
         timings.parse_default_css = started.elapsed();
-
         let started = Instant::now();
         let mut stylesheets = Vec::with_capacity(css_chunks.len());
         let mut author_root_indices = Vec::with_capacity(css_chunks.len());
@@ -180,21 +224,30 @@ impl StyleProgram {
             match StyleSheet::parse(&normalized, options) {
                 Ok(stylesheet) => {
                     stylesheets.push(stylesheet.into_owned());
-                    author_root_indices
-                        .push(u32::try_from(index).expect("author stylesheet count fits in u32"));
+                    author_root_indices.push(u32::try_from(index).expect("author stylesheet count fits in u32"));
                 }
                 Err(error) => eprintln!("Skipping CSS chunk {index}: {error}"),
             }
         }
         timings.parse_author_css = started.elapsed();
+        let prepared = ParsedStylesheetSet::with_contiguous_author_root_indices(&user_agent, &stylesheets, &author_root_indices);
+        Self::finish_compile(prepared, css_chunks.len(), environment, initial_font_size, timings)
+    }
 
+    fn compile_parsed_with_timings(input_count: usize, stylesheets: &[(Arc<StyleSheet<'static>>, usize)], environment: MediaEnvironment, initial_font_size: f32) -> (Self, StyleTimings) {
+        let mut timings = StyleTimings::default();
         let started = Instant::now();
-        let prepared = ParsedStylesheetSet::with_author_root_indices(
-            &user_agent,
-            &stylesheets,
-            &author_root_indices,
-        )
-        .prepare(environment, f64::from(initial_font_size));
+        let user_agent = StyleSheet::parse(DEFAULT_CSS, ParserOptions::default()).expect("default CSS must parse").into_owned();
+        timings.parse_default_css = started.elapsed();
+        let author_refs = stylesheets.iter().map(|(stylesheet, _)| stylesheet.as_ref()).collect::<Vec<_>>();
+        let author_root_indices = stylesheets.iter().map(|(_, index)| u32::try_from(*index).expect("author stylesheet count fits in u32")).collect::<Vec<_>>();
+        let prepared = ParsedStylesheetSet::with_author_root_indices(&user_agent, &author_refs, &author_root_indices);
+        Self::finish_compile(prepared, input_count, environment, initial_font_size, timings)
+    }
+
+    fn finish_compile(parsed: ParsedStylesheetSet<'_, 'static>, input_count: usize, environment: MediaEnvironment, initial_font_size: f32, mut timings: StyleTimings) -> (Self, StyleTimings) {
+        let started = Instant::now();
+        let prepared = parsed.prepare(environment, f64::from(initial_font_size));
         timings.prepare_rules = started.elapsed();
         let started = Instant::now();
         let selector_index = SelectorIndex::from_prepared(&prepared);
@@ -203,7 +256,7 @@ impl StyleProgram {
             Self {
                 prepared,
                 selector_index,
-                input_count: css_chunks.len(),
+                input_count,
             },
             timings,
         )
@@ -273,12 +326,13 @@ fn apply(
 
 #[cfg(test)]
 mod tests {
-    use super::StyleProgram;
+    use super::{StyleProgram, StyleProgramCache};
 
     fn assert_send_sync<T: Send + Sync>() {}
 
     #[test]
     fn compiled_program_can_move_between_document_workers() {
         assert_send_sync::<StyleProgram>();
+        assert_send_sync::<StyleProgramCache>();
     }
 }

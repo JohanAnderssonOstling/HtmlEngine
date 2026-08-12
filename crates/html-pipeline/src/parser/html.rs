@@ -47,6 +47,9 @@ pub struct BookStylesheetCacheStats {
     pub compiled_entries: usize,
     pub compiled_hits: u64,
     pub compiled_misses: u64,
+    pub parsed_entries: usize,
+    pub parsed_hits: u64,
+    pub parsed_misses: u64,
 }
 
 impl BookStylesheetCache {
@@ -58,7 +61,7 @@ impl BookStylesheetCache {
     pub fn stats(&self) -> BookStylesheetCacheStats {
         let entries = self.entries.lock().expect("stylesheet cache lock");
         let programs = self.programs.lock().expect("style program cache lock").stats();
-        BookStylesheetCacheStats { entries: entries.len(), bytes: entries.values().map(String::len).sum(), compiled_entries: programs.entries, compiled_hits: programs.hits, compiled_misses: programs.misses }
+        BookStylesheetCacheStats { entries: entries.len(), bytes: entries.values().map(String::len).sum(), compiled_entries: programs.entries, compiled_hits: programs.hits, compiled_misses: programs.misses, parsed_entries: programs.parsed_entries, parsed_hits: programs.parsed_hits, parsed_misses: programs.parsed_misses }
     }
 
     fn read(&self, provider: &dyn ResourceProvider, uri: &str, transport_label: Option<&str>, fallback_label: Option<&str>) -> std::io::Result<String> {
@@ -508,6 +511,20 @@ mod tests {
         }
         let stats = cache.stats();
         assert_eq!((stats.compiled_entries, stats.compiled_hits, stats.compiled_misses), (1, 1, 1));
+    }
+
+    #[test]
+    fn reuses_individual_parsed_stylesheets_across_spine_items() {
+        let cache = BookStylesheetCache::default();
+        let shared = "p { color: red; margin: 1em }";
+        for chapter_css in [".chapter-one { display: block }", ".chapter-two { display: block }"] {
+            let mut factory = DocumentFactory::new();
+            factory.set_book_stylesheet_cache(cache.clone());
+            let _document = factory.parse_with_new_pipeline_css_chunks("<html><body><p>text</p></body></html>", &[shared, chapter_css]);
+        }
+        let stats = cache.stats();
+        assert_eq!((stats.compiled_hits, stats.compiled_misses), (0, 2));
+        assert_eq!((stats.parsed_entries, stats.parsed_hits, stats.parsed_misses), (3, 1, 3));
     }
 
     #[test]
