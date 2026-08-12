@@ -7,6 +7,7 @@ use super::*;
 use crate::layout_model::{LayoutMode, LineInlineBoxFragment, LineTextFragment};
 use unicode_categories::UnicodeCategories;
 
+#[derive(Clone, Copy)]
 pub(super) struct TokenPlacement {
     pub(super) x: f64,
     pub(super) advance: f64,

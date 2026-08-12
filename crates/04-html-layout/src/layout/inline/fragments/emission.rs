@@ -75,11 +75,68 @@ pub(super) fn positioned_inline_box_fragments(
     baseline: f64,
     containing_width: f64,
 ) -> Vec<LineInlineBoxFragment> {
+    positioned_inline_box_fragments_from(
+        engine,
+        container_box_idx,
+        span.iter().zip(placements.iter().copied()),
+        runs,
+        replaced,
+        line_height,
+        baseline,
+        containing_width,
+    )
+}
+
+fn positioned_plain_inline_box_fragments(
+    engine: &crate::layout::LayoutEngine<'_, '_>,
+    container_box_idx: usize,
+    span: &[InlineToken],
+    runs: &[InlineTokenMetrics],
+    replaced: &[ReplacedToken],
+    line_height: f64,
+    baseline: f64,
+    containing_width: f64,
+) -> Vec<LineInlineBoxFragment> {
+    let mut x = 0.0;
+    let placements = span.iter().map(|token| {
+        let advance = token.advance_at(runs, x);
+        let placement = TokenPlacement {
+            x,
+            advance,
+            y_offset: 0.0,
+            relative_offset: Vec2::ZERO,
+        };
+        x += advance;
+        (token, placement)
+    });
+    positioned_inline_box_fragments_from(
+        engine,
+        container_box_idx,
+        placements,
+        runs,
+        replaced,
+        line_height,
+        baseline,
+        containing_width,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn positioned_inline_box_fragments_from<'a>(
+    engine: &crate::layout::LayoutEngine<'_, '_>,
+    container_box_idx: usize,
+    placements: impl IntoIterator<Item = (&'a InlineToken, TokenPlacement)>,
+    runs: &[InlineTokenMetrics],
+    replaced: &[ReplacedToken],
+    line_height: f64,
+    baseline: f64,
+    containing_width: f64,
+) -> Vec<LineInlineBoxFragment> {
     // A line normally intersects only a handful of inline boxes. A compact
     // linear accumulator beats allocating a box-count-sized side table for
     // every line while still publishing one durable fragment per owner.
     let mut bounds = Vec::<LineInlineBoxFragment>::new();
-    for (paint_order, (token, placement)) in span.iter().zip(placements).enumerate() {
+    for (paint_order, (token, placement)) in placements.into_iter().enumerate() {
         let paint_order = paint_order as u32;
         if placement.advance <= 0.0
             && !matches!(token.kind(), InlineTokenKind::InlineBoundary { .. })
@@ -472,6 +529,60 @@ pub(super) fn write_line_fragments(
     let timing_started = engine.start_timing();
     let point = Point::new(origin.x + line.x_offset, origin.y);
     let line_idx = engine.fragments.state().line_output.lines.len();
+    if line.placements.is_none() && !line.glyph_range.is_empty() {
+        let inline_box_fragments = positioned_plain_inline_box_fragments(
+            engine,
+            container_box_idx,
+            span,
+            runs,
+            replaced,
+            line.line_height,
+            line.baseline,
+            containing_width,
+        );
+        let inline_box_fragments = engine
+            .fragments
+            .push_inline_box_fragments(inline_box_fragments, engine.reader.box_count());
+        let layout = engine.fragments.state_mut();
+        layout.line_output.lines.push(Line {
+            owner_box_idx: container_box_idx as u32,
+            glyphs: line.glyph_range.clone(),
+            point,
+            height: line.line_height,
+            baseline: line.baseline,
+            word_spacing: line.word_spacing,
+            letter_spacing: line.letter_spacing,
+            optical_offset_x: line.optical_offset_x,
+            paint_color,
+            text_fragments: None,
+            prepared_text_runs: 0..0,
+            native_text_runs_complete: false,
+            inline_box_fragments,
+        });
+        layout.line_output.line_glyph_offsets.push(Vec::new());
+        layout.line_output.line_glyph_advances.push(
+            line.punctuation_space_advances
+                .iter()
+                .map(|&(glyph_idx, advance)| GlyphAdvanceRun {
+                    range: glyph_idx..glyph_idx + 1,
+                    advance,
+                })
+                .collect(),
+        );
+        if let Some((glyph, x)) = line.hyphen {
+            layout.line_output.hyphen_fragments.push(HyphenFragment {
+                line_idx,
+                glyph,
+                offset: Point::new(x, 0.0),
+                visible: true,
+            });
+        }
+        engine.push_line_owner(container_box_idx as u32);
+        engine.record_timing(|timings| {
+            timings.write_line_fragments += timing_started.elapsed();
+        });
+        return line.line_height;
+    }
     let has_fragment_owners = has_inline_fragment_owners(engine, span, runs, replaced);
     let needs_ordered_fragments = has_fragment_owners
         || span.iter().any(|token| {

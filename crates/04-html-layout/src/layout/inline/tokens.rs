@@ -484,6 +484,7 @@ impl InlineSummaryBlock {
             summary.plain_text &= expected_glyph.is_none_or(|expected| expected == glyph_idx)
                 && metrics.tab_interval < 0.0
                 && !metrics.placement_required
+                && metrics.visible
                 && matches!(metrics.vertical_align, VerticalAlignValue::Baseline);
             expected_glyph = Some(glyph_idx + 1);
             summary.preserves_newlines |= metrics.white_space.preserves_newlines();

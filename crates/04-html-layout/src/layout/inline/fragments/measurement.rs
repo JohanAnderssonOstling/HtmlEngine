@@ -217,6 +217,7 @@ pub(super) fn summarize_token_span(
                 plain_text &= expected_glyph.is_none_or(|expected| expected == glyph_idx)
                     && metrics.tab_interval < 0.0
                     && !metrics.placement_required
+                    && metrics.visible
                     && matches!(metrics.vertical_align, VerticalAlignValue::Baseline);
                 expected_glyph = Some(glyph_idx + 1);
                 let half_leading = (token_line_height - (ascent + descent)) / 2.0;
