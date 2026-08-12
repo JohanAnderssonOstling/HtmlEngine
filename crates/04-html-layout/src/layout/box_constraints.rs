@@ -290,6 +290,10 @@ pub(crate) struct BoxLayoutRequest {
 }
 
 impl BoxLayoutRequest {
+    pub(crate) fn box_idx(self) -> usize {
+        self.box_idx
+    }
+
     pub(crate) fn normal(
         box_idx: usize,
         available_width: f64,

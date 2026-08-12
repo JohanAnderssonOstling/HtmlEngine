@@ -17,6 +17,7 @@ pub(crate) struct ImageIntrinsic {
 
 /// Shared read-only access to the document, styled layout topology, and
 /// renderer-supplied metrics used during layout.
+#[derive(Clone)]
 pub(crate) struct LayoutReader<'input> {
     document: &'input Document,
     styles: &'input ComputedStyles,
@@ -36,8 +37,9 @@ pub(crate) struct LayoutReader<'input> {
 /// a layout session starts. This does not move value resolution: percentages
 /// and other containing-block-dependent values remain symbolic inside
 /// `UsedStyleView` until the owning layout algorithm supplies their basis.
+#[derive(Clone)]
 struct BoxStyleSnapshot<'input> {
-    styles: Vec<UsedStyleView<'input>>,
+    styles: std::sync::Arc<[UsedStyleView<'input>]>,
     tracks_overflow_clips: bool,
 }
 
@@ -60,7 +62,7 @@ impl<'input> BoxStyleSnapshot<'input> {
             resolved.push(style);
         }
         Self {
-            styles: resolved,
+            styles: resolved.into(),
             tracks_overflow_clips,
         }
     }

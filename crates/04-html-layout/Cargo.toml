@@ -10,6 +10,7 @@ html-style-model = { path = "../html-style-model" }
 hypher = "0.1"
 kurbo.workspace = true
 rustc_data_structures = "0.1.2"
+rayon = "1.12"
 taffy.workspace = true
 unicode_categories = "0.1"
 unicode-segmentation = "1.13"

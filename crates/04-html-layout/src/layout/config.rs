@@ -1,9 +1,11 @@
+#[derive(Clone, Copy)]
 pub(crate) struct LayoutConfig {
     viewport_width: f64,
     viewport_height: Option<f64>,
     image_sizing_policy: crate::ImageSizingPolicy,
     text_composition_policy: crate::TextCompositionPolicy,
     force_justify: bool,
+    parallel_workers: usize,
 }
 
 impl LayoutConfig {
@@ -14,6 +16,7 @@ impl LayoutConfig {
             image_sizing_policy: constraints.image_sizing_policy(),
             text_composition_policy: constraints.text_composition_policy(),
             force_justify: false,
+            parallel_workers: constraints.parallel_workers(),
         }
     }
 
@@ -37,5 +40,8 @@ impl LayoutConfig {
     }
     pub(crate) fn image_sizing_policy(&self) -> crate::ImageSizingPolicy {
         self.image_sizing_policy
+    }
+    pub(crate) fn parallel_workers(&self) -> usize {
+        self.parallel_workers
     }
 }

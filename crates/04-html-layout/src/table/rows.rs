@@ -4,6 +4,16 @@ use crate::layout::{LayoutEngine, OutputRanges, ResolvedBoxModel};
 use crate::layout_model::{Children, LayoutMode};
 use html_style_model::{UsedPreferredSize as PreferredSize, VerticalAlignValue};
 use kurbo::{Point, Size, Vec2};
+use rayon::prelude::*;
+
+const PARALLEL_CELL_MIN_TASKS: usize = 8;
+
+#[derive(Clone, Copy)]
+struct ParallelCellTask {
+    index: usize,
+    point: Point,
+    request: crate::layout::BoxLayoutRequest,
+}
 
 pub(super) struct PreparedTableCells {
     pub(super) baseline_offsets: Vec<Option<f64>>,
@@ -38,6 +48,8 @@ pub(super) fn prepare_cells(
     let mut heights = vec![0.0; placements.len()];
     let mut baseline_offsets = vec![None; placements.len()];
     let mut layouts = Vec::with_capacity(placements.len());
+    let parallel_workers = session.config.parallel_workers();
+    let mut parallel_tasks = Vec::new();
     for (index, placement) in placements.iter().enumerate() {
         let span_width = span_extent(
             &columns.starts,
@@ -54,35 +66,22 @@ pub(super) fn prepare_cells(
             cell_has_restricted_percentage_height_descendant(session, placement.cell_idx);
         let reusable = !assign_final_height
             && !cell_content_uses_parent_block_basis(session, placement.cell_idx);
-        let layout_cell = |session: &mut LayoutEngine<'_, '_>| {
-            session.without_fragmentation(|session| {
-                session
-                    .geometry
-                    .set_point(placement.cell_idx, provisional_point);
-                let mut request = crate::layout::BoxLayoutRequest::table_cell(
-                    placement.cell_idx,
-                    span_width,
-                    parent_content_height,
-                    used_borders,
-                );
-                if assign_final_height && let Some(row_area_height) = definite_row_area_height {
-                    let provisional_span_height = row_area_height
-                        * placement.rowspan.min(row_count) as f64
-                        / row_count.max(1) as f64;
-                    request = request.with_assigned_border_height(provisional_span_height);
-                } else {
-                    request = request.for_table_intrinsic_measurement();
-                }
-                let cell_layout = session.layout_box(request);
-                let baseline = session.fragments.first_baseline_offset(
-                    cell_layout.output.lines.clone(),
-                    session.geometry.point(placement.cell_idx).y,
-                );
-                (cell_layout, baseline)
-            })
-        };
+        let mut request = crate::layout::BoxLayoutRequest::table_cell(
+            placement.cell_idx,
+            span_width,
+            parent_content_height,
+            used_borders,
+        );
+        if assign_final_height && let Some(row_area_height) = definite_row_area_height {
+            let provisional_span_height = row_area_height
+                * placement.rowspan.min(row_count) as f64
+                / row_count.max(1) as f64;
+            request = request.with_assigned_border_height(provisional_span_height);
+        } else {
+            request = request.for_table_intrinsic_measurement();
+        }
         let (cell_size, baseline) = if reusable {
-            let (cell_layout, baseline) = layout_cell(session);
+            let (cell_layout, baseline) = layout_cell(session, provisional_point, request);
             let cell_style = session.reader.style(placement.cell_idx);
             let cell_box_model = used_borders.map_or_else(
                 || ResolvedBoxModel::new(cell_style, span_width),
@@ -101,15 +100,53 @@ pub(super) fn prepare_cells(
             }));
             (cell_size, baseline)
         } else {
-            let ((cell_layout, baseline), _) =
-                crate::layout::with_isolated_measurement(session, layout_cell);
             layouts.push(PreparedCellLayout::Relayout {
                 assign_final_height,
             });
-            (cell_layout.size, baseline)
+            if parallel_workers > 1 {
+                parallel_tasks.push(ParallelCellTask {
+                    index,
+                    point: provisional_point,
+                    request,
+                });
+                (Size::ZERO, None)
+            } else {
+                let ((cell_layout, baseline), _) = crate::layout::with_isolated_measurement(
+                    session,
+                    |session| layout_cell(session, provisional_point, request),
+                );
+                (cell_layout.size, baseline)
+            }
         };
         heights[index] = cell_size.height;
         baseline_offsets[index] = baseline;
+    }
+
+    if !parallel_tasks.is_empty() {
+        if parallel_tasks.len() >= PARALLEL_CELL_MIN_TASKS {
+            let context = session.parallel_measurement_context();
+            let measurements = crate::layout::install_parallel(parallel_workers, || {
+                parallel_tasks
+                    .par_iter()
+                    .map_init(crate::layout::ParallelMeasurementWorker::default, |worker, task| {
+                        context.measure_table_cell(worker, task.point, task.request)
+                    })
+                    .collect::<Vec<crate::layout::ParallelBoxMeasurement>>()
+            });
+            for (task, measurement) in parallel_tasks.iter().zip(measurements) {
+                heights[task.index] = measurement.size.height;
+                baseline_offsets[task.index] = measurement.first_baseline;
+            }
+        } else {
+            for task in parallel_tasks {
+                let ((cell_layout, baseline), _) = crate::layout::with_isolated_measurement(
+                    session,
+                    |session| layout_cell(session, task.point, task.request),
+                );
+                heights[task.index] = cell_layout.size.height;
+                baseline_offsets[task.index] = baseline;
+            }
+        }
     }
 
     let mut row_baselines = vec![None::<f64>; row_count];
@@ -133,6 +170,22 @@ pub(super) fn prepare_cells(
         row_baselines,
         layouts,
     }
+}
+
+fn layout_cell(
+    session: &mut LayoutEngine<'_, '_>,
+    point: Point,
+    request: crate::layout::BoxLayoutRequest,
+) -> (crate::layout::BoxLayoutResult, Option<f64>) {
+    session.without_fragmentation(|session| {
+        session.geometry.set_point(request.box_idx(), point);
+        let cell_layout = session.layout_box(request);
+        let baseline = session.fragments.first_baseline_offset(
+            cell_layout.output.lines.clone(),
+            session.geometry.point(request.box_idx()).y,
+        );
+        (cell_layout, baseline)
+    })
 }
 
 /// Whether the cell subtree consumes the block-size basis suppressed during

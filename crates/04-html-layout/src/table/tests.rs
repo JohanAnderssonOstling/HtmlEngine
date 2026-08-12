@@ -49,6 +49,39 @@ mod tests {
     }
 
     #[test]
+    fn parallel_cell_measurement_matches_sequential_layout() {
+        let html = "<html><body style='margin:0'><table style='width:320px;border-collapse:collapse'><tr><td id='a' style='padding:3px;border:1px solid'><div style='height:50%;overflow:hidden'>alpha alpha alpha alpha</div></td><td id='b' style='padding:4px;border:1px solid'><div style='height:50%;overflow:hidden'>beta beta beta beta</div></td></tr><tr><td id='c' style='padding:2px;border:1px solid'><div style='height:50%;overflow:hidden'>gamma gamma gamma</div></td><td id='d' style='padding:5px;border:1px solid'><div style='height:50%;overflow:hidden'>delta delta delta</div></td></tr><tr><td id='e'><div style='height:50%;overflow:hidden'>epsilon epsilon</div></td><td id='f'><div style='height:50%;overflow:hidden'>zeta zeta</div></td></tr><tr><td id='g'><div style='height:50%;overflow:hidden'>eta eta</div></td><td id='h'><div style='height:50%;overflow:hidden'>theta theta</div></td></tr></table></body></html>";
+        let mut factory = DocumentFactory::new();
+        let mut glyphs = TestGlyphShaper::new();
+        let shaped = factory
+            .parse_with_new_pipeline(html, None)
+            .shape(&mut glyphs)
+            .expect("test glyphs shape");
+        let sequential = shaped
+            .clone()
+            .layout(LayoutConstraints::new(360.0, 16.0).unwrap());
+        let parallel = shaped.layout(
+            LayoutConstraints::new(360.0, 16.0)
+                .unwrap()
+                .with_parallel_workers(4),
+        );
+
+        let sequential_view = sequential.render_view();
+        let parallel_view = parallel.render_view();
+        assert_eq!(sequential_view.boxes().len(), parallel_view.boxes().len());
+        for box_idx in 0..sequential_view.boxes().len() {
+            assert_eq!(sequential_view.boxes().point(box_idx), parallel_view.boxes().point(box_idx));
+            assert_eq!(sequential_view.boxes().size(box_idx), parallel_view.boxes().size(box_idx));
+        }
+        let sequential_lines = sequential_view.text().lines().iter().map(|line| (line.owner_box_idx(), line.glyphs(), line.point(), line.height(), line.baseline())).collect::<Vec<_>>();
+        let parallel_lines = parallel_view.text().lines().iter().map(|line| (line.owner_box_idx(), line.glyphs(), line.point(), line.height(), line.baseline())).collect::<Vec<_>>();
+        assert_eq!(sequential_lines, parallel_lines);
+        let sequential_decorations = sequential_view.fragments().decorations().iter().map(|fragment| (fragment.rect(), fragment.color())).collect::<Vec<_>>();
+        let parallel_decorations = parallel_view.fragments().decorations().iter().map(|fragment| (fragment.rect(), fragment.color())).collect::<Vec<_>>();
+        assert_eq!(sequential_decorations, parallel_decorations);
+    }
+
+    #[test]
     fn direct_cells_before_a_row_group_form_the_same_rows_as_native_table_markup() {
         let document = layout_html(
             "<html><body style='margin:0;font:32px/normal monospace'><div id='candidate' style='display:table;border-spacing:0'><span id='candidate-1' style='display:table-cell'>Row 1, Col 1</span><span style='display:table-cell'>Row 1, Col 2</span><span style='display:table-cell'>Row 1, Col 3</span><span style='display:table-row-group'><span style='display:table-row'><span id='candidate-2' style='display:table-cell'>Row 22, Col 1</span><span style='display:table-cell'>Row 22, Col 2</span><span style='display:table-cell'>Row 22, Col 3</span></span><span style='display:table-row'><span id='candidate-3' style='display:table-cell'>Row 333, Col 1</span><span style='display:table-cell'>Row 333, Col 2</span><span style='display:table-cell'>Row 333, Col 3</span></span></span></div><table id='native' style='border-spacing:0'><tr><td id='native-1' style='padding:0'>Row 1, Col 1</td><td style='padding:0'>Row 1, Col 2</td><td style='padding:0'>Row 1, Col 3</td></tr><tr><td id='native-2' style='padding:0'>Row 22, Col 1</td><td style='padding:0'>Row 22, Col 2</td><td style='padding:0'>Row 22, Col 3</td></tr><tr><td id='native-3' style='padding:0'>Row 333, Col 1</td><td style='padding:0'>Row 333, Col 2</td><td style='padding:0'>Row 333, Col 3</td></tr></table></body></html>",
@@ -1108,6 +1141,12 @@ mod tests {
             .unwrap_or_else(|_| "ordinary".to_owned());
         let with_captions = case == "captioned";
         let dependent_cells = case == "dependent-cells";
+        let parallel_cells = case == "parallel-cells";
+        let workers = std::env::var("HTML_LAYOUT_BENCH_WORKERS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(1)
+            .max(1);
 
         let mut html = String::from("<html><body style='margin:0;font:16px monospace'>");
         for table in 0..16 {
@@ -1118,8 +1157,14 @@ mod tests {
             for row in 0..8 {
                 html.push_str("<tr>");
                 for column in 0..6 {
-                    if dependent_cells {
-                        html.push_str(&format!("<td style='padding:2px;border:1px solid'><div style='height:50%;overflow:hidden'>T{table} R{row} C{column}</div></td>"));
+                    if dependent_cells || parallel_cells {
+                        html.push_str(&format!("<td style='padding:2px;border:1px solid'><div style='height:50%;overflow:hidden'>T{table} R{row} C{column}"));
+                        if parallel_cells {
+                            for word in 0..48 {
+                                html.push_str(&format!(" measurement{word}"));
+                            }
+                        }
+                        html.push_str("</div></td>");
                     } else {
                         html.push_str(&format!("<td style='padding:2px;border:1px solid'>T{table} R{row} C{column}</td>"));
                     }
@@ -1130,16 +1175,20 @@ mod tests {
         }
         html.push_str("</body></html>");
 
-        let mut document = layout_html(&html, 800.0);
+        let mut factory = DocumentFactory::new();
+        let mut glyphs = TestGlyphShaper::new();
+        let shaped = factory.parse_with_new_pipeline(&html, None).shape(&mut glyphs).expect("benchmark glyphs shape");
+        let constraints = |width| LayoutConstraints::new(width, 16.0).unwrap().with_parallel_workers(workers);
+        let mut document = shaped.layout(constraints(800.0));
         for iteration in 0..warmup {
             let width = if iteration % 2 == 0 { 800.0 } else { 801.0 };
-            document.relayout(LayoutConstraints::new(width, 16.0).unwrap());
+            document.relayout(constraints(width));
         }
 
         let started = Instant::now();
         for iteration in 0..iterations {
             let width = if iteration % 2 == 0 { 800.0 } else { 801.0 };
-            document.relayout(LayoutConstraints::new(width, 16.0).unwrap());
+            document.relayout(constraints(width));
         }
         let elapsed = started.elapsed();
         let view = document.render_view();
@@ -1149,8 +1198,9 @@ mod tests {
             + view.fragments().images().len();
         std::hint::black_box(checksum);
         println!(
-            "TABLE_BENCH case={} iterations={} total_ns={} ns_per_relayout={} checksum={checksum}",
+            "TABLE_BENCH case={} workers={} iterations={} total_ns={} ns_per_relayout={} checksum={checksum}",
             case,
+            workers,
             iterations,
             elapsed.as_nanos(),
             elapsed.as_nanos() / iterations.max(1) as u128,

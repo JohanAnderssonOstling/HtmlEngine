@@ -20,6 +20,7 @@ mod intrinsic_sizing;
 mod list_marker;
 mod measurement;
 mod placement;
+mod parallel;
 mod read_context;
 mod replaced;
 
@@ -30,6 +31,7 @@ pub(crate) use box_constraints::{
     BoxLayoutRequest, constrain_content_width, resolve_definite_content_size,
     resolve_definite_outer_inline_size, resolve_definite_size_value, resolve_vertical_size,
 };
+pub(crate) use box_layout::BoxLayoutResult;
 pub(crate) use box_model::{ResolvedBoxModel, UsedBorderInsets};
 pub(crate) use box_positioning::{translate_laid_out_content, translate_laid_out_output};
 pub(crate) use box_sizing::{ResolvedBoxSizing, ResolvedTableBoxSizing};
@@ -41,9 +43,11 @@ pub(super) use engine::LayoutEngine;
 pub use engine::LayoutTimings;
 pub(crate) use engine::layout_with_timings;
 pub(crate) use engine::{LayoutInputs, LayoutOutputs, LayoutScratch};
+pub(crate) use engine::{ParallelBoxMeasurement, ParallelMeasurementWorker};
 pub(crate) use fragment_writer::{FragmentWriter, OutputRanges};
 pub(crate) use inline::PreparedInlinePlans;
 pub(crate) use placement::PlacementState;
+pub(crate) use parallel::install as install_parallel;
 pub(crate) use intrinsic_sizing::{
     box_content_intrinsic_widths, box_intrinsic_widths, contains_full_width_percentage_table,
     percentage_height_image_width,

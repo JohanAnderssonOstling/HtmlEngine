@@ -9,6 +9,7 @@ pub struct LayoutConstraints {
     line_height: f64,
     image_sizing_policy: ImageSizingPolicy,
     text_composition_policy: TextCompositionPolicy,
+    parallel_workers: usize,
 }
 
 /// Optional renderer-level adaptation for standalone images. Web-compatible
@@ -98,6 +99,7 @@ impl LayoutConstraints {
             line_height,
             image_sizing_policy: ImageSizingPolicy::WebCompatible,
             text_composition_policy: TextCompositionPolicy::WebCompatible,
+            parallel_workers: 1,
         })
     }
 
@@ -140,6 +142,18 @@ impl LayoutConstraints {
 
     pub fn text_composition_policy(self) -> TextCompositionPolicy {
         self.text_composition_policy
+    }
+
+    /// Enables worker-owned parallel subtree measurement. A value of one
+    /// preserves deterministic sequential execution; larger values cap the
+    /// dedicated layout pool used by dependency-independent work.
+    pub fn with_parallel_workers(mut self, workers: usize) -> Self {
+        self.parallel_workers = workers.max(1);
+        self
+    }
+
+    pub fn parallel_workers(self) -> usize {
+        self.parallel_workers
     }
 }
 

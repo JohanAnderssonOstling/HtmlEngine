@@ -3,6 +3,7 @@ use crate::layout_model::{GlyphId, GlyphMetric, GlyphMetrics, InlineContent, Inl
 /// Immutable shaped-text input used by inline layout and intrinsic sizing.
 /// Keeping it separate from the token cache makes the distinction between
 /// source data and mutable inline layout state explicit.
+#[derive(Clone, Copy)]
 pub(crate) struct InlineReader<'input> {
     content: &'input InlineContent,
     glyph_metrics: &'input GlyphMetrics,

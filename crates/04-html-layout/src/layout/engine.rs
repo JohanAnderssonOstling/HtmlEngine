@@ -214,6 +214,16 @@ pub(crate) struct LayoutEngine<'a, 'out> {
 }
 
 impl<'a, 'out> LayoutEngine<'a, 'out> {
+    pub(crate) fn parallel_measurement_context(&self) -> ParallelMeasurementContext<'a> {
+        ParallelMeasurementContext {
+            config: self.config,
+            reader: self.reader.clone(),
+            text: self.text,
+            inline_plans: self.inline_plans,
+            track_overflow_clips: self.track_overflow_clips,
+        }
+    }
+
     pub(crate) fn start_timing(&self) -> LayoutTimingStart {
         LayoutTimingStart(self.timings.as_ref().map(|_| Instant::now()))
     }
@@ -323,5 +333,101 @@ impl<'a, 'out> LayoutEngine<'a, 'out> {
         } else {
             self.placement.reset(self.reader.box_count());
         }
+    }
+}
+
+/// Immutable inputs shared by table-cell measurement workers. Mutable layout
+/// arenas deliberately live in [`ParallelMeasurementWorker`] instead.
+#[derive(Clone)]
+pub(crate) struct ParallelMeasurementContext<'a> {
+    config: LayoutConfig,
+    reader: LayoutReader<'a>,
+    text: InlineReader<'a>,
+    inline_plans: &'a crate::layout::PreparedInlinePlans,
+    track_overflow_clips: bool,
+}
+
+pub(crate) struct ParallelMeasurementWorker {
+    geometry: BoxGeometry,
+    state: LayoutState,
+    placement: PlacementState,
+    scratch: LayoutScratch,
+}
+
+impl Default for ParallelMeasurementWorker {
+    fn default() -> Self {
+        Self {
+            geometry: BoxGeometry::lazy(),
+            state: LayoutState::default(),
+            placement: PlacementState::default(),
+            scratch: LayoutScratch::default(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ParallelBoxMeasurement {
+    pub(crate) size: kurbo::Size,
+    pub(crate) first_baseline: Option<f64>,
+}
+
+impl ParallelMeasurementContext<'_> {
+    pub(crate) fn measure_table_cell(
+        &self,
+        worker: &mut ParallelMeasurementWorker,
+        point: Point,
+        request: crate::layout::BoxLayoutRequest,
+    ) -> ParallelBoxMeasurement {
+        let scratch = &mut worker.scratch;
+        let mut engine = LayoutEngine {
+            config: self.config,
+            floats: std::mem::take(&mut scratch.floats),
+            margins: std::mem::take(&mut scratch.margins),
+            absolute_positioning: std::mem::take(&mut scratch.absolute_positioning),
+            flex_grid: std::mem::take(&mut scratch.flex_grid),
+            measurement: std::mem::take(&mut scratch.measurement),
+            finalization: std::mem::take(&mut scratch.finalization),
+            track_overflow_clips: self.track_overflow_clips,
+            reader: self.reader.clone(),
+            text: self.text,
+            geometry: GeometryWriter::new(&mut worker.geometry),
+            fragments: FragmentWriter::new(
+                &mut worker.state,
+                std::mem::take(&mut scratch.line_owners),
+                std::mem::take(&mut scratch.block_decoration_owners),
+            ),
+            placement: std::mem::take(&mut worker.placement),
+            inline_plans: self.inline_plans,
+            fragmentation_suppression_depth: 1,
+            timings: None,
+        };
+        engine.clear_layout_output();
+        engine.floats.reset();
+        engine.margins.reset();
+        engine.absolute_positioning.clear();
+        engine.flex_grid.clear();
+        engine.geometry.set_point(request.box_idx, point);
+        let cell_layout = engine.layout_box(request);
+        let first_baseline = engine.fragments.first_baseline_offset(
+            cell_layout.output.lines,
+            engine.geometry.point(request.box_idx).y,
+        );
+        let result = ParallelBoxMeasurement {
+            size: cell_layout.size,
+            first_baseline,
+        };
+
+        engine.fragments.recycle_owner_storage(
+            &mut scratch.line_owners,
+            &mut scratch.block_decoration_owners,
+        );
+        worker.placement = std::mem::take(&mut engine.placement);
+        scratch.floats = std::mem::take(&mut engine.floats);
+        scratch.margins = std::mem::take(&mut engine.margins);
+        scratch.absolute_positioning = std::mem::take(&mut engine.absolute_positioning);
+        scratch.flex_grid = std::mem::take(&mut engine.flex_grid);
+        scratch.measurement = std::mem::take(&mut engine.measurement);
+        scratch.finalization = std::mem::take(&mut engine.finalization);
+        result
     }
 }
