@@ -46,6 +46,7 @@ pub(super) fn measure_line(
         word_spacing,
         letter_spacing,
         word_adjustment,
+        tracking_adjustment,
         punctuation_space_advances,
     } = spacing;
     let (line_height, baseline) = if summary.plain_text {
@@ -79,9 +80,7 @@ pub(super) fn measure_line(
         )
     });
 
-    let adjusted_width = summary.width
-        + word_adjustment
-        + letter_spacing * tracking_boundary_count(engine, summary.glyph_range.clone()) as f64;
+    let adjusted_width = summary.width + word_adjustment + tracking_adjustment;
     let hyphen = hyphen.map(|(glyph, width)| (glyph, (adjusted_width - width).max(0.0)));
     let layout = LineLayout {
         glyph_range: summary.glyph_range,
@@ -352,6 +351,7 @@ struct JustificationSpacing {
     word_spacing: f64,
     letter_spacing: f64,
     word_adjustment: f64,
+    tracking_adjustment: f64,
     punctuation_space_advances: Vec<(u32, f32)>,
 }
 
@@ -376,49 +376,47 @@ fn justification_spacing(
     // slack matches the width that line placement will actually consume.
     let extra_space = available_width - summary.width;
     let punctuation_aware = engine.config.book_optimized_text();
-    let spaces = tokens
-        .iter()
-        .filter_map(|token| {
-            let InlineTokenKind::Glyph { glyph_idx } = token.kind() else {
-                return None;
+    let mut spaces = punctuation_aware.then(Vec::new);
+    let mut space_count = 0usize;
+    let mut expansion_limit = 0.0;
+    let mut shrink_capacity = 0.0;
+    for token in tokens {
+        if !token.is_space() {
+            continue;
+        }
+        let InlineTokenKind::Glyph { glyph_idx } = token.kind() else {
+            continue;
+        };
+        if summary.glyph_range.contains(&glyph_idx) {
+            let glue_width = if punctuation_aware {
+                token.width()
+            } else {
+                let metric = engine
+                    .text
+                    .glyph_metric(engine.text.glyph_at(glyph_idx as usize).unwrap_or_default());
+                engine
+                    .text
+                    .text_advance(glyph_idx as usize, metric.advance()) as f64
             };
-            let metric = engine
-                .text
-                .glyph_metric(engine.text.glyph_at(glyph_idx as usize).unwrap_or_default());
-            (metric.ch() == ' ' && summary.glyph_range.contains(&glyph_idx)).then(|| {
-                // Web-compatible placement retains the historical natural
-                // glyph-space basis. Book composition uses the complete token
-                // width, matching the optimal line-breaking plan.
-                let glue_width = if punctuation_aware {
-                    token.width()
-                } else {
-                    engine
-                        .text
-                        .text_advance(glyph_idx as usize, metric.advance())
-                        as f64
-                };
-                let (stretch, shrink) = super::justification::glue_capacities(
-                    glue_width,
-                    token.space_glue_class(),
-                    punctuation_aware,
-                );
-                (
+            let (stretch, shrink) = super::justification::glue_capacities(
+                glue_width,
+                token.space_glue_class(),
+                punctuation_aware,
+            );
+            space_count += 1;
+            expansion_limit += stretch;
+            shrink_capacity += shrink;
+            if let Some(spaces) = &mut spaces {
+                spaces.push((
                     glyph_idx,
                     token.width(),
                     token.space_glue_class(),
                     stretch,
                     shrink,
-                )
-            })
-        })
-        .collect::<Vec<_>>();
-    let space_count = spaces.len();
-    let (expansion_limit, shrink_capacity) = spaces.iter().fold(
-        (0.0, 0.0),
-        |(stretch, shrink), &(_, _, _, space_stretch, space_shrink)| {
-            (stretch + space_stretch, shrink + space_shrink)
-        },
-    );
+                ));
+            }
+        }
+    }
     // Use the same per-space glue capacities as Knuth--Plass. This also
     // protects greedy fallback lines with unbreakable content from producing
     // zero or negative space advances.
@@ -429,10 +427,14 @@ fn justification_spacing(
     } else {
         word_adjustment / space_count as f64
     };
-    let tracking_count = tracking_boundary_count(engine, summary.glyph_range.clone());
     let tracking_capacity = summary.width.max(0.0) * super::wrapping::MICRO_TRACKING_FRACTION;
     let tracking_adjustment =
         (extra_space - word_adjustment).clamp(-tracking_capacity, tracking_capacity);
+    let tracking_count = if tracking_adjustment == 0.0 {
+        0
+    } else {
+        tracking_boundary_count(engine, summary.glyph_range.clone())
+    };
     let per_boundary_limit =
         summary.line_height.max(0.0) * super::wrapping::MICRO_TRACKING_FRACTION;
     let letter_spacing = if tracking_count > 0 {
@@ -440,10 +442,12 @@ fn justification_spacing(
     } else {
         0.0
     };
+    let tracking_adjustment = letter_spacing * tracking_count as f64;
     let mut spacing = JustificationSpacing {
         word_spacing,
         letter_spacing,
         word_adjustment,
+        tracking_adjustment,
         punctuation_space_advances: Vec::new(),
     };
 
@@ -454,6 +458,7 @@ fn justification_spacing(
         } else {
             shrink_capacity
         };
+        let spaces = spaces.as_deref().unwrap_or_default();
         let first_capacity = spaces
             .first()
             .map(|space| if expanding { space.3 } else { space.4 })
@@ -465,7 +470,7 @@ fn justification_spacing(
         if requires_exact_advances && capacity > 0.0 {
             let ratio = word_adjustment.abs() / capacity;
             let mut advances = Vec::with_capacity(space_count);
-            for &(glyph_idx, width, _, stretch, shrink) in &spaces {
+            for &(glyph_idx, width, _, stretch, shrink) in spaces {
                 let glue_adjustment = ratio * if expanding { stretch } else { -shrink };
                 let tracking =
                     if has_tracking_boundary_after(engine, glyph_idx, summary.glyph_range.end) {

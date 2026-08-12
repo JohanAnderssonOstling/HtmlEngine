@@ -213,6 +213,7 @@ impl InlineToken {
     const CLUSTER_BOUNDARY_BIT: u32 = 1 << 8;
     const SPACE_GLUE_SHIFT: u32 = 9;
     const SPACE_GLUE_MASK: u32 = 0b111 << Self::SPACE_GLUE_SHIFT;
+    const SPACE_BIT: u32 = 1 << 12;
 
     pub(super) fn new(
         kind: InlineTokenKind,
@@ -311,6 +312,15 @@ impl InlineToken {
     #[inline]
     pub(super) fn is_cluster_boundary(&self) -> bool {
         self.metadata & Self::CLUSTER_BOUNDARY_BIT != 0
+    }
+
+    #[inline]
+    pub(super) fn is_space(&self) -> bool {
+        self.metadata & Self::SPACE_BIT != 0
+    }
+
+    pub(super) fn set_is_space(&mut self) {
+        self.metadata |= Self::SPACE_BIT;
     }
 
     #[inline]
@@ -747,7 +757,7 @@ impl InlineTokens {
             .iter()
             .enumerate()
             .filter_map(|(index, token)| {
-                (glyph_character(engine, token) == Some(' ')).then(|| {
+                token.is_space().then(|| {
                     let previous = context_character(engine, &self.dense, index, -1);
                     let next = context_character(engine, &self.dense, index, 1);
                     (index, classify_space(previous, next))

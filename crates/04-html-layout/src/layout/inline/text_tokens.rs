@@ -202,6 +202,9 @@ pub(super) fn append_text_tokens(
             wrap,
             engine.text.is_cluster_boundary(glyph_idx as usize),
         );
+        if character == ' ' {
+            token.set_is_space();
+        }
         let metrics = InlineTokenMetrics {
             owner_box_idx: box_idx as u32,
             ascent: metric.ascent(),
