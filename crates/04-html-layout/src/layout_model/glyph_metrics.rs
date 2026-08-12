@@ -36,13 +36,25 @@ pub(crate) enum GlyphMetricsError {
 }
 
 impl GlyphMetric {
-    pub fn try_new(ch: char, advance: f32, ascent: f32, descent: f32, baseline_offset: f32) -> Result<Self, GlyphMetricError> {
+    pub fn try_new(
+        ch: char,
+        advance: f32,
+        ascent: f32,
+        descent: f32,
+        baseline_offset: f32,
+    ) -> Result<Self, GlyphMetricError> {
         validate_metric_value_non_negative("advance", advance)?;
         validate_metric_value_non_negative("ascent", ascent)?;
         validate_metric_value_non_negative("descent", descent)?;
         validate_metric_value("baseline_offset", baseline_offset)?;
 
-        Ok(Self { ch, advance, ascent, descent, baseline_offset })
+        Ok(Self {
+            ch,
+            advance,
+            ascent,
+            descent,
+            baseline_offset,
+        })
     }
 
     pub fn ch(&self) -> char {
@@ -73,7 +85,10 @@ fn validate_metric_value(field: &'static str, value: f32) -> Result<(), GlyphMet
     Ok(())
 }
 
-fn validate_metric_value_non_negative(field: &'static str, value: f32) -> Result<(), GlyphMetricError> {
+fn validate_metric_value_non_negative(
+    field: &'static str,
+    value: f32,
+) -> Result<(), GlyphMetricError> {
     validate_metric_value(field, value)?;
     if value < 0.0 {
         return Err(GlyphMetricError::NegativeValue { field, value });
@@ -112,7 +127,11 @@ impl GlyphMetrics {
 
     pub(crate) fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
-        report.add_slice_storage::<GlyphMetric>("GlyphMetrics.storage", self.0.capacity(), self.0.len());
+        report.add_slice_storage::<GlyphMetric>(
+            "GlyphMetrics.storage",
+            self.0.capacity(),
+            self.0.len(),
+        );
         report
     }
 }

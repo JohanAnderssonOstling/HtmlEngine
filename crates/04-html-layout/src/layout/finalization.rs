@@ -10,6 +10,7 @@ use super::read_context::LayoutReader;
 mod geometry;
 mod ordering;
 mod overflow;
+mod text_paint;
 
 use geometry::publish_inline_box_geometry;
 use ordering::{
@@ -17,6 +18,7 @@ use ordering::{
     rebuild_glyph_line_indices, rebuild_image_fragments_by_line, sort_lines_and_remap_images,
 };
 use overflow::rebuild_overflow_clips;
+use text_paint::prepare_line_text_runs;
 
 #[derive(Default)]
 pub(super) struct FinalizationScratch {
@@ -54,6 +56,8 @@ impl LayoutEngine<'_, '_> {
         let start = self.start_timing();
         sort_lines_and_remap_images(&self.reader, &mut self.fragments, &mut self.finalization);
         self.record_timing(|timings| timings.sort_lines_and_remap_images += start.elapsed());
+
+        prepare_line_text_runs(&self.text, &mut self.fragments);
 
         rebuild_glyph_line_indices(self.text.glyphs().len(), &mut self.fragments);
         build_block_decoration_traversal(&self.reader, &mut self.fragments, &mut self.finalization);

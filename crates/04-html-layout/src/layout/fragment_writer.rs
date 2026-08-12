@@ -57,6 +57,7 @@ impl<'out> FragmentWriter<'out> {
         let state = &mut self.state;
         state.line_output.lines.clear();
         state.line_output.paint_order_indices.clear();
+        state.line_output.paint_order_ranks.clear();
         state.line_output.inline_box_fragments.clear();
         state.line_output.positioned_layers.clear();
         state.line_output.negative_positioned_layers.clear();
@@ -65,6 +66,7 @@ impl<'out> FragmentWriter<'out> {
         state.line_output.glyph_line_indices.clear();
         state.line_output.line_glyph_offsets.clear();
         state.line_output.line_glyph_advances.clear();
+        state.line_output.prepared_text_run_fragments.clear();
         state.line_output.ellipsis_fragments.clear();
         state.line_output.hyphen_fragments.clear();
         state.fragment_output.decorations.clear();
@@ -83,6 +85,9 @@ impl<'out> FragmentWriter<'out> {
             .decoration_independent_positioned_layers
             .clear();
         state.fragment_output.block_paint_ranges.clear();
+        state.fragment_output.block_decoration_indices_by_y.clear();
+        state.fragment_output.block_decoration_prefix_max_y1.clear();
+        state.fragment_output.block_decoration_paint_ranks.clear();
         state.fragment_output.block_decoration_count = 0;
         state.fragment_output.decoration_clips.clear();
         state.fragment_output.image_fragments.clear();

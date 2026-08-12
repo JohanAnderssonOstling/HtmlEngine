@@ -1,4 +1,7 @@
-use html_style_model::{AspectRatio, BoxSizing, ObjectFit, UsedObjectPosition, UsedPreferredSize as PreferredSize, UsedStyleView};
+use html_style_model::{
+    AspectRatio, BoxSizing, ObjectFit, UsedObjectPosition, UsedPreferredSize as PreferredSize,
+    UsedStyleView,
+};
 use kurbo::{Point, Rect, Size};
 use taffy::geometry::Size as TaffySize;
 use taffy::prelude::AvailableSpace;
@@ -25,7 +28,13 @@ pub(crate) struct ReplacedSizeInput {
 }
 
 impl ReplacedSizeInput {
-    pub(crate) fn from_style(style: UsedStyleView<'_>, intrinsic: Size, aspect_ratio: Option<f64>, available_width: f64, available_height: Option<f64>) -> Self {
+    pub(crate) fn from_style(
+        style: UsedStyleView<'_>,
+        intrinsic: Size,
+        aspect_ratio: Option<f64>,
+        available_width: f64,
+        available_height: Option<f64>,
+    ) -> Self {
         Self {
             intrinsic,
             aspect_ratio,
@@ -45,7 +54,13 @@ impl ReplacedSizeInput {
         }
     }
 
-    pub(crate) fn with_box_model(mut self, horizontal_margin: f64, vertical_margin: f64, horizontal_padding_border: f64, vertical_padding_border: f64) -> Self {
+    pub(crate) fn with_box_model(
+        mut self,
+        horizontal_margin: f64,
+        vertical_margin: f64,
+        horizontal_padding_border: f64,
+        vertical_padding_border: f64,
+    ) -> Self {
         self.horizontal_margin = horizontal_margin;
         self.vertical_margin = vertical_margin;
         self.horizontal_padding_border = horizontal_padding_border;
@@ -53,7 +68,12 @@ impl ReplacedSizeInput {
         self
     }
 
-    pub(crate) fn with_width_constraints(mut self, width: PreferredSize, min_width: PreferredSize, max_width: PreferredSize) -> Self {
+    pub(crate) fn with_width_constraints(
+        mut self,
+        width: PreferredSize,
+        min_width: PreferredSize,
+        max_width: PreferredSize,
+    ) -> Self {
         self.width = width;
         self.min_width = min_width;
         self.max_width = max_width;
@@ -62,7 +82,11 @@ impl ReplacedSizeInput {
 }
 
 pub(crate) fn preferred_aspect_ratio(authored: AspectRatio, intrinsic: Option<f64>) -> Option<f64> {
-    if authored.uses_intrinsic() { intrinsic.or_else(|| authored.preferred().map(f64::from)) } else { authored.preferred().map(f64::from) }
+    if authored.uses_intrinsic() {
+        intrinsic.or_else(|| authored.preferred().map(f64::from))
+    } else {
+        authored.preferred().map(f64::from)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -73,13 +97,22 @@ pub(crate) struct ReplacedObjectGeometry {
     pub clip: Rect,
 }
 
-pub(crate) fn replaced_object_geometry(content: Size, intrinsic: Size, fit: ObjectFit, position: UsedObjectPosition) -> ReplacedObjectGeometry {
+pub(crate) fn replaced_object_geometry(
+    content: Size,
+    intrinsic: Size,
+    fit: ObjectFit,
+    position: UsedObjectPosition,
+) -> ReplacedObjectGeometry {
     let content = Size::new(content.width.max(0.0), content.height.max(0.0));
-    let valid_intrinsic = intrinsic.width.is_finite() && intrinsic.height.is_finite() && intrinsic.width > 0.0 && intrinsic.height > 0.0;
+    let valid_intrinsic = intrinsic.width.is_finite()
+        && intrinsic.height.is_finite()
+        && intrinsic.width > 0.0
+        && intrinsic.height > 0.0;
     let fitted = if !valid_intrinsic || matches!(fit, ObjectFit::Fill) {
         content
     } else {
-        let contain_scale = (content.width / intrinsic.width).min(content.height / intrinsic.height);
+        let contain_scale =
+            (content.width / intrinsic.width).min(content.height / intrinsic.height);
         let cover_scale = (content.width / intrinsic.width).max(content.height / intrinsic.height);
         match fit {
             ObjectFit::Fill => content,
@@ -88,12 +121,22 @@ pub(crate) fn replaced_object_geometry(content: Size, intrinsic: Size, fit: Obje
             ObjectFit::CoverScaleDown if cover_scale >= 1.0 => intrinsic,
             ObjectFit::CoverScaleDown => intrinsic * cover_scale,
             ObjectFit::None => intrinsic,
-            ObjectFit::ScaleDown if intrinsic.width <= content.width && intrinsic.height <= content.height => intrinsic,
+            ObjectFit::ScaleDown
+                if intrinsic.width <= content.width && intrinsic.height <= content.height =>
+            {
+                intrinsic
+            }
             ObjectFit::ScaleDown => intrinsic * contain_scale,
         }
     };
-    let offset = Point::new(position.x.resolve(content.width - fitted.width), position.y.resolve(content.height - fitted.height));
-    ReplacedObjectGeometry { rect: Rect::from_origin_size(offset, fitted), clip: Rect::from_origin_size(Point::ZERO, content) }
+    let offset = Point::new(
+        position.x.resolve(content.width - fitted.width),
+        position.y.resolve(content.height - fitted.height),
+    );
+    ReplacedObjectGeometry {
+        rect: Rect::from_origin_size(offset, fitted),
+        clip: Rect::from_origin_size(Point::ZERO, content),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -139,21 +182,78 @@ pub(crate) fn resolve_replaced_flex_auto_min_main_size(input: ReplacedFlexAutoMi
         ReplacedMainAxis::Horizontal => (input.intrinsic.width, input.intrinsic.height),
         ReplacedMainAxis::Vertical => (input.intrinsic.height, input.intrinsic.width),
     };
-    let ratio = input.aspect_ratio.filter(|ratio| ratio.is_finite() && *ratio > 0.0);
-    let effective_cross_size = if input.stretch_cross_size && matches!(input.cross_size, PreferredSize::Auto | PreferredSize::Stretch) { PreferredSize::Stretch } else { input.cross_size };
-    let tentative_cross = resolve_definite_content_size(effective_cross_size, input.cross_basis, input.cross_margin, input.cross_padding_border, input.box_sizing).unwrap_or(intrinsic_cross.max(0.0));
-    let cross_min = resolve_bound(input.min_cross_size, 0.0, intrinsic_cross.max(0.0), input.cross_basis, input.cross_margin, input.cross_padding_border, input.box_sizing);
-    let cross_max = resolve_bound(input.max_cross_size, f64::INFINITY, intrinsic_cross.max(0.0), input.cross_basis, input.cross_margin, input.cross_padding_border, input.box_sizing).max(cross_min);
+    let ratio = input
+        .aspect_ratio
+        .filter(|ratio| ratio.is_finite() && *ratio > 0.0);
+    let effective_cross_size = if input.stretch_cross_size
+        && matches!(
+            input.cross_size,
+            PreferredSize::Auto | PreferredSize::Stretch
+        ) {
+        PreferredSize::Stretch
+    } else {
+        input.cross_size
+    };
+    let tentative_cross = resolve_definite_content_size(
+        effective_cross_size,
+        input.cross_basis,
+        input.cross_margin,
+        input.cross_padding_border,
+        input.box_sizing,
+    )
+    .unwrap_or(intrinsic_cross.max(0.0));
+    let cross_min = resolve_bound(
+        input.min_cross_size,
+        0.0,
+        intrinsic_cross.max(0.0),
+        input.cross_basis,
+        input.cross_margin,
+        input.cross_padding_border,
+        input.box_sizing,
+    );
+    let cross_max = resolve_bound(
+        input.max_cross_size,
+        f64::INFINITY,
+        intrinsic_cross.max(0.0),
+        input.cross_basis,
+        input.cross_margin,
+        input.cross_padding_border,
+        input.box_sizing,
+    )
+    .max(cross_min);
     let cross = tentative_cross.clamp(cross_min, cross_max);
     let transferred_main = ratio.map_or(intrinsic_main.max(0.0), |ratio| match input.main_axis {
         ReplacedMainAxis::Horizontal => cross * ratio,
         ReplacedMainAxis::Vertical => cross / ratio,
     });
 
-    let main_min = resolve_bound(input.min_main_size, 0.0, intrinsic_main.max(0.0), input.main_basis, input.main_margin, input.main_padding_border, input.box_sizing);
-    let main_max = resolve_bound(input.max_main_size, f64::INFINITY, intrinsic_main.max(0.0), input.main_basis, input.main_margin, input.main_padding_border, input.box_sizing).max(main_min);
+    let main_min = resolve_bound(
+        input.min_main_size,
+        0.0,
+        intrinsic_main.max(0.0),
+        input.main_basis,
+        input.main_margin,
+        input.main_padding_border,
+        input.box_sizing,
+    );
+    let main_max = resolve_bound(
+        input.max_main_size,
+        f64::INFINITY,
+        intrinsic_main.max(0.0),
+        input.main_basis,
+        input.main_margin,
+        input.main_padding_border,
+        input.box_sizing,
+    )
+    .max(main_min);
     let mut automatic_minimum = transferred_main.clamp(main_min, main_max);
-    if let Some(specified) = resolve_definite_content_size(input.main_size, input.main_basis, input.main_margin, input.main_padding_border, input.box_sizing) {
+    if let Some(specified) = resolve_definite_content_size(
+        input.main_size,
+        input.main_basis,
+        input.main_margin,
+        input.main_padding_border,
+        input.box_sizing,
+    ) {
         automatic_minimum = automatic_minimum.min(specified.clamp(main_min, main_max));
     }
 
@@ -168,8 +268,16 @@ pub(crate) fn resolve_replaced_flex_auto_min_main_size(input: ReplacedFlexAutoMi
 /// intrinsic dimensions stored by the renderer are content-box dimensions;
 /// an adapter whose sizing model consumes border-box constraints must include
 /// the corresponding padding and border exactly once.
-pub(crate) fn resolve_replaced_intrinsic_constraint(value: PreferredSize, intrinsic_content_size: f64, padding_border: f64, box_sizing: BoxSizing) -> Option<f64> {
-    if !matches!(value, PreferredSize::MinContent | PreferredSize::MaxContent | PreferredSize::FitContent) {
+pub(crate) fn resolve_replaced_intrinsic_constraint(
+    value: PreferredSize,
+    intrinsic_content_size: f64,
+    padding_border: f64,
+    box_sizing: BoxSizing,
+) -> Option<f64> {
+    if !matches!(
+        value,
+        PreferredSize::MinContent | PreferredSize::MaxContent | PreferredSize::FitContent
+    ) {
         return None;
     }
     let intrinsic_content_size = intrinsic_content_size.max(0.0);
@@ -183,8 +291,14 @@ pub(crate) fn resolve_replaced_intrinsic_constraint(value: PreferredSize, intrin
 /// is exposed as an intrinsic contribution. This is observable for grid auto
 /// tracks: passing an unclamped preferred size lets the track grow from a
 /// value the item itself can never use.
-pub(crate) fn clamp_replaced_definite_size_by_intrinsic_constraints(preferred: PreferredSize, intrinsic_minimum: Option<f64>, intrinsic_maximum: Option<f64>) -> Option<f64> {
-    let PreferredSize::Px(preferred) = preferred else { return None };
+pub(crate) fn clamp_replaced_definite_size_by_intrinsic_constraints(
+    preferred: PreferredSize,
+    intrinsic_minimum: Option<f64>,
+    intrinsic_maximum: Option<f64>,
+) -> Option<f64> {
+    let PreferredSize::Px(preferred) = preferred else {
+        return None;
+    };
     let minimum = intrinsic_minimum.unwrap_or(0.0).max(0.0);
     let maximum = intrinsic_maximum.unwrap_or(f64::INFINITY).max(minimum);
     Some((preferred.max(0.0) as f64).clamp(minimum, maximum))
@@ -196,9 +310,23 @@ pub(crate) fn clamp_replaced_definite_size_by_intrinsic_constraints(preferred: P
 /// preferred aspect ratio. `stretch` is different: it fills the available
 /// margin box, regardless of `box-sizing`.
 pub(crate) fn resolve_replaced_content_size(input: ReplacedSizeInput) -> Size {
-    let ratio = input.aspect_ratio.filter(|ratio| ratio.is_finite() && *ratio > 0.0);
-    let definite_width = resolve_definite_content_size(input.width, Some(input.available_width), input.horizontal_margin, input.horizontal_padding_border, input.box_sizing);
-    let definite_height = resolve_definite_content_size(input.height, input.available_height, input.vertical_margin, input.vertical_padding_border, input.box_sizing);
+    let ratio = input
+        .aspect_ratio
+        .filter(|ratio| ratio.is_finite() && *ratio > 0.0);
+    let definite_width = resolve_definite_content_size(
+        input.width,
+        Some(input.available_width),
+        input.horizontal_margin,
+        input.horizontal_padding_border,
+        input.box_sizing,
+    );
+    let definite_height = resolve_definite_content_size(
+        input.height,
+        input.available_height,
+        input.vertical_margin,
+        input.vertical_padding_border,
+        input.box_sizing,
+    );
 
     let (mut width, mut height) = match (definite_width, definite_height, ratio) {
         (Some(width), Some(height), _) => (width, height),
@@ -208,40 +336,122 @@ pub(crate) fn resolve_replaced_content_size(input: ReplacedSizeInput) -> Size {
         (None, Some(height), None) => (input.intrinsic.width.max(0.0), height),
         (None, None, _) => {
             let intrinsic_width = input.intrinsic.width.max(0.0);
-            let available_content = (input.available_width - input.horizontal_margin - input.horizontal_padding_border).max(0.0);
-            let width = if matches!(input.width, PreferredSize::Auto | PreferredSize::FitContent) { intrinsic_width.min(available_content) } else { intrinsic_width };
-            let height = ratio.map_or_else(|| input.intrinsic.height.max(0.0), |ratio| width / ratio);
+            let available_content =
+                (input.available_width - input.horizontal_margin - input.horizontal_padding_border)
+                    .max(0.0);
+            let width = if matches!(input.width, PreferredSize::Auto | PreferredSize::FitContent) {
+                intrinsic_width.min(available_content)
+            } else {
+                intrinsic_width
+            };
+            let height =
+                ratio.map_or_else(|| input.intrinsic.height.max(0.0), |ratio| width / ratio);
             (width, height)
         }
     };
 
-    let transferred_width = definite_height.and_then(|height| ratio.map(|ratio| height * ratio)).unwrap_or(input.intrinsic.width.max(0.0));
-    let transferred_height = definite_width.and_then(|width| ratio.map(|ratio| width / ratio)).unwrap_or(input.intrinsic.height.max(0.0));
-    let min_width = resolve_bound(input.min_width, 0.0, transferred_width, Some(input.available_width), input.horizontal_margin, input.horizontal_padding_border, input.box_sizing);
-    let min_height = resolve_bound(input.min_height, 0.0, transferred_height, input.available_height, input.vertical_margin, input.vertical_padding_border, input.box_sizing);
-    let max_width = resolve_bound(input.max_width, f64::INFINITY, transferred_width, Some(input.available_width), input.horizontal_margin, input.horizontal_padding_border, input.box_sizing).max(min_width);
-    let max_height = resolve_bound(input.max_height, f64::INFINITY, transferred_height, input.available_height, input.vertical_margin, input.vertical_padding_border, input.box_sizing).max(min_height);
+    let transferred_width = definite_height
+        .and_then(|height| ratio.map(|ratio| height * ratio))
+        .unwrap_or(input.intrinsic.width.max(0.0));
+    let transferred_height = definite_width
+        .and_then(|width| ratio.map(|ratio| width / ratio))
+        .unwrap_or(input.intrinsic.height.max(0.0));
+    let min_width = resolve_bound(
+        input.min_width,
+        0.0,
+        transferred_width,
+        Some(input.available_width),
+        input.horizontal_margin,
+        input.horizontal_padding_border,
+        input.box_sizing,
+    );
+    let min_height = resolve_bound(
+        input.min_height,
+        0.0,
+        transferred_height,
+        input.available_height,
+        input.vertical_margin,
+        input.vertical_padding_border,
+        input.box_sizing,
+    );
+    let max_width = resolve_bound(
+        input.max_width,
+        f64::INFINITY,
+        transferred_width,
+        Some(input.available_width),
+        input.horizontal_margin,
+        input.horizontal_padding_border,
+        input.box_sizing,
+    )
+    .max(min_width);
+    let max_height = resolve_bound(
+        input.max_height,
+        f64::INFINITY,
+        transferred_height,
+        input.available_height,
+        input.vertical_margin,
+        input.vertical_padding_border,
+        input.box_sizing,
+    )
+    .max(min_height);
 
-    constrain_replaced_size(&mut width, &mut height, min_width, min_height, max_width, max_height, ratio, definite_width.is_some(), definite_height.is_some());
+    constrain_replaced_size(
+        &mut width,
+        &mut height,
+        min_width,
+        min_height,
+        max_width,
+        max_height,
+        ratio,
+        definite_width.is_some(),
+        definite_height.is_some(),
+    );
     Size::new(width.max(0.0), height.max(0.0))
 }
 
-fn resolve_bound(value: PreferredSize, auto: f64, intrinsic: f64, basis: Option<f64>, margin: f64, padding_border: f64, box_sizing: BoxSizing) -> f64 {
+fn resolve_bound(
+    value: PreferredSize,
+    auto: f64,
+    intrinsic: f64,
+    basis: Option<f64>,
+    margin: f64,
+    padding_border: f64,
+    box_sizing: BoxSizing,
+) -> f64 {
     match value {
         PreferredSize::Auto => auto,
-        PreferredSize::MinContent | PreferredSize::MaxContent | PreferredSize::FitContent => intrinsic,
-        _ => resolve_definite_content_size(value, basis, margin, padding_border, box_sizing).unwrap_or(auto),
+        PreferredSize::MinContent | PreferredSize::MaxContent | PreferredSize::FitContent => {
+            intrinsic
+        }
+        _ => resolve_definite_content_size(value, basis, margin, padding_border, box_sizing)
+            .unwrap_or(auto),
     }
 }
 
-fn constrain_replaced_size(width: &mut f64, height: &mut f64, min_width: f64, min_height: f64, max_width: f64, max_height: f64, fallback_ratio: Option<f64>, width_was_definite: bool, height_was_definite: bool) {
+fn constrain_replaced_size(
+    width: &mut f64,
+    height: &mut f64,
+    min_width: f64,
+    min_height: f64,
+    max_width: f64,
+    max_height: f64,
+    fallback_ratio: Option<f64>,
+    width_was_definite: bool,
+    height_was_definite: bool,
+) {
     let original_width = *width;
     let original_height = *height;
     // Constraint transfer on a replaced element follows its preferred aspect
     // ratio. Using the tentative ratio would make a clamped `width: 1px`
     // distort a definite stretched height instead of restoring the intrinsic
     // ratio.
-    let ratio = fallback_ratio.unwrap_or_else(|| if original_width > 0.0 && original_height > 0.0 { original_width / original_height } else { 1.0 });
+    let ratio = fallback_ratio.unwrap_or_else(|| {
+        if original_width > 0.0 && original_height > 0.0 {
+            original_width / original_height
+        } else {
+            1.0
+        }
+    });
     let width_low = original_width < min_width;
     let width_high = original_width > max_width;
     let height_low = original_height < min_height;
@@ -305,7 +515,12 @@ fn constrain_replaced_size(width: &mut f64, height: &mut f64, min_width: f64, mi
 /// callback returns content-box dimensions. When a known axis is present,
 /// Taffy has already subtracted padding and borders from the corresponding
 /// definite available space; use that content size for ratio transfer.
-pub(crate) fn measure_replaced_content(intrinsic: Size, aspect_ratio: Option<f64>, known: TaffySize<Option<f32>>, available: TaffySize<AvailableSpace>) -> TaffySize<f32> {
+pub(crate) fn measure_replaced_content(
+    intrinsic: Size,
+    aspect_ratio: Option<f64>,
+    known: TaffySize<Option<f32>>,
+    available: TaffySize<AvailableSpace>,
+) -> TaffySize<f32> {
     let known_content_width = known.width.map(|width| match available.width {
         AvailableSpace::Definite(content) => content.max(0.0),
         AvailableSpace::MinContent | AvailableSpace::MaxContent => width.max(0.0),
@@ -317,9 +532,18 @@ pub(crate) fn measure_replaced_content(intrinsic: Size, aspect_ratio: Option<f64
     let ratio = aspect_ratio.filter(|ratio| ratio.is_finite() && *ratio > 0.0);
     match (known_content_width, known_content_height, ratio) {
         (Some(width), Some(height), _) => TaffySize { width, height },
-        (Some(width), None, Some(ratio)) => TaffySize { width, height: finite_f32(f64::from(width) / ratio) },
-        (None, Some(height), Some(ratio)) => TaffySize { width: finite_f32(f64::from(height) * ratio), height },
-        (width, height, _) => TaffySize { width: width.unwrap_or_else(|| finite_f32(intrinsic.width)), height: height.unwrap_or_else(|| finite_f32(intrinsic.height)) },
+        (Some(width), None, Some(ratio)) => TaffySize {
+            width,
+            height: finite_f32(f64::from(width) / ratio),
+        },
+        (None, Some(height), Some(ratio)) => TaffySize {
+            width: finite_f32(f64::from(height) * ratio),
+            height,
+        },
+        (width, height, _) => TaffySize {
+            width: width.unwrap_or_else(|| finite_f32(intrinsic.width)),
+            height: height.unwrap_or_else(|| finite_f32(intrinsic.height)),
+        },
     }
 }
 
@@ -334,36 +558,78 @@ mod tests {
 
     fn position(x: f32, y: f32) -> UsedObjectPosition {
         UsedObjectPosition {
-            x: UsedObjectPositionAxis { origin: ObjectPositionOrigin::Start, offset: UsedLengthPct::Pct(x) },
-            y: UsedObjectPositionAxis { origin: ObjectPositionOrigin::Start, offset: UsedLengthPct::Pct(y) },
+            x: UsedObjectPositionAxis {
+                origin: ObjectPositionOrigin::Start,
+                offset: UsedLengthPct::Pct(x),
+            },
+            y: UsedObjectPositionAxis {
+                origin: ObjectPositionOrigin::Start,
+                offset: UsedLengthPct::Pct(y),
+            },
         }
     }
 
     #[test]
     fn object_fit_preserves_ratio_and_positions_in_free_space() {
-        let contain = replaced_object_geometry(Size::new(100.0, 100.0), Size::new(200.0, 100.0), ObjectFit::Contain, position(0.5, 0.5));
+        let contain = replaced_object_geometry(
+            Size::new(100.0, 100.0),
+            Size::new(200.0, 100.0),
+            ObjectFit::Contain,
+            position(0.5, 0.5),
+        );
         assert_eq!(contain.rect, Rect::new(0.0, 25.0, 100.0, 75.0));
         assert_eq!(contain.clip, Rect::new(0.0, 0.0, 100.0, 100.0));
 
-        let cover = replaced_object_geometry(Size::new(100.0, 100.0), Size::new(200.0, 100.0), ObjectFit::Cover, position(0.5, 0.5));
+        let cover = replaced_object_geometry(
+            Size::new(100.0, 100.0),
+            Size::new(200.0, 100.0),
+            ObjectFit::Cover,
+            position(0.5, 0.5),
+        );
         assert_eq!(cover.rect, Rect::new(-50.0, 0.0, 150.0, 100.0));
         assert_eq!(cover.clip, Rect::new(0.0, 0.0, 100.0, 100.0));
     }
 
     #[test]
     fn object_fit_none_and_scale_down_choose_the_correct_concrete_size() {
-        let none = replaced_object_geometry(Size::new(100.0, 100.0), Size::new(40.0, 20.0), ObjectFit::None, position(1.0, 1.0));
+        let none = replaced_object_geometry(
+            Size::new(100.0, 100.0),
+            Size::new(40.0, 20.0),
+            ObjectFit::None,
+            position(1.0, 1.0),
+        );
         assert_eq!(none.rect, Rect::new(60.0, 80.0, 100.0, 100.0));
-        let smaller = replaced_object_geometry(Size::new(100.0, 100.0), Size::new(40.0, 20.0), ObjectFit::ScaleDown, position(0.5, 0.5));
+        let smaller = replaced_object_geometry(
+            Size::new(100.0, 100.0),
+            Size::new(40.0, 20.0),
+            ObjectFit::ScaleDown,
+            position(0.5, 0.5),
+        );
         assert_eq!(smaller.rect.size(), Size::new(40.0, 20.0));
-        let reduced = replaced_object_geometry(Size::new(100.0, 100.0), Size::new(200.0, 100.0), ObjectFit::ScaleDown, position(0.5, 0.5));
+        let reduced = replaced_object_geometry(
+            Size::new(100.0, 100.0),
+            Size::new(200.0, 100.0),
+            ObjectFit::ScaleDown,
+            position(0.5, 0.5),
+        );
         assert_eq!(reduced.rect.size(), Size::new(100.0, 50.0));
 
         let from_end = UsedObjectPosition {
-            x: UsedObjectPositionAxis { origin: ObjectPositionOrigin::End, offset: UsedLengthPct::Px(10.0) },
-            y: UsedObjectPositionAxis { origin: ObjectPositionOrigin::End, offset: UsedLengthPct::Px(5.0) },
+            x: UsedObjectPositionAxis {
+                origin: ObjectPositionOrigin::End,
+                offset: UsedLengthPct::Px(10.0),
+            },
+            y: UsedObjectPositionAxis {
+                origin: ObjectPositionOrigin::End,
+                offset: UsedLengthPct::Px(5.0),
+            },
         };
-        let positioned = replaced_object_geometry(Size::new(100.0, 100.0), Size::new(40.0, 20.0), ObjectFit::None, from_end);
+        let positioned = replaced_object_geometry(
+            Size::new(100.0, 100.0),
+            Size::new(40.0, 20.0),
+            ObjectFit::None,
+            from_end,
+        );
         assert_eq!(positioned.rect, Rect::new(50.0, 75.0, 90.0, 95.0));
     }
 
@@ -392,9 +658,18 @@ mod tests {
         let explicit = AspectRatio::new(false, Some((4.0, 3.0))).expect("valid ratio");
         let auto_with_fallback = AspectRatio::new(true, Some((4.0, 3.0))).expect("valid ratio");
 
-        assert_eq!(preferred_aspect_ratio(AspectRatio::AUTO, Some(2.0)), Some(2.0));
-        assert_eq!(preferred_aspect_ratio(explicit, Some(2.0)), explicit.preferred().map(f64::from));
-        assert_eq!(preferred_aspect_ratio(auto_with_fallback, None), auto_with_fallback.preferred().map(f64::from));
+        assert_eq!(
+            preferred_aspect_ratio(AspectRatio::AUTO, Some(2.0)),
+            Some(2.0)
+        );
+        assert_eq!(
+            preferred_aspect_ratio(explicit, Some(2.0)),
+            explicit.preferred().map(f64::from)
+        );
+        assert_eq!(
+            preferred_aspect_ratio(auto_with_fallback, None),
+            auto_with_fallback.preferred().map(f64::from)
+        );
     }
 
     #[test]
@@ -424,7 +699,10 @@ mod tests {
         input.width = PreferredSize::Auto;
         input.height = PreferredSize::Px(0.0);
         input.min_height = PreferredSize::MinContent;
-        assert_eq!(resolve_replaced_content_size(input), Size::new(100.0, 100.0));
+        assert_eq!(
+            resolve_replaced_content_size(input),
+            Size::new(100.0, 100.0)
+        );
     }
 
     #[test]
@@ -454,13 +732,33 @@ mod tests {
         input.min_width = PreferredSize::Px(150.0);
         input.min_height = PreferredSize::MinContent;
         input.available_height = None;
-        assert_eq!(resolve_replaced_content_size(input), Size::new(150.0, 150.0));
+        assert_eq!(
+            resolve_replaced_content_size(input),
+            Size::new(150.0, 150.0)
+        );
     }
 
     #[test]
     fn taffy_measurement_uses_definite_content_box_space() {
-        let measured = measure_replaced_content(Size::new(16.0, 16.0), Some(1.0), TaffySize { width: Some(30.0), height: None }, TaffySize { width: AvailableSpace::Definite(24.0), height: AvailableSpace::MaxContent });
-        assert_eq!(measured, TaffySize { width: 24.0, height: 24.0 });
+        let measured = measure_replaced_content(
+            Size::new(16.0, 16.0),
+            Some(1.0),
+            TaffySize {
+                width: Some(30.0),
+                height: None,
+            },
+            TaffySize {
+                width: AvailableSpace::Definite(24.0),
+                height: AvailableSpace::MaxContent,
+            },
+        );
+        assert_eq!(
+            measured,
+            TaffySize {
+                width: 24.0,
+                height: 24.0
+            }
+        );
     }
 
     fn flex_auto_min_input(main_axis: ReplacedMainAxis) -> ReplacedFlexAutoMinInput {
@@ -487,7 +785,12 @@ mod tests {
 
     #[test]
     fn flex_auto_minimum_transfers_the_stretched_cross_size() {
-        assert_eq!(resolve_replaced_flex_auto_min_main_size(flex_auto_min_input(ReplacedMainAxis::Horizontal)), 100.0);
+        assert_eq!(
+            resolve_replaced_flex_auto_min_main_size(flex_auto_min_input(
+                ReplacedMainAxis::Horizontal
+            )),
+            100.0
+        );
     }
 
     #[test]
@@ -524,16 +827,69 @@ mod tests {
 
     #[test]
     fn intrinsic_constraint_conversion_preserves_the_adapter_box_model() {
-        assert_eq!(resolve_replaced_intrinsic_constraint(PreferredSize::MaxContent, 50.0, 10.0, BoxSizing::ContentBox), Some(50.0));
-        assert_eq!(resolve_replaced_intrinsic_constraint(PreferredSize::MinContent, 50.0, 10.0, BoxSizing::BorderBox), Some(60.0));
-        assert_eq!(resolve_replaced_intrinsic_constraint(PreferredSize::FitContent, 50.0, 10.0, BoxSizing::BorderBox), Some(60.0));
-        assert_eq!(resolve_replaced_intrinsic_constraint(PreferredSize::Auto, 50.0, 10.0, BoxSizing::BorderBox), None);
+        assert_eq!(
+            resolve_replaced_intrinsic_constraint(
+                PreferredSize::MaxContent,
+                50.0,
+                10.0,
+                BoxSizing::ContentBox
+            ),
+            Some(50.0)
+        );
+        assert_eq!(
+            resolve_replaced_intrinsic_constraint(
+                PreferredSize::MinContent,
+                50.0,
+                10.0,
+                BoxSizing::BorderBox
+            ),
+            Some(60.0)
+        );
+        assert_eq!(
+            resolve_replaced_intrinsic_constraint(
+                PreferredSize::FitContent,
+                50.0,
+                10.0,
+                BoxSizing::BorderBox
+            ),
+            Some(60.0)
+        );
+        assert_eq!(
+            resolve_replaced_intrinsic_constraint(
+                PreferredSize::Auto,
+                50.0,
+                10.0,
+                BoxSizing::BorderBox
+            ),
+            None
+        );
     }
 
     #[test]
     fn definite_intrinsic_contribution_is_clamped_before_adapter_transfer() {
-        assert_eq!(clamp_replaced_definite_size_by_intrinsic_constraints(PreferredSize::Px(100.0), None, Some(50.0)), Some(50.0));
-        assert_eq!(clamp_replaced_definite_size_by_intrinsic_constraints(PreferredSize::Px(0.0), Some(50.0), None), Some(50.0));
-        assert_eq!(clamp_replaced_definite_size_by_intrinsic_constraints(PreferredSize::Auto, Some(50.0), Some(50.0)), None);
+        assert_eq!(
+            clamp_replaced_definite_size_by_intrinsic_constraints(
+                PreferredSize::Px(100.0),
+                None,
+                Some(50.0)
+            ),
+            Some(50.0)
+        );
+        assert_eq!(
+            clamp_replaced_definite_size_by_intrinsic_constraints(
+                PreferredSize::Px(0.0),
+                Some(50.0),
+                None
+            ),
+            Some(50.0)
+        );
+        assert_eq!(
+            clamp_replaced_definite_size_by_intrinsic_constraints(
+                PreferredSize::Auto,
+                Some(50.0),
+                Some(50.0)
+            ),
+            None
+        );
     }
 }

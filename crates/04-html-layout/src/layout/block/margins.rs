@@ -1,6 +1,9 @@
 use crate::layout::box_constraints::resolve_vertical_size;
 use crate::layout_model::{BoxType, Children};
-use html_style_model::{BoxSizing, Clear, Display, Float, OverflowMode, PositionMode, UsedPreferredSize as PreferredSize};
+use html_style_model::{
+    BoxSizing, Clear, Display, Float, OverflowMode, PositionMode,
+    UsedPreferredSize as PreferredSize,
+};
 
 use super::margin_cache::MarginCache;
 
@@ -87,7 +90,9 @@ impl MarginProfile {
     }
 
     pub(super) fn leading_bfc_to_probe(self, has_active_float: bool) -> Option<usize> {
-        (self.leading_bfc_box != NO_LEADING_BFC && (self.leading_bfc_float_sides != 0 || has_active_float)).then_some(self.leading_bfc_box as usize)
+        (self.leading_bfc_box != NO_LEADING_BFC
+            && (self.leading_bfc_float_sides != 0 || has_active_float))
+            .then_some(self.leading_bfc_box as usize)
     }
 
     pub(super) fn adjoining_float_sides(self) -> u8 {
@@ -120,7 +125,11 @@ fn clear_side_mask(clear: Clear) -> u8 {
     }
 }
 
-fn inline_item_float_side_mask(reader: &crate::layout::read_context::LayoutReader<'_>, box_idx: usize, runs: &std::ops::Range<u32>) -> u8 {
+fn inline_item_float_side_mask(
+    reader: &crate::layout::read_context::LayoutReader<'_>,
+    box_idx: usize,
+    runs: &std::ops::Range<u32>,
+) -> u8 {
     let (left, right) = reader.inline_item_float_sides(box_idx, runs);
     u8::from(left) * ADJOINING_LEFT_FLOAT | u8::from(right) * ADJOINING_RIGHT_FLOAT
 }
@@ -131,10 +140,18 @@ pub(super) struct ParentCollapseContext {
     bottom_open: bool,
 }
 
-pub(super) fn parent_collapse_context(reader: &crate::layout::read_context::LayoutReader<'_>, parent_idx: usize) -> ParentCollapseContext {
+pub(super) fn parent_collapse_context(
+    reader: &crate::layout::read_context::LayoutReader<'_>,
+    parent_idx: usize,
+) -> ParentCollapseContext {
     let style = reader.style(parent_idx);
     let (overflow_x, overflow_y) = reader.effective_overflow_modes(parent_idx);
-    let is_flex_grid_item = reader.get_parent(parent_idx).is_some_and(|ancestor| matches!(reader.box_layout_mode(ancestor), Some(BoxType::Flex(_) | BoxType::Grid(_))));
+    let is_flex_grid_item = reader.get_parent(parent_idx).is_some_and(|ancestor| {
+        matches!(
+            reader.box_layout_mode(ancestor),
+            Some(BoxType::Flex(_) | BoxType::Grid(_))
+        )
+    });
     let establishes_context = establishes_formatting_context(
         style.display(),
         overflow_x,
@@ -145,8 +162,13 @@ pub(super) fn parent_collapse_context(reader: &crate::layout::read_context::Layo
         is_flex_grid_item,
     );
     ParentCollapseContext {
-        top_open: !establishes_context && style.padding_top().is_zero() && style.border_top_width() == 0.0,
-        bottom_open: !establishes_context && style.padding_bottom().is_zero() && style.border_bottom_width() == 0.0 && matches!(style.height(), PreferredSize::Auto),
+        top_open: !establishes_context
+            && style.padding_top().is_zero()
+            && style.border_top_width() == 0.0,
+        bottom_open: !establishes_context
+            && style.padding_bottom().is_zero()
+            && style.border_bottom_width() == 0.0
+            && matches!(style.height(), PreferredSize::Auto),
     }
 }
 
@@ -156,13 +178,20 @@ pub(super) fn parent_collapse_context(reader: &crate::layout::read_context::Layo
 /// zero for this calculation. Inline formatting roots, floats, flex/grid
 /// items, and formatting-context roots keep both margins because their
 /// margins cannot adjoin the parent's content edges.
-pub(in crate::layout) fn stretch_margin_inset(reader: &crate::layout::read_context::LayoutReader<'_>, box_idx: usize, cb_width: f64) -> f64 {
+pub(in crate::layout) fn stretch_margin_inset(
+    reader: &crate::layout::read_context::LayoutReader<'_>,
+    box_idx: usize,
+    cb_width: f64,
+) -> f64 {
     let style = reader.style(box_idx);
     let before = style.margin_top().resolve(cb_width);
     let after = style.margin_bottom().resolve(cb_width);
     let both = before + after;
     if participation(style.float(), style.position()) != FlowParticipation::InFlow
-        || matches!(style.display(), Display::InlineBlock | Display::InlineTable | Display::InlineFlex | Display::InlineGrid)
+        || matches!(
+            style.display(),
+            Display::InlineBlock | Display::InlineTable | Display::InlineFlex | Display::InlineGrid
+        )
     {
         return both;
     }
@@ -170,13 +199,21 @@ pub(in crate::layout) fn stretch_margin_inset(reader: &crate::layout::read_conte
     let Some(parent_idx) = reader.get_parent(box_idx) else {
         return both;
     };
-    if matches!(reader.box_layout_mode(parent_idx), Some(BoxType::Flex(_) | BoxType::Grid(_))) {
+    if matches!(
+        reader.box_layout_mode(parent_idx),
+        Some(BoxType::Flex(_) | BoxType::Grid(_))
+    ) {
         return both;
     }
 
     let parent = reader.style(parent_idx);
     let (parent_overflow_x, parent_overflow_y) = reader.effective_overflow_modes(parent_idx);
-    let parent_is_flex_grid_item = reader.get_parent(parent_idx).is_some_and(|ancestor| matches!(reader.box_layout_mode(ancestor), Some(BoxType::Flex(_) | BoxType::Grid(_))));
+    let parent_is_flex_grid_item = reader.get_parent(parent_idx).is_some_and(|ancestor| {
+        matches!(
+            reader.box_layout_mode(ancestor),
+            Some(BoxType::Flex(_) | BoxType::Grid(_))
+        )
+    });
     let parent_establishes_context = establishes_formatting_context(
         parent.display(),
         parent_overflow_x,
@@ -190,24 +227,49 @@ pub(in crate::layout) fn stretch_margin_inset(reader: &crate::layout::read_conte
         return both;
     }
 
-    let before = if parent.padding_top().is_zero() && parent.border_top_width() == 0.0 { 0.0 } else { before };
-    let after = if parent.padding_bottom().is_zero() && parent.border_bottom_width() == 0.0 { 0.0 } else { after };
+    let before = if parent.padding_top().is_zero() && parent.border_top_width() == 0.0 {
+        0.0
+    } else {
+        before
+    };
+    let after = if parent.padding_bottom().is_zero() && parent.border_bottom_width() == 0.0 {
+        0.0
+    } else {
+        after
+    };
     before + after
 }
 
-pub(super) fn collapse_before_child(pending: &mut MarginStrut, profile: MarginProfile, started_flow: bool, has_clearance: bool, clearance_consumed_before_margin: bool, parent: ParentCollapseContext, is_anonymous: bool) -> (bool, f64) {
+pub(super) fn collapse_before_child(
+    pending: &mut MarginStrut,
+    profile: MarginProfile,
+    started_flow: bool,
+    has_clearance: bool,
+    clearance_consumed_before_margin: bool,
+    parent: ParentCollapseContext,
+    is_anonymous: bool,
+) -> (bool, f64) {
     let collapses_with_parent = !started_flow && !has_clearance && parent.top_open && !is_anonymous;
     if !collapses_with_parent && !clearance_consumed_before_margin {
         pending.merge(profile.before);
     }
-    let offset = if !profile.collapses_through && !collapses_with_parent { pending.resolve() } else { 0.0 };
+    let offset = if !profile.collapses_through && !collapses_with_parent {
+        pending.resolve()
+    } else {
+        0.0
+    };
     if !profile.collapses_through {
         *pending = MarginStrut::default();
     }
     (collapses_with_parent, offset)
 }
 
-pub(super) fn remaining_parent_margin(pending: MarginStrut, parent: ParentCollapseContext, clearance_barrier: bool, clearance_consumed_margin: f64) -> f64 {
+pub(super) fn remaining_parent_margin(
+    pending: MarginStrut,
+    parent: ParentCollapseContext,
+    clearance_barrier: bool,
+    clearance_consumed_margin: f64,
+) -> f64 {
     if clearance_barrier {
         pending.resolve() - clearance_consumed_margin
     } else if pending.is_empty() || parent.bottom_open {
@@ -230,22 +292,46 @@ pub(super) fn participation(float: Float, position: PositionMode) -> FlowPartici
 /// A new block formatting context prevents descendant margins from escaping
 /// through the box. Its own outer margins may still collapse with in-flow
 /// siblings, so this is deliberately separate from `FlowParticipation`.
-pub(in crate::layout) fn establishes_formatting_context(display: Display, overflow_x: OverflowMode, overflow_y: OverflowMode, is_float: bool, is_root: bool, is_table_cell: bool, is_flex_grid_item: bool) -> bool {
+pub(in crate::layout) fn establishes_formatting_context(
+    display: Display,
+    overflow_x: OverflowMode,
+    overflow_y: OverflowMode,
+    is_float: bool,
+    is_root: bool,
+    is_table_cell: bool,
+    is_flex_grid_item: bool,
+) -> bool {
     is_root
         || is_float
         || is_table_cell
         || is_flex_grid_item
-        || matches!(display, Display::FlowRoot | Display::FlowRootListItem | Display::InlineBlock | Display::InlineTable | Display::Flex | Display::InlineFlex | Display::Grid | Display::InlineGrid)
+        || matches!(
+            display,
+            Display::FlowRoot
+                | Display::FlowRootListItem
+                | Display::InlineBlock
+                | Display::InlineTable
+                | Display::Flex
+                | Display::InlineFlex
+                | Display::Grid
+                | Display::InlineGrid
+        )
         || establishes_overflow_context(overflow_x)
         || establishes_overflow_context(overflow_y)
 }
 
 fn establishes_overflow_context(overflow: OverflowMode) -> bool {
-    matches!(overflow, OverflowMode::Hidden | OverflowMode::Scroll | OverflowMode::Auto)
+    matches!(
+        overflow,
+        OverflowMode::Hidden | OverflowMode::Scroll | OverflowMode::Auto
+    )
 }
 
 pub(super) fn permits_zero_height_collapse(size: PreferredSize) -> bool {
-    matches!(size, PreferredSize::Auto | PreferredSize::Px(0.0) | PreferredSize::Percent(0.0))
+    matches!(
+        size,
+        PreferredSize::Auto | PreferredSize::Px(0.0) | PreferredSize::Percent(0.0)
+    )
 }
 
 #[derive(Default)]
@@ -268,18 +354,33 @@ impl MarginAnalysis {
     }
 
     pub(crate) fn natural_content_height(&self, box_idx: usize) -> f64 {
-        self.natural_content_heights.get(box_idx).and_then(|height| *height).unwrap_or(0.0)
+        self.natural_content_heights
+            .get(box_idx)
+            .and_then(|height| *height)
+            .unwrap_or(0.0)
     }
 
-    pub(super) fn record_used_after_margin(&mut self, box_idx: usize, cb_width: f64, parent_content_height: Option<f64>, margin: MarginStrut) {
+    pub(super) fn record_used_after_margin(
+        &mut self,
+        box_idx: usize,
+        cb_width: f64,
+        parent_content_height: Option<f64>,
+        margin: MarginStrut,
+    ) {
         let height_key = parent_content_height.map(f64::to_bits).unwrap_or(u64::MAX);
-        self.cache.insert_after_margin(box_idx, cb_width.to_bits(), height_key, margin);
+        self.cache
+            .insert_after_margin(box_idx, cb_width.to_bits(), height_key, margin);
     }
 
     /// Computes the vertical margin set exposed by this box to its parent.
     /// Descendant margins cross an edge only when that edge is open; floats are
     /// excluded from the adjoining set entirely.
-    pub(super) fn margin_profile(&mut self, reader: &crate::layout::read_context::LayoutReader<'_>, box_idx: usize, cb_width: f64) -> MarginProfile {
+    pub(super) fn margin_profile(
+        &mut self,
+        reader: &crate::layout::read_context::LayoutReader<'_>,
+        box_idx: usize,
+        cb_width: f64,
+    ) -> MarginProfile {
         let width_key = cb_width.to_bits();
         if let Some(profile) = self.cache.profile(box_idx, width_key) {
             return profile;
@@ -290,12 +391,21 @@ impl MarginAnalysis {
         profile
     }
 
-    fn compute_margin_profile(&mut self, reader: &crate::layout::read_context::LayoutReader<'_>, box_idx: usize, cb_width: f64) -> MarginProfile {
+    fn compute_margin_profile(
+        &mut self,
+        reader: &crate::layout::read_context::LayoutReader<'_>,
+        box_idx: usize,
+        cb_width: f64,
+    ) -> MarginProfile {
         let style = reader.style(box_idx);
         let own_before = style.margin_top().resolve(cb_width);
         let own_after = style.margin_bottom().resolve(cb_width);
         let participation = participation(style.float(), style.position());
-        let own_clear_sides = if matches!(participation, FlowParticipation::OutOfFlow) { 0 } else { clear_side_mask(style.clear()) };
+        let own_clear_sides = if matches!(participation, FlowParticipation::OutOfFlow) {
+            0
+        } else {
+            clear_side_mask(style.clear())
+        };
         let is_anonymous = matches!(reader.box_layout_mode(box_idx), Some(BoxType::Anonymous(_)));
         if is_anonymous {
             return MarginProfile {
@@ -328,7 +438,12 @@ impl MarginAnalysis {
             };
         }
 
-        let is_flex_grid_item = reader.get_parent(box_idx).is_some_and(|parent_idx| matches!(reader.box_layout_mode(parent_idx), Some(BoxType::Flex(_) | BoxType::Grid(_))));
+        let is_flex_grid_item = reader.get_parent(box_idx).is_some_and(|parent_idx| {
+            matches!(
+                reader.box_layout_mode(parent_idx),
+                Some(BoxType::Flex(_) | BoxType::Grid(_))
+            )
+        });
         let (overflow_x, overflow_y) = reader.effective_overflow_modes(box_idx);
         let establishes_context = establishes_formatting_context(
             style.display(),
@@ -340,12 +455,15 @@ impl MarginAnalysis {
             is_flex_grid_item,
         );
         let physical_before_open = style.padding_top().is_zero() && style.border_top_width() == 0.0;
-        let physical_after_open = style.padding_bottom().is_zero() && style.border_bottom_width() == 0.0;
+        let physical_after_open =
+            style.padding_bottom().is_zero() && style.border_bottom_width() == 0.0;
         let children_before_open = physical_before_open && !establishes_context;
         // A parent's used min/max-height does not prevent its last child's
         // bottom margin from adjoining; only a non-auto authored height closes
         // this edge (CSS 2.1 section 8.3.1).
-        let children_after_open = physical_after_open && !establishes_context && matches!(style.height(), PreferredSize::Auto);
+        let children_after_open = physical_after_open
+            && !establishes_context
+            && matches!(style.height(), PreferredSize::Auto);
         let block_children = match reader.box_layout_mode(box_idx) {
             Some(BoxType::Block(block)) => match &block.children {
                 Children::Blocks(children) => Some(children.as_slice()),
@@ -372,7 +490,9 @@ impl MarginAnalysis {
                 // A matching float followed by a clear candidate can insert
                 // real clearance at runtime, so the containing box cannot be
                 // represented as one uninterrupted collapse-through chain.
-                if profile.leading_clear_sides & preceding_float_sides != 0 || !profile.collapses_through {
+                if profile.leading_clear_sides & preceding_float_sides != 0
+                    || !profile.collapses_through
+                {
                     return false;
                 }
                 preceding_float_sides |= profile.adjoining_float_sides;
@@ -385,8 +505,13 @@ impl MarginAnalysis {
                 if matches!(&block.children, Children::Empty)
                     || matches!(&block.children, Children::InlineItems(runs) if !reader.inline_items_establish_line_box(box_idx, runs))
         );
-        let has_zero_collapsible_height = permits_zero_height_collapse(style.height()) && permits_zero_height_collapse(style.min_height());
-        let collapses_through = physical_before_open && physical_after_open && has_zero_collapsible_height && !establishes_context && (is_empty_block || children_all_collapse_through);
+        let has_zero_collapsible_height = permits_zero_height_collapse(style.height())
+            && permits_zero_height_collapse(style.min_height());
+        let collapses_through = physical_before_open
+            && physical_after_open
+            && has_zero_collapsible_height
+            && !establishes_context
+            && (is_empty_block || children_all_collapse_through);
 
         if collapses_through {
             let mut adjoining = MarginStrut::from_margin(own_before);
@@ -433,9 +558,14 @@ impl MarginAnalysis {
         let mut before = MarginStrut::from_margin(own_before);
         let mut adjoining_float_sides = 0;
         let mut leading_clear_sides = own_clear_sides;
-        let mut leading_bfc_box = if establishes_context { box_idx as u32 } else { NO_LEADING_BFC };
+        let mut leading_bfc_box = if establishes_context {
+            box_idx as u32
+        } else {
+            NO_LEADING_BFC
+        };
         let mut leading_bfc_float_sides = 0;
-        let mut before_clear = (own_clear_sides != 0 || establishes_context).then_some(MarginStrut::default());
+        let mut before_clear =
+            (own_clear_sides != 0 || establishes_context).then_some(MarginStrut::default());
         if children_before_open && let Some(children) = block_children {
             for child in children {
                 let child_idx = *child as usize;
@@ -488,14 +618,32 @@ impl MarginAnalysis {
             }
         }
 
-        MarginProfile { before, before_clear: before_clear.unwrap_or(before), after, own_before, own_after, participation, collapses_through: false, adjoining_float_sides, leading_clear_sides, leading_bfc_box, leading_bfc_float_sides }
+        MarginProfile {
+            before,
+            before_clear: before_clear.unwrap_or(before),
+            after,
+            own_before,
+            own_after,
+            participation,
+            collapses_through: false,
+            adjoining_float_sides,
+            leading_clear_sides,
+            leading_bfc_box,
+            leading_bfc_float_sides,
+        }
     }
 
     /// Resolves the trailing margin after the box has been laid out. CSS bases
     /// min/max-height exceptions on used values: a constraint only stops the
     /// last child's bottom margin from escaping when it actually changes the
     /// parent's natural content height.
-    pub(super) fn used_after_margin(&mut self, reader: &crate::layout::read_context::LayoutReader<'_>, box_idx: usize, cb_width: f64, parent_content_height: Option<f64>) -> MarginStrut {
+    pub(super) fn used_after_margin(
+        &mut self,
+        reader: &crate::layout::read_context::LayoutReader<'_>,
+        box_idx: usize,
+        cb_width: f64,
+        parent_content_height: Option<f64>,
+    ) -> MarginStrut {
         let width_key = cb_width.to_bits();
         let height_key = parent_content_height.map(f64::to_bits).unwrap_or(u64::MAX);
         if let Some(margin) = self.cache.after_margin(box_idx, width_key, height_key) {
@@ -504,7 +652,12 @@ impl MarginAnalysis {
 
         let style = reader.style(box_idx);
         let own_after = style.margin_bottom().resolve(cb_width);
-        let is_flex_grid_item = reader.get_parent(box_idx).is_some_and(|parent_idx| matches!(reader.box_layout_mode(parent_idx), Some(BoxType::Flex(_) | BoxType::Grid(_))));
+        let is_flex_grid_item = reader.get_parent(box_idx).is_some_and(|parent_idx| {
+            matches!(
+                reader.box_layout_mode(parent_idx),
+                Some(BoxType::Flex(_) | BoxType::Grid(_))
+            )
+        });
         let (overflow_x, overflow_y) = reader.effective_overflow_modes(box_idx);
         let establishes_context = establishes_formatting_context(
             style.display(),
@@ -515,11 +668,27 @@ impl MarginAnalysis {
             reader.is_table_cell_box(box_idx),
             is_flex_grid_item,
         );
-        let edge_open = !establishes_context && style.padding_bottom().is_zero() && style.border_bottom_width() == 0.0 && matches!(style.height(), PreferredSize::Auto);
-        let vertical_inset = if matches!(style.box_sizing(), BoxSizing::BorderBox) { style.get_vertical_padding(cb_width) + style.border_top_width() as f64 + style.border_bottom_width() as f64 } else { 0.0 };
-        let minimum = crate::layout::box_constraints::resolve_vertical_min_size(style.min_height(), parent_content_height, vertical_inset);
-        let maximum = resolve_vertical_size(style.max_height(), parent_content_height, vertical_inset).map(|maximum| maximum.max(minimum.unwrap_or(0.0)));
-        let descendant_height_basis = resolve_vertical_size(style.height(), parent_content_height, vertical_inset);
+        let edge_open = !establishes_context
+            && style.padding_bottom().is_zero()
+            && style.border_bottom_width() == 0.0
+            && matches!(style.height(), PreferredSize::Auto);
+        let vertical_inset = if matches!(style.box_sizing(), BoxSizing::BorderBox) {
+            style.get_vertical_padding(cb_width)
+                + style.border_top_width() as f64
+                + style.border_bottom_width() as f64
+        } else {
+            0.0
+        };
+        let minimum = crate::layout::box_constraints::resolve_vertical_min_size(
+            style.min_height(),
+            parent_content_height,
+            vertical_inset,
+        );
+        let maximum =
+            resolve_vertical_size(style.max_height(), parent_content_height, vertical_inset)
+                .map(|maximum| maximum.max(minimum.unwrap_or(0.0)));
+        let descendant_height_basis =
+            resolve_vertical_size(style.height(), parent_content_height, vertical_inset);
         let natural_height = self.natural_content_height(box_idx);
         let minimum_blocks_child = minimum.is_some_and(|minimum| natural_height < minimum);
         let maximum_blocks_child = maximum.is_some_and(|maximum| natural_height > maximum);
@@ -541,7 +710,12 @@ impl MarginAnalysis {
                 if matches!(profile.participation, FlowParticipation::Float) {
                     continue;
                 }
-                after.merge(self.used_after_margin(reader, child_idx, cb_width, descendant_height_basis));
+                after.merge(self.used_after_margin(
+                    reader,
+                    child_idx,
+                    cb_width,
+                    descendant_height_basis,
+                ));
                 if profile.collapses_through {
                     after.merge(profile.before);
                     continue;
@@ -550,7 +724,8 @@ impl MarginAnalysis {
             }
         }
 
-        self.cache.insert_after_margin(box_idx, width_key, height_key, after);
+        self.cache
+            .insert_after_margin(box_idx, width_key, height_key, after);
         after
     }
 }
@@ -570,8 +745,24 @@ mod tests {
 
     #[test]
     fn overflow_clip_does_not_create_a_formatting_context_by_itself() {
-        assert!(!establishes_formatting_context(Display::Block, OverflowMode::Clip, OverflowMode::Visible, false, false, false, false));
-        assert!(establishes_formatting_context(Display::Block, OverflowMode::Hidden, OverflowMode::Visible, false, false, false, false));
+        assert!(!establishes_formatting_context(
+            Display::Block,
+            OverflowMode::Clip,
+            OverflowMode::Visible,
+            false,
+            false,
+            false,
+            false
+        ));
+        assert!(establishes_formatting_context(
+            Display::Block,
+            OverflowMode::Hidden,
+            OverflowMode::Visible,
+            false,
+            false,
+            false,
+            false
+        ));
     }
 
     #[test]

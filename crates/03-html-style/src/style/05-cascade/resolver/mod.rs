@@ -65,6 +65,7 @@ use std::time::{Duration, Instant};
 mod custom_properties;
 #[path = "../html_presentational_hints.rs"]
 mod html_presentational_hints;
+mod local_matching;
 mod parent_style;
 mod plan;
 mod properties;
@@ -77,6 +78,7 @@ mod values;
 mod wide_keywords;
 
 use custom_properties::*;
+use local_matching::{LocalMatchCache, LocalMatchProbe};
 use parent_style::ParentStyle;
 use plan::*;
 use properties::{apply_property_in_phase, property_is_computable};
@@ -109,6 +111,8 @@ pub(super) struct StyleResolverContext<'a, 'css> {
     pub(super) styles: &'a mut ComputedStylesBuilder,
     pub(super) candidate_scratch: &'a mut Vec<EffectiveRuleId>,
     pub(super) candidate_seen: &'a mut CandidateDeduper,
+    local_specificity_scratch: &'a mut Vec<Option<u32>>,
+    local_match_cache: &'a mut LocalMatchCache,
     matched_rule_scratch: &'a mut Vec<MatchedRule>,
     important_rule_scratch: &'a mut Vec<MatchedRule>,
     property_targets: &'a mut specified::PropertyTargetState,
@@ -172,6 +176,8 @@ pub(crate) fn resolve_styles_for_dom_timed(
     let mut computed_styles = ComputedStylesBuilder::new(doc);
     let mut candidate_scratch = Vec::new();
     let mut candidate_seen = CandidateDeduper::new(index.rule_count());
+    let mut local_specificity_scratch = Vec::new();
+    let mut local_match_cache = LocalMatchCache::default();
     let mut matched_rule_scratch = Vec::new();
     let mut important_rule_scratch = Vec::new();
     let mut property_targets = specified::PropertyTargetState::default();
@@ -189,6 +195,8 @@ pub(crate) fn resolve_styles_for_dom_timed(
             styles: &mut computed_styles,
             candidate_scratch: &mut candidate_scratch,
             candidate_seen: &mut candidate_seen,
+            local_specificity_scratch: &mut local_specificity_scratch,
+            local_match_cache: &mut local_match_cache,
             matched_rule_scratch: &mut matched_rule_scratch,
             important_rule_scratch: &mut important_rule_scratch,
             property_targets: &mut property_targets,
@@ -527,25 +535,40 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
         let tag = doc.get_dom_tag(node_idx).unwrap_or("");
         let id = doc.get_dom_id(node_idx);
 
-        // Get candidate rule indices
-        index.collect_candidates(
-            tag,
-            id,
-            doc.get_dom_classes(node_idx),
-            self.candidate_scratch,
-            self.candidate_seen,
-        );
+        let local_probe = self.local_match_cache.probe(doc, node_idx, self.candidate_scratch, self.local_specificity_scratch);
+        let local_hit = matches!(&local_probe, LocalMatchProbe::Hit);
+        if !local_hit {
+            index.collect_candidates(tag, id, doc.get_dom_classes(node_idx), self.candidate_scratch, self.candidate_seen);
+            self.local_specificity_scratch.clear();
+            self.local_specificity_scratch.resize(self.candidate_scratch.len(), None);
+        }
 
         // Check each candidate. A rule cascades with the most specific of its
         // matching selectors, not the first one that happens to match.
-        for id in self.candidate_scratch.iter().copied() {
+        for (candidate_index, id) in self.candidate_scratch.iter().copied().enumerate() {
             let style_rule = prepared.get(id).style_rule();
+            let mut specificity = self.local_specificity_scratch[candidate_index];
+            if !local_hit {
+                for prepared_selector in index.prepared_selectors(id) {
+                    if !index.selector_is_context_free(*prepared_selector) {
+                        continue;
+                    }
+                    debug_assert!(index.selector_might_match(*prepared_selector, ancestor_filter));
+                    if index.matches_fast_selector(*prepared_selector, doc, node_idx) == Some(true) {
+                        let matched = index.selector_specificity(*prepared_selector);
+                        specificity = Some(specificity.map_or(matched, |current| current.max(matched)));
+                    }
+                }
+                self.local_specificity_scratch[candidate_index] = specificity;
+            }
             let Some(scope_match) = prepared.scope_match(prepared.get(id).scope(), doc, self.author_roots, node_idx)
             else {
                 continue;
             };
-            let mut specificity = None;
             for (selector, prepared_selector) in style_rule.selectors.0.iter().zip(index.prepared_selectors(id)) {
+                if index.selector_is_context_free(*prepared_selector) {
+                    continue;
+                }
                 if !index.selector_might_match(*prepared_selector, ancestor_filter) {
                     continue;
                 }
@@ -564,6 +587,9 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
                     scope_proximity: scope_match.proximity,
                 });
             }
+        }
+        if let LocalMatchProbe::Miss(signature) = local_probe {
+            self.local_match_cache.insert(signature, self.candidate_scratch, self.local_specificity_scratch);
         }
 
         self.timings.selector_matching += matching_started.elapsed();

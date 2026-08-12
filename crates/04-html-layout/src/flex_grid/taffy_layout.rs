@@ -2,8 +2,13 @@ use super::measurement::measure_item_with_baseline;
 use super::{TaffyContainerKind, finite_f32};
 use crate::layout::LayoutEngine;
 use taffy::geometry::Size;
-use taffy::prelude::{AvailableSpace, Dimension, Layout, LayoutPartialTree, NodeId, Style, TraversePartialTree};
-use taffy::{LayoutFlexboxContainer, LayoutGridContainer, LayoutInput, LayoutOutput, compute_flexbox_layout, compute_grid_layout, compute_leaf_layout, compute_root_layout};
+use taffy::prelude::{
+    AvailableSpace, Dimension, Layout, LayoutPartialTree, NodeId, Style, TraversePartialTree,
+};
+use taffy::{
+    LayoutFlexboxContainer, LayoutGridContainer, LayoutInput, LayoutOutput, compute_flexbox_layout,
+    compute_grid_layout, compute_leaf_layout, compute_root_layout,
+};
 
 /// A shallow Taffy tree for one renderer-owned Flex/Grid formatting context.
 ///
@@ -23,7 +28,12 @@ pub(super) struct TaffyLayoutTree<'tree, 'document, 'output> {
 }
 
 impl<'tree, 'document, 'output> TaffyLayoutTree<'tree, 'document, 'output> {
-    pub(super) fn new(session: &'tree mut LayoutEngine<'document, 'output>, kind: TaffyContainerKind, root_style: Style, child_styles: Vec<(Style, Option<u32>)>) -> Self {
+    pub(super) fn new(
+        session: &'tree mut LayoutEngine<'document, 'output>,
+        kind: TaffyContainerKind,
+        root_style: Style,
+        child_styles: Vec<(Style, Option<u32>)>,
+    ) -> Self {
         let mut styles = Vec::with_capacity(child_styles.len() + 1);
         let mut contexts = Vec::with_capacity(child_styles.len() + 1);
         styles.push(root_style);
@@ -37,14 +47,26 @@ impl<'tree, 'document, 'output> TaffyLayoutTree<'tree, 'document, 'output> {
         children[0] = root_children;
         let layouts = vec![Layout::new(); styles.len()];
         let outputs = vec![LayoutOutput::DEFAULT; styles.len()];
-        Self { session, kind, styles, contexts, children, layouts, outputs }
+        Self {
+            session,
+            kind,
+            styles,
+            contexts,
+            children,
+            layouts,
+            outputs,
+        }
     }
 
     pub(super) fn compute(&mut self, available_space: Size<AvailableSpace>) {
         compute_root_layout(self, NodeId::from(0usize), available_space);
     }
 
-    pub(super) fn compute_with_definite_root_height(&mut self, available_space: Size<AvailableSpace>, height: f32) {
+    pub(super) fn compute_with_definite_root_height(
+        &mut self,
+        available_space: Size<AvailableSpace>,
+        height: f32,
+    ) {
         self.styles[0].size.height = Dimension::length(height.max(0.0));
         compute_root_layout(self, NodeId::from(0usize), available_space);
     }
@@ -117,12 +139,20 @@ impl LayoutPartialTree for TaffyLayoutTree<'_, '_, '_> {
         let style = self.styles[index].clone();
         let context = self.contexts[index];
         let mut first_baseline = None;
-        let mut output = compute_leaf_layout(inputs, &style, |_, _| 0.0, |known, available| {
-            let Some(box_idx) = context else { return Size::ZERO };
-            let measured = measure_item_with_baseline(self.session, box_idx as usize, known, available);
-            first_baseline = measured.first_baseline;
-            measured.size
-        });
+        let mut output = compute_leaf_layout(
+            inputs,
+            &style,
+            |_, _| 0.0,
+            |known, available| {
+                let Some(box_idx) = context else {
+                    return Size::ZERO;
+                };
+                let measured =
+                    measure_item_with_baseline(self.session, box_idx as usize, known, available);
+                first_baseline = measured.first_baseline;
+                measured.size
+            },
+        );
         output.first_baselines.y = first_baseline.map(finite_f32);
         self.outputs[index] = output;
         output

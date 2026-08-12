@@ -1,5 +1,8 @@
 pub(crate) fn parse_positive_span(value: Option<&str>) -> usize {
-    value.and_then(|value| value.trim().parse::<usize>().ok()).filter(|&value| value > 0).unwrap_or(1)
+    value
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|&value| value > 0)
+        .unwrap_or(1)
 }
 
 mod backgrounds;

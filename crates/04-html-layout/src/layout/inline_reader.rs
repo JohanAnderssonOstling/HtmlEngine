@@ -13,10 +13,19 @@ pub(crate) struct InlineReader<'input> {
 
 impl<'input> InlineReader<'input> {
     pub(crate) fn new(
-        content: &'input InlineContent, glyph_metrics: &'input GlyphMetrics, text_geometry: Option<&'input crate::shaping::ShapedTextGeometry>, ellipsis_glyphs: &'input rustc_data_structures::fx::FxHashMap<u32, GlyphId>,
+        content: &'input InlineContent,
+        glyph_metrics: &'input GlyphMetrics,
+        text_geometry: Option<&'input crate::shaping::ShapedTextGeometry>,
+        ellipsis_glyphs: &'input rustc_data_structures::fx::FxHashMap<u32, GlyphId>,
         hyphen_glyphs: &'input rustc_data_structures::fx::FxHashMap<u32, GlyphId>,
     ) -> Self {
-        Self { content, glyph_metrics, text_geometry, ellipsis_glyphs, hyphen_glyphs }
+        Self {
+            content,
+            glyph_metrics,
+            text_geometry,
+            ellipsis_glyphs,
+            hyphen_glyphs,
+        }
     }
 
     pub(crate) fn inline_items(&self) -> &[InlineItem] {
@@ -39,7 +48,10 @@ impl<'input> InlineReader<'input> {
         self.content.glyph_at(glyph_idx)
     }
 
-    pub(crate) fn whitespace_wrap_before(&self, glyph_idx: usize) -> crate::layout_model::WhitespaceWrapOverride {
+    pub(crate) fn whitespace_wrap_before(
+        &self,
+        glyph_idx: usize,
+    ) -> crate::layout_model::WhitespaceWrapOverride {
         self.content.whitespace_wrap_before(glyph_idx)
     }
 
@@ -51,12 +63,24 @@ impl<'input> InlineReader<'input> {
         self.glyph_metrics.get(glyph)
     }
 
+    pub(crate) fn glyph_metric_checked(&self, glyph: GlyphId) -> Option<GlyphMetric> {
+        self.glyph_metrics.get_checked(glyph)
+    }
+
+    pub(crate) fn authoritative_runs(&self) -> &[crate::shaping::AuthoritativeShapedRun] {
+        self.text_geometry
+            .map_or(&[], |geometry| geometry.authoritative_runs())
+    }
+
     pub(crate) fn text_advance(&self, character_index: usize, fallback: f32) -> f32 {
-        self.text_geometry.and_then(|geometry| geometry.advance(character_index)).unwrap_or(fallback)
+        self.text_geometry
+            .and_then(|geometry| geometry.advance(character_index))
+            .unwrap_or(fallback)
     }
 
     pub(crate) fn is_cluster_boundary(&self, character_boundary: usize) -> bool {
-        self.text_geometry.is_none_or(|geometry| geometry.is_cluster_boundary(character_boundary))
+        self.text_geometry
+            .is_none_or(|geometry| geometry.is_cluster_boundary(character_boundary))
     }
 
     pub(crate) fn ellipsis_glyph(&self, box_idx: usize) -> Option<GlyphId> {

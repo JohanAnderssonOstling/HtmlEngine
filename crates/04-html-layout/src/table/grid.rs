@@ -37,12 +37,21 @@ fn size_keeps_empty_track(size: html_style_model::UsedPreferredSize) -> bool {
         Size::Auto | Size::Stretch => false,
         Size::Px(value) => value > 0.0,
         Size::Percent(value) => value > 0.0,
-        Size::Calc { absolute_px, percentage, .. } => absolute_px > 0.0 || percentage > 0.0,
+        Size::Calc {
+            absolute_px,
+            percentage,
+            ..
+        } => absolute_px > 0.0 || percentage > 0.0,
         Size::MinContent | Size::MaxContent | Size::FitContent | Size::Comparison { .. } => true,
     }
 }
 
-pub(super) fn effective_table_grid(session: &LayoutEngine<'_, '_>, mut grid: TableGrid, hints: &[crate::layout_model::TableColumnWidthHint], fixed_mode: bool) -> (TableGrid, Vec<usize>, Vec<usize>) {
+pub(super) fn effective_table_grid(
+    session: &LayoutEngine<'_, '_>,
+    mut grid: TableGrid,
+    hints: &[crate::layout_model::TableColumnWidthHint],
+    fixed_mode: bool,
+) -> (TableGrid, Vec<usize>, Vec<usize>) {
     let logical_count = grid.column_count.max(hints.len());
     if logical_count == 0 {
         return (grid, Vec::new(), Vec::new());
@@ -64,7 +73,14 @@ pub(super) fn effective_table_grid(session: &LayoutEngine<'_, '_>, mut grid: Tab
             originating[column]
                 || hints.get(column).is_some_and(|hint| {
                     let primary = session.reader.used_style(hint.style);
-                    let width = if matches!(primary.width(), html_style_model::UsedPreferredSize::Auto) { hint.fallback_style.map(|style| session.reader.used_style(style).width()).unwrap_or(primary.width()) } else { primary.width() };
+                    let width =
+                        if matches!(primary.width(), html_style_model::UsedPreferredSize::Auto) {
+                            hint.fallback_style
+                                .map(|style| session.reader.used_style(style).width())
+                                .unwrap_or(primary.width())
+                        } else {
+                            primary.width()
+                        };
                     size_keeps_empty_track(width) || size_keeps_empty_track(primary.min_width())
                 })
         })
@@ -78,7 +94,9 @@ pub(super) fn effective_table_grid(session: &LayoutEngine<'_, '_>, mut grid: Tab
     let mut effective = 0usize;
     for logical in 0..logical_count {
         if retained.binary_search(&logical).is_ok() {
-            effective = retained.binary_search(&logical).expect("retained track is searchable");
+            effective = retained
+                .binary_search(&logical)
+                .expect("retained track is searchable");
         }
         logical_to_effective[logical] = effective;
     }
@@ -88,7 +106,10 @@ pub(super) fn effective_table_grid(session: &LayoutEngine<'_, '_>, mut grid: Tab
     }
 
     for placement in &mut grid.placements {
-        let logical_end = placement.col.saturating_add(placement.colspan).min(logical_count);
+        let logical_end = placement
+            .col
+            .saturating_add(placement.colspan)
+            .min(logical_count);
         if logical_end <= placement.col {
             continue;
         }
@@ -100,5 +121,3 @@ pub(super) fn effective_table_grid(session: &LayoutEngine<'_, '_>, mut grid: Tab
     grid.column_count = retained.len();
     (grid, retained, logical_to_effective)
 }
-
-

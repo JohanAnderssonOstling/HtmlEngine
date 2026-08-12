@@ -48,15 +48,24 @@ impl SpaceGlueClass {
 }
 
 pub(super) fn classify_space(previous: Option<char>, next: Option<char>) -> SpaceGlueClass {
-    let adjacent_to_opening = previous.is_some_and(|ch| matches!(ch, '(' | '[' | '{' | '“' | '‘' | '«' | '‹'));
-    let adjacent_to_closing = next.is_some_and(|ch| matches!(ch, ')' | ']' | '}' | '”' | '’' | '»' | '›' | '"' | '\''));
+    let adjacent_to_opening =
+        previous.is_some_and(|ch| matches!(ch, '(' | '[' | '{' | '“' | '‘' | '«' | '‹'));
+    let adjacent_to_closing =
+        next.is_some_and(|ch| matches!(ch, ')' | ']' | '}' | '”' | '’' | '»' | '›' | '"' | '\''));
     if adjacent_to_opening || adjacent_to_closing {
         return SpaceGlueClass::OpeningOrClosing;
     }
-    if previous.is_some_and(|ch| matches!(ch, '—' | '–')) || next.is_some_and(|ch| matches!(ch, '—' | '–')) {
+    if previous.is_some_and(|ch| matches!(ch, '—' | '–'))
+        || next.is_some_and(|ch| matches!(ch, '—' | '–'))
+    {
         return SpaceGlueClass::Dash;
     }
-    if previous.is_some_and(|ch| matches!(ch, '.' | '!' | '?' | '…' | '”' | '’' | '»' | '›' | '"' | '\'')) {
+    if previous.is_some_and(|ch| {
+        matches!(
+            ch,
+            '.' | '!' | '?' | '…' | '”' | '’' | '»' | '›' | '"' | '\''
+        )
+    }) {
         return SpaceGlueClass::Sentence;
     }
     if previous.is_some_and(|ch| matches!(ch, ',' | ';' | ':')) {
@@ -65,10 +74,21 @@ pub(super) fn classify_space(previous: Option<char>, next: Option<char>) -> Spac
     SpaceGlueClass::Ordinary
 }
 
-pub(super) fn glue_capacities(space_width: f64, class: SpaceGlueClass, punctuation_aware: bool) -> (f64, f64) {
+pub(super) fn glue_capacities(
+    space_width: f64,
+    class: SpaceGlueClass,
+    punctuation_aware: bool,
+) -> (f64, f64) {
     let width = space_width.max(0.0);
-    let class = if punctuation_aware { class } else { SpaceGlueClass::Ordinary };
-    (width * NORMAL_STRETCH_FRACTION * class.stretch_factor(), width * NORMAL_SHRINK_FRACTION * class.shrink_factor())
+    let class = if punctuation_aware {
+        class
+    } else {
+        SpaceGlueClass::Ordinary
+    };
+    (
+        width * NORMAL_STRETCH_FRACTION * class.stretch_factor(),
+        width * NORMAL_SHRINK_FRACTION * class.shrink_factor(),
+    )
 }
 
 #[cfg(test)]
@@ -84,6 +104,10 @@ mod tests {
         assert!(clause.0 > ordinary.0);
         assert!(dash.0 < ordinary.0);
         assert!(dash.1 < ordinary.1);
-        assert_eq!(glue_capacities(10.0, SpaceGlueClass::Clause, false), ordinary, "web-compatible glue ignores punctuation classes");
+        assert_eq!(
+            glue_capacities(10.0, SpaceGlueClass::Clause, false),
+            ordinary,
+            "web-compatible glue ignores punctuation classes"
+        );
     }
 }

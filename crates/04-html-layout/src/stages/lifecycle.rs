@@ -519,7 +519,9 @@ impl PreparedDocument {
                 hyphen_glyphs,
                 link_glyph_targets,
                 anchor_glyphs,
-                inline_plans: crate::layout::PreparedInlinePlans::new(self.inputs.layout_tree.box_count()),
+                inline_plans: crate::layout::PreparedInlinePlans::new(
+                    self.inputs.layout_tree.box_count(),
+                ),
             }),
         })
     }

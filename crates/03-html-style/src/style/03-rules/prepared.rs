@@ -201,9 +201,10 @@ struct PreparedRuleMetadata {
     scope: ScopeId,
 }
 
-struct PendingRule<'css> {
+struct PendingRule<'fragment, 'css> {
     style_rule: StyleRule<'css>,
     metadata: PreparedRuleMetadata,
+    fragment_rule: Option<(&'fragment PreparedStylesheetFragment<'css>, usize)>,
 }
 
 #[derive(Clone)]
@@ -225,6 +226,49 @@ struct PreparedRuleDeclarations {
     important_start: u32,
     normal_shadow_mask: u64,
     important_shadow_mask: u64,
+}
+
+struct FragmentRuleDeclarations {
+    starts: PreparedRuleDeclarations,
+}
+
+/// Environment- and order-independent work compiled once for one stylesheet.
+/// Linking still evaluates media, layers, scopes, and source order globally.
+pub(crate) struct PreparedStylesheetFragment<'css> {
+    stylesheet: StyleSheet<'css>,
+    rule_declarations: Vec<FragmentRuleDeclarations>,
+    declaration_target_ranges: Vec<PreparedTargetRange>,
+    property_targets: Vec<PreparedPropertyTarget>,
+}
+
+impl<'css> PreparedStylesheetFragment<'css> {
+    pub(crate) fn compile(stylesheet: StyleSheet<'css>) -> Self {
+        let mut style_rules = Vec::new();
+        collect_all_style_rules(&stylesheet.rules, &mut style_rules);
+        let declaration_capacity = style_rules.iter().map(|rule| rule.declarations.declarations.len() + rule.declarations.important_declarations.len()).sum();
+        let mut declaration_target_ranges = Vec::with_capacity(declaration_capacity);
+        let mut property_targets = Vec::with_capacity(declaration_capacity);
+        let mut property_slots = FxHashMap::default();
+        let mut rule_declarations = Vec::with_capacity(style_rules.len());
+        for rule in style_rules {
+            let normal_start = u32::try_from(declaration_target_ranges.len()).expect("prepared declaration target ranges fit in u32");
+            for property in &rule.declarations.declarations {
+                append_fragment_declaration(property, &mut property_slots, &mut property_targets, &mut declaration_target_ranges);
+            }
+            let important_start = u32::try_from(declaration_target_ranges.len()).expect("prepared declaration target ranges fit in u32");
+            for property in &rule.declarations.important_declarations {
+                append_fragment_declaration(property, &mut property_slots, &mut property_targets, &mut declaration_target_ranges);
+            }
+            rule_declarations.push(FragmentRuleDeclarations { starts: PreparedRuleDeclarations {
+                normal_start,
+                important_start,
+                normal_shadow_mask: shadow_mask(&rule.declarations.declarations),
+                important_shadow_mask: shadow_mask(&rule.declarations.important_declarations),
+            }});
+        }
+        Self { stylesheet, rule_declarations, declaration_target_ranges, property_targets }
+    }
+
 }
 
 const ALL_DECLARATIONS_SHADOWABLE: u64 = 1 << 63;
@@ -331,6 +375,36 @@ fn append_property_targets(property: &Property<'_>, slot_ids: &mut FxHashMap<Arc
     output.push(intern_target(canonical_slot(property_id.name()), None, slot_ids));
 }
 
+fn append_fragment_declaration(property: &Property<'_>, slot_ids: &mut FxHashMap<Arc<str>, u32>, targets: &mut Vec<PreparedPropertyTarget>, ranges: &mut Vec<PreparedTargetRange>) {
+    let start = u32::try_from(targets.len()).expect("prepared property targets fit in u32");
+    append_property_targets(property, slot_ids, targets);
+    let len = u32::try_from(targets.len() - start as usize).expect("one declaration's property targets fit in u32");
+    ranges.push(PreparedTargetRange::new(start, len, property));
+}
+
+fn link_fragment_declaration(fragment: &PreparedStylesheetFragment<'_>, range_index: usize, slot_ids: &mut FxHashMap<Arc<str>, u32>, targets: &mut Vec<PreparedPropertyTarget>, ranges: &mut Vec<PreparedTargetRange>) {
+    let local_range = fragment.declaration_target_ranges[range_index];
+    let start = u32::try_from(targets.len()).expect("prepared property targets fit in u32");
+    for target in &fragment.property_targets[local_range.start as usize..local_range.start as usize + local_range.len()] {
+        targets.push(intern_target(&target.name, target.longhand.clone(), slot_ids));
+    }
+    let len = u32::try_from(targets.len() - start as usize).expect("one declaration's property targets fit in u32");
+    ranges.push(PreparedTargetRange { start, len_and_flags: len | (local_range.len_and_flags & PreparedTargetRange::FLAGS) });
+}
+
+fn collect_all_style_rules<'a, 'css>(rules: &'a CssRuleList<'css>, output: &mut Vec<&'a StyleRule<'css>>) {
+    for rule in &rules.0 {
+        match rule {
+            CssRule::Style(style) => output.push(style),
+            CssRule::Media(media) => collect_all_style_rules(&media.rules, output),
+            CssRule::Supports(supports) => collect_all_style_rules(&supports.rules, output),
+            CssRule::LayerBlock(layer) => collect_all_style_rules(&layer.rules, output),
+            CssRule::Scope(scope) => collect_all_style_rules(&scope.rules, output),
+            _ => {}
+        }
+    }
+}
+
 pub(crate) fn compile_property_targets(property: &Property<'_>, slot_ids: &mut FxHashMap<Arc<str>, u32>, targets: &mut Vec<PreparedPropertyTarget>) {
     targets.clear();
     append_property_targets(property, slot_ids, targets);
@@ -362,7 +436,7 @@ pub(crate) struct ParsedStylesheetSet<'sheet, 'css> {
 #[derive(Clone, Copy)]
 enum AuthorStylesheets<'sheet, 'css> {
     Contiguous(&'sheet [StyleSheet<'css>]),
-    References(&'sheet [&'sheet StyleSheet<'css>]),
+    Fragments(&'sheet [&'sheet PreparedStylesheetFragment<'css>]),
 }
 
 impl<'sheet, 'css> ParsedStylesheetSet<'sheet, 'css> {
@@ -376,15 +450,15 @@ impl<'sheet, 'css> ParsedStylesheetSet<'sheet, 'css> {
         Self { user_agent, authors: AuthorStylesheets::Contiguous(authors), author_root_indices }
     }
 
-    pub(crate) fn with_author_root_indices(user_agent: &'sheet StyleSheet<'css>, authors: &'sheet [&'sheet StyleSheet<'css>], author_root_indices: &'sheet [u32]) -> Self {
+    pub(crate) fn with_fragments(user_agent: &'sheet StyleSheet<'css>, authors: &'sheet [&'sheet PreparedStylesheetFragment<'css>], author_root_indices: &'sheet [u32]) -> Self {
         debug_assert_eq!(authors.len(), author_root_indices.len());
-        Self { user_agent, authors: AuthorStylesheets::References(authors), author_root_indices }
+        Self { user_agent, authors: AuthorStylesheets::Fragments(authors), author_root_indices }
     }
 
     pub(crate) fn prepare(self, environment: MediaEnvironment, initial_font_size: f64) -> PreparedRuleSet<'css> {
         let author_capacity = match self.authors {
             AuthorStylesheets::Contiguous(stylesheets) => stylesheets.iter().map(|stylesheet| stylesheet.rules.0.len()).sum::<usize>(),
-            AuthorStylesheets::References(stylesheets) => stylesheets.iter().map(|stylesheet| stylesheet.rules.0.len()).sum::<usize>(),
+            AuthorStylesheets::Fragments(fragments) => fragments.iter().map(|fragment| fragment.stylesheet.rules.0.len()).sum::<usize>(),
         };
         let capacity = self.user_agent.rules.0.len() + author_capacity;
         let mut rules = Vec::with_capacity(capacity);
@@ -402,12 +476,8 @@ impl<'sheet, 'css> ParsedStylesheetSet<'sheet, 'css> {
                 });
                 prepare_origin(authors, CascadeOrigin::Author, &mut rules, &mut scopes, &mut source_order, environment, initial_font_size, &mut media_queries, &mut media_path);
             }
-            AuthorStylesheets::References(stylesheets) => {
-                let authors = stylesheets.iter().copied().enumerate().map(|(index, stylesheet)| {
-                    let root_index = self.author_root_indices.get(index).copied().unwrap_or_else(|| u32::try_from(index).expect("author stylesheet count fits in u32"));
-                    (stylesheet, Some(root_index))
-                });
-                prepare_origin(authors, CascadeOrigin::Author, &mut rules, &mut scopes, &mut source_order, environment, initial_font_size, &mut media_queries, &mut media_path);
+            AuthorStylesheets::Fragments(fragments) => {
+                prepare_fragment_origin(fragments, self.author_root_indices, CascadeOrigin::Author, &mut rules, &mut scopes, &mut source_order, environment, initial_font_size, &mut media_queries, &mut media_path);
             }
         }
 
@@ -426,24 +496,33 @@ impl<'sheet, 'css> ParsedStylesheetSet<'sheet, 'css> {
         let mut rule_target_starts = Vec::with_capacity(rules.len());
         for rule in &rules {
             let normal_start = u32::try_from(declaration_target_ranges.len()).expect("prepared declaration target ranges fit in u32");
-            for property in &rule.style_rule.declarations.declarations {
-                let start = u32::try_from(property_targets.len()).expect("prepared property targets fit in u32");
-                append_property_targets(property, &mut property_slots, &mut property_targets);
-                let len = u32::try_from(property_targets.len() - start as usize).expect("one declaration's property targets fit in u32");
-                declaration_target_ranges.push(PreparedTargetRange::new(start, len, property));
+            if let Some((fragment, rule_index)) = rule.fragment_rule {
+                let starts = fragment.rule_declarations[rule_index].starts;
+                for index in 0..rule.style_rule.declarations.declarations.len() {
+                    link_fragment_declaration(fragment, starts.normal_start as usize + index, &mut property_slots, &mut property_targets, &mut declaration_target_ranges);
+                }
+            } else {
+                for property in &rule.style_rule.declarations.declarations {
+                    append_fragment_declaration(property, &mut property_slots, &mut property_targets, &mut declaration_target_ranges);
+                }
             }
             let important_start = u32::try_from(declaration_target_ranges.len()).expect("prepared declaration target ranges fit in u32");
-            for property in &rule.style_rule.declarations.important_declarations {
-                let start = u32::try_from(property_targets.len()).expect("prepared property targets fit in u32");
-                append_property_targets(property, &mut property_slots, &mut property_targets);
-                let len = u32::try_from(property_targets.len() - start as usize).expect("one declaration's property targets fit in u32");
-                declaration_target_ranges.push(PreparedTargetRange::new(start, len, property));
+            if let Some((fragment, rule_index)) = rule.fragment_rule {
+                let starts = fragment.rule_declarations[rule_index].starts;
+                for index in 0..rule.style_rule.declarations.important_declarations.len() {
+                    link_fragment_declaration(fragment, starts.important_start as usize + index, &mut property_slots, &mut property_targets, &mut declaration_target_ranges);
+                }
+            } else {
+                for property in &rule.style_rule.declarations.important_declarations {
+                    append_fragment_declaration(property, &mut property_slots, &mut property_targets, &mut declaration_target_ranges);
+                }
             }
+            let masks = rule.fragment_rule.map(|(fragment, rule_index)| fragment.rule_declarations[rule_index].starts);
             rule_target_starts.push(PreparedRuleDeclarations {
                 normal_start,
                 important_start,
-                normal_shadow_mask: shadow_mask(&rule.style_rule.declarations.declarations),
-                important_shadow_mask: shadow_mask(&rule.style_rule.declarations.important_declarations),
+                normal_shadow_mask: masks.map_or_else(|| shadow_mask(&rule.style_rule.declarations.declarations), |starts| starts.normal_shadow_mask),
+                important_shadow_mask: masks.map_or_else(|| shadow_mask(&rule.style_rule.declarations.important_declarations), |starts| starts.important_shadow_mask),
             });
         }
 
@@ -464,7 +543,7 @@ impl<'sheet, 'css> ParsedStylesheetSet<'sheet, 'css> {
 }
 
 fn prepare_origin<'sheet, 'css: 'sheet>(
-    stylesheets: impl IntoIterator<Item = (&'sheet StyleSheet<'css>, Option<u32>)>, origin: CascadeOrigin, output: &mut Vec<PendingRule<'css>>, scopes: &mut Vec<ScopeDescriptor<'css>>, source_order: &mut u32,
+    stylesheets: impl IntoIterator<Item = (&'sheet StyleSheet<'css>, Option<u32>)>, origin: CascadeOrigin, output: &mut Vec<PendingRule<'_, 'css>>, scopes: &mut Vec<ScopeDescriptor<'css>>, source_order: &mut u32,
     environment: MediaEnvironment, initial_font_size: f64, media_queries: &mut MediaQuerySet, media_path: &mut Vec<u32>,
 ) {
     let first_rule = output.len();
@@ -481,8 +560,139 @@ fn prepare_origin<'sheet, 'css: 'sheet>(
     }
 }
 
+fn prepare_fragment_origin<'fragment, 'css>(
+    fragments: &[&'fragment PreparedStylesheetFragment<'css>], root_indices: &[u32], origin: CascadeOrigin, output: &mut Vec<PendingRule<'fragment, 'css>>, scopes: &mut Vec<ScopeDescriptor<'css>>, source_order: &mut u32,
+    environment: MediaEnvironment, initial_font_size: f64, media_queries: &mut MediaQuerySet, media_path: &mut Vec<u32>,
+) {
+    let first_rule = output.len();
+    let mut layers = LayerRegistry::default();
+    for (index, fragment) in fragments.iter().copied().enumerate() {
+        let implicit_root_index = root_indices.get(index).copied().or_else(|| Some(u32::try_from(index).expect("author stylesheet count fits in u32")));
+        let mut rule_index = 0;
+        collect_fragment_effective_rules(&fragment.stylesheet.rules, fragment, &mut rule_index, origin, None, ScopeId::NONE, implicit_root_index, &mut layers, output, scopes, source_order, environment, initial_font_size, media_queries, media_path);
+        debug_assert_eq!(rule_index, fragment.rule_declarations.len());
+    }
+    let ranks = layers.ranks();
+    for rule in &mut output[first_rule..] {
+        if !rule.metadata.priority.layer.is_unlayered() {
+            rule.metadata.priority.layer = ranks[rule.metadata.priority.layer.0 as usize];
+        }
+    }
+}
+
+fn collect_fragment_effective_rules<'fragment, 'css>(
+    rule_list: &CssRuleList<'css>, fragment: &'fragment PreparedStylesheetFragment<'css>, rule_index: &mut usize, origin: CascadeOrigin, current_layer: Option<LayerId>, current_scope: ScopeId, implicit_root_index: Option<u32>, layers: &mut LayerRegistry,
+    output: &mut Vec<PendingRule<'fragment, 'css>>, scopes: &mut Vec<ScopeDescriptor<'css>>, source_order: &mut u32, environment: MediaEnvironment, initial_font_size: f64, media_queries: &mut MediaQuerySet, media_path: &mut Vec<u32>,
+) {
+    for rule in &rule_list.0 {
+        match rule {
+            CssRule::Style(style_rule) => {
+                let fragment_rule_index = *rule_index;
+                *rule_index += 1;
+                if selector_list_is_web_valid(&style_rule.selectors) {
+                    media_queries.record_dependency(media_path);
+                    let layer = current_layer.map_or(LayerOrder::UNLAYERED, LayerOrder::from_layer_id);
+                    output.push(PendingRule { style_rule: style_rule.clone(), metadata: PreparedRuleMetadata { priority: RulePriority { origin, layer, source_order: *source_order }, scope: current_scope }, fragment_rule: Some((fragment, fragment_rule_index)) });
+                    *source_order = source_order.checked_add(1).expect("a stylesheet cannot contain more than u32::MAX effective rules");
+                }
+            }
+            CssRule::Media(media) => {
+                let compiled = CompiledMediaList::compile(&media.query);
+                let applies = compiled.evaluate(environment, initial_font_size).is_true();
+                let query_id = media_queries.register_query(compiled);
+                media_path.push(query_id);
+                if applies {
+                    collect_fragment_effective_rules(&media.rules, fragment, rule_index, origin, current_layer, current_scope, implicit_root_index, layers, output, scopes, source_order, environment, initial_font_size, media_queries, media_path);
+                } else {
+                    collect_fragment_media_dependencies(&media.rules, rule_index, media_queries, media_path);
+                }
+                media_path.pop();
+            }
+            CssRule::Supports(supports) => {
+                if supports_condition_applies(&supports.condition) {
+                    collect_fragment_effective_rules(&supports.rules, fragment, rule_index, origin, current_layer, current_scope, implicit_root_index, layers, output, scopes, source_order, environment, initial_font_size, media_queries, media_path);
+                } else {
+                    skip_fragment_style_rules(&supports.rules, rule_index);
+                }
+            }
+            CssRule::LayerStatement(statement) => {
+                media_queries.record_dependency(media_path);
+                for name in &statement.names {
+                    layers.register_named(current_layer, name);
+                }
+            }
+            CssRule::LayerBlock(block) => {
+                media_queries.record_dependency(media_path);
+                let layer = match &block.name {
+                    Some(name) => layers.register_named(current_layer, name),
+                    None => layers.register_anonymous(current_layer),
+                };
+                collect_fragment_effective_rules(&block.rules, fragment, rule_index, origin, Some(layer), current_scope, implicit_root_index, layers, output, scopes, source_order, environment, initial_font_size, media_queries, media_path);
+            }
+            CssRule::Scope(scope) => {
+                let start_valid = scope.scope_start.as_ref().is_none_or(selector_list_is_web_valid);
+                let end_valid = scope.scope_end.as_ref().is_none_or(selector_list_is_web_valid);
+                if start_valid && end_valid {
+                    let scope_id = ScopeId(u32::try_from(scopes.len()).expect("scope IDs fit in u32"));
+                    scopes.push(ScopeDescriptor { parent: current_scope, start: scope.scope_start.clone(), end: scope.scope_end.clone(), implicit_root_index });
+                    collect_fragment_effective_rules(&scope.rules, fragment, rule_index, origin, current_layer, scope_id, implicit_root_index, layers, output, scopes, source_order, environment, initial_font_size, media_queries, media_path);
+                } else {
+                    skip_fragment_style_rules(&scope.rules, rule_index);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn skip_fragment_style_rules(rules: &CssRuleList<'_>, rule_index: &mut usize) {
+    for rule in &rules.0 {
+        match rule {
+            CssRule::Style(_) => *rule_index += 1,
+            CssRule::Media(media) => skip_fragment_style_rules(&media.rules, rule_index),
+            CssRule::Supports(supports) => skip_fragment_style_rules(&supports.rules, rule_index),
+            CssRule::LayerBlock(layer) => skip_fragment_style_rules(&layer.rules, rule_index),
+            CssRule::Scope(scope) => skip_fragment_style_rules(&scope.rules, rule_index),
+            _ => {}
+        }
+    }
+}
+
+fn collect_fragment_media_dependencies(rule_list: &CssRuleList<'_>, rule_index: &mut usize, media_queries: &mut MediaQuerySet, media_path: &mut Vec<u32>) {
+    for rule in &rule_list.0 {
+        match rule {
+            CssRule::Style(style_rule) => {
+                *rule_index += 1;
+                if selector_list_is_web_valid(&style_rule.selectors) {
+                    media_queries.record_dependency(media_path);
+                }
+            }
+            CssRule::Media(media) => {
+                let query_id = media_queries.register_query(CompiledMediaList::compile(&media.query));
+                media_path.push(query_id);
+                collect_fragment_media_dependencies(&media.rules, rule_index, media_queries, media_path);
+                media_path.pop();
+            }
+            CssRule::Supports(supports) => {
+                if supports_condition_applies(&supports.condition) {
+                    collect_fragment_media_dependencies(&supports.rules, rule_index, media_queries, media_path);
+                } else {
+                    skip_fragment_style_rules(&supports.rules, rule_index);
+                }
+            }
+            CssRule::LayerStatement(_) => media_queries.record_dependency(media_path),
+            CssRule::LayerBlock(block) => {
+                media_queries.record_dependency(media_path);
+                collect_fragment_media_dependencies(&block.rules, rule_index, media_queries, media_path);
+            }
+            CssRule::Scope(scope) => collect_fragment_media_dependencies(&scope.rules, rule_index, media_queries, media_path),
+            _ => {}
+        }
+    }
+}
+
 fn collect_effective_rules<'css>(
-    rule_list: &CssRuleList<'css>, origin: CascadeOrigin, current_layer: Option<LayerId>, current_scope: ScopeId, implicit_root_index: Option<u32>, layers: &mut LayerRegistry, output: &mut Vec<PendingRule<'css>>,
+    rule_list: &CssRuleList<'css>, origin: CascadeOrigin, current_layer: Option<LayerId>, current_scope: ScopeId, implicit_root_index: Option<u32>, layers: &mut LayerRegistry, output: &mut Vec<PendingRule<'_, 'css>>,
     scopes: &mut Vec<ScopeDescriptor<'css>>, source_order: &mut u32, environment: MediaEnvironment, initial_font_size: f64, media_queries: &mut MediaQuerySet, media_path: &mut Vec<u32>,
 ) {
     for rule in &rule_list.0 {
@@ -490,7 +700,7 @@ fn collect_effective_rules<'css>(
             CssRule::Style(style_rule) if selector_list_is_web_valid(&style_rule.selectors) => {
                 media_queries.record_dependency(media_path);
                 let layer = current_layer.map_or(LayerOrder::UNLAYERED, LayerOrder::from_layer_id);
-                output.push(PendingRule { style_rule: style_rule.clone(), metadata: PreparedRuleMetadata { priority: RulePriority { origin, layer, source_order: *source_order }, scope: current_scope } });
+                output.push(PendingRule { style_rule: style_rule.clone(), metadata: PreparedRuleMetadata { priority: RulePriority { origin, layer, source_order: *source_order }, scope: current_scope }, fragment_rule: None });
                 *source_order = source_order.checked_add(1).expect("a stylesheet cannot contain more than u32::MAX effective rules");
             }
             CssRule::Media(media) => {

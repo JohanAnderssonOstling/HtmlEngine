@@ -1,7 +1,12 @@
-use crate::layout_model::{Children, GlyphMetrics, InlineContent, InlineItemKind, LayoutBox, LayoutMode, LayoutTree, ListItemMarker};
+use crate::layout_model::{
+    Children, GlyphMetrics, InlineContent, InlineItemKind, LayoutBox, LayoutMode, LayoutTree,
+    ListItemMarker,
+};
 use crate::shaping::{FontRelativeMetrics, ShapedFontMetrics};
 use html_dom::Document;
-use html_style_model::{ComputedStyles, Float, LayoutStyle, PositionMode, StyleIndices, UsedStyleView};
+use html_style_model::{
+    ComputedStyles, Float, LayoutStyle, PositionMode, StyleIndices, UsedStyleView,
+};
 use kurbo::Size;
 
 #[derive(Clone, Copy, Debug)]
@@ -37,23 +42,51 @@ struct BoxStyleSnapshot<'input> {
 }
 
 impl<'input> BoxStyleSnapshot<'input> {
-    fn new(styles: &'input ComputedStyles, topology: &'input LayoutTree, font_metrics: &'input ShapedFontMetrics) -> Self {
+    fn new(
+        styles: &'input ComputedStyles,
+        topology: &'input LayoutTree,
+        font_metrics: &'input ShapedFontMetrics,
+    ) -> Self {
         let mut resolved = Vec::with_capacity(topology.box_count());
         let mut tracks_overflow_clips = false;
         for box_idx in 0..topology.box_count() {
-            let indices = topology.get_box_style_indices(box_idx).unwrap_or_else(|| styles.default_indices());
-            let style = font_metrics.used_style(styles, indices, box_idx).expect("validated style handle");
+            let indices = topology
+                .get_box_style_indices(box_idx)
+                .unwrap_or_else(|| styles.default_indices());
+            let style = font_metrics
+                .used_style(styles, indices, box_idx)
+                .expect("validated style handle");
             tracks_overflow_clips |= style.overflow_x().clips() || style.overflow_y().clips();
             resolved.push(style);
         }
-        Self { styles: resolved, tracks_overflow_clips }
+        Self {
+            styles: resolved,
+            tracks_overflow_clips,
+        }
     }
 }
 
 impl<'input> LayoutReader<'input> {
-    pub(crate) fn new(document: &'input Document, styles: &'input ComputedStyles, topology: &'input LayoutTree, inline_content: &'input InlineContent, glyph_metrics: &'input GlyphMetrics, font_metrics: &'input ShapedFontMetrics, image_metrics: &'input crate::ImageMetrics) -> Self {
+    pub(crate) fn new(
+        document: &'input Document,
+        styles: &'input ComputedStyles,
+        topology: &'input LayoutTree,
+        inline_content: &'input InlineContent,
+        glyph_metrics: &'input GlyphMetrics,
+        font_metrics: &'input ShapedFontMetrics,
+        image_metrics: &'input crate::ImageMetrics,
+    ) -> Self {
         let box_styles = BoxStyleSnapshot::new(styles, topology, font_metrics);
-        Self { document, styles, topology, inline_content, glyph_metrics, font_metrics, image_metrics, box_styles }
+        Self {
+            document,
+            styles,
+            topology,
+            inline_content,
+            glyph_metrics,
+            font_metrics,
+            image_metrics,
+            box_styles,
+        }
     }
 
     pub(crate) fn document(&self) -> &'input Document {
@@ -69,7 +102,9 @@ impl<'input> LayoutReader<'input> {
     }
 
     pub(crate) fn used_style(&self, indices: StyleIndices) -> UsedStyleView<'input> {
-        self.font_metrics.used_non_box_style(self.styles, indices).expect("validated style handle")
+        self.font_metrics
+            .used_non_box_style(self.styles, indices)
+            .expect("validated style handle")
     }
 
     pub(crate) fn font_metrics(&self, box_idx: usize) -> FontRelativeMetrics {
@@ -97,22 +132,38 @@ impl<'input> LayoutReader<'input> {
     }
 
     pub(crate) fn image_display_size(&self, image_idx: u32) -> (f64, f64) {
-        self.image_metrics.display_size(image_idx, self.document.image(image_idx).expect("image index should be valid"))
+        self.image_metrics.display_size(
+            image_idx,
+            self.document
+                .image(image_idx)
+                .expect("image index should be valid"),
+        )
     }
 
     pub(crate) fn image_intrinsic(&self, box_idx: usize) -> Option<ImageIntrinsic> {
         let image_idx = self.image_idx(box_idx)?;
         let (width, height) = self.image_display_size(image_idx);
         let size = Size::new(width, height);
-        Some(ImageIntrinsic { size, aspect_ratio: self.image_intrinsic_ratio(box_idx, size) })
+        Some(ImageIntrinsic {
+            size,
+            aspect_ratio: self.image_intrinsic_ratio(box_idx, size),
+        })
     }
 
     fn image_intrinsic_ratio(&self, box_idx: usize, intrinsic: Size) -> Option<f64> {
-        if let Some(element) = self.box_dom_element(box_idx).and_then(|raw| self.document.node_id_from_raw(raw)).and_then(|node| self.document.element_ref(node))
+        if let Some(element) = self
+            .box_dom_element(box_idx)
+            .and_then(|raw| self.document.node_id_from_raw(raw))
+            .and_then(|node| self.document.element_ref(node))
             && element.tag().eq_ignore_ascii_case("svg")
         {
             if let Some(view_box) = element.attr("viewBox").or_else(|| element.attr("viewbox")) {
-                let values = view_box.split(|character: char| character.is_ascii_whitespace() || character == ',').filter(|value| !value.is_empty()).map(str::parse::<f64>).collect::<Result<Vec<_>, _>>().ok()?;
+                let values = view_box
+                    .split(|character: char| character.is_ascii_whitespace() || character == ',')
+                    .filter(|value| !value.is_empty())
+                    .map(str::parse::<f64>)
+                    .collect::<Result<Vec<_>, _>>()
+                    .ok()?;
                 if values.len() != 4 || values[2] <= 0.0 || values[3] <= 0.0 {
                     return None;
                 }
@@ -126,19 +177,35 @@ impl<'input> LayoutReader<'input> {
     /// Returns a renderer-supplied column-filling width for an eligible
     /// standalone image, capped so its outer height fits the viewport.
     pub(crate) fn smart_standalone_image_width(
-        &self, policy: crate::ImageSizingPolicy, box_idx: usize, intrinsic: Size, available_width: f64, viewport_height: Option<f64>, horizontal_padding_border: f64, vertical_outer_inset: f64, standalone: bool,
+        &self,
+        policy: crate::ImageSizingPolicy,
+        box_idx: usize,
+        intrinsic: Size,
+        available_width: f64,
+        viewport_height: Option<f64>,
+        horizontal_padding_border: f64,
+        vertical_outer_inset: f64,
+        standalone: bool,
     ) -> Option<html_style_model::UsedPreferredSize> {
         const MIN_SOURCE_WIDTH: f64 = 96.0;
 
-        if policy != crate::ImageSizingPolicy::SmartStandalone || !standalone || intrinsic.width < MIN_SOURCE_WIDTH {
+        if policy != crate::ImageSizingPolicy::SmartStandalone
+            || !standalone
+            || intrinsic.width < MIN_SOURCE_WIDTH
+        {
             return None;
         }
         let style = self.style(box_idx);
-        if style.height() != html_style_model::UsedPreferredSize::Auto || style.min_height() != html_style_model::UsedPreferredSize::Auto || style.max_height() != html_style_model::UsedPreferredSize::Auto {
+        if style.height() != html_style_model::UsedPreferredSize::Auto
+            || style.min_height() != html_style_model::UsedPreferredSize::Auto
+            || style.max_height() != html_style_model::UsedPreferredSize::Auto
+        {
             return None;
         }
 
-        let node = self.box_dom_element(box_idx).and_then(|raw| self.document.node_id_from_raw(raw))?;
+        let node = self
+            .box_dom_element(box_idx)
+            .and_then(|raw| self.document.node_id_from_raw(raw))?;
         let element = self.document.element_ref(node)?;
         if element.attr("height").is_some() {
             return None;
@@ -149,11 +216,14 @@ impl<'input> LayoutReader<'input> {
             && let Some(viewport_height) = viewport_height
         {
             let available_content_height = (viewport_height - vertical_outer_inset).max(0.0);
-            expanded_content_width = expanded_content_width.min(available_content_height * intrinsic.width / intrinsic.height);
+            expanded_content_width = expanded_content_width
+                .min(available_content_height * intrinsic.width / intrinsic.height);
         }
         let preferred = match style.box_sizing() {
             html_style_model::BoxSizing::ContentBox => expanded_content_width,
-            html_style_model::BoxSizing::BorderBox => expanded_content_width + horizontal_padding_border,
+            html_style_model::BoxSizing::BorderBox => {
+                expanded_content_width + horizontal_padding_border
+            }
         };
         Some(html_style_model::UsedPreferredSize::Px(preferred as f32))
     }
@@ -163,8 +233,12 @@ impl<'input> LayoutReader<'input> {
     }
 
     pub(crate) fn layout_style(&self, box_idx: usize) -> &'input LayoutStyle {
-        let indices = self.box_style_indices(box_idx).unwrap_or_else(|| self.styles.default_indices());
-        self.styles.layout_style(indices).expect("validated style handle")
+        let indices = self
+            .box_style_indices(box_idx)
+            .unwrap_or_else(|| self.styles.default_indices());
+        self.styles
+            .layout_style(indices)
+            .expect("validated style handle")
     }
 
     pub(crate) fn inline_fragment_edges(&self, box_idx: usize) -> (bool, bool) {
@@ -187,37 +261,64 @@ impl<'input> LayoutReader<'input> {
     /// and absolutely positioned descendants leave anchors in the run stream,
     /// but those anchors do not give their containing block a line box or
     /// prevent its vertical margins from collapsing through.
-    pub(crate) fn inline_items_establish_line_box(&self, container_box_idx: usize, runs: &std::ops::Range<u32>) -> bool {
-        self.inline_content.inline_items()[runs.start as usize..runs.end as usize].iter().any(|run| {
-            let ownership_box = match run.kind {
-                InlineItemKind::AtomicBox { box_idx } => self.get_parent(box_idx as usize),
-                _ => Some(run.box_idx as usize),
-            };
-            if !ownership_box.is_some_and(|box_idx| self.run_belongs_to_inline_context(box_idx, container_box_idx)) {
-                return false;
-            }
-            match &run.kind {
-                InlineItemKind::FloatAnchor { .. } | InlineItemKind::AbsoluteAnchor { .. } => false,
-                InlineItemKind::Text { glyphs } => {
-                    let preserves_space = self.style(run.box_idx as usize).white_space().preserves_spaces();
-                    glyphs.clone().any(|glyph_idx| {
-                        let character = self.inline_content.glyph_at(glyph_idx as usize).map(|glyph| self.glyph_metrics.get(glyph).ch()).unwrap_or_default();
-                        preserves_space || !character.is_whitespace() || character == '\u{00A0}'
-                    })
+    pub(crate) fn inline_items_establish_line_box(
+        &self,
+        container_box_idx: usize,
+        runs: &std::ops::Range<u32>,
+    ) -> bool {
+        self.inline_content.inline_items()[runs.start as usize..runs.end as usize]
+            .iter()
+            .any(|run| {
+                let ownership_box = match run.kind {
+                    InlineItemKind::AtomicBox { box_idx } => self.get_parent(box_idx as usize),
+                    _ => Some(run.box_idx as usize),
+                };
+                if !ownership_box.is_some_and(|box_idx| {
+                    self.run_belongs_to_inline_context(box_idx, container_box_idx)
+                }) {
+                    return false;
                 }
-                InlineItemKind::Image { .. } | InlineItemKind::Break { .. } | InlineItemKind::InlineBoundary { .. } | InlineItemKind::AtomicBox { .. } | InlineItemKind::Marker { .. } => true,
-            }
-        })
+                match &run.kind {
+                    InlineItemKind::FloatAnchor { .. } | InlineItemKind::AbsoluteAnchor { .. } => {
+                        false
+                    }
+                    InlineItemKind::Text { glyphs } => {
+                        let preserves_space = self
+                            .style(run.box_idx as usize)
+                            .white_space()
+                            .preserves_spaces();
+                        glyphs.clone().any(|glyph_idx| {
+                            let character = self
+                                .inline_content
+                                .glyph_at(glyph_idx as usize)
+                                .map(|glyph| self.glyph_metrics.get(glyph).ch())
+                                .unwrap_or_default();
+                            preserves_space || !character.is_whitespace() || character == '\u{00A0}'
+                        })
+                    }
+                    InlineItemKind::Image { .. }
+                    | InlineItemKind::Break { .. }
+                    | InlineItemKind::InlineBoundary { .. }
+                    | InlineItemKind::AtomicBox { .. }
+                    | InlineItemKind::Marker { .. } => true,
+                }
+            })
     }
 
     /// Float sides represented only by anchors in this block's inline-run
     /// stream. Anchor-only streams do not establish a line box, but their
     /// float sources still participate in adjoining-margin/clearance rules.
-    pub(crate) fn inline_item_float_sides(&self, container_box_idx: usize, runs: &std::ops::Range<u32>) -> (bool, bool) {
+    pub(crate) fn inline_item_float_sides(
+        &self,
+        container_box_idx: usize,
+        runs: &std::ops::Range<u32>,
+    ) -> (bool, bool) {
         let mut left = false;
         let mut right = false;
         for run in &self.inline_content.inline_items()[runs.start as usize..runs.end as usize] {
-            let InlineItemKind::FloatAnchor { box_idx } = run.kind else { continue };
+            let InlineItemKind::FloatAnchor { box_idx } = run.kind else {
+                continue;
+            };
             if !self.run_belongs_to_inline_context(run.box_idx as usize, container_box_idx) {
                 continue;
             }
@@ -236,7 +337,17 @@ impl<'input> LayoutReader<'input> {
             if box_idx == container_box_idx {
                 return true;
             }
-            if matches!(self.box_layout_mode(box_idx), Some(LayoutMode::Block(_) | LayoutMode::Table(_) | LayoutMode::TableRow(_) | LayoutMode::TableCell(_) | LayoutMode::Flex(_) | LayoutMode::Grid(_))) {
+            if matches!(
+                self.box_layout_mode(box_idx),
+                Some(
+                    LayoutMode::Block(_)
+                        | LayoutMode::Table(_)
+                        | LayoutMode::TableRow(_)
+                        | LayoutMode::TableCell(_)
+                        | LayoutMode::Flex(_)
+                        | LayoutMode::Grid(_)
+                )
+            ) {
                 return false;
             }
             current = self.get_parent(box_idx);
@@ -260,15 +371,25 @@ impl<'input> LayoutReader<'input> {
     /// viewport when both root axes are `visible`. The body's used overflow
     /// then becomes `visible`, so it must not create a block formatting
     /// context or clip its own descendants.
-    pub(crate) fn effective_overflow_modes(&self, box_idx: usize) -> (html_style_model::OverflowMode, html_style_model::OverflowMode) {
+    pub(crate) fn effective_overflow_modes(
+        &self,
+        box_idx: usize,
+    ) -> (
+        html_style_model::OverflowMode,
+        html_style_model::OverflowMode,
+    ) {
         let style = self.style(box_idx);
         if self.body_box() == Some(box_idx)
             && self.root_box().is_some_and(|root_idx| {
                 let root = self.style(root_idx);
-                root.overflow_x() == html_style_model::OverflowMode::Visible && root.overflow_y() == html_style_model::OverflowMode::Visible
+                root.overflow_x() == html_style_model::OverflowMode::Visible
+                    && root.overflow_y() == html_style_model::OverflowMode::Visible
             })
         {
-            (html_style_model::OverflowMode::Visible, html_style_model::OverflowMode::Visible)
+            (
+                html_style_model::OverflowMode::Visible,
+                html_style_model::OverflowMode::Visible,
+            )
         } else {
             (style.overflow_x(), style.overflow_y())
         }
@@ -279,18 +400,26 @@ impl<'input> LayoutReader<'input> {
     /// canvas; for HTML documents whose root has no background, the body
     /// background is propagated instead.
     pub(crate) fn background_paints_on_canvas(&self, box_idx: usize) -> bool {
-        let Some(root_box) = self.root_box() else { return false };
+        let Some(root_box) = self.root_box() else {
+            return false;
+        };
         let root = self.style(root_box);
         if root.background_image_present() || root.background_color() & 0xFF != 0 {
             return box_idx == root_box;
         }
-        let Some(body_box) = self.body_box() else { return false };
+        let Some(body_box) = self.body_box() else {
+            return false;
+        };
         let body = self.style(body_box);
-        (body.background_image_present() || body.background_color() & 0xFF != 0) && box_idx == body_box
+        (body.background_image_present() || body.background_color() & 0xFF != 0)
+            && box_idx == body_box
     }
 
     pub(crate) fn is_table_cell_box(&self, box_idx: usize) -> bool {
-        matches!(self.box_layout_mode(box_idx), Some(LayoutMode::TableCell(_)))
+        matches!(
+            self.box_layout_mode(box_idx),
+            Some(LayoutMode::TableCell(_))
+        )
     }
 
     pub(crate) fn is_block_box(&self, box_idx: usize) -> bool {
@@ -298,11 +427,17 @@ impl<'input> LayoutReader<'input> {
     }
 
     pub(crate) fn is_flex_grid_box(&self, box_idx: usize) -> bool {
-        matches!(self.box_layout_mode(box_idx), Some(LayoutMode::Flex(_) | LayoutMode::Grid(_)))
+        matches!(
+            self.box_layout_mode(box_idx),
+            Some(LayoutMode::Flex(_) | LayoutMode::Grid(_))
+        )
     }
 
     pub(crate) fn is_anonymous_box(&self, box_idx: usize) -> bool {
-        matches!(self.box_layout_mode(box_idx), Some(LayoutMode::Anonymous(_)))
+        matches!(
+            self.box_layout_mode(box_idx),
+            Some(LayoutMode::Anonymous(_))
+        )
     }
 
     pub(crate) fn is_table_box(&self, box_idx: usize) -> bool {
@@ -314,7 +449,9 @@ impl<'input> LayoutReader<'input> {
     }
 
     pub(crate) fn is_only_block_child(&self, box_idx: usize) -> bool {
-        let Some(parent) = self.get_parent(box_idx) else { return false };
+        let Some(parent) = self.get_parent(box_idx) else {
+            return false;
+        };
         matches!(
             self.box_layout_mode(parent),
             Some(LayoutMode::Block(block)) if matches!(&block.children, Children::Blocks(children) if children.as_slice() == [box_idx as u32])
@@ -328,7 +465,9 @@ impl<'input> LayoutReader<'input> {
     pub(crate) fn box_uses_float_context(&self, box_idx: usize) -> bool {
         let style = self.style(box_idx);
         let (overflow_x, overflow_y) = self.effective_overflow_modes(box_idx);
-        let is_flex_grid_item = self.get_parent(box_idx).is_some_and(|parent| self.is_flex_grid_box(parent));
+        let is_flex_grid_item = self
+            .get_parent(box_idx)
+            .is_some_and(|parent| self.is_flex_grid_box(parent));
         self.is_table_box(box_idx)
             || super::block::establishes_formatting_context(
                 style.display(),
@@ -343,7 +482,14 @@ impl<'input> LayoutReader<'input> {
     }
 
     pub(crate) fn box_uses_ahem(&self, box_idx: usize) -> bool {
-        let indices = self.topology.get_box_style_indices(box_idx).unwrap_or_else(|| self.styles.default_indices());
-        self.styles.view(indices).and_then(|style| style.font_family()).and_then(|family| self.styles.string(family)).is_some_and(|family| family.eq_ignore_ascii_case("Ahem"))
+        let indices = self
+            .topology
+            .get_box_style_indices(box_idx)
+            .unwrap_or_else(|| self.styles.default_indices());
+        self.styles
+            .view(indices)
+            .and_then(|style| style.font_family())
+            .and_then(|family| self.styles.string(family))
+            .is_some_and(|family| family.eq_ignore_ascii_case("Ahem"))
     }
 }

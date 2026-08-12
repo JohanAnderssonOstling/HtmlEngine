@@ -1,6 +1,6 @@
 //! Owned stylesheet programs reusable across document loads.
 
-use super::prepared::{ParsedStylesheetSet, PreparedRuleSet};
+use super::prepared::{ParsedStylesheetSet, PreparedRuleSet, PreparedStylesheetFragment};
 use crate::style::matching::selectors::SelectorIndex;
 use crate::{
     AuthorStylesheetInput, DEFAULT_CSS, MediaEnvironment, MediaQuerySet, MediaType, StyleTimings,
@@ -50,7 +50,7 @@ struct CachedStyleProgram {
 
 struct CachedParsedStylesheet {
     css: String,
-    stylesheet: Option<Arc<StyleSheet<'static>>>,
+    stylesheet: Option<Arc<PreparedStylesheetFragment<'static>>>,
 }
 
 struct CachedInlineStyle {
@@ -154,7 +154,7 @@ impl StyleProgramCache {
         }
     }
 
-    fn get_or_parse(&mut self, css: &str, index: usize) -> Option<Arc<StyleSheet<'static>>> {
+    fn get_or_parse(&mut self, css: &str, index: usize) -> Option<Arc<PreparedStylesheetFragment<'static>>> {
         if let Some(position) = self.parsed_entries.iter().position(|entry| entry.css == css) {
             self.parsed_hits += 1;
             if position + 1 != self.parsed_entries.len() {
@@ -169,7 +169,7 @@ impl StyleProgramCache {
             None
         } else {
             StyleSheet::parse(&normalized, ParserOptions { error_recovery: true, ..ParserOptions::default() })
-                .map(|stylesheet| Arc::new(stylesheet.into_owned()))
+                .map(|stylesheet| Arc::new(PreparedStylesheetFragment::compile(stylesheet.into_owned())))
                 .map_err(|error| eprintln!("Skipping CSS chunk {index}: {error}"))
                 .ok()
         };
@@ -290,14 +290,14 @@ impl StyleProgram {
         Self::finish_compile(prepared, css_chunks.len(), environment, initial_font_size, timings, Arc::new(Mutex::new(ParsedInlineStyleCache::default())))
     }
 
-    fn compile_parsed_with_timings(input_count: usize, stylesheets: &[(Arc<StyleSheet<'static>>, usize)], environment: MediaEnvironment, initial_font_size: f32, inline_styles: Arc<Mutex<ParsedInlineStyleCache>>) -> (Self, StyleTimings) {
+    fn compile_parsed_with_timings(input_count: usize, stylesheets: &[(Arc<PreparedStylesheetFragment<'static>>, usize)], environment: MediaEnvironment, initial_font_size: f32, inline_styles: Arc<Mutex<ParsedInlineStyleCache>>) -> (Self, StyleTimings) {
         let mut timings = StyleTimings::default();
         let started = Instant::now();
         let user_agent = StyleSheet::parse(DEFAULT_CSS, ParserOptions::default()).expect("default CSS must parse").into_owned();
         timings.parse_default_css = started.elapsed();
         let author_refs = stylesheets.iter().map(|(stylesheet, _)| stylesheet.as_ref()).collect::<Vec<_>>();
         let author_root_indices = stylesheets.iter().map(|(_, index)| u32::try_from(*index).expect("author stylesheet count fits in u32")).collect::<Vec<_>>();
-        let prepared = ParsedStylesheetSet::with_author_root_indices(&user_agent, &author_refs, &author_root_indices);
+        let prepared = ParsedStylesheetSet::with_fragments(&user_agent, &author_refs, &author_root_indices);
         Self::finish_compile(prepared, input_count, environment, initial_font_size, timings, inline_styles)
     }
 

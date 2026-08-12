@@ -42,10 +42,26 @@ pub(crate) struct InlineContent {
 impl InlineContent {
     pub(crate) fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
-        report.add_slice_storage::<GlyphId>("InlineContent.glyphs.storage", self.glyphs.capacity(), self.glyphs.len());
-        report.add_slice_storage::<u32>("InlineContent.glyph_source_offsets.storage", self.glyph_source_offsets.capacity(), self.glyph_source_offsets.len());
-        report.add_slice_storage::<WhitespaceWrapOverride>("InlineContent.whitespace_wrap_before.storage", self.whitespace_wrap_before.capacity(), self.whitespace_wrap_before.len());
-        report.add_slice_storage::<InlineItem>("InlineContent.inline_items.storage", self.inline_items.capacity(), self.inline_items.len());
+        report.add_slice_storage::<GlyphId>(
+            "InlineContent.glyphs.storage",
+            self.glyphs.capacity(),
+            self.glyphs.len(),
+        );
+        report.add_slice_storage::<u32>(
+            "InlineContent.glyph_source_offsets.storage",
+            self.glyph_source_offsets.capacity(),
+            self.glyph_source_offsets.len(),
+        );
+        report.add_slice_storage::<WhitespaceWrapOverride>(
+            "InlineContent.whitespace_wrap_before.storage",
+            self.whitespace_wrap_before.capacity(),
+            self.whitespace_wrap_before.len(),
+        );
+        report.add_slice_storage::<InlineItem>(
+            "InlineContent.inline_items.storage",
+            self.inline_items.capacity(),
+            self.inline_items.len(),
+        );
         report
     }
 }
@@ -64,18 +80,32 @@ impl InlineContent {
     }
 
     pub(crate) fn glyph_source_offset(&self, glyph_idx: usize) -> Option<u32> {
-        self.glyph_source_offsets.get(glyph_idx).copied().filter(|offset| *offset != u32::MAX)
+        self.glyph_source_offsets
+            .get(glyph_idx)
+            .copied()
+            .filter(|offset| *offset != u32::MAX)
     }
 
     pub(crate) fn raw_glyph_source_offset(&self, glyph_idx: usize) -> u32 {
-        self.glyph_source_offsets.get(glyph_idx).copied().unwrap_or(u32::MAX)
+        self.glyph_source_offsets
+            .get(glyph_idx)
+            .copied()
+            .unwrap_or(u32::MAX)
     }
 
     pub(crate) fn whitespace_wrap_before(&self, glyph_idx: usize) -> WhitespaceWrapOverride {
-        self.whitespace_wrap_before.get(glyph_idx).copied().unwrap_or_default()
+        self.whitespace_wrap_before
+            .get(glyph_idx)
+            .copied()
+            .unwrap_or_default()
     }
 
-    pub(crate) fn replace_glyphs(&mut self, glyphs: Vec<GlyphId>, source_offsets: Vec<u32>, whitespace_wrap_before: Vec<WhitespaceWrapOverride>) {
+    pub(crate) fn replace_glyphs(
+        &mut self,
+        glyphs: Vec<GlyphId>,
+        source_offsets: Vec<u32>,
+        whitespace_wrap_before: Vec<WhitespaceWrapOverride>,
+    ) {
         debug_assert_eq!(glyphs.len(), source_offsets.len());
         debug_assert_eq!(glyphs.len(), whitespace_wrap_before.len());
         self.glyphs = glyphs;
@@ -106,13 +136,15 @@ impl InlineContent {
     pub(crate) fn push_glyph(&mut self, glyph: GlyphId) {
         self.glyphs.push(glyph);
         self.glyph_source_offsets.push(u32::MAX);
-        self.whitespace_wrap_before.push(WhitespaceWrapOverride::Style);
+        self.whitespace_wrap_before
+            .push(WhitespaceWrapOverride::Style);
     }
 
     pub(crate) fn push_source_glyph(&mut self, glyph: GlyphId, source_offset: u32) {
         self.glyphs.push(glyph);
         self.glyph_source_offsets.push(source_offset);
-        self.whitespace_wrap_before.push(WhitespaceWrapOverride::Style);
+        self.whitespace_wrap_before
+            .push(WhitespaceWrapOverride::Style);
     }
 }
 

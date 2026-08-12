@@ -36,16 +36,40 @@ pub(crate) struct LayoutTree {
 impl LayoutTree {
     pub(crate) fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
-        report.add_slice_storage::<LayoutBox>("LayoutTree.boxes.storage", self.boxes.capacity(), self.boxes.len());
+        report.add_slice_storage::<LayoutBox>(
+            "LayoutTree.boxes.storage",
+            self.boxes.capacity(),
+            self.boxes.len(),
+        );
         for layout_box in &self.boxes {
             report.extend_prefixed("LayoutTree.boxes", layout_box.memory_usage_report());
         }
-        report.add_slice_storage::<(u32, ListItemMarker)>("LayoutTree.list_markers.storage", self.list_markers.capacity(), self.list_markers.len());
-        report.add_slice_storage::<(u32, u32)>("LayoutTree.image_indices.storage", self.image_indices.capacity(), self.image_indices.len());
-        report.add_slice_storage::<(u32, (bool, bool))>("LayoutTree.inline_fragment_edges.storage", self.inline_fragment_edges.capacity(), self.inline_fragment_edges.len());
-        report.add_slice_storage::<(u32, Box<[StyleIndices]>)>("LayoutTree.split_inline_position_ancestors.storage", self.split_inline_position_ancestors.capacity(), self.split_inline_position_ancestors.len());
+        report.add_slice_storage::<(u32, ListItemMarker)>(
+            "LayoutTree.list_markers.storage",
+            self.list_markers.capacity(),
+            self.list_markers.len(),
+        );
+        report.add_slice_storage::<(u32, u32)>(
+            "LayoutTree.image_indices.storage",
+            self.image_indices.capacity(),
+            self.image_indices.len(),
+        );
+        report.add_slice_storage::<(u32, (bool, bool))>(
+            "LayoutTree.inline_fragment_edges.storage",
+            self.inline_fragment_edges.capacity(),
+            self.inline_fragment_edges.len(),
+        );
+        report.add_slice_storage::<(u32, Box<[StyleIndices]>)>(
+            "LayoutTree.split_inline_position_ancestors.storage",
+            self.split_inline_position_ancestors.capacity(),
+            self.split_inline_position_ancestors.len(),
+        );
         for ancestors in self.split_inline_position_ancestors.values() {
-            report.add_slice_storage::<StyleIndices>("LayoutTree.split_inline_position_ancestors.entries", ancestors.len(), ancestors.len());
+            report.add_slice_storage::<StyleIndices>(
+                "LayoutTree.split_inline_position_ancestors.entries",
+                ancestors.len(),
+                ancestors.len(),
+            );
         }
         report
     }
@@ -97,7 +121,9 @@ impl LayoutTree {
     }
 
     pub(crate) fn get_box_layout_mode(&self, box_idx: usize) -> Option<&LayoutMode> {
-        self.boxes.get(box_idx).map(|layout_box| layout_box.layout_mode())
+        self.boxes
+            .get(box_idx)
+            .map(|layout_box| layout_box.layout_mode())
     }
 
     pub(crate) fn push_box(&mut self, layout_box: LayoutBox) -> u32 {
@@ -118,22 +144,39 @@ impl LayoutTree {
         self.list_markers.get(&(list_item_box as u32)).copied()
     }
 
-    pub(crate) fn set_inline_fragment_edges(&mut self, box_idx: u32, inline_start: bool, inline_end: bool) {
-        self.inline_fragment_edges.insert(box_idx, (inline_start, inline_end));
+    pub(crate) fn set_inline_fragment_edges(
+        &mut self,
+        box_idx: u32,
+        inline_start: bool,
+        inline_end: bool,
+    ) {
+        self.inline_fragment_edges
+            .insert(box_idx, (inline_start, inline_end));
     }
 
     pub(crate) fn inline_fragment_edges(&self, box_idx: usize) -> (bool, bool) {
-        self.inline_fragment_edges.get(&(box_idx as u32)).copied().unwrap_or((true, true))
+        self.inline_fragment_edges
+            .get(&(box_idx as u32))
+            .copied()
+            .unwrap_or((true, true))
     }
 
-    pub(crate) fn set_split_inline_position_ancestors(&mut self, box_idx: u32, ancestors: Vec<StyleIndices>) {
+    pub(crate) fn set_split_inline_position_ancestors(
+        &mut self,
+        box_idx: u32,
+        ancestors: Vec<StyleIndices>,
+    ) {
         if !ancestors.is_empty() {
-            self.split_inline_position_ancestors.insert(box_idx, ancestors.into_boxed_slice());
+            self.split_inline_position_ancestors
+                .insert(box_idx, ancestors.into_boxed_slice());
         }
     }
 
     pub(crate) fn split_inline_position_ancestors(&self, box_idx: usize) -> &[StyleIndices] {
-        self.split_inline_position_ancestors.get(&(box_idx as u32)).map(Box::as_ref).unwrap_or_default()
+        self.split_inline_position_ancestors
+            .get(&(box_idx as u32))
+            .map(Box::as_ref)
+            .unwrap_or_default()
     }
 }
 
@@ -155,7 +198,10 @@ pub(crate) struct LayoutBox {
 impl LayoutBox {
     pub(crate) fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
-        report.extend_prefixed("LayoutBox.layout_mode", self.layout_mode.memory_usage_report());
+        report.extend_prefixed(
+            "LayoutBox.layout_mode",
+            self.layout_mode.memory_usage_report(),
+        );
         report
     }
 }
@@ -175,7 +221,9 @@ impl LayoutBox {
 
     /// Get element data from DOM tree
     pub(crate) fn get_element<'a>(&self, doc: &'a Document) -> Option<ElementRef<'a>> {
-        self.dom_element.and_then(|idx| doc.node_id_from_raw(idx)).and_then(|node_id| doc.element_ref(node_id))
+        self.dom_element
+            .and_then(|idx| doc.node_id_from_raw(idx))
+            .and_then(|node_id| doc.element_ref(node_id))
     }
 
     pub(crate) fn layout_mode(&self) -> &LayoutMode {
@@ -201,7 +249,6 @@ impl LayoutBox {
     pub(crate) fn parent(&self) -> Option<u32> {
         self.parent
     }
-
 }
 
 #[derive(Clone)]
@@ -223,12 +270,24 @@ impl LayoutMode {
     pub(crate) fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
         match self {
-            LayoutMode::Block(block) => report.extend_prefixed("LayoutMode::Block", block.memory_usage_report()),
-            LayoutMode::Table(table) => report.extend_prefixed("LayoutMode::Table", table.memory_usage_report()),
-            LayoutMode::TableRow(row) => report.extend_prefixed("LayoutMode::TableRow", row.memory_usage_report()),
-            LayoutMode::TableCell(cell) => report.extend_prefixed("LayoutMode::TableCell", cell.memory_usage_report()),
-            LayoutMode::Flex(container) => report.extend_prefixed("LayoutMode::Flex", container.memory_usage_report()),
-            LayoutMode::Grid(container) => report.extend_prefixed("LayoutMode::Grid", container.memory_usage_report()),
+            LayoutMode::Block(block) => {
+                report.extend_prefixed("LayoutMode::Block", block.memory_usage_report())
+            }
+            LayoutMode::Table(table) => {
+                report.extend_prefixed("LayoutMode::Table", table.memory_usage_report())
+            }
+            LayoutMode::TableRow(row) => {
+                report.extend_prefixed("LayoutMode::TableRow", row.memory_usage_report())
+            }
+            LayoutMode::TableCell(cell) => {
+                report.extend_prefixed("LayoutMode::TableCell", cell.memory_usage_report())
+            }
+            LayoutMode::Flex(container) => {
+                report.extend_prefixed("LayoutMode::Flex", container.memory_usage_report())
+            }
+            LayoutMode::Grid(container) => {
+                report.extend_prefixed("LayoutMode::Grid", container.memory_usage_report())
+            }
             LayoutMode::Inline(_) => {}
             LayoutMode::Anonymous(_) => {}
         }
@@ -244,7 +303,11 @@ pub(crate) struct FlexBox {
 impl FlexBox {
     pub(crate) fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
-        report.add_slice_storage::<u32>("FlexBox.children.storage", self.children.capacity(), self.children.len());
+        report.add_slice_storage::<u32>(
+            "FlexBox.children.storage",
+            self.children.capacity(),
+            self.children.len(),
+        );
         report
     }
 }
@@ -257,7 +320,11 @@ pub(crate) struct GridBox {
 impl GridBox {
     pub(crate) fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
-        report.add_slice_storage::<u32>("GridBox.children.storage", self.children.capacity(), self.children.len());
+        report.add_slice_storage::<u32>(
+            "GridBox.children.storage",
+            self.children.capacity(),
+            self.children.len(),
+        );
         report
     }
 }
@@ -310,13 +377,41 @@ pub(crate) struct TableColumnWidthHint {
 impl TableBox {
     pub(crate) fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
-        report.add_slice_storage::<u32>("TableBox.rows.storage", self.rows.capacity(), self.rows.len());
-        report.add_slice_storage::<u32>("TableBox.row_groups.storage", self.row_groups.capacity(), self.row_groups.len());
-        report.add_slice_storage::<u32>("TableBox.captions_top.storage", self.captions_top.capacity(), self.captions_top.len());
-        report.add_slice_storage::<u32>("TableBox.captions_bottom.storage", self.captions_bottom.capacity(), self.captions_bottom.len());
-        report.add_slice_storage::<TableColumnTrack>("TableBox.columns.storage", self.columns.capacity(), self.columns.len());
-        report.add_slice_storage::<TableColumnGroupSpan>("TableBox.column_groups.storage", self.column_groups.capacity(), self.column_groups.len());
-        report.add_slice_storage::<TableColumnWidthHint>("TableBox.column_width_hints.storage", self.column_width_hints.capacity(), self.column_width_hints.len());
+        report.add_slice_storage::<u32>(
+            "TableBox.rows.storage",
+            self.rows.capacity(),
+            self.rows.len(),
+        );
+        report.add_slice_storage::<u32>(
+            "TableBox.row_groups.storage",
+            self.row_groups.capacity(),
+            self.row_groups.len(),
+        );
+        report.add_slice_storage::<u32>(
+            "TableBox.captions_top.storage",
+            self.captions_top.capacity(),
+            self.captions_top.len(),
+        );
+        report.add_slice_storage::<u32>(
+            "TableBox.captions_bottom.storage",
+            self.captions_bottom.capacity(),
+            self.captions_bottom.len(),
+        );
+        report.add_slice_storage::<TableColumnTrack>(
+            "TableBox.columns.storage",
+            self.columns.capacity(),
+            self.columns.len(),
+        );
+        report.add_slice_storage::<TableColumnGroupSpan>(
+            "TableBox.column_groups.storage",
+            self.column_groups.capacity(),
+            self.column_groups.len(),
+        );
+        report.add_slice_storage::<TableColumnWidthHint>(
+            "TableBox.column_width_hints.storage",
+            self.column_width_hints.capacity(),
+            self.column_width_hints.len(),
+        );
         report
     }
 }
@@ -332,8 +427,16 @@ pub(crate) struct TableRowBox {
 impl TableRowBox {
     pub(crate) fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
-        report.add_slice_storage::<u32>("TableRowBox.cells.storage", self.cells.capacity(), self.cells.len());
-        report.add_slice_storage::<u32>("TableRowBox.out_of_flow.storage", self.out_of_flow.capacity(), self.out_of_flow.len());
+        report.add_slice_storage::<u32>(
+            "TableRowBox.cells.storage",
+            self.cells.capacity(),
+            self.cells.len(),
+        );
+        report.add_slice_storage::<u32>(
+            "TableRowBox.out_of_flow.storage",
+            self.out_of_flow.capacity(),
+            self.out_of_flow.len(),
+        );
         report
     }
 }
@@ -347,7 +450,11 @@ pub(crate) struct TableCellBox {
 
 impl TableCellBox {
     pub(crate) fn new(children: Children) -> Self {
-        Self { children, colspan: 1, rowspan: 1 }
+        Self {
+            children,
+            colspan: 1,
+            rowspan: 1,
+        }
     }
 
     pub(crate) fn memory_usage_report(&self) -> MemoryUsageReport {
@@ -366,7 +473,11 @@ impl Children {
     pub(crate) fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
         if let Children::Blocks(children) = self {
-            report.add_slice_storage::<u32>("Children::Blocks.storage", children.capacity(), children.len());
+            report.add_slice_storage::<u32>(
+                "Children::Blocks.storage",
+                children.capacity(),
+                children.len(),
+            );
         }
         report
     }

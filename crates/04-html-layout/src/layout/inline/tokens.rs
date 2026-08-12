@@ -30,14 +30,23 @@ pub(super) fn compute_baseline(max_ascent: f64, max_descent: f64, min_height: f6
     let content_height = max_ascent + max_descent;
     let line_height = content_height.max(min_height);
     let has_extents = max_ascent != 0.0 || max_descent != 0.0;
-    let baseline = if has_extents { max_ascent + (line_height - content_height).max(0.0) / 2.0 } else { line_height * 0.8 };
+    let baseline = if has_extents {
+        max_ascent + (line_height - content_height).max(0.0) / 2.0
+    } else {
+        line_height * 0.8
+    };
     (line_height, baseline)
 }
 
 /// Converts a computed vertical-alignment value into the upward offset used by
 /// the fragment writer.
 #[cfg(test)]
-pub(super) fn vertical_align_offset(token: &InlineToken, runs: &[InlineTokenMetrics], line_height: f64, baseline: f64) -> f64 {
+pub(super) fn vertical_align_offset(
+    token: &InlineToken,
+    runs: &[InlineTokenMetrics],
+    line_height: f64,
+    baseline: f64,
+) -> f64 {
     let metrics = token.run_metrics(runs);
     let ascent = metrics.ascent as f64;
     let descent = metrics.descent as f64;
@@ -47,14 +56,38 @@ pub(super) fn vertical_align_offset(token: &InlineToken, runs: &[InlineTokenMetr
     // tall box produce negative half-leading and inflate `vertical-align: top`
     // or `bottom` line boxes.
     let half_leading = match token.kind() {
-        InlineTokenKind::Glyph { .. } | InlineTokenKind::Ellipsis { .. } | InlineTokenKind::Discretionary { .. } => (token.line_height(runs) - (ascent + descent)) / 2.0,
+        InlineTokenKind::Glyph { .. }
+        | InlineTokenKind::Ellipsis { .. }
+        | InlineTokenKind::Discretionary { .. } => {
+            (token.line_height(runs) - (ascent + descent)) / 2.0
+        }
         _ => 0.0,
     };
-    vertical_align_metrics_offset(metrics.vertical_align, ascent, descent, token.line_height(runs), metrics.font_size as f64, half_leading, line_height, baseline, ascent, descent)
+    vertical_align_metrics_offset(
+        metrics.vertical_align,
+        ascent,
+        descent,
+        token.line_height(runs),
+        metrics.font_size as f64,
+        half_leading,
+        line_height,
+        baseline,
+        ascent,
+        descent,
+    )
 }
 
 pub(super) fn vertical_align_metrics_offset(
-    value: VerticalAlignValue, ascent: f64, descent: f64, own_line_height: f64, font_size: f64, half_leading: f64, line_height: f64, baseline: f64, parent_font_ascent: f64, parent_font_descent: f64,
+    value: VerticalAlignValue,
+    ascent: f64,
+    descent: f64,
+    own_line_height: f64,
+    font_size: f64,
+    half_leading: f64,
+    line_height: f64,
+    baseline: f64,
+    parent_font_ascent: f64,
+    parent_font_descent: f64,
 ) -> f64 {
     let middle = baseline - ascent + (ascent + descent - line_height) / 2.0;
     match value {
@@ -65,7 +98,11 @@ pub(super) fn vertical_align_metrics_offset(
         // CSS resolves a percentage baseline shift against this element's own
         // line-height, not the final height of the containing line box.
         VerticalAlignValue::Percent(pct) => own_line_height * pct as f64,
-        VerticalAlignValue::Calc { absolute_px, line_height_fraction, .. } => absolute_px as f64 + own_line_height * line_height_fraction as f64,
+        VerticalAlignValue::Calc {
+            absolute_px,
+            line_height_fraction,
+            ..
+        } => absolute_px as f64 + own_line_height * line_height_fraction as f64,
         VerticalAlignValue::Top => baseline - ascent - half_leading,
         VerticalAlignValue::Bottom => baseline + descent + half_leading - line_height,
         // Unlike `top` and `bottom`, these values use the content area of the
@@ -80,7 +117,11 @@ pub(super) fn vertical_align_metrics_offset(
 ///
 /// This keeps the first-line and hanging-indent policy out of the main line
 /// breaking loop.
-pub(in crate::layout) fn indent_for_line(text_indent: f64, hanging: bool, is_first_line: bool) -> f64 {
+pub(in crate::layout) fn indent_for_line(
+    text_indent: f64,
+    hanging: bool,
+    is_first_line: bool,
+) -> f64 {
     if hanging && is_first_line {
         0.0
     } else if hanging || is_first_line {
@@ -104,7 +145,14 @@ pub(super) fn effective_vertical_align(doc: &LayoutEngine, box_idx: usize) -> Ve
 /// cell's text inside the line box.  A real inline owner, on the other hand,
 /// contributes its authored alignment to the complete inline subtree.
 fn text_vertical_align(doc: &LayoutEngine, box_idx: usize) -> VerticalAlignValue {
-    if matches!(doc.reader.box_layout_mode(box_idx), Some(LayoutMode::Inline(_))) { effective_vertical_align(doc, box_idx) } else { VerticalAlignValue::Baseline }
+    if matches!(
+        doc.reader.box_layout_mode(box_idx),
+        Some(LayoutMode::Inline(_))
+    ) {
+        effective_vertical_align(doc, box_idx)
+    } else {
+        VerticalAlignValue::Baseline
+    }
 }
 
 pub(super) fn has_aligned_inline_ancestor(doc: &LayoutEngine, box_idx: usize) -> bool {
@@ -117,7 +165,9 @@ pub(super) fn has_aligned_inline_ancestor(doc: &LayoutEngine, box_idx: usize) ->
         if ancestor_style.display() != html_style_model::Display::Inline {
             break;
         }
-        if !ancestor_style.vertical_align().is_initial() || ancestor_style.position() == html_style_model::PositionMode::Relative {
+        if !ancestor_style.vertical_align().is_initial()
+            || ancestor_style.position() == html_style_model::PositionMode::Relative
+        {
             return true;
         }
         current = doc.reader.get_parent(ancestor_idx);
@@ -164,7 +214,13 @@ impl InlineToken {
     const SPACE_GLUE_SHIFT: u32 = 9;
     const SPACE_GLUE_MASK: u32 = 0b111 << Self::SPACE_GLUE_SHIFT;
 
-    pub(super) fn new(kind: InlineTokenKind, width: f64, break_kind: BreakKind, wrap: TokenWrap, cluster_boundary_before: bool) -> Self {
+    pub(super) fn new(
+        kind: InlineTokenKind,
+        width: f64,
+        break_kind: BreakKind,
+        wrap: TokenWrap,
+        cluster_boundary_before: bool,
+    ) -> Self {
         let (kind_tag, data) = match kind {
             InlineTokenKind::Glyph { glyph_idx } => (0, glyph_idx),
             InlineTokenKind::Ellipsis { glyph } => (1, glyph),
@@ -177,17 +233,35 @@ impl InlineToken {
             InlineTokenKind::Opportunity => (8, 0),
             InlineTokenKind::AbsoluteAnchor { box_idx } => (9, box_idx),
         };
-        let metadata = kind_tag | ((break_kind as u32) << Self::BREAK_SHIFT) | ((wrap as u32) << Self::WRAP_SHIFT) | if cluster_boundary_before { Self::CLUSTER_BOUNDARY_BIT } else { 0 };
-        Self { data, metadata, run_idx: u32::MAX, width: width as f32 }
+        let metadata = kind_tag
+            | ((break_kind as u32) << Self::BREAK_SHIFT)
+            | ((wrap as u32) << Self::WRAP_SHIFT)
+            | if cluster_boundary_before {
+                Self::CLUSTER_BOUNDARY_BIT
+            } else {
+                0
+            };
+        Self {
+            data,
+            metadata,
+            run_idx: u32::MAX,
+            width: width as f32,
+        }
     }
 
     #[inline]
     pub(super) fn kind(&self) -> InlineTokenKind {
         match self.metadata & Self::KIND_MASK {
-            0 => InlineTokenKind::Glyph { glyph_idx: self.data },
+            0 => InlineTokenKind::Glyph {
+                glyph_idx: self.data,
+            },
             1 => InlineTokenKind::Ellipsis { glyph: self.data },
-            2 => InlineTokenKind::Image { payload_idx: self.data },
-            3 => InlineTokenKind::AtomicBox { payload_idx: self.data },
+            2 => InlineTokenKind::Image {
+                payload_idx: self.data,
+            },
+            3 => InlineTokenKind::AtomicBox {
+                payload_idx: self.data,
+            },
             4 => InlineTokenKind::Break {
                 clear: match self.data {
                     0 => html_style_model::Clear::None,
@@ -198,7 +272,9 @@ impl InlineToken {
                 },
             },
             5 => InlineTokenKind::FloatAnchor { box_idx: self.data },
-            6 => InlineTokenKind::InlineBoundary { payload_idx: self.data },
+            6 => InlineTokenKind::InlineBoundary {
+                payload_idx: self.data,
+            },
             7 => InlineTokenKind::Discretionary { glyph: self.data },
             8 => InlineTokenKind::Opportunity,
             9 => InlineTokenKind::AbsoluteAnchor { box_idx: self.data },
@@ -218,7 +294,8 @@ impl InlineToken {
     }
 
     fn set_break_kind(&mut self, break_kind: BreakKind) {
-        self.metadata = (self.metadata & !(0b11 << Self::BREAK_SHIFT)) | ((break_kind as u32) << Self::BREAK_SHIFT);
+        self.metadata = (self.metadata & !(0b11 << Self::BREAK_SHIFT))
+            | ((break_kind as u32) << Self::BREAK_SHIFT);
     }
 
     #[inline]
@@ -238,20 +315,31 @@ impl InlineToken {
 
     #[inline]
     pub(super) fn space_glue_class(&self) -> SpaceGlueClass {
-        SpaceGlueClass::from_packed((self.metadata & Self::SPACE_GLUE_MASK) >> Self::SPACE_GLUE_SHIFT)
+        SpaceGlueClass::from_packed(
+            (self.metadata & Self::SPACE_GLUE_MASK) >> Self::SPACE_GLUE_SHIFT,
+        )
     }
 
     pub(super) fn set_space_glue_class(&mut self, class: SpaceGlueClass) {
-        self.metadata = (self.metadata & !Self::SPACE_GLUE_MASK) | ((class as u32) << Self::SPACE_GLUE_SHIFT);
+        self.metadata =
+            (self.metadata & !Self::SPACE_GLUE_MASK) | ((class as u32) << Self::SPACE_GLUE_SHIFT);
     }
 
     #[inline]
     pub(super) fn width(&self) -> f64 {
-        if matches!(self.kind(), InlineTokenKind::Discretionary { .. }) { 0.0 } else { self.width as f64 }
+        if matches!(self.kind(), InlineTokenKind::Discretionary { .. }) {
+            0.0
+        } else {
+            self.width as f64
+        }
     }
 
     pub(super) fn discretionary_width(&self) -> f64 {
-        if matches!(self.kind(), InlineTokenKind::Discretionary { .. }) { self.width as f64 } else { 0.0 }
+        if matches!(self.kind(), InlineTokenKind::Discretionary { .. }) {
+            self.width as f64
+        } else {
+            0.0
+        }
     }
 
     #[inline]
@@ -265,7 +353,11 @@ impl InlineToken {
     }
 
     #[inline]
-    pub(super) fn advance_at(&self, runs: &[InlineTokenMetrics], position_from_block_start: f64) -> f64 {
+    pub(super) fn advance_at(
+        &self,
+        runs: &[InlineTokenMetrics],
+        position_from_block_start: f64,
+    ) -> f64 {
         let metrics = self.run_metrics(runs);
         if metrics.tab_interval < 0.0 {
             return self.width();
@@ -275,7 +367,11 @@ impl InlineToken {
             return 0.0;
         }
         let remainder = position_from_block_start.rem_euclid(interval);
-        let mut advance = if remainder <= f64::EPSILON { interval } else { interval - remainder };
+        let mut advance = if remainder <= f64::EPSILON {
+            interval
+        } else {
+            interval - remainder
+        };
         if advance < metrics.tab_min_advance {
             advance += interval;
         }
@@ -328,9 +424,32 @@ pub(super) enum InlineTokenKind {
 /// pass instead of dragging image-sized enum storage through cache lines.
 #[derive(Clone)]
 pub(super) enum ReplacedToken {
-    Image { image_idx: u32, box_idx: u32, content_size: Size, border_size: Size, content_inset: Point, margin_left: f64, margin_top: f64, position_offset: Vec2, set_box_geometry: bool },
-    AtomicBox { box_idx: u32, border_size: Size, containing_width: f64, containing_height: Option<f64>, margin_left: f64, margin_top: f64 },
-    InlineBoundary { box_idx: u32, margin_left: f64, left_inset: f64, inline_start: bool, inline_end: bool },
+    Image {
+        image_idx: u32,
+        box_idx: u32,
+        content_size: Size,
+        border_size: Size,
+        content_inset: Point,
+        margin_left: f64,
+        margin_top: f64,
+        position_offset: Vec2,
+        set_box_geometry: bool,
+    },
+    AtomicBox {
+        box_idx: u32,
+        border_size: Size,
+        containing_width: f64,
+        containing_height: Option<f64>,
+        margin_left: f64,
+        margin_top: f64,
+    },
+    InlineBoundary {
+        box_idx: u32,
+        margin_left: f64,
+        left_inset: f64,
+        inline_start: bool,
+        inline_end: bool,
+    },
 }
 
 #[derive(Clone, Copy, Default)]
@@ -346,7 +465,13 @@ pub(super) struct InlineSummaryBlock {
 
 impl InlineSummaryBlock {
     fn build(tokens: &[InlineToken], runs: &[InlineTokenMetrics]) -> Self {
-        let mut summary = Self { glyph_start: u32::MAX, max_ascent: f64::NEG_INFINITY, max_descent: f64::NEG_INFINITY, plain_text: !tokens.is_empty(), ..Self::default() };
+        let mut summary = Self {
+            glyph_start: u32::MAX,
+            max_ascent: f64::NEG_INFINITY,
+            max_descent: f64::NEG_INFINITY,
+            plain_text: !tokens.is_empty(),
+            ..Self::default()
+        };
         let mut expected_glyph = None;
         for token in tokens {
             let InlineTokenKind::Glyph { glyph_idx } = token.kind() else {
@@ -356,7 +481,10 @@ impl InlineSummaryBlock {
             let metrics = token.run_metrics(runs);
             summary.glyph_start = summary.glyph_start.min(glyph_idx);
             summary.glyph_end = summary.glyph_end.max(glyph_idx + 1);
-            summary.plain_text &= expected_glyph.is_none_or(|expected| expected == glyph_idx) && metrics.tab_interval < 0.0 && !metrics.placement_required && matches!(metrics.vertical_align, VerticalAlignValue::Baseline);
+            summary.plain_text &= expected_glyph.is_none_or(|expected| expected == glyph_idx)
+                && metrics.tab_interval < 0.0
+                && !metrics.placement_required
+                && matches!(metrics.vertical_align, VerticalAlignValue::Baseline);
             expected_glyph = Some(glyph_idx + 1);
             summary.preserves_newlines |= metrics.white_space.preserves_newlines();
             summary.width += token.width();
@@ -436,27 +564,49 @@ pub(super) struct InlineTokens {
 
 impl InlineTokens {
     pub(super) fn with_capacity(capacity: usize) -> Self {
-        Self { dense: InlineStorage::with_capacity(capacity), runs: InlineStorage::default(), summary_blocks: InlineStorage::with_capacity(capacity.div_ceil(INLINE_SUMMARY_BLOCK_TOKENS)), replaced: Vec::new(), kp_plan: None }
+        Self {
+            dense: InlineStorage::with_capacity(capacity),
+            runs: InlineStorage::default(),
+            summary_blocks: InlineStorage::with_capacity(
+                capacity.div_ceil(INLINE_SUMMARY_BLOCK_TOKENS),
+            ),
+            replaced: Vec::new(),
+            kp_plan: None,
+        }
     }
 
-    pub(super) fn bind_metrics_in(runs: &mut Vec<InlineTokenMetrics>, previous_run_idx: Option<u32>, token: &mut InlineToken, metrics: InlineTokenMetrics) -> u32 {
+    pub(super) fn bind_metrics_in(
+        runs: &mut Vec<InlineTokenMetrics>,
+        previous_run_idx: Option<u32>,
+        token: &mut InlineToken,
+        metrics: InlineTokenMetrics,
+    ) -> u32 {
         if let Some(run_idx) = previous_run_idx
-            && runs.get(run_idx as usize).is_some_and(|previous| *previous == metrics)
+            && runs
+                .get(run_idx as usize)
+                .is_some_and(|previous| *previous == metrics)
         {
             token.run_idx = run_idx;
             return run_idx;
         }
 
-        let run_idx = runs.iter().position(|candidate| *candidate == metrics).unwrap_or_else(|| {
-            runs.push(metrics);
-            runs.len() - 1
-        });
+        let run_idx = runs
+            .iter()
+            .position(|candidate| *candidate == metrics)
+            .unwrap_or_else(|| {
+                runs.push(metrics);
+                runs.len() - 1
+            });
         let run_idx = u32::try_from(run_idx).expect("inline run-metrics arena capacity exhausted");
         token.run_idx = run_idx;
         run_idx
     }
 
-    pub(super) fn bind_metrics(&mut self, mut token: InlineToken, metrics: InlineTokenMetrics) -> InlineToken {
+    pub(super) fn bind_metrics(
+        &mut self,
+        mut token: InlineToken,
+        metrics: InlineTokenMetrics,
+    ) -> InlineToken {
         let previous_run_idx = self.dense.last().map(|previous| previous.run_idx);
         Self::bind_metrics_in(self.runs.make_mut(), previous_run_idx, &mut token, metrics);
         token
@@ -467,12 +617,21 @@ impl InlineTokens {
         self.dense.make_mut().push(token);
     }
 
-    fn push_replaced(&mut self, payload: ReplacedToken, kind: impl FnOnce(u32) -> InlineTokenKind, mut token: InlineToken, metrics: InlineTokenMetrics) {
-        let payload_idx = u32::try_from(self.replaced.len()).expect("inline replaced-token arena capacity exhausted");
+    fn push_replaced(
+        &mut self,
+        payload: ReplacedToken,
+        kind: impl FnOnce(u32) -> InlineTokenKind,
+        mut token: InlineToken,
+        metrics: InlineTokenMetrics,
+    ) {
+        let payload_idx = u32::try_from(self.replaced.len())
+            .expect("inline replaced-token arena capacity exhausted");
         self.replaced.push(payload);
         let packed_kind = kind(payload_idx);
         token.data = match packed_kind {
-            InlineTokenKind::Image { payload_idx } | InlineTokenKind::AtomicBox { payload_idx } | InlineTokenKind::InlineBoundary { payload_idx } => payload_idx,
+            InlineTokenKind::Image { payload_idx }
+            | InlineTokenKind::AtomicBox { payload_idx }
+            | InlineTokenKind::InlineBoundary { payload_idx } => payload_idx,
             _ => unreachable!("replaced token kind must use a payload index"),
         };
         token.metadata = (token.metadata & !InlineToken::KIND_MASK)
@@ -503,7 +662,11 @@ impl InlineTokens {
     fn rebuild_summary_blocks(&mut self) {
         let summaries = self.summary_blocks.make_mut();
         summaries.clear();
-        summaries.extend(self.dense.chunks(INLINE_SUMMARY_BLOCK_TOKENS).map(|tokens| InlineSummaryBlock::build(tokens, &self.runs)));
+        summaries.extend(
+            self.dense
+                .chunks(INLINE_SUMMARY_BLOCK_TOKENS)
+                .map(|tokens| InlineSummaryBlock::build(tokens, &self.runs)),
+        );
     }
 
     /// Collapsible indentation remains line-edge whitespace when inline
@@ -511,7 +674,14 @@ impl InlineTokens {
     /// geometry but no text content, so walk through them while zeroing soft
     /// spaces at either paragraph edge.
     fn collapse_edge_whitespace_through_boundaries(&mut self) {
-        let transparent_boundary = |token: &InlineToken| matches!(token.kind(), InlineTokenKind::InlineBoundary { .. } | InlineTokenKind::FloatAnchor { .. } | InlineTokenKind::AbsoluteAnchor { .. });
+        let transparent_boundary = |token: &InlineToken| {
+            matches!(
+                token.kind(),
+                InlineTokenKind::InlineBoundary { .. }
+                    | InlineTokenKind::FloatAnchor { .. }
+                    | InlineTokenKind::AbsoluteAnchor { .. }
+            )
+        };
         let mut collapsed = Vec::new();
         for (index, token) in self.dense.iter().enumerate() {
             if token_is_collapsible_line_edge_space(token, &self.runs) {
@@ -538,11 +708,23 @@ impl InlineTokens {
     /// final placement resolve it through the shared glue policy.
     fn classify_space_glue(&mut self, engine: &LayoutEngine<'_, '_>) {
         fn glyph_character(engine: &LayoutEngine<'_, '_>, token: &InlineToken) -> Option<char> {
-            let InlineTokenKind::Glyph { glyph_idx } = token.kind() else { return None };
-            Some(engine.text.glyph_metric(engine.text.glyph_at(glyph_idx as usize).unwrap_or_default()).ch())
+            let InlineTokenKind::Glyph { glyph_idx } = token.kind() else {
+                return None;
+            };
+            Some(
+                engine
+                    .text
+                    .glyph_metric(engine.text.glyph_at(glyph_idx as usize).unwrap_or_default())
+                    .ch(),
+            )
         }
 
-        fn context_character(engine: &LayoutEngine<'_, '_>, tokens: &[InlineToken], mut index: usize, direction: isize) -> Option<char> {
+        fn context_character(
+            engine: &LayoutEngine<'_, '_>,
+            tokens: &[InlineToken],
+            mut index: usize,
+            direction: isize,
+        ) -> Option<char> {
             loop {
                 index = index.checked_add_signed(direction)?;
                 let token = tokens.get(index)?;
@@ -550,7 +732,10 @@ impl InlineTokens {
                     return Some(character);
                 }
                 match token.kind() {
-                    InlineTokenKind::InlineBoundary { .. } | InlineTokenKind::FloatAnchor { .. } | InlineTokenKind::AbsoluteAnchor { .. } | InlineTokenKind::Opportunity => {}
+                    InlineTokenKind::InlineBoundary { .. }
+                    | InlineTokenKind::FloatAnchor { .. }
+                    | InlineTokenKind::AbsoluteAnchor { .. }
+                    | InlineTokenKind::Opportunity => {}
                     _ => return None,
                 }
             }
@@ -579,29 +764,58 @@ impl InlineTokens {
     /// represents a break before discardable whitespace, so use explicit
     /// zero-width opportunities for these after-space rules.
     fn insert_preserved_space_break_opportunities(&mut self, engine: &LayoutEngine<'_, '_>) {
-        let InlineStorage::Owned(dense) = &mut self.dense else { unreachable!("new inline token plans must own their construction buffer") };
+        let InlineStorage::Owned(dense) = &mut self.dense else {
+            unreachable!("new inline token plans must own their construction buffer")
+        };
         let mut expanded = Vec::with_capacity(dense.len());
         for (index, token) in dense.iter().copied().enumerate() {
             expanded.push(token);
-            let InlineTokenKind::Glyph { glyph_idx } = token.kind() else { continue };
-            let character = engine.text.glyph_metric(engine.text.glyph_at(glyph_idx as usize).unwrap_or_default()).ch();
+            let InlineTokenKind::Glyph { glyph_idx } = token.kind() else {
+                continue;
+            };
+            let character = engine
+                .text
+                .glyph_metric(engine.text.glyph_at(glyph_idx as usize).unwrap_or_default())
+                .ch();
             if !matches!(character, ' ' | '\t') {
                 continue;
             }
             let white_space = token.run_metrics(&self.runs).white_space;
             let break_after = match white_space {
                 WhiteSpace::BreakSpaces => true,
-                WhiteSpace::PreWrap => {
-                    dense[index + 1..].iter().find(|next| !matches!(next.kind(), InlineTokenKind::InlineBoundary { .. } | InlineTokenKind::FloatAnchor { .. } | InlineTokenKind::AbsoluteAnchor { .. })).is_none_or(|next| {
-                        let InlineTokenKind::Glyph { glyph_idx } = next.kind() else { return true };
-                        let next_character = engine.text.glyph_metric(engine.text.glyph_at(glyph_idx as usize).unwrap_or_default()).ch();
-                        !matches!(next_character, ' ' | '\t') || !next.run_metrics(&self.runs).white_space.preserves_spaces()
+                WhiteSpace::PreWrap => dense[index + 1..]
+                    .iter()
+                    .find(|next| {
+                        !matches!(
+                            next.kind(),
+                            InlineTokenKind::InlineBoundary { .. }
+                                | InlineTokenKind::FloatAnchor { .. }
+                                | InlineTokenKind::AbsoluteAnchor { .. }
+                        )
                     })
-                }
+                    .is_none_or(|next| {
+                        let InlineTokenKind::Glyph { glyph_idx } = next.kind() else {
+                            return true;
+                        };
+                        let next_character = engine
+                            .text
+                            .glyph_metric(
+                                engine.text.glyph_at(glyph_idx as usize).unwrap_or_default(),
+                            )
+                            .ch();
+                        !matches!(next_character, ' ' | '\t')
+                            || !next.run_metrics(&self.runs).white_space.preserves_spaces()
+                    }),
                 _ => false,
             };
             if break_after {
-                let mut opportunity = InlineToken::new(InlineTokenKind::Opportunity, 0.0, BreakKind::Discretionary, TokenWrap::Normal, true);
+                let mut opportunity = InlineToken::new(
+                    InlineTokenKind::Opportunity,
+                    0.0,
+                    BreakKind::Discretionary,
+                    TokenWrap::Normal,
+                    true,
+                );
                 opportunity.run_idx = token.run_idx;
                 expanded.push(opportunity);
             }
@@ -618,11 +832,16 @@ impl InlineTokens {
         let mut text = String::new();
         let mut glyph_tokens = Vec::new();
         for (token_idx, token) in self.dense.iter().enumerate() {
-            let InlineTokenKind::Glyph { glyph_idx } = token.kind() else { continue };
+            let InlineTokenKind::Glyph { glyph_idx } = token.kind() else {
+                continue;
+            };
             if token.run_metrics(&self.runs).white_space.preserves_spaces() {
                 return;
             }
-            let character = engine.text.glyph_metric(engine.text.glyph_at(glyph_idx as usize).unwrap_or_default()).ch();
+            let character = engine
+                .text
+                .glyph_metric(engine.text.glyph_at(glyph_idx as usize).unwrap_or_default())
+                .ch();
             let byte_start = text.len();
             text.push(character);
             glyph_tokens.push((byte_start, text.len(), token_idx, character));
@@ -642,8 +861,19 @@ impl InlineTokens {
                 continue;
             }
             let content_end = segment_start + trimmed.len();
-            let Some((_, _, content_token, _)) = glyph_tokens.iter().copied().rev().find(|(_, end, _, _)| *end <= content_end) else { continue };
-            let whitespace_token = glyph_tokens.iter().copied().find(|(start, _, _, character)| *start >= content_end && character.is_whitespace()).map(|(_, _, token_idx, _)| token_idx);
+            let Some((_, _, content_token, _)) = glyph_tokens
+                .iter()
+                .copied()
+                .rev()
+                .find(|(_, end, _, _)| *end <= content_end)
+            else {
+                continue;
+            };
+            let whitespace_token = glyph_tokens
+                .iter()
+                .copied()
+                .find(|(start, _, _, character)| *start >= content_end && character.is_whitespace())
+                .map(|(_, _, token_idx, _)| token_idx);
             break_positions.push((content_token + 1, whitespace_token));
         }
         break_positions.sort_unstable();
@@ -654,8 +884,18 @@ impl InlineTokens {
             if let Some(token_idx) = whitespace_token {
                 dense[token_idx].set_break_kind(BreakKind::Hard);
             } else {
-                let Some(previous) = dense.get(insert_after.saturating_sub(1)).copied() else { continue };
-                let mut break_token = InlineToken::new(InlineTokenKind::Break { clear: html_style_model::Clear::None }, 0.0, BreakKind::Hard, TokenWrap::Normal, true);
+                let Some(previous) = dense.get(insert_after.saturating_sub(1)).copied() else {
+                    continue;
+                };
+                let mut break_token = InlineToken::new(
+                    InlineTokenKind::Break {
+                        clear: html_style_model::Clear::None,
+                    },
+                    0.0,
+                    BreakKind::Hard,
+                    TokenWrap::Normal,
+                    true,
+                );
                 break_token.run_idx = previous.run_idx;
                 dense.insert(insert_after, break_token);
             }
@@ -664,11 +904,16 @@ impl InlineTokens {
     }
 
     fn enable_kp_plan_cache(&mut self) {
-        self.kp_plan.get_or_insert_with(|| std::sync::Arc::new([std::sync::OnceLock::new(), std::sync::OnceLock::new()]));
+        self.kp_plan.get_or_insert_with(|| {
+            std::sync::Arc::new([std::sync::OnceLock::new(), std::sync::OnceLock::new()])
+        });
     }
 
     pub(super) fn kp_plan(&self, punctuation_aware: bool) -> Option<&KpPlan> {
-        self.kp_plan.as_deref().map(|plans| plans[usize::from(punctuation_aware)].get_or_init(|| KpPlan::build(self.as_slice(), &self.runs, punctuation_aware)))
+        self.kp_plan.as_deref().map(|plans| {
+            plans[usize::from(punctuation_aware)]
+                .get_or_init(|| KpPlan::build(self.as_slice(), &self.runs, punctuation_aware))
+        })
     }
 }
 
@@ -709,7 +954,12 @@ pub(crate) struct PreparedInlinePlans {
 
 impl PreparedInlinePlans {
     pub(crate) fn new(box_count: usize) -> Self {
-        Self { slots: (0..box_count).map(|_| std::sync::OnceLock::new()).collect::<Vec<_>>().into() }
+        Self {
+            slots: (0..box_count)
+                .map(|_| std::sync::OnceLock::new())
+                .collect::<Vec<_>>()
+                .into(),
+        }
     }
 
     fn get(&self, key: PreparedInlinePlanKey) -> Option<InlineTokens> {
@@ -718,32 +968,58 @@ impl PreparedInlinePlans {
     }
 
     fn insert(&self, key: PreparedInlinePlanKey, tokens: InlineTokens) -> InlineTokens {
-        let Some(slot) = self.slots.get(key.container_box_idx as usize) else { return tokens };
+        let Some(slot) = self.slots.get(key.container_box_idx as usize) else {
+            return tokens;
+        };
         if let Some(plan) = slot.get() {
-            return if plan.key == key { plan.tokens.clone() } else { tokens };
+            return if plan.key == key {
+                plan.tokens.clone()
+            } else {
+                tokens
+            };
         }
         match slot.set(PreparedInlinePlan { key, tokens }) {
-            Ok(()) => slot.get().expect("prepared inline plan was just initialized").tokens.clone(),
-            Err(candidate) => slot.get().filter(|plan| plan.key == key).map_or(candidate.tokens, |plan| plan.tokens.clone()),
+            Ok(()) => slot
+                .get()
+                .expect("prepared inline plan was just initialized")
+                .tokens
+                .clone(),
+            Err(candidate) => slot
+                .get()
+                .filter(|plan| plan.key == key)
+                .map_or(candidate.tokens, |plan| plan.tokens.clone()),
         }
     }
 
     pub(crate) fn memory_usage_bytes(&self) -> usize {
         self.slots.len() * std::mem::size_of::<std::sync::OnceLock<PreparedInlinePlan>>()
             + self
-            .slots
-            .iter()
-            .filter_map(std::sync::OnceLock::get)
-            .map(|tokens| {
-                let tokens = &tokens.tokens;
-                let kp_plan_bytes = tokens.kp_plan.as_deref().map_or(0, |plans| plans.iter().filter_map(std::sync::OnceLock::get).map(KpPlan::memory_usage_bytes).sum());
-                tokens.dense.capacity() * std::mem::size_of::<InlineToken>() + tokens.runs.capacity() * std::mem::size_of::<InlineTokenMetrics>() + tokens.summary_blocks.capacity() * std::mem::size_of::<InlineSummaryBlock>() + kp_plan_bytes
-            })
-            .sum::<usize>()
+                .slots
+                .iter()
+                .filter_map(std::sync::OnceLock::get)
+                .map(|tokens| {
+                    let tokens = &tokens.tokens;
+                    let kp_plan_bytes = tokens.kp_plan.as_deref().map_or(0, |plans| {
+                        plans
+                            .iter()
+                            .filter_map(std::sync::OnceLock::get)
+                            .map(KpPlan::memory_usage_bytes)
+                            .sum()
+                    });
+                    tokens.dense.capacity() * std::mem::size_of::<InlineToken>()
+                        + tokens.runs.capacity() * std::mem::size_of::<InlineTokenMetrics>()
+                        + tokens.summary_blocks.capacity()
+                            * std::mem::size_of::<InlineSummaryBlock>()
+                        + kp_plan_bytes
+                })
+                .sum::<usize>()
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.slots.iter().filter(|slot| slot.get().is_some()).count()
+        self.slots
+            .iter()
+            .filter(|slot| slot.get().is_some())
+            .count()
     }
 }
 
@@ -756,7 +1032,10 @@ pub(in crate::layout) enum BreakKind {
     Discretionary,
 }
 
-pub(super) fn token_is_collapsible_line_edge_space(token: &InlineToken, runs: &[InlineTokenMetrics]) -> bool {
+pub(super) fn token_is_collapsible_line_edge_space(
+    token: &InlineToken,
+    runs: &[InlineTokenMetrics],
+) -> bool {
     token.break_kind() == BreakKind::Soft && !token.run_metrics(runs).white_space.preserves_spaces()
 }
 
@@ -783,7 +1062,10 @@ pub(in crate::layout) use build::{inline_item_ownership_box, run_belongs_to_inli
 /// Style supplying the space/ch metric used by number-valued `tab-size`.
 /// CSS defines it on the nearest block container rather than the inline
 /// span that happens to contain the tab.
-pub(in crate::layout) fn tab_reference_style<'input>(engine: &crate::layout::LayoutEngine<'input, '_>, box_idx: usize) -> html_style_model::UsedStyleView<'input> {
+pub(in crate::layout) fn tab_reference_style<'input>(
+    engine: &crate::layout::LayoutEngine<'input, '_>,
+    box_idx: usize,
+) -> html_style_model::UsedStyleView<'input> {
     let mut current = Some(box_idx);
     while let Some(idx) = current {
         let style = engine.reader.style(idx);
@@ -798,13 +1080,26 @@ pub(in crate::layout) fn tab_reference_style<'input>(engine: &crate::layout::Lay
 /// Canonical metrics for a preserved tab. Both intrinsic measurement and
 /// final line placement use this helper so tab stops cannot diverge between
 /// sizing and layout.
-pub(in crate::layout) fn preserved_tab_metrics(style: html_style_model::UsedStyleView<'_>, reference_style: html_style_model::UsedStyleView<'_>, uses_ahem: bool) -> (f64, f64) {
+pub(in crate::layout) fn preserved_tab_metrics(
+    style: html_style_model::UsedStyleView<'_>,
+    reference_style: html_style_model::UsedStyleView<'_>,
+    uses_ahem: bool,
+) -> (f64, f64) {
     let ch_advance = reference_style.font_size() as f64 * if uses_ahem { 1.0 } else { 0.5 };
     let interval = match style.tab_size().kind() {
-        TabSizeKind::Spaces => style.tab_size().value() as f64 * (ch_advance + reference_style.letter_spacing() as f64 + reference_style.word_spacing() as f64).max(0.0),
+        TabSizeKind::Spaces => {
+            style.tab_size().value() as f64
+                * (ch_advance
+                    + reference_style.letter_spacing() as f64
+                    + reference_style.word_spacing() as f64)
+                    .max(0.0)
+        }
         TabSizeKind::LengthPx => style.tab_size().value() as f64,
     };
-    (interval.min(f32::MAX as f64), (ch_advance * 0.5).min(f32::MAX as f64))
+    (
+        interval.min(f32::MAX as f64),
+        (ch_advance * 0.5).min(f32::MAX as f64),
+    )
 }
 
 /// The text facts shared by intrinsic sizing and final line construction.
@@ -817,7 +1112,12 @@ pub(in crate::layout) struct CanonicalTextUnit {
     pub(in crate::layout) natural_advance: f64,
 }
 
-pub(in crate::layout) fn canonical_text_unit(engine: &crate::layout::LayoutEngine<'_, '_>, glyph_idx: u32, style: html_style_model::UsedStyleView<'_>, white_space: WhiteSpace) -> CanonicalTextUnit {
+pub(in crate::layout) fn canonical_text_unit(
+    engine: &crate::layout::LayoutEngine<'_, '_>,
+    glyph_idx: u32,
+    style: html_style_model::UsedStyleView<'_>,
+    white_space: WhiteSpace,
+) -> CanonicalTextUnit {
     let glyph = engine.text.glyph_at(glyph_idx as usize).unwrap_or_default();
     let metric = engine.text.glyph_metric(glyph);
     let character = metric.ch();
@@ -826,12 +1126,25 @@ pub(in crate::layout) fn canonical_text_unit(engine: &crate::layout::LayoutEngin
         crate::layout_model::WhitespaceWrapOverride::Allow => BreakKind::Soft,
         crate::layout_model::WhitespaceWrapOverride::Suppress => BreakKind::None,
     };
-    let natural_advance = if matches!(character, '\u{00ad}' | '\u{200b}') || style.font_size() <= 0.0 {
-        0.0
-    } else {
-        engine.text.text_advance(glyph_idx as usize, metric.advance()) as f64 + style.letter_spacing() as f64 + if character == ' ' { style.word_spacing() as f64 } else { 0.0 }
-    };
-    CanonicalTextUnit { character, break_kind, natural_advance }
+    let natural_advance =
+        if matches!(character, '\u{00ad}' | '\u{200b}') || style.font_size() <= 0.0 {
+            0.0
+        } else {
+            engine
+                .text
+                .text_advance(glyph_idx as usize, metric.advance()) as f64
+                + style.letter_spacing() as f64
+                + if character == ' ' {
+                    style.word_spacing() as f64
+                } else {
+                    0.0
+                }
+        };
+    CanonicalTextUnit {
+        character,
+        break_kind,
+        natural_advance,
+    }
 }
 
 /// Measures a token span as a fully placed line without mutating the document.

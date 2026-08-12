@@ -611,6 +611,16 @@ impl<'a> RenderTextView<'a> {
         &self.doc.layout_state.line_output.paint_order_indices
     }
 
+    /// Returns the CSS paint rank for a spatial line index.
+    pub fn paint_order_rank(self, line_idx: usize) -> Option<u32> {
+        self.doc
+            .layout_state
+            .line_output
+            .paint_order_ranks
+            .get(line_idx)
+            .copied()
+    }
+
     pub fn glyph_count(self) -> usize {
         self.doc.shaped.inline_content.glyphs().len()
     }
@@ -665,6 +675,22 @@ impl<'a> RenderTextView<'a> {
                     placement_required: run.placement_required,
                 })
             })
+    }
+
+    /// Retained, line-relative authoritative run slices prepared by layout.
+    /// `None` means native-run coverage was incomplete for this line.
+    pub fn prepared_text_runs(
+        self,
+        line_idx: usize,
+    ) -> Option<&'a [crate::PreparedTextRunFragment]> {
+        let output = &self.doc.layout_state.line_output;
+        let line = output.lines.get(line_idx)?;
+        if !line.native_text_runs_complete {
+            return None;
+        }
+        output
+            .prepared_text_run_fragments
+            .get(line.prepared_text_runs.start as usize..line.prepared_text_runs.end as usize)
     }
 
     pub fn line_count(self) -> usize {

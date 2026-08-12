@@ -7,14 +7,21 @@ use super::*;
 /// this here lets the backend shape, size, and paint the whole typographic
 /// unit with the pseudo style instead of trying to resize already-shaped
 /// glyphs during line layout.
-pub(crate) fn first_letter_style_overrides(document: &Document, styles: &ComputedStyles, layout_tree: &LayoutTree, inline_content: &InlineContent) -> Vec<Option<StyleIndices>> {
+pub(crate) fn first_letter_style_overrides(
+    document: &Document,
+    styles: &ComputedStyles,
+    layout_tree: &LayoutTree,
+    inline_content: &InlineContent,
+) -> Vec<Option<StyleIndices>> {
     // Preserve source order. An ancestor's `::first-letter` belongs to the
     // first in-flow descendant that contributes text, not to every descendant
     // formatting context carrying that ancestor in its box chain.
     let mut root_indices = FxHashMap::<usize, usize>::default();
     let mut content_by_root = Vec::<(usize, Vec<(u32, char, usize)>)>::new();
     for run in inline_content.inline_items() {
-        let InlineItemKind::Text { glyphs } = &run.kind else { continue };
+        let InlineItemKind::Text { glyphs } = &run.kind else {
+            continue;
+        };
         let root = whitespace_context_root(layout_tree, run.box_idx as usize);
         let entry = if let Some(&entry) = root_indices.get(&root) {
             entry
@@ -24,18 +31,44 @@ pub(crate) fn first_letter_style_overrides(document: &Document, styles: &Compute
             root_indices.insert(root, entry);
             entry
         };
-        content_by_root[entry].1.extend(glyphs.clone().map(|glyph_idx| {
-            let character = char::from_u32(inline_content.glyph_at(glyph_idx as usize).unwrap_or('?' as GlyphId)).unwrap_or('?');
-            (glyph_idx, character, run.box_idx as usize)
-        }));
+        content_by_root[entry]
+            .1
+            .extend(glyphs.clone().map(|glyph_idx| {
+                let character = char::from_u32(
+                    inline_content
+                        .glyph_at(glyph_idx as usize)
+                        .unwrap_or('?' as GlyphId),
+                )
+                .unwrap_or('?');
+                (glyph_idx, character, run.box_idx as usize)
+            }));
     }
 
     let mut overrides = vec![None; inline_content.glyphs().len()];
     let mut consumed_owners = FxHashSet::<u32>::default();
     for (root, content) in content_by_root {
-        let Some(mut start) = content.iter().position(|(_, character, _)| !character.is_whitespace()) else { continue };
-        consume_blocked_first_letter_owners(document, styles, layout_tree, root, &mut consumed_owners);
-        let Some((owner, pseudo_style, eligible)) = pseudo_style_owner(document, styles, layout_tree, root, PseudoStyleKind::FirstLetter) else { continue };
+        let Some(mut start) = content
+            .iter()
+            .position(|(_, character, _)| !character.is_whitespace())
+        else {
+            continue;
+        };
+        consume_blocked_first_letter_owners(
+            document,
+            styles,
+            layout_tree,
+            root,
+            &mut consumed_owners,
+        );
+        let Some((owner, pseudo_style, eligible)) = pseudo_style_owner(
+            document,
+            styles,
+            layout_tree,
+            root,
+            PseudoStyleKind::FirstLetter,
+        ) else {
+            continue;
+        };
         if !consumed_owners.insert(owner.raw()) {
             continue;
         }
@@ -58,15 +91,23 @@ pub(crate) fn first_letter_style_overrides(document: &Document, styles: &Compute
                 selection_end += 1;
             }
         }
-        while selection_end < content.len() && is_first_letter_punctuation(content[selection_end].1) {
+        while selection_end < content.len() && is_first_letter_punctuation(content[selection_end].1)
+        {
             selection_end += 1;
         }
 
-        let before_style = styles.before_style_for_node(owner).map(|(style, _, _)| style);
+        let before_style = styles
+            .before_style_for_node(owner)
+            .map(|(style, _, _)| style);
         let generated_style = styles.before_first_letter_style_for_node(owner);
         for &(glyph_idx, _, box_idx) in &content[selection_start..selection_end] {
-            let comes_from_before = before_style.is_some_and(|style| layout_tree.get_box_style_indices(box_idx) == Some(style));
-            overrides[glyph_idx as usize] = Some(if comes_from_before { generated_style.unwrap_or(pseudo_style) } else { pseudo_style });
+            let comes_from_before = before_style
+                .is_some_and(|style| layout_tree.get_box_style_indices(box_idx) == Some(style));
+            overrides[glyph_idx as usize] = Some(if comes_from_before {
+                generated_style.unwrap_or(pseudo_style)
+            } else {
+                pseudo_style
+            });
         }
     }
     overrides
@@ -76,33 +117,56 @@ pub(crate) fn first_letter_style_overrides(document: &Document, styles: &Compute
 /// items to its own (or an ancestor's) `::first-letter`. Those blocked owners
 /// still have to be consumed in source order: otherwise an ancestor pseudo
 /// incorrectly skips the container and styles text in a later sibling.
-fn consume_blocked_first_letter_owners(document: &Document, styles: &ComputedStyles, layout_tree: &LayoutTree, mut root: usize, consumed_owners: &mut FxHashSet<u32>) {
+fn consume_blocked_first_letter_owners(
+    document: &Document,
+    styles: &ComputedStyles,
+    layout_tree: &LayoutTree,
+    mut root: usize,
+    consumed_owners: &mut FxHashSet<u32>,
+) {
     let mut crossed_flex_or_grid = false;
     loop {
         if crossed_flex_or_grid {
-            if let Some(node) = layout_tree.get_box_dom_element(root).and_then(|raw| document.node_id_from_raw(raw)) {
+            if let Some(node) = layout_tree
+                .get_box_dom_element(root)
+                .and_then(|raw| document.node_id_from_raw(raw))
+            {
                 if styles.first_letter_style_for_node(node).is_some() {
                     consumed_owners.insert(node.raw());
                 }
             }
         }
 
-        let Some(parent) = layout_tree.get_box_parent(root) else { break };
-        if matches!(layout_tree.box_at(parent).map(|box_| box_.layout_mode()), Some(LayoutMode::Flex(_) | LayoutMode::Grid(_))) {
+        let Some(parent) = layout_tree.get_box_parent(root) else {
+            break;
+        };
+        if matches!(
+            layout_tree.box_at(parent).map(|box_| box_.layout_mode()),
+            Some(LayoutMode::Flex(_) | LayoutMode::Grid(_))
+        ) {
             crossed_flex_or_grid = true;
         }
         root = parent;
     }
 }
 
-fn pseudo_owner_is_blocked_at_root(layout_tree: &LayoutTree, mut root: usize, owner: html_dom::DomNodeId) -> bool {
+fn pseudo_owner_is_blocked_at_root(
+    layout_tree: &LayoutTree,
+    mut root: usize,
+    owner: html_dom::DomNodeId,
+) -> bool {
     let mut crossed_flex_or_grid = false;
     loop {
         if crossed_flex_or_grid && layout_tree.get_box_dom_element(root) == Some(owner.raw()) {
             return true;
         }
-        let Some(parent) = layout_tree.get_box_parent(root) else { return false };
-        if matches!(layout_tree.box_at(parent).map(|box_| box_.layout_mode()), Some(LayoutMode::Flex(_) | LayoutMode::Grid(_))) {
+        let Some(parent) = layout_tree.get_box_parent(root) else {
+            return false;
+        };
+        if matches!(
+            layout_tree.box_at(parent).map(|box_| box_.layout_mode()),
+            Some(LayoutMode::Flex(_) | LayoutMode::Grid(_))
+        ) {
             crossed_flex_or_grid = true;
         }
         root = parent;
@@ -119,10 +183,19 @@ enum PseudoStyleKind {
 /// inline formatting context. Walking layout ancestry is essential because
 /// CSS defines the first formatted line/letter through in-flow block
 /// descendants, not only through text directly owned by the styled element.
-fn pseudo_style_owner(document: &Document, styles: &ComputedStyles, layout_tree: &LayoutTree, mut root: usize, kind: PseudoStyleKind) -> Option<(html_dom::DomNodeId, StyleIndices, bool)> {
+fn pseudo_style_owner(
+    document: &Document,
+    styles: &ComputedStyles,
+    layout_tree: &LayoutTree,
+    mut root: usize,
+    kind: PseudoStyleKind,
+) -> Option<(html_dom::DomNodeId, StyleIndices, bool)> {
     let mut eligible = true;
     loop {
-        if let Some(node) = layout_tree.get_box_dom_element(root).and_then(|raw| document.node_id_from_raw(raw)) {
+        if let Some(node) = layout_tree
+            .get_box_dom_element(root)
+            .and_then(|raw| document.node_id_from_raw(raw))
+        {
             let style = match kind {
                 PseudoStyleKind::FirstLine => styles.first_line_style_for_node(node),
                 PseudoStyleKind::FirstLetter => styles.first_letter_style_for_node(node),
@@ -136,7 +209,10 @@ fn pseudo_style_owner(document: &Document, styles: &ComputedStyles, layout_tree:
         // flex/grid container blocks pseudos found on that container or any
         // ancestor. Keep searching so the blocked owner is still consumed in
         // source order instead of incorrectly applying to a later sibling.
-        if matches!(layout_tree.box_at(parent).map(|box_| box_.layout_mode()), Some(LayoutMode::Flex(_) | LayoutMode::Grid(_))) {
+        if matches!(
+            layout_tree.box_at(parent).map(|box_| box_.layout_mode()),
+            Some(LayoutMode::Flex(_) | LayoutMode::Grid(_))
+        ) {
             eligible = false;
         }
         root = parent;
@@ -147,18 +223,41 @@ fn pseudo_style_owner(document: &Document, styles: &ComputedStyles, layout_tree:
 /// CSS2 case where an ancestor's first formatted line occurs inside its first
 /// in-flow block descendant. Only the first text-contributing root owned by a
 /// pseudo-element is eligible.
-pub(crate) fn first_line_style_for_inline_root(document: &Document, styles: &ComputedStyles, layout_tree: &LayoutTree, inline_content: &InlineContent, root: usize) -> Option<StyleIndices> {
-    let (owner, style, eligible) = pseudo_style_owner(document, styles, layout_tree, root, PseudoStyleKind::FirstLine)?;
+pub(crate) fn first_line_style_for_inline_root(
+    document: &Document,
+    styles: &ComputedStyles,
+    layout_tree: &LayoutTree,
+    inline_content: &InlineContent,
+    root: usize,
+) -> Option<StyleIndices> {
+    let (owner, style, eligible) = pseudo_style_owner(
+        document,
+        styles,
+        layout_tree,
+        root,
+        PseudoStyleKind::FirstLine,
+    )?;
     if !eligible {
         return None;
     }
     for run in inline_content.inline_items() {
-        let (InlineItemKind::Text { glyphs } | InlineItemKind::Marker { glyphs }) = &run.kind else { continue };
+        let (InlineItemKind::Text { glyphs } | InlineItemKind::Marker { glyphs }) = &run.kind
+        else {
+            continue;
+        };
         if glyphs.start >= glyphs.end {
             continue;
         }
         let candidate_root = whitespace_context_root(layout_tree, run.box_idx as usize);
-        let Some((candidate_owner, _, candidate_eligible)) = pseudo_style_owner(document, styles, layout_tree, candidate_root, PseudoStyleKind::FirstLine) else { continue };
+        let Some((candidate_owner, _, candidate_eligible)) = pseudo_style_owner(
+            document,
+            styles,
+            layout_tree,
+            candidate_root,
+            PseudoStyleKind::FirstLine,
+        ) else {
+            continue;
+        };
         if candidate_owner == owner {
             return (candidate_root == root && candidate_eligible).then_some(style);
         }
@@ -166,13 +265,27 @@ pub(crate) fn first_line_style_for_inline_root(document: &Document, styles: &Com
     None
 }
 
-pub(crate) fn first_letter_style_for_inline_root(document: &Document, styles: &ComputedStyles, layout_tree: &LayoutTree, inline_content: &InlineContent, root: usize) -> Option<StyleIndices> {
-    let (owner, style, eligible) = pseudo_style_owner(document, styles, layout_tree, root, PseudoStyleKind::FirstLetter)?;
+pub(crate) fn first_letter_style_for_inline_root(
+    document: &Document,
+    styles: &ComputedStyles,
+    layout_tree: &LayoutTree,
+    inline_content: &InlineContent,
+    root: usize,
+) -> Option<StyleIndices> {
+    let (owner, style, eligible) = pseudo_style_owner(
+        document,
+        styles,
+        layout_tree,
+        root,
+        PseudoStyleKind::FirstLetter,
+    )?;
     if !eligible {
         return None;
     }
     for run in inline_content.inline_items() {
-        let InlineItemKind::Text { glyphs } = &run.kind else { continue };
+        let InlineItemKind::Text { glyphs } = &run.kind else {
+            continue;
+        };
         if glyphs.start >= glyphs.end {
             continue;
         }
@@ -180,7 +293,15 @@ pub(crate) fn first_letter_style_for_inline_root(document: &Document, styles: &C
         if pseudo_owner_is_blocked_at_root(layout_tree, candidate_root, owner) {
             return None;
         }
-        let Some((candidate_owner, _, candidate_eligible)) = pseudo_style_owner(document, styles, layout_tree, candidate_root, PseudoStyleKind::FirstLetter) else { continue };
+        let Some((candidate_owner, _, candidate_eligible)) = pseudo_style_owner(
+            document,
+            styles,
+            layout_tree,
+            candidate_root,
+            PseudoStyleKind::FirstLetter,
+        ) else {
+            continue;
+        };
         if candidate_owner == owner {
             return (candidate_root == root && candidate_eligible).then_some(style);
         }
@@ -189,5 +310,9 @@ pub(crate) fn first_letter_style_for_inline_root(document: &Document, styles: &C
 }
 
 fn is_first_letter_punctuation(character: char) -> bool {
-    character.is_punctuation_open() || character.is_punctuation_close() || character.is_punctuation_initial_quote() || character.is_punctuation_final_quote() || character.is_punctuation_other()
+    character.is_punctuation_open()
+        || character.is_punctuation_close()
+        || character.is_punctuation_initial_quote()
+        || character.is_punctuation_final_quote()
+        || character.is_punctuation_other()
 }

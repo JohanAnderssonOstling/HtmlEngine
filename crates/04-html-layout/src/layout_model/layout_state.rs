@@ -19,6 +19,10 @@ pub(crate) struct LineOutput {
     /// Line indexes in CSS paint order. Physical line storage remains sorted
     /// by document geometry so pagination and viewport lookup can use it.
     pub paint_order_indices: Vec<u32>,
+    /// Inverse of `paint_order_indices`: CSS paint rank for each spatial line
+    /// index. Page composition uses this to order only its visible lines
+    /// instead of rescanning the document-wide paint traversal.
+    pub paint_order_ranks: Vec<u32>,
     /// Contiguous non-text inline fragment arena. Each line owns a range into
     /// this buffer, avoiding one heap allocation per non-trivial line.
     pub inline_box_fragments: Vec<LineInlineBoxFragment>,
@@ -34,6 +38,9 @@ pub(crate) struct LineOutput {
     pub glyph_line_indices: Vec<u32>,
     pub line_glyph_offsets: Vec<Vec<GlyphOffsetRun>>,
     pub line_glyph_advances: Vec<Vec<GlyphAdvanceRun>>,
+    /// Contiguous arena of authoritative shaped-run slices prepared for
+    /// painting. Lines retain compact ranges into this buffer.
+    pub prepared_text_run_fragments: Vec<PreparedTextRunFragment>,
     pub ellipsis_fragments: Vec<EllipsisFragment>,
     pub hyphen_fragments: Vec<HyphenFragment>,
 }
@@ -60,6 +67,11 @@ pub(crate) struct FragmentOutput {
     /// flattening or physically reordering fragment storage.
     pub block_paint_ranges: Vec<Range<u32>>,
     pub block_decoration_count: u32,
+    /// Block decoration indexes sorted by vertical start, plus prefix maxima
+    /// and inverse CSS ranks for bounded viewport interval queries.
+    pub block_decoration_indices_by_y: Vec<u32>,
+    pub block_decoration_prefix_max_y1: Vec<f64>,
+    pub block_decoration_paint_ranks: Vec<u32>,
     /// Sparse resolved ancestor-overflow clips, indexed by decoration. Empty
     /// when the document does not establish an overflow clip.
     pub decoration_clips: Vec<Option<OverflowClip>>,
@@ -87,6 +99,11 @@ impl LayoutState {
             "LayoutState.line_output.paint_order_indices.storage",
             self.line_output.paint_order_indices.capacity(),
             self.line_output.paint_order_indices.len(),
+        );
+        report.add_slice_storage::<u32>(
+            "LayoutState.line_output.paint_order_ranks.storage",
+            self.line_output.paint_order_ranks.capacity(),
+            self.line_output.paint_order_ranks.len(),
         );
         report.add_slice_storage::<LineInlineBoxFragment>(
             "LayoutState.line_output.inline_box_fragments.storage",
@@ -142,6 +159,11 @@ impl LayoutState {
                 advances.len(),
             );
         }
+        report.add_slice_storage::<PreparedTextRunFragment>(
+            "LayoutState.line_output.prepared_text_run_fragments.storage",
+            self.line_output.prepared_text_run_fragments.capacity(),
+            self.line_output.prepared_text_run_fragments.len(),
+        );
         report.add_slice_storage::<EllipsisFragment>(
             "LayoutState.line_output.ellipsis_fragments.storage",
             self.line_output.ellipsis_fragments.capacity(),
@@ -156,6 +178,25 @@ impl LayoutState {
             "LayoutState.fragment_output.decorations.storage",
             self.fragment_output.decorations.fragment_capacity(),
             self.fragment_output.decorations.len(),
+        );
+        report.add_slice_storage::<u32>(
+            "LayoutState.fragment_output.block_decoration_indices_by_y.storage",
+            self.fragment_output
+                .block_decoration_indices_by_y
+                .capacity(),
+            self.fragment_output.block_decoration_indices_by_y.len(),
+        );
+        report.add_slice_storage::<f64>(
+            "LayoutState.fragment_output.block_decoration_prefix_max_y1.storage",
+            self.fragment_output
+                .block_decoration_prefix_max_y1
+                .capacity(),
+            self.fragment_output.block_decoration_prefix_max_y1.len(),
+        );
+        report.add_slice_storage::<u32>(
+            "LayoutState.fragment_output.block_decoration_paint_ranks.storage",
+            self.fragment_output.block_decoration_paint_ranks.capacity(),
+            self.fragment_output.block_decoration_paint_ranks.len(),
         );
         report.add_slice_storage::<u32>(
             "LayoutState.fragment_output.decoration_line_indices.storage",
@@ -282,6 +323,10 @@ pub(crate) struct Line {
     /// independently positioned shaping fragments. Ordinary text-only lines
     /// use `None` and implicitly consist of `glyphs` at x=0.
     pub text_fragments: Option<Box<[LineTextFragment]>>,
+    /// Range into `LineOutput::prepared_text_run_fragments`.
+    pub prepared_text_runs: Range<u32>,
+    /// False when authoritative native-run coverage was incomplete.
+    pub native_text_runs_complete: bool,
     /// Non-text inline items occupying this line. Their horizontal spans are
     /// retained so ancestor inline backgrounds and borders cover replaced and
     /// atomic children instead of deriving their geometry from glyphs alone.
@@ -301,6 +346,31 @@ impl Line {
             );
         }
         report
+    }
+}
+
+/// One authoritative shaped-run slice positioned relative to its line.
+///
+/// Pagination supplies the line's screen origin; painters only translate
+/// this retained geometry and never need to reconstruct glyph placement.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreparedTextRunFragment {
+    pub(crate) run: crate::TextRunId,
+    pub(crate) range: Range<u32>,
+    pub(crate) offset: Point,
+}
+
+impl PreparedTextRunFragment {
+    pub fn run(&self) -> crate::TextRunId {
+        self.run
+    }
+
+    pub fn range(&self) -> Range<u32> {
+        self.range.clone()
+    }
+
+    pub fn offset(&self) -> Point {
+        self.offset
     }
 }
 

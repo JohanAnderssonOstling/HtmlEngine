@@ -4,8 +4,14 @@ use html_style_model::{Float, PositionMode};
 use kurbo::{Point, Size, Vec2};
 
 use super::floats::{clearance_offset, layout_float};
-use super::fragmentation::{PreviousBlock, make_previous_block, offset_after_layout, offset_before_layout, offset_for_forced_break_after};
-use super::margins::{FlowParticipation, MarginProfile, MarginStrut, clear_matches_float_sides, collapse_before_child, parent_collapse_context, remaining_parent_margin};
+use super::fragmentation::{
+    PreviousBlock, make_previous_block, offset_after_layout, offset_before_layout,
+    offset_for_forced_break_after,
+};
+use super::margins::{
+    FlowParticipation, MarginProfile, MarginStrut, clear_matches_float_sides,
+    collapse_before_child, parent_collapse_context, remaining_parent_margin,
+};
 
 struct BlockFlowItem {
     profile: MarginProfile,
@@ -15,7 +21,15 @@ struct BlockFlowItem {
 /// `available_width` is the content width of `parent_idx` — i.e. the containing
 /// block inline-size for the children, against which their margin percentages
 /// resolve. `parent_cb_width` is the parent's own containing-block width.
-pub(crate) fn layout_block_children(engine: &mut LayoutEngine<'_, '_>, parent_idx: usize, children: &[u32], available_width: f64, parent_cb_width: f64, parent_content_height: Option<f64>, first_line_indent: f64) -> Size {
+pub(crate) fn layout_block_children(
+    engine: &mut LayoutEngine<'_, '_>,
+    parent_idx: usize,
+    children: &[u32],
+    available_width: f64,
+    parent_cb_width: f64,
+    parent_content_height: Option<f64>,
+    first_line_indent: f64,
+) -> Size {
     let timing_started = engine.start_timing();
     let mut y_offset = 0.0;
     let mut max_width = 0.0f64;
@@ -38,7 +52,11 @@ pub(crate) fn layout_block_children(engine: &mut LayoutEngine<'_, '_>, parent_id
     let parent_style = engine.reader.style(parent_idx);
     // Children start inside the parent's border and padding (the parent's box
     // point is its border-box origin).
-    let parent_padding = parent_style.get_top_left_padding(parent_cb_width) + Vec2::new(parent_style.border_left_width() as f64, parent_style.border_top_width() as f64);
+    let parent_padding = parent_style.get_top_left_padding(parent_cb_width)
+        + Vec2::new(
+            parent_style.border_left_width() as f64,
+            parent_style.border_top_width() as f64,
+        );
     let parent_ctx = parent_collapse_context(&engine.reader, parent_idx);
     let position = engine.geometry.point(parent_idx) + parent_padding;
 
@@ -49,7 +67,10 @@ pub(crate) fn layout_block_children(engine: &mut LayoutEngine<'_, '_>, parent_id
             // margin accumulated from preceding in-flow content. Resolving it
             // here does not consume that margin; the next in-flow sibling
             // still collapses against the same strut.
-            engine.defer_absolute_box(child_idx, position + Vec2::new(0.0, y_offset + pending_margin.resolve()));
+            engine.defer_absolute_box(
+                child_idx,
+                position + Vec2::new(0.0, y_offset + pending_margin.resolve()),
+            );
             continue;
         }
         if engine.reader.is_inline_box(child_idx) {
@@ -60,7 +81,10 @@ pub(crate) fn layout_block_children(engine: &mut LayoutEngine<'_, '_>, parent_id
         let child_style = engine.reader.style(child_idx);
         let child_float = child_style.float();
         let child_clear = child_style.clear();
-        debug_assert_eq!(matches!(item.profile.participation, FlowParticipation::Float), matches!(child_float, Float::Left | Float::Right));
+        debug_assert_eq!(
+            matches!(item.profile.participation, FlowParticipation::Float),
+            matches!(child_float, Float::Left | Float::Right)
+        );
 
         // A descendant clear behind open before edges exposes a different
         // margin when a matching float is active. Leave the clear candidate's
@@ -69,7 +93,9 @@ pub(crate) fn layout_block_children(engine: &mut LayoutEngine<'_, '_>, parent_id
         let leading_clear = item.profile.leading_clear();
         let mut runtime_leading_clearance = false;
         let mut runtime_leading_clearance_rewind = 0.0;
-        if child_clear == html_style_model::Clear::None && leading_clear != html_style_model::Clear::None {
+        if child_clear == html_style_model::Clear::None
+            && leading_clear != html_style_model::Clear::None
+        {
             let leading_clearance = clearance_offset(
                 &engine.floats,
                 position.y,
@@ -87,7 +113,8 @@ pub(crate) fn layout_block_children(engine: &mut LayoutEngine<'_, '_>, parent_id
                 // candidate's own top margin remains inside: clearance is
                 // inserted between that margin and the preceding margin
                 // chain (CSS 2.1 8.3.1 and 9.5.2).
-                runtime_leading_clearance_rewind = item.profile.before_clear.resolve() - MarginStrut::from_margin(item.profile.own_before).resolve();
+                runtime_leading_clearance_rewind = item.profile.before_clear.resolve()
+                    - MarginStrut::from_margin(item.profile.own_before).resolve();
                 item.profile.before = item.profile.before_clear;
                 // The cached profile describes the no-clearance case. Once a
                 // leading descendant actually clears an external float this
@@ -104,9 +131,20 @@ pub(crate) fn layout_block_children(engine: &mut LayoutEngine<'_, '_>, parent_id
         // in any band beside that float. Resolve the propagated candidate at
         // the real containing width before allowing its margin to escape
         // through the wrapper.
-        let has_active_float = engine.floats.current_float_context().is_some_and(|context| !context.is_empty());
-        if let Some(leading_bfc_idx) = item.profile.leading_bfc_to_probe(has_active_float).filter(|leading_bfc_idx| *leading_bfc_idx != child_idx) {
-            let candidate = engine.resolve_box_sizing(crate::layout::BoxLayoutRequest::normal(leading_bfc_idx, available_width, parent_content_height));
+        let has_active_float = engine
+            .floats
+            .current_float_context()
+            .is_some_and(|context| !context.is_empty());
+        if let Some(leading_bfc_idx) = item
+            .profile
+            .leading_bfc_to_probe(has_active_float)
+            .filter(|leading_bfc_idx| *leading_bfc_idx != child_idx)
+        {
+            let candidate = engine.resolve_box_sizing(crate::layout::BoxLayoutRequest::normal(
+                leading_bfc_idx,
+                available_width,
+                parent_content_height,
+            ));
             let horizontal = candidate.horizontal_margins();
             let measured = crate::layout::measure_resolved_box_isolated(engine, candidate);
             if measured.width + horizontal.total >= available_width - 0.001 {
@@ -120,19 +158,49 @@ pub(crate) fn layout_block_children(engine: &mut LayoutEngine<'_, '_>, parent_id
         // siblings, but clearance is calculated at its top border edge. Its
         // bottom margin must therefore not move the hypothetical clear
         // position.
-        let clearance_before = if child_clear != html_style_model::Clear::None && item.profile.collapses_through { MarginStrut::from_margin(item.profile.own_before) } else { item.profile.before };
-        let cleared_offset =
-            clearance_offset(&engine.floats, position.y, y_offset, pending_margin, clearance_before, item.profile.own_before, child_clear, margin_adjoins_parent_top, clear_matches_float_sides(child_clear, latest_adjoining_float_sides));
+        let clearance_before =
+            if child_clear != html_style_model::Clear::None && item.profile.collapses_through {
+                MarginStrut::from_margin(item.profile.own_before)
+            } else {
+                item.profile.before
+            };
+        let cleared_offset = clearance_offset(
+            &engine.floats,
+            position.y,
+            y_offset,
+            pending_margin,
+            clearance_before,
+            item.profile.own_before,
+            child_clear,
+            margin_adjoins_parent_top,
+            clear_matches_float_sides(child_clear, latest_adjoining_float_sides),
+        );
 
         if matches!(item.profile.participation, FlowParticipation::Float) {
             // `clear` changes this float's hypothetical position, but a
             // float remains out of flow: its clearance must not advance the
             // parent's normal-flow cursor or consume the adjoining margin
             // that a later in-flow sibling still sees.
-            let float_margin_y = cleared_offset.map(|clearance| clearance.offset).unwrap_or_else(|| y_offset + pending_margin.resolve());
-            let resolved = engine.resolve_box_sizing(crate::layout::BoxLayoutRequest::normal(child_idx, available_width, parent_content_height));
+            let float_margin_y = cleared_offset
+                .map(|clearance| clearance.offset)
+                .unwrap_or_else(|| y_offset + pending_margin.resolve());
+            let resolved = engine.resolve_box_sizing(crate::layout::BoxLayoutRequest::normal(
+                child_idx,
+                available_width,
+                parent_content_height,
+            ));
             let horizontal = resolved.horizontal_margins();
-            let child_size = layout_float(engine, resolved, child_float, position, float_margin_y, horizontal.left, horizontal.total, item.profile.own_before, item.profile.own_after);
+            let child_size = layout_float(
+                engine,
+                resolved,
+                child_float,
+                position,
+                float_margin_y,
+                horizontal.left,
+                horizontal.total,
+                item.profile.own_before,
+                item.profile.own_after,
+            );
             max_width = max_width.max(child_size.width + horizontal.total);
             latest_adjoining_float_sides = item.profile.adjoining_float_sides();
             continue;
@@ -140,7 +208,8 @@ pub(crate) fn layout_block_children(engine: &mut LayoutEngine<'_, '_>, parent_id
 
         let mut has_clearance = false;
         let mut clearance_consumed_before_margin = false;
-        let clearance_on_collapsed_through_box = cleared_offset.is_some() && item.profile.collapses_through;
+        let clearance_on_collapsed_through_box =
+            cleared_offset.is_some() && item.profile.collapses_through;
         let clearance_chain_leading_margin = if !collapsed_parent_top_margin.is_empty() {
             collapsed_parent_top_margin.resolve()
         } else if item.profile.own_after.abs() > 0.001 {
@@ -159,15 +228,30 @@ pub(crate) fn layout_block_children(engine: &mut LayoutEngine<'_, '_>, parent_id
                 // Carry that consumed component until the chain is resolved.
                 clearance_margin_barrier = true;
                 let cleared_border_y = position.y + clearance.offset;
-                clearance_consumed_margin = if clearance.hypothetical_y > cleared_border_y + 0.001 { 0.0 } else { clearance_chain_leading_margin - engine.floats.hypothetical_clearance_rewind() };
+                clearance_consumed_margin = if clearance.hypothetical_y > cleared_border_y + 0.001 {
+                    0.0
+                } else {
+                    clearance_chain_leading_margin - engine.floats.hypothetical_clearance_rewind()
+                };
                 item.profile.before = MarginStrut::from_margin(item.profile.own_before);
                 item.profile.after = MarginStrut::from_margin(item.profile.own_after);
                 item.profile.collapses_through = false;
             }
         }
 
-        let (top_collapses_with_parent, mut margin_offset) = collapse_before_child(&mut pending_margin, item.profile, started_flow || clearance_margin_barrier, has_clearance, clearance_consumed_before_margin, parent_ctx, item.is_anonymous);
-        if clearance_margin_barrier && !item.profile.collapses_through && !clearance_on_collapsed_through_box {
+        let (top_collapses_with_parent, mut margin_offset) = collapse_before_child(
+            &mut pending_margin,
+            item.profile,
+            started_flow || clearance_margin_barrier,
+            has_clearance,
+            clearance_consumed_before_margin,
+            parent_ctx,
+            item.is_anonymous,
+        );
+        if clearance_margin_barrier
+            && !item.profile.collapses_through
+            && !clearance_on_collapsed_through_box
+        {
             margin_offset -= clearance_consumed_margin;
             clearance_margin_barrier = false;
             clearance_consumed_margin = 0.0;
@@ -187,33 +271,79 @@ pub(crate) fn layout_block_children(engine: &mut LayoutEngine<'_, '_>, parent_id
         let fragment_height = engine.fragment_height();
         y_offset += offset_before_layout(engine, child_idx, position.y + y_offset, fragment_height);
 
-        let child_indent = engine.reader.box_layout_mode(child_idx).map(|mode| calculate_child_indent(mode, &mut indent_remaining)).unwrap_or(0.0);
-        let mut resolved = engine.resolve_box_sizing(crate::layout::BoxLayoutRequest::normal(child_idx, available_width, parent_content_height)).with_first_line_indent(child_indent);
+        let child_indent = engine
+            .reader
+            .box_layout_mode(child_idx)
+            .map(|mode| calculate_child_indent(mode, &mut indent_remaining))
+            .unwrap_or(0.0);
+        let mut resolved = engine
+            .resolve_box_sizing(crate::layout::BoxLayoutRequest::normal(
+                child_idx,
+                available_width,
+                parent_content_height,
+            ))
+            .with_first_line_indent(child_indent);
         let mut horizontal = resolved.horizontal_margins();
         // A collapse-through box still has a hypothetical border position.
         // When it establishes a containing block via `position: relative`,
         // that origin includes the adjoining margin even though the margin
         // remains pending in normal flow. Floats and absolute descendants
         // must therefore agree on the same source position.
-        let relative_collapse_through_offset = if item.profile.collapses_through && child_style.position() == PositionMode::Relative { pending_margin.resolve() } else { 0.0 };
-        let inline_offset = crate::layout::box_sizing::block_inline_alignment_offset(engine, &resolved);
-        let mut child_pos = position + Vec2::new(inline_offset, y_offset + relative_collapse_through_offset);
+        let relative_collapse_through_offset =
+            if item.profile.collapses_through && child_style.position() == PositionMode::Relative {
+                pending_margin.resolve()
+            } else {
+                0.0
+            };
+        let inline_offset =
+            crate::layout::box_sizing::block_inline_alignment_offset(engine, &resolved);
+        let mut child_pos =
+            position + Vec2::new(inline_offset, y_offset + relative_collapse_through_offset);
         if engine.reader.box_uses_float_context(child_idx)
-            && let Some(float_context) = engine.floats.current_float_context().filter(|context| !context.is_empty()).cloned()
+            && let Some(float_context) = engine
+                .floats
+                .current_float_context()
+                .filter(|context| !context.is_empty())
+                .cloned()
         {
             let original_y = child_pos.y;
             let mut candidate_y = original_y;
-            let mut probe_height = crate::layout::measure_resolved_box_isolated(engine, resolved.clone()).height.max(1.0);
+            let mut probe_height =
+                crate::layout::measure_resolved_box_isolated(engine, resolved.clone())
+                    .height
+                    .max(1.0);
             let mut selected = false;
             for _ in 0..float_context.band_count() + 2 {
-                let (band_left, band_right) = float_context.available(candidate_y, probe_height, position.x, position.x + available_width);
+                let (band_left, band_right) = float_context.available(
+                    candidate_y,
+                    probe_height,
+                    position.x,
+                    position.x + available_width,
+                );
                 let band_width = (band_right - band_left).max(0.0);
-                let candidate = engine.resolve_box_sizing(crate::layout::BoxLayoutRequest::normal(child_idx, available_width, parent_content_height).with_auto_width_limit(band_width)).with_first_line_indent(child_indent);
+                let candidate = engine
+                    .resolve_box_sizing(
+                        crate::layout::BoxLayoutRequest::normal(
+                            child_idx,
+                            available_width,
+                            parent_content_height,
+                        )
+                        .with_auto_width_limit(band_width),
+                    )
+                    .with_first_line_indent(child_indent);
                 let candidate_horizontal = candidate.horizontal_margins();
-                let measured = crate::layout::measure_resolved_box_isolated(engine, candidate.clone());
+                let measured =
+                    crate::layout::measure_resolved_box_isolated(engine, candidate.clone());
                 let candidate_height = measured.height.max(1.0);
-                let (stable_left, stable_right) = float_context.available(candidate_y, candidate_height, position.x, position.x + available_width);
-                if (stable_left - band_left).abs() > 0.001 || (stable_right - band_right).abs() > 0.001 {
+                let (stable_left, stable_right) = float_context.available(
+                    candidate_y,
+                    candidate_height,
+                    position.x,
+                    position.x + available_width,
+                );
+                if (stable_left - band_left).abs() > 0.001
+                    || (stable_right - band_right).abs() > 0.001
+                {
                     probe_height = candidate_height;
                     continue;
                 }
@@ -222,8 +352,13 @@ pub(crate) fn layout_block_children(engine: &mut LayoutEngine<'_, '_>, parent_id
                 // float. A trailing margin at the containing block edge may
                 // overflow that edge, though, and must not force the BFC below
                 // an otherwise fitting float (CSS2 new-fc-beside-float-with-margin).
-                let trailing_float_margin = if stable_right < position.x + available_width - 0.001 { candidate_horizontal.total - candidate_horizontal.left } else { 0.0 };
-                let required_width = (measured.width + candidate_horizontal.left + trailing_float_margin).max(0.0);
+                let trailing_float_margin = if stable_right < position.x + available_width - 0.001 {
+                    candidate_horizontal.total - candidate_horizontal.left
+                } else {
+                    0.0
+                };
+                let required_width =
+                    (measured.width + candidate_horizontal.left + trailing_float_margin).max(0.0);
                 let stable_width = (stable_right - stable_left).max(0.0);
                 if stable_left <= stable_right + 0.001 && required_width <= stable_width + 0.001 {
                     resolved = candidate;
@@ -233,7 +368,13 @@ pub(crate) fn layout_block_children(engine: &mut LayoutEngine<'_, '_>, parent_id
                     break;
                 }
 
-                let next_y = float_context.next_y_fitting(candidate_y, required_width, candidate_height, position.x, position.x + available_width);
+                let next_y = float_context.next_y_fitting(
+                    candidate_y,
+                    required_width,
+                    candidate_height,
+                    position.x,
+                    position.x + available_width,
+                );
                 if next_y <= candidate_y + 0.001 {
                     resolved = candidate;
                     horizontal = candidate_horizontal;
@@ -245,19 +386,30 @@ pub(crate) fn layout_block_children(engine: &mut LayoutEngine<'_, '_>, parent_id
                 probe_height = candidate_height;
             }
             if !selected {
-                let measured = crate::layout::measure_resolved_box_isolated(engine, resolved.clone());
-                let placement = float_context.place_margin_box(original_y, measured.width + horizontal.total, measured.height.max(1.0), position.x, position.x + available_width);
+                let measured =
+                    crate::layout::measure_resolved_box_isolated(engine, resolved.clone());
+                let placement = float_context.place_margin_box(
+                    original_y,
+                    measured.width + horizontal.total,
+                    measured.height.max(1.0),
+                    position.x,
+                    position.x + available_width,
+                );
                 child_pos = Point::new(placement.left + horizontal.left, placement.y);
             }
             y_offset += child_pos.y - original_y;
         }
         engine.geometry.set_point(child_idx, child_pos);
-        let inherited_hypothetical_margin = (item.profile.collapses_through && !pending_margin.is_empty()).then_some(position.y + y_offset + pending_margin.resolve());
+        let inherited_hypothetical_margin = (item.profile.collapses_through
+            && !pending_margin.is_empty())
+        .then_some(position.y + y_offset + pending_margin.resolve());
         if let Some(floor) = inherited_hypothetical_margin {
             engine.floats.push_hypothetical_clearance_floor(floor);
         }
         if runtime_leading_clearance_rewind.abs() > 0.001 {
-            engine.floats.push_hypothetical_clearance_rewind(runtime_leading_clearance_rewind);
+            engine
+                .floats
+                .push_hypothetical_clearance_rewind(runtime_leading_clearance_rewind);
         }
         let child_layout = engine.layout_resolved_box(resolved);
         if runtime_leading_clearance_rewind.abs() > 0.001 {
@@ -268,9 +420,26 @@ pub(crate) fn layout_block_children(engine: &mut LayoutEngine<'_, '_>, parent_id
         }
         let child_size = child_layout.size;
         let output = child_layout.output;
-        let used_after_margin = if runtime_leading_clearance { item.profile.after } else { engine.margins.used_after_margin(&engine.reader, child_idx, available_width, parent_content_height) };
+        let used_after_margin = if runtime_leading_clearance {
+            item.profile.after
+        } else {
+            engine.margins.used_after_margin(
+                &engine.reader,
+                child_idx,
+                available_width,
+                parent_content_height,
+            )
+        };
 
-        y_offset += offset_after_layout(engine, child_idx, child_size, &output, previous_block.as_ref(), fragment_height, &mut child_pos);
+        y_offset += offset_after_layout(
+            engine,
+            child_idx,
+            child_size,
+            &output,
+            previous_block.as_ref(),
+            fragment_height,
+            &mut child_pos,
+        );
 
         max_width = max_width.max(child_size.width + horizontal.total);
 
@@ -294,7 +463,12 @@ pub(crate) fn layout_block_children(engine: &mut LayoutEngine<'_, '_>, parent_id
         }
 
         y_offset += child_size.height;
-        y_offset += offset_for_forced_break_after(child_style.break_after(), position.y + y_offset, fragment_height, engine.config.book_optimized_text());
+        y_offset += offset_for_forced_break_after(
+            child_style.break_after(),
+            position.y + y_offset,
+            fragment_height,
+            engine.config.book_optimized_text(),
+        );
         pending_margin.merge(used_after_margin);
         clearance_margin_barrier = false;
         clearance_consumed_margin = 0.0;
@@ -304,13 +478,24 @@ pub(crate) fn layout_block_children(engine: &mut LayoutEngine<'_, '_>, parent_id
         previous_block = Some(make_previous_block(engine, child_idx, child_pos, output));
     }
 
-    y_offset += remaining_parent_margin(pending_margin, parent_ctx, clearance_margin_barrier, clearance_consumed_margin);
+    y_offset += remaining_parent_margin(
+        pending_margin,
+        parent_ctx,
+        clearance_margin_barrier,
+        clearance_consumed_margin,
+    );
     if clearance_margin_barrier {
         // The clearance-separated chain was consumed into this box's used
         // height. Do not let the static trailing-margin analysis expose it a
         // second time to the parent.
-        let own_after = MarginStrut::from_margin(parent_style.margin_bottom().resolve(parent_cb_width));
-        engine.margins.record_used_after_margin(parent_idx, parent_cb_width, parent_content_height, own_after);
+        let own_after =
+            MarginStrut::from_margin(parent_style.margin_bottom().resolve(parent_cb_width));
+        engine.margins.record_used_after_margin(
+            parent_idx,
+            parent_cb_width,
+            parent_content_height,
+            own_after,
+        );
     }
 
     let size = Size::new(max_width, y_offset);
@@ -320,10 +505,22 @@ pub(crate) fn layout_block_children(engine: &mut LayoutEngine<'_, '_>, parent_id
 
 /// `cb_width` is the containing-block inline-size for `box_idx` (its parent's
 /// content width), against which this box's margin percentages resolve.
-fn block_flow_item(engine: &mut LayoutEngine<'_, '_>, box_idx: usize, cb_width: f64) -> BlockFlowItem {
-    let is_anonymous = matches!(engine.reader.box_layout_mode(box_idx), Some(BoxType::Anonymous(_)));
-    let profile = engine.margins.margin_profile(&engine.reader, box_idx, cb_width);
-    BlockFlowItem { profile, is_anonymous }
+fn block_flow_item(
+    engine: &mut LayoutEngine<'_, '_>,
+    box_idx: usize,
+    cb_width: f64,
+) -> BlockFlowItem {
+    let is_anonymous = matches!(
+        engine.reader.box_layout_mode(box_idx),
+        Some(BoxType::Anonymous(_))
+    );
+    let profile = engine
+        .margins
+        .margin_profile(&engine.reader, box_idx, cb_width);
+    BlockFlowItem {
+        profile,
+        is_anonymous,
+    }
 }
 
 fn calculate_child_indent(box_type: &BoxType, indent_remaining: &mut f64) -> f64 {
@@ -359,18 +556,29 @@ mod tests {
     fn layout_document_with_css(html: &str, css: Option<&str>) -> LaidOutDocument {
         let mut factory = DocumentFactory::new();
         let mut glyphs = TestGlyphShaper::new();
-        factory.parse_with_new_pipeline(html, css).shape(&mut glyphs).expect("test glyphs shape").layout(crate::LayoutConstraints::new(300.0, 16.0).unwrap())
+        factory
+            .parse_with_new_pipeline(html, css)
+            .shape(&mut glyphs)
+            .expect("test glyphs shape")
+            .layout(crate::LayoutConstraints::new(300.0, 16.0).unwrap())
     }
 
     fn geometry(document: &LaidOutDocument, id: &str) -> (Point, Size) {
         let view = document.render_view();
-        let box_idx = (0..view.boxes().len()).find(|idx| view.boxes().id(*idx).map(|value| view.string(value)) == Some(id)).unwrap_or_else(|| panic!("missing box #{id}"));
-        (view.boxes().point(box_idx).expect("box index in range"), view.boxes().size(box_idx).expect("box index in range"))
+        let box_idx = (0..view.boxes().len())
+            .find(|idx| view.boxes().id(*idx).map(|value| view.string(value)) == Some(id))
+            .unwrap_or_else(|| panic!("missing box #{id}"));
+        (
+            view.boxes().point(box_idx).expect("box index in range"),
+            view.boxes().size(box_idx).expect("box index in range"),
+        )
     }
 
     #[test]
     fn adjoining_sibling_margins_use_the_largest_positive_value() {
-        let document = layout_html("<div id='first' style='height:10px;margin-bottom:30px'></div><div id='second' style='height:10px;margin-top:20px'></div>");
+        let document = layout_html(
+            "<div id='first' style='height:10px;margin-bottom:30px'></div><div id='second' style='height:10px;margin-top:20px'></div>",
+        );
         let (first, first_size) = geometry(&document, "first");
         let (second, _) = geometry(&document, "second");
 
@@ -379,7 +587,9 @@ mod tests {
 
     #[test]
     fn adjoining_positive_and_negative_margins_sum_their_extremes() {
-        let document = layout_html("<div id='first' style='height:10px;margin-bottom:30px'></div><div id='second' style='height:10px;margin-top:-10px'></div>");
+        let document = layout_html(
+            "<div id='first' style='height:10px;margin-bottom:30px'></div><div id='second' style='height:10px;margin-top:-10px'></div>",
+        );
         let (first, first_size) = geometry(&document, "first");
         let (second, _) = geometry(&document, "second");
 
@@ -388,7 +598,9 @@ mod tests {
 
     #[test]
     fn first_child_margin_collapses_with_parent_even_when_child_has_a_border() {
-        let document = layout_html("<div id='anchor' style='height:10px'></div><div id='parent' style='margin-top:30px'><div id='child' style='height:10px;margin-top:50px;border-top:1px solid'></div></div>");
+        let document = layout_html(
+            "<div id='anchor' style='height:10px'></div><div id='parent' style='margin-top:30px'><div id='child' style='height:10px;margin-top:50px;border-top:1px solid'></div></div>",
+        );
         let (anchor, anchor_size) = geometry(&document, "anchor");
         let (parent, _) = geometry(&document, "parent");
         let (child, _) = geometry(&document, "child");
@@ -399,7 +611,9 @@ mod tests {
 
     #[test]
     fn nested_empty_blocks_collapse_through_one_adjoining_set() {
-        let document = layout_html("<div id='first' style='height:10px;margin-bottom:10px'></div><div id='empty' style='height:0;margin-top:30px;margin-bottom:40px'></div><div id='last' style='height:10px;margin-top:20px'></div>");
+        let document = layout_html(
+            "<div id='first' style='height:10px;margin-bottom:10px'></div><div id='empty' style='height:0;margin-top:30px;margin-bottom:40px'></div><div id='last' style='height:10px;margin-top:20px'></div>",
+        );
         let (first, first_size) = geometry(&document, "first");
         let (last, _) = geometry(&document, "last");
 
@@ -408,7 +622,9 @@ mod tests {
 
     #[test]
     fn parent_border_prevents_child_margin_from_escaping() {
-        let document = layout_html("<div id='parent' style='border-top:5px solid'><div id='child' style='height:10px;margin-top:30px'></div></div>");
+        let document = layout_html(
+            "<div id='parent' style='border-top:5px solid'><div id='child' style='height:10px;margin-top:30px'></div></div>",
+        );
         let (parent, _) = geometry(&document, "parent");
         let (child, _) = geometry(&document, "child");
 
@@ -417,7 +633,9 @@ mod tests {
 
     #[test]
     fn overflow_formatting_context_contains_child_margin() {
-        let document = layout_html("<div id='parent' style='overflow:hidden'><div id='child' style='height:10px;margin-top:30px'></div></div>");
+        let document = layout_html(
+            "<div id='parent' style='overflow:hidden'><div id='child' style='height:10px;margin-top:30px'></div></div>",
+        );
         let (parent, _) = geometry(&document, "parent");
         let (child, _) = geometry(&document, "child");
 
@@ -426,7 +644,9 @@ mod tests {
 
     #[test]
     fn float_margins_do_not_collapse_with_the_preceding_block_margin() {
-        let document = layout_html("<div id='first' style='height:10px;margin-bottom:20px'></div><div id='float' style='float:left;width:10px;height:10px;margin-top:15px'></div>");
+        let document = layout_html(
+            "<div id='first' style='height:10px;margin-bottom:20px'></div><div id='float' style='float:left;width:10px;height:10px;margin-top:15px'></div>",
+        );
         let (first, first_size) = geometry(&document, "first");
         let (float, _) = geometry(&document, "float");
 
@@ -435,7 +655,9 @@ mod tests {
 
     #[test]
     fn nested_float_keeps_the_preceding_adjoining_margin_position() {
-        let document = layout_html("<div id='first' style='height:10px;margin-bottom:20px'></div><div><div id='float' style='float:left;width:10px;height:10px;margin-top:15px'></div></div>");
+        let document = layout_html(
+            "<div id='first' style='height:10px;margin-bottom:20px'></div><div><div id='float' style='float:left;width:10px;height:10px;margin-top:15px'></div></div>",
+        );
         let (first, first_size) = geometry(&document, "first");
         let (float, _) = geometry(&document, "float");
 
@@ -470,7 +692,10 @@ mod tests {
         let (image, _) = geometry(&document, "image");
 
         assert_eq!(wrapper.y, first.y + first_size.height + 20.0);
-        assert!((image.y - wrapper.y).abs() < 1.0, "wrapper={wrapper:?} image={image:?}");
+        assert!(
+            (image.y - wrapper.y).abs() < 1.0,
+            "wrapper={wrapper:?} image={image:?}"
+        );
     }
 
     #[test]
@@ -486,7 +711,9 @@ mod tests {
 
     #[test]
     fn nonzero_min_height_prevents_empty_block_collapse_through() {
-        let document = layout_html("<div id='first' style='height:10px'></div><div id='empty' style='min-height:1px;margin-top:20px;margin-bottom:30px'></div><div id='last' style='height:10px'></div>");
+        let document = layout_html(
+            "<div id='first' style='height:10px'></div><div id='empty' style='min-height:1px;margin-top:20px;margin-bottom:30px'></div><div id='last' style='height:10px'></div>",
+        );
         let (first, first_size) = geometry(&document, "first");
         let (last, _) = geometry(&document, "last");
 
@@ -495,7 +722,9 @@ mod tests {
 
     #[test]
     fn nonzero_min_height_does_not_close_the_parent_last_child_edge() {
-        let document = layout_html("<div id='parent' style='min-height:10px;margin-bottom:20px'><div id='child' style='height:10px;margin-bottom:30px'></div></div><div id='next' style='height:10px'></div>");
+        let document = layout_html(
+            "<div id='parent' style='min-height:10px;margin-bottom:20px'><div id='child' style='height:10px;margin-bottom:30px'></div></div><div id='next' style='height:10px'></div>",
+        );
         let (parent, parent_size) = geometry(&document, "parent");
         let (next, _) = geometry(&document, "next");
 
@@ -505,7 +734,9 @@ mod tests {
 
     #[test]
     fn binding_min_height_closes_the_parent_last_child_edge() {
-        let document = layout_html("<div id='parent' style='min-height:50px;margin-bottom:20px'><div id='child' style='margin-bottom:30px'></div></div><div id='next' style='height:10px'></div>");
+        let document = layout_html(
+            "<div id='parent' style='min-height:50px;margin-bottom:20px'><div id='child' style='margin-bottom:30px'></div></div><div id='next' style='height:10px'></div>",
+        );
         let (parent, parent_size) = geometry(&document, "parent");
         let (next, _) = geometry(&document, "next");
 
@@ -541,7 +772,9 @@ mod tests {
 
     #[test]
     fn binding_max_height_closes_the_parent_last_child_edge() {
-        let document = layout_html("<div id='parent' style='max-height:50px'><div id='child' style='height:51px;margin-bottom:10px'></div></div><div id='next' style='height:50px'></div>");
+        let document = layout_html(
+            "<div id='parent' style='max-height:50px'><div id='child' style='height:51px;margin-bottom:10px'></div></div><div id='next' style='height:50px'></div>",
+        );
         let (parent, parent_size) = geometry(&document, "parent");
         let (next, _) = geometry(&document, "next");
 
@@ -551,7 +784,9 @@ mod tests {
 
     #[test]
     fn root_margin_does_not_collapse_with_the_first_descendant_margin() {
-        let document = layout_document("<html style='margin-top:20px'><body style='margin:0'><div id='child' style='height:10px;margin-top:20px'></div></body></html>");
+        let document = layout_document(
+            "<html style='margin-top:20px'><body style='margin:0'><div id='child' style='height:10px;margin-top:20px'></div></body></html>",
+        );
         let (child, _) = geometry(&document, "child");
 
         assert_eq!(child.y, 40.0);
@@ -559,7 +794,9 @@ mod tests {
 
     #[test]
     fn body_and_first_child_top_margins_collapse_normally() {
-        let document = layout_document("<html style='margin:0'><body style='margin-top:40px'><div id='child' style='height:10px;margin-top:40px'></div></body></html>");
+        let document = layout_document(
+            "<html style='margin:0'><body style='margin-top:40px'><div id='child' style='height:10px;margin-top:40px'></div></body></html>",
+        );
         let (child, _) = geometry(&document, "child");
 
         assert_eq!(child.y, 40.0);
@@ -567,16 +804,23 @@ mod tests {
 
     #[test]
     fn collapsed_child_margin_is_considered_before_clearance() {
-        let document = layout_html("<div id='float' style='float:left;width:10px;height:50px'></div><div id='cleared' style='clear:left'><div id='child' style='height:50px;margin-top:50px'></div></div>");
+        let document = layout_html(
+            "<div id='float' style='float:left;width:10px;height:50px'></div><div id='cleared' style='clear:left'><div id='child' style='height:50px;margin-top:50px'></div></div>",
+        );
         let (float, _) = geometry(&document, "float");
         let (child, _) = geometry(&document, "child");
 
-        assert_eq!(child.y, float.y, "the already-sufficient collapsed margin must not receive extra clearance");
+        assert_eq!(
+            child.y, float.y,
+            "the already-sufficient collapsed margin must not receive extra clearance"
+        );
     }
 
     #[test]
     fn actual_clearance_places_the_border_edge_at_the_float_bottom_once() {
-        let document = layout_html("<div id='float' style='float:left;width:10px;height:50px'></div><div id='cleared' style='clear:left;height:10px;margin-top:10px'></div>");
+        let document = layout_html(
+            "<div id='float' style='float:left;width:10px;height:50px'></div><div id='cleared' style='clear:left;height:10px;margin-top:10px'></div>",
+        );
         let (float, float_size) = geometry(&document, "float");
         let (cleared, _) = geometry(&document, "cleared");
 
@@ -623,7 +867,10 @@ mod tests {
         let (cleared, cleared_size) = geometry(&document, "cleared-chain");
         let (next, _) = geometry(&document, "next");
 
-        assert_eq!(parent_size.height, 201.0, "parent={parent:?} cleared={cleared:?}/{cleared_size:?} next={next:?}");
+        assert_eq!(
+            parent_size.height, 201.0,
+            "parent={parent:?} cleared={cleared:?}/{cleared_size:?} next={next:?}"
+        );
         assert_eq!(next.y, parent.y + parent_size.height);
     }
 
@@ -663,7 +910,10 @@ mod tests {
         let (zero, zero_size) = geometry(&document, "zero");
         let (cleared, cleared_size) = geometry(&document, "cleared");
 
-        assert_eq!(green_size.height, 50.0, "green={green:?} zero={zero:?}/{zero_size:?} cleared={cleared:?}/{cleared_size:?} lower={lower:?}");
+        assert_eq!(
+            green_size.height, 50.0,
+            "green={green:?} zero={zero:?}/{zero_size:?} cleared={cleared:?}/{cleared_size:?} lower={lower:?}"
+        );
         assert_eq!(lower.y, green.y + green_size.height);
     }
 
@@ -688,7 +938,11 @@ mod tests {
         let (lower, _) = geometry(&document, "lower");
 
         assert_eq!(float.y, outer.y);
-        assert_eq!(green.y, float.y + float_size.height - 50.0, "outer={outer:?} float={float:?}/{float_size:?} green={green:?}/{green_size:?} lower={lower:?}");
+        assert_eq!(
+            green.y,
+            float.y + float_size.height - 50.0,
+            "outer={outer:?} float={float:?}/{float_size:?} green={green:?}/{green_size:?} lower={lower:?}"
+        );
         assert_eq!(lower.y, green.y + green_size.height);
     }
 
@@ -703,34 +957,51 @@ mod tests {
         let (first, _) = geometry(&document, "first");
         let (second, _) = geometry(&document, "second");
 
-        assert_eq!(second.y, first.y, "clearance belongs above the top margin, so the negative margin pulls the border box back over the first float");
+        assert_eq!(
+            second.y, first.y,
+            "clearance belongs above the top margin, so the negative margin pulls the border box back over the first float"
+        );
     }
 
     #[test]
     fn inline_float_starts_at_its_paragraphs_first_line() {
-        let document = layout_html("<p id='paragraph'><span id='float' style='float:left'>PA</span>SS</p>");
+        let document =
+            layout_html("<p id='paragraph'><span id='float' style='float:left'>PA</span>SS</p>");
         let (paragraph, _) = geometry(&document, "paragraph");
         let (float, _) = geometry(&document, "float");
 
-        assert_eq!(float.y, paragraph.y, "an inline float at the start of a paragraph must use the first line's source position");
+        assert_eq!(
+            float.y, paragraph.y,
+            "an inline float at the start of a paragraph must use the first line's source position"
+        );
     }
 
     #[test]
     fn full_width_inline_float_after_text_starts_below_that_line() {
-        let document = layout_html("<p id='paragraph' style='width:100px;font-size:5px'>H<span id='float' style='float:left;width:100px;height:20px'></span></p>");
+        let document = layout_html(
+            "<p id='paragraph' style='width:100px;font-size:5px'>H<span id='float' style='float:left;width:100px;height:20px'></span></p>",
+        );
         let (paragraph, _) = geometry(&document, "paragraph");
         let (float, _) = geometry(&document, "float");
 
-        assert!(float.y > paragraph.y, "paragraph={paragraph:?} float={float:?}");
+        assert!(
+            float.y > paragraph.y,
+            "paragraph={paragraph:?} float={float:?}"
+        );
     }
 
     #[test]
     fn inline_float_after_text_shares_the_line_when_both_fit() {
-        let document = layout_html("<p id='paragraph' style='width:200px;font-size:5px'>H<span id='float' style='float:right;width:100px;height:20px'></span></p>");
+        let document = layout_html(
+            "<p id='paragraph' style='width:200px;font-size:5px'>H<span id='float' style='float:right;width:100px;height:20px'></span></p>",
+        );
         let (paragraph, _) = geometry(&document, "paragraph");
         let (float, _) = geometry(&document, "float");
 
-        assert_eq!(float.y, paragraph.y, "paragraph={paragraph:?} float={float:?}");
+        assert_eq!(
+            float.y, paragraph.y,
+            "paragraph={paragraph:?} float={float:?}"
+        );
     }
 
     #[test]
@@ -747,14 +1018,33 @@ mod tests {
         assert_eq!(two.y, one.y + one_size.height);
         assert_eq!(three.y, two.y + two_size.height);
         let text = document.render_view().text();
-        let painted_lines = text.lines().iter().filter(|line| !line.glyphs().is_empty()).collect::<Vec<_>>();
-        assert_eq!(painted_lines.len(), 3, "each floated paragraph must retain its painted line");
-        let line_bottoms = text.lines().iter().map(|line| line.point().y + line.height()).collect::<Vec<_>>();
-        assert!(line_bottoms.windows(2).all(|pair| pair[0] <= pair[1]), "physical line storage must remain spatially searchable: {line_bottoms:?}");
+        let painted_lines = text
+            .lines()
+            .iter()
+            .filter(|line| !line.glyphs().is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            painted_lines.len(),
+            3,
+            "each floated paragraph must retain its painted line"
+        );
+        let line_bottoms = text
+            .lines()
+            .iter()
+            .map(|line| line.point().y + line.height())
+            .collect::<Vec<_>>();
+        assert!(
+            line_bottoms.windows(2).all(|pair| pair[0] <= pair[1]),
+            "physical line storage must remain spatially searchable: {line_bottoms:?}"
+        );
         let paint_order = text.paint_order_indices();
         let mut covered = paint_order.to_vec();
         covered.sort_unstable();
-        assert_eq!(covered, (0..text.line_count() as u32).collect::<Vec<_>>(), "paint traversal must cover every spatial line exactly once");
+        assert_eq!(
+            covered,
+            (0..text.line_count() as u32).collect::<Vec<_>>(),
+            "paint traversal must cover every spatial line exactly once"
+        );
         // These floats are both sourced and positioned top-to-bottom, so the
         // valid paint traversal may equal spatial order. Non-spatial stacking
         // is covered by the positioned z-index and overlapping-inline tests.
@@ -778,7 +1068,10 @@ mod tests {
         let (d, d_size) = geometry(&document, "d");
         let (e, _) = geometry(&document, "e");
 
-        assert_eq!([a_size.width, b_size.width, c_size.width, d_size.width], [50.0; 4]);
+        assert_eq!(
+            [a_size.width, b_size.width, c_size.width, d_size.width],
+            [50.0; 4]
+        );
         assert_eq!([a.x, b.x, c.x, d.x], [0.0, 50.0, 100.0, 150.0]);
         assert_eq!(e, Point::new(0.0, a.y + 50.0));
     }

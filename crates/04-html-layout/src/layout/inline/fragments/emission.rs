@@ -576,6 +576,8 @@ pub(super) fn write_line_fragments(
             optical_offset_x: line.optical_offset_x,
             paint_color,
             text_fragments,
+            prepared_text_runs: 0..0,
+            native_text_runs_complete: false,
             inline_box_fragments,
         });
         layout.line_output.line_glyph_offsets.push(Vec::new());

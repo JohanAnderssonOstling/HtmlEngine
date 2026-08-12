@@ -1,5 +1,9 @@
 use super::{AncestorIter, LaidOutDocument};
-use crate::layout_model::{AnchorPosition, DecorationFragment, DecorationStore, EllipsisFragment, GlyphAdvanceRun, GlyphId, GlyphOffsetRun, HyphenFragment, ImageFragment, InlineItem, InlineItemKind, LayoutMode, Line, ListItemMarker};
+use crate::layout_model::{
+    AnchorPosition, DecorationFragment, DecorationStore, EllipsisFragment, GlyphAdvanceRun,
+    GlyphId, GlyphOffsetRun, HyphenFragment, ImageFragment, InlineItem, InlineItemKind, LayoutMode,
+    Line, ListItemMarker,
+};
 use html_dom::{Document, ImageResource, NodeRef};
 use html_style_model::{ListStylePosition, TextDecorationLines, UsedBorderRadii};
 use kurbo::{Point, Size};
@@ -11,12 +15,23 @@ mod boxes;
 mod fragments;
 mod text;
 
-pub use addressing::{RenderAddressingView, RenderAnchorPosition, RenderAnchorPositions, SourceElementStep, SourcePosition};
-pub use boxes::{BoxTextFormat, RenderBoxView, RenderForcedBreak, RenderListItemMarker, RenderTable, RenderTableCell, RenderTableRow};
-pub use fragments::{RenderDecoration, RenderDecorationPattern, RenderDecorations, RenderFragmentView, RenderImageFragment, RenderImageFragments, RenderOverflowClip};
+pub use addressing::{
+    RenderAddressingView, RenderAnchorPosition, RenderAnchorPositions, SourceElementStep,
+    SourcePosition,
+};
+pub use boxes::{
+    BoxTextFormat, RenderBoxView, RenderForcedBreak, RenderListItemMarker, RenderTable,
+    RenderTableCell, RenderTableRow,
+};
+pub use fragments::{
+    RenderDecoration, RenderDecorationPattern, RenderDecorations, RenderFragmentView,
+    RenderImageFragment, RenderImageFragments, RenderOverflowClip,
+};
 pub use text::{
-    RenderAuthoritativeTextRun, RenderEllipsisFragment, RenderGlyphAdvanceRun, RenderGlyphAdvanceRuns, RenderGlyphOffsetRun, RenderGlyphOffsetRuns, RenderHyphenFragment, RenderLine, RenderLineTextFragment, RenderLineTextFragments,
-    RenderLines, RenderTextRun, RenderTextRuns, RenderTextView,
+    RenderAuthoritativeTextRun, RenderEllipsisFragment, RenderGlyphAdvanceRun,
+    RenderGlyphAdvanceRuns, RenderGlyphOffsetRun, RenderGlyphOffsetRuns, RenderHyphenFragment,
+    RenderLine, RenderLineTextFragment, RenderLineTextFragments, RenderLines, RenderTextRun,
+    RenderTextRuns, RenderTextView,
 };
 #[derive(Clone, Debug, Default)]
 pub struct ImageMetrics {
@@ -45,7 +60,9 @@ impl ImageMetrics {
     }
 
     pub(crate) fn display_size(&self, image_idx: u32, resource: &ImageResource) -> (f64, f64) {
-        let (width, height) = self.get(image_idx).unwrap_or((resource.width, resource.height));
+        let (width, height) = self
+            .get(image_idx)
+            .unwrap_or((resource.width, resource.height));
         // HTML dimension attributes are CSS presentational hints, not natural
         // image dimensions. They are resolved by the style/layout sizing path;
         // folding them into the decoded metrics here would also change the
@@ -69,7 +86,13 @@ mod image_metrics_tests {
 
     #[test]
     fn html_dimensions_do_not_replace_decoded_intrinsic_metrics() {
-        let resource = ImageResource { source: ImageSource::Uri("image.png".to_owned()), width: 320, height: 180, width_attr: Some(10), height_attr: Some(20) };
+        let resource = ImageResource {
+            source: ImageSource::Uri("image.png".to_owned()),
+            width: 320,
+            height: 180,
+            width_attr: Some(10),
+            height_attr: Some(20),
+        };
         let mut metrics = ImageMetrics::default();
 
         assert_eq!(metrics.display_size(0, &resource), (320.0, 180.0));
@@ -112,16 +135,28 @@ impl<'a> RenderView<'a> {
     /// drawable layer is an image that this renderer cannot paint yet.
     pub fn canvas_background_color(&self) -> Option<u32> {
         let root_box = self.doc.inputs.layout_tree.root_box()?;
-        let root_indices = self.doc.inputs.layout_tree.get_box_style_indices(root_box)?;
+        let root_indices = self
+            .doc
+            .inputs
+            .layout_tree
+            .get_box_style_indices(root_box)?;
         let root = self.doc.inputs.styles.view(root_indices)?;
         if root.background_image_present() || root.background_color() & 0xFF != 0 {
-            return (root.visibility() == html_style_model::Visibility::Visible && root.background_color() & 0xFF != 0).then_some(root.background_color());
+            return (root.visibility() == html_style_model::Visibility::Visible
+                && root.background_color() & 0xFF != 0)
+                .then_some(root.background_color());
         }
 
         let body_box = self.doc.inputs.layout_tree.body_box()?;
-        let body_indices = self.doc.inputs.layout_tree.get_box_style_indices(body_box)?;
+        let body_indices = self
+            .doc
+            .inputs
+            .layout_tree
+            .get_box_style_indices(body_box)?;
         let body = self.doc.inputs.styles.view(body_indices)?;
-        (body.visibility() == html_style_model::Visibility::Visible && body.background_color() & 0xFF != 0).then_some(body.background_color())
+        (body.visibility() == html_style_model::Visibility::Visible
+            && body.background_color() & 0xFF != 0)
+            .then_some(body.background_color())
     }
 
     pub fn title(&self) -> Option<&'a str> {
@@ -133,7 +168,14 @@ impl<'a> RenderView<'a> {
     }
 
     pub fn image_uri(&self, image_idx: u32) -> Option<&'a str> {
-        match &self.doc.inputs.document.images().get(image_idx as usize)?.source {
+        match &self
+            .doc
+            .inputs
+            .document
+            .images()
+            .get(image_idx as usize)?
+            .source
+        {
             html_dom::ImageSource::Uri(uri) => Some(uri.as_str()),
             html_dom::ImageSource::Inline(_) => None,
         }

@@ -6,7 +6,13 @@ use super::{FinalizationScratch, FragmentWriter, GeometryWriter, LayoutReader};
 /// Resolves overflow ownership once layout geometry is final. The common
 /// `overflow: visible` path leaves both output vectors empty; renderers can
 /// therefore test one slice and continue without issuing clip commands.
-pub(super) fn rebuild_overflow_clips(reader: &LayoutReader<'_>, geometry: &GeometryWriter<'_>, fragments: &mut FragmentWriter<'_>, scratch: &mut FinalizationScratch, track_overflow_clips: bool) {
+pub(super) fn rebuild_overflow_clips(
+    reader: &LayoutReader<'_>,
+    geometry: &GeometryWriter<'_>,
+    fragments: &mut FragmentWriter<'_>,
+    scratch: &mut FinalizationScratch,
+    track_overflow_clips: bool,
+) {
     let box_count = reader.box_count();
     if !track_overflow_clips {
         let (layout, line_owners, decoration_owners) = fragments.finalization_parts();
@@ -48,7 +54,11 @@ pub(super) fn rebuild_overflow_clips(reader: &LayoutReader<'_>, geometry: &Geome
                 } else {
                     b.rect.y1
                 };
-                Some(OverflowClip { rect: Rect::new(x0, y0, x1.max(x0), y1.max(y0)), x: a.x || b.x, y: a.y || b.y })
+                Some(OverflowClip {
+                    rect: Rect::new(x0, y0, x1.max(x0), y1.max(y0)),
+                    x: a.x || b.x,
+                    y: a.y || b.y,
+                })
             }
             (Some(a), None) => Some(a),
             (None, Some(b)) => Some(b),
@@ -66,7 +76,10 @@ pub(super) fn rebuild_overflow_clips(reader: &LayoutReader<'_>, geometry: &Geome
     content_clips.fill(None);
     for idx in 0..box_count {
         let parent_clip = reader.get_parent(idx).and_then(|parent| {
-            debug_assert!(parent < idx, "layout boxes must be stored in parent-before-child order");
+            debug_assert!(
+                parent < idx,
+                "layout boxes must be stored in parent-before-child order"
+            );
             content_clips.get(parent).copied().flatten()
         });
         let style = reader.style(idx);
@@ -80,23 +93,47 @@ pub(super) fn rebuild_overflow_clips(reader: &LayoutReader<'_>, geometry: &Geome
             let top = style.border_top_width() as f64;
             let right = style.border_right_width() as f64;
             let bottom = style.border_bottom_width() as f64;
-            OverflowClip { rect: Rect::new(point.x + left, point.y + top, (point.x + size.width - right).max(point.x + left), (point.y + size.height - bottom).max(point.y + top)), x: clip_x, y: clip_y }
+            OverflowClip {
+                rect: Rect::new(
+                    point.x + left,
+                    point.y + top,
+                    (point.x + size.width - right).max(point.x + left),
+                    (point.y + size.height - bottom).max(point.y + top),
+                ),
+                x: clip_x,
+                y: clip_y,
+            }
         });
         content_clips[idx] = combine(parent_clip, own_clip);
     }
 
-    assert_eq!(line_owners.len(), layout.line_output.lines.len(), "every final line must retain its owner until clip resolution");
-    assert_eq!(decoration_owners.len(), layout.fragment_output.decorations.len(), "every final decoration must retain its owner until clip resolution");
+    assert_eq!(
+        line_owners.len(),
+        layout.line_output.lines.len(),
+        "every final line must retain its owner until clip resolution"
+    );
+    assert_eq!(
+        decoration_owners.len(),
+        layout.fragment_output.decorations.len(),
+        "every final decoration must retain its owner until clip resolution"
+    );
     let mut line_clips = std::mem::take(&mut layout.line_output.line_clips);
     line_clips.clear();
-    line_clips.extend(line_owners.iter().map(|&owner| content_clips.get(owner as usize).copied().flatten()));
+    line_clips.extend(
+        line_owners
+            .iter()
+            .map(|&owner| content_clips.get(owner as usize).copied().flatten()),
+    );
     let mut decoration_clips = std::mem::take(&mut layout.fragment_output.decoration_clips);
     decoration_clips.clear();
-    decoration_clips.extend(decoration_owners.iter().map(|&owner| reader.get_parent(owner as usize).and_then(|parent| content_clips.get(parent).copied().flatten())));
+    decoration_clips.extend(decoration_owners.iter().map(|&owner| {
+        reader
+            .get_parent(owner as usize)
+            .and_then(|parent| content_clips.get(parent).copied().flatten())
+    }));
     layout.line_output.line_clips = line_clips;
     layout.fragment_output.decoration_clips = decoration_clips;
     scratch.content_clips = content_clips;
     line_owners.clear();
     decoration_owners.clear();
 }
-

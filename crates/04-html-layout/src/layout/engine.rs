@@ -1,4 +1,6 @@
-use crate::layout_model::{BoxGeometry, GlyphId, GlyphMetrics, InlineContent, LayoutState, LayoutTree};
+use crate::layout_model::{
+    BoxGeometry, GlyphId, GlyphMetrics, InlineContent, LayoutState, LayoutTree,
+};
 use html_dom::Document;
 use html_style_model::ComputedStyles;
 use kurbo::Point;
@@ -18,16 +20,39 @@ use super::{
     finalization::FinalizationScratch,
 };
 
-pub(crate) fn layout_with_timings(inputs: LayoutInputs<'_>, outputs: LayoutOutputs<'_>, constraints: crate::LayoutConstraints, timings: Option<&mut LayoutTimings>) {
+pub(crate) fn layout_with_timings(
+    inputs: LayoutInputs<'_>,
+    outputs: LayoutOutputs<'_>,
+    constraints: crate::LayoutConstraints,
+    timings: Option<&mut LayoutTimings>,
+) {
     // Keep telemetry owned by the layout session. `record_timing` is called
     // through shared references throughout recursive layout, so interior
     // mutability provides the narrow safe capability that the old raw pointer
     // was approximating.
     let collected_timings = timings.as_deref().cloned().map(RefCell::new);
-    let LayoutOutputs { geometry, state, scratch } = outputs;
-    let reader = LayoutReader::new(inputs.document, inputs.styles, inputs.topology, inputs.inline_content, inputs.glyph_metrics, inputs.font_metrics, inputs.image_metrics);
+    let LayoutOutputs {
+        geometry,
+        state,
+        scratch,
+    } = outputs;
+    let reader = LayoutReader::new(
+        inputs.document,
+        inputs.styles,
+        inputs.topology,
+        inputs.inline_content,
+        inputs.glyph_metrics,
+        inputs.font_metrics,
+        inputs.image_metrics,
+    );
     let track_overflow_clips = reader.tracks_overflow_clips();
-    let text = InlineReader::new(inputs.inline_content, inputs.glyph_metrics, inputs.text_geometry, inputs.ellipsis_glyphs, inputs.hyphen_glyphs);
+    let text = InlineReader::new(
+        inputs.inline_content,
+        inputs.glyph_metrics,
+        inputs.text_geometry,
+        inputs.ellipsis_glyphs,
+        inputs.hyphen_glyphs,
+    );
     let mut context = LayoutEngine {
         config: LayoutConfig::new(constraints),
         floats: std::mem::take(&mut scratch.floats),
@@ -40,7 +65,11 @@ pub(crate) fn layout_with_timings(inputs: LayoutInputs<'_>, outputs: LayoutOutpu
         reader,
         text,
         geometry: GeometryWriter::new(geometry),
-        fragments: FragmentWriter::new(state, std::mem::take(&mut scratch.line_owners), std::mem::take(&mut scratch.block_decoration_owners)),
+        fragments: FragmentWriter::new(
+            state,
+            std::mem::take(&mut scratch.line_owners),
+            std::mem::take(&mut scratch.block_decoration_owners),
+        ),
         placement: std::mem::take(&mut scratch.placement),
         inline_plans: inputs.inline_plans,
         fragmentation_suppression_depth: 0,
@@ -50,7 +79,10 @@ pub(crate) fn layout_with_timings(inputs: LayoutInputs<'_>, outputs: LayoutOutpu
     if let (Some(destination), Some(collected)) = (timings, context.timings.take()) {
         *destination = collected.into_inner();
     }
-    context.fragments.recycle_owner_storage(&mut scratch.line_owners, &mut scratch.block_decoration_owners);
+    context.fragments.recycle_owner_storage(
+        &mut scratch.line_owners,
+        &mut scratch.block_decoration_owners,
+    );
     scratch.placement = std::mem::take(&mut context.placement);
     scratch.floats = std::mem::take(&mut context.floats);
     scratch.margins = std::mem::take(&mut context.margins);
@@ -85,8 +117,16 @@ impl Clone for LayoutScratch {
 
 impl LayoutScratch {
     #[cfg(test)]
-    pub(crate) fn allocation_capacities(&self) -> ((usize, usize), (usize, usize, usize, usize, usize, usize)) {
-        ((self.line_owners.capacity(), self.block_decoration_owners.capacity()), self.finalization.allocation_capacities())
+    pub(crate) fn allocation_capacities(
+        &self,
+    ) -> ((usize, usize), (usize, usize, usize, usize, usize, usize)) {
+        (
+            (
+                self.line_owners.capacity(),
+                self.block_decoration_owners.capacity(),
+            ),
+            self.finalization.allocation_capacities(),
+        )
     }
 }
 
@@ -185,8 +225,13 @@ impl<'a, 'out> LayoutEngine<'a, 'out> {
         self.fragments.push_line_owner(&mut self.placement, owner);
     }
 
-    pub(crate) fn push_block_decoration(&mut self, owner: u32, decoration: crate::layout_model::DecorationFragment) {
-        self.fragments.push_block_decoration(&mut self.placement, owner, decoration);
+    pub(crate) fn push_block_decoration(
+        &mut self,
+        owner: u32,
+        decoration: crate::layout_model::DecorationFragment,
+    ) {
+        self.fragments
+            .push_block_decoration(&mut self.placement, owner, decoration);
     }
 
     pub(crate) fn natural_content_height(&self, box_idx: usize) -> f64 {
@@ -202,12 +247,16 @@ impl<'a, 'out> LayoutEngine<'a, 'out> {
     pub(crate) fn without_fragmentation<R>(&mut self, layout: impl FnOnce(&mut Self) -> R) -> R {
         self.fragmentation_suppression_depth += 1;
         let result = layout(self);
-        self.fragmentation_suppression_depth = self.fragmentation_suppression_depth.saturating_sub(1);
+        self.fragmentation_suppression_depth =
+            self.fragmentation_suppression_depth.saturating_sub(1);
         result
     }
 
     pub(crate) fn fragment_height(&self) -> Option<f64> {
-        (self.fragmentation_suppression_depth == 0).then(|| self.config.viewport_height()).flatten().filter(|height| *height > 0.0)
+        (self.fragmentation_suppression_depth == 0)
+            .then(|| self.config.viewport_height())
+            .flatten()
+            .filter(|height| *height > 0.0)
     }
 
     fn run(&mut self) {
@@ -228,12 +277,23 @@ impl<'a, 'out> LayoutEngine<'a, 'out> {
             // Unlike ordinary boxes, it has no parent flow to consume those
             // margins; place its border box explicitly inside the canvas.
             let root_style = self.reader.style(root_box);
-            let root_origin = Point::new(root_style.margin_left().resolve(self.config.viewport_width()), root_style.margin_top().resolve(self.config.viewport_width()));
+            let root_origin = Point::new(
+                root_style
+                    .margin_left()
+                    .resolve(self.config.viewport_width()),
+                root_style
+                    .margin_top()
+                    .resolve(self.config.viewport_width()),
+            );
             if root_style.position() == html_style_model::PositionMode::Absolute {
                 super::absolute_positioning::defer(self, root_box, Point::ZERO);
             } else {
                 self.geometry.set_point(root_box, root_origin);
-                let _ = self.layout_box(super::BoxLayoutRequest::normal(root_box, self.config.viewport_width(), self.config.viewport_height()));
+                let _ = self.layout_box(super::BoxLayoutRequest::normal(
+                    root_box,
+                    self.config.viewport_width(),
+                    self.config.viewport_height(),
+                ));
             }
             super::absolute_positioning::layout_initial_containing_block(self);
             let elapsed = start.elapsed();

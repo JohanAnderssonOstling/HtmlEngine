@@ -116,6 +116,11 @@ impl CompiledSelectors {
     }
 
     #[inline]
+    pub(crate) fn is_context_free(&self, selector: PreparedSelector) -> bool {
+        selector.fast_len == 1
+    }
+
+    #[inline]
     pub(crate) fn matches(
         &self,
         selector: PreparedSelector,

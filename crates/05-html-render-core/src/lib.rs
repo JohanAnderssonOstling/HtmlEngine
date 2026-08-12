@@ -1,4 +1,6 @@
-use html_layout::{GlyphId, GlyphShaper, LaidOutDocument, TextRunId, UsedBorderRadii};
+use html_layout::{
+    GlyphId, GlyphShaper, LaidOutDocument, PreparedTextRunFragment, TextRunId, UsedBorderRadii,
+};
 use html_pipeline::{
     FontEnvironmentRevision, ImageMetricsRevision, LayoutConstraints, PaintSettingsRevision,
     PipelineInputs, PipelineSession, ResourceRevision, SourceRevision, StyleEnvironment,
@@ -116,6 +118,34 @@ pub trait Painter {
                 fragment.range(),
                 fragment.origin(),
                 fragment.color(),
+            );
+        }
+    }
+    /// Draws layout-prepared, line-relative shaped-run slices.
+    ///
+    /// The default translates the retained fragments without allocating an
+    /// intermediate display list. Backends may override this to submit the
+    /// complete line as one native batch.
+    fn draw_prepared_text_run_batch(
+        &mut self,
+        fragments: &[PreparedTextRunFragment],
+        line_origin: Point,
+        scale: f64,
+        color: Option<u32>,
+    ) {
+        let scale = if scale.is_finite() && scale > 0.0 {
+            scale
+        } else {
+            1.0
+        };
+        let snap = |value: f64| (value * scale).round() / scale;
+        for fragment in fragments {
+            let offset = fragment.offset();
+            self.draw_text_run_fragment(
+                fragment.run(),
+                fragment.range(),
+                Point::new(line_origin.x + offset.x, snap(line_origin.y + offset.y)),
+                color,
             );
         }
     }
@@ -751,6 +781,11 @@ pub fn paint_line_text_runs(
         return false;
     }
     let text = document.render_view().text();
+    if let Some(fragments) = text.prepared_text_runs(line_idx) {
+        painter.draw_prepared_text_run_batch(fragments, origin, scale, color);
+        paint_line_ellipsis(document, line_idx, origin, scale, color, painter);
+        return true;
+    }
     let Some(line) = text.line(line_idx) else {
         return false;
     };
@@ -1349,7 +1384,9 @@ impl ResourceProvider for DenyResourceProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use html_layout::{FontSlant, GlyphMetric, GlyphRegistry, ShapeError};
+    use html_layout::{
+        FontSlant, GlyphMetric, GlyphRegistry, ShapeError, ShapedTextRun, TextRunShapeRequest,
+    };
     use std::collections::HashMap;
 
     #[derive(Default)]
@@ -1388,6 +1425,128 @@ mod tests {
             self.glyphs.insert(key, glyph);
             Ok(glyph)
         }
+    }
+
+    #[derive(Default)]
+    struct NativeTestShaper {
+        fallback: TestShaper,
+        next_run: TextRunId,
+    }
+
+    impl GlyphShaper for NativeTestShaper {
+        fn reset(&mut self) {
+            self.fallback.reset();
+            self.next_run = 0;
+        }
+
+        fn shape_glyph<'a>(
+            &mut self,
+            glyph_metrics: &mut GlyphRegistry<'a>,
+            character: char,
+            font_size: f32,
+            font_weight: u16,
+            font_slant: FontSlant,
+            color: u32,
+            family: Option<&str>,
+        ) -> Result<GlyphId, ShapeError> {
+            self.fallback.shape_glyph(
+                glyph_metrics,
+                character,
+                font_size,
+                font_weight,
+                font_slant,
+                color,
+                family,
+            )
+        }
+
+        fn shape_text_run(
+            &mut self,
+            request: TextRunShapeRequest<'_>,
+        ) -> Result<Option<ShapedTextRun>, ShapeError> {
+            let count = request.text().chars().count();
+            let advances = vec![8.0; count];
+            let caret_stops = (0..=count)
+                .map(|index| index as f32 * 8.0)
+                .collect::<Vec<_>>();
+            let run = self.next_run;
+            self.next_run += 1;
+            Ok(ShapedTextRun::with_backend_run(
+                Arc::from(advances),
+                Arc::from(vec![true; count + 1]),
+                run,
+                Arc::from(caret_stops),
+                12.0,
+            ))
+        }
+    }
+
+    #[derive(Default)]
+    struct PreparedBatchPainter {
+        prepared_calls: usize,
+        fragments: usize,
+        scalar_glyphs: usize,
+    }
+
+    impl Painter for PreparedBatchPainter {
+        fn fill_rect(&mut self, _rect: Rect, _color: Color) {}
+
+        fn draw_glyph(&mut self, _glyph: GlyphId, _origin: Point) {
+            self.scalar_glyphs += 1;
+        }
+
+        fn supports_text_runs(&self) -> bool {
+            true
+        }
+
+        fn draw_prepared_text_run_batch(
+            &mut self,
+            fragments: &[PreparedTextRunFragment],
+            _line_origin: Point,
+            _scale: f64,
+            _color: Option<u32>,
+        ) {
+            self.prepared_calls += 1;
+            self.fragments += fragments.len();
+        }
+
+        fn draw_image(&mut self, _image: &Image, _hash: &[u8], _rect: Rect) {}
+    }
+
+    #[test]
+    fn native_line_paint_replays_layout_prepared_run_fragments() {
+        let mut renderer = FragmentRenderer::new();
+        let mut shaper = NativeTestShaper::default();
+        let options = FragmentRenderOptions::new(200.0, None).unwrap();
+        let rendered = renderer
+            .render("<p>prepared native text</p>", &options, &mut shaper)
+            .unwrap();
+        let text = rendered.document().render_view().text();
+        let line_idx = text
+            .lines()
+            .iter()
+            .position(|line| !line.glyphs().is_empty())
+            .expect("fixture emits text");
+        assert!(
+            text.prepared_text_runs(line_idx).is_some(),
+            "layout retains authoritative run slices"
+        );
+
+        let mut painter = PreparedBatchPainter::default();
+        assert!(paint_line_text_runs(
+            rendered.document(),
+            line_idx,
+            Point::new(10.0, 20.0),
+            1.0,
+            None,
+            &mut painter
+        ));
+        assert_eq!(painter.prepared_calls, 1);
+        assert!(painter.fragments > 0);
+        assert_eq!(
+            painter.scalar_glyphs, 0,
+            "native coverage never falls back to scalar glyph painting"
+        );
     }
 
     #[derive(Default)]

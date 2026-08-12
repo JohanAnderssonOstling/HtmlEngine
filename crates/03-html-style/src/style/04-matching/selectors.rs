@@ -133,6 +133,11 @@ impl SelectorIndex {
     }
 
     #[inline]
+    pub(crate) fn selector_is_context_free(&self, selector: PreparedSelector) -> bool {
+        self.compiled.is_context_free(selector)
+    }
+
+    #[inline]
     pub(crate) fn matches_fast_selector(&self, selector: PreparedSelector, doc: &Document, node: DomNodeId) -> Option<bool> {
         self.compiled.matches(selector, doc, node)
     }

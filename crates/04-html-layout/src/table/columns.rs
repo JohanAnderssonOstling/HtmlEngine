@@ -29,7 +29,9 @@ pub(super) struct TableColumnLayout {
     pub(super) table_width: f64,
 }
 
-pub(super) fn build_table_grid(rows: impl IntoIterator<Item = Vec<(usize, usize, usize)>>) -> TableGrid {
+pub(super) fn build_table_grid(
+    rows: impl IntoIterator<Item = Vec<(usize, usize, usize)>>,
+) -> TableGrid {
     let mut placements = Vec::new();
     let mut carry_rowspans: Vec<usize> = Vec::new();
     let mut max_columns = 0usize;
@@ -61,13 +63,23 @@ pub(super) fn build_table_grid(rows: impl IntoIterator<Item = Vec<(usize, usize,
             for covered_col in col..end_col {
                 carry_rowspans[covered_col] = carry_rowspans[covered_col].max(rowspan);
             }
-            placements.push(TableCellPlacement { cell_idx, row: row_idx, col, colspan, source_colspan: colspan, rowspan });
+            placements.push(TableCellPlacement {
+                cell_idx,
+                row: row_idx,
+                col,
+                colspan,
+                source_colspan: colspan,
+                rowspan,
+            });
             col = end_col;
             max_columns = max_columns.max(end_col);
         }
     }
 
-    TableGrid { placements, column_count: max_columns }
+    TableGrid {
+        placements,
+        column_count: max_columns,
+    }
 }
 
 pub(super) fn span_extent(starts: &[f64], sizes: &[f64], start: usize, span: usize) -> f64 {

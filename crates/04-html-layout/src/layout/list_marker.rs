@@ -23,7 +23,9 @@ pub(crate) fn marker_text(list_style_type: ListStyleType, ordinal: i64) -> Optio
     }
     let body = match list_style_type {
         ListStyleType::None => return None,
-        ListStyleType::Disc | ListStyleType::Circle | ListStyleType::Square => unreachable!("handled by bullet_char"),
+        ListStyleType::Disc | ListStyleType::Circle | ListStyleType::Square => {
+            unreachable!("handled by bullet_char")
+        }
         ListStyleType::Decimal => decimal(ordinal),
         ListStyleType::DecimalLeadingZero => decimal_leading_zero(ordinal),
         ListStyleType::LowerAlpha => alphabetic(ordinal, false),
@@ -40,7 +42,13 @@ pub(crate) fn counter_text(style: CounterStyle, value: i64) -> String {
         CounterStyle::DecimalLeadingZero => decimal_leading_zero(value),
         CounterStyle::LowerRoman => roman(value, false),
         CounterStyle::UpperRoman => roman(value, true),
-        CounterStyle::LowerGreek => alphabetic_chars(value, &['α', 'β', 'γ', 'δ', 'ε', 'ζ', 'η', 'θ', 'ι', 'κ', 'λ', 'μ', 'ν', 'ξ', 'ο', 'π', 'ρ', 'σ', 'τ', 'υ', 'φ', 'χ', 'ψ', 'ω']),
+        CounterStyle::LowerGreek => alphabetic_chars(
+            value,
+            &[
+                'α', 'β', 'γ', 'δ', 'ε', 'ζ', 'η', 'θ', 'ι', 'κ', 'λ', 'μ', 'ν', 'ξ', 'ο', 'π',
+                'ρ', 'σ', 'τ', 'υ', 'φ', 'χ', 'ψ', 'ω',
+            ],
+        ),
         CounterStyle::LowerAlpha => alphabetic(value, false),
         CounterStyle::UpperAlpha => alphabetic(value, true),
         CounterStyle::Armenian => additive(value, &ARMENIAN_NUMERALS),
@@ -197,7 +205,21 @@ fn roman(n: i64, upper: bool) -> String {
     if !(1..=3999).contains(&n) {
         return decimal(n);
     }
-    const TABLE: [(i64, &str); 13] = [(1000, "m"), (900, "cm"), (500, "d"), (400, "cd"), (100, "c"), (90, "xc"), (50, "l"), (40, "xl"), (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i")];
+    const TABLE: [(i64, &str); 13] = [
+        (1000, "m"),
+        (900, "cm"),
+        (500, "d"),
+        (400, "cd"),
+        (100, "c"),
+        (90, "xc"),
+        (50, "l"),
+        (40, "xl"),
+        (10, "x"),
+        (9, "ix"),
+        (5, "v"),
+        (4, "iv"),
+        (1, "i"),
+    ];
     let mut remaining = n;
     let mut out = String::new();
     for (value, numeral) in TABLE {
