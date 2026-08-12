@@ -6,6 +6,7 @@ use html_dom::{Document, MemoryUsageReport};
 use html_style_model::{ComputedStyles, ComputedStylesValidationError, StyleIndices};
 use rustc_data_structures::fx::FxHashMap;
 use std::fmt;
+use std::time::{Duration, Instant};
 
 #[path = "stages_output/mod.rs"]
 mod output;
@@ -27,7 +28,7 @@ mod semantics;
 pub(crate) use html_dom::element_is_note_target;
 pub use lifecycle::{
     ImageSizingPolicy, LaidOutDocument, LayoutConstraintError, LayoutConstraints, NoteFlow,
-    PrepareError, PreparedDocument, ShapedDocument, TextCompositionPolicy,
+    PrepareError, PreparedDocument, ShapeLayoutTimings, ShapedDocument, TextCompositionPolicy,
 };
 pub(crate) use lifecycle::{PreparedInputs, ShapedText};
 use semantics::{LinkGlyphTarget, box_id, collect_anchor_glyphs, collect_link_glyph_targets};

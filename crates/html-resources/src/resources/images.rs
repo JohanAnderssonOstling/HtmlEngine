@@ -99,12 +99,17 @@ impl ImageService {
             completion_waker: None,
         }));
         let (bytes_tx, bytes_rx) = mpsc::channel();
-        let (decode_tx, decode_rx) = mpsc::channel();
+        let decoder_count = image_decoder_worker_count();
+        let mut decode_txs = Vec::with_capacity(decoder_count);
+        for _ in 0..decoder_count {
+            let (decode_tx, decode_rx) = mpsc::channel();
+            decode_txs.push(decode_tx);
+            let decode_state = state.clone();
+            thread::spawn(move || decode_worker(decode_rx, decode_state));
+        }
 
         let bytes_state = state.clone();
-        thread::spawn(move || bytes_worker(provider, bytes_rx, decode_tx, bytes_state));
-        let decode_state = state.clone();
-        thread::spawn(move || decode_worker(decode_rx, decode_state));
+        thread::spawn(move || bytes_worker(provider, bytes_rx, decode_txs, bytes_state));
         Self { state, bytes_tx }
     }
 
@@ -289,13 +294,16 @@ impl ImagePipeline {
 fn bytes_worker(
     provider: Arc<dyn ResourceProvider>,
     rx: mpsc::Receiver<BytesRequest>,
-    tx: mpsc::Sender<DecodeRequest>,
+    decode_txs: Vec<mpsc::Sender<DecodeRequest>>,
     state: Arc<Mutex<SharedState>>,
 ) {
+    let mut next_decoder = 0;
     while let Ok(request) = rx.recv() {
         match load_bytes(provider.as_ref(), &request.source) {
             Ok(bytes) => {
-                if tx
+                let decoder = next_decoder;
+                next_decoder = (next_decoder + 1) % decode_txs.len();
+                if decode_txs[decoder]
                     .send(DecodeRequest {
                         key: request.key.clone(),
                         bytes: Arc::new(bytes),
@@ -320,6 +328,15 @@ fn bytes_worker(
             }
         }
     }
+}
+
+fn image_decoder_worker_count() -> usize {
+    // Keep one logical CPU available for parsing/layout and avoid creating a
+    // large pool on desktop systems. A two-core reader retains one decoder;
+    // larger systems can decode several independent images concurrently.
+    thread::available_parallelism().map_or(1, |parallelism| {
+        parallelism.get().saturating_sub(1).clamp(1, 4)
+    })
 }
 
 fn decode_worker(rx: mpsc::Receiver<DecodeRequest>, state: Arc<Mutex<SharedState>>) {

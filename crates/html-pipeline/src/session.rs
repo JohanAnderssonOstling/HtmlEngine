@@ -143,12 +143,14 @@ impl PipelineSession {
                 let (prepared, media_queries) = self
                     .factory
                     .build_pipeline_from_parsed_with_media_queries(&parsed, &user_styles);
-                let (shaped, laid_out) = self.shape_and_layout(
+                let (shaped, laid_out, shape_layout_timings) = self.shape_and_layout(
                     &prepared,
                     layout_constraints,
                     &requested_inputs.image_metrics,
                     glyph_shaper,
                 )?;
+                timings.shape_time += shape_layout_timings.shape;
+                timings.layout_time += shape_layout_timings.layout;
                 rebuilt_media_queries = Some(media_queries);
 
                 self.cache.parsed = Some(parsed.clone());
@@ -183,12 +185,14 @@ impl PipelineSession {
                     .factory
                     .build_pipeline_from_parsed_with_media_queries(&parsed, &user_styles);
 
-                let (shaped, laid_out) = self.shape_and_layout(
+                let (shaped, laid_out, shape_layout_timings) = self.shape_and_layout(
                     &prepared,
                     layout_constraints,
                     &requested_inputs.image_metrics,
                     glyph_shaper,
                 )?;
+                timings.shape_time += shape_layout_timings.shape;
+                timings.layout_time += shape_layout_timings.layout;
                 rebuilt_media_queries = Some(media_queries);
 
                 self.cache.parsed = Some(parsed);
@@ -220,12 +224,14 @@ impl PipelineSession {
                     &prepared_key,
                     &requested_inputs.user_styles,
                 );
-                let (shaped, laid_out) = self.shape_and_layout(
+                let (shaped, laid_out, shape_layout_timings) = self.shape_and_layout(
                     &prepared,
                     layout_constraints,
                     &requested_inputs.image_metrics,
                     glyph_shaper,
                 )?;
+                timings.shape_time += shape_layout_timings.shape;
+                timings.layout_time += shape_layout_timings.layout;
                 rebuilt_media_queries = media_queries;
 
                 self.cache.parsed = Some(parsed);
@@ -266,8 +272,13 @@ impl PipelineSession {
                     &requested_inputs.user_styles,
                 );
                 let shaped_reused = self.cache.shaped_matches(&shaped_key);
+                let shape_started = Instant::now();
                 let shaped =
                     self.shape_from_cache_or_rebuild(&prepared, &shaped_key, glyph_shaper)?;
+                if !shaped_reused {
+                    timings.shape_time += shape_started.elapsed();
+                }
+                let layout_started = Instant::now();
                 self.relayout_laid_out(
                     layout_constraints,
                     &requested_inputs.image_metrics,
@@ -276,6 +287,7 @@ impl PipelineSession {
                     &shaped,
                     glyph_shaper,
                 )?;
+                timings.layout_time += layout_started.elapsed();
                 rebuilt_media_queries = media_queries;
 
                 self.cache.parsed = Some(parsed);
@@ -372,9 +384,11 @@ impl PipelineSession {
         timings.stage_reuses = stage_reuses;
         timings.retained_bytes = self.cache.retained_bytes;
         println!(
-            "HTML_PIPELINE_UPDATE phase=complete stage={requested_stage:?} total_ms={} decision_ms={} runs={stage_runs:?} reuses={stage_reuses:?} retained_bytes={}",
+            "HTML_PIPELINE_UPDATE phase=complete stage={requested_stage:?} total_ms={} decision_ms={} shape_us={} layout_us={} runs={stage_runs:?} reuses={stage_reuses:?} retained_bytes={}",
             update_started.elapsed().as_millis(),
             timings.decision_time.as_millis(),
+            timings.shape_time.as_micros(),
+            timings.layout_time.as_micros(),
             timings.retained_bytes.total(),
         );
         Ok(PipelineUpdate {
@@ -409,7 +423,7 @@ impl PipelineSession {
                 "cannot rehydrate a pipeline session without a prepared document".to_owned(),
             )
         })?;
-        let (shaped, laid_out) = self.shape_and_layout(
+        let (shaped, laid_out, _) = self.shape_and_layout(
             &prepared,
             to_layout_constraints(inputs.layout),
             &inputs.image_metrics,
@@ -715,9 +729,20 @@ impl PipelineSession {
         constraints: LayoutConstraintsOutput,
         image_metrics: &html_layout::ImageMetrics,
         glyph_shaper: &mut impl LayoutGlyphShaper,
-    ) -> Result<(ShapedDocument, LaidOutDocument), PipelineError> {
+    ) -> Result<
+        (
+            ShapedDocument,
+            LaidOutDocument,
+            html_layout::ShapeLayoutTimings,
+        ),
+        PipelineError,
+    > {
         prepared
-            .shape_and_layout_with_metrics_and_shaper(constraints, image_metrics, glyph_shaper)
+            .shape_and_layout_with_metrics_and_shaper_timed(
+                constraints,
+                image_metrics,
+                glyph_shaper,
+            )
             .map_err(|error| PipelineError(error.to_string()))
     }
 
@@ -1866,16 +1891,22 @@ mod tests {
         );
         let update = session.update(input.clone(), &mut shaper).unwrap();
         assert_eq!(update.stage, EarliestStage::Parse);
+        assert!(!update.timings.shape_time.is_zero());
+        assert!(!update.timings.layout_time.is_zero());
 
         let after_parse_calls = shaper.calls;
         let mut next = input.clone();
         next.layout.viewport_width = 450.0;
         let width_update_1 = session.update(next.clone(), &mut shaper).unwrap();
         assert_eq!(width_update_1.stage, EarliestStage::Layout);
+        assert!(width_update_1.timings.shape_time.is_zero());
+        assert!(!width_update_1.timings.layout_time.is_zero());
         assert_eq!(shaper.calls, after_parse_calls);
 
         let no_change = session.update(next.clone(), &mut shaper).unwrap();
         assert_eq!(no_change.stage, EarliestStage::Paint);
+        assert!(no_change.timings.shape_time.is_zero());
+        assert!(no_change.timings.layout_time.is_zero());
         assert_eq!(shaper.calls, after_parse_calls);
 
         next.layout.viewport_width = 640.0;

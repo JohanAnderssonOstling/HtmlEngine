@@ -229,6 +229,14 @@ pub struct ShapedDocument {
     pub(super) shaped: std::sync::Arc<ShapedText>,
 }
 
+/// Wall time spent in the two renderer-resource phases of an explicitly timed
+/// shape-and-layout operation.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ShapeLayoutTimings {
+    pub shape: Duration,
+    pub layout: Duration,
+}
+
 impl PreparedDocument {
     pub fn try_new(document: Document, styles: ComputedStyles) -> Result<Self, PrepareError> {
         Self::try_new_with_note_flow(document, styles, NoteFlow::default())
@@ -431,6 +439,36 @@ impl PreparedDocument {
                 glyph_shaper,
             )?;
             Ok((shaped, laid_out))
+        });
+        if result.is_ok() {
+            glyph_shaper.commit_document_shaping();
+        } else {
+            glyph_shaper.rollback_document_shaping();
+        }
+        result
+    }
+
+    /// Timed form of [`Self::shape_and_layout_with_metrics_and_shaper`]. Clock
+    /// reads are kept out of the ordinary layout API.
+    pub fn shape_and_layout_with_metrics_and_shaper_timed(
+        &self,
+        constraints: LayoutConstraints,
+        image_metrics: &ImageMetrics,
+        glyph_shaper: &mut impl crate::GlyphShaper,
+    ) -> Result<(ShapedDocument, LaidOutDocument, ShapeLayoutTimings), crate::ShapeError> {
+        glyph_shaper.begin_document_shaping();
+        let mut timings = ShapeLayoutTimings::default();
+        let shape_started = Instant::now();
+        let result = self.shape_active_document(glyph_shaper).and_then(|shaped| {
+            timings.shape = shape_started.elapsed();
+            let layout_started = Instant::now();
+            let laid_out = shaped.clone().layout_with_metrics_and_shaper(
+                constraints,
+                image_metrics,
+                glyph_shaper,
+            )?;
+            timings.layout = layout_started.elapsed();
+            Ok((shaped, laid_out, timings))
         });
         if result.is_ok() {
             glyph_shaper.commit_document_shaping();

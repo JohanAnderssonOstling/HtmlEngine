@@ -67,8 +67,8 @@ pub use stages::{
     RenderGlyphOffsetRun, RenderGlyphOffsetRuns, RenderHyphenFragment, RenderImageFragment,
     RenderImageFragments, RenderLine, RenderLineTextFragment, RenderLineTextFragments, RenderLines,
     RenderListItemMarker, RenderOverflowClip, RenderTable, RenderTableCell, RenderTableRow,
-    RenderTextRun, RenderTextRuns, RenderTextView, RenderView, ShapedDocument, SourceElementStep,
-    SourcePosition, TextCompositionPolicy,
+    RenderTextRun, RenderTextRuns, RenderTextView, RenderView, ShapeLayoutTimings, ShapedDocument,
+    SourceElementStep, SourcePosition, TextCompositionPolicy,
 };
 
 #[cfg(test)]

@@ -354,11 +354,13 @@ pub struct PipelineTimings {
     pub stage_runs: PipelineStageCounts,
     pub stage_reuses: PipelineStageCounts,
     pub retained_bytes: PipelineRetainedBytes,
+    pub shape_time: Duration,
+    pub layout_time: Duration,
 }
 
 impl Default for PipelineTimings {
     fn default() -> Self {
-        Self { change_cause: PipelineChangeMask::empty(), decision_time: Duration::ZERO, stage_runs: PipelineStageCounts::default(), stage_reuses: PipelineStageCounts::default(), retained_bytes: PipelineRetainedBytes::default() }
+        Self { change_cause: PipelineChangeMask::empty(), decision_time: Duration::ZERO, stage_runs: PipelineStageCounts::default(), stage_reuses: PipelineStageCounts::default(), retained_bytes: PipelineRetainedBytes::default(), shape_time: Duration::ZERO, layout_time: Duration::ZERO }
     }
 }
 
@@ -603,6 +605,8 @@ impl PipelineUpdate {
                 stage_runs: PipelineStageCounts { parsed: 1, styled: 1, prepared: 1, shaped: 1, laid_out: 1, paint: 0 },
                 stage_reuses: PipelineStageCounts::default(),
                 retained_bytes: PipelineRetainedBytes::default(),
+                shape_time: Duration::ZERO,
+                layout_time: Duration::ZERO,
             },
             report: ReuseReport { parsed: Reuse::RECOMPUTED, styled: Reuse::RECOMPUTED, prepared: Reuse::RECOMPUTED, shaped: Reuse::RECOMPUTED, laid_out: Reuse::RECOMPUTED },
             anchors_preserved: false,
