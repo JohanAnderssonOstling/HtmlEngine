@@ -38,3 +38,8 @@ Production code denies `unsafe_code` and the crate denies `unreachable_pub`.
 Run `bash HtmlRenderer/scripts/check-html-boundaries.sh` from the workspace root
 after boundary changes.
 Text tests use deterministic metrics and require no windowing framework.
+
+Independent table-cell measurement can use worker-owned layout arenas without
+changing deterministic publication order. Embedders opt in per layout through
+`LayoutConstraints::with_parallel_workers`; small workloads remain sequential
+to avoid dispatch overhead.

@@ -378,6 +378,8 @@ impl ParallelMeasurementContext<'_> {
         point: Point,
         request: crate::layout::BoxLayoutRequest,
     ) -> ParallelBoxMeasurement {
+        #[cfg(test)]
+        super::parallel::record_worker();
         let scratch = &mut worker.scratch;
         let mut engine = LayoutEngine {
             config: self.config,

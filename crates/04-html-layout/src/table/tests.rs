@@ -50,21 +50,38 @@ mod tests {
 
     #[test]
     fn parallel_cell_measurement_matches_sequential_layout() {
-        let html = "<html><body style='margin:0'><table style='width:320px;border-collapse:collapse'><tr><td id='a' style='padding:3px;border:1px solid'><div style='height:50%;overflow:hidden'>alpha alpha alpha alpha</div></td><td id='b' style='padding:4px;border:1px solid'><div style='height:50%;overflow:hidden'>beta beta beta beta</div></td></tr><tr><td id='c' style='padding:2px;border:1px solid'><div style='height:50%;overflow:hidden'>gamma gamma gamma</div></td><td id='d' style='padding:5px;border:1px solid'><div style='height:50%;overflow:hidden'>delta delta delta</div></td></tr><tr><td id='e'><div style='height:50%;overflow:hidden'>epsilon epsilon</div></td><td id='f'><div style='height:50%;overflow:hidden'>zeta zeta</div></td></tr><tr><td id='g'><div style='height:50%;overflow:hidden'>eta eta</div></td><td id='h'><div style='height:50%;overflow:hidden'>theta theta</div></td></tr></table></body></html>";
+        let mut html = String::from("<html><body style='margin:0'><table style='width:320px;border-collapse:collapse'>");
+        for row in 0..4 {
+            html.push_str("<tr>");
+            for column in 0..2 {
+                html.push_str(&format!("<td id='cell-{row}-{column}' style='padding:3px;border:1px solid'><div style='height:50%;overflow:hidden'>"));
+                for word in 0..96 {
+                    html.push_str(&format!(" deterministic{word}"));
+                }
+                html.push_str("</div></td>");
+            }
+            html.push_str("</tr>");
+        }
+        html.push_str("</table></body></html>");
         let mut factory = DocumentFactory::new();
         let mut glyphs = TestGlyphShaper::new();
         let shaped = factory
-            .parse_with_new_pipeline(html, None)
+            .parse_with_new_pipeline(&html, None)
             .shape(&mut glyphs)
             .expect("test glyphs shape");
         let sequential = shaped
             .clone()
             .layout(LayoutConstraints::new(360.0, 16.0).unwrap());
+        let workers = std::thread::available_parallelism().map_or(1, usize::from).min(4);
+        crate::layout::reset_observed_workers();
         let parallel = shaped.layout(
             LayoutConstraints::new(360.0, 16.0)
                 .unwrap()
-                .with_parallel_workers(4),
+                .with_parallel_workers(workers),
         );
+        if workers > 1 {
+            assert!(crate::layout::observed_worker_count() > 1, "measurement must execute on multiple worker threads");
+        }
 
         let sequential_view = sequential.render_view();
         let parallel_view = parallel.render_view();
@@ -79,6 +96,21 @@ mod tests {
         let sequential_decorations = sequential_view.fragments().decorations().iter().map(|fragment| (fragment.rect(), fragment.color())).collect::<Vec<_>>();
         let parallel_decorations = parallel_view.fragments().decorations().iter().map(|fragment| (fragment.rect(), fragment.color())).collect::<Vec<_>>();
         assert_eq!(sequential_decorations, parallel_decorations);
+    }
+
+    #[test]
+    fn small_cell_measurements_stay_sequential_below_the_work_threshold() {
+        let mut html = String::from("<html><body><table>");
+        for _ in 0..4 {
+            html.push_str("<tr><td><div style='height:50%;overflow:hidden'>a</div></td><td><div style='height:50%;overflow:hidden'>b</div></td></tr>");
+        }
+        html.push_str("</table></body></html>");
+        let mut factory = DocumentFactory::new();
+        let mut glyphs = TestGlyphShaper::new();
+        let shaped = factory.parse_with_new_pipeline(&html, None).shape(&mut glyphs).expect("test glyphs shape");
+        crate::layout::reset_observed_workers();
+        let _ = shaped.layout(LayoutConstraints::new(360.0, 16.0).unwrap().with_parallel_workers(4));
+        assert_eq!(crate::layout::observed_worker_count(), 0, "small tables must avoid parallel dispatch overhead");
     }
 
     #[test]

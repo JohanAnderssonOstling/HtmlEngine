@@ -4,6 +4,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 static POOLS: OnceLock<Mutex<HashMap<usize, Arc<ThreadPool>>>> = OnceLock::new();
 
+#[cfg(test)]
+static OBSERVED_WORKERS: std::sync::LazyLock<
+    Mutex<std::collections::HashSet<std::thread::ThreadId>>,
+> = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
 /// Runs dependency-independent layout work on a reusable, size-specific pool.
 /// Keeping pools outside documents avoids retaining operating-system threads
 /// in every cached layout while still making the worker cap deterministic.
@@ -26,4 +31,28 @@ pub(crate) fn install<R: Send>(workers: usize, operation: impl FnOnce() -> R + S
             .clone()
     };
     pool.install(operation)
+}
+
+#[cfg(test)]
+pub(crate) fn record_worker() {
+    OBSERVED_WORKERS
+        .lock()
+        .expect("parallel-layout observation lock poisoned")
+        .insert(std::thread::current().id());
+}
+
+#[cfg(test)]
+pub(crate) fn reset_observed_workers() {
+    OBSERVED_WORKERS
+        .lock()
+        .expect("parallel-layout observation lock poisoned")
+        .clear();
+}
+
+#[cfg(test)]
+pub(crate) fn observed_worker_count() -> usize {
+    OBSERVED_WORKERS
+        .lock()
+        .expect("parallel-layout observation lock poisoned")
+        .len()
 }

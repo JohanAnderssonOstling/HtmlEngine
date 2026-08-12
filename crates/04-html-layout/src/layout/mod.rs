@@ -48,6 +48,8 @@ pub(crate) use fragment_writer::{FragmentWriter, OutputRanges};
 pub(crate) use inline::PreparedInlinePlans;
 pub(crate) use placement::PlacementState;
 pub(crate) use parallel::install as install_parallel;
+#[cfg(test)]
+pub(crate) use parallel::{observed_worker_count, reset_observed_workers};
 pub(crate) use intrinsic_sizing::{
     box_content_intrinsic_widths, box_intrinsic_widths, contains_full_width_percentage_table,
     percentage_height_image_width,

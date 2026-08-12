@@ -7,12 +7,14 @@ use kurbo::{Point, Size, Vec2};
 use rayon::prelude::*;
 
 const PARALLEL_CELL_MIN_TASKS: usize = 8;
+const PARALLEL_CELL_MIN_GLYPHS: usize = 4_096;
 
 #[derive(Clone, Copy)]
 struct ParallelCellTask {
     index: usize,
     point: Point,
     request: crate::layout::BoxLayoutRequest,
+    glyph_cost: usize,
 }
 
 pub(super) struct PreparedTableCells {
@@ -108,6 +110,7 @@ pub(super) fn prepare_cells(
                     index,
                     point: provisional_point,
                     request,
+                    glyph_cost: cell_subtree_glyph_cost(session, placement.cell_idx),
                 });
                 (Size::ZERO, None)
             } else {
@@ -123,7 +126,10 @@ pub(super) fn prepare_cells(
     }
 
     if !parallel_tasks.is_empty() {
-        if parallel_tasks.len() >= PARALLEL_CELL_MIN_TASKS {
+        let glyph_cost = parallel_tasks.iter().map(|task| task.glyph_cost).sum::<usize>();
+        if parallel_tasks.len() >= PARALLEL_CELL_MIN_TASKS
+            && glyph_cost >= PARALLEL_CELL_MIN_GLYPHS
+        {
             let context = session.parallel_measurement_context();
             let measurements = crate::layout::install_parallel(parallel_workers, || {
                 parallel_tasks
@@ -170,6 +176,60 @@ pub(super) fn prepare_cells(
         row_baselines,
         layouts,
     }
+}
+
+fn cell_subtree_glyph_cost(session: &LayoutEngine<'_, '_>, box_idx: usize) -> usize {
+    fn children_cost(session: &LayoutEngine<'_, '_>, children: &Children) -> usize {
+        match children {
+            Children::Blocks(children) => children
+                .iter()
+                .map(|&child| box_cost(session, child as usize))
+                .sum(),
+            Children::InlineItems(range) => range
+                .clone()
+                .filter_map(|item_idx| session.text.inline_item(item_idx as usize))
+                .map(|item| match &item.kind {
+                    crate::layout_model::InlineItemKind::Text { glyphs } => glyphs.len(),
+                    crate::layout_model::InlineItemKind::AtomicBox { box_idx } => {
+                        box_cost(session, *box_idx as usize)
+                    }
+                    _ => 1,
+                })
+                .sum(),
+            Children::Empty => 0,
+        }
+    }
+
+    fn box_cost(session: &LayoutEngine<'_, '_>, box_idx: usize) -> usize {
+        match session.reader.box_layout_mode(box_idx) {
+            Some(LayoutMode::Block(block)) => children_cost(session, &block.children),
+            Some(LayoutMode::TableCell(cell)) => children_cost(session, &cell.children),
+            Some(LayoutMode::Flex(container)) => container
+                .children
+                .iter()
+                .map(|&child| box_cost(session, child as usize))
+                .sum(),
+            Some(LayoutMode::Grid(container)) => container
+                .children
+                .iter()
+                .map(|&child| box_cost(session, child as usize))
+                .sum(),
+            Some(LayoutMode::Inline(range) | LayoutMode::Anonymous(range)) => range
+                .clone()
+                .filter_map(|item_idx| session.text.inline_item(item_idx as usize))
+                .map(|item| match &item.kind {
+                    crate::layout_model::InlineItemKind::Text { glyphs } => glyphs.len(),
+                    crate::layout_model::InlineItemKind::AtomicBox { box_idx } => {
+                        box_cost(session, *box_idx as usize)
+                    }
+                    _ => 1,
+                })
+                .sum(),
+            _ => 1,
+        }
+    }
+
+    box_cost(session, box_idx)
 }
 
 fn layout_cell(

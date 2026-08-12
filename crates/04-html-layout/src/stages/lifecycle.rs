@@ -148,7 +148,8 @@ impl LayoutConstraints {
     /// preserves deterministic sequential execution; larger values cap the
     /// dedicated layout pool used by dependency-independent work.
     pub fn with_parallel_workers(mut self, workers: usize) -> Self {
-        self.parallel_workers = workers.max(1);
+        let available = std::thread::available_parallelism().map_or(1, usize::from);
+        self.parallel_workers = workers.clamp(1, available);
         self
     }
 
