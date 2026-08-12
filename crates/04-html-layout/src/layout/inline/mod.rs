@@ -35,25 +35,8 @@ pub(super) use paragraph::{
 };
 pub(crate) use tokens::PreparedInlinePlans;
 pub(in crate::layout) use tokens::{
-    BreakKind, ParallelInlinePlanTask, canonical_text_unit, collect_parallel_inline_plan_tasks,
-    preserved_tab_metrics, run_belongs_to_inline_context, tab_reference_style,
+    BreakKind, canonical_text_unit, preserved_tab_metrics, run_belongs_to_inline_context,
+    tab_reference_style,
 };
-
-pub(in crate::layout) fn prepare_cached_inline_plan(
-    engine: &mut crate::layout::LayoutEngine<'_, '_>,
-    task: &ParallelInlinePlanTask,
-) {
-    let tokens = tokens::build_inline_tokens(
-        engine,
-        task.run_range.clone(),
-        task.container_box_idx,
-        0.0,
-        None,
-    );
-    // Construct the width-independent breakpoint stream as part of the same
-    // worker job. The dynamic-programming line choice remains width-dependent
-    // and is therefore deferred until the paragraph is laid out.
-    let _ = tokens.kp_plan(engine.config.book_optimized_text());
-}
 
 include!("tests.rs");

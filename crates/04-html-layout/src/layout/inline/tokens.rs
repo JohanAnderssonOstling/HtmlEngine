@@ -991,29 +991,6 @@ impl PreparedInlinePlans {
         }
     }
 
-    pub(crate) fn contains(
-        &self,
-        container_box_idx: usize,
-        run_range: &Range<u32>,
-        high_quality_hyphenation: bool,
-    ) -> bool {
-        let Some(plan) = self
-            .slots
-            .get(container_box_idx)
-            .and_then(|slot| slot.get())
-        else {
-            return false;
-        };
-        plan.key
-            == PreparedInlinePlanKey {
-                run_start: run_range.start,
-                run_end: run_range.end,
-                container_box_idx: u32::try_from(container_box_idx)
-                    .expect("inline-plan box index exhausted"),
-                high_quality_hyphenation,
-            }
-    }
-
     pub(crate) fn memory_usage_bytes(&self) -> usize {
         self.slots.len() * std::mem::size_of::<std::sync::OnceLock<PreparedInlinePlan>>()
             + self
@@ -1080,10 +1057,7 @@ pub(super) enum TokenWrap {
 mod build;
 
 pub(super) use build::build_inline_tokens;
-pub(in crate::layout) use build::{
-    ParallelInlinePlanTask, collect_parallel_inline_plan_tasks, inline_item_ownership_box,
-    run_belongs_to_inline_context,
-};
+pub(in crate::layout) use build::{inline_item_ownership_box, run_belongs_to_inline_context};
 
 /// Style supplying the space/ch metric used by number-valued `tab-size`.
 /// CSS defines it on the nearest block container rather than the inline
