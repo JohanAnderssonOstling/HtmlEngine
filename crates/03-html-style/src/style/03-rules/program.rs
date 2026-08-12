@@ -7,10 +7,10 @@ use crate::{
     StyledDocument,
 };
 use html_dom::Document;
-use lightningcss::stylesheet::{ParserOptions, StyleSheet};
+use lightningcss::stylesheet::{ParserOptions, StyleAttribute, StyleSheet};
 use static_self::IntoOwned;
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 /// Parsed, prepared, and indexed CSS that can be applied to multiple DOMs.
@@ -19,6 +19,7 @@ pub struct StyleProgram {
     prepared: PreparedRuleSet<'static>,
     selector_index: SelectorIndex,
     input_count: usize,
+    inline_styles: Arc<Mutex<ParsedInlineStyleCache>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -29,6 +30,9 @@ pub struct StyleProgramCacheStats {
     pub parsed_entries: usize,
     pub parsed_hits: u64,
     pub parsed_misses: u64,
+    pub inline_entries: usize,
+    pub inline_hits: u64,
+    pub inline_misses: u64,
 }
 
 struct StyleProgramCacheKey {
@@ -49,6 +53,51 @@ struct CachedParsedStylesheet {
     stylesheet: Option<Arc<StyleSheet<'static>>>,
 }
 
+struct CachedInlineStyle {
+    css: String,
+    style: Option<Arc<StyleAttribute<'static>>>,
+}
+
+pub(crate) struct ParsedInlineStyleCache {
+    entries: VecDeque<CachedInlineStyle>,
+    capacity: usize,
+    hits: u64,
+    misses: u64,
+}
+
+impl Default for ParsedInlineStyleCache {
+    fn default() -> Self {
+        Self { entries: VecDeque::new(), capacity: 256, hits: 0, misses: 0 }
+    }
+}
+
+impl ParsedInlineStyleCache {
+    pub(crate) fn get_or_parse(&mut self, css: &str) -> Option<Arc<StyleAttribute<'static>>> {
+        if let Some(position) = self.entries.iter().position(|entry| entry.css == css) {
+            self.hits += 1;
+            if position + 1 != self.entries.len() {
+                let entry = self.entries.remove(position).expect("located inline style exists");
+                self.entries.push_back(entry);
+            }
+            return self.entries.back().expect("cached inline style exists").style.clone();
+        }
+        self.misses += 1;
+        let normalized = crate::style::source::declarations::normalize(css);
+        let style = StyleAttribute::parse(&normalized, ParserOptions { error_recovery: true, ..ParserOptions::default() }).ok().map(|style| Arc::new(style.into_owned()));
+        if self.entries.len() == self.capacity {
+            self.entries.pop_front();
+        }
+        self.entries.push_back(CachedInlineStyle { css: css.to_owned(), style: style.clone() });
+        style
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.hits = 0;
+        self.misses = 0;
+    }
+}
+
 /// Small in-process cache intended to live for the lifetime of an open book.
 /// Entries are bounded and oldest-first evicted.
 pub struct StyleProgramCache {
@@ -60,6 +109,7 @@ pub struct StyleProgramCache {
     parsed_capacity: usize,
     parsed_hits: u64,
     parsed_misses: u64,
+    inline_styles: Arc<Mutex<ParsedInlineStyleCache>>,
 }
 
 impl Default for StyleProgramCache {
@@ -73,6 +123,7 @@ impl Default for StyleProgramCache {
             parsed_capacity: 64,
             parsed_hits: 0,
             parsed_misses: 0,
+            inline_styles: Arc::new(Mutex::new(ParsedInlineStyleCache::default())),
         }
     }
 }
@@ -85,9 +136,11 @@ impl StyleProgramCache {
         self.parsed_entries.clear();
         self.parsed_hits = 0;
         self.parsed_misses = 0;
+        self.inline_styles.lock().expect("inline style cache lock").clear();
     }
 
     pub fn stats(&self) -> StyleProgramCacheStats {
+        let inline_styles = self.inline_styles.lock().expect("inline style cache lock");
         StyleProgramCacheStats {
             entries: self.entries.len(),
             hits: self.hits,
@@ -95,6 +148,9 @@ impl StyleProgramCache {
             parsed_entries: self.parsed_entries.len(),
             parsed_hits: self.parsed_hits,
             parsed_misses: self.parsed_misses,
+            inline_entries: inline_styles.entries.len(),
+            inline_hits: inline_styles.hits,
+            inline_misses: inline_styles.misses,
         }
     }
 
@@ -177,7 +233,7 @@ impl StyleProgramCache {
         let parse_started = Instant::now();
         let stylesheets = inputs.iter().enumerate().filter_map(|(index, input)| self.get_or_parse(input.css, index).map(|stylesheet| (stylesheet, index))).collect::<Vec<_>>();
         let parse_author_css = parse_started.elapsed();
-        let (program, mut timings) = StyleProgram::compile_parsed_with_timings(inputs.len(), &stylesheets, environment, f32::from_bits(initial_font_size));
+        let (program, mut timings) = StyleProgram::compile_parsed_with_timings(inputs.len(), &stylesheets, environment, f32::from_bits(initial_font_size), self.inline_styles.clone());
         timings.parse_author_css = parse_author_css;
         if self.entries.len() == self.capacity {
             self.entries.pop_front();
@@ -231,10 +287,10 @@ impl StyleProgram {
         }
         timings.parse_author_css = started.elapsed();
         let prepared = ParsedStylesheetSet::with_contiguous_author_root_indices(&user_agent, &stylesheets, &author_root_indices);
-        Self::finish_compile(prepared, css_chunks.len(), environment, initial_font_size, timings)
+        Self::finish_compile(prepared, css_chunks.len(), environment, initial_font_size, timings, Arc::new(Mutex::new(ParsedInlineStyleCache::default())))
     }
 
-    fn compile_parsed_with_timings(input_count: usize, stylesheets: &[(Arc<StyleSheet<'static>>, usize)], environment: MediaEnvironment, initial_font_size: f32) -> (Self, StyleTimings) {
+    fn compile_parsed_with_timings(input_count: usize, stylesheets: &[(Arc<StyleSheet<'static>>, usize)], environment: MediaEnvironment, initial_font_size: f32, inline_styles: Arc<Mutex<ParsedInlineStyleCache>>) -> (Self, StyleTimings) {
         let mut timings = StyleTimings::default();
         let started = Instant::now();
         let user_agent = StyleSheet::parse(DEFAULT_CSS, ParserOptions::default()).expect("default CSS must parse").into_owned();
@@ -242,10 +298,10 @@ impl StyleProgram {
         let author_refs = stylesheets.iter().map(|(stylesheet, _)| stylesheet.as_ref()).collect::<Vec<_>>();
         let author_root_indices = stylesheets.iter().map(|(_, index)| u32::try_from(*index).expect("author stylesheet count fits in u32")).collect::<Vec<_>>();
         let prepared = ParsedStylesheetSet::with_author_root_indices(&user_agent, &author_refs, &author_root_indices);
-        Self::finish_compile(prepared, input_count, environment, initial_font_size, timings)
+        Self::finish_compile(prepared, input_count, environment, initial_font_size, timings, inline_styles)
     }
 
-    fn finish_compile(parsed: ParsedStylesheetSet<'_, 'static>, input_count: usize, environment: MediaEnvironment, initial_font_size: f32, mut timings: StyleTimings) -> (Self, StyleTimings) {
+    fn finish_compile(parsed: ParsedStylesheetSet<'_, 'static>, input_count: usize, environment: MediaEnvironment, initial_font_size: f32, mut timings: StyleTimings, inline_styles: Arc<Mutex<ParsedInlineStyleCache>>) -> (Self, StyleTimings) {
         let started = Instant::now();
         let prepared = parsed.prepare(environment, f64::from(initial_font_size));
         timings.prepare_rules = started.elapsed();
@@ -257,6 +313,7 @@ impl StyleProgram {
                 prepared,
                 selector_index,
                 input_count,
+                inline_styles,
             },
             timings,
         )
@@ -314,6 +371,7 @@ fn apply(
         &program.prepared,
         &program.selector_index,
         &author_roots,
+        &program.inline_styles,
     );
     let media_queries = program.prepared.media_queries().clone();
     timings.resolve_styles = started.elapsed();

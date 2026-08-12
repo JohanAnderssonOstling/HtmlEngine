@@ -9,7 +9,7 @@ use crate::style::rules::prepared::{
     CascadeOrigin, EffectiveRuleId, PreparedPropertyTarget, PreparedRuleSet, RulePriority,
     compile_property_targets,
 };
-use crate::style::source::declarations::normalize as normalize_declarations;
+use crate::style::rules::program::ParsedInlineStyleCache;
 use crate::style::syntax::values::tab_size::{
     CASCADE_MARKER as TAB_SIZE_CASCADE_MARKER, ParsedTabSize, parse as parse_tab_size,
 };
@@ -59,6 +59,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::ops::Deref;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 mod custom_properties;
@@ -149,11 +150,12 @@ thread_local! {
     static RESOLUTION_ROOT_LINE_HEIGHT: Cell<Option<f32>> = const { Cell::new(None) };
 }
 
-pub(crate) fn resolve_styles_for_dom_timed<'css>(
+pub(crate) fn resolve_styles_for_dom_timed(
     doc: &Document,
-    prepared: &PreparedRuleSet<'css>,
+    prepared: &PreparedRuleSet<'static>,
     index: &SelectorIndex,
     author_roots: &[Option<DomNodeId>],
+    shared_inline_styles: &Arc<Mutex<ParsedInlineStyleCache>>,
 ) -> (ComputedStyles, ResolveStyleTimings) {
     RESOLUTION_MEDIA_ENVIRONMENT.set(prepared.environment());
     RESOLUTION_USES_VIEWPORT_UNITS.set(false);
@@ -164,7 +166,7 @@ pub(crate) fn resolve_styles_for_dom_timed<'css>(
     let started = Instant::now();
     let mut node_custom_map_ids = vec![0u32; doc.node_count()];
     let mut custom_maps = Vec::with_capacity(16);
-    custom_maps.push(FxHashMap::<String, TokenList<'css>>::default());
+    custom_maps.push(FxHashMap::<String, TokenList<'static>>::default());
     let mut custom_cascade_cache = CustomCascadeCache::default();
     let mut style_sharing_cache = StyleSharingCache::default();
     let mut computed_styles = ComputedStylesBuilder::new(doc);
@@ -176,7 +178,7 @@ pub(crate) fn resolve_styles_for_dom_timed<'css>(
     let mut cascade_scratch = specified::CascadeScratch::default();
     let mut validation_style = WorkingStyle::default();
     let mut ancestor_filters = vec![AncestorFilter::default(); doc.node_count()];
-    let inline_styles = InlineStyleCache::new(doc);
+    let inline_styles = InlineStyleCache::new(doc, shared_inline_styles);
     timings.resolver_setup = started.elapsed();
     {
         let mut resolver = StyleResolverContext {

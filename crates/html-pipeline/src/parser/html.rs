@@ -50,6 +50,9 @@ pub struct BookStylesheetCacheStats {
     pub parsed_entries: usize,
     pub parsed_hits: u64,
     pub parsed_misses: u64,
+    pub inline_entries: usize,
+    pub inline_hits: u64,
+    pub inline_misses: u64,
 }
 
 impl BookStylesheetCache {
@@ -61,7 +64,7 @@ impl BookStylesheetCache {
     pub fn stats(&self) -> BookStylesheetCacheStats {
         let entries = self.entries.lock().expect("stylesheet cache lock");
         let programs = self.programs.lock().expect("style program cache lock").stats();
-        BookStylesheetCacheStats { entries: entries.len(), bytes: entries.values().map(String::len).sum(), compiled_entries: programs.entries, compiled_hits: programs.hits, compiled_misses: programs.misses, parsed_entries: programs.parsed_entries, parsed_hits: programs.parsed_hits, parsed_misses: programs.parsed_misses }
+        BookStylesheetCacheStats { entries: entries.len(), bytes: entries.values().map(String::len).sum(), compiled_entries: programs.entries, compiled_hits: programs.hits, compiled_misses: programs.misses, parsed_entries: programs.parsed_entries, parsed_hits: programs.parsed_hits, parsed_misses: programs.parsed_misses, inline_entries: programs.inline_entries, inline_hits: programs.inline_hits, inline_misses: programs.inline_misses }
     }
 
     fn read(&self, provider: &dyn ResourceProvider, uri: &str, transport_label: Option<&str>, fallback_label: Option<&str>) -> std::io::Result<String> {
@@ -525,6 +528,19 @@ mod tests {
         let stats = cache.stats();
         assert_eq!((stats.compiled_hits, stats.compiled_misses), (0, 2));
         assert_eq!((stats.parsed_entries, stats.parsed_hits, stats.parsed_misses), (3, 1, 3));
+    }
+
+    #[test]
+    fn reuses_inline_styles_across_spine_items() {
+        let cache = BookStylesheetCache::default();
+        for chapter_css in [".chapter-one { display: block }", ".chapter-two { display: block }"] {
+            let mut factory = DocumentFactory::new();
+            factory.set_book_stylesheet_cache(cache.clone());
+            let _document = factory.parse_with_new_pipeline("<html><body><p style='color: red; margin: 1em'>text</p></body></html>", Some(chapter_css));
+        }
+        let stats = cache.stats();
+        assert_eq!((stats.compiled_hits, stats.compiled_misses), (0, 2));
+        assert_eq!((stats.inline_entries, stats.inline_hits, stats.inline_misses), (1, 1, 1));
     }
 
     #[test]

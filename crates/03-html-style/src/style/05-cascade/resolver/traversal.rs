@@ -3,16 +3,17 @@ use super::*;
 // Helper functions for DOM-based style resolution
 use crate::style::matching::selectors::AncestorFilter;
 
-pub(super) struct InlineStyleCache<'css> {
+pub(super) struct InlineStyleCache {
     node_style_ids: Vec<Option<u32>>,
-    styles: Vec<StyleAttribute<'css>>,
+    styles: Vec<Arc<StyleAttribute<'static>>>,
 }
 
-impl<'css> InlineStyleCache<'css> {
-    pub(super) fn new(doc: &Document) -> Self {
+impl InlineStyleCache {
+    pub(super) fn new(doc: &Document, shared: &Arc<Mutex<ParsedInlineStyleCache>>) -> Self {
         let mut node_style_ids = vec![None; doc.node_count()];
         let mut styles = Vec::new();
         let mut parsed = FxHashMap::<&str, Option<u32>>::default();
+        let mut shared = shared.lock().expect("inline style cache lock");
         for node_idx in doc.node_ids() {
             let Some(source) = doc
                 .get_dom_attr(node_idx, "style")
@@ -23,17 +24,7 @@ impl<'css> InlineStyleCache<'css> {
             let style_id = if let Some(style_id) = parsed.get(source) {
                 *style_id
             } else {
-                let normalized = normalize_declarations(source);
-                let normalized: &'css str = Box::leak(normalized.into_boxed_str());
-                let style_id = StyleAttribute::parse(
-                    normalized,
-                    ParserOptions {
-                        error_recovery: true,
-                        ..ParserOptions::default()
-                    },
-                )
-                .ok()
-                .map(|style| {
+                let style_id = shared.get_or_parse(source).map(|style| {
                     let id = u32::try_from(styles.len()).expect("inline style count fits in u32");
                     styles.push(style);
                     id
@@ -43,15 +34,12 @@ impl<'css> InlineStyleCache<'css> {
             };
             node_style_ids[node_idx.index()] = style_id;
         }
-        Self {
-            node_style_ids,
-            styles,
-        }
+        Self { node_style_ids, styles }
     }
 
-    pub(super) fn get(&self, node_idx: DomNodeId) -> Option<&StyleAttribute<'css>> {
+    pub(super) fn get(&self, node_idx: DomNodeId) -> Option<&StyleAttribute<'static>> {
         let id = self.node_style_ids.get(node_idx.index()).copied().flatten()?;
-        self.styles.get(id as usize)
+        self.styles.get(id as usize).map(Arc::as_ref)
     }
 }
 
