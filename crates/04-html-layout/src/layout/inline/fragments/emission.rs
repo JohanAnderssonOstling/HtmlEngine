@@ -225,8 +225,7 @@ fn positioned_inline_box_fragments_from<'a>(
             let has_propagated_decoration = !engine
                 .reader
                 .style(box_idx)
-                .text_decoration()
-                .lines
+                .text_decoration_lines()
                 .is_empty();
             if (!outside_formatting_context && is_inline) || has_propagated_decoration {
                 let relative_offset =
@@ -475,8 +474,7 @@ fn has_inline_fragment_owners(
                 || !engine
                     .reader
                     .style(box_idx)
-                    .text_decoration()
-                    .lines
+                    .text_decoration_lines()
                     .is_empty()
             {
                 return true;

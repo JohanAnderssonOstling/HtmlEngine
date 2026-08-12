@@ -1070,7 +1070,7 @@ impl LaidOutDocument {
             font_family: style.font_family(),
             letter_spacing: style.letter_spacing(),
             word_spacing: style.word_spacing(),
-            text_decoration: style.text_decoration().lines,
+            text_decoration: style.text_decoration_lines(),
         }
     }
 

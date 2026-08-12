@@ -2562,6 +2562,9 @@ impl<'a> StyleView<'a> {
     pub fn text_decoration(&self) -> TextDecoration {
         self.background.text_decoration
     }
+    pub fn text_decoration_lines(&self) -> TextDecorationLines {
+        self.background.text_decoration.lines
+    }
     pub fn text_decoration_color(&self) -> u32 {
         self.background.text_decoration.color.resolve(self.text.color)
     }
@@ -2935,6 +2938,9 @@ impl<'a> UsedStyleView<'a> {
     }
     pub fn text_decoration(&self) -> UsedTextDecoration {
         self.computed.background.text_decoration.resolve_font_relative(self.font_relative)
+    }
+    pub fn text_decoration_lines(&self) -> TextDecorationLines {
+        self.computed.text_decoration_lines()
     }
     pub fn grid_template_rows(&self) -> impl ExactSizeIterator<Item = UsedGridTemplateTrack<'a>> + 'a {
         let tracks: &'a [GridTemplateTrack] = &self.computed.layout.grid_template_rows;

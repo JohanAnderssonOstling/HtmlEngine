@@ -83,7 +83,7 @@ pub(crate) fn shape_document(
         // those metrics even when no font-relative CSS length needs them.
         dense_box_metrics_required |= style.requires_font_metrics();
         font_content_extents_required[idx] =
-            !style.text_decoration().lines.is_empty() || paints_inline_content_box;
+            !style.text_decoration_lines().is_empty() || paints_inline_content_box;
         if let Some(family_idx) = style.font_family() {
             *family = styles.string(family_idx).map(str::to_owned);
         }
