@@ -618,13 +618,11 @@ mod tests {
     }
 
     #[test]
-    fn plain_text_emits_one_offset_run_for_the_whole_line() {
+    fn plain_text_uses_implicit_zero_glyph_offsets() {
         let document = layout_html("<html><body style='margin:0'><span style='line-height:12px'>ab</span><span style='line-height:18px'>cd</span></body></html>", 200.0);
         let offsets = document.render_view().text().line_glyph_offsets(0).expect("plain line offset runs").iter().collect::<Vec<_>>();
 
-        assert_eq!(offsets.len(), 1);
-        assert_eq!(offsets[0].range(), 0..4);
-        assert_eq!(offsets[0].offset(), 0.0);
+        assert!(offsets.is_empty(), "zero is the implicit glyph offset");
     }
 
     #[test]

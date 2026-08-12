@@ -609,14 +609,6 @@ pub(super) fn write_line_fragments(
     }
 
     let Some(placements) = line.placements.as_deref() else {
-        if publishes_line && line.glyph_range.start < line.glyph_range.end {
-            engine.fragments.state_mut().line_output.line_glyph_offsets[line_idx].push(
-                GlyphOffsetRun {
-                    range: line.glyph_range.clone(),
-                    offset: 0.0,
-                },
-            );
-        }
         engine.record_timing(|t| t.write_line_fragments += timing_started.elapsed());
         return if publishes_line {
             line.line_height
@@ -742,11 +734,13 @@ pub(super) fn write_line_fragments(
         } else if let InlineTokenKind::Glyph { glyph_idx } = token.kind() {
             debug_assert!(publishes_line);
             let layout = engine.fragments.state_mut();
-            push_glyph_offset_run(
-                &mut layout.line_output.line_glyph_offsets[line_idx],
-                glyph_idx,
-                offset as f32,
-            );
+            if offset != 0.0 {
+                push_glyph_offset_run(
+                    &mut layout.line_output.line_glyph_offsets[line_idx],
+                    glyph_idx,
+                    offset as f32,
+                );
+            }
             if token.is_tab(runs) {
                 layout.line_output.line_glyph_advances[line_idx].push(GlyphAdvanceRun {
                     range: glyph_idx..glyph_idx + 1,
