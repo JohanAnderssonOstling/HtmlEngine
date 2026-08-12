@@ -1730,4 +1730,59 @@ mod tests {
         let first = document.render_view().text().line(0).expect("line should exist");
         assert!((first.point().x - 50.0).abs() < 1.0, "expected first line offset ~50px (25% of 200px), got {}", first.point().x);
     }
+
+    fn paragraph_heavy_html(paragraphs: usize, words: usize) -> String {
+        let mut html = String::from("<html><body style='margin:0;font:16px serif'>");
+        for paragraph in 0..paragraphs {
+            html.push_str("<p>");
+            for word in 0..words {
+                html.push_str(&format!("paragraph{paragraph}word{word} "));
+            }
+            html.push_str("</p>");
+        }
+        html.push_str("</body></html>");
+        html
+    }
+
+    #[test]
+    fn parallel_paragraph_preparation_matches_sequential_layout() {
+        let html = paragraph_heavy_html(16, 64);
+        let build = || {
+            let mut factory = DocumentFactory::new();
+            let mut glyphs = GlyphCache::new();
+            factory.parse_with_new_pipeline(&html, None).shape(&mut glyphs).expect("test glyphs shape")
+        };
+        let sequential = build().layout(crate::LayoutConstraints::new(420.0, 16.0).unwrap());
+        let workers = std::thread::available_parallelism().map_or(1, usize::from).min(4);
+        crate::layout::reset_observed_workers();
+        let parallel = build().layout(crate::LayoutConstraints::new(420.0, 16.0).unwrap().with_parallel_workers(workers));
+        if workers > 1 {
+            assert!(crate::layout::observed_worker_count() > 1, "paragraph preparation must execute on multiple worker threads");
+        }
+        let lines = |document: &LaidOutDocument| document.render_view().text().lines().iter().map(|line| (line.owner_box_idx(), line.glyphs(), line.point(), line.height(), line.baseline())).collect::<Vec<_>>();
+        assert_eq!(lines(&sequential), lines(&parallel));
+    }
+
+    /// Manual cold-layout benchmark for paragraph-plan preparation.
+    #[test]
+    #[ignore = "manual performance benchmark"]
+    fn benchmark_parallel_paragraph_preparation() {
+        use std::time::Instant;
+
+        let iterations = std::env::var("HTML_LAYOUT_BENCH_ITERATIONS").ok().and_then(|value| value.parse::<usize>().ok()).unwrap_or(40);
+        let workers = std::env::var("HTML_LAYOUT_BENCH_WORKERS").ok().and_then(|value| value.parse::<usize>().ok()).unwrap_or(1).max(1);
+        let html = paragraph_heavy_html(32, 96);
+        let mut shaped_documents = Vec::with_capacity(iterations);
+        for _ in 0..iterations {
+            let mut factory = DocumentFactory::new();
+            let mut glyphs = GlyphCache::new();
+            shaped_documents.push(factory.parse_with_new_pipeline(&html, None).shape(&mut glyphs).expect("benchmark glyphs shape"));
+        }
+        let constraints = crate::LayoutConstraints::new(420.0, 16.0).unwrap().with_parallel_workers(workers);
+        let started = Instant::now();
+        let checksum = shaped_documents.into_iter().map(|shaped| shaped.layout(constraints)).map(|document| document.render_view().text().lines().len()).sum::<usize>();
+        let elapsed = started.elapsed();
+        std::hint::black_box(checksum);
+        println!("PARAGRAPH_PREP_BENCH workers={} iterations={} total_ns={} ns_per_layout={} checksum={checksum}", workers, iterations, elapsed.as_nanos(), elapsed.as_nanos() / iterations.max(1) as u128);
+    }
 }

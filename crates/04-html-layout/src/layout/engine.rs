@@ -4,6 +4,7 @@ use crate::layout_model::{
 use html_dom::Document;
 use html_style_model::ComputedStyles;
 use kurbo::Point;
+use rayon::prelude::*;
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
@@ -76,6 +77,7 @@ pub(crate) fn layout_with_timings(
         fragmentation_suppression_depth: 0,
         timings: collected_timings,
     };
+    context.prepare_inline_plans_parallel();
     context.run();
     if let (Some(destination), Some(collected)) = (timings, context.timings.take()) {
         *destination = collected.into_inner();
@@ -222,6 +224,34 @@ impl<'a, 'out> LayoutEngine<'a, 'out> {
             inline_plans: self.inline_plans,
             track_overflow_clips: self.track_overflow_clips,
         }
+    }
+
+    fn prepare_inline_plans_parallel(&mut self) {
+        const MIN_TASKS: usize = 8;
+        const MIN_GLYPHS: usize = 512;
+
+        let workers = self.config.parallel_workers();
+        if workers <= 1 {
+            return;
+        }
+        let tasks = super::inline::collect_parallel_inline_plan_tasks(self);
+        if tasks.len() < MIN_TASKS
+            || tasks.iter().map(|task| task.glyph_count).sum::<usize>() < MIN_GLYPHS
+        {
+            return;
+        }
+        let timing_started = self.start_timing();
+        let context = self.parallel_measurement_context();
+        super::install_parallel(workers, || {
+            tasks
+                .par_iter()
+                .for_each_init(ParallelMeasurementWorker::default, |worker, task| {
+                    context.prepare_inline_plan(worker, task)
+                });
+        });
+        self.record_timing(|timings| {
+            timings.build_inline_tokens += timing_started.elapsed();
+        });
     }
 
     pub(crate) fn start_timing(&self) -> LayoutTimingStart {
@@ -372,14 +402,11 @@ pub(crate) struct ParallelBoxMeasurement {
 }
 
 impl ParallelMeasurementContext<'_> {
-    pub(crate) fn measure_table_cell(
+    fn with_worker<R>(
         &self,
         worker: &mut ParallelMeasurementWorker,
-        point: Point,
-        request: crate::layout::BoxLayoutRequest,
-    ) -> ParallelBoxMeasurement {
-        #[cfg(test)]
-        super::parallel::record_worker();
+        operation: impl FnOnce(&mut LayoutEngine<'_, '_>) -> R,
+    ) -> R {
         let scratch = &mut worker.scratch;
         let mut engine = LayoutEngine {
             config: self.config,
@@ -408,17 +435,7 @@ impl ParallelMeasurementContext<'_> {
         engine.margins.reset();
         engine.absolute_positioning.clear();
         engine.flex_grid.clear();
-        engine.geometry.set_point(request.box_idx, point);
-        let cell_layout = engine.layout_box(request);
-        let first_baseline = engine.fragments.first_baseline_offset(
-            cell_layout.output.lines,
-            engine.geometry.point(request.box_idx).y,
-        );
-        let result = ParallelBoxMeasurement {
-            size: cell_layout.size,
-            first_baseline,
-        };
-
+        let result = operation(&mut engine);
         engine.fragments.recycle_owner_storage(
             &mut scratch.line_owners,
             &mut scratch.block_decoration_owners,
@@ -431,5 +448,39 @@ impl ParallelMeasurementContext<'_> {
         scratch.measurement = std::mem::take(&mut engine.measurement);
         scratch.finalization = std::mem::take(&mut engine.finalization);
         result
+    }
+
+    pub(in crate::layout) fn prepare_inline_plan(
+        &self,
+        worker: &mut ParallelMeasurementWorker,
+        task: &super::inline::ParallelInlinePlanTask,
+    ) {
+        #[cfg(test)]
+        super::parallel::record_worker();
+        self.with_worker(worker, |engine| {
+            super::inline::prepare_cached_inline_plan(engine, task)
+        });
+    }
+
+    pub(crate) fn measure_table_cell(
+        &self,
+        worker: &mut ParallelMeasurementWorker,
+        point: Point,
+        request: crate::layout::BoxLayoutRequest,
+    ) -> ParallelBoxMeasurement {
+        #[cfg(test)]
+        super::parallel::record_worker();
+        self.with_worker(worker, |engine| {
+            engine.geometry.set_point(request.box_idx, point);
+            let cell_layout = engine.layout_box(request);
+            let first_baseline = engine.fragments.first_baseline_offset(
+                cell_layout.output.lines,
+                engine.geometry.point(request.box_idx).y,
+            );
+            ParallelBoxMeasurement {
+                size: cell_layout.size,
+                first_baseline,
+            }
+        })
     }
 }

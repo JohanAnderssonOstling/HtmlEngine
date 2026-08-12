@@ -2,6 +2,75 @@
 
 use super::*;
 
+#[derive(Clone)]
+pub(in crate::layout) struct ParallelInlinePlanTask {
+    pub(in crate::layout) container_box_idx: usize,
+    pub(in crate::layout) run_range: Range<u32>,
+    pub(in crate::layout) glyph_count: usize,
+}
+
+/// Finds width-independent pure-text plans which have not yet been populated.
+/// These are safe to build before box traversal because their token geometry
+/// depends only on shaped text and used styles, not the containing block.
+pub(in crate::layout) fn collect_parallel_inline_plan_tasks(
+    engine: &crate::layout::LayoutEngine<'_, '_>,
+) -> Vec<ParallelInlinePlanTask> {
+    if engine.config.sentence_per_line() {
+        return Vec::new();
+    }
+    let high_quality_hyphenation = engine.config.hyphenation_quality();
+    let mut tasks = Vec::new();
+    for container_box_idx in 0..engine.reader.box_count() {
+        let run_range = match engine.reader.box_layout_mode(container_box_idx) {
+            Some(crate::layout_model::LayoutMode::Block(block)) => match &block.children {
+                crate::layout_model::Children::InlineItems(range) => range.clone(),
+                _ => continue,
+            },
+            Some(crate::layout_model::LayoutMode::TableCell(cell)) => match &cell.children {
+                crate::layout_model::Children::InlineItems(range) => range.clone(),
+                _ => continue,
+            },
+            // Ordinary inline boxes share their parent's formatting context
+            // and are not laid out independently. Anonymous boxes are real
+            // formatting-context roots and own a cache slot.
+            Some(crate::layout_model::LayoutMode::Anonymous(range)) => range.clone(),
+            _ => continue,
+        };
+        if run_range.is_empty()
+            || engine
+                .inline_plans
+                .contains(container_box_idx, &run_range, high_quality_hyphenation)
+        {
+            continue;
+        }
+        let source_runs =
+            &engine.text.inline_items()[run_range.start as usize..run_range.end as usize];
+        if !source_runs.iter().all(|run| {
+            matches!(
+                run.kind,
+                InlineItemKind::Text { .. } | InlineItemKind::Marker { .. }
+            )
+        }) {
+            continue;
+        }
+        let glyph_count = source_runs
+            .iter()
+            .map(|run| match &run.kind {
+                InlineItemKind::Text { glyphs } | InlineItemKind::Marker { glyphs } => {
+                    glyphs.end.saturating_sub(glyphs.start) as usize
+                }
+                _ => 0,
+            })
+            .sum();
+        tasks.push(ParallelInlinePlanTask {
+            container_box_idx,
+            run_range,
+            glyph_count,
+        });
+    }
+    tasks
+}
+
 fn create_image_token(
     engine: &crate::layout::LayoutEngine<'_, '_>,
     image_idx: u32,
