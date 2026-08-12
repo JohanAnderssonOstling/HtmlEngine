@@ -60,6 +60,7 @@ pub(crate) struct PlacementState {
     remapped_line_points: Vec<Point>,
     remapped_line_groups: Vec<PlacementId>,
     current_group: PlacementId,
+    has_transforms: bool,
     retain_output: bool,
     phase: PlacementPhase,
 }
@@ -80,6 +81,7 @@ impl PlacementState {
         self.remapped_line_points.clear();
         self.remapped_line_groups.clear();
         self.current_group = 0;
+        self.has_transforms = false;
         self.retain_output = true;
         self.phase = PlacementPhase::Building;
     }
@@ -98,6 +100,7 @@ impl PlacementState {
         self.remapped_line_points.clear();
         self.remapped_line_groups.clear();
         self.current_group = 0;
+        self.has_transforms = false;
         self.retain_output = false;
         self.phase = PlacementPhase::Building;
     }
@@ -132,6 +135,7 @@ impl PlacementState {
         if offset == Vec2::ZERO {
             return;
         }
+        self.has_transforms = true;
         let node = &mut self.nodes[group as usize];
         if node.offset_index == NO_OFFSET {
             node.offset_index =
@@ -197,18 +201,22 @@ impl PlacementState {
             &mut self.local_line_points,
             &mut self.local_decoration_rects,
         );
-        self.resolve();
-        for box_idx in 0..geometry.len() {
-            let offset = self.resolved_offsets[self.box_groups[box_idx] as usize];
-            geometry.set_point(box_idx, self.local_box_points[box_idx] + offset);
+        if self.has_transforms {
+            self.resolve();
+            for box_idx in 0..geometry.len() {
+                let offset = self.resolved_offsets[self.box_groups[box_idx] as usize];
+                if offset != Vec2::ZERO {
+                    geometry.set_point(box_idx, self.local_box_points[box_idx] + offset);
+                }
+            }
+            fragments.materialize_absolute_positions(
+                &self.local_line_points,
+                &self.local_decoration_rects,
+                &self.line_groups,
+                &self.decoration_groups,
+                &self.resolved_offsets,
+            );
         }
-        fragments.materialize_absolute_positions(
-            &self.local_line_points,
-            &self.local_decoration_rects,
-            &self.line_groups,
-            &self.decoration_groups,
-            &self.resolved_offsets,
-        );
 
         self.phase = PlacementPhase::Published;
         self.current_group = 0;

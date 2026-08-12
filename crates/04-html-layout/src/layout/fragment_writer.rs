@@ -239,8 +239,10 @@ impl<'out> FragmentWriter<'out> {
         resolved_offsets: &[Vec2],
     ) {
         for (index, line) in self.state.line_output.lines.iter_mut().enumerate() {
-            line.point = local_line_points[index]
-                + resolved_offsets[line_groups[index] as usize];
+            let offset = resolved_offsets[line_groups[index] as usize];
+            if offset != Vec2::ZERO {
+                line.point = local_line_points[index] + offset;
+            }
         }
         for (index, decoration) in self
             .state
@@ -251,7 +253,9 @@ impl<'out> FragmentWriter<'out> {
             .enumerate()
         {
             let offset = resolved_offsets[decoration_groups[index] as usize];
-            decoration.rect = local_decoration_rects[index] + offset;
+            if offset != Vec2::ZERO {
+                decoration.rect = local_decoration_rects[index] + offset;
+            }
         }
     }
 
