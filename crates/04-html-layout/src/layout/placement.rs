@@ -60,7 +60,6 @@ pub(crate) struct PlacementState {
     remapped_line_points: Vec<Point>,
     remapped_line_groups: Vec<PlacementId>,
     current_group: PlacementId,
-    active: bool,
     retain_output: bool,
     phase: PlacementPhase,
 }
@@ -81,7 +80,6 @@ impl PlacementState {
         self.remapped_line_points.clear();
         self.remapped_line_groups.clear();
         self.current_group = 0;
-        self.active = false;
         self.retain_output = true;
         self.phase = PlacementPhase::Building;
     }
@@ -100,7 +98,6 @@ impl PlacementState {
         self.remapped_line_points.clear();
         self.remapped_line_groups.clear();
         self.current_group = 0;
-        self.active = false;
         self.retain_output = false;
         self.phase = PlacementPhase::Building;
     }
@@ -135,7 +132,6 @@ impl PlacementState {
         if offset == Vec2::ZERO {
             return;
         }
-        self.active = true;
         let node = &mut self.nodes[group as usize];
         if node.offset_index == NO_OFFSET {
             node.offset_index =

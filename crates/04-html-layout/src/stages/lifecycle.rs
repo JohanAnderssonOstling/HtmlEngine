@@ -696,7 +696,7 @@ impl ShapedDocument {
         let mut laid_out = LaidOutDocument {
             inputs: self.inputs,
             geometry,
-            placement,
+            placement: std::sync::Arc::new(placement),
             base_shaped: self.shaped.clone(),
             shaped: self.shaped,
             layout_state,
@@ -720,7 +720,7 @@ pub struct LaidOutDocument {
     pub(super) geometry: BoxGeometry,
     /// Authoritative local coordinates and the retained placement tree. The
     /// renderer-facing geometry and fragments remain absolute snapshots.
-    pub(super) placement: crate::layout::PlacementState,
+    pub(super) placement: std::sync::Arc<crate::layout::PlacementState>,
     /// Viewport-independent shaping retained so a width change can recompute
     /// the dynamic extent of `::first-line` without accumulating old styles.
     pub(super) base_shaped: std::sync::Arc<ShapedText>,
@@ -844,7 +844,7 @@ impl LaidOutDocument {
             crate::layout::LayoutOutputs {
                 geometry: &mut self.geometry,
                 state: &mut self.layout_state,
-                placement: &mut self.placement,
+                placement: std::sync::Arc::make_mut(&mut self.placement),
                 scratch: &mut self.layout_scratch,
             },
             constraints,

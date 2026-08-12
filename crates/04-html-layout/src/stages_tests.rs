@@ -286,6 +286,7 @@ mod stage_tests {
 
         let cloned = document.clone();
         assert_eq!(cloned.layout_scratch.allocation_capacities(), ((0, 0), (0, 0, 0, 0, 0, 0)), "cloning semantic layout state must not duplicate transient scratch allocations");
+        assert!(std::sync::Arc::ptr_eq(&cloned.placement, &document.placement), "cloning a laid-out document must share its retained local placement snapshot");
     }
 
     #[test]
