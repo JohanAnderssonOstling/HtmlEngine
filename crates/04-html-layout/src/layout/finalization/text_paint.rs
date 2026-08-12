@@ -43,9 +43,6 @@ fn prepare_line(
     advances: &[GlyphAdvanceRun],
     prepared: &mut Vec<PreparedTextRunFragment>,
 ) -> Option<()> {
-    let mut offset_index = 0usize;
-    let mut advance_index = 0usize;
-
     if let Some(fragments) = &line.text_fragments {
         for fragment in fragments.iter().filter(|fragment| fragment.visible) {
             prepare_fragment(
@@ -55,8 +52,6 @@ fn prepare_line(
                 fragment.offset_x,
                 offsets,
                 advances,
-                &mut offset_index,
-                &mut advance_index,
                 prepared,
             )?;
         }
@@ -68,8 +63,6 @@ fn prepare_line(
             0.0,
             offsets,
             advances,
-            &mut offset_index,
-            &mut advance_index,
             prepared,
         )?;
     }
@@ -85,14 +78,22 @@ fn prepare_fragment(
     fragment_offset_x: f64,
     offsets: &[GlyphOffsetRun],
     advances: &[GlyphAdvanceRun],
-    offset_index: &mut usize,
-    advance_index: &mut usize,
     prepared: &mut Vec<PreparedTextRunFragment>,
 ) -> Option<()> {
     let mut expected = source_range.start;
     let mut x = line.optical_offset_x + fragment_offset_x;
+    let mut offset_index =
+        offsets.partition_point(|candidate| candidate.range.end <= source_range.start);
+    let mut advance_index =
+        advances.partition_point(|candidate| candidate.range.end <= source_range.start);
+    let authoritative_runs = text.authoritative_runs();
+    let first_run =
+        authoritative_runs.partition_point(|run| run.source_range.end <= source_range.start);
 
-    for run in text.authoritative_runs() {
+    for run in &authoritative_runs[first_run..] {
+        if run.source_range.start >= source_range.end {
+            break;
+        }
         let start = source_range.start.max(run.source_range.start);
         let end = source_range.end.min(run.source_range.end);
         if start >= end {
@@ -111,24 +112,24 @@ fn prepare_fragment(
             let metric = text.glyph_metric_checked(glyph)?;
 
             while offsets
-                .get(*offset_index)
+                .get(offset_index)
                 .is_some_and(|candidate| index >= candidate.range.end)
             {
-                *offset_index += 1;
+                offset_index += 1;
             }
             let offset = offsets
-                .get(*offset_index)
+                .get(offset_index)
                 .filter(|candidate| candidate.range.contains(&index))
                 .map_or(0.0, |candidate| f64::from(candidate.offset));
 
             while advances
-                .get(*advance_index)
+                .get(advance_index)
                 .is_some_and(|candidate| index >= candidate.range.end)
             {
-                *advance_index += 1;
+                advance_index += 1;
             }
             let advance_override = advances
-                .get(*advance_index)
+                .get(advance_index)
                 .filter(|candidate| candidate.range.contains(&index))
                 .map(|candidate| f64::from(candidate.advance));
 
