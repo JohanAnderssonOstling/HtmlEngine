@@ -56,12 +56,12 @@ impl AncestorFilter {
 // ============================================================================
 
 /// Index of rule keys, keyed by selector target (tag/class/id)
-pub struct SelectorIndex<'css> {
+pub struct SelectorIndex {
     by_tag: FxHashMap<String, Vec<EffectiveRuleId>>,
     by_class: FxHashMap<String, Vec<EffectiveRuleId>>,
     by_id: FxHashMap<String, Vec<EffectiveRuleId>>,
     universal: Vec<EffectiveRuleId>, // *, [attr], :pseudo with no tag/class/id
-    compiled: CompiledSelectors<'css>,
+    compiled: CompiledSelectors,
 }
 
 /// Dense duplicate suppression for candidate rule IDs. Prepared IDs are
@@ -97,13 +97,13 @@ impl CandidateDeduper {
     }
 }
 
-impl<'css> SelectorIndex<'css> {
+impl SelectorIndex {
     pub fn new() -> Self {
         Self { by_tag: FxHashMap::default(), by_class: FxHashMap::default(), by_id: FxHashMap::default(), universal: Vec::new(), compiled: CompiledSelectors::empty() }
     }
 
     /// Build an index only from rules admitted by stylesheet preparation.
-    pub fn from_prepared(prepared: &PreparedRuleSet<'_, 'css>) -> Self {
+    pub fn from_prepared(prepared: &PreparedRuleSet<'_>) -> Self {
         let mut index = Self::new();
         index.compiled = CompiledSelectors::from_prepared(prepared);
         for (id, rule) in prepared.iter() {

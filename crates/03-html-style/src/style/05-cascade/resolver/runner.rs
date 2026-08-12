@@ -45,7 +45,7 @@ fn wide_keyword<'property, 'css>(property: &'property Property<'css>) -> Option<
         .then_some(keyword)
 }
 
-impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
+impl<'a, 'css> StyleResolverContext<'a, 'css> {
     fn apply_presentational_hints(
         &mut self,
         style: &mut WorkingStyle,

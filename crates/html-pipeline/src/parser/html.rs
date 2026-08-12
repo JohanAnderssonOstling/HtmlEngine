@@ -16,6 +16,7 @@ pub struct DocumentFactory {
     title: Option<String>,
     resources: Option<ResourceContext>,
     stylesheet_cache: Option<BookStylesheetCache>,
+    style_program_cache: html_style::StyleProgramCache,
     reader_overrides: html_layout::ReaderStyleOverrides,
     note_flow: html_layout::NoteFlow,
 }
@@ -36,22 +37,28 @@ struct ExpandedStylesheet {
 #[derive(Clone, Default)]
 pub struct BookStylesheetCache {
     entries: Arc<Mutex<HashMap<(String, Option<String>, Option<String>), String>>>,
+    programs: Arc<Mutex<html_style::StyleProgramCache>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct BookStylesheetCacheStats {
     pub entries: usize,
     pub bytes: usize,
+    pub compiled_entries: usize,
+    pub compiled_hits: u64,
+    pub compiled_misses: u64,
 }
 
 impl BookStylesheetCache {
     pub fn clear(&self) {
         self.entries.lock().expect("stylesheet cache lock").clear();
+        self.programs.lock().expect("style program cache lock").clear();
     }
 
     pub fn stats(&self) -> BookStylesheetCacheStats {
         let entries = self.entries.lock().expect("stylesheet cache lock");
-        BookStylesheetCacheStats { entries: entries.len(), bytes: entries.values().map(String::len).sum() }
+        let programs = self.programs.lock().expect("style program cache lock").stats();
+        BookStylesheetCacheStats { entries: entries.len(), bytes: entries.values().map(String::len).sum(), compiled_entries: programs.entries, compiled_hits: programs.hits, compiled_misses: programs.misses }
     }
 
     fn read(&self, provider: &dyn ResourceProvider, uri: &str, transport_label: Option<&str>, fallback_label: Option<&str>) -> std::io::Result<String> {
@@ -74,7 +81,7 @@ impl Default for DocumentFactory {
 
 impl DocumentFactory {
     pub fn new() -> Self {
-        Self { root_font_size: RootFontSize::default(), media_environment: html_style::MediaEnvironment::default(), title: None, resources: None, stylesheet_cache: None, reader_overrides: Default::default(), note_flow: Default::default() }
+        Self { root_font_size: RootFontSize::default(), media_environment: html_style::MediaEnvironment::default(), title: None, resources: None, stylesheet_cache: None, style_program_cache: html_style::StyleProgramCache::default(), reader_overrides: Default::default(), note_flow: Default::default() }
     }
 
     pub fn set_resource_context(&mut self, provider: Arc<dyn ResourceProvider>, base_uri: impl Into<String>) {
@@ -83,6 +90,17 @@ impl DocumentFactory {
 
     pub fn set_book_stylesheet_cache(&mut self, cache: BookStylesheetCache) {
         self.stylesheet_cache = Some(cache);
+    }
+
+    pub fn style_program_cache_stats(&self) -> html_style::StyleProgramCacheStats {
+        self.stylesheet_cache.as_ref().map_or_else(|| self.style_program_cache.stats(), |cache| cache.programs.lock().expect("style program cache lock").stats())
+    }
+
+    pub fn clear_style_program_cache(&mut self) {
+        self.style_program_cache.clear();
+        if let Some(cache) = &self.stylesheet_cache {
+            cache.programs.lock().expect("style program cache lock").clear();
+        }
     }
 
     pub fn set_root_font_size(&mut self, root_font_size: RootFontSize) {
@@ -208,7 +226,18 @@ impl DocumentFactory {
             timings.resolve_css_imports += css_started.elapsed();
         }
         let all_css = expanded_css.iter().map(|stylesheet| html_style::AuthorStylesheetInput { css: stylesheet.css.as_str(), implicit_scope_root: stylesheet.implicit_scope_root }).collect::<Vec<_>>();
-        let (styled, style_timings, media_queries) = html_style::style_document_with_author_stylesheets_and_environment_and_timings(document, &all_css, self.media_environment);
+        let (styled, style_timings, media_queries) = if let Some(cache) = &self.stylesheet_cache {
+            let root_font_size = document.root_font_size();
+            let (program, build_timings) = cache.programs.lock().expect("style program cache lock").get_or_compile(&all_css, self.media_environment, root_font_size);
+            let (styled, mut style_timings, media_queries) = html_style::style_document_with_program_and_timings(document, &program, &all_css);
+            style_timings.parse_default_css = build_timings.parse_default_css;
+            style_timings.parse_author_css = build_timings.parse_author_css;
+            style_timings.prepare_rules = build_timings.prepare_rules;
+            style_timings.selector_index = build_timings.selector_index;
+            (styled, style_timings, media_queries)
+        } else {
+            html_style::style_document_with_cached_program_and_timings(&mut self.style_program_cache, document, &all_css, self.media_environment)
+        };
         if let Some(timings) = timings.as_deref_mut() {
             timings.parse_default_css += style_timings.parse_default_css;
             timings.parse_author_css += style_timings.parse_author_css;
@@ -422,7 +451,7 @@ pub struct BuildPipelineTimings {
 
 #[cfg(test)]
 mod tests {
-    use super::{DocumentFactory, decode_stylesheet_bytes};
+    use super::{BookStylesheetCache, DocumentFactory, decode_stylesheet_bytes};
     use html_dom::{Document, ElementRef, NodeRef};
     use html_resources::ResourceProvider;
     use std::collections::HashMap;
@@ -466,6 +495,19 @@ mod tests {
         let middle_text = document.text_ref(children[1]).expect("expected whitespace text node");
 
         assert_eq!(middle_text.text(), " ");
+    }
+
+    #[test]
+    fn reuses_compiled_style_programs_across_document_loads() {
+        let cache = BookStylesheetCache::default();
+        let css = ["p { color: red; margin: 1em }"];
+        for body in ["one", "two"] {
+            let mut factory = DocumentFactory::new();
+            factory.set_book_stylesheet_cache(cache.clone());
+            let _document = factory.parse_with_new_pipeline_css_chunks(&format!("<html><body><p>{body}</p></body></html>"), &css);
+        }
+        let stats = cache.stats();
+        assert_eq!((stats.compiled_entries, stats.compiled_hits, stats.compiled_misses), (1, 1, 1));
     }
 
     #[test]

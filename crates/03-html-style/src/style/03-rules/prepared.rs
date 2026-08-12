@@ -1,10 +1,9 @@
 //! The boundary between parser output and selector/cascade input.
 //!
-//! A `ParsedStylesheetSet` is only a borrowed view of Lightning CSS parser
-//! output. Calling `prepare` validates which style rules are effective and
-//! assigns compact handles plus cascade metadata. Downstream stages cannot
-//! accidentally index arbitrary parser nodes because they accept only a
-//! `PreparedRuleSet` and its private `EffectiveRuleId` values.
+//! A `ParsedStylesheetSet` is a borrowed view of Lightning CSS parser output.
+//! Calling `prepare` validates and owns the effective style rules, then assigns
+//! compact handles plus cascade metadata. The resulting `PreparedRuleSet` can
+//! therefore outlive the parser AST and be reused across documents.
 
 use super::media::{CompiledMediaList, MediaEnvironment, MediaQuerySet};
 use crate::style::matching::selectors::{selector_list_is_web_valid, selector_list_pseudo_mask};
@@ -19,7 +18,7 @@ use lightningcss::selector::SelectorList;
 use lightningcss::stylesheet::StyleSheet;
 use rustc_data_structures::fx::FxHashMap;
 use std::cmp::Ordering;
-use std::rc::Rc;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
@@ -176,11 +175,11 @@ impl ScopeId {
     const NONE: Self = Self(u32::MAX);
 }
 
-struct ScopeDescriptor<'sheet, 'css> {
+struct ScopeDescriptor<'css> {
     parent: ScopeId,
-    start: Option<&'sheet SelectorList<'css>>,
-    end: Option<&'sheet SelectorList<'css>>,
-    implicit_root: Option<DomNodeId>,
+    start: Option<SelectorList<'css>>,
+    end: Option<SelectorList<'css>>,
+    implicit_root_index: Option<u32>,
 }
 
 #[derive(Clone, Copy)]
@@ -196,9 +195,20 @@ pub(crate) struct EffectiveRule<'sheet, 'css> {
     scope: ScopeId,
 }
 
+#[derive(Clone, Copy)]
+struct PreparedRuleMetadata {
+    priority: RulePriority,
+    scope: ScopeId,
+}
+
+struct PendingRule<'css> {
+    style_rule: StyleRule<'css>,
+    metadata: PreparedRuleMetadata,
+}
+
 #[derive(Clone)]
 pub(crate) struct PreparedPropertyTarget {
-    pub(crate) name: Rc<str>,
+    pub(crate) name: Arc<str>,
     pub(crate) slot: u32,
     pub(crate) longhand: Option<PropertyId<'static>>,
 }
@@ -291,17 +301,17 @@ fn canonical_slot(name: &str) -> &str {
     }
 }
 
-fn intern_target(name: &str, longhand: Option<PropertyId<'static>>, slot_ids: &mut FxHashMap<Rc<str>, u32>) -> PreparedPropertyTarget {
+fn intern_target(name: &str, longhand: Option<PropertyId<'static>>, slot_ids: &mut FxHashMap<Arc<str>, u32>) -> PreparedPropertyTarget {
     if let Some((name, slot)) = slot_ids.get_key_value(name) {
         return PreparedPropertyTarget { name: name.clone(), slot: *slot, longhand };
     }
-    let name: Rc<str> = Rc::from(name);
+    let name: Arc<str> = Arc::from(name);
     let slot = u32::try_from(slot_ids.len()).expect("CSS property slot count fits in u32");
     slot_ids.insert(name.clone(), slot);
     PreparedPropertyTarget { name, slot, longhand }
 }
 
-fn append_property_targets(property: &Property<'_>, slot_ids: &mut FxHashMap<Rc<str>, u32>, output: &mut Vec<PreparedPropertyTarget>) {
+fn append_property_targets(property: &Property<'_>, slot_ids: &mut FxHashMap<Arc<str>, u32>, output: &mut Vec<PreparedPropertyTarget>) {
     if matches!(property, Property::Custom(value) if value.name.as_ref().starts_with("--")) || matches!(property, Property::Unparsed(value) if value.property_id.name().starts_with("--")) {
         return;
     }
@@ -321,7 +331,7 @@ fn append_property_targets(property: &Property<'_>, slot_ids: &mut FxHashMap<Rc<
     output.push(intern_target(canonical_slot(property_id.name()), None, slot_ids));
 }
 
-pub(crate) fn compile_property_targets(property: &Property<'_>, slot_ids: &mut FxHashMap<Rc<str>, u32>, targets: &mut Vec<PreparedPropertyTarget>) {
+pub(crate) fn compile_property_targets(property: &Property<'_>, slot_ids: &mut FxHashMap<Arc<str>, u32>, targets: &mut Vec<PreparedPropertyTarget>) {
     targets.clear();
     append_property_targets(property, slot_ids, targets);
 }
@@ -346,21 +356,21 @@ impl<'sheet, 'css> EffectiveRule<'sheet, 'css> {
 pub(crate) struct ParsedStylesheetSet<'sheet, 'css> {
     user_agent: &'sheet StyleSheet<'css>,
     authors: &'sheet [StyleSheet<'css>],
-    author_roots: &'sheet [Option<DomNodeId>],
+    author_root_indices: &'sheet [u32],
 }
 
 impl<'sheet, 'css> ParsedStylesheetSet<'sheet, 'css> {
     #[cfg(test)]
     pub(crate) fn new(user_agent: &'sheet StyleSheet<'css>, authors: &'sheet [StyleSheet<'css>]) -> Self {
-        Self { user_agent, authors, author_roots: &[] }
+        Self { user_agent, authors, author_root_indices: &[] }
     }
 
-    pub(crate) fn with_author_roots(user_agent: &'sheet StyleSheet<'css>, authors: &'sheet [StyleSheet<'css>], author_roots: &'sheet [Option<DomNodeId>]) -> Self {
-        debug_assert_eq!(authors.len(), author_roots.len());
-        Self { user_agent, authors, author_roots }
+    pub(crate) fn with_author_root_indices(user_agent: &'sheet StyleSheet<'css>, authors: &'sheet [StyleSheet<'css>], author_root_indices: &'sheet [u32]) -> Self {
+        debug_assert_eq!(authors.len(), author_root_indices.len());
+        Self { user_agent, authors, author_root_indices }
     }
 
-    pub(crate) fn prepare(self, environment: MediaEnvironment, initial_font_size: f64) -> PreparedRuleSet<'sheet, 'css> {
+    pub(crate) fn prepare(self, environment: MediaEnvironment, initial_font_size: f64) -> PreparedRuleSet<'css> {
         let capacity = self.user_agent.rules.0.len() + self.authors.iter().map(|stylesheet| stylesheet.rules.0.len()).sum::<usize>();
         let mut rules = Vec::with_capacity(capacity);
         let mut source_order = 0u32;
@@ -369,7 +379,10 @@ impl<'sheet, 'css> ParsedStylesheetSet<'sheet, 'css> {
         let mut scopes = Vec::new();
 
         prepare_origin(std::iter::once((self.user_agent, None)), CascadeOrigin::UserAgent, &mut rules, &mut scopes, &mut source_order, environment, initial_font_size, &mut media_queries, &mut media_path);
-        let authors = self.authors.iter().enumerate().map(|(index, stylesheet)| (stylesheet, self.author_roots.get(index).copied().flatten()));
+        let authors = self.authors.iter().enumerate().map(|(index, stylesheet)| {
+            let root_index = self.author_root_indices.get(index).copied().unwrap_or_else(|| u32::try_from(index).expect("author stylesheet count fits in u32"));
+            (stylesheet, Some(root_index))
+        });
         prepare_origin(authors, CascadeOrigin::Author, &mut rules, &mut scopes, &mut source_order, environment, initial_font_size, &mut media_queries, &mut media_path);
 
         let rule_pseudo_masks = rules
@@ -408,7 +421,9 @@ impl<'sheet, 'css> ParsedStylesheetSet<'sheet, 'css> {
             });
         }
 
+        let (style_rules, rules) = rules.into_iter().map(|rule| (rule.style_rule, rule.metadata)).unzip();
         PreparedRuleSet {
+            style_rules,
             rules,
             rule_pseudo_masks,
             scopes,
@@ -422,34 +437,34 @@ impl<'sheet, 'css> ParsedStylesheetSet<'sheet, 'css> {
     }
 }
 
-fn prepare_origin<'sheet, 'css>(
-    stylesheets: impl IntoIterator<Item = (&'sheet StyleSheet<'css>, Option<DomNodeId>)>, origin: CascadeOrigin, output: &mut Vec<EffectiveRule<'sheet, 'css>>, scopes: &mut Vec<ScopeDescriptor<'sheet, 'css>>, source_order: &mut u32,
+fn prepare_origin<'sheet, 'css: 'sheet>(
+    stylesheets: impl IntoIterator<Item = (&'sheet StyleSheet<'css>, Option<u32>)>, origin: CascadeOrigin, output: &mut Vec<PendingRule<'css>>, scopes: &mut Vec<ScopeDescriptor<'css>>, source_order: &mut u32,
     environment: MediaEnvironment, initial_font_size: f64, media_queries: &mut MediaQuerySet, media_path: &mut Vec<u32>,
 ) {
     let first_rule = output.len();
     let mut layers = LayerRegistry::default();
-    for (stylesheet, implicit_root) in stylesheets {
-        collect_effective_rules(&stylesheet.rules, origin, None, ScopeId::NONE, implicit_root, &mut layers, output, scopes, source_order, environment, initial_font_size, media_queries, media_path);
+    for (stylesheet, implicit_root_index) in stylesheets {
+        collect_effective_rules(&stylesheet.rules, origin, None, ScopeId::NONE, implicit_root_index, &mut layers, output, scopes, source_order, environment, initial_font_size, media_queries, media_path);
     }
 
     let ranks = layers.ranks();
     for rule in &mut output[first_rule..] {
-        if !rule.priority.layer.is_unlayered() {
-            rule.priority.layer = ranks[rule.priority.layer.0 as usize];
+        if !rule.metadata.priority.layer.is_unlayered() {
+            rule.metadata.priority.layer = ranks[rule.metadata.priority.layer.0 as usize];
         }
     }
 }
 
-fn collect_effective_rules<'sheet, 'css>(
-    rule_list: &'sheet CssRuleList<'css>, origin: CascadeOrigin, current_layer: Option<LayerId>, current_scope: ScopeId, implicit_root: Option<DomNodeId>, layers: &mut LayerRegistry, output: &mut Vec<EffectiveRule<'sheet, 'css>>,
-    scopes: &mut Vec<ScopeDescriptor<'sheet, 'css>>, source_order: &mut u32, environment: MediaEnvironment, initial_font_size: f64, media_queries: &mut MediaQuerySet, media_path: &mut Vec<u32>,
+fn collect_effective_rules<'css>(
+    rule_list: &CssRuleList<'css>, origin: CascadeOrigin, current_layer: Option<LayerId>, current_scope: ScopeId, implicit_root_index: Option<u32>, layers: &mut LayerRegistry, output: &mut Vec<PendingRule<'css>>,
+    scopes: &mut Vec<ScopeDescriptor<'css>>, source_order: &mut u32, environment: MediaEnvironment, initial_font_size: f64, media_queries: &mut MediaQuerySet, media_path: &mut Vec<u32>,
 ) {
     for rule in &rule_list.0 {
         match rule {
             CssRule::Style(style_rule) if selector_list_is_web_valid(&style_rule.selectors) => {
                 media_queries.record_dependency(media_path);
                 let layer = current_layer.map_or(LayerOrder::UNLAYERED, LayerOrder::from_layer_id);
-                output.push(EffectiveRule { style_rule, priority: RulePriority { origin, layer, source_order: *source_order }, scope: current_scope });
+                output.push(PendingRule { style_rule: style_rule.clone(), metadata: PreparedRuleMetadata { priority: RulePriority { origin, layer, source_order: *source_order }, scope: current_scope } });
                 *source_order = source_order.checked_add(1).expect("a stylesheet cannot contain more than u32::MAX effective rules");
             }
             CssRule::Media(media) => {
@@ -458,14 +473,14 @@ fn collect_effective_rules<'sheet, 'css>(
                 let query_id = media_queries.register_query(compiled);
                 media_path.push(query_id);
                 if applies {
-                    collect_effective_rules(&media.rules, origin, current_layer, current_scope, implicit_root, layers, output, scopes, source_order, environment, initial_font_size, media_queries, media_path);
+                    collect_effective_rules(&media.rules, origin, current_layer, current_scope, implicit_root_index, layers, output, scopes, source_order, environment, initial_font_size, media_queries, media_path);
                 } else {
                     collect_media_dependencies(&media.rules, media_queries, media_path);
                 }
                 media_path.pop();
             }
             CssRule::Supports(supports) if supports_condition_applies(&supports.condition) => {
-                collect_effective_rules(&supports.rules, origin, current_layer, current_scope, implicit_root, layers, output, scopes, source_order, environment, initial_font_size, media_queries, media_path);
+                collect_effective_rules(&supports.rules, origin, current_layer, current_scope, implicit_root_index, layers, output, scopes, source_order, environment, initial_font_size, media_queries, media_path);
             }
             CssRule::LayerStatement(statement) => {
                 media_queries.record_dependency(media_path);
@@ -479,15 +494,15 @@ fn collect_effective_rules<'sheet, 'css>(
                     Some(name) => layers.register_named(current_layer, name),
                     None => layers.register_anonymous(current_layer),
                 };
-                collect_effective_rules(&block.rules, origin, Some(layer), current_scope, implicit_root, layers, output, scopes, source_order, environment, initial_font_size, media_queries, media_path);
+                collect_effective_rules(&block.rules, origin, Some(layer), current_scope, implicit_root_index, layers, output, scopes, source_order, environment, initial_font_size, media_queries, media_path);
             }
             CssRule::Scope(scope) => {
                 let start_valid = scope.scope_start.as_ref().is_none_or(selector_list_is_web_valid);
                 let end_valid = scope.scope_end.as_ref().is_none_or(selector_list_is_web_valid);
                 if start_valid && end_valid {
                     let scope_id = ScopeId(u32::try_from(scopes.len()).expect("scope IDs fit in u32"));
-                    scopes.push(ScopeDescriptor { parent: current_scope, start: scope.scope_start.as_ref(), end: scope.scope_end.as_ref(), implicit_root });
-                    collect_effective_rules(&scope.rules, origin, current_layer, scope_id, implicit_root, layers, output, scopes, source_order, environment, initial_font_size, media_queries, media_path);
+                    scopes.push(ScopeDescriptor { parent: current_scope, start: scope.scope_start.clone(), end: scope.scope_end.clone(), implicit_root_index });
+                    collect_effective_rules(&scope.rules, origin, current_layer, scope_id, implicit_root_index, layers, output, scopes, source_order, environment, initial_font_size, media_queries, media_path);
                 }
             }
             _ => {}
@@ -582,19 +597,20 @@ fn supports_declaration_value(value: &str) -> Option<&str> {
     }
 }
 
-pub(crate) struct PreparedRuleSet<'sheet, 'css> {
-    rules: Vec<EffectiveRule<'sheet, 'css>>,
+pub(crate) struct PreparedRuleSet<'css> {
+    style_rules: Vec<StyleRule<'css>>,
+    rules: Vec<PreparedRuleMetadata>,
     rule_pseudo_masks: Vec<u8>,
-    scopes: Vec<ScopeDescriptor<'sheet, 'css>>,
+    scopes: Vec<ScopeDescriptor<'css>>,
     rule_target_starts: Vec<PreparedRuleDeclarations>,
     declaration_target_ranges: Vec<PreparedTargetRange>,
     property_targets: Vec<PreparedPropertyTarget>,
-    property_slots: FxHashMap<Rc<str>, u32>,
+    property_slots: FxHashMap<Arc<str>, u32>,
     media_queries: MediaQuerySet,
     environment: MediaEnvironment,
 }
 
-impl<'sheet, 'css> PreparedRuleSet<'sheet, 'css> {
+impl<'css> PreparedRuleSet<'css> {
     pub(crate) fn media_queries(&self) -> &MediaQuerySet {
         &self.media_queries
     }
@@ -606,15 +622,16 @@ impl<'sheet, 'css> PreparedRuleSet<'sheet, 'css> {
         self.rules.len()
     }
 
-    pub(crate) fn iter(&self) -> impl Iterator<Item = (EffectiveRuleId, EffectiveRule<'sheet, 'css>)> + '_ {
-        self.rules.iter().copied().enumerate().map(|(index, rule)| {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (EffectiveRuleId, EffectiveRule<'_, 'css>)> + '_ {
+        self.rules.iter().copied().enumerate().map(|(index, metadata)| {
             let index = u32::try_from(index).expect("prepared rule IDs fit in u32");
-            (EffectiveRuleId(index), rule)
+            (EffectiveRuleId(index), EffectiveRule { style_rule: &self.style_rules[index as usize], priority: metadata.priority, scope: metadata.scope })
         })
     }
 
-    pub(crate) fn get(&self, id: EffectiveRuleId) -> EffectiveRule<'sheet, 'css> {
-        self.rules[id.0 as usize]
+    pub(crate) fn get(&self, id: EffectiveRuleId) -> EffectiveRule<'_, 'css> {
+        let metadata = self.rules[id.0 as usize];
+        EffectiveRule { style_rule: &self.style_rules[id.0 as usize], priority: metadata.priority, scope: metadata.scope }
     }
 
     pub(crate) fn pseudo_mask(&self, id: EffectiveRuleId) -> u8 {
@@ -645,7 +662,7 @@ impl<'sheet, 'css> PreparedRuleSet<'sheet, 'css> {
         (mask & !ALL_DECLARATIONS_SHADOWABLE, mask & ALL_DECLARATIONS_SHADOWABLE != 0)
     }
 
-    pub(crate) fn clone_property_slots(&self) -> FxHashMap<Rc<str>, u32> {
+    pub(crate) fn clone_property_slots(&self) -> FxHashMap<Arc<str>, u32> {
         self.property_slots.clone()
     }
 
@@ -653,12 +670,12 @@ impl<'sheet, 'css> PreparedRuleSet<'sheet, 'css> {
         self.property_slots.len()
     }
 
-    pub(crate) fn scope_match(&self, scope: ScopeId, document: &Document, subject: DomNodeId) -> Option<ScopeMatch> {
+    pub(crate) fn scope_match(&self, scope: ScopeId, document: &Document, author_roots: &[Option<DomNodeId>], subject: DomNodeId) -> Option<ScopeMatch> {
         if scope == ScopeId::NONE {
             return Some(ScopeMatch { root: document.dom_root()?, proximity: u32::MAX });
         }
         let descriptor = &self.scopes[scope.0 as usize];
-        let parent = self.scope_match(descriptor.parent, document, subject)?;
+        let parent = self.scope_match(descriptor.parent, document, author_roots, subject)?;
         let inside_parent = |candidate| candidate == parent.root || document.dom_ancestors(candidate).any(|ancestor| ancestor == parent.root);
         let match_for_root = |root| {
             let mut proximity = 0u32;
@@ -673,14 +690,14 @@ impl<'sheet, 'css> PreparedRuleSet<'sheet, 'css> {
             }
             None
         };
-        if let Some(start) = descriptor.start {
+        if let Some(start) = &descriptor.start {
             std::iter::once(subject)
                 .chain(document.dom_ancestors(subject))
                 .take_while(|candidate| inside_parent(*candidate))
                 .filter(|candidate| start.0.iter().any(|selector| crate::style::matching::dom::selector_matches_dom_node_in_scope(selector, document, *candidate, parent.root)))
                 .find_map(match_for_root)
         } else {
-            let root = descriptor.implicit_root?;
+            let root = author_roots.get(descriptor.implicit_root_index? as usize).copied().flatten()?;
             inside_parent(root).then(|| match_for_root(root)).flatten()
         }
     }
@@ -695,7 +712,7 @@ mod tests {
     use lightningcss::stylesheet::{ParserOptions, StyleSheet};
 
     #[test]
-    fn preparation_keeps_ast_nodes_borrowed_and_filters_invalid_selectors() {
+    fn preparation_owns_effective_rules_and_filters_invalid_selectors() {
         let user_agent = StyleSheet::parse("", ParserOptions::default()).unwrap();
         let author = StyleSheet::parse("p { color: red } p, :unknown { color: blue }", ParserOptions { error_recovery: true, ..ParserOptions::default() }).unwrap();
         let expected = match &author.rules.0[0] {
@@ -705,10 +722,10 @@ mod tests {
         let authors = [author];
         let (prepared, allocations) = count_allocations(|| ParsedStylesheetSet::new(&user_agent, &authors).prepare(MediaEnvironment::default(), 16.0));
 
-        assert_eq!(allocations, 7, "preparation should allocate only its dense rule and declaration metadata");
+        assert_eq!(allocations, 11, "preparation should allocate its owned effective rules and dense declaration metadata");
         assert_eq!(prepared.len(), 1);
         let (_, rule) = prepared.iter().next().unwrap();
-        assert_eq!(rule.style_rule() as *const _, expected);
+        assert_ne!(rule.style_rule() as *const _, expected, "prepared rules must not borrow parser AST nodes");
         assert_eq!(rule.priority().origin(), CascadeOrigin::Author);
 
         let (count, allocations) = count_allocations(|| prepared.iter().count());

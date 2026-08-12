@@ -1,6 +1,6 @@
 use lightningcss::media_query::{MediaCondition as ParsedCondition, MediaFeatureComparison, MediaFeatureId, MediaFeatureName, MediaFeatureValue, MediaList, MediaType as ParsedMediaType, Operator, Qualifier, QueryFeature};
 use lightningcss::values::length::{Length, LengthValue};
-use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum MediaType {
@@ -68,20 +68,26 @@ pub struct MediaMatchKey {
 
 /// Owned media dependencies retained by the pipeline after Lightning CSS's
 /// borrowed stylesheet AST has been dropped.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct MediaQuerySet {
     queries: Vec<CompiledMediaList>,
     rule_conditions: Vec<Vec<u32>>,
-    uses_viewport_units: Cell<bool>,
+    uses_viewport_units: AtomicBool,
+}
+
+impl Clone for MediaQuerySet {
+    fn clone(&self) -> Self {
+        Self { queries: self.queries.clone(), rule_conditions: self.rule_conditions.clone(), uses_viewport_units: AtomicBool::new(self.uses_viewport_units()) }
+    }
 }
 
 impl MediaQuerySet {
     pub fn uses_viewport_units(&self) -> bool {
-        self.uses_viewport_units.get()
+        self.uses_viewport_units.load(AtomicOrdering::Relaxed)
     }
 
     pub(crate) fn mark_viewport_unit_dependency(&self) {
-        self.uses_viewport_units.set(true);
+        self.uses_viewport_units.store(true, AtomicOrdering::Relaxed);
     }
     pub fn match_key(&self, environment: MediaEnvironment, initial_font_size: f64) -> MediaMatchKey {
         let mut words = vec![0; self.rule_conditions.len().div_ceil(64)];

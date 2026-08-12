@@ -41,9 +41,10 @@ use lightningcss::properties::{Property, PropertyId};
 use lightningcss::selector::SelectorList;
 use lightningcss::stylesheet::{ParserOptions, StyleSheet};
 use lightningcss::traits::ParseWithOptions;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub use style::rules::media::{MediaEnvironment, MediaMatchKey, MediaQuerySet, MediaType};
+pub use style::rules::program::{StyleProgram, StyleProgramCache, StyleProgramCacheStats, style_document_with_cached_program_and_timings, style_document_with_program_and_timings};
 
 #[cfg(test)]
 mod allocation_test_support {
@@ -448,59 +449,40 @@ pub fn style_document_with_environment_and_timings(document: Document, css_chunk
 }
 
 pub fn style_document_with_author_stylesheets_and_environment_and_timings(document: Document, inputs: &[AuthorStylesheetInput<'_>], environment: MediaEnvironment) -> (StyledDocument, StyleTimings, MediaQuerySet) {
-    let mut timings = StyleTimings::default();
-    // Lightning CSS stylesheets are invariant over their source lifetime, so
-    // the UA source must live alongside normalized reader CSS.
-    let default_css = DEFAULT_CSS.to_owned();
-    let normalized_chunks = inputs.iter().map(|input| style::source::declarations::normalize(input.css)).collect::<Vec<_>>();
-    let mut stylesheets = Vec::with_capacity(inputs.len());
-    let mut author_roots = Vec::with_capacity(inputs.len());
-    let started = Instant::now();
-    let user_agent = StyleSheet::parse(&default_css, ParserOptions::default()).expect("default CSS must parse");
-    timings.parse_default_css = started.elapsed();
-
-    let started = Instant::now();
-    for (idx, css) in normalized_chunks.iter().enumerate() {
-        if css.trim().is_empty() {
-            continue;
-        }
-        let options = ParserOptions { error_recovery: true, ..ParserOptions::default() };
-        match StyleSheet::parse(css, options) {
-            Ok(stylesheet) => {
-                stylesheets.push(stylesheet);
-                author_roots.push(inputs[idx].implicit_scope_root);
-            }
-            Err(error) => eprintln!("Skipping CSS chunk {idx}: {error}"),
-        }
-    }
-    timings.parse_author_css = started.elapsed();
-
-    let started = Instant::now();
-    let prepared = style::rules::prepared::ParsedStylesheetSet::with_author_roots(&user_agent, &stylesheets, &author_roots).prepare(environment, f64::from(document.root_font_size()));
-    timings.prepare_rules = started.elapsed();
-
-    let started = Instant::now();
-    let (styles, resolution) = style::cascade::resolver::resolve_styles_for_dom_timed(&document, &prepared);
-    let media_queries = prepared.media_queries().clone();
-    timings.resolve_styles = started.elapsed();
-    timings.selector_index = resolution.selector_index;
-    timings.resolver_setup = resolution.resolver_setup;
-    timings.selector_matching = resolution.selector_matching;
-    timings.cascade = resolution.cascade;
-    timings.style_store = resolution.style_store;
-    (StyledDocument { document, styles }, timings, media_queries)
+    style::rules::program::compile_and_apply(document, inputs, environment)
 }
 
 #[cfg(test)]
 mod boundary_tests {
     use super::{
-        DeclarationSupport, MediaEnvironment, PropertyCapability, PropertySyntax, PropertyValueSyntax, UnsupportedStyleFeature, declaration_support, property_value_syntax, selector_syntax_is_valid, style_document,
-        style_document_with_environment,
+        AuthorStylesheetInput, DeclarationSupport, MediaEnvironment, PropertyCapability, PropertySyntax, PropertyValueSyntax, StyleProgramCache, UnsupportedStyleFeature, declaration_support, property_value_syntax, selector_syntax_is_valid, style_document,
+        style_document_with_cached_program_and_timings, style_document_with_environment,
     };
     use html_style_model::{Float, LengthPct, PreferredSize, SizeComparison, TabSizeKind, WhiteSpace, resolve_used_preferred_size};
+    use std::time::Duration;
 
     fn standards_document(html: &str) -> html_dom::Document {
         html_parse::parse_dom_document(&format!("<!doctype html>{html}")).expect("valid standards-mode HTML")
+    }
+
+    #[test]
+    fn compiled_style_programs_are_reused_and_rebind_implicit_scope_roots() {
+        let css = "@scope { p { color: red } }";
+        let mut cache = StyleProgramCache::default();
+        for expected_hits in [0, 1] {
+            let document = standards_document("<html><body><p>cached</p></body></html>");
+            let root = document.dom_root();
+            let inputs = [AuthorStylesheetInput { css, implicit_scope_root: root }];
+            let (styled, timings, _) = style_document_with_cached_program_and_timings(&mut cache, document, &inputs, MediaEnvironment::default());
+            let paragraph = styled.document().node_ids().find(|node| styled.document().get_dom_tag(*node) == Some("p")).expect("paragraph");
+            let style = styled.style_for_node(paragraph).expect("paragraph style");
+            assert_eq!(styled.text_style(style).expect("paragraph text style").color, 0xFF0000FF);
+            assert_eq!(cache.stats().hits, expected_hits);
+            if expected_hits == 1 {
+                assert_eq!(timings.parse_default_css + timings.parse_author_css + timings.prepare_rules + timings.selector_index, Duration::ZERO);
+            }
+        }
+        assert_eq!(cache.stats().misses, 1);
     }
 
     #[test]

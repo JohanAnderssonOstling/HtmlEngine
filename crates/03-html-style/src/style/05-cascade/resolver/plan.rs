@@ -20,7 +20,7 @@ impl CascadePlan {
     pub(super) fn build(
         mut normal: Vec<MatchedRule>,
         important_scratch: &mut Vec<MatchedRule>,
-        prepared: &PreparedRuleSet<'_, '_>,
+        prepared: &PreparedRuleSet<'_>,
     ) -> Self {
         // Preserve this buffer's capacity between elements. Cloning `normal`
         // allocated and copied every matching rule even when only a small

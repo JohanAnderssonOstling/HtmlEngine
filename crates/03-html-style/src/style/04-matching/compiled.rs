@@ -8,6 +8,7 @@ use crate::style::rules::prepared::{EffectiveRuleId, PreparedRuleSet};
 use html_dom::{Document, DomNodeId};
 use lightningcss::selector::{Combinator, Component, Selector};
 use lightningcss::values::ident::Ident;
+use static_self::IntoOwned;
 
 #[derive(Clone, Copy)]
 pub(crate) struct PreparedSelector {
@@ -18,13 +19,13 @@ pub(crate) struct PreparedSelector {
 }
 
 #[derive(Clone)]
-enum FastTest<'css> {
+enum FastTest {
     LocalName {
-        name: Ident<'css>,
-        lower_name: Ident<'css>,
+        name: Ident<'static>,
+        lower_name: Ident<'static>,
     },
-    Id(Ident<'css>),
-    Class(Ident<'css>),
+    Id(Ident<'static>),
+    Class(Ident<'static>),
 }
 
 #[derive(Clone, Copy)]
@@ -41,14 +42,14 @@ struct Compound {
     relation: Relation,
 }
 
-pub(crate) struct CompiledSelectors<'css> {
+pub(crate) struct CompiledSelectors {
     rule_starts: Vec<u32>,
     selectors: Vec<PreparedSelector>,
-    tests: Vec<FastTest<'css>>,
+    tests: Vec<FastTest>,
     compounds: Vec<Compound>,
 }
 
-impl<'css> CompiledSelectors<'css> {
+impl CompiledSelectors {
     pub(crate) fn empty() -> Self {
         Self {
             rule_starts: Vec::new(),
@@ -58,7 +59,7 @@ impl<'css> CompiledSelectors<'css> {
         }
     }
 
-    pub(crate) fn from_prepared(prepared: &PreparedRuleSet<'_, 'css>) -> Self {
+    pub(crate) fn from_prepared(prepared: &PreparedRuleSet<'_>) -> Self {
         let mut rule_count = 0;
         let mut selector_count = 0;
         let mut fast_test_count = 0;
@@ -198,9 +199,9 @@ fn ancestor_requirement_mask(selector: &Selector<'_>) -> u64 {
     requirements
 }
 
-fn append_fast<'css>(
-    selector: &Selector<'css>,
-    tests: &mut Vec<FastTest<'css>>,
+fn append_fast(
+    selector: &Selector<'_>,
+    tests: &mut Vec<FastTest>,
     compounds: &mut Vec<Compound>,
 ) -> Option<(u32, u16)> {
     let tests_before = tests.len();
@@ -209,11 +210,11 @@ fn append_fast<'css>(
     for component in selector.iter_raw_match_order() {
         match component {
             Component::LocalName(name) => tests.push(FastTest::LocalName {
-                name: name.name.clone(),
-                lower_name: name.lower_name.clone(),
+                name: name.name.clone().into_owned(),
+                lower_name: name.lower_name.clone().into_owned(),
             }),
-            Component::ID(id) => tests.push(FastTest::Id(id.clone())),
-            Component::Class(class) => tests.push(FastTest::Class(class.clone())),
+            Component::ID(id) => tests.push(FastTest::Id(id.clone().into_owned())),
+            Component::Class(class) => tests.push(FastTest::Class(class.clone().into_owned())),
             Component::ExplicitUniversalType => {}
             Component::Combinator(combinator @ (Combinator::Child | Combinator::Descendant)) => {
                 let Ok(test_len) = u16::try_from(tests.len() - test_start) else {
@@ -287,9 +288,9 @@ mod tests {
         SelectorList::parse_string_with_options(text, ParserOptions::default()).unwrap()
     }
 
-    fn prepared<'css>(
-        selector: &Selector<'css>,
-        compiled: &mut CompiledSelectors<'css>,
+    fn prepared(
+        selector: &Selector<'_>,
+        compiled: &mut CompiledSelectors,
     ) -> PreparedSelector {
         let (fast_start, fast_len) =
             append_fast(selector, &mut compiled.tests, &mut compiled.compounds).unwrap();

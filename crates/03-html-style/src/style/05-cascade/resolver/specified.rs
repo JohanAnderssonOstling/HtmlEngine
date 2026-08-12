@@ -5,7 +5,7 @@
 //! `revert` and `revert-layer` discard candidates from their cascade scope.
 
 use super::*;
-use std::rc::Rc;
+use std::sync::Arc;
 
 const ALWAYS_COMPUTABLE: u8 = 1 << 0;
 const ELIGIBILITY_KNOWN: u8 = 1 << 1;
@@ -128,7 +128,7 @@ pub(super) struct EventScratch<'sheet, 'css> {
     shadow_epoch: u32,
 }
 
-fn mark_fully_shadowed_rules(prepared: &PreparedRuleSet<'_, '_>, rules: &[MatchedRule], important: bool, origin: Option<CascadeOrigin>, skipped_rules: &mut Vec<bool>, shadow_epochs: &mut Vec<u32>, shadow_epoch: &mut u32) {
+fn mark_fully_shadowed_rules(prepared: &PreparedRuleSet<'_>, rules: &[MatchedRule], important: bool, origin: Option<CascadeOrigin>, skipped_rules: &mut Vec<bool>, shadow_epochs: &mut Vec<u32>, shadow_epoch: &mut u32) {
     skipped_rules.clear();
     skipped_rules.resize(rules.len(), false);
     let mut group_end = rules.len();
@@ -190,7 +190,7 @@ pub(super) struct CascadeScratch<'sheet, 'css> {
     pub(super) selection: SpecifiedSelection,
 }
 
-pub(super) fn build_cascade_events<'prepared, 'sheet, 'css>(prepared: &'prepared PreparedRuleSet<'sheet, 'css>, normal_rules: &[MatchedRule], important_rules: &[MatchedRule], inline_style: Option<&StyleAttribute<'css>>, scratch: &mut EventScratch<'prepared, 'css>) -> usize {
+pub(super) fn build_cascade_events<'prepared, 'css>(prepared: &'prepared PreparedRuleSet<'css>, normal_rules: &[MatchedRule], important_rules: &[MatchedRule], inline_style: Option<&StyleAttribute<'css>>, scratch: &mut EventScratch<'prepared, 'css>) -> usize {
     let inline_capacity = inline_style.map_or(0, |inline| inline.declarations.declarations.len() + inline.declarations.important_declarations.len());
     let event_capacity = normal_rules.iter().map(|matched| prepared.get(matched.id).style_rule().declarations.declarations.len()).sum::<usize>() + important_rules.iter().map(|matched| prepared.get(matched.id).style_rule().declarations.important_declarations.len()).sum::<usize>() + inline_capacity;
     let events = &mut scratch.events;
@@ -293,7 +293,7 @@ pub(super) type PropertyTarget = PreparedPropertyTarget;
 
 #[derive(Default)]
 pub(super) struct PropertyTargetState {
-    slot_ids: Option<FxHashMap<Rc<str>, u32>>,
+    slot_ids: Option<FxHashMap<Arc<str>, u32>>,
     claim_epochs: Vec<u32>,
     epoch: u32,
 }
@@ -334,7 +334,7 @@ pub(super) struct SpecifiedSelection {
     inline_targets: Vec<PropertyTarget>,
     /// Presentational hints cascade as a distinct origin, but `revert` in the
     /// author origin also rolls that origin back.
-    pub(super) reverted_hint_targets: rustc_data_structures::fx::FxHashSet<Rc<str>>,
+    pub(super) reverted_hint_targets: rustc_data_structures::fx::FxHashSet<Arc<str>>,
     pub(super) reverted_all_hints: bool,
 }
 
@@ -393,7 +393,7 @@ pub(super) fn declaration_is_custom_property(property: &Property<'_>) -> bool {
 /// Return only the declarations that win at least one longhand. The output is
 /// restored to low-to-high order so computed-value conversion remains ordered
 /// for logical/physical aliases that share renderer storage.
-pub(super) fn select_specified_values<'sheet, 'css>(events: &[DeclarationEvent<'sheet, 'css>], prepared: &PreparedRuleSet<'_, 'css>, inline_style: Option<&StyleAttribute<'css>>, target_state: &mut PropertyTargetState, selected: &mut SpecifiedSelection) {
+pub(super) fn select_specified_values<'sheet, 'css>(events: &[DeclarationEvent<'sheet, 'css>], prepared: &PreparedRuleSet<'css>, inline_style: Option<&StyleAttribute<'css>>, target_state: &mut PropertyTargetState, selected: &mut SpecifiedSelection) {
     let claim_epoch = target_state.begin_selection();
     let mut rollbacks = FxHashMap::<u32, Vec<Rollback>>::default();
     let mut global_rollbacks = Vec::<Rollback>::new();

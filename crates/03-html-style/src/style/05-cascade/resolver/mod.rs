@@ -94,17 +94,17 @@ use wide_keywords::*;
 /// This works with the DOM tree before boxes are created
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ResolveStyleTimings {
-    pub selector_index: Duration,
     pub resolver_setup: Duration,
     pub selector_matching: Duration,
     pub cascade: Duration,
     pub style_store: Duration,
 }
 
-pub(super) struct StyleResolverContext<'a, 'sheet, 'css> {
+pub(super) struct StyleResolverContext<'a, 'css> {
     pub(super) doc: &'a Document,
-    pub(super) prepared: &'a PreparedRuleSet<'sheet, 'css>,
-    pub(super) index: &'a SelectorIndex<'css>,
+    pub(super) prepared: &'a PreparedRuleSet<'css>,
+    pub(super) author_roots: &'a [Option<DomNodeId>],
+    pub(super) index: &'a SelectorIndex,
     pub(super) styles: &'a mut ComputedStylesBuilder,
     pub(super) candidate_scratch: &'a mut Vec<EffectiveRuleId>,
     pub(super) candidate_seen: &'a mut CandidateDeduper,
@@ -149,20 +149,16 @@ thread_local! {
     static RESOLUTION_ROOT_LINE_HEIGHT: Cell<Option<f32>> = const { Cell::new(None) };
 }
 
-pub(crate) fn resolve_styles_for_dom_timed<'sheet, 'css>(
+pub(crate) fn resolve_styles_for_dom_timed<'css>(
     doc: &Document,
-    prepared: &PreparedRuleSet<'sheet, 'css>,
+    prepared: &PreparedRuleSet<'css>,
+    index: &SelectorIndex,
+    author_roots: &[Option<DomNodeId>],
 ) -> (ComputedStyles, ResolveStyleTimings) {
     RESOLUTION_MEDIA_ENVIRONMENT.set(prepared.environment());
     RESOLUTION_USES_VIEWPORT_UNITS.set(false);
     RESOLUTION_ROOT_LINE_HEIGHT.set(None);
-    // Build selector index for fast candidate lookup
-    let started = Instant::now();
-    let index = SelectorIndex::from_prepared(prepared);
-    let mut timings = ResolveStyleTimings {
-        selector_index: started.elapsed(),
-        ..ResolveStyleTimings::default()
-    };
+    let mut timings = ResolveStyleTimings::default();
 
     // Process each DOM element
     let started = Instant::now();
@@ -186,7 +182,8 @@ pub(crate) fn resolve_styles_for_dom_timed<'sheet, 'css>(
         let mut resolver = StyleResolverContext {
             doc,
             prepared,
-            index: &index,
+            author_roots,
+            index,
             styles: &mut computed_styles,
             candidate_scratch: &mut candidate_scratch,
             candidate_seen: &mut candidate_seen,
@@ -399,7 +396,7 @@ pub(crate) fn resolve_styles_for_dom_timed<'sheet, 'css>(
     (styles, timings)
 }
 
-impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
+impl<'a, 'css> StyleResolverContext<'a, 'css> {
     fn compute_pseudo_style_for_dom_element(
         &mut self,
         node_idx: DomNodeId,
@@ -416,7 +413,7 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
                 continue;
             }
             let style_rule = prepared.get(id).style_rule();
-            let Some(scope_match) = prepared.scope_match(prepared.get(id).scope(), doc, node_idx)
+            let Some(scope_match) = prepared.scope_match(prepared.get(id).scope(), doc, self.author_roots, node_idx)
             else {
                 continue;
             };
@@ -507,7 +504,7 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
 }
 
 /// Compute style for a single DOM element (used in new pipeline)
-impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
+impl<'a, 'css> StyleResolverContext<'a, 'css> {
     fn compute_style_for_dom_element(
         &mut self,
         node_idx: DomNodeId,
@@ -541,7 +538,7 @@ impl<'a, 'sheet, 'css> StyleResolverContext<'a, 'sheet, 'css> {
         // matching selectors, not the first one that happens to match.
         for id in self.candidate_scratch.iter().copied() {
             let style_rule = prepared.get(id).style_rule();
-            let Some(scope_match) = prepared.scope_match(prepared.get(id).scope(), doc, node_idx)
+            let Some(scope_match) = prepared.scope_match(prepared.get(id).scope(), doc, self.author_roots, node_idx)
             else {
                 continue;
             };

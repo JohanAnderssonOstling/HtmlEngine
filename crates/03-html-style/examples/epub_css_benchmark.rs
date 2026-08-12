@@ -5,7 +5,7 @@
 //!
 //! Arguments are measured iterations and synthetic page copies.
 
-use html_style::{StyleTimings, style_document_with_timings};
+use html_style::{AuthorStylesheetInput, MediaEnvironment, StyleProgramCache, StyleTimings, style_document_with_cached_program_and_timings};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::collections::BTreeSet;
@@ -198,11 +198,15 @@ fn workload(css_chunks: &[&str], page_copies: usize) -> (String, usize) {
     (html, classes.len())
 }
 
-fn run(sample: &Sample, iterations: usize, page_copies: usize) {
+fn run(sample: &Sample, iterations: usize, page_copies: usize, reuse_program: bool) {
     let (html, class_count) = workload(sample.css, page_copies);
+    let mut style_program_cache = StyleProgramCache::default();
     for _ in 0..2 {
         let document = html_parse::parse_dom_document(&html).expect("benchmark HTML parses");
-        black_box(style_document_with_timings(document, sample.css));
+        let root = document.dom_root();
+        let inputs = sample.css.iter().map(|css| AuthorStylesheetInput { css, implicit_scope_root: root }).collect::<Vec<_>>();
+        black_box(style_document_with_cached_program_and_timings(&mut style_program_cache, document, &inputs, MediaEnvironment::default()));
+        if !reuse_program { style_program_cache.clear() }
     }
 
     let mut samples = Samples::default();
@@ -210,6 +214,7 @@ fn run(sample: &Sample, iterations: usize, page_copies: usize) {
     let mut style_peak_bytes = 0;
     let mut node_count = 0;
     for iteration in 0..iterations {
+        if !reuse_program { style_program_cache.clear() }
         let started = Instant::now();
         let document = html_parse::parse_dom_document(&html).expect("benchmark HTML parses");
         let html_parse = started.elapsed();
@@ -220,7 +225,9 @@ fn run(sample: &Sample, iterations: usize, page_copies: usize) {
             ALLOCATION_BYTES.with(|bytes| bytes.set(Some((0, 0))));
         }
         let started = Instant::now();
-        let (styled, timings) = style_document_with_timings(document, sample.css);
+        let root = document.dom_root();
+        let inputs = sample.css.iter().map(|css| AuthorStylesheetInput { css, implicit_scope_root: root }).collect::<Vec<_>>();
+        let (styled, timings, _) = style_document_with_cached_program_and_timings(&mut style_program_cache, document, &inputs, MediaEnvironment::default());
         let total_style = started.elapsed();
         if iteration == 0 {
             style_allocations =
@@ -262,10 +269,11 @@ fn main() {
         .next()
         .and_then(|value| value.parse().ok())
         .unwrap_or(4);
+    let reuse_program = arguments.next().as_deref() != Some("cold");
     assert!(iterations > 0 && page_copies > 0);
 
-    println!("iterations={iterations} page_copies={page_copies}");
+    println!("iterations={iterations} page_copies={page_copies} reuse_program={reuse_program}");
     for sample in SAMPLES {
-        run(sample, iterations, page_copies);
+        run(sample, iterations, page_copies, reuse_program);
     }
 }
