@@ -3,7 +3,7 @@ mod tests {
     use super::{BreakKind, InlineToken, InlineTokenKind, InlineTokenMetrics, InlineTokens, TokenWrap, automatic_hyphen_fragments_are_long_enough, vertical_align_offset};
     use crate::parser::DocumentFactory;
     use crate::test_support::TestGlyphShaper as GlyphCache;
-    use crate::{FontSlant, GlyphId, GlyphRegistry, GlyphShaper, LaidOutDocument, ShapeError, ShapedTextRun, TextRunShapeRequest, TextShapeRequest};
+    use crate::{FontSlant, GlyphId, GlyphShaper, LaidOutDocument, ShapeError, ShapedTextRun, TextRunShapeRequest, TextShapeRequest};
     use html_style_model::{VerticalAlignValue, WhiteSpace};
     use lightningcss::stylesheet::ParserOptions;
     use std::fs;
@@ -22,8 +22,24 @@ mod tests {
             self.fallback.reset();
         }
 
-        fn shape_glyph<'a>(&mut self, glyph_metrics: &mut GlyphRegistry<'a>, ch: char, font_size: f32, font_weight: u16, font_slant: FontSlant, color: u32, family: Option<&str>) -> Result<GlyphId, ShapeError> {
-            self.fallback.shape_glyph(glyph_metrics, ch, font_size, font_weight, font_slant, color, family)
+        fn glyph_resources(&mut self) -> &mut crate::GlyphResourceStore {
+            self.fallback.glyph_resources()
+        }
+
+        fn begin_append_shaping(&mut self) -> Result<(), ShapeError> {
+            self.fallback.begin_append_shaping()
+        }
+
+        fn commit_append_shaping(&mut self) {
+            self.fallback.commit_append_shaping();
+        }
+
+        fn rollback_append_shaping(&mut self) {
+            self.fallback.rollback_append_shaping();
+        }
+
+        fn shape_glyph(&mut self, ch: char, font_size: f32, font_weight: u16, font_slant: FontSlant, color: u32, family: Option<&str>) -> Result<GlyphId, ShapeError> {
+            self.fallback.shape_glyph(ch, font_size, font_weight, font_slant, color, family)
         }
 
         fn shape_text_run(&mut self, request: TextRunShapeRequest<'_>) -> Result<Option<ShapedTextRun>, ShapeError> {
@@ -50,8 +66,24 @@ mod tests {
             self.fallback.reset();
         }
 
-        fn shape_glyph<'a>(&mut self, glyph_metrics: &mut GlyphRegistry<'a>, ch: char, font_size: f32, font_weight: u16, font_slant: FontSlant, color: u32, family: Option<&str>) -> Result<GlyphId, ShapeError> {
-            self.fallback.shape_glyph(glyph_metrics, ch, font_size, font_weight, font_slant, color, family)
+        fn glyph_resources(&mut self) -> &mut crate::GlyphResourceStore {
+            self.fallback.glyph_resources()
+        }
+
+        fn begin_append_shaping(&mut self) -> Result<(), ShapeError> {
+            self.fallback.begin_append_shaping()
+        }
+
+        fn commit_append_shaping(&mut self) {
+            self.fallback.commit_append_shaping();
+        }
+
+        fn rollback_append_shaping(&mut self) {
+            self.fallback.rollback_append_shaping();
+        }
+
+        fn shape_glyph(&mut self, ch: char, font_size: f32, font_weight: u16, font_slant: FontSlant, color: u32, family: Option<&str>) -> Result<GlyphId, ShapeError> {
+            self.fallback.shape_glyph(ch, font_size, font_weight, font_slant, color, family)
         }
 
         fn shape_text_run(&mut self, request: TextRunShapeRequest<'_>) -> Result<Option<ShapedTextRun>, ShapeError> {

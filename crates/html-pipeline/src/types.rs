@@ -1,6 +1,5 @@
 use html_layout::ImageMetrics;
 use std::fmt;
-use std::time::Duration;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PipelineChange {
@@ -323,47 +322,6 @@ impl Default for ReuseReport {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct PipelineStageCounts {
-    pub parsed: u32,
-    pub styled: u32,
-    pub prepared: u32,
-    pub shaped: u32,
-    pub laid_out: u32,
-    pub paint: u32,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct PipelineRetainedBytes {
-    pub parsed: usize,
-    pub styled: usize,
-    pub shaped: usize,
-    pub laid_out: usize,
-}
-
-impl PipelineRetainedBytes {
-    pub const fn total(self) -> usize {
-        self.parsed + self.styled + self.shaped + self.laid_out
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct PipelineTimings {
-    pub change_cause: PipelineChangeMask,
-    pub decision_time: Duration,
-    pub stage_runs: PipelineStageCounts,
-    pub stage_reuses: PipelineStageCounts,
-    pub retained_bytes: PipelineRetainedBytes,
-    pub shape_time: Duration,
-    pub layout_time: Duration,
-}
-
-impl Default for PipelineTimings {
-    fn default() -> Self {
-        Self { change_cause: PipelineChangeMask::empty(), decision_time: Duration::ZERO, stage_runs: PipelineStageCounts::default(), stage_reuses: PipelineStageCounts::default(), retained_bytes: PipelineRetainedBytes::default(), shape_time: Duration::ZERO, layout_time: Duration::ZERO }
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct PipelineInputs {
     pub source: String,
@@ -591,7 +549,6 @@ impl Eq for PipelineCacheKey {}
 pub struct PipelineUpdate {
     pub stage: EarliestStage,
     pub report: ReuseReport,
-    pub timings: PipelineTimings,
     pub anchors_preserved: bool,
 }
 
@@ -599,15 +556,6 @@ impl PipelineUpdate {
     pub fn full_rebuild() -> Self {
         Self {
             stage: EarliestStage::Parse,
-            timings: PipelineTimings {
-                change_cause: PipelineChangeMask::empty(),
-                decision_time: Duration::ZERO,
-                stage_runs: PipelineStageCounts { parsed: 1, styled: 1, prepared: 1, shaped: 1, laid_out: 1, paint: 0 },
-                stage_reuses: PipelineStageCounts::default(),
-                retained_bytes: PipelineRetainedBytes::default(),
-                shape_time: Duration::ZERO,
-                layout_time: Duration::ZERO,
-            },
             report: ReuseReport { parsed: Reuse::RECOMPUTED, styled: Reuse::RECOMPUTED, prepared: Reuse::RECOMPUTED, shaped: Reuse::RECOMPUTED, laid_out: Reuse::RECOMPUTED },
             anchors_preserved: false,
         }

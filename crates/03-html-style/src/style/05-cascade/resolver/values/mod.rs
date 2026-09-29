@@ -24,12 +24,15 @@ pub(super) fn parse_line_height(
     lh: &lightningcss::properties::font::LineHeight,
     font_size: f32,
     root_font_size: f32,
+    resolution: &ResolutionContext,
 ) -> Option<f32> {
     use lightningcss::properties::font::LineHeight;
     match lh {
         LineHeight::Normal => Some(0.0),
         LineHeight::Number(n) => Some(font_size * n),
-        LineHeight::Length(lp) => length_percentage_to_px(lp, font_size, root_font_size),
+        LineHeight::Length(lp) => {
+            length_percentage_to_px(lp, font_size, root_font_size, resolution)
+        }
     }
 }
 
@@ -37,6 +40,7 @@ pub(super) fn checked_line_height_components(
     lh: &lightningcss::properties::font::LineHeight,
     font_size: f32,
     root_font_size: f32,
+    resolution: &ResolutionContext,
 ) -> Option<(f32, f32)> {
     use lightningcss::properties::font::LineHeight;
     let components = match lh {
@@ -45,13 +49,16 @@ pub(super) fn checked_line_height_components(
         }
         LineHeight::Length(LengthPercentage::Calc(calc)) => {
             let (absolute_px, percentage, x_height_px, ch_advance_px, cap_height_px) =
-                calc_box_length_percentage_components(calc, font_size, root_font_size)?;
+                calc_box_length_percentage_components(calc, font_size, root_font_size, resolution)?;
             if ch_advance_px != 0.0 || cap_height_px != 0.0 {
                 return None;
             }
             (absolute_px + percentage * font_size, x_height_px)
         }
-        _ => (parse_line_height(lh, font_size, root_font_size)?, 0.0),
+        _ => (
+            parse_line_height(lh, font_size, root_font_size, resolution)?,
+            0.0,
+        ),
     };
     (components.0.is_finite()
         && components.0 >= 0.0
@@ -96,11 +103,12 @@ pub(super) fn flex_basis(
     font: &Font,
     root_font_size: f32,
     styles: &mut ComputedStylesBuilder,
+    resolution: &ResolutionContext,
 ) -> Option<PreferredSize> {
     let value = match value {
         LengthPercentageOrAuto::Auto => Some(PreferredSize::Auto),
         LengthPercentageOrAuto::LengthPercentage(value) => {
-            length_percentage_to_preferred(value, font, root_font_size, styles)
+            length_percentage_to_preferred(value, font, root_font_size, styles, resolution)
         }
     }?;
     non_negative_preferred_size(value)
@@ -155,23 +163,32 @@ pub(super) fn length_percentage_to_preferred(
     font: &Font,
     root_font_size: f32,
     styles: &mut ComputedStylesBuilder,
+    resolution: &ResolutionContext,
 ) -> Option<PreferredSize> {
     match value {
-        LengthPercentage::Dimension(value) => preferred_from_length(value, font, root_font_size),
+        LengthPercentage::Dimension(value) => {
+            preferred_from_length(value, font, root_font_size, resolution)
+        }
         LengthPercentage::Percentage(value) => Some(PreferredSize::Percent(value.0)),
         LengthPercentage::Calc(value) => {
-            comparison_preferred_size(value, font.font_size, root_font_size, styles).or_else(|| {
-                let (absolute_px, percentage, x_height_px, ch_advance_px, cap_height_px) =
-                    calc_box_length_percentage_components(value, font.font_size, root_font_size)?;
-                Some(PreferredSize::Calc {
-                    absolute_px,
-                    percentage,
-                    x_height_px,
-                    ch_advance_px,
-                    cap_height_px,
-                    percentage_dependent: calc_depends_on_percentage(value),
+            comparison_preferred_size(value, font.font_size, root_font_size, styles, resolution)
+                .or_else(|| {
+                    let (absolute_px, percentage, x_height_px, ch_advance_px, cap_height_px) =
+                        calc_box_length_percentage_components(
+                            value,
+                            font.font_size,
+                            root_font_size,
+                            resolution,
+                        )?;
+                    Some(PreferredSize::Calc {
+                        absolute_px,
+                        percentage,
+                        x_height_px,
+                        ch_advance_px,
+                        cap_height_px,
+                        percentage_dependent: calc_depends_on_percentage(value),
+                    })
                 })
-            })
         }
     }
 }
@@ -181,6 +198,7 @@ pub(super) fn comparison_preferred_size(
     font_size: f32,
     root_font_size: f32,
     styles: &mut ComputedStylesBuilder,
+    resolution: &ResolutionContext,
 ) -> Option<PreferredSize> {
     let Calc::Function(function) = calc else {
         return None;
@@ -193,6 +211,7 @@ pub(super) fn comparison_preferred_size(
             font_size,
             root_font_size,
             styles,
+            resolution,
         ),
         MathFunction::Max(values) => comparison_from_operands(
             SizeComparison::Max,
@@ -201,6 +220,7 @@ pub(super) fn comparison_preferred_size(
             font_size,
             root_font_size,
             styles,
+            resolution,
         ),
         MathFunction::Clamp(min, value, max) => comparison_from_operands(
             SizeComparison::Clamp,
@@ -209,9 +229,10 @@ pub(super) fn comparison_preferred_size(
             font_size,
             root_font_size,
             styles,
+            resolution,
         ),
         MathFunction::Calc(value) => {
-            return comparison_preferred_size(value, font_size, root_font_size, styles);
+            return comparison_preferred_size(value, font_size, root_font_size, styles, resolution);
         }
         _ => None,
     }
@@ -224,6 +245,7 @@ pub(super) fn comparison_from_operands<'a>(
     font_size: f32,
     root_font_size: f32,
     styles: &mut ComputedStylesBuilder,
+    resolution: &ResolutionContext,
 ) -> Option<PreferredSize> {
     if count == 0 || count > 3 {
         return None;
@@ -231,7 +253,7 @@ pub(super) fn comparison_from_operands<'a>(
     let mut values = [ComputedSizeComponent::default(); 3];
     for (slot, operand) in values.iter_mut().zip(operands) {
         let (absolute_px, percentage, x_height_px, ch_advance_px, cap_height_px) =
-            calc_box_length_percentage_components(operand, font_size, root_font_size)?;
+            calc_box_length_percentage_components(operand, font_size, root_font_size, resolution)?;
         *slot = ComputedSizeComponent {
             absolute_px,
             percentage,
@@ -248,15 +270,21 @@ pub(super) fn computed_length_pct(
     value: &LengthPercentage,
     font_size: f32,
     root_font_size: f32,
+    resolution: &ResolutionContext,
 ) -> Option<LengthPct> {
     match value {
         LengthPercentage::Dimension(value) => {
-            length_pct_from_length(value, font_size, root_font_size)
+            length_pct_from_length(value, font_size, root_font_size, resolution)
         }
         LengthPercentage::Percentage(value) => Some(LengthPct::Pct(value.0)),
         LengthPercentage::Calc(value) => {
             let (absolute_px, percentage, x_height_px, ch_advance_px, cap_height_px) =
-                calc_box_length_percentage_components(value, font_size, root_font_size)?;
+                calc_box_length_percentage_components(
+                    value,
+                    font_size,
+                    root_font_size,
+                    resolution,
+                )?;
             Some(LengthPct::Calc {
                 absolute_px,
                 percentage,
@@ -311,11 +339,12 @@ pub(super) fn corner_radius(
     value: &Size2D<LengthPercentage>,
     font_size: f32,
     root_font_size: f32,
+    resolution: &ResolutionContext,
 ) -> Option<CornerRadius> {
     Some(CornerRadius {
-        x: length_percentage_to_lengthpct(&value.0, font_size, root_font_size)
+        x: length_percentage_to_lengthpct(&value.0, font_size, root_font_size, resolution)
             .and_then(non_negative_length_pct)?,
-        y: length_percentage_to_lengthpct(&value.1, font_size, root_font_size)
+        y: length_percentage_to_lengthpct(&value.1, font_size, root_font_size, resolution)
             .and_then(non_negative_length_pct)?,
     })
 }
@@ -508,8 +537,9 @@ pub(super) fn checked_border_width(
     value: &BorderSideWidth,
     font_size: f32,
     root_font_size: f32,
+    resolution: &ResolutionContext,
 ) -> Option<FontRelativeLength> {
-    border_width(value, font_size, root_font_size)
+    border_width(value, font_size, root_font_size, resolution)
 }
 
 pub(super) fn apply_logical_border<const P: u8>(
@@ -517,9 +547,14 @@ pub(super) fn apply_logical_border<const P: u8>(
     side: usize,
     value: &lightningcss::properties::border::GenericBorder<LineStyle, P>,
     root_font_size: f32,
+    resolution: &ResolutionContext,
 ) {
-    let Some(width) = checked_border_width(&value.width, style.font.font_size, root_font_size)
-    else {
+    let Some(width) = checked_border_width(
+        &value.width,
+        style.font.font_size,
+        root_font_size,
+        resolution,
+    ) else {
         return;
     };
     set_border_width(style, side, width);
@@ -531,11 +566,14 @@ pub(super) fn gap_value(
     value: &lightningcss::properties::align::GapValue,
     font_size: f32,
     root_font_size: f32,
+    resolution: &ResolutionContext,
 ) -> Option<LengthPct> {
     use lightningcss::properties::align::GapValue;
     let value = match value {
         GapValue::Normal => Some(LengthPct::Px(0.0)),
-        GapValue::LengthPercentage(value) => computed_length_pct(value, font_size, root_font_size),
+        GapValue::LengthPercentage(value) => {
+            computed_length_pct(value, font_size, root_font_size, resolution)
+        }
     }?;
 
     // Lightning CSS currently represents negative gaps as typed values even
@@ -712,14 +750,15 @@ pub(super) fn text_decoration_thickness(
     value: &lightningcss::properties::text::TextDecorationThickness,
     font_size: f32,
     root_font_size: f32,
+    resolution: &ResolutionContext,
 ) -> Option<TextDecorationThickness> {
     use lightningcss::properties::text::TextDecorationThickness as CssThickness;
     match value {
         CssThickness::Auto => Some(TextDecorationThickness::Auto),
         CssThickness::FromFont => Some(TextDecorationThickness::FromFont),
-        CssThickness::LengthPercentage(value) => {
-            TextDecorationThickness::length(computed_length_pct(value, font_size, root_font_size)?)
-        }
+        CssThickness::LengthPercentage(value) => TextDecorationThickness::length(
+            computed_length_pct(value, font_size, root_font_size, resolution)?,
+        ),
     }
 }
 

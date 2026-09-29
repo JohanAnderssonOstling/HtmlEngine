@@ -74,15 +74,8 @@ fn prescan_html_encoding(bytes: &[u8]) -> Option<&'static Encoding> {
                 break;
             }
             let end = tag_end(bytes, cursor + 5);
-            if let Some(label) = meta_charset_label(&bytes[cursor + 5..end]) {
-                if let Some(encoding) = Encoding::for_label(label) {
-                    return Some(encoding);
-                }
-                if let Some(decoded) = decode_ascii_numeric_references(label)
-                    && let Some(encoding) = Encoding::for_label(&decoded)
-                {
-                    return Some(encoding);
-                }
+            if let Some(encoding) = meta_encoding(&bytes[cursor + 5..end]) {
+                return Some(encoding);
             }
             cursor = end.saturating_add(1);
             landed_on_boundary_from_tag = false;
@@ -144,8 +137,14 @@ fn starts_raw_text_element(bytes: &[u8], cursor: usize, name: &[u8]) -> bool {
             .is_some_and(|byte| byte.is_ascii_whitespace() || matches!(byte, b'/' | b'>'))
 }
 
-fn meta_charset_label(attributes: &[u8]) -> Option<&[u8]> {
+fn meta_encoding(attributes: &[u8]) -> Option<&'static Encoding> {
     let mut cursor = 0usize;
+    let mut charset = None;
+    let mut content = None;
+    let mut has_content_type_pragma = false;
+    let mut seen_charset = false;
+    let mut seen_content = false;
+    let mut seen_http_equiv = false;
     while cursor < attributes.len() {
         while attributes
             .get(cursor)
@@ -190,7 +189,7 @@ fn meta_charset_label(attributes: &[u8]) -> Option<&[u8]> {
                 let start = cursor;
                 while attributes
                     .get(cursor)
-                    .is_some_and(|byte| !byte.is_ascii_whitespace() && !matches!(byte, b'/' | b'>'))
+                    .is_some_and(|byte| !byte.is_ascii_whitespace() && *byte != b'>')
                 {
                     cursor += 1;
                 }
@@ -198,12 +197,63 @@ fn meta_charset_label(attributes: &[u8]) -> Option<&[u8]> {
             }
             None => return None,
         };
-        if name.eq_ignore_ascii_case(b"charset") {
-            return Some(&attributes[value_start..value_end]);
+        let value = &attributes[value_start..value_end];
+        if name.eq_ignore_ascii_case(b"charset") && !seen_charset {
+            charset = Some(value);
+            seen_charset = true;
+        } else if name.eq_ignore_ascii_case(b"content") && !seen_content {
+            content = Some(value);
+            seen_content = true;
+        } else if name.eq_ignore_ascii_case(b"http-equiv") && !seen_http_equiv {
+            has_content_type_pragma = value.eq_ignore_ascii_case(b"content-type");
+            seen_http_equiv = true;
         }
         cursor = cursor.saturating_add(1);
     }
-    None
+    let label = match charset {
+        Some(label) => label,
+        None if has_content_type_pragma => content_charset_label(content?)?,
+        None => return None,
+    };
+    Encoding::for_label(label).or_else(|| {
+        decode_ascii_numeric_references(label)
+            .as_deref()
+            .and_then(Encoding::for_label)
+    })
+}
+
+fn content_charset_label(content: &[u8]) -> Option<&[u8]> {
+    let mut cursor = 0;
+    loop {
+        cursor = find_ascii_case_insensitive(content, cursor, b"charset")?
+            + b"charset".len();
+        while content.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        if content.get(cursor) == Some(&b'=') {
+            break;
+        }
+    }
+    cursor += 1;
+    while content.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+        cursor += 1;
+    }
+    let quote = content
+        .get(cursor)
+        .copied()
+        .filter(|byte| matches!(byte, b'\'' | b'"'));
+    if quote.is_some() {
+        cursor += 1;
+    }
+    let end = content[cursor..]
+        .iter()
+        .position(|byte| match quote {
+            Some(quote) => *byte == quote,
+            None => byte.is_ascii_whitespace() || *byte == b';',
+        })
+        .map(|offset| cursor + offset)
+        .or_else(|| quote.is_none().then_some(content.len()))?;
+    Some(&content[cursor..end])
 }
 
 fn starts_ascii_case_insensitive(bytes: &[u8], start: usize, needle: &[u8]) -> bool {

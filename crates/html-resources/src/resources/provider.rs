@@ -1,7 +1,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use html_source::{ResourceProvider, TocEntry};
+use html_source::ResourceProvider;
 
 pub struct FileSystemProvider;
 
@@ -20,8 +20,18 @@ impl FileSystemProvider {
         path.to_string_lossy().into_owned()
     }
 
+    fn resource_path(uri: &str) -> &str {
+        uri.split(['?', '#']).next().unwrap_or(uri)
+    }
+
     fn is_html(path: &Path) -> bool {
-        matches!(path.extension().and_then(|e| e.to_str()).map(|s| s.to_ascii_lowercase()).as_deref(), Some("html") | Some("htm") | Some("xhtml"))
+        matches!(
+            path.extension()
+                .and_then(|e| e.to_str())
+                .map(|s| s.to_ascii_lowercase())
+                .as_deref(),
+            Some("html") | Some("htm") | Some("xhtml")
+        )
     }
 
     fn find_html_in_dir(dir: &Path) -> io::Result<Vec<String>> {
@@ -43,21 +53,33 @@ impl FileSystemProvider {
 
 impl ResourceProvider for FileSystemProvider {
     fn read_bytes(&self, uri: &str) -> io::Result<Vec<u8>> {
-        std::fs::read(uri)
+        std::fs::read(Self::resource_path(uri))
     }
 
     fn exists(&self, uri: &str) -> bool {
-        std::fs::metadata(uri).is_ok()
+        std::fs::metadata(Self::resource_path(uri)).is_ok()
     }
 
     fn resolve(&self, base: &str, href: &str) -> String {
+        let href = Self::resource_path(href);
+        let base = Self::resource_path(base);
+        if href.is_empty() {
+            return base.to_owned();
+        }
         let href_path = PathBuf::from(href);
         if href_path.is_absolute() {
             return Self::normalize_path(&href_path);
         }
 
         let base_path = PathBuf::from(base);
-        let base_dir = if base.ends_with(['/', '\\']) || base_path.is_dir() { base_path } else { base_path.parent().map(|p| p.to_path_buf()).unwrap_or(base_path) };
+        let base_dir = if base.ends_with(['/', '\\']) || base_path.is_dir() {
+            base_path
+        } else {
+            base_path
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or(base_path)
+        };
         Self::normalize_path(&base_dir.join(href_path))
     }
 
@@ -72,7 +94,4 @@ impl ResourceProvider for FileSystemProvider {
         }
     }
 
-    fn toc(&self) -> io::Result<Option<Vec<TocEntry>>> {
-        Ok(None)
-    }
 }

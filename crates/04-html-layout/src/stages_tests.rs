@@ -6,12 +6,15 @@ mod stage_tests {
     use crate::{GlyphShaper, LayoutConstraintError, LayoutConstraints, PreparedDocument, TextCompositionPolicy};
     use html_style_model::{ComputedStylesBuildError, ComputedStylesBuilder, ComputedStylesValidationError};
 
-    struct InvalidGlyphShaper;
+    #[derive(Default)]
+    struct InvalidGlyphShaper(crate::GlyphResourceStore);
 
     impl GlyphShaper for InvalidGlyphShaper {
         fn reset(&mut self) {}
 
-        fn shape_glyph<'a>(&mut self, _glyph_metrics: &mut crate::GlyphRegistry<'a>, _ch: char, _font_size: f32, _font_weight: u16, _font_slant: crate::FontSlant, _color: u32, _family: Option<&str>) -> Result<GlyphId, ShapeError> {
+        fn glyph_resources(&mut self) -> &mut crate::GlyphResourceStore { &mut self.0 }
+
+        fn shape_glyph(&mut self, _ch: char, _font_size: f32, _font_weight: u16, _font_slant: crate::FontSlant, _color: u32, _family: Option<&str>) -> Result<GlyphId, ShapeError> {
             Ok(17)
         }
     }
@@ -100,21 +103,23 @@ mod stage_tests {
     fn shaping_rejects_unregistered_glyph_ids() {
         let mut factory = DocumentFactory::new();
         let prepared = factory.parse_with_new_pipeline("<html><body>text</body></html>", None);
-        let error = prepared.shape(&mut InvalidGlyphShaper).err().expect("invalid shaper must be rejected");
+        let error = prepared.shape(&mut InvalidGlyphShaper::default()).err().expect("invalid shaper must be rejected");
 
-        assert_eq!(error.glyph_id(), 17);
-        assert_eq!(error.metrics_len(), 0);
+        assert_eq!(error.glyph_id(), Some(17));
+        assert_eq!(error.metrics_len(), Some(0));
     }
 
     #[derive(Default)]
-    struct InvalidMetricShaper;
+    struct InvalidMetricShaper(crate::GlyphResourceStore);
 
     impl GlyphShaper for InvalidMetricShaper {
         fn reset(&mut self) {}
 
-        fn shape_glyph<'a>(&mut self, glyph_metrics: &mut crate::GlyphRegistry<'a>, ch: char, font_size: f32, _font_weight: u16, _font_slant: crate::FontSlant, _color: u32, _family: Option<&str>) -> Result<GlyphId, ShapeError> {
+        fn glyph_resources(&mut self) -> &mut crate::GlyphResourceStore { &mut self.0 }
+
+        fn shape_glyph(&mut self, ch: char, font_size: f32, _font_weight: u16, _font_slant: crate::FontSlant, _color: u32, _family: Option<&str>) -> Result<GlyphId, ShapeError> {
             let metric = GlyphMetric::try_new(ch, font_size, -font_size, font_size * 0.25, font_size * 0.75).map_err(ShapeError::rejected_metric)?;
-            glyph_metrics.register(metric)
+            self.0.register(metric)
         }
     }
 
@@ -122,7 +127,7 @@ mod stage_tests {
     fn shaping_rejects_invalid_glyph_metrics() {
         let mut factory = DocumentFactory::new();
         let prepared = factory.parse_with_new_pipeline("<html><body>text</body></html>", None);
-        let error = prepared.shape(&mut InvalidMetricShaper).err().expect("invalid metric must be rejected");
+        let error = prepared.shape(&mut InvalidMetricShaper::default()).err().expect("invalid metric must be rejected");
         assert!(matches!(error.reason(), Some(GlyphMetricError::NegativeValue { field: "ascent", .. })));
     }
 
@@ -360,7 +365,8 @@ mod stage_tests {
         let original_len = document.glyph_metrics().len();
         let original_first = document.glyph_metrics().get_checked(0);
         let metric = GlyphMetric::try_new('#', 4.0, 3.0, 1.0, 0.0).expect("valid auxiliary metric");
-        let appended = document.auxiliary_glyph_registry().register(metric).expect("append auxiliary glyph");
+        let appended = shaper.glyph_resources().register(metric).expect("append auxiliary glyph");
+        document.refresh_glyph_metrics_from(&mut shaper).expect("same resource generation");
 
         assert_eq!(appended as usize, original_len);
         assert_eq!(document.glyph_metrics().len(), original_len + 1);

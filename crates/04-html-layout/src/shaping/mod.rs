@@ -23,7 +23,8 @@ mod spans;
 pub(crate) use contracts::{AuthoritativeShapedRun, ShapedFontMetrics, ShapedTextGeometry};
 use contracts::{BoxFontMetrics, RequiredFontMetrics};
 pub use contracts::{
-    CharacterPlacement, FontMetricsRequest, FontRelativeMetrics, FontSlant, GlyphRegistry,
+    CharacterPlacement, FontMetricsRequest, FontRelativeMetrics, FontSlant,
+    GlyphResourceGeneration, GlyphResourceStore,
     GlyphShaper, ShapeError, ShapedLine, ShapedTextRun, TextRunId, TextRunShapeRequest,
     TextShapeRequest, TextStyleSpan,
 };

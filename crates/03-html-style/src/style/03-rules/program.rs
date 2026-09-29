@@ -11,7 +11,7 @@ use lightningcss::stylesheet::{ParserOptions, StyleAttribute, StyleSheet};
 use static_self::IntoOwned;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use web_time::Instant;
 
 /// Parsed, prepared, and indexed CSS that can be applied to multiple DOMs.
 /// DOM-specific implicit `@scope` roots are supplied when the program runs.
@@ -154,7 +154,7 @@ impl StyleProgramCache {
         }
     }
 
-    fn get_or_parse(&mut self, css: &str, index: usize) -> Option<Arc<PreparedStylesheetFragment<'static>>> {
+    fn get_or_parse(&mut self, css: &str) -> Option<Arc<PreparedStylesheetFragment<'static>>> {
         if let Some(position) = self.parsed_entries.iter().position(|entry| entry.css == css) {
             self.parsed_hits += 1;
             if position + 1 != self.parsed_entries.len() {
@@ -170,7 +170,6 @@ impl StyleProgramCache {
         } else {
             StyleSheet::parse(&normalized, ParserOptions { error_recovery: true, ..ParserOptions::default() })
                 .map(|stylesheet| Arc::new(PreparedStylesheetFragment::compile(stylesheet.into_owned())))
-                .map_err(|error| eprintln!("Skipping CSS chunk {index}: {error}"))
                 .ok()
         };
         if self.parsed_entries.len() == self.parsed_capacity {
@@ -231,7 +230,7 @@ impl StyleProgramCache {
             initial_font_size,
         };
         let parse_started = Instant::now();
-        let stylesheets = inputs.iter().enumerate().filter_map(|(index, input)| self.get_or_parse(input.css, index).map(|stylesheet| (stylesheet, index))).collect::<Vec<_>>();
+        let stylesheets = inputs.iter().enumerate().filter_map(|(index, input)| self.get_or_parse(input.css).map(|stylesheet| (stylesheet, index))).collect::<Vec<_>>();
         let parse_author_css = parse_started.elapsed();
         let (program, mut timings) = StyleProgram::compile_parsed_with_timings(inputs.len(), &stylesheets, environment, f32::from_bits(initial_font_size), self.inline_styles.clone());
         timings.parse_author_css = parse_author_css;
@@ -282,7 +281,7 @@ impl StyleProgram {
                     stylesheets.push(stylesheet.into_owned());
                     author_root_indices.push(u32::try_from(index).expect("author stylesheet count fits in u32"));
                 }
-                Err(error) => eprintln!("Skipping CSS chunk {index}: {error}"),
+                Err(_) => {}
             }
         }
         timings.parse_author_css = started.elapsed();
@@ -328,7 +327,7 @@ pub(crate) fn compile_and_apply(
     let css = inputs.iter().map(|input| input.css).collect::<Vec<_>>();
     let (program, timings) =
         StyleProgram::compile_with_timings(&css, environment, document.root_font_size());
-    apply(document, &program, inputs, timings)
+    apply(document, &program, inputs, timings, &html_style_model::ReaderStyleOverrides::default())
 }
 
 pub fn style_document_with_cached_program_and_timings(
@@ -337,9 +336,19 @@ pub fn style_document_with_cached_program_and_timings(
     inputs: &[AuthorStylesheetInput<'_>],
     environment: MediaEnvironment,
 ) -> (StyledDocument, StyleTimings, MediaQuerySet) {
+    style_document_with_cached_program_and_reader_overrides(cache, document, inputs, environment, &html_style_model::ReaderStyleOverrides::default())
+}
+
+pub fn style_document_with_cached_program_and_reader_overrides(
+    cache: &mut StyleProgramCache,
+    document: Document,
+    inputs: &[AuthorStylesheetInput<'_>],
+    environment: MediaEnvironment,
+    reader_overrides: &html_style_model::ReaderStyleOverrides,
+) -> (StyledDocument, StyleTimings, MediaQuerySet) {
     let root_font_size = document.root_font_size();
     let (program, timings) = cache.get_or_compile(inputs, environment, root_font_size);
-    apply(document, &program, inputs, timings)
+    apply(document, &program, inputs, timings, reader_overrides)
 }
 
 pub fn style_document_with_program_and_timings(
@@ -347,7 +356,16 @@ pub fn style_document_with_program_and_timings(
     program: &StyleProgram,
     inputs: &[AuthorStylesheetInput<'_>],
 ) -> (StyledDocument, StyleTimings, MediaQuerySet) {
-    apply(document, program, inputs, StyleTimings::default())
+    style_document_with_program_and_reader_overrides(document, program, inputs, &html_style_model::ReaderStyleOverrides::default())
+}
+
+pub fn style_document_with_program_and_reader_overrides(
+    document: Document,
+    program: &StyleProgram,
+    inputs: &[AuthorStylesheetInput<'_>],
+    reader_overrides: &html_style_model::ReaderStyleOverrides,
+) -> (StyledDocument, StyleTimings, MediaQuerySet) {
+    apply(document, program, inputs, StyleTimings::default(), reader_overrides)
 }
 
 fn apply(
@@ -355,6 +373,7 @@ fn apply(
     program: &StyleProgram,
     inputs: &[AuthorStylesheetInput<'_>],
     mut timings: StyleTimings,
+    reader_overrides: &html_style_model::ReaderStyleOverrides,
 ) -> (StyledDocument, StyleTimings, MediaQuerySet) {
     assert_eq!(
         inputs.len(),
@@ -372,6 +391,7 @@ fn apply(
         &program.selector_index,
         &author_roots,
         &program.inline_styles,
+        reader_overrides,
     );
     let media_queries = program.prepared.media_queries().clone();
     timings.resolve_styles = started.elapsed();

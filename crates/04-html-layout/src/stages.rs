@@ -6,7 +6,8 @@ use html_dom::{Document, MemoryUsageReport};
 use html_style_model::{ComputedStyles, ComputedStylesValidationError, StyleIndices};
 use rustc_data_structures::fx::FxHashMap;
 use std::fmt;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 #[path = "stages_output/mod.rs"]
 mod output;
@@ -27,8 +28,9 @@ mod semantics;
 
 pub(crate) use html_dom::element_is_note_target;
 pub use lifecycle::{
-    ImageSizingPolicy, LaidOutDocument, LayoutConstraintError, LayoutConstraints, NoteFlow,
-    PrepareError, PreparedDocument, ShapeLayoutTimings, ShapedDocument, TextCompositionPolicy,
+    ImageSizingPolicy, LaidOutDocument, LayoutConstraintError,
+    LayoutConstraints, NoteFlow, PrepareError, PreparedDocument, ShapeLayoutTimings,
+    ShapedDocument, TextCompositionPolicy,
 };
 pub(crate) use lifecycle::{PreparedInputs, ShapedText};
 use semantics::{LinkGlyphTarget, box_id, collect_anchor_glyphs, collect_link_glyph_targets};
@@ -166,15 +168,14 @@ fn append_first_line_style_range(
 fn shape_first_line_ranges(
     inputs: &std::sync::Arc<PreparedInputs>,
     base: &std::sync::Arc<ShapedText>,
-    seed: &std::sync::Arc<ShapedText>,
+    seed: &GlyphMetrics,
     ranges: &[FirstLineStyleRange],
     glyph_shaper: &mut impl crate::GlyphShaper,
 ) -> Result<std::sync::Arc<ShapedText>, crate::ShapeError> {
     // Preserve metrics registered by an earlier attempt: renderer glyph IDs
     // remain live for the whole document-shaping transaction.
-    let retained_metrics = seed.glyph_metrics.clone();
     let mut shaped = (**base).clone();
-    shaped.glyph_metrics = retained_metrics;
+    shaped.glyph_metrics = seed.clone();
     shaped.inline_plans = crate::layout::PreparedInlinePlans::new(inputs.layout_tree.box_count());
     for range in ranges {
         crate::shaping::reshape_range_with_style(
@@ -198,20 +199,28 @@ fn shape_first_line_ranges(
 fn refine_first_lines(
     mut laid_out: LaidOutDocument,
     base_shaped: std::sync::Arc<ShapedText>,
-    mut shaping_seed: std::sync::Arc<ShapedText>,
+    mut shaping_seed: GlyphMetrics,
     constraints: LayoutConstraints,
     image_metrics: &ImageMetrics,
     glyph_shaper: &mut impl crate::GlyphShaper,
 ) -> Result<LaidOutDocument, crate::ShapeError> {
     let mut ranges = first_line_style_ranges(&laid_out);
     if ranges.is_empty() {
+        if shaping_seed.len() > laid_out.shaped.glyph_metrics.len() {
+            let mut shaped = (*laid_out.shaped).clone();
+            shaped.glyph_metrics = shaping_seed;
+            laid_out.shaped = std::sync::Arc::new(shaped);
+        }
         laid_out.base_shaped = base_shaped;
         return Ok(laid_out);
     }
 
-    // A second pass is enough to remove stale styling when the changed metrics
-    // move the first boundary. Stop early when the styled source set is stable.
-    for _ in 0..2 {
+    // Font changes can move the boundary more than once. Never publish a
+    // layout whose first line differs from the range used to shape it.
+    const MAX_FIRST_LINE_PASSES: usize = 32;
+    let mut seen_ranges = Vec::new();
+    for _ in 0..MAX_FIRST_LINE_PASSES {
+        seen_ranges.push(ranges.clone());
         let shaped = shape_first_line_ranges(
             &laid_out.inputs,
             &base_shaped,
@@ -219,21 +228,22 @@ fn refine_first_lines(
             &ranges,
             glyph_shaper,
         )?;
-        shaping_seed = shaped.clone();
-        let candidate = ShapedDocument {
-            inputs: laid_out.inputs.clone(),
-            shaped,
-        }
-        .layout_impl(constraints, image_metrics, None);
-        let next_ranges = first_line_style_ranges(&candidate);
-        laid_out = candidate;
+        shaping_seed = shaped.glyph_metrics.clone();
+        // This document is still a private candidate. Reuse its layout
+        // buffers while the first-line boundary converges, then publish it.
+        laid_out.shaped = shaped;
+        laid_out.relayout_impl(constraints, image_metrics, None);
+        let next_ranges = first_line_style_ranges(&laid_out);
         if next_ranges == ranges {
-            break;
+            laid_out.base_shaped = base_shaped;
+            return Ok(laid_out);
+        }
+        if seen_ranges.contains(&next_ranges) {
+            return Err(crate::ShapeError::first_line_refinement_did_not_converge());
         }
         ranges = next_ranges;
     }
-    laid_out.base_shaped = base_shaped;
-    Ok(laid_out)
+    Err(crate::ShapeError::first_line_refinement_did_not_converge())
 }
 
 pub(crate) struct AncestorIter<'a> {

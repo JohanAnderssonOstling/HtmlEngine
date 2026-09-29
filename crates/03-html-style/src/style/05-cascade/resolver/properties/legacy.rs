@@ -8,6 +8,7 @@ pub(super) fn try_apply_legacy_grid_gap_alias(
     style: &mut WorkingStyle,
     property: &Property<'_>,
     parent: &ParentStyle,
+    resolution: &ResolutionContext,
 ) -> bool {
     #[derive(Clone, Copy)]
     enum Axis {
@@ -63,19 +64,39 @@ pub(super) fn try_apply_legacy_grid_gap_alias(
     };
     match (axis, property) {
         (Axis::Row, Property::RowGap(value)) => {
-            if let Some(value) = gap_value(&value, style.font.font_size, doc.root_font_size()) {
+            if let Some(value) = gap_value(
+                &value,
+                style.font.font_size,
+                doc.root_font_size(),
+                resolution,
+            ) {
                 style.layout.row_gap = value;
             }
         }
         (Axis::Column, Property::ColumnGap(value)) => {
-            if let Some(value) = gap_value(&value, style.font.font_size, doc.root_font_size()) {
+            if let Some(value) = gap_value(
+                &value,
+                style.font.font_size,
+                doc.root_font_size(),
+                resolution,
+            ) {
                 style.layout.column_gap = value;
             }
         }
         (Axis::Both, Property::Gap(value)) => {
             if let (Some(row), Some(column)) = (
-                gap_value(&value.row, style.font.font_size, doc.root_font_size()),
-                gap_value(&value.column, style.font.font_size, doc.root_font_size()),
+                gap_value(
+                    &value.row,
+                    style.font.font_size,
+                    doc.root_font_size(),
+                    resolution,
+                ),
+                gap_value(
+                    &value.column,
+                    style.font.font_size,
+                    doc.root_font_size(),
+                    resolution,
+                ),
             ) {
                 style.layout.row_gap = row;
                 style.layout.column_gap = column;

@@ -19,12 +19,21 @@ const MAX_CONSECUTIVE_HYPHENATED_LINES: u8 = 2;
 const MIN_HYPHENATED_LINE_FILL: f64 = 0.5;
 const SHORT_HYPHENATED_LINE_DEMERITS: f64 = 25_000_000.0;
 const UNDERFULL_LINE_DEMERITS: f64 = 1_000_000.0;
+// An emergency line is allowed only when the normal glue limits cannot make
+// the paragraph fit.  A very short line must still be much more expensive
+// than spreading a modest amount of slack over the remaining lines; otherwise
+// the fallback can create one-word first lines in an otherwise ordinary
+// paragraph.
+const SEVERELY_UNDERFULL_LINE_DEMERITS: f64 = 100_000_000.0;
 const TRACKING_LINE_DEMERITS: f64 = 25_000.0;
 pub(super) const MICRO_TRACKING_FRACTION: f64 = 0.005;
 
 fn underfull_demerits(remaining: f64, available: f64) -> f64 {
     let fraction = remaining.max(0.0) / available.max(1.0);
-    UNDERFULL_LINE_DEMERITS + (fraction * 1000.0).powi(2)
+    let severity = fraction.clamp(0.0, 1.0);
+    UNDERFULL_LINE_DEMERITS
+        + (fraction * 1000.0).powi(2)
+        + SEVERELY_UNDERFULL_LINE_DEMERITS * severity.powi(4)
 }
 
 fn tracking_demerits(adjustment: f64, capacity: f64) -> f64 {
@@ -669,6 +678,17 @@ mod tests {
         assert_eq!(
             break_compact_emergency(&compact, |_| 8.5, 1.0),
             Some(vec![1, 3])
+        );
+    }
+
+    #[test]
+    fn emergency_pass_does_not_create_a_one_word_first_line() {
+        let compact = compact_paragraph(&[10.0, 10.0, 10.0], 1.0);
+
+        assert_eq!(
+            break_compact_emergency(&compact, |_| 25.0, 1.0),
+            Some(vec![1, 2]),
+            "when two words fit more closely, an emergency fallback must not strand the first word"
         );
     }
 

@@ -5,7 +5,12 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub enum ImageSource {
     Uri(String),
-    Inline(Arc<[u8]>),
+    /// Serialized inline SVG plus the effective base URI needed to resolve
+    /// resources referenced from inside the SVG.
+    InlineSvg {
+        bytes: Arc<[u8]>,
+        base_uri: String,
+    },
 }
 
 impl MemoryUsage for ImageSource {
@@ -15,8 +20,9 @@ impl MemoryUsage for ImageSource {
             ImageSource::Uri(uri) => {
                 report.add_slice_storage::<u8>("ImageSource::Uri.storage", uri.capacity(), uri.len());
             }
-            ImageSource::Inline(bytes) => {
-                report.add_slice_storage::<u8>("ImageSource::Inline.storage", bytes.len(), bytes.len());
+            ImageSource::InlineSvg { bytes, base_uri } => {
+                report.add_slice_storage::<u8>("ImageSource::InlineSvg.bytes", bytes.len(), bytes.len());
+                report.add_slice_storage::<u8>("ImageSource::InlineSvg.base_uri", base_uri.capacity(), base_uri.len());
             }
         }
         report

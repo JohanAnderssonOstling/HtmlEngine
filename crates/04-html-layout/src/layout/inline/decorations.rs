@@ -2,7 +2,7 @@ use super::super::border_geometry::{
     emit_border_fragments, emit_horizontal_pattern, emit_outline_fragments, uniform_solid_border,
 };
 use super::super::decorations::DecorationEmitter;
-use crate::layout_model::{LayoutMode, Line, RoundedDecoration};
+use crate::layout_model::{LayoutMode, Line, LineInlineBoxFragment, RoundedDecoration};
 use html_style_model::BorderStyle;
 use kurbo::Rect;
 
@@ -27,43 +27,29 @@ impl DecorationEmitter<'_, '_, '_> {
                 .unwrap_or_default()
                 .to_vec();
             for fragment in fragments {
-                self.emit_inline_segment(
-                    fragment.box_idx as usize,
-                    line_idx,
-                    &line,
-                    line.point.x + fragment.start_x as f64,
-                    line.point.x + fragment.end_x as f64,
-                    line.point.y + fragment.top as f64,
-                    line.point.y + fragment.bottom as f64,
-                    line.point.y + fragment.baseline as f64,
-                    fragment.flags & crate::layout_model::LineInlineBoxFragment::INLINE_START != 0,
-                    fragment.flags & crate::layout_model::LineInlineBoxFragment::INLINE_END != 0,
-                    fragment.flags & crate::layout_model::LineInlineBoxFragment::BORDER_BOX_BOUNDS
-                        != 0,
-                    fragment.paint_order,
-                );
+                self.emit_inline_segment(line_idx, &line, &fragment);
             }
         }
     }
 
     fn emit_inline_segment(
         &mut self,
-        box_idx: usize,
         line_idx: usize,
         line: &Line,
-        start_x: f64,
-        end_x: f64,
-        fragment_top: f64,
-        fragment_bottom: f64,
-        fragment_baseline: f64,
-        inline_start: bool,
-        inline_end: bool,
-        border_box_bounds: bool,
-        paint_order: u32,
+        fragment: &LineInlineBoxFragment,
     ) {
+        let box_idx = fragment.box_idx as usize;
+        let start_x = line.point.x + fragment.start_x as f64;
+        let end_x = line.point.x + fragment.end_x as f64;
         if start_x > end_x {
             return;
         }
+        let fragment_top = line.point.y + fragment.top as f64;
+        let fragment_bottom = line.point.y + fragment.bottom as f64;
+        let fragment_baseline = line.point.y + fragment.baseline as f64;
+        let inline_start = fragment.flags & LineInlineBoxFragment::INLINE_START != 0;
+        let inline_end = fragment.flags & LineInlineBoxFragment::INLINE_END != 0;
+        let border_box_bounds = fragment.flags & LineInlineBoxFragment::BORDER_BOX_BOUNDS != 0;
         let is_inline_box = matches!(
             self.reader.box_layout_mode(box_idx),
             Some(LayoutMode::Inline(_))
@@ -251,6 +237,6 @@ impl DecorationEmitter<'_, '_, '_> {
         self.fragments
             .record_decoration_line_since(line_idx, decoration_start);
         self.fragments
-            .record_decoration_paint_order_since(paint_order, decoration_start);
+            .record_decoration_paint_order_since(fragment.paint_order, decoration_start);
     }
 }

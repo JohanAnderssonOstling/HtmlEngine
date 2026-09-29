@@ -1,7 +1,7 @@
 use super::*;
 
 #[allow(unused_variables)]
-pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'_>) -> bool {
+pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'_>) -> ApplyResult {
     let doc = context.doc;
     let styles = &mut *context.styles;
     let style = &mut *context.style;
@@ -9,7 +9,6 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
     let parent_font_size = context.parent_font_size;
     let parent_font_weight = context.parent_font_weight;
     let parent_color = context.parent_color;
-    let environment = context.environment;
     match property {
         // Color
         Property::Color(c) => {
@@ -37,7 +36,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
         Property::BackgroundImage(_) => {
             style.background.background_image_present = false;
         }
-        _ => return false,
+        _ => return ApplyResult::Unhandled,
     }
-    true
+    ApplyResult::Applied
 }

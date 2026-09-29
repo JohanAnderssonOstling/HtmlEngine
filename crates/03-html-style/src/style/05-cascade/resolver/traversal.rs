@@ -34,11 +34,18 @@ impl InlineStyleCache {
             };
             node_style_ids[node_idx.index()] = style_id;
         }
-        Self { node_style_ids, styles }
+        Self {
+            node_style_ids,
+            styles,
+        }
     }
 
     pub(super) fn get(&self, node_idx: DomNodeId) -> Option<&StyleAttribute<'static>> {
-        let id = self.node_style_ids.get(node_idx.index()).copied().flatten()?;
+        let id = self
+            .node_style_ids
+            .get(node_idx.index())
+            .copied()
+            .flatten()?;
         self.styles.get(id as usize).map(Arc::as_ref)
     }
 }
@@ -110,6 +117,7 @@ pub(super) fn root_font_size_for_resolution(doc: &Document, styles: &ComputedSty
 pub(super) struct ResolutionDocument<'a> {
     pub(super) document: &'a Document,
     pub(super) root_font_size: f32,
+    pub(super) resolution: &'a ResolutionContext,
 }
 
 impl ResolutionDocument<'_> {

@@ -50,11 +50,12 @@ pub use crate::layout_model::{GlyphId, GlyphMetric, GlyphMetricError, PreparedTe
 pub use html_dom::DocumentTocNode;
 pub use html_style_model::OpenTypeFeature;
 pub use html_style_model::{
-    FontStyle, ListStylePosition, ReaderStyleOverrides, StyleStringId, TextAlign,
+    FontStyle, ListStylePosition, ReaderStyleOverrides, StyleStringId, TextAlign, ThemeAdaptation,
     TextDecorationLines, UsedBorderRadii,
 };
 pub use shaping::{
-    CharacterPlacement, FontMetricsRequest, FontRelativeMetrics, FontSlant, GlyphRegistry,
+    CharacterPlacement, FontMetricsRequest, FontRelativeMetrics, FontSlant,
+    GlyphResourceGeneration, GlyphResourceStore,
     GlyphShaper, ShapeError, ShapedLine, ShapedTextRun, TextRunId, TextRunShapeRequest,
     TextShapeRequest, TextStyleSpan,
 };
@@ -177,6 +178,8 @@ pub(crate) mod test_support {
 
     pub(crate) struct TestGlyphShaper {
         glyphs: HashMap<(char, u32), GlyphId>,
+        glyph_store: crate::GlyphResourceStore,
+        append_checkpoint: Option<(HashMap<(char, u32), GlyphId>, crate::GlyphResourceStore)>,
         x_height_ratio: f32,
         ch_advance_ratio: f32,
         cap_height_ratio: f32,
@@ -188,6 +191,8 @@ pub(crate) mod test_support {
         fn default() -> Self {
             Self {
                 glyphs: HashMap::new(),
+                glyph_store: crate::GlyphResourceStore::default(),
+                append_checkpoint: None,
                 x_height_ratio: 0.5,
                 ch_advance_ratio: 0.5,
                 cap_height_ratio: 0.8,
@@ -213,6 +218,8 @@ pub(crate) mod test_support {
         pub(crate) fn with_x_height_ratio(x_height_ratio: f32) -> Self {
             Self {
                 glyphs: HashMap::new(),
+                glyph_store: crate::GlyphResourceStore::default(),
+                append_checkpoint: None,
                 x_height_ratio,
                 ch_advance_ratio: 0.5,
                 cap_height_ratio: 0.8,
@@ -224,6 +231,8 @@ pub(crate) mod test_support {
         pub(crate) fn with_font_relative_metrics(x_height_ratio: f32, ascent_ratio: f32) -> Self {
             Self {
                 glyphs: HashMap::new(),
+                glyph_store: crate::GlyphResourceStore::default(),
+                append_checkpoint: None,
                 x_height_ratio,
                 ch_advance_ratio: 0.5,
                 cap_height_ratio: 0.8,
@@ -238,6 +247,8 @@ pub(crate) mod test_support {
         ) -> Self {
             Self {
                 glyphs: HashMap::new(),
+                glyph_store: crate::GlyphResourceStore::default(),
+                append_checkpoint: None,
                 x_height_ratio,
                 ch_advance_ratio,
                 cap_height_ratio: 0.8,
@@ -250,11 +261,32 @@ pub(crate) mod test_support {
     impl GlyphShaper for TestGlyphShaper {
         fn reset(&mut self) {
             self.glyphs.clear();
+            self.glyph_store.clear();
         }
 
-        fn shape_glyph<'a>(
+        fn glyph_resources(&mut self) -> &mut crate::GlyphResourceStore {
+            &mut self.glyph_store
+        }
+
+        fn begin_append_shaping(&mut self) -> Result<(), crate::ShapeError> {
+            assert!(self.append_checkpoint.is_none(), "append shaping transactions cannot be nested");
+            self.append_checkpoint = Some((self.glyphs.clone(), self.glyph_store.clone()));
+            Ok(())
+        }
+
+        fn commit_append_shaping(&mut self) {
+            self.append_checkpoint = None;
+        }
+
+        fn rollback_append_shaping(&mut self) {
+            if let Some((glyphs, glyph_store)) = self.append_checkpoint.take() {
+                self.glyphs = glyphs;
+                self.glyph_store = glyph_store;
+            }
+        }
+
+        fn shape_glyph(
             &mut self,
-            glyph_metrics: &mut crate::GlyphRegistry<'a>,
             ch: char,
             font_size: f32,
             _font_weight: u16,
@@ -271,7 +303,7 @@ pub(crate) mod test_support {
             let metric =
                 GlyphMetric::try_new(ch, font_size * 0.5, ascent, descent, font_size * 0.75)
                     .map_err(crate::ShapeError::rejected_metric)?;
-            let glyph = glyph_metrics.register(metric)?;
+            let glyph = self.glyph_store.register(metric)?;
             self.glyphs.insert(key, glyph);
             Ok(glyph)
         }

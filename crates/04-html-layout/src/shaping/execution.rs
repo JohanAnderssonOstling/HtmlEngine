@@ -35,8 +35,6 @@ pub(crate) fn shape_document(
             &mut first_letter_styles,
         );
     }
-    let mut glyph_metrics = GlyphRegistry::new(glyph_metrics);
-
     let mut box_family: Vec<Option<String>> = vec![None; layout_tree.box_count()];
     let mut boxes_with_conditional_hyphens = vec![false; layout_tree.box_count()];
     for (box_idx, range) in text_runs(inline_content) {
@@ -382,7 +380,6 @@ pub(crate) fn shape_document(
                 // shaping APIs), so register these glyphs independently.
                 for (glyph, &character) in run_glyphs.iter_mut().zip(&normalized_characters) {
                     *glyph = glyph_shaper.shape_glyph(
-                        &mut glyph_metrics,
                         character,
                         font_size,
                         font_weight,
@@ -393,13 +390,13 @@ pub(crate) fn shape_document(
                 }
                 None
             } else {
-                glyph_shaper.shape_glyph_run(&mut glyph_metrics, request, run_glyphs)?
+                glyph_shaper.shape_glyph_run(request, run_glyphs)?
             };
             for &glyph in run_glyphs.iter() {
-                if !glyph_metrics.contains(glyph) {
+                if !glyph_shaper.glyph_resources().contains(glyph) {
                     return Err(ShapeError::unregistered_glyph_id(
                         glyph,
-                        glyph_metrics.len(),
+                        glyph_shaper.glyph_resources().len(),
                     ));
                 }
             }
@@ -441,7 +438,7 @@ pub(crate) fn shape_document(
         } else {
             for (offset, &index) in source_indices.iter().enumerate() {
                 let glyph = inline_content.glyph_at(index as usize).unwrap_or_default();
-                let metric = glyph_metrics.get(glyph).expect("registered glyph metric");
+                let metric = glyph_shaper.glyph_resources().get(glyph).expect("registered glyph metric");
                 text_geometry.advances[index as usize] = metric.advance();
                 debug_assert_eq!(metric.ch(), normalized_characters[offset]);
             }
@@ -466,7 +463,6 @@ pub(crate) fn shape_document(
         let family = box_family[box_idx].as_deref();
         let font_size = font_metrics.resolved_font_size(style, box_idx);
         let glyph = glyph_shaper.shape_glyph(
-            &mut glyph_metrics,
             '\u{2026}',
             font_size,
             style.font_weight(),
@@ -474,10 +470,10 @@ pub(crate) fn shape_document(
             style.color(),
             family,
         )?;
-        if !glyph_metrics.contains(glyph) {
+        if !glyph_shaper.glyph_resources().contains(glyph) {
             return Err(ShapeError::unregistered_glyph_id(
                 glyph,
-                glyph_metrics.len(),
+                glyph_shaper.glyph_resources().len(),
             ));
         }
         ellipsis_glyphs.insert(box_idx as u32, glyph);
@@ -490,7 +486,6 @@ pub(crate) fn shape_document(
         let family = box_family[box_idx].as_deref();
         let font_size = font_metrics.resolved_font_size(style, box_idx);
         let glyph = glyph_shaper.shape_glyph(
-            &mut glyph_metrics,
             '\u{2010}',
             font_size,
             style.font_weight(),
@@ -498,14 +493,15 @@ pub(crate) fn shape_document(
             style.color(),
             family,
         )?;
-        if !glyph_metrics.contains(glyph) {
+        if !glyph_shaper.glyph_resources().contains(glyph) {
             return Err(ShapeError::unregistered_glyph_id(
                 glyph,
-                glyph_metrics.len(),
+                glyph_shaper.glyph_resources().len(),
             ));
         }
         hyphen_glyphs.insert(box_idx as u32, glyph);
     }
+    *glyph_metrics = glyph_shaper.glyph_resources().snapshot();
     Ok((ellipsis_glyphs, hyphen_glyphs, text_geometry, font_metrics))
 }
 
@@ -576,15 +572,13 @@ pub(crate) fn reshape_range_with_style(
     };
     let start = range.start as usize;
     let end = range.end as usize;
-    let mut registry = GlyphRegistry::new(glyph_metrics);
     let native = glyph_shaper.shape_glyph_run(
-        &mut registry,
         request,
         &mut inline_content.glyphs_mut()[start..end],
     )?;
     for &glyph in &inline_content.glyphs()[start..end] {
-        if !registry.contains(glyph) {
-            return Err(ShapeError::unregistered_glyph_id(glyph, registry.len()));
+        if !glyph_shaper.glyph_resources().contains(glyph) {
+            return Err(ShapeError::unregistered_glyph_id(glyph, glyph_shaper.glyph_resources().len()));
         }
     }
 
@@ -626,7 +620,7 @@ pub(crate) fn reshape_range_with_style(
     } else {
         for index in start..end {
             let glyph = inline_content.glyph_at(index).unwrap_or_default();
-            text_geometry.advances[index] = registry
+            text_geometry.advances[index] = glyph_shaper.glyph_resources()
                 .get(glyph)
                 .expect("registered pseudo glyph")
                 .advance()
@@ -634,5 +628,6 @@ pub(crate) fn reshape_range_with_style(
         }
         text_geometry.cluster_boundaries[start..=end].fill(true);
     }
+    *glyph_metrics = glyph_shaper.glyph_resources().snapshot();
     Ok(())
 }

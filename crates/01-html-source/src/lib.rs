@@ -9,14 +9,6 @@ pub struct ResourceMetadata {
     pub charset: Option<String>,
 }
 
-/// A framework- and container-neutral table-of-contents entry.
-#[derive(Clone, Debug, Default)]
-pub struct TocEntry {
-    pub title: String,
-    pub link: String,
-    pub children: Vec<TocEntry>,
-}
-
 /// Supplies documents and related resources to the HTML pipeline.
 ///
 /// Implementations may read from a filesystem, an EPUB archive, a network
@@ -39,7 +31,4 @@ pub trait ResourceProvider: Send + Sync {
 
     fn list_html_candidates(&self, root: &str) -> io::Result<Vec<String>>;
 
-    fn toc(&self) -> io::Result<Option<Vec<TocEntry>>> {
-        Ok(None)
-    }
 }

@@ -22,18 +22,17 @@ use crate::style::syntax::values::white_space::{
 use html_dom::{Document, DomNodeId};
 use html_style_model::{
     AspectRatio as ComputedAspectRatio, Background, Border, BorderRadii, BorderStyle, BoxModel,
-    BoxSizing, BreakBetween, BreakInside, Clear,
-    ComputedSizeComponent, ComputedStyleValueError, ComputedStyles, ComputedStylesBuilder,
-    ContentAlignment, CornerRadius, CounterDirective, CounterDirectives, CounterStyle,
-    DecorationColor, Display, FlexDirection, FlexWrap, Float, Font,
-    FontRelativeLength, FontStyle, GeneratedContent, GeneratedContentItem, GridAutoFlow,
+    BoxSizing, BreakBetween, BreakInside, Clear, ComputedSizeComponent, ComputedStyleValueError,
+    ComputedStyles, ComputedStylesBuilder, ContentAlignment, CornerRadius, CounterDirective,
+    CounterDirectives, CounterStyle, DecorationColor, Display, FlexDirection, FlexWrap, Float,
+    Font, FontRelativeLength, FontStyle, GeneratedContent, GeneratedContentItem, GridAutoFlow,
     GridPlacement, GridPlacementRange, GridRepeatCount, GridTemplateArea, GridTemplateTrack,
     GridTrackBreadth, GridTrackSize, Hyphens, InheritedText, ItemAlignment, LayoutStyle, LengthPct,
     LogicalTextAlign, ObjectFit, ObjectPosition, ObjectPositionAxis, ObjectPositionOrigin,
-    OpenTypeFeature, OverflowMode, OverflowWrap, PositionMode, PreferredSize,
-    QuoteStyle, SizeComparison, StyleIndices, StyleStringId, TabSize, TextAlign,
-    TextDecorationLines, TextDecorationStyle, TextDecorationThickness, TextDirection,
-    TextOverflow, TextSpacing, TextTransform, VerticalAlignValue, Visibility, WhiteSpace, WordBreak,
+    OpenTypeFeature, OverflowMode, OverflowWrap, PositionMode, PreferredSize, QuoteStyle,
+    ReaderStyleOverrides, SizeComparison, StyleIndices, StyleStringId, TabSize, TextAlign,
+    TextDecorationLines, TextDecorationStyle, TextDecorationThickness, TextDirection, TextOverflow,
+    TextSpacing, TextTransform, VerticalAlignValue, Visibility, WhiteSpace, WordBreak,
 };
 use lightningcss::printer::{Printer, PrinterOptions};
 use lightningcss::properties::border::{BorderSideWidth, LineStyle};
@@ -48,7 +47,7 @@ use lightningcss::properties::size::{MaxSize, Size};
 use lightningcss::properties::text::Spacing;
 use lightningcss::properties::{CSSWideKeyword, Property, PropertyId};
 use lightningcss::stylesheet::{ParserOptions, StyleAttribute};
-use lightningcss::traits::{Parse, ParseWithOptions, ToCss};
+use lightningcss::traits::{Parse, ToCss};
 use lightningcss::values::calc::{Calc, MathFunction};
 use lightningcss::values::color::{CssColor, SystemColor};
 use lightningcss::values::length::{Length, LengthPercentage, LengthPercentageOrAuto, LengthValue};
@@ -60,7 +59,8 @@ use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 mod custom_properties;
 #[path = "../html_presentational_hints.rs"]
@@ -81,10 +81,12 @@ use custom_properties::*;
 use local_matching::{LocalMatchCache, LocalMatchProbe};
 use parent_style::ParentStyle;
 use plan::*;
-use properties::{apply_property_in_phase, property_is_computable};
+use properties::apply_property_in_phase;
 use runner::{CascadeInputs, CascadePhase};
 use state::{WorkingStyle, initial_border, initial_box_model};
-use style_sharing::{SharedElementStyle, StyleSharingCache, StyleSharingProbe, StyleSharingSignature};
+use style_sharing::{
+    SharedElementStyle, StyleSharingCache, StyleSharingProbe, StyleSharingSignature,
+};
 use traversal::*;
 pub(crate) use values::parse_font_kerning;
 use values::*;
@@ -109,6 +111,7 @@ pub(super) struct StyleResolverContext<'a, 'css> {
     pub(super) author_roots: &'a [Option<DomNodeId>],
     pub(super) index: &'a SelectorIndex,
     pub(super) styles: &'a mut ComputedStylesBuilder,
+    pub(super) reader_overrides: &'a ReaderStyleOverrides,
     pub(super) candidate_scratch: &'a mut Vec<EffectiveRuleId>,
     pub(super) candidate_seen: &'a mut CandidateDeduper,
     local_specificity_scratch: &'a mut Vec<Option<u32>>,
@@ -119,6 +122,7 @@ pub(super) struct StyleResolverContext<'a, 'css> {
     cascade_scratch: &'a mut specified::CascadeScratch<'a, 'css>,
     style_sharing_cache: &'a mut StyleSharingCache,
     validation_style: &'a mut WorkingStyle,
+    resolution: &'a ResolutionContext,
     pub(super) timings: &'a mut ResolveStyleTimings,
 }
 
@@ -140,18 +144,76 @@ enum ElementStyleResult<'css> {
     },
 }
 
-thread_local! {
-    /// Length conversion is a synchronous part of one style-resolution pass.
-    /// Keeping its immutable media environment thread-local avoids threading
-    /// duplicate viewport arguments through every typed property converter,
-    /// while remaining isolated when documents are styled in parallel.
-    static RESOLUTION_MEDIA_ENVIRONMENT: Cell<crate::MediaEnvironment> = Cell::new(crate::MediaEnvironment::default());
-    static RESOLUTION_USES_VIEWPORT_UNITS: Cell<bool> = const { Cell::new(false) };
-    /// The computed line height against which `lh` resolves for the property
-    /// currently being converted. `None` means no finite basis is available.
-    static RESOLUTION_LINE_HEIGHT: Cell<Option<f32>> = const { Cell::new(None) };
-    /// The root element's computed line height for `rlh` conversion.
-    static RESOLUTION_ROOT_LINE_HEIGHT: Cell<Option<f32>> = const { Cell::new(None) };
+fn apply_renderer_markers<'sheet, 'css>(
+    doc: &Document,
+    styles: &ComputedStylesBuilder,
+    style: &mut WorkingStyle,
+    events: &[specified::DeclarationEvent<'sheet, 'css>],
+    inline_style: Option<&StyleAttribute<'css>>,
+    custom_properties: &FxHashMap<String, TokenList<'css>>,
+    root_font_size: f32,
+    resolution: &ResolutionContext,
+) {
+    set_marker_resolution_bases(doc, styles, style, resolution);
+    let selected = |name| selected_renderer_marker(events, inline_style, name, custom_properties);
+    if let Some(value) = selected(WHITE_SPACE_CASCADE_MARKER)
+        .as_ref()
+        .and_then(from_marker_tokens)
+    {
+        style.text.white_space = value;
+    }
+    for (marker, target) in [
+        (LETTER_SPACING_MARKER, &mut style.text.letter_spacing),
+        (WORD_SPACING_MARKER, &mut style.text.word_spacing),
+    ] {
+        if let Some(spacing) = selected(marker)
+            .as_ref()
+            .and_then(token_list_to_css_string)
+            .as_deref()
+            .and_then(parse_text_spacing)
+            .as_ref()
+            .and_then(|parsed| {
+                parsed_text_spacing_to_computed(
+                    parsed,
+                    style.font.font_size,
+                    root_font_size,
+                    resolution,
+                )
+            })
+        {
+            *target = spacing;
+        }
+    }
+    if let Some(tab_size) = selected(TAB_SIZE_CASCADE_MARKER)
+        .as_ref()
+        .and_then(token_list_to_css_string)
+        .as_deref()
+        .and_then(parse_tab_size)
+        .as_ref()
+        .and_then(|parsed| {
+            parsed_tab_size_to_computed(parsed, style.font.font_size, root_font_size, resolution)
+        })
+    {
+        style.text.tab_size = tab_size;
+    }
+}
+
+struct ResolutionContext {
+    environment: crate::MediaEnvironment,
+    uses_viewport_units: Cell<bool>,
+    line_height: Cell<Option<f32>>,
+    root_line_height: Cell<Option<f32>>,
+}
+
+impl ResolutionContext {
+    fn new(environment: crate::MediaEnvironment) -> Self {
+        Self {
+            environment,
+            uses_viewport_units: Cell::new(false),
+            line_height: Cell::new(None),
+            root_line_height: Cell::new(None),
+        }
+    }
 }
 
 pub(crate) fn resolve_styles_for_dom_timed(
@@ -160,10 +222,9 @@ pub(crate) fn resolve_styles_for_dom_timed(
     index: &SelectorIndex,
     author_roots: &[Option<DomNodeId>],
     shared_inline_styles: &Arc<Mutex<ParsedInlineStyleCache>>,
+    reader_overrides: &ReaderStyleOverrides,
 ) -> (ComputedStyles, ResolveStyleTimings) {
-    RESOLUTION_MEDIA_ENVIRONMENT.set(prepared.environment());
-    RESOLUTION_USES_VIEWPORT_UNITS.set(false);
-    RESOLUTION_ROOT_LINE_HEIGHT.set(None);
+    let resolution = ResolutionContext::new(prepared.environment());
     let mut timings = ResolveStyleTimings::default();
 
     // Process each DOM element
@@ -193,6 +254,7 @@ pub(crate) fn resolve_styles_for_dom_timed(
             author_roots,
             index,
             styles: &mut computed_styles,
+            reader_overrides,
             candidate_scratch: &mut candidate_scratch,
             candidate_seen: &mut candidate_seen,
             local_specificity_scratch: &mut local_specificity_scratch,
@@ -203,6 +265,7 @@ pub(crate) fn resolve_styles_for_dom_timed(
             cascade_scratch: &mut cascade_scratch,
             style_sharing_cache: &mut style_sharing_cache,
             validation_style: &mut validation_style,
+            resolution: &resolution,
             timings: &mut timings,
         };
         for node_idx in doc.node_ids() {
@@ -219,9 +282,9 @@ pub(crate) fn resolve_styles_for_dom_timed(
                 AncestorFilter::default()
             };
             ancestor_filters[node_idx.index()] = ancestor_filter;
-            let parent_custom_id = doc
-                .get_dom_parent(node_idx)
-                .map_or(0, |parent_idx| node_custom_map_ids[parent_idx.index()] as usize);
+            let parent_custom_id = doc.get_dom_parent(node_idx).map_or(0, |parent_idx| {
+                node_custom_map_ids[parent_idx.index()] as usize
+            });
 
             let style_result = resolver.compute_style_for_dom_element(
                 node_idx,
@@ -238,14 +301,24 @@ pub(crate) fn resolve_styles_for_dom_timed(
 
             let started = Instant::now();
             let (style_indices, custom_map_id, counters, sharing_signature) = match style_result {
-                ElementStyleResult::Shared(shared) => (shared.style, shared.custom_map_id, shared.counters, None),
-                ElementStyleResult::Computed { mut style, custom_map, sharing_signature } => {
+                ElementStyleResult::Shared(shared) => {
+                    (shared.style, shared.custom_map_id, shared.counters, None)
+                }
+                ElementStyleResult::Computed {
+                    mut style,
+                    custom_map,
+                    sharing_signature,
+                } => {
                     let custom_map_id = match custom_map {
                         CustomMapResult::Inherited => parent_custom_id as u32,
                         CustomMapResult::Reused(map_id) => map_id,
-                        CustomMapResult::New { values, cache_signature } => {
+                        CustomMapResult::New {
+                            values,
+                            cache_signature,
+                        } => {
                             custom_maps.push(values);
-                            let map_id = u32::try_from(custom_maps.len() - 1).expect("custom property map count fits in u32");
+                            let map_id = u32::try_from(custom_maps.len() - 1)
+                                .expect("custom property map count fits in u32");
                             if let Some(signature) = cache_signature {
                                 custom_cascade_cache.insert(signature, map_id);
                             }
@@ -253,7 +326,9 @@ pub(crate) fn resolve_styles_for_dom_timed(
                         }
                     };
                     let counters = std::mem::take(&mut style.counters);
-                    let style_indices = style.intern(resolver.styles).expect("resolver built style values should pass style validation");
+                    let style_indices = style
+                        .intern(resolver.styles)
+                        .expect("resolver built style values should pass style validation");
                     (style_indices, custom_map_id, counters, sharing_signature)
                 }
             };
@@ -262,7 +337,12 @@ pub(crate) fn resolve_styles_for_dom_timed(
                 .set_node_style(node_idx, style_indices)
                 .expect("resolver only assigns styles to nodes from its source document");
             if let Some(signature) = sharing_signature {
-                resolver.style_sharing_cache.insert(signature, style_indices, custom_map_id, counters.clone());
+                resolver.style_sharing_cache.insert(
+                    signature,
+                    style_indices,
+                    custom_map_id,
+                    counters.clone(),
+                );
             }
             if !counters.is_empty() {
                 resolver
@@ -396,11 +476,12 @@ pub(crate) fn resolve_styles_for_dom_timed(
         }
     }
     let started = Instant::now();
+    computed_styles.apply_reader_overrides(doc, reader_overrides);
     let styles = computed_styles
         .finish()
         .expect("resolver must assign a valid computed style to every element");
     timings.style_store += started.elapsed();
-    if RESOLUTION_USES_VIEWPORT_UNITS.get() {
+    if resolution.uses_viewport_units.get() {
         prepared.media_queries().mark_viewport_unit_dependency();
     }
     (styles, timings)
@@ -423,7 +504,8 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
                 continue;
             }
             let style_rule = prepared.get(id).style_rule();
-            let Some(scope_match) = prepared.scope_match(prepared.get(id).scope(), doc, self.author_roots, node_idx)
+            let Some(scope_match) =
+                prepared.scope_match(prepared.get(id).scope(), doc, self.author_roots, node_idx)
             else {
                 continue;
             };
@@ -431,10 +513,22 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
             // a synthetic combinator. The ancestor bloom filter treats that as a
             // real tree hop, so it cannot safely prefilter pseudo selectors.
             let mut specificity = None;
-            for (selector, prepared_selector) in style_rule.selectors.0.iter().zip(self.index.prepared_selectors(id)) {
-                if selector_matches_dom_pseudo_in_scope(selector, doc, node_idx, pseudo, scope_match.root) {
+            for (selector, prepared_selector) in style_rule
+                .selectors
+                .0
+                .iter()
+                .zip(self.index.prepared_selectors(id))
+            {
+                if selector_matches_dom_pseudo_in_scope(
+                    selector,
+                    doc,
+                    node_idx,
+                    pseudo,
+                    scope_match.root,
+                ) {
                     let matched = self.index.selector_specificity(*prepared_selector);
-                    specificity = Some(specificity.map_or(matched, |current: u32| current.max(matched)));
+                    specificity =
+                        Some(specificity.map_or(matched, |current: u32| current.max(matched)));
                 }
             }
             if let Some(specificity) = specificity {
@@ -505,8 +599,17 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
                 presentational_hints_node: None,
             },
             &mut cascade_scratch.valid_events,
-            &mut cascade_scratch.invalid_sequences,
             &mut cascade_scratch.selection,
+        );
+        apply_renderer_markers(
+            doc,
+            self.styles,
+            &mut style,
+            &cascade_scratch.events.events,
+            None,
+            custom_properties,
+            doc.root_font_size(),
+            self.resolution,
         );
         *self.cascade_scratch = cascade_scratch;
         Some(style)
@@ -535,12 +638,24 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
         let tag = doc.get_dom_tag(node_idx).unwrap_or("");
         let id = doc.get_dom_id(node_idx);
 
-        let local_probe = self.local_match_cache.probe(doc, node_idx, self.candidate_scratch, self.local_specificity_scratch);
+        let local_probe = self.local_match_cache.probe(
+            doc,
+            node_idx,
+            self.candidate_scratch,
+            self.local_specificity_scratch,
+        );
         let local_hit = matches!(&local_probe, LocalMatchProbe::Hit);
         if !local_hit {
-            index.collect_candidates(tag, id, doc.get_dom_classes(node_idx), self.candidate_scratch, self.candidate_seen);
+            index.collect_candidates(
+                tag,
+                id,
+                doc.get_dom_classes(node_idx),
+                self.candidate_scratch,
+                self.candidate_seen,
+            );
             self.local_specificity_scratch.clear();
-            self.local_specificity_scratch.resize(self.candidate_scratch.len(), None);
+            self.local_specificity_scratch
+                .resize(self.candidate_scratch.len(), None);
         }
 
         // Check each candidate. A rule cascades with the most specific of its
@@ -554,30 +669,46 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
                         continue;
                     }
                     debug_assert!(index.selector_might_match(*prepared_selector, ancestor_filter));
-                    if index.matches_fast_selector(*prepared_selector, doc, node_idx) == Some(true) {
+                    if index.matches_fast_selector(*prepared_selector, doc, node_idx) == Some(true)
+                    {
                         let matched = index.selector_specificity(*prepared_selector);
-                        specificity = Some(specificity.map_or(matched, |current| current.max(matched)));
+                        specificity =
+                            Some(specificity.map_or(matched, |current| current.max(matched)));
                     }
                 }
                 self.local_specificity_scratch[candidate_index] = specificity;
             }
-            let Some(scope_match) = prepared.scope_match(prepared.get(id).scope(), doc, self.author_roots, node_idx)
+            let Some(scope_match) =
+                prepared.scope_match(prepared.get(id).scope(), doc, self.author_roots, node_idx)
             else {
                 continue;
             };
-            for (selector, prepared_selector) in style_rule.selectors.0.iter().zip(index.prepared_selectors(id)) {
+            for (selector, prepared_selector) in style_rule
+                .selectors
+                .0
+                .iter()
+                .zip(index.prepared_selectors(id))
+            {
                 if index.selector_is_context_free(*prepared_selector) {
                     continue;
                 }
                 if !index.selector_might_match(*prepared_selector, ancestor_filter) {
                     continue;
                 }
-                let matches = index.matches_fast_selector(*prepared_selector, doc, node_idx).unwrap_or_else(|| {
-                    crate::style::matching::dom::selector_matches_dom_node_in_scope(selector, doc, node_idx, scope_match.root)
-                });
+                let matches = index
+                    .matches_fast_selector(*prepared_selector, doc, node_idx)
+                    .unwrap_or_else(|| {
+                        crate::style::matching::dom::selector_matches_dom_node_in_scope(
+                            selector,
+                            doc,
+                            node_idx,
+                            scope_match.root,
+                        )
+                    });
                 if matches {
                     let matched = index.selector_specificity(*prepared_selector);
-                    specificity = Some(specificity.map_or(matched, |current: u32| current.max(matched)));
+                    specificity =
+                        Some(specificity.map_or(matched, |current: u32| current.max(matched)));
                 }
             }
             if let Some(specificity) = specificity {
@@ -589,14 +720,20 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
             }
         }
         if let LocalMatchProbe::Miss(signature) = local_probe {
-            self.local_match_cache.insert(signature, self.candidate_scratch, self.local_specificity_scratch);
+            self.local_match_cache.insert(
+                signature,
+                self.candidate_scratch,
+                self.local_specificity_scratch,
+            );
         }
 
         self.timings.selector_matching += matching_started.elapsed();
 
         // Build computed style from matched rules (same as box-based version)
         let cascade_started = Instant::now();
-        let parent_style_indices = doc.get_dom_parent(node_idx).and_then(|parent| self.styles.style_for_node(parent));
+        let parent_style_indices = doc
+            .get_dom_parent(node_idx)
+            .and_then(|parent| self.styles.style_for_node(parent));
         let sharing_signature = match self.style_sharing_cache.probe(
             doc,
             node_idx,
@@ -632,33 +769,33 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
         *self.matched_rule_scratch = matched_rules;
         *self.important_rule_scratch = important_rules;
         let parent_custom = &custom_maps[parent_custom_id as usize];
-        let (mut custom_properties, reused_custom_id, cache_signature) =
-            match custom_cascade_cache.probe(
+        let (custom_properties, reused_custom_id, cache_signature) = match custom_cascade_cache
+            .probe(
                 &cascade_scratch.events.events,
                 inline_style,
                 parent_custom_id,
             ) {
-                CustomCascadeProbe::NoDeclarations => (None, None, None),
-                CustomCascadeProbe::UncachedDeclarations => (
-                    cascade_custom_properties(
-                        &cascade_scratch.events.events,
-                        inline_style,
-                        parent_custom,
-                    ),
-                    None,
-                    None,
+            CustomCascadeProbe::NoDeclarations => (None, None, None),
+            CustomCascadeProbe::UncachedDeclarations => (
+                cascade_custom_properties(
+                    &cascade_scratch.events.events,
+                    inline_style,
+                    parent_custom,
                 ),
-                CustomCascadeProbe::Hit(map_id) => (None, Some(map_id), None),
-                CustomCascadeProbe::Miss(signature) => (
-                    cascade_custom_properties(
-                        &cascade_scratch.events.events,
-                        inline_style,
-                        parent_custom,
-                    ),
-                    None,
-                    Some(signature),
+                None,
+                None,
+            ),
+            CustomCascadeProbe::Hit(map_id) => (None, Some(map_id), None),
+            CustomCascadeProbe::Miss(signature) => (
+                cascade_custom_properties(
+                    &cascade_scratch.events.events,
+                    inline_style,
+                    parent_custom,
                 ),
-            };
+                None,
+                Some(signature),
+            ),
+        };
         let custom_base = reused_custom_id
             .map(|map_id| &custom_maps[map_id as usize])
             .unwrap_or(parent_custom);
@@ -671,70 +808,24 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
                 inline_style,
                 hints_sequence,
                 parent_font_size,
-                custom_properties: effective_custom_properties(
-                    &custom_properties,
-                    custom_base,
-                ),
+                custom_properties: effective_custom_properties(&custom_properties, custom_base),
                 parent: &parent_style,
                 presentational_hints_node: Some(node_idx),
             },
             &mut cascade_scratch.valid_events,
-            &mut cascade_scratch.invalid_sequences,
             &mut cascade_scratch.selection,
         );
+        apply_renderer_markers(
+            doc,
+            self.styles,
+            &mut style,
+            &cascade_scratch.events.events,
+            inline_style,
+            effective_custom_properties(&custom_properties, custom_base),
+            doc.root_font_size(),
+            self.resolution,
+        );
         *self.cascade_scratch = cascade_scratch;
-
-        if let Some(white_space) = effective_custom_properties(&custom_properties, custom_base)
-            .get(WHITE_SPACE_CASCADE_MARKER)
-            .and_then(from_marker_tokens)
-        {
-            style.text.white_space = white_space;
-        }
-        for (marker, target) in [
-            (LETTER_SPACING_MARKER, &mut style.text.letter_spacing),
-            (WORD_SPACING_MARKER, &mut style.text.word_spacing),
-        ] {
-            let Some(spacing) = effective_custom_properties(&custom_properties, custom_base)
-                .get(marker)
-                .and_then(token_list_to_css_string)
-                .as_deref()
-                .and_then(parse_text_spacing)
-                .as_ref()
-                .and_then(|parsed| {
-                    parsed_text_spacing_to_computed(
-                        parsed,
-                        style.font.font_size,
-                        doc.root_font_size(),
-                    )
-                })
-            else {
-                continue;
-            };
-            *target = spacing;
-            if let Some(tokens) = canonical_text_spacing_tokens(spacing) {
-                update_custom_property(&mut custom_properties, custom_base, marker, tokens);
-            }
-        }
-        if let Some(tab_size) = effective_custom_properties(&custom_properties, custom_base)
-            .get(TAB_SIZE_CASCADE_MARKER)
-            .and_then(token_list_to_css_string)
-            .as_deref()
-            .and_then(parse_tab_size)
-            .as_ref()
-            .and_then(|parsed| {
-                parsed_tab_size_to_computed(parsed, style.font.font_size, doc.root_font_size())
-            })
-        {
-            style.text.tab_size = tab_size;
-            if let Some(tokens) = canonical_tab_size_tokens(tab_size) {
-                update_custom_property(
-                    &mut custom_properties,
-                    custom_base,
-                    TAB_SIZE_CASCADE_MARKER,
-                    tokens,
-                );
-            }
-        }
 
         // HTML `lang` and XML `xml:lang` participate in inherited text
         // semantics even though they are not CSS properties.
@@ -749,32 +840,23 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
 
         // Preserve `currentColor` as a computed keyword for inheritance while
         // caching this element's resolved RGBA for paint.
-        let current_color = style.text.color;
-        if style.border.current_color_sides & 0b0001 != 0 {
-            style.border.border_top_color = current_color;
-        }
-        if style.border.current_color_sides & 0b0010 != 0 {
-            style.border.border_right_color = current_color;
-        }
-        if style.border.current_color_sides & 0b0100 != 0 {
-            style.border.border_bottom_color = current_color;
-        }
-        if style.border.current_color_sides & 0b1000 != 0 {
-            style.border.border_left_color = current_color;
-        }
+        style.border.cache_current_color(style.text.color);
 
         self.timings.cascade += cascade_started.elapsed();
         let custom_map = match custom_properties {
-            Some(values) => {
-                let cache_signature = cache_signature
-                    .filter(|_| custom_map_is_cacheable(&values));
-                CustomMapResult::New { values, cache_signature }
-            }
+            Some(values) => CustomMapResult::New {
+                values,
+                cache_signature,
+            },
             None => reused_custom_id
                 .map(CustomMapResult::Reused)
                 .unwrap_or(CustomMapResult::Inherited),
         };
-        ElementStyleResult::Computed { style, custom_map, sharing_signature }
+        ElementStyleResult::Computed {
+            style,
+            custom_map,
+            sharing_signature,
+        }
     }
 }
 

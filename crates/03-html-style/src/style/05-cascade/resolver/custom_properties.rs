@@ -2,7 +2,10 @@
 
 use super::*;
 use rustc_data_structures::fx::FxHasher;
-use specified::{CascadeBoundary, DeclarationEvent};
+use specified::{
+    CandidateAction, CascadeBoundary, CascadeRollback, DeclarationEvent, candidate_action,
+    rollback_keyword,
+};
 use static_self::IntoOwned;
 use std::hash::{Hash, Hasher};
 
@@ -120,27 +123,98 @@ impl CustomCascadeCache {
     }
 }
 
-pub(super) fn custom_map_is_cacheable(values: &FxHashMap<String, TokenList<'_>>) -> bool {
-    // Renderer-owned compatibility markers may be rewritten using this
-    // element's computed font metrics. Keep those maps element-local.
-    !values.contains_key(WHITE_SPACE_CASCADE_MARKER)
-        && !values.contains_key(LETTER_SPACING_MARKER)
-        && !values.contains_key(WORD_SPACING_MARKER)
-        && !values.contains_key(TAB_SIZE_CASCADE_MARKER)
-}
-
 fn custom_declaration<'property, 'css>(
     property: &'property Property<'css>,
 ) -> Option<(&'property str, &'property TokenList<'css>)> {
     match property {
-        Property::Custom(custom) if custom.name.as_ref().starts_with("--") => {
+        Property::Custom(custom)
+            if custom.name.as_ref().starts_with("--")
+                && !is_renderer_marker(custom.name.as_ref()) =>
+        {
             Some((custom.name.as_ref(), &custom.value))
         }
-        Property::Unparsed(unparsed) if unparsed.property_id.name().starts_with("--") => {
+        Property::Unparsed(unparsed)
+            if unparsed.property_id.name().starts_with("--")
+                && !is_renderer_marker(unparsed.property_id.name()) =>
+        {
             Some((unparsed.property_id.name(), &unparsed.value))
         }
         _ => None,
     }
+}
+
+fn is_renderer_marker(name: &str) -> bool {
+    matches!(
+        name,
+        WHITE_SPACE_CASCADE_MARKER
+            | LETTER_SPACING_MARKER
+            | WORD_SPACING_MARKER
+            | TAB_SIZE_CASCADE_MARKER
+    )
+}
+
+fn renderer_marker_declaration<'property, 'css>(
+    property: &'property Property<'css>,
+) -> Option<(&'property str, &'property TokenList<'css>)> {
+    match property {
+        Property::Custom(custom) if is_renderer_marker(custom.name.as_ref()) => {
+            Some((custom.name.as_ref(), &custom.value))
+        }
+        Property::Unparsed(unparsed) if is_renderer_marker(unparsed.property_id.name()) => {
+            Some((unparsed.property_id.name(), &unparsed.value))
+        }
+        _ => None,
+    }
+}
+
+/// Select an internal renderer declaration with the same origin/layer rollback
+/// rules as custom properties. Its computed value lives in `WorkingStyle`, so
+/// it does not need to be serialized back into the inherited variable map.
+pub(super) fn selected_renderer_marker<'sheet, 'css>(
+    events: &[DeclarationEvent<'sheet, 'css>],
+    inline_style: Option<&StyleAttribute<'css>>,
+    name: &str,
+    custom_properties: &FxHashMap<String, TokenList<'css>>,
+) -> Option<TokenList<'css>> {
+    let mut rollbacks = Vec::<CascadeRollback>::new();
+    for event in events.iter().rev() {
+        let Some((candidate, value)) = renderer_marker_declaration(event.property(inline_style))
+        else {
+            continue;
+        };
+        if candidate != name {
+            continue;
+        }
+        let keyword = single_ident_keyword(value).map(str::to_ascii_lowercase);
+        let rollback = keyword.as_deref().and_then(rollback_keyword);
+        match candidate_action(&rollbacks, event.boundary, rollback) {
+            CandidateAction::Excluded => continue,
+            CandidateAction::Rollback(kind) => {
+                rollbacks.push(CascadeRollback::new(event.boundary, kind));
+                continue;
+            }
+            CandidateAction::Select => {}
+        }
+        match keyword.as_deref() {
+            Some("initial" | "inherit" | "unset") => return None,
+            _ => {
+                let mut resolved = value.clone();
+                if token_list_contains_var(&resolved) {
+                    let variables = custom_properties
+                        .iter()
+                        .map(|(name, value)| (name.as_str(), value.clone()))
+                        .collect::<HashMap<_, _>>();
+                    mark_var_substitution_boundaries(&mut resolved);
+                    resolved.substitute_variables(&variables);
+                    if token_list_contains_var(&resolved) {
+                        return None;
+                    }
+                }
+                return Some(resolved);
+            }
+        }
+    }
+    None
 }
 
 /// Cascade custom properties as specified token values. Rollback discards
@@ -159,31 +233,33 @@ pub(super) fn cascade_custom_properties<'sheet, 'css>(
     }
     let mut values = parent.clone();
     let mut decided = HashSet::<&str>::new();
-    let mut rollbacks = FxHashMap::<&str, Vec<(CascadeBoundary, bool)>>::default();
+    let mut rollbacks = FxHashMap::<&str, Vec<CascadeRollback>>::default();
 
     for event in events.iter().rev() {
         let Some((name, value)) = custom_declaration(event.property(inline_style)) else {
             continue;
         };
-        if decided.contains(&name)
-            || rollbacks.get(&name).is_some_and(|entries| {
-                entries
-                    .iter()
-                    .any(|(boundary, layer)| boundary.rollback_excludes(event.boundary, *layer))
-            })
-        {
+        if decided.contains(&name) {
             continue;
         }
         let keyword = single_ident_keyword(value).map(str::to_ascii_lowercase);
+        let rollback = keyword.as_deref().and_then(rollback_keyword);
+        match candidate_action(
+            rollbacks.get(&name).map_or(&[], Vec::as_slice),
+            event.boundary,
+            rollback,
+        ) {
+            CandidateAction::Excluded => continue,
+            CandidateAction::Rollback(kind) => {
+                rollbacks
+                    .entry(name)
+                    .or_default()
+                    .push(CascadeRollback::new(event.boundary, kind));
+                continue;
+            }
+            CandidateAction::Select => {}
+        }
         match keyword.as_deref() {
-            Some("revert") => rollbacks
-                .entry(name)
-                .or_default()
-                .push((event.boundary, false)),
-            Some("revert-layer") => rollbacks
-                .entry(name)
-                .or_default()
-                .push((event.boundary, true)),
             Some("initial") => {
                 values.remove(name);
                 decided.insert(name);
@@ -207,20 +283,6 @@ pub(super) fn effective_custom_properties<'map, 'css>(
     parent: &'map FxHashMap<String, TokenList<'css>>,
 ) -> &'map FxHashMap<String, TokenList<'css>> {
     properties.as_ref().unwrap_or(parent)
-}
-
-pub(super) fn update_custom_property<'css>(
-    properties: &mut Option<FxHashMap<String, TokenList<'css>>>,
-    parent: &FxHashMap<String, TokenList<'css>>,
-    name: &str,
-    value: TokenList<'css>,
-) {
-    if effective_custom_properties(properties, parent).get(name) == Some(&value) {
-        return;
-    }
-    properties
-        .get_or_insert_with(|| parent.clone())
-        .insert(name.to_string(), value);
 }
 
 pub(super) fn single_ident_keyword<'tokens, 'css>(
@@ -515,13 +577,9 @@ pub(super) fn resolve_single_var_property<'a>(
     };
     let replacement = custom_properties.get(var.name.ident.as_ref())?;
     let css = token_list_to_css_string(replacement)?;
-    Property::parse_string(
-        unparsed.property_id.clone(),
-        &css,
-        ParserOptions::default(),
-    )
-    .ok()
-    .map(IntoOwned::into_owned)
+    Property::parse_string(unparsed.property_id.clone(), &css, ParserOptions::default())
+        .ok()
+        .map(IntoOwned::into_owned)
 }
 
 pub(super) fn token_list_to_css_string(tokens: &TokenList<'_>) -> Option<String> {
@@ -575,31 +633,6 @@ fn write_token_list(tokens: &TokenList<'_>, out: &mut String) -> Option<()> {
         }
     }
     Some(())
-}
-
-pub(super) fn canonical_text_spacing_tokens<'a>(spacing: TextSpacing) -> Option<TokenList<'a>> {
-    let absolute_px = spacing.absolute_px();
-    let percentage = spacing.font_size_fraction() * 100.0;
-    let css = if percentage == 0.0 {
-        format!("{absolute_px}px")
-    } else if absolute_px == 0.0 {
-        format!("{percentage}%")
-    } else if percentage.is_sign_negative() {
-        format!("calc({absolute_px}px - {}%)", percentage.abs())
-    } else {
-        format!("calc({absolute_px}px + {percentage}%)")
-    };
-    let leaked: &'a str = Box::leak(css.into_boxed_str());
-    TokenList::parse_string_with_options(leaked, ParserOptions::default()).ok()
-}
-
-pub(super) fn canonical_tab_size_tokens<'a>(tab_size: TabSize) -> Option<TokenList<'a>> {
-    let css = match tab_size.kind() {
-        html_style_model::TabSizeKind::Spaces => tab_size.value().to_string(),
-        html_style_model::TabSizeKind::LengthPx => format!("{}px", tab_size.value()),
-    };
-    let leaked: &'a str = Box::leak(css.into_boxed_str());
-    TokenList::parse_string_with_options(leaked, ParserOptions::default()).ok()
 }
 
 pub(super) fn token_list_contains_var(tokens: &TokenList<'_>) -> bool {

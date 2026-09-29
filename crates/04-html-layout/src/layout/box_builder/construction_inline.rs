@@ -439,18 +439,13 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
             let target = self.first_letter_target_box(character, box_idx);
             if fragment_target.is_none()
                 && target == box_idx
-                && self.floated_first_letter.as_ref().is_some_and(|capture| {
+                && let Some(capture) = self.floated_first_letter.as_mut().filter(|capture| {
                     capture.phase == FirstLetterCapturePhase::Done && capture.item_end.is_none()
                 })
             {
-                let end = self.output.item_position();
-                self.floated_first_letter
-                    .as_mut()
-                    .expect("active first-letter capture")
-                    .item_end = Some(end);
+                capture.item_end = Some(self.output.item_position());
             }
-            if fragment_target.is_some() && fragment_target != Some(target) {
-                let previous = fragment_target.expect("text fragment target");
+            if let Some(previous) = fragment_target.filter(|&previous| previous != target) {
                 let fragment = &text[fragment_start..byte_offset];
                 self.output.push_source_text_fragment(
                     fragment,
@@ -458,14 +453,12 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
                     node_id.raw(),
                     source_utf16_offset,
                 );
-                if self.floated_first_letter.as_ref().is_some_and(|capture| {
-                    capture.box_idx == previous && capture.item_end.is_none()
-                }) {
-                    let end = self.output.item_position();
-                    self.floated_first_letter
-                        .as_mut()
-                        .expect("active first-letter capture")
-                        .item_end = Some(end);
+                if let Some(capture) = self
+                    .floated_first_letter
+                    .as_mut()
+                    .filter(|capture| capture.box_idx == previous && capture.item_end.is_none())
+                {
+                    capture.item_end = Some(self.output.item_position());
                 }
                 source_utf16_offset += fragment.encode_utf16().count() as u32;
                 fragment_start = byte_offset;

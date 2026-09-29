@@ -5,6 +5,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
+base64 = "0.22"
 html-dom = { path = "../html-dom" }
 html-source = { path = "../01-html-source" }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }

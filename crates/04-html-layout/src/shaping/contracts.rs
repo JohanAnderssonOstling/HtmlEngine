@@ -808,6 +808,9 @@ enum ShapeErrorKind {
     RegistryCapacityExhausted {
         metrics_len: usize,
     },
+    FirstLineRefinementDidNotConverge,
+    AppendTransactionUnsupported,
+    ResourceGenerationMismatch,
 }
 
 impl ShapeError {
@@ -832,19 +835,43 @@ impl ShapeError {
         }
     }
 
-    pub fn glyph_id(self) -> GlyphId {
-        match self.kind {
-            ShapeErrorKind::UnregisteredGlyphId { glyph_id, .. } => glyph_id,
-            ShapeErrorKind::RejectedMetric { .. } => GlyphId::MAX,
-            ShapeErrorKind::RegistryCapacityExhausted { .. } => GlyphId::MAX,
+    pub(crate) fn first_line_refinement_did_not_converge() -> Self {
+        Self {
+            kind: ShapeErrorKind::FirstLineRefinementDidNotConverge,
         }
     }
 
-    pub fn metrics_len(self) -> usize {
+    pub(crate) fn append_transaction_unsupported() -> Self {
+        Self {
+            kind: ShapeErrorKind::AppendTransactionUnsupported,
+        }
+    }
+
+    pub(crate) fn resource_generation_mismatch() -> Self {
+        Self {
+            kind: ShapeErrorKind::ResourceGenerationMismatch,
+        }
+    }
+
+    pub fn glyph_id(self) -> Option<GlyphId> {
         match self.kind {
-            ShapeErrorKind::UnregisteredGlyphId { metrics_len, .. } => metrics_len,
-            ShapeErrorKind::RejectedMetric { .. } => 0,
-            ShapeErrorKind::RegistryCapacityExhausted { metrics_len } => metrics_len,
+            ShapeErrorKind::UnregisteredGlyphId { glyph_id, .. } => Some(glyph_id),
+            ShapeErrorKind::RejectedMetric { .. }
+            | ShapeErrorKind::RegistryCapacityExhausted { .. }
+            | ShapeErrorKind::FirstLineRefinementDidNotConverge
+            | ShapeErrorKind::AppendTransactionUnsupported
+            | ShapeErrorKind::ResourceGenerationMismatch => None,
+        }
+    }
+
+    pub fn metrics_len(self) -> Option<usize> {
+        match self.kind {
+            ShapeErrorKind::UnregisteredGlyphId { metrics_len, .. }
+            | ShapeErrorKind::RegistryCapacityExhausted { metrics_len } => Some(metrics_len),
+            ShapeErrorKind::RejectedMetric { .. }
+            | ShapeErrorKind::FirstLineRefinementDidNotConverge
+            | ShapeErrorKind::AppendTransactionUnsupported
+            | ShapeErrorKind::ResourceGenerationMismatch => None,
         }
     }
 
@@ -853,6 +880,9 @@ impl ShapeError {
             ShapeErrorKind::RejectedMetric { reason } => Some(reason),
             ShapeErrorKind::UnregisteredGlyphId { .. }
             | ShapeErrorKind::RegistryCapacityExhausted { .. } => None,
+            ShapeErrorKind::FirstLineRefinementDidNotConverge
+            | ShapeErrorKind::AppendTransactionUnsupported
+            | ShapeErrorKind::ResourceGenerationMismatch => None,
         }
     }
 }
@@ -880,47 +910,82 @@ impl fmt::Display for ShapeError {
                     "glyph registry exceeded capacity after {metrics_len} registered metrics"
                 )
             }
+            ShapeErrorKind::FirstLineRefinementDidNotConverge => {
+                formatter.write_str("first-line layout did not converge")
+            }
+            ShapeErrorKind::AppendTransactionUnsupported => {
+                formatter.write_str("glyph shaper does not support append rollback")
+            }
+            ShapeErrorKind::ResourceGenerationMismatch => {
+                formatter.write_str("glyph shaper resources do not belong to this document")
+            }
         }
     }
 }
 
 impl std::error::Error for ShapeError {}
 
-/// Append-only access to the glyph metrics owned by an active shaping phase.
-///
-/// The backing store is intentionally not part of the public API:
-///
-/// ```compile_fail
-/// let _ = html_layout::GlyphMetrics::default();
-/// ```
-pub struct GlyphRegistry<'a> {
-    glyph_metrics: &'a mut GlyphMetrics,
+/// Glyph metrics owned by the renderer resource backend. Glyph IDs refer to
+/// this store for as long as the backend resources remain active.
+#[derive(Clone)]
+pub struct GlyphResourceStore {
+    metrics: GlyphMetrics,
+    generation: GlyphResourceGeneration,
 }
 
-impl<'a> GlyphRegistry<'a> {
-    pub(crate) fn new(glyph_metrics: &'a mut GlyphMetrics) -> Self {
-        Self { glyph_metrics }
+#[derive(Clone, Debug)]
+pub struct GlyphResourceGeneration(Arc<()>);
+
+impl PartialEq for GlyphResourceGeneration {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for GlyphResourceGeneration {}
+
+impl Default for GlyphResourceStore {
+    fn default() -> Self {
+        Self {
+            metrics: GlyphMetrics::default(),
+            generation: GlyphResourceGeneration(Arc::new(())),
+        }
+    }
+}
+
+impl GlyphResourceStore {
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn generation(&self) -> GlyphResourceGeneration {
+        self.generation.clone()
     }
 
     pub fn register(&mut self, metric: GlyphMetric) -> Result<GlyphId, ShapeError> {
-        self.glyph_metrics
+        self.metrics
             .register(metric)
             .map_err(|_| ShapeError::registry_capacity_exhausted(self.len()))
     }
 
-    #[inline]
     pub fn len(&self) -> usize {
-        self.glyph_metrics.len()
+        self.metrics.len()
     }
 
-    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn get(&self, glyph: GlyphId) -> Option<GlyphMetric> {
-        self.glyph_metrics.get_checked(glyph)
+        self.metrics.get_checked(glyph)
     }
 
-    #[inline]
     pub fn contains(&self, glyph: GlyphId) -> bool {
-        self.glyph_metrics.get_checked(glyph).is_some()
+        self.get(glyph).is_some()
+    }
+
+    pub(crate) fn snapshot(&self) -> GlyphMetrics {
+        self.metrics.clone()
     }
 }
 
@@ -929,12 +994,31 @@ impl<'a> GlyphRegistry<'a> {
 pub trait GlyphShaper {
     fn reset(&mut self);
 
+    /// The active backend-owned glyph ledger. Register each backend glyph in
+    /// this store at the same ID. Document replacement must start a fresh
+    /// store generation; rollback must restore the previous store and backend
+    /// glyph and run data together.
+    fn glyph_resources(&mut self) -> &mut GlyphResourceStore;
+
+    /// Checkpoint active resources before an operation that appends glyphs.
+    /// The default rejects appends so failed shaping cannot leave dense IDs
+    /// ahead of the published glyph metrics. Resource-backed shapers should
+    /// restore all glyph and run resources in `rollback_append_shaping`.
+    fn begin_append_shaping(&mut self) -> Result<(), ShapeError> {
+        Err(ShapeError::append_transaction_unsupported())
+    }
+
+    fn commit_append_shaping(&mut self) {}
+
+    fn rollback_append_shaping(&mut self) {}
+
     /// Starts replacing the renderer-owned resources for a shaped document.
     ///
     /// Resource-backed implementations should retain the previous document's
     /// resources until either [`GlyphShaper::commit_document_shaping`] or
     /// [`GlyphShaper::rollback_document_shaping`] is called. Implementations
-    /// without renderer-owned resources can rely on this reset-only default.
+    /// without renderer-owned resources can rely on this reset-only default;
+    /// `reset` must clear [`GlyphShaper::glyph_resources`].
     fn begin_document_shaping(&mut self) {
         self.reset();
     }
@@ -955,9 +1039,8 @@ pub trait GlyphShaper {
         Ok(FontRelativeMetrics::fallback())
     }
 
-    fn shape_glyph<'a>(
+    fn shape_glyph(
         &mut self,
-        glyph_metrics: &mut GlyphRegistry<'a>,
         ch: char,
         font_size: f32,
         font_weight: u16,
@@ -970,9 +1053,8 @@ pub trait GlyphShaper {
     /// dense glyph-ID buffer. Backends can override this to resolve shared
     /// style state once and batch character lookup; the default preserves the
     /// established per-character contract.
-    fn shape_glyph_run<'a>(
+    fn shape_glyph_run(
         &mut self,
-        glyph_metrics: &mut GlyphRegistry<'a>,
         request: TextRunShapeRequest<'_>,
         glyphs: &mut [GlyphId],
     ) -> Result<Option<ShapedTextRun>, ShapeError> {
@@ -980,7 +1062,6 @@ pub trait GlyphShaper {
         let style = request.style();
         for (slot, character) in glyphs.iter_mut().zip(request.text().chars()) {
             *slot = self.shape_glyph(
-                glyph_metrics,
                 character,
                 style.font_size(),
                 style.font_weight(),

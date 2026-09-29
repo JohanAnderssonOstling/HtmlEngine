@@ -1,10 +1,7 @@
 use super::*;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-use std::sync::{Mutex, OnceLock};
 
 #[allow(unused_variables)]
-pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'_>) -> bool {
+pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'_>) -> ApplyResult {
     let doc = context.doc;
     let styles = &mut *context.styles;
     let style = &mut *context.style;
@@ -12,7 +9,6 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
     let parent_font_size = context.parent_font_size;
     let parent_font_weight = context.parent_font_weight;
     let parent_color = context.parent_color;
-    let environment = context.environment;
     match property {
         Property::Custom(custom) => match custom.name.as_ref().to_ascii_lowercase().as_str() {
             "float" => {
@@ -75,18 +71,18 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
         _ => {
             if let Property::Unparsed(unparsed) = property {
                 if apply_custom_box_keyword(style, unparsed.property_id.name(), &unparsed.value) {
-                    return true;
+                    return ApplyResult::Applied;
                 }
                 match unparsed.property_id.name() {
                     "page-break-before" | "page-break-after" | "page-break-inside"
                     | "break-before" | "break-after" | "break-inside" => {
                         // Not supported yet.
-                        return true;
+                        return ApplyResult::Applied;
                     }
                     "content" => {
                         if let Some(content) = parse_generated_content(styles, &unparsed.value) {
                             style.generated_content = content;
-                            return true;
+                            return ApplyResult::Applied;
                         }
                     }
                     "float" => {
@@ -98,7 +94,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                                 style.text.direction,
                                 style.box_model.float,
                             );
-                            return true;
+                            return ApplyResult::Applied;
                         }
                     }
                     "clear" => {
@@ -110,7 +106,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                                 style.text.direction,
                                 style.box_model.clear,
                             );
-                            return true;
+                            return ApplyResult::Applied;
                         }
                     }
                     "flex-basis" => {
@@ -123,7 +119,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                                 "fit-content" => PreferredSize::FitContent,
                                 _ => style.layout.flex_basis,
                             };
-                            return true;
+                            return ApplyResult::Applied;
                         }
                     }
                     _ => {}
@@ -140,26 +136,13 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 if prop_name == "float" {
                     style.box_model.float =
                         logical_float(value, style.text.direction, style.box_model.float);
-                    return true;
+                    return ApplyResult::Applied;
                 }
                 style.box_model.clear =
                     logical_clear(value, style.text.direction, style.box_model.clear);
-                return true;
+                return ApplyResult::Applied;
             }
-            log_unhandled_property(property);
         }
     }
-    true
-}
-
-fn log_unhandled_property(property: &Property) {
-    static UNHANDLED_PROPERTIES: OnceLock<Mutex<HashSet<u64>>> = OnceLock::new();
-    let set = UNHANDLED_PROPERTIES.get_or_init(|| Mutex::new(HashSet::new()));
-    let mut hasher = DefaultHasher::new();
-    std::mem::discriminant(property).hash(&mut hasher);
-    let id = hasher.finish();
-    let mut guard = set.lock().unwrap();
-    if guard.insert(id) {
-        println!("Unhandled CSS property: {:?}", property);
-    }
+    ApplyResult::Applied
 }

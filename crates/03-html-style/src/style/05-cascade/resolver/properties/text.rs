@@ -9,13 +9,15 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
     let parent_font_size = context.parent_font_size;
     let parent_font_weight = context.parent_font_weight;
     let parent_color = context.parent_color;
-    let environment = context.environment;
     match property {
         // Text properties
         Property::LineHeight(lh) => {
-            let Some((line_height, x_height_px)) =
-                checked_line_height_components(lh, style.font.font_size, doc.root_font_size())
-            else {
+            let Some((line_height, x_height_px)) = checked_line_height_components(
+                lh,
+                style.font.font_size,
+                doc.root_font_size(),
+                doc.resolution,
+            ) else {
                 return ApplyResult::Invalid;
             };
             style.line_height_spec = Some(lh.clone());
@@ -25,17 +27,23 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             style.text.line_height_normal = line_height_is_normal(lh);
         }
         Property::LetterSpacing(spacing) => {
-            let Some(value) =
-                spacing_to_text_spacing(spacing, style.font.font_size, doc.root_font_size())
-            else {
+            let Some(value) = spacing_to_text_spacing(
+                spacing,
+                style.font.font_size,
+                doc.root_font_size(),
+                doc.resolution,
+            ) else {
                 return ApplyResult::Invalid;
             };
             style.text.letter_spacing = value;
         }
         Property::WordSpacing(spacing) => {
-            let Some(value) =
-                spacing_to_text_spacing(spacing, style.font.font_size, doc.root_font_size())
-            else {
+            let Some(value) = spacing_to_text_spacing(
+                spacing,
+                style.font.font_size,
+                doc.root_font_size(),
+                doc.resolution,
+            ) else {
                 return ApplyResult::Invalid;
             };
             style.text.word_spacing = value;
@@ -92,6 +100,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 &ti.value,
                 style.font.font_size,
                 doc.root_font_size(),
+                doc.resolution,
             ) else {
                 return ApplyResult::Invalid;
             };
@@ -145,6 +154,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 &td.thickness,
                 style.font.font_size,
                 doc.root_font_size(),
+                doc.resolution,
             ) else {
                 return ApplyResult::Invalid;
             };
@@ -163,9 +173,12 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             style.background.text_decoration.style = decoration_style;
         }
         Property::TextDecorationThickness(thickness) => {
-            let Some(thickness) =
-                text_decoration_thickness(thickness, style.font.font_size, doc.root_font_size())
-            else {
+            let Some(thickness) = text_decoration_thickness(
+                thickness,
+                style.font.font_size,
+                doc.root_font_size(),
+                doc.resolution,
+            ) else {
                 return ApplyResult::Invalid;
             };
             style.background.text_decoration.thickness = thickness;
@@ -182,9 +195,12 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             let Some(outline_style) = outline_style(&outline.style) else {
                 return ApplyResult::Invalid;
             };
-            let Some(width) =
-                border_width(&outline.width, style.font.font_size, doc.root_font_size())
-            else {
+            let Some(width) = border_width(
+                &outline.width,
+                style.font.font_size,
+                doc.root_font_size(),
+                doc.resolution,
+            ) else {
                 return ApplyResult::Invalid;
             };
             style.background.outline.set_width(width);
@@ -192,8 +208,12 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             style.background.outline.color = decoration_color(&outline.color, style.text.color);
         }
         Property::OutlineWidth(width) => {
-            let Some(width) = border_width(width, style.font.font_size, doc.root_font_size())
-            else {
+            let Some(width) = border_width(
+                width,
+                style.font.font_size,
+                doc.root_font_size(),
+                doc.resolution,
+            ) else {
                 return ApplyResult::Invalid;
             };
             style.background.outline.set_width(width);
@@ -220,7 +240,12 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                     VerticalAlignKeyword::TextBottom => VerticalAlignValue::TextBottom,
                 },
                 VerticalAlign::Length(lp) => {
-                    match vertical_align_value(lp, style.font.font_size, doc.root_font_size()) {
+                    match vertical_align_value(
+                        lp,
+                        style.font.font_size,
+                        doc.root_font_size(),
+                        doc.resolution,
+                    ) {
                         Some(value) => value,
                         None => return ApplyResult::Invalid,
                     }

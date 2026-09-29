@@ -1,6 +1,5 @@
 use crate::{
-    HtmlQuirksMode, HtmlSyntaxElement, HtmlSyntaxNode, HtmlSyntaxTree, MarkupSyntax, ParsedHtml,
-    parse_html_document,
+    HtmlSyntaxElement, HtmlSyntaxNode, HtmlSyntaxTree, MarkupSyntax, ParsedHtml, parse_html_document,
 };
 use html_dom::{
     Document, DocumentBuildError, DocumentBuilder, DocumentMode, DocumentTocEntry, DomAttribute,
@@ -15,16 +14,6 @@ pub fn parse_dom_document(html: &str) -> Result<Document, DocumentBuildError> {
 
 /// Convert already parsed markup into the renderer's DOM.
 pub fn build_dom_document(parsed: &ParsedHtml) -> Result<Document, DocumentBuildError> {
-    if parsed.syntax == MarkupSyntax::Html {
-        let has_explicit_doctype = parsed
-            .document
-            .nodes
-            .iter()
-            .any(|node| matches!(node, HtmlSyntaxNode::Doctype { .. }));
-        (!has_explicit_doctype || parsed.quirks_mode == HtmlQuirksMode::NoQuirks)
-            .then_some(())
-            .expect("explicit quirks and limited-quirks HTML doctypes are unsupported");
-    }
     let mode = match parsed.syntax {
         MarkupSyntax::Html => DocumentMode::Html,
         MarkupSyntax::Xml => DocumentMode::Xml,
@@ -109,7 +98,10 @@ fn build_dom_syntax_element_data<State>(
     let image_idx = if is_inline_svg {
         let bytes: Arc<[u8]> = serialize_svg_syntax_element(element).into_bytes().into();
         Some(document.push_image(ImageResource {
-            source: ImageSource::Inline(bytes),
+            source: ImageSource::InlineSvg {
+                bytes,
+                base_uri: String::new(),
+            },
             width: 0,
             height: 0,
             width_attr: None,
@@ -153,9 +145,19 @@ fn build_dom_syntax_element_data<State>(
 }
 
 fn serialize_svg_syntax_element(element: &HtmlSyntaxElement) -> String {
-    fn push_node(output: &mut String, node: &HtmlSyntaxNode) {
+    fn push_attribute(output: &mut String, name: &str, value: &str) {
+        output.push(' ');
+        output.push_str(name);
+        output.push_str("=\"");
+        output.push_str(&quick_xml::escape::escape(value));
+        output.push('"');
+    }
+
+    fn push_node(output: &mut String, node: &HtmlSyntaxNode, default_namespace: &str) {
         match node {
-            HtmlSyntaxNode::Element(element) => push_element(output, element),
+            HtmlSyntaxNode::Element(element) => {
+                push_element(output, element, default_namespace)
+            }
             HtmlSyntaxNode::Text(text) => output.push_str(&quick_xml::escape::escape(text)),
             HtmlSyntaxNode::Comment(comment) => {
                 output.push_str("<!--");
@@ -170,41 +172,66 @@ fn serialize_svg_syntax_element(element: &HtmlSyntaxElement) -> String {
                 output.push_str("?>");
             }
             HtmlSyntaxNode::TemplateContents(children) => {
-                children.iter().for_each(|child| push_node(output, child))
+                children
+                    .iter()
+                    .for_each(|child| push_node(output, child, default_namespace))
             }
             HtmlSyntaxNode::Doctype { .. } => {}
         }
     }
-    fn push_element(output: &mut String, element: &HtmlSyntaxElement) {
+    fn push_element(output: &mut String, element: &HtmlSyntaxElement, inherited_namespace: &str) {
         output.push('<');
         output.push_str(&element.local_name);
-        if element.local_name == "svg"
-            && !element
-                .attributes
-                .iter()
-                .any(|attribute| attribute.name == "xmlns")
-        {
-            output.push_str(" xmlns=\"http://www.w3.org/2000/svg\"");
+        let namespace = element.namespace.as_deref().unwrap_or("");
+        if namespace != inherited_namespace {
+            push_attribute(output, "xmlns", namespace);
+        }
+
+        let mut declared_prefixes = Vec::new();
+        for attribute in &element.attributes {
+            let Some(prefix) = attribute.name.strip_prefix("xmlns:") else {
+                continue;
+            };
+            let conflicting_use = element.attributes.iter().any(|other| {
+                other.name.split_once(':').is_some_and(|(used_prefix, _)| {
+                    used_prefix == prefix
+                        && other.namespace.as_deref().is_some_and(|uri| uri != attribute.value)
+                })
+            });
+            if !conflicting_use && !declared_prefixes.contains(&prefix) {
+                push_attribute(output, &attribute.name, &attribute.value);
+                declared_prefixes.push(prefix);
+            }
         }
         for attribute in &element.attributes {
-            output.push(' ');
-            output.push_str(&attribute.name);
-            output.push_str("=\"");
-            output.push_str(&quick_xml::escape::escape(&attribute.value));
-            output.push('"');
+            if let Some((prefix, _)) = attribute.name.split_once(':')
+                && prefix != "xmlns"
+                && prefix != "xml"
+                && !declared_prefixes.contains(&prefix)
+                && let Some(uri) = attribute.namespace.as_deref()
+            {
+                push_attribute(output, &format!("xmlns:{prefix}"), uri);
+                declared_prefixes.push(prefix);
+            }
+        }
+        for attribute in &element.attributes {
+            if attribute.name == "xmlns" || attribute.name.starts_with("xmlns:") {
+                continue;
+            }
+            push_attribute(output, &attribute.name, &attribute.value);
         }
         output.push('>');
         element
             .children
             .iter()
-            .for_each(|child| push_node(output, child));
+            .for_each(|child| push_node(output, child, namespace));
         output.push_str("</");
         output.push_str(&element.local_name);
         output.push('>');
     }
 
     let mut output = String::new();
-    push_element(&mut output, element);
+    push_element(&mut output, element, "");
     output
 }
 

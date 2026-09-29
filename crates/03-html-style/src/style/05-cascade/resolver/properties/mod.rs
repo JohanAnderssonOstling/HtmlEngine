@@ -16,13 +16,23 @@ mod unparsed;
 use generated::*;
 use legacy::*;
 use raw::*;
-use unparsed::{apply_unparsed_property, unparsed_renderer_property_is_computable};
+use unparsed::apply_unparsed_property;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum ApplyResult {
     Applied,
     Invalid,
     Unhandled,
+}
+
+impl ApplyResult {
+    fn conversion_result(self) -> Result<(), ()> {
+        if self == Self::Invalid {
+            Err(())
+        } else {
+            Ok(())
+        }
+    }
 }
 
 pub(super) struct PropertyContext<'a, 'doc> {
@@ -33,7 +43,6 @@ pub(super) struct PropertyContext<'a, 'doc> {
     pub(super) parent_font_size: f32,
     pub(super) parent_font_weight: u16,
     pub(super) parent_color: u32,
-    pub(super) environment: crate::MediaEnvironment,
 }
 
 pub(super) fn apply_property_in_phase<'a>(
@@ -42,11 +51,11 @@ pub(super) fn apply_property_in_phase<'a>(
     style: &mut WorkingStyle,
     property: &Property<'a>,
     parent_font_size: f32,
-    environment: crate::MediaEnvironment,
     phase: CascadePhase,
     parent: &ParentStyle,
-) {
-    set_line_height_resolution_bases(doc, styles, property, style, parent);
+    resolution: &ResolutionContext,
+) -> Result<(), ()> {
+    set_line_height_resolution_bases(doc, styles, property, style, parent, resolution);
     // Preserve whether the winning background establishes an image layer even
     // while image painting is unsupported. Canvas background propagation
     // depends on the computed image being `none`, not merely on whether a
@@ -60,23 +69,23 @@ pub(super) fn apply_property_in_phase<'a>(
         // standalone background-image declarations after recording their
         // computed presence, but allow the shorthand's supported color through.
         if !matches!(property, Property::Background(_)) {
-            return;
+            return Ok(());
         }
     }
     // Parsing a gradient does not imply that this renderer can paint it. Skip
     // the entire declaration so an earlier usable fallback remains active.
     if crate::style::syntax::capabilities::property_uses_gradient(property) {
-        return;
+        return Ok(());
     }
     // Unsupported paint styles are rejected as whole declarations so their
     // shorthand color/width/line components cannot leak into computed style.
     if crate::style::syntax::capabilities::property_uses_unsupported_text_decoration_style(property)
         || crate::style::syntax::capabilities::property_uses_unsupported_outline_style(property)
     {
-        return;
+        return Ok(());
     }
-    if try_apply_legacy_grid_gap_alias(doc, style, property, parent) {
-        return;
+    if try_apply_legacy_grid_gap_alias(doc, style, property, parent, resolution) {
+        return Ok(());
     }
     // CSS-wide keywords copy already-computed values, so applying them in both
     // phases is idempotent and keeps cascade order within each phase.
@@ -97,10 +106,10 @@ pub(super) fn apply_property_in_phase<'a>(
             // Winner selection consumes rollback keywords before conversion.
             CSSWideKeyword::Revert | CSSWideKeyword::RevertLayer => {}
         }
-        return;
+        return Ok(());
     }
     if try_apply_css_wide_keyword(style, property, parent, doc.root_font_size(), phase) {
-        return;
+        return Ok(());
     }
     match phase {
         CascadePhase::Prerequisites => match property {
@@ -113,7 +122,7 @@ pub(super) fn apply_property_in_phase<'a>(
                 resolve_logical_text_alignments(&mut style.text);
             }
             Property::FontSize(_) | Property::LineHeight(_) | Property::Color(_) => {
-                let _ = apply_property(
+                return apply_property(
                     doc,
                     styles,
                     style,
@@ -121,8 +130,9 @@ pub(super) fn apply_property_in_phase<'a>(
                     parent_font_size,
                     parent.font.font_weight,
                     parent.text.color,
-                    environment,
-                );
+                    resolution,
+                )
+                .conversion_result();
             }
             Property::Font(font) => {
                 let Some(values) = checked_font_shorthand(
@@ -130,9 +140,9 @@ pub(super) fn apply_property_in_phase<'a>(
                     parent_font_size,
                     parent.font.font_weight,
                     doc.root_font_size(),
-                    environment,
+                    resolution,
                 ) else {
-                    return;
+                    return Err(());
                 };
                 style.font.font_size = values.font_size;
                 style.font.font_size_x_height_px = 0.0;
@@ -174,7 +184,7 @@ pub(super) fn apply_property_in_phase<'a>(
                     style.text.line_height_x_height_px,
                     style.text.line_height_normal,
                 );
-                let _ = apply_property(
+                let result = apply_property(
                     doc,
                     styles,
                     style,
@@ -182,7 +192,7 @@ pub(super) fn apply_property_in_phase<'a>(
                     parent_font_size,
                     parent.font.font_weight,
                     parent.text.color,
-                    environment,
+                    resolution,
                 );
                 style.font.font_size = final_font_size.0;
                 style.font.font_size_x_height_px = final_font_size.1;
@@ -201,14 +211,16 @@ pub(super) fn apply_property_in_phase<'a>(
                         spec,
                         final_font_size.0,
                         doc.root_font_size(),
+                        resolution,
                     ) {
                         style.text.line_height = line_height;
                         style.text.line_height_x_height_px = x_height_px;
                     }
                 }
+                return result.conversion_result();
             }
             _ => {
-                let _ = apply_property(
+                return apply_property(
                     doc,
                     styles,
                     style,
@@ -216,11 +228,13 @@ pub(super) fn apply_property_in_phase<'a>(
                     parent_font_size,
                     parent.font.font_weight,
                     parent.text.color,
-                    environment,
-                );
+                    resolution,
+                )
+                .conversion_result();
             }
         },
     }
+    Ok(())
 }
 
 fn apply_property<'a>(
@@ -231,16 +245,23 @@ fn apply_property<'a>(
     parent_font_size: f32,
     parent_font_weight: u16,
     parent_color: u32,
-    environment: crate::MediaEnvironment,
+    resolution: &ResolutionContext,
 ) -> ApplyResult {
     let resolved_root_font_size = root_font_size_for_resolution(doc, styles);
     let resolved_document = ResolutionDocument {
         document: doc,
         root_font_size: resolved_root_font_size,
+        resolution,
     };
     let doc = &resolved_document;
-    if apply_unparsed_property(styles, style, property, resolved_root_font_size) {
-        return ApplyResult::Applied;
+    if let Some(result) = apply_unparsed_property(
+        styles,
+        style,
+        property,
+        resolved_root_font_size,
+        doc.resolution,
+    ) {
+        return result;
     }
     let mut context = PropertyContext {
         doc,
@@ -250,34 +271,24 @@ fn apply_property<'a>(
         parent_font_size,
         parent_font_weight,
         parent_color,
-        environment,
     };
-    for result in [
-        typography::apply(&mut context, property),
-        text::apply(&mut context, property),
+    for apply in [
+        typography::apply,
+        text::apply,
+        paint::apply,
+        box_model::apply,
+        layout::apply,
+        misc::apply,
     ] {
+        let result = apply(&mut context, property);
         if result != ApplyResult::Unhandled {
             return result;
         }
-    }
-    if paint::apply(&mut context, property) {
-        return ApplyResult::Applied;
-    }
-    for result in [
-        box_model::apply(&mut context, property),
-        layout::apply(&mut context, property),
-    ] {
-        if result != ApplyResult::Unhandled {
-            return result;
-        }
-    }
-    if misc::apply(&mut context, property) {
-        return ApplyResult::Applied;
     }
     ApplyResult::Unhandled
 }
 
-pub(super) fn property_is_computable(
+pub(super) fn partially_selected_shorthand_is_computable(
     doc: &Document,
     styles: &mut ComputedStylesBuilder,
     scratch: &mut WorkingStyle,
@@ -285,13 +296,10 @@ pub(super) fn property_is_computable(
     property: &Property<'_>,
     parent_font_size: f32,
     parent: &ParentStyle,
-    environment: crate::MediaEnvironment,
+    resolution: &ResolutionContext,
 ) -> bool {
-    if unparsed_renderer_property_is_computable(property, base.font.font_size, root_font_size_for_resolution(doc, styles)).is_some_and(|valid| !valid) {
-        return false;
-    }
     scratch.clone_from(base);
-    set_line_height_resolution_bases(doc, styles, property, &scratch, parent);
+    set_line_height_resolution_bases(doc, styles, property, scratch, parent, resolution);
     apply_property(
         doc,
         styles,
@@ -300,6 +308,6 @@ pub(super) fn property_is_computable(
         parent_font_size,
         parent.font.font_weight,
         parent.text.color,
-        environment,
+        resolution,
     ) != ApplyResult::Invalid
 }

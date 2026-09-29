@@ -5,7 +5,8 @@ use html_dom::Document;
 use html_style_model::ComputedStyles;
 use kurbo::Point;
 use std::cell::RefCell;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use web_time::Instant;
 
 use super::fragment_writer::FragmentWriter;
 use super::geometry_writer::GeometryWriter;
@@ -22,7 +23,7 @@ use super::{
 
 pub(crate) fn layout_with_timings(
     inputs: LayoutInputs<'_>,
-    outputs: LayoutOutputs<'_>,
+    outputs: LayoutOutputs<'_, '_>,
     constraints: crate::LayoutConstraints,
     timings: Option<&mut LayoutTimings>,
 ) {
@@ -54,43 +55,29 @@ pub(crate) fn layout_with_timings(
         inputs.ellipsis_glyphs,
         inputs.hyphen_glyphs,
     );
-    let mut context = LayoutEngine {
+    let read = LayoutReadContext {
         config: LayoutConfig::new(constraints),
-        floats: std::mem::take(&mut scratch.floats),
-        margins: std::mem::take(&mut scratch.margins),
-        absolute_positioning: std::mem::take(&mut scratch.absolute_positioning),
-        flex_grid: std::mem::take(&mut scratch.flex_grid),
-        measurement: std::mem::take(&mut scratch.measurement),
-        finalization: std::mem::take(&mut scratch.finalization),
         track_overflow_clips,
         reader,
         text,
-        geometry: GeometryWriter::new(geometry),
-        fragments: FragmentWriter::new(
-            state,
-            std::mem::take(&mut scratch.line_owners),
-            std::mem::take(&mut scratch.block_decoration_owners),
-        ),
-        placement: std::mem::take(placement),
         inline_plans: inputs.inline_plans,
-        fragmentation_suppression_depth: 0,
-        timings: collected_timings,
     };
+    let mut context = LayoutEngine::new(
+        read,
+        LayoutOutputs {
+            geometry,
+            state,
+            placement: &mut *placement,
+            scratch: &mut *scratch,
+        },
+        collected_timings,
+        0,
+    );
     context.run();
     if let (Some(destination), Some(collected)) = (timings, context.timings.take()) {
         *destination = collected.into_inner();
     }
-    context.fragments.recycle_owner_storage(
-        &mut scratch.line_owners,
-        &mut scratch.block_decoration_owners,
-    );
-    *placement = std::mem::take(&mut context.placement);
-    scratch.floats = std::mem::take(&mut context.floats);
-    scratch.margins = std::mem::take(&mut context.margins);
-    scratch.absolute_positioning = std::mem::take(&mut context.absolute_positioning);
-    scratch.flex_grid = std::mem::take(&mut context.flex_grid);
-    scratch.measurement = std::mem::take(&mut context.measurement);
-    scratch.finalization = std::mem::take(&mut context.finalization);
+    context.recycle_into(placement, scratch);
 }
 
 /// Allocation-owning state reused by successive layout passes. It is separate
@@ -144,11 +131,11 @@ pub(crate) struct LayoutInputs<'a> {
     pub(crate) image_metrics: &'a crate::ImageMetrics,
 }
 
-pub(crate) struct LayoutOutputs<'out> {
+pub(crate) struct LayoutOutputs<'out, 'scratch> {
     pub(crate) geometry: &'out mut BoxGeometry,
     pub(crate) state: &'out mut LayoutState,
-    pub(crate) placement: &'out mut PlacementState,
-    pub(crate) scratch: &'out mut LayoutScratch,
+    pub(crate) placement: &'scratch mut PlacementState,
+    pub(crate) scratch: &'scratch mut LayoutScratch,
 }
 
 #[derive(Default, Debug, Clone)]
@@ -214,8 +201,58 @@ pub(crate) struct LayoutEngine<'a, 'out> {
 }
 
 impl<'a, 'out> LayoutEngine<'a, 'out> {
-    pub(crate) fn parallel_measurement_context(&self) -> ParallelMeasurementContext<'a> {
-        ParallelMeasurementContext {
+    fn new(
+        read: LayoutReadContext<'a>,
+        outputs: LayoutOutputs<'out, '_>,
+        timings: Option<RefCell<LayoutTimings>>,
+        fragmentation_suppression_depth: usize,
+    ) -> Self {
+        let LayoutOutputs {
+            geometry,
+            state,
+            placement,
+            scratch,
+        } = outputs;
+        Self {
+            config: read.config,
+            floats: std::mem::take(&mut scratch.floats),
+            margins: std::mem::take(&mut scratch.margins),
+            absolute_positioning: std::mem::take(&mut scratch.absolute_positioning),
+            flex_grid: std::mem::take(&mut scratch.flex_grid),
+            measurement: std::mem::take(&mut scratch.measurement),
+            finalization: std::mem::take(&mut scratch.finalization),
+            track_overflow_clips: read.track_overflow_clips,
+            reader: read.reader,
+            text: read.text,
+            geometry: GeometryWriter::new(geometry),
+            fragments: FragmentWriter::new(
+                state,
+                std::mem::take(&mut scratch.line_owners),
+                std::mem::take(&mut scratch.block_decoration_owners),
+            ),
+            placement: std::mem::take(placement),
+            inline_plans: read.inline_plans,
+            fragmentation_suppression_depth,
+            timings,
+        }
+    }
+
+    fn recycle_into(&mut self, placement: &mut PlacementState, scratch: &mut LayoutScratch) {
+        self.fragments.recycle_owner_storage(
+            &mut scratch.line_owners,
+            &mut scratch.block_decoration_owners,
+        );
+        *placement = std::mem::take(&mut self.placement);
+        scratch.floats = std::mem::take(&mut self.floats);
+        scratch.margins = std::mem::take(&mut self.margins);
+        scratch.absolute_positioning = std::mem::take(&mut self.absolute_positioning);
+        scratch.flex_grid = std::mem::take(&mut self.flex_grid);
+        scratch.measurement = std::mem::take(&mut self.measurement);
+        scratch.finalization = std::mem::take(&mut self.finalization);
+    }
+
+    pub(crate) fn parallel_measurement_context(&self) -> LayoutReadContext<'a> {
+        LayoutReadContext {
             config: self.config,
             reader: self.reader.clone(),
             text: self.text,
@@ -336,10 +373,9 @@ impl<'a, 'out> LayoutEngine<'a, 'out> {
     }
 }
 
-/// Immutable inputs shared by table-cell measurement workers. Mutable layout
-/// arenas deliberately live in [`ParallelMeasurementWorker`] instead.
+/// Immutable inputs shared by normal layout and table-cell measurement workers.
 #[derive(Clone)]
-pub(crate) struct ParallelMeasurementContext<'a> {
+pub(crate) struct LayoutReadContext<'a> {
     config: LayoutConfig,
     reader: LayoutReader<'a>,
     text: InlineReader<'a>,
@@ -371,7 +407,7 @@ pub(crate) struct ParallelBoxMeasurement {
     pub(crate) first_baseline: Option<f64>,
 }
 
-impl ParallelMeasurementContext<'_> {
+impl LayoutReadContext<'_> {
     pub(crate) fn measure_table_cell(
         &self,
         worker: &mut ParallelMeasurementWorker,
@@ -380,29 +416,17 @@ impl ParallelMeasurementContext<'_> {
     ) -> ParallelBoxMeasurement {
         #[cfg(test)]
         super::parallel::record_worker();
-        let scratch = &mut worker.scratch;
-        let mut engine = LayoutEngine {
-            config: self.config,
-            floats: std::mem::take(&mut scratch.floats),
-            margins: std::mem::take(&mut scratch.margins),
-            absolute_positioning: std::mem::take(&mut scratch.absolute_positioning),
-            flex_grid: std::mem::take(&mut scratch.flex_grid),
-            measurement: std::mem::take(&mut scratch.measurement),
-            finalization: std::mem::take(&mut scratch.finalization),
-            track_overflow_clips: self.track_overflow_clips,
-            reader: self.reader.clone(),
-            text: self.text,
-            geometry: GeometryWriter::new(&mut worker.geometry),
-            fragments: FragmentWriter::new(
-                &mut worker.state,
-                std::mem::take(&mut scratch.line_owners),
-                std::mem::take(&mut scratch.block_decoration_owners),
-            ),
-            placement: std::mem::take(&mut worker.placement),
-            inline_plans: self.inline_plans,
-            fragmentation_suppression_depth: 1,
-            timings: None,
-        };
+        let mut engine = LayoutEngine::new(
+            self.clone(),
+            LayoutOutputs {
+                geometry: &mut worker.geometry,
+                state: &mut worker.state,
+                placement: &mut worker.placement,
+                scratch: &mut worker.scratch,
+            },
+            None,
+            1,
+        );
         engine.clear_layout_output();
         engine.floats.reset();
         engine.margins.reset();
@@ -419,17 +443,7 @@ impl ParallelMeasurementContext<'_> {
             first_baseline,
         };
 
-        engine.fragments.recycle_owner_storage(
-            &mut scratch.line_owners,
-            &mut scratch.block_decoration_owners,
-        );
-        worker.placement = std::mem::take(&mut engine.placement);
-        scratch.floats = std::mem::take(&mut engine.floats);
-        scratch.margins = std::mem::take(&mut engine.margins);
-        scratch.absolute_positioning = std::mem::take(&mut engine.absolute_positioning);
-        scratch.flex_grid = std::mem::take(&mut engine.flex_grid);
-        scratch.measurement = std::mem::take(&mut engine.measurement);
-        scratch.finalization = std::mem::take(&mut engine.finalization);
+        engine.recycle_into(&mut worker.placement, &mut worker.scratch);
         result
     }
 }

@@ -756,12 +756,11 @@ impl InlineTokens {
             .dense
             .iter()
             .enumerate()
-            .filter_map(|(index, token)| {
-                token.is_space().then(|| {
-                    let previous = context_character(engine, &self.dense, index, -1);
-                    let next = context_character(engine, &self.dense, index, 1);
-                    (index, classify_space(previous, next))
-                })
+            .filter(|(_, token)| token.is_space())
+            .map(|(index, _)| {
+                let previous = context_character(engine, &self.dense, index, -1);
+                let next = context_character(engine, &self.dense, index, 1);
+                (index, classify_space(previous, next))
             })
             .collect::<Vec<_>>();
         let dense = self.dense.make_mut();

@@ -17,6 +17,7 @@ pub(in crate::style::cascade::resolver) fn grid_template_tracks(
     value: &lightningcss::properties::grid::TrackSizing<'_>,
     font_size: f32,
     root_font_size: f32,
+    resolution: &ResolutionContext,
 ) -> Option<(Vec<GridTemplateTrack>, Vec<Vec<StyleStringId>>)> {
     use lightningcss::properties::grid::{RepeatCount, TrackListItem, TrackSizing};
     let TrackSizing::TrackList(list) = value else {
@@ -37,9 +38,12 @@ pub(in crate::style::cascade::resolver) fn grid_template_tracks(
     let mut tracks = Vec::with_capacity(list.items.len());
     for item in &list.items {
         tracks.push(match item {
-            TrackListItem::TrackSize(size) => {
-                GridTemplateTrack::Single(grid_track_size(size, font_size, root_font_size)?)
-            }
+            TrackListItem::TrackSize(size) => GridTemplateTrack::Single(grid_track_size(
+                size,
+                font_size,
+                root_font_size,
+                resolution,
+            )?),
             TrackListItem::TrackRepeat(repeat) => {
                 let count = match repeat.count {
                     RepeatCount::Number(value) => GridRepeatCount::Count(
@@ -51,7 +55,7 @@ pub(in crate::style::cascade::resolver) fn grid_template_tracks(
                 let tracks = repeat
                     .track_sizes
                     .iter()
-                    .map(|size| grid_track_size(size, font_size, root_font_size))
+                    .map(|size| grid_track_size(size, font_size, root_font_size, resolution))
                     .collect::<Option<Vec<_>>>()?;
                 if tracks.is_empty() {
                     return None;
@@ -126,11 +130,12 @@ pub(in crate::style::cascade::resolver) fn grid_auto_tracks(
     value: &lightningcss::properties::grid::TrackSizeList,
     font_size: f32,
     root_font_size: f32,
+    resolution: &ResolutionContext,
 ) -> Option<Vec<GridTrackSize>> {
     value
         .0
         .iter()
-        .map(|size| grid_track_size(size, font_size, root_font_size))
+        .map(|size| grid_track_size(size, font_size, root_font_size, resolution))
         .collect()
 }
 
@@ -138,18 +143,22 @@ pub(in crate::style::cascade::resolver) fn grid_track_size(
     value: &lightningcss::properties::grid::TrackSize,
     font_size: f32,
     root_font_size: f32,
+    resolution: &ResolutionContext,
 ) -> Option<GridTrackSize> {
     use lightningcss::properties::grid::TrackSize;
     Some(match value {
-        TrackSize::TrackBreadth(value) => {
-            GridTrackSize::Breadth(grid_track_breadth(value, font_size, root_font_size)?)
-        }
+        TrackSize::TrackBreadth(value) => GridTrackSize::Breadth(grid_track_breadth(
+            value,
+            font_size,
+            root_font_size,
+            resolution,
+        )?),
         TrackSize::MinMax { min, max } => GridTrackSize::MinMax {
-            min: grid_track_breadth(min, font_size, root_font_size)?,
-            max: grid_track_breadth(max, font_size, root_font_size)?,
+            min: grid_track_breadth(min, font_size, root_font_size, resolution)?,
+            max: grid_track_breadth(max, font_size, root_font_size, resolution)?,
         },
         TrackSize::FitContent(value) => GridTrackSize::FitContent(non_negative_length_pct(
-            computed_length_pct(value, font_size, root_font_size)?,
+            computed_length_pct(value, font_size, root_font_size, resolution)?,
         )?),
     })
 }
@@ -158,11 +167,12 @@ pub(in crate::style::cascade::resolver) fn grid_track_breadth(
     value: &lightningcss::properties::grid::TrackBreadth,
     font_size: f32,
     root_font_size: f32,
+    resolution: &ResolutionContext,
 ) -> Option<GridTrackBreadth> {
     use lightningcss::properties::grid::TrackBreadth;
     Some(match value {
         TrackBreadth::Length(value) => GridTrackBreadth::Length(non_negative_length_pct(
-            computed_length_pct(value, font_size, root_font_size)?,
+            computed_length_pct(value, font_size, root_font_size, resolution)?,
         )?),
         TrackBreadth::Flex(value) if value.is_finite() && *value >= 0.0 => {
             GridTrackBreadth::Flex(*value)

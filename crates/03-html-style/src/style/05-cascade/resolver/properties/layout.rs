@@ -9,7 +9,6 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
     let parent_font_size = context.parent_font_size;
     let parent_font_weight = context.parent_font_weight;
     let parent_color = context.parent_color;
-    let environment = context.environment;
     match property {
         // Display
         Property::Display(d) => {
@@ -87,14 +86,25 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             style.layout.flex_shrink = value;
         }
         Property::FlexBasis(value, _) => {
-            let Some(value) = flex_basis(value, &style.font, doc.root_font_size(), styles) else {
+            let Some(value) = flex_basis(
+                value,
+                &style.font,
+                doc.root_font_size(),
+                styles,
+                doc.resolution,
+            ) else {
                 return ApplyResult::Invalid;
             };
             style.layout.flex_basis = value;
         }
         Property::Flex(value, _) => {
-            let Some(basis) = flex_basis(&value.basis, &style.font, doc.root_font_size(), styles)
-            else {
+            let Some(basis) = flex_basis(
+                &value.basis,
+                &style.font,
+                doc.root_font_size(),
+                styles,
+                doc.resolution,
+            ) else {
                 return ApplyResult::Invalid;
             };
             let (Some(grow), Some(shrink)) = (
@@ -165,21 +175,41 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             style.layout.justify_self = justify;
         }
         Property::RowGap(value) => {
-            let Some(value) = gap_value(value, style.font.font_size, doc.root_font_size()) else {
+            let Some(value) = gap_value(
+                value,
+                style.font.font_size,
+                doc.root_font_size(),
+                doc.resolution,
+            ) else {
                 return ApplyResult::Invalid;
             };
             style.layout.row_gap = value;
         }
         Property::ColumnGap(value) => {
-            let Some(value) = gap_value(value, style.font.font_size, doc.root_font_size()) else {
+            let Some(value) = gap_value(
+                value,
+                style.font.font_size,
+                doc.root_font_size(),
+                doc.resolution,
+            ) else {
                 return ApplyResult::Invalid;
             };
             style.layout.column_gap = value;
         }
         Property::Gap(value) => {
             let (Some(row), Some(column)) = (
-                gap_value(&value.row, style.font.font_size, doc.root_font_size()),
-                gap_value(&value.column, style.font.font_size, doc.root_font_size()),
+                gap_value(
+                    &value.row,
+                    style.font.font_size,
+                    doc.root_font_size(),
+                    doc.resolution,
+                ),
+                gap_value(
+                    &value.column,
+                    style.font.font_size,
+                    doc.root_font_size(),
+                    doc.resolution,
+                ),
             ) else {
                 return ApplyResult::Invalid;
             };
@@ -187,33 +217,49 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             style.layout.column_gap = column;
         }
         Property::GridTemplateRows(value) => {
-            let Some((tracks, names)) =
-                grid_template_tracks(styles, value, style.font.font_size, doc.root_font_size())
-            else {
+            let Some((tracks, names)) = grid_template_tracks(
+                styles,
+                value,
+                style.font.font_size,
+                doc.root_font_size(),
+                doc.resolution,
+            ) else {
                 return ApplyResult::Invalid;
             };
             style.layout.grid_template_rows = tracks;
             style.layout.grid_template_row_names = names;
         }
         Property::GridTemplateColumns(value) => {
-            let Some((tracks, names)) =
-                grid_template_tracks(styles, value, style.font.font_size, doc.root_font_size())
-            else {
+            let Some((tracks, names)) = grid_template_tracks(
+                styles,
+                value,
+                style.font.font_size,
+                doc.root_font_size(),
+                doc.resolution,
+            ) else {
                 return ApplyResult::Invalid;
             };
             style.layout.grid_template_columns = tracks;
             style.layout.grid_template_column_names = names;
         }
         Property::GridAutoRows(value) => {
-            let Some(value) = grid_auto_tracks(value, style.font.font_size, doc.root_font_size())
-            else {
+            let Some(value) = grid_auto_tracks(
+                value,
+                style.font.font_size,
+                doc.root_font_size(),
+                doc.resolution,
+            ) else {
                 return ApplyResult::Invalid;
             };
             style.layout.grid_auto_rows = value;
         }
         Property::GridAutoColumns(value) => {
-            let Some(value) = grid_auto_tracks(value, style.font.font_size, doc.root_font_size())
-            else {
+            let Some(value) = grid_auto_tracks(
+                value,
+                style.font.font_size,
+                doc.root_font_size(),
+                doc.resolution,
+            ) else {
                 return ApplyResult::Invalid;
             };
             style.layout.grid_auto_columns = value;
@@ -238,12 +284,14 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                     &value.rows,
                     style.font.font_size,
                     doc.root_font_size(),
+                    doc.resolution,
                 ),
                 grid_template_tracks(
                     styles,
                     &value.columns,
                     style.font.font_size,
                     doc.root_font_size(),
+                    doc.resolution,
                 ),
                 grid_template_areas(styles, &value.areas),
             )
@@ -271,19 +319,27 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                     &value.rows,
                     style.font.font_size,
                     doc.root_font_size(),
+                    doc.resolution,
                 ),
                 grid_template_tracks(
                     styles,
                     &value.columns,
                     style.font.font_size,
                     doc.root_font_size(),
+                    doc.resolution,
                 ),
                 grid_template_areas(styles, &value.areas),
-                grid_auto_tracks(&value.auto_rows, style.font.font_size, doc.root_font_size()),
+                grid_auto_tracks(
+                    &value.auto_rows,
+                    style.font.font_size,
+                    doc.root_font_size(),
+                    doc.resolution,
+                ),
                 grid_auto_tracks(
                     &value.auto_columns,
                     style.font.font_size,
                     doc.root_font_size(),
+                    doc.resolution,
                 ),
             )
             else {

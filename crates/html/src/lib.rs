@@ -24,7 +24,7 @@ pub mod parse {
 
 pub mod resources {
     pub use html_resources::*;
-    pub use html_source::{ResourceMetadata, ResourceProvider, TocEntry};
+    pub use html_source::{ResourceMetadata, ResourceProvider};
 
     pub use html_source::ResourceMetadata as Metadata;
     pub use html_source::ResourceProvider as Provider;
@@ -38,7 +38,8 @@ pub mod style {
 pub mod text {
     pub use html_layout::{
         CharacterPlacement, FontMetricsRequest, FontRelativeMetrics, FontSlant, GlyphId,
-        GlyphMetric, GlyphMetricError, GlyphRegistry, GlyphShaper, OpenTypeFeature, ShapeError,
+        GlyphMetric, GlyphMetricError, GlyphResourceGeneration, GlyphResourceStore, GlyphShaper,
+        OpenTypeFeature, ShapeError,
         ShapedLine, ShapedTextRun, TextRunId, TextRunShapeRequest, TextShapeRequest, TextStyleSpan,
     };
 }
@@ -135,7 +136,17 @@ pub mod engine {
             inputs: PipelineInputs,
             glyph_shaper: &mut impl GlyphShaper,
         ) -> Result<PipelineUpdate, PipelineError> {
-            self.session.update(inputs, glyph_shaper)
+            self.session.attach(glyph_shaper).update(inputs)
+        }
+
+        /// Prepares provider-backed HTML through parse and style without
+        /// borrowing a platform text system. Finish with [`Self::rehydrate_glyphs`]
+        /// on the host thread that owns its glyph shaper.
+        pub fn prepare_through_style(
+            &mut self,
+            inputs: PipelineInputs,
+        ) -> Result<(), PipelineError> {
+            self.session.prepare_through_style(inputs)
         }
 
         pub fn media_environment_change_affects_style(
@@ -151,7 +162,7 @@ pub mod engine {
             &mut self,
             glyph_shaper: &mut impl GlyphShaper,
         ) -> Result<LaidOutDocument, PipelineError> {
-            self.session.rehydrate_glyphs(glyph_shaper)
+            self.session.attach(glyph_shaper).rehydrate_glyphs()
         }
 
         /// Lays out one note body under its own constraints, for embedders
@@ -162,7 +173,7 @@ pub mod engine {
             constraints: crate::layout::LayoutConstraints,
             glyph_shaper: &mut impl GlyphShaper,
         ) -> Option<LaidOutDocument> {
-            self.session.layout_note(id, constraints, glyph_shaper)
+            self.session.attach(glyph_shaper).layout_note(id, constraints)
         }
 
         /// Ids of the current document's note bodies, in document order.

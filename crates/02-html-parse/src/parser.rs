@@ -489,16 +489,17 @@ mod tests {
     }
 
     #[test]
-    fn registers_inline_svg_as_a_self_contained_image_resource() {
+    fn registers_inline_svg_with_serialized_bytes_for_the_resource_pipeline() {
         let parsed = parse_xml_document(r#"<html xmlns="http://www.w3.org/1999/xhtml" xmlns:svg="http://www.w3.org/2000/svg"><body><svg:svg height="50%"><svg:rect width="20" height="10" fill="blue"/></svg:svg></body></html>"#)
             .expect("well-formed XHTML with SVG");
         let document = parsed.build_dom();
         let svg = child_element(&document, body(&document), "svg");
         let image_idx = svg.image_idx().expect("inline SVG is replaced content");
         let image = document.image(image_idx).expect("registered SVG image");
-        let ImageSource::Inline(bytes) = &image.source else {
+        let ImageSource::InlineSvg { bytes, base_uri } = &image.source else {
             panic!("inline SVG must retain its serialized bytes")
         };
+        assert!(base_uri.is_empty(), "the resource pipeline supplies the effective base URI");
         let serialized = std::str::from_utf8(bytes).expect("serialized SVG is UTF-8");
         assert!(serialized.starts_with("<svg xmlns=\"http://www.w3.org/2000/svg\""));
         assert!(serialized.contains("<rect width=\"20\" height=\"10\" fill=\"blue\"></rect>"));
@@ -573,23 +574,23 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "explicit quirks and limited-quirks HTML doctypes are unsupported")]
-    fn renderer_dom_rejects_an_explicit_quirks_doctype() {
+    fn renderer_dom_ignores_an_explicit_quirks_doctype() {
         let parsed = parse_html_document(
             r#"<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN"><p>explicit quirks</p>"#,
         );
         assert_eq!(parsed.quirks_mode(), HtmlQuirksMode::Quirks);
-        parsed.build_dom();
+        let document = parsed.build_dom_checked().expect("legacy doctype should build a DOM");
+        assert_eq!(document.mode(), DocumentMode::Html);
     }
 
     #[test]
-    #[should_panic(expected = "explicit quirks and limited-quirks HTML doctypes are unsupported")]
-    fn renderer_dom_rejects_an_explicit_limited_quirks_doctype() {
+    fn renderer_dom_ignores_an_explicit_limited_quirks_doctype() {
         let parsed = parse_html_document(
             r#"<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "http://www.w3.org/TR/html4/loose.dtd"><p>explicit limited quirks</p>"#,
         );
         assert_eq!(parsed.quirks_mode(), HtmlQuirksMode::LimitedQuirks);
-        parsed.build_dom();
+        let document = parsed.build_dom_checked().expect("legacy doctype should build a DOM");
+        assert_eq!(document.mode(), DocumentMode::Html);
     }
 
     #[test]

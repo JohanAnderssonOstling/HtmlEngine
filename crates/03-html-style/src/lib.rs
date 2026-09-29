@@ -44,7 +44,7 @@ use lightningcss::traits::ParseWithOptions;
 use std::time::Duration;
 
 pub use style::rules::media::{MediaEnvironment, MediaMatchKey, MediaQuerySet, MediaType};
-pub use style::rules::program::{StyleProgram, StyleProgramCache, StyleProgramCacheStats, style_document_with_cached_program_and_timings, style_document_with_program_and_timings};
+pub use style::rules::program::{StyleProgram, StyleProgramCache, StyleProgramCacheStats, style_document_with_cached_program_and_reader_overrides, style_document_with_cached_program_and_timings, style_document_with_program_and_reader_overrides, style_document_with_program_and_timings};
 
 #[cfg(test)]
 mod allocation_test_support {

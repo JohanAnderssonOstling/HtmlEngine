@@ -11,6 +11,7 @@ lightningcss.workspace = true
 parcel_selectors.workspace = true
 rustc_data_structures = "0.1.2"
 static-self = "0.1.2"
+web-time = "1"
 
 [dev-dependencies]
 html-parse = { path = "../02-html-parse" }

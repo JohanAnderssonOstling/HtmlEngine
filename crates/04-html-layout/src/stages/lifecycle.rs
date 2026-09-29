@@ -227,6 +227,7 @@ pub struct PreparedDocument {
 
 #[derive(Clone)]
 pub(crate) struct ShapedText {
+    pub(super) resource_generation: crate::GlyphResourceGeneration,
     pub(super) inline_content: InlineContent,
     pub(super) glyph_metrics: GlyphMetrics,
     pub(super) font_metrics: crate::shaping::ShapedFontMetrics,
@@ -242,6 +243,20 @@ pub(crate) struct ShapedText {
 pub struct ShapedDocument {
     pub(super) inputs: std::sync::Arc<PreparedInputs>,
     pub(super) shaped: std::sync::Arc<ShapedText>,
+}
+
+fn with_append_shaping<S: crate::GlyphShaper, T>(
+    glyph_shaper: &mut S,
+    work: impl FnOnce(&mut S) -> Result<T, crate::ShapeError>,
+) -> Result<T, crate::ShapeError> {
+    glyph_shaper.begin_append_shaping()?;
+    let result = work(glyph_shaper);
+    if result.is_ok() {
+        glyph_shaper.commit_append_shaping();
+    } else {
+        glyph_shaper.rollback_append_shaping();
+    }
+    result
 }
 
 /// Wall time spent in the two renderer-resource phases of an explicitly timed
@@ -448,7 +463,7 @@ impl PreparedDocument {
     ) -> Result<(ShapedDocument, LaidOutDocument), crate::ShapeError> {
         glyph_shaper.begin_document_shaping();
         let result = self.shape_active_document(glyph_shaper).and_then(|shaped| {
-            let laid_out = shaped.clone().layout_with_metrics_and_shaper(
+            let laid_out = shaped.clone().layout_with_metrics_and_shaper_inner(
                 constraints,
                 image_metrics,
                 glyph_shaper,
@@ -477,7 +492,7 @@ impl PreparedDocument {
         let result = self.shape_active_document(glyph_shaper).and_then(|shaped| {
             timings.shape = shape_started.elapsed();
             let layout_started = Instant::now();
-            let laid_out = shaped.clone().layout_with_metrics_and_shaper(
+            let laid_out = shaped.clone().layout_with_metrics_and_shaper_inner(
                 constraints,
                 image_metrics,
                 glyph_shaper,
@@ -494,49 +509,39 @@ impl PreparedDocument {
     }
 
     /// Shapes and lays out a subtree of the document whose renderer resources
-    /// are already active, appending to them instead of opening a transaction.
+    /// are already active, using a rollback-capable append transaction.
     ///
     /// A document shaping transaction *replaces* the shaper's glyphs and runs
     /// on commit. That is right for a new document and wrong for a note, which
     /// belongs to the document it was taken from: committing the note's
     /// resources strands every glyph the page still refers to, and rolling
-    /// them back discards the note's own. Appending leaves both usable.
+    /// them back discards the note's own. An append transaction retains both
+    /// on success and restores the page's resources on failure.
     ///
-    /// Glyph ids continue past `base`'s, because the shaper keeps appending to
-    /// one store, so metrics start from `base`'s table -- indexed by id, a
-    /// fresh table would put every id this produces out of range.
-    ///
-    /// There is no rollback. A failure can leave the note's glyphs behind,
-    /// which is harmless: they are unreferenced and the page's are untouched.
+    /// Glyph ids and metrics both append to the shaper's active resource
+    /// store. A failed append restores that store to the previous dense ID.
     pub fn shape_and_layout_into_active_resources(
         &self,
-        base: &ShapedDocument,
         constraints: LayoutConstraints,
         image_metrics: &ImageMetrics,
         glyph_shaper: &mut impl crate::GlyphShaper,
     ) -> Result<(ShapedDocument, LaidOutDocument), crate::ShapeError> {
-        let shaped =
-            self.shape_active_document_with_metrics(base.glyph_metrics().clone(), glyph_shaper)?;
-        let laid_out = shaped.clone().layout_with_metrics_and_shaper(
-            constraints,
-            image_metrics,
-            glyph_shaper,
-        )?;
-        Ok((shaped, laid_out))
+        with_append_shaping(glyph_shaper, |glyph_shaper| {
+            let shaped = self.shape_active_document(glyph_shaper)?;
+            let laid_out = shaped.clone().layout_with_metrics_and_shaper_inner(
+                constraints,
+                image_metrics,
+                glyph_shaper,
+            )?;
+            Ok((shaped, laid_out))
+        })
     }
 
     fn shape_active_document(
         &self,
         glyph_shaper: &mut impl crate::GlyphShaper,
     ) -> Result<ShapedDocument, crate::ShapeError> {
-        self.shape_active_document_with_metrics(GlyphMetrics::default(), glyph_shaper)
-    }
-
-    fn shape_active_document_with_metrics(
-        &self,
-        mut glyph_metrics: GlyphMetrics,
-        glyph_shaper: &mut impl crate::GlyphShaper,
-    ) -> Result<ShapedDocument, crate::ShapeError> {
+        let mut glyph_metrics = glyph_shaper.glyph_resources().snapshot();
         let mut inline_content = self.inputs.inline_content.clone();
         let (ellipsis_glyphs, hyphen_glyphs, text_geometry, font_metrics) =
             crate::shaping::shape_document(
@@ -564,6 +569,7 @@ impl PreparedDocument {
         Ok(ShapedDocument {
             inputs: self.inputs.clone(),
             shaped: std::sync::Arc::new(ShapedText {
+                resource_generation: glyph_shaper.glyph_resources().generation(),
                 inline_content,
                 glyph_metrics,
                 font_metrics,
@@ -592,6 +598,7 @@ impl ShapedDocument {
         self.shaped.inline_content.glyphs()
     }
 
+    #[cfg(test)]
     pub(crate) fn glyph_metrics(&self) -> &GlyphMetrics {
         &self.shaped.glyph_metrics
     }
@@ -691,12 +698,44 @@ impl ShapedDocument {
         image_metrics: &ImageMetrics,
         glyph_shaper: &mut impl crate::GlyphShaper,
     ) -> Result<LaidOutDocument, crate::ShapeError> {
+        if self.shaped.resource_generation != glyph_shaper.glyph_resources().generation() {
+            return Err(crate::ShapeError::resource_generation_mismatch());
+        }
         let base_shaped = self.shaped.clone();
         let initial = self.layout_impl(constraints, image_metrics, None);
+        let shaping_seed = glyph_shaper.glyph_resources().snapshot();
+        let needs_append = !first_line_style_ranges(&initial).is_empty();
+        let refine = |glyph_shaper: &mut _| {
+            refine_first_lines(
+                initial,
+                base_shaped.clone(),
+                shaping_seed,
+                constraints,
+                image_metrics,
+                glyph_shaper,
+            )
+        };
+        if needs_append {
+            with_append_shaping(glyph_shaper, refine)
+        } else {
+            refine(glyph_shaper)
+        }
+    }
+
+    fn layout_with_metrics_and_shaper_inner(
+        self,
+        constraints: LayoutConstraints,
+        image_metrics: &ImageMetrics,
+        glyph_shaper: &mut impl crate::GlyphShaper,
+    ) -> Result<LaidOutDocument, crate::ShapeError> {
+        debug_assert_eq!(self.shaped.resource_generation, glyph_shaper.glyph_resources().generation());
+        let base_shaped = self.shaped.clone();
+        let initial = self.layout_impl(constraints, image_metrics, None);
+        let shaping_seed = glyph_shaper.glyph_resources().snapshot();
         refine_first_lines(
             initial,
             base_shaped.clone(),
-            base_shaped,
+            shaping_seed,
             constraints,
             image_metrics,
             glyph_shaper,
@@ -724,19 +763,7 @@ impl ShapedDocument {
         let mut placement = crate::layout::PlacementState::default();
         let mut layout_scratch = crate::layout::LayoutScratch::default();
         crate::layout::layout_with_timings(
-            crate::layout::LayoutInputs {
-                document: &self.inputs.document,
-                styles: &self.inputs.styles,
-                topology: &self.inputs.layout_tree,
-                inline_content: &self.shaped.inline_content,
-                glyph_metrics: &self.shaped.glyph_metrics,
-                font_metrics: &self.shaped.font_metrics,
-                text_geometry: Some(&self.shaped.text_geometry),
-                ellipsis_glyphs: &self.shaped.ellipsis_glyphs,
-                hyphen_glyphs: &self.shaped.hyphen_glyphs,
-                inline_plans: &self.shaped.inline_plans,
-                image_metrics,
-            },
+            layout_inputs(&self.inputs, &self.shaped, image_metrics),
             crate::layout::LayoutOutputs {
                 geometry: &mut geometry,
                 state: &mut layout_state,
@@ -759,6 +786,26 @@ impl ShapedDocument {
         };
         laid_out.rebuild_anchor_positions();
         laid_out
+    }
+}
+
+fn layout_inputs<'a>(
+    inputs: &'a PreparedInputs,
+    shaped: &'a ShapedText,
+    image_metrics: &'a ImageMetrics,
+) -> crate::layout::LayoutInputs<'a> {
+    crate::layout::LayoutInputs {
+        document: &inputs.document,
+        styles: &inputs.styles,
+        topology: &inputs.layout_tree,
+        inline_content: &shaped.inline_content,
+        glyph_metrics: &shaped.glyph_metrics,
+        font_metrics: &shaped.font_metrics,
+        text_geometry: Some(&shaped.text_geometry),
+        ellipsis_glyphs: &shaped.ellipsis_glyphs,
+        hyphen_glyphs: &shaped.hyphen_glyphs,
+        inline_plans: &shaped.inline_plans,
+        image_metrics,
     }
 }
 
@@ -796,8 +843,19 @@ impl LaidOutDocument {
             style.height().percentage_dependent()
                 || style.min_height().percentage_dependent()
                 || style.max_height().percentage_dependent()
-                || (style.position() == html_style_model::PositionMode::Absolute
-                    && style.inset_bottom().is_some())
+                || match style.position() {
+                    html_style_model::PositionMode::Absolute => {
+                        style.inset_bottom().is_some()
+                            || style.inset_top().is_some_and(|top| top.has_percentage())
+                    }
+                    html_style_model::PositionMode::Relative => {
+                        style.inset_top().is_some_and(|top| top.has_percentage())
+                            || style
+                                .inset_bottom()
+                                .is_some_and(|bottom| bottom.has_percentage())
+                    }
+                    html_style_model::PositionMode::Static => false,
+                }
         })
     }
 
@@ -844,20 +902,34 @@ impl LaidOutDocument {
         image_metrics: &ImageMetrics,
         glyph_shaper: &mut impl crate::GlyphShaper,
     ) -> Result<(), crate::ShapeError> {
-        let shaping_seed = self.shaped.clone();
-        self.shaped = self.base_shaped.clone();
-        self.relayout_impl(constraints, image_metrics, None);
-        let initial = self.clone();
-        *self = refine_first_lines(
-            initial,
-            self.base_shaped.clone(),
-            shaping_seed,
-            constraints,
-            image_metrics,
-            glyph_shaper,
-        )?;
-        self.last_constraints = constraints;
-        self.last_image_metrics = image_metrics.clone();
+        if self.base_shaped.resource_generation != glyph_shaper.glyph_resources().generation() {
+            return Err(crate::ShapeError::resource_generation_mismatch());
+        }
+        let candidate = ShapedDocument {
+            inputs: self.inputs.clone(),
+            shaped: self.base_shaped.clone(),
+        }
+        .layout_impl(constraints, image_metrics, None);
+        let shaping_seed = glyph_shaper.glyph_resources().snapshot();
+        let needs_append = !first_line_style_ranges(&candidate).is_empty();
+        let refine = |glyph_shaper: &mut _| {
+            refine_first_lines(
+                candidate,
+                self.base_shaped.clone(),
+                shaping_seed,
+                constraints,
+                image_metrics,
+                glyph_shaper,
+            )
+        };
+        let mut candidate = if needs_append {
+            with_append_shaping(glyph_shaper, refine)?
+        } else {
+            refine(glyph_shaper)?
+        };
+        candidate.last_constraints = constraints;
+        candidate.last_image_metrics = image_metrics.clone();
+        *self = candidate;
         Ok(())
     }
 
@@ -873,27 +945,14 @@ impl LaidOutDocument {
         timings
     }
 
-    fn relayout_impl(
+    pub(super) fn relayout_impl(
         &mut self,
         constraints: LayoutConstraints,
         image_metrics: &ImageMetrics,
         timings: Option<&mut crate::LayoutTimings>,
     ) {
-        let text_geometry = &self.shaped.text_geometry;
         crate::layout::layout_with_timings(
-            crate::layout::LayoutInputs {
-                document: &self.inputs.document,
-                styles: &self.inputs.styles,
-                topology: &self.inputs.layout_tree,
-                inline_content: &self.shaped.inline_content,
-                glyph_metrics: &self.shaped.glyph_metrics,
-                font_metrics: &self.shaped.font_metrics,
-                text_geometry: Some(text_geometry),
-                ellipsis_glyphs: &self.shaped.ellipsis_glyphs,
-                hyphen_glyphs: &self.shaped.hyphen_glyphs,
-                inline_plans: &self.shaped.inline_plans,
-                image_metrics,
-            },
+            layout_inputs(&self.inputs, &self.shaped, image_metrics),
             crate::layout::LayoutOutputs {
                 geometry: &mut self.geometry,
                 state: &mut self.layout_state,
@@ -997,10 +1056,15 @@ impl LaidOutDocument {
         &self.shaped.anchor_glyphs
     }
 
-    /// Creates a scoped, append-only registry for renderer-owned auxiliary glyphs.
-    /// Existing glyph IDs and document layout remain unchanged.
-    pub fn auxiliary_glyph_registry(&mut self) -> crate::GlyphRegistry<'_> {
-        crate::GlyphRegistry::new(&mut std::sync::Arc::make_mut(&mut self.shaped).glyph_metrics)
+    /// Refreshes the immutable render snapshot after the backend registers
+    /// auxiliary glyphs in its active resource store.
+    pub fn refresh_glyph_metrics_from(&mut self, glyph_shaper: &mut impl crate::GlyphShaper) -> Result<(), crate::ShapeError> {
+        if self.shaped.resource_generation != glyph_shaper.glyph_resources().generation() {
+            return Err(crate::ShapeError::resource_generation_mismatch());
+        }
+        std::sync::Arc::make_mut(&mut self.shaped).glyph_metrics =
+            glyph_shaper.glyph_resources().snapshot();
+        Ok(())
     }
 
     #[cfg(test)]

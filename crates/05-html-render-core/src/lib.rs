@@ -566,7 +566,8 @@ impl FragmentRenderer {
             paint: PaintSettingsRevision::INITIAL,
         };
         self.session
-            .update(inputs, glyph_shaper)
+            .attach(glyph_shaper)
+            .update(inputs)
             .map_err(|error| FragmentRenderError::new(error.to_string()))?;
         let document = self
             .session
@@ -1385,23 +1386,46 @@ impl ResourceProvider for DenyResourceProvider {
 mod tests {
     use super::*;
     use html_layout::{
-        FontSlant, GlyphMetric, GlyphRegistry, ShapeError, ShapedTextRun, TextRunShapeRequest,
+        FontSlant, GlyphMetric, ShapeError, ShapedTextRun, TextRunShapeRequest,
     };
     use std::collections::HashMap;
 
     #[derive(Default)]
     struct TestShaper {
         glyphs: HashMap<(char, u32), GlyphId>,
+        glyph_store: html_layout::GlyphResourceStore,
+        append_checkpoint: Option<(HashMap<(char, u32), GlyphId>, html_layout::GlyphResourceStore)>,
     }
 
     impl GlyphShaper for TestShaper {
         fn reset(&mut self) {
             self.glyphs.clear();
+            self.glyph_store.clear();
         }
 
-        fn shape_glyph<'a>(
+        fn glyph_resources(&mut self) -> &mut html_layout::GlyphResourceStore {
+            &mut self.glyph_store
+        }
+
+        fn begin_append_shaping(&mut self) -> Result<(), ShapeError> {
+            assert!(self.append_checkpoint.is_none());
+            self.append_checkpoint = Some((self.glyphs.clone(), self.glyph_store.clone()));
+            Ok(())
+        }
+
+        fn commit_append_shaping(&mut self) {
+            self.append_checkpoint = None;
+        }
+
+        fn rollback_append_shaping(&mut self) {
+            if let Some((glyphs, glyph_store)) = self.append_checkpoint.take() {
+                self.glyphs = glyphs;
+                self.glyph_store = glyph_store;
+            }
+        }
+
+        fn shape_glyph(
             &mut self,
-            glyph_metrics: &mut GlyphRegistry<'a>,
             character: char,
             font_size: f32,
             _font_weight: u16,
@@ -1421,7 +1445,7 @@ mod tests {
                 font_size * 0.75,
             )
             .map_err(ShapeError::rejected_metric)?;
-            let glyph = glyph_metrics.register(metric)?;
+            let glyph = self.glyph_store.register(metric)?;
             self.glyphs.insert(key, glyph);
             Ok(glyph)
         }
@@ -1431,6 +1455,7 @@ mod tests {
     struct NativeTestShaper {
         fallback: TestShaper,
         next_run: TextRunId,
+        append_checkpoint_run: Option<TextRunId>,
     }
 
     impl GlyphShaper for NativeTestShaper {
@@ -1439,9 +1464,30 @@ mod tests {
             self.next_run = 0;
         }
 
-        fn shape_glyph<'a>(
+        fn glyph_resources(&mut self) -> &mut html_layout::GlyphResourceStore {
+            self.fallback.glyph_resources()
+        }
+
+        fn begin_append_shaping(&mut self) -> Result<(), ShapeError> {
+            self.fallback.begin_append_shaping()?;
+            self.append_checkpoint_run = Some(self.next_run);
+            Ok(())
+        }
+
+        fn commit_append_shaping(&mut self) {
+            self.fallback.commit_append_shaping();
+            self.append_checkpoint_run = None;
+        }
+
+        fn rollback_append_shaping(&mut self) {
+            self.fallback.rollback_append_shaping();
+            if let Some(next_run) = self.append_checkpoint_run.take() {
+                self.next_run = next_run;
+            }
+        }
+
+        fn shape_glyph(
             &mut self,
-            glyph_metrics: &mut GlyphRegistry<'a>,
             character: char,
             font_size: f32,
             font_weight: u16,
@@ -1450,7 +1496,6 @@ mod tests {
             family: Option<&str>,
         ) -> Result<GlyphId, ShapeError> {
             self.fallback.shape_glyph(
-                glyph_metrics,
                 character,
                 font_size,
                 font_weight,

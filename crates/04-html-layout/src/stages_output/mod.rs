@@ -177,7 +177,7 @@ impl<'a> RenderView<'a> {
             .source
         {
             html_dom::ImageSource::Uri(uri) => Some(uri.as_str()),
-            html_dom::ImageSource::Inline(_) => None,
+            html_dom::ImageSource::InlineSvg { .. } => None,
         }
     }
 

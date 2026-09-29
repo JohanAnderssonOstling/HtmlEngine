@@ -9,7 +9,6 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
     let parent_font_size = context.parent_font_size;
     let parent_font_weight = context.parent_font_weight;
     let parent_color = context.parent_color;
-    let environment = context.environment;
     match property {
         // Font properties
         Property::FontSize(size) => {
@@ -26,7 +25,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 &style.font,
                 parent_font_size,
                 resolved_root_font_size,
-                environment,
+                doc.resolution,
             )
             else {
                 return ApplyResult::Invalid;
@@ -39,9 +38,12 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             style.font.font_size_root_cap_height = root_cap_height;
             style.font.font_size_root_line_height = root_line_height;
             if let Some(spec) = style.line_height_spec.as_ref() {
-                if let Some((line_height, x_height_px)) =
-                    checked_line_height_components(spec, style.font.font_size, doc.root_font_size())
-                {
+                if let Some((line_height, x_height_px)) = checked_line_height_components(
+                    spec,
+                    style.font.font_size,
+                    doc.root_font_size(),
+                    doc.resolution,
+                ) {
                     style.text.line_height = line_height;
                     style.text.line_height_x_height_px = x_height_px;
                 }
@@ -75,7 +77,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 parent_font_size,
                 parent_font_weight,
                 doc.root_font_size(),
-                environment,
+                doc.resolution,
             ) else {
                 return ApplyResult::Invalid;
             };

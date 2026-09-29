@@ -6,7 +6,6 @@ use html_resources::{ResourceMetadata, ResourceProvider};
 use html_style::StylesheetEntry;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
 
 pub use html_parse::parse_html_document;
 
@@ -143,62 +142,20 @@ impl DocumentFactory {
 
     pub fn parse_with_new_pipeline_css_chunks(&mut self, html: &str, css_chunks: &[&str]) -> PreparedDocument {
         let parsed_html = parse_html_document(html);
-        self.build_pipeline_from_parsed_impl(&parsed_html, css_chunks, None).0
-    }
-
-    pub fn parse_with_new_pipeline_css_chunks_timed(&mut self, html: &str, css_chunks: &[&str]) -> (PreparedDocument, BuildPipelineTimings) {
-        let parsed_html = parse_html_document(html);
-        self.build_pipeline_from_parsed_timed(&parsed_html, css_chunks)
+        self.build_pipeline_from_parsed_impl(&parsed_html, css_chunks).0
     }
 
     pub fn build_pipeline_from_parsed(&mut self, parsed_html: &ParsedHtml, css_chunks: &[&str]) -> PreparedDocument {
-        self.build_pipeline_from_parsed_impl(parsed_html, css_chunks, None).0
+        self.build_pipeline_from_parsed_impl(parsed_html, css_chunks).0
     }
 
     pub(crate) fn build_pipeline_from_parsed_with_media_queries(&mut self, parsed_html: &ParsedHtml, css_chunks: &[&str]) -> (PreparedDocument, html_style::MediaQuerySet) {
-        let started = Instant::now();
-        let mut timings = BuildPipelineTimings::default();
-        let result = self.build_pipeline_from_parsed_impl(parsed_html, css_chunks, Some(&mut timings));
-        println!(
-            "HTML_PIPELINE_PREPARE total_ms={} dom_ms={} toc_ms={} css_imports_ms={} default_css_ms={} author_css_ms={} rules_ms={} resolve_styles_ms={} selector_index_ms={} resolver_setup_ms={} selector_match_ms={} cascade_ms={} style_store_ms={} layout_inputs_ms={}",
-            started.elapsed().as_millis(),
-            timings.build_dom_tree.as_millis(),
-            timings.rebuild_document_toc.as_millis(),
-            timings.resolve_css_imports.as_millis(),
-            timings.parse_default_css.as_millis(),
-            timings.parse_author_css.as_millis(),
-            timings.prepare_style_rules.as_millis(),
-            timings.resolve_styles.as_millis(),
-            timings.selector_index.as_millis(),
-            timings.resolver_setup.as_millis(),
-            timings.selector_matching.as_millis(),
-            timings.cascade.as_millis(),
-            timings.style_store.as_millis(),
-            timings.build_layout_inputs.as_millis(),
-        );
-        result
+        self.build_pipeline_from_parsed_impl(parsed_html, css_chunks)
     }
 
-    pub fn build_pipeline_from_parsed_timed(&mut self, parsed_html: &ParsedHtml, css_chunks: &[&str]) -> (PreparedDocument, BuildPipelineTimings) {
-        let mut timings = BuildPipelineTimings::default();
-        let (document, _) = self.build_pipeline_from_parsed_impl(parsed_html, css_chunks, Some(&mut timings));
-        (document, timings)
-    }
-
-    fn build_pipeline_from_parsed_impl(&mut self, parsed_html: &ParsedHtml, css_chunks: &[&str], mut timings: Option<&mut BuildPipelineTimings>) -> (PreparedDocument, html_style::MediaQuerySet) {
-        let dom_started = Instant::now();
+    fn build_pipeline_from_parsed_impl(&mut self, parsed_html: &ParsedHtml, css_chunks: &[&str]) -> (PreparedDocument, html_style::MediaQuerySet) {
         let (mut document, base_uri) = self.configured_dom_and_base(parsed_html);
-        if let Some(timings) = timings.as_deref_mut() {
-            timings.build_dom_tree += dom_started.elapsed();
-        }
-
-        let toc_started = Instant::now();
         document.rebuild_document_toc_entries();
-        if let Some(timings) = timings.as_deref_mut() {
-            timings.rebuild_document_toc += toc_started.elapsed();
-        }
-
-        let css_started = Instant::now();
         let mut expanded_css = Vec::new();
         let document_encoding = parsed_html.source_encoding();
         for (stylesheet, implicit_scope_root) in document_stylesheets(&document) {
@@ -228,41 +185,18 @@ impl DocumentFactory {
         for css in css_chunks {
             self.expand_stylesheet(css, &base_uri, None, document_encoding, document.dom_root(), &mut HashSet::new(), 0, &mut expanded_css);
         }
-        if let Some(timings) = timings.as_deref_mut() {
-            timings.resolve_css_imports += css_started.elapsed();
-        }
         let all_css = expanded_css.iter().map(|stylesheet| html_style::AuthorStylesheetInput { css: stylesheet.css.as_str(), implicit_scope_root: stylesheet.implicit_scope_root }).collect::<Vec<_>>();
-        let (styled, style_timings, media_queries) = if let Some(cache) = &self.stylesheet_cache {
+        let (styled, media_queries) = if let Some(cache) = &self.stylesheet_cache {
             let root_font_size = document.root_font_size();
-            let (program, build_timings) = cache.programs.lock().expect("style program cache lock").get_or_compile(&all_css, self.media_environment, root_font_size);
-            let (styled, mut style_timings, media_queries) = html_style::style_document_with_program_and_timings(document, &program, &all_css);
-            style_timings.parse_default_css = build_timings.parse_default_css;
-            style_timings.parse_author_css = build_timings.parse_author_css;
-            style_timings.prepare_rules = build_timings.prepare_rules;
-            style_timings.selector_index = build_timings.selector_index;
-            (styled, style_timings, media_queries)
+            let (program, _) = cache.programs.lock().expect("style program cache lock").get_or_compile(&all_css, self.media_environment, root_font_size);
+            let (styled, _, media_queries) = html_style::style_document_with_program_and_reader_overrides(document, &program, &all_css, &self.reader_overrides);
+            (styled, media_queries)
         } else {
-            html_style::style_document_with_cached_program_and_timings(&mut self.style_program_cache, document, &all_css, self.media_environment)
+            let (styled, _, media_queries) = html_style::style_document_with_cached_program_and_reader_overrides(&mut self.style_program_cache, document, &all_css, self.media_environment, &self.reader_overrides);
+            (styled, media_queries)
         };
-        if let Some(timings) = timings.as_deref_mut() {
-            timings.parse_default_css += style_timings.parse_default_css;
-            timings.parse_author_css += style_timings.parse_author_css;
-            timings.prepare_style_rules += style_timings.prepare_rules;
-            timings.resolve_styles += style_timings.resolve_styles;
-            timings.selector_index += style_timings.selector_index;
-            timings.resolver_setup += style_timings.resolver_setup;
-            timings.selector_matching += style_timings.selector_matching;
-            timings.cascade += style_timings.cascade;
-            timings.style_store += style_timings.style_store;
-        }
-
-        let layout_started = Instant::now();
         let (document, styles) = styled.into_parts();
-        let styles = styles.with_reader_overrides(&document, &self.reader_overrides).expect("reader overrides must preserve complete computed styles");
         let prepared = PreparedDocument::try_new_with_note_flow(document, styles, self.note_flow).expect("style resolver must produce complete styles for its document");
-        if let Some(timings) = timings {
-            timings.build_layout_inputs += layout_started.elapsed();
-        }
         (prepared, media_queries)
     }
 
@@ -278,8 +212,9 @@ impl DocumentFactory {
         let base_uri = self.resources.as_ref().map_or_else(String::new, |resources| effective_document_base_uri(&document, resources));
         if let Some(resources) = self.resources.as_ref() {
             for image in document.images_mut() {
-                if let ImageSource::Uri(uri) = &mut image.source {
-                    *uri = resources.provider.resolve(&base_uri, uri);
+                match &mut image.source {
+                    ImageSource::Uri(uri) => *uri = resources.provider.resolve(&base_uri, uri),
+                    ImageSource::InlineSvg { base_uri: svg_base_uri, .. } => svg_base_uri.clone_from(&base_uri),
                 }
             }
         }
@@ -438,23 +373,6 @@ fn css_charset_label(bytes: &[u8]) -> Option<&[u8]> {
     (rest.get(end + 1) == Some(&b';')).then_some(&rest[..end])
 }
 
-#[derive(Default, Debug, Clone)]
-pub struct BuildPipelineTimings {
-    pub build_dom_tree: Duration,
-    pub parse_default_css: Duration,
-    pub parse_author_css: Duration,
-    pub resolve_css_imports: Duration,
-    pub prepare_style_rules: Duration,
-    pub resolve_styles: Duration,
-    pub selector_index: Duration,
-    pub resolver_setup: Duration,
-    pub selector_matching: Duration,
-    pub cascade: Duration,
-    pub style_store: Duration,
-    pub build_layout_inputs: Duration,
-    pub rebuild_document_toc: Duration,
-}
-
 #[cfg(test)]
 mod tests {
     use super::{BookStylesheetCache, DocumentFactory, decode_stylesheet_bytes};
@@ -604,13 +522,18 @@ mod tests {
                 <base href="resources/">
                 <base href="wrong/">
                 <link rel="stylesheet" href="style.css">
-            </head><body><p>text</p><img src="cat.png"></body></html>
+            </head><body><p>text</p><img src="cat.png"><svg xmlns="http://www.w3.org/2000/svg"><image href="cover.png"/></svg></body></html>
         "#;
         let mut factory = DocumentFactory::new();
         factory.set_resource_context(provider, "book/chapter.html");
 
         let document = factory.parse_to_dom(html);
         assert!(matches!(&document.images()[0].source, html_dom::ImageSource::Uri(uri) if uri == "book/resources/cat.png"));
+        assert!(matches!(
+            &document.images()[1].source,
+            html_dom::ImageSource::InlineSvg { base_uri, .. }
+                if base_uri == "book/resources/"
+        ));
 
         let prepared = factory.parse_with_new_pipeline(html, None);
         let paragraph = (0..prepared.box_count()).find(|&box_idx| prepared.get_tag(box_idx) == "p").expect("paragraph box");

@@ -1,3 +1,3 @@
 pub mod html;
 
-pub use html::{BookStylesheetCache, BookStylesheetCacheStats, BuildPipelineTimings, DocumentFactory};
+pub use html::{BookStylesheetCache, BookStylesheetCacheStats, DocumentFactory};
