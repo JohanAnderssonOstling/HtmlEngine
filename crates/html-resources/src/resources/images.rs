@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
-use std::io::Cursor;
+use std::future::Future;
+use std::io::{self, Cursor};
 use std::sync::{Arc, Mutex, Weak};
 
 use base64::Engine;
@@ -10,7 +11,7 @@ use quick_xml::events::{BytesStart, Event};
 use sha2::{Digest, Sha256};
 
 use crate::document::{ImageResource, ImageSource};
-use crate::resources::ResourceProvider;
+use crate::resources::{ResourceMetadata, ResourceProvider};
 
 #[derive(Clone)]
 pub enum DecodedImage {
@@ -82,6 +83,39 @@ impl BlockingJobSpawner for InlineJobSpawner {
     }
 }
 
+/// Completes one image-byte request. Loaders must call this exactly once,
+/// including on failure. The engine schedules decoding after completion.
+pub type ImageLoadCompletion = Box<dyn FnOnce(std::io::Result<Vec<u8>>) + Send + 'static>;
+
+/// Runtime-neutral image I/O boundary. Return promptly after scheduling work;
+/// the host may use asynchronous network I/O or a blocking storage worker.
+/// Inline SVG results must include their referenced image resources.
+pub trait ImageLoader: Send + Sync {
+    fn load(&self, source: ImageSource, complete: ImageLoadCompletion);
+}
+
+/// Compatibility loader for synchronous resource providers. Interactive hosts
+/// supply their existing background job spawner; no runtime is created here.
+pub struct ProviderImageLoader {
+    provider: Arc<dyn ResourceProvider>,
+    jobs: Arc<dyn BlockingJobSpawner>,
+}
+
+impl ProviderImageLoader {
+    pub fn new(provider: Arc<dyn ResourceProvider>, jobs: Arc<dyn BlockingJobSpawner>) -> Self {
+        Self { provider, jobs }
+    }
+}
+
+impl ImageLoader for ProviderImageLoader {
+    fn load(&self, source: ImageSource, complete: ImageLoadCompletion) {
+        let provider = self.provider.clone();
+        self.jobs.spawn(Box::new(move || {
+            complete(load_image_bytes(provider.as_ref(), &source))
+        }));
+    }
+}
+
 struct SharedImage {
     decoded: Arc<DecodedImage>,
     byte_len: usize,
@@ -104,7 +138,7 @@ struct SharedState {
 #[derive(Clone)]
 pub struct ImageService {
     state: Arc<Mutex<SharedState>>,
-    provider: Arc<dyn ResourceProvider>,
+    loader: Arc<dyn ImageLoader>,
     jobs: Arc<dyn BlockingJobSpawner>,
 }
 
@@ -120,6 +154,15 @@ impl ImageService {
         jobs: Arc<dyn BlockingJobSpawner>,
         byte_budget: usize,
     ) -> Self {
+        let loader = Arc::new(ProviderImageLoader::new(provider, jobs.clone()));
+        Self::with_loader(loader, jobs, byte_budget)
+    }
+
+    pub fn with_loader(
+        loader: Arc<dyn ImageLoader>,
+        jobs: Arc<dyn BlockingJobSpawner>,
+        byte_budget: usize,
+    ) -> Self {
         let state = Arc::new(Mutex::new(SharedState {
             decoded: HashMap::new(),
             pending: HashSet::new(),
@@ -131,7 +174,7 @@ impl ImageService {
         }));
         Self {
             state,
-            provider,
+            loader,
             jobs,
         }
     }
@@ -151,12 +194,17 @@ impl ImageService {
                 return;
             }
         }
-        let provider = self.provider.clone();
         let state = Arc::downgrade(&self.state);
-        let source = source.clone();
-        self.jobs.spawn(Box::new(move || {
-            execute_image_job(provider, state, key, source);
-        }));
+        let jobs = self.jobs.clone();
+        self.loader.load(
+            source.clone(),
+            Box::new(move |bytes| {
+                if state.strong_count() == 0 {
+                    return;
+                }
+                jobs.spawn(Box::new(move || execute_image_job(state, key, bytes)));
+            }),
+        );
     }
 
     fn get(&self, source: &ImageSource) -> Option<(Arc<DecodedImage>, u64)> {
@@ -306,17 +354,14 @@ impl ImagePipeline {
 }
 
 fn execute_image_job(
-    provider: Arc<dyn ResourceProvider>,
     state: Weak<Mutex<SharedState>>,
     key: ImageKey,
-    source: ImageSource,
+    bytes: std::io::Result<Vec<u8>>,
 ) {
     let Some(state) = state.upgrade() else {
         return;
     };
-    let decoded = load_bytes(provider.as_ref(), &source)
-        .ok()
-        .and_then(|bytes| decode_image(&bytes).ok());
+    let decoded = bytes.ok().and_then(|bytes| decode_image(&bytes).ok());
     let mut state = state.lock().expect("image service mutex poisoned");
     state.pending.remove(&key);
     if let Some(decoded) = decoded {
@@ -403,7 +448,7 @@ pub fn probe_dimensions(
     provider: &dyn ResourceProvider,
     source: &ImageSource,
 ) -> Option<(u32, u32)> {
-    let bytes = load_bytes(provider, source).ok()?;
+    let bytes = load_image_bytes(provider, source).ok()?;
     if let Some(dimensions) = svg_dimensions(&bytes) {
         return Some(dimensions);
     }
@@ -460,12 +505,110 @@ fn svg_absolute_length(value: &[u8]) -> Option<u32> {
     (value.is_finite() && value > 0.0).then(|| value.round().max(1.0) as u32)
 }
 
-fn load_bytes(provider: &dyn ResourceProvider, source: &ImageSource) -> std::io::Result<Vec<u8>> {
+/// Resolve encoded image bytes, including image references inside inline SVG.
+/// Call this on a loading worker when using a synchronous provider.
+pub fn load_image_bytes(
+    provider: &dyn ResourceProvider,
+    source: &ImageSource,
+) -> std::io::Result<Vec<u8>> {
     match source {
         ImageSource::Uri(uri) => provider.read_bytes(uri),
         ImageSource::InlineSvg { bytes, base_uri } => {
             Ok(embed_svg_image_resources(provider, base_uri, bytes))
         }
+    }
+}
+
+/// Fetch image resources asynchronously, then reuse the synchronous SVG
+/// embedding step with prepared bytes. ZIP/network access never occurs there.
+pub async fn load_image_bytes_async<F, Fut>(
+    provider: &dyn ResourceProvider,
+    source: &ImageSource,
+    read: F,
+) -> io::Result<Vec<u8>>
+where
+    F: Fn(String) -> Fut,
+    Fut: Future<Output = io::Result<Vec<u8>>>,
+{
+    match source {
+        ImageSource::Uri(uri) => read(uri.clone()).await,
+        ImageSource::InlineSvg { bytes, base_uri } => {
+            let mut reader = Reader::from_reader(bytes.as_ref());
+            let mut uris = HashSet::new();
+            loop {
+                match reader.read_event() {
+                    Ok(Event::Start(element) | Event::Empty(element))
+                        if element.local_name().as_ref().eq_ignore_ascii_case(b"image") =>
+                    {
+                        for attribute in element.attributes().with_checks(false).flatten() {
+                            if attribute
+                                .key
+                                .local_name()
+                                .as_ref()
+                                .eq_ignore_ascii_case(b"href")
+                            {
+                                if let Ok(href) = attribute.unescape_value() {
+                                    if let Some(uri) =
+                                        resolvable_svg_resource(provider, base_uri, &href)
+                                    {
+                                        uris.insert(uri);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok(Event::Eof) | Err(_) => break,
+                    _ => {}
+                }
+            }
+            let mut resources = HashMap::new();
+            let mut total = 0usize;
+            for uri in uris {
+                if total >= 24 * 1024 * 1024 {
+                    break;
+                }
+                if let Ok(bytes) = read(uri.clone()).await {
+                    if total.saturating_add(bytes.len()) <= 24 * 1024 * 1024 {
+                        total += bytes.len();
+                        resources.insert(uri, bytes);
+                    }
+                }
+            }
+            Ok(embed_svg_image_resources(
+                &PreparedSvgResources {
+                    provider,
+                    resources,
+                },
+                base_uri,
+                bytes,
+            ))
+        }
+    }
+}
+
+struct PreparedSvgResources<'a> {
+    provider: &'a dyn ResourceProvider,
+    resources: HashMap<String, Vec<u8>>,
+}
+
+impl ResourceProvider for PreparedSvgResources<'_> {
+    fn read_bytes(&self, uri: &str) -> io::Result<Vec<u8>> {
+        self.resources.get(uri).cloned().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "SVG image resource unavailable")
+        })
+    }
+
+    fn metadata(&self, uri: &str) -> io::Result<ResourceMetadata> {
+        self.provider.metadata(uri)
+    }
+    fn resolve(&self, base: &str, href: &str) -> String {
+        self.provider.resolve(base, href)
+    }
+    fn exists(&self, uri: &str) -> bool {
+        self.resources.contains_key(uri)
+    }
+    fn list_html_candidates(&self, root: &str) -> io::Result<Vec<String>> {
+        self.provider.list_html_candidates(root)
     }
 }
 
@@ -677,7 +820,7 @@ fn image_media_type_from_uri(uri: &str) -> Option<&'static str> {
 mod tests {
     use super::{
         BlockingJob, BlockingJobSpawner, DecodedImage, ImageKey, ImagePipeline, ImageService,
-        decode_image, load_bytes,
+        decode_image, load_image_bytes,
     };
     use crate::document::{ImageResource, ImageSource};
     use crate::resources::{ResourceMetadata, ResourceProvider};
@@ -794,7 +937,7 @@ mod tests {
         };
 
         let hydrated =
-            String::from_utf8(load_bytes(&provider, &source).expect("hydrate inline SVG"))
+            String::from_utf8(load_image_bytes(&provider, &source).expect("hydrate inline SVG"))
                 .expect("rewritten SVG remains UTF-8");
 
         assert!(hydrated.contains(r#"xlink:href="data:image/jpeg;base64,/9j/2Q==""#));
