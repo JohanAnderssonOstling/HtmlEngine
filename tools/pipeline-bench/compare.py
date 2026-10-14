@@ -17,6 +17,7 @@ parser.add_argument('--output', required=True)
 parser.add_argument('--cpu', type=int, required=True)
 parser.add_argument('--samples', type=int, default=11)
 parser.add_argument('--rounds', type=int, default=3)
+parser.add_argument('--cases', nargs='+', default=['cold', 'resize', 'paint', 'font', 'handoff'])
 args = parser.parse_args()
 chapters = sorted(Path(args.chapters).glob('c000[123].html'))
 assert len(chapters) == 3
@@ -30,7 +31,7 @@ def run(binary, chapter, case, samples):
     return json.loads(process.stdout)
 
 for chapter in chapters:
-    for case in ['cold', 'resize', 'paint', 'font', 'handoff']:
+    for case in args.cases:
         row = {'chapter': chapter.name, 'case': case, 'time': {}, 'heap': {}}
         samples = {'before': [], 'after': []}
         for round_index in range(args.rounds):

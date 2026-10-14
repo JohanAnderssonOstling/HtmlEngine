@@ -4,7 +4,10 @@ version = "0.1.0"
 edition = "2024"
 [workspace]
 [features]
+# Disable default features only when building the frozen pre-ownership engine.
+default = ["borrowed-view"]
 heap = []
+borrowed-view = []
 [dependencies]
 html = { package = "html-engine", path = "../../crates/html" }
 libc = "0.2"

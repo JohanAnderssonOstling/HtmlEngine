@@ -91,7 +91,7 @@ impl<S: LayoutGlyphShaper> OwnedActivePipelineSession<S> {
         self.session.update(inputs, &mut self.glyph_shaper)
     }
 
-    pub fn rehydrate_glyphs(&mut self) -> Result<LaidOutDocument, PipelineError> {
+    pub fn rehydrate_glyphs(&mut self) -> Result<(), PipelineError> {
         self.session.rehydrate_glyphs(&mut self.glyph_shaper)
     }
 
@@ -125,7 +125,7 @@ impl<S: LayoutGlyphShaper> ActivePipelineSession<'_, S> {
         self.session.update(inputs, self.glyph_shaper)
     }
 
-    pub fn rehydrate_glyphs(&mut self) -> Result<LaidOutDocument, PipelineError> {
+    pub fn rehydrate_glyphs(&mut self) -> Result<(), PipelineError> {
         self.session.rehydrate_glyphs(self.glyph_shaper)
     }
 
@@ -179,7 +179,9 @@ impl PipelineSession {
             != Some(&glyph_shaper.glyph_resources().generation())
         {
             self.cache.shaped = None;
-            self.cache.laid_out = None;
+            // Published geometry remains available to borrowed readers after
+            // failure or backend replacement. The generation gate prevents
+            // treating it as reusable renderer state until shaping succeeds.
             self.active_resource_generation = None;
         }
     }
@@ -436,11 +438,12 @@ impl PipelineSession {
     /// Glyph shapers may keep renderer-specific data indexed by `GlyphId`. That
     /// data is reset whenever another document is shaped, so restoring a cached
     /// document must rehydrate it even when its parse and style inputs are still
-    /// valid.
+    /// valid. Publishes the result in place; borrow it through `document()`
+    /// instead of retaining a second owned layout.
     pub fn rehydrate_glyphs(
         &mut self,
         glyph_shaper: &mut impl LayoutGlyphShaper,
-    ) -> Result<LaidOutDocument, PipelineError> {
+    ) -> Result<(), PipelineError> {
         let result = self.rehydrate_glyphs_inner(glyph_shaper);
         self.invalidate_stale_renderer_state(glyph_shaper);
         result
@@ -449,7 +452,7 @@ impl PipelineSession {
     fn rehydrate_glyphs_inner(
         &mut self,
         glyph_shaper: &mut impl LayoutGlyphShaper,
-    ) -> Result<LaidOutDocument, PipelineError> {
+    ) -> Result<(), PipelineError> {
         let inputs = self.cache.inputs.clone().ok_or_else(|| {
             PipelineError("cannot rehydrate an empty pipeline session".to_owned())
         })?;
@@ -476,10 +479,10 @@ impl PipelineSession {
         });
         self.cache.laid_out = Some(CacheEntry {
             key: inputs.layout_cache_key(),
-            value: laid_out.clone(),
+            value: laid_out,
         });
         self.active_resource_generation = Some(glyph_shaper.glyph_resources().generation());
-        Ok(laid_out)
+        Ok(())
     }
 
     fn earliest_uncached_stage(
@@ -656,6 +659,10 @@ impl PipelineSession {
             .unwrap_or_default()
     }
 
+    /// The last successfully published geometry. Backend invalidation does
+    /// not erase it, so source queries and failure recovery remain available.
+    /// After replacing renderer resources, update or rehydrate before painting
+    /// renderer-owned glyph and native-run handles from this document.
     pub fn document(&self) -> Option<&LaidOutDocument> {
         self.cache.laid_out.as_ref().map(|entry| &entry.value)
     }
@@ -1409,6 +1416,43 @@ mod tests {
         );
         assert_eq!(session.cache.inputs.as_ref(), Some(&original_inputs));
         assert_eq!(session.cache.laid_out.as_ref().map(|entry| &entry.key), original_layout_key.as_ref());
+    }
+
+    #[test]
+    fn invalidated_backend_retains_published_geometry_but_requires_new_shaping() {
+        let mut session = PipelineSession::new(Arc::new(MockProvider));
+        let mut shaper = TransactionalShaper::default();
+        let inputs = base_inputs("<p>Published chapter</p>", SourceRevision::INITIAL);
+        session.update(inputs.clone(), &mut shaper).unwrap();
+        let original = build_snapshot(session.document().unwrap());
+        shaper.reset();
+        shaper.fail_on = Some('P');
+        session.attach(&mut shaper).update(inputs.clone()).unwrap_err();
+        assert_eq!(build_snapshot(session.document().unwrap()), original);
+        assert!(session.cache.shaped.is_none());
+        assert!(session.active_resource_generation.is_none());
+        assert!(session.layout_note("n", html_layout::LayoutConstraints::new(100.0, 16.0).unwrap(), &mut shaper).is_none());
+        shaper.fail_on = None;
+        assert_eq!(session.attach(&mut shaper).update(inputs).unwrap().stage, EarliestStage::Shape);
+        assert_eq!(build_snapshot(session.document().unwrap()), original);
+    }
+
+    #[test]
+    fn glyph_rehydration_publishes_in_place_and_preserves_the_previous_result_on_failure() {
+        let mut session = PipelineSession::new(Arc::new(MockProvider));
+        let mut shaper = TransactionalShaper::default();
+        session.update(base_inputs("<p>Chapter</p>", SourceRevision::INITIAL), &mut shaper).unwrap();
+        let original = build_snapshot(session.document().unwrap());
+        let resources = shaper.resources.clone();
+        let generation = shaper.glyph_store.generation();
+        shaper.fail_on = Some('C');
+        session.rehydrate_glyphs(&mut shaper).unwrap_err();
+        assert_eq!(shaper.resources, resources);
+        assert_eq!(build_snapshot(session.document().unwrap()), original);
+        shaper.fail_on = None;
+        let () = session.rehydrate_glyphs(&mut shaper).unwrap();
+        assert_eq!(build_snapshot(session.document().unwrap()), original);
+        assert_ne!(shaper.glyph_store.generation(), generation);
     }
 
     #[test]

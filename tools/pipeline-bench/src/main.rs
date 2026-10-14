@@ -505,10 +505,10 @@ fn main() {
 
     let mut session = PipelineSession::new(Arc::new(FileSystemProvider));
     let mut shaper = Shaper::default();
-    if case != "cold" {
+    if !matches!(case.as_str(), "cold" | "reader_load") {
         session.update(inputs.clone(), &mut shaper).unwrap();
     }
-    let mut view = if case == "handoff" {
+    let mut view = if matches!(case.as_str(), "handoff" | "rehydrate") && !cfg!(feature = "borrowed-view") {
         session.document().cloned()
     } else {
         None
@@ -528,7 +528,8 @@ fn main() {
     let mut allocated_bytes = Vec::with_capacity(count);
     for iteration in 0..count + 3 {
         match case.as_str() {
-            "cold" => {
+            "cold" | "reader_load" => {
+                view = None;
                 session = PipelineSession::new(Arc::new(FileSystemProvider));
                 shaper = Shaper::default();
             }
@@ -543,6 +544,7 @@ fn main() {
                 })
             }
             "font" => inputs.font_environment = inputs.font_environment.next(),
+            "rehydrate" => {},
             _ => panic!("unknown case"),
         }
         heap::reset();
@@ -551,11 +553,21 @@ fn main() {
         }
         let cpu = cpu_seconds();
         let wall = Instant::now();
-        black_box(session.update(inputs.clone(), &mut shaper).unwrap());
-        if case == "handoff" {
-            view = session.document().cloned();
-            black_box(&view);
+        if case == "rehydrate" {
+            #[cfg(not(feature = "borrowed-view"))]
+            { view = Some(session.rehydrate_glyphs(&mut shaper).unwrap()); }
+            #[cfg(feature = "borrowed-view")]
+            { session.rehydrate_glyphs(&mut shaper).unwrap(); }
+        } else {
+            black_box(session.update(inputs.clone(), &mut shaper).unwrap());
         }
+        if matches!(case.as_str(), "handoff" | "reader_load") && !cfg!(feature = "borrowed-view") {
+            view = session.document().cloned();
+        }
+        // Match the actual reader handoff: the old reader retained an owned
+        // copy; the new reader borrows the engine's published result.
+        black_box(session.document().unwrap().render_view().text().line_count());
+        black_box(&view);
         let elapsed = wall.elapsed().as_secs_f64() * 1000.0;
         let consumed = (cpu_seconds() - cpu) * 1000.0;
         let instruction_count = counter.as_mut().and_then(counter::InstructionCounter::stop);
@@ -575,6 +587,6 @@ fn main() {
     let doc = session.document().unwrap();
     let reported = doc.memory_usage_bytes();
     let rss = peak_rss();
-    let output = json!({"case":case,"chapter":path.rsplit('/').next().unwrap(),"samples":count,"font_backend":"deterministic mock","heap_instrumented":cfg!(feature="heap"),"wall_median_ms":median(&mut walls),"cpu_median_ms":median(&mut cpus),"user_instructions":if instructions.len()==count {Some(median(&mut instructions) as u64)} else {None},"heap_live_bytes":median(&mut retained) as usize,"heap_peak_bytes":median(&mut peaks) as usize,"allocation_requests":median(&mut allocations) as usize,"allocated_bytes":median(&mut allocated_bytes) as usize,"rss_peak_bytes":rss,"reported_document_bytes":reported,"glyphs":doc.render_view().text().glyph_count(),"lines":doc.render_view().text().line_count(),"render_fingerprint":format!("{:016x}",layout_fingerprint(doc)),"text_color_fingerprint":format!("{:016x}",text_color_fingerprint(doc,&shaper)),"source_fingerprint":format!("{:016x}",source_fingerprint(doc))});
+    let output = json!({"case":case,"chapter":path.rsplit('/').next().unwrap(),"samples":count,"font_backend":"deterministic mock","heap_instrumented":cfg!(feature="heap"),"reader_borrows_layout":cfg!(feature="borrowed-view"),"wall_median_ms":median(&mut walls),"cpu_median_ms":median(&mut cpus),"user_instructions":if instructions.len()==count {Some(median(&mut instructions) as u64)} else {None},"heap_live_bytes":median(&mut retained) as usize,"heap_peak_bytes":median(&mut peaks) as usize,"allocation_requests":median(&mut allocations) as usize,"allocated_bytes":median(&mut allocated_bytes) as usize,"rss_peak_bytes":rss,"reported_document_bytes":reported,"glyphs":doc.render_view().text().glyph_count(),"lines":doc.render_view().text().line_count(),"render_fingerprint":format!("{:016x}",layout_fingerprint(doc)),"text_color_fingerprint":format!("{:016x}",text_color_fingerprint(doc,&shaper)),"source_fingerprint":format!("{:016x}",source_fingerprint(doc))});
     println!("{output}");
 }

@@ -158,10 +158,12 @@ pub mod engine {
                 .media_environment_change_affects_style(media, root_font_size)
         }
 
+        /// Rebuild glyph resources and publish the layout in place. Borrow
+        /// the resulting chapter with [`Self::document`].
         pub fn rehydrate_glyphs(
             &mut self,
             glyph_shaper: &mut impl GlyphShaper,
-        ) -> Result<LaidOutDocument, PipelineError> {
+        ) -> Result<(), PipelineError> {
             self.session.attach(glyph_shaper).rehydrate_glyphs()
         }
 
