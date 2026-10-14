@@ -82,16 +82,13 @@ impl ShapingSpan {
 /// observe non-text items: numerically adjacent glyph ranges are not
 /// necessarily typographically adjacent when an empty atomic item, image, or
 /// forced break occurs between them.
-pub(super) fn plan_shaping_spans(
+pub(super) fn plan_shaping_spans<Overrides: StyleOverrides + ?Sized>(
     styles: &ComputedStyles,
     layout_tree: &LayoutTree,
     inline_content: &InlineContent,
-    style_overrides: &[Option<StyleIndices>],
+    style_overrides: &Overrides,
     font_metrics: &ShapedFontMetrics,
 ) -> Vec<ShapingSpan> {
-    debug_assert!(
-        style_overrides.is_empty() || style_overrides.len() == inline_content.glyphs().len()
-    );
     #[derive(Clone, Copy, Default)]
     struct ContextState {
         previous_span: Option<usize>,
@@ -160,19 +157,7 @@ pub(super) fn plan_shaping_spans(
 
         let mut start = range.start;
         while start < range.end {
-            let style_override = if style_overrides.is_empty() {
-                None
-            } else {
-                style_overrides[start as usize]
-            };
-            let mut end = if style_overrides.is_empty() {
-                range.end
-            } else {
-                start + 1
-            };
-            while end < range.end && style_overrides[end as usize] == style_override {
-                end += 1;
-            }
+            let (style_override, end) = style_overrides.segment_at(start, range.end);
 
             let mut part_start = start;
             for index in start..end {

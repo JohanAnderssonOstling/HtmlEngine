@@ -176,6 +176,75 @@ mod stage_tests {
         assert_eq!(source_offsets, [0, 2, 2]);
     }
 
+    #[test]
+    fn prepared_logical_text_survives_replacing_font_resources() {
+        let mut factory = DocumentFactory::new();
+        let prepared = factory.parse_with_new_pipeline(
+            "<p>  ß😀  a</p>",
+            Some("p {text-transform:uppercase} p::first-letter {font-size:32px}"),
+        );
+        let text = prepared.inputs.text.clone();
+        let characters: String = text.content().glyphs().iter().copied().filter_map(char::from_u32).collect();
+        assert_eq!(characters, "SS😀 A");
+        assert!(text.first_letter_styles().style_at(0).is_some());
+        assert_eq!(text.first_letter_styles().style_at(0), text.first_letter_styles().style_at(1));
+        assert!(text.first_letter_styles().style_at(2).is_none());
+        let mut first_generation = None;
+        for _ in 0..2 {
+            let mut shaper = TestGlyphShaper::new();
+            let shaped = prepared.shape(&mut shaper).unwrap();
+            assert!(Arc::ptr_eq(&text, &shaped.inputs.text));
+            let generation = shaper.glyph_resources().generation();
+            if let Some(previous) = first_generation.as_ref() { assert_ne!(previous, &generation); }
+            first_generation = Some(generation);
+            let metrics = &shaped.shaped.glyph_metrics;
+            let glyphs = shaped.glyphs();
+            assert_eq!(metrics.get(glyphs[0]).advance(), metrics.get(glyphs[1]).advance());
+            assert!(metrics.get(glyphs[0]).advance() > metrics.get(glyphs[2]).advance());
+            let mut document = shaped.layout(LayoutConstraints::new(600.0, 20.0).unwrap());
+            document.relayout(LayoutConstraints::new(50.0, 20.0).unwrap());
+            assert!(Arc::ptr_eq(&text, &document.inputs.text));
+            let offsets: Vec<_> = (0..5).map(|glyph| document.glyph_source_offset(glyph)).collect();
+            assert_eq!(offsets, [Some(2), Some(2), Some(3), Some(5), Some(7)]);
+        }
+    }
+
+    #[test]
+    fn prepared_first_letter_storage_does_not_grow_with_paragraph_length() {
+        let mut bytes = Vec::new();
+        for length in [10, 40_000] {
+            let mut factory = DocumentFactory::new();
+            let prepared = factory.parse_with_new_pipeline(
+                &format!("<p>{}</p>", "a".repeat(length)),
+                Some("p::first-letter {font-size:32px}"),
+            );
+            let report = prepared.memory_usage_report();
+            let storage = report.entries.iter().find(|entry| entry.label.ends_with("PreparedText.first_letter_styles.storage")).unwrap();
+            assert!(storage.bytes > 0 && storage.bytes <= 128);
+            bytes.push(storage.bytes);
+        }
+        assert_eq!(bytes[0], bytes[1]);
+    }
+
+    #[test]
+    fn paint_variants_share_logical_text_and_retarget_sparse_pseudo_styles() {
+        for generated in [false, true] {
+            let mut factory = DocumentFactory::new();
+            let css = format!("p {{text-transform:uppercase}} p::first-letter {{font-size:32px;color:red}} {}", if generated {"p::before {content:'ß'}"} else {""});
+            let prepared = factory.parse_with_new_pipeline("<p>ßa</p>", Some(&css));
+            let themed = prepared.with_reader_paint_overrides(&crate::ReaderStyleOverrides {
+                foreground: Some(0xddddddff), ..Default::default()
+            }).unwrap();
+            assert!(std::ptr::eq(prepared.inputs.text.content(), themed.inputs.text.content()));
+            let first = themed.inputs.text.first_letter_styles().style_at(0).unwrap();
+            assert!(themed.inputs.styles.view(first).is_some(), "cached pseudo style belongs to the new paint store");
+            assert_eq!(Some(first), themed.inputs.text.first_letter_styles().style_at(1));
+            let shaped = themed.shape(&mut TestGlyphShaper::new()).unwrap();
+            let metrics = &shaped.shaped.glyph_metrics;
+            assert_eq!(metrics.get(shaped.glyphs()[0]).advance(), metrics.get(shaped.glyphs()[1]).advance());
+        }
+    }
+
     #[derive(Default)]
     struct InvalidGlyphShaper(crate::GlyphResourceStore);
 

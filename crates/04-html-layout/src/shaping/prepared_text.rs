@@ -1,0 +1,186 @@
+//! Immutable logical text prepared independently of renderer font resources.
+
+use super::{collapse_whitespace, first_letter_style_overrides, transform_text};
+use crate::layout_model::{InlineContent, LayoutTree};
+use html_dom::{Document, MemoryUsageReport};
+use html_style_model::{ComputedStyles, StyleIndices};
+use rustc_data_structures::fx::FxHashMap;
+use std::ops::Range;
+use std::sync::Arc;
+
+/// Text transforms, whitespace and source correspondence depend on publication
+/// styles, not the lifetime of a renderer's glyph cache. Keep their result with
+/// preparation so replacing font resources only repeats native shaping.
+pub(crate) struct PreparedText {
+    content: Arc<InlineContent>,
+    first_letter_styles: FirstLetterStyles,
+}
+
+impl PreparedText {
+    pub(crate) fn new(
+        document: &Document,
+        styles: &ComputedStyles,
+        tree: &LayoutTree,
+        mut content: InlineContent,
+    ) -> Self {
+        if !content.glyphs().is_empty() {
+            collapse_whitespace(styles, tree, &mut content);
+        }
+        let mut first_letter_styles =
+            first_letter_style_overrides(document, styles, tree, &content);
+        if !content.glyphs().is_empty() {
+            transform_text(styles, tree, &mut content, &mut first_letter_styles);
+        }
+        Self {
+            content: Arc::new(content),
+            first_letter_styles: FirstLetterStyles::new(&first_letter_styles),
+        }
+    }
+
+    /// Paint variants share normalized characters and source correspondence.
+    /// Only sparse style handles must be retargeted to the new style store.
+    pub(crate) fn with_paint_styles(
+        &self,
+        document: &Document,
+        previous: &ComputedStyles,
+        next: &ComputedStyles,
+    ) -> Self {
+        let mut mapping = FxHashMap::default();
+        if !self.first_letter_styles.runs.is_empty() {
+            for node in document.node_ids() {
+                for (before, after) in [
+                    (
+                        previous.first_letter_style_for_node(node),
+                        next.first_letter_style_for_node(node),
+                    ),
+                    (
+                        previous.before_first_letter_style_for_node(node),
+                        next.before_first_letter_style_for_node(node),
+                    ),
+                ] {
+                    if let (Some(before), Some(after)) = (before, after) {
+                        mapping.insert(before, after);
+                    }
+                }
+            }
+        }
+        let runs = self
+            .first_letter_styles
+            .runs
+            .iter()
+            .map(|run| StyleOverrideRun {
+                glyphs: run.glyphs.clone(),
+                style: *mapping
+                    .get(&run.style)
+                    .expect("paint variants retain every first-letter style"),
+            })
+            .collect();
+        Self {
+            content: self.content.clone(),
+            first_letter_styles: FirstLetterStyles { runs },
+        }
+    }
+
+    pub(crate) fn content(&self) -> &InlineContent {
+        &self.content
+    }
+
+    pub(crate) fn first_letter_styles(&self) -> &FirstLetterStyles {
+        &self.first_letter_styles
+    }
+
+    pub(crate) fn memory_usage_report(&self) -> MemoryUsageReport {
+        let mut report = self.content.memory_usage_report();
+        report.add_slice_storage::<StyleOverrideRun>(
+            "PreparedText.first_letter_styles.storage",
+            self.first_letter_styles.runs.len(),
+            self.first_letter_styles.runs.len(),
+        );
+        report
+    }
+}
+
+/// Read one contiguous style segment without scanning all unstyled characters.
+/// Dense slices remain useful to normalization tests; prepared text keeps only
+/// the sparse first-letter ranges that survive whitespace and case conversion.
+pub(super) trait StyleOverrides {
+    fn segment_at(&self, start: u32, end: u32) -> (Option<StyleIndices>, u32);
+}
+
+pub(crate) struct FirstLetterStyles {
+    runs: Box<[StyleOverrideRun]>,
+}
+
+struct StyleOverrideRun {
+    glyphs: Range<u32>,
+    style: StyleIndices,
+}
+
+impl FirstLetterStyles {
+    fn new(dense: &[Option<StyleIndices>]) -> Self {
+        let mut runs: Vec<StyleOverrideRun> = Vec::new();
+        for (index, &style) in dense.iter().enumerate() {
+            let Some(style) = style else {
+                continue;
+            };
+            let index = index as u32;
+            if let Some(last) = runs
+                .last_mut()
+                .filter(|last| last.glyphs.end == index && last.style == style)
+            {
+                last.glyphs.end += 1;
+            } else {
+                runs.push(StyleOverrideRun {
+                    glyphs: index..index + 1,
+                    style,
+                });
+            }
+        }
+        Self { runs: runs.into() }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn style_at(&self, glyph: u32) -> Option<StyleIndices> {
+        self.segment_at(glyph, glyph + 1).0
+    }
+}
+
+impl StyleOverrides for FirstLetterStyles {
+    fn segment_at(&self, start: u32, end: u32) -> (Option<StyleIndices>, u32) {
+        let index = self.runs.partition_point(|run| run.glyphs.end <= start);
+        match self.runs.get(index) {
+            Some(run) if run.glyphs.start <= start => (Some(run.style), end.min(run.glyphs.end)),
+            Some(run) => (None, end.min(run.glyphs.start)),
+            None => (None, end),
+        }
+    }
+}
+
+#[cfg(test)]
+impl StyleOverrides for [Option<StyleIndices>] {
+    fn segment_at(&self, start: u32, end: u32) -> (Option<StyleIndices>, u32) {
+        if self.is_empty() {
+            return (None, end);
+        }
+        let style = self[start as usize];
+        let mut boundary = start + 1;
+        while boundary < end && self[boundary as usize] == style {
+            boundary += 1;
+        }
+        (style, boundary)
+    }
+}
+
+#[cfg(test)]
+impl StyleOverrides for Vec<Option<StyleIndices>> {
+    fn segment_at(&self, start: u32, end: u32) -> (Option<StyleIndices>, u32) {
+        self.as_slice().segment_at(start, end)
+    }
+}
+
+#[cfg(test)]
+impl<const N: usize> StyleOverrides for [Option<StyleIndices>; N] {
+    fn segment_at(&self, start: u32, end: u32) -> (Option<StyleIndices>, u32) {
+        self.as_slice().segment_at(start, end)
+    }
+}

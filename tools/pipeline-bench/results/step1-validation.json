@@ -1,0 +1,17 @@
+{
+  "tests": {
+    "step1-tests-final.log": {
+      "passed": 709,
+      "ignored": 2
+    },
+    "step1-reader-tests.log": {
+      "passed": 159,
+      "ignored": 2
+    }
+  },
+  "baseline_exceptions": [
+    "html-style-model::store_brand_uses_the_option_niche_without_growing_node_entries fails before refactor",
+    "WPT integration requires unavailable HTML_WPT_ROOT"
+  ],
+  "real_chapter_fingerprints": "Every successful baseline case has identical render and source fingerprints; both known paint-panicking chapters remain for the paint stage."
+}

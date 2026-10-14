@@ -3,6 +3,7 @@
 use super::*;
 use crate::layout::prepare_text_paint;
 use crate::ReaderStyleOverrides;
+use crate::shaping::PreparedText;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -220,7 +221,7 @@ pub(crate) struct PreparedInputs {
     pub(super) document: std::sync::Arc<Document>,
     pub(super) styles: std::sync::Arc<ComputedStyles>,
     pub(super) layout_tree: std::sync::Arc<LayoutTree>,
-    pub(super) inline_content: InlineContent,
+    pub(super) text: Arc<PreparedText>,
     pub(super) note_flow: NoteFlow,
     pub(super) paint_base: Option<Arc<PreparedInputs>>,
 }
@@ -290,7 +291,8 @@ impl PreparedDocument {
         let mut layout_tree = LayoutTree::default();
         let mut inline_content = InlineContent::default();
         crate::layout::build_layout_inputs(&document, &styles, &mut layout_tree, &mut inline_content, note_flow);
-        Ok(Self { inputs: std::sync::Arc::new(PreparedInputs { document: std::sync::Arc::new(document), styles: std::sync::Arc::new(styles), layout_tree: std::sync::Arc::new(layout_tree), inline_content, note_flow, paint_base: None }) })
+        let text = Arc::new(PreparedText::new(&document, &styles, &layout_tree, inline_content));
+        Ok(Self { inputs: Arc::new(PreparedInputs { document: Arc::new(document), styles: Arc::new(styles), layout_tree: Arc::new(layout_tree), text, note_flow, paint_base: None }) })
     }
 
     /// Apply color preferences to an unpainted prepared document. The cascade
@@ -303,8 +305,9 @@ impl PreparedDocument {
         let mut layout_tree = LayoutTree::default();
         let mut inline_content = InlineContent::default();
         crate::layout::build_layout_inputs(&self.inputs.document, &styles, &mut layout_tree, &mut inline_content, self.inputs.note_flow);
+        let text = Arc::new(self.inputs.text.with_paint_styles(&self.inputs.document, &self.inputs.styles, &styles));
         Ok(Self {
-            inputs: Arc::new(PreparedInputs { document: self.inputs.document.clone(), styles: Arc::new(styles), layout_tree: Arc::new(layout_tree), inline_content, note_flow: self.inputs.note_flow, paint_base: Some(self.inputs.clone()) }),
+            inputs: Arc::new(PreparedInputs { document: self.inputs.document.clone(), styles: Arc::new(styles), layout_tree: Arc::new(layout_tree), text, note_flow: self.inputs.note_flow, paint_base: Some(self.inputs.clone()) }),
         })
     }
 
@@ -334,12 +337,13 @@ impl PreparedDocument {
             NoteFlow::InFlow,
             root,
         );
+        let text = Arc::new(PreparedText::new(document, &self.inputs.styles, &layout_tree, inline_content));
         Some(Self {
             inputs: std::sync::Arc::new(PreparedInputs {
                 document: std::sync::Arc::clone(&self.inputs.document),
                 styles: std::sync::Arc::clone(&self.inputs.styles),
                 layout_tree: std::sync::Arc::new(layout_tree),
-                inline_content,
+                text,
                 note_flow: NoteFlow::InFlow,
                 paint_base: None,
             }),
@@ -385,7 +389,7 @@ impl PreparedDocument {
 
     #[cfg(test)]
     pub(crate) fn inline_content(&self) -> &InlineContent {
-        &self.inputs.inline_content
+        self.inputs.text.content()
     }
 
     pub fn box_count(&self) -> usize {
@@ -414,7 +418,7 @@ impl PreparedDocument {
         );
         report.extend_prefixed(
             "PreparedDocument.inline_content",
-            self.inputs.inline_content.memory_usage_report(),
+            self.inputs.text.memory_usage_report(),
         );
         report
     }
@@ -555,13 +559,13 @@ impl PreparedDocument {
         glyph_shaper: &mut impl crate::GlyphShaper,
     ) -> Result<ShapedDocument, crate::ShapeError> {
         let mut glyph_metrics = glyph_shaper.glyph_resources().snapshot();
-        let mut inline_content = self.inputs.inline_content.clone();
+        let mut inline_content = self.inputs.text.content().clone();
         let (ellipsis_glyphs, hyphen_glyphs, text_geometry, font_metrics) =
             crate::shaping::shape_document(
-                &self.inputs.document,
                 &self.inputs.styles,
                 &self.inputs.layout_tree,
                 &mut inline_content,
+                self.inputs.text.first_letter_styles(),
                 glyph_shaper,
                 &mut glyph_metrics,
             )?;

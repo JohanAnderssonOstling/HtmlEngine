@@ -17,6 +17,7 @@ use unicode_segmentation::UnicodeSegmentation;
 mod contracts;
 mod execution;
 mod normalization;
+mod prepared_text;
 mod pseudo_styles;
 mod spans;
 
@@ -29,6 +30,8 @@ pub use contracts::{
     TextShapeRequest, TextStyleSpan,
 };
 pub(crate) use execution::{reshape_range_with_style, shape_document};
+pub(crate) use prepared_text::PreparedText;
+use prepared_text::{FirstLetterStyles, StyleOverrides};
 #[cfg(test)]
 use normalization::is_css_collapsible_space;
 pub(crate) use normalization::whitespace_context_root;

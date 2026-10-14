@@ -1,0 +1,11 @@
+[package]
+name = "pipeline-bench"
+version = "0.1.0"
+edition = "2024"
+[workspace]
+[features]
+heap = []
+[dependencies]
+html = { package = "html-engine", path = "../../crates/html" }
+libc = "0.2"
+serde_json = "1"

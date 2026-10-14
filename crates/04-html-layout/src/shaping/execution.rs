@@ -2,15 +2,14 @@
 
 use super::*;
 
-/// Shapes all styled text in a document. Whitespace normalization and CSS text
-/// transforms are framework-neutral. The renderer supplies native run geometry
-/// when available and the established per-character metrics remain the
-/// renderer-independent fallback.
+/// Shapes prepared logical text without repeating whitespace or case conversion.
+/// The renderer supplies native run geometry when available; per-character
+/// metrics remain the renderer-independent fallback.
 pub(crate) fn shape_document(
-    document: &Document,
     styles: &ComputedStyles,
     layout_tree: &LayoutTree,
     inline_content: &mut InlineContent,
+    first_letter_styles: &FirstLetterStyles,
     glyph_shaper: &mut impl GlyphShaper,
     glyph_metrics: &mut GlyphMetrics,
 ) -> Result<
@@ -22,19 +21,6 @@ pub(crate) fn shape_document(
     ),
     ShapeError,
 > {
-    if !inline_content.glyphs().is_empty() {
-        collapse_whitespace(styles, layout_tree, inline_content);
-    }
-    let mut first_letter_styles =
-        first_letter_style_overrides(document, styles, layout_tree, inline_content);
-    if !inline_content.glyphs().is_empty() {
-        transform_text(
-            styles,
-            layout_tree,
-            inline_content,
-            &mut first_letter_styles,
-        );
-    }
     let mut box_family: Vec<Option<String>> = vec![None; layout_tree.box_count()];
     let mut boxes_with_conditional_hyphens = vec![false; layout_tree.box_count()];
     for (box_idx, range) in text_runs(inline_content) {
@@ -310,7 +296,7 @@ pub(crate) fn shape_document(
         styles,
         layout_tree,
         inline_content,
-        &first_letter_styles,
+        first_letter_styles,
         &font_metrics,
     ) {
         let box_idx = span.shaping_box;
