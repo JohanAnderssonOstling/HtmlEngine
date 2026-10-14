@@ -177,7 +177,7 @@ pub(super) fn has_aligned_inline_ancestor(doc: &LayoutEngine, box_idx: usize) ->
     false
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 #[repr(C)]
 pub(super) struct InlineToken {
     pub(super) data: u32,
@@ -434,7 +434,7 @@ pub(super) enum InlineTokenKind {
 /// Large, uncommon replaced-element geometry lives outside the dense token
 /// stream. Most documents now scan compact fixed-width tokens for every text
 /// pass instead of dragging image-sized enum storage through cache lines.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub(super) enum ReplacedToken {
     Image {
         image_idx: u32,
@@ -578,7 +578,65 @@ pub(super) struct InlineTokens {
     pub(super) kp_plan: Option<Arc<[OnceLock<KpPlan>; 2]>>,
 }
 
+pub(super) enum ParagraphTokenInput {
+    Shared(InlineTokens),
+    Dynamic {
+        count: usize,
+        runs: Box<[InlineTokenMetrics]>,
+        replaced: Box<[ReplacedToken]>,
+        controls: Box<[(usize, InlineToken)]>,
+    },
+}
+
+impl ParagraphTokenInput {
+    pub(super) fn new(tokens: &InlineTokens) -> Self {
+        if matches!(tokens.dense, InlineStorage::Shared(_)) {
+            return Self::Shared(tokens.clone());
+        }
+        Self::Dynamic {
+            count: tokens.len(), runs: tokens.runs.to_vec().into_boxed_slice(),
+            replaced: tokens.replaced.clone().into_boxed_slice(),
+            controls: tokens.iter().enumerate().filter(|(_, token)| !matches!(token.kind(), InlineTokenKind::Glyph { .. })).map(|(index, token)| (index, *token)).collect(),
+        }
+    }
+
+    pub(super) fn matches(&self, tokens: &InlineTokens) -> bool {
+        match self {
+            Self::Shared(previous) => previous.same_layout_input(tokens),
+            Self::Dynamic { count, runs, replaced, controls } => {
+                *count == tokens.len() && runs.as_ref() == tokens.runs.as_ref() && replaced.as_ref() == tokens.replaced.as_slice()
+                    && controls.iter().copied().eq(tokens.iter().enumerate().filter(|(_, token)| !matches!(token.kind(), InlineTokenKind::Glyph { .. })).map(|(index, token)| (index,*token)))
+            }
+        }
+    }
+
+    pub(super) fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Shared(tokens) => tokens.retained_bytes(),
+            Self::Dynamic { runs, replaced, controls, .. } => runs.len()*size_of::<InlineTokenMetrics>() + replaced.len()*size_of::<ReplacedToken>() + controls.len()*size_of::<(usize,InlineToken)>(),
+        }
+    }
+}
+
 impl InlineTokens {
+    pub(super) fn same_layout_input(&self, other: &Self) -> bool {
+        fn same<T: Clone + PartialEq>(a: &InlineStorage<T>, b: &InlineStorage<T>) -> bool {
+            (a.len() == b.len() && a.as_ptr() == b.as_ptr()) || **a == **b
+        }
+        same(&self.dense, &other.dense) && same(&self.runs, &other.runs)
+            && self.replaced == other.replaced
+    }
+
+    pub(super) fn retained_bytes(&self) -> usize {
+        fn owned<T: Clone>(storage: &InlineStorage<T>) -> usize {
+            match storage { InlineStorage::Owned(values) => values.capacity() * size_of::<T>(), InlineStorage::Shared(_) => 0 }
+        }
+        owned(&self.dense) + owned(&self.runs) + owned(&self.summary_blocks)
+            + self.replaced.capacity() * size_of::<ReplacedToken>()
+            + if matches!(self.dense, InlineStorage::Owned(_)) {
+                self.kp_plan.as_deref().map_or(0, |plans| plans.iter().filter_map(OnceLock::get).map(KpPlan::memory_usage_bytes).sum())
+            } else { 0 }
+    }
     pub(super) fn with_capacity(capacity: usize) -> Self {
         Self {
             dense: InlineStorage::with_capacity(capacity),

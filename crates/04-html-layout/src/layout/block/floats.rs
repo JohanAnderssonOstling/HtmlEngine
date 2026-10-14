@@ -1,4 +1,4 @@
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct FloatBand {
     pub left: f64,
     pub right: f64,
@@ -21,6 +21,14 @@ pub(crate) struct FloatPlacement {
 }
 
 impl FloatContext {
+    /// Exclusion geometry relative to a paragraph's placement. Translating a
+    /// complete formatting context preserves its paragraph layout dependency.
+    pub(crate) fn paragraph_bands(&self, origin: Point) -> Vec<FloatBand> {
+        self.bands.iter().filter(|band| band.bottom > origin.y).map(|band| FloatBand {
+            left: band.left - origin.x, right: band.right - origin.x,
+            top: band.top - origin.y, bottom: band.bottom - origin.y, side: band.side,
+        }).collect()
+    }
     pub(crate) fn is_empty(&self) -> bool {
         self.bands.is_empty()
     }

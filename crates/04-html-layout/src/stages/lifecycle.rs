@@ -1,7 +1,7 @@
 //! Prepared, shaped, and laid-out document lifecycle types.
 
 use super::*;
-use crate::layout::prepare_text_paint;
+use crate::layout::{LayoutScratch, prepare_text_paint};
 use crate::ReaderStyleOverrides;
 use crate::shaping::PreparedText;
 use std::sync::Arc;
@@ -781,10 +781,16 @@ impl ShapedDocument {
         image_metrics: &ImageMetrics,
         timings: Option<&mut crate::LayoutTimings>,
     ) -> LaidOutDocument {
+        self.layout_impl_with_scratch(constraints, image_metrics, timings, LayoutScratch::default())
+    }
+
+    pub(super) fn layout_impl_with_scratch(
+        self, constraints: LayoutConstraints, image_metrics: &ImageMetrics,
+        timings: Option<&mut crate::LayoutTimings>, mut layout_scratch: LayoutScratch,
+    ) -> LaidOutDocument {
         let mut layout_state = LayoutState::default();
         let mut geometry = BoxGeometry::default();
         let mut placement = crate::layout::PlacementState::default();
-        let mut layout_scratch = crate::layout::LayoutScratch::default();
         crate::layout::layout_with_timings(
             layout_inputs(&self.inputs, &self.shaped, image_metrics),
             crate::layout::LayoutOutputs {
@@ -832,6 +838,8 @@ fn layout_inputs<'a>(
         inline_plans: &shaped.inline_plans,
         image_metrics,
         paint: &inputs.paint,
+        text_style_ranges: &shaped.paint_ranges,
+        resource_generation: &shaped.resource_generation,
     }
 }
 
@@ -852,13 +860,13 @@ pub struct LaidOutDocument {
     pub(super) base_shaped: std::sync::Arc<ShapedText>,
     pub(super) shaped: std::sync::Arc<ShapedText>,
     pub(super) layout_state: LayoutState,
-    pub(super) layout_scratch: crate::layout::LayoutScratch,
+    pub(super) layout_scratch: LayoutScratch,
     pub(super) paint_colors: Arc<[PaintColorRun]>,
     pub(super) last_constraints: LayoutConstraints,
     pub(super) last_image_metrics: ImageMetrics,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) struct TextPaintRange {
     pub(crate) glyphs: std::ops::Range<u32>,
     pub(crate) style: StyleIndices,
@@ -1043,7 +1051,7 @@ impl LaidOutDocument {
             inputs: self.inputs.clone(),
             shaped: self.base_shaped.clone(),
         }
-        .layout_impl(constraints, image_metrics, None);
+        .layout_impl_with_scratch(constraints, image_metrics, None, std::mem::take(&mut self.layout_scratch));
         let shaping_seed = glyph_shaper.glyph_resources().snapshot();
         let needs_append = !first_line_style_ranges(&candidate).is_empty();
         let refine = |glyph_shaper: &mut _| {
@@ -1334,6 +1342,7 @@ impl LaidOutDocument {
             "LaidOutDocument.paint_colors.storage",
             self.paint_colors.len(), self.paint_colors.len(),
         );
+        report.extend_prefixed("LaidOutDocument.paragraph_layouts", self.layout_scratch.paragraph_layout_memory_report());
         report.add(
             "LaidOutDocument.inline_plans",
             self.shaped.inline_plans.memory_usage_bytes(),

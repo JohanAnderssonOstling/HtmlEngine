@@ -21,7 +21,7 @@ mod measurement;
 mod preparation;
 
 use alignment::{adjusted_line_metrics, build_token_placements};
-use emission::{inline_relative_position_offset, write_line_fragments};
+use emission::{inline_relative_position_offset, line_publishes, write_line_fragments};
 use measurement::{measure_line, summarize_token_span};
 pub(super) use preparation::pseudo_line_heights;
 use preparation::{
@@ -99,49 +99,29 @@ impl<'a> LineEmissionContext<'a> {
     }
 }
 
-/// Measures and emits broken lines, returning the final laid-out size.
-///
-/// This is the write-side pass of the pipeline. It turns `BrokenLine`
-/// records into measured line layouts and then writes document fragments.
-pub(super) fn emit_lines(
-    engine: &mut crate::layout::LayoutEngine<'_, '_>,
-    tokens: &InlineTokens,
-    input: &InlineFormattingInput,
-    overflow: InlineOverflow,
-    first_line_height: Option<f64>,
-    first_letter_height: Option<f64>,
-    lines: &[BrokenLine],
-) -> Size {
-    let timing_started = engine.start_timing();
-    let context = LineEmissionContext::new(
-        tokens,
-        input,
-        overflow,
-        first_line_height,
-        first_letter_height,
-    );
+/// Select local line measurements without writing chapter fragments.
+pub(super) fn prepare_lines(
+    engine: &crate::layout::LayoutEngine<'_, '_>, context: &LineEmissionContext<'_>, lines: &[BrokenLine],
+    mut prepared: Vec<PreparedLine>, mut adjustments: Vec<LineAdjustment>,
+) -> (Vec<PreparedLine>, Vec<LineAdjustment>, Size) {
+    prepared.clear();
+    prepared.reserve(lines.len());
+    adjustments.clear();
     let mut y = 0.0;
-    let mut max_width = 0.0f64;
-    for (line_index, line) in lines.iter().enumerate() {
-        let origin = Point::new(input.area.origin.x, input.area.origin.y + y);
-        let (width, height) = emit_line(engine, &context, line, line_index == 0, origin);
-        max_width = max_width.max(width);
+    let mut width = 0.0f64;
+    for (index, line) in lines.iter().enumerate() {
+        let (line, line_width, height) = prepare_line(engine, context, line, index == 0, Point::new(0.0, y), index, &mut adjustments);
+        prepared.push(line);
+        width = width.max(line_width);
         y += height;
     }
-    let size = Size::new(max_width, y);
-    engine.record_timing(|t| t.emit_lines += timing_started.elapsed());
-    size
+    (prepared, adjustments, Size::new(width, y))
 }
 
-/// Measures and publishes one selected line. Ordinary and float-constrained
-/// paragraphs share this write path; only their selected line geometry differs.
-pub(super) fn emit_line(
-    engine: &mut crate::layout::LayoutEngine<'_, '_>,
-    context: &LineEmissionContext<'_>,
-    line: &BrokenLine,
-    is_first_line: bool,
-    origin: Point,
-) -> (f64, f64) {
+pub(super) fn prepare_line(
+    engine: &crate::layout::LayoutEngine<'_, '_>, context: &LineEmissionContext<'_>, line: &BrokenLine,
+    is_first_line: bool, origin: Point, line_index: usize, adjustments: &mut Vec<LineAdjustment>,
+) -> (PreparedLine, f64, f64) {
     let tokens = context.tokens;
     let original_span = &tokens[line.start..line.end];
     let mut overflow_adjusted = Vec::new();
@@ -201,20 +181,33 @@ pub(super) fn emit_line(
         context.input.container_box_idx,
         context.input.area.width,
     );
-    let fragment_origin = Point::new(origin.x + line.indent, origin.y);
-    let paint_color = is_first_line
-        .then(|| first_line_color(engine, context.input.container_box_idx))
-        .flatten();
-    let height = write_line_fragments(
-        engine,
-        context.input.container_box_idx,
-        span,
-        line_runs,
-        &tokens.replaced,
-        fragment_origin,
-        &layout,
-        paint_color,
-        context.input.area.width,
-    );
-    (layout.width + line.indent, height)
+    let height = if line_publishes(engine, span, line_runs, &tokens.replaced, &layout) { layout.line_height } else { 0.0 };
+    let width = layout.width + line.indent;
+    let adjusted = span.as_ptr() != original_span.as_ptr() || span.len() != original_span.len();
+    let pseudo = line_runs.as_ptr() != tokens.runs.as_ptr();
+    if adjusted || pseudo {
+        adjustments.push(LineAdjustment {
+            line: line_index,
+            tokens: if pseudo { pseudo_adjusted.into_boxed_slice() } else { overflow_adjusted.into_boxed_slice() },
+            runs: pseudo.then(|| pseudo_runs.into_boxed_slice()),
+        });
+    }
+    (PreparedLine { tokens: line.start..line.end, origin: Point::new(origin.x + line.indent, origin.y), layout }, width, height)
+}
+
+/// Project a paragraph-local result into the current chapter placement. Image,
+/// atomic-box, decoration and absolute-anchor publication still runs here.
+pub(super) fn emit_prepared_paragraph(engine: &mut crate::layout::LayoutEngine<'_, '_>, input: &InlineFormattingInput, tokens: &InlineTokens, paragraph: &PreparedParagraph) {
+    let started = engine.start_timing();
+    let mut adjustments = paragraph.adjustments.iter().peekable();
+    for (index, line) in paragraph.lines.iter().enumerate() {
+        let adjustment = adjustments.peek().filter(|entry| entry.line == index).copied();
+        let span = adjustment.map_or_else(|| &tokens[line.tokens.clone()], |entry| entry.tokens.as_ref());
+        let runs = adjustment.and_then(|entry| entry.runs.as_deref()).unwrap_or(&tokens.runs);
+        let color = (index == 0).then(|| first_line_color(engine, input.container_box_idx)).flatten();
+        write_line_fragments(engine, input.container_box_idx, span, runs, &tokens.replaced,
+            input.area.origin + line.origin.to_vec2(), &line.layout, color, input.area.width);
+        if adjustment.is_some() { adjustments.next(); }
+    }
+    engine.record_timing(|timings| timings.emit_lines += started.elapsed());
 }

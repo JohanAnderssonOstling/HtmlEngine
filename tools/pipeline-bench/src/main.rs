@@ -404,6 +404,9 @@ fn main() {
     let mut inputs = input(std::fs::read_to_string(path).unwrap());
     inputs.base_uri = path.clone();
     inputs.markup_syntax = MarkupSyntax::from_uri(path);
+    if case.ends_with("_book") {
+        inputs.layout.text_composition_policy = TextCompositionPolicy::BookOptimized;
+    }
     let palette = args.get(4).map(String::as_str).unwrap_or("links");
     match palette {
         "foreground" => {
@@ -505,9 +508,27 @@ fn main() {
 
     let mut session = PipelineSession::new(Arc::new(FileSystemProvider));
     let mut shaper = Shaper::default();
-    if !matches!(case.as_str(), "cold" | "reader_load") {
+    if !matches!(case.as_str(), "cold" | "reader_load" | "cold_book") {
         session.update(inputs.clone(), &mut shaper).unwrap();
     }
+    // Use an existing figure rather than bullet icons; vary decoded intrinsic
+    // height while retaining source, width, CSS and all text inputs.
+    let image_metric = if case.starts_with("image") {
+        let doc = session.document().unwrap();
+        for (index, image) in doc.render_view().images().iter().enumerate() {
+            if let Some((width, height)) = html::resources::probe_dimensions(&FileSystemProvider, &image.source) {
+                inputs.image_metrics.set(index as u32, width, height);
+            }
+        }
+        let (index, image) = doc.render_view().images().iter().enumerate()
+            .find(|(index, _)| doc.render_view().image_uri(*index as u32).is_some_and(|uri| !uri.contains("square")))
+            .expect("real chapter contains a figure");
+        let (width, height) = inputs.image_metrics.get(index as u32).unwrap_or((image.width.max(1), image.height.max(1)));
+        let metric = (index as u32, width, height);
+        inputs.image_metrics_revision = inputs.image_metrics_revision.next();
+        session.update(inputs.clone(), &mut shaper).unwrap();
+        Some(metric)
+    } else { None };
     let mut view = if matches!(case.as_str(), "handoff" | "rehydrate") && !cfg!(feature = "borrowed-view") {
         session.document().cloned()
     } else {
@@ -528,12 +549,12 @@ fn main() {
     let mut allocated_bytes = Vec::with_capacity(count);
     for iteration in 0..count + 3 {
         match case.as_str() {
-            "cold" | "reader_load" => {
+            "cold" | "reader_load" | "cold_book" => {
                 view = None;
                 session = PipelineSession::new(Arc::new(FileSystemProvider));
                 shaper = Shaper::default();
             }
-            "resize" | "handoff" => {
+            "resize" | "handoff" | "resize_book" => {
                 inputs.layout.viewport_width = if iteration % 2 == 0 { 620.0 } else { 600.0 }
             }
             "paint" => {
@@ -545,6 +566,11 @@ fn main() {
             }
             "font" => inputs.font_environment = inputs.font_environment.next(),
             "rehydrate" => {},
+            "image" | "image_book" => {
+                let (index, width, height) = image_metric.unwrap();
+                inputs.image_metrics.set(index, width, if iteration % 2 == 0 {height + 80} else {height});
+                inputs.image_metrics_revision = inputs.image_metrics_revision.next();
+            },
             _ => panic!("unknown case"),
         }
         heap::reset();
@@ -586,7 +612,8 @@ fn main() {
     }
     let doc = session.document().unwrap();
     let reported = doc.memory_usage_bytes();
+    let paragraph_cache: Vec<_> = doc.memory_usage_report().entries.into_iter().filter(|entry| entry.label.contains("paragraph_layouts")).map(|entry| json!({"label":entry.label,"bytes":entry.bytes})).collect();
     let rss = peak_rss();
-    let output = json!({"case":case,"chapter":path.rsplit('/').next().unwrap(),"samples":count,"font_backend":"deterministic mock","heap_instrumented":cfg!(feature="heap"),"reader_borrows_layout":cfg!(feature="borrowed-view"),"wall_median_ms":median(&mut walls),"cpu_median_ms":median(&mut cpus),"user_instructions":if instructions.len()==count {Some(median(&mut instructions) as u64)} else {None},"heap_live_bytes":median(&mut retained) as usize,"heap_peak_bytes":median(&mut peaks) as usize,"allocation_requests":median(&mut allocations) as usize,"allocated_bytes":median(&mut allocated_bytes) as usize,"rss_peak_bytes":rss,"reported_document_bytes":reported,"glyphs":doc.render_view().text().glyph_count(),"lines":doc.render_view().text().line_count(),"render_fingerprint":format!("{:016x}",layout_fingerprint(doc)),"text_color_fingerprint":format!("{:016x}",text_color_fingerprint(doc,&shaper)),"source_fingerprint":format!("{:016x}",source_fingerprint(doc))});
+    let output = json!({"case":case,"chapter":path.rsplit('/').next().unwrap(),"samples":count,"font_backend":"deterministic mock","heap_instrumented":cfg!(feature="heap"),"reader_borrows_layout":cfg!(feature="borrowed-view"),"image_metric":image_metric,"paragraph_cache":paragraph_cache,"wall_median_ms":median(&mut walls),"cpu_median_ms":median(&mut cpus),"user_instructions":if instructions.len()==count {Some(median(&mut instructions) as u64)} else {None},"heap_live_bytes":median(&mut retained) as usize,"heap_peak_bytes":median(&mut peaks) as usize,"allocation_requests":median(&mut allocations) as usize,"allocated_bytes":median(&mut allocated_bytes) as usize,"rss_peak_bytes":rss,"reported_document_bytes":reported,"glyphs":doc.render_view().text().glyph_count(),"lines":doc.render_view().text().line_count(),"render_fingerprint":format!("{:016x}",layout_fingerprint(doc)),"text_color_fingerprint":format!("{:016x}",text_color_fingerprint(doc,&shaper)),"source_fingerprint":format!("{:016x}",source_fingerprint(doc))});
     println!("{output}");
 }

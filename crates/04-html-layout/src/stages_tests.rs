@@ -10,6 +10,122 @@ mod stage_tests {
     use std::sync::Arc;
     use html_style_model::{ComputedStylesBuildError, ComputedStylesBuilder, ComputedStylesValidationError};
 
+    fn paragraph_geometry_snapshot(document: &LaidOutDocument) -> Vec<String> {
+        let mut result = Vec::new();
+        let output = &document.layout_state.line_output;
+        for (index, line) in output.lines.iter().enumerate() {
+            result.push(format!("{:?}", (&line.glyphs, line.owner_box_idx, line.point, line.height, line.baseline, line.word_spacing, line.letter_spacing,
+                output.line_glyph_offsets.get(index).unwrap_or_default().iter().map(|run| (&run.range,run.offset)).collect::<Vec<_>>(), output.line_glyph_advances.get(index).unwrap_or_default().iter().map(|run| (&run.range,run.advance)).collect::<Vec<_>>(), document.render_view().text().line_overflow_clip(index))));
+        }
+        result.push(format!("{:?}", (&output.text_fragments, &output.inline_box_fragments, &output.prepared_text_run_fragments)));
+        for index in 0..document.box_count() {
+            result.push(format!("{:?}", (document.geometry.point(index), document.geometry.size(index))));
+        }
+        result.extend(document.render_view().fragments().decorations().iter().map(|decoration| format!("{decoration:?}")));
+        result.extend(document.render_view().fragments().images().iter().map(|image| format!("{image:?}")));
+        result.push(format!("{:?}", (0..document.glyphs().len()).map(|glyph| document.render_view().text().line_index_for_glyph(glyph as u32)).collect::<Vec<_>>()));
+        result
+    }
+
+    #[test]
+    fn image_height_changes_reposition_unchanged_paragraphs_without_recomposing_them() {
+        let mut factory = DocumentFactory::new();
+        let prepared = factory.parse_with_new_pipeline("<img src='top' style='display:block;width:40px'><p>one two three four five six seven eight nine ten</p><p>more words across several lines of text</p>", None);
+        let constraints = LayoutConstraints::new(160.0, 20.0).unwrap();
+        let mut metrics = ImageMetrics::default(); metrics.set(0, 40, 10);
+        let mut document = prepared.shape(&mut TestGlyphShaper::new()).unwrap().layout_with_metrics(constraints, &metrics);
+        let old_y = document.layout_state.line_output.lines.last().unwrap().point.y;
+        let before = document.layout_scratch.paragraph_reuse_counts();
+        metrics.set(0, 40, 60);
+        document.relayout_with_metrics(constraints, &metrics);
+        let after = document.layout_scratch.paragraph_reuse_counts();
+        assert!(after.0 >= before.0 + 2, "both unchanged text paragraphs must reuse local line layout");
+        assert!(after.1 > before.1, "the changed image paragraph must be measured again");
+        assert!(document.layout_state.line_output.lines.last().unwrap().point.y > old_y);
+        let mut reference = document.clone();
+        reference.relayout_with_metrics(constraints, &metrics);
+        assert_eq!(paragraph_geometry_snapshot(&document), paragraph_geometry_snapshot(&reference));
+    }
+
+    #[test]
+    fn translated_float_contexts_reuse_lines_but_changed_exclusion_heights_recompose() {
+        let mut factory = DocumentFactory::new();
+        let source = "<img src='top' style='display:block;width:40px'><section style='display:flow-root'><img src='float' style='float:left;width:60px'><p>one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen</p></section>";
+        let constraints = LayoutConstraints::new(180.0, 20.0).unwrap();
+        let mut metrics = ImageMetrics::default();metrics.set(0,40,10);metrics.set(1,60,70);
+        let mut document = factory.parse_with_new_pipeline(source,None).shape(&mut TestGlyphShaper::new()).unwrap().layout_with_metrics(constraints,&metrics);
+        let before = document.layout_scratch.paragraph_reuse_counts();
+        metrics.set(0,40,50);
+        document.relayout_with_metrics(constraints,&metrics);
+        let translated = document.layout_scratch.paragraph_reuse_counts();
+        assert!(translated.0 > before.0, "translating the whole context preserves its relative float profile");
+        let mut reference = document.clone();reference.relayout_with_metrics(constraints,&metrics);
+        assert_eq!(paragraph_geometry_snapshot(&document),paragraph_geometry_snapshot(&reference));
+        metrics.set(1,60,150);
+        document.relayout_with_metrics(constraints,&metrics);
+        let changed = document.layout_scratch.paragraph_reuse_counts();
+        assert!(changed.1 > translated.1,"changed float lanes must invalidate dependent line layout");
+        let mut reference = document.clone();reference.relayout_with_metrics(constraints,&metrics);
+        assert_eq!(paragraph_geometry_snapshot(&document),paragraph_geometry_snapshot(&reference));
+    }
+
+    #[test]
+    fn retained_paragraph_layout_matches_uncached_tables_pseudos_overflow_and_width_changes() {
+        let sources = [
+            "<table style='width:100%'><tr><td><p>table text with <img src='x' style='width:40%'> a changing image</p></td><td>another cell with several words that wrap</td></tr></table>",
+            "<p>before <span style='display:inline-block;width:50%'><table><tr><td>nested table words</td></tr></table></span> after <img src='x' style='width:30px'></p>",
+            "<style>p::first-line{font-size:24px;line-height:1.4}p::first-letter{font-size:28px}p::before{content:'G'}</style><img src='x' style='display:block;width:20px'><p>one two three four five six seven eight nine ten</p>",
+            "<p style='white-space:nowrap;overflow:hidden;text-overflow:ellipsis'>some text that overflows</p><p style='white-space:pre-wrap'>a\tb c\nnext line</p>",
+        ];
+        for source in sources {
+            let mut factory=DocumentFactory::new();let mut shaper=TestGlyphShaper::new();let mut metrics=ImageMetrics::default();metrics.set(0,40,30);
+            let initial=LayoutConstraints::new(180.0,20.0).unwrap();
+            let mut document=factory.parse_with_new_pipeline(source,None).shape(&mut shaper).unwrap().layout_with_metrics_and_shaper(initial,&metrics,&mut shaper).unwrap();
+            let before=document.layout_scratch.paragraph_reuse_counts();
+            for (width,height,policy) in [(180.0,60,TextCompositionPolicy::WebCompatible),(120.0,60,TextCompositionPolicy::BookOptimized),(180.0,60,TextCompositionPolicy::WebCompatible),(180.0,60,TextCompositionPolicy::WebCompatible)] {
+                let constraints=LayoutConstraints::new(width,20.0).unwrap().with_text_composition_policy(policy);
+                metrics.set(0,40,height);
+                document.relayout_with_metrics_and_shaper(constraints,&metrics,&mut shaper).unwrap();
+                let mut reference=document.clone();reference.layout_scratch.clear_paragraph_layouts();
+                reference.relayout_with_metrics_and_shaper(constraints,&metrics,&mut shaper).unwrap();
+                assert_eq!(paragraph_geometry_snapshot(&document),paragraph_geometry_snapshot(&reference),"{source}");
+            }
+            assert!(document.layout_scratch.paragraph_reuse_counts().0>before.0,"repeated dependencies must reuse paragraph results: {source}");
+        }
+    }
+
+    #[test]
+    fn intrinsic_table_probes_do_not_displace_published_paragraph_results() {
+        let mut factory=DocumentFactory::new();
+        let source="<img src='top' style='display:block;width:40px'><table style='width:160px'><tr><td><p id='cell'>some words that wrap inside this table cell</p></td></tr></table>";
+        let constraints=LayoutConstraints::new(200.0,20.0).unwrap();
+        let mut metrics=ImageMetrics::default();metrics.set(0,40,10);
+        let mut document=factory.parse_with_new_pipeline(source,None).shape(&mut TestGlyphShaper::new()).unwrap().layout_with_metrics(constraints,&metrics);
+        let owner=(0..document.box_count()).find(|&index| document.inputs.layout_tree.get_box_dom_element(index).and_then(|raw| document.inputs.document.node_id_from_raw(raw)).is_some_and(|node| document.inputs.document.get_dom_id(node)==Some("cell"))).unwrap();
+        let before=document.layout_scratch.paragraph_published_hits(owner);
+        metrics.set(0,40,60);
+        document.relayout_with_metrics(constraints,&metrics);
+        assert!(document.layout_scratch.paragraph_published_hits(owner)>before,"measurement widths must not evict the cell's actual paragraph layout");
+        let mut reference=document.clone();reference.relayout_with_metrics(constraints,&metrics);
+        assert_eq!(paragraph_geometry_snapshot(&document),paragraph_geometry_snapshot(&reference));
+    }
+
+    #[test]
+    fn paragraph_result_retention_stays_bounded_across_many_width_variants() {
+        let paragraph = format!("<p>{}</p>", "one two three four five six seven eight ".repeat(12));
+        let source = paragraph.repeat(1000);
+        let mut factory = DocumentFactory::new();
+        let mut document = factory.parse_with_new_pipeline(&source, None).shape(&mut TestGlyphShaper::new()).unwrap().layout(LayoutConstraints::new(120.0,20.0).unwrap());
+        for width in [160.0,120.0,200.0,120.0] {
+            document.relayout(LayoutConstraints::new(width,20.0).unwrap());
+            assert!(document.layout_scratch.paragraph_layout_bytes() < 5 * 1024 * 1024,
+                "retained results have a 4 MiB budget plus bounded slot metadata");
+        }
+        let mut reference=document.clone();reference.relayout(document.last_constraints);
+        assert_eq!(document.line_count(),reference.line_count());
+        assert_eq!(document.layout_state.line_output.lines.last().unwrap().point,reference.layout_state.line_output.lines.last().unwrap().point);
+    }
+
     #[test]
     fn resizing_switches_glyph_line_width_without_losing_ownership_or_snapshots() {
         const ROWS: usize = 32_800;

@@ -61,6 +61,8 @@ pub(crate) fn layout_with_timings(
         reader,
         text,
         inline_plans: inputs.inline_plans,
+        text_style_ranges: inputs.text_style_ranges,
+        resource_generation: inputs.resource_generation,
     };
     let mut context = LayoutEngine::new(
         read,
@@ -95,6 +97,7 @@ pub(crate) struct LayoutScratch {
     measurement: MeasurementScratch,
     finalization: FinalizationScratch,
     paragraphs: Vec<super::inline::ParagraphScratch>,
+    paragraph_layouts: super::inline::ParagraphLayouts,
     line_owners: Vec<u32>,
     block_decoration_owners: Vec<u32>,
 }
@@ -108,6 +111,15 @@ impl Clone for LayoutScratch {
 }
 
 impl LayoutScratch {
+    #[cfg(test)]
+    pub(crate) fn paragraph_layout_bytes(&self) -> usize { self.paragraph_layouts.memory_usage_bytes() }
+    pub(crate) fn paragraph_layout_memory_report(&self) -> html_dom::MemoryUsageReport { self.paragraph_layouts.memory_usage_report() }
+    #[cfg(test)]
+    pub(crate) fn paragraph_reuse_counts(&self) -> (usize, usize) { self.paragraph_layouts.reuse_counts() }
+    #[cfg(test)]
+    pub(crate) fn clear_paragraph_layouts(&mut self) { self.paragraph_layouts = Default::default(); }
+    #[cfg(test)]
+    pub(crate) fn paragraph_published_hits(&self, box_idx: usize) -> usize { self.paragraph_layouts.published_hits(box_idx) }
     #[cfg(test)]
     pub(crate) fn paragraph_capacities(&self) -> Vec<(usize, (usize, usize, usize))> {
         self.paragraphs.iter().map(super::inline::ParagraphScratch::capacities).collect()
@@ -140,6 +152,8 @@ pub(crate) struct LayoutInputs<'a> {
     pub(crate) inline_plans: &'a crate::layout::PreparedInlinePlans,
     pub(crate) image_metrics: &'a crate::ImageMetrics,
     pub(crate) paint: &'a crate::stages::PaintStyles,
+    pub(crate) text_style_ranges: &'a [crate::stages::TextPaintRange],
+    pub(crate) resource_generation: &'a crate::GlyphResourceGeneration,
 }
 
 pub(crate) struct LayoutOutputs<'out, 'scratch> {
@@ -202,6 +216,9 @@ pub(crate) struct LayoutEngine<'a, 'out> {
     pub(super) measurement: MeasurementScratch,
     pub(super) finalization: FinalizationScratch,
     pub(super) paragraphs: Vec<super::inline::ParagraphScratch>,
+    pub(super) paragraph_layouts: super::inline::ParagraphLayouts,
+    pub(super) text_style_ranges: &'a [crate::stages::TextPaintRange],
+    pub(super) resource_generation: &'a crate::GlyphResourceGeneration,
     pub(super) track_overflow_clips: bool,
     fragmentation_suppression_depth: usize,
     pub(crate) reader: LayoutReader<'a>,
@@ -234,6 +251,9 @@ impl<'a, 'out> LayoutEngine<'a, 'out> {
             measurement: std::mem::take(&mut scratch.measurement),
             finalization: std::mem::take(&mut scratch.finalization),
             paragraphs: std::mem::take(&mut scratch.paragraphs),
+            paragraph_layouts: std::mem::take(&mut scratch.paragraph_layouts),
+            text_style_ranges: read.text_style_ranges,
+            resource_generation: read.resource_generation,
             track_overflow_clips: read.track_overflow_clips,
             reader: read.reader,
             text: read.text,
@@ -263,6 +283,7 @@ impl<'a, 'out> LayoutEngine<'a, 'out> {
         scratch.measurement = std::mem::take(&mut self.measurement);
         scratch.finalization = std::mem::take(&mut self.finalization);
         scratch.paragraphs = std::mem::take(&mut self.paragraphs);
+        scratch.paragraph_layouts = std::mem::take(&mut self.paragraph_layouts);
     }
 
     pub(crate) fn parallel_measurement_context(&self) -> LayoutReadContext<'a> {
@@ -271,6 +292,8 @@ impl<'a, 'out> LayoutEngine<'a, 'out> {
             reader: self.reader.clone(),
             text: self.text,
             inline_plans: self.inline_plans,
+            text_style_ranges: self.text_style_ranges,
+            resource_generation: self.resource_generation,
             track_overflow_clips: self.track_overflow_clips,
         }
     }
@@ -385,6 +408,8 @@ pub(crate) struct LayoutReadContext<'a> {
     reader: LayoutReader<'a>,
     text: InlineReader<'a>,
     inline_plans: &'a crate::layout::PreparedInlinePlans,
+    text_style_ranges: &'a [crate::stages::TextPaintRange],
+    resource_generation: &'a crate::GlyphResourceGeneration,
     track_overflow_clips: bool,
 }
 
@@ -460,7 +485,7 @@ pub(crate) fn repaint(inputs: LayoutInputs<'_>, geometry: &mut BoxGeometry, stat
     let mut scratch = LayoutScratch::default();
     let reader = LayoutReader::new(inputs.document, inputs.styles, inputs.topology, inputs.inline_content, inputs.glyph_metrics, inputs.font_metrics, inputs.image_metrics).with_paint(inputs.paint);
     let text = InlineReader::new(inputs.inline_content, inputs.glyph_metrics, inputs.text_geometry, inputs.ellipsis_glyphs, inputs.hyphen_glyphs);
-    let read = LayoutReadContext { config: LayoutConfig::new(constraints), track_overflow_clips: reader.tracks_overflow_clips(), reader, text, inline_plans: inputs.inline_plans };
+    let read = LayoutReadContext { config: LayoutConfig::new(constraints), track_overflow_clips: reader.tracks_overflow_clips(), reader, text, inline_plans: inputs.inline_plans, text_style_ranges: inputs.text_style_ranges, resource_generation: inputs.resource_generation };
     let mut engine = LayoutEngine::new(read, LayoutOutputs { geometry, state, placement: &mut placement, scratch: &mut scratch }, None, 0);
     engine.repaint();
 }

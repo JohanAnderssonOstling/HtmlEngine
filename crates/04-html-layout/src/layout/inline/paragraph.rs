@@ -9,21 +9,21 @@ pub(in crate::layout) struct InlineFormattingInput {
     pub(in crate::layout) paragraph: ParagraphLayout,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub(in crate::layout) struct InlineLayoutArea {
     pub(in crate::layout) origin: Point,
     pub(in crate::layout) width: f64,
     pub(in crate::layout) percentage_height_basis: Option<f64>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub(in crate::layout) struct ParagraphLayout {
     pub(in crate::layout) indent: ResolvedTextIndent,
     pub(in crate::layout) text_align: TextAlign,
     pub(in crate::layout) text_align_last: TextAlign,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub(in crate::layout) struct ResolvedTextIndent {
     pub(in crate::layout) amount: f64,
     pub(in crate::layout) hanging: bool,
@@ -224,15 +224,16 @@ pub(super) fn prepare_inline_tokens(engine: &mut crate::layout::LayoutEngine<'_,
     (tokens, has_float_exclusions)
 }
 
-/// Selects and emits lines whose available interval changes around floats.
-pub(super) fn layout_inline_content_around_float_exclusions(
+/// Selects and measures lines whose available interval changes around floats.
+pub(super) fn prepare_lines_around_float_exclusions(
     engine: &mut crate::layout::LayoutEngine<'_, '_>,
     input: &InlineFormattingInput,
     tokens: &InlineTokens,
     overflow: InlineOverflow,
     first_line_height: Option<f64>,
     first_letter_height: Option<f64>,
-) -> Size {
+    mut lines: Vec<PreparedLine>, mut adjustments: Vec<LineAdjustment>,
+) -> (Vec<PreparedLine>, Vec<LineAdjustment>, Size) {
     let timing_started = engine.start_timing();
     let emission = LineEmissionContext::new(
         tokens,
@@ -241,6 +242,8 @@ pub(super) fn layout_inline_content_around_float_exclusions(
         first_line_height,
         first_letter_height,
     );
+    lines.clear();
+    adjustments.clear();
     let mut y = 0.0;
     let mut max_width = 0.0f64;
     let mut start = 0usize;
@@ -345,8 +348,9 @@ pub(super) fn layout_inline_content_around_float_exclusions(
             .flatten();
 
         if let Some(line) = result.line {
-            let line_origin = Point::new(left, input.area.origin.y + y);
-            let (width, height) = emit_line(engine, &emission, &line, is_first_line, line_origin);
+            let line_origin = Point::new(left - input.area.origin.x, y);
+            let (line, width, height) = prepare_line(engine, &emission, &line, is_first_line, line_origin, lines.len(), &mut adjustments);
+            lines.push(line);
             max_width = max_width.max(width);
             y += height;
             is_first_line = false;
@@ -375,7 +379,7 @@ pub(super) fn layout_inline_content_around_float_exclusions(
     engine.record_timing(|timing| {
         timing.layout_runs_around_float_exclusions += timing_started.elapsed()
     });
-    size
+    (lines, adjustments, size)
 }
 
 fn place_float_anchor(
