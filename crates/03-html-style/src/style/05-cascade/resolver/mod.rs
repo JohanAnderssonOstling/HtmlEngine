@@ -200,6 +200,7 @@ fn apply_renderer_markers<'sheet, 'css>(
 
 struct ResolutionContext {
     environment: crate::MediaEnvironment,
+    font_size_scale: f32,
     uses_viewport_units: Cell<bool>,
     line_height: Cell<Option<f32>>,
     root_line_height: Cell<Option<f32>>,
@@ -209,10 +210,35 @@ impl ResolutionContext {
     fn new(environment: crate::MediaEnvironment) -> Self {
         Self {
             environment,
+            font_size_scale: 1.0,
             uses_viewport_units: Cell::new(false),
             line_height: Cell::new(None),
             root_line_height: Cell::new(None),
         }
+    }
+
+    /// Evaluate typography in canonical coordinates before scaling the result.
+    /// Parent and root sizes have already been scaled by earlier resolutions.
+    fn with_canonical_font_sizes<T>(&self, resolve: impl FnOnce(&Self) -> T) -> T {
+        if self.font_size_scale == 1.0 {
+            return resolve(self);
+        }
+        let canonical = Self {
+            environment: self.environment,
+            font_size_scale: 1.0,
+            uses_viewport_units: Cell::new(false),
+            line_height: Cell::new(
+                self.line_height.get().map(|value| value / self.font_size_scale),
+            ),
+            root_line_height: Cell::new(
+                self.root_line_height.get().map(|value| value / self.font_size_scale),
+            ),
+        };
+        let result = resolve(&canonical);
+        if canonical.uses_viewport_units.get() {
+            self.uses_viewport_units.set(true);
+        }
+        result
     }
 }
 
@@ -224,7 +250,13 @@ pub(crate) fn resolve_styles_for_dom_timed(
     shared_inline_styles: &Arc<Mutex<ParsedInlineStyleCache>>,
     reader_overrides: &ReaderStyleOverrides,
 ) -> (ComputedStyles, ResolveStyleTimings) {
-    let resolution = ResolutionContext::new(prepared.environment());
+    let mut resolution = ResolutionContext::new(prepared.environment());
+    resolution.font_size_scale = reader_overrides
+        .canonical_font_size
+        .filter(|size| size.is_finite() && *size > 0.0)
+        .map(|size| doc.root_font_size() / size)
+        .filter(|scale| scale.is_finite() && *scale > 0.0)
+        .unwrap_or(1.0);
     let mut timings = ResolveStyleTimings::default();
 
     // Process each DOM element

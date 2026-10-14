@@ -81,6 +81,8 @@ pub(super) fn sort_lines_and_remap_images(
     let mut lines = std::mem::take(&mut layout.line_output.lines);
     let mut offsets_by_line = std::mem::take(&mut layout.line_output.line_glyph_offsets);
     let mut advances_by_line = std::mem::take(&mut layout.line_output.line_glyph_advances);
+    offsets_by_line.freeze();
+    advances_by_line.freeze();
     assert_eq!(
         owners.len(),
         lines.len(),
@@ -91,19 +93,13 @@ pub(super) fn sort_lines_and_remap_images(
     line_pairs.extend(lines.drain(..).enumerate().map(|(idx, line)| {
         (
             line,
-            offsets_by_line
-                .get_mut(idx)
-                .map(std::mem::take)
-                .unwrap_or_default(),
-            advances_by_line
-                .get_mut(idx)
-                .map(std::mem::take)
-                .unwrap_or_default(),
+            offsets_by_line.range(idx),
+            advances_by_line.range(idx),
             idx,
         )
     }));
-    offsets_by_line.clear();
-    advances_by_line.clear();
+    offsets_by_line.clear_ranges();
+    advances_by_line.clear_ranges();
 
     // CSS paint order and document geometry are different orderings. Keep a
     // compact paint traversal, but store the lines themselves top-to-bottom;
@@ -182,8 +178,8 @@ pub(super) fn sort_lines_and_remap_images(
 
     for (line, offsets, advances, _) in line_pairs.drain(..) {
         lines.push(line);
-        offsets_by_line.push(offsets);
-        advances_by_line.push(advances);
+        offsets_by_line.push_range(offsets);
+        advances_by_line.push_range(advances);
     }
     layout.line_output.lines = lines;
     layout.line_output.line_glyph_offsets = offsets_by_line;
@@ -322,34 +318,19 @@ pub(super) fn build_block_decoration_traversal(
 
 pub(super) fn rebuild_image_fragments_by_line(fragments: &mut FragmentWriter<'_>) {
     let layout = fragments.state_mut();
-    layout
-        .fragment_output
-        .image_fragments_by_line
-        .resize_with(layout.line_output.lines.len(), Vec::new);
-    layout
-        .fragment_output
-        .image_fragments_by_line
-        .truncate(layout.line_output.lines.len());
-    for (idx, frag) in layout.fragment_output.image_fragments.iter().enumerate() {
-        if let Some(line) = layout
-            .fragment_output
-            .image_fragments_by_line
-            .get_mut(frag.line_idx)
-        {
-            line.push(idx);
-        }
+    let by_line = &mut layout.fragment_output.image_fragments_by_line;
+    by_line.reset_groups(layout.line_output.lines.len());
+    for (idx, fragment) in layout.fragment_output.image_fragments.iter().enumerate() {
+        if fragment.line_idx < by_line.len() { by_line.push_to(fragment.line_idx, idx); }
     }
+    by_line.freeze();
 }
 
 pub(super) fn rebuild_decoration_fragments_by_line(fragments: &mut FragmentWriter<'_>) {
     let layout = fragments.state_mut();
     let paint_orders = &layout.fragment_output.decoration_paint_orders;
     let by_line = &mut layout.fragment_output.decoration_fragments_by_line;
-    by_line.resize_with(layout.line_output.lines.len(), Vec::new);
-    by_line.truncate(layout.line_output.lines.len());
-    for indexes in by_line.iter_mut() {
-        indexes.clear();
-    }
+    by_line.reset_groups(layout.line_output.lines.len());
 
     let block_count = layout.fragment_output.block_decoration_count as usize;
     let traversal = layout
@@ -406,8 +387,8 @@ pub(super) fn rebuild_decoration_fragments_by_line(fragments: &mut FragmentWrite
                     .copied()
                     .unwrap_or(false);
         if same_paint_layer {
-            if let Some(line) = by_line.get_mut(line_idx as usize) {
-                line.push(decoration_idx);
+            if (line_idx as usize) < by_line.len() {
+                by_line.push_to(line_idx as usize, decoration_idx);
             }
         } else if let Some(owner) = layout
             .fragment_output
@@ -420,7 +401,9 @@ pub(super) fn rebuild_decoration_fragments_by_line(fragments: &mut FragmentWrite
             *owner = u32::MAX;
         }
     }
-    for indexes in by_line.iter_mut() {
+    by_line.freeze();
+    for line_idx in 0..by_line.len() {
+        let indexes = by_line.get_mut(line_idx).expect("valid line group");
         // `traversal` already carries CSS tree order (ancestor backgrounds
         // before descendant backgrounds). Keep that stable order when an
         // atomic inline assigns the same token paint slot to its whole
@@ -431,17 +414,13 @@ pub(super) fn rebuild_decoration_fragments_by_line(fragments: &mut FragmentWrite
 }
 
 pub(super) fn rebuild_glyph_line_indices(glyph_count: usize, fragments: &mut FragmentWriter<'_>) {
-    const NO_LINE: u32 = u32::MAX;
     let layout = fragments.state_mut();
     layout
         .line_output
         .glyph_line_indices
-        .resize(glyph_count, NO_LINE);
-    layout.line_output.glyph_line_indices.fill(NO_LINE);
+        .reset(glyph_count, layout.line_output.lines.len());
 
     for (line_idx, line) in layout.line_output.lines.iter().enumerate() {
-        let line_idx =
-            u32::try_from(line_idx).expect("layout line count exceeds glyph-line index capacity");
         let mut assign = |range: &Range<u32>| {
             let start = usize::try_from(range.start)
                 .unwrap_or(usize::MAX)
@@ -450,11 +429,11 @@ pub(super) fn rebuild_glyph_line_indices(glyph_count: usize, fragments: &mut Fra
                 .unwrap_or(usize::MAX)
                 .min(glyph_count);
             if start < end {
-                layout.line_output.glyph_line_indices[start..end].fill(line_idx);
+                layout.line_output.glyph_line_indices.assign(start..end, line_idx);
             }
         };
-        if let Some(fragments) = &line.text_fragments {
-            for fragment in fragments.iter() {
+        if let Some(range) = line.text_fragment_range(&layout.line_output.line_details) {
+            for fragment in &layout.line_output.text_fragments[range.start as usize..range.end as usize] {
                 assign(&fragment.glyphs);
             }
         } else {

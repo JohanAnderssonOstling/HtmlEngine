@@ -1,12 +1,13 @@
+use crate::stages::PaintColorRun;
 use std::ops::Range;
 
 use kurbo::Point;
 
 use crate::layout::fragment_writer::FragmentWriter;
 use crate::layout::inline_reader::InlineReader;
-use crate::layout_model::{GlyphAdvanceRun, GlyphOffsetRun, Line, PreparedTextRunFragment};
+use crate::layout_model::{GlyphAdvanceRun, GlyphOffsetRun, Line, LineDetails, LineTextFragment, PreparedTextRunFragment};
 
-pub(super) fn prepare_line_text_runs(text: &InlineReader<'_>, fragments: &mut FragmentWriter<'_>) {
+pub(super) fn prepare_line_text_runs(text: &InlineReader<'_>, fragments: &mut FragmentWriter<'_>, colors: &[PaintColorRun]) {
     let output = &mut fragments.state_mut().line_output;
     output.prepared_text_run_fragments.clear();
     for line_idx in 0..output.lines.len() {
@@ -14,15 +15,18 @@ pub(super) fn prepare_line_text_runs(text: &InlineReader<'_>, fragments: &mut Fr
         let complete = prepare_line(
             text,
             &output.lines[line_idx],
+            &output.line_details,
+            &output.text_fragments,
             output
                 .line_glyph_offsets
                 .get(line_idx)
-                .map_or(&[], Vec::as_slice),
+                .unwrap_or(&[]),
             output
                 .line_glyph_advances
                 .get(line_idx)
-                .map_or(&[], Vec::as_slice),
+                .unwrap_or(&[]),
             &mut output.prepared_text_run_fragments,
+            colors,
         )
         .is_some();
         if !complete {
@@ -36,35 +40,14 @@ pub(super) fn prepare_line_text_runs(text: &InlineReader<'_>, fragments: &mut Fr
     }
 }
 
-fn prepare_line(
-    text: &InlineReader<'_>,
-    line: &Line,
-    offsets: &[GlyphOffsetRun],
-    advances: &[GlyphAdvanceRun],
-    prepared: &mut Vec<PreparedTextRunFragment>,
-) -> Option<()> {
-    if let Some(fragments) = &line.text_fragments {
-        for fragment in fragments.iter().filter(|fragment| fragment.visible) {
-            prepare_fragment(
-                text,
-                line,
-                fragment.glyphs.clone(),
-                fragment.offset_x,
-                offsets,
-                advances,
-                prepared,
-            )?;
+fn prepare_line(text: &InlineReader<'_>, line: &Line, details: &[LineDetails], text_fragments: &[LineTextFragment], offsets: &[GlyphOffsetRun], advances: &[GlyphAdvanceRun], prepared: &mut Vec<PreparedTextRunFragment>, colors: &[PaintColorRun]) -> Option<()> {
+    let optical_offset_x = line.optical_offset_x(details);
+    if let Some(range) = line.text_fragment_range(details) {
+        for fragment in text_fragments[range.start as usize..range.end as usize].iter().filter(|fragment| fragment.visible) {
+            prepare_fragment(text, line, fragment.glyphs.clone(), fragment.offset_x, offsets, advances, prepared, colors, optical_offset_x)?;
         }
     } else if !line.glyphs.is_empty() {
-        prepare_fragment(
-            text,
-            line,
-            line.glyphs.clone(),
-            0.0,
-            offsets,
-            advances,
-            prepared,
-        )?;
+        prepare_fragment(text, line, line.glyphs.clone(), 0.0, offsets, advances, prepared, colors, optical_offset_x)?;
     }
 
     Some(())
@@ -72,16 +55,10 @@ fn prepare_line(
 
 #[allow(clippy::too_many_arguments)]
 fn prepare_fragment(
-    text: &InlineReader<'_>,
-    line: &Line,
-    source_range: Range<u32>,
-    fragment_offset_x: f64,
-    offsets: &[GlyphOffsetRun],
-    advances: &[GlyphAdvanceRun],
-    prepared: &mut Vec<PreparedTextRunFragment>,
+    text: &InlineReader<'_>, line: &Line, source_range: Range<u32>, fragment_offset_x: f64, offsets: &[GlyphOffsetRun], advances: &[GlyphAdvanceRun], prepared: &mut Vec<PreparedTextRunFragment>, colors: &[PaintColorRun], optical_offset_x: f64,
 ) -> Option<()> {
     let mut expected = source_range.start;
-    let mut x = line.optical_offset_x + fragment_offset_x;
+    let mut x = optical_offset_x + fragment_offset_x;
     let mut offset_index =
         offsets.partition_point(|candidate| candidate.range.end <= source_range.start);
     let mut advance_index =
@@ -105,7 +82,7 @@ fn prepare_fragment(
 
         let local_start = start - run.source_range.start;
         let mut natural_x = f64::from(*run.caret_stops.get(local_start as usize)?);
-        let mut segment: Option<(u32, u32, Point)> = None;
+        let mut segment: Option<(u32, u32, Point, Option<u32>)> = None;
 
         for index in start..end {
             let glyph = text.glyph(index)?;
@@ -139,16 +116,16 @@ fn prepare_fragment(
                 line.baseline - f64::from(run.ascent) - offset,
             );
             let paints = advance_override.is_none() && metric.ch() != '\u{00ad}';
+            let paint_index = colors.partition_point(|run| run.glyphs.end <= index);
+            let color = colors.get(paint_index).filter(|run| run.glyphs.contains(&index)).map(|run| run.color);
             if paints {
                 match segment.as_mut() {
-                    Some((_, segment_end, segment_origin))
-                        if *segment_end == local_index && *segment_origin == run_origin =>
-                    {
+                    Some((_, segment_end, segment_origin, segment_color)) if *segment_end == local_index && *segment_origin == run_origin && (*segment_color == color || !text.is_cluster_boundary(index as usize)) => {
                         *segment_end = local_index + 1;
                     }
                     _ => {
                         flush_segment(run.backend_run, &mut segment, prepared);
-                        segment = Some((local_index, local_index + 1, run_origin));
+                        segment = Some((local_index, local_index + 1, run_origin, color));
                     }
                 }
             } else {
@@ -180,16 +157,15 @@ fn prepare_fragment(
     (expected == source_range.end).then_some(())
 }
 
-fn flush_segment(
-    run: crate::TextRunId,
-    segment: &mut Option<(u32, u32, Point)>,
-    prepared: &mut Vec<PreparedTextRunFragment>,
-) {
-    if let Some((start, end, offset)) = segment.take() {
-        prepared.push(PreparedTextRunFragment {
-            run,
-            range: start..end,
-            offset,
-        });
+fn flush_segment(run: crate::TextRunId, segment: &mut Option<(u32, u32, Point, Option<u32>)>, prepared: &mut Vec<PreparedTextRunFragment>) {
+    if let Some((start, end, offset, color)) = segment.take() {
+        prepared.push(PreparedTextRunFragment { run, range: start..end, offset, color });
     }
+}
+
+/// Refresh native paint slices after a color update, without rebuilding lines.
+pub(crate) fn prepare_text_paint(inputs: crate::layout::LayoutInputs<'_>, state: &mut crate::layout_model::LayoutState, colors: &[PaintColorRun]) {
+    let text = InlineReader::new(inputs.inline_content, inputs.glyph_metrics, inputs.text_geometry, inputs.ellipsis_glyphs, inputs.hyphen_glyphs);
+    let mut fragments = FragmentWriter::new(state, Vec::new(), Vec::new());
+    prepare_line_text_runs(&text, &mut fragments, colors);
 }

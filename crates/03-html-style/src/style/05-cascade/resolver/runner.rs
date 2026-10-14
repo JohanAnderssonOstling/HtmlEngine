@@ -90,11 +90,11 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
         parent: &ParentStyle,
     ) {
         if selection.reverted_hint_targets.is_empty() && !selection.reverted_all_hints {
-            html_presentational_hints::apply(self.doc, node, style, phase);
+            html_presentational_hints::apply(self.doc, node, style, phase, self.resolution.font_size_scale);
             return;
         }
         let before = style.clone();
-        html_presentational_hints::apply(self.doc, node, style, phase);
+        html_presentational_hints::apply(self.doc, node, style, phase, self.resolution.font_size_scale);
         if selection.reverted_all_hints {
             // `all` excludes direction. Preserve that hint while rolling back
             // every other presentation-hint property.

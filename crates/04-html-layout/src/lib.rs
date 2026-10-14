@@ -3,19 +3,24 @@
 
 mod layout_model {
     mod geometry;
+    mod grouped_arena;
+    mod glyph_line_indices;
     mod glyph_metrics;
     mod inline;
     mod layout_state;
     mod layout_tree;
+    mod source_offsets;
 
     pub(crate) use geometry::BoxGeometry;
+    pub(crate) use grouped_arena::GroupedArena;
     pub(crate) use glyph_metrics::GlyphMetrics;
     pub use glyph_metrics::{GlyphMetric, GlyphMetricError};
     pub use inline::GlyphId;
     pub(crate) use inline::{InlineContent, InlineItem, InlineItemKind, WhitespaceWrapOverride};
+    pub(crate) use source_offsets::SourceOffsets;
     pub(crate) use layout_state::{
         AnchorPosition, DecorationFragment, DecorationPattern, DecorationStore, EllipsisFragment,
-        GlyphAdvanceRun, GlyphOffsetRun, HyphenFragment, ImageFragment, LayoutState, Line,
+        GlyphAdvanceRun, GlyphOffsetRun, HyphenFragment, ImageFragment, LayoutState, Line, LineDetails,
         LineInlineBoxFragment, LineTextFragment, OverflowClip, RoundedDecoration,
     };
     pub use layout_state::PreparedTextRunFragment;
@@ -69,7 +74,7 @@ pub use stages::{
     RenderImageFragments, RenderLine, RenderLineTextFragment, RenderLineTextFragments, RenderLines,
     RenderListItemMarker, RenderOverflowClip, RenderTable, RenderTableCell, RenderTableRow,
     RenderTextRun, RenderTextRuns, RenderTextView, RenderView, ShapeLayoutTimings, ShapedDocument,
-    SourceElementStep, SourcePosition, TextCompositionPolicy,
+    SourceElementStep, SourcePosition, TextCompositionPolicy, ReadingFragment, ReadingTarget,
 };
 
 #[cfg(test)]

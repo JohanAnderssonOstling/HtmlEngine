@@ -28,6 +28,19 @@ rule, and matched-rule hot-path records are capped at 12 bytes. The preparation
 timing is reported separately by `StyleTimings::prepare_rules` and propagated
 through the pipeline profiler.
 
+## Reader typography
+
+Reader typography can scale fixed publication font sizes using
+`ReaderStyleOverrides::canonical_font_size`. Set it to the regular CSS font size
+(usually `16.0`), and set the document's root font size to the desired reading
+size. The resolver uses `desired / canonical`: at `24px`, a `12px` publication
+size becomes `18px`, and a `32px` heading becomes `48px`. Nested percentages,
+`em`, `rem`, font shorthands, generated text, and line heights preserve their
+proportions. Font-relative spacing resolves against the resized font; fixed
+box dimensions retain their CSS sizes. Leave the canonical size unset for
+normal CSS behavior. Changes require resolving styles again, as font-relative
+properties depend on the resulting typography.
+
 ## Cascade validation
 
 Run the reproducible resolver benchmark in release mode. Its arguments are the

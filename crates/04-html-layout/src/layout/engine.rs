@@ -90,6 +90,7 @@ pub(crate) struct LayoutScratch {
     flex_grid: crate::flex_grid::FlexGridState,
     measurement: MeasurementScratch,
     finalization: FinalizationScratch,
+    paragraphs: Vec<super::inline::ParagraphScratch>,
     line_owners: Vec<u32>,
     block_decoration_owners: Vec<u32>,
 }
@@ -103,6 +104,11 @@ impl Clone for LayoutScratch {
 }
 
 impl LayoutScratch {
+    #[cfg(test)]
+    pub(crate) fn paragraph_capacities(&self) -> Vec<(usize, (usize, usize, usize))> {
+        self.paragraphs.iter().map(super::inline::ParagraphScratch::capacities).collect()
+    }
+
     #[cfg(test)]
     pub(crate) fn allocation_capacities(
         &self,
@@ -190,6 +196,7 @@ pub(crate) struct LayoutEngine<'a, 'out> {
     pub(crate) flex_grid: crate::flex_grid::FlexGridState,
     pub(super) measurement: MeasurementScratch,
     pub(super) finalization: FinalizationScratch,
+    pub(super) paragraphs: Vec<super::inline::ParagraphScratch>,
     pub(super) track_overflow_clips: bool,
     fragmentation_suppression_depth: usize,
     pub(crate) reader: LayoutReader<'a>,
@@ -221,6 +228,7 @@ impl<'a, 'out> LayoutEngine<'a, 'out> {
             flex_grid: std::mem::take(&mut scratch.flex_grid),
             measurement: std::mem::take(&mut scratch.measurement),
             finalization: std::mem::take(&mut scratch.finalization),
+            paragraphs: std::mem::take(&mut scratch.paragraphs),
             track_overflow_clips: read.track_overflow_clips,
             reader: read.reader,
             text: read.text,
@@ -249,6 +257,7 @@ impl<'a, 'out> LayoutEngine<'a, 'out> {
         scratch.flex_grid = std::mem::take(&mut self.flex_grid);
         scratch.measurement = std::mem::take(&mut self.measurement);
         scratch.finalization = std::mem::take(&mut self.finalization);
+        scratch.paragraphs = std::mem::take(&mut self.paragraphs);
     }
 
     pub(crate) fn parallel_measurement_context(&self) -> LayoutReadContext<'a> {
@@ -446,4 +455,16 @@ impl LayoutReadContext<'_> {
         engine.recycle_into(&mut worker.placement, &mut worker.scratch);
         result
     }
+}
+
+/// Rebuild paint fragments over retained line and box geometry. Specialized
+/// formatting contexts are rejected by the document before entering this path.
+pub(crate) fn repaint(inputs: LayoutInputs<'_>, geometry: &mut BoxGeometry, state: &mut LayoutState, constraints: crate::LayoutConstraints) {
+    let mut placement = PlacementState::default();
+    let mut scratch = LayoutScratch::default();
+    let reader = LayoutReader::new(inputs.document, inputs.styles, inputs.topology, inputs.inline_content, inputs.glyph_metrics, inputs.font_metrics, inputs.image_metrics);
+    let text = InlineReader::new(inputs.inline_content, inputs.glyph_metrics, inputs.text_geometry, inputs.ellipsis_glyphs, inputs.hyphen_glyphs);
+    let read = LayoutReadContext { config: LayoutConfig::new(constraints), track_overflow_clips: reader.tracks_overflow_clips(), reader, text, inline_plans: inputs.inline_plans };
+    let mut engine = LayoutEngine::new(read, LayoutOutputs { geometry, state, placement: &mut placement, scratch: &mut scratch }, None, 0);
+    engine.repaint();
 }

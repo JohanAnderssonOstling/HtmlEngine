@@ -12,7 +12,7 @@ use web_time::Instant;
 #[path = "stages_output/mod.rs"]
 mod output;
 pub use output::{
-    BoxTextFormat, ImageMetrics, RenderAddressingView, RenderAnchorPosition, RenderAnchorPositions,
+    BoxTextFormat, ImageMetrics, RenderAddressingView, RenderAnchorPosition, RenderAnchorPositions, ReadingFragment, ReadingTarget,
     RenderAuthoritativeTextRun, RenderBoxView, RenderDecoration, RenderDecorationPattern,
     RenderDecorations, RenderEllipsisFragment, RenderForcedBreak, RenderFragmentView,
     RenderGlyphAdvanceRun, RenderGlyphAdvanceRuns, RenderGlyphOffsetRun, RenderGlyphOffsetRuns,
@@ -21,18 +21,15 @@ pub use output::{
     RenderOverflowClip, RenderTable, RenderTableCell, RenderTableRow, RenderTextRun,
     RenderTextRuns, RenderTextView, RenderView, SourceElementStep, SourcePosition,
 };
+mod mathml;
 #[path = "stages/lifecycle.rs"]
 mod lifecycle;
 #[path = "stages/semantics.rs"]
 mod semantics;
 
 pub(crate) use html_dom::element_is_note_target;
-pub use lifecycle::{
-    ImageSizingPolicy, LaidOutDocument, LayoutConstraintError,
-    LayoutConstraints, NoteFlow, PrepareError, PreparedDocument, ShapeLayoutTimings,
-    ShapedDocument, TextCompositionPolicy,
-};
-pub(crate) use lifecycle::{PreparedInputs, ShapedText};
+pub use lifecycle::{ImageSizingPolicy, LaidOutDocument, LayoutConstraintError, LayoutConstraints, NoteFlow, PrepareError, PreparedDocument, ShapeLayoutTimings, ShapedDocument, TextCompositionPolicy};
+pub(crate) use lifecycle::{PaintColorRun, PreparedInputs, ShapedText};
 use semantics::{LinkGlyphTarget, box_id, collect_anchor_glyphs, collect_link_glyph_targets};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -43,6 +40,9 @@ struct FirstLineStyleRange {
 }
 
 fn first_line_style_ranges(document: &LaidOutDocument) -> Vec<FirstLineStyleRange> {
+    if !document.inputs.styles.has_first_line_styles() {
+        return Vec::new();
+    }
     let first_letter = crate::shaping::first_letter_style_overrides(
         &document.inputs.document,
         &document.inputs.styles,
@@ -55,7 +55,7 @@ fn first_line_style_ranges(document: &LaidOutDocument) -> Vec<FirstLineStyleRang
         .line_output
         .lines
         .iter()
-        .filter(|line| line.paint_color.is_some())
+        .filter(|line| line.paint_color(&document.layout_state.line_output.line_details).is_some())
     {
         let line_result_start = result.len();
         let mut previous_text_end = None;
@@ -92,9 +92,17 @@ fn first_line_style_ranges(document: &LaidOutDocument) -> Vec<FirstLineStyleRang
                 .get_box_style_indices(run.box_idx as usize)
                 .unwrap_or_else(|| document.inputs.styles.default_indices());
             let mut segment_start = start;
-            let mut segment_style = first_letter[start as usize].unwrap_or(first_line_style);
+            let mut segment_style = first_letter
+                .get(start as usize)
+                .copied()
+                .flatten()
+                .unwrap_or(first_line_style);
             for glyph in start + 1..end {
-                let style = first_letter[glyph as usize].unwrap_or(first_line_style);
+                let style = first_letter
+                    .get(glyph as usize)
+                    .copied()
+                    .flatten()
+                    .unwrap_or(first_line_style);
                 if style != segment_style {
                     append_first_line_style_range(
                         document,
@@ -176,7 +184,7 @@ fn shape_first_line_ranges(
     // remain live for the whole document-shaping transaction.
     let mut shaped = (**base).clone();
     shaped.glyph_metrics = seed.clone();
-    shaped.inline_plans = crate::layout::PreparedInlinePlans::new(inputs.layout_tree.box_count());
+    shaped.inline_plans = crate::layout::PreparedInlinePlans::new(&inputs.layout_tree, &shaped.inline_content);
     for range in ranges {
         crate::shaping::reshape_range_with_style(
             &inputs.styles,

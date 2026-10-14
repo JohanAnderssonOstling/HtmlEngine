@@ -1,4 +1,4 @@
-use crate::layout_model::{GlyphAdvanceRun, GlyphOffsetRun, Line, OverflowClip};
+use crate::layout_model::{Line, OverflowClip};
 use kurbo::Rect;
 use std::ops::Range;
 
@@ -10,7 +10,7 @@ use super::read_context::LayoutReader;
 mod geometry;
 mod ordering;
 mod overflow;
-mod text_paint;
+pub(crate) mod text_paint;
 
 use geometry::publish_inline_box_geometry;
 use ordering::{
@@ -22,7 +22,7 @@ use text_paint::prepare_line_text_runs;
 
 #[derive(Default)]
 pub(super) struct FinalizationScratch {
-    line_pairs: Vec<(Line, Vec<GlyphOffsetRun>, Vec<GlyphAdvanceRun>, usize)>,
+    line_pairs: Vec<(Line, Range<u32>, Range<u32>, usize)>,
     index_map: Vec<usize>,
     sorted_line_owners: Vec<u32>,
     block_groups: Vec<(u32, Range<u32>)>,
@@ -44,6 +44,28 @@ impl FinalizationScratch {
 }
 
 impl LayoutEngine<'_, '_> {
+    pub(super) fn repaint(&mut self) {
+        let output = &mut self.fragments.state_mut().fragment_output;
+        output.decorations.clear();
+        output.decoration_line_indices.clear();
+        output.decoration_paint_orders.clear();
+        output.decoration_positioned_layers.clear();
+        output.decoration_negative_positioned_layers.clear();
+        output.decoration_independent_positioned_layers.clear();
+        output.decoration_clips.clear();
+        output.decoration_fragments_by_line.clear();
+        self.placement.reset(self.reader.box_count());
+        for idx in 0..self.reader.box_count() {
+            if !matches!(self.reader.box_layout_mode(idx), Some(crate::layout_model::LayoutMode::Inline(_))) {
+                super::decorations::emit_block_decorations(self, idx);
+            }
+        }
+        build_block_decoration_traversal(&self.reader, &mut self.fragments, &mut self.finalization);
+        super::decorations::collect_inline_decorations(self);
+        rebuild_decoration_fragments_by_line(&mut self.fragments);
+        rebuild_overflow_clips(&self.reader, &self.geometry, &mut self.fragments, &mut self.finalization, self.track_overflow_clips);
+    }
+
     pub(super) fn finalize(&mut self, track_overflow_clips: bool) {
         let finalization_started = self.start_timing();
 
@@ -62,7 +84,7 @@ impl LayoutEngine<'_, '_> {
         );
         self.record_timing(|timings| timings.sort_lines_and_remap_images += start.elapsed());
 
-        prepare_line_text_runs(&self.text, &mut self.fragments);
+        prepare_line_text_runs(&self.text, &mut self.fragments, &[]);
 
         rebuild_glyph_line_indices(self.text.glyphs().len(), &mut self.fragments);
         build_block_decoration_traversal(&self.reader, &mut self.fragments, &mut self.finalization);

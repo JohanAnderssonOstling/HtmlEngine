@@ -65,7 +65,15 @@ pub(in crate::style::cascade::resolver) fn checked_font_size(
     root_font_size: f32,
     resolution: &ResolutionContext,
 ) -> Option<f32> {
-    let value = font_size_to_px(size, parent_font_size, root_font_size, resolution)?;
+    let scale = resolution.font_size_scale;
+    let value = resolution.with_canonical_font_sizes(|canonical| {
+        font_size_to_px(
+            size,
+            parent_font_size / scale,
+            root_font_size / scale,
+            canonical,
+        )
+    })? * scale;
     (value.is_finite() && value >= 0.0).then_some(value)
 }
 
@@ -76,13 +84,36 @@ pub(in crate::style::cascade::resolver) fn checked_font_size_components(
     root_font_size: f32,
     resolution: &ResolutionContext,
 ) -> Option<(f32, f32, f32, f32, f32, f32, f32)> {
+    let scale = resolution.font_size_scale;
+    let (px, ex, ch, cap, rch, rcap, rlh) = resolution.with_canonical_font_sizes(|canonical| {
+        canonical_font_size_components(
+            size,
+            inherited_font.font_size / scale,
+            parent_font_size / scale,
+            root_font_size / scale,
+            canonical,
+        )
+    })?;
+    // Root metric coefficients already consume the scaled root font at layout.
+    let result = (px * scale, ex * scale, ch * scale, cap * scale, rch, rcap, rlh);
+    (result.0.is_finite() && result.1.is_finite() && result.2.is_finite() && result.3.is_finite())
+        .then_some(result)
+}
+
+fn canonical_font_size_components(
+    size: &FontSize,
+    inherited_font_size: f32,
+    parent_font_size: f32,
+    root_font_size: f32,
+    resolution: &ResolutionContext,
+) -> Option<(f32, f32, f32, f32, f32, f32, f32)> {
     if let FontSize::Length(LengthPercentage::Dimension(length)) = size {
         return match length {
             LengthValue::Cap(value) if value.is_finite() && *value >= 0.0 => Some((
                 0.0,
                 0.0,
                 0.0,
-                *value * inherited_font.font_size,
+                *value * inherited_font_size,
                 0.0,
                 0.0,
                 0.0,
@@ -104,7 +135,7 @@ pub(in crate::style::cascade::resolver) fn checked_font_size_components(
         let (absolute_px, percentage, x_height_px, ch_advance_px, cap_height_px) =
             calc_box_length_percentage_components(
                 calc,
-                inherited_font.font_size,
+                inherited_font_size,
                 root_font_size,
                 resolution,
             )?;

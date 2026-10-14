@@ -178,15 +178,11 @@ fn trim_leading_soft_tokens(
     start
 }
 
-pub(in crate::layout::inline) fn break_lines(
-    engine: &crate::layout::LayoutEngine<'_, '_>,
-    tokens: &[InlineToken],
-    runs: &[InlineTokenMetrics],
-    paragraph: ParagraphLayout,
-    available_width: f64,
+pub(in crate::layout::inline) fn break_lines_into(
+    engine: &crate::layout::LayoutEngine<'_, '_>, tokens: &[InlineToken], runs: &[InlineTokenMetrics], paragraph: ParagraphLayout, available_width: f64, mut lines: Vec<BrokenLine>,
 ) -> Vec<BrokenLine> {
     let timing_started = engine.start_timing();
-    let mut lines = Vec::new();
+    lines.clear();
     let mut start = 0usize;
     let mut starts_indented_line = true;
     while start < tokens.len() {

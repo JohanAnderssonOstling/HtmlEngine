@@ -89,6 +89,9 @@ pub(super) fn plan_shaping_spans(
     style_overrides: &[Option<StyleIndices>],
     font_metrics: &ShapedFontMetrics,
 ) -> Vec<ShapingSpan> {
+    debug_assert!(
+        style_overrides.is_empty() || style_overrides.len() == inline_content.glyphs().len()
+    );
     #[derive(Clone, Copy, Default)]
     struct ContextState {
         previous_span: Option<usize>,
@@ -157,8 +160,16 @@ pub(super) fn plan_shaping_spans(
 
         let mut start = range.start;
         while start < range.end {
-            let style_override = style_overrides[start as usize];
-            let mut end = start + 1;
+            let style_override = if style_overrides.is_empty() {
+                None
+            } else {
+                style_overrides[start as usize]
+            };
+            let mut end = if style_overrides.is_empty() {
+                range.end
+            } else {
+                start + 1
+            };
             while end < range.end && style_overrides[end as usize] == style_override {
                 end += 1;
             }

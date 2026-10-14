@@ -215,6 +215,7 @@ impl DocumentFactory {
                 match &mut image.source {
                     ImageSource::Uri(uri) => *uri = resources.provider.resolve(&base_uri, uri),
                     ImageSource::InlineSvg { base_uri: svg_base_uri, .. } => svg_base_uri.clone_from(&base_uri),
+                    ImageSource::MathMl { .. } => {}
                 }
             }
         }

@@ -36,47 +36,21 @@ pub(in crate::layout) fn layout_inline_content(
         return size;
     }
 
-    let ragged_knuth = engine.config.book_optimized_text()
-        && input.paragraph.text_align == TextAlign::Left
-        && !engine.config.force_justify()
-        && !tokens.iter().any(|token| {
-            token
-                .run_metrics(&tokens.runs)
-                .white_space
-                .preserves_spaces()
-        });
-    let use_knuth = !tokens.iter().any(|token| token.is_tab(&tokens.runs))
-        && (matches!(input.paragraph.text_align, TextAlign::Justify)
-            || engine.config.force_justify()
-            || ragged_knuth);
+    let ragged_knuth = engine.config.book_optimized_text() && input.paragraph.text_align == TextAlign::Left && !engine.config.force_justify() && !tokens.iter().any(|token| token.run_metrics(&tokens.runs).white_space.preserves_spaces());
+    let use_knuth = !tokens.iter().any(|token| token.is_tab(&tokens.runs)) && (matches!(input.paragraph.text_align, TextAlign::Justify) || engine.config.force_justify() || ragged_knuth);
+    // Detach storage while emitting lines: inline layout can recurse for
+    // atomic content, and nested paragraphs must own separate scratch.
+    let mut scratch = engine.paragraphs.pop().unwrap_or_default();
+    let line_storage = std::mem::take(&mut scratch.lines);
     let lines = if use_knuth {
-        break_lines_knuth(
-            engine,
-            &tokens,
-            &tokens.runs,
-            input.paragraph,
-            input.area.width,
-            tokens.kp_plan(engine.config.book_optimized_text()),
-            ragged_knuth,
-        )
+        break_lines_knuth(engine, &tokens, &tokens.runs, input.paragraph, input.area.width, tokens.kp_plan(engine.config.book_optimized_text()), ragged_knuth, line_storage, &mut scratch.solver)
     } else {
-        break_lines(
-            engine,
-            &tokens,
-            &tokens.runs,
-            input.paragraph,
-            input.area.width,
-        )
+        wrapping::greedy::break_lines_into(engine, &tokens, &tokens.runs, input.paragraph, input.area.width, line_storage)
     };
-    let size = emit_lines(
-        engine,
-        &tokens,
-        &input,
-        overflow,
-        first_line_height,
-        first_letter_height,
-        &lines,
-    );
+    let size = emit_lines(engine, &tokens, &input, overflow, first_line_height, first_letter_height, &lines);
+    scratch.lines = lines;
+    scratch.lines.clear();
+    engine.paragraphs.push(scratch);
     engine.record_timing(|t| t.layout_runs += timing_started.elapsed());
     size
 }

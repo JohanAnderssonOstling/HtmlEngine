@@ -13,7 +13,7 @@ use lightningcss::values::color::CssColor;
 const HTML_NAMESPACE: &str = "http://www.w3.org/1999/xhtml";
 const SVG_NAMESPACE: &str = "http://www.w3.org/2000/svg";
 
-pub(super) fn apply(doc: &Document, node_idx: DomNodeId, style: &mut WorkingStyle, phase: CascadePhase) {
+pub(super) fn apply(doc: &Document, node_idx: DomNodeId, style: &mut WorkingStyle, phase: CascadePhase, font_size_scale: f32) {
     let Some(tag) = doc.get_dom_tag(node_idx) else { return };
     let namespace = doc.get_dom_namespace(node_idx);
 
@@ -30,7 +30,7 @@ pub(super) fn apply(doc: &Document, node_idx: DomNodeId, style: &mut WorkingStyl
     }
 
     if phase == CascadePhase::Prerequisites {
-        apply_prerequisite_hints(doc, node_idx, tag, style);
+        apply_prerequisite_hints(doc, node_idx, tag, style, font_size_scale);
         return;
     }
 
@@ -126,7 +126,7 @@ pub(super) fn apply(doc: &Document, node_idx: DomNodeId, style: &mut WorkingStyl
     }
 }
 
-fn apply_prerequisite_hints(doc: &Document, node_idx: DomNodeId, tag: &str, style: &mut WorkingStyle) {
+fn apply_prerequisite_hints(doc: &Document, node_idx: DomNodeId, tag: &str, style: &mut WorkingStyle, font_size_scale: f32) {
     if let Some(direction) = doc.get_dom_attr(node_idx, "dir") {
         if direction.eq_ignore_ascii_case("ltr") {
             style.text.direction = TextDirection::Ltr;
@@ -150,6 +150,10 @@ fn apply_prerequisite_hints(doc: &Document, node_idx: DomNodeId, tag: &str, styl
     {
         // A font-size hint participates in the prerequisite cascade so em
         // lengths declared later on the same element resolve against it.
+        let font_size = font_size * font_size_scale;
+        if !font_size.is_finite() {
+            return;
+        }
         style.font.font_size = font_size;
         style.font.font_size_x_height_px = 0.0;
         style.font.font_size_ch_advance_px = 0.0;

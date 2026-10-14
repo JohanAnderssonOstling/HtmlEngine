@@ -1,8 +1,11 @@
 use html_dom::MemoryUsageReport;
+use super::grouped_arena::GroupedArena;
+use super::glyph_line_indices::GlyphLineIndices;
 use html_style_model::UsedBorderRadii;
 use kurbo::{Point, Rect, Size};
 use rustc_data_structures::fx::FxHashMap;
 use std::ops::Range;
+use std::num::NonZeroU32;
 
 /// Output of the layout phase: line boxes, glyph offsets, and paint fragments.
 /// Produced by the layout phase and consumed read-only by the renderer.
@@ -16,6 +19,9 @@ pub(crate) struct LayoutState {
 #[derive(Default, Clone)]
 pub(crate) struct LineOutput {
     pub lines: Vec<Line>,
+    /// Uncommon paint/inline data is retained only for lines that need it.
+    pub line_details: Vec<LineDetails>,
+    pub text_fragments: Vec<LineTextFragment>,
     /// Line indexes in CSS paint order. Physical line storage remains sorted
     /// by document geometry so pagination and viewport lookup can use it.
     pub paint_order_indices: Vec<u32>,
@@ -35,9 +41,9 @@ pub(crate) struct LineOutput {
     /// Canonical owning line for each source glyph. Aggregate line ranges may
     /// overlap when an atomic inline box contains its own laid-out text, so
     /// renderer interaction must not infer ownership from `Line::glyphs`.
-    pub glyph_line_indices: Vec<u32>,
-    pub line_glyph_offsets: Vec<Vec<GlyphOffsetRun>>,
-    pub line_glyph_advances: Vec<Vec<GlyphAdvanceRun>>,
+    pub glyph_line_indices: GlyphLineIndices,
+    pub line_glyph_offsets: GroupedArena<GlyphOffsetRun>,
+    pub line_glyph_advances: GroupedArena<GlyphAdvanceRun>,
     /// Contiguous arena of authoritative shaped-run slices prepared for
     /// painting. Lines retain compact ranges into this buffer.
     pub prepared_text_run_fragments: Vec<PreparedTextRunFragment>,
@@ -58,7 +64,7 @@ pub(crate) struct FragmentOutput {
     /// Decoration indexes in final paint traversal order, grouped by their
     /// owning line. Line-owned backgrounds and borders replay with the line
     /// instead of in the document-wide block-decoration phase.
-    pub decoration_fragments_by_line: Vec<Vec<usize>>,
+    pub decoration_fragments_by_line: GroupedArena<usize>,
     pub decoration_positioned_layers: Vec<bool>,
     pub decoration_negative_positioned_layers: Vec<bool>,
     pub decoration_independent_positioned_layers: Vec<bool>,
@@ -76,7 +82,7 @@ pub(crate) struct FragmentOutput {
     /// when the document does not establish an overflow clip.
     pub decoration_clips: Vec<Option<OverflowClip>>,
     pub image_fragments: Vec<ImageFragment>,
-    pub image_fragments_by_line: Vec<Vec<usize>>,
+    pub image_fragments_by_line: GroupedArena<usize>,
 }
 
 #[derive(Default, Clone)]
@@ -92,9 +98,10 @@ impl LayoutState {
             self.line_output.lines.capacity(),
             self.line_output.lines.len(),
         );
-        for line in &self.line_output.lines {
-            report.extend_prefixed("LayoutState.line_output.lines", line.memory_usage_report());
-        }
+        report.add_slice_storage::<LineDetails>("LayoutState.line_output.line_details.storage",
+            self.line_output.line_details.capacity(), self.line_output.line_details.len());
+        report.add_slice_storage::<LineTextFragment>("LayoutState.line_output.text_fragments.storage",
+            self.line_output.text_fragments.capacity(), self.line_output.text_fragments.len());
         report.add_slice_storage::<u32>(
             "LayoutState.line_output.paint_order_indices.storage",
             self.line_output.paint_order_indices.capacity(),
@@ -130,35 +137,14 @@ impl LayoutState {
             self.line_output.line_clips.capacity(),
             self.line_output.line_clips.len(),
         );
-        report.add_slice_storage::<u32>(
-            "LayoutState.line_output.glyph_line_indices.storage",
-            self.line_output.glyph_line_indices.capacity(),
-            self.line_output.glyph_line_indices.len(),
+        report.extend_prefixed(
+            "LayoutState.line_output.glyph_line_indices",
+            self.line_output.glyph_line_indices.memory_usage_report(),
         );
-        report.add_slice_storage::<Vec<GlyphOffsetRun>>(
-            "LayoutState.line_output.line_glyph_offsets.storage",
-            self.line_output.line_glyph_offsets.capacity(),
-            self.line_output.line_glyph_offsets.len(),
-        );
-        for offsets in &self.line_output.line_glyph_offsets {
-            report.add_slice_storage::<GlyphOffsetRun>(
-                "LayoutState.line_output.line_glyph_offsets.items.storage",
-                offsets.capacity(),
-                offsets.len(),
-            );
-        }
-        report.add_slice_storage::<Vec<GlyphAdvanceRun>>(
-            "LayoutState.line_output.line_glyph_advances.storage",
-            self.line_output.line_glyph_advances.capacity(),
-            self.line_output.line_glyph_advances.len(),
-        );
-        for advances in &self.line_output.line_glyph_advances {
-            report.add_slice_storage::<GlyphAdvanceRun>(
-                "LayoutState.line_output.line_glyph_advances.items.storage",
-                advances.capacity(),
-                advances.len(),
-            );
-        }
+        report.extend_prefixed("LayoutState.line_output.line_glyph_offsets",
+            self.line_output.line_glyph_offsets.memory_usage_report());
+        report.extend_prefixed("LayoutState.line_output.line_glyph_advances",
+            self.line_output.line_glyph_advances.memory_usage_report());
         report.add_slice_storage::<PreparedTextRunFragment>(
             "LayoutState.line_output.prepared_text_run_fragments.storage",
             self.line_output.prepared_text_run_fragments.capacity(),
@@ -208,18 +194,8 @@ impl LayoutState {
             self.fragment_output.decoration_paint_orders.capacity(),
             self.fragment_output.decoration_paint_orders.len(),
         );
-        report.add_slice_storage::<Vec<usize>>(
-            "LayoutState.fragment_output.decoration_fragments_by_line.storage",
-            self.fragment_output.decoration_fragments_by_line.capacity(),
-            self.fragment_output.decoration_fragments_by_line.len(),
-        );
-        for fragments in &self.fragment_output.decoration_fragments_by_line {
-            report.add_slice_storage::<usize>(
-                "LayoutState.fragment_output.decoration_fragments_by_line.items.storage",
-                fragments.capacity(),
-                fragments.len(),
-            );
-        }
+        report.extend_prefixed("LayoutState.fragment_output.decoration_fragments_by_line",
+            self.fragment_output.decoration_fragments_by_line.memory_usage_report());
         report.add_slice_storage::<bool>(
             "LayoutState.fragment_output.decoration_positioned_layers.storage",
             self.fragment_output.decoration_positioned_layers.capacity(),
@@ -263,18 +239,8 @@ impl LayoutState {
             self.fragment_output.image_fragments.capacity(),
             self.fragment_output.image_fragments.len(),
         );
-        report.add_slice_storage::<Vec<usize>>(
-            "LayoutState.fragment_output.image_fragments_by_line.storage",
-            self.fragment_output.image_fragments_by_line.capacity(),
-            self.fragment_output.image_fragments_by_line.len(),
-        );
-        for fragments in &self.fragment_output.image_fragments_by_line {
-            report.add_slice_storage::<usize>(
-                "LayoutState.fragment_output.image_fragments_by_line.items.storage",
-                fragments.capacity(),
-                fragments.len(),
-            );
-        }
+        report.extend_prefixed("LayoutState.fragment_output.image_fragments_by_line",
+            self.fragment_output.image_fragments_by_line.memory_usage_report());
         report.add_slice_storage::<(u16, AnchorPosition)>(
             "LayoutState.semantic_indexes.anchor_positions.storage",
             self.semantic_indexes.anchor_positions.capacity(),
@@ -310,42 +276,76 @@ pub(crate) struct Line {
     pub point: Point,
     pub height: f64,
     pub baseline: f64,
-    pub word_spacing: f64, // extra space to add after each space (for justification)
+    pub word_spacing: f64,   // extra space to add after each space (for justification)
     pub letter_spacing: f64, // micro-tracking after eligible shaped-cluster boundaries
-    /// Paint-only horizontal shift used for optical margin alignment. This is
-    /// deliberately excluded from logical line width and line breaking.
-    pub optical_offset_x: f64,
-    /// Color fallback and refinement marker contributed by the originating
-    /// block's `::first-line` pseudo-element. Ordinary lines keep using the
-    /// colors retained by the shaping backend.
-    pub paint_color: Option<u32>,
-    /// Present only when replaced inline content splits the source text into
-    /// independently positioned shaping fragments. Ordinary text-only lines
-    /// use `None` and implicitly consist of `glyphs` at x=0.
-    pub text_fragments: Option<Box<[LineTextFragment]>>,
+    /// One-based index into the sparse line-detail arena. Plain lines need no entry.
+    pub details: Option<NonZeroU32>,
     /// Range into `LineOutput::prepared_text_run_fragments`.
     pub prepared_text_runs: Range<u32>,
     /// False when authoritative native-run coverage was incomplete.
     pub native_text_runs_complete: bool,
-    /// Non-text inline items occupying this line. Their horizontal spans are
-    /// retained so ancestor inline backgrounds and borders cover replaced and
-    /// atomic children instead of deriving their geometry from glyphs alone.
-    /// Range into `LineOutput::inline_box_fragments`. Empty for the common
-    /// plain-text line.
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct LineDetails {
+    /// Paint-only optical margin shift, excluded from logical line breaking.
+    pub optical_offset_x: f64,
+    /// First-line pseudo color and refinement marker. Ordinary lines use the
+    /// retained backend colors or the document's updated source paint colors.
+    pub paint_color: Option<u32>,
+    /// Range into LineOutput::text_fragments. None implicitly paints the
+    /// complete line glyph range; Some can represent gaps or hidden text.
+    pub text_fragments: Option<Range<u32>>,
+    /// Range into LineOutput::inline_box_fragments, retaining occupied spans
+    /// for inline backgrounds, borders, and propagated text decorations.
     pub inline_box_fragments: Range<u32>,
 }
 
 impl Line {
-    pub(crate) fn memory_usage_report(&self) -> MemoryUsageReport {
-        let mut report = MemoryUsageReport::new();
-        if let Some(fragments) = &self.text_fragments {
-            report.add_slice_storage::<LineTextFragment>(
-                "Line.text_fragments.storage",
-                fragments.len(),
-                fragments.len(),
-            );
+    pub(crate) fn details<'a>(&self, details: &'a [LineDetails]) -> Option<&'a LineDetails> {
+        self.details.and_then(|index| details.get(index.get() as usize - 1))
+    }
+    pub(crate) fn optical_offset_x(&self, details: &[LineDetails]) -> f64 {
+        self.details(details).map_or(0.0, |details| details.optical_offset_x)
+    }
+    pub(crate) fn paint_color(&self, details: &[LineDetails]) -> Option<u32> {
+        self.details(details).and_then(|details| details.paint_color)
+    }
+    pub(crate) fn text_fragment_range(&self, details: &[LineDetails]) -> Option<Range<u32>> {
+        self.details(details).and_then(|details| details.text_fragments.clone())
+    }
+    pub(crate) fn inline_box_fragments(&self, details: &[LineDetails]) -> Range<u32> {
+        self.details(details).map_or(0..0, |details| details.inline_box_fragments.clone())
+    }
+}
+
+impl LineOutput {
+    pub(crate) fn push_details(
+        &mut self, optical_offset_x: f64, paint_color: Option<u32>, text_fragments: Option<Box<[LineTextFragment]>>,
+        inline_box_fragments: Range<u32>,
+    ) -> Option<NonZeroU32> {
+        if optical_offset_x == 0.0
+            && paint_color.is_none()
+            && text_fragments.is_none()
+            && inline_box_fragments.is_empty()
+        {
+            return None;
         }
-        report
+        let text_fragments = text_fragments.map(|fragments| {
+            let start = u32::try_from(self.text_fragments.len()).expect("line text-fragment capacity exhausted");
+            self.text_fragments.extend(Vec::from(fragments));
+            let end = u32::try_from(self.text_fragments.len()).expect("line text-fragment capacity exhausted");
+            start..end
+        });
+        let index = self
+            .line_details
+            .len()
+            .checked_add(1)
+            .and_then(|len| u32::try_from(len).ok())
+            .and_then(NonZeroU32::new)
+            .expect("line detail capacity exhausted");
+        self.line_details.push(LineDetails { optical_offset_x, paint_color, text_fragments, inline_box_fragments });
+        Some(index)
     }
 }
 
@@ -358,6 +358,7 @@ pub struct PreparedTextRunFragment {
     pub(crate) run: crate::TextRunId,
     pub(crate) range: Range<u32>,
     pub(crate) offset: Point,
+    pub(crate) color: Option<u32>,
 }
 
 impl PreparedTextRunFragment {
@@ -367,6 +368,11 @@ impl PreparedTextRunFragment {
 
     pub fn range(&self) -> Range<u32> {
         self.range.clone()
+    }
+
+    /// Updated paint color, independent of the retained shaping resource.
+    pub fn color(&self) -> Option<u32> {
+        self.color
     }
 
     pub fn offset(&self) -> Point {
@@ -730,6 +736,7 @@ pub(crate) struct RoundedDecoration {
 pub(crate) struct ImageFragment {
     pub line_idx: usize,
     pub image_idx: u32,
+    pub box_idx: u32,
     pub offset: Point,
     pub size: Size,
     pub clip: Rect,

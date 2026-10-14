@@ -16,8 +16,8 @@ impl DecorationEmitter<'_, '_, '_> {
 
         let lines = self.fragments.state().line_output.lines.to_vec();
         for (line_idx, line) in lines.into_iter().enumerate() {
-            let fragment_range =
-                line.inline_box_fragments.start as usize..line.inline_box_fragments.end as usize;
+            let inline_range = line.inline_box_fragments(&self.fragments.state().line_output.line_details);
+            let fragment_range = inline_range.start as usize..inline_range.end as usize;
             let fragments = self
                 .fragments
                 .state()

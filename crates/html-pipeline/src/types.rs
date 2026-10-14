@@ -1,5 +1,6 @@
 use html_layout::ImageMetrics;
 use std::fmt;
+use std::sync::Arc;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PipelineChange {
@@ -324,7 +325,8 @@ impl Default for ReuseReport {
 
 #[derive(Clone, Debug)]
 pub struct PipelineInputs {
-    pub source: String,
+    /// Immutable chapter text shared by updates and cached snapshots.
+    pub source: Arc<str>,
     pub markup_syntax: html_parse::MarkupSyntax,
     /// Reader-authored CSS applied after the publication stylesheets.
     pub user_styles: Vec<String>,
@@ -382,15 +384,21 @@ pub struct RenderOnlyCacheKey {
 }
 
 impl PipelineInputs {
+    /// Shared chapters compare in constant time; independent allocations retain
+    /// value equality so replacing text without a revision still invalidates it.
+    pub fn same_source(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.source, &other.source) || self.source == other.source
+    }
+
     pub fn change_mask(&self, previous: &Self) -> PipelineChangeMask {
         let mut mask = PipelineChangeMask::empty();
-        if self.source != previous.source || self.source_revision != previous.source_revision || self.markup_syntax != previous.markup_syntax {
+        if !self.same_source(previous) || self.source_revision != previous.source_revision || self.markup_syntax != previous.markup_syntax {
             mask.source_changed = true;
         }
         if self.base_uri != previous.base_uri || self.resource_revision != previous.resource_revision {
             mask.resource_base_changed = true;
         }
-        if self.stylesheet_revision != previous.stylesheet_revision || self.user_styles != previous.user_styles || self.reader_overrides != previous.reader_overrides {
+        if self.stylesheet_revision != previous.stylesheet_revision || self.user_styles != previous.user_styles || !self.reader_overrides.same_layout_preferences(&previous.reader_overrides) {
             mask.stylesheets_changed = true;
         }
         if !self.style_environment.same_non_media_part(&previous.style_environment) {
@@ -405,7 +413,7 @@ impl PipelineInputs {
         if !self.layout.same(previous.layout) {
             mask.layout_constraints_changed = true;
         }
-        if self.paint != previous.paint {
+        if self.paint != previous.paint || self.reader_overrides.paint_overrides() != previous.reader_overrides.paint_overrides() {
             mask.paint_settings_changed = true;
         }
         mask
@@ -418,13 +426,13 @@ impl PipelineInputs {
     pub fn changes_from(&self, previous: &Self) -> (Vec<PipelineChange>, EarliestStage) {
         let mut changes = Vec::new();
 
-        if self.source != previous.source || self.source_revision != previous.source_revision || self.markup_syntax != previous.markup_syntax {
+        if !self.same_source(previous) || self.source_revision != previous.source_revision || self.markup_syntax != previous.markup_syntax {
             changes.push(PipelineChange::SourceChanged(self.source_revision));
         }
         if self.base_uri != previous.base_uri || self.resource_revision != previous.resource_revision {
             changes.push(PipelineChange::ResourceBaseChanged(self.resource_revision));
         }
-        if self.stylesheet_revision != previous.stylesheet_revision || self.user_styles != previous.user_styles || self.reader_overrides != previous.reader_overrides {
+        if self.stylesheet_revision != previous.stylesheet_revision || self.user_styles != previous.user_styles || !self.reader_overrides.same_layout_preferences(&previous.reader_overrides) {
             changes.push(PipelineChange::StylesheetsChanged(self.stylesheet_revision));
         }
         if !self.style_environment.same_non_media_part(&previous.style_environment) {
@@ -440,7 +448,7 @@ impl PipelineInputs {
             changes.push(PipelineChange::LayoutConstraintsChanged(self.layout));
         }
 
-        if self.paint != previous.paint {
+        if self.paint != previous.paint || self.reader_overrides.paint_overrides() != previous.reader_overrides.paint_overrides() {
             changes.push(PipelineChange::PaintSettingsChanged(self.paint));
         }
 
@@ -491,7 +499,7 @@ impl PipelineInputs {
 
 impl PartialEq for PipelineInputs {
     fn eq(&self, other: &Self) -> bool {
-        self.source == other.source
+        self.same_source(other)
             && self.source_revision == other.source_revision
             && self.markup_syntax == other.markup_syntax
             && self.user_styles == other.user_styles

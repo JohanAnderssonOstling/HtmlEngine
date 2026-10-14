@@ -1,6 +1,7 @@
 //! CSS whitespace normalization and text transformation.
 
 use super::*;
+use crate::layout_model::SourceOffsets;
 
 pub(super) fn collapse_whitespace(
     styles: &ComputedStyles,
@@ -8,7 +9,7 @@ pub(super) fn collapse_whitespace(
     inline_content: &mut InlineContent,
 ) {
     let mut new_glyphs = Vec::with_capacity(inline_content.glyphs().len());
-    let mut new_source_offsets = Vec::with_capacity(inline_content.glyphs().len());
+    let mut new_source_offsets = SourceOffsets::with_capacity(inline_content.glyphs().len());
     let mut new_whitespace_wrap_before = Vec::with_capacity(inline_content.glyphs().len());
     let mut remap = vec![u32::MAX; inline_content.glyphs().len()];
     let mut at_line_start = true;
@@ -239,9 +240,11 @@ pub(super) fn transform_text(
 
     let capitalize_starts = capitalization_starts(layout_tree, inline_content);
     let mut new_glyphs = Vec::with_capacity(old_len);
-    let mut new_source_offsets = Vec::with_capacity(old_len);
+    let mut new_source_offsets = SourceOffsets::with_capacity(old_len);
     let mut new_whitespace_wrap_before = Vec::with_capacity(old_len);
-    let mut new_first_letter_styles = Vec::with_capacity(old_len);
+    let has_first_letter_styles = !first_letter_styles.is_empty();
+    let mut new_first_letter_styles =
+        Vec::with_capacity(if has_first_letter_styles { old_len } else { 0 });
     let mut remap_start = vec![0u32; old_len];
     let mut remap_end = vec![0u32; old_len];
 
@@ -261,7 +264,9 @@ pub(super) fn transform_text(
             } else {
                 WhitespaceWrapOverride::Style
             });
-            new_first_letter_styles.push(first_letter_style);
+            if has_first_letter_styles {
+                new_first_letter_styles.push(first_letter_style);
+            }
             first_output = false;
         };
 

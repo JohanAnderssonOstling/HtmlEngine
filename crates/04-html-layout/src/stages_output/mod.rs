@@ -4,7 +4,7 @@ use crate::layout_model::{
     GlyphId, GlyphOffsetRun, HyphenFragment, ImageFragment, InlineItem, InlineItemKind, LayoutMode,
     Line, ListItemMarker,
 };
-use html_dom::{Document, ImageResource, NodeRef};
+use html_dom::{Document, ImageResource, ImageSource, NodeRef};
 use html_style_model::{ListStylePosition, TextDecorationLines, UsedBorderRadii};
 use kurbo::{Point, Size};
 use rustc_data_structures::fx::FxHashMap;
@@ -13,7 +13,9 @@ use std::ops::Range;
 mod addressing;
 mod boxes;
 mod fragments;
+mod reading;
 mod text;
+pub use reading::{ReadingFragment, ReadingTarget};
 
 pub use addressing::{
     RenderAddressingView, RenderAnchorPosition, RenderAnchorPositions, SourceElementStep,
@@ -60,9 +62,13 @@ impl ImageMetrics {
     }
 
     pub(crate) fn display_size(&self, image_idx: u32, resource: &ImageResource) -> (f64, f64) {
-        let (width, height) = self
-            .get(image_idx)
-            .unwrap_or((resource.width, resource.height));
+        // Formula dimensions belong to the current font-size preparation,
+        // not to a possibly older asynchronous SVG decode.
+        let (width, height) = if matches!(resource.source, ImageSource::MathMl { .. }) {
+            (resource.width, resource.height)
+        } else {
+            self.get(image_idx).unwrap_or((resource.width, resource.height))
+        };
         // HTML dimension attributes are CSS presentational hints, not natural
         // image dimensions. They are resolved by the style/layout sizing path;
         // folding them into the decoded metrics here would also change the
@@ -167,6 +173,14 @@ impl<'a> RenderView<'a> {
         self.doc.inputs.document.images()
     }
 
+    /// Preserved source for equation-specific actions; ordinary images return None.
+    pub fn image_mathml(&self, image_idx: u32) -> Option<&'a str> {
+        match &self.images().get(image_idx as usize)?.source {
+            ImageSource::MathMl { markup, .. } => Some(markup),
+            _ => None,
+        }
+    }
+
     pub fn image_uri(&self, image_idx: u32) -> Option<&'a str> {
         match &self
             .doc
@@ -176,8 +190,8 @@ impl<'a> RenderView<'a> {
             .get(image_idx as usize)?
             .source
         {
-            html_dom::ImageSource::Uri(uri) => Some(uri.as_str()),
-            html_dom::ImageSource::InlineSvg { .. } => None,
+            ImageSource::Uri(uri) => Some(uri.as_str()),
+            ImageSource::InlineSvg { .. } | ImageSource::MathMl { .. } => None,
         }
     }
 

@@ -381,10 +381,11 @@ pub struct RenderImageFragment {
     size: Size,
     clip: kurbo::Rect,
     paint_order: u32,
+    text_color: u32,
 }
 
 impl RenderImageFragment {
-    fn from_fragment(fragment: &ImageFragment) -> Self {
+    fn from_fragment(fragment: &ImageFragment, document: &LaidOutDocument) -> Self {
         Self {
             line_idx: fragment.line_idx,
             image_idx: fragment.image_idx,
@@ -392,6 +393,9 @@ impl RenderImageFragment {
             size: fragment.size,
             clip: fragment.clip,
             paint_order: fragment.paint_order,
+            text_color: document.inputs.layout_tree.get_box_style_indices(fragment.box_idx as usize)
+                .and_then(|indices| document.inputs.styles.view(indices))
+                .map_or(0x000000ff, |style| style.color()),
         }
     }
 
@@ -401,6 +405,10 @@ impl RenderImageFragment {
 
     pub fn image_idx(&self) -> u32 {
         self.image_idx
+    }
+
+    pub fn text_color(&self) -> u32 {
+        self.text_color
     }
 
     pub fn offset(&self) -> Point {
@@ -423,20 +431,23 @@ impl RenderImageFragment {
 pub struct RenderImageFragments<'a> {
     fragments: &'a [ImageFragment],
     indexes: Option<&'a [usize]>,
+    document: &'a LaidOutDocument,
 }
 
 impl<'a> RenderImageFragments<'a> {
-    fn all(fragments: &'a [ImageFragment]) -> Self {
+    fn all(fragments: &'a [ImageFragment], document: &'a LaidOutDocument) -> Self {
         Self {
             fragments,
             indexes: None,
+            document,
         }
     }
 
-    fn selected(fragments: &'a [ImageFragment], indexes: &'a [usize]) -> Self {
+    fn selected(fragments: &'a [ImageFragment], indexes: &'a [usize], document: &'a LaidOutDocument) -> Self {
         Self {
             fragments,
             indexes: Some(indexes),
+            document,
         }
     }
 
@@ -453,7 +464,7 @@ impl<'a> RenderImageFragments<'a> {
             let index = self.indexes.map_or(position, |indexes| indexes[position]);
             self.fragments
                 .get(index)
-                .map(RenderImageFragment::from_fragment)
+                .map(|fragment| RenderImageFragment::from_fragment(fragment, self.document))
         })
     }
 }
@@ -618,10 +629,11 @@ impl<'a> RenderFragmentView<'a> {
             .fragment_output
             .image_fragments_by_line
             .get(line_idx)
-            .map_or(&[] as &'a [usize], |indexes| indexes.as_slice());
+            .unwrap_or(&[]);
         RenderImageFragments::selected(
             &self.doc.layout_state.fragment_output.image_fragments,
             indexes,
+            self.doc,
         )
     }
 
@@ -632,7 +644,7 @@ impl<'a> RenderFragmentView<'a> {
             .fragment_output
             .decoration_fragments_by_line
             .get(line_idx)
-            .map_or(&[] as &'a [usize], |indexes| indexes.as_slice());
+            .unwrap_or(&[]);
         RenderDecorations::selected(
             &self.doc.layout_state.fragment_output.decorations,
             &self.doc.layout_state.fragment_output.decoration_clips,
@@ -666,6 +678,6 @@ impl<'a> RenderFragmentView<'a> {
     }
 
     pub fn images(self) -> RenderImageFragments<'a> {
-        RenderImageFragments::all(&self.doc.layout_state.fragment_output.image_fragments)
+        RenderImageFragments::all(&self.doc.layout_state.fragment_output.image_fragments, self.doc)
     }
 }

@@ -1,6 +1,7 @@
 //! Durable text, box, image, and glyph-fragment publication.
 
 use super::*;
+use crate::layout_model::GroupedArena;
 
 /// Records independently positioned text fragments only for lines where
 /// replaced inline content interrupts the source text. Text-only lines keep
@@ -542,6 +543,7 @@ pub(super) fn write_line_fragments(
             .fragments
             .push_inline_box_fragments(inline_box_fragments, engine.reader.box_count());
         let layout = engine.fragments.state_mut();
+        let details = layout.line_output.push_details(line.optical_offset_x, paint_color, None, inline_box_fragments);
         layout.line_output.lines.push(Line {
             owner_box_idx: container_box_idx as u32,
             glyphs: line.glyph_range.clone(),
@@ -550,12 +552,9 @@ pub(super) fn write_line_fragments(
             baseline: line.baseline,
             word_spacing: line.word_spacing,
             letter_spacing: line.letter_spacing,
-            optical_offset_x: line.optical_offset_x,
-            paint_color,
-            text_fragments: None,
+            details,
             prepared_text_runs: 0..0,
             native_text_runs_complete: false,
-            inline_box_fragments,
         });
         layout.line_output.line_glyph_offsets.push(Vec::new());
         layout.line_output.line_glyph_advances.push(
@@ -564,8 +563,7 @@ pub(super) fn write_line_fragments(
                 .map(|&(glyph_idx, advance)| GlyphAdvanceRun {
                     range: glyph_idx..glyph_idx + 1,
                     advance,
-                })
-                .collect(),
+                }),
         );
         if let Some((glyph, x)) = line.hyphen {
             layout.line_output.hyphen_fragments.push(HyphenFragment {
@@ -674,6 +672,7 @@ pub(super) fn write_line_fragments(
             .fragments
             .push_inline_box_fragments(inline_box_fragments, engine.reader.box_count());
         let layout = engine.fragments.state_mut();
+        let details = layout.line_output.push_details(line.optical_offset_x, paint_color, text_fragments, inline_box_fragments);
         layout.line_output.lines.push(Line {
             owner_box_idx: container_box_idx as u32,
             glyphs: line.glyph_range.clone(),
@@ -682,23 +681,21 @@ pub(super) fn write_line_fragments(
             baseline: line.baseline,
             word_spacing: line.word_spacing,
             letter_spacing: line.letter_spacing,
-            optical_offset_x: line.optical_offset_x,
-            paint_color,
-            text_fragments,
+            details,
             prepared_text_runs: 0..0,
             native_text_runs_complete: false,
-            inline_box_fragments,
         });
         layout.line_output.line_glyph_offsets.push(Vec::new());
         layout.line_output.line_glyph_advances.push(Vec::new());
-        layout.line_output.line_glyph_advances[line_idx].extend(
+        for advance in
             line.punctuation_space_advances
                 .iter()
                 .map(|&(glyph_idx, advance)| GlyphAdvanceRun {
                     range: glyph_idx..glyph_idx + 1,
                     advance,
-                }),
-        );
+                }) {
+            layout.line_output.line_glyph_advances.push_to(line_idx, advance);
+        }
         if let Some((glyph, x)) = line.hyphen {
             let visible = span
                 .iter()
@@ -782,6 +779,7 @@ pub(super) fn write_line_fragments(
                 .push(ImageFragment {
                     line_idx,
                     image_idx: *image_idx,
+                    box_idx: *box_idx,
                     offset: content_offset + object.rect.origin().to_vec2(),
                     size: object.rect.size(),
                     clip: object.clip + content_offset.to_vec2(),
@@ -845,13 +843,14 @@ pub(super) fn write_line_fragments(
             let layout = engine.fragments.state_mut();
             if offset != 0.0 {
                 push_glyph_offset_run(
-                    &mut layout.line_output.line_glyph_offsets[line_idx],
+                    &mut layout.line_output.line_glyph_offsets,
+                    line_idx,
                     glyph_idx,
                     offset as f32,
                 );
             }
             if token.is_tab(runs) {
-                layout.line_output.line_glyph_advances[line_idx].push(GlyphAdvanceRun {
+                layout.line_output.line_glyph_advances.push_to(line_idx, GlyphAdvanceRun {
                     range: glyph_idx..glyph_idx + 1,
                     advance: placement.advance as f32,
                 });
@@ -894,14 +893,14 @@ pub(super) fn write_line_fragments(
 ///
 /// Adjacent glyphs with the same vertical offset are merged so the document
 /// stores compact offset ranges instead of one entry per glyph.
-fn push_glyph_offset_run(offsets: &mut Vec<GlyphOffsetRun>, glyph_idx: u32, offset: f32) {
+fn push_glyph_offset_run(offsets: &mut GroupedArena<GlyphOffsetRun>, line_idx: usize, glyph_idx: u32, offset: f32) {
     if let Some(last) = offsets
-        .last_mut()
+        .last_mut(line_idx)
         .filter(|last| last.range.end == glyph_idx && last.offset == offset)
     {
         last.range.end = glyph_idx + 1;
     } else {
-        offsets.push(GlyphOffsetRun {
+        offsets.push_to(line_idx, GlyphOffsetRun {
             range: glyph_idx..glyph_idx + 1,
             offset,
         });

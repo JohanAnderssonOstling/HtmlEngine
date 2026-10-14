@@ -2,13 +2,8 @@ use super::*;
 
 /// Knuth–Plass optimal line breaking over the shared immutable token stream.
 pub(in crate::layout::inline) fn break_lines_knuth(
-    engine: &crate::layout::LayoutEngine<'_, '_>,
-    tokens: &[InlineToken],
-    runs: &[InlineTokenMetrics],
-    paragraph: ParagraphLayout,
-    available_width: f64,
-    cached_plan: Option<&KpPlan>,
-    ragged: bool,
+    engine: &crate::layout::LayoutEngine<'_, '_>, tokens: &[InlineToken], runs: &[InlineTokenMetrics], paragraph: ParagraphLayout, available_width: f64, cached_plan: Option<&KpPlan>, ragged: bool, mut lines: Vec<BrokenLine>,
+    scratch: &mut knuth_plass::CompactScratch,
 ) -> Vec<BrokenLine> {
     let timing_started = engine.start_timing();
     use super::knuth_plass as kp;
@@ -20,7 +15,7 @@ pub(in crate::layout::inline) fn break_lines_knuth(
         &fallback_plan
     };
     let seg_count = plan.segments.len();
-    let mut lines = Vec::new();
+    lines.clear();
     let mut global_line = 0usize;
 
     for (seg_idx, segment) in plan.segments.iter().enumerate() {
@@ -53,37 +48,15 @@ pub(in crate::layout::inline) fn break_lines_knuth(
         }
 
         let seg_base_line = global_line;
-        let line_width = |line: usize| {
-            (available_width
-                - indent_for_line(
-                    paragraph.indent.amount,
-                    paragraph.indent.hanging,
-                    seg_base_line + line == 0 || paragraph.indent.each_line,
-                ))
-            .max(0.0)
-        };
-        let breaks = if ragged {
-            if engine.config.hyphenation_quality() {
-                kp::break_compact_ragged(&segment.breakpoints, &line_width)
-            } else {
-                kp::break_compact_ragged_unrestricted(&segment.breakpoints, &line_width)
-            }
-        } else if engine.config.hyphenation_quality() {
-            kp::break_compact_book(&segment.breakpoints, &line_width, KP_TOLERANCE).or_else(|| {
-                kp::break_compact_emergency_book(&segment.breakpoints, &line_width, KP_TOLERANCE)
-            })
-        } else {
-            kp::break_compact(&segment.breakpoints, &line_width, KP_TOLERANCE).or_else(|| {
-                kp::break_compact_emergency(&segment.breakpoints, &line_width, KP_TOLERANCE)
-            })
-        };
+        let line_width = |line: usize| (available_width - indent_for_line(paragraph.indent.amount, paragraph.indent.hanging, seg_base_line + line == 0 || paragraph.indent.each_line)).max(0.0);
+        let breaks = kp::break_compact_reusing(&segment.breakpoints, &line_width, KP_TOLERANCE, ragged, engine.config.hyphenation_quality(), scratch);
         let Some(breaks) = breaks else {
-            return greedy::break_lines(engine, tokens, runs, paragraph, available_width);
+            return greedy::break_lines_into(engine, tokens, runs, paragraph, available_width, lines);
         };
 
         let break_count = breaks.len();
         let mut line_start = start;
-        for (index, breakpoint_index) in breaks.into_iter().enumerate() {
+        for (index, breakpoint_index) in breaks.iter().copied().enumerate() {
             let is_segment_last = index + 1 == break_count;
             let breakpoint = segment
                 .breakpoints

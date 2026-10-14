@@ -3,8 +3,178 @@ mod stage_tests {
     use crate::ShapeError;
     use crate::layout_model::{GlyphId, GlyphMetric, GlyphMetricError};
     use crate::test_support::{DocumentFactory, TestGlyphShaper};
-    use crate::{GlyphShaper, LayoutConstraintError, LayoutConstraints, PreparedDocument, TextCompositionPolicy};
+    use crate::{
+        FontSlant, GlyphResourceStore, GlyphShaper, ImageMetrics, LaidOutDocument,
+        LayoutConstraintError, LayoutConstraints, PreparedDocument, TextCompositionPolicy,
+    };
+    use std::sync::Arc;
     use html_style_model::{ComputedStylesBuildError, ComputedStylesBuilder, ComputedStylesValidationError};
+
+    #[test]
+    fn resizing_switches_glyph_line_width_without_losing_ownership_or_snapshots() {
+        const ROWS: usize = 32_800;
+        let content = "xx\n".repeat(ROWS - 1) + "xx";
+        let html = format!("<pre>{content}</pre>");
+        let mut factory = DocumentFactory::new();
+        let prepared = factory.parse_with_new_pipeline(&html, Some("html,body,pre {margin:0} pre {font-size:10px;white-space:pre-wrap;overflow-wrap:anywhere}"));
+        let mut shaper = TestGlyphShaper::new();
+        let shaped = prepared.shape(&mut shaper).unwrap();
+        let mut document = shaped.layout(LayoutConstraints::new(12.0, 16.0).unwrap());
+        let last = document.render_view().text().glyph_count() as u32 - 1;
+        assert_eq!(document.line_count(), ROWS);
+        assert!(document.layout_state.line_output.glyph_line_indices.is_narrow());
+        assert_eq!(document.render_view().text().line_index_for_glyph(last), Some(ROWS - 1));
+        let snapshot = document.clone();
+        let glyphs = document.glyphs().as_ptr();
+        document.relayout_with_metrics(LayoutConstraints::new(6.0, 16.0).unwrap(), &ImageMetrics::default());
+        assert_eq!(document.line_count(), ROWS * 2);
+        assert!(!document.layout_state.line_output.glyph_line_indices.is_narrow());
+        assert_eq!(document.render_view().text().line_index_for_glyph(last), Some(ROWS * 2 - 1));
+        assert_eq!(document.glyphs().as_ptr(), glyphs);
+        assert!(snapshot.layout_state.line_output.glyph_line_indices.is_narrow());
+        assert_eq!(snapshot.render_view().text().line_index_for_glyph(last), Some(ROWS - 1));
+        document.relayout_with_metrics(LayoutConstraints::new(12.0, 16.0).unwrap(), &ImageMetrics::default());
+        assert_eq!(document.line_count(), ROWS);
+        assert!(document.layout_state.line_output.glyph_line_indices.is_narrow());
+        assert_eq!(document.render_view().text().line_index_for_glyph(last), Some(ROWS - 1));
+    }
+
+
+    #[test]
+    fn compact_source_offsets_preserve_collapsed_spaces_and_unicode_expansion() {
+        let mut factory = DocumentFactory::new();
+        let prepared =
+            factory.parse_with_new_pipeline("<p>a   😀ß</p>", Some("p {text-transform:uppercase}"));
+        let document = prepared
+            .shape(&mut TestGlyphShaper::new())
+            .unwrap()
+            .layout(LayoutConstraints::new(600.0, 20.0).unwrap());
+        let addressing = document.render_view().addressing();
+        let offsets = [0, 1, 4, 6, 6];
+        let after_offsets = [1, 2, 6, 7, 7];
+        assert_eq!(document.glyphs().len(), offsets.len());
+        for (glyph, &offset) in offsets.iter().enumerate() {
+            assert_eq!(document.glyph_source_offset(glyph as u32), Some(offset));
+            let position = addressing
+                .source_position_for_glyph(glyph as u32, false)
+                .unwrap();
+            assert_eq!(position.utf16_offset(), offset as usize);
+            let elements: Vec<_> = position.elements().map(|element| element.step()).collect();
+            assert_eq!(
+                addressing.resolve_source_position(
+                    &elements,
+                    Some(position.text_step()),
+                    Some(position.utf16_offset()),
+                    false
+                ),
+                Some(glyph.min(3) as u32)
+            );
+            assert_eq!(
+                addressing
+                    .source_position_for_glyph(glyph as u32, true)
+                    .unwrap()
+                    .utf16_offset(),
+                after_offsets[glyph]
+            );
+        }
+    }
+
+    #[test]
+    fn source_offsets_above_u16_preserve_reading_positions() {
+        let html = format!("<p>{}😀Z</p>", "a".repeat(65_535));
+        let mut factory = DocumentFactory::new();
+        let prepared = factory.parse_with_new_pipeline(&html, None);
+        let document = prepared
+            .shape(&mut TestGlyphShaper::new())
+            .unwrap()
+            .layout(LayoutConstraints::new(600.0, 20.0).unwrap());
+        let addressing = document.render_view().addressing();
+        for (glyph, offset, after) in [
+            (65_534, 65_534, 65_535),
+            (65_535, 65_535, 65_537),
+            (65_536, 65_537, 65_538),
+        ] {
+            assert_eq!(document.glyph_source_offset(glyph), Some(offset));
+            let position = addressing.source_position_for_glyph(glyph, false).unwrap();
+            assert_eq!(position.utf16_offset(), offset as usize);
+            let elements: Vec<_> = position.elements().map(|element| element.step()).collect();
+            assert_eq!(
+                addressing.resolve_source_position(
+                    &elements,
+                    Some(position.text_step()),
+                    Some(position.utf16_offset()),
+                    false
+                ),
+                Some(glyph)
+            );
+            assert_eq!(
+                addressing
+                    .source_position_for_glyph(glyph, true)
+                    .unwrap()
+                    .utf16_offset(),
+                after
+            );
+        }
+    }
+
+    #[test]
+    fn narrow_node_offsets_support_cfi_text_chunks_larger_than_u16() {
+        let html = format!(
+            "<p>{}<!--split-->{}</p>",
+            "a".repeat(40_000),
+            "b".repeat(40_000)
+        );
+        let mut factory = DocumentFactory::new();
+        let prepared = factory.parse_with_new_pipeline(&html, None);
+        let document = prepared
+            .shape(&mut TestGlyphShaper::new())
+            .unwrap()
+            .layout(LayoutConstraints::new(600.0, 20.0).unwrap());
+        let addressing = document.render_view().addressing();
+        assert_eq!(document.glyph_source_offset(79_999), Some(39_999));
+        let position = addressing.source_position_for_glyph(79_999, false).unwrap();
+        assert_eq!(position.utf16_offset(), 79_999);
+        let elements: Vec<_> = position.elements().map(|element| element.step()).collect();
+        assert_eq!(
+            addressing.resolve_source_position(
+                &elements,
+                Some(position.text_step()),
+                Some(position.utf16_offset()),
+                false
+            ),
+            Some(79_999)
+        );
+    }
+
+    #[test]
+    fn compact_source_offsets_keep_generated_markers_without_source_positions() {
+        let mut factory = DocumentFactory::new();
+        let prepared = factory.parse_with_new_pipeline(
+            "<ol><li>😀ß</li></ol>",
+            Some("li {display:list-item;list-style-type:decimal;text-transform:uppercase}"),
+        );
+        let document = prepared
+            .shape(&mut TestGlyphShaper::new())
+            .unwrap()
+            .layout(LayoutConstraints::new(600.0, 20.0).unwrap());
+        let text = document.render_view().text();
+        let addressing = document.render_view().addressing();
+        let mut marker_count = 0;
+        let mut source_offsets = Vec::new();
+        for run in text.text_runs().chain(text.marker_runs()) {
+            for glyph in run.glyphs() {
+                if run.is_marker() {
+                    marker_count += 1;
+                    assert_eq!(document.glyph_source_offset(glyph), None);
+                    assert_eq!(addressing.source_position_for_glyph(glyph, false), None);
+                } else {
+                    source_offsets.push(document.glyph_source_offset(glyph).unwrap());
+                }
+            }
+        }
+        assert!(marker_count > 0);
+        assert_eq!(source_offsets, [0, 2, 2]);
+    }
 
     #[derive(Default)]
     struct InvalidGlyphShaper(crate::GlyphResourceStore);
@@ -292,6 +462,359 @@ mod stage_tests {
         let cloned = document.clone();
         assert_eq!(cloned.layout_scratch.allocation_capacities(), ((0, 0), (0, 0, 0, 0, 0, 0)), "cloning semantic layout state must not duplicate transient scratch allocations");
         assert!(std::sync::Arc::ptr_eq(&cloned.placement, &document.placement), "cloning a laid-out document must share its retained local placement snapshot");
+    }
+
+    #[test]
+    fn inline_descendants_and_empty_blocks_do_not_reserve_paragraph_plans() {
+        let mut factory = DocumentFactory::new();
+        let prepared = factory.parse_with_new_pipeline("<p>words <em>emphasis</em> <span>span</span> <a href='#a'>link</a></p><div></div><p></p>", None);
+        let mut shaper = TestGlyphShaper::new();
+        let mut document = prepared.shape(&mut shaper).unwrap().layout(LayoutConstraints::new(120.0, 16.0).unwrap());
+        let (boxes, reserved, filled) = document.shaped.inline_plans.storage_counts();
+        assert!(boxes > reserved);
+        assert_eq!((reserved, filled), (1, 1));
+        let glyph_pointer = document.glyphs().as_ptr();
+        document.relayout(LayoutConstraints::new(100.0, 16.0).unwrap());
+        assert_eq!(document.shaped.inline_plans.storage_counts(), (boxes, reserved, filled));
+        assert_eq!(document.glyphs().as_ptr(), glyph_pointer);
+    }
+
+    #[test]
+    fn ordinary_lines_omit_optional_storage_and_preserve_snapshot_geometry() {
+        let mut factory = DocumentFactory::new();
+        let prepared = factory.parse_with_new_pipeline("<p>plain text continues through several lines without inline elements or special paint data</p>", None);
+        let mut shaper = TestGlyphShaper::new();
+        let mut document = prepared.shape(&mut shaper).unwrap().layout(LayoutConstraints::new(100.0, 16.0).unwrap());
+        assert!(document.layout_state.line_output.lines.len() > 1);
+        assert!(document.layout_state.line_output.lines.iter().all(|line| line.details.is_none()));
+        assert!(document.layout_state.line_output.line_details.is_empty());
+        assert!(document.layout_state.line_output.text_fragments.is_empty());
+        assert!(std::mem::size_of::<crate::layout_model::Line>() <= 80);
+        let snapshot = document.clone();
+        let original = snapshot.render_view().text().line(1).unwrap();
+        document.relayout(LayoutConstraints::new(200.0, 16.0).unwrap());
+        assert_eq!(snapshot.render_view().text().line(1).unwrap().point(), original.point());
+        assert_eq!(snapshot.render_view().text().line(1).unwrap().glyphs(), original.glyphs());
+    }
+
+    #[test]
+    fn paragraph_scratch_is_retained_between_layouts_and_not_copied_to_snapshots() {
+        let mut factory = DocumentFactory::new();
+        let source = format!("<p>{}</p><p>second paragraph</p>", "Words continue through this paragraph with punctuation and possible hyphenation. ".repeat(20));
+        let prepared = factory.parse_with_new_pipeline(&source, None);
+        let mut shaper = TestGlyphShaper::new();
+        let constraints = LayoutConstraints::new(180.0, 16.0).unwrap().with_text_composition_policy(TextCompositionPolicy::BookOptimized);
+        let mut document = prepared.shape(&mut shaper).unwrap().layout(constraints);
+        let capacities = document.layout_scratch.paragraph_capacities();
+        assert_eq!(capacities.len(), 1);
+        assert!(capacities[0].0 > 0 && capacities[0].1.0 > 0 && capacities[0].1.1 > 0 && capacities[0].1.2 > 0);
+        document.relayout(constraints);
+        assert_eq!(document.layout_scratch.paragraph_capacities(), capacities);
+        assert!(document.clone().layout_scratch.paragraph_capacities().is_empty());
+    }
+
+    #[test]
+    fn shaper_relayout_reuses_buffers_and_matches_fresh_layout() {
+        for policy in [
+            TextCompositionPolicy::WebCompatible,
+            TextCompositionPolicy::BookOptimized,
+        ] {
+            let mut factory = DocumentFactory::new();
+            let prepared = factory.parse_with_new_pipeline(
+                "<html><body><p id='first'>one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen</p><p id='second'>another paragraph with an <em>inline span</em> and more words</p></body></html>",
+                Some("p::first-letter { font-size:2em }"),
+            );
+            let mut shaper = TestGlyphShaper::new();
+            let shaped = prepared.shape(&mut shaper).unwrap();
+            let constraints = LayoutConstraints::new(120.0, 20.0)
+                .unwrap()
+                .with_text_composition_policy(policy);
+            let metrics = ImageMetrics::default();
+            let mut document = shaped
+                .clone()
+                .layout_with_metrics_and_shaper(constraints, &metrics, &mut shaper)
+                .unwrap();
+            let lines = document.layout_state.line_output.lines.as_ptr();
+            let offsets = document
+                .layout_state
+                .line_output
+                .line_glyph_offsets
+                .as_ptr();
+            let advances = document
+                .layout_state
+                .line_output
+                .line_glyph_advances
+                .as_ptr();
+            let glyph_lines = document
+                .layout_state
+                .line_output
+                .glyph_line_indices
+                .as_ptr();
+            let scratch = document.layout_scratch.allocation_capacities();
+            let glyphs = document.glyphs().as_ptr();
+
+            for width in [240.0, 180.0, 300.0, 120.0] {
+                let constraints = LayoutConstraints::new(width, 20.0)
+                    .unwrap()
+                    .with_text_composition_policy(policy);
+                document
+                    .relayout_with_metrics_and_shaper(constraints, &metrics, &mut shaper)
+                    .unwrap();
+                let fresh = shaped.clone().layout(constraints);
+                assert_eq!(document.glyphs().as_ptr(), glyphs);
+                assert_eq!(
+                    document.layout_state.line_output.lines.as_ptr(),
+                    lines,
+                    "resize must recycle line storage"
+                );
+                assert_eq!(
+                    document
+                        .layout_state
+                        .line_output
+                        .line_glyph_offsets
+                        .as_ptr(),
+                    offsets
+                );
+                assert_eq!(
+                    document
+                        .layout_state
+                        .line_output
+                        .line_glyph_advances
+                        .as_ptr(),
+                    advances
+                );
+                assert_eq!(
+                    document
+                        .layout_state
+                        .line_output
+                        .glyph_line_indices
+                        .as_ptr(),
+                    glyph_lines
+                );
+                let retained = document.layout_scratch.allocation_capacities();
+                assert_eq!(retained.0.0 + retained.1.2, scratch.0.0 + scratch.1.2);
+                assert_eq!(retained.1.0, scratch.1.0);
+                assert_eq!(retained.1.1, scratch.1.1);
+                assert_eq!(document.last_constraints, constraints);
+                let lines = |doc: &LaidOutDocument| {
+                    doc.render_view()
+                        .text()
+                        .lines()
+                        .iter()
+                        .map(|line| (line.glyphs(), line.point(), line.height(), line.baseline()))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(lines(&document), lines(&fresh));
+                for index in 0..document.box_count() {
+                    assert_eq!(document.geometry.point(index), fresh.geometry.point(index));
+                    assert_eq!(document.geometry.size(index), fresh.geometry.size(index));
+                }
+                for (id, position) in document
+                    .render_view()
+                    .addressing()
+                    .anchor_positions()
+                    .iter()
+                {
+                    let expected = fresh
+                        .render_view()
+                        .addressing()
+                        .anchor_position(id)
+                        .unwrap();
+                    assert_eq!(
+                        (position.y(), position.order()),
+                        (expected.y(), expected.order())
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn shaper_relayout_preserves_auxiliary_glyphs_and_retained_snapshots() {
+        let mut factory = DocumentFactory::new();
+        let prepared = factory.parse_with_new_pipeline(
+            "<html><body><p>one two three four five six seven eight nine ten</p></body></html>",
+            None,
+        );
+        let mut shaper = TestGlyphShaper::new();
+        let mut document = prepared
+            .shape(&mut shaper)
+            .unwrap()
+            .layout(LayoutConstraints::new(120.0, 20.0).unwrap());
+        let snapshot = document.clone();
+        let old_lines = snapshot
+            .render_view()
+            .text()
+            .lines()
+            .iter()
+            .map(|line| (line.glyphs(), line.point()))
+            .collect::<Vec<_>>();
+        let metric = GlyphMetric::try_new('#', 4.0, 3.0, 1.0, 0.0).unwrap();
+        let appended = shaper.glyph_resources().register(metric).unwrap();
+        assert!(
+            snapshot
+                .render_view()
+                .text()
+                .glyph_metric(appended)
+                .is_none()
+        );
+
+        document
+            .relayout_with_metrics_and_shaper(
+                LayoutConstraints::new(240.0, 20.0).unwrap(),
+                &ImageMetrics::default(),
+                &mut shaper,
+            )
+            .unwrap();
+
+        assert_eq!(
+            document.render_view().text().glyph_metric(appended),
+            Some(metric)
+        );
+        assert!(
+            snapshot
+                .render_view()
+                .text()
+                .glyph_metric(appended)
+                .is_none()
+        );
+        assert_eq!(
+            snapshot
+                .render_view()
+                .text()
+                .lines()
+                .iter()
+                .map(|line| (line.glyphs(), line.point()))
+                .collect::<Vec<_>>(),
+            old_lines
+        );
+        assert!(
+            !Arc::ptr_eq(&snapshot.placement, &document.placement),
+            "retained placement snapshots must not be mutated by resize"
+        );
+        let shaped = document.shaped.clone();
+        document
+            .relayout_with_metrics_and_shaper(
+                LayoutConstraints::new(120.0, 20.0).unwrap(),
+                &ImageMetrics::default(),
+                &mut shaper,
+            )
+            .unwrap();
+        assert!(
+            Arc::ptr_eq(&document.shaped, &shaped),
+            "unchanged glyph resources must not copy the shaped chapter again"
+        );
+        assert_eq!(
+            document.render_view().text().glyph_metric(appended),
+            Some(metric)
+        );
+    }
+
+    #[test]
+    fn shaper_relayout_rejects_a_stale_generation_before_mutating_layout() {
+        let mut factory = DocumentFactory::new();
+        let prepared = factory.parse_with_new_pipeline(
+            "<html><body><p>one two three four five six</p></body></html>",
+            None,
+        );
+        let mut shaper = TestGlyphShaper::new();
+        let constraints = LayoutConstraints::new(120.0, 20.0).unwrap();
+        let mut document = prepared.shape(&mut shaper).unwrap().layout(constraints);
+        let lines = document.layout_state.line_output.lines.as_ptr();
+        let before = document
+            .render_view()
+            .text()
+            .lines()
+            .iter()
+            .map(|line| (line.glyphs(), line.point()))
+            .collect::<Vec<_>>();
+        shaper.reset();
+
+        let error = document
+            .relayout_with_metrics_and_shaper(
+                LayoutConstraints::new(240.0, 20.0).unwrap(),
+                &ImageMetrics::default(),
+                &mut shaper,
+            )
+            .unwrap_err();
+
+        assert_eq!(error, ShapeError::resource_generation_mismatch());
+        assert_eq!(document.last_constraints, constraints);
+        assert_eq!(document.layout_state.line_output.lines.as_ptr(), lines);
+        assert_eq!(
+            document
+                .render_view()
+                .text()
+                .lines()
+                .iter()
+                .map(|line| (line.glyphs(), line.point()))
+                .collect::<Vec<_>>(),
+            before
+        );
+    }
+
+    #[test]
+    fn failed_first_line_append_keeps_the_published_layout() {
+        struct RejectAppend<'a>(&'a mut TestGlyphShaper);
+        impl GlyphShaper for RejectAppend<'_> {
+            fn reset(&mut self) {
+                self.0.reset();
+            }
+            fn glyph_resources(&mut self) -> &mut GlyphResourceStore {
+                self.0.glyph_resources()
+            }
+            fn shape_glyph(
+                &mut self,
+                ch: char,
+                size: f32,
+                weight: u16,
+                slant: FontSlant,
+                color: u32,
+                family: Option<&str>,
+            ) -> Result<GlyphId, ShapeError> {
+                self.0.shape_glyph(ch, size, weight, slant, color, family)
+            }
+        }
+        let mut factory = DocumentFactory::new();
+        let prepared = factory.parse_with_new_pipeline(
+            "<html><body><p>one two three four five six</p></body></html>",
+            Some("p::first-line {font-size:24px}"),
+        );
+        let mut shaper = TestGlyphShaper::new();
+        let constraints = LayoutConstraints::new(120.0, 20.0).unwrap();
+        let mut document = prepared.shape(&mut shaper).unwrap().layout(constraints);
+        let before = document
+            .render_view()
+            .text()
+            .lines()
+            .iter()
+            .map(|line| (line.glyphs(), line.point()))
+            .collect::<Vec<_>>();
+        let lines = document.layout_state.line_output.lines.as_ptr();
+        let metrics = shaper.glyph_resources().len();
+
+        let error = document
+            .relayout_with_metrics_and_shaper(
+                LayoutConstraints::new(240.0, 20.0).unwrap(),
+                &ImageMetrics::default(),
+                &mut RejectAppend(&mut shaper),
+            )
+            .unwrap_err();
+
+        assert_eq!(error, ShapeError::append_transaction_unsupported());
+        assert_eq!(document.last_constraints, constraints);
+        assert_eq!(document.layout_state.line_output.lines.as_ptr(), lines);
+        assert_eq!(
+            document
+                .render_view()
+                .text()
+                .lines()
+                .iter()
+                .map(|line| (line.glyphs(), line.point()))
+                .collect::<Vec<_>>(),
+            before
+        );
+        assert_eq!(shaper.glyph_resources().len(), metrics);
     }
 
     #[test]

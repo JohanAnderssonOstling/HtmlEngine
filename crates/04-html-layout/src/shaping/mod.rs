@@ -33,10 +33,7 @@ pub(crate) use execution::{reshape_range_with_style, shape_document};
 use normalization::is_css_collapsible_space;
 pub(crate) use normalization::whitespace_context_root;
 use normalization::{collapse_whitespace, get_style, transform_text};
-pub(crate) use pseudo_styles::{
-    first_letter_style_for_inline_root, first_letter_style_overrides,
-    first_line_style_for_inline_root,
-};
+pub(crate) use pseudo_styles::{first_letter_overrides_with_characters, first_letter_style_for_inline_root, first_letter_style_overrides, first_line_style_for_inline_root};
 use spans::{plan_shaping_spans, text_runs};
 
 include!("../shaping_tests.rs");
