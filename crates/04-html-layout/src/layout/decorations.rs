@@ -1,6 +1,7 @@
 use crate::layout::{FragmentWriter, LayoutEngine};
 use crate::layout_model::{DecorationFragment, InlineContent, RoundedDecoration};
 use kurbo::Rect;
+use super::paint_program::{PaintCommand, PaintOperation, PaintStyleSource};
 
 /// Emits geometry-dependent decoration fragments while limiting mutation to
 /// fragment output and its transient decoration-order owner keys.
@@ -11,6 +12,7 @@ pub(super) struct DecorationEmitter<'scope, 'input, 'output> {
     pub(super) fragments: &'scope mut FragmentWriter<'output>,
     pub(super) placement: &'scope mut super::placement::PlacementState,
     pub(super) track_overflow_clips: bool,
+    pub(super) retained_rect: Option<Rect>,
 }
 
 impl<'scope, 'input, 'output> DecorationEmitter<'scope, 'input, 'output> {
@@ -29,6 +31,7 @@ impl<'scope, 'input, 'output> DecorationEmitter<'scope, 'input, 'output> {
             fragments,
             placement,
             track_overflow_clips,
+            retained_rect: None,
         }
     }
 }
@@ -82,17 +85,6 @@ pub(crate) fn emit_block_decorations(engine: &mut LayoutEngine<'_, '_>, box_idx:
 pub(crate) fn emit_block_border_and_outline(engine: &mut LayoutEngine<'_, '_>, box_idx: usize) {
     with_decoration_emitter(engine, |emitter| {
         emitter.emit_block_border_and_outline(box_idx)
-    });
-}
-
-pub(crate) fn emit_color_rect_for_owner(
-    engine: &mut LayoutEngine<'_, '_>,
-    owner_box_idx: usize,
-    rect: Rect,
-    color: u32,
-) {
-    with_decoration_emitter(engine, |emitter| {
-        emitter.emit_color_rect_for_owner(owner_box_idx, rect, color)
     });
 }
 
@@ -966,5 +958,48 @@ mod tests {
             black, reference_black,
             "the source and reference border geometry must agree"
         );
+    }
+}
+
+pub(crate) fn emit_bound_background(
+    engine: &mut LayoutEngine<'_, '_>, owner: usize, rect: Rect,
+    source: PaintStyleSource,
+) {
+    with_decoration_emitter(engine, |emitter| {
+        emitter.fragments.record_paint(emitter.placement, PaintOperation::BackgroundRect { owner: owner as u32, source, rect });
+        if !emitter.fragments.is_paint_replay() { return; }
+        let style = match source { PaintStyleSource::Box(index) => emitter.reader.paint_style(index as usize), PaintStyleSource::Style { indices, context } => emitter.reader.paint_used_style(indices, context as usize) };
+        emitter.emit_color_rect_for_owner(owner, rect, style.background_color());
+    });
+}
+
+pub(crate) fn emit_bound_border(
+    engine: &mut LayoutEngine<'_, '_>, owner: usize, rect: Rect,
+    source: PaintStyleSource, side: u8,
+    pattern: crate::layout_model::DecorationPattern,
+) {
+    with_decoration_emitter(engine, |emitter| {
+        emitter.fragments.record_paint(emitter.placement, PaintOperation::CollapsedBorder { owner: owner as u32, source, side, pattern, rect });
+        if !emitter.fragments.is_paint_replay() { return; }
+        let style = match source { PaintStyleSource::Box(index) => emitter.reader.paint_style(index as usize), PaintStyleSource::Style { indices, context } => emitter.reader.paint_used_style(indices, context as usize) };
+        let color = [style.border_top_color(),style.border_right_color(),style.border_bottom_color(),style.border_left_color()][side as usize];
+        if color & 0xff != 0 {
+            emitter.fragments.push_block_decoration(emitter.placement, owner as u32, DecorationFragment::patterned(rect, color, false, false, pattern));
+        }
+    });
+}
+
+pub(super) fn replay_command(engine: &mut LayoutEngine<'_, '_>, command: PaintCommand) {
+    let start = engine.fragments.decoration_len();
+    match command.operation {
+        PaintOperation::Background { owner, rect } => with_decoration_emitter(engine, |emitter| { emitter.retained_rect = Some(rect); emitter.emit_block_background(owner as usize); }),
+        PaintOperation::BorderOutline { owner, rect } => with_decoration_emitter(engine, |emitter| { emitter.retained_rect = Some(rect); emitter.emit_block_border_and_outline(owner as usize); }),
+        PaintOperation::BackgroundRect { owner, source, rect } => emit_bound_background(engine, owner as usize, rect, source),
+        PaintOperation::CollapsedBorder { owner, source, side, pattern, rect } => emit_bound_border(engine, owner as usize, rect, source, side, pattern),
+    }
+    engine.fragments.apply_paint_layers_since(start, command.layers);
+    if command.line != u32::MAX {
+        engine.fragments.record_decoration_line_since(command.line as usize, start);
+        engine.fragments.record_decoration_paint_order_since(command.paint_order, start);
     }
 }

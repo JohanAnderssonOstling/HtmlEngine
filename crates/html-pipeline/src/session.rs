@@ -259,16 +259,12 @@ impl PipelineSession {
         let shaped_key = layout_key.shaped.clone();
         let prepared_key = shaped_key.prepared.clone();
         let parsed_key = prepared_key.parsed.clone();
-        let color_preferences_changed = self.cache.inputs.as_ref().is_some_and(|previous| previous.reader_overrides != requested_inputs.reader_overrides);
+        let color_preferences_changed = self.cache.inputs.as_ref().is_some_and(|previous| previous.reader_overrides.paint_overrides() != requested_inputs.reader_overrides.paint_overrides());
         let can_repaint = color_preferences_changed
             && self.cache.inputs.as_ref().is_some_and(|previous| {
-                let mut geometry_inputs = requested_inputs.clone();
-                geometry_inputs.reader_overrides = previous.reader_overrides.clone();
                 self.cache.parsed_matches(&parsed_key)
                     && previous.same_source(&requested_inputs)
-                    && self.cache.laid_out_matches(&geometry_inputs.layout_cache_key())
-                    && previous.note_flow == requested_inputs.note_flow
-                    && previous.reader_overrides.same_layout_preferences(&requested_inputs.reader_overrides)
+                    && self.cache.laid_out_matches(&layout_key)
                     && !self.media_match_changed(&requested_inputs)
                     && self.active_resource_generation.as_ref() == Some(&glyph_shaper.glyph_resources().generation())
             });
@@ -323,7 +319,12 @@ impl PipelineSession {
 
             let prepared_reused = stage > EarliestStage::Prepare;
             let (prepared, media_queries, unpainted_prepared) = if prepared_reused {
-                (self.cache.prepared.as_ref().expect("matching prepared entry").value.clone(), None, None)
+                let prepared = if color_preferences_changed {
+                    self.cache.unpainted_prepared.as_ref().expect("prepared geometry has publication inputs").with_reader_paint_overrides(&requested_inputs.reader_overrides).map_err(|error| PipelineError(error.to_string()))?
+                } else {
+                    self.cache.prepared.as_ref().expect("matching prepared entry").value.clone()
+                };
+                (prepared, None, None)
             } else {
                 let user_styles = requested_inputs.user_styles.iter().map(String::as_str).collect::<Vec<_>>();
                 let (prepared, queries) = self.factory.build_pipeline_from_parsed_with_media_queries(&parsed, &user_styles);
@@ -340,11 +341,11 @@ impl PipelineSession {
                     .as_ref()
                     .expect("matching shaped entry")
                     .value
-                    .clone();
+                    .with_paint_from(&prepared);
                 let laid_out = if let Some(entry) = self.cache.laid_out.take() {
                     let mut candidate = entry.value;
-                    if let Err(error) = candidate.relayout_with_metrics_and_shaper(
-                        constraints,
+                    if let Err(error) = candidate.relayout_from(
+                        &prepared, constraints,
                         &requested_inputs.image_metrics,
                         glyph_shaper,
                     ) {
@@ -764,6 +765,7 @@ fn to_layout_constraints(
 
 #[cfg(test)]
 mod tests {
+    use crate::DocumentFactory;
     use super::{PipelineSession, to_layout_constraints};
     use crate::{
         EarliestStage, FontEnvironmentRevision, FontEnvironmentRevision as FontEnv,
@@ -852,9 +854,9 @@ mod tests {
     struct TracingShaper {
         colors: Vec<(char, u32)>,
         calls: usize,
-        cache: HashMap<(char, u32), GlyphId>,
+        cache: HashMap<(char, u32, u32), GlyphId>,
         glyph_store: html_layout::GlyphResourceStore,
-        append_checkpoint: Option<(HashMap<(char, u32), GlyphId>, html_layout::GlyphResourceStore)>,
+        append_checkpoint: Option<(HashMap<(char, u32, u32), GlyphId>, html_layout::GlyphResourceStore)>,
     }
 
     impl LayoutGlyphShaper for TracingShaper {
@@ -908,7 +910,7 @@ mod tests {
         ) -> Result<GlyphId, html_layout::ShapeError> {
             self.calls += 1;
             self.colors.push((ch, color));
-            let key = (ch, font_size.to_bits());
+            let key = (ch, font_size.to_bits(), color);
             if let Some(&glyph) = self.cache.get(&key) {
                 return Ok(glyph);
             }
@@ -1973,13 +1975,11 @@ mod tests {
             shaper.colors.clear();
             let update = session.update(inputs.clone(), &mut shaper).unwrap();
             for (character, expected) in [('L', accent), ('N', accent), ('G', accent), ('B', theme.adapt(0x008000ff)), ('A', theme.adapt(0xff00ffff))] {
+                let text = session.document().unwrap().render_view().text();
+                let index = (0..text.glyph_count()).find(|&index| text.glyph_at(index).and_then(|glyph| text.glyph_metric(glyph)).is_some_and(|metric| metric.ch() == character)).unwrap();
+                assert_eq!(text.paint_color_at(index as u32), Some(expected));
                 if update.stage == EarliestStage::Paint {
-                    let text = session.document().unwrap().render_view().text();
-                    let index = (0..text.glyph_count()).find(|&index| text.glyph_at(index).and_then(|glyph| text.glyph_metric(glyph)).is_some_and(|metric| metric.ch() == character)).unwrap();
-                    assert_eq!(text.paint_color_at(index as u32), Some(expected));
                     assert!(shaper.colors.is_empty(), "color updates must not reshape");
-                } else {
-                    assert!(shaper.colors.contains(&(character, expected)));
                 }
             }
         }
@@ -2108,7 +2108,7 @@ mod tests {
             session.update(inputs.clone(), &mut shaper).unwrap();
             let calls = shaper.calls;
             inputs.reader_overrides.foreground = Some(0xabcdef88);
-            assert_eq!(session.update(inputs.clone(), &mut shaper).unwrap().stage, EarliestStage::Layout);
+            assert_eq!(session.update(inputs.clone(), &mut shaper).unwrap().stage, EarliestStage::Paint);
             assert_eq!(shaper.calls, calls);
             shaper.reset();
             inputs.reader_overrides.foreground = Some(0x112233ff);
@@ -2118,7 +2118,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_specialized_paint_update_keeps_published_styles_and_resources() {
+    fn failed_font_and_paint_update_keeps_published_styles_and_resources() {
         let source = "<style>p::first-line {font-size:32px}</style><p style='position:relative'>ABC</p>";
         let mut inputs = base_inputs(source, SourceRevision::INITIAL);
         let mut session = PipelineSession::new(Arc::new(MockProvider));
@@ -2129,12 +2129,141 @@ mod tests {
         let generation = shaper.glyph_resources().generation();
         shaper.fail_on = Some('A');
         inputs.reader_overrides.foreground = Some(0x123456ff);
+        inputs.font_environment = inputs.font_environment.next();
         assert!(session.update(inputs, &mut shaper).is_err());
         assert_eq!(build_snapshot(session.document().unwrap()), snapshot);
         assert_eq!(shaper.resources, resources);
         assert_eq!(shaper.glyph_resources().generation(), generation);
         assert_eq!(session.cache.inputs.as_ref().unwrap().reader_overrides.foreground, None);
         assert_eq!(session.document().unwrap().render_view().text().paint_color_at(0), None);
+    }
+
+    #[test]
+    fn paint_preferences_have_independent_cache_keys() {
+        let original = base_inputs("<p>text</p>", SourceRevision::INITIAL);
+        let mut painted = original.clone();
+        painted.reader_overrides.foreground = Some(0xabcdef88);
+        painted.reader_overrides.link_foreground = Some(0xabcdef88);
+        painted.reader_overrides.background = Some(0x112233ff);
+        painted.reader_overrides.theme = Some(crate::ThemeAdaptation { ink: 0xddddddff, surface: 0x222222ff });
+        assert_eq!(original.prepared_cache_key(), painted.prepared_cache_key());
+        assert_eq!(original.shaped_cache_key(), painted.shaped_cache_key());
+        assert_eq!(original.layout_cache_key(), painted.layout_cache_key());
+        assert_ne!(original.render_only_cache_key(), painted.render_only_cache_key());
+        painted.reader_overrides.minimum_font_size = Some(32.0);
+        assert_ne!(original.prepared_cache_key(), painted.prepared_cache_key());
+    }
+
+    #[test]
+    fn retained_paint_program_matches_full_cascade_for_specialized_and_clipped_layouts() {
+        let sources = [
+            include_str!("../../../testdata/pipeline/paint/01-clipped.html"),
+            include_str!("../../../testdata/pipeline/paint/02-collapsed-table.html"),
+            include_str!("../../../testdata/pipeline/paint/03-separate-table.html"),
+            include_str!("../../../testdata/pipeline/paint/04-positioned-flex-grid.html"),
+            include_str!("../../../testdata/pipeline/paint/05-pseudo-styles.html"),
+            include_str!("../../../testdata/pipeline/paint/06-math-and-links.html"),
+            include_str!("../../../testdata/pipeline/paint/07-inline-atomic.html"),
+            include_str!("../../../testdata/pipeline/paint/08-linked-table-columns.html"),
+        ];
+        let theme = crate::ThemeAdaptation { ink: 0xeeeeeeff, surface: 0x222222ff };
+        for source in sources {
+            let mut inputs = base_inputs(source, SourceRevision::INITIAL);
+            inputs.layout.viewport_width = 140.0;
+            let mut session = PipelineSession::new(Arc::new(MockProvider));
+            let mut shaper = TracingShaper::default();
+            session.update(inputs.clone(), &mut shaper).unwrap();
+            let calls = shaper.calls;
+            let line_clips: Vec<_> = session.document().unwrap().render_view().text().lines().iter().map(|line| session.document().unwrap().render_view().text().line_overflow_clip(line.index())).collect();
+            for palette in [
+                crate::ReaderStyleOverrides { foreground: Some(0x123456ff), background: Some(0xeeeeddff), ..Default::default() },
+                crate::ReaderStyleOverrides { theme: Some(theme), link_foreground: Some(0x99aabbff), ..Default::default() },
+                crate::ReaderStyleOverrides::default(),
+            ] {
+                inputs.reader_overrides = palette.clone();
+                let update = session.update(inputs.clone(), &mut shaper).unwrap();
+                assert_eq!(update.stage, EarliestStage::Paint, "{source}");
+                assert_eq!(shaper.calls, calls, "palette changes must not enter shaping");
+                let candidate = session.document().unwrap();
+                let mut factory = DocumentFactory::new();
+                factory.set_reader_overrides(palette);
+                let prepared = factory.parse_with_new_pipeline(source, None);
+                let mut reference_shaper = TracingShaper::default();
+                let reference = prepared.shape(&mut reference_shaper).unwrap().layout_with_metrics_and_shaper(to_layout_constraints(inputs.layout).unwrap(), &inputs.image_metrics, &mut reference_shaper).unwrap();
+                let mut actual = build_snapshot(candidate);
+                let mut expected = build_snapshot(&reference);
+                actual.glyphs.clear(); expected.glyphs.clear();
+                assert_eq!(actual, expected, "full-cascade paint parity: {source}");
+                let decorations = |doc: &LaidOutDocument| doc.render_view().fragments().decorations().iter().map(|decoration| format!("{decoration:?}")).collect::<Vec<_>>();
+                assert_eq!(decorations(candidate), decorations(&reference), "decoration clips, patterns and layers: {source}");
+                assert_eq!(candidate.render_view().canvas_background_color(), reference.render_view().canvas_background_color());
+                let text = candidate.render_view().text();
+                assert_eq!((0..text.line_count()).map(|index| text.line_overflow_clip(index)).collect::<Vec<_>>(), line_clips);
+                for index in 0..text.glyph_count() {
+                    let actual_glyph = text.glyph_at(index).unwrap();
+                    let actual_color = text.paint_color_at(index as u32).unwrap_or_else(|| shaper.cache.iter().find_map(|(&(character, _, color), &glyph)| (glyph == actual_glyph && text.glyph_metric(glyph).is_some_and(|metric| metric.ch() == character)).then_some(color)).unwrap());
+                    let expected_glyph = reference.render_view().text().glyph_at(index).unwrap();
+                    let expected_color = reference_shaper.cache.iter().find_map(|(&(_, _, color), &glyph)| (glyph == expected_glyph).then_some(color)).unwrap();
+                    assert_eq!(actual_color, expected_color, "effective glyph color at {index}: {source}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn excluded_notes_keep_link_paint_bindings_for_non_box_table_styles() {
+        let source = "<p>Main flow without links</p><aside id='n' epub:type='footnote'><a href='x'><table><colgroup style='background:currentColor'><col></colgroup><tr><td>note</td></tr></table></a></aside>";
+        for palette in [
+            crate::ReaderStyleOverrides { foreground: Some(0x123456ff), ..Default::default() },
+            crate::ReaderStyleOverrides { link_foreground: Some(0x99aabbff), ..Default::default() },
+        ] {
+            let mut inputs = base_inputs(source, SourceRevision::INITIAL);
+            inputs.note_flow = html_layout::NoteFlow::Excluded;
+            let mut session = PipelineSession::new(Arc::new(MockProvider));
+            let mut shaper = TracingShaper::default();
+            session.update(inputs.clone(), &mut shaper).unwrap();
+            inputs.reader_overrides = palette.clone();
+            assert_eq!(session.update(inputs, &mut shaper).unwrap().stage, EarliestStage::Paint);
+            let constraints = html_layout::LayoutConstraints::new(200.0, 20.0).unwrap();
+            let note = session.layout_note("n", constraints, &mut shaper).unwrap();
+            let mut factory = DocumentFactory::new();
+            factory.set_reader_overrides(palette.clone());
+            let prepared = factory.parse_with_new_pipeline(source, None).scoped_to_element_id("n").unwrap();
+            let mut reference_shaper = TracingShaper::default();
+            let reference = prepared.shape(&mut reference_shaper).unwrap().layout(constraints);
+            let mut actual = build_snapshot(&note);
+            let mut expected = build_snapshot(&reference);
+            actual.glyphs.clear(); expected.glyphs.clear();
+            assert_eq!(actual, expected);
+            let decorations = |doc: &LaidOutDocument| doc.render_view().fragments().decorations().iter().map(|decoration| format!("{decoration:?}")).collect::<Vec<_>>();
+            assert_eq!(decorations(&note), decorations(&reference));
+            let expected_color = palette.link_foreground.or(palette.foreground).unwrap();
+            let text = note.render_view().text();
+            for index in 0..text.glyph_count() {
+                assert_eq!(text.paint_color_at(index as u32), Some(expected_color));
+            }
+        }
+    }
+
+    #[test]
+    fn simultaneous_width_and_paint_changes_retarget_the_retained_layout() {
+        let mut inputs = base_inputs("<p><a href='x'>some linked words that wrap across lines</a></p>", SourceRevision::INITIAL);
+        let mut session = PipelineSession::new(Arc::new(MockProvider));
+        let mut shaper = TracingShaper::default();
+        session.update(inputs.clone(), &mut shaper).unwrap();
+        let calls = shaper.calls;
+        inputs.layout.viewport_width = 10.0;
+        inputs.reader_overrides.foreground = Some(0xabcdef88);
+        inputs.reader_overrides.link_foreground = Some(0x998877ff);
+        assert_eq!(session.update(inputs.clone(), &mut shaper).unwrap().stage, EarliestStage::Layout);
+        assert_eq!(shaper.calls, calls);
+        let doc = session.document().unwrap();
+        let text = doc.render_view().text();
+        assert!(text.line_count() > 1);
+        assert_eq!(text.paint_color_at(0), Some(0x998877ff));
+        let mut fresh = PipelineSession::new(Arc::new(MockProvider));
+        fresh.update(inputs, &mut TracingShaper::default()).unwrap();
+        assert_eq!(build_snapshot(doc), build_snapshot(fresh.document().unwrap()));
     }
 
     #[test]

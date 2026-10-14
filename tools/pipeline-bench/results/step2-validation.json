@@ -1,0 +1,41 @@
+{
+  "step": "independent_paint_and_geometry",
+  "before_commit": "7246150a3f09d1134327486339c0289cb12940dd",
+  "tests": {
+    "step2-tests-final.log": {
+      "passed": 735,
+      "ignored": 2
+    },
+    "step2-reader-tests.log": {
+      "passed": 159,
+      "ignored": 2
+    }
+  },
+  "frozen_full_cascade_fixture_comparisons": 24,
+  "real_chapter_comparisons": "All successful old-engine cases match glyph/line counts, geometry/paint, effective text colors and source correspondence. Old paint updates panic in c1/c3; candidate matches independent full-cascade layout instead.",
+  "intentional_correctness_change": "First-line shaping reuses the normalized first-letter selection. The old path reinterpreted renderer glyph cache IDs as codepoints, selecting punctuation and expanded letters incorrectly. A dedicated test checks opening punctuation and the full uppercase expansion of \u00df.",
+  "scope": "Real c1/c2/c3 HTML, CSS and provider resources; deterministic mock font backend. Native font shaping, GPU work, image decoding and full application latency are outside this harness.",
+  "method": {
+    "cpu_affinity": 3,
+    "timing_rounds": 3,
+    "samples_per_round": 11,
+    "warmups_per_process": 3,
+    "order": "alternating before/after",
+    "heap_samples": 5,
+    "cpu_time": "CLOCK_PROCESS_CPUTIME_ID",
+    "instructions": "Linux perf user-mode retired instructions, gated to measured operation, scaled for multiplexing",
+    "memory": "Separate allocator-instrumented process records live and peak requested heap; uninstrumented process getrusage records peak RSS. Decimal MB."
+  },
+  "timing_limitation": "Other tasks ran on this shared machine. Large wall-time/CPU-time gaps and per-round drift show scheduler contention and clock/cache variation. Timings are observed values; instruction counts give the more stable CPU-work comparison. The final run began after this task finished compiling.",
+  "tradeoffs": "The retained generalized decoration program reduces paint work and retained heap, with about 0.4-1.0% extra instructions for font/resize/handoff cases across these chapters. Palette updates cover specialized layouts without relayout.",
+  "baseline_exceptions": [
+    "Preexisting style-model size/niche assertion filtered out",
+    "External WPT integration requires unavailable HTML_WPT_ROOT"
+  ],
+  "binaries_sha256": {
+    "step2-before-time": "034c750e04cc03dc60d3639c7a9b0fe205f8c236561dd4d21b5b8a15f66a7d62",
+    "step2-before-heap": "b60361d342d8d48d9978957e521eebdc90546ff0b8890fb2b3ef529f9d8f4841",
+    "step2-after-time": "e3daaacfcdba4a639ec980f2e40991fb10cf3e975e9d0565280151d9a72e9554",
+    "step2-after-heap": "bf0ef0a6f0e5f30e7fad9f1ab0d1e552f3a0880dd280d778eeecf3415ddf71cf"
+  }
+}

@@ -74,6 +74,10 @@ pub(crate) fn layout_with_timings(
         0,
     );
     context.run();
+    context.reader = context.reader.with_paint(inputs.paint);
+    let paint_started = context.start_timing();
+    context.repaint();
+    context.record_timing(|timings| timings.finalize_layout += paint_started.elapsed());
     if let (Some(destination), Some(collected)) = (timings, context.timings.take()) {
         *destination = collected.into_inner();
     }
@@ -135,6 +139,7 @@ pub(crate) struct LayoutInputs<'a> {
     pub(crate) hyphen_glyphs: &'a rustc_data_structures::fx::FxHashMap<u32, GlyphId>,
     pub(crate) inline_plans: &'a crate::layout::PreparedInlinePlans,
     pub(crate) image_metrics: &'a crate::ImageMetrics,
+    pub(crate) paint: &'a crate::stages::PaintStyles,
 }
 
 pub(crate) struct LayoutOutputs<'out, 'scratch> {
@@ -280,15 +285,6 @@ impl<'a, 'out> LayoutEngine<'a, 'out> {
 
     pub(crate) fn push_line_owner(&mut self, owner: u32) {
         self.fragments.push_line_owner(&mut self.placement, owner);
-    }
-
-    pub(crate) fn push_block_decoration(
-        &mut self,
-        owner: u32,
-        decoration: crate::layout_model::DecorationFragment,
-    ) {
-        self.fragments
-            .push_block_decoration(&mut self.placement, owner, decoration);
     }
 
     pub(crate) fn natural_content_height(&self, box_idx: usize) -> f64 {
@@ -457,12 +453,12 @@ impl LayoutReadContext<'_> {
     }
 }
 
-/// Rebuild paint fragments over retained line and box geometry. Specialized
-/// formatting contexts are rejected by the document before entering this path.
+/// Rebuild paint fragments over retained line and box geometry without
+/// running geometry algorithms or modifying their retained placement state.
 pub(crate) fn repaint(inputs: LayoutInputs<'_>, geometry: &mut BoxGeometry, state: &mut LayoutState, constraints: crate::LayoutConstraints) {
     let mut placement = PlacementState::default();
     let mut scratch = LayoutScratch::default();
-    let reader = LayoutReader::new(inputs.document, inputs.styles, inputs.topology, inputs.inline_content, inputs.glyph_metrics, inputs.font_metrics, inputs.image_metrics);
+    let reader = LayoutReader::new(inputs.document, inputs.styles, inputs.topology, inputs.inline_content, inputs.glyph_metrics, inputs.font_metrics, inputs.image_metrics).with_paint(inputs.paint);
     let text = InlineReader::new(inputs.inline_content, inputs.glyph_metrics, inputs.text_geometry, inputs.ellipsis_glyphs, inputs.hyphen_glyphs);
     let read = LayoutReadContext { config: LayoutConfig::new(constraints), track_overflow_clips: reader.tracks_overflow_clips(), reader, text, inline_plans: inputs.inline_plans };
     let mut engine = LayoutEngine::new(read, LayoutOutputs { geometry, state, placement: &mut placement, scratch: &mut scratch }, None, 0);

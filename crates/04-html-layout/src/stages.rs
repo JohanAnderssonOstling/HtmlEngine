@@ -24,12 +24,14 @@ pub use output::{
 mod mathml;
 #[path = "stages/lifecycle.rs"]
 mod lifecycle;
+mod paint;
+pub(crate) use paint::PaintStyles;
 #[path = "stages/semantics.rs"]
 mod semantics;
 
 pub(crate) use html_dom::element_is_note_target;
 pub use lifecycle::{ImageSizingPolicy, LaidOutDocument, LayoutConstraintError, LayoutConstraints, NoteFlow, PrepareError, PreparedDocument, ShapeLayoutTimings, ShapedDocument, TextCompositionPolicy};
-pub(crate) use lifecycle::{PaintColorRun, PreparedInputs, ShapedText};
+pub(crate) use lifecycle::{PaintColorRun, PreparedInputs, ShapedText, TextPaintRange};
 use semantics::{LinkGlyphTarget, box_id, collect_anchor_glyphs, collect_link_glyph_targets};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -43,12 +45,7 @@ fn first_line_style_ranges(document: &LaidOutDocument) -> Vec<FirstLineStyleRang
     if !document.inputs.styles.has_first_line_styles() {
         return Vec::new();
     }
-    let first_letter = crate::shaping::first_letter_style_overrides(
-        &document.inputs.document,
-        &document.inputs.styles,
-        &document.inputs.layout_tree,
-        &document.base_shaped.inline_content,
-    );
+    let first_letter = document.inputs.text.first_letter_styles();
     let mut result = Vec::new();
     for line in document
         .layout_state
@@ -92,16 +89,10 @@ fn first_line_style_ranges(document: &LaidOutDocument) -> Vec<FirstLineStyleRang
                 .get_box_style_indices(run.box_idx as usize)
                 .unwrap_or_else(|| document.inputs.styles.default_indices());
             let mut segment_start = start;
-            let mut segment_style = first_letter
-                .get(start as usize)
-                .copied()
-                .flatten()
+            let mut segment_style = first_letter.segment(start, start + 1).0
                 .unwrap_or(first_line_style);
             for glyph in start + 1..end {
-                let style = first_letter
-                    .get(glyph as usize)
-                    .copied()
-                    .flatten()
+                let style = first_letter.segment(glyph, glyph + 1).0
                     .unwrap_or(first_line_style);
                 if style != segment_style {
                     append_first_line_style_range(
@@ -185,6 +176,9 @@ fn shape_first_line_ranges(
     let mut shaped = (**base).clone();
     shaped.glyph_metrics = seed.clone();
     shaped.inline_plans = crate::layout::PreparedInlinePlans::new(&inputs.layout_tree, &shaped.inline_content);
+    let mut paint_ranges: Vec<_> = ranges.iter().map(|range| TextPaintRange { glyphs: range.glyphs.clone(), style: range.style }).collect();
+    paint_ranges.sort_by_key(|range| range.glyphs.start);
+    shaped.paint_ranges = paint_ranges.into();
     for range in ranges {
         crate::shaping::reshape_range_with_style(
             &inputs.styles,

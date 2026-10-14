@@ -1,3 +1,6 @@
+mod paint;
+pub use paint::StylePaintColors;
+
 use html_dom::{Document, DocumentLineage, DomNodeId, MemoryUsageReport, NodeRef};
 use kurbo::Vec2;
 use rustc_data_structures::fx::{FxHashMap, FxHasher};
@@ -3285,6 +3288,7 @@ impl ComputedStyles {
             computed,
             font_relative,
             root_relative,
+            paint: None,
         })
     }
 
@@ -3833,6 +3837,7 @@ pub struct StyleView<'a> {
 #[derive(Clone, Copy, Debug)]
 pub struct UsedStyleView<'a> {
     computed: StyleView<'a>,
+    paint: Option<&'a StylePaintColors>,
     font_relative: FontRelativeRatios,
     root_relative: RootRelativeLengths,
 }
@@ -4334,6 +4339,12 @@ fn used_border_width(style: BorderStyle, width: f32) -> f32 {
 }
 
 impl<'a> UsedStyleView<'a> {
+    /// Attach paint values while retaining the same resolved geometry style.
+    pub fn with_paint_colors(mut self, colors: &'a StylePaintColors) -> Self {
+        self.paint = Some(colors);
+        self
+    }
+
     pub fn font_size(&self) -> f32 {
         self.computed
             .font
@@ -4352,7 +4363,7 @@ impl<'a> UsedStyleView<'a> {
         self.computed.font_variant_small_caps()
     }
     pub fn color(&self) -> u32 {
-        self.computed.color()
+        self.paint.map_or_else(|| self.computed.color(), |paint| paint.foreground)
     }
     pub fn visibility(&self) -> Visibility {
         self.computed.visibility()
@@ -4514,16 +4525,16 @@ impl<'a> UsedStyleView<'a> {
         self.computed.aspect_ratio()
     }
     pub fn border_top_color(&self) -> u32 {
-        self.computed.border_top_color()
+        self.paint.map_or_else(|| self.computed.border_top_color(), |paint| paint.borders[0])
     }
     pub fn border_right_color(&self) -> u32 {
-        self.computed.border_right_color()
+        self.paint.map_or_else(|| self.computed.border_right_color(), |paint| paint.borders[1])
     }
     pub fn border_bottom_color(&self) -> u32 {
-        self.computed.border_bottom_color()
+        self.paint.map_or_else(|| self.computed.border_bottom_color(), |paint| paint.borders[2])
     }
     pub fn border_left_color(&self) -> u32 {
-        self.computed.border_left_color()
+        self.paint.map_or_else(|| self.computed.border_left_color(), |paint| paint.borders[3])
     }
     pub fn border_top_style(&self) -> BorderStyle {
         self.computed.border_top_style()
@@ -4538,13 +4549,13 @@ impl<'a> UsedStyleView<'a> {
         self.computed.border_left_style()
     }
     pub fn background_color(&self) -> u32 {
-        self.computed.background_color()
+        self.paint.map_or_else(|| self.computed.background_color(), |paint| paint.background)
     }
     pub fn background_image_present(&self) -> bool {
         self.computed.background_image_present()
     }
     pub fn text_decoration_color(&self) -> u32 {
-        self.computed.text_decoration_color()
+        self.paint.map_or_else(|| self.computed.text_decoration_color(), |paint| paint.text_decoration)
     }
     pub fn outline(&self) -> UsedOutline {
         let outline = self.computed.outline();
@@ -4563,7 +4574,7 @@ impl<'a> UsedStyleView<'a> {
         }
     }
     pub fn outline_color(&self) -> u32 {
-        self.computed.outline_color()
+        self.paint.map_or_else(|| self.computed.outline_color(), |paint| paint.outline)
     }
     pub fn x_height_ratio(&self) -> f32 {
         self.font_relative.x_height

@@ -975,10 +975,6 @@ fn emit_table_row_layer_background<'a>(
     row_starts: &[f64],
     row_heights: &[f64],
 ) {
-    let color = session.reader.style(owner_box_idx).background_color();
-    if color & 0xFF == 0 {
-        return;
-    }
     for placement in placements {
         let width = span_extent(
             &columns.starts,
@@ -994,7 +990,7 @@ fn emit_table_row_layer_background<'a>(
         else {
             continue;
         };
-        crate::layout::emit_color_rect_for_owner(
+        crate::layout::decorations::emit_bound_background(
             session,
             owner_box_idx,
             Rect::new(
@@ -1003,7 +999,7 @@ fn emit_table_row_layer_background<'a>(
                 table_content_pos.x + x + width,
                 table_content_pos.y + y + height,
             ),
-            color,
+            crate::layout::paint_program::PaintStyleSource::Box(owner_box_idx as u32),
         );
     }
 }

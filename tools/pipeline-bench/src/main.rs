@@ -1,3 +1,4 @@
+mod counter;
 use html::layout::{
     FontSlant, GlyphId, GlyphMetric, GlyphResourceStore, GlyphShaper, ShapeError, ShapedTextRun,
     TextRunShapeRequest,
@@ -19,8 +20,12 @@ fn layout_fingerprint(document: &html::layout::LaidOutDocument) -> u64 {
     let bits = |value: f64| if value == 0.0 { 0 } else { value.to_bits() };
     mix(text.glyph_count() as u64);
     mix(text.line_count() as u64);
+    mix(view.canvas_background_color().unwrap_or(0) as u64);
     for index in 0..text.glyph_count() {
-        mix(text.glyph_at(index).unwrap_or_default() as u64);
+        mix(text
+            .glyph_at(index)
+            .and_then(|glyph| text.glyph_metric(glyph))
+            .map_or(0, |metric| metric.ch() as u64));
         mix(text
             .line_index_for_glyph(index as u32)
             .unwrap_or(usize::MAX) as u64);
@@ -102,6 +107,31 @@ fn layout_fingerprint(document: &html::layout::LaidOutDocument) -> u64 {
         }
         mix(decoration.color() as u64);
         mix(decoration.is_inline() as u64);
+        mix(decoration.is_background() as u64);
+        mix(decoration.is_border() as u64);
+        mix(decoration.is_foreground() as u64);
+        mix(decoration.pattern() as u64);
+        mix(decoration.is_in_positioned_layer() as u64);
+        mix(decoration.is_in_negative_positioned_layer() as u64);
+        mix(decoration.is_in_independent_positioned_layer() as u64);
+        mix(decoration.line_idx().unwrap_or(usize::MAX) as u64);
+        mix(decoration.paint_order() as u64);
+        mix(decoration.border_width().map_or(0, |width| width.to_bits()) as u64);
+        if let Some(radii) = decoration.radii() {
+            mix(1);
+            for (x, y) in [
+                radii.top_left,
+                radii.top_right,
+                radii.bottom_right,
+                radii.bottom_left,
+            ] {
+                mix(x.to_bits() as u64);
+                mix(y.to_bits() as u64);
+            }
+        } else {
+            mix(0);
+        }
+
         if let Some(clip) = decoration.overflow_clip() {
             mix(1);
             let rect = clip.rect();
@@ -137,11 +167,21 @@ fn layout_fingerprint(document: &html::layout::LaidOutDocument) -> u64 {
 }
 #[derive(Default)]
 struct Shaper {
+    append_checkpoint: Option<(GlyphResourceStore, HashMap<(char, u32, u32), GlyphId>)>,
     resources: GlyphResourceStore,
     cache: HashMap<(char, u32, u32), GlyphId>,
     calls: usize,
 }
 impl GlyphShaper for Shaper {
+    fn begin_append_shaping(&mut self) -> Result<(), ShapeError> {
+        assert!(self.append_checkpoint.is_none());
+        self.append_checkpoint = Some((self.resources.clone(), self.cache.clone()));
+        Ok(())
+    }
+    fn commit_append_shaping(&mut self) { self.append_checkpoint = None; }
+    fn rollback_append_shaping(&mut self) {
+        if let Some((resources, cache)) = self.append_checkpoint.take() { self.resources = resources; self.cache = cache; }
+    }
     fn reset(&mut self) {
         self.resources.clear();
         self.cache.clear();
@@ -339,6 +379,23 @@ fn source_fingerprint(doc: &html::layout::LaidOutDocument) -> u64 {
     }
     hash
 }
+fn text_color_fingerprint(document: &html::layout::LaidOutDocument, shaper: &Shaper) -> u64 {
+    let mut glyph_colors = vec![0; shaper.resources.len()];
+    for (&(_, _, color), &glyph) in &shaper.cache {
+        glyph_colors[glyph as usize] = color;
+    }
+    let text = document.render_view().text();
+    let mut hash = 0xcbf29ce484222325u64;
+    for index in 0..text.glyph_count() {
+        let glyph = text.glyph_at(index).unwrap();
+        let color = text
+            .paint_color_at(index as u32)
+            .unwrap_or(glyph_colors[glyph as usize]);
+        hash = (hash ^ u64::from(color)).wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
 fn main() {
     let args: Vec<_> = std::env::args().collect();
     let path = &args[1];
@@ -347,6 +404,105 @@ fn main() {
     let mut inputs = input(std::fs::read_to_string(path).unwrap());
     inputs.base_uri = path.clone();
     inputs.markup_syntax = MarkupSyntax::from_uri(path);
+    let palette = args.get(4).map(String::as_str).unwrap_or("links");
+    match palette {
+        "foreground" => {
+            inputs.reader_overrides.foreground = Some(0x123456ff);
+            inputs.reader_overrides.background = Some(0xeeeeddff);
+            inputs.reader_overrides.link_foreground = None;
+        }
+        "theme" => {
+            inputs.reader_overrides.theme = Some(html::layout::ThemeAdaptation {
+                ink: 0xeeeeeeff,
+                surface: 0x222222ff,
+            });
+            inputs.reader_overrides.link_foreground = Some(0x99aabbff);
+        }
+        "default" => {
+            inputs.reader_overrides.link_foreground = None;
+        }
+        "links" => {}
+        _ => panic!("unknown palette"),
+    }
+    if case == "profile" {
+        let mut samples: HashMap<&str, Vec<f64>> = HashMap::new();
+        for iteration in 0..count + 3 {
+            let mut factory = DocumentFactory::new();
+            factory.set_resource_context(Arc::new(FileSystemProvider), path.clone());
+            factory.set_reader_overrides(inputs.reader_overrides.layout_overrides());
+            factory.set_media_environment(inputs.style_environment.media);
+            let start = cpu_seconds();
+            let parsed = parse_document(&inputs.source, inputs.markup_syntax).unwrap();
+            let parsed_at = cpu_seconds();
+            let base = factory.build_pipeline_from_parsed(&parsed, &[]);
+            let prepared_at = cpu_seconds();
+            let prepared = base
+                .with_reader_paint_overrides(&inputs.reader_overrides)
+                .unwrap();
+            let painted_at = cpu_seconds();
+            let mut shaper = Shaper::default();
+            let shaped = prepared.shape(&mut shaper).unwrap();
+            let shaped_at = cpu_seconds();
+            let document = shaped
+                .layout_with_metrics_and_shaper(
+                    html::layout::LayoutConstraints::new(600.0, 16.0).unwrap(),
+                    &inputs.image_metrics,
+                    &mut shaper,
+                )
+                .unwrap();
+            let laid_out_at = cpu_seconds();
+            black_box(&document);
+            if iteration >= 3 {
+                for (name, seconds) in [
+                    ("parse", parsed_at - start),
+                    ("prepare", prepared_at - parsed_at),
+                    ("paint_prepare", painted_at - prepared_at),
+                    ("shape", shaped_at - painted_at),
+                    ("layout", laid_out_at - shaped_at),
+                ] {
+                    samples.entry(name).or_default().push(seconds * 1000.0);
+                }
+            }
+        }
+        let result: serde_json::Map<_, _> = samples
+            .into_iter()
+            .map(|(name, mut values)| {
+                (
+                    name.to_owned(),
+                    json!({"median_cpu_ms":median(&mut values),"samples":values}),
+                )
+            })
+            .collect();
+        println!("{}", json!({"case":case,"stages":result}));
+        return;
+    }
+    if case == "reference" {
+        if palette == "links" && count % 2 == 0 {
+            inputs.reader_overrides.link_foreground = Some(0x3388ccff);
+        }
+        let mut factory = DocumentFactory::new();
+        factory.set_resource_context(Arc::new(FileSystemProvider), path.clone());
+        factory.set_reader_overrides(inputs.reader_overrides.clone());
+        factory.set_media_environment(inputs.style_environment.media);
+        let parsed = parse_document(&inputs.source, inputs.markup_syntax).unwrap();
+        let prepared = factory.build_pipeline_from_parsed(&parsed, &[]);
+        let mut shaper = Shaper::default();
+        let doc = prepared
+            .shape(&mut shaper)
+            .unwrap()
+            .layout_with_metrics_and_shaper(
+                html::layout::LayoutConstraints::new(600.0, 16.0).unwrap(),
+                &inputs.image_metrics,
+                &mut shaper,
+            )
+            .unwrap();
+        println!(
+            "{}",
+            json!({"case":case,"chapter":path.rsplit('/').next().unwrap(),"glyphs":doc.render_view().text().glyph_count(),"lines":doc.render_view().text().line_count(),"render_fingerprint":format!("{:016x}",layout_fingerprint(&doc)),"source_fingerprint":format!("{:016x}",source_fingerprint(&doc)),"text_color_fingerprint":format!("{:016x}",text_color_fingerprint(&doc,&shaper))})
+        );
+        return;
+    }
+
     let mut session = PipelineSession::new(Arc::new(FileSystemProvider));
     let mut shaper = Shaper::default();
     if case != "cold" {
@@ -358,6 +514,12 @@ fn main() {
         None
     };
     black_box(&view);
+    let mut instructions = Vec::with_capacity(count);
+    let mut counter = if cfg!(feature = "heap") {
+        None
+    } else {
+        counter::InstructionCounter::new()
+    };
     let mut walls = Vec::with_capacity(count);
     let mut cpus = Vec::with_capacity(count);
     let mut retained = Vec::with_capacity(count);
@@ -384,6 +546,9 @@ fn main() {
             _ => panic!("unknown case"),
         }
         heap::reset();
+        if let Some(counter) = counter.as_mut() {
+            counter.start();
+        }
         let cpu = cpu_seconds();
         let wall = Instant::now();
         black_box(session.update(inputs.clone(), &mut shaper).unwrap());
@@ -393,8 +558,12 @@ fn main() {
         }
         let elapsed = wall.elapsed().as_secs_f64() * 1000.0;
         let consumed = (cpu_seconds() - cpu) * 1000.0;
+        let instruction_count = counter.as_mut().and_then(counter::InstructionCounter::stop);
         let (live, peak, allocs, bytes) = heap::sample();
         if iteration >= 3 {
+            if let Some(value) = instruction_count {
+                instructions.push(value as f64);
+            }
             walls.push(elapsed);
             cpus.push(consumed);
             retained.push(live as f64);
@@ -406,6 +575,6 @@ fn main() {
     let doc = session.document().unwrap();
     let reported = doc.memory_usage_bytes();
     let rss = peak_rss();
-    let output = json!({"case":case,"chapter":path.rsplit('/').next().unwrap(),"samples":count,"font_backend":"deterministic mock","heap_instrumented":cfg!(feature="heap"),"wall_median_ms":median(&mut walls),"cpu_median_ms":median(&mut cpus),"heap_live_bytes":median(&mut retained) as usize,"heap_peak_bytes":median(&mut peaks) as usize,"allocation_requests":median(&mut allocations) as usize,"allocated_bytes":median(&mut allocated_bytes) as usize,"rss_peak_bytes":rss,"reported_document_bytes":reported,"glyphs":doc.render_view().text().glyph_count(),"lines":doc.render_view().text().line_count(),"render_fingerprint":format!("{:016x}",layout_fingerprint(doc)),"source_fingerprint":format!("{:016x}",source_fingerprint(doc))});
+    let output = json!({"case":case,"chapter":path.rsplit('/').next().unwrap(),"samples":count,"font_backend":"deterministic mock","heap_instrumented":cfg!(feature="heap"),"wall_median_ms":median(&mut walls),"cpu_median_ms":median(&mut cpus),"user_instructions":if instructions.len()==count {Some(median(&mut instructions) as u64)} else {None},"heap_live_bytes":median(&mut retained) as usize,"heap_peak_bytes":median(&mut peaks) as usize,"allocation_requests":median(&mut allocations) as usize,"allocated_bytes":median(&mut allocated_bytes) as usize,"rss_peak_bytes":rss,"reported_document_bytes":reported,"glyphs":doc.render_view().text().glyph_count(),"lines":doc.render_view().text().line_count(),"render_fingerprint":format!("{:016x}",layout_fingerprint(doc)),"text_color_fingerprint":format!("{:016x}",text_color_fingerprint(doc,&shaper)),"source_fingerprint":format!("{:016x}",source_fingerprint(doc))});
     println!("{output}");
 }

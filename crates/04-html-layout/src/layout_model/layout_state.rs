@@ -11,6 +11,7 @@ use std::num::NonZeroU32;
 /// Produced by the layout phase and consumed read-only by the renderer.
 #[derive(Default, Clone)]
 pub(crate) struct LayoutState {
+    pub paint_program: crate::layout::paint_program::PaintProgram,
     pub line_output: LineOutput,
     pub fragment_output: FragmentOutput,
     pub semantic_indexes: SemanticIndexes,
@@ -93,6 +94,7 @@ pub(crate) struct SemanticIndexes {
 impl LayoutState {
     pub(crate) fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
+        report.extend_prefixed("LayoutState.paint_program", self.paint_program.memory_usage_report());
         report.add_slice_storage::<Line>(
             "LayoutState.line_output.lines.storage",
             self.line_output.lines.capacity(),

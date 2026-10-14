@@ -46,14 +46,25 @@ for chapter in chapters:
             if 'error' not in summary:
                 for key in ['wall_median_ms', 'cpu_median_ms']:
                     summary[key] = statistics.median(run[key] for run in runs)
+                if all(run.get('user_instructions') is not None for run in runs):
+                    summary['user_instructions'] = int(statistics.median(run['user_instructions'] for run in runs))
+                summary['rss_peak_bytes'] = int(statistics.median(run['rss_peak_bytes'] for run in runs))
                 summary['measured_samples'] = args.samples * len(runs)
             summary['rounds'] = runs
             row['time'][variant] = summary
             row['heap'][variant] = run(getattr(args, variant + '_heap'), chapter, case, 5)
+        if all('error' not in sample for variant in samples.values() for sample in variant):
+            row['paired_change_percent'] = {key: 100 * statistics.median(after[key] / before[key] - 1 for before, after in zip(samples['before'], samples['after'])) for key in ['wall_median_ms', 'cpu_median_ms']}
         before, after = row['time']['before'], row['time']['after']
         if 'error' not in before and 'error' not in after:
-            for key in ['glyphs', 'lines', 'render_fingerprint', 'source_fingerprint']:
+            for key in ['glyphs', 'lines', 'render_fingerprint', 'source_fingerprint', 'text_color_fingerprint']:
                 assert before[key] == after[key], (chapter.name, case, key, before[key], after[key])
+        if case == 'paint' and 'error' in before and 'error' not in after:
+            reference = run(args.before_time, chapter, 'reference', args.samples)
+            assert 'error' not in reference, reference
+            row['full_layout_reference'] = reference
+            for key in ['glyphs', 'lines', 'render_fingerprint', 'source_fingerprint', 'text_color_fingerprint']:
+                assert reference[key] == after[key], (chapter.name, case, key, reference[key], after[key])
         results.append(row)
         Path(args.output).write_text(json.dumps({'cpu': args.cpu, 'results': results}, indent=2) + '\n')
         print(json.dumps(row), flush=True)

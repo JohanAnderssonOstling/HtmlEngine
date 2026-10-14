@@ -7,6 +7,7 @@ pub(crate) struct PhysicalBorderEdge {
     pub style: BorderStyle,
     pub width: f64,
     pub color: u32,
+    pub side: u8,
 }
 
 impl PhysicalBorderEdge {
@@ -26,21 +27,25 @@ pub(crate) struct PhysicalBorders {
 pub(crate) fn physical_borders(style: &UsedStyleView<'_>) -> PhysicalBorders {
     PhysicalBorders {
         top: PhysicalBorderEdge {
+            side: 0,
             style: style.border_top_style(),
             width: style.border_top_width() as f64,
             color: style.border_top_color(),
         },
         right: PhysicalBorderEdge {
+            side: 1,
             style: style.border_right_style(),
             width: style.border_right_width() as f64,
             color: style.border_right_color(),
         },
         bottom: PhysicalBorderEdge {
+            side: 2,
             style: style.border_bottom_style(),
             width: style.border_bottom_width() as f64,
             color: style.border_bottom_color(),
         },
         left: PhysicalBorderEdge {
+            side: 3,
             style: style.border_left_style(),
             width: style.border_left_width() as f64,
             color: style.border_left_color(),

@@ -4,7 +4,6 @@ use super::{collapse_whitespace, first_letter_style_overrides, transform_text};
 use crate::layout_model::{InlineContent, LayoutTree};
 use html_dom::{Document, MemoryUsageReport};
 use html_style_model::{ComputedStyles, StyleIndices};
-use rustc_data_structures::fx::FxHashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -34,50 +33,6 @@ impl PreparedText {
         Self {
             content: Arc::new(content),
             first_letter_styles: FirstLetterStyles::new(&first_letter_styles),
-        }
-    }
-
-    /// Paint variants share normalized characters and source correspondence.
-    /// Only sparse style handles must be retargeted to the new style store.
-    pub(crate) fn with_paint_styles(
-        &self,
-        document: &Document,
-        previous: &ComputedStyles,
-        next: &ComputedStyles,
-    ) -> Self {
-        let mut mapping = FxHashMap::default();
-        if !self.first_letter_styles.runs.is_empty() {
-            for node in document.node_ids() {
-                for (before, after) in [
-                    (
-                        previous.first_letter_style_for_node(node),
-                        next.first_letter_style_for_node(node),
-                    ),
-                    (
-                        previous.before_first_letter_style_for_node(node),
-                        next.before_first_letter_style_for_node(node),
-                    ),
-                ] {
-                    if let (Some(before), Some(after)) = (before, after) {
-                        mapping.insert(before, after);
-                    }
-                }
-            }
-        }
-        let runs = self
-            .first_letter_styles
-            .runs
-            .iter()
-            .map(|run| StyleOverrideRun {
-                glyphs: run.glyphs.clone(),
-                style: *mapping
-                    .get(&run.style)
-                    .expect("paint variants retain every first-letter style"),
-            })
-            .collect();
-        Self {
-            content: self.content.clone(),
-            first_letter_styles: FirstLetterStyles { runs },
         }
     }
 
@@ -117,6 +72,10 @@ struct StyleOverrideRun {
 }
 
 impl FirstLetterStyles {
+    pub(crate) fn segment(&self, start: u32, end: u32) -> (Option<StyleIndices>, u32) {
+        self.segment_at(start, end)
+    }
+
     fn new(dense: &[Option<StyleIndices>]) -> Self {
         let mut runs: Vec<StyleOverrideRun> = Vec::new();
         for (index, &style) in dense.iter().enumerate() {

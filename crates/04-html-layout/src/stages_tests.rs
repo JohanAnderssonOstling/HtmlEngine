@@ -245,6 +245,27 @@ mod stage_tests {
         }
     }
 
+    #[test]
+    fn first_line_refinement_retains_prepared_first_letter_selection() {
+        for (source, second_offset) in [("<p>ß word</p>", 0), ("<p>“Apple” word</p>", 1)] {
+            let mut factory = DocumentFactory::new();
+            let prepared = factory.parse_with_new_pipeline(source, Some("p{text-transform:uppercase}p::first-letter{font-size:32px;color:purple}p::first-line{font-size:20px;color:blue}"));
+            let mut shaper = TestGlyphShaper::new();
+            let mut document = prepared.shape(&mut shaper).unwrap().layout_with_metrics_and_shaper(LayoutConstraints::new(400.0,20.0).unwrap(), &ImageMetrics::default(), &mut shaper).unwrap();
+            let glyphs = document.glyphs();
+            assert_eq!(document.glyph_metrics().get(glyphs[0]).advance(), document.glyph_metrics().get(glyphs[1]).advance());
+            assert!(document.glyph_metrics().get(glyphs[0]).advance() > document.glyph_metrics().get(glyphs[2]).advance());
+            let theme = crate::ThemeAdaptation {ink:0xeeeeeeff,surface:0x222222ff};
+            let painted = prepared.with_reader_paint_overrides(&crate::ReaderStyleOverrides {theme:Some(theme),..Default::default()}).unwrap();
+            assert!(document.repaint_from(&painted));
+            let text = document.render_view().text();
+            assert_eq!(text.paint_color_at(0), Some(theme.adapt(0x800080ff)));
+            assert_eq!(text.paint_color_at(1), Some(theme.adapt(0x800080ff)));
+            assert_eq!(document.glyph_source_offset(0),Some(0));
+            assert_eq!(document.glyph_source_offset(1),Some(second_offset));
+        }
+    }
+
     #[derive(Default)]
     struct InvalidGlyphShaper(crate::GlyphResourceStore);
 

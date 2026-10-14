@@ -1,4 +1,4 @@
-use crate::layout_model::{Line, OverflowClip};
+use crate::layout_model::Line;
 use kurbo::Rect;
 use std::ops::Range;
 
@@ -26,7 +26,6 @@ pub(super) struct FinalizationScratch {
     index_map: Vec<usize>,
     sorted_line_owners: Vec<u32>,
     block_groups: Vec<(u32, Range<u32>)>,
-    content_clips: Vec<Option<OverflowClip>>,
     inline_bounds: Vec<Option<Rect>>,
 }
 impl FinalizationScratch {
@@ -37,7 +36,7 @@ impl FinalizationScratch {
             self.index_map.capacity(),
             self.sorted_line_owners.capacity(),
             self.block_groups.capacity(),
-            self.content_clips.capacity(),
+            0,
             self.inline_bounds.capacity(),
         )
     }
@@ -45,6 +44,7 @@ impl FinalizationScratch {
 
 impl LayoutEngine<'_, '_> {
     pub(super) fn repaint(&mut self) {
+        let commands = std::mem::take(&mut self.fragments.state_mut().paint_program.commands);
         let output = &mut self.fragments.state_mut().fragment_output;
         output.decorations.clear();
         output.decoration_line_indices.clear();
@@ -54,16 +54,23 @@ impl LayoutEngine<'_, '_> {
         output.decoration_independent_positioned_layers.clear();
         output.decoration_clips.clear();
         output.decoration_fragments_by_line.clear();
-        self.placement.reset(self.reader.box_count());
-        for idx in 0..self.reader.box_count() {
-            if !matches!(self.reader.box_layout_mode(idx), Some(crate::layout_model::LayoutMode::Inline(_))) {
-                super::decorations::emit_block_decorations(self, idx);
-            }
-        }
+        // Paint emits absolute rectangles. Keep the canonical placement tree
+        // intact when the geometry pass reuses this engine and style snapshot.
+        let retained_placement = std::mem::take(&mut self.placement);
+        self.placement.reset_for_measurement();
+        self.fragments.set_paint_replay();
+        for &command in &commands { super::decorations::replay_command(self, command); }
         build_block_decoration_traversal(&self.reader, &mut self.fragments, &mut self.finalization);
         super::decorations::collect_inline_decorations(self);
         rebuild_decoration_fragments_by_line(&mut self.fragments);
-        rebuild_overflow_clips(&self.reader, &self.geometry, &mut self.fragments, &mut self.finalization, self.track_overflow_clips);
+        if self.track_overflow_clips {
+            let (layout, _, owners) = self.fragments.finalization_parts();
+            layout.fragment_output.decoration_clips.extend(owners.iter().map(|&owner| {
+                self.reader.get_parent(owner as usize).and_then(|parent| layout.paint_program.content_clips.get(parent).copied().flatten())
+            }));
+        }
+        self.fragments.state_mut().paint_program.commands = commands;
+        self.placement = retained_placement;
     }
 
     pub(super) fn finalize(&mut self, track_overflow_clips: bool) {
@@ -87,11 +94,6 @@ impl LayoutEngine<'_, '_> {
         prepare_line_text_runs(&self.text, &mut self.fragments, &[]);
 
         rebuild_glyph_line_indices(self.text.glyphs().len(), &mut self.fragments);
-        build_block_decoration_traversal(&self.reader, &mut self.fragments, &mut self.finalization);
-
-        let start = self.start_timing();
-        super::decorations::collect_inline_decorations(self);
-        self.record_timing(|timings| timings.collect_inline_decorations += start.elapsed());
 
         publish_inline_box_geometry(
             &self.reader,
@@ -99,8 +101,6 @@ impl LayoutEngine<'_, '_> {
             &self.fragments,
             &mut self.finalization,
         );
-
-        rebuild_decoration_fragments_by_line(&mut self.fragments);
 
         let start = self.start_timing();
         rebuild_image_fragments_by_line(&mut self.fragments);

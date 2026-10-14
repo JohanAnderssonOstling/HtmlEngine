@@ -9,6 +9,7 @@ pub(crate) struct OutputCursor {
     lines: usize,
     decorations: usize,
     images: usize,
+    paint_commands: usize,
 }
 
 #[derive(Clone)]
@@ -17,6 +18,7 @@ pub(crate) struct OutputRanges {
     pub lines: Range<usize>,
     pub decorations: Range<usize>,
     pub images: Range<usize>,
+    pub paint_commands: Range<usize>,
 }
 
 impl OutputRanges {
@@ -28,6 +30,7 @@ impl OutputRanges {
 /// Owns published line/fragment output and the parallel owner indexes required
 /// while that output is being assembled.
 pub(crate) struct FragmentWriter<'out> {
+    replaying_paint: bool,
     state: &'out mut LayoutState,
     line_owners: Vec<u32>,
     block_decoration_owners: Vec<u32>,
@@ -41,6 +44,7 @@ impl<'out> FragmentWriter<'out> {
         block_decoration_owners: Vec<u32>,
     ) -> Self {
         Self {
+            replaying_paint: false,
             state,
             line_owners,
             block_decoration_owners,
@@ -55,6 +59,7 @@ impl<'out> FragmentWriter<'out> {
         self.last_inline_fragments.clear();
 
         let state = &mut self.state;
+        state.paint_program.clear();
         state.line_output.lines.clear();
         state.line_output.line_details.clear();
         state.line_output.text_fragments.clear();
@@ -108,6 +113,7 @@ impl<'out> FragmentWriter<'out> {
             lines: self.state.line_output.lines.len(),
             decorations: self.state.fragment_output.decorations.len(),
             images: self.state.fragment_output.image_fragments.len(),
+            paint_commands: self.state.paint_program.commands.len(),
         }
     }
 
@@ -121,6 +127,30 @@ impl<'out> FragmentWriter<'out> {
             lines: cursor.lines..self.state.line_output.lines.len(),
             decorations: cursor.decorations..self.state.fragment_output.decorations.len(),
             images: cursor.images..self.state.fragment_output.image_fragments.len(),
+            paint_commands: cursor.paint_commands..self.state.paint_program.commands.len(),
+        }
+    }
+
+    pub(crate) fn set_paint_replay(&mut self) { self.replaying_paint = true; }
+    pub(crate) fn is_paint_replay(&self) -> bool { self.replaying_paint }
+
+    pub(crate) fn record_paint(&mut self, placement: &PlacementState, operation: super::paint_program::PaintOperation) {
+        if !self.replaying_paint && placement.retains_output() {
+            self.state.paint_program.record(operation, placement.current_group());
+        }
+    }
+
+    pub(crate) fn apply_paint_layers_since(&mut self, start: usize, layers: u8) {
+        use super::paint_program::{POSITIONED, NEGATIVE, INDEPENDENT};
+        let output = &mut self.state.fragment_output;
+        let end = output.decorations.len();
+        output.decoration_positioned_layers.resize(end, false);
+        output.decoration_negative_positioned_layers.resize(end, false);
+        output.decoration_independent_positioned_layers.resize(end, false);
+        for index in start..end {
+            output.decoration_positioned_layers[index] = layers & POSITIONED != 0;
+            output.decoration_negative_positioned_layers[index] = layers & NEGATIVE != 0;
+            output.decoration_independent_positioned_layers[index] = layers & INDEPENDENT != 0 && !output.decorations.fragments()[index].is_foreground();
         }
     }
 
@@ -130,6 +160,10 @@ impl<'out> FragmentWriter<'out> {
         negative: bool,
         independent: bool,
     ) {
+        use super::paint_program::{POSITIONED, NEGATIVE, INDEPENDENT};
+        for command in &mut self.state.paint_program.commands[output.paint_commands.clone()] {
+            command.layers |= POSITIONED | if negative { NEGATIVE } else { 0 } | if independent { INDEPENDENT } else { 0 };
+        }
         self.state
             .line_output
             .positioned_layers

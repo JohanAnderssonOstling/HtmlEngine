@@ -806,6 +806,7 @@ pub(super) fn write_line_fragments(
             );
             engine.geometry.set_point(*box_idx as usize, border_point);
             let decoration_start = engine.fragments.decoration_len();
+            let paint_start = engine.fragments.state().paint_program.commands.len();
             let height = engine.reader.style(*box_idx as usize).height();
             let authored_height_is_definite = match height {
                 html_style_model::UsedPreferredSize::Px(_) => true,
@@ -828,6 +829,7 @@ pub(super) fn write_line_fragments(
                 authored_height_is_definite,
             );
             let _ = engine.layout_box(request);
+            engine.fragments.state_mut().paint_program.record_line_since(paint_start, line_idx, paint_order);
             // CSS paints an inline-block (and the non-positioned contents it
             // establishes) atomically at this point in the owning line. Keep
             // its block decorations with that line instead of replaying them
