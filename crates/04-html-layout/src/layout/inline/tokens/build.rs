@@ -379,6 +379,8 @@ pub(in crate::layout::inline) fn build_inline_tokens(
         container_box_idx: u32::try_from(container_box_idx)
             .expect("inline-plan box index exhausted"),
         high_quality_hyphenation: engine.config.hyphenation_quality(),
+        book_optimized: engine.config.book_optimized_text(),
+        sentence_per_line: engine.config.sentence_per_line(),
     };
     let source_runs = &engine.text.inline_items()[run_range.start as usize..run_range.end as usize];
     let cacheable = !engine.config.sentence_per_line()

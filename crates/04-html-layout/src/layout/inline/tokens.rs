@@ -579,7 +579,10 @@ pub(super) struct InlineTokens {
 }
 
 pub(super) enum ParagraphTokenInput {
-    Shared(InlineTokens),
+    // These tokens are fixed by the enclosing source/shaping generation,
+    // first-line selections and composition key. Do not retain their Arc:
+    // a temporary policy plan need not be owned by the shaping cache.
+    ImmutableText { count: usize },
     Dynamic {
         count: usize,
         runs: Box<[InlineTokenMetrics]>,
@@ -590,8 +593,8 @@ pub(super) enum ParagraphTokenInput {
 
 impl ParagraphTokenInput {
     pub(super) fn new(tokens: &InlineTokens) -> Self {
-        if matches!(tokens.dense, InlineStorage::Shared(_)) {
-            return Self::Shared(tokens.clone());
+        if matches!(tokens.dense, InlineStorage::Shared(_)) && tokens.replaced.is_empty() {
+            return Self::ImmutableText { count: tokens.len() };
         }
         Self::Dynamic {
             count: tokens.len(), runs: tokens.runs.to_vec().into_boxed_slice(),
@@ -602,7 +605,8 @@ impl ParagraphTokenInput {
 
     pub(super) fn matches(&self, tokens: &InlineTokens) -> bool {
         match self {
-            Self::Shared(previous) => previous.same_layout_input(tokens),
+            Self::ImmutableText { count } => *count == tokens.len()
+                && matches!(tokens.dense, InlineStorage::Shared(_)) && tokens.replaced.is_empty(),
             Self::Dynamic { count, runs, replaced, controls } => {
                 *count == tokens.len() && runs.as_ref() == tokens.runs.as_ref() && replaced.as_ref() == tokens.replaced.as_slice()
                     && controls.iter().copied().eq(tokens.iter().enumerate().filter(|(_, token)| !matches!(token.kind(), InlineTokenKind::Glyph { .. })).map(|(index, token)| (index,*token)))
@@ -612,31 +616,13 @@ impl ParagraphTokenInput {
 
     pub(super) fn retained_bytes(&self) -> usize {
         match self {
-            Self::Shared(tokens) => tokens.retained_bytes(),
+            Self::ImmutableText { .. } => 0,
             Self::Dynamic { runs, replaced, controls, .. } => runs.len()*size_of::<InlineTokenMetrics>() + replaced.len()*size_of::<ReplacedToken>() + controls.len()*size_of::<(usize,InlineToken)>(),
         }
     }
 }
 
 impl InlineTokens {
-    pub(super) fn same_layout_input(&self, other: &Self) -> bool {
-        fn same<T: Clone + PartialEq>(a: &InlineStorage<T>, b: &InlineStorage<T>) -> bool {
-            (a.len() == b.len() && a.as_ptr() == b.as_ptr()) || **a == **b
-        }
-        same(&self.dense, &other.dense) && same(&self.runs, &other.runs)
-            && self.replaced == other.replaced
-    }
-
-    pub(super) fn retained_bytes(&self) -> usize {
-        fn owned<T: Clone>(storage: &InlineStorage<T>) -> usize {
-            match storage { InlineStorage::Owned(values) => values.capacity() * size_of::<T>(), InlineStorage::Shared(_) => 0 }
-        }
-        owned(&self.dense) + owned(&self.runs) + owned(&self.summary_blocks)
-            + self.replaced.capacity() * size_of::<ReplacedToken>()
-            + if matches!(self.dense, InlineStorage::Owned(_)) {
-                self.kp_plan.as_deref().map_or(0, |plans| plans.iter().filter_map(OnceLock::get).map(KpPlan::memory_usage_bytes).sum())
-            } else { 0 }
-    }
     pub(super) fn with_capacity(capacity: usize) -> Self {
         Self {
             dense: InlineStorage::with_capacity(capacity),
@@ -1004,6 +990,8 @@ pub(super) struct PreparedInlinePlanKey {
     pub(super) run_end: u32,
     pub(super) container_box_idx: u32,
     pub(super) high_quality_hyphenation: bool,
+    pub(super) book_optimized: bool,
+    pub(super) sentence_per_line: bool,
 }
 
 #[derive(Clone)]
@@ -1291,8 +1279,21 @@ pub(in crate::layout) fn break_kind(character: char, white_space: WhiteSpace) ->
 
 #[cfg(test)]
 mod storage_tests {
-    use super::InlineStorage;
+    use super::{BreakKind, InlineStorage, InlineToken, InlineTokenKind, InlineTokens, ParagraphTokenInput, TokenWrap};
     use std::sync::Arc;
+
+    #[test]
+    fn paragraph_inputs_do_not_pin_temporary_shared_policy_plans() {
+        // A policy whose plan key differs from the shaping slot can produce
+        // shared storage that is not retained by the shaped document.
+        let dense: Arc<[InlineToken]> = vec![InlineToken::new(InlineTokenKind::Glyph { glyph_idx: 0 }, 10.0, BreakKind::None, TokenWrap::Normal, true)].into();
+        let released = Arc::downgrade(&dense);
+        let tokens = InlineTokens { dense: InlineStorage::Shared(dense), ..Default::default() };
+        let input = ParagraphTokenInput::new(&tokens);
+        drop(tokens);
+        assert!(released.upgrade().is_none(), "paragraph metadata must not pin an unaccounted token array");
+        assert_eq!(input.retained_bytes(), 0);
+    }
 
     #[test]
     fn frozen_arrays_release_spare_capacity_and_thaw_without_mutating_snapshots() {

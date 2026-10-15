@@ -111,6 +111,21 @@ mod stage_tests {
     }
 
     #[test]
+    fn composition_policy_switches_match_fresh_shaping_and_layout() {
+        let mut factory=DocumentFactory::new();
+        let prepared=factory.parse_with_new_pipeline("<p>First sentence. Second sentence. Third sentence.</p>",None);
+        let base=LayoutConstraints::new(600.0,20.0).unwrap();
+        let mut document=prepared.clone().shape(&mut TestGlyphShaper::new()).unwrap().layout(base);
+        for policy in [TextCompositionPolicy::BookOptimized,TextCompositionPolicy::SentencePerLine,TextCompositionPolicy::BookOptimizedUnrestrictedHyphenation,TextCompositionPolicy::WebCompatible,TextCompositionPolicy::SentencePerLine] {
+            let constraints=base.with_text_composition_policy(policy);
+            document.relayout(constraints);
+            let reference=prepared.clone().shape(&mut TestGlyphShaper::new()).unwrap().layout(constraints);
+            assert_eq!(paragraph_geometry_snapshot(&document),paragraph_geometry_snapshot(&reference),"{policy:?}");
+            if policy==TextCompositionPolicy::SentencePerLine { assert!(document.line_count()>1); }
+        }
+    }
+
+    #[test]
     fn paragraph_result_retention_stays_bounded_across_many_width_variants() {
         let paragraph = format!("<p>{}</p>", "one two three four five six seven eight ".repeat(12));
         let source = paragraph.repeat(1000);
