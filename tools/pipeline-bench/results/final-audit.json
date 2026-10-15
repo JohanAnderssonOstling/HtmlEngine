@@ -1,7 +1,7 @@
 {
   "checkpoint_revision": "6184791e84a54b699a8a622b790a2ca722c010f4",
-  "engine_implementation_revision": "afbf82d3b2e2a6ec598876c5428ff6aec5b6a55c",
-  "reader_revision": "bd8c55132041b070e0e7625a337ab557fd7f4d60",
+  "engine_implementation_revision": "912a84ce98bb38df163c0508a57a4f06cb40ee5a",
+  "reader_revision": "710aa3afff185587adac8a8afdf423e39f273474",
   "feature_branch": "codex/pipeline-lifetimes-20261014",
   "requirements": [
     {
@@ -47,7 +47,8 @@
         "Paragraph-local measured lines and sparse adjustments are retained; publication executes current image/atomic/table/absolute-anchor work at the new origin.",
         "Keys cover width, height basis, composition, first-line shaping selections, immutable resource generation, exact dynamic metrics/controls/replaced inputs and relative float profiles; intrinsic/published slots are separate.",
         "Current-input retention with base/refined variants, recycled buffers and 4 MiB result budget plus metadata. Cache memory is reported; document snapshots do not copy it.",
-        "Implementation afbf82d3b2e2a6ec598876c5428ff6aec5b6a55c, five new reuse/invalidation/budget regressions, 1085 engine tests, published reader tests and all 18 step4 chapter scenarios."
+        "Implementation 912a84ce98bb38df163c0508a57a4f06cb40ee5a, five new reuse/invalidation/budget regressions, 1087 engine tests, published reader tests and all 18 step4 chapter scenarios.",
+        "Corrected revision 912a84ce98bb38df163c0508a57a4f06cb40ee5a releases temporary policy buffers and distinguishes book/sentence plan keys, covered by two additional regression tests."
       ]
     },
     {
@@ -73,7 +74,7 @@
       "requirement": "Publish coherent reviewable refactor branches without adopting them in other agents builds",
       "status": "verified",
       "evidence": [
-        "Remote engine branch contains implementation afbf82d3b2e2a6ec598876c5428ff6aec5b6a55c; remote reader branch contains bd8c55132041b070e0e7625a337ab557fd7f4d60 and pins the exact engine implementation Git revision.",
+        "Remote engine branch contains implementation 912a84ce98bb38df163c0508a57a4f06cb40ee5a; remote reader branch contains 710aa3afff185587adac8a8afdf423e39f273474 and pins the exact engine implementation Git revision.",
         "All 226 reader workspace tests passed using the published Git engine source.",
         "Main app/audible/shared ViewCore stay on 6184791e84a54b699a8a622b790a2ca722c010f4."
       ]
@@ -81,19 +82,19 @@
   ],
   "tests": {
     "step4-tests-final.log": {
-      "passed": 1085,
+      "passed": 1087,
       "ignored": 2,
-      "sha256": "cd805bea1864be028d234e55c57ed9fdcbe8caf92af7ef3ba8ce2943df803769"
+      "sha256": "d772de5a465ee220068eb06a4288aab6e56f670f1306612ece71ae4592ec5db6"
     },
     "final-reader-published-tests.log": {
       "passed": 226,
       "ignored": 2,
-      "sha256": "990a6632e311bce5710b8169b6f5d59492d0b0dabe8d0a2a4b62017e859ac451"
+      "sha256": "1684a52716db570d50f7d34223fa3f13e9016dff7d65ff8c6a5181be60df8aa0"
     },
     "final-doc-tests.log": {
       "passed": 5,
       "ignored": 0,
-      "sha256": "08099888c2cbf2bf552fcfaf30126e068b3b07b8733ef761aa9aafaa1499938d"
+      "sha256": "091501fffbd92ccb1a3022fd580b86a3df6a6bf7d7df274ec5780222c0380b3b"
     }
   },
   "consumer_graphs": {
@@ -147,7 +148,7 @@
       "local_engine_paths": []
     },
     "feature-reader": {
-      "revision": "afbf82d3b2e2a6ec598876c5428ff6aec5b6a55c",
+      "revision": "912a84ce98bb38df163c0508a57a4f06cb40ee5a",
       "package_names": [
         "html-dom",
         "html-engine",
@@ -170,11 +171,11 @@
     "c0003.html"
   ],
   "measurement_scope": "Real chapter HTML/CSS/resources, deterministic mock font backend. Image scenarios seed real file-header dimensions outside timing. Native font/GPU/image pixel decoding/full application costs are excluded. Shared-machine clock/scheduling variation remains; raw rounds, paired ratios and hardware instruction counts are retained. Heap uses a separate allocator-instrumented process; RSS is process high-water memory. Decimal MB.",
-  "material_tradeoff": "Paragraph results add about 0.65-1.58 MB live heap relative to step3 and can modestly slow cold/changed-width work. The complete pipeline still retains less memory than the starting reader/engine in the measured chapters. Figure-height updates avoid about 36-38% of original instructions; color updates avoid about 98.5%.",
+  "material_tradeoff": "Paragraph results add about 0.62-1.54 MB live heap relative to step3. Changed-width and cold timings vary and can regress; instruction work for those cases is roughly unchanged. Complete-pipeline live heap remains below the initial checkpoint across measured cases. Process RSS can vary, including a small font-rebuild increase in this final run. Full raw/paired timing, instruction and memory data are retained.",
   "preexisting_validation_exceptions": [
-    "One style-model size/niche assertion already fails at checkpoint and is explicitly filtered.",
+    "One style-model size/niche assertion fails at checkpoint and is explicitly filtered.",
     "Four profiling tests ignored.",
-    "External WPT integration requires unavailable HTML_WPT_ROOT; self-contained WPT support library tests passed."
+    "External WPT integration requires unavailable HTML_WPT_ROOT; self-contained WPT support tests passed."
   ],
   "reproduction": {
     "engine_tests": "TMPDIR=/dev/shm/htmlengine-pipeline cargo test --release --offline --workspace --lib --test reading -- --skip store_brand_uses_the_option_niche_without_growing_node_entries",
@@ -185,8 +186,14 @@
   "binaries_sha256": {
     "final-before-time": "01da4b4e622fc8d70952f24e5f00451a7de04c7a4875797fce158f65be300b3c",
     "final-before-heap": "db2bd6b95ceda1ef529fe30657b4f30472d03a57191b3d3034683a9d1f7ed272",
-    "step4-after-time": "260ed19faff271e44d2c95890db60d08f93cb2e853567dd9e862970089a3894d",
-    "step4-after-heap": "f77e07b121308a95fce2f07bb32af8d659a462cd0ab4fa444f9730616c04ecfc"
+    "step4-after-time": "5fbd6860566757e7db4cd501383f595b78cfa2bca59f24bf92e27c5628e16ac5",
+    "step4-after-heap": "9565ad0e2fe97ce315ed1babc1089c3b8bad0c5682a82f02c6cfda7727a1e8ac"
   },
-  "remaining_required_work": []
+  "remaining_required_work": [],
+  "audit_correction": {
+    "regression_failed_before_fix": true,
+    "before_log_sha256": "7661353119f84331bcd466b8869ac794a1266cf9c77112dffab0147469c6e8ae",
+    "fixed_revision": "912a84ce98bb38df163c0508a57a4f06cb40ee5a",
+    "description": "Final inspection found and reproduced temporary shared-plan retention outside the reported budget. Non-owning immutable text descriptors fix ownership; book/sentence token-plan keys and fresh-layout policy tests fix policy invalidation. All tests and both benchmark sets were rerun on corrected code."
+  }
 }
