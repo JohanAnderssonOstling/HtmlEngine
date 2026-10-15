@@ -171,7 +171,7 @@
     "c0003.html"
   ],
   "measurement_scope": "Real chapter HTML/CSS/resources, deterministic mock font backend. Image scenarios seed real file-header dimensions outside timing. Native font/GPU/image pixel decoding/full application costs are excluded. Shared-machine clock/scheduling variation remains; raw rounds, paired ratios and hardware instruction counts are retained. Heap uses a separate allocator-instrumented process; RSS is process high-water memory. Decimal MB.",
-  "material_tradeoff": "Paragraph results add about 0.62-1.54 MB live heap relative to step3. Changed-width and cold timings vary and can regress; instruction work for those cases is roughly unchanged. Complete-pipeline live heap remains below the initial checkpoint across measured cases. Process RSS can vary, including a small font-rebuild increase in this final run. Full raw/paired timing, instruction and memory data are retained.",
+  "material_tradeoff": "Paragraph results add about 0.64-1.54 MB live heap relative to step3. Changed-width and cold timings vary and can regress; instruction work for those cases is roughly unchanged. Complete-pipeline live heap remains below the initial checkpoint across measured cases. Process RSS can vary, including a small font-rebuild increase in this final run. Full raw/paired timing, instruction and memory data are retained.",
   "preexisting_validation_exceptions": [
     "One style-model size/niche assertion fails at checkpoint and is explicitly filtered.",
     "Four profiling tests ignored.",

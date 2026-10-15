@@ -41,7 +41,7 @@
     "order": "alternating before/after",
     "source": "identical harness source in frozen and development worktrees"
   },
-  "tradeoff": "Image updates use about 35.6-39.1% fewer user instructions across these chapters. Retained heap rises about 0.65-1.58 MB. Changed-width layout still recomposes and cold-load/resize wall and CPU timing can regress modestly; full raw and paired data are retained. Shared-machine scheduling/clock variation remains.",
+  "tradeoff": "Image updates use about 35.6-39.1% fewer user instructions across these chapters. Retained heap rises about 0.64-1.54 MB. Changed-width layout still recomposes and cold-load/resize wall and CPU timing can regress modestly; full raw and paired data are retained. Shared-machine scheduling/clock variation remains.",
   "parity": "All 18 timing and heap cases match glyph/line counts, complete render geometry/paint, effective text colors and source correspondence.",
   "baseline_exceptions": [
     "Preexisting style-model size/niche assertion filtered out",
