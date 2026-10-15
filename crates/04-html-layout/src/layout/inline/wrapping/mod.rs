@@ -6,15 +6,15 @@
 use super::justification::glue_capacities;
 use super::*;
 
-mod greedy;
+pub(super) mod greedy;
 pub(super) mod knuth_plass;
 mod optimal;
 pub(super) const MICRO_TRACKING_FRACTION: f64 = knuth_plass::MICRO_TRACKING_FRACTION;
-pub(super) use greedy::{break_lines, break_next_line};
+pub(super) use greedy::break_next_line;
 pub(super) use optimal::break_lines_knuth;
 
 pub(super) struct KpPlan {
-    segments: Vec<KpSegmentPlan>,
+    segments: Box<[KpSegmentPlan]>,
 }
 
 struct KpSegmentPlan {
@@ -50,11 +50,11 @@ impl KpPlan {
             tokens.len(),
             punctuation_aware,
         ));
-        Self { segments }
+        Self { segments: segments.into_boxed_slice() }
     }
 
     pub(super) fn memory_usage_bytes(&self) -> usize {
-        self.segments.capacity() * std::mem::size_of::<KpSegmentPlan>()
+        self.segments.len() * std::mem::size_of::<KpSegmentPlan>()
             + self
                 .segments
                 .iter()

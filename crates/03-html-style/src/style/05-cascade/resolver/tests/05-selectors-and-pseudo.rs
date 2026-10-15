@@ -85,6 +85,37 @@ fn only_anchors_with_href_get_link_styling() {
 }
 
 #[test]
+fn note_references_keep_link_color_without_default_underlines() {
+    use crate::style_document;
+    use html_parse::{parse_html_document, parse_xml_document};
+
+    let html = r#"<html><body><a href='chapter.html'>Chapter</a><a role='doc-noteref' href='#footnote'>1</a><a epub:type='noteref' href='#endnote'>2</a><a epub:type='other NOTEREF' href='#margin-note'>3</a></body></html>"#;
+    let xhtml = r#"<html xmlns='http://www.w3.org/1999/xhtml' xmlns:ops='http://www.idpf.org/2007/ops'><body><a href='chapter.html'>Chapter</a><a role='other DOC-NOTEREF' href='#footnote'>1</a><a ops:type='noteref' href='#endnote'>2</a><a ops:type='other NOTEREF' href='#margin-note'>3</a></body></html>"#;
+    let documents = [parse_html_document(html), parse_xml_document(xhtml).expect("valid XHTML")];
+
+    for (document_index, parsed) in documents.into_iter().enumerate() {
+        let document = style_document(parsed.build_dom(), &[]);
+        let anchors: Vec<_> = find_body(document.document()).children().collect();
+        assert_eq!(anchors.len(), 4);
+        for (index, anchor) in anchors.into_iter().enumerate() {
+            let style = document.style_for_node(anchor).expect("anchor style");
+            assert_eq!(document.text_style(style).expect("text style").color, 0x0000FFFF, "all links retain their link color");
+            assert_eq!(document.background_style(style).expect("paint style").text_decoration.lines.underline(), index == 0, "only the ordinary link has a default underline (document {document_index}, anchor {index})");
+        }
+    }
+}
+
+#[test]
+fn authors_can_explicitly_style_note_reference_decorations() {
+    let html = "<html><body><a role='doc-noteref' href='#note'>1</a></body></html>";
+    let mut factory = DocumentFactory::new();
+    let document = factory.parse_with_new_pipeline(html, Some("a { text-decoration: underline; }"));
+    let anchor = find_body(document.document()).children().next().expect("note reference");
+    let style = document.style_for_node(anchor).expect("anchor style");
+    assert!(document.background_style(style).expect("paint style").text_decoration.lines.underline(), "explicit author styling overrides the default");
+}
+
+#[test]
 fn vertical_align_inherit_propagates_tbody_middle_to_cells() {
     use crate::document::VerticalAlignValue;
     let html = "<html><body><table><tbody><tr><td>X</td></tr></tbody></table></body></html>";

@@ -14,6 +14,19 @@ use html_style_model::{
 use kurbo::{Point, Size, Vec2};
 use std::ops::Range;
 
+#[derive(Default)]
+pub(super) struct ParagraphScratch {
+    lines: Vec<wrapping::BrokenLine>,
+    solver: wrapping::knuth_plass::CompactScratch,
+}
+
+impl ParagraphScratch {
+    #[cfg(test)]
+    pub(super) fn capacities(&self) -> (usize, (usize, usize, usize)) {
+        (self.lines.capacity(), self.solver.capacities())
+    }
+}
+
 mod algorithm;
 mod decorations;
 mod fragments;

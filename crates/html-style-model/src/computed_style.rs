@@ -1102,16 +1102,25 @@ pub struct ComputedStyles {
     strings: Vec<String>,
 }
 
-/// Reader preferences applied after the publication cascade without adding a
-/// stylesheet to the publication. `None` preserves the publisher-computed
-/// value.
+/// Reader preferences applied without adding a publication stylesheet. Font
+/// scaling participates in value resolution; other preferences override the
+/// resulting publication styles. `None` preserves the publisher-computed value.
 #[derive(Clone, Debug, Default)]
 pub struct ReaderStyleOverrides {
     pub font_family: Option<String>,
     pub text_align: Option<TextAlign>,
     pub line_height: Option<f32>,
+    /// Canonical regular font size in CSS pixels. During style resolution,
+    /// publication font sizes and line heights scale by the document's requested
+    /// root font size divided by this value. Relative sizes inherit that scale
+    /// once, preserving the publisher's proportions. `None` preserves CSS sizing;
+    /// non-finite, non-positive, or unusable ratios are ignored.
+    pub canonical_font_size: Option<f32>,
     pub minimum_font_size: Option<f32>,
     pub foreground: Option<u32>,
+    /// Overrides text inside anchors with an `href`, including descendants
+    /// and generated content. Uses `0xRRGGBBAA` and bypasses theme adaptation.
+    pub link_foreground: Option<u32>,
     pub background: Option<u32>,
     /// Let the reader controls own page edges instead of HTML/body CSS.
     pub strip_root_spacing: bool,
@@ -1238,13 +1247,36 @@ fn oklab_to_srgb(lightness: f32, a: f32, b: f32, alpha: u32) -> u32 {
     (r << 24) | (g << 16) | (blue << 8) | alpha
 }
 
+impl ReaderStyleOverrides {
+    /// Preferences that can affect text metrics, box generation, or geometry.
+    pub fn layout_overrides(&self) -> Self {
+        Self { foreground: None, link_foreground: None, background: None, theme: None, ..self.clone() }
+    }
+
+    /// Color preferences applied to the retained publication styles.
+    pub fn paint_overrides(&self) -> Self {
+        Self { foreground: self.foreground, link_foreground: self.link_foreground, background: self.background, theme: self.theme, ..Self::default() }
+    }
+
+    pub fn same_layout_preferences(&self, other: &Self) -> bool {
+        self.font_family == other.font_family
+            && self.text_align == other.text_align
+            && self.line_height.map(f32::to_bits) == other.line_height.map(f32::to_bits)
+            && self.canonical_font_size.map(f32::to_bits) == other.canonical_font_size.map(f32::to_bits)
+            && self.minimum_font_size.map(f32::to_bits) == other.minimum_font_size.map(f32::to_bits)
+            && self.strip_root_spacing == other.strip_root_spacing
+    }
+}
+
 impl PartialEq for ReaderStyleOverrides {
     fn eq(&self, other: &Self) -> bool {
         self.font_family == other.font_family
             && self.text_align == other.text_align
             && self.line_height.map(f32::to_bits) == other.line_height.map(f32::to_bits)
+            && self.canonical_font_size.map(f32::to_bits) == other.canonical_font_size.map(f32::to_bits)
             && self.minimum_font_size.map(f32::to_bits) == other.minimum_font_size.map(f32::to_bits)
             && self.foreground == other.foreground
+            && self.link_foreground == other.link_foreground
             && self.background == other.background
             && self.strip_root_spacing == other.strip_root_spacing
             && self.theme == other.theme
@@ -2556,6 +2588,43 @@ impl ComputedStylesBuilder {
         {
             pseudo.style = remapped[&(pseudo.style, false)];
         }
+        self.apply_link_foreground(document, overrides.link_foreground);
+    }
+
+    fn apply_link_foreground(&mut self, document: &Document, color: Option<u32>) {
+        let Some(color) = color else { return };
+        let mut linked = vec![false; document.node_count()];
+        for (node, _) in document.nodes() {
+            linked[node.index()] = std::iter::once(node)
+                .chain(document.dom_ancestors(node))
+                .any(|ancestor| document.element_ref(ancestor).is_some_and(|element| {
+                    element.tag().eq_ignore_ascii_case("a") && element.attr("href").is_some()
+                }));
+        }
+        let store = &mut self.store;
+        let mut recolor = |style: &mut StyleIndices| {
+            let mut text = store.text_styles[style.text_idx as usize].clone();
+            text.color = color;
+            style.text_idx = intern_style(&mut store.text_styles, &mut store.text_dedup, text);
+        };
+        for (index, style) in self.node_styles.iter_mut().enumerate() {
+            if linked[index] && let Some(style) = style {
+                recolor(style);
+            }
+        }
+        for (node, style) in self.first_line_styles.iter_mut()
+            .chain(self.first_letter_styles.iter_mut())
+            .chain(self.before_first_letter_styles.iter_mut())
+        {
+            if linked[*node as usize] {
+                recolor(style);
+            }
+        }
+        for pseudo in self.before_styles.iter_mut().chain(self.after_styles.iter_mut()) {
+            if linked[pseudo.node as usize] {
+                recolor(&mut pseudo.style);
+            }
+        }
     }
 
     pub fn finish(mut self) -> Result<ComputedStyles, ComputedStylesBuildError> {
@@ -2931,6 +3000,9 @@ fn reintern_with_reader_overrides(
 }
 
 impl ComputedStyles {
+    /// Apply preferences to existing computed styles. Changing
+    /// `canonical_font_size` requires resolving the cascade again, since it
+    /// also changes inherited values and font-relative box dimensions.
     pub fn with_reader_overrides(
         &self,
         document: &Document,
@@ -3008,6 +3080,7 @@ impl ComputedStyles {
             let counters = reintern_counter_directives(self, &mut builder, &pseudo.counters);
             builder.set_after_style(node, style, content, counters)?;
         }
+        builder.apply_link_foreground(document, overrides.link_foreground);
         builder.finish()
     }
 
@@ -3017,6 +3090,17 @@ impl ComputedStyles {
 
     pub fn style_for_node(&self, node_idx: DomNodeId) -> Option<StyleIndices> {
         self.node_styles.get(node_idx.index()).copied().flatten()
+    }
+
+    /// Whether a first-letter style can apply to publication or generated text.
+    pub fn has_first_letter_styles(&self) -> bool {
+        !self.first_letter_styles.is_empty() || !self.before_first_letter_styles.is_empty()
+    }
+
+    /// Whether any element has a computed `::first-line` style. Layout uses
+    /// this to skip width-dependent shaping when no such style can apply.
+    pub fn has_first_line_styles(&self) -> bool {
+        !self.first_line_styles.is_empty()
     }
 
     pub fn first_line_style_for_node(&self, node_idx: DomNodeId) -> Option<StyleIndices> {

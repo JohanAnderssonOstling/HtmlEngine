@@ -7,12 +7,15 @@ use super::*;
 /// this here lets the backend shape, size, and paint the whole typographic
 /// unit with the pseudo style instead of trying to resize already-shaped
 /// glyphs during line layout.
-pub(crate) fn first_letter_style_overrides(
-    document: &Document,
-    styles: &ComputedStyles,
-    layout_tree: &LayoutTree,
-    inline_content: &InlineContent,
-) -> Vec<Option<StyleIndices>> {
+pub(crate) fn first_letter_style_overrides(document: &Document, styles: &ComputedStyles, layout_tree: &LayoutTree, inline_content: &InlineContent) -> Vec<Option<StyleIndices>> {
+    first_letter_overrides_with_characters(document, styles, layout_tree, inline_content, |index| char::from_u32(inline_content.glyph_at(index as usize).unwrap_or('?' as GlyphId)).unwrap_or('?'))
+}
+
+pub(crate) fn first_letter_overrides_with_characters(document: &Document, styles: &ComputedStyles, layout_tree: &LayoutTree, inline_content: &InlineContent, character_at: impl Fn(u32) -> char) -> Vec<Option<StyleIndices>> {
+    // An empty override vector denotes the absence of first-letter styles.
+    if !styles.has_first_letter_styles() {
+        return Vec::new();
+    }
     // Preserve source order. An ancestor's `::first-letter` belongs to the
     // first in-flow descendant that contributes text, not to every descendant
     // formatting context carrying that ancestor in its box chain.
@@ -31,17 +34,10 @@ pub(crate) fn first_letter_style_overrides(
             root_indices.insert(root, entry);
             entry
         };
-        content_by_root[entry]
-            .1
-            .extend(glyphs.clone().map(|glyph_idx| {
-                let character = char::from_u32(
-                    inline_content
-                        .glyph_at(glyph_idx as usize)
-                        .unwrap_or('?' as GlyphId),
-                )
-                .unwrap_or('?');
-                (glyph_idx, character, run.box_idx as usize)
-            }));
+        content_by_root[entry].1.extend(glyphs.clone().map(|glyph_idx| {
+            let character = character_at(glyph_idx);
+            (glyph_idx, character, run.box_idx as usize)
+        }));
     }
 
     let mut overrides = vec![None; inline_content.glyphs().len()];

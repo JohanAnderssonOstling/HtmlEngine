@@ -95,8 +95,22 @@ fn build_dom_syntax_element_data<State>(
         .and_then(|value| value.parse().ok());
     let is_inline_svg = element.local_name == "svg"
         && element.namespace.as_deref() == Some("http://www.w3.org/2000/svg");
-    let image_idx = if is_inline_svg {
-        let bytes: Arc<[u8]> = serialize_svg_syntax_element(element).into_bytes().into();
+    let is_mathml = element.local_name == "math"
+        && element.namespace.as_deref() == Some("http://www.w3.org/1998/Math/MathML");
+    let image_idx = if is_mathml {
+        Some(document.push_image(ImageResource {
+            source: ImageSource::MathMl {
+                markup: serialize_foreign_syntax_element(element).into(),
+                svg: Arc::from([]),
+                baseline: 1.0,
+            },
+            width: 0,
+            height: 0,
+            width_attr: None,
+            height_attr: None,
+        }))
+    } else if is_inline_svg {
+        let bytes: Arc<[u8]> = serialize_foreign_syntax_element(element).into_bytes().into();
         Some(document.push_image(ImageResource {
             source: ImageSource::InlineSvg {
                 bytes,
@@ -144,7 +158,7 @@ fn build_dom_syntax_element_data<State>(
     }
 }
 
-fn serialize_svg_syntax_element(element: &HtmlSyntaxElement) -> String {
+fn serialize_foreign_syntax_element(element: &HtmlSyntaxElement) -> String {
     fn push_attribute(output: &mut String, name: &str, value: &str) {
         output.push(' ');
         output.push_str(name);

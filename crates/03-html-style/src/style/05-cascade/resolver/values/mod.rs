@@ -42,6 +42,25 @@ pub(super) fn checked_line_height_components(
     root_font_size: f32,
     resolution: &ResolutionContext,
 ) -> Option<(f32, f32)> {
+    let scale = resolution.font_size_scale;
+    let (px, ex) = resolution.with_canonical_font_sizes(|canonical| {
+        canonical_line_height_components(
+            lh,
+            font_size / scale,
+            root_font_size / scale,
+            canonical,
+        )
+    })?;
+    let result = (px * scale, ex * scale);
+    (result.0.is_finite() && result.1.is_finite()).then_some(result)
+}
+
+fn canonical_line_height_components(
+    lh: &lightningcss::properties::font::LineHeight,
+    font_size: f32,
+    root_font_size: f32,
+    resolution: &ResolutionContext,
+) -> Option<(f32, f32)> {
     use lightningcss::properties::font::LineHeight;
     let components = match lh {
         LineHeight::Length(LengthPercentage::Dimension(LengthValue::Ex(value))) => {

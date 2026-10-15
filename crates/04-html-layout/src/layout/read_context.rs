@@ -191,6 +191,12 @@ impl<'input> LayoutReader<'input> {
     ) -> Option<html_style_model::UsedPreferredSize> {
         const MIN_SOURCE_WIDTH: f64 = 96.0;
 
+        if self.image_idx(box_idx).and_then(|index| self.document.image(index))
+            .is_some_and(|image| matches!(image.source, html_dom::ImageSource::MathMl { .. }))
+        {
+            return None;
+        }
+
         if policy != crate::ImageSizingPolicy::SmartStandalone
             || !standalone
             || intrinsic.width < MIN_SOURCE_WIDTH

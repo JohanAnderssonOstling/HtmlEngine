@@ -35,13 +35,8 @@ pub(in crate::layout) struct ResolvedTextIndent {
 ///
 /// The boolean reports whether line widths must be queried from the active
 /// float formatting context. Token preparation itself is shared by both paths.
-pub(super) fn prepare_inline_tokens(
-    engine: &mut crate::layout::LayoutEngine<'_, '_>,
-    input: &InlineFormattingInput,
-) -> (InlineTokens, bool) {
-    let source_runs = engine.text.inline_items()
-        [input.run_range.start as usize..input.run_range.end as usize]
-        .to_vec();
+pub(super) fn prepare_inline_tokens(engine: &mut crate::layout::LayoutEngine<'_, '_>, input: &InlineFormattingInput) -> (InlineTokens, bool) {
+    let source_runs = &engine.text.inline_items()[input.run_range.start as usize..input.run_range.end as usize];
     let is_float_anchor = |run: &InlineItem| {
         let InlineItemKind::FloatAnchor { box_idx } = run.kind else {
             return false;

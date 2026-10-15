@@ -13,8 +13,8 @@ pub(super) fn publish_inline_box_geometry(
     bounds.fill(None);
     let state = fragments.state();
     for line in &state.line_output.lines {
-        let range =
-            line.inline_box_fragments.start as usize..line.inline_box_fragments.end as usize;
+        let inline_range = line.inline_box_fragments(&state.line_output.line_details);
+        let range = inline_range.start as usize..inline_range.end as usize;
         for fragment in state
             .line_output
             .inline_box_fragments

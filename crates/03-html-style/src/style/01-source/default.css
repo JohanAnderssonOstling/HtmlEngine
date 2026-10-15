@@ -1,3 +1,14 @@
+/* Equations use a generated SVG as their atomic content. */
+math {
+    display: inline;
+    max-width: 100%;
+}
+math[display="block" i] {
+    display: block;
+    margin-inline: auto;
+    margin-block: 0.5em;
+}
+
 /* Inline elements */
 a,
 abbr,
@@ -418,6 +429,14 @@ ins {
 a:any-link {
     color: blue;
     text-decoration: underline;
+}
+
+/* Footnote, endnote and margin-note references share noteref semantics.
+   Support both HTML's literal attribute and namespaced EPUB XHTML. */
+a[role~="doc-noteref" i],
+a[epub\:type~="noteref" i],
+a[*|type~="noteref" i] {
+    text-decoration: none;
 }
 
 a:visited {

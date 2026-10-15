@@ -125,7 +125,8 @@ pub trait Painter {
     ///
     /// The default translates the retained fragments without allocating an
     /// intermediate display list. Backends may override this to submit the
-    /// complete line as one native batch.
+    /// complete line as one native batch. Overrides must honor the supplied
+    /// color, or each fragment's color when no line color is supplied.
     fn draw_prepared_text_run_batch(
         &mut self,
         fragments: &[PreparedTextRunFragment],
@@ -141,16 +142,16 @@ pub trait Painter {
         let snap = |value: f64| (value * scale).round() / scale;
         for fragment in fragments {
             let offset = fragment.offset();
-            self.draw_text_run_fragment(
-                fragment.run(),
-                fragment.range(),
-                Point::new(line_origin.x + offset.x, snap(line_origin.y + offset.y)),
-                color,
-            );
+            self.draw_text_run_fragment(fragment.run(), fragment.range(), Point::new(line_origin.x + offset.x, snap(line_origin.y + offset.y)), color.or(fragment.color()));
         }
     }
     fn draw_image(&mut self, image: &Image, hash: &[u8], rect: Rect);
     fn draw_svg(&mut self, _bytes: &[u8], _hash: &[u8], _intrinsic_size: (u32, u32), _rect: Rect) {}
+    /// Inherited equation ink can change with the reader theme without
+    /// regenerating geometry. Explicit colors in the SVG remain intact.
+    fn draw_math_svg(&mut self, bytes: &[u8], hash: &[u8], intrinsic_size: (u32, u32), rect: Rect, _color: u32) {
+        self.draw_svg(bytes, hash, intrinsic_size, rect);
+    }
     fn draw_resource_image(&mut self, _image_idx: u32, _uri: Option<&str>, _rect: Rect) {}
 }
 
@@ -535,7 +536,7 @@ impl FragmentRenderer {
         glyph_shaper: &mut impl GlyphShaper,
     ) -> Result<RenderedFragment, FragmentRenderError> {
         let inputs = PipelineInputs {
-            source: source.to_owned(),
+            source: source.into(),
             markup_syntax: html_pipeline::MarkupSyntax::Html,
             user_styles: options.user_styles.clone(),
             reader_overrides: Default::default(),
@@ -664,7 +665,7 @@ pub fn paint_line_glyphs(
                 snap(baseline_y - metric.baseline_offset() as f64 - offset),
             );
             if advance_override.is_none() && metric.ch() != '\u{00ad}' {
-                match color {
+                match color.or_else(|| text.paint_color_at(index)) {
                     Some(color) => painter.draw_glyph_with_color(glyph, draw_point, color),
                     None => painter.draw_glyph(glyph, draw_point),
                 }
@@ -742,7 +743,7 @@ pub fn paint_line_glyph_fragment(
             snap(baseline_y - metric.baseline_offset() as f64 - offset),
         );
         if advance_override.is_none() && metric.ch() != '\u{00ad}' {
-            match color {
+            match color.or_else(|| text.paint_color_at(index)) {
                 Some(color) => painter.draw_glyph_with_color(glyph, draw_point, color),
                 None => painter.draw_glyph(glyph, draw_point),
             }
@@ -830,7 +831,7 @@ pub fn paint_line_text_runs(
             let source = run.source_range();
             let local = run.run_range();
             let mut natural_x = f64::from(run.natural_offset());
-            let mut segment: Option<(u32, u32, Point)> = None;
+            let mut segment: Option<(u32, u32, Point, Option<u32>)> = None;
             for index in source.clone() {
                 let glyph = text
                     .glyph_at(index as usize)
@@ -859,32 +860,21 @@ pub fn paint_line_text_runs(
                 );
                 let paints = advance_override.is_none() && metric.ch() != '\u{00ad}';
 
+                let paint_color = color.or_else(|| text.paint_color_at(index));
                 if paints {
                     match segment.as_mut() {
-                        Some((_, end, segment_origin))
-                            if *end == local_index && *segment_origin == run_origin =>
-                        {
+                        Some((_, end, segment_origin, segment_color)) if *end == local_index && *segment_origin == run_origin && (*segment_color == paint_color || !text.is_character_cluster_boundary(index)) => {
                             *end = local_index + 1;
                         }
                         _ => {
-                            if let Some((start, end, segment_origin)) = segment.take() {
-                                batch.push(TextRunFragment::new(
-                                    run.run(),
-                                    start..end,
-                                    segment_origin,
-                                    color,
-                                ));
+                            if let Some((start, end, segment_origin, segment_color)) = segment.take() {
+                                batch.push(TextRunFragment::new(run.run(), start..end, segment_origin, segment_color));
                             }
-                            segment = Some((local_index, local_index + 1, run_origin));
+                            segment = Some((local_index, local_index + 1, run_origin, paint_color));
                         }
                     }
-                } else if let Some((start, end, segment_origin)) = segment.take() {
-                    batch.push(TextRunFragment::new(
-                        run.run(),
-                        start..end,
-                        segment_origin,
-                        color,
-                    ));
+                } else if let Some((start, end, segment_origin, segment_color)) = segment.take() {
+                    batch.push(TextRunFragment::new(run.run(), start..end, segment_origin, segment_color));
                 }
 
                 let natural_advance = f64::from(
@@ -908,13 +898,8 @@ pub fn paint_line_text_runs(
                 );
                 natural_x += natural_advance;
             }
-            if let Some((start, end, segment_origin)) = segment {
-                batch.push(TextRunFragment::new(
-                    run.run(),
-                    start..end,
-                    segment_origin,
-                    color,
-                ));
+            if let Some((start, end, segment_origin, segment_color)) = segment {
+                batch.push(TextRunFragment::new(run.run(), start..end, segment_origin, segment_color));
             }
         }
     }
@@ -950,11 +935,8 @@ pub fn paint_line_ellipsis(
         && let Some(metric) = text.glyph_metric(ellipsis.glyph())
     {
         let offset = ellipsis.offset();
-        let point = Point::new(
-            snap(origin.x + line.optical_offset_x() + offset.x),
-            snap(baseline_y - metric.baseline_offset() as f64 - offset.y),
-        );
-        match color {
+        let point = Point::new(snap(origin.x + line.optical_offset_x() + offset.x), snap(baseline_y - metric.baseline_offset() as f64 - offset.y));
+        match color.or_else(|| text.paint_color_at(line.start())) {
             Some(color) => painter.draw_glyph_with_color(ellipsis.glyph(), point, color),
             None => painter.draw_glyph(ellipsis.glyph(), point),
         }
@@ -964,11 +946,8 @@ pub fn paint_line_ellipsis(
         && let Some(metric) = text.glyph_metric(hyphen.glyph())
     {
         let offset = hyphen.offset();
-        let point = Point::new(
-            snap(origin.x + line.optical_offset_x() + offset.x),
-            snap(baseline_y - metric.baseline_offset() as f64 - offset.y),
-        );
-        match color {
+        let point = Point::new(snap(origin.x + line.optical_offset_x() + offset.x), snap(baseline_y - metric.baseline_offset() as f64 - offset.y));
+        match color.or_else(|| text.paint_color_at(line.end().saturating_sub(1))) {
             Some(color) => painter.draw_glyph_with_color(hyphen.glyph(), point, color),
             None => painter.draw_glyph(hyphen.glyph(), point),
         }
@@ -1556,6 +1535,104 @@ mod tests {
         }
 
         fn draw_image(&mut self, _image: &Image, _hash: &[u8], _rect: Rect) {}
+    }
+
+    #[derive(Default)]
+    struct ColorPainter {
+        native: bool,
+        glyph_colors: Vec<Option<u32>>,
+        run_colors: Vec<(Range<u32>, Option<u32>)>,
+    }
+
+    impl Painter for ColorPainter {
+        fn fill_rect(&mut self, _: Rect, _: Color) {}
+        fn draw_glyph(&mut self, _: GlyphId, _: Point) {
+            self.glyph_colors.push(None);
+        }
+        fn draw_glyph_with_color(&mut self, _: GlyphId, _: Point, color: u32) {
+            self.glyph_colors.push(Some(color));
+        }
+        fn supports_text_runs(&self) -> bool {
+            self.native
+        }
+        fn draw_text_run_fragment(&mut self, _: TextRunId, range: Range<u32>, _: Point, color: Option<u32>) {
+            self.run_colors.push((range, color));
+        }
+        fn draw_image(&mut self, _: &Image, _: &[u8], _: Rect) {}
+    }
+
+    #[test]
+    fn paint_color_updates_replay_native_and_scalar_text_without_shaping() {
+        let mut factory = html_pipeline::DocumentFactory::new();
+        let base = factory.parse_with_new_pipeline("<p><span>A</span><a href='#target'>A</a></p>", None);
+        let mut shaper = NativeTestShaper::default();
+        let constraints = html_layout::LayoutConstraints::new(200.0, 16.0).unwrap();
+        let mut document = base.shape(&mut shaper).unwrap().layout(constraints);
+        let retained = document.clone();
+        let run_count = shaper.next_run;
+        let preferences = html_layout::ReaderStyleOverrides { foreground: Some(0x008000ff), link_foreground: Some(0xff0000ff), ..Default::default() };
+        let painted = base.with_reader_paint_overrides(&preferences).unwrap();
+        assert!(document.repaint_from(&painted));
+        assert_eq!(shaper.next_run, run_count);
+        let text = document.render_view().text();
+        let line = text.lines().iter().find(|line| !line.glyphs().is_empty()).unwrap().index();
+        assert_eq!(text.paint_color_at(0), Some(0x008000ff));
+        assert_eq!(text.paint_color_at(1), Some(0xff0000ff));
+        assert_eq!(retained.render_view().text().paint_color_at(1), None);
+        let mut native = ColorPainter { native: true, ..Default::default() };
+        assert!(paint_line_text_runs(&document, line, Point::ZERO, 1.0, None, &mut native));
+        assert!(native.run_colors.iter().any(|(_, color)| *color == Some(0x008000ff)));
+        assert!(native.run_colors.iter().any(|(_, color)| *color == Some(0xff0000ff)));
+        assert!(native.glyph_colors.is_empty());
+        let mut scalar = ColorPainter::default();
+        paint_line_glyphs(&document, line, Point::ZERO, 1.0, None, &mut scalar);
+        assert_eq!(scalar.glyph_colors, vec![Some(0x008000ff), Some(0xff0000ff)]);
+        let mut overridden = ColorPainter { native: true, ..Default::default() };
+        paint_line_text_runs(&document, line, Point::ZERO, 1.0, Some(0x0000ffff), &mut overridden);
+        assert!(overridden.run_colors.iter().all(|(_, color)| *color == Some(0x0000ffff)));
+        // Restore publisher colors, including prepared native fragments.
+        assert!(document.repaint_from(&base));
+        let mut restored = ColorPainter { native: true, ..Default::default() };
+        paint_line_text_runs(&document, line, Point::ZERO, 1.0, None, &mut restored);
+        assert!(restored.run_colors.iter().all(|(_, color)| color.is_none()));
+    }
+
+    #[test]
+    fn paint_color_updates_preserve_overflow_clips_without_shaping() {
+        let mut factory = html_pipeline::DocumentFactory::new();
+        let base = factory.parse_with_new_pipeline("<div style='width:80px;height:20px;overflow:hidden;background-color:white'><p style='margin:0'>Clipped text retains its owner and geometry.</p></div>", None);
+        let mut shaper = NativeTestShaper::default();
+        let constraints = html_layout::LayoutConstraints::new(120.0, 16.0).unwrap();
+        let mut document = base.shape(&mut shaper).unwrap().layout(constraints);
+        let clips: Vec<_> = (0..document.render_view().text().line_count()).map(|index| document.render_view().text().line_overflow_clip(index)).collect();
+        assert!(clips.iter().any(Option::is_some));
+        let run_count = shaper.next_run;
+        let painted = base.with_reader_paint_overrides(&html_layout::ReaderStyleOverrides { foreground: Some(0xeeeeeeff), ..Default::default() }).unwrap();
+        assert!(document.repaint_from(&painted));
+        let repainted_clips: Vec<_> = (0..document.render_view().text().line_count()).map(|index| document.render_view().text().line_overflow_clip(index)).collect();
+        assert_eq!(clips, repainted_clips);
+        assert_eq!(shaper.next_run, run_count);
+        assert!(document.repaint_from(&base));
+        let restored_clips: Vec<_> = (0..document.render_view().text().line_count()).map(|index| document.render_view().text().line_overflow_clip(index)).collect();
+        assert_eq!(clips, restored_clips);
+    }
+
+    #[test]
+    fn paint_updates_keep_first_letter_and_first_line_colors_after_resize() {
+        let mut factory = html_pipeline::DocumentFactory::new();
+        let base = factory.parse_with_new_pipeline("<p style='color:green'>“Apple” text continues here and wraps.</p>", Some("p::first-letter {color:purple} p::first-line {color:blue}"));
+        let mut shaper = NativeTestShaper::default();
+        let constraints = html_layout::LayoutConstraints::new(120.0, 16.0).unwrap();
+        let mut document = base.shape(&mut shaper).unwrap().layout_with_metrics_and_shaper(constraints, &Default::default(), &mut shaper).unwrap();
+        let theme = html_layout::ThemeAdaptation { ink: 0xeeeeeeff, surface: 0x222222ff };
+        let painted = base.with_reader_paint_overrides(&html_layout::ReaderStyleOverrides { theme: Some(theme), ..Default::default() }).unwrap();
+        assert!(document.repaint_from(&painted));
+        let text = document.render_view().text();
+        assert_eq!(text.paint_color_at(0), Some(theme.adapt(0x800080ff)));
+        assert_eq!(text.paint_color_at(1), Some(theme.adapt(0x800080ff)));
+        assert_eq!(text.line(0).unwrap().paint_color(), Some(theme.adapt(0x0000ffff)));
+        document.relayout_with_metrics_and_shaper(html_layout::LayoutConstraints::new(200.0, 16.0).unwrap(), &Default::default(), &mut shaper).unwrap();
+        assert_eq!(document.render_view().text().paint_color_at(0), Some(theme.adapt(0x800080ff)));
     }
 
     #[test]

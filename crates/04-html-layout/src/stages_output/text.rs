@@ -1,6 +1,7 @@
 //! Renderer-facing text, glyph, and line-layout queries.
 
 use super::*;
+use crate::layout_model::{LineDetails, LineTextFragment};
 
 /// Stable renderer-facing line geometry.
 ///
@@ -61,6 +62,7 @@ impl RenderLineTextFragment {
 
 pub struct RenderLineTextFragments<'a> {
     line: &'a Line,
+    fragments: Option<&'a [LineTextFragment]>,
     index: usize,
     implicit_emitted: bool,
 }
@@ -100,7 +102,7 @@ impl<'a> Iterator for RenderLineTextFragments<'a> {
     type Item = RenderLineTextFragment;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(fragments) = &self.line.text_fragments {
+        if let Some(fragments) = self.fragments {
             let fragment = fragments.get(self.index)?;
             self.index += 1;
             return Some(RenderLineTextFragment {
@@ -127,6 +129,7 @@ impl RenderLine {
     fn from_line(
         index: usize,
         line: &Line,
+        details: &[LineDetails],
         positioned_layer: bool,
         negative_positioned_layer: bool,
         independent_positioned_layer: bool,
@@ -140,8 +143,8 @@ impl RenderLine {
             baseline: line.baseline,
             word_spacing: line.word_spacing,
             letter_spacing: line.letter_spacing,
-            optical_offset_x: line.optical_offset_x,
-            paint_color: line.paint_color,
+            optical_offset_x: line.optical_offset_x(details),
+            paint_color: line.paint_color(details),
             positioned_layer,
             negative_positioned_layer,
             independent_positioned_layer,
@@ -224,6 +227,7 @@ impl RenderLine {
 
 pub struct RenderLines<'a> {
     lines: &'a [Line],
+    details: &'a [LineDetails],
     positioned_layers: &'a [bool],
     negative_positioned_layers: &'a [bool],
     independent_positioned_layers: &'a [bool],
@@ -232,12 +236,14 @@ pub struct RenderLines<'a> {
 impl<'a> RenderLines<'a> {
     fn new(
         lines: &'a [Line],
+        details: &'a [LineDetails],
         positioned_layers: &'a [bool],
         negative_positioned_layers: &'a [bool],
         independent_positioned_layers: &'a [bool],
     ) -> Self {
         Self {
             lines,
+            details,
             positioned_layers,
             negative_positioned_layers,
             independent_positioned_layers,
@@ -257,6 +263,7 @@ impl<'a> RenderLines<'a> {
             RenderLine::from_line(
                 idx,
                 line,
+                self.details,
                 self.positioned_layers.get(idx).copied().unwrap_or(false),
                 self.negative_positioned_layers
                     .get(idx)
@@ -275,6 +282,7 @@ impl<'a> RenderLines<'a> {
             RenderLine::from_line(
                 0,
                 line,
+                self.details,
                 self.positioned_layers.first().copied().unwrap_or(false),
                 self.negative_positioned_layers
                     .first()
@@ -294,6 +302,7 @@ impl<'a> RenderLines<'a> {
             RenderLine::from_line(
                 index,
                 line,
+                self.details,
                 self.positioned_layers.get(index).copied().unwrap_or(false),
                 self.negative_positioned_layers
                     .get(index)
@@ -312,6 +321,7 @@ impl<'a> RenderLines<'a> {
             RenderLine::from_line(
                 index,
                 line,
+                self.details,
                 self.positioned_layers.get(index).copied().unwrap_or(false),
                 self.negative_positioned_layers
                     .get(index)
@@ -635,6 +645,13 @@ impl<'a> RenderTextView<'a> {
         self.doc.shaped.inline_content.glyphs().get(start..end)
     }
 
+    /// Updated source color, independent of the retained backend glyph/run.
+    pub fn paint_color_at(self, character_index: u32) -> Option<u32> {
+        let colors = &self.doc.paint_colors;
+        let index = colors.partition_point(|run| run.glyphs.end <= character_index);
+        colors.get(index).filter(|run| run.glyphs.contains(&character_index)).map(|run| run.color)
+    }
+
     pub fn glyph_metric(self, glyph: GlyphId) -> Option<crate::GlyphMetric> {
         self.doc.shaped.glyph_metrics.get_checked(glyph)
     }
@@ -700,6 +717,7 @@ impl<'a> RenderTextView<'a> {
     pub fn lines(self) -> RenderLines<'a> {
         RenderLines::new(
             &self.doc.layout_state.line_output.lines,
+            &self.doc.layout_state.line_output.line_details,
             &self.doc.layout_state.line_output.positioned_layers,
             &self.doc.layout_state.line_output.negative_positioned_layers,
             &self
@@ -720,6 +738,7 @@ impl<'a> RenderTextView<'a> {
                 RenderLine::from_line(
                     idx,
                     line,
+                    &self.doc.layout_state.line_output.line_details,
                     self.doc
                         .layout_state
                         .line_output
@@ -758,14 +777,13 @@ impl<'a> RenderTextView<'a> {
     }
 
     /// Returns the line that owns a source glyph.
+    #[inline]
     pub fn line_index_for_glyph(self, glyph_idx: u32) -> Option<usize> {
-        let encoded = *self
-            .doc
+        self.doc
             .layout_state
             .line_output
             .glyph_line_indices
-            .get(glyph_idx as usize)?;
-        (encoded != u32::MAX).then_some(encoded as usize)
+            .get(glyph_idx as usize)
     }
 
     pub fn line_glyph_offsets(self, line_idx: usize) -> Option<RenderGlyphOffsetRuns<'a>> {
@@ -790,6 +808,8 @@ impl<'a> RenderTextView<'a> {
         let line = self.doc.layout_state.line_output.lines.get(line_idx)?;
         Some(RenderLineTextFragments {
             line,
+            fragments: line.text_fragment_range(&self.doc.layout_state.line_output.line_details)
+                .map(|range| &self.doc.layout_state.line_output.text_fragments[range.start as usize..range.end as usize]),
             index: 0,
             implicit_emitted: false,
         })

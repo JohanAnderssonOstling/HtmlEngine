@@ -207,6 +207,7 @@ fn runs_pinned_noninteractive_wpt_layout_assertions() {
         for (image_idx, image) in expectation_document.images().iter().enumerate() {
             let source = match &image.source {
                 ImageSource::Uri(uri) => ImageSource::Uri(provider.resolve(relative, uri)),
+                source @ ImageSource::MathMl { .. } => source.clone(),
                 ImageSource::InlineSvg { bytes, base_uri } => ImageSource::InlineSvg {
                     bytes: bytes.clone(),
                     base_uri: base_uri.clone(),

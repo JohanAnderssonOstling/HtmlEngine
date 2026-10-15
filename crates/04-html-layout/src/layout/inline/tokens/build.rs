@@ -1,6 +1,7 @@
 //! Construction of inline tokens and measurement of atomic inline content.
 
 use super::*;
+use html_dom::ImageSource;
 
 fn create_image_token(
     engine: &crate::layout::LayoutEngine<'_, '_>,
@@ -18,7 +19,8 @@ fn create_image_token(
     } else {
         effective_vertical_align(engine, box_idx as usize)
     };
-    let smart_standalone = standalone_image == Some(box_idx)
+    let is_mathml = matches!(engine.reader.document().image(image_idx).map(|image| &image.source), Some(ImageSource::MathMl { .. }));
+    let smart_standalone = !is_mathml && standalone_image == Some(box_idx)
         && style.position() != html_style_model::PositionMode::Absolute;
     let max_width = max_width.max(0.0);
     let authored_margin_left = style.margin_left().resolve(max_width);
@@ -136,6 +138,11 @@ fn create_image_token(
     );
     let outer_width = (border_size.width + margin_left + margin_right).max(0.0);
     let outer_height = (border_size.height + margin_top + margin_bottom).max(0.0);
+    let math_descent = match &engine.reader.document().image(image_idx).expect("registered image").source {
+        ImageSource::MathMl { baseline, .. } =>
+            content_size.height * f64::from(1.0 - baseline) + margin_bottom + vertical_padding - padding_top + style.border_bottom_width() as f64,
+        _ => 0.0,
+    };
     let font_size = style.font_size();
     let line_height = resolved_line_height(style);
     let position_offset = if style.position() == html_style_model::PositionMode::Relative {
@@ -159,8 +166,8 @@ fn create_image_token(
         ),
         InlineTokenMetrics {
             owner_box_idx: box_idx,
-            ascent: outer_height as f32,
-            descent: 0.0,
+            ascent: (outer_height - math_descent) as f32,
+            descent: math_descent as f32,
             line_height,
             tab_interval: -1.0,
             tab_min_advance: 0.0,
@@ -375,6 +382,7 @@ pub(in crate::layout::inline) fn build_inline_tokens(
     };
     let source_runs = &engine.text.inline_items()[run_range.start as usize..run_range.end as usize];
     let cacheable = !engine.config.sentence_per_line()
+        && engine.inline_plans.can_cache(plan_key.container_box_idx)
         && source_runs.iter().all(|run| {
             matches!(
                 run.kind,

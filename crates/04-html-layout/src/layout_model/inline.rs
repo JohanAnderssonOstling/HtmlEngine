@@ -1,3 +1,4 @@
+use super::SourceOffsets;
 use html_dom::MemoryUsageReport;
 use std::ops::Range;
 
@@ -30,8 +31,8 @@ impl WhitespaceWrapOverride {
 pub(crate) struct InlineContent {
     pub(super) glyphs: Vec<GlyphId>,
     /// UTF-16 source offset within `InlineItem::dom_text_node` for each glyph.
-    /// Synthetic glyphs such as list markers use `u32::MAX`.
-    pub(super) glyph_source_offsets: Vec<u32>,
+    /// Synthetic glyphs such as list markers have no source position.
+    pub(super) glyph_source_offsets: SourceOffsets,
     /// A soft-wrap opportunity retained from the pre-collapse whitespace
     /// sequence. This is separate from the surviving glyph's style because a
     /// sequence can cross inline elements with different `white-space` values.
@@ -47,10 +48,9 @@ impl InlineContent {
             self.glyphs.capacity(),
             self.glyphs.len(),
         );
-        report.add_slice_storage::<u32>(
-            "InlineContent.glyph_source_offsets.storage",
-            self.glyph_source_offsets.capacity(),
-            self.glyph_source_offsets.len(),
+        report.extend_prefixed(
+            "InlineContent.glyph_source_offsets",
+            self.glyph_source_offsets.memory_usage_report(),
         );
         report.add_slice_storage::<WhitespaceWrapOverride>(
             "InlineContent.whitespace_wrap_before.storage",
@@ -82,14 +82,12 @@ impl InlineContent {
     pub(crate) fn glyph_source_offset(&self, glyph_idx: usize) -> Option<u32> {
         self.glyph_source_offsets
             .get(glyph_idx)
-            .copied()
             .filter(|offset| *offset != u32::MAX)
     }
 
     pub(crate) fn raw_glyph_source_offset(&self, glyph_idx: usize) -> u32 {
         self.glyph_source_offsets
             .get(glyph_idx)
-            .copied()
             .unwrap_or(u32::MAX)
     }
 
@@ -103,7 +101,7 @@ impl InlineContent {
     pub(crate) fn replace_glyphs(
         &mut self,
         glyphs: Vec<GlyphId>,
-        source_offsets: Vec<u32>,
+        source_offsets: SourceOffsets,
         whitespace_wrap_before: Vec<WhitespaceWrapOverride>,
     ) {
         debug_assert_eq!(glyphs.len(), source_offsets.len());

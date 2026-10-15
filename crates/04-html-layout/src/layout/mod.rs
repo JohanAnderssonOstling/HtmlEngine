@@ -66,3 +66,5 @@ pub(crate) use replaced::{
     preferred_aspect_ratio, resolve_replaced_flex_auto_min_main_size,
     resolve_replaced_intrinsic_constraint,
 };
+
+pub(crate) use finalization::text_paint::prepare_text_paint;

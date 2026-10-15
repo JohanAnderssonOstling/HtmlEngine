@@ -9,6 +9,8 @@ use super::*;
 use crate::layout::LayoutEngine;
 use crate::layout_model::LayoutMode;
 use unicode_segmentation::UnicodeSegmentation;
+use crate::layout_model::{Children, InlineContent, LayoutTree};
+use std::sync::{Arc, OnceLock};
 
 /// Normal justification consumes at most the glue declared by the paragraph:
 /// 50% space expansion or 33% contraction. A separate emergency pass may
@@ -518,7 +520,7 @@ impl InlineSummaryBlock {
 #[derive(Clone)]
 pub(super) enum InlineStorage<T: Clone> {
     Owned(Vec<T>),
-    Shared(std::sync::Arc<Vec<T>>),
+    Shared(Arc<[T]>),
 }
 
 impl<T: Clone> Default for InlineStorage<T> {
@@ -533,22 +535,25 @@ impl<T: Clone> InlineStorage<T> {
     }
 
     fn make_mut(&mut self) -> &mut Vec<T> {
+        if let Self::Shared(values) = self {
+            *self = Self::Owned(values.to_vec());
+        }
         match self {
             Self::Owned(values) => values,
-            Self::Shared(values) => std::sync::Arc::make_mut(values),
+            Self::Shared(_) => unreachable!("shared storage was thawed"),
         }
     }
 
     fn share(&mut self) {
         if let Self::Owned(values) = self {
-            *self = Self::Shared(std::sync::Arc::new(std::mem::take(values)));
+            *self = Self::Shared(std::mem::take(values).into());
         }
     }
 
     fn capacity(&self) -> usize {
         match self {
             Self::Owned(values) => values.capacity(),
-            Self::Shared(values) => values.capacity(),
+            Self::Shared(values) => values.len(),
         }
     }
 }
@@ -570,7 +575,7 @@ pub(super) struct InlineTokens {
     pub(super) runs: InlineStorage<InlineTokenMetrics>,
     pub(super) summary_blocks: InlineStorage<InlineSummaryBlock>,
     pub(super) replaced: Vec<ReplacedToken>,
-    pub(super) kp_plan: Option<std::sync::Arc<[std::sync::OnceLock<KpPlan>; 2]>>,
+    pub(super) kp_plan: Option<Arc<[OnceLock<KpPlan>; 2]>>,
 }
 
 impl InlineTokens {
@@ -915,7 +920,7 @@ impl InlineTokens {
 
     fn enable_kp_plan_cache(&mut self) {
         self.kp_plan.get_or_insert_with(|| {
-            std::sync::Arc::new([std::sync::OnceLock::new(), std::sync::OnceLock::new()])
+            Arc::new([OnceLock::new(), OnceLock::new()])
         });
     }
 
@@ -952,84 +957,112 @@ struct PreparedInlinePlan {
 /// Width-independent text plans owned by the shaped document and shared by
 /// every layout derived from it.
 ///
-/// A layout box owns at most one inline formatting-context range, so topology
-/// order is already the ideal cache index. Dense `OnceLock` slots avoid a hash
-/// lookup and allow the first layout to prepare plans lazily without making
-/// immutable shaping data depend on viewport constraints. Replaced and other
-/// layout-sensitive contexts never enter these slots.
+/// Only text-only formatting contexts reserve a plan slot. A compact map
+/// keeps box lookup constant-time without reserving a full plan for every
+/// inline descendant or a context that contains replaced content.
 #[derive(Clone)]
 pub(crate) struct PreparedInlinePlans {
-    slots: std::sync::Arc<[std::sync::OnceLock<PreparedInlinePlan>]>,
+    box_slots: Arc<[u32]>,
+    slots: Arc<[OnceLock<PreparedInlinePlan>]>,
 }
 
 impl PreparedInlinePlans {
-    pub(crate) fn new(box_count: usize) -> Self {
-        Self {
-            slots: (0..box_count)
-                .map(|_| std::sync::OnceLock::new())
-                .collect::<Vec<_>>()
-                .into(),
+    pub(crate) fn new(tree: &LayoutTree, content: &InlineContent) -> Self {
+        let mut box_slots = vec![u32::MAX; tree.box_count()];
+        let mut slot_count = 0usize;
+        for (box_idx, slot) in box_slots.iter_mut().enumerate() {
+            let range = match tree.get_box_layout_mode(box_idx) {
+                Some(LayoutMode::Block(block)) => match &block.children {
+                    Children::InlineItems(range) => range,
+                    _ => continue,
+                },
+                Some(LayoutMode::TableCell(cell)) => match &cell.children {
+                    Children::InlineItems(range) => range,
+                    _ => continue,
+                },
+                Some(LayoutMode::Anonymous(range)) => range,
+                Some(LayoutMode::Inline(range))
+                    if tree.get_box_parent(box_idx).is_none()
+                        || content.inline_items().get(range.start as usize..range.end as usize).is_some_and(
+                            |runs| runs.iter().any(|run| matches!(run.kind, InlineItemKind::Marker { .. })),
+                        ) =>
+                {
+                    range
+                }
+                _ => continue,
+            };
+            let Some(runs) = content.inline_items().get(range.start as usize..range.end as usize) else {
+                continue;
+            };
+            if runs.is_empty()
+                || !runs
+                    .iter()
+                    .all(|run| matches!(run.kind, InlineItemKind::Text { .. } | InlineItemKind::Marker { .. }))
+            {
+                continue;
+            }
+            *slot = u32::try_from(slot_count).expect("inline-plan slot capacity exhausted");
+            slot_count += 1;
         }
+        Self { box_slots: box_slots.into(), slots: (0..slot_count).map(|_| OnceLock::new()).collect::<Vec<_>>().into() }
+    }
+
+    fn slot(&self, box_idx: u32) -> Option<&OnceLock<PreparedInlinePlan>> {
+        let index = *self.box_slots.get(box_idx as usize)?;
+        (index != u32::MAX).then(|| &self.slots[index as usize])
+    }
+
+    pub(in crate::layout::inline) fn can_cache(&self, box_idx: u32) -> bool {
+        self.slot(box_idx).is_some()
     }
 
     fn get(&self, key: PreparedInlinePlanKey) -> Option<InlineTokens> {
-        let plan = self.slots.get(key.container_box_idx as usize)?.get()?;
+        let plan = self.slot(key.container_box_idx)?.get()?;
         (plan.key == key).then(|| plan.tokens.clone())
     }
 
     fn insert(&self, key: PreparedInlinePlanKey, tokens: InlineTokens) -> InlineTokens {
-        let Some(slot) = self.slots.get(key.container_box_idx as usize) else {
+        let Some(slot) = self.slot(key.container_box_idx) else {
             return tokens;
         };
         if let Some(plan) = slot.get() {
-            return if plan.key == key {
-                plan.tokens.clone()
-            } else {
-                tokens
-            };
+            return if plan.key == key { plan.tokens.clone() } else { tokens };
         }
         match slot.set(PreparedInlinePlan { key, tokens }) {
-            Ok(()) => slot
-                .get()
-                .expect("prepared inline plan was just initialized")
-                .tokens
-                .clone(),
-            Err(candidate) => slot
-                .get()
-                .filter(|plan| plan.key == key)
-                .map_or(candidate.tokens, |plan| plan.tokens.clone()),
+            Ok(()) => slot.get().expect("prepared inline plan was just initialized").tokens.clone(),
+            Err(candidate) => {
+                slot.get().filter(|plan| plan.key == key).map_or(candidate.tokens, |plan| plan.tokens.clone())
+            }
         }
     }
 
     pub(crate) fn memory_usage_bytes(&self) -> usize {
-        self.slots.len() * std::mem::size_of::<std::sync::OnceLock<PreparedInlinePlan>>()
+        self.box_slots.len() * std::mem::size_of::<u32>()
+            + self.slots.len() * std::mem::size_of::<OnceLock<PreparedInlinePlan>>()
             + self
                 .slots
                 .iter()
-                .filter_map(std::sync::OnceLock::get)
+                .filter_map(OnceLock::get)
                 .map(|tokens| {
                     let tokens = &tokens.tokens;
                     let kp_plan_bytes = tokens.kp_plan.as_deref().map_or(0, |plans| {
-                        plans
-                            .iter()
-                            .filter_map(std::sync::OnceLock::get)
-                            .map(KpPlan::memory_usage_bytes)
-                            .sum()
+                        plans.iter().filter_map(OnceLock::get).map(KpPlan::memory_usage_bytes).sum()
                     });
                     tokens.dense.capacity() * std::mem::size_of::<InlineToken>()
                         + tokens.runs.capacity() * std::mem::size_of::<InlineTokenMetrics>()
-                        + tokens.summary_blocks.capacity()
-                            * std::mem::size_of::<InlineSummaryBlock>()
+                        + tokens.summary_blocks.capacity() * std::mem::size_of::<InlineSummaryBlock>()
                         + kp_plan_bytes
                 })
                 .sum::<usize>()
     }
 
+    #[cfg(test)]
+    pub(crate) fn storage_counts(&self) -> (usize, usize, usize) {
+        (self.box_slots.len(), self.slots.len(), self.len())
+    }
+
     pub(crate) fn len(&self) -> usize {
-        self.slots
-            .iter()
-            .filter(|slot| slot.get().is_some())
-            .count()
+        self.slots.iter().filter(|slot| slot.get().is_some()).count()
     }
 }
 
@@ -1195,5 +1228,29 @@ pub(in crate::layout) fn break_kind(character: char, white_space: WhiteSpace) ->
         ' ' | '\t' | '\n' => BreakKind::Soft,
         '\u{200b}' => BreakKind::Discretionary,
         _ => BreakKind::None,
+    }
+}
+
+#[cfg(test)]
+mod storage_tests {
+    use super::InlineStorage;
+    use std::sync::Arc;
+
+    #[test]
+    fn frozen_arrays_release_spare_capacity_and_thaw_without_mutating_snapshots() {
+        let mut storage = InlineStorage::with_capacity(1024);
+        storage.make_mut().extend([1u32, 2, 3]);
+        storage.share();
+        assert_eq!(storage.capacity(), 3);
+        let mut cloned = storage.clone();
+        match (&storage, &cloned) {
+            (InlineStorage::Shared(left), InlineStorage::Shared(right)) => assert!(Arc::ptr_eq(left, right)),
+            _ => panic!("frozen arrays must be shared slices"),
+        }
+        cloned.make_mut().push(4);
+        assert_eq!(&*storage, &[1, 2, 3]);
+        assert_eq!(&*cloned, &[1, 2, 3, 4]);
+        cloned.share();
+        assert_eq!(cloned.capacity(), 4);
     }
 }

@@ -56,6 +56,8 @@ impl<'out> FragmentWriter<'out> {
 
         let state = &mut self.state;
         state.line_output.lines.clear();
+        state.line_output.line_details.clear();
+        state.line_output.text_fragments.clear();
         state.line_output.paint_order_indices.clear();
         state.line_output.paint_order_ranks.clear();
         state.line_output.inline_box_fragments.clear();
@@ -72,9 +74,7 @@ impl<'out> FragmentWriter<'out> {
         state.fragment_output.decorations.clear();
         state.fragment_output.decoration_line_indices.clear();
         state.fragment_output.decoration_paint_orders.clear();
-        for fragments in &mut state.fragment_output.decoration_fragments_by_line {
-            fragments.clear();
-        }
+        state.fragment_output.decoration_fragments_by_line.clear();
         state.fragment_output.decoration_positioned_layers.clear();
         state
             .fragment_output
@@ -91,9 +91,7 @@ impl<'out> FragmentWriter<'out> {
         state.fragment_output.block_decoration_count = 0;
         state.fragment_output.decoration_clips.clear();
         state.fragment_output.image_fragments.clear();
-        for fragments in &mut state.fragment_output.image_fragments_by_line {
-            fragments.clear();
-        }
+        state.fragment_output.image_fragments_by_line.clear();
         state.semantic_indexes.anchor_positions.clear();
     }
 

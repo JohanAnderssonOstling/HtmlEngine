@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use super::{BoxFontMetrics, CharacterPlacement, FontSlant, RequiredFontMetrics, ShapedFontMetrics, ShapedLine, ShapedTextGeometry, ShapedTextRun, TextRunShapeRequest, TextShapeRequest, TextStyleSpan, collapse_whitespace, first_letter_style_overrides, is_css_collapsible_space, plan_shaping_spans, transform_text};
+    use super::{BoxFontMetrics, CharacterPlacement, FontSlant, RequiredFontMetrics, ShapedFontMetrics, ShapedLine, ShapedTextGeometry, ShapedTextRun, TextRunShapeRequest, TextShapeRequest, TextStyleSpan, collapse_whitespace, first_letter_style_overrides, first_letter_overrides_with_characters, is_css_collapsible_space, plan_shaping_spans, transform_text};
     use crate::parser::DocumentFactory;
     use std::sync::Arc;
 
@@ -31,6 +31,190 @@ mod tests {
         let text = content.glyphs().iter().filter_map(|glyph| char::from_u32(*glyph)).collect();
         let offsets = (0..content.glyphs().len()).map(|index| content.raw_glyph_source_offset(index)).collect();
         (text, offsets)
+    }
+
+    #[test]
+    fn absent_first_letter_skips_character_access_even_with_generated_text() {
+        let mut factory = DocumentFactory::new();
+        let prepared = factory.parse_with_new_pipeline(
+            "<p>text <em>inside</em></p>",
+            Some("p::before {content:'prefix'} p::first-line {color:blue}"),
+        );
+        assert!(!prepared.styles().has_first_letter_styles());
+        assert!(prepared.styles().has_first_line_styles());
+        let overrides = first_letter_overrides_with_characters(
+            prepared.document(),
+            prepared.styles(),
+            prepared.layout_tree(),
+            prepared.inline_content(),
+            |_| panic!("first-letter scan must be skipped"),
+        );
+        assert!(overrides.is_empty());
+        assert_eq!(overrides.capacity(), 0);
+    }
+
+    #[test]
+    fn empty_first_letter_overrides_match_dense_none_shaping_spans() {
+        for (html, css) in [
+            ("<p>of<span style='color:red'>fi</span>ce</p>", None),
+            ("<pre>one\ntwo\tthree</pre>", None),
+            (
+                "<p>of<span style='position:absolute'>x</span>fice<br>end</p>",
+                None,
+            ),
+            (
+                "<p>A<span style='display:inline-block'>nested</span>B<img src='x'>C</p>",
+                None,
+            ),
+            ("<p>A<span style='vertical-align:super'>b</span>C</p>", None),
+            (
+                "<p dir='rtl'>السلام <em>عليكم</em> a\u{301} fi</p>",
+                Some("p::before {content:'prefix'}"),
+            ),
+            ("<p></p>", None),
+        ] {
+            let mut factory = DocumentFactory::new();
+            let prepared = factory.parse_with_new_pipeline(html, css);
+            let mut content = prepared.inline_content().clone();
+            collapse_whitespace(prepared.styles(), prepared.layout_tree(), &mut content);
+            let metrics = ShapedFontMetrics::new(
+                BoxFontMetrics::NotRequired,
+                RequiredFontMetrics::NotRequired,
+                prepared.box_count(),
+                0.0,
+                0.0,
+                0.0,
+            );
+            let dense = vec![None; content.glyphs().len()];
+            let original = plan_shaping_spans(
+                prepared.styles(),
+                prepared.layout_tree(),
+                &content,
+                &dense,
+                &metrics,
+            );
+            let empty = plan_shaping_spans(
+                prepared.styles(),
+                prepared.layout_tree(),
+                &content,
+                &[],
+                &metrics,
+            );
+            assert_eq!(format!("{empty:?}"), format!("{original:?}"), "{html}");
+            for (before, after) in original.iter().zip(empty.iter()) {
+                assert_eq!(
+                    before.paint_colors(prepared.styles(), prepared.layout_tree()),
+                    after.paint_colors(prepared.styles(), prepared.layout_tree())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn text_transforms_preserve_empty_first_letter_overrides_and_source_mapping() {
+        for html in [
+            "<p style='text-transform:uppercase'>Straße <em>ß</em> a\u{301}</p>",
+            "<p style='text-transform:lowercase'>İSTANBUL</p>",
+            "<p style='text-transform:capitalize'>one <em>two</em><br>three</p>",
+            "<p style='text-transform:uppercase'>ა</p>",
+        ] {
+            let mut factory = DocumentFactory::new();
+            let prepared = factory.parse_with_new_pipeline(html, None);
+            let mut empty_content = prepared.inline_content().clone();
+            collapse_whitespace(
+                prepared.styles(),
+                prepared.layout_tree(),
+                &mut empty_content,
+            );
+            let mut dense_content = empty_content.clone();
+            let mut empty_overrides = Vec::new();
+            let mut dense_overrides = vec![None; dense_content.glyphs().len()];
+            transform_text(
+                prepared.styles(),
+                prepared.layout_tree(),
+                &mut empty_content,
+                &mut empty_overrides,
+            );
+            transform_text(
+                prepared.styles(),
+                prepared.layout_tree(),
+                &mut dense_content,
+                &mut dense_overrides,
+            );
+            assert!(empty_overrides.is_empty(), "{html}");
+            assert_eq!(empty_overrides.capacity(), 0);
+            assert_eq!(empty_content.glyphs(), dense_content.glyphs());
+            for index in 0..empty_content.glyphs().len() {
+                assert_eq!(
+                    empty_content.raw_glyph_source_offset(index),
+                    dense_content.raw_glyph_source_offset(index)
+                );
+                assert_eq!(
+                    empty_content.whitespace_wrap_before(index),
+                    dense_content.whitespace_wrap_before(index)
+                );
+            }
+            let metrics = ShapedFontMetrics::new(
+                BoxFontMetrics::NotRequired,
+                RequiredFontMetrics::NotRequired,
+                prepared.box_count(),
+                0.0,
+                0.0,
+                0.0,
+            );
+            let empty = plan_shaping_spans(
+                prepared.styles(),
+                prepared.layout_tree(),
+                &empty_content,
+                &empty_overrides,
+                &metrics,
+            );
+            let dense = plan_shaping_spans(
+                prepared.styles(),
+                prepared.layout_tree(),
+                &dense_content,
+                &dense_overrides,
+                &metrics,
+            );
+            assert_eq!(format!("{empty:?}"), format!("{dense:?}"), "{html}");
+        }
+    }
+
+    #[test]
+    fn present_first_letter_styles_keep_dense_override_selection() {
+        for (html, css) in [
+            (
+                "<p>“Apple” a\u{301}</p>",
+                "p::first-letter {font-size:2em; color:purple}",
+            ),
+            (
+                "<div><p>Apple</p></div>",
+                "div::first-letter {font-size:2em}",
+            ),
+            (
+                "<p>Apple</p>",
+                "p::before {content:'“Hello” '} p::first-letter {font-size:2em}",
+            ),
+            (
+                "<p>Apple</p>",
+                "p::first-letter {float:left; font-size:2em}",
+            ),
+        ] {
+            let mut factory = DocumentFactory::new();
+            let prepared = factory.parse_with_new_pipeline(html, Some(css));
+            assert!(prepared.styles().has_first_letter_styles(), "{css}");
+            let overrides = first_letter_style_overrides(
+                prepared.document(),
+                prepared.styles(),
+                prepared.layout_tree(),
+                prepared.inline_content(),
+            );
+            assert_eq!(
+                overrides.len(),
+                prepared.inline_content().glyphs().len(),
+                "{css}"
+            );
+        }
     }
 
     fn shaped_line() -> ShapedLine {

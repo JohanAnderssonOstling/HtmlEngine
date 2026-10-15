@@ -210,83 +210,78 @@ struct CompactPathNode {
 
 const NO_COMPACT_PATH: u32 = u32::MAX;
 
+/// Width-dependent solver storage retained between paragraphs and resizes.
+#[derive(Default)]
+pub(in crate::layout::inline) struct CompactScratch {
+    paths: Vec<CompactPathNode>,
+    active: Vec<CompactActiveNode>,
+    breaks: Vec<usize>,
+}
+
+impl CompactScratch {
+    #[cfg(test)]
+    pub(in crate::layout::inline) fn capacities(&self) -> (usize, usize, usize) {
+        (self.paths.capacity(), self.active.capacity(), self.breaks.capacity())
+    }
+}
+
+pub(super) fn break_compact_reusing<'s>(breakpoints: &[CompactBreakpoint], line_width: impl Fn(usize) -> f64, tolerance: f64, ragged: bool, quality: bool, scratch: &'s mut CompactScratch) -> Option<&'s [usize]> {
+    if ragged {
+        if quality && break_compact_ragged_with_mode(breakpoints, &line_width, false, true, scratch).is_some() {
+            return Some(&scratch.breaks);
+        }
+        break_compact_ragged_with_mode(breakpoints, &line_width, true, quality, scratch)
+    } else {
+        if break_compact_with_mode(breakpoints, &line_width, tolerance, false, quality, scratch).is_some() {
+            return Some(&scratch.breaks);
+        }
+        break_compact_with_mode(breakpoints, &line_width, tolerance, true, quality, scratch)
+    }
+}
+
 /// Knuth–Plass over the compact legal-break stream used by inline layout.
 ///
 /// The active records contain every value read by the inner loop and are
 /// compacted in place. This avoids the old active-index gathers into a much
 /// larger append-only `Node` arena and exposes contiguous numeric columns to
 /// the optimizer.
-pub(super) fn break_compact(
-    breakpoints: &[CompactBreakpoint],
-    line_width: impl Fn(usize) -> f64,
-    tolerance: f64,
-) -> Option<Vec<usize>> {
-    break_compact_with_mode(breakpoints, line_width, tolerance, false, false)
+#[cfg(test)]
+pub(super) fn break_compact(breakpoints: &[CompactBreakpoint], line_width: impl Fn(usize) -> f64, tolerance: f64) -> Option<Vec<usize>> {
+    break_compact_with_mode(breakpoints, line_width, tolerance, false, false, &mut CompactScratch::default()).map(<[usize]>::to_vec)
 }
 
-pub(super) fn break_compact_emergency(
-    breakpoints: &[CompactBreakpoint],
-    line_width: impl Fn(usize) -> f64,
-    tolerance: f64,
-) -> Option<Vec<usize>> {
-    break_compact_with_mode(breakpoints, line_width, tolerance, true, false)
+#[cfg(test)]
+pub(super) fn break_compact_emergency(breakpoints: &[CompactBreakpoint], line_width: impl Fn(usize) -> f64, tolerance: f64) -> Option<Vec<usize>> {
+    break_compact_with_mode(breakpoints, line_width, tolerance, true, false, &mut CompactScratch::default()).map(<[usize]>::to_vec)
 }
 
-pub(super) fn break_compact_book(
-    breakpoints: &[CompactBreakpoint],
-    line_width: impl Fn(usize) -> f64,
-    tolerance: f64,
-) -> Option<Vec<usize>> {
-    break_compact_with_mode(breakpoints, line_width, tolerance, false, true)
+#[cfg(test)]
+pub(super) fn break_compact_book(breakpoints: &[CompactBreakpoint], line_width: impl Fn(usize) -> f64, tolerance: f64) -> Option<Vec<usize>> {
+    break_compact_with_mode(breakpoints, line_width, tolerance, false, true, &mut CompactScratch::default()).map(<[usize]>::to_vec)
 }
 
-pub(super) fn break_compact_emergency_book(
-    breakpoints: &[CompactBreakpoint],
-    line_width: impl Fn(usize) -> f64,
-    tolerance: f64,
-) -> Option<Vec<usize>> {
-    break_compact_with_mode(breakpoints, line_width, tolerance, true, true)
+#[cfg(test)]
+pub(super) fn break_compact_emergency_book(breakpoints: &[CompactBreakpoint], line_width: impl Fn(usize) -> f64, tolerance: f64) -> Option<Vec<usize>> {
+    break_compact_with_mode(breakpoints, line_width, tolerance, true, true, &mut CompactScratch::default()).map(<[usize]>::to_vec)
 }
 
 /// Paragraph-wide composition for fixed-spacing ragged text. Unlike justified
 /// Knuth--Plass, unused line width is intentional and becomes the badness
 /// being minimized; word spaces retain their natural advances.
-pub(super) fn break_compact_ragged(
-    breakpoints: &[CompactBreakpoint],
-    line_width: impl Fn(usize) -> f64,
-) -> Option<Vec<usize>> {
-    break_compact_ragged_with_mode(breakpoints, &line_width, false, true)
-        .or_else(|| break_compact_ragged_with_mode(breakpoints, &line_width, true, true))
+#[cfg(test)]
+pub(super) fn break_compact_ragged(breakpoints: &[CompactBreakpoint], line_width: impl Fn(usize) -> f64) -> Option<Vec<usize>> {
+    break_compact_reusing(breakpoints, line_width, 1.0, true, true, &mut CompactScratch::default()).map(<[usize]>::to_vec)
 }
 
-pub(super) fn break_compact_ragged_unrestricted(
-    breakpoints: &[CompactBreakpoint],
-    line_width: impl Fn(usize) -> f64,
-) -> Option<Vec<usize>> {
-    break_compact_ragged_with_mode(breakpoints, &line_width, true, false)
-}
-
-fn break_compact_ragged_with_mode(
-    breakpoints: &[CompactBreakpoint],
-    line_width: &impl Fn(usize) -> f64,
-    allow_excessive_hyphen_run: bool,
-    hyphenation_quality: bool,
-) -> Option<Vec<usize>> {
+fn break_compact_ragged_with_mode<'s>(breakpoints: &[CompactBreakpoint], line_width: &impl Fn(usize) -> f64, allow_excessive_hyphen_run: bool, hyphenation_quality: bool, scratch: &'s mut CompactScratch) -> Option<&'s [usize]> {
+    scratch.paths.clear();
+    scratch.active.clear();
+    scratch.breaks.clear();
     if breakpoints.is_empty() {
-        return Some(Vec::new());
+        return Some(&scratch.breaks);
     }
-
-    let mut paths = Vec::<CompactPathNode>::new();
-    let mut active = vec![CompactActiveNode {
-        path: NO_COMPACT_PATH,
-        line: 0,
-        width: 0.0,
-        stretch: 0.0,
-        shrink: 0.0,
-        demerits: 0.0,
-        fitness: 1,
-        hyphen_run: 0,
-    }];
+    let CompactScratch { paths, active, breaks } = scratch;
+    active.push(CompactActiveNode { path: NO_COMPACT_PATH, line: 0, width: 0.0, stretch: 0.0, shrink: 0.0, demerits: 0.0, fitness: 1, hyphen_run: 0 });
 
     for (breakpoint_index, breakpoint) in breakpoints.iter().enumerate() {
         let forced = breakpoint_index + 1 == breakpoints.len();
@@ -397,38 +392,24 @@ fn break_compact_ragged_with_mode(
             .unwrap_or(Ordering::Equal)
     })?;
     let mut path = best.path;
-    let mut breaks = Vec::new();
     while path != NO_COMPACT_PATH {
         let node = &paths[path as usize];
         breaks.push(node.breakpoint as usize);
         path = node.previous;
     }
     breaks.reverse();
-    Some(breaks)
+    Some(breaks.as_slice())
 }
 
-fn break_compact_with_mode(
-    breakpoints: &[CompactBreakpoint],
-    line_width: impl Fn(usize) -> f64,
-    tolerance: f64,
-    allow_underfull: bool,
-    book_hyphen_quality: bool,
-) -> Option<Vec<usize>> {
+fn break_compact_with_mode<'s>(breakpoints: &[CompactBreakpoint], line_width: impl Fn(usize) -> f64, tolerance: f64, allow_underfull: bool, book_hyphen_quality: bool, scratch: &'s mut CompactScratch) -> Option<&'s [usize]> {
+    scratch.paths.clear();
+    scratch.active.clear();
+    scratch.breaks.clear();
     if breakpoints.is_empty() {
-        return Some(Vec::new());
+        return Some(&scratch.breaks);
     }
-
-    let mut paths = Vec::<CompactPathNode>::new();
-    let mut active = vec![CompactActiveNode {
-        path: NO_COMPACT_PATH,
-        line: 0,
-        width: 0.0,
-        stretch: 0.0,
-        shrink: 0.0,
-        demerits: 0.0,
-        fitness: 1,
-        hyphen_run: 0,
-    }];
+    let CompactScratch { paths, active, breaks } = scratch;
+    active.push(CompactActiveNode { path: NO_COMPACT_PATH, line: 0, width: 0.0, stretch: 0.0, shrink: 0.0, demerits: 0.0, fitness: 1, hyphen_run: 0 });
 
     for (breakpoint_index, breakpoint) in breakpoints.iter().enumerate() {
         let forced = breakpoint_index + 1 == breakpoints.len();
@@ -588,14 +569,13 @@ fn break_compact_with_mode(
             .unwrap_or(Ordering::Equal)
     })?;
     let mut path = best.path;
-    let mut breaks = Vec::new();
     while path != NO_COMPACT_PATH {
         let node = &paths[path as usize];
         breaks.push(node.breakpoint as usize);
         path = node.previous;
     }
     breaks.reverse();
-    Some(breaks)
+    Some(breaks.as_slice())
 }
 
 #[cfg(test)]
