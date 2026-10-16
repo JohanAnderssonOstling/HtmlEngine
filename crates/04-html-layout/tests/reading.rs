@@ -209,3 +209,165 @@ fn unicode_chunks_and_note_gaps_preserve_source_ranges() {
             .collect::<String>()
     );
 }
+
+#[test]
+fn legacy_footnotes_and_reference_markers_are_excluded() {
+    let document = layout(
+        "<p>First<a class='fnanchor' href='#fn1'>[1]</a> sentence. <span class='footnote'>Inline note.</span> Second sentence.</p><div class='extra FOOTNOTES'><h2>Footnotes</h2><p id='fn1'>Nested note body.</p></div><p class='endnote'>Endnote body.</p><p class='note'>Ordinary note in the prose.</p><p>Read <a href='#chapter'>this link</a>.</p>",
+    );
+    let addressing = document.render_view().addressing();
+    let items = addressing.reading_targets_in(0..u32::MAX);
+    let text: Vec<_> = items
+        .iter()
+        .map(|item| addressing.reading_text(item))
+        .collect();
+    assert_eq!(
+        text,
+        [
+            "First sentence. Second sentence.",
+            "Ordinary note in the prose.",
+            "Read this link."
+        ]
+    );
+    let (chunk, next) = addressing
+        .reading_chunk(&items[0], 0, 400, |text| Some(0..text.len()))
+        .unwrap();
+    assert_eq!(chunk.text, text[0]);
+    assert_eq!(next, None);
+    assert!(chunk.target.glyph_ranges.len() > 1);
+    assert_eq!(addressing.reading_text(&chunk.target), chunk.text);
+}
+
+#[test]
+fn explicit_references_exclude_unmarked_local_note_bodies() {
+    let document = layout(
+        "<p>Reading<a role='doc-noteref' href='#n1'>1</a> continues.</p><div id='n1'><p>Unmarked note body.</p></div><p id='chapter'>Ordinary linked prose.</p><p><a href='#chapter'>Chapter link</a></p>",
+    );
+    let addressing = document.render_view().addressing();
+    let fragments = addressing.reading_fragments(0);
+    assert_eq!(
+        fragments
+            .iter()
+            .map(|fragment| fragment.text.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "Reading continues.",
+            "Ordinary linked prose.",
+            "Chapter link"
+        ]
+    );
+}
+
+#[test]
+fn footnote_only_documents_have_no_readable_items() {
+    let document = layout(
+        "<section class='footnotes'><h1>Footnotes</h1><p>A note.</p></section><aside role='doc-footnote'><p>Semantic note.</p></aside>",
+    );
+    assert!(
+        document
+            .render_view()
+            .addressing()
+            .reading_targets_in(0..u32::MAX)
+            .is_empty()
+    );
+}
+
+#[test]
+fn navigation_titles_match_whole_labels() {
+    for title in [
+        "Contents",
+        " TABLE OF CONTENTS: ",
+        "Brief Contents",
+        "Contents at a Glance",
+        "List of Figures",
+        "Innehållsförteckning",
+    ] {
+        assert!(html_layout::is_navigation_section_title(title), "{title}");
+    }
+    for title in [
+        "The Contents of the Letter",
+        "Contents and Consequences",
+        "Chapter One",
+        "Introduction",
+        "Bibliography",
+        "Notes",
+        "",
+    ] {
+        assert!(!html_layout::is_navigation_section_title(title), "{title}");
+    }
+}
+
+#[test]
+fn contents_headings_exclude_the_section_and_resume_at_the_next_peer_heading() {
+    let document = layout(
+        "<p>Preface prose.</p><h1>Table of <em>Contents</em></h1><p>Chapter One ... 1</p><h2>Part Two</h2><p>Chapter Two ... 12</p><h1>The Contents of the Letter</h1><p>Actual story.</p>",
+    );
+    let addressing = document.render_view().addressing();
+    let fragments = addressing.reading_fragments(0);
+    assert_eq!(
+        fragments
+            .iter()
+            .map(|fragment| fragment.text.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "Preface prose.",
+            "The Contents of the Letter",
+            "Actual story."
+        ]
+    );
+    let after_contents_heading = document
+        .render_view()
+        .text()
+        .text_runs()
+        .find(|run| {
+            addressing
+                .reading_text(&html_layout::ReadingTarget {
+                    element: 0,
+                    glyph_ranges: vec![run.glyphs()],
+                })
+                .contains("Chapter One")
+        })
+        .unwrap()
+        .glyphs()
+        .start;
+    assert_eq!(
+        addressing
+            .reading_fragments(after_contents_heading)
+            .iter()
+            .map(|fragment| fragment.text.as_str())
+            .collect::<Vec<_>>(),
+        ["The Contents of the Letter", "Actual story."]
+    );
+}
+
+#[test]
+fn contents_exclusion_ends_with_its_structural_section() {
+    let document = layout(
+        "<section><h2>Contents</h2><ul><li>Chapter One</li></ul></section><section><p>Readable chapter without a heading.</p></section>",
+    );
+    assert_eq!(
+        document
+            .render_view()
+            .addressing()
+            .reading_fragments(0)
+            .iter()
+            .map(|fragment| fragment.text.as_str())
+            .collect::<Vec<_>>(),
+        ["Readable chapter without a heading."]
+    );
+}
+
+#[test]
+fn hidden_contents_heading_does_not_suppress_visible_prose() {
+    let document = layout("<h1 style='display:none'>Contents</h1><p>Readable prose.</p>");
+    assert_eq!(
+        document
+            .render_view()
+            .addressing()
+            .reading_fragments(0)
+            .iter()
+            .map(|fragment| fragment.text.as_str())
+            .collect::<Vec<_>>(),
+        ["Readable prose."]
+    );
+}

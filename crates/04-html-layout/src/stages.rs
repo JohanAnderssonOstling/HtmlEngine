@@ -12,7 +12,7 @@ use web_time::Instant;
 #[path = "stages_output/mod.rs"]
 mod output;
 pub use output::{
-    BoxTextFormat, ImageMetrics, RenderAddressingView, RenderAnchorPosition, RenderAnchorPositions, ReadingFragment, ReadingTarget,
+    BoxTextFormat, ImageMetrics, RenderAddressingView, RenderAnchorPosition, RenderAnchorPositions, ReadingFragment, ReadingTarget, is_navigation_section_title,
     RenderAuthoritativeTextRun, RenderBoxView, RenderDecoration, RenderDecorationPattern,
     RenderDecorations, RenderEllipsisFragment, RenderForcedBreak, RenderFragmentView,
     RenderGlyphAdvanceRun, RenderGlyphAdvanceRuns, RenderGlyphOffsetRun, RenderGlyphOffsetRuns,

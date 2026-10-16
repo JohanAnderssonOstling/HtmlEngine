@@ -74,7 +74,7 @@ pub use stages::{
     RenderImageFragments, RenderLine, RenderLineTextFragment, RenderLineTextFragments, RenderLines,
     RenderListItemMarker, RenderOverflowClip, RenderTable, RenderTableCell, RenderTableRow,
     RenderTextRun, RenderTextRuns, RenderTextView, RenderView, ShapeLayoutTimings, ShapedDocument,
-    SourceElementStep, SourcePosition, TextCompositionPolicy, ReadingFragment, ReadingTarget,
+    SourceElementStep, SourcePosition, TextCompositionPolicy, ReadingFragment, ReadingTarget, is_navigation_section_title,
 };
 
 #[cfg(test)]

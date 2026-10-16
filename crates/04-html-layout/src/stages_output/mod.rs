@@ -15,7 +15,7 @@ mod boxes;
 mod fragments;
 mod reading;
 mod text;
-pub use reading::{ReadingFragment, ReadingTarget};
+pub use reading::{ReadingFragment, ReadingTarget, is_navigation_section_title};
 
 pub use addressing::{
     RenderAddressingView, RenderAnchorPosition, RenderAnchorPositions, SourceElementStep,

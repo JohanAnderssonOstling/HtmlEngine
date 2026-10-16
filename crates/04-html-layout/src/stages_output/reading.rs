@@ -4,7 +4,7 @@ use crate::layout_model::InlineItemKind;
 use crate::shaping::whitespace_context_root;
 use html_dom::{DomNodeId, ElementRef, element_is_note_reference, element_is_note_target};
 use html_style_model::Visibility;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 /// Indices into the current document's DOM and normalized character arrays.
@@ -19,6 +19,31 @@ pub struct ReadingTarget {
 pub struct ReadingFragment {
     pub text: String,
     pub target: ReadingTarget,
+}
+
+/// Navigation lists have little value when reading the book aloud. Match
+/// complete titles so ordinary chapters mentioning contents remain readable.
+pub fn is_navigation_section_title(title: &str) -> bool {
+    let normalized: String = title
+        .chars()
+        .filter(|ch| ch.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect();
+    matches!(
+        normalized.as_str(),
+        "contents"
+            | "tableofcontents"
+            | "toc"
+            | "detailedcontents"
+            | "briefcontents"
+            | "contentsataglance"
+            | "listofillustrations"
+            | "listoffigures"
+            | "listoftables"
+            | "listofmaps"
+            | "innehåll"
+            | "innehållsförteckning"
+    )
 }
 
 impl RenderAddressingView<'_> {
@@ -44,6 +69,19 @@ impl RenderAddressingView<'_> {
         let (start, end) = (interval.start, interval.end);
         let document = self.doc.document();
         let boxes = self.doc.render_view().boxes();
+        let navigation_nodes = self.navigation_section_nodes();
+        // Explicit references also identify note bodies without EPUB/ARIA
+        // attributes. Only local fragments belong to this document.
+        let note_ids: HashSet<_> = document
+            .node_ids()
+            .filter_map(|node| document.element_ref(node))
+            .filter(|element| {
+                element_is_note_reference(*element)
+                    || element.attr("class").is_some_and(note_reference_class)
+            })
+            .filter_map(|element| element.attr("href").and_then(|href| href.strip_prefix('#')))
+            .filter(|id| !id.is_empty())
+            .collect();
         let mut rendered = HashMap::<DomNodeId, Vec<Range<u32>>>::new();
         for run in self.doc.render_view().text().text_runs() {
             if run.is_marker()
@@ -71,6 +109,9 @@ impl RenderAddressingView<'_> {
         }
         let mut targets = Vec::<ReadingTarget>::new();
         for node in document.node_ids() {
+            if navigation_nodes.contains(&node) {
+                continue;
+            }
             let Some(text) = document.text_ref(node) else {
                 continue;
             };
@@ -84,7 +125,9 @@ impl RenderAddressingView<'_> {
                 let Some(element) = document.element_ref(ancestor) else {
                     break;
                 };
-                if excluded_element(element) {
+                if excluded_element(element)
+                    || element.attr("id").is_some_and(|id| note_ids.contains(id))
+                {
                     excluded = true;
                     break;
                 }
@@ -120,6 +163,67 @@ impl RenderAddressingView<'_> {
                 .extend(glyph_ranges.iter().cloned());
         }
         targets
+    }
+
+    fn navigation_section_nodes(self) -> HashSet<DomNodeId> {
+        let document = self.doc.document();
+        let headings = document.toc_entries();
+        let nodes: Vec<_> = document.node_ids().collect();
+        let mut excluded = HashSet::new();
+        for (index, heading) in headings.iter().enumerate() {
+            if !is_navigation_section_title(document.string(heading.title)) {
+                continue;
+            }
+            let Some(root) = document.node_id_from_raw(heading.node_idx) else {
+                continue;
+            };
+            let path = document.get_dom_path_to_node(root);
+            let visible = self.doc.render_view().text().text_runs().any(|run| {
+                !self
+                    .doc
+                    .box_used_style(run.box_idx())
+                    .is_some_and(|style| style.visibility() == Visibility::Hidden)
+                    && run
+                        .dom_text_node()
+                        .and_then(|raw| document.node_id_from_raw(raw))
+                        .is_some_and(|node| document.get_dom_path_to_node(node).starts_with(&path))
+            });
+            if !visible {
+                continue;
+            }
+            let scope = path
+                .iter()
+                .rev()
+                .copied()
+                .find(|node| {
+                    document.element_ref(*node).is_some_and(|element| {
+                        matches!(
+                            element.tag(),
+                            "body" | "section" | "article" | "nav" | "table"
+                        )
+                    })
+                })
+                .unwrap_or(root);
+            let scope_path = document.get_dom_path_to_node(scope);
+            let Some(start) = nodes.iter().position(|node| *node == root) else {
+                continue;
+            };
+            let end = headings[index + 1..]
+                .iter()
+                .find(|next| next.level <= heading.level)
+                .and_then(|next| nodes.iter().position(|node| node.raw() == next.node_idx))
+                .unwrap_or(nodes.len());
+            for node in &nodes[start..end] {
+                if !document
+                    .get_dom_path_to_node(*node)
+                    .starts_with(&scope_path)
+                {
+                    break;
+                }
+                excluded.insert(*node);
+            }
+        }
+        excluded
     }
 
     /// Materialize only the requested item's normalized visible text.
@@ -329,11 +433,36 @@ fn block_element(tag: &str) -> bool {
     )
 }
 
+fn note_reference_class(classes: &str) -> bool {
+    classes.split_ascii_whitespace().any(|class| {
+        ["noteref", "footnote-ref", "footnote-reference", "fnanchor"]
+            .iter()
+            .any(|name| class.eq_ignore_ascii_case(name))
+    })
+}
+
+fn note_class(classes: &str) -> bool {
+    note_reference_class(classes)
+        || classes.split_ascii_whitespace().any(|class| {
+            [
+                "footnote",
+                "footnotes",
+                "endnote",
+                "endnotes",
+                "rearnote",
+                "rearnotes",
+            ]
+            .iter()
+            .any(|name| class.eq_ignore_ascii_case(name))
+        })
+}
+
 fn excluded_element(element: ElementRef<'_>) -> bool {
     matches!(
         element.tag(),
         "table" | "nav" | "script" | "style" | "head" | "template" | "noscript"
-    ) || element_is_note_target(element)
+    ) || element.attr("class").is_some_and(note_class)
+        || element_is_note_target(element)
         || element_is_note_reference(element)
         || element.attr("hidden").is_some()
         || element
