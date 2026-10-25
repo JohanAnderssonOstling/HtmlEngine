@@ -395,49 +395,50 @@ pub(crate) fn shape_document(
                 inline_content.glyphs_mut()[index as usize] = glyph;
             }
         }
-        if let Some(native_geometry) = native_geometry
+        let mut geometry = native_geometry
             .filter(|geometry| geometry.advances().len() == normalized_characters.len())
+            .unwrap_or_else(|| {
+                let advances = source_indices
+                    .iter()
+                    .map(|&index| {
+                        let glyph = inline_content.glyph_at(index as usize).unwrap_or_default();
+                        glyph_shaper
+                            .glyph_resources()
+                            .get(glyph)
+                            .expect("registered glyph metric")
+                            .advance()
+                    })
+                    .collect::<Arc<[f32]>>();
+                ShapedTextRun::new(advances, Arc::from(vec![true; source_indices.len() + 1]))
+                    .expect("validated glyph metrics")
+            });
+        // U+00AD is conditional ink. Only copy the advance array when this run
+        // actually contains a soft hyphen; ordinary runs remain shared.
+        if normalized_characters.contains(&'\u{00ad}') {
+            for (offset, character) in normalized_characters.iter().enumerate() {
+                if *character == '\u{00ad}' {
+                    Arc::make_mut(&mut geometry.advances)[offset] = 0.0;
+                }
+            }
+        }
+        if let Some(range) = contiguous_range
+            && let (Some(backend_run), Some(caret_stops)) =
+                (geometry.backend_run(), geometry.shared_caret_stops())
         {
-            for (offset, &index) in source_indices.iter().enumerate() {
-                text_geometry.advances[index as usize] = native_geometry.advances()[offset];
-                text_geometry.cluster_boundaries[index as usize] &=
-                    native_geometry.cluster_boundaries()[offset];
-            }
-            if let Some(&last) = source_indices.last() {
-                text_geometry.cluster_boundaries[last as usize + 1] &=
-                    native_geometry.cluster_boundaries()[source_indices.len()];
-            }
-            if let Some(range) = contiguous_range
-                && let (Some(backend_run), Some(caret_stops)) =
-                    (native_geometry.backend_run(), native_geometry.caret_stops())
-            {
-                text_geometry
-                    .authoritative_runs
-                    .push(AuthoritativeShapedRun {
-                        source_range: range.clone(),
-                        backend_run,
-                        caret_stops: Arc::from(caret_stops),
-                        ascent: native_geometry.ascent(),
-                        placement_required: span.placement_required(styles, layout_tree),
-                    });
-            }
-        } else {
-            for (offset, &index) in source_indices.iter().enumerate() {
-                let glyph = inline_content.glyph_at(index as usize).unwrap_or_default();
-                let metric = glyph_shaper.glyph_resources().get(glyph).expect("registered glyph metric");
-                text_geometry.advances[index as usize] = metric.advance();
-                debug_assert_eq!(metric.ch(), normalized_characters[offset]);
-            }
+            text_geometry
+                .authoritative_runs
+                .push(AuthoritativeShapedRun {
+                    source_range: range,
+                    backend_run,
+                    caret_stops,
+                    ascent: geometry.ascent(),
+                    placement_required: span.placement_required(styles, layout_tree),
+                });
         }
-        // U+00AD is a conditional break marker, not visible inline content.
-        // Some shaping backends already report a zero advance, but enforcing
-        // it here keeps layout independent of backend/font behavior.
-        for (offset, character) in normalized_characters.iter().copied().enumerate() {
-            if character == '\u{00ad}' {
-                text_geometry.advances[source_indices[offset] as usize] = 0.0;
-            }
-        }
+        text_geometry.push_run(&source_indices, geometry);
     }
+
+    text_geometry.finish_runs();
 
     // Text-overflow markers are shaped once per applicable container so width
     // changes can relayout without calling the renderer's font backend again.
@@ -558,30 +559,48 @@ pub(crate) fn reshape_range_with_style(
     };
     let start = range.start as usize;
     let end = range.end as usize;
-    let native = glyph_shaper.shape_glyph_run(
-        request,
-        &mut inline_content.glyphs_mut()[start..end],
-    )?;
+    let native =
+        glyph_shaper.shape_glyph_run(request, &mut inline_content.glyphs_mut()[start..end])?;
     for &glyph in &inline_content.glyphs()[start..end] {
         if !glyph_shaper.glyph_resources().contains(glyph) {
-            return Err(ShapeError::unregistered_glyph_id(glyph, glyph_shaper.glyph_resources().len()));
+            return Err(ShapeError::unregistered_glyph_id(
+                glyph,
+                glyph_shaper.glyph_resources().len(),
+            ));
         }
     }
 
     text_geometry
         .authoritative_runs
         .retain(|run| run.source_range.end <= range.start || run.source_range.start >= range.end);
-    if let Some(native) = native.filter(|geometry| geometry.advances().len() == characters.len()) {
-        for ((target, advance), spacing) in text_geometry.advances[start..end]
+    let mut geometry = native
+        .filter(|geometry| geometry.advances().len() == characters.len())
+        .unwrap_or_else(|| {
+            let advances = inline_content.glyphs()[start..end]
+                .iter()
+                .map(|&glyph| {
+                    glyph_shaper
+                        .glyph_resources()
+                        .get(glyph)
+                        .expect("registered pseudo glyph")
+                        .advance()
+                })
+                .collect::<Arc<[f32]>>();
+            ShapedTextRun::new(advances, Arc::from(vec![true; characters.len() + 1]))
+                .expect("validated pseudo metrics")
+        });
+    if spacing_deltas.iter().any(|spacing| *spacing != 0.0) {
+        for (advance, spacing) in Arc::make_mut(&mut geometry.advances)
             .iter_mut()
-            .zip(native.advances())
             .zip(&spacing_deltas)
         {
-            *target = *advance + *spacing;
+            *advance += *spacing;
         }
-        text_geometry.cluster_boundaries[start..=end].copy_from_slice(native.cluster_boundaries());
-        if let (Some(backend_run), Some(caret_stops)) = (native.backend_run(), native.caret_stops())
-        {
+    }
+    if let (Some(backend_run), Some(caret_stops)) =
+        (geometry.backend_run(), geometry.shared_caret_stops())
+    {
+        let caret_stops = if spacing_deltas.iter().any(|spacing| *spacing != 0.0) {
             let mut adjusted_stops = Vec::with_capacity(caret_stops.len());
             let mut cumulative_spacing = 0.0;
             for (offset, stop) in caret_stops.iter().copied().enumerate() {
@@ -590,30 +609,24 @@ pub(crate) fn reshape_range_with_style(
                     cumulative_spacing += *delta;
                 }
             }
-            text_geometry
-                .authoritative_runs
-                .push(AuthoritativeShapedRun {
-                    source_range: range,
-                    backend_run,
-                    caret_stops: Arc::from(adjusted_stops),
-                    ascent: native.ascent(),
-                    placement_required: style.letter_spacing() != 0.0
-                        || style.word_spacing() != 0.0
-                        || letter_spacing_delta != 0.0
-                        || word_spacing_delta != 0.0,
-                });
-        }
-    } else {
-        for index in start..end {
-            let glyph = inline_content.glyph_at(index).unwrap_or_default();
-            text_geometry.advances[index] = glyph_shaper.glyph_resources()
-                .get(glyph)
-                .expect("registered pseudo glyph")
-                .advance()
-                + spacing_deltas[index - start];
-        }
-        text_geometry.cluster_boundaries[start..=end].fill(true);
+            Arc::from(adjusted_stops)
+        } else {
+            caret_stops
+        };
+        text_geometry
+            .authoritative_runs
+            .push(AuthoritativeShapedRun {
+                source_range: range.clone(),
+                backend_run,
+                caret_stops,
+                ascent: geometry.ascent(),
+                placement_required: style.letter_spacing() != 0.0
+                    || style.word_spacing() != 0.0
+                    || letter_spacing_delta != 0.0
+                    || word_spacing_delta != 0.0,
+            });
     }
+    text_geometry.replace_range(range, geometry);
     *glyph_metrics = glyph_shaper.glyph_resources().snapshot();
     Ok(())
 }

@@ -67,6 +67,7 @@ fn prepare_fragment(
     let first_run =
         authoritative_runs.partition_point(|run| run.source_range.end <= source_range.start);
 
+    let mut text_cursor = text.cursor();
     for run in &authoritative_runs[first_run..] {
         if run.source_range.start >= source_range.end {
             break;
@@ -86,7 +87,7 @@ fn prepare_fragment(
 
         for index in start..end {
             let glyph = text.glyph(index)?;
-            let metric = text.glyph_metric_checked(glyph)?;
+            let metric = text_cursor.glyph_metric(glyph)?;
 
             while offsets
                 .get(offset_index)
@@ -120,7 +121,7 @@ fn prepare_fragment(
             let color = colors.get(paint_index).filter(|run| run.glyphs.contains(&index)).map(|run| run.color);
             if paints {
                 match segment.as_mut() {
-                    Some((_, segment_end, segment_origin, segment_color)) if *segment_end == local_index && *segment_origin == run_origin && (*segment_color == color || !text.is_cluster_boundary(index as usize)) => {
+                    Some((_, segment_end, segment_origin, segment_color)) if *segment_end == local_index && *segment_origin == run_origin && (*segment_color == color || !text_cursor.is_cluster_boundary(index as usize)) => {
                         *segment_end = local_index + 1;
                     }
                     _ => {
@@ -132,7 +133,7 @@ fn prepare_fragment(
                 flush_segment(run.backend_run, &mut segment, prepared);
             }
 
-            let natural_advance = f64::from(text.text_advance(index as usize, metric.advance()));
+            let natural_advance = f64::from(text_cursor.text_advance(index as usize, metric.advance()));
             let tracking =
                 if index + 1 < line.glyphs.end && text.is_cluster_boundary((index + 1) as usize) {
                     line.letter_spacing

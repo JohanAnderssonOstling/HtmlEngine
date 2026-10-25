@@ -26,3 +26,8 @@ returns `Result<(), Error>`. After it succeeds, borrow the document through
 `Engine::document()` instead of storing a second owned layout. Integrations
 using the earlier returned-document API must update their reader ownership
 alongside this engine change.
+
+Text backends can use `GlyphResourceStore::register_run` to register a shaped
+run with shared advances and common vertical metrics. Individual glyph
+registration remains supported. Layout retains shared run geometry, including
+cluster boundaries and caret positions, across document snapshots.
