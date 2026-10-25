@@ -29,6 +29,14 @@ impl<'input> InlineReader<'input> {
         }
     }
 
+    pub(crate) fn cursor(self) -> TextCursor<'input> {
+        TextCursor {
+            text: self,
+            metric_hint: 0,
+            geometry_hint: 0,
+        }
+    }
+
     pub(crate) fn inline_items(&self) -> &[InlineItem] {
         self.content.inline_items()
     }
@@ -64,10 +72,6 @@ impl<'input> InlineReader<'input> {
         self.glyph_metrics.get(glyph)
     }
 
-    pub(crate) fn glyph_metric_checked(&self, glyph: GlyphId) -> Option<GlyphMetric> {
-        self.glyph_metrics.get_checked(glyph)
-    }
-
     pub(crate) fn authoritative_runs(&self) -> &[crate::shaping::AuthoritativeShapedRun] {
         self.text_geometry
             .map_or(&[], |geometry| geometry.authoritative_runs())
@@ -90,5 +94,37 @@ impl<'input> InlineReader<'input> {
 
     pub(crate) fn hyphen_glyph(&self, box_idx: usize) -> Option<GlyphId> {
         self.hyphen_glyphs.get(&(box_idx as u32)).copied()
+    }
+}
+
+/// Per-traversal hints stay local to each layout operation; shared document
+/// snapshots remain immutable and parallel table measurement stays independent.
+pub(crate) struct TextCursor<'input> {
+    text: InlineReader<'input>,
+    metric_hint: usize,
+    geometry_hint: usize,
+}
+
+impl TextCursor<'_> {
+    #[inline]
+    pub(crate) fn glyph_metric(&mut self, glyph: GlyphId) -> Option<GlyphMetric> {
+        self.text
+            .glyph_metrics
+            .get_with_hint(glyph, &mut self.metric_hint)
+    }
+
+    #[inline]
+    pub(crate) fn text_advance(&mut self, index: usize, fallback: f32) -> f32 {
+        self.text
+            .text_geometry
+            .and_then(|geometry| geometry.advance_with_hint(index, &mut self.geometry_hint))
+            .unwrap_or(fallback)
+    }
+
+    #[inline]
+    pub(crate) fn is_cluster_boundary(&mut self, index: usize) -> bool {
+        self.text
+            .text_geometry
+            .is_none_or(|geometry| geometry.boundary_with_hint(index, &mut self.geometry_hint))
     }
 }

@@ -301,6 +301,164 @@ mod tests {
     }
 
     #[test]
+    fn run_metric_registration_shares_advances_and_preserves_snapshots() {
+        use crate::{GlyphMetric, GlyphResourceStore};
+        let mut resources = GlyphResourceStore::default();
+        let single = GlyphMetric::try_new('x', 3.0, 8.0, 2.0, 8.0).unwrap();
+        assert_eq!(resources.register(single).unwrap(), 0);
+        let advances: Arc<[f32]> = Arc::from([2.0, 0.0, 4.0, 5.0]);
+        let run = ShapedTextRun::new(advances.clone(), Arc::from([true, false, true, true, true])).unwrap();
+        assert_eq!(resources.register_run("a\u{301}😀ב", &run, 8.0, 2.0, 8.0).unwrap(), 1..5);
+        // Both the run and ledger retain the original advance allocation.
+        assert_eq!(Arc::strong_count(&advances), 3);
+        assert_eq!(resources.record_count(), 2);
+        for (id, (ch, advance)) in "a\u{301}😀ב".chars().zip(advances.iter().copied()).enumerate() {
+            assert_eq!(resources.get(id as u32 + 1), Some(GlyphMetric::try_new(ch, advance, 8.0, 2.0, 8.0).unwrap()));
+        }
+        let retained = resources.clone();
+        let snapshot = resources.snapshot();
+        resources.register(single).unwrap();
+        resources.register(single).unwrap();
+        assert_eq!(resources.record_count(), 3);
+        assert_eq!(retained.len(), 5);
+        assert_eq!(snapshot.len(), 5);
+        assert_eq!(snapshot.get_checked(4).unwrap().ch(), 'ב');
+        assert!(snapshot.get_checked(5).is_none());
+        let mut hint = usize::MAX;
+        for id in [4, 0, 2, 3, 1, 5, u32::MAX] {
+            assert_eq!(snapshot.get_with_hint(id, &mut hint), snapshot.get_checked(id));
+        }
+        resources.clear();
+        assert_eq!(retained.get(0), Some(single));
+        assert_eq!(retained.get(4).unwrap().ch(), 'ב');
+        assert!(resources.is_empty());
+    }
+
+    #[test]
+    fn run_metric_registration_rejects_invalid_input_without_allocating_ids() {
+        use crate::GlyphResourceStore;
+        let mut resources = GlyphResourceStore::default();
+        let run = ShapedTextRun::new(Arc::from([1.0, 2.0]), Arc::from([true; 3])).unwrap();
+        assert!(resources.register_run("x", &run, 8.0, 2.0, 8.0).is_err());
+        for (ascent, descent, baseline) in [(f32::NAN, 2.0, 8.0), (8.0, -1.0, 8.0), (8.0, 2.0, f32::INFINITY)] {
+            assert!(resources.register_run("ab", &run, ascent, descent, baseline).is_err());
+        }
+        assert_eq!(resources.len(), 0);
+        assert_eq!(resources.record_count(), 0);
+        let empty = ShapedTextRun::new(Arc::from([]), Arc::from([true])).unwrap();
+        assert_eq!(resources.register_run("", &empty, 0.0, 0.0, 0.0).unwrap(), 0..0);
+        assert_eq!(resources.record_count(), 0);
+    }
+
+    #[test]
+    fn shared_geometry_matches_dense_geometry_for_scattered_and_replaced_runs() {
+        const LEN: usize = 80;
+        let mut geometry = ShapedTextGeometry::with_len(LEN);
+        let mut advances = vec![0.0; LEN];
+        let mut boundaries = vec![true; LEN + 1];
+        // Include out-of-source-order runs, gaps, and cluster boundaries that
+        // land at the edge of a discontiguous DOM slice.
+        for indices in [vec![40, 41, 48, 49, 50], vec![0, 1, 2, 3], vec![20, 21, 22]] {
+            let widths = (0..indices.len()).map(|index| index as f32 + 0.25).collect::<Arc<[f32]>>();
+            let mut clusters = vec![true; indices.len() + 1];
+            clusters[1..indices.len()].fill(false);
+            let shaped = ShapedTextRun::new(widths, Arc::from(clusters)).unwrap();
+            for (offset, &index) in indices.iter().enumerate() {
+                advances[index as usize] = shaped.advances()[offset];
+                boundaries[index as usize] &= shaped.cluster_boundaries()[offset];
+            }
+            boundaries[*indices.last().unwrap() as usize + 1] &= shaped.cluster_boundaries()[indices.len()];
+            geometry.push_run(&indices, shaped);
+        }
+        geometry.finish_runs();
+        let check = |geometry: &ShapedTextGeometry, advances: &[f32], boundaries: &[bool]| {
+            for (index, expected) in advances.iter().enumerate() { assert_eq!(geometry.advance(index), Some(*expected), "advance {index}"); }
+            for (index, expected) in boundaries.iter().enumerate() { assert_eq!(geometry.is_cluster_boundary(index), *expected, "boundary {index}"); }
+            assert_eq!(geometry.advance(LEN), None);
+            let mut advance_hint = usize::MAX;
+            let mut boundary_hint = usize::MAX;
+            for index in (0..LEN).chain((0..LEN).rev()) {
+                assert_eq!(geometry.advance_with_hint(index, &mut advance_hint), Some(advances[index]));
+                assert_eq!(geometry.boundary_with_hint(index, &mut boundary_hint), boundaries[index]);
+            }
+        };
+        check(&geometry, &advances, &boundaries);
+        // Dynamic first-line styling replaces partial ranges. Check retained
+        // prefixes/suffixes as well as entirely overwritten and empty spans.
+        for range in [1..3, 42..51, 19..23, 0..2, 2..80, 0..80] {
+            let count = (range.end - range.start) as usize;
+            let mut clusters = vec![true; count + 1];
+            if count > 1 { clusters[1] = false; }
+            let shaped = ShapedTextRun::new(Arc::from(vec![7.5; count]), Arc::from(clusters)).unwrap();
+            advances[range.start as usize..range.end as usize].copy_from_slice(shaped.advances());
+            boundaries[range.start as usize..=range.end as usize].copy_from_slice(shaped.cluster_boundaries());
+            geometry.replace_range(range, shaped);
+            check(&geometry, &advances, &boundaries);
+        }
+    }
+
+    #[test]
+    fn run_backed_metrics_preserve_layout_and_source_geometry() {
+        use crate::{GlyphId, GlyphMetric, GlyphResourceStore, GlyphShaper, ImageMetrics, LayoutConstraints, ShapeError};
+        use crate::test_support::TestGlyphShaper;
+        struct LedgerShaper { fallback: TestGlyphShaper, compact: bool }
+        impl GlyphShaper for LedgerShaper {
+            fn reset(&mut self) { self.fallback.reset(); }
+            fn glyph_resources(&mut self) -> &mut GlyphResourceStore { self.fallback.glyph_resources() }
+            fn begin_append_shaping(&mut self) -> Result<(), ShapeError> { self.fallback.begin_append_shaping() }
+            fn commit_append_shaping(&mut self) { self.fallback.commit_append_shaping(); }
+            fn rollback_append_shaping(&mut self) { self.fallback.rollback_append_shaping(); }
+            fn shape_glyph(&mut self, ch: char, size: f32, weight: u16, slant: FontSlant, color: u32, family: Option<&str>) -> Result<GlyphId, ShapeError> {
+                self.fallback.shape_glyph(ch, size, weight, slant, color, family)
+            }
+            fn shape_glyph_run(&mut self, request: TextRunShapeRequest<'_>, glyphs: &mut [GlyphId]) -> Result<Option<ShapedTextRun>, ShapeError> {
+                let size = request.style().font_size();
+                let geometry = ShapedTextRun::new(Arc::from(vec![size * 0.5; glyphs.len()]), Arc::from(vec![true; glyphs.len() + 1])).unwrap();
+                if self.compact {
+                    let ids = self.glyph_resources().register_run(request.text(), &geometry, size * 0.75, size * 0.25, size * 0.75)?;
+                    for (slot, id) in glyphs.iter_mut().zip(ids) { *slot = id; }
+                } else {
+                    for (slot, ch) in glyphs.iter_mut().zip(request.text().chars()) {
+                        *slot = self.glyph_resources().register(GlyphMetric::try_new(ch, size * 0.5, size * 0.75, size * 0.25, size * 0.75).unwrap())?;
+                    }
+                }
+                Ok(Some(geometry))
+            }
+        }
+        for (html, css) in [
+            ("<p>office a\u{301} 😀 אבג soft\u{ad}hyphen with more words</p>", None),
+            ("<p>of<span style='position:absolute'>nested</span>fice <em>again</em></p><pre>a\nb\tc</pre>", None),
+            ("<p>aa aa aa aa aa aa aa</p><p>second paragraph</p>", Some("p {font-size:10px} p::first-line {font-size:20px;letter-spacing:1px;word-spacing:2px}")),
+            ("<p>first <span style='font-size:24px'>large</span> end</p><ul><li>marker</li></ul>", None),
+        ] {
+            let mut factory = DocumentFactory::new();
+            let prepared = factory.parse_with_new_pipeline(html, css);
+            let mut dense = LedgerShaper { fallback: TestGlyphShaper::new(), compact: false };
+            let mut compact = LedgerShaper { fallback: TestGlyphShaper::new(), compact: true };
+            let dense_shaped = prepared.shape(&mut dense).unwrap();
+            let compact_shaped = prepared.shape(&mut compact).unwrap();
+            for width in [40.0, 120.0, 350.0] {
+                let constraints = LayoutConstraints::new(width, 16.0).unwrap();
+                let dense_doc = dense_shaped.clone().layout_with_metrics_and_shaper(constraints, &ImageMetrics::default(), &mut dense).unwrap();
+                let compact_doc = compact_shaped.clone().layout_with_metrics_and_shaper(constraints, &ImageMetrics::default(), &mut compact).unwrap();
+                let expected = dense_doc.render_view().text();
+                let actual = compact_doc.render_view().text();
+                assert_eq!(actual.glyph_count(), expected.glyph_count());
+                assert_eq!(compact_doc.line_count(), dense_doc.line_count(), "{html} at {width}");
+                for line in 0..dense_doc.line_count() {
+                    assert_eq!(format!("{:?}", actual.line(line)), format!("{:?}", expected.line(line)), "{html} at {width}");
+                }
+                for index in 0..expected.glyph_count() {
+                    assert_eq!(actual.glyph_metric(actual.glyph_at(index).unwrap()), expected.glyph_metric(expected.glyph_at(index).unwrap()));
+                    assert_eq!(actual.character_advance(index as u32), expected.character_advance(index as u32));
+                    assert_eq!(actual.is_character_cluster_boundary(index as u32), expected.is_character_cluster_boundary(index as u32));
+                    assert_eq!(compact_doc.glyph_source_offset(index as u32), dense_doc.glyph_source_offset(index as u32));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn run_shape_request_requires_one_full_nonempty_style_span() {
         let full = TextStyleSpan::new(0..2, 16.0, 400, FontSlant::Normal, 0, None).unwrap();
         let partial = TextStyleSpan::new(0..1, 16.0, 400, FontSlant::Normal, 0, None).unwrap();

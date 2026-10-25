@@ -13,7 +13,7 @@ pub type TextRunId = u32;
 /// the only boundaries at which layout may split the run.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ShapedTextRun {
-    advances: Arc<[f32]>,
+    pub(super) advances: Arc<[f32]>,
     cluster_boundaries: Arc<[bool]>,
     backend_run: Option<TextRunId>,
     caret_stops: Option<Arc<[f32]>>,
@@ -61,6 +61,20 @@ impl ShapedTextRun {
 
     pub fn advances(&self) -> &[f32] {
         &self.advances
+    }
+
+    /// Share validated geometry with resource ledgers and layout without
+    /// copying character arrays at adapter boundaries.
+    pub fn shared_advances(&self) -> Arc<[f32]> {
+        self.advances.clone()
+    }
+
+    pub fn shared_cluster_boundaries(&self) -> Arc<[bool]> {
+        self.cluster_boundaries.clone()
+    }
+
+    pub fn shared_caret_stops(&self) -> Option<Arc<[f32]>> {
+        self.caret_stops.clone()
     }
 
     pub fn cluster_boundaries(&self) -> &[bool] {
@@ -121,9 +135,17 @@ impl<'a> TextRunShapeRequest<'a> {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ShapedTextGeometry {
-    pub(super) advances: Vec<f32>,
-    pub(super) cluster_boundaries: Vec<bool>,
+    len: usize,
+    ranges: Vec<TextGeometryRange>,
     pub(super) authoritative_runs: Vec<AuthoritativeShapedRun>,
+}
+
+#[derive(Clone, Debug)]
+struct TextGeometryRange {
+    source: Range<u32>,
+    offset: usize,
+    geometry: ShapedTextRun,
+    apply_start_boundary: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -138,27 +160,148 @@ pub(crate) struct AuthoritativeShapedRun {
 impl ShapedTextGeometry {
     pub(super) fn with_len(len: usize) -> Self {
         Self {
-            advances: vec![0.0; len],
-            cluster_boundaries: vec![true; len.saturating_add(1)],
+            len,
+            ranges: Vec::new(),
             authoritative_runs: Vec::new(),
         }
     }
 
-    pub(crate) fn advance(&self, character_index: usize) -> Option<f32> {
-        self.advances.get(character_index).copied()
+    fn range_at(&self, index: usize) -> Option<&TextGeometryRange> {
+        let position = self
+            .ranges
+            .partition_point(|run| run.source.start as usize <= index);
+        self.ranges
+            .get(position.checked_sub(1)?)
+            .filter(|run| index < run.source.end as usize)
     }
 
+    pub(crate) fn advance(&self, character_index: usize) -> Option<f32> {
+        if character_index >= self.len {
+            return None;
+        }
+        Some(self.range_at(character_index).map_or(0.0, |run| {
+            run.geometry.advances[run.offset + character_index - run.source.start as usize]
+        }))
+    }
+
+    #[inline]
     pub(crate) fn is_cluster_boundary(&self, character_boundary: usize) -> bool {
-        self.cluster_boundaries
-            .get(character_boundary)
-            .copied()
-            .unwrap_or(true)
+        let mut hint = 0;
+        self.boundary_with_hint(character_boundary, &mut hint)
+    }
+
+    #[inline]
+    fn range_with_hint(&self, index: usize, hint: &mut usize) -> Option<&TextGeometryRange> {
+        if let Some(run) = self.ranges.get(*hint)
+            && run.source.start as usize <= index
+            && index < run.source.end as usize
+        {
+            return Some(run);
+        }
+        if let Some(run) = self.ranges.get(hint.saturating_add(1))
+            && run.source.start as usize <= index
+            && index < run.source.end as usize
+        {
+            *hint += 1;
+            return Some(run);
+        }
+        *hint = self
+            .ranges
+            .partition_point(|run| run.source.start as usize <= index)
+            .checked_sub(1)?;
+        self.ranges
+            .get(*hint)
+            .filter(|run| index < run.source.end as usize)
+    }
+
+    #[inline]
+    pub(crate) fn advance_with_hint(&self, index: usize, hint: &mut usize) -> Option<f32> {
+        if index >= self.len {
+            return None;
+        }
+        Some(self.range_with_hint(index, hint).map_or(0.0, |run| {
+            run.geometry.advances[run.offset + index - run.source.start as usize]
+        }))
+    }
+
+    #[inline]
+    pub(crate) fn boundary_with_hint(&self, index: usize, hint: &mut usize) -> bool {
+        // A whole run ends on a validated cluster boundary. At the end of a
+        // discontiguous source slice, no boundary was contributed by that
+        // slice. Only the run containing the following character can override
+        // the default true value at a shared source boundary.
+        self.range_with_hint(index, hint).is_none_or(|run| {
+            (index == run.source.start as usize && !run.apply_start_boundary)
+                || run.geometry.cluster_boundaries[run.offset + index - run.source.start as usize]
+        })
+    }
+
+    /// Retain slices of the backend's immutable run arrays. Discontiguous DOM
+    /// spans reference the same allocation with different source ranges.
+    pub(super) fn push_run(&mut self, indices: &[u32], geometry: ShapedTextRun) {
+        let mut start = 0;
+        while start < indices.len() {
+            let mut end = start + 1;
+            while end < indices.len() && indices[end] == indices[end - 1] + 1 {
+                end += 1;
+            }
+            self.ranges.push(TextGeometryRange {
+                source: indices[start]..indices[end - 1] + 1,
+                offset: start,
+                geometry: geometry.clone(),
+                apply_start_boundary: true,
+            });
+            start = end;
+        }
+    }
+
+    pub(super) fn finish_runs(&mut self) {
+        self.ranges.sort_by_key(|run| run.source.start);
+    }
+
+    pub(super) fn replace_range(&mut self, range: Range<u32>, geometry: ShapedTextRun) {
+        let mut ranges = Vec::with_capacity(self.ranges.len() + 2);
+        for old in self.ranges.drain(..) {
+            if old.source.end <= range.start || old.source.start >= range.end {
+                ranges.push(old);
+                continue;
+            }
+            if old.source.start < range.start {
+                ranges.push(TextGeometryRange {
+                    source: old.source.start..range.start,
+                    ..old.clone()
+                });
+            }
+            if old.source.end > range.end {
+                ranges.push(TextGeometryRange {
+                    apply_start_boundary: false,
+                    offset: old.offset + (range.end - old.source.start) as usize,
+                    source: range.end..old.source.end,
+                    ..old
+                });
+            }
+        }
+        ranges.push(TextGeometryRange {
+            source: range,
+            offset: 0,
+            geometry,
+            apply_start_boundary: true,
+        });
+        ranges.sort_by_key(|run| run.source.start);
+        self.ranges = ranges;
     }
 
     pub(crate) fn memory_usage_bytes(&self) -> usize {
-        self.advances.capacity() * std::mem::size_of::<f32>()
-            + self.cluster_boundaries.capacity() * std::mem::size_of::<bool>()
+        self.ranges.capacity() * std::mem::size_of::<TextGeometryRange>()
             + self.authoritative_runs.capacity() * std::mem::size_of::<AuthoritativeShapedRun>()
+            + self
+                .ranges
+                .iter()
+                .map(|run| {
+                    run.geometry.advances.len() * std::mem::size_of::<f32>()
+                        + run.geometry.cluster_boundaries.len() * std::mem::size_of::<bool>()
+                })
+                .sum::<usize>()
             + self
                 .authoritative_runs
                 .iter()
@@ -172,30 +315,22 @@ impl ShapedTextGeometry {
 
     #[cfg(test)]
     pub(crate) fn update_range(&mut self, range: Range<u32>, shaped: &ShapedTextRun) -> bool {
-        let start = range.start as usize;
-        let end = range.end as usize;
-        if start >= end
-            || shaped.advances().len() != end - start
-            || shaped.cluster_boundaries().len() != end - start + 1
+        if range.start >= range.end
+            || range.end as usize > self.len
+            || shaped.advances().len() != (range.end - range.start) as usize
         {
             return false;
         }
-        // Layout observes caret positions (prefix sums), not isolated scalar
-        // advances. Individually sub-epsilon changes can accumulate enough to
-        // alter wrapping or fragment placement across a long line.
         let mut cumulative_delta = 0.0f32;
-        let advances_changed =
-            self.advances[start..end]
-                .iter()
-                .zip(shaped.advances())
-                .any(|(old, new)| {
-                    cumulative_delta += new - old;
-                    cumulative_delta.abs() > 0.01
-                });
+        let advances_changed = range.clone().zip(shaped.advances()).any(|(index, new)| {
+            cumulative_delta += new - self.advance(index as usize).unwrap_or(0.0);
+            cumulative_delta.abs() > 0.01
+        });
         let changed = advances_changed
-            || self.cluster_boundaries[start..=end] != *shaped.cluster_boundaries();
-        self.advances[start..end].copy_from_slice(shaped.advances());
-        self.cluster_boundaries[start..=end].copy_from_slice(shaped.cluster_boundaries());
+            || (range.start..=range.end)
+                .zip(shaped.cluster_boundaries())
+                .any(|(index, new)| self.is_cluster_boundary(index as usize) != *new);
+        self.replace_range(range, shaped.clone());
         changed
     }
 }
@@ -798,6 +933,10 @@ pub struct ShapeError {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum ShapeErrorKind {
+    RunLengthMismatch {
+        characters: usize,
+        advances: usize,
+    },
     UnregisteredGlyphId {
         glyph_id: GlyphId,
         metrics_len: usize,
@@ -853,10 +992,20 @@ impl ShapeError {
         }
     }
 
+    fn run_length_mismatch(characters: usize, advances: usize) -> Self {
+        Self {
+            kind: ShapeErrorKind::RunLengthMismatch {
+                characters,
+                advances,
+            },
+        }
+    }
+
     pub fn glyph_id(self) -> Option<GlyphId> {
         match self.kind {
             ShapeErrorKind::UnregisteredGlyphId { glyph_id, .. } => Some(glyph_id),
-            ShapeErrorKind::RejectedMetric { .. }
+            ShapeErrorKind::RunLengthMismatch { .. }
+            | ShapeErrorKind::RejectedMetric { .. }
             | ShapeErrorKind::RegistryCapacityExhausted { .. }
             | ShapeErrorKind::FirstLineRefinementDidNotConverge
             | ShapeErrorKind::AppendTransactionUnsupported
@@ -868,7 +1017,8 @@ impl ShapeError {
         match self.kind {
             ShapeErrorKind::UnregisteredGlyphId { metrics_len, .. }
             | ShapeErrorKind::RegistryCapacityExhausted { metrics_len } => Some(metrics_len),
-            ShapeErrorKind::RejectedMetric { .. }
+            ShapeErrorKind::RunLengthMismatch { .. }
+            | ShapeErrorKind::RejectedMetric { .. }
             | ShapeErrorKind::FirstLineRefinementDidNotConverge
             | ShapeErrorKind::AppendTransactionUnsupported
             | ShapeErrorKind::ResourceGenerationMismatch => None,
@@ -878,7 +1028,8 @@ impl ShapeError {
     pub fn reason(self) -> Option<GlyphMetricError> {
         match self.kind {
             ShapeErrorKind::RejectedMetric { reason } => Some(reason),
-            ShapeErrorKind::UnregisteredGlyphId { .. }
+            ShapeErrorKind::RunLengthMismatch { .. }
+            | ShapeErrorKind::UnregisteredGlyphId { .. }
             | ShapeErrorKind::RegistryCapacityExhausted { .. } => None,
             ShapeErrorKind::FirstLineRefinementDidNotConverge
             | ShapeErrorKind::AppendTransactionUnsupported
@@ -890,6 +1041,13 @@ impl ShapeError {
 impl fmt::Display for ShapeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.kind {
+            ShapeErrorKind::RunLengthMismatch {
+                characters,
+                advances,
+            } => write!(
+                formatter,
+                "shaped run has {characters} characters but {advances} advances"
+            ),
             ShapeErrorKind::UnregisteredGlyphId {
                 glyph_id,
                 metrics_len,
@@ -968,6 +1126,36 @@ impl GlyphResourceStore {
             .map_err(|_| ShapeError::registry_capacity_exhausted(self.len()))
     }
 
+    /// Register a whole run using its existing validated advance allocation.
+    /// IDs remain dense for compatibility with individual-glyph paint APIs;
+    /// no per-character GlyphMetric records are created.
+    pub fn register_run(
+        &mut self,
+        text: &str,
+        shaped: &ShapedTextRun,
+        ascent: f32,
+        descent: f32,
+        baseline_offset: f32,
+    ) -> Result<Range<GlyphId>, ShapeError> {
+        let characters: Arc<[char]> = text.chars().collect();
+        if characters.len() != shaped.advances.len() {
+            return Err(ShapeError::run_length_mismatch(
+                characters.len(),
+                shaped.advances.len(),
+            ));
+        }
+        let vertical = GlyphMetric::try_new('\0', 0.0, ascent, descent, baseline_offset)
+            .map_err(ShapeError::rejected_metric)?;
+        self.metrics
+            .register_run(characters, shaped.shared_advances(), vertical)
+            .map_err(|_| ShapeError::registry_capacity_exhausted(self.len()))
+    }
+
+    /// Number of stored metric records, independent of the logical ID count.
+    pub fn record_count(&self) -> usize {
+        self.metrics.record_count()
+    }
+
     pub fn len(&self) -> usize {
         self.metrics.len()
     }
@@ -981,7 +1169,7 @@ impl GlyphResourceStore {
     }
 
     pub fn contains(&self, glyph: GlyphId) -> bool {
-        self.get(glyph).is_some()
+        (glyph as usize) < self.len()
     }
 
     pub(crate) fn snapshot(&self) -> GlyphMetrics {

@@ -1167,7 +1167,7 @@ pub(in crate::layout) fn canonical_text_unit(
         engine,
         glyph_idx,
         metric.ch(),
-        metric.advance(),
+        engine.text.text_advance(glyph_idx as usize, metric.advance()),
         style.font_size(),
         style.letter_spacing() as f64,
         style.word_spacing() as f64,
@@ -1194,7 +1194,7 @@ pub(super) fn canonical_text_unit_from_facts(
     let natural_advance = if matches!(character, '\u{00ad}' | '\u{200b}') || font_size <= 0.0 {
         0.0
     } else {
-        engine.text.text_advance(glyph_idx as usize, glyph_advance) as f64
+        glyph_advance as f64
             + letter_spacing
             + if character == ' ' { word_spacing } else { 0.0 }
     };

@@ -1,5 +1,7 @@
 use crate::GlyphId;
 use html_dom::MemoryUsageReport;
+use std::ops::Range;
+use std::sync::Arc;
 
 /// Immutable validated layout data for one shaped glyph.
 ///
@@ -96,43 +98,183 @@ fn validate_metric_value_non_negative(
     Ok(())
 }
 
-/// Dense glyph metrics indexed by [`GlyphId`].
+/// Dense IDs backed by compact run records. Character metrics are resolved on
+/// demand from shared advances and uniform vertical metrics, rather than
+/// materialized and cloned for every character in a document.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct GlyphMetrics(Vec<GlyphMetric>);
+pub(crate) struct GlyphMetrics {
+    records: Vec<MetricRecord>,
+    len: usize,
+}
+
+#[derive(Clone, Debug)]
+struct MetricRecord {
+    start: GlyphId,
+    end: GlyphId,
+    data: MetricData,
+}
+
+#[derive(Clone, Debug)]
+enum MetricData {
+    Singles(Arc<Vec<GlyphMetric>>),
+    Run {
+        characters: Arc<[char]>,
+        advances: Arc<[f32]>,
+        vertical: GlyphMetric,
+    },
+}
 
 impl GlyphMetrics {
     #[inline]
     pub(crate) fn get(&self, glyph: GlyphId) -> GlyphMetric {
-        self.0[glyph as usize]
+        self.get_checked(glyph).expect("registered glyph metric")
     }
 
-    #[inline]
     pub(crate) fn register(&mut self, metric: GlyphMetric) -> Result<GlyphId, GlyphMetricsError> {
-        if self.0.len() == u32::MAX as usize {
+        if self.len == u32::MAX as usize {
             return Err(GlyphMetricsError::CapacityExceeded);
         }
-        let id = self.0.len() as GlyphId;
-        self.0.push(metric);
+        let id = self.len as GlyphId;
+        if let Some(MetricRecord {
+            data: MetricData::Singles(metrics),
+            ..
+        }) = self.records.last_mut()
+        {
+            Arc::make_mut(metrics).push(metric);
+            self.records.last_mut().unwrap().end += 1;
+        } else {
+            self.records.push(MetricRecord {
+                start: id,
+                end: id + 1,
+                data: MetricData::Singles(Arc::new(vec![metric])),
+            });
+        }
+        self.len += 1;
         Ok(id)
     }
 
+    pub(crate) fn register_run(
+        &mut self,
+        characters: Arc<[char]>,
+        advances: Arc<[f32]>,
+        vertical: GlyphMetric,
+    ) -> Result<Range<GlyphId>, GlyphMetricsError> {
+        let end = self
+            .len
+            .checked_add(characters.len())
+            .filter(|end| *end <= u32::MAX as usize)
+            .ok_or(GlyphMetricsError::CapacityExceeded)?;
+        let range = self.len as GlyphId..end as GlyphId;
+        if !characters.is_empty() {
+            debug_assert_eq!(characters.len(), advances.len());
+            self.records.push(MetricRecord {
+                start: range.start,
+                end: range.end,
+                data: MetricData::Run {
+                    characters,
+                    advances,
+                    vertical,
+                },
+            });
+            self.len = end;
+        }
+        Ok(range)
+    }
+
+    #[inline]
     pub(crate) fn get_checked(&self, glyph: GlyphId) -> Option<GlyphMetric> {
-        self.0.get(glyph as usize).copied()
+        if glyph as usize >= self.len {
+            return None;
+        }
+        let record =
+            &self.records[self.records.partition_point(|record| record.start <= glyph) - 1];
+        Some(record.metric(glyph))
+    }
+
+    /// A caller-local cursor lets sequential layout reuse its current run.
+    #[inline]
+    pub(crate) fn get_with_hint(&self, glyph: GlyphId, hint: &mut usize) -> Option<GlyphMetric> {
+        if glyph as usize >= self.len {
+            return None;
+        }
+        if let Some(record) = self.records.get(*hint)
+            && glyph >= record.start
+            && glyph < record.end
+        {
+            return Some(record.metric(glyph));
+        }
+        if let Some(record) = self.records.get(hint.saturating_add(1))
+            && glyph >= record.start
+            && glyph < record.end
+        {
+            *hint += 1;
+            return Some(record.metric(glyph));
+        }
+        *hint = self.records.partition_point(|record| record.start <= glyph) - 1;
+        Some(self.records[*hint].metric(glyph))
     }
 
     #[inline]
     pub(crate) fn len(&self) -> usize {
-        self.0.len()
+        self.len
+    }
+
+    pub(crate) fn record_count(&self) -> usize {
+        self.records.len()
     }
 
     pub(crate) fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
-        report.add_slice_storage::<GlyphMetric>(
-            "GlyphMetrics.storage",
-            self.0.capacity(),
-            self.0.len(),
+        report.add_slice_storage::<MetricRecord>(
+            "GlyphMetrics.records",
+            self.records.capacity(),
+            self.records.len(),
         );
+        for record in &self.records {
+            match &record.data {
+                MetricData::Singles(metrics) => report.add_slice_storage::<GlyphMetric>(
+                    "GlyphMetrics.singles",
+                    metrics.capacity(),
+                    metrics.len(),
+                ),
+                MetricData::Run {
+                    characters,
+                    advances,
+                    ..
+                } => {
+                    report.add_slice_storage::<char>(
+                        "GlyphMetrics.run.characters",
+                        characters.len(),
+                        characters.len(),
+                    );
+                    report.add_slice_storage::<f32>(
+                        "GlyphMetrics.run.advances.shared",
+                        advances.len(),
+                        advances.len(),
+                    );
+                }
+            }
+        }
         report
+    }
+}
+
+impl MetricRecord {
+    #[inline]
+    fn metric(&self, glyph: GlyphId) -> GlyphMetric {
+        let offset = (glyph - self.start) as usize;
+        match &self.data {
+            MetricData::Singles(metrics) => metrics[offset],
+            MetricData::Run {
+                characters,
+                advances,
+                vertical,
+            } => GlyphMetric {
+                ch: characters[offset],
+                advance: advances[offset],
+                ..*vertical
+            },
+        }
     }
 }
 

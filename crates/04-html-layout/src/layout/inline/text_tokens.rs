@@ -157,9 +157,10 @@ pub(super) fn append_text_tokens(
     };
     let mut previous_run_idx = dense.last().map(|previous| previous.run_idx);
 
+    let mut text_cursor = engine.text.cursor();
     for glyph_idx in glyphs {
         let glyph = engine.text.glyph_at(glyph_idx as usize).unwrap_or_default();
-        let metric = engine.text.glyph_metric(glyph);
+        let metric = text_cursor.glyph_metric(glyph).expect("registered text metric");
         let line_height = if !style.line_height_is_normal() {
             authored_line_height as f64
         } else if uses_ahem {
@@ -171,7 +172,7 @@ pub(super) fn append_text_tokens(
             engine,
             glyph_idx,
             metric.ch(),
-            metric.advance(),
+            text_cursor.text_advance(glyph_idx as usize, metric.advance()),
             font_size,
             letter_spacing,
             word_spacing,
@@ -200,7 +201,7 @@ pub(super) fn append_text_tokens(
             width,
             unit.break_kind,
             wrap,
-            engine.text.is_cluster_boundary(glyph_idx as usize),
+            text_cursor.is_cluster_boundary(glyph_idx as usize),
         );
         if character == ' ' {
             token.set_is_space();
