@@ -3,6 +3,7 @@ use super::super::border_geometry::{
     uniform_solid_border,
 };
 use super::super::decorations::DecorationEmitter;
+use super::super::paint_program::PaintOperation;
 use crate::layout_model::RoundedDecoration;
 use html_style_model::BorderStyle;
 use kurbo::Rect;
@@ -11,6 +12,7 @@ impl DecorationEmitter<'_, '_, '_> {
     /// Returns the used border box produced by layout. Margins affect its
     /// position and available size earlier; they are not part of its stored size.
     fn block_border_box_rect(&self, box_idx: usize) -> Rect {
+        if let Some(rect) = self.retained_rect { return rect; }
         self.geometry
             .decoration_rect(box_idx)
             .map(|rect| rect + self.geometry.point(box_idx).to_vec2())
@@ -25,10 +27,15 @@ impl DecorationEmitter<'_, '_, '_> {
     }
 
     pub(in crate::layout) fn emit_block_background(&mut self, box_idx: usize) {
+        let rect = self.block_border_box_rect(box_idx);
+        if self.reader.background_can_change(box_idx) {
+            self.fragments.record_paint(self.placement, PaintOperation::Background { owner: box_idx as u32, rect });
+        }
+        if !self.fragments.is_paint_replay() { return; }
         if self.reader.background_paints_on_canvas(box_idx) {
             return;
         }
-        let style = self.reader.style(box_idx);
+        let style = self.reader.paint_style(box_idx);
         if style.visibility() == html_style_model::Visibility::Hidden {
             return;
         }
@@ -57,7 +64,12 @@ impl DecorationEmitter<'_, '_, '_> {
     }
 
     pub(in crate::layout) fn emit_block_border_and_outline(&mut self, box_idx: usize) {
-        let style = self.reader.style(box_idx);
+        let style = self.reader.paint_style(box_idx);
+        if [style.border_top_width(), style.border_right_width(), style.border_bottom_width(), style.border_left_width()].into_iter().any(|width| width > 0.0) || (style.outline().style != BorderStyle::None && style.outline().width() > 0.0) {
+            let rect = self.block_border_box_rect(box_idx);
+            self.fragments.record_paint(self.placement, PaintOperation::BorderOutline { owner: box_idx as u32, rect });
+        }
+        if !self.fragments.is_paint_replay() { return; }
         if style.visibility() == html_style_model::Visibility::Hidden {
             return;
         }
@@ -162,7 +174,7 @@ impl DecorationEmitter<'_, '_, '_> {
         color: u32,
     ) {
         if color & 0xFF == 0
-            || self.reader.style(owner_box_idx).visibility() == html_style_model::Visibility::Hidden
+            || self.reader.paint_style(owner_box_idx).visibility() == html_style_model::Visibility::Hidden
         {
             return;
         }

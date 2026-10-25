@@ -23,15 +23,23 @@ pub(in crate::layout) fn layout_inline_content(
     let overflow = inline_overflow(engine, input.container_box_idx, &mut tokens);
     let (first_line_height, first_letter_height) =
         pseudo_line_heights(engine, input.container_box_idx);
+    let dependencies = ParagraphDependencies::new(engine, &input, overflow, first_line_height, first_letter_height, has_float_exclusions);
+    let slot = ParagraphSlot::new(&input, !engine.placement.retains_output());
+    let (line_storage, adjustment_storage) = match engine.paragraph_layouts.take(slot, &dependencies, &tokens) {
+        ParagraphLookup::Hit(paragraph) => {
+            let size = paragraph.size;
+            emit_prepared_paragraph(engine, &input, &tokens, &paragraph);
+            engine.paragraph_layouts.insert(slot, paragraph);
+            engine.record_timing(|t| t.layout_runs += timing_started.elapsed());
+            return size;
+        }
+        ParagraphLookup::Miss { lines, adjustments } => (lines, adjustments),
+    };
     if has_float_exclusions {
-        let size = layout_inline_content_around_float_exclusions(
-            engine,
-            &input,
-            &tokens,
-            overflow,
-            first_line_height,
-            first_letter_height,
-        );
+        let (lines, adjustments, size) = prepare_lines_around_float_exclusions(engine, &input, &tokens, overflow, first_line_height, first_letter_height, line_storage, adjustment_storage);
+        let paragraph = PreparedParagraph::new(dependencies, &tokens, lines, adjustments, size);
+        emit_prepared_paragraph(engine, &input, &tokens, &paragraph);
+        engine.paragraph_layouts.insert(slot, paragraph);
         engine.record_timing(|t| t.layout_runs += timing_started.elapsed());
         return size;
     }
@@ -41,13 +49,17 @@ pub(in crate::layout) fn layout_inline_content(
     // Detach storage while emitting lines: inline layout can recurse for
     // atomic content, and nested paragraphs must own separate scratch.
     let mut scratch = engine.paragraphs.pop().unwrap_or_default();
-    let line_storage = std::mem::take(&mut scratch.lines);
+    let break_storage = std::mem::take(&mut scratch.lines);
     let lines = if use_knuth {
-        break_lines_knuth(engine, &tokens, &tokens.runs, input.paragraph, input.area.width, tokens.kp_plan(engine.config.book_optimized_text()), ragged_knuth, line_storage, &mut scratch.solver)
+        break_lines_knuth(engine, &tokens, &tokens.runs, input.paragraph, input.area.width, tokens.kp_plan(engine.config.book_optimized_text()), ragged_knuth, break_storage, &mut scratch.solver)
     } else {
-        wrapping::greedy::break_lines_into(engine, &tokens, &tokens.runs, input.paragraph, input.area.width, line_storage)
+        wrapping::greedy::break_lines_into(engine, &tokens, &tokens.runs, input.paragraph, input.area.width, break_storage)
     };
-    let size = emit_lines(engine, &tokens, &input, overflow, first_line_height, first_letter_height, &lines);
+    let context = LineEmissionContext::new(&tokens, &input, overflow, first_line_height, first_letter_height);
+    let (prepared, adjustments, size) = prepare_lines(engine, &context, &lines, line_storage, adjustment_storage);
+    let paragraph = PreparedParagraph::new(dependencies, &tokens, prepared, adjustments, size);
+    emit_prepared_paragraph(engine, &input, &tokens, &paragraph);
+    engine.paragraph_layouts.insert(slot, paragraph);
     scratch.lines = lines;
     scratch.lines.clear();
     engine.paragraphs.push(scratch);

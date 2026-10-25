@@ -1,0 +1,1610 @@
+[
+  {
+    "fixture": "01-clipped.html",
+    "palette": "default",
+    "matches": true,
+    "reference": {
+      "case": "reference",
+      "chapter": "01-clipped.html",
+      "glyphs": 24,
+      "lines": 3,
+      "render_fingerprint": "f46fe0155d5c7edc",
+      "source_fingerprint": "5391d7a7768d06e1",
+      "text_color_fingerprint": "81d23fd7003c2305"
+    },
+    "candidate": {
+      "allocated_bytes": 0,
+      "allocation_requests": 0,
+      "case": "cold",
+      "chapter": "01-clipped.html",
+      "cpu_median_ms": 0.5269750000000007,
+      "font_backend": "deterministic mock",
+      "glyphs": 24,
+      "heap_instrumented": false,
+      "heap_live_bytes": 0,
+      "heap_peak_bytes": 0,
+      "image_metric": null,
+      "lines": 3,
+      "paragraph_cache": [
+        {
+          "bytes": 416,
+          "label": "LaidOutDocument.paragraph_layouts.entries"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.tokens"
+        },
+        {
+          "bytes": 704,
+          "label": "LaidOutDocument.paragraph_layouts.lines"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.placements"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.adjustments"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.spacing"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.dependencies"
+        }
+      ],
+      "reader_borrows_layout": true,
+      "render_fingerprint": "f46fe0155d5c7edc",
+      "reported_document_bytes": 16942,
+      "rss_peak_bytes": 16429056,
+      "samples": 1,
+      "source_fingerprint": "5391d7a7768d06e1",
+      "text_color_fingerprint": "81d23fd7003c2305",
+      "user_instructions": 3870925,
+      "wall_median_ms": 0.531526
+    }
+  },
+  {
+    "fixture": "01-clipped.html",
+    "palette": "foreground",
+    "matches": true,
+    "reference": {
+      "case": "reference",
+      "chapter": "01-clipped.html",
+      "glyphs": 24,
+      "lines": 3,
+      "render_fingerprint": "2d2dd96c18f330ab",
+      "source_fingerprint": "5391d7a7768d06e1",
+      "text_color_fingerprint": "71c0ccb9b7d7796d"
+    },
+    "candidate": {
+      "allocated_bytes": 0,
+      "allocation_requests": 0,
+      "case": "cold",
+      "chapter": "01-clipped.html",
+      "cpu_median_ms": 0.5792929999999998,
+      "font_backend": "deterministic mock",
+      "glyphs": 24,
+      "heap_instrumented": false,
+      "heap_live_bytes": 0,
+      "heap_peak_bytes": 0,
+      "image_metric": null,
+      "lines": 3,
+      "paragraph_cache": [
+        {
+          "bytes": 416,
+          "label": "LaidOutDocument.paragraph_layouts.entries"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.tokens"
+        },
+        {
+          "bytes": 704,
+          "label": "LaidOutDocument.paragraph_layouts.lines"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.placements"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.adjustments"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.spacing"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.dependencies"
+        }
+      ],
+      "reader_borrows_layout": true,
+      "render_fingerprint": "2d2dd96c18f330ab",
+      "reported_document_bytes": 18570,
+      "rss_peak_bytes": 16429056,
+      "samples": 1,
+      "source_fingerprint": "5391d7a7768d06e1",
+      "text_color_fingerprint": "71c0ccb9b7d7796d",
+      "user_instructions": 3887790,
+      "wall_median_ms": 0.582112
+    }
+  },
+  {
+    "fixture": "01-clipped.html",
+    "palette": "theme",
+    "matches": true,
+    "reference": {
+      "case": "reference",
+      "chapter": "01-clipped.html",
+      "glyphs": 24,
+      "lines": 3,
+      "render_fingerprint": "9c38f85a346a7adc",
+      "source_fingerprint": "5391d7a7768d06e1",
+      "text_color_fingerprint": "81d23fd7003c2305"
+    },
+    "candidate": {
+      "allocated_bytes": 0,
+      "allocation_requests": 0,
+      "case": "cold",
+      "chapter": "01-clipped.html",
+      "cpu_median_ms": 0.5228869999999997,
+      "font_backend": "deterministic mock",
+      "glyphs": 24,
+      "heap_instrumented": false,
+      "heap_live_bytes": 0,
+      "heap_peak_bytes": 0,
+      "image_metric": null,
+      "lines": 3,
+      "paragraph_cache": [
+        {
+          "bytes": 416,
+          "label": "LaidOutDocument.paragraph_layouts.entries"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.tokens"
+        },
+        {
+          "bytes": 704,
+          "label": "LaidOutDocument.paragraph_layouts.lines"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.placements"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.adjustments"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.spacing"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.dependencies"
+        }
+      ],
+      "reader_borrows_layout": true,
+      "render_fingerprint": "9c38f85a346a7adc",
+      "reported_document_bytes": 17506,
+      "rss_peak_bytes": 16560128,
+      "samples": 1,
+      "source_fingerprint": "5391d7a7768d06e1",
+      "text_color_fingerprint": "81d23fd7003c2305",
+      "user_instructions": 3926121,
+      "wall_median_ms": 0.521447
+    }
+  },
+  {
+    "fixture": "02-collapsed-table.html",
+    "palette": "default",
+    "matches": true,
+    "reference": {
+      "case": "reference",
+      "chapter": "02-collapsed-table.html",
+      "glyphs": 3,
+      "lines": 3,
+      "render_fingerprint": "9ea7d9819ea36763",
+      "source_fingerprint": "48b96827016745b5",
+      "text_color_fingerprint": "f998341be47bae14"
+    },
+    "candidate": {
+      "allocated_bytes": 0,
+      "allocation_requests": 0,
+      "case": "cold",
+      "chapter": "02-collapsed-table.html",
+      "cpu_median_ms": 0.6242769999999995,
+      "font_backend": "deterministic mock",
+      "glyphs": 3,
+      "heap_instrumented": false,
+      "heap_live_bytes": 0,
+      "heap_peak_bytes": 0,
+      "image_metric": null,
+      "lines": 3,
+      "paragraph_cache": [
+        {
+          "bytes": 1008,
+          "label": "LaidOutDocument.paragraph_layouts.entries"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.tokens"
+        },
+        {
+          "bytes": 2112,
+          "label": "LaidOutDocument.paragraph_layouts.lines"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.placements"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.adjustments"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.spacing"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.dependencies"
+        }
+      ],
+      "reader_borrows_layout": true,
+      "render_fingerprint": "9ea7d9819ea36763",
+      "reported_document_bytes": 34741,
+      "rss_peak_bytes": 16560128,
+      "samples": 1,
+      "source_fingerprint": "48b96827016745b5",
+      "text_color_fingerprint": "f998341be47bae14",
+      "user_instructions": 4572822,
+      "wall_median_ms": 0.625484
+    }
+  },
+  {
+    "fixture": "02-collapsed-table.html",
+    "palette": "foreground",
+    "matches": true,
+    "reference": {
+      "case": "reference",
+      "chapter": "02-collapsed-table.html",
+      "glyphs": 3,
+      "lines": 3,
+      "render_fingerprint": "e241c59dde30d93a",
+      "source_fingerprint": "48b96827016745b5",
+      "text_color_fingerprint": "1cec7eaa8f011014"
+    },
+    "candidate": {
+      "allocated_bytes": 0,
+      "allocation_requests": 0,
+      "case": "cold",
+      "chapter": "02-collapsed-table.html",
+      "cpu_median_ms": 0.6297680000000002,
+      "font_backend": "deterministic mock",
+      "glyphs": 3,
+      "heap_instrumented": false,
+      "heap_live_bytes": 0,
+      "heap_peak_bytes": 0,
+      "image_metric": null,
+      "lines": 3,
+      "paragraph_cache": [
+        {
+          "bytes": 1008,
+          "label": "LaidOutDocument.paragraph_layouts.entries"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.tokens"
+        },
+        {
+          "bytes": 2112,
+          "label": "LaidOutDocument.paragraph_layouts.lines"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.placements"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.adjustments"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.spacing"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.dependencies"
+        }
+      ],
+      "reader_borrows_layout": true,
+      "render_fingerprint": "e241c59dde30d93a",
+      "reported_document_bytes": 36697,
+      "rss_peak_bytes": 16560128,
+      "samples": 1,
+      "source_fingerprint": "48b96827016745b5",
+      "text_color_fingerprint": "1cec7eaa8f011014",
+      "user_instructions": 4589059,
+      "wall_median_ms": 0.632367
+    }
+  },
+  {
+    "fixture": "02-collapsed-table.html",
+    "palette": "theme",
+    "matches": true,
+    "reference": {
+      "case": "reference",
+      "chapter": "02-collapsed-table.html",
+      "glyphs": 3,
+      "lines": 3,
+      "render_fingerprint": "9180bb90e050a363",
+      "source_fingerprint": "48b96827016745b5",
+      "text_color_fingerprint": "0ed838dd26b4f814"
+    },
+    "candidate": {
+      "allocated_bytes": 0,
+      "allocation_requests": 0,
+      "case": "cold",
+      "chapter": "02-collapsed-table.html",
+      "cpu_median_ms": 0.6423610000000002,
+      "font_backend": "deterministic mock",
+      "glyphs": 3,
+      "heap_instrumented": false,
+      "heap_live_bytes": 0,
+      "heap_peak_bytes": 0,
+      "image_metric": null,
+      "lines": 3,
+      "paragraph_cache": [
+        {
+          "bytes": 1008,
+          "label": "LaidOutDocument.paragraph_layouts.entries"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.tokens"
+        },
+        {
+          "bytes": 2112,
+          "label": "LaidOutDocument.paragraph_layouts.lines"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.placements"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.adjustments"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.spacing"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.dependencies"
+        }
+      ],
+      "reader_borrows_layout": true,
+      "render_fingerprint": "9180bb90e050a363",
+      "reported_document_bytes": 36641,
+      "rss_peak_bytes": 16560128,
+      "samples": 1,
+      "source_fingerprint": "48b96827016745b5",
+      "text_color_fingerprint": "0ed838dd26b4f814",
+      "user_instructions": 4713931,
+      "wall_median_ms": 0.6484270000000001
+    }
+  },
+  {
+    "fixture": "03-separate-table.html",
+    "palette": "default",
+    "matches": true,
+    "reference": {
+      "case": "reference",
+      "chapter": "03-separate-table.html",
+      "glyphs": 3,
+      "lines": 3,
+      "render_fingerprint": "f0ff6321af0f3c69",
+      "source_fingerprint": "f09a38ef1380445b",
+      "text_color_fingerprint": "f998341be47bae14"
+    },
+    "candidate": {
+      "allocated_bytes": 0,
+      "allocation_requests": 0,
+      "case": "cold",
+      "chapter": "03-separate-table.html",
+      "cpu_median_ms": 0.5896619999999995,
+      "font_backend": "deterministic mock",
+      "glyphs": 3,
+      "heap_instrumented": false,
+      "heap_live_bytes": 0,
+      "heap_peak_bytes": 0,
+      "image_metric": null,
+      "lines": 3,
+      "paragraph_cache": [
+        {
+          "bytes": 1008,
+          "label": "LaidOutDocument.paragraph_layouts.entries"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.tokens"
+        },
+        {
+          "bytes": 2112,
+          "label": "LaidOutDocument.paragraph_layouts.lines"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.placements"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.adjustments"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.spacing"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.dependencies"
+        }
+      ],
+      "reader_borrows_layout": true,
+      "render_fingerprint": "f0ff6321af0f3c69",
+      "reported_document_bytes": 30667,
+      "rss_peak_bytes": 16560128,
+      "samples": 1,
+      "source_fingerprint": "f09a38ef1380445b",
+      "text_color_fingerprint": "f998341be47bae14",
+      "user_instructions": 4380653,
+      "wall_median_ms": 0.5883839999999999
+    }
+  },
+  {
+    "fixture": "03-separate-table.html",
+    "palette": "foreground",
+    "matches": true,
+    "reference": {
+      "case": "reference",
+      "chapter": "03-separate-table.html",
+      "glyphs": 3,
+      "lines": 3,
+      "render_fingerprint": "0bded0fc9ea84dfa",
+      "source_fingerprint": "f09a38ef1380445b",
+      "text_color_fingerprint": "1cec7eaa8f011014"
+    },
+    "candidate": {
+      "allocated_bytes": 0,
+      "allocation_requests": 0,
+      "case": "cold",
+      "chapter": "03-separate-table.html",
+      "cpu_median_ms": 0.6070650000000004,
+      "font_backend": "deterministic mock",
+      "glyphs": 3,
+      "heap_instrumented": false,
+      "heap_live_bytes": 0,
+      "heap_peak_bytes": 0,
+      "image_metric": null,
+      "lines": 3,
+      "paragraph_cache": [
+        {
+          "bytes": 1008,
+          "label": "LaidOutDocument.paragraph_layouts.entries"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.tokens"
+        },
+        {
+          "bytes": 2112,
+          "label": "LaidOutDocument.paragraph_layouts.lines"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.placements"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.adjustments"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.spacing"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.dependencies"
+        }
+      ],
+      "reader_borrows_layout": true,
+      "render_fingerprint": "0bded0fc9ea84dfa",
+      "reported_document_bytes": 31767,
+      "rss_peak_bytes": 16560128,
+      "samples": 1,
+      "source_fingerprint": "f09a38ef1380445b",
+      "text_color_fingerprint": "1cec7eaa8f011014",
+      "user_instructions": 4387724,
+      "wall_median_ms": 0.610546
+    }
+  },
+  {
+    "fixture": "03-separate-table.html",
+    "palette": "theme",
+    "matches": true,
+    "reference": {
+      "case": "reference",
+      "chapter": "03-separate-table.html",
+      "glyphs": 3,
+      "lines": 3,
+      "render_fingerprint": "37dc0f9fb3d9b669",
+      "source_fingerprint": "f09a38ef1380445b",
+      "text_color_fingerprint": "0ed838dd26b4f814"
+    },
+    "candidate": {
+      "allocated_bytes": 0,
+      "allocation_requests": 0,
+      "case": "cold",
+      "chapter": "03-separate-table.html",
+      "cpu_median_ms": 0.646509,
+      "font_backend": "deterministic mock",
+      "glyphs": 3,
+      "heap_instrumented": false,
+      "heap_live_bytes": 0,
+      "heap_peak_bytes": 0,
+      "image_metric": null,
+      "lines": 3,
+      "paragraph_cache": [
+        {
+          "bytes": 1008,
+          "label": "LaidOutDocument.paragraph_layouts.entries"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.tokens"
+        },
+        {
+          "bytes": 2112,
+          "label": "LaidOutDocument.paragraph_layouts.lines"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.placements"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.adjustments"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.spacing"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.dependencies"
+        }
+      ],
+      "reader_borrows_layout": true,
+      "render_fingerprint": "37dc0f9fb3d9b669",
+      "reported_document_bytes": 31751,
+      "rss_peak_bytes": 16560128,
+      "samples": 1,
+      "source_fingerprint": "f09a38ef1380445b",
+      "text_color_fingerprint": "0ed838dd26b4f814",
+      "user_instructions": 4507678,
+      "wall_median_ms": 0.67644
+    }
+  },
+  {
+    "fixture": "04-positioned-flex-grid.html",
+    "palette": "default",
+    "matches": true,
+    "reference": {
+      "case": "reference",
+      "chapter": "04-positioned-flex-grid.html",
+      "glyphs": 35,
+      "lines": 3,
+      "render_fingerprint": "233955db1f1c16e5",
+      "source_fingerprint": "02022de619ab4929",
+      "text_color_fingerprint": "c72c2a67d15765f4"
+    },
+    "candidate": {
+      "allocated_bytes": 0,
+      "allocation_requests": 0,
+      "case": "cold",
+      "chapter": "04-positioned-flex-grid.html",
+      "cpu_median_ms": 0.6472509999999997,
+      "font_backend": "deterministic mock",
+      "glyphs": 35,
+      "heap_instrumented": false,
+      "heap_live_bytes": 0,
+      "heap_peak_bytes": 0,
+      "image_metric": null,
+      "lines": 3,
+      "paragraph_cache": [
+        {
+          "bytes": 1008,
+          "label": "LaidOutDocument.paragraph_layouts.entries"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.tokens"
+        },
+        {
+          "bytes": 2112,
+          "label": "LaidOutDocument.paragraph_layouts.lines"
+        },
+        {
+          "bytes": 400,
+          "label": "LaidOutDocument.paragraph_layouts.placements"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.adjustments"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.spacing"
+        },
+        {
+          "bytes": 160,
+          "label": "LaidOutDocument.paragraph_layouts.dependencies"
+        }
+      ],
+      "reader_borrows_layout": true,
+      "render_fingerprint": "233955db1f1c16e5",
+      "reported_document_bytes": 34749,
+      "rss_peak_bytes": 16560128,
+      "samples": 1,
+      "source_fingerprint": "02022de619ab4929",
+      "text_color_fingerprint": "c72c2a67d15765f4",
+      "user_instructions": 4574690,
+      "wall_median_ms": 0.6504409999999999
+    }
+  },
+  {
+    "fixture": "04-positioned-flex-grid.html",
+    "palette": "foreground",
+    "matches": true,
+    "reference": {
+      "case": "reference",
+      "chapter": "04-positioned-flex-grid.html",
+      "glyphs": 35,
+      "lines": 3,
+      "render_fingerprint": "9df21f08cfca6322",
+      "source_fingerprint": "02022de619ab4929",
+      "text_color_fingerprint": "3c8cf66c97834bf4"
+    },
+    "candidate": {
+      "allocated_bytes": 0,
+      "allocation_requests": 0,
+      "case": "cold",
+      "chapter": "04-positioned-flex-grid.html",
+      "cpu_median_ms": 0.6510589999999998,
+      "font_backend": "deterministic mock",
+      "glyphs": 35,
+      "heap_instrumented": false,
+      "heap_live_bytes": 0,
+      "heap_peak_bytes": 0,
+      "image_metric": null,
+      "lines": 3,
+      "paragraph_cache": [
+        {
+          "bytes": 1008,
+          "label": "LaidOutDocument.paragraph_layouts.entries"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.tokens"
+        },
+        {
+          "bytes": 2112,
+          "label": "LaidOutDocument.paragraph_layouts.lines"
+        },
+        {
+          "bytes": 400,
+          "label": "LaidOutDocument.paragraph_layouts.placements"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.adjustments"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.spacing"
+        },
+        {
+          "bytes": 160,
+          "label": "LaidOutDocument.paragraph_layouts.dependencies"
+        }
+      ],
+      "reader_borrows_layout": true,
+      "render_fingerprint": "9df21f08cfca6322",
+      "reported_document_bytes": 36713,
+      "rss_peak_bytes": 16560128,
+      "samples": 1,
+      "source_fingerprint": "02022de619ab4929",
+      "text_color_fingerprint": "3c8cf66c97834bf4",
+      "user_instructions": 4591041,
+      "wall_median_ms": 0.65505
+    }
+  },
+  {
+    "fixture": "04-positioned-flex-grid.html",
+    "palette": "theme",
+    "matches": true,
+    "reference": {
+      "case": "reference",
+      "chapter": "04-positioned-flex-grid.html",
+      "glyphs": 35,
+      "lines": 3,
+      "render_fingerprint": "8f021e7e56d687e5",
+      "source_fingerprint": "02022de619ab4929",
+      "text_color_fingerprint": "9298429153bb13f4"
+    },
+    "candidate": {
+      "allocated_bytes": 0,
+      "allocation_requests": 0,
+      "case": "cold",
+      "chapter": "04-positioned-flex-grid.html",
+      "cpu_median_ms": 0.6531720000000005,
+      "font_backend": "deterministic mock",
+      "glyphs": 35,
+      "heap_instrumented": false,
+      "heap_live_bytes": 0,
+      "heap_peak_bytes": 0,
+      "image_metric": null,
+      "lines": 3,
+      "paragraph_cache": [
+        {
+          "bytes": 1008,
+          "label": "LaidOutDocument.paragraph_layouts.entries"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.tokens"
+        },
+        {
+          "bytes": 2112,
+          "label": "LaidOutDocument.paragraph_layouts.lines"
+        },
+        {
+          "bytes": 400,
+          "label": "LaidOutDocument.paragraph_layouts.placements"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.adjustments"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.spacing"
+        },
+        {
+          "bytes": 160,
+          "label": "LaidOutDocument.paragraph_layouts.dependencies"
+        }
+      ],
+      "reader_borrows_layout": true,
+      "render_fingerprint": "8f021e7e56d687e5",
+      "reported_document_bytes": 35961,
+      "rss_peak_bytes": 16560128,
+      "samples": 1,
+      "source_fingerprint": "02022de619ab4929",
+      "text_color_fingerprint": "9298429153bb13f4",
+      "user_instructions": 4687956,
+      "wall_median_ms": 0.656052
+    }
+  },
+  {
+    "fixture": "05-pseudo-styles.html",
+    "palette": "default",
+    "matches": true,
+    "reference": {
+      "case": "reference",
+      "chapter": "05-pseudo-styles.html",
+      "glyphs": 41,
+      "lines": 1,
+      "render_fingerprint": "6070004a75d549b6",
+      "source_fingerprint": "dbacf5c8e7148a46",
+      "text_color_fingerprint": "68f44a89aebcae86"
+    },
+    "candidate": {
+      "allocated_bytes": 0,
+      "allocation_requests": 0,
+      "case": "cold",
+      "chapter": "05-pseudo-styles.html",
+      "cpu_median_ms": 0.5289580000000004,
+      "font_backend": "deterministic mock",
+      "glyphs": 41,
+      "heap_instrumented": false,
+      "heap_live_bytes": 0,
+      "heap_peak_bytes": 0,
+      "image_metric": null,
+      "lines": 1,
+      "paragraph_cache": [
+        {
+          "bytes": 712,
+          "label": "LaidOutDocument.paragraph_layouts.entries"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.tokens"
+        },
+        {
+          "bytes": 1408,
+          "label": "LaidOutDocument.paragraph_layouts.lines"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.placements"
+        },
+        {
+          "bytes": 7264,
+          "label": "LaidOutDocument.paragraph_layouts.adjustments"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.spacing"
+        },
+        {
+          "bytes": 128,
+          "label": "LaidOutDocument.paragraph_layouts.dependencies"
+        }
+      ],
+      "reader_borrows_layout": true,
+      "render_fingerprint": "6070004a75d549b6",
+      "reported_document_bytes": 24985,
+      "rss_peak_bytes": 16560128,
+      "samples": 1,
+      "source_fingerprint": "dbacf5c8e7148a46",
+      "text_color_fingerprint": "68f44a89aebcae86",
+      "user_instructions": 4034928,
+      "wall_median_ms": 0.5559729999999999
+    }
+  },
+  {
+    "fixture": "05-pseudo-styles.html",
+    "palette": "foreground",
+    "matches": true,
+    "reference": {
+      "case": "reference",
+      "chapter": "05-pseudo-styles.html",
+      "glyphs": 41,
+      "lines": 1,
+      "render_fingerprint": "062ebb26117670e6",
+      "source_fingerprint": "dbacf5c8e7148a46",
+      "text_color_fingerprint": "b82a975f2840a686"
+    },
+    "candidate": {
+      "allocated_bytes": 0,
+      "allocation_requests": 0,
+      "case": "cold",
+      "chapter": "05-pseudo-styles.html",
+      "cpu_median_ms": 0.5295289999999999,
+      "font_backend": "deterministic mock",
+      "glyphs": 41,
+      "heap_instrumented": false,
+      "heap_live_bytes": 0,
+      "heap_peak_bytes": 0,
+      "image_metric": null,
+      "lines": 1,
+      "paragraph_cache": [
+        {
+          "bytes": 712,
+          "label": "LaidOutDocument.paragraph_layouts.entries"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.tokens"
+        },
+        {
+          "bytes": 1408,
+          "label": "LaidOutDocument.paragraph_layouts.lines"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.placements"
+        },
+        {
+          "bytes": 7264,
+          "label": "LaidOutDocument.paragraph_layouts.adjustments"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.spacing"
+        },
+        {
+          "bytes": 128,
+          "label": "LaidOutDocument.paragraph_layouts.dependencies"
+        }
+      ],
+      "reader_borrows_layout": true,
+      "render_fingerprint": "062ebb26117670e6",
+      "reported_document_bytes": 26189,
+      "rss_peak_bytes": 16560128,
+      "samples": 1,
+      "source_fingerprint": "dbacf5c8e7148a46",
+      "text_color_fingerprint": "b82a975f2840a686",
+      "user_instructions": 4043834,
+      "wall_median_ms": 0.52825
+    }
+  },
+  {
+    "fixture": "05-pseudo-styles.html",
+    "palette": "theme",
+    "matches": true,
+    "reference": {
+      "case": "reference",
+      "chapter": "05-pseudo-styles.html",
+      "glyphs": 41,
+      "lines": 1,
+      "render_fingerprint": "6070004a75d549b6",
+      "source_fingerprint": "dbacf5c8e7148a46",
+      "text_color_fingerprint": "1fb0d44bc9b01386"
+    },
+    "candidate": {
+      "allocated_bytes": 0,
+      "allocation_requests": 0,
+      "case": "cold",
+      "chapter": "05-pseudo-styles.html",
+      "cpu_median_ms": 0.5330259999999998,
+      "font_backend": "deterministic mock",
+      "glyphs": 41,
+      "heap_instrumented": false,
+      "heap_live_bytes": 0,
+      "heap_peak_bytes": 0,
+      "image_metric": null,
+      "lines": 1,
+      "paragraph_cache": [
+        {
+          "bytes": 712,
+          "label": "LaidOutDocument.paragraph_layouts.entries"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.tokens"
+        },
+        {
+          "bytes": 1408,
+          "label": "LaidOutDocument.paragraph_layouts.lines"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.placements"
+        },
+        {
+          "bytes": 7264,
+          "label": "LaidOutDocument.paragraph_layouts.adjustments"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.spacing"
+        },
+        {
+          "bytes": 128,
+          "label": "LaidOutDocument.paragraph_layouts.dependencies"
+        }
+      ],
+      "reader_borrows_layout": true,
+      "render_fingerprint": "6070004a75d549b6",
+      "reported_document_bytes": 25921,
+      "rss_peak_bytes": 16560128,
+      "samples": 1,
+      "source_fingerprint": "dbacf5c8e7148a46",
+      "text_color_fingerprint": "1fb0d44bc9b01386",
+      "user_instructions": 4109650,
+      "wall_median_ms": 0.531726
+    }
+  },
+  {
+    "fixture": "06-math-and-links.html",
+    "palette": "default",
+    "matches": true,
+    "reference": {
+      "case": "reference",
+      "chapter": "06-math-and-links.html",
+      "glyphs": 4,
+      "lines": 1,
+      "render_fingerprint": "f68a91b7ed67acb1",
+      "source_fingerprint": "defdc83f414f4255",
+      "text_color_fingerprint": "1d897ee756acb351"
+    },
+    "candidate": {
+      "allocated_bytes": 0,
+      "allocation_requests": 0,
+      "case": "cold",
+      "chapter": "06-math-and-links.html",
+      "cpu_median_ms": 0.5402589999999995,
+      "font_backend": "deterministic mock",
+      "glyphs": 4,
+      "heap_instrumented": false,
+      "heap_live_bytes": 0,
+      "heap_peak_bytes": 0,
+      "image_metric": null,
+      "lines": 1,
+      "paragraph_cache": [
+        {
+          "bytes": 416,
+          "label": "LaidOutDocument.paragraph_layouts.entries"
+        },
+        {
+          "bytes": 600,
+          "label": "LaidOutDocument.paragraph_layouts.tokens"
+        },
+        {
+          "bytes": 704,
+          "label": "LaidOutDocument.paragraph_layouts.lines"
+        },
+        {
+          "bytes": 360,
+          "label": "LaidOutDocument.paragraph_layouts.placements"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.adjustments"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.spacing"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.dependencies"
+        }
+      ],
+      "reader_borrows_layout": true,
+      "render_fingerprint": "f68a91b7ed67acb1",
+      "reported_document_bytes": 20505,
+      "rss_peak_bytes": 16560128,
+      "samples": 1,
+      "source_fingerprint": "defdc83f414f4255",
+      "text_color_fingerprint": "1d897ee756acb351",
+      "user_instructions": 4081396,
+      "wall_median_ms": 0.539
+    }
+  },
+  {
+    "fixture": "06-math-and-links.html",
+    "palette": "foreground",
+    "matches": true,
+    "reference": {
+      "case": "reference",
+      "chapter": "06-math-and-links.html",
+      "glyphs": 4,
+      "lines": 1,
+      "render_fingerprint": "64c0748e1ed1d0bb",
+      "source_fingerprint": "defdc83f414f4255",
+      "text_color_fingerprint": "5b2226e921878151"
+    },
+    "candidate": {
+      "allocated_bytes": 0,
+      "allocation_requests": 0,
+      "case": "cold",
+      "chapter": "06-math-and-links.html",
+      "cpu_median_ms": 0.5401189999999995,
+      "font_backend": "deterministic mock",
+      "glyphs": 4,
+      "heap_instrumented": false,
+      "heap_live_bytes": 0,
+      "heap_peak_bytes": 0,
+      "image_metric": null,
+      "lines": 1,
+      "paragraph_cache": [
+        {
+          "bytes": 416,
+          "label": "LaidOutDocument.paragraph_layouts.entries"
+        },
+        {
+          "bytes": 600,
+          "label": "LaidOutDocument.paragraph_layouts.tokens"
+        },
+        {
+          "bytes": 704,
+          "label": "LaidOutDocument.paragraph_layouts.lines"
+        },
+        {
+          "bytes": 360,
+          "label": "LaidOutDocument.paragraph_layouts.placements"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.adjustments"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.spacing"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.dependencies"
+        }
+      ],
+      "reader_borrows_layout": true,
+      "render_fingerprint": "64c0748e1ed1d0bb",
+      "reported_document_bytes": 21557,
+      "rss_peak_bytes": 16560128,
+      "samples": 1,
+      "source_fingerprint": "defdc83f414f4255",
+      "text_color_fingerprint": "5b2226e921878151",
+      "user_instructions": 4091681,
+      "wall_median_ms": 0.538809
+    }
+  },
+  {
+    "fixture": "06-math-and-links.html",
+    "palette": "theme",
+    "matches": true,
+    "reference": {
+      "case": "reference",
+      "chapter": "06-math-and-links.html",
+      "glyphs": 4,
+      "lines": 1,
+      "render_fingerprint": "620b1f3eb03ff4b1",
+      "source_fingerprint": "defdc83f414f4255",
+      "text_color_fingerprint": "09a4bf665da0bb51"
+    },
+    "candidate": {
+      "allocated_bytes": 0,
+      "allocation_requests": 0,
+      "case": "cold",
+      "chapter": "06-math-and-links.html",
+      "cpu_median_ms": 0.5573710000000001,
+      "font_backend": "deterministic mock",
+      "glyphs": 4,
+      "heap_instrumented": false,
+      "heap_live_bytes": 0,
+      "heap_peak_bytes": 0,
+      "image_metric": null,
+      "lines": 1,
+      "paragraph_cache": [
+        {
+          "bytes": 416,
+          "label": "LaidOutDocument.paragraph_layouts.entries"
+        },
+        {
+          "bytes": 600,
+          "label": "LaidOutDocument.paragraph_layouts.tokens"
+        },
+        {
+          "bytes": 704,
+          "label": "LaidOutDocument.paragraph_layouts.lines"
+        },
+        {
+          "bytes": 360,
+          "label": "LaidOutDocument.paragraph_layouts.placements"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.adjustments"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.spacing"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.dependencies"
+        }
+      ],
+      "reader_borrows_layout": true,
+      "render_fingerprint": "620b1f3eb03ff4b1",
+      "reported_document_bytes": 22245,
+      "rss_peak_bytes": 16560128,
+      "samples": 1,
+      "source_fingerprint": "defdc83f414f4255",
+      "text_color_fingerprint": "09a4bf665da0bb51",
+      "user_instructions": 4141826,
+      "wall_median_ms": 0.5560320000000001
+    }
+  },
+  {
+    "fixture": "07-inline-atomic.html",
+    "palette": "default",
+    "matches": true,
+    "reference": {
+      "case": "reference",
+      "chapter": "07-inline-atomic.html",
+      "glyphs": 35,
+      "lines": 6,
+      "render_fingerprint": "09d8d139a3ac9c73",
+      "source_fingerprint": "db9fceea72d5125f",
+      "text_color_fingerprint": "c72c2a67d15765f4"
+    },
+    "candidate": {
+      "allocated_bytes": 0,
+      "allocation_requests": 0,
+      "case": "cold",
+      "chapter": "07-inline-atomic.html",
+      "cpu_median_ms": 0.6242879999999997,
+      "font_backend": "deterministic mock",
+      "glyphs": 35,
+      "heap_instrumented": false,
+      "heap_live_bytes": 0,
+      "heap_peak_bytes": 0,
+      "image_metric": null,
+      "lines": 6,
+      "paragraph_cache": [
+        {
+          "bytes": 2352,
+          "label": "LaidOutDocument.paragraph_layouts.entries"
+        },
+        {
+          "bytes": 888,
+          "label": "LaidOutDocument.paragraph_layouts.tokens"
+        },
+        {
+          "bytes": 4928,
+          "label": "LaidOutDocument.paragraph_layouts.lines"
+        },
+        {
+          "bytes": 880,
+          "label": "LaidOutDocument.paragraph_layouts.placements"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.adjustments"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.spacing"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.dependencies"
+        }
+      ],
+      "reader_borrows_layout": true,
+      "render_fingerprint": "09d8d139a3ac9c73",
+      "reported_document_bytes": 38796,
+      "rss_peak_bytes": 16560128,
+      "samples": 1,
+      "source_fingerprint": "db9fceea72d5125f",
+      "text_color_fingerprint": "c72c2a67d15765f4",
+      "user_instructions": 4541933,
+      "wall_median_ms": 0.6229589999999999
+    }
+  },
+  {
+    "fixture": "07-inline-atomic.html",
+    "palette": "foreground",
+    "matches": true,
+    "reference": {
+      "case": "reference",
+      "chapter": "07-inline-atomic.html",
+      "glyphs": 35,
+      "lines": 6,
+      "render_fingerprint": "204e84efb8f5de46",
+      "source_fingerprint": "db9fceea72d5125f",
+      "text_color_fingerprint": "3c8cf66c97834bf4"
+    },
+    "candidate": {
+      "allocated_bytes": 0,
+      "allocation_requests": 0,
+      "case": "cold",
+      "chapter": "07-inline-atomic.html",
+      "cpu_median_ms": 0.6329339999999999,
+      "font_backend": "deterministic mock",
+      "glyphs": 35,
+      "heap_instrumented": false,
+      "heap_live_bytes": 0,
+      "heap_peak_bytes": 0,
+      "image_metric": null,
+      "lines": 6,
+      "paragraph_cache": [
+        {
+          "bytes": 2352,
+          "label": "LaidOutDocument.paragraph_layouts.entries"
+        },
+        {
+          "bytes": 888,
+          "label": "LaidOutDocument.paragraph_layouts.tokens"
+        },
+        {
+          "bytes": 4928,
+          "label": "LaidOutDocument.paragraph_layouts.lines"
+        },
+        {
+          "bytes": 880,
+          "label": "LaidOutDocument.paragraph_layouts.placements"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.adjustments"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.spacing"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.dependencies"
+        }
+      ],
+      "reader_borrows_layout": true,
+      "render_fingerprint": "204e84efb8f5de46",
+      "reported_document_bytes": 39968,
+      "rss_peak_bytes": 16560128,
+      "samples": 1,
+      "source_fingerprint": "db9fceea72d5125f",
+      "text_color_fingerprint": "3c8cf66c97834bf4",
+      "user_instructions": 4558249,
+      "wall_median_ms": 0.637366
+    }
+  },
+  {
+    "fixture": "07-inline-atomic.html",
+    "palette": "theme",
+    "matches": true,
+    "reference": {
+      "case": "reference",
+      "chapter": "07-inline-atomic.html",
+      "glyphs": 35,
+      "lines": 6,
+      "render_fingerprint": "2040b43ebe114673",
+      "source_fingerprint": "db9fceea72d5125f",
+      "text_color_fingerprint": "9298429153bb13f4"
+    },
+    "candidate": {
+      "allocated_bytes": 0,
+      "allocation_requests": 0,
+      "case": "cold",
+      "chapter": "07-inline-atomic.html",
+      "cpu_median_ms": 0.9502920000000001,
+      "font_backend": "deterministic mock",
+      "glyphs": 35,
+      "heap_instrumented": false,
+      "heap_live_bytes": 0,
+      "heap_peak_bytes": 0,
+      "image_metric": null,
+      "lines": 6,
+      "paragraph_cache": [
+        {
+          "bytes": 2352,
+          "label": "LaidOutDocument.paragraph_layouts.entries"
+        },
+        {
+          "bytes": 888,
+          "label": "LaidOutDocument.paragraph_layouts.tokens"
+        },
+        {
+          "bytes": 4928,
+          "label": "LaidOutDocument.paragraph_layouts.lines"
+        },
+        {
+          "bytes": 880,
+          "label": "LaidOutDocument.paragraph_layouts.placements"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.adjustments"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.spacing"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.dependencies"
+        }
+      ],
+      "reader_borrows_layout": true,
+      "render_fingerprint": "2040b43ebe114673",
+      "reported_document_bytes": 39912,
+      "rss_peak_bytes": 16560128,
+      "samples": 1,
+      "source_fingerprint": "db9fceea72d5125f",
+      "text_color_fingerprint": "9298429153bb13f4",
+      "user_instructions": 4662158,
+      "wall_median_ms": 2.386778
+    }
+  },
+  {
+    "fixture": "08-linked-table-columns.html",
+    "palette": "default",
+    "matches": true,
+    "reference": {
+      "case": "reference",
+      "chapter": "08-linked-table-columns.html",
+      "glyphs": 6,
+      "lines": 2,
+      "render_fingerprint": "f407c21296e11578",
+      "source_fingerprint": "bad5bafca76ddedb",
+      "text_color_fingerprint": "a3e084bd7943f66f"
+    },
+    "candidate": {
+      "allocated_bytes": 0,
+      "allocation_requests": 0,
+      "case": "cold",
+      "chapter": "08-linked-table-columns.html",
+      "cpu_median_ms": 0.5651759999999997,
+      "font_backend": "deterministic mock",
+      "glyphs": 6,
+      "heap_instrumented": false,
+      "heap_live_bytes": 0,
+      "heap_peak_bytes": 0,
+      "image_metric": null,
+      "lines": 2,
+      "paragraph_cache": [
+        {
+          "bytes": 712,
+          "label": "LaidOutDocument.paragraph_layouts.entries"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.tokens"
+        },
+        {
+          "bytes": 1408,
+          "label": "LaidOutDocument.paragraph_layouts.lines"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.placements"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.adjustments"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.spacing"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.dependencies"
+        }
+      ],
+      "reader_borrows_layout": true,
+      "render_fingerprint": "f407c21296e11578",
+      "reported_document_bytes": 26967,
+      "rss_peak_bytes": 16560128,
+      "samples": 1,
+      "source_fingerprint": "bad5bafca76ddedb",
+      "text_color_fingerprint": "a3e084bd7943f66f",
+      "user_instructions": 4185260,
+      "wall_median_ms": 0.563817
+    }
+  },
+  {
+    "fixture": "08-linked-table-columns.html",
+    "palette": "foreground",
+    "matches": true,
+    "reference": {
+      "case": "reference",
+      "chapter": "08-linked-table-columns.html",
+      "glyphs": 6,
+      "lines": 2,
+      "render_fingerprint": "fd860749c379b54b",
+      "source_fingerprint": "bad5bafca76ddedb",
+      "text_color_fingerprint": "69726a7aed40ee6f"
+    },
+    "candidate": {
+      "allocated_bytes": 0,
+      "allocation_requests": 0,
+      "case": "cold",
+      "chapter": "08-linked-table-columns.html",
+      "cpu_median_ms": 0.5748840000000003,
+      "font_backend": "deterministic mock",
+      "glyphs": 6,
+      "heap_instrumented": false,
+      "heap_live_bytes": 0,
+      "heap_peak_bytes": 0,
+      "image_metric": null,
+      "lines": 2,
+      "paragraph_cache": [
+        {
+          "bytes": 712,
+          "label": "LaidOutDocument.paragraph_layouts.entries"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.tokens"
+        },
+        {
+          "bytes": 1408,
+          "label": "LaidOutDocument.paragraph_layouts.lines"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.placements"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.adjustments"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.spacing"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.dependencies"
+        }
+      ],
+      "reader_borrows_layout": true,
+      "render_fingerprint": "fd860749c379b54b",
+      "reported_document_bytes": 28531,
+      "rss_peak_bytes": 16560128,
+      "samples": 1,
+      "source_fingerprint": "bad5bafca76ddedb",
+      "text_color_fingerprint": "69726a7aed40ee6f",
+      "user_instructions": 4200117,
+      "wall_median_ms": 0.578565
+    }
+  },
+  {
+    "fixture": "08-linked-table-columns.html",
+    "palette": "theme",
+    "matches": true,
+    "reference": {
+      "case": "reference",
+      "chapter": "08-linked-table-columns.html",
+      "glyphs": 6,
+      "lines": 2,
+      "render_fingerprint": "1eecb9d395dd7b78",
+      "source_fingerprint": "bad5bafca76ddedb",
+      "text_color_fingerprint": "74ac4f0f9078a46f"
+    },
+    "candidate": {
+      "allocated_bytes": 0,
+      "allocation_requests": 0,
+      "case": "cold",
+      "chapter": "08-linked-table-columns.html",
+      "cpu_median_ms": 0.6152500000000003,
+      "font_backend": "deterministic mock",
+      "glyphs": 6,
+      "heap_instrumented": false,
+      "heap_live_bytes": 0,
+      "heap_peak_bytes": 0,
+      "image_metric": null,
+      "lines": 2,
+      "paragraph_cache": [
+        {
+          "bytes": 712,
+          "label": "LaidOutDocument.paragraph_layouts.entries"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.tokens"
+        },
+        {
+          "bytes": 1408,
+          "label": "LaidOutDocument.paragraph_layouts.lines"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.placements"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.adjustments"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.spacing"
+        },
+        {
+          "bytes": 0,
+          "label": "LaidOutDocument.paragraph_layouts.dependencies"
+        }
+      ],
+      "reader_borrows_layout": true,
+      "render_fingerprint": "1eecb9d395dd7b78",
+      "reported_document_bytes": 28899,
+      "rss_peak_bytes": 16560128,
+      "samples": 1,
+      "source_fingerprint": "bad5bafca76ddedb",
+      "text_color_fingerprint": "74ac4f0f9078a46f",
+      "user_instructions": 4395512,
+      "wall_median_ms": 0.6185109999999999
+    }
+  }
+]

@@ -151,6 +151,7 @@ pub(super) fn sort_lines_and_remap_images(
         index_map[*old_idx] = new_idx;
     }
     placement.remap_lines(&index_map);
+    layout.paint_program.remap_lines(&index_map);
     for line_idx in &mut layout.line_output.paint_order_indices {
         *line_idx = u32::try_from(index_map[*line_idx as usize])
             .expect("line index exceeds paint traversal capacity");

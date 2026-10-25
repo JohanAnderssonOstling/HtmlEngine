@@ -393,9 +393,7 @@ impl RenderImageFragment {
             size: fragment.size,
             clip: fragment.clip,
             paint_order: fragment.paint_order,
-            text_color: document.inputs.layout_tree.get_box_style_indices(fragment.box_idx as usize)
-                .and_then(|indices| document.inputs.styles.view(indices))
-                .map_or(0x000000ff, |style| style.color()),
+            text_color: document.box_text_format(fragment.box_idx as usize).color,
         }
     }
 

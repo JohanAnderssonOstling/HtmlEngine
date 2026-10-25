@@ -510,6 +510,53 @@ fn stops_text_decoration_propagation(
     ) || style.position() == html_style_model::PositionMode::Absolute
 }
 
+pub(super) fn line_publishes(
+    engine: &crate::layout::LayoutEngine<'_, '_>,
+    span: &[InlineToken], runs: &[InlineTokenMetrics], replaced: &[ReplacedToken], line: &LineLayout,
+) -> bool {
+    if line.placements.is_none() && !line.glyph_range.is_empty() { return true; }
+    line.publish_empty
+        || span.iter().any(|token| match token.kind() {
+            InlineTokenKind::FloatAnchor { .. }
+            | InlineTokenKind::AbsoluteAnchor { .. }
+            | InlineTokenKind::Opportunity => false,
+            InlineTokenKind::InlineBoundary { payload_idx } => {
+                match replaced.get(payload_idx as usize) {
+                    Some(ReplacedToken::InlineBoundary {
+                        box_idx,
+                        inline_start,
+                        inline_end,
+                        ..
+                    }) => {
+                        let style = engine.reader.style(*box_idx as usize);
+                        token.width != 0.0
+                            || (*inline_start
+                                && (!style.padding_left().is_zero()
+                                    || style.border_left_width() != 0.0))
+                            || (*inline_end
+                                && (!style.padding_right().is_zero()
+                                    || style.border_right_width() != 0.0))
+                            || !style.margin_top().is_zero()
+                            || !style.margin_bottom().is_zero()
+                            || !style.padding_top().is_zero()
+                            || !style.padding_bottom().is_zero()
+                            || style.border_top_width() != 0.0
+                            || style.border_bottom_width() != 0.0
+                    }
+                    _ => false,
+                }
+            }
+            InlineTokenKind::Glyph { glyph_idx } => {
+                let glyph = engine.text.glyph_at(glyph_idx as usize).unwrap_or_default();
+                let character = engine.text.glyph_metric(glyph).ch();
+                token.width != 0.0
+                    || !character.is_whitespace()
+                    || token.run_metrics(runs).white_space.preserves_spaces()
+            }
+            _ => true,
+        })
+}
+
 /// Writes fragments for one broken line using a precomputed line layout.
 ///
 /// The write phase only mutates the document; all layout decisions have
@@ -627,46 +674,7 @@ pub(super) fn write_line_fragments(
     // Absolute/float anchors are executable source-position markers, not
     // line-box content. Keep processing them below, but do not publish the
     // zero-height carrier line that exists solely to trigger that work.
-    let publishes_line = line.publish_empty
-        || span.iter().any(|token| match token.kind() {
-            InlineTokenKind::FloatAnchor { .. }
-            | InlineTokenKind::AbsoluteAnchor { .. }
-            | InlineTokenKind::Opportunity => false,
-            InlineTokenKind::InlineBoundary { payload_idx } => {
-                match replaced.get(payload_idx as usize) {
-                    Some(ReplacedToken::InlineBoundary {
-                        box_idx,
-                        inline_start,
-                        inline_end,
-                        ..
-                    }) => {
-                        let style = engine.reader.style(*box_idx as usize);
-                        token.width != 0.0
-                            || (*inline_start
-                                && (!style.padding_left().is_zero()
-                                    || style.border_left_width() != 0.0))
-                            || (*inline_end
-                                && (!style.padding_right().is_zero()
-                                    || style.border_right_width() != 0.0))
-                            || !style.margin_top().is_zero()
-                            || !style.margin_bottom().is_zero()
-                            || !style.padding_top().is_zero()
-                            || !style.padding_bottom().is_zero()
-                            || style.border_top_width() != 0.0
-                            || style.border_bottom_width() != 0.0
-                    }
-                    _ => false,
-                }
-            }
-            InlineTokenKind::Glyph { glyph_idx } => {
-                let glyph = engine.text.glyph_at(glyph_idx as usize).unwrap_or_default();
-                let character = engine.text.glyph_metric(glyph).ch();
-                token.width != 0.0
-                    || !character.is_whitespace()
-                    || token.run_metrics(runs).white_space.preserves_spaces()
-            }
-            _ => true,
-        });
+    let publishes_line = line_publishes(engine, span, runs, replaced, line);
     if publishes_line {
         let inline_box_fragments = engine
             .fragments
@@ -806,6 +814,7 @@ pub(super) fn write_line_fragments(
             );
             engine.geometry.set_point(*box_idx as usize, border_point);
             let decoration_start = engine.fragments.decoration_len();
+            let paint_start = engine.fragments.state().paint_program.commands.len();
             let height = engine.reader.style(*box_idx as usize).height();
             let authored_height_is_definite = match height {
                 html_style_model::UsedPreferredSize::Px(_) => true,
@@ -828,6 +837,7 @@ pub(super) fn write_line_fragments(
                 authored_height_is_definite,
             );
             let _ = engine.layout_box(request);
+            engine.fragments.state_mut().paint_program.record_line_since(paint_start, line_idx, paint_order);
             // CSS paints an inline-block (and the non-positioned contents it
             // establishes) atomically at this point in the owning line. Keep
             // its block decorations with that line instead of replaying them

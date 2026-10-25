@@ -1,9 +1,11 @@
 //! Prepared, shaped, and laid-out document lifecycle types.
 
 use super::*;
-use crate::layout::prepare_text_paint;
+use crate::layout::{LayoutScratch, prepare_text_paint};
 use crate::ReaderStyleOverrides;
+use crate::shaping::PreparedText;
 use std::sync::Arc;
+use super::paint::PaintStyles;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LayoutConstraints {
@@ -220,9 +222,9 @@ pub(crate) struct PreparedInputs {
     pub(super) document: std::sync::Arc<Document>,
     pub(super) styles: std::sync::Arc<ComputedStyles>,
     pub(super) layout_tree: std::sync::Arc<LayoutTree>,
-    pub(super) inline_content: InlineContent,
+    pub(super) text: Arc<PreparedText>,
     pub(super) note_flow: NoteFlow,
-    pub(super) paint_base: Option<Arc<PreparedInputs>>,
+    pub(crate) paint: Arc<PaintStyles>,
 }
 
 #[derive(Clone)]
@@ -233,9 +235,9 @@ pub struct PreparedDocument {
 #[derive(Clone)]
 pub(crate) struct ShapedText {
     pub(super) resource_generation: crate::GlyphResourceGeneration,
-    pub(super) paint_styles: Arc<ComputedStyles>,
-    pub(super) geometry_inputs: Arc<PreparedInputs>,
+    pub(super) geometry_tree: Arc<LayoutTree>,
     pub(super) inline_content: InlineContent,
+    pub(super) paint_ranges: Arc<[TextPaintRange]>,
     pub(super) glyph_metrics: GlyphMetrics,
     pub(super) font_metrics: crate::shaping::ShapedFontMetrics,
     pub(super) text_geometry: crate::shaping::ShapedTextGeometry,
@@ -290,22 +292,20 @@ impl PreparedDocument {
         let mut layout_tree = LayoutTree::default();
         let mut inline_content = InlineContent::default();
         crate::layout::build_layout_inputs(&document, &styles, &mut layout_tree, &mut inline_content, note_flow);
-        Ok(Self { inputs: std::sync::Arc::new(PreparedInputs { document: std::sync::Arc::new(document), styles: std::sync::Arc::new(styles), layout_tree: std::sync::Arc::new(layout_tree), inline_content, note_flow, paint_base: None }) })
+        let text = Arc::new(PreparedText::new(&document, &styles, &layout_tree, inline_content));
+        let paint = Arc::new(PaintStyles::new(&document, &styles, &layout_tree));
+        Ok(Self { inputs: Arc::new(PreparedInputs { document: Arc::new(document), styles: Arc::new(styles), layout_tree: Arc::new(layout_tree), text, note_flow, paint }) })
     }
 
     /// Apply color preferences to an unpainted prepared document. The cascade
     /// and typography are retained, including their publication colors.
     pub fn with_reader_paint_overrides(&self, overrides: &ReaderStyleOverrides) -> Result<Self, PrepareError> {
-        if overrides.paint_overrides() == ReaderStyleOverrides::default() {
-            return Ok(self.clone());
-        }
-        let styles = self.inputs.styles.with_reader_overrides(&self.inputs.document, &overrides.paint_overrides()).expect("color overrides preserve validated computed styles");
-        let mut layout_tree = LayoutTree::default();
-        let mut inline_content = InlineContent::default();
-        crate::layout::build_layout_inputs(&self.inputs.document, &styles, &mut layout_tree, &mut inline_content, self.inputs.note_flow);
-        Ok(Self {
-            inputs: Arc::new(PreparedInputs { document: self.inputs.document.clone(), styles: Arc::new(styles), layout_tree: Arc::new(layout_tree), inline_content, note_flow: self.inputs.note_flow, paint_base: Some(self.inputs.clone()) }),
-        })
+        let paint = self.inputs.paint.with_overrides(&self.inputs.styles, &self.inputs.layout_tree, overrides);
+        Ok(Self { inputs: Arc::new(PreparedInputs {
+            document: self.inputs.document.clone(), styles: self.inputs.styles.clone(),
+            layout_tree: self.inputs.layout_tree.clone(), text: self.inputs.text.clone(),
+            note_flow: self.inputs.note_flow, paint: Arc::new(paint),
+        }) })
     }
 
     /// Prepares the subtree rooted at the element carrying `id` as a document
@@ -334,14 +334,16 @@ impl PreparedDocument {
             NoteFlow::InFlow,
             root,
         );
+        let text = Arc::new(PreparedText::new(document, &self.inputs.styles, &layout_tree, inline_content));
+        let paint = Arc::new(self.inputs.paint.for_tree(document, &self.inputs.styles, &layout_tree));
         Some(Self {
             inputs: std::sync::Arc::new(PreparedInputs {
                 document: std::sync::Arc::clone(&self.inputs.document),
                 styles: std::sync::Arc::clone(&self.inputs.styles),
                 layout_tree: std::sync::Arc::new(layout_tree),
-                inline_content,
+                text,
                 note_flow: NoteFlow::InFlow,
-                paint_base: None,
+                paint,
             }),
         })
     }
@@ -385,7 +387,7 @@ impl PreparedDocument {
 
     #[cfg(test)]
     pub(crate) fn inline_content(&self) -> &InlineContent {
-        &self.inputs.inline_content
+        self.inputs.text.content()
     }
 
     pub fn box_count(&self) -> usize {
@@ -400,6 +402,7 @@ impl PreparedDocument {
     /// Report bytes retained for the prepared stage cache.
     pub fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
+        report.extend_prefixed("PreparedDocument.paint", self.inputs.paint.memory_usage_report());
         report.extend_prefixed(
             "PreparedDocument.document",
             self.document().memory_usage_report(),
@@ -414,7 +417,7 @@ impl PreparedDocument {
         );
         report.extend_prefixed(
             "PreparedDocument.inline_content",
-            self.inputs.inline_content.memory_usage_report(),
+            self.inputs.text.memory_usage_report(),
         );
         report
     }
@@ -448,7 +451,7 @@ impl PreparedDocument {
 
     pub fn box_text_color(&self, box_idx: usize) -> Option<u32> {
         let indices = self.box_style_indices(box_idx)?;
-        Some(self.inputs.styles.text_style(indices)?.color)
+        Some(self.inputs.paint.resolve(&self.inputs.styles, indices, box_idx).foreground)
     }
 
     pub fn shape(
@@ -555,13 +558,13 @@ impl PreparedDocument {
         glyph_shaper: &mut impl crate::GlyphShaper,
     ) -> Result<ShapedDocument, crate::ShapeError> {
         let mut glyph_metrics = glyph_shaper.glyph_resources().snapshot();
-        let mut inline_content = self.inputs.inline_content.clone();
+        let mut inline_content = self.inputs.text.content().clone();
         let (ellipsis_glyphs, hyphen_glyphs, text_geometry, font_metrics) =
             crate::shaping::shape_document(
-                &self.inputs.document,
                 &self.inputs.styles,
                 &self.inputs.layout_tree,
                 &mut inline_content,
+                self.inputs.text.first_letter_styles(),
                 glyph_shaper,
                 &mut glyph_metrics,
             )?;
@@ -584,9 +587,9 @@ impl PreparedDocument {
             inputs: self.inputs.clone(),
             shaped: std::sync::Arc::new(ShapedText {
                 resource_generation: glyph_shaper.glyph_resources().generation(),
-                paint_styles: self.inputs.styles.clone(),
-                geometry_inputs: self.inputs.paint_base.as_ref().unwrap_or(&self.inputs).clone(),
+                geometry_tree: self.inputs.layout_tree.clone(),
                 inline_content,
+                paint_ranges: Arc::from([]),
                 glyph_metrics,
                 font_metrics,
                 text_geometry,
@@ -606,7 +609,7 @@ impl PreparedDocument {
 impl ShapedDocument {
     /// Retarget retained shaping to color-only styles produced from the same DOM.
     pub fn with_paint_from(&self, prepared: &PreparedDocument) -> Self {
-        assert!(Arc::ptr_eq(&self.shaped.geometry_inputs, prepared.inputs.paint_base.as_ref().unwrap_or(&prepared.inputs)));
+        assert!(Arc::ptr_eq(&self.shaped.geometry_tree, &prepared.inputs.layout_tree));
         Self { inputs: prepared.inputs.clone(), shaped: self.shaped.clone() }
     }
 
@@ -778,10 +781,16 @@ impl ShapedDocument {
         image_metrics: &ImageMetrics,
         timings: Option<&mut crate::LayoutTimings>,
     ) -> LaidOutDocument {
+        self.layout_impl_with_scratch(constraints, image_metrics, timings, LayoutScratch::default())
+    }
+
+    pub(super) fn layout_impl_with_scratch(
+        self, constraints: LayoutConstraints, image_metrics: &ImageMetrics,
+        timings: Option<&mut crate::LayoutTimings>, mut layout_scratch: LayoutScratch,
+    ) -> LaidOutDocument {
         let mut layout_state = LayoutState::default();
         let mut geometry = BoxGeometry::default();
         let mut placement = crate::layout::PlacementState::default();
-        let mut layout_scratch = crate::layout::LayoutScratch::default();
         crate::layout::layout_with_timings(
             layout_inputs(&self.inputs, &self.shaped, image_metrics),
             crate::layout::LayoutOutputs {
@@ -828,6 +837,9 @@ fn layout_inputs<'a>(
         hyphen_glyphs: &shaped.hyphen_glyphs,
         inline_plans: &shaped.inline_plans,
         image_metrics,
+        paint: &inputs.paint,
+        text_style_ranges: &shaped.paint_ranges,
+        resource_generation: &shaped.resource_generation,
     }
 }
 
@@ -848,10 +860,16 @@ pub struct LaidOutDocument {
     pub(super) base_shaped: std::sync::Arc<ShapedText>,
     pub(super) shaped: std::sync::Arc<ShapedText>,
     pub(super) layout_state: LayoutState,
-    pub(super) layout_scratch: crate::layout::LayoutScratch,
+    pub(super) layout_scratch: LayoutScratch,
     pub(super) paint_colors: Arc<[PaintColorRun]>,
     pub(super) last_constraints: LayoutConstraints,
     pub(super) last_image_metrics: ImageMetrics,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct TextPaintRange {
+    pub(crate) glyphs: std::ops::Range<u32>,
+    pub(crate) style: StyleIndices,
 }
 
 #[derive(Clone)]
@@ -861,33 +879,11 @@ pub(crate) struct PaintColorRun {
 }
 
 impl LaidOutDocument {
-    /// Repaint an ordinary flow document using colors derived from its own
-    /// prepared publication styles. Returns false for layouts whose decorations
-    /// are emitted by specialized formatting algorithms.
+    /// Resolve paint over retained geometry, including specialized formatting
+    /// contexts. A different prepared geometry epoch must be laid out first.
     pub fn repaint_from(&mut self, prepared: &PreparedDocument) -> bool {
-        if !Arc::ptr_eq(&self.shaped.geometry_inputs, prepared.inputs.paint_base.as_ref().unwrap_or(&prepared.inputs))
-            || self.inputs.layout_tree.box_count() != prepared.inputs.layout_tree.box_count()
-            || (0..self.inputs.layout_tree.box_count()).any(|idx| {
-                let indices = self.inputs.layout_tree.get_box_style_indices(idx).unwrap_or_else(|| self.inputs.styles.default_indices());
-                let style = self.inputs.styles.view(indices).expect("validated box style");
-                !matches!(self.inputs.layout_tree.get_box_layout_mode(idx), Some(LayoutMode::Block(_) | LayoutMode::Inline(_) | LayoutMode::Anonymous(_)))
-                    || self.inputs.styles.layout_style(indices).expect("validated layout style").position != html_style_model::PositionMode::Static
-                    || style.float() != html_style_model::Float::None
-            })
-        {
-            return false;
-        }
+        if !Arc::ptr_eq(&self.shaped.geometry_tree, &prepared.inputs.layout_tree) { return false; }
         self.inputs = prepared.inputs.clone();
-        for line in &self.layout_state.line_output.lines {
-            let Some(detail_idx) = line.details else { continue; };
-            let details = &mut self.layout_state.line_output.line_details[detail_idx.get() as usize - 1];
-            if details.paint_color.is_some() {
-                let root = crate::shaping::whitespace_context_root(&self.inputs.layout_tree, line.owner_box_idx as usize);
-                details.paint_color = crate::shaping::first_line_style_for_inline_root(&self.inputs.document, &self.inputs.styles, &self.inputs.layout_tree, &self.shaped.inline_content, root)
-                    .and_then(|indices| self.inputs.styles.view(indices))
-                    .map(|style| style.color());
-            }
-        }
         self.rebuild_paint_colors();
         crate::layout::engine::repaint(layout_inputs(&self.inputs, &self.shaped, &self.last_image_metrics), &mut self.geometry, &mut self.layout_state, self.last_constraints);
         true
@@ -896,28 +892,38 @@ impl LaidOutDocument {
     /// Refresh specialized decoration geometry while retaining shaped text.
     /// The paint variant must come from this document's prepared publication.
     pub fn relayout_with_paint_from(
-        &mut self,
-        prepared: &PreparedDocument,
-        glyph_shaper: &mut impl crate::GlyphShaper,
+        &mut self, prepared: &PreparedDocument, glyph_shaper: &mut impl crate::GlyphShaper,
     ) -> Result<(), crate::ShapeError> {
-        assert!(Arc::ptr_eq(
-            &self.shaped.geometry_inputs,
-            prepared.inputs.paint_base.as_ref().unwrap_or(&prepared.inputs),
-        ));
+        let image_metrics = self.last_image_metrics.clone();
+        self.relayout_from(prepared, self.last_constraints, &image_metrics, glyph_shaper)
+    }
+
+    /// Update geometry and paint together while retaining shaping. A failed
+    /// exact-line refinement leaves both the previous geometry and palette.
+    pub fn relayout_from(
+        &mut self, prepared: &PreparedDocument, constraints: LayoutConstraints,
+        image_metrics: &ImageMetrics, glyph_shaper: &mut impl crate::GlyphShaper,
+    ) -> Result<(), crate::ShapeError> {
+        assert!(Arc::ptr_eq(&self.shaped.geometry_tree, &prepared.inputs.layout_tree));
         let previous_inputs = self.inputs.clone();
         self.inputs = prepared.inputs.clone();
-        let image_metrics = self.last_image_metrics.clone();
-        let result = self.relayout_with_metrics_and_shaper(
-            self.last_constraints, &image_metrics, glyph_shaper,
-        );
-        if result.is_err() {
-            self.inputs = previous_inputs;
-        }
+        let result = self.relayout_with_metrics_and_shaper(constraints, image_metrics, glyph_shaper);
+        if result.is_err() { self.inputs = previous_inputs; }
         result
     }
 
     pub(super) fn rebuild_paint_colors(&mut self) {
-        if Arc::ptr_eq(&self.inputs.styles, &self.shaped.paint_styles) {
+        for line in &self.layout_state.line_output.lines {
+            let Some(detail_idx) = line.details else { continue; };
+            let details = &mut self.layout_state.line_output.line_details[detail_idx.get() as usize - 1];
+            if details.paint_color.is_some() {
+                let root = crate::shaping::whitespace_context_root(&self.inputs.layout_tree, line.owner_box_idx as usize);
+                details.paint_color = crate::shaping::first_line_style_for_inline_root(&self.inputs.document, &self.inputs.styles, &self.inputs.layout_tree, &self.shaped.inline_content, root)
+                    .map(|indices| self.inputs.paint.resolve(&self.inputs.styles, indices, root).foreground);
+            }
+        }
+
+        if self.inputs.paint.is_default() {
             let had_updates = !self.paint_colors.is_empty();
             self.paint_colors = Arc::from([]);
             if had_updates {
@@ -925,25 +931,24 @@ impl LaidOutDocument {
             }
             return;
         }
-        let overrides = self.inputs.styles.has_first_letter_styles().then(|| {
-            crate::shaping::first_letter_overrides_with_characters(&self.inputs.document, &self.inputs.styles, &self.inputs.layout_tree, &self.shaped.inline_content, |index| {
-                self.shaped.glyph_metrics.get(self.shaped.inline_content.glyph_at(index as usize).unwrap_or_default()).ch()
-            })
-        });
         let mut colors: Vec<PaintColorRun> = Vec::new();
         for item in self.shaped.inline_content.inline_items() {
-            let (InlineItemKind::Text { glyphs } | InlineItemKind::Marker { glyphs }) = &item.kind else {
-                continue;
-            };
+            let (InlineItemKind::Text { glyphs } | InlineItemKind::Marker { glyphs }) = &item.kind else { continue; };
             let base = self.inputs.layout_tree.get_box_style_indices(item.box_idx as usize).unwrap_or_else(|| self.inputs.styles.default_indices());
             let mut start = glyphs.start;
             while start < glyphs.end {
-                let style = overrides.as_ref().and_then(|styles| styles[start as usize]).unwrap_or(base);
-                let color = self.inputs.styles.view(style).expect("validated paint style").color();
-                let mut end = if overrides.is_none() { glyphs.end } else { start + 1 };
-                while end < glyphs.end && overrides.as_ref().and_then(|styles| styles[end as usize]).unwrap_or(base) == style {
-                    end += 1;
+                let (override_style, mut end) = self.inputs.text.first_letter_styles().segment(start, glyphs.end);
+                let index = self.shaped.paint_ranges.partition_point(|range| range.glyphs.end <= start);
+                let mut style = override_style.unwrap_or(base);
+                if let Some(range) = self.shaped.paint_ranges.get(index) {
+                    if range.glyphs.start <= start { style = range.style; end = end.min(range.glyphs.end); }
+                    else { end = end.min(range.glyphs.start); }
                 }
+                let color = if style == base {
+                    self.inputs.paint.box_colors(item.box_idx as usize).expect("active palette has every box binding").foreground
+                } else {
+                    self.inputs.paint.resolve(&self.inputs.styles, style, item.box_idx as usize).foreground
+                };
                 if let Some(last) = colors.last_mut().filter(|last| last.glyphs.end == start && last.color == color) {
                     last.glyphs.end = end;
                 } else {
@@ -1046,7 +1051,7 @@ impl LaidOutDocument {
             inputs: self.inputs.clone(),
             shaped: self.base_shaped.clone(),
         }
-        .layout_impl(constraints, image_metrics, None);
+        .layout_impl_with_scratch(constraints, image_metrics, None, std::mem::take(&mut self.layout_scratch));
         let shaping_seed = glyph_shaper.glyph_resources().snapshot();
         let needs_append = !first_line_style_ranges(&candidate).is_empty();
         let refine = |glyph_shaper: &mut _| {
@@ -1265,7 +1270,7 @@ impl LaidOutDocument {
             font_size: style.font_size(),
             font_weight: style.font_weight(),
             font_style: style.font_style(),
-            color: style.color(),
+            color: self.inputs.paint.box_colors(box_idx).map_or_else(|| style.color(), |paint| paint.foreground),
             font_family: style.font_family(),
             letter_spacing: style.letter_spacing(),
             word_spacing: style.word_spacing(),
@@ -1298,6 +1303,7 @@ impl LaidOutDocument {
 
     pub fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
+        report.extend_prefixed("LaidOutDocument.paint", self.inputs.paint.memory_usage_report());
         report.extend_prefixed(
             "LaidOutDocument.document",
             self.document().memory_usage_report(),
@@ -1331,10 +1337,12 @@ impl LaidOutDocument {
             "LaidOutDocument.glyph_metrics",
             self.glyph_metrics().memory_usage_report(),
         );
+        report.add_slice_storage::<TextPaintRange>("LaidOutDocument.text_paint_ranges", self.shaped.paint_ranges.len(), self.shaped.paint_ranges.len());
         report.add_slice_storage::<PaintColorRun>(
             "LaidOutDocument.paint_colors.storage",
             self.paint_colors.len(), self.paint_colors.len(),
         );
+        report.extend_prefixed("LaidOutDocument.paragraph_layouts", self.layout_scratch.paragraph_layout_memory_report());
         report.add(
             "LaidOutDocument.inline_plans",
             self.shaped.inline_plans.memory_usage_bytes(),

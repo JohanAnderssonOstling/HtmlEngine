@@ -32,12 +32,15 @@ mod decorations;
 mod fragments;
 mod justification;
 mod paragraph;
+mod retained;
+pub(in crate::layout) use retained::ParagraphLayouts;
+use retained::{LineAdjustment, ParagraphDependencies, ParagraphLookup, ParagraphSlot, PreparedLine, PreparedParagraph};
 mod text_tokens;
 pub(in crate::layout) mod tokens;
 mod wrapping;
 
 use fragments::*;
-use paragraph::{layout_inline_content_around_float_exclusions, prepare_inline_tokens};
+use paragraph::{prepare_lines_around_float_exclusions, prepare_inline_tokens};
 use text_tokens::*;
 use tokens::*;
 use wrapping::*;

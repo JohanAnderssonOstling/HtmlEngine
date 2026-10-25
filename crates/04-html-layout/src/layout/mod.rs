@@ -1,3 +1,4 @@
+pub(crate) mod paint_program;
 mod absolute_positioning;
 mod block;
 mod border_geometry;
@@ -8,7 +9,7 @@ mod box_model;
 mod box_positioning;
 mod box_sizing;
 mod config;
-mod decorations;
+pub(crate) mod decorations;
 pub(crate) mod engine;
 mod finalization;
 mod formatting_context;
@@ -37,7 +38,6 @@ pub(crate) use box_positioning::{translate_laid_out_content, translate_laid_out_
 pub(crate) use box_sizing::{ResolvedBoxSizing, ResolvedTableBoxSizing};
 pub(crate) use decorations::{
     emit_block_background, emit_block_border_and_outline, emit_block_decorations,
-    emit_color_rect_for_owner,
 };
 pub(super) use engine::LayoutEngine;
 pub use engine::LayoutTimings;

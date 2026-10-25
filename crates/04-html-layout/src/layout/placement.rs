@@ -105,6 +105,9 @@ impl PlacementState {
         self.phase = PlacementPhase::Building;
     }
 
+    pub(crate) fn current_group(&self) -> PlacementId { self.current_group }
+    pub(crate) fn retains_output(&self) -> bool { self.retain_output }
+
     pub(crate) fn select(&mut self, group: PlacementId) {
         self.assert_building();
         self.current_group = group;
@@ -218,6 +221,7 @@ impl PlacementState {
             );
         }
 
+        fragments.state_mut().paint_program.publish(&self.resolved_offsets);
         self.phase = PlacementPhase::Published;
         self.current_group = 0;
     }

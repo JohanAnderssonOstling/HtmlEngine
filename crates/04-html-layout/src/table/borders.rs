@@ -3,7 +3,8 @@ use crate::layout::{
     LayoutEngine, LayoutReader, PhysicalBorderEdge, UsedBorderInsets, border_pattern,
     physical_borders,
 };
-use crate::layout_model::{DecorationFragment, TableColumnGroupSpan, TableColumnTrack};
+use crate::layout_model::{TableColumnGroupSpan, TableColumnTrack};
+use crate::layout::paint_program::PaintStyleSource;
 use html_style_model::{BorderStyle, UsedStyleView};
 use kurbo::{Point, Rect};
 
@@ -11,7 +12,8 @@ use kurbo::{Point, Rect};
 struct CollapsedBorder {
     style: BorderStyle,
     width: f64,
-    color: u32,
+    source: PaintStyleSource,
+    side: u8,
     source_priority: u8,
     order: u32,
     visible: bool,
@@ -23,12 +25,14 @@ impl CollapsedBorder {
         source_priority: u8,
         order: u32,
         visible: bool,
+        source: PaintStyleSource,
     ) -> Option<Self> {
         (edge.style == BorderStyle::Hidden || (edge.style != BorderStyle::None && edge.width > 0.0))
             .then_some(Self {
                 style: edge.style,
                 width: edge.width,
-                color: edge.color,
+                source,
+                side: edge.side,
                 source_priority,
                 order,
                 visible,
@@ -73,6 +77,7 @@ pub(super) struct CollapsedBorderGrid {
     horizontal: Vec<Option<CollapsedBorder>>,
     vertical: Vec<Option<CollapsedBorder>>,
     next_order: u32,
+    source: PaintStyleSource,
 }
 
 impl CollapsedBorderGrid {
@@ -96,15 +101,18 @@ impl CollapsedBorderGrid {
             horizontal: vec![None; (row_boxes.len() + 1) * column_count],
             vertical: vec![None; row_boxes.len() * (column_count + 1)],
             next_order: 0,
+            source: PaintStyleSource::Box(table_box_idx as u32),
         };
 
         // Lowest-precedence sources are registered first. The conflict
         // comparison still resolves width and style before source origin.
         grid.register_table(reader.style(table_box_idx), 1);
         for group in column_groups {
+            grid.source = PaintStyleSource::Style {indices:group.style,context:table_box_idx as u32};
             grid.register_column_group(reader.used_style(group.style), group.start, group.span, 2);
         }
         for (column, track) in columns.iter().enumerate().take(column_count) {
+            grid.source = PaintStyleSource::Style {indices:track.width_style,context:table_box_idx as u32};
             grid.register_column(reader.used_style(track.width_style), column, 3);
         }
         for &group_idx in row_groups {
@@ -116,13 +124,16 @@ impl CollapsedBorderGrid {
                 })
                 .collect::<Vec<_>>();
             if let (Some(&first), Some(&last)) = (group_rows.first(), group_rows.last()) {
+                grid.source = PaintStyleSource::Box(group_idx);
                 grid.register_row_group(reader.style(group_idx as usize), first, last + 1, 4);
             }
         }
         for (row, &row_idx) in row_boxes.iter().enumerate() {
+            grid.source = PaintStyleSource::Box(row_idx);
             grid.register_row(reader.style(row_idx as usize), row, 5);
         }
         for placement in placements {
+            grid.source = PaintStyleSource::Box(placement.cell_idx as u32);
             grid.register_cell(reader.style(placement.cell_idx), *placement, 6);
         }
         grid
@@ -194,7 +205,7 @@ impl CollapsedBorderGrid {
                 };
                 let start_join = self.vertical_joint_width(boundary, column) * 0.5;
                 let end_join = self.vertical_joint_width(boundary, column + 1) * 0.5;
-                if let Some(fragment) = edge_fragment(
+                emit_edge(session, table_box_idx,
                     Rect::new(
                         origin.x + x - start_join,
                         origin.y + anchor - edge.width * 0.5,
@@ -203,9 +214,7 @@ impl CollapsedBorderGrid {
                     ),
                     edge,
                     true,
-                ) {
-                    session.push_block_decoration(table_box_idx as u32, fragment);
-                }
+                );
             }
         }
         for row in 0..self.rows {
@@ -221,7 +230,7 @@ impl CollapsedBorderGrid {
                 };
                 let start_join = self.horizontal_joint_width(row, boundary) * 0.5;
                 let end_join = self.horizontal_joint_width(row + 1, boundary) * 0.5;
-                if let Some(fragment) = edge_fragment(
+                emit_edge(session, table_box_idx,
                     Rect::new(
                         origin.x + anchor - edge.width * 0.5,
                         origin.y + y - start_join,
@@ -230,9 +239,7 @@ impl CollapsedBorderGrid {
                     ),
                     edge,
                     false,
-                ) {
-                    session.push_block_decoration(table_box_idx as u32, fragment);
-                }
+                );
             }
         }
     }
@@ -407,7 +414,7 @@ impl CollapsedBorderGrid {
         visible: bool,
     ) {
         let order = self.take_order();
-        let Some(candidate) = CollapsedBorder::from_edge(edge, priority, order, visible) else {
+        let Some(candidate) = CollapsedBorder::from_edge(edge, priority, order, visible, self.source) else {
             return;
         };
         for column in start.min(self.columns)..end.min(self.columns) {
@@ -426,7 +433,7 @@ impl CollapsedBorderGrid {
         visible: bool,
     ) {
         let order = self.take_order();
-        let Some(candidate) = CollapsedBorder::from_edge(edge, priority, order, visible) else {
+        let Some(candidate) = CollapsedBorder::from_edge(edge, priority, order, visible, self.source) else {
             return;
         };
         for row in start.min(self.rows)..end.min(self.rows) {
@@ -511,19 +518,8 @@ fn boundary_anchor(starts: &[f64], sizes: &[f64], boundary: usize) -> Option<f64
     }
 }
 
-fn edge_fragment(
-    rect: Rect,
-    edge: CollapsedBorder,
-    horizontal: bool,
-) -> Option<DecorationFragment> {
-    if !edge.visible {
-        return None;
-    }
-    if rect.width() <= 0.0 || rect.height() <= 0.0 || edge.color & 0xFF == 0 {
-        return None;
-    }
-    let pattern = border_pattern(edge.style, horizontal)?;
-    Some(DecorationFragment::patterned(
-        rect, edge.color, false, false, pattern,
-    ))
+fn emit_edge(session: &mut LayoutEngine<'_, '_>, owner: usize, rect: Rect, edge: CollapsedBorder, horizontal: bool) {
+    if !edge.visible || rect.width() <= 0.0 || rect.height() <= 0.0 { return; }
+    let Some(pattern) = border_pattern(edge.style, horizontal) else { return; };
+    crate::layout::decorations::emit_bound_border(session, owner, rect, edge.source, edge.side, pattern);
 }

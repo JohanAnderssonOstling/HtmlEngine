@@ -381,6 +381,7 @@ pub struct LayoutCacheKey {
 pub struct RenderOnlyCacheKey {
     pub layout: LayoutCacheKey,
     pub paint: PaintSettingsRevision,
+    pub reader_paint: html_layout::ReaderStyleOverrides,
 }
 
 impl PipelineInputs {
@@ -466,7 +467,7 @@ impl PipelineInputs {
             stylesheet_revision: self.stylesheet_revision,
             style_environment: self.style_environment.cache_key(),
             user_styles: self.user_styles.clone(),
-            reader_overrides: self.reader_overrides.clone(),
+            reader_overrides: self.reader_overrides.layout_overrides(),
             note_flow: self.note_flow,
         }
     }
@@ -480,7 +481,7 @@ impl PipelineInputs {
     }
 
     pub fn render_only_cache_key(&self) -> RenderOnlyCacheKey {
-        RenderOnlyCacheKey { layout: self.layout_cache_key(), paint: self.paint }
+        RenderOnlyCacheKey { layout: self.layout_cache_key(), paint: self.paint, reader_paint: self.reader_overrides.paint_overrides() }
     }
 
     pub fn cache_key(&self) -> PipelineCacheKey {

@@ -20,3 +20,9 @@ library as `html`. The other workspace crates are implementation details.
 [dependencies]
 html = { package = "html-engine", git = "https://github.com/JohanAnderssonOstling/HtmlEngine" }
 ```
+
+`Engine::rehydrate_glyphs` updates the engine's active layout in place and
+returns `Result<(), Error>`. After it succeeds, borrow the document through
+`Engine::document()` instead of storing a second owned layout. Integrations
+using the earlier returned-document API must update their reader ownership
+alongside this engine change.

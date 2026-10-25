@@ -1,6 +1,6 @@
 use super::*;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub(super) struct InlineOverflow {
     pub(super) clips: bool,
     pub(super) ellipsis: Option<InlineToken>,

@@ -27,6 +27,7 @@ pub(crate) struct LayoutReader<'input> {
     font_metrics: &'input ShapedFontMetrics,
     image_metrics: &'input crate::ImageMetrics,
     box_styles: BoxStyleSnapshot<'input>,
+    paint: Option<&'input crate::stages::PaintStyles>,
 }
 
 /// Layout-ready styles for boxes in topology order.
@@ -88,15 +89,34 @@ impl<'input> LayoutReader<'input> {
             font_metrics,
             image_metrics,
             box_styles,
+            paint: None,
         }
+    }
+
+    pub(crate) fn with_paint(mut self, paint: &'input crate::stages::PaintStyles) -> Self {
+        self.paint = Some(paint);
+        self
     }
 
     pub(crate) fn document(&self) -> &'input Document {
         self.document
     }
 
+    /// Geometry reads never consult the reader palette.
     pub(crate) fn style(&self, box_idx: usize) -> UsedStyleView<'input> {
         self.box_styles.styles[box_idx]
+    }
+
+    pub(crate) fn paint_style(&self, box_idx: usize) -> UsedStyleView<'input> {
+        let style = self.style(box_idx);
+        self.paint.and_then(|paint| paint.box_colors(box_idx)).map_or(style, |colors| style.with_paint_colors(colors))
+    }
+
+    pub(crate) fn background_can_change(&self, box_idx: usize) -> bool {
+        let indices = self.topology.get_box_style_indices(box_idx).unwrap_or_else(|| self.styles.default_indices());
+        self.style(box_idx).background_color() & 0xff != 0
+            || self.styles.background_style(indices).is_some_and(|background| background.background_color_current_color)
+            || self.topology.root_box() == Some(box_idx) || self.topology.body_box() == Some(box_idx)
     }
 
     pub(crate) fn tracks_overflow_clips(&self) -> bool {
@@ -104,9 +124,12 @@ impl<'input> LayoutReader<'input> {
     }
 
     pub(crate) fn used_style(&self, indices: StyleIndices) -> UsedStyleView<'input> {
-        self.font_metrics
-            .used_non_box_style(self.styles, indices)
-            .expect("validated style handle")
+        self.font_metrics.used_non_box_style(self.styles, indices).expect("validated style handle")
+    }
+
+    pub(crate) fn paint_used_style(&self, indices: StyleIndices, context: usize) -> UsedStyleView<'input> {
+        let style = self.used_style(indices);
+        self.paint.and_then(|paint| paint.style_colors(indices, context)).map_or(style, |colors| style.with_paint_colors(colors))
     }
 
     pub(crate) fn font_metrics(&self, box_idx: usize) -> FontRelativeMetrics {
@@ -411,14 +434,14 @@ impl<'input> LayoutReader<'input> {
         let Some(root_box) = self.root_box() else {
             return false;
         };
-        let root = self.style(root_box);
+        let root = self.paint_style(root_box);
         if root.background_image_present() || root.background_color() & 0xFF != 0 {
             return box_idx == root_box;
         }
         let Some(body_box) = self.body_box() else {
             return false;
         };
-        let body = self.style(body_box);
+        let body = self.paint_style(body_box);
         (body.background_image_present() || body.background_color() & 0xFF != 0)
             && box_idx == body_box
     }

@@ -17,6 +17,7 @@ use unicode_segmentation::UnicodeSegmentation;
 mod contracts;
 mod execution;
 mod normalization;
+mod prepared_text;
 mod pseudo_styles;
 mod spans;
 
@@ -29,11 +30,15 @@ pub use contracts::{
     TextShapeRequest, TextStyleSpan,
 };
 pub(crate) use execution::{reshape_range_with_style, shape_document};
+pub(crate) use prepared_text::PreparedText;
+use prepared_text::{FirstLetterStyles, StyleOverrides};
 #[cfg(test)]
 use normalization::is_css_collapsible_space;
 pub(crate) use normalization::whitespace_context_root;
 use normalization::{collapse_whitespace, get_style, transform_text};
-pub(crate) use pseudo_styles::{first_letter_overrides_with_characters, first_letter_style_for_inline_root, first_letter_style_overrides, first_line_style_for_inline_root};
+#[cfg(test)]
+use pseudo_styles::first_letter_overrides_with_characters;
+pub(crate) use pseudo_styles::{ first_letter_style_for_inline_root, first_letter_style_overrides, first_line_style_for_inline_root};
 use spans::{plan_shaping_spans, text_runs};
 
 include!("../shaping_tests.rs");
