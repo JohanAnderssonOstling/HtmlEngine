@@ -14,6 +14,9 @@ members = [
     "test-support/html-wpt",
 ]
 
+[workspace.package]
+license = "GPL-3.0-or-later"
+
 [workspace.dependencies]
 kurbo = "0.11.3"
 peniko = "0.2.0"
