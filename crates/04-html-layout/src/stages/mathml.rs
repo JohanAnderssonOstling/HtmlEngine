@@ -4,31 +4,52 @@ use formulary::{Item, Layout, LayoutOptions, MathFont, layout, parse, svg};
 use html_dom::{Document, ImageSource};
 use html_style_model::ComputedStyles;
 use quick_xml::{Reader, events::Event};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 fn math_font() -> &'static MathFont<'static> {
     static FONT: OnceLock<MathFont<'static>> = OnceLock::new();
     FONT.get_or_init(|| MathFont::new(include_bytes!("../../assets/math/STIXTwoMath-Regular.otf"), 0).expect("bundled STIX Two Math must have a valid MATH table"))
 }
 
+pub(super) struct MathMlUndo {
+    index: usize,
+    width: u32,
+    height: u32,
+    svg: Arc<[u8]>,
+    baseline: f32,
+}
+
 pub(super) fn prepare(document: &mut Document, styles: &ComputedStyles) {
-    let equations = document
-        .node_ids()
-        .filter_map(|node| {
-            let image_idx = document.element_ref(node)?.image_idx()?;
-            let ImageSource::MathMl { markup, .. } = &document.image(image_idx)?.source else {
-                return None;
-            };
-            let style = styles.view(styles.style_for_node(node)?)?;
-            Some((image_idx, markup.clone(), style.font_size(), style.color()))
-        })
-        .collect::<Vec<_>>();
-    for (image_idx, markup, size, color) in equations {
-        let (svg, width, height, baseline) = render(&markup, size, color);
-        let image = &mut document.images_mut()[image_idx as usize];
-        image.width = width;
-        image.height = height;
-        image.source = ImageSource::MathMl { markup, svg: svg.into(), baseline };
+    prepare_with_undo(document, styles);
+}
+
+pub(super) fn prepare_with_undo(document: &mut Document, styles: &ComputedStyles) -> Vec<MathMlUndo> {
+    let equations: Vec<_> = document.node_ids().filter_map(|node| {
+        let image_idx = document.element_ref(node)?.image_idx()?;
+        if !matches!(document.image(image_idx)?.source, ImageSource::MathMl { .. }) { return None; }
+        let style = styles.view(styles.style_for_node(node)?)?;
+        Some((image_idx as usize, style.font_size(), style.color()))
+    }).collect();
+    let mut undo = Vec::with_capacity(equations.len());
+    for (index, size, color) in equations {
+        let ImageSource::MathMl { markup, .. } = &document.images()[index].source else { unreachable!() };
+        let (svg, width, height, baseline) = render(markup, size, color);
+        let image = &mut document.images_mut()[index];
+        let ImageSource::MathMl { svg: old_svg, baseline: old_baseline, .. } = &mut image.source else { unreachable!() };
+        undo.push(MathMlUndo {
+            index, width: std::mem::replace(&mut image.width, width), height: std::mem::replace(&mut image.height, height),
+            svg: std::mem::replace(old_svg, svg.into()), baseline: std::mem::replace(old_baseline, baseline),
+        });
+    }
+    undo
+}
+
+pub(super) fn restore(document: &mut Document, undo: Vec<MathMlUndo>) {
+    for old in undo {
+        let image = &mut document.images_mut()[old.index];
+        image.width = old.width; image.height = old.height;
+        let ImageSource::MathMl { svg, baseline, .. } = &mut image.source else { unreachable!() };
+        *svg = old.svg; *baseline = old.baseline;
     }
 }
 

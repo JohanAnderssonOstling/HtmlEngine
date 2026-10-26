@@ -1,6 +1,21 @@
 //! Shared punctuation-aware glue policy for optimal line breaking and final
 //! justified-space placement.
 
+/// Total tracking and per-shaped-cluster spacing share the same tiny limit.
+pub(super) const MICRO_TRACKING_FRACTION: f64 = 0.005;
+
+pub(super) fn tracking_width_limit(width: f64) -> f64 {
+    width.max(0.0) * MICRO_TRACKING_FRACTION
+}
+
+pub(super) fn tracking_boundary_limit(line_height: f64) -> f64 {
+    line_height.max(0.0) * MICRO_TRACKING_FRACTION
+}
+
+pub(super) fn tracking_boundary_allowed(current: char, next: char) -> bool {
+    current != '\u{00ad}' && next != '\u{00ad}' && !crate::shaping::is_bidi_control(current)
+}
+
 pub(super) const NORMAL_STRETCH_FRACTION: f64 = 0.5;
 pub(super) const NORMAL_SHRINK_FRACTION: f64 = 0.33;
 

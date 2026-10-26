@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::marker::PhantomData;
 use std::ops::Range;
+use unicode_bidi::{Direction, get_base_direction_full};
 
 const HTML_NAMESPACE: &str = "http://www.w3.org/1999/xhtml";
 
@@ -608,6 +609,8 @@ impl Document {
             let rtl = match is_html.then(|| attr("dir")).flatten() {
                 Some(value) if value.eq_ignore_ascii_case("ltr") => false,
                 Some(value) if value.eq_ignore_ascii_case("rtl") => true,
+                Some(value) if value.eq_ignore_ascii_case("auto") => html_auto_direction(self, node).unwrap_or(false),
+                _ if tag_is("bdi") => html_auto_direction(self, node).unwrap_or(false),
                 _ => inherited_rtl,
             };
             let editable = match is_html.then(|| attr("contenteditable")).flatten() {
@@ -998,6 +1001,42 @@ impl Document {
         }
         let end = self.class_list.len() as u16;
         start..end
+    }
+}
+
+fn html_auto_direction(doc: &Document, root: DomNodeId) -> Option<bool> {
+    let element = doc.element_ref(root)?;
+    if matches!(element.tag(), "input" | "textarea") {
+        if let Some(value) = element.attr("value") {
+            if let Some(direction) = first_strong_direction(value) {
+                return Some(direction);
+            }
+        }
+    }
+    let mut pending: Vec<_> = element.children().collect();
+    pending.reverse();
+    let mut content = String::new();
+    while let Some(node) = pending.pop() {
+        if let Some(text) = doc.text_ref(node) {
+            content.push_str(text.text());
+        } else if let Some(element) = doc.element_ref(node) {
+            if matches!(element.tag(), "bdi" | "script" | "style" | "textarea")
+                || element.attr("dir").is_some_and(|value| ["ltr", "rtl", "auto"].iter().any(|direction| value.eq_ignore_ascii_case(direction)))
+            {
+                continue;
+            }
+            let children: Vec<_> = element.children().collect();
+            pending.extend(children.into_iter().rev());
+        }
+    }
+    first_strong_direction(&content)
+}
+
+fn first_strong_direction(text: &str) -> Option<bool> {
+    match get_base_direction_full(text) {
+        Direction::Ltr => Some(false),
+        Direction::Rtl => Some(true),
+        Direction::Mixed => None,
     }
 }
 

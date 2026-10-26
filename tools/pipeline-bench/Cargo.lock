@@ -580,6 +580,7 @@ version = "0.1.0"
 dependencies = [
  "kurbo",
  "rustc_data_structures",
+ "unicode-bidi",
 ]
 
 [[package]]
@@ -610,7 +611,12 @@ dependencies = [
  "rayon",
  "rustc_data_structures",
  "taffy",
+ "unicode-bidi",
+ "unicode-bidi-mirroring",
+ "unicode-linebreak",
+ "unicode-normalization",
  "unicode-segmentation",
+ "unicode-width",
  "unicode_categories",
  "web-time",
 ]
@@ -637,6 +643,7 @@ dependencies = [
  "html-parse",
  "html-resources",
  "html-style",
+ "html-style-model",
 ]
 
 [[package]]
@@ -671,6 +678,7 @@ version = "0.1.0"
 name = "html-style"
 version = "0.1.0"
 dependencies = [
+ "cssparser",
  "html-dom",
  "html-style-model",
  "lightningcss",
@@ -686,7 +694,9 @@ version = "0.1.0"
 dependencies = [
  "html-dom",
  "kurbo",
+ "language-tags",
  "rustc_data_structures",
+ "unicode-script",
 ]
 
 [[package]]
@@ -800,6 +810,12 @@ dependencies = [
  "euclid",
  "smallvec",
 ]
+
+[[package]]
+name = "language-tags"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d4345964bb142484797b161f473a503a434de77149dd8c7427788c6e13379388"
 
 [[package]]
 name = "lazy_static"
@@ -1827,10 +1843,43 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
 
 [[package]]
+name = "unicode-bidi"
+version = "0.3.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c1cb5db39152898a79168971543b1cb5020dff7fe43c8dc468b0885f5e29df5"
+
+[[package]]
+name = "unicode-bidi-mirroring"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5dfa6e8c60bb66d49db113e0125ee8711b7647b5579dc7f5f19c42357ed039fe"
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
+
+[[package]]
+name = "unicode-linebreak"
+version = "0.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b09c83c3c29d37506a3e260c08c03743a6bb66a9cd432c6934ab501a190571f"
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75cd3fb03d5288b3ba9a1ee103ac7e9cbb59f0b03d64f8ddfcc04dd42758a85d"
+dependencies = [
+ "tinyvec",
+]
+
+[[package]]
+name = "unicode-script"
+version = "0.5.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "383ad40bb927465ec0ce7720e033cb4ca06912855fc35db31b5755d0de75b1ee"
 
 [[package]]
 name = "unicode-segmentation"

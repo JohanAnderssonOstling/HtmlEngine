@@ -4,8 +4,8 @@ use crate::layout_model::{
 };
 use html_dom::Document;
 use html_style_model::{
-    BorderStyle, ComputedStyles, FontStyle, OpenTypeFeature, StyleIndices, StyleView, TextOverflow,
-    TextTransform, UsedStyleView, VerticalAlignValue,
+    BorderStyle, ComputedStyles, ContentLanguage, FontStyle, LanguageId, OpenTypeFeature, StyleIndices, StyleView, TextOverflow,
+    TextTransform, UsedStyleView, VerticalAlignValue, TextDirection,
 };
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use std::fmt;
@@ -15,13 +15,20 @@ use unicode_categories::UnicodeCategories;
 use unicode_segmentation::UnicodeSegmentation;
 
 mod contracts;
+mod bidi;
 mod execution;
 mod normalization;
+mod line_breaks;
 mod prepared_text;
 mod pseudo_styles;
 mod spans;
+mod views;
+
+pub use views::GlyphSlice;
+pub(crate) use views::{GlyphPatch, TextGeometryView, NativeRuns};
 
 pub(crate) use contracts::{AuthoritativeShapedRun, ShapedFontMetrics, ShapedTextGeometry};
+pub(crate) use bidi::{ResolvedBidi, is_bidi_control, paragraph_unicode_bidi};
 use contracts::{BoxFontMetrics, RequiredFontMetrics};
 pub use contracts::{
     CharacterPlacement, FontMetricsRequest, FontRelativeMetrics, FontSlant,

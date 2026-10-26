@@ -471,21 +471,21 @@ impl FragmentRenderOptions {
     }
 }
 
-pub struct RenderedFragment {
-    document: LaidOutDocument,
+pub struct RenderedFragment<'a> {
+    document: &'a LaidOutDocument,
     scene: RenderScene,
 }
 
-impl RenderedFragment {
+impl<'a> RenderedFragment<'a> {
     pub fn document(&self) -> &LaidOutDocument {
-        &self.document
+        self.document
     }
 
     pub fn scene(&self) -> &RenderScene {
         &self.scene
     }
 
-    pub fn into_parts(self) -> (LaidOutDocument, RenderScene) {
+    pub fn into_parts(self) -> (&'a LaidOutDocument, RenderScene) {
         (self.document, self.scene)
     }
 }
@@ -529,12 +529,17 @@ impl FragmentRenderer {
         self.font_revision = self.font_revision.next();
     }
 
+    /// The last laid-out fragment, retained by the rendering session.
+    pub fn document(&self) -> Option<&LaidOutDocument> {
+        self.session.document()
+    }
+
     pub fn render(
         &mut self,
         source: &str,
         options: &FragmentRenderOptions,
         glyph_shaper: &mut impl GlyphShaper,
-    ) -> Result<RenderedFragment, FragmentRenderError> {
+    ) -> Result<RenderedFragment<'_>, FragmentRenderError> {
         let inputs = PipelineInputs {
             source: source.into(),
             markup_syntax: html_pipeline::MarkupSyntax::Html,
@@ -575,9 +580,8 @@ impl FragmentRenderer {
             .document()
             .ok_or_else(|| {
                 FragmentRenderError::new("fragment pipeline produced no laid-out document")
-            })?
-            .clone();
-        let scene = build_fragment_scene(&document, options);
+            })?;
+        let scene = build_fragment_scene(document, options);
         Ok(RenderedFragment { document, scene })
     }
 }
@@ -664,15 +668,15 @@ pub fn paint_line_glyphs(
                 current_x,
                 snap(baseline_y - metric.baseline_offset() as f64 - offset),
             );
-            if advance_override.is_none() && metric.ch() != '\u{00ad}' {
+            if advance_override.is_none() && let Some(paint_glyph) = text.paint_glyph_at(index) {
                 match color.or_else(|| text.paint_color_at(index)) {
-                    Some(color) => painter.draw_glyph_with_color(glyph, draw_point, color),
-                    None => painter.draw_glyph(glyph, draw_point),
+                    Some(color) => painter.draw_glyph_with_color(paint_glyph, draw_point, color),
+                    None => painter.draw_glyph(paint_glyph, draw_point),
                 }
             }
             current_x += advance_override.unwrap_or_else(|| {
                 let tracking =
-                    if index + 1 < line.end() && text.is_character_cluster_boundary(index + 1) {
+                    if text.paint_glyph_at(index).is_some() && index + 1 < line.end() && text.is_character_cluster_boundary(index + 1) {
                         line.letter_spacing()
                     } else {
                         0.0
@@ -742,15 +746,15 @@ pub fn paint_line_glyph_fragment(
             current_x,
             snap(baseline_y - metric.baseline_offset() as f64 - offset),
         );
-        if advance_override.is_none() && metric.ch() != '\u{00ad}' {
+        if advance_override.is_none() && let Some(paint_glyph) = text.paint_glyph_at(index) {
             match color.or_else(|| text.paint_color_at(index)) {
-                Some(color) => painter.draw_glyph_with_color(glyph, draw_point, color),
-                None => painter.draw_glyph(glyph, draw_point),
+                Some(color) => painter.draw_glyph_with_color(paint_glyph, draw_point, color),
+                None => painter.draw_glyph(paint_glyph, draw_point),
             }
         }
         current_x += advance_override.unwrap_or_else(|| {
             let tracking =
-                if index + 1 < line.end() && text.is_character_cluster_boundary(index + 1) {
+                if text.paint_glyph_at(index).is_some() && index + 1 < line.end() && text.is_character_cluster_boundary(index + 1) {
                     line.letter_spacing()
                 } else {
                     0.0
@@ -858,7 +862,7 @@ pub fn paint_line_text_runs(
                     x - natural_x,
                     snap(origin.y + line.baseline() - f64::from(run.ascent()) - offset),
                 );
-                let paints = advance_override.is_none() && metric.ch() != '\u{00ad}';
+                let paints = advance_override.is_none() && text.paint_glyph_at(index).is_some();
 
                 let paint_color = color.or_else(|| text.paint_color_at(index));
                 if paints {
@@ -882,7 +886,7 @@ pub fn paint_line_text_runs(
                         .unwrap_or_else(|| metric.advance()),
                 );
                 let tracking =
-                    if index + 1 < line.end() && text.is_character_cluster_boundary(index + 1) {
+                    if text.paint_glyph_at(index).is_some() && index + 1 < line.end() && text.is_character_cluster_boundary(index + 1) {
                         line.letter_spacing()
                     } else {
                         0.0
@@ -1365,7 +1369,7 @@ impl ResourceProvider for DenyResourceProvider {
 mod tests {
     use super::*;
     use html_layout::{
-        FontSlant, GlyphMetric, ShapeError, ShapedTextRun, TextRunShapeRequest,
+        FontSlant, GlyphMetric, ShapeError, ShapedTextRun, TextDirection, TextRunShapeRequest,
     };
     use std::collections::HashMap;
 
@@ -1491,7 +1495,7 @@ mod tests {
             let count = request.text().chars().count();
             let advances = vec![8.0; count];
             let caret_stops = (0..=count)
-                .map(|index| index as f32 * 8.0)
+                .map(|index| (if request.style().direction() == TextDirection::Rtl { count - index } else { index }) as f32 * 8.0)
                 .collect::<Vec<_>>();
             let run = self.next_run;
             self.next_run += 1;
@@ -1568,7 +1572,7 @@ mod tests {
         let mut shaper = NativeTestShaper::default();
         let constraints = html_layout::LayoutConstraints::new(200.0, 16.0).unwrap();
         let mut document = base.shape(&mut shaper).unwrap().layout(constraints);
-        let retained = document.clone();
+        let retained_color = document.render_view().text().paint_color_at(1);
         let run_count = shaper.next_run;
         let preferences = html_layout::ReaderStyleOverrides { foreground: Some(0x008000ff), link_foreground: Some(0xff0000ff), ..Default::default() };
         let painted = base.with_reader_paint_overrides(&preferences).unwrap();
@@ -1578,7 +1582,7 @@ mod tests {
         let line = text.lines().iter().find(|line| !line.glyphs().is_empty()).unwrap().index();
         assert_eq!(text.paint_color_at(0), Some(0x008000ff));
         assert_eq!(text.paint_color_at(1), Some(0xff0000ff));
-        assert_eq!(retained.render_view().text().paint_color_at(1), None);
+        assert_eq!(retained_color, None);
         let mut native = ColorPainter { native: true, ..Default::default() };
         assert!(paint_line_text_runs(&document, line, Point::ZERO, 1.0, None, &mut native));
         assert!(native.run_colors.iter().any(|(_, color)| *color == Some(0x008000ff)));
@@ -1669,6 +1673,33 @@ mod tests {
             painter.scalar_glyphs, 0,
             "native coverage never falls back to scalar glyph painting"
         );
+    }
+
+    #[test]
+    fn rtl_scalar_paint_places_mirrored_brackets_and_hides_directional_controls() {
+        let mut renderer = FragmentRenderer::new();
+        let mut shaper = TestShaper::default();
+        let options = FragmentRenderOptions::new(200.0, None).unwrap();
+        let rendered = renderer.render("<p dir='rtl'>(אבג)\u{200f}</p>", &options, &mut shaper).unwrap();
+        let text = rendered.document().render_view().text();
+        let mut painter = RecordingPainter::default();
+        paint_line_glyphs(rendered.document(), 0, Point::ZERO, 1.0, None, &mut painter);
+        painter.glyphs.sort_by(|a, b| a.1.x.total_cmp(&b.1.x));
+        let actual: String = painter.glyphs.iter().map(|(glyph, _)| text.glyph_metric(*glyph).unwrap().ch()).collect();
+        assert_eq!(actual, "(גבא)");
+    }
+
+    #[test]
+    fn rtl_native_paint_uses_document_owned_directional_slices() {
+        let mut renderer = FragmentRenderer::new();
+        let mut shaper = NativeTestShaper::default();
+        let options = FragmentRenderOptions::new(200.0, None).unwrap();
+        let rendered = renderer.render("<p dir='rtl'>אבג abc</p>", &options, &mut shaper).unwrap();
+        let mut painter = PreparedBatchPainter::default();
+        assert!(paint_line_text_runs(rendered.document(), 0, Point::ZERO, 1.0, None, &mut painter));
+        assert_eq!(painter.prepared_calls, 1);
+        assert!(painter.fragments >= 4);
+        assert_eq!(painter.scalar_glyphs, 0);
     }
 
     #[derive(Default)]

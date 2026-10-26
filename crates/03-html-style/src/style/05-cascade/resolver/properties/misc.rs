@@ -43,13 +43,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 LcWordBreak::Normal => WordBreak::Normal,
                 LcWordBreak::BreakAll => WordBreak::BreakAll,
                 LcWordBreak::KeepAll => WordBreak::KeepAll,
-                // Legacy value: behaves as `overflow-wrap: break-word`.
-                LcWordBreak::BreakWord => {
-                    if style.text.overflow_wrap == OverflowWrap::Normal {
-                        style.text.overflow_wrap = OverflowWrap::BreakWord;
-                    }
-                    WordBreak::Normal
-                }
+                LcWordBreak::BreakWord => WordBreak::BreakWord,
             };
         }
         Property::OverflowWrap(ow) | Property::WordWrap(ow) => {

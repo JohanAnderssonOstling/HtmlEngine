@@ -268,7 +268,7 @@ pub(crate) struct AnchorPosition {
     pub order: u32,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(crate) struct Line {
     /// Block formatting context that emitted this line. Retained with the
     /// line so consumers can inspect semantics for a visible range without
@@ -386,6 +386,7 @@ impl PreparedTextRunFragment {
 pub(crate) struct LineTextFragment {
     pub glyphs: Range<u32>,
     pub offset_x: f64,
+    pub rtl: bool,
     /// Source-token order within the owning line. Sparse text fragments are
     /// already split at every inline boundary and replaced item, making this
     /// sufficient to merge paint without retaining the dense token stream.
@@ -423,7 +424,7 @@ impl LineInlineBoxFragment {
 // two indexes, five relative coordinates, and edge flags.
 const _: () = assert!(std::mem::size_of::<LineInlineBoxFragment>() <= 32);
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(crate) struct GlyphOffsetRun {
     pub range: Range<u32>,
     pub offset: f32,
@@ -431,7 +432,7 @@ pub(crate) struct GlyphOffsetRun {
 
 /// Sparse horizontal advance overrides produced for position-dependent glyphs
 /// such as preserved tabs. Ordinary glyphs remain on the metric fast path.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(crate) struct GlyphAdvanceRun {
     pub range: Range<u32>,
     pub advance: f32,

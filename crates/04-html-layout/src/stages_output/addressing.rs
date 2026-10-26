@@ -121,7 +121,7 @@ impl<'a> RenderAddressingView<'a> {
             .find(|node| document.get_dom_id(*node) == Some(id))?;
         let mut start = u32::MAX;
         let mut end = 0u32;
-        for run in text_runs(self.doc.shaped.inline_content.inline_items()) {
+        for run in text_runs(self.doc.inputs.text.content().inline_items()) {
             let Some(mut node) = run
                 .dom_text_node()
                 .and_then(|raw| document.node_id_from_raw(raw))

@@ -45,7 +45,7 @@ pub(crate) use engine::layout_with_timings;
 pub(crate) use engine::{LayoutInputs, LayoutOutputs, LayoutScratch};
 pub(crate) use engine::{ParallelBoxMeasurement, ParallelMeasurementWorker};
 pub(crate) use fragment_writer::{FragmentWriter, OutputRanges};
-pub(crate) use inline::PreparedInlinePlans;
+pub(crate) use inline::InlinePlanGeneration;
 pub(crate) use placement::PlacementState;
 pub(crate) use parallel::install as install_parallel;
 #[cfg(test)]

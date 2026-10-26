@@ -5,13 +5,12 @@ use crate::layout_model::{InlineContent, LayoutTree};
 use html_dom::{Document, MemoryUsageReport};
 use html_style_model::{ComputedStyles, StyleIndices};
 use std::ops::Range;
-use std::sync::Arc;
 
 /// Text transforms, whitespace and source correspondence depend on publication
 /// styles, not the lifetime of a renderer's glyph cache. Keep their result with
 /// preparation so replacing font resources only repeats native shaping.
 pub(crate) struct PreparedText {
-    content: Arc<InlineContent>,
+    content: InlineContent,
     first_letter_styles: FirstLetterStyles,
 }
 
@@ -22,17 +21,21 @@ impl PreparedText {
         tree: &LayoutTree,
         mut content: InlineContent,
     ) -> Self {
-        if !content.glyphs().is_empty() {
-            collapse_whitespace(styles, tree, &mut content);
-        }
+        profile_scope!("prepare.logical_text");
+        let unicode_roots = if content.characters().is_empty() {
+            Default::default()
+        } else {
+            profile!("prepare.whitespace", collapse_whitespace(styles, tree, &mut content))
+        };
         let mut first_letter_styles =
-            first_letter_style_overrides(document, styles, tree, &content);
-        if !content.glyphs().is_empty() {
-            transform_text(styles, tree, &mut content, &mut first_letter_styles);
+            profile!("prepare.first_letter", first_letter_style_overrides(document, styles, tree, &content));
+        if !content.characters().is_empty() {
+            profile!("prepare.text_transform", transform_text(styles, tree, &mut content, &mut first_letter_styles));
         }
+        profile!("prepare.unicode_line_breaks", super::line_breaks::resolve(styles, tree, &mut content, &unicode_roots));
         Self {
-            content: Arc::new(content),
-            first_letter_styles: FirstLetterStyles::new(&first_letter_styles),
+            content,
+            first_letter_styles: profile!("prepare.compact_first_letter", FirstLetterStyles::new(&first_letter_styles)),
         }
     }
 

@@ -489,7 +489,7 @@ pub(crate) fn layout_block_children(
         // height. Do not let the static trailing-margin analysis expose it a
         // second time to the parent.
         let own_after =
-            MarginStrut::from_margin(parent_style.margin_bottom().resolve(parent_cb_width));
+            MarginStrut::from_margin(engine.reader.vertical_margins(parent_idx, parent_cb_width).1);
         engine.margins.record_used_after_margin(
             parent_idx,
             parent_cb_width,

@@ -1,6 +1,7 @@
 //! Renderer-neutral shaping contracts and validated font metrics.
 
 use super::*;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Backend-owned immutable shaped-line identifier. It is only meaningful for
 /// the `GlyphShaper` instance that produced it.
@@ -81,6 +82,17 @@ impl ShapedTextRun {
         &self.cluster_boundaries
     }
 
+    pub(super) fn preserve_graphemes(&mut self, text: &str) {
+        profile_scope!("shape.preserve_graphemes");
+        if text.is_ascii() && !text.as_bytes().contains(&b'\r') { return; }
+        let graphemes = super::bidi::grapheme_boundaries(text, self.advances.len());
+        if self.cluster_boundaries.iter().zip(graphemes.iter()).any(|(&native, &grapheme)| native && !grapheme) {
+            for (native, &grapheme) in Arc::make_mut(&mut self.cluster_boundaries).iter_mut().zip(graphemes.iter()) {
+                *native &= grapheme;
+            }
+        }
+    }
+
     pub fn backend_run(&self) -> Option<TextRunId> {
         self.backend_run
     }
@@ -136,6 +148,8 @@ impl<'a> TextRunShapeRequest<'a> {
 #[derive(Clone, Debug)]
 pub(crate) struct ShapedTextGeometry {
     len: usize,
+    pub(crate) bidi: ResolvedBidi,
+    pub(super) mirrored_glyphs: FxHashMap<u32, GlyphId>,
     ranges: Vec<TextGeometryRange>,
     pub(super) authoritative_runs: Vec<AuthoritativeShapedRun>,
 }
@@ -151,6 +165,7 @@ struct TextGeometryRange {
 #[derive(Clone, Debug)]
 pub(crate) struct AuthoritativeShapedRun {
     pub(crate) source_range: Range<u32>,
+    pub(crate) run_offset: u32,
     pub(crate) backend_run: TextRunId,
     pub(crate) caret_stops: Arc<[f32]>,
     pub(crate) ascent: f32,
@@ -158,9 +173,11 @@ pub(crate) struct AuthoritativeShapedRun {
 }
 
 impl ShapedTextGeometry {
-    pub(super) fn with_len(len: usize) -> Self {
+    pub(crate) fn with_len(len: usize) -> Self {
         Self {
             len,
+            bidi: ResolvedBidi::default(),
+            mirrored_glyphs: FxHashMap::default(),
             ranges: Vec::new(),
             authoritative_runs: Vec::new(),
         }
@@ -175,6 +192,15 @@ impl ShapedTextGeometry {
             .filter(|run| index < run.source.end as usize)
     }
 
+    pub(super) fn has_character_geometry(&self, index: usize) -> bool {
+        self.range_at(index).is_some()
+    }
+
+    pub(super) fn next_geometry_range(&self, index: u32) -> Option<Range<u32>> {
+        let position = self.ranges.partition_point(|run| run.source.end <= index);
+        self.ranges.get(position).map(|run| run.source.clone())
+    }
+
     pub(crate) fn advance(&self, character_index: usize) -> Option<f32> {
         if character_index >= self.len {
             return None;
@@ -184,6 +210,11 @@ impl ShapedTextGeometry {
         }))
     }
 
+    pub(crate) fn paint_glyph(&self, index: u32, fallback: GlyphId) -> GlyphId {
+        self.mirrored_glyphs.get(&index).copied().unwrap_or(fallback)
+    }
+
+    #[cfg(test)]
     #[inline]
     pub(crate) fn is_cluster_boundary(&self, character_boundary: usize) -> bool {
         let mut hint = 0;
@@ -225,6 +256,22 @@ impl ShapedTextGeometry {
     }
 
     #[inline]
+    pub(crate) fn character_geometry_with_hint(&self, index: usize, hint: &mut usize) -> (Option<f32>, bool) {
+        if index >= self.len {
+            return (None, self.boundary_with_hint(index, hint));
+        }
+        let Some(run) = self.range_with_hint(index, hint) else {
+            return (Some(0.0), true);
+        };
+        let offset = run.offset + index - run.source.start as usize;
+        (
+            Some(run.geometry.advances[offset]),
+            (index == run.source.start as usize && !run.apply_start_boundary)
+                || run.geometry.cluster_boundaries[offset],
+        )
+    }
+
+    #[inline]
     pub(crate) fn boundary_with_hint(&self, index: usize, hint: &mut usize) -> bool {
         // A whole run ends on a validated cluster boundary. At the end of a
         // discontiguous source slice, no boundary was contributed by that
@@ -257,6 +304,47 @@ impl ShapedTextGeometry {
 
     pub(super) fn finish_runs(&mut self) {
         self.ranges.sort_by_key(|run| run.source.start);
+        self.authoritative_runs.sort_by_key(|run| run.source_range.start);
+    }
+
+    pub(super) fn retain_native_run(&mut self, indices: &[u32], geometry: &ShapedTextRun, placement_required: bool) {
+        profile_scope!("shape.native_run_registration");
+        let (Some(backend_run), Some(caret_stops)) = (geometry.backend_run(), geometry.shared_caret_stops()) else { return };
+        let mut start = 0;
+        while start < indices.len() {
+            let mut end = start + 1;
+            while end < indices.len() && indices[end] == indices[end - 1] + 1 { end += 1; }
+            self.authoritative_runs.push(AuthoritativeShapedRun {
+                source_range: indices[start]..indices[end - 1] + 1,
+                run_offset: start as u32,
+                backend_run,
+                caret_stops: caret_stops.clone(),
+                ascent: geometry.ascent(),
+                placement_required,
+            });
+            start = end;
+        }
+    }
+
+    pub(super) fn remove_native_range(&mut self, range: Range<u32>) {
+        let mut retained = Vec::with_capacity(self.authoritative_runs.len() + 1);
+        for old in self.authoritative_runs.drain(..) {
+            if old.source_range.end <= range.start || old.source_range.start >= range.end {
+                retained.push(old);
+                continue;
+            }
+            if old.source_range.start < range.start {
+                retained.push(AuthoritativeShapedRun { source_range: old.source_range.start..range.start, ..old.clone() });
+            }
+            if old.source_range.end > range.end {
+                retained.push(AuthoritativeShapedRun {
+                    run_offset: old.run_offset + range.end - old.source_range.start,
+                    source_range: range.end..old.source_range.end,
+                    ..old
+                });
+            }
+        }
+        self.authoritative_runs = retained;
     }
 
     pub(super) fn replace_range(&mut self, range: Range<u32>, geometry: ShapedTextRun) {
@@ -289,9 +377,15 @@ impl ShapedTextGeometry {
         });
         ranges.sort_by_key(|run| run.source.start);
         self.ranges = ranges;
+        self.authoritative_runs.sort_by_key(|run| run.source_range.start);
     }
 
+    #[cfg(test)]
     pub(crate) fn memory_usage_bytes(&self) -> usize {
+        self.memory_usage_bytes_with_shared(&mut FxHashSet::default())
+    }
+
+    pub(crate) fn memory_usage_bytes_with_shared(&self, seen: &mut FxHashSet<*const ()>) -> usize {
         use std::mem::{size_of, size_of_val};
 
         fn allocation_bytes<T>(values: &Arc<[T]>, seen: &mut FxHashSet<*const ()>) -> usize {
@@ -304,23 +398,24 @@ impl ShapedTextGeometry {
 
         // Discontiguous source spans and first-line replacements retain slices
         // of the same run. Caret arrays can also be held by authoritative runs.
-        let mut seen = FxHashSet::default();
         self.ranges.capacity() * size_of::<TextGeometryRange>()
+            + self.bidi.memory_usage_bytes()
+            + self.mirrored_glyphs.capacity() * size_of::<(u32, GlyphId)>()
             + self.authoritative_runs.capacity() * size_of::<AuthoritativeShapedRun>()
             + self
                 .ranges
                 .iter()
                 .map(|run| {
-                    allocation_bytes(&run.geometry.advances, &mut seen)
-                        + allocation_bytes(&run.geometry.cluster_boundaries, &mut seen)
+                    allocation_bytes(&run.geometry.advances, seen)
+                        + allocation_bytes(&run.geometry.cluster_boundaries, seen)
                         + run.geometry.caret_stops.as_ref()
-                            .map_or(0, |stops| allocation_bytes(stops, &mut seen))
+                            .map_or(0, |stops| allocation_bytes(stops, seen))
                 })
                 .sum::<usize>()
             + self
                 .authoritative_runs
                 .iter()
-                .map(|run| allocation_bytes(&run.caret_stops, &mut seen))
+                .map(|run| allocation_bytes(&run.caret_stops, seen))
                 .sum::<usize>()
     }
 
@@ -406,6 +501,7 @@ pub struct FontMetricsRequest<'a> {
     font_weight: u16,
     font_slant: FontSlant,
     font_family: Option<&'a str>,
+    language: Option<&'a ContentLanguage>,
 }
 
 impl<'a> FontMetricsRequest<'a> {
@@ -420,7 +516,18 @@ impl<'a> FontMetricsRequest<'a> {
             font_weight,
             font_slant,
             font_family,
+            language: None,
         })
+    }
+
+    /// Content language used when selecting the face whose metrics are measured.
+    pub fn with_language(mut self, language: Option<&'a ContentLanguage>) -> Self {
+        self.language = language;
+        self
+    }
+
+    pub fn language(self) -> Option<&'a ContentLanguage> {
+        self.language
     }
 
     pub fn font_size(self) -> f32 {
@@ -718,11 +825,14 @@ impl From<FontStyle> for FontSlant {
 #[derive(Clone, Debug)]
 pub struct TextStyleSpan<'a> {
     byte_range: Range<usize>,
+    direction: TextDirection,
     font_size: f32,
     font_weight: u16,
     font_slant: FontSlant,
     color: u32,
     font_family: Option<&'a str>,
+    cjk_font_family: Option<&'a str>,
+    language: Option<&'a ContentLanguage>,
     font_features: Arc<[OpenTypeFeature]>,
 }
 
@@ -743,11 +853,14 @@ impl<'a> TextStyleSpan<'a> {
         }
         Some(Self {
             byte_range,
+            direction: TextDirection::Ltr,
             font_size,
             font_weight,
             font_slant,
             color,
             font_family,
+            cjk_font_family: None,
+            language: None,
             font_features: Arc::from([]),
         })
     }
@@ -755,6 +868,26 @@ impl<'a> TextStyleSpan<'a> {
     pub fn with_font_features(mut self, font_features: Vec<OpenTypeFeature>) -> Self {
         self.font_features = font_features.into();
         self
+    }
+
+    /// Inherited BCP 47 content language, for font selection and localized glyphs.
+    pub fn with_language(mut self, language: Option<&'a ContentLanguage>) -> Self {
+        self.language = language;
+        self
+    }
+
+    pub fn language(&self) -> Option<&'a ContentLanguage> {
+        self.language
+    }
+
+    /// Resolved direction of this shaping run, after paragraph bidi analysis.
+    pub fn with_direction(mut self, direction: TextDirection) -> Self {
+        self.direction = direction;
+        self
+    }
+
+    pub fn direction(&self) -> TextDirection {
+        self.direction
     }
 
     pub fn byte_range(&self) -> Range<usize> {
@@ -779,6 +912,19 @@ impl<'a> TextStyleSpan<'a> {
 
     pub fn font_family(&self) -> Option<&'a str> {
         self.font_family
+    }
+
+    pub fn with_cjk_font_family(mut self, family: Option<&'a str>) -> Self {
+        self.cjk_font_family = family;
+        self
+    }
+
+    pub fn cjk_font_family(&self) -> Option<&'a str> {
+        self.cjk_font_family
+    }
+
+    pub fn font_family_for_character(&self, character: char) -> Option<&'a str> {
+        self.cjk_font_family.filter(|_| html_style_model::is_cjk_character(character)).or(self.font_family)
     }
 
     pub fn font_features(&self) -> &[OpenTypeFeature] {
@@ -965,6 +1111,7 @@ enum ShapeErrorKind {
     FirstLineRefinementDidNotConverge,
     AppendTransactionUnsupported,
     ResourceGenerationMismatch,
+    DocumentIsShared,
 }
 
 impl ShapeError {
@@ -1007,6 +1154,8 @@ impl ShapeError {
         }
     }
 
+    pub(crate) fn document_is_shared() -> Self { Self { kind: ShapeErrorKind::DocumentIsShared } }
+
     fn run_length_mismatch(characters: usize, advances: usize) -> Self {
         Self {
             kind: ShapeErrorKind::RunLengthMismatch {
@@ -1024,7 +1173,8 @@ impl ShapeError {
             | ShapeErrorKind::RegistryCapacityExhausted { .. }
             | ShapeErrorKind::FirstLineRefinementDidNotConverge
             | ShapeErrorKind::AppendTransactionUnsupported
-            | ShapeErrorKind::ResourceGenerationMismatch => None,
+            | ShapeErrorKind::ResourceGenerationMismatch
+            | ShapeErrorKind::DocumentIsShared => None,
         }
     }
 
@@ -1036,7 +1186,8 @@ impl ShapeError {
             | ShapeErrorKind::RejectedMetric { .. }
             | ShapeErrorKind::FirstLineRefinementDidNotConverge
             | ShapeErrorKind::AppendTransactionUnsupported
-            | ShapeErrorKind::ResourceGenerationMismatch => None,
+            | ShapeErrorKind::ResourceGenerationMismatch
+            | ShapeErrorKind::DocumentIsShared => None,
         }
     }
 
@@ -1048,7 +1199,8 @@ impl ShapeError {
             | ShapeErrorKind::RegistryCapacityExhausted { .. } => None,
             ShapeErrorKind::FirstLineRefinementDidNotConverge
             | ShapeErrorKind::AppendTransactionUnsupported
-            | ShapeErrorKind::ResourceGenerationMismatch => None,
+            | ShapeErrorKind::ResourceGenerationMismatch
+            | ShapeErrorKind::DocumentIsShared => None,
         }
     }
 }
@@ -1089,6 +1241,7 @@ impl fmt::Display for ShapeError {
             ShapeErrorKind::AppendTransactionUnsupported => {
                 formatter.write_str("glyph shaper does not support append rollback")
             }
+            ShapeErrorKind::DocumentIsShared => formatter.write_str("repreparation requires the document's sole owner; release other stage handles first"),
             ShapeErrorKind::ResourceGenerationMismatch => {
                 formatter.write_str("glyph shaper resources do not belong to this document")
             }
@@ -1106,22 +1259,23 @@ pub struct GlyphResourceStore {
     generation: GlyphResourceGeneration,
 }
 
-#[derive(Clone, Debug)]
-pub struct GlyphResourceGeneration(Arc<()>);
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GlyphResourceGeneration(u64);
 
-impl PartialEq for GlyphResourceGeneration {
-    fn eq(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+static NEXT_GLYPH_RESOURCE_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+impl GlyphResourceGeneration {
+    fn new() -> Self {
+        Self(NEXT_GLYPH_RESOURCE_GENERATION.try_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_add(1))
+            .expect("glyph-resource generation space exhausted"))
     }
 }
-
-impl Eq for GlyphResourceGeneration {}
 
 impl Default for GlyphResourceStore {
     fn default() -> Self {
         Self {
             metrics: GlyphMetrics::default(),
-            generation: GlyphResourceGeneration(Arc::new(())),
+            generation: GlyphResourceGeneration::new(),
         }
     }
 }
@@ -1132,7 +1286,7 @@ impl GlyphResourceStore {
     }
 
     pub fn generation(&self) -> GlyphResourceGeneration {
-        self.generation.clone()
+        self.generation
     }
 
     pub fn register(&mut self, metric: GlyphMetric) -> Result<GlyphId, ShapeError> {
@@ -1270,7 +1424,7 @@ pub trait GlyphShaper {
                 style.font_weight(),
                 style.font_slant(),
                 style.color(),
-                style.font_family(),
+                style.font_family_for_character(character),
             )?;
         }
         self.shape_text_run(request)

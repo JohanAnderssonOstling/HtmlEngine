@@ -402,6 +402,7 @@ fn resolve_box_model(
     style: UsedStyleView<'_>,
 ) -> ResolvedBoxModel {
     let mut box_model = ResolvedBoxModel::new(style, request.available_width);
+    (box_model.margin_top, box_model.margin_bottom) = engine.reader.vertical_margins(request.box_idx, request.available_width);
     let collapsed_table = (engine.reader.is_table_box(request.box_idx)
         || matches!(
             style.display(),

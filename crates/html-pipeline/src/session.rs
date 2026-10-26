@@ -5,11 +5,11 @@ use std::sync::{Arc, Mutex};
 use html_dom::RootFontSize;
 use html_layout::{
     GlyphResourceGeneration, GlyphShaper as LayoutGlyphShaper, LaidOutDocument,
-    LayoutConstraints as LayoutConstraintsOutput, PreparedDocument, ShapedDocument,
+    LayoutConstraints as LayoutConstraintsOutput, PreparedDocument,
 };
 use html_parse::{MarkupSyntax, ParsedHtml, parse_document};
 use html_resources::ResourceProvider;
-use html_style::{MediaMatchKey, MediaQuerySet};
+use html_style::{FontFace, MediaMatchKey, MediaQuerySet};
 
 use crate::parser::DocumentFactory;
 use crate::types::{
@@ -23,12 +23,17 @@ use crate::{
 #[derive(Default)]
 pub struct PipelineCacheState {
     pub inputs: Option<PipelineInputs>,
-    pub parsed: Option<CacheEntry<ParsedCacheKey, Arc<ParsedHtml>>>,
-    pub prepared: Option<CacheEntry<PreparedCacheKey, PreparedDocument>>,
-    unpainted_prepared: Option<PreparedDocument>,
+    /// Parse validity and source encoding; the syntax tree is consumed into the DOM.
+    pub parsed: Option<CacheEntry<ParsedCacheKey, Option<String>>>,
+    /// Cache metadata; published preparation lives in the document owner.
+    pub prepared: Option<CacheEntry<PreparedCacheKey, ()>>,
+    /// Owned preparation while a worker has not yet attached a glyph backend.
+    pub pending_prepared: Option<PreparedDocument>,
     pub media_queries: Option<MediaQuerySet>,
+    pub font_faces: Arc<[FontFace]>,
     pub media_match_key: Option<MediaMatchKey>,
-    pub shaped: Option<CacheEntry<ShapedCacheKey, ShapedDocument>>,
+    /// Shaping validity only; glyph data has exactly one document owner.
+    pub shaped: Option<CacheEntry<ShapedCacheKey, ()>>,
     pub laid_out: Option<CacheEntry<LayoutCacheKey, LaidOutDocument>>,
 }
 
@@ -103,6 +108,10 @@ impl<S: LayoutGlyphShaper> OwnedActivePipelineSession<S> {
         self.session.layout_note(id, constraints, &mut self.glyph_shaper)
     }
 
+    pub fn font_faces(&self) -> &[FontFace] {
+        self.session.font_faces()
+    }
+
     pub fn document(&self) -> Option<&LaidOutDocument> {
         self.session.document()
     }
@@ -137,6 +146,10 @@ impl<S: LayoutGlyphShaper> ActivePipelineSession<'_, S> {
         self.session.layout_note(id, constraints, self.glyph_shaper)
     }
 
+    pub fn font_faces(&self) -> &[FontFace] {
+        self.session.font_faces()
+    }
+
     pub fn document(&self) -> Option<&LaidOutDocument> {
         self.session.document()
     }
@@ -152,6 +165,14 @@ impl<S: LayoutGlyphShaper> ActivePipelineSession<'_, S> {
 }
 
 impl PipelineSession {
+    /// Active `@font-face` declarations from the last successful preparation
+    /// or update. URLs use the declaring stylesheet's resource-provider base.
+    /// After `prepare_through_style`, hosts can load these faces before calling
+    /// `rehydrate_glyphs`. The engine never reads font bytes.
+    pub fn font_faces(&self) -> &[FontFace] {
+        &self.cache.font_faces
+    }
+
     pub fn into_active<S: LayoutGlyphShaper>(
         mut self,
         mut glyph_shaper: S,
@@ -212,15 +233,17 @@ impl PipelineSession {
         let parsed_key = prepared_key.parsed.clone();
         let parsed = self.parse(&requested_inputs.source, requested_inputs.markup_syntax)?;
         let user_styles = requested_inputs.user_styles.iter().map(String::as_str).collect::<Vec<_>>();
-        let (prepared, media_queries) = self.factory.build_pipeline_from_parsed_with_media_queries(&parsed, &user_styles);
+        let encoding = parsed.source_encoding().map(str::to_owned);
+        let (prepared, media_queries) = self.factory.build_pipeline_from_owned_parsed(parsed, &user_styles);
         let unpainted_prepared = prepared;
         let prepared = unpainted_prepared.with_reader_paint_overrides(&requested_inputs.reader_overrides).map_err(|error| PipelineError(error.to_string()))?;
         let media_match_key = media_queries.match_key(requested_inputs.style_environment.media, f64::from(requested_inputs.style_environment.root_font_size));
 
+        self.cache.font_faces = Arc::from(self.factory.font_faces());
         self.cache.inputs = Some(requested_inputs);
-        self.cache.parsed = Some(CacheEntry { key: parsed_key, value: parsed });
-        self.cache.unpainted_prepared = Some(unpainted_prepared);
-        self.cache.prepared = Some(CacheEntry { key: prepared_key, value: prepared });
+        self.cache.parsed = Some(CacheEntry { key: parsed_key, value: encoding });
+        self.cache.prepared = Some(CacheEntry { key: prepared_key, value: () });
+        self.cache.pending_prepared = Some(prepared);
         self.cache.media_queries = Some(media_queries);
         self.cache.media_match_key = Some(media_match_key);
         self.cache.shaped = None;
@@ -271,29 +294,17 @@ impl PipelineSession {
                     && self.active_resource_generation.as_ref() == Some(&glyph_shaper.glyph_resources().generation())
             });
         if can_repaint {
-            if let Some(base) = &self.cache.unpainted_prepared {
-                let prepared = base.with_reader_paint_overrides(&requested_inputs.reader_overrides).map_err(|error| PipelineError(error.to_string()))?;
-                let layout = &mut self.cache.laid_out.as_mut().expect("paint update has layout").value;
-                let stage = if layout.repaint_from(&prepared) {
-                    EarliestStage::Paint
-                } else {
-                    layout.relayout_with_paint_from(&prepared, glyph_shaper)
-                        .map_err(|error| PipelineError(error.to_string()))?;
-                    EarliestStage::Layout
-                };
-                self.cache.prepared = Some(CacheEntry { key: prepared_key, value: prepared.clone() });
-                let shaped = self.cache.shaped.as_mut().expect("paint update has retained shaping");
-                shaped.key = shaped_key;
-                shaped.value = shaped.value.with_paint_from(&prepared);
-                self.cache.laid_out.as_mut().expect("paint update has layout").key = layout_key;
-                self.cache.inputs = Some(requested_inputs);
-                let reused = Reuse::reused(stage);
-                return Ok(PipelineUpdate {
-                    stage, anchors_preserved: true,
-                    report: ReuseReport { parsed: reused, styled: reused, prepared: reused, shaped: reused,
-                        laid_out: if stage == EarliestStage::Paint { reused } else { Reuse::recomputed(stage) } },
-                });
-            }
+            self.cache.laid_out.as_mut().expect("paint update has layout").value
+                .repaint_with_reader_overrides(&requested_inputs.reader_overrides)
+                .map_err(|error| PipelineError(error.to_string()))?;
+            self.cache.prepared = Some(CacheEntry { key: prepared_key, value: () });
+            self.cache.shaped = Some(CacheEntry { key: shaped_key, value: () });
+            self.cache.laid_out.as_mut().expect("paint update has layout").key = layout_key;
+            self.cache.inputs = Some(requested_inputs);
+            let stage = EarliestStage::Paint;
+            let reused = Reuse::reused(stage);
+            return Ok(PipelineUpdate { stage, anchors_preserved: true,
+                report: ReuseReport { parsed: reused, styled: reused, prepared: reused, shaped: reused, laid_out: reused } });
         }
         let stage = self.earliest_uncached_stage(
             &parsed_key,
@@ -306,116 +317,81 @@ impl PipelineSession {
                 == Some(&glyph_shaper.glyph_resources().generation()),
         );
 
+        if stage <= EarliestStage::Prepare && self.cache.parsed_matches(&parsed_key)
+            && self.cache.inputs.as_ref().is_some_and(|previous| previous.same_source(&requested_inputs))
+        {
+            return self.restyle_cached(requested_inputs, constraints, stage, glyph_shaper);
+        }
+
         let report = if stage <= EarliestStage::Layout {
             let parsed_reused = stage != EarliestStage::Parse;
-            let parsed = if parsed_reused {
-                self.cache
-                    .parsed
-                    .as_ref()
-                    .expect("matching parsed entry")
-                    .value
-                    .clone()
-            } else {
-                self.parse(&requested_inputs.source, requested_inputs.markup_syntax)?
-            };
-
             let prepared_reused = stage > EarliestStage::Prepare;
-            let (prepared, media_queries, unpainted_prepared) = if prepared_reused {
-                let prepared = if color_preferences_changed {
-                    self.cache.unpainted_prepared.as_ref().expect("prepared geometry has publication inputs").with_reader_paint_overrides(&requested_inputs.reader_overrides).map_err(|error| PipelineError(error.to_string()))?
-                } else {
-                    self.cache.prepared.as_ref().expect("matching prepared entry").value.clone()
-                };
-                (prepared, None, None)
-            } else {
-                let user_styles = requested_inputs.user_styles.iter().map(String::as_str).collect::<Vec<_>>();
-                let (prepared, queries) = self.factory.build_pipeline_from_parsed_with_media_queries(&parsed, &user_styles);
-                let unpainted = prepared;
-                let prepared = unpainted.with_reader_paint_overrides(&requested_inputs.reader_overrides).map_err(|error| PipelineError(error.to_string()))?;
-                (prepared, Some(queries), Some(unpainted))
-            };
-
             let shaped_reused = stage == EarliestStage::Layout;
-            let (shaped, laid_out) = if shaped_reused {
-                let shaped = self
-                    .cache
-                    .shaped
-                    .as_ref()
-                    .expect("matching shaped entry")
-                    .value
-                    .with_paint_from(&prepared);
-                let laid_out = if let Some(entry) = self.cache.laid_out.take() {
-                    let mut candidate = entry.value;
-                    if let Err(error) = candidate.relayout_from(
-                        &prepared, constraints,
-                        &requested_inputs.image_metrics,
-                        glyph_shaper,
-                    ) {
-                        self.cache.laid_out = Some(CacheEntry {
-                            key: entry.key,
-                            value: candidate,
-                        });
-                        return Err(PipelineError(error.to_string()));
-                    }
-                    candidate
+            let mut queries = None;
+            if shaped_reused {
+                let layout = &mut self.cache.laid_out.as_mut().expect("matching layout owner").value;
+                let result = if color_preferences_changed {
+                    layout.update_with_reader_overrides(&requested_inputs.reader_overrides, constraints,
+                        &requested_inputs.image_metrics, false, glyph_shaper)
                 } else {
-                    shaped
-                        .clone()
-                        .layout_with_metrics_and_shaper(
-                            constraints,
-                            &requested_inputs.image_metrics,
-                            glyph_shaper,
-                        )
-                        .map_err(|error| PipelineError(error.to_string()))?
+                    layout.relayout_with_metrics_and_shaper(constraints, &requested_inputs.image_metrics, glyph_shaper)
                 };
-                (shaped, laid_out)
-            } else {
-                self.shape_and_layout(
-                    &prepared,
-                    constraints,
-                    &requested_inputs.image_metrics,
-                    glyph_shaper,
-                )?
-            };
-
-            if let Some(unpainted) = unpainted_prepared {
-                self.cache.unpainted_prepared = Some(unpainted);
-            }
-            self.cache.parsed = Some(CacheEntry { key: parsed_key.clone(), value: parsed });
-            self.cache.prepared = Some(CacheEntry { key: prepared_key.clone(), value: prepared });
-            self.cache.shaped = Some(CacheEntry { key: shaped_key.clone(), value: shaped });
-            self.cache.laid_out = Some(CacheEntry { key: layout_key.clone(), value: laid_out });
-            self.active_resource_generation = Some(glyph_shaper.glyph_resources().generation());
-            if let Some(queries) = media_queries {
-                self.cache.media_queries = Some(queries);
-            }
-
-            let reuse = |reused| {
-                if reused {
-                    Reuse::reused(stage)
+                result.map_err(|error| PipelineError(error.to_string()))?;
+            } else if prepared_reused && self.cache.pending_prepared.is_none() {
+                let layout = &mut self.cache.laid_out.as_mut().expect("prepared owner remains published").value;
+                let result = if color_preferences_changed {
+                    layout.update_with_reader_overrides(&requested_inputs.reader_overrides, constraints,
+                        &requested_inputs.image_metrics, true, glyph_shaper)
                 } else {
-                    Reuse::recomputed(stage)
+                    layout.reshape_and_layout_with_metrics_and_shaper(constraints, &requested_inputs.image_metrics, glyph_shaper)
+                };
+                result.map_err(|error| PipelineError(error.to_string()))?;
+            } else {
+                let (prepared, encoding) = if prepared_reused {
+                    (self.cache.pending_prepared.take().expect("prepared worker result"), None)
+                } else {
+                    let parsed = self.parse(&requested_inputs.source, requested_inputs.markup_syntax)?;
+                    let encoding = parsed.source_encoding().map(str::to_owned);
+                    let user_styles = requested_inputs.user_styles.iter().map(String::as_str).collect::<Vec<_>>();
+                    let (prepared, media) = self.factory.build_pipeline_from_owned_parsed(parsed, &user_styles);
+                    queries = Some(media);
+                    let prepared = prepared.with_reader_paint_overrides(&requested_inputs.reader_overrides)
+                        .map_err(|error| PipelineError(error.to_string()))?;
+                    (prepared, encoding)
+                };
+                let painted = if prepared_reused && color_preferences_changed {
+                    Some(prepared.with_reader_paint_overrides(&requested_inputs.reader_overrides)
+                        .map_err(|error| PipelineError(error.to_string()))?)
+                } else { None };
+                let result = Self::shape_and_layout(painted.as_ref().unwrap_or(&prepared), constraints, &requested_inputs.image_metrics, glyph_shaper);
+                drop(painted);
+                let laid_out = match result {
+                    Ok(document) => document,
+                    Err(error) => {
+                        if prepared_reused { self.cache.pending_prepared = Some(prepared); }
+                        return Err(error);
+                    }
+                };
+                // Move publication ownership to the laid-out document. The
+                // prepared-stage cache retains only its validity key.
+                drop(prepared);
+                self.cache.laid_out = Some(CacheEntry { key: layout_key.clone(), value: laid_out });
+                if !parsed_reused {
+                    self.cache.parsed = Some(CacheEntry { key: parsed_key.clone(), value: encoding });
+                    self.cache.font_faces = Arc::from(self.factory.font_faces());
                 }
-            };
-            ReuseReport {
-                parsed: reuse(parsed_reused),
-                styled: reuse(prepared_reused),
-                prepared: reuse(prepared_reused),
-                shaped: reuse(shaped_reused),
-                laid_out: reuse(false),
             }
+            self.cache.prepared = Some(CacheEntry { key: prepared_key.clone(), value: () });
+            self.cache.shaped = Some(CacheEntry { key: shaped_key.clone(), value: () });
+            self.cache.laid_out.as_mut().expect("published document owner").key = layout_key.clone();
+            self.active_resource_generation = Some(glyph_shaper.glyph_resources().generation());
+            if let Some(media) = queries { self.cache.media_queries = Some(media); }
+            let reuse = |reused| if reused { Reuse::reused(stage) } else { Reuse::recomputed(stage) };
+            ReuseReport { parsed: reuse(parsed_reused), styled: reuse(prepared_reused), prepared: reuse(prepared_reused),
+                shaped: reuse(shaped_reused), laid_out: reuse(false) }
         } else {
-            if stage == EarliestStage::Paint {
-                debug_assert!(self.cache.laid_out_matches(&render_only_key.layout));
-            }
             let reused = Reuse::reused(stage);
-            ReuseReport {
-                parsed: reused,
-                styled: reused,
-                prepared: reused,
-                shaped: reused,
-                laid_out: reused,
-            }
+            ReuseReport { parsed: reused, styled: reused, prepared: reused, shaped: reused, laid_out: reused }
         };
 
         self.cache.media_match_key = self.cache.media_queries.as_ref().map(|queries| {
@@ -431,6 +407,104 @@ impl PipelineSession {
             report,
             anchors_preserved: stage >= EarliestStage::Layout,
         })
+    }
+
+    fn restyle_cached(
+        &mut self,
+        inputs: PipelineInputs,
+        constraints: LayoutConstraintsOutput,
+        stage: EarliestStage,
+        shaper: &mut impl LayoutGlyphShaper,
+    ) -> Result<PipelineUpdate, PipelineError> {
+        let encoding = self
+            .cache
+            .parsed
+            .as_ref()
+            .and_then(|entry| entry.value.as_deref());
+        let css: Vec<_> = inputs.user_styles.iter().map(String::as_str).collect();
+        let mut queries = None;
+        let factory = &mut self.factory;
+        let resolve = |document: &html_dom::Document| {
+            let (styles, media) = factory.resolve_canonical_dom(document, encoding, &css);
+            queries = Some(media);
+            styles
+        };
+        let root_font = to_root_font_size(inputs.style_environment.root_font_size);
+        let result = if let Some(prepared) = &mut self.cache.pending_prepared {
+            prepared
+                .reprepare_and_layout(
+                    root_font,
+                    inputs.note_flow,
+                    &inputs.reader_overrides,
+                    resolve,
+                    constraints,
+                    &inputs.image_metrics,
+                    shaper,
+                )
+                .map(Some)
+        } else {
+            self.cache
+                .laid_out
+                .as_mut()
+                .expect("cached DOM has document owner")
+                .value
+                .reprepare_and_layout(
+                    root_font,
+                    inputs.note_flow,
+                    &inputs.reader_overrides,
+                    resolve,
+                    constraints,
+                    &inputs.image_metrics,
+                    shaper,
+                )
+                .map(|()| None)
+        };
+        match result {
+            Ok(layout) => {
+                if let Some(layout) = layout {
+                    self.cache.laid_out = Some(CacheEntry {
+                        key: inputs.layout_cache_key(),
+                        value: layout,
+                    });
+                }
+                self.cache.pending_prepared = None;
+                self.cache.prepared = Some(CacheEntry {
+                    key: inputs.prepared_cache_key(),
+                    value: (),
+                });
+                self.cache.shaped = Some(CacheEntry {
+                    key: inputs.shaped_cache_key(),
+                    value: (),
+                });
+                self.cache
+                    .laid_out
+                    .as_mut()
+                    .expect("restyle publishes document")
+                    .key = inputs.layout_cache_key();
+                self.active_resource_generation = Some(shaper.glyph_resources().generation());
+                self.cache.font_faces = Arc::from(self.factory.font_faces());
+                self.cache.media_queries = queries;
+                self.cache.media_match_key = self.cache.media_queries.as_ref().map(|queries| {
+                    queries.match_key(
+                        inputs.style_environment.media,
+                        f64::from(inputs.style_environment.root_font_size),
+                    )
+                });
+                self.cache.inputs = Some(inputs);
+                Ok(PipelineUpdate {
+                    stage,
+                    anchors_preserved: false,
+                    report: ReuseReport {
+                        parsed: Reuse::reused(stage),
+                        styled: Reuse::recomputed(stage),
+                        prepared: Reuse::recomputed(stage),
+                        shaped: Reuse::recomputed(stage),
+                        laid_out: Reuse::recomputed(stage),
+                    },
+                })
+            }
+            Err(error) => Err(PipelineError(error.to_string())),
+        }
     }
 
     /// Rebuild the shaped and laid-out stages for a cached document.
@@ -453,34 +527,19 @@ impl PipelineSession {
         &mut self,
         glyph_shaper: &mut impl LayoutGlyphShaper,
     ) -> Result<(), PipelineError> {
-        let inputs = self.cache.inputs.clone().ok_or_else(|| {
-            PipelineError("cannot rehydrate an empty pipeline session".to_owned())
-        })?;
-        let prepared = self
-            .cache
-            .prepared
-            .as_ref()
-            .map(|entry| entry.value.clone())
-            .ok_or_else(|| {
-                PipelineError(
-                    "cannot rehydrate a pipeline session without a prepared document".to_owned(),
-                )
-            })?;
-        let (shaped, laid_out) = self.shape_and_layout(
-            &prepared,
-            to_layout_constraints(inputs.layout)?,
-            &inputs.image_metrics,
-            glyph_shaper,
-        )?;
-
-        self.cache.shaped = Some(CacheEntry {
-            key: inputs.shaped_cache_key(),
-            value: shaped,
-        });
-        self.cache.laid_out = Some(CacheEntry {
-            key: inputs.layout_cache_key(),
-            value: laid_out,
-        });
+        let inputs = self.cache.inputs.as_ref().ok_or_else(|| PipelineError("cannot rehydrate an empty pipeline session".to_owned()))?;
+        let constraints = to_layout_constraints(inputs.layout)?;
+        if let Some(prepared) = self.cache.pending_prepared.as_ref() {
+            let laid_out = Self::shape_and_layout(prepared, constraints, &inputs.image_metrics, glyph_shaper)?;
+            self.cache.pending_prepared = None;
+            self.cache.laid_out = Some(CacheEntry { key: inputs.layout_cache_key(), value: laid_out });
+        } else {
+            self.cache.laid_out.as_mut().ok_or_else(|| PipelineError("cannot rehydrate a pipeline session without preparation".to_owned()))?.value
+                .reshape_and_layout_with_metrics_and_shaper(constraints, &inputs.image_metrics, glyph_shaper)
+                .map_err(|error| PipelineError(error.to_string()))?;
+            self.cache.laid_out.as_mut().expect("rehydrated document owner").key = inputs.layout_cache_key();
+        }
+        self.cache.shaped = Some(CacheEntry { key: inputs.shaped_cache_key(), value: () });
         self.active_resource_generation = Some(glyph_shaper.glyph_resources().generation());
         Ok(())
     }
@@ -528,9 +587,8 @@ impl PipelineSession {
         &mut self,
         source: &str,
         syntax: MarkupSyntax,
-    ) -> Result<Arc<ParsedHtml>, PipelineError> {
+    ) -> Result<ParsedHtml, PipelineError> {
         parse_document(source, syntax)
-            .map(Arc::new)
             .map_err(|error| PipelineError(error.to_string()))
     }
 
@@ -578,12 +636,11 @@ impl PipelineSession {
     }
 
     fn shape_and_layout(
-        &self,
         prepared: &PreparedDocument,
         constraints: LayoutConstraintsOutput,
         image_metrics: &html_layout::ImageMetrics,
         glyph_shaper: &mut impl LayoutGlyphShaper,
-    ) -> Result<(ShapedDocument, LaidOutDocument), PipelineError> {
+    ) -> Result<LaidOutDocument, PipelineError> {
         prepared
             .shape_and_layout_with_metrics_and_shaper(
                 constraints,
@@ -634,12 +691,12 @@ impl PipelineSession {
         {
             return None;
         }
-        let scoped = self.cache.prepared.as_ref()?.value.scoped_to_element_id(id)?;
+        let scoped = self.cache.laid_out.as_ref()?.value.scoped_to_element_id(id)?;
         // Appended to the page's renderer resources rather than shaped as a
         // document of its own: a note's glyphs have to coexist with the page's,
         // which are still referenced by what is on screen. Every note appends,
         // so the seed is whatever the last one left behind.
-        let (_, laid_out) = scoped
+        let laid_out = scoped
             .shape_and_layout_into_active_resources(
                 constraints,
                 &inputs.image_metrics,
@@ -652,11 +709,8 @@ impl PipelineSession {
     /// Ids of the note bodies in the current document, in document order.
     /// Empty before the first successful update.
     pub fn note_ids(&self) -> Vec<&str> {
-        self.cache
-            .prepared
-            .as_ref()
-            .map(|entry| entry.value.note_ids())
-            .unwrap_or_default()
+        if let Some(prepared) = &self.cache.pending_prepared { prepared.note_ids() }
+        else { self.document().map(LaidOutDocument::note_ids).unwrap_or_default() }
     }
 
     /// The last successfully published geometry. Backend invalidation does
@@ -740,6 +794,10 @@ impl ResourceProvider for RevisionCachedResourceProvider {
         self.inner.metadata(uri)
     }
 
+    fn primary_language(&self) -> Option<String> {
+        self.inner.primary_language()
+    }
+
     fn exists(&self, uri: &str) -> bool {
         self.inner.exists(uri)
     }
@@ -814,6 +872,7 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct MutableProvider {
+        primary_language: Option<String>,
         resources: Arc<Mutex<HashMap<String, Vec<u8>>>>,
         reads: Arc<Mutex<usize>>,
     }
@@ -839,6 +898,10 @@ mod tests {
                 .get(uri)
                 .cloned()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, uri.to_owned()))
+        }
+
+        fn primary_language(&self) -> Option<String> {
+            self.primary_language.clone()
         }
 
         fn exists(&self, uri: &str) -> bool {
@@ -1135,6 +1198,105 @@ mod tests {
                     .map(|metric| metric.ch())
             })
             .collect()
+    }
+
+    #[test]
+    fn hyphenation_language_fallback_survives_preparation_and_style_rebuilds() {
+        for (publication, markup, expected) in [
+            (None, "", true),
+            (Some("en"), "", true),
+            (Some("zz"), "", false),
+            (Some("zz"), "lang='en'", true),
+            (Some("en"), "lang='zz'", false),
+        ] {
+            let provider = MutableProvider { primary_language: publication.map(str::to_owned), ..Default::default() };
+            let mut session = PipelineSession::new(Arc::new(provider));
+            let mut inputs = base_inputs(&format!("<html {markup}><body style='margin:0;hyphens:auto'><p style='margin:0'>internationalization internationalization</p></body></html>"), SourceRevision::INITIAL);
+            inputs.layout.viewport_width = 8.0;
+            let mut shaper = SizedShaper::default();
+            session.prepare_through_style(inputs.clone()).unwrap();
+            for weight in [0, 100] {
+                inputs.reader_overrides.font_weight_adjustment = weight;
+                session.update(inputs.clone(), &mut shaper).unwrap();
+                let text = session.document().unwrap().render_view().text();
+                assert_eq!((0..text.line_count()).any(|index| text.hyphen_for_line(index).is_some()), expected,
+                    "publication {publication:?}, explicit {markup}, style adjustment {weight}");
+            }
+        }
+    }
+
+    #[test]
+    fn pending_preparation_uses_the_latest_palette_when_published() {
+        let mut session = PipelineSession::new(Arc::new(MockProvider));
+        let mut inputs = base_inputs("<p>Hello</p>", SourceRevision::INITIAL);
+        session.prepare_through_style(inputs.clone()).unwrap();
+        inputs.reader_overrides.foreground = Some(0xeeeeeeff);
+        let mut shaper = SizedShaper::default();
+        let update = session.update(inputs, &mut shaper).unwrap();
+        assert_eq!(update.stage, EarliestStage::Shape);
+        assert!(session.cache.pending_prepared.is_none());
+        let text = session.document().unwrap().render_view().text();
+        assert_eq!(text.paint_color_at(0), Some(0xeeeeeeff));
+    }
+
+    #[test]
+    fn font_faces_are_available_before_shaping_without_reading_font_bytes() {
+        let provider = Arc::new(MutableProvider::default());
+        let mut session = PipelineSession::new(provider.clone());
+        assert!(session.font_faces().is_empty());
+        let inputs = base_inputs(
+            r#"<html><head><style>
+                @font-face { font-family: Reader; src: url(reader.woff2) format(woff2); }
+            </style></head><body><p>Hello</p></body></html>"#,
+            SourceRevision::INITIAL,
+        );
+        session.prepare_through_style(inputs).expect("prepare without shaper");
+        assert_eq!(session.font_faces()[0].family, "Reader");
+        assert_eq!(provider.read_count(), 0, "font bytes belong to the caller");
+        assert!(session.document().is_none());
+        assert!(session.cache.pending_prepared.is_some());
+        let mut shaper = TracingShaper::default();
+        session.rehydrate_glyphs(&mut shaper).expect("shape after host font registration");
+        assert!(session.document().is_some());
+        assert!(session.cache.pending_prepared.is_none(), "published preparation has one owner");
+        assert!(session.cache.prepared.is_some() && session.cache.shaped.is_some(), "stage caches retain validity keys");
+        assert_eq!(session.attach(&mut shaper).font_faces()[0].family, "Reader");
+        assert_eq!(provider.read_count(), 0);
+        assert_eq!(session.into_active(shaper).font_faces()[0].family, "Reader");
+    }
+
+    #[test]
+    fn font_faces_follow_media_changes_and_successful_document_replacement() {
+        let mut session = PipelineSession::new(Arc::new(MockProvider));
+        let mut shaper = TransactionalShaper::default();
+        let mut inputs = base_inputs(
+            r#"<html><head><style>
+                @media (min-width: 700px) {
+                    @font-face { font-family: Wide; src: url(wide.ttf); }
+                }
+            </style></head><body><p>Hello</p></body></html>"#,
+            SourceRevision::INITIAL,
+        );
+        session.update(inputs.clone(), &mut shaper).expect("initial layout");
+        assert!(session.font_faces().is_empty());
+        inputs.style_environment.media = MediaEnvironment::new(html_style::MediaType::Screen, 800.0, None).unwrap();
+        inputs.layout.viewport_width = 800.0;
+        assert!(session.media_environment_change_affects_style(inputs.style_environment.media, inputs.style_environment.root_font_size));
+        let update = session.update(inputs.clone(), &mut shaper).expect("font-only media change");
+        assert_eq!(update.stage, EarliestStage::Style);
+        assert_eq!(session.font_faces()[0].family, "Wide");
+        inputs.source = r#"<html><head><style>
+            @font-face { font-family: Replacement; src: url(new.ttf); }
+        </style></head><body><p>!</p></body></html>"#.into();
+        shaper.fail_on = Some('!');
+        assert!(session.update(inputs.clone(), &mut shaper).is_err());
+        assert_eq!(session.font_faces()[0].family, "Wide", "failed updates preserve published metadata");
+        shaper.fail_on = None;
+        session.update(inputs, &mut shaper).expect("successful replacement");
+        assert_eq!(session.font_faces()[0].family, "Replacement");
+        let no_fonts = base_inputs("<html><body><p>No fonts</p></body></html>", SourceRevision::INITIAL);
+        session.update(no_fonts, &mut shaper).expect("remove declarations");
+        assert!(session.font_faces().is_empty());
     }
 
     #[test]
@@ -1438,6 +1600,27 @@ mod tests {
     }
 
     #[test]
+    fn source_addresses_follow_rehydration_reflow_and_source_replacement() {
+        let mut session = PipelineSession::new(Arc::new(MockProvider));
+        let mut inputs = base_inputs("<p>Chapter with text</p>", SourceRevision::INITIAL);
+        session.prepare_through_style(inputs.clone()).unwrap();
+        let mut shaper = TransactionalShaper::default();
+        session.rehydrate_glyphs(&mut shaper).unwrap();
+        let location = |session: &PipelineSession| session.document().unwrap()
+            .render_view().addressing().source_location_on_line(0, Some(0)).unwrap();
+        let original = location(&session);
+        session.rehydrate_glyphs(&mut shaper).unwrap();
+        assert_eq!(location(&session), original);
+        inputs.layout.viewport_width = 80.0;
+        session.update(inputs.clone(), &mut shaper).unwrap();
+        assert_eq!(location(&session), original);
+        inputs.source_revision = inputs.source_revision.next();
+        inputs.source = "<blockquote><p>Chapter with text</p></blockquote>".into();
+        session.update(inputs, &mut shaper).unwrap();
+        assert_ne!(location(&session), original, "queries use the current DOM without retained metadata");
+    }
+
+    #[test]
     fn glyph_rehydration_publishes_in_place_and_preserves_the_previous_result_on_failure() {
         let mut session = PipelineSession::new(Arc::new(MockProvider));
         let mut shaper = TransactionalShaper::default();
@@ -1470,13 +1653,14 @@ mod tests {
         shaper.fail_measurement = true;
         let mut narrower = original_inputs.clone();
         narrower.layout.viewport_width = 10.0;
-        let mut changed_layout = session.document().expect("initial document").clone();
+        let changed_layout = session.document_mut().expect("initial document");
         changed_layout.relayout_with_metrics(
             to_layout_constraints(narrower.layout).expect("valid layout constraints"),
             &narrower.image_metrics,
         );
+        let expected = build_snapshot(changed_layout);
         assert_ne!(
-            build_snapshot(&changed_layout),
+            expected,
             original_document,
             "the request must exercise geometry that differs from the cached layout"
         );
@@ -1486,7 +1670,7 @@ mod tests {
 
         assert_eq!(
             build_snapshot(session.document().expect("updated document")),
-            build_snapshot(&changed_layout)
+            expected
         );
         assert_eq!(session.cache.inputs.as_ref(), Some(&narrower));
     }
@@ -1987,6 +2171,63 @@ mod tests {
     }
 
     #[test]
+    fn restyling_borrows_the_canonical_dom_text_storage() {
+        let mut session = PipelineSession::new(Arc::new(MockProvider));
+        let mut shaper = SizedShaper::default();
+        let mut inputs = base_inputs("<p>Canonical source text.</p>", SourceRevision::INITIAL);
+        session.update(inputs.clone(), &mut shaper).unwrap();
+        let text_pointers = |session: &PipelineSession| {
+            session.document().unwrap().visible_text_runs()
+                .map(|(text, _)| (text.as_ptr(), text.len())).collect::<Vec<_>>()
+        };
+        let source = text_pointers(&session);
+        assert!(!source.is_empty());
+        for font_size in [24, 12, 32, 16] {
+            inputs.style_environment.root_font_size = font_size;
+            let update = session.update(inputs.clone(), &mut shaper).unwrap();
+            assert_eq!(update.stage, EarliestStage::Prepare);
+            assert_eq!(text_pointers(&session), source);
+            assert_eq!(session.document().unwrap().render_view().root_font_size(), font_size as f32);
+        }
+        inputs.user_styles.push("p { font-weight: bold }".to_owned());
+        session.update(inputs, &mut shaper).unwrap();
+        assert_eq!(text_pointers(&session), source);
+    }
+
+    #[test]
+    fn failed_restyling_restores_root_font_math_resources_and_published_geometry() {
+        use html_dom::ImageSource;
+
+        let mut session = PipelineSession::new(Arc::new(MockProvider));
+        let mut shaper = TransactionalShaper::default();
+        let mut inputs = base_inputs("<p>ABC <math><mfrac><mi>x</mi><mn>2</mn></mfrac></math></p>", SourceRevision::INITIAL);
+        session.update(inputs.clone(), &mut shaper).unwrap();
+        let before = build_snapshot(session.document().unwrap());
+        let view = session.document().unwrap().render_view();
+        let font = view.root_font_size();
+        let image = &view.images()[0];
+        let ImageSource::MathMl { svg, baseline, .. } = &image.source else { panic!("formula") };
+        let formula = (svg.as_ptr(), image.width, image.height, *baseline);
+        let resources = shaper.resources.clone();
+        let generation = shaper.glyph_resources().generation();
+        inputs.style_environment.root_font_size = 32;
+        inputs.user_styles.push("p { color: red }".to_owned());
+        shaper.fail_on = Some('A');
+        assert!(session.update(inputs.clone(), &mut shaper).is_err());
+        assert_eq!(build_snapshot(session.document().unwrap()), before);
+        let view = session.document().unwrap().render_view();
+        assert_eq!(view.root_font_size(), font);
+        let image = &view.images()[0];
+        let ImageSource::MathMl { svg, baseline, .. } = &image.source else { panic!("formula") };
+        assert_eq!((svg.as_ptr(), image.width, image.height, *baseline), formula);
+        assert_eq!(shaper.resources, resources);
+        assert_eq!(shaper.glyph_resources().generation(), generation);
+        shaper.fail_on = None;
+        session.update(inputs, &mut shaper).unwrap();
+        assert_eq!(session.document().unwrap().render_view().root_font_size(), 32.0);
+    }
+
+    #[test]
     fn reader_root_spacing_override_removes_authored_page_insets() {
         let mut shaper = SizedShaper::default();
         let mut session = PipelineSession::new(Arc::new(MockProvider));
@@ -2103,8 +2344,8 @@ mod tests {
         let mut session = PipelineSession::new(Arc::new(MockProvider));
         let mut shaper = TracingShaper::default();
         session.update(inputs.clone(), &mut shaper).unwrap();
-        let original = session.document().unwrap().clone();
-        let glyph_pointer = session.document().unwrap().render_view().text().glyph_slice(0..session.document().unwrap().render_view().text().glyph_count() as u32).unwrap().as_ptr();
+        let original = build_snapshot(session.document().unwrap());
+        let glyph_pointer = session.document().unwrap().render_view().text().glyph_slice(0..session.document().unwrap().render_view().text().glyph_count() as u32).unwrap().as_contiguous().unwrap().as_ptr();
         let generation = shaper.glyph_resources().generation();
         let calls = shaper.calls;
         let preferences = [
@@ -2120,7 +2361,7 @@ mod tests {
             assert!(update.report.shaped.reused && update.report.laid_out.reused);
             assert_eq!(shaper.calls, calls);
             assert_eq!(shaper.glyph_resources().generation(), generation);
-            assert_eq!(session.document().unwrap().render_view().text().glyph_slice(0..session.document().unwrap().render_view().text().glyph_count() as u32).unwrap().as_ptr(), glyph_pointer);
+            assert_eq!(session.document().unwrap().render_view().text().glyph_slice(0..session.document().unwrap().render_view().text().glyph_count() as u32).unwrap().as_contiguous().unwrap().as_ptr(), glyph_pointer);
             let mut fresh_session = PipelineSession::new(Arc::new(MockProvider));
             let mut fresh_shaper = TracingShaper::default();
             fresh_session.update(inputs.clone(), &mut fresh_shaper).unwrap();
@@ -2132,8 +2373,7 @@ mod tests {
             fresh.decorations.sort_by_key(order);
             assert_eq!(updated, fresh);
         }
-        assert_eq!(build_snapshot(&original).lines, build_snapshot(session.document().unwrap()).lines);
-        assert_eq!(original.render_view().text().paint_color_at(0), None);
+        assert_eq!(original.lines, build_snapshot(session.document().unwrap()).lines);
         assert_eq!(session.document().unwrap().render_view().text().paint_color_at(0), None);
         inputs.layout.viewport_width = 200.0;
         assert_eq!(session.update(inputs.clone(), &mut shaper).unwrap().stage, EarliestStage::Layout);
@@ -2311,6 +2551,48 @@ mod tests {
     }
 
     #[test]
+    fn paragraph_controls_match_fresh_cascades_and_restore_book_layout() {
+        use html_dom::RootFontSize;
+        for source in [
+            "<html><body style='margin:0;font-size:1.29167em'><span style='font-size:0.77419em'>An opening passage outside a paragraph.</span><p style='margin:1em 0;text-indent:7%'><span style='font-size:0.77419em'>Words that wrap across several lines for paragraph controls.</span></p><p style='font-size:12px;margin:8px 0'>Another paragraph follows the first.</p></body></html>",
+            "<html><body style='margin:0;font-size:1.29167em;text-indent:7%;text-align:justify'><div><span style='font-size:.77419em'>An opening passage with enough words to wrap.<br><br>A second passage with more words for wrapping.</span><br> <br>A final passage.</div></body></html>",
+        ] {
+            let mut inputs = base_inputs(source, SourceRevision::INITIAL);
+            inputs.layout.viewport_width = 100.0;
+            inputs.style_environment.root_font_size = 24;
+            inputs.layout.line_height = 24.0;
+            inputs.reader_overrides.canonical_font_size = Some(16.0);
+            let mut session = PipelineSession::new(Arc::new(MockProvider));
+            let mut shaper = SizedShaper::default();
+            session.update(inputs.clone(), &mut shaper).unwrap();
+            let snapshot = |document: &LaidOutDocument| {
+                let mut snapshot = build_snapshot(document);
+                snapshot.glyphs.clear();
+                snapshot
+            };
+            let book = snapshot(session.document().unwrap());
+            for (spacing, indent) in [(Some(0.7), Some(1.5)), (Some(0.0), None), (None, Some(0.0)), (None, None)] {
+                inputs.reader_overrides.paragraph_spacing_em = spacing;
+                inputs.reader_overrides.first_line_indent_em = indent;
+                let update = session.update(inputs.clone(), &mut shaper).unwrap();
+                assert_eq!(update.stage, EarliestStage::Prepare);
+                for width in [100.0, 140.0, 100.0] {
+                    inputs.layout.viewport_width = width;
+                    session.update(inputs.clone(), &mut shaper).unwrap();
+                    let mut factory = DocumentFactory::new();
+                    factory.set_root_font_size(RootFontSize::new(24.0).unwrap());
+                    factory.set_reader_overrides(inputs.reader_overrides.clone());
+                    let prepared = factory.parse_with_new_pipeline(source, None);
+                    let mut reference_shaper = SizedShaper::default();
+                    let reference = prepared.shape(&mut reference_shaper).unwrap().layout_with_metrics_and_shaper(to_layout_constraints(inputs.layout).unwrap(), &inputs.image_metrics, &mut reference_shaper).unwrap();
+                    assert_eq!(snapshot(session.document().unwrap()), snapshot(&reference), "cached/fresh mismatch for spacing {spacing:?}, indentation {indent:?}, width {width}");
+                }
+            }
+            assert_eq!(snapshot(session.document().unwrap()), book);
+        }
+    }
+
+    #[test]
     fn typed_reader_overrides_apply_without_injecting_css() {
         let mut shaper = SizedShaper::default();
         let mut session = PipelineSession::new(Arc::new(MockProvider));
@@ -2332,6 +2614,7 @@ mod tests {
             background: Some(0xfefefeff),
             strip_root_spacing: false,
             theme: None,
+            ..Default::default()
         };
         assert!(inputs.user_styles.is_empty());
         let update = session.update(inputs, &mut shaper).unwrap();

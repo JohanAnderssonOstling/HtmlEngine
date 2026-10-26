@@ -57,6 +57,88 @@ fn text_for_ranges(document: &LaidOutDocument, fragment: &ReadingFragment) -> St
 }
 
 #[test]
+fn cjk_wrapping_and_segment_break_joining_preserve_utf16_source_positions() {
+    let document = layout("<p lang='ja' style='width:16px'>中𠀀\nが文</p>");
+    assert!(document.render_view().text().line_count() > 1);
+    let view = document.render_view();
+    let addressing = view.addressing();
+    let fragments = addressing.reading_fragments(0);
+    assert_eq!(fragments.len(), 1);
+    assert_eq!(fragments[0].text, "中𠀀が文");
+    assert_eq!(text_for_ranges(&document, &fragments[0]), "中𠀀が文");
+    let mut offsets = Vec::new();
+    for range in &fragments[0].target.glyph_ranges {
+        for index in range.clone() {
+            let source = addressing.source_position_for_glyph(index, false).unwrap();
+            let steps = source.elements().map(|element| element.step()).collect::<Vec<_>>();
+            assert_eq!(addressing.resolve_source_position(&steps, Some(source.text_step()), Some(source.utf16_offset()), false), Some(index));
+            offsets.push(source.utf16_offset());
+        }
+    }
+    assert_eq!(offsets, [0, 1, 4, 5, 6]);
+}
+
+#[test]
+fn bidi_controls_and_collapsed_newlines_keep_source_positions_in_order() {
+    for (source, expected, expected_offsets) in [
+        ("中\n\u{200e}文", "中\u{200e}文", vec![0, 2, 3]),
+        ("中\u{200e}\n文", "中\u{200e}文", vec![0, 1, 3]),
+        ("A\n\u{200e}B", "A \u{200e}B", vec![0, 1, 2, 3]),
+    ] {
+        let document = layout(&format!("<p>{source}</p>"));
+        let view = document.render_view();
+        let addressing = view.addressing();
+        let text = view.text();
+        let actual: String = (0..text.glyph_count())
+            .map(|index| {
+                text.glyph_metric(text.glyph_at(index).unwrap())
+                    .unwrap()
+                    .ch()
+            })
+            .collect();
+        assert_eq!(actual, expected);
+        let offsets: Vec<_> = (0..text.glyph_count())
+            .map(|index| {
+                let source = addressing
+                    .source_position_for_glyph(index as u32, false)
+                    .unwrap();
+                let steps: Vec<_> = source.elements().map(|element| element.step()).collect();
+                assert_eq!(
+                    addressing.resolve_source_position(
+                        &steps,
+                        Some(source.text_step()),
+                        Some(source.utf16_offset()),
+                        false
+                    ),
+                    Some(index as u32)
+                );
+                source.utf16_offset()
+            })
+            .collect();
+        assert_eq!(offsets, expected_offsets);
+    }
+}
+
+#[test]
+fn rtl_reading_and_source_positions_keep_logical_order() {
+    let document = layout("<p dir='rtl'>(אבג) <span dir='ltr'>abc 123</span></p>");
+    let view = document.render_view();
+    let addressing = view.addressing();
+    let fragments = addressing.reading_fragments(0);
+    assert_eq!(fragments.len(), 1);
+    assert_eq!(fragments[0].text, "(אבג) abc 123");
+    assert_eq!(text_for_ranges(&document, &fragments[0]), "(אבג) abc 123");
+    assert_eq!(addressing.reading_text(&fragments[0].target), fragments[0].text);
+    for range in &fragments[0].target.glyph_ranges {
+        for index in range.clone() {
+            let source = addressing.source_position_for_glyph(index, false).unwrap();
+            let steps: Vec<_> = source.elements().map(|element| element.step()).collect();
+            assert_eq!(addressing.resolve_source_position(&steps, Some(source.text_step()), Some(source.utf16_offset()), false), Some(index));
+        }
+    }
+}
+
+#[test]
 fn hidden_text_is_excluded_from_fragments_and_chunks() {
     let document = layout(
         "<p>Visible <span style='visibility:hidden'>SECRET</span> text.</p><p style='visibility:hidden'>Entire hidden paragraph</p>",

@@ -90,7 +90,7 @@ mod tests {
                 _ => None,
             })
             .flatten()
-            .map(|glyph| char::from_u32(document.inline_content().glyph_at(glyph as usize).expect("source glyph")).expect("Unicode scalar"))
+            .map(|glyph| char::from_u32(document.inline_content().character_at(glyph as usize).expect("source glyph")).expect("Unicode scalar"))
             .collect::<String>();
         assert_eq!(selected, "\u{201c}T", "leading quote and first typographic letter belong to the float");
     }
@@ -374,7 +374,7 @@ mod tests {
         let mut saw_space = false;
         for run in &document.inline_content().inline_items()[runs.start as usize..runs.end as usize] {
             if let InlineItemKind::Text { glyphs } = &run.kind
-                && document.inline_content().glyphs()[glyphs.start as usize..glyphs.end as usize].contains(&(' ' as GlyphId))
+                && document.inline_content().characters()[glyphs.start as usize..glyphs.end as usize].contains(&(' ' as GlyphId))
             {
                 saw_space = true;
                 break;
@@ -395,7 +395,7 @@ mod tests {
             .inline_items()
             .iter()
             .filter_map(|run| match &run.kind {
-                InlineItemKind::Text { glyphs } => Some(document.inline_content().glyphs()[glyphs.start as usize..glyphs.end as usize].iter().map(|&glyph| char::from_u32(glyph).expect("glyph should be valid char")).collect::<String>()),
+                InlineItemKind::Text { glyphs } => Some(document.inline_content().characters()[glyphs.start as usize..glyphs.end as usize].iter().map(|&glyph| char::from_u32(glyph).expect("glyph should be valid char")).collect::<String>()),
                 _ => None,
             })
             .collect();
@@ -630,7 +630,7 @@ mod tests {
         let following_text = runs[atomic + 1..]
             .iter()
             .find_map(|run| match &run.kind {
-                InlineItemKind::Text { glyphs } => Some(document.inline_content().glyphs()[glyphs.start as usize..glyphs.end as usize].iter().filter_map(|glyph| char::from_u32(*glyph)).collect::<String>()),
+                InlineItemKind::Text { glyphs } => Some(document.inline_content().characters()[glyphs.start as usize..glyphs.end as usize].iter().filter_map(|glyph| char::from_u32(*glyph)).collect::<String>()),
                 _ => None,
             })
             .expect("text should follow the atomic table");
@@ -664,7 +664,7 @@ mod tests {
             .inline_items()
             .iter()
             .filter_map(|run| match &run.kind {
-                InlineItemKind::Text { glyphs } => Some(document.inline_content().glyphs()[glyphs.start as usize..glyphs.end as usize].iter().filter_map(|glyph| char::from_u32(*glyph)).collect::<String>()),
+                InlineItemKind::Text { glyphs } => Some(document.inline_content().characters()[glyphs.start as usize..glyphs.end as usize].iter().filter_map(|glyph| char::from_u32(*glyph)).collect::<String>()),
                 _ => None,
             })
             .collect();
@@ -685,7 +685,7 @@ mod tests {
             .inline_items()
             .iter()
             .filter_map(|run| match &run.kind {
-                InlineItemKind::Text { glyphs } => Some(document.inline_content().glyphs()[glyphs.start as usize..glyphs.end as usize].iter().filter_map(|glyph| char::from_u32(*glyph)).collect::<String>()),
+                InlineItemKind::Text { glyphs } => Some(document.inline_content().characters()[glyphs.start as usize..glyphs.end as usize].iter().filter_map(|glyph| char::from_u32(*glyph)).collect::<String>()),
                 _ => None,
             })
             .collect();
@@ -706,7 +706,7 @@ mod tests {
             .inline_items()
             .iter()
             .find_map(|run| match &run.kind {
-                InlineItemKind::Text { glyphs } if document.inline_content().glyphs()[glyphs.start as usize..glyphs.end as usize].iter().any(|glyph| char::from_u32(*glyph) == Some('\u{25aa}')) => Some(run.box_idx as usize),
+                InlineItemKind::Text { glyphs } if document.inline_content().characters()[glyphs.start as usize..glyphs.end as usize].iter().any(|glyph| char::from_u32(*glyph) == Some('\u{25aa}')) => Some(run.box_idx as usize),
                 _ => None,
             })
             .expect("generated square counter run");
@@ -728,7 +728,7 @@ mod tests {
             .inline_items()
             .iter()
             .filter_map(|run| match &run.kind {
-                InlineItemKind::Text { glyphs } => Some(document.inline_content().glyphs()[glyphs.start as usize..glyphs.end as usize].iter().filter_map(|glyph| char::from_u32(*glyph)).collect::<String>()),
+                InlineItemKind::Text { glyphs } => Some(document.inline_content().characters()[glyphs.start as usize..glyphs.end as usize].iter().filter_map(|glyph| char::from_u32(*glyph)).collect::<String>()),
                 _ => None,
             })
             .collect();
@@ -748,7 +748,7 @@ mod tests {
             .inline_items()
             .iter()
             .filter_map(|run| match &run.kind {
-                InlineItemKind::Text { glyphs } => Some(document.inline_content().glyphs()[glyphs.start as usize..glyphs.end as usize].iter().filter_map(|glyph| char::from_u32(*glyph)).collect::<String>()),
+                InlineItemKind::Text { glyphs } => Some(document.inline_content().characters()[glyphs.start as usize..glyphs.end as usize].iter().filter_map(|glyph| char::from_u32(*glyph)).collect::<String>()),
                 _ => None,
             })
             .collect();
@@ -768,7 +768,7 @@ mod tests {
             .inline_items()
             .iter()
             .filter_map(|run| match &run.kind {
-                InlineItemKind::Text { glyphs } => Some(document.inline_content().glyphs()[glyphs.start as usize..glyphs.end as usize].iter().filter_map(|glyph| char::from_u32(*glyph)).collect::<String>()),
+                InlineItemKind::Text { glyphs } => Some(document.inline_content().characters()[glyphs.start as usize..glyphs.end as usize].iter().filter_map(|glyph| char::from_u32(*glyph)).collect::<String>()),
                 _ => None,
             })
             .collect();
@@ -788,7 +788,7 @@ mod tests {
             .inline_items()
             .iter()
             .filter_map(|run| match &run.kind {
-                InlineItemKind::Text { glyphs } => Some(document.inline_content().glyphs()[glyphs.start as usize..glyphs.end as usize].iter().filter_map(|glyph| char::from_u32(*glyph)).collect::<String>()),
+                InlineItemKind::Text { glyphs } => Some(document.inline_content().characters()[glyphs.start as usize..glyphs.end as usize].iter().filter_map(|glyph| char::from_u32(*glyph)).collect::<String>()),
                 _ => None,
             })
             .collect();
@@ -808,7 +808,7 @@ mod tests {
             .inline_items()
             .iter()
             .filter_map(|run| match &run.kind {
-                InlineItemKind::Text { glyphs } => Some(document.inline_content().glyphs()[glyphs.start as usize..glyphs.end as usize].iter().filter_map(|glyph| char::from_u32(*glyph)).collect::<String>()),
+                InlineItemKind::Text { glyphs } => Some(document.inline_content().characters()[glyphs.start as usize..glyphs.end as usize].iter().filter_map(|glyph| char::from_u32(*glyph)).collect::<String>()),
                 _ => None,
             })
             .collect();
@@ -827,7 +827,7 @@ mod tests {
             .inline_items()
             .iter()
             .filter_map(|run| match &run.kind {
-                InlineItemKind::Text { glyphs } => Some(document.inline_content().glyphs()[glyphs.start as usize..glyphs.end as usize].iter().filter_map(|glyph| char::from_u32(*glyph)).collect::<String>()),
+                InlineItemKind::Text { glyphs } => Some(document.inline_content().characters()[glyphs.start as usize..glyphs.end as usize].iter().filter_map(|glyph| char::from_u32(*glyph)).collect::<String>()),
                 _ => None,
             })
             .collect();
@@ -848,7 +848,7 @@ mod tests {
             .inline_items()
             .iter()
             .filter_map(|run| match &run.kind {
-                InlineItemKind::Text { glyphs } => Some(document.inline_content().glyphs()[glyphs.start as usize..glyphs.end as usize].iter().filter_map(|glyph| char::from_u32(*glyph)).collect::<String>()),
+                InlineItemKind::Text { glyphs } => Some(document.inline_content().characters()[glyphs.start as usize..glyphs.end as usize].iter().filter_map(|glyph| char::from_u32(*glyph)).collect::<String>()),
                 _ => None,
             })
             .collect();
@@ -884,7 +884,7 @@ mod tests {
             .inline_items()
             .iter()
             .filter_map(|run| match &run.kind {
-                InlineItemKind::Text { glyphs } => Some(document.inline_content().glyphs()[glyphs.start as usize..glyphs.end as usize].iter().filter_map(|glyph| char::from_u32(*glyph)).collect::<String>()),
+                InlineItemKind::Text { glyphs } => Some(document.inline_content().characters()[glyphs.start as usize..glyphs.end as usize].iter().filter_map(|glyph| char::from_u32(*glyph)).collect::<String>()),
                 _ => None,
             })
             .collect();
@@ -953,7 +953,7 @@ mod tests {
                 .inline_items()
                 .iter()
                 .filter_map(|run| match &run.kind {
-                    InlineItemKind::Text { glyphs } => Some(document.inline_content().glyphs()[glyphs.start as usize..glyphs.end as usize].iter().filter_map(|glyph| char::from_u32(*glyph)).collect::<String>()),
+                    InlineItemKind::Text { glyphs } => Some(document.inline_content().characters()[glyphs.start as usize..glyphs.end as usize].iter().filter_map(|glyph| char::from_u32(*glyph)).collect::<String>()),
                     _ => None,
                 })
                 .collect();
@@ -974,7 +974,7 @@ mod tests {
             .inline_items()
             .iter()
             .filter_map(|run| match &run.kind {
-                InlineItemKind::Text { glyphs } => Some(document.inline_content().glyphs()[glyphs.start as usize..glyphs.end as usize].iter().filter_map(|glyph| char::from_u32(*glyph)).collect::<String>()),
+                InlineItemKind::Text { glyphs } => Some(document.inline_content().characters()[glyphs.start as usize..glyphs.end as usize].iter().filter_map(|glyph| char::from_u32(*glyph)).collect::<String>()),
                 _ => None,
             })
             .collect();
@@ -1017,7 +1017,7 @@ mod tests {
             .inline_items()
             .iter()
             .filter_map(|run| match &run.kind {
-                InlineItemKind::Text { glyphs } => Some(document.inline_content().glyphs()[glyphs.start as usize..glyphs.end as usize].iter().filter_map(|glyph| char::from_u32(*glyph)).collect::<String>()),
+                InlineItemKind::Text { glyphs } => Some(document.inline_content().characters()[glyphs.start as usize..glyphs.end as usize].iter().filter_map(|glyph| char::from_u32(*glyph)).collect::<String>()),
                 _ => None,
             })
             .collect();
@@ -1049,7 +1049,7 @@ mod tests {
             .inline_items()
             .iter()
             .filter_map(|run| match &run.kind {
-                InlineItemKind::Text { glyphs } => Some(document.inline_content().glyphs()[glyphs.start as usize..glyphs.end as usize].iter().filter_map(|glyph| char::from_u32(*glyph)).collect::<String>()),
+                InlineItemKind::Text { glyphs } => Some(document.inline_content().characters()[glyphs.start as usize..glyphs.end as usize].iter().filter_map(|glyph| char::from_u32(*glyph)).collect::<String>()),
                 _ => None,
             })
             .collect();
@@ -1073,7 +1073,7 @@ mod tests {
             .inline_items()
             .iter()
             .filter_map(|run| match &run.kind {
-                InlineItemKind::Text { glyphs } => Some(document.inline_content().glyphs()[glyphs.start as usize..glyphs.end as usize].iter().filter_map(|glyph| char::from_u32(*glyph)).collect::<String>()),
+                InlineItemKind::Text { glyphs } => Some(document.inline_content().characters()[glyphs.start as usize..glyphs.end as usize].iter().filter_map(|glyph| char::from_u32(*glyph)).collect::<String>()),
                 _ => None,
             })
             .collect();
@@ -1105,7 +1105,7 @@ mod tests {
             .inline_items()
             .iter()
             .filter_map(|run| match &run.kind {
-                InlineItemKind::Text { glyphs } => Some(document.inline_content().glyphs()[glyphs.start as usize..glyphs.end as usize].iter().filter_map(|glyph| char::from_u32(*glyph)).collect::<String>()),
+                InlineItemKind::Text { glyphs } => Some(document.inline_content().characters()[glyphs.start as usize..glyphs.end as usize].iter().filter_map(|glyph| char::from_u32(*glyph)).collect::<String>()),
                 _ => None,
             })
             .collect();

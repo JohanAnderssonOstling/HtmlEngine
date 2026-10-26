@@ -264,8 +264,6 @@ impl<'out> FragmentWriter<'out> {
 
     pub(super) fn materialize_absolute_positions(
         &mut self,
-        local_line_points: &[Point],
-        local_decoration_rects: &[Rect],
         line_groups: &[u32],
         decoration_groups: &[u32],
         resolved_offsets: &[Vec2],
@@ -273,7 +271,7 @@ impl<'out> FragmentWriter<'out> {
         for (index, line) in self.state.line_output.lines.iter_mut().enumerate() {
             let offset = resolved_offsets[line_groups[index] as usize];
             if offset != Vec2::ZERO {
-                line.point = local_line_points[index] + offset;
+                line.point += offset;
             }
         }
         for (index, decoration) in self
@@ -286,27 +284,9 @@ impl<'out> FragmentWriter<'out> {
         {
             let offset = resolved_offsets[decoration_groups[index] as usize];
             if offset != Vec2::ZERO {
-                decoration.rect = local_decoration_rects[index] + offset;
+                decoration.rect = decoration.rect + offset;
             }
         }
-    }
-
-    pub(super) fn capture_local_positions(
-        &self,
-        line_points: &mut Vec<Point>,
-        decoration_rects: &mut Vec<Rect>,
-    ) {
-        line_points.clear();
-        line_points.extend(self.state.line_output.lines.iter().map(|line| line.point));
-        decoration_rects.clear();
-        decoration_rects.extend(
-            self.state
-                .fragment_output
-                .decorations
-                .fragments()
-                .iter()
-                .map(|decoration| decoration.rect),
-        );
     }
 
     pub(super) fn push_line_owner(&mut self, placement: &mut PlacementState, owner: u32) {

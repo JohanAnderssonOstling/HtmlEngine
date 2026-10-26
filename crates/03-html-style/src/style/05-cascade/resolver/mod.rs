@@ -863,11 +863,10 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
         // semantics even though they are not CSS properties.
         if let Some(language) = doc
             .element_ref(node_idx)
-            .and_then(|element| element.attr_in_any_namespace("lang"))
-            .map(str::trim)
-            .filter(|language| !language.is_empty())
+            .and_then(|element| element.attr_expanded(Some("http://www.w3.org/XML/1998/namespace"), "lang")
+                .or_else(|| element.attr("lang")))
         {
-            style.text.language = Some(self.styles.intern_string(language));
+            style.text.language = self.styles.intern_language(language);
         }
 
         // Preserve `currentColor` as a computed keyword for inheritance while

@@ -1,6 +1,6 @@
 use super::fragment_writer::FragmentWriter;
 use super::geometry_writer::GeometryWriter;
-use kurbo::{Point, Rect, Vec2};
+use kurbo::Vec2;
 
 pub(crate) type PlacementId = u32;
 
@@ -44,9 +44,9 @@ enum PlacementPhase {
 /// Session-owned retained transform tree and fragment ownership.
 ///
 /// Layout writes local coordinates while this state is `Building`. Publication
-/// resolves every transform and converts all public output to absolute
-/// coordinates in one transition. No writer carries an independent cursor.
-#[derive(Clone, Default)]
+/// resolves every transform and converts the canonical output coordinates in
+/// place. No second local-coordinate snapshot is retained.
+#[derive(Default)]
 pub(crate) struct PlacementState {
     nodes: Vec<PlacementNode>,
     offsets: Vec<Vec2>,
@@ -54,11 +54,6 @@ pub(crate) struct PlacementState {
     box_groups: Vec<PlacementId>,
     line_groups: Vec<PlacementId>,
     decoration_groups: Vec<PlacementId>,
-    local_box_points: Vec<Point>,
-    local_line_points: Vec<Point>,
-    local_decoration_rects: Vec<Rect>,
-    remapped_line_points: Vec<Point>,
-    remapped_line_groups: Vec<PlacementId>,
     current_group: PlacementId,
     has_transforms: bool,
     retain_output: bool,
@@ -75,11 +70,6 @@ impl PlacementState {
         self.box_groups.fill(0);
         self.line_groups.clear();
         self.decoration_groups.clear();
-        self.local_box_points.clear();
-        self.local_line_points.clear();
-        self.local_decoration_rects.clear();
-        self.remapped_line_points.clear();
-        self.remapped_line_groups.clear();
         self.current_group = 0;
         self.has_transforms = false;
         self.retain_output = true;
@@ -94,11 +84,6 @@ impl PlacementState {
         self.box_groups.clear();
         self.line_groups.clear();
         self.decoration_groups.clear();
-        self.local_box_points.clear();
-        self.local_line_points.clear();
-        self.local_decoration_rects.clear();
-        self.remapped_line_points.clear();
-        self.remapped_line_groups.clear();
         self.current_group = 0;
         self.has_transforms = false;
         self.retain_output = false;
@@ -178,8 +163,8 @@ impl PlacementState {
         self.decoration_groups.resize(end, self.current_group);
     }
 
-    /// Publishes absolute renderer output while retaining the local coordinate
-    /// snapshot and transform tree as reusable layout state.
+    /// Publishes absolute coordinates directly in the owning output buffers.
+    /// Borrowed readers observe this single representation after publication.
     pub(super) fn publish_absolute(
         &mut self,
         geometry: &mut GeometryWriter<'_>,
@@ -197,24 +182,15 @@ impl PlacementState {
             "every pre-publication decoration must retain placement ownership"
         );
 
-        self.local_box_points.clear();
-        self.local_box_points
-            .extend((0..geometry.len()).map(|box_idx| geometry.point(box_idx)));
-        fragments.capture_local_positions(
-            &mut self.local_line_points,
-            &mut self.local_decoration_rects,
-        );
         if self.has_transforms {
             self.resolve();
             for box_idx in 0..geometry.len() {
                 let offset = self.resolved_offsets[self.box_groups[box_idx] as usize];
                 if offset != Vec2::ZERO {
-                    geometry.set_point(box_idx, self.local_box_points[box_idx] + offset);
+                    geometry.set_point(box_idx, geometry.point(box_idx) + offset);
                 }
             }
             fragments.materialize_absolute_positions(
-                &self.local_line_points,
-                &self.local_decoration_rects,
                 &self.line_groups,
                 &self.decoration_groups,
                 &self.resolved_offsets,
@@ -226,24 +202,6 @@ impl PlacementState {
         self.current_group = 0;
     }
 
-    #[cfg(test)]
-    pub(super) fn local_box_point(&self, box_idx: usize) -> Point {
-        self.local_box_points[box_idx]
-    }
-
-    pub(super) fn remap_lines(&mut self, old_to_new: &[usize]) {
-        assert_eq!(self.local_line_points.len(), old_to_new.len());
-        assert_eq!(self.line_groups.len(), old_to_new.len());
-        self.remapped_line_points.resize(old_to_new.len(), Point::ZERO);
-        self.remapped_line_groups.resize(old_to_new.len(), 0);
-        for (old, &new) in old_to_new.iter().enumerate() {
-            self.remapped_line_points[new] = self.local_line_points[old];
-            self.remapped_line_groups[new] = self.line_groups[old];
-        }
-        std::mem::swap(&mut self.local_line_points, &mut self.remapped_line_points);
-        std::mem::swap(&mut self.line_groups, &mut self.remapped_line_groups);
-    }
-
     pub(crate) fn memory_usage_bytes(&self) -> usize {
         self.nodes.capacity() * std::mem::size_of::<PlacementNode>()
             + self.offsets.capacity() * std::mem::size_of::<Vec2>()
@@ -251,11 +209,6 @@ impl PlacementState {
             + self.box_groups.capacity() * std::mem::size_of::<PlacementId>()
             + self.line_groups.capacity() * std::mem::size_of::<PlacementId>()
             + self.decoration_groups.capacity() * std::mem::size_of::<PlacementId>()
-            + self.local_box_points.capacity() * std::mem::size_of::<Point>()
-            + self.local_line_points.capacity() * std::mem::size_of::<Point>()
-            + self.local_decoration_rects.capacity() * std::mem::size_of::<Rect>()
-            + self.remapped_line_points.capacity() * std::mem::size_of::<Point>()
-            + self.remapped_line_groups.capacity() * std::mem::size_of::<PlacementId>()
     }
 
     fn assert_building(&self) {
@@ -318,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn absolute_publication_retains_local_box_coordinates() {
+    fn absolute_publication_updates_the_owning_box_coordinates() {
         let mut geometry_output = BoxGeometry::default();
         let mut fragment_output = LayoutState::default();
         let mut geometry = GeometryWriter::new(&mut geometry_output);
@@ -333,7 +286,6 @@ mod tests {
         placement.translate(box_placement.box_group, Vec2::new(5.0, 7.0));
         placement.publish_absolute(&mut geometry, &mut fragments);
 
-        assert_eq!(placement.local_box_point(0), Point::new(10.0, 20.0));
         assert_eq!(geometry_output.point(0), Point::new(15.0, 27.0));
     }
 

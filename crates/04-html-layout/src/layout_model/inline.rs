@@ -2,15 +2,9 @@ use super::SourceOffsets;
 use html_dom::MemoryUsageReport;
 use std::ops::Range;
 
-/// Width of a single cell in the inline glyph buffer.
+/// A renderer glyph-cache index in a derived shaping buffer.
 ///
-/// Each cell holds a Unicode scalar value before shaping and a glyph-cache
-/// index after shaping (see [`crate::text::glyph_cache`]). Both roles share
-/// this one type so the buffer width can be changed in a single place.
-///
-/// `u32` so the buffer holds full Unicode scalar values (no BMP truncation of
-/// emoji / supplementary-plane CJK) and the glyph-cache index has no 65 536-entry
-/// ceiling.
+/// `u32` keeps glyph-cache indices above 65,535 addressable.
 pub type GlyphId = u32;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -19,6 +13,11 @@ pub(crate) enum WhitespaceWrapOverride {
     Style,
     Allow,
     Suppress,
+    /// A Unicode/CSS break before this retained character. Unlike whitespace,
+    /// the character must remain on the following line.
+    UnicodeAllow,
+    /// Unicode/CSS evaluated this boundary and prohibited a normal break.
+    UnicodeSuppress,
 }
 
 impl WhitespaceWrapOverride {
@@ -27,26 +26,37 @@ impl WhitespaceWrapOverride {
     }
 }
 
-#[derive(Default, Clone)]
+const _: () = assert!(std::mem::size_of::<WhitespaceWrapOverride>() == 1);
+
+/// Canonical logical text and source correspondence, owned by preparation.
+/// Shaping borrows this content and writes glyph IDs into a separate buffer;
+/// it never copies or modifies the source offsets, wrap flags, or inline items.
+#[derive(Default)]
+#[cfg_attr(test, derive(Clone))]
 pub(crate) struct InlineContent {
-    pub(super) glyphs: Vec<GlyphId>,
+    unicode_wraps: bool,
+    pub(super) characters: Vec<u32>,
     /// UTF-16 source offset within `InlineItem::dom_text_node` for each glyph.
-    /// Synthetic glyphs such as list markers have no source position.
+    /// Synthetic characters such as list markers have no source position.
     pub(super) glyph_source_offsets: SourceOffsets,
     /// A soft-wrap opportunity retained from the pre-collapse whitespace
     /// sequence. This is separate from the surviving glyph's style because a
     /// sequence can cross inline elements with different `white-space` values.
+    /// Unicode/CSS boundaries in CJK paragraphs reuse this same byte.
     pub(super) whitespace_wrap_before: Vec<WhitespaceWrapOverride>,
     pub(super) inline_items: Vec<InlineItem>,
 }
 
 impl InlineContent {
+    pub(crate) fn has_unicode_wraps(&self) -> bool {
+        self.unicode_wraps
+    }
     pub(crate) fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
-        report.add_slice_storage::<GlyphId>(
-            "InlineContent.glyphs.storage",
-            self.glyphs.capacity(),
-            self.glyphs.len(),
+        report.add_slice_storage::<u32>(
+            "InlineContent.characters.storage",
+            self.characters.capacity(),
+            self.characters.len(),
         );
         report.extend_prefixed(
             "InlineContent.glyph_source_offsets",
@@ -67,16 +77,12 @@ impl InlineContent {
 }
 
 impl InlineContent {
-    pub(crate) fn glyphs(&self) -> &[GlyphId] {
-        self.glyphs.as_slice()
+    pub(crate) fn characters(&self) -> &[u32] {
+        self.characters.as_slice()
     }
 
-    pub(crate) fn glyphs_mut(&mut self) -> &mut [GlyphId] {
-        self.glyphs.as_mut_slice()
-    }
-
-    pub(crate) fn glyph_at(&self, glyph_idx: usize) -> Option<GlyphId> {
-        self.glyphs.get(glyph_idx).copied()
+    pub(crate) fn character_at(&self, glyph_idx: usize) -> Option<u32> {
+        self.characters.get(glyph_idx).copied()
     }
 
     pub(crate) fn glyph_source_offset(&self, glyph_idx: usize) -> Option<u32> {
@@ -98,17 +104,27 @@ impl InlineContent {
             .unwrap_or_default()
     }
 
-    pub(crate) fn replace_glyphs(
+    pub(crate) fn set_unicode_wrap_before(&mut self, glyph_idx: usize, allow: bool) {
+        self.unicode_wraps = true;
+        self.whitespace_wrap_before[glyph_idx] = if allow {
+            WhitespaceWrapOverride::UnicodeAllow
+        } else {
+            WhitespaceWrapOverride::UnicodeSuppress
+        };
+    }
+
+    pub(crate) fn replace_characters(
         &mut self,
-        glyphs: Vec<GlyphId>,
+        characters: Vec<u32>,
         source_offsets: SourceOffsets,
         whitespace_wrap_before: Vec<WhitespaceWrapOverride>,
     ) {
-        debug_assert_eq!(glyphs.len(), source_offsets.len());
-        debug_assert_eq!(glyphs.len(), whitespace_wrap_before.len());
-        self.glyphs = glyphs;
+        debug_assert_eq!(characters.len(), source_offsets.len());
+        debug_assert_eq!(characters.len(), whitespace_wrap_before.len());
+        self.characters = characters;
         self.glyph_source_offsets = source_offsets;
         self.whitespace_wrap_before = whitespace_wrap_before;
+        self.unicode_wraps = false;
     }
 
     pub(crate) fn inline_items(&self) -> &[InlineItem] {
@@ -131,15 +147,15 @@ impl InlineContent {
         self.inline_items.push(run);
     }
 
-    pub(crate) fn push_glyph(&mut self, glyph: GlyphId) {
-        self.glyphs.push(glyph);
+    pub(crate) fn push_character(&mut self, character: char) {
+        self.characters.push(character as u32);
         self.glyph_source_offsets.push(u32::MAX);
         self.whitespace_wrap_before
             .push(WhitespaceWrapOverride::Style);
     }
 
-    pub(crate) fn push_source_glyph(&mut self, glyph: GlyphId, source_offset: u32) {
-        self.glyphs.push(glyph);
+    pub(crate) fn push_source_character(&mut self, character: char, source_offset: u32) {
+        self.characters.push(character as u32);
         self.glyph_source_offsets.push(source_offset);
         self.whitespace_wrap_before
             .push(WhitespaceWrapOverride::Style);

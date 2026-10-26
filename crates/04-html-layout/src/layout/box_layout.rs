@@ -1,6 +1,6 @@
 use crate::layout::LayoutEngine;
 use crate::layout_model::{BoxType, InlineItemKind, LayoutMode, ListItemMarker};
-use html_style_model::{BoxSizing, ListStylePosition, UsedPreferredSize as PreferredSize};
+use html_style_model::{BoxSizing, ListStylePosition, TextDirection, UsedPreferredSize as PreferredSize};
 use kurbo::{Point, Size};
 
 use super::box_constraints::BoxLayoutRequest;
@@ -187,8 +187,11 @@ fn layout_box_contents(
             marker.marker,
             marker.width,
             marker.gap,
-            placement.box_point.x,
+            if engine.reader.style(box_idx).direction() == TextDirection::Rtl {
+                placement.content_point.x + resolved.horizontal.content + resolved.box_model.padding_right + resolved.box_model.border_right
+            } else { placement.box_point.x },
             placement.content_point,
+            resolved.horizontal.content,
             marker.first_content_line,
         );
     }
@@ -443,6 +446,7 @@ fn place_list_marker(
     marker_gap: f64,
     border_start_x: f64,
     content_pos: Point,
+    content_width: f64,
     first_content_line_idx: usize,
 ) {
     let line_y = if first_content_line_idx < engine.fragments.state().line_output.lines.len() {
@@ -450,14 +454,17 @@ fn place_list_marker(
     } else {
         content_pos.y
     };
-    let marker_x = match marker.position {
-        ListStylePosition::Outside => border_start_x - marker_width - marker_gap,
-        ListStylePosition::Inside => content_pos.x,
+    let rtl = engine.reader.style(marker.marker_box as usize).direction() == TextDirection::Rtl;
+    let marker_x = match (marker.position, rtl) {
+        (ListStylePosition::Outside, true) => border_start_x + marker_gap,
+        (ListStylePosition::Outside, false) => border_start_x - marker_width - marker_gap,
+        (ListStylePosition::Inside, true) => content_pos.x + content_width - marker_width,
+        (ListStylePosition::Inside, false) => content_pos.x,
     };
     engine
         .geometry
         .set_point(marker.marker_box as usize, Point::new(marker_x, line_y));
-    let available = engine.config.viewport_width().max(marker_width + 1.0);
+    let available = if rtl { marker_width.max(1.0) } else { engine.config.viewport_width().max(marker_width + 1.0) };
     // Marker glyphs are positioned relative to the list-item border edge;
     // descendant or adjoining floats must not reflow that already-positioned
     // marker as though it were ordinary inline content.

@@ -32,6 +32,7 @@ pub(crate) mod parser {
 mod style;
 
 pub use style::DEFAULT_CSS;
+pub use style::source::fonts::{FontFace, FontFaceDescriptor, FontFaceSource, FontFaceStyle, resolve_font_face_urls};
 pub use style::source::imports::{ImportLayer, StylesheetEntry, StylesheetImport, stylesheet_entries};
 pub use style::syntax::capabilities::property_name_is_supported;
 
@@ -41,10 +42,11 @@ use lightningcss::properties::{Property, PropertyId};
 use lightningcss::selector::SelectorList;
 use lightningcss::stylesheet::{ParserOptions, StyleSheet};
 use lightningcss::traits::ParseWithOptions;
+use std::sync::Arc;
 use std::time::Duration;
 
 pub use style::rules::media::{MediaEnvironment, MediaMatchKey, MediaQuerySet, MediaType};
-pub use style::rules::program::{StyleProgram, StyleProgramCache, StyleProgramCacheStats, style_document_with_cached_program_and_reader_overrides, style_document_with_cached_program_and_timings, style_document_with_program_and_reader_overrides, style_document_with_program_and_timings};
+pub use style::rules::program::{resolve_document_with_program,StyleProgram, StyleProgramCache, StyleProgramCacheStats, style_document_with_cached_program_and_reader_overrides, style_document_with_cached_program_and_timings, style_document_with_program_and_reader_overrides, style_document_with_program_and_timings};
 
 #[cfg(test)]
 mod allocation_test_support {
@@ -350,9 +352,16 @@ pub fn stylesheet_syntax_is_valid(css: &str) -> bool {
 pub struct StyledDocument {
     document: Document,
     styles: ComputedStyles,
+    font_faces: Arc<[FontFace]>,
 }
 
 impl StyledDocument {
+    /// Active `@font-face` declarations in stylesheet order. Relative URLs
+    /// remain relative when styling CSS directly; the pipeline resolves them.
+    pub fn font_faces(&self) -> &[FontFace] {
+        &self.font_faces
+    }
+
     pub fn document(&self) -> &Document {
         &self.document
     }
@@ -413,6 +422,8 @@ pub fn style_document(document: Document, css_chunks: &[&str]) -> StyledDocument
 
 #[derive(Clone, Debug, Default)]
 pub struct StyleTimings {
+    /// Actual parsing time on first use in this process; zero when the shared
+    /// immutable default stylesheet has already been initialized.
     pub parse_default_css: Duration,
     pub parse_author_css: Duration,
     pub prepare_rules: Duration,

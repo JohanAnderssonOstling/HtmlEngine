@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::layout_model::{LineDetails, LineTextFragment};
+use html_style_model::TextDirection;
 
 /// Stable renderer-facing line geometry.
 ///
@@ -38,11 +39,13 @@ pub struct RenderLine {
 pub struct RenderLineTextFragment {
     glyphs: Range<u32>,
     offset_x: f64,
+    rtl: bool,
     paint_order: u32,
     visible: bool,
 }
 
 impl RenderLineTextFragment {
+    pub fn is_rtl(&self) -> bool { self.rtl }
     pub fn glyphs(&self) -> Range<u32> {
         self.glyphs.clone()
     }
@@ -108,6 +111,7 @@ impl<'a> Iterator for RenderLineTextFragments<'a> {
             return Some(RenderLineTextFragment {
                 glyphs: fragment.glyphs.clone(),
                 offset_x: fragment.offset_x,
+                rtl: fragment.rtl,
                 paint_order: fragment.paint_order,
                 visible: fragment.visible,
             });
@@ -119,6 +123,7 @@ impl<'a> Iterator for RenderLineTextFragments<'a> {
         Some(RenderLineTextFragment {
             glyphs: self.line.glyphs.clone(),
             offset_x: 0.0,
+            rtl: false,
             paint_order: 0,
             visible: true,
         })
@@ -632,17 +637,17 @@ impl<'a> RenderTextView<'a> {
     }
 
     pub fn glyph_count(self) -> usize {
-        self.doc.shaped.inline_content.glyphs().len()
+        self.doc.shaped().glyphs.len()
     }
 
     pub fn glyph_at(self, glyph_idx: usize) -> Option<GlyphId> {
-        self.doc.shaped.inline_content.glyph_at(glyph_idx)
+        self.doc.shaped().glyphs.get(glyph_idx).copied()
     }
 
-    pub fn glyph_slice(self, range: Range<u32>) -> Option<&'a [GlyphId]> {
+    pub fn glyph_slice(self, range: Range<u32>) -> Option<crate::shaping::GlyphSlice<'a>> {
         let start = usize::try_from(range.start).ok()?;
         let end = usize::try_from(range.end).ok()?;
-        self.doc.shaped.inline_content.glyphs().get(start..end)
+        self.doc.shaped().glyphs.slice(start..end)
     }
 
     /// Updated source color, independent of the retained backend glyph/run.
@@ -653,7 +658,26 @@ impl<'a> RenderTextView<'a> {
     }
 
     pub fn glyph_metric(self, glyph: GlyphId) -> Option<crate::GlyphMetric> {
-        self.doc.shaped.glyph_metrics.get_checked(glyph)
+        self.doc.shaped().glyph_metrics.get_checked(glyph)
+    }
+
+    /// Paint identity, including bidi mirroring, without changing logical text.
+    /// Directional controls and discretionary hyphens have no ordinary ink.
+    pub fn paint_glyph_at(self, index: u32) -> Option<GlyphId> {
+        let glyph = self.glyph_at(index as usize)?;
+        let character = self.glyph_metric(glyph)?.ch();
+        if character == '\u{00ad}' || crate::shaping::is_bidi_control(character) {
+            return None;
+        }
+        Some(self.doc.text_geometry().paint_glyph(index, glyph))
+    }
+
+    pub fn character_direction(self, index: u32) -> TextDirection {
+        if self.doc.text_geometry().bidi().level(index) % 2 == 1 {
+            TextDirection::Rtl
+        } else {
+            TextDirection::Ltr
+        }
     }
 
     /// Natural shaped advance for one logical character.
@@ -673,21 +697,22 @@ impl<'a> RenderTextView<'a> {
     ) -> impl Iterator<Item = RenderAuthoritativeTextRun> + 'a {
         self.doc
             .text_geometry()
-            .authoritative_runs()
-            .iter()
+            .authoritative_runs(requested.clone())
             .filter_map(move |run| {
                 let start = requested.start.max(run.source_range.start);
                 let end = requested.end.min(run.source_range.end);
                 if start >= end {
                     return None;
                 }
-                let local_start = start - run.source_range.start;
-                let local_end = end - run.source_range.start;
+                let local_start = start - run.source_range.start + run.run_offset;
+                let local_end = end - run.source_range.start + run.run_offset;
                 Some(RenderAuthoritativeTextRun {
                     source_range: start..end,
                     run_range: local_start..local_end,
                     run: run.backend_run,
-                    natural_offset: *run.caret_stops.get(local_start as usize)?,
+                    natural_offset: if self.doc.text_geometry().bidi().level(start) % 2 == 1 {
+                        run.caret_stops.get(local_start as usize)?.min(*run.caret_stops.get(local_end as usize)?)
+                    } else { *run.caret_stops.get(local_start as usize)? },
                     ascent: run.ascent,
                     placement_required: run.placement_required,
                 })
@@ -835,14 +860,14 @@ impl<'a> RenderTextView<'a> {
 
     pub fn text_runs(self) -> RenderTextRuns<'a> {
         RenderTextRuns::new(
-            self.doc.shaped.inline_content.inline_items(),
+            self.doc.inputs.text.content().inline_items(),
             Some(TextRunKind::Text),
         )
     }
 
     pub fn marker_runs(self) -> RenderTextRuns<'a> {
         RenderTextRuns::new(
-            self.doc.shaped.inline_content.inline_items(),
+            self.doc.inputs.text.content().inline_items(),
             Some(TextRunKind::Marker),
         )
     }

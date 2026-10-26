@@ -3,15 +3,31 @@
 use super::prepared::{ParsedStylesheetSet, PreparedRuleSet, PreparedStylesheetFragment};
 use crate::style::matching::selectors::SelectorIndex;
 use crate::{
-    AuthorStylesheetInput, DEFAULT_CSS, MediaEnvironment, MediaQuerySet, MediaType, StyleTimings,
+    AuthorStylesheetInput, DEFAULT_CSS, FontFace, MediaEnvironment, MediaQuerySet, MediaType, StyleTimings,
     StyledDocument,
 };
 use html_dom::Document;
 use lightningcss::stylesheet::{ParserOptions, StyleAttribute, StyleSheet};
 use static_self::IntoOwned;
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use web_time::Instant;
+
+/// The built-in source never changes. Share its immutable parser output across
+/// programs and document workers; media evaluation and rule preparation still
+/// run for each program's environment. Only the initializing call records parse
+/// time, so a cache lookup is not reported as another CSS parse.
+fn default_stylesheet(timings: &mut StyleTimings) -> &'static StyleSheet<'static> {
+    static STYLESHEET: OnceLock<StyleSheet<'static>> = OnceLock::new();
+    STYLESHEET.get_or_init(|| {
+        let started = Instant::now();
+        let stylesheet = StyleSheet::parse(DEFAULT_CSS, ParserOptions::default())
+            .expect("default CSS must parse")
+            .into_owned();
+        timings.parse_default_css = started.elapsed();
+        stylesheet
+    })
+}
 
 /// Parsed, prepared, and indexed CSS that can be applied to multiple DOMs.
 /// DOM-specific implicit `@scope` roots are supplied when the program runs.
@@ -63,36 +79,70 @@ pub(crate) struct ParsedInlineStyleCache {
     capacity: usize,
     hits: u64,
     misses: u64,
+    revision: u64,
 }
 
 impl Default for ParsedInlineStyleCache {
     fn default() -> Self {
-        Self { entries: VecDeque::new(), capacity: 256, hits: 0, misses: 0 }
+        Self { entries: VecDeque::new(), capacity: 256, hits: 0, misses: 0, revision: 0 }
     }
 }
 
 impl ParsedInlineStyleCache {
-    pub(crate) fn get_or_parse(&mut self, css: &str) -> Option<Arc<StyleAttribute<'static>>> {
-        if let Some(position) = self.entries.iter().position(|entry| entry.css == css) {
-            self.hits += 1;
-            if position + 1 != self.entries.len() {
-                let entry = self.entries.remove(position).expect("located inline style exists");
-                self.entries.push_back(entry);
+    fn lookup(&mut self, css: &str) -> Option<Option<Arc<StyleAttribute<'static>>>> {
+        let position = self.entries.iter().position(|entry| entry.css == css)?;
+        if position + 1 != self.entries.len() {
+            let entry = self.entries.remove(position).expect("located inline style exists");
+            self.entries.push_back(entry);
+        }
+        Some(self.entries.back().expect("cached inline style exists").style.clone())
+    }
+
+    /// Resolve the document's distinct inline sources with at most two locks.
+    /// Parsing and disposal of redundant concurrent results happen outside
+    /// the shared LRU's critical section.
+    pub(crate) fn get_or_parse_batch(shared: &Mutex<Self>, sources: &[&str]) -> Vec<Option<Arc<StyleAttribute<'static>>>> {
+        let mut styles = vec![None; sources.len()];
+        if sources.is_empty() { return styles; }
+        let mut misses = Vec::new();
+        let revision = {
+            let mut cache = shared.lock().expect("inline style cache lock");
+            for (index, source) in sources.iter().enumerate() {
+                if let Some(style) = cache.lookup(source) {
+                    cache.hits += 1;
+                    styles[index] = style;
+                } else {
+                    cache.misses += 1;
+                    misses.push(index);
+                }
             }
-            return self.entries.back().expect("cached inline style exists").style.clone();
+            cache.revision
+        };
+        if misses.is_empty() { return styles; }
+        for &index in &misses {
+            let normalized = crate::style::source::declarations::normalize(sources[index]);
+            styles[index] = StyleAttribute::parse(&normalized, ParserOptions { error_recovery: true, ..ParserOptions::default() }).ok().map(|style| Arc::new(style.into_owned()));
         }
-        self.misses += 1;
-        let normalized = crate::style::source::declarations::normalize(css);
-        let style = StyleAttribute::parse(&normalized, ParserOptions { error_recovery: true, ..ParserOptions::default() }).ok().map(|style| Arc::new(style.into_owned()));
-        if self.entries.len() == self.capacity {
-            self.entries.pop_front();
+        let mut discarded = Vec::new();
+        let mut cache = shared.lock().expect("inline style cache lock");
+        let raced = cache.revision != revision;
+        for index in misses {
+            if raced && let Some(cached) = cache.lookup(sources[index]) {
+                discarded.push(std::mem::replace(&mut styles[index], cached));
+                continue;
+            }
+            if cache.entries.len() == cache.capacity { cache.entries.pop_front(); }
+            cache.entries.push_back(CachedInlineStyle { css: sources[index].to_owned(), style: styles[index].clone() });
+            cache.revision = cache.revision.wrapping_add(1);
         }
-        self.entries.push_back(CachedInlineStyle { css: css.to_owned(), style: style.clone() });
-        style
+        drop(cache);
+        drop(discarded);
+        styles
     }
 
     fn clear(&mut self) {
         self.entries.clear();
+        self.revision = self.revision.wrapping_add(1);
         self.hits = 0;
         self.misses = 0;
     }
@@ -247,6 +297,11 @@ impl StyleProgramCache {
 }
 
 impl StyleProgram {
+    /// Active font declarations for this program's media environment.
+    pub fn font_faces(&self) -> &[FontFace] {
+        self.prepared.font_faces()
+    }
+
     pub fn compile(
         css_chunks: &[&str],
         environment: MediaEnvironment,
@@ -261,9 +316,7 @@ impl StyleProgram {
         initial_font_size: f32,
     ) -> (Self, StyleTimings) {
         let mut timings = StyleTimings::default();
-        let started = Instant::now();
-        let user_agent = StyleSheet::parse(DEFAULT_CSS, ParserOptions::default()).expect("default CSS must parse").into_owned();
-        timings.parse_default_css = started.elapsed();
+        let user_agent = default_stylesheet(&mut timings);
         let started = Instant::now();
         let mut stylesheets = Vec::with_capacity(css_chunks.len());
         let mut author_root_indices = Vec::with_capacity(css_chunks.len());
@@ -285,18 +338,16 @@ impl StyleProgram {
             }
         }
         timings.parse_author_css = started.elapsed();
-        let prepared = ParsedStylesheetSet::with_contiguous_author_root_indices(&user_agent, &stylesheets, &author_root_indices);
+        let prepared = ParsedStylesheetSet::with_contiguous_author_root_indices(user_agent, &stylesheets, &author_root_indices);
         Self::finish_compile(prepared, css_chunks.len(), environment, initial_font_size, timings, Arc::new(Mutex::new(ParsedInlineStyleCache::default())))
     }
 
     fn compile_parsed_with_timings(input_count: usize, stylesheets: &[(Arc<PreparedStylesheetFragment<'static>>, usize)], environment: MediaEnvironment, initial_font_size: f32, inline_styles: Arc<Mutex<ParsedInlineStyleCache>>) -> (Self, StyleTimings) {
         let mut timings = StyleTimings::default();
-        let started = Instant::now();
-        let user_agent = StyleSheet::parse(DEFAULT_CSS, ParserOptions::default()).expect("default CSS must parse").into_owned();
-        timings.parse_default_css = started.elapsed();
+        let user_agent = default_stylesheet(&mut timings);
         let author_refs = stylesheets.iter().map(|(stylesheet, _)| stylesheet.as_ref()).collect::<Vec<_>>();
         let author_root_indices = stylesheets.iter().map(|(_, index)| u32::try_from(*index).expect("author stylesheet count fits in u32")).collect::<Vec<_>>();
-        let prepared = ParsedStylesheetSet::with_fragments(&user_agent, &author_refs, &author_root_indices);
+        let prepared = ParsedStylesheetSet::with_fragments(user_agent, &author_refs, &author_root_indices);
         Self::finish_compile(prepared, input_count, environment, initial_font_size, timings, inline_styles)
     }
 
@@ -372,9 +423,21 @@ fn apply(
     document: Document,
     program: &StyleProgram,
     inputs: &[AuthorStylesheetInput<'_>],
-    mut timings: StyleTimings,
+    timings: StyleTimings,
     reader_overrides: &html_style_model::ReaderStyleOverrides,
 ) -> (StyledDocument, StyleTimings, MediaQuerySet) {
+    let (styles, timings, queries) = resolve_document_with_program(&document, program, inputs, timings, reader_overrides);
+    (StyledDocument { document, styles, font_faces: program.prepared.font_faces().clone() }, timings, queries)
+}
+
+/// Resolve a new cascade while borrowing the canonical DOM owned by the session.
+pub fn resolve_document_with_program(
+    document: &Document,
+    program: &StyleProgram,
+    inputs: &[AuthorStylesheetInput<'_>],
+    mut timings: StyleTimings,
+    reader_overrides: &html_style_model::ReaderStyleOverrides,
+) -> (html_style_model::ComputedStyles, StyleTimings, MediaQuerySet) {
     assert_eq!(
         inputs.len(),
         program.input_count,
@@ -386,7 +449,7 @@ fn apply(
         .collect::<Vec<_>>();
     let started = Instant::now();
     let (styles, resolution) = crate::style::cascade::resolver::resolve_styles_for_dom_timed(
-        &document,
+        document,
         &program.prepared,
         &program.selector_index,
         &author_roots,
@@ -399,12 +462,16 @@ fn apply(
     timings.selector_matching = resolution.selector_matching;
     timings.cascade = resolution.cascade;
     timings.style_store = resolution.style_store;
-    (StyledDocument { document, styles }, timings, media_queries)
+    (styles, timings, media_queries)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{StyleProgram, StyleProgramCache};
+    use super::{StyleProgram, StyleProgramCache, default_stylesheet, style_document_with_program_and_timings};
+    use crate::{AuthorStylesheetInput, MediaEnvironment, StyleTimings};
+    use html_style_model::Display;
+    use std::ptr;
+    use std::time::Duration;
 
     fn assert_send_sync<T: Send + Sync>() {}
 
@@ -412,5 +479,87 @@ mod tests {
     fn compiled_program_can_move_between_document_workers() {
         assert_send_sync::<StyleProgram>();
         assert_send_sync::<StyleProgramCache>();
+    }
+
+    #[test]
+    fn default_stylesheet_is_shared_across_document_workers() {
+        let shared = default_stylesheet(&mut StyleTimings::default());
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8).map(|_| scope.spawn(|| {
+                let mut timings = StyleTimings::default();
+                let reused = default_stylesheet(&mut timings);
+                assert!(ptr::eq(shared, reused));
+                assert_eq!(timings.parse_default_css, Duration::ZERO);
+            })).collect();
+            for worker in workers { worker.join().unwrap(); }
+        });
+    }
+
+    #[test]
+    fn fresh_programs_reuse_default_css_and_keep_environment_specific_styles() {
+        default_stylesheet(&mut StyleTimings::default());
+        let css = "p { color: red } @media (min-width: 600px) { p { color: blue } }";
+        for cached in [false, true] {
+            let mut cache = StyleProgramCache::default();
+            for (width, expected_color) in [(400.0, 0xff0000ff), (800.0, 0x0000ffff), (400.0, 0xff0000ff)] {
+                let document = html_parse::parse_dom_document("<!doctype html><html><body><p>text<span>span</span></p></body></html>").unwrap();
+                let inputs = [AuthorStylesheetInput { css, implicit_scope_root: document.dom_root() }];
+                let environment = MediaEnvironment::screen(width, None).unwrap();
+                let (styled, timings) = if cached {
+                    // Clearing a book cache must not discard the shared UA AST.
+                    cache.clear();
+                    let (program, timings) = cache.get_or_compile(&inputs, environment, 16.0);
+                    (style_document_with_program_and_timings(document, &program, &inputs).0, timings)
+                } else {
+                    let (program, timings) = StyleProgram::compile_with_timings(&[css], environment, 16.0);
+                    (style_document_with_program_and_timings(document, &program, &inputs).0, timings)
+                };
+                assert_eq!(timings.parse_default_css, Duration::ZERO);
+                let paragraph = styled.document().node_ids().find(|&node| styled.document().get_dom_tag(node) == Some("p")).unwrap();
+                let paragraph_style = styled.style_for_node(paragraph).unwrap();
+                assert_eq!(styled.text_style(paragraph_style).unwrap().color, expected_color);
+                assert_eq!(styled.style_view(paragraph_style).unwrap().display(), Display::Block);
+                let span = styled.document().node_ids().find(|&node| styled.document().get_dom_tag(node) == Some("span")).unwrap();
+                assert_eq!(styled.style_view(styled.style_for_node(span).unwrap()).unwrap().display(), Display::Inline);
+            }
+        }
+    }
+}
+
+
+
+#[cfg(test)]
+mod inline_cache_tests {
+    use super::*;
+    use std::sync::Barrier;
+
+    #[test]
+    fn simultaneous_inline_cache_misses_publish_one_shared_style() {
+        let cache = Mutex::new(ParsedInlineStyleCache::default());
+        let ready = Barrier::new(4);
+        let styles = std::thread::scope(|scope| {
+            let jobs: Vec<_> = (0..4).map(|_| scope.spawn(|| {
+                ready.wait();
+                ParsedInlineStyleCache::get_or_parse_batch(&cache, &["color: red; padding: 1px"]).pop().flatten().unwrap()
+            })).collect();
+            jobs.into_iter().map(|job| job.join().unwrap()).collect::<Vec<_>>()
+        });
+        assert!(styles.iter().all(|style| Arc::ptr_eq(style, &styles[0])));
+        let cache = cache.lock().unwrap();
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.hits + cache.misses, 4);
+    }
+
+    #[test]
+    fn a_batch_pins_hits_before_new_sources_evict_them() {
+        let cache = Mutex::new(ParsedInlineStyleCache { capacity: 2, ..Default::default() });
+        let first = ParsedInlineStyleCache::get_or_parse_batch(&cache, &["color: red", "color: blue"]);
+        let second = ParsedInlineStyleCache::get_or_parse_batch(&cache, &["color: green", "color: red", "color: blue"]);
+        assert!(Arc::ptr_eq(first[0].as_ref().unwrap(), second[1].as_ref().unwrap()));
+        assert!(Arc::ptr_eq(first[1].as_ref().unwrap(), second[2].as_ref().unwrap()));
+        let cache = cache.lock().unwrap();
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.hits, 2);
+        assert_eq!(cache.misses, 3);
     }
 }

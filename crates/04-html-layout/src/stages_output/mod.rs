@@ -13,9 +13,19 @@ use std::ops::Range;
 mod addressing;
 mod boxes;
 mod fragments;
+mod geometry;
+mod markdown;
 mod reading;
+mod semantics;
+mod search;
+mod source;
 mod text;
+pub use source::{SourceLocation};
+pub use search::{TextSearchOptions, find_text_matches};
+pub use geometry::{CaretAffinity, PositionedShapedLine, RenderGeometryView};
+pub use semantics::{ContentRole, ContentSemantics, RenderSemanticsView};
 pub use reading::{ReadingFragment, ReadingTarget, is_navigation_section_title};
+pub use markdown::RenderExportView;
 
 pub use addressing::{
     RenderAddressingView, RenderAnchorPosition, RenderAnchorPositions, SourceElementStep,
@@ -129,6 +139,19 @@ impl<'a> RenderView<'a> {
 
     pub fn addressing(self) -> RenderAddressingView<'a> {
         RenderAddressingView { doc: self.doc }
+    }
+
+    /// Semantic selection export for clipboard or file output.
+    pub fn export(self) -> RenderExportView<'a> {
+        RenderExportView { doc: self.doc }
+    }
+
+    pub fn semantics(self) -> RenderSemanticsView<'a> {
+        RenderSemanticsView { doc: self.doc }
+    }
+
+    pub fn geometry(self) -> RenderGeometryView<'a> {
+        RenderGeometryView { doc: self.doc }
     }
 
     pub fn root_font_size(&self) -> f32 {

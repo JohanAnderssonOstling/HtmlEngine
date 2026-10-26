@@ -5,39 +5,25 @@ use crate::style::matching::selectors::AncestorFilter;
 
 pub(super) struct InlineStyleCache {
     node_style_ids: Vec<Option<u32>>,
-    styles: Vec<Arc<StyleAttribute<'static>>>,
+    styles: Vec<Option<Arc<StyleAttribute<'static>>>>,
 }
 
 impl InlineStyleCache {
     pub(super) fn new(doc: &Document, shared: &Arc<Mutex<ParsedInlineStyleCache>>) -> Self {
         let mut node_style_ids = vec![None; doc.node_count()];
-        let mut styles = Vec::new();
-        let mut parsed = FxHashMap::<&str, Option<u32>>::default();
-        let mut shared = shared.lock().expect("inline style cache lock");
+        let mut sources = Vec::new();
+        let mut parsed = FxHashMap::<&str, u32>::default();
         for node_idx in doc.node_ids() {
-            let Some(source) = doc
-                .get_dom_attr(node_idx, "style")
-                .filter(|source| !source.trim().is_empty())
-            else {
-                continue;
-            };
-            let style_id = if let Some(style_id) = parsed.get(source) {
-                *style_id
-            } else {
-                let style_id = shared.get_or_parse(source).map(|style| {
-                    let id = u32::try_from(styles.len()).expect("inline style count fits in u32");
-                    styles.push(style);
-                    id
-                });
-                parsed.insert(source, style_id);
-                style_id
-            };
-            node_style_ids[node_idx.index()] = style_id;
+            let Some(source) = doc.get_dom_attr(node_idx, "style").filter(|source| !source.trim().is_empty()) else { continue };
+            let style_id = *parsed.entry(source).or_insert_with(|| {
+                let id = u32::try_from(sources.len()).expect("inline style count fits in u32");
+                sources.push(source);
+                id
+            });
+            node_style_ids[node_idx.index()] = Some(style_id);
         }
-        Self {
-            node_style_ids,
-            styles,
-        }
+        let styles = ParsedInlineStyleCache::get_or_parse_batch(shared, &sources);
+        Self { node_style_ids, styles }
     }
 
     pub(super) fn get(&self, node_idx: DomNodeId) -> Option<&StyleAttribute<'static>> {
@@ -46,7 +32,7 @@ impl InlineStyleCache {
             .get(node_idx.index())
             .copied()
             .flatten()?;
-        self.styles.get(id as usize).map(Arc::as_ref)
+        self.styles.get(id as usize)?.as_deref()
     }
 }
 

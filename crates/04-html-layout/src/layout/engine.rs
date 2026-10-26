@@ -1,7 +1,7 @@
 use crate::layout_model::{
-    BoxGeometry, GlyphId, GlyphMetrics, InlineContent, LayoutState, LayoutTree,
+    BoxGeometry, GlyphId, GlyphMetrics, InlineContent, LayoutState, LayoutTree, LineOutput,
 };
-use html_dom::Document;
+use html_dom::{Document, MemoryUsageReport};
 use html_style_model::ComputedStyles;
 use kurbo::Point;
 use std::cell::RefCell;
@@ -11,9 +11,10 @@ use web_time::Instant;
 use super::fragment_writer::FragmentWriter;
 use super::geometry_writer::GeometryWriter;
 use super::inline_reader::InlineReader;
+use super::inline::{InlinePlanCache, InlinePlanGeneration};
 use super::measurement::MeasurementScratch;
 use super::placement::PlacementState;
-use super::read_context::LayoutReader;
+use super::read_context::{BoxStyleSnapshot, LayoutReader};
 use super::{
     absolute_positioning::AbsolutePositioningState,
     block::{FloatState, MarginAnalysis},
@@ -27,6 +28,7 @@ pub(crate) fn layout_with_timings(
     constraints: crate::LayoutConstraints,
     timings: Option<&mut LayoutTimings>,
 ) {
+    profile_scope!("layout.engine");
     // Keep telemetry owned by the layout session. `record_timing` is called
     // through shared references throughout recursive layout, so interior
     // mutability provides the narrow safe capability that the old raw pointer
@@ -38,18 +40,20 @@ pub(crate) fn layout_with_timings(
         placement,
         scratch,
     } = outputs;
+    let box_styles = BoxStyleSnapshot::new(inputs.document, inputs.inline_content, inputs.styles, inputs.topology, inputs.font_metrics);
     let reader = LayoutReader::new(
         inputs.document,
         inputs.styles,
         inputs.topology,
         inputs.inline_content,
-        inputs.glyph_metrics,
         inputs.font_metrics,
         inputs.image_metrics,
+        &box_styles,
     );
     let track_overflow_clips = reader.tracks_overflow_clips();
     let text = InlineReader::new(
         inputs.inline_content,
+        inputs.glyphs,
         inputs.glyph_metrics,
         inputs.text_geometry,
         inputs.ellipsis_glyphs,
@@ -60,7 +64,7 @@ pub(crate) fn layout_with_timings(
         track_overflow_clips,
         reader,
         text,
-        inline_plans: inputs.inline_plans,
+        inline_plan_generation: inputs.inline_plan_generation,
         text_style_ranges: inputs.text_style_ranges,
         resource_generation: inputs.resource_generation,
     };
@@ -98,22 +102,30 @@ pub(crate) struct LayoutScratch {
     finalization: FinalizationScratch,
     paragraphs: Vec<super::inline::ParagraphScratch>,
     paragraph_layouts: super::inline::ParagraphLayouts,
+    publication_epoch: u64,
+    previous_config: Option<LayoutConfig>,
+    inline_plans: InlinePlanCache,
     line_owners: Vec<u32>,
     block_decoration_owners: Vec<u32>,
 }
 
 impl Clone for LayoutScratch {
     fn clone(&self) -> Self {
-        // Scratch has no semantic state. Cloning a laid-out document should not
-        // duplicate potentially large temporary allocations.
+        // An independent executor starts without copying retained execution
+        // buffers or publication locators.
         Self::default()
     }
 }
 
 impl LayoutScratch {
+    pub(crate) fn inline_plan_memory_report(&self) -> MemoryUsageReport { self.inline_plans.memory_usage_report() }
+    #[cfg(test)]
+    pub(crate) fn inline_plan_count(&self) -> usize { self.inline_plans.len() }
+    #[cfg(test)]
+    pub(crate) fn inline_plan_pointer(&self) -> Option<usize> { self.inline_plans.first_token_pointer() }
     #[cfg(test)]
     pub(crate) fn paragraph_layout_bytes(&self) -> usize { self.paragraph_layouts.memory_usage_bytes() }
-    pub(crate) fn paragraph_layout_memory_report(&self) -> html_dom::MemoryUsageReport { self.paragraph_layouts.memory_usage_report() }
+    pub(crate) fn paragraph_layout_memory_report(&self) -> MemoryUsageReport { self.paragraph_layouts.memory_usage_report() }
     #[cfg(test)]
     pub(crate) fn paragraph_reuse_counts(&self) -> (usize, usize) { self.paragraph_layouts.reuse_counts() }
     #[cfg(test)]
@@ -144,16 +156,17 @@ pub(crate) struct LayoutInputs<'a> {
     pub(crate) styles: &'a ComputedStyles,
     pub(crate) topology: &'a LayoutTree,
     pub(crate) inline_content: &'a InlineContent,
+    pub(crate) glyphs: crate::shaping::GlyphSlice<'a>,
     pub(crate) glyph_metrics: &'a GlyphMetrics,
     pub(crate) font_metrics: &'a crate::shaping::ShapedFontMetrics,
-    pub(crate) text_geometry: Option<&'a crate::shaping::ShapedTextGeometry>,
+    pub(crate) text_geometry: Option<crate::shaping::TextGeometryView<'a>>,
     pub(crate) ellipsis_glyphs: &'a rustc_data_structures::fx::FxHashMap<u32, GlyphId>,
     pub(crate) hyphen_glyphs: &'a rustc_data_structures::fx::FxHashMap<u32, GlyphId>,
-    pub(crate) inline_plans: &'a crate::layout::PreparedInlinePlans,
+    pub(crate) inline_plan_generation: InlinePlanGeneration,
     pub(crate) image_metrics: &'a crate::ImageMetrics,
     pub(crate) paint: &'a crate::stages::PaintStyles,
     pub(crate) text_style_ranges: &'a [crate::stages::TextPaintRange],
-    pub(crate) resource_generation: &'a crate::GlyphResourceGeneration,
+    pub(crate) resource_generation: crate::GlyphResourceGeneration,
 }
 
 pub(crate) struct LayoutOutputs<'out, 'scratch> {
@@ -187,6 +200,10 @@ pub struct LayoutTimings {
     pub emit_lines: Duration,
     pub measure_line: Duration,
     pub write_line_fragments: Duration,
+    /// Lines measured during this pass, including intrinsic probes.
+    pub measured_lines: usize,
+    /// Published line records moved from the previous output without measurement.
+    pub reused_lines: usize,
     pub place_float_anchor: Duration,
     pub layout_flex_grid: Duration,
     pub measure_flex_grid_item: Duration,
@@ -211,14 +228,18 @@ pub(crate) struct LayoutEngine<'a, 'out> {
     pub(super) floats: FloatState,
     pub(super) margins: MarginAnalysis,
     pub(super) absolute_positioning: AbsolutePositioningState,
-    pub(super) inline_plans: &'a crate::layout::PreparedInlinePlans,
+    pub(super) inline_plans: InlinePlanCache,
+    pub(super) inline_plan_generation: InlinePlanGeneration,
     pub(crate) flex_grid: crate::flex_grid::FlexGridState,
     pub(super) measurement: MeasurementScratch,
     pub(super) finalization: FinalizationScratch,
     pub(super) paragraphs: Vec<super::inline::ParagraphScratch>,
     pub(super) paragraph_layouts: super::inline::ParagraphLayouts,
+    pub(super) publication_epoch: u64,
+    // Only lives during the pass. No old publication is retained in scratch.
+    pub(super) previous_lines: Option<LineOutput>,
     pub(super) text_style_ranges: &'a [crate::stages::TextPaintRange],
-    pub(super) resource_generation: &'a crate::GlyphResourceGeneration,
+    pub(super) resource_generation: crate::GlyphResourceGeneration,
     pub(super) track_overflow_clips: bool,
     fragmentation_suppression_depth: usize,
     pub(crate) reader: LayoutReader<'a>,
@@ -242,8 +263,16 @@ impl<'a, 'out> LayoutEngine<'a, 'out> {
             placement,
             scratch,
         } = outputs;
+        scratch.inline_plans.begin_generation(read.inline_plan_generation);
+        let previous_lines = (scratch.previous_config == Some(read.config)
+            && !geometry.uses_lazy_reset()
+            && scratch.paragraph_layouts.has_publication()
+            && !state.line_output.lines.is_empty())
+            .then(|| std::mem::take(&mut state.line_output));
         Self {
             config: read.config,
+            previous_lines,
+            publication_epoch: scratch.publication_epoch.wrapping_add(1),
             floats: std::mem::take(&mut scratch.floats),
             margins: std::mem::take(&mut scratch.margins),
             absolute_positioning: std::mem::take(&mut scratch.absolute_positioning),
@@ -264,7 +293,8 @@ impl<'a, 'out> LayoutEngine<'a, 'out> {
                 std::mem::take(&mut scratch.block_decoration_owners),
             ),
             placement: std::mem::take(placement),
-            inline_plans: read.inline_plans,
+            inline_plans: std::mem::take(&mut scratch.inline_plans),
+            inline_plan_generation: read.inline_plan_generation,
             fragmentation_suppression_depth,
             timings,
         }
@@ -284,14 +314,38 @@ impl<'a, 'out> LayoutEngine<'a, 'out> {
         scratch.finalization = std::mem::take(&mut self.finalization);
         scratch.paragraphs = std::mem::take(&mut self.paragraphs);
         scratch.paragraph_layouts = std::mem::take(&mut self.paragraph_layouts);
+        scratch.publication_epoch = self.publication_epoch;
+        scratch.previous_config = Some(self.config);
+        self.inline_plans.trim();
+        scratch.inline_plans = std::mem::take(&mut self.inline_plans);
+    }
+
+    /// Return buffers only used by finalization after the last borrowed read.
+    /// All remaining previous output storage is released at this boundary.
+    pub(super) fn release_previous_lines(&mut self) {
+        if let Some(mut previous) = self.previous_lines.take() {
+            let current = &mut self.fragments.state_mut().line_output;
+            previous.lines.clear();
+            previous.lines.append(&mut current.lines);
+            current.lines = std::mem::take(&mut previous.lines);
+            current.line_glyph_offsets.recycle_storage(std::mem::take(&mut previous.line_glyph_offsets));
+            current.line_glyph_advances.recycle_storage(std::mem::take(&mut previous.line_glyph_advances));
+            current.glyph_line_indices = std::mem::take(&mut previous.glyph_line_indices);
+            previous.prepared_text_run_fragments.clear();
+            current.prepared_text_run_fragments = std::mem::take(&mut previous.prepared_text_run_fragments);
+        }
+    }
+
+    pub(crate) fn retain_measurement_plans(&mut self, measurement: ParallelBoxMeasurement) {
+        self.inline_plans.merge(measurement.inline_plans);
     }
 
     pub(crate) fn parallel_measurement_context(&self) -> LayoutReadContext<'a> {
         LayoutReadContext {
             config: self.config,
-            reader: self.reader.clone(),
+            reader: self.reader,
             text: self.text,
-            inline_plans: self.inline_plans,
+            inline_plan_generation: self.inline_plan_generation,
             text_style_ranges: self.text_style_ranges,
             resource_generation: self.resource_generation,
             track_overflow_clips: self.track_overflow_clips,
@@ -402,14 +456,14 @@ impl<'a, 'out> LayoutEngine<'a, 'out> {
 }
 
 /// Immutable inputs shared by normal layout and table-cell measurement workers.
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub(crate) struct LayoutReadContext<'a> {
     config: LayoutConfig,
     reader: LayoutReader<'a>,
     text: InlineReader<'a>,
-    inline_plans: &'a crate::layout::PreparedInlinePlans,
+    inline_plan_generation: InlinePlanGeneration,
     text_style_ranges: &'a [crate::stages::TextPaintRange],
-    resource_generation: &'a crate::GlyphResourceGeneration,
+    resource_generation: crate::GlyphResourceGeneration,
     track_overflow_clips: bool,
 }
 
@@ -431,10 +485,10 @@ impl Default for ParallelMeasurementWorker {
     }
 }
 
-#[derive(Clone, Copy)]
 pub(crate) struct ParallelBoxMeasurement {
     pub(crate) size: kurbo::Size,
     pub(crate) first_baseline: Option<f64>,
+    pub(super) inline_plans: InlinePlanCache,
 }
 
 impl LayoutReadContext<'_> {
@@ -447,7 +501,7 @@ impl LayoutReadContext<'_> {
         #[cfg(test)]
         super::parallel::record_worker();
         let mut engine = LayoutEngine::new(
-            self.clone(),
+            *self,
             LayoutOutputs {
                 geometry: &mut worker.geometry,
                 state: &mut worker.state,
@@ -468,13 +522,12 @@ impl LayoutReadContext<'_> {
             cell_layout.output.lines,
             engine.geometry.point(request.box_idx).y,
         );
-        let result = ParallelBoxMeasurement {
+        engine.recycle_into(&mut worker.placement, &mut worker.scratch);
+        ParallelBoxMeasurement {
             size: cell_layout.size,
             first_baseline,
-        };
-
-        engine.recycle_into(&mut worker.placement, &mut worker.scratch);
-        result
+            inline_plans: std::mem::take(&mut worker.scratch.inline_plans),
+        }
     }
 }
 
@@ -483,9 +536,10 @@ impl LayoutReadContext<'_> {
 pub(crate) fn repaint(inputs: LayoutInputs<'_>, geometry: &mut BoxGeometry, state: &mut LayoutState, constraints: crate::LayoutConstraints) {
     let mut placement = PlacementState::default();
     let mut scratch = LayoutScratch::default();
-    let reader = LayoutReader::new(inputs.document, inputs.styles, inputs.topology, inputs.inline_content, inputs.glyph_metrics, inputs.font_metrics, inputs.image_metrics).with_paint(inputs.paint);
-    let text = InlineReader::new(inputs.inline_content, inputs.glyph_metrics, inputs.text_geometry, inputs.ellipsis_glyphs, inputs.hyphen_glyphs);
-    let read = LayoutReadContext { config: LayoutConfig::new(constraints), track_overflow_clips: reader.tracks_overflow_clips(), reader, text, inline_plans: inputs.inline_plans, text_style_ranges: inputs.text_style_ranges, resource_generation: inputs.resource_generation };
+    let box_styles = BoxStyleSnapshot::new(inputs.document, inputs.inline_content, inputs.styles, inputs.topology, inputs.font_metrics);
+    let reader = LayoutReader::new(inputs.document, inputs.styles, inputs.topology, inputs.inline_content, inputs.font_metrics, inputs.image_metrics, &box_styles).with_paint(inputs.paint);
+    let text = InlineReader::new(inputs.inline_content, inputs.glyphs, inputs.glyph_metrics, inputs.text_geometry, inputs.ellipsis_glyphs, inputs.hyphen_glyphs);
+    let read = LayoutReadContext { config: LayoutConfig::new(constraints), track_overflow_clips: reader.tracks_overflow_clips(), reader, text, inline_plan_generation: inputs.inline_plan_generation, text_style_ranges: inputs.text_style_ranges, resource_generation: inputs.resource_generation };
     let mut engine = LayoutEngine::new(read, LayoutOutputs { geometry, state, placement: &mut placement, scratch: &mut scratch }, None, 0);
     engine.repaint();
 }

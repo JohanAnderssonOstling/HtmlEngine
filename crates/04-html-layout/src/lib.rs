@@ -1,6 +1,23 @@
 #![cfg_attr(not(test), deny(unsafe_code))]
 #![deny(unreachable_pub)]
 
+macro_rules! profile_scope {
+    ($name:literal) => {
+        #[cfg(feature = "profiling")]
+        let _profile_scope = crate::profiling::scope($name);
+    };
+}
+
+macro_rules! profile {
+    ($name:literal, $operation:expr) => {{
+        profile_scope!($name);
+        $operation
+    }};
+}
+
+#[cfg(feature = "profiling")]
+pub mod profiling;
+
 mod layout_model {
     mod geometry;
     mod grouped_arena;
@@ -20,7 +37,7 @@ mod layout_model {
     pub(crate) use source_offsets::SourceOffsets;
     pub(crate) use layout_state::{
         AnchorPosition, DecorationFragment, DecorationPattern, DecorationStore, EllipsisFragment,
-        GlyphAdvanceRun, GlyphOffsetRun, HyphenFragment, ImageFragment, LayoutState, Line, LineDetails,
+        GlyphAdvanceRun, GlyphOffsetRun, HyphenFragment, ImageFragment, LayoutState, Line, LineDetails, LineOutput,
         LineInlineBoxFragment, LineTextFragment, OverflowClip, RoundedDecoration,
     };
     pub use layout_state::PreparedTextRunFragment;
@@ -55,21 +72,26 @@ pub use crate::layout_model::{GlyphId, GlyphMetric, GlyphMetricError, PreparedTe
 pub use html_dom::DocumentTocNode;
 pub use html_style_model::OpenTypeFeature;
 pub use html_style_model::{
+    ContentLanguage, LanguageTag,
     FontStyle, ListStylePosition, ReaderStyleOverrides, StyleStringId, TextAlign, ThemeAdaptation,
-    TextDecorationLines, UsedBorderRadii,
+    TextDecorationLines, TextDirection, UnicodeBidi, UsedBorderRadii,
 };
-pub use shaping::{
+pub use shaping::{GlyphSlice,
     CharacterPlacement, FontMetricsRequest, FontRelativeMetrics, FontSlant,
     GlyphResourceGeneration, GlyphResourceStore,
     GlyphShaper, ShapeError, ShapedLine, ShapedTextRun, TextRunId, TextRunShapeRequest,
     TextShapeRequest, TextStyleSpan,
 };
 pub use stages::{
+    CaretAffinity, PositionedShapedLine, RenderGeometryView,
+    TextSearchOptions, find_text_matches,
+    SourceLocation,
+    ContentRole, ContentSemantics, RenderSemanticsView,
     BoxTextFormat, ImageMetrics, ImageSizingPolicy, LaidOutDocument, LayoutConstraintError,
     LayoutConstraints, NoteFlow, PrepareError, PreparedDocument, RenderAddressingView,
     RenderAnchorPosition, RenderAnchorPositions, RenderAuthoritativeTextRun, RenderBoxView,
     RenderDecoration, RenderDecorationPattern, RenderDecorations, RenderEllipsisFragment,
-    RenderForcedBreak, RenderFragmentView, RenderGlyphAdvanceRun, RenderGlyphAdvanceRuns,
+    RenderExportView, RenderForcedBreak, RenderFragmentView, RenderGlyphAdvanceRun, RenderGlyphAdvanceRuns,
     RenderGlyphOffsetRun, RenderGlyphOffsetRuns, RenderHyphenFragment, RenderImageFragment,
     RenderImageFragments, RenderLine, RenderLineTextFragment, RenderLineTextFragments, RenderLines,
     RenderListItemMarker, RenderOverflowClip, RenderTable, RenderTableCell, RenderTableRow,

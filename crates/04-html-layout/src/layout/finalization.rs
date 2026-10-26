@@ -44,6 +44,7 @@ impl FinalizationScratch {
 
 impl LayoutEngine<'_, '_> {
     pub(super) fn repaint(&mut self) {
+        profile_scope!("layout.paint_replay");
         let commands = std::mem::take(&mut self.fragments.state_mut().paint_program.commands);
         let output = &mut self.fragments.state_mut().fragment_output;
         output.decorations.clear();
@@ -74,7 +75,10 @@ impl LayoutEngine<'_, '_> {
     }
 
     pub(super) fn finalize(&mut self, track_overflow_clips: bool) {
+        profile_scope!("layout.finalize");
         let finalization_started = self.start_timing();
+
+        self.release_previous_lines();
 
         // Recursive layout retains subtree placement transforms so moving a
         // container is independent of descendant count. Public layout output
@@ -86,7 +90,6 @@ impl LayoutEngine<'_, '_> {
         sort_lines_and_remap_images(
             &self.reader,
             &mut self.fragments,
-            &mut self.placement,
             &mut self.finalization,
         );
         self.record_timing(|timings| timings.sort_lines_and_remap_images += start.elapsed());

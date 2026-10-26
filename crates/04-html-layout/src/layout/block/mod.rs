@@ -4,6 +4,8 @@ mod flow;
 mod fragmentation;
 mod margin_cache;
 mod margins;
+mod paragraph_spacing;
+pub(in crate::layout) use paragraph_spacing::ParagraphSpacing;
 
 pub(in crate::layout) use floats::FloatState;
 pub(crate) use floats::{FloatBand, FloatContext, FloatSide};

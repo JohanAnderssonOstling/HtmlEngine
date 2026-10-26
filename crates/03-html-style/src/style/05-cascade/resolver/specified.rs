@@ -691,12 +691,12 @@ pub(super) fn select_specified_values<'sheet, 'css>(
         let target_start = selected.targets.len();
         for target in targets.iter() {
             // `all` deliberately excludes direction and custom properties.
-            if (&*target.name != "direction" && all_claimed)
+            if (!matches!(&*target.name, "direction" | "unicode-bidi") && all_claimed)
                 || target_state.is_claimed(target.slot, claim_epoch)
             {
                 continue;
             }
-            if &*target.name != "direction"
+            if !matches!(&*target.name, "direction" | "unicode-bidi")
                 && matches!(
                     candidate_action(&global_rollbacks, event.boundary, None),
                     CandidateAction::Excluded

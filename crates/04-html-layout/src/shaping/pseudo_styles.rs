@@ -8,7 +8,7 @@ use super::*;
 /// unit with the pseudo style instead of trying to resize already-shaped
 /// glyphs during line layout.
 pub(crate) fn first_letter_style_overrides(document: &Document, styles: &ComputedStyles, layout_tree: &LayoutTree, inline_content: &InlineContent) -> Vec<Option<StyleIndices>> {
-    first_letter_overrides_with_characters(document, styles, layout_tree, inline_content, |index| char::from_u32(inline_content.glyph_at(index as usize).unwrap_or('?' as GlyphId)).unwrap_or('?'))
+    first_letter_overrides_with_characters(document, styles, layout_tree, inline_content, |index| char::from_u32(inline_content.character_at(index as usize).unwrap_or('?' as GlyphId)).unwrap_or('?'))
 }
 
 pub(crate) fn first_letter_overrides_with_characters(document: &Document, styles: &ComputedStyles, layout_tree: &LayoutTree, inline_content: &InlineContent, character_at: impl Fn(u32) -> char) -> Vec<Option<StyleIndices>> {
@@ -40,7 +40,7 @@ pub(crate) fn first_letter_overrides_with_characters(document: &Document, styles
         }));
     }
 
-    let mut overrides = vec![None; inline_content.glyphs().len()];
+    let mut overrides = vec![None; inline_content.characters().len()];
     let mut consumed_owners = FxHashSet::<u32>::default();
     for (root, content) in content_by_root {
         let Some(mut start) = content

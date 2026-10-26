@@ -1,5 +1,20 @@
 #[cfg(test)]
 mod stage_tests {
+    #[test]
+    fn visible_text_runs_follow_display_visibility_and_language_before_shaping() {
+        let mut factory = DocumentFactory::new();
+        let prepared = factory.parse_with_new_pipeline(
+            "<html lang='ja'><head><style>.off {display:none}</style></head><body><p hidden>hidden</p><p class='off'><b style='display:block'>also hidden</b></p><p style='visibility:hidden'>hidden <span lang='zh-Hant' style='visibility:visible'>漢字</span></p><p hidden style='display:block'>かな</p></body></html>",
+            Some(".off {display:none}"),
+        );
+        let runs: Vec<_> = prepared
+            .visible_text_runs()
+            .filter(|(text, _)| !text.trim().is_empty())
+            .map(|(text, language)| (text, language.map(|language| language.as_str())))
+            .collect();
+        assert_eq!(runs, [("漢字", Some("zh-Hant")), ("かな", Some("ja"))]);
+    }
+
     use crate::ShapeError;
     use crate::layout_model::{GlyphId, GlyphMetric, GlyphMetricError};
     use crate::test_support::{DocumentFactory, TestGlyphShaper};
@@ -10,6 +25,18 @@ mod stage_tests {
     };
     use std::sync::Arc;
     use html_style_model::{ComputedStylesBuildError, ComputedStylesBuilder, ComputedStylesValidationError};
+
+    // Independent execution for correctness comparisons; published documents
+    // cannot be cloned. Production readers use the borrowed render view.
+    fn reference_layout(document: &LaidOutDocument) -> LaidOutDocument {
+        reference_layout_with_shaper(document, &mut TestGlyphShaper::new())
+    }
+
+    fn reference_layout_with_shaper(document: &LaidOutDocument, shaper: &mut TestGlyphShaper) -> LaidOutDocument {
+        PreparedDocument { inputs: document.inputs.clone() }
+            .shape(shaper).unwrap()
+            .layout_with_metrics(document.last_constraints, &document.last_image_metrics)
+    }
 
     fn paragraph_geometry_snapshot(document: &LaidOutDocument) -> Vec<String> {
         let mut result = Vec::new();
@@ -43,9 +70,34 @@ mod stage_tests {
         assert!(after.0 >= before.0 + 2, "both unchanged text paragraphs must reuse local line layout");
         assert!(after.1 > before.1, "the changed image paragraph must be measured again");
         assert!(document.layout_state.line_output.lines.last().unwrap().point.y > old_y);
-        let mut reference = document.clone();
+        let mut reference = reference_layout(&document);
         reference.relayout_with_metrics(constraints, &metrics);
         assert_eq!(paragraph_geometry_snapshot(&document), paragraph_geometry_snapshot(&reference));
+    }
+
+    #[test]
+    fn image_relayout_moves_published_lines_and_preserves_exact_fractional_geometry() {
+        let source = format!("<img src='top' style='display:block;width:40px'><section style='margin-left:3.7px'><p>{}</p><p>{}</p></section>", "one two three four five six seven eight ".repeat(8), "more words follow ".repeat(8));
+        let mut factory = DocumentFactory::new();
+        let prepared = factory.parse_with_new_pipeline(&source, Some("p {text-align:justify;text-indent:7.3px;hyphens:none}"));
+        let constraints = LayoutConstraints::new(180.0, 20.0).unwrap().with_text_composition_policy(TextCompositionPolicy::BookOptimized);
+        let mut metrics = ImageMetrics::default();
+        metrics.set(0, 40, 10);
+        let mut document = prepared.shape(&mut TestGlyphShaper::new()).unwrap().layout_with_metrics(constraints, &metrics);
+        let lines = document.layout_state.line_output.lines.as_ptr();
+        let expected_reuse = document.line_count() - 1;
+        for height in [60, 15, 90, 10, 120] {
+            metrics.set(0, 40, height);
+            let timings = document.relayout_with_metrics_and_timings(constraints, &metrics);
+            assert_eq!(timings.reused_lines, expected_reuse, "only the image paragraph needs measurement");
+            assert_eq!(timings.measured_lines, 1);
+            assert_eq!(document.layout_state.line_output.lines.as_ptr(), lines);
+            assert_eq!(paragraph_geometry_snapshot(&document), paragraph_geometry_snapshot(&reference_layout(&document)));
+        }
+        let wider = LayoutConstraints::new(220.0, 20.0).unwrap().with_text_composition_policy(TextCompositionPolicy::BookOptimized);
+        let timings = document.relayout_with_metrics_and_timings(wider, &metrics);
+        assert_eq!(timings.reused_lines, 0, "a width change must recompose");
+        assert_eq!(paragraph_geometry_snapshot(&document), paragraph_geometry_snapshot(&reference_layout(&document)));
     }
 
     #[test]
@@ -90,7 +142,7 @@ mod stage_tests {
     }
 
     #[test]
-    fn translated_float_contexts_reuse_lines_but_changed_exclusion_heights_recompose() {
+    fn float_context_changes_recompose_without_retaining_exclusion_geometry() {
         let mut factory = DocumentFactory::new();
         let source = "<img src='top' style='display:block;width:40px'><section style='display:flow-root'><img src='float' style='float:left;width:60px'><p>one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen</p></section>";
         let constraints = LayoutConstraints::new(180.0, 20.0).unwrap();
@@ -100,14 +152,14 @@ mod stage_tests {
         metrics.set(0,40,50);
         document.relayout_with_metrics(constraints,&metrics);
         let translated = document.layout_scratch.paragraph_reuse_counts();
-        assert!(translated.0 > before.0, "translating the whole context preserves its relative float profile");
-        let mut reference = document.clone();reference.relayout_with_metrics(constraints,&metrics);
+        assert!(translated.1 > before.1, "float paragraphs borrow current exclusions and recompose");
+        let mut reference = reference_layout(&document);reference.relayout_with_metrics(constraints,&metrics);
         assert_eq!(paragraph_geometry_snapshot(&document),paragraph_geometry_snapshot(&reference));
         metrics.set(1,60,150);
         document.relayout_with_metrics(constraints,&metrics);
         let changed = document.layout_scratch.paragraph_reuse_counts();
         assert!(changed.1 > translated.1,"changed float lanes must invalidate dependent line layout");
-        let mut reference = document.clone();reference.relayout_with_metrics(constraints,&metrics);
+        let mut reference = reference_layout(&document);reference.relayout_with_metrics(constraints,&metrics);
         assert_eq!(paragraph_geometry_snapshot(&document),paragraph_geometry_snapshot(&reference));
     }
 
@@ -128,8 +180,9 @@ mod stage_tests {
                 let constraints=LayoutConstraints::new(width,20.0).unwrap().with_text_composition_policy(policy);
                 metrics.set(0,40,height);
                 document.relayout_with_metrics_and_shaper(constraints,&metrics,&mut shaper).unwrap();
-                let mut reference=document.clone();reference.layout_scratch.clear_paragraph_layouts();
-                reference.relayout_with_metrics_and_shaper(constraints,&metrics,&mut shaper).unwrap();
+                let mut reference_shaper = TestGlyphShaper::new();
+                let mut reference=reference_layout_with_shaper(&document, &mut reference_shaper);reference.layout_scratch.clear_paragraph_layouts();
+                reference.relayout_with_metrics_and_shaper(constraints,&metrics,&mut reference_shaper).unwrap();
                 assert_eq!(paragraph_geometry_snapshot(&document),paragraph_geometry_snapshot(&reference),"{source}");
             }
             assert!(document.layout_scratch.paragraph_reuse_counts().0>before.0,"repeated dependencies must reuse paragraph results: {source}");
@@ -148,7 +201,7 @@ mod stage_tests {
         metrics.set(0,40,60);
         document.relayout_with_metrics(constraints,&metrics);
         assert!(document.layout_scratch.paragraph_published_hits(owner)>before,"measurement widths must not evict the cell's actual paragraph layout");
-        let mut reference=document.clone();reference.relayout_with_metrics(constraints,&metrics);
+        let mut reference=reference_layout(&document);reference.relayout_with_metrics(constraints,&metrics);
         assert_eq!(paragraph_geometry_snapshot(&document),paragraph_geometry_snapshot(&reference));
     }
 
@@ -158,13 +211,30 @@ mod stage_tests {
         let prepared=factory.parse_with_new_pipeline("<p>First sentence. Second sentence. Third sentence.</p>",None);
         let base=LayoutConstraints::new(600.0,20.0).unwrap();
         let mut document=prepared.clone().shape(&mut TestGlyphShaper::new()).unwrap().layout(base);
-        for policy in [TextCompositionPolicy::BookOptimized,TextCompositionPolicy::SentencePerLine,TextCompositionPolicy::BookOptimizedUnrestrictedHyphenation,TextCompositionPolicy::WebCompatible,TextCompositionPolicy::SentencePerLine] {
+        for policy in [TextCompositionPolicy::BookOptimized,TextCompositionPolicy::BookOptimizedUnrestrictedHyphenation,TextCompositionPolicy::WebCompatible,TextCompositionPolicy::BookOptimized] {
             let constraints=base.with_text_composition_policy(policy);
             document.relayout(constraints);
             let reference=prepared.clone().shape(&mut TestGlyphShaper::new()).unwrap().layout(constraints);
             assert_eq!(paragraph_geometry_snapshot(&document),paragraph_geometry_snapshot(&reference),"{policy:?}");
-            if policy==TextCompositionPolicy::SentencePerLine { assert!(document.line_count()>1); }
         }
+    }
+
+    #[test]
+    fn paragraph_cache_retains_break_choices_without_measured_output() {
+        let source = "<p>one two three four five six seven eight nine ten</p><p>before <img src='x' style='width:20px'> after</p>";
+        let mut document = DocumentFactory::new().parse_with_new_pipeline(source, None)
+            .shape(&mut TestGlyphShaper::new()).unwrap()
+            .layout(LayoutConstraints::new(100.0, 20.0).unwrap());
+        document.relayout(LayoutConstraints::new(100.0, 20.0).unwrap());
+        let report = document.memory_usage_report();
+        let cache: Vec<_> = report.entries.iter().filter(|entry| entry.label.contains("paragraph_layouts")).collect();
+        assert!(cache.iter().any(|entry| entry.label.ends_with("lines") && entry.bytes > 0));
+        for entry in cache {
+            if ["tokens", "placements", "adjustments", "spacing", "dependencies"].iter().any(|label| entry.label.ends_with(label)) {
+                assert_eq!(entry.bytes, 0, "{} duplicates canonical input or published geometry", entry.label);
+            }
+        }
+        assert!(document.line_count() > 1);
     }
 
     #[test]
@@ -178,13 +248,13 @@ mod stage_tests {
             assert!(document.layout_scratch.paragraph_layout_bytes() < 5 * 1024 * 1024,
                 "retained results have a 4 MiB budget plus bounded slot metadata");
         }
-        let mut reference=document.clone();reference.relayout(document.last_constraints);
+        let mut reference=reference_layout(&document);reference.relayout(document.last_constraints);
         assert_eq!(document.line_count(),reference.line_count());
         assert_eq!(document.layout_state.line_output.lines.last().unwrap().point,reference.layout_state.line_output.lines.last().unwrap().point);
     }
 
     #[test]
-    fn resizing_switches_glyph_line_width_without_losing_ownership_or_snapshots() {
+    fn resizing_switches_glyph_line_width_without_affecting_independent_layouts() {
         const ROWS: usize = 32_800;
         let content = "xx\n".repeat(ROWS - 1) + "xx";
         let html = format!("<pre>{content}</pre>");
@@ -197,13 +267,13 @@ mod stage_tests {
         assert_eq!(document.line_count(), ROWS);
         assert!(document.layout_state.line_output.glyph_line_indices.is_narrow());
         assert_eq!(document.render_view().text().line_index_for_glyph(last), Some(ROWS - 1));
-        let snapshot = document.clone();
-        let glyphs = document.glyphs().as_ptr();
+        let snapshot = reference_layout(&document);
+        let glyphs = document.glyphs().as_contiguous().unwrap().as_ptr();
         document.relayout_with_metrics(LayoutConstraints::new(6.0, 16.0).unwrap(), &ImageMetrics::default());
         assert_eq!(document.line_count(), ROWS * 2);
         assert!(!document.layout_state.line_output.glyph_line_indices.is_narrow());
         assert_eq!(document.render_view().text().line_index_for_glyph(last), Some(ROWS * 2 - 1));
-        assert_eq!(document.glyphs().as_ptr(), glyphs);
+        assert_eq!(document.glyphs().as_contiguous().unwrap().as_ptr(), glyphs);
         assert!(snapshot.layout_state.line_output.glyph_line_indices.is_narrow());
         assert_eq!(snapshot.render_view().text().line_index_for_glyph(last), Some(ROWS - 1));
         document.relayout_with_metrics(LayoutConstraints::new(12.0, 16.0).unwrap(), &ImageMetrics::default());
@@ -357,7 +427,7 @@ mod stage_tests {
             Some("p {text-transform:uppercase} p::first-letter {font-size:32px}"),
         );
         let text = prepared.inputs.text.clone();
-        let characters: String = text.content().glyphs().iter().copied().filter_map(char::from_u32).collect();
+        let characters: String = text.content().characters().iter().copied().filter_map(char::from_u32).collect();
         assert_eq!(characters, "SS😀 A");
         assert!(text.first_letter_styles().style_at(0).is_some());
         assert_eq!(text.first_letter_styles().style_at(0), text.first_letter_styles().style_at(1));
@@ -469,12 +539,8 @@ mod stage_tests {
         assert!(TextCompositionPolicy::BookOptimized.uses_hyphenation_quality());
         assert!(TextCompositionPolicy::BookOptimizedUnrestrictedHyphenation.is_book_optimized());
         assert!(!TextCompositionPolicy::BookOptimizedUnrestrictedHyphenation.uses_hyphenation_quality());
-        assert!(TextCompositionPolicy::SentencePerLine.is_book_optimized());
-        assert!(TextCompositionPolicy::SentencePerLine.uses_hyphenation_quality());
-        assert!(TextCompositionPolicy::SentencePerLine.uses_sentence_per_line());
         assert!(!TextCompositionPolicy::WebCompatible.is_book_optimized());
         assert!(!TextCompositionPolicy::WebCompatible.uses_hyphenation_quality());
-        assert!(!TextCompositionPolicy::WebCompatible.uses_sentence_per_line());
     }
 
     #[test]
@@ -696,8 +762,8 @@ mod stage_tests {
         let offsets_ptr = document.layout_state.line_output.line_glyph_offsets.as_ptr();
         let advances_ptr = document.layout_state.line_output.line_glyph_advances.as_ptr();
         let image_lines_ptr = document.layout_state.fragment_output.image_fragments_by_line.as_ptr();
-        let glyphs_ptr = document.glyphs().as_ptr();
-        let cached_text_plans = document.shaped.inline_plans.len();
+        let glyphs_ptr = document.glyphs().as_contiguous().unwrap().as_ptr();
+        let cached_text_plans = document.layout_scratch.inline_plan_count();
         let scratch_capacities = document.layout_scratch.allocation_capacities();
         assert!(cached_text_plans > 0, "initial layout should retain width-independent text plans");
         assert!(scratch_capacities.0.0 > 0, "initial layout should retain line-owner storage");
@@ -708,12 +774,12 @@ mod stage_tests {
 
         assert_eq!(document.glyphs().len(), glyph_count);
         assert_eq!(document.glyph_metrics().len(), metric_count);
-        assert_eq!(document.glyphs().as_ptr(), glyphs_ptr);
+        assert_eq!(document.glyphs().as_contiguous().unwrap().as_ptr(), glyphs_ptr);
         assert_eq!(document.layout_state.line_output.lines.as_ptr(), lines_ptr);
         assert_eq!(document.layout_state.line_output.line_glyph_offsets.as_ptr(), offsets_ptr);
         assert_eq!(document.layout_state.line_output.line_glyph_advances.as_ptr(), advances_ptr);
         assert_eq!(document.layout_state.fragment_output.image_fragments_by_line.as_ptr(), image_lines_ptr);
-        assert_eq!(document.shaped.inline_plans.len(), cached_text_plans);
+        assert_eq!(document.layout_scratch.inline_plan_count(), cached_text_plans);
         let retained_scratch_capacities = document.layout_scratch.allocation_capacities();
         assert_eq!(retained_scratch_capacities.0.0 + retained_scratch_capacities.1.2, scratch_capacities.0.0 + scratch_capacities.1.2, "the two rotating line-owner buffers must retain their combined allocation");
         assert_eq!(retained_scratch_capacities.1.0, scratch_capacities.1.0, "line-sort storage must be recycled");
@@ -722,9 +788,10 @@ mod stage_tests {
         assert!(relayout_timings.layout_tree_traversal >= relayout_timings.root_box_layout, "tree timing must include root layout");
         assert_eq!(relayout_timings.build_inline_tokens_from_runs, std::time::Duration::ZERO, "pure-text relayout should not rebuild token plans");
 
-        let cloned = document.clone();
-        assert_eq!(cloned.layout_scratch.allocation_capacities(), ((0, 0), (0, 0, 0, 0, 0, 0)), "cloning semantic layout state must not duplicate transient scratch allocations");
-        assert!(std::sync::Arc::ptr_eq(&cloned.placement, &document.placement), "cloning a laid-out document must share its retained local placement snapshot");
+        let (glyphs, allocations) = crate::allocation_test_support::count_allocations(|| document.render_view().text().glyph_count());
+        assert_eq!(glyphs, glyph_count);
+        assert_eq!(allocations, 0, "borrowed publication must not allocate or copy executor state");
+
     }
 
     #[test]
@@ -733,17 +800,15 @@ mod stage_tests {
         let prepared = factory.parse_with_new_pipeline("<p>words <em>emphasis</em> <span>span</span> <a href='#a'>link</a></p><div></div><p></p>", None);
         let mut shaper = TestGlyphShaper::new();
         let mut document = prepared.shape(&mut shaper).unwrap().layout(LayoutConstraints::new(120.0, 16.0).unwrap());
-        let (boxes, reserved, filled) = document.shaped.inline_plans.storage_counts();
-        assert!(boxes > reserved);
-        assert_eq!((reserved, filled), (1, 1));
-        let glyph_pointer = document.glyphs().as_ptr();
+        assert_eq!(document.layout_scratch.inline_plan_count(), 1);
+        let glyph_pointer = document.glyphs().as_contiguous().unwrap().as_ptr();
         document.relayout(LayoutConstraints::new(100.0, 16.0).unwrap());
-        assert_eq!(document.shaped.inline_plans.storage_counts(), (boxes, reserved, filled));
-        assert_eq!(document.glyphs().as_ptr(), glyph_pointer);
+        assert_eq!(document.layout_scratch.inline_plan_count(), 1);
+        assert_eq!(document.glyphs().as_contiguous().unwrap().as_ptr(), glyph_pointer);
     }
 
     #[test]
-    fn ordinary_lines_omit_optional_storage_and_preserve_snapshot_geometry() {
+    fn ordinary_lines_omit_optional_storage_and_keep_independent_geometry() {
         let mut factory = DocumentFactory::new();
         let prepared = factory.parse_with_new_pipeline("<p>plain text continues through several lines without inline elements or special paint data</p>", None);
         let mut shaper = TestGlyphShaper::new();
@@ -753,7 +818,7 @@ mod stage_tests {
         assert!(document.layout_state.line_output.line_details.is_empty());
         assert!(document.layout_state.line_output.text_fragments.is_empty());
         assert!(std::mem::size_of::<crate::layout_model::Line>() <= 80);
-        let snapshot = document.clone();
+        let snapshot = reference_layout(&document);
         let original = snapshot.render_view().text().line(1).unwrap();
         document.relayout(LayoutConstraints::new(200.0, 16.0).unwrap());
         assert_eq!(snapshot.render_view().text().line(1).unwrap().point(), original.point());
@@ -761,7 +826,7 @@ mod stage_tests {
     }
 
     #[test]
-    fn paragraph_scratch_is_retained_between_layouts_and_not_copied_to_snapshots() {
+    fn paragraph_scratch_is_retained_and_render_views_allocate_nothing() {
         let mut factory = DocumentFactory::new();
         let source = format!("<p>{}</p><p>second paragraph</p>", "Words continue through this paragraph with punctuation and possible hyphenation. ".repeat(20));
         let prepared = factory.parse_with_new_pipeline(&source, None);
@@ -773,7 +838,8 @@ mod stage_tests {
         assert!(capacities[0].0 > 0 && capacities[0].1.0 > 0 && capacities[0].1.1 > 0 && capacities[0].1.2 > 0);
         document.relayout(constraints);
         assert_eq!(document.layout_scratch.paragraph_capacities(), capacities);
-        assert!(document.clone().layout_scratch.paragraph_capacities().is_empty());
+        let (_, allocations) = crate::allocation_test_support::count_allocations(|| document.render_view());
+        assert_eq!(allocations, 0, "borrowing does not copy paragraph scratch");
     }
 
     #[test]
@@ -794,7 +860,6 @@ mod stage_tests {
                 .with_text_composition_policy(policy);
             let metrics = ImageMetrics::default();
             let mut document = shaped
-                .clone()
                 .layout_with_metrics_and_shaper(constraints, &metrics, &mut shaper)
                 .unwrap();
             let lines = document.layout_state.line_output.lines.as_ptr();
@@ -814,7 +879,7 @@ mod stage_tests {
                 .glyph_line_indices
                 .as_ptr();
             let scratch = document.layout_scratch.allocation_capacities();
-            let glyphs = document.glyphs().as_ptr();
+            let glyphs = document.glyphs().as_contiguous().unwrap().as_ptr();
 
             for width in [240.0, 180.0, 300.0, 120.0] {
                 let constraints = LayoutConstraints::new(width, 20.0)
@@ -823,8 +888,8 @@ mod stage_tests {
                 document
                     .relayout_with_metrics_and_shaper(constraints, &metrics, &mut shaper)
                     .unwrap();
-                let fresh = shaped.clone().layout(constraints);
-                assert_eq!(document.glyphs().as_ptr(), glyphs);
+                let fresh = prepared.shape(&mut TestGlyphShaper::new()).unwrap().layout(constraints);
+                assert_eq!(document.glyphs().as_contiguous().unwrap().as_ptr(), glyphs);
                 assert_eq!(
                     document.layout_state.line_output.lines.as_ptr(),
                     lines,
@@ -893,7 +958,7 @@ mod stage_tests {
     }
 
     #[test]
-    fn shaper_relayout_preserves_auxiliary_glyphs_and_retained_snapshots() {
+    fn shaper_relayout_preserves_auxiliary_glyphs_and_independent_layouts() {
         let mut factory = DocumentFactory::new();
         let prepared = factory.parse_with_new_pipeline(
             "<html><body><p>one two three four five six seven eight nine ten</p></body></html>",
@@ -904,7 +969,7 @@ mod stage_tests {
             .shape(&mut shaper)
             .unwrap()
             .layout(LayoutConstraints::new(120.0, 20.0).unwrap());
-        let snapshot = document.clone();
+        let snapshot = reference_layout(&document);
         let old_lines = snapshot
             .render_view()
             .text()
@@ -952,10 +1017,10 @@ mod stage_tests {
             old_lines
         );
         assert!(
-            !Arc::ptr_eq(&snapshot.placement, &document.placement),
-            "retained placement snapshots must not be mutated by resize"
+            !std::ptr::eq(&snapshot.placement, &document.placement),
+            "independent placement state must not be mutated by resize"
         );
-        let shaped = document.shaped.clone();
+        let shaped = std::ptr::from_ref(document.base_shaped.as_ref());
         document
             .relayout_with_metrics_and_shaper(
                 LayoutConstraints::new(120.0, 20.0).unwrap(),
@@ -964,7 +1029,7 @@ mod stage_tests {
             )
             .unwrap();
         assert!(
-            Arc::ptr_eq(&document.shaped, &shaped),
+            std::ptr::eq(document.base_shaped.as_ref(), shaped),
             "unchanged glyph resources must not copy the shaped chapter again"
         );
         assert_eq!(
@@ -1081,45 +1146,124 @@ mod stage_tests {
     }
 
     #[test]
-    fn shaped_inline_plans_are_shared_for_short_text_contexts() {
+    fn token_caches_have_one_layout_owner_and_independent_executions_own_their_plans() {
         let mut factory = DocumentFactory::new();
-        let mut shaper = TestGlyphShaper::new();
-        let shaped = factory
-            .parse_with_new_pipeline("<html><body><p>tiny</p></body></html>", None)
-            .shape(&mut shaper)
-            .expect("short text shapes");
-
-        let first = shaped.clone().layout(LayoutConstraints::new(100.0, 16.0).unwrap());
-        let prepared_plan_count = first.shaped.inline_plans.len();
-        assert!(prepared_plan_count > 0, "short contexts must enter the shaped plan arena");
-
-        let (second, timings) = shaped.layout_with_timings(LayoutConstraints::new(80.0, 16.0).unwrap());
-        assert_eq!(second.shaped.inline_plans.len(), prepared_plan_count);
-        assert_eq!(timings.build_inline_tokens_from_runs, std::time::Duration::ZERO, "a second layout from the same shaped document must not rebuild short text tokens");
+        let prepared = factory.parse_with_new_pipeline("<html><body><p>tiny</p></body></html>", None);
+        let mut first = prepared.shape(&mut TestGlyphShaper::new()).unwrap().layout(LayoutConstraints::new(100.0, 16.0).unwrap());
+        let pointer = first.layout_scratch.inline_plan_pointer().expect("owned token plan");
+        let snapshot = reference_layout(&first);
+        assert_eq!(snapshot.layout_scratch.inline_plan_count(), 1, "independent reference execution owns its plan; readers borrow the published result");
+        let second = prepared.shape(&mut TestGlyphShaper::new()).unwrap().layout(LayoutConstraints::new(80.0, 16.0).unwrap());
+        assert_ne!(second.layout_scratch.inline_plan_pointer(), Some(pointer), "independent layout executors must own independent token arrays");
+        let timings = first.relayout_with_timings(LayoutConstraints::new(80.0, 16.0).unwrap());
+        assert_eq!(first.layout_scratch.inline_plan_pointer(), Some(pointer), "relayout must move and reuse the original token allocation");
+        assert_eq!(timings.build_inline_tokens_from_runs, std::time::Duration::ZERO);
+        assert_eq!(paragraph_geometry_snapshot(&first), paragraph_geometry_snapshot(&second));
+        assert_eq!(snapshot.render_view().text().glyph_count(), first.render_view().text().glyph_count());
     }
 
     #[test]
-    fn phase_wrappers_share_immutable_prepared_and_shaped_inputs() {
+    fn first_line_refinement_borrows_one_canonical_inline_source() {
+        let mut factory = DocumentFactory::new();
+        let prepared = factory.parse_with_new_pipeline(
+            &format!("<p class='target' id='anchor'>ß😀 word</p><p>{}</p>", "unaffected text ".repeat(100)),
+            Some("p{text-transform:uppercase} .target::first-line{font-size:24px}"),
+        );
+        let source = prepared.inputs.text.content();
+        let characters = source.characters().to_vec();
+        let offsets: Vec<_> = (0..characters.len())
+            .map(|i| source.raw_glyph_source_offset(i))
+            .collect();
+        let mut shaper = TestGlyphShaper::new();
+        let shaped = prepared.shape(&mut shaper).unwrap();
+        let mut document = shaped
+            .layout_with_metrics_and_shaper(
+                LayoutConstraints::new(400.0, 20.0).unwrap(),
+                &ImageMetrics::default(),
+                &mut shaper,
+            )
+            .unwrap();
+        assert!(
+            document.refinement.is_some(),
+            "pseudo styling must exercise a separate derived shape"
+        );
+        let base_glyph_pointer = document.base_shaped.glyphs.as_ptr();
+        document
+            .relayout_with_metrics_and_shaper(
+                LayoutConstraints::new(200.0, 20.0).unwrap(),
+                &ImageMetrics::default(),
+                &mut shaper,
+            )
+            .unwrap();
+
+        for inputs in [&prepared.inputs, &document.inputs] {
+            assert!(std::ptr::eq(source, inputs.text.content()));
+            assert_eq!(inputs.text.content().characters(), characters);
+            assert_eq!(
+                inputs.text.content().inline_items().as_ptr(),
+                source.inline_items().as_ptr()
+            );
+        }
+        assert_eq!(document.base_shaped.glyphs.as_ptr(), base_glyph_pointer);
+        assert_eq!(
+            (0..characters.len())
+                .map(|i| document.glyph_source_offset(i as u32).unwrap())
+                .collect::<Vec<_>>(),
+            offsets
+        );
+        let text: String = document
+            .glyphs()
+            .iter()
+            .map(|&glyph| document.glyph_metrics().get(glyph).ch())
+            .collect();
+        assert_eq!(text, format!("SS😀 WORD{}", "UNAFFECTED TEXT ".repeat(100).trim_end()));
+
+        let report = document.memory_usage_report();
+        for suffix in [
+            "InlineContent.characters.storage",
+            "InlineContent.glyph_source_offsets.storage",
+            "InlineContent.whitespace_wrap_before.storage",
+            "InlineContent.inline_items.storage",
+        ] {
+            assert_eq!(
+                report
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.label.ends_with(suffix))
+                    .count(),
+                1,
+                "canonical metadata must be reported once: {suffix}"
+            );
+        }
+        let base_bytes = report.entries.iter().find(|entry| entry.label == "LaidOutDocument.glyphs.storage").unwrap().bytes;
+        let patch_bytes: usize = report.entries.iter().filter(|entry| entry.label == "LaidOutDocument.refinement.glyphs.storage").map(|entry| entry.bytes).sum();
+        assert_eq!(base_bytes, characters.len() * size_of::<GlyphId>());
+        assert!(patch_bytes > 0 && patch_bytes <= 8 * size_of::<GlyphId>(), "only the styled first line owns changed glyph IDs");
+    }
+
+    #[test]
+    fn layout_moves_the_shaped_owner_and_borrows_preparation() {
         let mut factory = DocumentFactory::new();
         let prepared = factory.parse_with_new_pipeline("<html><body><p>shared phase inputs</p></body></html>", None);
         let mut shaper = TestGlyphShaper::new();
         let shaped = prepared.shape(&mut shaper).expect("test shaper must register every glyph");
-        let document = shaped.clone().layout(LayoutConstraints::new(180.0, 20.0).unwrap());
-
-        assert!(std::sync::Arc::ptr_eq(&prepared.inputs, &shaped.inputs));
+        assert!(Arc::ptr_eq(&prepared.inputs, &shaped.inputs));
+        let shape_pointer = std::ptr::from_ref(shaped.shaped.as_ref());
+        let document = shaped.layout(LayoutConstraints::new(180.0, 20.0).unwrap());
         assert!(std::sync::Arc::ptr_eq(&prepared.inputs, &document.inputs));
-        assert!(std::sync::Arc::ptr_eq(&shaped.shaped, &document.shaped));
+        assert!(std::ptr::eq(shape_pointer, document.base_shaped.as_ref()));
     }
 
     #[test]
-    fn exact_line_refinement_keeps_immutable_shaped_storage_shared() {
+    fn exact_line_refinement_preserves_the_shaped_owner() {
         let mut factory = DocumentFactory::new();
         let prepared = factory.parse_with_new_pipeline("<html><body><p>shared exact geometry</p></body></html>", None);
         let mut shaper = TestGlyphShaper::new();
         let shaped = prepared.shape(&mut shaper).expect("test shaper must register every glyph");
-        let document = shaped.clone().layout_with_metrics_and_shaper(LayoutConstraints::new(180.0, 20.0).unwrap(), &crate::ImageMetrics::default(), &mut shaper).expect("line refinement must succeed");
+        let shape_pointer = std::ptr::from_ref(shaped.shaped.as_ref());
+        let document = shaped.layout_with_metrics_and_shaper(LayoutConstraints::new(180.0, 20.0).unwrap(), &ImageMetrics::default(), &mut shaper).expect("line refinement must succeed");
 
-        assert!(std::sync::Arc::ptr_eq(&shaped.shaped, &document.shaped), "exact refinement must not copy inline content, glyph metrics, or shaping maps");
+        assert!(std::ptr::eq(shape_pointer, document.base_shaped.as_ref()), "exact refinement borrows the shape until publication moves its owner");
         assert!(document.text_geometry().advance(0).is_some(), "the shared shaped storage retains its text geometry through layout");
     }
 
@@ -1134,9 +1278,35 @@ mod stage_tests {
         let shaped = prepared.shape(&mut shaper).expect("test text shapes");
         let document = shaped.layout(LayoutConstraints::new(180.0, 20.0).unwrap());
 
-        let ranges = super::first_line_style_ranges(&document);
+        let ranges = super::first_line_style_ranges(&document.inputs, &document.layout_state);
 
         assert!(ranges.iter().any(|range| range.glyphs.end - range.glyphs.start == 6), "the fictional first-line box must retain one shaping range across compatible spans");
+    }
+
+    #[test]
+    fn first_line_batch_preserves_text_across_nested_atomic_contexts() {
+        let mut factory = DocumentFactory::new();
+        let prepared = factory.parse_with_new_pipeline(
+            "<div class='outer'>Before text <span class='atom'>Inner words <i>more words</i></span> after text trailing words.</div>",
+            Some(".outer::first-line{font-size:18px}.atom::first-line{font-size:20px}.atom{display:inline-block;width:120px}"),
+        );
+        let mut shaper = TestGlyphShaper::new();
+        let shaped = prepared.shape(&mut shaper).unwrap();
+        let expected: String = shaped.glyphs().iter()
+            .map(|&glyph| shaped.shaped.glyph_metrics.get(glyph).ch()).collect();
+        let mut document = shaped.layout_with_metrics_and_shaper(
+            LayoutConstraints::new(600.0, 16.0).unwrap(), &ImageMetrics::default(), &mut shaper,
+        ).unwrap();
+        for width in [240.0, 160.0, 600.0] {
+            document.relayout_with_metrics_and_shaper(
+                LayoutConstraints::new(width, 16.0).unwrap(), &ImageMetrics::default(), &mut shaper,
+            ).unwrap();
+            let text = document.render_view().text();
+            let actual: String = (0..text.glyph_count()).map(|index| {
+                text.glyph_metric(text.glyph_at(index).unwrap()).unwrap().ch()
+            }).collect();
+            assert_eq!(actual, expected);
+        }
     }
 
     #[test]

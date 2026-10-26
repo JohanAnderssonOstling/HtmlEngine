@@ -65,16 +65,12 @@ mod tests {
         html.push_str("</table></body></html>");
         let mut factory = DocumentFactory::new();
         let mut glyphs = TestGlyphShaper::new();
-        let shaped = factory
-            .parse_with_new_pipeline(&html, None)
-            .shape(&mut glyphs)
-            .expect("test glyphs shape");
-        let sequential = shaped
-            .clone()
+        let prepared = factory.parse_with_new_pipeline(&html, None);
+        let sequential = prepared.shape(&mut glyphs).expect("test glyphs shape")
             .layout(LayoutConstraints::new(360.0, 16.0).unwrap());
         let workers = std::thread::available_parallelism().map_or(1, usize::from).min(4);
         crate::layout::reset_observed_workers();
-        let parallel = shaped.layout(
+        let parallel = prepared.shape(&mut TestGlyphShaper::new()).expect("test glyphs shape").layout(
             LayoutConstraints::new(360.0, 16.0)
                 .unwrap()
                 .with_parallel_workers(workers),

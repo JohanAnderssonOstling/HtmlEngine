@@ -2,7 +2,6 @@ use html_style_model::{Display, Float, PositionMode};
 use std::ops::Range;
 
 use super::{FinalizationScratch, FragmentWriter, LayoutReader};
-use crate::layout::PlacementState;
 
 type PaintOrderKey = (u8, i32, usize, u8, usize);
 
@@ -73,9 +72,9 @@ fn paint_order_key(reader: &LayoutReader<'_>, box_idx: usize, ordinary_layer: u8
 pub(super) fn sort_lines_and_remap_images(
     reader: &LayoutReader<'_>,
     fragments: &mut FragmentWriter<'_>,
-    placement: &mut PlacementState,
     scratch: &mut FinalizationScratch,
 ) {
+    profile_scope!("finalize.sort_lines");
     let (layout, line_owners, _) = fragments.finalization_parts();
     let mut owners = std::mem::take(line_owners);
     let mut lines = std::mem::take(&mut layout.line_output.lines);
@@ -150,7 +149,6 @@ pub(super) fn sort_lines_and_remap_images(
     for (new_idx, (_, _, _, old_idx)) in line_pairs.iter().enumerate() {
         index_map[*old_idx] = new_idx;
     }
-    placement.remap_lines(&index_map);
     layout.paint_program.remap_lines(&index_map);
     for line_idx in &mut layout.line_output.paint_order_indices {
         *line_idx = u32::try_from(index_map[*line_idx as usize])
@@ -318,6 +316,7 @@ pub(super) fn build_block_decoration_traversal(
 }
 
 pub(super) fn rebuild_image_fragments_by_line(fragments: &mut FragmentWriter<'_>) {
+    profile_scope!("finalize.image_index");
     let layout = fragments.state_mut();
     let by_line = &mut layout.fragment_output.image_fragments_by_line;
     by_line.reset_groups(layout.line_output.lines.len());
@@ -415,6 +414,7 @@ pub(super) fn rebuild_decoration_fragments_by_line(fragments: &mut FragmentWrite
 }
 
 pub(super) fn rebuild_glyph_line_indices(glyph_count: usize, fragments: &mut FragmentWriter<'_>) {
+    profile_scope!("finalize.glyph_line_index");
     let layout = fragments.state_mut();
     layout
         .line_output

@@ -14,6 +14,9 @@ members = [
     "test-support/html-wpt",
 ]
 
+[workspace.package]
+license = "GPL-3.0-or-later"
+
 [workspace.dependencies]
 kurbo = "0.11.3"
 peniko = "0.2.0"
@@ -25,3 +28,4 @@ html5ever = "0.39"
 quick-xml = { version = "0.41", features = ["escape-html"] }
 encoding_rs = "0.8"
 ego-tree = "0.11"
+unicode-bidi = "0.3.18"

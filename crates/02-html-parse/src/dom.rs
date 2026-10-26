@@ -9,7 +9,7 @@ use html_dom::{
 use std::sync::Arc;
 
 pub fn parse_dom_document(html: &str) -> Result<Document, DocumentBuildError> {
-    build_dom_document(&parse_html_document(html))
+    build_dom_document_owned(parse_html_document(html))
 }
 
 /// Convert already parsed markup into the renderer's DOM.
@@ -19,6 +19,53 @@ pub fn build_dom_document(parsed: &ParsedHtml) -> Result<Document, DocumentBuild
         MarkupSyntax::Xml => DocumentMode::Xml,
     };
     build_dom_from_syntax_tree(&parsed.document, mode)
+}
+
+pub(crate) fn build_dom_document_owned(parsed: ParsedHtml) -> Result<Document, DocumentBuildError> {
+    let mode = match parsed.syntax {
+        MarkupSyntax::Html => DocumentMode::Html,
+        MarkupSyntax::Xml => DocumentMode::Xml,
+    };
+    let Some(root) = parsed
+        .document
+        .nodes
+        .into_iter()
+        .find_map(|node| match node {
+            HtmlSyntaxNode::Element(element) => Some(element),
+            _ => None,
+        })
+    else {
+        return DocumentBuilder::new().finish_without_root();
+    };
+    let mut document = DocumentBuilder::new();
+    document.set_mode(mode);
+    let root_data = build_dom_syntax_element_data(&mut document, &root);
+    let (root_node, mut document) = document.append_dom_element(None, root_data)?;
+    build_dom_owned_children(&mut document, root.children, root_node)?;
+    register_heading_toc(&mut document, root_node);
+    document.set_dom_root(root_node)?.finish()
+}
+
+fn build_dom_owned_children(
+    document: &mut DocumentBuilder<Rootless>,
+    children: Vec<HtmlSyntaxNode>,
+    parent: DomNodeId,
+) -> Result<(), DocumentBuildError> {
+    for child in children {
+        match child {
+            HtmlSyntaxNode::Element(element) => {
+                let data = build_dom_syntax_element_data(document, &element);
+                let node = document.append_dom_element(Some(parent), data)?;
+                build_dom_owned_children(document, element.children, node)?;
+                register_heading_toc(document, node);
+            }
+            HtmlSyntaxNode::Text(text) if !text.is_empty() => {
+                document.append_dom_text(parent, text)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn build_dom_from_syntax_tree(

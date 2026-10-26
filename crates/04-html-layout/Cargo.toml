@@ -1,8 +1,13 @@
 [package]
+license.workspace = true
 name = "html-layout"
 version = "0.1.0"
 edition = "2024"
 publish = false
+
+[features]
+# Explicit diagnostic builds only; ordinary builds contain no scope hooks.
+profiling = []
 
 [dependencies]
 html-dom = { path = "../html-dom" }
@@ -16,6 +21,11 @@ rayon = "1.12"
 taffy.workspace = true
 unicode_categories = "0.1"
 unicode-segmentation = "1.13"
+unicode-normalization = "0.1"
+unicode-bidi.workspace = true
+unicode-bidi-mirroring = "0.4"
+unicode-linebreak = "0.1.5"
+unicode-width = "0.2.2"
 web-time = "1"
 
 [dev-dependencies]

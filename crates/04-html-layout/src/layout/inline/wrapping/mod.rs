@@ -5,11 +5,11 @@
 
 use super::justification::glue_capacities;
 use super::*;
+use knuth_plass::BreakpointStorage;
 
 pub(super) mod greedy;
 pub(super) mod knuth_plass;
 mod optimal;
-pub(super) const MICRO_TRACKING_FRACTION: f64 = knuth_plass::MICRO_TRACKING_FRACTION;
 pub(super) use greedy::break_next_line;
 pub(super) use optimal::break_lines_knuth;
 
@@ -20,7 +20,7 @@ pub(super) struct KpPlan {
 struct KpSegmentPlan {
     token_start: usize,
     token_end: usize,
-    breakpoints: Box<[knuth_plass::CompactBreakpoint]>,
+    breakpoints: BreakpointStorage,
 }
 
 impl KpPlan {
@@ -29,6 +29,7 @@ impl KpPlan {
         runs: &[InlineTokenMetrics],
         punctuation_aware: bool,
     ) -> Self {
+        profile_scope!("lines.build_breakpoint_plan");
         let mut segments = Vec::new();
         let mut token_start = 0usize;
         for (index, token) in tokens.iter().enumerate() {
@@ -58,10 +59,7 @@ impl KpPlan {
             + self
                 .segments
                 .iter()
-                .map(|segment| {
-                    segment.breakpoints.len()
-                        * std::mem::size_of::<knuth_plass::CompactBreakpoint>()
-                })
+                .map(|segment| segment.breakpoints.memory_usage_bytes())
                 .sum::<usize>()
     }
 }
@@ -89,17 +87,28 @@ impl KpSegmentPlan {
             let token = &tokens[token_index];
             if token.break_kind() == BreakKind::Discretionary {
                 token_index += 1;
-                breakpoints.push(CompactBreakpoint::discretionary(
-                    width,
-                    stretch,
-                    shrink,
-                    token.discretionary_width(),
-                    HYPHEN_PENALTY,
-                    u32::try_from(token_index)
-                        .expect("inline token index exceeds compact Knuth plan capacity"),
-                    u32::try_from(token_index)
-                        .expect("inline token index exceeds compact Knuth plan capacity"),
-                ));
+                let breakpoint = if matches!(token.kind(), InlineTokenKind::Opportunity) {
+                    // CJK/atomic boundaries are ordinary opportunities, not
+                    // flagged hyphens with consecutive-hyphen demerits.
+                    CompactBreakpoint::soft(
+                        width, stretch, shrink, 0.0, 0.0, 0.0,
+                        u32::try_from(token_index).expect("inline token index exceeds compact Knuth plan capacity"),
+                        u32::try_from(token_index).expect("inline token index exceeds compact Knuth plan capacity"),
+                    )
+                } else {
+                    CompactBreakpoint::discretionary(
+                        width,
+                        stretch,
+                        shrink,
+                        token.discretionary_width(),
+                        HYPHEN_PENALTY,
+                        u32::try_from(token_index)
+                            .expect("inline token index exceeds compact Knuth plan capacity"),
+                        u32::try_from(token_index)
+                            .expect("inline token index exceeds compact Knuth plan capacity"),
+                    )
+                };
+                breakpoints.push(breakpoint);
                 word_open = true;
                 continue;
             }
@@ -165,7 +174,7 @@ impl KpSegmentPlan {
         Self {
             token_start,
             token_end,
-            breakpoints: breakpoints.into_boxed_slice(),
+            breakpoints: BreakpointStorage::new(breakpoints),
         }
     }
 }
@@ -183,6 +192,7 @@ pub(super) struct LineBreakResult {
     pub(super) ended_by_forced_break: bool,
 }
 
+#[derive(Clone)]
 pub(super) struct BrokenLine {
     pub(super) start: usize,
     pub(super) end: usize,
@@ -239,8 +249,8 @@ mod tests {
 
         let uniform = KpPlan::build(&tokens, &[], false);
         let punctuation_aware = KpPlan::build(&tokens, &[], true);
-        let uniform_break = &uniform.segments[0].breakpoints[0];
-        let punctuation_break = &punctuation_aware.segments[0].breakpoints[0];
+        let uniform_break = uniform.segments[0].breakpoints.get(0).unwrap();
+        let punctuation_break = punctuation_aware.segments[0].breakpoints.get(0).unwrap();
 
         assert_eq!(uniform_break.discarded_stretch(), 5.0);
         assert_eq!(uniform_break.discarded_shrink(), 3.3f32 as f64);

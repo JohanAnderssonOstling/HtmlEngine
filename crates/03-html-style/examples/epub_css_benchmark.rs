@@ -103,6 +103,7 @@ const SAMPLES: &[Sample] = &[
 struct Samples {
     html_parse: Vec<Duration>,
     total_style: Vec<Duration>,
+    parse_default_css: Vec<Duration>,
     parse_author_css: Vec<Duration>,
     prepare_rules: Vec<Duration>,
     selector_index: Vec<Duration>,
@@ -114,6 +115,7 @@ impl Samples {
     fn push(&mut self, html_parse: Duration, total_style: Duration, timings: StyleTimings) {
         self.html_parse.push(html_parse);
         self.total_style.push(total_style);
+        self.parse_default_css.push(timings.parse_default_css);
         self.parse_author_css.push(timings.parse_author_css);
         self.prepare_rules.push(timings.prepare_rules);
         self.selector_index.push(timings.selector_index);
@@ -124,6 +126,7 @@ impl Samples {
     fn sort(&mut self) {
         self.html_parse.sort_unstable();
         self.total_style.sort_unstable();
+        self.parse_default_css.sort_unstable();
         self.parse_author_css.sort_unstable();
         self.prepare_rules.sort_unstable();
         self.selector_index.sort_unstable();
@@ -242,13 +245,14 @@ fn run(sample: &Sample, iterations: usize, page_copies: usize, reuse_program: bo
 
     let css_bytes = sample.css.iter().map(|css| css.len()).sum::<usize>();
     println!(
-        "sample={} css_bytes={} classes={} nodes={} html_parse_us={} style_total_us={} css_parse_us={} prepare_us={} index_us={} matching_us={} cascade_us={} style_allocations={} style_peak_bytes={}",
+        "sample={} css_bytes={} classes={} nodes={} html_parse_us={} style_total_us={} default_css_parse_us={} css_parse_us={} prepare_us={} index_us={} matching_us={} cascade_us={} style_allocations={} style_peak_bytes={}",
         sample.name,
         css_bytes,
         class_count,
         node_count,
         median(&samples.html_parse),
         median(&samples.total_style),
+        median(&samples.parse_default_css),
         median(&samples.parse_author_css),
         median(&samples.prepare_rules),
         median(&samples.selector_index),

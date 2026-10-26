@@ -21,6 +21,33 @@ pub(super) struct ShapingSpan {
 }
 
 impl ShapingSpan {
+    pub(super) fn split_bidi(self, bidi: &ResolvedBidi) -> Vec<(Self, u8)> {
+        profile_scope!("shape.split_bidi");
+        let mut result: Vec<(Self, u8)> = Vec::new();
+        for paint in self.paint_spans {
+            let mut start = paint.characters.start;
+            while start < paint.characters.end {
+                let level = bidi.level(start);
+                let end = (start + 1..paint.characters.end)
+                    .find(|&index| bidi.level(index) != level)
+                    .unwrap_or(paint.characters.end);
+                let part = ShapingPaintSpan { characters: start..end, ..paint.clone() };
+                if let Some((span, _)) = result.last_mut().filter(|(_, previous)| *previous == level) {
+                    span.paint_spans.push(part);
+                } else {
+                    result.push((Self {
+                        shaping_box: self.shaping_box,
+                        formatting_root: self.formatting_root,
+                        style_override: self.style_override,
+                        paint_spans: vec![part],
+                    }, level));
+                }
+                start = end;
+            }
+        }
+        result
+    }
+
     pub(super) fn character_count(&self) -> usize {
         self.paint_spans
             .iter()
@@ -162,7 +189,7 @@ pub(super) fn plan_shaping_spans<Overrides: StyleOverrides + ?Sized>(
             let mut part_start = start;
             for index in start..end {
                 if inline_content
-                    .glyph_at(index as usize)
+                    .character_at(index as usize)
                     .and_then(char::from_u32)
                     != Some('\n')
                 {
@@ -346,6 +373,7 @@ fn shaping_styles_are_equivalent(
         && left.font_weight() == right.font_weight()
         && left.font_style() == right.font_style()
         && left.font_family() == right.font_family()
+        && left.cjk_font_family() == right.cjk_font_family()
         && left.open_type_features() == right.open_type_features()
         && left.language() == right.language()
         && left.direction() == right.direction()

@@ -1,5 +1,6 @@
+use super::block::ParagraphSpacing;
 use crate::layout_model::{
-    Children, GlyphMetrics, InlineContent, InlineItemKind, LayoutBox, LayoutMode, LayoutTree,
+    Children, InlineContent, InlineItemKind, LayoutBox, LayoutMode, LayoutTree,
     ListItemMarker,
 };
 use crate::shaping::{FontRelativeMetrics, ShapedFontMetrics};
@@ -17,16 +18,17 @@ pub(crate) struct ImageIntrinsic {
 
 /// Shared read-only access to the document, styled layout topology, and
 /// renderer-supplied metrics used during layout.
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub(crate) struct LayoutReader<'input> {
     document: &'input Document,
     styles: &'input ComputedStyles,
     topology: &'input LayoutTree,
     inline_content: &'input InlineContent,
-    glyph_metrics: &'input GlyphMetrics,
     font_metrics: &'input ShapedFontMetrics,
     image_metrics: &'input crate::ImageMetrics,
-    box_styles: BoxStyleSnapshot<'input>,
+    box_styles: &'input [UsedStyleView<'input>],
+    paragraph_spacing: &'input ParagraphSpacing,
+    tracks_overflow_clips: bool,
     paint: Option<&'input crate::stages::PaintStyles>,
 }
 
@@ -38,14 +40,16 @@ pub(crate) struct LayoutReader<'input> {
 /// a layout session starts. This does not move value resolution: percentages
 /// and other containing-block-dependent values remain symbolic inside
 /// `UsedStyleView` until the owning layout algorithm supplies their basis.
-#[derive(Clone)]
-struct BoxStyleSnapshot<'input> {
-    styles: std::sync::Arc<[UsedStyleView<'input>]>,
+pub(super) struct BoxStyleSnapshot<'input> {
+    styles: Vec<UsedStyleView<'input>>,
+    paragraph_spacing: ParagraphSpacing,
     tracks_overflow_clips: bool,
 }
 
 impl<'input> BoxStyleSnapshot<'input> {
-    fn new(
+    pub(super) fn new(
+        document: &Document,
+        inline_content: &InlineContent,
         styles: &'input ComputedStyles,
         topology: &'input LayoutTree,
         font_metrics: &'input ShapedFontMetrics,
@@ -62,33 +66,35 @@ impl<'input> BoxStyleSnapshot<'input> {
             tracks_overflow_clips |= style.overflow_x().clips() || style.overflow_y().clips();
             resolved.push(style);
         }
+        let paragraph_spacing = ParagraphSpacing::new(document, styles, topology, inline_content, &resolved);
         Self {
-            styles: resolved.into(),
+            styles: resolved,
+            paragraph_spacing,
             tracks_overflow_clips,
         }
     }
 }
 
 impl<'input> LayoutReader<'input> {
-    pub(crate) fn new(
+    pub(super) fn new(
         document: &'input Document,
         styles: &'input ComputedStyles,
         topology: &'input LayoutTree,
         inline_content: &'input InlineContent,
-        glyph_metrics: &'input GlyphMetrics,
         font_metrics: &'input ShapedFontMetrics,
         image_metrics: &'input crate::ImageMetrics,
+        box_styles: &'input BoxStyleSnapshot<'input>,
     ) -> Self {
-        let box_styles = BoxStyleSnapshot::new(styles, topology, font_metrics);
         Self {
             document,
             styles,
             topology,
             inline_content,
-            glyph_metrics,
             font_metrics,
             image_metrics,
-            box_styles,
+            box_styles: &box_styles.styles,
+            paragraph_spacing: &box_styles.paragraph_spacing,
+            tracks_overflow_clips: box_styles.tracks_overflow_clips,
             paint: None,
         }
     }
@@ -104,7 +110,24 @@ impl<'input> LayoutReader<'input> {
 
     /// Geometry reads never consult the reader palette.
     pub(crate) fn style(&self, box_idx: usize) -> UsedStyleView<'input> {
-        self.box_styles.styles[box_idx]
+        self.box_styles[box_idx]
+    }
+
+    pub(crate) fn reader_text_indent(&self, box_idx: usize) -> Option<f64> {
+        self.paragraph_spacing.indent(box_idx)
+    }
+
+    pub(crate) fn reader_paragraph_gap(&self, box_idx: usize) -> Option<f64> {
+        self.paragraph_spacing.gap(box_idx)
+    }
+
+    pub(crate) fn is_reader_prose(&self, box_idx: usize) -> bool {
+        self.paragraph_spacing.is_prose(box_idx)
+    }
+
+    pub(crate) fn vertical_margins(&self, box_idx: usize, containing_width: f64) -> (f64, f64) {
+        let style = self.style(box_idx);
+        self.paragraph_spacing.resolve(box_idx, style.margin_top().resolve(containing_width), style.margin_bottom().resolve(containing_width))
     }
 
     pub(crate) fn paint_style(&self, box_idx: usize) -> UsedStyleView<'input> {
@@ -120,7 +143,7 @@ impl<'input> LayoutReader<'input> {
     }
 
     pub(crate) fn tracks_overflow_clips(&self) -> bool {
-        self.box_styles.tracks_overflow_clips
+        self.tracks_overflow_clips
     }
 
     pub(crate) fn used_style(&self, indices: StyleIndices) -> UsedStyleView<'input> {
@@ -321,8 +344,8 @@ impl<'input> LayoutReader<'input> {
                         glyphs.clone().any(|glyph_idx| {
                             let character = self
                                 .inline_content
-                                .glyph_at(glyph_idx as usize)
-                                .map(|glyph| self.glyph_metrics.get(glyph).ch())
+                                .character_at(glyph_idx as usize)
+                                .and_then(char::from_u32)
                                 .unwrap_or_default();
                             preserves_space || !character.is_whitespace() || character == '\u{00A0}'
                         })

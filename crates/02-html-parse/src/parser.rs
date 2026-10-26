@@ -269,6 +269,11 @@ impl ParsedHtml {
             .expect("parser produced an invalid DOM")
     }
 
+    /// Move parsed text into the canonical DOM and release the syntax tree.
+    pub fn into_dom(self) -> Document {
+        crate::dom::build_dom_document_owned(self).expect("parsed markup must form a valid DOM")
+    }
+
     pub fn build_dom_checked(&self) -> Result<Document, DocumentBuildError> {
         crate::build_dom_document(self)
     }

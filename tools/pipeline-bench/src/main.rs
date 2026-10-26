@@ -1,4 +1,11 @@
 mod counter;
+mod access;
+mod opening;
+mod book_css;
+mod geometry;
+mod queries;
+#[cfg(feature = "profiling")]
+mod opening_deep;
 use html::layout::{
     FontSlant, GlyphId, GlyphMetric, GlyphResourceStore, GlyphShaper, ShapeError, ShapedTextRun,
     TextRunShapeRequest,
@@ -6,7 +13,7 @@ use html::layout::{
 use html::pipeline::*;
 use html::resources::FileSystemProvider;
 use serde_json::json;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::hint::black_box;
 use std::sync::Arc;
 use std::time::Instant;
@@ -167,6 +174,7 @@ fn layout_fingerprint(document: &html::layout::LaidOutDocument) -> u64 {
 }
 #[derive(Default)]
 struct Shaper {
+    register_runs: bool,
     append_checkpoint: Option<(GlyphResourceStore, HashMap<(char, u32, u32), GlyphId>)>,
     resources: GlyphResourceStore,
     cache: HashMap<(char, u32, u32), GlyphId>,
@@ -214,7 +222,20 @@ impl GlyphShaper for Shaper {
         request: TextRunShapeRequest<'_>,
         glyphs: &mut [GlyphId],
     ) -> Result<Option<ShapedTextRun>, ShapeError> {
+        #[cfg(feature = "profiling")]
+        let _profile_scope = html::layout::profiling::scope("shape.mock_backend");
         let style = request.style();
+        if self.register_runs {
+            let count = glyphs.len();
+            let geometry = ShapedTextRun::new(
+                vec![style.font_size() * 0.5; count].into(),
+                vec![true; count + 1].into(),
+            ).unwrap();
+            let range = self.resources.register_run(request.text(), &geometry,
+                style.font_size() * 0.75, style.font_size() * 0.25, 0.0)?;
+            for (slot, glyph) in glyphs.iter_mut().zip(range) { *slot = glyph; }
+            return Ok(Some(geometry));
+        }
         for (index, (glyph, ch)) in glyphs.iter_mut().zip(request.text().chars()).enumerate() {
             *glyph = self.shape_glyph(
                 ch,
@@ -401,6 +422,18 @@ fn main() {
     let path = &args[1];
     let case = &args[2];
     let count: usize = args.get(3).map_or(11, |n| n.parse().unwrap());
+    if matches!(case.as_str(), "book_css" | "book_css_profile" | "book_cache") {
+        book_css::run(path, count, case == "book_css_profile", case == "book_cache");
+        return;
+    }
+    if case.starts_with("access_") {
+        access::run(path, case, count);
+        return;
+    }
+    if case.starts_with("query_") {
+        queries::run(path, case, count);
+        return;
+    }
     let mut inputs = input(std::fs::read_to_string(path).unwrap());
     inputs.base_uri = path.clone();
     inputs.markup_syntax = MarkupSyntax::from_uri(path);
@@ -426,6 +459,15 @@ fn main() {
         }
         "links" => {}
         _ => panic!("unknown palette"),
+    }
+    #[cfg(feature = "profiling")]
+    if matches!(case.as_str(), "open_deep_book" | "open_deep_wall_book" | "open_solver_book") {
+        opening_deep::run(path, case, count, &inputs);
+        return;
+    }
+    if matches!(case.as_str(), "open_profile" | "open_profile_book") {
+        opening::run(path, case, count, &inputs);
+        return;
     }
     if case == "profile" {
         let mut samples: HashMap<&str, Vec<f64>> = HashMap::new();
@@ -485,7 +527,7 @@ fn main() {
         }
         let mut factory = DocumentFactory::new();
         factory.set_resource_context(Arc::new(FileSystemProvider), path.clone());
-        factory.set_reader_overrides(inputs.reader_overrides.clone());
+        factory.set_reader_overrides(inputs.reader_overrides.layout_overrides());
         factory.set_media_environment(inputs.style_environment.media);
         let parsed = parse_document(&inputs.source, inputs.markup_syntax).unwrap();
         let prepared = factory.build_pipeline_from_parsed(&parsed, &[]);
@@ -529,12 +571,6 @@ fn main() {
         session.update(inputs.clone(), &mut shaper).unwrap();
         Some(metric)
     } else { None };
-    let mut view = if matches!(case.as_str(), "handoff" | "rehydrate") && !cfg!(feature = "borrowed-view") {
-        session.document().cloned()
-    } else {
-        None
-    };
-    black_box(&view);
     let mut instructions = Vec::with_capacity(count);
     let mut counter = if cfg!(feature = "heap") {
         None
@@ -550,7 +586,6 @@ fn main() {
     for iteration in 0..count + 3 {
         match case.as_str() {
             "cold" | "reader_load" | "cold_book" => {
-                view = None;
                 session = PipelineSession::new(Arc::new(FileSystemProvider));
                 shaper = Shaper::default();
             }
@@ -580,20 +615,12 @@ fn main() {
         let cpu = cpu_seconds();
         let wall = Instant::now();
         if case == "rehydrate" {
-            #[cfg(not(feature = "borrowed-view"))]
-            { view = Some(session.rehydrate_glyphs(&mut shaper).unwrap()); }
-            #[cfg(feature = "borrowed-view")]
-            { session.rehydrate_glyphs(&mut shaper).unwrap(); }
+            session.rehydrate_glyphs(&mut shaper).unwrap();
         } else {
             black_box(session.update(inputs.clone(), &mut shaper).unwrap());
         }
-        if matches!(case.as_str(), "handoff" | "reader_load") && !cfg!(feature = "borrowed-view") {
-            view = session.document().cloned();
-        }
-        // Match the actual reader handoff: the old reader retained an owned
-        // copy; the new reader borrows the engine's published result.
+        // The reader borrows the engine's published result.
         black_box(session.document().unwrap().render_view().text().line_count());
-        black_box(&view);
         let elapsed = wall.elapsed().as_secs_f64() * 1000.0;
         let consumed = (cpu_seconds() - cpu) * 1000.0;
         let instruction_count = counter.as_mut().and_then(counter::InstructionCounter::stop);
@@ -611,9 +638,25 @@ fn main() {
         }
     }
     let doc = session.document().unwrap();
-    let reported = doc.memory_usage_bytes();
-    let paragraph_cache: Vec<_> = doc.memory_usage_report().entries.into_iter().filter(|entry| entry.label.contains("paragraph_layouts")).map(|entry| json!({"label":entry.label,"bytes":entry.bytes})).collect();
     let rss = peak_rss();
-    let output = json!({"case":case,"chapter":path.rsplit('/').next().unwrap(),"samples":count,"font_backend":"deterministic mock","heap_instrumented":cfg!(feature="heap"),"reader_borrows_layout":cfg!(feature="borrowed-view"),"image_metric":image_metric,"paragraph_cache":paragraph_cache,"wall_median_ms":median(&mut walls),"cpu_median_ms":median(&mut cpus),"user_instructions":if instructions.len()==count {Some(median(&mut instructions) as u64)} else {None},"heap_live_bytes":median(&mut retained) as usize,"heap_peak_bytes":median(&mut peaks) as usize,"allocation_requests":median(&mut allocations) as usize,"allocated_bytes":median(&mut allocated_bytes) as usize,"rss_peak_bytes":rss,"reported_document_bytes":reported,"glyphs":doc.render_view().text().glyph_count(),"lines":doc.render_view().text().line_count(),"render_fingerprint":format!("{:016x}",layout_fingerprint(doc)),"text_color_fingerprint":format!("{:016x}",text_color_fingerprint(doc,&shaper)),"source_fingerprint":format!("{:016x}",source_fingerprint(doc))});
+    let report = doc.memory_usage_report();
+    let reported = report.total_bytes();
+    let paragraph_cache: Vec<_> = report.entries.iter().filter(|entry| entry.label.contains("paragraph_layouts")).map(|entry| json!({"label":entry.label,"bytes":entry.bytes})).collect();
+    // Per-node allocations share labels; combine them for a compact breakdown.
+    let mut by_label = BTreeMap::<String, (usize, usize)>::new();
+    for entry in report.entries {
+        let totals = by_label.entry(entry.label).or_default();
+        totals.0 += entry.bytes;
+        totals.1 += entry.count;
+    }
+    let memory_breakdown: Vec<_> = by_label
+        .into_iter()
+        .map(|(label, (bytes, count))| json!({"label":label,"bytes":bytes,"count":count}))
+        .collect();
+    let output = json!({"case":case,"chapter":path.rsplit('/').next().unwrap(),"samples":count,"font_backend":"deterministic mock","heap_instrumented":cfg!(feature="heap"),"reader_borrows_layout":true,"image_metric":image_metric,"paragraph_cache":paragraph_cache,"memory_breakdown":memory_breakdown,"wall_median_ms":median(&mut walls),"cpu_median_ms":median(&mut cpus),"user_instructions":if instructions.len()==count {Some(median(&mut instructions) as u64)} else {None},"heap_live_bytes":median(&mut retained) as usize,"heap_peak_bytes":median(&mut peaks) as usize,"allocation_requests":median(&mut allocations) as usize,"allocated_bytes":median(&mut allocated_bytes) as usize,"rss_peak_bytes":rss,"reported_document_bytes":reported,"glyphs":doc.render_view().text().glyph_count(),"lines":doc.render_view().text().line_count(),"render_fingerprint":format!("{:016x}",layout_fingerprint(doc)),"text_color_fingerprint":format!("{:016x}",text_color_fingerprint(doc,&shaper)),"source_fingerprint":format!("{:016x}",source_fingerprint(doc))});
+    let mut output = output;
+    if args.get(5).is_some_and(|argument| argument == "geometry") {
+        output["geometry"] = geometry::snapshot(doc);
+    }
     println!("{output}");
 }

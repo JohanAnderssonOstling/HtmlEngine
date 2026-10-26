@@ -9,12 +9,12 @@ mod tests {
         let prepared = factory.parse_with_new_pipeline(html, css);
         let mut content = prepared.inline_content().clone();
         collapse_whitespace(prepared.styles(), prepared.layout_tree(), &mut content);
-        let overrides = vec![None; content.glyphs().len()];
+        let overrides = vec![None; content.characters().len()];
         let metrics = ShapedFontMetrics::new(BoxFontMetrics::NotRequired, RequiredFontMetrics::NotRequired, prepared.box_count(), 0.0, 0.0, 0.0);
         plan_shaping_spans(prepared.styles(), prepared.layout_tree(), &content, &overrides, &metrics)
             .into_iter()
             .map(|span| {
-                let text = span.character_indices().filter_map(|index| content.glyph_at(index as usize).and_then(char::from_u32)).collect();
+                let text = span.character_indices().filter_map(|index| content.character_at(index as usize).and_then(char::from_u32)).collect();
                 let colors = span.paint_colors(prepared.styles(), prepared.layout_tree());
                 (text, colors)
             })
@@ -28,8 +28,8 @@ mod tests {
         collapse_whitespace(prepared.styles(), prepared.layout_tree(), &mut content);
         let mut first_letter = first_letter_style_overrides(prepared.document(), prepared.styles(), prepared.layout_tree(), &content);
         transform_text(prepared.styles(), prepared.layout_tree(), &mut content, &mut first_letter);
-        let text = content.glyphs().iter().filter_map(|glyph| char::from_u32(*glyph)).collect();
-        let offsets = (0..content.glyphs().len()).map(|index| content.raw_glyph_source_offset(index)).collect();
+        let text = content.characters().iter().filter_map(|glyph| char::from_u32(*glyph)).collect();
+        let offsets = (0..content.characters().len()).map(|index| content.raw_glyph_source_offset(index)).collect();
         (text, offsets)
     }
 
@@ -85,7 +85,7 @@ mod tests {
                 0.0,
                 0.0,
             );
-            let dense = vec![None; content.glyphs().len()];
+            let dense = vec![None; content.characters().len()];
             let original = plan_shaping_spans(
                 prepared.styles(),
                 prepared.layout_tree(),
@@ -128,7 +128,7 @@ mod tests {
             );
             let mut dense_content = empty_content.clone();
             let mut empty_overrides = Vec::new();
-            let mut dense_overrides = vec![None; dense_content.glyphs().len()];
+            let mut dense_overrides = vec![None; dense_content.characters().len()];
             transform_text(
                 prepared.styles(),
                 prepared.layout_tree(),
@@ -143,8 +143,8 @@ mod tests {
             );
             assert!(empty_overrides.is_empty(), "{html}");
             assert_eq!(empty_overrides.capacity(), 0);
-            assert_eq!(empty_content.glyphs(), dense_content.glyphs());
-            for index in 0..empty_content.glyphs().len() {
+            assert_eq!(empty_content.characters(), dense_content.characters());
+            for index in 0..empty_content.characters().len() {
                 assert_eq!(
                     empty_content.raw_glyph_source_offset(index),
                     dense_content.raw_glyph_source_offset(index)
@@ -211,7 +211,7 @@ mod tests {
             );
             assert_eq!(
                 overrides.len(),
-                prepared.inline_content().glyphs().len(),
+                prepared.inline_content().characters().len(),
                 "{css}"
             );
         }
@@ -227,6 +227,84 @@ mod tests {
         assert!(ShapedTextRun::new(Arc::from([4.0, 4.0]), Arc::from([true, true])).is_none());
         assert!(ShapedTextRun::new(Arc::from([4.0]), Arc::from([false, true])).is_none());
         assert!(ShapedTextRun::new(Arc::from([f32::NAN]), Arc::from([true, true])).is_none());
+    }
+
+    #[test]
+    fn native_ascii_boundaries_preserve_crlf_and_ligatures() {
+        let mut run = ShapedTextRun::new(
+            Arc::from([4.0; 4]), Arc::from([true, false, true, true, true]),
+        ).unwrap();
+        run.preserve_graphemes("fi\r\n");
+        assert_eq!(run.cluster_boundaries(), &[true, false, true, false, true]);
+    }
+
+    #[test]
+    fn graphemes_are_segmented_once_per_run_and_keep_native_ligatures() {
+        use crate::{GlyphId, GlyphResourceStore, GlyphShaper, ImageMetrics, LayoutConstraints, ShapeError};
+        use crate::test_support::TestGlyphShaper;
+
+        struct Shaper {
+            fallback: TestGlyphShaper,
+            native: bool,
+            run_calls: usize,
+        }
+        impl GlyphShaper for Shaper {
+            fn reset(&mut self) {
+                self.fallback.reset();
+                self.run_calls = 0;
+            }
+            fn glyph_resources(&mut self) -> &mut GlyphResourceStore { self.fallback.glyph_resources() }
+            fn begin_append_shaping(&mut self) -> Result<(), ShapeError> { self.fallback.begin_append_shaping() }
+            fn commit_append_shaping(&mut self) { self.fallback.commit_append_shaping(); }
+            fn rollback_append_shaping(&mut self) { self.fallback.rollback_append_shaping(); }
+            fn shape_glyph(&mut self, ch: char, size: f32, weight: u16, slant: FontSlant, color: u32, family: Option<&str>) -> Result<GlyphId, ShapeError> {
+                self.fallback.shape_glyph(ch, size, weight, slant, color, family)
+            }
+            fn shape_glyph_run(&mut self, request: TextRunShapeRequest<'_>, glyphs: &mut [GlyphId]) -> Result<Option<ShapedTextRun>, ShapeError> {
+                self.run_calls += 1;
+                let size = request.style().font_size();
+                let ligature_boundary = request.text().find("fi")
+                    .map(|byte| request.text()[..byte].chars().count() + 1);
+                self.fallback.shape_glyph_run(request, glyphs)?;
+                if !self.native { return Ok(None); }
+                // The backend merges "fi" but leaves combining/emoji clusters
+                // too permissive, so both native and Unicode constraints matter.
+                let mut boundaries = vec![true; glyphs.len() + 1];
+                if let Some(boundary) = ligature_boundary { boundaries[boundary] = false; }
+                Ok(Some(ShapedTextRun::new(vec![size * 0.5; glyphs.len()].into(), boundaries.into()).unwrap()))
+            }
+        }
+
+        for native in [false, true] {
+            for first_line in [false, true] {
+                let css = first_line.then_some("p::first-line { font-size:20px }");
+                let prepared = DocumentFactory::new().parse_with_new_pipeline(
+                    "<p>e\u{301}fi 👩\u{200d}💻 🇸🇪</p>", css,
+                );
+                let mut shaper = Shaper { fallback: TestGlyphShaper::new(), native, run_calls: 0 };
+                let constraints = LayoutConstraints::new(1000.0, 16.0).unwrap();
+                let metrics = ImageMetrics::default();
+                #[cfg(feature = "profiling")]
+                let document = {
+                    let (result, entries) = crate::profiling::capture(std::time::Duration::default, || {
+                        prepared.shape_and_layout_with_metrics_and_shaper(constraints, &metrics, &mut shaper)
+                    });
+                    let passes = entries.iter().find(|entry| entry.name == "shape.grapheme_boundaries").unwrap().calls;
+                    assert_eq!(passes, shaper.run_calls, "native={native}, first_line={first_line}");
+                    result.unwrap()
+                };
+                #[cfg(not(feature = "profiling"))]
+                let document = prepared.shape_and_layout_with_metrics_and_shaper(constraints, &metrics, &mut shaper).unwrap();
+                let text = document.render_view().text();
+                let mut expected = [true, false, true, true, true, true, false, false, true, true, false, true];
+                if native { expected[3] = false; }
+                assert_eq!(text.glyph_count(), expected.len() - 1);
+                for (index, expected) in expected.into_iter().enumerate() {
+                    assert_eq!(text.is_character_cluster_boundary(index as u32), expected,
+                        "boundary {index}, native={native}, first_line={first_line}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -363,6 +441,7 @@ mod tests {
             for (indices, run) in [([0, 1], first), ([4, 5], second)] {
                 geometry.authoritative_runs.push(super::AuthoritativeShapedRun {
                     source_range: indices[0]..indices[1] + 1,
+                    run_offset: 0,
                     backend_run: run.backend_run().unwrap(),
                     caret_stops: run.shared_caret_stops().unwrap(),
                     ascent: run.ascent(),
@@ -404,6 +483,11 @@ mod tests {
             for (index, expected) in advances.iter().enumerate() { assert_eq!(geometry.advance(index), Some(*expected), "advance {index}"); }
             for (index, expected) in boundaries.iter().enumerate() { assert_eq!(geometry.is_cluster_boundary(index), *expected, "boundary {index}"); }
             assert_eq!(geometry.advance(LEN), None);
+            let view = super::TextGeometryView::new(geometry, None);
+            let mut geometry_hint = 0;
+            for index in (0..=LEN + 1).chain((0..=LEN).rev()) {
+                assert_eq!(view.character_geometry_with_hint(index, &mut geometry_hint), (geometry.advance(index), geometry.is_cluster_boundary(index)), "cursor {index}");
+            }
             let mut advance_hint = usize::MAX;
             let mut boundary_hint = usize::MAX;
             for index in (0..LEN).chain((0..LEN).rev()) {
@@ -423,6 +507,43 @@ mod tests {
             boundaries[range.start as usize..=range.end as usize].copy_from_slice(shaped.cluster_boundaries());
             geometry.replace_range(range, shaped);
             check(&geometry, &advances, &boundaries);
+        }
+    }
+
+    #[test]
+    fn combined_geometry_matches_scalar_queries_across_refinement_edges_and_gaps() {
+        use super::TextGeometryView;
+
+        const LEN: usize = 32;
+        let assert_cursor = |view: TextGeometryView<'_>| {
+            let mut geometry_hint = 0;
+            let indices = (0..=LEN + 2).chain((0..=LEN + 2).rev())
+                .chain((0..200).map(|index| (index * 17) % (LEN + 3)))
+                .chain([usize::MAX, 0, LEN, 2]);
+            for index in indices {
+                assert_eq!(view.character_geometry_with_hint(index, &mut geometry_hint), (view.advance(index), view.is_cluster_boundary(index)), "index {index}");
+            }
+        };
+        let empty = ShapedTextGeometry::with_len(0);
+        assert_cursor(TextGeometryView::new(&empty, None));
+        let mut base = ShapedTextGeometry::with_len(LEN);
+        assert_cursor(TextGeometryView::new(&base, None));
+        for indices in [vec![0, 1, 2, 3], vec![6, 7, 9], vec![16, 17, 18], vec![25, 26, 27, 28, 29, 30, 31]] {
+            let mut boundaries = vec![true; indices.len() + 1];
+            boundaries[1..indices.len()].fill(false);
+            let advances = (0..indices.len()).map(|index| index as f32 + 0.25).collect::<Arc<[f32]>>();
+            base.push_run(&indices, ShapedTextRun::new(advances, boundaries.into()).unwrap());
+        }
+        base.finish_runs();
+        assert_cursor(TextGeometryView::new(&base, None));
+        let mut refined = ShapedTextGeometry::with_len(LEN);
+        assert_cursor(TextGeometryView::new(&base, Some(&refined)));
+        for range in [1..3, 4..7, 7..9, 17..19, 18..21, 24..32] {
+            let length = (range.end - range.start) as usize;
+            let mut boundaries = vec![true; length + 1];
+            boundaries[1..length].fill(false);
+            refined.replace_range(range, ShapedTextRun::new(vec![7.5; length].into(), boundaries.into()).unwrap());
+            assert_cursor(TextGeometryView::new(&base, Some(&refined)));
         }
     }
 
@@ -465,7 +586,7 @@ mod tests {
             let prepared = factory.parse_with_new_pipeline(html, css);
             let mut dense = LedgerShaper { fallback: TestGlyphShaper::new(), compact: false };
             let mut compact = LedgerShaper { fallback: TestGlyphShaper::new(), compact: true };
-            let dense_shaped = prepared.shape(&mut dense).unwrap();
+
             let compact_shaped = prepared.shape(&mut compact).unwrap();
             let metrics = ImageMetrics::default();
             let mut compact_doc = compact_shaped
@@ -473,7 +594,7 @@ mod tests {
                 .unwrap();
             for width in [40.0, 120.0, 350.0, 350.0, 40.0] {
                 let constraints = LayoutConstraints::new(width, 16.0).unwrap();
-                let mut dense_doc = dense_shaped.clone().layout_with_metrics_and_shaper(constraints, &metrics, &mut dense).unwrap();
+                let mut dense_doc = prepared.shape(&mut dense).unwrap().layout_with_metrics_and_shaper(constraints, &metrics, &mut dense).unwrap();
                 compact_doc.relayout_with_metrics_and_shaper(constraints, &metrics, &mut compact).unwrap();
                 let expected = dense_doc.render_view().text();
                 let actual = compact_doc.render_view().text();

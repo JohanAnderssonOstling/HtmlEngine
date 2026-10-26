@@ -29,6 +29,7 @@ fn is_inherited_property(name: &str) -> bool {
             | "white-space"
             | "visibility"
             | "word-break"
+            | "line-break"
             | "overflow-wrap"
             | "word-wrap"
             | "list-style"
@@ -200,6 +201,7 @@ fn apply_css_wide_keyword_with_rollback(
         "color" => style.text.color = src.text.color,
         "visibility" => style.text.visibility = src.text.visibility,
         "direction" => style.text.direction = src.text.direction,
+        "unicode-bidi" => style.box_model.unicode_bidi = src.box_model.unicode_bidi,
         "font" => {
             style.font = src.font.clone();
             style.text.line_height = src.text.line_height;
@@ -267,6 +269,7 @@ fn apply_css_wide_keyword_with_rollback(
         "text-transform" => style.text.text_transform = src.text.text_transform,
         "white-space" => style.text.white_space = src.text.white_space,
         "word-break" => style.text.word_break = src.text.word_break,
+        "line-break" => style.text.line_break = src.text.line_break,
         "overflow-wrap" | "word-wrap" => style.text.overflow_wrap = src.text.overflow_wrap,
         "overflow" => {
             style.box_model.overflow_x = src.box_model.overflow_x;
@@ -649,6 +652,7 @@ pub(super) fn apply_all_from_basis(
             // Preserve values finalized in the prerequisite pass so a later
             // declaration in the same layer remains the winner.
             let direction = style.text.direction;
+            let unicode_bidi = style.box_model.unicode_bidi;
             let language = style.text.language;
             let color = style.text.color;
             let line_height = style.text.line_height;
@@ -665,6 +669,7 @@ pub(super) fn apply_all_from_basis(
             let root_line_height = style.font.font_size_root_line_height;
             *style = basis.clone();
             style.text.direction = direction;
+            style.box_model.unicode_bidi = unicode_bidi;
             style.text.language = language;
             style.text.color = color;
             style.text.line_height = line_height;

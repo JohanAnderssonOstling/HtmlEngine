@@ -1,4 +1,4 @@
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub(crate) struct LayoutConfig {
     viewport_width: f64,
     viewport_height: Option<f64>,
@@ -34,9 +34,6 @@ impl LayoutConfig {
     }
     pub(crate) fn hyphenation_quality(&self) -> bool {
         self.text_composition_policy.uses_hyphenation_quality()
-    }
-    pub(crate) fn sentence_per_line(&self) -> bool {
-        self.text_composition_policy.uses_sentence_per_line()
     }
     pub(crate) fn image_sizing_policy(&self) -> crate::ImageSizingPolicy {
         self.image_sizing_policy

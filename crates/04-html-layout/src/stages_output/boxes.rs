@@ -60,6 +60,7 @@ pub struct RenderTableCell {
     colspan: usize,
     header: bool,
     text: String,
+    glyphs: Option<Range<u32>>,
 }
 
 impl RenderTable {
@@ -113,6 +114,11 @@ impl RenderTableCell {
 
     pub fn is_header(&self) -> bool {
         self.header
+    }
+
+    /// Logical source interval owned by this cell, excluding nested tables.
+    pub fn glyphs(&self) -> Option<Range<u32>> {
+        self.glyphs.clone()
     }
 
     pub fn text(&self) -> &str {
@@ -404,11 +410,47 @@ impl<'a> RenderBoxView<'a> {
                     colspan,
                     header,
                     text,
+                    glyphs: None,
                 });
                 column += colspan;
             }
             column_count = column_count.max(occupied_until.len()).max(column);
             rows.push(RenderTableRow { cells });
+        }
+        // Resolve all cell intervals in one traversal rather than rescanning
+        // the document for every cell during semantic selection.
+        let cells = rows
+            .iter()
+            .enumerate()
+            .flat_map(|(row, data)| {
+                data.cells
+                    .iter()
+                    .enumerate()
+                    .map(move |(column, cell)| (cell.box_idx, (row, column)))
+            })
+            .collect::<FxHashMap<_, _>>();
+        for run in self.doc.render_view().text().text_runs() {
+            let mut owner = None;
+            for ancestor in std::iter::once(run.box_idx()).chain(self.ancestors(run.box_idx())) {
+                if let Some(&cell) = cells.get(&ancestor) {
+                    owner.get_or_insert(cell);
+                }
+                if self.is_table(ancestor) {
+                    if ancestor == box_idx
+                        && let Some((row, column)) = owner
+                    {
+                        let glyphs = &mut rows[row].cells[column].glyphs;
+                        let range = run.glyphs();
+                        if let Some(existing) = glyphs {
+                            existing.start = existing.start.min(range.start);
+                            existing.end = existing.end.max(range.end);
+                        } else if !range.is_empty() {
+                            *glyphs = Some(range);
+                        }
+                    }
+                    break;
+                }
+            }
         }
         let mut authored_html = String::new();
         serialize_authored_html(document, table_element.node_id(), &mut authored_html);

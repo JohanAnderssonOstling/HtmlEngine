@@ -184,8 +184,7 @@ pub(in crate::layout) fn stretch_margin_inset(
     cb_width: f64,
 ) -> f64 {
     let style = reader.style(box_idx);
-    let before = style.margin_top().resolve(cb_width);
-    let after = style.margin_bottom().resolve(cb_width);
+    let (before, after) = reader.vertical_margins(box_idx, cb_width);
     let both = before + after;
     if participation(style.float(), style.position()) != FlowParticipation::InFlow
         || matches!(
@@ -398,8 +397,7 @@ impl MarginAnalysis {
         cb_width: f64,
     ) -> MarginProfile {
         let style = reader.style(box_idx);
-        let own_before = style.margin_top().resolve(cb_width);
-        let own_after = style.margin_bottom().resolve(cb_width);
+        let (own_before, own_after) = reader.vertical_margins(box_idx, cb_width);
         let participation = participation(style.float(), style.position());
         let own_clear_sides = if matches!(participation, FlowParticipation::OutOfFlow) {
             0
@@ -409,11 +407,11 @@ impl MarginAnalysis {
         let is_anonymous = matches!(reader.box_layout_mode(box_idx), Some(BoxType::Anonymous(_)));
         if is_anonymous {
             return MarginProfile {
-                before: MarginStrut::default(),
-                before_clear: MarginStrut::default(),
-                after: MarginStrut::default(),
-                own_before: 0.0,
-                own_after: 0.0,
+                before: MarginStrut::from_margin(own_before),
+                before_clear: MarginStrut::from_margin(own_before),
+                after: MarginStrut::from_margin(own_after),
+                own_before,
+                own_after,
                 participation: FlowParticipation::InFlow,
                 collapses_through: false,
                 adjoining_float_sides: 0,
@@ -651,7 +649,7 @@ impl MarginAnalysis {
         }
 
         let style = reader.style(box_idx);
-        let own_after = style.margin_bottom().resolve(cb_width);
+        let (_, own_after) = reader.vertical_margins(box_idx, cb_width);
         let is_flex_grid_item = reader.get_parent(box_idx).is_some_and(|parent_idx| {
             matches!(
                 reader.box_layout_mode(parent_idx),

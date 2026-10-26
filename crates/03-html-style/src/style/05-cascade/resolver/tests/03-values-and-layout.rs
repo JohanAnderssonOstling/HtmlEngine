@@ -1,6 +1,180 @@
 use super::*;
 
 #[test]
+fn content_languages_inherit_as_structured_tags_and_empty_values_reset_them() {
+    let prepared = DocumentFactory::new().parse_with_new_pipeline(
+        "<body lang='ZH-hant-tw-u-nu-hanidec-x-reader'>\
+         <div id='parent'><span id='inherited'></span><span id='empty' lang=''><i id='empty-child'></i></span>\
+         <span id='unknown' lang='en_US'><i id='unknown-child'></i></span>\
+         <span id='variant' lang='de-DE-1996-u-co-phonebk-x-reader'></span>\
+         <span id='alias' lang='iw'></span><span id='private' lang='x-reader'></span></div></body>", None);
+    let language = |id| {
+        let node = prepared
+            .document()
+            .node_ids()
+            .find(|&node| prepared.document().get_dom_id(node) == Some(id))
+            .unwrap();
+        let style = prepared
+            .styles()
+            .view(prepared.style_for_node(node).unwrap())
+            .unwrap();
+        style.language()
+    };
+    assert_eq!(language("parent"), language("inherited"));
+    let tag = prepared
+        .styles()
+        .language(language("inherited").unwrap())
+        .unwrap()
+        .tag()
+        .unwrap();
+    assert_eq!(tag.script(), Some("Hant"));
+    assert_eq!(tag.region(), Some("TW"));
+    assert!(language("empty").is_none());
+    assert!(language("empty-child").is_none());
+    assert_eq!(language("unknown"), language("unknown-child"));
+    assert_eq!(
+        prepared
+            .styles()
+            .language(language("unknown").unwrap())
+            .unwrap()
+            .as_str(),
+        "en_US"
+    );
+    let variant = prepared
+        .styles()
+        .language(language("variant").unwrap())
+        .unwrap()
+        .tag()
+        .unwrap();
+    assert_eq!(variant.variant(), Some("1996"));
+    assert_eq!(variant.extension(), Some("u-co-phonebk"));
+    assert_eq!(
+        prepared
+            .styles()
+            .language(language("alias").unwrap())
+            .unwrap()
+            .tag()
+            .unwrap()
+            .primary_language(),
+        "he"
+    );
+    assert_eq!(
+        prepared
+            .styles()
+            .language(language("private").unwrap())
+            .unwrap()
+            .tag()
+            .unwrap()
+            .private_use(),
+        Some("x-reader")
+    );
+}
+
+#[test]
+fn xml_language_precedes_html_language_and_survives_reader_rebuilding() {
+    use html_style_model::ReaderStyleOverrides;
+    let parsed = html_parse::parse_xml_document(
+        "<html xmlns='http://www.w3.org/1999/xhtml' xml:lang='ja-JP'><body><p id='target' lang='en' xml:lang='zh-Hant-TW'>漢字</p><p id='empty' xml:lang=''>字</p></body></html>").unwrap();
+    let prepared = crate::style_document(parsed.build_dom(), &[]);
+    let node = prepared
+        .document()
+        .node_ids()
+        .find(|&node| prepared.document().get_dom_id(node) == Some("target"))
+        .unwrap();
+    let language = prepared
+        .styles()
+        .view(prepared.style_for_node(node).unwrap())
+        .unwrap()
+        .language()
+        .unwrap();
+    let tag = prepared.styles().language(language).unwrap().tag().unwrap();
+    assert_eq!(tag.primary_language(), "zh");
+    assert_eq!(tag.script(), Some("Hant"));
+    assert_eq!(tag.region(), Some("TW"));
+    let rebuilt = prepared
+        .styles()
+        .with_reader_overrides(
+            prepared.document(),
+            &ReaderStyleOverrides {
+                font_family: Some("reader serif".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let new_id = rebuilt
+        .view(rebuilt.style_for_node(node).unwrap())
+        .unwrap()
+        .language()
+        .unwrap();
+    assert_eq!(
+        rebuilt.language(new_id),
+        prepared.styles().language(language)
+    );
+    assert!(
+        rebuilt.language(language).is_none(),
+        "language IDs must be rebound to the new style store"
+    );
+    let empty = prepared
+        .document()
+        .node_ids()
+        .find(|&node| prepared.document().get_dom_id(node) == Some("empty"))
+        .unwrap();
+    assert!(
+        prepared
+            .styles()
+            .view(prepared.style_for_node(empty).unwrap())
+            .unwrap()
+            .language()
+            .is_none()
+    );
+}
+
+#[test]
+fn cjk_line_break_values_inherit_and_honor_css_wide_keywords_and_variables() {
+    use html_style_model::LineBreak;
+    let html = "<div style='line-break:strict;--breaking:loose'>\
+        <span id='inherited'></span>\
+        <span id='initial' style='line-break:initial'></span>\
+        <span id='unset' style='line-break:unset'></span>\
+        <span id='all' style='all:initial'></span>\
+        <span id='variable' style='line-break:var(--breaking)'></span>\
+        <span id='anywhere' style='line-break:anywhere'></span>\
+        <span id='normal' style='line-break:normal'></span></div>";
+    let prepared = DocumentFactory::new().parse_with_new_pipeline(html, None);
+    for (id, expected) in [
+        ("inherited", LineBreak::Strict), ("initial", LineBreak::Auto),
+        ("unset", LineBreak::Strict), ("all", LineBreak::Auto),
+        ("variable", LineBreak::Loose), ("anywhere", LineBreak::Anywhere),
+        ("normal", LineBreak::Normal),
+    ] {
+        let node = prepared.document().node_ids()
+            .find(|&node| prepared.document().get_dom_id(node) == Some(id)).unwrap();
+        let style = prepared.styles().view(prepared.style_for_node(node).unwrap()).unwrap();
+        assert_eq!(style.line_break(), expected, "{id}");
+    }
+}
+
+#[test]
+fn rtl_unicode_bidi_is_reset_and_css_wide_keywords_preserve_its_semantics() {
+    use html_style_model::{TextDirection, UnicodeBidi};
+    let html = "<body><div id='parent' style='direction:rtl;unicode-bidi:isolate-override'><span id='normal'></span><span id='inherited' style='unicode-bidi:inherit'></span><span id='all' style='unicode-bidi:embed;all:initial'></span></div><bdi id='auto'>אבג</bdi><bdo id='override' dir='rtl'>abc</bdo></body>";
+    let mut factory = DocumentFactory::new();
+    let prepared = factory.parse_with_new_pipeline(html, None);
+    let style = |id| {
+        let node = prepared.document().node_ids().find(|&node| prepared.document().get_dom_id(node) == Some(id)).unwrap();
+        prepared.styles().view(prepared.style_for_node(node).unwrap()).unwrap()
+    };
+    assert_eq!(style("normal").unicode_bidi(), UnicodeBidi::Normal);
+    assert_eq!(style("normal").direction(), TextDirection::Rtl);
+    assert_eq!(style("inherited").unicode_bidi(), UnicodeBidi::IsolateOverride);
+    assert_eq!(style("all").unicode_bidi(), UnicodeBidi::Embed);
+    assert_eq!(style("all").direction(), TextDirection::Rtl);
+    assert_eq!(style("auto").direction(), TextDirection::Rtl);
+    assert_eq!(style("auto").unicode_bidi(), UnicodeBidi::Isolate);
+    assert_eq!(style("override").unicode_bidi(), UnicodeBidi::BidiOverride);
+}
+
+#[test]
 fn invalid_font_shorthand_is_atomic() {
     let html = "<html><body><div style='font:italic 700 20px/30px serif;font:4em/-2em monospace'></div></body></html>";
     let mut factory = DocumentFactory::new();

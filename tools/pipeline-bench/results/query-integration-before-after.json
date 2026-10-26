@@ -1,0 +1,237 @@
+{
+  "method": {
+    "samples": 5,
+    "warmup_samples": 3,
+    "timing_and_allocation_runs_separate": true,
+    "fixture_generator": "tools/pipeline-bench/query_fixtures.py",
+    "chapter_bytes": 210621,
+    "chapter_sha256": "c9c604c0ba5a3bd91397626ed9abb1c49452a46e7256a484b15a42635e8d9183",
+    "table_rows": 501,
+    "table_columns": 8,
+    "timing_includes": "query only; parse, shaping, layout and fingerprinting excluded",
+    "engine_base_commit": "6b1d2dda24e1ff87c8e633df9bab61abee90961e",
+    "source_state": "uncommitted working tree before and after the query optimizations"
+  },
+  "timing_before": [
+    {
+      "allocated_bytes": 0.0,
+      "allocations": 0.0,
+      "case": "query_search",
+      "characters": 190390,
+      "cpu_median_ms": 16.90035199999998,
+      "integrity": "ba394f523f6a03c8",
+      "lines": 3400,
+      "measured_samples": 5,
+      "observed": 3000,
+      "user_instructions": 226118677.0,
+      "wall_median_ms": 17.000679
+    },
+    {
+      "allocated_bytes": 0.0,
+      "allocations": 0.0,
+      "case": "query_table",
+      "characters": 39168,
+      "cpu_median_ms": 141.018455,
+      "integrity": "182948538b6e699f",
+      "lines": 7928,
+      "measured_samples": 5,
+      "observed": 20243,
+      "user_instructions": 2093194225.0,
+      "wall_median_ms": 141.635548
+    },
+    {
+      "allocated_bytes": 0.0,
+      "allocations": 0.0,
+      "case": "query_roles",
+      "characters": 190390,
+      "cpu_median_ms": 0.3144600000000025,
+      "integrity": "ba394f523f6a03c8",
+      "lines": 3400,
+      "measured_samples": 5,
+      "observed": 200,
+      "user_instructions": 4961419.0,
+      "wall_median_ms": 0.319787
+    },
+    {
+      "allocated_bytes": 0.0,
+      "allocations": 0.0,
+      "case": "query_restore",
+      "characters": 190390,
+      "cpu_median_ms": 0.05436200000000224,
+      "integrity": "ba394f523f6a03c8",
+      "lines": 3400,
+      "measured_samples": 5,
+      "observed": 12,
+      "user_instructions": 754329.0,
+      "wall_median_ms": 0.053711999999999996
+    }
+  ],
+  "timing_after": [
+    {
+      "allocated_bytes": 0.0,
+      "allocations": 0.0,
+      "case": "query_search",
+      "characters": 190390,
+      "cpu_median_ms": 13.29988,
+      "integrity": "ba394f523f6a03c8",
+      "lines": 3400,
+      "measured_samples": 5,
+      "observed": 3000,
+      "user_instructions": 148813706.0,
+      "wall_median_ms": 14.17937
+    },
+    {
+      "allocated_bytes": 0.0,
+      "allocations": 0.0,
+      "case": "query_table",
+      "characters": 39168,
+      "cpu_median_ms": 1.3651599999999902,
+      "integrity": "182948538b6e699f",
+      "lines": 7928,
+      "measured_samples": 5,
+      "observed": 20243,
+      "user_instructions": 15187289.0,
+      "wall_median_ms": 1.374317
+    },
+    {
+      "allocated_bytes": 0.0,
+      "allocations": 0.0,
+      "case": "query_roles",
+      "characters": 190390,
+      "cpu_median_ms": 0.35392400000000546,
+      "integrity": "ba394f523f6a03c8",
+      "lines": 3400,
+      "measured_samples": 5,
+      "observed": 200,
+      "user_instructions": 4965419.0,
+      "wall_median_ms": 0.35307
+    },
+    {
+      "allocated_bytes": 0.0,
+      "allocations": 0.0,
+      "case": "query_restore",
+      "characters": 190390,
+      "cpu_median_ms": 0.1184929999999973,
+      "integrity": "ba394f523f6a03c8",
+      "lines": 3400,
+      "measured_samples": 5,
+      "observed": 12,
+      "user_instructions": 754329.0,
+      "wall_median_ms": 0.117383
+    }
+  ],
+  "heap_before": [
+    {
+      "allocated_bytes": 20353457.0,
+      "allocations": 380815.0,
+      "case": "query_search",
+      "characters": 190390,
+      "cpu_median_ms": 18.908505999999992,
+      "integrity": "ba394f523f6a03c8",
+      "lines": 3400,
+      "measured_samples": 5,
+      "observed": 3000,
+      "user_instructions": null,
+      "wall_median_ms": 19.011314000000002
+    },
+    {
+      "allocated_bytes": 1683542.0,
+      "allocations": 26197.0,
+      "case": "query_table",
+      "characters": 39168,
+      "cpu_median_ms": 133.21935100000005,
+      "integrity": "182948538b6e699f",
+      "lines": 7928,
+      "measured_samples": 5,
+      "observed": 20243,
+      "user_instructions": null,
+      "wall_median_ms": 135.172192
+    },
+    {
+      "allocated_bytes": 0.0,
+      "allocations": 0.0,
+      "case": "query_roles",
+      "characters": 190390,
+      "cpu_median_ms": 0.3055629999999948,
+      "integrity": "ba394f523f6a03c8",
+      "lines": 3400,
+      "measured_samples": 5,
+      "observed": 200,
+      "user_instructions": null,
+      "wall_median_ms": 0.31105
+    },
+    {
+      "allocated_bytes": 960.0,
+      "allocations": 24.0,
+      "case": "query_restore",
+      "characters": 190390,
+      "cpu_median_ms": 0.04321099999999439,
+      "integrity": "ba394f523f6a03c8",
+      "lines": 3400,
+      "measured_samples": 5,
+      "observed": 12,
+      "user_instructions": null,
+      "wall_median_ms": 0.042641
+    }
+  ],
+  "heap_after": [
+    {
+      "allocated_bytes": 6271505.0,
+      "allocations": 18.0,
+      "case": "query_search",
+      "characters": 190390,
+      "cpu_median_ms": 10.944404000000004,
+      "integrity": "ba394f523f6a03c8",
+      "lines": 3400,
+      "measured_samples": 5,
+      "observed": 3000,
+      "user_instructions": null,
+      "wall_median_ms": 11.004066
+    },
+    {
+      "allocated_bytes": 2141330.0,
+      "allocations": 26209.0,
+      "case": "query_table",
+      "characters": 39168,
+      "cpu_median_ms": 1.5130790000000005,
+      "integrity": "182948538b6e699f",
+      "lines": 7928,
+      "measured_samples": 5,
+      "observed": 20243,
+      "user_instructions": null,
+      "wall_median_ms": 1.5239209999999999
+    },
+    {
+      "allocated_bytes": 0.0,
+      "allocations": 0.0,
+      "case": "query_roles",
+      "characters": 190390,
+      "cpu_median_ms": 0.34085900000000585,
+      "integrity": "ba394f523f6a03c8",
+      "lines": 3400,
+      "measured_samples": 5,
+      "observed": 200,
+      "user_instructions": null,
+      "wall_median_ms": 0.348571
+    },
+    {
+      "allocated_bytes": 960.0,
+      "allocations": 24.0,
+      "case": "query_restore",
+      "characters": 190390,
+      "cpu_median_ms": 0.04809000000000063,
+      "integrity": "ba394f523f6a03c8",
+      "lines": 3400,
+      "measured_samples": 5,
+      "observed": 12,
+      "user_instructions": null,
+      "wall_median_ms": 0.04744
+    }
+  ],
+  "production_code_delta": {
+    "method": "crates/**/src Rust only; tests, comments and blanks excluded; before/after normalized with identical rustfmt settings",
+    "engine": 107,
+    "reader": -133,
+    "combined": -26
+  }
+}

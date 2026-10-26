@@ -362,8 +362,9 @@ impl RenderAddressingView<'_> {
         let mut previous_context = None;
         let mut explicit_break = false;
         self.doc
-            .shaped
-            .inline_content
+            .inputs
+            .text
+            .content()
             .inline_items()
             .iter()
             .filter_map(move |item| {

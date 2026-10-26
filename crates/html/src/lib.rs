@@ -4,6 +4,8 @@
 //! packages. Reader pagination and UI behavior deliberately live outside this
 //! facade.
 
+pub mod export;
+
 pub mod document {
     pub use html_dom::*;
     pub use html_parse::{
@@ -14,6 +16,23 @@ pub mod document {
         parse_html_document, parse_html_document_bytes, parse_html_document_with_options,
         parse_html_fragment, parse_xml_document, plain_text_from_fragment,
     };
+
+    /// Declared media type takes precedence over the resource filename.
+    pub fn markup_syntax_for_resource(provider: &dyn crate::resources::ResourceProvider, uri: &str) -> MarkupSyntax {
+        let media_type = provider.metadata(uri).ok().and_then(|metadata| metadata.media_type);
+        match media_type.as_deref().map(|value| value.split(';').next().unwrap_or(value).trim()) {
+            Some(value) if value.eq_ignore_ascii_case("application/xhtml+xml") || value.eq_ignore_ascii_case("application/xml") || value.eq_ignore_ascii_case("text/xml") => MarkupSyntax::Xml,
+            Some(value) if value.eq_ignore_ascii_case("text/html") => MarkupSyntax::Html,
+            _ => MarkupSyntax::from_uri(uri),
+        }
+    }
+
+    /// Build a parse-only text/source index for search without loading fonts,
+    /// images, styles, or a reader viewport.
+    pub fn text_index_for_resource(source: &str, provider: &dyn crate::resources::ResourceProvider, uri: &str) -> Option<DocumentTextIndex> {
+        let parsed = parse_document(source, markup_syntax_for_resource(provider, uri)).ok()?;
+        DocumentTextIndex::from_parsed(&parsed).ok()
+    }
 }
 
 /// Transitional access to parsing diagnostics. Normal consumers should prefer
@@ -36,10 +55,11 @@ pub mod style {
 }
 
 pub mod text {
+    pub use html_layout::{TextSearchOptions, find_text_matches};
     pub use html_layout::{
         CharacterPlacement, FontMetricsRequest, FontRelativeMetrics, FontSlant, GlyphId,
         GlyphMetric, GlyphMetricError, GlyphResourceGeneration, GlyphResourceStore, GlyphShaper,
-        OpenTypeFeature, ShapeError,
+        ContentLanguage, LanguageTag, OpenTypeFeature, ShapeError, TextDirection,
         ShapedLine, ShapedTextRun, TextRunId, TextRunShapeRequest, TextShapeRequest, TextStyleSpan,
     };
 }
@@ -114,6 +134,7 @@ pub mod engine {
     use crate::layout::{GlyphShaper, LaidOutDocument};
     use crate::pipeline::{PipelineError, PipelineInputs, PipelineSession, PipelineUpdate};
     use crate::resources::ResourceProvider;
+    use crate::style::FontFace;
 
     /// Stable facade over the internal incremental pipeline.
     ///
@@ -147,6 +168,14 @@ pub mod engine {
             inputs: PipelineInputs,
         ) -> Result<(), PipelineError> {
             self.session.prepare_through_style(inputs)
+        }
+
+        /// Active font declarations, available before shaping after
+        /// [`Self::prepare_through_style`]. Load/register these faces in the
+        /// host text backend, then call [`Self::rehydrate_glyphs`].
+        /// URL sources are resolved against their declaring stylesheet.
+        pub fn font_faces(&self) -> &[FontFace] {
+            self.session.font_faces()
         }
 
         pub fn media_environment_change_affects_style(

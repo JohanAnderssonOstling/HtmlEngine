@@ -648,8 +648,8 @@ pub(super) fn justify_content(
             ContentPosition::FlexStart => ContentAlignment::FlexStart,
             ContentPosition::FlexEnd => ContentAlignment::FlexEnd,
         },
-        JustifyContent::Left { .. } => ContentAlignment::Start,
-        JustifyContent::Right { .. } => ContentAlignment::End,
+        JustifyContent::Left { .. } => ContentAlignment::Left,
+        JustifyContent::Right { .. } => ContentAlignment::Right,
     }
 }
 

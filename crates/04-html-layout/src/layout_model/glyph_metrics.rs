@@ -224,9 +224,16 @@ impl GlyphMetrics {
         self.records.len()
     }
 
+    #[cfg(test)]
     pub(crate) fn memory_usage_report(&self) -> MemoryUsageReport {
+        self.memory_usage_report_with_shared(&mut FxHashSet::default())
+    }
+
+    pub(crate) fn memory_usage_report_with_shared(
+        &self,
+        seen: &mut FxHashSet<*const ()>,
+    ) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
-        let mut shared_advances = FxHashSet::default();
         report.add_slice_storage::<MetricRecord>(
             "GlyphMetrics.records",
             self.records.capacity(),
@@ -234,22 +241,28 @@ impl GlyphMetrics {
         );
         for record in &self.records {
             match &record.data {
-                MetricData::Singles(metrics) => report.add_slice_storage::<GlyphMetric>(
-                    "GlyphMetrics.singles",
-                    metrics.capacity(),
-                    metrics.len(),
-                ),
+                MetricData::Singles(metrics) => {
+                    if seen.insert(metrics.as_ptr().cast()) {
+                        report.add_slice_storage::<GlyphMetric>(
+                            "GlyphMetrics.singles",
+                            metrics.capacity(),
+                            metrics.len(),
+                        );
+                    }
+                }
                 MetricData::Run {
                     characters,
                     advances,
                     ..
                 } => {
-                    report.add_slice_storage::<char>(
-                        "GlyphMetrics.run.characters",
-                        characters.len(),
-                        characters.len(),
-                    );
-                    if shared_advances.insert(advances.as_ptr()) {
+                    if seen.insert(characters.as_ptr().cast()) {
+                        report.add_slice_storage::<char>(
+                            "GlyphMetrics.run.characters",
+                            characters.len(),
+                            characters.len(),
+                        );
+                    }
+                    if seen.insert(advances.as_ptr().cast()) {
                         report.add_slice_storage::<f32>(
                             "GlyphMetrics.run.advances.shared",
                             advances.len(),

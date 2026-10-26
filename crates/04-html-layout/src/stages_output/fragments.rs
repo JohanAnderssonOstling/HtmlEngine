@@ -375,6 +375,7 @@ impl<'a> RenderDecorations<'a> {
 
 #[derive(Clone, Copy, Debug)]
 pub struct RenderImageFragment {
+    pub(super) box_idx: usize,
     line_idx: usize,
     image_idx: u32,
     offset: Point,
@@ -387,6 +388,7 @@ pub struct RenderImageFragment {
 impl RenderImageFragment {
     fn from_fragment(fragment: &ImageFragment, document: &LaidOutDocument) -> Self {
         Self {
+            box_idx: fragment.box_idx as usize,
             line_idx: fragment.line_idx,
             image_idx: fragment.image_idx,
             offset: fragment.offset,

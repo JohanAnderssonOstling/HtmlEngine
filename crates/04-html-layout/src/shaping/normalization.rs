@@ -1,31 +1,103 @@
 //! CSS whitespace normalization and text transformation.
 
+use super::line_breaks::{CjkWritingSystem, is_unspaced_cjk};
 use super::*;
 use crate::layout_model::SourceOffsets;
+use html_style_model::{LineBreak, WordBreak};
+
+struct PendingSpace {
+    source: usize,
+    offset: u32,
+    wrap_before: WhitespaceWrapOverride,
+    segment_break: bool,
+}
+
+impl PendingSpace {
+    fn new(source: usize, offset: u32, wrap_before: bool, segment_break: bool) -> Self {
+        Self {
+            source,
+            offset,
+            wrap_before: WhitespaceWrapOverride::retained(wrap_before),
+            segment_break,
+        }
+    }
+}
+
+struct NormalizedText {
+    glyphs: Vec<GlyphId>,
+    source_offsets: SourceOffsets,
+    wraps: Vec<WhitespaceWrapOverride>,
+    remap: Vec<u32>,
+    // Allocated only for controls following pending whitespace; reuse this
+    // scratch buffer when later whitespace sequences contain controls too.
+    pending_controls: Vec<usize>,
+}
+
+impl NormalizedText {
+    fn new(capacity: usize) -> Self {
+        Self {
+            glyphs: Vec::with_capacity(capacity),
+            source_offsets: SourceOffsets::with_capacity(capacity),
+            wraps: Vec::with_capacity(capacity),
+            remap: vec![u32::MAX; capacity],
+            pending_controls: Vec::new(),
+        }
+    }
+
+    fn push(
+        &mut self,
+        source: usize,
+        character: GlyphId,
+        offset: u32,
+        wrap: WhitespaceWrapOverride,
+    ) {
+        self.remap[source] = self.glyphs.len() as u32;
+        self.glyphs.push(character);
+        self.source_offsets.push(offset);
+        self.wraps.push(wrap);
+    }
+
+    fn finish_pending(&mut self, pending: PendingSpace, keep_space: bool, content: &InlineContent) {
+        if keep_space {
+            self.push(
+                pending.source,
+                ' ' as GlyphId,
+                pending.offset,
+                pending.wrap_before,
+            );
+        }
+        // Retain source order whether the preceding space survives or not.
+        for index in 0..self.pending_controls.len() {
+            let source = self.pending_controls[index];
+            self.push(
+                source,
+                content.character_at(source).expect("pending control glyph"),
+                content.raw_glyph_source_offset(source),
+                WhitespaceWrapOverride::Style,
+            );
+        }
+        self.pending_controls.clear();
+    }
+}
 
 pub(super) fn collapse_whitespace(
     styles: &ComputedStyles,
     layout_tree: &LayoutTree,
     inline_content: &mut InlineContent,
-) {
-    let mut new_glyphs = Vec::with_capacity(inline_content.glyphs().len());
-    let mut new_source_offsets = SourceOffsets::with_capacity(inline_content.glyphs().len());
-    let mut new_whitespace_wrap_before = Vec::with_capacity(inline_content.glyphs().len());
-    let mut remap = vec![u32::MAX; inline_content.glyphs().len()];
+) -> FxHashSet<usize> {
+    let mut unicode_roots = FxHashSet::default();
+    let mut output = NormalizedText::new(inline_content.characters().len());
     let mut at_line_start = true;
-    let mut pending_space: Option<(usize, u32, bool)> = None;
+    let mut pending_space: Option<PendingSpace> = None;
     let mut current_context = None;
+    // Limit joining lookbehind to this flow, excluding atomic descendants and
+    // previous blocks. Ordinary characters need no additional bookkeeping.
+    let mut context_start = 0;
 
-    // Non-text inline items participate in whitespace collapsing too. A
-    // pending segment-break space before an image or atomic inline box must be
-    // committed, while whitespace at the true end of a formatting context is
-    // discarded. Preserve run order here instead of filtering down to text
-    // runs and losing those boundaries.
     let inline_items = inline_content.inline_items().to_vec();
     for run in &inline_items {
-        // Out-of-flow anchors and formatting-only boundaries are absent from
-        // the inline text stream. They neither commit nor discard pending
-        // whitespace and cannot start a new whitespace context.
+        // Formatting-only boundaries and out-of-flow anchors do not affect
+        // the inline text stream or its whitespace context.
         if matches!(
             run.kind,
             InlineItemKind::FloatAnchor { .. }
@@ -42,25 +114,17 @@ pub(super) fn collapse_whitespace(
         };
         let context = whitespace_context_root(layout_tree, context_box);
         if current_context != Some(context) {
-            if current_context
-                .is_some_and(|previous| layout_box_is_descendant_of(layout_tree, context, previous))
-            {
-                // Atomic descendants allocate their runs before the carrier
-                // token in the parent's run arena. Entering that nested
-                // formatting context therefore follows the parent's pending
-                // whitespace logically; commit it before shaping descendants.
-                if let Some((source, offset, wrap_before)) = pending_space.take() {
-                    remap[source] = new_glyphs.len() as u32;
-                    new_glyphs.push(' ' as GlyphId);
-                    new_source_offsets.push(offset);
-                    new_whitespace_wrap_before.push(WhitespaceWrapOverride::retained(wrap_before));
-                }
-            } else {
-                // A trailing collapsible space is discarded between sibling
-                // formatting contexts and must not leak into the next block.
-                pending_space = None;
+            if let Some(pending) = pending_space.take() {
+                // Atomic descendants precede their carrier in the run arena;
+                // commit the parent's pending space before those descendants.
+                // Sibling flows instead discard trailing collapsible space.
+                let enters_descendant = current_context.is_some_and(|previous| {
+                    layout_box_is_descendant_of(layout_tree, context, previous)
+                });
+                output.finish_pending(pending, enters_descendant, inline_content);
             }
             at_line_start = true;
+            context_start = output.glyphs.len();
             current_context = Some(context);
         }
         let (InlineItemKind::Text { glyphs: range } | InlineItemKind::Marker { glyphs: range }) =
@@ -68,43 +132,72 @@ pub(super) fn collapse_whitespace(
         else {
             match run.kind {
                 InlineItemKind::Image { .. } | InlineItemKind::AtomicBox { .. } => {
-                    if let Some((source, offset, wrap_before)) = pending_space.take() {
-                        remap[source] = new_glyphs.len() as u32;
-                        new_glyphs.push(' ' as GlyphId);
-                        new_source_offsets.push(offset);
-                        new_whitespace_wrap_before
-                            .push(WhitespaceWrapOverride::retained(wrap_before));
+                    if let Some(pending) = pending_space.take() {
+                        output.finish_pending(pending, true, inline_content);
                     }
                     at_line_start = false;
+                    context_start = output.glyphs.len();
                 }
                 InlineItemKind::Break { .. } => {
-                    pending_space = None;
+                    if let Some(pending) = pending_space.take() {
+                        output.finish_pending(pending, false, inline_content);
+                    }
                     at_line_start = true;
+                    context_start = output.glyphs.len();
                 }
-                InlineItemKind::FloatAnchor { .. }
-                | InlineItemKind::AbsoluteAnchor { .. }
-                | InlineItemKind::InlineBoundary { .. } => unreachable!(
-                    "non-textual boundaries are filtered before whitespace context selection"
-                ),
-                InlineItemKind::Text { .. } | InlineItemKind::Marker { .. } => unreachable!(),
+                _ => unreachable!("non-textual boundaries were filtered before context selection"),
             }
             continue;
         };
-        let white_space = get_style(styles, layout_tree, run.box_idx as usize).white_space();
+        let style = get_style(styles, layout_tree, run.box_idx as usize);
+        let white_space = style.white_space();
+        // A branch-free integer reduction vectorizes for Latin runs. Detailed
+        // classification stays outside the per-character whitespace loop.
+        let characters = &inline_content.characters()[range.start as usize..range.end as usize];
+        let character_bits = characters
+            .iter()
+            .fold(0, |bits, &character| bits | character);
+        let unicode_breaks = style.word_break() == WordBreak::BreakAll
+            || style.line_break() == LineBreak::Anywhere
+            || (character_bits >= 0x1100
+                && characters
+                    .iter()
+                    .copied()
+                    .filter_map(char::from_u32)
+                    .any(super::line_breaks::is_cjk));
+        let break_root = if matches!(run.kind, InlineItemKind::Marker { .. }) {
+            run.box_idx as usize
+        } else {
+            context
+        };
+        if unicode_breaks {
+            unicode_roots.insert(break_root);
+        }
+        let korean = unicode_breaks
+            && CjkWritingSystem::for_language(style.language().and_then(|id| styles.language(id)))
+                == CjkWritingSystem::Korean;
         let collapse = white_space.collapses_spaces();
         let preserve_newlines = white_space.preserves_newlines();
 
         for i in range.clone() {
             let i = i as usize;
-            let char_code = inline_content.glyph_at(i).unwrap_or('?' as GlyphId);
+            let char_code = inline_content.character_at(i).unwrap_or('?' as GlyphId);
             let mut character = char::from_u32(char_code).unwrap_or('?');
-            // CSS Text treats CRLF as one segment break and a standalone CR as
-            // an LF. Character references can introduce CR after HTML input
-            // preprocessing, so this normalization belongs at the whitespace
-            // boundary rather than only in the byte parser.
+            let offset = inline_content.raw_glyph_source_offset(i);
+            // Bidi controls are retained for shaping and addressing, but are
+            // transparent to whitespace collapsing, line starts and joining.
+            if character_bits >= 0x061c && is_bidi_control(character) {
+                if pending_space.is_some() {
+                    output.pending_controls.push(i);
+                } else {
+                    output.push(i, char_code, offset, WhitespaceWrapOverride::Style);
+                }
+                continue;
+            }
+            // Character references can introduce CR after HTML preprocessing.
             if character == '\r' {
                 let followed_by_lf = (i + 1) < range.end as usize
-                    && inline_content.glyph_at(i + 1).and_then(char::from_u32) == Some('\n');
+                    && inline_content.character_at(i + 1).and_then(char::from_u32) == Some('\n');
                 if followed_by_lf {
                     continue;
                 }
@@ -112,73 +205,72 @@ pub(super) fn collapse_whitespace(
             }
             if character == '\n' {
                 if preserve_newlines {
-                    // Collapsible spaces immediately before a segment break
-                    // are removed before that break is preserved.
-                    pending_space = None;
-                    remap[i] = new_glyphs.len() as u32;
-                    new_glyphs.push('\n' as GlyphId);
-                    new_source_offsets.push(inline_content.raw_glyph_source_offset(i));
-                    new_whitespace_wrap_before.push(WhitespaceWrapOverride::Style);
+                    if let Some(pending) = pending_space.take() {
+                        output.finish_pending(pending, false, inline_content);
+                    }
+                    output.push(i, '\n' as GlyphId, offset, WhitespaceWrapOverride::Style);
                     at_line_start = true;
+                    context_start = output.glyphs.len();
                 } else if collapse && !at_line_start {
-                    // The segment break becomes one collapsible space. Keep an
-                    // already-pending space as the representative of the
-                    // sequence so its originating inline style paints the
-                    // collapsed glyph (CSS2 collapsing can cross element and
-                    // display:none boundaries).
-                    if let Some((_, _, wrap_before)) = pending_space.as_mut() {
-                        *wrap_before |= white_space.allows_wrap();
+                    if let Some(pending) = pending_space.as_mut() {
+                        if white_space.allows_wrap() {
+                            pending.wrap_before = WhitespaceWrapOverride::Allow;
+                        }
+                        pending.segment_break = true;
                     } else {
-                        pending_space = Some((
+                        pending_space = Some(PendingSpace::new(
                             i,
-                            inline_content.raw_glyph_source_offset(i),
+                            offset,
                             white_space.allows_wrap(),
+                            true,
                         ));
                     }
                 }
             } else if is_css_collapsible_space(character) {
                 if collapse {
                     if !at_line_start {
-                        if let Some((_, _, wrap_before)) = pending_space.as_mut() {
-                            *wrap_before |= white_space.allows_wrap();
+                        if let Some(pending) = pending_space.as_mut() {
+                            if white_space.allows_wrap() {
+                                pending.wrap_before = WhitespaceWrapOverride::Allow;
+                            }
                         } else {
-                            pending_space = Some((
+                            pending_space = Some(PendingSpace::new(
                                 i,
-                                inline_content.raw_glyph_source_offset(i),
+                                offset,
                                 white_space.allows_wrap(),
+                                false,
                             ));
                         }
                     }
                 } else {
-                    if let Some((source, offset, _)) = pending_space.take() {
-                        remap[source] = new_glyphs.len() as u32;
-                        new_glyphs.push(' ' as GlyphId);
-                        new_source_offsets.push(offset);
-                        // A collapsible space immediately adjoining a
-                        // preserved space cannot introduce a break into the
-                        // unwrappable preserved sequence.
-                        new_whitespace_wrap_before.push(WhitespaceWrapOverride::Suppress);
+                    if let Some(mut pending) = pending_space.take() {
+                        // Collapsed space next to preserved space must not
+                        // introduce a break into an unwrappable sequence.
+                        pending.wrap_before = WhitespaceWrapOverride::Suppress;
+                        output.finish_pending(pending, true, inline_content);
                     }
-                    remap[i] = new_glyphs.len() as u32;
-                    new_glyphs.push(char_code);
-                    new_source_offsets.push(inline_content.raw_glyph_source_offset(i));
-                    new_whitespace_wrap_before.push(WhitespaceWrapOverride::Style);
+                    output.push(i, char_code, offset, WhitespaceWrapOverride::Style);
                     at_line_start = false;
                 }
             } else {
-                if let Some((source, offset, wrap_before)) = pending_space.take() {
-                    remap[source] = new_glyphs.len() as u32;
-                    new_glyphs.push(' ' as GlyphId);
-                    new_source_offsets.push(offset);
-                    new_whitespace_wrap_before.push(WhitespaceWrapOverride::retained(wrap_before));
+                if let Some(pending) = pending_space.take() {
+                    let join = pending.segment_break
+                        && !korean
+                        && is_unspaced_cjk(character)
+                        && output.glyphs[context_start..].iter().rev().copied()
+                            .filter_map(char::from_u32)
+                            .find(|&character| !is_bidi_control(character)
+                                && !matches!(character as u32, 0xfe00..=0xfe0f | 0xe0100..=0xe01ef))
+                            .is_some_and(is_unspaced_cjk);
+                    output.finish_pending(pending, !join, inline_content);
                 }
-                remap[i] = new_glyphs.len() as u32;
-                new_glyphs.push(char_code);
-                new_source_offsets.push(inline_content.raw_glyph_source_offset(i));
-                new_whitespace_wrap_before.push(WhitespaceWrapOverride::Style);
+                output.push(i, char_code, offset, WhitespaceWrapOverride::Style);
                 at_line_start = false;
             }
         }
+    }
+    if let Some(pending) = pending_space {
+        output.finish_pending(pending, false, inline_content);
     }
 
     for run in inline_content.inline_items_mut() {
@@ -188,10 +280,21 @@ pub(super) fn collapse_whitespace(
         };
         let old_start = glyphs.start as usize;
         let old_end = glyphs.end as usize;
-        let new_start = (old_start..old_end)
-            .find_map(|i| remap.get(i).copied().filter(|mapped| *mapped != u32::MAX));
+        let new_start = (old_start..old_end).find_map(|i| {
+            output
+                .remap
+                .get(i)
+                .copied()
+                .filter(|mapped| *mapped != u32::MAX)
+        });
         let new_end = (old_start..old_end)
-            .filter_map(|i| remap.get(i).copied().filter(|mapped| *mapped != u32::MAX))
+            .filter_map(|i| {
+                output
+                    .remap
+                    .get(i)
+                    .copied()
+                    .filter(|mapped| *mapped != u32::MAX)
+            })
             .next_back()
             .map(|mapped| mapped + 1);
         *glyphs = match (new_start, new_end) {
@@ -199,7 +302,8 @@ pub(super) fn collapse_whitespace(
             _ => 0..0,
         };
     }
-    inline_content.replace_glyphs(new_glyphs, new_source_offsets, new_whitespace_wrap_before);
+    inline_content.replace_characters(output.glyphs, output.source_offsets, output.wraps);
+    unicode_roots
 }
 
 /// Applies CSS case conversion to the normalized character stream before any
@@ -212,7 +316,7 @@ pub(super) fn transform_text(
     inline_content: &mut InlineContent,
     first_letter_styles: &mut Vec<Option<StyleIndices>>,
 ) {
-    let old_len = inline_content.glyphs().len();
+    let old_len = inline_content.characters().len();
     let mut transforms = vec![TextTransform::None; old_len];
     for item in inline_content.inline_items() {
         let (InlineItemKind::Text { glyphs } | InlineItemKind::Marker { glyphs }) = &item.kind
@@ -251,7 +355,7 @@ pub(super) fn transform_text(
     for index in 0..old_len {
         remap_start[index] = new_glyphs.len() as u32;
         let character =
-            char::from_u32(inline_content.glyph_at(index).unwrap_or('?' as GlyphId)).unwrap_or('?');
+            char::from_u32(inline_content.character_at(index).unwrap_or('?' as GlyphId)).unwrap_or('?');
         let source_offset = inline_content.raw_glyph_source_offset(index);
         let wrap_override = inline_content.whitespace_wrap_before(index);
         let first_letter_style = first_letter_styles.get(index).copied().flatten();
@@ -294,7 +398,7 @@ pub(super) fn transform_text(
         let old_end = glyphs.end as usize;
         *glyphs = remap_start[old_start]..remap_end[old_end - 1];
     }
-    inline_content.replace_glyphs(new_glyphs, new_source_offsets, new_whitespace_wrap_before);
+    inline_content.replace_characters(new_glyphs, new_source_offsets, new_whitespace_wrap_before);
     *first_letter_styles = new_first_letter_styles;
 }
 
@@ -370,7 +474,7 @@ fn capitalization_starts(
                 for glyph_idx in glyphs.clone() {
                     let character = char::from_u32(
                         inline_content
-                            .glyph_at(glyph_idx as usize)
+                            .character_at(glyph_idx as usize)
                             .unwrap_or('?' as GlyphId),
                     )
                     .unwrap_or('?');

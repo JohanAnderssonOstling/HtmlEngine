@@ -1,4 +1,5 @@
 mod paint;
+use unicode_script::{Script, UnicodeScript};
 pub use paint::StylePaintColors;
 
 use html_dom::{Document, DocumentLineage, DomNodeId, MemoryUsageReport, NodeRef};
@@ -7,6 +8,7 @@ use rustc_data_structures::fx::{FxHashMap, FxHasher};
 use std::hash::{Hash, Hasher};
 use std::num::{NonZeroI16, NonZeroU16, NonZeroU32};
 use std::sync::atomic::{AtomicU32, Ordering};
+use crate::{ContentLanguage, LanguageId};
 
 /// Implement bitwise `PartialEq`/`Eq`/`Hash` for a style sub-struct so it can be
 /// deduplicated in `StyleStore`. Float fields are compared and hashed by their
@@ -179,7 +181,7 @@ impl OpenTypeFeature {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Font {
     pub font_size: f32,
     /// Deferred selected-face contributions for a linear `font-size: calc()`.
@@ -195,8 +197,13 @@ pub struct Font {
     pub font_size_root_cap_height: f32,
     pub font_size_root_line_height: f32,
     pub font_weight: u16,
+    /// Reader selection; the publication weight remains available for reset
+    /// and for identifying the original weight level in the settings UI.
+    pub reader_font_weight: Option<u16>,
     pub font_style: FontStyle,
     pub font_family: Option<StyleStringId>,
+    /// Independently selected family list for CJK glyphs.
+    pub cjk_font_family: Option<StyleStringId>,
     /// Features selected by each CSS longhand are retained separately because
     /// `font-feature-settings` overrides the higher-level variant controls for
     /// duplicate tags regardless of declaration order.
@@ -205,6 +212,52 @@ pub struct Font {
     pub font_variant_ligature_features: Vec<OpenTypeFeature>,
     pub font_kerning_features: Vec<OpenTypeFeature>,
     pub font_feature_settings: Vec<OpenTypeFeature>,
+}
+
+impl Clone for Font {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self {
+            font_size: self.font_size,
+            font_size_x_height_px: self.font_size_x_height_px,
+            font_size_ch_advance_px: self.font_size_ch_advance_px,
+            font_size_cap_height_px: self.font_size_cap_height_px,
+            font_size_root_ch: self.font_size_root_ch,
+            font_size_root_cap_height: self.font_size_root_cap_height,
+            font_size_root_line_height: self.font_size_root_line_height,
+            font_weight: self.font_weight,
+            reader_font_weight: self.reader_font_weight,
+            font_style: self.font_style,
+            font_family: self.font_family,
+            cjk_font_family: self.cjk_font_family,
+            font_variant_caps_features: self.font_variant_caps_features.clone(),
+            font_variant_numeric_features: self.font_variant_numeric_features.clone(),
+            font_variant_ligature_features: self.font_variant_ligature_features.clone(),
+            font_kerning_features: self.font_kerning_features.clone(),
+            font_feature_settings: self.font_feature_settings.clone(),
+        }
+    }
+
+    #[inline]
+    fn clone_from(&mut self, source: &Self) {
+        self.font_size = source.font_size;
+        self.font_size_x_height_px = source.font_size_x_height_px;
+        self.font_size_ch_advance_px = source.font_size_ch_advance_px;
+        self.font_size_cap_height_px = source.font_size_cap_height_px;
+        self.font_size_root_ch = source.font_size_root_ch;
+        self.font_size_root_cap_height = source.font_size_root_cap_height;
+        self.font_size_root_line_height = source.font_size_root_line_height;
+        self.font_weight = source.font_weight;
+        self.reader_font_weight = source.reader_font_weight;
+        self.font_style = source.font_style;
+        self.font_family = source.font_family;
+        self.cjk_font_family = source.cjk_font_family;
+        self.font_variant_caps_features.clone_from(&source.font_variant_caps_features);
+        self.font_variant_numeric_features.clone_from(&source.font_variant_numeric_features);
+        self.font_variant_ligature_features.clone_from(&source.font_variant_ligature_features);
+        self.font_kerning_features.clone_from(&source.font_kerning_features);
+        self.font_feature_settings.clone_from(&source.font_feature_settings);
+    }
 }
 
 impl Font {
@@ -249,7 +302,7 @@ pub struct InheritedText {
     pub color: u32,
     pub visibility: Visibility,
     /// Inherited BCP 47 language tag sourced from `lang`/`xml:lang`.
-    pub language: Option<StyleStringId>,
+    pub language: Option<LanguageId>,
     /// Computed inline base direction. Logical box properties are resolved to
     /// physical sides in the style stage, so layout never has to interpret
     /// parser-owned logical-property values.
@@ -269,6 +322,8 @@ pub struct InheritedText {
     pub line_height_number: f32,
     pub letter_spacing: TextSpacing,
     pub word_spacing: TextSpacing,
+    /// Reader multiplier for natural word gaps, independent of authored CSS spacing.
+    pub reader_word_spacing_factor: f32,
     pub tab_size: TabSize,
     pub text_align: TextAlign,
     /// Retains the logical keyword behind the resolved physical alignment so
@@ -285,7 +340,10 @@ pub struct InheritedText {
     pub text_indent_each_line: bool,
     pub white_space: WhiteSpace,
     pub hyphens: Hyphens,
+    /// Reader override; the publication value remains available when Book is selected.
+    pub reader_hyphens: Option<Hyphens>,
     pub word_break: WordBreak,
+    pub line_break: LineBreak,
     pub overflow_wrap: OverflowWrap,
     /// Font metrics selected for `text-box-trim`. The edge is inherited even
     /// though the trimming operation itself is a reset property.
@@ -393,6 +451,7 @@ pub struct BoxModel {
     // means ordinary DOM nodes do not grow just because flex/grid is enabled.
     layout_idx: u32,
     pub display: Display,
+    pub unicode_bidi: UnicodeBidi,
     pub box_sizing: BoxSizing,
     pub overflow_x: OverflowMode,
     pub overflow_y: OverflowMode,
@@ -943,15 +1002,15 @@ pub struct Background {
 }
 
 impl_style_key!(Font {
-    font_weight, font_style, font_family, font_variant_caps_features, font_variant_numeric_features,
+    font_weight, reader_font_weight, font_style, font_family, cjk_font_family, font_variant_caps_features, font_variant_numeric_features,
     font_variant_ligature_features, font_kerning_features, font_feature_settings
 } floats { font_size, font_size_x_height_px, font_size_ch_advance_px, font_size_cap_height_px, font_size_root_ch, font_size_root_cap_height, font_size_root_line_height });
 impl_style_key!(InheritedText {
-    color, visibility, language, direction, letter_spacing, word_spacing, tab_size, text_align, text_align_logical, text_align_last, text_align_last_logical, text_align_last_explicit, text_indent, text_indent_hanging, text_indent_each_line, white_space, hyphens, word_break, overflow_wrap, widows, orphans, text_transform,
+    color, visibility, language, direction, letter_spacing, word_spacing, tab_size, text_align, text_align_logical, text_align_last, text_align_last_logical, text_align_last_explicit, text_indent, text_indent_hanging, text_indent_each_line, white_space, hyphens, reader_hyphens, word_break, line_break, overflow_wrap, widows, orphans, text_transform,
     quotes, list_style_type, list_style_position, list_style_image, line_height_normal, text_box_edge
-} floats { line_height, line_height_x_height_px, line_height_number });
+} floats { line_height, line_height_x_height_px, line_height_number, reader_word_spacing_factor });
 impl_style_key!(BoxModel {
-    layout_idx, display, box_sizing, overflow_x, overflow_y, text_overflow, text_box_trim, size_containment, vertical_align, float, clear, table_layout, border_collapse, empty_cells, caption_side,
+    layout_idx, display, unicode_bidi, box_sizing, overflow_x, overflow_y, text_overflow, text_box_trim, size_containment, vertical_align, float, clear, table_layout, border_collapse, empty_cells, caption_side,
     width, height, min_width, min_height, max_width, max_height, aspect_ratio, object_fit, object_position,
     margin_top, margin_bottom, margin_left, margin_right,
     padding_top, padding_bottom, padding_left, padding_right
@@ -1092,6 +1151,9 @@ struct GeneratedPseudoStyle {
 /// DOM, while style resolution produces this value. Downstream stages can
 /// retain or replace either representation independently.
 pub struct ComputedStyles {
+    hyphenation_fallback_language: Option<ContentLanguage>,
+    reader_paragraph_spacing_em: Option<f32>,
+    reader_first_line_indent_em: Option<f32>,
     document_lineage: DocumentLineage,
     node_styles: Vec<Option<StyleIndices>>,
     first_line_styles: Vec<(u32, StyleIndices)>,
@@ -1105,14 +1167,44 @@ pub struct ComputedStyles {
     strings: Vec<String>,
 }
 
+/// Script and punctuation coverage for a reader's independent CJK font choice.
+pub fn is_cjk_character(character: char) -> bool {
+    if character < '\u{1100}' { return false; }
+    let scripts = character.script_extension();
+    (!scripts.is_common() && !scripts.is_inherited()
+        && [Script::Han, Script::Hiragana, Script::Katakana, Script::Hangul, Script::Bopomofo]
+            .into_iter().any(|script| scripts.contains_script(script)))
+        || matches!(character as u32, 0x3000..=0x303f | 0x3099..=0x309c | 0xfe10..=0xfe1f | 0xfe30..=0xfe4f | 0xff01..=0xff60 | 0xffe0..=0xffe6)
+}
+
 /// Reader preferences applied without adding a publication stylesheet. Font
 /// scaling participates in value resolution; other preferences override the
 /// resulting publication styles. `None` preserves the publisher-computed value.
 #[derive(Clone, Debug, Default)]
 pub struct ReaderStyleOverrides {
+    /// Shift publication weights together; zero preserves the book's values.
+    pub font_weight_adjustment: i16,
+    /// Scale natural word gaps, including authored word spacing, before justification.
+    pub word_spacing_factor: Option<f32>,
+    /// None preserves the publication's hyphenation rules.
+    pub hyphens: Option<Hyphens>,
     pub font_family: Option<String>,
+    /// CJK-only replacement. None retains the publication's CJK family even
+    /// when the ordinary reader family replaces Latin text.
+    pub cjk_font_family: Option<String>,
+    /// Appended after the publication or selected CJK family.
+    pub cjk_font_fallback: Option<String>,
+    /// Replace the corresponding unquoted CSS generic family. The replacement
+    /// may be any installed family, regardless of its own classification.
+    pub serif_font_family: Option<String>,
+    pub sans_serif_font_family: Option<String>,
+    pub monospace_font_family: Option<String>,
     pub text_align: Option<TextAlign>,
     pub line_height: Option<f32>,
+    /// Gap between neighboring prose blocks, in reader base-font em units.
+    pub paragraph_spacing_em: Option<f32>,
+    /// First-line prose indentation in reader base-font em; clears hanging/each-line.
+    pub first_line_indent_em: Option<f32>,
     /// Canonical regular font size in CSS pixels. During style resolution,
     /// publication font sizes and line heights scale by the document's requested
     /// root font size divided by this value. Relative sizes inherit that scale
@@ -1251,6 +1343,66 @@ fn oklab_to_srgb(lightness: f32, a: f32, b: f32, alpha: u32) -> u32 {
 }
 
 impl ReaderStyleOverrides {
+    fn cjk_family_for(&self, publication: Option<&str>) -> Option<String> {
+        let family = self.cjk_font_family.as_deref().or(publication);
+        match (family, self.cjk_font_fallback.as_deref()) {
+            (Some(family), Some(fallback)) => Some(format!("{family}, {fallback}")),
+            (None, Some(fallback)) => Some(fallback.to_owned()),
+            (Some(family), None) if self.cjk_font_family.is_some() => Some(family.to_owned()),
+            _ => None,
+        }
+    }
+
+    fn family_for(&self, publication: Option<&str>) -> Option<&str> {
+        if let Some(family) = self.font_family.as_deref() {
+            return Some(family);
+        }
+        let Some(publication) = publication.filter(|family| !family.trim().is_empty()) else {
+            return self.serif_font_family.as_deref();
+        };
+        let mut start = 0;
+        let mut quote = None;
+        let mut escaped = false;
+        for (index, character) in publication
+            .char_indices()
+            .chain(std::iter::once((publication.len(), ',')))
+        {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match character {
+                '\\' => escaped = true,
+                '\'' | '"' if quote.is_none() => quote = Some(character),
+                character if quote == Some(character) => quote = None,
+                ',' if quote.is_none() => {
+                    let family = publication[start..index].trim();
+                    start = index + 1;
+                    if ["serif", "ui-serif"]
+                        .iter()
+                        .any(|generic| family.eq_ignore_ascii_case(generic))
+                    {
+                        return self.serif_font_family.as_deref();
+                    }
+                    if ["sans-serif", "ui-sans-serif", "system-ui"]
+                        .iter()
+                        .any(|generic| family.eq_ignore_ascii_case(generic))
+                    {
+                        return self.sans_serif_font_family.as_deref();
+                    }
+                    if ["monospace", "ui-monospace"]
+                        .iter()
+                        .any(|generic| family.eq_ignore_ascii_case(generic))
+                    {
+                        return self.monospace_font_family.as_deref();
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
     /// Preferences that can affect text metrics, box generation, or geometry.
     pub fn layout_overrides(&self) -> Self {
         Self { foreground: None, link_foreground: None, background: None, theme: None, ..self.clone() }
@@ -1262,9 +1414,19 @@ impl ReaderStyleOverrides {
     }
 
     pub fn same_layout_preferences(&self, other: &Self) -> bool {
-        self.font_family == other.font_family
+        self.hyphens == other.hyphens
+            && self.font_weight_adjustment == other.font_weight_adjustment
+            && self.font_family == other.font_family
+            && self.cjk_font_family == other.cjk_font_family
+            && self.cjk_font_fallback == other.cjk_font_fallback
+            && self.serif_font_family == other.serif_font_family
+            && self.sans_serif_font_family == other.sans_serif_font_family
+            && self.monospace_font_family == other.monospace_font_family
             && self.text_align == other.text_align
+            && self.word_spacing_factor.map(f32::to_bits) == other.word_spacing_factor.map(f32::to_bits)
             && self.line_height.map(f32::to_bits) == other.line_height.map(f32::to_bits)
+            && self.paragraph_spacing_em.map(f32::to_bits) == other.paragraph_spacing_em.map(f32::to_bits)
+            && self.first_line_indent_em.map(f32::to_bits) == other.first_line_indent_em.map(f32::to_bits)
             && self.canonical_font_size.map(f32::to_bits) == other.canonical_font_size.map(f32::to_bits)
             && self.minimum_font_size.map(f32::to_bits) == other.minimum_font_size.map(f32::to_bits)
             && self.strip_root_spacing == other.strip_root_spacing
@@ -1273,9 +1435,19 @@ impl ReaderStyleOverrides {
 
 impl PartialEq for ReaderStyleOverrides {
     fn eq(&self, other: &Self) -> bool {
-        self.font_family == other.font_family
+        self.hyphens == other.hyphens
+            && self.font_weight_adjustment == other.font_weight_adjustment
+            && self.font_family == other.font_family
+            && self.cjk_font_family == other.cjk_font_family
+            && self.cjk_font_fallback == other.cjk_font_fallback
+            && self.serif_font_family == other.serif_font_family
+            && self.sans_serif_font_family == other.sans_serif_font_family
+            && self.monospace_font_family == other.monospace_font_family
             && self.text_align == other.text_align
+            && self.word_spacing_factor.map(f32::to_bits) == other.word_spacing_factor.map(f32::to_bits)
             && self.line_height.map(f32::to_bits) == other.line_height.map(f32::to_bits)
+            && self.paragraph_spacing_em.map(f32::to_bits) == other.paragraph_spacing_em.map(f32::to_bits)
+            && self.first_line_indent_em.map(f32::to_bits) == other.first_line_indent_em.map(f32::to_bits)
             && self.canonical_font_size.map(f32::to_bits) == other.canonical_font_size.map(f32::to_bits)
             && self.minimum_font_size.map(f32::to_bits) == other.minimum_font_size.map(f32::to_bits)
             && self.foreground == other.foreground
@@ -1287,6 +1459,192 @@ impl PartialEq for ReaderStyleOverrides {
 }
 
 impl Eq for ReaderStyleOverrides {}
+
+#[cfg(test)]
+mod custom_font_tests {
+    use super::*;
+
+    #[test]
+    fn publication_hyphenation_language_survives_reader_style_updates() {
+        let document = Document::new();
+        let styles = ComputedStylesBuilder::new(&document).finish().unwrap()
+            .with_hyphenation_fallback_language(Some("sv"));
+        let updated = styles.with_reader_overrides(&document, &ReaderStyleOverrides { hyphens: Some(Hyphens::Auto), ..Default::default() }).unwrap();
+        assert_eq!(updated.hyphenation_fallback_language().unwrap().as_str(), "sv");
+        assert!(updated.with_hyphenation_fallback_language(None).hyphenation_fallback_language().is_none());
+    }
+
+    #[test]
+    fn reader_hyphenation_modes_preserve_publication_rules_when_reset() {
+        for authored in [Hyphens::None, Hyphens::Manual, Hyphens::Auto] {
+            let mut text = InheritedText { hyphens: authored, ..Default::default() };
+            for selection in [Some(Hyphens::Auto), Some(Hyphens::None), None] {
+                let overrides = ReaderStyleOverrides { hyphens: selection, ..Default::default() };
+                assert_eq!(overrides.same_layout_preferences(&ReaderStyleOverrides::default()), selection.is_none());
+                apply_reader_text(&mut text, 16.0, 16.0, &overrides);
+                assert_eq!(text.hyphens, authored);
+                assert_eq!(text.reader_hyphens, selection);
+            }
+        }
+    }
+
+    #[test]
+    fn reader_word_spacing_preserves_authored_values_without_accumulating() {
+        let mut text = InheritedText { word_spacing: TextSpacing::from_px(2.0).unwrap(), ..Default::default() };
+        let overrides = ReaderStyleOverrides { word_spacing_factor: Some(1.2), ..Default::default() };
+        assert!(!overrides.same_layout_preferences(&ReaderStyleOverrides::default()));
+        for _ in 0..2 {
+            apply_reader_text(&mut text, 16.0, 16.0, &overrides);
+            assert_eq!(text.reader_word_spacing_factor, 1.2);
+            assert_eq!(text.word_spacing.resolve(16.0), 2.0);
+        }
+        apply_reader_text(&mut text, 16.0, 16.0, &ReaderStyleOverrides::default());
+        assert_eq!(text.reader_word_spacing_factor, 1.0);
+        assert_eq!(text.word_spacing.resolve(16.0), 2.0);
+        for invalid in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            apply_reader_text(&mut text, 16.0, 16.0, &ReaderStyleOverrides { word_spacing_factor: Some(invalid), ..Default::default() });
+            assert_eq!(text.reader_word_spacing_factor, 1.0);
+        }
+    }
+
+    #[test]
+    fn reader_weight_mapping_preserves_originals_and_resets_without_accumulating() {
+        let document = Document::new();
+        let mut builder = ComputedStylesBuilder::new(&document);
+        let regular = builder.push(Font::default(), Default::default(), Default::default(), Default::default(), Default::default()).unwrap();
+        let bold = builder.push(Font { font_weight: 600, ..Default::default() }, Default::default(), Default::default(), Default::default(), Default::default()).unwrap();
+        let overrides = ReaderStyleOverrides { font_weight_adjustment: 100, ..Default::default() };
+        assert!(!overrides.same_layout_preferences(&ReaderStyleOverrides::default()));
+        builder.apply_reader_overrides(&document, &overrides);
+        assert_eq!(builder.font_style(regular).unwrap().font_weight, 400);
+        assert_eq!(builder.font_style(regular).unwrap().reader_font_weight, Some(500));
+        assert_eq!(builder.font_style(bold).unwrap().reader_font_weight, Some(700));
+        builder.apply_reader_overrides(&document, &overrides);
+        assert_eq!(builder.font_style(regular).unwrap().reader_font_weight, Some(500));
+        builder.apply_reader_overrides(&document, &ReaderStyleOverrides::default());
+        assert_eq!(builder.font_style(regular).unwrap().reader_font_weight, None);
+    }
+
+    #[test]
+    fn reader_weight_adjustments_preserve_levels_at_css_limits() {
+        assert_eq!(reader_weight_adjustment([400, 600].into_iter(), 200), 200);
+        assert_eq!(reader_weight_adjustment([400, 600].into_iter(), -200), -200);
+        assert_eq!(reader_weight_adjustment([400, 950].into_iter(), 200), 50);
+        assert_eq!(reader_weight_adjustment([50, 600].into_iter(), -200), -49);
+    }
+
+    fn profile() -> ReaderStyleOverrides {
+        ReaderStyleOverrides {
+            serif_font_family: Some("Reader Sans".into()),
+            sans_serif_font_family: Some("Reader Serif".into()),
+            monospace_font_family: Some("Proportional Font".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn cjk_fonts_preserve_publisher_families_independently_of_latin_overrides() {
+        for cjk in [None, Some("Selected CJK")] {
+            let document = Document::new();
+            let mut builder = ComputedStylesBuilder::new(&document);
+            let family = builder.intern_string("Publisher, serif");
+            let indices = builder.push(Font { font_family: Some(family), ..Default::default() }, InheritedText::default(), Default::default(), Default::default(), Default::default()).unwrap();
+            let raw = builder.finish().unwrap();
+            let overrides = ReaderStyleOverrides { font_family: Some("Selected Latin".into()), cjk_font_family: cjk.map(str::to_owned), cjk_font_fallback: Some("Embedded".into()), ..Default::default() };
+            let mut target = ComputedStylesBuilder::new(&document);
+            let updated = reintern_with_reader_overrides(&raw, &mut target, indices, &overrides, false).unwrap();
+            let font = target.font_style(updated).unwrap();
+            assert_eq!(font.font_family.and_then(|id| target.string(id)), Some("Selected Latin"));
+            let expected = format!("{}, Embedded", cjk.unwrap_or("Publisher, serif"));
+            assert_eq!(font.cjk_font_family.and_then(|id| target.string(id)), Some(expected.as_str()));
+            let mut builder = ComputedStylesBuilder::new(&document);
+            let family = builder.intern_string("Publisher, serif");
+            let indices = builder.push(Font { font_family: Some(family), ..Default::default() }, InheritedText::default(), Default::default(), Default::default(), Default::default()).unwrap();
+            builder.apply_reader_overrides(&document, &overrides);
+            let font = builder.font_style(indices).unwrap();
+            assert_eq!(font.font_family.and_then(|id| builder.string(id)), Some("Selected Latin"));
+            assert_eq!(font.cjk_font_family.and_then(|id| builder.string(id)), Some(expected.as_str()));
+            assert!(!ReaderStyleOverrides::default().same_layout_preferences(&overrides));
+        }
+    }
+
+    #[test]
+    fn cjk_script_selection_includes_jamo_shared_kana_marks_and_fullwidth_punctuation() {
+        for character in "漢かなカナー한한ㄅ、。Ａ！".chars() { assert!(is_cjk_character(character), "{character}"); }
+        for character in "Latin Åé — العربية אבג 😀".chars() { assert!(!is_cjk_character(character), "{character}"); }
+    }
+
+    #[test]
+    fn custom_fonts_can_cross_generic_classifications() {
+        let profile = profile();
+        assert_eq!(
+            profile.family_for(Some("Publisher, serif")),
+            Some("Reader Sans")
+        );
+        assert_eq!(
+            profile.family_for(Some("Publisher, sans-serif")),
+            Some("Reader Serif")
+        );
+        assert_eq!(
+            profile.family_for(Some("monospace")),
+            Some("Proportional Font")
+        );
+        assert_eq!(profile.family_for(None), Some("Reader Sans"));
+        assert_eq!(profile.family_for(Some("\"sans-serif\"")), None);
+        assert_eq!(
+            profile.family_for(Some("\"A, B\", ui-monospace")),
+            Some("Proportional Font")
+        );
+    }
+
+    #[test]
+    fn changing_a_generic_font_invalidates_layout_but_not_paint_preferences() {
+        let original = ReaderStyleOverrides::default();
+        let changed = profile();
+        assert!(!original.same_layout_preferences(&changed));
+        assert_ne!(original, changed);
+        assert_eq!(original.paint_overrides(), changed.paint_overrides());
+        assert_eq!(changed.layout_overrides(), changed);
+    }
+
+    #[test]
+    fn resolver_replaces_each_generic_independently() {
+        let document = Document::new();
+        let mut builder = ComputedStylesBuilder::new(&document);
+        let indices: Vec<_> = ["serif", "sans-serif", "monospace"]
+            .into_iter()
+            .map(|family| {
+                let family = builder.intern_string(family);
+                builder
+                    .push(
+                        Font {
+                            font_family: Some(family),
+                            ..Default::default()
+                        },
+                        InheritedText::default(),
+                        Default::default(),
+                        Default::default(),
+                        Default::default(),
+                    )
+                    .unwrap()
+            })
+            .collect();
+        builder.apply_reader_overrides(&document, &profile());
+        let names: Vec<_> = indices
+            .into_iter()
+            .map(|indices| {
+                builder
+                    .font_style(indices)
+                    .unwrap()
+                    .font_family
+                    .and_then(|id| builder.string(id))
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(names, ["Reader Sans", "Reader Serif", "Proportional Font"]);
+    }
+}
 
 #[cfg(test)]
 mod theme_adaptation_tests {
@@ -1390,6 +1748,8 @@ mod theme_adaptation_tests {
 /// Construction-only form used by the style stage. Finishing consumes the
 /// deduplication maps, so they are not retained by layout or rendering.
 pub struct ComputedStylesBuilder {
+    reader_paragraph_spacing_em: Option<f32>,
+    reader_first_line_indent_em: Option<f32>,
     document_lineage: DocumentLineage,
     node_styles: Vec<Option<StyleIndices>>,
     first_line_styles: Vec<(u32, StyleIndices)>,
@@ -1638,6 +1998,9 @@ impl Font {
         if let Some(font_family) = self.font_family {
             validate_style_string_id("Font", "font_family", font_family, store_id)?;
         }
+        if let Some(family) = self.cjk_font_family {
+            validate_style_string_id("Font", "cjk_font_family", family, store_id)?;
+        }
         Ok(())
     }
 }
@@ -1668,6 +2031,7 @@ impl InheritedText {
         )?;
         debug_assert!(self.letter_spacing.is_finite());
         debug_assert!(self.word_spacing.is_finite());
+        must_be_non_negative("InheritedText", "reader_word_spacing_factor", self.reader_word_spacing_factor)?;
         debug_assert!(self.tab_size.value().is_finite() && self.tab_size.value() >= 0.0);
         self.text_indent
             .validate("InheritedText", "text_indent", true)?;
@@ -1680,7 +2044,12 @@ impl InheritedText {
             )?;
         }
         if let Some(language) = self.language {
-            validate_style_string_id("InheritedText", "language", language, store_id)?;
+            if language.store_id != store_id {
+                return Err(ComputedStyleValueError::InvalidStructure {
+                    property: "InheritedText",
+                    field: "language",
+                });
+            }
         }
         if let QuoteStyle::Pairs(pairs) = self.quotes {
             validate_style_string_id("InheritedText", "quotes", pairs, store_id)?;
@@ -2092,6 +2461,8 @@ impl ComputedStylesBuilder {
             .map(|(_, node)| matches!(node, NodeRef::Element(_)))
             .collect();
         Self {
+            reader_paragraph_spacing_em: None,
+            reader_first_line_indent_em: None,
             document_lineage: document.lineage().clone(),
             node_styles: vec![None; document.node_count()],
             first_line_styles: Vec::new(),
@@ -2119,6 +2490,41 @@ impl ComputedStylesBuilder {
         self.string_dedup.insert(owned.clone(), id);
         self.strings.push(owned);
         id
+    }
+
+    /// Parse each distinct declaration once, retaining a compact inherited ID.
+    /// Empty HTML declarations explicitly reset the inherited language.
+    pub fn intern_language(&mut self, value: &str) -> Option<LanguageId> {
+        if value.is_empty() {
+            return None;
+        }
+        if let Some(&id) = self.store.language_dedup.get(value) {
+            return Some(id);
+        }
+        let language = ContentLanguage::parse(value);
+        let id = if let Some(&id) = self.store.language_dedup.get(language.as_str()) {
+            id
+        } else {
+            let id = LanguageId {
+                store_id: self.store.store_id,
+                index: u32::try_from(self.store.languages.len()).expect("language count fits u32"),
+            };
+            self.store
+                .language_dedup
+                .insert(language.as_str().to_owned(), id);
+            self.store.languages.push(language);
+            id
+        };
+        if !self.store.language_dedup.contains_key(value) {
+            self.store.language_dedup.insert(value.to_owned(), id);
+        }
+        Some(id)
+    }
+
+    pub fn language(&self, id: LanguageId) -> Option<&ContentLanguage> {
+        (id.store_id == self.store.store_id)
+            .then(|| self.store.languages.get(id.index as usize))
+            .flatten()
     }
 
     pub fn intern_size_comparison(
@@ -2440,21 +2846,44 @@ impl ComputedStylesBuilder {
         overrides: &ReaderStyleOverrides,
     ) {
         if *overrides == ReaderStyleOverrides::default() {
+            for font in &mut self.store.font_styles {
+                font.reader_font_weight = None;
+            }
+            for text in &mut self.store.text_styles {
+                text.reader_word_spacing_factor = 1.0;
+                text.reader_hyphens = None;
+            }
+            self.apply_reader_paragraph_overrides(document, overrides);
             return;
         }
         debug_assert_eq!(self.node_styles.len(), document.node_count());
 
-        let family = overrides
-            .font_family
-            .as_deref()
-            .map(|value| self.intern_string(value));
+        let families: Vec<_> = self
+            .store
+            .font_styles
+            .iter()
+            .map(|font| {
+                let source = font.font_family.and_then(|id| self.string(id));
+                (overrides.family_for(source).map(str::to_owned), overrides.cjk_family_for(source).or_else(|| font.cjk_font_family.and_then(|id| self.string(id)).map(str::to_owned)))
+            })
+            .collect();
+        let families: Vec<_> = families
+            .iter()
+            .map(|(family, cjk)| (
+                family.as_deref().map(|family| self.intern_string(family)),
+                cjk.as_deref().map(|family| self.intern_string(family)),
+            ))
+            .collect();
         let old_font_sizes = self
             .store
             .font_styles
             .iter()
             .map(|font| font.font_size)
             .collect::<Vec<_>>();
-        for font in &mut self.store.font_styles {
+        let weight_adjustment = reader_weight_adjustment(self.store.font_styles.iter().map(|font| font.font_weight), overrides.font_weight_adjustment);
+        for (font, (family, cjk)) in self.store.font_styles.iter_mut().zip(families) {
+            font.cjk_font_family = cjk;
+            apply_reader_weight(font, weight_adjustment);
             apply_reader_font(font, family, overrides.minimum_font_size);
         }
         for background in &mut self.store.bg_styles {
@@ -2592,6 +3021,18 @@ impl ComputedStylesBuilder {
             pseudo.style = remapped[&(pseudo.style, false)];
         }
         self.apply_link_foreground(document, overrides.link_foreground);
+        self.apply_reader_paragraph_overrides(document, overrides);
+    }
+
+    fn apply_reader_paragraph_overrides(
+        &mut self,
+        _document: &Document,
+        overrides: &ReaderStyleOverrides,
+    ) {
+        self.reader_paragraph_spacing_em = overrides.paragraph_spacing_em
+            .filter(|value| value.is_finite() && *value >= 0.0);
+        self.reader_first_line_indent_em = overrides.first_line_indent_em
+            .filter(|value| value.is_finite() && *value >= 0.0);
     }
 
     fn apply_link_foreground(&mut self, document: &Document, color: Option<u32>) {
@@ -2600,9 +3041,11 @@ impl ComputedStylesBuilder {
         for (node, _) in document.nodes() {
             linked[node.index()] = std::iter::once(node)
                 .chain(document.dom_ancestors(node))
-                .any(|ancestor| document.element_ref(ancestor).is_some_and(|element| {
-                    element.tag().eq_ignore_ascii_case("a") && element.attr("href").is_some()
-                }));
+                .any(|ancestor| {
+                    document.element_ref(ancestor).is_some_and(|element| {
+                        element.tag().eq_ignore_ascii_case("a") && element.attr("href").is_some()
+                    })
+                });
         }
         let store = &mut self.store;
         let mut recolor = |style: &mut StyleIndices| {
@@ -2652,6 +3095,9 @@ impl ComputedStylesBuilder {
         }
         self.store.discard_deduplication_maps();
         Ok(ComputedStyles {
+            hyphenation_fallback_language: None,
+            reader_paragraph_spacing_em: self.reader_paragraph_spacing_em,
+            reader_first_line_indent_em: self.reader_first_line_indent_em,
             document_lineage: self.document_lineage,
             node_styles: self.node_styles,
             first_line_styles: self.first_line_styles,
@@ -2821,6 +3267,17 @@ fn apply_reader_font(font: &mut Font, family: Option<StyleStringId>, minimum: Op
     original_size
 }
 
+/// Use one adjustment for every level, even at CSS bounds, so distinct
+/// original weights never collapse. No font capability lookup is involved.
+fn reader_weight_adjustment(weights: impl Iterator<Item = u16>, requested: i16) -> i16 {
+    let (minimum, maximum) = weights.fold((1000, 1), |(min, max), weight| (min.min(weight), max.max(weight)));
+    requested.clamp(1 - minimum as i16, 1000 - maximum as i16)
+}
+
+fn apply_reader_weight(font: &mut Font, adjustment: i16) {
+    font.reader_font_weight = (adjustment != 0).then_some((i32::from(font.font_weight) + i32::from(adjustment)).clamp(1, 1000) as u16);
+}
+
 fn apply_reader_text(
     text: &mut InheritedText,
     font_size: f32,
@@ -2831,6 +3288,8 @@ fn apply_reader_text(
         text.line_height = reader_line_height(font_size, text.line_height_number);
         text.line_height_x_height_px = 0.0;
     }
+    text.reader_hyphens = overrides.hyphens;
+    text.reader_word_spacing_factor = overrides.word_spacing_factor.filter(|value| value.is_finite() && *value > 0.0).unwrap_or(1.0);
     apply_reader_text_alignment(text, overrides.text_align);
     if let Some(multiplier) = overrides
         .line_height
@@ -2929,7 +3388,11 @@ fn reintern_with_reader_overrides(
         .font_style(indices)
         .expect("validated font style")
         .clone();
-    font.font_family = match overrides.font_family.as_deref() {
+    font.cjk_font_family = overrides.cjk_family_for(font.font_family.and_then(|id| source.string(id)))
+        .or_else(|| font.cjk_font_family.and_then(|id| source.string(id)).map(str::to_owned))
+        .as_deref().map(|family| builder.intern_string(family));
+    font.font_family = match overrides.family_for(font.font_family.and_then(|id| source.string(id)))
+    {
         Some(family) => Some(builder.intern_string(family)),
         None => font
             .font_family
@@ -2937,6 +3400,7 @@ fn reintern_with_reader_overrides(
             .map(|value| builder.intern_string(value)),
     };
     let original_font_size = apply_reader_font(&mut font, None, overrides.minimum_font_size);
+    apply_reader_weight(&mut font, overrides.font_weight_adjustment);
     let mut text = source
         .text_style(indices)
         .expect("validated text style")
@@ -2945,9 +3409,9 @@ fn reintern_with_reader_overrides(
     text.list_style_image = text
         .list_style_image
         .map(|id| reintern_style_string(source, builder, id));
-    text.language = text
-        .language
-        .map(|id| reintern_style_string(source, builder, id));
+    text.language = text.language.and_then(|id| {
+        builder.intern_language(source.language(id).expect("validated language handle").as_str())
+    });
     if let QuoteStyle::Pairs(pairs) = text.quotes {
         text.quotes = QuoteStyle::Pairs(reintern_style_string(source, builder, pairs));
     }
@@ -3011,6 +3475,11 @@ impl ComputedStyles {
         document: &Document,
         overrides: &ReaderStyleOverrides,
     ) -> Result<Self, ComputedStylesBuildError> {
+        let mut adjusted_overrides = overrides.clone();
+        adjusted_overrides.font_weight_adjustment = reader_weight_adjustment(
+            self.store.font_styles.iter().map(|font| font.font_weight), overrides.font_weight_adjustment,
+        );
+        let overrides = &adjusted_overrides;
         let mut builder = ComputedStylesBuilder::new(document);
         for (node, node_ref) in document.nodes() {
             if !matches!(node_ref, NodeRef::Element(_)) {
@@ -3084,7 +3553,32 @@ impl ComputedStyles {
             builder.set_after_style(node, style, content, counters)?;
         }
         builder.apply_link_foreground(document, overrides.link_foreground);
-        builder.finish()
+        builder.apply_reader_paragraph_overrides(document, overrides);
+        let mut styles = builder.finish()?;
+        styles.hyphenation_fallback_language = self.hyphenation_fallback_language.clone();
+        Ok(styles)
+    }
+
+    /// Supply a publication language for hyphenation without changing the
+    /// document's authored language, CSS matching, or shaping language.
+    pub fn with_hyphenation_fallback_language(mut self, language: Option<&str>) -> Self {
+        self.hyphenation_fallback_language = language.map(str::trim).filter(|value| !value.is_empty()).map(ContentLanguage::parse);
+        self
+    }
+
+    /// Custom prose indentation is applied during layout in reader base-font units.
+    pub fn reader_first_line_indent_em(&self) -> Option<f32> {
+        self.reader_first_line_indent_em
+    }
+
+    /// Custom paragraph gaps are applied to prose boundaries during layout,
+    /// using the reader-selected base font size rather than authored CSS wrappers.
+    pub fn reader_paragraph_spacing_em(&self) -> Option<f32> {
+        self.reader_paragraph_spacing_em
+    }
+
+    pub fn hyphenation_fallback_language(&self) -> Option<&ContentLanguage> {
+        self.hyphenation_fallback_language.as_ref()
     }
 
     pub fn node_count(&self) -> usize {
@@ -3155,6 +3649,12 @@ impl ComputedStyles {
             .then(|| self.strings.get(id.index as usize))
             .flatten()
             .map(String::as_str)
+    }
+
+    pub fn language(&self, id: LanguageId) -> Option<&ContentLanguage> {
+        (id.store_id == self.store.store_id)
+            .then(|| self.store.languages.get(id.index as usize))
+            .flatten()
     }
 
     pub fn default_indices(&self) -> StyleIndices {
@@ -3391,6 +3891,8 @@ impl ComputedStyles {
 /// `StyleIndices` from the `ComputedStyles` node side table index these vecs.
 struct StyleStore {
     store_id: NonZeroU32,
+    languages: Vec<ContentLanguage>,
+    language_dedup: FxHashMap<String, LanguageId>,
     font_styles: Vec<Font>,
     text_styles: Vec<InheritedText>,
     box_styles: Vec<BoxModel>,
@@ -3461,6 +3963,8 @@ impl StyleStore {
     fn new(store_id: NonZeroU32) -> Self {
         Self {
             store_id,
+            languages: Vec::new(),
+            language_dedup: FxHashMap::default(),
             font_styles: Vec::new(),
             text_styles: Vec::new(),
             box_styles: Vec::new(),
@@ -3619,6 +4123,7 @@ impl StyleStore {
     }
 
     fn discard_deduplication_maps(&mut self) {
+        self.language_dedup = FxHashMap::default();
         self.font_dedup = StyleDedup::default();
         self.text_dedup = StyleDedup::default();
         self.box_dedup = StyleDedup::default();
@@ -3635,6 +4140,11 @@ impl StyleStore {
         }
         for text in &self.text_styles {
             text.validate(self.store_id)?;
+            if text.language.is_some_and(|id| id.index as usize >= self.languages.len()) {
+                return Err(ComputedStyleValueError::InvalidStructure {
+                    property: "InheritedText", field: "language",
+                });
+            }
         }
         for box_model in &self.box_styles {
             box_model.validate(self.store_id)?;
@@ -3751,6 +4261,30 @@ impl StyleStore {
             self.font_styles.capacity(),
             self.font_styles.len(),
         );
+        report.add_slice_storage::<ContentLanguage>(
+            "StyleStore.languages.storage",
+            self.languages.capacity(),
+            self.languages.len(),
+        );
+        for language in &self.languages {
+            report.add(
+                "StyleStore.languages.contents",
+                language.as_str().len(),
+                language.as_str().len(),
+            );
+        }
+        report.add_slice_storage::<(String, LanguageId)>(
+            "StyleStore.language_dedup.storage",
+            self.language_dedup.capacity(),
+            self.language_dedup.len(),
+        );
+        for declaration in self.language_dedup.keys() {
+            report.add(
+                "StyleStore.language_dedup.keys",
+                declaration.capacity(),
+                declaration.len(),
+            );
+        }
         report.add_slice_storage::<InheritedText>(
             "StyleStore.text_styles.storage",
             self.text_styles.capacity(),
@@ -3919,13 +4453,16 @@ impl<'a> StyleView<'a> {
         ))
     }
     pub fn font_weight(&self) -> u16 {
-        self.font.font_weight
+        self.font.reader_font_weight.unwrap_or(self.font.font_weight)
     }
     pub fn font_style(&self) -> FontStyle {
         self.font.font_style
     }
     pub fn font_family(&self) -> Option<StyleStringId> {
         self.font.font_family
+    }
+    pub fn cjk_font_family(&self) -> Option<StyleStringId> {
+        self.font.cjk_font_family
     }
     pub fn font_variant_small_caps(&self) -> bool {
         self.font
@@ -3944,11 +4481,14 @@ impl<'a> StyleView<'a> {
     pub fn visibility(&self) -> Visibility {
         self.text.visibility
     }
-    pub fn language(&self) -> Option<StyleStringId> {
+    pub fn language(&self) -> Option<LanguageId> {
         self.text.language
     }
     pub fn direction(&self) -> TextDirection {
         self.text.direction
+    }
+    pub fn unicode_bidi(&self) -> UnicodeBidi {
+        self.box_model.unicode_bidi
     }
     pub fn quotes(&self) -> QuoteStyle {
         self.text.quotes
@@ -3969,12 +4509,17 @@ impl<'a> StyleView<'a> {
     pub fn word_spacing(&self) -> f32 {
         self.text.word_spacing.resolve(self.font.font_size)
     }
+    pub fn word_spacing_factor(&self) -> f32 {
+        self.text.reader_word_spacing_factor
+    }
     pub fn tab_size(&self) -> TabSize {
         self.text.tab_size
     }
     pub fn text_align(&self) -> TextAlign {
         self.text.text_align
     }
+    pub fn text_align_logical(&self) -> LogicalTextAlign { self.text.text_align_logical }
+    pub fn text_align_last_logical(&self) -> LogicalTextAlign { self.text.text_align_last_logical }
     pub fn text_align_last(&self) -> TextAlign {
         self.text.text_align_last
     }
@@ -3991,10 +4536,13 @@ impl<'a> StyleView<'a> {
         self.text.white_space
     }
     pub fn hyphens(&self) -> Hyphens {
-        self.text.hyphens
+        self.text.reader_hyphens.unwrap_or(self.text.hyphens)
     }
     pub fn word_break(&self) -> WordBreak {
         self.text.word_break
+    }
+    pub fn line_break(&self) -> LineBreak {
+        self.text.line_break
     }
     pub fn overflow_wrap(&self) -> OverflowWrap {
         self.text.overflow_wrap
@@ -4268,10 +4816,10 @@ impl<'a> StyleView<'a> {
             || self.text.line_height_x_height_px != 0.0
             || matches!(self.box_model.vertical_align, VerticalAlignValue::Calc { x_height_px, .. } if x_height_px != 0.0)
             || [
-                self.text.text_indent,
-                self.box_model.margin_top,
+                self.text_indent(),
+                self.margin_top(),
                 self.box_model.margin_right,
-                self.box_model.margin_bottom,
+                self.margin_bottom(),
                 self.box_model.margin_left,
                 self.box_model.padding_top,
                 self.box_model.padding_right,
@@ -4368,11 +4916,14 @@ impl<'a> UsedStyleView<'a> {
     pub fn visibility(&self) -> Visibility {
         self.computed.visibility()
     }
-    pub fn language(&self) -> Option<StyleStringId> {
+    pub fn language(&self) -> Option<LanguageId> {
         self.computed.language()
     }
     pub fn direction(&self) -> TextDirection {
         self.computed.text.direction
+    }
+    pub fn unicode_bidi(&self) -> UnicodeBidi {
+        self.computed.unicode_bidi()
     }
     pub fn line_height(&self) -> f32 {
         self.computed.text.line_height
@@ -4387,12 +4938,17 @@ impl<'a> UsedStyleView<'a> {
     pub fn word_spacing(&self) -> f32 {
         self.computed.word_spacing()
     }
+    pub fn word_spacing_factor(&self) -> f32 {
+        self.computed.word_spacing_factor()
+    }
     pub fn tab_size(&self) -> TabSize {
         self.computed.tab_size()
     }
     pub fn text_align(&self) -> TextAlign {
         self.computed.text_align()
     }
+    pub fn text_align_logical(&self) -> LogicalTextAlign { self.computed.text_align_logical() }
+    pub fn text_align_last_logical(&self) -> LogicalTextAlign { self.computed.text_align_last_logical() }
     pub fn text_align_last(&self) -> TextAlign {
         self.computed.text_align_last()
     }
@@ -4410,6 +4966,9 @@ impl<'a> UsedStyleView<'a> {
     }
     pub fn word_break(&self) -> WordBreak {
         self.computed.word_break()
+    }
+    pub fn line_break(&self) -> LineBreak {
+        self.computed.line_break()
     }
     pub fn overflow_wrap(&self) -> OverflowWrap {
         self.computed.overflow_wrap()
@@ -4525,16 +5084,28 @@ impl<'a> UsedStyleView<'a> {
         self.computed.aspect_ratio()
     }
     pub fn border_top_color(&self) -> u32 {
-        self.paint.map_or_else(|| self.computed.border_top_color(), |paint| paint.borders[0])
+        self.paint.map_or_else(
+            || self.computed.border_top_color(),
+            |paint| paint.borders[0],
+        )
     }
     pub fn border_right_color(&self) -> u32 {
-        self.paint.map_or_else(|| self.computed.border_right_color(), |paint| paint.borders[1])
+        self.paint.map_or_else(
+            || self.computed.border_right_color(),
+            |paint| paint.borders[1],
+        )
     }
     pub fn border_bottom_color(&self) -> u32 {
-        self.paint.map_or_else(|| self.computed.border_bottom_color(), |paint| paint.borders[2])
+        self.paint.map_or_else(
+            || self.computed.border_bottom_color(),
+            |paint| paint.borders[2],
+        )
     }
     pub fn border_left_color(&self) -> u32 {
-        self.paint.map_or_else(|| self.computed.border_left_color(), |paint| paint.borders[3])
+        self.paint.map_or_else(
+            || self.computed.border_left_color(),
+            |paint| paint.borders[3],
+        )
     }
     pub fn border_top_style(&self) -> BorderStyle {
         self.computed.border_top_style()
@@ -4549,13 +5120,19 @@ impl<'a> UsedStyleView<'a> {
         self.computed.border_left_style()
     }
     pub fn background_color(&self) -> u32 {
-        self.paint.map_or_else(|| self.computed.background_color(), |paint| paint.background)
+        self.paint.map_or_else(
+            || self.computed.background_color(),
+            |paint| paint.background,
+        )
     }
     pub fn background_image_present(&self) -> bool {
         self.computed.background_image_present()
     }
     pub fn text_decoration_color(&self) -> u32 {
-        self.paint.map_or_else(|| self.computed.text_decoration_color(), |paint| paint.text_decoration)
+        self.paint.map_or_else(
+            || self.computed.text_decoration_color(),
+            |paint| paint.text_decoration,
+        )
     }
     pub fn outline(&self) -> UsedOutline {
         let outline = self.computed.outline();
@@ -4643,16 +5220,10 @@ impl<'a> UsedStyleView<'a> {
         }
     }
     pub fn text_indent(&self) -> UsedLengthPct {
-        self.computed
-            .text
-            .text_indent
-            .resolve_font_relative(self.font_relative)
+        self.computed.text_indent().resolve_font_relative(self.font_relative)
     }
     pub fn margin_top(&self) -> UsedLengthPct {
-        self.computed
-            .box_model
-            .margin_top
-            .resolve_font_relative(self.font_relative)
+        self.computed.margin_top().resolve_font_relative(self.font_relative)
     }
     pub fn margin_right(&self) -> UsedLengthPct {
         self.computed
@@ -4661,10 +5232,7 @@ impl<'a> UsedStyleView<'a> {
             .resolve_font_relative(self.font_relative)
     }
     pub fn margin_bottom(&self) -> UsedLengthPct {
-        self.computed
-            .box_model
-            .margin_bottom
-            .resolve_font_relative(self.font_relative)
+        self.computed.margin_bottom().resolve_font_relative(self.font_relative)
     }
     pub fn margin_left(&self) -> UsedLengthPct {
         self.computed
@@ -4867,8 +5435,10 @@ impl Default for Font {
             font_size_root_cap_height: 0.0,
             font_size_root_line_height: 0.0,
             font_weight: 400,
+            reader_font_weight: None,
             font_style: FontStyle::Normal,
             font_family: None,
+            cjk_font_family: None,
             font_variant_caps_features: Vec::new(),
             font_variant_numeric_features: Vec::new(),
             font_variant_ligature_features: Vec::new(),
@@ -4891,6 +5461,7 @@ impl Default for InheritedText {
             line_height_number: 0.0,
             letter_spacing: TextSpacing::ZERO,
             word_spacing: TextSpacing::ZERO,
+            reader_word_spacing_factor: 1.0,
             tab_size: TabSize::DEFAULT,
             text_align: TextAlign::Left,
             text_align_logical: LogicalTextAlign::Start,
@@ -4902,7 +5473,9 @@ impl Default for InheritedText {
             text_indent_each_line: false,
             white_space: WhiteSpace::Normal,
             hyphens: Hyphens::Manual,
+            reader_hyphens: None,
             word_break: WordBreak::Normal,
+            line_break: LineBreak::Auto,
             overflow_wrap: OverflowWrap::Normal,
             text_box_edge: TextBoxEdge::default(),
             widows: 2,
@@ -4921,6 +5494,7 @@ impl Default for BoxModel {
         Self {
             layout_idx: 0,
             display: Display::Block,
+            unicode_bidi: UnicodeBidi::Normal,
             box_sizing: BoxSizing::ContentBox,
             overflow_x: OverflowMode::Visible,
             overflow_y: OverflowMode::Visible,
@@ -5026,6 +5600,7 @@ impl Default for Border {
 
 // Default constants for reset groups (used by anonymous boxes)
 pub const DEFAULT_BOX_MODEL: BoxModel = BoxModel {
+    unicode_bidi: UnicodeBidi::Normal,
     layout_idx: 0,
     display: Display::Block,
     box_sizing: BoxSizing::ContentBox,
@@ -5550,6 +6125,18 @@ pub enum TextDirection {
     Rtl,
 }
 
+/// CSS bidirectional embedding behavior. Unlike `direction`, this does not inherit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum UnicodeBidi {
+    #[default]
+    Normal,
+    Embed,
+    Isolate,
+    BidiOverride,
+    IsolateOverride,
+    Plaintext,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum WhiteSpace {
     #[default]
@@ -5590,17 +6177,29 @@ impl WhiteSpace {
     }
 }
 
-/// Computed `word-break`. The legacy `break-word` value behaves like
-/// `overflow-wrap: break-word` and is mapped onto that property instead.
+/// Computed `word-break`, including its legacy `break-word` value.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum WordBreak {
     #[default]
     Normal,
-    /// Allow a break between any two characters.
+    /// Allow breaks within words, retaining punctuation restrictions.
     BreakAll,
-    /// Forbid breaks inside CJK "words". Treated like `Normal` here, since the
-    /// default breaker already only breaks at spaces.
+    /// Suppress implicit breaks between typographic letter units, including CJK.
     KeepAll,
+    /// Use normal word breaking and emergency wrapping as `overflow-wrap: anywhere`,
+    /// regardless of the computed `overflow-wrap` value.
+    BreakWord,
+}
+
+/// Strictness of punctuation and small-kana restrictions in horizontal text.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum LineBreak {
+    #[default]
+    Auto,
+    Loose,
+    Normal,
+    Strict,
+    Anywhere,
 }
 
 /// Computed value of CSS `hyphens`.
@@ -5614,8 +6213,8 @@ pub enum Hyphens {
 
 /// Computed `overflow-wrap` (and its legacy alias `word-wrap`). Both
 /// non-normal values allow an emergency mid-word break when a word cannot fit
-/// on a line by itself; the min-content sizing distinction between them is not
-/// modeled.
+/// on a line by itself. Only `anywhere` contributes these opportunities to
+/// min-content sizing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum OverflowWrap {
     #[default]
@@ -5779,6 +6378,8 @@ pub enum ContentAlignment {
     Normal,
     Start,
     End,
+    Left,
+    Right,
     FlexStart,
     FlexEnd,
     Center,
@@ -6484,6 +7085,33 @@ mod boundary_tests {
     use std::hash::{Hash, Hasher};
     use std::mem::size_of;
 
+    #[test]
+    fn language_handles_intern_structured_tags_and_preserve_unknown_declarations() {
+        let document = Document::new();
+        let mut builder = ComputedStylesBuilder::new(&document);
+        assert_eq!(builder.store.languages.capacity(), 0);
+        assert_eq!(builder.intern_language(""), None);
+        let id = builder.intern_language("ZH-hant-tw-u-nu-hanidec-x-reader").unwrap();
+        assert_eq!(builder.intern_language("zh-Hant-TW-u-nu-hanidec-x-reader"), Some(id));
+        assert_eq!(builder.store.languages.len(), 1);
+        let tag = builder.language(id).unwrap().tag().unwrap();
+        assert_eq!(tag.primary_language(), "zh");
+        assert_eq!(tag.script(), Some("Hant"));
+        assert_eq!(tag.region(), Some("TW"));
+        assert_eq!(tag.extension(), Some("u-nu-hanidec"));
+        assert_eq!(tag.private_use(), Some("x-reader"));
+        let invalid = builder.intern_language("en_US").unwrap();
+        assert!(builder.language(invalid).unwrap().tag().is_none());
+        assert_eq!(builder.language(invalid).unwrap().as_str(), "en_US");
+        assert_ne!(builder.intern_language("en_UK"), Some(invalid));
+        let foreign = ComputedStylesBuilder::new(&document);
+        assert!(foreign.language(id).is_none());
+        let mut text = InheritedText::default();
+        text.language = Some(id);
+        assert!(text.validate(foreign.store.store_id).is_err());
+        assert_eq!(size_of::<Option<crate::LanguageId>>(), size_of::<StyleStringId>());
+    }
+
     #[derive(Eq, PartialEq)]
     struct CollidingStyle(u32);
 
@@ -6548,13 +7176,13 @@ mod boundary_tests {
             size_of::<StyleStringId>()
         );
         assert!(
-            size_of::<VerticalAlignValue>() <= 12,
+            size_of::<VerticalAlignValue>() <= 16,
             "vertical alignment is stored per distinct box style and must remain compact"
         );
         assert_eq!(size_of::<super::OverflowMode>(), 1);
         assert_eq!(size_of::<super::TextOverflow>(), 1);
         assert!(
-            size_of::<super::Border>() <= 40,
+            size_of::<super::Border>() <= 44,
             "optional corner radii must not inflate every distinct border style"
         );
         assert_eq!(

@@ -1,5 +1,5 @@
 use crate::layout_model::{
-    Children, GlyphId, InlineContent, InlineItem, InlineItemKind, LayoutBox, LayoutMode,
+    Children, InlineContent, InlineItem, InlineItemKind, LayoutBox, LayoutMode,
     LayoutTree, ListItemMarker, TableCellBox, TableColumnGroupSpan, TableColumnTrack,
     TableColumnWidthHint, TableRowBox,
 };
@@ -169,14 +169,14 @@ impl<'styles, 'out> BoxTreeWriter<'styles, 'out> {
         if text.is_empty() {
             return;
         }
-        let glyph_start = self.inline.glyphs().len() as u32;
+        let glyph_start = self.inline.characters().len() as u32;
         let mut utf16_offset = source_utf16_offset;
         for character in text.chars() {
             self.inline
-                .push_source_glyph(character as GlyphId, utf16_offset);
+                .push_source_character(character, utf16_offset);
             utf16_offset = utf16_offset.saturating_add(character.len_utf16() as u32);
         }
-        let glyph_end = self.inline.glyphs().len() as u32;
+        let glyph_end = self.inline.characters().len() as u32;
         self.push_item(
             InlineItemKind::Text {
                 glyphs: glyph_start..glyph_end,
@@ -192,11 +192,11 @@ impl<'styles, 'out> BoxTreeWriter<'styles, 'out> {
         box_idx: u32,
         kind: impl FnOnce(Range<u32>) -> InlineItemKind,
     ) {
-        let glyph_start = self.inline.glyphs().len() as u32;
+        let glyph_start = self.inline.characters().len() as u32;
         for character in text.chars() {
-            self.inline.push_glyph(character as GlyphId);
+            self.inline.push_character(character);
         }
-        let glyph_end = self.inline.glyphs().len() as u32;
+        let glyph_end = self.inline.characters().len() as u32;
         self.push_item(kind(glyph_start..glyph_end), box_idx, None);
     }
 

@@ -1,0 +1,172 @@
+--- a/crates/gpui/Cargo.toml
++++ b/crates/gpui/Cargo.toml
+@@ -17,6 +17,7 @@
+ workspace = true
+ 
+ [features]
++snapshot = []
+ default = ["font-kit", "image-formats", "wayland", "x11", "windows-manifest"]
+ test-support = [
+     "leak-detection",
+--- a/crates/gpui/src/platform.rs
++++ b/crates/gpui/src/platform.rs
+@@ -47,7 +47,7 @@
+ use anyhow::{Context as _, Result};
+ use async_task::Runnable;
+ use futures::channel::oneshot;
+-#[cfg(any(test, feature = "test-support"))]
++#[cfg(any(test, feature = "test-support", feature = "snapshot"))]
+ use image::RgbaImage;
+ use image::codecs::gif::GifDecoder;
+ use image::{AnimationDecoder as _, DynamicImage, Frame};
+@@ -1085,7 +1085,7 @@
+     /// Renders the given scene to a texture and returns the pixel data as an RGBA image.
+     /// This does not present the frame to screen - useful for visual testing where we want
+     /// to capture what would be rendered without displaying it or requiring the window to be visible.
+-    #[cfg(any(test, feature = "test-support"))]
++    #[cfg(any(test, feature = "test-support", feature = "snapshot"))]
+     fn render_to_image(&self, _scene: &Scene) -> Result<RgbaImage> {
+         anyhow::bail!("render_to_image not implemented for this platform")
+     }
+--- a/crates/gpui/src/window.rs
++++ b/crates/gpui/src/window.rs
+@@ -2632,7 +2632,7 @@
+     /// Renders the current frame's scene to a texture and returns the pixel data as an RGBA image.
+     /// This does not present the frame to screen - useful for visual testing where we want
+     /// to capture what would be rendered without displaying it or requiring the window to be visible.
+-    #[cfg(any(test, feature = "test-support"))]
++    #[cfg(any(test, feature = "test-support", feature = "snapshot"))]
+     pub fn render_to_image(&self) -> anyhow::Result<image::RgbaImage> {
+         self.platform_window
+             .render_to_image(&self.rendered_frame.scene)
+--- a/crates/gpui_linux/Cargo.toml
++++ b/crates/gpui_linux/Cargo.toml
+@@ -12,6 +12,7 @@
+ path = "src/gpui_linux.rs"
+ 
+ [features]
++snapshot = ["gpui/snapshot", "gpui_wgpu?/snapshot", "dep:image"]
+ default = ["wayland", "x11"]
+ test-support = ["gpui/test-support"]
+ wayland = [
+@@ -61,6 +62,7 @@
+ gpui_util.workspace = true
+ gpui_wgpu = { workspace = true, optional = true, features = ["font-kit"] }
+ http_client.workspace = true
++image = { workspace = true, optional = true }
+ libc.workspace = true
+ log.workspace = true
+ parking_lot.workspace = true
+--- a/crates/gpui_linux/src/linux/x11/window.rs
++++ b/crates/gpui_linux/src/linux/x11/window.rs
+@@ -1715,6 +1715,11 @@
+         self.0.callbacks.borrow_mut().button_layout_changed = Some(callback);
+     }
+ 
++    #[cfg(feature = "snapshot")]
++    fn render_to_image(&self, scene: &Scene) -> anyhow::Result<image::RgbaImage> {
++        self.0.state.borrow_mut().renderer.snapshot(scene)
++    }
++
+     fn draw(&self, scene: &Scene) {
+         let mut inner = self.0.state.borrow_mut();
+ 
+--- a/crates/gpui_wgpu/Cargo.toml
++++ b/crates/gpui_wgpu/Cargo.toml
+@@ -12,6 +12,7 @@
+ path = "src/gpui_wgpu.rs"
+ 
+ [features]
++snapshot = ["dep:image"]
+ default = []
+ font-kit = ["dep:font-kit"]
+ test-support = ["gpui/test-support", "dep:image"]
+--- a/crates/gpui_wgpu/src/wgpu_renderer.rs
++++ b/crates/gpui_wgpu/src/wgpu_renderer.rs
+@@ -8,7 +8,10 @@
+     AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, Path, Point, PrimitiveBatch,
+     ScaledPixels, Scene, Size, get_gamma_correction_ratios,
+ };
+-#[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
++#[cfg(all(
++    not(target_family = "wasm"),
++    any(feature = "test-support", feature = "snapshot")
++))]
+ use image::RgbaImage;
+ use log::warn;
+ #[cfg(not(target_family = "wasm"))]
+@@ -239,7 +242,10 @@
+     Headless(HeadlessTarget),
+ }
+ 
+-#[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
++#[cfg(all(
++    not(target_family = "wasm"),
++    any(feature = "test-support", feature = "snapshot")
++))]
+ struct HeadlessTarget {
+     texture: wgpu::Texture,
+     view: wgpu::TextureView,
+@@ -913,7 +919,10 @@
+         })
+     }
+ 
+-    #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
++    #[cfg(all(
++        not(target_family = "wasm"),
++        any(feature = "test-support", feature = "snapshot")
++    ))]
+     fn create_headless_target(
+         device: &wgpu::Device,
+         width: u32,
+@@ -1578,7 +1587,10 @@
+         Ok(self.render_scene_to_view(scene, &view))
+     }
+ 
+-    #[cfg(all(not(target_family = "wasm"), feature = "test-support"))]
++    #[cfg(all(
++        not(target_family = "wasm"),
++        any(feature = "test-support", feature = "snapshot")
++    ))]
+     fn render_scene_to_view(&mut self, scene: &Scene, frame_view: &wgpu::TextureView) -> bool {
+         let last_error = self.last_error.lock().unwrap().take();
+         if let Some(error) = last_error {
+@@ -1649,6 +1661,14 @@
+         let WgpuTarget::Headless(target) = &self.target else {
+             anyhow::bail!("headless readback requested from a window renderer");
+         };
++        self.read_snapshot(target)
++    }
++
++    #[cfg(all(
++        not(target_family = "wasm"),
++        any(feature = "test-support", feature = "snapshot")
++    ))]
++    fn read_snapshot(&self, target: &HeadlessTarget) -> anyhow::Result<RgbaImage> {
+         let width = self.surface_config.width;
+         let height = self.surface_config.height;
+         let mut encoder =
+@@ -1712,6 +1732,23 @@
+         }
+         RgbaImage::from_raw(width, height, rgba)
+             .ok_or_else(|| anyhow::anyhow!("Failed to construct headless RGBA image"))
++    }
++
++    /// Captures a window scene using its existing GPU context and sprite atlas.
++    #[cfg(all(not(target_family = "wasm"), feature = "snapshot"))]
++    pub fn snapshot(&mut self, scene: &Scene) -> anyhow::Result<RgbaImage> {
++        anyhow::ensure!(!self.device_lost(), "snapshot requested after GPU device loss");
++        let target = Self::create_headless_target(
++            &self.resources().device,
++            self.surface_config.width,
++            self.surface_config.height,
++            self.surface_config.format,
++        );
++        anyhow::ensure!(
++            self.render_scene_to_view(scene, &target.view),
++            "could not render the window scene for snapshot"
++        );
++        self.read_snapshot(&target)
+     }
+ 
+     pub fn set_subpixel_layout(&mut self, is_bgr: bool) {

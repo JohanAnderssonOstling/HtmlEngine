@@ -2,7 +2,7 @@ use super::box_model::ResolvedBoxModel;
 use crate::flex_grid::TaffyContainerKind;
 use crate::layout::LayoutEngine;
 use crate::layout_model::{Children, InlineItemKind, LayoutMode};
-use html_style_model::{Float, UsedPreferredSize as PreferredSize};
+use html_style_model::{Float, OverflowWrap, UsedPreferredSize as PreferredSize, WhiteSpace, WordBreak};
 use std::ops::Range;
 
 /// Shared intrinsic inline-size calculation for every formatting context.
@@ -379,7 +379,7 @@ fn runs_intrinsic_widths(
             continue;
         }
         let style = engine.reader.style(run.box_idx as usize);
-        let tab_reference_style = super::inline::tab_reference_style(engine, run.box_idx as usize);
+        let tab_reference_style = super::inline::tab_reference_style(&engine.reader, run.box_idx as usize);
         match &run.kind {
             InlineItemKind::Text { glyphs } => {
                 for glyph_idx in glyphs.clone() {
@@ -399,6 +399,22 @@ fn runs_intrinsic_widths(
                         max_indent_applied = false;
                         min_indent_applied = false;
                         continue;
+                    }
+
+                    // Emergency opportunities affect min-content for `anywhere`
+                    // (including legacy word-break), but not overflow-wrap's
+                    // `break-word`. Keep shaped clusters intact and honor nowrap.
+                    if white_space.allows_wrap()
+                        && !(white_space == WhiteSpace::PreWrap && matches!(c, ' ' | '\t'))
+                        && (style.overflow_wrap() == OverflowWrap::Anywhere
+                            || style.word_break() == WordBreak::BreakWord)
+                        && engine.text.is_cluster_boundary(glyph_idx as usize)
+                        && (segment != 0.0 || min_indent_applied)
+                    {
+                        min_content = min_content.max(segment.max(0.0));
+                        segment = 0.0;
+                        min_starts_indented_line = false;
+                        min_indent_applied = false;
                     }
 
                     let advance = if c == '\u{00ad}' {
@@ -426,12 +442,16 @@ fn runs_intrinsic_widths(
                     } else {
                         unit.natural_advance
                     };
-                    if break_kind == super::inline::BreakKind::Discretionary {
+                    if break_kind == super::inline::BreakKind::Discretionary
+                        && engine.text.is_cluster_boundary(glyph_idx as usize)
+                    {
                         min_content = min_content.max(segment.max(0.0));
                         segment = 0.0;
                         min_starts_indented_line = false;
                         min_indent_applied = false;
-                        continue;
+                        if c == '\u{200b}' {
+                            continue;
+                        }
                     }
                     if break_kind == super::inline::BreakKind::Soft {
                         min_content = min_content.max(segment.max(0.0));
@@ -450,7 +470,11 @@ fn runs_intrinsic_widths(
                             &mut min_indent_applied,
                             min_starts_indented_line,
                         );
-                        segment += advance;
+                        // Pre-wrap spaces and tabs hang at a hypothetical
+                        // line end, so they do not enlarge min-content.
+                        if white_space != WhiteSpace::PreWrap || !matches!(c, ' ' | '\t') {
+                            segment += advance;
+                        }
                     }
                     apply_max_indent(
                         &mut current_line,

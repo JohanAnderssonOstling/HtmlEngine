@@ -422,7 +422,10 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
                 }
                 valid_events.remove(sequence);
             } else {
-                *style = candidate;
+                // Retain the original accumulator as scratch for the next
+                // element; clone_from can reuse its font-feature buffers.
+                std::mem::swap(style, &mut candidate);
+                *self.validation_style = candidate;
                 break;
             }
         }

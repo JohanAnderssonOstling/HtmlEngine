@@ -1,9 +1,11 @@
 //! Prepared, shaped, and laid-out document lifecycle types.
 
 use super::*;
-use crate::layout::{LayoutScratch, prepare_text_paint};
+use crate::layout::{InlinePlanGeneration, LayoutScratch, prepare_text_paint};
 use crate::ReaderStyleOverrides;
 use crate::shaping::PreparedText;
+use html_dom::{NodeRef, RootFontSize};
+use html_style_model::{ContentLanguage, Display, Visibility};
 use std::sync::Arc;
 use super::paint::PaintStyles;
 
@@ -59,27 +61,18 @@ pub enum TextCompositionPolicy {
     /// Paragraph-wide book composition without the optional consecutive-run,
     /// paragraph-ending, fragment-length, and short-line hyphen safeguards.
     BookOptimizedUnrestrictedHyphenation,
-    /// Experimental book composition that starts every Unicode sentence on a
-    /// new logical line without inserting characters into the source text.
-    SentencePerLine,
 }
 
 impl TextCompositionPolicy {
     pub fn is_book_optimized(self) -> bool {
         matches!(
             self,
-            Self::BookOptimized
-                | Self::BookOptimizedUnrestrictedHyphenation
-                | Self::SentencePerLine
+            Self::BookOptimized | Self::BookOptimizedUnrestrictedHyphenation
         )
     }
 
     pub fn uses_hyphenation_quality(self) -> bool {
-        matches!(self, Self::BookOptimized | Self::SentencePerLine)
-    }
-
-    pub fn uses_sentence_per_line(self) -> bool {
-        self == Self::SentencePerLine
+        self == Self::BookOptimized
     }
 }
 
@@ -219,9 +212,9 @@ impl std::error::Error for PrepareError {}
 /// ```
 #[derive(Clone)]
 pub(crate) struct PreparedInputs {
-    pub(super) document: std::sync::Arc<Document>,
-    pub(super) styles: std::sync::Arc<ComputedStyles>,
-    pub(super) layout_tree: std::sync::Arc<LayoutTree>,
+    pub(super) document: Arc<Document>,
+    pub(super) styles: Arc<ComputedStyles>,
+    pub(super) layout_tree: Arc<LayoutTree>,
     pub(super) text: Arc<PreparedText>,
     pub(super) note_flow: NoteFlow,
     pub(crate) paint: Arc<PaintStyles>,
@@ -229,29 +222,176 @@ pub(crate) struct PreparedInputs {
 
 #[derive(Clone)]
 pub struct PreparedDocument {
-    pub(super) inputs: std::sync::Arc<PreparedInputs>,
+    pub(super) inputs: Arc<PreparedInputs>,
 }
 
-#[derive(Clone)]
 pub(crate) struct ShapedText {
     pub(super) resource_generation: crate::GlyphResourceGeneration,
     pub(super) geometry_tree: Arc<LayoutTree>,
-    pub(super) inline_content: InlineContent,
-    pub(super) paint_ranges: Arc<[TextPaintRange]>,
+    pub(super) glyphs: Vec<GlyphId>,
     pub(super) glyph_metrics: GlyphMetrics,
-    pub(super) font_metrics: crate::shaping::ShapedFontMetrics,
     pub(super) text_geometry: crate::shaping::ShapedTextGeometry,
+    pub(super) shared: SharedShapedData,
+    pub(super) inline_plan_generation: InlinePlanGeneration,
+}
+
+/// Immutable shaping tables shared by the base shape and first-line variants.
+pub(super) struct SharedShapedData {
+    pub(super) font_metrics: crate::shaping::ShapedFontMetrics,
     pub(super) ellipsis_glyphs: FxHashMap<u32, GlyphId>,
     pub(super) hyphen_glyphs: FxHashMap<u32, GlyphId>,
     pub(super) link_glyph_targets: FxHashMap<u32, LinkGlyphTarget>,
     pub(super) anchor_glyphs: FxHashMap<u16, u32>,
-    pub(super) inline_plans: crate::layout::PreparedInlinePlans,
 }
 
-#[derive(Clone)]
+pub(crate) struct FirstLineRefinement {
+    pub(super) glyph_patches: Vec<GlyphPatch>,
+    pub(super) paint_ranges: Vec<TextPaintRange>,
+    pub(super) glyph_metrics: GlyphMetrics,
+    pub(super) text_geometry: ShapedTextGeometry,
+    pub(super) inline_plan_generation: InlinePlanGeneration,
+}
+
+impl FirstLineRefinement {
+    fn memory_usage_report(&self, seen: &mut FxHashSet<*const ()>) -> MemoryUsageReport {
+        let mut report = MemoryUsageReport::new();
+        report.add_slice_storage::<GlyphPatch>(
+            "glyph_patches",
+            self.glyph_patches.capacity(),
+            self.glyph_patches.len(),
+        );
+        for patch in &self.glyph_patches {
+            report.add_slice_storage::<GlyphId>(
+                "glyphs.storage",
+                patch.glyphs.capacity(),
+                patch.glyphs.len(),
+            );
+        }
+        report.add_slice_storage::<TextPaintRange>(
+            "text_paint_ranges",
+            self.paint_ranges.capacity(),
+            self.paint_ranges.len(),
+        );
+        report.extend_prefixed(
+            "glyph_metrics",
+            self.glyph_metrics.memory_usage_report_with_shared(seen),
+        );
+        report.add(
+            "text_geometry",
+            self.text_geometry.memory_usage_bytes_with_shared(seen),
+            self.paint_ranges.len(),
+        );
+        report
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ShapedTextView<'a> {
+    pub(super) resource_generation: crate::GlyphResourceGeneration,
+    pub(super) glyphs: GlyphSlice<'a>,
+    pub(super) glyph_metrics: &'a GlyphMetrics,
+    pub(super) text_geometry: TextGeometryView<'a>,
+    pub(super) paint_ranges: &'a [TextPaintRange],
+    pub(super) shared: &'a SharedShapedData,
+    pub(super) inline_plan_generation: InlinePlanGeneration,
+}
+
+impl<'a> ShapedTextView<'a> {
+    fn new(
+        base: &'a ShapedText,
+        refinement: Option<&'a FirstLineRefinement>,
+        metrics: Option<&'a GlyphMetrics>,
+    ) -> Self {
+        Self {
+            resource_generation: base.resource_generation,
+            glyphs: GlyphSlice::new(
+                &base.glyphs,
+                refinement.map_or(&[], |refined| &refined.glyph_patches),
+            ),
+            glyph_metrics: metrics.unwrap_or_else(|| {
+                refinement.map_or(&base.glyph_metrics, |refined| &refined.glyph_metrics)
+            }),
+            text_geometry: TextGeometryView::new(
+                &base.text_geometry,
+                refinement.map(|refined| &refined.text_geometry),
+            ),
+            paint_ranges: refinement.map_or(&[][..], |refined| &refined.paint_ranges),
+            shared: &base.shared,
+            inline_plan_generation: refinement.map_or(base.inline_plan_generation, |refined| {
+                refined.inline_plan_generation
+            }),
+        }
+    }
+}
+
+/// Sole owner of viewport-independent shaping. Layout consumes this stage
+/// and moves its glyph storage into the published document.
+///
+/// ```compile_fail
+/// fn duplicate(shape: html_layout::ShapedDocument) {
+///     let _ = shape.clone();
+/// }
+/// ```
+/// Owns the shaped text until it is moved into a layout document.
+/// Independent layouts execute shaping separately; readers borrow publication.
+///
+/// ```compile_fail
+/// fn copy_shape(document: &html_layout::ShapedDocument) {
+///     let _: html_layout::ShapedDocument = document.clone();
+/// }
+/// ```
 pub struct ShapedDocument {
-    pub(super) inputs: std::sync::Arc<PreparedInputs>,
-    pub(super) shaped: std::sync::Arc<ShapedText>,
+    pub(super) inputs: Arc<PreparedInputs>,
+    pub(super) shaped: Box<ShapedText>,
+}
+
+impl ShapedText {
+    fn memory_usage_report(&self, seen: &mut FxHashSet<*const ()>) -> MemoryUsageReport {
+        let mut report = MemoryUsageReport::new();
+        report.add_slice_storage::<GlyphId>(
+            "glyphs.storage",
+            self.glyphs.capacity(),
+            self.glyphs.len(),
+        );
+        report.extend_prefixed(
+            "glyph_metrics",
+            self.glyph_metrics.memory_usage_report_with_shared(seen),
+        );
+        report.add(
+            "text_geometry",
+            self.text_geometry.memory_usage_bytes_with_shared(seen),
+            self.glyphs.len(),
+        );
+        if seen.insert((&self.shared as *const SharedShapedData).cast()) {
+            report.add("shared_metadata", std::mem::size_of::<SharedShapedData>(), 1);
+            report.add(
+                "font_metrics",
+                self.shared.font_metrics.memory_usage_bytes(),
+                self.geometry_tree.box_count(),
+            );
+            report.add_slice_storage::<(u32, GlyphId)>(
+                "ellipsis_glyphs.storage",
+                self.shared.ellipsis_glyphs.capacity(),
+                self.shared.ellipsis_glyphs.len(),
+            );
+            report.add_slice_storage::<(u32, GlyphId)>(
+                "hyphen_glyphs.storage",
+                self.shared.hyphen_glyphs.capacity(),
+                self.shared.hyphen_glyphs.len(),
+            );
+            report.add_slice_storage::<(u32, LinkGlyphTarget)>(
+                "link_glyph_targets.storage",
+                self.shared.link_glyph_targets.capacity(),
+                self.shared.link_glyph_targets.len(),
+            );
+            report.add_slice_storage::<(u16, u32)>(
+                "anchor_glyphs.storage",
+                self.shared.anchor_glyphs.capacity(),
+                self.shared.anchor_glyphs.len(),
+            );
+        }
+        report
+    }
 }
 
 fn with_append_shaping<S: crate::GlyphShaper, T>(
@@ -276,7 +416,71 @@ pub struct ShapeLayoutTimings {
     pub layout: Duration,
 }
 
+/// Rebuild derived preparation while the session exclusively owns its DOM.
+/// The resolver borrows the canonical tree. A journal moves old derived state
+/// aside until the complete shape/layout transaction commits.
+fn with_reprepared<T>(
+    owner: &mut Arc<PreparedInputs>,
+    root_font_size: RootFontSize,
+    note_flow: NoteFlow,
+    overrides: &ReaderStyleOverrides,
+    resolve: impl FnOnce(&Document) -> ComputedStyles,
+    apply: impl FnOnce(&PreparedInputs) -> Result<T, crate::ShapeError>,
+) -> Result<T, crate::ShapeError> {
+    let inputs = Arc::get_mut(owner).ok_or_else(crate::ShapeError::document_is_shared)?;
+    let document =
+        Arc::get_mut(&mut inputs.document).ok_or_else(crate::ShapeError::document_is_shared)?;
+    let old_font = RootFontSize::new(document.root_font_size()).expect("validated root font size");
+    document.set_root_font_size(root_font_size);
+    let styles = resolve(document);
+    styles
+        .validate_for(document)
+        .expect("resolver styles must belong to the canonical DOM");
+    let math_undo = super::mathml::prepare_with_undo(document, &styles);
+    let mut tree = LayoutTree::default();
+    let mut content = InlineContent::default();
+    crate::layout::build_layout_inputs(document, &styles, &mut tree, &mut content, note_flow);
+    let text = PreparedText::new(document, &styles, &tree, content);
+    let paint =
+        PaintStyles::new(document, &styles, &tree).with_overrides(&styles, &tree, overrides);
+    let old_styles = std::mem::replace(&mut inputs.styles, Arc::new(styles));
+    let old_tree = std::mem::replace(&mut inputs.layout_tree, Arc::new(tree));
+    let old_text = std::mem::replace(&mut inputs.text, Arc::new(text));
+    let old_paint = std::mem::replace(&mut inputs.paint, Arc::new(paint));
+    let old_flow = std::mem::replace(&mut inputs.note_flow, note_flow);
+    let result = apply(owner.as_ref());
+    if result.is_err() {
+        let inputs =
+            Arc::get_mut(owner).expect("failed candidates release their borrowed preparation");
+        inputs.styles = old_styles;
+        inputs.layout_tree = old_tree;
+        inputs.text = old_text;
+        inputs.paint = old_paint;
+        inputs.note_flow = old_flow;
+        let document = Arc::get_mut(&mut inputs.document).expect("canonical DOM owner is retained");
+        document.set_root_font_size(old_font);
+        super::mathml::restore(document, math_undo);
+    }
+    result
+}
+
 impl PreparedDocument {
+    /// Source text participating in visible content, with inherited language,
+    /// before any platform shaping. Display suppression applies to subtrees;
+    /// visibility can be restored by a descendant's own computed style.
+    pub fn visible_text_runs(&self) -> impl Iterator<Item = (&str, Option<&ContentLanguage>)> { visible_text_runs(&self.inputs) }
+
+    pub fn reprepare_and_layout(
+        &mut self, root_font_size: RootFontSize, note_flow: NoteFlow, overrides: &ReaderStyleOverrides,
+        resolve: impl FnOnce(&Document) -> ComputedStyles, constraints: LayoutConstraints,
+        image_metrics: &ImageMetrics, glyph_shaper: &mut impl crate::GlyphShaper,
+    ) -> Result<LaidOutDocument, crate::ShapeError> {
+        let (shaped, candidate) = with_reprepared(&mut self.inputs, root_font_size, note_flow, overrides, resolve, |inputs| {
+            shape_and_layout_candidate(inputs, constraints, image_metrics, glyph_shaper)
+        })?;
+        Ok(candidate.into_document(self.inputs.clone(), shaped, constraints, image_metrics))
+    }
+
     pub fn try_new(document: Document, styles: ComputedStyles) -> Result<Self, PrepareError> {
         Self::try_new_with_note_flow(document, styles, NoteFlow::default())
     }
@@ -286,14 +490,15 @@ impl PreparedDocument {
         styles: ComputedStyles,
         note_flow: NoteFlow,
     ) -> Result<Self, PrepareError> {
-        styles.validate_for(&document).map_err(PrepareError)?;
+        profile_scope!("prepare.total");
+        profile!("prepare.validate_styles", styles.validate_for(&document)).map_err(PrepareError)?;
         let mut document = document;
-        super::mathml::prepare(&mut document, &styles);
+        profile!("prepare.mathml", super::mathml::prepare(&mut document, &styles));
         let mut layout_tree = LayoutTree::default();
         let mut inline_content = InlineContent::default();
-        crate::layout::build_layout_inputs(&document, &styles, &mut layout_tree, &mut inline_content, note_flow);
+        profile!("prepare.build_box_tree", crate::layout::build_layout_inputs(&document, &styles, &mut layout_tree, &mut inline_content, note_flow));
         let text = Arc::new(PreparedText::new(&document, &styles, &layout_tree, inline_content));
-        let paint = Arc::new(PaintStyles::new(&document, &styles, &layout_tree));
+        let paint = Arc::new(profile!("prepare.paint_bindings", PaintStyles::new(&document, &styles, &layout_tree)));
         Ok(Self { inputs: Arc::new(PreparedInputs { document: Arc::new(document), styles: Arc::new(styles), layout_tree: Arc::new(layout_tree), text, note_flow, paint }) })
     }
 
@@ -317,51 +522,11 @@ impl PreparedDocument {
     /// are already resolved, so the subtree keeps the typography it would have
     /// had in place. Notes are in flow here whatever the containing document
     /// asked for: the caller has explicitly asked for this one.
-    pub fn scoped_to_element_id(&self, id: &str) -> Option<Self> {
-        let document = &self.inputs.document;
-        let root = document
-            .node_ids()
-            .find(|node| document.get_dom_id(*node) == Some(id))?;
-        document.element_ref(root)?;
-
-        let mut layout_tree = LayoutTree::default();
-        let mut inline_content = InlineContent::default();
-        crate::layout::build_layout_inputs_from(
-            document,
-            &self.inputs.styles,
-            &mut layout_tree,
-            &mut inline_content,
-            NoteFlow::InFlow,
-            root,
-        );
-        let text = Arc::new(PreparedText::new(document, &self.inputs.styles, &layout_tree, inline_content));
-        let paint = Arc::new(self.inputs.paint.for_tree(document, &self.inputs.styles, &layout_tree));
-        Some(Self {
-            inputs: std::sync::Arc::new(PreparedInputs {
-                document: std::sync::Arc::clone(&self.inputs.document),
-                styles: std::sync::Arc::clone(&self.inputs.styles),
-                layout_tree: std::sync::Arc::new(layout_tree),
-                text,
-                note_flow: NoteFlow::InFlow,
-                paint,
-            }),
-        })
-    }
+    pub fn scoped_to_element_id(&self, id: &str) -> Option<Self> { scoped_to_element_id(&self.inputs, id) }
 
     /// Ids of this document's note bodies, in document order. A note without an
     /// id cannot be referenced, so it is not listed.
-    pub fn note_ids(&self) -> Vec<&str> {
-        let document = &self.inputs.document;
-        document
-            .node_ids()
-            .filter(|node| {
-                document
-                    .element_ref(*node)
-                    .is_some_and(element_is_note_target)
-            })
-            .filter_map(|node| document.get_dom_id(node))
-            .collect()
-    }
+    pub fn note_ids(&self) -> Vec<&str> { note_ids(&self.inputs) }
 
     pub(crate) fn document(&self) -> &Document {
         self.inputs.document.as_ref()
@@ -476,15 +641,15 @@ impl PreparedDocument {
         constraints: LayoutConstraints,
         image_metrics: &ImageMetrics,
         glyph_shaper: &mut impl crate::GlyphShaper,
-    ) -> Result<(ShapedDocument, LaidOutDocument), crate::ShapeError> {
+    ) -> Result<LaidOutDocument, crate::ShapeError> {
         glyph_shaper.begin_document_shaping();
         let result = self.shape_active_document(glyph_shaper).and_then(|shaped| {
-            let laid_out = shaped.clone().layout_with_metrics_and_shaper_inner(
+            let laid_out = shaped.layout_with_metrics_and_shaper_inner(
                 constraints,
                 image_metrics,
                 glyph_shaper,
             )?;
-            Ok((shaped, laid_out))
+            Ok(laid_out)
         });
         if result.is_ok() {
             glyph_shaper.commit_document_shaping();
@@ -501,20 +666,20 @@ impl PreparedDocument {
         constraints: LayoutConstraints,
         image_metrics: &ImageMetrics,
         glyph_shaper: &mut impl crate::GlyphShaper,
-    ) -> Result<(ShapedDocument, LaidOutDocument, ShapeLayoutTimings), crate::ShapeError> {
+    ) -> Result<(LaidOutDocument, ShapeLayoutTimings), crate::ShapeError> {
         glyph_shaper.begin_document_shaping();
         let mut timings = ShapeLayoutTimings::default();
         let shape_started = Instant::now();
         let result = self.shape_active_document(glyph_shaper).and_then(|shaped| {
             timings.shape = shape_started.elapsed();
             let layout_started = Instant::now();
-            let laid_out = shaped.clone().layout_with_metrics_and_shaper_inner(
+            let laid_out = shaped.layout_with_metrics_and_shaper_inner(
                 constraints,
                 image_metrics,
                 glyph_shaper,
             )?;
             timings.layout = layout_started.elapsed();
-            Ok((shaped, laid_out, timings))
+            Ok((laid_out, timings))
         });
         if result.is_ok() {
             glyph_shaper.commit_document_shaping();
@@ -541,84 +706,126 @@ impl PreparedDocument {
         constraints: LayoutConstraints,
         image_metrics: &ImageMetrics,
         glyph_shaper: &mut impl crate::GlyphShaper,
-    ) -> Result<(ShapedDocument, LaidOutDocument), crate::ShapeError> {
+    ) -> Result<LaidOutDocument, crate::ShapeError> {
         with_append_shaping(glyph_shaper, |glyph_shaper| {
             let shaped = self.shape_active_document(glyph_shaper)?;
-            let laid_out = shaped.clone().layout_with_metrics_and_shaper_inner(
+            let laid_out = shaped.layout_with_metrics_and_shaper_inner(
                 constraints,
                 image_metrics,
                 glyph_shaper,
             )?;
-            Ok((shaped, laid_out))
+            Ok(laid_out)
         })
     }
 
     fn shape_active_document(
-        &self,
-        glyph_shaper: &mut impl crate::GlyphShaper,
+        &self, glyph_shaper: &mut impl crate::GlyphShaper,
     ) -> Result<ShapedDocument, crate::ShapeError> {
-        let mut glyph_metrics = glyph_shaper.glyph_resources().snapshot();
-        let mut inline_content = self.inputs.text.content().clone();
-        let (ellipsis_glyphs, hyphen_glyphs, text_geometry, font_metrics) =
-            crate::shaping::shape_document(
-                &self.inputs.styles,
-                &self.inputs.layout_tree,
-                &mut inline_content,
-                self.inputs.text.first_letter_styles(),
-                glyph_shaper,
-                &mut glyph_metrics,
-            )?;
-        let link_glyph_targets = collect_link_glyph_targets(
-            &self.inputs.document,
-            &self.inputs.layout_tree,
-            &inline_content,
-        )
-        .into_iter()
-        .collect();
-        let anchor_glyphs = collect_anchor_glyphs(
-            &self.inputs.document,
-            &self.inputs.layout_tree,
-            &inline_content,
-        )
-        .into_iter()
-        .collect();
-        let inline_plans = crate::layout::PreparedInlinePlans::new(&self.inputs.layout_tree, &inline_content);
-        Ok(ShapedDocument {
-            inputs: self.inputs.clone(),
-            shaped: std::sync::Arc::new(ShapedText {
-                resource_generation: glyph_shaper.glyph_resources().generation(),
-                geometry_tree: self.inputs.layout_tree.clone(),
-                inline_content,
-                paint_ranges: Arc::from([]),
-                glyph_metrics,
-                font_metrics,
-                text_geometry,
-                ellipsis_glyphs,
-                hyphen_glyphs,
-                link_glyph_targets,
-                anchor_glyphs,
-                inline_plans,
-            }),
-        })
+        Ok(ShapedDocument { inputs: self.inputs.clone(), shaped: shape_text(&self.inputs, glyph_shaper)? })
     }
+}
+
+fn shape_text(
+    inputs: &PreparedInputs,
+    glyph_shaper: &mut impl crate::GlyphShaper,
+) -> Result<Box<ShapedText>, crate::ShapeError> {
+    profile_scope!("shape.total");
+    let mut glyph_metrics = profile!(
+        "shape.snapshot_metrics",
+        glyph_shaper.glyph_resources().snapshot()
+    );
+    let inline_content = inputs.text.content();
+    let mut glyphs = profile!(
+        "shape.allocate_glyphs",
+        inline_content.characters().to_vec()
+    );
+    let (ellipsis_glyphs, hyphen_glyphs, text_geometry, font_metrics) =
+        crate::shaping::shape_document(
+            &inputs.styles,
+            &inputs.layout_tree,
+            inline_content,
+            &mut glyphs,
+            inputs.text.first_letter_styles(),
+            glyph_shaper,
+            &mut glyph_metrics,
+        )?;
+    let link_glyph_targets = profile!(
+        "shape.link_targets",
+        collect_link_glyph_targets(&inputs.document, &inputs.layout_tree, inline_content,)
+            .into_iter()
+            .collect()
+    );
+    let anchor_glyphs = profile!(
+        "shape.anchor_targets",
+        collect_anchor_glyphs(&inputs.document, &inputs.layout_tree, inline_content,)
+            .into_iter()
+            .collect()
+    );
+    let inline_plan_generation = InlinePlanGeneration::new();
+    Ok(Box::new(ShapedText {
+        resource_generation: glyph_shaper.glyph_resources().generation(),
+        geometry_tree: inputs.layout_tree.clone(),
+        glyphs,
+        glyph_metrics,
+        text_geometry,
+        shared: SharedShapedData {
+            font_metrics,
+            ellipsis_glyphs,
+            hyphen_glyphs,
+            link_glyph_targets,
+            anchor_glyphs,
+        },
+        inline_plan_generation,
+    }))
+}
+
+fn shape_and_layout_candidate(
+    inputs: &PreparedInputs,
+    constraints: LayoutConstraints,
+    image_metrics: &ImageMetrics,
+    glyph_shaper: &mut impl crate::GlyphShaper,
+) -> Result<(Box<ShapedText>, LayoutCandidate), crate::ShapeError> {
+    glyph_shaper.begin_document_shaping();
+    let result = (|| {
+        let shaped = shape_text(inputs, glyph_shaper)?;
+        let candidate = LayoutCandidate::new(
+            inputs,
+            &shaped,
+            constraints,
+            image_metrics,
+            None,
+            LayoutScratch::default(),
+        );
+        let seed = glyph_shaper.glyph_resources().snapshot();
+        let candidate = refine_first_lines(
+            candidate,
+            inputs,
+            &shaped,
+            seed,
+            constraints,
+            image_metrics,
+            glyph_shaper,
+        )?;
+        Ok((shaped, candidate))
+    })();
+    if result.is_ok() {
+        glyph_shaper.commit_document_shaping();
+    } else {
+        glyph_shaper.rollback_document_shaping();
+    }
+    result
 }
 
 /// A prepared document whose inline text has concrete glyph IDs and metrics.
 /// Layout constraints can change without repeating parsing, styling, box-tree
 /// construction, or shaping.
 impl ShapedDocument {
-    /// Retarget retained shaping to color-only styles produced from the same DOM.
-    pub fn with_paint_from(&self, prepared: &PreparedDocument) -> Self {
-        assert!(Arc::ptr_eq(&self.shaped.geometry_tree, &prepared.inputs.layout_tree));
-        Self { inputs: prepared.inputs.clone(), shaped: self.shaped.clone() }
-    }
-
     pub(crate) fn document(&self) -> &Document {
         self.inputs.document.as_ref()
     }
 
     pub fn glyphs(&self) -> &[GlyphId] {
-        self.shaped.inline_content.glyphs()
+        &self.shaped.glyphs
     }
 
     #[cfg(test)]
@@ -648,47 +855,9 @@ impl ShapedDocument {
         );
         report.extend_prefixed(
             "ShapedDocument.inline_content",
-            self.shaped.inline_content.memory_usage_report(),
+            self.inputs.text.memory_usage_report(),
         );
-        report.extend_prefixed(
-            "ShapedDocument.glyph_metrics",
-            self.shaped.glyph_metrics.memory_usage_report(),
-        );
-        report.add(
-            "ShapedDocument.text_geometry",
-            self.shaped.text_geometry.memory_usage_bytes(),
-            self.shaped.inline_content.glyphs().len(),
-        );
-        report.add(
-            "ShapedDocument.font_metrics",
-            self.shaped.font_metrics.memory_usage_bytes(),
-            self.inputs.layout_tree.box_count(),
-        );
-        report.add(
-            "ShapedDocument.inline_plans",
-            self.shaped.inline_plans.memory_usage_bytes(),
-            self.shaped.inline_plans.len(),
-        );
-        report.add_slice_storage::<(u32, GlyphId)>(
-            "ShapedDocument.ellipsis_glyphs.storage",
-            self.shaped.ellipsis_glyphs.capacity(),
-            self.shaped.ellipsis_glyphs.len(),
-        );
-        report.add_slice_storage::<(u32, GlyphId)>(
-            "ShapedDocument.hyphen_glyphs.storage",
-            self.shaped.hyphen_glyphs.capacity(),
-            self.shaped.hyphen_glyphs.len(),
-        );
-        report.add_slice_storage::<(u32, LinkGlyphTarget)>(
-            "ShapedDocument.link_glyph_targets.storage",
-            self.shaped.link_glyph_targets.capacity(),
-            self.shaped.link_glyph_targets.len(),
-        );
-        report.add_slice_storage::<(u16, u32)>(
-            "ShapedDocument.anchor_glyphs.storage",
-            self.shaped.anchor_glyphs.capacity(),
-            self.shaped.anchor_glyphs.len(),
-        );
+        report.extend_prefixed("ShapedDocument", self.shaped.memory_usage_report(&mut FxHashSet::default()));
         report
     }
 
@@ -724,45 +893,25 @@ impl ShapedDocument {
         if self.shaped.resource_generation != glyph_shaper.glyph_resources().generation() {
             return Err(crate::ShapeError::resource_generation_mismatch());
         }
-        let base_shaped = self.shaped.clone();
-        let initial = self.layout_impl(constraints, image_metrics, None);
+        let candidate = LayoutCandidate::new(&self.inputs, &self.shaped, constraints, image_metrics, None, LayoutScratch::default());
         let shaping_seed = glyph_shaper.glyph_resources().snapshot();
-        let needs_append = !first_line_style_ranges(&initial).is_empty();
+        let needs_append = !first_line_style_ranges(&self.inputs, &candidate.layout_state).is_empty();
         let refine = |glyph_shaper: &mut _| {
-            refine_first_lines(
-                initial,
-                base_shaped.clone(),
-                shaping_seed,
-                constraints,
-                image_metrics,
-                glyph_shaper,
-            )
+            refine_first_lines(candidate, &self.inputs, &self.shaped, shaping_seed, constraints, image_metrics, glyph_shaper)
         };
-        if needs_append {
-            with_append_shaping(glyph_shaper, refine)
-        } else {
-            refine(glyph_shaper)
-        }
+        let candidate = if needs_append { with_append_shaping(glyph_shaper, refine)? } else { refine(glyph_shaper)? };
+        Ok(candidate.into_document(self.inputs, self.shaped, constraints, image_metrics))
     }
 
     fn layout_with_metrics_and_shaper_inner(
-        self,
-        constraints: LayoutConstraints,
-        image_metrics: &ImageMetrics,
+        self, constraints: LayoutConstraints, image_metrics: &ImageMetrics,
         glyph_shaper: &mut impl crate::GlyphShaper,
     ) -> Result<LaidOutDocument, crate::ShapeError> {
         debug_assert_eq!(self.shaped.resource_generation, glyph_shaper.glyph_resources().generation());
-        let base_shaped = self.shaped.clone();
-        let initial = self.layout_impl(constraints, image_metrics, None);
+        let candidate = LayoutCandidate::new(&self.inputs, &self.shaped, constraints, image_metrics, None, LayoutScratch::default());
         let shaping_seed = glyph_shaper.glyph_resources().snapshot();
-        refine_first_lines(
-            initial,
-            base_shaped.clone(),
-            shaping_seed,
-            constraints,
-            image_metrics,
-            glyph_shaper,
-        )
+        let candidate = refine_first_lines(candidate, &self.inputs, &self.shaped, shaping_seed, constraints, image_metrics, glyph_shaper)?;
+        Ok(candidate.into_document(self.inputs, self.shaped, constraints, image_metrics))
     }
 
     pub fn layout_with_timings_and_metrics(
@@ -786,60 +935,139 @@ impl ShapedDocument {
 
     pub(super) fn layout_impl_with_scratch(
         self, constraints: LayoutConstraints, image_metrics: &ImageMetrics,
-        timings: Option<&mut crate::LayoutTimings>, mut layout_scratch: LayoutScratch,
+        timings: Option<&mut crate::LayoutTimings>, layout_scratch: LayoutScratch,
     ) -> LaidOutDocument {
-        let mut layout_state = LayoutState::default();
-        let mut geometry = BoxGeometry::default();
-        let mut placement = crate::layout::PlacementState::default();
+        LayoutCandidate::new(&self.inputs, &self.shaped, constraints, image_metrics, timings, layout_scratch)
+            .into_document(self.inputs, self.shaped, constraints, image_metrics)
+    }
+}
+
+/// Candidate output owns only mutable layout state. Preparation and shaping
+/// are borrowed for the operation, including each first-line refinement pass.
+pub(crate) struct LayoutCandidate {
+    geometry: BoxGeometry,
+    placement: crate::layout::PlacementState,
+    pub(super) refinement: Option<FirstLineRefinement>,
+    pub(super) glyph_metrics_override: Option<GlyphMetrics>,
+    pub(super) layout_state: LayoutState,
+    layout_scratch: LayoutScratch,
+}
+
+impl LayoutCandidate {
+    fn new(
+        inputs: &PreparedInputs,
+        base: &ShapedText,
+        constraints: LayoutConstraints,
+        image_metrics: &ImageMetrics,
+        timings: Option<&mut crate::LayoutTimings>,
+        layout_scratch: LayoutScratch,
+    ) -> Self {
+        let mut candidate = Self {
+            geometry: BoxGeometry::default(),
+            placement: crate::layout::PlacementState::default(),
+            refinement: None,
+            glyph_metrics_override: None,
+            layout_state: LayoutState::default(),
+            layout_scratch,
+        };
+        candidate.relayout(inputs, base, constraints, image_metrics, timings);
+        candidate
+    }
+
+    pub(super) fn relayout(
+        &mut self,
+        inputs: &PreparedInputs,
+        base: &ShapedText,
+        constraints: LayoutConstraints,
+        image_metrics: &ImageMetrics,
+        timings: Option<&mut crate::LayoutTimings>,
+    ) {
         crate::layout::layout_with_timings(
-            layout_inputs(&self.inputs, &self.shaped, image_metrics),
+            layout_inputs(
+                inputs,
+                ShapedTextView::new(
+                    base,
+                    self.refinement.as_ref(),
+                    self.glyph_metrics_override.as_ref(),
+                ),
+                image_metrics,
+            ),
             crate::layout::LayoutOutputs {
-                geometry: &mut geometry,
-                state: &mut layout_state,
-                placement: &mut placement,
-                scratch: &mut layout_scratch,
+                geometry: &mut self.geometry,
+                state: &mut self.layout_state,
+                placement: &mut self.placement,
+                scratch: &mut self.layout_scratch,
             },
             constraints,
             timings,
         );
-        let mut laid_out = LaidOutDocument {
-            inputs: self.inputs,
-            geometry,
-            placement: std::sync::Arc::new(placement),
-            base_shaped: self.shaped.clone(),
-            shaped: self.shaped,
-            layout_state,
-            layout_scratch,
+    }
+
+    fn into_document(
+        self,
+        inputs: Arc<PreparedInputs>,
+        base_shaped: Box<ShapedText>,
+        constraints: LayoutConstraints,
+        image_metrics: &ImageMetrics,
+    ) -> LaidOutDocument {
+        let mut document = LaidOutDocument {
+            inputs,
+            base_shaped,
+            geometry: self.geometry,
+            placement: self.placement,
+            refinement: self.refinement,
+            glyph_metrics_override: self.glyph_metrics_override,
+            layout_state: self.layout_state,
+            layout_scratch: self.layout_scratch,
+            paint_colors: Vec::new(),
             last_constraints: constraints,
             last_image_metrics: image_metrics.clone(),
-            paint_colors: Arc::from([]),
         };
-        laid_out.rebuild_anchor_positions();
-        laid_out.rebuild_paint_colors();
-        laid_out
+        document.rebuild_anchor_positions();
+        document.rebuild_paint_colors();
+        document
+    }
+
+    fn publish(
+        self,
+        document: &mut LaidOutDocument,
+        constraints: LayoutConstraints,
+        image_metrics: &ImageMetrics,
+    ) {
+        document.geometry = self.geometry;
+        document.placement = self.placement;
+        document.refinement = self.refinement;
+        document.glyph_metrics_override = self.glyph_metrics_override;
+        document.layout_state = self.layout_state;
+        document.layout_scratch = self.layout_scratch;
+        document.last_constraints = constraints;
+        document.last_image_metrics = image_metrics.clone();
+        document.rebuild_anchor_positions();
+        document.rebuild_paint_colors();
     }
 }
 
 fn layout_inputs<'a>(
     inputs: &'a PreparedInputs,
-    shaped: &'a ShapedText,
+    shaped: ShapedTextView<'a>,
     image_metrics: &'a ImageMetrics,
 ) -> crate::layout::LayoutInputs<'a> {
     crate::layout::LayoutInputs {
         document: &inputs.document,
         styles: &inputs.styles,
         topology: &inputs.layout_tree,
-        inline_content: &shaped.inline_content,
-        glyph_metrics: &shaped.glyph_metrics,
-        font_metrics: &shaped.font_metrics,
-        text_geometry: Some(&shaped.text_geometry),
-        ellipsis_glyphs: &shaped.ellipsis_glyphs,
-        hyphen_glyphs: &shaped.hyphen_glyphs,
-        inline_plans: &shaped.inline_plans,
+        inline_content: inputs.text.content(),
+        glyphs: shaped.glyphs,
+        glyph_metrics: shaped.glyph_metrics,
+        font_metrics: &shaped.shared.font_metrics,
+        text_geometry: Some(shaped.text_geometry),
+        ellipsis_glyphs: &shaped.shared.ellipsis_glyphs,
+        hyphen_glyphs: &shaped.shared.hyphen_glyphs,
+        inline_plan_generation: shaped.inline_plan_generation,
         image_metrics,
         paint: &inputs.paint,
-        text_style_ranges: &shaped.paint_ranges,
-        resource_generation: &shaped.resource_generation,
+        text_style_ranges: shaped.paint_ranges,
+        resource_generation: shaped.resource_generation,
     }
 }
 
@@ -848,20 +1076,20 @@ fn layout_inputs<'a>(
 /// No public constructor exists: values can only be produced from a
 /// [`ShapedDocument`]. Relayout mutates only layout-owned data, retaining the
 /// immutable shaping inputs and reusing top-level layout buffers.
-#[derive(Clone)]
 pub struct LaidOutDocument {
-    pub(super) inputs: std::sync::Arc<PreparedInputs>,
+    pub(super) inputs: Arc<PreparedInputs>,
     pub(super) geometry: BoxGeometry,
-    /// Authoritative local coordinates and the retained placement tree. The
-    /// renderer-facing geometry and fragments remain absolute snapshots.
-    pub(super) placement: std::sync::Arc<crate::layout::PlacementState>,
+    /// Retained placement relationships. Publication updates the owning
+    /// geometry and fragment coordinates in place.
+    pub(super) placement: crate::layout::PlacementState,
     /// Viewport-independent shaping retained so a width change can recompute
     /// the dynamic extent of `::first-line` without accumulating old styles.
-    pub(super) base_shaped: std::sync::Arc<ShapedText>,
-    pub(super) shaped: std::sync::Arc<ShapedText>,
+    pub(super) base_shaped: Box<ShapedText>,
+    pub(super) refinement: Option<FirstLineRefinement>,
+    pub(super) glyph_metrics_override: Option<GlyphMetrics>,
     pub(super) layout_state: LayoutState,
     pub(super) layout_scratch: LayoutScratch,
-    pub(super) paint_colors: Arc<[PaintColorRun]>,
+    pub(super) paint_colors: Vec<PaintColorRun>,
     pub(super) last_constraints: LayoutConstraints,
     pub(super) last_image_metrics: ImageMetrics,
 }
@@ -879,13 +1107,85 @@ pub(crate) struct PaintColorRun {
 }
 
 impl LaidOutDocument {
+    /// Move the retained shape out when starting an independent layout pass.
+    /// Glyph storage keeps its address; prior layout buffers are released.
+    pub fn into_shaped(self) -> ShapedDocument {
+        ShapedDocument { inputs: self.inputs, shaped: self.base_shaped }
+    }
+
+    /// Borrow source text from this document's sole preparation owner.
+    pub fn visible_text_runs(&self) -> impl Iterator<Item = (&str, Option<&ContentLanguage>)> {
+        visible_text_runs(&self.inputs)
+    }
+
+    pub fn note_ids(&self) -> Vec<&str> { note_ids(&self.inputs) }
+
+    /// Explicitly detached note documents share only immutable DOM/styles.
+    pub fn scoped_to_element_id(&self, id: &str) -> Option<PreparedDocument> {
+        scoped_to_element_id(&self.inputs, id)
+    }
+
+    /// Replace backend shaping while retaining preparation. Candidate layout
+    /// borrows both inputs and the new shape; publication moves the shape once.
+    pub fn reshape_and_layout_with_metrics_and_shaper(
+        &mut self, constraints: LayoutConstraints, image_metrics: &ImageMetrics,
+        glyph_shaper: &mut impl crate::GlyphShaper,
+    ) -> Result<(), crate::ShapeError> {
+        let (shaped, candidate) = shape_and_layout_candidate(&self.inputs, constraints, image_metrics, glyph_shaper)?;
+        self.base_shaped = shaped;
+        candidate.publish(self, constraints, image_metrics);
+        Ok(())
+    }
+
+    /// Update a palette without manufacturing another prepared-stage owner.
+    pub fn repaint_with_reader_overrides(&mut self, overrides: &ReaderStyleOverrides) -> Result<(), crate::ShapeError> {
+        let paint = self.inputs.paint.with_overrides(&self.inputs.styles, &self.inputs.layout_tree, overrides);
+        Arc::get_mut(&mut self.inputs).ok_or_else(crate::ShapeError::document_is_shared)?.paint = Arc::new(paint);
+        self.rebuild_paint_colors();
+        crate::layout::engine::repaint(layout_inputs(&self.inputs, ShapedTextView::new(&self.base_shaped, self.refinement.as_ref(), self.glyph_metrics_override.as_ref()), &self.last_image_metrics), &mut self.geometry, &mut self.layout_state, self.last_constraints);
+        Ok(())
+    }
+
+    /// Stage a palette together with fallible shaping/layout and restore it on
+    /// failure. The previous published geometry remains intact until commit.
+    pub fn update_with_reader_overrides(
+        &mut self, overrides: &ReaderStyleOverrides, constraints: LayoutConstraints,
+        image_metrics: &ImageMetrics, reshape: bool, glyph_shaper: &mut impl crate::GlyphShaper,
+    ) -> Result<(), crate::ShapeError> {
+        let paint = self.inputs.paint.with_overrides(&self.inputs.styles, &self.inputs.layout_tree, overrides);
+        let owner = Arc::get_mut(&mut self.inputs).ok_or_else(crate::ShapeError::document_is_shared)?;
+        let previous = std::mem::replace(&mut owner.paint, Arc::new(paint));
+        let result = if reshape { self.reshape_and_layout_with_metrics_and_shaper(constraints, image_metrics, glyph_shaper) }
+            else { self.relayout_with_metrics_and_shaper(constraints, image_metrics, glyph_shaper) };
+        if result.is_err() {
+            Arc::get_mut(&mut self.inputs).expect("candidate borrows preparation").paint = previous;
+        }
+        result
+    }
+
+    pub fn reprepare_and_layout(
+        &mut self, root_font_size: RootFontSize, note_flow: NoteFlow, overrides: &ReaderStyleOverrides,
+        resolve: impl FnOnce(&Document) -> ComputedStyles, constraints: LayoutConstraints,
+        image_metrics: &ImageMetrics, glyph_shaper: &mut impl crate::GlyphShaper,
+    ) -> Result<(), crate::ShapeError> {
+        let (shaped, candidate) = with_reprepared(&mut self.inputs, root_font_size, note_flow, overrides, resolve, |inputs| {
+            shape_and_layout_candidate(inputs, constraints, image_metrics, glyph_shaper)
+        })?;
+        self.base_shaped = shaped;
+        candidate.publish(self, constraints, image_metrics);
+        Ok(())
+    }
+
+    pub(super) fn shaped(&self) -> ShapedTextView<'_> {
+        ShapedTextView::new(&self.base_shaped, self.refinement.as_ref(), self.glyph_metrics_override.as_ref())
+    }
     /// Resolve paint over retained geometry, including specialized formatting
     /// contexts. A different prepared geometry epoch must be laid out first.
     pub fn repaint_from(&mut self, prepared: &PreparedDocument) -> bool {
-        if !Arc::ptr_eq(&self.shaped.geometry_tree, &prepared.inputs.layout_tree) { return false; }
+        if !Arc::ptr_eq(&self.base_shaped.geometry_tree, &prepared.inputs.layout_tree) { return false; }
         self.inputs = prepared.inputs.clone();
         self.rebuild_paint_colors();
-        crate::layout::engine::repaint(layout_inputs(&self.inputs, &self.shaped, &self.last_image_metrics), &mut self.geometry, &mut self.layout_state, self.last_constraints);
+        crate::layout::engine::repaint(layout_inputs(&self.inputs, ShapedTextView::new(&self.base_shaped, self.refinement.as_ref(), self.glyph_metrics_override.as_ref()), &self.last_image_metrics), &mut self.geometry, &mut self.layout_state, self.last_constraints);
         true
     }
 
@@ -904,7 +1204,7 @@ impl LaidOutDocument {
         &mut self, prepared: &PreparedDocument, constraints: LayoutConstraints,
         image_metrics: &ImageMetrics, glyph_shaper: &mut impl crate::GlyphShaper,
     ) -> Result<(), crate::ShapeError> {
-        assert!(Arc::ptr_eq(&self.shaped.geometry_tree, &prepared.inputs.layout_tree));
+        assert!(Arc::ptr_eq(&self.base_shaped.geometry_tree, &prepared.inputs.layout_tree));
         let previous_inputs = self.inputs.clone();
         self.inputs = prepared.inputs.clone();
         let result = self.relayout_with_metrics_and_shaper(constraints, image_metrics, glyph_shaper);
@@ -918,29 +1218,29 @@ impl LaidOutDocument {
             let details = &mut self.layout_state.line_output.line_details[detail_idx.get() as usize - 1];
             if details.paint_color.is_some() {
                 let root = crate::shaping::whitespace_context_root(&self.inputs.layout_tree, line.owner_box_idx as usize);
-                details.paint_color = crate::shaping::first_line_style_for_inline_root(&self.inputs.document, &self.inputs.styles, &self.inputs.layout_tree, &self.shaped.inline_content, root)
+                details.paint_color = crate::shaping::first_line_style_for_inline_root(&self.inputs.document, &self.inputs.styles, &self.inputs.layout_tree, self.inputs.text.content(), root)
                     .map(|indices| self.inputs.paint.resolve(&self.inputs.styles, indices, root).foreground);
             }
         }
 
         if self.inputs.paint.is_default() {
             let had_updates = !self.paint_colors.is_empty();
-            self.paint_colors = Arc::from([]);
+            self.paint_colors.clear();
             if had_updates {
-                prepare_text_paint(layout_inputs(&self.inputs, &self.shaped, &self.last_image_metrics), &mut self.layout_state, &[]);
+                prepare_text_paint(layout_inputs(&self.inputs, ShapedTextView::new(&self.base_shaped, self.refinement.as_ref(), self.glyph_metrics_override.as_ref()), &self.last_image_metrics), &mut self.layout_state, &[]);
             }
             return;
         }
         let mut colors: Vec<PaintColorRun> = Vec::new();
-        for item in self.shaped.inline_content.inline_items() {
+        for item in self.inputs.text.content().inline_items() {
             let (InlineItemKind::Text { glyphs } | InlineItemKind::Marker { glyphs }) = &item.kind else { continue; };
             let base = self.inputs.layout_tree.get_box_style_indices(item.box_idx as usize).unwrap_or_else(|| self.inputs.styles.default_indices());
             let mut start = glyphs.start;
             while start < glyphs.end {
                 let (override_style, mut end) = self.inputs.text.first_letter_styles().segment(start, glyphs.end);
-                let index = self.shaped.paint_ranges.partition_point(|range| range.glyphs.end <= start);
+                let index = self.shaped().paint_ranges.partition_point(|range| range.glyphs.end <= start);
                 let mut style = override_style.unwrap_or(base);
-                if let Some(range) = self.shaped.paint_ranges.get(index) {
+                if let Some(range) = self.shaped().paint_ranges.get(index) {
                     if range.glyphs.start <= start { style = range.style; end = end.min(range.glyphs.end); }
                     else { end = end.min(range.glyphs.start); }
                 }
@@ -957,8 +1257,8 @@ impl LaidOutDocument {
                 start = end;
             }
         }
-        self.paint_colors = colors.into();
-        prepare_text_paint(layout_inputs(&self.inputs, &self.shaped, &self.last_image_metrics), &mut self.layout_state, &self.paint_colors);
+        self.paint_colors = colors;
+        prepare_text_paint(layout_inputs(&self.inputs, ShapedTextView::new(&self.base_shaped, self.refinement.as_ref(), self.glyph_metrics_override.as_ref()), &self.last_image_metrics), &mut self.layout_state, &self.paint_colors);
     }
 
     /// Whether changing only the viewport height can alter document geometry.
@@ -988,12 +1288,23 @@ impl LaidOutDocument {
         })
     }
 
+    /// Borrow the published output without copying any document storage.
+    /// A view cannot outlive a mutation of its owning layout:
+    ///
+    /// ```compile_fail,E0502
+    /// use html_layout::{LaidOutDocument, LayoutConstraints};
+    /// fn resize(document: &mut LaidOutDocument, constraints: LayoutConstraints) {
+    ///     let view = document.render_view();
+    ///     document.relayout(constraints);
+    ///     let _ = view.text().line_count();
+    /// }
+    /// ```
     pub fn render_view(&self) -> RenderView<'_> {
         RenderView { doc: self }
     }
 
-    pub(super) fn text_geometry(&self) -> &crate::shaping::ShapedTextGeometry {
-        &self.shaped.text_geometry
+    pub(super) fn text_geometry(&self) -> crate::shaping::TextGeometryView<'_> {
+        self.shaped().text_geometry
     }
 
     pub fn relayout(&mut self, constraints: LayoutConstraints) {
@@ -1039,39 +1350,23 @@ impl LaidOutDocument {
             // line output, placement and scratch storage instead of allocating
             // a private refinement candidate for every viewport change.
             let resources = glyph_shaper.glyph_resources();
-            if resources.len() > self.shaped.glyph_metrics.len() {
+            if resources.len() > self.shaped().glyph_metrics.len() {
                 // Notes and renderer-owned auxiliary glyphs can have appended
                 // metrics since the document was shaped. Keep them addressable.
-                std::sync::Arc::make_mut(&mut self.shaped).glyph_metrics = resources.snapshot();
+                self.glyph_metrics_override = Some(resources.snapshot());
             }
             self.relayout_with_metrics(constraints, image_metrics);
             return Ok(());
         }
-        let candidate = ShapedDocument {
-            inputs: self.inputs.clone(),
-            shaped: self.base_shaped.clone(),
-        }
-        .layout_impl_with_scratch(constraints, image_metrics, None, std::mem::take(&mut self.layout_scratch));
+        let candidate = LayoutCandidate::new(&self.inputs, &self.base_shaped, constraints, image_metrics,
+            None, std::mem::take(&mut self.layout_scratch));
         let shaping_seed = glyph_shaper.glyph_resources().snapshot();
-        let needs_append = !first_line_style_ranges(&candidate).is_empty();
+        let needs_append = !first_line_style_ranges(&self.inputs, &candidate.layout_state).is_empty();
         let refine = |glyph_shaper: &mut _| {
-            refine_first_lines(
-                candidate,
-                self.base_shaped.clone(),
-                shaping_seed,
-                constraints,
-                image_metrics,
-                glyph_shaper,
-            )
+            refine_first_lines(candidate, &self.inputs, &self.base_shaped, shaping_seed, constraints, image_metrics, glyph_shaper)
         };
-        let mut candidate = if needs_append {
-            with_append_shaping(glyph_shaper, refine)?
-        } else {
-            refine(glyph_shaper)?
-        };
-        candidate.last_constraints = constraints;
-        candidate.last_image_metrics = image_metrics.clone();
-        *self = candidate;
+        let candidate = if needs_append { with_append_shaping(glyph_shaper, refine)? } else { refine(glyph_shaper)? };
+        candidate.publish(self, constraints, image_metrics);
         Ok(())
     }
 
@@ -1094,11 +1389,11 @@ impl LaidOutDocument {
         timings: Option<&mut crate::LayoutTimings>,
     ) {
         crate::layout::layout_with_timings(
-            layout_inputs(&self.inputs, &self.shaped, image_metrics),
+            layout_inputs(&self.inputs, ShapedTextView::new(&self.base_shaped, self.refinement.as_ref(), self.glyph_metrics_override.as_ref()), image_metrics),
             crate::layout::LayoutOutputs {
                 geometry: &mut self.geometry,
                 state: &mut self.layout_state,
-                placement: std::sync::Arc::make_mut(&mut self.placement),
+                placement: &mut self.placement,
                 scratch: &mut self.layout_scratch,
             },
             constraints,
@@ -1162,19 +1457,22 @@ impl LaidOutDocument {
         &self.inputs.document
     }
 
+    #[cfg(test)]
     pub(crate) fn glyph_metrics(&self) -> &GlyphMetrics {
-        &self.shaped.glyph_metrics
+        self.shaped().glyph_metrics
     }
 
     pub(crate) fn link_href_for_glyph(&self, glyph_idx: u32) -> Option<u16> {
-        self.shaped
+        self.base_shaped
+            .shared
             .link_glyph_targets
             .get(&glyph_idx)
             .map(|target| target.href)
     }
 
     pub(crate) fn glyph_is_note_reference(&self, glyph_idx: u32) -> bool {
-        self.shaped
+        self.base_shaped
+            .shared
             .link_glyph_targets
             .get(&glyph_idx)
             .is_some_and(|target| target.note_reference)
@@ -1189,39 +1487,37 @@ impl LaidOutDocument {
     }
 
     pub(crate) fn anchor_glyph(&self, id_idx: u16) -> Option<u32> {
-        self.shaped.anchor_glyphs.get(&id_idx).copied()
+        self.base_shaped.shared.anchor_glyphs.get(&id_idx).copied()
     }
 
     pub(crate) fn anchor_glyphs(&self) -> &FxHashMap<u16, u32> {
-        &self.shaped.anchor_glyphs
+        &self.base_shaped.shared.anchor_glyphs
     }
 
     /// Refreshes the immutable render snapshot after the backend registers
     /// auxiliary glyphs in its active resource store.
     pub fn refresh_glyph_metrics_from(&mut self, glyph_shaper: &mut impl crate::GlyphShaper) -> Result<(), crate::ShapeError> {
-        if self.shaped.resource_generation != glyph_shaper.glyph_resources().generation() {
+        if self.base_shaped.resource_generation != glyph_shaper.glyph_resources().generation() {
             return Err(crate::ShapeError::resource_generation_mismatch());
         }
-        std::sync::Arc::make_mut(&mut self.shaped).glyph_metrics =
-            glyph_shaper.glyph_resources().snapshot();
+        self.glyph_metrics_override = Some(glyph_shaper.glyph_resources().snapshot());
         Ok(())
     }
 
     #[cfg(test)]
-    pub(crate) fn glyphs(&self) -> &[GlyphId] {
-        self.shaped.inline_content.glyphs()
+    pub(crate) fn glyphs(&self) -> crate::shaping::GlyphSlice<'_> {
+        self.shaped().glyphs
     }
 
     /// Returns the DOM text node and UTF-16 source offset for the glyph.
     pub(crate) fn get_dom_node_for_glyph(&self, glyph_idx: u32) -> Option<(u32, usize)> {
-        for run in self.shaped.inline_content.inline_items() {
+        for run in self.inputs.text.content().inline_items() {
             if let InlineItemKind::Text { glyphs } = &run.kind
                 && glyphs.contains(&glyph_idx)
             {
                 let node_idx = run.dom_text_node?;
                 let source_offset =
-                    self.shaped
-                        .inline_content
+                    self.inputs.text.content()
                         .glyph_source_offset(glyph_idx as usize)? as usize;
                 return Some((node_idx, source_offset));
             }
@@ -1230,8 +1526,7 @@ impl LaidOutDocument {
     }
 
     pub(crate) fn glyph_source_offset(&self, glyph_idx: u32) -> Option<u32> {
-        self.shaped
-            .inline_content
+        self.inputs.text.content()
             .glyph_source_offset(glyph_idx as usize)
     }
 
@@ -1257,7 +1552,8 @@ impl LaidOutDocument {
         let indices = self
             .box_style_indices(box_idx)
             .unwrap_or_else(|| self.inputs.styles.default_indices());
-        self.shaped
+        self.base_shaped
+            .shared
             .font_metrics
             .used_style(&self.inputs.styles, indices, box_idx)
     }
@@ -1327,42 +1623,35 @@ impl LaidOutDocument {
         );
         report.extend_prefixed(
             "LaidOutDocument.inline_content",
-            self.shaped.inline_content.memory_usage_report(),
+            self.inputs.text.memory_usage_report(),
         );
         report.extend_prefixed(
             "LaidOutDocument.layout_state",
             self.layout_state.memory_usage_report(),
         );
-        report.extend_prefixed(
-            "LaidOutDocument.glyph_metrics",
-            self.glyph_metrics().memory_usage_report(),
-        );
-        report.add_slice_storage::<TextPaintRange>("LaidOutDocument.text_paint_ranges", self.shaped.paint_ranges.len(), self.shaped.paint_ranges.len());
+        let mut seen = FxHashSet::default();
+        report.extend_prefixed("LaidOutDocument", self.base_shaped.memory_usage_report(&mut seen));
+        if let Some(refinement) = &self.refinement {
+            report.extend_prefixed("LaidOutDocument.refinement", refinement.memory_usage_report(&mut seen));
+        }
+        if let Some(metrics) = &self.glyph_metrics_override {
+            report.extend_prefixed("LaidOutDocument.auxiliary_metrics", metrics.memory_usage_report_with_shared(&mut seen));
+        }
         report.add_slice_storage::<PaintColorRun>(
             "LaidOutDocument.paint_colors.storage",
-            self.paint_colors.len(), self.paint_colors.len(),
+            self.paint_colors.capacity(), self.paint_colors.len(),
         );
         report.extend_prefixed("LaidOutDocument.paragraph_layouts", self.layout_scratch.paragraph_layout_memory_report());
-        report.add(
+        report.extend_prefixed(
             "LaidOutDocument.inline_plans",
-            self.shaped.inline_plans.memory_usage_bytes(),
-            self.shaped.inline_plans.len(),
+            self.layout_scratch.inline_plan_memory_report(),
         );
         report.add(
             "LaidOutDocument.rollback_image_metrics",
             self.last_image_metrics.memory_usage_bytes(),
             self.last_image_metrics.len(),
         );
-        report.add_slice_storage::<(u32, LinkGlyphTarget)>(
-            "LaidOutDocument.link_glyph_targets.storage",
-            self.shaped.link_glyph_targets.capacity(),
-            self.shaped.link_glyph_targets.len(),
-        );
-        report.add_slice_storage::<(u16, u32)>(
-            "LaidOutDocument.anchor_glyphs.storage",
-            self.shaped.anchor_glyphs.capacity(),
-            self.shaped.anchor_glyphs.len(),
-        );
+
         report
     }
 
@@ -1370,3 +1659,87 @@ impl LaidOutDocument {
         self.memory_usage_report().total_bytes()
     }
 }
+
+fn visible_text_runs(inputs: &PreparedInputs) -> impl Iterator<Item = (&str, Option<&ContentLanguage>)> {
+        let document = inputs.document.as_ref();
+        let styles = inputs.styles.as_ref();
+        let mut pending: Vec<_> = document.dom_root().into_iter().collect();
+        std::iter::from_fn(move || {
+            while let Some(node) = pending.pop() {
+                match document.node_ref(node) {
+                    Some(NodeRef::Element(element)) => {
+                        if styles
+                            .style_for_node(node)
+                            .and_then(|style| styles.box_model_style(style))
+                            .is_some_and(|style| style.display == Display::None)
+                        {
+                            continue;
+                        }
+                        let first_child = pending.len();
+                        pending.extend(element.children());
+                        pending[first_child..].reverse();
+                    }
+                    Some(NodeRef::Text(text)) => {
+                        let Some(style) = text
+                            .parent()
+                            .and_then(|parent| styles.style_for_node(parent))
+                            .and_then(|style| styles.text_style(style))
+                        else {
+                            continue;
+                        };
+                        if style.visibility != Visibility::Visible {
+                            continue;
+                        }
+                        let language = style.language.and_then(|language| styles.language(language));
+                        return Some((text.text(), language));
+                    }
+                    None => {}
+                }
+            }
+            None
+        })
+    }
+
+fn scoped_to_element_id(inputs: &PreparedInputs, id: &str) -> Option<PreparedDocument> {
+        let document = &inputs.document;
+        let root = document
+            .node_ids()
+            .find(|node| document.get_dom_id(*node) == Some(id))?;
+        document.element_ref(root)?;
+
+        let mut layout_tree = LayoutTree::default();
+        let mut inline_content = InlineContent::default();
+        crate::layout::build_layout_inputs_from(
+            document,
+            &inputs.styles,
+            &mut layout_tree,
+            &mut inline_content,
+            NoteFlow::InFlow,
+            root,
+        );
+        let text = Arc::new(PreparedText::new(document, &inputs.styles, &layout_tree, inline_content));
+        let paint = Arc::new(inputs.paint.for_tree(document, &inputs.styles, &layout_tree));
+        Some(PreparedDocument {
+            inputs: Arc::new(PreparedInputs {
+                document: Arc::clone(&inputs.document),
+                styles: Arc::clone(&inputs.styles),
+                layout_tree: Arc::new(layout_tree),
+                text,
+                note_flow: NoteFlow::InFlow,
+                paint,
+            }),
+        })
+    }
+
+fn note_ids(inputs: &PreparedInputs) -> Vec<&str> {
+        let document = &inputs.document;
+        document
+            .node_ids()
+            .filter(|node| {
+                document
+                    .element_ref(*node)
+                    .is_some_and(element_is_note_target)
+            })
+            .filter_map(|node| document.get_dom_id(node))
+            .collect()
+    }

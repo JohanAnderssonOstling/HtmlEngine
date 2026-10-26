@@ -10,6 +10,29 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
     let parent_font_weight = context.parent_font_weight;
     let parent_color = context.parent_color;
     match property {
+        Property::LineBreak(value) => {
+            use html_style_model::LineBreak;
+            use lightningcss::properties::text::LineBreak as CssLineBreak;
+            style.text.line_break = match value {
+                CssLineBreak::Auto => LineBreak::Auto,
+                CssLineBreak::Loose => LineBreak::Loose,
+                CssLineBreak::Normal => LineBreak::Normal,
+                CssLineBreak::Strict => LineBreak::Strict,
+                CssLineBreak::Anywhere => LineBreak::Anywhere,
+            };
+        }
+        Property::UnicodeBidi(value) => {
+            use html_style_model::UnicodeBidi;
+            use lightningcss::properties::text::UnicodeBidi as CssUnicodeBidi;
+            style.box_model.unicode_bidi = match value {
+                CssUnicodeBidi::Normal => UnicodeBidi::Normal,
+                CssUnicodeBidi::Embed => UnicodeBidi::Embed,
+                CssUnicodeBidi::Isolate => UnicodeBidi::Isolate,
+                CssUnicodeBidi::BidiOverride => UnicodeBidi::BidiOverride,
+                CssUnicodeBidi::IsolateOverride => UnicodeBidi::IsolateOverride,
+                CssUnicodeBidi::Plaintext => UnicodeBidi::Plaintext,
+            };
+        }
         // Text properties
         Property::LineHeight(lh) => {
             let Some((line_height, x_height_px)) = checked_line_height_components(

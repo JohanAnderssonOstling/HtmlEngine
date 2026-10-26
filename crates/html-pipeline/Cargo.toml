@@ -1,11 +1,16 @@
 [package]
+license.workspace = true
 name = "html-pipeline"
 version = "0.1.0"
 edition = "2024"
 publish = false
 
+[features]
+profiling = ["html-layout/profiling"]
+
 [dependencies]
 html-dom = { path = "../html-dom" }
+html-style-model = { path = "../html-style-model" }
 html-style = { path = "../03-html-style" }
 html-parse = { path = "../02-html-parse" }
 html-layout = { path = "../04-html-layout" }

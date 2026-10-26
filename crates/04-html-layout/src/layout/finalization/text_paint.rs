@@ -8,6 +8,7 @@ use crate::layout::inline_reader::InlineReader;
 use crate::layout_model::{GlyphAdvanceRun, GlyphOffsetRun, Line, LineDetails, LineTextFragment, PreparedTextRunFragment};
 
 pub(super) fn prepare_line_text_runs(text: &InlineReader<'_>, fragments: &mut FragmentWriter<'_>, colors: &[PaintColorRun]) {
+    profile_scope!("finalize.text_paint_runs");
     let output = &mut fragments.state_mut().line_output;
     output.prepared_text_run_fragments.clear();
     for line_idx in 0..output.lines.len() {
@@ -63,12 +64,10 @@ fn prepare_fragment(
         offsets.partition_point(|candidate| candidate.range.end <= source_range.start);
     let mut advance_index =
         advances.partition_point(|candidate| candidate.range.end <= source_range.start);
-    let authoritative_runs = text.authoritative_runs();
-    let first_run =
-        authoritative_runs.partition_point(|run| run.source_range.end <= source_range.start);
+    let authoritative_runs = text.authoritative_runs(source_range.clone())?;
 
     let mut text_cursor = text.cursor();
-    for run in &authoritative_runs[first_run..] {
+    for run in authoritative_runs {
         if run.source_range.start >= source_range.end {
             break;
         }
@@ -81,8 +80,11 @@ fn prepare_fragment(
             return None;
         }
 
-        let local_start = start - run.source_range.start;
+        let local_start = start - run.source_range.start + run.run_offset;
         let mut natural_x = f64::from(*run.caret_stops.get(local_start as usize)?);
+        let rtl_origin_x = (text.bidi_level(start) % 2 == 1).then(|| {
+            x - f64::from(run.caret_stops[local_start as usize].min(run.caret_stops[(end - run.source_range.start + run.run_offset) as usize]))
+        });
         let mut segment: Option<(u32, u32, Point, Option<u32>)> = None;
 
         for index in start..end {
@@ -112,11 +114,14 @@ fn prepare_fragment(
                 .map(|candidate| f64::from(candidate.advance));
 
             let local_index = local_start + index - start;
+            if text.bidi_level(index) % 2 == 1 {
+                natural_x = f64::from(*run.caret_stops.get(local_index as usize)?).min(f64::from(*run.caret_stops.get(local_index as usize + 1)?));
+            }
             let run_origin = Point::new(
-                x - natural_x,
+                rtl_origin_x.unwrap_or(x - natural_x),
                 line.baseline - f64::from(run.ascent) - offset,
             );
-            let paints = advance_override.is_none() && metric.ch() != '\u{00ad}';
+            let paints = advance_override.is_none() && metric.ch() != '\u{00ad}' && !crate::shaping::is_bidi_control(metric.ch());
             let paint_index = colors.partition_point(|run| run.glyphs.end <= index);
             let color = colors.get(paint_index).filter(|run| run.glyphs.contains(&index)).map(|run| run.color);
             if paints {
@@ -135,7 +140,7 @@ fn prepare_fragment(
 
             let natural_advance = f64::from(text_cursor.text_advance(index as usize, metric.advance()));
             let tracking =
-                if index + 1 < line.glyphs.end && text.is_cluster_boundary((index + 1) as usize) {
+                if !crate::shaping::is_bidi_control(metric.ch()) && index + 1 < line.glyphs.end && text.is_cluster_boundary((index + 1) as usize) {
                     line.letter_spacing
                 } else {
                     0.0
@@ -166,7 +171,7 @@ fn flush_segment(run: crate::TextRunId, segment: &mut Option<(u32, u32, Point, O
 
 /// Refresh native paint slices after a color update, without rebuilding lines.
 pub(crate) fn prepare_text_paint(inputs: crate::layout::LayoutInputs<'_>, state: &mut crate::layout_model::LayoutState, colors: &[PaintColorRun]) {
-    let text = InlineReader::new(inputs.inline_content, inputs.glyph_metrics, inputs.text_geometry, inputs.ellipsis_glyphs, inputs.hyphen_glyphs);
+    let text = InlineReader::new(inputs.inline_content, inputs.glyphs, inputs.glyph_metrics, inputs.text_geometry, inputs.ellipsis_glyphs, inputs.hyphen_glyphs);
     let mut fragments = FragmentWriter::new(state, Vec::new(), Vec::new());
     prepare_line_text_runs(&text, &mut fragments, colors);
 }

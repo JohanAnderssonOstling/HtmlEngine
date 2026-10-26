@@ -1,10 +1,10 @@
 #[cfg(test)]
 mod tests {
-    use super::{BreakKind, InlineToken, InlineTokenKind, InlineTokenMetrics, InlineTokens, TokenWrap, automatic_hyphen_fragments_are_long_enough, vertical_align_offset};
+    use super::{BreakKind, InlineToken, InlineTokenKind, InlineTokenMetrics, InlineTokens, InlineVerticalAlign, TokenWrap, automatic_hyphen_fragments_are_long_enough, hyphenation_language, vertical_align_offset};
     use crate::parser::DocumentFactory;
     use crate::test_support::TestGlyphShaper as GlyphCache;
     use crate::{FontSlant, GlyphId, GlyphShaper, LaidOutDocument, ShapeError, ShapedTextRun, TextRunShapeRequest, TextShapeRequest};
-    use html_style_model::{VerticalAlignValue, WhiteSpace};
+    use html_style_model::{Hyphens, VerticalAlignValue, WhiteSpace};
     use lightningcss::stylesheet::ParserOptions;
     use std::fs;
     use std::sync::Arc;
@@ -327,6 +327,59 @@ mod tests {
         assert!((candidate_line.baseline() - reference_line.baseline()).abs() < 1e-5, "candidate={candidate_line:?}, reference={reference_line:?}");
     }
 
+    fn layout_with_word_spacing(text: &str, css: &str, width: f64, factor: f32, policy: crate::TextCompositionPolicy) -> LaidOutDocument {
+        let html = format!("<html><body style='margin:0'><p style='margin:0;{css}'>{text}</p></body></html>");
+        let document = html_parse::parse_dom_document(&html).unwrap();
+        let (document, styles) = html_style::style_document(document, &[]).into_parts();
+        let styles = styles.with_reader_overrides(&document, &crate::ReaderStyleOverrides { word_spacing_factor: Some(factor), ..Default::default() }).unwrap();
+        let count = text.chars().count();
+        let mut shaper = NativeGeometryShaper { fallback: GlyphCache::new(), advances: vec![2.0; count], boundaries: vec![true; count + 1], exact_line_advance: None, measured_texts: Vec::new() };
+        crate::PreparedDocument::try_new(document, styles).unwrap().shape(&mut shaper).unwrap()
+            .layout(crate::LayoutConstraints::new(width, 16.0).unwrap().with_text_composition_policy(policy))
+    }
+
+    #[test]
+    fn reader_word_spacing_scales_natural_and_authored_gaps_and_publishes_geometry() {
+        for (factor, expected) in [(0.5, 2.0), (1.0, 4.0), (1.5, 6.0), (2.0, 8.0)] {
+            let document = layout_with_word_spacing("a a", "word-spacing:2px", 100.0, factor, crate::TextCompositionPolicy::WebCompatible);
+            let text = document.render_view().text();
+            let fragments = text.line_text_fragments(0).unwrap().collect::<Vec<_>>();
+            let last = fragments.iter().find(|fragment| fragment.glyphs().contains(&2)).unwrap();
+            assert!((last.offset_x() - (2.0 + expected)).abs() < 1.0e-6, "the next word's painted origin must use the scaled gap: {factor}");
+            if factor != 1.0 {
+                let space = text.line_glyph_advances(0).unwrap().iter().find(|run| run.range().contains(&1)).unwrap();
+                assert!((space.advance() - expected).abs() < 1.0e-6, "selection must use the painted gap width");
+            }
+        }
+    }
+
+    #[test]
+    fn reader_word_spacing_changes_wraps_and_scales_nonbreaking_spaces() {
+        let normal = layout_with_word_spacing("a a a", "text-align:left", 6.5, 1.0, crate::TextCompositionPolicy::WebCompatible);
+        let wider = layout_with_word_spacing("a a a", "text-align:left", 6.5, 2.0, crate::TextCompositionPolicy::WebCompatible);
+        assert_eq!(line_text(&normal, 0), "a a");
+        assert_eq!(line_text(&wider, 0), "a");
+        let nonbreaking = layout_with_word_spacing("a\u{00a0}a", "text-align:left", 6.5, 2.0, crate::TextCompositionPolicy::WebCompatible);
+        assert_eq!(nonbreaking.line_count(), 1, "a wider nonbreaking space must remain nonbreaking");
+        assert_eq!(nonbreaking.render_view().text().line_glyph_advances(0).unwrap().iter().next().unwrap().advance(), 4.0);
+    }
+
+    #[test]
+    fn reader_word_spacing_justifies_scaled_gaps_and_keeps_last_lines_natural() {
+        for policy in [crate::TextCompositionPolicy::WebCompatible, crate::TextCompositionPolicy::BookOptimized] {
+            let document = layout_with_word_spacing("a a a", "text-align:justify", 7.0, 1.2, policy);
+            assert_eq!(line_text(&document, 0), "a a");
+            let text = document.render_view().text();
+            let space = text.line_glyph_advances(0).unwrap().iter().find(|run| run.range().contains(&1)).unwrap();
+            assert!((space.advance() - 3.0).abs() < 1.0e-6, "justification must fill the column after scaling the preferred gap: {policy:?}, actual {}, line adjustment {}", space.advance(), text.line(0).unwrap().word_spacing());
+            let last_word = text.line_text_fragments(0).unwrap().find(|fragment| fragment.glyphs().contains(&2)).unwrap();
+            assert!((last_word.offset_x() - 5.0).abs() < 1.0e-6, "painted word positions must include justification");
+            assert_eq!(text.line(1).unwrap().word_spacing(), 0.0);
+        }
+        let last = layout_with_word_spacing("a a", "text-align:justify", 100.0, 1.5, crate::TextCompositionPolicy::BookOptimized);
+        assert_eq!(last.render_view().text().line_glyph_advances(0).unwrap().iter().next().unwrap().advance(), 3.0);
+    }
+
     #[test]
     fn line_breaking_uses_native_run_advances_instead_of_character_fallbacks() {
         let document = layout_with_native_geometry("<html><body style='margin:0'><p style='margin:0;overflow-wrap:anywhere'>abcd</p></body></html>", 7.0, vec![3.0; 4], vec![true; 5]);
@@ -492,7 +545,7 @@ mod tests {
     }
 
     #[test]
-    fn emergency_justification_uses_tiny_positive_cluster_tracking_before_raggedness() {
+    fn justification_uses_tiny_positive_cluster_tracking_before_raggedness() {
         let document = layout_with_native_geometry("<html><body style='margin:0'><p style='margin:0;text-align:justify'>aaaa aaaa aaaa</p></body></html>", 19.04, vec![2.0; 14], vec![true; 15]);
 
         let first = document.render_view().text().line(0).expect("micro-tracked first line");
@@ -502,13 +555,119 @@ mod tests {
     }
 
     #[test]
-    fn emergency_justification_uses_tiny_negative_cluster_tracking_after_space_shrink() {
+    fn justification_uses_tiny_negative_cluster_tracking_after_space_shrink() {
         let document = layout_with_native_geometry("<html><body style='margin:0'><p style='margin:0;text-align:justify'>aa aa aa</p></body></html>", 9.32, vec![2.0; 8], vec![true; 9]);
 
         let first = document.render_view().text().line(0).expect("micro-tracked tight first line");
         assert_eq!(line_text(&document, 0), "aa aa");
         assert!((first.word_spacing() + 0.66).abs() < 1.0e-9);
         assert!((first.letter_spacing() * 4.0 + 0.02).abs() < 1.0e-6, "four shaped-cluster boundaries must share the -0.02px residual; got {}", first.letter_spacing());
+    }
+
+    #[cfg(feature = "profiling")]
+    #[test]
+    fn normal_pass_admits_tracking_only_within_final_cluster_capacity() {
+        use crate::profiling::capture;
+        use std::time::Duration;
+
+        for (text, width, glyphs, adjustment) in [
+            ("aaaa aaaa aaaa", 19.04, 14, 0.04),
+            ("aa aa aa", 9.32, 8, -0.02),
+            ("aaaa aaaa aaaa<br>aaaa aaaa aaaa", 19.04, 14, 0.04),
+        ] {
+            let html = format!("<html><body style='margin:0'><p style='margin:0;text-align:justify'>{text}</p></body></html>");
+            let (document, entries) = capture(Duration::default, || {
+                layout_with_native_geometry(&html, width, vec![2.0; glyphs], vec![true; glyphs + 1])
+            });
+            assert!(entries.iter().any(|entry| entry.name == "lines.justified.normal"));
+            assert!(!entries.iter().any(|entry| entry.name == "lines.justified.emergency"), "tracking-feasible text must finish in the normal pass");
+            let first = document.render_view().text().line(0).unwrap();
+            let boundaries = if adjustment > 0.0 { 8.0 } else { 4.0 };
+            assert!((first.letter_spacing() * boundaries - adjustment).abs() < 1.0e-6);
+        }
+
+        // The same requested expansion fits eight boundaries but exceeds
+        // two native word-cluster boundaries at a 1px line height.
+        let html = "<html><body style='margin:0'><p style='margin:0;font:1px/1px sans-serif;text-align:justify'>aaaa aaaa aaaa</p></body></html>";
+        for clustered in [false, true] {
+            let boundaries = if clustered {
+                (0..15).map(|index| [0, 4, 5, 9, 10, 14].contains(&index)).collect()
+            } else {
+                vec![true; 15]
+            };
+            let (document, entries) = capture(Duration::default, || {
+                layout_with_native_geometry(html, 19.03, vec![2.0; 14], boundaries)
+            });
+            assert_eq!(entries.iter().any(|entry| entry.name == "lines.justified.emergency"), clustered);
+            assert_eq!(line_text(&document, 0), "aaaa aaaa");
+            let first = document.render_view().text().line(0).unwrap();
+            assert!(first.letter_spacing().abs() <= 0.005 + 1.0e-9, "placement must retain its per-boundary tracking limit");
+        }
+    }
+
+    #[test]
+    fn hyphenation_language_prefers_explicit_tags_then_publication_then_english() {
+        use html_style_model::{ContentLanguage, LanguageTag};
+        use hypher::Lang;
+        let tag = |value| ContentLanguage::Tag(LanguageTag::parse(value).unwrap());
+        let english = tag("en-GB");
+        let french = tag("fr");
+        let swedish = tag("sv");
+        let unsupported = tag("zz");
+        let malformed = ContentLanguage::Unrecognized("en_US".into());
+        assert_eq!(hyphenation_language(None, None), Some(Lang::English));
+        assert_eq!(hyphenation_language(None, Some(&french)), Some(Lang::French));
+        assert_eq!(hyphenation_language(Some(&swedish), Some(&french)), Some(Lang::Swedish));
+        assert_eq!(hyphenation_language(Some(&english), Some(&french)), Some(Lang::English));
+        assert_eq!(hyphenation_language(Some(&unsupported), Some(&english)), None);
+        assert_eq!(hyphenation_language(Some(&malformed), Some(&english)), None);
+        assert_eq!(hyphenation_language(None, Some(&unsupported)), None);
+    }
+
+    #[test]
+    fn inline_language_annotations_control_hyphenation_in_multilingual_text() {
+        let html = "<html lang='en'><body style='margin:0;hyphens:auto'><p id='english' style='margin:0'>internationalization internationalization</p><p lang='zz' style='margin:0'>internationalization internationalization</p><p lang='zz' style='margin:0'><span lang='en'>internationalization internationalization</span></p></body></html>";
+        let document = layout_html(html, 72.0);
+        let text = document.render_view().text();
+        let mut paragraphs = vec![false; 3];
+        for index in 0..document.line_count() {
+            let line = text.line(index).unwrap();
+            let paragraph_length = "internationalization internationalization".chars().count() as u32;
+            let paragraph = (line.start() / paragraph_length) as usize;
+            paragraphs[paragraph] |= text.hyphen_for_line(index).is_some();
+        }
+        assert_eq!(paragraphs, [true, false, true], "inline tags must override inherited chapter tags independently for each passage");
+    }
+
+    fn layout_with_reader_hyphenation(author_rule: &str, language: &str, text: &str, selection: Option<Hyphens>) -> LaidOutDocument {
+        let html = format!("<html {language}><body style='margin:0'><p style='margin:0;hyphens:{author_rule}'>{text}</p></body></html>");
+        let (document, styles) = html_style::style_document(html_parse::parse_dom_document(&html).unwrap(), &[]).into_parts();
+        let styles = styles.with_reader_overrides(&document, &crate::ReaderStyleOverrides { hyphens: selection, ..Default::default() }).unwrap();
+        crate::PreparedDocument::try_new(document, styles).unwrap().shape(&mut GlyphCache::new()).unwrap()
+            .layout(crate::LayoutConstraints::new(72.0, 16.0).unwrap())
+    }
+
+    #[test]
+    fn reader_hyphenation_on_and_off_override_publication_rules_and_book_preserves_them() {
+        let content = "internationalization internationalization";
+        let has_hyphen = |document: &LaidOutDocument| (0..document.line_count()).any(|index| document.render_view().text().hyphen_for_line(index).is_some());
+        assert!(!has_hyphen(&layout_with_reader_hyphenation("none", "lang='en'", content, None)));
+        assert!(has_hyphen(&layout_with_reader_hyphenation("none", "lang='en'", content, Some(Hyphens::Auto))));
+        assert!(has_hyphen(&layout_with_reader_hyphenation("auto", "lang='en'", content, None)));
+        assert!(!has_hyphen(&layout_with_reader_hyphenation("auto", "lang='en'", content, Some(Hyphens::None))));
+        assert!(has_hyphen(&layout_with_reader_hyphenation("none", "", content, Some(Hyphens::Auto))), "On defaults to English when no language is declared");
+        assert!(!has_hyphen(&layout_with_reader_hyphenation("none", "lang='zz'", content, Some(Hyphens::Auto))), "unsupported languages must remain unhyphenated");
+    }
+
+    #[test]
+    fn reader_hyphenation_off_suppresses_soft_hyphens_and_preserves_literal_hyphens() {
+        let content = "inter&shy;nationalization state-of-the-art";
+        let book = layout_with_reader_hyphenation("manual", "lang='en'", content, None);
+        let off = layout_with_reader_hyphenation("manual", "lang='en'", content, Some(Hyphens::None));
+        assert!((0..book.line_count()).any(|index| book.render_view().text().hyphen_for_line(index).is_some()));
+        assert!((0..off.line_count()).all(|index| off.render_view().text().hyphen_for_line(index).is_none()));
+        let source = (0..off.line_count()).map(|index| line_text(&off, index)).collect::<String>();
+        assert!(source.contains("state-of-the-art"));
     }
 
     #[test]
@@ -573,6 +732,86 @@ mod tests {
         assert!(line_text(&document, hyphenated_line).ends_with('\u{00ad}'), "automatic dictionary points in a word with an authored soft hyphen must not supersede it");
     }
 
+    #[test]
+    fn automatic_hyphenation_joins_words_across_inline_formatting() {
+        let plain = "internationalization internationalization";
+        let styled = "in<span style='color:red'>terna</span>tionalization inter<span style='color:blue'>national</span>ization";
+        for width in [48.0, 64.0, 72.0, 88.0, 104.0, 128.0] {
+            let layout = |content| layout_html(&format!("<html lang='en'><body style='margin:0;hyphens:auto'>{content}</body></html>"), width);
+            let expected = layout(plain);
+            let actual = layout(styled);
+            let lines = |document: &LaidOutDocument| (0..document.line_count()).map(|index| (
+                line_text(document, index), document.render_view().text().hyphen_for_line(index).is_some()
+            )).collect::<Vec<_>>();
+            assert_eq!(lines(&actual), lines(&expected), "inline color boundaries changed hyphenation at width {width}");
+        }
+    }
+
+    #[test]
+    fn automatic_hyphenation_respects_soft_hyphens_across_inline_formatting() {
+        let html = "<html lang='en'><body style='margin:0;hyphens:auto'>inter<span style='color:red'>&shy;national</span>ization tail</body></html>";
+        let document = layout_html(html, 56.0);
+        let hyphenated = (0..document.line_count()).filter(|&index| document.render_view().text().hyphen_for_line(index).is_some()).collect::<Vec<_>>();
+        assert!(!hyphenated.is_empty());
+        assert!(hyphenated.into_iter().all(|index| line_text(&document, index).ends_with('\u{00ad}')));
+    }
+
+    #[test]
+    fn automatic_hyphenation_does_not_split_words_at_policy_boundaries() {
+        for attributes in ["lang='zz'", "lang='fr'", "lang='en-GB'", "style='hyphens:none'", "style='white-space:nowrap'"] {
+            let html = format!("<html lang='en'><body style='margin:0;hyphens:auto'>inter<span {attributes}>national</span>ization</body></html>");
+            let document = layout_html(&html, 48.0);
+            assert!((0..document.line_count()).all(|index| document.render_view().text().hyphen_for_line(index).is_none()), "a word with {attributes} must not be hyphenated as separate fragments");
+        }
+    }
+
+    #[test]
+    fn automatic_hyphenation_apostrophe_variants_have_identical_layout() {
+        let layout = |apostrophe: char| layout_html(&format!("<html lang='en'><body style='margin:0;hyphens:auto'>internationalization{apostrophe}s internationalization{apostrophe}s</body></html>"), 72.0);
+        let lines = |document: &LaidOutDocument| (0..document.line_count()).map(|index| (
+            line_text(document, index).replace(['\u{2019}', '\u{02bc}'], "'"), document.render_view().text().hyphen_for_line(index).is_some()
+        )).collect::<Vec<_>>();
+        let expected = lines(&layout('\''));
+        assert_eq!(lines(&layout('\u{2019}')), expected);
+        assert_eq!(lines(&layout('\u{02bc}')), expected);
+    }
+
+    #[test]
+    fn automatic_hyphenation_respects_native_shaping_clusters() {
+        let word = "internationalization";
+        let count = word.chars().count();
+        let mut boundaries = vec![false; count + 1];
+        boundaries[0] = true;
+        boundaries[count] = true;
+        let html = format!("<html lang='en'><body style='margin:0;hyphens:auto'>{word}</body></html>");
+        let document = layout_with_native_geometry(&html, 48.0, vec![8.0; count], boundaries);
+        assert!((0..document.line_count()).all(|index| document.render_view().text().hyphen_for_line(index).is_none()));
+    }
+
+    #[test]
+    fn automatic_hyphenation_preserves_decomposed_source_positions_in_layout() {
+        use unicode_categories::UnicodeCategories;
+        use unicode_normalization::UnicodeNormalization;
+
+        let composed = "électroencéphalographie";
+        let decomposed = composed.nfd().collect::<String>();
+        let layout = |word: &str| {
+            let advances = word.chars().map(|ch| if ch.is_mark() { 0.0 } else { 8.0 }).collect();
+            let mut boundaries = word.chars().map(|ch| !ch.is_mark()).collect::<Vec<_>>();
+            boundaries.push(true);
+            layout_with_native_geometry(&format!("<html lang='fr'><body style='margin:0;hyphens:auto'>{word}</body></html>"), 72.0, advances, boundaries)
+        };
+        let expected = layout(composed);
+        let actual = layout(&decomposed);
+        let lines = |document: &LaidOutDocument| (0..document.line_count()).map(|index| (
+            line_text(document, index).nfc().collect::<String>(), document.render_view().text().hyphen_for_line(index).is_some()
+        )).collect::<Vec<_>>();
+        assert_eq!(lines(&actual), lines(&expected));
+        assert!((0..actual.line_count()).any(|index| actual.render_view().text().hyphen_for_line(index).is_some()));
+        let original_source = (0..actual.line_count()).map(|index| line_text(&actual, index)).collect::<String>();
+        assert_eq!(original_source, decomposed, "normalization must not rewrite selection/source ranges");
+    }
+
     fn layout_html_with_images(html: &str, width: f64, image_sizes: &[(u32, u32)], policy: crate::ImageSizingPolicy) -> LaidOutDocument {
         layout_html_with_images_in_viewport(html, width, None, image_sizes, policy)
     }
@@ -613,16 +852,14 @@ mod tests {
 
     fn alignment_token(vertical_align: VerticalAlignValue) -> (InlineToken, [InlineTokenMetrics; 1]) {
         let mut token = InlineToken::new(InlineTokenKind::Glyph { glyph_idx: 0 }, 8.0, BreakKind::None, TokenWrap::Normal, true);
-        token.run_idx = 0;
+        token.set_run_idx(0);
         let metrics = [InlineTokenMetrics {
             owner_box_idx: u32::MAX,
             ascent: 8.0,
             descent: 2.0,
             line_height: 12.0,
-            tab_interval: -1.0,
-            tab_min_advance: 0.0,
             font_size: 16.0,
-            vertical_align,
+            vertical_align: InlineVerticalAlign::resolve(vertical_align, 12.0, 16.0),
             white_space: WhiteSpace::Normal,
             visible: true,
             placement_required: false,
@@ -632,8 +869,93 @@ mod tests {
 
     #[test]
     fn common_inline_token_stays_cache_compact() {
-        assert_eq!(std::mem::size_of::<InlineToken>(), 16, "dense inline token grew to {} bytes", std::mem::size_of::<InlineToken>());
+        assert_eq!(std::mem::size_of::<InlineToken>(), 12, "dense inline token grew to {} bytes", std::mem::size_of::<InlineToken>());
+        assert_eq!(std::mem::align_of::<InlineToken>(), 4);
+        assert_eq!(std::mem::offset_of!(InlineToken, width), 8);
+        assert_eq!(std::mem::size_of::<InlineVerticalAlign>(), 8);
+        assert_eq!(std::mem::size_of::<InlineTokenMetrics>(), 32);
         assert!(std::mem::size_of::<InlineTokenKind>() <= 8, "rare replaced geometry leaked back into the token discriminant");
+    }
+
+    #[test]
+    fn packed_token_header_preserves_fields_at_their_bit_limits() {
+        use super::justification::SpaceGlueClass;
+        let index = InlineToken::MAX_DATA;
+        let kinds = [
+            InlineTokenKind::Glyph { glyph_idx: index },
+            InlineTokenKind::Ellipsis { glyph: index },
+            InlineTokenKind::Image { payload_idx: index },
+            InlineTokenKind::AtomicBox { payload_idx: index },
+            InlineTokenKind::Break {
+                clear: html_style_model::Clear::Both,
+            },
+            InlineTokenKind::FloatAnchor { box_idx: index },
+            InlineTokenKind::InlineBoundary { payload_idx: index },
+            InlineTokenKind::Discretionary { glyph: index },
+            InlineTokenKind::Opportunity,
+            InlineTokenKind::AbsoluteAnchor { box_idx: index },
+        ];
+        for kind in kinds {
+            for wrap in [TokenWrap::Normal, TokenWrap::BreakWord, TokenWrap::Anywhere] {
+                for break_kind in [
+                    BreakKind::None,
+                    BreakKind::Soft,
+                    BreakKind::Hard,
+                    BreakKind::Discretionary,
+                ] {
+                    let mut token = InlineToken::new(kind, 12.5, break_kind, wrap, true);
+                    token.set_run_idx(InlineToken::MAX_RUN_IDX);
+                    token.set_bidi_level(u8::MAX);
+                    token.set_is_space();
+                    token.set_is_tab();
+                    token.set_space_glue_class(SpaceGlueClass::Clause);
+                    assert!(token.kind() == kind);
+                    assert!(token.wrap() == wrap);
+                    assert!(token.break_kind() == break_kind);
+                    assert!(token.is_cluster_boundary() && token.is_space() && token.is_tab());
+                    assert_eq!(token.space_glue_class(), SpaceGlueClass::Clause);
+                    assert_eq!(token.run_idx(), InlineToken::MAX_RUN_IDX);
+                    assert_eq!(token.bidi_level(), u8::MAX);
+                    assert_eq!(f64::from(token.width), 12.5);
+
+                    token.set_run_idx(0);
+                    token.set_bidi_level(0);
+                    assert!(token.kind() == kind);
+                    assert!(token.break_kind() == break_kind && token.wrap() == wrap);
+                    assert_eq!(token.run_idx(), 0);
+                    assert_eq!(token.bidi_level(), 0);
+                    assert_eq!(token.space_glue_class(), SpaceGlueClass::Clause);
+                    assert!(token.is_cluster_boundary() && token.is_space() && token.is_tab());
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "glyph/payload index exceeds 24-bit capacity")]
+    fn packed_token_rejects_indices_above_24_bits() {
+        InlineToken::new(
+            InlineTokenKind::Glyph {
+                glyph_idx: InlineToken::MAX_DATA + 1,
+            },
+            8.0,
+            BreakKind::None,
+            TokenWrap::Normal,
+            true,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "metrics index exceeds 18-bit capacity")]
+    fn packed_token_reserves_the_unbound_metrics_index() {
+        let mut token = InlineToken::new(
+            InlineTokenKind::Opportunity,
+            0.0,
+            BreakKind::None,
+            TokenWrap::Normal,
+            true,
+        );
+        token.set_run_idx(InlineToken::MAX_RUN_IDX + 1);
     }
 
     #[test]
@@ -646,7 +968,7 @@ mod tests {
         tokens.push(second, metrics);
 
         assert_eq!(tokens.runs.len(), 1);
-        assert_eq!(tokens.dense[0].run_idx, tokens.dense[1].run_idx);
+        assert_eq!(tokens.dense[0].run_idx(), tokens.dense[1].run_idx());
     }
 
     #[test]
@@ -692,6 +1014,41 @@ mod tests {
         let offset = document.render_view().text().line_glyph_offsets(0).expect("first line offset runs").iter().find(|run| run.range().contains(&1)).expect("the shifted glyph has an offset").offset();
 
         assert!((offset - 4.0).abs() < 0.001, "calc shift should preserve both components, got {offset}");
+    }
+
+    #[test]
+    fn numeric_alignment_uses_a_compact_offset_without_losing_script_identity() {
+        for (value, expected) in [
+            (VerticalAlignValue::Length(-3.5), -3.5),
+            (VerticalAlignValue::Percent(0.25), 3.0),
+            (VerticalAlignValue::Calc { absolute_px: -2.0, line_height_fraction: 0.5, x_height_px: 0.0 }, 4.0),
+            (VerticalAlignValue::Sub, -4.0),
+            (VerticalAlignValue::Super, 8.0),
+        ] {
+            let (token, runs) = alignment_token(value);
+            assert_eq!(vertical_align_offset(&token, &runs, 40.0, 10.0), expected);
+        }
+        assert_ne!(InlineVerticalAlign::resolve(VerticalAlignValue::Super, 12.0, 16.0), InlineVerticalAlign::Offset(8.0));
+        assert_ne!(InlineVerticalAlign::resolve(VerticalAlignValue::Sub, 12.0, 16.0), InlineVerticalAlign::Offset(-4.0));
+        assert_ne!(InlineVerticalAlign::Baseline, InlineVerticalAlign::Offset(0.0));
+    }
+
+    #[test]
+    fn first_line_height_reresolves_numeric_alignment() {
+        for (alignment, expected) in [("50%", 20.0), ("calc(50% - 2px)", 18.0)] {
+            let mut factory = DocumentFactory::new();
+            let mut glyphs = GlyphCache::new();
+            let markup = format!("<html><body style='margin:0'><div style='font-size:16px;line-height:20px'>A<span style='vertical-align:{alignment}'>B</span></div></body></html>");
+            let document = factory
+                .parse_with_new_pipeline(&markup, Some("div::first-line { line-height:40px }"))
+                .shape(&mut glyphs)
+                .expect("first-line glyphs shape")
+                .layout(crate::LayoutConstraints::new(200.0, 16.0).unwrap());
+            let offset = document.render_view().text().line_glyph_offsets(0)
+                .expect("aligned first line").iter()
+                .find(|run| run.range().contains(&1)).expect("shifted B").offset();
+            assert!((offset - expected).abs() < 0.001, "{alignment} should resolve against the 40px first-line height, got {offset}");
+        }
     }
 
     #[test]
@@ -888,6 +1245,61 @@ mod tests {
 
         assert_eq!(text.line(0).expect("A line").point().y, 0.0);
         assert_eq!(text.line(1).expect("B line").point().y, 20.0);
+    }
+
+    #[test]
+    fn text_run_metrics_keep_varying_glyph_extents_and_tab_transitions() {
+        use crate::{GlyphMetric, GlyphResourceStore};
+
+        struct VaryingMetrics(GlyphResourceStore);
+        impl GlyphShaper for VaryingMetrics {
+            fn reset(&mut self) { self.0.clear(); }
+            fn glyph_resources(&mut self) -> &mut GlyphResourceStore { &mut self.0 }
+            fn shape_glyph(&mut self, ch: char, _size: f32, _weight: u16, _slant: FontSlant, _color: u32, _family: Option<&str>) -> Result<GlyphId, ShapeError> {
+                let (ascent, descent) = if ch == 'Y' { (16.0, 4.0) } else { (8.0, 2.0) };
+                self.0.register(GlyphMetric::try_new(ch, 10.0, ascent, descent, ascent).unwrap())
+            }
+        }
+        let mut factory = DocumentFactory::new();
+        let mut shaper = VaryingMetrics(GlyphResourceStore::default());
+        let document = factory.parse_with_new_pipeline(
+            "<html><body style='margin:0'><div style='font:10px Ahem;white-space:pre;tab-size:4;text-decoration:underline'>X\tYX\nX</div></body></html>", None,
+        ).shape(&mut shaper).unwrap().layout(crate::LayoutConstraints::new(200.0, 10.0).unwrap());
+        let text = document.render_view().text();
+        assert_eq!(line_text(&document, 0), "X\tYX");
+        assert_eq!(line_text(&document, 1), "X");
+        assert_eq!(text.line(0).unwrap().height(), 20.0);
+        assert_eq!(text.line(1).unwrap().height(), 10.0);
+        assert_eq!(tab_advance(&document, 0), 30.0);
+    }
+
+    #[test]
+    fn inline_fragment_ancestor_geometry_tracks_each_line_baseline() {
+        for (direction, content) in [
+            ("ltr", "one two three four five six seven eight"),
+            ("rtl", "אבג דהו זחט יכל מנס עפק"),
+        ] {
+            let split: String = content.chars().map(|character| format!("<span>{character}</span>")).collect();
+            let source = |text: &str| format!("<html><body style='margin:0'><p style='direction:{direction};font-size:16px'><span style='border-bottom:2px solid blue;position:relative;left:5px;top:3px'>{text}</span></p></body></html>");
+            for source_text in [content, &split] {
+                let document = layout_html(&source(source_text), 90.0);
+                let view = document.render_view();
+                let text = view.text();
+                assert!(text.line_count() > 1);
+                let borders: Vec<_> = view.fragments().decorations().iter()
+                    .filter(|fragment| fragment.is_inline() && fragment.color() == 0x0000ffff)
+                    .collect();
+                assert!(!borders.is_empty());
+                for border in borders {
+                    let line = text.line(border.line_idx().unwrap() as usize).unwrap();
+                    // The owner's 16px font has 0.2em descent. Its relative
+                    // top offset is 3px, independently of descendant owners.
+                    let expected = line.point().y + line.baseline() + 3.0 + 16.0 * 0.2;
+                    assert!((border.rect().y0 - expected).abs() < 0.001,
+                        "{direction}: border {:?}, line {line:?}", border.rect());
+                }
+            }
+        }
     }
 
     #[test]
@@ -1215,17 +1627,6 @@ mod tests {
     }
 
     #[test]
-    fn sentence_per_line_inserts_logical_breaks_without_changing_text_order() {
-        let html = "<html><body style='margin:0'><p style='margin:0'>First sentence. <em>Second sentence!</em> Third?</p></body></html>";
-        let count = "First sentence. Second sentence! Third?".chars().count();
-        let document = layout_with_native_geometry_policy(html, 1_000.0, vec![8.0; count], vec![true; count + 1], crate::TextCompositionPolicy::SentencePerLine);
-
-        let lines = (0..document.line_count()).map(|line| line_text(&document, line)).collect::<Vec<_>>();
-        assert_eq!(lines, ["First sentence.", "Second sentence!", "Third?"]);
-        assert_eq!(lines.concat(), "First sentence.Second sentence!Third?");
-    }
-
-    #[test]
     fn ordinary_book_composition_does_not_force_sentence_breaks() {
         let html = "<html><body style='margin:0'><p style='margin:0'>First sentence. Second sentence!</p></body></html>";
         let count = "First sentence. Second sentence!".chars().count();
@@ -1253,6 +1654,53 @@ mod tests {
         // Test shaper: every 16px glyph/space advances 8px. After `a`, a
         // four-space tab interval reaches the 32px stop, hence 24px.
         assert!((tab_advance(&document, 0) - 24.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn preserved_tabs_share_metrics_with_adjacent_text() {
+        let document = layout_html("<html><body><pre style='tab-size:4'>a\tb\tc</pre></body></html>", 300.0);
+        let text = document.render_view().text();
+        let advances: Vec<_> = text.line_glyph_advances(0).unwrap().iter()
+            .map(|run| (run.range(), run.advance()))
+            .collect();
+        assert_eq!(advances, [(1..2, 24.0), (3..4, 24.0)]);
+        let metrics_entries: usize = document.memory_usage_report().entries.iter()
+            .filter(|entry| entry.label.ends_with("inline_plans.run_metrics"))
+            .map(|entry| entry.count)
+            .sum();
+        assert_eq!(metrics_entries, 1, "tabs and letters should share the same ordinary metrics");
+    }
+
+    #[test]
+    fn preserved_tab_wrap_opportunities_do_not_advance_twice() {
+        for white_space in ["pre-wrap", "break-spaces"] {
+            let html = format!("<html><body style='margin:0'><div style='white-space:{white_space};tab-size:4;width:90px'>a\tb\tc</div></body></html>");
+            let document = layout_html(&html, 300.0);
+            let text = document.render_view().text();
+            assert_eq!(text.line_count(), 1, "zero-width opportunities must not expand tabs for {white_space}");
+            assert_eq!(line_text(&document, 0), "a\tb\tc");
+            let advances: Vec<_> = text.line_glyph_advances(0).unwrap().iter()
+                .map(|run| (run.range(), run.advance()))
+                .collect();
+            assert_eq!(advances, [(1..2, 24.0), (3..4, 24.0)]);
+        }
+    }
+
+    #[test]
+    fn preserved_tabs_resolve_each_inline_owners_style() {
+        let document = layout_html("<html><body><pre><span style='tab-size:20px'>a\tb</span><span style='tab-size:40px'>c\td</span></pre></body></html>", 300.0);
+        let text = document.render_view().text();
+        let advances: Vec<_> = text.line_glyph_advances(0).unwrap().iter()
+            .map(|run| (run.range(), run.advance()))
+            .collect();
+        assert_eq!(advances, [(1..2, 12.0), (4..5, 4.0)]);
+    }
+
+    #[test]
+    fn preserved_tab_skips_a_stop_closer_than_the_minimum_advance() {
+        let document = layout_html("<html><body><pre style='tab-size:18px'>aa\tb</pre></body></html>", 300.0);
+        // At x=16 the next stop is only 2px away, below the 4px minimum.
+        assert_eq!(tab_advance(&document, 0), 20.0);
     }
 
     #[test]
@@ -1724,6 +2172,85 @@ mod tests {
 
         assert!(lines.iter().any(|line| line == "AAACCCC"), "the parent line must skip nested absolute glyph storage: {lines:?}");
         assert!(lines.iter().any(|line| line == "BBB"), "the absolute child still paints in its own formatting context: {lines:?}");
+    }
+
+    fn paragraph_geometry(document: &html_dom::Document, styles: &html_style_model::ComputedStyles, id: &str) -> (f64, f64, f64, bool, bool) {
+        let node = document.node_ids().find(|&node| document.get_dom_id(node) == Some(id)).unwrap();
+        let style = styles.used_view(styles.style_for_node(node).unwrap(), 0.5, 0.5, 0.7).unwrap();
+        (style.margin_top().resolve(300.0), style.margin_bottom().resolve(300.0), style.text_indent().resolve(300.0), style.text_indent_hanging(), style.text_indent_each_line())
+    }
+
+    #[test]
+    fn authored_break_marker_preserves_clear_bidi_and_metrics() {
+        for clear in [html_style_model::Clear::None, html_style_model::Clear::Both] {
+            let mut token = InlineToken::new(InlineTokenKind::Break { clear }, 0.0, BreakKind::Hard, TokenWrap::Normal, true);
+            token.set_run_idx(InlineToken::MAX_RUN_IDX);
+            assert!(!token.is_authored_break());
+            token.mark_authored_break();
+            for level in [0, 1, u8::MAX] {
+                token.set_bidi_level(level);
+                assert!(token.is_authored_break());
+                assert!(token.kind() == InlineTokenKind::Break { clear });
+                assert_eq!(token.run_idx(), InlineToken::MAX_RUN_IDX);
+                assert_eq!(token.bidi_level(), level);
+            }
+        }
+    }
+
+    #[test]
+    fn reader_paragraph_controls_preserve_authored_styles() {
+        let html = "<html><body><p id='p' style='font-size:20px;margin:7px 0 11px;text-indent:15% hanging each-line'>Text</p><p id='small' style='font-size:10px'>Small</p><div id='div' style='font-size:20px;margin:7px 0 11px;text-indent:15% hanging each-line'>Div</div></body></html>";
+        let (document, book) = html_style::style_document(html_parse::parse_dom_document(html).unwrap(), &[]).into_parts();
+        let controls = crate::ReaderStyleOverrides { paragraph_spacing_em: Some(0.5), first_line_indent_em: Some(1.5), ..Default::default() };
+        assert!(!controls.same_layout_preferences(&crate::ReaderStyleOverrides::default()));
+        let adjusted = book.with_reader_overrides(&document, &controls).unwrap();
+        assert_eq!(adjusted.reader_paragraph_spacing_em(), Some(0.5));
+        assert_eq!(adjusted.reader_first_line_indent_em(), Some(1.5));
+        assert_eq!(paragraph_geometry(&document, &adjusted, "p"), paragraph_geometry(&document, &book, "p"));
+        let small = paragraph_geometry(&document, &book, "small");
+        assert_eq!(paragraph_geometry(&document, &adjusted, "small"), small);
+        let paragraph = document.node_ids().find(|&node| document.get_dom_id(node) == Some("p")).unwrap();
+        let anonymous = adjusted.anonymous_box_indices(adjusted.style_for_node(paragraph).unwrap()).unwrap();
+        let anonymous = adjusted.used_view(anonymous, 0.5, 0.5, 0.7).unwrap();
+        assert!((anonymous.text_indent().resolve(300.0) - 45.0).abs() < 1e-5);
+        assert_eq!(anonymous.margin_top().resolve(300.0), 0.0);
+        assert_eq!(anonymous.margin_bottom().resolve(300.0), 0.0);
+        assert_eq!(paragraph_geometry(&document, &adjusted, "div"), paragraph_geometry(&document, &book, "div"));
+        let repeated = adjusted.with_reader_overrides(&document, &controls).unwrap();
+        assert_eq!(paragraph_geometry(&document, &repeated, "p"), paragraph_geometry(&document, &adjusted, "p"));
+        let restored = adjusted.with_reader_overrides(&document, &crate::ReaderStyleOverrides::default()).unwrap();
+        assert_eq!(paragraph_geometry(&document, &restored, "p"), paragraph_geometry(&document, &book, "p"));
+        assert_eq!(restored.reader_paragraph_spacing_em(), None);
+        let indent_only = adjusted.with_reader_overrides(&document, &crate::ReaderStyleOverrides { first_line_indent_em: Some(0.0), ..Default::default() }).unwrap();
+        assert_eq!(indent_only.reader_first_line_indent_em(), Some(0.0));
+        assert_eq!(paragraph_geometry(&document, &indent_only, "p"), paragraph_geometry(&document, &book, "p"));
+        let spacing_only = adjusted.with_reader_overrides(&document, &crate::ReaderStyleOverrides { paragraph_spacing_em: Some(0.0), ..Default::default() }).unwrap();
+        let authored = paragraph_geometry(&document, &book, "p");
+        assert_eq!(paragraph_geometry(&document, &spacing_only, "p"), authored);
+        for invalid in [-1.0, f32::NAN, f32::INFINITY] {
+            let invalid = adjusted.with_reader_overrides(&document, &crate::ReaderStyleOverrides { paragraph_spacing_em: Some(invalid), first_line_indent_em: Some(invalid), ..Default::default() }).unwrap();
+            assert_eq!(paragraph_geometry(&document, &invalid, "p"), authored);
+        }
+    }
+
+    #[test]
+    fn reader_paragraph_spacing_and_indentation_use_reader_base_font() {
+        for font_size in [12.0, 24.0] {
+            for (spacing, indent) in [(0.0, 0.0), (0.5, 1.5)] {
+                let html = format!("<html><body style='margin:0'><p style='font-size:{font_size}px;line-height:{font_size}px;margin:7px 0 11px;white-space:pre-line;text-indent:4px hanging each-line'><span>one</span>\nsecond</p><p style='font-size:{font_size}px;line-height:{font_size}px;margin:7px 0 11px;white-space:pre-line;text-indent:4px hanging each-line'>three\nfour</p></body></html>");
+                let (document, styles) = html_style::style_document(html_parse::parse_dom_document(&html).unwrap(), &[]).into_parts();
+                let styles = styles.with_reader_overrides(&document, &crate::ReaderStyleOverrides { paragraph_spacing_em: Some(spacing), first_line_indent_em: Some(indent), ..Default::default() }).unwrap();
+                let layout = crate::PreparedDocument::try_new(document, styles).unwrap().shape(&mut GlyphCache::new()).unwrap().layout(crate::LayoutConstraints::new(300.0, 16.0).unwrap());
+                let lines = layout.render_view().text().lines().iter().collect::<Vec<_>>();
+                assert_eq!(lines.len(), 4);
+                assert!((lines[0].point().x - f64::from(16.0 * indent)).abs() < 1e-5);
+                assert!((lines[2].point().x - f64::from(16.0 * indent)).abs() < 1e-5);
+                assert_eq!(lines[1].point().x, 0.0, "forced breaks must not reapply first-line indentation");
+                assert_eq!(lines[3].point().x, 0.0);
+                let gap = lines[2].point().y - lines[1].point().y - lines[1].height();
+                assert!((gap - f64::from(16.0 * spacing)).abs() < 1e-5, "paragraph gap was {gap} for {spacing} em at base 16px and paragraph {font_size}px");
+            }
+        }
     }
 
     #[test]

@@ -1,10 +1,12 @@
+use crate::layout::InlinePlanGeneration;
+use crate::shaping::{GlyphPatch, GlyphSlice, TextGeometryView, ShapedTextGeometry};
 use crate::layout_model::{
     AnchorPosition, BoxGeometry, GlyphId, GlyphMetrics, InlineContent, InlineItemKind, LayoutMode,
     LayoutState, LayoutTree,
 };
 use html_dom::{Document, MemoryUsageReport};
 use html_style_model::{ComputedStyles, ComputedStylesValidationError, StyleIndices};
-use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use std::fmt;
 use std::time::Duration;
 use web_time::Instant;
@@ -12,9 +14,13 @@ use web_time::Instant;
 #[path = "stages_output/mod.rs"]
 mod output;
 pub use output::{
+    CaretAffinity, PositionedShapedLine, RenderGeometryView,
+    TextSearchOptions, find_text_matches,
+    SourceLocation,
+    ContentRole, ContentSemantics, RenderSemanticsView,
     BoxTextFormat, ImageMetrics, RenderAddressingView, RenderAnchorPosition, RenderAnchorPositions, ReadingFragment, ReadingTarget, is_navigation_section_title,
     RenderAuthoritativeTextRun, RenderBoxView, RenderDecoration, RenderDecorationPattern,
-    RenderDecorations, RenderEllipsisFragment, RenderForcedBreak, RenderFragmentView,
+    RenderDecorations, RenderEllipsisFragment, RenderExportView, RenderForcedBreak, RenderFragmentView,
     RenderGlyphAdvanceRun, RenderGlyphAdvanceRuns, RenderGlyphOffsetRun, RenderGlyphOffsetRuns,
     RenderHyphenFragment, RenderImageFragment, RenderImageFragments, RenderLine,
     RenderLineTextFragment, RenderLineTextFragments, RenderLines, RenderListItemMarker,
@@ -24,6 +30,7 @@ pub use output::{
 mod mathml;
 #[path = "stages/lifecycle.rs"]
 mod lifecycle;
+use lifecycle::LayoutCandidate;
 mod paint;
 pub(crate) use paint::PaintStyles;
 #[path = "stages/semantics.rs"]
@@ -31,7 +38,7 @@ mod semantics;
 
 pub(crate) use html_dom::element_is_note_target;
 pub use lifecycle::{ImageSizingPolicy, LaidOutDocument, LayoutConstraintError, LayoutConstraints, NoteFlow, PrepareError, PreparedDocument, ShapeLayoutTimings, ShapedDocument, TextCompositionPolicy};
-pub(crate) use lifecycle::{PaintColorRun, PreparedInputs, ShapedText, TextPaintRange};
+pub(crate) use lifecycle::{FirstLineRefinement, PaintColorRun, PreparedInputs, ShapedText, TextPaintRange};
 use semantics::{LinkGlyphTarget, box_id, collect_anchor_glyphs, collect_link_glyph_targets};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -41,22 +48,21 @@ struct FirstLineStyleRange {
     base_style: StyleIndices,
 }
 
-fn first_line_style_ranges(document: &LaidOutDocument) -> Vec<FirstLineStyleRange> {
-    if !document.inputs.styles.has_first_line_styles() {
+fn first_line_style_ranges(inputs: &PreparedInputs, layout_state: &LayoutState) -> Vec<FirstLineStyleRange> {
+    if !inputs.styles.has_first_line_styles() {
         return Vec::new();
     }
-    let first_letter = document.inputs.text.first_letter_styles();
+    let first_letter = inputs.text.first_letter_styles();
     let mut result = Vec::new();
-    for line in document
-        .layout_state
+    for line in layout_state
         .line_output
         .lines
         .iter()
-        .filter(|line| line.paint_color(&document.layout_state.line_output.line_details).is_some())
+        .filter(|line| line.paint_color(&layout_state.line_output.line_details).is_some())
     {
         let line_result_start = result.len();
         let mut previous_text_end = None;
-        for run in document.base_shaped.inline_content.inline_items() {
+        for run in inputs.text.content().inline_items() {
             let InlineItemKind::Text { glyphs } = &run.kind else {
                 // Atomic inline content is a real shaping boundary even when
                 // it occupies no positions in the document glyph buffer.
@@ -71,23 +77,22 @@ fn first_line_style_ranges(document: &LaidOutDocument) -> Vec<FirstLineStyleRang
                 continue;
             }
             let root = crate::shaping::whitespace_context_root(
-                &document.inputs.layout_tree,
+                &inputs.layout_tree,
                 run.box_idx as usize,
             );
             let Some(first_line_style) = crate::shaping::first_line_style_for_inline_root(
-                &document.inputs.document,
-                &document.inputs.styles,
-                &document.inputs.layout_tree,
-                &document.base_shaped.inline_content,
+                &inputs.document,
+                &inputs.styles,
+                &inputs.layout_tree,
+                inputs.text.content(),
                 root,
             ) else {
                 continue;
             };
-            let base_style = document
-                .inputs
+            let base_style = inputs
                 .layout_tree
                 .get_box_style_indices(run.box_idx as usize)
-                .unwrap_or_else(|| document.inputs.styles.default_indices());
+                .unwrap_or_else(|| inputs.styles.default_indices());
             let mut segment_start = start;
             let mut segment_style = first_letter.segment(start, start + 1).0
                 .unwrap_or(first_line_style);
@@ -96,7 +101,7 @@ fn first_line_style_ranges(document: &LaidOutDocument) -> Vec<FirstLineStyleRang
                     .unwrap_or(first_line_style);
                 if style != segment_style {
                     append_first_line_style_range(
-                        document,
+                        &inputs.styles,
                         &mut result,
                         FirstLineStyleRange {
                             glyphs: segment_start..glyph,
@@ -111,7 +116,7 @@ fn first_line_style_ranges(document: &LaidOutDocument) -> Vec<FirstLineStyleRang
                 }
             }
             append_first_line_style_range(
-                document,
+                &inputs.styles,
                 &mut result,
                 FirstLineStyleRange {
                     glyphs: segment_start..end,
@@ -132,7 +137,7 @@ fn first_line_style_ranges(document: &LaidOutDocument) -> Vec<FirstLineStyleRang
 /// are identical. Keeping one range also preserves kerning and ligatures
 /// across otherwise paint-only spans.
 fn append_first_line_style_range(
-    document: &LaidOutDocument,
+    styles: &ComputedStyles,
     result: &mut Vec<FirstLineStyleRange>,
     candidate: FirstLineStyleRange,
     may_join: bool,
@@ -142,14 +147,10 @@ fn append_first_line_style_range(
         let previous = result
             .last_mut()
             .expect("line has a preceding pseudo-style range");
-        let previous_base = document
-            .inputs
-            .styles
+        let previous_base = styles
             .view(previous.base_style)
             .expect("validated base style");
-        let candidate_base = document
-            .inputs
-            .styles
+        let candidate_base = styles
             .view(candidate.base_style)
             .expect("validated base style");
         if previous.glyphs.end == candidate.glyphs.start
@@ -165,33 +166,47 @@ fn append_first_line_style_range(
 }
 
 fn shape_first_line_ranges(
-    inputs: &std::sync::Arc<PreparedInputs>,
-    base: &std::sync::Arc<ShapedText>,
-    seed: &GlyphMetrics,
+    inputs: &PreparedInputs,
+    base: &ShapedText,
     ranges: &[FirstLineStyleRange],
     glyph_shaper: &mut impl crate::GlyphShaper,
-) -> Result<std::sync::Arc<ShapedText>, crate::ShapeError> {
-    // Preserve metrics registered by an earlier attempt: renderer glyph IDs
-    // remain live for the whole document-shaping transaction.
-    let mut shaped = (**base).clone();
-    shaped.glyph_metrics = seed.clone();
-    shaped.inline_plans = crate::layout::PreparedInlinePlans::new(&inputs.layout_tree, &shaped.inline_content);
-    let mut paint_ranges: Vec<_> = ranges.iter().map(|range| TextPaintRange { glyphs: range.glyphs.clone(), style: range.style }).collect();
-    paint_ranges.sort_by_key(|range| range.glyphs.start);
-    shaped.paint_ranges = paint_ranges.into();
+) -> Result<FirstLineRefinement, crate::ShapeError> {
+    let mut refined = FirstLineRefinement {
+        glyph_patches: Vec::new(),
+        paint_ranges: ranges
+            .iter()
+            .map(|range| TextPaintRange {
+                glyphs: range.glyphs.clone(),
+                style: range.style,
+            })
+            .collect(),
+        glyph_metrics: GlyphMetrics::default(),
+        text_geometry: ShapedTextGeometry::with_len(base.glyphs.len()),
+        inline_plan_generation: InlinePlanGeneration::new(),
+    };
+    refined.paint_ranges.sort_by_key(|range| range.glyphs.start);
     for range in ranges {
+        let source = range.glyphs.clone();
+        let original = &base.glyphs[source.start as usize..source.end as usize];
+        let mut glyphs = original.to_vec();
         crate::shaping::reshape_range_with_style(
             &inputs.styles,
-            &mut shaped.inline_content,
-            &mut shaped.glyph_metrics,
-            &mut shaped.text_geometry,
-            range.glyphs.clone(),
+            inputs.text.content(),
+            &mut glyphs,
+            source.start,
+            &base.text_geometry.bidi,
+            &mut refined.text_geometry,
+            source.clone(),
             range.style,
             range.base_style,
             glyph_shaper,
         )?;
+        if glyphs != original {
+            refined.glyph_patches.push(GlyphPatch { source, glyphs });
+        }
     }
-    Ok(std::sync::Arc::new(shaped))
+    refined.glyph_metrics = glyph_shaper.glyph_resources().snapshot();
+    Ok(refined)
 }
 
 /// Resolve the circular dependency between `::first-line` style and the line
@@ -199,21 +214,19 @@ fn shape_first_line_ranges(
 /// viewport-independent shape, so characters that leave the first line never
 /// retain pseudo styling from the preceding width.
 fn refine_first_lines(
-    mut laid_out: LaidOutDocument,
-    base_shaped: std::sync::Arc<ShapedText>,
-    mut shaping_seed: GlyphMetrics,
+    mut laid_out: LayoutCandidate,
+    inputs: &PreparedInputs,
+    base_shaped: &ShapedText,
+    shaping_seed: GlyphMetrics,
     constraints: LayoutConstraints,
     image_metrics: &ImageMetrics,
     glyph_shaper: &mut impl crate::GlyphShaper,
-) -> Result<LaidOutDocument, crate::ShapeError> {
-    let mut ranges = first_line_style_ranges(&laid_out);
+) -> Result<LayoutCandidate, crate::ShapeError> {
+    let mut ranges = first_line_style_ranges(inputs, &laid_out.layout_state);
     if ranges.is_empty() {
-        if shaping_seed.len() > laid_out.shaped.glyph_metrics.len() {
-            let mut shaped = (*laid_out.shaped).clone();
-            shaped.glyph_metrics = shaping_seed;
-            laid_out.shaped = std::sync::Arc::new(shaped);
+        if shaping_seed.len() > base_shaped.glyph_metrics.len() {
+            laid_out.glyph_metrics_override = Some(shaping_seed);
         }
-        laid_out.base_shaped = base_shaped;
         return Ok(laid_out);
     }
 
@@ -223,21 +236,14 @@ fn refine_first_lines(
     let mut seen_ranges = Vec::new();
     for _ in 0..MAX_FIRST_LINE_PASSES {
         seen_ranges.push(ranges.clone());
-        let shaped = shape_first_line_ranges(
-            &laid_out.inputs,
-            &base_shaped,
-            &shaping_seed,
-            &ranges,
-            glyph_shaper,
-        )?;
-        shaping_seed = shaped.glyph_metrics.clone();
+        let shaped = shape_first_line_ranges(inputs, base_shaped, &ranges, glyph_shaper)?;
         // This document is still a private candidate. Reuse its layout
         // buffers while the first-line boundary converges, then publish it.
-        laid_out.shaped = shaped;
-        laid_out.relayout_impl(constraints, image_metrics, None);
-        let next_ranges = first_line_style_ranges(&laid_out);
+        laid_out.refinement = Some(shaped);
+        laid_out.glyph_metrics_override = None;
+        laid_out.relayout(inputs, base_shaped, constraints, image_metrics, None);
+        let next_ranges = first_line_style_ranges(inputs, &laid_out.layout_state);
         if next_ranges == ranges {
-            laid_out.base_shaped = base_shaped;
             return Ok(laid_out);
         }
         if seen_ranges.contains(&next_ranges) {
