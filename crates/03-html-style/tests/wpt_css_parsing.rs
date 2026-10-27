@@ -56,6 +56,7 @@ fn runs_vendored_declarative_css_parsing_tests_directly() {
     let ignored_total = ignored.len();
     let mut unexpected = Vec::new();
     let mut unexpected_passes = Vec::new();
+    let mut parser_panics = Vec::new();
     let mut extracted = 0usize;
     let mut unsupported_calls = 0usize;
     let mut unsupported_details = Vec::new();
@@ -282,11 +283,7 @@ fn runs_vendored_declarative_css_parsing_tests_directly() {
                     let Ok(valid) =
                         catch_unwind(AssertUnwindSafe(|| selector_syntax_is_valid(selector)))
                     else {
-                        unsupported_calls += 1;
-                        unsupported_details.push(format!(
-                            "{run_key}|helper={:?}|reason=dependency parser panicked",
-                            test.kind
-                        ));
+                        parser_panics.push(run_key);
                         continue;
                     };
                     valid
@@ -332,11 +329,7 @@ fn runs_vendored_declarative_css_parsing_tests_directly() {
                         }
                         true
                     })) else {
-                        unsupported_calls += 1;
-                        unsupported_details.push(format!(
-                            "{run_key}|helper={:?}|reason=dependency parser panicked",
-                            test.kind
-                        ));
+                        parser_panics.push(run_key);
                         continue;
                     };
                     valid
@@ -362,11 +355,7 @@ fn runs_vendored_declarative_css_parsing_tests_directly() {
                         }
                         Some(property_value_syntax(property, value))
                     })) else {
-                        unsupported_calls += 1;
-                        unsupported_details.push(format!(
-                            "{run_key}|helper={:?}|reason=dependency parser panicked",
-                            test.kind
-                        ));
+                        parser_panics.push(run_key);
                         continue;
                     };
                     let Some(syntax) = syntax else {
@@ -431,11 +420,12 @@ fn runs_vendored_declarative_css_parsing_tests_directly() {
     }
 
     eprintln!(
-        "direct CSS WPT parsing: {} files, {} non-UTF-8 encoding fixtures, {extracted} literal calls, {executed} non-excluded syntax assertions, {unsupported_declarations} unrepresented syntax assertions, {unsupported_dependency_mismatches} known dependency/scope mismatches, {renderer_unsupported_declarations} declarations with unsupported renderer capabilities, {computed_helpers_checked_for_syntax} computed/shorthand helpers checked for syntax only, {selector_serialization_helpers_checked_for_syntax} selector serialization helpers checked for syntax only, {unsupported_calls} dynamic/unimplemented calls, {unusable_literal_calls} unusable literal calls, {known_mismatches} other known syntax mismatches, {ignored_total} explicitly ignored, {superseded_easing_expectations} superseded easing expectations checked, {superseded_shadow_expectations} superseded shadow expectations checked, {superseded_outline_expectations} superseded outline expectations checked, {superseded_alpha_expectations} superseded alpha expectations checked, {superseded_symbols_expectations} superseded symbols expectations checked, {} unexpected mismatches, {} unexpected passes",
+        "direct CSS WPT parsing: {} files, {} non-UTF-8 encoding fixtures, {extracted} literal calls, {executed} non-excluded syntax assertions, {unsupported_declarations} unrepresented syntax assertions, {unsupported_dependency_mismatches} known dependency/scope mismatches, {renderer_unsupported_declarations} declarations with unsupported renderer capabilities, {computed_helpers_checked_for_syntax} computed/shorthand helpers checked for syntax only, {selector_serialization_helpers_checked_for_syntax} selector serialization helpers checked for syntax only, {unsupported_calls} dynamic/unimplemented calls, {unusable_literal_calls} unusable literal calls, {known_mismatches} other known syntax mismatches, {ignored_total} explicitly ignored, {superseded_easing_expectations} superseded easing expectations checked, {superseded_shadow_expectations} superseded shadow expectations checked, {superseded_outline_expectations} superseded outline expectations checked, {superseded_alpha_expectations} superseded alpha expectations checked, {superseded_symbols_expectations} superseded symbols expectations checked, {} unexpected mismatches, {} unexpected passes, {} dependency parser panics",
         files.len(),
         non_utf8_files.len(),
         unexpected.len(),
-        unexpected_passes.len()
+        unexpected_passes.len(),
+        parser_panics.len()
     );
     if std::env::var_os("HTML_WPT_VERBOSE").is_some() {
         for detail in &unsupported_details {
@@ -443,6 +433,11 @@ fn runs_vendored_declarative_css_parsing_tests_directly() {
         }
     }
 
+    assert!(
+        parser_panics.is_empty(),
+        "dependency parser panics must not be skipped:\n{}",
+        parser_panics.join("\n")
+    );
     assert_eq!(files.len(), 35_417, "the pinned CSS corpus changed");
     assert_eq!(
         non_utf8_files.len(),
