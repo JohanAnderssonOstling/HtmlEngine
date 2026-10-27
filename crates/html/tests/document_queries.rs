@@ -416,8 +416,9 @@ fn public_formula_export_prefers_authored_tex_and_ignores_normal_images() {
     assert!(html::export::mathml_to_latex("<math>").is_err());
     let mut doc_resources = GlyphResourceStore::default();
     let doc = layout("<p><img src='image.png'></p>", &mut doc_resources);
-    assert!(!doc.render_view().export().is_equation(0));
-    assert!(html::export::equation_latex(doc.render_view(), 0).is_none());
+    let view = doc.render_view(&doc_resources);
+    assert!(!view.export().is_equation(0));
+    assert!(html::export::equation_latex(view, 0).is_none());
 }
 
 #[test]
