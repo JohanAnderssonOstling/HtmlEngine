@@ -89,6 +89,19 @@ Skrift is a framework agnostic HTML and CSS rendering engine built with the purp
 - Structured table copy and paste
 - Copy selected content as Markdown
 
+## Benchmark environment
+
+These Linux/X11 measurements use the same GPUI host for both engines. Skrift paints through GPUI. Wry embeds a WebKitGTK child webview inside the GPUI window, and WebKitGTK renders its HTML content through the GTK stack.
+
+| Component | Version |
+| --- | --- |
+| GPUI fork | 0.2.2 |
+| Wry binding (`lb-wry`) | 0.53.3 |
+| WebKitGTK runtime | 2.54.2 |
+| GTK runtime | 3.24.52 |
+
+WebKitGTK and GTK are system libraries. Their shared libraries are excluded from the executable size comparison; the RAM measurements include the host and webview helper processes.
+
 ## Warm engine RAM
 
 <table>
