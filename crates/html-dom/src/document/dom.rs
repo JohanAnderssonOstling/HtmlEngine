@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::marker::PhantomData;
 use std::ops::Range;
+use unicode_bidi::{Direction, get_base_direction_full};
 
 const HTML_NAMESPACE: &str = "http://www.w3.org/1999/xhtml";
 
@@ -44,7 +45,6 @@ pub enum DocumentBuildError {
     NonElementRoot { raw: u32 },
     RecursionCycle { raw: u32 },
     UnreachableNodes { raw: u32 },
-    ToplevelTableEntries { kind: &'static str, raw: u32, index: u16 },
     TooManyNodes,
 }
 
@@ -73,7 +73,6 @@ impl fmt::Display for DocumentBuildError {
             Self::NonElementRoot { raw } => write!(formatter, "document root {raw} is not an element"),
             Self::RecursionCycle { raw } => write!(formatter, "recursion cycle detected near node {raw}"),
             Self::UnreachableNodes { raw } => write!(formatter, "node {raw} is not reachable from root"),
-            Self::ToplevelTableEntries { kind, raw, index } => write!(formatter, "{kind} entry {raw} references invalid string index {index}"),
             Self::TooManyNodes => formatter.write_str("document has too many nodes"),
         }
     }
@@ -150,10 +149,6 @@ impl<State> DocumentBuilder<State> {
 
     pub fn intern_classes(&mut self, classes: Option<&str>) -> Range<u16> {
         self.document.intern_classes(classes)
-    }
-
-    pub fn push_toc_entry(&mut self, entry: crate::DocumentTocEntry) {
-        self.document.toc_entries.push(entry);
     }
 }
 
@@ -257,7 +252,6 @@ impl DocumentBuilder<NeedsRoot> {
         let mut document = self.document;
         document.dom_root = root;
         document.rebuild_html_semantics();
-        document.rebuild_document_toc_entries();
         Ok(document)
     }
 }
@@ -296,16 +290,11 @@ impl DocumentBuilder<Rooted> {
         self.append_dom_text_raw(parent, text)
     }
 
-    pub fn rebuild_document_toc_entries(&mut self) {
-        self.document.rebuild_document_toc_entries();
-    }
-
     pub fn finish(self) -> Result<Document, DocumentBuildError> {
         let root = self.document.validate_for_build()?;
         let mut document = self.document;
         document.dom_root = root;
         document.rebuild_html_semantics();
-        document.rebuild_document_toc_entries();
         Ok(document)
     }
 }
@@ -608,6 +597,8 @@ impl Document {
             let rtl = match is_html.then(|| attr("dir")).flatten() {
                 Some(value) if value.eq_ignore_ascii_case("ltr") => false,
                 Some(value) if value.eq_ignore_ascii_case("rtl") => true,
+                Some(value) if value.eq_ignore_ascii_case("auto") => html_auto_direction(self, node).unwrap_or(false),
+                _ if tag_is("bdi") => html_auto_direction(self, node).unwrap_or(false),
                 _ => inherited_rtl,
             };
             let editable = match is_html.then(|| attr("contenteditable")).flatten() {
@@ -838,18 +829,6 @@ impl Document {
             }
         }
 
-        for (index, entry) in self.toc_entries.iter().enumerate() {
-            if entry.title as usize >= self.strings.len() {
-                return Err(DocumentBuildError::ToplevelTableEntries { kind: "toc title", raw: index as u32, index: entry.title });
-            }
-            if entry.href as usize >= self.strings.len() {
-                return Err(DocumentBuildError::ToplevelTableEntries { kind: "toc href", raw: index as u32, index: entry.href });
-            }
-            if entry.node_idx as usize >= self.dom_nodes.len() {
-                return Err(DocumentBuildError::ToplevelTableEntries { kind: "toc node", raw: index as u32, index: entry.node_idx as u16 });
-            }
-        }
-
         Ok(Some(root))
     }
 
@@ -998,6 +977,42 @@ impl Document {
         }
         let end = self.class_list.len() as u16;
         start..end
+    }
+}
+
+fn html_auto_direction(doc: &Document, root: DomNodeId) -> Option<bool> {
+    let element = doc.element_ref(root)?;
+    if matches!(element.tag(), "input" | "textarea") {
+        if let Some(value) = element.attr("value") {
+            if let Some(direction) = first_strong_direction(value) {
+                return Some(direction);
+            }
+        }
+    }
+    let mut pending: Vec<_> = element.children().collect();
+    pending.reverse();
+    let mut content = String::new();
+    while let Some(node) = pending.pop() {
+        if let Some(text) = doc.text_ref(node) {
+            content.push_str(text.text());
+        } else if let Some(element) = doc.element_ref(node) {
+            if matches!(element.tag(), "bdi" | "script" | "style" | "textarea")
+                || element.attr("dir").is_some_and(|value| ["ltr", "rtl", "auto"].iter().any(|direction| value.eq_ignore_ascii_case(direction)))
+            {
+                continue;
+            }
+            let children: Vec<_> = element.children().collect();
+            pending.extend(children.into_iter().rev());
+        }
+    }
+    first_strong_direction(&content)
+}
+
+fn first_strong_direction(text: &str) -> Option<bool> {
+    match get_base_direction_full(text) {
+        Direction::Ltr => Some(false),
+        Direction::Rtl => Some(true),
+        Direction::Mixed => None,
     }
 }
 
@@ -1412,14 +1427,7 @@ mod tests {
     }
 
     #[test]
-    fn finish_rejects_invalid_toc_indices_and_missing_text_parent() {
-        let mut builder = DocumentBuilder::new();
-        let tag = builder.intern_string("html");
-        let (root, builder) = builder.append_dom_element(None, DomElementData { tag, namespace: None, attributes: Vec::new(), attribute_cache: DomElementAttributeCache::new(None, 0..0), image_idx: None }).expect("root append");
-        let mut builder = builder.set_dom_root(root).expect("root set");
-        builder.push_toc_entry(crate::DocumentTocEntry { level: 1, title: u16::MAX, href: u16::MAX, node_idx: root.raw() });
-        assert!(matches!(builder.finish(), Err(DocumentBuildError::ToplevelTableEntries { .. })));
-
+    fn finish_rejects_missing_text_parent() {
         let mut builder = DocumentBuilder::new();
         let tag = builder.intern_string("html");
         let (root, mut builder) = builder.append_dom_element(None, DomElementData { tag, namespace: None, attributes: Vec::new(), attribute_cache: DomElementAttributeCache::new(None, 0..0), image_idx: None }).expect("root append");

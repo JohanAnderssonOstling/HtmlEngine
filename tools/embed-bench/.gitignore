@@ -1,0 +1,6 @@
+**/target/
+__pycache__/
+results/*
+!results/gpui-culled-suite-cold-first-20261027.json
+!results/gpui-culled-suite-warm-first-20261027.json
+!results/gpui-culled-suite-warm-whole-20261027.json

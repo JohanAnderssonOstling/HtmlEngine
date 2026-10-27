@@ -13,14 +13,15 @@ parser.add_argument('--after-time', required=True)
 parser.add_argument('--before-heap', required=True)
 parser.add_argument('--after-heap', required=True)
 parser.add_argument('--chapters', required=True)
+parser.add_argument('--pattern', default='c000[123].html')
 parser.add_argument('--output', required=True)
 parser.add_argument('--cpu', type=int, required=True)
 parser.add_argument('--samples', type=int, default=11)
 parser.add_argument('--rounds', type=int, default=3)
 parser.add_argument('--cases', nargs='+', default=['cold', 'resize', 'paint', 'font', 'handoff'])
 args = parser.parse_args()
-chapters = sorted(Path(args.chapters).glob('c000[123].html'))
-assert len(chapters) == 3
+chapters = sorted(Path(args.chapters).glob(args.pattern))
+assert chapters, f'No fixtures matching {args.pattern!r}'
 results = []
 
 def run(binary, chapter, case, samples):
@@ -55,7 +56,10 @@ for chapter in chapters:
             row['time'][variant] = summary
             row['heap'][variant] = run(getattr(args, variant + '_heap'), chapter, case, 5)
         if all('error' not in sample for variant in samples.values() for sample in variant):
-            row['paired_change_percent'] = {key: 100 * statistics.median(after[key] / before[key] - 1 for before, after in zip(samples['before'], samples['after'])) for key in ['wall_median_ms', 'cpu_median_ms']}
+            metrics = ['wall_median_ms', 'cpu_median_ms']
+            if all(run.get('user_instructions') is not None for runs in samples.values() for run in runs):
+                metrics.append('user_instructions')
+            row['paired_change_percent'] = {key: 100 * statistics.median(after[key] / before[key] - 1 for before, after in zip(samples['before'], samples['after'])) for key in metrics}
         before, after = row['time']['before'], row['time']['after']
         if 'error' not in before and 'error' not in after:
             for key in ['glyphs', 'lines', 'render_fingerprint', 'source_fingerprint', 'text_color_fingerprint']:

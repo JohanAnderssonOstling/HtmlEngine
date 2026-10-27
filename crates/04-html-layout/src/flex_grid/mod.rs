@@ -11,11 +11,11 @@ mod measurement;
 mod style;
 mod taffy_layout;
 mod tracks;
-pub(crate) use intrinsic::{
+pub use intrinsic::{
     intrinsic_widths, intrinsic_widths_with_available, intrinsic_widths_with_constraints,
 };
 use item_sizing::resolve_intrinsic_flex_basis;
-pub(crate) use measurement::FlexGridState;
+pub use measurement::FlexGridState;
 use style::{
     grid_definite_inline_minimum_exceeds_track_limit, layout_style, taffy_container_style,
     taffy_item_style,
@@ -24,12 +24,12 @@ use taffy_layout::TaffyLayoutTree;
 use tracks::template_tracks_use_percentage;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TaffyContainerKind {
+pub enum TaffyContainerKind {
     Flex,
     Grid,
 }
 
-pub(crate) fn layout(
+pub fn layout(
     session: &mut LayoutEngine<'_, '_>,
     container_idx: usize,
     children: &[u32],
@@ -107,7 +107,7 @@ pub(crate) fn layout(
     let mut child_styles = Vec::with_capacity(ordered_children.len().max(1));
     for &(_, child) in &ordered_children {
         let resolved_flex_basis = if kind == TaffyContainerKind::Flex {
-            resolve_intrinsic_flex_basis(session, child as usize, content_width, flex_row)
+            resolve_intrinsic_flex_basis(session, child as usize, content_width, child_containing_height, flex_row)
         } else {
             None
         };
@@ -246,6 +246,7 @@ pub(crate) fn layout(
             PreferredSize::Calc { .. } => child_containing_height.is_some(),
             PreferredSize::Comparison { .. } => child_containing_height.is_some(),
             PreferredSize::Auto
+            | PreferredSize::Content
             | PreferredSize::MinContent
             | PreferredSize::MaxContent
             | PreferredSize::FitContent => false,

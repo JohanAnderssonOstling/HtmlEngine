@@ -5,7 +5,7 @@ use std::ops::Range;
 use super::placement::{BoxPlacement, PlacementState};
 
 #[derive(Clone, Copy)]
-pub(crate) struct OutputCursor {
+pub struct OutputCursor {
     lines: usize,
     decorations: usize,
     images: usize,
@@ -13,7 +13,7 @@ pub(crate) struct OutputCursor {
 }
 
 #[derive(Clone)]
-pub(crate) struct OutputRanges {
+pub struct OutputRanges {
     pub placement: BoxPlacement,
     pub lines: Range<usize>,
     pub decorations: Range<usize>,
@@ -22,14 +22,14 @@ pub(crate) struct OutputRanges {
 }
 
 impl OutputRanges {
-    pub(crate) fn has_lines_or_images(&self) -> bool {
+    pub fn has_lines_or_images(&self) -> bool {
         !self.lines.is_empty() || !self.images.is_empty()
     }
 }
 
 /// Owns published line/fragment output and the parallel owner indexes required
 /// while that output is being assembled.
-pub(crate) struct FragmentWriter<'out> {
+pub struct FragmentWriter<'out> {
     replaying_paint: bool,
     state: &'out mut LayoutState,
     line_owners: Vec<u32>,
@@ -53,7 +53,7 @@ impl<'out> FragmentWriter<'out> {
     }
 
     /// Resets all published fragment state while retaining reusable allocation.
-    pub(crate) fn reset(&mut self) {
+    pub fn reset(&mut self) {
         self.line_owners.clear();
         self.block_decoration_owners.clear();
         self.last_inline_fragments.clear();
@@ -77,6 +77,7 @@ impl<'out> FragmentWriter<'out> {
         state.line_output.ellipsis_fragments.clear();
         state.line_output.hyphen_fragments.clear();
         state.fragment_output.decorations.clear();
+        state.fragment_output.scene_paint_order.clear();
         state.fragment_output.decoration_line_indices.clear();
         state.fragment_output.decoration_paint_orders.clear();
         state.fragment_output.decoration_fragments_by_line.clear();
@@ -100,15 +101,15 @@ impl<'out> FragmentWriter<'out> {
         state.semantic_indexes.anchor_positions.clear();
     }
 
-    pub(crate) fn state(&self) -> &LayoutState {
+    pub fn state(&self) -> &LayoutState {
         self.state
     }
 
-    pub(crate) fn state_mut(&mut self) -> &mut LayoutState {
+    pub fn state_mut(&mut self) -> &mut LayoutState {
         self.state
     }
 
-    pub(crate) fn output_cursor(&self) -> OutputCursor {
+    pub fn output_cursor(&self) -> OutputCursor {
         OutputCursor {
             lines: self.state.line_output.lines.len(),
             decorations: self.state.fragment_output.decorations.len(),
@@ -117,7 +118,7 @@ impl<'out> FragmentWriter<'out> {
         }
     }
 
-    pub(crate) fn output_since(
+    pub fn output_since(
         &self,
         cursor: OutputCursor,
         placement: BoxPlacement,
@@ -131,16 +132,16 @@ impl<'out> FragmentWriter<'out> {
         }
     }
 
-    pub(crate) fn set_paint_replay(&mut self) { self.replaying_paint = true; }
-    pub(crate) fn is_paint_replay(&self) -> bool { self.replaying_paint }
+    pub fn set_paint_replay(&mut self) { self.replaying_paint = true; }
+    pub fn is_paint_replay(&self) -> bool { self.replaying_paint }
 
-    pub(crate) fn record_paint(&mut self, placement: &PlacementState, operation: super::paint_program::PaintOperation) {
+    pub fn record_paint(&mut self, placement: &PlacementState, operation: super::paint_program::PaintOperation) {
         if !self.replaying_paint && placement.retains_output() {
             self.state.paint_program.record(operation, placement.current_group());
         }
     }
 
-    pub(crate) fn apply_paint_layers_since(&mut self, start: usize, layers: u8) {
+    pub fn apply_paint_layers_since(&mut self, start: usize, layers: u8) {
         use super::paint_program::{POSITIONED, NEGATIVE, INDEPENDENT};
         let output = &mut self.state.fragment_output;
         let end = output.decorations.len();
@@ -154,7 +155,7 @@ impl<'out> FragmentWriter<'out> {
         }
     }
 
-    pub(crate) fn mark_positioned_layer(
+    pub fn mark_positioned_layer(
         &mut self,
         output: &OutputRanges,
         negative: bool,
@@ -224,7 +225,7 @@ impl<'out> FragmentWriter<'out> {
         }
     }
 
-    pub(crate) fn first_baseline_offset(&self, lines: Range<usize>, origin_y: f64) -> Option<f64> {
+    pub fn first_baseline_offset(&self, lines: Range<usize>, origin_y: f64) -> Option<f64> {
         let mut first: Option<(Point, f64)> = None;
         for line_idx in lines {
             let line = &self.state.line_output.lines[line_idx];
@@ -236,7 +237,7 @@ impl<'out> FragmentWriter<'out> {
         first.map(|(point, baseline)| point.y + baseline - origin_y)
     }
 
-    pub(crate) fn last_baseline_offset(&self, lines: Range<usize>, origin_y: f64) -> Option<f64> {
+    pub fn last_baseline_offset(&self, lines: Range<usize>, origin_y: f64) -> Option<f64> {
         let mut last: Option<(Point, f64)> = None;
         for line_idx in lines {
             let line = &self.state.line_output.lines[line_idx];
@@ -248,11 +249,11 @@ impl<'out> FragmentWriter<'out> {
         last.map(|(point, baseline)| point.y + baseline - origin_y)
     }
 
-    pub(crate) fn line_point(&self, line_idx: usize) -> Point {
+    pub fn line_point(&self, line_idx: usize) -> Point {
         self.state.line_output.lines[line_idx].point
     }
 
-    pub(crate) fn lines_before_y(&self, lines: Range<usize>, y: f64) -> usize {
+    pub fn lines_before_y(&self, lines: Range<usize>, y: f64) -> usize {
         lines
             .filter(|&line_idx| self.line_point(line_idx).y < y)
             .count()
@@ -264,8 +265,6 @@ impl<'out> FragmentWriter<'out> {
 
     pub(super) fn materialize_absolute_positions(
         &mut self,
-        local_line_points: &[Point],
-        local_decoration_rects: &[Rect],
         line_groups: &[u32],
         decoration_groups: &[u32],
         resolved_offsets: &[Vec2],
@@ -273,7 +272,7 @@ impl<'out> FragmentWriter<'out> {
         for (index, line) in self.state.line_output.lines.iter_mut().enumerate() {
             let offset = resolved_offsets[line_groups[index] as usize];
             if offset != Vec2::ZERO {
-                line.point = local_line_points[index] + offset;
+                line.point += offset;
             }
         }
         for (index, decoration) in self
@@ -286,27 +285,9 @@ impl<'out> FragmentWriter<'out> {
         {
             let offset = resolved_offsets[decoration_groups[index] as usize];
             if offset != Vec2::ZERO {
-                decoration.rect = local_decoration_rects[index] + offset;
+                decoration.rect = decoration.rect + offset;
             }
         }
-    }
-
-    pub(super) fn capture_local_positions(
-        &self,
-        line_points: &mut Vec<Point>,
-        decoration_rects: &mut Vec<Rect>,
-    ) {
-        line_points.clear();
-        line_points.extend(self.state.line_output.lines.iter().map(|line| line.point));
-        decoration_rects.clear();
-        decoration_rects.extend(
-            self.state
-                .fragment_output
-                .decorations
-                .fragments()
-                .iter()
-                .map(|decoration| decoration.rect),
-        );
     }
 
     pub(super) fn push_line_owner(&mut self, placement: &mut PlacementState, owner: u32) {
@@ -316,7 +297,7 @@ impl<'out> FragmentWriter<'out> {
 
     /// Publishes one line's inline fragments and links continuations without
     /// adding per-line allocations.
-    pub(crate) fn push_inline_box_fragments(
+    pub fn push_inline_box_fragments(
         &mut self,
         fragments: Vec<crate::layout_model::LineInlineBoxFragment>,
         box_count: usize,
@@ -356,11 +337,11 @@ impl<'out> FragmentWriter<'out> {
         self.block_decoration_owners.push(owner);
     }
 
-    pub(crate) fn decoration_len(&self) -> usize {
+    pub fn decoration_len(&self) -> usize {
         self.state.fragment_output.decorations.len()
     }
 
-    pub(crate) fn decoration_store_mut(&mut self) -> &mut DecorationStore {
+    pub fn decoration_store_mut(&mut self) -> &mut DecorationStore {
         &mut self.state.fragment_output.decorations
     }
 
@@ -421,7 +402,7 @@ impl<'out> FragmentWriter<'out> {
             .extend(std::iter::repeat_n(owner, added));
     }
 
-    pub(crate) fn record_decoration_line_since(&mut self, line_idx: usize, start: usize) {
+    pub fn record_decoration_line_since(&mut self, line_idx: usize, start: usize) {
         const NO_LINE: u32 = u32::MAX;
         let end = self.decoration_len();
         self.state
@@ -438,7 +419,7 @@ impl<'out> FragmentWriter<'out> {
     /// those late decorations so they can continue to be replayed with that
     /// line (especially after relative positioning moves them away from its
     /// unshifted flow geometry).
-    pub(crate) fn inherit_line_layer_for_decorations_since(
+    pub fn inherit_line_layer_for_decorations_since(
         &mut self,
         line_idx: usize,
         start: usize,
@@ -491,7 +472,7 @@ impl<'out> FragmentWriter<'out> {
             .fill(independent);
     }
 
-    pub(crate) fn record_decoration_paint_order_since(&mut self, paint_order: u32, start: usize) {
+    pub fn record_decoration_paint_order_since(&mut self, paint_order: u32, start: usize) {
         let end = self.decoration_len();
         self.state
             .fragment_output
@@ -500,7 +481,7 @@ impl<'out> FragmentWriter<'out> {
         self.state.fragment_output.decoration_paint_orders[start..end].fill(paint_order);
     }
 
-    pub(crate) fn finalization_parts(
+    pub fn finalization_parts(
         &mut self,
     ) -> (&mut LayoutState, &mut Vec<u32>, &mut Vec<u32>) {
         (
@@ -523,7 +504,7 @@ impl<'out> FragmentWriter<'out> {
         std::mem::swap(&mut self.last_inline_fragments, last_inline_fragments);
     }
 
-    pub(crate) fn recycle_owner_storage(
+    pub fn recycle_owner_storage(
         &mut self,
         line_owners: &mut Vec<u32>,
         block_decoration_owners: &mut Vec<u32>,

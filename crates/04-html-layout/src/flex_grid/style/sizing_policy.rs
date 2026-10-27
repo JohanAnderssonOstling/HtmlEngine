@@ -3,7 +3,7 @@ use html_style_model::UsedPreferredSize as PreferredSize;
 use super::super::{TaffyContainerKind, tracks::fixed_auto_track_limit};
 use super::{LayoutEngine, layout_style};
 
-pub(crate) fn grid_definite_inline_minimum_exceeds_track_limit(
+pub fn grid_definite_inline_minimum_exceeds_track_limit(
     session: &LayoutEngine<'_, '_>,
     container_idx: usize,
     children: &[u32],

@@ -4,6 +4,8 @@
 //! packages. Reader pagination and UI behavior deliberately live outside this
 //! facade.
 
+pub mod export;
+
 pub mod document {
     pub use html_dom::*;
     pub use html_parse::{
@@ -14,6 +16,42 @@ pub mod document {
         parse_html_document, parse_html_document_bytes, parse_html_document_with_options,
         parse_html_fragment, parse_xml_document, plain_text_from_fragment,
     };
+
+    /// Declared media type takes precedence over the resource filename.
+    pub fn markup_syntax_for_resource(
+        provider: &dyn crate::resources::ResourceProvider,
+        uri: &str,
+    ) -> MarkupSyntax {
+        let media_type = provider
+            .metadata(uri)
+            .ok()
+            .and_then(|metadata| metadata.media_type);
+        match media_type
+            .as_deref()
+            .map(|value| value.split(';').next().unwrap_or(value).trim())
+        {
+            Some(value)
+                if value.eq_ignore_ascii_case("application/xhtml+xml")
+                    || value.eq_ignore_ascii_case("application/xml")
+                    || value.eq_ignore_ascii_case("text/xml") =>
+            {
+                MarkupSyntax::Xml
+            }
+            Some(value) if value.eq_ignore_ascii_case("text/html") => MarkupSyntax::Html,
+            _ => MarkupSyntax::from_uri(uri),
+        }
+    }
+
+    /// Build a parse-only text/source index for search without loading fonts,
+    /// images, styles, or a reader viewport.
+    pub fn text_index_for_resource(
+        source: &str,
+        provider: &dyn crate::resources::ResourceProvider,
+        uri: &str,
+    ) -> Option<DocumentTextIndex> {
+        let parsed = parse_document(source, markup_syntax_for_resource(provider, uri)).ok()?;
+        DocumentTextIndex::from_parsed(&parsed).ok()
+    }
 }
 
 /// Transitional access to parsing diagnostics. Normal consumers should prefer
@@ -36,16 +74,19 @@ pub mod style {
 }
 
 pub mod text {
-    pub use html_layout::{
-        CharacterPlacement, FontMetricsRequest, FontRelativeMetrics, FontSlant, GlyphId,
-        GlyphMetric, GlyphMetricError, GlyphResourceGeneration, GlyphResourceStore, GlyphShaper,
-        OpenTypeFeature, ShapeError,
-        ShapedLine, ShapedTextRun, TextRunId, TextRunShapeRequest, TextShapeRequest, TextStyleSpan,
+    pub use html_pipeline::engine::{
+        CharacterPlacement, ContentLanguage, FontMetrics, FontMetricsRequest, FontRelativeMetrics,
+        FontSlant, GlyphHandle, GlyphId, GlyphMetric, GlyphMetricError, GlyphRequest,
+        GlyphResourceCheckpoint, GlyphResourceGeneration, GlyphResourceStore, GlyphResources,
+        GlyphShaper, LanguageTag, OpenTypeFeature, ShapeError, ShapedGlyph, ShapedLine,
+        ShapedTextRun, TextDirection, TextRunId, TextRunShapeRequest, TextShapeRequest,
+        TextStyleSpan,
     };
+    pub use html_pipeline::engine::{TextSearchOptions, find_text_matches};
 }
 
 pub mod layout {
-    pub use html_layout::*;
+    pub use html_pipeline::engine::*;
 }
 
 /// Incremental parse/style/layout engine API.
@@ -112,14 +153,15 @@ pub mod engine {
     use std::sync::Arc;
 
     use crate::layout::{GlyphShaper, LaidOutDocument};
-    use crate::pipeline::{PipelineError, PipelineInputs, PipelineSession, PipelineUpdate};
+    use crate::pipeline::{
+        PipelineChanges, PipelineError, PipelineInputs, PipelineSession, PipelineUpdate,
+    };
     use crate::resources::ResourceProvider;
+    use crate::style::FontFace;
 
-    /// Stable facade over the internal incremental pipeline.
-    ///
-    /// Revision management remains exposed through `PipelineInputs` during the
-    /// migration. It can move behind focused setters without changing which
-    /// Cargo package applications depend on.
+    /// Facade over the incremental pipeline. The session owns its source and
+    /// committed inputs; hosts submit changes and borrow the published state.
+    /// Each shaping operation borrows the host's text backend.
     pub struct Engine {
         session: PipelineSession,
     }
@@ -131,12 +173,30 @@ pub mod engine {
             }
         }
 
+        /// Load or replace a complete set of owned document inputs. For
+        /// subsequent updates, use [`Self::apply_changes`] to retain unchanged
+        /// source text and configuration in the session.
         pub fn update(
             &mut self,
             inputs: PipelineInputs,
             glyph_shaper: &mut impl GlyphShaper,
         ) -> Result<PipelineUpdate, PipelineError> {
             self.session.attach(glyph_shaper).update(inputs)
+        }
+
+        /// The session owns the committed source and configuration. Hosts can
+        /// borrow these values instead of retaining a second input snapshot.
+        pub fn inputs(&self) -> Option<&PipelineInputs> {
+            self.session.inputs()
+        }
+
+        /// Applies proposed fields while borrowing unchanged source and inputs.
+        pub fn apply_changes(
+            &mut self,
+            changes: PipelineChanges,
+            glyph_shaper: &mut impl GlyphShaper,
+        ) -> Result<PipelineUpdate, PipelineError> {
+            self.session.attach(glyph_shaper).apply_changes(changes)
         }
 
         /// Prepares provider-backed HTML through parse and style without
@@ -147,6 +207,14 @@ pub mod engine {
             inputs: PipelineInputs,
         ) -> Result<(), PipelineError> {
             self.session.prepare_through_style(inputs)
+        }
+
+        /// Active font declarations, available before shaping after
+        /// [`Self::prepare_through_style`]. Load/register these faces in the
+        /// host text backend, then call [`Self::rehydrate_glyphs`].
+        /// URL sources are resolved against their declaring stylesheet.
+        pub fn font_faces(&self) -> &[FontFace] {
+            self.session.font_faces()
         }
 
         pub fn media_environment_change_affects_style(
@@ -174,8 +242,10 @@ pub mod engine {
             id: &str,
             constraints: crate::layout::LayoutConstraints,
             glyph_shaper: &mut impl GlyphShaper,
-        ) -> Option<LaidOutDocument> {
-            self.session.attach(glyph_shaper).layout_note(id, constraints)
+        ) -> Option<crate::layout::NoteLayout> {
+            self.session
+                .attach(glyph_shaper)
+                .layout_note(id, constraints)
         }
 
         /// Ids of the current document's note bodies, in document order.
@@ -183,11 +253,28 @@ pub mod engine {
             self.session.note_ids()
         }
 
-        pub fn document(&self) -> Option<&LaidOutDocument> {
+        pub fn document(&self) -> Option<&LaidOutDocument<'static>> {
             self.session.document()
         }
 
-        pub fn document_mut(&mut self) -> Option<&mut LaidOutDocument> {
+        pub fn glyph_resources(&self) -> &crate::text::GlyphResourceStore {
+            self.session.glyph_resources()
+        }
+
+        pub fn render_view(&self) -> Option<crate::layout::RenderView<'_>> {
+            self.session.render_view()
+        }
+
+        pub fn document_mut_and_resources(
+            &mut self,
+        ) -> Option<(
+            &mut LaidOutDocument<'static>,
+            &crate::text::GlyphResourceStore,
+        )> {
+            self.session.document_mut_and_resources()
+        }
+
+        pub fn document_mut(&mut self) -> Option<&mut LaidOutDocument<'static>> {
             self.session.document_mut()
         }
     }

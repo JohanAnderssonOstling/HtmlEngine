@@ -588,16 +588,11 @@ pub(super) fn candidate_action(
 }
 
 fn rollback(property: &Property<'_>) -> Option<RollbackKind> {
-    let keyword = match property {
-        Property::All(CSSWideKeyword::Revert) => return Some(RollbackKind::Origin),
-        Property::All(CSSWideKeyword::RevertLayer) => return Some(RollbackKind::Layer),
-        Property::Unparsed(value) => single_ident_keyword(&value.value)?,
-        Property::Custom(value) if !value.name.as_ref().starts_with("--") => {
-            single_ident_keyword(&value.value)?
-        }
-        _ => return None,
-    };
-    rollback_keyword(keyword)
+    match property {
+        Property::All(CSSWideKeyword::Revert) => Some(RollbackKind::Origin),
+        Property::All(CSSWideKeyword::RevertLayer) => Some(RollbackKind::Layer),
+        _ => rollback_keyword(property_css_wide_keyword(property)?),
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -691,12 +686,12 @@ pub(super) fn select_specified_values<'sheet, 'css>(
         let target_start = selected.targets.len();
         for target in targets.iter() {
             // `all` deliberately excludes direction and custom properties.
-            if (&*target.name != "direction" && all_claimed)
+            if (!matches!(&*target.name, "direction" | "unicode-bidi") && all_claimed)
                 || target_state.is_claimed(target.slot, claim_epoch)
             {
                 continue;
             }
-            if &*target.name != "direction"
+            if !matches!(&*target.name, "direction" | "unicode-bidi")
                 && matches!(
                     candidate_action(&global_rollbacks, event.boundary, None),
                     CandidateAction::Excluded

@@ -2,7 +2,7 @@ use super::{MemoryUsage, MemoryUsageReport};
 use rustc_data_structures::fx::FxHashMap;
 use std::sync::Arc;
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub enum ImageSource {
     Uri(String),
     /// Original MathML retained beside its generated, self-contained SVG.
@@ -40,7 +40,7 @@ impl MemoryUsage for ImageSource {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct ImageResource {
     pub source: ImageSource,
     pub width: u32,

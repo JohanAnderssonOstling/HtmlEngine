@@ -4,11 +4,16 @@
 //! declaration such as `opacity: 0.5` can be valid CSS while still being a
 //! feature this renderer does not implement.
 
+use super::property_id::RendererPropertyId;
+use super::substitution::{contains_function, needs_substitution};
+use super::value::{css_wide_keyword, may_have_substitutions, parsed_property};
+use super::{inline_values, unit_algebra};
 use crate::{PropertyCapability, PropertySyntax, UnsupportedStyleFeature};
 use lightningcss::printer::PrinterOptions;
 use lightningcss::properties::custom::{Token, TokenList, TokenOrValue};
+use lightningcss::properties::display::Visibility;
+use lightningcss::properties::position::Position;
 use lightningcss::properties::{Property, PropertyId};
-use lightningcss::stylesheet::ParserOptions;
 use lightningcss::values::image::Image;
 
 pub(crate) fn declaration_is_custom_property(property: &Property<'_>) -> bool {
@@ -19,18 +24,20 @@ pub(crate) fn declaration_is_custom_property(property: &Property<'_>) -> bool {
     }
 }
 
-fn token_list_contains_var(tokens: &TokenList<'_>) -> bool {
-    tokens.0.iter().any(|token| match token {
-        TokenOrValue::Var(_) => true,
-        TokenOrValue::Function(function) => token_list_contains_var(&function.arguments),
-        _ => false,
-    })
-}
-
 fn token_list_is_css_wide_keyword(tokens: &TokenList<'_>) -> bool {
-    let mut tokens = tokens.0.iter().filter(|token| !matches!(token, TokenOrValue::Token(Token::WhiteSpace(_) | Token::Comment(_))));
-    let Some(TokenOrValue::Token(Token::Ident(keyword))) = tokens.next() else { return false };
-    tokens.next().is_none() && ["inherit", "initial", "unset", "revert", "revert-layer"].iter().any(|candidate| keyword.eq_ignore_ascii_case(candidate))
+    let mut tokens = tokens.0.iter().filter(|token| {
+        !matches!(
+            token,
+            TokenOrValue::Token(Token::WhiteSpace(_) | Token::Comment(_))
+        )
+    });
+    let Some(TokenOrValue::Token(Token::Ident(keyword))) = tokens.next() else {
+        return false;
+    };
+    tokens.next().is_none()
+        && ["inherit", "initial", "unset", "revert", "revert-layer"]
+            .iter()
+            .any(|candidate| keyword.eq_ignore_ascii_case(candidate))
 }
 
 /// Target-independent eligibility that can be decided without serializing the
@@ -40,12 +47,51 @@ pub(crate) fn declaration_renderer_eligibility(property: &Property<'_>) -> Optio
         return Some(false);
     }
     if matches!(property, Property::All(_))
-        || matches!(property, Property::Unparsed(value) if token_list_is_css_wide_keyword(&value.value) || token_list_contains_var(&value.value))
-        || matches!(property, Property::Custom(value) if token_list_is_css_wide_keyword(&value.value) || token_list_contains_var(&value.value))
+        || matches!(property, Property::Unparsed(value) if token_list_is_css_wide_keyword(&value.value) || needs_substitution(&value.value))
+        || matches!(property, Property::Custom(value) if token_list_is_css_wide_keyword(&value.value) || needs_substitution(&value.value))
     {
-        return Some(true);
+        // Native var() arguments are already checked by the dependency.
+        // Other arbitrary-value functions are retained as unknown functions,
+        // so validate their grammar before admitting pending declarations.
+        let valid = match property {
+            Property::Unparsed(value) => super::substitution::substitutions(&value.value.0).is_ok(),
+            Property::Custom(value) => super::substitution::substitutions(&value.value.0).is_ok(),
+            _ => true,
+        };
+        return Some(valid);
     }
-    if property_uses_unsupported_text_decoration_style(property) || property_uses_unsupported_outline_style(property) {
+    if property_uses_unsupported_text_decoration_style(property)
+        || property_uses_unsupported_outline_style(property)
+    {
+        return Some(false);
+    }
+    if matches!(property, Property::Unparsed(value) if matches!(value.property_id, PropertyId::Background))
+    {
+        return Some(false);
+    }
+    if let Property::Unparsed(value) = property
+        && unit_algebra::size_property(&value.property_id)
+        && let Ok(source) = property.value_to_css_string(PrinterOptions::default())
+        && let Some(supported) = unit_algebra::value_is_supported(&value.property_id, &source)
+    {
+        return Some(supported);
+    }
+    if let Property::Unparsed(value) = property
+        && matches!(
+            value.property_id,
+            PropertyId::VerticalAlign | PropertyId::TextOverflow(_)
+        )
+    {
+        return Some(
+            property
+                .value_to_css_string(PrinterOptions::default())
+                .is_ok_and(|source| inline_values::value_is_supported(&value.property_id, &source)),
+        );
+    }
+    if super::grid::native_value_is_unsupported(property)
+        || matches!(property, Property::Unparsed(value)
+            if raw_value_is_unsupported(&value.property_id, &value.value))
+    {
         return Some(false);
     }
     if matches!(property, Property::Unparsed(_) | Property::Custom(_)) {
@@ -60,13 +106,31 @@ pub(crate) fn declaration_is_renderer_eligible(property: &Property<'_>) -> bool 
     if let Some(eligible) = declaration_renderer_eligibility(property) {
         return eligible;
     }
-    let Ok(value) = property.value_to_css_string(PrinterOptions::default()) else { return false };
+    let Ok(value) = property.value_to_css_string(PrinterOptions::default()) else {
+        return false;
+    };
+    // Partial containment still applies its implemented size behavior even
+    // though @supports must report the full value as unsupported.
+    if RendererPropertyId::from_lightning(&property.property_id())
+        == Some(RendererPropertyId::Contain)
+    {
+        return super::contain::parse(&value).is_some();
+    }
     let support = crate::declaration_support(property.property_id().name(), &value);
-    support.syntax != PropertySyntax::Invalid
-        && !matches!(support.capability, PropertyCapability::Unsupported(UnsupportedStyleFeature::Gradient | UnsupportedStyleFeature::GeneratedContent))
+    support.syntax == PropertySyntax::Valid && support.capability == PropertyCapability::Supported
 }
 
 pub(crate) fn is_supported_property_name(name: &str) -> bool {
+    if name.starts_with('-') && !matches!(PropertyId::from(name), PropertyId::Custom(_)) {
+        for prefix in ["-webkit-", "-moz-", "-ms-", "-o-"] {
+            if let Some(unprefixed) = name.strip_prefix(prefix) {
+                return is_supported_property_name(unprefixed);
+            }
+        }
+    }
+    if RendererPropertyId::from_name(name).is_some() {
+        return true;
+    }
     matches!(
         name,
         "all"
@@ -83,16 +147,10 @@ pub(crate) fn is_supported_property_name(name: &str) -> bool {
             | "text-align-last"
             | "text-indent"
             | "text-overflow"
-            | "text-box"
-            | "text-box-trim"
-            | "text-box-edge"
             | "text-transform"
             | "direction"
+            | "unicode-bidi"
             | "font-variant-caps"
-            | "font-variant-numeric"
-            | "font-variant-ligatures"
-            | "font-kerning"
-            | "font-feature-settings"
             | "text-decoration-line"
             | "text-decoration"
             | "text-decoration-color"
@@ -110,10 +168,7 @@ pub(crate) fn is_supported_property_name(name: &str) -> bool {
             | "width"
             | "height"
             | "aspect-ratio"
-            | "object-fit"
-            | "object-position"
             | "visibility"
-            | "outline-offset"
             | "min-width"
             | "min-height"
             | "max-width"
@@ -200,33 +255,19 @@ pub(crate) fn is_supported_property_name(name: &str) -> bool {
             | "border-end-start-radius"
             | "border-end-end-radius"
             | "border-spacing"
-            | "table-layout"
-            | "border-collapse"
-            | "caption-side"
-            | "empty-cells"
             | "outline"
             | "outline-width"
             | "outline-style"
             | "outline-color"
-            | "float"
-            | "clear"
             | "hyphens"
             | "word-break"
+            | "line-break"
             | "overflow-wrap"
             | "word-wrap"
             | "overflow"
             | "overflow-x"
             | "overflow-y"
             | "box-sizing"
-            | "contain"
-            | "break-before"
-            | "break-after"
-            | "break-inside"
-            | "page-break-before"
-            | "page-break-after"
-            | "page-break-inside"
-            | "widows"
-            | "orphans"
             | "display"
             | "position"
             | "z-index"
@@ -254,9 +295,6 @@ pub(crate) fn is_supported_property_name(name: &str) -> bool {
             | "place-self"
             | "row-gap"
             | "column-gap"
-            | "grid-row-gap"
-            | "grid-column-gap"
-            | "grid-gap"
             | "gap"
             | "grid-template-rows"
             | "grid-template-columns"
@@ -273,10 +311,6 @@ pub(crate) fn is_supported_property_name(name: &str) -> bool {
             | "grid-row"
             | "grid-column"
             | "grid-area"
-            | "content"
-            | "counter-reset"
-            | "counter-increment"
-            | "quotes"
     )
 }
 
@@ -285,116 +319,165 @@ pub fn property_name_is_supported(name: &str) -> bool {
     normalized.starts_with("--") || is_supported_property_name(&normalized)
 }
 
+/// Decide renderer support before doing any property-specific validation.
+/// Unsupported features do not need a second implementation of their grammar.
 pub(crate) fn declaration_capability(name: &str, value: &str) -> PropertyCapability {
-    if name.eq_ignore_ascii_case("content") {
+    let unsupported = if is_border_image_property_name(name) {
+        Some(UnsupportedStyleFeature::BorderImage)
+    } else if is_box_shadow_property_name(name) {
+        Some(UnsupportedStyleFeature::BoxShadow)
+    } else if is_filter_effect_property_name(name) {
+        Some(UnsupportedStyleFeature::FilterEffects)
+    } else if is_transition_property_name(name) {
+        Some(UnsupportedStyleFeature::Transitions)
+    } else if is_animation_property_name(name) {
+        Some(UnsupportedStyleFeature::Animations)
+    } else if !name.starts_with("--") && !is_supported_property_name(name) {
+        Some(UnsupportedStyleFeature::Property)
+    } else {
+        None
+    };
+    if let Some(reason) = unsupported {
+        return PropertyCapability::Unsupported(reason);
+    }
+    if name.starts_with("--") || css_wide_keyword(value) || may_have_substitutions(value) {
+        return PropertyCapability::Supported;
+    }
+    let id = PropertyId::from(name);
+    let renderer_id = RendererPropertyId::from_name(name);
+    if renderer_id == Some(RendererPropertyId::Content) {
         return match super::generated_content::content(value) {
             super::generated_content::ValueSupport::Unsupported => {
                 PropertyCapability::Unsupported(UnsupportedStyleFeature::GeneratedContent)
             }
-            super::generated_content::ValueSupport::Supported
-            | super::generated_content::ValueSupport::Invalid => PropertyCapability::Supported,
+            _ => PropertyCapability::Supported,
         };
     }
-    if name.eq_ignore_ascii_case("counter-reset")
-        || name.eq_ignore_ascii_case("counter-increment")
+    if let Some(id @ (RendererPropertyId::CounterReset | RendererPropertyId::CounterIncrement)) =
+        renderer_id
     {
-        return match super::generated_content::counter_directive(name, value) {
+        return match super::generated_content::counter_directive(id, value) {
             super::generated_content::ValueSupport::Unsupported => {
                 PropertyCapability::Unsupported(UnsupportedStyleFeature::GeneratedContent)
             }
-            super::generated_content::ValueSupport::Supported
-            | super::generated_content::ValueSupport::Invalid => PropertyCapability::Supported,
+            _ => PropertyCapability::Supported,
         };
     }
-    if name.eq_ignore_ascii_case("contain") {
-        let css_wide = matches!(value.trim().to_ascii_lowercase().as_str(), "inherit" | "initial" | "unset" | "revert" | "revert-layer");
-        return if css_wide || crate::style::syntax::contain::parse(value).is_some_and(|contain| contain.fully_supported) {
+    if renderer_id == Some(RendererPropertyId::Contain) {
+        return if super::contain::parse(value).is_none_or(|contain| contain.fully_supported) {
             PropertyCapability::Supported
         } else {
             PropertyCapability::Unsupported(UnsupportedStyleFeature::Value)
         };
     }
-    if is_border_image_property_name(name) {
-        return PropertyCapability::Unsupported(UnsupportedStyleFeature::BorderImage);
+    // Guard native color conversion before parsing; these values cannot be
+    // computed by this renderer, so no surrogate grammar is necessary.
+    if super::color_syntax::declaration_is_unsupported(&id, value) {
+        return PropertyCapability::Unsupported(UnsupportedStyleFeature::Value);
     }
-    if is_box_shadow_property_name(name) {
-        return PropertyCapability::Unsupported(UnsupportedStyleFeature::BoxShadow);
+    if unit_algebra::value_is_supported(&id, value) == Some(false)
+        && unit_algebra::property_value_is_valid(&id, value) == Some(true)
+    {
+        return PropertyCapability::Unsupported(UnsupportedStyleFeature::Value);
     }
-    if is_filter_effect_property_name(name) {
-        return PropertyCapability::Unsupported(UnsupportedStyleFeature::FilterEffects);
+    if matches!(id, PropertyId::VerticalAlign | PropertyId::TextOverflow(_))
+        && inline_values::property_value_is_valid(&id, value) == Some(true)
+        && !inline_values::value_is_supported(&id, value)
+    {
+        return PropertyCapability::Unsupported(UnsupportedStyleFeature::Value);
     }
-    if is_transition_property_name(name) {
-        return PropertyCapability::Unsupported(UnsupportedStyleFeature::Transitions);
+    let parsed = parsed_property(id, value);
+    if parsed.as_ref().is_some_and(|property| {
+        super::grid::native_value_is_unsupported(property)
+            || display_value_is_unsupported(property)
+            || list_style_value_is_unsupported(property)
+            || (matches!(property, Property::TextTransform(_))
+                && text_transform_value_is_unsupported(property))
+            || property_uses_unsupported_text_decoration_style(property)
+            || property_uses_unsupported_outline_style(property)
+            || matches!(property, Property::Position(position)
+                if !matches!(position, Position::Static
+                    | Position::Relative
+                    | Position::Absolute))
+            || matches!(property, Property::Visibility(Visibility::Collapse))
+            || matches!(property, Property::Unparsed(raw)
+                if raw_value_is_unsupported(&raw.property_id, &raw.value))
+    }) {
+        return PropertyCapability::Unsupported(UnsupportedStyleFeature::Value);
     }
-    if is_animation_property_name(name) {
-        return PropertyCapability::Unsupported(UnsupportedStyleFeature::Animations);
+    if contains_gradient_function(value)
+        && parsed.as_ref().is_none_or(|property| {
+            property_uses_gradient(property) || matches!(property, Property::Unparsed(_))
+        })
+    {
+        return PropertyCapability::Unsupported(UnsupportedStyleFeature::Gradient);
     }
-    // Avoid a second parse on the overwhelmingly common non-gradient path.
-    // The typed check prevents strings such as url('gradient.png') from being
-    // mistaken for a gradient function.
-    if contains_gradient_function(value) {
-        let parsed = Property::parse_string(PropertyId::from(name), value, ParserOptions::default()).ok();
-        if parsed.as_ref().is_some_and(property_uses_gradient) || parsed.as_ref().is_none_or(|property| matches!(property, Property::Unparsed(_))) {
-            return PropertyCapability::Unsupported(UnsupportedStyleFeature::Gradient);
-        }
+    if matches!(name, "background" | "background-image")
+        && parsed.as_ref().is_some_and(property_uses_background_image)
+    {
+        return PropertyCapability::Unsupported(UnsupportedStyleFeature::BackgroundImage);
     }
-    if name.eq_ignore_ascii_case("background") || name.eq_ignore_ascii_case("background-image") {
-        let parsed = Property::parse_string(PropertyId::from(name), value, ParserOptions::default()).ok();
-        if parsed.as_ref().is_some_and(property_uses_background_image) {
-            return PropertyCapability::Unsupported(UnsupportedStyleFeature::BackgroundImage);
-        }
-    }
-    if name.eq_ignore_ascii_case("display") {
-        let parsed = Property::parse_string(PropertyId::from(name), value, ParserOptions::default()).ok();
-        if parsed.as_ref().is_some_and(display_value_is_unsupported) {
-            return PropertyCapability::Unsupported(UnsupportedStyleFeature::Value);
-        }
-    }
-    if name.eq_ignore_ascii_case("position") {
-        let parsed = Property::parse_string(PropertyId::from(name), value, ParserOptions::default()).ok();
-        if parsed.as_ref().is_some_and(|property| {
-            !matches!(property, Property::Position(lightningcss::properties::position::Position::Static | lightningcss::properties::position::Position::Relative | lightningcss::properties::position::Position::Absolute))
-        }) {
-            return PropertyCapability::Unsupported(UnsupportedStyleFeature::Value);
-        }
-    }
-    if name.eq_ignore_ascii_case("visibility") {
-        let parsed = Property::parse_string(PropertyId::from(name), value, ParserOptions::default()).ok();
-        if matches!(parsed, Some(Property::Visibility(lightningcss::properties::display::Visibility::Collapse))) {
-            return PropertyCapability::Unsupported(UnsupportedStyleFeature::Value);
-        }
-    }
-    if name.eq_ignore_ascii_case("list-style-type") || name.eq_ignore_ascii_case("list-style") {
-        let parsed = Property::parse_string(PropertyId::from(name), value, ParserOptions::default()).ok();
-        if parsed.as_ref().is_some_and(list_style_value_is_unsupported) {
-            return PropertyCapability::Unsupported(UnsupportedStyleFeature::Value);
-        }
-    }
-    if name.eq_ignore_ascii_case("text-transform") {
-        let parsed = Property::parse_string(PropertyId::from(name), value, ParserOptions::default()).ok();
-        if parsed.as_ref().is_some_and(text_transform_value_is_unsupported) {
-            return PropertyCapability::Unsupported(UnsupportedStyleFeature::Value);
-        }
-    }
-    if matches!(name, "text-decoration" | "text-decoration-line" | "text-decoration-style" | "outline" | "outline-style") {
-        let parsed = Property::parse_string(PropertyId::from(name), value, ParserOptions::default()).ok();
-        if parsed.as_ref().is_some_and(|property| property_uses_unsupported_text_decoration_style(property) || property_uses_unsupported_outline_style(property)) {
-            return PropertyCapability::Unsupported(UnsupportedStyleFeature::Value);
-        }
-    }
-    if property_name_is_supported(name) { PropertyCapability::Supported } else { PropertyCapability::Unsupported(UnsupportedStyleFeature::Property) }
+    PropertyCapability::Supported
+}
+
+fn raw_value_is_unsupported(id: &PropertyId<'_>, tokens: &TokenList<'_>) -> bool {
+    matches!(
+        id,
+        PropertyId::Background
+            | PropertyId::ListStyleImage
+            | PropertyId::Outline
+            | PropertyId::OutlineColor
+            | PropertyId::TextTransform
+            | PropertyId::WordBreak
+    ) || super::flex::is_wrap_property(id)
+        || super::grid::raw_is_unsupported(id, tokens)
+        || super::color_syntax::raw_color_is_unsupported(id, tokens)
+        || contains_function(tokens, |name| {
+            name.eq_ignore_ascii_case("anchor")
+                || name.eq_ignore_ascii_case("anchor-size")
+                || name.eq_ignore_ascii_case("calc-size")
+        })
+        || tokens.0.iter().any(|token| {
+            matches!(token,
+            TokenOrValue::Token(Token::Ident(name))
+                if name.eq_ignore_ascii_case("anchor-center")
+                    || (matches!(id, PropertyId::Display)
+                        && (name.eq_ignore_ascii_case("grid-lanes")
+                            || name.eq_ignore_ascii_case("inline-grid-lanes"))))
+        })
 }
 
 fn is_border_image_property_name(name: &str) -> bool {
-    matches!(name, "border-image" | "border-image-source" | "border-image-slice" | "border-image-width" | "border-image-outset" | "border-image-repeat")
+    matches!(
+        name,
+        "border-image"
+            | "border-image-source"
+            | "border-image-slice"
+            | "border-image-width"
+            | "border-image-outset"
+            | "border-image-repeat"
+    )
 }
 
 fn is_box_shadow_property_name(name: &str) -> bool {
-    matches!(name, "box-shadow" | "-webkit-box-shadow" | "-moz-box-shadow")
+    matches!(
+        name,
+        "box-shadow" | "-webkit-box-shadow" | "-moz-box-shadow"
+    )
 }
 
 fn is_filter_effect_property_name(name: &str) -> bool {
-    matches!(name, "filter" | "-webkit-filter" | "backdrop-filter" | "-webkit-backdrop-filter" | "color-interpolation-filters" | "flood-color" | "flood-opacity" | "lighting-color")
+    matches!(
+        name,
+        "filter"
+            | "-webkit-filter"
+            | "backdrop-filter"
+            | "-webkit-backdrop-filter"
+            | "color-interpolation-filters"
+            | "flood-color"
+            | "flood-opacity"
+            | "lighting-color"
+    )
 }
 
 fn is_transition_property_name(name: &str) -> bool {
@@ -444,11 +527,28 @@ fn is_animation_property_name(name: &str) -> bool {
 }
 
 fn list_style_value_is_unsupported(property: &Property<'_>) -> bool {
-    use lightningcss::properties::list::{CounterStyle, ListStyleType, PredefinedCounterStyle as P};
+    use lightningcss::properties::list::{
+        CounterStyle, ListStyleType, PredefinedCounterStyle as P,
+    };
     let supported = |value: &ListStyleType<'_>| match value {
         ListStyleType::None => true,
-        ListStyleType::CounterStyle(CounterStyle::Predefined(P::Disc | P::Circle | P::Square | P::Decimal | P::DecimalLeadingZero | P::LowerAlpha | P::LowerLatin | P::UpperAlpha | P::UpperLatin | P::LowerRoman | P::UpperRoman)) => true,
-        ListStyleType::String(_) | ListStyleType::CounterStyle(CounterStyle::Name(_) | CounterStyle::Symbols { .. }) => false,
+        ListStyleType::CounterStyle(CounterStyle::Predefined(
+            P::Disc
+            | P::Circle
+            | P::Square
+            | P::Decimal
+            | P::DecimalLeadingZero
+            | P::LowerAlpha
+            | P::LowerLatin
+            | P::UpperAlpha
+            | P::UpperLatin
+            | P::LowerRoman
+            | P::UpperRoman,
+        )) => true,
+        ListStyleType::String(_)
+        | ListStyleType::CounterStyle(CounterStyle::Name(_) | CounterStyle::Symbols { .. }) => {
+            false
+        }
         ListStyleType::CounterStyle(CounterStyle::Predefined(_)) => false,
     };
     match property {
@@ -467,16 +567,35 @@ fn text_transform_value_is_unsupported(property: &Property<'_>) -> bool {
 }
 
 fn display_value_is_unsupported(property: &Property<'_>) -> bool {
-    use lightningcss::properties::display::{Display, DisplayInside, DisplayKeyword, DisplayOutside};
+    use lightningcss::properties::display::{
+        Display, DisplayInside, DisplayKeyword, DisplayOutside,
+    };
     match property {
-        Property::Display(Display::Keyword(DisplayKeyword::RubyBase | DisplayKeyword::RubyText | DisplayKeyword::RubyBaseContainer | DisplayKeyword::RubyTextContainer)) => true,
+        Property::Display(Display::Keyword(
+            DisplayKeyword::RubyBase
+            | DisplayKeyword::RubyText
+            | DisplayKeyword::RubyBaseContainer
+            | DisplayKeyword::RubyTextContainer,
+        )) => true,
         Property::Display(Display::Pair(pair)) => {
             if pair.is_list_item {
-                return !matches!((&pair.outside, &pair.inside), (DisplayOutside::Block, DisplayInside::Flow));
+                return !matches!(
+                    (&pair.outside, &pair.inside),
+                    (DisplayOutside::Block, DisplayInside::Flow)
+                );
             }
             !matches!(
                 (&pair.outside, &pair.inside),
-                (DisplayOutside::Block | DisplayOutside::Inline, DisplayInside::Flow | DisplayInside::Table | DisplayInside::Grid | DisplayInside::Flex(_)) | (DisplayOutside::Block | DisplayOutside::Inline, DisplayInside::FlowRoot)
+                (
+                    DisplayOutside::Block | DisplayOutside::Inline,
+                    DisplayInside::Flow
+                        | DisplayInside::Table
+                        | DisplayInside::Grid
+                        | DisplayInside::Flex(_)
+                ) | (
+                    DisplayOutside::Block | DisplayOutside::Inline,
+                    DisplayInside::FlowRoot
+                )
             )
         }
         _ => false,
@@ -485,7 +604,9 @@ fn display_value_is_unsupported(property: &Property<'_>) -> bool {
 
 pub(crate) fn property_uses_gradient(property: &Property<'_>) -> bool {
     match property {
-        Property::Background(layers) => layers.iter().any(|layer| image_uses_gradient(&layer.image)),
+        Property::Background(layers) => {
+            layers.iter().any(|layer| image_uses_gradient(&layer.image))
+        }
         Property::BackgroundImage(images) => images.iter().any(image_uses_gradient),
         Property::ListStyleImage(image) => image_uses_gradient(image),
         Property::ListStyle(list) => image_uses_gradient(&list.image),
@@ -495,17 +616,29 @@ pub(crate) fn property_uses_gradient(property: &Property<'_>) -> bool {
 
 pub(crate) fn property_uses_background_image(property: &Property<'_>) -> bool {
     match property {
-        Property::Background(layers) => layers.iter().any(|layer| !matches!(layer.image, Image::None)),
-        Property::BackgroundImage(images) => images.iter().any(|image| !matches!(image, Image::None)),
+        Property::Background(layers) => layers
+            .iter()
+            .any(|layer| !matches!(layer.image, Image::None)),
+        Property::BackgroundImage(images) => {
+            images.iter().any(|image| !matches!(image, Image::None))
+        }
         _ => false,
     }
 }
 
 pub(crate) fn property_uses_unsupported_text_decoration_style(property: &Property<'_>) -> bool {
     use lightningcss::properties::text::{TextDecorationLine, TextDecorationStyle};
-    let unsupported_line = |line: &TextDecorationLine| line.intersects(TextDecorationLine::Blink | TextDecorationLine::SpellingError | TextDecorationLine::GrammarError);
+    let unsupported_line = |line: &TextDecorationLine| {
+        line.intersects(
+            TextDecorationLine::Blink
+                | TextDecorationLine::SpellingError
+                | TextDecorationLine::GrammarError,
+        )
+    };
     match property {
-        Property::TextDecoration(value, _) => matches!(value.style, TextDecorationStyle::Wavy) || unsupported_line(&value.line),
+        Property::TextDecoration(value, _) => {
+            matches!(value.style, TextDecorationStyle::Wavy) || unsupported_line(&value.line)
+        }
         Property::TextDecorationLine(value, _) => unsupported_line(value),
         Property::TextDecorationStyle(value, _) => matches!(value, TextDecorationStyle::Wavy),
         _ => false,
@@ -515,7 +648,18 @@ pub(crate) fn property_uses_unsupported_text_decoration_style(property: &Propert
 pub(crate) fn property_uses_unsupported_outline_style(property: &Property<'_>) -> bool {
     use lightningcss::properties::border::LineStyle;
     use lightningcss::properties::outline::OutlineStyle;
-    let unsupported = |style: &OutlineStyle| matches!(style, OutlineStyle::LineStyle(LineStyle::Double | LineStyle::Groove | LineStyle::Ridge | LineStyle::Inset | LineStyle::Outset));
+    let unsupported = |style: &OutlineStyle| {
+        matches!(
+            style,
+            OutlineStyle::LineStyle(
+                LineStyle::Double
+                    | LineStyle::Groove
+                    | LineStyle::Ridge
+                    | LineStyle::Inset
+                    | LineStyle::Outset
+            )
+        )
+    };
     match property {
         Property::Outline(value) => unsupported(&value.style),
         Property::OutlineStyle(value) => unsupported(value),
@@ -526,27 +670,48 @@ pub(crate) fn property_uses_unsupported_outline_style(property: &Property<'_>) -
 fn image_uses_gradient(image: &Image<'_>) -> bool {
     match image {
         Image::Gradient(_) => true,
-        Image::ImageSet(set) => set.options.iter().any(|option| image_uses_gradient(&option.image)),
+        Image::ImageSet(set) => set
+            .options
+            .iter()
+            .any(|option| image_uses_gradient(&option.image)),
         Image::None | Image::Url(_) => false,
     }
 }
 
 fn contains_gradient_function(value: &str) -> bool {
-    value.as_bytes().windows(b"gradient(".len()).any(|window| window.eq_ignore_ascii_case(b"gradient("))
+    value
+        .as_bytes()
+        .windows(b"gradient(".len())
+        .any(|window| window.eq_ignore_ascii_case(b"gradient("))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{declaration_capability, declaration_is_renderer_eligible, declaration_renderer_eligibility, property_name_is_supported};
+    use super::{
+        declaration_capability, declaration_is_renderer_eligible, declaration_renderer_eligibility,
+        property_name_is_supported,
+    };
     use crate::{PropertyCapability, UnsupportedStyleFeature};
     use lightningcss::properties::{Property, PropertyId};
     use lightningcss::stylesheet::ParserOptions;
 
     #[test]
     fn renderer_eligibility_caches_only_allocation_free_decisions() {
-        let color = Property::parse_string(PropertyId::from("color"), "red", ParserOptions::default()).unwrap();
-        let custom = Property::parse_string(PropertyId::from("--accent"), "red", ParserOptions::default()).unwrap();
-        let content = Property::parse_string(PropertyId::from("content"), "url('marker.svg')", ParserOptions::default()).unwrap();
+        let color =
+            Property::parse_string(PropertyId::from("color"), "red", ParserOptions::default())
+                .unwrap();
+        let custom = Property::parse_string(
+            PropertyId::from("--accent"),
+            "red",
+            ParserOptions::default(),
+        )
+        .unwrap();
+        let content = Property::parse_string(
+            PropertyId::from("content"),
+            "url('marker.svg')",
+            ParserOptions::default(),
+        )
+        .unwrap();
 
         assert_eq!(declaration_renderer_eligibility(&color), Some(true));
         assert_eq!(declaration_renderer_eligibility(&custom), Some(false));
@@ -592,37 +757,89 @@ mod tests {
 
     #[test]
     fn contain_capabilities_cover_only_the_implemented_size_subset() {
-        assert_eq!(declaration_capability("contain", "none"), PropertyCapability::Supported);
-        assert_eq!(declaration_capability("contain", "size"), PropertyCapability::Supported);
-        assert_eq!(declaration_capability("contain", "layout size"), PropertyCapability::Unsupported(UnsupportedStyleFeature::Value));
-        assert_eq!(declaration_capability("contain", "strict"), PropertyCapability::Unsupported(UnsupportedStyleFeature::Value));
+        assert_eq!(
+            declaration_capability("contain", "none"),
+            PropertyCapability::Supported
+        );
+        assert_eq!(
+            declaration_capability("contain", "size"),
+            PropertyCapability::Supported
+        );
+        assert_eq!(
+            declaration_capability("contain", "layout size"),
+            PropertyCapability::Unsupported(UnsupportedStyleFeature::Value)
+        );
+        assert_eq!(
+            declaration_capability("contain", "strict"),
+            PropertyCapability::Unsupported(UnsupportedStyleFeature::Value)
+        );
     }
 
     #[test]
     fn gradient_values_are_not_renderer_capabilities() {
-        assert_eq!(declaration_capability("background", "linear-gradient(red, blue)"), PropertyCapability::Unsupported(UnsupportedStyleFeature::Gradient));
-        assert_eq!(declaration_capability("background-image", "LINEAR-GRADIENT(red, blue)"), PropertyCapability::Unsupported(UnsupportedStyleFeature::Gradient));
-        assert_eq!(declaration_capability("background", "url('gradient.png') red"), PropertyCapability::Unsupported(UnsupportedStyleFeature::BackgroundImage));
+        assert_eq!(
+            declaration_capability("background", "linear-gradient(red, blue)"),
+            PropertyCapability::Unsupported(UnsupportedStyleFeature::Gradient)
+        );
+        assert_eq!(
+            declaration_capability("background-image", "LINEAR-GRADIENT(red, blue)"),
+            PropertyCapability::Unsupported(UnsupportedStyleFeature::Property)
+        );
+        assert_eq!(
+            declaration_capability("background", "url('gradient.png') red"),
+            PropertyCapability::Unsupported(UnsupportedStyleFeature::BackgroundImage)
+        );
     }
 
     #[test]
     fn border_image_family_has_a_specific_unsupported_capability() {
-        for name in ["border-image", "border-image-source", "border-image-slice", "border-image-width", "border-image-outset", "border-image-repeat"] {
-            assert_eq!(declaration_capability(name, "initial"), PropertyCapability::Unsupported(UnsupportedStyleFeature::BorderImage));
+        for name in [
+            "border-image",
+            "border-image-source",
+            "border-image-slice",
+            "border-image-width",
+            "border-image-outset",
+            "border-image-repeat",
+        ] {
+            assert_eq!(
+                declaration_capability(name, "initial"),
+                PropertyCapability::Unsupported(UnsupportedStyleFeature::BorderImage)
+            );
         }
     }
 
     #[test]
     fn box_shadow_has_a_specific_unsupported_capability() {
-        assert_eq!(declaration_capability("box-shadow", "none"), PropertyCapability::Unsupported(UnsupportedStyleFeature::BoxShadow));
-        assert_eq!(declaration_capability("-webkit-box-shadow", "none"), PropertyCapability::Unsupported(UnsupportedStyleFeature::BoxShadow));
-        assert_eq!(declaration_capability("-moz-box-shadow", "none"), PropertyCapability::Unsupported(UnsupportedStyleFeature::BoxShadow));
+        assert_eq!(
+            declaration_capability("box-shadow", "none"),
+            PropertyCapability::Unsupported(UnsupportedStyleFeature::BoxShadow)
+        );
+        assert_eq!(
+            declaration_capability("-webkit-box-shadow", "none"),
+            PropertyCapability::Unsupported(UnsupportedStyleFeature::BoxShadow)
+        );
+        assert_eq!(
+            declaration_capability("-moz-box-shadow", "none"),
+            PropertyCapability::Unsupported(UnsupportedStyleFeature::BoxShadow)
+        );
     }
 
     #[test]
     fn filter_effect_family_has_a_specific_unsupported_capability() {
-        for name in ["filter", "-webkit-filter", "backdrop-filter", "-webkit-backdrop-filter", "color-interpolation-filters", "flood-color", "flood-opacity", "lighting-color"] {
-            assert_eq!(declaration_capability(name, "initial"), PropertyCapability::Unsupported(UnsupportedStyleFeature::FilterEffects));
+        for name in [
+            "filter",
+            "-webkit-filter",
+            "backdrop-filter",
+            "-webkit-backdrop-filter",
+            "color-interpolation-filters",
+            "flood-color",
+            "flood-opacity",
+            "lighting-color",
+        ] {
+            assert_eq!(
+                declaration_capability(name, "initial"),
+                PropertyCapability::Unsupported(UnsupportedStyleFeature::FilterEffects)
+            );
         }
     }
 
@@ -641,20 +858,47 @@ mod tests {
             "-webkit-transition-delay",
             "-webkit-transition-timing-function",
         ] {
-            assert_eq!(declaration_capability(name, "initial"), PropertyCapability::Unsupported(UnsupportedStyleFeature::Transitions));
+            assert_eq!(
+                declaration_capability(name, "initial"),
+                PropertyCapability::Unsupported(UnsupportedStyleFeature::Transitions)
+            );
         }
     }
 
     #[test]
     fn paint_style_capabilities_reject_only_unrenderable_variants() {
-        assert_eq!(declaration_capability("text-decoration", "underline dashed red"), PropertyCapability::Supported);
-        assert_eq!(declaration_capability("text-decoration", "underline wavy red"), PropertyCapability::Unsupported(UnsupportedStyleFeature::Value));
-        assert_eq!(declaration_capability("text-decoration-line", "blink"), PropertyCapability::Unsupported(UnsupportedStyleFeature::Value));
-        assert_eq!(declaration_capability("outline", "2px dotted red"), PropertyCapability::Supported);
-        assert_eq!(declaration_capability("outline", "2px double red"), PropertyCapability::Unsupported(UnsupportedStyleFeature::Value));
-        assert_eq!(declaration_capability("outline-offset", "2px"), PropertyCapability::Supported);
-        assert_eq!(declaration_capability("visibility", "hidden"), PropertyCapability::Supported);
-        assert_eq!(declaration_capability("visibility", "collapse"), PropertyCapability::Unsupported(UnsupportedStyleFeature::Value));
+        assert_eq!(
+            declaration_capability("text-decoration", "underline dashed red"),
+            PropertyCapability::Supported
+        );
+        assert_eq!(
+            declaration_capability("text-decoration", "underline wavy red"),
+            PropertyCapability::Unsupported(UnsupportedStyleFeature::Value)
+        );
+        assert_eq!(
+            declaration_capability("text-decoration-line", "blink"),
+            PropertyCapability::Unsupported(UnsupportedStyleFeature::Value)
+        );
+        assert_eq!(
+            declaration_capability("outline", "2px dotted red"),
+            PropertyCapability::Supported
+        );
+        assert_eq!(
+            declaration_capability("outline", "2px double red"),
+            PropertyCapability::Unsupported(UnsupportedStyleFeature::Value)
+        );
+        assert_eq!(
+            declaration_capability("outline-offset", "2px"),
+            PropertyCapability::Supported
+        );
+        assert_eq!(
+            declaration_capability("visibility", "hidden"),
+            PropertyCapability::Supported
+        );
+        assert_eq!(
+            declaration_capability("visibility", "collapse"),
+            PropertyCapability::Unsupported(UnsupportedStyleFeature::Value)
+        );
     }
 
     #[test]
@@ -676,29 +920,62 @@ mod tests {
             "animation-range-end",
             "-webkit-animation",
         ] {
-            assert_eq!(declaration_capability(name, "initial"), PropertyCapability::Unsupported(UnsupportedStyleFeature::Animations));
+            assert_eq!(
+                declaration_capability(name, "initial"),
+                PropertyCapability::Unsupported(UnsupportedStyleFeature::Animations)
+            );
         }
     }
 
     #[test]
     fn unsupported_display_algorithms_are_value_capabilities_not_parser_failures() {
-        assert_eq!(declaration_capability("display", "flex"), PropertyCapability::Supported);
-        assert_eq!(declaration_capability("display", "grid"), PropertyCapability::Supported);
-        assert_eq!(declaration_capability("display", "flow-root"), PropertyCapability::Supported);
-        assert_eq!(declaration_capability("display", "contents"), PropertyCapability::Supported);
+        assert_eq!(
+            declaration_capability("display", "flex"),
+            PropertyCapability::Supported
+        );
+        assert_eq!(
+            declaration_capability("display", "grid"),
+            PropertyCapability::Supported
+        );
+        assert_eq!(
+            declaration_capability("display", "flow-root"),
+            PropertyCapability::Supported
+        );
+        assert_eq!(
+            declaration_capability("display", "contents"),
+            PropertyCapability::Supported
+        );
     }
 
     #[test]
     fn unsupported_list_marker_algorithms_are_value_capabilities() {
-        assert_eq!(declaration_capability("list-style-type", "decimal"), PropertyCapability::Supported);
-        assert_eq!(declaration_capability("list-style-type", "symbols(cyclic 'x')"), PropertyCapability::Unsupported(UnsupportedStyleFeature::Value));
-        assert_eq!(declaration_capability("list-style", "inside symbols(cyclic 'x')"), PropertyCapability::Unsupported(UnsupportedStyleFeature::Value));
+        assert_eq!(
+            declaration_capability("list-style-type", "decimal"),
+            PropertyCapability::Supported
+        );
+        assert_eq!(
+            declaration_capability("list-style-type", "symbols(cyclic 'x')"),
+            PropertyCapability::Unsupported(UnsupportedStyleFeature::Value)
+        );
+        assert_eq!(
+            declaration_capability("list-style", "inside symbols(cyclic 'x')"),
+            PropertyCapability::Unsupported(UnsupportedStyleFeature::Value)
+        );
     }
 
     #[test]
     fn unsupported_text_transform_algorithms_are_value_capabilities() {
-        assert_eq!(declaration_capability("text-transform", "uppercase"), PropertyCapability::Supported);
-        assert_eq!(declaration_capability("text-transform", "full-width"), PropertyCapability::Unsupported(UnsupportedStyleFeature::Value));
-        assert_eq!(declaration_capability("text-transform", "math-auto"), PropertyCapability::Unsupported(UnsupportedStyleFeature::Value));
+        assert_eq!(
+            declaration_capability("text-transform", "uppercase"),
+            PropertyCapability::Supported
+        );
+        assert_eq!(
+            declaration_capability("text-transform", "full-width"),
+            PropertyCapability::Unsupported(UnsupportedStyleFeature::Value)
+        );
+        assert_eq!(
+            declaration_capability("text-transform", "math-auto"),
+            PropertyCapability::Unsupported(UnsupportedStyleFeature::Value)
+        );
     }
 }

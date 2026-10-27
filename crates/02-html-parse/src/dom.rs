@@ -2,14 +2,13 @@ use crate::{
     HtmlSyntaxElement, HtmlSyntaxNode, HtmlSyntaxTree, MarkupSyntax, ParsedHtml, parse_html_document,
 };
 use html_dom::{
-    Document, DocumentBuildError, DocumentBuilder, DocumentMode, DocumentTocEntry, DomAttribute,
-    DomElementAttributeCache, DomElementData, DomNodeId, ImageResource, ImageSource, NodeRef,
-    Rootless,
+    Document, DocumentBuildError, DocumentBuilder, DocumentMode, DomAttribute,
+    DomElementAttributeCache, DomElementData, DomNodeId, ImageResource, ImageSource, Rootless,
 };
 use std::sync::Arc;
 
 pub fn parse_dom_document(html: &str) -> Result<Document, DocumentBuildError> {
-    build_dom_document(&parse_html_document(html))
+    build_dom_document_owned(parse_html_document(html))
 }
 
 /// Convert already parsed markup into the renderer's DOM.
@@ -19,6 +18,51 @@ pub fn build_dom_document(parsed: &ParsedHtml) -> Result<Document, DocumentBuild
         MarkupSyntax::Xml => DocumentMode::Xml,
     };
     build_dom_from_syntax_tree(&parsed.document, mode)
+}
+
+pub(crate) fn build_dom_document_owned(parsed: ParsedHtml) -> Result<Document, DocumentBuildError> {
+    let mode = match parsed.syntax {
+        MarkupSyntax::Html => DocumentMode::Html,
+        MarkupSyntax::Xml => DocumentMode::Xml,
+    };
+    let Some(root) = parsed
+        .document
+        .nodes
+        .into_iter()
+        .find_map(|node| match node {
+            HtmlSyntaxNode::Element(element) => Some(element),
+            _ => None,
+        })
+    else {
+        return DocumentBuilder::new().finish_without_root();
+    };
+    let mut document = DocumentBuilder::new();
+    document.set_mode(mode);
+    let root_data = build_dom_syntax_element_data(&mut document, &root);
+    let (root_node, mut document) = document.append_dom_element(None, root_data)?;
+    build_dom_owned_children(&mut document, root.children, root_node)?;
+    document.set_dom_root(root_node)?.finish()
+}
+
+fn build_dom_owned_children(
+    document: &mut DocumentBuilder<Rootless>,
+    children: Vec<HtmlSyntaxNode>,
+    parent: DomNodeId,
+) -> Result<(), DocumentBuildError> {
+    for child in children {
+        match child {
+            HtmlSyntaxNode::Element(element) => {
+                let data = build_dom_syntax_element_data(document, &element);
+                let node = document.append_dom_element(Some(parent), data)?;
+                build_dom_owned_children(document, element.children, node)?;
+            }
+            HtmlSyntaxNode::Text(text) if !text.is_empty() => {
+                document.append_dom_text(parent, text)?;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn build_dom_from_syntax_tree(
@@ -37,7 +81,6 @@ fn build_dom_from_syntax_tree(
     let root_data = build_dom_syntax_element_data(&mut document, root);
     let (root_node, mut document) = document.append_dom_element(None, root_data)?;
     build_dom_syntax_children(&mut document, &root.children, root_node)?;
-    register_heading_toc(&mut document, root_node);
     document.set_dom_root(root_node)?.finish()
 }
 
@@ -52,7 +95,6 @@ fn build_dom_syntax_children(
                 let data = build_dom_syntax_element_data(document, element);
                 let node = document.append_dom_element(Some(parent), data)?;
                 build_dom_syntax_children(document, &element.children, node)?;
-                register_heading_toc(document, node);
             }
             HtmlSyntaxNode::Text(text) if !text.is_empty() => {
                 document.append_dom_text(parent, text.clone())?;
@@ -247,75 +289,4 @@ fn serialize_foreign_syntax_element(element: &HtmlSyntaxElement) -> String {
     let mut output = String::new();
     push_element(&mut output, element, "");
     output
-}
-
-fn register_heading_toc(document: &mut DocumentBuilder<Rootless>, node: DomNodeId) {
-    let Some(element) = document.document().element_ref(node) else {
-        return;
-    };
-    let Some(level) = (match element.tag() {
-        "h1" => Some(1),
-        "h2" => Some(2),
-        "h3" => Some(3),
-        "h4" => Some(4),
-        "h5" => Some(5),
-        "h6" => Some(6),
-        _ => None,
-    }) else {
-        return;
-    };
-    let existing_id = element.id().map(str::to_owned);
-    let children: Vec<_> = element.children().collect();
-    let mut title = String::new();
-    for child in children {
-        collect_text(document.document(), child, &mut title);
-    }
-    let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
-    if title.is_empty() {
-        return;
-    }
-    let id = existing_id.unwrap_or_else(|| assign_generated_id(document, node));
-    let title = document.intern_string(&title);
-    let href = document.intern_string(&format!("#{id}"));
-    document.push_toc_entry(DocumentTocEntry {
-        level,
-        title,
-        href,
-        node_idx: node.raw(),
-    });
-}
-
-fn collect_text(document: &Document, node: DomNodeId, output: &mut String) {
-    match document.node_ref(node) {
-        Some(NodeRef::Text(text)) => {
-            if !output.is_empty() {
-                output.push(' ');
-            }
-            output.push_str(text.text());
-        }
-        Some(NodeRef::Element(element)) => {
-            for child in element.children() {
-                collect_text(document, child, output);
-            }
-        }
-        None => {}
-    }
-}
-
-fn assign_generated_id<State>(document: &mut DocumentBuilder<State>, node: DomNodeId) -> String {
-    let base = format!("heading-{}", node.raw());
-    let mut candidate = base.clone();
-    let mut suffix = 2;
-    loop {
-        let value = document.intern_string(&candidate);
-        if !document.document().dom_id_in_use(value) {
-            let name = document.intern_string("id");
-            document
-                .set_dom_id_attribute(node, value, name)
-                .expect("generated heading IDs should be valid");
-            return candidate;
-        }
-        candidate = format!("{base}-{suffix}");
-        suffix += 1;
-    }
 }

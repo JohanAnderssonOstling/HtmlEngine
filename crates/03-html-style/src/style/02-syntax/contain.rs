@@ -17,7 +17,12 @@ pub(crate) fn parse_tokens(tokens: &TokenList<'_>) -> Option<ParsedContain> {
     let keywords = tokens
         .0
         .iter()
-        .filter(|token| !matches!(token, TokenOrValue::Token(Token::WhiteSpace(_) | Token::Comment(_))))
+        .filter(|token| {
+            !matches!(
+                token,
+                TokenOrValue::Token(Token::WhiteSpace(_) | Token::Comment(_))
+            )
+        })
         .map(|token| match token {
             TokenOrValue::Token(Token::Ident(value)) => Some(value.as_ref().to_ascii_lowercase()),
             _ => None,
@@ -25,9 +30,18 @@ pub(crate) fn parse_tokens(tokens: &TokenList<'_>) -> Option<ParsedContain> {
         .collect::<Option<Vec<_>>>()?;
 
     match keywords.as_slice() {
-        [value] if value == "none" => Some(ParsedContain { size: false, fully_supported: true }),
-        [value] if value == "strict" => Some(ParsedContain { size: true, fully_supported: false }),
-        [value] if value == "content" => Some(ParsedContain { size: false, fully_supported: false }),
+        [value] if value == "none" => Some(ParsedContain {
+            size: false,
+            fully_supported: true,
+        }),
+        [value] if value == "strict" => Some(ParsedContain {
+            size: true,
+            fully_supported: false,
+        }),
+        [value] if value == "content" => Some(ParsedContain {
+            size: false,
+            fully_supported: false,
+        }),
         [] => None,
         values => {
             let mut size = false;
@@ -52,7 +66,10 @@ pub(crate) fn parse_tokens(tokens: &TokenList<'_>) -> Option<ParsedContain> {
             if size && inline_size {
                 return None;
             }
-            Some(ParsedContain { size, fully_supported: size && !inline_size && !layout && !style && !paint })
+            Some(ParsedContain {
+                size,
+                fully_supported: size && !inline_size && !layout && !style && !paint,
+            })
         }
     }
 }
@@ -63,10 +80,34 @@ mod tests {
 
     #[test]
     fn validates_the_contain_grammar_and_reports_the_supported_size_subset() {
-        assert_eq!(parse("none"), Some(ParsedContain { size: false, fully_supported: true }));
-        assert_eq!(parse("size"), Some(ParsedContain { size: true, fully_supported: true }));
-        assert_eq!(parse("layout size"), Some(ParsedContain { size: true, fully_supported: false }));
-        assert_eq!(parse("strict"), Some(ParsedContain { size: true, fully_supported: false }));
+        assert_eq!(
+            parse("none"),
+            Some(ParsedContain {
+                size: false,
+                fully_supported: true
+            })
+        );
+        assert_eq!(
+            parse("size"),
+            Some(ParsedContain {
+                size: true,
+                fully_supported: true
+            })
+        );
+        assert_eq!(
+            parse("layout size"),
+            Some(ParsedContain {
+                size: true,
+                fully_supported: false
+            })
+        );
+        assert_eq!(
+            parse("strict"),
+            Some(ParsedContain {
+                size: true,
+                fully_supported: false
+            })
+        );
         assert!(parse("size inline-size").is_none());
         assert!(parse("layout layout").is_none());
         assert!(parse("strict layout").is_none());

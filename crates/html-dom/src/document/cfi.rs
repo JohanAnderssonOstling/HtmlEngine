@@ -132,7 +132,7 @@ impl Document {
             let element = self.dom_nodes.get(current.index())?.as_element()?;
 
             // Convert CFI step to element index: (step / 2) - 1
-            if step % 2 != 0 {
+            if step == 0 || step % 2 != 0 {
                 // Odd steps point to text nodes, which we don't navigate through
                 return None;
             }

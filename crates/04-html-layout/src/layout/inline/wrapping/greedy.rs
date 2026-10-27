@@ -35,6 +35,7 @@ pub(in crate::layout::inline) fn line_constraints(
 
 /// Breaks exactly one line using caller-provided geometry.
 pub(in crate::layout::inline) fn break_next_line(
+    reader: &LayoutReader<'_>,
     tokens: &[InlineToken],
     runs: &[InlineTokenMetrics],
     paragraph: ParagraphLayout,
@@ -78,7 +79,7 @@ pub(in crate::layout::inline) fn break_next_line(
             };
         }
 
-        let advance = token.advance_at(runs, state.tab_origin + state.x);
+        let advance = token.advance_at(reader, runs, state.tab_origin + state.x);
         if state.x + advance > state.line_width_limit
             && !should_trim_leading_soft_token(token, runs)
             && i > state.line_start
@@ -184,9 +185,10 @@ pub(in crate::layout::inline) fn break_lines_into(
     let timing_started = engine.start_timing();
     lines.clear();
     let mut start = 0usize;
-    let mut starts_indented_line = true;
+    let mut starts_indented_line = paragraph.indent.first_line;
     while start < tokens.len() {
         let result = break_next_line(
+            &engine.reader,
             tokens,
             runs,
             paragraph,
@@ -214,7 +216,7 @@ fn keep_with_previous_token(tokens: &[InlineToken], runs: &[InlineTokenMetrics],
     let token = &tokens[i];
     if !matches!(
         token.run_metrics(runs).vertical_align,
-        VerticalAlignValue::Super | VerticalAlignValue::Sub
+        InlineVerticalAlign::Super(_) | InlineVerticalAlign::Sub(_)
     ) {
         return false;
     }

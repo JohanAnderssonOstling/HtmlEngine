@@ -1,6 +1,9 @@
 //! Central property routing and property-family application.
 
 use super::*;
+use crate::style::syntax::{sign, unit_algebra, value};
+use static_self::IntoOwned;
+use std::borrow::Cow;
 
 mod box_model;
 mod generated;
@@ -35,6 +38,18 @@ impl ApplyResult {
     }
 }
 
+/// Native property IDs whose dependency recovery tokens have an explicit
+/// renderer conversion, rather than representing an unsupported value.
+pub(super) fn supports_unparsed_property(id: &PropertyId<'_>) -> bool {
+    sign::supports(id) || unit_algebra::size_property(id) || matches!(
+        id,
+        PropertyId::ZIndex | PropertyId::JustifyItems | PropertyId::PlaceItems | PropertyId::FontWeight
+            | PropertyId::Order(_)
+            | PropertyId::LetterSpacing | PropertyId::WordSpacing
+            | PropertyId::Flex(_) | PropertyId::FlexBasis(_)
+    )
+}
+
 pub(super) struct PropertyContext<'a, 'doc> {
     pub(super) doc: &'a ResolutionDocument<'doc>,
     pub(super) styles: &'a mut ComputedStylesBuilder,
@@ -56,6 +71,20 @@ pub(super) fn apply_property_in_phase<'a>(
     resolution: &ResolutionContext,
 ) -> Result<(), ()> {
     set_line_height_resolution_bases(doc, styles, property, style, parent, resolution);
+    let computed = if matches!(
+        property,
+        Property::Unparsed(_)
+            | Property::LineHeight(CssLineHeight::Length(LengthPercentage::Calc(_)))
+            | Property::VerticalAlign(VerticalAlign::Length(LengthPercentage::Calc(_)))
+    ) && sign::supports(&property.property_id()) {
+        resolve_sign_property(
+            property, style, parent_font_size,
+            root_font_size_for_resolution(doc, styles), resolution,
+        )?
+    } else {
+        None
+    };
+    let property = computed.as_ref().unwrap_or(property);
     // Preserve whether the winning background establishes an image layer even
     // while image painting is unsupported. Canvas background propagation
     // depends on the computed image being `none`, not merely on whether a
@@ -92,7 +121,7 @@ pub(super) fn apply_property_in_phase<'a>(
     if let Property::All(keyword) = property {
         match keyword {
             CSSWideKeyword::Initial => {
-                let basis = ParentStyle::initial(doc.root_font_size()).to_working_style();
+                let basis = parent.initial_for_child(doc.root_font_size()).to_working_style();
                 apply_all_from_basis(style, &basis, phase);
             }
             CSSWideKeyword::Inherit => {
@@ -110,6 +139,11 @@ pub(super) fn apply_property_in_phase<'a>(
     }
     if try_apply_css_wide_keyword(style, property, parent, doc.root_font_size(), phase) {
         return Ok(());
+    }
+    if matches!(phase, CascadePhase::Remaining)
+        && let Some(result) = apply_legacy_items(style, property, parent)
+    {
+        return result.conversion_result();
     }
     match phase {
         CascadePhase::Prerequisites => match property {
@@ -235,6 +269,45 @@ pub(super) fn apply_property_in_phase<'a>(
         },
     }
     Ok(())
+}
+
+pub(super) fn resolve_sign_property<'a>(
+    property: &Property<'_>,
+    style: &WorkingStyle,
+    parent_font_size: f32,
+    root_font_size: f32,
+    resolution: &ResolutionContext,
+) -> Result<Option<Property<'a>>, ()> {
+    let id = property.property_id();
+    let css = property
+        .value_to_css_string(PrinterOptions::default())
+        .map_err(|_| ())?;
+    let font_size = if matches!(id, PropertyId::FontSize) {
+        parent_font_size
+    } else {
+        style.font.font_size
+    };
+    let lower = |context: &ResolutionContext, scale| {
+        sign::lower(&css, |number| {
+            resolve_number(number, font_size / scale, root_font_size / scale, context)
+        })
+    };
+    let lowered = if matches!(id, PropertyId::FontSize | PropertyId::LineHeight) {
+        resolution.with_canonical_font_sizes(|context| lower(context, resolution.font_size_scale))
+    } else {
+        lower(resolution, 1.0)
+    }?;
+    if matches!(lowered, Cow::Borrowed(_)) {
+        return Ok(None);
+    }
+    let property = value::parsed_property(id, &lowered).ok_or(())?;
+    if matches!(property, Property::Unparsed(_))
+        && !(matches!(property.property_id(), PropertyId::Flex(_))
+            && crate::style::syntax::flex::parse(&lowered).is_some())
+    {
+        return Err(());
+    }
+    Ok(Some(property.into_owned()))
 }
 
 fn apply_property<'a>(

@@ -1,6 +1,11 @@
 //! Custom-property collection, cycle detection, inheritance, and substitution.
 
 use super::*;
+use lightningcss::properties::custom::{Function, UnparsedProperty};
+use lightningcss::traits::ParseWithOptions;
+use crate::style::syntax::substitution::{contains_lazy_function, contains_random_item, is_lazy_function};
+pub(super) use crate::style::syntax::substitution::contains_random_math;
+pub(super) use crate::style::syntax::substitution::needs_substitution;
 use rustc_data_structures::fx::FxHasher;
 use specified::{
     CandidateAction, CascadeBoundary, CascadeRollback, DeclarationEvent, candidate_action,
@@ -66,6 +71,15 @@ impl CustomCascadeCache {
         inline_style: Option<&StyleAttribute<'css>>,
         parent_map_id: u32,
     ) -> CustomCascadeProbe {
+        // Custom-property random choices compute at their defining element.
+        // Keep raw declaration/program reuse while avoiding a map frozen for
+        // another element's auto or dynamically scoped random key.
+        if events.iter().any(|event| {
+            custom_declaration(event.property(inline_style))
+                .is_some_and(|(_, value)| contains_random_item(value))
+        }) {
+            return CustomCascadeProbe::UncachedDeclarations;
+        }
         let mut hasher = FxHasher::default();
         parent_map_id.hash(&mut hasher);
         let mut declaration_count = 0usize;
@@ -175,6 +189,8 @@ pub(super) fn selected_renderer_marker<'sheet, 'css>(
     inline_style: Option<&StyleAttribute<'css>>,
     name: &str,
     custom_properties: &FxHashMap<String, TokenList<'css>>,
+    parent_custom: &FxHashMap<String, TokenList<'css>>,
+    random: &RandomContext,
 ) -> Option<TokenList<'css>> {
     let mut rollbacks = Vec::<CascadeRollback>::new();
     for event in events.iter().rev() {
@@ -199,15 +215,34 @@ pub(super) fn selected_renderer_marker<'sheet, 'css>(
             Some("initial" | "inherit" | "unset") => return None,
             _ => {
                 let mut resolved = value.clone();
-                if token_list_contains_var(&resolved) {
+                if needs_substitution(&resolved) || contains_random_math(&resolved) {
                     let variables = custom_properties
                         .iter()
                         .map(|(name, value)| (name.as_str(), value.clone()))
                         .collect::<HashMap<_, _>>();
-                    mark_var_substitution_boundaries(&mut resolved);
-                    resolved.substitute_variables(&variables);
-                    if token_list_contains_var(&resolved) {
+                    let property = match name {
+                        WHITE_SPACE_CASCADE_MARKER => PropertyId::WhiteSpace.name(),
+                        LETTER_SPACING_MARKER => PropertyId::LetterSpacing.name(),
+                        WORD_SPACING_MARKER => PropertyId::WordSpacing.name(),
+                        TAB_SIZE_CASCADE_MARKER => "tab-size",
+                        _ => unreachable!("known renderer marker"),
+                    };
+                    if !substitute_property_tokens(&mut resolved, &variables, parent_custom, random, property) {
                         return None;
+                    }
+                    if single_ident_keyword(&resolved)
+                        .is_some_and(|keyword| keyword.eq_ignore_ascii_case("initial"))
+                    {
+                        let initial = if name == TAB_SIZE_CASCADE_MARKER {
+                            "8"
+                        } else {
+                            "normal"
+                        };
+                        return TokenList::parse_string_with_options(
+                            initial,
+                            ParserOptions::default(),
+                        )
+                        .ok();
                     }
                 }
                 return Some(resolved);
@@ -224,6 +259,7 @@ pub(super) fn cascade_custom_properties<'sheet, 'css>(
     events: &[DeclarationEvent<'sheet, 'css>],
     inline_style: Option<&StyleAttribute<'css>>,
     parent: &FxHashMap<String, TokenList<'css>>,
+    random: &RandomContext,
 ) -> Option<FxHashMap<String, TokenList<'css>>> {
     if !events
         .iter()
@@ -274,7 +310,7 @@ pub(super) fn cascade_custom_properties<'sheet, 'css>(
             }
         }
     }
-    resolve_custom_properties(&mut values, parent);
+    resolve_custom_properties(&mut values, parent, random);
     Some(values)
 }
 
@@ -314,7 +350,7 @@ impl<'i> Visitor<'i> for CustomPropertyDependencyCollector {
     type Error = Infallible;
 
     fn visit_types(&self) -> lightningcss::visitor::VisitTypes {
-        lightningcss::visit_types!(VARIABLES)
+        lightningcss::visit_types!(VARIABLES | FUNCTIONS)
     }
 
     fn visit_variable(&mut self, variable: &mut Variable<'i>) -> Result<(), Self::Error> {
@@ -323,6 +359,16 @@ impl<'i> Visitor<'i> for CustomPropertyDependencyCollector {
             self.names.push(name);
         }
         variable.visit_children(self)
+    }
+
+    fn visit_function(&mut self, function: &mut Function<'i>) -> Result<(), Self::Error> {
+        // Only evaluated names, keys and selected branches create local
+        // dependencies. Unused choices must not create property cycles.
+        if is_lazy_function(function.name.as_ref()) {
+            Ok(())
+        } else {
+            function.visit_children(self)
+        }
     }
 }
 
@@ -428,18 +474,24 @@ fn resolve_custom_property<'a>(
     specified: &FxHashMap<String, TokenList<'a>>,
     parent_custom: &FxHashMap<String, TokenList<'a>>,
     dependencies: &FxHashMap<String, Vec<String>>,
-    cyclic: &HashSet<String>,
-    resolving: &mut HashSet<String>,
+    cyclic: &mut HashSet<String>,
+    resolving: &mut Vec<String>,
     resolved: &mut FxHashMap<String, TokenList<'a>>,
+    random: &RandomContext,
 ) -> bool {
     if resolved.contains_key(name) {
         return true;
     }
-    if cyclic.contains(name) || !resolving.insert(name.to_string()) {
+    if cyclic.contains(name) {
         return false;
     }
+    if let Some(start) = resolving.iter().position(|active| active == name) {
+        cyclic.extend(resolving[start..].iter().cloned());
+        return false;
+    }
+    resolving.push(name.to_string());
     let Some(mut value) = specified.get(name).cloned() else {
-        resolving.remove(name);
+        resolving.pop();
         return false;
     };
 
@@ -453,18 +505,36 @@ fn resolve_custom_property<'a>(
                 cyclic,
                 resolving,
                 resolved,
+                random,
             );
         }
     }
 
-    let variables = resolved
-        .iter()
-        .map(|(name, value)| (name.as_str(), value.clone()))
-        .collect::<HashMap<_, _>>();
-    mark_var_substitution_boundaries(&mut value);
-    value.substitute_variables(&variables);
-    resolving.remove(name);
-    if token_list_contains_var(&value) {
+    let valid = if contains_lazy_function(&value) {
+        substitution::substitute(&mut value, parent_custom, random, name, |dependency| {
+            let _ = resolve_custom_property(
+                dependency,
+                specified,
+                parent_custom,
+                dependencies,
+                cyclic,
+                resolving,
+                resolved,
+                random,
+            );
+            resolved.get(dependency).cloned()
+        })
+    } else {
+        let variables = resolved
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.clone()))
+            .collect::<HashMap<_, _>>();
+        mark_var_substitution_boundaries(&mut value);
+        value.substitute_variables(&variables);
+        !needs_substitution(&value)
+    };
+    resolving.pop();
+    if !valid || cyclic.contains(name) {
         return false;
     }
     if let Some(keyword) = single_ident_keyword(&value).map(str::to_ascii_lowercase) {
@@ -486,6 +556,7 @@ fn resolve_custom_property<'a>(
 pub(super) fn resolve_custom_properties<'a>(
     custom_properties: &mut FxHashMap<String, TokenList<'a>>,
     parent_custom: &FxHashMap<String, TokenList<'a>>,
+    random: &RandomContext,
 ) {
     // The common EPUB case is a flat set of literal custom properties. Those
     // values are already final after the cascade above: inherited entries came
@@ -495,13 +566,13 @@ pub(super) fn resolve_custom_properties<'a>(
     // times per element.
     if custom_properties
         .values()
-        .all(|value| !token_list_contains_var(value))
+        .all(|value| !needs_substitution(value))
     {
         return;
     }
     let specified = custom_properties.clone();
-    let (dependencies, cyclic) = cyclic_custom_properties(&specified);
-    let mut resolving = HashSet::new();
+    let (dependencies, mut cyclic) = cyclic_custom_properties(&specified);
+    let mut resolving = Vec::new();
     let mut resolved = FxHashMap::default();
     for name in specified.keys() {
         let _ = resolve_custom_property(
@@ -509,9 +580,10 @@ pub(super) fn resolve_custom_properties<'a>(
             &specified,
             parent_custom,
             &dependencies,
-            &cyclic,
+            &mut cyclic,
             &mut resolving,
             &mut resolved,
+            random,
         );
     }
     *custom_properties = resolved;
@@ -565,21 +637,36 @@ pub(super) fn single_var_property_is_resolvable(
     };
     custom_properties
         .get(var.name.ident.as_ref())
-        .is_some_and(token_list_is_serializable)
+        .is_some_and(|value| !contains_random_math(value) && token_list_is_serializable(value))
 }
 
 pub(super) fn resolve_single_var_property<'a>(
-    unparsed: &lightningcss::properties::custom::UnparsedProperty<'a>,
+    unparsed: &UnparsedProperty<'a>,
     custom_properties: &FxHashMap<String, TokenList<'a>>,
 ) -> Option<Property<'a>> {
     let [TokenOrValue::Var(var)] = unparsed.value.0.as_slice() else {
         return None;
     };
     let replacement = custom_properties.get(var.name.ident.as_ref())?;
-    let css = token_list_to_css_string(replacement)?;
-    Property::parse_string(unparsed.property_id.clone(), &css, ParserOptions::default())
-        .ok()
-        .map(IntoOwned::into_owned)
+    if contains_random_math(replacement) { return None; }
+    parse_substituted_property(&unparsed.property_id, replacement)
+}
+
+pub(super) fn parse_substituted_property<'a>(
+    id: &PropertyId<'_>,
+    tokens: &TokenList<'_>,
+) -> Option<Property<'a>> {
+    use crate::style::syntax::{box_syntax, value};
+
+    let css = token_list_to_css_string(tokens).or_else(|| {
+        Property::Unparsed(UnparsedProperty { property_id: id.clone(), value: tokens.clone() })
+            .value_to_css_string(PrinterOptions::default()).ok()
+    })?;
+    let normalized = value::normalize_property_value(id, &css);
+    if box_syntax::property_value_is_valid(id, &normalized) == Some(false) {
+        return None;
+    }
+    value::parsed_property(id.clone(), &normalized).map(IntoOwned::into_owned)
 }
 
 pub(super) fn token_list_to_css_string(tokens: &TokenList<'_>) -> Option<String> {
@@ -592,6 +679,9 @@ fn token_list_is_serializable(tokens: &TokenList<'_>) -> bool {
     tokens.0.iter().all(|token| match token {
         TokenOrValue::Color(_)
         | TokenOrValue::Length(_)
+        | TokenOrValue::Angle(_)
+        | TokenOrValue::Time(_)
+        | TokenOrValue::Resolution(_)
         | TokenOrValue::DashedIdent(_)
         | TokenOrValue::AnimationName(_)
         | TokenOrValue::Token(_) => true,
@@ -614,8 +704,14 @@ fn write_token_list(tokens: &TokenList<'_>, out: &mut String) -> Option<()> {
                 out.push(')');
             }
             TokenOrValue::Length(length) => {
+                let (value, unit) = length.to_unit_value();
+                write_dimension(value,unit,out)?;
+            }
+            TokenOrValue::Angle(angle) => write_dimension(angle.to_degrees(),"deg",out)?,
+            TokenOrValue::Time(time) => write_dimension(time.to_ms(),"ms",out)?,
+            TokenOrValue::Resolution(value) => {
                 let mut printer = Printer::new(out, PrinterOptions::default());
-                length.to_css(&mut printer).ok()?;
+                value.to_css(&mut printer).ok()?;
             }
             TokenOrValue::DashedIdent(ident) => {
                 let mut printer = Printer::new(out, PrinterOptions::default());
@@ -635,10 +731,24 @@ fn write_token_list(tokens: &TokenList<'_>, out: &mut String) -> Option<()> {
     Some(())
 }
 
-pub(super) fn token_list_contains_var(tokens: &TokenList<'_>) -> bool {
-    tokens.0.iter().any(|token| match token {
-        TokenOrValue::Var(_) => true,
-        TokenOrValue::Function(function) => token_list_contains_var(&function.arguments),
-        _ => false,
-    })
+fn write_dimension(value:f32,unit:&str,out:&mut String)->Option<()> {
+    // Numeric functions must retain the dimension of zero.
+    let token=Token::Dimension {has_sign:value.is_sign_negative(),value,int_value:None,unit:unit.into()};
+    token.to_css(&mut Printer::new(out,PrinterOptions::default())).ok()
+}
+
+pub(super) fn substitute_property_tokens<'css>(
+    tokens: &mut TokenList<'css>,
+    variables: &HashMap<&str, TokenList<'css>>,
+    parent: &FxHashMap<String, TokenList<'css>>,
+    random: &RandomContext,
+    property: &str,
+) -> bool {
+    if contains_lazy_function(tokens) || contains_random_math(tokens) || variables.values().any(contains_random_math) {
+        substitution::substitute(tokens, parent, random, property, |name| variables.get(name).cloned())
+    } else {
+        mark_var_substitution_boundaries(tokens);
+        tokens.substitute_variables(variables);
+        !needs_substitution(tokens)
+    }
 }

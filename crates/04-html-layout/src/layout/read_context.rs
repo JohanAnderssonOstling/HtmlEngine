@@ -1,8 +1,9 @@
+use super::block::ParagraphSpacing;
 use crate::layout_model::{
-    Children, GlyphMetrics, InlineContent, InlineItemKind, LayoutBox, LayoutMode, LayoutTree,
+    Children, InlineContent, InlineItemKind, LayoutBox, LayoutMode, LayoutTree,
     ListItemMarker,
 };
-use crate::shaping::{FontRelativeMetrics, ShapedFontMetrics};
+use crate::layout_model::{FontRelativeMetrics, ShapedFontMetrics};
 use html_dom::Document;
 use html_style_model::{
     ComputedStyles, Float, LayoutStyle, PositionMode, StyleIndices, UsedStyleView,
@@ -10,24 +11,25 @@ use html_style_model::{
 use kurbo::Size;
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ImageIntrinsic {
-    pub(crate) size: Size,
-    pub(crate) aspect_ratio: Option<f64>,
+pub struct ImageIntrinsic {
+    pub size: Size,
+    pub aspect_ratio: Option<f64>,
 }
 
 /// Shared read-only access to the document, styled layout topology, and
 /// renderer-supplied metrics used during layout.
-#[derive(Clone)]
-pub(crate) struct LayoutReader<'input> {
+#[derive(Clone, Copy)]
+pub struct LayoutReader<'input> {
     document: &'input Document,
     styles: &'input ComputedStyles,
     topology: &'input LayoutTree,
     inline_content: &'input InlineContent,
-    glyph_metrics: &'input GlyphMetrics,
     font_metrics: &'input ShapedFontMetrics,
     image_metrics: &'input crate::ImageMetrics,
-    box_styles: BoxStyleSnapshot<'input>,
-    paint: Option<&'input crate::stages::PaintStyles>,
+    box_styles: &'input [UsedStyleView<'input>],
+    paragraph_spacing: &'input ParagraphSpacing,
+    tracks_overflow_clips: bool,
+    paint: Option<html_engine_model::PaintView<'input>>,
 }
 
 /// Layout-ready styles for boxes in topology order.
@@ -38,14 +40,16 @@ pub(crate) struct LayoutReader<'input> {
 /// a layout session starts. This does not move value resolution: percentages
 /// and other containing-block-dependent values remain symbolic inside
 /// `UsedStyleView` until the owning layout algorithm supplies their basis.
-#[derive(Clone)]
-struct BoxStyleSnapshot<'input> {
-    styles: std::sync::Arc<[UsedStyleView<'input>]>,
+pub(super) struct BoxStyleSnapshot<'input> {
+    styles: Vec<UsedStyleView<'input>>,
+    paragraph_spacing: ParagraphSpacing,
     tracks_overflow_clips: bool,
 }
 
 impl<'input> BoxStyleSnapshot<'input> {
-    fn new(
+    pub(super) fn new(
+        document: &Document,
+        inline_content: &InlineContent,
         styles: &'input ComputedStyles,
         topology: &'input LayoutTree,
         font_metrics: &'input ShapedFontMetrics,
@@ -62,101 +66,120 @@ impl<'input> BoxStyleSnapshot<'input> {
             tracks_overflow_clips |= style.overflow_x().clips() || style.overflow_y().clips();
             resolved.push(style);
         }
+        let paragraph_spacing = ParagraphSpacing::new(document, styles, topology, inline_content, &resolved);
         Self {
-            styles: resolved.into(),
+            styles: resolved,
+            paragraph_spacing,
             tracks_overflow_clips,
         }
     }
 }
 
 impl<'input> LayoutReader<'input> {
-    pub(crate) fn new(
+    pub(super) fn new(
         document: &'input Document,
         styles: &'input ComputedStyles,
         topology: &'input LayoutTree,
         inline_content: &'input InlineContent,
-        glyph_metrics: &'input GlyphMetrics,
         font_metrics: &'input ShapedFontMetrics,
         image_metrics: &'input crate::ImageMetrics,
+        box_styles: &'input BoxStyleSnapshot<'input>,
     ) -> Self {
-        let box_styles = BoxStyleSnapshot::new(styles, topology, font_metrics);
         Self {
             document,
             styles,
             topology,
             inline_content,
-            glyph_metrics,
             font_metrics,
             image_metrics,
-            box_styles,
+            box_styles: &box_styles.styles,
+            paragraph_spacing: &box_styles.paragraph_spacing,
+            tracks_overflow_clips: box_styles.tracks_overflow_clips,
             paint: None,
         }
     }
 
-    pub(crate) fn with_paint(mut self, paint: &'input crate::stages::PaintStyles) -> Self {
+    pub fn with_paint(mut self, paint: html_engine_model::PaintView<'input>) -> Self {
         self.paint = Some(paint);
         self
     }
 
-    pub(crate) fn document(&self) -> &'input Document {
+    pub fn document(&self) -> &'input Document {
         self.document
     }
 
     /// Geometry reads never consult the reader palette.
-    pub(crate) fn style(&self, box_idx: usize) -> UsedStyleView<'input> {
-        self.box_styles.styles[box_idx]
+    pub fn style(&self, box_idx: usize) -> UsedStyleView<'input> {
+        self.box_styles[box_idx]
     }
 
-    pub(crate) fn paint_style(&self, box_idx: usize) -> UsedStyleView<'input> {
+    pub fn reader_text_indent(&self, box_idx: usize) -> Option<f64> {
+        self.paragraph_spacing.indent(box_idx)
+    }
+
+    pub fn reader_paragraph_gap(&self, box_idx: usize) -> Option<f64> {
+        self.paragraph_spacing.gap(box_idx)
+    }
+
+    pub fn is_reader_prose(&self, box_idx: usize) -> bool {
+        self.paragraph_spacing.is_prose(box_idx)
+    }
+
+    pub fn vertical_margins(&self, box_idx: usize, containing_width: f64) -> (f64, f64) {
+        let style = self.style(box_idx);
+        self.paragraph_spacing.resolve(box_idx, style.margin_top().resolve(containing_width), style.margin_bottom().resolve(containing_width))
+    }
+
+    pub fn paint_style(&self, box_idx: usize) -> UsedStyleView<'input> {
         let style = self.style(box_idx);
         self.paint.and_then(|paint| paint.box_colors(box_idx)).map_or(style, |colors| style.with_paint_colors(colors))
     }
 
-    pub(crate) fn background_can_change(&self, box_idx: usize) -> bool {
+    pub fn background_can_change(&self, box_idx: usize) -> bool {
         let indices = self.topology.get_box_style_indices(box_idx).unwrap_or_else(|| self.styles.default_indices());
         self.style(box_idx).background_color() & 0xff != 0
             || self.styles.background_style(indices).is_some_and(|background| background.background_color_current_color)
             || self.topology.root_box() == Some(box_idx) || self.topology.body_box() == Some(box_idx)
     }
 
-    pub(crate) fn tracks_overflow_clips(&self) -> bool {
-        self.box_styles.tracks_overflow_clips
+    pub fn tracks_overflow_clips(&self) -> bool {
+        self.tracks_overflow_clips
     }
 
-    pub(crate) fn used_style(&self, indices: StyleIndices) -> UsedStyleView<'input> {
+    pub fn used_style(&self, indices: StyleIndices) -> UsedStyleView<'input> {
         self.font_metrics.used_non_box_style(self.styles, indices).expect("validated style handle")
     }
 
-    pub(crate) fn paint_used_style(&self, indices: StyleIndices, context: usize) -> UsedStyleView<'input> {
+    pub fn paint_used_style(&self, indices: StyleIndices, context: usize) -> UsedStyleView<'input> {
         let style = self.used_style(indices);
         self.paint.and_then(|paint| paint.style_colors(indices, context)).map_or(style, |colors| style.with_paint_colors(colors))
     }
 
-    pub(crate) fn font_metrics(&self, box_idx: usize) -> FontRelativeMetrics {
+    pub fn font_metrics(&self, box_idx: usize) -> FontRelativeMetrics {
         self.font_metrics.for_box(box_idx)
     }
 
-    pub(crate) fn styles(&self) -> &'input ComputedStyles {
+    pub fn styles(&self) -> &'input ComputedStyles {
         self.styles
     }
 
-    pub(crate) fn layout_tree(&self) -> &'input LayoutTree {
+    pub fn layout_tree(&self) -> &'input LayoutTree {
         self.topology
     }
 
-    pub(crate) fn box_at(&self, box_idx: usize) -> Option<&LayoutBox> {
+    pub fn box_at(&self, box_idx: usize) -> Option<&LayoutBox> {
         self.topology.box_at(box_idx)
     }
 
-    pub(crate) fn box_dom_element(&self, box_idx: usize) -> Option<u32> {
+    pub fn box_dom_element(&self, box_idx: usize) -> Option<u32> {
         self.topology.get_box_dom_element(box_idx)
     }
 
-    pub(crate) fn image_idx(&self, box_idx: usize) -> Option<u32> {
+    pub fn image_idx(&self, box_idx: usize) -> Option<u32> {
         self.topology.get_box_image_idx(box_idx)
     }
 
-    pub(crate) fn image_display_size(&self, image_idx: u32) -> (f64, f64) {
+    pub fn image_display_size(&self, image_idx: u32) -> (f64, f64) {
         self.image_metrics.display_size(
             image_idx,
             self.document
@@ -165,7 +188,7 @@ impl<'input> LayoutReader<'input> {
         )
     }
 
-    pub(crate) fn image_intrinsic(&self, box_idx: usize) -> Option<ImageIntrinsic> {
+    pub fn image_intrinsic(&self, box_idx: usize) -> Option<ImageIntrinsic> {
         let image_idx = self.image_idx(box_idx)?;
         let (width, height) = self.image_display_size(image_idx);
         let size = Size::new(width, height);
@@ -201,7 +224,7 @@ impl<'input> LayoutReader<'input> {
 
     /// Returns a renderer-supplied column-filling width for an eligible
     /// standalone image, capped so its outer height fits the viewport.
-    pub(crate) fn smart_standalone_image_width(
+    pub fn smart_standalone_image_width(
         &self,
         policy: crate::ImageSizingPolicy,
         box_idx: usize,
@@ -259,11 +282,11 @@ impl<'input> LayoutReader<'input> {
         Some(html_style_model::UsedPreferredSize::Px(preferred as f32))
     }
 
-    pub(crate) fn box_style_indices(&self, box_idx: usize) -> Option<StyleIndices> {
+    pub fn box_style_indices(&self, box_idx: usize) -> Option<StyleIndices> {
         self.topology.get_box_style_indices(box_idx)
     }
 
-    pub(crate) fn layout_style(&self, box_idx: usize) -> &'input LayoutStyle {
+    pub fn layout_style(&self, box_idx: usize) -> &'input LayoutStyle {
         let indices = self
             .box_style_indices(box_idx)
             .unwrap_or_else(|| self.styles.default_indices());
@@ -272,19 +295,19 @@ impl<'input> LayoutReader<'input> {
             .expect("validated style handle")
     }
 
-    pub(crate) fn inline_fragment_edges(&self, box_idx: usize) -> (bool, bool) {
+    pub fn inline_fragment_edges(&self, box_idx: usize) -> (bool, bool) {
         self.topology.inline_fragment_edges(box_idx)
     }
 
-    pub(crate) fn split_inline_position_ancestors(&self, box_idx: usize) -> &[StyleIndices] {
+    pub fn split_inline_position_ancestors(&self, box_idx: usize) -> &[StyleIndices] {
         self.topology.split_inline_position_ancestors(box_idx)
     }
 
-    pub(crate) fn box_count(&self) -> usize {
+    pub fn box_count(&self) -> usize {
         self.topology.box_count()
     }
 
-    pub(crate) fn box_layout_mode(&self, box_idx: usize) -> Option<&LayoutMode> {
+    pub fn box_layout_mode(&self, box_idx: usize) -> Option<&LayoutMode> {
         self.topology.get_box_layout_mode(box_idx)
     }
 
@@ -292,7 +315,7 @@ impl<'input> LayoutReader<'input> {
     /// and absolutely positioned descendants leave anchors in the run stream,
     /// but those anchors do not give their containing block a line box or
     /// prevent its vertical margins from collapsing through.
-    pub(crate) fn inline_items_establish_line_box(
+    pub fn inline_items_establish_line_box(
         &self,
         container_box_idx: usize,
         runs: &std::ops::Range<u32>,
@@ -321,8 +344,8 @@ impl<'input> LayoutReader<'input> {
                         glyphs.clone().any(|glyph_idx| {
                             let character = self
                                 .inline_content
-                                .glyph_at(glyph_idx as usize)
-                                .map(|glyph| self.glyph_metrics.get(glyph).ch())
+                                .character_at(glyph_idx as usize)
+                                .and_then(char::from_u32)
                                 .unwrap_or_default();
                             preserves_space || !character.is_whitespace() || character == '\u{00A0}'
                         })
@@ -339,7 +362,7 @@ impl<'input> LayoutReader<'input> {
     /// Float sides represented only by anchors in this block's inline-run
     /// stream. Anchor-only streams do not establish a line box, but their
     /// float sources still participate in adjoining-margin/clearance rules.
-    pub(crate) fn inline_item_float_sides(
+    pub fn inline_item_float_sides(
         &self,
         container_box_idx: usize,
         runs: &std::ops::Range<u32>,
@@ -386,15 +409,15 @@ impl<'input> LayoutReader<'input> {
         false
     }
 
-    pub(crate) fn get_parent(&self, box_idx: usize) -> Option<usize> {
+    pub fn get_parent(&self, box_idx: usize) -> Option<usize> {
         self.topology.get_box_parent(box_idx)
     }
 
-    pub(crate) fn root_box(&self) -> Option<usize> {
+    pub fn root_box(&self) -> Option<usize> {
         self.topology.root_box()
     }
 
-    pub(crate) fn body_box(&self) -> Option<usize> {
+    pub fn body_box(&self) -> Option<usize> {
         self.topology.body_box()
     }
 
@@ -402,7 +425,7 @@ impl<'input> LayoutReader<'input> {
     /// viewport when both root axes are `visible`. The body's used overflow
     /// then becomes `visible`, so it must not create a block formatting
     /// context or clip its own descendants.
-    pub(crate) fn effective_overflow_modes(
+    pub fn effective_overflow_modes(
         &self,
         box_idx: usize,
     ) -> (
@@ -430,7 +453,7 @@ impl<'input> LayoutReader<'input> {
     /// separate element background. CSS propagates the root background to the
     /// canvas; for HTML documents whose root has no background, the body
     /// background is propagated instead.
-    pub(crate) fn background_paints_on_canvas(&self, box_idx: usize) -> bool {
+    pub fn background_paints_on_canvas(&self, box_idx: usize) -> bool {
         let Some(root_box) = self.root_box() else {
             return false;
         };
@@ -446,40 +469,40 @@ impl<'input> LayoutReader<'input> {
             && box_idx == body_box
     }
 
-    pub(crate) fn is_table_cell_box(&self, box_idx: usize) -> bool {
+    pub fn is_table_cell_box(&self, box_idx: usize) -> bool {
         matches!(
             self.box_layout_mode(box_idx),
             Some(LayoutMode::TableCell(_))
         )
     }
 
-    pub(crate) fn is_block_box(&self, box_idx: usize) -> bool {
+    pub fn is_block_box(&self, box_idx: usize) -> bool {
         matches!(self.box_layout_mode(box_idx), Some(LayoutMode::Block(_)))
     }
 
-    pub(crate) fn is_flex_grid_box(&self, box_idx: usize) -> bool {
+    pub fn is_flex_grid_box(&self, box_idx: usize) -> bool {
         matches!(
             self.box_layout_mode(box_idx),
             Some(LayoutMode::Flex(_) | LayoutMode::Grid(_))
         )
     }
 
-    pub(crate) fn is_anonymous_box(&self, box_idx: usize) -> bool {
+    pub fn is_anonymous_box(&self, box_idx: usize) -> bool {
         matches!(
             self.box_layout_mode(box_idx),
             Some(LayoutMode::Anonymous(_))
         )
     }
 
-    pub(crate) fn is_table_box(&self, box_idx: usize) -> bool {
+    pub fn is_table_box(&self, box_idx: usize) -> bool {
         matches!(self.box_layout_mode(box_idx), Some(LayoutMode::Table(_)))
     }
 
-    pub(crate) fn is_inline_box(&self, box_idx: usize) -> bool {
+    pub fn is_inline_box(&self, box_idx: usize) -> bool {
         matches!(self.box_layout_mode(box_idx), Some(LayoutMode::Inline(_)))
     }
 
-    pub(crate) fn is_only_block_child(&self, box_idx: usize) -> bool {
+    pub fn is_only_block_child(&self, box_idx: usize) -> bool {
         let Some(parent) = self.get_parent(box_idx) else {
             return false;
         };
@@ -489,11 +512,11 @@ impl<'input> LayoutReader<'input> {
         )
     }
 
-    pub(crate) fn list_marker(&self, box_idx: usize) -> Option<ListItemMarker> {
+    pub fn list_marker(&self, box_idx: usize) -> Option<ListItemMarker> {
         self.topology.list_marker(box_idx)
     }
 
-    pub(crate) fn box_uses_float_context(&self, box_idx: usize) -> bool {
+    pub fn box_uses_float_context(&self, box_idx: usize) -> bool {
         let style = self.style(box_idx);
         let (overflow_x, overflow_y) = self.effective_overflow_modes(box_idx);
         let is_flex_grid_item = self
@@ -512,7 +535,7 @@ impl<'input> LayoutReader<'input> {
             || style.position() == PositionMode::Absolute
     }
 
-    pub(crate) fn box_uses_ahem(&self, box_idx: usize) -> bool {
+    pub fn box_uses_ahem(&self, box_idx: usize) -> bool {
         let indices = self
             .topology
             .get_box_style_indices(box_idx)

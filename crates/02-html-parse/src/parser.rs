@@ -5,7 +5,7 @@ use html5ever::tree_builder::{QuirksMode as Html5everQuirksMode, TreeBuilderOpts
 use html5ever::{LocalName, Namespace, QualName};
 use scraper::{Html, Node};
 
-use crate::metadata::{head_metadata_from_syntax_tree, nonempty};
+use crate::metadata::{head_metadata_from_syntax_tree, nonempty, title_from_syntax_tree};
 use crate::{XmlParseError, parse_xml_document};
 
 pub struct ParsedHtml {
@@ -269,12 +269,22 @@ impl ParsedHtml {
             .expect("parser produced an invalid DOM")
     }
 
+    /// Move parsed text into the canonical DOM and release the syntax tree.
+    pub fn into_dom(self) -> Document {
+        crate::dom::build_dom_document_owned(self).expect("parsed markup must form a valid DOM")
+    }
+
     pub fn build_dom_checked(&self) -> Result<Document, DocumentBuildError> {
         crate::build_dom_document(self)
     }
 
     pub fn head_metadata(&self) -> HeadMetadata {
         head_metadata_from_syntax_tree(&self.document)
+    }
+
+    /// Read the document title without collecting or copying stylesheet text.
+    pub fn title(&self) -> Option<String> {
+        title_from_syntax_tree(&self.document)
     }
 
     pub fn errors(&self) -> impl ExactSizeIterator<Item = &str> {
@@ -417,6 +427,16 @@ mod tests {
     }
 
     #[test]
+    fn parsing_headings_preserves_author_ids_without_generating_anchors() {
+        let parsed = parse_html_document("<h1>Intro</h1><h2 id='chapter-a'>Chapter A</h2>");
+        for document in [parsed.build_dom(), parsed.into_dom()] {
+            let body = body(&document);
+            assert_eq!(child_element(&document, body, "h1").id(), None);
+            assert_eq!(child_element(&document, body, "h2").id(), Some("chapter-a"));
+        }
+    }
+
+    #[test]
     fn selects_xml_syntax_from_xml_family_extensions() {
         assert_eq!(MarkupSyntax::from_uri("chapter.xhtml"), MarkupSyntax::Xml);
         assert_eq!(
@@ -526,6 +546,7 @@ mod tests {
     fn xml_names_and_metadata_are_case_sensitive() {
         let parsed = parse_xml_document(r#"<HTML xmlns="http://www.w3.org/1999/xhtml"><HEAD><TITLE>not an XHTML title</TITLE></HEAD><Body/></HTML>"#).unwrap();
         assert_eq!(parsed.head_metadata().title, None);
+        assert_eq!(parsed.title(), None);
         let document = parsed.build_dom();
         let root = document.element_ref(document.dom_root().unwrap()).unwrap();
         assert_eq!(root.tag(), "HTML");
@@ -674,6 +695,19 @@ mod tests {
     }
 
     #[test]
+    fn title_query_skips_empty_titles_and_ignores_titles_outside_head() {
+        let parsed = parse_xml_document(
+            "<html><head><style>p { color: blue }</style><title> </title><title> Selected <em>title</em> </title></head><body><title>Ignored</title></body></html>",
+        ).unwrap();
+        assert_eq!(parsed.title().as_deref(), Some("Selected title"));
+        assert_eq!(parsed.title(), parsed.head_metadata().title);
+        let parsed = parse_xml_document(
+            "<html><head><style>p { color: blue }</style></head><body><title>Ignored</title></body></html>",
+        ).unwrap();
+        assert_eq!(parsed.title(), None);
+    }
+
+    #[test]
     fn extracts_head_metadata_without_exposing_scraper() {
         let document = parse_html_document(
             r#"
@@ -681,6 +715,9 @@ mod tests {
                 <title> Example </title>
                 <link rel="preload StyleSheet" type="Text/CSS; charset=utf-8" href="base.css?v=1">
                 <link rel="alternate stylesheet" href="inactive.css">
+                <link rel="stylesheet" type="text/plain" href="ignored.css">
+                <link rel="stylesheet" href=" ">
+                <link rel="stylesheet" href=" legacy.css " charset=" windows-1252 ">
                 <style>p { color: blue; }</style>
                 <style type="TeXt/CsS">p { background: green; }</style>
                 <style type="text/cſs">p { color: red; }</style>
@@ -689,10 +726,15 @@ mod tests {
         );
         let metadata = document.head_metadata();
         assert_eq!(metadata.title.as_deref(), Some("Example"));
+        assert_eq!(document.title(), metadata.title);
         assert_eq!(
             metadata.stylesheets,
             vec![
                 StylesheetReference::External("base.css?v=1".to_owned()),
+                StylesheetReference::ExternalWithCharset {
+                    href: "legacy.css".to_owned(),
+                    charset: "windows-1252".to_owned(),
+                },
                 StylesheetReference::Inline("p { color: blue; }".to_owned()),
                 StylesheetReference::Inline("p { background: green; }".to_owned()),
             ]

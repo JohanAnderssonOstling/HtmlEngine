@@ -1,4 +1,5 @@
 //! Per-line pseudo, overflow, and inline-strut preparation.
+use html_text::{whitespace_context_root, first_line_style_for_inline_root};
 
 use super::*;
 
@@ -138,8 +139,8 @@ pub(super) fn first_line_color(
 ) -> Option<u32> {
     let styles = engine.reader.styles();
     let tree = engine.reader.layout_tree();
-    let root = crate::shaping::whitespace_context_root(tree, container_box_idx);
-    crate::shaping::first_line_style_for_inline_root(
+    let root = whitespace_context_root(tree, container_box_idx);
+    first_line_style_for_inline_root(
         engine.reader.document(),
         styles,
         tree,
@@ -160,7 +161,7 @@ pub(in crate::layout::inline) fn pseudo_line_heights(
 ) -> (Option<f64>, Option<f64>) {
     let styles = engine.reader.styles();
     let tree = engine.reader.layout_tree();
-    let root = crate::shaping::whitespace_context_root(tree, container_box_idx);
+    let root = whitespace_context_root(tree, container_box_idx);
     let resolve = |style: html_style_model::StyleView<'_>| {
         if style.line_height_is_normal() {
             style.font_size() as f64 * 1.2
@@ -168,7 +169,7 @@ pub(in crate::layout::inline) fn pseudo_line_heights(
             style.line_height().max(0.0) as f64
         }
     };
-    let line = crate::shaping::first_line_style_for_inline_root(
+    let line = first_line_style_for_inline_root(
         engine.reader.document(),
         styles,
         tree,
@@ -177,7 +178,7 @@ pub(in crate::layout::inline) fn pseudo_line_heights(
     )
     .and_then(|style| styles.view(style))
     .map(resolve);
-    let letter = crate::shaping::first_letter_style_for_inline_root(
+    let letter = html_text::first_letter_style_for_inline_root(
         engine.reader.document(),
         styles,
         tree,
@@ -214,7 +215,7 @@ pub(super) fn apply_first_line_pseudo_styles<'b>(
                 InlineTokenKind::Glyph { .. } | InlineTokenKind::Ellipsis { .. }
             )
         }) {
-            set_token_line_height(token, run_storage, height);
+            set_token_line_height(engine, token, run_storage, height);
         }
     }
     if let Some(height) = first_letter_height {
@@ -252,7 +253,7 @@ pub(super) fn apply_first_line_pseudo_styles<'b>(
             if !selected {
                 break;
             }
-            set_token_line_height(token, run_storage, height);
+            set_token_line_height(engine, token, run_storage, height);
         }
     }
     (storage.as_slice(), run_storage.as_slice())
@@ -266,19 +267,32 @@ fn is_first_letter_punctuation(character: char) -> bool {
         || character.is_punctuation_other()
 }
 
-fn set_token_line_height(token: &mut InlineToken, runs: &mut Vec<InlineTokenMetrics>, height: f64) {
+fn set_token_line_height(
+    engine: &crate::layout::LayoutEngine<'_, '_>,
+    token: &mut InlineToken,
+    runs: &mut Vec<InlineTokenMetrics>,
+    height: f64,
+) {
     let mut metrics = *token.run_metrics(runs);
-    metrics.line_height = height;
+    metrics.line_height = height as f32;
+    if metrics.owner_box_idx != u32::MAX {
+        metrics.vertical_align = InlineVerticalAlign::resolve(
+            text_vertical_align(engine, metrics.owner_box_idx as usize),
+            height,
+            metrics.font_size,
+        );
+    }
     let run_idx =
         u32::try_from(runs.len()).expect("inline pseudo run-metrics arena capacity exhausted");
     runs.push(metrics);
-    token.run_idx = run_idx;
+    token.set_run_idx(run_idx);
 }
 
 /// Applies the block container's inline overflow policy to one already
 /// broken line. The borrowed source span is returned unchanged on the hot
 /// path; storage is populated only when a line actually overflows.
 pub(super) fn apply_inline_overflow<'b>(
+    reader: &LayoutReader<'_>,
     span: &'b [InlineToken],
     runs: &[InlineTokenMetrics],
     tab_origin: f64,
@@ -292,7 +306,7 @@ pub(super) fn apply_inline_overflow<'b>(
 
     let mut full_width = 0.0;
     for token in span {
-        full_width += token.advance_at(runs, tab_origin + full_width);
+        full_width += token.advance_at(reader, runs, tab_origin + full_width);
     }
     if full_width <= line_width_limit {
         return span;
@@ -306,7 +320,7 @@ pub(super) fn apply_inline_overflow<'b>(
         return span;
     };
 
-    let marker_width = marker.advance_at(runs, tab_origin);
+    let marker_width = marker.advance_at(reader, runs, tab_origin);
     let show_marker = marker_width <= line_width_limit;
     let prefix_limit = if show_marker {
         (line_width_limit - marker_width).max(0.0)
@@ -316,7 +330,7 @@ pub(super) fn apply_inline_overflow<'b>(
     let mut width = 0.0;
     let mut end = 0usize;
     for (idx, token) in span.iter().enumerate() {
-        let advance = token.advance_at(runs, tab_origin + width);
+        let advance = token.advance_at(reader, runs, tab_origin + width);
         if width + advance > prefix_limit {
             break;
         }

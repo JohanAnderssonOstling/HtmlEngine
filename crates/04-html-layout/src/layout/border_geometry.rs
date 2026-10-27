@@ -3,7 +3,7 @@ use html_style_model::{BorderStyle, TextDecorationStyle, UsedStyleView};
 use kurbo::Rect;
 
 #[derive(Clone, Copy)]
-pub(crate) struct PhysicalBorderEdge {
+pub struct PhysicalBorderEdge {
     pub style: BorderStyle,
     pub width: f64,
     pub color: u32,
@@ -11,20 +11,20 @@ pub(crate) struct PhysicalBorderEdge {
 }
 
 impl PhysicalBorderEdge {
-    pub(crate) fn solid(self) -> Option<(f64, u32)> {
+    pub fn solid(self) -> Option<(f64, u32)> {
         matches!(self.style, BorderStyle::Solid).then_some((self.width, self.color))
     }
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct PhysicalBorders {
+pub struct PhysicalBorders {
     pub top: PhysicalBorderEdge,
     pub right: PhysicalBorderEdge,
     pub bottom: PhysicalBorderEdge,
     pub left: PhysicalBorderEdge,
 }
 
-pub(crate) fn physical_borders(style: &UsedStyleView<'_>) -> PhysicalBorders {
+pub fn physical_borders(style: &UsedStyleView<'_>) -> PhysicalBorders {
     PhysicalBorders {
         top: PhysicalBorderEdge {
             side: 0,
@@ -126,7 +126,7 @@ fn emit_vertical_pattern(
     ));
 }
 
-pub(crate) fn border_pattern(style: BorderStyle, horizontal: bool) -> Option<DecorationPattern> {
+pub fn border_pattern(style: BorderStyle, horizontal: bool) -> Option<DecorationPattern> {
     match (style, horizontal) {
         (BorderStyle::Solid, _) => Some(DecorationPattern::Solid),
         (BorderStyle::Dotted, true) => Some(DecorationPattern::DottedHorizontal),
@@ -227,7 +227,7 @@ pub(super) fn emit_outline_fragments(
     }
 }
 
-pub(crate) fn emit_uniform_3d_border(
+pub fn emit_uniform_3d_border(
     fragments: &mut DecorationStore,
     rect: Rect,
     width: f64,

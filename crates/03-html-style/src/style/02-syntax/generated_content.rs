@@ -1,7 +1,8 @@
 //! Syntax and renderer support for generated-content declarations.
 
+use super::property_id::RendererPropertyId;
+use lightningcss::properties::Property;
 use lightningcss::properties::custom::{Token, TokenList, TokenOrValue};
-use lightningcss::properties::{Property, PropertyId};
 use lightningcss::stylesheet::ParserOptions;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -17,8 +18,8 @@ impl ValueSupport {
     }
 }
 
-fn parsed_tokens<'a>(name: &'a str, value: &'a str) -> Option<TokenList<'a>> {
-    match Property::parse_string(PropertyId::from(name), value, ParserOptions::default()).ok()? {
+fn parsed_tokens(id: RendererPropertyId, value: &str) -> Option<TokenList<'_>> {
+    match Property::parse_string(id.lightning_id(), value, ParserOptions::default()).ok()? {
         Property::Unparsed(value) => Some(value.value),
         Property::Custom(value) => Some(value.value),
         _ => None,
@@ -155,7 +156,7 @@ fn content_function(function: &lightningcss::properties::custom::Function<'_>) -
 }
 
 pub(crate) fn content(value: &str) -> ValueSupport {
-    let Some(tokens) = parsed_tokens("content", value) else {
+    let Some(tokens) = parsed_tokens(RendererPropertyId::Content, value) else {
         return ValueSupport::Invalid;
     };
     let tokens = significant(&tokens);
@@ -236,8 +237,8 @@ pub(crate) fn content(value: &str) -> ValueSupport {
     }
 }
 
-pub(crate) fn counter_directive(name: &str, value: &str) -> ValueSupport {
-    let Some(tokens) = parsed_tokens(name, value) else {
+pub(crate) fn counter_directive(id: RendererPropertyId, value: &str) -> ValueSupport {
+    let Some(tokens) = parsed_tokens(id, value) else {
         return ValueSupport::Invalid;
     };
     let tokens = significant(&tokens);
@@ -253,7 +254,7 @@ pub(crate) fn counter_directive(name: &str, value: &str) -> ValueSupport {
     let mut cursor = 0;
     let mut support = ValueSupport::Supported;
     while cursor < tokens.len() {
-        let is_reset = name.eq_ignore_ascii_case("counter-reset");
+        let is_reset = id == RendererPropertyId::CounterReset;
         let (counter_name, unsupported_name_form) = match tokens[cursor] {
             TokenOrValue::Token(Token::Ident(counter_name)) => (counter_name.as_ref(), false),
             TokenOrValue::Function(function)
@@ -302,7 +303,7 @@ pub(crate) fn counter_directive(name: &str, value: &str) -> ValueSupport {
 }
 
 pub(crate) fn quotes(value: &str) -> ValueSupport {
-    let Some(tokens) = parsed_tokens("quotes", value) else {
+    let Some(tokens) = parsed_tokens(RendererPropertyId::Quotes, value) else {
         return ValueSupport::Invalid;
     };
     let tokens = significant(&tokens);
@@ -367,27 +368,27 @@ mod tests {
     #[test]
     fn validates_related_generated_content_properties() {
         assert_eq!(
-            counter_directive("counter-reset", "chapter 1 section"),
+            counter_directive(RendererPropertyId::CounterReset, "chapter 1 section"),
             ValueSupport::Supported
         );
         assert_eq!(
-            counter_directive("counter-increment", "none extra"),
+            counter_directive(RendererPropertyId::CounterIncrement, "none extra"),
             ValueSupport::Invalid
         );
         assert_eq!(
-            counter_directive("counter-reset", "reversed(chapter)"),
+            counter_directive(RendererPropertyId::CounterReset, "reversed(chapter)"),
             ValueSupport::Unsupported
         );
         assert_eq!(
-            counter_directive("counter-increment", "reversed(chapter)"),
+            counter_directive(RendererPropertyId::CounterIncrement, "reversed(chapter)"),
             ValueSupport::Invalid
         );
         assert_eq!(
-            counter_directive("counter-increment", "chapter calc(1)"),
+            counter_directive(RendererPropertyId::CounterIncrement, "chapter calc(1)"),
             ValueSupport::Unsupported
         );
         assert_eq!(
-            counter_directive("counter-reset", "default 1"),
+            counter_directive(RendererPropertyId::CounterReset, "default 1"),
             ValueSupport::Invalid
         );
         assert_eq!(quotes("'«' '»' '‹' '›'"), ValueSupport::Supported);

@@ -20,7 +20,7 @@ fn hierarchical_vertical_align_offset(
             | InlineTokenKind::Discretionary { .. }
     ) && matches!(
         metrics.vertical_align,
-        VerticalAlignValue::Top | VerticalAlignValue::Bottom
+        InlineVerticalAlign::Top | InlineVerticalAlign::Bottom
     );
     let mut offset = if own_is_group_alignment {
         0.0
@@ -41,7 +41,7 @@ fn hierarchical_vertical_align_offset(
             parent_font_content_extents(engine, metrics.owner_box_idx as usize)
         };
         vertical_align_metrics_offset(
-            metrics.vertical_align,
+            metrics.vertical_align.as_style_value(),
             ascent,
             descent,
             token.line_height(runs),
@@ -141,9 +141,9 @@ fn line_relative_alignment_for_token(
         InlineTokenKind::Image { .. } | InlineTokenKind::AtomicBox { .. }
     ) && matches!(
         metrics.vertical_align,
-        VerticalAlignValue::Top | VerticalAlignValue::Bottom
+        InlineVerticalAlign::Top | InlineVerticalAlign::Bottom
     ) {
-        return Some((metrics.owner_box_idx as usize, metrics.vertical_align));
+        return Some((metrics.owner_box_idx as usize, metrics.vertical_align.as_style_value()));
     }
     let start = if matches!(
         token.kind(),
@@ -202,7 +202,7 @@ fn line_relative_groups(
                 | InlineTokenKind::Ellipsis { .. }
                 | InlineTokenKind::Discretionary { .. }
         ) {
-            (metrics.line_height - ascent - descent) * 0.5
+            (f64::from(metrics.line_height) - ascent - descent) * 0.5
         } else {
             0.0
         };
@@ -263,7 +263,7 @@ pub(super) fn adjusted_line_metrics(
                 hierarchical_vertical_align_offset(engine, token, runs, line_height, baseline);
             let half_leading = match token.kind() {
                 InlineTokenKind::Glyph { .. } | InlineTokenKind::Ellipsis { .. } => {
-                    (metrics.line_height - ascent - descent) * 0.5
+                    (f64::from(metrics.line_height) - ascent - descent) * 0.5
                 }
                 _ => 0.0,
             };
@@ -304,7 +304,7 @@ pub(super) fn adjusted_line_metrics(
     let needs_container_strut = span.iter().any(|token| {
         let metrics = token.run_metrics(runs);
         matches!(token.kind(), InlineTokenKind::Image { .. })
-            || (!matches!(metrics.vertical_align, VerticalAlignValue::Baseline)
+            || (!matches!(metrics.vertical_align, InlineVerticalAlign::Baseline)
                 && metrics.owner_box_idx != u32::MAX
                 && matches!(
                     engine
@@ -341,7 +341,7 @@ pub(super) fn adjusted_line_metrics(
         // Put the strut's descent below that baseline instead of splitting
         // spare line-height above and below the atomic box.
         if matches!(token.kind(), InlineTokenKind::AtomicBox { .. })
-            && matches!(metrics.vertical_align, VerticalAlignValue::Baseline)
+            && matches!(metrics.vertical_align, InlineVerticalAlign::Baseline)
             && descent <= f64::EPSILON
         {
             ascent = ascent.max(token.line_height(runs) * 0.8);
@@ -522,7 +522,7 @@ pub(super) fn build_token_placements(
     let mut curr_x = 0.0;
     span.iter()
         .map(|token| {
-            let advance = token.advance_at(runs, tab_origin + curr_x);
+            let advance = token.advance_at(&engine.reader, runs, tab_origin + curr_x);
             let owner = token.run_metrics(runs).owner_box_idx;
             let relative_offset = if owner == u32::MAX {
                 Vec2::ZERO

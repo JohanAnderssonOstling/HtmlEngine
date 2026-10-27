@@ -76,7 +76,7 @@ pub(super) fn emit_table_layers(
         if span_width <= 0.0 {
             continue;
         }
-        let x = table_content_pos.x + columns.starts[start];
+        let x = table_content_pos.x + columns.physical_start(start, end - start);
         if session.reader.used_style(group.style).visibility()
             == html_style_model::Visibility::Hidden
         {
@@ -94,11 +94,11 @@ pub(super) fn emit_table_layers(
         let Some(style_idx) = track.background_style else {
             continue;
         };
-        let Some((&width, &start)) = columns.widths.get(column).zip(columns.starts.get(column))
+        let Some((&width, _)) = columns.widths.get(column).zip(columns.starts.get(column))
         else {
             continue;
         };
-        let x = table_content_pos.x + start;
+        let x = table_content_pos.x + columns.physical_start(column, 1);
         if session.reader.used_style(style_idx).visibility() == html_style_model::Visibility::Hidden
         {
             continue;

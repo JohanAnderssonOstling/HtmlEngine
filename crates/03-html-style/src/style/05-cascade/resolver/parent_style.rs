@@ -84,6 +84,12 @@ impl ParentStyle {
         }
     }
 
+    pub(super) fn initial_for_child(&self, root_font_size: f32) -> Self {
+        let mut initial = Self::initial(root_font_size);
+        initial.layout.justify_items = default_justify_items(self.layout.justify_items);
+        initial
+    }
+
     pub(super) fn to_working_style(&self) -> WorkingStyle {
         WorkingStyle {
             font: self.font.clone(),
@@ -100,7 +106,7 @@ impl ParentStyle {
     }
 
     pub(super) fn unset_working_style(&self, root_font_size: f32) -> WorkingStyle {
-        let mut style = Self::initial(root_font_size).to_working_style();
+        let mut style = self.initial_for_child(root_font_size).to_working_style();
         style.font = self.font.clone();
         style.text = self.text.clone();
         inherit_box_model_properties(&mut style.box_model, &self.box_model);

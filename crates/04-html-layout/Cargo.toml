@@ -1,14 +1,21 @@
 [package]
+license.workspace = true
 name = "html-layout"
 version = "0.1.0"
 edition = "2024"
 publish = false
 
+[features]
+# Explicit diagnostic builds only; ordinary builds contain no scope hooks.
+profiling = ["html-engine-model/profiling"]
+testing = ["html-engine-model/testing"]
+
 [dependencies]
+unicode-bidi-mirroring = "0.4"
+html-engine-model = { path = "../html-engine-model" }
+html-text = { path = "../html-text" }
 html-dom = { path = "../html-dom" }
 html-style-model = { path = "../html-style-model" }
-formulary = { version = "=0.3.0", default-features = false, features = ["shaping", "svg"] }
-quick-xml = "0.38"
 hypher = "0.1"
 kurbo.workspace = true
 rustc_data_structures = "0.1.2"
@@ -16,11 +23,15 @@ rayon = "1.12"
 taffy.workspace = true
 unicode_categories = "0.1"
 unicode-segmentation = "1.13"
+unicode-normalization = "0.1"
+unicode-bidi.workspace = true
 web-time = "1"
 
 [dev-dependencies]
+html-pipeline = { path = "../html-pipeline", features = ["testing"] }
 html-parse = { path = "../02-html-parse" }
 html-style = { path = "../03-html-style" }
 lightningcss.workspace = true
+html-text = { path = "../html-text", features = ["testing"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

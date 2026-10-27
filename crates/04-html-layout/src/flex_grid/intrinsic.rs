@@ -23,7 +23,7 @@ struct FlexIntrinsicItem {
     flex_grow: f64,
 }
 
-pub(crate) fn intrinsic_widths(
+pub fn intrinsic_widths(
     session: &LayoutEngine<'_, '_>,
     container_idx: usize,
     children: &[u32],
@@ -32,7 +32,7 @@ pub(crate) fn intrinsic_widths(
     intrinsic_widths_with_constraints(session, container_idx, children, kind, None, None)
 }
 
-pub(crate) fn intrinsic_widths_with_available(
+pub fn intrinsic_widths_with_available(
     session: &LayoutEngine<'_, '_>,
     container_idx: usize,
     children: &[u32],
@@ -49,7 +49,7 @@ pub(crate) fn intrinsic_widths_with_available(
     )
 }
 
-pub(crate) fn intrinsic_widths_with_constraints(
+pub fn intrinsic_widths_with_constraints(
     session: &LayoutEngine<'_, '_>,
     container_idx: usize,
     children: &[u32],
@@ -371,7 +371,8 @@ fn flex_intrinsic_item(session: &LayoutEngine<'_, '_>, box_idx: usize) -> FlexIn
     let outer_preferred = outer_preferred_width(session, box_idx, style.width(), raw_min, raw_max);
     let outer_flex_base =
         outer_preferred_width(session, box_idx, style.flex_basis(), raw_min, raw_max)
-            .or_else(|| outer_preferred_width(session, box_idx, style.width(), raw_min, raw_max))
+            .or_else(|| matches!(style.flex_basis(), PreferredSize::Auto)
+                .then(|| outer_preferred_width(session, box_idx, style.width(), raw_min, raw_max)).flatten())
             .unwrap_or(raw_max);
     let automatic_min = if matches!(
         style.overflow_x(),
@@ -391,13 +392,14 @@ fn flex_intrinsic_item(session: &LayoutEngine<'_, '_>, box_idx: usize) -> FlexIn
             .unwrap_or(f64::INFINITY),
     }
     .max(outer_min);
-    let percentage_dependent_basis = style.flex_basis().percentage_dependent();
+    let constraint_dependent_basis = style.flex_basis().percentage_dependent()
+        || matches!(style.flex_basis(), PreferredSize::Content | PreferredSize::FitContent | PreferredSize::Stretch);
     let contribution = |raw: f64, min_content: bool| {
         let mut value = outer_preferred.map_or(raw, |preferred| raw.max(preferred));
         if layout.flex_grow == 0.0 {
             value = value.min(outer_flex_base);
         }
-        if layout.flex_shrink == 0.0 && !(min_content && percentage_dependent_basis) {
+        if layout.flex_shrink == 0.0 && !(min_content && constraint_dependent_basis) {
             value = value.max(outer_flex_base);
         }
         value.clamp(outer_min, outer_max)
@@ -426,7 +428,7 @@ fn outer_preferred_width(
         + style.border_right_width() as f64;
     match value {
         PreferredSize::MinContent => Some(raw_min),
-        PreferredSize::MaxContent | PreferredSize::FitContent => Some(raw_max),
+        PreferredSize::Content | PreferredSize::MaxContent | PreferredSize::FitContent => Some(raw_max),
         _ => resolve_definite_content_size(value, None, margin, padding_border, style.box_sizing())
             .map(|content| content + padding_border + margin),
     }

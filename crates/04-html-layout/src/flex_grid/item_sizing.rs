@@ -3,11 +3,11 @@
 use super::finite_f32;
 use super::style::{dimension, layout_style};
 use crate::layout::{
-    LayoutEngine, ReplacedFlexAutoMinInput, ReplacedMainAxis, measure_box_isolated,
+    LayoutEngine, ReplacedFlexAutoMinInput, ReplacedMainAxis, measure_intrinsic_block_size_isolated,
     preferred_aspect_ratio, resolve_definite_content_size,
     resolve_replaced_flex_auto_min_main_size,
 };
-use html_style_model::{ItemAlignment, OverflowMode, UsedPreferredSize as PreferredSize};
+use html_style_model::{BoxSizing, FlexWrap, ItemAlignment, OverflowMode, UsedPreferredSize as PreferredSize};
 use taffy::prelude::Dimension;
 
 /// Taffy represents `flex-basis` as only auto, length, or percentage. CSS
@@ -17,12 +17,62 @@ pub(super) fn resolve_intrinsic_flex_basis(
     session: &mut LayoutEngine<'_, '_>,
     box_idx: usize,
     containing_width: f64,
+    containing_height: Option<f64>,
     horizontal_main_axis: bool,
 ) -> Option<Dimension> {
-    let basis = session.reader.style(box_idx).flex_basis();
+    let style = session.reader.style(box_idx);
+    let mut basis = style.flex_basis();
+    if matches!(basis, PreferredSize::Stretch) {
+        let available = if horizontal_main_axis {
+            Some(containing_width)
+        } else {
+            containing_height
+        };
+        if let Some(available) = available {
+            let (margin, inset) = if horizontal_main_axis {
+                (
+                    style.get_horizontal_margin(containing_width),
+                    style.get_horizontal_padding(containing_width)
+                        + style.border_left_width() as f64
+                        + style.border_right_width() as f64,
+                )
+            } else {
+                (
+                    style.margin_top().resolve(containing_width)
+                        + style.margin_bottom().resolve(containing_width),
+                    style.get_vertical_padding(containing_width)
+                        + style.border_top_width() as f64
+                        + style.border_bottom_width() as f64,
+                )
+            };
+            let border_box = (available - margin).max(inset);
+            let value = match style.box_sizing() {
+                BoxSizing::ContentBox => border_box - inset,
+                BoxSizing::BorderBox => border_box,
+            };
+            return Some(Dimension::length(finite_f32(value)));
+        }
+        // An indefinite stretch basis resolves to content rather than using
+        // the item's authored main size through the `auto` basis path.
+        basis = PreferredSize::Content;
+    }
+    if matches!(basis, PreferredSize::Content) {
+        if let Some(value) = content_ratio_basis(
+            session,
+            box_idx,
+            containing_width,
+            containing_height,
+            horizontal_main_axis,
+        ) {
+            return Some(value);
+        }
+    }
     if !matches!(
         basis,
-        PreferredSize::MinContent | PreferredSize::MaxContent | PreferredSize::FitContent
+        PreferredSize::Content
+            | PreferredSize::MinContent
+            | PreferredSize::MaxContent
+            | PreferredSize::FitContent
     ) {
         return None;
     }
@@ -30,7 +80,11 @@ pub(super) fn resolve_intrinsic_flex_basis(
         return Some(taffy_item_width_dimension(
             session,
             box_idx,
-            basis,
+            if matches!(basis, PreferredSize::Content) {
+                PreferredSize::MaxContent
+            } else {
+                basis
+            },
             containing_width,
             false,
         ));
@@ -38,15 +92,116 @@ pub(super) fn resolve_intrinsic_flex_basis(
 
     // Intrinsic block-axis sizes are measured with the item's allocated
     // cross size. This is observable when content wraps at that width.
-    let measured = measure_box_isolated(session, box_idx, containing_width, None);
+    let measured = measure_intrinsic_block_size_isolated(session, box_idx, containing_width);
     let style = session.reader.style(box_idx);
     let vertical_inset = style.get_vertical_padding(containing_width)
         + style.border_top_width() as f64
         + style.border_bottom_width() as f64;
     let basis = match style.box_sizing() {
-        html_style_model::BoxSizing::ContentBox => (measured.height - vertical_inset).max(0.0),
-        html_style_model::BoxSizing::BorderBox => measured.height.max(vertical_inset),
+        BoxSizing::ContentBox => (measured.height - vertical_inset).max(0.0),
+        BoxSizing::BorderBox => measured.height.max(vertical_inset),
     };
+    Some(Dimension::length(finite_f32(basis)))
+}
+
+fn content_ratio_basis(
+    session: &LayoutEngine<'_, '_>,
+    box_idx: usize,
+    containing_width: f64,
+    containing_height: Option<f64>,
+    horizontal_main_axis: bool,
+) -> Option<Dimension> {
+    let style = session.reader.style(box_idx);
+    let intrinsic_ratio = session
+        .reader
+        .image_intrinsic(box_idx)
+        .and_then(|image| image.aspect_ratio);
+    let authored = style.aspect_ratio();
+    let ratio = preferred_aspect_ratio(authored, intrinsic_ratio)?;
+    let horizontal_inset = style.get_horizontal_padding(containing_width)
+        + style.border_left_width() as f64
+        + style.border_right_width() as f64;
+    let vertical_inset = style.get_vertical_padding(containing_width)
+        + style.border_top_width() as f64
+        + style.border_bottom_width() as f64;
+    let layout = layout_style(session, box_idx);
+    let (
+        cross_size,
+        cross_min,
+        cross_max,
+        cross_basis,
+        cross_margin,
+        cross_inset,
+        main_inset,
+        auto_margins,
+    ) = if horizontal_main_axis {
+        (
+            style.height(),
+            style.min_height(),
+            style.max_height(),
+            containing_height,
+            style.margin_top().resolve(containing_width)
+                + style.margin_bottom().resolve(containing_width),
+            vertical_inset,
+            horizontal_inset,
+            layout.margin_top_auto || layout.margin_bottom_auto,
+        )
+    } else {
+        (
+            style.width(),
+            style.min_width(),
+            style.max_width(),
+            Some(containing_width),
+            style.get_horizontal_margin(containing_width),
+            horizontal_inset,
+            vertical_inset,
+            layout.margin_left_auto || layout.margin_right_auto,
+        )
+    };
+    let resolve = |size| {
+        resolve_definite_content_size(
+            size,
+            cross_basis,
+            cross_margin,
+            cross_inset,
+            style.box_sizing(),
+        )
+    };
+    let mut cross = resolve(cross_size).or_else(|| {
+        if !matches!(cross_size, PreferredSize::Auto) || auto_margins {
+            return None;
+        }
+        let parent = layout_style(session, session.reader.get_parent(box_idx)?);
+        let align = if layout.align_self == ItemAlignment::Auto {
+            parent.align_items
+        } else {
+            layout.align_self
+        };
+        (parent.flex_wrap == FlexWrap::NoWrap
+            && matches!(align, ItemAlignment::Normal | ItemAlignment::Stretch))
+        .then(|| resolve(PreferredSize::Stretch))
+        .flatten()
+    })?;
+    let minimum = resolve(cross_min).unwrap_or(0.0);
+    let maximum = resolve(cross_max).unwrap_or(f64::INFINITY).max(minimum);
+    cross = cross.clamp(minimum, maximum);
+    // Intrinsic image ratios refer to the content box; an authored ratio
+    // follows box-sizing, including border-box ratios on ordinary elements.
+    let border_ratio = style.box_sizing() == BoxSizing::BorderBox
+        && !(authored.uses_intrinsic() && intrinsic_ratio.is_some());
+    let cross = cross + if border_ratio { cross_inset } else { 0.0 };
+    let main = if horizontal_main_axis {
+        cross * ratio
+    } else {
+        cross / ratio
+    };
+    let content = (main - if border_ratio { main_inset } else { 0.0 }).max(0.0);
+    let basis = content
+        + if style.box_sizing() == BoxSizing::BorderBox {
+            main_inset
+        } else {
+            0.0
+        };
     Some(Dimension::length(finite_f32(basis)))
 }
 
@@ -273,8 +428,8 @@ pub(super) fn taffy_item_width_dimension(
         _ => unreachable!(),
     };
     let border_box_inset = match style.box_sizing() {
-        html_style_model::BoxSizing::ContentBox => 0.0,
-        html_style_model::BoxSizing::BorderBox => {
+        BoxSizing::ContentBox => 0.0,
+        BoxSizing::BorderBox => {
             style.get_horizontal_padding(containing_width)
                 + style.border_left_width() as f64
                 + style.border_right_width() as f64

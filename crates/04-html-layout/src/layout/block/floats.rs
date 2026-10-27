@@ -1,5 +1,5 @@
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub(crate) struct FloatBand {
+pub struct FloatBand {
     pub left: f64,
     pub right: f64,
     pub top: f64,
@@ -8,36 +8,28 @@ pub(crate) struct FloatBand {
 }
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct FloatContext {
+pub struct FloatContext {
     bands: Vec<FloatBand>,
     source_position_floor: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct FloatPlacement {
-    pub(crate) y: f64,
-    pub(crate) left: f64,
-    pub(crate) right: f64,
+pub struct FloatPlacement {
+    pub y: f64,
+    pub left: f64,
+    pub right: f64,
 }
 
 impl FloatContext {
-    /// Exclusion geometry relative to a paragraph's placement. Translating a
-    /// complete formatting context preserves its paragraph layout dependency.
-    pub(crate) fn paragraph_bands(&self, origin: Point) -> Vec<FloatBand> {
-        self.bands.iter().filter(|band| band.bottom > origin.y).map(|band| FloatBand {
-            left: band.left - origin.x, right: band.right - origin.x,
-            top: band.top - origin.y, bottom: band.bottom - origin.y, side: band.side,
-        }).collect()
-    }
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.bands.is_empty()
     }
 
-    pub(crate) fn band_count(&self) -> usize {
+    pub fn band_count(&self) -> usize {
         self.bands.len()
     }
 
-    pub(crate) fn max_bottom(&self) -> f64 {
+    pub fn max_bottom(&self) -> f64 {
         self.bands
             .iter()
             .map(|band| band.bottom)
@@ -48,18 +40,18 @@ impl FloatContext {
     /// this formatting context. A descendant float in a collapse-through
     /// wrapper must not lose the adjoining margin that established that
     /// position.
-    pub(crate) fn note_source_position(&mut self, y: f64) {
+    pub fn note_source_position(&mut self, y: f64) {
         self.source_position_floor =
             Some(self.source_position_floor.map_or(y, |floor| floor.max(y)));
     }
 
-    pub(crate) fn source_position_at_or_after(&self, y: f64) -> f64 {
+    pub fn source_position_at_or_after(&self, y: f64) -> f64 {
         self.source_position_floor.map_or(y, |floor| floor.max(y))
     }
 
     /// Finds the first vertical position at or below `start_y` where a float's
     /// complete margin box fits between the active left and right floats.
-    pub(crate) fn place_margin_box(
+    pub fn place_margin_box(
         &self,
         start_y: f64,
         width: f64,
@@ -105,7 +97,7 @@ impl FloatContext {
         }
     }
 
-    pub(crate) fn add_band(&mut self, band: FloatBand) {
+    pub fn add_band(&mut self, band: FloatBand) {
         // A zero-inline-size float excludes no horizontal space, but it still
         // has a float side and block extent that `clear` must honor.
         if band.right >= band.left && band.bottom > band.top {
@@ -113,7 +105,7 @@ impl FloatContext {
         }
     }
 
-    pub(crate) fn available(
+    pub fn available(
         &self,
         y: f64,
         height: f64,
@@ -139,7 +131,7 @@ impl FloatContext {
     /// without overlapping an active float. Unlike a float placement this
     /// does not mutate the float context; it is used by the inline formatter
     /// to retry an otherwise-empty line below an exclusion.
-    pub(crate) fn next_y_fitting(
+    pub fn next_y_fitting(
         &self,
         mut y: f64,
         width: f64,
@@ -168,7 +160,7 @@ impl FloatContext {
         }
     }
 
-    pub(crate) fn clear_for(&self, y: f64, clear: Clear) -> f64 {
+    pub fn clear_for(&self, y: f64, clear: Clear) -> f64 {
         match clear {
             Clear::None => y,
             Clear::Left => self.clear_to(y, ClearSide::Left),
@@ -201,7 +193,7 @@ enum ClearSide {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum FloatSide {
+pub enum FloatSide {
     #[default]
     Left,
     Right,
@@ -228,35 +220,35 @@ impl FloatState {
         self.hypothetical_clearance_rewinds.clear();
     }
 
-    pub(crate) fn current_float_context(&self) -> Option<&FloatContext> {
+    pub fn current_float_context(&self) -> Option<&FloatContext> {
         self.stack.last()
     }
 
-    pub(crate) fn current_float_context_mut(&mut self) -> Option<&mut FloatContext> {
+    pub fn current_float_context_mut(&mut self) -> Option<&mut FloatContext> {
         self.stack.last_mut()
     }
 
-    pub(crate) fn push_context(&mut self) {
+    pub fn push_context(&mut self) {
         self.stack.push(FloatContext::default());
     }
 
-    pub(crate) fn pop_context(&mut self) {
+    pub fn pop_context(&mut self) {
         self.stack.pop();
     }
 
-    pub(crate) fn push_hypothetical_clearance_floor(&mut self, y: f64) {
+    pub fn push_hypothetical_clearance_floor(&mut self, y: f64) {
         self.hypothetical_clearance_floors.push(y);
     }
 
-    pub(crate) fn pop_hypothetical_clearance_floor(&mut self) {
+    pub fn pop_hypothetical_clearance_floor(&mut self) {
         self.hypothetical_clearance_floors.pop();
     }
 
-    pub(crate) fn push_hypothetical_clearance_rewind(&mut self, offset: f64) {
+    pub fn push_hypothetical_clearance_rewind(&mut self, offset: f64) {
         self.hypothetical_clearance_rewinds.push(offset);
     }
 
-    pub(crate) fn pop_hypothetical_clearance_rewind(&mut self) {
+    pub fn pop_hypothetical_clearance_rewind(&mut self) {
         self.hypothetical_clearance_rewinds.pop();
     }
 

@@ -1,0 +1,20 @@
+[package]
+name = "html-engine-model"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+publish = false
+
+[features]
+profiling = []
+testing = ["html-text/testing"]
+
+[dependencies]
+html-dom = { path = "../html-dom" }
+html-style-model = { path = "../html-style-model" }
+html-text = { path = "../html-text" }
+rustc_data_structures = "0.1.2"
+kurbo.workspace = true
+unicode-bidi.workspace = true
+unicode-segmentation = "1.13"
+

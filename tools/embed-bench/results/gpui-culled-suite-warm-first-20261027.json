@@ -1,0 +1,1774 @@
+{
+  "schema": 6,
+  "complete": true,
+  "environment": {
+    "platform": "Linux-7.2.11-arch1-1-x86_64-with-glibc2.44",
+    "machine": "x86_64",
+    "display": ":1",
+    "wayland_display": "wayland-1",
+    "cpu_count": 16,
+    "load_average_before": [
+      1.966796875,
+      11.251953125,
+      13.251953125
+    ],
+    "fontconfig": {
+      "path": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/results/language-fonts-20261026/fonts.conf",
+      "sha256": "7a45d275d01b34b07e9d686212890b1691eefb7a1239e7bd3353dcfbd616ae1e"
+    },
+    "load_average_after": [
+      1.64892578125,
+      8.35888671875,
+      11.98828125
+    ],
+    "source_environments": [
+      {
+        "report": "results/middlemarch-culled-warm-first-20261027.json",
+        "environment": {
+          "platform": "Linux-7.2.11-arch1-1-x86_64-with-glibc2.44",
+          "machine": "x86_64",
+          "display": ":1",
+          "wayland_display": "wayland-1",
+          "cpu_count": 16,
+          "load_average_before": [
+            1.966796875,
+            11.251953125,
+            13.251953125
+          ],
+          "fontconfig": {
+            "path": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/results/language-fonts-20261026/fonts.conf",
+            "sha256": "7a45d275d01b34b07e9d686212890b1691eefb7a1239e7bd3353dcfbd616ae1e"
+          },
+          "load_average_after": [
+            1.88916015625,
+            11.08154296875,
+            13.18603515625
+          ]
+        }
+      },
+      {
+        "report": "results/culled-warm-first-remaining-20261027.json",
+        "environment": {
+          "platform": "Linux-7.2.11-arch1-1-x86_64-with-glibc2.44",
+          "machine": "x86_64",
+          "display": ":1",
+          "wayland_display": "wayland-1",
+          "cpu_count": 16,
+          "load_average_before": [
+            1.8193359375,
+            8.8525390625,
+            12.22314453125
+          ],
+          "fontconfig": {
+            "path": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/results/language-fonts-20261026/fonts.conf",
+            "sha256": "7a45d275d01b34b07e9d686212890b1691eefb7a1239e7bd3353dcfbd616ae1e"
+          },
+          "load_average_after": [
+            1.64892578125,
+            8.35888671875,
+            11.98828125
+          ]
+        }
+      }
+    ]
+  },
+  "viewport": [
+    800,
+    600
+  ],
+  "settle_ms": 500,
+  "window_backend": "x11",
+  "scale_factor": 1,
+  "viewport_pixels": [
+    800,
+    600
+  ],
+  "samples_per_fixture": 1,
+  "baseline": "settled GPUI host after the selected content engine renders an empty document",
+  "timing": "controller load command through snapshot readiness; selected content engine already initialized; document never loaded before measurement",
+  "memory": "total process-session PSS before loading (settled initialized engine) and after loading, including helpers",
+  "endpoint": "viewport snapshot including readback, excluding PNG encoding",
+  "pixel_equivalence_verified": false,
+  "hosts": [
+    {
+      "label": "skrift",
+      "binary": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/gpui/target/release/embed-bench-gpui-culled",
+      "size_bytes": 59190624,
+      "sha256": "dc791dee906c9d332ce5b5d0e21646d54012c66f8074b101f9c1b36d714b3f84"
+    },
+    {
+      "label": "wry",
+      "binary": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/gpui/target/release/embed-bench-gpui-culled",
+      "size_bytes": 59190624,
+      "sha256": "dc791dee906c9d332ce5b5d0e21646d54012c66f8074b101f9c1b36d714b3f84"
+    }
+  ],
+  "fixtures": [
+    {
+      "path": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/fixtures/books/middlemarch/chapter-37.xhtml",
+      "sha256": "95fa303cade74a643d01c56cd1f19540d5f177953347a52f1e1b7de204d31ef8"
+    },
+    {
+      "path": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/fixtures/article.html",
+      "sha256": "afcec7297c570f233776aed6f7203e2fa60fe2152670454d6cd43ff68169e9c9"
+    },
+    {
+      "path": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/fixtures/images.html",
+      "sha256": "47b071d0e4b17c22839863c52f5fd1f54ca11cd9f157893568384f56541125a9"
+    },
+    {
+      "path": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/fixtures/tables.html",
+      "sha256": "41271449548e81958a988fd802cf3f14e5b1006a030201309b84ac336b6c72c0"
+    },
+    {
+      "path": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/fixtures/languages/rtl-arabic.html",
+      "sha256": "d119b91c233c33580a3d5dd482805ee7a8115844149793e78c5e287ba3083b8e"
+    },
+    {
+      "path": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/fixtures/languages/cjk-japanese.html",
+      "sha256": "4777bb9fa50c1f992e61bc75fb3429bf0a8df2649906d032f90c63caf98e997a"
+    },
+    {
+      "path": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/fixtures/large-document.html",
+      "sha256": "2b5f67c0ea9477591702878af8d1fb792f5a967a99002bdd9822213872e470eb"
+    }
+  ],
+  "runs": [
+    {
+      "host": {
+        "event": "ready",
+        "phase": "document",
+        "engine": "skrift-gpui",
+        "document_to_snapshot_ms": 116.769379,
+        "snapshot_width": 800,
+        "snapshot_height": 600,
+        "page": {
+          "width": 800.0,
+          "height": 600.0,
+          "scale": 1.0,
+          "layout_width": 800.0,
+          "content_height": 11037.927244853974,
+          "scroll_y": 0.0
+        },
+        "endpoint": "viewport snapshot complete including readback, without PNG encoding"
+      },
+      "diagnostics": [],
+      "additional_time_ms": 116.980609,
+      "additional_pss_bytes": 17141760,
+      "memory": {
+        "initialized": {
+          "pss_bytes": 93099008,
+          "rss_bytes": 108462080,
+          "private_bytes": 88125440,
+          "pids": [
+            2896238
+          ]
+        },
+        "loaded": {
+          "pss_bytes": 110240768,
+          "rss_bytes": 125603840,
+          "private_bytes": 105267200,
+          "pids": [
+            2896238
+          ]
+        }
+      },
+      "load_command_to_output_ms": 116.980609,
+      "native_window": true,
+      "baseline_host": {
+        "event": "ready",
+        "phase": "native",
+        "engine": "gpui",
+        "skrift_initialized": false,
+        "wry_initialized": false,
+        "page": {
+          "width": 800.0,
+          "height": 600.0,
+          "scale": 1.0
+        },
+        "frame_width": 800,
+        "frame_height": 600
+      },
+      "warm_engine": true,
+      "initialized_baseline_host": {
+        "event": "ready",
+        "phase": "warm",
+        "engine": "skrift-gpui",
+        "document_to_snapshot_ms": 19.587153,
+        "snapshot_width": 800,
+        "snapshot_height": 600,
+        "page": {
+          "width": 800.0,
+          "height": 600.0,
+          "scale": 1.0,
+          "layout_width": 800.0,
+          "content_height": 0.0,
+          "scroll_y": 0.0
+        },
+        "endpoint": "viewport snapshot complete including readback, without PNG encoding"
+      },
+      "additional_cpu_ms": 97.652,
+      "cpu": {
+        "initialized": {
+          "usage_usec": 178313,
+          "user_usec": 92389,
+          "system_usec": 85923,
+          "pids": [
+            2896238
+          ]
+        },
+        "rendered": {
+          "usage_usec": 275965,
+          "user_usec": 148845,
+          "system_usec": 127120,
+          "pids": [
+            2896238
+          ]
+        },
+        "scope": "all threads and helper processes in a private cgroup; exited helpers retained"
+      },
+      "label": "skrift",
+      "fixture": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/fixtures/books/middlemarch/chapter-37.xhtml",
+      "verification_screenshot": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/results/middlemarch-culled-warm-first-screenshots-20261027/skrift-chapter-37.png"
+    },
+    {
+      "host": {
+        "event": "ready",
+        "phase": "document",
+        "engine": "wry-in-gpui",
+        "pid": 2896297,
+        "webview_version": "2.54.2",
+        "parent_x11_window": 14680065,
+        "embedded_as_child": true,
+        "document_to_snapshot_ms": 98.690603,
+        "snapshot_width": 800,
+        "snapshot_height": 600,
+        "page": {
+          "event": "document_ready",
+          "width": 800,
+          "height": 600,
+          "scale": 1,
+          "layout_width": 800,
+          "content_width": 800,
+          "content_height": 11044,
+          "scroll_y": 0,
+          "compatibility": "CSS1Compat"
+        },
+        "endpoint": "WebKit child viewport snapshot complete; includes readback; excludes PNG encoding"
+      },
+      "diagnostics": [],
+      "additional_time_ms": 99.045394,
+      "additional_pss_bytes": 15557632,
+      "memory": {
+        "initialized": {
+          "pss_bytes": 221162496,
+          "rss_bytes": 358105088,
+          "private_bytes": 148021248,
+          "pids": [
+            2896297,
+            2896359,
+            2896360
+          ]
+        },
+        "loaded": {
+          "pss_bytes": 236720128,
+          "rss_bytes": 375087104,
+          "private_bytes": 162779136,
+          "pids": [
+            2896297,
+            2896359,
+            2896360
+          ]
+        }
+      },
+      "load_command_to_output_ms": 99.045394,
+      "native_window": true,
+      "baseline_host": {
+        "event": "ready",
+        "phase": "native",
+        "engine": "gpui",
+        "skrift_initialized": false,
+        "wry_initialized": false,
+        "page": {
+          "width": 800.0,
+          "height": 600.0,
+          "scale": 1.0
+        },
+        "frame_width": 800,
+        "frame_height": 600
+      },
+      "warm_engine": true,
+      "initialized_baseline_host": {
+        "event": "ready",
+        "phase": "warm",
+        "engine": "wry-in-gpui",
+        "pid": 2896297,
+        "webview_version": "2.54.2",
+        "parent_x11_window": 14680065,
+        "embedded_as_child": true,
+        "document_to_snapshot_ms": 153.25089499999999,
+        "snapshot_width": 800,
+        "snapshot_height": 600,
+        "page": {
+          "event": "document_ready",
+          "width": 800,
+          "height": 600,
+          "scale": 1,
+          "layout_width": 800,
+          "content_width": 800,
+          "content_height": 600,
+          "scroll_y": 0,
+          "compatibility": "CSS1Compat"
+        },
+        "endpoint": "WebKit child viewport snapshot complete; includes readback; excludes PNG encoding"
+      },
+      "additional_cpu_ms": 95.238,
+      "cpu": {
+        "initialized": {
+          "usage_usec": 536236,
+          "user_usec": 307849,
+          "system_usec": 228387,
+          "pids": [
+            2896297,
+            2896359,
+            2896360
+          ]
+        },
+        "rendered": {
+          "usage_usec": 631474,
+          "user_usec": 380564,
+          "system_usec": 250909,
+          "pids": [
+            2896297,
+            2896359,
+            2896360
+          ]
+        },
+        "scope": "all threads and helper processes in a private cgroup; exited helpers retained"
+      },
+      "label": "wry",
+      "fixture": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/fixtures/books/middlemarch/chapter-37.xhtml",
+      "verification_screenshot": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/results/middlemarch-culled-warm-first-screenshots-20261027/wry-chapter-37.png"
+    },
+    {
+      "host": {
+        "event": "ready",
+        "phase": "document",
+        "engine": "skrift-gpui",
+        "document_to_snapshot_ms": 45.180148,
+        "snapshot_width": 800,
+        "snapshot_height": 600,
+        "page": {
+          "width": 800.0,
+          "height": 600.0,
+          "scale": 1.0,
+          "layout_width": 800.0,
+          "content_height": 474.0,
+          "scroll_y": 0.0
+        },
+        "endpoint": "viewport snapshot complete including readback, without PNG encoding"
+      },
+      "diagnostics": [],
+      "additional_time_ms": 45.396678,
+      "additional_pss_bytes": 10104832,
+      "memory": {
+        "initialized": {
+          "pss_bytes": 92705792,
+          "rss_bytes": 108027904,
+          "private_bytes": 87801856,
+          "pids": [
+            2898424
+          ]
+        },
+        "loaded": {
+          "pss_bytes": 102810624,
+          "rss_bytes": 118132736,
+          "private_bytes": 97906688,
+          "pids": [
+            2898424
+          ]
+        }
+      },
+      "load_command_to_output_ms": 45.396678,
+      "native_window": true,
+      "baseline_host": {
+        "event": "ready",
+        "phase": "native",
+        "engine": "gpui",
+        "skrift_initialized": false,
+        "wry_initialized": false,
+        "page": {
+          "width": 800.0,
+          "height": 600.0,
+          "scale": 1.0
+        },
+        "frame_width": 800,
+        "frame_height": 600
+      },
+      "warm_engine": true,
+      "initialized_baseline_host": {
+        "event": "ready",
+        "phase": "warm",
+        "engine": "skrift-gpui",
+        "document_to_snapshot_ms": 6.332322,
+        "snapshot_width": 800,
+        "snapshot_height": 600,
+        "page": {
+          "width": 800.0,
+          "height": 600.0,
+          "scale": 1.0,
+          "layout_width": 800.0,
+          "content_height": 0.0,
+          "scroll_y": 0.0
+        },
+        "endpoint": "viewport snapshot complete including readback, without PNG encoding"
+      },
+      "additional_cpu_ms": 44.312,
+      "cpu": {
+        "initialized": {
+          "usage_usec": 165447,
+          "user_usec": 85309,
+          "system_usec": 80138,
+          "pids": [
+            2898424
+          ]
+        },
+        "rendered": {
+          "usage_usec": 209759,
+          "user_usec": 97969,
+          "system_usec": 111790,
+          "pids": [
+            2898424
+          ]
+        },
+        "scope": "all threads and helper processes in a private cgroup; exited helpers retained"
+      },
+      "label": "skrift",
+      "fixture": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/fixtures/article.html",
+      "verification_screenshot": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/results/culled-warm-first-remaining-screenshots-20261027/skrift-article.png"
+    },
+    {
+      "host": {
+        "event": "ready",
+        "phase": "document",
+        "engine": "wry-in-gpui",
+        "pid": 2898469,
+        "webview_version": "2.54.2",
+        "parent_x11_window": 14680065,
+        "embedded_as_child": true,
+        "document_to_snapshot_ms": 21.172375,
+        "snapshot_width": 800,
+        "snapshot_height": 600,
+        "page": {
+          "event": "document_ready",
+          "width": 800,
+          "height": 600,
+          "scale": 1,
+          "layout_width": 800,
+          "content_width": 800,
+          "content_height": 600,
+          "scroll_y": 0,
+          "compatibility": "CSS1Compat"
+        },
+        "endpoint": "WebKit child viewport snapshot complete; includes readback; excludes PNG encoding"
+      },
+      "diagnostics": [],
+      "additional_time_ms": 21.456843,
+      "additional_pss_bytes": 6419456,
+      "memory": {
+        "initialized": {
+          "pss_bytes": 225514496,
+          "rss_bytes": 363954176,
+          "private_bytes": 151773184,
+          "pids": [
+            2898469,
+            2898530,
+            2898531
+          ]
+        },
+        "loaded": {
+          "pss_bytes": 231933952,
+          "rss_bytes": 371109888,
+          "private_bytes": 157847552,
+          "pids": [
+            2898469,
+            2898530,
+            2898531
+          ]
+        }
+      },
+      "load_command_to_output_ms": 21.456843,
+      "native_window": true,
+      "baseline_host": {
+        "event": "ready",
+        "phase": "native",
+        "engine": "gpui",
+        "skrift_initialized": false,
+        "wry_initialized": false,
+        "page": {
+          "width": 800.0,
+          "height": 600.0,
+          "scale": 1.0
+        },
+        "frame_width": 800,
+        "frame_height": 600
+      },
+      "warm_engine": true,
+      "initialized_baseline_host": {
+        "event": "ready",
+        "phase": "warm",
+        "engine": "wry-in-gpui",
+        "pid": 2898469,
+        "webview_version": "2.54.2",
+        "parent_x11_window": 14680065,
+        "embedded_as_child": true,
+        "document_to_snapshot_ms": 148.129135,
+        "snapshot_width": 800,
+        "snapshot_height": 600,
+        "page": {
+          "event": "document_ready",
+          "width": 800,
+          "height": 600,
+          "scale": 1,
+          "layout_width": 800,
+          "content_width": 800,
+          "content_height": 600,
+          "scroll_y": 0,
+          "compatibility": "CSS1Compat"
+        },
+        "endpoint": "WebKit child viewport snapshot complete; includes readback; excludes PNG encoding"
+      },
+      "additional_cpu_ms": 28.32,
+      "cpu": {
+        "initialized": {
+          "usage_usec": 479388,
+          "user_usec": 283051,
+          "system_usec": 196336,
+          "pids": [
+            2898469,
+            2898530,
+            2898531
+          ]
+        },
+        "rendered": {
+          "usage_usec": 507708,
+          "user_usec": 304504,
+          "system_usec": 203203,
+          "pids": [
+            2898469,
+            2898530,
+            2898531
+          ]
+        },
+        "scope": "all threads and helper processes in a private cgroup; exited helpers retained"
+      },
+      "label": "wry",
+      "fixture": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/fixtures/article.html",
+      "verification_screenshot": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/results/culled-warm-first-remaining-screenshots-20261027/wry-article.png"
+    },
+    {
+      "host": {
+        "event": "ready",
+        "phase": "document",
+        "engine": "skrift-gpui",
+        "document_to_snapshot_ms": 39.228197,
+        "snapshot_width": 800,
+        "snapshot_height": 600,
+        "page": {
+          "width": 800.0,
+          "height": 600.0,
+          "scale": 1.0,
+          "layout_width": 800.0,
+          "content_height": 502.0,
+          "scroll_y": 0.0
+        },
+        "endpoint": "viewport snapshot complete including readback, without PNG encoding"
+      },
+      "diagnostics": [],
+      "additional_time_ms": 39.435339,
+      "additional_pss_bytes": 13913088,
+      "memory": {
+        "initialized": {
+          "pss_bytes": 92923904,
+          "rss_bytes": 108261376,
+          "private_bytes": 87977984,
+          "pids": [
+            2898598
+          ]
+        },
+        "loaded": {
+          "pss_bytes": 106836992,
+          "rss_bytes": 122253312,
+          "private_bytes": 101879808,
+          "pids": [
+            2898598
+          ]
+        }
+      },
+      "load_command_to_output_ms": 39.435339,
+      "native_window": true,
+      "baseline_host": {
+        "event": "ready",
+        "phase": "native",
+        "engine": "gpui",
+        "skrift_initialized": false,
+        "wry_initialized": false,
+        "page": {
+          "width": 800.0,
+          "height": 600.0,
+          "scale": 1.0
+        },
+        "frame_width": 800,
+        "frame_height": 600
+      },
+      "warm_engine": true,
+      "initialized_baseline_host": {
+        "event": "ready",
+        "phase": "warm",
+        "engine": "skrift-gpui",
+        "document_to_snapshot_ms": 6.333143000000001,
+        "snapshot_width": 800,
+        "snapshot_height": 600,
+        "page": {
+          "width": 800.0,
+          "height": 600.0,
+          "scale": 1.0,
+          "layout_width": 800.0,
+          "content_height": 0.0,
+          "scroll_y": 0.0
+        },
+        "endpoint": "viewport snapshot complete including readback, without PNG encoding"
+      },
+      "additional_cpu_ms": 38.041,
+      "cpu": {
+        "initialized": {
+          "usage_usec": 163640,
+          "user_usec": 87862,
+          "system_usec": 75778,
+          "pids": [
+            2898598
+          ]
+        },
+        "rendered": {
+          "usage_usec": 201681,
+          "user_usec": 99949,
+          "system_usec": 101731,
+          "pids": [
+            2898598
+          ]
+        },
+        "scope": "all threads and helper processes in a private cgroup; exited helpers retained"
+      },
+      "label": "skrift",
+      "fixture": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/fixtures/images.html",
+      "verification_screenshot": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/results/culled-warm-first-remaining-screenshots-20261027/skrift-images.png"
+    },
+    {
+      "host": {
+        "event": "ready",
+        "phase": "document",
+        "engine": "wry-in-gpui",
+        "pid": 2898642,
+        "webview_version": "2.54.2",
+        "parent_x11_window": 14680065,
+        "embedded_as_child": true,
+        "document_to_snapshot_ms": 21.937454,
+        "snapshot_width": 800,
+        "snapshot_height": 600,
+        "page": {
+          "event": "document_ready",
+          "width": 800,
+          "height": 600,
+          "scale": 1,
+          "layout_width": 800,
+          "content_width": 800,
+          "content_height": 600,
+          "scroll_y": 0,
+          "compatibility": "CSS1Compat"
+        },
+        "endpoint": "WebKit child viewport snapshot complete; includes readback; excludes PNG encoding"
+      },
+      "diagnostics": [],
+      "additional_time_ms": 22.213476,
+      "additional_pss_bytes": 8356864,
+      "memory": {
+        "initialized": {
+          "pss_bytes": 225344512,
+          "rss_bytes": 363790336,
+          "private_bytes": 151523328,
+          "pids": [
+            2898642,
+            2898704,
+            2898705
+          ]
+        },
+        "loaded": {
+          "pss_bytes": 233701376,
+          "rss_bytes": 373002240,
+          "private_bytes": 159473664,
+          "pids": [
+            2898642,
+            2898704,
+            2898705
+          ]
+        }
+      },
+      "load_command_to_output_ms": 22.213476,
+      "native_window": true,
+      "baseline_host": {
+        "event": "ready",
+        "phase": "native",
+        "engine": "gpui",
+        "skrift_initialized": false,
+        "wry_initialized": false,
+        "page": {
+          "width": 800.0,
+          "height": 600.0,
+          "scale": 1.0
+        },
+        "frame_width": 800,
+        "frame_height": 600
+      },
+      "warm_engine": true,
+      "initialized_baseline_host": {
+        "event": "ready",
+        "phase": "warm",
+        "engine": "wry-in-gpui",
+        "pid": 2898642,
+        "webview_version": "2.54.2",
+        "parent_x11_window": 14680065,
+        "embedded_as_child": true,
+        "document_to_snapshot_ms": 152.08929500000002,
+        "snapshot_width": 800,
+        "snapshot_height": 600,
+        "page": {
+          "event": "document_ready",
+          "width": 800,
+          "height": 600,
+          "scale": 1,
+          "layout_width": 800,
+          "content_width": 800,
+          "content_height": 600,
+          "scroll_y": 0,
+          "compatibility": "CSS1Compat"
+        },
+        "endpoint": "WebKit child viewport snapshot complete; includes readback; excludes PNG encoding"
+      },
+      "additional_cpu_ms": 21.402,
+      "cpu": {
+        "initialized": {
+          "usage_usec": 445795,
+          "user_usec": 266744,
+          "system_usec": 179051,
+          "pids": [
+            2898642,
+            2898704,
+            2898705
+          ]
+        },
+        "rendered": {
+          "usage_usec": 467197,
+          "user_usec": 282818,
+          "system_usec": 184378,
+          "pids": [
+            2898642,
+            2898704,
+            2898705
+          ]
+        },
+        "scope": "all threads and helper processes in a private cgroup; exited helpers retained"
+      },
+      "label": "wry",
+      "fixture": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/fixtures/images.html",
+      "verification_screenshot": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/results/culled-warm-first-remaining-screenshots-20261027/wry-images.png"
+    },
+    {
+      "host": {
+        "event": "ready",
+        "phase": "document",
+        "engine": "wry-in-gpui",
+        "pid": 2898778,
+        "webview_version": "2.54.2",
+        "parent_x11_window": 14680065,
+        "embedded_as_child": true,
+        "document_to_snapshot_ms": 21.871568,
+        "snapshot_width": 800,
+        "snapshot_height": 600,
+        "page": {
+          "event": "document_ready",
+          "width": 800,
+          "height": 600,
+          "scale": 1,
+          "layout_width": 800,
+          "content_width": 800,
+          "content_height": 3464,
+          "scroll_y": 0,
+          "compatibility": "CSS1Compat"
+        },
+        "endpoint": "WebKit child viewport snapshot complete; includes readback; excludes PNG encoding"
+      },
+      "diagnostics": [],
+      "additional_time_ms": 30.20517,
+      "additional_pss_bytes": 7997440,
+      "memory": {
+        "initialized": {
+          "pss_bytes": 224152576,
+          "rss_bytes": 362917888,
+          "private_bytes": 150392832,
+          "pids": [
+            2898778,
+            2898838,
+            2898839
+          ]
+        },
+        "loaded": {
+          "pss_bytes": 232150016,
+          "rss_bytes": 371744768,
+          "private_bytes": 158035968,
+          "pids": [
+            2898778,
+            2898838,
+            2898839
+          ]
+        }
+      },
+      "load_command_to_output_ms": 30.20517,
+      "native_window": true,
+      "baseline_host": {
+        "event": "ready",
+        "phase": "native",
+        "engine": "gpui",
+        "skrift_initialized": false,
+        "wry_initialized": false,
+        "page": {
+          "width": 800.0,
+          "height": 600.0,
+          "scale": 1.0
+        },
+        "frame_width": 800,
+        "frame_height": 600
+      },
+      "warm_engine": true,
+      "initialized_baseline_host": {
+        "event": "ready",
+        "phase": "warm",
+        "engine": "wry-in-gpui",
+        "pid": 2898778,
+        "webview_version": "2.54.2",
+        "parent_x11_window": 14680065,
+        "embedded_as_child": true,
+        "document_to_snapshot_ms": 166.10514700000002,
+        "snapshot_width": 800,
+        "snapshot_height": 600,
+        "page": {
+          "event": "document_ready",
+          "width": 800,
+          "height": 600,
+          "scale": 1,
+          "layout_width": 800,
+          "content_width": 800,
+          "content_height": 600,
+          "scroll_y": 0,
+          "compatibility": "CSS1Compat"
+        },
+        "endpoint": "WebKit child viewport snapshot complete; includes readback; excludes PNG encoding"
+      },
+      "additional_cpu_ms": 28.765,
+      "cpu": {
+        "initialized": {
+          "usage_usec": 493203,
+          "user_usec": 296143,
+          "system_usec": 197059,
+          "pids": [
+            2898778,
+            2898838,
+            2898839
+          ]
+        },
+        "rendered": {
+          "usage_usec": 521968,
+          "user_usec": 317799,
+          "system_usec": 204168,
+          "pids": [
+            2898778,
+            2898838,
+            2898839
+          ]
+        },
+        "scope": "all threads and helper processes in a private cgroup; exited helpers retained"
+      },
+      "label": "wry",
+      "fixture": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/fixtures/tables.html",
+      "verification_screenshot": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/results/culled-warm-first-remaining-screenshots-20261027/wry-tables.png"
+    },
+    {
+      "host": {
+        "event": "ready",
+        "phase": "document",
+        "engine": "skrift-gpui",
+        "document_to_snapshot_ms": 50.165510000000005,
+        "snapshot_width": 800,
+        "snapshot_height": 600,
+        "page": {
+          "width": 800.0,
+          "height": 600.0,
+          "scale": 1.0,
+          "layout_width": 800.0,
+          "content_height": 3440.0,
+          "scroll_y": 0.0
+        },
+        "endpoint": "viewport snapshot complete including readback, without PNG encoding"
+      },
+      "diagnostics": [],
+      "additional_time_ms": 50.455488,
+      "additional_pss_bytes": 11612160,
+      "memory": {
+        "initialized": {
+          "pss_bytes": 92530688,
+          "rss_bytes": 107823104,
+          "private_bytes": 87609344,
+          "pids": [
+            2898909
+          ]
+        },
+        "loaded": {
+          "pss_bytes": 104142848,
+          "rss_bytes": 119435264,
+          "private_bytes": 99221504,
+          "pids": [
+            2898909
+          ]
+        }
+      },
+      "load_command_to_output_ms": 50.455488,
+      "native_window": true,
+      "baseline_host": {
+        "event": "ready",
+        "phase": "native",
+        "engine": "gpui",
+        "skrift_initialized": false,
+        "wry_initialized": false,
+        "page": {
+          "width": 800.0,
+          "height": 600.0,
+          "scale": 1.0
+        },
+        "frame_width": 800,
+        "frame_height": 600
+      },
+      "warm_engine": true,
+      "initialized_baseline_host": {
+        "event": "ready",
+        "phase": "warm",
+        "engine": "skrift-gpui",
+        "document_to_snapshot_ms": 6.887453,
+        "snapshot_width": 800,
+        "snapshot_height": 600,
+        "page": {
+          "width": 800.0,
+          "height": 600.0,
+          "scale": 1.0,
+          "layout_width": 800.0,
+          "content_height": 0.0,
+          "scroll_y": 0.0
+        },
+        "endpoint": "viewport snapshot complete including readback, without PNG encoding"
+      },
+      "additional_cpu_ms": 40.325,
+      "cpu": {
+        "initialized": {
+          "usage_usec": 173461,
+          "user_usec": 95029,
+          "system_usec": 78432,
+          "pids": [
+            2898909
+          ]
+        },
+        "rendered": {
+          "usage_usec": 213786,
+          "user_usec": 113457,
+          "system_usec": 100328,
+          "pids": [
+            2898909
+          ]
+        },
+        "scope": "all threads and helper processes in a private cgroup; exited helpers retained"
+      },
+      "label": "skrift",
+      "fixture": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/fixtures/tables.html",
+      "verification_screenshot": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/results/culled-warm-first-remaining-screenshots-20261027/skrift-tables.png"
+    },
+    {
+      "host": {
+        "event": "ready",
+        "phase": "document",
+        "engine": "skrift-gpui",
+        "document_to_snapshot_ms": 28.085987,
+        "snapshot_width": 800,
+        "snapshot_height": 600,
+        "page": {
+          "width": 800.0,
+          "height": 600.0,
+          "scale": 1.0,
+          "layout_width": 800.0,
+          "content_height": 360.0,
+          "scroll_y": 0.0
+        },
+        "endpoint": "viewport snapshot complete including readback, without PNG encoding"
+      },
+      "diagnostics": [],
+      "additional_time_ms": 28.280305,
+      "additional_pss_bytes": 10629120,
+      "memory": {
+        "initialized": {
+          "pss_bytes": 92815360,
+          "rss_bytes": 108077056,
+          "private_bytes": 87949312,
+          "pids": [
+            2898953
+          ]
+        },
+        "loaded": {
+          "pss_bytes": 103444480,
+          "rss_bytes": 118706176,
+          "private_bytes": 98578432,
+          "pids": [
+            2898953
+          ]
+        }
+      },
+      "load_command_to_output_ms": 28.280305,
+      "native_window": true,
+      "baseline_host": {
+        "event": "ready",
+        "phase": "native",
+        "engine": "gpui",
+        "skrift_initialized": false,
+        "wry_initialized": false,
+        "page": {
+          "width": 800.0,
+          "height": 600.0,
+          "scale": 1.0
+        },
+        "frame_width": 800,
+        "frame_height": 600
+      },
+      "warm_engine": true,
+      "initialized_baseline_host": {
+        "event": "ready",
+        "phase": "warm",
+        "engine": "skrift-gpui",
+        "document_to_snapshot_ms": 6.219387,
+        "snapshot_width": 800,
+        "snapshot_height": 600,
+        "page": {
+          "width": 800.0,
+          "height": 600.0,
+          "scale": 1.0,
+          "layout_width": 800.0,
+          "content_height": 0.0,
+          "scroll_y": 0.0
+        },
+        "endpoint": "viewport snapshot complete including readback, without PNG encoding"
+      },
+      "additional_cpu_ms": 23.88,
+      "cpu": {
+        "initialized": {
+          "usage_usec": 166348,
+          "user_usec": 77495,
+          "system_usec": 88852,
+          "pids": [
+            2898953
+          ]
+        },
+        "rendered": {
+          "usage_usec": 190228,
+          "user_usec": 92491,
+          "system_usec": 97736,
+          "pids": [
+            2898953
+          ]
+        },
+        "scope": "all threads and helper processes in a private cgroup; exited helpers retained"
+      },
+      "label": "skrift",
+      "fixture": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/fixtures/languages/rtl-arabic.html",
+      "verification_screenshot": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/results/culled-warm-first-remaining-screenshots-20261027/skrift-rtl-arabic.png"
+    },
+    {
+      "host": {
+        "event": "ready",
+        "phase": "document",
+        "engine": "wry-in-gpui",
+        "pid": 2898999,
+        "webview_version": "2.54.2",
+        "parent_x11_window": 14680065,
+        "embedded_as_child": true,
+        "document_to_snapshot_ms": 11.055456,
+        "snapshot_width": 800,
+        "snapshot_height": 600,
+        "page": {
+          "event": "document_ready",
+          "width": 800,
+          "height": 600,
+          "scale": 1,
+          "layout_width": 800,
+          "content_width": 800,
+          "content_height": 600,
+          "scroll_y": 0,
+          "compatibility": "CSS1Compat"
+        },
+        "endpoint": "WebKit child viewport snapshot complete; includes readback; excludes PNG encoding"
+      },
+      "diagnostics": [],
+      "additional_time_ms": 11.639943,
+      "additional_pss_bytes": 5593088,
+      "memory": {
+        "initialized": {
+          "pss_bytes": 222283776,
+          "rss_bytes": 363626496,
+          "private_bytes": 148451328,
+          "pids": [
+            2898999,
+            2899059,
+            2899060
+          ]
+        },
+        "loaded": {
+          "pss_bytes": 227876864,
+          "rss_bytes": 369999872,
+          "private_bytes": 153714688,
+          "pids": [
+            2898999,
+            2899059,
+            2899060
+          ]
+        }
+      },
+      "load_command_to_output_ms": 11.639943,
+      "native_window": true,
+      "baseline_host": {
+        "event": "ready",
+        "phase": "native",
+        "engine": "gpui",
+        "skrift_initialized": false,
+        "wry_initialized": false,
+        "page": {
+          "width": 800.0,
+          "height": 600.0,
+          "scale": 1.0
+        },
+        "frame_width": 800,
+        "frame_height": 600
+      },
+      "warm_engine": true,
+      "initialized_baseline_host": {
+        "event": "ready",
+        "phase": "warm",
+        "engine": "wry-in-gpui",
+        "pid": 2898999,
+        "webview_version": "2.54.2",
+        "parent_x11_window": 14680065,
+        "embedded_as_child": true,
+        "document_to_snapshot_ms": 143.47241699999998,
+        "snapshot_width": 800,
+        "snapshot_height": 600,
+        "page": {
+          "event": "document_ready",
+          "width": 800,
+          "height": 600,
+          "scale": 1,
+          "layout_width": 800,
+          "content_width": 800,
+          "content_height": 600,
+          "scroll_y": 0,
+          "compatibility": "CSS1Compat"
+        },
+        "endpoint": "WebKit child viewport snapshot complete; includes readback; excludes PNG encoding"
+      },
+      "additional_cpu_ms": 17.582,
+      "cpu": {
+        "initialized": {
+          "usage_usec": 475002,
+          "user_usec": 280999,
+          "system_usec": 194003,
+          "pids": [
+            2898999,
+            2899059,
+            2899060
+          ]
+        },
+        "rendered": {
+          "usage_usec": 492584,
+          "user_usec": 293018,
+          "system_usec": 199565,
+          "pids": [
+            2898999,
+            2899059,
+            2899060
+          ]
+        },
+        "scope": "all threads and helper processes in a private cgroup; exited helpers retained"
+      },
+      "label": "wry",
+      "fixture": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/fixtures/languages/rtl-arabic.html",
+      "verification_screenshot": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/results/culled-warm-first-remaining-screenshots-20261027/wry-rtl-arabic.png"
+    },
+    {
+      "host": {
+        "event": "ready",
+        "phase": "document",
+        "engine": "skrift-gpui",
+        "document_to_snapshot_ms": 39.536802,
+        "snapshot_width": 800,
+        "snapshot_height": 600,
+        "page": {
+          "width": 800.0,
+          "height": 600.0,
+          "scale": 1.0,
+          "layout_width": 800.0,
+          "content_height": 360.0215001106262,
+          "scroll_y": 0.0
+        },
+        "endpoint": "viewport snapshot complete including readback, without PNG encoding"
+      },
+      "diagnostics": [],
+      "additional_time_ms": 39.756889,
+      "additional_pss_bytes": 13115392,
+      "memory": {
+        "initialized": {
+          "pss_bytes": 92694528,
+          "rss_bytes": 108101632,
+          "private_bytes": 87777280,
+          "pids": [
+            2899131
+          ]
+        },
+        "loaded": {
+          "pss_bytes": 105809920,
+          "rss_bytes": 121217024,
+          "private_bytes": 100892672,
+          "pids": [
+            2899131
+          ]
+        }
+      },
+      "load_command_to_output_ms": 39.756889,
+      "native_window": true,
+      "baseline_host": {
+        "event": "ready",
+        "phase": "native",
+        "engine": "gpui",
+        "skrift_initialized": false,
+        "wry_initialized": false,
+        "page": {
+          "width": 800.0,
+          "height": 600.0,
+          "scale": 1.0
+        },
+        "frame_width": 800,
+        "frame_height": 600
+      },
+      "warm_engine": true,
+      "initialized_baseline_host": {
+        "event": "ready",
+        "phase": "warm",
+        "engine": "skrift-gpui",
+        "document_to_snapshot_ms": 6.272889,
+        "snapshot_width": 800,
+        "snapshot_height": 600,
+        "page": {
+          "width": 800.0,
+          "height": 600.0,
+          "scale": 1.0,
+          "layout_width": 800.0,
+          "content_height": 0.0,
+          "scroll_y": 0.0
+        },
+        "endpoint": "viewport snapshot complete including readback, without PNG encoding"
+      },
+      "additional_cpu_ms": 27.608,
+      "cpu": {
+        "initialized": {
+          "usage_usec": 178200,
+          "user_usec": 85716,
+          "system_usec": 92484,
+          "pids": [
+            2899131
+          ]
+        },
+        "rendered": {
+          "usage_usec": 205808,
+          "user_usec": 100439,
+          "system_usec": 105369,
+          "pids": [
+            2899131
+          ]
+        },
+        "scope": "all threads and helper processes in a private cgroup; exited helpers retained"
+      },
+      "label": "skrift",
+      "fixture": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/fixtures/languages/cjk-japanese.html",
+      "verification_screenshot": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/results/culled-warm-first-remaining-screenshots-20261027/skrift-cjk-japanese.png"
+    },
+    {
+      "host": {
+        "event": "ready",
+        "phase": "document",
+        "engine": "wry-in-gpui",
+        "pid": 2899176,
+        "webview_version": "2.54.2",
+        "parent_x11_window": 14680065,
+        "embedded_as_child": true,
+        "document_to_snapshot_ms": 35.632819000000005,
+        "snapshot_width": 800,
+        "snapshot_height": 600,
+        "page": {
+          "event": "document_ready",
+          "width": 800,
+          "height": 600,
+          "scale": 1,
+          "layout_width": 800,
+          "content_width": 800,
+          "content_height": 600,
+          "scroll_y": 0,
+          "compatibility": "CSS1Compat"
+        },
+        "endpoint": "WebKit child viewport snapshot complete; includes readback; excludes PNG encoding"
+      },
+      "diagnostics": [],
+      "additional_time_ms": 44.042886,
+      "additional_pss_bytes": 8513536,
+      "memory": {
+        "initialized": {
+          "pss_bytes": 224258048,
+          "rss_bytes": 366194688,
+          "private_bytes": 150446080,
+          "pids": [
+            2899176,
+            2899236,
+            2899237
+          ]
+        },
+        "loaded": {
+          "pss_bytes": 232771584,
+          "rss_bytes": 375484416,
+          "private_bytes": 158629888,
+          "pids": [
+            2899176,
+            2899236,
+            2899237
+          ]
+        }
+      },
+      "load_command_to_output_ms": 44.042886,
+      "native_window": true,
+      "baseline_host": {
+        "event": "ready",
+        "phase": "native",
+        "engine": "gpui",
+        "skrift_initialized": false,
+        "wry_initialized": false,
+        "page": {
+          "width": 800.0,
+          "height": 600.0,
+          "scale": 1.0
+        },
+        "frame_width": 800,
+        "frame_height": 600
+      },
+      "warm_engine": true,
+      "initialized_baseline_host": {
+        "event": "ready",
+        "phase": "warm",
+        "engine": "wry-in-gpui",
+        "pid": 2899176,
+        "webview_version": "2.54.2",
+        "parent_x11_window": 14680065,
+        "embedded_as_child": true,
+        "document_to_snapshot_ms": 155.635681,
+        "snapshot_width": 800,
+        "snapshot_height": 600,
+        "page": {
+          "event": "document_ready",
+          "width": 800,
+          "height": 600,
+          "scale": 1,
+          "layout_width": 800,
+          "content_width": 800,
+          "content_height": 600,
+          "scroll_y": 0,
+          "compatibility": "CSS1Compat"
+        },
+        "endpoint": "WebKit child viewport snapshot complete; includes readback; excludes PNG encoding"
+      },
+      "additional_cpu_ms": 39.196,
+      "cpu": {
+        "initialized": {
+          "usage_usec": 484052,
+          "user_usec": 300426,
+          "system_usec": 183626,
+          "pids": [
+            2899176,
+            2899236,
+            2899237
+          ]
+        },
+        "rendered": {
+          "usage_usec": 523248,
+          "user_usec": 330726,
+          "system_usec": 192521,
+          "pids": [
+            2899176,
+            2899236,
+            2899237
+          ]
+        },
+        "scope": "all threads and helper processes in a private cgroup; exited helpers retained"
+      },
+      "label": "wry",
+      "fixture": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/fixtures/languages/cjk-japanese.html",
+      "verification_screenshot": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/results/culled-warm-first-remaining-screenshots-20261027/wry-cjk-japanese.png"
+    },
+    {
+      "host": {
+        "event": "ready",
+        "phase": "document",
+        "engine": "skrift-gpui",
+        "document_to_snapshot_ms": 696.303758,
+        "snapshot_width": 800,
+        "snapshot_height": 600,
+        "page": {
+          "width": 800.0,
+          "height": 600.0,
+          "scale": 1.0,
+          "layout_width": 800.0,
+          "content_height": 924660.0,
+          "scroll_y": 0.0
+        },
+        "endpoint": "viewport snapshot complete including readback, without PNG encoding"
+      },
+      "diagnostics": [],
+      "additional_time_ms": 696.554573,
+      "additional_pss_bytes": 206860288,
+      "memory": {
+        "initialized": {
+          "pss_bytes": 92573696,
+          "rss_bytes": 107958272,
+          "private_bytes": 87674880,
+          "pids": [
+            2899310
+          ]
+        },
+        "loaded": {
+          "pss_bytes": 299433984,
+          "rss_bytes": 314818560,
+          "private_bytes": 294535168,
+          "pids": [
+            2899310
+          ]
+        }
+      },
+      "load_command_to_output_ms": 696.554573,
+      "native_window": true,
+      "baseline_host": {
+        "event": "ready",
+        "phase": "native",
+        "engine": "gpui",
+        "skrift_initialized": false,
+        "wry_initialized": false,
+        "page": {
+          "width": 800.0,
+          "height": 600.0,
+          "scale": 1.0
+        },
+        "frame_width": 800,
+        "frame_height": 600
+      },
+      "warm_engine": true,
+      "initialized_baseline_host": {
+        "event": "ready",
+        "phase": "warm",
+        "engine": "skrift-gpui",
+        "document_to_snapshot_ms": 7.053137,
+        "snapshot_width": 800,
+        "snapshot_height": 600,
+        "page": {
+          "width": 800.0,
+          "height": 600.0,
+          "scale": 1.0,
+          "layout_width": 800.0,
+          "content_height": 0.0,
+          "scroll_y": 0.0
+        },
+        "endpoint": "viewport snapshot complete including readback, without PNG encoding"
+      },
+      "additional_cpu_ms": 679.603,
+      "cpu": {
+        "initialized": {
+          "usage_usec": 161994,
+          "user_usec": 85167,
+          "system_usec": 76826,
+          "pids": [
+            2899310
+          ]
+        },
+        "rendered": {
+          "usage_usec": 841597,
+          "user_usec": 636352,
+          "system_usec": 205245,
+          "pids": [
+            2899310
+          ]
+        },
+        "scope": "all threads and helper processes in a private cgroup; exited helpers retained"
+      },
+      "label": "skrift",
+      "fixture": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/fixtures/large-document.html",
+      "verification_screenshot": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/results/culled-warm-first-remaining-screenshots-20261027/skrift-large-document.png"
+    },
+    {
+      "host": {
+        "event": "ready",
+        "phase": "document",
+        "engine": "wry-in-gpui",
+        "pid": 2899357,
+        "webview_version": "2.54.2",
+        "parent_x11_window": 14680065,
+        "embedded_as_child": true,
+        "document_to_snapshot_ms": 369.58577399999996,
+        "snapshot_width": 800,
+        "snapshot_height": 600,
+        "page": {
+          "event": "document_ready",
+          "width": 800,
+          "height": 600,
+          "scale": 1,
+          "layout_width": 800,
+          "content_width": 800,
+          "content_height": 924700,
+          "scroll_y": 0,
+          "compatibility": "CSS1Compat"
+        },
+        "endpoint": "WebKit child viewport snapshot complete; includes readback; excludes PNG encoding"
+      },
+      "diagnostics": [],
+      "additional_time_ms": 372.163035,
+      "additional_pss_bytes": 90245120,
+      "memory": {
+        "initialized": {
+          "pss_bytes": 223690752,
+          "rss_bytes": 360882176,
+          "private_bytes": 150003712,
+          "pids": [
+            2899357,
+            2899416,
+            2899417
+          ]
+        },
+        "loaded": {
+          "pss_bytes": 313935872,
+          "rss_bytes": 451895296,
+          "private_bytes": 239919104,
+          "pids": [
+            2899357,
+            2899416,
+            2899417
+          ]
+        }
+      },
+      "load_command_to_output_ms": 372.163035,
+      "native_window": true,
+      "baseline_host": {
+        "event": "ready",
+        "phase": "native",
+        "engine": "gpui",
+        "skrift_initialized": false,
+        "wry_initialized": false,
+        "page": {
+          "width": 800.0,
+          "height": 600.0,
+          "scale": 1.0
+        },
+        "frame_width": 800,
+        "frame_height": 600
+      },
+      "warm_engine": true,
+      "initialized_baseline_host": {
+        "event": "ready",
+        "phase": "warm",
+        "engine": "wry-in-gpui",
+        "pid": 2899357,
+        "webview_version": "2.54.2",
+        "parent_x11_window": 14680065,
+        "embedded_as_child": true,
+        "document_to_snapshot_ms": 146.674471,
+        "snapshot_width": 800,
+        "snapshot_height": 600,
+        "page": {
+          "event": "document_ready",
+          "width": 800,
+          "height": 600,
+          "scale": 1,
+          "layout_width": 800,
+          "content_width": 800,
+          "content_height": 600,
+          "scroll_y": 0,
+          "compatibility": "CSS1Compat"
+        },
+        "endpoint": "WebKit child viewport snapshot complete; includes readback; excludes PNG encoding"
+      },
+      "additional_cpu_ms": 381.641,
+      "cpu": {
+        "initialized": {
+          "usage_usec": 437382,
+          "user_usec": 258325,
+          "system_usec": 179057,
+          "pids": [
+            2899357,
+            2899416,
+            2899417
+          ]
+        },
+        "rendered": {
+          "usage_usec": 819023,
+          "user_usec": 580363,
+          "system_usec": 238659,
+          "pids": [
+            2899357,
+            2899416,
+            2899417
+          ]
+        },
+        "scope": "all threads and helper processes in a private cgroup; exited helpers retained"
+      },
+      "label": "wry",
+      "fixture": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/fixtures/large-document.html",
+      "verification_screenshot": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/results/culled-warm-first-remaining-screenshots-20261027/wry-large-document.png"
+    }
+  ],
+  "summary": [
+    {
+      "label": "skrift",
+      "fixture": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/fixtures/books/middlemarch/chapter-37.xhtml",
+      "samples": 1,
+      "additional_cpu_ms": 97.652,
+      "memory_before_pss_bytes": 93099008,
+      "memory_after_pss_bytes": 110240768
+    },
+    {
+      "label": "wry",
+      "fixture": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/fixtures/books/middlemarch/chapter-37.xhtml",
+      "samples": 1,
+      "additional_cpu_ms": 95.238,
+      "memory_before_pss_bytes": 221162496,
+      "memory_after_pss_bytes": 236720128
+    },
+    {
+      "label": "skrift",
+      "fixture": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/fixtures/article.html",
+      "samples": 1,
+      "additional_cpu_ms": 44.312,
+      "memory_before_pss_bytes": 92705792,
+      "memory_after_pss_bytes": 102810624
+    },
+    {
+      "label": "wry",
+      "fixture": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/fixtures/article.html",
+      "samples": 1,
+      "additional_cpu_ms": 28.32,
+      "memory_before_pss_bytes": 225514496,
+      "memory_after_pss_bytes": 231933952
+    },
+    {
+      "label": "skrift",
+      "fixture": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/fixtures/images.html",
+      "samples": 1,
+      "additional_cpu_ms": 38.041,
+      "memory_before_pss_bytes": 92923904,
+      "memory_after_pss_bytes": 106836992
+    },
+    {
+      "label": "wry",
+      "fixture": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/fixtures/images.html",
+      "samples": 1,
+      "additional_cpu_ms": 21.402,
+      "memory_before_pss_bytes": 225344512,
+      "memory_after_pss_bytes": 233701376
+    },
+    {
+      "label": "wry",
+      "fixture": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/fixtures/tables.html",
+      "samples": 1,
+      "additional_cpu_ms": 28.765,
+      "memory_before_pss_bytes": 224152576,
+      "memory_after_pss_bytes": 232150016
+    },
+    {
+      "label": "skrift",
+      "fixture": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/fixtures/tables.html",
+      "samples": 1,
+      "additional_cpu_ms": 40.325,
+      "memory_before_pss_bytes": 92530688,
+      "memory_after_pss_bytes": 104142848
+    },
+    {
+      "label": "skrift",
+      "fixture": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/fixtures/languages/rtl-arabic.html",
+      "samples": 1,
+      "additional_cpu_ms": 23.88,
+      "memory_before_pss_bytes": 92815360,
+      "memory_after_pss_bytes": 103444480
+    },
+    {
+      "label": "wry",
+      "fixture": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/fixtures/languages/rtl-arabic.html",
+      "samples": 1,
+      "additional_cpu_ms": 17.582,
+      "memory_before_pss_bytes": 222283776,
+      "memory_after_pss_bytes": 227876864
+    },
+    {
+      "label": "skrift",
+      "fixture": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/fixtures/languages/cjk-japanese.html",
+      "samples": 1,
+      "additional_cpu_ms": 27.608,
+      "memory_before_pss_bytes": 92694528,
+      "memory_after_pss_bytes": 105809920
+    },
+    {
+      "label": "wry",
+      "fixture": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/fixtures/languages/cjk-japanese.html",
+      "samples": 1,
+      "additional_cpu_ms": 39.196,
+      "memory_before_pss_bytes": 224258048,
+      "memory_after_pss_bytes": 232771584
+    },
+    {
+      "label": "skrift",
+      "fixture": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/fixtures/large-document.html",
+      "samples": 1,
+      "additional_cpu_ms": 679.603,
+      "memory_before_pss_bytes": 92573696,
+      "memory_after_pss_bytes": 299433984
+    },
+    {
+      "label": "wry",
+      "fixture": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/fixtures/large-document.html",
+      "samples": 1,
+      "additional_cpu_ms": 381.641,
+      "memory_before_pss_bytes": 223690752,
+      "memory_after_pss_bytes": 313935872
+    }
+  ],
+  "cpu": "private cgroup v2 usage increase over the same load interval; all host threads and helper processes, including exited helpers; no tracing",
+  "cpu_cgroup_parent": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service",
+  "native_window": true,
+  "shared_gpui": true,
+  "warm_engine": true,
+  "verification_screenshots": "captured and PNG encoded after CPU, wall and loaded memory samples",
+  "source_reports": [
+    "results/middlemarch-culled-warm-first-20261027.json",
+    "results/culled-warm-first-remaining-20261027.json"
+  ]
+}

@@ -18,14 +18,11 @@ pub(in crate::style::cascade::resolver) fn length_to_px(
         LengthValue::Mm(mm) => mm * (96.0 / 25.4),
         LengthValue::Q(q) => q * (96.0 / 101.6),
         LengthValue::Pc(pc) => pc * 16.0,
-        LengthValue::Vw(_) | LengthValue::Vh(_) | LengthValue::Vmin(_) | LengthValue::Vmax(_) => {
-            return viewport_length_to_px(length, resolution);
-        }
         // These require selected-face metrics that are deliberately absent
         // during computed-style construction. Callers either preserve `ex`
         // symbolically or reject the declaration; they never guess a value.
         LengthValue::Ex(_) | LengthValue::Ch(_) | LengthValue::Cap(_) => return None,
-        _ => return None,
+        _ => return viewport_length_to_px(length, resolution),
     })
 }
 
@@ -88,8 +85,10 @@ pub(in crate::style::cascade::resolver) fn border_length_from_value(
     resolution: &ResolutionContext,
 ) -> Option<FontRelativeLength> {
     match length {
-        LengthValue::Ex(ex) => FontRelativeLength::ex(ex * font_size),
-        _ => FontRelativeLength::px(length_to_px(length, font_size, root_font_size, resolution)?),
+        LengthValue::Ex(ex) => FontRelativeLength::ex((ex * font_size).max(0.0)),
+        _ => FontRelativeLength::px(
+            length_to_px(length, font_size, root_font_size, resolution)?.max(0.0),
+        ),
     }
 }
 
@@ -137,50 +136,32 @@ pub(in crate::style::cascade::resolver) fn parsed_tab_size_to_computed(
     resolution: &ResolutionContext,
 ) -> Option<TabSize> {
     match parsed {
-        ParsedTabSize::Spaces(value) => TabSize::spaces(*value),
+        ParsedTabSize::Spaces(value) => {
+            let number = resolve_number(value, font_size, root_font_size, resolution)?;
+            TabSize::spaces(number.max(0.0).min(f32::MAX))
+        }
+        ParsedTabSize::ContextualLength(source) => {
+            let lowered = crate::style::syntax::sign::lower(source, |number| {
+                resolve_number(number, font_size, root_font_size, resolution)
+            })
+            .ok()?;
+            let ParsedTabSize::Length(value) = parse_tab_size(&lowered)? else {
+                return None;
+            };
+            parsed_tab_size_to_computed(
+                &ParsedTabSize::Length(value),
+                font_size,
+                root_font_size,
+                resolution,
+            )
+        }
         ParsedTabSize::Length(value) => {
-            if let LengthPercentage::Calc(calc) = value
-                && let Some(number) = calc_tab_number(calc)
-            {
-                return TabSize::spaces(number.max(0.0));
-            }
             let resolved =
                 length_percentage_to_text_spacing(value, font_size, root_font_size, resolution)?;
             (resolved.font_size_fraction() == 0.0)
                 .then(|| TabSize::length_px(resolved.absolute_px().max(0.0)))
                 .flatten()
         }
-    }
-}
-
-pub(in crate::style::cascade::resolver) fn calc_tab_number(
-    calc: &Calc<LengthPercentage>,
-) -> Option<f32> {
-    match calc {
-        Calc::Value(value) => match value.as_ref() {
-            LengthPercentage::Calc(nested) => calc_tab_number(nested),
-            _ => None,
-        },
-        Calc::Number(value) => Some(*value),
-        Calc::Sum(left, right) => Some(calc_tab_number(left)? + calc_tab_number(right)?),
-        Calc::Product(factor, value) => Some(*factor * calc_tab_number(value)?),
-        Calc::Function(function) => match function.as_ref() {
-            MathFunction::Calc(value) => calc_tab_number(value),
-            MathFunction::Min(values) => values
-                .iter()
-                .map(calc_tab_number)
-                .reduce(|left, right| Some(left?.min(right?)))?,
-            MathFunction::Max(values) => values
-                .iter()
-                .map(calc_tab_number)
-                .reduce(|left, right| Some(left?.max(right?)))?,
-            MathFunction::Clamp(min, value, max) => {
-                Some(calc_tab_number(value)?.clamp(calc_tab_number(min)?, calc_tab_number(max)?))
-            }
-            MathFunction::Abs(value) => Some(calc_tab_number(value)?.abs()),
-            MathFunction::Sign(value) => Some(calc_tab_number(value)?.signum()),
-            _ => None,
-        },
     }
 }
 
@@ -306,9 +287,77 @@ pub(in crate::style::cascade::resolver) fn calc_box_length_percentage_components
             MathFunction::Calc(value) => {
                 calc_box_length_percentage_components(value, font_size, root_font_size, resolution)
             }
+            MathFunction::Min(values) | MathFunction::Max(values) => {
+                let minimum = matches!(function.as_ref(), MathFunction::Min(_));
+                values
+                    .iter()
+                    .map(|value| {
+                        calc_box_length_percentage_components(
+                            value,
+                            font_size,
+                            root_font_size,
+                            resolution,
+                        )
+                    })
+                    .reduce(|left, right| select_comparison_operand(left?, right?, minimum))?
+            }
+            MathFunction::Clamp(minimum, value, maximum) => {
+                let minimum = calc_box_length_percentage_components(
+                    minimum,
+                    font_size,
+                    root_font_size,
+                    resolution,
+                )?;
+                let value = calc_box_length_percentage_components(
+                    value,
+                    font_size,
+                    root_font_size,
+                    resolution,
+                )?;
+                let maximum = calc_box_length_percentage_components(
+                    maximum,
+                    font_size,
+                    root_font_size,
+                    resolution,
+                )?;
+                select_comparison_operand(
+                    minimum,
+                    select_comparison_operand(value, maximum, true)?,
+                    false,
+                )
+            }
             _ => None,
         },
     }
+}
+
+/// Affine lengths can be ordered without a containing-block or font metric
+/// when they differ in just one coefficient. All five bases are nonnegative.
+/// Crossing expressions stay unresolved instead of comparing coefficients as
+/// if they were already pixel values.
+fn select_comparison_operand(
+    left: (f32, f32, f32, f32, f32),
+    right: (f32, f32, f32, f32, f32),
+    minimum: bool,
+) -> Option<(f32, f32, f32, f32, f32)> {
+    let mut difference = None;
+    for (a, b) in [left.0, left.1, left.2, left.3, left.4]
+        .into_iter()
+        .zip([right.0, right.1, right.2, right.3, right.4])
+    {
+        if a != b {
+            if difference.is_some() {
+                return None;
+            }
+            difference = Some(a.partial_cmp(&b)?);
+        }
+    }
+    let choose_left = match difference {
+        Some(order) if minimum => order.is_lt(),
+        Some(order) => order.is_gt(),
+        None => true,
+    };
+    Some(if choose_left { left } else { right })
 }
 
 pub(in crate::style::cascade::resolver) fn calc_length_percentage_components(
@@ -363,7 +412,20 @@ pub(in crate::style::cascade::resolver) fn calc_depends_on_percentage(
         Calc::Product(_, value) => calc_depends_on_percentage(value),
         Calc::Function(function) => match function.as_ref() {
             MathFunction::Calc(value) => calc_depends_on_percentage(value),
-            _ => false,
+            MathFunction::Abs(value) | MathFunction::Sign(value) => {
+                calc_depends_on_percentage(value)
+            }
+            MathFunction::Min(values) | MathFunction::Max(values) | MathFunction::Hypot(values) => {
+                values.iter().any(calc_depends_on_percentage)
+            }
+            MathFunction::Clamp(a, b, c) => {
+                calc_depends_on_percentage(a)
+                    || calc_depends_on_percentage(b)
+                    || calc_depends_on_percentage(c)
+            }
+            MathFunction::Round(_, a, b) | MathFunction::Rem(a, b) | MathFunction::Mod(a, b) => {
+                calc_depends_on_percentage(a) || calc_depends_on_percentage(b)
+            }
         },
     }
 }
@@ -544,12 +606,17 @@ pub(in crate::style::cascade::resolver) fn calc_length_to_px(
                 .iter()
                 .map(|value| calc_length_to_px(value, font_size, root_font_size, resolution))
                 .reduce(|left, right| Some(left?.max(right?)))?,
-            MathFunction::Clamp(min, value, max) => Some(
-                calc_length_to_px(value, font_size, root_font_size, resolution)?.clamp(
-                    calc_length_to_px(min, font_size, root_font_size, resolution)?,
-                    calc_length_to_px(max, font_size, root_font_size, resolution)?,
-                ),
-            ),
+            MathFunction::Clamp(min, value, max) => {
+                let minimum = calc_length_to_px(min, font_size, root_font_size, resolution)?;
+                let value = calc_length_to_px(value, font_size, root_font_size, resolution)?;
+                let maximum = calc_length_to_px(max, font_size, root_font_size, resolution)?;
+                // CSS gives the minimum precedence when limits conflict.
+                Some(if minimum.is_nan() || value.is_nan() || maximum.is_nan() {
+                    f32::NAN
+                } else {
+                    value.min(maximum).max(minimum)
+                })
+            }
             MathFunction::Abs(value) => {
                 Some(calc_length_to_px(value, font_size, root_font_size, resolution)?.abs())
             }
@@ -594,7 +661,10 @@ pub(in crate::style::cascade::resolver) fn border_width(
         BorderSideWidth::Thick => FontRelativeLength::px(5.0),
         BorderSideWidth::Length(len) => match len {
             Length::Value(v) => border_length_from_value(v, font_size, root_font_size, resolution),
-            Length::Calc(_) => FontRelativeLength::px(3.0), // Default to medium for calc
+            Length::Calc(calc) => {
+                let value = calc_length_to_px(calc, font_size, root_font_size, resolution)?;
+                FontRelativeLength::px(value.max(0.0))
+            }
         },
     }
 }

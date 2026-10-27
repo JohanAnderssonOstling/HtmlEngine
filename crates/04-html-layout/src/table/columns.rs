@@ -27,6 +27,18 @@ pub(super) struct TableColumnLayout {
     pub(super) widths: Vec<f64>,
     pub(super) starts: Vec<f64>,
     pub(super) table_width: f64,
+    pub(super) rtl: bool,
+}
+
+impl TableColumnLayout {
+    pub(super) fn physical_start(&self, column: usize, span: usize) -> f64 {
+        let start = self.starts.get(column).copied().unwrap_or(0.0);
+        if self.rtl {
+            self.table_width - start - span_extent(&self.starts, &self.widths, column, span)
+        } else {
+            start
+        }
+    }
 }
 
 pub(super) fn build_table_grid(

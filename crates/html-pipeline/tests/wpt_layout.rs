@@ -1,7 +1,13 @@
 use html_dom::{Document, ImageSource};
-use html_layout::{FontMetricsRequest, FontRelativeMetrics, FontSlant, GlyphId, GlyphMetric, GlyphShaper, ImageMetrics, LayoutConstraints, ShapeError};
 use html_parse::HtmlQuirksMode;
-use html_pipeline::{DocumentFactory, parse_html_document};
+use html_pipeline::GlyphResourceStore;
+use html_pipeline::ResourceContext;
+use html_pipeline::engine::{
+    FontMetricsRequest, FontRelativeMetrics, GlyphId, GlyphMetric, GlyphShaper, ImageMetrics,
+    LayoutConstraints, ShapeError,
+};
+use html_pipeline::{DocumentFactory, LaidOutDocument, PreparedDocument, parse_html_document};
+use html_pipeline::{GlyphRequest, ShapedGlyph};
 use html_resources::{ResourceProvider, probe_dimensions};
 use html_wpt_test_support::wpt_root;
 use std::borrow::Cow;
@@ -14,8 +20,10 @@ use std::sync::Arc;
 const LAYOUT_TESTS: &str = include_str!("../../../testdata/wpt/layout-check-tests.txt");
 const KNOWN_FAILURES: &str = include_str!("../../../testdata/wpt/known-layout-failures.txt");
 const IGNORED_RUNS: &str = include_str!("../../../testdata/wpt/ignored-layout-runs.txt");
-const SKIPPED_QUIRKS_FILES: &str = include_str!("../../../testdata/wpt/skipped-quirks-layout-files.txt");
-const SKIPPED_UNSUPPORTED_FILES: &str = include_str!("../../../testdata/wpt/skipped-unsupported-layout-files.txt");
+const SKIPPED_QUIRKS_FILES: &str =
+    include_str!("../../../testdata/wpt/skipped-quirks-layout-files.txt");
+const SKIPPED_UNSUPPORTED_FILES: &str =
+    include_str!("../../../testdata/wpt/skipped-unsupported-layout-files.txt");
 const VIEWPORT_WIDTH: f64 = 800.0;
 const LINE_HEIGHT: f64 = 16.0;
 const WPT_LAYOUT_TOLERANCE: f64 = 1.0;
@@ -23,23 +31,26 @@ const WPT_LAYOUT_TOLERANCE: f64 = 1.0;
 #[derive(Default)]
 struct DeterministicShaper {
     glyphs: HashMap<(char, u32, bool), GlyphId>,
-    glyph_store: html_layout::GlyphResourceStore,
-    append_checkpoint: Option<(HashMap<(char, u32, bool), GlyphId>, html_layout::GlyphResourceStore)>,
+    generation: html_pipeline::engine::GlyphResourceGeneration,
+    append_checkpoint: Option<(
+        HashMap<(char, u32, bool), GlyphId>,
+        html_pipeline::engine::GlyphResourceGeneration,
+    )>,
 }
 
 impl GlyphShaper for DeterministicShaper {
     fn reset(&mut self) {
         self.glyphs.clear();
-        self.glyph_store.clear();
+        self.generation = html_pipeline::engine::GlyphResourceGeneration::default();
     }
 
-    fn glyph_resources(&mut self) -> &mut html_layout::GlyphResourceStore {
-        &mut self.glyph_store
+    fn resource_generation(&self) -> html_pipeline::engine::GlyphResourceGeneration {
+        self.generation
     }
 
     fn begin_append_shaping(&mut self) -> Result<(), ShapeError> {
         assert!(self.append_checkpoint.is_none());
-        self.append_checkpoint = Some((self.glyphs.clone(), self.glyph_store.clone()));
+        self.append_checkpoint = Some((self.glyphs.clone(), self.generation.clone()));
         Ok(())
     }
 
@@ -50,28 +61,55 @@ impl GlyphShaper for DeterministicShaper {
     fn rollback_append_shaping(&mut self) {
         if let Some((glyphs, glyph_store)) = self.append_checkpoint.take() {
             self.glyphs = glyphs;
-            self.glyph_store = glyph_store;
+            self.generation = glyph_store;
         }
     }
 
-    fn font_relative_metrics(&mut self, request: FontMetricsRequest<'_>) -> Result<FontRelativeMetrics, ShapeError> {
-        if request.font_family().is_some_and(|family| family.split(',').next().is_some_and(|name| name.trim().trim_matches(['\'', '"']).eq_ignore_ascii_case("BaselineDiagnosticAlphabeticZero"))) {
-            return Ok(FontRelativeMetrics::from_line_ratios(0.25, 0.5, 0.55, 0.8, 0.2).expect("the pinned diagnostic font metrics are valid"));
+    fn font_relative_metrics(
+        &mut self,
+        request: FontMetricsRequest<'_>,
+    ) -> Result<FontRelativeMetrics, ShapeError> {
+        if request.font_family().is_some_and(|family| {
+            family.split(',').next().is_some_and(|name| {
+                name.trim()
+                    .trim_matches(['\'', '"'])
+                    .eq_ignore_ascii_case("BaselineDiagnosticAlphabeticZero")
+            })
+        }) {
+            return Ok(
+                FontRelativeMetrics::from_line_ratios(0.25, 0.5, 0.55, 0.8, 0.2)
+                    .expect("the pinned diagnostic font metrics are valid"),
+            );
         }
         Ok(FontRelativeMetrics::fallback())
     }
 
-    fn shape_glyph(&mut self, ch: char, font_size: f32, _font_weight: u16, _font_slant: FontSlant, _color: u32, family: Option<&str>) -> Result<GlyphId, ShapeError> {
-        let is_ahem = family.and_then(|families| families.split(',').next()).map(str::trim).map(|family| family.trim_matches(['\'', '"'])).is_some_and(|family| family.eq_ignore_ascii_case("ahem"));
-        let key = (ch, font_size.to_bits(), is_ahem);
+    fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
+        let is_ahem = request
+            .font_family
+            .and_then(|families| families.split(',').next())
+            .map(str::trim)
+            .map(|family| family.trim_matches(['\'', '"']))
+            .is_some_and(|family| family.eq_ignore_ascii_case("ahem"));
+        let key = (request.character, request.font_size.to_bits(), is_ahem);
+        let advance = if is_ahem {
+            request.font_size
+        } else {
+            request.font_size * 0.5
+        };
+        let metric = GlyphMetric::try_new(
+            request.character,
+            advance,
+            request.font_size * 0.75,
+            request.font_size * 0.25,
+        )
+        .map_err(ShapeError::rejected_metric)?;
         if let Some(&glyph) = self.glyphs.get(&key) {
-            return Ok(glyph);
+            return Ok(ShapedGlyph::from_metric(glyph, metric));
         }
-        let advance = if is_ahem { font_size } else { font_size * 0.5 };
-        let metric = GlyphMetric::try_new(ch, advance, font_size * 0.75, font_size * 0.25, font_size * 0.75).map_err(ShapeError::rejected_metric)?;
-        let glyph = self.glyph_store.register(metric)?;
+        let glyph = self.glyphs.len() as GlyphId;
         self.glyphs.insert(key, glyph);
-        Ok(glyph)
+        Ok(ShapedGlyph::from_metric(glyph, metric))
     }
 }
 
@@ -93,8 +131,16 @@ impl ResourceProvider for WptResourceProvider {
             return href.to_owned();
         }
         let base = Path::new(base);
-        let base_dir = if base.as_os_str().to_string_lossy().ends_with('/') { base } else { base.parent().unwrap_or_else(|| Path::new("")) };
-        let path = if href.starts_with('/') { PathBuf::from(href.trim_start_matches('/')) } else { base_dir.join(href) };
+        let base_dir = if base.as_os_str().to_string_lossy().ends_with('/') {
+            base
+        } else {
+            base.parent().unwrap_or_else(|| Path::new(""))
+        };
+        let path = if href.starts_with('/') {
+            PathBuf::from(href.trim_start_matches('/'))
+        } else {
+            base_dir.join(href)
+        };
         normalize_relative_path(&path)
     }
 
@@ -103,16 +149,75 @@ impl ResourceProvider for WptResourceProvider {
     }
 }
 
+fn layout_prepared<'a>(
+    prepared: &'a PreparedDocument<'_>,
+    image_metrics: &ImageMetrics,
+    shaper: &mut DeterministicShaper,
+    resources: &mut GlyphResourceStore,
+) -> Result<LaidOutDocument<'a>, ShapeError> {
+    prepared.shape_and_layout_with_metrics_and_shaper(
+        LayoutConstraints::new(VIEWPORT_WIDTH, LINE_HEIGHT)
+            .expect("fixed WPT constraints are valid"),
+        image_metrics,
+        shaper,
+        resources,
+    )
+}
+
+#[test]
+fn layout_harness_coordinates_first_line_styles() {
+    for (selector, expected_height) in [(".grid", 16.0), (".item", 100.0)] {
+        let source = format!(
+            "<!doctype html><style>body {{margin:0;font-size:16px;line-height:16px}} \
+             .grid {{display:grid}} {selector}::first-line {{line-height:100px}}</style>\
+             <div class='grid'><div class='item'>The first item.</div></div>"
+        );
+        let prepared = DocumentFactory::new().parse_with_new_pipeline(&source, None);
+        let mut document_resources = GlyphResourceStore::default();
+        let document = layout_prepared(
+            &prepared,
+            &ImageMetrics::default(),
+            &mut DeterministicShaper::default(),
+            &mut document_resources,
+        )
+        .expect("the WPT layout harness must coordinate first-line styles");
+        let view = document.render_view(&document_resources);
+        let text = view.text();
+        let heights = text
+            .lines()
+            .iter()
+            .map(|line| line.height())
+            .collect::<Vec<_>>();
+        assert_eq!(heights, [expected_height], "{selector}");
+    }
+}
+
 #[test]
 fn runs_pinned_noninteractive_wpt_layout_assertions() {
     let wpt_root = wpt_root();
-    let provider = Arc::new(WptResourceProvider { root: wpt_root.clone() });
+    let provider = Arc::new(WptResourceProvider {
+        root: wpt_root.clone(),
+    });
     let tests = manifest_entries();
     let mut skipped_modes = skipped_quirks_entries();
     let mut unsupported_files = skipped_unsupported_entries();
-    let mut known = KNOWN_FAILURES.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#')).map(str::to_owned).collect::<BTreeSet<_>>();
-    let mut ignored =
-        IGNORED_RUNS.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#')).map(|line| line.split_once("|reason=").expect("ignored layout run includes a reason").0.to_owned()).collect::<BTreeSet<_>>();
+    let mut known = KNOWN_FAILURES
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    let mut ignored = IGNORED_RUNS
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(|line| {
+            line.split_once("|reason=")
+                .expect("ignored layout run includes a reason")
+                .0
+                .to_owned()
+        })
+        .collect::<BTreeSet<_>>();
     let ignored_total = ignored.len();
     let verbose = std::env::var_os("HTML_WPT_LAYOUT_VERBOSE").is_some();
     let mut infrastructure_failures = Vec::new();
@@ -133,7 +238,9 @@ fn runs_pinned_noninteractive_wpt_layout_assertions() {
             eprintln!("layout WPT file: {relative}");
         }
         let path = wpt_root.join(relative);
-        let source = fs::read_to_string(&path).unwrap_or_else(|error| panic!("failed to read pinned WPT {}: {error}", path.display()));
+        let source = fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!("failed to read pinned WPT {}: {error}", path.display())
+        });
         let source = prepare_noninteractive_source(relative, &source);
         let parsed = parse_html_document(&source);
         let actual_mode = parsed.quirks_mode();
@@ -146,8 +253,11 @@ fn runs_pinned_noninteractive_wpt_layout_assertions() {
                 skipped_quirks += 1;
                 match skipped_modes.remove(relative) {
                     Some(HtmlQuirksMode::Quirks) => {}
-                    Some(expected) => infrastructure_failures.push(format!("{relative}|skip-ledger-mode={expected:?}|parsed-mode={actual_mode:?}")),
-                    None => infrastructure_failures.push(format!("{relative}|unlisted-quirks-mode-document")),
+                    Some(expected) => infrastructure_failures.push(format!(
+                        "{relative}|skip-ledger-mode={expected:?}|parsed-mode={actual_mode:?}"
+                    )),
+                    None => infrastructure_failures
+                        .push(format!("{relative}|unlisted-quirks-mode-document")),
                 }
                 skipped_known_mismatches += discard_file_entries(&mut known, relative);
                 skipped_ignored_runs += discard_file_entries(&mut ignored, relative);
@@ -160,8 +270,11 @@ fn runs_pinned_noninteractive_wpt_layout_assertions() {
                 skipped_limited_quirks += 1;
                 match skipped_modes.remove(relative) {
                     Some(HtmlQuirksMode::LimitedQuirks) => {}
-                    Some(expected) => infrastructure_failures.push(format!("{relative}|skip-ledger-mode={expected:?}|parsed-mode={actual_mode:?}")),
-                    None => infrastructure_failures.push(format!("{relative}|unlisted-limited-quirks-mode-document")),
+                    Some(expected) => infrastructure_failures.push(format!(
+                        "{relative}|skip-ledger-mode={expected:?}|parsed-mode={actual_mode:?}"
+                    )),
+                    None => infrastructure_failures
+                        .push(format!("{relative}|unlisted-limited-quirks-mode-document")),
                 }
                 skipped_known_mismatches += discard_file_entries(&mut known, relative);
                 skipped_ignored_runs += discard_file_entries(&mut ignored, relative);
@@ -172,7 +285,10 @@ fn runs_pinned_noninteractive_wpt_layout_assertions() {
         let replaced_element_tags = unsupported_replaced_element_tags(&expectation_document);
         if !replaced_element_tags.is_empty() {
             if verbose {
-                eprintln!("skipping replaced-element layout WPT file: {relative}|tags={}", replaced_element_tags.join(","));
+                eprintln!(
+                    "skipping replaced-element layout WPT file: {relative}|tags={}",
+                    replaced_element_tags.join(",")
+                );
             }
             skipped_replaced_element_files += 1;
             for tag in replaced_element_tags {
@@ -191,8 +307,18 @@ fn runs_pinned_noninteractive_wpt_layout_assertions() {
             skipped_ignored_runs += discard_file_entries(&mut ignored, relative);
             continue;
         }
-        let expectations = collect_expectations(relative, &expectation_document, &mut infrastructure_failures, &mut unsupported_checks);
-        assertion_count += expectations.iter().map(|expectation| usize::from(expectation.width.is_some()) + usize::from(expectation.height.is_some())).sum::<usize>();
+        let expectations = collect_expectations(
+            relative,
+            &expectation_document,
+            &mut infrastructure_failures,
+            &mut unsupported_checks,
+        );
+        assertion_count += expectations
+            .iter()
+            .map(|expectation| {
+                usize::from(expectation.width.is_some()) + usize::from(expectation.height.is_some())
+            })
+            .sum::<usize>();
         // Files with only geometry kinds that the semantic view cannot expose
         // are still parsed and audited, but need not pay for shape and layout.
         if expectations.is_empty() {
@@ -200,9 +326,11 @@ fn runs_pinned_noninteractive_wpt_layout_assertions() {
         }
 
         let mut factory = DocumentFactory::new();
-        factory.set_resource_context(provider.clone(), relative.clone());
+        let factory_resources = ResourceContext::new(provider.as_ref(), (relative).as_ref());
         let mut shaper = DeterministicShaper::default();
-        let prepared = factory.parse_with_new_pipeline(&source, None);
+        let prepared = factory
+            .with_resources(factory_resources)
+            .parse_with_new_pipeline(&source, None);
         let mut image_metrics = ImageMetrics::default();
         for (image_idx, image) in expectation_document.images().iter().enumerate() {
             let source = match &image.source {
@@ -217,15 +345,30 @@ fn runs_pinned_noninteractive_wpt_layout_assertions() {
                 image_metrics.set(image_idx as u32, width, height);
             }
         }
-        let document = prepared
-            .shape(&mut shaper)
-            .unwrap_or_else(|error| panic!("failed to shape pinned WPT {relative}: {error}"))
-            .layout_with_metrics(LayoutConstraints::new(VIEWPORT_WIDTH, LINE_HEIGHT).expect("fixed WPT constraints are valid"), &image_metrics);
-        let boxes = document.render_view().boxes();
-        let boxes_by_dom_node = (0..boxes.len()).filter_map(|box_idx| boxes.dom_node_index(box_idx).map(|node_idx| (node_idx, box_idx))).collect::<HashMap<_, _>>();
+        let mut document_resources = GlyphResourceStore::default();
+        let document = layout_prepared(
+            &prepared,
+            &image_metrics,
+            &mut shaper,
+            &mut document_resources,
+        )
+        .unwrap_or_else(|error| {
+            panic!("failed to shape and lay out pinned WPT {relative}: {error}")
+        });
+        let boxes = document.render_view(&document_resources).boxes();
+        let boxes_by_dom_node = (0..boxes.len())
+            .filter_map(|box_idx| {
+                boxes
+                    .dom_node_index(box_idx)
+                    .map(|node_idx| (node_idx, box_idx))
+            })
+            .collect::<HashMap<_, _>>();
 
         for expectation in expectations {
-            let missing_box = format!("{relative}|node={}|tag={}|missing-layout-box", expectation.node_index, expectation.tag);
+            let missing_box = format!(
+                "{relative}|node={}|tag={}|missing-layout-box",
+                expectation.node_index, expectation.tag
+            );
             let Some(&box_idx) = boxes_by_dom_node.get(&expectation.node_index) else {
                 if !known.remove(&missing_box) {
                     unexpected.push(missing_box);
@@ -239,25 +382,60 @@ fn runs_pinned_noninteractive_wpt_layout_assertions() {
             if let Some(expected) = expectation.width {
                 let run_key = assertion_run_key(relative, &expectation, "width", expected);
                 if verbose {
-                    eprintln!("layout assertion-run: {run_key}|actual={}|box={box_idx}|parent={:?}|class={:?}|style={:?}", size.width, boxes.parent(box_idx), expectation.class, expectation.style);
+                    eprintln!(
+                        "layout assertion-run: {run_key}|actual={}|box={box_idx}|parent={:?}|class={:?}|style={:?}",
+                        size.width,
+                        boxes.parent(box_idx),
+                        expectation.class,
+                        expectation.style
+                    );
                 }
                 if !ignored.remove(&run_key) {
-                    reconcile_dimension(relative, &expectation, "width", size.width, expected, &mut known, &mut unexpected, &mut unexpected_passes);
+                    reconcile_dimension(
+                        relative,
+                        &expectation,
+                        "width",
+                        size.width,
+                        expected,
+                        &mut known,
+                        &mut unexpected,
+                        &mut unexpected_passes,
+                    );
                 }
             }
             if let Some(expected) = expectation.height {
                 let run_key = assertion_run_key(relative, &expectation, "height", expected);
                 if verbose {
-                    eprintln!("layout assertion-run: {run_key}|actual={}|box={box_idx}|parent={:?}|class={:?}|style={:?}", size.height, boxes.parent(box_idx), expectation.class, expectation.style);
+                    eprintln!(
+                        "layout assertion-run: {run_key}|actual={}|box={box_idx}|parent={:?}|class={:?}|style={:?}",
+                        size.height,
+                        boxes.parent(box_idx),
+                        expectation.class,
+                        expectation.style
+                    );
                 }
                 if !ignored.remove(&run_key) {
-                    reconcile_dimension(relative, &expectation, "height", size.height, expected, &mut known, &mut unexpected, &mut unexpected_passes);
+                    reconcile_dimension(
+                        relative,
+                        &expectation,
+                        "height",
+                        size.height,
+                        expected,
+                        &mut known,
+                        &mut unexpected,
+                        &mut unexpected_passes,
+                    );
                 }
             }
         }
     }
 
-    let known_mismatches = KNOWN_FAILURES.lines().filter(|line| !line.trim().is_empty() && !line.trim().starts_with('#')).count() - known.len() - skipped_known_mismatches;
+    let known_mismatches = KNOWN_FAILURES
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !line.trim().starts_with('#'))
+        .count()
+        - known.len()
+        - skipped_known_mismatches;
     let active_ignored_runs = ignored_total - skipped_ignored_runs;
     let unsupported_check_count = unsupported_checks.values().sum::<usize>();
     eprintln!(
@@ -271,31 +449,68 @@ fn runs_pinned_noninteractive_wpt_layout_assertions() {
         eprintln!("unsupported WPT geometry assertions: {unsupported_checks:?}");
     }
     assert_eq!(tests.len(), 914, "the pinned WPT layout selection changed");
-    assert_eq!(skipped_replaced_element_files, 65, "the pinned replaced-element layout exclusion count changed");
-    assert_eq!(skipped_unsupported_files, 12, "the pinned unsupported-capability layout exclusion count changed");
-    assert!(assertion_count >= 16_400, "too few supported WPT layout assertions were exercised: {assertion_count}");
-    assert!(unsupported_check_count >= 15_500, "too few supported-document geometry assertions were audited: {unsupported_check_count}");
+    assert_eq!(
+        skipped_replaced_element_files, 65,
+        "the pinned replaced-element layout exclusion count changed"
+    );
+    assert_eq!(
+        skipped_unsupported_files, 12,
+        "the pinned unsupported-capability layout exclusion count changed"
+    );
+    assert!(
+        assertion_count >= 16_400,
+        "too few supported WPT layout assertions were exercised: {assertion_count}"
+    );
+    assert!(
+        unsupported_check_count >= 15_500,
+        "too few supported-document geometry assertions were audited: {unsupported_check_count}"
+    );
     let mut audit_failures = Vec::new();
     if !skipped_modes.is_empty() {
-        audit_failures.push(format!("listed quirks-mode WPT layout files were not skipped:\n{}", skipped_modes.keys().cloned().collect::<Vec<_>>().join("\n")));
+        audit_failures.push(format!(
+            "listed quirks-mode WPT layout files were not skipped:\n{}",
+            skipped_modes.keys().cloned().collect::<Vec<_>>().join("\n")
+        ));
     }
     if !unsupported_files.is_empty() {
-        audit_failures.push(format!("listed unsupported-capability WPT layout files were not skipped:\n{}", unsupported_files.keys().cloned().collect::<Vec<_>>().join("\n")));
+        audit_failures.push(format!(
+            "listed unsupported-capability WPT layout files were not skipped:\n{}",
+            unsupported_files
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
     }
     if !infrastructure_failures.is_empty() {
-        audit_failures.push(format!("WPT layout adapter failures:\n{}", infrastructure_failures.join("\n")));
+        audit_failures.push(format!(
+            "WPT layout adapter failures:\n{}",
+            infrastructure_failures.join("\n")
+        ));
     }
     if !unexpected.is_empty() {
-        audit_failures.push(format!("unexpected WPT layout mismatches:\n{}", unexpected.join("\n")));
+        audit_failures.push(format!(
+            "unexpected WPT layout mismatches:\n{}",
+            unexpected.join("\n")
+        ));
     }
     if !unexpected_passes.is_empty() {
-        audit_failures.push(format!("known WPT layout failures now pass and should be removed:\n{}", unexpected_passes.join("\n")));
+        audit_failures.push(format!(
+            "known WPT layout failures now pass and should be removed:\n{}",
+            unexpected_passes.join("\n")
+        ));
     }
     if !known.is_empty() {
-        audit_failures.push(format!("known WPT layout failures were not exercised:\n{}", known.into_iter().collect::<Vec<_>>().join("\n")));
+        audit_failures.push(format!(
+            "known WPT layout failures were not exercised:\n{}",
+            known.into_iter().collect::<Vec<_>>().join("\n")
+        ));
     }
     if !ignored.is_empty() {
-        audit_failures.push(format!("ignored WPT layout runs were not exercised:\n{}", ignored.into_iter().collect::<Vec<_>>().join("\n")));
+        audit_failures.push(format!(
+            "ignored WPT layout runs were not exercised:\n{}",
+            ignored.into_iter().collect::<Vec<_>>().join("\n")
+        ));
     }
     assert!(audit_failures.is_empty(), "{}", audit_failures.join("\n\n"));
 }
@@ -309,26 +524,54 @@ fn discard_file_entries(entries: &mut BTreeSet<String>, relative: &str) -> usize
 
 fn skipped_quirks_entries() -> BTreeMap<String, HtmlQuirksMode> {
     let mut entries = BTreeMap::new();
-    for line in SKIPPED_QUIRKS_FILES.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#')) {
-        let (entry, reason) = line.split_once("|reason=").expect("a skipped quirks layout file includes a reason");
-        assert!(!reason.trim().is_empty(), "a skipped quirks layout file includes a nonempty reason");
-        let (relative, mode) = entry.split_once("|mode=").expect("a skipped quirks layout file includes its expected mode");
+    for line in SKIPPED_QUIRKS_FILES
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+    {
+        let (entry, reason) = line
+            .split_once("|reason=")
+            .expect("a skipped quirks layout file includes a reason");
+        assert!(
+            !reason.trim().is_empty(),
+            "a skipped quirks layout file includes a nonempty reason"
+        );
+        let (relative, mode) = entry
+            .split_once("|mode=")
+            .expect("a skipped quirks layout file includes its expected mode");
         let mode = match mode {
             "quirks" => HtmlQuirksMode::Quirks,
             "limited-quirks" => HtmlQuirksMode::LimitedQuirks,
             _ => panic!("unknown skipped layout document mode: {mode}"),
         };
-        assert!(entries.insert(relative.to_owned(), mode).is_none(), "duplicate skipped quirks layout file: {relative}");
+        assert!(
+            entries.insert(relative.to_owned(), mode).is_none(),
+            "duplicate skipped quirks layout file: {relative}"
+        );
     }
     entries
 }
 
 fn skipped_unsupported_entries() -> BTreeMap<String, String> {
     let mut entries = BTreeMap::new();
-    for line in SKIPPED_UNSUPPORTED_FILES.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#')) {
-        let (relative, reason) = line.split_once("|reason=").expect("a skipped unsupported layout file includes a reason");
-        assert!(!reason.trim().is_empty(), "a skipped unsupported layout file includes a nonempty reason");
-        assert!(entries.insert(relative.to_owned(), reason.to_owned()).is_none(), "duplicate skipped unsupported layout file: {relative}");
+    for line in SKIPPED_UNSUPPORTED_FILES
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+    {
+        let (relative, reason) = line
+            .split_once("|reason=")
+            .expect("a skipped unsupported layout file includes a reason");
+        assert!(
+            !reason.trim().is_empty(),
+            "a skipped unsupported layout file includes a nonempty reason"
+        );
+        assert!(
+            entries
+                .insert(relative.to_owned(), reason.to_owned())
+                .is_none(),
+            "duplicate skipped unsupported layout file: {relative}"
+        );
     }
     entries
 }
@@ -338,7 +581,12 @@ fn unsupported_replaced_element_tags(document: &Document) -> Vec<String> {
         .node_ids()
         .filter_map(|node| document.element_ref(node))
         .map(|element| element.tag())
-        .filter(|tag| matches!(*tag, "audio" | "canvas" | "embed" | "iframe" | "img" | "input" | "object" | "video"))
+        .filter(|tag| {
+            matches!(
+                *tag,
+                "audio" | "canvas" | "embed" | "iframe" | "img" | "input" | "object" | "video"
+            )
+        })
         .map(str::to_owned)
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -350,13 +598,25 @@ fn unsupported_replaced_element_tags(document: &Document) -> Vec<String> {
 /// semantic: the layout input should match the DOM at `checkLayout()` time.
 fn prepare_noninteractive_source<'a>(relative: &str, source: &'a str) -> Cow<'a, str> {
     if relative == "css/css-sizing/percentage-height-replaced-content-in-auto-cb.html" {
-        return Cow::Owned(source.replacen("<img id=\"img\"", "<img id=\"img\" src=\"/css/support/60x60-green.png\"", 1));
+        return Cow::Owned(source.replacen(
+            "<img id=\"img\"",
+            "<img id=\"img\" src=\"/css/support/60x60-green.png\"",
+            1,
+        ));
     }
     Cow::Borrowed(source)
 }
 
-fn assertion_run_key(relative: &str, expectation: &LayoutExpectation, dimension: &str, expected: f64) -> String {
-    format!("{relative}|node={}|tag={}|{dimension}|expected={expected}", expectation.node_index, expectation.tag)
+fn assertion_run_key(
+    relative: &str,
+    expectation: &LayoutExpectation,
+    dimension: &str,
+    expected: f64,
+) -> String {
+    format!(
+        "{relative}|node={}|tag={}|{dimension}|expected={expected}",
+        expectation.node_index, expectation.tag
+    )
 }
 
 #[derive(Debug)]
@@ -369,23 +629,60 @@ struct LayoutExpectation {
     height: Option<f64>,
 }
 
-fn collect_expectations(relative: &str, document: &Document, failures: &mut Vec<String>, unsupported_checks: &mut BTreeMap<String, usize>) -> Vec<LayoutExpectation> {
+fn collect_expectations(
+    relative: &str,
+    document: &Document,
+    failures: &mut Vec<String>,
+    unsupported_checks: &mut BTreeMap<String, usize>,
+) -> Vec<LayoutExpectation> {
     let mut expectations = Vec::new();
     for node in document.node_ids() {
-        let Some(element) = document.element_ref(node) else { continue };
+        let Some(element) = document.element_ref(node) else {
+            continue;
+        };
         let mut width = None;
         let mut height = None;
         for attribute in element.attributes() {
             match attribute.name() {
-                "data-expected-width" => width = parse_expected(relative, node.index(), attribute.name(), attribute.value(), failures),
-                "data-expected-height" => height = parse_expected(relative, node.index(), attribute.name(), attribute.value(), failures),
-                name if is_known_unsupported_geometry_check(name) => *unsupported_checks.entry(name.to_owned()).or_default() += 1,
-                name if name.starts_with("data-expected-") || name.starts_with("data-offset-") => failures.push(format!("{relative}|node={}|unknown-check-layout-attribute={name}", node.index())),
+                "data-expected-width" => {
+                    width = parse_expected(
+                        relative,
+                        node.index(),
+                        attribute.name(),
+                        attribute.value(),
+                        failures,
+                    )
+                }
+                "data-expected-height" => {
+                    height = parse_expected(
+                        relative,
+                        node.index(),
+                        attribute.name(),
+                        attribute.value(),
+                        failures,
+                    )
+                }
+                name if is_known_unsupported_geometry_check(name) => {
+                    *unsupported_checks.entry(name.to_owned()).or_default() += 1
+                }
+                name if name.starts_with("data-expected-") || name.starts_with("data-offset-") => {
+                    failures.push(format!(
+                        "{relative}|node={}|unknown-check-layout-attribute={name}",
+                        node.index()
+                    ))
+                }
                 _ => {}
             }
         }
         if width.is_some() || height.is_some() {
-            expectations.push(LayoutExpectation { node_index: node.index(), tag: element.tag().to_owned(), class: element.attr("class").map(str::to_owned), style: element.attr("style").map(str::to_owned), width, height });
+            expectations.push(LayoutExpectation {
+                node_index: node.index(),
+                tag: element.tag().to_owned(),
+                class: element.attr("class").map(str::to_owned),
+                style: element.attr("style").map(str::to_owned),
+                width,
+                height,
+            });
         }
     }
     expectations
@@ -414,38 +711,71 @@ fn is_known_unsupported_geometry_check(name: &str) -> bool {
     )
 }
 
-fn parse_expected(relative: &str, node_index: usize, name: &str, value: &str, failures: &mut Vec<String>) -> Option<f64> {
+fn parse_expected(
+    relative: &str,
+    node_index: usize,
+    name: &str,
+    value: &str,
+    failures: &mut Vec<String>,
+) -> Option<f64> {
     match value.parse::<f64>() {
         Ok(value) if value.is_finite() => Some(value),
         Ok(_) | Err(_) => {
-            failures.push(format!("{relative}|node={node_index}|{name}=invalid({value:?})"));
+            failures.push(format!(
+                "{relative}|node={node_index}|{name}=invalid({value:?})"
+            ));
             None
         }
     }
 }
 
-fn reconcile_dimension(relative: &str, expectation: &LayoutExpectation, dimension: &str, actual: f64, expected: f64, known: &mut BTreeSet<String>, unexpected: &mut Vec<String>, unexpected_passes: &mut Vec<String>) {
+fn reconcile_dimension(
+    relative: &str,
+    expectation: &LayoutExpectation,
+    dimension: &str,
+    actual: f64,
+    expected: f64,
+    known: &mut BTreeSet<String>,
+    unexpected: &mut Vec<String>,
+    unexpected_passes: &mut Vec<String>,
+) {
     // This matches check-layout-th.js: values less than one CSS pixel apart
     // pass, while a difference of one pixel or more uses exact equality.
-    let prefix = format!("{relative}|node={}|tag={}|{dimension}|expected={expected}|", expectation.node_index, expectation.tag);
+    let prefix = format!(
+        "{relative}|node={}|tag={}|{dimension}|expected={expected}|",
+        expectation.node_index, expectation.tag
+    );
     if (actual - expected).abs() >= WPT_LAYOUT_TOLERANCE {
         let mismatch = format!("{prefix}actual={actual}");
         if !known.remove(&mismatch) {
             unexpected.push(mismatch);
         }
-    } else if let Some(stale) = known.iter().find(|entry| entry.starts_with(&prefix)).cloned() {
+    } else if let Some(stale) = known
+        .iter()
+        .find(|entry| entry.starts_with(&prefix))
+        .cloned()
+    {
         known.remove(&stale);
         unexpected_passes.push(stale);
     }
 }
 
 fn manifest_entries() -> Vec<String> {
-    let mut entries = LAYOUT_TESTS.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#')).map(str::to_owned).collect::<Vec<_>>();
+    let mut entries = LAYOUT_TESTS
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
     let mut sorted = entries.clone();
     sorted.sort();
     assert_eq!(entries, sorted, "WPT layout manifest must remain sorted");
     entries.dedup();
-    assert_eq!(entries.len(), sorted.len(), "WPT layout manifest contains duplicate paths");
+    assert_eq!(
+        entries.len(),
+        sorted.len(),
+        "WPT layout manifest contains duplicate paths"
+    );
     entries
 }
 
