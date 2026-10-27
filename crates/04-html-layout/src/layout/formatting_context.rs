@@ -35,6 +35,7 @@ pub(super) fn layout_flow_children(
                 amount: first_line_indent,
                 hanging: style.text_indent_hanging(),
                 each_line: style.text_indent_each_line(),
+                first_line: true,
             };
             layout_inline_range(
                 engine,
@@ -70,6 +71,7 @@ pub(super) fn layout_inline_box(
             amount: first_line_indent,
             hanging: false,
             each_line: false,
+            first_line: true,
         },
     )
 }
@@ -84,8 +86,12 @@ fn layout_inline_range(
     indent: ResolvedTextIndent,
 ) -> Size {
     let style = engine.reader.style(box_idx);
+    let indent = engine.reader.reader_text_indent(box_idx).map_or(indent, |amount| ResolvedTextIndent {
+        amount, hanging: false, each_line: false, first_line: true,
+    });
     let paragraph = ParagraphLayout {
         indent,
+        direction: style.direction(),
         text_align: style.text_align(),
         text_align_last: style.text_align_last(),
     };
@@ -93,6 +99,7 @@ fn layout_inline_range(
         engine,
         InlineFormattingInput {
             container_box_idx: box_idx,
+            starts_block: true,
             run_range,
             area: InlineLayoutArea {
                 origin: content_pos,

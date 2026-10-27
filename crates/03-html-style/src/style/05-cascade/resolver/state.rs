@@ -2,7 +2,6 @@
 /// `StyleStore` ultimately stores, bundled so resolution can mutate one value.
 /// Inherited groups (`font`, `text`) are cloned from the parent; reset groups
 /// start from their defaults.
-#[derive(Clone)]
 pub(super) struct WorkingStyle {
     pub(super) font: Font,
     pub(super) text: InheritedText,
@@ -14,6 +13,38 @@ pub(super) struct WorkingStyle {
     pub(super) line_height_spec: Option<CssLineHeight>,
     pub(super) generated_content: Option<GeneratedContent>,
     pub(super) counters: CounterDirectives,
+}
+
+impl Clone for WorkingStyle {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self {
+            font: self.font.clone(),
+            text: self.text.clone(),
+            box_model: self.box_model.clone(),
+            border: self.border.clone(),
+            radii: self.radii,
+            background: self.background.clone(),
+            layout: self.layout.clone(),
+            line_height_spec: self.line_height_spec.clone(),
+            generated_content: self.generated_content.clone(),
+            counters: self.counters.clone(),
+        }
+    }
+
+    #[inline]
+    fn clone_from(&mut self, source: &Self) {
+        self.font.clone_from(&source.font);
+        self.text.clone_from(&source.text);
+        self.box_model.clone_from(&source.box_model);
+        self.border.clone_from(&source.border);
+        self.radii = source.radii;
+        self.background.clone_from(&source.background);
+        self.layout.clone_from(&source.layout);
+        self.line_height_spec.clone_from(&source.line_height_spec);
+        self.generated_content.clone_from(&source.generated_content);
+        self.counters.clone_from(&source.counters);
+    }
 }
 
 pub(super) fn initial_box_model() -> BoxModel {

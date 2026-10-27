@@ -1,0 +1,11 @@
+Source: crates.io lightningcss 1.0.0-alpha.72
+Registry checksum: d31b760f96e8fdfe1d0c295e4bf76c503d6f15d2d470d53bd8cd1f7aa8c7d934
+
+Local production change: src/values/percentage.rs returns ParserError::InvalidValue
+when Calc parsing succeeds without producing a concrete percentage. This mirrors
+CSSNumber::parse and prevents mixed number/percentage math from panicking.
+
+Regression coverage: crates/03-html-style/tests/dependency_percentage.rs
+Remove the Cargo [patch.crates-io] override when an upstream release includes the fix.
+The source, Rust targets, manifest, license and upstream README are copied unchanged
+apart from the parser change above. Non-Rust tooling and website files are omitted.

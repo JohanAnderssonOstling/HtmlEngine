@@ -59,33 +59,33 @@ struct ResolvedIntrinsicWidths {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct ResolvedHorizontalMargins {
-    pub(crate) left: f64,
-    pub(crate) total: f64,
+pub struct ResolvedHorizontalMargins {
+    pub left: f64,
+    pub total: f64,
 }
 
 /// The geometry-independent subset of generic box sizing consumed by the
 /// table formatting context. Table code owns the interpretation of these
 /// values; generic box layout does not pre-resolve table-specific policy.
 #[derive(Clone, Copy)]
-pub(crate) struct ResolvedTableBoxSizing {
-    pub(crate) box_idx: usize,
-    pub(crate) available_width: f64,
-    pub(crate) auto_width_limit: Option<f64>,
-    pub(crate) parent_content_height: Option<f64>,
-    pub(crate) has_assigned_width: bool,
-    pub(crate) has_assigned_height: bool,
-    pub(crate) preferred_width: PreferredSize,
-    pub(crate) min_width: PreferredSize,
-    pub(crate) max_width: PreferredSize,
-    pub(crate) content_width: f64,
-    pub(crate) horizontal_margin_padding: f64,
-    pub(crate) horizontal_border: f64,
-    pub(crate) horizontal_border_box_inset: f64,
-    pub(crate) explicit_height: Option<f64>,
-    pub(crate) min_height: Option<f64>,
-    pub(crate) max_height: Option<f64>,
-    pub(crate) box_sizing: BoxSizing,
+pub struct ResolvedTableBoxSizing {
+    pub box_idx: usize,
+    pub available_width: f64,
+    pub auto_width_limit: Option<f64>,
+    pub parent_content_height: Option<f64>,
+    pub has_assigned_width: bool,
+    pub has_assigned_height: bool,
+    pub preferred_width: PreferredSize,
+    pub min_width: PreferredSize,
+    pub max_width: PreferredSize,
+    pub content_width: f64,
+    pub horizontal_margin_padding: f64,
+    pub horizontal_border: f64,
+    pub horizontal_border_box_inset: f64,
+    pub explicit_height: Option<f64>,
+    pub min_height: Option<f64>,
+    pub max_height: Option<f64>,
+    pub box_sizing: BoxSizing,
 }
 
 /// Geometry-independent used sizing for one box.
@@ -94,7 +94,7 @@ pub(crate) struct ResolvedTableBoxSizing {
 /// pass the same value to `layout_resolved_box`; sizing is never guessed or
 /// repeated by the parent.
 #[derive(Clone)]
-pub(crate) struct ResolvedBoxSizing {
+pub struct ResolvedBoxSizing {
     pub(super) request: BoxLayoutRequest,
     pub(super) layout_mode: LayoutMode,
     pub(super) box_model: ResolvedBoxModel,
@@ -111,19 +111,19 @@ pub(crate) struct ResolvedBoxSizing {
 }
 
 impl ResolvedBoxSizing {
-    pub(crate) fn box_idx(&self) -> usize {
+    pub fn box_idx(&self) -> usize {
         self.request.box_idx
     }
 
-    pub(crate) fn available_width(&self) -> f64 {
+    pub fn available_width(&self) -> f64 {
         self.request.available_width
     }
 
-    pub(crate) fn horizontal_margins(&self) -> ResolvedHorizontalMargins {
+    pub fn horizontal_margins(&self) -> ResolvedHorizontalMargins {
         self.horizontal_margins
     }
 
-    pub(crate) fn table_box_sizing(&self) -> ResolvedTableBoxSizing {
+    pub fn table_box_sizing(&self) -> ResolvedTableBoxSizing {
         ResolvedTableBoxSizing {
             box_idx: self.request.box_idx,
             available_width: self.request.available_width,
@@ -153,7 +153,7 @@ impl ResolvedBoxSizing {
         }
     }
 
-    pub(crate) fn with_first_line_indent(mut self, first_line_indent: f64) -> Self {
+    pub fn with_first_line_indent(mut self, first_line_indent: f64) -> Self {
         self.request.first_line_indent = first_line_indent;
         self
     }
@@ -222,9 +222,9 @@ pub(super) fn block_inline_alignment_offset(
         ItemAlignment::End | ItemAlignment::FlexEnd => end_offset(containing_direction),
         ItemAlignment::SelfStart | ItemAlignment::Baseline => start_offset(subject_direction),
         ItemAlignment::SelfEnd => end_offset(subject_direction),
-        ItemAlignment::Left => 0.0,
-        ItemAlignment::Right => free_space,
-        ItemAlignment::Center => free_space / 2.0,
+        ItemAlignment::Left | ItemAlignment::LegacyLeft => 0.0,
+        ItemAlignment::Right | ItemAlignment::LegacyRight => free_space,
+        ItemAlignment::Center | ItemAlignment::LegacyCenter => free_space / 2.0,
         ItemAlignment::Auto | ItemAlignment::Normal | ItemAlignment::Stretch => {
             return resolved.horizontal_margins.left;
         }
@@ -233,7 +233,7 @@ pub(super) fn block_inline_alignment_offset(
 }
 
 impl<'a, 'out> LayoutEngine<'a, 'out> {
-    pub(crate) fn resolve_box_sizing(&mut self, request: BoxLayoutRequest) -> ResolvedBoxSizing {
+    pub fn resolve_box_sizing(&mut self, request: BoxLayoutRequest) -> ResolvedBoxSizing {
         let timing_started = self.start_timing();
         let isolates_floats = self.reader.box_uses_float_context(request.box_idx);
         if isolates_floats {
@@ -402,6 +402,7 @@ fn resolve_box_model(
     style: UsedStyleView<'_>,
 ) -> ResolvedBoxModel {
     let mut box_model = ResolvedBoxModel::new(style, request.available_width);
+    (box_model.margin_top, box_model.margin_bottom) = engine.reader.vertical_margins(request.box_idx, request.available_width);
     let collapsed_table = (engine.reader.is_table_box(request.box_idx)
         || matches!(
             style.display(),

@@ -50,6 +50,29 @@ fn close(actual: f32, expected: f32) {
 }
 
 #[test]
+fn random_math_keeps_canonical_typography_coordinates() {
+    let source = "<style>body {font-size:20px;line-height:40px} #target {font-size:random(fixed 0.5,10px,30px);line-height:random(fixed 0.5,1lh,2lh)}</style><p id='target'>Text</p>";
+    for (desired, size, line) in [(16.0, 20.0, 60.0), (32.0, 40.0, 120.0)] {
+        let document = styled(source, desired, Some(16.0));
+        let view = document.style_view(style(&document, "target")).unwrap();
+        close(view.font.font_size, size);
+        close(view.text.line_height, line);
+    }
+}
+
+#[test]
+fn contextual_sign_products_keep_canonical_typography_coordinates() {
+    let source = "<style>body {font-size:20px;line-height:40px} #target {font-size:calc(sign(1rem - 20px) * 10px + 30px);line-height:calc(sign(1lh - 30px) * 10px + 20px)}</style><p id='target'>Text</p>";
+    for (desired, expected_size, expected_line) in [(16.0, 20.0, 30.0), (32.0, 40.0, 60.0)] {
+        let document = styled(source, desired, Some(16.0));
+        let indices = style(&document, "target");
+        let view = document.style_view(indices).unwrap();
+        close(view.font.font_size, expected_size);
+        close(view.text.line_height, expected_line);
+    }
+}
+
+#[test]
 fn fixed_and_nested_relative_sizes_preserve_publisher_proportions() {
     let source = r#"<!doctype html><html><body>
         <p id="regular">Regular</p>

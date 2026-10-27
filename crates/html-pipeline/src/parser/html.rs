@@ -1,28 +1,102 @@
 use encoding_rs::{Encoding, UTF_8};
 use html_dom::{Document, DomNodeId, ImageSource, NodeRef, RootFontSize};
-use html_layout::PreparedDocument;
-use html_parse::{ParsedHtml, StylesheetReference};
+use crate::engine::{FormattingDocument, PreparedDocument};
+use html_style_model::ComputedStyles;
+#[cfg(feature = "profiling")]
+use crate::engine::profiling::scope;
+use html_parse::{ParsedHtml, StylesheetReference, style_type_is_css};
 use html_resources::{ResourceMetadata, ResourceProvider};
-use html_style::StylesheetEntry;
+use html_style::{FontFace, StylesheetEntry, resolve_font_face_urls};
 use std::collections::{HashMap, HashSet};
+use std::mem::take;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 pub use html_parse::parse_html_document;
+
+/// Optional wall-clock telemetry for document preparation. Style substage
+/// timings are inclusive; they must not be added to `style` again.
+#[derive(Clone, Debug, Default)]
+pub struct PreparationTimings {
+    pub dom: Duration,
+    pub stylesheets: Duration,
+    pub style: Duration,
+    /// Total preparation, including formatting and logical text.
+    pub prepare: Duration,
+    /// Formatting structure construction before normalization.
+    pub formatting: Duration,
+    /// Logical text preparation and immutable paint bindings.
+    pub text: Duration,
+    pub style_details: html_style::StyleTimings,
+}
 
 pub struct DocumentFactory {
     root_font_size: RootFontSize,
     media_environment: html_style::MediaEnvironment,
     title: Option<String>,
-    resources: Option<ResourceContext>,
     stylesheet_cache: Option<BookStylesheetCache>,
     style_program_cache: html_style::StyleProgramCache,
-    reader_overrides: html_layout::ReaderStyleOverrides,
-    note_flow: html_layout::NoteFlow,
+    reader_overrides: crate::engine::ReaderStyleOverrides,
+    note_flow: crate::engine::NoteFlow,
+    font_faces: Vec<FontFace>,
 }
 
-struct ResourceContext {
-    provider: Arc<dyn ResourceProvider>,
-    base_uri: String,
+/// Borrowed resources for one preparation operation. The provider and base
+/// URI remain owned by the session or host that invokes the factory.
+#[derive(Clone, Copy)]
+pub struct ResourceContext<'a> {
+    provider: &'a dyn ResourceProvider,
+    base_uri: &'a str,
+}
+
+impl<'a> ResourceContext<'a> {
+    pub fn new(provider: &'a dyn ResourceProvider, base_uri: &'a str) -> Self {
+        Self { provider, base_uri }
+    }
+}
+
+/// A preparation view that borrows a factory and the current resource context.
+/// It stores no resource ownership in the factory between operations.
+pub struct ResourceDocumentFactory<'a> {
+    factory: &'a mut DocumentFactory,
+    resources: ResourceContext<'a>,
+}
+
+impl ResourceDocumentFactory<'_> {
+    pub fn parse_to_dom(&mut self, source: &str) -> Document {
+        let parsed = parse_html_document(source);
+        let title = parsed.title();
+        self.factory.configure_dom(parsed.into_dom(), title, Some(self.resources)).0
+    }
+
+    pub fn parse_with_new_pipeline(&mut self, source: &str, css: Option<&str>) -> PreparedDocument<'static> {
+        match css {
+            Some(css) => self.parse_with_new_pipeline_css_chunks(source, &[css]),
+            None => self.parse_with_new_pipeline_css_chunks(source, &[]),
+        }
+    }
+
+    pub fn parse_with_new_pipeline_css_chunks(&mut self, source: &str, css: &[&str]) -> PreparedDocument<'static> {
+        self.build_pipeline_from_owned_parsed(parse_html_document(source), css).0
+    }
+
+    pub fn build_pipeline_from_parsed(&mut self, parsed: &ParsedHtml, css: &[&str]) -> PreparedDocument<'static> {
+        self.factory.build_pipeline_from_parsed_impl(parsed, css, Some(self.resources)).0
+    }
+
+    pub fn build_pipeline_from_parsed_with_timings(&mut self, parsed: &ParsedHtml, css: &[&str]) -> (PreparedDocument<'static>, PreparationTimings) {
+        let mut timings = PreparationTimings::default();
+        let (prepared, _) = self.factory.build_pipeline_from_parsed_instrumented(parsed, css, Some(&mut timings), Some(self.resources));
+        (prepared, timings)
+    }
+
+    pub(crate) fn build_pipeline_from_owned_parsed(&mut self, parsed: ParsedHtml, css: &[&str]) -> (PreparedDocument<'static>, html_style::MediaQuerySet) {
+        self.factory.build_pipeline_from_owned_parsed(parsed, css, Some(self.resources))
+    }
+
+    pub(crate) fn resolve_canonical_dom(&mut self, document: &Document, encoding: Option<&str>, css: &[&str]) -> (ComputedStyles, html_style::MediaQuerySet) {
+        self.factory.resolve_canonical_dom(document, encoding, css, Some(self.resources))
+    }
 }
 
 struct ExpandedStylesheet {
@@ -86,11 +160,22 @@ impl Default for DocumentFactory {
 
 impl DocumentFactory {
     pub fn new() -> Self {
-        Self { root_font_size: RootFontSize::default(), media_environment: html_style::MediaEnvironment::default(), title: None, resources: None, stylesheet_cache: None, style_program_cache: html_style::StyleProgramCache::default(), reader_overrides: Default::default(), note_flow: Default::default() }
+        Self { root_font_size: RootFontSize::default(), media_environment: html_style::MediaEnvironment::default(), title: None, stylesheet_cache: None, style_program_cache: html_style::StyleProgramCache::default(), reader_overrides: Default::default(), note_flow: Default::default(), font_faces: Vec::new() }
     }
 
-    pub fn set_resource_context(&mut self, provider: Arc<dyn ResourceProvider>, base_uri: impl Into<String>) {
-        self.resources = Some(ResourceContext { provider, base_uri: base_uri.into() });
+    /// Active font declarations from the most recent preparation. Font bytes
+    /// are left to the host; URLs are resolved through the resource provider.
+    pub fn font_faces(&self) -> &[FontFace] {
+        &self.font_faces
+    }
+
+    /// Transfer prepared declarations to the session that publishes them.
+    pub(crate) fn take_font_faces(&mut self) -> Vec<FontFace> {
+        take(&mut self.font_faces)
+    }
+
+    pub fn with_resources<'a>(&'a mut self, resources: ResourceContext<'a>) -> ResourceDocumentFactory<'a> {
+        ResourceDocumentFactory { factory: self, resources }
     }
 
     pub fn set_book_stylesheet_cache(&mut self, cache: BookStylesheetCache) {
@@ -116,11 +201,11 @@ impl DocumentFactory {
         self.media_environment = media_environment;
     }
 
-    pub fn set_note_flow(&mut self, note_flow: html_layout::NoteFlow) {
+    pub fn set_note_flow(&mut self, note_flow: crate::engine::NoteFlow) {
         self.note_flow = note_flow;
     }
 
-    pub fn set_reader_overrides(&mut self, overrides: html_layout::ReaderStyleOverrides) {
+    pub fn set_reader_overrides(&mut self, overrides: crate::engine::ReaderStyleOverrides) {
         self.reader_overrides = overrides;
     }
 
@@ -130,50 +215,132 @@ impl DocumentFactory {
 
     pub fn parse_to_dom(&mut self, html: &str) -> Document {
         let parsed = parse_html_document(html);
-        self.configured_dom(&parsed)
+        let title = parsed.title();
+        self.configure_dom(parsed.into_dom(), title, None).0
     }
 
-    pub fn parse_with_new_pipeline(&mut self, html: &str, css: Option<&str>) -> PreparedDocument {
+    pub fn parse_with_new_pipeline(&mut self, html: &str, css: Option<&str>) -> PreparedDocument<'static> {
         match css {
             Some(css) => self.parse_with_new_pipeline_css_chunks(html, &[css]),
             None => self.parse_with_new_pipeline_css_chunks(html, &[]),
         }
     }
 
-    pub fn parse_with_new_pipeline_css_chunks(&mut self, html: &str, css_chunks: &[&str]) -> PreparedDocument {
+    pub fn parse_with_new_pipeline_css_chunks(&mut self, html: &str, css_chunks: &[&str]) -> PreparedDocument<'static> {
         let parsed_html = parse_html_document(html);
-        self.build_pipeline_from_parsed_impl(&parsed_html, css_chunks).0
+        self.build_pipeline_from_owned_parsed(parsed_html, css_chunks, None).0
     }
 
-    pub fn build_pipeline_from_parsed(&mut self, parsed_html: &ParsedHtml, css_chunks: &[&str]) -> PreparedDocument {
-        self.build_pipeline_from_parsed_impl(parsed_html, css_chunks).0
+    pub fn build_pipeline_from_parsed(&mut self, parsed_html: &ParsedHtml, css_chunks: &[&str]) -> PreparedDocument<'static> {
+        self.build_pipeline_from_parsed_impl(parsed_html, css_chunks, None).0
     }
 
-    pub(crate) fn build_pipeline_from_parsed_with_media_queries(&mut self, parsed_html: &ParsedHtml, css_chunks: &[&str]) -> (PreparedDocument, html_style::MediaQuerySet) {
-        self.build_pipeline_from_parsed_impl(parsed_html, css_chunks)
+    pub fn build_pipeline_from_parsed_with_timings(&mut self, parsed_html: &ParsedHtml, css_chunks: &[&str]) -> (PreparedDocument<'static>, PreparationTimings) {
+        let mut timings = PreparationTimings::default();
+        let (prepared, _) = self.build_pipeline_from_parsed_instrumented(parsed_html, css_chunks, Some(&mut timings), None);
+        (prepared, timings)
     }
 
-    fn build_pipeline_from_parsed_impl(&mut self, parsed_html: &ParsedHtml, css_chunks: &[&str]) -> (PreparedDocument, html_style::MediaQuerySet) {
-        let (mut document, base_uri) = self.configured_dom_and_base(parsed_html);
-        document.rebuild_document_toc_entries();
+    fn build_pipeline_from_parsed_impl(&mut self, parsed_html: &ParsedHtml, css_chunks: &[&str], resources: Option<ResourceContext<'_>>) -> (PreparedDocument<'static>, html_style::MediaQuerySet) {
+        self.build_pipeline_from_parsed_instrumented(parsed_html, css_chunks, None, resources)
+    }
+
+    fn build_pipeline_from_parsed_instrumented(&mut self, parsed_html: &ParsedHtml, css_chunks: &[&str], mut timings: Option<&mut PreparationTimings>, resources: Option<ResourceContext<'_>>) -> (PreparedDocument<'static>, html_style::MediaQuerySet) {
+        #[cfg(feature = "profiling")]
+        let dom_scope = scope("factory.dom");
+        let started = timings.as_ref().map(|_| Instant::now());
+        let (document, base_uri) = self.configured_dom_and_base(parsed_html, resources);
+        #[cfg(feature = "profiling")]
+        drop(dom_scope);
+        if let Some(timings) = timings.as_deref_mut() {
+            timings.dom = started.expect("timed preparation").elapsed();
+        }
+        self.build_pipeline_from_dom_instrumented(document, base_uri, parsed_html.source_encoding(), css_chunks, timings, resources)
+    }
+
+    pub(crate) fn build_pipeline_from_owned_parsed(&mut self, parsed: ParsedHtml, css_chunks: &[&str], resources: Option<ResourceContext<'_>>) -> (PreparedDocument<'static>, html_style::MediaQuerySet) {
+        let title = parsed.title();
+        let encoding = parsed.source_encoding().map(str::to_owned);
+        let (document, base_uri) = self.configure_dom(parsed.into_dom(), title, resources);
+        self.build_pipeline_from_dom_instrumented(document, base_uri, encoding.as_deref(), css_chunks, None, resources)
+    }
+
+    fn build_pipeline_from_dom_instrumented(&mut self, document: Document, base_uri: String, document_encoding: Option<&str>, css_chunks: &[&str], mut timings: Option<&mut PreparationTimings>, resources: Option<ResourceContext<'_>>) -> (PreparedDocument<'static>, html_style::MediaQuerySet) {
+        let started = timings.as_ref().map(|_| Instant::now());
+        #[cfg(feature = "profiling")]
+        let stylesheets_scope = scope("factory.stylesheets");
+        let expanded_css = self.expanded_document_stylesheets(&document, &base_uri, document_encoding, css_chunks, resources);
+        let all_css = expanded_css.iter().map(|stylesheet| html_style::AuthorStylesheetInput { css: stylesheet.css.as_str(), implicit_scope_root: stylesheet.implicit_scope_root }).collect::<Vec<_>>();
+        #[cfg(feature = "profiling")]
+        drop(stylesheets_scope);
+        if let Some(timings) = timings.as_deref_mut() {
+            timings.stylesheets = started.expect("timed preparation").elapsed();
+        }
+        let started = timings.as_ref().map(|_| Instant::now());
+        #[cfg(feature = "profiling")]
+        let style_scope = scope("factory.style");
+        let (styled, style_details, media_queries) = if let Some(cache) = &self.stylesheet_cache {
+            let root_font_size = document.root_font_size();
+            let (program, compilation) = cache.programs.lock().expect("style program cache lock").get_or_compile(&all_css, self.media_environment, root_font_size);
+            let (styled, mut details, queries) = html_style::style_document_with_program_and_reader_overrides(document, &program, &all_css, &self.reader_overrides);
+            details.parse_default_css = compilation.parse_default_css;
+            details.parse_author_css = compilation.parse_author_css;
+            details.prepare_rules = compilation.prepare_rules;
+            details.selector_index = compilation.selector_index;
+            (styled, details, queries)
+        } else {
+            html_style::style_document_with_cached_program_and_reader_overrides(&mut self.style_program_cache, document, &all_css, self.media_environment, &self.reader_overrides)
+        };
+        #[cfg(feature = "profiling")]
+        drop(style_scope);
+        if let Some(timings) = timings.as_deref_mut() {
+            timings.style = started.expect("timed preparation").elapsed();
+            timings.style_details = style_details;
+        }
+        let started = timings.as_ref().map(|_| Instant::now());
+        let font_faces = styled.font_faces().to_vec();
+        let (document, styles) = styled.into_parts();
+        let language = resources.as_ref().and_then(|resources| resources.provider.primary_language());
+        let styles = styles.with_hyphenation_fallback_language(language.as_deref());
+        #[cfg(feature = "profiling")]
+        let prepare_scope = scope("prepare.total");
+        let formatting = FormattingDocument::try_new_with_note_flow(document, styles, self.note_flow)
+            .expect("style resolver must produce complete styles for its document");
+        if let Some(timings) = timings.as_deref_mut() {
+            timings.formatting = started.expect("timed formatting construction").elapsed();
+        }
+        let text_started = timings.as_ref().map(|_| Instant::now());
+        let prepared = formatting.prepare_text();
+        if let Some(timings) = timings.as_deref_mut() {
+            timings.text = text_started.expect("timed logical-text preparation").elapsed();
+        }
+        #[cfg(feature = "profiling")]
+        drop(prepare_scope);
+        self.font_faces = font_faces;
+        if let Some(timings) = timings {
+            timings.prepare = started.expect("timed preparation").elapsed();
+        }
+        (prepared, media_queries)
+    }
+
+    fn expanded_document_stylesheets(&self, document: &Document, base_uri: &str, document_encoding: Option<&str>, css_chunks: &[&str], resources: Option<ResourceContext<'_>>) -> Vec<ExpandedStylesheet> {
         let mut expanded_css = Vec::new();
-        let document_encoding = parsed_html.source_encoding();
-        for (stylesheet, implicit_scope_root) in document_stylesheets(&document) {
+        for (stylesheet, implicit_scope_root) in document_stylesheets(document) {
             match stylesheet {
-                StylesheetReference::Inline(css) => self.expand_stylesheet(&css, &base_uri, None, document_encoding, implicit_scope_root, &mut HashSet::new(), 0, &mut expanded_css),
+                StylesheetReference::Inline(css) => self.expand_stylesheet(&css, base_uri, None, document_encoding, implicit_scope_root, &mut HashSet::new(), 0, &mut expanded_css, resources),
                 StylesheetReference::External(href) => {
-                    if let Some(resources) = self.resources.as_ref() {
-                        let uri = resources.provider.resolve(&base_uri, &href);
-                        if let Ok(css) = self.read_stylesheet(resources.provider.as_ref(), &uri, document_encoding) {
-                            self.expand_stylesheet(&css, &uri, Some(&uri), document_encoding, implicit_scope_root, &mut HashSet::new(), 0, &mut expanded_css);
+                    if let Some(resources) = resources.as_ref() {
+                        let uri = resources.provider.resolve(base_uri, &href);
+                        if let Ok(css) = self.read_stylesheet(resources.provider, &uri, document_encoding) {
+                            self.expand_stylesheet(&css, &uri, Some(&uri), document_encoding, implicit_scope_root, &mut HashSet::new(), 0, &mut expanded_css, Some(*resources));
                         }
                     }
                 }
                 StylesheetReference::ExternalWithCharset { href, charset } => {
-                    if let Some(resources) = self.resources.as_ref() {
-                        let uri = resources.provider.resolve(&base_uri, &href);
-                        if let Ok(css) = self.read_stylesheet(resources.provider.as_ref(), &uri, Some(&charset)) {
-                            self.expand_stylesheet(&css, &uri, Some(&uri), Some(&charset), implicit_scope_root, &mut HashSet::new(), 0, &mut expanded_css);
+                    if let Some(resources) = resources.as_ref() {
+                        let uri = resources.provider.resolve(base_uri, &href);
+                        if let Ok(css) = self.read_stylesheet(resources.provider, &uri, Some(&charset)) {
+                            self.expand_stylesheet(&css, &uri, Some(&uri), Some(&charset), implicit_scope_root, &mut HashSet::new(), 0, &mut expanded_css, Some(*resources));
                         }
                     }
                 }
@@ -183,34 +350,35 @@ impl DocumentFactory {
         // after every publication sheet so equal-specificity declarations win
         // as promised by PipelineInputs::user_styles.
         for css in css_chunks {
-            self.expand_stylesheet(css, &base_uri, None, document_encoding, document.dom_root(), &mut HashSet::new(), 0, &mut expanded_css);
+            self.expand_stylesheet(css, base_uri, None, document_encoding, document.dom_root(), &mut HashSet::new(), 0, &mut expanded_css, resources);
         }
-        let all_css = expanded_css.iter().map(|stylesheet| html_style::AuthorStylesheetInput { css: stylesheet.css.as_str(), implicit_scope_root: stylesheet.implicit_scope_root }).collect::<Vec<_>>();
-        let (styled, media_queries) = if let Some(cache) = &self.stylesheet_cache {
-            let root_font_size = document.root_font_size();
-            let (program, _) = cache.programs.lock().expect("style program cache lock").get_or_compile(&all_css, self.media_environment, root_font_size);
-            let (styled, _, media_queries) = html_style::style_document_with_program_and_reader_overrides(document, &program, &all_css, &self.reader_overrides);
-            (styled, media_queries)
+        expanded_css
+    }
+
+    pub(crate) fn resolve_canonical_dom(&mut self, document: &Document, document_encoding: Option<&str>, css_chunks: &[&str], resources: Option<ResourceContext<'_>>) -> (ComputedStyles, html_style::MediaQuerySet) {
+        let base_uri = resources.as_ref().map_or_else(String::new, |resources| effective_document_base_uri(document, resources));
+        let expanded = self.expanded_document_stylesheets(document, &base_uri, document_encoding, css_chunks, resources);
+        let inputs: Vec<_> = expanded.iter().map(|sheet| html_style::AuthorStylesheetInput { css: &sheet.css, implicit_scope_root: sheet.implicit_scope_root }).collect();
+        let (program, timings) = if let Some(cache) = &self.stylesheet_cache {
+            cache.programs.lock().expect("stylesheet cache lock").get_or_compile(&inputs, self.media_environment, document.root_font_size())
         } else {
-            let (styled, _, media_queries) = html_style::style_document_with_cached_program_and_reader_overrides(&mut self.style_program_cache, document, &all_css, self.media_environment, &self.reader_overrides);
-            (styled, media_queries)
+            self.style_program_cache.get_or_compile(&inputs, self.media_environment, document.root_font_size())
         };
-        let (document, styles) = styled.into_parts();
-        let prepared = PreparedDocument::try_new_with_note_flow(document, styles, self.note_flow).expect("style resolver must produce complete styles for its document");
-        (prepared, media_queries)
+        let (styles, _, queries) = html_style::resolve_document_with_program(document, &program, &inputs, timings, &self.reader_overrides);
+        self.font_faces = program.font_faces().to_vec();
+        let language = resources.as_ref().and_then(|resources| resources.provider.primary_language());
+        (styles.with_hyphenation_fallback_language(language.as_deref()), queries)
     }
 
-    fn configured_dom(&self, parsed: &ParsedHtml) -> Document {
-        self.configured_dom_and_base(parsed).0
+    fn configured_dom_and_base(&self, parsed: &ParsedHtml, resources: Option<ResourceContext<'_>>) -> (Document, String) {
+        self.configure_dom(parsed.build_dom(), parsed.title(), resources)
     }
 
-    fn configured_dom_and_base(&self, parsed: &ParsedHtml) -> (Document, String) {
-        let metadata = parsed.head_metadata();
-        let mut document = parsed.build_dom();
+    fn configure_dom(&self, mut document: Document, title: Option<String>, resources: Option<ResourceContext<'_>>) -> (Document, String) {
         document.set_root_font_size(self.root_font_size);
-        document.set_title(self.title.clone().or(metadata.title));
-        let base_uri = self.resources.as_ref().map_or_else(String::new, |resources| effective_document_base_uri(&document, resources));
-        if let Some(resources) = self.resources.as_ref() {
+        document.set_title(self.title.clone().or(title));
+        let base_uri = resources.as_ref().map_or_else(String::new, |resources| effective_document_base_uri(&document, resources));
+        if let Some(resources) = resources.as_ref() {
             for image in document.images_mut() {
                 match &mut image.source {
                     ImageSource::Uri(uri) => *uri = resources.provider.resolve(&base_uri, uri),
@@ -223,7 +391,7 @@ impl DocumentFactory {
     }
 
     fn expand_stylesheet(
-        &self, css: &str, base_uri: &str, source_uri: Option<&str>, fallback_label: Option<&str>, implicit_scope_root: Option<DomNodeId>, active_imports: &mut HashSet<String>, depth: usize, output: &mut Vec<ExpandedStylesheet>,
+        &self, css: &str, base_uri: &str, source_uri: Option<&str>, fallback_label: Option<&str>, implicit_scope_root: Option<DomNodeId>, active_imports: &mut HashSet<String>, depth: usize, output: &mut Vec<ExpandedStylesheet>, resources: Option<ResourceContext<'_>>,
     ) {
         const MAX_IMPORT_DEPTH: usize = 32;
         if depth > MAX_IMPORT_DEPTH {
@@ -237,17 +405,26 @@ impl DocumentFactory {
 
         for entry in html_style::stylesheet_entries(css) {
             match entry {
-                StylesheetEntry::Css(css) if !css.trim().is_empty() => output.push(ExpandedStylesheet { css, implicit_scope_root }),
+                StylesheetEntry::Css(css) if !css.trim().is_empty() => {
+                    // Resolve before imports are flattened: each imported sheet
+                    // owns its font URL base, independent of the document base.
+                    let css = if let Some(resources) = &resources {
+                        resolve_font_face_urls(&css, |url| resources.provider.resolve(base_uri, url)).into_owned()
+                    } else {
+                        css
+                    };
+                    output.push(ExpandedStylesheet { css, implicit_scope_root });
+                }
                 StylesheetEntry::Css(_) => {}
                 StylesheetEntry::Import(import) => {
-                    let Some(resources) = self.resources.as_ref() else { continue };
+                    let Some(resources) = resources.as_ref() else { continue };
                     let uri = resources.provider.resolve(base_uri, &import.url);
                     if active_imports.contains(&uri) {
                         continue;
                     }
-                    let Ok(imported_css) = self.read_stylesheet(resources.provider.as_ref(), &uri, fallback_label) else { continue };
+                    let Ok(imported_css) = self.read_stylesheet(resources.provider, &uri, fallback_label) else { continue };
                     let mut imported_output = Vec::new();
-                    self.expand_stylesheet(&imported_css, &uri, Some(&uri), fallback_label, implicit_scope_root, active_imports, depth + 1, &mut imported_output);
+                    self.expand_stylesheet(&imported_css, &uri, Some(&uri), fallback_label, implicit_scope_root, active_imports, depth + 1, &mut imported_output, Some(*resources));
                     if !imported_output.is_empty() {
                         let imported_css = imported_output.iter().map(|stylesheet| stylesheet.css.as_str()).collect::<Vec<_>>().join(" ");
                         output.push(ExpandedStylesheet { css: import.wrap_resolved_css(&imported_css), implicit_scope_root });
@@ -297,39 +474,19 @@ fn document_stylesheets(document: &Document) -> Vec<(StylesheetReference, Option
             if !css.trim().is_empty() {
                 stylesheets.push((StylesheetReference::Inline(css), implicit_scope_root));
             }
-        } else if element.tag().eq_ignore_ascii_case("link") && link_is_active_stylesheet(element.attr("rel")) && link_type_is_css(element.attr("type")) {
-            let Some(href) = element.attr("href").map(str::trim).filter(|href| !href.is_empty()).map(str::to_owned) else { continue };
-            let stylesheet = match element.attr("charset").map(str::trim).filter(|charset| !charset.is_empty()) {
-                Some(charset) => StylesheetReference::ExternalWithCharset { href, charset: charset.to_owned() },
-                None => StylesheetReference::External(href),
-            };
+        } else if element.tag().eq_ignore_ascii_case("link")
+            && let Some(stylesheet) = StylesheetReference::from_link(
+                element.attr("rel"), element.attr("type"),
+                element.attr("href"), element.attr("charset"),
+            )
+        {
             stylesheets.push((stylesheet, implicit_scope_root));
         }
     }
     stylesheets
 }
 
-fn link_is_active_stylesheet(rel: Option<&str>) -> bool {
-    let Some(rel) = rel else { return false };
-    let mut stylesheet = false;
-    for token in rel.split_ascii_whitespace() {
-        if token.eq_ignore_ascii_case("alternate") {
-            return false;
-        }
-        stylesheet |= token.eq_ignore_ascii_case("stylesheet");
-    }
-    stylesheet
-}
-
-fn link_type_is_css(media_type: Option<&str>) -> bool {
-    media_type.map(|media_type| media_type.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case("text/css")).unwrap_or(true)
-}
-
-fn style_type_is_css(media_type: Option<&str>) -> bool {
-    media_type.map(|media_type| media_type.trim().is_empty() || media_type.trim().eq_ignore_ascii_case("text/css")).unwrap_or(true)
-}
-
-fn effective_document_base_uri(document: &Document, resources: &ResourceContext) -> String {
+fn effective_document_base_uri(document: &Document, resources: &ResourceContext<'_>) -> String {
     const HTML_NAMESPACE: &str = "http://www.w3.org/1999/xhtml";
     let Some(href) = document
         .node_ids()
@@ -337,13 +494,13 @@ fn effective_document_base_uri(document: &Document, resources: &ResourceContext)
         .find(|element| element.namespace() == Some(HTML_NAMESPACE) && element.tag().eq_ignore_ascii_case("base") && element.attr("href").is_some())
         .and_then(|element| element.attr("href"))
     else {
-        return resources.base_uri.clone();
+        return resources.base_uri.to_owned();
     };
     let path = href.split(['?', '#']).next().unwrap_or(href);
     if path.is_empty() {
-        return resources.base_uri.clone();
+        return resources.base_uri.to_owned();
     }
-    let mut resolved = resources.provider.resolve(&resources.base_uri, href);
+    let mut resolved = resources.provider.resolve(resources.base_uri, href);
     if path.ends_with('/') && !resolved.ends_with('/') {
         resolved.push('/');
     }
@@ -376,12 +533,28 @@ fn css_charset_label(bytes: &[u8]) -> Option<&[u8]> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BookStylesheetCache, DocumentFactory, decode_stylesheet_bytes};
+    use super::{BookStylesheetCache, DocumentFactory, ResourceContext, decode_stylesheet_bytes, parse_html_document};
     use html_dom::{Document, ElementRef, NodeRef};
     use html_resources::ResourceProvider;
     use std::collections::HashMap;
     use std::io;
     use std::sync::Arc;
+
+    #[test]
+    fn resource_context_is_borrowed_for_one_operation() {
+        let mut factory = DocumentFactory::new();
+        let prepared = {
+            let provider = MemoryProvider { resources: HashMap::from([("book/book.css".to_owned(), b"#target {color:red}".to_vec())]) };
+            let base = String::from("book/index.html");
+            factory.with_resources(ResourceContext::new(&provider, &base))
+                .parse_with_new_pipeline("<link rel='stylesheet' href='book.css'><p id='target'>Text</p>", None)
+        };
+        let target = (0..prepared.box_count()).find(|&index| prepared.get_id(index) == Some("target")).unwrap();
+        assert_eq!(prepared.box_text_color(target), Some(0xff0000ff));
+        let without_context = factory.parse_with_new_pipeline("<link rel='stylesheet' href='book.css'><p id='target'>Text</p>", None);
+        let target = (0..without_context.box_count()).find(|&index| without_context.get_id(index) == Some("target")).unwrap();
+        assert_ne!(without_context.box_text_color(target), Some(0xff0000ff));
+    }
 
     struct MemoryProvider {
         resources: HashMap<String, Vec<u8>>,
@@ -407,6 +580,57 @@ mod tests {
     }
 
     #[test]
+    fn title_queries_preserve_factory_overrides_with_and_without_resources() {
+        let source = "<head><style>p { color: blue }</style><title> Book title </title></head><body>Text</body>";
+        let parsed = parse_html_document(source);
+        let provider = MemoryProvider { resources: HashMap::new() };
+        let mut factory = DocumentFactory::new();
+        for title in [None, Some("Reader title".to_owned())] {
+            factory.set_title(title.clone());
+            let expected = title.as_deref().unwrap_or("Book title");
+            assert_eq!(factory.parse_to_dom(source).title(), Some(expected));
+            assert_eq!(factory.configured_dom_and_base(&parsed, None).0.title(), Some(expected));
+            let document = factory.with_resources(ResourceContext::new(&provider, "chapter.html"))
+                .parse_to_dom(source);
+            assert_eq!(document.title(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn font_faces_resolve_against_each_declaring_stylesheet() {
+        use html_style::FontFaceSource;
+
+        let provider = Arc::new(MemoryProvider { resources: HashMap::from([
+            ("OPS/book/styles/main.css".into(), br#"
+                @import "nested/extra.css" layer(fonts) supports(display: block) screen;
+                @font-face { font-family: Linked; src: url("main.woff2") format(woff2); }
+            "#.to_vec()),
+            ("OPS/book/styles/nested/extra.css".into(), br#"
+                @font-face { font-family: Imported; src: local("Installed"), url("extra.ttf"); }
+            "#.to_vec()),
+        ]) });
+        let mut factory = DocumentFactory::new();
+        let factory_resources = ResourceContext::new(provider.as_ref(), ("OPS/chapter.xhtml").as_ref());
+        let html = r#"<html><head>
+            <base href="book/">
+            <link rel="stylesheet" href="styles/main.css">
+            <style>@font-face { font-family: Inline; src: url("inline.ttf"); }</style>
+        </head><body><p>Hello</p></body></html>"#;
+        factory.with_resources(factory_resources).parse_with_new_pipeline(html, Some("@font-face { font-family: User; src: url(user.ttf) }"));
+        let faces = factory.font_faces();
+        assert_eq!(faces.iter().map(|face| face.family.as_str()).collect::<Vec<_>>(), ["Imported", "Linked", "Inline", "User"]);
+        let urls = faces.iter().map(|face| face.sources.iter().find_map(|source| match source {
+            FontFaceSource::Url { url, .. } => Some(url.as_str()),
+            FontFaceSource::Local(_) => None,
+        }).expect("URL source")).collect::<Vec<_>>();
+        assert_eq!(urls, ["OPS/book/styles/nested/extra.ttf", "OPS/book/styles/main.woff2", "OPS/book/inline.ttf", "OPS/book/user.ttf"]);
+
+        // A second chapter must not retain the first chapter's declarations.
+        factory.with_resources(factory_resources).parse_with_new_pipeline("<html><body>No fonts</body></html>", None);
+        assert!(factory.font_faces().is_empty());
+    }
+
+    #[test]
     fn keeps_whitespace_only_text_nodes_in_inline_content() {
         let html = "<html><body><span>a</span> <span>b</span></body></html>";
         let mut factory = DocumentFactory::new();
@@ -420,6 +644,36 @@ mod tests {
         let middle_text = document.text_ref(children[1]).expect("expected whitespace text node");
 
         assert_eq!(middle_text.text(), " ");
+    }
+
+    #[test]
+    fn preparation_timings_preserve_styles_and_report_shared_cache_compilation() {
+        let parsed = parse_html_document("<html><body><p>text</p></body></html>");
+        let cache = BookStylesheetCache::default();
+        let css = ["p { color: red; margin: 1em }"];
+        let mut reference_factory = DocumentFactory::new();
+        let reference = reference_factory.build_pipeline_from_parsed(&parsed, &css);
+        for cached in [false, true] {
+            let mut factory = DocumentFactory::new();
+            factory.set_book_stylesheet_cache(cache.clone());
+            let (prepared, timings) = factory.build_pipeline_from_parsed_with_timings(&parsed, &css);
+            assert_eq!(prepared.box_count(), reference.box_count());
+            for index in 0..prepared.box_count() {
+                assert_eq!(prepared.get_tag(index), reference.get_tag(index));
+                assert_eq!(prepared.box_text_color(index), reference.box_text_color(index));
+            }
+            assert!(!timings.dom.is_zero());
+            assert!(!timings.style.is_zero());
+            assert!(!timings.prepare.is_zero());
+            assert!(!timings.formatting.is_zero());
+            assert!(!timings.text.is_zero());
+            assert!(timings.prepare >= timings.formatting + timings.text);
+            assert_eq!(timings.style_details.parse_author_css.is_zero(), cached);
+            // The reference preparation already initialized the process-wide
+            // default sheet, independently of this book's program cache.
+            assert!(timings.style_details.parse_default_css.is_zero());
+        }
+        assert_eq!(cache.stats().compiled_hits, 1);
     }
 
     #[test]
@@ -463,25 +717,6 @@ mod tests {
     }
 
     #[test]
-    fn builds_toc_entries_from_html_headers() {
-        let html = "<html><body><h1>Intro</h1><h2 id=\"chapter-a\">Chapter <em>A</em></h2></body></html>";
-        let mut factory = DocumentFactory::new();
-        let document = factory.parse_to_dom(html);
-
-        assert_eq!(document.toc_entries().len(), 2);
-
-        let first = &document.toc_entries()[0];
-        assert_eq!(first.level, 1);
-        assert_eq!(document.string(first.title), "Intro");
-        assert!(document.string(first.href).starts_with("#heading-"));
-
-        let second = &document.toc_entries()[1];
-        assert_eq!(second.level, 2);
-        assert_eq!(document.string(second.title), "Chapter A");
-        assert_eq!(document.string(second.href), "#chapter-a");
-    }
-
-    #[test]
     fn follows_html_anchor_scope_for_ignored_self_closing_flags() {
         let html = "<html><body><p><a id=\"p77\"/>After</p></body></html>";
         let mut factory = DocumentFactory::new();
@@ -504,13 +739,16 @@ mod tests {
             <html><head>
                 <link rel="stylesheet" href="first.css">
                 <style>p { color: green; }</style>
-                <link rel="stylesheet" href="last.css">
+                <link rel="preload StyleSheet" type="Text/CSS; charset=utf-8" href=" last.css " charset=" ">
+                <link rel="alternate STYLESHEET" href="first.css">
+                <link rel="stylesheet" type="text/plain" href="first.css">
+                <link rel="preload" href="first.css">
             </head><body><p>text</p></body></html>
         "#;
         let mut factory = DocumentFactory::new();
-        factory.set_resource_context(provider, "book/chapter.xhtml");
+        let factory_resources = ResourceContext::new(provider.as_ref(), ("book/chapter.xhtml").as_ref());
 
-        let prepared = factory.parse_with_new_pipeline(html, None);
+        let prepared = factory.with_resources(factory_resources).parse_with_new_pipeline(html, None);
         let paragraph = (0..prepared.box_count()).find(|&box_idx| prepared.get_tag(box_idx) == "p").expect("paragraph box");
         assert_eq!(prepared.box_text_color(paragraph), Some(0x0000FFFF));
     }
@@ -526,9 +764,9 @@ mod tests {
             </head><body><p>text</p><img src="cat.png"><svg xmlns="http://www.w3.org/2000/svg"><image href="cover.png"/></svg></body></html>
         "#;
         let mut factory = DocumentFactory::new();
-        factory.set_resource_context(provider, "book/chapter.html");
+        let factory_resources = ResourceContext::new(provider.as_ref(), ("book/chapter.html").as_ref());
 
-        let document = factory.parse_to_dom(html);
+        let document = factory.with_resources(factory_resources).parse_to_dom(html);
         assert!(matches!(&document.images()[0].source, html_dom::ImageSource::Uri(uri) if uri == "book/resources/cat.png"));
         assert!(matches!(
             &document.images()[1].source,
@@ -536,7 +774,7 @@ mod tests {
                 if base_uri == "book/resources/"
         ));
 
-        let prepared = factory.parse_with_new_pipeline(html, None);
+        let prepared = factory.with_resources(factory_resources).parse_with_new_pipeline(html, None);
         let paragraph = (0..prepared.box_count()).find(|&box_idx| prepared.get_tag(box_idx) == "p").expect("paragraph box");
         assert_eq!(prepared.box_text_color(paragraph), Some(0x008000FF));
     }
@@ -582,9 +820,9 @@ mod tests {
             </head><body><p>text</p></body></html>
         "#;
         let mut factory = DocumentFactory::new();
-        factory.set_resource_context(provider, "book/chapter.xhtml");
+        let factory_resources = ResourceContext::new(provider.as_ref(), ("book/chapter.xhtml").as_ref());
 
-        let prepared = factory.parse_with_new_pipeline(html, Some("p { color: green; }"));
+        let prepared = factory.with_resources(factory_resources).parse_with_new_pipeline(html, Some("p { color: green; }"));
         let paragraph = (0..prepared.box_count()).find(|&box_idx| prepared.get_tag(box_idx) == "p").expect("paragraph box");
         assert_eq!(prepared.box_text_color(paragraph), Some(0x008000FF));
     }
@@ -594,9 +832,9 @@ mod tests {
         let provider = Arc::new(MemoryProvider { resources: HashMap::from([("book/a.css".to_owned(), b"@import 'b.css'; p { color: red; }".to_vec()), ("book/b.css".to_owned(), b"@import 'a.css'; p { font-weight: 700; }".to_vec())]) });
         let html = "<html><head><style>@import 'a.css';</style></head><body><p>text</p></body></html>";
         let mut factory = DocumentFactory::new();
-        factory.set_resource_context(provider, "book/chapter.xhtml");
+        let factory_resources = ResourceContext::new(provider.as_ref(), ("book/chapter.xhtml").as_ref());
 
-        let prepared = factory.parse_with_new_pipeline(html, None);
+        let prepared = factory.with_resources(factory_resources).parse_with_new_pipeline(html, None);
         let paragraph = (0..prepared.box_count()).find(|&box_idx| prepared.get_tag(box_idx) == "p").expect("paragraph box");
         assert_eq!(prepared.box_text_color(paragraph), Some(0xFF0000FF));
     }
@@ -606,9 +844,9 @@ mod tests {
         let provider = Arc::new(MemoryProvider { resources: HashMap::from([("book/theme.css".to_owned(), b"p { color: red !important; }".to_vec())]) });
         let html = "<html><head><style>@import 'theme.css' layer(theme) supports(width: 1px) screen; p { color: green !important; }</style></head><body><p>text</p></body></html>";
         let mut factory = DocumentFactory::new();
-        factory.set_resource_context(provider, "book/chapter.xhtml");
+        let factory_resources = ResourceContext::new(provider.as_ref(), ("book/chapter.xhtml").as_ref());
 
-        let prepared = factory.parse_with_new_pipeline(html, None);
+        let prepared = factory.with_resources(factory_resources).parse_with_new_pipeline(html, None);
         let paragraph = (0..prepared.box_count()).find(|&box_idx| prepared.get_tag(box_idx) == "p").expect("paragraph box");
         assert_eq!(prepared.box_text_color(paragraph), Some(0xFF0000FF), "important layered imports outrank important unlayered author rules");
     }

@@ -5,8 +5,22 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[features]
+profiling = ["html-layout/profiling", "html-format/profiling", "html-shape/profiling"]
+testing = ["html-layout/testing", "html-engine-model/testing", "html-text/testing"]
+
 [dependencies]
+html-engine-model = { path = "../html-engine-model" }
+html-format = { path = "../html-format" }
+html-shape = { path = "../html-shape" }
+html-text = { path = "../html-text" }
+rustc_data_structures = "0.1.2"
+kurbo.workspace = true
+web-time = "1"
+unicode-normalization = "0.1"
+unicode-segmentation = "1.13"
 html-dom = { path = "../html-dom" }
+html-style-model = { path = "../html-style-model" }
 html-style = { path = "../03-html-style" }
 html-parse = { path = "../02-html-parse" }
 html-layout = { path = "../04-html-layout" }
@@ -14,4 +28,7 @@ html-resources = { path = "../html-resources" }
 encoding_rs.workspace = true
 
 [dev-dependencies]
+html-layout = { path = "../04-html-layout", features = ["testing"] }
+html-engine-model = { path = "../html-engine-model", features = ["testing"] }
+html-text = { path = "../html-text", features = ["testing"] }
 html-wpt-test-support = { path = "../../test-support/html-wpt" }

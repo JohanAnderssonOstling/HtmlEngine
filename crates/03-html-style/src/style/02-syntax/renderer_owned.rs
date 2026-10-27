@@ -3,9 +3,13 @@
 //! These parsers are shared by capability reporting and computed-value
 //! conversion so the renderer cannot claim a wider grammar than it applies.
 
+use super::font_features;
+use super::property_id::RendererPropertyId;
+use super::value::parse_integer;
+use cssparser::match_ignore_ascii_case;
 use html_style_model::{
-    BorderCollapseMode, CaptionSide, EmptyCellsMode, TableLayoutMode, TextBoxEdge, TextBoxOverEdge,
-    TextBoxTrim, TextBoxUnderEdge,
+    BorderCollapseMode, BreakBetween, BreakInside, CaptionSide, EmptyCellsMode, ObjectFit,
+    TableLayoutMode, TextBoxEdge, TextBoxOverEdge, TextBoxTrim, TextBoxUnderEdge,
 };
 use lightningcss::properties::custom::{Token, TokenList, TokenOrValue};
 use lightningcss::properties::{Property, PropertyId};
@@ -56,18 +60,6 @@ fn one_word<'a>(tokens: &'a TokenList<'_>) -> Option<&'a str> {
 
 fn keyword(value: &str, expected: &str) -> bool {
     value.eq_ignore_ascii_case(expected)
-}
-
-pub(crate) fn value_is_css_wide_keyword(value: &str) -> bool {
-    let Some(tokens) = parsed_tokens(value) else {
-        return false;
-    };
-    let Some(value) = one_word(&tokens) else {
-        return false;
-    };
-    ["inherit", "initial", "unset", "revert", "revert-layer"]
-        .iter()
-        .any(|keyword| value.eq_ignore_ascii_case(keyword))
 }
 
 pub(crate) fn table_layout(tokens: &TokenList<'_>) -> Option<TableLayoutMode> {
@@ -204,16 +196,121 @@ pub(crate) fn text_box(tokens: &TokenList<'_>) -> Option<(TextBoxTrim, TextBoxEd
     parse_text_box_edge(&words).map(|edge| (TextBoxTrim::Both, edge))
 }
 
-pub(crate) fn property_value_is_valid(name: &str, value: &str) -> Option<bool> {
+pub(crate) fn object_fit(tokens: &TokenList<'_>) -> Option<ObjectFit> {
+    let words = words(tokens)?;
+    match words.as_slice() {
+        [word] => match_ignore_ascii_case! { word,
+            "fill" => Some(ObjectFit::Fill),
+            "contain" => Some(ObjectFit::Contain),
+            "cover" => Some(ObjectFit::Cover),
+            "none" => Some(ObjectFit::None),
+            "scale-down" => Some(ObjectFit::ScaleDown),
+            _ => None,
+        },
+        [a, b] => {
+            let other = if a.eq_ignore_ascii_case("scale-down") {
+                b
+            } else if b.eq_ignore_ascii_case("scale-down") {
+                a
+            } else {
+                return None;
+            };
+            match_ignore_ascii_case! { other,
+                "contain" => Some(ObjectFit::ScaleDown),
+                "cover" => Some(ObjectFit::CoverScaleDown),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+pub(crate) fn break_between(
+    id: RendererPropertyId,
+    tokens: &TokenList<'_>,
+) -> Option<BreakBetween> {
+    let value = one_word(tokens)?;
+    if matches!(
+        id,
+        RendererPropertyId::PageBreakBefore | RendererPropertyId::PageBreakAfter
+    ) && !["auto", "avoid", "always", "left", "right", "recto", "verso"]
+        .iter()
+        .any(|word| keyword(value, word))
+    {
+        return None;
+    }
+    match_ignore_ascii_case! { value,
+        "auto" => Some(BreakBetween::Auto),
+        "avoid" | "avoid-page" | "avoid-column" => Some(BreakBetween::Avoid),
+        "column" => Some(BreakBetween::Column),
+        // Facing-page parity is not modeled; retain the forced page break.
+        "always" | "all" | "page" | "left" | "right" | "recto" | "verso" => Some(BreakBetween::Page),
+        // Region controls have no effect in page/column fragmentation contexts.
+        "region" | "avoid-region" => Some(BreakBetween::Auto),
+        _ => None,
+    }
+}
+
+pub(crate) fn break_inside(id: RendererPropertyId, tokens: &TokenList<'_>) -> Option<BreakInside> {
+    let value = one_word(tokens)?;
+    if id == RendererPropertyId::PageBreakInside
+        && !["auto", "avoid"].iter().any(|word| keyword(value, word))
+    {
+        return None;
+    }
+    match_ignore_ascii_case! { value,
+        "auto" | "avoid-region" => Some(BreakInside::Auto),
+        "avoid" | "avoid-page" | "avoid-column" => Some(BreakInside::Avoid),
+        _ => None,
+    }
+}
+
+pub(crate) fn property_value_is_valid(id: RendererPropertyId, value: &str) -> Option<bool> {
+    if id == RendererPropertyId::FontFeatureSettings {
+        return Some(font_features::parse_settings(value).is_some());
+    }
+    if matches!(id, RendererPropertyId::Widows | RendererPropertyId::Orphans) {
+        return Some(parse_integer(value, 1).is_some());
+    }
     let tokens = parsed_tokens(value)?;
-    Some(match name {
-        "table-layout" => table_layout(&tokens).is_some(),
-        "border-collapse" => border_collapse(&tokens).is_some(),
-        "caption-side" => caption_side(&tokens).is_some(),
-        "empty-cells" => empty_cells(&tokens).is_some(),
-        "text-box-trim" => text_box_trim(&tokens).is_some(),
-        "text-box-edge" => text_box_edge(&tokens).is_some(),
-        "text-box" => text_box(&tokens).is_some(),
+    Some(match id {
+        RendererPropertyId::BreakBefore
+        | RendererPropertyId::BreakAfter
+        | RendererPropertyId::PageBreakBefore
+        | RendererPropertyId::PageBreakAfter => break_between(id, &tokens).is_some(),
+        RendererPropertyId::BreakInside | RendererPropertyId::PageBreakInside => {
+            break_inside(id, &tokens).is_some()
+        }
+        RendererPropertyId::FontKerning
+        | RendererPropertyId::FontVariantNumeric
+        | RendererPropertyId::FontVariantLigatures => {
+            font_features::parse_tokens(id, &tokens).is_some()
+        }
+        RendererPropertyId::Float => one_word(&tokens).is_some_and(|word| {
+            ["left", "right", "none", "inline-start", "inline-end"]
+                .iter()
+                .any(|value| keyword(word, value))
+        }),
+        RendererPropertyId::Clear => one_word(&tokens).is_some_and(|word| {
+            [
+                "left",
+                "right",
+                "both",
+                "none",
+                "inline-start",
+                "inline-end",
+            ]
+            .iter()
+            .any(|value| keyword(word, value))
+        }),
+        RendererPropertyId::ObjectFit => object_fit(&tokens).is_some(),
+        RendererPropertyId::TableLayout => table_layout(&tokens).is_some(),
+        RendererPropertyId::BorderCollapse => border_collapse(&tokens).is_some(),
+        RendererPropertyId::CaptionSide => caption_side(&tokens).is_some(),
+        RendererPropertyId::EmptyCells => empty_cells(&tokens).is_some(),
+        RendererPropertyId::TextBoxTrim => text_box_trim(&tokens).is_some(),
+        RendererPropertyId::TextBoxEdge => text_box_edge(&tokens).is_some(),
+        RendererPropertyId::TextBox => text_box(&tokens).is_some(),
         _ => return None,
     })
 }
@@ -221,9 +318,10 @@ pub(crate) fn property_value_is_valid(name: &str, value: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::style::syntax::value::css_wide_keyword;
 
     fn valid(name: &str, value: &str) -> bool {
-        property_value_is_valid(name, value).unwrap()
+        property_value_is_valid(RendererPropertyId::from_name(name).unwrap(), value).unwrap()
     }
 
     #[test]
@@ -234,7 +332,7 @@ mod tests {
         assert!(valid("empty-cells", "hide"));
         assert!(!valid("table-layout", "auto fixed"));
         assert!(!valid("caption-side", "left"));
-        assert!(value_is_css_wide_keyword("\\69nitial"));
+        assert!(css_wide_keyword("\\69nitial"));
     }
 
     #[test]

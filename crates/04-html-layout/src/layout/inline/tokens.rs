@@ -5,23 +5,22 @@
 
 use super::justification::{SpaceGlueClass, classify_space};
 use super::wrapping::KpPlan;
+use super::storage::TokenBuffer;
 use super::*;
 use crate::layout::LayoutEngine;
-use crate::layout_model::LayoutMode;
-use unicode_segmentation::UnicodeSegmentation;
-use crate::layout_model::{Children, InlineContent, LayoutTree};
-use std::sync::{Arc, OnceLock};
+use crate::layout_model::{LayoutMode, WhitespaceWrapOverride};
+use std::mem::{discriminant, size_of};
 
 /// Normal justification consumes at most the glue declared by the paragraph:
-/// 50% space expansion or 33% contraction. A separate emergency pass may
-/// choose an underfull line, but rendering still observes these limits.
+/// 50% space expansion or 33% contraction, followed by bounded cluster tracking.
+/// A separate emergency pass may choose an underfull line; rendering still
+/// observes the same space and tracking limits.
 pub(super) const KP_TOLERANCE: f64 = 1.0;
 pub(super) const HYPHEN_PENALTY: f64 = 50.0;
 
-/// Knuth--Plass planning is useful for substantial paragraphs, but allocating
-/// its two lazy plan slots for tiny inline contexts costs more than rebuilding
-/// the plan if such a context ever requests optimal wrapping.
-pub(super) const INLINE_KP_CACHE_MIN_GLYPHS: usize = 64;
+/// Keep line-breaking plans only when the token stream is substantial enough
+/// to amortize their retained storage across later layouts.
+pub(super) const INLINE_KP_CACHE_MIN_TOKENS: usize = 64;
 pub(super) const INLINE_SUMMARY_BLOCK_TOKENS: usize = 16;
 
 /// Derives a final line box from ascent, descent, and a minimum height.
@@ -42,7 +41,7 @@ pub(super) fn compute_baseline(max_ascent: f64, max_descent: f64, min_height: f6
 
 /// Converts a computed vertical-alignment value into the upward offset used by
 /// the fragment writer.
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 pub(super) fn vertical_align_offset(
     token: &InlineToken,
     runs: &[InlineTokenMetrics],
@@ -66,7 +65,7 @@ pub(super) fn vertical_align_offset(
         _ => 0.0,
     };
     vertical_align_metrics_offset(
-        metrics.vertical_align,
+        metrics.vertical_align.as_style_value(),
         ascent,
         descent,
         token.line_height(runs),
@@ -146,7 +145,7 @@ pub(super) fn effective_vertical_align(doc: &LayoutEngine, box_idx: usize) -> Ve
 /// cell's own value aligns the cell within its row; it must not also shift the
 /// cell's text inside the line box.  A real inline owner, on the other hand,
 /// contributes its authored alignment to the complete inline subtree.
-fn text_vertical_align(doc: &LayoutEngine, box_idx: usize) -> VerticalAlignValue {
+pub(super) fn text_vertical_align(doc: &LayoutEngine, box_idx: usize) -> VerticalAlignValue {
     if matches!(
         doc.reader.box_layout_mode(box_idx),
         Some(LayoutMode::Inline(_))
@@ -177,38 +176,116 @@ pub(super) fn has_aligned_inline_ancestor(doc: &LayoutEngine, box_idx: usize) ->
     false
 }
 
-#[derive(Clone, Copy)]
-#[repr(C)]
+#[derive(Clone, Copy, PartialEq)]
+// Four-byte alignment keeps the cached width beside the packed header without
+// rounding the stride back up to 16 bytes. Read the header by value so Rust can
+// generate an unaligned load where the target requires one.
+#[repr(C, packed(4))]
 pub(super) struct InlineToken {
-    pub(super) data: u32,
-    pub(super) metadata: u32,
-    pub(super) run_idx: u32,
+    header: u64,
     pub(super) width: f32,
 }
 
 // This is a performance invariant: the line-breaking passes walk one of these
 // per character, often several times.
-const _: () = assert!(std::mem::size_of::<InlineToken>() <= 16);
+const _: () = assert!(size_of::<InlineToken>() <= 12);
+
+/// Numeric alignment is resolved against the owner's font size and this run's
+/// own line-height before interning. Only the remaining keywords depend on
+/// the containing line or parent font during placement.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum InlineVerticalAlign {
+    Baseline,
+    Top,
+    Bottom,
+    TextTop,
+    TextBottom,
+    Middle,
+    Offset(f32),
+    // Preserve their identity because line breaking keeps scripts attached to
+    // the preceding token, unlike an arbitrary numeric baseline shift.
+    Sub(f32),
+    Super(f32),
+}
+
+impl InlineVerticalAlign {
+    pub(super) fn resolve(value: VerticalAlignValue, line_height: f64, font_size: f32) -> Self {
+        match value {
+            VerticalAlignValue::Baseline => Self::Baseline,
+            VerticalAlignValue::Top => Self::Top,
+            VerticalAlignValue::Bottom => Self::Bottom,
+            VerticalAlignValue::TextTop => Self::TextTop,
+            VerticalAlignValue::TextBottom => Self::TextBottom,
+            VerticalAlignValue::Middle => Self::Middle,
+            VerticalAlignValue::Sub => Self::Sub(-(font_size * 0.25)),
+            VerticalAlignValue::Super => Self::Super(font_size * 0.5),
+            VerticalAlignValue::Length(px) => Self::Offset(px),
+            VerticalAlignValue::Percent(fraction) => {
+                Self::Offset((line_height * f64::from(fraction)) as f32)
+            }
+            VerticalAlignValue::Calc { absolute_px, line_height_fraction, .. } => {
+                Self::Offset((f64::from(absolute_px)
+                    + line_height * f64::from(line_height_fraction)) as f32)
+            }
+        }
+    }
+
+    /// Reuse the shared placement calculation without retaining the larger
+    /// computed-style enum in each metrics entry.
+    #[inline]
+    pub(super) fn as_style_value(self) -> VerticalAlignValue {
+        match self {
+            Self::Baseline => VerticalAlignValue::Baseline,
+            Self::Top => VerticalAlignValue::Top,
+            Self::Bottom => VerticalAlignValue::Bottom,
+            Self::TextTop => VerticalAlignValue::TextTop,
+            Self::TextBottom => VerticalAlignValue::TextBottom,
+            Self::Middle => VerticalAlignValue::Middle,
+            Self::Offset(px) | Self::Sub(px) | Self::Super(px) => VerticalAlignValue::Length(px),
+        }
+    }
+}
+
+impl PartialEq for InlineVerticalAlign {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Offset(a), Self::Offset(b))
+            | (Self::Sub(a), Self::Sub(b))
+            | (Self::Super(a), Self::Super(b)) => a.to_bits() == b.to_bits(),
+            _ => discriminant(self) == discriminant(other),
+        }
+    }
+}
+
+const _: () = assert!(size_of::<InlineVerticalAlign>() <= 8);
 
 #[derive(Clone, Copy, PartialEq)]
 pub(super) struct InlineTokenMetrics {
     /// Prepared layout box that owns this run. Keeping ownership once per
     /// interned metrics run lets fragment publication recover inline ancestry
-    /// without expanding the 16-byte dense token representation.
+    /// without expanding the 12-byte dense token representation.
     pub(super) owner_box_idx: u32,
     pub(super) ascent: f32,
     pub(super) descent: f32,
-    pub(super) line_height: f64,
-    pub(super) tab_interval: f64,
-    pub(super) tab_min_advance: f64,
+    pub(super) line_height: f32,
     pub(super) font_size: f32,
-    pub(super) vertical_align: VerticalAlignValue,
+    pub(super) vertical_align: InlineVerticalAlign,
     pub(super) white_space: WhiteSpace,
     pub(super) visible: bool,
     pub(super) placement_required: bool,
 }
 
+const _: () = assert!(size_of::<InlineTokenMetrics>() <= 32);
+
 impl InlineToken {
+    // Header: data[0..24], metrics index[24..42], metadata[42..64].
+    pub(super) const MAX_DATA: u32 = (1 << 24) - 1;
+    const RUN_SHIFT: u32 = 24;
+    const RUN_MASK: u32 = (1 << 18) - 1;
+    pub(super) const MAX_RUN_IDX: u32 = Self::RUN_MASK - 1;
+    const METADATA_SHIFT: u32 = 42;
+    const BIDI_SHIFT: u32 = 14;
+
     pub(super) const KIND_MASK: u32 = 0b1111;
     const BREAK_SHIFT: u32 = 4;
     const WRAP_SHIFT: u32 = 6;
@@ -216,15 +293,66 @@ impl InlineToken {
     const SPACE_GLUE_SHIFT: u32 = 9;
     const SPACE_GLUE_MASK: u32 = 0b111 << Self::SPACE_GLUE_SHIFT;
     const SPACE_BIT: u32 = 1 << 12;
+    const TAB_BIT: u32 = 1 << 13;
+    // Break payload uses two bits for `clear`; retain BR provenance here so
+    // it does not consume metadata bits used by bidi levels.
+    const AUTHORED_BREAK_DATA_BIT: u32 = 1 << 2;
 
-    pub(super) fn new(
-        kind: InlineTokenKind,
-        width: f64,
-        break_kind: BreakKind,
-        wrap: TokenWrap,
-        cluster_boundary_before: bool,
-    ) -> Self {
-        let (kind_tag, data) = match kind {
+    pub(super) fn mark_authored_break(&mut self) {
+        debug_assert!(matches!(self.kind(), InlineTokenKind::Break { .. }));
+        self.header |= u64::from(Self::AUTHORED_BREAK_DATA_BIT);
+    }
+
+    pub(super) fn is_authored_break(&self) -> bool {
+        self.metadata() & Self::KIND_MASK == 4 && self.data() & Self::AUTHORED_BREAK_DATA_BIT != 0
+    }
+
+    #[inline]
+    fn data(&self) -> u32 {
+        self.header as u32 & Self::MAX_DATA
+    }
+
+    #[inline]
+    fn metadata(&self) -> u32 {
+        (self.header >> Self::METADATA_SHIFT) as u32
+    }
+
+    #[inline]
+    fn set_metadata(&mut self, metadata: u32) {
+        debug_assert!(metadata < (1 << 22));
+        self.header = (self.header & ((1u64 << Self::METADATA_SHIFT) - 1))
+            | (u64::from(metadata) << Self::METADATA_SHIFT);
+    }
+
+    #[inline]
+    pub(super) fn run_idx(&self) -> u32 {
+        (self.header >> Self::RUN_SHIFT) as u32 & Self::RUN_MASK
+    }
+
+    #[inline]
+    pub(super) fn set_run_idx(&mut self, run_idx: u32) {
+        assert!(
+            run_idx <= Self::MAX_RUN_IDX,
+            "inline token metrics index exceeds 18-bit capacity"
+        );
+        self.header = (self.header & !(u64::from(Self::RUN_MASK) << Self::RUN_SHIFT))
+            | (u64::from(run_idx) << Self::RUN_SHIFT);
+    }
+
+    pub(super) fn bidi_level(&self) -> u8 {
+        (self.metadata() >> Self::BIDI_SHIFT) as u8
+    }
+
+    pub(super) fn set_bidi_level(&mut self, level: u8) {
+        self.set_metadata(
+            (self.metadata() & ((1 << Self::BIDI_SHIFT) - 1))
+                | (u32::from(level) << Self::BIDI_SHIFT),
+        );
+    }
+
+    #[inline]
+    fn kind_parts(kind: InlineTokenKind) -> (u32, u32) {
+        match kind {
             InlineTokenKind::Glyph { glyph_idx } => (0, glyph_idx),
             InlineTokenKind::Ellipsis { glyph } => (1, glyph),
             InlineTokenKind::Image { payload_idx } => (2, payload_idx),
@@ -235,7 +363,33 @@ impl InlineToken {
             InlineTokenKind::Discretionary { glyph } => (7, glyph),
             InlineTokenKind::Opportunity => (8, 0),
             InlineTokenKind::AbsoluteAnchor { box_idx } => (9, box_idx),
-        };
+        }
+    }
+
+    fn set_kind(&mut self, kind: InlineTokenKind) {
+        let (kind_tag, data) = Self::kind_parts(kind);
+        assert!(
+            data <= Self::MAX_DATA,
+            "inline token glyph/payload index exceeds 24-bit capacity"
+        );
+        let mask = u64::from(Self::MAX_DATA) | (u64::from(Self::KIND_MASK) << Self::METADATA_SHIFT);
+        self.header =
+            (self.header & !mask) | u64::from(data) | (u64::from(kind_tag) << Self::METADATA_SHIFT);
+    }
+
+    #[inline]
+    pub(super) fn new(
+        kind: InlineTokenKind,
+        width: f64,
+        break_kind: BreakKind,
+        wrap: TokenWrap,
+        cluster_boundary_before: bool,
+    ) -> Self {
+        let (kind_tag, data) = Self::kind_parts(kind);
+        assert!(
+            data <= Self::MAX_DATA,
+            "inline token glyph/payload index exceeds 24-bit capacity"
+        );
         let metadata = kind_tag
             | ((break_kind as u32) << Self::BREAK_SHIFT)
             | ((wrap as u32) << Self::WRAP_SHIFT)
@@ -245,28 +399,29 @@ impl InlineToken {
                 0
             };
         Self {
-            data,
-            metadata,
-            run_idx: u32::MAX,
+            header: u64::from(data)
+                | (u64::from(Self::RUN_MASK) << Self::RUN_SHIFT)
+                | (u64::from(metadata) << Self::METADATA_SHIFT),
             width: width as f32,
         }
     }
-
     #[inline]
     pub(super) fn kind(&self) -> InlineTokenKind {
-        match self.metadata & Self::KIND_MASK {
+        let header = self.header;
+        let data = header as u32 & Self::MAX_DATA;
+        match (header >> Self::METADATA_SHIFT) as u32 & Self::KIND_MASK {
             0 => InlineTokenKind::Glyph {
-                glyph_idx: self.data,
+                glyph_idx: data,
             },
-            1 => InlineTokenKind::Ellipsis { glyph: self.data },
+            1 => InlineTokenKind::Ellipsis { glyph: data },
             2 => InlineTokenKind::Image {
-                payload_idx: self.data,
+                payload_idx: data,
             },
             3 => InlineTokenKind::AtomicBox {
-                payload_idx: self.data,
+                payload_idx: data,
             },
             4 => InlineTokenKind::Break {
-                clear: match self.data {
+                clear: match data & 3 {
                     0 => html_style_model::Clear::None,
                     1 => html_style_model::Clear::Left,
                     2 => html_style_model::Clear::Right,
@@ -274,20 +429,20 @@ impl InlineToken {
                     _ => unreachable!("invalid packed clear value"),
                 },
             },
-            5 => InlineTokenKind::FloatAnchor { box_idx: self.data },
+            5 => InlineTokenKind::FloatAnchor { box_idx: data },
             6 => InlineTokenKind::InlineBoundary {
-                payload_idx: self.data,
+                payload_idx: data,
             },
-            7 => InlineTokenKind::Discretionary { glyph: self.data },
+            7 => InlineTokenKind::Discretionary { glyph: data },
             8 => InlineTokenKind::Opportunity,
-            9 => InlineTokenKind::AbsoluteAnchor { box_idx: self.data },
+            9 => InlineTokenKind::AbsoluteAnchor { box_idx: data },
             _ => unreachable!("invalid packed inline-token kind"),
         }
     }
 
     #[inline]
     pub(super) fn break_kind(&self) -> BreakKind {
-        match (self.metadata >> Self::BREAK_SHIFT) & 0b11 {
+        match (self.metadata() >> Self::BREAK_SHIFT) & 0b11 {
             0 => BreakKind::None,
             1 => BreakKind::Soft,
             2 => BreakKind::Hard,
@@ -297,13 +452,13 @@ impl InlineToken {
     }
 
     fn set_break_kind(&mut self, break_kind: BreakKind) {
-        self.metadata = (self.metadata & !(0b11 << Self::BREAK_SHIFT))
-            | ((break_kind as u32) << Self::BREAK_SHIFT);
+        self.set_metadata((self.metadata() & !(0b11 << Self::BREAK_SHIFT))
+            | ((break_kind as u32) << Self::BREAK_SHIFT));
     }
 
     #[inline]
     pub(super) fn wrap(&self) -> TokenWrap {
-        match (self.metadata >> Self::WRAP_SHIFT) & 0b11 {
+        match (self.metadata() >> Self::WRAP_SHIFT) & 0b11 {
             0 => TokenWrap::Normal,
             1 => TokenWrap::BreakWord,
             2 => TokenWrap::Anywhere,
@@ -313,28 +468,32 @@ impl InlineToken {
 
     #[inline]
     pub(super) fn is_cluster_boundary(&self) -> bool {
-        self.metadata & Self::CLUSTER_BOUNDARY_BIT != 0
+        self.metadata() & Self::CLUSTER_BOUNDARY_BIT != 0
     }
 
     #[inline]
     pub(super) fn is_space(&self) -> bool {
-        self.metadata & Self::SPACE_BIT != 0
+        self.metadata() & Self::SPACE_BIT != 0
     }
 
     pub(super) fn set_is_space(&mut self) {
-        self.metadata |= Self::SPACE_BIT;
+        self.set_metadata(self.metadata() | Self::SPACE_BIT);
+    }
+
+    pub(super) fn set_is_tab(&mut self) {
+        self.set_metadata(self.metadata() | Self::TAB_BIT);
     }
 
     #[inline]
     pub(super) fn space_glue_class(&self) -> SpaceGlueClass {
         SpaceGlueClass::from_packed(
-            (self.metadata & Self::SPACE_GLUE_MASK) >> Self::SPACE_GLUE_SHIFT,
+            (self.metadata() & Self::SPACE_GLUE_MASK) >> Self::SPACE_GLUE_SHIFT,
         )
     }
 
     pub(super) fn set_space_glue_class(&mut self, class: SpaceGlueClass) {
-        self.metadata =
-            (self.metadata & !Self::SPACE_GLUE_MASK) | ((class as u32) << Self::SPACE_GLUE_SHIFT);
+        self.set_metadata(
+            (self.metadata() & !Self::SPACE_GLUE_MASK) | ((class as u32) << Self::SPACE_GLUE_SHIFT));
     }
 
     #[inline]
@@ -356,25 +515,39 @@ impl InlineToken {
 
     #[inline]
     pub(super) fn run_metrics<'a>(&self, runs: &'a [InlineTokenMetrics]) -> &'a InlineTokenMetrics {
-        &runs[self.run_idx as usize]
+        &runs[self.run_idx() as usize]
     }
 
     #[inline]
     pub(super) fn line_height(&self, runs: &[InlineTokenMetrics]) -> f64 {
-        self.run_metrics(runs).line_height
+        f64::from(self.run_metrics(runs).line_height)
     }
 
     #[inline]
     pub(super) fn advance_at(
         &self,
+        reader: &LayoutReader<'_>,
         runs: &[InlineTokenMetrics],
         position_from_block_start: f64,
     ) -> f64 {
-        let metrics = self.run_metrics(runs);
-        if metrics.tab_interval < 0.0 {
+        if !self.is_tab() {
             return self.width();
         }
-        let interval = metrics.tab_interval;
+        self.tab_advance_at(reader, runs, position_from_block_start)
+    }
+
+    fn tab_advance_at(
+        &self,
+        reader: &LayoutReader<'_>,
+        runs: &[InlineTokenMetrics],
+        position_from_block_start: f64,
+    ) -> f64 {
+        let box_idx = self.run_metrics(runs).owner_box_idx as usize;
+        let (interval, minimum_advance) = preserved_tab_metrics(
+            reader.style(box_idx),
+            tab_reference_style(reader, box_idx),
+            reader.box_uses_ahem(box_idx),
+        );
         if interval <= 0.0 {
             return 0.0;
         }
@@ -384,19 +557,19 @@ impl InlineToken {
         } else {
             interval - remainder
         };
-        if advance < metrics.tab_min_advance {
+        if advance < minimum_advance {
             advance += interval;
         }
         advance
     }
 
     #[inline]
-    pub(super) fn is_tab(&self, runs: &[InlineTokenMetrics]) -> bool {
-        self.run_metrics(runs).tab_interval >= 0.0
+    pub(super) fn is_tab(&self) -> bool {
+        self.metadata() & Self::TAB_BIT != 0
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub(super) enum InlineTokenKind {
     Glyph {
         glyph_idx: u32,
@@ -434,7 +607,7 @@ pub(super) enum InlineTokenKind {
 /// Large, uncommon replaced-element geometry lives outside the dense token
 /// stream. Most documents now scan compact fixed-width tokens for every text
 /// pass instead of dragging image-sized enum storage through cache lines.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub(super) enum ReplacedToken {
     Image {
         image_idx: u32,
@@ -466,13 +639,14 @@ pub(super) enum ReplacedToken {
 
 #[derive(Clone, Copy, Default)]
 pub(super) struct InlineSummaryBlock {
+    // A plain block covers consecutive glyphs, so its end follows from the
+    // fixed block size rather than occupying another field and padding.
     pub(super) glyph_start: u32,
-    pub(super) glyph_end: u32,
+    pub(super) preserves_newlines: bool,
+    pub(super) plain_text: bool,
     pub(super) width: f64,
     pub(super) max_ascent: f64,
     pub(super) max_descent: f64,
-    pub(super) preserves_newlines: bool,
-    pub(super) plain_text: bool,
 }
 
 impl InlineSummaryBlock {
@@ -492,18 +666,17 @@ impl InlineSummaryBlock {
             };
             let metrics = token.run_metrics(runs);
             summary.glyph_start = summary.glyph_start.min(glyph_idx);
-            summary.glyph_end = summary.glyph_end.max(glyph_idx + 1);
             summary.plain_text &= expected_glyph.is_none_or(|expected| expected == glyph_idx)
-                && metrics.tab_interval < 0.0
+                && !token.is_tab()
                 && !metrics.placement_required
                 && metrics.visible
-                && matches!(metrics.vertical_align, VerticalAlignValue::Baseline);
+                && matches!(metrics.vertical_align, InlineVerticalAlign::Baseline);
             expected_glyph = Some(glyph_idx + 1);
             summary.preserves_newlines |= metrics.white_space.preserves_newlines();
             summary.width += token.width();
             let ascent = metrics.ascent as f64;
             let descent = metrics.descent as f64;
-            let half_leading = (metrics.line_height - (ascent + descent)) / 2.0;
+            let half_leading = (f64::from(metrics.line_height) - (ascent + descent)) / 2.0;
             summary.max_ascent = summary.max_ascent.max(ascent + half_leading);
             summary.max_descent = summary.max_descent.max(descent + half_leading);
         }
@@ -517,82 +690,51 @@ impl InlineSummaryBlock {
     }
 }
 
-#[derive(Clone)]
-pub(super) enum InlineStorage<T: Clone> {
-    Owned(Vec<T>),
-    Shared(Arc<[T]>),
+#[derive(Default)]
+pub(super) struct InlineTokens<'a> {
+    pub(super) dense: TokenBuffer<'a, InlineToken>,
+    pub(super) runs: TokenBuffer<'a, InlineTokenMetrics>,
+    pub(super) summary_blocks: TokenBuffer<'a, InlineSummaryBlock>,
+    pub(super) replaced: TokenBuffer<'a, ReplacedToken>,
+    pub(super) kp_plan: Option<KpPlan>,
 }
 
-impl<T: Clone> Default for InlineStorage<T> {
-    fn default() -> Self {
-        Self::Owned(Vec::new())
-    }
-}
-
-impl<T: Clone> InlineStorage<T> {
-    fn with_capacity(capacity: usize) -> Self {
-        Self::Owned(Vec::with_capacity(capacity))
-    }
-
-    fn make_mut(&mut self) -> &mut Vec<T> {
-        if let Self::Shared(values) = self {
-            *self = Self::Owned(values.to_vec());
-        }
-        match self {
-            Self::Owned(values) => values,
-            Self::Shared(_) => unreachable!("shared storage was thawed"),
-        }
+impl<'a> InlineTokens<'a> {
+    /// Transform one paragraph's dense tokens while moving its borrowed
+    /// metric and payload views temporarily. Restore those views after emission.
+    pub(super) fn take_paragraph(&mut self, range: Range<usize>, breaks: Option<(usize, usize)>) -> Self {
+        let mut paragraph = Self {
+            dense: range.filter(|index| !breaks.is_some_and(|(a, b)| *index == a || *index == b))
+                .map(|index| self.dense[index]).collect(),
+            runs: std::mem::take(&mut self.runs),
+            replaced: std::mem::take(&mut self.replaced),
+            ..Self::default()
+        };
+        paragraph.collapse_edge_whitespace_through_boundaries();
+        paragraph.rebuild_summary_blocks();
+        paragraph
     }
 
-    fn share(&mut self) {
-        if let Self::Owned(values) = self {
-            *self = Self::Shared(std::mem::take(values).into());
-        }
+    pub(super) fn restore_paragraph(&mut self, paragraph: Self) {
+        self.runs = paragraph.runs;
+        self.replaced = paragraph.replaced;
     }
 
-    fn capacity(&self) -> usize {
-        match self {
-            Self::Owned(values) => values.capacity(),
-            Self::Shared(values) => values.len(),
-        }
-    }
-}
-
-impl<T: Clone> std::ops::Deref for InlineStorage<T> {
-    type Target = [T];
-
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Owned(values) => values,
-            Self::Shared(values) => values,
-        }
-    }
-}
-
-#[derive(Clone, Default)]
-pub(super) struct InlineTokens {
-    pub(super) dense: InlineStorage<InlineToken>,
-    pub(super) runs: InlineStorage<InlineTokenMetrics>,
-    pub(super) summary_blocks: InlineStorage<InlineSummaryBlock>,
-    pub(super) replaced: Vec<ReplacedToken>,
-    pub(super) kp_plan: Option<Arc<[OnceLock<KpPlan>; 2]>>,
-}
-
-impl InlineTokens {
+    #[cfg(any(test, feature = "testing"))]
     pub(super) fn with_capacity(capacity: usize) -> Self {
         Self {
-            dense: InlineStorage::with_capacity(capacity),
-            runs: InlineStorage::default(),
-            summary_blocks: InlineStorage::with_capacity(
+            dense: Vec::with_capacity(capacity).into(),
+            runs: TokenBuffer::default(),
+            summary_blocks: Vec::with_capacity(
                 capacity.div_ceil(INLINE_SUMMARY_BLOCK_TOKENS),
-            ),
-            replaced: Vec::new(),
+            ).into(),
+            replaced: TokenBuffer::default(),
             kp_plan: None,
         }
     }
 
     pub(super) fn bind_metrics_in(
-        runs: &mut Vec<InlineTokenMetrics>,
+        runs: &mut TokenBuffer<'_, InlineTokenMetrics>,
         previous_run_idx: Option<u32>,
         token: &mut InlineToken,
         metrics: InlineTokenMetrics,
@@ -602,7 +744,7 @@ impl InlineTokens {
                 .get(run_idx as usize)
                 .is_some_and(|previous| *previous == metrics)
         {
-            token.run_idx = run_idx;
+            token.set_run_idx(run_idx);
             return run_idx;
         }
 
@@ -614,7 +756,7 @@ impl InlineTokens {
                 runs.len() - 1
             });
         let run_idx = u32::try_from(run_idx).expect("inline run-metrics arena capacity exhausted");
-        token.run_idx = run_idx;
+        token.set_run_idx(run_idx);
         run_idx
     }
 
@@ -623,14 +765,14 @@ impl InlineTokens {
         mut token: InlineToken,
         metrics: InlineTokenMetrics,
     ) -> InlineToken {
-        let previous_run_idx = self.dense.last().map(|previous| previous.run_idx);
-        Self::bind_metrics_in(self.runs.make_mut(), previous_run_idx, &mut token, metrics);
+        let previous_run_idx = self.dense.last().map(|previous| previous.run_idx());
+        Self::bind_metrics_in(&mut self.runs, previous_run_idx, &mut token, metrics);
         token
     }
 
     pub(super) fn push(&mut self, token: InlineToken, metrics: InlineTokenMetrics) {
         let token = self.bind_metrics(token, metrics);
-        self.dense.make_mut().push(token);
+        self.dense.push(token);
     }
 
     fn push_replaced(
@@ -643,22 +785,9 @@ impl InlineTokens {
         let payload_idx = u32::try_from(self.replaced.len())
             .expect("inline replaced-token arena capacity exhausted");
         self.replaced.push(payload);
-        let packed_kind = kind(payload_idx);
-        token.data = match packed_kind {
-            InlineTokenKind::Image { payload_idx }
-            | InlineTokenKind::AtomicBox { payload_idx }
-            | InlineTokenKind::InlineBoundary { payload_idx } => payload_idx,
-            _ => unreachable!("replaced token kind must use a payload index"),
-        };
-        token.metadata = (token.metadata & !InlineToken::KIND_MASK)
-            | match packed_kind {
-                InlineTokenKind::Image { .. } => 2,
-                InlineTokenKind::AtomicBox { .. } => 3,
-                InlineTokenKind::InlineBoundary { .. } => 6,
-                _ => unreachable!(),
-            };
+        token.set_kind(kind(payload_idx));
         let token = self.bind_metrics(token, metrics);
-        self.dense.make_mut().push(token);
+        self.dense.push(token);
     }
 
     fn as_slice(&self) -> &[InlineToken] {
@@ -669,13 +798,8 @@ impl InlineTokens {
         self.dense.is_empty()
     }
 
-    fn share(&mut self) {
-        self.dense.share();
-        self.runs.share();
-        self.summary_blocks.share();
-    }
-
-    fn rebuild_summary_blocks(&mut self) {
+    pub(super) fn rebuild_summary_blocks(&mut self) {
+        profile_scope!("tokens.summary_blocks");
         let summaries = self.summary_blocks.make_mut();
         summaries.clear();
         summaries.extend(
@@ -690,6 +814,7 @@ impl InlineTokens {
     /// geometry but no text content, so walk through them while zeroing soft
     /// spaces at either paragraph edge.
     fn collapse_edge_whitespace_through_boundaries(&mut self) {
+        profile_scope!("tokens.collapse_edges");
         let transparent_boundary = |token: &InlineToken| {
             matches!(
                 token.kind(),
@@ -723,6 +848,7 @@ impl InlineTokens {
     /// owns only this compact semantic classification; both Knuth--Plass and
     /// final placement resolve it through the shared glue policy.
     fn classify_space_glue(&mut self, engine: &LayoutEngine<'_, '_>) {
+        profile_scope!("tokens.classify_glue");
         fn glyph_character(engine: &LayoutEngine<'_, '_>, token: &InlineToken) -> Option<char> {
             let InlineTokenKind::Glyph { glyph_idx } = token.kind() else {
                 return None;
@@ -774,14 +900,55 @@ impl InlineTokens {
         }
     }
 
+    /// Expand only Unicode paragraphs into the already-supported opportunity
+    /// tokens. The ordinary Latin line-selection loops remain unchanged.
+    fn insert_unicode_break_opportunities(&mut self, engine: &LayoutEngine<'_, '_>) {
+        profile_scope!("tokens.unicode_breaks");
+        let allow = |token: &InlineToken| match token.kind() {
+            InlineTokenKind::Glyph { glyph_idx } =>
+                engine.text.whitespace_wrap_before(glyph_idx as usize) == WhitespaceWrapOverride::UnicodeAllow,
+            _ => false,
+        };
+        if !self.dense.iter().any(allow) { return; }
+        let dense = self.dense.make_mut();
+        let mut expanded: Vec<InlineToken> = Vec::with_capacity(dense.len());
+        for mut token in dense.iter().copied() {
+            if allow(&token) {
+                token.set_break_kind(BreakKind::None);
+                if token.is_cluster_boundary() {
+                    let mut opportunity = InlineToken::new(
+                        InlineTokenKind::Opportunity, 0.0, BreakKind::Discretionary, TokenWrap::Normal, true,
+                    );
+                    opportunity.set_run_idx(token.run_idx());
+                    opportunity.set_bidi_level(token.bidi_level());
+                    let mut position = expanded.len();
+                    // Opening inline decoration travels with the first
+                    // character rather than staying on the preceding line.
+                    while let Some(previous) = position.checked_sub(1).and_then(|index| expanded.get(index)) {
+                        let InlineTokenKind::InlineBoundary { payload_idx } = previous.kind() else { break };
+                        if !matches!(self.replaced[payload_idx as usize], ReplacedToken::InlineBoundary { inline_start: true, inline_end: false, .. }) {
+                            break;
+                        }
+                        position -= 1;
+                    }
+                    expanded.insert(position, opportunity);
+                }
+            }
+            expanded.push(token);
+        }
+        *dense = expanded;
+    }
+
     /// `pre-wrap` breaks after a complete sequence of preserved spaces, while
     /// `break-spaces` breaks after every preserved space. A normal soft token
     /// represents a break before discardable whitespace, so use explicit
     /// zero-width opportunities for these after-space rules.
     fn insert_preserved_space_break_opportunities(&mut self, engine: &LayoutEngine<'_, '_>) {
-        let InlineStorage::Owned(dense) = &mut self.dense else {
-            unreachable!("new inline token plans must own their construction buffer")
-        };
+        profile_scope!("tokens.preserved_space_breaks");
+        if !self.runs.iter().any(|run| matches!(run.white_space, WhiteSpace::PreWrap | WhiteSpace::BreakSpaces)) {
+            return;
+        }
+        let dense = self.dense.make_mut();
         let mut expanded = Vec::with_capacity(dense.len());
         for (index, token) in dense.iter().copied().enumerate() {
             expanded.push(token);
@@ -831,108 +998,24 @@ impl InlineTokens {
                     TokenWrap::Normal,
                     true,
                 );
-                opportunity.run_idx = token.run_idx;
+                opportunity.set_run_idx(token.run_idx());
+                opportunity.set_bidi_level(token.bidi_level());
                 expanded.push(opportunity);
             }
         }
         *dense = expanded;
     }
 
-    /// Inserts zero-source-length logical breaks at Unicode sentence
-    /// boundaries. Existing collapsible whitespace becomes the break token
-    /// where possible; otherwise a synthetic zero-width break is inserted.
-    /// Glyph indices and source ranges remain untouched, so selection and
-    /// annotation anchoring still refer to the original document.
-    fn insert_sentence_breaks(&mut self, engine: &LayoutEngine<'_, '_>) {
-        let mut text = String::new();
-        let mut glyph_tokens = Vec::new();
-        for (token_idx, token) in self.dense.iter().enumerate() {
-            let InlineTokenKind::Glyph { glyph_idx } = token.kind() else {
-                continue;
-            };
-            if token.run_metrics(&self.runs).white_space.preserves_spaces() {
-                return;
-            }
-            let character = engine
-                .text
-                .glyph_metric(engine.text.glyph_at(glyph_idx as usize).unwrap_or_default())
-                .ch();
-            let byte_start = text.len();
-            text.push(character);
-            glyph_tokens.push((byte_start, text.len(), token_idx, character));
+    pub(super) fn prepare_kp_plan(&mut self, punctuation_aware: bool) {
+        profile_scope!("lines.prepare_kp_plan");
+        if self.kp_plan.is_none() {
+            self.kp_plan = Some(KpPlan::build(self.as_slice(), &self.runs, punctuation_aware));
         }
-        if glyph_tokens.len() < 2 {
-            return;
-        }
-
-        let mut break_positions = Vec::new();
-        let segments = text.split_sentence_bound_indices().collect::<Vec<_>>();
-        for (segment_index, (segment_start, segment)) in segments.iter().copied().enumerate() {
-            if segment_index + 1 == segments.len() {
-                break;
-            }
-            let trimmed = segment.trim_end_matches(char::is_whitespace);
-            if trimmed.is_empty() {
-                continue;
-            }
-            let content_end = segment_start + trimmed.len();
-            let Some((_, _, content_token, _)) = glyph_tokens
-                .iter()
-                .copied()
-                .rev()
-                .find(|(_, end, _, _)| *end <= content_end)
-            else {
-                continue;
-            };
-            let whitespace_token = glyph_tokens
-                .iter()
-                .copied()
-                .find(|(start, _, _, character)| *start >= content_end && character.is_whitespace())
-                .map(|(_, _, token_idx, _)| token_idx);
-            break_positions.push((content_token + 1, whitespace_token));
-        }
-        break_positions.sort_unstable();
-        break_positions.dedup();
-
-        let dense = self.dense.make_mut();
-        for (insert_after, whitespace_token) in break_positions.into_iter().rev() {
-            if let Some(token_idx) = whitespace_token {
-                dense[token_idx].set_break_kind(BreakKind::Hard);
-            } else {
-                let Some(previous) = dense.get(insert_after.saturating_sub(1)).copied() else {
-                    continue;
-                };
-                let mut break_token = InlineToken::new(
-                    InlineTokenKind::Break {
-                        clear: html_style_model::Clear::None,
-                    },
-                    0.0,
-                    BreakKind::Hard,
-                    TokenWrap::Normal,
-                    true,
-                );
-                break_token.run_idx = previous.run_idx;
-                dense.insert(insert_after, break_token);
-            }
-        }
-        self.kp_plan = None;
     }
 
-    fn enable_kp_plan_cache(&mut self) {
-        self.kp_plan.get_or_insert_with(|| {
-            Arc::new([OnceLock::new(), OnceLock::new()])
-        });
-    }
-
-    pub(super) fn kp_plan(&self, punctuation_aware: bool) -> Option<&KpPlan> {
-        self.kp_plan.as_deref().map(|plans| {
-            plans[usize::from(punctuation_aware)]
-                .get_or_init(|| KpPlan::build(self.as_slice(), &self.runs, punctuation_aware))
-        })
-    }
 }
 
-impl std::ops::Deref for InlineTokens {
+impl std::ops::Deref for InlineTokens<'_> {
     type Target = [InlineToken];
 
     fn deref(&self) -> &Self::Target {
@@ -946,124 +1029,7 @@ pub(super) struct PreparedInlinePlanKey {
     pub(super) run_end: u32,
     pub(super) container_box_idx: u32,
     pub(super) high_quality_hyphenation: bool,
-}
-
-#[derive(Clone)]
-struct PreparedInlinePlan {
-    key: PreparedInlinePlanKey,
-    tokens: InlineTokens,
-}
-
-/// Width-independent text plans owned by the shaped document and shared by
-/// every layout derived from it.
-///
-/// Only text-only formatting contexts reserve a plan slot. A compact map
-/// keeps box lookup constant-time without reserving a full plan for every
-/// inline descendant or a context that contains replaced content.
-#[derive(Clone)]
-pub(crate) struct PreparedInlinePlans {
-    box_slots: Arc<[u32]>,
-    slots: Arc<[OnceLock<PreparedInlinePlan>]>,
-}
-
-impl PreparedInlinePlans {
-    pub(crate) fn new(tree: &LayoutTree, content: &InlineContent) -> Self {
-        let mut box_slots = vec![u32::MAX; tree.box_count()];
-        let mut slot_count = 0usize;
-        for (box_idx, slot) in box_slots.iter_mut().enumerate() {
-            let range = match tree.get_box_layout_mode(box_idx) {
-                Some(LayoutMode::Block(block)) => match &block.children {
-                    Children::InlineItems(range) => range,
-                    _ => continue,
-                },
-                Some(LayoutMode::TableCell(cell)) => match &cell.children {
-                    Children::InlineItems(range) => range,
-                    _ => continue,
-                },
-                Some(LayoutMode::Anonymous(range)) => range,
-                Some(LayoutMode::Inline(range))
-                    if tree.get_box_parent(box_idx).is_none()
-                        || content.inline_items().get(range.start as usize..range.end as usize).is_some_and(
-                            |runs| runs.iter().any(|run| matches!(run.kind, InlineItemKind::Marker { .. })),
-                        ) =>
-                {
-                    range
-                }
-                _ => continue,
-            };
-            let Some(runs) = content.inline_items().get(range.start as usize..range.end as usize) else {
-                continue;
-            };
-            if runs.is_empty()
-                || !runs
-                    .iter()
-                    .all(|run| matches!(run.kind, InlineItemKind::Text { .. } | InlineItemKind::Marker { .. }))
-            {
-                continue;
-            }
-            *slot = u32::try_from(slot_count).expect("inline-plan slot capacity exhausted");
-            slot_count += 1;
-        }
-        Self { box_slots: box_slots.into(), slots: (0..slot_count).map(|_| OnceLock::new()).collect::<Vec<_>>().into() }
-    }
-
-    fn slot(&self, box_idx: u32) -> Option<&OnceLock<PreparedInlinePlan>> {
-        let index = *self.box_slots.get(box_idx as usize)?;
-        (index != u32::MAX).then(|| &self.slots[index as usize])
-    }
-
-    pub(in crate::layout::inline) fn can_cache(&self, box_idx: u32) -> bool {
-        self.slot(box_idx).is_some()
-    }
-
-    fn get(&self, key: PreparedInlinePlanKey) -> Option<InlineTokens> {
-        let plan = self.slot(key.container_box_idx)?.get()?;
-        (plan.key == key).then(|| plan.tokens.clone())
-    }
-
-    fn insert(&self, key: PreparedInlinePlanKey, tokens: InlineTokens) -> InlineTokens {
-        let Some(slot) = self.slot(key.container_box_idx) else {
-            return tokens;
-        };
-        if let Some(plan) = slot.get() {
-            return if plan.key == key { plan.tokens.clone() } else { tokens };
-        }
-        match slot.set(PreparedInlinePlan { key, tokens }) {
-            Ok(()) => slot.get().expect("prepared inline plan was just initialized").tokens.clone(),
-            Err(candidate) => {
-                slot.get().filter(|plan| plan.key == key).map_or(candidate.tokens, |plan| plan.tokens.clone())
-            }
-        }
-    }
-
-    pub(crate) fn memory_usage_bytes(&self) -> usize {
-        self.box_slots.len() * std::mem::size_of::<u32>()
-            + self.slots.len() * std::mem::size_of::<OnceLock<PreparedInlinePlan>>()
-            + self
-                .slots
-                .iter()
-                .filter_map(OnceLock::get)
-                .map(|tokens| {
-                    let tokens = &tokens.tokens;
-                    let kp_plan_bytes = tokens.kp_plan.as_deref().map_or(0, |plans| {
-                        plans.iter().filter_map(OnceLock::get).map(KpPlan::memory_usage_bytes).sum()
-                    });
-                    tokens.dense.capacity() * std::mem::size_of::<InlineToken>()
-                        + tokens.runs.capacity() * std::mem::size_of::<InlineTokenMetrics>()
-                        + tokens.summary_blocks.capacity() * std::mem::size_of::<InlineSummaryBlock>()
-                        + kp_plan_bytes
-                })
-                .sum::<usize>()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn storage_counts(&self) -> (usize, usize, usize) {
-        (self.box_slots.len(), self.slots.len(), self.len())
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.slots.iter().filter(|slot| slot.get().is_some()).count()
-    }
+    pub(super) book_optimized: bool,
 }
 
 #[repr(u8)]
@@ -1099,25 +1065,25 @@ pub(super) enum TokenWrap {
 
 mod build;
 
-pub(super) use build::build_inline_tokens;
+pub(super) use build::{build_inline_tokens, cached_inline_plan_key};
 pub(in crate::layout) use build::{inline_item_ownership_box, run_belongs_to_inline_context};
 
 /// Style supplying the space/ch metric used by number-valued `tab-size`.
 /// CSS defines it on the nearest block container rather than the inline
 /// span that happens to contain the tab.
 pub(in crate::layout) fn tab_reference_style<'input>(
-    engine: &crate::layout::LayoutEngine<'input, '_>,
+    reader: &LayoutReader<'input>,
     box_idx: usize,
 ) -> html_style_model::UsedStyleView<'input> {
     let mut current = Some(box_idx);
     while let Some(idx) = current {
-        let style = engine.reader.style(idx);
+        let style = reader.style(idx);
         if style.display() != html_style_model::Display::Inline {
             return style;
         }
-        current = engine.reader.get_parent(idx);
+        current = reader.get_parent(idx);
     }
-    engine.reader.style(box_idx)
+    reader.style(box_idx)
 }
 
 /// Canonical metrics for a preserved tab. Both intrinsic measurement and
@@ -1167,14 +1133,16 @@ pub(in crate::layout) fn canonical_text_unit(
         engine,
         glyph_idx,
         metric.ch(),
-        metric.advance(),
+        engine.text.text_advance(glyph_idx as usize, metric.advance()),
         style.font_size(),
         style.letter_spacing() as f64,
         style.word_spacing() as f64,
+        style.word_spacing_factor() as f64,
         white_space,
     )
 }
 
+#[inline]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn canonical_text_unit_from_facts(
     engine: &crate::layout::LayoutEngine<'_, '_>,
@@ -1184,19 +1152,23 @@ pub(super) fn canonical_text_unit_from_facts(
     font_size: f32,
     letter_spacing: f64,
     word_spacing: f64,
+    word_spacing_factor: f64,
     white_space: WhiteSpace,
 ) -> CanonicalTextUnit {
-    let break_kind = match engine.text.whitespace_wrap_before(glyph_idx as usize) {
-        crate::layout_model::WhitespaceWrapOverride::Style => break_kind(character, white_space),
-        crate::layout_model::WhitespaceWrapOverride::Allow => BreakKind::Soft,
-        crate::layout_model::WhitespaceWrapOverride::Suppress => BreakKind::None,
+    let wrap_override = engine.text.whitespace_wrap_before(glyph_idx as usize);
+    let break_kind = match wrap_override {
+        WhitespaceWrapOverride::Style => break_kind(character, white_space),
+        WhitespaceWrapOverride::Allow => BreakKind::Soft,
+        WhitespaceWrapOverride::Suppress => BreakKind::None,
+        WhitespaceWrapOverride::UnicodeAllow => BreakKind::Discretionary,
+        WhitespaceWrapOverride::UnicodeSuppress => BreakKind::None,
     };
-    let natural_advance = if matches!(character, '\u{00ad}' | '\u{200b}') || font_size <= 0.0 {
+    let natural_advance = if matches!(character, '\u{00ad}' | '\u{200b}') || html_text::is_bidi_control(character) || font_size <= 0.0 {
         0.0
     } else {
-        engine.text.text_advance(glyph_idx as usize, glyph_advance) as f64
-            + letter_spacing
-            + if character == ' ' { word_spacing } else { 0.0 }
+        let advance = glyph_advance as f64 + if character == ' ' { word_spacing } else { 0.0 };
+        let advance = if matches!(character, ' ' | '\u{00a0}') { advance * word_spacing_factor } else { advance };
+        advance + letter_spacing
     };
     CanonicalTextUnit {
         character,
@@ -1228,29 +1200,5 @@ pub(in crate::layout) fn break_kind(character: char, white_space: WhiteSpace) ->
         ' ' | '\t' | '\n' => BreakKind::Soft,
         '\u{200b}' => BreakKind::Discretionary,
         _ => BreakKind::None,
-    }
-}
-
-#[cfg(test)]
-mod storage_tests {
-    use super::InlineStorage;
-    use std::sync::Arc;
-
-    #[test]
-    fn frozen_arrays_release_spare_capacity_and_thaw_without_mutating_snapshots() {
-        let mut storage = InlineStorage::with_capacity(1024);
-        storage.make_mut().extend([1u32, 2, 3]);
-        storage.share();
-        assert_eq!(storage.capacity(), 3);
-        let mut cloned = storage.clone();
-        match (&storage, &cloned) {
-            (InlineStorage::Shared(left), InlineStorage::Shared(right)) => assert!(Arc::ptr_eq(left, right)),
-            _ => panic!("frozen arrays must be shared slices"),
-        }
-        cloned.make_mut().push(4);
-        assert_eq!(&*storage, &[1, 2, 3]);
-        assert_eq!(&*cloned, &[1, 2, 3, 4]);
-        cloned.share();
-        assert_eq!(cloned.capacity(), 4);
     }
 }

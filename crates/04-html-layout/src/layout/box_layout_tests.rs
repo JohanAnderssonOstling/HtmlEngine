@@ -1,16 +1,25 @@
+use crate::GlyphResourceStore;
 use crate::LaidOutDocument;
 use crate::parser::DocumentFactory;
 use crate::test_support::TestGlyphShaper as GlyphCache;
 use kurbo::{Size, Vec2};
 
-fn layout_html(html: &str, width: f64) -> LaidOutDocument {
+fn layout_html(
+    html: &str,
+    width: f64,
+    resources: &mut GlyphResourceStore,
+) -> LaidOutDocument<'static> {
     let mut factory = DocumentFactory::new();
     let mut glyph_cache = GlyphCache::new();
     factory
         .parse_with_new_pipeline(html, None)
-        .shape(&mut glyph_cache)
+        .shape(&mut glyph_cache, resources)
         .expect("test shaper must register every glyph")
-        .layout(crate::LayoutConstraints::new(width, 16.0).unwrap())
+        .layout(
+            crate::LayoutConstraints::new(width, 16.0).unwrap(),
+            resources,
+        )
+        .expect("layout requires the shaper-aware API for first-line styles")
 }
 
 fn layout_html_with_font_relative_ratios(
@@ -18,18 +27,23 @@ fn layout_html_with_font_relative_ratios(
     width: f64,
     x_height_ratio: f32,
     ch_advance_ratio: f32,
-) -> LaidOutDocument {
+    resources: &mut GlyphResourceStore,
+) -> LaidOutDocument<'static> {
     let mut factory = DocumentFactory::new();
     let mut glyph_cache = GlyphCache::with_font_relative_ratios(x_height_ratio, ch_advance_ratio);
     factory
         .parse_with_new_pipeline(html, None)
-        .shape(&mut glyph_cache)
+        .shape(&mut glyph_cache, resources)
         .expect("test shaper must register every glyph")
-        .layout(crate::LayoutConstraints::new(width, 16.0).unwrap())
+        .layout(
+            crate::LayoutConstraints::new(width, 16.0).unwrap(),
+            resources,
+        )
+        .expect("layout requires the shaper-aware API for first-line styles")
 }
 
-fn div_size(document: &LaidOutDocument) -> Size {
-    let boxes = document.render_view().boxes();
+fn div_size(document: &LaidOutDocument, resources: &GlyphResourceStore) -> Size {
+    let boxes = document.render_view(resources).boxes();
     let div_idx = (0..boxes.len())
         .find(|&idx| {
             boxes
@@ -40,8 +54,8 @@ fn div_size(document: &LaidOutDocument) -> Size {
     boxes.size(div_idx).expect("box index in range")
 }
 
-fn tag_size(document: &LaidOutDocument, tag: &str) -> Size {
-    let boxes = document.render_view().boxes();
+fn tag_size(document: &LaidOutDocument, tag: &str, resources: &GlyphResourceStore) -> Size {
+    let boxes = document.render_view(resources).boxes();
     let box_idx = (0..boxes.len())
         .find(|&idx| {
             boxes
@@ -52,8 +66,12 @@ fn tag_size(document: &LaidOutDocument, tag: &str) -> Size {
     boxes.size(box_idx).expect("box index in range")
 }
 
-fn id_geometry(document: &LaidOutDocument, id: &str) -> (kurbo::Point, Size) {
-    let view = document.render_view();
+fn id_geometry(
+    document: &LaidOutDocument,
+    id: &str,
+    resources: &GlyphResourceStore,
+) -> (kurbo::Point, Size) {
+    let view = document.render_view(resources);
     let box_idx = (0..view.boxes().len())
         .find(|&idx| view.boxes().id(idx).map(|value| view.string(value)) == Some(id))
         .unwrap_or_else(|| panic!("#{id} box should exist"));
@@ -72,19 +90,47 @@ fn shrink_to_fit_intrinsic_widths_include_text_indent_on_the_applicable_line() {
         <div id='negative' style='float:left;clear:left;text-indent:-30px'><span style='display:inline-block;width:50px'></span></div>
         <div id='negative-soft' style='float:left;clear:left;text-indent:-30px'><span style='display:inline-block;width:10px'></span>&#x200B;<span style='display:inline-block;width:30px'></span></div>
     </body></html>";
-    let document = layout_html(html, 600.0);
+    let mut document_resources = GlyphResourceStore::default();
+    let document = layout_html(html, 600.0, &mut document_resources);
 
-    assert_eq!(id_geometry(&document, "single").1.width, 40.0);
-    assert_eq!(id_geometry(&document, "soft").1.width, 61.0);
-    assert_eq!(id_geometry(&document, "forced").1.width, 40.0);
-    assert_eq!(id_geometry(&document, "negative").1.width, 20.0);
-    assert_eq!(id_geometry(&document, "negative-soft").1.width, 30.0);
+    assert_eq!(
+        id_geometry(&document, "single", &document_resources)
+            .1
+            .width,
+        40.0
+    );
+    assert_eq!(
+        id_geometry(&document, "soft", &document_resources).1.width,
+        61.0
+    );
+    assert_eq!(
+        id_geometry(&document, "forced", &document_resources)
+            .1
+            .width,
+        40.0
+    );
+    assert_eq!(
+        id_geometry(&document, "negative", &document_resources)
+            .1
+            .width,
+        20.0
+    );
+    assert_eq!(
+        id_geometry(&document, "negative-soft", &document_resources)
+            .1
+            .width,
+        30.0
+    );
 }
 
 #[test]
 fn content_box_width_adds_padding_and_border() {
     let html = "<html><body><div style=\"width:100px; height:50px; padding:10px; border:5px solid black;\">x</div></body></html>";
-    let size = div_size(&layout_html(html, 600.0));
+    let mut size_resources = GlyphResourceStore::default();
+    let size = div_size(
+        &layout_html(html, 600.0, &mut size_resources),
+        &size_resources,
+    );
 
     assert_eq!(
         size.width, 130.0,
@@ -96,9 +142,11 @@ fn content_box_width_adds_padding_and_border() {
 #[test]
 fn ch_box_lengths_use_the_selected_fonts_zero_advance() {
     let html = "<html><body><div style='font-size:80px;width:5ch;height:2ch'></div></body></html>";
-    let size = div_size(&layout_html_with_font_relative_ratios(
-        html, 600.0, 0.4, 0.625,
-    ));
+    let mut size_resources = GlyphResourceStore::default();
+    let size = div_size(
+        &layout_html_with_font_relative_ratios(html, 600.0, 0.4, 0.625, &mut size_resources),
+        &size_resources,
+    );
 
     assert_eq!(size.width, 250.0);
     assert_eq!(size.height, 100.0);
@@ -107,9 +155,11 @@ fn ch_box_lengths_use_the_selected_fonts_zero_advance() {
 #[test]
 fn compound_font_relative_calc_uses_selected_font_metrics() {
     let html = "<html><body><div style='font-size:80px;width:calc(1ex + 1ch + 1em);height:calc(1ex + 1ch + 1em)'></div></body></html>";
-    let size = div_size(&layout_html_with_font_relative_ratios(
-        html, 600.0, 0.4, 0.625,
-    ));
+    let mut size_resources = GlyphResourceStore::default();
+    let size = div_size(
+        &layout_html_with_font_relative_ratios(html, 600.0, 0.4, 0.625, &mut size_resources),
+        &size_resources,
+    );
 
     assert_eq!(size, Size::new(162.0, 162.0));
 }
@@ -121,8 +171,9 @@ fn mixed_calc_width_height_and_padding_resolve_against_their_bases() {
           <div id='target' style='box-sizing:content-box;width:calc(50% - 10px);height:calc(50% - 20px);padding-left:calc(10% + 5px)'></div>
         </div>
     </body></html>";
-    let document = layout_html(html, 600.0);
-    let (_, size) = id_geometry(&document, "target");
+    let mut document_resources = GlyphResourceStore::default();
+    let document = layout_html(html, 600.0, &mut document_resources);
+    let (_, size) = id_geometry(&document, "target", &document_resources);
 
     assert!(
         (size.width - 115.0).abs() < 0.001,
@@ -139,8 +190,9 @@ fn mixed_calc_absolute_insets_resolve_against_containing_block_axes() {
           <div id='target' style='position:absolute;width:20px;height:10px;right:calc(25% - 5px);top:calc(50% - 10px)'></div>
         </div>
     </body></html>";
-    let document = layout_html(html, 600.0);
-    let (point, _) = id_geometry(&document, "target");
+    let mut document_resources = GlyphResourceStore::default();
+    let document = layout_html(html, 600.0, &mut document_resources);
+    let (point, _) = id_geometry(&document, "target", &document_resources);
 
     assert_eq!(point.x, 135.0);
     assert_eq!(point.y, 40.0);
@@ -165,17 +217,21 @@ fn absolute_replaced_child_does_not_contribute_to_auto_containing_block_width() 
         "inline SVG must register one image resource"
     );
     let mut glyph_cache = GlyphCache::new();
+    let mut shaped_resources = GlyphResourceStore::default();
     let shaped = prepared
-        .shape(&mut glyph_cache)
+        .shape(&mut glyph_cache, &mut shaped_resources)
         .expect("test shaper must register every glyph");
     let mut image_metrics = crate::ImageMetrics::default();
     image_metrics.set(0, 300, 50);
-    let document = shaped.layout_with_metrics(
-        crate::LayoutConstraints::new(800.0, 16.0).unwrap(),
-        &image_metrics,
-    );
-    let (parent_point, parent_size) = id_geometry(&document, "parent");
-    let (image_point, image_size) = id_geometry(&document, "image");
+    let document = shaped
+        .layout_with_metrics(
+            crate::LayoutConstraints::new(800.0, 16.0).unwrap(),
+            &image_metrics,
+            &shaped_resources,
+        )
+        .expect("layout requires the shaper-aware API for first-line styles");
+    let (parent_point, parent_size) = id_geometry(&document, "parent", &shaped_resources);
+    let (image_point, image_size) = id_geometry(&document, "image", &shaped_resources);
 
     assert_eq!(parent_size, Size::new(288.0, 288.0));
     assert_eq!(image_size.width, 300.0);
@@ -189,8 +245,9 @@ fn mixed_calc_min_height_uses_the_definite_parent_content_height() {
           <div id='target' style='box-sizing:border-box;height:50px;min-height:calc(50% - 100px)'></div>
         </div>
     </body></html>";
-    let document = layout_html(html, 600.0);
-    let (_, size) = id_geometry(&document, "target");
+    let mut document_resources = GlyphResourceStore::default();
+    let document = layout_html(html, 600.0, &mut document_resources);
+    let (_, size) = id_geometry(&document, "target", &document_resources);
 
     assert_eq!(size.height, 100.0);
 }
@@ -204,16 +261,31 @@ fn min_height_constrained_explicit_height_is_the_descendant_percentage_basis() {
           </div>
         </div>
     </body></html>";
-    let document = layout_html(html, 600.0);
+    let mut document_resources = GlyphResourceStore::default();
+    let document = layout_html(html, 600.0, &mut document_resources);
 
-    assert_eq!(id_geometry(&document, "parent").1.height, 100.0);
-    assert_eq!(id_geometry(&document, "child").1.height, 100.0);
+    assert_eq!(
+        id_geometry(&document, "parent", &document_resources)
+            .1
+            .height,
+        100.0
+    );
+    assert_eq!(
+        id_geometry(&document, "child", &document_resources)
+            .1
+            .height,
+        100.0
+    );
 }
 
 #[test]
 fn border_box_width_includes_padding_and_border() {
     let html = "<html><body><div style=\"width:100px; height:50px; padding:10px; border:5px solid black; box-sizing:border-box;\">x</div></body></html>";
-    let size = div_size(&layout_html(html, 600.0));
+    let mut size_resources = GlyphResourceStore::default();
+    let size = div_size(
+        &layout_html(html, 600.0, &mut size_resources),
+        &size_resources,
+    );
 
     assert_eq!(
         size.width, 100.0,
@@ -227,7 +299,11 @@ fn border_box_width_never_goes_negative() {
     // Padding+border exceed the specified width; content clamps to 0 and the
     // border box becomes just padding + border.
     let html = "<html><body><div style=\"width:10px; padding:10px; border:5px solid black; box-sizing:border-box;\"></div></body></html>";
-    let size = div_size(&layout_html(html, 600.0));
+    let mut size_resources = GlyphResourceStore::default();
+    let size = div_size(
+        &layout_html(html, 600.0, &mut size_resources),
+        &size_resources,
+    );
 
     assert_eq!(
         size.width, 30.0,
@@ -238,7 +314,11 @@ fn border_box_width_never_goes_negative() {
 #[test]
 fn minimum_size_wins_over_smaller_maximum_size() {
     let html = "<html><body><div style=\"width:50px; height:50px; min-width:70px; max-width:60px; min-height:70px; max-height:60px;\"></div></body></html>";
-    let size = div_size(&layout_html(html, 600.0));
+    let mut size_resources = GlyphResourceStore::default();
+    let size = div_size(
+        &layout_html(html, 600.0, &mut size_resources),
+        &size_resources,
+    );
 
     assert_eq!(size, Size::new(70.0, 70.0));
 }
@@ -246,7 +326,11 @@ fn minimum_size_wins_over_smaller_maximum_size() {
 #[test]
 fn resolved_logical_box_properties_reach_layout_as_physical_geometry() {
     let html = "<html><body><div dir='rtl' style='inline-size:100px;block-size:50px;padding-inline:10px 20px;padding-block:4px 6px;border-inline-width:3px 7px;border-block-width:2px 8px;border-style:solid'>x</div></body></html>";
-    let size = div_size(&layout_html(html, 600.0));
+    let mut size_resources = GlyphResourceStore::default();
+    let size = div_size(
+        &layout_html(html, 600.0, &mut size_resources),
+        &size_resources,
+    );
 
     assert_eq!(
         size.width, 140.0,
@@ -260,12 +344,14 @@ fn resolved_logical_box_properties_reach_layout_as_physical_geometry() {
 
 #[test]
 fn rtl_fixed_width_block_solves_the_inline_end_margin() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body><div id='parent' style='direction:rtl;width:100px'><div id='child' style='width:20px;margin-right:10px'></div></div></body></html>",
         300.0,
+        &mut document_resources,
     );
-    let (parent_point, _) = id_geometry(&document, "parent");
-    let (child_point, child_size) = id_geometry(&document, "child");
+    let (parent_point, _) = id_geometry(&document, "parent", &document_resources);
+    let (child_point, child_size) = id_geometry(&document, "child", &document_resources);
 
     assert_eq!(child_size.width, 20.0);
     assert_eq!(child_point.x - parent_point.x, 70.0);
@@ -273,24 +359,28 @@ fn rtl_fixed_width_block_solves_the_inline_end_margin() {
 
 #[test]
 fn block_overconstraint_uses_the_containing_blocks_direction() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body><div id='parent' style='direction:ltr;width:100px'><div id='child' style='direction:rtl;width:20px;margin-right:10px'></div></div></body></html>",
         300.0,
+        &mut document_resources,
     );
-    let (parent_point, _) = id_geometry(&document, "parent");
-    let (child_point, _) = id_geometry(&document, "child");
+    let (parent_point, _) = id_geometry(&document, "parent", &document_resources);
+    let (child_point, _) = id_geometry(&document, "child", &document_resources);
 
     assert_eq!(child_point.x - parent_point.x, 0.0);
 }
 
 #[test]
 fn inline_table_bottom_padding_contributes_once_to_parent_line_height() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body><div id='wrapper' style='width:200px'><div id='table' style='display:inline-table;padding-bottom:50px;vertical-align:top'><div style='display:table-row'><div style='display:table-cell'><div style='border-bottom:10px solid;width:200px'></div></div></div></div></div></body></html>",
         800.0,
+        &mut document_resources,
     );
-    let (wrapper_point, wrapper_size) = id_geometry(&document, "wrapper");
-    let (table_point, table_size) = id_geometry(&document, "table");
+    let (wrapper_point, wrapper_size) = id_geometry(&document, "wrapper", &document_resources);
+    let (table_point, table_size) = id_geometry(&document, "table", &document_resources);
 
     assert_eq!(
         table_size.height, 60.0,
@@ -308,6 +398,7 @@ fn inline_table_bottom_padding_contributes_once_to_parent_line_height() {
 
 #[test]
 fn empty_inline_table_rows_do_not_add_a_text_strut_below_the_table_margin_box() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div id='wrapper'><table id='table' style='display:inline-table;border:3px solid;border-spacing:0;margin:16px 0 0 16px'>\
          <tr><td style='height:16px;width:128px;padding:0'></td></tr>\
@@ -315,9 +406,10 @@ fn empty_inline_table_rows_do_not_add_a_text_strut_below_the_table_margin_box() 
          <tr><td style='height:16px;width:128px;padding:0'></td></tr>\
          </table></div></body></html>",
         800.0,
+        &mut document_resources,
     );
-    let (_, wrapper_size) = id_geometry(&document, "wrapper");
-    let (_, table_size) = id_geometry(&document, "table");
+    let (_, wrapper_size) = id_geometry(&document, "wrapper", &document_resources);
+    let (_, table_size) = id_geometry(&document, "table", &document_resources);
 
     assert_eq!(table_size.height, 54.0);
     assert_eq!(
@@ -328,12 +420,14 @@ fn empty_inline_table_rows_do_not_add_a_text_strut_below_the_table_margin_box() 
 
 #[test]
 fn inline_block_padding_separates_nested_and_outer_borders() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div id='outer' style='display:inline-block;height:200px;padding-right:50px;border-right:10px solid orange'><div id='inner' style='display:inline-block;height:200px;border-right:10px solid blue'></div></div></body></html>",
         800.0,
+        &mut document_resources,
     );
-    let (outer_point, outer_size) = id_geometry(&document, "outer");
-    let (inner_point, inner_size) = id_geometry(&document, "inner");
+    let (outer_point, outer_size) = id_geometry(&document, "outer", &document_resources);
+    let (inner_point, inner_size) = id_geometry(&document, "inner", &document_resources);
 
     assert_eq!(outer_size.width, 70.0);
     assert_eq!(inner_size.width, 10.0);
@@ -343,7 +437,10 @@ fn inline_block_padding_separates_nested_and_outer_borders() {
         60.0,
         "50px padding and the outer 10px border must follow the inner border"
     );
-    let decorations = document.render_view().fragments().decorations();
+    let decorations = document
+        .render_view(&document_resources)
+        .fragments()
+        .decorations();
     let blues = decorations
         .iter()
         .filter(|fragment| fragment.color() == 0x0000FFFF)
@@ -370,11 +467,16 @@ fn inline_block_padding_separates_nested_and_outer_borders() {
 
 #[test]
 fn isolated_measurement_does_not_leak_deferred_absolute_boxes() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div style='display:inline-block'><div style='width:20px;height:20px'></div><div id='absolute' style='position:absolute;left:0;top:0;width:10px;height:10px;background:blue'></div></div></body></html>",
         800.0,
+        &mut document_resources,
     );
-    let decorations = document.render_view().fragments().decorations();
+    let decorations = document
+        .render_view(&document_resources)
+        .fragments()
+        .decorations();
     let blue = decorations
         .iter()
         .filter(|fragment| fragment.color() == 0x0000FFFF)
@@ -389,12 +491,14 @@ fn isolated_measurement_does_not_leak_deferred_absolute_boxes() {
 
 #[test]
 fn inline_block_shrink_to_fit_honors_a_descendants_max_width() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div id='outer' style='display:inline-block'><span id='inner' style='display:inline-block;max-width:100px;white-space:nowrap'>xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx</span></div></body></html>",
         800.0,
+        &mut document_resources,
     );
-    let (_, outer_size) = id_geometry(&document, "outer");
-    let (_, inner_size) = id_geometry(&document, "inner");
+    let (_, outer_size) = id_geometry(&document, "outer", &document_resources);
+    let (_, inner_size) = id_geometry(&document, "inner", &document_resources);
 
     assert_eq!(inner_size.width, 100.0);
     assert_eq!(
@@ -409,13 +513,15 @@ fn inline_block_shrink_to_fit_honors_a_descendants_max_width() {
 
 #[test]
 fn inline_block_uses_an_empty_terminal_block_childs_bottom_baseline_before_own_padding() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><span id='outer' style='display:inline-block;padding-bottom:20px'><span id='inner' style='display:block;width:30px;height:30px;overflow:hidden'></span></span>XX</body></html>",
         800.0,
+        &mut document_resources,
     );
-    let (outer_point, _) = id_geometry(&document, "outer");
+    let (outer_point, _) = id_geometry(&document, "outer", &document_resources);
     let line = document
-        .render_view()
+        .render_view(&document_resources)
         .text()
         .line(0)
         .expect("outer atomic box and following text share a line");
@@ -431,16 +537,17 @@ fn inline_block_uses_an_empty_terminal_block_childs_bottom_baseline_before_own_p
 fn absolute_shrink_to_fit_honors_a_floated_descendants_em_max_width() {
     let mut factory = DocumentFactory::new();
     let mut glyph_cache = GlyphCache::new();
+    let mut document_resources = GlyphResourceStore::default();
     let document = factory
         .parse_with_new_pipeline(
             "<html><body><p>preceding normal-flow content</p><div id='outer'><div id='inner'>1234567812345678</div></div></body></html>",
             Some("body { margin: 8px } div#outer { position:absolute;left:auto;right:auto;width:auto;font:30px/4 Ahem;background:red } div#inner { float:left;max-width:4em;background:green }"),
         )
-        .shape(&mut glyph_cache)
+        .shape(&mut glyph_cache, &mut document_resources)
         .expect("test shaper must register every glyph")
-        .layout(crate::LayoutConstraints::new(800.0, 16.0).unwrap());
-    let (_, outer_size) = id_geometry(&document, "outer");
-    let (_, inner_size) = id_geometry(&document, "inner");
+        .layout(crate::LayoutConstraints::new(800.0, 16.0).unwrap(), &document_resources).expect("layout requires the shaper-aware API for first-line styles");
+    let (_, outer_size) = id_geometry(&document, "outer", &document_resources);
+    let (_, inner_size) = id_geometry(&document, "inner", &document_resources);
 
     assert_eq!(
         inner_size.width, 120.0,
@@ -454,11 +561,13 @@ fn absolute_shrink_to_fit_honors_a_floated_descendants_em_max_width() {
 
 #[test]
 fn outside_list_marker_hangs_before_border_and_padding() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div id='item' style='display:list-item;width:200px;height:200px;border-left:10px solid blue;padding-left:50px'><div id='child' style='border-left:10px solid orange;height:200px'></div></div></body></html>",
         800.0,
+        &mut document_resources,
     );
-    let view = document.render_view();
+    let view = document.render_view(&document_resources);
     let boxes = view.boxes();
     let item_idx = (0..boxes.len())
         .find(|&idx| boxes.id(idx).map(|value| view.string(value)) == Some("item"))
@@ -470,7 +579,7 @@ fn outside_list_marker_hangs_before_border_and_padding() {
     let item_point = boxes.point(item_idx).expect("list item geometry");
     let marker_point = boxes.point(marker_idx).expect("marker geometry");
     let marker_size = boxes.size(marker_idx).expect("marker size");
-    let (child_point, _) = id_geometry(&document, "child");
+    let (child_point, _) = id_geometry(&document, "child", &document_resources);
 
     assert!(
         marker_point.x + marker_size.width < item_point.x,
@@ -485,27 +594,31 @@ fn outside_list_marker_hangs_before_border_and_padding() {
 
 #[test]
 fn paired_auto_margins_center_a_fixed_width_block() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body><div id='parent' style='width:100px'><div id='child' style='width:20px;margin-left:auto;margin-right:auto'></div></div></body></html>",
         300.0,
+        &mut document_resources,
     );
-    let (parent_point, _) = id_geometry(&document, "parent");
-    let (child_point, _) = id_geometry(&document, "child");
+    let (parent_point, _) = id_geometry(&document, "parent", &document_resources);
+    let (child_point, _) = id_geometry(&document, "child", &document_resources);
 
     assert_eq!(child_point.x - parent_point.x, 40.0);
 }
 
 #[test]
 fn relative_position_offsets_paint_without_consuming_flow_space() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body><div id='first' style='width:5px;height:5px'></div><div id='second' style='position:relative;left:7px;top:11px;width:5px;height:5px;background:orange'></div><div id='third' style='width:5px;height:5px'></div></body></html>",
         300.0,
+        &mut document_resources,
     );
-    let (first, _) = id_geometry(&document, "first");
-    let (second, _) = id_geometry(&document, "second");
-    let (third, _) = id_geometry(&document, "third");
+    let (first, _) = id_geometry(&document, "first", &document_resources);
+    let (second, _) = id_geometry(&document, "second", &document_resources);
+    let (third, _) = id_geometry(&document, "third", &document_resources);
     let orange = document
-        .render_view()
+        .render_view(&document_resources)
         .fragments()
         .decorations()
         .iter()
@@ -545,20 +658,24 @@ fn relative_block_after_inline_replaced_content_keeps_ancestor_origin() {
         "inline SVG must remain an image run before a block sibling"
     );
     let mut glyph_cache = GlyphCache::new();
+    let mut shaped_resources = GlyphResourceStore::default();
     let shaped = prepared
-        .shape(&mut glyph_cache)
+        .shape(&mut glyph_cache, &mut shaped_resources)
         .expect("test shaper must register every glyph");
     let mut image_metrics = crate::ImageMetrics::default();
     image_metrics.set(0, 150, 150);
-    let document = shaped.layout_with_metrics(
-        crate::LayoutConstraints::new(800.0, 16.0).unwrap(),
-        &image_metrics,
-    );
-    let (parent, _) = id_geometry(&document, "parent");
-    let (replaced, replaced_size) = id_geometry(&document, "replaced");
-    let (overlay, _) = id_geometry(&document, "overlay");
+    let document = shaped
+        .layout_with_metrics(
+            crate::LayoutConstraints::new(800.0, 16.0).unwrap(),
+            &image_metrics,
+            &shaped_resources,
+        )
+        .expect("layout requires the shaper-aware API for first-line styles");
+    let (parent, _) = id_geometry(&document, "parent", &shaped_resources);
+    let (replaced, replaced_size) = id_geometry(&document, "replaced", &shaped_resources);
+    let (overlay, _) = id_geometry(&document, "overlay", &shaped_resources);
     let green = document
-        .render_view()
+        .render_view(&shaped_resources)
         .fragments()
         .decorations()
         .iter()
@@ -583,22 +700,24 @@ fn relative_block_after_inline_replaced_content_keeps_ancestor_origin() {
 
 #[test]
 fn block_after_baseline_inline_replaced_content_starts_after_the_line_descender() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div id='parent'>\n<img id='image' src='pixel.png' style='width:200px;height:50px'>\n<div id='after' style='width:200px;height:50px'></div></div></body></html>",
         800.0,
+        &mut document_resources,
     );
-    let (parent, _) = id_geometry(&document, "parent");
-    let (image, image_size) = id_geometry(&document, "image");
-    let (after, _) = id_geometry(&document, "after");
+    let (parent, _) = id_geometry(&document, "parent", &document_resources);
+    let (image, image_size) = id_geometry(&document, "image", &document_resources);
+    let (after, _) = id_geometry(&document, "after", &document_resources);
     let fragment = document
-        .render_view()
+        .render_view(&document_resources)
         .fragments()
         .images()
         .iter()
         .next()
         .expect("inline image fragment");
     let line = document
-        .render_view()
+        .render_view(&document_resources)
         .text()
         .line(fragment.line_idx())
         .expect("image line");
@@ -648,27 +767,31 @@ fn block_after_baseline_inline_svg_starts_after_the_line_descender() {
         image_style.vertical_align()
     );
     let mut glyph_cache = GlyphCache::new();
+    let mut shaped_resources = GlyphResourceStore::default();
     let shaped = prepared
-        .shape(&mut glyph_cache)
+        .shape(&mut glyph_cache, &mut shaped_resources)
         .expect("test shaper must register every glyph");
     let mut image_metrics = crate::ImageMetrics::default();
     image_metrics.set(0, 300, 50);
-    let document = shaped.layout_with_metrics(
-        crate::LayoutConstraints::new(800.0, 16.0).unwrap(),
-        &image_metrics,
-    );
-    let (parent, _) = id_geometry(&document, "parent");
-    let (image, image_size) = id_geometry(&document, "image");
-    let (after, _) = id_geometry(&document, "after");
+    let document = shaped
+        .layout_with_metrics(
+            crate::LayoutConstraints::new(800.0, 16.0).unwrap(),
+            &image_metrics,
+            &shaped_resources,
+        )
+        .expect("layout requires the shaper-aware API for first-line styles");
+    let (parent, _) = id_geometry(&document, "parent", &shaped_resources);
+    let (image, image_size) = id_geometry(&document, "image", &shaped_resources);
+    let (after, _) = id_geometry(&document, "after", &shaped_resources);
     let fragment = document
-        .render_view()
+        .render_view(&shaped_resources)
         .fragments()
         .images()
         .iter()
         .next()
         .expect("inline SVG fragment");
     let line = document
-        .render_view()
+        .render_view(&shaped_resources)
         .text()
         .line(fragment.line_idx())
         .expect("SVG line");
@@ -689,12 +812,14 @@ fn block_after_baseline_inline_svg_starts_after_the_line_descender() {
 
 #[test]
 fn block_replaced_percentage_width_with_auto_margins_is_centered() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div id='parent' style='width:200px'><img id='image' src='pixel.png' style='display:block;width:50%;height:10px;margin-left:auto;margin-right:auto'></div></body></html>",
         800.0,
+        &mut document_resources,
     );
-    let (parent, _) = id_geometry(&document, "parent");
-    let (image, image_size) = id_geometry(&document, "image");
+    let (parent, _) = id_geometry(&document, "parent", &document_resources);
+    let (image, image_size) = id_geometry(&document, "image", &document_resources);
 
     assert_eq!(image_size.width, 100.0);
     assert_eq!(
@@ -706,12 +831,14 @@ fn block_replaced_percentage_width_with_auto_margins_is_centered() {
 
 #[test]
 fn auto_height_block_formatting_context_contains_nested_float_margin_box() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div id='context' style='overflow:hidden;width:96px'><div><div id='float' style='float:left;width:96px;height:48px;margin-bottom:48px'></div></div></div></body></html>",
         800.0,
+        &mut document_resources,
     );
-    let (_, context_size) = id_geometry(&document, "context");
-    let (_, float_size) = id_geometry(&document, "float");
+    let (_, context_size) = id_geometry(&document, "context", &document_resources);
+    let (_, float_size) = id_geometry(&document, "float", &document_resources);
 
     assert_eq!(float_size.height, 48.0);
     assert_eq!(
@@ -722,13 +849,15 @@ fn auto_height_block_formatting_context_contains_nested_float_margin_box() {
 
 #[test]
 fn flow_root_span_contains_its_child_float() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div id='outer' style='border:1px solid'><span id='context' style='display:flow-root'><div id='float' style='float:left;width:20px;height:40px'></div></span></div></body></html>",
         800.0,
+        &mut document_resources,
     );
-    let (_, outer_size) = id_geometry(&document, "outer");
-    let (_, context_size) = id_geometry(&document, "context");
-    let (_, float_size) = id_geometry(&document, "float");
+    let (_, outer_size) = id_geometry(&document, "outer", &document_resources);
+    let (_, context_size) = id_geometry(&document, "context", &document_resources);
+    let (_, float_size) = id_geometry(&document, "float", &document_resources);
 
     assert_eq!(float_size.height, 40.0);
     assert_eq!(context_size.height, 40.0);
@@ -737,13 +866,15 @@ fn flow_root_span_contains_its_child_float() {
 
 #[test]
 fn flow_root_list_item_keeps_child_margin_inside_after_a_float() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0;padding-left:100px'><div id='prior' style='border:1px solid;margin-bottom:20px'><div id='float' style='float:left;width:20px;height:40px'></div><span style='display:flow-root;border:1px solid'>x</span></div><span><span id='context' style='display:flow-root list-item;background:gray'><div id='child' style='margin:20px'>x</div></span></span></body></html>",
         800.0,
+        &mut document_resources,
     );
-    let (prior, prior_size) = id_geometry(&document, "prior");
-    let (context, context_size) = id_geometry(&document, "context");
-    let (child, _) = id_geometry(&document, "child");
+    let (prior, prior_size) = id_geometry(&document, "prior", &document_resources);
+    let (context, context_size) = id_geometry(&document, "context", &document_resources);
+    let (child, _) = id_geometry(&document, "child", &document_resources);
 
     assert_eq!(
         context.y,
@@ -751,33 +882,38 @@ fn flow_root_list_item_keeps_child_margin_inside_after_a_float() {
         "the child's contained margin must not move the flow-root list-item itself"
     );
     assert_eq!(child.y - context.y, 20.0);
-    let (_, child_size) = id_geometry(&document, "child");
+    let (_, child_size) = id_geometry(&document, "child", &document_resources);
     assert_eq!(context_size.height, child_size.height + 40.0);
 }
 
 #[test]
 fn flow_root_list_item_matches_equivalent_reference_geometry_after_float() {
+    let mut actual_resources = GlyphResourceStore::default();
     let actual = layout_html(
         "<html><body style='color:black;background:white;font:16px/1 monospace;padding:0 0 0 100px;margin:0'><div style='border:1px solid;margin-bottom:20px'><div style='float:left;width:20px;height:40px'></div><span style='display:flow-root list-item;border:1px solid'>x</span></div><span><span id='subject' style='display:flow-root list-item;background:gray'><div style='margin:20px'>x</div></span></span></body></html>",
         800.0,
+        &mut actual_resources,
     );
+    let mut reference_resources = GlyphResourceStore::default();
     let reference = layout_html(
         "<html><body style='color:black;background:white;font:16px/1 monospace;padding:0 0 0 100px;margin:0'><div id='reference-prior' style='border:1px solid'><div style='float:left;width:20px;height:40px'></div><div style='display:list-item;border:1px solid;margin-left:20px'>x</div></div><span><div id='wrapper' style='display:flow-root;margin-top:20px'><span id='subject' style='display:list-item;background:gray'><div style='padding:20px'>x</div></span></div></span></body></html>",
         800.0,
+        &mut reference_resources,
     );
 
-    let (reference_prior, reference_prior_size) = id_geometry(&reference, "reference-prior");
-    let (wrapper, _) = id_geometry(&reference, "wrapper");
+    let (reference_prior, reference_prior_size) =
+        id_geometry(&reference, "reference-prior", &reference_resources);
+    let (wrapper, _) = id_geometry(&reference, "wrapper", &reference_resources);
     assert_eq!(
         wrapper.y,
         reference_prior.y + reference_prior_size.height + 20.0
     );
     assert_eq!(
-        id_geometry(&actual, "subject"),
-        id_geometry(&reference, "subject")
+        id_geometry(&actual, "subject", &actual_resources),
+        id_geometry(&reference, "subject", &reference_resources)
     );
-    let marker_point = |document: &LaidOutDocument| {
-        let view = document.render_view();
+    let marker_point = |document: &LaidOutDocument, resources: &GlyphResourceStore| {
+        let view = document.render_view(resources);
         let item = (0..view.boxes().len())
             .find(|&idx| view.boxes().id(idx).map(|value| view.string(value)) == Some("subject"))
             .expect("list item");
@@ -788,17 +924,22 @@ fn flow_root_list_item_matches_equivalent_reference_geometry_after_float() {
             .marker_box();
         view.boxes().point(marker).expect("marker geometry")
     };
-    assert_eq!(marker_point(&actual), marker_point(&reference));
+    assert_eq!(
+        marker_point(&actual, &actual_resources),
+        marker_point(&reference, &reference_resources)
+    );
 }
 
 #[test]
 fn block_formatting_context_avoids_an_adjacent_float_margin_box() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div id='parent' style='width:200px'><div id='float' style='float:left;width:50px;height:50px'></div><div id='context' style='overflow:hidden;width:50px;height:50px'><div style='width:96px;height:96px'></div></div></div></body></html>",
         800.0,
+        &mut document_resources,
     );
-    let (float, float_size) = id_geometry(&document, "float");
-    let (context, context_size) = id_geometry(&document, "context");
+    let (float, float_size) = id_geometry(&document, "float", &document_resources);
+    let (context, context_size) = id_geometry(&document, "context", &document_resources);
 
     assert_eq!(context_size, Size::new(50.0, 50.0));
     assert_eq!(
@@ -814,11 +955,13 @@ fn block_formatting_context_avoids_an_adjacent_float_margin_box() {
 
 #[test]
 fn zero_width_flow_root_descends_below_crossed_float_edges() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div id='outer' style='width:400px'><div style='float:right;width:250px;height:100px'></div><div style='float:left;width:250px;height:100px'></div><div id='context' style='display:flow-root;width:0;height:200px'></div></div></body></html>",
         800.0,
+        &mut document_resources,
     );
-    let (context, context_size) = id_geometry(&document, "context");
+    let (context, context_size) = id_geometry(&document, "context", &document_resources);
 
     assert_eq!(context, kurbo::Point::new(250.0, 100.0));
     assert_eq!(context_size, Size::new(0.0, 200.0));
@@ -826,12 +969,14 @@ fn zero_width_flow_root_descends_below_crossed_float_edges() {
 
 #[test]
 fn auto_width_block_formatting_context_fills_the_band_beside_a_float() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div id='parent' style='width:100px'><div id='float' style='float:left;width:50px;height:100px'></div><div id='context' style='overflow:hidden;height:100px;min-width:25px'></div></div></body></html>",
         800.0,
+        &mut document_resources,
     );
-    let (float, float_size) = id_geometry(&document, "float");
-    let (context, context_size) = id_geometry(&document, "context");
+    let (float, float_size) = id_geometry(&document, "float", &document_resources);
+    let (context, context_size) = id_geometry(&document, "context", &document_resources);
 
     assert_eq!(context, float + Vec2::new(float_size.width, 0.0));
     assert_eq!(context_size, Size::new(50.0, 100.0));
@@ -839,13 +984,15 @@ fn auto_width_block_formatting_context_fills_the_band_beside_a_float() {
 
 #[test]
 fn overflowing_content_does_not_push_an_auto_width_bfc_below_a_float() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div id='parent' style='width:300px'><div id='float' style='float:left;width:100px;height:100px'></div><div id='context' style='overflow:hidden'><span id='content' style='display:inline-block;width:250px;height:50px'></span></div></div></body></html>",
         800.0,
+        &mut document_resources,
     );
-    let (float, float_size) = id_geometry(&document, "float");
-    let (context, context_size) = id_geometry(&document, "context");
-    let (content, content_size) = id_geometry(&document, "content");
+    let (float, float_size) = id_geometry(&document, "float", &document_resources);
+    let (context, context_size) = id_geometry(&document, "context", &document_resources);
+    let (content, content_size) = id_geometry(&document, "content", &document_resources);
 
     assert_eq!(context, float + Vec2::new(float_size.width, 0.0));
     assert_eq!(context_size.width, 200.0);
@@ -868,8 +1015,9 @@ fn table_bfc_uses_the_first_full_height_float_band_that_fits() {
     let html = format!(
         "<html><body style='margin:0'><div id='parent' style='width:300px'>{floats}<table id='context' style='border-spacing:0'><caption style='height:30px;width:100px'>Caption</caption><tbody><tr><td style='padding:0'><div style='width:230px;height:30px'></div></td></tr></tbody></table></div></body></html>"
     );
-    let document = layout_html(&html, 800.0);
-    let (context, context_size) = id_geometry(&document, "context");
+    let mut document_resources = GlyphResourceStore::default();
+    let document = layout_html(&html, 800.0, &mut document_resources);
+    let (context, context_size) = id_geometry(&document, "context", &document_resources);
 
     assert_eq!(
         (context, context_size),
@@ -879,12 +1027,14 @@ fn table_bfc_uses_the_first_full_height_float_band_that_fits() {
 
 #[test]
 fn trailing_margin_at_the_container_edge_does_not_push_a_fitting_bfc_below_a_float() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div id='parent' style='width:100px'><div id='float' style='float:left;width:50px;height:100px'></div><div id='context' style='overflow:hidden;width:50px;height:100px;margin-right:1px'></div></div></body></html>",
         800.0,
+        &mut document_resources,
     );
-    let (float, float_size) = id_geometry(&document, "float");
-    let (context, context_size) = id_geometry(&document, "context");
+    let (float, float_size) = id_geometry(&document, "float", &document_resources);
+    let (context, context_size) = id_geometry(&document, "context", &document_resources);
 
     assert_eq!(context, float + Vec2::new(float_size.width, 0.0));
     assert_eq!(context_size, Size::new(50.0, 100.0));
@@ -892,14 +1042,16 @@ fn trailing_margin_at_the_container_edge_does_not_push_a_fitting_bfc_below_a_flo
 
 #[test]
 fn bfc_that_cannot_fit_beside_an_adjoining_float_separates_its_top_margin() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div id='outer' style='display:flow-root;width:100px;position:relative'><div id='wrapper'><div><div id='float' style='float:right;width:50px;height:30px'></div></div><div><div id='context' style='overflow:hidden;width:100px;height:70px;margin-top:100px'></div></div></div></div></body></html>",
         800.0,
+        &mut document_resources,
     );
-    let (outer, _) = id_geometry(&document, "outer");
-    let (wrapper, _) = id_geometry(&document, "wrapper");
-    let (float, float_size) = id_geometry(&document, "float");
-    let (context, context_size) = id_geometry(&document, "context");
+    let (outer, _) = id_geometry(&document, "outer", &document_resources);
+    let (wrapper, _) = id_geometry(&document, "wrapper", &document_resources);
+    let (float, float_size) = id_geometry(&document, "float", &document_resources);
+    let (context, context_size) = id_geometry(&document, "context", &document_resources);
 
     assert_eq!(wrapper, outer);
     assert_eq!(float, outer + Vec2::new(50.0, 0.0));
@@ -910,11 +1062,13 @@ fn bfc_that_cannot_fit_beside_an_adjoining_float_separates_its_top_margin() {
 
 #[test]
 fn absolutely_positioned_root_uses_the_initial_containing_block() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html id='root' style='position:absolute;left:50px;top:40px;width:50%;border:10px solid'><body style='margin:0'></body></html>",
         400.0,
+        &mut document_resources,
     );
-    let (root, root_size) = id_geometry(&document, "root");
+    let (root, root_size) = id_geometry(&document, "root", &document_resources);
 
     assert_eq!(root, kurbo::Point::new(50.0, 40.0));
     assert_eq!(root_size.width, 220.0);
@@ -922,12 +1076,14 @@ fn absolutely_positioned_root_uses_the_initial_containing_block() {
 
 #[test]
 fn negative_margin_expands_an_auto_width_bfc_border_box_without_expanding_its_float_band() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div id='parent' style='width:100px;direction:rtl'><div id='float' style='float:left;width:50px;height:100px'></div><div id='context' style='overflow:hidden;height:100px;margin-left:-20px'></div></div></body></html>",
         800.0,
+        &mut document_resources,
     );
-    let (float, _) = id_geometry(&document, "float");
-    let (context, context_size) = id_geometry(&document, "context");
+    let (float, _) = id_geometry(&document, "float", &document_resources);
+    let (context, context_size) = id_geometry(&document, "context", &document_resources);
 
     assert_eq!(context, float + Vec2::new(30.0, 0.0));
     assert_eq!(context_size, Size::new(70.0, 100.0));
@@ -935,13 +1091,15 @@ fn negative_margin_expands_an_auto_width_bfc_border_box_without_expanding_its_fl
 
 #[test]
 fn absolute_child_uses_positioned_ancestor_padding_box_and_leaves_flow() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div id='parent' style='position:relative;width:200px;padding:10px;border:5px solid;height:auto'><div id='absolute' style='position:absolute;left:30px;top:40px;width:20px;height:50px;background:green'></div><div id='flow' style='width:10px;height:12px'></div></div></body></html>",
         400.0,
+        &mut document_resources,
     );
-    let (parent_point, parent_size) = id_geometry(&document, "parent");
-    let (absolute_point, absolute_size) = id_geometry(&document, "absolute");
-    let (flow_point, _) = id_geometry(&document, "flow");
+    let (parent_point, parent_size) = id_geometry(&document, "parent", &document_resources);
+    let (absolute_point, absolute_size) = id_geometry(&document, "absolute", &document_resources);
+    let (flow_point, _) = id_geometry(&document, "flow", &document_resources);
 
     assert_eq!(
         absolute_point,
@@ -957,12 +1115,14 @@ fn absolute_child_uses_positioned_ancestor_padding_box_and_leaves_flow() {
 
 #[test]
 fn absolute_grid_item_uses_its_taffy_resolved_grid_area() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div id='grid' style='display:grid;position:relative;width:max-content;height:40px;grid-template-columns:20px 30px 50px'><div style='grid-column:1/-1;height:10px'></div><div id='absolute' style='position:absolute;grid-column:2/3;width:100%;height:5px'></div></div></body></html>",
         400.0,
+        &mut document_resources,
     );
-    let (grid_point, grid_size) = id_geometry(&document, "grid");
-    let (absolute_point, absolute_size) = id_geometry(&document, "absolute");
+    let (grid_point, grid_size) = id_geometry(&document, "grid", &document_resources);
+    let (absolute_point, absolute_size) = id_geometry(&document, "absolute", &document_resources);
 
     assert_eq!(grid_size, Size::new(100.0, 40.0));
     assert_eq!(absolute_point, grid_point + Vec2::new(20.0, 0.0));
@@ -971,14 +1131,16 @@ fn absolute_grid_item_uses_its_taffy_resolved_grid_area() {
 
 #[test]
 fn blockified_absolute_inline_uses_authored_geometry_and_positioned_paint_layer() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div id='parent' style='position:relative;width:300px'><p style='width:200%'><img style='width:50%;height:100px'/><span id='absolute' style='position:absolute;top:0;left:0;background:green;width:300px;height:100px'></span></p></div></body></html>",
         800.0,
+        &mut document_resources,
     );
-    let (parent, _) = id_geometry(&document, "parent");
-    let (absolute, size) = id_geometry(&document, "absolute");
+    let (parent, _) = id_geometry(&document, "parent", &document_resources);
+    let (absolute, size) = id_geometry(&document, "absolute", &document_resources);
     let decorations = document
-        .render_view()
+        .render_view(&document_resources)
         .fragments()
         .decorations()
         .iter()
@@ -1009,12 +1171,14 @@ fn blockified_absolute_inline_uses_authored_geometry_and_positioned_paint_layer(
 
 #[test]
 fn blockified_absolute_inline_uses_its_later_positioned_sibling_as_containing_block() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div style='width:300px;height:100px'></div><div id='parent' style='position:relative;width:300px'><p style='margin:0;width:200%'><img style='width:50%;height:100px'/><span id='absolute' style='position:absolute;top:0;left:0;background:green;width:300px;height:100px'></span></p></div></body></html>",
         800.0,
+        &mut document_resources,
     );
-    let (parent, _) = id_geometry(&document, "parent");
-    let (absolute, size) = id_geometry(&document, "absolute");
+    let (parent, _) = id_geometry(&document, "parent", &document_resources);
+    let (absolute, size) = id_geometry(&document, "absolute", &document_resources);
 
     assert_eq!(parent, kurbo::Point::new(0.0, 100.0));
     assert_eq!(
@@ -1026,13 +1190,15 @@ fn blockified_absolute_inline_uses_its_later_positioned_sibling_as_containing_bl
 
 #[test]
 fn absolute_sibling_with_top_zero_overlays_the_containing_block_start() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div id='parent' style='position:relative;font-size:32px'><div id='flow' style='position:relative;padding:1px'><span style='display:table-cell'>a b</span><span style='display:table-cell'>c d</span></div><div id='absolute' style='position:absolute;top:0;padding:1px'>a bc d</div></div></body></html>",
         800.0,
+        &mut document_resources,
     );
-    let (parent, _) = id_geometry(&document, "parent");
-    let (flow, _) = id_geometry(&document, "flow");
-    let (absolute, _) = id_geometry(&document, "absolute");
+    let (parent, _) = id_geometry(&document, "parent", &document_resources);
+    let (flow, _) = id_geometry(&document, "flow", &document_resources);
+    let (absolute, _) = id_geometry(&document, "absolute", &document_resources);
 
     assert_eq!(flow, parent);
     assert_eq!(
@@ -1040,7 +1206,7 @@ fn absolute_sibling_with_top_zero_overlays_the_containing_block_start() {
         "top:0 must use the positioned ancestor's padding edge, not the later static position"
     );
     let line_points = document
-        .render_view()
+        .render_view(&document_resources)
         .text()
         .lines()
         .iter()
@@ -1062,18 +1228,20 @@ fn absolute_sibling_with_top_zero_overlays_the_containing_block_start() {
 
 #[test]
 fn absolute_nested_table_text_translates_with_top_zero_container() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div id='parent' style='position:relative;font-size:32px'><div style='position:relative'>same text</div><div id='absolute' style='position:absolute;top:0'><table id='table' style='border-spacing:0'><tr><td style='padding:0'>same text</td></tr></table></div></div></body></html>",
         800.0,
+        &mut document_resources,
     );
-    let (parent, _) = id_geometry(&document, "parent");
-    let (absolute, _) = id_geometry(&document, "absolute");
-    let (table, _) = id_geometry(&document, "table");
+    let (parent, _) = id_geometry(&document, "parent", &document_resources);
+    let (absolute, _) = id_geometry(&document, "absolute", &document_resources);
+    let (table, _) = id_geometry(&document, "table", &document_resources);
     assert_eq!(absolute, parent);
     assert_eq!(table, parent);
 
     let line_points = document
-        .render_view()
+        .render_view(&document_resources)
         .text()
         .lines()
         .iter()
@@ -1095,11 +1263,13 @@ fn absolute_nested_table_text_translates_with_top_zero_container() {
 
 #[test]
 fn z_index_orders_positioned_text_and_backgrounds_independently_of_dom_order() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div style='position:relative'><div style='position:absolute;z-index:2;top:0;left:0;width:10px;height:10px;background:red'>H</div><div style='position:absolute;z-index:1;top:0;left:0;width:10px;height:10px;background:green'>L</div></div></body></html>",
         100.0,
+        &mut document_resources,
     );
-    let text = document.render_view().text();
+    let text = document.render_view(&document_resources).text();
     let lines = text.lines().iter().collect::<Vec<_>>();
     assert_eq!(lines.len(), 2, "positioned fixture lines: {lines:?}");
     let painted_starts = text
@@ -1113,7 +1283,7 @@ fn z_index_orders_positioned_text_and_backgrounds_independently_of_dom_order() {
     );
 
     let colors = document
-        .render_view()
+        .render_view(&document_resources)
         .fragments()
         .decorations()
         .iter()
@@ -1129,12 +1299,14 @@ fn z_index_orders_positioned_text_and_backgrounds_independently_of_dom_order() {
 
 #[test]
 fn later_relative_border_paints_above_earlier_absolute_background_at_auto_z() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div style='position:relative'><div style='position:absolute;inset:0;width:20px;height:20px;background:red'></div><div style='position:relative;width:0;height:0;border:10px solid blue'></div></div></body></html>",
         100.0,
+        &mut document_resources,
     );
     let colors = document
-        .render_view()
+        .render_view(&document_resources)
         .fragments()
         .decorations()
         .iter()
@@ -1150,12 +1322,14 @@ fn later_relative_border_paints_above_earlier_absolute_background_at_auto_z() {
 
 #[test]
 fn inline_block_background_paints_above_a_later_overlapping_block_background() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div style='width:20px;height:10px'><span style='display:inline-block;width:20px;height:10px;background:green'></span></div><div style='width:20px;height:10px;margin-top:-10px;background:red'></div></body></html>",
         100.0,
+        &mut document_resources,
     );
     let colors = document
-        .render_view()
+        .render_view(&document_resources)
         .fragments()
         .decorations()
         .iter()
@@ -1172,12 +1346,14 @@ fn inline_block_background_paints_above_a_later_overlapping_block_background() {
 
 #[test]
 fn descendant_background_stays_in_its_inline_block_atomic_paint_group() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div style='width:20px;height:10px'><span style='display:inline-block;width:20px;height:10px'><span style='display:block;width:20px;height:10px;background:green'></span></span></div><div style='width:20px;height:10px;margin-top:-10px;background:red'></div></body></html>",
         100.0,
+        &mut document_resources,
     );
     let colors = document
-        .render_view()
+        .render_view(&document_resources)
         .fragments()
         .decorations()
         .iter()
@@ -1194,11 +1370,13 @@ fn descendant_background_stays_in_its_inline_block_atomic_paint_group() {
 
 #[test]
 fn later_inline_text_paints_after_earlier_inline_block_text() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div style='height:10px'><span style='display:inline-block'>R</span></div><div style='height:10px;margin-top:-10px'><span>G</span></div></body></html>",
         100.0,
+        &mut document_resources,
     );
-    let text = document.render_view().text();
+    let text = document.render_view(&document_resources).text();
     let glyph_for = |target| {
         (0..text.glyph_count() as u32)
             .find(|index| {
@@ -1232,12 +1410,14 @@ fn later_inline_text_paints_after_earlier_inline_block_text() {
 
 #[test]
 fn negative_z_child_of_auto_positioned_parent_paints_behind_parent_background() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div style='position:absolute;z-index:auto;width:20px;height:20px;background:green'><div style='position:absolute;z-index:-1;width:20px;height:20px;background:red'></div></div></body></html>",
         100.0,
+        &mut document_resources,
     );
     let colors = document
-        .render_view()
+        .render_view(&document_resources)
         .fragments()
         .decorations()
         .iter()
@@ -1249,12 +1429,14 @@ fn negative_z_child_of_auto_positioned_parent_paints_behind_parent_background() 
 
 #[test]
 fn negative_absolute_multiline_text_is_marked_for_the_negative_paint_pass() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div style='position:relative'><div style='height:60px;background:lime;white-space:pre'>\n\nG</div><div style='position:absolute;z-index:-1;inset:0'>R<br>R<br>R</div></div></body></html>",
         200.0,
+        &mut document_resources,
     );
     let lines = document
-        .render_view()
+        .render_view(&document_resources)
         .text()
         .lines()
         .iter()
@@ -1272,11 +1454,13 @@ fn negative_absolute_multiline_text_is_marked_for_the_negative_paint_pass() {
 
 #[test]
 fn floated_pre_block_border_contains_two_exact_line_heights() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div id='target' style='float:left;border:medium solid blue;font-size:20px;line-height:20px;white-space:pre'>x\nx</div></body></html>",
         200.0,
+        &mut document_resources,
     );
-    let (_, size) = id_geometry(&document, "target");
+    let (_, size) = id_geometry(&document, "target", &document_resources);
 
     assert_eq!(
         size.height, 46.0,
@@ -1286,12 +1470,14 @@ fn floated_pre_block_border_contains_two_exact_line_heights() {
 
 #[test]
 fn float_backgrounds_paint_after_ordinary_in_flow_block_backgrounds() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div><div style='float:left;width:20px;height:20px;background:green'></div><div style='width:20px;height:20px;background:red'></div></div></body></html>",
         100.0,
+        &mut document_resources,
     );
     let colors = document
-        .render_view()
+        .render_view(&document_resources)
         .fragments()
         .decorations()
         .iter()
@@ -1303,12 +1489,14 @@ fn float_backgrounds_paint_after_ordinary_in_flow_block_backgrounds() {
 
 #[test]
 fn opposing_horizontal_insets_stretch_absolute_auto_width() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div id='parent' style='position:relative;width:200px;height:100px'><div id='child' style='position:absolute;left:20px;right:30px;height:10px'></div></div></body></html>",
         400.0,
+        &mut document_resources,
     );
-    let (parent_point, _) = id_geometry(&document, "parent");
-    let (child_point, child_size) = id_geometry(&document, "child");
+    let (parent_point, _) = id_geometry(&document, "parent", &document_resources);
+    let (child_point, child_size) = id_geometry(&document, "child", &document_resources);
 
     assert_eq!(child_point.x, parent_point.x + 20.0);
     assert_eq!(child_size.width, 150.0);
@@ -1316,12 +1504,14 @@ fn opposing_horizontal_insets_stretch_absolute_auto_width() {
 
 #[test]
 fn opposing_vertical_insets_stretch_absolute_auto_height() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div id='parent' style='position:relative;width:100px;height:200px'><div id='child' style='position:absolute;top:20px;bottom:30px;width:10px'></div></div></body></html>",
         400.0,
+        &mut document_resources,
     );
-    let (parent_point, _) = id_geometry(&document, "parent");
-    let (child_point, child_size) = id_geometry(&document, "child");
+    let (parent_point, _) = id_geometry(&document, "parent", &document_resources);
+    let (child_point, child_size) = id_geometry(&document, "child", &document_resources);
 
     assert_eq!(child_point.y, parent_point.y + 20.0);
     assert_eq!(child_size.height, 150.0);
@@ -1329,26 +1519,39 @@ fn opposing_vertical_insets_stretch_absolute_auto_height() {
 
 #[test]
 fn opposing_insets_bound_absolute_stretch_sizes_and_zero_auto_margins() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div style='position:relative;width:200px;height:200px'>
             <div id='horizontal' style='position:absolute;left:25px;right:25px;top:0;bottom:0;width:stretch;margin:auto'></div>
             <div id='vertical' style='position:absolute;left:0;right:0;top:25px;bottom:25px;height:stretch;margin:auto'></div>
         </div></body></html>",
         400.0,
-    );
+     &mut document_resources);
 
-    assert_eq!(id_geometry(&document, "horizontal").1.width, 150.0);
-    assert_eq!(id_geometry(&document, "vertical").1.height, 150.0);
+    assert_eq!(
+        id_geometry(&document, "horizontal", &document_resources)
+            .1
+            .width,
+        150.0
+    );
+    assert_eq!(
+        id_geometry(&document, "vertical", &document_resources)
+            .1
+            .height,
+        150.0
+    );
 }
 
 #[test]
 fn blockified_absolute_row_group_keeps_its_anonymous_table_descendants() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div style='display:table'><div id='group' style='display:table-row-group;position:absolute;left:0'><div style='display:table-row'><div id='cell' style='display:table-cell;width:20px;height:20px;background:green'></div></div></div></div></body></html>",
         200.0,
+        &mut document_resources,
     );
-    let (group_point, group_size) = id_geometry(&document, "group");
-    let (cell_point, cell_size) = id_geometry(&document, "cell");
+    let (group_point, group_size) = id_geometry(&document, "group", &document_resources);
+    let (cell_point, cell_size) = id_geometry(&document, "cell", &document_resources);
 
     assert_eq!(group_point.x, 0.0);
     assert_eq!(group_size, Size::new(20.0, 20.0));
@@ -1358,17 +1561,19 @@ fn blockified_absolute_row_group_keeps_its_anonymous_table_descendants() {
 
 #[test]
 fn blockified_absolute_table_cell_is_retained_as_row_out_of_flow_content() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div style='display:table'><div style='display:table-row'><div id='cell' style='display:table-cell;position:absolute;left:0;width:20px;height:20px;background:green'></div></div></div></body></html>",
         200.0,
+        &mut document_resources,
     );
-    let (cell_point, cell_size) = id_geometry(&document, "cell");
+    let (cell_point, cell_size) = id_geometry(&document, "cell", &document_resources);
 
     assert_eq!(cell_point.x, 0.0);
     assert_eq!(cell_size, Size::new(20.0, 20.0));
     assert!(
         document
-            .render_view()
+            .render_view(&document_resources)
             .fragments()
             .decorations()
             .iter()
@@ -1379,14 +1584,16 @@ fn blockified_absolute_table_cell_is_retained_as_row_out_of_flow_content() {
 
 #[test]
 fn rtl_absolute_static_position_keeps_its_line_inside_the_shrink_to_fit_box() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div id='parent' style='position:relative;direction:rtl;width:200px;height:200px'><div id='child' style='position:absolute;font:100px/1 serif;background:red;color:blue'>X</div></div></body></html>",
         400.0,
+        &mut document_resources,
     );
-    let (parent_point, _) = id_geometry(&document, "parent");
-    let (child_point, child_size) = id_geometry(&document, "child");
+    let (parent_point, _) = id_geometry(&document, "parent", &document_resources);
+    let (child_point, child_size) = id_geometry(&document, "child", &document_resources);
     let lines = document
-        .render_view()
+        .render_view(&document_resources)
         .text()
         .lines()
         .iter()
@@ -1414,14 +1621,16 @@ fn rtl_absolute_static_position_keeps_its_line_inside_the_shrink_to_fit_box() {
 
 #[test]
 fn inline_block_percentage_child_uses_max_height_constrained_basis() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div id='parent' style='display:inline-block;width:100px;height:200px;max-height:100px;background:red'><span id='child' style='display:inline-block;width:100px;height:100%;background:green'></span></div></body></html>",
         300.0,
+        &mut document_resources,
     );
-    let (parent_point, parent_size) = id_geometry(&document, "parent");
-    let (child_point, child_size) = id_geometry(&document, "child");
+    let (parent_point, parent_size) = id_geometry(&document, "parent", &document_resources);
+    let (child_point, child_size) = id_geometry(&document, "child", &document_resources);
     let decorations = document
-        .render_view()
+        .render_view(&document_resources)
         .fragments()
         .decorations()
         .iter()
@@ -1442,21 +1651,25 @@ fn inline_block_percentage_child_uses_max_height_constrained_basis() {
 fn block_percentage_child_uses_inline_block_content_height() {
     let mut factory = DocumentFactory::new();
     let mut glyph_cache = GlyphCache::new();
+    let mut document_resources = GlyphResourceStore::default();
     let document = factory
         .parse_with_new_pipeline(
             "<html><body><p>Test passes if there is a filled green square and no red.</p><div id='parent'><div id='child'></div></div></body></html>",
             Some("#parent{display:inline-block;width:100px;height:100px;background:red} div div{width:100%;height:100%;background:green}"),
         )
-        .shape(&mut glyph_cache)
+        .shape(&mut glyph_cache, &mut document_resources)
         .expect("test shaper must register every glyph")
-        .layout(crate::LayoutConstraints::new(300.0, 16.0).unwrap());
-    let (parent_point, parent_size) = id_geometry(&document, "parent");
-    let (child_point, child_size) = id_geometry(&document, "child");
+        .layout(crate::LayoutConstraints::new(300.0, 16.0).unwrap(), &document_resources).expect("layout requires the shaper-aware API for first-line styles");
+    let (parent_point, parent_size) = id_geometry(&document, "parent", &document_resources);
+    let (child_point, child_size) = id_geometry(&document, "child", &document_resources);
 
     assert_eq!(parent_size, Size::new(100.0, 100.0));
     assert_eq!(child_point, parent_point);
     assert_eq!(child_size, parent_size);
-    let decorations = document.render_view().fragments().decorations();
+    let decorations = document
+        .render_view(&document_resources)
+        .fragments()
+        .decorations();
     let parent_rect = decorations
         .iter()
         .find(|decoration| decoration.color() == 0xff0000ff)
@@ -1468,7 +1681,7 @@ fn block_percentage_child_uses_inline_block_content_height() {
         .expect("green child background")
         .rect();
     assert_eq!(child_rect, parent_rect);
-    let view = document.render_view();
+    let view = document.render_view(&document_resources);
     let line_idx = (0..view.text().lines().len())
         .find(|&line_idx| {
             view.fragments()
@@ -1478,7 +1691,7 @@ fn block_percentage_child_uses_inline_block_content_height() {
         })
         .expect("inline-block line");
     let line_colors = document
-        .render_view()
+        .render_view(&document_resources)
         .fragments()
         .decorations_for_line(line_idx)
         .iter()
@@ -1500,60 +1713,98 @@ fn block_percentage_child_uses_inline_block_content_height() {
 
 #[test]
 fn stretch_sizes_the_margin_box_in_both_axes() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div style='display:flow-root;width:100px;height:100px'><div id='target' style='width:stretch;height:stretch;margin:5px;padding:2px;border:3px solid'></div></div></body></html>",
         300.0,
+        &mut document_resources,
     );
 
-    assert_eq!(id_geometry(&document, "target").1, Size::new(90.0, 90.0));
+    assert_eq!(
+        id_geometry(&document, "target", &document_resources).1,
+        Size::new(90.0, 90.0)
+    );
 }
 
 #[test]
 fn stretch_treats_margins_at_open_parent_edges_as_zero() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div style='width:100px;height:100px'><div id='target' style='height:stretch;margin:10px;border:3px solid'></div></div></body></html>",
         300.0,
+        &mut document_resources,
     );
 
-    assert_eq!(id_geometry(&document, "target").1.height, 100.0);
+    assert_eq!(
+        id_geometry(&document, "target", &document_resources)
+            .1
+            .height,
+        100.0
+    );
 }
 
 #[test]
 fn intrinsic_block_size_keywords_constrain_natural_content_height() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'>
             <div id='minimum' style='display:inline-block;height:0;min-height:min-content;padding:2px;border:3px solid;font:20px/1 serif'>X</div>
             <div id='maximum' style='display:inline-block;height:500px;max-height:max-content;padding:2px;border:3px solid;font:20px/1 serif'>X</div>
         </body></html>",
         300.0,
-    );
+     &mut document_resources);
 
-    assert_eq!(id_geometry(&document, "minimum").1.height, 30.0);
-    assert_eq!(id_geometry(&document, "maximum").1.height, 30.0);
+    assert_eq!(
+        id_geometry(&document, "minimum", &document_resources)
+            .1
+            .height,
+        30.0
+    );
+    assert_eq!(
+        id_geometry(&document, "maximum", &document_resources)
+            .1
+            .height,
+        30.0
+    );
 }
 
 #[test]
 fn empty_stretched_inline_block_retains_padding_and_border() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div style='display:inline-block;width:0'><span id='target' style='display:inline-block;width:stretch;margin:5px;padding:2px;border:3px solid'></span></div></body></html>",
         300.0,
+        &mut document_resources,
     );
 
-    assert_eq!(id_geometry(&document, "target").1.width, 10.0);
+    assert_eq!(
+        id_geometry(&document, "target", &document_resources)
+            .1
+            .width,
+        10.0
+    );
 }
 
 #[test]
 fn nested_inline_block_fit_content_uses_its_atomic_containing_width() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div style='display:inline-block;width:100px'><span id='target' style='display:inline-block;width:fit-content;margin:5px;padding:2px;border:3px solid;font:40px/1 Ahem'>XXX XXX</span></div></body></html>",
         800.0,
+        &mut document_resources,
     );
 
-    assert_eq!(id_geometry(&document, "target").1.width, 90.0);
+    assert_eq!(
+        id_geometry(&document, "target", &document_resources)
+            .1
+            .width,
+        90.0
+    );
 }
 
 #[test]
 fn floated_fit_content_child_uses_the_available_intrinsic_contribution() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'>
             <div style='display:inline-block;width:0'><div id='narrow' style='float:left;margin:5px;border:3px solid;padding:2px;font:40px/1 serif'><div style='width:fit-content'>XXX XXX</div></div></div>
@@ -1561,35 +1812,61 @@ fn floated_fit_content_child_uses_the_available_intrinsic_contribution() {
             <div style='display:inline-block;width:200px'><div id='wide' style='float:left;margin:5px;border:3px solid;padding:2px;font:40px/1 serif'><div style='width:fit-content'>XXX XXX</div></div></div>
         </body></html>",
         800.0,
-    );
+     &mut document_resources);
 
-    assert_eq!(id_geometry(&document, "narrow").1.width, 70.0);
-    assert_eq!(id_geometry(&document, "middle").1.width, 90.0);
-    assert_eq!(id_geometry(&document, "wide").1.width, 150.0);
+    assert_eq!(
+        id_geometry(&document, "narrow", &document_resources)
+            .1
+            .width,
+        70.0
+    );
+    assert_eq!(
+        id_geometry(&document, "middle", &document_resources)
+            .1
+            .width,
+        90.0
+    );
+    assert_eq!(
+        id_geometry(&document, "wide", &document_resources).1.width,
+        150.0
+    );
 }
 
 #[test]
 fn stretch_height_is_auto_when_the_containing_block_height_is_indefinite() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0;height:100px'><div style='display:inline-block;width:100px;max-height:100px'><div id='target' style='height:stretch;margin:5px;padding:2px;border:3px solid;font:20px/1 serif'>X</div></div></body></html>",
         300.0,
+        &mut document_resources,
     );
 
-    assert_eq!(id_geometry(&document, "target").1.height, 30.0);
+    assert_eq!(
+        id_geometry(&document, "target", &document_resources)
+            .1
+            .height,
+        30.0
+    );
 }
 
 #[test]
 fn definite_stretch_height_transfers_through_a_preferred_aspect_ratio() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'><div style='height:100px'><div id='target' style='height:stretch;width:auto;aspect-ratio:2/1'></div></div></body></html>",
         800.0,
+        &mut document_resources,
     );
 
-    assert_eq!(id_geometry(&document, "target").1, Size::new(200.0, 100.0));
+    assert_eq!(
+        id_geometry(&document, "target", &document_resources).1,
+        Size::new(200.0, 100.0)
+    );
 }
 
 #[test]
 fn aspect_ratio_automatic_minimum_is_zero_only_on_the_scrollable_axis() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'>
             <div id='inline-x' style='display:inline-block;width:auto;height:100px;aspect-ratio:1/1;overflow-x:hidden;overflow-y:clip'><div style='width:200px;height:200px'></div></div>
@@ -1598,22 +1875,29 @@ fn aspect_ratio_automatic_minimum_is_zero_only_on_the_scrollable_axis() {
             <div id='block-x' style='width:100px;height:auto;aspect-ratio:1/1;overflow-x:hidden;overflow-y:clip'><div style='width:200px;height:200px'></div></div>
         </body></html>",
         800.0,
-    );
+     &mut document_resources);
 
     assert_eq!(
-        id_geometry(&document, "inline-x").1,
+        id_geometry(&document, "inline-x", &document_resources).1,
         Size::new(100.0, 100.0)
     );
     assert_eq!(
-        id_geometry(&document, "inline-y").1,
+        id_geometry(&document, "inline-y", &document_resources).1,
         Size::new(200.0, 100.0)
     );
-    assert_eq!(id_geometry(&document, "block-y").1, Size::new(100.0, 100.0));
-    assert_eq!(id_geometry(&document, "block-x").1, Size::new(100.0, 200.0));
+    assert_eq!(
+        id_geometry(&document, "block-y", &document_resources).1,
+        Size::new(100.0, 100.0)
+    );
+    assert_eq!(
+        id_geometry(&document, "block-x", &document_resources).1,
+        Size::new(100.0, 200.0)
+    );
 }
 
 #[test]
 fn block_justify_self_shrink_wraps_and_uses_logical_and_physical_alignment() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<!doctype html><html><body style='margin:0'>
             <div id='ltr' style='display:flow-root;width:40px;direction:ltr'>
@@ -1629,10 +1913,10 @@ fn block_justify_self_shrink_wraps_and_uses_logical_and_physical_alignment() {
             </div>
         </body></html>",
         300.0,
-    );
+     &mut document_resources);
 
-    let (ltr_point, _) = id_geometry(&document, "ltr");
-    let (rtl_point, _) = id_geometry(&document, "rtl");
+    let (ltr_point, _) = id_geometry(&document, "ltr", &document_resources);
+    let (rtl_point, _) = id_geometry(&document, "rtl", &document_resources);
     for id in [
         "start",
         "center",
@@ -1643,28 +1927,54 @@ fn block_justify_self_shrink_wraps_and_uses_logical_and_physical_alignment() {
         "right",
     ] {
         assert_eq!(
-            id_geometry(&document, id).1.width,
+            id_geometry(&document, id, &document_resources).1.width,
             20.0,
             "#{id} should use its fit-content width"
         );
     }
-    assert_eq!(id_geometry(&document, "start").0.x - ltr_point.x, 0.0);
-    assert_eq!(id_geometry(&document, "center").0.x - ltr_point.x, 10.0);
-    assert_eq!(id_geometry(&document, "end").0.x - ltr_point.x, 20.0);
-    assert_eq!(id_geometry(&document, "self-start").0.x - ltr_point.x, 20.0);
-    assert_eq!(id_geometry(&document, "rtl-start").0.x - rtl_point.x, 20.0);
-    assert_eq!(id_geometry(&document, "left").0.x - rtl_point.x, 0.0);
-    assert_eq!(id_geometry(&document, "right").0.x - rtl_point.x, 20.0);
+    assert_eq!(
+        id_geometry(&document, "start", &document_resources).0.x - ltr_point.x,
+        0.0
+    );
+    assert_eq!(
+        id_geometry(&document, "center", &document_resources).0.x - ltr_point.x,
+        10.0
+    );
+    assert_eq!(
+        id_geometry(&document, "end", &document_resources).0.x - ltr_point.x,
+        20.0
+    );
+    assert_eq!(
+        id_geometry(&document, "self-start", &document_resources)
+            .0
+            .x
+            - ltr_point.x,
+        20.0
+    );
+    assert_eq!(
+        id_geometry(&document, "rtl-start", &document_resources).0.x - rtl_point.x,
+        20.0
+    );
+    assert_eq!(
+        id_geometry(&document, "left", &document_resources).0.x - rtl_point.x,
+        0.0
+    );
+    assert_eq!(
+        id_geometry(&document, "right", &document_resources).0.x - rtl_point.x,
+        20.0
+    );
 }
 
 #[test]
 fn block_justify_items_supplies_auto_justify_self() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<!doctype html><html><body style='margin:0'><div id='parent' style='display:flow-root;width:40px;justify-items:center'><div id='child'><span style='display:block;width:20px;height:1px'></span></div></div></body></html>",
         300.0,
+        &mut document_resources,
     );
-    let (parent_point, _) = id_geometry(&document, "parent");
-    let (child_point, child_size) = id_geometry(&document, "child");
+    let (parent_point, _) = id_geometry(&document, "parent", &document_resources);
+    let (child_point, child_size) = id_geometry(&document, "child", &document_resources);
 
     assert_eq!(child_size.width, 20.0);
     assert_eq!(child_point.x - parent_point.x, 10.0);
@@ -1672,49 +1982,76 @@ fn block_justify_items_supplies_auto_justify_self() {
 
 #[test]
 fn justify_self_shrink_wrapped_parent_still_stretches_its_block_in_inline_child() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<!doctype html><html><body style='margin:0'><div id='outer' style='justify-self:start'><span style='display:inline-block;width:200px;height:1px'></span><div id='block' style='height:1px'></div><span style='display:inline-block;width:100px;height:1px'></span></div></body></html>",
         800.0,
+        &mut document_resources,
     );
 
-    assert_eq!(id_geometry(&document, "outer").1.width, 200.0);
-    assert_eq!(id_geometry(&document, "block").1.width, 200.0);
+    assert_eq!(
+        id_geometry(&document, "outer", &document_resources).1.width,
+        200.0
+    );
+    assert_eq!(
+        id_geometry(&document, "block", &document_resources).1.width,
+        200.0
+    );
 }
 
 #[test]
 fn absolute_stretch_respects_min_size_when_insets_exhaust_the_containing_block() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<!doctype html><html><body style='margin:0'><div id='container' style='display:inline-block;position:relative;width:20px;height:20px'><div id='target' style='position:absolute;inset:18px;margin:auto;min-width:12px;min-height:12px'></div></div></body></html>",
         300.0,
+        &mut document_resources,
     );
 
-    assert_eq!(id_geometry(&document, "target").1, Size::new(12.0, 12.0));
+    assert_eq!(
+        id_geometry(&document, "target", &document_resources).1,
+        Size::new(12.0, 12.0)
+    );
 }
 
 #[test]
 fn absolute_auto_table_keeps_its_intrinsic_size_when_insets_exhaust_the_containing_block() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<!doctype html><html><body style='margin:0'><div style='position:relative;width:20px;height:20px'><div id='target' style='display:table;position:absolute;inset:18px;margin:auto'><div style='width:12px;height:12px'></div></div></div></body></html>",
         300.0,
+        &mut document_resources,
     );
 
-    assert_eq!(id_geometry(&document, "target").1, Size::new(12.0, 12.0));
+    assert_eq!(
+        id_geometry(&document, "target", &document_resources).1,
+        Size::new(12.0, 12.0)
+    );
 }
 
 #[test]
 fn body_overflow_propagated_to_the_viewport_does_not_create_a_body_bfc() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<!doctype html><html id='root'><body style='overflow-x:hidden'><div id='list' style='position:relative'><p style='position:absolute;top:0;width:10px;height:10px;margin:0'></p><p style='position:absolute;top:1000px;width:10px;height:10px;margin:0'></p></div></body></html>",
         800.0,
+        &mut document_resources,
     );
 
-    assert_eq!(id_geometry(&document, "root").1.height, 8.0);
-    assert_eq!(tag_size(&document, "body").height, 0.0);
-    assert_eq!(id_geometry(&document, "list").1.height, 0.0);
+    assert_eq!(
+        id_geometry(&document, "root", &document_resources).1.height,
+        8.0
+    );
+    assert_eq!(tag_size(&document, "body", &document_resources).height, 0.0);
+    assert_eq!(
+        id_geometry(&document, "list", &document_resources).1.height,
+        0.0
+    );
 }
 
 #[test]
 fn wrapped_column_flex_stretch_uses_each_lines_cross_size() {
+    let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
         "<html><body style='margin:0'>
             <div style='display:flex;flex-direction:column;max-width:100px;width:min-content;height:100px;border:3px solid;flex-wrap:wrap;align-content:start;font:20px/1 serif'>
@@ -1728,10 +2065,30 @@ fn wrapped_column_flex_stretch_uses_each_lines_cross_size() {
             </div>
         </body></html>",
         800.0,
-    );
+     &mut document_resources);
 
-    assert_eq!(id_geometry(&document, "first-a").1.width, 16.0);
-    assert_eq!(id_geometry(&document, "first-b").1.width, 16.0);
-    assert_eq!(id_geometry(&document, "second-c").1.width, 156.0);
-    assert_eq!(id_geometry(&document, "second-d").1.width, 100.0);
+    assert_eq!(
+        id_geometry(&document, "first-a", &document_resources)
+            .1
+            .width,
+        16.0
+    );
+    assert_eq!(
+        id_geometry(&document, "first-b", &document_resources)
+            .1
+            .width,
+        16.0
+    );
+    assert_eq!(
+        id_geometry(&document, "second-c", &document_resources)
+            .1
+            .width,
+        156.0
+    );
+    assert_eq!(
+        id_geometry(&document, "second-d", &document_resources)
+            .1
+            .width,
+        100.0
+    );
 }

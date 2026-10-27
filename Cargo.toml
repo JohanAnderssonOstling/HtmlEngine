@@ -1,5 +1,6 @@
 [workspace]
 resolver = "3"
+exclude = ["vendor/lightningcss"]
 members = [
     "crates/01-html-source",
     "crates/02-html-parse",
@@ -11,6 +12,10 @@ members = [
     "crates/html-pipeline",
     "crates/html-resources",
     "crates/html-style-model",
+    "crates/html-text",
+    "crates/html-engine-model",
+    "crates/html-format",
+    "crates/html-shape",
     "test-support/html-wpt",
 ]
 
@@ -28,3 +33,9 @@ html5ever = "0.39"
 quick-xml = { version = "0.41", features = ["escape-html"] }
 encoding_rs = "0.8"
 ego-tree = "0.11"
+unicode-bidi = "0.3.18"
+
+# alpha.72 panics on mixed number/percentage calculations. Keep the error
+# handling fix in the dependency until an upstream release contains it.
+[patch.crates-io]
+lightningcss = { path = "vendor/lightningcss" }

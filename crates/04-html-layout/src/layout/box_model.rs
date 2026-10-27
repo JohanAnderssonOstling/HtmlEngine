@@ -1,7 +1,7 @@
 use html_style_model::UsedStyleView;
 
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct UsedBorderInsets {
+pub struct UsedBorderInsets {
     pub top: f64,
     pub right: f64,
     pub bottom: f64,
@@ -9,11 +9,11 @@ pub(crate) struct UsedBorderInsets {
 }
 
 impl UsedBorderInsets {
-    pub(crate) fn horizontal(self) -> f64 {
+    pub fn horizontal(self) -> f64 {
         self.left + self.right
     }
 
-    pub(crate) fn vertical(self) -> f64 {
+    pub fn vertical(self) -> f64 {
         self.top + self.bottom
     }
 }
@@ -25,7 +25,7 @@ impl UsedBorderInsets {
 /// decide whether a CSS rule suppresses a value (for example table-cell
 /// margins) and which percentage basis applies.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ResolvedBoxModel {
+pub struct ResolvedBoxModel {
     pub margin_left: f64,
     pub margin_right: f64,
     pub margin_top: f64,
@@ -41,7 +41,7 @@ pub(crate) struct ResolvedBoxModel {
 }
 
 impl ResolvedBoxModel {
-    pub(crate) fn new(style: UsedStyleView<'_>, containing_width: f64) -> Self {
+    pub fn new(style: UsedStyleView<'_>, containing_width: f64) -> Self {
         Self {
             margin_left: style.margin_left().resolve(containing_width),
             margin_right: style.margin_right().resolve(containing_width),
@@ -58,7 +58,7 @@ impl ResolvedBoxModel {
         }
     }
 
-    pub(crate) fn with_used_borders(mut self, borders: UsedBorderInsets) -> Self {
+    pub fn with_used_borders(mut self, borders: UsedBorderInsets) -> Self {
         self.border_top = borders.top;
         self.border_right = borders.right;
         self.border_bottom = borders.bottom;
@@ -66,7 +66,7 @@ impl ResolvedBoxModel {
         self
     }
 
-    pub(crate) fn without_padding(mut self) -> Self {
+    pub fn without_padding(mut self) -> Self {
         self.padding_top = 0.0;
         self.padding_right = 0.0;
         self.padding_bottom = 0.0;
@@ -74,11 +74,11 @@ impl ResolvedBoxModel {
         self
     }
 
-    pub(crate) fn horizontal_margin(self) -> f64 {
+    pub fn horizontal_margin(self) -> f64 {
         self.margin_left + self.margin_right
     }
 
-    pub(crate) fn vertical_margin(self) -> f64 {
+    pub fn vertical_margin(self) -> f64 {
         self.margin_top + self.margin_bottom
     }
 
@@ -98,11 +98,11 @@ impl ResolvedBoxModel {
         self.border_top + self.border_bottom
     }
 
-    pub(crate) fn horizontal_padding_border(self) -> f64 {
+    pub fn horizontal_padding_border(self) -> f64 {
         self.horizontal_padding() + self.horizontal_border()
     }
 
-    pub(crate) fn vertical_padding_border(self) -> f64 {
+    pub fn vertical_padding_border(self) -> f64 {
         self.vertical_padding() + self.vertical_border()
     }
 }

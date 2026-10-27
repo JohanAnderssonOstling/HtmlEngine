@@ -3159,6 +3159,7 @@ version = "0.1.0"
 dependencies = [
  "kurbo 0.11.3",
  "rustc_data_structures",
+ "unicode-bidi",
 ]
 
 [[package]]
@@ -3174,6 +3175,19 @@ dependencies = [
  "html-source",
  "html-style",
  "html-style-model",
+]
+
+[[package]]
+name = "html-engine-model"
+version = "0.1.0"
+dependencies = [
+ "html-dom",
+ "html-style-model",
+ "html-text",
+ "kurbo 0.11.3",
+ "rustc_data_structures",
+ "unicode-bidi",
+ "unicode-segmentation",
 ]
 
 [[package]]
@@ -3195,6 +3209,20 @@ dependencies = [
  "wasm-bindgen-futures",
  "web-sys",
  "wuff",
+]
+
+[[package]]
+name = "html-format"
+version = "0.1.0"
+dependencies = [
+ "formulary",
+ "html-dom",
+ "html-engine-model",
+ "html-style-model",
+ "html-text",
+ "quick-xml 0.38.4",
+ "rustc_data_structures",
+ "unicode_categories",
 ]
 
 [[package]]
@@ -3220,15 +3248,18 @@ dependencies = [
 name = "html-layout"
 version = "0.1.0"
 dependencies = [
- "formulary",
  "html-dom",
+ "html-engine-model",
  "html-style-model",
+ "html-text",
  "hypher",
  "kurbo 0.11.3",
- "quick-xml 0.38.4",
  "rayon",
  "rustc_data_structures",
  "taffy",
+ "unicode-bidi",
+ "unicode-bidi-mirroring",
+ "unicode-normalization",
  "unicode-segmentation",
  "unicode_categories",
  "web-time",
@@ -3252,10 +3283,20 @@ version = "0.1.0"
 dependencies = [
  "encoding_rs",
  "html-dom",
+ "html-engine-model",
+ "html-format",
  "html-layout",
  "html-parse",
  "html-resources",
+ "html-shape",
  "html-style",
+ "html-style-model",
+ "html-text",
+ "kurbo 0.11.3",
+ "rustc_data_structures",
+ "unicode-normalization",
+ "unicode-segmentation",
+ "web-time",
 ]
 
 [[package]]
@@ -3283,6 +3324,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "html-shape"
+version = "0.1.0"
+dependencies = [
+ "html-dom",
+ "html-engine-model",
+ "html-style-model",
+ "html-text",
+ "rustc_data_structures",
+ "unicode-bidi-mirroring",
+]
+
+[[package]]
 name = "html-source"
 version = "0.1.0"
 
@@ -3290,6 +3343,7 @@ version = "0.1.0"
 name = "html-style"
 version = "0.1.0"
 dependencies = [
+ "cssparser 0.37.0",
  "html-dom",
  "html-style-model",
  "lightningcss",
@@ -3305,7 +3359,22 @@ version = "0.1.0"
 dependencies = [
  "html-dom",
  "kurbo 0.11.3",
+ "language-tags",
  "rustc_data_structures",
+ "unicode-script",
+]
+
+[[package]]
+name = "html-text"
+version = "0.1.0"
+dependencies = [
+ "html-dom",
+ "html-style-model",
+ "rustc_data_structures",
+ "unicode-linebreak",
+ "unicode-segmentation",
+ "unicode-width",
+ "unicode_categories",
 ]
 
 [[package]]
@@ -3904,6 +3973,12 @@ dependencies = [
  "polycool",
  "smallvec",
 ]
+
+[[package]]
+name = "language-tags"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d4345964bb142484797b161f473a503a434de77149dd8c7427788c6e13379388"
 
 [[package]]
 name = "lazy_static"
@@ -7825,6 +7900,15 @@ name = "unicode-linebreak"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3b09c83c3c29d37506a3e260c08c03743a6bb66a9cd432c6934ab501a190571f"
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.25"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5fd4f6878c9cb28d874b009da9e8d183b5abc80117c40bbd187a1fde336be6e8"
+dependencies = [
+ "tinyvec",
+]
 
 [[package]]
 name = "unicode-properties"

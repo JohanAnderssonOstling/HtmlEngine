@@ -9,7 +9,7 @@ use taffy::prelude::AvailableSpace;
 type TaffyMeasureKey = (usize, u32, u32, u32, u32, u32, u32);
 
 #[derive(Default)]
-pub(crate) struct FlexGridState {
+pub struct FlexGridState {
     measure_cache: rustc_data_structures::fx::FxHashMap<TaffyMeasureKey, MeasuredItem>,
     container_first_baselines: rustc_data_structures::fx::FxHashMap<usize, f64>,
 }
@@ -21,7 +21,7 @@ pub(super) struct MeasuredItem {
 }
 
 impl FlexGridState {
-    pub(crate) fn clear(&mut self) {
+    pub fn clear(&mut self) {
         self.measure_cache.clear();
         self.container_first_baselines.clear();
     }
@@ -34,7 +34,7 @@ impl FlexGridState {
         self.measure_cache.insert(key, measured);
     }
 
-    pub(crate) fn set_container_first_baseline(&mut self, box_idx: usize, baseline: Option<f64>) {
+    pub fn set_container_first_baseline(&mut self, box_idx: usize, baseline: Option<f64>) {
         if let Some(baseline) = baseline {
             self.container_first_baselines.insert(box_idx, baseline);
         } else {
@@ -42,7 +42,7 @@ impl FlexGridState {
         }
     }
 
-    pub(crate) fn container_first_baseline(&self, box_idx: usize) -> Option<f64> {
+    pub fn container_first_baseline(&self, box_idx: usize) -> Option<f64> {
         self.container_first_baselines.get(&box_idx).copied()
     }
 }

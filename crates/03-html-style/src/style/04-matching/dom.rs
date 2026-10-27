@@ -458,6 +458,14 @@ mod tests {
     }
 
     #[test]
+    fn auto_direction_and_bdi_are_available_to_direction_selectors() {
+        let document = html_parse::parse_dom_document("<!doctype html><main dir='rtl'><p dir='auto' id='hebrew'><bdi>abc</bdi>אבג<span id='child'></span></p><bdi id='latin'>abc</bdi></main>").unwrap();
+        assert!(selector_matches_id(&document, "hebrew", ":dir(rtl)"));
+        assert!(selector_matches_id(&document, "child", ":dir(rtl)"));
+        assert!(selector_matches_id(&document, "latin", ":dir(ltr)"));
+    }
+
+    #[test]
     fn inherited_direction_and_open_state_are_available_to_relational_selectors() {
         let document =
             html_parse::parse_dom_document("<!doctype html><main dir='rtl'><section id='owner'><span id='inherited'></span></section><details id='open' open></details><details id='closed'></details></main>").expect("valid standards HTML");

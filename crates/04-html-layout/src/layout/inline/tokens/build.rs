@@ -12,6 +12,7 @@ fn create_image_token(
     containing_block_height: Option<f64>,
     standalone_image: Option<u32>,
 ) -> (InlineToken, InlineTokenMetrics, ReplacedToken) {
+    profile_scope!("tokens.image_metrics");
     let style = engine.reader.style(box_idx as usize);
     let self_owned_replaced = box_idx as usize == container_box_idx;
     let vertical_align = if self_owned_replaced {
@@ -54,7 +55,7 @@ fn create_image_token(
         return (
             InlineToken::new(
                 InlineTokenKind::Image {
-                    payload_idx: u32::MAX,
+                    payload_idx: InlineToken::MAX_DATA,
                 },
                 content_size.width,
                 BreakKind::None,
@@ -65,11 +66,9 @@ fn create_image_token(
                 owner_box_idx: box_idx,
                 ascent: content_size.height as f32,
                 descent: 0.0,
-                line_height,
-                tab_interval: -1.0,
-                tab_min_advance: 0.0,
+                line_height: line_height as f32,
                 font_size,
-                vertical_align,
+                vertical_align: InlineVerticalAlign::resolve(vertical_align, line_height, style.font_size()),
                 white_space: style.white_space(),
                 visible: style.visibility() == html_style_model::Visibility::Visible,
                 placement_required: false,
@@ -157,7 +156,7 @@ fn create_image_token(
     (
         InlineToken::new(
             InlineTokenKind::Image {
-                payload_idx: u32::MAX,
+                payload_idx: InlineToken::MAX_DATA,
             },
             outer_width,
             BreakKind::None,
@@ -168,11 +167,9 @@ fn create_image_token(
             owner_box_idx: box_idx,
             ascent: (outer_height - math_descent) as f32,
             descent: math_descent as f32,
-            line_height,
-            tab_interval: -1.0,
-            tab_min_advance: 0.0,
+            line_height: line_height as f32,
             font_size,
-            vertical_align,
+            vertical_align: InlineVerticalAlign::resolve(vertical_align, line_height, style.font_size()),
             white_space: style.white_space(),
             visible: style.visibility() == html_style_model::Visibility::Visible,
             placement_required: false,
@@ -210,11 +207,9 @@ fn create_break_token(
             owner_box_idx: box_idx,
             ascent: 0.0,
             descent: 0.0,
-            line_height,
-            tab_interval: -1.0,
-            tab_min_advance: 0.0,
+            line_height: line_height as f32,
             font_size: style.font_size(),
-            vertical_align,
+            vertical_align: InlineVerticalAlign::resolve(vertical_align, line_height, style.font_size()),
             white_space: style.white_space(),
             visible: style.visibility() == html_style_model::Visibility::Visible,
             placement_required: false,
@@ -240,11 +235,9 @@ fn create_float_anchor_token(
             owner_box_idx: box_idx,
             ascent: 0.0,
             descent: 0.0,
-            line_height,
-            tab_interval: -1.0,
-            tab_min_advance: 0.0,
+            line_height: line_height as f32,
             font_size: style.font_size(),
-            vertical_align,
+            vertical_align: InlineVerticalAlign::resolve(vertical_align, line_height, style.font_size()),
             white_space: style.white_space(),
             visible: style.visibility() == html_style_model::Visibility::Visible,
             placement_required: false,
@@ -270,11 +263,9 @@ fn create_absolute_anchor_token(
             owner_box_idx: box_idx,
             ascent: 0.0,
             descent: 0.0,
-            line_height,
-            tab_interval: -1.0,
-            tab_min_advance: 0.0,
+            line_height: line_height as f32,
             font_size: style.font_size(),
-            vertical_align,
+            vertical_align: InlineVerticalAlign::resolve(vertical_align, line_height, style.font_size()),
             white_space: style.white_space(),
             visible: style.visibility() == html_style_model::Visibility::Visible,
             placement_required: false,
@@ -291,6 +282,11 @@ fn create_inline_boundary_token(
     vertical_align: VerticalAlignValue,
     max_width: f64,
 ) -> (InlineToken, InlineTokenMetrics, ReplacedToken) {
+    let parent_direction = engine.reader.get_parent(box_idx as usize)
+        .map_or(style.direction(), |parent| engine.reader.style(parent).direction());
+    let (inline_start, inline_end) = if parent_direction == TextDirection::Rtl {
+        (inline_end, inline_start)
+    } else { (inline_start, inline_end) };
     let margin_left = if inline_start {
         style.margin_left().resolve(max_width)
     } else {
@@ -328,7 +324,7 @@ fn create_inline_boundary_token(
     let (ascent, descent) = (font_ascent + half_leading, font_descent + half_leading);
     let token = InlineToken::new(
         InlineTokenKind::InlineBoundary {
-            payload_idx: u32::MAX,
+            payload_idx: InlineToken::MAX_DATA,
         },
         margin_left + left + right + margin_right,
         BreakKind::None,
@@ -339,11 +335,9 @@ fn create_inline_boundary_token(
         owner_box_idx: box_idx,
         ascent: ascent as f32,
         descent: descent as f32,
-        line_height,
-        tab_interval: -1.0,
-        tab_min_advance: 0.0,
+        line_height: line_height as f32,
         font_size: font_size as f32,
-        vertical_align,
+        vertical_align: InlineVerticalAlign::resolve(vertical_align, line_height, style.font_size()),
         white_space: style.white_space(),
         visible: style.visibility() == html_style_model::Visibility::Visible,
         placement_required: false,
@@ -361,6 +355,30 @@ fn create_inline_boundary_token(
     )
 }
 
+/// Retained plans contain only text and markers, so replay cannot recurse
+/// into atomic inline boxes or place float anchors.
+pub(in crate::layout::inline) fn cached_inline_plan_key(
+    engine: &crate::layout::LayoutEngine<'_, '_>, run_range: &Range<u32>, container_box_idx: usize,
+) -> Option<PreparedInlinePlanKey> {
+    let plan_key = PreparedInlinePlanKey {
+        run_start: run_range.start,
+        run_end: run_range.end,
+        container_box_idx: u32::try_from(container_box_idx)
+            .expect("inline-plan box index exhausted"),
+        high_quality_hyphenation: engine.config.hyphenation_quality(),
+        book_optimized: engine.config.book_optimized_text(),
+    };
+    let source_runs = &engine.text.inline_items()[run_range.start as usize..run_range.end as usize];
+    let cacheable = !source_runs.is_empty()
+        && source_runs.iter().all(|run| {
+            matches!(
+                run.kind,
+                InlineItemKind::Text { .. } | InlineItemKind::Marker { .. }
+            )
+        });
+    cacheable.then_some(plan_key)
+}
+
 /// Converts inline items into layout tokens.
 ///
 /// Each token carries the geometry and break metadata needed by the line
@@ -371,66 +389,22 @@ pub(in crate::layout::inline) fn build_inline_tokens(
     container_box_idx: usize,
     max_width: f64,
     containing_block_height: Option<f64>,
-) -> InlineTokens {
+) -> InlineTokens<'static> {
+    profile_scope!("tokens.build");
     let timing_started = engine.start_timing();
-    let plan_key = PreparedInlinePlanKey {
-        run_start: run_range.start,
-        run_end: run_range.end,
-        container_box_idx: u32::try_from(container_box_idx)
-            .expect("inline-plan box index exhausted"),
-        high_quality_hyphenation: engine.config.hyphenation_quality(),
-    };
-    let source_runs = &engine.text.inline_items()[run_range.start as usize..run_range.end as usize];
-    let cacheable = !engine.config.sentence_per_line()
-        && engine.inline_plans.can_cache(plan_key.container_box_idx)
-        && source_runs.iter().all(|run| {
-            matches!(
-                run.kind,
-                InlineItemKind::Text { .. } | InlineItemKind::Marker { .. }
-            )
-        });
-    let glyph_count = source_runs
-        .iter()
-        .map(|run| match &run.kind {
-            InlineItemKind::Text { glyphs } | InlineItemKind::Marker { glyphs } => glyphs.len(),
-            _ => 0,
-        })
-        .sum::<usize>();
-    if cacheable && let Some(tokens) = engine.inline_plans.get(plan_key) {
-        engine.record_timing(|t| t.build_inline_tokens += timing_started.elapsed());
-        return tokens;
-    }
-
-    // Atomic descendants allocate their own run ranges in the shared arena.
-    // Clone this small range so token measurement can mutably invoke their
-    // independent layout algorithms without aliasing the arena borrow.
-    let runs =
-        engine.text.inline_items()[run_range.start as usize..run_range.end as usize].to_vec();
-    let standalone_image = standalone_inline_image(engine, &runs, container_box_idx);
-    let mut tokens = build_inline_tokens_from_runs(
+    // Inline content is immutable throughout layout. Copy the reader so this
+    // borrow stays independent of recursive mutations to the layout executor.
+    let text = engine.text;
+    let runs = &text.inline_items()[run_range.start as usize..run_range.end as usize];
+    let standalone_image = standalone_inline_image(engine, runs, container_box_idx);
+    let tokens = build_inline_tokens_from_runs(
         engine,
-        &runs,
+        runs,
         container_box_idx,
         max_width,
         containing_block_height,
         standalone_image,
     );
-    if engine.config.sentence_per_line() {
-        tokens.insert_sentence_breaks(engine);
-        tokens.rebuild_summary_blocks();
-    }
-    if cacheable {
-        if glyph_count >= INLINE_KP_CACHE_MIN_GLYPHS
-            && (engine.config.force_justify()
-                || engine.reader.style(container_box_idx).text_align() == TextAlign::Justify
-                || (engine.config.book_optimized_text()
-                    && engine.reader.style(container_box_idx).text_align() == TextAlign::Left))
-        {
-            tokens.enable_kp_plan_cache();
-        }
-        tokens.share();
-        tokens = engine.inline_plans.insert(plan_key, tokens);
-    }
     // Nested timing is measured in build_inline_tokens_from_runs; this captures the outer wrapper.
     engine.record_timing(|t| t.build_inline_tokens += timing_started.elapsed());
     tokens
@@ -443,7 +417,8 @@ pub(super) fn build_inline_tokens_from_runs(
     max_width: f64,
     containing_block_height: Option<f64>,
     standalone_image: Option<u32>,
-) -> InlineTokens {
+) -> InlineTokens<'static> {
+    profile_scope!("tokens.from_runs");
     let timing_started = engine.start_timing();
     let glyph_capacity = runs
         .iter()
@@ -454,8 +429,10 @@ pub(super) fn build_inline_tokens_from_runs(
             _ => 1,
         })
         .sum();
-    let mut tokens = InlineTokens::with_capacity(glyph_capacity);
+    let hyphen_breaks = automatic_hyphen_breaks(engine, runs, container_box_idx);
+    let mut tokens = engine.inline_plans.working_tokens(glyph_capacity);
     for run in runs {
+        let token_start = tokens.len();
         let ownership_box = inline_item_ownership_box(engine, run);
         if !ownership_box.is_some_and(|box_idx| {
             run_belongs_to_inline_context(engine, box_idx, container_box_idx)
@@ -476,6 +453,7 @@ pub(super) fn build_inline_tokens_from_runs(
                     style,
                     white_space,
                     vertical_align,
+                    &hyphen_breaks,
                 );
             }
             InlineItemKind::Image { image_idx } => {
@@ -568,8 +546,9 @@ pub(super) fn build_inline_tokens_from_runs(
                 }
             }
             InlineItemKind::Break { clear } => {
-                let (token, metrics) =
+                let (mut token, metrics) =
                     create_break_token(run.box_idx, *clear, style, vertical_align);
+                token.mark_authored_break();
                 tokens.push(token, metrics);
             }
             InlineItemKind::FloatAnchor { box_idx } => {
@@ -602,6 +581,16 @@ pub(super) fn build_inline_tokens_from_runs(
                 );
             }
         }
+        for token in &mut tokens.dense[token_start..] {
+            let level = match token.kind() {
+                InlineTokenKind::Glyph { glyph_idx } => engine.text.bidi_level(glyph_idx),
+                _ => engine.text.item_bidi_level(run),
+            };
+            token.set_bidi_level(level);
+        }
+    }
+    if engine.text.content().has_unicode_wraps() {
+        tokens.insert_unicode_break_opportunities(engine);
     }
     tokens.insert_preserved_space_break_opportunities(engine);
     tokens.collapse_edge_whitespace_through_boundaries();
@@ -703,6 +692,7 @@ fn create_atomic_box_token(
     max_width: f64,
     containing_block_height: Option<f64>,
 ) -> (InlineToken, InlineTokenMetrics, ReplacedToken) {
+    profile_scope!("tokens.atomic_box");
     let max_width = max_width.max(0.0);
     let margin_left = style.margin_left().resolve(max_width);
     let margin_right = style.margin_right().resolve(max_width);
@@ -869,7 +859,7 @@ fn create_atomic_box_token(
     (
         InlineToken::new(
             InlineTokenKind::AtomicBox {
-                payload_idx: u32::MAX,
+                payload_idx: InlineToken::MAX_DATA,
             },
             outer_width,
             BreakKind::None,
@@ -880,11 +870,9 @@ fn create_atomic_box_token(
             owner_box_idx: box_idx,
             ascent: ascent as f32,
             descent: descent as f32,
-            line_height,
-            tab_interval: -1.0,
-            tab_min_advance: 0.0,
+            line_height: line_height as f32,
             font_size: style.font_size(),
-            vertical_align,
+            vertical_align: InlineVerticalAlign::resolve(vertical_align, line_height, style.font_size()),
             white_space: style.white_space(),
             visible: style.visibility() == html_style_model::Visibility::Visible,
             placement_required: false,

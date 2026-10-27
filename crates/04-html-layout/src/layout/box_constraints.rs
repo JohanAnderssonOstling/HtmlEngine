@@ -7,7 +7,7 @@ use kurbo::Size;
 
 /// `border_box_inset` is the padding+border to subtract from a specified size
 /// under `box-sizing: border-box` (0 for `content-box`); `auto` is unaffected.
-pub(crate) fn resolve_vertical_size(
+pub fn resolve_vertical_size(
     size: PreferredSize,
     parent_content_height: Option<f64>,
     border_box_inset: f64,
@@ -20,7 +20,7 @@ pub(crate) fn resolve_vertical_size(
     )
 }
 
-pub(crate) fn resolve_vertical_size_with_stretch_inset(
+pub fn resolve_vertical_size_with_stretch_inset(
     size: PreferredSize,
     parent_content_height: Option<f64>,
     border_box_inset: f64,
@@ -36,7 +36,7 @@ pub(crate) fn resolve_vertical_size_with_stretch_inset(
 
 /// Resolve a numeric CSS size whose percentage basis may be indefinite.
 /// Keywords whose meaning belongs to a formatting context remain unresolved.
-pub(crate) fn resolve_definite_size_value(
+pub fn resolve_definite_size_value(
     size: PreferredSize,
     percentage_basis: Option<f64>,
 ) -> Option<f64> {
@@ -62,6 +62,7 @@ pub(crate) fn resolve_definite_size_value(
             }
         }
         PreferredSize::Auto
+        | PreferredSize::Content
         | PreferredSize::MinContent
         | PreferredSize::MaxContent
         | PreferredSize::FitContent
@@ -72,7 +73,7 @@ pub(crate) fn resolve_definite_size_value(
 /// Resolve a content-box size from a CSS size and explicit box-model insets.
 /// `stretch` fits the margin box, so its inset may differ from the inset used
 /// to convert a border-box authored size.
-pub(crate) fn resolve_definite_content_size_with_insets(
+pub fn resolve_definite_content_size_with_insets(
     size: PreferredSize,
     percentage_basis: Option<f64>,
     border_box_inset: f64,
@@ -87,7 +88,7 @@ pub(crate) fn resolve_definite_content_size_with_insets(
 
 /// Resolve a content-box size when the caller has margins, padding, borders,
 /// and `box-sizing` rather than precomputed conversion insets.
-pub(crate) fn resolve_definite_content_size(
+pub fn resolve_definite_content_size(
     size: PreferredSize,
     percentage_basis: Option<f64>,
     margin: f64,
@@ -110,7 +111,7 @@ pub(crate) fn resolve_definite_content_size(
 /// Resolve an inline size that is independent of its containing block and
 /// convert it to an outer size. Formatting contexts can share this conversion
 /// while retaining ownership of their own auto/percentage sizing algorithms.
-pub(crate) fn resolve_definite_outer_inline_size(
+pub fn resolve_definite_outer_inline_size(
     size: PreferredSize,
     box_sizing: BoxSizing,
     padding_border: f64,
@@ -124,7 +125,7 @@ pub(crate) fn resolve_definite_outer_inline_size(
 /// unresolved percentage in `min-height` contributes zero rather than making
 /// the entire value behave as `auto`. A mixed calc therefore retains its
 /// absolute component when the containing block has an indefinite height.
-pub(crate) fn resolve_vertical_min_size(
+pub fn resolve_vertical_min_size(
     size: PreferredSize,
     parent_content_height: Option<f64>,
     border_box_inset: f64,
@@ -137,7 +138,7 @@ pub(crate) fn resolve_vertical_min_size(
     )
 }
 
-pub(crate) fn resolve_vertical_min_size_with_stretch_inset(
+pub fn resolve_vertical_min_size_with_stretch_inset(
     size: PreferredSize,
     parent_content_height: Option<f64>,
     border_box_inset: f64,
@@ -182,7 +183,7 @@ pub(super) fn resolve_content_width(
     )
 }
 
-pub(crate) fn constrain_content_width(
+pub fn constrain_content_width(
     width: f64,
     min_width: PreferredSize,
     max_width: PreferredSize,
@@ -275,7 +276,7 @@ enum BoxMeasurementMode {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct BoxLayoutRequest {
+pub struct BoxLayoutRequest {
     pub(super) box_idx: usize,
     pub(super) available_width: f64,
     /// Optional inline space left by adjacent floats. Percentages and margins
@@ -290,11 +291,11 @@ pub(crate) struct BoxLayoutRequest {
 }
 
 impl BoxLayoutRequest {
-    pub(crate) fn box_idx(self) -> usize {
+    pub fn box_idx(self) -> usize {
         self.box_idx
     }
 
-    pub(crate) fn normal(
+    pub fn normal(
         box_idx: usize,
         available_width: f64,
         parent_content_height: Option<f64>,
@@ -311,12 +312,12 @@ impl BoxLayoutRequest {
         }
     }
 
-    pub(crate) fn with_auto_width_limit(mut self, auto_width_limit: f64) -> Self {
+    pub fn with_auto_width_limit(mut self, auto_width_limit: f64) -> Self {
         self.auto_width_limit = Some(auto_width_limit.max(0.0));
         self
     }
 
-    pub(crate) fn table_cell(
+    pub fn table_cell(
         box_idx: usize,
         available_width: f64,
         parent_content_height: Option<f64>,
@@ -328,17 +329,17 @@ impl BoxLayoutRequest {
         }
     }
 
-    pub(crate) fn for_table_intrinsic_measurement(mut self) -> Self {
+    pub fn for_table_intrinsic_measurement(mut self) -> Self {
         self.measurement_mode = BoxMeasurementMode::TableIntrinsic;
         self
     }
 
-    pub(crate) fn for_intrinsic_block_measurement(mut self) -> Self {
+    pub fn for_intrinsic_block_measurement(mut self) -> Self {
         self.measurement_mode = BoxMeasurementMode::IntrinsicBlock;
         self
     }
 
-    pub(crate) fn with_assigned_border_height(mut self, height: f64) -> Self {
+    pub fn with_assigned_border_height(mut self, height: f64) -> Self {
         self.parent_content_height = Some(height.max(0.0));
         self.assigned_border_size = Some(AssignedBorderSize {
             width: None,
@@ -351,7 +352,7 @@ impl BoxLayoutRequest {
     /// Final geometry for an atomic inline box. A measured height fixes the
     /// box geometry without necessarily establishing a definite percentage
     /// basis for its descendants.
-    pub(crate) fn atomic_assigned(
+    pub fn atomic_assigned(
         box_idx: usize,
         containing_width: f64,
         containing_height: Option<f64>,
@@ -374,7 +375,7 @@ impl BoxLayoutRequest {
         }
     }
 
-    pub(crate) fn taffy_assigned(
+    pub fn taffy_assigned(
         box_idx: usize,
         containing_width: f64,
         parent_content_height: Option<f64>,
@@ -397,7 +398,7 @@ impl BoxLayoutRequest {
         }
     }
 
-    pub(crate) fn width_assigned(
+    pub fn width_assigned(
         box_idx: usize,
         containing_width: f64,
         assigned_width: f64,
@@ -419,7 +420,7 @@ impl BoxLayoutRequest {
         }
     }
 
-    pub(crate) fn absolute_assigned(
+    pub fn absolute_assigned(
         box_idx: usize,
         containing_width: f64,
         containing_height: f64,

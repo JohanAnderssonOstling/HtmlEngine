@@ -2,17 +2,15 @@ pub mod cfi;
 mod dom;
 mod memory;
 mod resources;
-mod toc;
 
 pub use dom::*;
 pub use memory::*;
 pub use resources::*;
-pub use toc::*;
 
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-#[derive(Clone)]
+#[derive(Clone, Hash)]
 pub struct DocumentLineage(NonZeroU64);
 
 static NEXT_DOCUMENT_LINEAGE: AtomicU64 = AtomicU64::new(1);
@@ -128,18 +126,6 @@ impl Document {
         image_idx
     }
 
-    pub fn toc_entries(&self) -> &[DocumentTocEntry] {
-        self.toc_entries.as_slice()
-    }
-
-    pub fn document_toc_entries(&self) -> &[DocumentTocNode] {
-        self.document_toc_entries.as_slice()
-    }
-
-    pub fn rebuild_document_toc_entries(&mut self) {
-        self.document_toc_entries = build_document_toc_tree(self.toc_entries.as_slice());
-    }
-
     pub fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
         report.add_slice_storage::<DomNode>("Document.dom_nodes.storage", self.dom_nodes.capacity(), self.dom_nodes.len());
@@ -155,11 +141,6 @@ impl Document {
         }
         report.extend_prefixed("Document.strings", self.strings.memory_usage_report());
         report.add_slice_storage::<u16>("Document.class_list.storage", self.class_list.capacity(), self.class_list.len());
-        report.add_slice_storage::<DocumentTocEntry>("Document.toc_entries.storage", self.toc_entries.capacity(), self.toc_entries.len());
-        report.add_slice_storage::<DocumentTocNode>("Document.document_toc_entries.storage", self.document_toc_entries.capacity(), self.document_toc_entries.len());
-        for node in &self.document_toc_entries {
-            report.extend_prefixed("Document.document_toc_entries", node.memory_usage_report());
-        }
         report
     }
 }
@@ -182,10 +163,6 @@ pub struct Document {
     strings: StringInterner,
     class_list: Vec<u16>, // interned class indices
 
-    // Document-level navigation
-    toc_entries: Vec<DocumentTocEntry>,
-    document_toc_entries: Vec<DocumentTocNode>,
-
     // Style configuration input; computed styles live in the style-stage output.
     root_font_size: RootFontSize,
 }
@@ -201,8 +178,6 @@ impl Default for Document {
             title: None,
             strings: StringInterner::new(),
             class_list: Vec::new(),
-            toc_entries: Vec::new(),
-            document_toc_entries: Vec::new(),
             root_font_size: RootFontSize::default(),
         }
     }

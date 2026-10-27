@@ -1,10 +1,14 @@
+use crate::style::syntax::value::split_important;
 use html_style_model::WhiteSpace;
 use lightningcss::properties::custom::{Token, TokenList, TokenOrValue};
 
 pub const CASCADE_MARKER: &str = "--html-renderer-white-space";
 
 pub fn parse_shorthand(value: &str) -> Option<WhiteSpace> {
-    let words = value.split_ascii_whitespace().map(str::to_ascii_lowercase).collect::<Vec<_>>();
+    let words = value
+        .split_ascii_whitespace()
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>();
     if words.is_empty() {
         return None;
     }
@@ -73,8 +77,12 @@ pub fn parse_shorthand(value: &str) -> Option<WhiteSpace> {
 }
 
 pub fn from_marker_tokens(tokens: &TokenList<'_>) -> Option<WhiteSpace> {
-    let mut significant = tokens.0.iter().filter(|token| !token.is_whitespace() && !matches!(token, TokenOrValue::Token(Token::Comment(_))));
-    let TokenOrValue::Token(Token::Ident(value)) = significant.next()? else { return None };
+    let mut significant = tokens.0.iter().filter(|token| {
+        !token.is_whitespace() && !matches!(token, TokenOrValue::Token(Token::Comment(_)))
+    });
+    let TokenOrValue::Token(Token::Ident(value)) = significant.next()? else {
+        return None;
+    };
     if significant.next().is_some() {
         return None;
     }
@@ -97,14 +105,18 @@ pub(crate) fn normalized_declaration(raw: &str) -> Option<String> {
     let value = value.trim();
     let lower = value.to_ascii_lowercase();
     let (fallback, marker) = match lower.as_str() {
-        "inherit" | "initial" | "unset" | "revert" | "revert-layer" => (lower.as_str(), lower.as_str()),
+        "inherit" | "initial" | "unset" | "revert" | "revert-layer" => {
+            (lower.as_str(), lower.as_str())
+        }
         _ => {
             let white_space = parse_shorthand(value)?;
             (fallback_value(white_space), marker_value(white_space))
         }
     };
     let important = if important { " !important" } else { "" };
-    Some(format!("white-space: {fallback}{important}; {CASCADE_MARKER}: {marker}{important}"))
+    Some(format!(
+        "white-space: {fallback}{important}; {CASCADE_MARKER}: {marker}{important}"
+    ))
 }
 
 fn fallback_value(value: WhiteSpace) -> &'static str {
@@ -131,11 +143,6 @@ fn marker_value(value: WhiteSpace) -> &'static str {
     }
 }
 
-fn split_important(value: &str) -> (&str, bool) {
-    let Some(bang) = value.rfind('!') else { return (value, false) };
-    if value[bang + 1..].trim().eq_ignore_ascii_case("important") { (&value[..bang], true) } else { (value, false) }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{from_marker_tokens, parse_shorthand};
@@ -148,14 +155,27 @@ mod tests {
     fn parses_level_four_white_space_axes_without_losing_nowrap() {
         assert_eq!(parse_shorthand("wrap collapse"), Some(WhiteSpace::Normal));
         assert_eq!(parse_shorthand("preserve nowrap"), Some(WhiteSpace::Pre));
-        assert_eq!(parse_shorthand("preserve-breaks nowrap"), Some(WhiteSpace::PreserveBreaksNoWrap));
-        assert_eq!(parse_shorthand("break-spaces nowrap"), Some(WhiteSpace::BreakSpacesNoWrap));
+        assert_eq!(
+            parse_shorthand("preserve-breaks nowrap"),
+            Some(WhiteSpace::PreserveBreaksNoWrap)
+        );
+        assert_eq!(
+            parse_shorthand("break-spaces nowrap"),
+            Some(WhiteSpace::BreakSpacesNoWrap)
+        );
         assert_eq!(parse_shorthand("collapse balance"), None);
     }
 
     #[test]
     fn parses_internal_cascade_marker_tokens() {
-        let tokens = TokenList::parse_string_with_options("preserve-breaks-nowrap", ParserOptions::default()).expect("valid custom-property value");
-        assert_eq!(from_marker_tokens(&tokens), Some(WhiteSpace::PreserveBreaksNoWrap));
+        let tokens = TokenList::parse_string_with_options(
+            "preserve-breaks-nowrap",
+            ParserOptions::default(),
+        )
+        .expect("valid custom-property value");
+        assert_eq!(
+            from_marker_tokens(&tokens),
+            Some(WhiteSpace::PreserveBreaksNoWrap)
+        );
     }
 }

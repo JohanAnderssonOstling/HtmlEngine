@@ -1,0 +1,199 @@
+{
+  "checkpoint_revision": "6184791e84a54b699a8a622b790a2ca722c010f4",
+  "engine_implementation_revision": "912a84ce98bb38df163c0508a57a4f06cb40ee5a",
+  "reader_revision": "710aa3afff185587adac8a8afdf423e39f273474",
+  "feature_branch": "codex/pipeline-lifetimes-20261014",
+  "requirements": [
+    {
+      "requirement": "Publish the starting version and isolate consumer builds before refactoring",
+      "status": "verified",
+      "evidence": [
+        "Remote checkpoint branch resolves to 6184791e84a54b699a8a622b790a2ca722c010f4",
+        "Independent HtmlEngine-pipeline and HtmlViewCore-pipeline worktrees",
+        "Current locked Linux graphs for main app, audible and shared ViewCore resolve every engine package name to checkpoint Git source; no editable engine paths. Original shared source checkouts were not used for implementation."
+      ]
+    },
+    {
+      "requirement": "Separate normalized logical text from font-resource shaping",
+      "status": "verified",
+      "evidence": [
+        "PreparedText::new owns whitespace, case conversion and sparse first-letter selection; PreparedInputs retains it in Arc. shape_active_document starts from prepared content.",
+        "Commit 7246150a3f09d1134327486339c0289cb12940dd and step1-normalized-text.json/step1-validation.json",
+        "Full baseline-to-final chapter render/color/source comparison, including font environment rebuilds."
+      ]
+    },
+    {
+      "requirement": "Separate paint preferences from preparation, shaping and geometry",
+      "status": "verified",
+      "evidence": [
+        "Immutable compiled paint bindings and independent StylePaintColors palettes share DOM, typography, topology and prepared text.",
+        "Prepared/shaped/layout keys omit reader paint; RenderOnlyCacheKey includes it. Retained block, inline and table recipes replay with clipping/layers and first-line paint selections.",
+        "Commit 7ee41bcbd2dc222d95c31e070fe83738e6d1c193, step2 reports, current specialized-context/palette failure tests and 24 independent original-engine fixture comparisons."
+      ]
+    },
+    {
+      "requirement": "Use one authoritative active layout and borrowed reader views",
+      "status": "verified",
+      "evidence": [
+        "LoadedRenderDocument contains Engine and inputs; chapter DocumentView<Engine> borrows document(). Notes own independent small layouts.",
+        "Glyph rehydration publishes in place; chapter navigation moves the outgoing SpineItem after acquiring its replacement. No automatic reader document clones remain.",
+        "Engine f7a0e1c49822f9986d32b998092062b542d02e6e and reader e73cecca1fe76f5403f02168bf74e8403e015ae4; step3 report and failed-update/navigation tests."
+      ]
+    },
+    {
+      "requirement": "Separate reusable paragraph line layout from chapter placement across formatting contexts",
+      "status": "verified",
+      "evidence": [
+        "Paragraph-local measured lines and sparse adjustments are retained; publication executes current image/atomic/table/absolute-anchor work at the new origin.",
+        "Keys cover width, height basis, composition, first-line shaping selections, immutable resource generation, exact dynamic metrics/controls/replaced inputs and relative float profiles; intrinsic/published slots are separate.",
+        "Current-input retention with base/refined variants, recycled buffers and 4 MiB result budget plus metadata. Cache memory is reported; document snapshots do not copy it.",
+        "Implementation 912a84ce98bb38df163c0508a57a4f06cb40ee5a, five new reuse/invalidation/budget regressions, 1087 engine tests, published reader tests and all 18 step4 chapter scenarios.",
+        "Corrected revision 912a84ce98bb38df163c0508a57a4f06cb40ee5a releases temporary policy buffers and distinguishes book/sentence plan keys, covered by two additional regression tests."
+      ]
+    },
+    {
+      "requirement": "Preserve errors, source/CFI/TTS addressing and rendering",
+      "status": "verified",
+      "evidence": [
+        "Transactional shaping/refinement and palette failure tests pass; stale resource generations force reshaping while last published geometry remains queryable.",
+        "All self-contained workspace library, reading, reader and phase-boundary documentation tests pass, with recorded preexisting exceptions.",
+        "18 cumulative chapter cases match geometry/paint/effective text color/source fingerprints in both timing and heap builds; 24 rich HTML comparisons match original full-cascade output.",
+        "Intentional first-line correction is documented separately: retained punctuation and full \u00df uppercase expansion selection replaces interpreting glyph cache IDs as characters."
+      ]
+    },
+    {
+      "requirement": "Benchmark and report CPU, memory and elapsed time after every step",
+      "status": "verified",
+      "evidence": [
+        "Committed step1-normalized-text.json, step2-independent-paint.json, step3-single-layout-owner.json and step4-paragraph-layout.json with validation files.",
+        "Each report includes process CPU time, elapsed medians, live/peak requested heap and peak RSS; later comparisons also include retired user instructions.",
+        "Cumulative report compares original checkpoint and final implementation with the same harness, showing RAM/time tradeoffs without adding per-step timings from different runs."
+      ]
+    },
+    {
+      "requirement": "Publish coherent reviewable refactor branches without adopting them in other agents builds",
+      "status": "verified",
+      "evidence": [
+        "Remote engine branch contains implementation 912a84ce98bb38df163c0508a57a4f06cb40ee5a; remote reader branch contains 710aa3afff185587adac8a8afdf423e39f273474 and pins the exact engine implementation Git revision.",
+        "All 226 reader workspace tests passed using the published Git engine source.",
+        "Main app/audible/shared ViewCore stay on 6184791e84a54b699a8a622b790a2ca722c010f4."
+      ]
+    }
+  ],
+  "tests": {
+    "step4-tests-final.log": {
+      "passed": 1087,
+      "ignored": 2,
+      "sha256": "d772de5a465ee220068eb06a4288aab6e56f670f1306612ece71ae4592ec5db6"
+    },
+    "final-reader-published-tests.log": {
+      "passed": 226,
+      "ignored": 2,
+      "sha256": "1684a52716db570d50f7d34223fa3f13e9016dff7d65ff8c6a5181be60df8aa0"
+    },
+    "final-doc-tests.log": {
+      "passed": 5,
+      "ignored": 0,
+      "sha256": "091501fffbd92ccb1a3022fd580b86a3df6a6bf7d7df274ec5780222c0380b3b"
+    }
+  },
+  "consumer_graphs": {
+    "root": {
+      "revision": "6184791e84a54b699a8a622b790a2ca722c010f4",
+      "package_names": [
+        "html-dom",
+        "html-engine",
+        "html-layout",
+        "html-parse",
+        "html-pipeline",
+        "html-render-core",
+        "html-resources",
+        "html-source",
+        "html-style",
+        "html-style-model"
+      ],
+      "local_engine_paths": []
+    },
+    "audible": {
+      "revision": "6184791e84a54b699a8a622b790a2ca722c010f4",
+      "package_names": [
+        "html-dom",
+        "html-engine",
+        "html-layout",
+        "html-parse",
+        "html-pipeline",
+        "html-render-core",
+        "html-resources",
+        "html-source",
+        "html-style",
+        "html-style-model",
+        "html-wpt-test-support"
+      ],
+      "local_engine_paths": []
+    },
+    "view": {
+      "revision": "6184791e84a54b699a8a622b790a2ca722c010f4",
+      "package_names": [
+        "html-dom",
+        "html-engine",
+        "html-layout",
+        "html-parse",
+        "html-pipeline",
+        "html-render-core",
+        "html-resources",
+        "html-source",
+        "html-style",
+        "html-style-model"
+      ],
+      "local_engine_paths": []
+    },
+    "feature-reader": {
+      "revision": "912a84ce98bb38df163c0508a57a4f06cb40ee5a",
+      "package_names": [
+        "html-dom",
+        "html-engine",
+        "html-layout",
+        "html-parse",
+        "html-pipeline",
+        "html-render-core",
+        "html-resources",
+        "html-source",
+        "html-style",
+        "html-style-model"
+      ],
+      "local_engine_paths": []
+    }
+  },
+  "cumulative_comparisons": 18,
+  "independent_fixture_comparisons": 24,
+  "old_paint_failures_with_full_layout_reference": [
+    "c0001.html",
+    "c0003.html"
+  ],
+  "measurement_scope": "Real chapter HTML/CSS/resources, deterministic mock font backend. Image scenarios seed real file-header dimensions outside timing. Native font/GPU/image pixel decoding/full application costs are excluded. Shared-machine clock/scheduling variation remains; raw rounds, paired ratios and hardware instruction counts are retained. Heap uses a separate allocator-instrumented process; RSS is process high-water memory. Decimal MB.",
+  "material_tradeoff": "Paragraph results add about 0.64-1.54 MB live heap relative to step3. Changed-width and cold timings vary and can regress; instruction work for those cases is roughly unchanged. Complete-pipeline live heap remains below the initial checkpoint across measured cases. Process RSS can vary, including a small font-rebuild increase in this final run. Full raw/paired timing, instruction and memory data are retained.",
+  "preexisting_validation_exceptions": [
+    "One style-model size/niche assertion fails at checkpoint and is explicitly filtered.",
+    "Four profiling tests ignored.",
+    "External WPT integration requires unavailable HTML_WPT_ROOT; self-contained WPT support tests passed."
+  ],
+  "reproduction": {
+    "engine_tests": "TMPDIR=/dev/shm/htmlengine-pipeline cargo test --release --offline --workspace --lib --test reading -- --skip store_brand_uses_the_option_niche_without_growing_node_entries",
+    "reader_tests": "cargo test --release --workspace --lib (reader pins published engine implementation)",
+    "doc_tests": "cargo test --release --offline -p html-layout -p html-pipeline -p html-engine -p html-render-core --doc",
+    "benchmarks": "Build identical tools/pipeline-bench sources against frozen revision and implementation, then run compare.py. Original ownership builds use --no-default-features; final uses default borrowed-view. Add --features heap for allocation runs. CPU affinity3,3 warmups,11 samples x3 alternating rounds;5 heap samples. Cases reader_load,handoff,font,image,image_book,paint."
+  },
+  "binaries_sha256": {
+    "final-before-time": "01da4b4e622fc8d70952f24e5f00451a7de04c7a4875797fce158f65be300b3c",
+    "final-before-heap": "db2bd6b95ceda1ef529fe30657b4f30472d03a57191b3d3034683a9d1f7ed272",
+    "step4-after-time": "5fbd6860566757e7db4cd501383f595b78cfa2bca59f24bf92e27c5628e16ac5",
+    "step4-after-heap": "9565ad0e2fe97ce315ed1babc1089c3b8bad0c5682a82f02c6cfda7727a1e8ac"
+  },
+  "remaining_required_work": [],
+  "audit_correction": {
+    "regression_failed_before_fix": true,
+    "before_log_sha256": "7661353119f84331bcd466b8869ac794a1266cf9c77112dffab0147469c6e8ae",
+    "fixed_revision": "912a84ce98bb38df163c0508a57a4f06cb40ee5a",
+    "description": "Final inspection found and reproduced temporary shared-plan retention outside the reported budget. Non-owning immutable text descriptors fix ownership; book/sentence token-plan keys and fresh-layout policy tests fix policy invalidation. All tests and both benchmark sets were rerun on corrected code."
+  }
+}

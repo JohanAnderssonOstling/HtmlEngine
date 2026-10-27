@@ -1,0 +1,66 @@
+{
+  "step": "paragraph_line_layout_separate_from_chapter_placement",
+  "before_commit": "f7a0e1c49822f9986d32b998092062b542d02e6e",
+  "tests": {
+    "step4-tests-final.log": {
+      "passed": 1087,
+      "ignored": 2,
+      "sha256": "d772de5a465ee220068eb06a4288aab6e56f670f1306612ece71ae4592ec5db6"
+    },
+    "final-reader-published-tests.log": {
+      "passed": 226,
+      "ignored": 2,
+      "sha256": "1684a52716db570d50f7d34223fa3f13e9016dff7d65ff8c6a5181be60df8aa0"
+    },
+    "final-doc-tests.log": {
+      "passed": 5,
+      "ignored": 0,
+      "sha256": "091501fffbd92ccb1a3022fd580b86a3df6a6bf7d7df274ec5780222c0380b3b"
+    }
+  },
+  "architecture": "Cache paragraph-local measured lines and sparse adjustments. Fragment publication reads current tokens and executes current image/atomic/table/absolute-anchor work. Immutable shared text uses a non-owning descriptor guarded by source/run identity, shaping generation, first-line style selection and composition inputs; dynamic control/replaced tokens and metrics are retained exactly.",
+  "dependencies": "Container/run identity, available width, percentage-height basis, paragraph alignment/indent, composition/hyphenation/sentence policies, overflow, pseudo heights, shaping resource generation and first-line style ranges, exact dynamic inputs, and float exclusion bands relative to the paragraph. Ended float bands are irrelevant; float wrapping mode remains explicit. Intrinsic measurement and published layout use separate cache slots.",
+  "ownership_and_budget": "The executor owns measured results in recycled scratch; snapshots do not clone them. Keep current base/refined inputs, with separate intrinsic/published slots and no resize history. Immutable text descriptors own no token arrays, including temporary policy plans. Dynamic arrays and all local line payloads count toward the 4 MiB result budget plus reported slot metadata.",
+  "regressions_covered": [
+    "Image height moves unchanged paragraphs without recomposition",
+    "Whole float context translation versus changed exclusion height",
+    "Inline images, atomic inline tables, percentage table cells, first-line and first-letter refinements, generated content, tabs, overflow ellipsis and composition/width switches match uncached results",
+    "Intrinsic probes preserve the cell paragraph result used for publication",
+    "Large chapter retention remains bounded across width changes",
+    "Temporary shared policy token arrays are released when the operation ends; paragraph metadata does not pin unaccounted buffers",
+    "Prepared token-plan keys distinguish book and sentence modes; policy transitions match fresh shaping/layout"
+  ],
+  "benchmark_scene": "Real c1/c2/c3 chapters. Image cases probe actual chapter image-file headers outside timing, seed all intrinsic metrics, then alternate one existing figure height by 80 pixels at unchanged width. Cold/resize cases retain the previous harness scene with initially unknown image dimensions. Web-compatible and book composition are measured separately.",
+  "measurement_scope": "Deterministic mock font backend; native fonts/GPU/image pixel decoding and full application latency are excluded. CPU time uses CLOCK_PROCESS_CPUTIME_ID; user instructions use gated Linux perf counters; separate allocator tracking records requested live/peak heap; uninstrumented process getrusage records RSS. Decimal MB.",
+  "method": {
+    "cpu_affinity": 3,
+    "rounds": 3,
+    "timing_samples_per_round": 11,
+    "warmups_per_process": 3,
+    "heap_samples": 5,
+    "order": "alternating before/after",
+    "source": "identical harness source in frozen and development worktrees"
+  },
+  "tradeoff": "Image updates use about 35.6-39.1% fewer user instructions across these chapters. Retained heap rises about 0.64-1.54 MB. Changed-width layout still recomposes and cold-load/resize wall and CPU timing can regress modestly; full raw and paired data are retained. Shared-machine scheduling/clock variation remains.",
+  "parity": "All 18 timing and heap cases match glyph/line counts, complete render geometry/paint, effective text colors and source correspondence.",
+  "baseline_exceptions": [
+    "Preexisting style-model size/niche assertion filtered out",
+    "External WPT integration needs unavailable HTML_WPT_ROOT; self-contained workspace library and reading tests passed"
+  ],
+  "binaries_sha256": {
+    "step4-before-time": "cedb7f45e734288e8d8367e4bb947e6487fae45fb6a9b1398a068d74e0a528cc",
+    "step4-before-heap": "6502d772ad246e0d37a1ced91419e5f396a825f611b2b5fc9deb519de7cce782",
+    "step4-after-time": "5fbd6860566757e7db4cd501383f595b78cfa2bca59f24bf92e27c5628e16ac5",
+    "step4-after-heap": "9565ad0e2fe97ce315ed1babc1089c3b8bad0c5682a82f02c6cfda7727a1e8ac"
+  },
+  "engine_implementation_revision": "912a84ce98bb38df163c0508a57a4f06cb40ee5a",
+  "audit_correction": {
+    "regression_failed_before_fix": true,
+    "before_log_sha256": "7661353119f84331bcd466b8869ac794a1266cf9c77112dffab0147469c6e8ae",
+    "fixed_revision": "912a84ce98bb38df163c0508a57a4f06cb40ee5a"
+  },
+  "live_heap_change_mb_range": [
+    0.644119,
+    1.542223
+  ]
+}

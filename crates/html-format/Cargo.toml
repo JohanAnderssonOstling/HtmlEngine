@@ -1,0 +1,26 @@
+[package]
+name = "html-format"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+publish = false
+
+[features]
+profiling = ["html-engine-model/profiling"]
+
+[dependencies]
+html-dom = { path = "../html-dom" }
+html-style-model = { path = "../html-style-model" }
+html-text = { path = "../html-text" }
+rustc_data_structures = "0.1.2"
+html-engine-model = { path = "../html-engine-model" }
+formulary = { version = "=0.3.0", default-features = false, features = ["shaping", "svg"] }
+quick-xml = "0.38"
+unicode_categories = "0.1"
+
+
+[dev-dependencies]
+html-pipeline = { path = "../html-pipeline", features = ["testing"] }
+html-parse = { path = "../02-html-parse" }
+html-style = { path = "../03-html-style" }
+lightningcss.workspace = true

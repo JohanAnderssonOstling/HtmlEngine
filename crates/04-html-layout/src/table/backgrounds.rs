@@ -1,5 +1,6 @@
 use super::columns::{TableColumnLayout, span_extent};
 use crate::layout::LayoutEngine;
+use crate::layout::paint_program::PaintStyleSource;
 use crate::layout_model::{TableColumnGroupSpan, TableColumnTrack};
 use kurbo::{Point, Rect};
 
@@ -7,9 +8,9 @@ fn emit_table_background_rect(
     session: &mut LayoutEngine<'_, '_>,
     table_box_idx: usize,
     rect: Rect,
-    color: u32,
+    source: PaintStyleSource,
 ) {
-    crate::layout::emit_color_rect_for_owner(session, table_box_idx, rect, color);
+    crate::layout::decorations::emit_bound_background(session, table_box_idx, rect, source);
 }
 
 pub(super) fn emit_collapsed_table_background(
@@ -30,7 +31,7 @@ pub(super) fn emit_collapsed_table_background(
         session,
         table_box_idx,
         rect,
-        session.reader.style(table_box_idx).background_color(),
+        PaintStyleSource::Box(table_box_idx as u32),
     );
 }
 
@@ -75,8 +76,7 @@ pub(super) fn emit_table_layers(
         if span_width <= 0.0 {
             continue;
         }
-        let x = table_content_pos.x + columns.starts[start];
-        let color = session.reader.used_style(group.style).background_color();
+        let x = table_content_pos.x + columns.physical_start(start, end - start);
         if session.reader.used_style(group.style).visibility()
             == html_style_model::Visibility::Hidden
         {
@@ -86,7 +86,7 @@ pub(super) fn emit_table_layers(
             session,
             table_box_idx,
             Rect::new(x, table_grid.y0, x + span_width, table_grid.y1),
-            color,
+            PaintStyleSource::Style {indices:group.style,context:table_box_idx as u32},
         );
     }
 
@@ -94,11 +94,11 @@ pub(super) fn emit_table_layers(
         let Some(style_idx) = track.background_style else {
             continue;
         };
-        let Some((&width, &start)) = columns.widths.get(column).zip(columns.starts.get(column))
+        let Some((&width, _)) = columns.widths.get(column).zip(columns.starts.get(column))
         else {
             continue;
         };
-        let x = table_content_pos.x + start;
+        let x = table_content_pos.x + columns.physical_start(column, 1);
         if session.reader.used_style(style_idx).visibility() == html_style_model::Visibility::Hidden
         {
             continue;
@@ -107,7 +107,7 @@ pub(super) fn emit_table_layers(
             session,
             table_box_idx,
             Rect::new(x, table_grid.y0, x + width, table_grid.y1),
-            session.reader.used_style(style_idx).background_color(),
+            PaintStyleSource::Style {indices:style_idx,context:table_box_idx as u32},
         );
     }
 }

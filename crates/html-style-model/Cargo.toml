@@ -9,3 +9,5 @@ publish = false
 html-dom = { path = "../html-dom" }
 kurbo.workspace = true
 rustc_data_structures = "0.1.2"
+language-tags = "0.3.2"
+unicode-script = "0.5"

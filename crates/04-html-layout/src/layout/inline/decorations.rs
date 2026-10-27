@@ -54,7 +54,7 @@ impl DecorationEmitter<'_, '_, '_> {
             self.reader.box_layout_mode(box_idx),
             Some(LayoutMode::Inline(_))
         );
-        let style = self.reader.style(box_idx);
+        let style = self.reader.paint_style(box_idx);
         if style.visibility() == html_style_model::Visibility::Hidden {
             return;
         }

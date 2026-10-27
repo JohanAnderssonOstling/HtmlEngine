@@ -57,7 +57,7 @@ pub(super) struct MeasurementScratch {
 
 /// Runs recursive layout against reusable scratch output, restoring the active
 /// pass even when the measured formatting context emits lines or fragments.
-pub(crate) fn with_isolated_measurement<T>(
+pub fn with_isolated_measurement<T>(
     engine: &mut LayoutEngine<'_, '_>,
     measure: impl FnOnce(&mut LayoutEngine<'_, '_>) -> T,
 ) -> (T, f64) {
@@ -81,7 +81,7 @@ pub(crate) fn with_isolated_measurement<T>(
 
 /// Measures a box in disposable output state so intrinsic measurement cannot
 /// publish geometry or fragments into the active layout pass.
-pub(crate) fn measure_box_isolated(
+pub fn measure_box_isolated(
     session: &mut LayoutEngine<'_, '_>,
     box_idx: usize,
     available_width: f64,
@@ -103,7 +103,7 @@ pub(crate) fn measure_box_isolated(
 /// Measures the natural border-box block size without allowing authored
 /// height/min/max-height to turn the probe into a specified-size measurement.
 /// Flexbox uses this for a non-replaced item's content-size suggestion.
-pub(crate) fn measure_intrinsic_block_size_isolated(
+pub fn measure_intrinsic_block_size_isolated(
     session: &mut LayoutEngine<'_, '_>,
     box_idx: usize,
     available_width: f64,
@@ -122,7 +122,7 @@ pub(crate) fn measure_intrinsic_block_size_isolated(
 
 /// Measures an already-resolved box without repeating style, intrinsic, or
 /// replaced-size resolution in the disposable pass.
-pub(crate) fn measure_resolved_box_isolated(
+pub fn measure_resolved_box_isolated(
     session: &mut LayoutEngine<'_, '_>,
     resolved: super::box_sizing::ResolvedBoxSizing,
 ) -> Size {
@@ -139,7 +139,7 @@ pub(crate) fn measure_resolved_box_isolated(
 /// Measures an assigned-width atomic box together with the first and last
 /// in-flow line baselines it publishes. Inline tables use the first baseline;
 /// inline-blocks use the last when overflow remains visible.
-pub(crate) fn measure_box_width_and_baselines_isolated(
+pub fn measure_box_width_and_baselines_isolated(
     session: &mut LayoutEngine<'_, '_>,
     box_idx: usize,
     containing_width: f64,
@@ -160,7 +160,7 @@ pub(crate) fn measure_box_width_and_baselines_isolated(
 
 /// Measures an atomic box using its normal formatting-context sizing while
 /// retaining the baselines needed by inline placement.
-pub(crate) fn measure_box_and_baselines_isolated(
+pub fn measure_box_and_baselines_isolated(
     session: &mut LayoutEngine<'_, '_>,
     box_idx: usize,
     available_width: f64,

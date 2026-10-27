@@ -3,44 +3,49 @@ use html_style_model::{BorderStyle, TextDecorationStyle, UsedStyleView};
 use kurbo::Rect;
 
 #[derive(Clone, Copy)]
-pub(crate) struct PhysicalBorderEdge {
+pub struct PhysicalBorderEdge {
     pub style: BorderStyle,
     pub width: f64,
     pub color: u32,
+    pub side: u8,
 }
 
 impl PhysicalBorderEdge {
-    pub(crate) fn solid(self) -> Option<(f64, u32)> {
+    pub fn solid(self) -> Option<(f64, u32)> {
         matches!(self.style, BorderStyle::Solid).then_some((self.width, self.color))
     }
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct PhysicalBorders {
+pub struct PhysicalBorders {
     pub top: PhysicalBorderEdge,
     pub right: PhysicalBorderEdge,
     pub bottom: PhysicalBorderEdge,
     pub left: PhysicalBorderEdge,
 }
 
-pub(crate) fn physical_borders(style: &UsedStyleView<'_>) -> PhysicalBorders {
+pub fn physical_borders(style: &UsedStyleView<'_>) -> PhysicalBorders {
     PhysicalBorders {
         top: PhysicalBorderEdge {
+            side: 0,
             style: style.border_top_style(),
             width: style.border_top_width() as f64,
             color: style.border_top_color(),
         },
         right: PhysicalBorderEdge {
+            side: 1,
             style: style.border_right_style(),
             width: style.border_right_width() as f64,
             color: style.border_right_color(),
         },
         bottom: PhysicalBorderEdge {
+            side: 2,
             style: style.border_bottom_style(),
             width: style.border_bottom_width() as f64,
             color: style.border_bottom_color(),
         },
         left: PhysicalBorderEdge {
+            side: 3,
             style: style.border_left_style(),
             width: style.border_left_width() as f64,
             color: style.border_left_color(),
@@ -121,7 +126,7 @@ fn emit_vertical_pattern(
     ));
 }
 
-pub(crate) fn border_pattern(style: BorderStyle, horizontal: bool) -> Option<DecorationPattern> {
+pub fn border_pattern(style: BorderStyle, horizontal: bool) -> Option<DecorationPattern> {
     match (style, horizontal) {
         (BorderStyle::Solid, _) => Some(DecorationPattern::Solid),
         (BorderStyle::Dotted, true) => Some(DecorationPattern::DottedHorizontal),
@@ -222,7 +227,7 @@ pub(super) fn emit_outline_fragments(
     }
 }
 
-pub(crate) fn emit_uniform_3d_border(
+pub fn emit_uniform_3d_border(
     fragments: &mut DecorationStore,
     rect: Rect,
     width: f64,

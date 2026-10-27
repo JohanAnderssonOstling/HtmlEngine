@@ -139,9 +139,8 @@ impl DocumentView {
 
         let resources = self
             .engine
-            .document()
-            .context("missing document")?
             .render_view()
+            .context("missing document")?
             .images();
         let desired = (0..resources.len() as u32).collect::<HashSet<_>>();
         let mut decoded = ImagePipeline::new(self.provider.clone());
@@ -178,9 +177,9 @@ impl DocumentView {
         }
         let document = self
             .engine
-            .document()
+            .render_view()
             .context("missing laid-out document")?;
-        let scene = RenderScene::for_document(document, &settings);
+        let scene = RenderScene::for_view(document, &settings);
         self.content_height = scene.content_height();
         let mut painter = GpuiCommandPainter::new(
             &mut self.images,
@@ -234,7 +233,7 @@ impl DocumentView {
                 }
             }
         }
-        let text = document.render_view().text();
+        let text = document.text();
         for index in text.paint_order_indices() {
             let index = *index as usize;
             let Some(line) = text.line(index) else {
@@ -287,8 +286,7 @@ impl DocumentView {
     }
 
     pub(super) fn inspect(&self) -> serde_json::Value {
-        let document = self.engine.document().expect("loaded document");
-        let view = document.render_view();
+        let view = self.engine.render_view().expect("loaded document");
         let boxes = view.boxes();
         let entries: Vec<_> = (0..boxes.len().min(45))
             .map(|index| {

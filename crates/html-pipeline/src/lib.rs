@@ -1,17 +1,86 @@
+macro_rules! profile_scope {
+    ($name:literal) => {
+        #[cfg(feature = "profiling")]
+        let _profile_scope = crate::profiling::scope($name);
+    };
+}
+
+macro_rules! profile {
+    ($name:literal, $operation:expr) => {{
+        profile_scope!($name);
+        $operation
+    }};
+}
+
+#[cfg(feature = "profiling")]
+pub use html_engine_model::profiling;
 #[path = "parser/mod.rs"]
 mod parser;
 mod session;
 mod types;
 
 pub use html_dom::RootFontSize;
-pub use html_layout::PreparedDocument;
-pub use html_layout::{ImageSizingPolicy, NoteFlow, TextCompositionPolicy};
-pub use html_layout::{ReaderStyleOverrides, TextAlign, ThemeAdaptation};
-pub use html_parse::{DocumentTextIndex, MarkupSyntax, ParsedHtml, SourceTextPosition, XmlParseError, decode_html_bytes, parse_document, parse_html_document, parse_html_document_bytes, parse_xml_document, plain_text_from_fragment};
-pub use html_style::{MediaEnvironment, MediaType};
-pub use parser::{BookStylesheetCache, BookStylesheetCacheStats, DocumentFactory};
-pub use session::{ActivePipelineSession, CacheEntry, OwnedActivePipelineSession, PipelineCacheState, PipelineSession};
-pub use types::{
-    EarliestStage, FontEnvironmentRevision, ImageMetricsRevision, LayoutConstraints, PaintSettingsRevision, PipelineCacheKey, PipelineChange, PipelineChangeMask, PipelineError, PipelineInputs,
-    PipelineUpdate, ResourceRevision, Reuse, ReuseReport, SourceRevision, StyleCacheEnvironment, StyleEnvironment, StylesheetRevision,
+use html_engine_model as layout_model;
+use html_layout as layout;
+use html_shape as shaping;
+mod stages;
+pub use html_engine_model::{
+    ContentLanguage, FontMetricsRequest, FontRelativeMetrics, FontSlant, GlyphId, GlyphMetric,
+    GlyphMetricError, GlyphResourceCheckpoint, GlyphResourceGeneration, GlyphResourceStore,
+    GlyphShaper, GlyphSlice, PreparedTextRunFragment, ShapeError, ShapedLine, ShapedTextRun,
+    TextDirection, TextRunId,
+    TextRunShapeRequest, TextShapeRequest, TextStyleSpan,
 };
+pub use html_layout::LayoutTimings;
+pub use stages::{
+    DetachedLayout, FormattingDocument, LaidOutDocument, NoteLayout, PreparedDocument,
+    ReadingFragment, ReadingTarget, RenderExportView, RenderTable, RenderView, ShapeLayoutTimings,
+    ShapedDocument, TextSearchOptions, find_text_matches,
+};
+
+/// Document lifecycle and render capabilities, orchestrated above the stage crates.
+pub mod engine {
+    pub use crate::stages::*;
+    #[cfg(feature = "profiling")]
+    pub use html_engine_model::profiling;
+    pub use html_engine_model::{
+        CharacterPlacement, ContentLanguage, FontMetricsRequest, FontRelativeMetrics, FontSlant,
+        FontStyle, GlyphId, GlyphMetric, GlyphMetricError, GlyphResourceCheckpoint,
+        GlyphResourceGeneration, GlyphResourceStore, GlyphShaper, GlyphSlice, LanguageTag, ListStylePosition,
+        OpenTypeFeature, PreparedTextRunFragment, ReaderStyleOverrides, ShapeError, ShapedLine,
+        ShapedTextRun, StyleStringId, TextAlign, TextDecorationLines, TextDirection, TextRunId,
+        TextRunShapeRequest, TextShapeRequest, TextStyleSpan, ThemeAdaptation, UnicodeBidi,
+        UsedBorderRadii,
+    };
+    pub use html_layout::{LayoutTimings, LineCharacterPlacement, LineTextPlacement};
+}
+#[cfg(test)]
+include!("../../../test-support/stage-fixtures.rs");
+pub use html_engine_model::{ImageSizingPolicy, NoteFlow, TextCompositionPolicy};
+pub use html_engine_model::{ReaderStyleOverrides, TextAlign, ThemeAdaptation};
+pub use html_parse::{
+    DocumentTextIndex, MarkupSyntax, ParsedHtml, SourceTextPosition, XmlParseError,
+    decode_html_bytes, parse_document, parse_html_document, parse_html_document_bytes,
+    parse_xml_document, plain_text_from_fragment,
+};
+pub use html_style::{MediaEnvironment, MediaType};
+pub use parser::{
+    BookStylesheetCache, BookStylesheetCacheStats, DocumentFactory, PreparationTimings,
+    ResourceContext, ResourceDocumentFactory,
+};
+pub use session::{
+    ActivePipelineSession, CacheEntry, OwnedActivePipelineSession, PipelineCacheState,
+    PipelineSession,
+};
+pub use types::{
+    EarliestStage, FontEnvironmentRevision, ImageMetricsRevision, LayoutConstraints,
+    PaintSettingsRevision, PipelineCacheKey, PipelineChange, PipelineChangeMask, PipelineChanges,
+    PipelineError, PipelineInputs, PipelineUpdate, ResourceRevision, Reuse, ReuseReport,
+    SourceRevision, StyleCacheEnvironment, StyleEnvironment, StylesheetRevision,
+};
+
+#[cfg(test)]
+mod stage_boundary_tests;
+
+#[cfg(feature = "testing")]
+pub use html_layout::testing as layout_testing;

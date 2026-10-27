@@ -9,9 +9,13 @@ publish = false
 name = "html"
 
 [features]
+profiling = ["html-layout/profiling", "html-pipeline/profiling"]
 testing = ["dep:html-wpt-test-support"]
+math-export = ["dep:mathema", "dep:roxmltree"]
 
 [dependencies]
+mathema = { git = "https://github.com/DevExzh/mathema", rev = "d9cce9ffeb7346181d4c3201dc0a13727269863b", default-features = false, optional = true }
+roxmltree = { version = "0.21", optional = true }
 html-dom = { path = "../html-dom" }
 html-layout = { path = "../04-html-layout" }
 html-parse = { path = "../02-html-parse" }

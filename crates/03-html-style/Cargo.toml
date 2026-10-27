@@ -6,6 +6,7 @@ edition = "2024"
 publish = false
 
 [dependencies]
+cssparser = "0.37"
 html-dom = { path = "../html-dom" }
 html-style-model = { path = "../html-style-model" }
 lightningcss.workspace = true

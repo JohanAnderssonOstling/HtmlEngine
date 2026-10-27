@@ -10,6 +10,7 @@ use crate::style::rules::prepared::{
     compile_property_targets,
 };
 use crate::style::rules::program::ParsedInlineStyleCache;
+use crate::style::syntax::property_id::RendererPropertyId;
 use crate::style::syntax::values::tab_size::{
     CASCADE_MARKER as TAB_SIZE_CASCADE_MARKER, ParsedTabSize, parse as parse_tab_size,
 };
@@ -22,13 +23,13 @@ use crate::style::syntax::values::white_space::{
 use html_dom::{Document, DomNodeId};
 use html_style_model::{
     AspectRatio as ComputedAspectRatio, Background, Border, BorderRadii, BorderStyle, BoxModel,
-    BoxSizing, BreakBetween, BreakInside, Clear, ComputedSizeComponent, ComputedStyleValueError,
+    BoxSizing, Clear, ComputedSizeComponent, ComputedStyleValueError,
     ComputedStyles, ComputedStylesBuilder, ContentAlignment, CornerRadius, CounterDirective,
     CounterDirectives, CounterStyle, DecorationColor, Display, FlexDirection, FlexWrap, Float,
     Font, FontRelativeLength, FontStyle, GeneratedContent, GeneratedContentItem, GridAutoFlow,
     GridPlacement, GridPlacementRange, GridRepeatCount, GridTemplateArea, GridTemplateTrack,
     GridTrackBreadth, GridTrackSize, Hyphens, InheritedText, ItemAlignment, LayoutStyle, LengthPct,
-    LogicalTextAlign, ObjectFit, ObjectPosition, ObjectPositionAxis, ObjectPositionOrigin,
+    LogicalTextAlign, ObjectPosition, ObjectPositionAxis, ObjectPositionOrigin,
     OpenTypeFeature, OverflowMode, OverflowWrap, PositionMode, PreferredSize, QuoteStyle,
     ReaderStyleOverrides, SizeComparison, StyleIndices, StyleStringId, TabSize, TextAlign,
     TextDecorationLines, TextDecorationStyle, TextDecorationThickness, TextDirection, TextOverflow,
@@ -55,6 +56,7 @@ use lightningcss::values::size::Size2D;
 use lightningcss::visitor::{Visit, Visitor};
 use rustc_data_structures::fx::FxHashMap;
 use std::cell::Cell;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::ops::Deref;
@@ -74,6 +76,9 @@ mod specified;
 mod state;
 mod style_sharing;
 mod traversal;
+mod tree_counting;
+mod substitution;
+mod random;
 mod values;
 mod wide_keywords;
 
@@ -88,7 +93,8 @@ use style_sharing::{
     SharedElementStyle, StyleSharingCache, StyleSharingProbe, StyleSharingSignature,
 };
 use traversal::*;
-pub(crate) use values::parse_font_kerning;
+use tree_counting::TreeCountingContext;
+use random::RandomContext;
 use values::*;
 use wide_keywords::*;
 
@@ -123,6 +129,8 @@ pub(super) struct StyleResolverContext<'a, 'css> {
     style_sharing_cache: &'a mut StyleSharingCache,
     validation_style: &'a mut WorkingStyle,
     resolution: &'a ResolutionContext,
+    tree_counting: TreeCountingContext,
+    random: RandomContext,
     pub(super) timings: &'a mut ResolveStyleTimings,
 }
 
@@ -151,24 +159,35 @@ fn apply_renderer_markers<'sheet, 'css>(
     events: &[specified::DeclarationEvent<'sheet, 'css>],
     inline_style: Option<&StyleAttribute<'css>>,
     custom_properties: &FxHashMap<String, TokenList<'css>>,
+    parent_custom: &FxHashMap<String, TokenList<'css>>,
     root_font_size: f32,
     resolution: &ResolutionContext,
+    tree_counting: &mut TreeCountingContext,
+    random: &RandomContext,
 ) {
     set_marker_resolution_bases(doc, styles, style, resolution);
-    let selected = |name| selected_renderer_marker(events, inline_style, name, custom_properties);
+    let selected = |name| {
+        selected_renderer_marker(events, inline_style, name, custom_properties, parent_custom, random)
+    };
     if let Some(value) = selected(WHITE_SPACE_CASCADE_MARKER)
         .as_ref()
         .and_then(from_marker_tokens)
     {
         style.text.white_space = value;
     }
+    let mut selected_css = |name| {
+        let css = selected(name).as_ref().and_then(token_list_to_css_string)?;
+        let tree = tree_counting.lower(doc, &css).ok()?;
+        match crate::style::syntax::random_math::for_computation(&tree, |key|random.base(key,name,1)).ok()? {
+            Cow::Borrowed(_) => Some(tree.into_owned()),
+            Cow::Owned(lowered) => Some(lowered),
+        }
+    };
     for (marker, target) in [
         (LETTER_SPACING_MARKER, &mut style.text.letter_spacing),
         (WORD_SPACING_MARKER, &mut style.text.word_spacing),
     ] {
-        if let Some(spacing) = selected(marker)
-            .as_ref()
-            .and_then(token_list_to_css_string)
+        if let Some(spacing) = selected_css(marker)
             .as_deref()
             .and_then(parse_text_spacing)
             .as_ref()
@@ -184,9 +203,7 @@ fn apply_renderer_markers<'sheet, 'css>(
             *target = spacing;
         }
     }
-    if let Some(tab_size) = selected(TAB_SIZE_CASCADE_MARKER)
-        .as_ref()
-        .and_then(token_list_to_css_string)
+    if let Some(tab_size) = selected_css(TAB_SIZE_CASCADE_MARKER)
         .as_deref()
         .and_then(parse_tab_size)
         .as_ref()
@@ -298,6 +315,8 @@ pub(crate) fn resolve_styles_for_dom_timed(
             style_sharing_cache: &mut style_sharing_cache,
             validation_style: &mut validation_style,
             resolution: &resolution,
+            tree_counting: TreeCountingContext::default(),
+            random: RandomContext::new(doc),
             timings: &mut timings,
         };
         for node_idx in doc.node_ids() {
@@ -305,6 +324,8 @@ pub(crate) fn resolve_styles_for_dom_timed(
             if doc.is_text_node(node_idx) {
                 continue;
             }
+            resolver.tree_counting.begin_element(node_idx);
+            resolver.random.begin_element(node_idx);
 
             let ancestor_filter = if let Some(parent_idx) = doc.get_dom_parent(node_idx) {
                 let mut filter = ancestor_filters[parent_idx.index()];
@@ -368,7 +389,12 @@ pub(crate) fn resolve_styles_for_dom_timed(
                 .styles
                 .set_node_style(node_idx, style_indices)
                 .expect("resolver only assigns styles to nodes from its source document");
-            if let Some(signature) = sharing_signature {
+            // Tree positions and element-scoped randomness make a completed
+            // style specific to its originating element.
+            if let Some(signature) = sharing_signature
+                && !resolver.tree_counting.used()
+                && !resolver.random.used_element()
+            {
                 resolver.style_sharing_cache.insert(
                     signature,
                     style_indices,
@@ -527,6 +553,7 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
         pseudo: PseudoTarget,
         inherited_custom_properties: &FxHashMap<String, TokenList<'css>>,
     ) -> Option<WorkingStyle> {
+        self.random.set_pseudo(pseudo.mask());
         let doc = self.doc;
         let prepared = self.prepared;
         let mut matched_rules = std::mem::take(self.matched_rule_scratch);
@@ -615,6 +642,7 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
             &cascade_scratch.events.events,
             None,
             inherited_custom_properties,
+            &self.random,
         );
         let custom_properties =
             effective_custom_properties(&custom_properties, inherited_custom_properties);
@@ -627,6 +655,7 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
                 hints_sequence,
                 parent_font_size,
                 custom_properties,
+                parent_custom: inherited_custom_properties,
                 parent: &inherited,
                 presentational_hints_node: None,
             },
@@ -640,8 +669,11 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
             &cascade_scratch.events.events,
             None,
             custom_properties,
+            inherited_custom_properties,
             doc.root_font_size(),
             self.resolution,
+            &mut self.tree_counting,
+            &self.random,
         );
         *self.cascade_scratch = cascade_scratch;
         Some(style)
@@ -813,6 +845,7 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
                     &cascade_scratch.events.events,
                     inline_style,
                     parent_custom,
+                    &self.random,
                 ),
                 None,
                 None,
@@ -823,6 +856,7 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
                     &cascade_scratch.events.events,
                     inline_style,
                     parent_custom,
+                    &self.random,
                 ),
                 None,
                 Some(signature),
@@ -841,6 +875,7 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
                 hints_sequence,
                 parent_font_size,
                 custom_properties: effective_custom_properties(&custom_properties, custom_base),
+                parent_custom,
                 parent: &parent_style,
                 presentational_hints_node: Some(node_idx),
             },
@@ -854,8 +889,11 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
             &cascade_scratch.events.events,
             inline_style,
             effective_custom_properties(&custom_properties, custom_base),
+            parent_custom,
             doc.root_font_size(),
             self.resolution,
+            &mut self.tree_counting,
+            &self.random,
         );
         *self.cascade_scratch = cascade_scratch;
 
@@ -863,11 +901,10 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
         // semantics even though they are not CSS properties.
         if let Some(language) = doc
             .element_ref(node_idx)
-            .and_then(|element| element.attr_in_any_namespace("lang"))
-            .map(str::trim)
-            .filter(|language| !language.is_empty())
+            .and_then(|element| element.attr_expanded(Some("http://www.w3.org/XML/1998/namespace"), "lang")
+                .or_else(|| element.attr("lang")))
         {
-            style.text.language = Some(self.styles.intern_string(language));
+            style.text.language = self.styles.intern_language(language);
         }
 
         // Preserve `currentColor` as a computed keyword for inheritance while

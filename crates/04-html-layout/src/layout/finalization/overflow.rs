@@ -10,12 +10,13 @@ pub(super) fn rebuild_overflow_clips(
     reader: &LayoutReader<'_>,
     geometry: &GeometryWriter<'_>,
     fragments: &mut FragmentWriter<'_>,
-    scratch: &mut FinalizationScratch,
+    _scratch: &mut FinalizationScratch,
     track_overflow_clips: bool,
 ) {
     let box_count = reader.box_count();
     if !track_overflow_clips {
         let (layout, line_owners, decoration_owners) = fragments.finalization_parts();
+        layout.paint_program.content_clips.clear();
         layout.line_output.line_clips.clear();
         layout.fragment_output.decoration_clips.clear();
         line_owners.clear();
@@ -71,7 +72,7 @@ pub(super) fn rebuild_overflow_clips(
     // decoration paint keys.
     let geometry = geometry.as_ref();
     let (layout, line_owners, decoration_owners) = fragments.finalization_parts();
-    let mut content_clips = std::mem::take(&mut scratch.content_clips);
+    let mut content_clips = std::mem::take(&mut layout.paint_program.content_clips);
     content_clips.resize(box_count, None);
     content_clips.fill(None);
     for idx in 0..box_count {
@@ -133,7 +134,7 @@ pub(super) fn rebuild_overflow_clips(
     }));
     layout.line_output.line_clips = line_clips;
     layout.fragment_output.decoration_clips = decoration_clips;
-    scratch.content_clips = content_clips;
+    layout.paint_program.content_clips = content_clips;
     line_owners.clear();
     decoration_owners.clear();
 }

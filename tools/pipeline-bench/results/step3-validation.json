@@ -1,0 +1,47 @@
+{
+  "step": "single_active_layout_owner",
+  "before_engine_commit": "7ee41bcbd2dc222d95c31e070fe83738e6d1c193",
+  "before_reader_commit": "0378bff1324b80363897186b86ed0c46b354982e",
+  "tests": {
+    "step3-engine-tests.log": {
+      "passed": 53,
+      "ignored": 0
+    },
+    "step3-reader-tests.log": {
+      "passed": 226,
+      "ignored": 2
+    },
+    "step3-facade-tests.log": {
+      "passed": 0,
+      "ignored": 0
+    }
+  },
+  "ownership": "The engine owns the only active/cached chapter layout. DocumentView<Engine> borrows it for reader queries; notes use DocumentView<LaidOutDocument>. LoadedRenderDocument no longer duplicates the layout. Glyph rehydration publishes in place. Navigation moves the whole chapter into the cache after the destination is acquired.",
+  "failure_contract": "The last published geometry survives backend invalidation. Resource generation gates reject its reuse for paint, layout or note shaping until successful reshaping. Transactional backend failure preserves matching resources and geometry. Callers must rehydrate/update after replacing native renderer resources before using old renderer handles.",
+  "intentional_behavior_change": "Claiming a cached destination before inserting the outgoing chapter avoids premature LRU eviction. A five-chapter forward/backward test now requires one reload rather than two, while checking every cached return transition.",
+  "benchmark_scope": "Same real c1/c2/c3 chapters and deterministic mock font backend. The harness reproduces the reader handoff ownership before/after: reader_load measures update plus owned-copy/borrow; handoff measures resize plus owned-copy/borrow with the old view retained; rehydrate measures the actual old/new pipeline rehydration API. These are pipeline/handoff measurements, not full application/GPU/native-font timings.",
+  "build_flags": {
+    "frozen_before": "--no-default-features (plus --features heap for allocator run)",
+    "after": "default borrowed-view feature (plus --features heap for allocator run)"
+  },
+  "method": {
+    "cpu_affinity": 3,
+    "rounds": 3,
+    "timing_samples_per_round": 11,
+    "warmups_per_process": 3,
+    "order": "alternating before/after",
+    "heap_samples": 5,
+    "cpu_time": "CLOCK_PROCESS_CPUTIME_ID",
+    "cpu_work": "Linux perf retired user instructions",
+    "rss": "uninstrumented process getrusage high-water mark",
+    "heap": "separate requested-byte allocator tracking; decimal MB"
+  },
+  "timing_limitation": "Shared-machine clock and scheduling variation remain. Full per-round observations and paired percent changes are retained; RAM savings are clearer than the small CPU-work differences.",
+  "fingerprints": "All nine cases match glyph/line counts, complete retained render geometry/paint, effective text color and source correspondence.",
+  "binaries_sha256": {
+    "step3-before-time": "c20693f10eb5ed2dd367b1b862419a7f179bdaf63b0b7047097d374d184461b2",
+    "step3-before-heap": "f95e1465c35d304f77731d1ce6a7b1ce5a082e9072ae637ddbb1fb4744fcbe7f",
+    "step3-after-time": "efe5ae799343314c6af3beb76477a2d551d1b91394277c6f5e1c4faf6e19b711",
+    "step3-after-heap": "38b1a37d809ab729103da870cfe012e72ba31d5ce93da8f136adc56dcd2b67f6"
+  }
+}
