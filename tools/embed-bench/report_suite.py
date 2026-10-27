@@ -106,10 +106,7 @@ def main():
     hashes = {host['sha256'] for report in reports.values() for host in report['hosts']}
     if len(hashes) != 1:
         raise ValueError('all measurements must use one common executable')
-    baseline = ('## Warm engine RAM\n\n' + warm_baseline_table(pairs['warm'][FIXTURES[0][0]])
-                + '\n\nTotal process session PSS after rendering an empty document and settling for 500 ms, '
-                  'before loading benchmark content. Includes the GPUI host, engine and helpers. '
-                  'One sample per engine, using the baseline from the article warm first frame run.')
+    baseline = '## Warm engine RAM\n\n' + warm_baseline_table(pairs['warm'][FIXTURES[0][0]])
     sections = '\n\n'.join('## ' + title + '\n\n' + table(pairs[mode], mode != 'cold')
                             for mode, title in CASES)
     note = ('One sample per engine and document. CPU includes viewport snapshot readback. '

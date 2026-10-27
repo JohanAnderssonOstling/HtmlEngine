@@ -109,8 +109,6 @@ Skrift is a framework agnostic HTML and CSS rendering engine built with the purp
 </tbody>
 </table>
 
-Total process session PSS after rendering an empty document and settling for 500 ms, before loading benchmark content. Includes the GPUI host, engine and helpers. One sample per engine, using the baseline from the article warm first frame run.
-
 ## Cold first rendered frame
 
 <table>
