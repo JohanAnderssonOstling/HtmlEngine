@@ -1,5 +1,7 @@
 #[cfg(test)]
 mod stage_tests {
+    use crate::{GlyphRequest, ShapedGlyph};
+
     #[test]
     fn visible_text_runs_follow_display_visibility_and_language_before_shaping() {
         let mut factory = DocumentFactory::new();
@@ -17,9 +19,9 @@ mod stage_tests {
 
     use crate::ShapeError;
     use crate::engine::{
-        FontSlant, GlyphResourceGeneration, GlyphResourceStore, GlyphShaper, ImageMetrics,
-        LaidOutDocument, LayoutConstraintError, LayoutConstraints, PreparedDocument,
-        ReaderStyleOverrides, TextCompositionPolicy,
+        GlyphResourceGeneration, GlyphResourceStore, GlyphShaper, ImageMetrics, LaidOutDocument,
+        LayoutConstraintError, LayoutConstraints, PreparedDocument, ReaderStyleOverrides,
+        TextCompositionPolicy,
     };
     use crate::layout_model::{GlyphId, GlyphMetric, GlyphMetricError};
     use crate::test_support::{DocumentFactory, TestGlyphShaper};
@@ -1159,23 +1161,23 @@ mod stage_tests {
     struct InvalidGlyphShaper(crate::GlyphResourceGeneration);
 
     impl GlyphShaper for InvalidGlyphShaper {
+        fn shape_glyph_run(
+            &mut self,
+            _request: crate::TextRunShapeRequest<'_>,
+            glyphs: &mut [GlyphId],
+            _resources: &mut GlyphResourceStore,
+        ) -> Result<Option<crate::ShapedTextRun>, ShapeError> {
+            glyphs.fill(17);
+            Ok(None)
+        }
         fn reset(&mut self) {}
 
         fn resource_generation(&self) -> crate::GlyphResourceGeneration {
             self.0
         }
 
-        fn shape_glyph(
-            &mut self,
-            _ch: char,
-            _font_size: f32,
-            _font_weight: u16,
-            _font_slant: crate::FontSlant,
-            _color: u32,
-            _family: Option<&str>,
-            _resources: &mut crate::GlyphResourceStore,
-        ) -> Result<GlyphId, ShapeError> {
-            Ok(17)
+        fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
+            Ok(ShapedGlyph::from_metric(17, crate::GlyphMetric::default()))
         }
     }
 
@@ -1339,25 +1341,15 @@ mod stage_tests {
             self.0
         }
 
-        fn shape_glyph(
-            &mut self,
-            ch: char,
-            font_size: f32,
-            _font_weight: u16,
-            _font_slant: crate::FontSlant,
-            _color: u32,
-            _family: Option<&str>,
-            resources: &mut crate::GlyphResourceStore,
-        ) -> Result<GlyphId, ShapeError> {
+        fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
             let metric = GlyphMetric::try_new(
-                ch,
-                font_size,
-                -font_size,
-                font_size * 0.25,
-                font_size * 0.75,
+                request.character,
+                request.font_size,
+                -request.font_size,
+                request.font_size * 0.25,
             )
             .map_err(ShapeError::rejected_metric)?;
-            resources.register(metric)
+            Ok(ShapedGlyph::from_metric(request.character as u32, metric))
         }
     }
 
@@ -1985,7 +1977,7 @@ mod stage_tests {
             .iter()
             .map(|line| (line.glyphs(), line.point()))
             .collect::<Vec<_>>();
-        let metric = GlyphMetric::try_new('#', 4.0, 3.0, 1.0, 0.0).unwrap();
+        let metric = GlyphMetric::try_new('#', 4.0, 3.0, 1.0).unwrap();
         let appended = document_resources.register(metric).unwrap();
         assert!(
             snapshot
@@ -2145,16 +2137,9 @@ mod stage_tests {
             }
             fn shape_glyph(
                 &mut self,
-                ch: char,
-                size: f32,
-                weight: u16,
-                slant: FontSlant,
-                color: u32,
-                family: Option<&str>,
-                resources: &mut GlyphResourceStore,
-            ) -> Result<GlyphId, ShapeError> {
-                self.0
-                    .shape_glyph(ch, size, weight, slant, color, family, resources)
+                request: GlyphRequest<'_>,
+            ) -> Result<ShapedGlyph, ShapeError> {
+                self.0.shape_glyph(request)
             }
         }
         let mut factory = DocumentFactory::new();
@@ -2574,7 +2559,7 @@ mod stage_tests {
 
         let original_len = document.glyph_metrics(&shaped_resources).len();
         let original_first = document.glyph_metrics(&shaped_resources).get_checked(0);
-        let metric = GlyphMetric::try_new('#', 4.0, 3.0, 1.0, 0.0).expect("valid auxiliary metric");
+        let metric = GlyphMetric::try_new('#', 4.0, 3.0, 1.0).expect("valid auxiliary metric");
         let appended = shaped_resources
             .register(metric)
             .expect("append auxiliary glyph");

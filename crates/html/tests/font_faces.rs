@@ -62,8 +62,8 @@ fn inputs_defaults() -> PipelineInputs {
 fn independent_reader_fonts_reach_portable_shaping_for_mixed_text() {
     use html::pipeline::{DocumentFactory, ReaderStyleOverrides};
     use html::text::{
-        FontSlant, GlyphId, GlyphMetric, GlyphResourceGeneration, GlyphResourceStore, GlyphShaper,
-        ShapeError,
+        GlyphMetric, GlyphRequest, GlyphResourceGeneration, GlyphResourceStore, GlyphShaper,
+        ShapeError, ShapedGlyph,
     };
 
     #[derive(Default)]
@@ -79,21 +79,17 @@ fn independent_reader_fonts_reach_portable_shaping_for_mixed_text() {
         fn resource_generation(&self) -> GlyphResourceGeneration {
             self.generation
         }
-        fn shape_glyph(
-            &mut self,
-            character: char,
-            size: f32,
-            _: u16,
-            _: FontSlant,
-            _: u32,
-            family: Option<&str>,
-            resources: &mut GlyphResourceStore,
-        ) -> Result<GlyphId, ShapeError> {
-            self.selected.push((character, family.map(str::to_owned)));
-            let metric =
-                GlyphMetric::try_new(character, size * 0.5, size * 0.8, size * 0.2, size * 0.8)
-                    .map_err(ShapeError::rejected_metric)?;
-            resources.register(metric)
+        fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
+            self.selected
+                .push((request.character, request.font_family.map(str::to_owned)));
+            let metric = GlyphMetric::try_new(
+                request.character,
+                request.font_size * 0.5,
+                request.font_size * 0.8,
+                request.font_size * 0.2,
+            )
+            .map_err(ShapeError::rejected_metric)?;
+            Ok(ShapedGlyph::from_metric(request.character as u32, metric))
         }
     }
     for cjk in [None, Some("Selected CJK")] {

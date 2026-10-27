@@ -2228,9 +2228,7 @@ impl<'a> LaidOutDocument<'a> {
         let mut report = self.memory_usage_report_with_shared(&mut seen);
         report.extend_prefixed(
             "GlyphResourceStore",
-            resources
-                .metrics()
-                .memory_usage_report_with_shared(&mut seen),
+            resources.memory_usage_report_with_shared(&mut seen),
         );
         report
     }

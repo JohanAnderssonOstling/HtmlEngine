@@ -187,7 +187,7 @@ mod tests {
             };
             glyphs.push(
                 metrics
-                    .register(GlyphMetric::try_new(character, advance, 12.0, 4.0, 12.0).unwrap())
+                    .register(GlyphMetric::try_new(character, advance, 12.0, 4.0).unwrap())
                     .unwrap(),
             );
         }

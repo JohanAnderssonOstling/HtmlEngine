@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod tests {
+    use crate::{GlyphRequest, ShapedGlyph};
 
     use super::{
         BoxFontMetrics, CharacterPlacement, FontSlant, RequiredFontMetrics, ShapedFontMetrics,
@@ -323,16 +324,9 @@ mod tests {
             }
             fn shape_glyph(
                 &mut self,
-                ch: char,
-                size: f32,
-                weight: u16,
-                slant: FontSlant,
-                color: u32,
-                family: Option<&str>,
-                resources: &mut GlyphResourceStore,
-            ) -> Result<GlyphId, ShapeError> {
-                self.fallback
-                    .shape_glyph(ch, size, weight, slant, color, family, resources)
+                request: GlyphRequest<'_>,
+            ) -> Result<ShapedGlyph, ShapeError> {
+                self.fallback.shape_glyph(request)
             }
             fn shape_glyph_run(
                 &mut self,
@@ -522,14 +516,14 @@ mod tests {
     fn run_metric_registration_shares_advances_and_borrows_the_ledger() {
         use crate::{GlyphMetric, GlyphResourceStore};
         let mut resources = GlyphResourceStore::default();
-        let single = GlyphMetric::try_new('x', 3.0, 8.0, 2.0, 8.0).unwrap();
+        let single = GlyphMetric::try_new('x', 3.0, 8.0, 2.0).unwrap();
         assert_eq!(resources.register(single).unwrap(), 0);
         let advances: Arc<[f32]> = Arc::from([2.0, 0.0, 4.0, 5.0]);
         let run = ShapedTextRun::new(advances.clone(), Arc::from([true, false, true, true, true]))
             .unwrap();
         assert_eq!(
             resources
-                .register_run("a\u{301}😀ב", &run, 8.0, 2.0, 8.0)
+                .register_run("a\u{301}😀ב", &run, 8.0, 2.0)
                 .unwrap(),
             1..5
         );
@@ -543,7 +537,7 @@ mod tests {
         {
             assert_eq!(
                 resources.get(id as u32 + 1),
-                Some(GlyphMetric::try_new(ch, advance, 8.0, 2.0, 8.0).unwrap())
+                Some(GlyphMetric::try_new(ch, advance, 8.0, 2.0).unwrap())
             );
         }
         {
@@ -578,25 +572,14 @@ mod tests {
         use crate::GlyphResourceStore;
         let mut resources = GlyphResourceStore::default();
         let run = ShapedTextRun::new(Arc::from([1.0, 2.0]), Arc::from([true; 3])).unwrap();
-        assert!(resources.register_run("x", &run, 8.0, 2.0, 8.0).is_err());
-        for (ascent, descent, baseline) in [
-            (f32::NAN, 2.0, 8.0),
-            (8.0, -1.0, 8.0),
-            (8.0, 2.0, f32::INFINITY),
-        ] {
-            assert!(
-                resources
-                    .register_run("ab", &run, ascent, descent, baseline)
-                    .is_err()
-            );
+        assert!(resources.register_run("x", &run, 8.0, 2.0).is_err());
+        for (ascent, descent) in [(f32::NAN, 2.0), (8.0, -1.0), (8.0, f32::INFINITY)] {
+            assert!(resources.register_run("ab", &run, ascent, descent).is_err());
         }
         assert_eq!(resources.len(), 0);
         assert_eq!(resources.record_count(), 0);
         let empty = ShapedTextRun::new(Arc::from([]), Arc::from([true])).unwrap();
-        assert_eq!(
-            resources.register_run("", &empty, 0.0, 0.0, 0.0).unwrap(),
-            0..0
-        );
+        assert_eq!(resources.register_run("", &empty, 0.0, 0.0).unwrap(), 0..0);
         assert_eq!(resources.record_count(), 0);
     }
 
@@ -794,16 +777,9 @@ mod tests {
             }
             fn shape_glyph(
                 &mut self,
-                ch: char,
-                size: f32,
-                weight: u16,
-                slant: FontSlant,
-                color: u32,
-                family: Option<&str>,
-                resources: &mut GlyphResourceStore,
-            ) -> Result<GlyphId, ShapeError> {
-                self.fallback
-                    .shape_glyph(ch, size, weight, slant, color, family, resources)
+                request: GlyphRequest<'_>,
+            ) -> Result<ShapedGlyph, ShapeError> {
+                self.fallback.shape_glyph(request)
             }
             fn shape_glyph_run(
                 &mut self,
@@ -823,7 +799,6 @@ mod tests {
                         &geometry,
                         size * 0.75,
                         size * 0.25,
-                        size * 0.75,
                     )?;
                     for (slot, id) in glyphs.iter_mut().zip(ids) {
                         *slot = id;
@@ -831,14 +806,7 @@ mod tests {
                 } else {
                     for (slot, ch) in glyphs.iter_mut().zip(request.text().chars()) {
                         *slot = resources.register(
-                            GlyphMetric::try_new(
-                                ch,
-                                size * 0.5,
-                                size * 0.75,
-                                size * 0.25,
-                                size * 0.75,
-                            )
-                            .unwrap(),
+                            GlyphMetric::try_new(ch, size * 0.5, size * 0.75, size * 0.25).unwrap(),
                         )?;
                     }
                 }

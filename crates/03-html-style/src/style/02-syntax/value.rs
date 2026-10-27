@@ -5,11 +5,8 @@ use lightningcss::properties::custom::{TokenList, UnparsedProperty};
 use lightningcss::properties::{Property, PropertyId};
 use lightningcss::stylesheet::ParserOptions;
 use lightningcss::traits::{Parse, ParseWithOptions};
-use lightningcss::values::angle::Angle;
 use lightningcss::values::calc::{Calc, MathFunction};
 use lightningcss::values::length::{Length, LengthPercentage};
-use lightningcss::values::percentage::Percentage;
-use lightningcss::values::time::Time;
 use static_self::IntoOwned;
 use std::borrow::Cow;
 use std::ops::Range;
@@ -539,43 +536,6 @@ pub(crate) fn number_is_valid(value: &Calc<Length>) -> bool {
     calc_dimension(value, length_dimension) == Some(Dimension::Number)
 }
 
-fn percentage_calculation_is_valid(value: &Calc<Percentage>) -> bool {
-    // Percentage is the sole dimensional type in this calculation tree.
-    calc_dimension(value, |_| Some(Dimension::Length)) == Some(Dimension::Length)
-}
-
-pub(crate) fn angle_calculation_is_valid(value: &Calc<Angle>) -> bool {
-    // Angle is the sole dimensional type here; the same tree checker also
-    // used for percentages rejects sums that mix an angle with a number.
-    calc_dimension(value, |_| Some(Dimension::Length)) == Some(Dimension::Length)
-}
-
-pub(crate) fn time_calculation_is_valid(value: &Calc<Time>) -> bool {
-    calc_dimension(value, |_| Some(Dimension::Length)) == Some(Dimension::Length)
-}
-
-pub(crate) enum PercentageValue {
-    Percentage(f32),
-    Calculation,
-}
-
-/// Retain literal provenance for range checks without evaluating calculations.
-pub(crate) fn parse_percentage_value<'i>(
-    parser: &mut Parser<'i, '_>,
-) -> Result<PercentageValue, ParseError<'i, ()>> {
-    if let Ok(value) = parser.try_parse(|parser| parser.expect_percentage()) {
-        return Ok(PercentageValue::Percentage(value));
-    }
-    // The native Percentage parser assumes every calculation simplifies to
-    // a constant. Read its tree directly so abs()/round() cannot panic here.
-    let value = Calc::<Percentage>::parse(parser).map_err(|_| parser.new_custom_error(()))?;
-    if percentage_calculation_is_valid(&value) {
-        Ok(PercentageValue::Calculation)
-    } else {
-        Err(parser.new_custom_error(()))
-    }
-}
-
 pub(crate) fn length_is_valid(value: &Length) -> bool {
     length_dimension(value) == Some(Dimension::Length)
 }
@@ -590,12 +550,15 @@ pub(crate) fn length_percentage_or_number_is_valid(value: &LengthPercentage) -> 
     percentage_dimension(value).is_some()
 }
 
-pub(crate) fn numeric_component<'i>(parser: &mut Parser<'i, '_>) -> Result<&'i str, ParseError<'i, ()>> {
+pub(crate) fn numeric_component<'i>(
+    parser: &mut Parser<'i, '_>,
+) -> Result<&'i str, ParseError<'i, ()>> {
     let start = parser.position();
     match parser.next()? {
         Token::Number { .. } | Token::Percentage { .. } | Token::Dimension { .. } => {}
         Token::Function(_) => {
-            parser.parse_nested_block(|parser| super::urls::consume(parser, 0, false).map(|_| ()))?;
+            parser
+                .parse_nested_block(|parser| super::urls::consume(parser, 0, false).map(|_| ()))?;
         }
         _ => return Err(parser.new_custom_error(())),
     }

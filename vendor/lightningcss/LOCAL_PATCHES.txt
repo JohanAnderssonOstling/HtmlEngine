@@ -6,6 +6,8 @@ when Calc parsing succeeds without producing a concrete percentage. This mirrors
 CSSNumber::parse and prevents mixed number/percentage math from panicking.
 
 Regression coverage: crates/03-html-style/tests/dependency_percentage.rs
-Remove the Cargo [patch.crates-io] override when an upstream release includes the fix.
+Remove the Cargo [patch.crates-io] override and workspace dependency path when an
+upstream release includes the fix. The direct path also covers downstream consumers,
+which do not inherit this workspace's Cargo patches.
 The source, Rust targets, manifest, license and upstream README are copied unchanged
 apart from the parser change above. Non-Rust tooling and website files are omitted.

@@ -1362,6 +1362,7 @@ impl std::error::Error for ShapeError {}
 pub struct GlyphResourceStore {
     metrics: GlyphMetrics,
     generation: GlyphResourceGeneration,
+    shaped_ids: FxHashMap<(GlyphHandle, char, u32, u32, u32), GlyphId>,
 }
 
 /// An append-only ledger checkpoint. It owns no glyph data and can be consumed
@@ -1402,6 +1403,7 @@ impl Default for GlyphResourceStore {
         Self {
             metrics: GlyphMetrics::default(),
             generation: GlyphResourceGeneration::new(),
+            shaped_ids: FxHashMap::default(),
         }
     }
 }
@@ -1411,6 +1413,7 @@ impl GlyphResourceStore {
         Self {
             metrics: GlyphMetrics::default(),
             generation,
+            shaped_ids: FxHashMap::default(),
         }
     }
 
@@ -1419,8 +1422,21 @@ impl GlyphResourceStore {
     }
 
     pub fn memory_usage_report(&self) -> MemoryUsageReport {
-        self.metrics
-            .memory_usage_report_with_shared(&mut Default::default())
+        self.memory_usage_report_with_shared(&mut FxHashSet::default())
+    }
+
+    pub fn memory_usage_report_with_shared(
+        &self,
+        seen: &mut FxHashSet<*const ()>,
+    ) -> MemoryUsageReport {
+        let mut report = self.metrics.memory_usage_report_with_shared(seen);
+        report.add(
+            "GlyphResourceStore.shaped_ids",
+            self.shaped_ids.capacity()
+                * std::mem::size_of::<((GlyphHandle, char, u32, u32, u32), GlyphId)>(),
+            self.shaped_ids.len(),
+        );
+        report
     }
 
     pub fn clear(&mut self) {
@@ -1446,7 +1462,44 @@ impl GlyphResourceStore {
             return false;
         }
         self.metrics.truncate(checkpoint.len);
+        self.shaped_ids
+            .retain(|_, id| (*id as usize) < checkpoint.len);
         true
+    }
+
+    /// Shape and intern a native result, assigning its layout ID here.
+    pub fn shape_glyph(
+        &mut self,
+        shaper: &mut (impl GlyphShaper + ?Sized),
+        request: GlyphRequest<'_>,
+    ) -> Result<GlyphId, ShapeError> {
+        let shaped = shaper.shape_glyph(request)?;
+        let metric = shaped.metric(request.character);
+        let key = (
+            shaped.handle(),
+            request.character,
+            metric.advance().to_bits(),
+            metric.ascent().to_bits(),
+            metric.descent().to_bits(),
+        );
+        if let Some(&id) = self.shaped_ids.get(&key) {
+            return Ok(id);
+        }
+        let id = self.register_shaped(request.character, shaped)?;
+        self.shaped_ids.insert(key, id);
+        Ok(id)
+    }
+
+    /// Register a newly produced result without interning. Batch backends use
+    /// this when each native resource is already unique to its shaped run.
+    pub fn register_shaped(
+        &mut self,
+        character: char,
+        shaped: ShapedGlyph,
+    ) -> Result<GlyphId, ShapeError> {
+        let id = self.register(shaped.metric(character))?;
+        self.metrics.set_paint_handle(id, shaped.handle());
+        Ok(id)
     }
 
     pub fn register(&mut self, metric: GlyphMetric) -> Result<GlyphId, ShapeError> {
@@ -1464,7 +1517,6 @@ impl GlyphResourceStore {
         shaped: &ShapedTextRun,
         ascent: f32,
         descent: f32,
-        baseline_offset: f32,
     ) -> Result<Range<GlyphId>, ShapeError> {
         let characters: Box<[char]> = text.chars().collect();
         if characters.len() != shaped.advances.len() {
@@ -1473,7 +1525,7 @@ impl GlyphResourceStore {
                 shaped.advances.len(),
             ));
         }
-        let vertical = GlyphMetric::try_new('\0', 0.0, ascent, descent, baseline_offset)
+        let vertical = GlyphMetric::try_new('\0', 0.0, ascent, descent)
             .map_err(ShapeError::rejected_metric)?;
         self.metrics
             .register_run(characters, shaped.shared_advances(), vertical)
@@ -1502,8 +1554,9 @@ impl GlyphResourceStore {
     }
 }
 
-/// Backend supplied by a renderer adapter for turning styled characters into
-/// dense glyph IDs and framework-neutral metrics.
+/// Backend supplied by a renderer adapter for measuring styled characters
+/// and returning handles to its native paint resources. HtmlEngine assigns
+/// layout glyph IDs and stores the returned measurements.
 pub trait GlyphShaper {
     /// Identity of the backend's active paint resources. Reset must assign a
     /// fresh generation; a failed document replacement restores the old one.
@@ -1512,8 +1565,8 @@ pub trait GlyphShaper {
     fn reset(&mut self);
 
     /// Checkpoint active resources before an operation that appends glyphs.
-    /// The default rejects appends so failed shaping cannot leave dense IDs
-    /// ahead of the published glyph metrics. Resource-backed shapers should
+    /// The default rejects appends so failed shaping cannot leave native
+    /// resources ahead of the published glyph metrics. Resource-backed shapers should
     /// restore all glyph and run resources in `rollback_append_shaping`.
     fn begin_append_shaping(&mut self) -> Result<(), ShapeError> {
         Err(ShapeError::append_transaction_unsupported())
@@ -1529,7 +1582,7 @@ pub trait GlyphShaper {
     /// resources until either [`GlyphShaper::commit_document_shaping`] or
     /// [`GlyphShaper::rollback_document_shaping`] is called. Implementations
     /// without renderer-owned resources can rely on this reset-only default;
-    /// `reset` must clear [`GlyphShaper::glyph_resources`].
+    /// `reset` must assign a fresh resource generation.
     fn begin_document_shaping(&mut self) {
         self.reset();
     }
@@ -1550,16 +1603,9 @@ pub trait GlyphShaper {
         Ok(FontRelativeMetrics::fallback())
     }
 
-    fn shape_glyph(
-        &mut self,
-        ch: char,
-        font_size: f32,
-        font_weight: u16,
-        font_slant: FontSlant,
-        color: u32,
-        family: Option<&str>,
-        resources: &mut GlyphResourceStore,
-    ) -> Result<GlyphId, ShapeError>;
+    /// Shape one character using the native text system. Return its paint
+    /// handle, advance, and measured font extents; no metric registration is needed.
+    fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError>;
 
     /// Shapes one normalized, single-style logical run into a caller-owned
     /// dense glyph-ID buffer. Backends can override this to resolve shared
@@ -1574,14 +1620,16 @@ pub trait GlyphShaper {
         debug_assert_eq!(request.text().chars().count(), glyphs.len());
         let style = request.style();
         for (slot, character) in glyphs.iter_mut().zip(request.text().chars()) {
-            *slot = self.shape_glyph(
-                character,
-                style.font_size(),
-                style.font_weight(),
-                style.font_slant(),
-                style.color(),
-                style.font_family_for_character(character),
-                resources,
+            *slot = resources.shape_glyph(
+                self,
+                GlyphRequest {
+                    character,
+                    font_size: style.font_size(),
+                    font_weight: style.font_weight(),
+                    font_slant: style.font_slant(),
+                    color: style.color(),
+                    font_family: style.font_family_for_character(character),
+                },
             )?;
         }
         self.shape_text_run(request)
@@ -1627,11 +1675,11 @@ mod geometry_tests {
         let generation = resources.generation();
         let advances: Arc<[f32]> = [2.0, 3.0].into();
         let run = ShapedTextRun::new(advances.clone(), vec![true; 3].into()).unwrap();
-        resources.register_run("ab", &run, 8.0, 2.0, 8.0).unwrap();
+        resources.register_run("ab", &run, 8.0, 2.0).unwrap();
         let owners = Arc::strong_count(&advances);
         let checkpoint = resources.checkpoint();
         assert_eq!(Arc::strong_count(&advances), owners);
-        let extra = GlyphMetric::try_new('x', 1.0, 8.0, 2.0, 8.0).unwrap();
+        let extra = GlyphMetric::try_new('x', 1.0, 8.0, 2.0).unwrap();
         assert_eq!(resources.register(extra).unwrap(), 2);
         assert!(resources.rollback_to(checkpoint));
         assert_eq!(resources.generation(), generation);
@@ -1647,7 +1695,7 @@ mod geometry_tests {
         let mut resources = GlyphResourceStore::default();
         let other = GlyphResourceStore::default().checkpoint();
         let empty = resources.checkpoint();
-        let extra = GlyphMetric::try_new('x', 1.0, 8.0, 2.0, 8.0).unwrap();
+        let extra = GlyphMetric::try_new('x', 1.0, 8.0, 2.0).unwrap();
         resources.register(extra).unwrap();
         assert!(!resources.rollback_to(other));
         assert_eq!(resources.len(), 1);

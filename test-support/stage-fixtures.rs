@@ -60,6 +60,8 @@ static TEST_ALLOCATOR: allocation_test_support::TrackingAllocator =
 
 #[cfg(test)]
 pub(crate) mod test_support {
+    use crate::{GlyphRequest, ShapedGlyph};
+
     use std::collections::HashMap;
 
     use crate::layout_model::{GlyphId, GlyphMetric};
@@ -216,26 +218,20 @@ pub(crate) mod test_support {
 
         fn shape_glyph(
             &mut self,
-            ch: char,
-            font_size: f32,
-            _font_weight: u16,
-            _font_slant: crate::FontSlant,
-            _color: u32,
-            _family: Option<&str>,
-            resources: &mut crate::GlyphResourceStore,
-        ) -> Result<GlyphId, crate::ShapeError> {
-            let key = (ch, font_size.to_bits());
-            if let Some(&glyph) = self.glyphs.get(&key) {
-                return Ok(glyph);
-            }
-            let ascent = font_size * self.ascent_ratio.unwrap_or(0.75);
-            let descent = (font_size - ascent).max(0.0);
+            request: GlyphRequest<'_>,
+        ) -> Result<ShapedGlyph, crate::ShapeError> {
+            let key = (request.character, request.font_size.to_bits());
+            let ascent = request.font_size * self.ascent_ratio.unwrap_or(0.75);
+            let descent = (request.font_size - ascent).max(0.0);
             let metric =
-                GlyphMetric::try_new(ch, font_size * 0.5, ascent, descent, font_size * 0.75)
+                GlyphMetric::try_new(request.character, request.font_size * 0.5, ascent, descent)
                     .map_err(crate::ShapeError::rejected_metric)?;
-            let glyph = resources.register(metric)?;
+            if let Some(&glyph) = self.glyphs.get(&key) {
+                return Ok(ShapedGlyph::from_metric(glyph, metric));
+            }
+            let glyph = self.glyphs.len() as GlyphId;
             self.glyphs.insert(key, glyph);
-            Ok(glyph)
+            Ok(ShapedGlyph::from_metric(glyph, metric))
         }
 
         fn font_relative_metrics(

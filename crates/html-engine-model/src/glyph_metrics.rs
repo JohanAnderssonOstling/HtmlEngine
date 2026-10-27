@@ -1,6 +1,6 @@
-use crate::GlyphId;
+use crate::{GlyphHandle, GlyphId};
 use html_dom::MemoryUsageReport;
-use rustc_data_structures::fx::FxHashSet;
+use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -14,7 +14,6 @@ use std::sync::Arc;
 ///     advance: f32::NAN,
 ///     ascent: 1.0,
 ///     descent: 1.0,
-///     baseline_offset: 0.0,
 /// };
 /// ```
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -23,7 +22,6 @@ pub struct GlyphMetric {
     advance: f32,
     ascent: f32,
     descent: f32,
-    baseline_offset: f32,
 }
 
 /// Error returned when glyph metric values violate boundary invariants.
@@ -44,19 +42,16 @@ impl GlyphMetric {
         advance: f32,
         ascent: f32,
         descent: f32,
-        baseline_offset: f32,
     ) -> Result<Self, GlyphMetricError> {
         validate_metric_value_non_negative("advance", advance)?;
         validate_metric_value_non_negative("ascent", ascent)?;
         validate_metric_value_non_negative("descent", descent)?;
-        validate_metric_value("baseline_offset", baseline_offset)?;
 
         Ok(Self {
             ch,
             advance,
             ascent,
             descent,
-            baseline_offset,
         })
     }
 
@@ -74,10 +69,6 @@ impl GlyphMetric {
 
     pub fn descent(&self) -> f32 {
         self.descent
-    }
-
-    pub fn baseline_offset(&self) -> f32 {
-        self.baseline_offset
     }
 }
 
@@ -115,6 +106,7 @@ fn validate_metric_value_non_negative(
 pub struct GlyphMetrics {
     records: Vec<MetricRecord>,
     len: usize,
+    paint_handles: FxHashMap<GlyphId, GlyphHandle>,
 }
 
 #[derive(Debug)]
@@ -135,6 +127,19 @@ enum MetricData {
 }
 
 impl GlyphMetrics {
+    /// Resolve a layout glyph to its adapter-owned native paint handle.
+    pub fn paint_handle(&self, glyph: GlyphId) -> Option<GlyphHandle> {
+        ((glyph as usize) < self.len)
+            .then(|| self.paint_handles.get(&glyph).copied().unwrap_or(glyph))
+    }
+    pub(crate) fn set_paint_handle(&mut self, glyph: GlyphId, handle: GlyphHandle) {
+        if glyph != handle {
+            self.paint_handles.insert(glyph, handle);
+        } else {
+            self.paint_handles.remove(&glyph);
+        }
+    }
+
     #[inline]
     pub fn get(&self, glyph: GlyphId) -> GlyphMetric {
         self.get_checked(glyph).expect("registered glyph metric")
@@ -243,6 +248,7 @@ impl GlyphMetrics {
                 metrics.truncate(len - record.start as usize);
             }
         }
+        self.paint_handles.retain(|id, _| (*id as usize) < len);
         self.len = len;
     }
 
@@ -256,6 +262,11 @@ impl GlyphMetrics {
         seen: &mut FxHashSet<*const ()>,
     ) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
+        report.add(
+            "GlyphMetrics.paint_handles",
+            self.paint_handles.capacity() * std::mem::size_of::<(GlyphId, GlyphHandle)>(),
+            self.paint_handles.len(),
+        );
         report.add_slice_storage::<MetricRecord>(
             "GlyphMetrics.records",
             self.records.capacity(),
@@ -322,7 +333,7 @@ mod tests {
     use super::*;
 
     fn metric(ch: char) -> GlyphMetric {
-        GlyphMetric::try_new(ch, 2.0, 8.0, 2.0, 8.0).unwrap()
+        GlyphMetric::try_new(ch, 2.0, 8.0, 2.0).unwrap()
     }
 
     #[test]
@@ -398,41 +409,31 @@ mod tests {
 
     #[test]
     fn glyph_metric_rejects_negative_advance() {
-        assert!(GlyphMetric::try_new('x', -1.0, 0.0, 0.0, 0.0).is_err());
+        assert!(GlyphMetric::try_new('x', -1.0, 0.0, 0.0).is_err());
     }
 
     #[test]
     fn glyph_metric_rejects_negative_ascent() {
-        assert!(GlyphMetric::try_new('x', 1.0, -0.25, 0.0, 0.0).is_err());
+        assert!(GlyphMetric::try_new('x', 1.0, -0.25, 0.0).is_err());
     }
 
     #[test]
     fn glyph_metric_rejects_negative_descent() {
-        assert!(GlyphMetric::try_new('x', 1.0, 0.0, -0.25, 0.0).is_err());
+        assert!(GlyphMetric::try_new('x', 1.0, 0.0, -0.25).is_err());
     }
 
     #[test]
     fn glyph_metric_rejects_nan_advance() {
-        assert!(GlyphMetric::try_new('x', f32::NAN, 0.0, 0.0, 0.0).is_err());
+        assert!(GlyphMetric::try_new('x', f32::NAN, 0.0, 0.0).is_err());
     }
 
     #[test]
     fn glyph_metric_rejects_nan_ascent() {
-        assert!(GlyphMetric::try_new('x', 1.0, f32::NAN, 0.0, 0.0).is_err());
+        assert!(GlyphMetric::try_new('x', 1.0, f32::NAN, 0.0).is_err());
     }
 
     #[test]
     fn glyph_metric_rejects_nan_descent() {
-        assert!(GlyphMetric::try_new('x', 1.0, 0.0, f32::NAN, 0.0).is_err());
-    }
-
-    #[test]
-    fn glyph_metric_rejects_nan_baseline_offset() {
-        assert!(GlyphMetric::try_new('x', 1.0, 0.0, 0.0, f32::NAN).is_err());
-    }
-
-    #[test]
-    fn glyph_metric_rejects_infinite_baseline_offset() {
-        assert!(GlyphMetric::try_new('x', 1.0, 0.0, 0.0, f32::INFINITY).is_err());
+        assert!(GlyphMetric::try_new('x', 1.0, 0.0, f32::NAN).is_err());
     }
 }

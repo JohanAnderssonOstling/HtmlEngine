@@ -3,10 +3,11 @@ use html_parse::HtmlQuirksMode;
 use html_pipeline::GlyphResourceStore;
 use html_pipeline::ResourceContext;
 use html_pipeline::engine::{
-    FontMetricsRequest, FontRelativeMetrics, FontSlant, GlyphId, GlyphMetric, GlyphShaper,
-    ImageMetrics, LayoutConstraints, ShapeError,
+    FontMetricsRequest, FontRelativeMetrics, GlyphId, GlyphMetric, GlyphShaper, ImageMetrics,
+    LayoutConstraints, ShapeError,
 };
 use html_pipeline::{DocumentFactory, LaidOutDocument, PreparedDocument, parse_html_document};
+use html_pipeline::{GlyphRequest, ShapedGlyph};
 use html_resources::{ResourceProvider, probe_dimensions};
 use html_wpt_test_support::wpt_root;
 use std::borrow::Cow;
@@ -83,37 +84,32 @@ impl GlyphShaper for DeterministicShaper {
         Ok(FontRelativeMetrics::fallback())
     }
 
-    fn shape_glyph(
-        &mut self,
-        ch: char,
-        font_size: f32,
-        _font_weight: u16,
-        _font_slant: FontSlant,
-        _color: u32,
-        family: Option<&str>,
-        resources: &mut html_pipeline::engine::GlyphResourceStore,
-    ) -> Result<GlyphId, ShapeError> {
-        let is_ahem = family
+    fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
+        let is_ahem = request
+            .font_family
             .and_then(|families| families.split(',').next())
             .map(str::trim)
             .map(|family| family.trim_matches(['\'', '"']))
             .is_some_and(|family| family.eq_ignore_ascii_case("ahem"));
-        let key = (ch, font_size.to_bits(), is_ahem);
-        if let Some(&glyph) = self.glyphs.get(&key) {
-            return Ok(glyph);
-        }
-        let advance = if is_ahem { font_size } else { font_size * 0.5 };
+        let key = (request.character, request.font_size.to_bits(), is_ahem);
+        let advance = if is_ahem {
+            request.font_size
+        } else {
+            request.font_size * 0.5
+        };
         let metric = GlyphMetric::try_new(
-            ch,
+            request.character,
             advance,
-            font_size * 0.75,
-            font_size * 0.25,
-            font_size * 0.75,
+            request.font_size * 0.75,
+            request.font_size * 0.25,
         )
         .map_err(ShapeError::rejected_metric)?;
-        let glyph = resources.register(metric)?;
+        if let Some(&glyph) = self.glyphs.get(&key) {
+            return Ok(ShapedGlyph::from_metric(glyph, metric));
+        }
+        let glyph = self.glyphs.len() as GlyphId;
         self.glyphs.insert(key, glyph);
-        Ok(glyph)
+        Ok(ShapedGlyph::from_metric(glyph, metric))
     }
 }
 

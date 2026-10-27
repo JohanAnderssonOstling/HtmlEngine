@@ -11,6 +11,7 @@ macro_rules! profile_scope {
 mod bidi;
 mod constraints;
 mod geometry;
+mod glyph_adapter;
 mod glyph_line_indices;
 mod glyph_metrics;
 mod grouped_arena;
@@ -28,6 +29,7 @@ mod shaping_views;
 pub use bidi::{ResolvedBidi, grapheme_boundaries, paragraph_unicode_bidi};
 pub use constraints::*;
 pub use geometry::*;
+pub use glyph_adapter::*;
 pub use glyph_line_indices::*;
 pub use glyph_metrics::*;
 pub use grouped_arena::*;

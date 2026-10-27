@@ -8,77 +8,59 @@ use gpui::{
 };
 use html::render::{FragmentImagePolicy, FragmentRenderOptions, FragmentRenderer, Painter};
 use html::text::{
-    FontSlant, GlyphId, GlyphMetric, GlyphResourceGeneration, GlyphResourceStore, GlyphShaper,
-    ShapeError,
+    FontMetrics, FontSlant, GlyphHandle, GlyphRequest, GlyphResourceGeneration, GlyphResources,
+    GlyphShaper, ShapeError, ShapedGlyph,
 };
 use kurbo::{Point as HtmlPoint, Rect};
 use peniko::{Color, Image};
 
 struct Shaper<'a> {
     system: &'a WindowTextSystem,
-    generation: GlyphResourceGeneration,
-    glyphs: Vec<ShapedLine>,
+    glyphs: GlyphResources<ShapedLine>,
 }
 
 impl GlyphShaper for Shaper<'_> {
     fn resource_generation(&self) -> GlyphResourceGeneration {
-        self.generation
+        self.glyphs.generation()
     }
 
     fn reset(&mut self) {
         self.glyphs.clear();
-        self.generation = GlyphResourceGeneration::default();
     }
 
-    fn shape_glyph(
-        &mut self,
-        ch: char,
-        font_size: f32,
-        weight: u16,
-        slant: FontSlant,
-        color: u32,
-        _family: Option<&str>,
-        resources: &mut GlyphResourceStore,
-    ) -> Result<GlyphId, ShapeError> {
+    fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
         let font = Font {
-            weight: FontWeight(f32::from(weight)),
-            style: match slant {
+            weight: FontWeight(f32::from(request.font_weight)),
+            style: match request.font_slant {
                 FontSlant::Normal => FontStyle::Normal,
                 FontSlant::Italic => FontStyle::Italic,
                 FontSlant::Oblique => FontStyle::Oblique,
             },
             ..Font::default() // System font for this minimal adapter.
         };
-        let text = ch.to_string();
+        let text = request.character.to_string();
         let run = TextRun {
             len: text.len(),
             font,
-            color: rgba(color).into(),
+            color: rgba(request.color).into(),
             ..Default::default()
         };
-        let line = if font_size == 0.0 || ch.is_control() {
+        let line = if request.font_size == 0.0 || request.character.is_control() {
             ShapedLine::default()
         } else {
             self.system
-                .shape_line(text.into(), px(font_size), &[run], None)
+                .shape_line(text.into(), px(request.font_size), &[run], None)
         };
-        let metric = GlyphMetric::try_new(
-            ch,
-            f32::from(line.width()),
-            f32::from(line.ascent),
-            f32::from(line.descent),
-            f32::from(line.ascent),
-        )
-        .map_err(ShapeError::rejected_metric)?;
-        let id = resources.register(metric)?;
-        debug_assert_eq!(id as usize, self.glyphs.len());
-        self.glyphs.push(line);
-        Ok(id)
+        let metrics = FontMetrics::new(f32::from(line.ascent), f32::from(line.descent))
+            .map_err(ShapeError::rejected_metric)?;
+        let advance = f32::from(line.width());
+        let handle = self.glyphs.insert(line)?;
+        ShapedGlyph::new(handle, advance, metrics).map_err(ShapeError::rejected_metric)
     }
 }
 
 struct GpuiPainter<'a> {
-    glyphs: &'a [ShapedLine],
+    glyphs: &'a GlyphResources<ShapedLine>,
     origin: Point<Pixels>,
     window: &'a mut Window,
     cx: &'a mut App,
@@ -96,12 +78,12 @@ impl Painter for GpuiPainter<'_> {
         ));
     }
 
-    fn draw_glyph(&mut self, glyph: GlyphId, origin: HtmlPoint) {
-        let line = &self.glyphs[glyph as usize];
+    fn draw_glyph(&mut self, glyph: GlyphHandle, origin: HtmlPoint) {
+        let line = self.glyphs.get(glyph).expect("native glyph handle");
         if line.len() == 0 {
             return;
         }
-        let origin = self.origin + point(px(origin.x as f32), px(origin.y as f32));
+        let origin = self.origin + point(px(origin.x as f32), px(origin.y as f32) - line.ascent);
         line.paint(
             origin,
             line.ascent + line.descent,
@@ -126,8 +108,7 @@ impl Render for Example {
                     let mut renderer = FragmentRenderer::new();
                     let mut shaper = Shaper {
                         system: window.text_system(),
-                        generation: GlyphResourceGeneration::default(),
-                        glyphs: Vec::new(),
+                        glyphs: GlyphResources::default(),
                     };
                     let options = FragmentRenderOptions::new(
                         f64::from(f32::from(bounds.size.width)).max(1.0),

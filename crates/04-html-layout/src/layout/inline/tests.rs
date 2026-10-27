@@ -1,5 +1,7 @@
 #[cfg(test)]
 mod tests {
+    use crate::{GlyphRequest, ShapedGlyph};
+
     use crate::GlyphResourceStore;
 
     use super::{
@@ -10,8 +12,8 @@ mod tests {
     use crate::parser::DocumentFactory;
     use crate::test_support::TestGlyphShaper as GlyphCache;
     use crate::{
-        FontSlant, GlyphId, GlyphShaper, LaidOutDocument, ShapeError, ShapedTextRun,
-        TextRunShapeRequest, TextShapeRequest,
+        GlyphShaper, LaidOutDocument, ShapeError, ShapedTextRun, TextRunShapeRequest,
+        TextShapeRequest,
     };
     use html_style_model::{Hyphens, VerticalAlignValue, WhiteSpace};
     use lightningcss::stylesheet::ParserOptions;
@@ -47,25 +49,8 @@ mod tests {
             self.fallback.rollback_append_shaping();
         }
 
-        fn shape_glyph(
-            &mut self,
-            ch: char,
-            font_size: f32,
-            font_weight: u16,
-            font_slant: FontSlant,
-            color: u32,
-            family: Option<&str>,
-            resources: &mut crate::GlyphResourceStore,
-        ) -> Result<GlyphId, ShapeError> {
-            self.fallback.shape_glyph(
-                ch,
-                font_size,
-                font_weight,
-                font_slant,
-                color,
-                family,
-                resources,
-            )
+        fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
+            self.fallback.shape_glyph(request)
         }
 
         fn shape_text_run(
@@ -122,25 +107,8 @@ mod tests {
             self.fallback.rollback_append_shaping();
         }
 
-        fn shape_glyph(
-            &mut self,
-            ch: char,
-            font_size: f32,
-            font_weight: u16,
-            font_slant: FontSlant,
-            color: u32,
-            family: Option<&str>,
-            resources: &mut crate::GlyphResourceStore,
-        ) -> Result<GlyphId, ShapeError> {
-            self.fallback.shape_glyph(
-                ch,
-                font_size,
-                font_weight,
-                font_slant,
-                color,
-                family,
-                resources,
-            )
+        fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
+            self.fallback.shape_glyph(request)
         }
 
         fn shape_text_run(
@@ -3013,16 +2981,17 @@ mod tests {
             }
             fn shape_glyph(
                 &mut self,
-                ch: char,
-                _size: f32,
-                _weight: u16,
-                _slant: FontSlant,
-                _color: u32,
-                _family: Option<&str>,
-                resources: &mut GlyphResourceStore,
-            ) -> Result<GlyphId, ShapeError> {
-                let (ascent, descent) = if ch == 'Y' { (16.0, 4.0) } else { (8.0, 2.0) };
-                resources.register(GlyphMetric::try_new(ch, 10.0, ascent, descent, ascent).unwrap())
+                request: GlyphRequest<'_>,
+            ) -> Result<ShapedGlyph, ShapeError> {
+                let (ascent, descent) = if request.character == 'Y' {
+                    (16.0, 4.0)
+                } else {
+                    (8.0, 2.0)
+                };
+                Ok(ShapedGlyph::from_metric(
+                    request.character as u32,
+                    GlyphMetric::try_new(request.character, 10.0, ascent, descent).unwrap(),
+                ))
             }
         }
         let mut factory = DocumentFactory::new();
@@ -4634,7 +4603,7 @@ mod tests {
             .glyph_slice(line.glyphs())
             .expect("line glyph range")[0];
         let metric = document.glyph_metrics(&document_resources).get(glyph);
-        let baseline_offset = metric.baseline_offset() as f64;
+        let baseline_offset = metric.ascent() as f64;
         let half_leading = (line.height() - (metric.ascent() + metric.descent()) as f64) / 2.0;
 
         assert!(

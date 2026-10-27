@@ -625,6 +625,11 @@ pub struct RenderTextView<'a> {
 }
 
 impl<'a> RenderTextView<'a> {
+    /// Native key consumed by a baseline-oriented painter.
+    pub fn paint_handle(self, glyph: GlyphId) -> Option<crate::GlyphHandle> {
+        self.glyph_metrics.paint_handle(glyph)
+    }
+
     /// Resolved advances, vertical offsets and paint glyphs for one line.
     /// The borrowed cursor allocates nothing and supports source-order reads
     /// across visually reordered fragments.

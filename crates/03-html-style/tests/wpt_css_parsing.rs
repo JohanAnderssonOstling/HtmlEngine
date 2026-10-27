@@ -1,12 +1,14 @@
 use html_style::{
-    PropertyCapability, PropertyValueSyntax, StylesheetEntry, UnsupportedStyleFeature,
-    declaration_support, property_value_syntax, selector_syntax_is_valid, stylesheet_entries,
-    stylesheet_syntax_is_valid,
+    PropertyCapability, PropertySyntax, StylesheetEntry, declaration_support,
+    selector_syntax_is_valid, stylesheet_entries, stylesheet_syntax_is_valid,
 };
 use html_wpt_test_support::{
     CssParsingTestKind, extract_css_parsing_tests_with_prelude, relative_script_references,
     wpt_root,
 };
+use lightningcss::rules::CssRule;
+use lightningcss::stylesheet::{ParserOptions, StyleSheet};
+use lightningcss::visitor::{Visit, VisitTypes, Visitor};
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -63,16 +65,12 @@ fn runs_vendored_declarative_css_parsing_tests_directly() {
     let mut unusable_literal_calls = 0usize;
     let mut unsupported_declarations = 0usize;
     let mut renderer_unsupported_declarations = 0usize;
+    let mut unsupported_rules = 0usize;
     let mut computed_helpers_checked_for_syntax = 0usize;
     let mut selector_serialization_helpers_checked_for_syntax = 0usize;
     let mut executed = 0usize;
     let mut known_mismatches = 0usize;
     let mut unsupported_dependency_mismatches = 0usize;
-    let mut superseded_easing_expectations = 0usize;
-    let mut superseded_shadow_expectations = 0usize;
-    let mut superseded_outline_expectations = 0usize;
-    let mut superseded_alpha_expectations = 0usize;
-    let mut superseded_symbols_expectations = 0usize;
     let mut non_utf8_files = Vec::new();
 
     for file in &files {
@@ -153,105 +151,6 @@ fn runs_vendored_declarative_css_parsing_tests_directly() {
             let Some(expected_valid) = expectation else {
                 continue;
             };
-            // These pinned assertions predate the current easing/math rules.
-            // Easing 2 now permits a single linear() stop; Values 4 censors
-            // NaN to zero and defers calculated integer range clamping.
-            // Keep testing all four values, with their corrected expectation.
-            // https://drafts.csswg.org/css-easing-2/#linear-easing-function
-            // https://drafts.csswg.org/css-values-4/#infinity
-            let corrected_easing_value = match run_key.as_str() {
-                "css-easing/linear-timing-functions-syntax.html|line=32|ordinal=0|kind=InvalidValue" => Some("linear(0)"),
-                "css-easing/linear-timing-functions-syntax.html|line=35|ordinal=0|kind=InvalidValue" => Some("linear(0 0% 100%)"),
-                "css-easing/linear-timing-functions-syntax.html|line=36|ordinal=0|kind=InvalidValue" => Some("linear(0% 100% 0)"),
-                "css-easing/step-timing-functions-syntax.html|line=32|ordinal=0|kind=InvalidValue" => Some("steps(calc(0/0), jump-none)"),
-                _ => None,
-            };
-            let expected_valid = if let Some(value) = corrected_easing_value {
-                assert!(!expected_valid);
-                assert_eq!(test.arguments.as_slice(), ["animation-timing-function", value]);
-                superseded_easing_expectations += 1;
-                true
-            } else {
-                expected_valid
-            };
-
-            // This pinned Text Decoration 3 assertion predates the spread
-            // length added by Text Decoration 4. Keep executing the same
-            // value against the current grammar; changes to the fixture fail.
-            // https://drafts.csswg.org/css-text-decor-4/#text-shadow-property
-            let expected_valid = if run_key == "css-text-decor/text-shadow/parsing/text-shadow-invalid.html|line=15|ordinal=0|kind=InvalidValue" {
-                assert!(!expected_valid);
-                assert_eq!(test.arguments.as_slice(), ["text-shadow", "10px 20px 30px 40px"]);
-                superseded_shadow_expectations += 1;
-                true
-            } else {
-                expected_valid
-            };
-
-            // UI 4 removed invert after UI 3 already allowed rejecting it on
-            // platforms without pixel inversion. These exact pinned fixtures
-            // still expect it to parse. Keep checking all eleven inputs for
-            // rejection, rather than implementing the obsolete keyword.
-            // https://drafts.csswg.org/css-ui-4/#outline-color
-            let obsolete_outline_value = run_key.strip_prefix(
-                "css-ui/parsing/canonical-order-outline-sub-properties-001.html|line=158|ordinal=",
-            ).and_then(|suffix| match suffix {
-                "1|kind=ComputedValue" => Some("invert"),
-                "7|kind=ComputedValue" => Some("dotted invert"),
-                "9|kind=ComputedValue" => Some("invert solid"),
-                "11|kind=ComputedValue" => Some("invert 4px"),
-                "13|kind=ComputedValue" => Some("5px invert"),
-                "15|kind=ComputedValue" => Some("invert solid 6px"),
-                "17|kind=ComputedValue" => Some("invert 4px dotted"),
-                "19|kind=ComputedValue" => Some("dashed 5px invert"),
-                "21|kind=ComputedValue" => Some("solid invert 6px"),
-                "23|kind=ComputedValue" => Some("4px dotted invert"),
-                "25|kind=ComputedValue" => Some("5px invert dashed"),
-                _ => None,
-            });
-            let expected_valid = if let Some(value) = obsolete_outline_value {
-                assert!(expected_valid);
-                assert_eq!(test.arguments.as_slice(), ["outline", value]);
-                superseded_outline_expectations += 1;
-                false
-            } else {
-                expected_valid
-            };
-
-            // The current Color 5 alpha() grammar requires slash plus alpha;
-            // these exact pinned assertions use the older optional form.
-            // Keep executing them as rejections, with fixture identity guards.
-            // https://drafts.csswg.org/css-color-5/#relative-alpha
-            let obsolete_alpha_value = match run_key.as_str() {
-                "css-color/parsing/alpha-color-computed.html|line=30|ordinal=0|kind=ComputedValue"
-                | "css-color/parsing/alpha-color-parsing-valid.html|line=27|ordinal=0|kind=ValidValue" => Some(("color", "alpha(from red)")),
-                "css-color/parsing/alpha-color-computed.html|line=31|ordinal=0|kind=ComputedValue"
-                | "css-color/parsing/alpha-color-parsing-valid.html|line=58|ordinal=0|kind=ValidValue" => Some(("color", "alpha(from rgba(255, 0, 0, 0.3))")),
-                "css-color/parsing/alpha-color-computed.html|line=79|ordinal=0|kind=ComputedValue" => Some(("background-color", "alpha(from currentcolor)")),
-                "css-color/parsing/alpha-color-parsing-valid.html|line=28|ordinal=0|kind=ValidValue" => Some(("color", "alpha(from currentcolor)")),
-                _ => None,
-            };
-            let expected_valid = if let Some((property, value)) = obsolete_alpha_value {
-                assert!(expected_valid);
-                assert_eq!(test.arguments.as_slice(), [property, value]);
-                superseded_alpha_expectations += 1;
-                false
-            } else {
-                expected_valid
-            };
-
-            // Counter Styles permits images in symbols(). Keep the pinned
-            // image-symbol assertion active with its corrected expectation.
-            // https://drafts.csswg.org/css-counter-styles-3/#symbols-function
-            let expected_valid = if run_key == "css-lists/parsing/list-style-type-invalid.html|line=21|ordinal=0|kind=InvalidValue" {
-                assert!(!expected_valid);
-                assert_eq!(test.arguments.as_slice(), ["list-style-type", "symbols(fixed url(\"https://example.com\"))"]);
-                superseded_symbols_expectations += 1;
-                true
-            } else {
-                expected_valid
-            };
-
             if std::env::var_os("HTML_WPT_TRACE").is_some() {
                 eprintln!(
                     "running CSS adapter assertion: {run_key}|arguments={:?}",
@@ -309,8 +208,11 @@ fn runs_vendored_declarative_css_parsing_tests_directly() {
                         } else {
                             Cow::Borrowed(rule.as_str())
                         };
+                        if stylesheet_uses_unsupported_rules(&rule) {
+                            return None;
+                        }
                         if !stylesheet_syntax_is_valid(&rule) {
-                            return false;
+                            return Some(false);
                         }
                         if matches!(
                             test.kind,
@@ -319,17 +221,23 @@ fn runs_vendored_declarative_css_parsing_tests_directly() {
                         ) {
                             let entries = stylesheet_entries(&rule);
                             let [StylesheetEntry::Import(import)] = entries.as_slice() else {
-                                return false;
+                                return Some(false);
                             };
-                            return if test.kind == CssParsingTestKind::ValidLayerImport {
+                            return Some(if test.kind == CssParsingTestKind::ValidLayerImport {
                                 import.layer.is_some() && import.media.is_none()
                             } else {
                                 import.layer.is_none() && import.media.is_some()
-                            };
+                            });
                         }
-                        true
+                        Some(true)
                     })) else {
                         parser_panics.push(run_key);
+                        continue;
+                    };
+                    let Some(valid) = valid else {
+                        unsupported_rules += 1;
+                        unsupported_details
+                            .push(format!("{run_key}|reason=rule is outside renderer scope"));
                         continue;
                     };
                     valid
@@ -339,35 +247,25 @@ fn runs_vendored_declarative_css_parsing_tests_directly() {
                         unusable_literal_calls += 1;
                         continue;
                     };
-                    let Ok(syntax) = catch_unwind(AssertUnwindSafe(|| {
-                        let capability = declaration_support(property, value).capability;
-                        if matches!(capability, PropertyCapability::Unsupported(_)) {
-                            renderer_unsupported_declarations += 1;
-                        }
-                        if matches!(
-                            capability,
-                            PropertyCapability::Unsupported(
-                                UnsupportedStyleFeature::Gradient
-                                    | UnsupportedStyleFeature::GeneratedContent
-                            )
-                        ) {
-                            return None;
-                        }
-                        Some(property_value_syntax(property, value))
-                    })) else {
+                    let Ok(support) =
+                        catch_unwind(AssertUnwindSafe(|| declaration_support(property, value)))
+                    else {
                         parser_panics.push(run_key);
                         continue;
                     };
-                    let Some(syntax) = syntax else {
+                    if let PropertyCapability::Unsupported(reason) = support.capability {
+                        renderer_unsupported_declarations += 1;
                         unsupported_declarations += 1;
+                        unsupported_details.push(format!(
+                            "{run_key}|reason=renderer does not implement {reason:?}"
+                        ));
                         continue;
-                    };
-                    match syntax {
-                        PropertyValueSyntax::Valid => true,
-                        PropertyValueSyntax::Invalid => false,
-                        PropertyValueSyntax::UnsupportedProperty => {
-                            unsupported_declarations += 1;
-                            continue;
+                    }
+                    match support.syntax {
+                        PropertySyntax::Valid => true,
+                        PropertySyntax::Invalid => false,
+                        PropertySyntax::Unsupported => {
+                            unreachable!("unsupported capabilities are reported above")
                         }
                     }
                 }
@@ -420,7 +318,7 @@ fn runs_vendored_declarative_css_parsing_tests_directly() {
     }
 
     eprintln!(
-        "direct CSS WPT parsing: {} files, {} non-UTF-8 encoding fixtures, {extracted} literal calls, {executed} non-excluded syntax assertions, {unsupported_declarations} unrepresented syntax assertions, {unsupported_dependency_mismatches} known dependency/scope mismatches, {renderer_unsupported_declarations} declarations with unsupported renderer capabilities, {computed_helpers_checked_for_syntax} computed/shorthand helpers checked for syntax only, {selector_serialization_helpers_checked_for_syntax} selector serialization helpers checked for syntax only, {unsupported_calls} dynamic/unimplemented calls, {unusable_literal_calls} unusable literal calls, {known_mismatches} other known syntax mismatches, {ignored_total} explicitly ignored, {superseded_easing_expectations} superseded easing expectations checked, {superseded_shadow_expectations} superseded shadow expectations checked, {superseded_outline_expectations} superseded outline expectations checked, {superseded_alpha_expectations} superseded alpha expectations checked, {superseded_symbols_expectations} superseded symbols expectations checked, {} unexpected mismatches, {} unexpected passes, {} dependency parser panics",
+        "direct CSS WPT parsing: {} files, {} non-UTF-8 encoding fixtures, {extracted} literal calls, {executed} non-excluded syntax assertions, {unsupported_declarations} unrepresented syntax assertions, {unsupported_dependency_mismatches} known dependency/scope mismatches, {renderer_unsupported_declarations} declarations with unsupported renderer capabilities, {unsupported_rules} rules outside renderer scope, {computed_helpers_checked_for_syntax} computed/shorthand helpers checked for syntax only, {selector_serialization_helpers_checked_for_syntax} selector serialization helpers checked for syntax only, {unsupported_calls} dynamic/unimplemented calls, {unusable_literal_calls} unusable literal calls, {known_mismatches} other known syntax mismatches, {ignored_total} explicitly ignored, {} unexpected mismatches, {} unexpected passes, {} dependency parser panics",
         files.len(),
         non_utf8_files.len(),
         unexpected.len(),
@@ -444,11 +342,6 @@ fn runs_vendored_declarative_css_parsing_tests_directly() {
         4,
         "the pinned non-UTF-8 fixture set changed: {non_utf8_files:?}"
     );
-    assert_eq!(superseded_easing_expectations, 4);
-    assert_eq!(superseded_shadow_expectations, 1);
-    assert_eq!(superseded_outline_expectations, 11);
-    assert_eq!(superseded_alpha_expectations, 6);
-    assert_eq!(superseded_symbols_expectations, 1);
     assert!(
         extracted >= 31_000,
         "too few direct CSS WPT calls were extracted: {extracted}"
@@ -501,5 +394,69 @@ fn collect_html_files(directory: &Path, files: &mut Vec<PathBuf>) {
         {
             files.push(path);
         }
+    }
+}
+
+fn stylesheet_uses_unsupported_rules(css: &str) -> bool {
+    struct RendererRules;
+    impl<'i> Visitor<'i> for RendererRules {
+        type Error = ();
+        fn visit_types(&self) -> VisitTypes {
+            lightningcss::visit_types!(RULES)
+        }
+        fn visit_rule(&mut self, rule: &mut CssRule<'i>) -> Result<(), ()> {
+            match rule {
+                CssRule::Style(_)
+                | CssRule::Media(_)
+                | CssRule::Supports(_)
+                | CssRule::LayerBlock(_)
+                | CssRule::LayerStatement(_)
+                | CssRule::Scope(_)
+                | CssRule::FontFace(_)
+                | CssRule::Import(_)
+                | CssRule::Namespace(_)
+                | CssRule::Ignored => rule.visit_children(self),
+                _ => Err(()),
+            }
+        }
+    }
+    StyleSheet::parse(
+        css,
+        ParserOptions {
+            error_recovery: true,
+            ..ParserOptions::default()
+        },
+    )
+    .is_ok_and(|mut sheet| sheet.visit(&mut RendererRules).is_err())
+}
+
+#[test]
+fn conformance_adapter_reports_unsupported_features_without_validating_them() {
+    for (property, value) in [
+        ("filter", "blur(2px)"),
+        ("filter", "blur(bad)"),
+        ("animation", "name 1s"),
+        ("animation", "invalid invalid invalid"),
+    ] {
+        assert_eq!(
+            declaration_support(property, value).syntax,
+            PropertySyntax::Unsupported
+        );
+    }
+    for css in [
+        "@keyframes fade { from {opacity:0} }",
+        "@position-try --fallback {top:10px}",
+        "@media screen { @page {margin:0} }",
+        "@custom-media --small (width < 20em);",
+    ] {
+        assert!(stylesheet_uses_unsupported_rules(css), "{css}");
+    }
+    for css in [
+        "p {color:red}",
+        "@media screen {@supports (width:10px) {p {width:10px}}}",
+        "p {--opaque: {@page {color:red}}}",
+        "@layer base {p {color:red}}",
+    ] {
+        assert!(!stylesheet_uses_unsupported_rules(css), "{css}");
     }
 }

@@ -1,5 +1,4 @@
 use super::alignment;
-use super::display;
 use super::flex;
 use super::font;
 use super::property_id::RendererPropertyId;
@@ -12,16 +11,18 @@ use super::value::{
     parse_signed_integer, parsed_property, substitutions,
 };
 use super::values::text_spacing;
-use cssparser::{CowRcStr, Parser, ParserInput, Token};
+use cssparser::{CowRcStr, ParseError, Parser, ParserInput, Token};
 use lightningcss::properties::align::GapValue;
+use lightningcss::properties::background::BackgroundSize;
 use lightningcss::properties::border::{BorderSideWidth, LineStyle};
 use lightningcss::properties::font::{FontSize, LineHeight};
-use lightningcss::properties::outline::OutlineStyle;
 use lightningcss::properties::list::{CounterStyle, ListStyleType, Symbol, SymbolsType};
-use lightningcss::properties::text::{TextTransform, WordBreak};
+use lightningcss::properties::outline::OutlineStyle;
 use lightningcss::properties::size::{MaxSize, Size};
+use lightningcss::properties::text::{TextTransform, WordBreak};
 use lightningcss::properties::{Property, PropertyId};
 use lightningcss::traits::{Parse, TrySign};
+use lightningcss::values::color::CssColor;
 use lightningcss::values::image::Image;
 use lightningcss::values::length::{Length, LengthPercentage, LengthPercentageOrAuto};
 use lightningcss::values::position::Position;
@@ -50,13 +51,7 @@ pub fn property_value_is_valid(id: &PropertyId<'_>, value: &str) -> Option<bool>
     if let Some(id) = RendererPropertyId::from_lightning(id) {
         return renderer_property_value_is_valid(id, value);
     }
-    if !targeted_property(id)
-        && !super::grid::supports(id)
-        && !super::filters::supports(id)
-        && !super::motion::supports(id)
-        && !super::geometry::supports(id)
-        && !super::paint_values::supports(id)
-    {
+    if !targeted_property(id) && !super::grid::supports(id) {
         return None;
     }
     let value = value.trim();
@@ -74,19 +69,7 @@ pub fn property_value_is_valid(id: &PropertyId<'_>, value: &str) -> Option<bool>
     if let Some(valid) = super::grid::property_value_is_valid(id, value) {
         return Some(valid);
     }
-    if let Some(valid) = super::filters::property_value_is_valid(id, value) {
-        return Some(valid);
-    }
-    if let Some(valid) = super::motion::property_value_is_valid(id, value) {
-        return Some(valid);
-    }
     if let Some(valid) = super::inline_values::property_value_is_valid(id, value) {
-        return Some(valid);
-    }
-    if let Some(valid) = super::geometry::property_value_is_valid(id, value) {
-        return Some(valid);
-    }
-    if let Some(valid) = super::paint_values::property_value_is_valid(id, value) {
         return Some(valid);
     }
     if let Some(valid) = super::unit_algebra::property_value_is_valid(id, value) {
@@ -116,7 +99,6 @@ pub fn property_value_is_valid(id: &PropertyId<'_>, value: &str) -> Option<bool>
     match id {
         PropertyId::TextTransform => return Some(text_transform_is_valid(value)),
         PropertyId::WordBreak => return Some(word_break_is_valid(value)),
-        PropertyId::Display if display::grid_lanes_is_valid(value) => return Some(true),
         PropertyId::FontWeight => return Some(font::weight_is_valid(value)),
         PropertyId::ZIndex => {
             let mut input = ParserInput::new(value);
@@ -141,11 +123,7 @@ pub fn property_value_is_valid(id: &PropertyId<'_>, value: &str) -> Option<bool>
     let mut parser = Parser::new(&mut input);
     let nonzero_number =
         parser.expect_number().is_ok_and(|number| number != 0.0) && parser.is_exhausted();
-    if !matches!(
-        id,
-        PropertyId::AspectRatio | PropertyId::LineHeight
-    ) && nonzero_number
-    {
+    if !matches!(id, PropertyId::AspectRatio | PropertyId::LineHeight) && nonzero_number {
         return Some(false);
     }
 
@@ -171,6 +149,55 @@ pub fn property_value_is_valid(id: &PropertyId<'_>, value: &str) -> Option<bool>
                 Property::OutlineStyle(OutlineStyle::LineStyle(LineStyle::Hidden))
             ),
     )
+}
+
+/// The native parser accepts a color on non-final background layers and
+/// negative literal sizes. Keep these source checks to preserve fallbacks.
+fn background_layers_are_valid(source: &str) -> bool {
+    let mut input = ParserInput::new(source);
+    let result = Parser::new(&mut input).parse_comma_separated(
+        |parser| -> Result<bool, ParseError<'_, ()>> {
+            let mut color = false;
+            while !parser.is_exhausted() {
+                if parser.try_parse(CssColor::parse).is_ok() {
+                    color = true;
+                    continue;
+                }
+                match parser.next()?.clone() {
+                    Token::Ident(name)
+                        if ["border", "padding", "content"]
+                            .iter()
+                            .any(|keyword| name.eq_ignore_ascii_case(keyword)) =>
+                    {
+                        return Err(parser.new_custom_error(()));
+                    }
+                    Token::Delim('/') => {
+                        let start = parser.position();
+                        BackgroundSize::parse(parser).map_err(|_| parser.new_custom_error(()))?;
+                        if !literal_numeric_tokens_are_valid(parser.slice_from(start), true, false)
+                        {
+                            return Err(parser.new_custom_error(()));
+                        }
+                    }
+                    Token::Function(_)
+                    | Token::ParenthesisBlock
+                    | Token::SquareBracketBlock
+                    | Token::CurlyBracketBlock => {
+                        parser.parse_nested_block(|nested| {
+                            super::urls::consume(nested, 0, false).map(|_| ())
+                        })?;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(color)
+        },
+    );
+    result.is_ok_and(|layers| {
+        !layers[..layers.len().saturating_sub(1)]
+            .iter()
+            .any(|color| *color)
+    })
 }
 
 fn repeated_keyword(value: &str, only: Option<&str>) -> bool {
@@ -386,7 +413,8 @@ pub(crate) fn renderer_property_value_is_valid(
 fn targeted_property(id: &PropertyId<'_>) -> bool {
     matches!(
         id,
-        PropertyId::ZIndex
+        PropertyId::Background
+            | PropertyId::ZIndex
             | PropertyId::VerticalAlign
             | PropertyId::TextOverflow(_)
             | PropertyId::TextTransform
@@ -526,6 +554,7 @@ fn property_has_valid_range(property: &Property<'_>, source: &str) -> bool {
         return literal_numeric_tokens_are_valid(source, true, false) && valid_border_width(width);
     }
     match property {
+        Property::Background(_) => background_layers_are_valid(source),
         Property::ListStyleType(value) => list_style_type_is_valid(value),
         Property::ListStyle(value) => list_style_type_is_valid(&value.list_style_type),
         Property::TextIndent(value) => {

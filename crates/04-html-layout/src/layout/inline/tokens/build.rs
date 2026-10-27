@@ -217,43 +217,16 @@ fn create_break_token(
     )
 }
 
-fn create_float_anchor_token(
+fn create_anchor_token(
     box_idx: u32,
+    kind: InlineTokenKind,
     style: html_style_model::UsedStyleView,
     vertical_align: VerticalAlignValue,
 ) -> (InlineToken, InlineTokenMetrics) {
     let line_height = resolved_line_height(style);
     (
         InlineToken::new(
-            InlineTokenKind::FloatAnchor { box_idx },
-            0.0,
-            BreakKind::None,
-            TokenWrap::Normal,
-            true,
-        ),
-        InlineTokenMetrics {
-            owner_box_idx: box_idx,
-            ascent: 0.0,
-            descent: 0.0,
-            line_height: line_height as f32,
-            font_size: style.font_size(),
-            vertical_align: InlineVerticalAlign::resolve(vertical_align, line_height, style.font_size()),
-            white_space: style.white_space(),
-            visible: style.visibility() == html_style_model::Visibility::Visible,
-            placement_required: false,
-        },
-    )
-}
-
-fn create_absolute_anchor_token(
-    box_idx: u32,
-    style: html_style_model::UsedStyleView,
-    vertical_align: VerticalAlignValue,
-) -> (InlineToken, InlineTokenMetrics) {
-    let line_height = resolved_line_height(style);
-    (
-        InlineToken::new(
-            InlineTokenKind::AbsoluteAnchor { box_idx },
+            kind,
             0.0,
             BreakKind::None,
             TokenWrap::Normal,
@@ -552,12 +525,21 @@ pub(super) fn build_inline_tokens_from_runs(
                 tokens.push(token, metrics);
             }
             InlineItemKind::FloatAnchor { box_idx } => {
-                let (token, metrics) = create_float_anchor_token(*box_idx, style, vertical_align);
+                let (token, metrics) = create_anchor_token(
+                    *box_idx,
+                    InlineTokenKind::FloatAnchor { box_idx: *box_idx },
+                    style,
+                    vertical_align,
+                );
                 tokens.push(token, metrics);
             }
             InlineItemKind::AbsoluteAnchor { box_idx } => {
-                let (token, metrics) =
-                    create_absolute_anchor_token(*box_idx, style, vertical_align);
+                let (token, metrics) = create_anchor_token(
+                    *box_idx,
+                    InlineTokenKind::AbsoluteAnchor { box_idx: *box_idx },
+                    style,
+                    vertical_align,
+                );
                 tokens.push(token, metrics);
             }
             InlineItemKind::InlineBoundary {

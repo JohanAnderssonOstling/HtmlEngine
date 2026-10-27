@@ -1,6 +1,7 @@
 //! Document shaping execution and targeted pseudo-style reshaping.
 
 use super::*;
+use crate::GlyphRequest;
 #[cfg(feature = "profiling")]
 use crate::profiling::scope;
 use html_engine_model::grapheme_boundaries;
@@ -430,14 +431,16 @@ pub fn shape_document(
                     // line's ascent/baseline (and is invalid for several native
                     // shaping APIs), so register these glyphs independently.
                     for (glyph, &character) in run_glyphs.iter_mut().zip(&normalized_characters) {
-                        *glyph = glyph_shaper.shape_glyph(
-                            character,
-                            font_size,
-                            font_weight,
-                            font_style.into(),
-                            color,
-                            family,
-                            resources,
+                        *glyph = resources.shape_glyph(
+                            glyph_shaper,
+                            GlyphRequest {
+                                character,
+                                font_size,
+                                font_weight,
+                                font_slant: font_style.into(),
+                                color,
+                                font_family: family,
+                            },
                         )?;
                     }
                     None
@@ -500,14 +503,16 @@ pub fn shape_document(
                         .filter(|_| is_cjk_character(mirrored))
                         .and_then(|id| styles.string(id))
                         .or(family);
-                    let glyph = glyph_shaper.shape_glyph(
-                        mirrored,
-                        font_size,
-                        font_weight,
-                        font_style.into(),
-                        color,
-                        family,
-                        resources,
+                    let glyph = resources.shape_glyph(
+                        glyph_shaper,
+                        GlyphRequest {
+                            character: mirrored,
+                            font_size,
+                            font_weight,
+                            font_slant: font_style.into(),
+                            color,
+                            font_family: family,
+                        },
                     )?;
                     if !resources.contains(glyph) {
                         return Err(ShapeError::unregistered_glyph_id(glyph, resources.len()));
@@ -541,14 +546,16 @@ pub fn shape_document(
         let style = get_style(styles, layout_tree, box_idx);
         let family = box_family[box_idx].as_deref();
         let font_size = font_metrics.resolved_font_size(style, box_idx);
-        let glyph = glyph_shaper.shape_glyph(
-            '\u{2026}',
-            font_size,
-            style.font_weight(),
-            style.font_style().into(),
-            style.color(),
-            family,
-            resources,
+        let glyph = resources.shape_glyph(
+            glyph_shaper,
+            GlyphRequest {
+                character: '\u{2026}',
+                font_size,
+                font_weight: style.font_weight(),
+                font_slant: style.font_style().into(),
+                color: style.color(),
+                font_family: family,
+            },
         )?;
         if !resources.contains(glyph) {
             return Err(ShapeError::unregistered_glyph_id(glyph, resources.len()));
@@ -562,14 +569,16 @@ pub fn shape_document(
         let style = get_style(styles, layout_tree, box_idx);
         let family = box_family[box_idx].as_deref();
         let font_size = font_metrics.resolved_font_size(style, box_idx);
-        let glyph = glyph_shaper.shape_glyph(
-            '\u{2010}',
-            font_size,
-            style.font_weight(),
-            style.font_style().into(),
-            style.color(),
-            family,
-            resources,
+        let glyph = resources.shape_glyph(
+            glyph_shaper,
+            GlyphRequest {
+                character: '\u{2010}',
+                font_size,
+                font_weight: style.font_weight(),
+                font_slant: style.font_style().into(),
+                color: style.color(),
+                font_family: family,
+            },
         )?;
         if !resources.contains(glyph) {
             return Err(ShapeError::unregistered_glyph_id(glyph, resources.len()));
@@ -765,14 +774,16 @@ fn reshape_directional_range(
                     .filter(|_| is_cjk_character(mirrored))
                     .and_then(|id| styles.string(id))
                     .or(family);
-                let glyph = glyph_shaper.shape_glyph(
-                    mirrored,
-                    style.font_size(),
-                    style.font_weight(),
-                    style.font_style().into(),
-                    style.color(),
-                    family,
-                    resources,
+                let glyph = resources.shape_glyph(
+                    glyph_shaper,
+                    GlyphRequest {
+                        character: mirrored,
+                        font_size: style.font_size(),
+                        font_weight: style.font_weight(),
+                        font_slant: style.font_style().into(),
+                        color: style.color(),
+                        font_family: family,
+                    },
                 )?;
                 if !resources.contains(glyph) {
                     return Err(ShapeError::unregistered_glyph_id(glyph, resources.len()));

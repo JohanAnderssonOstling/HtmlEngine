@@ -75,9 +75,10 @@ pub mod style {
 
 pub mod text {
     pub use html_pipeline::engine::{
-        CharacterPlacement, ContentLanguage, FontMetricsRequest, FontRelativeMetrics, FontSlant,
-        GlyphId, GlyphMetric, GlyphMetricError, GlyphResourceCheckpoint, GlyphResourceGeneration,
-        GlyphResourceStore, GlyphShaper, LanguageTag, OpenTypeFeature, ShapeError, ShapedLine,
+        CharacterPlacement, ContentLanguage, FontMetrics, FontMetricsRequest, FontRelativeMetrics,
+        FontSlant, GlyphHandle, GlyphId, GlyphMetric, GlyphMetricError, GlyphRequest,
+        GlyphResourceCheckpoint, GlyphResourceGeneration, GlyphResourceStore, GlyphResources,
+        GlyphShaper, LanguageTag, OpenTypeFeature, ShapeError, ShapedGlyph, ShapedLine,
         ShapedTextRun, TextDirection, TextRunId, TextRunShapeRequest, TextShapeRequest,
         TextStyleSpan,
     };

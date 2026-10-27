@@ -25,7 +25,8 @@ license = "GPL-3.0-or-later"
 [workspace.dependencies]
 kurbo = "0.11.3"
 peniko = "0.2.0"
-lightningcss = { version = "1.0.0-alpha.72", features = ["substitute_variables"] }
+# Keep the fix for downstream consumers, which do not inherit root Cargo patches.
+lightningcss = { version = "1.0.0-alpha.72", path = "vendor/lightningcss", features = ["substitute_variables"] }
 taffy = { version = "0.13.0", default-features = false, features = ["std", "taffy_tree", "flexbox", "grid"] }
 parcel_selectors = "0.28.2"
 scraper = "0.27"
@@ -37,5 +38,6 @@ unicode-bidi = "0.3.18"
 
 # alpha.72 panics on mixed number/percentage calculations. Keep the error
 # handling fix in the dependency until an upstream release contains it.
+# Registry consumers in this workspace must resolve to that same crate.
 [patch.crates-io]
 lightningcss = { path = "vendor/lightningcss" }

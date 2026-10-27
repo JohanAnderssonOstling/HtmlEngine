@@ -43,8 +43,8 @@ Skrift is a framework agnostic HTML and CSS rendering engine built with the purp
   - [x] Chinese, Japanese, and Korean line breaking
   - [x] Manual and automatic hyphenation for supported languages
   - [x] Justification and paragraph composition
-  - [x] First line and initial letter styling
-  - [x] Text decorations
+  - [x] `::first-line` and `::first-letter` styling
+  - [x] Underline, overline, and line-through decorations
   - [x] Reader font size and color overrides
   - [x] Font loading and fallback
   - [ ] Ruby annotations
@@ -57,7 +57,7 @@ Skrift is a framework agnostic HTML and CSS rendering engine built with the purp
   - [x] Relative and absolute positioning
   - [x] Overflow clipping and stacking order
   - [ ] Fixed and sticky positioning
-  - [ ] Shared tracks across nested grids
+  - [ ] Subgrid (shared tracks across nested grids)
 
 - **Lists and generated content**
   - [x] Decimal, alphabetic, Roman numeral, and bullet markers
@@ -71,11 +71,35 @@ Skrift is a framework agnostic HTML and CSS rendering engine built with the purp
 - **CSS and painting**
   - [x] Linked and embedded stylesheets and imports
   - [x] Cascade layers and custom properties
-  - [x] Media and feature queries
+  - [x] Media queries and `@supports` for implemented features
   - [x] Solid backgrounds, borders, outlines, and text decorations
-  - [x] Rounded corners and clipping
+  - [x] Rounded corners and overflow clipping
   - [ ] Background images, gradients, and border images
   - [ ] Shadows, opacity, transforms, and filters
+
+## CSS support limits
+
+Parser acceptance alone does not imply rendering support. `@supports` checks
+the implemented property and value, and reports unsupported features as false.
+An implemented property can still have unsupported values.
+Selector syntax checks follow the native parser; newer pseudo-element chains
+that require parser extensions are outside their scope.
+
+| Area | Unsupported features |
+| --- | --- |
+| Painting | CSS background images, gradients, border images, box and text shadows, opacity, transforms, masks, `clip-path`, and filters including backdrop filters |
+| Motion | CSS animations, transitions, and `@keyframes` |
+| Layout | Fixed and sticky positioning, subgrid, grid lanes, anchor positioning, `calc-size()`, vertical and sideways writing, and containment beyond `contain: size` |
+| Typography | Ruby annotations, advanced baseline alignment modes, custom text overflow strings, fading overflow, custom counter styles, and string list markers |
+| Generated content | `content: url(...)`, CSS `reversed()` counters, and alternative text forms such as `content: 'text' / 'alternative'` |
+| Colors | `color-layers()`, `contrast-color()`, and relative color values the backend cannot resolve |
+| At-rules | `@container` queries, `@page` styling, `@property` registration, `@position-try`, `@custom-media` aliases, and `@counter-style` definitions |
+
+Document images such as `<img>` and SVG are supported. Ordinary grid tracks,
+`text-overflow: ellipsis`, generated text and counters, and HTML reversed lists
+are also supported within the feature checklist above. The
+[renderer capability checks](crates/03-html-style/src/style/02-syntax/capabilities.rs)
+define the implemented CSS subset.
 
 ## Additional features
 

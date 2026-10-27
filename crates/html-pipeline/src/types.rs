@@ -110,7 +110,7 @@ impl PipelineChangeMask {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum EarliestStage {
     Parse,
     Style,
@@ -123,39 +123,7 @@ pub enum EarliestStage {
 
 impl EarliestStage {
     pub fn coalesce(self, other: EarliestStage) -> EarliestStage {
-        use EarliestStage::*;
-        let rank = |stage: EarliestStage| match stage {
-            Parse => 0,
-            Style => 1,
-            Prepare => 2,
-            Shape => 3,
-            Layout => 4,
-            Paint => 5,
-            None => 6,
-        };
-        if rank(self) <= rank(other) { self } else { other }
-    }
-}
-
-impl std::cmp::PartialOrd for EarliestStage {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl std::cmp::Ord for EarliestStage {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        use EarliestStage::*;
-        let rank = |stage: EarliestStage| match stage {
-            Parse => 0,
-            Style => 1,
-            Prepare => 2,
-            Shape => 3,
-            Layout => 4,
-            Paint => 5,
-            None => 6,
-        };
-        rank(*self).cmp(&rank(*other))
+        self.min(other)
     }
 }
 

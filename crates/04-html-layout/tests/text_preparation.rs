@@ -1,7 +1,8 @@
 use html_pipeline::engine::{
-    FontSlant, FormattingDocument, GlyphId, GlyphMetric, GlyphResourceGeneration,
-    GlyphResourceStore, GlyphShaper, LayoutConstraints, PreparedDocument, ShapeError,
+    FormattingDocument, GlyphMetric, GlyphResourceGeneration, GlyphResourceStore, GlyphShaper,
+    LayoutConstraints, PreparedDocument, ShapeError,
 };
+use html_pipeline::{GlyphRequest, ShapedGlyph};
 
 #[derive(Default)]
 struct Shaper(GlyphResourceGeneration);
@@ -15,17 +16,17 @@ impl GlyphShaper for Shaper {
         self.0
     }
 
-    fn shape_glyph(
-        &mut self,
-        character: char,
-        size: f32,
-        _: u16,
-        _: FontSlant,
-        _: u32,
-        _: Option<&str>,
-        resources: &mut GlyphResourceStore,
-    ) -> Result<GlyphId, ShapeError> {
-        resources.register(GlyphMetric::try_new(character, size / 2.0, size, 0.0, 0.0).unwrap())
+    fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
+        Ok(ShapedGlyph::from_metric(
+            request.character as u32,
+            GlyphMetric::try_new(
+                request.character,
+                request.font_size / 2.0,
+                request.font_size,
+                0.0,
+            )
+            .unwrap(),
+        ))
     }
 }
 

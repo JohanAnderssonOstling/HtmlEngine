@@ -1,53 +1,13 @@
 //! Font grammar, system-font fallback and reset-only shorthand longhands.
 
 use super::property_id::RendererPropertyId;
-use super::sign;
-use super::value::{
-    NumberValue, PercentageValue, parse_number, parse_percentage_value, parsed_property,
-    without_priority,
-};
-use cssparser::{ParseError, Parser, ParserInput, Token};
-use lightningcss::properties::font::{AbsoluteFontWeight, FontStretchKeyword, FontWeight};
+use super::value::{NumberValue, parse_number, parsed_property, without_priority};
+use cssparser::{Parser, ParserInput, Token};
+use lightningcss::properties::font::{AbsoluteFontWeight, FontWeight};
 use lightningcss::properties::{Property, PropertyId};
 use lightningcss::traits::Parse;
 use static_self::IntoOwned;
 use std::borrow::Cow;
-
-pub(crate) fn property_value_is_valid(id: &PropertyId<'_>, source: &str) -> Option<bool> {
-    if !matches!(id, PropertyId::FontStretch | PropertyId::TextSizeAdjust(_)) {
-        return None;
-    }
-    let mut input = ParserInput::new(source);
-    let keyword: Result<(), ParseError<'_, ()>> =
-        Parser::new(&mut input).parse_entirely(|parser| {
-            if matches!(id, PropertyId::FontStretch) {
-                FontStretchKeyword::parse(parser)
-                    .map(|_| ())
-                    .map_err(|_| parser.new_custom_error(()))
-            } else {
-                let name = parser.expect_ident()?;
-                if name.eq_ignore_ascii_case("auto") || name.eq_ignore_ascii_case("none") {
-                    Ok(())
-                } else {
-                    Err(parser.new_custom_error(()))
-                }
-            }
-        });
-    if keyword.is_ok() {
-        return Some(true);
-    }
-    let Ok(source) = sign::lower(source, |_| Some(1.0)) else {
-        return Some(false);
-    };
-    let mut input = ParserInput::new(&source);
-    Some(
-        match Parser::new(&mut input).parse_entirely(parse_percentage_value) {
-            Ok(PercentageValue::Percentage(value)) => value >= 0.0,
-            Ok(PercentageValue::Calculation) => true,
-            Err(_) => false,
-        },
-    )
-}
 
 pub(crate) const RESET_LONGHANDS: [RendererPropertyId; 4] = [
     RendererPropertyId::FontKerning,

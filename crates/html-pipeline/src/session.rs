@@ -59,6 +59,21 @@ impl<K: PartialEq, V> CacheEntry<K, V> {
 }
 
 impl PipelineCacheState {
+    fn publish_layout_key(&mut self, key: LayoutCacheKey) {
+        self.prepared = Some(CacheEntry {
+            key: key.shaped.prepared.clone(),
+            value: (),
+        });
+        self.shaped = Some(CacheEntry {
+            key: key.shaped.clone(),
+            value: (),
+        });
+        self.laid_out
+            .as_mut()
+            .expect("published document owner")
+            .key = key;
+    }
+
     fn parsed_matches(&self, key: &ParsedCacheKey) -> bool {
         self.parsed.as_ref().is_some_and(|entry| entry.matches(key))
     }
@@ -315,28 +330,7 @@ impl PipelineSession {
         self.configure_factory(&requested_inputs);
         let prepared_key = requested_inputs.prepared_cache_key();
         let parsed_key = prepared_key.parsed.clone();
-        let parsed = self.parse(&requested_inputs.source, requested_inputs.markup_syntax)?;
-        let user_styles = requested_inputs
-            .user_styles
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-        let encoding = parsed.source_encoding().map(str::to_owned);
-        let (prepared, media_queries) = self
-            .factory
-            .with_resources(ResourceContext::new(
-                self.cached_provider.as_ref(),
-                if requested_inputs.base_uri.is_empty() {
-                    "index.html"
-                } else {
-                    &requested_inputs.base_uri
-                },
-            ))
-            .build_pipeline_from_owned_parsed(parsed, &user_styles);
-        let unpainted_prepared = prepared;
-        let prepared = unpainted_prepared
-            .into_reader_paint_overrides(&requested_inputs.reader_overrides)
-            .map_err(|error| PipelineError(error.to_string()))?;
+        let (prepared, encoding, media_queries) = self.prepare_document(&requested_inputs)?;
         let media_match_key = media_queries.match_key(
             requested_inputs.style_environment.media,
             f64::from(requested_inputs.style_environment.root_font_size),
@@ -359,6 +353,34 @@ impl PipelineSession {
         self.cache.laid_out = None;
         self.active_resource_generation = None;
         Ok(())
+    }
+
+    fn prepare_document(
+        &mut self,
+        requested_inputs: &PipelineInputs,
+    ) -> Result<(PreparedDocument<'static>, Option<String>, MediaQuerySet), PipelineError> {
+        let parsed = self.parse(&requested_inputs.source, requested_inputs.markup_syntax)?;
+        let user_styles = requested_inputs
+            .user_styles
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let encoding = parsed.source_encoding().map(str::to_owned);
+        let (prepared, media_queries) = self
+            .factory
+            .with_resources(ResourceContext::new(
+                self.cached_provider.as_ref(),
+                if requested_inputs.base_uri.is_empty() {
+                    "index.html"
+                } else {
+                    &requested_inputs.base_uri
+                },
+            ))
+            .build_pipeline_from_owned_parsed(parsed, &user_styles);
+        let prepared = prepared
+            .into_reader_paint_overrides(&requested_inputs.reader_overrides)
+            .map_err(|error| PipelineError(error.to_string()))?;
+        Ok((prepared, encoding, media_queries))
     }
 
     fn configure_factory(&mut self, requested_inputs: &PipelineInputs) {
@@ -448,10 +470,10 @@ impl PipelineSession {
         self.configure_factory(requested_inputs);
         let constraints = to_layout_constraints(requested_inputs.layout)?;
         let render_only_key = requested_inputs.render_only_cache_key();
-        let layout_key = render_only_key.layout.clone();
-        let shaped_key = layout_key.shaped.clone();
-        let prepared_key = shaped_key.prepared.clone();
-        let parsed_key = prepared_key.parsed.clone();
+        let layout_key = &render_only_key.layout;
+        let shaped_key = &layout_key.shaped;
+        let prepared_key = &shaped_key.prepared;
+        let parsed_key = &prepared_key.parsed;
         let color_preferences_changed =
             previous.is_some_and(|previous| previous.color_preferences_changed);
         let source_matches = previous.is_some_and(|previous| previous.source_matches);
@@ -459,9 +481,9 @@ impl PipelineSession {
             self.media_match_changed(requested_inputs, previous.map(|inputs| inputs.media));
         let can_repaint = color_preferences_changed
             && previous.is_some_and(|previous| {
-                self.cache.parsed_matches(&parsed_key)
+                self.cache.parsed_matches(parsed_key)
                     && previous.source_matches
-                    && self.cache.laid_out_matches(&layout_key)
+                    && self.cache.laid_out_matches(layout_key)
                     && !media_match_changed
                     && self.active_resource_generation.as_ref()
                         == Some(&glyph_shaper.resource_generation())
@@ -474,19 +496,7 @@ impl PipelineSession {
                 .value
                 .repaint_with_reader_overrides(&requested_inputs.reader_overrides, resources)
                 .map_err(|error| PipelineError(error.to_string()))?;
-            self.cache.prepared = Some(CacheEntry {
-                key: prepared_key,
-                value: (),
-            });
-            self.cache.shaped = Some(CacheEntry {
-                key: shaped_key,
-                value: (),
-            });
-            self.cache
-                .laid_out
-                .as_mut()
-                .expect("paint update has layout")
-                .key = layout_key;
+            self.cache.publish_layout_key(layout_key.clone());
             let stage = EarliestStage::Paint;
             let reused = Reuse::reused(stage);
             return Ok(PipelineUpdate {
@@ -502,17 +512,17 @@ impl PipelineSession {
             });
         }
         let stage = self.earliest_uncached_stage(
-            &parsed_key,
-            &prepared_key,
-            &shaped_key,
-            &layout_key,
+            parsed_key,
+            prepared_key,
+            shaped_key,
+            layout_key,
             source_matches,
             media_match_changed,
             self.active_resource_generation.as_ref() == Some(&glyph_shaper.resource_generation()),
         );
 
         if stage <= EarliestStage::Prepare
-            && self.cache.parsed_matches(&parsed_key)
+            && self.cache.parsed_matches(parsed_key)
             && source_matches
         {
             return self.restyle_cached(
@@ -529,44 +539,26 @@ impl PipelineSession {
             let prepared_reused = stage > EarliestStage::Prepare;
             let shaped_reused = stage == EarliestStage::Layout;
             let mut queries = None;
-            if shaped_reused {
+            if shaped_reused || (prepared_reused && self.cache.pending_prepared.is_none()) {
                 let layout = &mut self
                     .cache
                     .laid_out
                     .as_mut()
-                    .expect("matching layout owner")
+                    .expect("cached document owner")
                     .value;
                 let result = if color_preferences_changed {
                     layout.update_with_reader_overrides(
                         &requested_inputs.reader_overrides,
                         constraints,
                         &requested_inputs.image_metrics,
-                        false,
+                        !shaped_reused,
                         glyph_shaper,
                         resources,
                     )
-                } else {
+                } else if shaped_reused {
                     layout.relayout_with_metrics_and_shaper(
                         constraints,
                         &requested_inputs.image_metrics,
-                        glyph_shaper,
-                        resources,
-                    )
-                };
-                result.map_err(|error| PipelineError(error.to_string()))?;
-            } else if prepared_reused && self.cache.pending_prepared.is_none() {
-                let layout = &mut self
-                    .cache
-                    .laid_out
-                    .as_mut()
-                    .expect("prepared owner remains published")
-                    .value;
-                let result = if color_preferences_changed {
-                    layout.update_with_reader_overrides(
-                        &requested_inputs.reader_overrides,
-                        constraints,
-                        &requested_inputs.image_metrics,
-                        true,
                         glyph_shaper,
                         resources,
                     )
@@ -589,29 +581,8 @@ impl PipelineSession {
                         None,
                     )
                 } else {
-                    let parsed =
-                        self.parse(&requested_inputs.source, requested_inputs.markup_syntax)?;
-                    let encoding = parsed.source_encoding().map(str::to_owned);
-                    let user_styles = requested_inputs
-                        .user_styles
-                        .iter()
-                        .map(String::as_str)
-                        .collect::<Vec<_>>();
-                    let (prepared, media) = self
-                        .factory
-                        .with_resources(ResourceContext::new(
-                            self.cached_provider.as_ref(),
-                            if requested_inputs.base_uri.is_empty() {
-                                "index.html"
-                            } else {
-                                &requested_inputs.base_uri
-                            },
-                        ))
-                        .build_pipeline_from_owned_parsed(parsed, &user_styles);
+                    let (prepared, encoding, media) = self.prepare_document(requested_inputs)?;
                     queries = Some(media);
-                    let prepared = prepared
-                        .into_reader_paint_overrides(&requested_inputs.reader_overrides)
-                        .map_err(|error| PipelineError(error.to_string()))?;
                     (prepared, encoding)
                 };
                 let painted = if prepared_reused && color_preferences_changed {
@@ -658,19 +629,7 @@ impl PipelineSession {
                     self.cache.font_faces = self.factory.take_font_faces();
                 }
             }
-            self.cache.prepared = Some(CacheEntry {
-                key: prepared_key.clone(),
-                value: (),
-            });
-            self.cache.shaped = Some(CacheEntry {
-                key: shaped_key.clone(),
-                value: (),
-            });
-            self.cache
-                .laid_out
-                .as_mut()
-                .expect("published document owner")
-                .key = layout_key.clone();
+            self.cache.publish_layout_key(layout_key.clone());
             self.active_resource_generation = Some(glyph_shaper.resource_generation());
             if let Some(media) = queries {
                 self.cache.media_queries = Some(media);
@@ -788,19 +747,7 @@ impl PipelineSession {
                     });
                 }
                 self.cache.pending_prepared = None;
-                self.cache.prepared = Some(CacheEntry {
-                    key: inputs.prepared_cache_key(),
-                    value: (),
-                });
-                self.cache.shaped = Some(CacheEntry {
-                    key: inputs.shaped_cache_key(),
-                    value: (),
-                });
-                self.cache
-                    .laid_out
-                    .as_mut()
-                    .expect("restyle publishes document")
-                    .key = inputs.layout_cache_key();
+                self.cache.publish_layout_key(inputs.layout_cache_key());
                 self.active_resource_generation = Some(shaper.resource_generation());
                 self.cache.font_faces = self.factory.take_font_faces();
                 self.cache.media_queries = queries;
@@ -951,19 +898,10 @@ impl PipelineSession {
         if previous_media == requested_inputs.style_environment.media {
             return false;
         }
-        let (Some(media_queries), Some(previous_key)) = (
-            self.cache.media_queries.as_ref(),
-            self.cache.media_match_key.as_ref(),
-        ) else {
-            return true;
-        };
-        if media_queries.uses_viewport_units() {
-            return true;
-        }
-        media_queries.match_key(
+        self.media_dependencies_changed(
             requested_inputs.style_environment.media,
-            f64::from(requested_inputs.style_environment.root_font_size),
-        ) != *previous_key
+            requested_inputs.style_environment.root_font_size,
+        )
     }
 
     pub fn media_environment_change_affects_style(
@@ -977,6 +915,10 @@ impl PipelineSession {
         if previous_inputs.style_environment.media == media {
             return false;
         }
+        self.media_dependencies_changed(media, root_font_size)
+    }
+
+    fn media_dependencies_changed(&self, media: MediaEnvironment, root_font_size: u32) -> bool {
         let (Some(media_queries), Some(previous_key)) = (
             self.cache.media_queries.as_ref(),
             self.cache.media_match_key.as_ref(),
@@ -1201,6 +1143,8 @@ fn to_layout_constraints(
 
 #[cfg(test)]
 mod tests {
+    use crate::{GlyphRequest, ShapedGlyph};
+
     use super::{PipelineSession, to_layout_constraints};
     use crate::engine::{
         GlyphId, GlyphMetric, GlyphResourceStore, GlyphShaper as LayoutGlyphShaper,
@@ -1317,14 +1261,16 @@ mod tests {
                 let color = request
                     .paint_colors()
                     .map_or(style.color(), |colors| colors[index]);
-                *glyph = self.shape_glyph(
-                    ch,
-                    style.font_size(),
-                    style.font_weight(),
-                    style.font_slant(),
-                    color,
-                    style.font_family(),
-                    resources,
+                *glyph = resources.shape_glyph(
+                    self,
+                    GlyphRequest {
+                        character: ch,
+                        font_size: style.font_size(),
+                        font_weight: style.font_weight(),
+                        font_slant: style.font_slant(),
+                        color,
+                        font_family: style.font_family(),
+                    },
                 )?;
             }
             Ok(None)
@@ -1358,30 +1304,26 @@ mod tests {
 
         fn shape_glyph(
             &mut self,
-            ch: char,
-            font_size: f32,
-            _font_weight: u16,
-            _font_slant: crate::engine::FontSlant,
-            color: u32,
-            _family: Option<&str>,
-            resources: &mut crate::engine::GlyphResourceStore,
-        ) -> Result<GlyphId, crate::engine::ShapeError> {
+            request: GlyphRequest<'_>,
+        ) -> Result<ShapedGlyph, crate::engine::ShapeError> {
             self.calls += 1;
-            self.colors.push((ch, color));
-            let key = (ch, font_size.to_bits(), color);
-            if let Some(&glyph) = self.cache.get(&key) {
-                return Ok(glyph);
-            }
+            self.colors.push((request.character, request.color));
+            let key = (
+                request.character,
+                request.font_size.to_bits(),
+                request.color,
+            );
 
             let idx = u32::try_from(self.cache.len()).expect("glyph ids must fit");
             let glyph = idx;
-            let metric = GlyphMetric::try_new(ch, 1.0, 1.0, 0.0, 0.0)
+            let metric = GlyphMetric::try_new(request.character, 1.0, 1.0, 0.0)
                 .expect("deterministic metrics must be valid");
-            resources
-                .register(metric)
-                .expect("glyph metrics registry capacity should not be exceeded");
+            if let Some(&glyph) = self.cache.get(&key) {
+                return Ok(ShapedGlyph::from_metric(glyph, metric));
+            }
+
             self.cache.insert(key, glyph);
-            Ok(glyph)
+            Ok(ShapedGlyph::from_metric(glyph, metric))
         }
     }
 
@@ -1424,29 +1366,26 @@ mod tests {
 
         fn shape_glyph(
             &mut self,
-            ch: char,
-            font_size: f32,
-            _font_weight: u16,
-            _font_slant: crate::engine::FontSlant,
-            _color: u32,
-            _family: Option<&str>,
-            resources: &mut crate::engine::GlyphResourceStore,
-        ) -> Result<GlyphId, crate::engine::ShapeError> {
-            let key = (ch, font_size.to_bits());
-            if let Some(&glyph) = self.cache.get(&key) {
-                return Ok(glyph);
-            }
+            request: GlyphRequest<'_>,
+        ) -> Result<ShapedGlyph, crate::engine::ShapeError> {
+            let key = (request.character, request.font_size.to_bits());
 
             let idx = u32::try_from(self.cache.len()).expect("glyph ids must fit");
             let glyph = idx;
-            let width = font_size.max(1.0) * 0.75;
-            let metric = GlyphMetric::try_new(ch, width, font_size, font_size * 0.2, 0.0)
-                .expect("deterministic metrics must be valid");
-            resources
-                .register(metric)
-                .expect("glyph metrics registry capacity should not be exceeded");
+            let width = request.font_size.max(1.0) * 0.75;
+            let metric = GlyphMetric::try_new(
+                request.character,
+                width,
+                request.font_size,
+                request.font_size * 0.2,
+            )
+            .expect("deterministic metrics must be valid");
+            if let Some(&glyph) = self.cache.get(&key) {
+                return Ok(ShapedGlyph::from_metric(glyph, metric));
+            }
+
             self.cache.insert(key, glyph);
-            Ok(glyph)
+            Ok(ShapedGlyph::from_metric(glyph, metric))
         }
     }
 
@@ -1531,30 +1470,24 @@ mod tests {
 
         fn shape_glyph(
             &mut self,
-            ch: char,
-            font_size: f32,
-            _font_weight: u16,
-            _font_slant: crate::engine::FontSlant,
-            _color: u32,
-            _family: Option<&str>,
-            resources: &mut crate::engine::GlyphResourceStore,
-        ) -> Result<GlyphId, crate::engine::ShapeError> {
-            if self.fail_on == Some(ch) {
+            request: GlyphRequest<'_>,
+        ) -> Result<ShapedGlyph, crate::engine::ShapeError> {
+            if self.fail_on == Some(request.character) {
                 return Err(crate::engine::ShapeError::unregistered_glyph_id(
                     u32::MAX,
-                    resources.len(),
+                    self.cache.len(),
                 ));
             }
-            let key = (ch, font_size.to_bits());
+            let key = (request.character, request.font_size.to_bits());
+            let metric = GlyphMetric::try_new(request.character, 1.0, 1.0, 0.0)
+                .expect("test metrics must be valid");
             if let Some(&glyph) = self.cache.get(&key) {
-                return Ok(glyph);
+                return Ok(ShapedGlyph::from_metric(glyph, metric));
             }
-            let metric =
-                GlyphMetric::try_new(ch, 1.0, 1.0, 0.0, 0.0).expect("test metrics must be valid");
-            let glyph = resources.register(metric)?;
+            let glyph = self.cache.len() as GlyphId;
             self.cache.insert(key, glyph);
-            self.resources.push(ch);
-            Ok(glyph)
+            self.resources.push(request.character);
+            Ok(ShapedGlyph::from_metric(glyph, metric))
         }
 
         fn measure_line(

@@ -112,32 +112,16 @@ pub(crate) fn replace<'a>(
     if !source.contains('(') {
         return Ok(Cow::Borrowed(source));
     }
-    replace_tokens(source, &mut resolve, &mut |_| Ok(None))
-}
-
-/// Replace identifier tokens while preserving strings, comments and function names.
-pub(crate) fn replace_identifiers<'a>(
-    source: &'a str,
-    mut resolve: impl FnMut(&str) -> Result<Option<String>, ()>,
-) -> Result<Cow<'a, str>, ()> {
-    replace_tokens(source, &mut |_, _| Ok(None), &mut resolve)
+    replace_tokens(source, &mut resolve)
 }
 
 fn replace_tokens<'a>(
     source: &'a str,
     resolve: &mut impl FnMut(&str, &str) -> Result<Option<String>, ()>,
-    resolve_ident: &mut impl FnMut(&str) -> Result<Option<String>, ()>,
 ) -> Result<Cow<'a, str>, ()> {
     let mut input = ParserInput::new(source);
     let mut edits = Vec::new();
-    walk(
-        &mut Parser::new(&mut input),
-        source,
-        &mut edits,
-        resolve,
-        resolve_ident,
-        0,
-    )?;
+    walk(&mut Parser::new(&mut input), source, &mut edits, resolve, 0)?;
     if edits.is_empty() {
         Ok(Cow::Borrowed(source))
     } else {
@@ -150,7 +134,6 @@ fn walk(
     source: &str,
     edits: &mut Vec<Edit>,
     resolve: &mut impl FnMut(&str, &str) -> Result<Option<String>, ()>,
-    resolve_ident: &mut impl FnMut(&str) -> Result<Option<String>, ()>,
     depth: usize,
 ) -> Result<(), ()> {
     if depth >= 128 {
@@ -159,15 +142,6 @@ fn walk(
     loop {
         let start = parser.position().byte_index();
         let name = match parser.next_including_whitespace_and_comments() {
-            Ok(Token::Ident(name)) => {
-                if let Some(replacement) = resolve_ident(name)? {
-                    edits.push(Edit {
-                        range: start..parser.position().byte_index(),
-                        replacement,
-                    });
-                }
-                continue;
-            }
             Ok(Token::Function(name)) => Some(name.clone()),
             Ok(Token::ParenthesisBlock | Token::SquareBracketBlock | Token::CurlyBracketBlock) => {
                 None
@@ -179,7 +153,7 @@ fn walk(
         let arguments = parser
             .parse_nested_block(|nested| -> Result<_, ParseError<'_, ()>> {
                 let start = nested.position().byte_index();
-                walk(nested, source, edits, resolve, resolve_ident, depth + 1)
+                walk(nested, source, edits, resolve, depth + 1)
                     .map_err(|()| nested.new_custom_error(()))?;
                 Ok(start..nested.position().byte_index())
             })

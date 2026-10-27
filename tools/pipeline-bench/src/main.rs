@@ -1,4 +1,5 @@
 use html::pipeline::ResourceContext;
+use html::text::{GlyphRequest, ShapedGlyph};
 mod access;
 mod book_css;
 mod counter;
@@ -8,8 +9,8 @@ mod opening;
 mod opening_deep;
 mod queries;
 use html::layout::{
-    FontSlant, GlyphId, GlyphMetric, GlyphResourceGeneration, GlyphResourceStore, GlyphShaper,
-    ShapeError, ShapedTextRun, TextRunShapeRequest,
+    GlyphId, GlyphMetric, GlyphResourceGeneration, GlyphResourceStore, GlyphShaper, ShapeError,
+    ShapedTextRun, TextRunShapeRequest,
 };
 use html::pipeline::*;
 use html::resources::FileSystemProvider;
@@ -205,26 +206,26 @@ impl GlyphShaper for Shaper {
     fn resource_generation(&self) -> GlyphResourceGeneration {
         self.generation
     }
-    fn shape_glyph(
-        &mut self,
-        ch: char,
-        size: f32,
-        _: u16,
-        _: FontSlant,
-        color: u32,
-        _: Option<&str>,
-        resources: &mut GlyphResourceStore,
-    ) -> Result<GlyphId, ShapeError> {
+    fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
         self.calls += 1;
-        let key = (ch, size.to_bits(), color);
+        let key = (
+            request.character,
+            request.font_size.to_bits(),
+            request.color,
+        );
+        let metric = GlyphMetric::try_new(
+            request.character,
+            request.font_size * 0.5,
+            request.font_size * 0.75,
+            request.font_size * 0.25,
+        )
+        .unwrap();
         if let Some(&glyph) = self.cache.get(&key) {
-            return Ok(glyph);
+            return Ok(ShapedGlyph::from_metric(glyph, metric));
         }
-        let glyph = resources.register(
-            GlyphMetric::try_new(ch, size * 0.5, size * 0.75, size * 0.25, 0.0).unwrap(),
-        )?;
+        let glyph = self.cache.len() as GlyphId;
         self.cache.insert(key, glyph);
-        Ok(glyph)
+        Ok(ShapedGlyph::from_metric(glyph, metric))
     }
     fn shape_glyph_run(
         &mut self,
@@ -247,7 +248,6 @@ impl GlyphShaper for Shaper {
                 &geometry,
                 style.font_size() * 0.75,
                 style.font_size() * 0.25,
-                0.0,
             )?;
             for (slot, glyph) in glyphs.iter_mut().zip(range) {
                 *slot = glyph;
@@ -255,16 +255,18 @@ impl GlyphShaper for Shaper {
             return Ok(Some(geometry));
         }
         for (index, (glyph, ch)) in glyphs.iter_mut().zip(request.text().chars()).enumerate() {
-            *glyph = self.shape_glyph(
-                ch,
-                style.font_size(),
-                style.font_weight(),
-                style.font_slant(),
-                request
-                    .paint_colors()
-                    .map_or(style.color(), |colors| colors[index]),
-                style.font_family(),
-                resources,
+            *glyph = resources.shape_glyph(
+                self,
+                GlyphRequest {
+                    character: ch,
+                    font_size: style.font_size(),
+                    font_weight: style.font_weight(),
+                    font_slant: style.font_slant(),
+                    color: request
+                        .paint_colors()
+                        .map_or(style.color(), |colors| colors[index]),
+                    font_family: style.font_family(),
+                },
             )?;
         }
         Ok(None)
@@ -424,17 +426,19 @@ fn text_color_fingerprint(
     shaper: &Shaper,
     resources: &GlyphResourceStore,
 ) -> u64 {
-    let mut glyph_colors = vec![0; resources.len()];
+    let mut glyph_colors = HashMap::new();
     for (&(_, _, color), &glyph) in &shaper.cache {
-        glyph_colors[glyph as usize] = color;
+        glyph_colors.insert(glyph, color);
     }
     let text = document.render_view(resources).text();
     let mut hash = 0xcbf29ce484222325u64;
     for index in 0..text.glyph_count() {
         let glyph = text.glyph_at(index).unwrap();
-        let color = text
-            .paint_color_at(index as u32)
-            .unwrap_or(glyph_colors[glyph as usize]);
+        let color = text.paint_color_at(index as u32).unwrap_or_else(|| {
+            text.paint_handle(glyph)
+                .and_then(|handle| glyph_colors.get(&handle).copied())
+                .unwrap_or_default()
+        });
         hash = (hash ^ u64::from(color)).wrapping_mul(0x100000001b3);
     }
     hash

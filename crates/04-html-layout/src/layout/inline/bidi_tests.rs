@@ -1,8 +1,9 @@
 use crate::parser::DocumentFactory;
 use crate::test_support::TestGlyphShaper;
+use crate::{GlyphRequest, ShapedGlyph};
 use crate::{
-    FontSlant, GlyphId, GlyphResourceGeneration, GlyphResourceStore, GlyphShaper, LaidOutDocument,
-    LayoutConstraints, ShapeError, ShapedTextRun, TextDirection, TextRunShapeRequest,
+    GlyphResourceGeneration, GlyphResourceStore, GlyphShaper, LaidOutDocument, LayoutConstraints,
+    ShapeError, ShapedTextRun, TextDirection, TextRunShapeRequest,
 };
 use std::sync::Arc;
 
@@ -443,18 +444,8 @@ impl GlyphShaper for DirectionalShaper {
     fn resource_generation(&self) -> GlyphResourceGeneration {
         self.fallback.resource_generation()
     }
-    fn shape_glyph(
-        &mut self,
-        ch: char,
-        size: f32,
-        weight: u16,
-        slant: FontSlant,
-        color: u32,
-        family: Option<&str>,
-        resources: &mut GlyphResourceStore,
-    ) -> Result<GlyphId, ShapeError> {
-        self.fallback
-            .shape_glyph(ch, size, weight, slant, color, family, resources)
+    fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
+        self.fallback.shape_glyph(request)
     }
     fn shape_text_run(
         &mut self,

@@ -275,77 +275,17 @@ impl DecorationSelection<'_> {
 }
 
 impl<'a> RenderDecorations<'a> {
-    fn all(
-        decorations: &'a DecorationStore,
-        clips: &'a [Option<crate::layout_model::OverflowClip>],
-        block_paint_ranges: &'a [Range<u32>],
-        block_decoration_count: usize,
-        positioned_layers: &'a [bool],
-        negative_positioned_layers: &'a [bool],
-        independent_positioned_layers: &'a [bool],
-        line_indices: &'a [u32],
-        paint_orders: &'a [u32],
-    ) -> Self {
+    fn new(document: DocumentRead<'a>, selection: DecorationSelection<'a>) -> Self {
+        let output = &document.layout_state.fragment_output;
         Self {
-            decorations,
-            clips,
-            positioned_layers,
-            negative_positioned_layers,
-            independent_positioned_layers,
-            line_indices,
-            paint_orders,
-            selection: DecorationSelection::All {
-                block_paint_ranges,
-                block_decoration_count,
-            },
-        }
-    }
-
-    fn selected(
-        decorations: &'a DecorationStore,
-        clips: &'a [Option<crate::layout_model::OverflowClip>],
-        positioned_layers: &'a [bool],
-        negative_positioned_layers: &'a [bool],
-        independent_positioned_layers: &'a [bool],
-        line_indices: &'a [u32],
-        paint_orders: &'a [u32],
-        indexes: &'a [usize],
-    ) -> Self {
-        Self {
-            decorations,
-            clips,
-            positioned_layers,
-            negative_positioned_layers,
-            independent_positioned_layers,
-            line_indices,
-            paint_orders,
-            selection: DecorationSelection::Indexes(indexes),
-        }
-    }
-
-    fn blocks(
-        decorations: &'a DecorationStore,
-        clips: &'a [Option<crate::layout_model::OverflowClip>],
-        block_paint_ranges: &'a [Range<u32>],
-        block_decoration_count: usize,
-        positioned_layers: &'a [bool],
-        negative_positioned_layers: &'a [bool],
-        independent_positioned_layers: &'a [bool],
-        line_indices: &'a [u32],
-        paint_orders: &'a [u32],
-    ) -> Self {
-        Self {
-            decorations,
-            clips,
-            positioned_layers,
-            negative_positioned_layers,
-            independent_positioned_layers,
-            line_indices,
-            paint_orders,
-            selection: DecorationSelection::Blocks {
-                block_paint_ranges,
-                block_decoration_count,
-            },
+            decorations: &output.decorations,
+            clips: &output.decoration_clips,
+            positioned_layers: &output.decoration_positioned_layers,
+            negative_positioned_layers: &output.decoration_negative_positioned_layers,
+            independent_positioned_layers: &output.decoration_independent_positioned_layers,
+            line_indices: &output.decoration_line_indices,
+            paint_orders: &output.decoration_paint_orders,
+            selection,
         }
     }
 
@@ -518,72 +458,26 @@ impl<'a> RenderFragmentView<'a> {
     }
 
     pub fn decorations(self) -> RenderDecorations<'a> {
-        RenderDecorations::all(
-            &self.doc.layout_state.fragment_output.decorations,
-            &self.doc.layout_state.fragment_output.decoration_clips,
-            &self.doc.layout_state.fragment_output.block_paint_ranges,
-            self.doc.layout_state.fragment_output.block_decoration_count as usize,
-            &self
-                .doc
-                .layout_state
-                .fragment_output
-                .decoration_positioned_layers,
-            &self
-                .doc
-                .layout_state
-                .fragment_output
-                .decoration_negative_positioned_layers,
-            &self
-                .doc
-                .layout_state
-                .fragment_output
-                .decoration_independent_positioned_layers,
-            &self
-                .doc
-                .layout_state
-                .fragment_output
-                .decoration_line_indices,
-            &self
-                .doc
-                .layout_state
-                .fragment_output
-                .decoration_paint_orders,
+        let output = &self.doc.layout_state.fragment_output;
+        RenderDecorations::new(
+            self.doc,
+            DecorationSelection::All {
+                block_paint_ranges: &output.block_paint_ranges,
+                block_decoration_count: output.block_decoration_count as usize,
+            },
         )
     }
 
     /// Document-level decorations only, in CSS paint order. Line-owned
     /// decorations are already indexed and replayed with their visible line.
     pub fn block_decorations(self) -> RenderDecorations<'a> {
-        RenderDecorations::blocks(
-            &self.doc.layout_state.fragment_output.decorations,
-            &self.doc.layout_state.fragment_output.decoration_clips,
-            &self.doc.layout_state.fragment_output.block_paint_ranges,
-            self.doc.layout_state.fragment_output.block_decoration_count as usize,
-            &self
-                .doc
-                .layout_state
-                .fragment_output
-                .decoration_positioned_layers,
-            &self
-                .doc
-                .layout_state
-                .fragment_output
-                .decoration_negative_positioned_layers,
-            &self
-                .doc
-                .layout_state
-                .fragment_output
-                .decoration_independent_positioned_layers,
-            &self
-                .doc
-                .layout_state
-                .fragment_output
-                .decoration_line_indices,
-            &self
-                .doc
-                .layout_state
-                .fragment_output
-                .decoration_paint_orders,
+        let output = &self.doc.layout_state.fragment_output;
+        RenderDecorations::new(
+            self.doc,
+            DecorationSelection::Blocks {
+                block_paint_ranges: &output.block_paint_ranges,
+                block_decoration_count: output.block_decoration_count as usize,
+            },
         )
     }
 
@@ -621,36 +515,7 @@ impl<'a> RenderFragmentView<'a> {
     }
 
     pub fn decorations_by_indices(self, indexes: &'a [usize]) -> RenderDecorations<'a> {
-        RenderDecorations::selected(
-            &self.doc.layout_state.fragment_output.decorations,
-            &self.doc.layout_state.fragment_output.decoration_clips,
-            &self
-                .doc
-                .layout_state
-                .fragment_output
-                .decoration_positioned_layers,
-            &self
-                .doc
-                .layout_state
-                .fragment_output
-                .decoration_negative_positioned_layers,
-            &self
-                .doc
-                .layout_state
-                .fragment_output
-                .decoration_independent_positioned_layers,
-            &self
-                .doc
-                .layout_state
-                .fragment_output
-                .decoration_line_indices,
-            &self
-                .doc
-                .layout_state
-                .fragment_output
-                .decoration_paint_orders,
-            indexes,
-        )
+        RenderDecorations::new(self.doc, DecorationSelection::Indexes(indexes))
     }
 
     pub fn images_for_line(self, line_idx: usize) -> RenderImageFragments<'a> {
@@ -676,36 +541,7 @@ impl<'a> RenderFragmentView<'a> {
             .decoration_fragments_by_line
             .get(line_idx)
             .unwrap_or(&[]);
-        RenderDecorations::selected(
-            &self.doc.layout_state.fragment_output.decorations,
-            &self.doc.layout_state.fragment_output.decoration_clips,
-            &self
-                .doc
-                .layout_state
-                .fragment_output
-                .decoration_positioned_layers,
-            &self
-                .doc
-                .layout_state
-                .fragment_output
-                .decoration_negative_positioned_layers,
-            &self
-                .doc
-                .layout_state
-                .fragment_output
-                .decoration_independent_positioned_layers,
-            &self
-                .doc
-                .layout_state
-                .fragment_output
-                .decoration_line_indices,
-            &self
-                .doc
-                .layout_state
-                .fragment_output
-                .decoration_paint_orders,
-            indexes,
-        )
+        RenderDecorations::new(self.doc, DecorationSelection::Indexes(indexes))
     }
 
     pub fn images(self) -> RenderImageFragments<'a> {

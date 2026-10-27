@@ -16041,13 +16041,13 @@
       }
     },
     "validation": {
-      "command": "HTML_WPT_ROOT=target/wpt-upstream CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 cargo test --locked --workspace --no-fail-fast",
+      "command": "HTML_WPT_ROOT=target/wpt-upstream CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 cargo test --locked --offline --workspace --no-fail-fast",
       "exit_code": 0,
-      "passed": 1594,
+      "passed": 1597,
       "failed": 0,
       "ignored": 2,
-      "suites": 44,
-      "log": "/tmp/skrift-selector-audit-workspace-final.log"
+      "suites": 45,
+      "log": "/home/johan/.cache/skrift-percentage-dependency-workspace-final.log"
     },
     "tree_counting_function_pass": {
       "known_ledger_records_fixed": 39,
@@ -20932,7 +20932,8 @@
         "source": "/home/johan/.cache/skrift-selector-completion/original_ledger_probe.rs",
         "passing_records": "/home/johan/.cache/skrift-selector-completion/verified-fixed.txt",
         "fixture_correction_records": "/home/johan/.cache/skrift-selector-completion/verified-reclassified.txt",
-        "log": "/tmp/skrift-css-original-ledger-replay-final.log"
+        "log": "/tmp/skrift-css-original-ledger-replay-final.log",
+        "recorded_before_dependency_patch": true
       },
       "current_ledgers": {
         "known_failure_records": 0,
@@ -20940,6 +20941,39 @@
         "ignored_assertion_records": 0
       },
       "workspace_validation": {
+        "command": "HTML_WPT_ROOT=target/wpt-upstream CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 cargo test --locked --offline --workspace --no-fail-fast",
+        "exit_code": 0,
+        "passed": 1597,
+        "failed": 0,
+        "ignored": 2,
+        "suites": 45,
+        "log": "/home/johan/.cache/skrift-percentage-dependency-workspace-final.log"
+      },
+      "direct_wpt_validation": {
+        "exit_code": 0,
+        "unexpected_mismatches": 0,
+        "unexpected_passes": 0,
+        "dependency_parser_panics": 0,
+        "known_dependency_scope_mismatches": 0,
+        "other_known_syntax_mismatches": 0,
+        "non_excluded_syntax_assertions": 23411,
+        "literal_calls": 32021,
+        "explicitly_ignored": 0,
+        "dynamic_or_unimplemented_calls": 16732,
+        "unrepresented_syntax_assertions": 8606,
+        "renderer_unsupported_declarations": 15082,
+        "computed_or_shorthand_helpers_checked_for_syntax_only": 10787,
+        "selector_serialization_helpers_checked_for_syntax_only": 111,
+        "newly_skipped_assertions": 0,
+        "log": "/home/johan/.cache/skrift-percentage-dependency-wpt.log"
+      },
+      "limits": [
+        "This completes the tracked parsing failures, not full browser conformance. 8,606 syntax assertions remain outside represented properties/capabilities, and 16,732 calls require dynamic or unimplemented fixture execution. The five formerly caught parser-panic cases now execute as ordinary syntax assertions.",
+        "Valid syntax is separate from rendering support. Nonlinear percentage size expressions, selected-face metric products, and color math unrepresented by the native backend remain unsupported values rather than guessed computed results. Other unsupported renderer features remain explicitly reported.",
+        "The five previously caught dependency percentage-arithmetic panics are fixed by the vendored Lightning CSS patch. The WPT gate now asserts zero parser panics instead of skipping them; its full corpus run passes with zero panics.",
+        "Computed-value and serialization helper input syntax is checked; dedicated browser output comparison remains outside this parsing audit."
+      ],
+      "workspace_validation_before_dependency_patch": {
         "command": "HTML_WPT_ROOT=target/wpt-upstream CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 cargo test --locked --workspace --no-fail-fast",
         "exit_code": 0,
         "passed": 1594,
@@ -20948,7 +20982,7 @@
         "suites": 44,
         "log": "/tmp/skrift-selector-audit-workspace-final.log"
       },
-      "direct_wpt_validation": {
+      "direct_wpt_validation_before_dependency_patch": {
         "exit_code": 0,
         "unexpected_mismatches": 0,
         "unexpected_passes": 0,
@@ -20966,12 +21000,118 @@
         "caught_dependency_panics": 5,
         "log": "/tmp/skrift-selector-audit-wpt-final.log"
       },
-      "limits": [
-        "This completes the tracked parsing failures, not full browser conformance. 8,606 syntax assertions remain outside represented properties/capabilities, and 16,737 calls require dynamic or unimplemented fixture execution. These counts did not increase.",
-        "Valid syntax is separate from rendering support. Nonlinear percentage size expressions, selected-face metric products, and color math unrepresented by the native backend remain unsupported values rather than guessed computed results. Other unsupported renderer features remain explicitly reported.",
-        "The direct WPT adapter still catches five pre-existing dependency percentage-arithmetic panics among dynamic/unimplemented calls, unchanged from the previous pass. The original-ledger replay proves none hides one of the 2,866 parser-fixed records.",
-        "Computed-value and serialization helper input syntax is checked; dedicated browser output comparison remains outside this parsing audit."
-      ]
+      "additional_dependency_panic_cases_fixed": 5
+    },
+    "dependency_percentage_parser_panic_pass": {
+      "date": "2026-10-27",
+      "known_ledger_records_fixed": 0,
+      "previously_caught_dependency_parser_panics_fixed": 5,
+      "fixed_assertions": [
+        {
+          "trace_key": "css-values/minmax-number-invalid.html|line=45|ordinal=0|kind=InvalidValue",
+          "property": "opacity",
+          "value": "min(1, 1%)",
+          "expected": "invalid"
+        },
+        {
+          "trace_key": "css-values/minmax-number-invalid.html|line=58|ordinal=0|kind=InvalidValue",
+          "property": "opacity",
+          "value": "max(1, 1%)",
+          "expected": "invalid"
+        },
+        {
+          "trace_key": "css-values/round-mod-rem-invalid.html|line=65|ordinal=0|kind=InvalidValue",
+          "property": "opacity",
+          "value": "round(1, 1%)",
+          "expected": "invalid"
+        },
+        {
+          "trace_key": "css-values/round-mod-rem-invalid.html|line=78|ordinal=0|kind=InvalidValue",
+          "property": "opacity",
+          "value": "mod(1, 1%)",
+          "expected": "invalid"
+        },
+        {
+          "trace_key": "css-values/round-mod-rem-invalid.html|line=91|ordinal=0|kind=InvalidValue",
+          "property": "opacity",
+          "value": "rem(1, 1%)",
+          "expected": "invalid"
+        }
+      ],
+      "dependency": {
+        "name": "lightningcss",
+        "version": "1.0.0-alpha.72",
+        "registry_checksum": "d31b760f96e8fdfe1d0c295e4bf76c503d6f15d2d470d53bd8cd1f7aa8c7d934",
+        "path": "vendor/lightningcss",
+        "changed_upstream_files": [
+          "src/values/percentage.rs"
+        ],
+        "source_note": "Rust source and targets are copied from the pinned crates.io package; unrelated JS tooling and website files are omitted. LOCAL_PATCHES.txt records the fix and removal instructions. No registry source files were edited."
+      },
+      "behavior": [
+        "Replace Percentage::parse unreachable!() with ParserError::InvalidValue when a parsed calculation does not reduce to a concrete percentage. This matches CSSNumber::parse error handling.",
+        "Retain valid percentage calculations, number-first parser fallback and public style syntax behavior. Regression tests cover all five mixed inputs, ten valid percentage values/calculations and caller fallback to numbers.",
+        "Use the vendored crate through a workspace dependency path and a crates.io patch. The direct path also covers external roots that consume our crates without inheriting root Cargo patches.",
+        "The WPT runner records dependency panics separately and requires the list to be empty. Panics can no longer be counted as dynamic/unimplemented calls and skipped."
+      ],
+      "classification_note": "These five cases were previously omitted after caught dependency panics rather than present in the 2,905-record original ledger. The original ledger fix/correction accounting remains unchanged. WPT now exercises five additional syntax assertions; dynamic/unimplemented calls decrease by five. The renderer capability counter includes those five previously uncounted opacity declarations, without adding rendering support.",
+      "regression_tests": [
+        "dependency_percentage_rejects_mixed_calculations_without_panicking",
+        "dependency_percentage_preserves_valid_percentage_calculations",
+        "dependency_percentage_errors_reach_the_public_syntax_apis"
+      ],
+      "focused_validation": {
+        "exit_code": 0,
+        "passed": 3,
+        "failed": 0,
+        "log": "/home/johan/.cache/skrift-percentage-dependency-focused.log"
+      },
+      "validation": {
+        "command": "HTML_WPT_ROOT=target/wpt-upstream CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0 CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=1 cargo test --locked --offline --workspace --no-fail-fast",
+        "exit_code": 0,
+        "passed": 1597,
+        "failed": 0,
+        "ignored": 2,
+        "suites": 45,
+        "log": "/home/johan/.cache/skrift-percentage-dependency-workspace-final.log"
+      },
+      "direct_wpt_validation": {
+        "exit_code": 0,
+        "unexpected_mismatches": 0,
+        "unexpected_passes": 0,
+        "dependency_parser_panics": 0,
+        "known_dependency_scope_mismatches": 0,
+        "other_known_syntax_mismatches": 0,
+        "non_excluded_syntax_assertions": 23411,
+        "literal_calls": 32021,
+        "explicitly_ignored": 0,
+        "dynamic_or_unimplemented_calls": 16732,
+        "unrepresented_syntax_assertions": 8606,
+        "renderer_unsupported_declarations": 15082,
+        "computed_or_shorthand_helpers_checked_for_syntax_only": 10787,
+        "selector_serialization_helpers_checked_for_syntax_only": 111,
+        "newly_skipped_assertions": 0,
+        "log": "/home/johan/.cache/skrift-percentage-dependency-wpt.log"
+      },
+      "downstream_consumer_validation": {
+        "exit_code": 0,
+        "method": "Resolve an independent temporary Cargo workspace whose only application dependency is html-style. Require exactly one Lightning CSS package with a local manifest path pointing to vendor/lightningcss.",
+        "metadata": "/home/johan/.cache/skrift-percentage-consumer-7w3w8svq/metadata.json",
+        "lightningcss_manifest": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/vendor/lightningcss/Cargo.toml"
+      },
+      "format_validation": {
+        "exit_code": 0,
+        "commands": [
+          "rustfmt --edition 2024 --check crates/03-html-style/tests/dependency_percentage.rs",
+          "rustfmt --edition 2021 --check --config-path vendor/lightningcss/rustfmt.toml vendor/lightningcss/src/values/percentage.rs"
+        ]
+      },
+      "initial_workspace_attempt": {
+        "exit_code": 101,
+        "failure": "Linker bus error while disk space had fallen to 68 MiB. Unchanged source passed after removing 18 obsolete test executables from the previously recorded workspace run.",
+        "log": "/home/johan/.cache/skrift-percentage-dependency-workspace.log",
+        "removed_build_artifacts_manifest": "/home/johan/.cache/skrift-percentage-removed-binaries.json"
+      }
     }
   }
 }

@@ -3,9 +3,9 @@
 //! CSS rule/declaration iterators own boundaries, escapes, comments, and nested
 //! blocks. Property modules own their individual syntax and lowering rules.
 
-use crate::style::syntax::{box_syntax, color_syntax, flex, motion, scope, selector_recovery};
 use crate::style::syntax::value::{normalize_math, normalize_property_value, without_priority};
 use crate::style::syntax::values::{tab_size, text_spacing, white_space};
+use crate::style::syntax::{box_syntax, color_syntax, flex, scope, selector_recovery};
 use cssparser::{
     AtRuleParser, CowRcStr, DeclarationParser, ParseError, Parser, ParserInput, ParserState,
     QualifiedRuleParser, RuleBodyItemParser, RuleBodyParser, StyleSheetParser, Token,
@@ -148,9 +148,6 @@ impl<'i> AtRuleParser<'i> for Scanner<'i> {
             ]
             .iter()
             .any(|rule| name.eq_ignore_ascii_case(rule));
-        if self.syntax_only && keyframes {
-            self.valid_preludes &= motion::keyframes_name_is_valid(input.slice_from(start));
-        }
         let valid_scope = if self.scope_context && name.eq_ignore_ascii_case("scope") {
             match selector_recovery::normalize(input.slice_from(start)) {
                 Some(source) if scope::prelude_is_valid(&source) => {
@@ -223,9 +220,7 @@ impl<'i> QualifiedRuleParser<'i> for Scanner<'i> {
     fn parse_prelude<'t>(&mut self, input: &mut Parser<'i, 't>) -> Result<(), ParseError<'i, ()>> {
         let start = input.position();
         consume(input);
-        if self.syntax_only && self.keyframes {
-            self.valid_preludes &= motion::keyframe_selectors_are_valid(input.slice_from(start));
-        } else if self.scope_context && !self.keyframes {
+        if self.scope_context && !self.keyframes {
             let source = input.slice_from(start);
             let replacement = match selector_recovery::normalize(source) {
                 Some(Cow::Borrowed(_)) => None,
@@ -316,8 +311,8 @@ impl<'i> DeclarationParser<'i> for Scanner<'i> {
         }
         .or_else(|| {
             (box_syntax::property_value_is_valid(&id, without_priority(&value)) == Some(false)
-                || color_syntax::declaration_is_invalid(&id, without_priority(&value)))
-                .then(String::new)
+                || color_syntax::declaration_is_unsupported(&id, without_priority(&value)))
+            .then(String::new)
         })
         .or_else(|| {
             matches!(value, Cow::Owned(_)).then(|| {
@@ -351,7 +346,9 @@ mod tests {
     #[test]
     fn font_face_descriptors_keep_ranges_and_share_math_normalization() {
         assert_eq!(
-            normalize("@media screen {@font-face {font-family:Reader;src:url(reader.woff2);font-weight:clamp(none,400,none) 900}} p {font-weight:0;font-weight:calc(-10)}"),
+            normalize(
+                "@media screen {@font-face {font-family:Reader;src:url(reader.woff2);font-weight:clamp(none,400,none) 900}} p {font-weight:0;font-weight:calc(-10)}"
+            ),
             "@media screen {@font-face {font-family:Reader;src:url(reader.woff2);font-weight:calc(400) 900}} p {;font-weight:1}"
         );
     }

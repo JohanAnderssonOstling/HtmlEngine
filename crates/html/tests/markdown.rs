@@ -1,9 +1,9 @@
 use html::layout::{LaidOutDocument, LayoutConstraints, RenderExportView, TextCompositionPolicy};
 use html::pipeline::DocumentFactory;
 use html::text::{
-    FontSlant, GlyphId, GlyphMetric, GlyphResourceGeneration, GlyphResourceStore, GlyphShaper,
-    ShapeError,
+    GlyphMetric, GlyphResourceGeneration, GlyphResourceStore, GlyphShaper, ShapeError,
 };
+use html::text::{GlyphRequest, ShapedGlyph};
 use std::ops::Range;
 
 #[derive(Default)]
@@ -16,17 +16,17 @@ impl GlyphShaper for TestShaper {
     fn resource_generation(&self) -> GlyphResourceGeneration {
         self.0
     }
-    fn shape_glyph(
-        &mut self,
-        ch: char,
-        size: f32,
-        _: u16,
-        _: FontSlant,
-        _: u32,
-        _: Option<&str>,
-        resources: &mut GlyphResourceStore,
-    ) -> Result<GlyphId, ShapeError> {
-        resources.register(GlyphMetric::try_new(ch, size / 2.0, size, 0.0, 0.0).unwrap())
+    fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
+        Ok(ShapedGlyph::from_metric(
+            request.character as u32,
+            GlyphMetric::try_new(
+                request.character,
+                request.font_size / 2.0,
+                request.font_size,
+                0.0,
+            )
+            .unwrap(),
+        ))
     }
 }
 

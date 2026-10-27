@@ -3410,6 +3410,10 @@ fn parse_color_mix<'i, 't>(input: &mut Parser<'i, 't>) -> Result<CssColor, Parse
     .or_else(|_| input.try_parse(|input| input.expect_percentage()))
     .ok();
 
+  if first_percent.into_iter().chain(second_percent).any(|value| !(0.0..=1.0).contains(&value)) {
+    return Err(input.new_custom_error(ParserError::InvalidValue));
+  }
+
   // https://drafts.csswg.org/css-color-5/#color-mix-percent-norm
   let (p1, p2) = if first_percent.is_none() && second_percent.is_none() {
     (0.5, 0.5)

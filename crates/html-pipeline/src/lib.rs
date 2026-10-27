@@ -25,11 +25,11 @@ use html_layout as layout;
 use html_shape as shaping;
 mod stages;
 pub use html_engine_model::{
-    ContentLanguage, FontMetricsRequest, FontRelativeMetrics, FontSlant, GlyphId, GlyphMetric,
-    GlyphMetricError, GlyphResourceCheckpoint, GlyphResourceGeneration, GlyphResourceStore,
-    GlyphShaper, GlyphSlice, PreparedTextRunFragment, ShapeError, ShapedLine, ShapedTextRun,
-    TextDirection, TextRunId,
-    TextRunShapeRequest, TextShapeRequest, TextStyleSpan,
+    ContentLanguage, FontMetrics, FontMetricsRequest, FontRelativeMetrics, FontSlant, GlyphHandle,
+    GlyphId, GlyphMetric, GlyphMetricError, GlyphRequest, GlyphResourceCheckpoint,
+    GlyphResourceGeneration, GlyphResourceStore, GlyphResources, GlyphShaper, GlyphSlice,
+    PreparedTextRunFragment, ShapeError, ShapedGlyph, ShapedLine, ShapedTextRun, TextDirection,
+    TextRunId, TextRunShapeRequest, TextShapeRequest, TextStyleSpan,
 };
 pub use html_layout::LayoutTimings;
 pub use stages::{
@@ -44,10 +44,11 @@ pub mod engine {
     #[cfg(feature = "profiling")]
     pub use html_engine_model::profiling;
     pub use html_engine_model::{
-        CharacterPlacement, ContentLanguage, FontMetricsRequest, FontRelativeMetrics, FontSlant,
-        FontStyle, GlyphId, GlyphMetric, GlyphMetricError, GlyphResourceCheckpoint,
-        GlyphResourceGeneration, GlyphResourceStore, GlyphShaper, GlyphSlice, LanguageTag, ListStylePosition,
-        OpenTypeFeature, PreparedTextRunFragment, ReaderStyleOverrides, ShapeError, ShapedLine,
+        CharacterPlacement, ContentLanguage, FontMetrics, FontMetricsRequest, FontRelativeMetrics,
+        FontSlant, FontStyle, GlyphHandle, GlyphId, GlyphMetric, GlyphMetricError, GlyphRequest,
+        GlyphResourceCheckpoint, GlyphResourceGeneration, GlyphResourceStore, GlyphResources,
+        GlyphShaper, GlyphSlice, LanguageTag, ListStylePosition, OpenTypeFeature,
+        PreparedTextRunFragment, ReaderStyleOverrides, ShapeError, ShapedGlyph, ShapedLine,
         ShapedTextRun, StyleStringId, TextAlign, TextDecorationLines, TextDirection, TextRunId,
         TextRunShapeRequest, TextShapeRequest, TextStyleSpan, ThemeAdaptation, UnicodeBidi,
         UsedBorderRadii,

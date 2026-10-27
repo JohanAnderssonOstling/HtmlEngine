@@ -1,7 +1,7 @@
 use html_pipeline::GlyphResourceStore;
 use html_pipeline::engine::{
-    GlyphId, GlyphShaper, LaidOutDocument, PreparedTextRunFragment, RenderPaintItem, RenderView,
-    TextRunId, UsedBorderRadii,
+    GlyphHandle, GlyphShaper, LaidOutDocument, PreparedTextRunFragment, RenderPaintItem,
+    RenderView, TextRunId, UsedBorderRadii,
 };
 use html_pipeline::{
     FontEnvironmentRevision, ImageMetricsRevision, LayoutConstraints, PaintSettingsRevision,
@@ -49,6 +49,7 @@ impl TextRunFragment {
         self.range.clone()
     }
 
+    /// Baseline origin in document coordinates.
     pub fn origin(&self) -> Point {
         self.origin
     }
@@ -92,13 +93,15 @@ pub trait Painter {
             color,
         );
     }
-    fn draw_glyph(&mut self, glyph: GlyphId, origin: Point);
-    fn draw_glyph_with_color(&mut self, glyph: GlyphId, origin: Point, _color: u32) {
+    /// Draw a native glyph with `origin` at its baseline.
+    fn draw_glyph(&mut self, glyph: GlyphHandle, origin: Point);
+    fn draw_glyph_with_color(&mut self, glyph: GlyphHandle, origin: Point, _color: u32) {
         self.draw_glyph(glyph, origin);
     }
     fn supports_text_runs(&self) -> bool {
         false
     }
+    /// Draw a native text run with `origin` at its baseline.
     fn draw_text_run(&mut self, _run: TextRunId, _origin: Point, _color: Option<u32>) {}
     fn draw_text_run_fragment(
         &mut self,
@@ -173,7 +176,7 @@ pub trait Painter {
 pub struct RecordingPainter {
     pub clips: Vec<Rect>,
     pub clip_pops: usize,
-    pub glyphs: Vec<(GlyphId, Point)>,
+    pub glyphs: Vec<(GlyphHandle, Point)>,
     pub fills: Vec<(Rect, Color)>,
     pub images: Vec<Rect>,
     pub svgs: Vec<Rect>,
@@ -209,7 +212,7 @@ impl Painter for RecordingPainter {
         self.rounded_borders.push((rect, radii, width, color));
     }
 
-    fn draw_glyph(&mut self, glyph: GlyphId, origin: Point) {
+    fn draw_glyph(&mut self, glyph: GlyphHandle, origin: Point) {
         self.glyphs.push((glyph, origin));
     }
 
@@ -249,7 +252,7 @@ pub enum RenderCommand {
         color: Color,
     },
     Glyph {
-        glyph: GlyphId,
+        glyph: GlyphHandle,
         origin: Point,
         color: Option<u32>,
     },
@@ -699,11 +702,11 @@ pub fn paint_line_glyph_fragment<'a>(
         };
         // Preserve fractional inline origins; only project the baseline onto
         // the device pixel grid, just as native prepared-run painting does.
-        let draw_point = Point::new(
-            current_x,
-            snap(baseline_y - f64::from(character.metric.baseline_offset()) - character.offset_y),
-        );
-        if let Some(glyph) = character.paint_glyph {
+        let draw_point = Point::new(current_x, snap(baseline_y - character.offset_y));
+        if let Some(glyph) = character
+            .paint_glyph
+            .and_then(|glyph| text.paint_handle(glyph))
+        {
             match color.or_else(|| text.paint_color_at(index)) {
                 Some(color) => painter.draw_glyph_with_color(glyph, draw_point, color),
                 None => painter.draw_glyph(glyph, draw_point),
@@ -761,30 +764,30 @@ pub fn paint_line_ellipsis<'a>(
     let baseline_y = origin.y + line.baseline();
     if let Some(ellipsis) = text.ellipsis_for_line(line_idx)
         && ellipsis.visible()
-        && let Some(metric) = text.glyph_metric(ellipsis.glyph())
+        && let Some(glyph) = text.paint_handle(ellipsis.glyph())
     {
         let offset = ellipsis.offset();
         let point = Point::new(
             snap(origin.x + line.optical_offset_x() + offset.x),
-            snap(baseline_y - metric.baseline_offset() as f64 - offset.y),
+            snap(baseline_y - offset.y),
         );
         match color.or_else(|| text.paint_color_at(line.start())) {
-            Some(color) => painter.draw_glyph_with_color(ellipsis.glyph(), point, color),
-            None => painter.draw_glyph(ellipsis.glyph(), point),
+            Some(color) => painter.draw_glyph_with_color(glyph, point, color),
+            None => painter.draw_glyph(glyph, point),
         }
     }
     if let Some(hyphen) = text.hyphen_for_line(line_idx)
         && hyphen.visible()
-        && let Some(metric) = text.glyph_metric(hyphen.glyph())
+        && let Some(glyph) = text.paint_handle(hyphen.glyph())
     {
         let offset = hyphen.offset();
         let point = Point::new(
             snap(origin.x + line.optical_offset_x() + offset.x),
-            snap(baseline_y - metric.baseline_offset() as f64 - offset.y),
+            snap(baseline_y - offset.y),
         );
         match color.or_else(|| text.paint_color_at(line.end().saturating_sub(1))) {
-            Some(color) => painter.draw_glyph_with_color(hyphen.glyph(), point, color),
-            None => painter.draw_glyph(hyphen.glyph(), point),
+            Some(color) => painter.draw_glyph_with_color(glyph, point, color),
+            None => painter.draw_glyph(glyph, point),
         }
     }
 }
@@ -1137,7 +1140,7 @@ impl Painter for SceneRecorder {
         });
     }
 
-    fn draw_glyph(&mut self, glyph: GlyphId, origin: Point) {
+    fn draw_glyph(&mut self, glyph: GlyphHandle, origin: Point) {
         self.commands.push(RenderCommand::Glyph {
             glyph,
             origin,
@@ -1145,7 +1148,7 @@ impl Painter for SceneRecorder {
         });
     }
 
-    fn draw_glyph_with_color(&mut self, glyph: GlyphId, origin: Point, color: u32) {
+    fn draw_glyph_with_color(&mut self, glyph: GlyphHandle, origin: Point, color: u32) {
         self.commands.push(RenderCommand::Glyph {
             glyph,
             origin,
@@ -1206,8 +1209,9 @@ impl ResourceProvider for DenyResourceProvider {
 mod tests {
     use super::*;
     use html_pipeline::engine::GlyphResourceGeneration;
+    use html_pipeline::engine::{GlyphId, GlyphRequest, ShapedGlyph};
     use html_pipeline::engine::{
-        FontSlant, GlyphMetric, ShapeError, ShapedTextRun, TextDirection, TextRunShapeRequest,
+        GlyphMetric, ShapeError, ShapedTextRun, TextDirection, TextRunShapeRequest,
     };
     use std::collections::HashMap;
 
@@ -1245,32 +1249,66 @@ mod tests {
             }
         }
 
-        fn shape_glyph(
-            &mut self,
-            character: char,
-            font_size: f32,
-            _font_weight: u16,
-            _font_slant: FontSlant,
-            _color: u32,
-            _family: Option<&str>,
-            resources: &mut html_pipeline::engine::GlyphResourceStore,
-        ) -> Result<GlyphId, ShapeError> {
-            let key = (character, font_size.to_bits());
-            if let Some(glyph) = self.glyphs.get(&key) {
-                return Ok(*glyph);
-            }
+        fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
+            let key = (request.character, request.font_size.to_bits());
             let metric = GlyphMetric::try_new(
-                character,
-                font_size * 0.5,
-                font_size * 0.75,
-                font_size * 0.25,
-                font_size * 0.75,
+                request.character,
+                request.font_size * 0.5,
+                request.font_size * 0.75,
+                request.font_size * 0.25,
             )
             .map_err(ShapeError::rejected_metric)?;
-            let glyph = resources.register(metric)?;
+            if let Some(glyph) = self.glyphs.get(&key) {
+                return Ok(ShapedGlyph::from_metric(*glyph, metric));
+            }
+            let glyph = self.glyphs.len() as GlyphId;
             self.glyphs.insert(key, glyph);
-            Ok(glyph)
+            Ok(ShapedGlyph::from_metric(glyph, metric))
         }
+    }
+
+    #[test]
+    fn scalar_paint_uses_native_handles_and_baseline_coordinates() {
+        use html_pipeline::FontMetrics;
+        #[derive(Default)]
+        struct NativeHandles(GlyphResourceGeneration);
+        impl GlyphShaper for NativeHandles {
+            fn resource_generation(&self) -> GlyphResourceGeneration {
+                self.0
+            }
+            fn reset(&mut self) {
+                self.0 = GlyphResourceGeneration::default();
+            }
+            fn shape_glyph(
+                &mut self,
+                _request: GlyphRequest<'_>,
+            ) -> Result<ShapedGlyph, ShapeError> {
+                Ok(ShapedGlyph::new(700, 8.0, FontMetrics::new(12.0, 4.0).unwrap()).unwrap())
+            }
+        }
+        let mut renderer = FragmentRenderer::new();
+        let mut shaper = NativeHandles::default();
+        let options = FragmentRenderOptions::new(200.0, None).unwrap();
+        let rendered = renderer
+            .render(
+                "<p style='margin:0;line-height:30px'>x</p>",
+                &options,
+                &mut shaper,
+            )
+            .unwrap();
+        let text = rendered.render_view().text();
+        let line = text
+            .lines()
+            .iter()
+            .find(|line| !line.glyphs().is_empty())
+            .unwrap();
+        assert_ne!(text.glyph_at(line.start() as usize), Some(700));
+        let mut painter = RecordingPainter::default();
+        rendered.scene().paint(&mut painter);
+        assert_eq!(painter.glyphs.len(), 1);
+        let (handle, origin) = painter.glyphs[0];
+        assert_eq!(handle, 700);
+        assert_eq!(origin.y, (line.point().y + line.baseline()).round());
     }
 
     #[derive(Default)]
@@ -1308,25 +1346,8 @@ mod tests {
             }
         }
 
-        fn shape_glyph(
-            &mut self,
-            character: char,
-            font_size: f32,
-            font_weight: u16,
-            font_slant: FontSlant,
-            color: u32,
-            family: Option<&str>,
-            resources: &mut html_pipeline::engine::GlyphResourceStore,
-        ) -> Result<GlyphId, ShapeError> {
-            self.fallback.shape_glyph(
-                character,
-                font_size,
-                font_weight,
-                font_slant,
-                color,
-                family,
-                resources,
-            )
+        fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
+            self.fallback.shape_glyph(request)
         }
 
         fn shape_text_run(
@@ -1359,6 +1380,55 @@ mod tests {
                 12.0,
             ))
         }
+    }
+
+    #[test]
+    fn native_run_paint_uses_the_line_baseline() {
+        #[derive(Default)]
+        struct BaselinePainter(Vec<Point>);
+        impl Painter for BaselinePainter {
+            fn fill_rect(&mut self, _: Rect, _: Color) {}
+            fn draw_glyph(&mut self, _: GlyphHandle, _: Point) {
+                panic!("expected native run painting");
+            }
+            fn supports_text_runs(&self) -> bool {
+                true
+            }
+            fn draw_text_run(&mut self, _: TextRunId, origin: Point, _: Option<u32>) {
+                self.0.push(origin);
+            }
+            fn draw_image(&mut self, _: &Image, _: &[u8], _: Rect) {}
+        }
+        let mut renderer = FragmentRenderer::new();
+        let mut shaper = NativeTestShaper::default();
+        let options = FragmentRenderOptions::new(200.0, None).unwrap();
+        let rendered = renderer
+            .render(
+                "<p style='margin:0;line-height:30px'><span style='font-size:24px'>x</span>y</p>",
+                &options,
+                &mut shaper,
+            )
+            .unwrap();
+        let view = rendered.render_view();
+        let text = view.text();
+        let line = text
+            .lines()
+            .iter()
+            .find(|line| !line.glyphs().is_empty())
+            .unwrap();
+        let origin = Point::new(10.0, 20.25);
+        let mut painter = BaselinePainter::default();
+        assert!(paint_line_text_runs(
+            view,
+            line.index(),
+            origin,
+            2.0,
+            None,
+            &mut painter
+        ));
+        assert!(!painter.0.is_empty());
+        let expected_y = ((origin.y + line.baseline()) * 2.0).round() / 2.0;
+        assert!(painter.0.iter().all(|point| point.y == expected_y));
     }
 
     #[derive(Default)]

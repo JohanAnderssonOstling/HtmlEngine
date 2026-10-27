@@ -52,34 +52,26 @@ fn dependency_percentage_preserves_valid_percentage_calculations() {
 }
 
 #[test]
-fn dependency_percentage_errors_reach_the_public_syntax_apis() {
-    for value in MIXED_CALCULATIONS {
-        assert_eq!(
-            property_value_syntax("opacity", value),
-            PropertyValueSyntax::Invalid,
-            "{value}"
-        );
-        assert_eq!(
-            declaration_syntax("opacity", value),
-            PropertySyntax::Invalid
-        );
-        assert_eq!(
-            declaration_support("opacity", value).syntax,
-            PropertySyntax::Invalid
-        );
-    }
-    for value in [
+fn unsupported_properties_skip_syntax_validation() {
+    for value in MIXED_CALCULATIONS.into_iter().chain([
         "50%",
         "calc(25% + 25%)",
         "min(25%, 50%)",
         "min(0.25, 0.5)",
         "var(--opacity)",
         "inherit",
-    ] {
+    ]) {
         assert_eq!(
             property_value_syntax("opacity", value),
-            PropertyValueSyntax::Valid,
-            "{value}"
+            PropertyValueSyntax::UnsupportedProperty
+        );
+        assert_eq!(
+            declaration_syntax("opacity", value),
+            PropertySyntax::Unsupported
+        );
+        assert_eq!(
+            declaration_support("opacity", value).syntax,
+            PropertySyntax::Unsupported
         );
     }
 }

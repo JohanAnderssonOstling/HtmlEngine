@@ -92,7 +92,7 @@ fn prepare_fragment(
             }
             let run_origin = Point::new(
                 rtl_origin_x.unwrap_or(x - natural_x),
-                line.baseline - f64::from(run.ascent) - character.offset_y,
+                line.baseline - character.offset_y,
             );
             let paint_index = colors.partition_point(|run| run.glyphs.end <= index);
             let color = colors.get(paint_index).filter(|run| run.glyphs.contains(&index)).map(|run| run.color);
@@ -151,7 +151,7 @@ mod tests {
             for (index, character) in source.chars().enumerate() {
                 content.push_character(character);
                 glyphs.push(metrics.register(GlyphMetric::try_new(character,
-                    if index == 2 { 0.0 } else { 8.0 }, 12.0, 4.0, 12.0).unwrap()).unwrap());
+                    if index == 2 { 0.0 } else { 8.0 }, 12.0, 4.0).unwrap()).unwrap());
             }
             let native = ShapedTextRun::with_backend_run(
                 vec![8.0, 8.0, 0.0, 8.0, 8.0].into(), vec![true; 6].into(), 0,
