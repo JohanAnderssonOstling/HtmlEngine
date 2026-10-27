@@ -93,7 +93,7 @@ Skrift is a framework agnostic HTML and CSS rendering engine built with the purp
 
 | Component | Version |
 | --- | --- |
-| GPUI fork | 0.2.2 |
+| GPUI | 0.2.2 |
 | Wry binding (`lb-wry`) | 0.53.3 |
 | WebKitGTK runtime | 2.54.2 |
 | GTK runtime | 3.24.52 |
