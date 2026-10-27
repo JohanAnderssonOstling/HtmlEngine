@@ -9,7 +9,7 @@ use taffy::prelude::AvailableSpace;
 use super::box_constraints::resolve_definite_content_size;
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ReplacedSizeInput {
+pub struct ReplacedSizeInput {
     pub intrinsic: Size,
     pub aspect_ratio: Option<f64>,
     pub width: PreferredSize,
@@ -28,7 +28,7 @@ pub(crate) struct ReplacedSizeInput {
 }
 
 impl ReplacedSizeInput {
-    pub(crate) fn from_style(
+    pub fn from_style(
         style: UsedStyleView<'_>,
         intrinsic: Size,
         aspect_ratio: Option<f64>,
@@ -54,7 +54,7 @@ impl ReplacedSizeInput {
         }
     }
 
-    pub(crate) fn with_box_model(
+    pub fn with_box_model(
         mut self,
         horizontal_margin: f64,
         vertical_margin: f64,
@@ -68,7 +68,7 @@ impl ReplacedSizeInput {
         self
     }
 
-    pub(crate) fn with_width_constraints(
+    pub fn with_width_constraints(
         mut self,
         width: PreferredSize,
         min_width: PreferredSize,
@@ -81,7 +81,7 @@ impl ReplacedSizeInput {
     }
 }
 
-pub(crate) fn preferred_aspect_ratio(authored: AspectRatio, intrinsic: Option<f64>) -> Option<f64> {
+pub fn preferred_aspect_ratio(authored: AspectRatio, intrinsic: Option<f64>) -> Option<f64> {
     if authored.uses_intrinsic() {
         intrinsic.or_else(|| authored.preferred().map(f64::from))
     } else {
@@ -90,14 +90,14 @@ pub(crate) fn preferred_aspect_ratio(authored: AspectRatio, intrinsic: Option<f6
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct ReplacedObjectGeometry {
+pub struct ReplacedObjectGeometry {
     /// Painted image rectangle relative to the content-box origin.
     pub rect: Rect,
     /// The replaced content is always clipped to its content box.
     pub clip: Rect,
 }
 
-pub(crate) fn replaced_object_geometry(
+pub fn replaced_object_geometry(
     content: Size,
     intrinsic: Size,
     fit: ObjectFit,
@@ -140,7 +140,7 @@ pub(crate) fn replaced_object_geometry(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ReplacedMainAxis {
+pub enum ReplacedMainAxis {
     Horizontal,
     Vertical,
 }
@@ -155,7 +155,7 @@ pub(crate) enum ReplacedMainAxis {
 /// prevents its style and measure paths from independently guessing which
 /// axis owns ratio transfer.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ReplacedFlexAutoMinInput {
+pub struct ReplacedFlexAutoMinInput {
     pub intrinsic: Size,
     pub aspect_ratio: Option<f64>,
     pub main_axis: ReplacedMainAxis,
@@ -177,7 +177,7 @@ pub(crate) struct ReplacedFlexAutoMinInput {
 
 /// Resolve the constraint value Taffy should receive for `min-size: auto` in
 /// the main axis of a replaced flex item.
-pub(crate) fn resolve_replaced_flex_auto_min_main_size(input: ReplacedFlexAutoMinInput) -> f64 {
+pub fn resolve_replaced_flex_auto_min_main_size(input: ReplacedFlexAutoMinInput) -> f64 {
     let (intrinsic_main, intrinsic_cross) = match input.main_axis {
         ReplacedMainAxis::Horizontal => (input.intrinsic.width, input.intrinsic.height),
         ReplacedMainAxis::Vertical => (input.intrinsic.height, input.intrinsic.width),
@@ -268,7 +268,7 @@ pub(crate) fn resolve_replaced_flex_auto_min_main_size(input: ReplacedFlexAutoMi
 /// intrinsic dimensions stored by the renderer are content-box dimensions;
 /// an adapter whose sizing model consumes border-box constraints must include
 /// the corresponding padding and border exactly once.
-pub(crate) fn resolve_replaced_intrinsic_constraint(
+pub fn resolve_replaced_intrinsic_constraint(
     value: PreferredSize,
     intrinsic_content_size: f64,
     padding_border: f64,
@@ -291,7 +291,7 @@ pub(crate) fn resolve_replaced_intrinsic_constraint(
 /// is exposed as an intrinsic contribution. This is observable for grid auto
 /// tracks: passing an unclamped preferred size lets the track grow from a
 /// value the item itself can never use.
-pub(crate) fn clamp_replaced_definite_size_by_intrinsic_constraints(
+pub fn clamp_replaced_definite_size_by_intrinsic_constraints(
     preferred: PreferredSize,
     intrinsic_minimum: Option<f64>,
     intrinsic_maximum: Option<f64>,
@@ -309,7 +309,7 @@ pub(crate) fn clamp_replaced_definite_size_by_intrinsic_constraints(
 /// elements behave like `auto`, but can transfer a definite size through the
 /// preferred aspect ratio. `stretch` is different: it fills the available
 /// margin box, regardless of `box-sizing`.
-pub(crate) fn resolve_replaced_content_size(input: ReplacedSizeInput) -> Size {
+pub fn resolve_replaced_content_size(input: ReplacedSizeInput) -> Size {
     let ratio = input
         .aspect_ratio
         .filter(|ratio| ratio.is_finite() && *ratio > 0.0);
@@ -515,7 +515,7 @@ fn constrain_replaced_size(
 /// callback returns content-box dimensions. When a known axis is present,
 /// Taffy has already subtracted padding and borders from the corresponding
 /// definite available space; use that content size for ratio transfer.
-pub(crate) fn measure_replaced_content(
+pub fn measure_replaced_content(
     intrinsic: Size,
     aspect_ratio: Option<f64>,
     known: TaffySize<Option<f32>>,

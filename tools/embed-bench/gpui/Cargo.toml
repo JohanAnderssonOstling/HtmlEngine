@@ -1,0 +1,54 @@
+[package]
+name = "embed-bench-gpui"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+publish = false
+autobins = false
+
+[workspace]
+
+[features]
+default = ["skrift"]
+skrift = ["dep:data-url", "dep:html", "dep:html-gpui", "dep:kurbo"]
+wry-in-gpui = ["dep:gtk", "dep:cairo-rs", "dep:webkit2gtk", "dep:wry", "dep:url", "dep:percent-encoding", "dep:raw-window-handle"]
+
+[[bin]]
+name = "embed-bench-gpui-culled"
+path = "src/workloads.rs"
+required-features = ["skrift", "wry-in-gpui"]
+
+[[bin]]
+name = "embed-bench-gpui-skrift-size"
+path = "src/skrift_size.rs"
+required-features = ["skrift"]
+
+[[bin]]
+name = "embed-bench-gpui-wry-size"
+path = "src/wry_size.rs"
+required-features = ["wry-in-gpui"]
+
+[dependencies]
+anyhow = "1"
+async-channel = "2"
+data-url = { version = "0.3", optional = true }
+gpui = { path = "../../../../GPUI-Fork/crates/gpui", default-features = false, features = ["font-kit", "wayland", "x11", "snapshot", "windows-manifest"] }
+gpui_platform = { path = "../../../../GPUI-Fork/crates/gpui_platform", features = ["wayland", "x11"] }
+gpui_linux = { path = "../../../../GPUI-Fork/crates/gpui_linux", features = ["snapshot"] }
+gpui_wgpu = { path = "../../../../GPUI-Fork/crates/gpui_wgpu", features = ["font-kit"] }
+html = { package = "html-engine", path = "../../../crates/html", optional = true }
+html-gpui = { path = "../../../../Html-Prototype/shared/html-gpui", optional = true }
+kurbo = { version = "0.11", optional = true }
+pollster = "0.4"
+libc = "0.2"
+serde_json = "1"
+gtk = { version = "0.18", optional = true }
+cairo-rs = { version = "0.18", features = ["png"], optional = true }
+webkit2gtk = { version = "2.0.1", features = ["v2_34"], optional = true }
+wry = { package = "lb-wry", version = "=0.53.3", optional = true }
+url = { version = "2", optional = true }
+percent-encoding = { version = "2", optional = true }
+raw-window-handle = { version = "0.6", optional = true }
+
+[patch."https://github.com/JohanAnderssonOstling/HtmlEngine"]
+html-engine = { path = "../../../crates/html" }

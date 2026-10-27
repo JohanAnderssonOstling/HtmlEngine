@@ -34,7 +34,7 @@ pub(super) fn table_grid(session: &LayoutEngine<'_, '_>, rows: &[u32]) -> TableG
 fn size_keeps_empty_track(size: html_style_model::UsedPreferredSize) -> bool {
     use html_style_model::UsedPreferredSize as Size;
     match size {
-        Size::Auto | Size::Stretch => false,
+        Size::Auto | Size::Content | Size::Stretch => false,
         Size::Px(value) => value > 0.0,
         Size::Percent(value) => value > 0.0,
         Size::Calc {

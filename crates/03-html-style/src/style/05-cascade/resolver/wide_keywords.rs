@@ -1,8 +1,51 @@
 //! CSS-wide keyword application after cascade winner selection.
 
 use super::*;
+use lightningcss::properties::font::GenericFontFamily;
+
+pub(super) fn property_css_wide_keyword(property: &Property<'_>) -> Option<&'static str> {
+    let keyword = match property {
+        // The native parser stores unquoted CSS-wide family keywords as
+        // generic families. Quoted names remain FamilyName values.
+        Property::FontFamily(families) => {
+            return match families.as_slice() {
+                [FontFamily::Generic(GenericFontFamily::Inherit)] => Some("inherit"),
+                [FontFamily::Generic(GenericFontFamily::Initial)] => Some("initial"),
+                [FontFamily::Generic(GenericFontFamily::Unset)] => Some("unset"),
+                [FontFamily::Generic(GenericFontFamily::Revert)] => Some("revert"),
+                [FontFamily::Generic(GenericFontFamily::RevertLayer)] => Some("revert-layer"),
+                _ => None,
+            };
+        }
+        Property::Unparsed(value) => single_ident_keyword(&value.value),
+        Property::Custom(value) if !value.name.as_ref().starts_with("--") => {
+            single_ident_keyword(&value.value)
+        }
+        _ => None,
+    }?;
+    ["inherit", "initial", "unset", "revert", "revert-layer"]
+        .iter()
+        .find(|candidate| keyword.eq_ignore_ascii_case(candidate))
+        .copied()
+}
 
 fn is_inherited_property(name: &str) -> bool {
+    if let Some(id) = RendererPropertyId::from_name(name) {
+        return matches!(
+            id,
+            RendererPropertyId::BorderCollapse
+                | RendererPropertyId::CaptionSide
+                | RendererPropertyId::EmptyCells
+                | RendererPropertyId::FontKerning
+                | RendererPropertyId::FontFeatureSettings
+                | RendererPropertyId::FontVariantNumeric
+                | RendererPropertyId::FontVariantLigatures
+                | RendererPropertyId::TextBoxEdge
+                | RendererPropertyId::Widows
+                | RendererPropertyId::Orphans
+                | RendererPropertyId::Quotes
+        );
+    }
     matches!(
         name,
         "color"
@@ -13,10 +56,6 @@ fn is_inherited_property(name: &str) -> bool {
             | "font-style"
             | "font-family"
             | "font-variant-caps"
-            | "font-variant-numeric"
-            | "font-variant-ligatures"
-            | "font-kerning"
-            | "font-feature-settings"
             | "line-height"
             | "letter-spacing"
             | "word-spacing"
@@ -25,31 +64,23 @@ fn is_inherited_property(name: &str) -> bool {
             | "text-align-last"
             | "text-indent"
             | "text-transform"
-            | "text-box-edge"
             | "white-space"
             | "visibility"
             | "word-break"
+            | "line-break"
             | "overflow-wrap"
             | "word-wrap"
             | "list-style"
             | "list-style-type"
             | "list-style-position"
             | "list-style-image"
-            | "border-collapse"
             | "border-spacing"
-            | "caption-side"
-            | "empty-cells"
             | "hyphens"
-            | "quotes"
-            | "widows"
-            | "orphans"
     )
 }
 
-/// Handle the CSS-wide keywords `inherit`, `initial`, `unset`, and `revert`.
-/// lightningcss leaves them as `Unparsed` (typed properties only hold concrete
-/// values), so they would otherwise be silently dropped. Returns true when the
-/// declaration was consumed.
+/// Apply CSS-wide values retained as raw tokens or native family keywords.
+/// Returns true when the declaration was consumed.
 pub(super) fn try_apply_css_wide_keyword(
     style: &mut WorkingStyle,
     property: &Property,
@@ -57,21 +88,14 @@ pub(super) fn try_apply_css_wide_keyword(
     root_font_size: f32,
     phase: CascadePhase,
 ) -> bool {
-    let (name, value) = match property {
-        Property::Unparsed(unparsed) => (unparsed.property_id.name(), &unparsed.value),
-        Property::Custom(custom) if !custom.name.as_ref().starts_with("--") => {
-            (custom.name.as_ref(), &custom.value)
-        }
-        _ => return false,
-    };
-    let Some(keyword) = single_ident_keyword(value).map(str::to_ascii_lowercase) else {
+    let Some(keyword) = property_css_wide_keyword(property) else {
         return false;
     };
 
     apply_css_wide_keyword_in_phase(
         style,
-        name,
-        &keyword,
+        property.property_id().name(),
+        keyword,
         parent,
         root_font_size,
         phase,
@@ -168,14 +192,14 @@ fn apply_css_wide_keyword_with_rollback(
     let src: &ParentStyle = match keyword {
         "inherit" => parent,
         "initial" => {
-            initial = ParentStyle::initial(root_font_size);
+            initial = parent.initial_for_child(root_font_size);
             &initial
         }
         "unset" => {
             if is_inherited_property(name) {
                 parent
             } else {
-                initial = ParentStyle::initial(root_font_size);
+                initial = parent.initial_for_child(root_font_size);
                 &initial
             }
         }
@@ -196,10 +220,14 @@ fn apply_css_wide_keyword_with_rollback(
         _ => return false,
     };
 
+    if let Some(id) = RendererPropertyId::from_name(name) {
+        return apply_renderer_css_wide_keyword(style, id, src);
+    }
     match name {
         "color" => style.text.color = src.text.color,
         "visibility" => style.text.visibility = src.text.visibility,
         "direction" => style.text.direction = src.text.direction,
+        "unicode-bidi" => style.box_model.unicode_bidi = src.box_model.unicode_bidi,
         "font" => {
             style.font = src.font.clone();
             style.text.line_height = src.text.line_height;
@@ -223,18 +251,6 @@ fn apply_css_wide_keyword_with_rollback(
         "font-variant-caps" => {
             style.font.font_variant_caps_features = src.font.font_variant_caps_features.clone()
         }
-        "font-variant-numeric" => {
-            style.font.font_variant_numeric_features =
-                src.font.font_variant_numeric_features.clone()
-        }
-        "font-variant-ligatures" => {
-            style.font.font_variant_ligature_features =
-                src.font.font_variant_ligature_features.clone()
-        }
-        "font-kerning" => style.font.font_kerning_features = src.font.font_kerning_features.clone(),
-        "font-feature-settings" => {
-            style.font.font_feature_settings = src.font.font_feature_settings.clone()
-        }
         "line-height" => {
             style.text.line_height = src.text.line_height;
             style.text.line_height_x_height_px = src.text.line_height_x_height_px;
@@ -244,7 +260,6 @@ fn apply_css_wide_keyword_with_rollback(
         }
         "letter-spacing" => style.text.letter_spacing = src.text.letter_spacing,
         "word-spacing" => style.text.word_spacing = src.text.word_spacing,
-        "quotes" => style.text.quotes = src.text.quotes,
         "tab-size" => style.text.tab_size = src.text.tab_size,
         "text-align" => {
             style.text.text_align = src.text.text_align;
@@ -267,6 +282,7 @@ fn apply_css_wide_keyword_with_rollback(
         "text-transform" => style.text.text_transform = src.text.text_transform,
         "white-space" => style.text.white_space = src.text.white_space,
         "word-break" => style.text.word_break = src.text.word_break,
+        "line-break" => style.text.line_break = src.text.line_break,
         "overflow-wrap" | "word-wrap" => style.text.overflow_wrap = src.text.overflow_wrap,
         "overflow" => {
             style.box_model.overflow_x = src.box_model.overflow_x;
@@ -275,12 +291,6 @@ fn apply_css_wide_keyword_with_rollback(
         "overflow-x" => style.box_model.overflow_x = src.box_model.overflow_x,
         "overflow-y" => style.box_model.overflow_y = src.box_model.overflow_y,
         "text-overflow" => style.box_model.text_overflow = src.box_model.text_overflow,
-        "text-box" => {
-            style.box_model.text_box_trim = src.box_model.text_box_trim;
-            style.text.text_box_edge = src.text.text_box_edge;
-        }
-        "text-box-trim" => style.box_model.text_box_trim = src.box_model.text_box_trim,
-        "text-box-edge" => style.text.text_box_edge = src.text.text_box_edge,
         "box-sizing" => style.box_model.box_sizing = src.box_model.box_sizing,
         "list-style" => {
             style.text.list_style_type = src.text.list_style_type;
@@ -327,14 +337,8 @@ fn apply_css_wide_keyword_with_rollback(
             style.background.background_image_present = src.background.background_image_present;
         }
         "vertical-align" => style.box_model.vertical_align = src.box_model.vertical_align,
-        "contain" => style.box_model.size_containment = src.box_model.size_containment,
         "display" => style.box_model.display = src.box_model.display,
         "position" => style.layout.position = src.layout.position,
-        "break-before" | "page-break-before" => style.layout.break_before = src.layout.break_before,
-        "break-after" | "page-break-after" => style.layout.break_after = src.layout.break_after,
-        "break-inside" | "page-break-inside" => style.layout.break_inside = src.layout.break_inside,
-        "widows" => style.text.widows = src.text.widows,
-        "orphans" => style.text.orphans = src.text.orphans,
         "z-index" => style.layout.z_index = src.layout.z_index,
         "top" => style.layout.inset_top = src.layout.inset_top,
         "right" => style.layout.inset_right = src.layout.inset_right,
@@ -379,8 +383,8 @@ fn apply_css_wide_keyword_with_rollback(
             style.layout.align_self = src.layout.align_self;
             style.layout.justify_self = src.layout.justify_self;
         }
-        "row-gap" | "grid-row-gap" => style.layout.row_gap = src.layout.row_gap,
-        "column-gap" | "grid-column-gap" => style.layout.column_gap = src.layout.column_gap,
+        "row-gap" => style.layout.row_gap = src.layout.row_gap,
+        "column-gap" => style.layout.column_gap = src.layout.column_gap,
         "gap" => {
             style.layout.row_gap = src.layout.row_gap;
             style.layout.column_gap = src.layout.column_gap;
@@ -434,28 +438,13 @@ fn apply_css_wide_keyword_with_rollback(
             style.layout.grid_auto_columns = src.layout.grid_auto_columns.clone();
             style.layout.grid_auto_flow = src.layout.grid_auto_flow;
         }
-        "float" => style.box_model.float = src.box_model.float,
-        "clear" => style.box_model.clear = src.box_model.clear,
-        "table-layout" => style.box_model.table_layout = src.box_model.table_layout,
-        "border-collapse" => style.box_model.border_collapse = src.box_model.border_collapse,
         "border-spacing" => {
             style.box_model.border_spacing_horizontal = src.box_model.border_spacing_horizontal;
             style.box_model.border_spacing_vertical = src.box_model.border_spacing_vertical;
         }
-        "caption-side" => style.box_model.caption_side = src.box_model.caption_side,
-        "empty-cells" => style.box_model.empty_cells = src.box_model.empty_cells,
         "width" | "inline-size" => style.box_model.width = src.box_model.width,
         "height" | "block-size" => style.box_model.height = src.box_model.height,
         "aspect-ratio" => style.box_model.aspect_ratio = src.box_model.aspect_ratio,
-        "object-fit" => style.box_model.object_fit = src.box_model.object_fit,
-        "object-position" => style.box_model.object_position = src.box_model.object_position,
-        "outline-offset" => {
-            if src.background.outline.offset_is_inset() {
-                style.background.outline.set_offset_inset();
-            } else {
-                style.background.outline.set_offset(src.background.outline.offset());
-            }
-        }
         "min-width" | "min-inline-size" => style.box_model.min_width = src.box_model.min_width,
         "min-height" | "min-block-size" => style.box_model.min_height = src.box_model.min_height,
         "max-width" | "max-inline-size" => style.box_model.max_width = src.box_model.max_width,
@@ -622,6 +611,86 @@ fn apply_css_wide_keyword_with_rollback(
     true
 }
 
+fn apply_renderer_css_wide_keyword(
+    style: &mut WorkingStyle,
+    id: RendererPropertyId,
+    src: &ParentStyle,
+) -> bool {
+    match id {
+        RendererPropertyId::FontVariantNumeric => {
+            style.font.font_variant_numeric_features =
+                src.font.font_variant_numeric_features.clone()
+        }
+        RendererPropertyId::FontVariantLigatures => {
+            style.font.font_variant_ligature_features =
+                src.font.font_variant_ligature_features.clone()
+        }
+        RendererPropertyId::FontKerning => {
+            style.font.font_kerning_features = src.font.font_kerning_features.clone()
+        }
+        RendererPropertyId::FontFeatureSettings => {
+            style.font.font_feature_settings = src.font.font_feature_settings.clone()
+        }
+        RendererPropertyId::Quotes => style.text.quotes = src.text.quotes,
+        RendererPropertyId::TextBox => {
+            style.box_model.text_box_trim = src.box_model.text_box_trim;
+            style.text.text_box_edge = src.text.text_box_edge;
+        }
+        RendererPropertyId::TextBoxTrim => {
+            style.box_model.text_box_trim = src.box_model.text_box_trim
+        }
+        RendererPropertyId::TextBoxEdge => style.text.text_box_edge = src.text.text_box_edge,
+        RendererPropertyId::Contain => {
+            style.box_model.size_containment = src.box_model.size_containment
+        }
+        RendererPropertyId::BreakBefore | RendererPropertyId::PageBreakBefore => {
+            style.layout.break_before = src.layout.break_before
+        }
+        RendererPropertyId::BreakAfter | RendererPropertyId::PageBreakAfter => {
+            style.layout.break_after = src.layout.break_after
+        }
+        RendererPropertyId::BreakInside | RendererPropertyId::PageBreakInside => {
+            style.layout.break_inside = src.layout.break_inside
+        }
+        RendererPropertyId::Widows => style.text.widows = src.text.widows,
+        RendererPropertyId::Orphans => style.text.orphans = src.text.orphans,
+        RendererPropertyId::GridRowGap => style.layout.row_gap = src.layout.row_gap,
+        RendererPropertyId::GridColumnGap => style.layout.column_gap = src.layout.column_gap,
+        RendererPropertyId::Float => style.box_model.float = src.box_model.float,
+        RendererPropertyId::Clear => style.box_model.clear = src.box_model.clear,
+        RendererPropertyId::TableLayout => {
+            style.box_model.table_layout = src.box_model.table_layout
+        }
+        RendererPropertyId::BorderCollapse => {
+            style.box_model.border_collapse = src.box_model.border_collapse
+        }
+        RendererPropertyId::CaptionSide => {
+            style.box_model.caption_side = src.box_model.caption_side
+        }
+        RendererPropertyId::EmptyCells => style.box_model.empty_cells = src.box_model.empty_cells,
+        RendererPropertyId::ObjectFit => style.box_model.object_fit = src.box_model.object_fit,
+        RendererPropertyId::ObjectPosition => {
+            style.box_model.object_position = src.box_model.object_position
+        }
+        RendererPropertyId::OutlineOffset => {
+            if src.background.outline.offset_is_inset() {
+                style.background.outline.set_offset_inset();
+            } else {
+                style
+                    .background
+                    .outline
+                    .set_offset(src.background.outline.offset());
+            }
+        }
+        // These raw declarations are handled separately, outside ParentStyle copies.
+        RendererPropertyId::GridGap
+        | RendererPropertyId::Content
+        | RendererPropertyId::CounterReset
+        | RendererPropertyId::CounterIncrement => return false,
+    }
+    true
+}
+
 pub(super) fn apply_all_from_basis(
     style: &mut WorkingStyle,
     basis: &WorkingStyle,
@@ -649,6 +718,7 @@ pub(super) fn apply_all_from_basis(
             // Preserve values finalized in the prerequisite pass so a later
             // declaration in the same layer remains the winner.
             let direction = style.text.direction;
+            let unicode_bidi = style.box_model.unicode_bidi;
             let language = style.text.language;
             let color = style.text.color;
             let line_height = style.text.line_height;
@@ -665,6 +735,7 @@ pub(super) fn apply_all_from_basis(
             let root_line_height = style.font.font_size_root_line_height;
             *style = basis.clone();
             style.text.direction = direction;
+            style.box_model.unicode_bidi = unicode_bidi;
             style.text.language = language;
             style.text.color = color;
             style.text.line_height = line_height;

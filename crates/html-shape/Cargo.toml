@@ -1,0 +1,24 @@
+[package]
+name = "html-shape"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+publish = false
+
+[features]
+profiling = ["html-engine-model/profiling"]
+
+[dependencies]
+html-dom = { path = "../html-dom" }
+html-style-model = { path = "../html-style-model" }
+html-text = { path = "../html-text" }
+rustc_data_structures = "0.1.2"
+html-engine-model = { path = "../html-engine-model" }
+unicode-bidi-mirroring = "0.4"
+
+
+[dev-dependencies]
+html-pipeline = { path = "../html-pipeline", features = ["testing"] }
+html-parse = { path = "../02-html-parse" }
+html-style = { path = "../03-html-style" }
+lightningcss.workspace = true

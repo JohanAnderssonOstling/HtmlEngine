@@ -60,7 +60,7 @@ pub(super) fn prepare_cells(
             placement.colspan,
         );
         let provisional_point = Point::new(
-            table_content_pos.x + columns.starts[placement.col],
+            table_content_pos.x + columns.physical_start(placement.col, placement.colspan),
             table_content_pos.y + v_spacing,
         );
         let used_borders = collapsed_grid.map(|grid| grid.cell_insets(*placement));
@@ -142,6 +142,7 @@ pub(super) fn prepare_cells(
             for (task, measurement) in parallel_tasks.iter().zip(measurements) {
                 heights[task.index] = measurement.size.height;
                 baseline_offsets[task.index] = measurement.first_baseline;
+                session.retain_measurement_plans(measurement);
             }
         } else {
             for task in parallel_tasks {
@@ -356,7 +357,7 @@ pub(super) fn cell_has_restricted_percentage_height_descendant(
     }
 }
 
-pub(crate) fn layout_table_row(
+pub fn layout_table_row(
     session: &mut LayoutEngine<'_, '_>,
     _row_box_idx: usize,
     cells: Vec<u32>,

@@ -17,16 +17,17 @@ pub(super) fn try_apply_legacy_grid_gap_alias(
         Both,
     }
 
-    let (name, tokens) = match property {
-        Property::Custom(custom) => (custom.name.as_ref(), &custom.value),
-        Property::Unparsed(unparsed) => (unparsed.property_id.name(), &unparsed.value),
-        _ => return false,
+    let Some((id, tokens)) = RendererPropertyId::raw(property) else {
+        return false;
     };
-    let axis = match name {
-        "grid-row-gap" => Axis::Row,
-        "grid-column-gap" => Axis::Column,
-        "grid-gap" => Axis::Both,
-        _ => return false,
+    let Some(canonical) = id.gap_property() else {
+        return false;
+    };
+    let axis = match id {
+        RendererPropertyId::GridRowGap => Axis::Row,
+        RendererPropertyId::GridColumnGap => Axis::Column,
+        RendererPropertyId::GridGap => Axis::Both,
+        _ => unreachable!(),
     };
 
     if let Some(keyword) = single_ident_keyword(tokens).map(str::to_ascii_lowercase) {
@@ -52,14 +53,7 @@ pub(super) fn try_apply_legacy_grid_gap_alias(
     let Some(css) = token_list_to_css_string(tokens) else {
         return true;
     };
-    let canonical = match axis {
-        Axis::Row => "row-gap",
-        Axis::Column => "column-gap",
-        Axis::Both => "gap",
-    };
-    let Ok(property) =
-        Property::parse_string(PropertyId::from(canonical), &css, ParserOptions::default())
-    else {
+    let Ok(property) = Property::parse_string(canonical, &css, ParserOptions::default()) else {
         return true;
     };
     match (axis, property) {

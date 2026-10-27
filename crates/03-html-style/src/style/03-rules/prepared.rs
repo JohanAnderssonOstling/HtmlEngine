@@ -6,9 +6,12 @@
 //! therefore outlive the parser AST and be reused across documents.
 
 use super::media::{CompiledMediaList, MediaEnvironment, MediaQuerySet};
-use crate::style::matching::selectors::{selector_list_is_web_valid, selector_list_pseudo_mask};
+use crate::style::matching::selectors::{
+    selector_list_is_web_valid, selector_list_is_web_valid_for_scope, selector_list_pseudo_mask,
+};
+use crate::style::syntax::property_id::RendererPropertyId;
 use crate::{
-    PropertyCapability, PropertySyntax, declaration_support, supports_selector_syntax_is_valid,
+    FontFace, PropertyCapability, PropertySyntax, declaration_support, supports_selector_syntax_is_valid,
 };
 use html_dom::{Document, DomNodeId};
 use lightningcss::properties::{Property, PropertyId};
@@ -417,6 +420,7 @@ fn property_is_always_computable(property: &Property<'_>) -> bool {
             | Property::FontStyle(_)
             | Property::FontFamily(_)
             | Property::TextAlign(_)
+            | Property::UnicodeBidi(_)
             | Property::TextAlignLast(_, _)
             | Property::FontVariantCaps(_)
             | Property::ListStylePosition(_)
@@ -455,13 +459,11 @@ fn property_is_always_computable(property: &Property<'_>) -> bool {
 }
 
 fn canonical_slot(name: &str) -> &str {
+    if let Some(id) = RendererPropertyId::from_name(name) {
+        return id.canonical_name();
+    }
     match name {
         "word-wrap" => "overflow-wrap",
-        "page-break-before" => "break-before",
-        "page-break-after" => "break-after",
-        "page-break-inside" => "break-inside",
-        "grid-row-gap" => "row-gap",
-        "grid-column-gap" => "column-gap",
         _ => name,
     }
 }
@@ -504,6 +506,11 @@ fn append_property_targets(
     }
     let property_id = property.property_id();
     if let Some(longhands) = property_id.longhands() {
+        if matches!(property_id, PropertyId::Font) {
+            output.extend(crate::style::syntax::font::RESET_LONGHANDS.map(|id| {
+                intern_target(id.name(), Some(id.lightning_id()), slot_ids)
+            }));
+        }
         output.extend(
             longhands
                 .into_iter()
@@ -706,12 +713,14 @@ impl<'sheet, 'css> ParsedStylesheetSet<'sheet, 'css> {
         let mut media_queries = MediaQuerySet::default();
         let mut media_path = Vec::new();
         let mut scopes = Vec::new();
+        let mut font_faces = Vec::new();
 
         prepare_origin(
             std::iter::once((self.user_agent, None, None)),
             CascadeOrigin::UserAgent,
             &mut rules,
             &mut scopes,
+            &mut font_faces,
             &mut source_order,
             environment,
             initial_font_size,
@@ -735,6 +744,7 @@ impl<'sheet, 'css> ParsedStylesheetSet<'sheet, 'css> {
                     CascadeOrigin::Author,
                     &mut rules,
                     &mut scopes,
+                    &mut font_faces,
                     &mut source_order,
                     environment,
                     initial_font_size,
@@ -758,6 +768,7 @@ impl<'sheet, 'css> ParsedStylesheetSet<'sheet, 'css> {
                     CascadeOrigin::Author,
                     &mut rules,
                     &mut scopes,
+                    &mut font_faces,
                     &mut source_order,
                     environment,
                     initial_font_size,
@@ -838,6 +849,7 @@ impl<'sheet, 'css> ParsedStylesheetSet<'sheet, 'css> {
             property_targets,
             property_slots,
             media_queries,
+            font_faces: font_faces.into(),
             environment,
         }
     }
@@ -891,6 +903,7 @@ struct RuleWalk<'a, 'fragment, 'css> {
     layers: LayerRegistry,
     output: &'a mut Vec<PendingRule<'fragment, 'css>>,
     scopes: &'a mut Vec<ScopeDescriptor<'css>>,
+    font_faces: &'a mut Vec<FontFace>,
     source_order: &'a mut u32,
     environment: MediaEnvironment,
     initial_font_size: f64,
@@ -960,6 +973,18 @@ impl<'fragment, 'css> RuleWalk<'_, 'fragment, 'css> {
                             self.media_queries.record_dependency(self.media_path)
                         }
                         RuleWalkMode::Skip => {}
+                    }
+                }
+                CssRule::FontFace(rule) => {
+                    if !matches!(mode, RuleWalkMode::Skip)
+                        && let Some(face) = FontFace::from_rule(rule)
+                    {
+                        // A sheet containing only font faces still changes
+                        // shaping when a media condition changes truth value.
+                        self.media_queries.record_dependency(self.media_path);
+                        if matches!(mode, RuleWalkMode::Active) {
+                            self.font_faces.push(face);
+                        }
                     }
                 }
                 CssRule::Media(media) => {
@@ -1052,11 +1077,11 @@ impl<'fragment, 'css> RuleWalk<'_, 'fragment, 'css> {
                         let start_valid = scope
                             .scope_start
                             .as_ref()
-                            .is_none_or(selector_list_is_web_valid);
+                            .is_none_or(selector_list_is_web_valid_for_scope);
                         let end_valid = scope
                             .scope_end
                             .as_ref()
-                            .is_none_or(selector_list_is_web_valid);
+                            .is_none_or(selector_list_is_web_valid_for_scope);
                         if start_valid && end_valid {
                             let scope_id = ScopeId(
                                 u32::try_from(self.scopes.len()).expect("scope IDs fit in u32"),
@@ -1113,6 +1138,7 @@ fn prepare_origin<'sheet, 'css: 'sheet>(
     origin: CascadeOrigin,
     output: &mut Vec<PendingRule<'sheet, 'css>>,
     scopes: &mut Vec<ScopeDescriptor<'css>>,
+    font_faces: &mut Vec<FontFace>,
     source_order: &mut u32,
     environment: MediaEnvironment,
     initial_font_size: f64,
@@ -1125,6 +1151,7 @@ fn prepare_origin<'sheet, 'css: 'sheet>(
         layers: LayerRegistry::default(),
         output,
         scopes,
+        font_faces,
         source_order,
         environment,
         initial_font_size,
@@ -1234,10 +1261,14 @@ pub(crate) struct PreparedRuleSet<'css> {
     property_targets: Vec<PreparedPropertyTarget>,
     property_slots: FxHashMap<Arc<str>, u32>,
     media_queries: MediaQuerySet,
+    font_faces: Arc<[FontFace]>,
     environment: MediaEnvironment,
 }
 
 impl<'css> PreparedRuleSet<'css> {
+    pub(crate) fn font_faces(&self) -> &Arc<[FontFace]> {
+        &self.font_faces
+    }
     pub(crate) fn media_queries(&self) -> &MediaQuerySet {
         &self.media_queries
     }
@@ -1449,7 +1480,7 @@ mod tests {
         });
 
         assert_eq!(
-            allocations, 11,
+            allocations, 12,
             "preparation should allocate its owned effective rules and dense declaration metadata"
         );
         assert_eq!(prepared.len(), 1);

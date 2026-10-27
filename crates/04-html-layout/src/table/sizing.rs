@@ -56,6 +56,7 @@ pub(super) fn resolve_table_columns(
         cursor += width + spacing;
     }
     TableColumnLayout {
+        rtl: false,
         widths,
         starts,
         table_width,

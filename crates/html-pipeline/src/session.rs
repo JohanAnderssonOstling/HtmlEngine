@@ -2,34 +2,49 @@ use std::collections::HashMap;
 use std::io;
 use std::sync::{Arc, Mutex};
 
-use html_dom::RootFontSize;
-use html_layout::{
-    GlyphResourceGeneration, GlyphShaper as LayoutGlyphShaper, LaidOutDocument,
-    LayoutConstraints as LayoutConstraintsOutput, PreparedDocument, ShapedDocument,
+use crate::engine::{
+    GlyphResourceGeneration, GlyphResourceStore, GlyphShaper as LayoutGlyphShaper, LaidOutDocument,
+    LayoutConstraints as LayoutConstraintsOutput, NoteLayout, PreparedDocument, RenderView,
 };
+use html_dom::RootFontSize;
 use html_parse::{MarkupSyntax, ParsedHtml, parse_document};
 use html_resources::ResourceProvider;
-use html_style::{MediaMatchKey, MediaQuerySet};
+use html_style::{FontFace, MediaMatchKey, MediaQuerySet};
 
-use crate::parser::DocumentFactory;
+use crate::parser::{DocumentFactory, ResourceContext};
 use crate::types::{
     LayoutCacheKey, ParsedCacheKey, PreparedCacheKey, RenderOnlyCacheKey, ShapedCacheKey,
 };
 use crate::types::{LayoutConstraints, ResourceRevision, StylesheetRevision};
 use crate::{
-    EarliestStage, PipelineError, PipelineInputs, PipelineUpdate, Reuse, ReuseReport,
+    EarliestStage, MediaEnvironment, PipelineChanges, PipelineError, PipelineInputs,
+    PipelineUpdate, Reuse, ReuseReport,
 };
 
 #[derive(Default)]
 pub struct PipelineCacheState {
     pub inputs: Option<PipelineInputs>,
-    pub parsed: Option<CacheEntry<ParsedCacheKey, Arc<ParsedHtml>>>,
-    pub prepared: Option<CacheEntry<PreparedCacheKey, PreparedDocument>>,
-    unpainted_prepared: Option<PreparedDocument>,
+    /// Parse validity and source encoding; the syntax tree is consumed into the DOM.
+    pub parsed: Option<CacheEntry<ParsedCacheKey, Option<String>>>,
+    /// Cache metadata; published preparation lives in the document owner.
+    pub prepared: Option<CacheEntry<PreparedCacheKey, ()>>,
+    /// Owned preparation while a worker has not yet attached a glyph backend.
+    pub pending_prepared: Option<PreparedDocument<'static>>,
     pub media_queries: Option<MediaQuerySet>,
+    pub font_faces: Vec<FontFace>,
     pub media_match_key: Option<MediaMatchKey>,
-    pub shaped: Option<CacheEntry<ShapedCacheKey, ShapedDocument>>,
-    pub laid_out: Option<CacheEntry<LayoutCacheKey, LaidOutDocument>>,
+    /// Shaping validity only; glyph data has exactly one document owner.
+    pub shaped: Option<CacheEntry<ShapedCacheKey, ()>>,
+    pub laid_out: Option<CacheEntry<LayoutCacheKey, LaidOutDocument<'static>>>,
+}
+
+/// Only the comparisons needed while proposed inputs are being evaluated.
+/// Large input values remain owned in one place throughout an update.
+#[derive(Clone, Copy)]
+struct PreviousInputs {
+    source_matches: bool,
+    media: MediaEnvironment,
+    color_preferences_changed: bool,
 }
 
 pub struct CacheEntry<K, V> {
@@ -49,7 +64,9 @@ impl PipelineCacheState {
     }
 
     fn prepared_matches(&self, key: &PreparedCacheKey) -> bool {
-        self.prepared.as_ref().is_some_and(|entry| entry.matches(key))
+        self.prepared
+            .as_ref()
+            .is_some_and(|entry| entry.matches(key))
     }
 
     fn shaped_matches(&self, key: &ShapedCacheKey) -> bool {
@@ -57,11 +74,14 @@ impl PipelineCacheState {
     }
 
     fn laid_out_matches(&self, key: &LayoutCacheKey) -> bool {
-        self.laid_out.as_ref().is_some_and(|entry| entry.matches(key))
+        self.laid_out
+            .as_ref()
+            .is_some_and(|entry| entry.matches(key))
     }
 }
 
 pub struct PipelineSession {
+    glyph_resources: GlyphResourceStore,
     cached_provider: Arc<RevisionCachedResourceProvider>,
     cached_resource_key: Option<(ResourceRevision, StylesheetRevision)>,
     factory: DocumentFactory,
@@ -91,6 +111,17 @@ impl<S: LayoutGlyphShaper> OwnedActivePipelineSession<S> {
         self.session.update(inputs, &mut self.glyph_shaper)
     }
 
+    pub fn inputs(&self) -> Option<&PipelineInputs> {
+        self.session.inputs()
+    }
+
+    pub fn apply_changes(
+        &mut self,
+        changes: PipelineChanges,
+    ) -> Result<PipelineUpdate, PipelineError> {
+        self.session.apply_changes(changes, &mut self.glyph_shaper)
+    }
+
     pub fn rehydrate_glyphs(&mut self) -> Result<(), PipelineError> {
         self.session.rehydrate_glyphs(&mut self.glyph_shaper)
     }
@@ -99,16 +130,35 @@ impl<S: LayoutGlyphShaper> OwnedActivePipelineSession<S> {
         &mut self,
         id: &str,
         constraints: LayoutConstraintsOutput,
-    ) -> Option<LaidOutDocument> {
-        self.session.layout_note(id, constraints, &mut self.glyph_shaper)
+    ) -> Option<NoteLayout> {
+        self.session
+            .layout_note(id, constraints, &mut self.glyph_shaper)
     }
 
-    pub fn document(&self) -> Option<&LaidOutDocument> {
+    pub fn font_faces(&self) -> &[FontFace] {
+        self.session.font_faces()
+    }
+
+    pub fn document(&self) -> Option<&LaidOutDocument<'static>> {
         self.session.document()
     }
 
-    pub fn document_mut(&mut self) -> Option<&mut LaidOutDocument> {
+    pub fn document_mut(&mut self) -> Option<&mut LaidOutDocument<'static>> {
         self.session.document_mut()
+    }
+
+    pub fn glyph_resources(&self) -> &GlyphResourceStore {
+        self.session.glyph_resources()
+    }
+
+    pub fn render_view(&self) -> Option<RenderView<'_>> {
+        self.session.render_view()
+    }
+
+    pub fn document_mut_and_resources(
+        &mut self,
+    ) -> Option<(&mut LaidOutDocument<'static>, &GlyphResourceStore)> {
+        self.session.document_mut_and_resources()
     }
 
     pub fn note_ids(&self) -> Vec<&str> {
@@ -125,6 +175,17 @@ impl<S: LayoutGlyphShaper> ActivePipelineSession<'_, S> {
         self.session.update(inputs, self.glyph_shaper)
     }
 
+    pub fn inputs(&self) -> Option<&PipelineInputs> {
+        self.session.inputs()
+    }
+
+    pub fn apply_changes(
+        &mut self,
+        changes: PipelineChanges,
+    ) -> Result<PipelineUpdate, PipelineError> {
+        self.session.apply_changes(changes, self.glyph_shaper)
+    }
+
     pub fn rehydrate_glyphs(&mut self) -> Result<(), PipelineError> {
         self.session.rehydrate_glyphs(self.glyph_shaper)
     }
@@ -133,25 +194,70 @@ impl<S: LayoutGlyphShaper> ActivePipelineSession<'_, S> {
         &mut self,
         id: &str,
         constraints: LayoutConstraintsOutput,
-    ) -> Option<LaidOutDocument> {
+    ) -> Option<NoteLayout> {
         self.session.layout_note(id, constraints, self.glyph_shaper)
     }
 
-    pub fn document(&self) -> Option<&LaidOutDocument> {
+    pub fn font_faces(&self) -> &[FontFace] {
+        self.session.font_faces()
+    }
+
+    pub fn document(&self) -> Option<&LaidOutDocument<'static>> {
         self.session.document()
     }
 
-    pub fn document_mut(&mut self) -> Option<&mut LaidOutDocument> {
+    pub fn document_mut(&mut self) -> Option<&mut LaidOutDocument<'static>> {
         self.session.document_mut()
+    }
+
+    pub fn glyph_resources(&self) -> &GlyphResourceStore {
+        self.session.glyph_resources()
+    }
+
+    pub fn render_view(&self) -> Option<RenderView<'_>> {
+        self.session.render_view()
+    }
+
+    pub fn document_mut_and_resources(
+        &mut self,
+    ) -> Option<(&mut LaidOutDocument<'static>, &GlyphResourceStore)> {
+        self.session.document_mut_and_resources()
     }
 
     pub fn note_ids(&self) -> Vec<&str> {
         self.session.note_ids()
     }
-
 }
 
 impl PipelineSession {
+    pub fn glyph_resources(&self) -> &GlyphResourceStore {
+        &self.glyph_resources
+    }
+    pub fn glyph_resources_mut(&mut self) -> &mut GlyphResourceStore {
+        &mut self.glyph_resources
+    }
+
+    pub fn render_view(&self) -> Option<RenderView<'_>> {
+        self.document()?.try_render_view(&self.glyph_resources)
+    }
+
+    pub fn document_mut_and_resources(
+        &mut self,
+    ) -> Option<(&mut LaidOutDocument<'static>, &GlyphResourceStore)> {
+        Some((
+            &mut self.cache.laid_out.as_mut()?.value,
+            &self.glyph_resources,
+        ))
+    }
+
+    /// Active `@font-face` declarations from the last successful preparation
+    /// or update. URLs use the declaring stylesheet's resource-provider base.
+    /// After `prepare_through_style`, hosts can load these faces before calling
+    /// `rehydrate_glyphs`. The engine never reads font bytes.
+    pub fn font_faces(&self) -> &[FontFace] {
+        &self.cache.font_faces
+    }
+
     pub fn into_active<S: LayoutGlyphShaper>(
         mut self,
         mut glyph_shaper: S,
@@ -175,9 +281,7 @@ impl PipelineSession {
     }
 
     fn invalidate_stale_renderer_state(&mut self, glyph_shaper: &mut impl LayoutGlyphShaper) {
-        if self.active_resource_generation.as_ref()
-            != Some(&glyph_shaper.glyph_resources().generation())
-        {
+        if self.active_resource_generation.as_ref() != Some(&glyph_shaper.resource_generation()) {
             self.cache.shaped = None;
             // Published geometry remains available to borrowed readers after
             // failure or backend replacement. The generation gate prevents
@@ -189,6 +293,7 @@ impl PipelineSession {
     pub fn new(provider: Arc<dyn ResourceProvider>) -> Self {
         let cached_provider = Arc::new(RevisionCachedResourceProvider::new(provider.clone()));
         Self {
+            glyph_resources: GlyphResourceStore::default(),
             cached_provider,
             cached_resource_key: None,
             factory: DocumentFactory::new(),
@@ -211,16 +316,43 @@ impl PipelineSession {
         let prepared_key = requested_inputs.prepared_cache_key();
         let parsed_key = prepared_key.parsed.clone();
         let parsed = self.parse(&requested_inputs.source, requested_inputs.markup_syntax)?;
-        let user_styles = requested_inputs.user_styles.iter().map(String::as_str).collect::<Vec<_>>();
-        let (prepared, media_queries) = self.factory.build_pipeline_from_parsed_with_media_queries(&parsed, &user_styles);
+        let user_styles = requested_inputs
+            .user_styles
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let encoding = parsed.source_encoding().map(str::to_owned);
+        let (prepared, media_queries) = self
+            .factory
+            .with_resources(ResourceContext::new(
+                self.cached_provider.as_ref(),
+                if requested_inputs.base_uri.is_empty() {
+                    "index.html"
+                } else {
+                    &requested_inputs.base_uri
+                },
+            ))
+            .build_pipeline_from_owned_parsed(parsed, &user_styles);
         let unpainted_prepared = prepared;
-        let prepared = unpainted_prepared.with_reader_paint_overrides(&requested_inputs.reader_overrides).map_err(|error| PipelineError(error.to_string()))?;
-        let media_match_key = media_queries.match_key(requested_inputs.style_environment.media, f64::from(requested_inputs.style_environment.root_font_size));
+        let prepared = unpainted_prepared
+            .into_reader_paint_overrides(&requested_inputs.reader_overrides)
+            .map_err(|error| PipelineError(error.to_string()))?;
+        let media_match_key = media_queries.match_key(
+            requested_inputs.style_environment.media,
+            f64::from(requested_inputs.style_environment.root_font_size),
+        );
 
+        self.cache.font_faces = self.factory.take_font_faces();
         self.cache.inputs = Some(requested_inputs);
-        self.cache.parsed = Some(CacheEntry { key: parsed_key, value: parsed });
-        self.cache.unpainted_prepared = Some(unpainted_prepared);
-        self.cache.prepared = Some(CacheEntry { key: prepared_key, value: prepared });
+        self.cache.parsed = Some(CacheEntry {
+            key: parsed_key,
+            value: encoding,
+        });
+        self.cache.prepared = Some(CacheEntry {
+            key: prepared_key,
+            value: (),
+        });
+        self.cache.pending_prepared = Some(prepared);
         self.cache.media_queries = Some(media_queries);
         self.cache.media_match_key = Some(media_match_key);
         self.cache.shaped = None;
@@ -230,13 +362,23 @@ impl PipelineSession {
     }
 
     fn configure_factory(&mut self, requested_inputs: &PipelineInputs) {
-        self.refresh_resource_cache(requested_inputs.resource_revision, requested_inputs.stylesheet_revision);
-        let base_uri = if requested_inputs.base_uri.is_empty() { "index.html".to_string() } else { requested_inputs.base_uri.clone() };
-        self.factory.set_resource_context(self.cached_provider.clone(), base_uri);
-        self.factory.set_root_font_size(to_root_font_size(requested_inputs.style_environment.root_font_size));
-        self.factory.set_media_environment(requested_inputs.style_environment.media);
-        self.factory.set_reader_overrides(requested_inputs.reader_overrides.layout_overrides());
+        self.refresh_resource_cache(
+            requested_inputs.resource_revision,
+            requested_inputs.stylesheet_revision,
+        );
+        self.factory.set_root_font_size(to_root_font_size(
+            requested_inputs.style_environment.root_font_size,
+        ));
+        self.factory
+            .set_media_environment(requested_inputs.style_environment.media);
+        self.factory
+            .set_reader_overrides(requested_inputs.reader_overrides.layout_overrides());
         self.factory.set_note_flow(requested_inputs.note_flow);
+    }
+
+    /// Borrow the last committed inputs. The session is their only owner.
+    pub fn inputs(&self) -> Option<&PipelineInputs> {
+        self.cache.inputs.as_ref()
     }
 
     pub fn update(
@@ -244,152 +386,295 @@ impl PipelineSession {
         requested_inputs: PipelineInputs,
         glyph_shaper: &mut impl LayoutGlyphShaper,
     ) -> Result<PipelineUpdate, PipelineError> {
-        let result = self.update_inner(requested_inputs, glyph_shaper);
+        let previous_inputs = self.cache.inputs.take();
+        let previous = previous_inputs.as_ref().map(|inputs| PreviousInputs {
+            source_matches: inputs.same_source(&requested_inputs),
+            media: inputs.style_environment.media,
+            color_preferences_changed: inputs.reader_overrides.paint_overrides()
+                != requested_inputs.reader_overrides.paint_overrides(),
+        });
+        let mut resources = std::mem::take(&mut self.glyph_resources);
+        let result = self.update_inner(&requested_inputs, previous, glyph_shaper, &mut resources);
+        self.glyph_resources = resources;
+        self.cache.inputs = if result.is_ok() {
+            Some(requested_inputs)
+        } else {
+            previous_inputs
+        };
+        self.invalidate_stale_renderer_state(glyph_shaper);
+        result
+    }
+
+    /// Apply only changed fields, borrowing all unchanged document inputs.
+    /// On failure, the proposed values are swapped back out before returning.
+    pub fn apply_changes(
+        &mut self,
+        mut changes: PipelineChanges,
+        glyph_shaper: &mut impl LayoutGlyphShaper,
+    ) -> Result<PipelineUpdate, PipelineError> {
+        let mut inputs =
+            self.cache.inputs.take().ok_or_else(|| {
+                PipelineError("cannot update an empty pipeline session".to_owned())
+            })?;
+        let previous = PreviousInputs {
+            source_matches: changes
+                .source
+                .as_ref()
+                .is_none_or(|source| source == &inputs.source),
+            media: inputs.style_environment.media,
+            color_preferences_changed: changes.reader_overrides.as_ref().is_some_and(|overrides| {
+                overrides.paint_overrides() != inputs.reader_overrides.paint_overrides()
+            }),
+        };
+        changes.swap_with(&mut inputs);
+        let mut resources = std::mem::take(&mut self.glyph_resources);
+        let result = self.update_inner(&inputs, Some(previous), glyph_shaper, &mut resources);
+        self.glyph_resources = resources;
+        if result.is_err() {
+            changes.swap_with(&mut inputs);
+        }
+        self.cache.inputs = Some(inputs);
         self.invalidate_stale_renderer_state(glyph_shaper);
         result
     }
 
     fn update_inner(
         &mut self,
-        requested_inputs: PipelineInputs,
+        requested_inputs: &PipelineInputs,
+        previous: Option<PreviousInputs>,
         glyph_shaper: &mut impl LayoutGlyphShaper,
+        resources: &mut GlyphResourceStore,
     ) -> Result<PipelineUpdate, PipelineError> {
-        self.configure_factory(&requested_inputs);
+        self.configure_factory(requested_inputs);
         let constraints = to_layout_constraints(requested_inputs.layout)?;
         let render_only_key = requested_inputs.render_only_cache_key();
         let layout_key = render_only_key.layout.clone();
         let shaped_key = layout_key.shaped.clone();
         let prepared_key = shaped_key.prepared.clone();
         let parsed_key = prepared_key.parsed.clone();
-        let color_preferences_changed = self.cache.inputs.as_ref().is_some_and(|previous| previous.reader_overrides.paint_overrides() != requested_inputs.reader_overrides.paint_overrides());
+        let color_preferences_changed =
+            previous.is_some_and(|previous| previous.color_preferences_changed);
+        let source_matches = previous.is_some_and(|previous| previous.source_matches);
+        let media_match_changed =
+            self.media_match_changed(requested_inputs, previous.map(|inputs| inputs.media));
         let can_repaint = color_preferences_changed
-            && self.cache.inputs.as_ref().is_some_and(|previous| {
+            && previous.is_some_and(|previous| {
                 self.cache.parsed_matches(&parsed_key)
-                    && previous.same_source(&requested_inputs)
+                    && previous.source_matches
                     && self.cache.laid_out_matches(&layout_key)
-                    && !self.media_match_changed(&requested_inputs)
-                    && self.active_resource_generation.as_ref() == Some(&glyph_shaper.glyph_resources().generation())
+                    && !media_match_changed
+                    && self.active_resource_generation.as_ref()
+                        == Some(&glyph_shaper.resource_generation())
             });
         if can_repaint {
-            if let Some(base) = &self.cache.unpainted_prepared {
-                let prepared = base.with_reader_paint_overrides(&requested_inputs.reader_overrides).map_err(|error| PipelineError(error.to_string()))?;
-                let layout = &mut self.cache.laid_out.as_mut().expect("paint update has layout").value;
-                let stage = if layout.repaint_from(&prepared) {
-                    EarliestStage::Paint
-                } else {
-                    layout.relayout_with_paint_from(&prepared, glyph_shaper)
-                        .map_err(|error| PipelineError(error.to_string()))?;
-                    EarliestStage::Layout
-                };
-                self.cache.prepared = Some(CacheEntry { key: prepared_key, value: prepared.clone() });
-                let shaped = self.cache.shaped.as_mut().expect("paint update has retained shaping");
-                shaped.key = shaped_key;
-                shaped.value = shaped.value.with_paint_from(&prepared);
-                self.cache.laid_out.as_mut().expect("paint update has layout").key = layout_key;
-                self.cache.inputs = Some(requested_inputs);
-                let reused = Reuse::reused(stage);
-                return Ok(PipelineUpdate {
-                    stage, anchors_preserved: true,
-                    report: ReuseReport { parsed: reused, styled: reused, prepared: reused, shaped: reused,
-                        laid_out: if stage == EarliestStage::Paint { reused } else { Reuse::recomputed(stage) } },
-                });
-            }
+            self.cache
+                .laid_out
+                .as_mut()
+                .expect("paint update has layout")
+                .value
+                .repaint_with_reader_overrides(&requested_inputs.reader_overrides, resources)
+                .map_err(|error| PipelineError(error.to_string()))?;
+            self.cache.prepared = Some(CacheEntry {
+                key: prepared_key,
+                value: (),
+            });
+            self.cache.shaped = Some(CacheEntry {
+                key: shaped_key,
+                value: (),
+            });
+            self.cache
+                .laid_out
+                .as_mut()
+                .expect("paint update has layout")
+                .key = layout_key;
+            let stage = EarliestStage::Paint;
+            let reused = Reuse::reused(stage);
+            return Ok(PipelineUpdate {
+                stage,
+                anchors_preserved: true,
+                report: ReuseReport {
+                    parsed: reused,
+                    styled: reused,
+                    prepared: reused,
+                    shaped: reused,
+                    laid_out: reused,
+                },
+            });
         }
         let stage = self.earliest_uncached_stage(
             &parsed_key,
             &prepared_key,
             &shaped_key,
             &layout_key,
-            self.cache.inputs.as_ref().is_some_and(|previous| previous.same_source(&requested_inputs)),
-            self.media_match_changed(&requested_inputs),
-            self.active_resource_generation.as_ref()
-                == Some(&glyph_shaper.glyph_resources().generation()),
+            source_matches,
+            media_match_changed,
+            self.active_resource_generation.as_ref() == Some(&glyph_shaper.resource_generation()),
         );
+
+        if stage <= EarliestStage::Prepare
+            && self.cache.parsed_matches(&parsed_key)
+            && source_matches
+        {
+            return self.restyle_cached(
+                requested_inputs,
+                constraints,
+                stage,
+                glyph_shaper,
+                resources,
+            );
+        }
 
         let report = if stage <= EarliestStage::Layout {
             let parsed_reused = stage != EarliestStage::Parse;
-            let parsed = if parsed_reused {
-                self.cache
-                    .parsed
-                    .as_ref()
-                    .expect("matching parsed entry")
-                    .value
-                    .clone()
-            } else {
-                self.parse(&requested_inputs.source, requested_inputs.markup_syntax)?
-            };
-
             let prepared_reused = stage > EarliestStage::Prepare;
-            let (prepared, media_queries, unpainted_prepared) = if prepared_reused {
-                let prepared = if color_preferences_changed {
-                    self.cache.unpainted_prepared.as_ref().expect("prepared geometry has publication inputs").with_reader_paint_overrides(&requested_inputs.reader_overrides).map_err(|error| PipelineError(error.to_string()))?
-                } else {
-                    self.cache.prepared.as_ref().expect("matching prepared entry").value.clone()
-                };
-                (prepared, None, None)
-            } else {
-                let user_styles = requested_inputs.user_styles.iter().map(String::as_str).collect::<Vec<_>>();
-                let (prepared, queries) = self.factory.build_pipeline_from_parsed_with_media_queries(&parsed, &user_styles);
-                let unpainted = prepared;
-                let prepared = unpainted.with_reader_paint_overrides(&requested_inputs.reader_overrides).map_err(|error| PipelineError(error.to_string()))?;
-                (prepared, Some(queries), Some(unpainted))
-            };
-
             let shaped_reused = stage == EarliestStage::Layout;
-            let (shaped, laid_out) = if shaped_reused {
-                let shaped = self
+            let mut queries = None;
+            if shaped_reused {
+                let layout = &mut self
                     .cache
-                    .shaped
-                    .as_ref()
-                    .expect("matching shaped entry")
-                    .value
-                    .with_paint_from(&prepared);
-                let laid_out = if let Some(entry) = self.cache.laid_out.take() {
-                    let mut candidate = entry.value;
-                    if let Err(error) = candidate.relayout_from(
-                        &prepared, constraints,
+                    .laid_out
+                    .as_mut()
+                    .expect("matching layout owner")
+                    .value;
+                let result = if color_preferences_changed {
+                    layout.update_with_reader_overrides(
+                        &requested_inputs.reader_overrides,
+                        constraints,
+                        &requested_inputs.image_metrics,
+                        false,
+                        glyph_shaper,
+                        resources,
+                    )
+                } else {
+                    layout.relayout_with_metrics_and_shaper(
+                        constraints,
                         &requested_inputs.image_metrics,
                         glyph_shaper,
-                    ) {
-                        self.cache.laid_out = Some(CacheEntry {
-                            key: entry.key,
-                            value: candidate,
-                        });
-                        return Err(PipelineError(error.to_string()));
-                    }
-                    candidate
-                } else {
-                    shaped
-                        .clone()
-                        .layout_with_metrics_and_shaper(
-                            constraints,
-                            &requested_inputs.image_metrics,
-                            glyph_shaper,
-                        )
-                        .map_err(|error| PipelineError(error.to_string()))?
+                        resources,
+                    )
                 };
-                (shaped, laid_out)
+                result.map_err(|error| PipelineError(error.to_string()))?;
+            } else if prepared_reused && self.cache.pending_prepared.is_none() {
+                let layout = &mut self
+                    .cache
+                    .laid_out
+                    .as_mut()
+                    .expect("prepared owner remains published")
+                    .value;
+                let result = if color_preferences_changed {
+                    layout.update_with_reader_overrides(
+                        &requested_inputs.reader_overrides,
+                        constraints,
+                        &requested_inputs.image_metrics,
+                        true,
+                        glyph_shaper,
+                        resources,
+                    )
+                } else {
+                    layout.reshape_and_layout_with_metrics_and_shaper(
+                        constraints,
+                        &requested_inputs.image_metrics,
+                        glyph_shaper,
+                        resources,
+                    )
+                };
+                result.map_err(|error| PipelineError(error.to_string()))?;
             } else {
-                self.shape_and_layout(
-                    &prepared,
+                let (prepared, encoding) = if prepared_reused {
+                    (
+                        self.cache
+                            .pending_prepared
+                            .take()
+                            .expect("prepared worker result"),
+                        None,
+                    )
+                } else {
+                    let parsed =
+                        self.parse(&requested_inputs.source, requested_inputs.markup_syntax)?;
+                    let encoding = parsed.source_encoding().map(str::to_owned);
+                    let user_styles = requested_inputs
+                        .user_styles
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>();
+                    let (prepared, media) = self
+                        .factory
+                        .with_resources(ResourceContext::new(
+                            self.cached_provider.as_ref(),
+                            if requested_inputs.base_uri.is_empty() {
+                                "index.html"
+                            } else {
+                                &requested_inputs.base_uri
+                            },
+                        ))
+                        .build_pipeline_from_owned_parsed(parsed, &user_styles);
+                    queries = Some(media);
+                    let prepared = prepared
+                        .into_reader_paint_overrides(&requested_inputs.reader_overrides)
+                        .map_err(|error| PipelineError(error.to_string()))?;
+                    (prepared, encoding)
+                };
+                let painted = if prepared_reused && color_preferences_changed {
+                    Some(
+                        prepared
+                            .with_reader_paint_overrides(&requested_inputs.reader_overrides)
+                            .map_err(|error| PipelineError(error.to_string()))?,
+                    )
+                } else {
+                    None
+                };
+                let result = Self::shape_and_layout(
+                    painted.as_ref().unwrap_or(&prepared),
                     constraints,
                     &requested_inputs.image_metrics,
                     glyph_shaper,
-                )?
-            };
+                    resources,
+                );
 
-            if let Some(unpainted) = unpainted_prepared {
-                self.cache.unpainted_prepared = Some(unpainted);
-            }
-            self.cache.parsed = Some(CacheEntry { key: parsed_key.clone(), value: parsed });
-            self.cache.prepared = Some(CacheEntry { key: prepared_key.clone(), value: prepared });
-            self.cache.shaped = Some(CacheEntry { key: shaped_key.clone(), value: shaped });
-            self.cache.laid_out = Some(CacheEntry { key: layout_key.clone(), value: laid_out });
-            self.active_resource_generation = Some(glyph_shaper.glyph_resources().generation());
-            if let Some(queries) = media_queries {
-                self.cache.media_queries = Some(queries);
-            }
+                let laid_out = match result {
+                    Ok(document) => {
+                        drop(painted);
+                        prepared.with_layout(document)
+                    }
+                    Err(error) => {
+                        if prepared_reused {
+                            self.cache.pending_prepared = Some(prepared);
+                        }
+                        return Err(error);
+                    }
+                };
+                // Move publication ownership to the laid-out document. The
+                // prepared-stage cache retains only its validity key.
 
+                self.cache.laid_out = Some(CacheEntry {
+                    key: layout_key.clone(),
+                    value: laid_out,
+                });
+                if !parsed_reused {
+                    self.cache.parsed = Some(CacheEntry {
+                        key: parsed_key.clone(),
+                        value: encoding,
+                    });
+                    self.cache.font_faces = self.factory.take_font_faces();
+                }
+            }
+            self.cache.prepared = Some(CacheEntry {
+                key: prepared_key.clone(),
+                value: (),
+            });
+            self.cache.shaped = Some(CacheEntry {
+                key: shaped_key.clone(),
+                value: (),
+            });
+            self.cache
+                .laid_out
+                .as_mut()
+                .expect("published document owner")
+                .key = layout_key.clone();
+            self.active_resource_generation = Some(glyph_shaper.resource_generation());
+            if let Some(media) = queries {
+                self.cache.media_queries = Some(media);
+            }
             let reuse = |reused| {
                 if reused {
                     Reuse::reused(stage)
@@ -405,9 +690,6 @@ impl PipelineSession {
                 laid_out: reuse(false),
             }
         } else {
-            if stage == EarliestStage::Paint {
-                debug_assert!(self.cache.laid_out_matches(&render_only_key.layout));
-            }
             let reused = Reuse::reused(stage);
             ReuseReport {
                 parsed: reused,
@@ -425,12 +707,123 @@ impl PipelineSession {
             )
         });
         self.validate_cache_against_requested(&render_only_key);
-        self.cache.inputs = Some(requested_inputs);
         Ok(PipelineUpdate {
             stage,
             report,
             anchors_preserved: stage >= EarliestStage::Layout,
         })
+    }
+
+    fn restyle_cached(
+        &mut self,
+        inputs: &PipelineInputs,
+        constraints: LayoutConstraintsOutput,
+        stage: EarliestStage,
+        shaper: &mut impl LayoutGlyphShaper,
+        resources: &mut GlyphResourceStore,
+    ) -> Result<PipelineUpdate, PipelineError> {
+        let encoding = self
+            .cache
+            .parsed
+            .as_ref()
+            .and_then(|entry| entry.value.as_deref());
+        let css: Vec<_> = inputs.user_styles.iter().map(String::as_str).collect();
+        let mut queries = None;
+        let mut factory = self.factory.with_resources(ResourceContext::new(
+            self.cached_provider.as_ref(),
+            if inputs.base_uri.is_empty() {
+                "index.html"
+            } else {
+                &inputs.base_uri
+            },
+        ));
+        let resolve = |document: &html_dom::Document| {
+            let (styles, media) = factory.resolve_canonical_dom(document, encoding, &css);
+            queries = Some(media);
+            styles
+        };
+        let root_font = to_root_font_size(inputs.style_environment.root_font_size);
+        let result = if let Some(prepared) = &mut self.cache.pending_prepared {
+            prepared
+                .reprepare_and_layout(
+                    root_font,
+                    inputs.note_flow,
+                    &inputs.reader_overrides,
+                    resolve,
+                    constraints,
+                    &inputs.image_metrics,
+                    shaper,
+                    resources,
+                )
+                .map(|layout| Some(layout.into_detached()))
+        } else {
+            self.cache
+                .laid_out
+                .as_mut()
+                .expect("cached DOM has document owner")
+                .value
+                .reprepare_and_layout(
+                    root_font,
+                    inputs.note_flow,
+                    &inputs.reader_overrides,
+                    resolve,
+                    constraints,
+                    &inputs.image_metrics,
+                    shaper,
+                    resources,
+                )
+                .map(|()| None)
+        };
+        match result {
+            Ok(layout) => {
+                if let Some(layout) = layout {
+                    self.cache.laid_out = Some(CacheEntry {
+                        key: inputs.layout_cache_key(),
+                        value: self
+                            .cache
+                            .pending_prepared
+                            .take()
+                            .expect("prepared owner")
+                            .with_layout(layout),
+                    });
+                }
+                self.cache.pending_prepared = None;
+                self.cache.prepared = Some(CacheEntry {
+                    key: inputs.prepared_cache_key(),
+                    value: (),
+                });
+                self.cache.shaped = Some(CacheEntry {
+                    key: inputs.shaped_cache_key(),
+                    value: (),
+                });
+                self.cache
+                    .laid_out
+                    .as_mut()
+                    .expect("restyle publishes document")
+                    .key = inputs.layout_cache_key();
+                self.active_resource_generation = Some(shaper.resource_generation());
+                self.cache.font_faces = self.factory.take_font_faces();
+                self.cache.media_queries = queries;
+                self.cache.media_match_key = self.cache.media_queries.as_ref().map(|queries| {
+                    queries.match_key(
+                        inputs.style_environment.media,
+                        f64::from(inputs.style_environment.root_font_size),
+                    )
+                });
+                Ok(PipelineUpdate {
+                    stage,
+                    anchors_preserved: false,
+                    report: ReuseReport {
+                        parsed: Reuse::reused(stage),
+                        styled: Reuse::recomputed(stage),
+                        prepared: Reuse::recomputed(stage),
+                        shaped: Reuse::recomputed(stage),
+                        laid_out: Reuse::recomputed(stage),
+                    },
+                })
+            }
+            Err(error) => Err(PipelineError(error.to_string())),
+        }
     }
 
     /// Rebuild the shaped and laid-out stages for a cached document.
@@ -444,7 +837,9 @@ impl PipelineSession {
         &mut self,
         glyph_shaper: &mut impl LayoutGlyphShaper,
     ) -> Result<(), PipelineError> {
-        let result = self.rehydrate_glyphs_inner(glyph_shaper);
+        let mut resources = std::mem::take(&mut self.glyph_resources);
+        let result = self.rehydrate_glyphs_inner(glyph_shaper, &mut resources);
+        self.glyph_resources = resources;
         self.invalidate_stale_renderer_state(glyph_shaper);
         result
     }
@@ -452,36 +847,53 @@ impl PipelineSession {
     fn rehydrate_glyphs_inner(
         &mut self,
         glyph_shaper: &mut impl LayoutGlyphShaper,
+        resources: &mut GlyphResourceStore,
     ) -> Result<(), PipelineError> {
-        let inputs = self.cache.inputs.clone().ok_or_else(|| {
+        let inputs = self.cache.inputs.as_ref().ok_or_else(|| {
             PipelineError("cannot rehydrate an empty pipeline session".to_owned())
         })?;
-        let prepared = self
-            .cache
-            .prepared
-            .as_ref()
-            .map(|entry| entry.value.clone())
-            .ok_or_else(|| {
-                PipelineError(
-                    "cannot rehydrate a pipeline session without a prepared document".to_owned(),
+        let constraints = to_layout_constraints(inputs.layout)?;
+        if let Some(prepared) = self.cache.pending_prepared.as_ref() {
+            let laid_out = Self::shape_and_layout(
+                prepared,
+                constraints,
+                &inputs.image_metrics,
+                glyph_shaper,
+                resources,
+            )?;
+            let prepared = self.cache.pending_prepared.take().expect("prepared owner");
+            self.cache.laid_out = Some(CacheEntry {
+                key: inputs.layout_cache_key(),
+                value: prepared.with_layout(laid_out),
+            });
+        } else {
+            self.cache
+                .laid_out
+                .as_mut()
+                .ok_or_else(|| {
+                    PipelineError(
+                        "cannot rehydrate a pipeline session without preparation".to_owned(),
+                    )
+                })?
+                .value
+                .reshape_and_layout_with_metrics_and_shaper(
+                    constraints,
+                    &inputs.image_metrics,
+                    glyph_shaper,
+                    resources,
                 )
-            })?;
-        let (shaped, laid_out) = self.shape_and_layout(
-            &prepared,
-            to_layout_constraints(inputs.layout)?,
-            &inputs.image_metrics,
-            glyph_shaper,
-        )?;
-
+                .map_err(|error| PipelineError(error.to_string()))?;
+            self.cache
+                .laid_out
+                .as_mut()
+                .expect("rehydrated document owner")
+                .key = inputs.layout_cache_key();
+        }
         self.cache.shaped = Some(CacheEntry {
             key: inputs.shaped_cache_key(),
-            value: shaped,
+            value: (),
         });
-        self.cache.laid_out = Some(CacheEntry {
-            key: inputs.layout_cache_key(),
-            value: laid_out,
-        });
-        self.active_resource_generation = Some(glyph_shaper.glyph_resources().generation());
+        self.active_resource_generation = Some(glyph_shaper.resource_generation());
         Ok(())
     }
 
@@ -524,21 +936,19 @@ impl PipelineSession {
         }
     }
 
-    fn parse(
-        &mut self,
-        source: &str,
-        syntax: MarkupSyntax,
-    ) -> Result<Arc<ParsedHtml>, PipelineError> {
-        parse_document(source, syntax)
-            .map(Arc::new)
-            .map_err(|error| PipelineError(error.to_string()))
+    fn parse(&mut self, source: &str, syntax: MarkupSyntax) -> Result<ParsedHtml, PipelineError> {
+        parse_document(source, syntax).map_err(|error| PipelineError(error.to_string()))
     }
 
-    fn media_match_changed(&self, requested_inputs: &PipelineInputs) -> bool {
-        let Some(previous_inputs) = self.cache.inputs.as_ref() else {
+    fn media_match_changed(
+        &self,
+        requested_inputs: &PipelineInputs,
+        previous_media: Option<MediaEnvironment>,
+    ) -> bool {
+        let Some(previous_media) = previous_media else {
             return false;
         };
-        if previous_inputs.style_environment.media == requested_inputs.style_environment.media {
+        if previous_media == requested_inputs.style_environment.media {
             return false;
         }
         let (Some(media_queries), Some(previous_key)) = (
@@ -578,18 +988,20 @@ impl PipelineSession {
     }
 
     fn shape_and_layout(
-        &self,
         prepared: &PreparedDocument,
         constraints: LayoutConstraintsOutput,
-        image_metrics: &html_layout::ImageMetrics,
+        image_metrics: &crate::engine::ImageMetrics,
         glyph_shaper: &mut impl LayoutGlyphShaper,
-    ) -> Result<(ShapedDocument, LaidOutDocument), PipelineError> {
+        resources: &mut GlyphResourceStore,
+    ) -> Result<crate::engine::DetachedLayout, PipelineError> {
         prepared
             .shape_and_layout_with_metrics_and_shaper(
                 constraints,
                 image_metrics,
                 glyph_shaper,
+                resources,
             )
+            .map(LaidOutDocument::into_detached)
             .map_err(|error| PipelineError(error.to_string()))
     }
 
@@ -615,8 +1027,10 @@ impl PipelineSession {
         id: &str,
         constraints: LayoutConstraintsOutput,
         glyph_shaper: &mut impl LayoutGlyphShaper,
-    ) -> Option<LaidOutDocument> {
-        let result = self.layout_note_inner(id, constraints, glyph_shaper);
+    ) -> Option<NoteLayout> {
+        let mut resources = std::mem::take(&mut self.glyph_resources);
+        let result = self.layout_note_inner(id, constraints, glyph_shaper, &mut resources);
+        self.glyph_resources = resources;
         self.invalidate_stale_renderer_state(glyph_shaper);
         result
     }
@@ -626,48 +1040,60 @@ impl PipelineSession {
         id: &str,
         constraints: LayoutConstraintsOutput,
         glyph_shaper: &mut impl LayoutGlyphShaper,
-    ) -> Option<LaidOutDocument> {
+        resources: &mut GlyphResourceStore,
+    ) -> Option<NoteLayout> {
         let inputs = self.cache.inputs.as_ref()?;
         self.cache.laid_out.as_ref()?;
-        if self.active_resource_generation.as_ref()
-            != Some(&glyph_shaper.glyph_resources().generation())
-        {
+        if self.active_resource_generation.as_ref() != Some(&glyph_shaper.resource_generation()) {
             return None;
         }
-        let scoped = self.cache.prepared.as_ref()?.value.scoped_to_element_id(id)?;
+        let scoped = self
+            .cache
+            .laid_out
+            .as_ref()?
+            .value
+            .scoped_to_element_id(id)?;
         // Appended to the page's renderer resources rather than shaped as a
         // document of its own: a note's glyphs have to coexist with the page's,
         // which are still referenced by what is on screen. Every note appends,
         // so the seed is whatever the last one left behind.
-        let (_, laid_out) = scoped
+        let laid_out = scoped
             .shape_and_layout_into_active_resources(
                 constraints,
                 &inputs.image_metrics,
                 glyph_shaper,
+                resources,
             )
-            .ok()?;
-        Some(laid_out)
+            .ok()?
+            .into_detached();
+        Some(
+            scoped
+                .with_layout(laid_out)
+                .into_note(&self.cache.laid_out.as_ref()?.value),
+        )
     }
 
     /// Ids of the note bodies in the current document, in document order.
     /// Empty before the first successful update.
     pub fn note_ids(&self) -> Vec<&str> {
-        self.cache
-            .prepared
-            .as_ref()
-            .map(|entry| entry.value.note_ids())
-            .unwrap_or_default()
+        if let Some(prepared) = &self.cache.pending_prepared {
+            prepared.note_ids()
+        } else {
+            self.document()
+                .map(LaidOutDocument::note_ids)
+                .unwrap_or_default()
+        }
     }
 
     /// The last successfully published geometry. Backend invalidation does
     /// not erase it, so source queries and failure recovery remain available.
     /// After replacing renderer resources, update or rehydrate before painting
     /// renderer-owned glyph and native-run handles from this document.
-    pub fn document(&self) -> Option<&LaidOutDocument> {
+    pub fn document(&self) -> Option<&LaidOutDocument<'static>> {
         self.cache.laid_out.as_ref().map(|entry| &entry.value)
     }
 
-    pub fn document_mut(&mut self) -> Option<&mut LaidOutDocument> {
+    pub fn document_mut(&mut self) -> Option<&mut LaidOutDocument<'static>> {
         self.cache.laid_out.as_mut().map(|entry| &mut entry.value)
     }
 }
@@ -740,6 +1166,10 @@ impl ResourceProvider for RevisionCachedResourceProvider {
         self.inner.metadata(uri)
     }
 
+    fn primary_language(&self) -> Option<String> {
+        self.inner.primary_language()
+    }
+
     fn exists(&self, uri: &str) -> bool {
         self.inner.exists(uri)
     }
@@ -751,7 +1181,6 @@ impl ResourceProvider for RevisionCachedResourceProvider {
     fn list_html_candidates(&self, root: &str) -> io::Result<Vec<String>> {
         self.inner.list_html_candidates(root)
     }
-
 }
 
 fn to_root_font_size(root_font_size: u32) -> RootFontSize {
@@ -772,15 +1201,17 @@ fn to_layout_constraints(
 
 #[cfg(test)]
 mod tests {
-    use crate::DocumentFactory;
     use super::{PipelineSession, to_layout_constraints};
+    use crate::engine::{
+        GlyphId, GlyphMetric, GlyphResourceStore, GlyphShaper as LayoutGlyphShaper,
+    };
+    use crate::{DocumentFactory, PipelineChanges};
     use crate::{
         EarliestStage, FontEnvironmentRevision, FontEnvironmentRevision as FontEnv,
         ImageMetricsRevision, LayoutConstraints, MarkupSyntax, MediaEnvironment,
         PaintSettingsRevision, PipelineChange, PipelineError, PipelineInputs, ResourceRevision,
         Reuse, SourceRevision, StyleEnvironment, StylesheetRevision,
     };
-    use html_layout::{GlyphId, GlyphMetric, GlyphShaper as LayoutGlyphShaper, LaidOutDocument};
     use html_resources::ResourceProvider;
     use std::{
         collections::HashMap,
@@ -814,6 +1245,7 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct MutableProvider {
+        primary_language: Option<String>,
         resources: Arc<Mutex<HashMap<String, Vec<u8>>>>,
         reads: Arc<Mutex<usize>>,
     }
@@ -841,6 +1273,10 @@ mod tests {
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, uri.to_owned()))
         }
 
+        fn primary_language(&self) -> Option<String> {
+            self.primary_language.clone()
+        }
+
         fn exists(&self, uri: &str) -> bool {
             self.resources
                 .lock()
@@ -862,36 +1298,50 @@ mod tests {
         colors: Vec<(char, u32)>,
         calls: usize,
         cache: HashMap<(char, u32, u32), GlyphId>,
-        glyph_store: html_layout::GlyphResourceStore,
-        append_checkpoint: Option<(HashMap<(char, u32, u32), GlyphId>, html_layout::GlyphResourceStore)>,
+        generation: crate::engine::GlyphResourceGeneration,
+        append_checkpoint: Option<(
+            HashMap<(char, u32, u32), GlyphId>,
+            crate::engine::GlyphResourceGeneration,
+        )>,
     }
 
     impl LayoutGlyphShaper for TracingShaper {
         fn shape_glyph_run(
             &mut self,
-            request: html_layout::TextRunShapeRequest<'_>,
+            request: crate::engine::TextRunShapeRequest<'_>,
             glyphs: &mut [GlyphId],
-        ) -> Result<Option<html_layout::ShapedTextRun>, html_layout::ShapeError> {
+            resources: &mut crate::engine::GlyphResourceStore,
+        ) -> Result<Option<crate::engine::ShapedTextRun>, crate::engine::ShapeError> {
             let style = request.style();
             for (index, (glyph, ch)) in glyphs.iter_mut().zip(request.text().chars()).enumerate() {
-                let color = request.paint_colors().map_or(style.color(), |colors| colors[index]);
-                *glyph = self.shape_glyph(ch, style.font_size(), style.font_weight(), style.font_slant(), color, style.font_family())?;
+                let color = request
+                    .paint_colors()
+                    .map_or(style.color(), |colors| colors[index]);
+                *glyph = self.shape_glyph(
+                    ch,
+                    style.font_size(),
+                    style.font_weight(),
+                    style.font_slant(),
+                    color,
+                    style.font_family(),
+                    resources,
+                )?;
             }
             Ok(None)
         }
 
         fn reset(&mut self) {
             self.cache.clear();
-            self.glyph_store.clear();
+            self.generation = crate::engine::GlyphResourceGeneration::default();
         }
 
-        fn glyph_resources(&mut self) -> &mut html_layout::GlyphResourceStore {
-            &mut self.glyph_store
+        fn resource_generation(&self) -> crate::engine::GlyphResourceGeneration {
+            self.generation
         }
 
-        fn begin_append_shaping(&mut self) -> Result<(), html_layout::ShapeError> {
+        fn begin_append_shaping(&mut self) -> Result<(), crate::engine::ShapeError> {
             assert!(self.append_checkpoint.is_none());
-            self.append_checkpoint = Some((self.cache.clone(), self.glyph_store.clone()));
+            self.append_checkpoint = Some((self.cache.clone(), self.generation.clone()));
             Ok(())
         }
 
@@ -902,7 +1352,7 @@ mod tests {
         fn rollback_append_shaping(&mut self) {
             if let Some((cache, glyph_store)) = self.append_checkpoint.take() {
                 self.cache = cache;
-                self.glyph_store = glyph_store;
+                self.generation = glyph_store;
             }
         }
 
@@ -911,10 +1361,11 @@ mod tests {
             ch: char,
             font_size: f32,
             _font_weight: u16,
-            _font_slant: html_layout::FontSlant,
+            _font_slant: crate::engine::FontSlant,
             color: u32,
             _family: Option<&str>,
-        ) -> Result<GlyphId, html_layout::ShapeError> {
+            resources: &mut crate::engine::GlyphResourceStore,
+        ) -> Result<GlyphId, crate::engine::ShapeError> {
             self.calls += 1;
             self.colors.push((ch, color));
             let key = (ch, font_size.to_bits(), color);
@@ -926,7 +1377,7 @@ mod tests {
             let glyph = idx;
             let metric = GlyphMetric::try_new(ch, 1.0, 1.0, 0.0, 0.0)
                 .expect("deterministic metrics must be valid");
-            self.glyph_store
+            resources
                 .register(metric)
                 .expect("glyph metrics registry capacity should not be exceeded");
             self.cache.insert(key, glyph);
@@ -937,23 +1388,26 @@ mod tests {
     #[derive(Clone, Default)]
     struct SizedShaper {
         cache: HashMap<(char, u32), GlyphId>,
-        glyph_store: html_layout::GlyphResourceStore,
-        append_checkpoint: Option<(HashMap<(char, u32), GlyphId>, html_layout::GlyphResourceStore)>,
+        generation: crate::engine::GlyphResourceGeneration,
+        append_checkpoint: Option<(
+            HashMap<(char, u32), GlyphId>,
+            crate::engine::GlyphResourceGeneration,
+        )>,
     }
 
     impl LayoutGlyphShaper for SizedShaper {
         fn reset(&mut self) {
             self.cache.clear();
-            self.glyph_store.clear();
+            self.generation = crate::engine::GlyphResourceGeneration::default();
         }
 
-        fn glyph_resources(&mut self) -> &mut html_layout::GlyphResourceStore {
-            &mut self.glyph_store
+        fn resource_generation(&self) -> crate::engine::GlyphResourceGeneration {
+            self.generation
         }
 
-        fn begin_append_shaping(&mut self) -> Result<(), html_layout::ShapeError> {
+        fn begin_append_shaping(&mut self) -> Result<(), crate::engine::ShapeError> {
             assert!(self.append_checkpoint.is_none());
-            self.append_checkpoint = Some((self.cache.clone(), self.glyph_store.clone()));
+            self.append_checkpoint = Some((self.cache.clone(), self.generation.clone()));
             Ok(())
         }
 
@@ -964,7 +1418,7 @@ mod tests {
         fn rollback_append_shaping(&mut self) {
             if let Some((cache, glyph_store)) = self.append_checkpoint.take() {
                 self.cache = cache;
-                self.glyph_store = glyph_store;
+                self.generation = glyph_store;
             }
         }
 
@@ -973,10 +1427,11 @@ mod tests {
             ch: char,
             font_size: f32,
             _font_weight: u16,
-            _font_slant: html_layout::FontSlant,
+            _font_slant: crate::engine::FontSlant,
             _color: u32,
             _family: Option<&str>,
-        ) -> Result<GlyphId, html_layout::ShapeError> {
+            resources: &mut crate::engine::GlyphResourceStore,
+        ) -> Result<GlyphId, crate::engine::ShapeError> {
             let key = (ch, font_size.to_bits());
             if let Some(&glyph) = self.cache.get(&key) {
                 return Ok(glyph);
@@ -987,7 +1442,7 @@ mod tests {
             let width = font_size.max(1.0) * 0.75;
             let metric = GlyphMetric::try_new(ch, width, font_size, font_size * 0.2, 0.0)
                 .expect("deterministic metrics must be valid");
-            self.glyph_store
+            resources
                 .register(metric)
                 .expect("glyph metrics registry capacity should not be exceeded");
             self.cache.insert(key, glyph);
@@ -999,9 +1454,17 @@ mod tests {
     struct TransactionalShaper {
         cache: HashMap<(char, u32), GlyphId>,
         resources: Vec<char>,
-        glyph_store: html_layout::GlyphResourceStore,
-        previous_document: Option<(HashMap<(char, u32), GlyphId>, Vec<char>, html_layout::GlyphResourceStore)>,
-        previous_append: Option<(HashMap<(char, u32), GlyphId>, Vec<char>, html_layout::GlyphResourceStore)>,
+        generation: crate::engine::GlyphResourceGeneration,
+        previous_document: Option<(
+            HashMap<(char, u32), GlyphId>,
+            Vec<char>,
+            crate::engine::GlyphResourceGeneration,
+        )>,
+        previous_append: Option<(
+            HashMap<(char, u32), GlyphId>,
+            Vec<char>,
+            crate::engine::GlyphResourceGeneration,
+        )>,
         fail_on: Option<char>,
         fail_measurement: bool,
     }
@@ -1010,16 +1473,23 @@ mod tests {
         fn reset(&mut self) {
             self.cache.clear();
             self.resources.clear();
-            self.glyph_store.clear();
+            self.generation = crate::engine::GlyphResourceGeneration::default();
         }
 
-        fn glyph_resources(&mut self) -> &mut html_layout::GlyphResourceStore {
-            &mut self.glyph_store
+        fn resource_generation(&self) -> crate::engine::GlyphResourceGeneration {
+            self.generation
         }
 
-        fn begin_append_shaping(&mut self) -> Result<(), html_layout::ShapeError> {
-            assert!(self.previous_append.is_none(), "append shaping transactions cannot be nested");
-            self.previous_append = Some((self.cache.clone(), self.resources.clone(), self.glyph_store.clone()));
+        fn begin_append_shaping(&mut self) -> Result<(), crate::engine::ShapeError> {
+            assert!(
+                self.previous_append.is_none(),
+                "append shaping transactions cannot be nested"
+            );
+            self.previous_append = Some((
+                self.cache.clone(),
+                self.resources.clone(),
+                self.generation.clone(),
+            ));
             Ok(())
         }
 
@@ -1031,7 +1501,7 @@ mod tests {
             if let Some((cache, resources, glyph_store)) = self.previous_append.take() {
                 self.cache = cache;
                 self.resources = resources;
-                self.glyph_store = glyph_store;
+                self.generation = glyph_store;
             }
         }
 
@@ -1043,7 +1513,7 @@ mod tests {
             self.previous_document = Some((
                 std::mem::take(&mut self.cache),
                 std::mem::take(&mut self.resources),
-                std::mem::take(&mut self.glyph_store),
+                std::mem::take(&mut self.generation),
             ));
         }
 
@@ -1055,7 +1525,7 @@ mod tests {
             if let Some((cache, resources, glyph_store)) = self.previous_document.take() {
                 self.cache = cache;
                 self.resources = resources;
-                self.glyph_store = glyph_store;
+                self.generation = glyph_store;
             }
         }
 
@@ -1064,14 +1534,15 @@ mod tests {
             ch: char,
             font_size: f32,
             _font_weight: u16,
-            _font_slant: html_layout::FontSlant,
+            _font_slant: crate::engine::FontSlant,
             _color: u32,
             _family: Option<&str>,
-        ) -> Result<GlyphId, html_layout::ShapeError> {
+            resources: &mut crate::engine::GlyphResourceStore,
+        ) -> Result<GlyphId, crate::engine::ShapeError> {
             if self.fail_on == Some(ch) {
-                return Err(html_layout::ShapeError::unregistered_glyph_id(
+                return Err(crate::engine::ShapeError::unregistered_glyph_id(
                     u32::MAX,
-                    self.glyph_store.len(),
+                    resources.len(),
                 ));
             }
             let key = (ch, font_size.to_bits());
@@ -1080,7 +1551,7 @@ mod tests {
             }
             let metric =
                 GlyphMetric::try_new(ch, 1.0, 1.0, 0.0, 0.0).expect("test metrics must be valid");
-            let glyph = self.glyph_store.register(metric)?;
+            let glyph = resources.register(metric)?;
             self.cache.insert(key, glyph);
             self.resources.push(ch);
             Ok(glyph)
@@ -1088,10 +1559,10 @@ mod tests {
 
         fn measure_line(
             &mut self,
-            request: html_layout::TextShapeRequest<'_>,
-        ) -> Result<Option<html_layout::ShapedTextRun>, html_layout::ShapeError> {
+            request: crate::engine::TextShapeRequest<'_>,
+        ) -> Result<Option<crate::engine::ShapedTextRun>, crate::engine::ShapeError> {
             if self.fail_measurement {
-                return Err(html_layout::ShapeError::unregistered_glyph_id(
+                return Err(crate::engine::ShapeError::unregistered_glyph_id(
                     u32::MAX,
                     request.text_range().len(),
                 ));
@@ -1118,16 +1589,16 @@ mod tests {
                 viewport_width: 600.0,
                 viewport_height: None,
                 line_height: StyleEnvironment::default().root_font_size as f64,
-                image_sizing_policy: html_layout::ImageSizingPolicy::WebCompatible,
-                text_composition_policy: html_layout::TextCompositionPolicy::WebCompatible,
+                image_sizing_policy: crate::engine::ImageSizingPolicy::WebCompatible,
+                text_composition_policy: crate::engine::TextCompositionPolicy::WebCompatible,
             },
             image_metrics: Default::default(),
             paint: PaintSettingsRevision::INITIAL,
         }
     }
 
-    fn glyph_text(document: &LaidOutDocument) -> String {
-        let text = document.render_view().text();
+    fn glyph_text<'a>(document: impl Into<crate::engine::RenderView<'a>>) -> String {
+        let text = document.into().text();
         (0..text.glyph_count())
             .filter_map(|index| {
                 text.glyph_at(index)
@@ -1138,17 +1609,169 @@ mod tests {
     }
 
     #[test]
+    fn hyphenation_language_fallback_survives_preparation_and_style_rebuilds() {
+        for (publication, markup, expected) in [
+            (None, "", true),
+            (Some("en"), "", true),
+            (Some("zz"), "", false),
+            (Some("zz"), "lang='en'", true),
+            (Some("en"), "lang='zz'", false),
+        ] {
+            let provider = MutableProvider {
+                primary_language: publication.map(str::to_owned),
+                ..Default::default()
+            };
+            let mut session = PipelineSession::new(Arc::new(provider));
+            let mut inputs = base_inputs(
+                &format!(
+                    "<html {markup}><body style='margin:0;hyphens:auto'><p style='margin:0'>internationalization internationalization</p></body></html>"
+                ),
+                SourceRevision::INITIAL,
+            );
+            inputs.layout.viewport_width = 8.0;
+            let mut shaper = SizedShaper::default();
+            session.prepare_through_style(inputs.clone()).unwrap();
+            for weight in [0, 100] {
+                inputs.reader_overrides.font_weight_adjustment = weight;
+                session.update(inputs.clone(), &mut shaper).unwrap();
+
+                let text = session
+                    .document()
+                    .unwrap()
+                    .render_view(session.glyph_resources())
+                    .text();
+                assert_eq!(
+                    (0..text.line_count()).any(|index| text.hyphen_for_line(index).is_some()),
+                    expected,
+                    "publication {publication:?}, explicit {markup}, style adjustment {weight}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pending_preparation_uses_the_latest_palette_when_published() {
+        let mut session = PipelineSession::new(Arc::new(MockProvider));
+        let mut inputs = base_inputs("<p>Hello</p>", SourceRevision::INITIAL);
+        session.prepare_through_style(inputs.clone()).unwrap();
+        inputs.reader_overrides.foreground = Some(0xeeeeeeff);
+        let mut shaper = SizedShaper::default();
+        let update = session.update(inputs, &mut shaper).unwrap();
+        assert_eq!(update.stage, EarliestStage::Shape);
+        assert!(session.cache.pending_prepared.is_none());
+
+        let text = session
+            .document()
+            .unwrap()
+            .render_view(session.glyph_resources())
+            .text();
+        assert_eq!(text.paint_color_at(0), Some(0xeeeeeeff));
+    }
+
+    #[test]
+    fn font_faces_are_available_before_shaping_without_reading_font_bytes() {
+        let provider = Arc::new(MutableProvider::default());
+        let mut session = PipelineSession::new(provider.clone());
+        assert!(session.font_faces().is_empty());
+        let inputs = base_inputs(
+            r#"<html><head><style>
+                @font-face { font-family: Reader; src: url(reader.woff2) format(woff2); }
+            </style></head><body><p>Hello</p></body></html>"#,
+            SourceRevision::INITIAL,
+        );
+        session
+            .prepare_through_style(inputs)
+            .expect("prepare without shaper");
+        assert_eq!(session.font_faces()[0].family, "Reader");
+        assert_eq!(provider.read_count(), 0, "font bytes belong to the caller");
+        assert!(session.document().is_none());
+        assert!(session.cache.pending_prepared.is_some());
+        let mut shaper = TracingShaper::default();
+        session
+            .rehydrate_glyphs(&mut shaper)
+            .expect("shape after host font registration");
+        assert!(session.document().is_some());
+        assert!(
+            session.cache.pending_prepared.is_none(),
+            "published preparation has one owner"
+        );
+        assert!(
+            session.cache.prepared.is_some() && session.cache.shaped.is_some(),
+            "stage caches retain validity keys"
+        );
+        assert_eq!(session.attach(&mut shaper).font_faces()[0].family, "Reader");
+        assert_eq!(provider.read_count(), 0);
+        assert_eq!(session.into_active(shaper).font_faces()[0].family, "Reader");
+    }
+
+    #[test]
+    fn font_faces_follow_media_changes_and_successful_document_replacement() {
+        let mut session = PipelineSession::new(Arc::new(MockProvider));
+        let mut shaper = TransactionalShaper::default();
+        let mut inputs = base_inputs(
+            r#"<html><head><style>
+                @media (min-width: 700px) {
+                    @font-face { font-family: Wide; src: url(wide.ttf); }
+                }
+            </style></head><body><p>Hello</p></body></html>"#,
+            SourceRevision::INITIAL,
+        );
+        session
+            .update(inputs.clone(), &mut shaper)
+            .expect("initial layout");
+        assert!(session.font_faces().is_empty());
+        inputs.style_environment.media =
+            MediaEnvironment::new(html_style::MediaType::Screen, 800.0, None).unwrap();
+        inputs.layout.viewport_width = 800.0;
+        assert!(session.media_environment_change_affects_style(
+            inputs.style_environment.media,
+            inputs.style_environment.root_font_size
+        ));
+        let update = session
+            .update(inputs.clone(), &mut shaper)
+            .expect("font-only media change");
+        assert_eq!(update.stage, EarliestStage::Style);
+        assert_eq!(session.font_faces()[0].family, "Wide");
+        inputs.source = r#"<html><head><style>
+            @font-face { font-family: Replacement; src: url(new.ttf); }
+        </style></head><body><p>!</p></body></html>"#
+            .into();
+        shaper.fail_on = Some('!');
+        assert!(session.update(inputs.clone(), &mut shaper).is_err());
+        assert_eq!(
+            session.font_faces()[0].family,
+            "Wide",
+            "failed updates preserve published metadata"
+        );
+        shaper.fail_on = None;
+        session
+            .update(inputs, &mut shaper)
+            .expect("successful replacement");
+        assert_eq!(session.font_faces()[0].family, "Replacement");
+        let no_fonts = base_inputs(
+            "<html><body><p>No fonts</p></body></html>",
+            SourceRevision::INITIAL,
+        );
+        session
+            .update(no_fonts, &mut shaper)
+            .expect("remove declarations");
+        assert!(session.font_faces().is_empty());
+    }
+
+    #[test]
     fn an_excluded_note_is_absent_from_the_flow_and_available_through_scoped_layout() {
         const SOURCE: &str = "<html><body><p>Reading</p><aside id='n' epub:type='footnote'><p>zebra</p></aside><p>Continues</p></body></html>";
         let mut session = PipelineSession::new(Arc::new(MockProvider));
         let mut shaper = TracingShaper::default();
         let mut inputs = base_inputs(SOURCE, SourceRevision::INITIAL);
-        inputs.note_flow = html_layout::NoteFlow::Excluded;
+        inputs.note_flow = crate::engine::NoteFlow::Excluded;
         session
             .update(inputs, &mut shaper)
             .expect("pipeline update should succeed");
 
-        let flow = glyph_text(session.document().expect("a document"));
+        let flow = glyph_text(
+            (session.document().expect("a document")).render_view(session.glyph_resources()),
+        );
         assert!(flow.contains("Reading") && flow.contains("Continues"));
         assert!(
             !flow.contains("zebra"),
@@ -1160,16 +1783,24 @@ mod tests {
         // The note is still reachable: scoped layout gives an embedder the
         // content it held back, under its own width.
         let constraints =
-            html_layout::LayoutConstraints::new(200.0, 20.0).expect("valid constraints");
+            crate::engine::LayoutConstraints::new(200.0, 20.0).expect("valid constraints");
         let note = session
             .layout_note("n", constraints, &mut shaper)
             .expect("the held-back note must lay out on demand");
         assert!(
-            glyph_text(&note).contains("zebra"),
+            glyph_text(
+                note.render_view(session.document().unwrap(), session.glyph_resources())
+                    .unwrap()
+            )
+            .contains("zebra"),
             "scoped layout produces the note's own content"
         );
         assert!(
-            !glyph_text(&note).contains("Reading"),
+            !glyph_text(
+                note.render_view(session.document().unwrap(), session.glyph_resources())
+                    .unwrap()
+            )
+            .contains("Reading"),
             "a scoped note is only its own subtree"
         );
 
@@ -1178,6 +1809,94 @@ mod tests {
                 .layout_note("absent", constraints, &mut shaper)
                 .is_none(),
             "an id that names nothing lays out nothing"
+        );
+    }
+
+    #[test]
+    fn detached_note_borrows_its_owner_and_rejects_replaced_preparation() {
+        let mut session = PipelineSession::new(Arc::new(MockProvider));
+        let mut shaper = TransactionalShaper::default();
+        let mut inputs = base_inputs(
+            "<p>Reading</p><aside id='n' epub:type='footnote'><p>Note body</p><img src='image.png'></aside>",
+            SourceRevision::INITIAL,
+        );
+        inputs.note_flow = crate::engine::NoteFlow::Excluded;
+        session.update(inputs.clone(), &mut shaper).unwrap();
+        let constraints = crate::engine::LayoutConstraints::new(160.0, 20.0).unwrap();
+        let note = session.layout_note("n", constraints, &mut shaper).unwrap();
+
+        let owner = session.document().unwrap();
+        let view = note.render_view(owner, session.glyph_resources()).unwrap();
+        assert!(std::ptr::eq(
+            view.images().as_ptr(),
+            owner
+                .render_view(session.glyph_resources())
+                .images()
+                .as_ptr()
+        ));
+        assert!(glyph_text(view).contains("Note body"));
+
+        inputs.user_styles.push("p {font-size:24px}".to_owned());
+        shaper.fail_on = Some('R');
+        assert!(session.update(inputs.clone(), &mut shaper).is_err());
+        assert!(
+            note.render_view(session.document().unwrap(), session.glyph_resources())
+                .is_some(),
+            "rollback restores the note's owner identity"
+        );
+        shaper.fail_on = None;
+        session.update(inputs, &mut shaper).unwrap();
+        assert!(
+            note.render_view(session.document().unwrap(), session.glyph_resources())
+                .is_none()
+        );
+
+        // The detached products can outlive the owner, but cannot be queried
+        // using a different document, even when its markup is identical.
+        drop(session);
+        let mut replacement = PipelineSession::new(Arc::new(MockProvider));
+        replacement
+            .update(
+                base_inputs("<aside id='n'>Note body</aside>", SourceRevision::INITIAL),
+                &mut shaper,
+            )
+            .unwrap();
+        assert!(
+            note.render_view(
+                replacement.document().unwrap(),
+                replacement.glyph_resources()
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn detached_notes_reject_changed_palettes_and_glyph_resources() {
+        let mut session = PipelineSession::new(Arc::new(MockProvider));
+        let mut shaper = TransactionalShaper::default();
+        let mut inputs = base_inputs(
+            "<p>Reading</p><aside id='n' epub:type='footnote'>Note body</aside>",
+            SourceRevision::INITIAL,
+        );
+        inputs.note_flow = crate::engine::NoteFlow::Excluded;
+        session.update(inputs.clone(), &mut shaper).unwrap();
+        let constraints = crate::engine::LayoutConstraints::new(160.0, 20.0).unwrap();
+        let note = session.layout_note("n", constraints, &mut shaper).unwrap();
+        inputs.reader_overrides.foreground = Some(0xeeeeeeff);
+        session.update(inputs, &mut shaper).unwrap();
+        assert!(
+            note.render_view(session.document().unwrap(), session.glyph_resources())
+                .is_none()
+        );
+        let note = session.layout_note("n", constraints, &mut shaper).unwrap();
+        assert!(
+            note.render_view(session.document().unwrap(), session.glyph_resources())
+                .is_some()
+        );
+        session.rehydrate_glyphs(&mut shaper).unwrap();
+        assert!(
+            note.render_view(session.document().unwrap(), session.glyph_resources())
+                .is_none()
         );
     }
 
@@ -1216,10 +1935,11 @@ mod tests {
         session
             .update(inputs, &mut shaper)
             .expect("well-formed XHTML pipeline");
+
         let colors = session
             .document()
             .expect("the XML pipeline produced a document")
-            .render_view()
+            .render_view(session.glyph_resources())
             .fragments()
             .decorations()
             .iter()
@@ -1259,7 +1979,10 @@ mod tests {
             .update(inputs, &mut shaper)
             .expect("well-formed XHTML pipeline");
 
-        let view = session.document().expect("XHTML document").render_view();
+        let view = session
+            .document()
+            .expect("XHTML document")
+            .render_view(session.glyph_resources());
         let size_for = |id| {
             let index = (0..view.boxes().len())
                 .find(|&idx| view.boxes().id(idx).map(|value| view.string(value)) == Some(id))
@@ -1294,7 +2017,7 @@ mod tests {
         let view = session
             .document()
             .expect("the XML pipeline produced a document")
-            .render_view();
+            .render_view(session.glyph_resources());
         let size_for = |id| {
             let index = (0..view.boxes().len())
                 .find(|&idx| view.boxes().id(idx).map(|value| view.string(value)) == Some(id))
@@ -1331,7 +2054,7 @@ mod tests {
         let lines = session
             .document()
             .expect("XHTML document")
-            .render_view()
+            .render_view(session.glyph_resources())
             .text()
             .lines()
             .iter()
@@ -1370,7 +2093,7 @@ mod tests {
         let view = session
             .document()
             .expect("the XML pipeline produced a document")
-            .render_view();
+            .render_view(session.glyph_resources());
         let target = (0..view.boxes().len())
             .find(|&idx| view.boxes().id(idx).map(|value| view.string(value)) == Some("target"))
             .expect("image layout box");
@@ -1389,9 +2112,16 @@ mod tests {
         session
             .update(original_inputs.clone(), &mut shaper)
             .expect("initial update");
-        let original_document = build_snapshot(session.document().expect("initial document"));
+
+        let original_document = build_snapshot(
+            (session.document().expect("initial document")).render_view(session.glyph_resources()),
+        );
         let original_resources = shaper.resources.clone();
-        let original_layout_key = session.cache.laid_out.as_ref().map(|entry| entry.key.clone());
+        let original_layout_key = session
+            .cache
+            .laid_out
+            .as_ref()
+            .map(|entry| entry.key.clone());
 
         shaper.fail_on = Some('!');
         let replacement = base_inputs(
@@ -1403,7 +2133,10 @@ mod tests {
             .expect_err("replacement shaping must fail");
 
         assert_eq!(
-            build_snapshot(session.document().expect("cached document must remain")),
+            build_snapshot(
+                (session.document().expect("cached document must remain"))
+                    .render_view(session.glyph_resources())
+            ),
             original_document
         );
         assert_eq!(
@@ -1415,7 +2148,10 @@ mod tests {
             "the failed transaction must be closed"
         );
         assert_eq!(session.cache.inputs.as_ref(), Some(&original_inputs));
-        assert_eq!(session.cache.laid_out.as_ref().map(|entry| &entry.key), original_layout_key.as_ref());
+        assert_eq!(
+            session.cache.laid_out.as_ref().map(|entry| &entry.key),
+            original_layout_key.as_ref()
+        );
     }
 
     #[test]
@@ -1424,35 +2160,103 @@ mod tests {
         let mut shaper = TransactionalShaper::default();
         let inputs = base_inputs("<p>Published chapter</p>", SourceRevision::INITIAL);
         session.update(inputs.clone(), &mut shaper).unwrap();
-        let original = build_snapshot(session.document().unwrap());
+
+        let original =
+            build_snapshot((session.document().unwrap()).render_view(session.glyph_resources()));
         shaper.reset();
         shaper.fail_on = Some('P');
-        session.attach(&mut shaper).update(inputs.clone()).unwrap_err();
-        assert_eq!(build_snapshot(session.document().unwrap()), original);
+        session
+            .attach(&mut shaper)
+            .update(inputs.clone())
+            .unwrap_err();
+        assert_eq!(
+            build_snapshot((session.document().unwrap()).render_view(session.glyph_resources())),
+            original
+        );
         assert!(session.cache.shaped.is_none());
         assert!(session.active_resource_generation.is_none());
-        assert!(session.layout_note("n", html_layout::LayoutConstraints::new(100.0, 16.0).unwrap(), &mut shaper).is_none());
+        assert!(
+            session
+                .layout_note(
+                    "n",
+                    crate::engine::LayoutConstraints::new(100.0, 16.0).unwrap(),
+                    &mut shaper
+                )
+                .is_none()
+        );
         shaper.fail_on = None;
-        assert_eq!(session.attach(&mut shaper).update(inputs).unwrap().stage, EarliestStage::Shape);
-        assert_eq!(build_snapshot(session.document().unwrap()), original);
+        assert_eq!(
+            session.attach(&mut shaper).update(inputs).unwrap().stage,
+            EarliestStage::Shape
+        );
+        assert_eq!(
+            build_snapshot((session.document().unwrap()).render_view(session.glyph_resources())),
+            original
+        );
+    }
+
+    #[test]
+    fn source_addresses_follow_rehydration_reflow_and_source_replacement() {
+        let mut session = PipelineSession::new(Arc::new(MockProvider));
+        let mut inputs = base_inputs("<p>Chapter with text</p>", SourceRevision::INITIAL);
+        session.prepare_through_style(inputs.clone()).unwrap();
+        let mut shaper = TransactionalShaper::default();
+        session.rehydrate_glyphs(&mut shaper).unwrap();
+
+        let location = |session: &PipelineSession| {
+            session
+                .document()
+                .unwrap()
+                .render_view(session.glyph_resources())
+                .addressing()
+                .source_location_on_line(0, Some(0))
+                .unwrap()
+        };
+        let original = location(&session);
+        session.rehydrate_glyphs(&mut shaper).unwrap();
+        assert_eq!(location(&session), original);
+        inputs.layout.viewport_width = 80.0;
+        session.update(inputs.clone(), &mut shaper).unwrap();
+        assert_eq!(location(&session), original);
+        inputs.source_revision = inputs.source_revision.next();
+        inputs.source = "<blockquote><p>Chapter with text</p></blockquote>".into();
+        session.update(inputs, &mut shaper).unwrap();
+        assert_ne!(
+            location(&session),
+            original,
+            "queries use the current DOM without retained metadata"
+        );
     }
 
     #[test]
     fn glyph_rehydration_publishes_in_place_and_preserves_the_previous_result_on_failure() {
         let mut session = PipelineSession::new(Arc::new(MockProvider));
         let mut shaper = TransactionalShaper::default();
-        session.update(base_inputs("<p>Chapter</p>", SourceRevision::INITIAL), &mut shaper).unwrap();
-        let original = build_snapshot(session.document().unwrap());
+        session
+            .update(
+                base_inputs("<p>Chapter</p>", SourceRevision::INITIAL),
+                &mut shaper,
+            )
+            .unwrap();
+
+        let original =
+            build_snapshot((session.document().unwrap()).render_view(session.glyph_resources()));
         let resources = shaper.resources.clone();
-        let generation = shaper.glyph_store.generation();
+        let generation = shaper.resource_generation();
         shaper.fail_on = Some('C');
         session.rehydrate_glyphs(&mut shaper).unwrap_err();
         assert_eq!(shaper.resources, resources);
-        assert_eq!(build_snapshot(session.document().unwrap()), original);
+        assert_eq!(
+            build_snapshot((session.document().unwrap()).render_view(session.glyph_resources())),
+            original
+        );
         shaper.fail_on = None;
         let () = session.rehydrate_glyphs(&mut shaper).unwrap();
-        assert_eq!(build_snapshot(session.document().unwrap()), original);
-        assert_ne!(shaper.glyph_store.generation(), generation);
+        assert_eq!(
+            build_snapshot((session.document().unwrap()).render_view(session.glyph_resources())),
+            original
+        );
+        assert_ne!(shaper.resource_generation(), generation);
     }
 
     #[test]
@@ -1466,18 +2270,26 @@ mod tests {
         session
             .update(original_inputs.clone(), &mut shaper)
             .expect("initial update");
-        let original_document = build_snapshot(session.document().expect("initial document"));
+
+        let original_document = build_snapshot(
+            (session.document().expect("initial document")).render_view(session.glyph_resources()),
+        );
         shaper.fail_measurement = true;
         let mut narrower = original_inputs.clone();
         narrower.layout.viewport_width = 10.0;
-        let mut changed_layout = session.document().expect("initial document").clone();
-        changed_layout.relayout_with_metrics(
-            to_layout_constraints(narrower.layout).expect("valid layout constraints"),
-            &narrower.image_metrics,
-        );
+        let (changed_layout, changed_layout_resources) = session
+            .document_mut_and_resources()
+            .expect("initial document");
+        changed_layout
+            .relayout_with_metrics(
+                to_layout_constraints(narrower.layout).expect("valid layout constraints"),
+                &narrower.image_metrics,
+                changed_layout_resources,
+            )
+            .expect("layout requires the shaper-aware API for first-line styles");
+        let expected = build_snapshot(changed_layout.render_view(changed_layout_resources));
         assert_ne!(
-            build_snapshot(&changed_layout),
-            original_document,
+            expected, original_document,
             "the request must exercise geometry that differs from the cached layout"
         );
         session
@@ -1485,8 +2297,11 @@ mod tests {
             .expect("layout must reuse authoritative document shaping");
 
         assert_eq!(
-            build_snapshot(session.document().expect("updated document")),
-            build_snapshot(&changed_layout)
+            build_snapshot(
+                (session.document().expect("updated document"))
+                    .render_view(session.glyph_resources())
+            ),
+            expected
         );
         assert_eq!(session.cache.inputs.as_ref(), Some(&narrower));
     }
@@ -1523,8 +2338,8 @@ mod tests {
         );
     }
 
-    fn build_snapshot(document: &LaidOutDocument) -> RenderSnapshot {
-        let root = document.render_view();
+    fn build_snapshot<'a>(document: impl Into<crate::engine::RenderView<'a>>) -> RenderSnapshot {
+        let root = document.into();
         let text = root.text();
         let fragments = root.fragments();
         let addressing = root.addressing();
@@ -1660,8 +2475,11 @@ mod tests {
         for input in updates {
             session.update(input.clone(), &mut shaper)?;
         }
+
         let document = session.document().expect("document should exist");
-        Ok(build_snapshot(document))
+        Ok(build_snapshot(
+            (document).render_view(session.glyph_resources()),
+        ))
     }
 
     #[test]
@@ -1778,20 +2596,24 @@ mod tests {
             update.report.laid_out,
             Reuse::recomputed(EarliestStage::Shape)
         );
+
         let incremental = build_snapshot(
-            session
+            (session
                 .document()
-                .expect("document should exist after backend-generation update"),
+                .expect("document should exist after backend-generation update"))
+            .render_view(session.glyph_resources()),
         );
         let mut fresh_shaper = SizedShaper::default();
         let mut fresh_session = PipelineSession::new(Arc::new(MockProvider));
         let _ = fresh_session
             .update(changed_inputs.clone(), &mut fresh_shaper)
             .unwrap();
+
         let fresh = build_snapshot(
-            fresh_session
+            (fresh_session
                 .document()
-                .expect("document should exist after full rebuild"),
+                .expect("document should exist after full rebuild"))
+            .render_view(fresh_session.glyph_resources()),
         );
 
         assert_eq!(incremental, fresh);
@@ -1820,8 +2642,8 @@ mod tests {
                     viewport_width: 430.0,
                     viewport_height: None,
                     line_height: 20.0,
-                    image_sizing_policy: html_layout::ImageSizingPolicy::WebCompatible,
-                    text_composition_policy: html_layout::TextCompositionPolicy::WebCompatible,
+                    image_sizing_policy: crate::engine::ImageSizingPolicy::WebCompatible,
+                    text_composition_policy: crate::engine::TextCompositionPolicy::WebCompatible,
                 };
                 final_input
             },
@@ -1829,13 +2651,17 @@ mod tests {
 
         let incremental =
             update_and_snapshot(&updates).expect("incremental pipeline should succeed");
+
         let fresh = {
             let mut shaper = TracingShaper::default();
             let mut session = PipelineSession::new(Arc::new(MockProvider));
             let mut inputs = updates.pop().expect("final input must exist");
             inputs.source_revision = SourceRevision::INITIAL;
             session.update(inputs, &mut shaper).unwrap();
-            build_snapshot(session.document().expect("document should exist"))
+            build_snapshot(
+                (session.document().expect("document should exist"))
+                    .render_view(session.glyph_resources()),
+            )
         };
 
         assert_eq!(incremental, fresh);
@@ -1962,8 +2788,14 @@ mod tests {
         inputs.layout.viewport_width = 420.0;
         let update = session.update(inputs, &mut shaper).unwrap();
         assert_eq!(update.stage, EarliestStage::Prepare);
-        assert_eq!(update.report.styled, Reuse::recomputed(EarliestStage::Prepare));
-        assert_eq!(update.report.prepared, Reuse::recomputed(EarliestStage::Prepare));
+        assert_eq!(
+            update.report.styled,
+            Reuse::recomputed(EarliestStage::Prepare)
+        );
+        assert_eq!(
+            update.report.prepared,
+            Reuse::recomputed(EarliestStage::Prepare)
+        );
     }
 
     #[test]
@@ -1975,15 +2807,118 @@ mod tests {
             SourceRevision::INITIAL,
         );
         session.update(inputs.clone(), &mut shaper).unwrap();
-        let baseline = build_snapshot(session.document().unwrap());
+
+        let baseline =
+            build_snapshot((session.document().unwrap()).render_view(session.glyph_resources()));
 
         inputs.user_styles = vec!["p { font-size: 42px !important; }".to_owned()];
         let update = session.update(inputs, &mut shaper).unwrap();
-        let styled = build_snapshot(session.document().unwrap());
+
+        let styled =
+            build_snapshot((session.document().unwrap()).render_view(session.glyph_resources()));
 
         assert_eq!(update.stage, EarliestStage::Prepare);
         assert_eq!(update.report.parsed, Reuse::reused(EarliestStage::Prepare));
         assert_ne!(baseline, styled);
+    }
+
+    #[test]
+    fn restyling_borrows_the_canonical_dom_text_storage() {
+        let mut session = PipelineSession::new(Arc::new(MockProvider));
+        let mut shaper = SizedShaper::default();
+        let mut inputs = base_inputs("<p>Canonical source text.</p>", SourceRevision::INITIAL);
+        session.update(inputs.clone(), &mut shaper).unwrap();
+
+        let text_pointers = |session: &PipelineSession| {
+            session
+                .document()
+                .unwrap()
+                .visible_text_runs()
+                .map(|(text, _)| (text.as_ptr(), text.len()))
+                .collect::<Vec<_>>()
+        };
+        let source = text_pointers(&session);
+        assert!(!source.is_empty());
+        for font_size in [24, 12, 32, 16] {
+            inputs.style_environment.root_font_size = font_size;
+            let update = session.update(inputs.clone(), &mut shaper).unwrap();
+            assert_eq!(update.stage, EarliestStage::Prepare);
+            assert_eq!(text_pointers(&session), source);
+            assert_eq!(
+                session
+                    .document()
+                    .unwrap()
+                    .render_view(session.glyph_resources())
+                    .root_font_size(),
+                font_size as f32
+            );
+        }
+        inputs
+            .user_styles
+            .push("p { font-weight: bold }".to_owned());
+        session.update(inputs, &mut shaper).unwrap();
+        assert_eq!(text_pointers(&session), source);
+    }
+
+    #[test]
+    fn failed_restyling_restores_root_font_math_resources_and_published_geometry() {
+        use html_dom::ImageSource;
+
+        let mut session = PipelineSession::new(Arc::new(MockProvider));
+        let mut shaper = TransactionalShaper::default();
+        let mut inputs = base_inputs(
+            "<p>ABC <math><mfrac><mi>x</mi><mn>2</mn></mfrac></math></p>",
+            SourceRevision::INITIAL,
+        );
+        session.update(inputs.clone(), &mut shaper).unwrap();
+
+        let before =
+            build_snapshot((session.document().unwrap()).render_view(session.glyph_resources()));
+        let view = session
+            .document()
+            .unwrap()
+            .render_view(session.glyph_resources());
+        let font = view.root_font_size();
+        let image = &view.images()[0];
+        let ImageSource::MathMl { svg, baseline, .. } = &image.source else {
+            panic!("formula")
+        };
+        let formula = (svg.as_ptr(), image.width, image.height, *baseline);
+        let resources = shaper.resources.clone();
+        let generation = shaper.resource_generation();
+        inputs.style_environment.root_font_size = 32;
+        inputs.user_styles.push("p { color: red }".to_owned());
+        shaper.fail_on = Some('A');
+        assert!(session.update(inputs.clone(), &mut shaper).is_err());
+        assert_eq!(
+            build_snapshot((session.document().unwrap()).render_view(session.glyph_resources())),
+            before
+        );
+        let view = session
+            .document()
+            .unwrap()
+            .render_view(session.glyph_resources());
+        assert_eq!(view.root_font_size(), font);
+        let image = &view.images()[0];
+        let ImageSource::MathMl { svg, baseline, .. } = &image.source else {
+            panic!("formula")
+        };
+        assert_eq!(
+            (svg.as_ptr(), image.width, image.height, *baseline),
+            formula
+        );
+        assert_eq!(shaper.resources, resources);
+        assert_eq!(shaper.resource_generation(), generation);
+        shaper.fail_on = None;
+        session.update(inputs, &mut shaper).unwrap();
+        assert_eq!(
+            session
+                .document()
+                .unwrap()
+                .render_view(session.glyph_resources())
+                .root_font_size(),
+            32.0
+        );
     }
 
     #[test]
@@ -1995,12 +2930,30 @@ mod tests {
             SourceRevision::INITIAL,
         );
         session.update(inputs.clone(), &mut shaper).unwrap();
-        let inset = session.document().unwrap().render_view().text().line(0).unwrap().point().x;
+
+        let inset = session
+            .document()
+            .unwrap()
+            .render_view(session.glyph_resources())
+            .text()
+            .line(0)
+            .unwrap()
+            .point()
+            .x;
         assert!(inset > 0.0);
 
         inputs.reader_overrides.strip_root_spacing = true;
         session.update(inputs, &mut shaper).unwrap();
-        let x = session.document().unwrap().render_view().text().line(0).unwrap().point().x;
+
+        let x = session
+            .document()
+            .unwrap()
+            .render_view(session.glyph_resources())
+            .text()
+            .line(0)
+            .unwrap()
+            .point()
+            .x;
         assert_eq!(x, 0.0);
     }
 
@@ -2012,15 +2965,34 @@ mod tests {
             "<html><head><style>a[href]::before {content: 'G'; color: orange}</style></head><body><p style='color: green'>B <a href='#note' style='color: red'>L<span style='color: blue'>N</span></a> <a id='note' style='color: magenta'>A</a></p></body></html>",
             SourceRevision::INITIAL,
         );
-        let theme = crate::ThemeAdaptation { ink: 0xeeeeeeff, surface: 0x222222ff };
+        let theme = crate::ThemeAdaptation {
+            ink: 0xeeeeeeff,
+            surface: 0x222222ff,
+        };
         inputs.reader_overrides.theme = Some(theme);
         for accent in [0x466853ff, 0xc6a25cff] {
             inputs.reader_overrides.link_foreground = Some(accent);
             shaper.colors.clear();
             let update = session.update(inputs.clone(), &mut shaper).unwrap();
-            for (character, expected) in [('L', accent), ('N', accent), ('G', accent), ('B', theme.adapt(0x008000ff)), ('A', theme.adapt(0xff00ffff))] {
-                let text = session.document().unwrap().render_view().text();
-                let index = (0..text.glyph_count()).find(|&index| text.glyph_at(index).and_then(|glyph| text.glyph_metric(glyph)).is_some_and(|metric| metric.ch() == character)).unwrap();
+            for (character, expected) in [
+                ('L', accent),
+                ('N', accent),
+                ('G', accent),
+                ('B', theme.adapt(0x008000ff)),
+                ('A', theme.adapt(0xff00ffff)),
+            ] {
+                let text = session
+                    .document()
+                    .unwrap()
+                    .render_view(session.glyph_resources())
+                    .text();
+                let index = (0..text.glyph_count())
+                    .find(|&index| {
+                        text.glyph_at(index)
+                            .and_then(|glyph| text.glyph_metric(glyph))
+                            .is_some_and(|metric| metric.ch() == character)
+                    })
+                    .unwrap();
                 assert_eq!(text.paint_color_at(index as u32), Some(expected));
                 if update.stage == EarliestStage::Paint {
                     assert!(shaper.colors.is_empty(), "color updates must not reshape");
@@ -2046,10 +3018,15 @@ mod tests {
             let ratio = desired as f32 / 16.0;
             for (character, canonical) in [('A', 16.0), ('B', 12.0), ('C', 32.0), ('D', 6.0)] {
                 let expected = canonical * ratio;
-                assert!(shaper.cache.contains_key(&(character, expected.to_bits())), "{character} should shape at {expected}px for a requested size of {desired}px");
+                assert!(
+                    shaper.cache.contains_key(&(character, expected.to_bits())),
+                    "{character} should shape at {expected}px for a requested size of {desired}px"
+                );
             }
             if desired == 24 {
-                let snapshot = build_snapshot(session.document().unwrap());
+                let snapshot = build_snapshot(
+                    (session.document().unwrap()).render_view(session.glyph_resources()),
+                );
                 if let Some(previous) = enlarged.as_ref() {
                     assert_eq!(&snapshot, previous);
                 } else {
@@ -2068,20 +3045,195 @@ mod tests {
     }
 
     #[test]
-    fn chapter_source_is_shared_and_replacements_still_invalidate_parse() {
-        let inputs = base_inputs("<p>first chapter</p>", SourceRevision::INITIAL);
-        let copied = inputs.clone();
-        assert!(Arc::ptr_eq(&inputs.source, &copied.source));
-        let independent = base_inputs("<p>first chapter</p>", SourceRevision::INITIAL);
-        assert!(!Arc::ptr_eq(&inputs.source, &independent.source));
-        assert!(inputs.same_source(&independent));
+    fn changes_borrow_unchanged_source_and_replacements_still_invalidate_parse() {
+        let mut inputs = base_inputs("<p>first chapter</p>", SourceRevision::INITIAL);
+        inputs.user_styles.push("p { color: red }".to_owned());
+        let source_pointer = inputs.source.as_ptr();
+        let style_pointer = inputs.user_styles[0].as_ptr();
         let mut session = PipelineSession::new(Arc::new(MockProvider));
         let mut shaper = TracingShaper::default();
-        session.update(inputs.clone(), &mut shaper).unwrap();
-        let replacement = base_inputs("<p>second chapter</p>", SourceRevision::INITIAL);
-        assert_eq!(session.update(replacement, &mut shaper).unwrap().stage, EarliestStage::Parse);
-        assert!(glyph_text(session.document().unwrap()).contains("second chapter"));
-        assert_eq!(session.update(inputs, &mut shaper).unwrap().stage, EarliestStage::Parse);
+        session.update(inputs, &mut shaper).unwrap();
+        assert_eq!(session.inputs().unwrap().source.as_ptr(), source_pointer);
+
+        let mut layout = session.inputs().unwrap().layout;
+        layout.viewport_width = 120.0;
+        let update = session
+            .apply_changes(
+                PipelineChanges {
+                    layout: Some(layout),
+                    ..Default::default()
+                },
+                &mut shaper,
+            )
+            .unwrap();
+        assert_eq!(update.stage, EarliestStage::Layout);
+        assert_eq!(session.inputs().unwrap().source.as_ptr(), source_pointer);
+        assert_eq!(
+            session.inputs().unwrap().user_styles[0].as_ptr(),
+            style_pointer
+        );
+
+        let replacement = "<p>second chapter</p>".to_owned();
+        let replacement_pointer = replacement.as_ptr();
+        let update = session
+            .apply_changes(
+                PipelineChanges {
+                    source: Some(replacement),
+                    ..Default::default()
+                },
+                &mut shaper,
+            )
+            .unwrap();
+        assert_eq!(update.stage, EarliestStage::Parse);
+        assert_eq!(
+            session.inputs().unwrap().source.as_ptr(),
+            replacement_pointer
+        );
+        assert!(
+            glyph_text((session.document().unwrap()).render_view(session.glyph_resources()))
+                .contains("second chapter")
+        );
+    }
+
+    #[test]
+    fn failed_changes_restore_owned_inputs_document_and_backend_resources() {
+        let mut inputs = base_inputs("<p>original document</p>", SourceRevision::INITIAL);
+        inputs.user_styles.push("p { color: red }".to_owned());
+        inputs.image_metrics.set(0, 40, 60);
+        let source_pointer = inputs.source.as_ptr();
+        let style_pointer = inputs.user_styles[0].as_ptr();
+        let original_inputs = inputs.clone();
+        let mut session = PipelineSession::new(Arc::new(MockProvider));
+        let mut shaper = TransactionalShaper::default();
+        session.update(inputs, &mut shaper).unwrap();
+
+        let original_document =
+            build_snapshot((session.document().unwrap()).render_view(session.glyph_resources()));
+        let original_resources = shaper.resources.clone();
+        let mut metrics = crate::engine::ImageMetrics::default();
+        metrics.set(0, 900, 800);
+        shaper.fail_on = Some('!');
+        assert!(
+            session
+                .apply_changes(
+                    PipelineChanges {
+                        source: Some("<p>replacement!</p>".to_owned()),
+                        source_revision: Some(SourceRevision::INITIAL.next()),
+                        base_uri: Some("replacement.html".to_owned()),
+                        user_styles: Some(vec!["p { color: blue }".to_owned()]),
+                        image_metrics: Some(metrics),
+                        reader_overrides: Some(crate::ReaderStyleOverrides {
+                            foreground: Some(0x123456ff),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    &mut shaper
+                )
+                .is_err()
+        );
+        let committed = session.inputs().unwrap();
+        assert_eq!(committed, &original_inputs);
+        assert_eq!(committed.source.as_ptr(), source_pointer);
+        assert_eq!(committed.user_styles[0].as_ptr(), style_pointer);
+        assert_eq!(committed.image_metrics.get(0), Some((40, 60)));
+        assert_eq!(
+            build_snapshot((session.document().unwrap()).render_view(session.glyph_resources())),
+            original_document
+        );
+        assert_eq!(shaper.resources, original_resources);
+        shaper.fail_on = None;
+        let update = session
+            .apply_changes(PipelineChanges::default(), &mut shaper)
+            .unwrap();
+        assert_eq!(update.stage, EarliestStage::Paint);
+        assert_eq!(session.inputs().unwrap().source.as_ptr(), source_pointer);
+    }
+
+    #[test]
+    fn changes_preserve_media_query_invalidation_and_paint_reuse() {
+        let inputs = base_inputs(
+            "<style>@media (max-width: 200px) { p { color: red } }</style><p>media</p>",
+            SourceRevision::INITIAL,
+        );
+        let mut session = PipelineSession::new(Arc::new(MockProvider));
+        let mut shaper = TracingShaper::default();
+        session.update(inputs, &mut shaper).unwrap();
+        let source_pointer = session.inputs().unwrap().source.as_ptr();
+        let mut layout = session.inputs().unwrap().layout;
+        layout.viewport_width = 100.0;
+        let mut environment = session.inputs().unwrap().style_environment;
+        environment.media = crate::MediaEnvironment::screen(100.0, None).unwrap();
+        let update = session
+            .apply_changes(
+                PipelineChanges {
+                    layout: Some(layout),
+                    style_environment: Some(environment),
+                    ..Default::default()
+                },
+                &mut shaper,
+            )
+            .unwrap();
+        assert_eq!(update.stage, EarliestStage::Style);
+        assert!(
+            session
+                .document()
+                .unwrap()
+                .render_view(session.glyph_resources())
+                .text()
+                .glyph_count()
+                > 0
+        );
+        let calls = shaper.calls;
+        let update = session
+            .apply_changes(
+                PipelineChanges {
+                    reader_overrides: Some(crate::ReaderStyleOverrides {
+                        foreground: Some(0x112233ff),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                &mut shaper,
+            )
+            .unwrap();
+        assert_eq!(update.stage, EarliestStage::Paint);
+        assert_eq!(shaper.calls, calls);
+        assert_eq!(session.inputs().unwrap().source.as_ptr(), source_pointer);
+    }
+
+    #[test]
+    fn changes_reject_empty_sessions_and_invalid_layout_without_committing() {
+        let mut session = PipelineSession::new(Arc::new(MockProvider));
+        let mut shaper = TracingShaper::default();
+        assert!(
+            session
+                .apply_changes(PipelineChanges::default(), &mut shaper)
+                .is_err()
+        );
+        assert!(session.inputs().is_none());
+        session
+            .prepare_through_style(base_inputs("<p>prepared</p>", SourceRevision::INITIAL))
+            .unwrap();
+        let original = session.inputs().unwrap().layout;
+        let mut invalid = original;
+        invalid.viewport_width = f64::NAN;
+        assert!(
+            session
+                .apply_changes(
+                    PipelineChanges {
+                        layout: Some(invalid),
+                        ..Default::default()
+                    },
+                    &mut shaper
+                )
+                .is_err()
+        );
+        assert_eq!(session.inputs().unwrap().layout, original);
+        session
+            .apply_changes(PipelineChanges::default(), &mut shaper)
+            .unwrap();
+        assert!(session.document().is_some());
     }
 
     #[test]
@@ -2089,10 +3241,16 @@ mod tests {
         let inputs = base_inputs("<p>colors</p>", SourceRevision::INITIAL);
         let mut next = inputs.clone();
         next.reader_overrides.link_foreground = Some(0x123456ff);
-        assert_eq!(next.change_mask(&inputs).earliest_stage(), EarliestStage::Paint);
+        assert_eq!(
+            next.change_mask(&inputs).earliest_stage(),
+            EarliestStage::Paint
+        );
         assert_eq!(next.changes_from(&inputs).1, EarliestStage::Paint);
         next.reader_overrides.font_family = Some("serif".into());
-        assert_eq!(next.change_mask(&inputs).earliest_stage(), EarliestStage::Style);
+        assert_eq!(
+            next.change_mask(&inputs).earliest_stage(),
+            EarliestStage::Style
+        );
     }
 
     #[test]
@@ -2103,14 +3261,50 @@ mod tests {
         let mut session = PipelineSession::new(Arc::new(MockProvider));
         let mut shaper = TracingShaper::default();
         session.update(inputs.clone(), &mut shaper).unwrap();
-        let original = session.document().unwrap().clone();
-        let glyph_pointer = session.document().unwrap().render_view().text().glyph_slice(0..session.document().unwrap().render_view().text().glyph_count() as u32).unwrap().as_ptr();
-        let generation = shaper.glyph_resources().generation();
+
+        let original =
+            build_snapshot((session.document().unwrap()).render_view(session.glyph_resources()));
+
+        let glyph_pointer = session
+            .document()
+            .unwrap()
+            .render_view(session.glyph_resources())
+            .text()
+            .glyph_slice(
+                0..session
+                    .document()
+                    .unwrap()
+                    .render_view(session.glyph_resources())
+                    .text()
+                    .glyph_count() as u32,
+            )
+            .unwrap()
+            .as_contiguous()
+            .unwrap()
+            .as_ptr();
+        let generation = shaper.resource_generation();
         let calls = shaper.calls;
         let preferences = [
-            crate::ReaderStyleOverrides { link_foreground: Some(0x123456ff), ..Default::default() },
-            crate::ReaderStyleOverrides { foreground: Some(0xeeeeeeff), background: Some(0x101010ff), theme: Some(crate::ThemeAdaptation { ink: 0xddddddff, surface: 0x222222ff }), ..Default::default() },
-            crate::ReaderStyleOverrides { theme: Some(crate::ThemeAdaptation { ink: 0x111111ff, surface: 0xffffffff }), ..Default::default() },
+            crate::ReaderStyleOverrides {
+                link_foreground: Some(0x123456ff),
+                ..Default::default()
+            },
+            crate::ReaderStyleOverrides {
+                foreground: Some(0xeeeeeeff),
+                background: Some(0x101010ff),
+                theme: Some(crate::ThemeAdaptation {
+                    ink: 0xddddddff,
+                    surface: 0x222222ff,
+                }),
+                ..Default::default()
+            },
+            crate::ReaderStyleOverrides {
+                theme: Some(crate::ThemeAdaptation {
+                    ink: 0x111111ff,
+                    surface: 0xffffffff,
+                }),
+                ..Default::default()
+            },
             crate::ReaderStyleOverrides::default(),
         ];
         for overrides in preferences {
@@ -2119,40 +3313,102 @@ mod tests {
             assert_eq!(update.stage, EarliestStage::Paint);
             assert!(update.report.shaped.reused && update.report.laid_out.reused);
             assert_eq!(shaper.calls, calls);
-            assert_eq!(shaper.glyph_resources().generation(), generation);
-            assert_eq!(session.document().unwrap().render_view().text().glyph_slice(0..session.document().unwrap().render_view().text().glyph_count() as u32).unwrap().as_ptr(), glyph_pointer);
+            assert_eq!(shaper.resource_generation(), generation);
+            assert_eq!(
+                session
+                    .document()
+                    .unwrap()
+                    .render_view(session.glyph_resources())
+                    .text()
+                    .glyph_slice(
+                        0..session
+                            .document()
+                            .unwrap()
+                            .render_view(session.glyph_resources())
+                            .text()
+                            .glyph_count() as u32
+                    )
+                    .unwrap()
+                    .as_contiguous()
+                    .unwrap()
+                    .as_ptr(),
+                glyph_pointer
+            );
             let mut fresh_session = PipelineSession::new(Arc::new(MockProvider));
             let mut fresh_shaper = TracingShaper::default();
-            fresh_session.update(inputs.clone(), &mut fresh_shaper).unwrap();
-            let mut updated = build_snapshot(session.document().unwrap());
-            let mut fresh = build_snapshot(fresh_session.document().unwrap());
+            fresh_session
+                .update(inputs.clone(), &mut fresh_shaper)
+                .unwrap();
+
+            let mut updated = build_snapshot(
+                (session.document().unwrap()).render_view(session.glyph_resources()),
+            );
+
+            let mut fresh = build_snapshot(
+                (fresh_session.document().unwrap()).render_view(fresh_session.glyph_resources()),
+            );
             // Semantic paint traversal is independent of physical decoration storage.
-            let order = |d: &DecorationSnapshot| (d.x0_bits, d.y0_bits, d.x1_bits, d.y1_bits, d.color, d.is_inline);
+            let order = |d: &DecorationSnapshot| {
+                (
+                    d.x0_bits,
+                    d.y0_bits,
+                    d.x1_bits,
+                    d.y1_bits,
+                    d.color,
+                    d.is_inline,
+                )
+            };
             updated.decorations.sort_by_key(order);
             fresh.decorations.sort_by_key(order);
             assert_eq!(updated, fresh);
         }
-        assert_eq!(build_snapshot(&original).lines, build_snapshot(session.document().unwrap()).lines);
-        assert_eq!(original.render_view().text().paint_color_at(0), None);
-        assert_eq!(session.document().unwrap().render_view().text().paint_color_at(0), None);
+        assert_eq!(
+            original.lines,
+            build_snapshot((session.document().unwrap()).render_view(session.glyph_resources()))
+                .lines
+        );
+        assert_eq!(
+            session
+                .document()
+                .unwrap()
+                .render_view(session.glyph_resources())
+                .text()
+                .paint_color_at(0),
+            None
+        );
         inputs.layout.viewport_width = 200.0;
-        assert_eq!(session.update(inputs.clone(), &mut shaper).unwrap().stage, EarliestStage::Layout);
+        assert_eq!(
+            session.update(inputs.clone(), &mut shaper).unwrap().stage,
+            EarliestStage::Layout
+        );
         inputs.reader_overrides.link_foreground = Some(0xabcdef88);
-        assert_eq!(session.update(inputs.clone(), &mut shaper).unwrap().stage, EarliestStage::Paint);
+        assert_eq!(
+            session.update(inputs.clone(), &mut shaper).unwrap().stage,
+            EarliestStage::Paint
+        );
         inputs.source = "<p>different chapter</p>".into();
-        assert_eq!(session.update(inputs, &mut shaper).unwrap().stage, EarliestStage::Parse);
+        assert_eq!(
+            session.update(inputs, &mut shaper).unwrap().stage,
+            EarliestStage::Parse
+        );
     }
 
     #[test]
     fn paint_preferences_retain_shaping_for_specialized_layout_and_reject_stale_resources() {
-        for source in ["<table><tr><td>table</td></tr></table>", "<p style='position:relative'>positioned</p>"] {
+        for source in [
+            "<table><tr><td>table</td></tr></table>",
+            "<p style='position:relative'>positioned</p>",
+        ] {
             let mut inputs = base_inputs(source, SourceRevision::INITIAL);
             let mut session = PipelineSession::new(Arc::new(MockProvider));
             let mut shaper = TracingShaper::default();
             session.update(inputs.clone(), &mut shaper).unwrap();
             let calls = shaper.calls;
             inputs.reader_overrides.foreground = Some(0xabcdef88);
-            assert_eq!(session.update(inputs.clone(), &mut shaper).unwrap().stage, EarliestStage::Paint);
+            assert_eq!(
+                session.update(inputs.clone(), &mut shaper).unwrap().stage,
+                EarliestStage::Paint
+            );
             assert_eq!(shaper.calls, calls);
             shaper.reset();
             inputs.reader_overrides.foreground = Some(0x112233ff);
@@ -2163,23 +3419,46 @@ mod tests {
 
     #[test]
     fn failed_font_and_paint_update_keeps_published_styles_and_resources() {
-        let source = "<style>p::first-line {font-size:32px}</style><p style='position:relative'>ABC</p>";
+        let source =
+            "<style>p::first-line {font-size:32px}</style><p style='position:relative'>ABC</p>";
         let mut inputs = base_inputs(source, SourceRevision::INITIAL);
         let mut session = PipelineSession::new(Arc::new(MockProvider));
         let mut shaper = TransactionalShaper::default();
         session.update(inputs.clone(), &mut shaper).unwrap();
-        let snapshot = build_snapshot(session.document().unwrap());
+
+        let snapshot =
+            build_snapshot((session.document().unwrap()).render_view(session.glyph_resources()));
         let resources = shaper.resources.clone();
-        let generation = shaper.glyph_resources().generation();
+        let generation = shaper.resource_generation();
         shaper.fail_on = Some('A');
         inputs.reader_overrides.foreground = Some(0x123456ff);
         inputs.font_environment = inputs.font_environment.next();
         assert!(session.update(inputs, &mut shaper).is_err());
-        assert_eq!(build_snapshot(session.document().unwrap()), snapshot);
+        assert_eq!(
+            build_snapshot((session.document().unwrap()).render_view(session.glyph_resources())),
+            snapshot
+        );
         assert_eq!(shaper.resources, resources);
-        assert_eq!(shaper.glyph_resources().generation(), generation);
-        assert_eq!(session.cache.inputs.as_ref().unwrap().reader_overrides.foreground, None);
-        assert_eq!(session.document().unwrap().render_view().text().paint_color_at(0), None);
+        assert_eq!(shaper.resource_generation(), generation);
+        assert_eq!(
+            session
+                .cache
+                .inputs
+                .as_ref()
+                .unwrap()
+                .reader_overrides
+                .foreground,
+            None
+        );
+        assert_eq!(
+            session
+                .document()
+                .unwrap()
+                .render_view(session.glyph_resources())
+                .text()
+                .paint_color_at(0),
+            None
+        );
     }
 
     #[test]
@@ -2189,11 +3468,17 @@ mod tests {
         painted.reader_overrides.foreground = Some(0xabcdef88);
         painted.reader_overrides.link_foreground = Some(0xabcdef88);
         painted.reader_overrides.background = Some(0x112233ff);
-        painted.reader_overrides.theme = Some(crate::ThemeAdaptation { ink: 0xddddddff, surface: 0x222222ff });
+        painted.reader_overrides.theme = Some(crate::ThemeAdaptation {
+            ink: 0xddddddff,
+            surface: 0x222222ff,
+        });
         assert_eq!(original.prepared_cache_key(), painted.prepared_cache_key());
         assert_eq!(original.shaped_cache_key(), painted.shaped_cache_key());
         assert_eq!(original.layout_cache_key(), painted.layout_cache_key());
-        assert_ne!(original.render_only_cache_key(), painted.render_only_cache_key());
+        assert_ne!(
+            original.render_only_cache_key(),
+            painted.render_only_cache_key()
+        );
         painted.reader_overrides.minimum_font_size = Some(32.0);
         assert_ne!(original.prepared_cache_key(), painted.prepared_cache_key());
     }
@@ -2210,7 +3495,10 @@ mod tests {
             include_str!("../../../testdata/pipeline/paint/07-inline-atomic.html"),
             include_str!("../../../testdata/pipeline/paint/08-linked-table-columns.html"),
         ];
-        let theme = crate::ThemeAdaptation { ink: 0xeeeeeeff, surface: 0x222222ff };
+        let theme = crate::ThemeAdaptation {
+            ink: 0xeeeeeeff,
+            surface: 0x222222ff,
+        };
         for source in sources {
             let mut inputs = base_inputs(source, SourceRevision::INITIAL);
             inputs.layout.viewport_width = 140.0;
@@ -2218,37 +3506,123 @@ mod tests {
             let mut shaper = TracingShaper::default();
             session.update(inputs.clone(), &mut shaper).unwrap();
             let calls = shaper.calls;
-            let line_clips: Vec<_> = session.document().unwrap().render_view().text().lines().iter().map(|line| session.document().unwrap().render_view().text().line_overflow_clip(line.index())).collect();
+
+            let line_clips: Vec<_> = session
+                .document()
+                .unwrap()
+                .render_view(session.glyph_resources())
+                .text()
+                .lines()
+                .iter()
+                .map(|line| {
+                    session
+                        .document()
+                        .unwrap()
+                        .render_view(session.glyph_resources())
+                        .text()
+                        .line_overflow_clip(line.index())
+                })
+                .collect();
             for palette in [
-                crate::ReaderStyleOverrides { foreground: Some(0x123456ff), background: Some(0xeeeeddff), ..Default::default() },
-                crate::ReaderStyleOverrides { theme: Some(theme), link_foreground: Some(0x99aabbff), ..Default::default() },
+                crate::ReaderStyleOverrides {
+                    foreground: Some(0x123456ff),
+                    background: Some(0xeeeeddff),
+                    ..Default::default()
+                },
+                crate::ReaderStyleOverrides {
+                    theme: Some(theme),
+                    link_foreground: Some(0x99aabbff),
+                    ..Default::default()
+                },
                 crate::ReaderStyleOverrides::default(),
             ] {
                 inputs.reader_overrides = palette.clone();
                 let update = session.update(inputs.clone(), &mut shaper).unwrap();
                 assert_eq!(update.stage, EarliestStage::Paint, "{source}");
-                assert_eq!(shaper.calls, calls, "palette changes must not enter shaping");
+                assert_eq!(
+                    shaper.calls, calls,
+                    "palette changes must not enter shaping"
+                );
+
                 let candidate = session.document().unwrap();
                 let mut factory = DocumentFactory::new();
                 factory.set_reader_overrides(palette);
                 let prepared = factory.parse_with_new_pipeline(source, None);
                 let mut reference_shaper = TracingShaper::default();
-                let reference = prepared.shape(&mut reference_shaper).unwrap().layout_with_metrics_and_shaper(to_layout_constraints(inputs.layout).unwrap(), &inputs.image_metrics, &mut reference_shaper).unwrap();
-                let mut actual = build_snapshot(candidate);
-                let mut expected = build_snapshot(&reference);
-                actual.glyphs.clear(); expected.glyphs.clear();
+                let mut reference_resources = GlyphResourceStore::default();
+                let reference = prepared
+                    .shape(&mut reference_shaper, &mut reference_resources)
+                    .unwrap()
+                    .layout_with_metrics_and_shaper(
+                        to_layout_constraints(inputs.layout).unwrap(),
+                        &inputs.image_metrics,
+                        &mut reference_shaper,
+                        &mut reference_resources,
+                    )
+                    .unwrap();
+                let mut actual = build_snapshot((candidate).render_view(session.glyph_resources()));
+                let mut expected = build_snapshot((&reference).render_view(&reference_resources));
+                actual.glyphs.clear();
+                expected.glyphs.clear();
                 assert_eq!(actual, expected, "full-cascade paint parity: {source}");
-                let decorations = |doc: &LaidOutDocument| doc.render_view().fragments().decorations().iter().map(|decoration| format!("{decoration:?}")).collect::<Vec<_>>();
-                assert_eq!(decorations(candidate), decorations(&reference), "decoration clips, patterns and layers: {source}");
-                assert_eq!(candidate.render_view().canvas_background_color(), reference.render_view().canvas_background_color());
-                let text = candidate.render_view().text();
-                assert_eq!((0..text.line_count()).map(|index| text.line_overflow_clip(index)).collect::<Vec<_>>(), line_clips);
+                let decorations = |view: crate::engine::RenderView<'_>| {
+                    view.fragments()
+                        .decorations()
+                        .iter()
+                        .map(|decoration| format!("{decoration:?}"))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(
+                    decorations(candidate.render_view(session.glyph_resources())),
+                    decorations(reference.render_view(&reference_resources)),
+                    "decoration clips, patterns and layers: {source}"
+                );
+                assert_eq!(
+                    candidate
+                        .render_view(session.glyph_resources())
+                        .canvas_background_color(),
+                    reference
+                        .render_view(&reference_resources)
+                        .canvas_background_color()
+                );
+                let text = candidate.render_view(session.glyph_resources()).text();
+                assert_eq!(
+                    (0..text.line_count())
+                        .map(|index| text.line_overflow_clip(index))
+                        .collect::<Vec<_>>(),
+                    line_clips
+                );
                 for index in 0..text.glyph_count() {
                     let actual_glyph = text.glyph_at(index).unwrap();
-                    let actual_color = text.paint_color_at(index as u32).unwrap_or_else(|| shaper.cache.iter().find_map(|(&(character, _, color), &glyph)| (glyph == actual_glyph && text.glyph_metric(glyph).is_some_and(|metric| metric.ch() == character)).then_some(color)).unwrap());
-                    let expected_glyph = reference.render_view().text().glyph_at(index).unwrap();
-                    let expected_color = reference_shaper.cache.iter().find_map(|(&(_, _, color), &glyph)| (glyph == expected_glyph).then_some(color)).unwrap();
-                    assert_eq!(actual_color, expected_color, "effective glyph color at {index}: {source}");
+                    let actual_color = text.paint_color_at(index as u32).unwrap_or_else(|| {
+                        shaper
+                            .cache
+                            .iter()
+                            .find_map(|(&(character, _, color), &glyph)| {
+                                (glyph == actual_glyph
+                                    && text
+                                        .glyph_metric(glyph)
+                                        .is_some_and(|metric| metric.ch() == character))
+                                .then_some(color)
+                            })
+                            .unwrap()
+                    });
+                    let expected_glyph = reference
+                        .render_view(&reference_resources)
+                        .text()
+                        .glyph_at(index)
+                        .unwrap();
+                    let expected_color = reference_shaper
+                        .cache
+                        .iter()
+                        .find_map(|(&(_, _, color), &glyph)| {
+                            (glyph == expected_glyph).then_some(color)
+                        })
+                        .unwrap();
+                    assert_eq!(
+                        actual_color, expected_color,
+                        "effective glyph color at {index}: {source}"
+                    );
                 }
             }
         }
@@ -2258,31 +3632,67 @@ mod tests {
     fn excluded_notes_keep_link_paint_bindings_for_non_box_table_styles() {
         let source = "<p>Main flow without links</p><aside id='n' epub:type='footnote'><a href='x'><table><colgroup style='background:currentColor'><col></colgroup><tr><td>note</td></tr></table></a></aside>";
         for palette in [
-            crate::ReaderStyleOverrides { foreground: Some(0x123456ff), ..Default::default() },
-            crate::ReaderStyleOverrides { link_foreground: Some(0x99aabbff), ..Default::default() },
+            crate::ReaderStyleOverrides {
+                foreground: Some(0x123456ff),
+                ..Default::default()
+            },
+            crate::ReaderStyleOverrides {
+                link_foreground: Some(0x99aabbff),
+                ..Default::default()
+            },
         ] {
             let mut inputs = base_inputs(source, SourceRevision::INITIAL);
-            inputs.note_flow = html_layout::NoteFlow::Excluded;
+            inputs.note_flow = crate::engine::NoteFlow::Excluded;
             let mut session = PipelineSession::new(Arc::new(MockProvider));
             let mut shaper = TracingShaper::default();
             session.update(inputs.clone(), &mut shaper).unwrap();
             inputs.reader_overrides = palette.clone();
-            assert_eq!(session.update(inputs, &mut shaper).unwrap().stage, EarliestStage::Paint);
-            let constraints = html_layout::LayoutConstraints::new(200.0, 20.0).unwrap();
+            assert_eq!(
+                session.update(inputs, &mut shaper).unwrap().stage,
+                EarliestStage::Paint
+            );
+            let constraints = crate::engine::LayoutConstraints::new(200.0, 20.0).unwrap();
             let note = session.layout_note("n", constraints, &mut shaper).unwrap();
             let mut factory = DocumentFactory::new();
             factory.set_reader_overrides(palette.clone());
-            let prepared = factory.parse_with_new_pipeline(source, None).scoped_to_element_id("n").unwrap();
+            let root = factory.parse_with_new_pipeline(source, None);
+            let prepared = root.scoped_to_element_id("n").unwrap();
             let mut reference_shaper = TracingShaper::default();
-            let reference = prepared.shape(&mut reference_shaper).unwrap().layout(constraints);
-            let mut actual = build_snapshot(&note);
-            let mut expected = build_snapshot(&reference);
-            actual.glyphs.clear(); expected.glyphs.clear();
+            let mut reference_resources = GlyphResourceStore::default();
+            let reference = prepared
+                .shape(&mut reference_shaper, &mut reference_resources)
+                .unwrap()
+                .layout(constraints, &reference_resources)
+                .expect("layout requires the shaper-aware API for first-line styles");
+
+            let mut actual = build_snapshot(
+                note.render_view(session.document().unwrap(), session.glyph_resources())
+                    .unwrap(),
+            );
+            let mut expected = build_snapshot((&reference).render_view(&reference_resources));
+            actual.glyphs.clear();
+            expected.glyphs.clear();
             assert_eq!(actual, expected);
-            let decorations = |doc: &LaidOutDocument| doc.render_view().fragments().decorations().iter().map(|decoration| format!("{decoration:?}")).collect::<Vec<_>>();
-            assert_eq!(decorations(&note), decorations(&reference));
+            let decorations = |view: crate::engine::RenderView<'_>| {
+                view.fragments()
+                    .decorations()
+                    .iter()
+                    .map(|decoration| format!("{decoration:?}"))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                decorations(
+                    note.render_view(session.document().unwrap(), session.glyph_resources())
+                        .unwrap()
+                ),
+                decorations(reference.render_view(&reference_resources))
+            );
             let expected_color = palette.link_foreground.or(palette.foreground).unwrap();
-            let text = note.render_view().text();
+
+            let text = note
+                .render_view(session.document().unwrap(), session.glyph_resources())
+                .unwrap()
+                .text();
             for index in 0..text.glyph_count() {
                 assert_eq!(text.paint_color_at(index as u32), Some(expected_color));
             }
@@ -2291,7 +3701,10 @@ mod tests {
 
     #[test]
     fn simultaneous_width_and_paint_changes_retarget_the_retained_layout() {
-        let mut inputs = base_inputs("<p><a href='x'>some linked words that wrap across lines</a></p>", SourceRevision::INITIAL);
+        let mut inputs = base_inputs(
+            "<p><a href='x'>some linked words that wrap across lines</a></p>",
+            SourceRevision::INITIAL,
+        );
         let mut session = PipelineSession::new(Arc::new(MockProvider));
         let mut shaper = TracingShaper::default();
         session.update(inputs.clone(), &mut shaper).unwrap();
@@ -2299,15 +3712,84 @@ mod tests {
         inputs.layout.viewport_width = 10.0;
         inputs.reader_overrides.foreground = Some(0xabcdef88);
         inputs.reader_overrides.link_foreground = Some(0x998877ff);
-        assert_eq!(session.update(inputs.clone(), &mut shaper).unwrap().stage, EarliestStage::Layout);
+        assert_eq!(
+            session.update(inputs.clone(), &mut shaper).unwrap().stage,
+            EarliestStage::Layout
+        );
         assert_eq!(shaper.calls, calls);
+
         let doc = session.document().unwrap();
-        let text = doc.render_view().text();
+        let text = doc.render_view(session.glyph_resources()).text();
         assert!(text.line_count() > 1);
         assert_eq!(text.paint_color_at(0), Some(0x998877ff));
         let mut fresh = PipelineSession::new(Arc::new(MockProvider));
         fresh.update(inputs, &mut TracingShaper::default()).unwrap();
-        assert_eq!(build_snapshot(doc), build_snapshot(fresh.document().unwrap()));
+        assert_eq!(
+            build_snapshot((doc).render_view(session.glyph_resources())),
+            build_snapshot((fresh.document().unwrap()).render_view(fresh.glyph_resources()))
+        );
+    }
+
+    #[test]
+    fn paragraph_controls_match_fresh_cascades_and_restore_book_layout() {
+        use html_dom::RootFontSize;
+        for source in [
+            "<html><body style='margin:0;font-size:1.29167em'><span style='font-size:0.77419em'>An opening passage outside a paragraph.</span><p style='margin:1em 0;text-indent:7%'><span style='font-size:0.77419em'>Words that wrap across several lines for paragraph controls.</span></p><p style='font-size:12px;margin:8px 0'>Another paragraph follows the first.</p></body></html>",
+            "<html><body style='margin:0;font-size:1.29167em;text-indent:7%;text-align:justify'><div><span style='font-size:.77419em'>An opening passage with enough words to wrap.<br><br>A second passage with more words for wrapping.</span><br> <br>A final passage.</div></body></html>",
+        ] {
+            let mut inputs = base_inputs(source, SourceRevision::INITIAL);
+            inputs.layout.viewport_width = 100.0;
+            inputs.style_environment.root_font_size = 24;
+            inputs.layout.line_height = 24.0;
+            inputs.reader_overrides.canonical_font_size = Some(16.0);
+            let mut session = PipelineSession::new(Arc::new(MockProvider));
+            let mut shaper = SizedShaper::default();
+            session.update(inputs.clone(), &mut shaper).unwrap();
+            let snapshot = |document: crate::RenderView<'_>| {
+                let mut snapshot = build_snapshot(document);
+                snapshot.glyphs.clear();
+                snapshot
+            };
+
+            let book = snapshot(session.render_view().unwrap());
+            for (spacing, indent) in [
+                (Some(0.7), Some(1.5)),
+                (Some(0.0), None),
+                (None, Some(0.0)),
+                (None, None),
+            ] {
+                inputs.reader_overrides.paragraph_spacing_em = spacing;
+                inputs.reader_overrides.first_line_indent_em = indent;
+                let update = session.update(inputs.clone(), &mut shaper).unwrap();
+                assert_eq!(update.stage, EarliestStage::Prepare);
+                for width in [100.0, 140.0, 100.0] {
+                    inputs.layout.viewport_width = width;
+                    session.update(inputs.clone(), &mut shaper).unwrap();
+                    let mut factory = DocumentFactory::new();
+                    factory.set_root_font_size(RootFontSize::new(24.0).unwrap());
+                    factory.set_reader_overrides(inputs.reader_overrides.clone());
+                    let prepared = factory.parse_with_new_pipeline(source, None);
+                    let mut reference_shaper = SizedShaper::default();
+                    let mut reference_resources = GlyphResourceStore::default();
+                    let reference = prepared
+                        .shape(&mut reference_shaper, &mut reference_resources)
+                        .unwrap()
+                        .layout_with_metrics_and_shaper(
+                            to_layout_constraints(inputs.layout).unwrap(),
+                            &inputs.image_metrics,
+                            &mut reference_shaper,
+                            &mut reference_resources,
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        snapshot(session.render_view().unwrap()),
+                        snapshot(reference.render_view(&reference_resources)),
+                        "cached/fresh mismatch for spacing {spacing:?}, indentation {indent:?}, width {width}"
+                    );
+                }
+            }
+            assert_eq!(snapshot(session.render_view().unwrap()), book);
+        }
     }
 
     #[test]
@@ -2319,7 +3801,9 @@ mod tests {
             SourceRevision::INITIAL,
         );
         session.update(inputs.clone(), &mut shaper).unwrap();
-        let baseline = build_snapshot(session.document().unwrap());
+
+        let baseline =
+            build_snapshot((session.document().unwrap()).render_view(session.glyph_resources()));
 
         inputs.reader_overrides = crate::ReaderStyleOverrides {
             font_family: Some("serif".to_owned()),
@@ -2332,10 +3816,13 @@ mod tests {
             background: Some(0xfefefeff),
             strip_root_spacing: false,
             theme: None,
+            ..Default::default()
         };
         assert!(inputs.user_styles.is_empty());
         let update = session.update(inputs, &mut shaper).unwrap();
-        let overridden = build_snapshot(session.document().unwrap());
+
+        let overridden =
+            build_snapshot((session.document().unwrap()).render_view(session.glyph_resources()));
 
         assert_eq!(update.stage, EarliestStage::Prepare);
         assert_ne!(baseline, overridden);
@@ -2361,9 +3848,10 @@ mod tests {
         session
             .update(update_inputs.clone(), &mut shaper)
             .expect("baseline update should succeed");
+
         let baseline = {
             let document = session.document().expect("document should exist");
-            build_snapshot(document)
+            build_snapshot((document).render_view(session.glyph_resources()))
         };
 
         provider.put_bytes("style.css", b"p { font-size: 36px; }".to_vec());
@@ -2373,10 +3861,14 @@ mod tests {
             .update(update_inputs.clone(), &mut shaper)
             .expect("style replacement update should succeed");
         assert_eq!(style_update.stage, EarliestStage::Prepare);
-        assert_eq!(style_update.report.styled, Reuse::recomputed(EarliestStage::Prepare));
+        assert_eq!(
+            style_update.report.styled,
+            Reuse::recomputed(EarliestStage::Prepare)
+        );
+
         let replaced = {
             let document = session.document().expect("document should exist");
-            build_snapshot(document)
+            build_snapshot((document).render_view(session.glyph_resources()))
         };
         assert_ne!(baseline, replaced);
 
@@ -2387,9 +3879,10 @@ mod tests {
             .update(update_inputs, &mut shaper)
             .expect("stylesheet restoration update should succeed");
         assert_eq!(restore.stage, EarliestStage::Prepare);
+
         let restored = {
             let document = session.document().expect("document should exist");
-            build_snapshot(document)
+            build_snapshot((document).render_view(session.glyph_resources()))
         };
         assert_eq!(restore.report.parsed, Reuse::reused(EarliestStage::Prepare));
         assert_eq!(baseline, restored);
@@ -2422,11 +3915,11 @@ mod tests {
         assert_eq!(next.earliest_stage(&previous), EarliestStage::Layout);
 
         let mut next = previous.clone();
-        next.layout.image_sizing_policy = html_layout::ImageSizingPolicy::SmartStandalone;
+        next.layout.image_sizing_policy = crate::engine::ImageSizingPolicy::SmartStandalone;
         assert_eq!(next.earliest_stage(&previous), EarliestStage::Layout);
 
         let mut next = previous.clone();
-        next.layout.text_composition_policy = html_layout::TextCompositionPolicy::BookOptimized;
+        next.layout.text_composition_policy = crate::engine::TextCompositionPolicy::BookOptimized;
         assert_eq!(next.earliest_stage(&previous), EarliestStage::Layout);
 
         let mut next = previous.clone();
@@ -2467,8 +3960,8 @@ mod tests {
                     viewport_width: 600.0,
                     viewport_height: None,
                     line_height: 20.0,
-                    image_sizing_policy: html_layout::ImageSizingPolicy::WebCompatible,
-                    text_composition_policy: html_layout::TextCompositionPolicy::WebCompatible,
+                    image_sizing_policy: crate::engine::ImageSizingPolicy::WebCompatible,
+                    text_composition_policy: crate::engine::TextCompositionPolicy::WebCompatible,
                 }),
                 EarliestStage::Layout,
             ),
@@ -2492,7 +3985,10 @@ mod tests {
 
         let mut different_source = inputs.clone();
         different_source.source = "<html><body><p>y</p></body></html>".into();
-        assert_ne!(different_source, inputs, "source text must remain part of input identity even when its revision is unchanged");
+        assert_ne!(
+            different_source, inputs,
+            "source text must remain part of input identity even when its revision is unchanged"
+        );
 
         let mut different_base = inputs.clone();
         different_base.base_uri = "other/chapter.xhtml".to_owned();
@@ -2518,7 +4014,7 @@ mod tests {
 
         let document = session.document().expect("laid out document");
         let green = document
-            .render_view()
+            .render_view(session.glyph_resources())
             .fragments()
             .decorations()
             .iter()
@@ -2531,7 +4027,7 @@ mod tests {
             "auto-z absolute and relative boxes share the source-ordered positioned stream"
         );
         assert!(green.line_idx().is_none());
-        let root = document.render_view();
+        let root = document.render_view(session.glyph_resources());
         let images = root.fragments().images().iter().collect::<Vec<_>>();
         assert!(
             !images.is_empty(),

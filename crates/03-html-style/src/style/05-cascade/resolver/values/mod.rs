@@ -6,17 +6,15 @@ mod colors;
 mod font_features;
 mod fonts;
 mod grid;
+mod integers;
 mod lengths;
 mod lists;
 
 pub(super) use colors::*;
-pub(crate) use font_features::parse_font_kerning;
-pub(super) use font_features::{
-    font_variant_caps_features, parse_font_feature_settings, parse_font_variant_ligatures,
-    parse_font_variant_numeric,
-};
+pub(super) use font_features::{font_variant_caps_features, resolve_font_feature_settings};
 pub(super) use fonts::*;
 pub(super) use grid::*;
+pub(super) use integers::{resolve_integer, resolve_number, resolve_signed_integer};
 pub(super) use lengths::*;
 pub(super) use lists::*;
 
@@ -62,7 +60,7 @@ fn canonical_line_height_components(
     resolution: &ResolutionContext,
 ) -> Option<(f32, f32)> {
     use lightningcss::properties::font::LineHeight;
-    let components = match lh {
+    let mut components = match lh {
         LineHeight::Length(LengthPercentage::Dimension(LengthValue::Ex(value))) => {
             (0.0, value * font_size)
         }
@@ -79,6 +77,9 @@ fn canonical_line_height_components(
             0.0,
         ),
     };
+    if components.1 == 0.0 {
+        components.0 = components.0.max(0.0);
+    }
     (components.0.is_finite()
         && components.0 >= 0.0
         && components.1.is_finite()
@@ -136,15 +137,19 @@ pub(super) fn flex_basis(
 pub(super) fn non_negative_preferred_size(value: PreferredSize) -> Option<PreferredSize> {
     match value {
         PreferredSize::Auto
+        | PreferredSize::Content
         | PreferredSize::MinContent
         | PreferredSize::MaxContent
         | PreferredSize::FitContent
         | PreferredSize::Stretch => Some(value),
-        PreferredSize::Px(value) if value >= 0.0 => Some(PreferredSize::Px(value)),
-        PreferredSize::Percent(value) if value >= 0.0 => Some(PreferredSize::Percent(value)),
-        PreferredSize::Ex(value) if value >= 0.0 => Some(PreferredSize::Ex(value)),
-        PreferredSize::Ch(value) if value >= 0.0 => Some(PreferredSize::Ch(value)),
-        PreferredSize::Cap(value) if value >= 0.0 => Some(PreferredSize::Cap(value)),
+        // Negative literals are rejected before cascade selection. The parser
+        // can fold a negative calculation to a plain dimension, whose computed
+        // value must be clamped rather than exposing a losing declaration.
+        PreferredSize::Px(value) if value.is_finite() => Some(PreferredSize::Px(value.max(0.0))),
+        PreferredSize::Percent(value) if value.is_finite() => Some(PreferredSize::Percent(value.max(0.0))),
+        PreferredSize::Ex(value) if value.is_finite() => Some(PreferredSize::Ex(value.max(0.0))),
+        PreferredSize::Ch(value) if value.is_finite() => Some(PreferredSize::Ch(value.max(0.0))),
+        PreferredSize::Cap(value) if value.is_finite() => Some(PreferredSize::Cap(value.max(0.0))),
         PreferredSize::Calc {
             absolute_px,
             percentage,
@@ -304,6 +309,13 @@ pub(super) fn computed_length_pct(
                     root_font_size,
                     resolution,
                 )?;
+            if !calc_depends_on_percentage(value)
+                && x_height_px == 0.0
+                && ch_advance_px == 0.0
+                && cap_height_px == 0.0
+            {
+                return Some(LengthPct::Px(absolute_px));
+            }
             Some(LengthPct::Calc {
                 absolute_px,
                 percentage,
@@ -648,8 +660,8 @@ pub(super) fn justify_content(
             ContentPosition::FlexStart => ContentAlignment::FlexStart,
             ContentPosition::FlexEnd => ContentAlignment::FlexEnd,
         },
-        JustifyContent::Left { .. } => ContentAlignment::Start,
-        JustifyContent::Right { .. } => ContentAlignment::End,
+        JustifyContent::Left { .. } => ContentAlignment::Left,
+        JustifyContent::Right { .. } => ContentAlignment::Right,
     }
 }
 
@@ -695,6 +707,15 @@ pub(super) fn align_self(
     })
 }
 
+pub(super) fn default_justify_items(parent: ItemAlignment) -> ItemAlignment {
+    match parent {
+        value @ (ItemAlignment::LegacyLeft
+        | ItemAlignment::LegacyRight
+        | ItemAlignment::LegacyCenter) => value,
+        _ => ItemAlignment::Normal,
+    }
+}
+
 pub(super) fn justify_items(
     value: &lightningcss::properties::align::JustifyItems,
 ) -> Option<ItemAlignment> {
@@ -707,9 +728,9 @@ pub(super) fn justify_items(
         JustifyItems::SelfPosition { value, .. } => self_position(value),
         JustifyItems::Left { .. } => ItemAlignment::Left,
         JustifyItems::Right { .. } => ItemAlignment::Right,
-        JustifyItems::Legacy(LegacyJustify::Left) => ItemAlignment::Left,
-        JustifyItems::Legacy(LegacyJustify::Right) => ItemAlignment::Right,
-        JustifyItems::Legacy(LegacyJustify::Center) => ItemAlignment::Center,
+        JustifyItems::Legacy(LegacyJustify::Left) => ItemAlignment::LegacyLeft,
+        JustifyItems::Legacy(LegacyJustify::Right) => ItemAlignment::LegacyRight,
+        JustifyItems::Legacy(LegacyJustify::Center) => ItemAlignment::LegacyCenter,
     })
 }
 
@@ -732,7 +753,7 @@ pub(super) fn justify_self(
 pub(super) fn line_height_number(lh: &lightningcss::properties::font::LineHeight) -> f32 {
     use lightningcss::properties::font::LineHeight;
     match lh {
-        LineHeight::Number(n) => *n,
+        LineHeight::Number(n) => n.max(0.0),
         _ => 0.0,
     }
 }

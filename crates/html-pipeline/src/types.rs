@@ -1,6 +1,6 @@
-use html_layout::ImageMetrics;
+use crate::engine::ImageMetrics;
 use std::fmt;
-use std::sync::Arc;
+use std::mem::swap;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PipelineChange {
@@ -244,8 +244,8 @@ pub struct LayoutConstraints {
     pub viewport_width: f64,
     pub viewport_height: Option<f64>,
     pub line_height: f64,
-    pub image_sizing_policy: html_layout::ImageSizingPolicy,
-    pub text_composition_policy: html_layout::TextCompositionPolicy,
+    pub image_sizing_policy: crate::engine::ImageSizingPolicy,
+    pub text_composition_policy: crate::engine::TextCompositionPolicy,
 }
 
 impl Eq for LayoutConstraints {}
@@ -323,17 +323,19 @@ impl Default for ReuseReport {
     }
 }
 
+/// Complete owned inputs for loading or replacing a document. Once submitted,
+/// borrow them through the session and use [`PipelineChanges`] for updates.
 #[derive(Clone, Debug)]
 pub struct PipelineInputs {
-    /// Immutable chapter text shared by updates and cached snapshots.
-    pub source: Arc<str>,
+    /// Source text owned by the session after preparation or a successful update.
+    pub source: String,
     pub markup_syntax: html_parse::MarkupSyntax,
     /// Reader-authored CSS applied after the publication stylesheets.
     pub user_styles: Vec<String>,
-    pub reader_overrides: html_layout::ReaderStyleOverrides,
+    pub reader_overrides: crate::engine::ReaderStyleOverrides,
     /// Whether note bodies generate boxes. Changing it rebuilds the prepared
     /// stage, since it decides box generation rather than geometry.
-    pub note_flow: html_layout::NoteFlow,
+    pub note_flow: crate::engine::NoteFlow,
     pub source_revision: SourceRevision,
     pub base_uri: String,
     pub resource_revision: ResourceRevision,
@@ -344,6 +346,98 @@ pub struct PipelineInputs {
     pub layout: LayoutConstraints,
     pub image_metrics: ImageMetrics,
     pub paint: PaintSettingsRevision,
+}
+
+/// Proposed changes to an existing session. Omitted fields keep their values.
+///
+/// Values move into the session on success. Failed updates restore the previous
+/// inputs without cloning the source, stylesheets, or image metrics.
+#[derive(Debug, Default)]
+pub struct PipelineChanges {
+    pub source: Option<String>,
+    pub markup_syntax: Option<html_parse::MarkupSyntax>,
+    pub user_styles: Option<Vec<String>>,
+    pub reader_overrides: Option<crate::engine::ReaderStyleOverrides>,
+    pub note_flow: Option<crate::engine::NoteFlow>,
+    pub source_revision: Option<SourceRevision>,
+    pub base_uri: Option<String>,
+    pub resource_revision: Option<ResourceRevision>,
+    pub stylesheet_revision: Option<StylesheetRevision>,
+    pub style_environment: Option<StyleEnvironment>,
+    pub font_environment: Option<FontEnvironmentRevision>,
+    pub image_metrics_revision: Option<ImageMetricsRevision>,
+    pub layout: Option<LayoutConstraints>,
+    pub image_metrics: Option<ImageMetrics>,
+    pub paint: Option<PaintSettingsRevision>,
+}
+
+impl PipelineChanges {
+    pub fn is_empty(&self) -> bool {
+        self.source.is_none()
+            && self.markup_syntax.is_none()
+            && self.user_styles.is_none()
+            && self.reader_overrides.is_none()
+            && self.note_flow.is_none()
+            && self.source_revision.is_none()
+            && self.base_uri.is_none()
+            && self.resource_revision.is_none()
+            && self.stylesheet_revision.is_none()
+            && self.style_environment.is_none()
+            && self.font_environment.is_none()
+            && self.image_metrics_revision.is_none()
+            && self.layout.is_none()
+            && self.image_metrics.is_none()
+            && self.paint.is_none()
+    }
+
+    /// Swapping a second time restores every changed field after failure.
+    pub(crate) fn swap_with(&mut self, inputs: &mut PipelineInputs) {
+        if let Some(value) = &mut self.source {
+            swap(value, &mut inputs.source);
+        }
+        if let Some(value) = &mut self.markup_syntax {
+            swap(value, &mut inputs.markup_syntax);
+        }
+        if let Some(value) = &mut self.user_styles {
+            swap(value, &mut inputs.user_styles);
+        }
+        if let Some(value) = &mut self.reader_overrides {
+            swap(value, &mut inputs.reader_overrides);
+        }
+        if let Some(value) = &mut self.note_flow {
+            swap(value, &mut inputs.note_flow);
+        }
+        if let Some(value) = &mut self.source_revision {
+            swap(value, &mut inputs.source_revision);
+        }
+        if let Some(value) = &mut self.base_uri {
+            swap(value, &mut inputs.base_uri);
+        }
+        if let Some(value) = &mut self.resource_revision {
+            swap(value, &mut inputs.resource_revision);
+        }
+        if let Some(value) = &mut self.stylesheet_revision {
+            swap(value, &mut inputs.stylesheet_revision);
+        }
+        if let Some(value) = &mut self.style_environment {
+            swap(value, &mut inputs.style_environment);
+        }
+        if let Some(value) = &mut self.font_environment {
+            swap(value, &mut inputs.font_environment);
+        }
+        if let Some(value) = &mut self.image_metrics_revision {
+            swap(value, &mut inputs.image_metrics_revision);
+        }
+        if let Some(value) = &mut self.layout {
+            swap(value, &mut inputs.layout);
+        }
+        if let Some(value) = &mut self.image_metrics {
+            swap(value, &mut inputs.image_metrics);
+        }
+        if let Some(value) = &mut self.paint {
+            swap(value, &mut inputs.paint);
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -360,8 +454,8 @@ pub struct PreparedCacheKey {
     pub stylesheet_revision: StylesheetRevision,
     pub style_environment: StyleCacheEnvironment,
     pub user_styles: Vec<String>,
-    pub reader_overrides: html_layout::ReaderStyleOverrides,
-    pub note_flow: html_layout::NoteFlow,
+    pub reader_overrides: crate::engine::ReaderStyleOverrides,
+    pub note_flow: crate::engine::NoteFlow,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -381,14 +475,13 @@ pub struct LayoutCacheKey {
 pub struct RenderOnlyCacheKey {
     pub layout: LayoutCacheKey,
     pub paint: PaintSettingsRevision,
-    pub reader_paint: html_layout::ReaderStyleOverrides,
+    pub reader_paint: crate::engine::ReaderStyleOverrides,
 }
 
 impl PipelineInputs {
-    /// Shared chapters compare in constant time; independent allocations retain
-    /// value equality so replacing text without a revision still invalidates it.
+    /// Replacing source without advancing its revision still invalidates it.
     pub fn same_source(&self, other: &Self) -> bool {
-        Arc::ptr_eq(&self.source, &other.source) || self.source == other.source
+        self.source == other.source
     }
 
     pub fn change_mask(&self, previous: &Self) -> PipelineChangeMask {

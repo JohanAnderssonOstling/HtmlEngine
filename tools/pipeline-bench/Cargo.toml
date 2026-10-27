@@ -1,4 +1,5 @@
 [package]
+license = "GPL-3.0-or-later"
 name = "pipeline-bench"
 version = "0.1.0"
 edition = "2024"
@@ -7,6 +8,7 @@ edition = "2024"
 # Disable default features only when building the frozen pre-ownership engine.
 default = ["borrowed-view"]
 heap = []
+profiling = ["html/profiling"]
 borrowed-view = []
 [dependencies]
 html = { package = "html-engine", path = "../../crates/html" }

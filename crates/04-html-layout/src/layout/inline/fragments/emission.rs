@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::layout_model::GroupedArena;
+use html_style_model::UsedPreferredSize;
 
 /// Records independently positioned text fragments only for lines where
 /// replaced inline content interrupts the source text. Text-only lines keep
@@ -11,6 +12,7 @@ pub(super) fn positioned_text_fragments(
     placements: &[TokenPlacement],
     runs: &[InlineTokenMetrics],
 ) -> Option<Box<[LineTextFragment]>> {
+    profile_scope!("fragments.positioned_text");
     let mut expected_glyph = None;
     let split = span.iter().any(|token| {
         let discontinuous = match token.kind() {
@@ -22,6 +24,7 @@ pub(super) fn positioned_text_fragments(
             _ => false,
         };
         discontinuous
+            || token.bidi_level() % 2 == 1
             || matches!(
                 token.kind(),
                 InlineTokenKind::Image { .. }
@@ -38,25 +41,35 @@ pub(super) fn positioned_text_fragments(
     let mut fragments = Vec::<LineTextFragment>::new();
     let mut current_fragment: Option<usize> = None;
     let mut current_run_idx = None;
+    let mut current_level = None;
+    let mut previous_end = 0.0;
     for (paint_order, (token, placement)) in span.iter().zip(placements).enumerate() {
         if let InlineTokenKind::Glyph { glyph_idx } = token.kind() {
             if let Some(index) = current_fragment
                 && fragments[index].glyphs.end == glyph_idx
-                && current_run_idx == Some(token.run_idx)
+                && current_run_idx == Some(token.run_idx())
+                && current_level == Some(token.bidi_level())
                 && fragments[index].visible == token.run_metrics(runs).visible
                 && !token.run_metrics(runs).placement_required
+                && ((!token.is_cluster_boundary())
+                    || (token.bidi_level() % 2 == 0 && (placement.x - previous_end).abs() < 0.001))
             {
                 fragments[index].glyphs.end += 1;
+                fragments[index].offset_x = fragments[index].offset_x.min(placement.x + placement.relative_offset.x);
+                previous_end = placement.x + placement.advance;
                 continue;
             }
             fragments.push(LineTextFragment {
                 glyphs: glyph_idx..glyph_idx + 1,
                 offset_x: placement.x + placement.relative_offset.x,
+                rtl: token.bidi_level() % 2 == 1,
                 paint_order: paint_order as u32,
                 visible: token.run_metrics(runs).visible,
             });
             current_fragment = Some(fragments.len() - 1);
-            current_run_idx = Some(token.run_idx);
+            current_run_idx = Some(token.run_idx());
+            current_level = Some(token.bidi_level());
+            previous_end = placement.x + placement.advance;
         } else {
             current_fragment = None;
             current_run_idx = None;
@@ -80,6 +93,7 @@ pub(super) fn positioned_inline_box_fragments(
         engine,
         container_box_idx,
         span.iter().zip(placements.iter().copied()),
+        span.iter().any(|token| token.bidi_level() % 2 == 1),
         runs,
         replaced,
         line_height,
@@ -98,9 +112,10 @@ fn positioned_plain_inline_box_fragments(
     baseline: f64,
     containing_width: f64,
 ) -> Vec<LineInlineBoxFragment> {
+    profile_scope!("fragments.plain_inline_boxes");
     let mut x = 0.0;
     let placements = span.iter().map(|token| {
-        let advance = token.advance_at(runs, x);
+        let advance = token.advance_at(&engine.reader, runs, x);
         let placement = TokenPlacement {
             x,
             advance,
@@ -114,6 +129,7 @@ fn positioned_plain_inline_box_fragments(
         engine,
         container_box_idx,
         placements,
+        false,
         runs,
         replaced,
         line_height,
@@ -122,21 +138,111 @@ fn positioned_plain_inline_box_fragments(
     )
 }
 
+#[derive(Clone, Copy)]
+struct InlineFragmentAncestor {
+    box_idx: usize,
+    relative_offset: Vec2,
+    baseline: f32,
+    content_bounds: Option<(f32, f32)>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_inline_fragment_ancestors(
+    engine: &crate::layout::LayoutEngine<'_, '_>,
+    container_box_idx: usize,
+    mut owner: Option<usize>,
+    line_height: f64,
+    baseline: f64,
+    containing_width: f64,
+    ancestors: &mut Vec<InlineFragmentAncestor>,
+) {
+    profile_scope!("fragments.resolve_ancestors");
+    ancestors.clear();
+    let mut outside_formatting_context = false;
+    while let Some(box_idx) = owner {
+        let is_inline = matches!(
+            engine.reader.box_layout_mode(box_idx), Some(LayoutMode::Inline(_))
+        );
+        let has_propagated_decoration = !engine.reader.style(box_idx)
+            .text_decoration_lines().is_empty();
+        if (!outside_formatting_context && is_inline) || has_propagated_decoration {
+            let relative_offset =
+                inline_relative_position_offset(engine, box_idx, containing_width);
+            let fragment_baseline = (baseline
+                - inline_fragment_vertical_align_offset(engine, box_idx, line_height, baseline)
+                + relative_offset.y) as f32;
+            // CSS 2.1 defines a non-replaced inline's vertical padding,
+            // border, and margin edges from its content box. Half-leading
+            // participates in line-box height, but is not part of that
+            // content box. Use the decorating inline's own font metrics so
+            // descendants with a different font do not resize its border.
+            let content_bounds = if is_inline {
+                let style = engine.reader.style(box_idx);
+                let font_size = style.font_size() as f64;
+                let font_metrics = engine.reader.font_metrics(box_idx);
+                let (ascent, descent) = font_metrics
+                    .line_box_ratios()
+                    .map_or((font_size * 0.8, font_size * 0.2), |(ascent, descent)| {
+                        (font_size * ascent as f64, font_size * descent as f64)
+                    });
+                let mut top = fragment_baseline - ascent as f32;
+                let mut bottom = fragment_baseline + descent as f32;
+                let trim = style.text_box_trim();
+                let edge = style.text_box_edge();
+                if matches!(trim, TextBoxTrim::Start | TextBoxTrim::Both) {
+                    top = match edge.over {
+                        TextBoxOverEdge::Text => top,
+                        TextBoxOverEdge::Cap => {
+                            fragment_baseline
+                                - font_size as f32 * font_metrics.cap_height_ratio()
+                        }
+                        TextBoxOverEdge::Ex => {
+                            fragment_baseline - font_size as f32 * font_metrics.x_height_ratio()
+                        }
+                    };
+                }
+                if matches!(trim, TextBoxTrim::End | TextBoxTrim::Both)
+                    && matches!(edge.under, TextBoxUnderEdge::Alphabetic)
+                {
+                    bottom = fragment_baseline;
+                }
+                Some((top, bottom))
+            } else {
+                None
+            };
+            ancestors.push(InlineFragmentAncestor {
+                box_idx, relative_offset, baseline: fragment_baseline, content_bounds,
+            });
+        }
+        if stops_text_decoration_propagation(engine, box_idx) {
+            break;
+        }
+        if box_idx == container_box_idx {
+            outside_formatting_context = true;
+        }
+        owner = engine.reader.get_parent(box_idx);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn positioned_inline_box_fragments_from<'a>(
     engine: &crate::layout::LayoutEngine<'_, '_>,
     container_box_idx: usize,
     placements: impl IntoIterator<Item = (&'a InlineToken, TokenPlacement)>,
+    bidi: bool,
     runs: &[InlineTokenMetrics],
     replaced: &[ReplacedToken],
     line_height: f64,
     baseline: f64,
     containing_width: f64,
 ) -> Vec<LineInlineBoxFragment> {
+    profile_scope!("fragments.positioned_inline_boxes");
     // A line normally intersects only a handful of inline boxes. A compact
     // linear accumulator beats allocating a box-count-sized side table for
     // every line while still publishing one durable fragment per owner.
     let mut bounds = Vec::<LineInlineBoxFragment>::new();
+    let mut cached_owner = None;
+    let mut ancestors = Vec::new();
     for (paint_order, (token, placement)) in placements.into_iter().enumerate() {
         let paint_order = paint_order as u32;
         if placement.advance <= 0.0
@@ -196,7 +302,7 @@ fn positioned_inline_box_fragments_from<'a>(
             },
             _ => None,
         };
-        let mut owner = match token.kind() {
+        let owner = match token.kind() {
             // Replaced and atomic boxes paint themselves. Their occupied span
             // contributes to enclosing inline fragments, starting at parent.
             InlineTokenKind::Image { payload_idx } => match replaced.get(payload_idx as usize) {
@@ -217,124 +323,79 @@ fn positioned_inline_box_fragments_from<'a>(
             _ => (token.run_metrics(runs).owner_box_idx != u32::MAX)
                 .then_some(token.run_metrics(runs).owner_box_idx as usize),
         };
-        let mut outside_formatting_context = false;
-        while let Some(box_idx) = owner {
-            let is_inline = matches!(
-                engine.reader.box_layout_mode(box_idx),
-                Some(LayoutMode::Inline(_))
+        // Consecutive tokens usually share an owner. Resolve its ancestry and
+        // line-relative inline geometry once; block decoration extents still
+        // use each token's own ascent, descent, and placement below.
+        if cached_owner != Some(owner) {
+            resolve_inline_fragment_ancestors(
+                engine, container_box_idx, owner, line_height, baseline,
+                containing_width, &mut ancestors,
             );
-            let has_propagated_decoration = !engine
-                .reader
-                .style(box_idx)
-                .text_decoration_lines()
-                .is_empty();
-            if (!outside_formatting_context && is_inline) || has_propagated_decoration {
-                let relative_offset =
-                    inline_relative_position_offset(engine, box_idx, containing_width);
-                let fragment_baseline = (baseline
-                    - inline_fragment_vertical_align_offset(engine, box_idx, line_height, baseline)
-                    + relative_offset.y) as f32;
-                // CSS 2.1 defines a non-replaced inline's vertical padding,
-                // border, and margin edges from its content box. Half-leading
-                // participates in line-box height, but is not part of that
-                // content box. Use the decorating inline's own font metrics so
-                // descendants with a different font do not resize its border.
-                let (fragment_top, fragment_bottom) = if is_inline {
-                    let style = engine.reader.style(box_idx);
-                    let font_size = style.font_size() as f64;
-                    let font_metrics = engine.reader.font_metrics(box_idx);
-                    let (ascent, descent) = font_metrics
-                        .line_box_ratios()
-                        .map_or((font_size * 0.8, font_size * 0.2), |(ascent, descent)| {
-                            (font_size * ascent as f64, font_size * descent as f64)
-                        });
-                    let mut top = fragment_baseline - ascent as f32;
-                    let mut bottom = fragment_baseline + descent as f32;
-                    let trim = style.text_box_trim();
-                    let edge = style.text_box_edge();
-                    if matches!(trim, TextBoxTrim::Start | TextBoxTrim::Both) {
-                        top = match edge.over {
-                            TextBoxOverEdge::Text => top,
-                            TextBoxOverEdge::Cap => {
-                                fragment_baseline
-                                    - font_size as f32 * font_metrics.cap_height_ratio()
-                            }
-                            TextBoxOverEdge::Ex => {
-                                fragment_baseline - font_size as f32 * font_metrics.x_height_ratio()
-                            }
-                        };
-                    }
-                    if matches!(trim, TextBoxTrim::End | TextBoxTrim::Both)
-                        && matches!(edge.under, TextBoxUnderEdge::Alphabetic)
-                    {
-                        bottom = fragment_baseline;
-                    }
-                    (top, bottom)
-                } else {
-                    (token_top, token_bottom)
-                };
-                let own_boundary = boundary.filter(|boundary| boundary.0 == box_idx);
-                let fragment_start = (own_boundary.map_or(placement.x, |boundary| boundary.1)
-                    + relative_offset.x) as f32;
-                let fragment_end = (own_boundary
-                    .map_or(placement.x + placement.advance, |boundary| boundary.1)
-                    + relative_offset.x) as f32;
-                if let Some(fragment) = bounds
-                    .iter_mut()
-                    .find(|fragment| fragment.box_idx as usize == box_idx)
-                {
-                    fragment.paint_order = fragment.paint_order.min(paint_order);
-                    fragment.start_x = fragment.start_x.min(fragment_start);
-                    fragment.end_x = fragment.end_x.max(fragment_end);
-                    fragment.top = fragment.top.min(fragment_top);
-                    fragment.bottom = fragment.bottom.max(fragment_bottom);
-                    if let Some((_, _, inline_start, inline_end)) = own_boundary {
-                        fragment.flags |= if inline_start {
-                            LineInlineBoxFragment::INLINE_START
-                        } else {
-                            0
-                        } | if inline_end {
-                            LineInlineBoxFragment::INLINE_END
-                        } else {
-                            0
-                        };
-                    }
-                } else {
-                    let (inline_start, inline_end) = own_boundary.map_or_else(
-                        || engine.reader.inline_fragment_edges(box_idx),
-                        |boundary| (boundary.2, boundary.3),
-                    );
-                    bounds.push(LineInlineBoxFragment {
-                        box_idx: box_idx as u32,
-                        paint_order,
-                        start_x: fragment_start,
-                        end_x: fragment_end,
-                        top: fragment_top,
-                        bottom: fragment_bottom,
-                        baseline: fragment_baseline,
-                        flags: if inline_start {
-                            LineInlineBoxFragment::INLINE_START
-                        } else {
-                            0
-                        } | if inline_end {
-                            LineInlineBoxFragment::INLINE_END
-                        } else {
-                            0
-                        },
-                    });
+            cached_owner = Some(owner);
+        }
+        for ancestor in &ancestors {
+            let box_idx = ancestor.box_idx;
+            let relative_offset = ancestor.relative_offset;
+            let fragment_baseline = ancestor.baseline;
+            let (fragment_top, fragment_bottom) = ancestor.content_bounds
+                .unwrap_or((token_top, token_bottom));
+            let own_boundary = boundary.filter(|boundary| boundary.0 == box_idx);
+            let fragment_start = (own_boundary.map_or(placement.x, |boundary| boundary.1)
+                + relative_offset.x) as f32;
+            let fragment_end = (own_boundary
+                .map_or(placement.x + placement.advance, |boundary| boundary.1)
+                + relative_offset.x) as f32;
+            if let Some(fragment) = bounds
+                .iter_mut()
+                .find(|fragment| fragment.box_idx as usize == box_idx
+                    && (!bidi || (fragment.start_x <= fragment_end + 0.001 && fragment.end_x >= fragment_start - 0.001)))
+            {
+                fragment.paint_order = fragment.paint_order.min(paint_order);
+                fragment.start_x = fragment.start_x.min(fragment_start);
+                fragment.end_x = fragment.end_x.max(fragment_end);
+                fragment.top = fragment.top.min(fragment_top);
+                fragment.bottom = fragment.bottom.max(fragment_bottom);
+                if let Some((_, _, inline_start, inline_end)) = own_boundary {
+                    fragment.flags |= if inline_start {
+                        LineInlineBoxFragment::INLINE_START
+                    } else {
+                        0
+                    } | if inline_end {
+                        LineInlineBoxFragment::INLINE_END
+                    } else {
+                        0
+                    };
                 }
+            } else {
+                let (inline_start, inline_end) = own_boundary.map_or_else(
+                    || {
+                        if bidi && replaced.iter().any(|replaced| matches!(replaced, ReplacedToken::InlineBoundary { box_idx: owner, .. } if *owner as usize == box_idx)) {
+                            return (false, false);
+                        }
+                        let edges = engine.reader.inline_fragment_edges(box_idx);
+                        if engine.reader.style(box_idx).direction() == TextDirection::Rtl { (edges.1, edges.0) } else { edges }
+                    },
+                    |boundary| (boundary.2, boundary.3),
+                );
+                bounds.push(LineInlineBoxFragment {
+                    box_idx: box_idx as u32,
+                    paint_order,
+                    start_x: fragment_start,
+                    end_x: fragment_end,
+                    top: fragment_top,
+                    bottom: fragment_bottom,
+                    baseline: fragment_baseline,
+                    flags: if inline_start {
+                        LineInlineBoxFragment::INLINE_START
+                    } else {
+                        0
+                    } | if inline_end {
+                        LineInlineBoxFragment::INLINE_END
+                    } else {
+                        0
+                    },
+                });
             }
-            if stops_text_decoration_propagation(engine, box_idx) {
-                break;
-            }
-            // Inline fragments belong to this formatting context only. A
-            // nested table/block context can share flattened run storage,
-            // but must not recreate decorations established outside its
-            // container on the nested line.
-            if box_idx == container_box_idx {
-                outside_formatting_context = true;
-            }
-            owner = engine.reader.get_parent(box_idx);
         }
         // Enclosing inline backgrounds must precede the replaced element's
         // own background and border in paint order, so append this fragment
@@ -342,6 +403,23 @@ fn positioned_inline_box_fragments_from<'a>(
         if let Some(fragment) = replaced_border_fragment {
             bounds.push(fragment);
         }
+    }
+    if bidi {
+        bounds.sort_by(|a, b| a.box_idx.cmp(&b.box_idx).then(a.start_x.total_cmp(&b.start_x)));
+        let mut merged: Vec<LineInlineBoxFragment> = Vec::with_capacity(bounds.len());
+        for fragment in bounds {
+            if let Some(previous) = merged.last_mut().filter(|previous| previous.box_idx == fragment.box_idx
+                && (previous.flags ^ fragment.flags) & LineInlineBoxFragment::BORDER_BOX_BOUNDS == 0
+                && previous.end_x + 0.001 >= fragment.start_x)
+            {
+                previous.end_x = previous.end_x.max(fragment.end_x);
+                previous.top = previous.top.min(fragment.top);
+                previous.bottom = previous.bottom.max(fragment.bottom);
+                previous.paint_order = previous.paint_order.min(fragment.paint_order);
+                previous.flags |= fragment.flags;
+            } else { merged.push(fragment); }
+        }
+        bounds = merged;
     }
     // For the same source position, ancestor backgrounds/borders paint before
     // descendant boxes. Token order remains the primary key across siblings.
@@ -572,6 +650,7 @@ pub(super) fn write_line_fragments(
     paint_color: Option<u32>,
     containing_width: f64,
 ) -> f64 {
+    profile_scope!("fragments.write");
     let timing_started = engine.start_timing();
     let point = Point::new(origin.x + line.x_offset, origin.y);
     let line_idx = engine.fragments.state().line_output.lines.len();
@@ -695,15 +774,6 @@ pub(super) fn write_line_fragments(
         });
         layout.line_output.line_glyph_offsets.push(Vec::new());
         layout.line_output.line_glyph_advances.push(Vec::new());
-        for advance in
-            line.punctuation_space_advances
-                .iter()
-                .map(|&(glyph_idx, advance)| GlyphAdvanceRun {
-                    range: glyph_idx..glyph_idx + 1,
-                    advance,
-                }) {
-            layout.line_output.line_glyph_advances.push_to(line_idx, advance);
-        }
         if let Some((glyph, x)) = line.hyphen {
             let visible = span
                 .iter()
@@ -817,17 +887,18 @@ pub(super) fn write_line_fragments(
             let paint_start = engine.fragments.state().paint_program.commands.len();
             let height = engine.reader.style(*box_idx as usize).height();
             let authored_height_is_definite = match height {
-                html_style_model::UsedPreferredSize::Px(_) => true,
-                html_style_model::UsedPreferredSize::Percent(_)
-                | html_style_model::UsedPreferredSize::Stretch => containing_height.is_some(),
-                html_style_model::UsedPreferredSize::Calc { .. }
-                | html_style_model::UsedPreferredSize::Comparison { .. } => {
+                UsedPreferredSize::Px(_) => true,
+                UsedPreferredSize::Percent(_)
+                | UsedPreferredSize::Stretch => containing_height.is_some(),
+                UsedPreferredSize::Calc { .. }
+                | UsedPreferredSize::Comparison { .. } => {
                     !height.percentage_dependent() || containing_height.is_some()
                 }
-                html_style_model::UsedPreferredSize::Auto
-                | html_style_model::UsedPreferredSize::MinContent
-                | html_style_model::UsedPreferredSize::MaxContent
-                | html_style_model::UsedPreferredSize::FitContent => false,
+                UsedPreferredSize::Auto
+                | UsedPreferredSize::Content
+                | UsedPreferredSize::MinContent
+                | UsedPreferredSize::MaxContent
+                | UsedPreferredSize::FitContent => false,
             };
             let request = crate::layout::BoxLayoutRequest::atomic_assigned(
                 *box_idx as usize,
@@ -850,6 +921,10 @@ pub(super) fn write_line_fragments(
                 .record_decoration_paint_order_since(paint_order, decoration_start);
         } else if let InlineTokenKind::Glyph { glyph_idx } = token.kind() {
             debug_assert!(publishes_line);
+            let metrics = token.run_metrics(runs);
+            let scaled_space = matches!(engine.text.glyph_metric(engine.text.glyph_at(glyph_idx as usize).unwrap_or_default()).ch(), ' ' | '\u{00a0}')
+                && engine.reader.style(metrics.owner_box_idx as usize).word_spacing_factor() != 1.0;
+            let justified_space = line.punctuation_space_advances.iter().find(|&&(index, _)| index == glyph_idx).map(|&(_, advance)| advance);
             let layout = engine.fragments.state_mut();
             if offset != 0.0 {
                 push_glyph_offset_run(
@@ -859,10 +934,10 @@ pub(super) fn write_line_fragments(
                     offset as f32,
                 );
             }
-            if token.is_tab(runs) {
+            if token.is_tab() || scaled_space || justified_space.is_some() {
                 layout.line_output.line_glyph_advances.push_to(line_idx, GlyphAdvanceRun {
                     range: glyph_idx..glyph_idx + 1,
-                    advance: placement.advance as f32,
+                    advance: justified_space.unwrap_or(placement.advance as f32),
                 });
             }
         } else if let InlineTokenKind::Ellipsis { glyph } = token.kind() {

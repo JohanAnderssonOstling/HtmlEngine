@@ -11,8 +11,15 @@ members = [
     "crates/html-pipeline",
     "crates/html-resources",
     "crates/html-style-model",
+    "crates/html-text",
+    "crates/html-engine-model",
+    "crates/html-format",
+    "crates/html-shape",
     "test-support/html-wpt",
 ]
+
+[workspace.package]
+license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
 kurbo = "0.11.3"
@@ -25,3 +32,4 @@ html5ever = "0.39"
 quick-xml = { version = "0.41", features = ["escape-html"] }
 encoding_rs = "0.8"
 ego-tree = "0.11"
+unicode-bidi = "0.3.18"

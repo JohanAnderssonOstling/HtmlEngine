@@ -56,7 +56,7 @@ pub(super) fn finish_box_layout(
 }
 
 /// Retain a translation on a complete laid-out box and its content.
-pub(crate) fn translate_laid_out_output(
+pub fn translate_laid_out_output(
     engine: &mut LayoutEngine<'_, '_>,
     output: &OutputRanges,
     offset: Vec2,
@@ -70,7 +70,7 @@ pub(crate) fn translate_laid_out_output(
 }
 
 /// Retain a translation on a box's content while keeping its own border box fixed.
-pub(crate) fn translate_laid_out_content(
+pub fn translate_laid_out_content(
     engine: &mut LayoutEngine<'_, '_>,
     output: &OutputRanges,
     offset: Vec2,
@@ -82,7 +82,7 @@ pub(crate) fn translate_laid_out_content(
     }
 }
 
-pub(crate) fn relative_position_offset(
+pub fn relative_position_offset(
     style: &html_style_model::UsedStyleView<'_>,
     containing_width: f64,
     containing_height: Option<f64>,
@@ -118,6 +118,8 @@ pub(crate) fn relative_position_offset(
 
 #[cfg(test)]
 mod tests {
+    use crate::GlyphResourceStore;
+
     use crate::LayoutConstraints;
     use crate::parser::DocumentFactory;
     use crate::test_support::TestGlyphShaper;
@@ -127,12 +129,17 @@ mod tests {
         let html = "<html><body style='margin:0'><table style='border-spacing:0'><tr><td style='padding:0'><div style='width:10px;height:20px'></div></td><td id='cell' style='padding:0;vertical-align:bottom;background:#ff0000'><div id='content' style='width:10px;height:5px'></div></td></tr></table></body></html>";
         let mut factory = DocumentFactory::new();
         let mut shaper = TestGlyphShaper::new();
+        let mut document_resources = GlyphResourceStore::default();
         let document = factory
             .parse_with_new_pipeline(html, None)
-            .shape(&mut shaper)
+            .shape(&mut shaper, &mut document_resources)
             .expect("test glyphs shape")
-            .layout(LayoutConstraints::new(300.0, 16.0).unwrap());
-        let view = document.render_view();
+            .layout(
+                LayoutConstraints::new(300.0, 16.0).unwrap(),
+                &document_resources,
+            )
+            .expect("layout requires the shaper-aware API for first-line styles");
+        let view = document.render_view(&document_resources);
         let box_by_id = |id| {
             (0..view.boxes().len())
                 .find(|&index| view.boxes().id(index).map(|value| view.string(value)) == Some(id))

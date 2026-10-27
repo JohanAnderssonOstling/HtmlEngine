@@ -6,6 +6,7 @@
 
 use super::{CascadePhase, WorkingStyle, css_color_to_u32, resolve_logical_text_alignments};
 use html_dom::{Document, DomNodeId};
+use html_style_model::UnicodeBidi;
 use html_style_model::{BorderStyle, BoxSizing, CaptionSide, Clear, Display, Float, FontRelativeLength, LengthPct, LogicalTextAlign, PreferredSize, TextAlign, TextDirection, VerticalAlignValue, WhiteSpace};
 use lightningcss::traits::Parse;
 use lightningcss::values::color::CssColor;
@@ -127,12 +128,28 @@ pub(super) fn apply(doc: &Document, node_idx: DomNodeId, style: &mut WorkingStyl
 }
 
 fn apply_prerequisite_hints(doc: &Document, node_idx: DomNodeId, tag: &str, style: &mut WorkingStyle, font_size_scale: f32) {
+    if tag.eq_ignore_ascii_case("bdi") {
+        style.box_model.unicode_bidi = UnicodeBidi::Isolate;
+        style.text.direction = if doc.element_ref(node_idx).is_some_and(|element| element.html_state().is_rtl()) { TextDirection::Rtl } else { TextDirection::Ltr };
+    } else if tag.eq_ignore_ascii_case("bdo") {
+        style.box_model.unicode_bidi = UnicodeBidi::BidiOverride;
+    }
     if let Some(direction) = doc.get_dom_attr(node_idx, "dir") {
         if direction.eq_ignore_ascii_case("ltr") {
             style.text.direction = TextDirection::Ltr;
         } else if direction.eq_ignore_ascii_case("rtl") {
             style.text.direction = TextDirection::Rtl;
+        } else if direction.eq_ignore_ascii_case("auto") {
+            style.text.direction = if doc.element_ref(node_idx).is_some_and(|element| element.html_state().is_rtl()) { TextDirection::Rtl } else { TextDirection::Ltr };
         }
+        if !tag.eq_ignore_ascii_case("bdo")
+            && ["ltr", "rtl", "auto"].iter().any(|value| direction.eq_ignore_ascii_case(value))
+        {
+            style.box_model.unicode_bidi = UnicodeBidi::Isolate;
+        }
+        resolve_logical_text_alignments(&mut style.text);
+    }
+    if tag.eq_ignore_ascii_case("bdi") {
         resolve_logical_text_alignments(&mut style.text);
     }
     if tag.eq_ignore_ascii_case("body")

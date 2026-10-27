@@ -7,12 +7,12 @@ use super::grid::{effective_table_grid, table_grid};
 use super::sizing::intrinsic_column_widths;
 
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct TableIntrinsicSizes {
-    pub(crate) minimum: f64,
-    pub(crate) maximum: f64,
-    pub(crate) grid_minimum: f64,
-    pub(crate) grid_maximum: f64,
-    pub(crate) full_width_percentage_grid: bool,
+pub struct TableIntrinsicSizes {
+    pub minimum: f64,
+    pub maximum: f64,
+    pub grid_minimum: f64,
+    pub grid_maximum: f64,
+    pub full_width_percentage_grid: bool,
 }
 
 fn caption_minimum_grid_contribution(
@@ -37,7 +37,7 @@ fn caption_minimum_grid_contribution(
     (caption_minimum - table_outer_extras).max(0.0)
 }
 
-pub(crate) fn table_intrinsic_sizes(
+pub fn table_intrinsic_sizes(
     session: &LayoutEngine<'_, '_>,
     table_box_idx: usize,
 ) -> TableIntrinsicSizes {
@@ -193,7 +193,7 @@ pub(crate) fn table_intrinsic_sizes(
     }
 }
 
-pub(crate) fn table_intrinsic_widths(
+pub fn table_intrinsic_widths(
     session: &LayoutEngine<'_, '_>,
     table_box_idx: usize,
 ) -> (f64, f64) {

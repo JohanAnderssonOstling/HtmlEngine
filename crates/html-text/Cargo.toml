@@ -1,0 +1,19 @@
+[package]
+name = "html-text"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+publish = false
+
+[features]
+# Exposes existing normalization fixtures to downstream stage tests.
+testing = []
+
+[dependencies]
+html-dom = { path = "../html-dom" }
+html-style-model = { path = "../html-style-model" }
+rustc_data_structures = "0.1.2"
+unicode_categories = "0.1"
+unicode-segmentation = "1.13"
+unicode-linebreak = "0.1.5"
+unicode-width = "0.2.2"

@@ -11,12 +11,13 @@ use crate::layout::{
     resolve_replaced_intrinsic_constraint,
 };
 use html_style_model::{
-    GridAutoFlow, ItemAlignment, LayoutStyle, OverflowMode, PositionMode,
+    FlexDirection, GridAutoFlow, ItemAlignment, LayoutStyle, OverflowMode, PositionMode, TextDirection,
     UsedPreferredSize as PreferredSize,
 };
 use taffy::geometry::{Line, Point as TaffyPoint, Rect, Size as TaffySize};
 use taffy::prelude::{Dimension, LengthPercentage, Style};
 use taffy::style::{
+    Direction as TaffyDirection,
     BoxSizing as TaffyBoxSizing, Display as TaffyDisplay, FlexDirection as TaffyFlexDirection,
     FlexWrap as TaffyFlexWrap, GridAutoFlow as TaffyGridAutoFlow,
     GridTemplateArea as TaffyGridTemplateArea, GridTemplateAreas as TaffyGridTemplateAreas,
@@ -40,11 +41,17 @@ pub(super) fn taffy_container_style(
 ) -> Style {
     let source = layout_style(session, box_idx);
     let used = session.reader.style(box_idx);
+    let rtl = used.direction() == TextDirection::Rtl;
+    let inline_main = kind == TaffyContainerKind::Grid || matches!(source.flex_direction, FlexDirection::Row | FlexDirection::RowReverse);
     let grid_template_rows = used.grid_template_rows();
     let grid_template_columns = used.grid_template_columns();
     let grid_auto_rows = used.grid_auto_rows();
     let grid_auto_columns = used.grid_auto_columns();
     let mut style = Style {
+        direction: match used.direction() {
+            TextDirection::Ltr => TaffyDirection::Ltr,
+            TextDirection::Rtl => TaffyDirection::Rtl,
+        },
         display: match kind {
             TaffyContainerKind::Flex => TaffyDisplay::Flex,
             TaffyContainerKind::Grid => TaffyDisplay::Grid,
@@ -74,9 +81,9 @@ pub(super) fn taffy_container_style(
             ),
             height: used_length_percentage(session.reader.style(box_idx).row_gap(), content_width),
         },
-        align_items: item_alignment(source.align_items, false),
-        align_content: content_alignment(source.align_content, kind, false),
-        justify_content: content_alignment(source.justify_content, kind, true),
+        align_items: item_alignment(source.align_items, rtl && !inline_main),
+        align_content: content_alignment(source.align_content, kind, false, rtl && !inline_main),
+        justify_content: content_alignment(source.justify_content, kind, true, rtl && inline_main),
         flex_direction: match source.flex_direction {
             html_style_model::FlexDirection::Row => TaffyFlexDirection::Row,
             html_style_model::FlexDirection::RowReverse => TaffyFlexDirection::RowReverse,
@@ -88,7 +95,7 @@ pub(super) fn taffy_container_style(
             html_style_model::FlexWrap::Wrap => TaffyFlexWrap::Wrap,
             html_style_model::FlexWrap::WrapReverse => TaffyFlexWrap::WrapReverse,
         },
-        justify_items: item_alignment(source.justify_items, true),
+        justify_items: item_alignment(source.justify_items, rtl),
         grid_template_rows: grid_template_rows
             .map(|track| {
                 grid_template_track(
@@ -177,6 +184,7 @@ pub(super) fn taffy_item_style(
     intrinsic_inline_sizing: bool,
 ) -> Style {
     let style = session.reader.style(box_idx);
+    let parent_rtl = session.reader.get_parent(box_idx).is_some_and(|parent| session.reader.style(parent).direction() == TextDirection::Rtl);
     let box_model = ResolvedBoxModel::new(style, containing_width);
     let layout = layout_style(session, box_idx);
     let image_intrinsic = session.reader.image_intrinsic(box_idx);
@@ -568,6 +576,10 @@ pub(super) fn taffy_item_style(
     })
     .flatten();
     Style {
+        direction: match style.direction() {
+            TextDirection::Ltr => TaffyDirection::Ltr,
+            TextDirection::Rtl => TaffyDirection::Rtl,
+        },
         // Absolute grid items still belong in Taffy's local tree: Taffy
         // excludes them from track sizing, then resolves their containing
         // area from grid-row/grid-column during its positioning pass.
@@ -668,12 +680,12 @@ pub(super) fn taffy_item_style(
         align_self: if percentage_height_is_grid_area_stretch {
             item_alignment(ItemAlignment::Stretch, false)
         } else {
-            item_alignment(layout.align_self, false)
+            item_alignment(layout.align_self, parent_rtl && kind == TaffyContainerKind::Flex && !horizontal_main_axis)
         },
         justify_self: if percentage_width_is_grid_area_stretch {
             item_alignment(ItemAlignment::Stretch, true)
         } else {
-            item_alignment(layout.justify_self, true)
+            item_alignment(layout.justify_self, parent_rtl)
         },
         grid_row: Line {
             start: grid_placement(session.reader.styles(), layout.grid_row.start),

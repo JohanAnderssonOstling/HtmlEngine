@@ -21,7 +21,7 @@ struct BlockFlowItem {
 /// `available_width` is the content width of `parent_idx` — i.e. the containing
 /// block inline-size for the children, against which their margin percentages
 /// resolve. `parent_cb_width` is the parent's own containing-block width.
-pub(crate) fn layout_block_children(
+pub fn layout_block_children(
     engine: &mut LayoutEngine<'_, '_>,
     parent_idx: usize,
     children: &[u32],
@@ -488,8 +488,12 @@ pub(crate) fn layout_block_children(
         // The clearance-separated chain was consumed into this box's used
         // height. Do not let the static trailing-margin analysis expose it a
         // second time to the parent.
-        let own_after =
-            MarginStrut::from_margin(parent_style.margin_bottom().resolve(parent_cb_width));
+        let own_after = MarginStrut::from_margin(
+            engine
+                .reader
+                .vertical_margins(parent_idx, parent_cb_width)
+                .1,
+        );
         engine.margins.record_used_after_margin(
             parent_idx,
             parent_cb_width,
@@ -539,32 +543,46 @@ fn calculate_child_indent(box_type: &BoxType, indent_remaining: &mut f64) -> f64
 
 #[cfg(test)]
 mod tests {
+    use crate::GlyphResourceStore;
+
     use crate::LaidOutDocument;
     use crate::parser::DocumentFactory;
     use crate::test_support::TestGlyphShaper;
     use kurbo::{Point, Size};
 
-    fn layout_html(body: &str) -> LaidOutDocument {
+    fn layout_html(body: &str, resources: &mut GlyphResourceStore) -> LaidOutDocument<'static> {
         let html = format!("<html><body style='margin:0'>{body}</body></html>");
-        layout_document(&html)
+        layout_document(&html, resources)
     }
 
-    fn layout_document(html: &str) -> LaidOutDocument {
-        layout_document_with_css(html, None)
+    fn layout_document(html: &str, resources: &mut GlyphResourceStore) -> LaidOutDocument<'static> {
+        layout_document_with_css(html, None, resources)
     }
 
-    fn layout_document_with_css(html: &str, css: Option<&str>) -> LaidOutDocument {
+    fn layout_document_with_css(
+        html: &str,
+        css: Option<&str>,
+        resources: &mut GlyphResourceStore,
+    ) -> LaidOutDocument<'static> {
         let mut factory = DocumentFactory::new();
         let mut glyphs = TestGlyphShaper::new();
         factory
             .parse_with_new_pipeline(html, css)
-            .shape(&mut glyphs)
+            .shape(&mut glyphs, resources)
             .expect("test glyphs shape")
-            .layout(crate::LayoutConstraints::new(300.0, 16.0).unwrap())
+            .layout(
+                crate::LayoutConstraints::new(300.0, 16.0).unwrap(),
+                resources,
+            )
+            .expect("layout requires the shaper-aware API for first-line styles")
     }
 
-    fn geometry(document: &LaidOutDocument, id: &str) -> (Point, Size) {
-        let view = document.render_view();
+    fn geometry(
+        document: &LaidOutDocument,
+        id: &str,
+        resources: &GlyphResourceStore,
+    ) -> (Point, Size) {
+        let view = document.render_view(resources);
         let box_idx = (0..view.boxes().len())
             .find(|idx| view.boxes().id(*idx).map(|value| view.string(value)) == Some(id))
             .unwrap_or_else(|| panic!("missing box #{id}"));
@@ -576,34 +594,40 @@ mod tests {
 
     #[test]
     fn adjoining_sibling_margins_use_the_largest_positive_value() {
+        let mut document_resources = GlyphResourceStore::default();
         let document = layout_html(
             "<div id='first' style='height:10px;margin-bottom:30px'></div><div id='second' style='height:10px;margin-top:20px'></div>",
+            &mut document_resources,
         );
-        let (first, first_size) = geometry(&document, "first");
-        let (second, _) = geometry(&document, "second");
+        let (first, first_size) = geometry(&document, "first", &document_resources);
+        let (second, _) = geometry(&document, "second", &document_resources);
 
         assert_eq!(second.y - (first.y + first_size.height), 30.0);
     }
 
     #[test]
     fn adjoining_positive_and_negative_margins_sum_their_extremes() {
+        let mut document_resources = GlyphResourceStore::default();
         let document = layout_html(
             "<div id='first' style='height:10px;margin-bottom:30px'></div><div id='second' style='height:10px;margin-top:-10px'></div>",
+            &mut document_resources,
         );
-        let (first, first_size) = geometry(&document, "first");
-        let (second, _) = geometry(&document, "second");
+        let (first, first_size) = geometry(&document, "first", &document_resources);
+        let (second, _) = geometry(&document, "second", &document_resources);
 
         assert_eq!(second.y - (first.y + first_size.height), 20.0);
     }
 
     #[test]
     fn first_child_margin_collapses_with_parent_even_when_child_has_a_border() {
+        let mut document_resources = GlyphResourceStore::default();
         let document = layout_html(
             "<div id='anchor' style='height:10px'></div><div id='parent' style='margin-top:30px'><div id='child' style='height:10px;margin-top:50px;border-top:1px solid'></div></div>",
+            &mut document_resources,
         );
-        let (anchor, anchor_size) = geometry(&document, "anchor");
-        let (parent, _) = geometry(&document, "parent");
-        let (child, _) = geometry(&document, "child");
+        let (anchor, anchor_size) = geometry(&document, "anchor", &document_resources);
+        let (parent, _) = geometry(&document, "parent", &document_resources);
+        let (child, _) = geometry(&document, "child", &document_resources);
 
         assert_eq!(parent.y - (anchor.y + anchor_size.height), 50.0);
         assert_eq!(child.y, parent.y);
@@ -611,71 +635,83 @@ mod tests {
 
     #[test]
     fn nested_empty_blocks_collapse_through_one_adjoining_set() {
+        let mut document_resources = GlyphResourceStore::default();
         let document = layout_html(
             "<div id='first' style='height:10px;margin-bottom:10px'></div><div id='empty' style='height:0;margin-top:30px;margin-bottom:40px'></div><div id='last' style='height:10px;margin-top:20px'></div>",
+            &mut document_resources,
         );
-        let (first, first_size) = geometry(&document, "first");
-        let (last, _) = geometry(&document, "last");
+        let (first, first_size) = geometry(&document, "first", &document_resources);
+        let (last, _) = geometry(&document, "last", &document_resources);
 
         assert_eq!(last.y - (first.y + first_size.height), 40.0);
     }
 
     #[test]
     fn parent_border_prevents_child_margin_from_escaping() {
+        let mut document_resources = GlyphResourceStore::default();
         let document = layout_html(
             "<div id='parent' style='border-top:5px solid'><div id='child' style='height:10px;margin-top:30px'></div></div>",
+            &mut document_resources,
         );
-        let (parent, _) = geometry(&document, "parent");
-        let (child, _) = geometry(&document, "child");
+        let (parent, _) = geometry(&document, "parent", &document_resources);
+        let (child, _) = geometry(&document, "child", &document_resources);
 
         assert_eq!(child.y - parent.y, 35.0);
     }
 
     #[test]
     fn overflow_formatting_context_contains_child_margin() {
+        let mut document_resources = GlyphResourceStore::default();
         let document = layout_html(
             "<div id='parent' style='overflow:hidden'><div id='child' style='height:10px;margin-top:30px'></div></div>",
+            &mut document_resources,
         );
-        let (parent, _) = geometry(&document, "parent");
-        let (child, _) = geometry(&document, "child");
+        let (parent, _) = geometry(&document, "parent", &document_resources);
+        let (child, _) = geometry(&document, "child", &document_resources);
 
         assert_eq!(child.y - parent.y, 30.0);
     }
 
     #[test]
     fn float_margins_do_not_collapse_with_the_preceding_block_margin() {
+        let mut document_resources = GlyphResourceStore::default();
         let document = layout_html(
             "<div id='first' style='height:10px;margin-bottom:20px'></div><div id='float' style='float:left;width:10px;height:10px;margin-top:15px'></div>",
+            &mut document_resources,
         );
-        let (first, first_size) = geometry(&document, "first");
-        let (float, _) = geometry(&document, "float");
+        let (first, first_size) = geometry(&document, "first", &document_resources);
+        let (float, _) = geometry(&document, "float", &document_resources);
 
         assert_eq!(float.y - (first.y + first_size.height), 35.0);
     }
 
     #[test]
     fn nested_float_keeps_the_preceding_adjoining_margin_position() {
+        let mut document_resources = GlyphResourceStore::default();
         let document = layout_html(
             "<div id='first' style='height:10px;margin-bottom:20px'></div><div><div id='float' style='float:left;width:10px;height:10px;margin-top:15px'></div></div>",
+            &mut document_resources,
         );
-        let (first, first_size) = geometry(&document, "first");
-        let (float, _) = geometry(&document, "float");
+        let (first, first_size) = geometry(&document, "first", &document_resources);
+        let (float, _) = geometry(&document, "float", &document_resources);
 
         assert_eq!(float.y - (first.y + first_size.height), 35.0);
     }
 
     #[test]
     fn inline_absolute_anchor_shares_a_nested_floats_collapsed_source_position() {
+        let mut document_resources = GlyphResourceStore::default();
         let document = layout_html(
             "<div id='first' style='height:10px;margin-bottom:20px'></div>\
              <div id='wrapper' style='position:relative'>\
                  <div id='absolute' style='position:absolute;width:10px;height:10px'></div>\
                  <div id='float' style='float:left;width:10px;height:10px'></div>\
              </div>",
+            &mut document_resources,
         );
-        let (wrapper, _) = geometry(&document, "wrapper");
-        let (absolute, _) = geometry(&document, "absolute");
-        let (float, _) = geometry(&document, "float");
+        let (wrapper, _) = geometry(&document, "wrapper", &document_resources);
+        let (absolute, _) = geometry(&document, "absolute", &document_resources);
+        let (float, _) = geometry(&document, "float", &document_resources);
 
         assert_eq!(wrapper.y, float.y);
         assert_eq!(absolute.y, float.y);
@@ -683,13 +719,15 @@ mod tests {
 
     #[test]
     fn inline_image_prevents_its_wrapper_from_collapsing_through() {
+        let mut document_resources = GlyphResourceStore::default();
         let document = layout_html(
             "<div id='first' style='height:10px;margin-bottom:20px'></div>\
              <div id='wrapper'><svg id='image' width='96' height='96'></svg></div>",
+            &mut document_resources,
         );
-        let (first, first_size) = geometry(&document, "first");
-        let (wrapper, _) = geometry(&document, "wrapper");
-        let (image, _) = geometry(&document, "image");
+        let (first, first_size) = geometry(&document, "first", &document_resources);
+        let (wrapper, _) = geometry(&document, "wrapper", &document_resources);
+        let (image, _) = geometry(&document, "image", &document_resources);
 
         assert_eq!(wrapper.y, first.y + first_size.height + 20.0);
         assert!(
@@ -700,33 +738,39 @@ mod tests {
 
     #[test]
     fn floated_box_contents_do_not_move_the_outer_float_source_position() {
+        let mut document_resources = GlyphResourceStore::default();
         let document = layout_html(
             "<div id='first' style='height:10px;margin-bottom:20px'></div><div><span id='float' style='display:inline-block;float:right;width:20px;height:20px'><span style='display:block'>a</span><span style='display:block'>b</span></span></div>",
+            &mut document_resources,
         );
-        let (first, first_size) = geometry(&document, "first");
-        let (float, _) = geometry(&document, "float");
+        let (first, first_size) = geometry(&document, "first", &document_resources);
+        let (float, _) = geometry(&document, "float", &document_resources);
 
         assert_eq!(float.y - (first.y + first_size.height), 20.0);
     }
 
     #[test]
     fn nonzero_min_height_prevents_empty_block_collapse_through() {
+        let mut document_resources = GlyphResourceStore::default();
         let document = layout_html(
             "<div id='first' style='height:10px'></div><div id='empty' style='min-height:1px;margin-top:20px;margin-bottom:30px'></div><div id='last' style='height:10px'></div>",
+            &mut document_resources,
         );
-        let (first, first_size) = geometry(&document, "first");
-        let (last, _) = geometry(&document, "last");
+        let (first, first_size) = geometry(&document, "first", &document_resources);
+        let (last, _) = geometry(&document, "last", &document_resources);
 
         assert_eq!(last.y - (first.y + first_size.height), 51.0);
     }
 
     #[test]
     fn nonzero_min_height_does_not_close_the_parent_last_child_edge() {
+        let mut document_resources = GlyphResourceStore::default();
         let document = layout_html(
             "<div id='parent' style='min-height:10px;margin-bottom:20px'><div id='child' style='height:10px;margin-bottom:30px'></div></div><div id='next' style='height:10px'></div>",
+            &mut document_resources,
         );
-        let (parent, parent_size) = geometry(&document, "parent");
-        let (next, _) = geometry(&document, "next");
+        let (parent, parent_size) = geometry(&document, "parent", &document_resources);
+        let (next, _) = geometry(&document, "next", &document_resources);
 
         assert_eq!(parent_size.height, 10.0);
         assert_eq!(next.y - (parent.y + parent_size.height), 30.0);
@@ -734,11 +778,13 @@ mod tests {
 
     #[test]
     fn binding_min_height_closes_the_parent_last_child_edge() {
+        let mut document_resources = GlyphResourceStore::default();
         let document = layout_html(
             "<div id='parent' style='min-height:50px;margin-bottom:20px'><div id='child' style='margin-bottom:30px'></div></div><div id='next' style='height:10px'></div>",
+            &mut document_resources,
         );
-        let (parent, parent_size) = geometry(&document, "parent");
-        let (next, _) = geometry(&document, "next");
+        let (parent, parent_size) = geometry(&document, "parent", &document_resources);
+        let (next, _) = geometry(&document, "next", &document_resources);
 
         assert_eq!(parent_size.height, 50.0);
         assert_eq!(next.y - (parent.y + parent_size.height), 20.0);
@@ -746,6 +792,7 @@ mod tests {
 
     #[test]
     fn nonzero_min_height_prevents_a_descendant_margin_from_escaping_both_edges() {
+        let mut document_resources = GlyphResourceStore::default();
         let document = layout_document_with_css(
             "<html><body>\
                  <div id='parent' class='parent'>\
@@ -759,10 +806,11 @@ mod tests {
                  div.last-child { margin-bottom: 5em; }\
                  div.float { float: left; width: 10px; height: 10px; }",
             ),
+            &mut document_resources,
         );
-        let (parent, parent_size) = geometry(&document, "parent");
-        let (float, _) = geometry(&document, "float");
-        let (next, _) = geometry(&document, "next");
+        let (parent, parent_size) = geometry(&document, "parent", &document_resources);
+        let (float, _) = geometry(&document, "float", &document_resources);
+        let (next, _) = geometry(&document, "next", &document_resources);
 
         assert_eq!(parent.y, 80.0);
         assert_eq!(parent_size.height, 32.0);
@@ -772,11 +820,13 @@ mod tests {
 
     #[test]
     fn binding_max_height_closes_the_parent_last_child_edge() {
+        let mut document_resources = GlyphResourceStore::default();
         let document = layout_html(
             "<div id='parent' style='max-height:50px'><div id='child' style='height:51px;margin-bottom:10px'></div></div><div id='next' style='height:50px'></div>",
+            &mut document_resources,
         );
-        let (parent, parent_size) = geometry(&document, "parent");
-        let (next, _) = geometry(&document, "next");
+        let (parent, parent_size) = geometry(&document, "parent", &document_resources);
+        let (next, _) = geometry(&document, "next", &document_resources);
 
         assert_eq!(parent_size.height, 50.0);
         assert_eq!(next.y, parent.y + parent_size.height);
@@ -784,31 +834,37 @@ mod tests {
 
     #[test]
     fn root_margin_does_not_collapse_with_the_first_descendant_margin() {
+        let mut document_resources = GlyphResourceStore::default();
         let document = layout_document(
             "<html style='margin-top:20px'><body style='margin:0'><div id='child' style='height:10px;margin-top:20px'></div></body></html>",
+            &mut document_resources,
         );
-        let (child, _) = geometry(&document, "child");
+        let (child, _) = geometry(&document, "child", &document_resources);
 
         assert_eq!(child.y, 40.0);
     }
 
     #[test]
     fn body_and_first_child_top_margins_collapse_normally() {
+        let mut document_resources = GlyphResourceStore::default();
         let document = layout_document(
             "<html style='margin:0'><body style='margin-top:40px'><div id='child' style='height:10px;margin-top:40px'></div></body></html>",
+            &mut document_resources,
         );
-        let (child, _) = geometry(&document, "child");
+        let (child, _) = geometry(&document, "child", &document_resources);
 
         assert_eq!(child.y, 40.0);
     }
 
     #[test]
     fn collapsed_child_margin_is_considered_before_clearance() {
+        let mut document_resources = GlyphResourceStore::default();
         let document = layout_html(
             "<div id='float' style='float:left;width:10px;height:50px'></div><div id='cleared' style='clear:left'><div id='child' style='height:50px;margin-top:50px'></div></div>",
+            &mut document_resources,
         );
-        let (float, _) = geometry(&document, "float");
-        let (child, _) = geometry(&document, "child");
+        let (float, _) = geometry(&document, "float", &document_resources);
+        let (child, _) = geometry(&document, "child", &document_resources);
 
         assert_eq!(
             child.y, float.y,
@@ -818,23 +874,27 @@ mod tests {
 
     #[test]
     fn actual_clearance_places_the_border_edge_at_the_float_bottom_once() {
+        let mut document_resources = GlyphResourceStore::default();
         let document = layout_html(
             "<div id='float' style='float:left;width:10px;height:50px'></div><div id='cleared' style='clear:left;height:10px;margin-top:10px'></div>",
+            &mut document_resources,
         );
-        let (float, float_size) = geometry(&document, "float");
-        let (cleared, _) = geometry(&document, "cleared");
+        let (float, float_size) = geometry(&document, "float", &document_resources);
+        let (cleared, _) = geometry(&document, "cleared", &document_resources);
 
         assert_eq!(cleared.y, float.y + float_size.height);
     }
 
     #[test]
     fn clear_without_a_matching_float_still_collapses_through() {
+        let mut document_resources = GlyphResourceStore::default();
         let document = layout_html(
             "<div id='parent' style='height:100px'></div>\
              <div id='empty' style='clear:both;margin-top:100px'></div>",
+            &mut document_resources,
         );
-        let (parent, parent_size) = geometry(&document, "parent");
-        let (empty, empty_size) = geometry(&document, "empty");
+        let (parent, parent_size) = geometry(&document, "parent", &document_resources);
+        let (empty, empty_size) = geometry(&document, "empty", &document_resources);
 
         assert_eq!(empty.y, parent.y + parent_size.height);
         assert_eq!(empty_size.height, 0.0);
@@ -842,30 +902,34 @@ mod tests {
 
     #[test]
     fn following_margin_remains_after_clearance_on_a_collapsed_through_box() {
+        let mut document_resources = GlyphResourceStore::default();
         let document = layout_html(
             "<div id='parent'>\
                  <div style='float:left;width:0;height:1px'></div>\
                  <div style='clear:left'></div>\
                  <div style='margin-top:99px'></div>\
              </div>",
+            &mut document_resources,
         );
-        let (_, parent_size) = geometry(&document, "parent");
+        let (_, parent_size) = geometry(&document, "parent", &document_resources);
 
         assert_eq!(parent_size.height, 100.0);
     }
 
     #[test]
     fn collapsed_margin_after_actual_clearance_cannot_escape_parent_bottom() {
+        let mut document_resources = GlyphResourceStore::default();
         let document = layout_html(
             "<div id='parent' style='border-top:1px solid black'>\
                  <div style='float:left;width:10px;height:100px'></div>\
                  <div id='cleared-chain' style='clear:left;margin-top:40px;margin-bottom:140px'></div>\
              </div>\
              <div id='next' style='height:1px'></div>",
+            &mut document_resources,
         );
-        let (parent, parent_size) = geometry(&document, "parent");
-        let (cleared, cleared_size) = geometry(&document, "cleared-chain");
-        let (next, _) = geometry(&document, "next");
+        let (parent, parent_size) = geometry(&document, "parent", &document_resources);
+        let (cleared, cleared_size) = geometry(&document, "cleared-chain", &document_resources);
+        let (next, _) = geometry(&document, "next", &document_resources);
 
         assert_eq!(
             parent_size.height, 201.0,
@@ -876,15 +940,17 @@ mod tests {
 
     #[test]
     fn clearance_stops_a_later_margin_from_escaping_past_a_nested_inline_float_anchor() {
+        let mut document_resources = GlyphResourceStore::default();
         let document = layout_html(
             "<div id='parent' style='width:100px'>\
                  <div><div id='float' style='float:left;width:100px;height:50px'></div></div>\
                  <div id='cleared' style='clear:left;height:50px;margin-top:400px'></div>\
              </div>",
+            &mut document_resources,
         );
-        let (parent, parent_size) = geometry(&document, "parent");
-        let (float, float_size) = geometry(&document, "float");
-        let (cleared, cleared_size) = geometry(&document, "cleared");
+        let (parent, parent_size) = geometry(&document, "parent", &document_resources);
+        let (float, float_size) = geometry(&document, "float", &document_resources);
+        let (cleared, cleared_size) = geometry(&document, "cleared", &document_resources);
 
         assert_eq!(float.y, parent.y);
         assert_eq!(cleared.y, float.y + float_size.height);
@@ -893,6 +959,7 @@ mod tests {
 
     #[test]
     fn negative_clearance_after_an_empty_bottom_margin_contributes_parent_height() {
+        let mut document_resources = GlyphResourceStore::default();
         let document = layout_html(
             "<div id='outer'>\
                  <div id='float' style='float:left;width:50px;height:50px;border-top:50px solid white'></div>\
@@ -904,11 +971,12 @@ mod tests {
                      <div id='lower' style='width:100px;height:50px'></div>\
                  </div>\
              </div>",
+            &mut document_resources,
         );
-        let (green, green_size) = geometry(&document, "green");
-        let (lower, _) = geometry(&document, "lower");
-        let (zero, zero_size) = geometry(&document, "zero");
-        let (cleared, cleared_size) = geometry(&document, "cleared");
+        let (green, green_size) = geometry(&document, "green", &document_resources);
+        let (lower, _) = geometry(&document, "lower", &document_resources);
+        let (zero, zero_size) = geometry(&document, "zero", &document_resources);
+        let (cleared, cleared_size) = geometry(&document, "cleared", &document_resources);
 
         assert_eq!(
             green_size.height, 50.0,
@@ -919,6 +987,7 @@ mod tests {
 
     #[test]
     fn cleared_descendant_margin_does_not_shift_its_relative_wrapper() {
+        let mut document_resources = GlyphResourceStore::default();
         let document = layout_html(
             "<p>Test passes if there is a filled green square.</p>\
              <div id='outer' style='position:relative;top:-50px'>\
@@ -931,11 +1000,12 @@ mod tests {
                      <div id='lower' style='width:100px;height:50px'></div>\
                  </div>\
              </div>",
+            &mut document_resources,
         );
-        let (outer, _) = geometry(&document, "outer");
-        let (float, float_size) = geometry(&document, "float");
-        let (green, green_size) = geometry(&document, "green");
-        let (lower, _) = geometry(&document, "lower");
+        let (outer, _) = geometry(&document, "outer", &document_resources);
+        let (float, float_size) = geometry(&document, "float", &document_resources);
+        let (green, green_size) = geometry(&document, "green", &document_resources);
+        let (lower, _) = geometry(&document, "lower", &document_resources);
 
         assert_eq!(float.y, outer.y);
         assert_eq!(
@@ -948,14 +1018,16 @@ mod tests {
 
     #[test]
     fn clearance_is_inserted_above_a_floats_negative_top_margin() {
+        let mut document_resources = GlyphResourceStore::default();
         let document = layout_html(
             "<div style='height:192px;width:192px'>\
              <div id='first' style='float:right;width:96px;height:96px'></div>\
              <div id='second' style='float:right;clear:right;width:96px;height:96px;margin-top:-96px'></div>\
              </div>",
+            &mut document_resources,
         );
-        let (first, _) = geometry(&document, "first");
-        let (second, _) = geometry(&document, "second");
+        let (first, _) = geometry(&document, "first", &document_resources);
+        let (second, _) = geometry(&document, "second", &document_resources);
 
         assert_eq!(
             second.y, first.y,
@@ -965,10 +1037,13 @@ mod tests {
 
     #[test]
     fn inline_float_starts_at_its_paragraphs_first_line() {
-        let document =
-            layout_html("<p id='paragraph'><span id='float' style='float:left'>PA</span>SS</p>");
-        let (paragraph, _) = geometry(&document, "paragraph");
-        let (float, _) = geometry(&document, "float");
+        let mut document_resources = GlyphResourceStore::default();
+        let document = layout_html(
+            "<p id='paragraph'><span id='float' style='float:left'>PA</span>SS</p>",
+            &mut document_resources,
+        );
+        let (paragraph, _) = geometry(&document, "paragraph", &document_resources);
+        let (float, _) = geometry(&document, "float", &document_resources);
 
         assert_eq!(
             float.y, paragraph.y,
@@ -978,11 +1053,13 @@ mod tests {
 
     #[test]
     fn full_width_inline_float_after_text_starts_below_that_line() {
+        let mut document_resources = GlyphResourceStore::default();
         let document = layout_html(
             "<p id='paragraph' style='width:100px;font-size:5px'>H<span id='float' style='float:left;width:100px;height:20px'></span></p>",
+            &mut document_resources,
         );
-        let (paragraph, _) = geometry(&document, "paragraph");
-        let (float, _) = geometry(&document, "float");
+        let (paragraph, _) = geometry(&document, "paragraph", &document_resources);
+        let (float, _) = geometry(&document, "float", &document_resources);
 
         assert!(
             float.y > paragraph.y,
@@ -992,11 +1069,13 @@ mod tests {
 
     #[test]
     fn inline_float_after_text_shares_the_line_when_both_fit() {
+        let mut document_resources = GlyphResourceStore::default();
         let document = layout_html(
             "<p id='paragraph' style='width:200px;font-size:5px'>H<span id='float' style='float:right;width:100px;height:20px'></span></p>",
+            &mut document_resources,
         );
-        let (paragraph, _) = geometry(&document, "paragraph");
-        let (float, _) = geometry(&document, "float");
+        let (paragraph, _) = geometry(&document, "paragraph", &document_resources);
+        let (float, _) = geometry(&document, "float", &document_resources);
 
         assert_eq!(
             float.y, paragraph.y,
@@ -1006,18 +1085,20 @@ mod tests {
 
     #[test]
     fn clearing_empty_wrappers_advance_between_their_floated_children() {
+        let mut document_resources = GlyphResourceStore::default();
         let document = layout_html(
             "<div style='clear:both'><p id='one' style='float:left;margin:0'>one</p></div>\
              <div style='clear:both;width:300px'><p id='two' style='float:left;margin:0'>two</p></div>\
              <div style='clear:both;height:0'><p id='three' style='float:left;margin:0'>three</p></div>",
+            &mut document_resources,
         );
-        let (one, one_size) = geometry(&document, "one");
-        let (two, two_size) = geometry(&document, "two");
-        let (three, _) = geometry(&document, "three");
+        let (one, one_size) = geometry(&document, "one", &document_resources);
+        let (two, two_size) = geometry(&document, "two", &document_resources);
+        let (three, _) = geometry(&document, "three", &document_resources);
 
         assert_eq!(two.y, one.y + one_size.height);
         assert_eq!(three.y, two.y + two_size.height);
-        let text = document.render_view().text();
+        let text = document.render_view(&document_resources).text();
         let painted_lines = text
             .lines()
             .iter()
@@ -1052,6 +1133,7 @@ mod tests {
 
     #[test]
     fn clearing_break_starts_the_next_float_row_below_collapsed_tables() {
+        let mut document_resources = GlyphResourceStore::default();
         let document = layout_document(
             "<html><body style='margin:0'>\
              <table id='a' style='border-collapse:collapse;float:left'><tr style='border:25px solid red'><td style='padding:0;border:25px solid green'></td></tr></table>\
@@ -1061,12 +1143,13 @@ mod tests {
              <br id='clear' style='clear:both'>\
              <table id='e' style='border-collapse:collapse;float:left;border:25px solid red'><td style='padding:0;border:25px solid green'></td></table>\
              </body></html>",
+            &mut document_resources,
         );
-        let (a, a_size) = geometry(&document, "a");
-        let (b, b_size) = geometry(&document, "b");
-        let (c, c_size) = geometry(&document, "c");
-        let (d, d_size) = geometry(&document, "d");
-        let (e, _) = geometry(&document, "e");
+        let (a, a_size) = geometry(&document, "a", &document_resources);
+        let (b, b_size) = geometry(&document, "b", &document_resources);
+        let (c, c_size) = geometry(&document, "c", &document_resources);
+        let (d, d_size) = geometry(&document, "d", &document_resources);
+        let (e, _) = geometry(&document, "e", &document_resources);
 
         assert_eq!(
             [a_size.width, b_size.width, c_size.width, d_size.width],

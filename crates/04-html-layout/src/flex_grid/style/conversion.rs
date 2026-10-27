@@ -9,9 +9,10 @@ use taffy::style::{
 use super::super::TaffyContainerKind;
 use super::super::tracks::length_percentage_auto;
 
-pub(crate) fn dimension(value: PreferredSize) -> Dimension {
+pub fn dimension(value: PreferredSize) -> Dimension {
     match value {
         PreferredSize::Auto
+        | PreferredSize::Content
         | PreferredSize::MinContent
         | PreferredSize::MaxContent
         | PreferredSize::FitContent => Dimension::auto(),
@@ -75,6 +76,7 @@ pub(super) fn content_alignment(
     value: ContentAlignment,
     kind: TaffyContainerKind,
     main_axis: bool,
+    rtl: bool,
 ) -> Option<TaffyAlignContent> {
     Some(match value {
         ContentAlignment::Normal if kind == TaffyContainerKind::Flex && main_axis => {
@@ -83,6 +85,8 @@ pub(super) fn content_alignment(
         ContentAlignment::Normal => TaffyAlignContent::STRETCH,
         ContentAlignment::Start => TaffyAlignContent::START,
         ContentAlignment::End => TaffyAlignContent::END,
+        ContentAlignment::Left => if rtl { TaffyAlignContent::END } else { TaffyAlignContent::START },
+        ContentAlignment::Right => if rtl { TaffyAlignContent::START } else { TaffyAlignContent::END },
         ContentAlignment::FlexStart => TaffyAlignContent::FLEX_START,
         ContentAlignment::FlexEnd => TaffyAlignContent::FLEX_END,
         ContentAlignment::Center => TaffyAlignContent::CENTER,
@@ -95,20 +99,24 @@ pub(super) fn content_alignment(
 
 pub(super) fn item_alignment(
     value: ItemAlignment,
-    _grid_inline_axis: bool,
+    rtl: bool,
 ) -> Option<TaffyAlignItems> {
     match value {
         ItemAlignment::Auto => None,
         ItemAlignment::Normal => Some(TaffyAlignItems::STRETCH),
-        ItemAlignment::Start | ItemAlignment::SelfStart | ItemAlignment::Left => {
+        ItemAlignment::Start => {
             Some(TaffyAlignItems::START)
         }
-        ItemAlignment::End | ItemAlignment::SelfEnd | ItemAlignment::Right => {
+        ItemAlignment::End => {
             Some(TaffyAlignItems::END)
         }
         ItemAlignment::FlexStart => Some(TaffyAlignItems::FLEX_START),
+        ItemAlignment::Left | ItemAlignment::LegacyLeft => Some(if rtl { TaffyAlignItems::END } else { TaffyAlignItems::START }),
+        ItemAlignment::Right | ItemAlignment::LegacyRight => Some(if rtl { TaffyAlignItems::START } else { TaffyAlignItems::END }),
+        ItemAlignment::SelfStart => Some(TaffyAlignItems::SELF_START),
+        ItemAlignment::SelfEnd => Some(TaffyAlignItems::SELF_END),
         ItemAlignment::FlexEnd => Some(TaffyAlignItems::FLEX_END),
-        ItemAlignment::Center => Some(TaffyAlignItems::CENTER),
+        ItemAlignment::Center | ItemAlignment::LegacyCenter => Some(TaffyAlignItems::CENTER),
         ItemAlignment::Stretch => Some(TaffyAlignItems::STRETCH),
         ItemAlignment::Baseline => Some(TaffyAlignItems::BASELINE),
     }

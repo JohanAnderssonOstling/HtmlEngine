@@ -74,16 +74,10 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             style.layout.flex_wrap = flex_wrap(&value.wrap);
         }
         Property::FlexGrow(value, _) => {
-            let Some(value) = checked_flex_factor(*value) else {
-                return ApplyResult::Invalid;
-            };
-            style.layout.flex_grow = value;
+            style.layout.flex_grow = computed_flex_factor(*value);
         }
         Property::FlexShrink(value, _) => {
-            let Some(value) = checked_flex_factor(*value) else {
-                return ApplyResult::Invalid;
-            };
-            style.layout.flex_shrink = value;
+            style.layout.flex_shrink = computed_flex_factor(*value);
         }
         Property::FlexBasis(value, _) => {
             let Some(value) = flex_basis(
@@ -107,14 +101,8 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             ) else {
                 return ApplyResult::Invalid;
             };
-            let (Some(grow), Some(shrink)) = (
-                checked_flex_factor(value.grow),
-                checked_flex_factor(value.shrink),
-            ) else {
-                return ApplyResult::Invalid;
-            };
-            style.layout.flex_grow = grow;
-            style.layout.flex_shrink = shrink;
+            style.layout.flex_grow = computed_flex_factor(value.grow);
+            style.layout.flex_shrink = computed_flex_factor(value.shrink);
             style.layout.flex_basis = basis;
         }
         Property::Order(value, _) => style.layout.order = *value,

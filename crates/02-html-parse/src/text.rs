@@ -3,7 +3,6 @@ use crate::{
 };
 use html_dom::{Document, DocumentBuildError, DomNodeId, NodeRef};
 use std::collections::HashMap;
-use std::sync::Arc;
 
 /// A durable DOM address for one character in parse-level plain text.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -31,7 +30,7 @@ impl SourceTextPosition {
 pub struct DocumentTextIndex {
     text: String,
     runs: Vec<SourceTextRun>,
-    path_count: usize,
+    paths: Vec<Box<[usize]>>,
 }
 
 struct SourceTextRun {
@@ -39,7 +38,7 @@ struct SourceTextRun {
     text_end: usize,
     byte_start: usize,
     byte_end: usize,
-    element_steps: Arc<[usize]>,
+    path_index: usize,
     text_step: usize,
     utf16_offset: usize,
 }
@@ -59,11 +58,11 @@ impl DocumentTextIndex {
         if let Some(root) = document.dom_root() {
             builder.visit(root);
         }
-        Ok(Self {
-            text: builder.text,
-            runs: builder.runs,
-            path_count: builder.paths.len(),
-        })
+        let mut paths = vec![Box::<[usize]>::default(); builder.paths.len()];
+        for (path, index) in builder.paths {
+            paths[index] = path.into_boxed_slice();
+        }
+        Ok(Self { text: builder.text, runs: builder.runs, paths })
     }
 
     pub fn text(&self) -> &str {
@@ -85,7 +84,7 @@ impl DocumentTextIndex {
             .map(char::len_utf16)
             .sum::<usize>();
         Some(SourceTextPosition {
-            element_steps: run.element_steps.to_vec(),
+            element_steps: self.paths[run.path_index].to_vec(),
             text_step: run.text_step,
             utf16_offset: run.utf16_offset + source_offset,
         })
@@ -95,7 +94,7 @@ impl DocumentTextIndex {
         self.runs.len()
     }
     pub fn source_path_count(&self) -> usize {
-        self.path_count
+        self.paths.len()
     }
 }
 
@@ -104,7 +103,7 @@ struct TextIndexBuilder<'a> {
     text: String,
     text_chars: usize,
     runs: Vec<SourceTextRun>,
-    paths: HashMap<Vec<usize>, Arc<[usize]>>,
+    paths: HashMap<Vec<usize>, usize>,
     text_offsets: HashMap<(DomNodeId, usize), usize>,
     pending_space: bool,
 }
@@ -154,16 +153,13 @@ impl TextIndexBuilder<'_> {
         else {
             return;
         };
-        let element_steps = self
-            .paths
-            .entry(element_steps.clone())
-            .or_insert_with(|| Arc::from(element_steps))
-            .clone();
+        let next_index = self.paths.len();
+        let path_index = *self.paths.entry(element_steps).or_insert(next_index);
         let mut local_utf16 = 0usize;
         let mut run_start = None;
         for character in value.chars() {
             if character.is_whitespace() {
-                self.finish_run(&mut run_start, element_steps.clone(), text_step);
+                self.finish_run(&mut run_start, path_index, text_step);
                 self.pending_space = true;
             } else {
                 if self.pending_space && !self.text.is_empty() {
@@ -181,13 +177,13 @@ impl TextIndexBuilder<'_> {
             }
             local_utf16 += character.len_utf16();
         }
-        self.finish_run(&mut run_start, element_steps, text_step);
+        self.finish_run(&mut run_start, path_index, text_step);
     }
 
     fn finish_run(
         &mut self,
         start: &mut Option<(usize, usize, usize)>,
-        element_steps: Arc<[usize]>,
+        path_index: usize,
         text_step: usize,
     ) {
         let Some((text_start, byte_start, utf16_offset)) = start.take() else {
@@ -198,7 +194,7 @@ impl TextIndexBuilder<'_> {
             text_end: self.text_chars,
             byte_start,
             byte_end: self.text.len(),
-            element_steps,
+            path_index,
             text_step,
             utf16_offset,
         });

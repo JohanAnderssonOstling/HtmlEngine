@@ -4,6 +4,7 @@ use super::*;
 
 pub(in crate::layout) struct InlineFormattingInput {
     pub(in crate::layout) container_box_idx: usize,
+    pub(in crate::layout) starts_block: bool,
     pub(in crate::layout) run_range: Range<u32>,
     pub(in crate::layout) area: InlineLayoutArea,
     pub(in crate::layout) paragraph: ParagraphLayout,
@@ -18,6 +19,7 @@ pub(in crate::layout) struct InlineLayoutArea {
 
 #[derive(Clone, Copy, PartialEq)]
 pub(in crate::layout) struct ParagraphLayout {
+    pub(in crate::layout) direction: TextDirection,
     pub(in crate::layout) indent: ResolvedTextIndent,
     pub(in crate::layout) text_align: TextAlign,
     pub(in crate::layout) text_align_last: TextAlign,
@@ -28,6 +30,7 @@ pub(in crate::layout) struct ResolvedTextIndent {
     pub(in crate::layout) amount: f64,
     pub(in crate::layout) hanging: bool,
     pub(in crate::layout) each_line: bool,
+    pub(in crate::layout) first_line: bool,
 }
 
 /// Builds the paragraph token stream and places inline float anchors at their
@@ -35,7 +38,8 @@ pub(in crate::layout) struct ResolvedTextIndent {
 ///
 /// The boolean reports whether line widths must be queried from the active
 /// float formatting context. Token preparation itself is shared by both paths.
-pub(super) fn prepare_inline_tokens(engine: &mut crate::layout::LayoutEngine<'_, '_>, input: &InlineFormattingInput) -> (InlineTokens, bool) {
+pub(super) fn prepare_inline_tokens(engine: &mut crate::layout::LayoutEngine<'_, '_>, input: &InlineFormattingInput) -> (InlineTokens<'static>, bool) {
+    profile_scope!("layout.prepare_tokens");
     let source_runs = &engine.text.inline_items()[input.run_range.start as usize..input.run_range.end as usize];
     let is_float_anchor = |run: &InlineItem| {
         let InlineItemKind::FloatAnchor { box_idx } = run.kind else {
@@ -46,7 +50,8 @@ pub(super) fn prepare_inline_tokens(engine: &mut crate::layout::LayoutEngine<'_,
             Float::Left | Float::Right
         )
     };
-    let has_float_exclusions = source_runs.iter().any(is_float_anchor)
+    let places_floats = source_runs.iter().any(is_float_anchor);
+    let has_float_exclusions = places_floats
         || engine
             .floats
             .current_float_context()
@@ -64,6 +69,11 @@ pub(super) fn prepare_inline_tokens(engine: &mut crate::layout::LayoutEngine<'_,
         max_width,
         input.area.percentage_height_basis,
     );
+    // This walk predicts source positions only to place this paragraph's
+    // float anchors. Existing exclusions are handled by line composition.
+    if !places_floats {
+        return (tokens, has_float_exclusions);
+    }
     let mut floated_boxes = Vec::new();
     let mut line_y = input.area.origin.y;
     let mut line_advance = 0.0f64;
@@ -75,7 +85,7 @@ pub(super) fn prepare_inline_tokens(engine: &mut crate::layout::LayoutEngine<'_,
     for (token_index, token) in tokens.iter().enumerate() {
         let metrics = token.run_metrics(&tokens.runs);
         let token_height =
-            (f64::from(metrics.ascent) + f64::from(metrics.descent)).max(metrics.line_height);
+            (f64::from(metrics.ascent) + f64::from(metrics.descent)).max(f64::from(metrics.line_height));
         match token.kind() {
             InlineTokenKind::FloatAnchor { box_idx } => {
                 let box_idx = box_idx as usize;
@@ -116,7 +126,7 @@ pub(super) fn prepare_inline_tokens(engine: &mut crate::layout::LayoutEngine<'_,
                             }
                             if !matches!(following.kind(), InlineTokenKind::FloatAnchor { .. }) {
                                 advance +=
-                                    following.advance_at(&tokens.runs, line_advance + advance);
+                                    following.advance_at(&engine.reader, &tokens.runs, line_advance + advance);
                             }
                         }
                         advance
@@ -178,7 +188,7 @@ pub(super) fn prepare_inline_tokens(engine: &mut crate::layout::LayoutEngine<'_,
             }
             InlineTokenKind::AbsoluteAnchor { .. } | InlineTokenKind::InlineBoundary { .. } => {}
             _ => {
-                let advance = token.advance_at(&tokens.runs, line_advance);
+                let advance = token.advance_at(&engine.reader, &tokens.runs, line_advance);
                 let available = engine
                     .floats
                     .current_float_context()
@@ -247,8 +257,8 @@ pub(super) fn prepare_lines_around_float_exclusions(
     let mut y = 0.0;
     let mut max_width = 0.0f64;
     let mut start = 0usize;
-    let mut is_first_line = true;
-    let mut starts_indented_line = true;
+    let mut is_first_line = input.starts_block;
+    let mut starts_indented_line = input.paragraph.indent.first_line;
     while start < tokens.len() {
         let container_line_height =
             resolved_line_height(engine.reader.style(input.container_box_idx));
@@ -264,7 +274,7 @@ pub(super) fn prepare_lines_around_float_exclusions(
             })
             .map(|token| {
                 let metrics = token.run_metrics(&tokens.runs);
-                (f64::from(metrics.ascent) + f64::from(metrics.descent)).max(metrics.line_height)
+                (f64::from(metrics.ascent) + f64::from(metrics.descent)).max(f64::from(metrics.line_height))
             })
             .next()
             .unwrap_or(container_line_height)
@@ -285,7 +295,7 @@ pub(super) fn prepare_lines_around_float_exclusions(
             let item_height = {
                 let metrics = item.run_metrics(&tokens.runs);
                 (f64::from(metrics.ascent) + f64::from(metrics.descent))
-                    .max(metrics.line_height)
+                    .max(f64::from(metrics.line_height))
                     .max(1.0)
             };
             if item_width <= input.area.width {
@@ -327,10 +337,12 @@ pub(super) fn prepare_lines_around_float_exclusions(
         );
         let constraints = LineConstraints {
             indent: line_indent,
-            tab_origin: (left - input.area.origin.x) + line_indent,
+            tab_origin: if input.paragraph.direction == TextDirection::Rtl {
+                input.area.origin.x + input.area.width - right + line_indent
+            } else { (left - input.area.origin.x) + line_indent },
             width_limit: (right - left - line_indent).max(0.0),
         };
-        let result = break_next_line(tokens, &tokens.runs, input.paragraph, start, constraints);
+        let result = break_next_line(&engine.reader, tokens, &tokens.runs, input.paragraph, start, constraints);
         let previous_start = start;
         start = result.next_start;
         starts_indented_line = result.ended_by_forced_break && input.paragraph.indent.each_line;

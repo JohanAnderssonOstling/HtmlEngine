@@ -8,6 +8,7 @@ pub(super) fn publish_inline_box_geometry(
     fragments: &FragmentWriter<'_>,
     scratch: &mut FinalizationScratch,
 ) {
+    profile_scope!("finalize.inline_geometry");
     let mut bounds = std::mem::take(&mut scratch.inline_bounds);
     bounds.resize(reader.box_count(), None);
     bounds.fill(None);

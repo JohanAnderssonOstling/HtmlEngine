@@ -38,7 +38,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             style.box_model.height = value;
         }
         Property::AspectRatio(value) => {
-            let components = value.ratio.as_ref().map(|ratio| (ratio.0, ratio.1));
+            let components = value.ratio.as_ref().map(|ratio| (ratio.0.max(0.0), ratio.1.max(0.0)));
             let Some(value) = ComputedAspectRatio::new(value.auto, components) else {
                 return ApplyResult::Invalid;
             };

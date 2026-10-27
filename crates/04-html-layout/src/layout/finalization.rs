@@ -10,15 +10,14 @@ use super::read_context::LayoutReader;
 mod geometry;
 mod ordering;
 mod overflow;
-pub(crate) mod text_paint;
+pub mod text_paint;
 
 use geometry::publish_inline_box_geometry;
 use ordering::{
-    build_block_decoration_traversal, rebuild_decoration_fragments_by_line,
+    build_block_decoration_traversal, build_scene_paint_order, rebuild_decoration_fragments_by_line,
     rebuild_glyph_line_indices, rebuild_image_fragments_by_line, sort_lines_and_remap_images,
 };
 use overflow::rebuild_overflow_clips;
-use text_paint::prepare_line_text_runs;
 
 #[derive(Default)]
 pub(super) struct FinalizationScratch {
@@ -29,7 +28,7 @@ pub(super) struct FinalizationScratch {
     inline_bounds: Vec<Option<Rect>>,
 }
 impl FinalizationScratch {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     pub(super) fn allocation_capacities(&self) -> (usize, usize, usize, usize, usize, usize) {
         (
             self.line_pairs.capacity(),
@@ -44,6 +43,7 @@ impl FinalizationScratch {
 
 impl LayoutEngine<'_, '_> {
     pub(super) fn repaint(&mut self) {
+        profile_scope!("layout.paint_replay");
         let commands = std::mem::take(&mut self.fragments.state_mut().paint_program.commands);
         let output = &mut self.fragments.state_mut().fragment_output;
         output.decorations.clear();
@@ -63,6 +63,7 @@ impl LayoutEngine<'_, '_> {
         build_block_decoration_traversal(&self.reader, &mut self.fragments, &mut self.finalization);
         super::decorations::collect_inline_decorations(self);
         rebuild_decoration_fragments_by_line(&mut self.fragments);
+        build_scene_paint_order(&self.reader, &mut self.fragments);
         if self.track_overflow_clips {
             let (layout, _, owners) = self.fragments.finalization_parts();
             layout.fragment_output.decoration_clips.extend(owners.iter().map(|&owner| {
@@ -74,7 +75,10 @@ impl LayoutEngine<'_, '_> {
     }
 
     pub(super) fn finalize(&mut self, track_overflow_clips: bool) {
+        profile_scope!("layout.finalize");
         let finalization_started = self.start_timing();
+
+        self.release_previous_lines();
 
         // Recursive layout retains subtree placement transforms so moving a
         // container is independent of descendant count. Public layout output
@@ -86,12 +90,9 @@ impl LayoutEngine<'_, '_> {
         sort_lines_and_remap_images(
             &self.reader,
             &mut self.fragments,
-            &mut self.placement,
             &mut self.finalization,
         );
         self.record_timing(|timings| timings.sort_lines_and_remap_images += start.elapsed());
-
-        prepare_line_text_runs(&self.text, &mut self.fragments, &[]);
 
         rebuild_glyph_line_indices(self.text.glyphs().len(), &mut self.fragments);
 

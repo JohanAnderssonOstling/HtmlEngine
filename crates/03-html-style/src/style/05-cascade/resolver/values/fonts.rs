@@ -4,26 +4,36 @@ pub(in crate::style::cascade::resolver) fn viewport_length_to_px(
     length: &LengthValue,
     resolution: &ResolutionContext,
 ) -> Option<f32> {
-    if matches!(
-        length,
-        LengthValue::Vw(_) | LengthValue::Vh(_) | LengthValue::Vmin(_) | LengthValue::Vmax(_)
-    ) {
-        resolution.uses_viewport_units.set(true);
-    }
     let environment = resolution.environment;
     let width = environment.viewport_width() as f32;
-    let value = match length {
-        LengthValue::Vw(value) => value * width / 100.0,
-        LengthValue::Vh(value) => value * environment.viewport_height()? as f32 / 100.0,
-        LengthValue::Vmin(value) => {
-            value * width.min(environment.viewport_height()? as f32) / 100.0
-        }
-        LengthValue::Vmax(value) => {
-            value * width.max(environment.viewport_height()? as f32) / 100.0
-        }
-        _ => return None,
+    let height = environment.viewport_height().map(|value| value as f32);
+    let resolve = |factor: f32, basis: Option<f32>| {
+        resolution.uses_viewport_units.set(true);
+        let value = factor * basis? / 100.0;
+        value.is_finite().then_some(value)
     };
-    value.is_finite().then_some(value)
+    // The renderer has one static viewport and horizontal writing axes.
+    // It has no eligible size-query containers: container units therefore
+    // use the specified small-viewport fallback on the corresponding axis.
+    match length {
+        LengthValue::Vw(value) | LengthValue::Vi(value)
+        | LengthValue::Svw(value) | LengthValue::Svi(value)
+        | LengthValue::Lvw(value) | LengthValue::Lvi(value)
+        | LengthValue::Dvw(value) | LengthValue::Dvi(value)
+        | LengthValue::Cqw(value) | LengthValue::Cqi(value) => resolve(*value, Some(width)),
+        LengthValue::Vh(value) | LengthValue::Vb(value)
+        | LengthValue::Svh(value) | LengthValue::Svb(value)
+        | LengthValue::Lvh(value) | LengthValue::Lvb(value)
+        | LengthValue::Dvh(value) | LengthValue::Dvb(value)
+        | LengthValue::Cqh(value) | LengthValue::Cqb(value) => resolve(*value, height),
+        LengthValue::Vmin(value) | LengthValue::Svmin(value)
+        | LengthValue::Lvmin(value) | LengthValue::Dvmin(value)
+        | LengthValue::Cqmin(value) => resolve(*value, height.map(|height| width.min(height))),
+        LengthValue::Vmax(value) | LengthValue::Svmax(value)
+        | LengthValue::Lvmax(value) | LengthValue::Dvmax(value)
+        | LengthValue::Cqmax(value) => resolve(*value, height.map(|height| width.max(height))),
+        _ => None,
+    }
 }
 
 pub(in crate::style::cascade::resolver) fn font_size_to_px(
@@ -74,7 +84,7 @@ pub(in crate::style::cascade::resolver) fn checked_font_size(
             canonical,
         )
     })? * scale;
-    (value.is_finite() && value >= 0.0).then_some(value)
+    value.is_finite().then_some(value.max(0.0))
 }
 
 pub(in crate::style::cascade::resolver) fn checked_font_size_components(
@@ -140,6 +150,11 @@ fn canonical_font_size_components(
                 resolution,
             )?;
         let absolute_px = absolute_px + percentage * parent_font_size;
+        let absolute_px = if x_height_px == 0.0 && ch_advance_px == 0.0 && cap_height_px == 0.0 {
+            absolute_px.max(0.0)
+        } else {
+            absolute_px
+        };
         return (absolute_px.is_finite()
             && absolute_px >= 0.0
             && x_height_px.is_finite()
@@ -246,8 +261,8 @@ pub(in crate::style::cascade::resolver) fn set_line_height_resolution_bases(
     resolution: &ResolutionContext,
 ) {
     let (font, text) = if matches!(
-        property,
-        Property::FontSize(_) | Property::LineHeight(_) | Property::Font(_)
+        property.property_id(),
+        PropertyId::FontSize | PropertyId::LineHeight | PropertyId::Font
     ) {
         (&parent.font, &parent.text)
     } else {
@@ -260,8 +275,8 @@ pub(in crate::style::cascade::resolver) fn set_line_height_resolution_bases(
         // use their initial basis to avoid a cycle. Other root properties
         // can use the prerequisite-resolved root line height.
         if matches!(
-            property,
-            Property::FontSize(_) | Property::LineHeight(_) | Property::Font(_)
+            property.property_id(),
+            PropertyId::FontSize | PropertyId::LineHeight | PropertyId::Font
         ) {
             let initial = ParentStyle::initial(doc.root_font_size());
             computed_line_height(&initial.font, &initial.text)
@@ -298,12 +313,8 @@ pub(in crate::style::cascade::resolver) fn set_marker_resolution_bases(
 // overflow when the layout backend sums several large flex factors.
 pub(in crate::style::cascade::resolver) const MAX_COMPUTED_FLEX_FACTOR: f32 = 1_000_000.0;
 
-pub(in crate::style::cascade::resolver) fn checked_flex_factor(value: f32) -> Option<f32> {
-    if value.is_nan() || value < 0.0 {
-        None
-    } else if value.is_infinite() {
-        value.is_sign_positive().then_some(MAX_COMPUTED_FLEX_FACTOR)
-    } else {
-        Some(value.min(MAX_COMPUTED_FLEX_FACTOR))
-    }
+pub(in crate::style::cascade::resolver) fn computed_flex_factor(value: f32) -> f32 {
+    // Source validation rejects negative literals. Calculated results clamp
+    // at computed-value time; NaN is censored to zero.
+    value.max(0.0).min(MAX_COMPUTED_FLEX_FACTOR)
 }

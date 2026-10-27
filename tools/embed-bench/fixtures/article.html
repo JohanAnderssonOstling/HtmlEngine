@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Embedding benchmark: article</title>
+  <style>
+    html { overflow: hidden; font: 16px/1.5 "DejaVu Sans", sans-serif; background: white; color: #20242a; }
+    body { margin: 0; padding: 24px; }
+    h1 { font-size: 30px; line-height: 1.2; margin: 0 0 16px; }
+    h2 { font-size: 20px; margin: 24px 0 8px; }
+    p { margin: 0 0 16px; }
+    blockquote { margin: 16px 0; padding: 12px; border-left: 4px solid #386a83; background: #eef3f6; }
+    ul { margin: 0 0 16px; padding-left: 24px; }
+    a { color: #235a91; }
+  </style>
+</head>
+<body>
+  <h1>A document inside an application</h1>
+  <p>This static article exercises real font shaping, paragraph wrapping, inline
+     emphasis, lists, backgrounds, and borders. Both hosts receive the same HTML
+     and use the same viewport and installed font family.</p>
+  <p>The reading room holds <strong>carefully composed books</strong>, handwritten
+     notes, and an <em>illustrated catalogue</em>. Its shelves connect technology,
+     history, and the everyday experience of reading.</p>
+  <blockquote>A useful benchmark measures equivalent work and checks the result.</blockquote>
+  <h2>What the application displays</h2>
+  <ul>
+    <li>Readable paragraphs with consistent spacing</li>
+    <li>Ordinary inline formatting and a <a href="#notes">document link</a></li>
+    <li>Visible decoration without authored scripts</li>
+  </ul>
+  <p id="notes">Document loading is timed after the empty window is ready.
+     Retained memory includes browser helper processes.</p>
+</body>
+</html>

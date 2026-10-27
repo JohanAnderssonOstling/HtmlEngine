@@ -3,7 +3,7 @@ use crate::layout::{
     constrain_content_width, contains_full_width_percentage_table, resolve_vertical_size,
 };
 use crate::layout_model::{LayoutMode, TableColumnGroupSpan, TableColumnTrack};
-use html_style_model::{BorderCollapseMode, BoxSizing, UsedPreferredSize as PreferredSize};
+use html_style_model::{BorderCollapseMode, BoxSizing, TextDirection, UsedPreferredSize as PreferredSize};
 use kurbo::{Point, Rect, Size, Vec2};
 
 use super::backgrounds::{emit_collapsed_table_background, emit_table_layers};
@@ -435,7 +435,7 @@ fn layout_zero_column_grid(
     size
 }
 
-pub(crate) fn layout_table(
+pub fn layout_table(
     session: &mut LayoutEngine<'_, '_>,
     resolved: &ResolvedBoxSizing,
     rows: Vec<u32>,
@@ -603,8 +603,9 @@ fn resolve_table_plan(
         collapsed_grid.as_ref(),
         fixed_mode,
     );
+    columns.rtl = session.reader.style(input.table_box_idx).direction() == TextDirection::Rtl;
     for start in &mut columns.starts {
-        *start += outer_borders.left;
+        *start += if columns.rtl { outer_borders.right } else { outer_borders.left };
     }
     columns.table_width += outer_borders.horizontal();
     // Measure bottom captions in isolation so they do not emit paint before
@@ -851,7 +852,7 @@ fn publish_table_plan(session: &mut LayoutEngine<'_, '_>, plan: ResolvedTablePla
         let span_height = span_extent(&row_starts, &row_heights, placement.row, placement.rowspan);
 
         let final_point = Point::new(
-            table_content_pos.x + columns.starts[placement.col],
+            table_content_pos.x + columns.physical_start(placement.col, placement.colspan),
             table_content_pos.y + row_starts[placement.row],
         );
         let (cell_output, natural_height, cell_has_content) = match &cells.layouts[i] {
@@ -945,6 +946,7 @@ fn publish_table_plan(session: &mut LayoutEngine<'_, '_>, plan: ResolvedTablePla
             session,
             table_box_idx,
             table_content_pos,
+            columns.table_width,
             &columns.starts,
             &columns.widths,
             row_starts,
@@ -983,13 +985,14 @@ fn emit_table_row_layer_background<'a>(
             placement.colspan,
         );
         let height = span_extent(row_starts, row_heights, placement.row, placement.rowspan);
-        let Some((&x, &y)) = columns
+        let Some((_, &y)) = columns
             .starts
             .get(placement.col)
             .zip(row_starts.get(placement.row))
         else {
             continue;
         };
+        let x = columns.physical_start(placement.col, placement.colspan);
         crate::layout::decorations::emit_bound_background(
             session,
             owner_box_idx,

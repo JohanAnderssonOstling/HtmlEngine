@@ -6,6 +6,10 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
+use cssparser::{
+    AtRuleParser, CowRcStr, ParseError, Parser, ParserInput, ParserState, QualifiedRuleParser,
+    StyleSheetParser,
+};
 
 /// Upstream WPT revision expected by this test adapter and the owning suites.
 pub const WPT_REVISION: &str = "7ea3d665ff9ae1df1f742433d51bd1e9c6499a3b";
@@ -187,6 +191,7 @@ pub enum CssParsingTestKind {
     ValidSelector,
     InvalidSelector,
     ValidForgivingSelector,
+    SelectorSerialization,
     ValidRule,
     InvalidRule,
     ValidLayerImport,
@@ -335,7 +340,7 @@ pub fn extract_css_parsing_tests_with_prelude(source: &str, prelude: &str) -> Cs
                             }
                             continue;
                         }
-                        if let Some(expansion) = expand_custom_css_helper(source, helper, &raw_arguments, start, call_line, &static_loops) {
+                        if let Some(expansion) = expand_custom_css_helper(source, helper, &raw_arguments, start, call_line, &static_loops, static_functions.get(helper)) {
                             match expansion {
                                 Ok(tests) => extraction.tests.extend(tests),
                                 Err(reason) => extraction.unsupported_calls.push(UnsupportedCssParsingCall { helper: helper.to_owned(), line: call_line, reason }),
@@ -809,7 +814,7 @@ fn expand_is_where_assertion(raw_arguments: &[&str], line: usize) -> Result<Vec<
         .collect())
 }
 
-fn expand_custom_css_helper(source: &str, helper: &str, arguments: &[&str], call_offset: usize, line: usize, loops: &[StaticLoopBinding]) -> Option<Result<Vec<CssParsingTest>, String>> {
+fn expand_custom_css_helper(source: &str, helper: &str, arguments: &[&str], call_offset: usize, line: usize, loops: &[StaticLoopBinding], function: Option<&StaticFunction>) -> Option<Result<Vec<CssParsingTest>, String>> {
     let declaration_tests = |kind, property: &str, value_indices: &[usize]| -> Result<Vec<CssParsingTest>, String> {
         value_indices
             .iter()
@@ -1063,16 +1068,241 @@ fn expand_custom_css_helper(source: &str, helper: &str, arguments: &[&str], call
             // permutations recursively. Reproduce that finite data generator
             // so the upstream files remain unchanged and no JS engine is needed.
             "test_various" => expand_font_various(source, arguments, line),
-            // This helper exists only in starting-style-parsing.html and inserts
-            // the supplied at-rule prefix followed by an empty block.
+            // Helpers with these names have different signatures. Inspect a
+            // declared style setter before interpreting argument 0 as a rule.
             "test_valid" | "test_invalid" => {
+                if function.is_some_and(|function| function_sets_style_value(source, function)) {
+                    let property = literal_argument(arguments, 0, helper)?;
+                    let kind = if helper == "test_valid" { CssParsingTestKind::ValidValue } else { CssParsingTestKind::InvalidValue };
+                    return declaration_tests(kind, &property, &[1]);
+                }
                 let prefix = literal_argument(arguments, 0, helper)?;
                 let kind = if helper == "test_valid" { CssParsingTestKind::ValidRule } else { CssParsingTestKind::InvalidRule };
+                if let Some(rule) = function.and_then(|function| function_rule_input(source, function, &prefix)) {
+                    return rule_test(kind, rule?);
+                }
+                if function.is_some() {
+                    return Err("local rule helper does not insert a statically resolvable rule".to_owned());
+                }
+                // Legacy external rule-prefix helpers append an empty block.
                 rule_test(kind, format!("{prefix}{{}}"))
             }
             _ => unreachable!("custom helper guard and expansion match stay synchronized"),
         }
     })())
+}
+
+/// Read the CSS expression consumed by a local rule helper, rather than
+/// assuming that every helper with the same name appends a block.
+fn function_rule_input(
+    source: &str,
+    function: &StaticFunction,
+    value: &str,
+) -> Option<Result<String, String>> {
+    let parameter = function.parameters.first()?;
+    let environment = BTreeMap::from([(parameter.clone(), value.to_owned())]);
+    let unbound = BTreeMap::new();
+    let expand = |expression: &str| {
+        let rule = evaluate_static_string(expression, &environment)?;
+        evaluate_static_string(expression, &unbound)
+            .is_none()
+            .then_some(rule)
+    };
+    let bytes = source.as_bytes();
+    let mut cursor = function.body_start + 1;
+    while cursor < function.body_end {
+        if !is_js_identifier_start(bytes[cursor]) {
+            advance_js_token(bytes, &mut cursor);
+            continue;
+        }
+        let start = cursor;
+        cursor += 1;
+        while cursor < function.body_end && is_js_identifier_continue(bytes[cursor]) {
+            cursor += 1;
+        }
+        let name = &source[start..cursor];
+        let mut open = cursor;
+        skip_ascii_whitespace(bytes, &mut open);
+        if matches!(name, "replaceSync" | "find_at_property_rule") && bytes.get(open) == Some(&b'(')
+        {
+            let mut ignored_line = 0;
+            if let Ok((arguments, end)) = collect_js_call_arguments(source, open, &mut ignored_line)
+            {
+                cursor = end;
+                if arguments.len() != 1 {
+                    continue;
+                }
+                if name == "find_at_property_rule" && arguments[0].trim() == parameter {
+                    return Some(embedded_property_rule(source, value));
+                }
+                if name == "replaceSync" {
+                    if let Some(rule) = expand(arguments[0]) {
+                        return Some(Ok(rule));
+                    }
+                }
+            }
+        }
+        if name == "textContent"
+            && bytes.get(open) == Some(&b'=')
+            && bytes.get(open + 1) != Some(&b'=')
+        {
+            let expression_start = open + 1;
+            cursor = expression_start;
+            while cursor < function.body_end && bytes[cursor] != b';' {
+                advance_js_token(bytes, &mut cursor);
+            }
+            if let Some(rule) = expand(&source[expression_start..cursor]) {
+                return Some(Ok(rule));
+            }
+        }
+    }
+    None
+}
+
+fn first_inline_stylesheet(source: &str) -> Option<&str> {
+    let lower = source.to_ascii_lowercase();
+    let mut cursor = 0;
+    while let Some(offset) = lower[cursor..].find('<') {
+        let start = cursor + offset;
+        if lower[start..].starts_with("<!--") {
+            cursor = start + lower[start..].find("-->")? + 3;
+            continue;
+        }
+        let end = start + lower[start..].find('>')? + 1;
+        let name_end = lower[start + 1..end]
+            .find(|c: char| !c.is_ascii_alphanumeric() && c != '-')
+            .unwrap_or(end - start - 1)
+            + start
+            + 1;
+        match &lower[start + 1..name_end] {
+            "style" => {
+                let length = lower[end..].find("</style")?;
+                return Some(&source[end..end + length]);
+            }
+            "script" => {
+                let close = end + lower[end..].find("</script")?;
+                cursor = close + lower[close..].find('>')? + 1;
+            }
+            _ => cursor = end,
+        }
+    }
+    None
+}
+
+fn embedded_property_rule(source: &str, requested: &str) -> Result<String, String> {
+    struct Rules<'a> {
+        source: &'a str,
+    }
+    impl<'i> AtRuleParser<'i> for Rules<'i> {
+        type Prelude = Option<String>;
+        type AtRule = Option<(String, String)>;
+        type Error = ();
+        fn parse_prelude<'t>(
+            &mut self,
+            name: CowRcStr<'i>,
+            input: &mut Parser<'i, 't>,
+        ) -> Result<Self::Prelude, ParseError<'i, ()>> {
+            if name.eq_ignore_ascii_case("property") {
+                let name = input.expect_ident_cloned()?.to_string();
+                input.expect_exhausted()?;
+                Ok(Some(name))
+            } else {
+                while input.next().is_ok() {}
+                Ok(None)
+            }
+        }
+        fn parse_block<'t>(
+            &mut self,
+            name: Self::Prelude,
+            start: &ParserState,
+            input: &mut Parser<'i, 't>,
+        ) -> Result<Self::AtRule, ParseError<'i, ()>> {
+            while input.next().is_ok() {}
+            let end = input.position().byte_index();
+            let end = end + usize::from(self.source.as_bytes().get(end) == Some(&b'}'));
+            Ok(name.map(|name| {
+                (
+                    name,
+                    self.source[start.position().byte_index()..end].to_owned(),
+                )
+            }))
+        }
+    }
+    impl<'i> QualifiedRuleParser<'i> for Rules<'i> {
+        type Prelude = ();
+        type QualifiedRule = Option<(String, String)>;
+        type Error = ();
+    }
+    let stylesheet = first_inline_stylesheet(source)
+        .ok_or_else(|| "property-rule lookup has no inline stylesheet".to_owned())?;
+    let mut input = ParserInput::new(stylesheet);
+    let mut rules = Rules { source: stylesheet };
+    let mut matches = StyleSheetParser::new(&mut Parser::new(&mut input), &mut rules)
+        .filter_map(|rule| rule.ok().flatten())
+        .filter(|(name, _)| name == requested)
+        .map(|(_, rule)| rule)
+        .collect::<Vec<_>>();
+    if matches.len() == 1 {
+        Ok(matches.remove(0))
+    } else {
+        Err(format!(
+            "property-rule lookup for {requested} has {} matching source rules",
+            matches.len()
+        ))
+    }
+}
+
+fn function_sets_style_value(source: &str, function: &StaticFunction) -> bool {
+    if function.parameters.len() < 2 {
+        return false;
+    }
+    let bytes = source.as_bytes();
+    let mut cursor = function.body_start + 1;
+    let mut member = 0;
+    while cursor < function.body_end {
+        match bytes[cursor] {
+            byte if byte.is_ascii_whitespace() => cursor += 1,
+            b'/' if matches!(bytes.get(cursor + 1), Some(b'/' | b'*')) => {
+                advance_js_token(bytes, &mut cursor);
+            }
+            byte if is_js_identifier_start(byte) => {
+                let start = cursor;
+                cursor += 1;
+                while cursor < function.body_end && is_js_identifier_continue(bytes[cursor]) {
+                    cursor += 1;
+                }
+                let name = &source[start..cursor];
+                if member == 2 && name == "setProperty" {
+                    let mut open = cursor;
+                    skip_ascii_whitespace(bytes, &mut open);
+                    if bytes.get(open) == Some(&b'(') {
+                        let mut ignored_line = 0;
+                        if let Ok((arguments, end)) =
+                            collect_js_call_arguments(source, open, &mut ignored_line)
+                        {
+                            if arguments.len() == 2
+                                && arguments[0].trim() == function.parameters[0]
+                                && arguments[1].trim() == function.parameters[1]
+                            {
+                                return true;
+                            }
+                            cursor = end;
+                        }
+                    }
+                }
+                member = usize::from(name == "style");
+            }
+            b'.' => {
+                member = if member == 1 { 2 } else { 0 };
+                cursor += 1;
+            }
+            _ => {
+                member = 0;
+                advance_js_token(bytes, &mut cursor);
+            }
+        }
+    }
+    false
 }
 
 fn expand_gap_shorthand_matrix(source: &str, call_offset: usize, line: usize) -> Result<Vec<CssParsingTest>, String> {
@@ -1498,7 +1728,7 @@ fn css_test_kind(helper: &str) -> Option<CssParsingTestKind> {
         "test_shorthand_value" => CssParsingTestKind::ShorthandValue,
         "test_valid_selector" => CssParsingTestKind::ValidSelector,
         "test_invalid_selector" => CssParsingTestKind::InvalidSelector,
-        "assert_selector_serializes_to" => CssParsingTestKind::ValidSelector,
+        "assert_selector_serializes_to" => CssParsingTestKind::SelectorSerialization,
         "assert_invalid_selector" => CssParsingTestKind::InvalidSelector,
         "test_valid_forgiving_selector" => CssParsingTestKind::ValidForgivingSelector,
         "test_valid_rule" => CssParsingTestKind::ValidRule,
@@ -1518,6 +1748,7 @@ fn required_argument_count(kind: CssParsingTestKind) -> usize {
         CssParsingTestKind::ValidSelector
         | CssParsingTestKind::InvalidSelector
         | CssParsingTestKind::ValidForgivingSelector
+        | CssParsingTestKind::SelectorSerialization
         | CssParsingTestKind::ValidRule
         | CssParsingTestKind::InvalidRule
         | CssParsingTestKind::ValidLayerImport
@@ -1886,6 +2117,132 @@ mod tests {
     }
 
     #[test]
+    fn local_rule_helpers_preserve_complete_rules_and_explicit_block_suffixes() {
+        let source = r#"
+            function test_valid(rule) {
+                const example = "sheet.replaceSync(rule + '{}')";
+                // style.textContent = `${rule}{}`;
+                sheet.replaceSync(`${rule}`);
+            }
+            test_valid('@custom-media --small (width < 30em)');
+        "#;
+        let extraction = extract_css_parsing_tests(source);
+        assert_eq!(extraction.unsupported_calls, []);
+        assert_eq!(extraction.tests[0].kind, CssParsingTestKind::ValidRule);
+        assert_eq!(
+            extraction.tests[0].arguments,
+            ["@custom-media --small (width < 30em)"]
+        );
+        let source = r#"
+            function test_invalid(actual) { style.textContent = `${actual}{}`; }
+            test_invalid('@scope ()');
+        "#;
+        let extraction = extract_css_parsing_tests(source);
+        assert_eq!(extraction.unsupported_calls, []);
+        assert_eq!(extraction.tests[0].kind, CssParsingTestKind::InvalidRule);
+        assert_eq!(extraction.tests[0].arguments, ["@scope (){}"]);
+    }
+
+    #[test]
+    fn local_property_lookup_helpers_extract_original_embedded_rules() {
+        let source = r#"
+            <!-- <style>@property --bad { inherits: true; }</style> -->
+            <script>const example = '<style>@property --bad {}</style>';</script>
+            <style>
+                @property --bad { syntax: "<color>"; }
+                @property --b\61 d-case { syntax: "*"; inherits: false; initial-value: "}"; }
+                @property --BAD { syntax: "*"; inherits: true; }
+            </style>
+            <script>
+                function test_invalid(name) {
+                    const example = "sheet.replaceSync(name)";
+                    const rule = find_at_property_rule(name);
+                    assert_true(!rule);
+                }
+                test_invalid('--bad', 'this optional argument is not inserted');
+                test_invalid('--bad-case');
+            </script>
+        "#;
+        let extraction = extract_css_parsing_tests(source);
+        assert_eq!(extraction.unsupported_calls, []);
+        assert_eq!(extraction.tests.len(), 2);
+        assert_eq!(
+            extraction.tests[0].arguments,
+            [r#"@property --bad { syntax: "<color>"; }"#]
+        );
+        assert_eq!(
+            extraction.tests[1].arguments,
+            [r#"@property --b\61 d-case { syntax: "*"; inherits: false; initial-value: "}"; }"#]
+        );
+        assert!(
+            extraction
+                .tests
+                .iter()
+                .all(|test| test.kind == CssParsingTestKind::InvalidRule)
+        );
+    }
+
+    #[test]
+    fn local_rule_helpers_do_not_invent_inputs_from_unused_parameters() {
+        for body in [
+            r#"sheet.replaceSync('');"#,
+            r#"const example = 'sheet.replaceSync(rule)'; /* sheet.replaceSync(rule) */"#,
+            r#"style.textContent = '';"#,
+        ] {
+            let source = format!(
+                "function test_invalid(rule) {{{body}}} test_invalid('@custom-media --bad false true');"
+            );
+            let extraction = extract_css_parsing_tests(&source);
+            assert_eq!(extraction.tests, []);
+            assert_eq!(extraction.unsupported_calls.len(), 1);
+            assert!(
+                extraction.unsupported_calls[0]
+                    .reason
+                    .contains("does not insert")
+            );
+        }
+    }
+
+    #[test]
+    fn distinguishes_style_value_helpers_from_rule_prefix_helpers() {
+        let source = r#"
+            function test_invalid(property, value) {
+                test(() => {
+                    light.style.setProperty(property, "initial");
+                    light.style.setProperty(property, value);
+                    assert_equals(light.style.getPropertyValue(property), "initial");
+                });
+            }
+            test_invalid("background-image", "light-dark(red,url(a.png))");
+        "#;
+        let extraction = extract_css_parsing_tests(source);
+        assert_eq!(extraction.unsupported_calls, []);
+        assert_eq!(extraction.tests.len(), 1);
+        assert_eq!(extraction.tests[0].kind, CssParsingTestKind::InvalidValue);
+        assert_eq!(
+            extraction.tests[0].arguments,
+            ["background-image", "light-dark(red,url(a.png))"]
+        );
+    }
+
+    #[test]
+    fn ignores_style_setter_text_in_strings_and_comments_when_classifying_helpers() {
+        let source = r#"
+            function test_valid(actual, expected) {
+                // light.style.setProperty(actual, expected)
+                const example = "light.style.setProperty(actual, expected)";
+                style.textContent = `${actual}{}`;
+            }
+            test_valid("@starting-style");
+        "#;
+        let extraction = extract_css_parsing_tests(source);
+        assert_eq!(extraction.unsupported_calls, []);
+        assert_eq!(extraction.tests.len(), 1);
+        assert_eq!(extraction.tests[0].kind, CssParsingTestKind::ValidRule);
+        assert_eq!(extraction.tests[0].arguments, ["@starting-style{}"]);
+    }
+
+    #[test]
     fn extracts_literal_css_helpers_and_reports_dynamic_calls() {
         let source = r#"
             test_valid_value("margin", "10px");
@@ -2001,10 +2358,25 @@ mod tests {
 
         assert_eq!(extraction.unsupported_calls, []);
         assert_eq!(extraction.tests.len(), 2);
-        assert_eq!(extraction.tests[0].kind, CssParsingTestKind::ValidSelector);
+        assert_eq!(extraction.tests[0].kind, CssParsingTestKind::SelectorSerialization);
         assert_eq!(extraction.tests[0].arguments, [":nth-child(n)"]);
         assert_eq!(extraction.tests[1].kind, CssParsingTestKind::InvalidSelector);
         assert_eq!(extraction.tests[1].arguments, [":nth-child(n-b1)"]);
+    }
+
+    #[test]
+    fn selector_serialization_helpers_preserve_stylesheet_preludes() {
+        let source = r#"
+            function assert_selector_serializes_to(source, expected) {
+                style.textContent = source + "{font-size:1em}";
+            }
+            assert_selector_serializes_to("@namespace 'blah'; *|\\\\", "*|\\\\");
+        "#;
+        let extraction = extract_css_parsing_tests(source);
+        assert_eq!(extraction.unsupported_calls, []);
+        assert_eq!(extraction.tests.len(), 1);
+        assert_eq!(extraction.tests[0].kind, CssParsingTestKind::SelectorSerialization);
+        assert_eq!(extraction.tests[0].arguments, [r"@namespace 'blah'; *|\\"]);
     }
 
     #[test]

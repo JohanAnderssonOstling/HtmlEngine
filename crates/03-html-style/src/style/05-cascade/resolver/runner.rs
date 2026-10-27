@@ -1,6 +1,10 @@
 //! Winner selection and dependency-ordered computed-value conversion.
 
 use super::*;
+use crate::style::syntax::{flex, font};
+use crate::style::syntax::value::parsed_property;
+use static_self::IntoOwned;
+use std::borrow::Cow;
 use specified::{DeclarationEvent, PropertyTarget, SpecifiedSelection, select_specified_values};
 
 /// The cascade computes dependency roots before values that consume them.
@@ -16,6 +20,7 @@ pub(super) struct CascadeInputs<'a, 'sheet, 'inline, 'css> {
     pub(super) hints_sequence: usize,
     pub(super) parent_font_size: f32,
     pub(super) custom_properties: &'a FxHashMap<String, TokenList<'css>>,
+    pub(super) parent_custom: &'a FxHashMap<String, TokenList<'css>>,
     pub(super) parent: &'a ParentStyle,
     pub(super) presentational_hints_node: Option<DomNodeId>,
 }
@@ -29,20 +34,6 @@ fn target_phase(target: &PropertyTarget) -> CascadePhase {
     } else {
         CascadePhase::Remaining
     }
-}
-
-fn wide_keyword<'property, 'css>(property: &'property Property<'css>) -> Option<&'property str> {
-    let keyword = match property {
-        Property::Unparsed(value) => single_ident_keyword(&value.value),
-        Property::Custom(value) if !value.name.as_ref().starts_with("--") => {
-            single_ident_keyword(&value.value)
-        }
-        _ => None,
-    }?;
-    ["inherit", "initial", "unset", "revert", "revert-layer"]
-        .iter()
-        .any(|candidate| keyword.eq_ignore_ascii_case(candidate))
-        .then_some(keyword)
 }
 
 impl<'a, 'css> StyleResolverContext<'a, 'css> {
@@ -130,7 +121,7 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
         if &*target.name != "all" && target_phase(target) != phase {
             return Ok(());
         }
-        if let Some(keyword) = wide_keyword(property) {
+        if let Some(keyword) = property_css_wide_keyword(property) {
             let _ = apply_css_wide_keyword_in_phase(
                 style,
                 &target.name,
@@ -146,7 +137,10 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
 
         let longhand;
         let property = if let Some(property_id) = &target.longhand {
-            if let Some(value) = property.longhand(property_id) {
+            if let Some(value) = property.longhand(property_id)
+                .or_else(|| flex::longhand(property, property_id))
+                .or_else(|| font::longhand(property, property_id))
+            {
                 longhand = value;
                 &longhand
             } else {
@@ -177,6 +171,7 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
         targets: &[PropertyTarget],
         parent_font_size: f32,
         custom_properties: &FxHashMap<String, TokenList<'css>>,
+        parent_custom: &FxHashMap<String, TokenList<'css>>,
         var_map: &HashMap<&str, TokenList<'css>>,
         phase: CascadePhase,
         parent: &ParentStyle,
@@ -189,15 +184,17 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
         }
         let resolved_unparsed;
         let resolved_custom;
-        let substituted = matches!(property, Property::Unparsed(value) if token_list_contains_var(&value.value))
-            || matches!(property, Property::Custom(value) if token_list_contains_var(&value.value));
+        let substituted = matches!(property, Property::Unparsed(value) if needs_substitution(&value.value) || contains_random_math(&value.value))
+            || matches!(property, Property::Custom(value) if needs_substitution(&value.value) || contains_random_math(&value.value));
         let resolved = match property {
-            Property::Unparsed(unparsed) if token_list_contains_var(&unparsed.value) => {
+            Property::Unparsed(unparsed) if needs_substitution(&unparsed.value) || contains_random_math(&unparsed.value) => {
                 resolved_unparsed = resolve_single_var_property(unparsed, custom_properties)
                     .or_else(|| {
                         let mut substitutable = unparsed.clone();
-                        mark_var_substitution_boundaries(&mut substitutable.value);
-                        substitutable.substitute_variables(var_map).ok()
+                        if !substitute_property_tokens(&mut substitutable.value, var_map, parent_custom, &self.random, property.property_id().name()) {
+                            return None;
+                        }
+                        parse_substituted_property(&substitutable.property_id, &substitutable.value)
                     });
                 let Some(property) = resolved_unparsed.as_ref() else {
                     self.unset_targets(style, targets, phase, parent);
@@ -207,12 +204,10 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
             }
             Property::Custom(custom)
                 if !custom.name.as_ref().starts_with("--")
-                    && token_list_contains_var(&custom.value) =>
+                    && (needs_substitution(&custom.value) || contains_random_math(&custom.value)) =>
             {
                 let mut value = custom.clone();
-                mark_var_substitution_boundaries(&mut value.value);
-                value.value.substitute_variables(var_map);
-                if token_list_contains_var(&value.value) {
+                if !substitute_property_tokens(&mut value.value, var_map, parent_custom, &self.random, property.property_id().name()) {
                     self.unset_targets(style, targets, phase, parent);
                     return Ok(());
                 }
@@ -222,12 +217,50 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
             property => property,
         };
 
-        // An unparsed value remaining after substitution is invalid at
-        // computed-value time. It still won the cascade, so each affected
-        // longhand becomes `unset` rather than exposing a losing declaration.
+        let numeric_resolved;
+        let resolved = match self.resolve_numeric_property(resolved) {
+            Ok(Some(property)) => {
+                numeric_resolved = property;
+                &numeric_resolved
+            }
+            Ok(None) => resolved,
+            Err(()) if substituted => {
+                self.unset_targets(style, targets, phase, parent);
+                return Ok(());
+            }
+            Err(()) => return Err(()),
+        };
+
+        // Resolve a contextual flex shorthand once before validating or
+        // extracting its selected longhands. Replaying it for one target
+        // would also overwrite independent longhand winners.
+        let computed_flex = if matches!(resolved, Property::Unparsed(value)
+            if matches!(value.property_id, PropertyId::Flex(_)))
+        {
+            match properties::resolve_sign_property(
+                resolved, style, parent_font_size,
+                root_font_size_for_resolution(self.doc, self.styles), self.resolution,
+            ) {
+                Ok(property) => property,
+                Err(()) if substituted => {
+                    self.unset_targets(style, targets, phase, parent);
+                    return Ok(());
+                }
+                Err(()) => return Err(()),
+            }
+        } else {
+            None
+        };
+        let resolved = computed_flex.as_ref().unwrap_or(resolved);
+
+        // Dependency recovery values need an explicit renderer conversion
+        // after substitution. Otherwise the winning declaration becomes unset
+        // rather than exposing a losing declaration.
         if substituted
-            && wide_keyword(resolved).is_none()
-            && (matches!(resolved, Property::Unparsed(_))
+            && property_css_wide_keyword(resolved).is_none()
+            && (matches!(resolved, Property::Unparsed(value)
+                if !properties::supports_unparsed_property(&value.property_id)
+                    || needs_substitution(&value.value))
                 || !crate::style::syntax::capabilities::declaration_is_renderer_eligible(resolved))
         {
             self.unset_targets(style, targets, phase, parent);
@@ -239,7 +272,14 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
         if resolved
             .property_id()
             .longhands()
-            .is_some_and(|longhands| targets.len() < longhands.len())
+            .is_some_and(|longhands| {
+                let reset_only = if matches!(resolved.property_id(), PropertyId::Font) {
+                    font::RESET_LONGHANDS.len()
+                } else {
+                    0
+                };
+                targets.len() < longhands.len() + reset_only
+            })
             && !properties::partially_selected_shorthand_is_computable(
                 self.doc,
                 self.styles,
@@ -297,6 +337,25 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
         }
     }
 
+    fn resolve_numeric_property<'property>(
+        &mut self,
+        property: &Property<'_>,
+    ) -> Result<Option<Property<'property>>, ()> {
+        if !matches!(property, Property::Unparsed(_) | Property::Custom(_))
+            || property.property_id().name().starts_with("--")
+        {
+            return Ok(None);
+        }
+        let css = property.value_to_css_string(PrinterOptions::default()).map_err(|_| ())?;
+        let tree = self.tree_counting.lower(self.doc, &css)?;
+        let lowered = crate::style::syntax::random_math::for_computation(&tree, |key|self.random.base(key,property.property_id().name(),1))?;
+        if matches!(tree, Cow::Borrowed(_)) && matches!(lowered, Cow::Borrowed(_)) {
+            return Ok(None);
+        }
+        parsed_property(property.property_id(), &lowered)
+            .map(IntoOwned::into_owned).map(Some).ok_or(())
+    }
+
     pub(super) fn apply_cascade<'event, 'inline>(
         &mut self,
         style: &mut WorkingStyle,
@@ -310,6 +369,7 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
             hints_sequence,
             parent_font_size,
             custom_properties,
+            parent_custom,
             parent,
             presentational_hints_node,
         } = inputs;
@@ -343,10 +403,10 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
                 selection.declarations.iter().any(|declaration| {
                     match valid_events[declaration.sequence].property(inline_style) {
                         Property::Unparsed(value) => {
-                            token_list_contains_var(&value.value)
+                            needs_substitution(&value.value)
                                 && !single_var_property_is_resolvable(value, custom_properties)
                         }
-                        Property::Custom(value) => token_list_contains_var(&value.value),
+                        Property::Custom(value) => needs_substitution(&value.value),
                         _ => false,
                     }
                 });
@@ -385,6 +445,7 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
                         selection.targets_for(declaration),
                         parent_font_size,
                         custom_properties,
+                        parent_custom,
                         &var_map,
                         phase,
                         parent,
@@ -422,7 +483,10 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
                 }
                 valid_events.remove(sequence);
             } else {
-                *style = candidate;
+                // Retain the original accumulator as scratch for the next
+                // element; clone_from can reuse its font-feature buffers.
+                std::mem::swap(style, &mut candidate);
+                *self.validation_style = candidate;
                 break;
             }
         }
