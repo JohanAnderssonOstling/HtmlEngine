@@ -1,0 +1,74 @@
+{
+  "title": "Middlemarch",
+  "subtitle": "A Study of Provincial Life",
+  "author": "George Eliot",
+  "chapter": "XXXVII (37)",
+  "language": "en-US",
+  "publisher": "Standard Ebooks",
+  "catalog_url": "https://standardebooks.org/ebooks/george-eliot/middlemarch",
+  "epub_url": "https://standardebooks.org/ebooks/george-eliot/middlemarch/downloads/george-eliot_middlemarch.epub?source=download",
+  "rights_url": "https://github.com/standardebooks/george-eliot_middlemarch/blob/master/LICENSE.md",
+  "public_domain_catalog_url": "https://www.gutenberg.org/ebooks/145",
+  "downloaded_at_utc": "2026-10-27T00:43:48.830884+00:00",
+  "edition_modified": "2026-09-09T15:46:05Z",
+  "epub_bytes": 1328604,
+  "epub_sha256": "cc2f7d8113f526335de81455b5bea9d3750a935f4b751cbdc6a191b3138ffcc8",
+  "epub_chapter_path": "epub/text/chapter-37.xhtml",
+  "epub_chapter_sha256": "7f23f7df4f79ced3861cbf6c91b992ccc76e0be3e3aa870b03a030369b90beb8",
+  "fixture_path": "chapter-37.xhtml",
+  "fixture_bytes": 54941,
+  "fixture_sha256": "95fa303cade74a643d01c56cd1f19540d5f177953347a52f1e1b7de204d31ef8",
+  "word_count": 8202,
+  "body_element_counts": {
+    "body": 1,
+    "section": 1,
+    "header": 1,
+    "h3": 1,
+    "blockquote": 3,
+    "p": 114,
+    "span": 16,
+    "br": 13,
+    "cite": 1,
+    "abbr": 86,
+    "i": 9,
+    "em": 1,
+    "footer": 2
+  },
+  "stylesheet_order": [
+    "css/core.css",
+    "css/local.css"
+  ],
+  "stylesheets": {
+    "css/core.css": {
+      "epub_path": "epub/css/core.css",
+      "bytes": 7175,
+      "sha256": "e467c38907d4037895d6077da34f2647f9311a7ae492ea542f747f10e76e305a",
+      "linked_by_chapter": true
+    },
+    "css/local.css": {
+      "epub_path": "epub/css/local.css",
+      "bytes": 4382,
+      "sha256": "8982fb50eadfe8025def1ce0fba91f1ad0aac2469cb43af71c2058d4d13f89aa",
+      "linked_by_chapter": true
+    },
+    "css/se.css": {
+      "epub_path": "epub/css/se.css",
+      "bytes": 2275,
+      "sha256": "f2bb2ba1291d73c342a0984f0571f313a8473ca5a5ec2e47211c024bb5fec1f5",
+      "linked_by_chapter": false
+    }
+  },
+  "changes": [
+    {
+      "attribute": "href",
+      "from": "../css/core.css",
+      "to": "css/core.css"
+    },
+    {
+      "attribute": "href",
+      "from": "../css/local.css",
+      "to": "css/local.css"
+    }
+  ],
+  "rights_from_epub": "The source text and artwork in this ebook are believed to be in the United States public domain; that is, they are believed to be free of copyright restrictions in the United States. They may still be copyrighted in other countries, so users located outside of the United States must check their local laws before using this ebook. The creators of, and contributors to, this ebook dedicate their contributions to the worldwide public domain via the terms in the [CC0 1.0 Universal Public Domain Dedication](https://creativecommons.org/publicdomain/zero/1.0/)."
+}
