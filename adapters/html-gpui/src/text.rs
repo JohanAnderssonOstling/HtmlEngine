@@ -925,7 +925,7 @@ impl GpuiTextCache {
             self.insert_line_shape(key, CachedLineShape { text: text.into(), styles: identities.into_boxed_slice(), geometry, natural_run: None });
             colors = Some(miss_colors);
         }
-        let cached_shape = self.line_shapes.get(&key).expect("requested shape was cached");
+        let Some(cached_shape) = self.line_shapes.get(&key) else { return Ok(None) };
         let cached = &cached_shape.geometry;
         let ascent = cached.ascent;
         let cluster_boundaries = cached.cluster_boundaries.clone();
