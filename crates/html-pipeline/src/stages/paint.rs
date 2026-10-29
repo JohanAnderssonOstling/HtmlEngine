@@ -130,20 +130,8 @@ impl<'a> PaintStyles<'a> {
                     .unwrap_or_else(|| styles.default_indices()),
             );
         }
-        for node in document.node_ids() {
-            for indices in [
-                styles.style_for_node(node),
-                styles.first_line_style_for_node(node),
-                styles.first_letter_style_for_node(node),
-                styles.before_first_letter_style_for_node(node),
-                styles.before_style_for_node(node).map(|entry| entry.0),
-                styles.after_style_for_node(node).map(|entry| entry.0),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                retain(indices);
-            }
+        for indices in styles.bound_styles().chain(tree.non_box_styles()) {
+            retain(indices);
         }
         Self {
             overrides: ReaderStyleOverrides::default(),

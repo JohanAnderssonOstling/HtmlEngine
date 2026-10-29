@@ -1,7 +1,7 @@
-use super::{AncestorIter, DocumentRead};
+use super::DocumentRead;
 use crate::layout_model::{
     AnchorPosition, DecorationFragment, DecorationStore, EllipsisFragment, GlyphAdvanceRun,
-    GlyphId, GlyphOffsetRun, HyphenFragment, ImageFragment, InlineItem, InlineItemKind, LayoutMode,
+    GlyphId, GlyphOffsetRun, HyphenFragment, ImageFragment, InlineItem, LayoutMode,
     Line, ListItemMarker,
 };
 use html_dom::{Document, ImageResource, ImageSource, NodeRef};
@@ -23,7 +23,7 @@ mod text;
 pub use geometry::{CaretAffinity, PositionedShapedLine, RenderGeometryView};
 pub use markdown::RenderExportView;
 pub use reading::{ReadingFragment, ReadingTarget, is_navigation_section_title};
-pub use search::{TextSearchOptions, find_text_matches};
+pub use search::{TextSearchOptions, find_text_matches, text_matches};
 pub use semantics::{ContentRole, ContentSemantics, RenderSemanticsView};
 pub use source::SourceLocation;
 
@@ -44,7 +44,7 @@ pub use text::{
     RenderAuthoritativeTextRun, RenderEllipsisFragment, RenderGlyphAdvanceRun,
     RenderGlyphAdvanceRuns, RenderGlyphOffsetRun, RenderGlyphOffsetRuns, RenderHyphenFragment,
     RenderLine, RenderLineTextFragment, RenderLineTextFragments, RenderLines, RenderTextRun,
-    RenderTextRuns, RenderTextView,
+    RenderTextRuns, RenderTextView, merge_text_ranges,
 };
 
 #[derive(Clone, Copy)]

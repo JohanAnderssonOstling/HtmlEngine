@@ -1,26 +1,22 @@
-use crate::layout_model::OverflowClip;
+use crate::layout_model::{BoxGeometry, OverflowClip};
 use kurbo::Rect;
 
-use super::{FinalizationScratch, FragmentWriter, GeometryWriter, LayoutReader};
+use super::{FragmentWriter, LayoutReader};
 
 /// Resolves overflow ownership once layout geometry is final. The common
 /// `overflow: visible` path leaves both output vectors empty; renderers can
 /// therefore test one slice and continue without issuing clip commands.
 pub(super) fn rebuild_overflow_clips(
     reader: &LayoutReader<'_>,
-    geometry: &GeometryWriter<'_>,
+    geometry: &BoxGeometry,
     fragments: &mut FragmentWriter<'_>,
-    _scratch: &mut FinalizationScratch,
-    track_overflow_clips: bool,
 ) {
-    let box_count = reader.box_count();
-    if !track_overflow_clips {
-        let (layout, line_owners, decoration_owners) = fragments.finalization_parts();
-        layout.paint_program.content_clips.clear();
-        layout.line_output.line_clips.clear();
-        layout.fragment_output.decoration_clips.clear();
-        line_owners.clear();
-        decoration_owners.clear();
+    let layout = fragments.state_mut();
+    let content_clips = &mut layout.paint_program.content_clips;
+    let output = &mut layout.line_output;
+    if !reader.tracks_overflow_clips() {
+        content_clips.clear();
+        output.line_clips.clear();
         return;
     }
 
@@ -70,11 +66,8 @@ pub(super) fn rebuild_overflow_clips(
     // Boxes are built in DOM preorder, so an owning parent's resolved clip
     // is available before every child. This is also the ordering used for
     // decoration paint keys.
-    let geometry = geometry.as_ref();
-    let (layout, line_owners, decoration_owners) = fragments.finalization_parts();
-    let mut content_clips = std::mem::take(&mut layout.paint_program.content_clips);
+    let box_count = reader.box_count();
     content_clips.resize(box_count, None);
-    content_clips.fill(None);
     for idx in 0..box_count {
         let parent_clip = reader.get_parent(idx).and_then(|parent| {
             debug_assert!(
@@ -108,33 +101,11 @@ pub(super) fn rebuild_overflow_clips(
         content_clips[idx] = combine(parent_clip, own_clip);
     }
 
-    assert_eq!(
-        line_owners.len(),
-        layout.line_output.lines.len(),
-        "every final line must retain its owner until clip resolution"
-    );
-    assert_eq!(
-        decoration_owners.len(),
-        layout.fragment_output.decorations.len(),
-        "every final decoration must retain its owner until clip resolution"
-    );
-    let mut line_clips = std::mem::take(&mut layout.line_output.line_clips);
-    line_clips.clear();
-    line_clips.extend(
-        line_owners
-            .iter()
-            .map(|&owner| content_clips.get(owner as usize).copied().flatten()),
-    );
-    let mut decoration_clips = std::mem::take(&mut layout.fragment_output.decoration_clips);
-    decoration_clips.clear();
-    decoration_clips.extend(decoration_owners.iter().map(|&owner| {
-        reader
-            .get_parent(owner as usize)
-            .and_then(|parent| content_clips.get(parent).copied().flatten())
+    output.line_clips.clear();
+    output.line_clips.extend(output.lines.iter().map(|line| {
+        content_clips
+            .get(line.owner_box_idx as usize)
+            .copied()
+            .flatten()
     }));
-    layout.line_output.line_clips = line_clips;
-    layout.fragment_output.decoration_clips = decoration_clips;
-    layout.paint_program.content_clips = content_clips;
-    line_owners.clear();
-    decoration_owners.clear();
 }

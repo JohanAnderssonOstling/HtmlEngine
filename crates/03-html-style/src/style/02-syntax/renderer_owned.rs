@@ -1,204 +1,158 @@
-//! Syntax for properties Lightning CSS preserves as raw declarations.
-//!
-//! These parsers are shared by capability reporting and computed-value
-//! conversion so the renderer cannot claim a wider grammar than it applies.
+//! Conversion of Lightning CSS raw tokens into renderer-owned style values.
 
-use super::font_features;
-use super::property_id::RendererPropertyId;
-use super::value::parse_integer;
+use super::value::{significant_tokens, single_ident_keyword, token_ident};
+use crate::style::syntax::property_id::RendererPropertyId;
 use cssparser::match_ignore_ascii_case;
 use html_style_model::{
-    BorderCollapseMode, BreakBetween, BreakInside, CaptionSide, EmptyCellsMode, ObjectFit,
-    TableLayoutMode, TextBoxEdge, TextBoxOverEdge, TextBoxTrim, TextBoxUnderEdge,
+    BorderCollapseMode, BreakBetween, BreakInside, CaptionSide, Clear, EmptyCellsMode, Float,
+    ObjectFit, TableLayoutMode, TextBoxEdge, TextBoxOverEdge, TextBoxTrim, TextBoxUnderEdge,
+    TextDirection,
 };
 use lightningcss::properties::custom::{Token, TokenList, TokenOrValue};
+#[cfg(test)]
 use lightningcss::properties::{Property, PropertyId};
+#[cfg(test)]
 use lightningcss::stylesheet::ParserOptions;
 
-fn parsed_tokens(value: &str) -> Option<TokenList<'_>> {
-    match Property::parse_string(
-        PropertyId::from("--html-style-value"),
-        value,
-        ParserOptions::default(),
-    )
-    .ok()?
-    {
-        Property::Custom(value) => Some(value.value),
+// Fit and edge values have at most two keywords; text-box may add a trim keyword.
+fn words<'a, 'i, const N: usize>(tokens: &'a TokenList<'i>) -> Option<([&'a str; N], usize)> {
+    let mut words = [""; N];
+    let mut len = 0;
+    for token in significant_tokens(tokens) {
+        *words.get_mut(len)? = token_ident(token)?;
+        len += 1;
+    }
+    Some((words, len))
+}
+
+pub(crate) fn float(tokens: &TokenList<'_>, direction: TextDirection) -> Option<Float> {
+    Some(match_ignore_ascii_case! { single_ident_keyword(tokens)?,
+        "left" => Float::Left,
+        "right" => Float::Right,
+        "none" => Float::None,
+        "inline-start" => if direction == TextDirection::Ltr { Float::Left } else { Float::Right },
+        "inline-end" => if direction == TextDirection::Ltr { Float::Right } else { Float::Left },
+        _ => return None,
+    })
+}
+
+pub(crate) fn clear(tokens: &TokenList<'_>, direction: TextDirection) -> Option<Clear> {
+    Some(match_ignore_ascii_case! { single_ident_keyword(tokens)?,
+        "left" => Clear::Left,
+        "right" => Clear::Right,
+        "both" => Clear::Both,
+        "none" => Clear::None,
+        "inline-start" => if direction == TextDirection::Ltr { Clear::Left } else { Clear::Right },
+        "inline-end" => if direction == TextDirection::Ltr { Clear::Right } else { Clear::Left },
+        _ => return None,
+    })
+}
+
+pub(crate) fn table_layout(tokens: &TokenList<'_>) -> Option<TableLayoutMode> {
+    match single_ident_keyword(tokens)? {
+        value if value.eq_ignore_ascii_case("auto") => Some(TableLayoutMode::Auto),
+        value if value.eq_ignore_ascii_case("fixed") => Some(TableLayoutMode::Fixed),
         _ => None,
     }
 }
 
-fn words<'a, 'i>(tokens: &'a TokenList<'i>) -> Option<Vec<&'a str>> {
-    tokens
-        .0
-        .iter()
-        .filter(|token| {
-            !matches!(
-                token,
-                TokenOrValue::Token(Token::WhiteSpace(_) | Token::Comment(_))
-            )
-        })
-        .map(|token| match token {
-            TokenOrValue::Token(Token::Ident(value)) => Some(value.as_ref()),
-            _ => None,
-        })
-        .collect()
-}
-
-fn one_word<'a>(tokens: &'a TokenList<'_>) -> Option<&'a str> {
-    let mut tokens = tokens.0.iter().filter(|token| {
-        !matches!(
-            token,
-            TokenOrValue::Token(Token::WhiteSpace(_) | Token::Comment(_))
-        )
-    });
-    let TokenOrValue::Token(Token::Ident(word)) = tokens.next()? else {
-        return None;
-    };
-    tokens.next().is_none().then_some(word.as_ref())
-}
-
-fn keyword(value: &str, expected: &str) -> bool {
-    value.eq_ignore_ascii_case(expected)
-}
-
-pub(crate) fn table_layout(tokens: &TokenList<'_>) -> Option<TableLayoutMode> {
-    let value = one_word(tokens)?;
-    if keyword(value, "auto") {
-        Some(TableLayoutMode::Auto)
-    } else if keyword(value, "fixed") {
-        Some(TableLayoutMode::Fixed)
-    } else {
-        None
-    }
-}
-
 pub(crate) fn border_collapse(tokens: &TokenList<'_>) -> Option<BorderCollapseMode> {
-    let value = one_word(tokens)?;
-    if keyword(value, "collapse") {
-        Some(BorderCollapseMode::Collapse)
-    } else if keyword(value, "separate") {
-        Some(BorderCollapseMode::Separate)
-    } else {
-        None
+    match single_ident_keyword(tokens)? {
+        value if value.eq_ignore_ascii_case("collapse") => Some(BorderCollapseMode::Collapse),
+        value if value.eq_ignore_ascii_case("separate") => Some(BorderCollapseMode::Separate),
+        _ => None,
     }
 }
 
 pub(crate) fn caption_side(tokens: &TokenList<'_>) -> Option<CaptionSide> {
-    let value = one_word(tokens)?;
-    if keyword(value, "top") {
-        Some(CaptionSide::Top)
-    } else if keyword(value, "bottom") {
-        Some(CaptionSide::Bottom)
-    } else {
-        None
+    match single_ident_keyword(tokens)? {
+        value if value.eq_ignore_ascii_case("top") => Some(CaptionSide::Top),
+        value if value.eq_ignore_ascii_case("bottom") => Some(CaptionSide::Bottom),
+        _ => None,
     }
 }
 
 pub(crate) fn empty_cells(tokens: &TokenList<'_>) -> Option<EmptyCellsMode> {
-    let value = one_word(tokens)?;
-    if keyword(value, "show") {
-        Some(EmptyCellsMode::Show)
-    } else if keyword(value, "hide") {
-        Some(EmptyCellsMode::Hide)
-    } else {
-        None
+    match single_ident_keyword(tokens)? {
+        value if value.eq_ignore_ascii_case("show") => Some(EmptyCellsMode::Show),
+        value if value.eq_ignore_ascii_case("hide") => Some(EmptyCellsMode::Hide),
+        _ => None,
     }
 }
 
 pub(crate) fn text_box_trim(tokens: &TokenList<'_>) -> Option<TextBoxTrim> {
-    parse_text_box_trim(one_word(tokens)?)
+    parse_text_box_trim(single_ident_keyword(tokens)?)
 }
 
 fn parse_text_box_trim(value: &str) -> Option<TextBoxTrim> {
-    if keyword(value, "none") {
-        Some(TextBoxTrim::None)
-    } else if keyword(value, "trim-start") {
-        Some(TextBoxTrim::Start)
-    } else if keyword(value, "trim-end") {
-        Some(TextBoxTrim::End)
-    } else if keyword(value, "trim-both") {
-        Some(TextBoxTrim::Both)
-    } else {
-        None
+    match value {
+        value if value.eq_ignore_ascii_case("none") => Some(TextBoxTrim::None),
+        value if value.eq_ignore_ascii_case("trim-start") => Some(TextBoxTrim::Start),
+        value if value.eq_ignore_ascii_case("trim-end") => Some(TextBoxTrim::End),
+        value if value.eq_ignore_ascii_case("trim-both") => Some(TextBoxTrim::Both),
+        _ => None,
     }
 }
 
 pub(crate) fn text_box_edge(tokens: &TokenList<'_>) -> Option<TextBoxEdge> {
-    parse_text_box_edge(&words(tokens)?)
+    let (words, len) = words::<2>(tokens)?;
+    parse_text_box_edge(&words[..len])
 }
 
 fn parse_text_box_edge(words: &[&str]) -> Option<TextBoxEdge> {
-    if matches!(words, [value] if keyword(value, "auto")) {
-        return Some(TextBoxEdge::default());
-    }
-    if matches!(words, [value] if keyword(value, "alphabetic")) {
-        return Some(TextBoxEdge {
-            over: TextBoxOverEdge::Text,
-            under: TextBoxUnderEdge::Alphabetic,
-        });
-    }
-    let over = parse_over_edge(words.first()?)?;
-    let under = match words.get(1) {
-        Some(value) => parse_under_edge(value)?,
-        None => TextBoxUnderEdge::Text,
+    let (over, under) = match words {
+        [value] if value.eq_ignore_ascii_case("auto") => return Some(TextBoxEdge::default()),
+        [value] if value.eq_ignore_ascii_case("alphabetic") => {
+            (TextBoxOverEdge::Text, TextBoxUnderEdge::Alphabetic)
+        }
+        [over] => (parse_over_edge(over)?, TextBoxUnderEdge::Text),
+        [over, under] => (parse_over_edge(over)?, parse_under_edge(under)?),
+        _ => return None,
     };
-    (words.len() <= 2).then_some(TextBoxEdge { over, under })
+    Some(TextBoxEdge { over, under })
 }
 
 fn parse_over_edge(value: &str) -> Option<TextBoxOverEdge> {
-    if ["text", "ideographic", "ideographic-ink"]
-        .iter()
-        .any(|keyword| value.eq_ignore_ascii_case(keyword))
-    {
-        Some(TextBoxOverEdge::Text)
-    } else if keyword(value, "cap") {
-        Some(TextBoxOverEdge::Cap)
-    } else if keyword(value, "ex") {
-        Some(TextBoxOverEdge::Ex)
-    } else {
-        None
-    }
+    Some(match_ignore_ascii_case! { value,
+        "text" | "ideographic" | "ideographic-ink" => TextBoxOverEdge::Text,
+        "cap" => TextBoxOverEdge::Cap,
+        "ex" => TextBoxOverEdge::Ex,
+        _ => return None,
+    })
 }
 
 fn parse_under_edge(value: &str) -> Option<TextBoxUnderEdge> {
-    if ["text", "ideographic", "ideographic-ink"]
-        .iter()
-        .any(|keyword| value.eq_ignore_ascii_case(keyword))
-    {
-        Some(TextBoxUnderEdge::Text)
-    } else if keyword(value, "alphabetic") {
-        Some(TextBoxUnderEdge::Alphabetic)
-    } else {
-        None
-    }
+    Some(match_ignore_ascii_case! { value,
+        "text" | "ideographic" | "ideographic-ink" => TextBoxUnderEdge::Text,
+        "alphabetic" => TextBoxUnderEdge::Alphabetic,
+        _ => return None,
+    })
 }
 
 pub(crate) fn text_box(tokens: &TokenList<'_>) -> Option<(TextBoxTrim, TextBoxEdge)> {
-    let words = words(tokens)?;
-    if matches!(words.as_slice(), [value] if keyword(value, "normal")) {
+    let (words, len) = words::<3>(tokens)?;
+    let words = &words[..len];
+    if matches!(words, [value] if value.eq_ignore_ascii_case("normal")) {
         return Some((TextBoxTrim::None, TextBoxEdge::default()));
     }
 
-    if let Some(first) = words.first().and_then(|value| parse_text_box_trim(value)) {
-        let edge = if words.len() == 1 {
-            TextBoxEdge::default()
+    let (trim, edges) =
+        if let Some(trim) = words.first().and_then(|value| parse_text_box_trim(value)) {
+            if words.len() == 1 {
+                return Some((trim, TextBoxEdge::default()));
+            }
+            (trim, &words[1..])
+        } else if let Some(trim) = words.last().and_then(|value| parse_text_box_trim(value)) {
+            (trim, &words[..words.len() - 1])
         } else {
-            parse_text_box_edge(&words[1..])?
+            (TextBoxTrim::Both, words)
         };
-        return Some((first, edge));
-    }
-    if let Some(last) = words.last().and_then(|value| parse_text_box_trim(value)) {
-        let edge = parse_text_box_edge(&words[..words.len() - 1])?;
-        return Some((last, edge));
-    }
-
-    parse_text_box_edge(&words).map(|edge| (TextBoxTrim::Both, edge))
+    parse_text_box_edge(edges).map(|edge| (trim, edge))
 }
 
 pub(crate) fn object_fit(tokens: &TokenList<'_>) -> Option<ObjectFit> {
-    let words = words(tokens)?;
-    match words.as_slice() {
+    let (words, len) = words::<2>(tokens)?;
+    match &words[..len] {
         [word] => match_ignore_ascii_case! { word,
             "fill" => Some(ObjectFit::Fill),
             "contain" => Some(ObjectFit::Contain),
@@ -229,13 +183,13 @@ pub(crate) fn break_between(
     id: RendererPropertyId,
     tokens: &TokenList<'_>,
 ) -> Option<BreakBetween> {
-    let value = one_word(tokens)?;
+    let value = single_ident_keyword(tokens)?;
     if matches!(
         id,
         RendererPropertyId::PageBreakBefore | RendererPropertyId::PageBreakAfter
     ) && !["auto", "avoid", "always", "left", "right", "recto", "verso"]
         .iter()
-        .any(|word| keyword(value, word))
+        .any(|word| value.eq_ignore_ascii_case(word))
     {
         return None;
     }
@@ -252,9 +206,11 @@ pub(crate) fn break_between(
 }
 
 pub(crate) fn break_inside(id: RendererPropertyId, tokens: &TokenList<'_>) -> Option<BreakInside> {
-    let value = one_word(tokens)?;
+    let value = single_ident_keyword(tokens)?;
     if id == RendererPropertyId::PageBreakInside
-        && !["auto", "avoid"].iter().any(|word| keyword(value, word))
+        && !["auto", "avoid"]
+            .iter()
+            .any(|word| value.eq_ignore_ascii_case(word))
     {
         return None;
     }
@@ -265,54 +221,42 @@ pub(crate) fn break_inside(id: RendererPropertyId, tokens: &TokenList<'_>) -> Op
     }
 }
 
-pub(crate) fn property_value_is_valid(id: RendererPropertyId, value: &str) -> Option<bool> {
-    if id == RendererPropertyId::FontFeatureSettings {
-        return Some(font_features::parse_settings(value).is_some());
-    }
-    if matches!(id, RendererPropertyId::Widows | RendererPropertyId::Orphans) {
-        return Some(parse_integer(value, 1).is_some());
-    }
-    let tokens = parsed_tokens(value)?;
-    Some(match id {
-        RendererPropertyId::BreakBefore
-        | RendererPropertyId::BreakAfter
-        | RendererPropertyId::PageBreakBefore
-        | RendererPropertyId::PageBreakAfter => break_between(id, &tokens).is_some(),
-        RendererPropertyId::BreakInside | RendererPropertyId::PageBreakInside => {
-            break_inside(id, &tokens).is_some()
+/// Whether the existing raw-token conversion can represent this value.
+pub(crate) fn tokens_are_supported(id: RendererPropertyId, tokens: &TokenList<'_>) -> bool {
+    match id {
+        RendererPropertyId::Float => float(tokens, TextDirection::Ltr).is_some(),
+        RendererPropertyId::Clear => clear(tokens, TextDirection::Ltr).is_some(),
+        RendererPropertyId::ObjectFit => object_fit(tokens).is_some(),
+        RendererPropertyId::TableLayout => table_layout(tokens).is_some(),
+        RendererPropertyId::BorderCollapse => border_collapse(tokens).is_some(),
+        RendererPropertyId::CaptionSide => caption_side(tokens).is_some(),
+        RendererPropertyId::EmptyCells => empty_cells(tokens).is_some(),
+        RendererPropertyId::TextBox => text_box(tokens).is_some(),
+        RendererPropertyId::TextBoxTrim => text_box_trim(tokens).is_some(),
+        RendererPropertyId::TextBoxEdge => text_box_edge(tokens).is_some(),
+        RendererPropertyId::FontFeatureSettings => {
+            super::font_features::parse_settings(tokens).is_some()
         }
         RendererPropertyId::FontKerning
         | RendererPropertyId::FontVariantNumeric
         | RendererPropertyId::FontVariantLigatures => {
-            font_features::parse_tokens(id, &tokens).is_some()
+            super::font_features::parse_tokens(id, tokens).is_some()
         }
-        RendererPropertyId::Float => one_word(&tokens).is_some_and(|word| {
-            ["left", "right", "none", "inline-start", "inline-end"]
-                .iter()
-                .any(|value| keyword(word, value))
-        }),
-        RendererPropertyId::Clear => one_word(&tokens).is_some_and(|word| {
-            [
-                "left",
-                "right",
-                "both",
-                "none",
-                "inline-start",
-                "inline-end",
-            ]
-            .iter()
-            .any(|value| keyword(word, value))
-        }),
-        RendererPropertyId::ObjectFit => object_fit(&tokens).is_some(),
-        RendererPropertyId::TableLayout => table_layout(&tokens).is_some(),
-        RendererPropertyId::BorderCollapse => border_collapse(&tokens).is_some(),
-        RendererPropertyId::CaptionSide => caption_side(&tokens).is_some(),
-        RendererPropertyId::EmptyCells => empty_cells(&tokens).is_some(),
-        RendererPropertyId::TextBoxTrim => text_box_trim(&tokens).is_some(),
-        RendererPropertyId::TextBoxEdge => text_box_edge(&tokens).is_some(),
-        RendererPropertyId::TextBox => text_box(&tokens).is_some(),
-        _ => return None,
-    })
+        RendererPropertyId::BreakBefore
+        | RendererPropertyId::BreakAfter
+        | RendererPropertyId::PageBreakBefore
+        | RendererPropertyId::PageBreakAfter => break_between(id, tokens).is_some(),
+        RendererPropertyId::BreakInside | RendererPropertyId::PageBreakInside => {
+            break_inside(id, tokens).is_some()
+        }
+        RendererPropertyId::Widows | RendererPropertyId::Orphans => {
+            let mut tokens = significant_tokens(tokens);
+            matches!(tokens.next(), Some(TokenOrValue::Token(Token::Number { int_value: Some(value), .. })) if *value > 0)
+                && tokens.next().is_none()
+        }
+        RendererPropertyId::Contain => super::contain::parse_tokens(tokens).is_some(),
+        _ => true,
+    }
 }
 
 #[cfg(test)]
@@ -321,7 +265,62 @@ mod tests {
     use crate::style::syntax::value::css_wide_keyword;
 
     fn valid(name: &str, value: &str) -> bool {
-        property_value_is_valid(RendererPropertyId::from_name(name).unwrap(), value).unwrap()
+        let tokens =
+            match Property::parse_string(PropertyId::from(name), value, ParserOptions::default())
+                .unwrap()
+            {
+                Property::Custom(value) => value.value,
+                _ => panic!("raw renderer property"),
+            };
+        match name {
+            "table-layout" => table_layout(&tokens).is_some(),
+            "border-collapse" => border_collapse(&tokens).is_some(),
+            "caption-side" => caption_side(&tokens).is_some(),
+            "empty-cells" => empty_cells(&tokens).is_some(),
+            "text-box" => text_box(&tokens).is_some(),
+            "text-box-trim" => text_box_trim(&tokens).is_some(),
+            "text-box-edge" => text_box_edge(&tokens).is_some(),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn bounded_values_keep_native_keyword_and_integer_rules_without_scratch_allocations() {
+        use crate::allocation_test_support::count_allocations;
+        use RendererPropertyId::{ObjectFit, Orphans, TextBox, TextBoxEdge, Widows};
+        use lightningcss::traits::ParseWithOptions;
+
+        for (id, css, expected) in [
+            (ObjectFit, "cover", true),
+            (ObjectFit, "cover scale-down", true),
+            (ObjectFit, "SCALE-DOWN /**/contain", true),
+            (TextBoxEdge, "alphabetic", true),
+            (TextBoxEdge, "\\63 ap ALPHABETIC", true),
+            (TextBoxEdge, "ideographic-ink text", true),
+            (TextBox, "normal", true),
+            (TextBox, "none", true),
+            (TextBox, "trim-start cap alphabetic", true),
+            (TextBox, "cap alphabetic TrIm-EnD", true),
+            (Widows, "+3/**/", true),
+            (Orphans, "2147483647", true),
+            (ObjectFit, "cover scale-down extra", false),
+            (ObjectFit, "'cover'", false),
+            (TextBoxEdge, "cap alphabetic extra", false),
+            (TextBoxEdge, "", false),
+            (TextBox, "trim-start cap alphabetic extra", false),
+            (TextBox, "cap none alphabetic", false),
+            (TextBox, "trim-start 2", false),
+            (Widows, "1e0", false),
+            (Widows, "0", false),
+            (Orphans, "-1", false),
+            (Orphans, "3 4", false),
+        ] {
+            let tokens =
+                TokenList::parse_string_with_options(css, ParserOptions::default()).unwrap();
+            let (supported, allocations) = count_allocations(|| tokens_are_supported(id, &tokens));
+            assert_eq!(supported, expected, "{id:?}: {css}");
+            assert_eq!(allocations, 0, "{id:?}: {css}");
+        }
     }
 
     #[test]

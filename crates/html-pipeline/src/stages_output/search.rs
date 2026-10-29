@@ -1,7 +1,6 @@
 //! Unicode-aware text queries. Returned offsets are logical character indices.
 
-use super::{RenderTextRun, RenderTextView};
-use html_style_model::Visibility;
+use super::RenderTextView;
 use std::ops::Range;
 use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 use unicode_segmentation::UnicodeSegmentation;
@@ -31,79 +30,79 @@ fn normalize_into(text: &str, options: TextSearchOptions, mut emit: impl FnMut(c
     }
 }
 
+/// Collect Unicode-aware matches as logical character offsets.
 pub fn find_text_matches(
     text: &str,
     query: &str,
     options: TextSearchOptions,
 ) -> Vec<(usize, usize)> {
+    text_matches(text, query, options).collect()
+}
+
+/// Normalize the search input once, then yield matches without collecting them.
+/// The iterator owns its normalized data and retains no input string borrows.
+pub fn text_matches(
+    text: &str,
+    query: &str,
+    options: TextSearchOptions,
+) -> impl Iterator<Item = (usize, usize)> + use<> {
     let mut needle = Vec::new();
     normalize_into(query, options, |character| needle.push(character));
-    if needle.is_empty() || query.contains('\0') {
-        return Vec::new();
-    }
-    // Use the same Unicode segmentation as word_range_at. Keep boundaries in
-    // source coordinates so case folding and removed marks cannot split words.
+    let valid_query = !needle.is_empty() && !query.contains('\0');
     let mut word_boundaries = Vec::new();
-    if options.whole_word {
-        word_boundaries.resize(text.chars().count() + 1, false);
-        let mut position = 0;
-        word_boundaries[0] = true;
-        for segment in text.split_word_bounds() {
-            position += segment.chars().count();
-            word_boundaries[position] = true;
+    let mut haystack = Vec::new();
+    if valid_query {
+        // Use the same Unicode segmentation as word_range_at. Keep boundaries in
+        // source coordinates so case folding and removed marks cannot split words.
+        if options.whole_word {
+            word_boundaries.resize(text.chars().count() + 1, false);
+            let mut position = 0;
+            word_boundaries[0] = true;
+            for segment in text.split_word_bounds() {
+                position += segment.chars().count();
+                word_boundaries[position] = true;
+            }
+        }
+        let mut offset = 0;
+        haystack.reserve(text.len());
+        for grapheme in text.graphemes(true) {
+            let start = offset;
+            offset += grapheme.chars().count();
+            normalize_into(grapheme, options, |character| {
+                haystack.push((character, start..offset))
+            });
         }
     }
-    let mut offset = 0;
-    let mut haystack = Vec::with_capacity(text.len());
-    for grapheme in text.graphemes(true) {
-        let start = offset;
-        offset += grapheme.chars().count();
-        normalize_into(grapheme, options, |character| {
-            haystack.push((character, start..offset))
-        });
-    }
-    haystack
-        .windows(needle.len())
-        .filter_map(|window| {
-            if !window
-                .iter()
-                .map(|(character, _)| *character)
-                .eq(needle.iter().copied())
-            {
-                return None;
-            }
-            let source_start = window.first()?.1.start;
-            let source_end = window.last()?.1.end;
-            if options.whole_word
-                && (!word_boundaries[source_start] || !word_boundaries[source_end])
-            {
-                return None;
-            }
-            Some((source_start, source_end))
-        })
-        .collect()
+    let starts = if !valid_query || needle.len() > haystack.len() {
+        0
+    } else {
+        haystack.len() - needle.len() + 1
+    };
+    (0..starts).filter_map(move |start| {
+        let window = &haystack[start..start + needle.len()];
+        if !window
+            .iter()
+            .map(|(character, _)| *character)
+            .eq(needle.iter().copied())
+        {
+            return None;
+        }
+        let source_start = window.first()?.1.start;
+        let source_end = window.last()?.1.end;
+        if options.whole_word && (!word_boundaries[source_start] || !word_boundaries[source_end]) {
+            return None;
+        }
+        Some((source_start, source_end))
+    })
 }
 
 impl<'a> RenderTextView<'a> {
-    fn visible_source_runs(self) -> impl Iterator<Item = RenderTextRun> + 'a {
-        self.text_runs().filter(move |run| {
-            run.dom_text_node().is_some()
-                && self
-                    .doc
-                    .box_used_style(run.box_idx())
-                    .is_some_and(|style| style.visibility() == Visibility::Visible)
-        })
-    }
-
     fn searchable_characters(self) -> Vec<char> {
         let content = self.doc.inputs.text.content();
         let mut characters = vec!['\0'; content.characters().len()];
         for run in self.visible_source_runs() {
             for index in run.glyphs() {
-                if let Some(character) = content
-                    .character_at(index as usize)
-                    .and_then(char::from_u32)
-                {
+                if let Some(character) = content.character_at(index as usize) {
                     characters[index as usize] = character;
                 }
             }
@@ -114,12 +113,11 @@ impl<'a> RenderTextView<'a> {
     /// Find visible source text without matching generated markers or hidden
     /// content. Case/diacritic normalization retains original range indices.
     pub fn find_matches(self, query: &str, options: TextSearchOptions) -> Vec<Range<u32>> {
-        find_text_matches(
+        text_matches(
             &self.searchable_characters().into_iter().collect::<String>(),
             query,
             options,
         )
-        .into_iter()
         .map(|(start, end)| start as u32..end as u32)
         .collect()
     }
@@ -168,9 +166,7 @@ impl<'a> RenderTextView<'a> {
                 if index == glyph {
                     target_byte = Some(text.len());
                 }
-                let character = content
-                    .character_at(index as usize)
-                    .and_then(char::from_u32)?;
+                let character = content.character_at(index as usize)?;
                 positions.push(index);
                 text.push(character);
             }

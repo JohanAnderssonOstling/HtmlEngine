@@ -1,8 +1,8 @@
-//! Internal CSS pipeline, ordered by the lifetime of style data.
+//! CSS compilation and document resolution with shared data contracts.
 //!
-//! `source` normalizes stylesheet text, `syntax` validates declarations,
-//! `rules` prepares effective rules, `matching` finds DOM targets, and
-//! `cascade` produces renderer-owned computed styles.
+//! `program` coordinates the stages. Rules compile native CSS without DOM
+//! access; matching and cascade resolve one document from compiled data and
+//! already-parsed inline declarations. Lower layers never import `program`.
 
 #[path = "05-cascade/mod.rs"]
 pub mod cascade;
@@ -16,3 +16,11 @@ pub mod source;
 pub mod syntax;
 
 pub use source::DEFAULT_CSS;
+pub(crate) mod compiled;
+pub(crate) mod document;
+pub(crate) mod environment;
+pub(crate) mod program;
+pub(crate) mod support;
+pub(crate) mod timings;
+
+pub(crate) mod property_catalogue;

@@ -1,15 +1,15 @@
 //! Owned font declarations for host text systems. No font bytes are loaded here.
 
-use super::declarations;
-use cssparser::{Parser, ParserInput};
+use html_dom::has_uri_scheme;
 use lightningcss::printer::PrinterOptions;
+use lightningcss::properties::custom::{Token, TokenList, TokenOrValue};
 use lightningcss::properties::font::{AbsoluteFontWeight, FontFamily, FontStretch, FontWeight};
 use lightningcss::rules::font_face::{
     FontFaceProperty, FontFaceRule, FontFormat, FontStyle, Source,
 };
 use lightningcss::rules::{CssRule, CssRuleList};
-use lightningcss::stylesheet::{ParserOptions, StyleSheet};
-use lightningcss::traits::ToCss;
+use lightningcss::traits::{ParseWithOptions, ToCss};
+use lightningcss::stylesheet::ParserOptions;
 use lightningcss::values::percentage::Percentage;
 use std::borrow::Cow;
 use std::ops::RangeInclusive;
@@ -203,17 +203,21 @@ fn font_format(format: &FontFormat<'_>) -> String {
 }
 
 fn decoded_family(family: &FontFamily<'_>) -> Option<String> {
-    // Lightning CSS keeps FamilyName's string private. Tokenizing its CSS
-    // serialization recovers the decoded name without hand-written unescaping.
+    // FamilyName's decoded string is private. Let Lightning CSS tokenize its
+    // serialization, then convert the parsed name tokens into host data.
     let css = family.to_css_string(PrinterOptions::default()).ok()?;
-    let mut input = ParserInput::new(&css);
-    let mut parser = Parser::new(&mut input);
-    let mut name = parser.expect_ident_or_string().ok()?.to_string();
-    while !parser.is_exhausted() {
-        name.push(' ');
-        name.push_str(parser.expect_ident().ok()?);
-    }
-    Some(name)
+    let tokens = TokenList::parse_string_with_options(&css, ParserOptions::default()).ok()?;
+    let words: Vec<&str> = tokens
+        .0
+        .iter()
+        .filter(|token| !token.is_whitespace())
+        .map(|token| match token {
+            TokenOrValue::Token(Token::Ident(value) | Token::String(value)) => Some(value.as_ref()),
+            TokenOrValue::DashedIdent(value) => Some(value.0.as_ref()),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    (!words.is_empty()).then(|| words.join(" "))
 }
 
 /// Resolve only `@font-face` URLs before flattening imported stylesheets.
@@ -236,14 +240,7 @@ pub fn resolve_font_face_urls<'a>(
     {
         return Cow::Borrowed(css);
     }
-    let normalized = declarations::normalize(css);
-    let Ok(mut sheet) = StyleSheet::parse(
-        &normalized,
-        ParserOptions {
-            error_recovery: true,
-            ..ParserOptions::default()
-        },
-    ) else {
+    let Some(mut sheet) = super::parse_stylesheet(css) else {
         return Cow::Borrowed(css);
     };
     if !resolve_rule_urls(&mut sheet.rules, &mut resolve) {
@@ -255,7 +252,7 @@ pub fn resolve_font_face_urls<'a>(
     }
 }
 
-fn resolve_rule_urls(
+pub(super) fn resolve_rule_urls(
     rules: &mut CssRuleList<'_>,
     resolve: &mut impl FnMut(&str) -> String,
 ) -> bool {
@@ -270,7 +267,7 @@ fn resolve_rule_urls(
                                 let original = source.url.url.as_ref();
                                 // Resource providers may implement filesystem
                                 // paths only; absolute URIs need no rebasing.
-                                if has_url_scheme(original) {
+                                if has_uri_scheme(original) {
                                     continue;
                                 }
                                 let url = resolve(original);
@@ -291,16 +288,4 @@ fn resolve_rule_urls(
         }
     }
     changed
-}
-
-fn has_url_scheme(url: &str) -> bool {
-    url.split_once(':').is_some_and(|(scheme, _)| {
-        scheme
-            .as_bytes()
-            .first()
-            .is_some_and(u8::is_ascii_alphabetic)
-            && scheme
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
-    })
 }

@@ -1,0 +1,29 @@
+[package]
+name = "html-fonts"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+html = { workspace = true, features = ["font-data"] }
+blake3.workspace = true
+ttf-parser = "0.25"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+dirs = "6"
+fs2 = "0.4"
+reqwest = { workspace = true, features = ["blocking", "rustls-tls"] }
+tempfile = "3"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
+futures-util = "0.3"
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["Window", "WorkerGlobalScope", "Cache", "CacheStorage", "Response", "ResponseInit"] }
+
+[dev-dependencies]
+base64 = "0.22"
+futures-lite = "2"
+tempfile = "3"

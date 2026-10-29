@@ -3,6 +3,129 @@ mod stage_tests {
     use crate::{GlyphRequest, ShapedGlyph};
 
     #[test]
+    fn streamed_spacing_updates_unique_geometry_without_allocating() {
+        use crate::ShapedTextRun;
+        use crate::allocation_test_support::count_allocations;
+
+        let mut run = ShapedTextRun::with_backend_run(
+            [1.0, 1.0, 1.0].into(),
+            [true; 4].into(),
+            0,
+            [0.0, 1.0, 2.0, 3.0].into(),
+            8.0,
+        )
+        .unwrap();
+        let characters = ['a', ' ', 'b'];
+        let deltas = characters
+            .iter()
+            .map(|character| if *character == ' ' { 0.5 } else { 0.25 });
+        let ((), allocations) = count_allocations(|| run.apply_spacing_iter(deltas, false));
+        assert_eq!(allocations, 0);
+        assert_eq!(run.advances(), [1.25, 1.5, 1.25]);
+        assert_eq!(run.caret_stops().unwrap(), [0.0, 1.25, 2.75, 4.0]);
+    }
+
+    #[test]
+    fn semantic_token_queries_borrow_mixed_case_and_prefixed_values_without_allocating() {
+        use crate::allocation_test_support::count_allocations;
+        use crate::engine::ContentRole;
+
+        let prepared = DocumentFactory::new().parse_with_new_pipeline(
+            "<div id='target' epub:type='語彙:PROOF book:LABEL book:chapter' role='book:DOC-EXAMPLE COMPLEMENTARY'>Text</div>",
+            None,
+        );
+        let mut resources = GlyphResourceStore::default();
+        let document = prepared
+            .shape_and_layout(
+                LayoutConstraints::new(600.0, 16.0).unwrap(),
+                &mut TestGlyphShaper::new(),
+                &mut resources,
+            )
+            .unwrap();
+        let view = document.render_view(&resources);
+        let boxes = view.boxes();
+        let target = (0..boxes.len())
+            .find(|&index| boxes.attribute(index, "id") == Some("target"))
+            .unwrap();
+        let (semantics, allocations) = count_allocations(|| view.semantics().content(target));
+        assert!(semantics.has_role(ContentRole::Statement));
+        assert!(semantics.has_role(ContentRole::CompactStructure));
+        assert!(semantics.has_role(ContentRole::Label));
+        assert!(semantics.has_role(ContentRole::Sidebar));
+        assert!(!semantics.has_role(ContentRole::MajorSection));
+        assert_eq!(allocations, 0);
+    }
+
+    #[test]
+    fn markup_escaping_appends_without_intermediate_allocations() {
+        use crate::allocation_test_support::count_allocations;
+        use html_dom::{write_escaped_html_attribute, write_escaped_html_text, write_escaped_xml};
+
+        let mut output = String::with_capacity(256);
+        let ((), allocations) = count_allocations(|| {
+            write_escaped_html_text(&mut output, "café🙂<&>\"'");
+            write_escaped_html_attribute(&mut output, "café🙂<&>\"'");
+            write_escaped_xml(&mut output, "café🙂<&>\"'");
+        });
+        assert_eq!(allocations, 0);
+    }
+
+    #[test]
+    fn search_iterators_allocate_no_match_buffer_and_scan_without_allocating() {
+        use crate::allocation_test_support::count_allocations;
+        use crate::engine::{TextSearchOptions, text_matches};
+
+        let text = "a ".repeat(4096);
+        for whole_word in [false, true] {
+            let options = TextSearchOptions {
+                whole_word,
+                ..TextSearchOptions::default()
+            };
+            let (missing, missing_setup) = count_allocations(|| text_matches(&text, "z", options));
+            let (mut matches, matching_setup) = count_allocations(|| text_matches(&text, "a", options));
+            assert_eq!(
+                matching_setup, missing_setup,
+                "matches need no additional buffer"
+            );
+            let ((first, remaining, missing), allocations) =
+                count_allocations(|| (matches.next(), matches.count(), missing.count()));
+            assert_eq!(first, Some((0, 1)));
+            assert_eq!((remaining, missing), (4095, 0));
+            assert_eq!(allocations, 0);
+        }
+    }
+
+    #[test]
+    fn collapsed_whitespace_allocates_only_the_normalized_output() {
+        use crate::allocation_test_support::count_allocations;
+        use html_dom::collapse_whitespace;
+
+        let gap = "\u{2003}\t\n ".repeat(1024);
+        let many_words = "word ".repeat(1024);
+        for text in ["", gap.as_str()] {
+            let (output, allocations) = count_allocations(|| collapse_whitespace(text));
+            assert!(output.is_empty());
+            assert_eq!(allocations, 0);
+        }
+        for (text, expected) in [
+            (
+                format!("{gap}café\u{a0}{gap}漢字{gap}"),
+                "café 漢字".to_owned(),
+            ),
+            (many_words, "word ".repeat(1023) + "word"),
+            (
+                "🙂\u{200b}e\u{301}".to_owned(),
+                "🙂\u{200b}e\u{301}".to_owned(),
+            ),
+        ] {
+            let (output, allocations) = count_allocations(|| collapse_whitespace(&text));
+            assert_eq!(output, expected);
+            assert_eq!(allocations, 1);
+            assert_eq!(output.capacity(), output.len());
+        }
+    }
+
+    #[test]
     fn visible_text_runs_follow_display_visibility_and_language_before_shaping() {
         let mut factory = DocumentFactory::new();
         let prepared = factory.parse_with_new_pipeline(
@@ -28,6 +151,93 @@ mod stage_tests {
     use html_style_model::{
         ComputedStylesBuildError, ComputedStylesBuilder, ComputedStylesValidationError,
     };
+
+    #[test]
+    fn stable_line_ids_keep_fragments_attached_when_spatial_order_differs() {
+        let source = "<html><body style='margin:0;font-size:10px;line-height:16px'><div style='position:relative;top:80px;width:50px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis'><span style='background:red'><img src='x' width='10' height='10'>AAAAAAAAAAAAAAAAAAAA</span></div><div>Second</div><div style='width:18px;hyphens:manual'>ab&shy;cd</div></body></html>";
+        let mut factory = DocumentFactory::new();
+        let prepared = factory.parse_with_new_pipeline(source, None);
+        let mut shaper = TestGlyphShaper::new();
+        let mut resources = GlyphResourceStore::default();
+        let constraints = LayoutConstraints::new(200.0, 16.0).unwrap();
+        let mut document = prepared
+            .shape_borrowed(&mut shaper, &mut resources)
+            .unwrap()
+            .layout(constraints, &resources)
+            .unwrap();
+        let view = document.render_view(&resources);
+        let text = view.text();
+        let first = text.line(0).unwrap();
+        assert!(first.point_y() >= 80.0);
+        assert_ne!(
+            text.spatial_order()[0],
+            first.id(),
+            "spatial traversal must differ from emission storage"
+        );
+        assert!(text.lines().first().unwrap().point_y() < first.point_y());
+        assert_eq!(view.fragments().images_for_line(first.index()).len(), 1);
+        assert!(text.ellipsis_for_line(first.index()).is_some());
+        assert!(
+            view.fragments()
+                .decorations()
+                .iter()
+                .any(|decoration| decoration.line_idx() == Some(first.index()))
+        );
+        assert!(
+            !document
+                .layout_state
+                .line_output
+                .hyphen_fragments
+                .is_empty()
+        );
+        for (rank, &id) in text.spatial_order().iter().enumerate() {
+            assert_eq!(text.spatial_rank(id), Some(rank));
+            assert_eq!(text.lines().get(rank).unwrap().id(), id);
+            assert_eq!(text.line(id.index()).unwrap().id(), id);
+        }
+        for fragment in &document.layout_state.line_output.hyphen_fragments {
+            assert!(text.hyphen_for_line(fragment.line_idx).is_some());
+        }
+        for line in text.lines().iter() {
+            for fragment in text.line_text_fragments(line.index()).unwrap() {
+                for glyph in fragment.glyphs() {
+                    assert_eq!(text.line_index_for_glyph(glyph), Some(line.index()));
+                }
+            }
+        }
+        let pointer = document.layout_state.line_output.lines.as_ptr();
+        let storage = document
+            .layout_state
+            .line_output
+            .lines
+            .iter()
+            .map(|line| (line.glyphs.clone(), line.point))
+            .collect::<Vec<_>>();
+        let spatial = text.spatial_order().to_vec();
+        let paint = text.paint_order_indices().to_vec();
+        let painted = prepared
+            .with_reader_paint_overrides(&ReaderStyleOverrides {
+                foreground: Some(0x123456ff),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(document.repaint_from(&painted, &resources));
+        assert_eq!(document.layout_state.line_output.lines.as_ptr(), pointer);
+        assert_eq!(
+            document
+                .layout_state
+                .line_output
+                .lines
+                .iter()
+                .map(|line| (line.glyphs.clone(), line.point))
+                .collect::<Vec<_>>(),
+            storage
+        );
+        let text = document.render_view(&resources).text();
+        assert_eq!(text.spatial_order(), spatial);
+        assert_eq!(text.paint_order_indices(), paint);
+        assert_eq!(text.line(0).unwrap().id(), first.id());
+    }
 
     // Independent execution for correctness comparisons; published documents
     // cannot be cloned. Production readers use the borrowed render view.
@@ -196,7 +406,7 @@ mod stage_tests {
     }
 
     #[test]
-    fn image_relayout_moves_published_lines_and_preserves_exact_fractional_geometry() {
+    fn image_relayout_reuses_local_lines_and_preserves_exact_fractional_geometry() {
         let mut comparison_resources_234 = GlyphResourceStore::default();
 
         let mut comparison_resources_222 = GlyphResourceStore::default();
@@ -468,13 +678,13 @@ mod stage_tests {
                     .is_some_and(|node| document.inputs.document.get_dom_id(node) == Some("cell"))
             })
             .unwrap();
-        let before = document.layout_scratch.paragraph_published_hits(owner);
+        let before = document.layout_scratch.paragraph_layout_hits(owner);
         metrics.set(0, 40, 60);
         document
             .relayout_with_metrics(constraints, &metrics, &document_resources)
             .expect("layout requires the shaper-aware API for first-line styles");
         assert!(
-            document.layout_scratch.paragraph_published_hits(owner) > before,
+            document.layout_scratch.paragraph_layout_hits(owner) > before,
             "measurement widths must not evict the cell's actual paragraph layout"
         );
         let mut reference_resources = GlyphResourceStore::default();
@@ -527,7 +737,131 @@ mod stage_tests {
     }
 
     #[test]
-    fn paragraph_cache_retains_break_choices_without_measured_output() {
+    fn box_probes_preserve_published_lines_and_baseline_alignment() {
+        let source = "<div style='display:flex;align-items:baseline;width:160px'><div style='padding:3px;border:2px solid'>one two three four five six</div><div style='font-size:24px'>second item</div></div>";
+        let constraints = LayoutConstraints::new(200.0, 20.0).unwrap();
+        let mut resources = GlyphResourceStore::default();
+        let mut document = DocumentFactory::new()
+            .parse_with_new_pipeline(source, None)
+            .shape(&mut TestGlyphShaper::new(), &mut resources)
+            .unwrap()
+            .layout(constraints, &resources)
+            .unwrap();
+        let expected = paragraph_geometry_snapshot(&document, &resources);
+        for _ in 0..3 {
+            document.relayout(constraints, &resources).unwrap();
+            assert_eq!(paragraph_geometry_snapshot(&document, &resources), expected);
+            let lines = &document.layout_state.line_output.lines;
+            let first = lines.first().unwrap();
+            let second = lines
+                .iter()
+                .find(|line| line.owner_box_idx != first.owner_box_idx)
+                .unwrap();
+            assert!(
+                (first.point.y + first.baseline - second.point.y - second.baseline).abs() < 0.001
+            );
+        }
+    }
+
+    #[test]
+    fn box_result_reuse_preserves_sizing_and_baselines() {
+        let sources = [
+            "<div style='display:flex;align-items:baseline'><div style='padding:5%;border:3px solid;box-sizing:border-box;min-height:30px'>one two three four five six seven</div><div style='font-size:25px'>second item</div></div>",
+            "<div style='display:grid;grid-template-columns:1fr 1fr;align-items:baseline'><p dir='rtl' style='text-align:center'>שלום עולם שלום עולם</p><p style='font-size:24px'>one two three four</p></div>",
+            "<div style='display:flex;align-items:baseline'><div style='line-height:0'>a\nb\nc</div><div>ordinary text</div></div>",
+            "<div style='display:flex;align-items:baseline'><div style='white-space:pre-wrap;tab-size:3;padding:4px'>a\tb\nc d\ne</div><div>ordinary text</div></div>",
+            "<div style='display:flex;align-items:baseline'><div style='overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:40px'>one two three four five</div><div>second item</div></div>",
+            "<div style='display:flex'><div style='aspect-ratio:2;height:0;min-height:max-content;padding:3px'>one two three four five</div><div>second item</div></div>",
+            "<p>before <span style='display:inline-block;width:40%;padding:3px;border:2px solid;vertical-align:baseline'>one two three four five six seven</span> after</p>",
+            "<style>div::first-line{font-size:24px;line-height:1.4}</style><div style='display:flex;align-items:baseline'><div style='padding:2px'>one two three four five six seven eight</div><div>second item</div></div>",
+            "<div style='float:left;width:40px;height:60px'></div><p>before <span style='display:inline-block;max-width:100px'>one two three four five six</span> after</p>",
+            "<div style='display:flex;align-items:baseline'><div style='white-space:pre;line-height:0'>a\nb\nc</div><div>next</div></div>",
+            "<div style='display:flex;align-items:baseline'><div style='white-space:pre'>   </div><div>next</div></div>",
+        ];
+        for source in sources {
+            let mut resources = GlyphResourceStore::default();
+            let mut shaper = TestGlyphShaper::new();
+            let mut document = DocumentFactory::new()
+                .parse_with_new_pipeline(source, None)
+                .shape(&mut shaper, &mut resources)
+                .unwrap()
+                .layout_with_shaper(
+                    LayoutConstraints::new(180.0, 20.0).unwrap(),
+                    &mut shaper,
+                    &mut resources,
+                )
+                .unwrap();
+            for (width, policy) in [
+                (120.0, TextCompositionPolicy::WebCompatible),
+                (220.0, TextCompositionPolicy::BookOptimized),
+            ] {
+                let constraints = LayoutConstraints::new(width, 20.0)
+                    .unwrap()
+                    .with_text_composition_policy(policy);
+                document
+                    .relayout_with_shaper(constraints, &mut shaper, &mut resources)
+                    .unwrap();
+                let mut reference_resources = GlyphResourceStore::default();
+                let mut reference_shaper = TestGlyphShaper::new();
+                let reference = DocumentFactory::new()
+                    .parse_with_new_pipeline(source, None)
+                    .shape(&mut reference_shaper, &mut reference_resources)
+                    .unwrap()
+                    .layout_with_shaper(
+                        constraints,
+                        &mut reference_shaper,
+                        &mut reference_resources,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    paragraph_geometry_snapshot(&document, &resources),
+                    paragraph_geometry_snapshot(&reference, &reference_resources),
+                    "{source}, {width}, {policy:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn local_paragraph_results_survive_replacing_the_published_output() {
+        let source = "<p>one two three four five six seven eight nine ten</p>";
+        let constraints = LayoutConstraints::new(100.0, 20.0).unwrap();
+        let mut resources = GlyphResourceStore::default();
+        let mut document = DocumentFactory::new()
+            .parse_with_new_pipeline(source, None)
+            .shape(&mut TestGlyphShaper::new(), &mut resources)
+            .unwrap()
+            .layout(constraints, &resources)
+            .unwrap();
+        let expected = paragraph_geometry_snapshot(&document, &resources);
+        let published = std::mem::take(&mut document.layout_state.line_output);
+        let old_lines: Vec<_> = published
+            .lines
+            .iter()
+            .map(|line| (line.point, line.baseline))
+            .collect();
+        let timings = document
+            .relayout_with_timings(constraints, &resources)
+            .unwrap();
+        assert_eq!(
+            timings.measured_lines, 0,
+            "reusing a local result needs no line measurement"
+        );
+        assert_eq!(timings.reused_lines, published.lines.len());
+        assert_eq!(paragraph_geometry_snapshot(&document, &resources), expected);
+        assert_eq!(
+            published
+                .lines
+                .iter()
+                .map(|line| (line.point, line.baseline))
+                .collect::<Vec<_>>(),
+            old_lines,
+            "publication is not a source or scratch buffer for the next layout"
+        );
+    }
+
+    #[test]
+    fn paragraph_cache_owns_local_results_without_copying_plain_text_tokens() {
         let source = "<p>one two three four five six seven eight nine ten</p><p>before <img src='x' style='width:20px'> after</p>";
         let mut document_resources = GlyphResourceStore::default();
         let mut document = DocumentFactory::new()
@@ -569,12 +903,50 @@ mod stage_tests {
             {
                 assert_eq!(
                     entry.bytes, 0,
-                    "{} duplicates canonical input or published geometry",
+                    "{} allocates no payload for this plain-text result",
                     entry.label
                 );
             }
         }
         assert!(document.line_count() > 1);
+    }
+
+    #[test]
+    fn local_paragraph_result_accounts_for_adjusted_tokens_and_bidi_placements() {
+        let source = "<style>p::first-line{font-size:24px;line-height:1.4}</style><p style='white-space:nowrap;overflow:hidden;text-overflow:ellipsis'>one two three four five six seven eight nine ten</p><p dir='rtl'>שלום עולם שלום עולם שלום עולם</p>";
+        let mut resources = GlyphResourceStore::default();
+        let constraints = LayoutConstraints::new(100.0, 20.0).unwrap();
+        let mut shaper = TestGlyphShaper::new();
+        let mut document = DocumentFactory::new()
+            .parse_with_new_pipeline(source, None)
+            .shape(&mut shaper, &mut resources)
+            .unwrap()
+            .layout_with_shaper(constraints, &mut shaper, &mut resources)
+            .unwrap();
+        document
+            .relayout_with_shaper(constraints, &mut shaper, &mut resources)
+            .unwrap();
+        let report = document.layout_scratch.paragraph_layout_memory_report();
+        for label in ["tokens", "adjustments", "placements"] {
+            assert!(
+                report
+                    .entries
+                    .iter()
+                    .any(|entry| entry.label == label && entry.bytes > 0),
+                "{label} must count its owned local payload"
+            );
+        }
+        let mut reference_resources = GlyphResourceStore::default();
+        let mut reference_shaper = TestGlyphShaper::new();
+        let reference = reference_layout_with_shaper(
+            &document,
+            &mut reference_shaper,
+            &mut reference_resources,
+        );
+        assert_eq!(
+            paragraph_geometry_snapshot(&document, &resources),
+            paragraph_geometry_snapshot(&reference, &reference_resources)
+        );
     }
 
     #[test]
@@ -906,7 +1278,6 @@ mod stage_tests {
             .characters()
             .iter()
             .copied()
-            .filter_map(char::from_u32)
             .collect();
         assert_eq!(characters, "SS😀 A");
         assert!(text.first_letter_styles().style_at(0).is_some());
@@ -1056,6 +1427,7 @@ mod stage_tests {
                     .unwrap();
                 let mut shaper = TestGlyphShaper::new();
                 let metrics = ImageMetrics::default();
+                let mut resources = GlyphResourceStore::default();
 
                 let (mut document, entries) = capture(Duration::default, || {
                     painted
@@ -1063,6 +1435,7 @@ mod stage_tests {
                             LayoutConstraints::new(160.0, 20.0).unwrap(),
                             &metrics,
                             &mut shaper,
+                            &mut resources,
                         )
                         .unwrap()
                 });
@@ -1088,16 +1461,33 @@ mod stage_tests {
                             LayoutConstraints::new(120.0, 20.0).unwrap(),
                             &metrics,
                             &mut shaper,
+                            &mut resources,
                         )
                         .unwrap();
                 });
                 assert_eq!(preparation_calls(&entries), 1);
                 let (_, entries) = capture(Duration::default, || {
-                    assert!(document.repaint_from(&prepared));
+                    assert!(document.repaint_from(&prepared, &resources));
                 });
                 assert_eq!(preparation_calls(&entries), 1);
             }
         }
+    }
+
+    #[test]
+    fn preserved_whitespace_flow_does_not_consume_ancestor_first_letter() {
+        let mut factory = DocumentFactory::new();
+        let prepared = factory.parse_with_new_pipeline(
+            "<div id='outer'><p style='white-space:pre'>   </p><p>Apple</p></div>",
+            Some("#outer::first-letter{color:red;font-size:32px}"),
+        );
+        let text = prepared.inputs.text.content();
+        let letter = text.characters().iter().position(|&character| character == 'A').unwrap() as u32;
+        let style = prepared.inputs.text.first_letter_styles().style_at(letter).expect("ancestor styles the first actual letter");
+        let item = text.inline_items().iter().find(|item| item.text_run().is_some_and(|run| run.glyphs.contains(&letter))).unwrap();
+        let root = item.flow_root(prepared.inputs.layout_tree.as_ref());
+        assert_eq!(text.pseudo_styles().first_letter(root), Some(style));
+        assert_eq!(prepared.inputs.styles.view(style).unwrap().color(), 0xff0000ff);
     }
 
     #[test]
@@ -1347,8 +1737,7 @@ mod stage_tests {
                 request.font_size,
                 -request.font_size,
                 request.font_size * 0.25,
-            )
-            .map_err(ShapeError::rejected_metric)?;
+            )?;
             Ok(ShapedGlyph::from_metric(request.character as u32, metric))
         }
     }
@@ -1576,23 +1965,17 @@ mod stage_tests {
             .as_ptr();
         let glyphs_ptr = document.glyphs().as_contiguous().unwrap().as_ptr();
         let cached_text_plans = document.layout_scratch.inline_plan_count();
-        let scratch_capacities = document.layout_scratch.allocation_capacities();
         assert!(
             cached_text_plans > 0,
             "initial layout should retain width-independent text plans"
         );
-        assert!(
-            scratch_capacities.0.0 > 0,
-            "initial layout should retain line-owner storage"
-        );
-        assert!(
-            scratch_capacities.1.0 > 0,
-            "initial layout should retain line-sort storage"
-        );
-        assert!(
-            scratch_capacities.1.1 > 0,
-            "initial layout should retain line-remapping storage"
-        );
+        let spatial_order = document.layout_state.line_output.spatial_order.as_ptr();
+        let spatial_ranks = document.layout_state.line_output.spatial_ranks.as_ptr();
+        let paint_order = document
+            .layout_state
+            .line_output
+            .paint_order_indices
+            .as_ptr();
 
         let relayout_timings = document
             .relayout_with_timings(constraints, &shaped_resources)
@@ -1636,19 +2019,21 @@ mod stage_tests {
             document.layout_scratch.inline_plan_count(),
             cached_text_plans
         );
-        let retained_scratch_capacities = document.layout_scratch.allocation_capacities();
         assert_eq!(
-            retained_scratch_capacities.0.0 + retained_scratch_capacities.1.2,
-            scratch_capacities.0.0 + scratch_capacities.1.2,
-            "the two rotating line-owner buffers must retain their combined allocation"
+            document.layout_state.line_output.spatial_order.as_ptr(),
+            spatial_order
         );
         assert_eq!(
-            retained_scratch_capacities.1.0, scratch_capacities.1.0,
-            "line-sort storage must be recycled"
+            document.layout_state.line_output.spatial_ranks.as_ptr(),
+            spatial_ranks
         );
         assert_eq!(
-            retained_scratch_capacities.1.1, scratch_capacities.1.1,
-            "line-remapping storage must be recycled"
+            document
+                .layout_state
+                .line_output
+                .paint_order_indices
+                .as_ptr(),
+            paint_order
         );
         assert!(
             !relayout_timings.root_box_layout.is_zero(),
@@ -1851,7 +2236,6 @@ mod stage_tests {
                 .line_output
                 .glyph_line_indices
                 .as_ptr();
-            let scratch = document.layout_scratch.allocation_capacities();
             let glyphs = document.glyphs().as_contiguous().unwrap().as_ptr();
 
             for width in [240.0, 180.0, 300.0, 120.0] {
@@ -1902,17 +2286,21 @@ mod stage_tests {
                         .as_ptr(),
                     glyph_lines
                 );
-                let retained = document.layout_scratch.allocation_capacities();
-                assert_eq!(retained.0.0 + retained.1.2, scratch.0.0 + scratch.1.2);
-                assert_eq!(retained.1.0, scratch.1.0);
-                assert_eq!(retained.1.1, scratch.1.1);
                 assert_eq!(document.last_constraints, constraints);
                 let lines = |doc: &LaidOutDocument, resources: &GlyphResourceStore| {
                     doc.render_view(resources)
                         .text()
                         .lines()
                         .iter()
-                        .map(|line| (line.glyphs(), line.point(), line.height(), line.baseline()))
+                        .map(|line| {
+                            (
+                                line.owner_box_idx(),
+                                line.glyphs(),
+                                line.point(),
+                                line.height(),
+                                line.baseline(),
+                            )
+                        })
                         .collect::<Vec<_>>()
                 };
                 assert_eq!(

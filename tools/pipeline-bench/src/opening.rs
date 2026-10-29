@@ -42,7 +42,7 @@ fn layout_details(t: &LayoutTimings) -> [(&'static str, Duration); 25] {
         ("layout_tree_traversal", t.layout_tree_traversal),
         ("root_box_layout", t.root_box_layout),
         ("finalize_layout", t.finalize_layout),
-        ("sort_lines_and_remap_images", t.sort_lines_and_remap_images),
+        ("build_line_traversals", t.build_line_traversals),
         ("collect_inline_decorations", t.collect_inline_decorations),
         (
             "rebuild_image_fragments_by_line",
@@ -78,7 +78,7 @@ fn layout_details(t: &LayoutTimings) -> [(&'static str, Duration); 25] {
         (
             "finalize_other",
             t.finalize_layout.saturating_sub(
-                t.sort_lines_and_remap_images
+                t.build_line_traversals
                     + t.collect_inline_decorations
                     + t.rebuild_image_fragments_by_line,
             ),

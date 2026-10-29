@@ -85,7 +85,6 @@ fn plain(text: &PreparedText) -> String {
         .characters()
         .iter()
         .copied()
-        .map(|value| char::from_u32(value).unwrap())
         .collect()
 }
 

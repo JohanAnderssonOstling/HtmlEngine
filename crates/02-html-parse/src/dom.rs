@@ -4,6 +4,7 @@ use crate::{
 use html_dom::{
     Document, DocumentBuildError, DocumentBuilder, DocumentMode, DomAttribute,
     DomElementAttributeCache, DomElementData, DomNodeId, ImageResource, ImageSource, Rootless,
+    write_escaped_xml,
 };
 use std::sync::Arc;
 
@@ -205,7 +206,7 @@ fn serialize_foreign_syntax_element(element: &HtmlSyntaxElement) -> String {
         output.push(' ');
         output.push_str(name);
         output.push_str("=\"");
-        output.push_str(&quick_xml::escape::escape(value));
+        write_escaped_xml(output, value);
         output.push('"');
     }
 
@@ -214,7 +215,7 @@ fn serialize_foreign_syntax_element(element: &HtmlSyntaxElement) -> String {
             HtmlSyntaxNode::Element(element) => {
                 push_element(output, element, default_namespace)
             }
-            HtmlSyntaxNode::Text(text) => output.push_str(&quick_xml::escape::escape(text)),
+            HtmlSyntaxNode::Text(text) => write_escaped_xml(output, text),
             HtmlSyntaxNode::Comment(comment) => {
                 output.push_str("<!--");
                 output.push_str(comment);

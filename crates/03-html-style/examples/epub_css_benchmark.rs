@@ -1,7 +1,7 @@
 //! End-to-end style-pipeline benchmark over CSS extracted from real EPUBs.
 //!
 //! Run with:
-//! `cargo run -p html-style --release --example epub_css_benchmark -- 15 4`
+//! `cargo run -p skrift-style --release --example epub_css_benchmark -- 15 4`
 //!
 //! Arguments are measured iterations and synthetic page copies.
 

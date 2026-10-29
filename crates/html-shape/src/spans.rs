@@ -1,6 +1,7 @@
 //! Contextual shaping-span planning across inline content.
 
 use super::*;
+use html_style_model::StyleView;
 use html_text::whitespace_context_root;
 
 #[derive(Clone, Debug)]
@@ -22,18 +23,23 @@ pub(super) struct ShapingSpan {
 }
 
 impl ShapingSpan {
+    pub(super) fn style<'a>(
+        &self,
+        styles: &'a ComputedStyles,
+        layout_tree: &LayoutTree,
+    ) -> StyleView<'a> {
+        self.style_override
+            .and_then(|indices| styles.view(indices))
+            .unwrap_or_else(|| get_style(styles, layout_tree, self.shaping_box))
+    }
+
     pub(super) fn split_bidi(self, bidi: &ResolvedBidi) -> Vec<(Self, u8)> {
         profile_scope!("shape.split_bidi");
         let mut result: Vec<(Self, u8)> = Vec::new();
         for paint in self.paint_spans {
-            let mut start = paint.characters.start;
-            while start < paint.characters.end {
-                let level = bidi.level(start);
-                let end = (start + 1..paint.characters.end)
-                    .find(|&index| bidi.level(index) != level)
-                    .unwrap_or(paint.characters.end);
+            for (characters, level) in bidi.level_runs(paint.characters.clone()) {
                 let part = ShapingPaintSpan {
-                    characters: start..end,
+                    characters,
                     ..paint.clone()
                 };
                 if let Some((span, _)) =
@@ -51,7 +57,6 @@ impl ShapingSpan {
                         level,
                     ));
                 }
-                start = end;
             }
         }
         result
@@ -82,20 +87,36 @@ impl ShapingSpan {
         Some(range)
     }
 
+    /// Omit per-character colors when the shaping style already describes them.
     pub(super) fn paint_colors(
         &self,
         styles: &ComputedStyles,
         layout_tree: &LayoutTree,
-    ) -> Vec<u32> {
-        let mut colors = Vec::with_capacity(self.character_count());
+    ) -> Option<Vec<u32>> {
+        let default_color = self.style(styles, layout_tree).color();
+        let mut colors = None;
+        let mut prefix_len = 0;
         for span in &self.paint_spans {
             let style = span
                 .style_override
                 .and_then(|indices| styles.view(indices))
                 .unwrap_or_else(|| get_style(styles, layout_tree, span.box_idx));
-            colors.extend(std::iter::repeat_n(style.color(), span.characters.len()));
+            let color = style.color();
+            if colors.is_none() && color != default_color {
+                let mut values = Vec::with_capacity(self.character_count());
+                values.resize(prefix_len, default_color);
+                colors = Some(values);
+            }
+            if let Some(colors) = &mut colors {
+                colors.extend(std::iter::repeat_n(color, span.characters.len()));
+            }
+            prefix_len += span.characters.len();
         }
-        debug_assert_eq!(colors.len(), self.character_count());
+        debug_assert!(
+            colors
+                .as_ref()
+                .is_none_or(|colors| colors.len() == self.character_count())
+        );
         colors
     }
 
@@ -138,7 +159,7 @@ pub(super) fn plan_shaping_spans<Overrides: StyleOverrides + ?Sized>(
         let range = match &item.kind {
             InlineItemKind::Text { glyphs } if glyphs.start < glyphs.end => glyphs.clone(),
             InlineItemKind::Marker { glyphs } if glyphs.start < glyphs.end => {
-                let root = whitespace_context_root(layout_tree, item.box_idx as usize);
+                let root = item.flow_root(layout_tree);
                 append_shaping_range(
                     styles,
                     layout_tree,
@@ -165,7 +186,7 @@ pub(super) fn plan_shaping_spans<Overrides: StyleOverrides + ?Sized>(
                     *inline_end,
                 ) {
                     contexts.insert(
-                        whitespace_context_root(layout_tree, item.box_idx as usize),
+                        item.flow_root(layout_tree),
                         ContextState::default(),
                     );
                 }
@@ -176,20 +197,14 @@ pub(super) fn plan_shaping_spans<Overrides: StyleOverrides + ?Sized>(
             InlineItemKind::Image { .. }
             | InlineItemKind::Break { .. }
             | InlineItemKind::AtomicBox { .. } => {
-                let context_box = match item.kind {
-                    InlineItemKind::Image { .. } | InlineItemKind::AtomicBox { .. } => layout_tree
-                        .get_box_parent(item.box_idx as usize)
-                        .unwrap_or(item.box_idx as usize),
-                    _ => item.box_idx as usize,
-                };
                 contexts.insert(
-                    whitespace_context_root(layout_tree, context_box),
+                    item.flow_root(layout_tree),
                     ContextState::default(),
                 );
                 continue;
             }
         };
-        let formatting_root = whitespace_context_root(layout_tree, item.box_idx as usize);
+        let formatting_root = item.flow_root(layout_tree);
 
         let mut start = range.start;
         while start < range.end {
@@ -197,11 +212,7 @@ pub(super) fn plan_shaping_spans<Overrides: StyleOverrides + ?Sized>(
 
             let mut part_start = start;
             for index in start..end {
-                if inline_content
-                    .character_at(index as usize)
-                    .and_then(char::from_u32)
-                    != Some('\n')
-                {
+                if inline_content.character_at(index as usize) != Some('\n') {
                     continue;
                 }
                 if part_start < index {
@@ -282,15 +293,8 @@ fn inline_boundary_breaks_shaping(
     if vertical_align_breaks_shaping(style.vertical_align()) {
         return true;
     }
-    let start_breaks = inline_start
-        && (!style.margin_left().is_zero()
-            || !style.padding_left().is_zero()
-            || style.border_left_width() != 0.0);
-    let end_breaks = inline_end
-        && (!style.margin_right().is_zero()
-            || !style.padding_right().is_zero()
-            || style.border_right_width() != 0.0);
-    start_breaks || end_breaks
+    let (start, end) = style.inline_edges();
+    (inline_start && start) || (inline_end && end)
 }
 
 fn vertical_align_breaks_shaping(value: VerticalAlignValue) -> bool {
@@ -386,19 +390,4 @@ fn shaping_styles_are_equivalent(
         && left.open_type_features() == right.open_type_features()
         && left.language() == right.language()
         && left.direction() == right.direction()
-}
-
-pub(super) fn text_runs(inline_content: &InlineContent) -> Vec<(usize, std::ops::Range<u32>)> {
-    inline_content
-        .inline_items()
-        .iter()
-        .filter_map(|run| match &run.kind {
-            InlineItemKind::Text { glyphs } | InlineItemKind::Marker { glyphs }
-                if glyphs.start < glyphs.end =>
-            {
-                Some((run.box_idx as usize, glyphs.clone()))
-            }
-            _ => None,
-        })
-        .collect()
 }

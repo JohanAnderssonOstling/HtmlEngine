@@ -1,5 +1,5 @@
 use super::{MemoryUsage, MemoryUsageReport};
-use rustc_data_structures::fx::FxHashMap;
+use crate::storage::StringTable;
 use std::sync::Arc;
 
 #[derive(Clone, PartialEq)]
@@ -57,28 +57,15 @@ impl MemoryUsage for ImageResource {
     }
 }
 
-impl ImageResource {
-    pub fn display_size(&self) -> (f64, f64) {
-        let width = self.width_attr.unwrap_or(self.width) as f64;
-        let height = self.height_attr.unwrap_or(self.height) as f64;
-        (width.max(1.0), height.max(1.0))
-    }
-}
-
 #[derive(Default)]
 pub struct StringInterner {
-    map: FxHashMap<String, u16>,
-    strings: Vec<String>,
+    strings: StringTable,
 }
 
 impl MemoryUsage for StringInterner {
     fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
-        report.add_slice_storage::<(String, u16)>("StringInterner.map.storage", self.map.capacity(), self.map.len());
-        for value in &self.strings {
-            report.add_slice_storage::<u8>("StringInterner.strings.content", value.capacity(), value.len());
-        }
-        report.add_slice_storage::<String>("StringInterner.strings.storage", self.strings.capacity(), self.strings.len());
+        report.extend_prefixed("StringInterner", self.strings.memory_usage_report());
         report
     }
 }
@@ -89,21 +76,15 @@ impl StringInterner {
     }
 
     pub fn intern(&mut self, s: &str) -> u16 {
-        if let Some(&idx) = self.map.get(s) {
-            return idx;
-        }
-        let idx = self.strings.len() as u16;
-        self.strings.push(s.to_string());
-        self.map.insert(s.to_string(), idx);
-        idx
+        self.strings.intern(s) as u16
     }
 
     pub fn get(&self, idx: u16) -> &str {
-        &self.strings[idx as usize]
+        self.strings.get(idx as usize).expect("registered DOM string")
     }
 
     pub fn lookup(&self, s: &str) -> Option<u16> {
-        self.map.get(s).copied()
+        self.strings.lookup(s).map(|index| index as u16)
     }
 
     pub fn len(&self) -> usize {

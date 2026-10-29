@@ -571,7 +571,7 @@ pub(super) fn taffy_item_style(
         && style.width().percentage_dependent())
     .then(|| {
         let ratio = aspect_ratio?;
-        let (_, max_content_width) = crate::layout::box_content_intrinsic_widths(session, box_idx);
+        let (_, max_content_width) = crate::layout::box_content_intrinsic_widths(session, box_idx, None);
         (ratio > 0.0).then(|| Dimension::length(finite_f32(max_content_width / f64::from(ratio))))
     })
     .flatten();

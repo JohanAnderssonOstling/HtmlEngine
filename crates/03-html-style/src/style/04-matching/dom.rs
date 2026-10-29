@@ -1,6 +1,7 @@
-use super::selectors::{
-    AncestorFilter, PSEUDO_AFTER_MASK, PSEUDO_BEFORE_MASK, PSEUDO_FIRST_LETTER_MASK,
-    PSEUDO_FIRST_LINE_MASK,
+#[cfg(test)]
+use crate::style::syntax::selectors::selector_specificity;
+use crate::style::syntax::selectors::{
+    PSEUDO_AFTER_MASK, PSEUDO_BEFORE_MASK, PSEUDO_FIRST_LETTER_MASK, PSEUDO_FIRST_LINE_MASK,
 };
 use html_dom::{Document, DomNodeId};
 use lightningcss::selector::{Combinator, Component, Direction, PseudoClass, PseudoElement, Selector};
@@ -72,7 +73,13 @@ struct MatchContext {
 }
 
 /// Match selector components from a position against a DOM node
-fn match_from_position_dom<'i>(components: &[Component<'i>], doc: &Document, node_idx: DomNodeId, pseudo: Option<PseudoTarget>, context: MatchContext) -> bool {
+fn match_from_position_dom<'i>(
+    components: &[Component<'i>],
+    doc: &Document,
+    node_idx: DomNodeId,
+    pseudo: Option<PseudoTarget>,
+    context: MatchContext,
+) -> bool {
     let mut pos = 0;
 
     // Match components in current sequence
@@ -86,28 +93,57 @@ fn match_from_position_dom<'i>(components: &[Component<'i>], doc: &Document, nod
                     // a pseudo-element and its originating element. Both are
                     // matched against the same DOM node; only the pseudo side
                     // receives the requested pseudo target.
-                    Combinator::PseudoElement => match_from_position_dom(remaining, doc, node_idx, None, context),
+                    Combinator::PseudoElement => {
+                        match_from_position_dom(remaining, doc, node_idx, None, context)
+                    }
                     Combinator::Child => doc
                         .element_ref(node_idx)
                         .and_then(|element| element.parent())
                         .filter(|parent_idx| Some(*parent_idx) != context.exclusive_ancestor_floor)
-                        .is_some_and(|parent_idx| match_from_position_dom(remaining, doc, parent_idx, pseudo, context)),
+                        .is_some_and(|parent_idx| {
+                            match_from_position_dom(remaining, doc, parent_idx, pseudo, context)
+                        }),
                     Combinator::Descendant => {
                         for ancestor_idx in doc.dom_ancestors(node_idx) {
                             if Some(ancestor_idx) == context.exclusive_ancestor_floor {
                                 break;
                             }
-                            if match_from_position_dom(remaining, doc, ancestor_idx, pseudo, context) {
+                            if match_from_position_dom(
+                                remaining,
+                                doc,
+                                ancestor_idx,
+                                pseudo,
+                                context,
+                            ) {
                                 return true;
                             }
                         }
                         false
                     }
-                    Combinator::NextSibling => doc.element_ref(node_idx).and_then(|element| element.previous_element_sibling()).is_some_and(|sibling| match_from_position_dom(remaining, doc, sibling.node_id(), pseudo, context)),
+                    Combinator::NextSibling => doc
+                        .element_ref(node_idx)
+                        .and_then(|element| element.previous_element_sibling())
+                        .is_some_and(|sibling| {
+                            match_from_position_dom(
+                                remaining,
+                                doc,
+                                sibling.node_id(),
+                                pseudo,
+                                context,
+                            )
+                        }),
                     Combinator::LaterSibling => {
-                        let mut current = doc.element_ref(node_idx).and_then(|element| element.previous_element_sibling());
+                        let mut current = doc
+                            .element_ref(node_idx)
+                            .and_then(|element| element.previous_element_sibling());
                         while let Some(sibling) = current {
-                            if match_from_position_dom(remaining, doc, sibling.node_id(), pseudo, context) {
+                            if match_from_position_dom(
+                                remaining,
+                                doc,
+                                sibling.node_id(),
+                                pseudo,
+                                context,
+                            ) {
                                 return true;
                             }
                             current = sibling.previous_element_sibling();
@@ -130,18 +166,30 @@ fn match_from_position_dom<'i>(components: &[Component<'i>], doc: &Document, nod
 }
 
 /// Check if a single selector component matches a DOM node
-fn component_matches_dom(component: &Component, doc: &Document, node_idx: DomNodeId, pseudo: Option<PseudoTarget>, context: MatchContext) -> bool {
+fn component_matches_dom(
+    component: &Component,
+    doc: &Document,
+    node_idx: DomNodeId,
+    pseudo: Option<PseudoTarget>,
+    context: MatchContext,
+) -> bool {
     let Some(element) = doc.element_ref(node_idx) else {
         return false;
     };
     match component {
         Component::ExplicitAnyNamespace => true,
         Component::ExplicitNoNamespace => element.namespace().is_none(),
-        Component::DefaultNamespace(namespace) | Component::Namespace(_, namespace) => element.namespace() == Some(namespace.as_ref()),
+        Component::DefaultNamespace(namespace) | Component::Namespace(_, namespace) => {
+            element.namespace() == Some(namespace.as_ref())
+        }
         Component::ExplicitUniversalType => true,
 
         Component::LocalName(name) => {
-            let selector_name = if element.is_html_element_in_html_document() { name.lower_name.0.as_ref() } else { name.name.0.as_ref() };
+            let selector_name = if element.is_html_element_in_html_document() {
+                name.lower_name.0.as_ref()
+            } else {
+                name.name.0.as_ref()
+            };
             element.tag() == selector_name
         }
 
@@ -149,31 +197,80 @@ fn component_matches_dom(component: &Component, doc: &Document, node_idx: DomNod
 
         Component::Class(class_selector) => element.has_class(class_selector.0.as_ref()),
 
-        Component::AttributeInNoNamespaceExists { local_name, local_name_lower } => {
-            let attr_name = local_name_string(local_name, local_name_lower, element.is_html_element_in_html_document());
+        Component::AttributeInNoNamespaceExists {
+            local_name,
+            local_name_lower,
+        } => {
+            let attr_name = local_name_string(
+                local_name,
+                local_name_lower,
+                element.is_html_element_in_html_document(),
+            );
             element.has_attr(attr_name)
         }
 
-        Component::AttributeInNoNamespace { local_name, operator, value, case_sensitivity, .. } => {
-            let attr_name = local_name_string(local_name, local_name, element.is_html_element_in_html_document());
+        Component::AttributeInNoNamespace {
+            local_name,
+            operator,
+            value,
+            case_sensitivity,
+            ..
+        } => {
+            let attr_name = local_name_string(
+                local_name,
+                local_name,
+                element.is_html_element_in_html_document(),
+            );
             let Some(attr_value) = element.attr(attr_name) else {
                 return false;
             };
 
-            attribute_value_matches(*operator, attr_value, value.as_ref(), parsed_case_sensitivity(*case_sensitivity, element.is_html_element_in_html_document(), Some(attr_name)))
+            attribute_value_matches(
+                *operator,
+                attr_value,
+                value.as_ref(),
+                parsed_case_sensitivity(
+                    *case_sensitivity,
+                    element.is_html_element_in_html_document(),
+                    Some(attr_name),
+                ),
+            )
         }
 
         Component::AttributeOther(other) => {
             let local_name = other.local_name.as_ref();
             match &other.operation {
-                ParsedAttrSelectorOperation::Exists => attribute_exists_in_namespace(element, namespace_match(other.namespace()), local_name),
-                ParsedAttrSelectorOperation::WithValue { operator, case_sensitivity, expected_value } => {
-                    let Some(attr_value) = get_attribute_in_namespace(element, namespace_match(other.namespace()), local_name) else {
+                ParsedAttrSelectorOperation::Exists => attribute_exists_in_namespace(
+                    element,
+                    namespace_match(other.namespace()),
+                    local_name,
+                ),
+                ParsedAttrSelectorOperation::WithValue {
+                    operator,
+                    case_sensitivity,
+                    expected_value,
+                } => {
+                    let Some(attr_value) = get_attribute_in_namespace(
+                        element,
+                        namespace_match(other.namespace()),
+                        local_name,
+                    ) else {
                         return false;
                     };
 
-                    let html_attribute = matches!(namespace_match(other.namespace()), NamespaceMatch::None).then_some(local_name);
-                    attribute_value_matches(*operator, attr_value, expected_value.as_ref(), parsed_case_sensitivity(*case_sensitivity, element.is_html_element_in_html_document(), html_attribute))
+                    let html_attribute =
+                        matches!(namespace_match(other.namespace()), NamespaceMatch::None)
+                            .then_some(local_name);
+                    attribute_value_matches(
+                        *operator,
+                        attr_value,
+                        expected_value.as_ref(),
+                        parsed_case_sensitivity(
+                            *case_sensitivity,
+                            element.is_html_element_in_html_document(),
+                            html_attribute,
+                        ),
+                    )
                 }
             }
         }
@@ -181,8 +278,12 @@ fn component_matches_dom(component: &Component, doc: &Document, node_idx: DomNod
         Component::NonTSPseudoClass(pseudo) => pseudo_matches_dom(pseudo, doc, element),
         Component::PseudoElement(PseudoElement::Before) => pseudo == Some(PseudoTarget::Before),
         Component::PseudoElement(PseudoElement::After) => pseudo == Some(PseudoTarget::After),
-        Component::PseudoElement(PseudoElement::FirstLine) => pseudo == Some(PseudoTarget::FirstLine),
-        Component::PseudoElement(PseudoElement::FirstLetter) => pseudo == Some(PseudoTarget::FirstLetter),
+        Component::PseudoElement(PseudoElement::FirstLine) => {
+            pseudo == Some(PseudoTarget::FirstLine)
+        }
+        Component::PseudoElement(PseudoElement::FirstLetter) => {
+            pseudo == Some(PseudoTarget::FirstLetter)
+        }
         Component::PseudoElement(_) => false,
 
         Component::Root => doc.dom_root() == Some(node_idx),
@@ -190,15 +291,25 @@ fn component_matches_dom(component: &Component, doc: &Document, node_idx: DomNod
         // Selectors L3 `:empty`: no children at all (text nodes count as content).
         Component::Empty => element.children().next().is_none(),
         Component::Nth(nth) => nth_matches_dom(nth, doc, element),
-        Component::NthOf(nth) => nth_of_matches_dom(nth.nth_data(), nth.selectors(), doc, element, context),
+        Component::NthOf(nth) => {
+            nth_of_matches_dom(nth.nth_data(), nth.selectors(), doc, element, context)
+        }
 
         // Forgiving (`:is()`) and non-specificity (`:where()`) matching: the
         // node matches if any inner selector matches it. The UA stylesheet uses
         // these for nested-list markers and margins.
-        Component::Is(selectors) | Component::Where(selectors) => selectors.iter().any(|selector| selector_matches_dom_node_with_context(selector, doc, node_idx, context)),
+        Component::Is(selectors) | Component::Where(selectors) => {
+            selectors.iter().any(|selector| {
+                selector_matches_dom_node_with_context(selector, doc, node_idx, context)
+            })
+        }
         // `:not()` matches when none of the inner selectors match.
-        Component::Negation(selectors) => !selectors.iter().any(|selector| selector_matches_dom_node_with_context(selector, doc, node_idx, context)),
-        Component::Has(selectors) => selectors.iter().any(|selector| relative_selector_matches_dom_node(selector, doc, node_idx)),
+        Component::Negation(selectors) => !selectors.iter().any(|selector| {
+            selector_matches_dom_node_with_context(selector, doc, node_idx, context)
+        }),
+        Component::Has(selectors) => selectors
+            .iter()
+            .any(|selector| relative_selector_matches_dom_node(selector, doc, node_idx)),
 
         _ => false,
     }
@@ -260,13 +371,35 @@ mod tests {
 
     #[test]
     fn enumerated_html_attribute_values_default_to_ascii_case_insensitive_matching() {
-        let document = html_parse::parse_dom_document("<!doctype html><table rules='RoWs'></table>").expect("valid standards HTML");
-        let table = document.nodes().find_map(|(id, node)| matches!(node, html_dom::NodeRef::Element(element) if element.tag() == "table").then_some(id)).expect("table");
-        let default = SelectorList::parse_string_with_options("table[rules=rows]", ParserOptions::default()).expect("selector parses");
-        let explicit_sensitive = SelectorList::parse_string_with_options("table[rules=rows s]", ParserOptions::default()).expect("selector parses");
+        let document =
+            html_parse::parse_dom_document("<!doctype html><table rules='RoWs'></table>")
+                .expect("valid standards HTML");
+        let table = document
+            .nodes()
+            .find_map(|(id, node)| {
+                matches!(node, html_dom::NodeRef::Element(element) if element.tag() == "table")
+                    .then_some(id)
+            })
+            .expect("table");
+        let default =
+            SelectorList::parse_string_with_options("table[rules=rows]", ParserOptions::default())
+                .expect("selector parses");
+        let explicit_sensitive = SelectorList::parse_string_with_options(
+            "table[rules=rows s]",
+            ParserOptions::default(),
+        )
+        .expect("selector parses");
 
-        assert!(selector_matches_dom_node(default.0.first().expect("selector"), &document, table));
-        assert!(!selector_matches_dom_node(explicit_sensitive.0.first().expect("selector"), &document, table));
+        assert!(selector_matches_dom_node(
+            default.0.first().expect("selector"),
+            &document,
+            table
+        ));
+        assert!(!selector_matches_dom_node(
+            explicit_sensitive.0.first().expect("selector"),
+            &document,
+            table
+        ));
     }
 
     #[test]
@@ -304,11 +437,30 @@ mod tests {
     fn unprefixed_descendant_type_selector_matches_xhtml_elements() {
         let parsed = html_parse::parse_xml_document("<html xmlns='http://www.w3.org/1999/xhtml'><body><div><div id='target'/></div></body></html>").expect("valid XHTML");
         let document = parsed.build_dom();
-        let root = document.element_ref(document.dom_root().expect("root")).expect("root element");
-        let body = root.children().find(|&node| document.get_dom_tag(node) == Some("body")).expect("body");
-        let outer = document.element_ref(body).expect("body element").children().find(|&node| document.get_dom_tag(node) == Some("div")).expect("outer div");
-        let target = document.element_ref(outer).expect("outer element").children().find(|&node| document.element_ref(node).and_then(|element| element.id()) == Some("target")).expect("target div");
-        let selectors = SelectorList::parse_string_with_options("div div", ParserOptions::default()).expect("selector parses");
+        let root = document
+            .element_ref(document.dom_root().expect("root"))
+            .expect("root element");
+        let body = root
+            .children()
+            .find(|&node| document.get_dom_tag(node) == Some("body"))
+            .expect("body");
+        let outer = document
+            .element_ref(body)
+            .expect("body element")
+            .children()
+            .find(|&node| document.get_dom_tag(node) == Some("div"))
+            .expect("outer div");
+        let target = document
+            .element_ref(outer)
+            .expect("outer element")
+            .children()
+            .find(|&node| {
+                document.element_ref(node).and_then(|element| element.id()) == Some("target")
+            })
+            .expect("target div");
+        let selectors =
+            SelectorList::parse_string_with_options("div div", ParserOptions::default())
+                .expect("selector parses");
         let selector = selectors.0.first().expect("one selector");
 
         assert!(selector_matches_dom_node(selector, &document, target));
@@ -330,16 +482,56 @@ mod tests {
     #[test]
     fn nth_child_of_counts_only_siblings_matching_the_selector_list() {
         let document = html_parse::parse_dom_document("<!doctype html><ol><li class='eligible' id='first'></li><li></li><li class='eligible' id='second'></li><li class='eligible skip' id='third'></li></ol>").expect("valid standards HTML");
-        let by_id = |id| document.nodes().find_map(|(node, value)| matches!(value, html_dom::NodeRef::Element(element) if element.id() == Some(id)).then_some(node)).expect("test element");
-        let second_of_class = SelectorList::parse_string_with_options("li:nth-child(2 of .eligible)", ParserOptions::default()).expect("selector parses");
-        let last_not_skipped = SelectorList::parse_string_with_options("li:nth-last-child(1 of :not(.skip))", ParserOptions::default()).expect("selector parses");
-        let fourth_in_any_namespace = SelectorList::parse_string_with_options("li:nth-child(4 of *|*)", ParserOptions::default()).expect("selector parses");
+        let by_id = |id| {
+            document
+                .nodes()
+                .find_map(|(node, value)| {
+                    matches!(value, html_dom::NodeRef::Element(element) if element.id() == Some(id))
+                        .then_some(node)
+                })
+                .expect("test element")
+        };
+        let second_of_class = SelectorList::parse_string_with_options(
+            "li:nth-child(2 of .eligible)",
+            ParserOptions::default(),
+        )
+        .expect("selector parses");
+        let last_not_skipped = SelectorList::parse_string_with_options(
+            "li:nth-last-child(1 of :not(.skip))",
+            ParserOptions::default(),
+        )
+        .expect("selector parses");
+        let fourth_in_any_namespace = SelectorList::parse_string_with_options(
+            "li:nth-child(4 of *|*)",
+            ParserOptions::default(),
+        )
+        .expect("selector parses");
 
-        assert!(!selector_matches_dom_node(second_of_class.0.first().expect("selector"), &document, by_id("first")));
-        assert!(selector_matches_dom_node(second_of_class.0.first().expect("selector"), &document, by_id("second")));
-        assert!(!selector_matches_dom_node(second_of_class.0.first().expect("selector"), &document, by_id("third")));
-        assert!(selector_matches_dom_node(last_not_skipped.0.first().expect("selector"), &document, by_id("second")));
-        assert!(selector_matches_dom_node(fourth_in_any_namespace.0.first().expect("selector"), &document, by_id("third")));
+        assert!(!selector_matches_dom_node(
+            second_of_class.0.first().expect("selector"),
+            &document,
+            by_id("first")
+        ));
+        assert!(selector_matches_dom_node(
+            second_of_class.0.first().expect("selector"),
+            &document,
+            by_id("second")
+        ));
+        assert!(!selector_matches_dom_node(
+            second_of_class.0.first().expect("selector"),
+            &document,
+            by_id("third")
+        ));
+        assert!(selector_matches_dom_node(
+            last_not_skipped.0.first().expect("selector"),
+            &document,
+            by_id("second")
+        ));
+        assert!(selector_matches_dom_node(
+            fourth_in_any_namespace.0.first().expect("selector"),
+            &document,
+            by_id("third")
+        ));
     }
 
     #[test]
@@ -354,12 +546,35 @@ mod tests {
     #[test]
     fn has_matches_relative_descendant_child_and_sibling_selectors() {
         let document = html_parse::parse_dom_document("<!doctype html><main><section id='anchor'><div><span></span></div></section><p id='next'></p><aside></aside></main>").expect("valid standards HTML");
-        let by_id = |id| document.nodes().find_map(|(node, value)| matches!(value, html_dom::NodeRef::Element(element) if element.id() == Some(id)).then_some(node)).expect("test element");
+        let by_id = |id| {
+            document
+                .nodes()
+                .find_map(|(node, value)| {
+                    matches!(value, html_dom::NodeRef::Element(element) if element.id() == Some(id))
+                        .then_some(node)
+                })
+                .expect("test element")
+        };
         let anchor = by_id("anchor");
 
-        for selector_text in [":has(span)", ":has(div > span)", ":has(> div)", ":has(+ p)", ":has(~ aside)"] {
-            let selectors = SelectorList::parse_string_with_options(selector_text, ParserOptions::default()).expect("selector parses");
-            assert!(selector_matches_dom_node(selectors.0.first().expect("selector"), &document, anchor), "{selector_text}");
+        for selector_text in [
+            ":has(span)",
+            ":has(div > span)",
+            ":has(> div)",
+            ":has(+ p)",
+            ":has(~ aside)",
+        ] {
+            let selectors =
+                SelectorList::parse_string_with_options(selector_text, ParserOptions::default())
+                    .expect("selector parses");
+            assert!(
+                selector_matches_dom_node(
+                    selectors.0.first().expect("selector"),
+                    &document,
+                    anchor
+                ),
+                "{selector_text}"
+            );
         }
     }
 
@@ -375,30 +590,75 @@ mod tests {
     #[test]
     fn has_composes_with_not_and_nth_child_of() {
         let document = html_parse::parse_dom_document("<!doctype html><main><div id='first'><span></span></div><div id='second'></div><div id='third'><span></span></div></main>").expect("valid standards HTML");
-        let by_id = |id| document.nodes().find_map(|(node, value)| matches!(value, html_dom::NodeRef::Element(element) if element.id() == Some(id)).then_some(node)).expect("test element");
-        let not_has = SelectorList::parse_string_with_options("div:not(:has(span))", ParserOptions::default()).expect("selector parses");
-        let second_with_span = SelectorList::parse_string_with_options("div:nth-child(2 of :has(span))", ParserOptions::default()).expect("selector parses");
+        let by_id = |id| {
+            document
+                .nodes()
+                .find_map(|(node, value)| {
+                    matches!(value, html_dom::NodeRef::Element(element) if element.id() == Some(id))
+                        .then_some(node)
+                })
+                .expect("test element")
+        };
+        let not_has = SelectorList::parse_string_with_options(
+            "div:not(:has(span))",
+            ParserOptions::default(),
+        )
+        .expect("selector parses");
+        let second_with_span = SelectorList::parse_string_with_options(
+            "div:nth-child(2 of :has(span))",
+            ParserOptions::default(),
+        )
+        .expect("selector parses");
 
-        assert!(selector_matches_dom_node(not_has.0.first().expect("selector"), &document, by_id("second")));
-        assert!(!selector_matches_dom_node(not_has.0.first().expect("selector"), &document, by_id("first")));
-        assert!(selector_matches_dom_node(second_with_span.0.first().expect("selector"), &document, by_id("third")));
+        assert!(selector_matches_dom_node(
+            not_has.0.first().expect("selector"),
+            &document,
+            by_id("second")
+        ));
+        assert!(!selector_matches_dom_node(
+            not_has.0.first().expect("selector"),
+            &document,
+            by_id("first")
+        ));
+        assert!(selector_matches_dom_node(
+            second_with_span.0.first().expect("selector"),
+            &document,
+            by_id("third")
+        ));
     }
 
     #[test]
     fn has_child_matches_only_elements_with_a_direct_matching_child() {
-        let document = html_parse::parse_dom_document("<!doctype html><div id='match'><span></span></div><div id='miss'></div>").expect("valid standards HTML");
-        let selector = SelectorList::parse_string_with_options(":has(> span)", ParserOptions::default()).expect("selector parses");
-        assert!(crate::style::matching::selectors::selector_list_is_web_valid(&selector));
-        assert!(selector_might_match_with_filter(selector.0.first().expect("selector"), &AncestorFilter::default()));
+        let document = html_parse::parse_dom_document(
+            "<!doctype html><div id='match'><span></span></div><div id='miss'></div>",
+        )
+        .expect("valid standards HTML");
+        let selector =
+            SelectorList::parse_string_with_options(":has(> span)", ParserOptions::default())
+                .expect("selector parses");
+        assert!(crate::style::syntax::selectors::selector_list_is_web_valid(
+            &selector
+        ));
         let matching_tags_and_ids = document
             .nodes()
             .filter_map(|(node, value)| match value {
-                html_dom::NodeRef::Element(element) if selector_matches_dom_node(selector.0.first().expect("selector"), &document, node) => Some((element.tag().to_owned(), element.id().map(str::to_owned))),
+                html_dom::NodeRef::Element(element)
+                    if selector_matches_dom_node(
+                        selector.0.first().expect("selector"),
+                        &document,
+                        node,
+                    ) =>
+                {
+                    Some((element.tag().to_owned(), element.id().map(str::to_owned)))
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();
 
-        assert_eq!(matching_tags_and_ids, [("div".to_owned(), Some("match".to_owned()))]);
+        assert_eq!(
+            matching_tags_and_ids,
+            [("div".to_owned(), Some("match".to_owned()))]
+        );
     }
 
     #[test]
@@ -536,9 +796,22 @@ fn nth_matches_dom(nth: &NthSelectorData, doc: &Document, element: html_dom::Ele
 
 /// Selectors 4 `:nth-child(An+B of S)` counts the subject only among element
 /// siblings matching the forgiving selector list `S`.
-fn nth_of_matches_dom(nth: &NthSelectorData, selectors: &[Selector<'_>], doc: &Document, element: html_dom::ElementRef<'_>, context: MatchContext) -> bool {
-    let matches_filter = |node| selectors.iter().any(|selector| selector_matches_dom_node_with_context(selector, doc, node, context));
-    let (sibling_count, position) = match element.parent().and_then(|parent_idx| doc.element_ref(parent_idx)) {
+fn nth_of_matches_dom(
+    nth: &NthSelectorData,
+    selectors: &[Selector<'_>],
+    doc: &Document,
+    element: html_dom::ElementRef<'_>,
+    context: MatchContext,
+) -> bool {
+    let matches_filter = |node| {
+        selectors
+            .iter()
+            .any(|selector| selector_matches_dom_node_with_context(selector, doc, node, context))
+    };
+    let (sibling_count, position) = match element
+        .parent()
+        .and_then(|parent_idx| doc.element_ref(parent_idx))
+    {
         Some(parent) => {
             let mut sibling_count = 0;
             let mut position = None;
@@ -558,7 +831,11 @@ fn nth_of_matches_dom(nth: &NthSelectorData, selectors: &[Selector<'_>], doc: &D
     let Some(position) = position else {
         return false;
     };
-    let index = if nth.ty == NthType::LastChild { sibling_count - position + 1 } else { position };
+    let index = if nth.ty == NthType::LastChild {
+        sibling_count - position + 1
+    } else {
+        position
+    };
     nth_index_matches(nth.a, nth.b, index)
 }
 
@@ -671,14 +948,28 @@ fn attribute_exists_in_namespace(element: html_dom::ElementRef<'_>, namespace: N
 }
 
 /// Check if pseudo-class matches DOM node
-fn pseudo_matches_dom(pseudo: &PseudoClass, doc: &Document, element: html_dom::ElementRef<'_>) -> bool {
+fn pseudo_matches_dom(
+    pseudo: &PseudoClass,
+    doc: &Document,
+    element: html_dom::ElementRef<'_>,
+) -> bool {
     let state = element.html_state();
     match pseudo {
         PseudoClass::Link | PseudoClass::AnyLink(_) => state.is_link(),
         PseudoClass::Visited => false, // Don't match visited for privacy
-        PseudoClass::Lang { languages } => effective_language(doc, element).is_some_and(|language| languages.iter().any(|range| language_range_matches(language, range.as_ref()))),
-        PseudoClass::Dir { direction: Direction::Ltr } => !state.is_rtl(),
-        PseudoClass::Dir { direction: Direction::Rtl } => state.is_rtl(),
+        PseudoClass::Lang { languages } => {
+            effective_language(doc, element).is_some_and(|language| {
+                languages
+                    .iter()
+                    .any(|range| language_range_matches(language, range.as_ref()))
+            })
+        }
+        PseudoClass::Dir {
+            direction: Direction::Ltr,
+        } => !state.is_rtl(),
+        PseudoClass::Dir {
+            direction: Direction::Rtl,
+        } => state.is_rtl(),
         PseudoClass::Enabled => state.is_enabled(),
         PseudoClass::Disabled => state.is_disabled(),
         PseudoClass::ReadOnly(_) => state.is_read_only(),
@@ -749,122 +1040,4 @@ fn language_range_matches(language: &str, range: &str) -> bool {
         }
     }
     true
-}
-
-/// Compute Selectors specificity from the parsed component tree. Parcel's
-/// current specificity cache intentionally assigns `:has()` zero specificity,
-/// contrary to Selectors 4, so the renderer owns the cascade-facing value.
-pub(crate) fn selector_specificity(selector: &Selector<'_>) -> u32 {
-    specificity_for_components(selector.iter_raw_match_order().as_slice()).packed()
-}
-
-#[derive(Clone, Copy, Default, Eq, Ord, PartialEq, PartialOrd)]
-struct Specificity {
-    ids: u32,
-    classes: u32,
-    elements: u32,
-}
-
-impl Specificity {
-    fn add(&mut self, other: Self) {
-        self.ids = self.ids.saturating_add(other.ids);
-        self.classes = self.classes.saturating_add(other.classes);
-        self.elements = self.elements.saturating_add(other.elements);
-    }
-
-    fn packed(self) -> u32 {
-        const MAX: u32 = 0x3ff;
-        self.ids.min(MAX) << 20 | self.classes.min(MAX) << 10 | self.elements.min(MAX)
-    }
-}
-
-fn specificity_for_selector_list(selectors: &[Selector<'_>]) -> Specificity {
-    selectors.iter().map(|selector| specificity_for_components(selector.iter_raw_match_order().as_slice())).max().unwrap_or_default()
-}
-
-fn specificity_for_components(components: &[Component<'_>]) -> Specificity {
-    let mut result = Specificity::default();
-    for component in components {
-        let mut contribution = Specificity::default();
-        match component {
-            Component::Part(_) | Component::PseudoElement(_) | Component::LocalName(_) => contribution.elements = 1,
-            Component::Slotted(selector) => {
-                contribution.elements = 1;
-                contribution.add(specificity_for_components(selector.iter_raw_match_order().as_slice()));
-            }
-            Component::Host(selector) => {
-                contribution.classes = 1;
-                if let Some(selector) = selector {
-                    contribution.add(specificity_for_components(selector.iter_raw_match_order().as_slice()));
-                }
-            }
-            Component::ID(_) => contribution.ids = 1,
-            Component::Class(_)
-            | Component::AttributeInNoNamespace { .. }
-            | Component::AttributeInNoNamespaceExists { .. }
-            | Component::AttributeOther(_)
-            | Component::Root
-            | Component::Empty
-            | Component::Scope
-            | Component::Nth(_)
-            | Component::NonTSPseudoClass(_) => contribution.classes = 1,
-            Component::NthOf(nth) => {
-                contribution.classes = 1;
-                contribution.add(specificity_for_selector_list(nth.selectors()));
-            }
-            Component::Negation(selectors) | Component::Is(selectors) | Component::Any(_, selectors) | Component::Has(selectors) => {
-                contribution = specificity_for_selector_list(selectors);
-            }
-            Component::Where(_)
-            | Component::Combinator(_)
-            | Component::ExplicitUniversalType
-            | Component::ExplicitAnyNamespace
-            | Component::ExplicitNoNamespace
-            | Component::DefaultNamespace(_)
-            | Component::Namespace(_, _)
-            | Component::Nesting => {}
-        }
-        result.add(contribution);
-    }
-    result
-}
-
-// ============================================================================
-// Bloom Filter Optimization for Fast Selector Rejection
-// ============================================================================
-
-/// Fast pre-check using bloom filter - can reject selectors that definitely won't match
-/// This is an optimization to avoid expensive full matching for selectors targeting ancestors
-#[allow(dead_code)]
-pub fn selector_might_match_with_filter(selector: &Selector, ancestor_filter: &AncestorFilter) -> bool {
-    let mut iter = selector.iter();
-
-    // Skip target sequence (already checked by selector index)
-    for _ in iter.by_ref() {}
-
-    // Check only sequences that are actually ancestors of the target. A
-    // sibling compound is not represented in the target's ancestor bloom
-    // filter; rejecting it here would turn valid `A + B` and `A ~ B`
-    // selectors into false negatives before the full matcher sees them.
-    while let Some(combinator) = iter.next_sequence() {
-        if !matches!(combinator, Combinator::Child | Combinator::Descendant) {
-            return true;
-        }
-        for component in iter.by_ref() {
-            match component {
-                Component::LocalName(name) if !ancestor_filter.might_contain(name.lower_name.0.as_ref()) => {
-                    return false; // Definitely no match
-                }
-                Component::Class(class) if !ancestor_filter.might_contain(class.0.as_ref()) => {
-                    return false; // Definitely no match
-                }
-                Component::ID(id) if !ancestor_filter.might_contain(id.0.as_ref()) => {
-                    return false; // Definitely no match
-                }
-                _ => {}
-            }
-        }
-    }
-
-    true // Might match (need full check)
 }

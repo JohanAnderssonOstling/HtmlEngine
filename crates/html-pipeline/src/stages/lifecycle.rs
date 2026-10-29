@@ -886,7 +886,11 @@ fn shape_text(
     let inline_content = inputs.text.content();
     let mut glyphs = profile!(
         "shape.allocate_glyphs",
-        inline_content.characters().to_vec()
+        inline_content
+            .characters()
+            .iter()
+            .map(|&character| character as GlyphId)
+            .collect::<Vec<_>>()
     );
     let (ellipsis_glyphs, hyphen_glyphs, text_geometry, font_metrics) =
         crate::shaping::shape_document(
@@ -1357,6 +1361,7 @@ fn layout_inputs<'a>(
         styles: &inputs.styles,
         topology: &inputs.layout_tree,
         inline_content: inputs.text.content(),
+        first_letter_styles: inputs.text.first_letter_styles(),
         glyphs: shaped.glyphs,
         glyph_metrics: resources.metrics(),
         font_metrics: &shaped.shared.font_metrics,
@@ -1812,13 +1817,7 @@ impl<'a> LaidOutDocument<'a> {
                     self.inputs.layout_tree.as_ref(),
                     line.owner_box_idx as usize,
                 );
-                details.paint_color = html_text::first_line_style_for_inline_root(
-                    &self.inputs.document,
-                    &self.inputs.styles,
-                    self.inputs.layout_tree.as_ref(),
-                    self.inputs.text.content(),
-                    root,
-                )
+                details.paint_color = self.inputs.text.content().pseudo_styles().first_line(root)
                 .map(|indices| {
                     self.inputs
                         .paint
@@ -1828,17 +1827,9 @@ impl<'a> LaidOutDocument<'a> {
             }
         }
 
-        if self.inputs.paint.is_default() {
-            self.paint_colors.clear();
-            self.prepare_text_paint(resources);
-            return;
-        }
         let mut colors: Vec<PaintColorRun> = Vec::new();
-        for item in self.inputs.text.content().inline_items() {
-            let (InlineItemKind::Text { glyphs } | InlineItemKind::Marker { glyphs }) = &item.kind
-            else {
-                continue;
-            };
+        for item in self.inputs.text.content().text_runs() {
+            let glyphs = item.glyphs;
             let base = self
                 .inputs
                 .layout_tree
@@ -1864,18 +1855,18 @@ impl<'a> LaidOutDocument<'a> {
                         end = end.min(range.glyphs.start);
                     }
                 }
-                let color = if style == base {
-                    self.inputs
-                        .paint
-                        .box_colors(item.box_idx as usize)
-                        .expect("active palette has every box binding")
-                        .foreground
-                } else {
-                    self.inputs
-                        .paint
-                        .resolve(&self.inputs.styles, style, item.box_idx as usize)
-                        .foreground
-                };
+                let color = self
+                    .inputs
+                    .paint
+                    .box_colors(item.box_idx as usize)
+                    .filter(|_| style == base)
+                    .map(|colors| colors.foreground)
+                    .unwrap_or_else(|| {
+                        self.inputs
+                            .paint
+                            .resolve(&self.inputs.styles, style, item.box_idx as usize)
+                            .foreground
+                    });
                 if let Some(last) = colors
                     .last_mut()
                     .filter(|last| last.glyphs.end == start && last.color == color)
@@ -1905,7 +1896,12 @@ impl<'a> LaidOutDocument<'a> {
                 resources,
             ),
             &mut self.layout_state,
-            &self.paint_colors,
+            // Native runs retain authored colors; only palette overrides replace them.
+            if self.inputs.paint.is_default() {
+                &[]
+            } else {
+                &self.paint_colors
+            },
         );
     }
 

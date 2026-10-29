@@ -4,18 +4,7 @@
 //! This adapter exposes import URLs and serialized wrappers without exposing
 //! Lightning CSS AST nodes to the pipeline crate.
 
-use super::declarations;
-use cssparser::{
-    AtRuleParser, CowRcStr, ParseError, Parser, ParserInput, ParserState, QualifiedRuleParser,
-    StyleSheetParser,
-};
-use lightningcss::rules::layer::LayerName;
-use lightningcss::printer::PrinterOptions;
-use lightningcss::rules::CssRule;
-use lightningcss::stylesheet::{ParserOptions, StyleSheet};
-use lightningcss::traits::{Parse, ToCss};
-use std::borrow::Cow;
-use std::ops::Range;
+use super::resource::{ResourceStylesheet, ResourceStylesheetEntry};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ImportLayer {
@@ -64,119 +53,19 @@ pub fn stylesheet_entries(css: &str) -> Vec<StylesheetEntry> {
         return vec![StylesheetEntry::Css(css.to_owned())];
     }
 
-    let normalized = declarations::normalize(css);
-    let options = ParserOptions { error_recovery: true, ..ParserOptions::default() };
-    let Ok(stylesheet) = StyleSheet::parse(&normalized, options) else {
-        return vec![StylesheetEntry::Css(css.to_owned())];
-    };
-    if !stylesheet.rules.0.iter().any(|rule| matches!(rule, CssRule::Import(_))) {
+    let entries = ResourceStylesheet::parse(css, str::to_owned);
+    if !entries.iter().any(|entry| matches!(entry, ResourceStylesheetEntry::Import(_))) {
         return vec![StylesheetEntry::Css(css.to_owned())];
     }
-
-    let mut entries = Vec::new();
-    for rule in &stylesheet.rules.0 {
-        match rule {
-            CssRule::Import(import) => {
-                let layer = match &import.layer {
-                    None => None,
-                    Some(None) => Some(ImportLayer::Anonymous),
-                    Some(Some(name)) => Some(ImportLayer::Named(name.to_css_string(PrinterOptions::default()).unwrap_or_default())),
-                };
-                let supports = import.supports.as_ref().and_then(|condition| condition.to_css_string(PrinterOptions::default()).ok());
-                let media = (!import.media.media_queries.is_empty()).then(|| import.media.to_css_string(PrinterOptions::default()).ok()).flatten();
-                entries.push(StylesheetEntry::Import(StylesheetImport { url: import.url.as_ref().to_owned(), layer, supports, media }));
-            }
-            _ => {
-                let Ok(serialized) = rule.to_css_string(PrinterOptions::default()) else {
-                    return vec![StylesheetEntry::Css(css.to_owned())];
-                };
-                push_css(&mut entries, serialized);
-            }
-        }
-    }
-    entries
-}
-
-fn push_css(entries: &mut Vec<StylesheetEntry>, css: String) {
-    if let Some(StylesheetEntry::Css(previous)) = entries.last_mut() {
-        previous.push(' ');
-        previous.push_str(&css);
-    } else {
-        entries.push(StylesheetEntry::Css(css));
-    }
+    entries.into_iter().map(|entry| match entry {
+        ResourceStylesheetEntry::Rules(sheet) => StylesheetEntry::Css(sheet.css().to_owned()),
+        ResourceStylesheetEntry::Import(import) => StylesheetEntry::Import(import.description()),
+    }).collect()
 }
 
 fn contains_import_at_rule(css: &str) -> bool {
     css.as_bytes().windows(7).any(|window| window.eq_ignore_ascii_case(b"@import"))
         || css.contains('\\')
-}
-
-/// Invalid layer() arguments belong to a general-enclosed media operand.
-/// The dependency commits to parsing the layer too early and cannot retain
-/// opaque operands in boolean expressions. Its unknown boolean media feature
-/// with the same name has the required false value in every media context.
-pub(crate) fn normalize_layers(css: &str) -> Cow<'_, str> {
-    if !contains_import_at_rule(css) {
-        return Cow::Borrowed(css);
-    }
-    struct Scanner {
-        layers: Vec<Range<usize>>,
-    }
-    impl<'i> AtRuleParser<'i> for Scanner {
-        type Prelude = ();
-        type AtRule = ();
-        type Error = ();
-
-        fn parse_prelude<'t>(
-            &mut self,
-            name: CowRcStr<'i>,
-            input: &mut Parser<'i, 't>,
-        ) -> Result<(), ParseError<'i, ()>> {
-            if !name.eq_ignore_ascii_case("import") {
-                return Err(input.new_custom_error(()));
-            }
-            input.expect_url_or_string()?;
-            input.skip_whitespace();
-            let start = input.position().byte_index();
-            if input
-                .try_parse(|input| input.expect_function_matching("layer"))
-                .is_ok()
-            {
-                let valid = input
-                    .parse_nested_block(|nested| nested.parse_entirely(LayerName::parse))
-                    .is_ok();
-                if !valid {
-                    self.layers.push(start..input.position().byte_index());
-                }
-            }
-            while input.next().is_ok() {}
-            Ok(())
-        }
-
-        fn rule_without_block(&mut self, _: (), _: &ParserState) -> Result<(), ()> {
-            Ok(())
-        }
-    }
-    impl<'i> QualifiedRuleParser<'i> for Scanner {
-        type Prelude = ();
-        type QualifiedRule = ();
-        type Error = ();
-    }
-    let mut scanner = Scanner { layers: Vec::new() };
-    let mut input = ParserInput::new(css);
-    for _ in StyleSheetParser::new(&mut Parser::new(&mut input), &mut scanner) {}
-    if scanner.layers.is_empty() {
-        return Cow::Borrowed(css);
-    }
-    let mut output = String::with_capacity(css.len() + scanner.layers.len() * 2);
-    let mut copied = 0;
-    for range in scanner.layers {
-        output.push_str(&css[copied..range.start]);
-        output.push_str("(layer)");
-        copied = range.end;
-    }
-    output.push_str(&css[copied..]);
-    Cow::Owned(output)
 }
 
 #[cfg(test)]

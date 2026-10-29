@@ -1,8 +1,9 @@
 use super::finite_f32;
 use crate::layout::{
-    LayoutEngine, measure_box_and_baselines_isolated, measure_replaced_content,
-    preferred_aspect_ratio,
+    BoxLayoutRequest, LayoutEngine, ResolvedBoxModel, measure_box_isolated, preferred_aspect_ratio,
 };
+use kurbo::Size;
+use rustc_data_structures::fx::FxHashMap;
 use taffy::geometry::Size as TaffySize;
 use taffy::prelude::AvailableSpace;
 
@@ -10,8 +11,7 @@ type TaffyMeasureKey = (usize, u32, u32, u32, u32, u32, u32);
 
 #[derive(Default)]
 pub struct FlexGridState {
-    measure_cache: rustc_data_structures::fx::FxHashMap<TaffyMeasureKey, MeasuredItem>,
-    container_first_baselines: rustc_data_structures::fx::FxHashMap<usize, f64>,
+    measure_cache: FxHashMap<TaffyMeasureKey, MeasuredItem>,
 }
 
 #[derive(Clone, Copy)]
@@ -23,7 +23,6 @@ pub(super) struct MeasuredItem {
 impl FlexGridState {
     pub fn clear(&mut self) {
         self.measure_cache.clear();
-        self.container_first_baselines.clear();
     }
 
     fn cached_measurement(&self, key: &TaffyMeasureKey) -> Option<MeasuredItem> {
@@ -32,18 +31,6 @@ impl FlexGridState {
 
     fn cache_measurement(&mut self, key: TaffyMeasureKey, measured: MeasuredItem) {
         self.measure_cache.insert(key, measured);
-    }
-
-    pub fn set_container_first_baseline(&mut self, box_idx: usize, baseline: Option<f64>) {
-        if let Some(baseline) = baseline {
-            self.container_first_baselines.insert(box_idx, baseline);
-        } else {
-            self.container_first_baselines.remove(&box_idx);
-        }
-    }
-
-    pub fn container_first_baseline(&self, box_idx: usize) -> Option<f64> {
-        self.container_first_baselines.get(&box_idx).copied()
     }
 }
 
@@ -54,19 +41,10 @@ pub(super) fn measure_item_with_baseline(
     available: TaffySize<AvailableSpace>,
 ) -> MeasuredItem {
     let timing_started = session.start_timing();
-    if let Some(intrinsic) = session.reader.image_intrinsic(box_idx) {
-        let result = measure_replaced_content(
-            intrinsic.size,
-            preferred_aspect_ratio(
-                session.reader.style(box_idx).aspect_ratio(),
-                intrinsic.aspect_ratio,
-            ),
-            known,
-            available,
-        );
+    if let Some(size) = measure_replaced_item(session, box_idx, known, available) {
         session.record_timing(|timings| timings.measure_flex_grid_item += timing_started.elapsed());
         return MeasuredItem {
-            size: result,
+            size,
             first_baseline: None,
         };
     }
@@ -86,28 +64,11 @@ pub(super) fn measure_item_with_baseline(
         return measured;
     }
     let style = session.reader.style(box_idx);
-    let (outer_min_width, outer_max_width) = crate::layout::box_intrinsic_widths(session, box_idx);
-    let horizontal_inset = style.get_horizontal_margin_padding(0.0)
-        + style.border_left_width() as f64
-        + style.border_right_width() as f64;
-    let mut min_width = (outer_min_width - horizontal_inset).max(0.0);
-    let mut max_width = (outer_max_width - horizontal_inset).max(min_width);
-    let vertical_inset = style.get_vertical_padding(0.0)
-        + style.border_top_width() as f64
-        + style.border_bottom_width() as f64;
-    let available_height = known
-        .height
-        .or(match available.height {
-            AvailableSpace::Definite(value) => Some(value),
-            AvailableSpace::MinContent | AvailableSpace::MaxContent => None,
-        })
-        .map(|value| finite_f32((f64::from(value) - vertical_inset).max(0.0)));
-    if let Some(width) = available_height.and_then(|height| {
-        crate::layout::percentage_height_image_width(session, box_idx, f64::from(height))
-    }) {
-        min_width = width;
-        max_width = width;
-    }
+    let ItemWidthBounds {
+        minimum: min_width,
+        maximum: max_width,
+        horizontal_inset,
+    } = item_width_bounds(session, box_idx, known.height, available.height);
     let width = known
         .width
         .map(f64::from)
@@ -117,11 +78,13 @@ pub(super) fn measure_item_with_baseline(
             AvailableSpace::MaxContent => max_width,
         });
     let containing_width = width.max(0.0) + horizontal_inset;
-    let (measured, first_baseline, _) = measure_box_and_baselines_isolated(
+    let measured = measure_box_isolated(
         session,
-        box_idx,
-        containing_width,
-        known.height.map(f64::from),
+        BoxLayoutRequest::normal(
+            box_idx,
+            containing_width.max(0.0),
+            known.height.map(f64::from),
+        ),
     );
     let resolved_vertical_inset = style.get_vertical_padding(containing_width)
         + style.border_top_width() as f64
@@ -134,13 +97,13 @@ pub(super) fn measure_item_with_baseline(
     // effectively subtracted here and then added by Taffy a second time.
     let result = TaffySize {
         width: known.width.unwrap_or_else(|| finite_f32(width)),
-        height: known
-            .height
-            .unwrap_or_else(|| finite_f32((measured.height - resolved_vertical_inset).max(0.0))),
+        height: known.height.unwrap_or_else(|| {
+            finite_f32((measured.size.height - resolved_vertical_inset).max(0.0))
+        }),
     };
     let measured = MeasuredItem {
         size: result,
-        first_baseline,
+        first_baseline: measured.first_baseline,
     };
     session.flex_grid.cache_measurement(key, measured);
     session.record_timing(|timings| timings.measure_flex_grid_item += timing_started.elapsed());
@@ -152,5 +115,151 @@ fn available_space_key(value: AvailableSpace) -> (u32, u32) {
         AvailableSpace::Definite(value) => (0, value.to_bits()),
         AvailableSpace::MinContent => (1, 0),
         AvailableSpace::MaxContent => (2, 0),
+    }
+}
+
+pub(super) fn measure_intrinsic_item(
+    session: &LayoutEngine<'_, '_>,
+    box_idx: usize,
+    known: TaffySize<Option<f32>>,
+    available: TaffySize<AvailableSpace>,
+) -> TaffySize<f32> {
+    if let Some(size) = measure_replaced_item(session, box_idx, known, available) {
+        return size;
+    }
+    let ItemWidthBounds {
+        minimum: min_width,
+        maximum: max_width,
+        ..
+    } = item_width_bounds(session, box_idx, known.height, available.height);
+    let width = known.width.unwrap_or_else(|| match available.width {
+        AvailableSpace::Definite(value) => value,
+        AvailableSpace::MinContent => finite_f32(min_width),
+        AvailableSpace::MaxContent => finite_f32(max_width),
+    });
+    TaffySize {
+        width,
+        height: known.height.unwrap_or(0.0),
+    }
+}
+
+/// Shared inputs for intrinsic contribution queries and final item measurement.
+/// Both stages resolve cyclic item insets against a zero inline-size basis.
+pub(super) struct ItemWidthBounds {
+    pub(super) minimum: f64,
+    pub(super) maximum: f64,
+    pub(super) horizontal_inset: f64,
+}
+
+pub(super) fn item_width_bounds(
+    session: &LayoutEngine<'_, '_>,
+    box_idx: usize,
+    known_height: Option<f32>,
+    available_height: AvailableSpace,
+) -> ItemWidthBounds {
+    let model = ResolvedBoxModel::new(session.reader.style(box_idx), 0.0).with_nonnegative_padding();
+    let (outer_min_width, outer_max_width) = crate::layout::box_intrinsic_widths(session, box_idx);
+    let horizontal_inset = model.horizontal_margin() + model.horizontal_padding_border();
+    let mut min_width = (outer_min_width - horizontal_inset).max(0.0);
+    let mut max_width = (outer_max_width - horizontal_inset).max(min_width);
+    let vertical_inset = model.vertical_padding_border();
+    let available_height = known_height
+        .or(match available_height {
+            AvailableSpace::Definite(value) => Some(value),
+            AvailableSpace::MinContent | AvailableSpace::MaxContent => None,
+        })
+        .map(|value| finite_f32((f64::from(value) - vertical_inset).max(0.0)));
+    if let Some(width) = available_height.and_then(|height| {
+        crate::layout::percentage_height_image_width(session, box_idx, f64::from(height))
+    }) {
+        min_width = width;
+        max_width = width;
+    }
+    ItemWidthBounds {
+        minimum: min_width,
+        maximum: max_width,
+        horizontal_inset,
+    }
+}
+
+pub(super) fn measure_replaced_item(
+    session: &LayoutEngine<'_, '_>,
+    box_idx: usize,
+    known: TaffySize<Option<f32>>,
+    available: TaffySize<AvailableSpace>,
+) -> Option<TaffySize<f32>> {
+    let intrinsic = session.reader.image_intrinsic(box_idx)?;
+    Some(measure_replaced_content(
+        intrinsic.size,
+        preferred_aspect_ratio(
+            session.reader.style(box_idx).aspect_ratio(),
+            intrinsic.aspect_ratio,
+        ),
+        known,
+        available,
+    ))
+}
+
+/// Taffy's known dimensions are border-box dimensions while its measure
+/// callback returns content-box dimensions. When a known axis is present,
+/// Taffy has already subtracted padding and borders from the corresponding
+/// definite available space; use that content size for ratio transfer.
+fn measure_replaced_content(
+    intrinsic: Size,
+    aspect_ratio: Option<f64>,
+    known: TaffySize<Option<f32>>,
+    available: TaffySize<AvailableSpace>,
+) -> TaffySize<f32> {
+    let known_content_width = known.width.map(|width| match available.width {
+        AvailableSpace::Definite(content) => content.max(0.0),
+        AvailableSpace::MinContent | AvailableSpace::MaxContent => width.max(0.0),
+    });
+    let known_content_height = known.height.map(|height| match available.height {
+        AvailableSpace::Definite(content) => content.max(0.0),
+        AvailableSpace::MinContent | AvailableSpace::MaxContent => height.max(0.0),
+    });
+    let ratio = aspect_ratio.filter(|ratio| ratio.is_finite() && *ratio > 0.0);
+    match (known_content_width, known_content_height, ratio) {
+        (Some(width), Some(height), _) => TaffySize { width, height },
+        (Some(width), None, Some(ratio)) => TaffySize {
+            width,
+            height: finite_f32(f64::from(width) / ratio),
+        },
+        (None, Some(height), Some(ratio)) => TaffySize {
+            width: finite_f32(f64::from(height) * ratio),
+            height,
+        },
+        (width, height, _) => TaffySize {
+            width: width.unwrap_or_else(|| finite_f32(intrinsic.width)),
+            height: height.unwrap_or_else(|| finite_f32(intrinsic.height)),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn taffy_measurement_uses_definite_content_box_space() {
+        let measured = measure_replaced_content(
+            Size::new(16.0, 16.0),
+            Some(1.0),
+            TaffySize {
+                width: Some(30.0),
+                height: None,
+            },
+            TaffySize {
+                width: AvailableSpace::Definite(24.0),
+                height: AvailableSpace::MaxContent,
+            },
+        );
+        assert_eq!(
+            measured,
+            TaffySize {
+                width: 24.0,
+                height: 24.0
+            }
+        );
     }
 }

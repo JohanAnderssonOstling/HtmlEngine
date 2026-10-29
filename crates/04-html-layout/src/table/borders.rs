@@ -1,13 +1,13 @@
-use super::columns::TableCellPlacement;
+use super::columns::{TableCellPlacement, TableColumnLayout, row_group_range};
+use crate::layout::paint_program::PaintStyleSource;
 use crate::layout::{
     LayoutEngine, LayoutReader, PhysicalBorderEdge, UsedBorderInsets, border_pattern,
     physical_borders,
 };
 use crate::layout_model::{TableColumnGroupSpan, TableColumnTrack};
-use crate::layout::paint_program::PaintStyleSource;
-use html_style_model::{BorderStyle, TextDirection, UsedStyleView};
-use std::mem::swap;
+use html_style_model::{BorderStyle, TextDirection, UsedStyleView, Visibility};
 use kurbo::{Point, Rect};
+use std::{mem::swap, ops::Range};
 
 #[derive(Clone, Copy, Debug)]
 struct CollapsedBorder {
@@ -59,13 +59,15 @@ impl CollapsedBorder {
         if current.style == BorderStyle::Hidden {
             return false;
         }
-        self.width > current.width
-            || (self.width == current.width
-                && (self.style_priority() > current.style_priority()
-                    || (self.style_priority() == current.style_priority()
-                        && (self.source_priority > current.source_priority
-                            || (self.source_priority == current.source_priority
-                                && self.order >= current.order)))))
+        let precedence = |edge: Self| {
+            (
+                edge.width,
+                edge.style_priority(),
+                edge.source_priority,
+                edge.order,
+            )
+        };
+        precedence(self) >= precedence(current)
     }
 }
 
@@ -79,7 +81,6 @@ pub(super) struct CollapsedBorderGrid {
     horizontal: Vec<Option<CollapsedBorder>>,
     vertical: Vec<Option<CollapsedBorder>>,
     next_order: u32,
-    source: PaintStyleSource,
 }
 
 impl CollapsedBorderGrid {
@@ -104,40 +105,69 @@ impl CollapsedBorderGrid {
             horizontal: vec![None; (row_boxes.len() + 1) * column_count],
             vertical: vec![None; row_boxes.len() * (column_count + 1)],
             next_order: 0,
-            source: PaintStyleSource::Box(table_box_idx as u32),
         };
 
         // Lowest-precedence sources are registered first. The conflict
         // comparison still resolves width and style before source origin.
-        grid.register_table(reader.style(table_box_idx), 1);
+        grid.register_area(
+            reader.style(table_box_idx),
+            0..row_boxes.len(),
+            0..column_count,
+            1,
+            PaintStyleSource::Box(table_box_idx as u32),
+        );
         for group in column_groups {
-            grid.source = PaintStyleSource::Style {indices:group.style,context:table_box_idx as u32};
-            grid.register_column_group(reader.used_style(group.style), group.start, group.span, 2);
+            grid.register_area(
+                reader.used_style(group.style),
+                0..row_boxes.len(),
+                group.start..group.start.saturating_add(group.span),
+                2,
+                PaintStyleSource::Style {
+                    indices: group.style,
+                    context: table_box_idx as u32,
+                },
+            );
         }
         for (column, track) in columns.iter().enumerate().take(column_count) {
-            grid.source = PaintStyleSource::Style {indices:track.width_style,context:table_box_idx as u32};
-            grid.register_column(reader.used_style(track.width_style), column, 3);
+            grid.register_area(
+                reader.used_style(track.width_style),
+                0..row_boxes.len(),
+                column..column + 1,
+                3,
+                PaintStyleSource::Style {
+                    indices: track.width_style,
+                    context: table_box_idx as u32,
+                },
+            );
         }
         for &group_idx in row_groups {
-            let group_rows = row_boxes
-                .iter()
-                .enumerate()
-                .filter_map(|(row, &row_idx)| {
-                    (reader.get_parent(row_idx as usize) == Some(group_idx as usize)).then_some(row)
-                })
-                .collect::<Vec<_>>();
-            if let (Some(&first), Some(&last)) = (group_rows.first(), group_rows.last()) {
-                grid.source = PaintStyleSource::Box(group_idx);
-                grid.register_row_group(reader.style(group_idx as usize), first, last + 1, 4);
+            if let Some(range) = row_group_range(reader, row_boxes, group_idx as usize) {
+                grid.register_area(
+                    reader.style(group_idx as usize),
+                    range,
+                    0..column_count,
+                    4,
+                    PaintStyleSource::Box(group_idx),
+                );
             }
         }
         for (row, &row_idx) in row_boxes.iter().enumerate() {
-            grid.source = PaintStyleSource::Box(row_idx);
-            grid.register_row(reader.style(row_idx as usize), row, 5);
+            grid.register_area(
+                reader.style(row_idx as usize),
+                row..row + 1,
+                0..column_count,
+                5,
+                PaintStyleSource::Box(row_idx),
+            );
         }
         for placement in placements {
-            grid.source = PaintStyleSource::Box(placement.cell_idx as u32);
-            grid.register_cell(reader.style(placement.cell_idx), *placement, 6);
+            grid.register_area(
+                reader.style(placement.cell_idx),
+                placement.row..placement.row.saturating_add(placement.rowspan),
+                placement.col..placement.col.saturating_add(placement.colspan),
+                6,
+                PaintStyleSource::Box(placement.cell_idx as u32),
+            );
         }
         grid
     }
@@ -167,7 +197,9 @@ impl CollapsedBorderGrid {
                 .fold(0.0, f64::max)
                 * 0.5,
             right: (placement.row..row_end)
-                .filter_map(|row| self.vertical_at(row, if self.rtl { placement.col } else { col_end }))
+                .filter_map(|row| {
+                    self.vertical_at(row, if self.rtl { placement.col } else { col_end })
+                })
                 .map(|edge| edge.width)
                 .fold(0.0, f64::max)
                 * 0.5,
@@ -177,7 +209,9 @@ impl CollapsedBorderGrid {
                 .fold(0.0, f64::max)
                 * 0.5,
             left: (placement.row..row_end)
-                .filter_map(|row| self.vertical_at(row, if self.rtl { col_end } else { placement.col }))
+                .filter_map(|row| {
+                    self.vertical_at(row, if self.rtl { col_end } else { placement.col })
+                })
                 .map(|edge| edge.width)
                 .fold(0.0, f64::max)
                 * 0.5,
@@ -189,12 +223,13 @@ impl CollapsedBorderGrid {
         session: &mut LayoutEngine<'_, '_>,
         table_box_idx: usize,
         origin: Point,
-        table_width: f64,
-        column_starts: &[f64],
-        column_widths: &[f64],
+        columns: &TableColumnLayout,
         row_starts: &[f64],
         row_heights: &[f64],
     ) {
+        let table_width = columns.table_width;
+        let column_starts = &columns.starts;
+        let column_widths = &columns.widths;
         for boundary in 0..=self.rows {
             let Some(anchor) = boundary_anchor(row_starts, row_heights, boundary) else {
                 continue;
@@ -210,11 +245,16 @@ impl CollapsedBorderGrid {
                 let start_join = self.vertical_joint_width(boundary, column) * 0.5;
                 let end_join = self.vertical_joint_width(boundary, column + 1) * 0.5;
                 let (left, right) = if self.rtl {
-                    (table_width - x - width - end_join, table_width - x + start_join)
+                    (
+                        table_width - x - width - end_join,
+                        table_width - x + start_join,
+                    )
                 } else {
                     (x - start_join, x + width + end_join)
                 };
-                emit_edge(session, table_box_idx,
+                emit_edge(
+                    session,
+                    table_box_idx,
                     Rect::new(
                         origin.x + left,
                         origin.y + anchor - edge.width * 0.5,
@@ -237,10 +277,16 @@ impl CollapsedBorderGrid {
                 let Some(anchor) = boundary_anchor(column_starts, column_widths, boundary) else {
                     continue;
                 };
-                let anchor = if self.rtl { table_width - anchor } else { anchor };
+                let anchor = if self.rtl {
+                    table_width - anchor
+                } else {
+                    anchor
+                };
                 let start_join = self.horizontal_joint_width(row, boundary) * 0.5;
                 let end_join = self.horizontal_joint_width(row + 1, boundary) * 0.5;
-                emit_edge(session, table_box_idx,
+                emit_edge(
+                    session,
+                    table_box_idx,
                     Rect::new(
                         origin.x + anchor - edge.width * 0.5,
                         origin.y + y - start_join,
@@ -254,207 +300,43 @@ impl CollapsedBorderGrid {
         }
     }
 
-    fn register_table(&mut self, style: UsedStyleView<'_>, priority: u8) {
-        let mut borders = physical_borders(&style);
-        if self.rtl { swap(&mut borders.left, &mut borders.right); }
-        let visible = style.visibility() == html_style_model::Visibility::Visible;
-        self.register_horizontal(0, 0, self.columns, borders.top, priority, visible);
-        self.register_horizontal(
-            self.rows,
-            0,
-            self.columns,
-            borders.bottom,
-            priority,
-            visible,
-        );
-        self.register_vertical(0, self.rows, 0, borders.left, priority, visible);
-        self.register_vertical(0, self.rows, self.columns, borders.right, priority, visible);
-    }
-
-    fn register_row_group(
+    /// Register the four outer edges of any table part in logical grid coordinates.
+    fn register_area(
         &mut self,
         style: UsedStyleView<'_>,
-        start: usize,
-        end: usize,
+        rows: Range<usize>,
+        columns: Range<usize>,
         priority: u8,
+        source: PaintStyleSource,
     ) {
+        let rows = rows.start.min(self.rows)..rows.end.min(self.rows);
+        let columns = columns.start.min(self.columns)..columns.end.min(self.columns);
         let mut borders = physical_borders(&style);
-        if self.rtl { swap(&mut borders.left, &mut borders.right); }
-        let visible = style.visibility() == html_style_model::Visibility::Visible;
-        self.register_horizontal(start, 0, self.columns, borders.top, priority, visible);
-        self.register_horizontal(
-            end.min(self.rows),
-            0,
-            self.columns,
-            borders.bottom,
-            priority,
-            visible,
-        );
-        self.register_vertical(
-            start,
-            end.min(self.rows),
-            0,
-            borders.left,
-            priority,
-            visible,
-        );
-        self.register_vertical(
-            start,
-            end.min(self.rows),
-            self.columns,
-            borders.right,
-            priority,
-            visible,
-        );
-    }
-
-    fn register_row(&mut self, style: UsedStyleView<'_>, row: usize, priority: u8) {
-        let mut borders = physical_borders(&style);
-        if self.rtl { swap(&mut borders.left, &mut borders.right); }
-        let visible = style.visibility() == html_style_model::Visibility::Visible;
-        self.register_horizontal(row, 0, self.columns, borders.top, priority, visible);
-        self.register_horizontal(
-            (row + 1).min(self.rows),
-            0,
-            self.columns,
-            borders.bottom,
-            priority,
-            visible,
-        );
-        self.register_vertical(row, row + 1, 0, borders.left, priority, visible);
-        self.register_vertical(row, row + 1, self.columns, borders.right, priority, visible);
-    }
-
-    fn register_column_group(
-        &mut self,
-        style: UsedStyleView<'_>,
-        start: usize,
-        span: usize,
-        priority: u8,
-    ) {
-        let end = start.saturating_add(span).min(self.columns);
-        let mut borders = physical_borders(&style);
-        if self.rtl { swap(&mut borders.left, &mut borders.right); }
-        let visible = style.visibility() == html_style_model::Visibility::Visible;
-        self.register_vertical(
-            0,
-            self.rows,
-            start.min(self.columns),
-            borders.left,
-            priority,
-            visible,
-        );
-        self.register_vertical(0, self.rows, end, borders.right, priority, visible);
-        self.register_horizontal(0, start, end, borders.top, priority, visible);
-        self.register_horizontal(self.rows, start, end, borders.bottom, priority, visible);
-    }
-
-    fn register_column(&mut self, style: UsedStyleView<'_>, column: usize, priority: u8) {
-        if column >= self.columns {
-            return;
+        if self.rtl {
+            swap(&mut borders.left, &mut borders.right);
         }
-        let mut borders = physical_borders(&style);
-        if self.rtl { swap(&mut borders.left, &mut borders.right); }
-        let visible = style.visibility() == html_style_model::Visibility::Visible;
-        self.register_vertical(0, self.rows, column, borders.left, priority, visible);
-        self.register_vertical(0, self.rows, column + 1, borders.right, priority, visible);
-        self.register_horizontal(0, column, column + 1, borders.top, priority, visible);
-        self.register_horizontal(
-            self.rows,
-            column,
-            column + 1,
-            borders.bottom,
-            priority,
-            visible,
-        );
-    }
-
-    fn register_cell(
-        &mut self,
-        style: UsedStyleView<'_>,
-        placement: TableCellPlacement,
-        priority: u8,
-    ) {
-        let row_end = placement
-            .row
-            .saturating_add(placement.rowspan)
-            .min(self.rows);
-        let col_end = placement
-            .col
-            .saturating_add(placement.colspan)
-            .min(self.columns);
-        let mut borders = physical_borders(&style);
-        if self.rtl { swap(&mut borders.left, &mut borders.right); }
-        let visible = style.visibility() == html_style_model::Visibility::Visible;
-        self.register_horizontal(
-            placement.row,
-            placement.col,
-            col_end,
-            borders.top,
-            priority,
-            visible,
-        );
-        self.register_horizontal(
-            row_end,
-            placement.col,
-            col_end,
-            borders.bottom,
-            priority,
-            visible,
-        );
-        self.register_vertical(
-            placement.row,
-            row_end,
-            placement.col,
-            borders.left,
-            priority,
-            visible,
-        );
-        self.register_vertical(
-            placement.row,
-            row_end,
-            col_end,
-            borders.right,
-            priority,
-            visible,
-        );
-    }
-
-    fn register_horizontal(
-        &mut self,
-        boundary: usize,
-        start: usize,
-        end: usize,
-        edge: PhysicalBorderEdge,
-        priority: u8,
-        visible: bool,
-    ) {
-        let order = self.take_order();
-        let Some(candidate) = CollapsedBorder::from_edge(edge, priority, order, visible, self.source) else {
-            return;
-        };
-        for column in start.min(self.columns)..end.min(self.columns) {
-            let index = boundary.min(self.rows) * self.columns + column;
-            register(&mut self.horizontal[index], candidate);
+        let visible = style.visibility() == Visibility::Visible;
+        for (boundary, edge) in [(rows.start, borders.top), (rows.end, borders.bottom)] {
+            let Some(candidate) =
+                CollapsedBorder::from_edge(edge, priority, self.take_order(), visible, source)
+            else {
+                continue;
+            };
+            for column in columns.clone() {
+                let index = boundary * self.columns + column;
+                register(&mut self.horizontal[index], candidate);
+            }
         }
-    }
-
-    fn register_vertical(
-        &mut self,
-        start: usize,
-        end: usize,
-        boundary: usize,
-        edge: PhysicalBorderEdge,
-        priority: u8,
-        visible: bool,
-    ) {
-        let order = self.take_order();
-        let Some(candidate) = CollapsedBorder::from_edge(edge, priority, order, visible, self.source) else {
-            return;
-        };
-        for row in start.min(self.rows)..end.min(self.rows) {
-            let index = row * (self.columns + 1) + boundary.min(self.columns);
-            register(&mut self.vertical[index], candidate);
+        for (boundary, edge) in [(columns.start, borders.left), (columns.end, borders.right)] {
+            let Some(candidate) =
+                CollapsedBorder::from_edge(edge, priority, self.take_order(), visible, source)
+            else {
+                continue;
+            };
+            for row in rows.clone() {
+                let index = row * (self.columns + 1) + boundary;
+                register(&mut self.vertical[index], candidate);
+            }
         }
     }
 
@@ -534,8 +416,25 @@ fn boundary_anchor(starts: &[f64], sizes: &[f64], boundary: usize) -> Option<f64
     }
 }
 
-fn emit_edge(session: &mut LayoutEngine<'_, '_>, owner: usize, rect: Rect, edge: CollapsedBorder, horizontal: bool) {
-    if !edge.visible || rect.width() <= 0.0 || rect.height() <= 0.0 { return; }
-    let Some(pattern) = border_pattern(edge.style, horizontal) else { return; };
-    crate::layout::decorations::emit_bound_border(session, owner, rect, edge.source, edge.side, pattern);
+fn emit_edge(
+    session: &mut LayoutEngine<'_, '_>,
+    owner: usize,
+    rect: Rect,
+    edge: CollapsedBorder,
+    horizontal: bool,
+) {
+    if !edge.visible || rect.width() <= 0.0 || rect.height() <= 0.0 {
+        return;
+    }
+    let Some(pattern) = border_pattern(edge.style, horizontal) else {
+        return;
+    };
+    crate::layout::decorations::record_bound_border(
+        session,
+        owner,
+        rect,
+        edge.source,
+        edge.side,
+        pattern,
+    );
 }

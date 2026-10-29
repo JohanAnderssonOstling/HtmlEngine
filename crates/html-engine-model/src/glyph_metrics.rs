@@ -1,4 +1,4 @@
-use crate::{GlyphHandle, GlyphId};
+use crate::{FontMetrics, GlyphHandle, GlyphId, ShapedGlyph};
 use html_dom::MemoryUsageReport;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use std::ops::Range;
@@ -12,16 +12,14 @@ use std::sync::Arc;
 /// let _ = html_engine_model::GlyphMetric {
 ///     ch: 'x',
 ///     advance: f32::NAN,
-///     ascent: 1.0,
-///     descent: 1.0,
+///     metrics: Default::default(),
 /// };
 /// ```
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct GlyphMetric {
     ch: char,
     advance: f32,
-    ascent: f32,
-    descent: f32,
+    metrics: FontMetrics,
 }
 
 /// Error returned when glyph metric values violate boundary invariants.
@@ -44,15 +42,25 @@ impl GlyphMetric {
         descent: f32,
     ) -> Result<Self, GlyphMetricError> {
         validate_metric_value_non_negative("advance", advance)?;
-        validate_metric_value_non_negative("ascent", ascent)?;
-        validate_metric_value_non_negative("descent", descent)?;
+        let metrics = FontMetrics::new(ascent, descent)?;
 
         Ok(Self {
             ch,
             advance,
-            ascent,
-            descent,
+            metrics,
         })
+    }
+
+    pub(crate) fn from_shaped(ch: char, shaped: ShapedGlyph) -> Self {
+        Self {
+            ch,
+            advance: shaped.advance(),
+            metrics: shaped.metrics(),
+        }
+    }
+
+    pub(crate) fn font_metrics(self) -> FontMetrics {
+        self.metrics
     }
 
     pub fn ch(&self) -> char {
@@ -64,11 +72,11 @@ impl GlyphMetric {
     }
 
     pub fn ascent(&self) -> f32 {
-        self.ascent
+        self.metrics.ascent()
     }
 
     pub fn descent(&self) -> f32 {
-        self.descent
+        self.metrics.descent()
     }
 }
 
@@ -79,7 +87,7 @@ fn validate_metric_value(field: &'static str, value: f32) -> Result<(), GlyphMet
     Ok(())
 }
 
-fn validate_metric_value_non_negative(
+pub(crate) fn validate_metric_value_non_negative(
     field: &'static str,
     value: f32,
 ) -> Result<(), GlyphMetricError> {

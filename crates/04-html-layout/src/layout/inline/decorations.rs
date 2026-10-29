@@ -225,12 +225,9 @@ impl DecorationEmitter<'_, '_, '_> {
                 }
             }
         }
-        if self.track_overflow_clips {
-            self.fragments.record_decoration_owner_since(
-                self.placement,
-                box_idx as u32,
-                decoration_start,
-            );
+        if self.reader.tracks_overflow_clips() {
+            self.fragments
+                .record_decoration_owner_since(box_idx as u32, decoration_start);
         }
         self.fragments
             .inherit_line_layer_for_decorations_since(line_idx, decoration_start);

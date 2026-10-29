@@ -3,37 +3,13 @@ use crate::layout::{FragmentWriter, LayoutEngine};
 use crate::layout_model::{DecorationFragment, InlineContent, RoundedDecoration};
 use kurbo::Rect;
 
-/// Emits geometry-dependent decoration fragments while limiting mutation to
-/// fragment output and its transient decoration-order owner keys.
+/// Paint reads finalized geometry and writes decoration output only.
 pub(super) struct DecorationEmitter<'scope, 'input, 'output> {
     pub(super) reader: &'scope super::read_context::LayoutReader<'input>,
     pub(super) inline_content: &'input InlineContent,
-    pub(super) geometry: &'scope super::geometry_writer::GeometryWriter<'output>,
+    pub(super) geometry: &'scope crate::layout_model::BoxGeometry,
     pub(super) fragments: &'scope mut FragmentWriter<'output>,
-    pub(super) placement: &'scope mut super::placement::PlacementState,
-    pub(super) track_overflow_clips: bool,
     pub(super) retained_rect: Option<Rect>,
-}
-
-impl<'scope, 'input, 'output> DecorationEmitter<'scope, 'input, 'output> {
-    fn new(
-        reader: &'scope super::read_context::LayoutReader<'input>,
-        inline_content: &'input InlineContent,
-        geometry: &'scope super::geometry_writer::GeometryWriter<'output>,
-        fragments: &'scope mut FragmentWriter<'output>,
-        placement: &'scope mut super::placement::PlacementState,
-        track_overflow_clips: bool,
-    ) -> Self {
-        Self {
-            reader,
-            inline_content,
-            geometry,
-            fragments,
-            placement,
-            track_overflow_clips,
-            retained_rect: None,
-        }
-    }
 }
 
 impl DecorationEmitter<'_, '_, '_> {
@@ -46,12 +22,12 @@ impl DecorationEmitter<'_, '_, '_> {
     ) {
         if let Some(rounded) = rounded {
             self.fragments
-                .push_rounded_decoration(self.placement, rect, color, is_inline, rounded);
+                .push_rounded_decoration(rect, color, is_inline, rounded);
         } else {
-            self.fragments.push_decoration(
-                self.placement,
-                DecorationFragment::border_rect(rect, color, is_inline, false),
-            );
+            self.fragments
+                .push_decoration(DecorationFragment::border_rect(
+                    rect, color, is_inline, false,
+                ));
         }
     }
 
@@ -64,47 +40,67 @@ impl DecorationEmitter<'_, '_, '_> {
     ) {
         if let Some(rounded) = rounded {
             self.fragments
-                .push_rounded_background(self.placement, rect, color, is_inline, rounded);
+                .push_rounded_background(rect, color, is_inline, rounded);
         } else {
-            self.fragments.push_decoration(
-                self.placement,
-                DecorationFragment::background_rect(rect, color, is_inline),
-            );
+            self.fragments
+                .push_decoration(DecorationFragment::background_rect(rect, color, is_inline));
         }
     }
 }
 
-pub fn emit_block_background(engine: &mut LayoutEngine<'_, '_>, box_idx: usize) {
-    with_decoration_emitter(engine, |emitter| emitter.emit_block_background(box_idx));
+fn block_border_box_rect(engine: &LayoutEngine<'_, '_>, box_idx: usize) -> Rect {
+    engine
+        .geometry
+        .decoration_rect(box_idx)
+        .map(|rect| rect + engine.geometry.point(box_idx).to_vec2())
+        .unwrap_or_else(|| {
+            Rect::from_origin_size(
+                engine.geometry.point(box_idx),
+                engine.geometry.size(box_idx),
+            )
+        })
 }
 
-pub fn emit_block_decorations(engine: &mut LayoutEngine<'_, '_>, box_idx: usize) {
-    with_decoration_emitter(engine, |emitter| emitter.emit_block_decorations(box_idx));
+pub fn record_block_background(engine: &mut LayoutEngine<'_, '_>, box_idx: usize) {
+    if engine.reader.background_can_change(box_idx) {
+        let rect = block_border_box_rect(engine, box_idx);
+        engine.fragments.record_paint(
+            &engine.placement,
+            PaintOperation::Background {
+                owner: box_idx as u32,
+                rect,
+            },
+        );
+    }
 }
 
-pub fn emit_block_border_and_outline(engine: &mut LayoutEngine<'_, '_>, box_idx: usize) {
-    with_decoration_emitter(engine, |emitter| {
-        emitter.emit_block_border_and_outline(box_idx)
-    });
+pub fn record_block_decorations(engine: &mut LayoutEngine<'_, '_>, box_idx: usize) {
+    record_block_background(engine, box_idx);
+    record_block_border_and_outline(engine, box_idx);
 }
 
-pub fn collect_inline_decorations(engine: &mut LayoutEngine<'_, '_>) {
-    with_decoration_emitter(engine, |emitter| emitter.collect_inline_decorations());
-}
-
-fn with_decoration_emitter<'input, R>(
-    engine: &mut LayoutEngine<'input, '_>,
-    operation: impl FnOnce(&mut DecorationEmitter<'_, 'input, '_>) -> R,
-) -> R {
-    let mut emitter = DecorationEmitter::new(
-        &engine.reader,
-        engine.text.content(),
-        &engine.geometry,
-        &mut engine.fragments,
-        &mut engine.placement,
-        engine.track_overflow_clips,
-    );
-    operation(&mut emitter)
+pub fn record_block_border_and_outline(engine: &mut LayoutEngine<'_, '_>, box_idx: usize) {
+    let style = engine.reader.style(box_idx);
+    if [
+        style.border_top_width(),
+        style.border_right_width(),
+        style.border_bottom_width(),
+        style.border_left_width(),
+    ]
+    .into_iter()
+    .any(|width| width > 0.0)
+        || (style.outline().style != html_style_model::BorderStyle::None
+            && style.outline().width() > 0.0)
+    {
+        let rect = block_border_box_rect(engine, box_idx);
+        engine.fragments.record_paint(
+            &engine.placement,
+            PaintOperation::BorderOutline {
+                owner: box_idx as u32,
+                rect,
+            },
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1122,35 +1118,23 @@ mod tests {
     }
 }
 
-pub fn emit_bound_background(
+pub fn record_bound_background(
     engine: &mut LayoutEngine<'_, '_>,
     owner: usize,
     rect: Rect,
     source: PaintStyleSource,
 ) {
-    with_decoration_emitter(engine, |emitter| {
-        emitter.fragments.record_paint(
-            emitter.placement,
-            PaintOperation::BackgroundRect {
-                owner: owner as u32,
-                source,
-                rect,
-            },
-        );
-        if !emitter.fragments.is_paint_replay() {
-            return;
-        }
-        let style = match source {
-            PaintStyleSource::Box(index) => emitter.reader.paint_style(index as usize),
-            PaintStyleSource::Style { indices, context } => {
-                emitter.reader.paint_used_style(indices, context as usize)
-            }
-        };
-        emitter.emit_color_rect_for_owner(owner, rect, style.background_color());
-    });
+    engine.fragments.record_paint(
+        &engine.placement,
+        PaintOperation::BackgroundRect {
+            owner: owner as u32,
+            source,
+            rect,
+        },
+    );
 }
 
-pub fn emit_bound_border(
+pub fn record_bound_border(
     engine: &mut LayoutEngine<'_, '_>,
     owner: usize,
     rect: Rect,
@@ -1158,77 +1142,77 @@ pub fn emit_bound_border(
     side: u8,
     pattern: crate::layout_model::DecorationPattern,
 ) {
-    with_decoration_emitter(engine, |emitter| {
-        emitter.fragments.record_paint(
-            emitter.placement,
-            PaintOperation::CollapsedBorder {
-                owner: owner as u32,
-                source,
-                side,
-                pattern,
-                rect,
-            },
-        );
-        if !emitter.fragments.is_paint_replay() {
-            return;
-        }
-        let style = match source {
-            PaintStyleSource::Box(index) => emitter.reader.paint_style(index as usize),
-            PaintStyleSource::Style { indices, context } => {
-                emitter.reader.paint_used_style(indices, context as usize)
-            }
-        };
-        let color = [
-            style.border_top_color(),
-            style.border_right_color(),
-            style.border_bottom_color(),
-            style.border_left_color(),
-        ][side as usize];
-        if color & 0xff != 0 {
-            emitter.fragments.push_block_decoration(
-                emitter.placement,
-                owner as u32,
-                DecorationFragment::patterned(rect, color, false, false, pattern),
-            );
-        }
-    });
-}
-
-pub(super) fn replay_command(engine: &mut LayoutEngine<'_, '_>, command: PaintCommand) {
-    let start = engine.fragments.decoration_len();
-    match command.operation {
-        PaintOperation::Background { owner, rect } => with_decoration_emitter(engine, |emitter| {
-            emitter.retained_rect = Some(rect);
-            emitter.emit_block_background(owner as usize);
-        }),
-        PaintOperation::BorderOutline { owner, rect } => {
-            with_decoration_emitter(engine, |emitter| {
-                emitter.retained_rect = Some(rect);
-                emitter.emit_block_border_and_outline(owner as usize);
-            })
-        }
-        PaintOperation::BackgroundRect {
-            owner,
-            source,
-            rect,
-        } => emit_bound_background(engine, owner as usize, rect, source),
+    engine.fragments.record_paint(
+        &engine.placement,
         PaintOperation::CollapsedBorder {
-            owner,
+            owner: owner as u32,
             source,
             side,
             pattern,
             rect,
-        } => emit_bound_border(engine, owner as usize, rect, source, side, pattern),
-    }
-    engine
-        .fragments
-        .apply_paint_layers_since(start, command.layers);
-    if command.line != u32::MAX {
-        engine
-            .fragments
-            .record_decoration_line_since(command.line as usize, start);
-        engine
-            .fragments
-            .record_decoration_paint_order_since(command.paint_order, start);
+        },
+    );
+}
+
+impl DecorationEmitter<'_, '_, '_> {
+    pub(super) fn replay_command(&mut self, command: PaintCommand) {
+        let start = self.fragments.decoration_len();
+        match command.operation {
+            PaintOperation::Background { owner, rect } => {
+                self.retained_rect = Some(rect);
+                self.emit_block_background(owner as usize);
+            }
+            PaintOperation::BorderOutline { owner, rect } => {
+                self.retained_rect = Some(rect);
+                self.emit_block_border_and_outline(owner as usize);
+            }
+            PaintOperation::BackgroundRect {
+                owner,
+                source,
+                rect,
+            } => {
+                let style = match source {
+                    PaintStyleSource::Box(index) => self.reader.paint_style(index as usize),
+                    PaintStyleSource::Style { indices, context } => {
+                        self.reader.paint_used_style(indices, context as usize)
+                    }
+                };
+                self.emit_color_rect_for_owner(owner as usize, rect, style.background_color());
+            }
+            PaintOperation::CollapsedBorder {
+                owner,
+                source,
+                side,
+                pattern,
+                rect,
+            } => {
+                let style = match source {
+                    PaintStyleSource::Box(index) => self.reader.paint_style(index as usize),
+                    PaintStyleSource::Style { indices, context } => {
+                        self.reader.paint_used_style(indices, context as usize)
+                    }
+                };
+                let color = [
+                    style.border_top_color(),
+                    style.border_right_color(),
+                    style.border_bottom_color(),
+                    style.border_left_color(),
+                ][side as usize];
+                if color & 0xff != 0 {
+                    self.fragments.push_block_decoration(
+                        owner,
+                        DecorationFragment::patterned(rect, color, false, false, pattern),
+                    );
+                }
+            }
+        }
+        self.fragments
+            .apply_paint_layers_since(start, command.layers);
+        if command.line != u32::MAX {
+            self.fragments
+                .record_decoration_line_since(command.line as usize, start);
+            self.fragments
+                .record_decoration_paint_order_since(command.paint_order, start);
+        }
     }
 }

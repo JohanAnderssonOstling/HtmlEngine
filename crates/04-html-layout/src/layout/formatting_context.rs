@@ -1,6 +1,6 @@
-use super::LayoutEngine;
 use super::box_constraints::constrain_content_width;
 use super::inline::{InlineFormattingInput, InlineLayoutArea, ParagraphLayout, ResolvedTextIndent};
+use super::{ContentLayoutResult, LayoutEngine};
 use crate::flex_grid::TaffyContainerKind;
 use crate::layout_model::Children;
 use html_style_model::UsedPreferredSize as PreferredSize;
@@ -15,20 +15,17 @@ pub(super) fn layout_flow_children(
     containing_width: f64,
     percentage_height_basis: Option<f64>,
     first_line_indent: f64,
-) -> Size {
+) -> ContentLayoutResult {
     match children {
-        Children::Blocks(indices) => {
-            let indices = indices.clone();
-            super::block::layout_block_children(
-                engine,
-                box_idx,
-                &indices,
-                content_width,
-                containing_width,
-                percentage_height_basis,
-                first_line_indent,
-            )
-        }
+        Children::Blocks(indices) => super::block::layout_block_children(
+            engine,
+            box_idx,
+            indices,
+            content_width,
+            containing_width,
+            percentage_height_basis,
+            first_line_indent,
+        ),
         Children::InlineItems(range) => {
             let style = engine.reader.style(box_idx);
             let indent = ResolvedTextIndent {
@@ -46,8 +43,9 @@ pub(super) fn layout_flow_children(
                 percentage_height_basis,
                 indent,
             )
+            .into()
         }
-        Children::Empty => Size::ZERO,
+        Children::Empty => Size::ZERO.into(),
     }
 }
 
@@ -86,9 +84,15 @@ fn layout_inline_range(
     indent: ResolvedTextIndent,
 ) -> Size {
     let style = engine.reader.style(box_idx);
-    let indent = engine.reader.reader_text_indent(box_idx).map_or(indent, |amount| ResolvedTextIndent {
-        amount, hanging: false, each_line: false, first_line: true,
-    });
+    let indent = engine
+        .reader
+        .reader_text_indent(box_idx)
+        .map_or(indent, |amount| ResolvedTextIndent {
+            amount,
+            hanging: false,
+            each_line: false,
+            first_line: true,
+        });
     let paragraph = ParagraphLayout {
         indent,
         direction: style.direction(),
@@ -128,9 +132,9 @@ pub(super) fn layout_taffy_container(
     min_width: PreferredSize,
     max_width: PreferredSize,
     border_box_inset: f64,
-) -> Size {
+) -> ContentLayoutResult {
     let layout_width = if shrink_to_fit {
-        let (min_content, max_content) = crate::flex_grid::intrinsic_widths_with_constraints(
+        let (min_content, max_content) = crate::flex_grid::intrinsic_widths(
             engine,
             box_idx,
             children,

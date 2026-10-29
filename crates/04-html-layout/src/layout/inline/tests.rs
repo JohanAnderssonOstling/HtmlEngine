@@ -289,7 +289,7 @@ mod tests {
     fn nested_atomic_text_has_unambiguous_line_ownership() {
         let mut document_resources = GlyphResourceStore::default();
         let document = layout_html(
-            "<html><body style='margin:0'><p style='margin:0;white-space:nowrap'>A<span style='display:inline-flex'>INNER</span>B</p></body></html>",
+            "<html><body style='margin:0'><p style='margin:0;white-space:nowrap;width:100px;overflow-x:clip;overflow-y:visible'>A<span style='display:inline-flex;height:10px;overflow-x:visible;overflow-y:clip'>INNER</span>B</p></body></html>",
             200.0,
             &mut document_resources,
         );
@@ -315,11 +315,17 @@ mod tests {
             Some(outer_line),
             "text after an atomic inline must remain owned by its outer line"
         );
+        let nested_line = view
+            .line_index_for_glyph(nested)
+            .expect("nested atomic text must own a line");
         assert_ne!(
-            view.line_index_for_glyph(nested),
-            Some(outer_line),
+            nested_line, outer_line,
             "nested atomic text must retain its own line identity"
         );
+        let outer_clip = view.line_overflow_clip(outer_line).expect("outer x clip");
+        assert!(outer_clip.clips_x() && !outer_clip.clips_y());
+        let nested_clip = view.line_overflow_clip(nested_line).expect("nested axis clips");
+        assert!(nested_clip.clips_x() && nested_clip.clips_y());
         assert_eq!(
             view.line(outer_line).map(|line| line.index()),
             Some(outer_line)
@@ -1490,7 +1496,7 @@ mod tests {
                     .any(|entry| entry.name == "lines.justified.emergency"),
                 "tracking-feasible text must finish in the normal pass"
             );
-            let first = document.render_view().text().line(0).unwrap();
+            let first = document.render_view(&entries_resources).text().line(0).unwrap();
             let boundaries = if adjustment > 0.0 { 8.0 } else { 4.0 };
             assert!((first.letter_spacing() * boundaries - adjustment).abs() < 1.0e-6);
         }
@@ -1523,7 +1529,7 @@ mod tests {
                 clustered
             );
             assert_eq!(line_text(&document, 0, &entries_resources), "aaaa aaaa");
-            let first = document.render_view().text().line(0).unwrap();
+            let first = document.render_view(&entries_resources).text().line(0).unwrap();
             assert!(
                 first.letter_spacing().abs() <= 0.005 + 1.0e-9,
                 "placement must retain its per-boundary tracking limit"
@@ -1815,6 +1821,28 @@ mod tests {
             !source.contains('\u{2010}'),
             "the displayed hyphen must remain synthetic"
         );
+    }
+
+    #[test]
+    fn manual_soft_hyphens_survive_later_text_runs_in_the_same_box() {
+        for content in [
+            "extra&shy;ordinary tail",
+            "extra&shy;ord<!-- split -->inary tail",
+        ] {
+            let mut resources = GlyphResourceStore::default();
+            let document = layout_html(
+                &format!(
+                    "<html lang='en'><body style='margin:0'><p style='margin:0;hyphens:manual'>{content}</p></body></html>"
+                ),
+                56.0,
+                &mut resources,
+            );
+            let text = document.render_view(&resources).text();
+            assert!(
+                (0..document.line_count()).any(|line| text.hyphen_for_line(line).is_some()),
+                "a later source run must not erase the box's conditional hyphen: {content}"
+            );
+        }
     }
 
     #[test]
@@ -3718,6 +3746,66 @@ mod tests {
         assert_eq!(text.line(0).expect("first line").height(), 72.0);
     }
 
+    #[test]
+    fn floated_and_inline_first_letters_share_selection_across_source_runs() {
+        for (body, selected) in [
+            (
+                "\u{201c}<span>A</span>!<em>\u{301}</em>rest",
+                "\u{201c}A!\u{301}",
+            ),
+            ("! A", "!"),
+            ("!?", "!?"),
+            ("  <span>A\u{301}</span>rest", "A\u{301}"),
+        ] {
+            for float in ["none", "left"] {
+                let mut factory = DocumentFactory::new();
+                let mut shaper = GlyphCache::new();
+                let mut resources = GlyphResourceStore::default();
+                let document = factory.parse_with_new_pipeline(
+                    &format!("<html><body><div>{body}</div></body></html>"),
+                    Some(&format!("html,body,div {{ margin:0; font-size:16px }} div::first-letter {{ float:{float}; font-size:36px; line-height:72px }}")),
+                ).shape(&mut shaper, &mut resources).unwrap()
+                    .layout(crate::LayoutConstraints::new(500.0, 16.0).unwrap(), &resources).unwrap();
+                let text = document.render_view(&resources).text();
+                let selected_text = (0..text.glyph_count())
+                    .filter_map(|index| {
+                        let metric = text.glyph_metric(text.glyph_at(index)?).unwrap();
+                        (metric.advance() == 18.0 && !metric.ch().is_whitespace())
+                            .then_some(metric.ch())
+                    })
+                    .collect::<String>();
+                assert_eq!(selected_text, selected, "{float}: {body:?}");
+                assert!(
+                    text.lines()
+                        .iter()
+                        .any(|line| (line.height() - 72.0).abs() < 1e-5),
+                    "selected text keeps the pseudo line height"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pseudo_line_heights_use_shaped_metrics_alongside_table_column_metrics() {
+        for pseudo in ["first-line", "first-letter"] {
+            for (height, expected) in [("10ex", 150.0), ("normal", 24.0)] {
+                let mut factory = DocumentFactory::new();
+                let mut shaper = GlyphCache::with_x_height_ratio(0.75);
+                let mut resources = GlyphResourceStore::default();
+                let document = factory.parse_with_new_pipeline(
+                    "<html><body><span style='position:relative;left:1ex'><div>Ab</div></span><table><col style='width:2ex'><tr><td>X</td></tr></table></body></html>",
+                    Some(&format!("html,body,div,table {{ margin:0; font-size:20px; line-height:20px }} div::{pseudo} {{ line-height:{height} }}")),
+                ).shape(&mut shaper, &mut resources).unwrap()
+                    .layout_with_shaper(crate::LayoutConstraints::new(500.0, 20.0).unwrap(), &mut shaper, &mut resources).unwrap();
+                let line = document.render_view(&resources).text().line(0).unwrap();
+                assert!(
+                    (line.height() - expected).abs() < 1e-5,
+                    "{pseudo}, {height}: {}",
+                    line.height()
+                );
+            }
+        }
+    }
     #[test]
     fn ancestor_first_letter_reaches_the_first_in_flow_block_descendant() {
         let mut factory = DocumentFactory::new();

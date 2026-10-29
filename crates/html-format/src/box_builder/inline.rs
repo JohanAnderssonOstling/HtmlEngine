@@ -1,12 +1,12 @@
 use html_dom::{Document, DomNodeId, ElementRef, NodeRef};
 use html_style_model::{
-    BorderStyle, Clear, ComputedStyles, Display, Float, PositionMode, StyleIndices, StyleView,
+    Clear, ComputedStyles, Display, Float, PositionMode, StyleIndices, StyleView,
     WhiteSpace,
 };
 
 use super::classification::{
-    display_for_element, display_for_style, is_absolutely_positioned,
-    is_block_level_pseudo_display, is_floated, is_table_internal_display,
+    display_for_element, display_for_style, has_table_internal_descendant,
+    is_absolutely_positioned, is_block_level_pseudo_display, is_floated,
     starts_inline_split_child, starts_new_block_child_for_element,
 };
 use super::generated::ResolvedGeneratedContent;
@@ -95,10 +95,7 @@ pub(super) fn plan_inline_node(
     if absolute || matches!(float, Float::Left | Float::Right) {
         return InlineNodePlan::OutOfFlow(node);
     }
-    if matches!(
-        display,
-        Display::InlineBlock | Display::InlineFlex | Display::InlineGrid | Display::InlineTable
-    ) {
+    if display.is_atomic_inline() {
         return InlineNodePlan::Atomic(node);
     }
 
@@ -143,27 +140,8 @@ pub(super) fn plan_generated_inline(
 fn inline_edges(styles: &ComputedStyles, style: Option<StyleIndices>) -> (bool, bool) {
     style
         .and_then(|indices| styles.view(indices))
-        .map(|view| inline_edges_for_view(&view))
+        .map(|view| view.inline_edges())
         .unwrap_or((false, false))
-}
-
-fn inline_edges_for_view(view: &StyleView<'_>) -> (bool, bool) {
-    (
-        !view.margin_left().is_zero()
-            || !view.padding_left().is_zero()
-            || (view.border_left_width() != html_style_model::FontRelativeLength::ZERO
-                && !matches!(
-                    view.border_left_style(),
-                    BorderStyle::None | BorderStyle::Hidden
-                )),
-        !view.margin_right().is_zero()
-            || !view.padding_right().is_zero()
-            || (view.border_right_width() != html_style_model::FontRelativeLength::ZERO
-                && !matches!(
-                    view.border_right_style(),
-                    BorderStyle::None | BorderStyle::Hidden
-                )),
-    )
 }
 
 #[derive(Clone, Copy)]
@@ -239,21 +217,6 @@ pub(super) fn has_block_child(
             })
         })
         || pseudo_is_block_level(styles, element.node_id(), false)
-}
-
-fn has_table_internal_descendant(
-    document: &Document,
-    styles: &ComputedStyles,
-    element: ElementRef<'_>,
-) -> bool {
-    element.children().any(|child_id| {
-        document.element_ref(child_id).is_some_and(|child| {
-            let display = display_for_element(styles, child);
-            is_table_internal_display(display)
-                || (display == Display::Contents
-                    && has_table_internal_descendant(document, styles, child))
-        })
-    })
 }
 
 pub(super) fn plan_split_inline(
@@ -627,13 +590,8 @@ fn node_has_renderable_inline_content(
                 return true;
             }
             let style = styles.view(style_indices).expect("validated style handle");
-            if matches!(
-                display,
-                Display::InlineBlock
-                    | Display::InlineFlex
-                    | Display::InlineGrid
-                    | Display::InlineTable
-            ) || matches!(style.float(), Float::Left | Float::Right)
+            if display.is_atomic_inline()
+                || matches!(style.float(), Float::Left | Float::Right)
                 || styles
                     .layout_style(style_indices)
                     .is_some_and(|layout| layout.position == PositionMode::Absolute)

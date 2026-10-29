@@ -9,6 +9,7 @@ use super::storage::TokenBuffer;
 use super::*;
 use crate::layout::LayoutEngine;
 use crate::layout_model::{LayoutMode, WhitespaceWrapOverride};
+use html_text::suppresses_glyph;
 use std::mem::{discriminant, size_of};
 
 /// Normal justification consumes at most the glue declared by the paragraph:
@@ -853,12 +854,7 @@ impl<'a> InlineTokens<'a> {
             let InlineTokenKind::Glyph { glyph_idx } = token.kind() else {
                 return None;
             };
-            Some(
-                engine
-                    .text
-                    .glyph_metric(engine.text.glyph_at(glyph_idx as usize).unwrap_or_default())
-                    .ch(),
-            )
+            Some(engine.text.character(glyph_idx))
         }
 
         fn context_character(
@@ -955,10 +951,7 @@ impl<'a> InlineTokens<'a> {
             let InlineTokenKind::Glyph { glyph_idx } = token.kind() else {
                 continue;
             };
-            let character = engine
-                .text
-                .glyph_metric(engine.text.glyph_at(glyph_idx as usize).unwrap_or_default())
-                .ch();
+            let character = engine.text.character(glyph_idx);
             if !matches!(character, ' ' | '\t') {
                 continue;
             }
@@ -979,12 +972,7 @@ impl<'a> InlineTokens<'a> {
                         let InlineTokenKind::Glyph { glyph_idx } = next.kind() else {
                             return true;
                         };
-                        let next_character = engine
-                            .text
-                            .glyph_metric(
-                                engine.text.glyph_at(glyph_idx as usize).unwrap_or_default(),
-                            )
-                            .ch();
+                        let next_character = engine.text.character(glyph_idx);
                         !matches!(next_character, ' ' | '\t')
                             || !next.run_metrics(&self.runs).white_space.preserves_spaces()
                     }),
@@ -1066,7 +1054,6 @@ pub(super) enum TokenWrap {
 mod build;
 
 pub(super) use build::{build_inline_tokens, cached_inline_plan_key};
-pub(in crate::layout) use build::{inline_item_ownership_box, run_belongs_to_inline_context};
 
 /// Style supplying the space/ch metric used by number-valued `tab-size`.
 /// CSS defines it on the nearest block container rather than the inline
@@ -1132,7 +1119,7 @@ pub(in crate::layout) fn canonical_text_unit(
     canonical_text_unit_from_facts(
         engine,
         glyph_idx,
-        metric.ch(),
+        engine.text.character(glyph_idx),
         engine.text.text_advance(glyph_idx as usize, metric.advance()),
         style.font_size(),
         style.letter_spacing() as f64,
@@ -1163,7 +1150,7 @@ pub(super) fn canonical_text_unit_from_facts(
         WhitespaceWrapOverride::UnicodeAllow => BreakKind::Discretionary,
         WhitespaceWrapOverride::UnicodeSuppress => BreakKind::None,
     };
-    let natural_advance = if matches!(character, '\u{00ad}' | '\u{200b}') || html_text::is_bidi_control(character) || font_size <= 0.0 {
+    let natural_advance = if suppresses_glyph(character) || character == '\u{200b}' || font_size <= 0.0 {
         0.0
     } else {
         let advance = glyph_advance as f64 + if character == ' ' { word_spacing } else { 0.0 };

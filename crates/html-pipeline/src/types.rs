@@ -1,13 +1,15 @@
-use crate::engine::ImageMetrics;
+use crate::engine::{ImageMetrics, NoteFlow, ReaderStyleOverrides};
 use std::fmt;
 use std::mem::swap;
+use std::sync::Arc;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PipelineChange {
     SourceChanged(SourceRevision),
     ResourceBaseChanged(ResourceRevision),
     StylesheetsChanged(StylesheetRevision),
     StyleEnvironmentChanged(StyleEnvironment),
+    NoteFlowChanged(NoteFlow),
     FontEnvironmentChanged(FontEnvironmentRevision),
     ImageMetricsChanged(ImageMetricsRevision),
     LayoutConstraintsChanged(LayoutConstraints),
@@ -16,16 +18,7 @@ pub enum PipelineChange {
 
 impl PipelineChange {
     pub const fn invalidated_stage(&self) -> EarliestStage {
-        match self {
-            Self::SourceChanged(_) => EarliestStage::Parse,
-            Self::ResourceBaseChanged(_) => EarliestStage::Parse,
-            Self::StylesheetsChanged(_) => EarliestStage::Style,
-            Self::StyleEnvironmentChanged(_) => EarliestStage::Style,
-            Self::FontEnvironmentChanged(_) => EarliestStage::Shape,
-            Self::ImageMetricsChanged(_) => EarliestStage::Layout,
-            Self::LayoutConstraintsChanged(_) => EarliestStage::Layout,
-            Self::PaintSettingsChanged(_) => EarliestStage::Paint,
-        }
+        PipelineChangeMask::empty().set(*self).earliest_stage()
     }
 }
 
@@ -35,6 +28,7 @@ pub struct PipelineChangeMask {
     pub resource_base_changed: bool,
     pub stylesheets_changed: bool,
     pub style_environment_changed: bool,
+    pub note_flow_changed: bool,
     pub font_environment_changed: bool,
     pub image_metrics_changed: bool,
     pub layout_constraints_changed: bool,
@@ -48,6 +42,7 @@ impl PipelineChangeMask {
             resource_base_changed: false,
             stylesheets_changed: false,
             style_environment_changed: false,
+            note_flow_changed: false,
             font_environment_changed: false,
             image_metrics_changed: false,
             layout_constraints_changed: false,
@@ -60,6 +55,7 @@ impl PipelineChangeMask {
             && !self.resource_base_changed
             && !self.stylesheets_changed
             && !self.style_environment_changed
+            && !self.note_flow_changed
             && !self.font_environment_changed
             && !self.image_metrics_changed
             && !self.layout_constraints_changed
@@ -70,24 +66,31 @@ impl PipelineChangeMask {
         !self.is_empty()
     }
 
-    pub fn earliest_stage(self) -> EarliestStage {
-        let mut stage = EarliestStage::None;
-        stage = stage.coalesce(if self.source_changed { EarliestStage::Parse } else { EarliestStage::None });
-        stage = stage.coalesce(if self.resource_base_changed { EarliestStage::Parse } else { EarliestStage::None });
-        stage = stage.coalesce(if self.stylesheets_changed { EarliestStage::Style } else { EarliestStage::None });
-        stage = stage.coalesce(if self.style_environment_changed { EarliestStage::Style } else { EarliestStage::None });
-        stage = stage.coalesce(if self.font_environment_changed { EarliestStage::Shape } else { EarliestStage::None });
-        stage = stage.coalesce(if self.image_metrics_changed { EarliestStage::Layout } else { EarliestStage::None });
-        stage = stage.coalesce(if self.layout_constraints_changed { EarliestStage::Layout } else { EarliestStage::None });
-        stage.coalesce(if self.paint_settings_changed { EarliestStage::Paint } else { EarliestStage::None })
+    pub const fn earliest_stage(self) -> EarliestStage {
+        if self.source_changed || self.resource_base_changed {
+            EarliestStage::Parse
+        } else if self.stylesheets_changed || self.style_environment_changed {
+            EarliestStage::Style
+        } else if self.note_flow_changed {
+            EarliestStage::Prepare
+        } else if self.font_environment_changed {
+            EarliestStage::Shape
+        } else if self.image_metrics_changed || self.layout_constraints_changed {
+            EarliestStage::Layout
+        } else if self.paint_settings_changed {
+            EarliestStage::Paint
+        } else {
+            EarliestStage::None
+        }
     }
 
-    pub fn set(mut self, change: PipelineChange) -> Self {
+    pub const fn set(mut self, change: PipelineChange) -> Self {
         match change {
             PipelineChange::SourceChanged(_) => self.source_changed = true,
             PipelineChange::ResourceBaseChanged(_) => self.resource_base_changed = true,
             PipelineChange::StylesheetsChanged(_) => self.stylesheets_changed = true,
             PipelineChange::StyleEnvironmentChanged(_) => self.style_environment_changed = true,
+            PipelineChange::NoteFlowChanged(_) => self.note_flow_changed = true,
             PipelineChange::FontEnvironmentChanged(_) => self.font_environment_changed = true,
             PipelineChange::ImageMetricsChanged(_) => self.image_metrics_changed = true,
             PipelineChange::LayoutConstraintsChanged(_) => self.layout_constraints_changed = true,
@@ -102,6 +105,7 @@ impl PipelineChangeMask {
             resource_base_changed: self.resource_base_changed || other.resource_base_changed,
             stylesheets_changed: self.stylesheets_changed || other.stylesheets_changed,
             style_environment_changed: self.style_environment_changed || other.style_environment_changed,
+            note_flow_changed: self.note_flow_changed || other.note_flow_changed,
             font_environment_changed: self.font_environment_changed || other.font_environment_changed,
             image_metrics_changed: self.image_metrics_changed || other.image_metrics_changed,
             layout_constraints_changed: self.layout_constraints_changed || other.layout_constraints_changed,
@@ -300,10 +304,10 @@ pub struct PipelineInputs {
     pub markup_syntax: html_parse::MarkupSyntax,
     /// Reader-authored CSS applied after the publication stylesheets.
     pub user_styles: Vec<String>,
-    pub reader_overrides: crate::engine::ReaderStyleOverrides,
+    pub reader_overrides: ReaderStyleOverrides,
     /// Whether note bodies generate boxes. Changing it rebuilds the prepared
     /// stage, since it decides box generation rather than geometry.
-    pub note_flow: crate::engine::NoteFlow,
+    pub note_flow: NoteFlow,
     pub source_revision: SourceRevision,
     pub base_uri: String,
     pub resource_revision: ResourceRevision,
@@ -325,8 +329,8 @@ pub struct PipelineChanges {
     pub source: Option<String>,
     pub markup_syntax: Option<html_parse::MarkupSyntax>,
     pub user_styles: Option<Vec<String>>,
-    pub reader_overrides: Option<crate::engine::ReaderStyleOverrides>,
-    pub note_flow: Option<crate::engine::NoteFlow>,
+    pub reader_overrides: Option<ReaderStyleOverrides>,
+    pub note_flow: Option<NoteFlow>,
     pub source_revision: Option<SourceRevision>,
     pub base_uri: Option<String>,
     pub resource_revision: Option<ResourceRevision>,
@@ -413,7 +417,8 @@ pub struct ParsedCacheKey {
     pub source_revision: SourceRevision,
     pub markup_syntax: html_parse::MarkupSyntax,
     pub resource_revision: ResourceRevision,
-    pub base_uri: String,
+    /// Retained URI snapshot shared by nested stage keys.
+    pub base_uri: Arc<str>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -421,9 +426,10 @@ pub struct PreparedCacheKey {
     pub parsed: ParsedCacheKey,
     pub stylesheet_revision: StylesheetRevision,
     pub style_environment: StyleCacheEnvironment,
-    pub user_styles: Vec<String>,
-    pub reader_overrides: crate::engine::ReaderStyleOverrides,
-    pub note_flow: crate::engine::NoteFlow,
+    /// Cloned stage keys retain the same stylesheet and preference snapshots.
+    pub user_styles: Arc<[String]>,
+    pub reader_overrides: Arc<ReaderStyleOverrides>,
+    pub note_flow: NoteFlow,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -443,7 +449,7 @@ pub struct LayoutCacheKey {
 pub struct RenderOnlyCacheKey {
     pub layout: LayoutCacheKey,
     pub paint: PaintSettingsRevision,
-    pub reader_paint: crate::engine::ReaderStyleOverrides,
+    pub reader_paint: ReaderStyleOverrides,
 }
 
 impl PipelineInputs {
@@ -466,6 +472,9 @@ impl PipelineInputs {
         if !self.style_environment.same_non_media_part(&previous.style_environment) {
             mask.style_environment_changed = true;
         }
+        if self.note_flow != previous.note_flow {
+            mask.note_flow_changed = true;
+        }
         if self.font_environment != previous.font_environment {
             mask.font_environment_changed = true;
         }
@@ -475,7 +484,9 @@ impl PipelineInputs {
         if !self.layout.same(previous.layout) {
             mask.layout_constraints_changed = true;
         }
-        if self.paint != previous.paint || self.reader_overrides.paint_overrides() != previous.reader_overrides.paint_overrides() {
+        if self.paint != previous.paint
+            || !self.reader_overrides.same_paint_preferences(&previous.reader_overrides)
+        {
             mask.paint_settings_changed = true;
         }
         mask
@@ -486,40 +497,43 @@ impl PipelineInputs {
     }
 
     pub fn changes_from(&self, previous: &Self) -> (Vec<PipelineChange>, EarliestStage) {
+        let mask = self.change_mask(previous);
         let mut changes = Vec::new();
 
-        if !self.same_source(previous) || self.source_revision != previous.source_revision || self.markup_syntax != previous.markup_syntax {
+        if mask.source_changed {
             changes.push(PipelineChange::SourceChanged(self.source_revision));
         }
-        if self.base_uri != previous.base_uri || self.resource_revision != previous.resource_revision {
+        if mask.resource_base_changed {
             changes.push(PipelineChange::ResourceBaseChanged(self.resource_revision));
         }
-        if self.stylesheet_revision != previous.stylesheet_revision || self.user_styles != previous.user_styles || !self.reader_overrides.same_layout_preferences(&previous.reader_overrides) {
+        if mask.stylesheets_changed {
             changes.push(PipelineChange::StylesheetsChanged(self.stylesheet_revision));
         }
-        if !self.style_environment.same_non_media_part(&previous.style_environment) {
+        if mask.style_environment_changed {
             changes.push(PipelineChange::StyleEnvironmentChanged(self.style_environment));
         }
-        if self.font_environment != previous.font_environment {
+        if mask.note_flow_changed {
+            changes.push(PipelineChange::NoteFlowChanged(self.note_flow));
+        }
+        if mask.font_environment_changed {
             changes.push(PipelineChange::FontEnvironmentChanged(self.font_environment));
         }
-        if self.image_metrics_revision != previous.image_metrics_revision {
+        if mask.image_metrics_changed {
             changes.push(PipelineChange::ImageMetricsChanged(self.image_metrics_revision));
         }
-        if !self.layout.same(previous.layout) {
+        if mask.layout_constraints_changed {
             changes.push(PipelineChange::LayoutConstraintsChanged(self.layout));
         }
 
-        if self.paint != previous.paint || self.reader_overrides.paint_overrides() != previous.reader_overrides.paint_overrides() {
+        if mask.paint_settings_changed {
             changes.push(PipelineChange::PaintSettingsChanged(self.paint));
         }
 
-        let earliest = changes.iter().fold(EarliestStage::None, |stage, change| stage.coalesce(change.invalidated_stage()));
-        (changes, earliest)
+        (changes, mask.earliest_stage())
     }
 
     pub fn parsed_cache_key(&self) -> ParsedCacheKey {
-        ParsedCacheKey { source_revision: self.source_revision, markup_syntax: self.markup_syntax, resource_revision: self.resource_revision, base_uri: self.base_uri.clone() }
+        ParsedCacheKey { source_revision: self.source_revision, markup_syntax: self.markup_syntax, resource_revision: self.resource_revision, base_uri: Arc::from(self.base_uri.as_str()) }
     }
 
     pub fn prepared_cache_key(&self) -> PreparedCacheKey {
@@ -527,8 +541,8 @@ impl PipelineInputs {
             parsed: self.parsed_cache_key(),
             stylesheet_revision: self.stylesheet_revision,
             style_environment: self.style_environment.cache_key(),
-            user_styles: self.user_styles.clone(),
-            reader_overrides: self.reader_overrides.layout_overrides(),
+            user_styles: self.user_styles.clone().into(),
+            reader_overrides: Arc::new(self.reader_overrides.layout_overrides()),
             note_flow: self.note_flow,
         }
     }
@@ -566,6 +580,7 @@ impl PartialEq for PipelineInputs {
             && self.markup_syntax == other.markup_syntax
             && self.user_styles == other.user_styles
             && self.reader_overrides == other.reader_overrides
+            && self.note_flow == other.note_flow
             && self.base_uri == other.base_uri
             && self.resource_revision == other.resource_revision
             && self.stylesheet_revision == other.stylesheet_revision

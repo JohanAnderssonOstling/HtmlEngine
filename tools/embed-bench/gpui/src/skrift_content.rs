@@ -235,7 +235,7 @@ impl DocumentView {
         }
         let text = document.text();
         for index in text.paint_order_indices() {
-            let index = *index as usize;
+            let index = index.index();
             let Some(line) = text.line(index) else {
                 continue;
             };

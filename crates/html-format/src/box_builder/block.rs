@@ -1,9 +1,9 @@
-use html_dom::{Document, DomNodeId, NodeRef};
+use html_dom::{Document, DomNodeId, ElementRef, NodeRef};
 use html_style_model::{ComputedStyles, Display};
 
 use super::classification::{
-    display_for_element, display_for_style, is_block_level_pseudo_display,
-    is_table_internal_display, starts_new_block_child_for_element,
+    display_for_element, display_for_style, has_table_internal_descendant,
+    is_block_level_pseudo_display, starts_new_block_child_for_element,
 };
 use super::inline::has_block_child;
 
@@ -83,7 +83,7 @@ pub(super) fn plan_block_children(
 fn append_children(
     document: &Document,
     styles: &ComputedStyles,
-    element: html_dom::ElementRef<'_>,
+    element: ElementRef<'_>,
     wrap_table_internals: bool,
     before_pending: &mut bool,
     inline_segment: &mut Vec<u32>,
@@ -125,7 +125,7 @@ fn append_children(
                     actions.push(BlockChildAction::ContentsWithTableInternals(child_id));
                     continue;
                 }
-                if wrap_table_internals && is_table_internal_display(display) {
+                if wrap_table_internals && display.is_table_internal() {
                     flush_inline(inline_segment, before_pending, false, actions);
                     table_segment.push(child_id.raw());
                     continue;
@@ -154,21 +154,6 @@ fn append_children(
             None => {}
         }
     }
-}
-
-fn has_table_internal_descendant(
-    document: &Document,
-    styles: &ComputedStyles,
-    element: html_dom::ElementRef<'_>,
-) -> bool {
-    element.children().any(|child_id| {
-        document.element_ref(child_id).is_some_and(|child| {
-            let display = display_for_element(styles, child);
-            is_table_internal_display(display)
-                || (display == Display::Contents
-                    && has_table_internal_descendant(document, styles, child))
-        })
-    })
 }
 
 fn generated_edge(styles: &ComputedStyles, origin: DomNodeId, before: bool) -> GeneratedEdge {

@@ -1,6 +1,8 @@
 //! Renderer-facing box geometry, semantics, and table queries.
 
 use super::*;
+use crate::layout_model::{parse_positive_span, place_table_cells};
+use html_dom::{DomNodeId, collapse_whitespace, write_escaped_html_attribute, write_escaped_html_text};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum RenderForcedBreak {
@@ -73,6 +75,11 @@ impl RenderTable {
         &self.rows
     }
 
+    /// Cells in source row order, visiting each spanning cell once.
+    pub fn cells(&self) -> impl Iterator<Item = &RenderTableCell> + Clone {
+        self.rows.iter().flat_map(|row| row.cells())
+    }
+
     /// Sanitized authored markup for rich table export. This preserves
     /// classes, inline styles, and structural attributes while dropping event
     /// handlers; consumers that want portable structure without styling can
@@ -111,6 +118,16 @@ impl RenderTableCell {
 
     pub fn colspan(&self) -> usize {
         self.colspan
+    }
+
+    /// Half-open logical row coordinates covered by this cell.
+    pub fn row_range(&self) -> Range<usize> {
+        self.row..self.row.saturating_add(self.rowspan)
+    }
+
+    /// Half-open logical column coordinates covered by this cell.
+    pub fn column_range(&self) -> Range<usize> {
+        self.column..self.column.saturating_add(self.colspan)
     }
 
     pub fn is_header(&self) -> bool {
@@ -254,9 +271,9 @@ impl<'a> RenderBoxView<'a> {
 
         fn collect_rows(
             document: &Document,
-            node: html_dom::DomNodeId,
-            root_table: html_dom::DomNodeId,
-            rows: &mut Vec<html_dom::DomNodeId>,
+            node: DomNodeId,
+            root_table: DomNodeId,
+            rows: &mut Vec<DomNodeId>,
         ) {
             let Some(element) = document.element_ref(node) else {
                 return;
@@ -276,27 +293,13 @@ impl<'a> RenderBoxView<'a> {
             }
         }
 
-        fn escape_html(value: &str, attribute: bool) -> String {
-            let mut escaped = String::with_capacity(value.len());
-            for character in value.chars() {
-                match character {
-                    '&' => escaped.push_str("&amp;"),
-                    '<' => escaped.push_str("&lt;"),
-                    '>' => escaped.push_str("&gt;"),
-                    '"' if attribute => escaped.push_str("&quot;"),
-                    _ => escaped.push(character),
-                }
-            }
-            escaped
-        }
-
         fn serialize_authored_html(
             document: &Document,
-            node: html_dom::DomNodeId,
+            node: DomNodeId,
             output: &mut String,
         ) {
             match document.node_ref(node) {
-                Some(NodeRef::Text(text)) => output.push_str(&escape_html(text.text(), false)),
+                Some(NodeRef::Text(text)) => write_escaped_html_text(output, text.text()),
                 Some(NodeRef::Element(element)) => {
                     let tag = element.tag();
                     output.push('<');
@@ -314,7 +317,7 @@ impl<'a> RenderBoxView<'a> {
                         output.push(' ');
                         output.push_str(name);
                         output.push_str("=\"");
-                        output.push_str(&escape_html(attribute.value(), true));
+                        write_escaped_html_attribute(output, attribute.value());
                         output.push('"');
                     }
                     output.push('>');
@@ -329,7 +332,7 @@ impl<'a> RenderBoxView<'a> {
             }
         }
 
-        fn collect_text(document: &Document, node: html_dom::DomNodeId, text: &mut String) {
+        fn collect_text(document: &Document, node: DomNodeId, text: &mut String) {
             match document.node_ref(node) {
                 Some(NodeRef::Text(value)) => {
                     text.push_str(value.text());
@@ -360,64 +363,52 @@ impl<'a> RenderBoxView<'a> {
         let table_node = table_element.node_id();
         let mut row_nodes = Vec::new();
         collect_rows(document, table_node, table_node, &mut row_nodes);
-        let mut occupied_until = Vec::<usize>::new();
-        let mut rows = Vec::with_capacity(row_nodes.len());
-        let mut column_count = 0;
-        for (row, row_node) in row_nodes.into_iter().enumerate() {
-            let row_element = document.element_ref(row_node)?;
-            let mut column = 0;
-            let mut cells = Vec::new();
-            for cell_node in row_element.children() {
-                let Some(cell_element) = document.element_ref(cell_node) else {
-                    continue;
-                };
-                let header = cell_element.tag().eq_ignore_ascii_case("th");
-                if !header && !cell_element.tag().eq_ignore_ascii_case("td") {
-                    continue;
-                }
-                while occupied_until.get(column).is_some_and(|&until| until > row) {
-                    column += 1;
-                }
-                let rowspan = cell_element
-                    .attr("rowspan")
-                    .and_then(|value| value.parse::<usize>().ok())
-                    .unwrap_or(1)
-                    .max(1);
-                let colspan = cell_element
-                    .attr("colspan")
-                    .and_then(|value| value.parse::<usize>().ok())
-                    .unwrap_or(1)
-                    .max(1);
-                if occupied_until.len() < column + colspan {
-                    occupied_until.resize(column + colspan, 0);
-                }
-                for occupied in &mut occupied_until[column..column + colspan] {
-                    *occupied = row.saturating_add(rowspan);
-                }
-                let Some(&cell_box) = box_for_node.get(&cell_element.node_idx()) else {
-                    column += colspan;
-                    continue;
-                };
-                let mut raw_text = String::new();
-                for child in cell_element.children() {
-                    collect_text(document, child, &mut raw_text);
-                }
-                let text = raw_text.split_whitespace().collect::<Vec<_>>().join(" ");
-                cells.push(RenderTableCell {
-                    box_idx: cell_box,
-                    row,
-                    column,
-                    rowspan,
-                    colspan,
-                    header,
-                    text,
-                    glyphs: None,
-                });
-                column += colspan;
+        let source_rows = row_nodes.iter().map(|&node| {
+            document
+                .element_ref(node)
+                .into_iter()
+                .flat_map(|row| row.children())
+                .filter_map(|node| {
+                    let cell = document.element_ref(node)?;
+                    if !cell.tag().eq_ignore_ascii_case("th") && !cell.tag().eq_ignore_ascii_case("td")
+                    {
+                        return None;
+                    }
+                    Some((
+                        cell.node_idx(),
+                        parse_positive_span(cell.attr("colspan")),
+                        parse_positive_span(cell.attr("rowspan")),
+                    ))
+                })
+        });
+        let mut rows = row_nodes
+            .iter()
+            .map(|_| RenderTableRow { cells: Vec::new() })
+            .collect::<Vec<_>>();
+        let column_count = place_table_cells(source_rows, |placement| {
+            let Some(&cell_box) = box_for_node.get(&placement.cell_idx) else {
+                return;
+            };
+            let cell_element = document
+                .node_id_from_raw(placement.cell_idx as u32)
+                .and_then(|node| document.element_ref(node))
+                .expect("grid cells originate from source table elements");
+            let mut raw_text = String::new();
+            for child in cell_element.children() {
+                collect_text(document, child, &mut raw_text);
             }
-            column_count = column_count.max(occupied_until.len()).max(column);
-            rows.push(RenderTableRow { cells });
-        }
+            let text = collapse_whitespace(&raw_text);
+            rows[placement.row].cells.push(RenderTableCell {
+                box_idx: cell_box,
+                row: placement.row,
+                column: placement.col,
+                rowspan: placement.rowspan,
+                colspan: placement.colspan,
+                header: cell_element.tag().eq_ignore_ascii_case("th"),
+                text,
+                glyphs: None,
+            });
+        });
         // Resolve all cell intervals in one traversal rather than rescanning
         // the document for every cell during semantic selection.
         let cells = rows
@@ -545,11 +536,7 @@ impl<'a> RenderBoxView<'a> {
     }
 
     pub fn parent(self, box_idx: usize) -> Option<usize> {
-        self.doc
-            .inputs
-            .layout_tree
-            .box_at(box_idx)
-            .and_then(|layout_box| layout_box.parent().map(|parent| parent as usize))
+        self.doc.inputs.layout_tree.get_box_parent(box_idx)
     }
 
     pub fn text_format(self, box_idx: usize) -> BoxTextFormat {
@@ -565,10 +552,7 @@ impl<'a> RenderBoxView<'a> {
     }
 
     pub fn ancestors(self, box_idx: usize) -> impl Iterator<Item = usize> + 'a {
-        AncestorIter {
-            doc: self.doc,
-            current: self.parent(box_idx),
-        }
+        self.doc.inputs.layout_tree.ancestors(box_idx)
     }
 
     fn used_style(self, box_idx: usize) -> Option<html_style_model::UsedStyleView<'a>> {

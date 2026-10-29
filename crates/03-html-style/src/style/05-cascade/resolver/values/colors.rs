@@ -1,4 +1,4 @@
-use super::*;
+use lightningcss::values::color::{CssColor, SystemColor};
 
 pub(in crate::style::cascade::resolver) fn css_color_to_u32(
     color: &CssColor,

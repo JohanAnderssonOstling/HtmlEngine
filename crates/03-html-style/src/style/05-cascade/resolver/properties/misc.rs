@@ -1,6 +1,8 @@
-use super::*;
+use super::super::context::{ApplyResult, PropertyContext};
+use html_style_model::{BoxSizing, Hyphens, OverflowWrap, WordBreak};
+use lightningcss::properties::Property;
 
-pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'_>) -> ApplyResult {
+pub(super) fn apply(context: &mut PropertyContext<'_>, property: &Property<'_>) -> ApplyResult {
     let style = &mut *context.style;
     match property {
         Property::Hyphens(value, _) => {

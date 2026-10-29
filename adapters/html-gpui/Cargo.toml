@@ -1,0 +1,26 @@
+[package]
+name = "html-gpui"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "GPUI shaping, painting and continuous HTML elements for skrift"
+readme = "README.md"
+
+[dependencies]
+cssparser = "0.37"
+html-fonts = { path = "../html-fonts" }
+gpui.workspace = true
+html.workspace = true
+gpui-image-eviction = { path = "../gpui-image-eviction" }
+image = { version = "0.25", default-features = false, features = ["png"] }
+kurbo.workspace = true
+peniko.workspace = true
+quick-xml = "0.38"
+roxmltree = "0.21"
+smallvec = "1"
+web-time = "1"
+unicode-segmentation = "1"
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+resvg = "0.46"

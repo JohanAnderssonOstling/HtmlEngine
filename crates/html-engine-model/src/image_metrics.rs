@@ -1,8 +1,11 @@
 use html_dom::{Document, ImageResource, ImageSource};
+use std::sync::Arc;
 
+/// Intrinsic image sizes shared by input and layout snapshots. Updating one
+/// snapshot preserves sizes retained by previously published layouts.
 #[derive(Clone, Debug, Default)]
 pub struct ImageMetrics {
-    sizes: Vec<(u32, u32)>,
+    sizes: Arc<Vec<(u32, u32)>>,
 }
 
 impl ImageMetrics {
@@ -11,15 +14,21 @@ impl ImageMetrics {
         for image in document.images() {
             sizes.push((image.width, image.height));
         }
-        Self { sizes }
+        Self {
+            sizes: Arc::new(sizes),
+        }
     }
 
     pub fn set(&mut self, image_idx: u32, width: u32, height: u32) {
-        let idx = image_idx as usize;
-        if self.sizes.len() <= idx {
-            self.sizes.resize(idx + 1, (0, 0));
+        if self.get(image_idx) == Some((width, height)) {
+            return;
         }
-        self.sizes[idx] = (width, height);
+        let idx = image_idx as usize;
+        let sizes = Arc::make_mut(&mut self.sizes);
+        if sizes.len() <= idx {
+            sizes.resize(idx + 1, (0, 0));
+        }
+        sizes[idx] = (width, height);
     }
 
     pub fn get(&self, image_idx: u32) -> Option<(u32, u32)> {
@@ -55,6 +64,37 @@ impl ImageMetrics {
 mod image_metrics_tests {
     use super::ImageMetrics;
     use html_dom::{ImageResource, ImageSource};
+    use std::sync::Arc;
+
+    #[test]
+    fn snapshots_share_unchanged_sizes_and_isolate_updates_and_growth() {
+        let mut original = ImageMetrics::default();
+        original.set(0, 320, 180);
+        let mut snapshot = original.clone();
+        assert!(Arc::ptr_eq(&original.sizes, &snapshot.sizes));
+        snapshot.set(0, 320, 180);
+        assert!(Arc::ptr_eq(&original.sizes, &snapshot.sizes));
+
+        snapshot.set(0, 640, 360);
+        assert_eq!(original.get(0), Some((320, 180)));
+        assert_eq!(snapshot.get(0), Some((640, 360)));
+        assert!(!Arc::ptr_eq(&original.sizes, &snapshot.sizes));
+
+        let resized = snapshot.clone();
+        snapshot.set(2, 120, 80);
+        assert_eq!(resized.len(), 1);
+        assert_eq!(resized.get(2), None);
+        assert_eq!(snapshot.get(1), Some((0, 0)));
+        assert_eq!(snapshot.get(2), Some((120, 80)));
+        let storage = snapshot.sizes.as_ptr();
+        snapshot.set(2, 240, 160);
+        assert_eq!(
+            snapshot.sizes.as_ptr(),
+            storage,
+            "unique updates reuse storage"
+        );
+        assert_eq!(snapshot.get(2), Some((240, 160)));
+    }
 
     #[test]
     fn html_dimensions_do_not_replace_decoded_intrinsic_metrics() {

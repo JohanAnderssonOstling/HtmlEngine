@@ -64,11 +64,22 @@ impl FloatContext {
         let start_y = self
             .source_position_floor
             .map_or(start_y, |floor| floor.max(start_y));
-        let mut y = self
+        let y = self
             .bands
             .iter()
             .map(|band| band.top)
             .fold(start_y, f64::max);
+        self.find_placement(y, width, height, container_left, container_right)
+    }
+
+    fn find_placement(
+        &self,
+        mut y: f64,
+        width: f64,
+        height: f64,
+        container_left: f64,
+        container_right: f64,
+    ) -> FloatPlacement {
         let width = width.max(0.0);
         let height = height.max(0.0);
 
@@ -88,9 +99,8 @@ impl FloatContext {
                 .filter_map(|band| (band.bottom > y && band.top < bottom).then_some(band.bottom))
                 .min_by(f64::total_cmp);
             let Some(next_y) = next_y.filter(|next_y| *next_y > y) else {
-                // The float itself may be wider than its containing block. In
-                // that case CSS permits overflow once no preceding float can
-                // make additional room by ending below this position.
+                // An oversized item may overflow once no float can make
+                // additional room by ending below this position.
                 return FloatPlacement { y, left, right };
             };
             y = next_y;
@@ -128,68 +138,38 @@ impl FloatContext {
     }
 
     /// Finds the next vertical position where an in-flow atomic item can fit
-    /// without overlapping an active float. Unlike a float placement this
-    /// does not mutate the float context; it is used by the inline formatter
-    /// to retry an otherwise-empty line below an exclusion.
+    /// without overlapping an active float. In-flow items can fit above later
+    /// floats; they do not inherit the source-order floor of float placement.
     pub fn next_y_fitting(
         &self,
-        mut y: f64,
+        y: f64,
         width: f64,
         height: f64,
         container_left: f64,
         container_right: f64,
     ) -> f64 {
-        let width = width.max(0.0);
-        let height = height.max(0.0);
-        loop {
-            let (left, right) = self.available(y, height, container_left, container_right);
-            if width <= right - left {
-                return y;
-            }
-
-            let bottom = y + height;
-            let next_y = self
-                .bands
-                .iter()
-                .filter_map(|band| (band.bottom > y && band.top < bottom).then_some(band.bottom))
-                .min_by(f64::total_cmp);
-            let Some(next_y) = next_y.filter(|next_y| *next_y > y) else {
-                return y;
-            };
-            y = next_y;
-        }
+        self.find_placement(y, width, height, container_left, container_right)
+            .y
     }
 
     pub fn clear_for(&self, y: f64, clear: Clear) -> f64 {
-        match clear {
-            Clear::None => y,
-            Clear::Left => self.clear_to(y, ClearSide::Left),
-            Clear::Right => self.clear_to(y, ClearSide::Right),
-            Clear::Both => self.clear_to(y, ClearSide::Both),
+        if clear == Clear::None {
+            return y;
         }
-    }
-
-    fn clear_to(&self, y: f64, side: ClearSide) -> f64 {
         let mut clear_y = y;
         for band in &self.bands {
-            let affects_side = match side {
-                ClearSide::Left => matches!(band.side, FloatSide::Left),
-                ClearSide::Right => matches!(band.side, FloatSide::Right),
-                ClearSide::Both => true,
-            };
+            let affects_side = matches!(
+                (clear, band.side),
+                (Clear::Both, _)
+                    | (Clear::Left, FloatSide::Left)
+                    | (Clear::Right, FloatSide::Right)
+            );
             if affects_side {
                 clear_y = clear_y.max(band.bottom);
             }
         }
         clear_y
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ClearSide {
-    Left,
-    Right,
-    Both,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -284,12 +264,9 @@ pub(super) fn clearance_offset(
     margin_adjoins_parent_top: bool,
     has_adjoining_matching_float: bool,
 ) -> Option<Clearance> {
-    let side = match clear {
-        Clear::Left => ClearSide::Left,
-        Clear::Right => ClearSide::Right,
-        Clear::Both => ClearSide::Both,
-        Clear::None => return None,
-    };
+    if clear == Clear::None {
+        return None;
+    }
     let context = floats.current_float_context()?;
     let mut hypothetical_margin = pending_margin;
     hypothetical_margin.merge(before_margin);
@@ -307,7 +284,7 @@ pub(super) fn clearance_offset(
         // border edge is placed at the float bottom, not at the hypothetical
         // margin-shifted position.
         let marginless_y = origin_y + y_offset;
-        let separated_y = context.clear_to(marginless_y, side);
+        let separated_y = context.clear_for(marginless_y, clear);
         if separated_y > marginless_y
             && ((has_adjoining_matching_float && hypothetical_y > separated_y)
                 || (own_before_margin.abs() > 0.001
@@ -319,41 +296,57 @@ pub(super) fn clearance_offset(
             });
         }
     }
-    let cleared_y = context.clear_to(hypothetical_y, side);
+    let cleared_y = context.clear_for(hypothetical_y, clear);
     (cleared_y > hypothetical_y).then_some(Clearance {
         offset: cleared_y - origin_y,
         hypothetical_y,
     })
 }
 
-/// Lays out and positions one float, translates its already-emitted subtree,
-/// and records the resulting exclusion band.
-pub(super) fn layout_float(
+/// Lay out, position and record either a block-flow float or an inline anchor.
+/// Callers resolve their margin policy; preceding inline content contributes
+/// its advance and line height, while block flow passes `Size::ZERO`.
+pub(in crate::layout) fn layout_float(
     engine: &mut LayoutEngine<'_, '_>,
-    resolved: crate::layout::box_sizing::ResolvedBoxSizing,
-    side: Float,
+    resolved: ResolvedBoxSizing,
     origin: Point,
-    flow_margin_y: f64,
-    margin_left: f64,
-    horizontal_margin: f64,
-    margin_before: f64,
-    margin_after: f64,
+    margins: Insets,
+    preceding_line: Size,
 ) -> Size {
     let box_idx = resolved.box_idx();
     let available_width = resolved.available_width();
-    let initial_point = origin + Vec2::new(margin_left, flow_margin_y + margin_before);
+    let side = engine.reader.style(box_idx).float();
+    let initial_point = origin + Vec2::new(margins.x0, margins.y0);
     engine.geometry.set_point(box_idx, initial_point);
     let layout = engine.layout_resolved_box(resolved);
     let size = layout.size;
 
-    let margin_width = size.width + horizontal_margin;
-    let margin_height = size.height + margin_before + margin_after;
+    let margin_width = size.width + margins.x0 + margins.x1;
+    let margin_height = size.height + margins.y0 + margins.y1;
+    let source_y = engine
+        .floats
+        .current_float_context()
+        .map_or(origin.y, |context| {
+            let candidate_y = context.source_position_at_or_after(origin.y);
+            if preceding_line.width > 0.001 {
+                let (left, right) = context.available(
+                    candidate_y,
+                    margin_height.max(1.0),
+                    origin.x,
+                    origin.x + available_width,
+                );
+                if preceding_line.width + margin_width > right - left + 0.001 {
+                    return candidate_y + preceding_line.height;
+                }
+            }
+            candidate_y
+        });
     let placement = engine
         .floats
         .current_float_context()
         .map(|context| {
             context.place_margin_box(
-                origin.y + flow_margin_y,
+                source_y,
                 margin_width,
                 margin_height,
                 origin.x,
@@ -361,25 +354,27 @@ pub(super) fn layout_float(
             )
         })
         .unwrap_or(FloatPlacement {
-            y: origin.y + flow_margin_y,
+            y: source_y,
             left: origin.x,
             right: origin.x + available_width,
         });
     let margin_y = placement.y;
     let final_x = if matches!(side, Float::Right) {
-        placement.right - margin_width + margin_left
+        placement.right - margin_width + margins.x0
     } else {
-        placement.left + margin_left
+        placement.left + margins.x0
     };
-    let final_y = margin_y + margin_before;
+    let final_y = margin_y + margins.y0;
     let final_point = Point::new(final_x, final_y);
     translate_laid_out_output(engine, &layout.output, final_point - initial_point);
+    // Exclude the margin box: negative bottom margins let text resume before
+    // the border-box bottom, as required for floated drop caps.
     if let Some(context) = engine.floats.current_float_context_mut() {
         context.add_band(FloatBand {
-            left: final_x - margin_left,
-            right: final_x + size.width + (horizontal_margin - margin_left),
+            left: final_x - margins.x0,
+            right: final_x + size.width + margins.x1,
             top: margin_y,
-            bottom: final_y + size.height + margin_after,
+            bottom: final_y + size.height + margins.y1,
             side: if matches!(side, Float::Right) {
                 FloatSide::Right
             } else {
@@ -442,6 +437,7 @@ mod tests {
         let placement = context.place_margin_box(10.0, 20.0, 20.0, 0.0, 300.0);
 
         assert_eq!(placement.y, 30.0);
+        assert_eq!(context.next_y_fitting(10.0, 20.0, 20.0, 0.0, 300.0), 10.0);
     }
 
     #[test]
@@ -530,10 +526,13 @@ mod tests {
             0.0,
             "normal-flow content is not subject to the source-order top constraint used when placing another float"
         );
+        assert_eq!(
+            context.place_margin_box(0.0, 60.0, 20.0, 0.0, 224.0).y,
+            20.0
+        );
     }
 }
 use super::margins::MarginStrut;
-use crate::layout::LayoutEngine;
-use crate::layout::translate_laid_out_output;
+use crate::layout::{LayoutEngine, ResolvedBoxSizing, translate_laid_out_output};
 use html_style_model::{Clear, Float};
-use kurbo::{Point, Size, Vec2};
+use kurbo::{Insets, Point, Size, Vec2};

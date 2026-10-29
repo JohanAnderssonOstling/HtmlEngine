@@ -1,4 +1,4 @@
-use super::*;
+use html_style_model::{ComputedStylesBuilder, StyleStringId};
 
 pub(in crate::style::cascade::resolver) fn map_list_style_position(
     pos: &lightningcss::properties::list::ListStylePosition,

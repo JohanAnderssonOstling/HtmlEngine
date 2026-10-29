@@ -1,6 +1,7 @@
 //! Source addresses resolved directly against the current document's DOM.
 
 use super::RenderAddressingView;
+use html_dom::SourcePosition;
 
 /// An owned document-relative source address. Publication/spine identifiers and
 /// encodings such as EPUB CFI belong to the embedding application.
@@ -8,6 +9,20 @@ use super::RenderAddressingView;
 pub struct SourceLocation {
     pub path: Vec<usize>,
     pub utf16_offset: Option<usize>,
+}
+
+impl From<SourcePosition<'_>> for SourceLocation {
+    fn from(position: SourcePosition<'_>) -> Self {
+        let mut path = position
+            .elements()
+            .map(|element| element.step())
+            .collect::<Vec<_>>();
+        path.push(position.text_step());
+        Self {
+            path,
+            utf16_offset: Some(position.utf16_offset()),
+        }
+    }
 }
 
 impl RenderAddressingView<'_> {
@@ -22,17 +37,7 @@ impl RenderAddressingView<'_> {
         let glyph = glyph.filter(|glyph| layout_line.glyphs().contains(glyph));
         let mut source = glyph
             .and_then(|glyph| self.source_position_for_glyph(glyph, false))
-            .map(|position| {
-                let mut path = position
-                    .elements()
-                    .map(|step| step.step())
-                    .collect::<Vec<_>>();
-                path.push(position.text_step());
-                SourceLocation {
-                    path,
-                    utf16_offset: Some(position.utf16_offset()),
-                }
-            });
+            .map(SourceLocation::from);
         for image in self
             .doc
             .render_view(self.glyph_metrics)
@@ -93,11 +98,10 @@ impl RenderAddressingView<'_> {
         let document = self.doc.document();
         let node = document.node_id_from_raw(self.doc.box_dom_element_idx(box_idx)?)?;
         let path = document
-            .get_dom_path_to_node(node)
+            .element_source_path(node)?
             .into_iter()
-            .skip(1)
-            .map(|node| document.get_element_step(node))
-            .collect::<Option<Vec<_>>>()?;
+            .map(|element| element.step())
+            .collect();
         Some(SourceLocation {
             path,
             utf16_offset: None,

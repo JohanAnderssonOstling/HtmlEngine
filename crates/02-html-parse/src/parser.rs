@@ -1,4 +1,4 @@
-use html_dom::{Document, DocumentBuildError};
+use html_dom::{Document, DocumentBuildError, media_type_essence, uri_path};
 use html5ever::driver::{self, ParseOpts};
 use html5ever::tendril::TendrilSink;
 use html5ever::tree_builder::{QuirksMode as Html5everQuirksMode, TreeBuilderOpts};
@@ -29,8 +29,24 @@ pub enum MarkupSyntax {
 }
 
 impl MarkupSyntax {
+    /// Declared markup media types take precedence over the resource filename.
+    /// Missing or unrecognized types fall back to the URI extension.
+    pub fn from_resource(uri: &str, media_type: Option<&str>) -> Self {
+        match media_type.map(media_type_essence) {
+            Some(value)
+                if ["application/xhtml+xml", "application/xml", "text/xml"]
+                    .iter()
+                    .any(|candidate| value.eq_ignore_ascii_case(candidate)) =>
+            {
+                Self::Xml
+            }
+            Some(value) if value.eq_ignore_ascii_case("text/html") => Self::Html,
+            _ => Self::from_uri(uri),
+        }
+    }
+
     pub fn from_uri(uri: &str) -> Self {
-        let path = uri.split(['?', '#']).next().unwrap_or(uri);
+        let path = uri_path(uri);
         match path.rsplit_once('.').map(|(_, extension)| extension) {
             Some(extension)
                 if ["xht", "xhtml", "xml", "svg"]
@@ -445,6 +461,36 @@ mod tests {
         );
         assert_eq!(MarkupSyntax::from_uri("image.svg#root"), MarkupSyntax::Xml);
         assert_eq!(MarkupSyntax::from_uri("chapter.html"), MarkupSyntax::Html);
+    }
+
+    #[test]
+    fn declared_markup_types_override_extensions_and_ignore_parameters() {
+        for (uri, media_type, expected) in [
+            (
+                "chapter.html",
+                Some(" Application/XHTML+XML ; charset=utf-8"),
+                MarkupSyntax::Xml,
+            ),
+            (
+                "chapter.xhtml",
+                Some("TEXT/HTML; charset=utf-8"),
+                MarkupSyntax::Html,
+            ),
+            ("chapter.html", Some("text/xml"), MarkupSyntax::Xml),
+            ("chapter.xhtml?mode=html#part", None, MarkupSyntax::Xml),
+            (
+                "chapter.xhtml",
+                Some("application/octet-stream"),
+                MarkupSyntax::Xml,
+            ),
+            ("chapter.html", Some(""), MarkupSyntax::Html),
+        ] {
+            assert_eq!(
+                MarkupSyntax::from_resource(uri, media_type),
+                expected,
+                "{uri}, {media_type:?}"
+            );
+        }
     }
 
     #[test]

@@ -1,8 +1,7 @@
 [workspace]
+exclude = ["adapters"]
 resolver = "3"
-exclude = ["vendor/lightningcss"]
 members = [
-    "crates/01-html-source",
     "crates/02-html-parse",
     "crates/03-html-style",
     "crates/04-html-layout",
@@ -20,13 +19,19 @@ members = [
 ]
 
 [workspace.package]
+version = "0.1.0"
+edition = "2024"
+repository = "https://github.com/JohanAnderssonOstling/HtmlEngine"
+homepage = "https://github.com/JohanAnderssonOstling/HtmlEngine"
+categories = ["rendering"]
+keywords = ["html", "css", "skrift"]
+include = ["src/**", "assets/**", "README.md", "LICENSE"]
 license = "GPL-3.0-or-later"
 
 [workspace.dependencies]
 kurbo = "0.11.3"
 peniko = "0.2.0"
-# Keep the fix for downstream consumers, which do not inherit root Cargo patches.
-lightningcss = { version = "1.0.0-alpha.72", path = "vendor/lightningcss", features = ["substitute_variables"] }
+lightningcss = { version = "1.0.0-alpha.72", features = ["substitute_variables"] }
 taffy = { version = "0.13.0", default-features = false, features = ["std", "taffy_tree", "flexbox", "grid"] }
 parcel_selectors = "0.28.2"
 scraper = "0.27"
@@ -35,9 +40,3 @@ quick-xml = { version = "0.41", features = ["escape-html"] }
 encoding_rs = "0.8"
 ego-tree = "0.11"
 unicode-bidi = "0.3.18"
-
-# alpha.72 panics on mixed number/percentage calculations. Keep the error
-# handling fix in the dependency until an upstream release contains it.
-# Registry consumers in this workspace must resolve to that same crate.
-[patch.crates-io]
-lightningcss = { path = "vendor/lightningcss" }

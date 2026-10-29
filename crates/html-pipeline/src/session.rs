@@ -31,7 +31,8 @@ pub struct PipelineCacheState {
     /// Owned preparation while a worker has not yet attached a glyph backend.
     pub pending_prepared: Option<PreparedDocument<'static>>,
     pub media_queries: Option<MediaQuerySet>,
-    pub font_faces: Vec<FontFace>,
+    /// Active declarations shared with the compiled style program.
+    pub font_faces: Arc<[FontFace]>,
     pub media_match_key: Option<MediaMatchKey>,
     /// Shaping validity only; glyph data has exactly one document owner.
     pub shaped: Option<CacheEntry<ShapedCacheKey, ()>>,
@@ -412,8 +413,9 @@ impl PipelineSession {
         let previous = previous_inputs.as_ref().map(|inputs| PreviousInputs {
             source_matches: inputs.same_source(&requested_inputs),
             media: inputs.style_environment.media,
-            color_preferences_changed: inputs.reader_overrides.paint_overrides()
-                != requested_inputs.reader_overrides.paint_overrides(),
+            color_preferences_changed: !inputs
+                .reader_overrides
+                .same_paint_preferences(&requested_inputs.reader_overrides),
         });
         let mut resources = std::mem::take(&mut self.glyph_resources);
         let result = self.update_inner(&requested_inputs, previous, glyph_shaper, &mut resources);
@@ -445,7 +447,7 @@ impl PipelineSession {
                 .is_none_or(|source| source == &inputs.source),
             media: inputs.style_environment.media,
             color_preferences_changed: changes.reader_overrides.as_ref().is_some_and(|overrides| {
-                overrides.paint_overrides() != inputs.reader_overrides.paint_overrides()
+                !overrides.same_paint_preferences(&inputs.reader_overrides)
             }),
         };
         changes.swap_with(&mut inputs);
@@ -1239,12 +1241,11 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct TracingShaper {
-        colors: Vec<(char, u32)>,
         calls: usize,
-        cache: HashMap<(char, u32, u32), GlyphId>,
+        cache: HashMap<(char, u32), GlyphId>,
         generation: crate::engine::GlyphResourceGeneration,
         append_checkpoint: Option<(
-            HashMap<(char, u32, u32), GlyphId>,
+            HashMap<(char, u32), GlyphId>,
             crate::engine::GlyphResourceGeneration,
         )>,
     }
@@ -1257,10 +1258,7 @@ mod tests {
             resources: &mut crate::engine::GlyphResourceStore,
         ) -> Result<Option<crate::engine::ShapedTextRun>, crate::engine::ShapeError> {
             let style = request.style();
-            for (index, (glyph, ch)) in glyphs.iter_mut().zip(request.text().chars()).enumerate() {
-                let color = request
-                    .paint_colors()
-                    .map_or(style.color(), |colors| colors[index]);
+            for (glyph, ch) in glyphs.iter_mut().zip(request.text().chars()) {
                 *glyph = resources.shape_glyph(
                     self,
                     GlyphRequest {
@@ -1268,7 +1266,7 @@ mod tests {
                         font_size: style.font_size(),
                         font_weight: style.font_weight(),
                         font_slant: style.font_slant(),
-                        color,
+
                         font_family: style.font_family(),
                     },
                 )?;
@@ -1307,12 +1305,7 @@ mod tests {
             request: GlyphRequest<'_>,
         ) -> Result<ShapedGlyph, crate::engine::ShapeError> {
             self.calls += 1;
-            self.colors.push((request.character, request.color));
-            let key = (
-                request.character,
-                request.font_size.to_bits(),
-                request.color,
-            );
+            let key = (request.character, request.font_size.to_bits());
 
             let idx = u32::try_from(self.cache.len()).expect("glyph ids must fit");
             let glyph = idx;
@@ -2905,7 +2898,7 @@ mod tests {
         inputs.reader_overrides.theme = Some(theme);
         for accent in [0x466853ff, 0xc6a25cff] {
             inputs.reader_overrides.link_foreground = Some(accent);
-            shaper.colors.clear();
+            let calls = shaper.calls;
             let update = session.update(inputs.clone(), &mut shaper).unwrap();
             for (character, expected) in [
                 ('L', accent),
@@ -2928,7 +2921,7 @@ mod tests {
                     .unwrap();
                 assert_eq!(text.paint_color_at(index as u32), Some(expected));
                 if update.stage == EarliestStage::Paint {
-                    assert!(shaper.colors.is_empty(), "color updates must not reshape");
+                    assert_eq!(shaper.calls, calls, "color updates must not reshape");
                 }
             }
         }
@@ -3187,6 +3180,39 @@ mod tests {
     }
 
     #[test]
+    fn note_flow_changes_are_reported_at_preparation_and_applied() {
+        let inputs = base_inputs(
+            "<p>Main text</p><aside epub:type='footnote'>unicornnote</aside>",
+            SourceRevision::INITIAL,
+        );
+        let mut next = inputs.clone();
+        next.note_flow = crate::engine::NoteFlow::Excluded;
+        assert_eq!(next.earliest_stage(&inputs), EarliestStage::Prepare);
+        let (changes, stage) = next.changes_from(&inputs);
+        assert_eq!(stage, EarliestStage::Prepare);
+        assert_eq!(changes, [PipelineChange::NoteFlowChanged(next.note_flow)]);
+        assert!(next.change_mask(&inputs).note_flow_changed);
+        assert_ne!(next, inputs);
+        let mut session = PipelineSession::new(Arc::new(MockProvider));
+        let mut shaper = TracingShaper::default();
+        session.update(inputs, &mut shaper).unwrap();
+        let has_note_text = |session: &PipelineSession| {
+            !session
+                .render_view()
+                .unwrap()
+                .text()
+                .find_matches("unicornnote", crate::TextSearchOptions::default())
+                .is_empty()
+        };
+        assert!(has_note_text(&session));
+        assert_eq!(
+            session.update(next, &mut shaper).unwrap().stage,
+            EarliestStage::Prepare
+        );
+        assert!(!has_note_text(&session));
+    }
+
+    #[test]
     fn paint_updates_restore_publication_colors_and_match_fresh_geometry() {
         let source = "<html><head><style>a::before {content:'G'; color:orange} p::first-letter {color:purple}</style></head><body><div style='background:#fafafa; border:2px solid red; outline:1px dotted blue'><p id='anchor' style='color:green'>B <a href='#anchor'>L<span style='color:blue'>N</span></a></p><p>Other text wraps across several lines in this paragraph.</p></div></body></html>";
         let mut inputs = base_inputs(source, SourceRevision::INITIAL);
@@ -3307,7 +3333,7 @@ mod tests {
                 .render_view(session.glyph_resources())
                 .text()
                 .paint_color_at(0),
-            None
+            Some(0x800080ff)
         );
         inputs.layout.viewport_width = 200.0;
         assert_eq!(
@@ -3390,7 +3416,7 @@ mod tests {
                 .render_view(session.glyph_resources())
                 .text()
                 .paint_color_at(0),
-            None
+            Some(0x000000ff)
         );
     }
 
@@ -3414,6 +3440,46 @@ mod tests {
         );
         painted.reader_overrides.minimum_font_size = Some(32.0);
         assert_ne!(original.prepared_cache_key(), painted.prepared_cache_key());
+    }
+
+    #[test]
+    fn published_stage_keys_share_payloads_and_remain_independent_of_mutable_inputs() {
+        use crate::allocation_test_support::count_allocations;
+
+        let mut inputs = base_inputs("<p>text</p>", SourceRevision::INITIAL);
+        inputs.base_uri = "book/chapter.html".into();
+        inputs.user_styles = vec!["p { color:red }".into()];
+        inputs.reader_overrides.font_family = Some("Reader".into());
+        let expected = inputs.layout_cache_key();
+        let mut session = PipelineSession::new(Arc::new(MockProvider));
+        session
+            .update(inputs.clone(), &mut TracingShaper::default())
+            .unwrap();
+        let layout = &session.cache.laid_out.as_ref().unwrap().key;
+        let prepared = &session.cache.prepared.as_ref().unwrap().key;
+        let shaped = &session.cache.shaped.as_ref().unwrap().key;
+        let parsed = &session.cache.parsed.as_ref().unwrap().key;
+        assert_eq!(layout, &expected);
+        assert!(Arc::ptr_eq(
+            &layout.shaped.prepared.user_styles,
+            &prepared.user_styles
+        ));
+        assert!(Arc::ptr_eq(
+            &layout.shaped.prepared.reader_overrides,
+            &shaped.prepared.reader_overrides
+        ));
+        assert!(Arc::ptr_eq(
+            &layout.shaped.prepared.parsed.base_uri,
+            &parsed.base_uri
+        ));
+        let (snapshot, allocations) = count_allocations(|| layout.clone());
+        assert_eq!(allocations, 0, "stage-key clones share owned payloads");
+
+        inputs.base_uri.push_str("?changed");
+        inputs.user_styles[0].push_str("p { color:blue }");
+        inputs.reader_overrides.font_family = Some("Other".into());
+        assert_eq!(snapshot, expected);
+        assert_ne!(snapshot, inputs.layout_cache_key());
     }
 
     #[test]
@@ -3520,37 +3586,18 @@ mod tests {
                 );
                 let text = candidate.render_view(session.glyph_resources()).text();
                 assert_eq!(
-                    (0..text.line_count())
-                        .map(|index| text.line_overflow_clip(index))
+                    text.lines()
+                        .iter()
+                        .map(|line| text.line_overflow_clip(line.index()))
                         .collect::<Vec<_>>(),
                     line_clips
                 );
                 for index in 0..text.glyph_count() {
-                    let actual_glyph = text.glyph_at(index).unwrap();
-                    let actual_color = text.paint_color_at(index as u32).unwrap_or_else(|| {
-                        shaper
-                            .cache
-                            .iter()
-                            .find_map(|(&(character, _, color), &glyph)| {
-                                (glyph == actual_glyph
-                                    && text
-                                        .glyph_metric(glyph)
-                                        .is_some_and(|metric| metric.ch() == character))
-                                .then_some(color)
-                            })
-                            .unwrap()
-                    });
-                    let expected_glyph = reference
+                    let actual_color = text.paint_color_at(index as u32).unwrap();
+                    let expected_color = reference
                         .render_view(&reference_resources)
                         .text()
-                        .glyph_at(index)
-                        .unwrap();
-                    let expected_color = reference_shaper
-                        .cache
-                        .iter()
-                        .find_map(|(&(_, _, color), &glyph)| {
-                            (glyph == expected_glyph).then_some(color)
-                        })
+                        .paint_color_at(index as u32)
                         .unwrap();
                     assert_eq!(
                         actual_color, expected_color,
@@ -3879,6 +3926,10 @@ mod tests {
             (
                 PipelineChange::StyleEnvironmentChanged(StyleEnvironment::default()),
                 EarliestStage::Style,
+            ),
+            (
+                PipelineChange::NoteFlowChanged(crate::engine::NoteFlow::Excluded),
+                EarliestStage::Prepare,
             ),
             (
                 PipelineChange::FontEnvironmentChanged(FontEnv::INITIAL),

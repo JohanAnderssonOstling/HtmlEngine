@@ -1,10 +1,11 @@
+use crate::layout_model::BoxGeometry;
 use kurbo::Rect;
 
-use super::{FinalizationScratch, FragmentWriter, GeometryWriter, LayoutReader};
+use super::{FinalizationScratch, FragmentWriter, LayoutReader};
 
 pub(super) fn publish_inline_box_geometry(
     reader: &LayoutReader<'_>,
-    geometry: &mut GeometryWriter<'_>,
+    geometry: &mut BoxGeometry,
     fragments: &FragmentWriter<'_>,
     scratch: &mut FinalizationScratch,
 ) {

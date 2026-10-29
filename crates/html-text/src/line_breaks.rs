@@ -1,7 +1,7 @@
 //! Unicode/CSS wrap opportunities in logical source order. Preparation records
 //! decisions in the existing wrap byte; layout still checks native clusters.
 
-use super::{get_style, whitespace_context_root};
+use super::get_style;
 use crate::{InlineContent, InlineItemKind, TextStructure, WhitespaceWrapOverride};
 use html_style_model::{ComputedStyles, ContentLanguage, LineBreak, StyleView, WordBreak};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
@@ -377,13 +377,7 @@ pub fn resolve(
             continue;
         }
         let owner = item.box_idx as usize;
-        let root = match item.kind {
-            InlineItemKind::Marker { .. } => owner,
-            InlineItemKind::Image { .. } | InlineItemKind::AtomicBox { .. } => {
-                whitespace_context_root(tree, tree.get_box_parent(owner).unwrap_or(owner))
-            }
-            _ => whitespace_context_root(tree, owner),
-        };
+        let root = item.paragraph_root(tree);
         if !roots.contains(&root) {
             continue;
         }
@@ -394,7 +388,6 @@ pub fn resolve(
                 for glyph in glyphs.clone() {
                     let character = content
                         .character_at(glyph as usize)
-                        .and_then(char::from_u32)
                         .unwrap_or('\u{fffd}');
                     paragraph.push(owner, Some(glyph as usize), character, policy);
                 }

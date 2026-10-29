@@ -1,124 +1,10 @@
-//! Renderer limits and validity checks on the native grid AST.
-
-use super::substitution::{contains_function, is_random_math};
-use super::value::parsed_property;
-use lightningcss::properties::custom::{Token as CssToken, TokenList, TokenOrValue};
+//! Limits of the renderer's native grid AST conversion.
+use lightningcss::properties::Property;
 use lightningcss::properties::grid::{
-    GridLine, GridTemplateAreas, RepeatCount, TrackBreadth, TrackListItem, TrackSize, TrackSizing,
+    GridLine, RepeatCount, TrackBreadth, TrackList, TrackListItem, TrackSize, TrackSizing,
 };
-use lightningcss::properties::{Property, PropertyId};
-use std::collections::HashMap;
-
-pub(crate) fn supports(id: &PropertyId<'_>) -> bool {
-    matches!(
-        id,
-        PropertyId::GridTemplateRows
-            | PropertyId::GridTemplateColumns
-            | PropertyId::GridAutoRows
-            | PropertyId::GridAutoColumns
-            | PropertyId::GridAutoFlow
-            | PropertyId::GridTemplateAreas
-            | PropertyId::GridTemplate
-            | PropertyId::Grid
-            | PropertyId::GridRowStart
-            | PropertyId::GridRowEnd
-            | PropertyId::GridColumnStart
-            | PropertyId::GridColumnEnd
-            | PropertyId::GridRow
-            | PropertyId::GridColumn
-            | PropertyId::GridArea
-    )
-}
-
-pub(crate) fn property_value_is_valid(id: &PropertyId<'_>, value: &str) -> Option<bool> {
-    if !supports(id) {
-        return None;
-    }
-    let property = parsed_property(id.clone(), value)?;
-    Some(match &property {
-        Property::Unparsed(_) | Property::Custom(_) => false,
-        Property::GridTemplateAreas(areas) => areas_are_rectangular(areas),
-        Property::GridTemplate(grid) => {
-            areas_are_rectangular(&grid.areas) && !native_value_is_unsupported(&property)
-        }
-        Property::Grid(grid) => {
-            areas_are_rectangular(&grid.areas) && !native_value_is_unsupported(&property)
-        }
-        _ => !native_value_is_unsupported(&property),
-    })
-}
-
 fn reserved_name(name: &str) -> bool {
     name.eq_ignore_ascii_case("span") || name.eq_ignore_ascii_case("auto")
-}
-
-fn areas_are_rectangular(value: &GridTemplateAreas) -> bool {
-    let GridTemplateAreas::Areas { columns, areas } = value else {
-        return true;
-    };
-    let columns = *columns as usize;
-    if columns == 0 || areas.is_empty() || areas.len() % columns != 0 {
-        return false;
-    }
-    let mut bounds = HashMap::<&str, (usize, usize, usize, usize, usize)>::new();
-    for (index, name) in areas.iter().enumerate() {
-        if let Some(name) = name {
-            let (row, column) = (index / columns, index % columns);
-            let entry = bounds.entry(name).or_insert((row, row, column, column, 0));
-            entry.0 = entry.0.min(row);
-            entry.1 = entry.1.max(row);
-            entry.2 = entry.2.min(column);
-            entry.3 = entry.3.max(column);
-            entry.4 += 1;
-        }
-    }
-    bounds
-        .values()
-        .all(|(r0, r1, c0, c1, count)| (r1 - r0 + 1) * (c1 - c0 + 1) == *count)
-}
-
-pub(crate) fn raw_is_unsupported(id: &PropertyId<'_>, tokens: &TokenList<'_>) -> bool {
-    supports(id)
-        && (tokens_use_subgrid(id, tokens)
-            || !contains_function(tokens, |name| {
-                is_random_math(name)
-                    || name.eq_ignore_ascii_case("sibling-index")
-                    || name.eq_ignore_ascii_case("sibling-count")
-            }))
-}
-
-fn tokens_use_subgrid(id: &PropertyId<'_>, tokens: &TokenList<'_>) -> bool {
-    if !matches!(
-        id,
-        PropertyId::GridTemplateRows
-            | PropertyId::GridTemplateColumns
-            | PropertyId::GridTemplate
-            | PropertyId::Grid
-    ) {
-        return false;
-    }
-    let mut depth = 0usize;
-    for token in &tokens.0 {
-        match token {
-            TokenOrValue::Token(
-                CssToken::SquareBracketBlock
-                | CssToken::ParenthesisBlock
-                | CssToken::CurlyBracketBlock,
-            ) => depth += 1,
-            TokenOrValue::Token(
-                CssToken::CloseSquareBracket
-                | CssToken::CloseParenthesis
-                | CssToken::CloseCurlyBracket,
-            ) => depth = depth.saturating_sub(1),
-            TokenOrValue::Token(CssToken::Ident(name))
-                if depth == 0 && name.eq_ignore_ascii_case("subgrid") =>
-            {
-                return true;
-            }
-            _ => {}
-        }
-    }
-    false
 }
 
 pub(crate) fn native_value_is_unsupported(property: &Property<'_>) -> bool {
@@ -175,6 +61,26 @@ fn unsupported_tracks(value: &TrackSizing<'_>) -> bool {
             if matches!(repeat.count, RepeatCount::AutoFill | RepeatCount::AutoFit)
                 && !repeat.track_sizes.iter().all(native_fixed_size))
     })
+}
+
+/// Check the complete auto-repeat shape before committing converted tracks.
+pub(crate) fn auto_repeat_is_supported(list: &TrackList<'_>) -> bool {
+    let count = list
+        .items
+        .iter()
+        .filter(|item| {
+            matches!(item, TrackListItem::TrackRepeat(repeat)
+            if matches!(repeat.count, RepeatCount::AutoFill | RepeatCount::AutoFit))
+        })
+        .count();
+    count <= 1
+        && (count == 0
+            || list.items.iter().all(|item| match item {
+                TrackListItem::TrackSize(size) => native_fixed_size(size),
+                TrackListItem::TrackRepeat(repeat) => {
+                    repeat.track_sizes.iter().all(native_fixed_size)
+                }
+            }))
 }
 
 fn native_fixed_size(size: &TrackSize) -> bool {

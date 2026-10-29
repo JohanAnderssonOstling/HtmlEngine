@@ -1,7 +1,7 @@
 use crate::layout_model::{GlyphAdvanceRun, GlyphId, GlyphMetric, GlyphMetrics, GlyphOffsetRun, InlineContent, InlineItem, Line};
-use crate::layout_model::{GlyphSlice, NativeRuns, TextGeometryView};
-use super::text_placement::{LineTextPlacement, tracking_boundary_after};
-use html_style_model::TextDirection;
+use crate::layout_model::{GlyphSlice, LineTextPlacement, NativeRuns, TextGeometryView};
+use html_style_model::{StyleIndices, TextDirection};
+use html_text::{FirstLetterStyles, tracking_boundary_after};
 use rustc_data_structures::fx::FxHashMap;
 
 /// Immutable shaped-text input used by inline layout and intrinsic sizing.
@@ -10,6 +10,7 @@ use rustc_data_structures::fx::FxHashMap;
 #[derive(Clone, Copy)]
 pub struct InlineReader<'input> {
     content: &'input InlineContent,
+    first_letter_styles: &'input FirstLetterStyles,
     glyphs: GlyphSlice<'input>,
     glyph_metrics: &'input GlyphMetrics,
     text_geometry: Option<TextGeometryView<'input>>,
@@ -20,6 +21,7 @@ pub struct InlineReader<'input> {
 impl<'input> InlineReader<'input> {
     pub fn new(
         content: &'input InlineContent,
+        first_letter_styles: &'input FirstLetterStyles,
         glyphs: GlyphSlice<'input>,
         glyph_metrics: &'input GlyphMetrics,
         text_geometry: Option<TextGeometryView<'input>>,
@@ -29,6 +31,7 @@ impl<'input> InlineReader<'input> {
         debug_assert_eq!(content.characters().len(), glyphs.len());
         Self {
             content,
+            first_letter_styles,
             glyphs,
             glyph_metrics,
             text_geometry,
@@ -77,6 +80,15 @@ impl<'input> InlineReader<'input> {
 
     pub fn glyph_at(&self, glyph_idx: usize) -> Option<GlyphId> {
         self.glyphs.get(glyph_idx).copied()
+    }
+
+    /// Prepared logical character at a retained text position.
+    pub fn character(&self, index: u32) -> char {
+        self.content.characters()[index as usize]
+    }
+
+    pub fn first_letter_style(&self, glyph: u32) -> Option<StyleIndices> {
+        self.first_letter_styles.segment(glyph, glyph + 1).0
     }
 
     pub fn whitespace_wrap_before(

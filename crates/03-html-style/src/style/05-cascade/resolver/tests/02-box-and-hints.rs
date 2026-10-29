@@ -9,11 +9,19 @@ fn open_type_controls_resolve_to_normalized_feature_tags() {
             font-feature-settings: "liga" on, "ss03" 2'>office 123</p></body></html>"#;
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, None);
-    let node = find_body(document.document()).children().next().expect("paragraph");
+    let node = find_body(document.document())
+        .children()
+        .next()
+        .expect("paragraph");
     let indices = document.style_for_node(node).expect("computed style");
     let font = document.font_style(indices).expect("font style");
     let features = font.open_type_features();
-    let value = |tag| features.iter().find(|feature| feature.tag() == tag).map(|feature| feature.value());
+    let value = |tag| {
+        features
+            .iter()
+            .find(|feature| feature.tag() == tag)
+            .map(|feature| feature.value())
+    };
 
     assert_eq!(value(*b"smcp"), Some(1));
     assert_eq!(value(*b"c2sc"), Some(1));
@@ -29,10 +37,20 @@ fn open_type_controls_resolve_to_normalized_feature_tags() {
 fn inherited_font_feature_settings_reach_inline_descendants() {
     let html = r#"<html><body><div><span id="target">A</span>SS</div></body></html>"#;
     let mut factory = DocumentFactory::new();
-    let document = factory.parse_with_new_pipeline(html, Some(r#"html { font-kerning: none; font-feature-settings: "kern" off; }"#));
-    let node = document.document().node_ids().find(|&node| document.document().get_dom_id(node) == Some("target")).expect("target span");
+    let document = factory.parse_with_new_pipeline(
+        html,
+        Some(r#"html { font-kerning: none; font-feature-settings: "kern" off; }"#),
+    );
+    let node = document
+        .document()
+        .node_ids()
+        .find(|&node| document.document().get_dom_id(node) == Some("target"))
+        .expect("target span");
     let indices = document.style_for_node(node).expect("computed style");
-    let features = document.font_style(indices).expect("font style").open_type_features();
+    let features = document
+        .font_style(indices)
+        .expect("font style")
+        .open_type_features();
 
     assert_eq!(features.iter().find(|feature| feature.tag() == *b"kern").map(|feature| feature.value()), Some(0));
 }
@@ -87,7 +105,7 @@ fn inline_style_recovers_after_an_invalid_declaration() {
 
 #[test]
 fn invalid_numeric_longhands_keep_the_previous_cascaded_value() {
-    let html = "<html><body><div style='font-size:18px;font-size:-1px;font-weight:400;font-weight:9000;border-bottom:7px solid;border-bottom-width:-10px;line-height:24px;line-height:-2'></div></body></html>";
+    let html = "<html><body><div style='font-size:18px;font-size:bogus;font-weight:400;font-weight:bogus;border-bottom:7px solid;border-bottom-width:bogus;line-height:24px;line-height:bogus'></div></body></html>";
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, None);
     let node = find_body(document.document()).children().next().expect("test element");
@@ -104,7 +122,7 @@ fn invalid_numeric_longhands_keep_the_previous_cascaded_value() {
 
 #[test]
 fn invalid_border_width_shorthand_is_atomic() {
-    let html = "<html><body><div style='border-width:1px 2px 3px 4px;border-width:5px -1px 7px 8px;border-style:solid'></div></body></html>";
+    let html = "<html><body><div style='border-width:1px 2px 3px 4px;border-width:5px bogus 7px 8px;border-style:solid'></div></body></html>";
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, None);
     let node = find_body(document.document()).children().next().expect("test element");
@@ -132,9 +150,25 @@ fn border_inherit_copies_the_parents_computed_current_color() {
     let html = "<html><body><p style='color:black;border:medium solid'><em style='color:red;border:inherit'></em></p></body></html>";
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, None);
-    let paragraph = find_body(document.document()).children().next().expect("paragraph");
-    let emphasis = document.document().element_ref(paragraph).expect("paragraph element").children().find(|&child| document.document().element_ref(child).is_some_and(|element| element.tag() == "em")).expect("emphasis element");
-    let indices = document.style_for_node(emphasis).expect("computed emphasis style");
+    let paragraph = find_body(document.document())
+        .children()
+        .next()
+        .expect("paragraph");
+    let emphasis = document
+        .document()
+        .element_ref(paragraph)
+        .expect("paragraph element")
+        .children()
+        .find(|&child| {
+            document
+                .document()
+                .element_ref(child)
+                .is_some_and(|element| element.tag() == "em")
+        })
+        .expect("emphasis element");
+    let indices = document
+        .style_for_node(emphasis)
+        .expect("computed emphasis style");
     let text = document.text_style(indices).expect("text style");
     let border = document.border_style(indices).expect("border style");
 
@@ -143,6 +177,64 @@ fn border_inherit_copies_the_parents_computed_current_color() {
     assert_eq!(border.border_right_color, 0x000000ff);
     assert_eq!(border.border_bottom_color, 0x000000ff);
     assert_eq!(border.border_left_color, 0x000000ff);
+}
+
+#[test]
+fn logical_inheritance_copies_physical_parent_sides_and_computed_colors() {
+    for (direction, inherited_side, other_side, width, padding) in
+        [("ltr", 3, 1, 4.0, 4.0), ("rtl", 1, 3, 2.0, 2.0)]
+    {
+        let html = format!("<html><body><div style='color:black;border-style:solid;border-width:1px 2px 3px 4px;margin:1px auto 3px auto;padding:1px 2px 3px 4px'><div id='child' style='direction:{direction};color:red;border:9px dashed blue;margin:9px;padding:9px;border-inline-start:inherit;border-inline-end-color:initial;margin-inline-start:inherit;padding-inline-start:inherit'></div></div></body></html>");
+        let mut factory = DocumentFactory::new();
+        let document = factory.parse_with_new_pipeline(&html, None);
+        let node = document
+            .document()
+            .node_ids()
+            .find(|&node| document.document().get_dom_id(node) == Some("child"))
+            .expect("child");
+        let indices = document.style_for_node(node).expect("computed child style");
+        let border = document.border_style(indices).expect("border style");
+        let box_model = document.box_model_style(indices).expect("box style");
+        let layout = document
+            .styles()
+            .layout_style(indices)
+            .expect("layout style");
+        let widths = [
+            border.border_top_width,
+            border.border_right_width,
+            border.border_bottom_width,
+            border.border_left_width,
+        ];
+        let colors = [
+            border.border_top_color,
+            border.border_right_color,
+            border.border_bottom_color,
+            border.border_left_color,
+        ];
+        let paddings = [
+            box_model.padding_top,
+            box_model.padding_right,
+            box_model.padding_bottom,
+            box_model.padding_left,
+        ];
+        let margin_auto = [
+            layout.margin_top_auto,
+            layout.margin_right_auto,
+            layout.margin_bottom_auto,
+            layout.margin_left_auto,
+        ];
+
+        assert_eq!(widths[inherited_side], FontRelativeLength::px(width).unwrap(), "{direction}");
+        assert_eq!(colors[inherited_side], 0x000000ff, "inherit retains the parent's black, {direction}");
+        assert_eq!(paddings[inherited_side], LengthPct::Px(padding), "{direction}");
+        assert!(margin_auto[inherited_side], "{direction}");
+        assert_eq!(widths[other_side], FontRelativeLength::px(9.0).unwrap(), "{direction}");
+        assert_eq!(colors[other_side], 0xff0000ff, "initial resolves currentColor against the child, {direction}");
+        assert_eq!(paddings[other_side], LengthPct::Px(9.0), "{direction}");
+        assert!(!margin_auto[other_side], "{direction}");
+        assert_eq!(colors[0], 0x0000ffff, "unaffected border stays blue, {direction}");
+        assert_eq!(colors[2], 0x0000ffff, "unaffected border stays blue, {direction}");
+    }
 }
 
 #[test]
@@ -176,13 +268,22 @@ fn margin_shorthand_expands_one_through_four_values() {
     let html = "<html><body><div style='margin:1px'></div><div style='margin:1px 2px'></div><div style='margin:1px 2px 3px'></div><div style='margin:1px 2px 3px 4px'></div></body></html>";
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, None);
-    let nodes = find_body(document.document()).children().collect::<Vec<_>>();
+    let nodes = find_body(document.document())
+        .children()
+        .collect::<Vec<_>>();
     let sides = nodes
         .iter()
         .map(|&node| {
-            let style = document.style_for_node(node).expect("computed margin style");
+            let style = document
+                .style_for_node(node)
+                .expect("computed margin style");
             let box_model = document.box_model_style(style).expect("box model");
-            (box_model.margin_top, box_model.margin_right, box_model.margin_bottom, box_model.margin_left)
+            (
+                box_model.margin_top,
+                box_model.margin_right,
+                box_model.margin_bottom,
+                box_model.margin_left,
+            )
         })
         .collect::<Vec<_>>();
 
@@ -197,18 +298,48 @@ fn padding_shorthand_expands_and_inherits_one_through_four_values() {
     let html = "<html><body><div style='padding:1px'><span style='padding:inherit'></span></div><div style='padding:1px 2px'><span style='padding:inherit'></span></div><div style='padding:1px 2px 3px'><span style='padding:inherit'></span></div><div style='padding:1px 2px 3px 4px'><span style='padding:inherit'></span></div></body></html>";
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, None);
-    let parents = find_body(document.document()).children().collect::<Vec<_>>();
+    let parents = find_body(document.document())
+        .children()
+        .collect::<Vec<_>>();
     let expected = [
-        (LengthPct::Px(1.0), LengthPct::Px(1.0), LengthPct::Px(1.0), LengthPct::Px(1.0)),
-        (LengthPct::Px(1.0), LengthPct::Px(2.0), LengthPct::Px(1.0), LengthPct::Px(2.0)),
-        (LengthPct::Px(1.0), LengthPct::Px(2.0), LengthPct::Px(3.0), LengthPct::Px(2.0)),
-        (LengthPct::Px(1.0), LengthPct::Px(2.0), LengthPct::Px(3.0), LengthPct::Px(4.0)),
+        (
+            LengthPct::Px(1.0),
+            LengthPct::Px(1.0),
+            LengthPct::Px(1.0),
+            LengthPct::Px(1.0),
+        ),
+        (
+            LengthPct::Px(1.0),
+            LengthPct::Px(2.0),
+            LengthPct::Px(1.0),
+            LengthPct::Px(2.0),
+        ),
+        (
+            LengthPct::Px(1.0),
+            LengthPct::Px(2.0),
+            LengthPct::Px(3.0),
+            LengthPct::Px(2.0),
+        ),
+        (
+            LengthPct::Px(1.0),
+            LengthPct::Px(2.0),
+            LengthPct::Px(3.0),
+            LengthPct::Px(4.0),
+        ),
     ];
 
     for (parent, expected_sides) in parents.into_iter().zip(expected) {
-        let child = document.document().element_ref(parent).expect("padding parent").children().next().expect("padding child");
+        let child = document
+            .document()
+            .element_ref(parent)
+            .expect("padding parent")
+            .children()
+            .next()
+            .expect("padding child");
         for node in [parent, child] {
-            let indices = document.style_for_node(node).expect("computed padding style");
+            let indices = document
+                .style_for_node(node)
+                .expect("computed padding style");
             let box_model = document.box_model_style(indices).expect("box model");
             assert_eq!((box_model.padding_top, box_model.padding_right, box_model.padding_bottom, box_model.padding_left), expected_sides);
         }
@@ -237,8 +368,20 @@ fn image_dimension_attributes_are_presentational_hints_below_author_css() {
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, None);
     let style_for = |id| {
-        let node = document.document().node_ids().find(|&node| document.document().element_ref(node).and_then(|element| element.attr("id")) == Some(id)).expect("image by id");
-        document.box_model_style(document.style_for_node(node).expect("computed image style")).expect("box model")
+        let node = document
+            .document()
+            .node_ids()
+            .find(|&node| {
+                document
+                    .document()
+                    .element_ref(node)
+                    .and_then(|element| element.attr("id"))
+                    == Some(id)
+            })
+            .expect("image by id");
+        document
+            .box_model_style(document.style_for_node(node).expect("computed image style"))
+            .expect("box model")
     };
 
     let percentage = style_for("percentage");
@@ -326,8 +469,20 @@ fn image_spacing_attributes_preserve_pixel_and_percentage_margins() {
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, None);
     let style_for = |id| {
-        let node = document.document().node_ids().find(|&node| document.document().element_ref(node).and_then(|element| element.attr("id")) == Some(id)).expect("image by id");
-        document.box_model_style(document.style_for_node(node).expect("computed image style")).expect("box model")
+        let node = document
+            .document()
+            .node_ids()
+            .find(|&node| {
+                document
+                    .document()
+                    .element_ref(node)
+                    .and_then(|element| element.attr("id"))
+                    == Some(id)
+            })
+            .expect("image by id");
+        document
+            .box_model_style(document.style_for_node(node).expect("computed image style"))
+            .expect("box model")
     };
 
     let hinted = style_for("hinted");
@@ -368,13 +523,29 @@ fn legacy_html_color_attributes_are_presentational_hints_below_author_css() {
     let html = "<html><body id='body' text='green' bgcolor='#ffff00'><table><tr><td id='cell' bgcolor='red' style='background-color:blue'>Cell</td></tr></table></body></html>";
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, Some("body { color: #123456; }"));
-    let node_by_id = |id| document.document().node_ids().find(|&node| document.document().element_ref(node).and_then(|element| element.attr("id")) == Some(id)).expect("element by id");
+    let node_by_id = |id| {
+        document
+            .document()
+            .node_ids()
+            .find(|&node| {
+                document
+                    .document()
+                    .element_ref(node)
+                    .and_then(|element| element.attr("id"))
+                    == Some(id)
+            })
+            .expect("element by id")
+    };
 
-    let body_style = document.style_for_node(node_by_id("body")).expect("computed body style");
+    let body_style = document
+        .style_for_node(node_by_id("body"))
+        .expect("computed body style");
     assert_eq!(document.text_style(body_style).expect("body text style").color, 0x123456FF, "author CSS should override the text hint");
     assert_eq!(document.background_style(body_style).expect("body background style").background_color, 0xFFFF00FF);
 
-    let cell_style = document.style_for_node(node_by_id("cell")).expect("computed cell style");
+    let cell_style = document
+        .style_for_node(node_by_id("cell"))
+        .expect("computed cell style");
     assert_eq!(document.background_style(cell_style).expect("cell background style").background_color, 0x0000FFFF, "author CSS should override the bgcolor hint");
 }
 
@@ -401,6 +572,65 @@ fn revert_layer_can_expose_the_presentational_hint_origin() {
 }
 
 #[test]
+fn hint_shorthands_and_keywords_share_longhand_selection_and_origin_rollback() {
+    use html_style_model::{Float, FontRelativeLength};
+    let html = r#"<html><body>
+        <img id="partial" width="123" border="4" bordercolor="red" hspace="10" align="left"
+             style="width:1ic;border-top-width:revert;border-right-width:9px;
+                    border-left-width:12px;border-left-width:revert-layer!important;
+                    border-right-color:blue;margin-right:3px;float:revert-layer">
+        <img id="reset" width="123" border="4" bordercolor="red" hspace="10" align="left"
+             style="all:revert">
+    </body></html>"#;
+    let document = DocumentFactory::new().parse_with_new_pipeline(html, None);
+    let indices = |id| {
+        let node = document
+            .document()
+            .node_ids()
+            .find(|&node| document.document().get_dom_id(node) == Some(id))
+            .unwrap();
+        document.style_for_node(node).unwrap()
+    };
+    let partial = indices("partial");
+    let box_model = document.box_model_style(partial).unwrap();
+    assert_eq!(box_model.width, PreferredSize::Px(123.0));
+    assert_eq!(box_model.float, Float::Left);
+    assert_eq!(
+        (box_model.margin_left, box_model.margin_right),
+        (LengthPct::Px(10.0), LengthPct::Px(3.0))
+    );
+    let border = document.border_style(partial).unwrap();
+    assert_eq!(border.border_top_width, FontRelativeLength::px(3.0).unwrap());
+    assert_eq!(
+        border.border_right_width,
+        FontRelativeLength::px(9.0).unwrap()
+    );
+    assert_eq!(
+        border.border_bottom_width,
+        FontRelativeLength::px(4.0).unwrap()
+    );
+    assert_eq!(
+        border.border_left_width,
+        FontRelativeLength::px(4.0).unwrap()
+    );
+    assert_eq!(border.border_left_color, 0xff0000ff);
+    assert_eq!(border.border_right_color, 0x0000ffff);
+
+    let reset = indices("reset");
+    let box_model = document.box_model_style(reset).unwrap();
+    assert_eq!(box_model.width, PreferredSize::Auto);
+    assert_eq!(box_model.float, Float::None);
+    assert_eq!(
+        (box_model.margin_left, box_model.margin_right),
+        (LengthPct::Px(0.0), LengthPct::Px(0.0))
+    );
+    assert_eq!(
+        document.border_style(reset).unwrap().border_left_width,
+        FontRelativeLength::px(3.0).unwrap()
+    );
+}
+
+#[test]
 fn all_revert_removes_hints_except_direction() {
     let html = "<html><body><table><tr><td id='target' dir='rtl' bgcolor='red' style='all:revert'>Cell</td></tr></table></body></html>";
     let mut factory = DocumentFactory::new();
@@ -418,8 +648,20 @@ fn legacy_table_spacing_and_padding_are_presentational_hints_below_author_css() 
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, None);
     let box_style_for = |id| {
-        let node = document.document().node_ids().find(|&node| document.document().element_ref(node).and_then(|element| element.attr("id")) == Some(id)).expect("element by id");
-        document.box_model_style(document.style_for_node(node).expect("computed style")).expect("box model")
+        let node = document
+            .document()
+            .node_ids()
+            .find(|&node| {
+                document
+                    .document()
+                    .element_ref(node)
+                    .and_then(|element| element.attr("id"))
+                    == Some(id)
+            })
+            .expect("element by id");
+        document
+            .box_model_style(document.style_for_node(node).expect("computed style"))
+            .expect("box model")
     };
 
     let hinted = box_style_for("hinted");
@@ -439,19 +681,41 @@ fn legacy_table_rules_and_frame_values_are_ascii_case_insensitive() {
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, None);
     let style_for = |id| {
-        let node = document.document().node_ids().find(|&node| document.document().element_ref(node).and_then(|element| element.attr("id")) == Some(id)).expect("element by id");
+        let node = document
+            .document()
+            .node_ids()
+            .find(|&node| {
+                document
+                    .document()
+                    .element_ref(node)
+                    .and_then(|element| element.attr("id"))
+                    == Some(id)
+            })
+            .expect("element by id");
         document.style_for_node(node).expect("computed style")
     };
 
-    let lower_row = document.border_style(style_for("lower-row")).expect("row border");
-    let upper_row = document.border_style(style_for("upper-row")).expect("row border");
-    let invalid_row = document.border_style(style_for("invalid-row")).expect("row border");
+    let lower_row = document
+        .border_style(style_for("lower-row"))
+        .expect("row border");
+    let upper_row = document
+        .border_style(style_for("upper-row"))
+        .expect("row border");
+    let invalid_row = document
+        .border_style(style_for("invalid-row"))
+        .expect("row border");
     assert_eq!(lower_row, upper_row);
     assert_ne!(lower_row, invalid_row);
 
-    let lower_frame = document.border_style(style_for("lower-frame")).expect("table border");
-    let upper_frame = document.border_style(style_for("upper-frame")).expect("table border");
-    let invalid_frame = document.border_style(style_for("invalid-frame")).expect("table border");
+    let lower_frame = document
+        .border_style(style_for("lower-frame"))
+        .expect("table border");
+    let upper_frame = document
+        .border_style(style_for("upper-frame"))
+        .expect("table border");
+    let invalid_frame = document
+        .border_style(style_for("invalid-frame"))
+        .expect("table border");
     assert_eq!(lower_frame, upper_frame);
     assert_ne!(lower_frame, invalid_frame);
 }
@@ -462,8 +726,21 @@ fn legacy_cell_nowrap_is_a_presentational_hint_below_author_css() {
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, None);
     let white_space_for = |id| {
-        let node = document.document().node_ids().find(|&node| document.document().element_ref(node).and_then(|element| element.attr("id")) == Some(id)).expect("element by id");
-        document.text_style(document.style_for_node(node).expect("computed style")).expect("text style").white_space
+        let node = document
+            .document()
+            .node_ids()
+            .find(|&node| {
+                document
+                    .document()
+                    .element_ref(node)
+                    .and_then(|element| element.attr("id"))
+                    == Some(id)
+            })
+            .expect("element by id");
+        document
+            .text_style(document.style_for_node(node).expect("computed style"))
+            .expect("text style")
+            .white_space
     };
 
     assert_eq!(white_space_for("hinted"), WhiteSpace::NoWrap);
@@ -475,11 +752,31 @@ fn inherited_table_model_properties_cross_the_computed_style_boundary() {
     let html = "<html><body><table id='table' style='border-collapse:collapse;border-spacing:7px 9px;caption-side:bottom;empty-cells:hide'><tbody><tr><td id='cell'>A</td></tr></tbody></table></body></html>";
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, None);
-    let by_id = |id| document.document().node_ids().find(|&node| document.document().element_ref(node).and_then(|element| element.attr("id")) == Some(id)).expect("element by id");
-    let table_style = document.box_model_style(document.style_for_node(by_id("table")).expect("computed table style")).expect("table box model");
+    let by_id = |id| {
+        document
+            .document()
+            .node_ids()
+            .find(|&node| {
+                document
+                    .document()
+                    .element_ref(node)
+                    .and_then(|element| element.attr("id"))
+                    == Some(id)
+            })
+            .expect("element by id")
+    };
+    let table_style = document
+        .box_model_style(
+            document
+                .style_for_node(by_id("table"))
+                .expect("computed table style"),
+        )
+        .expect("table box model");
     assert_eq!(table_style.border_collapse, BorderCollapseMode::Collapse);
     let cell = by_id("cell");
-    let style = document.box_model_style(document.style_for_node(cell).expect("computed cell style")).expect("cell box model");
+    let style = document
+        .box_model_style(document.style_for_node(cell).expect("computed cell style"))
+        .expect("cell box model");
 
     assert_eq!(style.border_collapse, BorderCollapseMode::Collapse);
     assert_eq!((style.border_spacing_horizontal, style.border_spacing_vertical), (7.0, 9.0));
@@ -491,9 +788,33 @@ fn inherited_table_model_properties_cross_the_computed_style_boundary() {
 fn custom_represented_table_keywords_obey_the_normal_cascade() {
     let html = "<html><body><table id='important' style='border-collapse:separate'><tr><td>A</td></tr></table><table id='ordered' style='border-collapse:collapse;border-collapse:separate'><tr><td>B</td></tr></table><table id='variable' style='--mode:collapse;border-collapse:var(--mode)'><tr><td>C</td></tr></table></body></html>";
     let mut factory = DocumentFactory::new();
-    let document = factory.parse_with_new_pipeline(html, Some("#important { border-collapse: collapse !important; }"));
-    let by_id = |id| document.document().node_ids().find(|&node| document.document().element_ref(node).and_then(|element| element.attr("id")) == Some(id)).expect("table by id");
-    let collapse = |id| document.box_model_style(document.style_for_node(by_id(id)).expect("computed table style")).expect("table box model").border_collapse;
+    let document = factory.parse_with_new_pipeline(
+        html,
+        Some("#important { border-collapse: collapse !important; }"),
+    );
+    let by_id = |id| {
+        document
+            .document()
+            .node_ids()
+            .find(|&node| {
+                document
+                    .document()
+                    .element_ref(node)
+                    .and_then(|element| element.attr("id"))
+                    == Some(id)
+            })
+            .expect("table by id")
+    };
+    let collapse = |id| {
+        document
+            .box_model_style(
+                document
+                    .style_for_node(by_id(id))
+                    .expect("computed table style"),
+            )
+            .expect("table box model")
+            .border_collapse
+    };
 
     assert_eq!(collapse("important"), BorderCollapseMode::Collapse);
     assert_eq!(collapse("ordered"), BorderCollapseMode::Separate);
@@ -505,8 +826,25 @@ fn table_layout_is_resolved_from_stylesheets_and_is_not_inherited_by_default() {
     let html = "<html><body><table id='table'><tr style='table-layout:fixed'><td id='reset'>A</td><td id='inherited' style='table-layout:inherit'>B</td></tr></table></body></html>";
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, Some("#table { table-layout: fixed; }"));
-    let by_id = |id| document.document().node_ids().find(|&node| document.document().element_ref(node).and_then(|element| element.attr("id")) == Some(id)).expect("element by id");
-    let mode = |id| document.box_model_style(document.style_for_node(by_id(id)).expect("computed style")).expect("box model").table_layout;
+    let by_id = |id| {
+        document
+            .document()
+            .node_ids()
+            .find(|&node| {
+                document
+                    .document()
+                    .element_ref(node)
+                    .and_then(|element| element.attr("id"))
+                    == Some(id)
+            })
+            .expect("element by id")
+    };
+    let mode = |id| {
+        document
+            .box_model_style(document.style_for_node(by_id(id)).expect("computed style"))
+            .expect("box model")
+            .table_layout
+    };
 
     assert_eq!(mode("table"), TableLayoutMode::Fixed);
     assert_eq!(mode("reset"), TableLayoutMode::Auto);
@@ -518,16 +856,34 @@ fn renderer_owned_text_box_grammar_matches_computed_behavior() {
     let html = "<html><body><p id='alphabetic' style='text-box-edge:alphabetic'>A</p><p id='fallback' style='text-box:trim-start cap alphabetic;text-box:cap none alphabetic'>B</p></body></html>";
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, None);
-    let by_id = |id| document.document().node_ids().find(|&node| document.document().element_ref(node).and_then(|element| element.attr("id")) == Some(id)).expect("element by id");
+    let by_id = |id| {
+        document
+            .document()
+            .node_ids()
+            .find(|&node| {
+                document
+                    .document()
+                    .element_ref(node)
+                    .and_then(|element| element.attr("id"))
+                    == Some(id)
+            })
+            .expect("element by id")
+    };
     let styles = |id| document.style_for_node(by_id(id)).expect("computed style");
 
-    let alphabetic = document.text_style(styles("alphabetic")).expect("text style").text_box_edge;
+    let alphabetic = document
+        .text_style(styles("alphabetic"))
+        .expect("text style")
+        .text_box_edge;
     assert_eq!(alphabetic.over, TextBoxOverEdge::Text);
     assert_eq!(alphabetic.under, TextBoxUnderEdge::Alphabetic);
 
     let fallback = styles("fallback");
     assert_eq!(document.box_model_style(fallback).expect("box style").text_box_trim, TextBoxTrim::Start);
-    let edge = document.text_style(fallback).expect("text style").text_box_edge;
+    let edge = document
+        .text_style(fallback)
+        .expect("text style")
+        .text_box_edge;
     assert_eq!(edge.over, TextBoxOverEdge::Cap);
     assert_eq!(edge.under, TextBoxUnderEdge::Alphabetic);
 }
@@ -537,8 +893,25 @@ fn size_containment_is_resolved_as_a_reset_property() {
     let html = "<html><body><div id='parent' style='contain:size'><div id='reset'></div><div id='inherited' style='contain:inherit'></div></div><div id='strict' style='contain:strict'></div><div id='content' style='contain:content'></div></body></html>";
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, None);
-    let by_id = |id| document.document().node_ids().find(|&node| document.document().element_ref(node).and_then(|element| element.attr("id")) == Some(id)).expect("element by id");
-    let contained = |id| document.box_model_style(document.style_for_node(by_id(id)).expect("computed style")).expect("box model").size_containment;
+    let by_id = |id| {
+        document
+            .document()
+            .node_ids()
+            .find(|&node| {
+                document
+                    .document()
+                    .element_ref(node)
+                    .and_then(|element| element.attr("id"))
+                    == Some(id)
+            })
+            .expect("element by id")
+    };
+    let contained = |id| {
+        document
+            .box_model_style(document.style_for_node(by_id(id)).expect("computed style"))
+            .expect("box model")
+            .size_containment
+    };
 
     assert!(contained("parent"));
     assert!(!contained("reset"));
@@ -549,30 +922,96 @@ fn size_containment_is_resolved_as_a_reset_property() {
 
 #[test]
 fn absolute_positioning_blockifies_table_internal_displays() {
-    let displays = ["table-row-group", "table-header-group", "table-footer-group", "table-row", "table-column-group", "table-column", "table-cell", "table-caption"];
-    let children = displays.iter().enumerate().map(|(index, display)| format!("<div id='d{index}' style='display:{display};position:absolute'></div>")).collect::<String>();
+    let displays = [
+        "table-row-group",
+        "table-header-group",
+        "table-footer-group",
+        "table-row",
+        "table-column-group",
+        "table-column",
+        "table-cell",
+        "table-caption",
+    ];
+    let children = displays
+        .iter()
+        .enumerate()
+        .map(|(index, display)| {
+            format!("<div id='d{index}' style='display:{display};position:absolute'></div>")
+        })
+        .collect::<String>();
     let mut factory = DocumentFactory::new();
-    let document = factory.parse_with_new_pipeline(&format!("<html><body>{children}</body></html>"), None);
+    let document =
+        factory.parse_with_new_pipeline(&format!("<html><body>{children}</body></html>"), None);
 
     for index in 0..displays.len() {
         let id = format!("d{index}");
-        let node = document.document().node_ids().find(|&node| document.document().element_ref(node).and_then(|element| element.attr("id")) == Some(id.as_str())).expect("positioned table-internal display");
-        let box_model = document.box_model_style(document.style_for_node(node).expect("computed positioned style")).expect("box model");
+        let node = document
+            .document()
+            .node_ids()
+            .find(|&node| {
+                document
+                    .document()
+                    .element_ref(node)
+                    .and_then(|element| element.attr("id"))
+                    == Some(id.as_str())
+            })
+            .expect("positioned table-internal display");
+        let box_model = document
+            .box_model_style(
+                document
+                    .style_for_node(node)
+                    .expect("computed positioned style"),
+            )
+            .expect("box model");
         assert_eq!(box_model.display, Display::Block, "{} must blockify", displays[index]);
     }
 }
 
 #[test]
 fn floating_blockifies_inline_and_table_internal_displays() {
-    let displays = ["inline", "inline-block", "table-row-group", "table-header-group", "table-footer-group", "table-row", "table-column-group", "table-column", "table-cell", "table-caption"];
-    let children = displays.iter().enumerate().map(|(index, display)| format!("<div id='d{index}' style='display:{display};float:left'></div>")).collect::<String>();
+    let displays = [
+        "inline",
+        "inline-block",
+        "table-row-group",
+        "table-header-group",
+        "table-footer-group",
+        "table-row",
+        "table-column-group",
+        "table-column",
+        "table-cell",
+        "table-caption",
+    ];
+    let children = displays
+        .iter()
+        .enumerate()
+        .map(|(index, display)| {
+            format!("<div id='d{index}' style='display:{display};float:left'></div>")
+        })
+        .collect::<String>();
     let mut factory = DocumentFactory::new();
-    let document = factory.parse_with_new_pipeline(&format!("<html><body>{children}</body></html>"), None);
+    let document =
+        factory.parse_with_new_pipeline(&format!("<html><body>{children}</body></html>"), None);
 
     for index in 0..displays.len() {
         let id = format!("d{index}");
-        let node = document.document().node_ids().find(|&node| document.document().element_ref(node).and_then(|element| element.attr("id")) == Some(id.as_str())).expect("floated display");
-        let box_model = document.box_model_style(document.style_for_node(node).expect("computed floated style")).expect("box model");
+        let node = document
+            .document()
+            .node_ids()
+            .find(|&node| {
+                document
+                    .document()
+                    .element_ref(node)
+                    .and_then(|element| element.attr("id"))
+                    == Some(id.as_str())
+            })
+            .expect("floated display");
+        let box_model = document
+            .box_model_style(
+                document
+                    .style_for_node(node)
+                    .expect("computed floated style"),
+            )
+            .expect("box model");
         assert_eq!(box_model.display, Display::Block, "{} must blockify", displays[index]);
     }
 }
@@ -583,8 +1022,22 @@ fn z_index_crosses_the_typed_style_boundary() {
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, None);
     let z_index_for = |id| {
-        let node = document.document().node_ids().find(|&node| document.document().element_ref(node).and_then(|element| element.attr("id")) == Some(id)).expect("element by id");
-        document.styles().layout_style(document.style_for_node(node).expect("computed style")).expect("layout style").z_index
+        let node = document
+            .document()
+            .node_ids()
+            .find(|&node| {
+                document
+                    .document()
+                    .element_ref(node)
+                    .and_then(|element| element.attr("id"))
+                    == Some(id)
+            })
+            .expect("element by id");
+        document
+            .styles()
+            .layout_style(document.style_for_node(node).expect("computed style"))
+            .expect("layout style")
+            .z_index
     };
     assert_eq!(z_index_for("integer"), Some(-7));
     assert_eq!(z_index_for("auto"), None);
@@ -596,8 +1049,20 @@ fn physical_padding_inherit_copies_the_parent_computed_value() {
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, None);
     for id in ["parent", "child"] {
-        let node = document.document().node_ids().find(|&node| document.document().element_ref(node).and_then(|element| element.attr("id")) == Some(id)).expect("padding test element");
-        let indices = document.style_for_node(node).expect("computed padding style");
+        let node = document
+            .document()
+            .node_ids()
+            .find(|&node| {
+                document
+                    .document()
+                    .element_ref(node)
+                    .and_then(|element| element.attr("id"))
+                    == Some(id)
+            })
+            .expect("padding test element");
+        let indices = document
+            .style_for_node(node)
+            .expect("computed padding style");
         assert_eq!(document.box_model_style(indices).expect("box style").padding_top, LengthPct::Px(96.0));
     }
 }
@@ -608,11 +1073,32 @@ fn inherited_em_and_percentage_padding_keep_their_computed_semantics() {
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, None);
     let box_model = |id| {
-        let node = document.document().node_ids().find(|&node| document.document().element_ref(node).and_then(|element| element.attr("id")) == Some(id)).expect("padding test element");
-        document.box_model_style(document.style_for_node(node).expect("computed padding style")).expect("box style")
+        let node = document
+            .document()
+            .node_ids()
+            .find(|&node| {
+                document
+                    .document()
+                    .element_ref(node)
+                    .and_then(|element| element.attr("id"))
+                    == Some(id)
+            })
+            .expect("padding test element");
+        document
+            .box_model_style(
+                document
+                    .style_for_node(node)
+                    .expect("computed padding style"),
+            )
+            .expect("box style")
     };
 
-    let expected_em = (LengthPct::Px(48.0), LengthPct::Px(72.0), LengthPct::Px(24.0), LengthPct::Px(96.0));
+    let expected_em = (
+        LengthPct::Px(48.0),
+        LengthPct::Px(72.0),
+        LengthPct::Px(24.0),
+        LengthPct::Px(96.0),
+    );
     for id in ["em-parent", "em-child"] {
         let style = box_model(id);
         assert_eq!((style.padding_top, style.padding_right, style.padding_bottom, style.padding_left), expected_em);

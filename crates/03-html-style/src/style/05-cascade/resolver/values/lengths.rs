@@ -1,4 +1,13 @@
-use super::*;
+use super::super::context::ResolutionContext;
+use html_style_model::{
+    BorderStyle, ComputedSizeComponent, ComputedStylesBuilder, Font, FontRelativeLength, LengthPct,
+    PreferredSize, SizeComparison, TextSpacing, VerticalAlignValue,
+};
+use lightningcss::properties::border::{BorderSideWidth, LineStyle};
+use lightningcss::properties::size::{MaxSize, Size};
+use lightningcss::properties::text::Spacing;
+use lightningcss::values::calc::{Calc, MathFunction};
+use lightningcss::values::length::{Length, LengthPercentage, LengthPercentageOrAuto, LengthValue};
 
 pub(in crate::style::cascade::resolver) fn length_to_px(
     length: &LengthValue,
@@ -115,56 +124,6 @@ pub(in crate::style::cascade::resolver) fn length_percentage_to_px(
     }
 }
 
-pub(in crate::style::cascade::resolver) fn parsed_text_spacing_to_computed(
-    parsed: &ParsedSpacing,
-    font_size: f32,
-    root_font_size: f32,
-    resolution: &ResolutionContext,
-) -> Option<TextSpacing> {
-    match parsed {
-        ParsedSpacing::Normal => Some(TextSpacing::ZERO),
-        ParsedSpacing::Value(value) => {
-            length_percentage_to_text_spacing(value, font_size, root_font_size, resolution)
-        }
-    }
-}
-
-pub(in crate::style::cascade::resolver) fn parsed_tab_size_to_computed(
-    parsed: &ParsedTabSize,
-    font_size: f32,
-    root_font_size: f32,
-    resolution: &ResolutionContext,
-) -> Option<TabSize> {
-    match parsed {
-        ParsedTabSize::Spaces(value) => {
-            let number = resolve_number(value, font_size, root_font_size, resolution)?;
-            TabSize::spaces(number.max(0.0).min(f32::MAX))
-        }
-        ParsedTabSize::ContextualLength(source) => {
-            let lowered = crate::style::syntax::sign::lower(source, |number| {
-                resolve_number(number, font_size, root_font_size, resolution)
-            })
-            .ok()?;
-            let ParsedTabSize::Length(value) = parse_tab_size(&lowered)? else {
-                return None;
-            };
-            parsed_tab_size_to_computed(
-                &ParsedTabSize::Length(value),
-                font_size,
-                root_font_size,
-                resolution,
-            )
-        }
-        ParsedTabSize::Length(value) => {
-            let resolved =
-                length_percentage_to_text_spacing(value, font_size, root_font_size, resolution)?;
-            (resolved.font_size_fraction() == 0.0)
-                .then(|| TabSize::length_px(resolved.absolute_px().max(0.0)))
-                .flatten()
-        }
-    }
-}
-
 pub(in crate::style::cascade::resolver) fn length_percentage_to_text_spacing(
     value: &LengthPercentage,
     font_size: f32,
@@ -205,8 +164,13 @@ pub(in crate::style::cascade::resolver) fn vertical_align_value(
         )?)),
         LengthPercentage::Percentage(percentage) => Some(VerticalAlignValue::Percent(percentage.0)),
         LengthPercentage::Calc(calc) => {
-            let (absolute_px, line_height_fraction, x_height_px, ch_advance_px, cap_height_px) =
-                calc_box_length_percentage_components(calc, font_size, root_font_size, resolution)?;
+            let [
+                absolute_px,
+                line_height_fraction,
+                x_height_px,
+                ch_advance_px,
+                cap_height_px,
+            ] = calc_box_length_percentage_components(calc, font_size, root_font_size, resolution)?;
             if ch_advance_px != 0.0 || cap_height_px != 0.0 {
                 return None;
             }
@@ -219,107 +183,57 @@ pub(in crate::style::cascade::resolver) fn vertical_align_value(
     }
 }
 
-/// Reduce Lightning CSS's typed linear calc tree while retaining the two
-/// selected-face metric terms that cannot become pixels until shaping.
+/// Reduce Lightning CSS's typed linear calc tree into coefficients for pixels,
+/// percentages, and the selected-face metrics `ex`, `ch`, and `cap`.
 pub(in crate::style::cascade::resolver) fn calc_box_length_percentage_components(
     calc: &Calc<LengthPercentage>,
     font_size: f32,
     root_font_size: f32,
     resolution: &ResolutionContext,
-) -> Option<(f32, f32, f32, f32, f32)> {
+) -> Option<[f32; 5]> {
+    let resolve =
+        |value| calc_box_length_percentage_components(value, font_size, root_font_size, resolution);
     match calc {
         Calc::Value(value) => match value.as_ref() {
             LengthPercentage::Dimension(LengthValue::Ex(value)) => {
-                Some((0.0, 0.0, value * font_size, 0.0, 0.0))
+                Some([0.0, 0.0, value * font_size, 0.0, 0.0])
             }
             LengthPercentage::Dimension(LengthValue::Ch(value)) => {
-                Some((0.0, 0.0, 0.0, value * font_size, 0.0))
+                Some([0.0, 0.0, 0.0, value * font_size, 0.0])
             }
             LengthPercentage::Dimension(LengthValue::Cap(value)) => {
-                Some((0.0, 0.0, 0.0, 0.0, value * font_size))
+                Some([0.0, 0.0, 0.0, 0.0, value * font_size])
             }
-            LengthPercentage::Dimension(value) => Some((
+            LengthPercentage::Dimension(value) => Some([
                 length_to_px(value, font_size, root_font_size, resolution)?,
                 0.0,
                 0.0,
                 0.0,
                 0.0,
-            )),
-            LengthPercentage::Percentage(value) => Some((0.0, value.0, 0.0, 0.0, 0.0)),
-            LengthPercentage::Calc(value) => {
-                calc_box_length_percentage_components(value, font_size, root_font_size, resolution)
-            }
+            ]),
+            LengthPercentage::Percentage(value) => Some([0.0, value.0, 0.0, 0.0, 0.0]),
+            LengthPercentage::Calc(value) => resolve(value),
         },
-        Calc::Number(value) => (*value == 0.0).then_some((0.0, 0.0, 0.0, 0.0, 0.0)),
+        Calc::Number(value) => (*value == 0.0).then_some([0.0; 5]),
         Calc::Sum(left, right) => {
-            let left =
-                calc_box_length_percentage_components(left, font_size, root_font_size, resolution)?;
-            let right = calc_box_length_percentage_components(
-                right,
-                font_size,
-                root_font_size,
-                resolution,
-            )?;
-            Some((
-                left.0 + right.0,
-                left.1 + right.1,
-                left.2 + right.2,
-                left.3 + right.3,
-                left.4 + right.4,
-            ))
+            let left = resolve(left)?;
+            let right = resolve(right)?;
+            Some(std::array::from_fn(|i| left[i] + right[i]))
         }
-        Calc::Product(factor, value) => {
-            let value = calc_box_length_percentage_components(
-                value,
-                font_size,
-                root_font_size,
-                resolution,
-            )?;
-            Some((
-                *factor * value.0,
-                *factor * value.1,
-                *factor * value.2,
-                *factor * value.3,
-                *factor * value.4,
-            ))
-        }
+        Calc::Product(factor, value) => Some(resolve(value)?.map(|value| *factor * value)),
         Calc::Function(function) => match function.as_ref() {
-            MathFunction::Calc(value) => {
-                calc_box_length_percentage_components(value, font_size, root_font_size, resolution)
-            }
+            MathFunction::Calc(value) => resolve(value),
             MathFunction::Min(values) | MathFunction::Max(values) => {
                 let minimum = matches!(function.as_ref(), MathFunction::Min(_));
                 values
                     .iter()
-                    .map(|value| {
-                        calc_box_length_percentage_components(
-                            value,
-                            font_size,
-                            root_font_size,
-                            resolution,
-                        )
-                    })
+                    .map(resolve)
                     .reduce(|left, right| select_comparison_operand(left?, right?, minimum))?
             }
             MathFunction::Clamp(minimum, value, maximum) => {
-                let minimum = calc_box_length_percentage_components(
-                    minimum,
-                    font_size,
-                    root_font_size,
-                    resolution,
-                )?;
-                let value = calc_box_length_percentage_components(
-                    value,
-                    font_size,
-                    root_font_size,
-                    resolution,
-                )?;
-                let maximum = calc_box_length_percentage_components(
-                    maximum,
-                    font_size,
-                    root_font_size,
-                    resolution,
-                )?;
+                let minimum = resolve(minimum)?;
+                let value = resolve(value)?;
+                let maximum = resolve(maximum)?;
                 select_comparison_operand(
                     minimum,
                     select_comparison_operand(value, maximum, true)?,
@@ -335,16 +249,9 @@ pub(in crate::style::cascade::resolver) fn calc_box_length_percentage_components
 /// when they differ in just one coefficient. All five bases are nonnegative.
 /// Crossing expressions stay unresolved instead of comparing coefficients as
 /// if they were already pixel values.
-fn select_comparison_operand(
-    left: (f32, f32, f32, f32, f32),
-    right: (f32, f32, f32, f32, f32),
-    minimum: bool,
-) -> Option<(f32, f32, f32, f32, f32)> {
+fn select_comparison_operand(left: [f32; 5], right: [f32; 5], minimum: bool) -> Option<[f32; 5]> {
     let mut difference = None;
-    for (a, b) in [left.0, left.1, left.2, left.3, left.4]
-        .into_iter()
-        .zip([right.0, right.1, right.2, right.3, right.4])
-    {
+    for (a, b) in left.into_iter().zip(right) {
         if a != b {
             if difference.is_some() {
                 return None;
@@ -366,6 +273,8 @@ pub(in crate::style::cascade::resolver) fn calc_length_percentage_components(
     root_font_size: f32,
     resolution: &ResolutionContext,
 ) -> Option<(f32, f32)> {
+    let resolve =
+        |value| calc_length_percentage_components(value, font_size, root_font_size, resolution);
     match calc {
         Calc::Value(value) => {
             let spacing =
@@ -374,21 +283,16 @@ pub(in crate::style::cascade::resolver) fn calc_length_percentage_components(
         }
         Calc::Number(value) => (*value == 0.0).then_some((0.0, 0.0)),
         Calc::Sum(left, right) => {
-            let left =
-                calc_length_percentage_components(left, font_size, root_font_size, resolution)?;
-            let right =
-                calc_length_percentage_components(right, font_size, root_font_size, resolution)?;
+            let left = resolve(left)?;
+            let right = resolve(right)?;
             Some((left.0 + right.0, left.1 + right.1))
         }
         Calc::Product(factor, value) => {
-            let value =
-                calc_length_percentage_components(value, font_size, root_font_size, resolution)?;
+            let value = resolve(value)?;
             Some((*factor * value.0, *factor * value.1))
         }
         Calc::Function(function) => match function.as_ref() {
-            MathFunction::Calc(value) => {
-                calc_length_percentage_components(value, font_size, root_font_size, resolution)
-            }
+            MathFunction::Calc(value) => resolve(value),
             // Non-linear math functions cannot retain an unresolved percentage
             // as a two-component computed value without keeping the parser AST.
             _ => None,
@@ -443,7 +347,7 @@ pub(in crate::style::cascade::resolver) fn length_or_auto_to_lengthpct(
     match value {
         LengthPercentageOrAuto::Auto => Some(LengthPct::Px(0.0)),
         LengthPercentageOrAuto::LengthPercentage(lp) => {
-            length_percentage_to_lengthpct(lp, font_size, root_font_size, resolution)
+            computed_length_pct(lp, font_size, root_font_size, resolution)
         }
     }
 }
@@ -468,31 +372,12 @@ pub(in crate::style::cascade::resolver) fn inset_value(
 ) -> Option<Option<LengthPct>> {
     match value {
         LengthPercentageOrAuto::Auto => Some(None),
-        LengthPercentageOrAuto::LengthPercentage(value) => Some(Some(
-            length_percentage_to_lengthpct(value, font_size, root_font_size, resolution)?,
-        )),
-    }
-}
-
-/// Convert a `<length-percentage>` (e.g. `text-indent`) into a `LengthPct`,
-/// deferring percentage resolution to layout (against the containing-block width).
-pub(in crate::style::cascade::resolver) fn length_percentage_to_lengthpct(
-    lp: &LengthPercentage,
-    font_size: f32,
-    root_font_size: f32,
-    resolution: &ResolutionContext,
-) -> Option<LengthPct> {
-    match lp {
-        LengthPercentage::Dimension(len) => {
-            length_pct_from_length(len, font_size, root_font_size, resolution)
-        }
-        LengthPercentage::Percentage(p) => Some(LengthPct::Pct(p.0)),
-        LengthPercentage::Calc(value) => computed_length_pct(
-            &LengthPercentage::Calc(value.clone()),
+        LengthPercentageOrAuto::LengthPercentage(value) => Some(Some(computed_length_pct(
+            value,
             font_size,
             root_font_size,
             resolution,
-        ),
+        )?)),
     }
 }
 
@@ -509,19 +394,9 @@ pub(in crate::style::cascade::resolver) fn size_to_preferred(
         Size::MaxContent(_) => PreferredSize::MaxContent,
         Size::FitContent(_) => PreferredSize::FitContent,
         Size::Stretch(_) => PreferredSize::Stretch,
-        Size::LengthPercentage(lp) => match lp {
-            LengthPercentage::Dimension(len) => {
-                preferred_from_length(len, font, root_font_size, resolution)?
-            }
-            LengthPercentage::Percentage(p) => PreferredSize::Percent(p.0),
-            LengthPercentage::Calc(value) => length_percentage_to_preferred(
-                &LengthPercentage::Calc(value.clone()),
-                font,
-                root_font_size,
-                styles,
-                resolution,
-            )?,
-        },
+        Size::LengthPercentage(lp) => {
+            length_percentage_to_preferred(lp, font, root_font_size, styles, resolution)?
+        }
         _ => PreferredSize::Auto,
     })
 }
@@ -539,19 +414,9 @@ pub(in crate::style::cascade::resolver) fn max_size_to_preferred(
         MaxSize::MaxContent(_) => PreferredSize::MaxContent,
         MaxSize::FitContent(_) => PreferredSize::FitContent,
         MaxSize::Stretch(_) => PreferredSize::Stretch,
-        MaxSize::LengthPercentage(lp) => match lp {
-            LengthPercentage::Dimension(len) => {
-                preferred_from_length(len, font, root_font_size, resolution)?
-            }
-            LengthPercentage::Percentage(p) => PreferredSize::Percent(p.0),
-            LengthPercentage::Calc(value) => length_percentage_to_preferred(
-                &LengthPercentage::Calc(value.clone()),
-                font,
-                root_font_size,
-                styles,
-                resolution,
-            )?,
-        },
+        MaxSize::LengthPercentage(lp) => {
+            length_percentage_to_preferred(lp, font, root_font_size, styles, resolution)?
+        }
         _ => PreferredSize::Auto,
     })
 }
@@ -564,12 +429,10 @@ pub(in crate::style::cascade::resolver) fn spacing_to_text_spacing(
 ) -> Option<TextSpacing> {
     match spacing {
         Spacing::Normal => Some(TextSpacing::ZERO),
-        Spacing::Length(len) => match len {
-            Length::Value(v) => length_to_px(v, font_size, root_font_size, resolution)
-                .and_then(TextSpacing::from_px),
-            Length::Calc(calc) => calc_length_to_px(calc, font_size, root_font_size, resolution)
-                .and_then(TextSpacing::from_px),
-        },
+        Spacing::Length(len) => {
+            length_to_px_from_length(len, font_size, root_font_size, resolution)
+                .and_then(TextSpacing::from_px)
+        }
     }
 }
 
@@ -579,37 +442,28 @@ pub(in crate::style::cascade::resolver) fn calc_length_to_px(
     root_font_size: f32,
     resolution: &ResolutionContext,
 ) -> Option<f32> {
+    let resolve = |value| calc_length_to_px(value, font_size, root_font_size, resolution);
     match calc {
-        Calc::Value(length) => match length.as_ref() {
-            Length::Value(value) => length_to_px(value, font_size, root_font_size, resolution),
-            Length::Calc(nested) => {
-                calc_length_to_px(nested, font_size, root_font_size, resolution)
-            }
-        },
-        Calc::Number(value) => (*value == 0.0).then_some(0.0),
-        Calc::Sum(left, right) => Some(
-            calc_length_to_px(left, font_size, root_font_size, resolution)?
-                + calc_length_to_px(right, font_size, root_font_size, resolution)?,
-        ),
-        Calc::Product(factor, value) => {
-            Some(*factor * calc_length_to_px(value, font_size, root_font_size, resolution)?)
+        Calc::Value(length) => {
+            length_to_px_from_length(length, font_size, root_font_size, resolution)
         }
+        Calc::Number(value) => (*value == 0.0).then_some(0.0),
+        Calc::Sum(left, right) => Some(resolve(left)? + resolve(right)?),
+        Calc::Product(factor, value) => Some(*factor * resolve(value)?),
         Calc::Function(function) => match function.as_ref() {
-            MathFunction::Calc(value) => {
-                calc_length_to_px(value, font_size, root_font_size, resolution)
-            }
+            MathFunction::Calc(value) => resolve(value),
             MathFunction::Min(values) => values
                 .iter()
-                .map(|value| calc_length_to_px(value, font_size, root_font_size, resolution))
+                .map(resolve)
                 .reduce(|left, right| Some(left?.min(right?)))?,
             MathFunction::Max(values) => values
                 .iter()
-                .map(|value| calc_length_to_px(value, font_size, root_font_size, resolution))
+                .map(resolve)
                 .reduce(|left, right| Some(left?.max(right?)))?,
             MathFunction::Clamp(min, value, max) => {
-                let minimum = calc_length_to_px(min, font_size, root_font_size, resolution)?;
-                let value = calc_length_to_px(value, font_size, root_font_size, resolution)?;
-                let maximum = calc_length_to_px(max, font_size, root_font_size, resolution)?;
+                let minimum = resolve(min)?;
+                let value = resolve(value)?;
+                let maximum = resolve(max)?;
                 // CSS gives the minimum precedence when limits conflict.
                 Some(if minimum.is_nan() || value.is_nan() || maximum.is_nan() {
                     f32::NAN
@@ -617,12 +471,10 @@ pub(in crate::style::cascade::resolver) fn calc_length_to_px(
                     value.min(maximum).max(minimum)
                 })
             }
-            MathFunction::Abs(value) => {
-                Some(calc_length_to_px(value, font_size, root_font_size, resolution)?.abs())
-            }
+            MathFunction::Abs(value) => Some(resolve(value)?.abs()),
             MathFunction::Hypot(values) => {
                 let squared = values.iter().try_fold(0.0, |sum, value| {
-                    let value = calc_length_to_px(value, font_size, root_font_size, resolution)?;
+                    let value = resolve(value)?;
                     Some(sum + value * value)
                 })?;
                 Some(squared.sqrt())
@@ -633,18 +485,14 @@ pub(in crate::style::cascade::resolver) fn calc_length_to_px(
 }
 
 pub(in crate::style::cascade::resolver) fn length_to_px_from_length(
-    length: &lightningcss::values::length::Length,
+    length: &Length,
     font_size: f32,
     root_font_size: f32,
     resolution: &ResolutionContext,
 ) -> Option<f32> {
     match length {
-        lightningcss::values::length::Length::Value(v) => {
-            length_to_px(v, font_size, root_font_size, resolution)
-        }
-        lightningcss::values::length::Length::Calc(value) => {
-            calc_length_to_px(value, font_size, root_font_size, resolution)
-        }
+        Length::Value(v) => length_to_px(v, font_size, root_font_size, resolution),
+        Length::Calc(value) => calc_length_to_px(value, font_size, root_font_size, resolution),
     }
 }
 
@@ -654,7 +502,6 @@ pub(in crate::style::cascade::resolver) fn border_width(
     root_font_size: f32,
     resolution: &ResolutionContext,
 ) -> Option<FontRelativeLength> {
-    use lightningcss::values::length::Length;
     match width {
         BorderSideWidth::Thin => FontRelativeLength::px(1.0),
         BorderSideWidth::Medium => FontRelativeLength::px(3.0),
@@ -683,5 +530,197 @@ pub(in crate::style::cascade::resolver) fn line_style_to_border_style(
         // The 3D styles (and `double`) paint as a plain line rather than
         // disappearing; only `none`/`hidden` suppress the border.
         LineStyle::Double | LineStyle::Inset | LineStyle::Outset => BorderStyle::Solid,
+    }
+}
+
+pub(in crate::style::cascade::resolver) fn length_percentage_to_preferred(
+    value: &LengthPercentage,
+    font: &Font,
+    root_font_size: f32,
+    styles: &mut ComputedStylesBuilder,
+    resolution: &ResolutionContext,
+) -> Option<PreferredSize> {
+    match value {
+        LengthPercentage::Dimension(value) => {
+            preferred_from_length(value, font, root_font_size, resolution)
+        }
+        LengthPercentage::Percentage(value) => Some(PreferredSize::Percent(value.0)),
+        LengthPercentage::Calc(value) => {
+            comparison_preferred_size(value, font.font_size, root_font_size, styles, resolution)
+                .or_else(|| {
+                    let [
+                        absolute_px,
+                        percentage,
+                        x_height_px,
+                        ch_advance_px,
+                        cap_height_px,
+                    ] = calc_box_length_percentage_components(
+                        value,
+                        font.font_size,
+                        root_font_size,
+                        resolution,
+                    )?;
+                    Some(PreferredSize::Calc {
+                        absolute_px,
+                        percentage,
+                        x_height_px,
+                        ch_advance_px,
+                        cap_height_px,
+                        percentage_dependent: calc_depends_on_percentage(value),
+                    })
+                })
+        }
+    }
+}
+
+pub(in crate::style::cascade::resolver) fn comparison_preferred_size(
+    calc: &Calc<LengthPercentage>,
+    font_size: f32,
+    root_font_size: f32,
+    styles: &mut ComputedStylesBuilder,
+    resolution: &ResolutionContext,
+) -> Option<PreferredSize> {
+    let Calc::Function(function) = calc else {
+        return None;
+    };
+    let mut operands = [calc; 3];
+    let (kind, count) = match function.as_ref() {
+        MathFunction::Min(values) | MathFunction::Max(values) => {
+            for (slot, value) in operands.get_mut(..values.len())?.iter_mut().zip(values) {
+                *slot = value;
+            }
+            let kind = if matches!(function.as_ref(), MathFunction::Min(_)) {
+                SizeComparison::Min
+            } else {
+                SizeComparison::Max
+            };
+            (kind, values.len())
+        }
+        MathFunction::Clamp(min, value, max) => {
+            operands = [min, value, max];
+            (SizeComparison::Clamp, 3)
+        }
+        MathFunction::Calc(value) => {
+            return comparison_preferred_size(value, font_size, root_font_size, styles, resolution);
+        }
+        _ => return None,
+    };
+    if count == 0 {
+        return None;
+    }
+    let mut values = [ComputedSizeComponent::default(); 3];
+    for (slot, operand) in values.iter_mut().zip(&operands[..count]) {
+        let [
+            absolute_px,
+            percentage,
+            x_height_px,
+            ch_advance_px,
+            cap_height_px,
+        ] = calc_box_length_percentage_components(operand, font_size, root_font_size, resolution)?;
+        *slot = ComputedSizeComponent {
+            absolute_px,
+            percentage,
+            x_height_px,
+            ch_advance_px,
+            cap_height_px,
+            percentage_dependent: calc_depends_on_percentage(operand),
+        };
+    }
+    styles.intern_size_comparison(kind, values, u8::try_from(count).ok()?)
+}
+
+/// Convert a `<length-percentage>` (e.g. `text-indent`) into a `LengthPct`,
+/// deferring percentage resolution to layout (against the containing-block width).
+pub(in crate::style::cascade::resolver) fn computed_length_pct(
+    value: &LengthPercentage,
+    font_size: f32,
+    root_font_size: f32,
+    resolution: &ResolutionContext,
+) -> Option<LengthPct> {
+    match value {
+        LengthPercentage::Dimension(value) => {
+            length_pct_from_length(value, font_size, root_font_size, resolution)
+        }
+        LengthPercentage::Percentage(value) => Some(LengthPct::Pct(value.0)),
+        LengthPercentage::Calc(value) => {
+            let [
+                absolute_px,
+                percentage,
+                x_height_px,
+                ch_advance_px,
+                cap_height_px,
+            ] = calc_box_length_percentage_components(
+                value,
+                font_size,
+                root_font_size,
+                resolution,
+            )?;
+            let percentage_dependent = calc_depends_on_percentage(value);
+            if !percentage_dependent
+                && x_height_px == 0.0
+                && ch_advance_px == 0.0
+                && cap_height_px == 0.0
+            {
+                return Some(LengthPct::Px(absolute_px));
+            }
+            Some(LengthPct::Calc {
+                absolute_px,
+                percentage,
+                x_height_px,
+                ch_advance_px,
+                cap_height_px,
+                percentage_dependent,
+            })
+        }
+    }
+}
+
+pub(in crate::style::cascade::resolver) fn viewport_length_to_px(
+    length: &LengthValue,
+    resolution: &ResolutionContext,
+) -> Option<f32> {
+    let environment = resolution.environment;
+    let width = environment.viewport_width() as f32;
+    let height = environment.viewport_height().map(|value| value as f32);
+    let resolve = |factor: f32, basis: Option<f32>| {
+        resolution.uses_viewport_units.set(true);
+        let value = factor * basis? / 100.0;
+        value.is_finite().then_some(value)
+    };
+    // The renderer has one static viewport and horizontal writing axes.
+    // It has no eligible size-query containers: container units therefore
+    // use the specified small-viewport fallback on the corresponding axis.
+    match length {
+        LengthValue::Vw(value)
+        | LengthValue::Vi(value)
+        | LengthValue::Svw(value)
+        | LengthValue::Svi(value)
+        | LengthValue::Lvw(value)
+        | LengthValue::Lvi(value)
+        | LengthValue::Dvw(value)
+        | LengthValue::Dvi(value)
+        | LengthValue::Cqw(value)
+        | LengthValue::Cqi(value) => resolve(*value, Some(width)),
+        LengthValue::Vh(value)
+        | LengthValue::Vb(value)
+        | LengthValue::Svh(value)
+        | LengthValue::Svb(value)
+        | LengthValue::Lvh(value)
+        | LengthValue::Lvb(value)
+        | LengthValue::Dvh(value)
+        | LengthValue::Dvb(value)
+        | LengthValue::Cqh(value)
+        | LengthValue::Cqb(value) => resolve(*value, height),
+        LengthValue::Vmin(value)
+        | LengthValue::Svmin(value)
+        | LengthValue::Lvmin(value)
+        | LengthValue::Dvmin(value)
+        | LengthValue::Cqmin(value) => resolve(*value, height.map(|height| width.min(height))),
+        LengthValue::Vmax(value)
+        | LengthValue::Svmax(value)
+        | LengthValue::Lvmax(value)
+        | LengthValue::Dvmax(value)
+        | LengthValue::Cqmax(value) => resolve(*value, height.map(|height| width.max(height))),
+        _ => None,
     }
 }

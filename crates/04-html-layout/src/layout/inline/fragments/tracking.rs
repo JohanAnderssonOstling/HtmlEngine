@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::layout::inline::justification::tracking_boundary_limit;
-use crate::layout::text_placement::tracking_boundary_allowed;
+use html_text::tracking_boundary_allowed;
 
 #[derive(Clone, Copy, Default)]
 struct Prefix {
@@ -39,7 +39,6 @@ impl<'a> TrackingCapacityIndex<'a> {
         prefix.push(counts);
         let mut heights: Vec<HeightRun> = Vec::new();
         let mut previous_glyph = None;
-        let mut text_cursor = engine.text.cursor();
         for (index, token) in tokens.iter().enumerate() {
             let metrics = token.run_metrics(runs);
             let mut unsupported = metrics.white_space.preserves_newlines();
@@ -49,11 +48,7 @@ impl<'a> TrackingCapacityIndex<'a> {
                         || metrics.placement_required
                         || !metrics.visible
                         || !matches!(metrics.vertical_align, InlineVerticalAlign::Baseline);
-                    let glyph = engine.text.glyph_at(glyph_idx as usize).unwrap_or_default();
-                    let character = text_cursor
-                        .glyph_metric(glyph)
-                        .expect("registered text metric")
-                        .ch();
+                    let character = engine.text.character(glyph_idx);
                     if let Some((previous, previous_character)) = previous_glyph {
                         if previous + 1 != glyph_idx {
                             counts.gaps += 1;

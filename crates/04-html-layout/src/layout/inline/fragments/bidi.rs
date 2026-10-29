@@ -1,5 +1,5 @@
 //! Visual placement after logical line breaking (UAX #9 rules L1–L3).
-use crate::layout::text_placement::spaced_advance;
+use html_text::spaced_advance;
 use html_text::is_bidi_control;
 
 use super::*;
@@ -32,7 +32,7 @@ pub(super) fn place_visual_line(
             for (token, placement) in span.iter().zip(&mut placements) {
                 placement.x += adjustment;
                 if let InlineTokenKind::Glyph { glyph_idx } = token.kind() {
-                    let character = engine.text.glyph_metric(engine.text.glyph_at(glyph_idx as usize).unwrap_or_default()).ch();
+                    let character = engine.text.character(glyph_idx);
                     let advance = layout.punctuation_space_advances.iter()
                         .find(|&&(index, _)| index == glyph_idx).map(|&(_, advance)| f64::from(advance))
                         .unwrap_or_else(|| spaced_advance(
@@ -76,12 +76,7 @@ pub(super) fn place_visual_line(
     let mut reset = true;
     for (index, token) in span.iter().enumerate().rev() {
         let class = match token.kind() {
-            InlineTokenKind::Glyph { glyph_idx } => bidi_class(
-                engine
-                    .text
-                    .glyph_metric(engine.text.glyph_at(glyph_idx as usize).unwrap_or_default())
-                    .ch(),
-            ),
+            InlineTokenKind::Glyph { glyph_idx } => bidi_class(engine.text.character(glyph_idx)),
             InlineTokenKind::InlineBoundary { .. }
             | InlineTokenKind::Opportunity
             | InlineTokenKind::AbsoluteAnchor { .. }
@@ -132,11 +127,7 @@ pub(super) fn place_visual_line(
             placements[index].advance += token.discretionary_width();
         }
         let combining = match token.kind() {
-            InlineTokenKind::Glyph { glyph_idx } => engine
-                .text
-                .glyph_metric(engine.text.glyph_at(glyph_idx as usize).unwrap_or_default())
-                .ch()
-                .is_mark(),
+            InlineTokenKind::Glyph { glyph_idx } => engine.text.character(glyph_idx).is_mark(),
             _ => false,
         };
         let joins = matches!(token.kind(), InlineTokenKind::Glyph { .. })
@@ -149,10 +140,7 @@ pub(super) fn place_visual_line(
             clusters.push(index..index + 1);
         }
         if let InlineTokenKind::Glyph { glyph_idx } = token.kind() {
-            let character = engine
-                .text
-                .glyph_metric(engine.text.glyph_at(glyph_idx as usize).unwrap_or_default())
-                .ch();
+            let character = engine.text.character(glyph_idx);
             let space = layout
                 .punctuation_space_advances
                 .iter()
@@ -233,7 +221,7 @@ fn place_inline_edges(
                     return false;
                 }
                 if let InlineTokenKind::Glyph { glyph_idx } = token.kind() {
-                    let character = engine.text.glyph_metric(engine.text.glyph_at(glyph_idx as usize).unwrap_or_default()).ch();
+                    let character = engine.text.character(glyph_idx);
                     if is_bidi_control(character) {
                         return false;
                     }

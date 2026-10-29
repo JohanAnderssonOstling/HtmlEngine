@@ -1,6 +1,7 @@
 //! Packed token storage with scoped read views. Arena writes occur after
 //! borrowed views end; transformations copy only the slice they change.
 
+use std::borrow::Cow;
 use std::ops::{Deref, DerefMut};
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -15,82 +16,68 @@ impl ArenaRange {
     }
 }
 
-enum BufferStorage<'a, T> {
-    Owned(Vec<T>),
-    Borrowed(&'a [T]),
-}
+pub(super) struct TokenBuffer<'a, T: Clone>(Cow<'a, [T]>);
 
-pub(super) struct TokenBuffer<'a, T>(BufferStorage<'a, T>);
-
-impl<T> Default for TokenBuffer<'_, T> {
+impl<T: Clone> Default for TokenBuffer<'_, T> {
     fn default() -> Self {
-        Self(BufferStorage::Owned(Vec::new()))
+        Self(Cow::Owned(Vec::new()))
     }
 }
 
-impl<T> From<Vec<T>> for TokenBuffer<'_, T> {
+impl<T: Clone> From<Vec<T>> for TokenBuffer<'_, T> {
     fn from(values: Vec<T>) -> Self {
-        Self(BufferStorage::Owned(values))
+        Self(Cow::Owned(values))
     }
 }
 
-impl<T> FromIterator<T> for TokenBuffer<'_, T> {
+impl<T: Clone> FromIterator<T> for TokenBuffer<'_, T> {
     fn from_iter<I: IntoIterator<Item = T>>(values: I) -> Self {
         Vec::from_iter(values).into()
     }
 }
 
-impl<T> Deref for TokenBuffer<'_, T> {
+impl<T: Clone> Deref for TokenBuffer<'_, T> {
     type Target = [T];
     #[inline]
     fn deref(&self) -> &[T] {
-        match &self.0 {
-            BufferStorage::Owned(values) => values,
-            BufferStorage::Borrowed(values) => values,
-        }
+        &self.0
     }
 }
 
-impl<T> TokenBuffer<'_, T> {
+impl<T: Clone> TokenBuffer<'_, T> {
     /// Arena storage is accounted for by its owner, not by borrowed views.
     pub(super) fn capacity(&self) -> usize {
         match &self.0 {
-            BufferStorage::Owned(values) => values.capacity(),
-            BufferStorage::Borrowed(_) => 0,
+            Cow::Owned(values) => values.capacity(),
+            Cow::Borrowed(_) => 0,
         }
     }
 
     pub(super) fn clear(&mut self) {
         match &mut self.0 {
-            BufferStorage::Owned(values) => values.clear(),
-            BufferStorage::Borrowed(_) => *self = Self::default(),
+            Cow::Owned(values) => values.clear(),
+            Cow::Borrowed(_) => *self = Self::default(),
         }
     }
 
-    /// Discard the borrow, retaining storage only when it was changed.
-    pub(super) fn into_owned(self) -> Option<Vec<T>> {
-        match self.0 {
-            BufferStorage::Owned(values) => Some(values),
-            BufferStorage::Borrowed(_) => None,
-        }
+    /// Keep changed working storage; untouched arena views become empty borrows.
+    pub(super) fn into_working(self) -> TokenBuffer<'static, T>
+    where
+        T: 'static,
+    {
+        TokenBuffer(match self.0 {
+            Cow::Owned(values) => Cow::Owned(values),
+            Cow::Borrowed(_) => Cow::Borrowed(&[]),
+        })
     }
 
-    #[cfg(test)]
     pub(super) fn is_borrowed(&self) -> bool {
-        matches!(self.0, BufferStorage::Borrowed(_))
+        matches!(self.0, Cow::Borrowed(_))
     }
-}
 
-impl<T: Clone> TokenBuffer<'_, T> {
     #[inline]
     pub(super) fn make_mut(&mut self) -> &mut Vec<T> {
-        if let BufferStorage::Borrowed(values) = &self.0 {
-            self.0 = BufferStorage::Owned(values.to_vec());
-        }
-        match &mut self.0 {
-            BufferStorage::Owned(values) => values,
-            BufferStorage::Borrowed(_) => unreachable!(),
-        }
+        self.0.to_mut()
     }
     pub(super) fn reserve(&mut self, additional: usize) {
         self.make_mut().reserve(additional);
@@ -116,7 +103,7 @@ impl<T> Default for TokenArena<T> {
     }
 }
 
-impl<T> TokenArena<T> {
+impl<T: Clone> TokenArena<T> {
     pub(super) fn len(&self) -> usize {
         self.data.len()
     }
@@ -124,9 +111,7 @@ impl<T> TokenArena<T> {
         self.data.capacity()
     }
     pub(super) fn view(&self, range: ArenaRange) -> TokenBuffer<'_, T> {
-        TokenBuffer(BufferStorage::Borrowed(
-            &self.data[range.start as usize..range.end()],
-        ))
+        TokenBuffer(Cow::Borrowed(&self.data[range.start as usize..range.end()]))
     }
     pub(super) fn reserve_exact(&mut self, capacity: usize) {
         assert!(self.data.is_empty());
@@ -139,10 +124,15 @@ impl<T> TokenArena<T> {
     pub(super) fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
-}
-
-impl<T: Clone> TokenArena<T> {
-    pub(super) fn store(&mut self, previous: ArenaRange, values: &[T]) -> ArenaRange {
+    pub(super) fn store(
+        &mut self,
+        previous: ArenaRange,
+        values: &TokenBuffer<'_, T>,
+        changed_only: bool,
+    ) -> ArenaRange {
+        if changed_only && values.is_borrowed() {
+            return previous;
+        }
         if values.is_empty() {
             return ArenaRange::default();
         }
@@ -189,7 +179,7 @@ mod tests {
                 clones: &clones,
             })
             .collect();
-        arena.store(ArenaRange::default(), &values);
+        arena.store(ArenaRange::default(), &values.into(), false);
         let range = ArenaRange { start: 10, len: 2 };
         clones.set(0);
         let mut view = arena.view(range);

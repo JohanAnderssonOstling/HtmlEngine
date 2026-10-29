@@ -75,7 +75,7 @@ fn hierarchical_vertical_align_offset(
         if !value.is_initial()
             && !matches!(value, VerticalAlignValue::Top | VerticalAlignValue::Bottom)
         {
-            let own_line_height = resolved_line_height(style);
+            let own_line_height = style.resolved_line_height();
             let ascent = own_line_height * 0.8;
             let descent = own_line_height - ascent;
             let (parent_ascent, parent_descent) = parent_font_content_extents(engine, box_idx);

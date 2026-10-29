@@ -4,7 +4,9 @@
 //! and relational selectors have already contributed their exact matched-rule
 //! identity. DOM-dependent presentational hints stay on the uncached path.
 
-use super::*;
+use super::plan::MatchedRule;
+use html_dom::{Document, DomNodeId};
+use html_style_model::{CounterDirectives, StyleIndices};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxHasher};
 use std::hash::{Hash, Hasher};
 
@@ -64,7 +66,11 @@ fn element_is_shareable(doc: &Document, node: DomNodeId, has_inline_style: bool)
     const OUT_OF_BAND_ATTRIBUTES: &[&str] = &[
         "style", "lang", "dir", "hidden", "text", "color", "size", "width", "height", "bgcolor", "align", "valign", "border", "bordercolor", "type", "clear", "hspace", "vspace", "marginwidth", "marginheight", "topmargin", "rightmargin", "bottommargin", "leftmargin", "cellspacing", "cellpadding", "nowrap", "noshade",
     ];
-    !element.attributes().any(|attribute| OUT_OF_BAND_ATTRIBUTES.iter().any(|name| attribute.local_name().eq_ignore_ascii_case(name)))
+    !element.attributes().any(|attribute| {
+        OUT_OF_BAND_ATTRIBUTES
+            .iter()
+            .any(|name| attribute.local_name().eq_ignore_ascii_case(name))
+    })
 }
 
 impl StyleSharingCache {
@@ -148,6 +154,7 @@ impl StyleSharingCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use html_style_model::ComputedStylesBuilder;
 
     #[test]
     fn exact_rule_and_parent_inputs_share_only_hint_free_elements() {

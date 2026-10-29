@@ -1,14 +1,25 @@
 [package]
 license.workspace = true
-name = "html-style"
-version = "0.1.0"
-edition = "2024"
-publish = false
+name = "skrift-style"
+version.workspace = true
+edition.workspace = true
+publish = ["crates-io"]
+description = "Parses CSS, matches selectors, and resolves styles."
+repository.workspace = true
+homepage.workspace = true
+categories.workspace = true
+keywords.workspace = true
+readme = "README.md"
+include.workspace = true
+documentation = "https://docs.rs/skrift-style"
+
+[lib]
+name = "html_style"
 
 [dependencies]
 cssparser = "0.37"
-html-dom = { path = "../html-dom" }
-html-style-model = { path = "../html-style-model" }
+html-dom = { version = "0.1.0", package = "skrift-dom", path = "../html-dom" }
+html-style-model = { version = "0.1.0", package = "skrift-style-model", path = "../html-style-model" }
 lightningcss.workspace = true
 parcel_selectors.workspace = true
 rustc_data_structures = "0.1.2"
@@ -16,5 +27,5 @@ static-self = "0.1.2"
 web-time = "1"
 
 [dev-dependencies]
-html-parse = { path = "../02-html-parse" }
+html-parse = { package = "skrift-parse", path = "../02-html-parse" }
 html-wpt-test-support = { path = "../../test-support/html-wpt" }

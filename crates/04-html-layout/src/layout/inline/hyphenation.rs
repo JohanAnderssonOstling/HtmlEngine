@@ -1,4 +1,4 @@
-use super::{InlineItem, InlineItemKind, inline_item_ownership_box, run_belongs_to_inline_context};
+use super::{InlineItem, InlineItemKind};
 use crate::layout::LayoutEngine;
 use html_style_model::{ContentLanguage, Hyphens, LineBreak, WordBreak};
 use hypher::Lang as HyphenationLanguage;
@@ -106,9 +106,7 @@ pub(super) fn automatic_hyphen_breaks(
     let mut group = TextGroup::default();
     let mut policies = Vec::new();
     for run in runs {
-        if !inline_item_ownership_box(engine, run).is_some_and(|box_idx| {
-            run_belongs_to_inline_context(engine, box_idx, container_box_idx)
-        }) {
+        if !engine.reader.inline_item_belongs_to_context(run, container_box_idx) {
             group.flush(engine, &policies, &mut breaks);
             continue;
         }
@@ -142,8 +140,7 @@ pub(super) fn automatic_hyphen_breaks(
                 && engine.text.hyphen_glyph(run.box_idx as usize).is_some(),
         });
         for glyph in glyphs.clone() {
-            let id = engine.text.glyph_at(glyph as usize).unwrap_or_default();
-            group.text.push(engine.text.glyph_metric(id).ch());
+            group.text.push(engine.text.character(glyph));
             group.source.push(SourceCharacter {
                 byte_end: group.text.len(),
                 glyph,

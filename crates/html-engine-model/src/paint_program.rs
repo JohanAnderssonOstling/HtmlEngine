@@ -48,15 +48,50 @@ impl PaintOperation {
 #[derive(Clone, Copy)]
 pub struct PaintCommand {
     pub operation: PaintOperation,
-    pub layers: u8,
+    pub layers: PaintLayers,
+    /// Stable line ID, or `u32::MAX` for a line-independent operation.
     pub line: u32,
     pub paint_order: u32,
     group: u32,
 }
 
-pub const POSITIONED: u8 = 1;
-pub const NEGATIVE: u8 = 2;
-pub const INDEPENDENT: u8 = 4;
+const POSITIONED: u8 = 1;
+const NEGATIVE: u8 = 2;
+const INDEPENDENT: u8 = 4;
+
+/// Shared layer flags for retained commands, published lines and decorations.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PaintLayers(u8);
+
+impl PaintLayers {
+    pub fn positioned(negative: bool, independent: bool) -> Self {
+        Self(
+            POSITIONED
+                | if negative { NEGATIVE } else { 0 }
+                | if independent { INDEPENDENT } else { 0 },
+        )
+    }
+
+    pub fn include(&mut self, layers: Self) {
+        self.0 |= layers.0;
+    }
+
+    pub fn is_positioned(self) -> bool {
+        self.0 & POSITIONED != 0
+    }
+
+    pub fn is_negative(self) -> bool {
+        self.0 & NEGATIVE != 0
+    }
+
+    pub fn is_independent(self) -> bool {
+        self.0 & INDEPENDENT != 0
+    }
+
+    pub fn for_decoration(self, foreground: bool) -> Self {
+        Self(self.0 & if foreground { !INDEPENDENT } else { u8::MAX })
+    }
+}
 
 #[derive(Clone, Default)]
 pub struct PaintProgram {
@@ -75,7 +110,7 @@ impl PaintProgram {
         self.commands.push(PaintCommand {
             operation,
             group,
-            layers: 0,
+            layers: PaintLayers::default(),
             line: u32::MAX,
             paint_order: u32::MAX,
         });
@@ -84,14 +119,6 @@ impl PaintProgram {
         for command in &mut self.commands[start..] {
             command.line = u32::try_from(line).expect("paint line index exceeds capacity");
             command.paint_order = paint_order;
-        }
-    }
-    pub fn remap_lines(&mut self, mapping: &[usize]) {
-        for command in &mut self.commands {
-            if command.line != u32::MAX {
-                command.line = u32::try_from(mapping[command.line as usize])
-                    .expect("paint line index exceeds capacity");
-            }
         }
     }
     pub fn publish(&mut self, offsets: &[Vec2]) {

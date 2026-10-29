@@ -119,10 +119,14 @@ fn optical_margin_protrusion(
         return (0.0, 0.0);
     }
     let visible = |index: u32| {
+        let character = engine.text.character(index);
+        if character.is_whitespace() || character == '\u{00ad}' {
+            return None;
+        }
         let metric = engine
             .text
             .glyph_metric(engine.text.glyph_at(index as usize).unwrap_or_default());
-        (!metric.ch().is_whitespace() && metric.ch() != '\u{00ad}').then_some((index, metric))
+        Some((index, metric))
     };
     let (first, last) = if summary.glyph_range.clone().any(|index| engine.text.bidi_level(index) % 2 == 1) {
         use unicode_bidi::{BidiInfo, Level};
@@ -137,9 +141,10 @@ fn optical_margin_protrusion(
         let Some((index, metric)) = entry else {
             return 0.0;
         };
+        let character = engine.text.character(index);
         let character = if engine.text.bidi_level(index) % 2 == 1 {
-            unicode_bidi_mirroring::get_mirrored(metric.ch()).unwrap_or(metric.ch())
-        } else { metric.ch() };
+            unicode_bidi_mirroring::get_mirrored(character).unwrap_or(character)
+        } else { character };
         let fraction = match (start, character) {
             (true, '“' | '‘' | '"' | '\'') | (false, '”' | '’' | '"' | '\'') => 0.65,
             (true, '«' | '‹') | (false, '»' | '›') => 0.5,

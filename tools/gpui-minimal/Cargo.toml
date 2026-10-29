@@ -7,7 +7,7 @@ publish = false
 [workspace]
 
 [dependencies]
-html = { package = "html-engine", path = "../../crates/html" }
+html = { version = "0.1.0", package = "skrift", path = "../../crates/html" }
 gpui = { path = "../../../GPUI-Fork/crates/gpui", default-features = false, features = ["font-kit", "wayland", "x11", "windows-manifest"] }
 gpui_platform = { path = "../../../GPUI-Fork/crates/gpui_platform", features = ["wayland", "x11"] }
 kurbo = "0.11.3"

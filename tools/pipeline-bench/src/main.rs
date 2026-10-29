@@ -182,7 +182,7 @@ struct Shaper {
     register_runs: bool,
     append_checkpoint: Option<usize>,
     generation: GlyphResourceGeneration,
-    cache: HashMap<(char, u32, u32), GlyphId>,
+    cache: HashMap<(char, u32), GlyphId>,
     calls: usize,
 }
 impl GlyphShaper for Shaper {
@@ -208,11 +208,7 @@ impl GlyphShaper for Shaper {
     }
     fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
         self.calls += 1;
-        let key = (
-            request.character,
-            request.font_size.to_bits(),
-            request.color,
-        );
+        let key = (request.character, request.font_size.to_bits());
         let metric = GlyphMetric::try_new(
             request.character,
             request.font_size * 0.5,
@@ -254,7 +250,7 @@ impl GlyphShaper for Shaper {
             }
             return Ok(Some(geometry));
         }
-        for (index, (glyph, ch)) in glyphs.iter_mut().zip(request.text().chars()).enumerate() {
+        for (glyph, ch) in glyphs.iter_mut().zip(request.text().chars()) {
             *glyph = resources.shape_glyph(
                 self,
                 GlyphRequest {
@@ -262,9 +258,7 @@ impl GlyphShaper for Shaper {
                     font_size: style.font_size(),
                     font_weight: style.font_weight(),
                     font_slant: style.font_slant(),
-                    color: request
-                        .paint_colors()
-                        .map_or(style.color(), |colors| colors[index]),
+
                     font_family: style.font_family(),
                 },
             )?;
@@ -423,22 +417,14 @@ fn source_fingerprint(doc: &html::layout::LaidOutDocument, resources: &GlyphReso
 }
 fn text_color_fingerprint(
     document: &html::layout::LaidOutDocument,
-    shaper: &Shaper,
     resources: &GlyphResourceStore,
 ) -> u64 {
-    let mut glyph_colors = HashMap::new();
-    for (&(_, _, color), &glyph) in &shaper.cache {
-        glyph_colors.insert(glyph, color);
-    }
     let text = document.render_view(resources).text();
     let mut hash = 0xcbf29ce484222325u64;
     for index in 0..text.glyph_count() {
-        let glyph = text.glyph_at(index).unwrap();
-        let color = text.paint_color_at(index as u32).unwrap_or_else(|| {
-            text.paint_handle(glyph)
-                .and_then(|handle| glyph_colors.get(&handle).copied())
-                .unwrap_or_default()
-        });
+        let color = text
+            .paint_color_at(index as u32)
+            .expect("styled text has a resolved foreground");
         hash = (hash ^ u64::from(color)).wrapping_mul(0x100000001b3);
     }
     hash
@@ -591,7 +577,7 @@ fn main() {
             .unwrap();
         println!(
             "{}",
-            json!({"case":case,"chapter":path.rsplit('/').next().unwrap(),"glyphs":doc.render_view(&doc_resources).text().glyph_count(),"lines":doc.render_view(&doc_resources).text().line_count(),"render_fingerprint":format!("{:016x}",layout_fingerprint(&doc, &doc_resources)),"source_fingerprint":format!("{:016x}",source_fingerprint(&doc, &doc_resources)),"text_color_fingerprint":format!("{:016x}",text_color_fingerprint(&doc,&shaper, &doc_resources))})
+            json!({"case":case,"chapter":path.rsplit('/').next().unwrap(),"glyphs":doc.render_view(&doc_resources).text().glyph_count(),"lines":doc.render_view(&doc_resources).text().line_count(),"render_fingerprint":format!("{:016x}",layout_fingerprint(&doc, &doc_resources)),"source_fingerprint":format!("{:016x}",source_fingerprint(&doc, &doc_resources)),"text_color_fingerprint":format!("{:016x}",text_color_fingerprint(&doc, &doc_resources))})
         );
         return;
     }
@@ -767,7 +753,7 @@ fn main() {
         .into_iter()
         .map(|(label, (bytes, count))| json!({"label":label,"bytes":bytes,"count":count}))
         .collect();
-    let output = json!({"case":case,"chapter":path.rsplit('/').next().unwrap(),"samples":count,"font_backend":"deterministic mock","heap_instrumented":cfg!(feature="heap"),"reader_borrows_layout":true,"image_metric":image_metric,"paragraph_cache":paragraph_cache,"memory_breakdown":memory_breakdown,"wall_median_ms":median(&mut walls),"cpu_median_ms":median(&mut cpus),"user_instructions":if instructions.len()==count {Some(median(&mut instructions) as u64)} else {None},"heap_live_bytes":median(&mut retained) as usize,"heap_peak_bytes":median(&mut peaks) as usize,"allocation_requests":median(&mut allocations) as usize,"allocated_bytes":median(&mut allocated_bytes) as usize,"rss_peak_bytes":rss,"reported_document_bytes":reported,"glyphs":doc.render_view(session.glyph_resources()).text().glyph_count(),"lines":doc.render_view(session.glyph_resources()).text().line_count(),"render_fingerprint":format!("{:016x}",layout_fingerprint(doc, session.glyph_resources())),"text_color_fingerprint":format!("{:016x}",text_color_fingerprint(doc,&shaper, session.glyph_resources())),"source_fingerprint":format!("{:016x}",source_fingerprint(doc, session.glyph_resources()))});
+    let output = json!({"case":case,"chapter":path.rsplit('/').next().unwrap(),"samples":count,"font_backend":"deterministic mock","heap_instrumented":cfg!(feature="heap"),"reader_borrows_layout":true,"image_metric":image_metric,"paragraph_cache":paragraph_cache,"memory_breakdown":memory_breakdown,"wall_median_ms":median(&mut walls),"cpu_median_ms":median(&mut cpus),"user_instructions":if instructions.len()==count {Some(median(&mut instructions) as u64)} else {None},"heap_live_bytes":median(&mut retained) as usize,"heap_peak_bytes":median(&mut peaks) as usize,"allocation_requests":median(&mut allocations) as usize,"allocated_bytes":median(&mut allocated_bytes) as usize,"rss_peak_bytes":rss,"reported_document_bytes":reported,"glyphs":doc.render_view(session.glyph_resources()).text().glyph_count(),"lines":doc.render_view(session.glyph_resources()).text().line_count(),"render_fingerprint":format!("{:016x}",layout_fingerprint(doc, session.glyph_resources())),"text_color_fingerprint":format!("{:016x}",text_color_fingerprint(doc, session.glyph_resources())),"source_fingerprint":format!("{:016x}",source_fingerprint(doc, session.glyph_resources()))});
     let mut output = output;
     if args.get(5).is_some_and(|argument| argument == "geometry") {
         output["geometry"] = geometry::snapshot(doc, session.glyph_resources());

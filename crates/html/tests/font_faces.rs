@@ -87,8 +87,7 @@ fn independent_reader_fonts_reach_portable_shaping_for_mixed_text() {
                 request.font_size * 0.5,
                 request.font_size * 0.8,
                 request.font_size * 0.2,
-            )
-            .map_err(ShapeError::rejected_metric)?;
+            )?;
             Ok(ShapedGlyph::from_metric(request.character as u32, metric))
         }
     }
@@ -100,29 +99,36 @@ fn independent_reader_fonts_reach_portable_shaping_for_mixed_text() {
             cjk_font_fallback: Some("Embedded".into()),
             ..Default::default()
         });
-        let prepared = factory.parse_with_new_pipeline(
+        for source in [
             "<p style='font-family:Publisher'>Latin 漢字 かな 한국</p>",
-            None,
-        );
-        let mut shaper = Recorder::default();
-        let mut resources = GlyphResourceStore::default();
-        prepared.shape(&mut shaper, &mut resources).unwrap();
-        for character in ['L', 'a'] {
-            assert!(shaper.selected.iter().any(
-                |(ch, family)| *ch == character && family.as_deref() == Some("Selected Latin")
-            ));
-        }
-        let expected = format!("{}, Embedded", cjk.unwrap_or("Publisher"));
-        for character in ['漢', '字', 'か', '한'] {
-            assert!(
+            "<pre style='font-family:Publisher'>Latin\n漢字 かな 한국</pre>",
+        ] {
+            let prepared = factory.parse_with_new_pipeline(source, None);
+            let mut shaper = Recorder::default();
+            let mut resources = GlyphResourceStore::default();
+            prepared.shape(&mut shaper, &mut resources).unwrap();
+            assert_eq!(
                 shaper
                     .selected
                     .iter()
-                    .any(|(ch, family)| *ch == character
-                        && family.as_deref() == Some(expected.as_str())),
-                "{character}: {:?}",
-                shaper.selected
+                    .any(|(character, _)| *character == '\n'),
+                source.contains('\n'),
             );
+            for character in ['L', 'a'] {
+                assert!(
+                    shaper.selected.iter().any(|(ch, family)| *ch == character
+                        && family.as_deref() == Some("Selected Latin"))
+                );
+            }
+            let expected = format!("{}, Embedded", cjk.unwrap_or("Publisher"));
+            for character in ['漢', '字', 'か', '한'] {
+                assert!(
+                    shaper.selected.iter().any(|(ch, family)| *ch == character
+                        && family.as_deref() == Some(expected.as_str())),
+                    "{character}: {:?}",
+                    shaper.selected
+                );
+            }
         }
     }
     let mut engine = Engine::new(Arc::new(FileSystemProvider::new()));
@@ -157,4 +163,66 @@ fn independent_reader_fonts_reach_portable_shaping_for_mixed_text() {
             shaper.selected
         );
     }
+}
+
+#[test]
+fn mirrored_cjk_glyphs_keep_selected_fonts_and_first_line_typography() {
+    use html::layout::LayoutConstraints;
+    use html::pipeline::{DocumentFactory, ReaderStyleOverrides};
+    use html::text::{
+        FontSlant, GlyphMetric, GlyphRequest, GlyphResourceStore, GlyphResources, ResourceShaper,
+        ShapedGlyph,
+    };
+
+    type Selection = (char, f32, u16, FontSlant, Option<String>);
+    let mut shaper = ResourceShaper::new(
+        |request: GlyphRequest<'_>, native: &mut GlyphResources<Selection>| {
+            let handle = native.insert((
+                request.character,
+                request.font_size,
+                request.font_weight,
+                request.font_slant,
+                request.font_family.map(str::to_owned),
+            ))?;
+            let metric = GlyphMetric::try_new(
+                request.character,
+                request.font_size * 0.5,
+                request.font_size * 0.8,
+                request.font_size * 0.2,
+            )?;
+            Ok(ShapedGlyph::from_metric(handle, metric))
+        },
+    );
+    let mut factory = DocumentFactory::new();
+    factory.set_reader_overrides(ReaderStyleOverrides {
+        font_family: Some("Latin".into()),
+        cjk_font_family: Some("CJK".into()),
+        ..Default::default()
+    });
+    let prepared = factory.parse_with_new_pipeline(
+        "<p dir='rtl' style='font-size:16px'>《אב</p>",
+        Some("p::first-line { font-size:32px; font-weight:700; font-style:italic }"),
+    );
+    let mut resources = GlyphResourceStore::default();
+    let shaped = prepared.shape(&mut shaper, &mut resources).unwrap();
+    let selected = |shaper: &ResourceShaper<Selection, _>, size, weight, slant| {
+        (0..).map_while(|id| shaper.resources().get(id)).any(
+            |(character, font_size, font_weight, font_slant, family)| {
+                *character == '》'
+                    && *font_size == size
+                    && *font_weight == weight
+                    && *font_slant == slant
+                    && family.as_deref() == Some("CJK")
+            },
+        )
+    };
+    assert!(selected(&shaper, 16.0, 400, FontSlant::Normal));
+    shaped
+        .layout_with_shaper(
+            LayoutConstraints::new(600.0, 16.0).unwrap(),
+            &mut shaper,
+            &mut resources,
+        )
+        .unwrap();
+    assert!(selected(&shaper, 32.0, 700, FontSlant::Italic));
 }

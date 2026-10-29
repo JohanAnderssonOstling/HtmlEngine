@@ -1,4 +1,6 @@
+use super::block::MarginStrut;
 use html_style_model::UsedStyleView;
+use kurbo::Size;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct UsedBorderInsets {
@@ -66,6 +68,15 @@ impl ResolvedBoxModel {
         self
     }
 
+    /// Clamp percentage/calc padding after resolving it against the inline size.
+    pub fn with_nonnegative_padding(mut self) -> Self {
+        self.padding_top = self.padding_top.max(0.0);
+        self.padding_right = self.padding_right.max(0.0);
+        self.padding_bottom = self.padding_bottom.max(0.0);
+        self.padding_left = self.padding_left.max(0.0);
+        self
+    }
+
     pub fn without_padding(mut self) -> Self {
         self.padding_top = 0.0;
         self.padding_right = 0.0;
@@ -104,5 +115,59 @@ impl ResolvedBoxModel {
 
     pub fn vertical_padding_border(self) -> f64 {
         self.vertical_padding() + self.vertical_border()
+    }
+}
+
+#[must_use = "box metrics and output ranges belong to one execution context"]
+pub struct BoxLayoutResult<Output = super::OutputRanges> {
+    pub size: Size,
+    pub natural_content_size: Size,
+    pub first_baseline: Option<f64>,
+    pub last_baseline: Option<f64>,
+    pub(crate) after_margin: MarginStrut,
+    /// Final layout retains its placement ranges; probes return `()` here.
+    pub output: Output,
+    /// Current float-context bottom relative to this box's origin. Isolated
+    /// probes use it to encompass escaping floats without changing box size.
+    pub(super) float_context_bottom: f64,
+}
+
+impl BoxLayoutResult {
+    pub(super) fn without_output(self) -> BoxLayoutResult<()> {
+        BoxLayoutResult {
+            size: self.size,
+            natural_content_size: self.natural_content_size,
+            first_baseline: self.first_baseline,
+            last_baseline: self.last_baseline,
+            after_margin: self.after_margin,
+            output: (),
+            float_context_bottom: self.float_context_bottom,
+        }
+    }
+}
+
+impl<Output> BoxLayoutResult<Output> {
+    pub fn size_with_floats(&self) -> Size {
+        Size::new(
+            self.size.width,
+            self.size.height.max(self.float_context_bottom),
+        )
+    }
+}
+
+/// Formatting contexts return content metrics before the box model is applied.
+#[derive(Default)]
+pub(crate) struct ContentLayoutResult {
+    pub size: Size,
+    pub first_baseline: Option<f64>,
+    pub after_margin: Option<MarginStrut>,
+}
+
+impl From<Size> for ContentLayoutResult {
+    fn from(size: Size) -> Self {
+        Self {
+            size,
+            ..Self::default()
+        }
     }
 }

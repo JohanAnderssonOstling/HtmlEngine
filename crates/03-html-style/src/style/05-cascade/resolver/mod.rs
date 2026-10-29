@@ -3,136 +3,54 @@
 //! Per-target work flows through `CascadePlan`, custom-property resolution,
 //! the shared cascade runner, property-family application, and style interning.
 
+use crate::style::compiled::CompiledStyles;
+use crate::style::environment::MediaQuerySet;
 use crate::style::matching::dom::{PseudoTarget, selector_matches_dom_pseudo_in_scope};
-use crate::style::matching::selectors::{AncestorFilter, CandidateDeduper, SelectorIndex};
-use crate::style::rules::prepared::{
-    CascadeOrigin, EffectiveRuleId, PreparedPropertyTarget, PreparedRuleSet, RulePriority,
-    compile_property_targets,
-};
-use crate::style::rules::program::ParsedInlineStyleCache;
-use crate::style::syntax::property_id::RendererPropertyId;
-use crate::style::syntax::values::tab_size::{
-    CASCADE_MARKER as TAB_SIZE_CASCADE_MARKER, ParsedTabSize, parse as parse_tab_size,
-};
-use crate::style::syntax::values::text_spacing::{
-    LETTER_SPACING_MARKER, ParsedSpacing, WORD_SPACING_MARKER, parse as parse_text_spacing,
-};
-use crate::style::syntax::values::white_space::{
-    CASCADE_MARKER as WHITE_SPACE_CASCADE_MARKER, from_marker_tokens,
+use crate::style::matching::scope::scope_match;
+use crate::style::matching::selectors::{AncestorFilter, CandidateDeduper};
+use crate::style::source::inline::InlineStyles;
+use context::ResolutionContext;
+use custom_properties::{
+    CustomCascadeCache, CustomCascadeProbe, CustomCascadeSignature, cascade_custom_properties,
+    effective_custom_properties,
 };
 use html_dom::{Document, DomNodeId};
-use html_style_model::{
-    AspectRatio as ComputedAspectRatio, Background, Border, BorderRadii, BorderStyle, BoxModel,
-    BoxSizing, Clear, ComputedSizeComponent, ComputedStyleValueError,
-    ComputedStyles, ComputedStylesBuilder, ContentAlignment, CornerRadius, CounterDirective,
-    CounterDirectives, CounterStyle, DecorationColor, Display, FlexDirection, FlexWrap, Float,
-    Font, FontRelativeLength, FontStyle, GeneratedContent, GeneratedContentItem, GridAutoFlow,
-    GridPlacement, GridPlacementRange, GridRepeatCount, GridTemplateArea, GridTemplateTrack,
-    GridTrackBreadth, GridTrackSize, Hyphens, InheritedText, ItemAlignment, LayoutStyle, LengthPct,
-    LogicalTextAlign, ObjectPosition, ObjectPositionAxis, ObjectPositionOrigin,
-    OpenTypeFeature, OverflowMode, OverflowWrap, PositionMode, PreferredSize, QuoteStyle,
-    ReaderStyleOverrides, SizeComparison, StyleIndices, StyleStringId, TabSize, TextAlign,
-    TextDecorationLines, TextDecorationStyle, TextDecorationThickness, TextDirection, TextOverflow,
-    TextSpacing, TextTransform, VerticalAlignValue, Visibility, WhiteSpace, WordBreak,
-};
-use lightningcss::printer::{Printer, PrinterOptions};
-use lightningcss::properties::border::{BorderSideWidth, LineStyle};
-use lightningcss::properties::custom::{Token, TokenList, TokenOrValue, Variable};
-use lightningcss::properties::font::LineHeight as CssLineHeight;
-use lightningcss::properties::font::{
-    AbsoluteFontWeight, Font as CssFont, FontFamily, FontSize, FontWeight, VerticalAlign,
-    VerticalAlignKeyword,
-};
-use lightningcss::properties::overflow::{OverflowKeyword, TextOverflow as CssTextOverflow};
-use lightningcss::properties::size::{MaxSize, Size};
-use lightningcss::properties::text::Spacing;
-use lightningcss::properties::{CSSWideKeyword, Property, PropertyId};
-use lightningcss::stylesheet::{ParserOptions, StyleAttribute};
-use lightningcss::traits::{Parse, ToCss};
-use lightningcss::values::calc::{Calc, MathFunction};
-use lightningcss::values::color::{CssColor, SystemColor};
-use lightningcss::values::length::{Length, LengthPercentage, LengthPercentageOrAuto, LengthValue};
-use lightningcss::values::size::Size2D;
-use lightningcss::visitor::{Visit, Visitor};
+use html_style_model::{ComputedStyles, ComputedStylesBuilder, ReaderStyleOverrides, StyleIndices};
+use lightningcss::properties::custom::TokenList;
+use lightningcss::stylesheet::StyleAttribute;
+use local_matching::{LocalMatchCache, LocalMatchProbe};
+use plan::{CascadePlan, MatchedRule};
+use runner::CascadeInputs;
 use rustc_data_structures::fx::FxHashMap;
-use std::cell::Cell;
-use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
-use std::convert::Infallible;
-use std::ops::Deref;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use session::{ResolveStyleTimings, StyleResolverContext};
+use specified::{ElementDeclarations, build_cascade_events};
+use state::WorkingStyle;
+use style_sharing::{
+    SharedElementStyle, StyleSharingCache, StyleSharingProbe, StyleSharingSignature,
+};
+use traversal::extend_ancestor_filter_dom;
+use values::default_justify_items;
 use web_time::Instant;
 
+mod context;
 mod custom_properties;
 #[path = "../html_presentational_hints.rs"]
 mod html_presentational_hints;
 mod local_matching;
-mod parent_style;
 mod plan;
 mod properties;
 mod runner;
+mod session;
 mod specified;
 mod state;
 mod style_sharing;
 mod traversal;
-mod tree_counting;
-mod substitution;
-mod random;
 mod values;
 mod wide_keywords;
-
-use custom_properties::*;
-use local_matching::{LocalMatchCache, LocalMatchProbe};
-use parent_style::ParentStyle;
-use plan::*;
-use properties::apply_property_in_phase;
-use runner::{CascadeInputs, CascadePhase};
-use state::{WorkingStyle, initial_border, initial_box_model};
-use style_sharing::{
-    SharedElementStyle, StyleSharingCache, StyleSharingProbe, StyleSharingSignature,
-};
-use traversal::*;
-use tree_counting::TreeCountingContext;
-use random::RandomContext;
-use values::*;
-use wide_keywords::*;
 
 // ============================================================================
 // Style Resolver - applies CSS styles to Document boxes
 // ============================================================================
-/// Resolve styles for all DOM elements
-/// This works with the DOM tree before boxes are created
-#[derive(Clone, Debug, Default)]
-pub(crate) struct ResolveStyleTimings {
-    pub resolver_setup: Duration,
-    pub selector_matching: Duration,
-    pub cascade: Duration,
-    pub style_store: Duration,
-}
-
-pub(super) struct StyleResolverContext<'a, 'css> {
-    pub(super) doc: &'a Document,
-    pub(super) prepared: &'a PreparedRuleSet<'css>,
-    pub(super) author_roots: &'a [Option<DomNodeId>],
-    pub(super) index: &'a SelectorIndex,
-    pub(super) styles: &'a mut ComputedStylesBuilder,
-    pub(super) reader_overrides: &'a ReaderStyleOverrides,
-    pub(super) candidate_scratch: &'a mut Vec<EffectiveRuleId>,
-    pub(super) candidate_seen: &'a mut CandidateDeduper,
-    local_specificity_scratch: &'a mut Vec<Option<u32>>,
-    local_match_cache: &'a mut LocalMatchCache,
-    matched_rule_scratch: &'a mut Vec<MatchedRule>,
-    important_rule_scratch: &'a mut Vec<MatchedRule>,
-    property_targets: &'a mut specified::PropertyTargetState,
-    cascade_scratch: &'a mut specified::CascadeScratch<'a, 'css>,
-    style_sharing_cache: &'a mut StyleSharingCache,
-    validation_style: &'a mut WorkingStyle,
-    resolution: &'a ResolutionContext,
-    tree_counting: TreeCountingContext,
-    random: RandomContext,
-    pub(super) timings: &'a mut ResolveStyleTimings,
-}
 
 enum CustomMapResult<'css> {
     Inherited,
@@ -152,121 +70,15 @@ enum ElementStyleResult<'css> {
     },
 }
 
-fn apply_renderer_markers<'sheet, 'css>(
-    doc: &Document,
-    styles: &ComputedStylesBuilder,
-    style: &mut WorkingStyle,
-    events: &[specified::DeclarationEvent<'sheet, 'css>],
-    inline_style: Option<&StyleAttribute<'css>>,
-    custom_properties: &FxHashMap<String, TokenList<'css>>,
-    parent_custom: &FxHashMap<String, TokenList<'css>>,
-    root_font_size: f32,
-    resolution: &ResolutionContext,
-    tree_counting: &mut TreeCountingContext,
-    random: &RandomContext,
-) {
-    set_marker_resolution_bases(doc, styles, style, resolution);
-    let selected = |name| {
-        selected_renderer_marker(events, inline_style, name, custom_properties, parent_custom, random)
-    };
-    if let Some(value) = selected(WHITE_SPACE_CASCADE_MARKER)
-        .as_ref()
-        .and_then(from_marker_tokens)
-    {
-        style.text.white_space = value;
-    }
-    let mut selected_css = |name| {
-        let css = selected(name).as_ref().and_then(token_list_to_css_string)?;
-        let tree = tree_counting.lower(doc, &css).ok()?;
-        match crate::style::syntax::random_math::for_computation(&tree, |key|random.base(key,name,1)).ok()? {
-            Cow::Borrowed(_) => Some(tree.into_owned()),
-            Cow::Owned(lowered) => Some(lowered),
-        }
-    };
-    for (marker, target) in [
-        (LETTER_SPACING_MARKER, &mut style.text.letter_spacing),
-        (WORD_SPACING_MARKER, &mut style.text.word_spacing),
-    ] {
-        if let Some(spacing) = selected_css(marker)
-            .as_deref()
-            .and_then(parse_text_spacing)
-            .as_ref()
-            .and_then(|parsed| {
-                parsed_text_spacing_to_computed(
-                    parsed,
-                    style.font.font_size,
-                    root_font_size,
-                    resolution,
-                )
-            })
-        {
-            *target = spacing;
-        }
-    }
-    if let Some(tab_size) = selected_css(TAB_SIZE_CASCADE_MARKER)
-        .as_deref()
-        .and_then(parse_tab_size)
-        .as_ref()
-        .and_then(|parsed| {
-            parsed_tab_size_to_computed(parsed, style.font.font_size, root_font_size, resolution)
-        })
-    {
-        style.text.tab_size = tab_size;
-    }
-}
-
-struct ResolutionContext {
-    environment: crate::MediaEnvironment,
-    font_size_scale: f32,
-    uses_viewport_units: Cell<bool>,
-    line_height: Cell<Option<f32>>,
-    root_line_height: Cell<Option<f32>>,
-}
-
-impl ResolutionContext {
-    fn new(environment: crate::MediaEnvironment) -> Self {
-        Self {
-            environment,
-            font_size_scale: 1.0,
-            uses_viewport_units: Cell::new(false),
-            line_height: Cell::new(None),
-            root_line_height: Cell::new(None),
-        }
-    }
-
-    /// Evaluate typography in canonical coordinates before scaling the result.
-    /// Parent and root sizes have already been scaled by earlier resolutions.
-    fn with_canonical_font_sizes<T>(&self, resolve: impl FnOnce(&Self) -> T) -> T {
-        if self.font_size_scale == 1.0 {
-            return resolve(self);
-        }
-        let canonical = Self {
-            environment: self.environment,
-            font_size_scale: 1.0,
-            uses_viewport_units: Cell::new(false),
-            line_height: Cell::new(
-                self.line_height.get().map(|value| value / self.font_size_scale),
-            ),
-            root_line_height: Cell::new(
-                self.root_line_height.get().map(|value| value / self.font_size_scale),
-            ),
-        };
-        let result = resolve(&canonical);
-        if canonical.uses_viewport_units.get() {
-            self.uses_viewport_units.set(true);
-        }
-        result
-    }
-}
-
 pub(crate) fn resolve_styles_for_dom_timed(
     doc: &Document,
-    prepared: &PreparedRuleSet<'static>,
-    index: &SelectorIndex,
+    compiled: &CompiledStyles,
     author_roots: &[Option<DomNodeId>],
-    shared_inline_styles: &Arc<Mutex<ParsedInlineStyleCache>>,
+    inline_styles: &InlineStyles,
     reader_overrides: &ReaderStyleOverrides,
-) -> (ComputedStyles, ResolveStyleTimings) {
+) -> (ComputedStyles, ResolveStyleTimings, MediaQuerySet) {
+    let prepared = &compiled.rules;
+    let index = &compiled.selectors;
     let mut resolution = ResolutionContext::new(prepared.environment());
     resolution.font_size_scale = reader_overrides
         .canonical_font_size
@@ -285,16 +97,14 @@ pub(crate) fn resolve_styles_for_dom_timed(
     let mut style_sharing_cache = StyleSharingCache::default();
     let mut computed_styles = ComputedStylesBuilder::new(doc);
     let mut candidate_scratch = Vec::new();
-    let mut candidate_seen = CandidateDeduper::new(index.rule_count());
+    let mut candidate_seen = CandidateDeduper::new(index.compiled.rule_count());
     let mut local_specificity_scratch = Vec::new();
     let mut local_match_cache = LocalMatchCache::default();
     let mut matched_rule_scratch = Vec::new();
     let mut important_rule_scratch = Vec::new();
-    let mut property_targets = specified::PropertyTargetState::default();
     let mut cascade_scratch = specified::CascadeScratch::default();
-    let mut validation_style = WorkingStyle::default();
+    let mut declaration_style = WorkingStyle::default();
     let mut ancestor_filters = vec![AncestorFilter::default(); doc.node_count()];
-    let inline_styles = InlineStyleCache::new(doc, shared_inline_styles);
     timings.resolver_setup = started.elapsed();
     {
         let mut resolver = StyleResolverContext {
@@ -310,13 +120,10 @@ pub(crate) fn resolve_styles_for_dom_timed(
             local_match_cache: &mut local_match_cache,
             matched_rule_scratch: &mut matched_rule_scratch,
             important_rule_scratch: &mut important_rule_scratch,
-            property_targets: &mut property_targets,
             cascade_scratch: &mut cascade_scratch,
             style_sharing_cache: &mut style_sharing_cache,
-            validation_style: &mut validation_style,
+            declaration_style: &mut declaration_style,
             resolution: &resolution,
-            tree_counting: TreeCountingContext::default(),
-            random: RandomContext::new(doc),
             timings: &mut timings,
         };
         for node_idx in doc.node_ids() {
@@ -324,8 +131,6 @@ pub(crate) fn resolve_styles_for_dom_timed(
             if doc.is_text_node(node_idx) {
                 continue;
             }
-            resolver.tree_counting.begin_element(node_idx);
-            resolver.random.begin_element(node_idx);
 
             let ancestor_filter = if let Some(parent_idx) = doc.get_dom_parent(node_idx) {
                 let mut filter = ancestor_filters[parent_idx.index()];
@@ -389,12 +194,7 @@ pub(crate) fn resolve_styles_for_dom_timed(
                 .styles
                 .set_node_style(node_idx, style_indices)
                 .expect("resolver only assigns styles to nodes from its source document");
-            // Tree positions and element-scoped randomness make a completed
-            // style specific to its originating element.
-            if let Some(signature) = sharing_signature
-                && !resolver.tree_counting.used()
-                && !resolver.random.used_element()
-            {
+            if let Some(signature) = sharing_signature {
                 resolver.style_sharing_cache.insert(
                     signature,
                     style_indices,
@@ -409,125 +209,103 @@ pub(crate) fn resolve_styles_for_dom_timed(
                     .expect("counter directives belong to their originating element");
             }
             let custom_map = &custom_maps[custom_map_id as usize];
-            let first_line = if candidate_pseudo_mask & PseudoTarget::FirstLine.mask() != 0 {
-                resolver
-                    .compute_pseudo_style_for_dom_element(
-                        node_idx,
-                        style_indices,
-                        PseudoTarget::FirstLine,
-                        custom_map,
-                    )
-                    .map(|style| {
-                        style
-                            .intern(resolver.styles)
-                            .expect("pseudo style values should pass validation")
-                    })
-            } else {
-                None
-            };
-            if let Some(style) = first_line {
-                resolver
-                    .styles
-                    .set_first_line_style(node_idx, style)
-                    .expect("pseudo style belongs to its originating element");
-            }
+            let mut first_line = None;
             let mut before_first_letter_parent = None;
-            if candidate_pseudo_mask & PseudoTarget::Before.mask() != 0
-                && let Some(mut style) = resolver.compute_pseudo_style_for_dom_element(
-                    node_idx,
-                    style_indices,
-                    PseudoTarget::Before,
-                    custom_map,
-                )
-                && let Some(content) = style.generated_content.take()
-            {
-                let counters = std::mem::take(&mut style.counters);
-                let style = style
-                    .intern(resolver.styles)
-                    .expect("pseudo style values should pass validation");
-                resolver
-                    .styles
-                    .set_before_style(node_idx, style, content, counters)
-                    .expect("pseudo style belongs to its originating element");
-                before_first_letter_parent = if let Some(first_line) = first_line {
-                    resolver
-                        .compute_pseudo_style_for_dom_element(
-                            node_idx,
-                            first_line,
-                            PseudoTarget::Before,
-                            custom_map,
-                        )
-                        .and_then(|mut style| {
-                            style.generated_content.take().map(|_| {
-                                style
-                                    .intern(resolver.styles)
-                                    .expect("pseudo style values should pass validation")
-                            })
-                        })
+            // First-letter styles need the preceding first-line and generated-before parents.
+            for pseudo in [
+                PseudoTarget::FirstLine,
+                PseudoTarget::Before,
+                PseudoTarget::FirstLetter,
+                PseudoTarget::After,
+            ] {
+                if candidate_pseudo_mask & pseudo.mask() == 0 {
+                    continue;
+                }
+                let parent = if pseudo == PseudoTarget::FirstLetter {
+                    first_line.unwrap_or(style_indices)
                 } else {
-                    Some(style)
+                    style_indices
                 };
-            }
-            let first_letter_parent = first_line.unwrap_or(style_indices);
-            let first_letter = if candidate_pseudo_mask & PseudoTarget::FirstLetter.mask() != 0 {
-                resolver
-                    .compute_pseudo_style_for_dom_element(
-                        node_idx,
-                        first_letter_parent,
-                        PseudoTarget::FirstLetter,
-                        custom_map,
-                    )
-                    .map(|style| {
-                        style
-                            .intern(resolver.styles)
-                            .expect("pseudo style values should pass validation")
-                    })
-            } else {
-                None
-            };
-            if let Some(style) = first_letter {
-                resolver
-                    .styles
-                    .set_first_letter_style(node_idx, style)
-                    .expect("pseudo style belongs to its originating element");
-            }
-            if candidate_pseudo_mask & PseudoTarget::FirstLetter.mask() != 0
-                && let Some(parent) = before_first_letter_parent
-                && let Some(style) = resolver
-                    .compute_pseudo_style_for_dom_element(
-                        node_idx,
-                        parent,
-                        PseudoTarget::FirstLetter,
-                        custom_map,
-                    )
-                    .map(|style| {
-                        style
-                            .intern(resolver.styles)
-                            .expect("pseudo style values should pass validation")
-                    })
-            {
-                resolver
-                    .styles
-                    .set_before_first_letter_style(node_idx, style)
-                    .expect("pseudo style belongs to its originating element");
-            }
-            if candidate_pseudo_mask & PseudoTarget::After.mask() != 0
-                && let Some(mut style) = resolver.compute_pseudo_style_for_dom_element(
-                    node_idx,
-                    style_indices,
-                    PseudoTarget::After,
-                    custom_map,
-                )
-                && let Some(content) = style.generated_content.take()
-            {
+                let Some(mut style) = resolver
+                    .compute_pseudo_style_for_dom_element(node_idx, parent, pseudo, custom_map)
+                else {
+                    continue;
+                };
+                let generated = matches!(pseudo, PseudoTarget::Before | PseudoTarget::After);
+                let content = if generated {
+                    style.generated_content.take()
+                } else {
+                    None
+                };
+                if generated && content.is_none() {
+                    continue;
+                }
                 let counters = std::mem::take(&mut style.counters);
                 let style = style
                     .intern(resolver.styles)
                     .expect("pseudo style values should pass validation");
-                resolver
-                    .styles
-                    .set_after_style(node_idx, style, content, counters)
-                    .expect("pseudo style belongs to its originating element");
+                match (pseudo, counters) {
+                    (PseudoTarget::FirstLine, _) => {
+                        resolver.styles.set_first_line_style(node_idx, style)
+                    }
+                    (PseudoTarget::FirstLetter, _) => {
+                        resolver.styles.set_first_letter_style(node_idx, style)
+                    }
+                    (PseudoTarget::Before, counters) => resolver.styles.set_before_style(
+                        node_idx,
+                        style,
+                        content.unwrap(),
+                        counters,
+                    ),
+                    (PseudoTarget::After, counters) => {
+                        resolver
+                            .styles
+                            .set_after_style(node_idx, style, content.unwrap(), counters)
+                    }
+                }
+                .expect("pseudo style belongs to its originating element");
+                match pseudo {
+                    PseudoTarget::FirstLine => first_line = Some(style),
+                    PseudoTarget::Before => {
+                        before_first_letter_parent = if let Some(first_line) = first_line {
+                            resolver
+                                .compute_pseudo_style_for_dom_element(
+                                    node_idx,
+                                    first_line,
+                                    PseudoTarget::Before,
+                                    custom_map,
+                                )
+                                .and_then(|mut style| {
+                                    style.generated_content.take().map(|_| {
+                                        style
+                                            .intern(resolver.styles)
+                                            .expect("pseudo style values should pass validation")
+                                    })
+                                })
+                        } else {
+                            Some(style)
+                        };
+                    }
+                    PseudoTarget::FirstLetter => {
+                        if let Some(parent) = before_first_letter_parent
+                            && let Some(style) = resolver.compute_pseudo_style_for_dom_element(
+                                node_idx,
+                                parent,
+                                PseudoTarget::FirstLetter,
+                                custom_map,
+                            )
+                        {
+                            let style = style
+                                .intern(resolver.styles)
+                                .expect("pseudo style values should pass validation");
+                            resolver
+                                .styles
+                                .set_before_first_letter_style(node_idx, style)
+                                .expect("pseudo style belongs to its originating element");
+                        }
+                    }
+                    PseudoTarget::After => {}
+                }
             }
             node_custom_map_ids[node_idx.index()] = custom_map_id;
             resolver.timings.style_store += started.elapsed();
@@ -539,10 +317,11 @@ pub(crate) fn resolve_styles_for_dom_timed(
         .finish()
         .expect("resolver must assign a valid computed style to every element");
     timings.style_store += started.elapsed();
+    let mut media_queries = prepared.media_queries().clone();
     if resolution.uses_viewport_units.get() {
-        prepared.media_queries().mark_viewport_unit_dependency();
+        media_queries.mark_viewport_unit_dependency();
     }
-    (styles, timings)
+    (styles, timings, media_queries)
 }
 
 impl<'a, 'css> StyleResolverContext<'a, 'css> {
@@ -553,7 +332,6 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
         pseudo: PseudoTarget,
         inherited_custom_properties: &FxHashMap<String, TokenList<'css>>,
     ) -> Option<WorkingStyle> {
-        self.random.set_pseudo(pseudo.mask());
         let doc = self.doc;
         let prepared = self.prepared;
         let mut matched_rules = std::mem::take(self.matched_rule_scratch);
@@ -563,9 +341,13 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
                 continue;
             }
             let style_rule = prepared.get(id).style_rule();
-            let Some(scope_match) =
-                prepared.scope_match(prepared.get(id).scope(), doc, self.author_roots, node_idx)
-            else {
+            let Some(scope_match) = scope_match(
+                prepared,
+                prepared.get(id).scope(),
+                doc,
+                self.author_roots,
+                node_idx,
+            ) else {
                 continue;
             };
             // Parcel selectors represents the pseudo-to-originating-element hop as
@@ -576,7 +358,7 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
                 .selectors
                 .0
                 .iter()
-                .zip(self.index.prepared_selectors(id))
+                .zip(self.index.compiled.for_rule(id))
             {
                 if selector_matches_dom_pseudo_in_scope(
                     selector,
@@ -585,7 +367,7 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
                     pseudo,
                     scope_match.root,
                 ) {
-                    let matched = self.index.selector_specificity(*prepared_selector);
+                    let matched = prepared_selector.specificity();
                     specificity =
                         Some(specificity.map_or(matched, |current: u32| current.max(matched)));
                 }
@@ -608,41 +390,25 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
             important: important_rules,
         } = CascadePlan::build(matched_rules, self.important_rule_scratch, prepared);
 
-        let inherited = ParentStyle::from_indices(self.styles, inherited_from);
-        let mut style = WorkingStyle {
-            font: inherited.font.clone(),
-            text: inherited.text.clone(),
-            box_model: initial_box_model(),
-            border: initial_border(),
-            radii: BorderRadii::default(),
-            background: Background::default(),
-            layout: LayoutStyle::default(),
-            line_height_spec: None,
-            generated_content: None,
-            counters: CounterDirectives::default(),
-        };
-        inherit_box_model_properties(&mut style.box_model, &inherited.box_model);
-        // Generated pseudo-elements use the CSS initial value of `display`,
-        // which is `inline`.  Ordinary DOM elements commonly become blocks
-        // through the UA sheet, but a pseudo has no element-name UA rule to
-        // override this initial value.
-        style.box_model.display = Display::Inline;
-        let parent_font_size = style.font.font_size;
+        let inherited = WorkingStyle::from_indices(self.styles, inherited_from);
+        // Pseudo-elements retain initial layout values; ordinary elements also
+        // inherit the legacy justify-items behavior from their parent.
+        let mut style =
+            WorkingStyle::inherited(&inherited.font, &inherited.text, &inherited.box_model);
         let mut cascade_scratch = std::mem::take(self.cascade_scratch);
-        let hints_sequence = specified::build_cascade_events(
+        build_cascade_events(
             prepared,
             &matched_rules,
             &important_rules,
-            None,
+            ElementDeclarations::default(),
             &mut cascade_scratch.events,
         );
         *self.matched_rule_scratch = matched_rules;
         *self.important_rule_scratch = important_rules;
         let custom_properties = cascade_custom_properties(
             &cascade_scratch.events.events,
-            None,
+            ElementDeclarations::default(),
             inherited_custom_properties,
-            &self.random,
         );
         let custom_properties =
             effective_custom_properties(&custom_properties, inherited_custom_properties);
@@ -651,30 +417,13 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
             &mut style,
             CascadeInputs {
                 events: &cascade_scratch.events.events,
-                inline_style: None,
-                hints_sequence,
-                parent_font_size,
+                element: ElementDeclarations::default(),
                 custom_properties,
-                parent_custom: inherited_custom_properties,
                 parent: &inherited,
-                presentational_hints_node: None,
             },
-            &mut cascade_scratch.valid_events,
-            &mut cascade_scratch.selection,
+            &mut cascade_scratch.computation,
         );
-        apply_renderer_markers(
-            doc,
-            self.styles,
-            &mut style,
-            &cascade_scratch.events.events,
-            None,
-            custom_properties,
-            inherited_custom_properties,
-            doc.root_font_size(),
-            self.resolution,
-            &mut self.tree_counting,
-            &self.random,
-        );
+
         *self.cascade_scratch = cascade_scratch;
         Some(style)
     }
@@ -728,39 +477,43 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
             let style_rule = prepared.get(id).style_rule();
             let mut specificity = self.local_specificity_scratch[candidate_index];
             if !local_hit {
-                for prepared_selector in index.prepared_selectors(id) {
-                    if !index.selector_is_context_free(*prepared_selector) {
+                for prepared_selector in index.compiled.for_rule(id) {
+                    if !prepared_selector.is_context_free() {
                         continue;
                     }
                     debug_assert!(index.selector_might_match(*prepared_selector, ancestor_filter));
-                    if index.matches_fast_selector(*prepared_selector, doc, node_idx) == Some(true)
-                    {
-                        let matched = index.selector_specificity(*prepared_selector);
+                    if index.compiled.matches(*prepared_selector, doc, node_idx) == Some(true) {
+                        let matched = prepared_selector.specificity();
                         specificity =
                             Some(specificity.map_or(matched, |current| current.max(matched)));
                     }
                 }
                 self.local_specificity_scratch[candidate_index] = specificity;
             }
-            let Some(scope_match) =
-                prepared.scope_match(prepared.get(id).scope(), doc, self.author_roots, node_idx)
-            else {
+            let Some(scope_match) = scope_match(
+                prepared,
+                prepared.get(id).scope(),
+                doc,
+                self.author_roots,
+                node_idx,
+            ) else {
                 continue;
             };
             for (selector, prepared_selector) in style_rule
                 .selectors
                 .0
                 .iter()
-                .zip(index.prepared_selectors(id))
+                .zip(index.compiled.for_rule(id))
             {
-                if index.selector_is_context_free(*prepared_selector) {
+                if prepared_selector.is_context_free() {
                     continue;
                 }
                 if !index.selector_might_match(*prepared_selector, ancestor_filter) {
                     continue;
                 }
                 let matches = index
-                    .matches_fast_selector(*prepared_selector, doc, node_idx)
+                    .compiled
+                    .matches(*prepared_selector, doc, node_idx)
                     .unwrap_or_else(|| {
                         crate::style::matching::dom::selector_matches_dom_node_in_scope(
                             selector,
@@ -770,7 +523,7 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
                         )
                     });
                 if matches {
-                    let matched = index.selector_specificity(*prepared_selector);
+                    let matched = prepared_selector.specificity();
                     specificity =
                         Some(specificity.map_or(matched, |current: u32| current.max(matched)));
                 }
@@ -820,44 +573,41 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
             normal: matched_rules,
             important: important_rules,
         } = CascadePlan::build(matched_rules, self.important_rule_scratch, prepared);
-        let mut style = get_inherited_style_dom(doc, self.styles, node_idx);
-        let parent_font_size = style.font.font_size;
+        let parent_style = WorkingStyle::for_node(doc, self.styles, node_idx);
+        let mut style = WorkingStyle::inherited(
+            &parent_style.font,
+            &parent_style.text,
+            &parent_style.box_model,
+        );
+        style.layout.justify_items = default_justify_items(parent_style.layout.justify_items);
         let mut cascade_scratch = std::mem::take(self.cascade_scratch);
-        let hints_sequence = specified::build_cascade_events(
+        html_presentational_hints::collect(doc, node_idx, &mut cascade_scratch.hints);
+        let element = ElementDeclarations {
+            inline: inline_style,
+            hints: &cascade_scratch.hints,
+        };
+        build_cascade_events(
             prepared,
             &matched_rules,
             &important_rules,
-            inline_style,
+            element,
             &mut cascade_scratch.events,
         );
         *self.matched_rule_scratch = matched_rules;
         *self.important_rule_scratch = important_rules;
         let parent_custom = &custom_maps[parent_custom_id as usize];
         let (custom_properties, reused_custom_id, cache_signature) = match custom_cascade_cache
-            .probe(
-                &cascade_scratch.events.events,
-                inline_style,
-                parent_custom_id,
-            ) {
+            .probe(&cascade_scratch.events.events, element, parent_custom_id)
+        {
             CustomCascadeProbe::NoDeclarations => (None, None, None),
             CustomCascadeProbe::UncachedDeclarations => (
-                cascade_custom_properties(
-                    &cascade_scratch.events.events,
-                    inline_style,
-                    parent_custom,
-                    &self.random,
-                ),
+                cascade_custom_properties(&cascade_scratch.events.events, element, parent_custom),
                 None,
                 None,
             ),
             CustomCascadeProbe::Hit(map_id) => (None, Some(map_id), None),
             CustomCascadeProbe::Miss(signature) => (
-                cascade_custom_properties(
-                    &cascade_scratch.events.events,
-                    inline_style,
-                    parent_custom,
-                    &self.random,
-                ),
+                cascade_custom_properties(&cascade_scratch.events.events, element, parent_custom),
                 None,
                 Some(signature),
             ),
@@ -866,44 +616,26 @@ impl<'a, 'css> StyleResolverContext<'a, 'css> {
             .map(|map_id| &custom_maps[map_id as usize])
             .unwrap_or(parent_custom);
 
-        let parent_style = ParentStyle::for_node(doc, self.styles, node_idx);
         self.apply_cascade(
             &mut style,
             CascadeInputs {
                 events: &cascade_scratch.events.events,
-                inline_style,
-                hints_sequence,
-                parent_font_size,
+                element,
                 custom_properties: effective_custom_properties(&custom_properties, custom_base),
-                parent_custom,
                 parent: &parent_style,
-                presentational_hints_node: Some(node_idx),
             },
-            &mut cascade_scratch.valid_events,
-            &mut cascade_scratch.selection,
+            &mut cascade_scratch.computation,
         );
-        apply_renderer_markers(
-            doc,
-            self.styles,
-            &mut style,
-            &cascade_scratch.events.events,
-            inline_style,
-            effective_custom_properties(&custom_properties, custom_base),
-            parent_custom,
-            doc.root_font_size(),
-            self.resolution,
-            &mut self.tree_counting,
-            &self.random,
-        );
+
         *self.cascade_scratch = cascade_scratch;
 
         // HTML `lang` and XML `xml:lang` participate in inherited text
         // semantics even though they are not CSS properties.
-        if let Some(language) = doc
-            .element_ref(node_idx)
-            .and_then(|element| element.attr_expanded(Some("http://www.w3.org/XML/1998/namespace"), "lang")
-                .or_else(|| element.attr("lang")))
-        {
+        if let Some(language) = doc.element_ref(node_idx).and_then(|element| {
+            element
+                .attr_expanded(Some("http://www.w3.org/XML/1998/namespace"), "lang")
+                .or_else(|| element.attr("lang"))
+        }) {
             style.text.language = self.styles.intern_language(language);
         }
 

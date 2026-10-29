@@ -6,17 +6,25 @@
 #![forbid(unsafe_code)]
 
 mod content;
+mod first_letter;
 mod line_breaks;
 mod normalization;
 mod prepared_text;
 mod pseudo_styles;
 mod source_offsets;
+mod spacing;
 
-pub use content::{InlineContent, InlineItem, InlineItemKind, WhitespaceWrapOverride};
+pub use content::{
+    InlineContent, InlineItem, InlineItemKind, InlineTextKind, InlineTextRun, WhitespaceWrapOverride,
+};
+pub use first_letter::{FirstLetterPart, FirstLetterSelection};
 use html_style_model::StyleIndices;
 pub use normalization::{get_style, whitespace_context_root};
 pub use prepared_text::{FirstLetterStyles, PreparedText, StyleOverrides};
-pub use pseudo_styles::{first_letter_style_for_inline_root, first_line_style_for_inline_root};
+pub use pseudo_styles::PseudoStyles;
+pub use spacing::{
+    spaced_advance, suppresses_glyph, tracking_boundary_after, tracking_boundary_allowed,
+};
 
 #[cfg(feature = "testing")]
 pub use normalization::{collapse_whitespace, is_css_collapsible_space, transform_text};

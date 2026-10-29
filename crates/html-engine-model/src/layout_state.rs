@@ -1,5 +1,6 @@
 use super::glyph_line_indices::GlyphLineIndices;
 use super::grouped_arena::GroupedArena;
+use super::paint_program::PaintLayers;
 use html_dom::MemoryUsageReport;
 use html_style_model::UsedBorderRadii;
 use kurbo::{Point, Rect, Size};
@@ -17,25 +18,46 @@ pub struct LayoutState {
     pub semantic_indexes: SemanticIndexes,
 }
 
+/// Identity of an emitted line within one published layout. Spatial and paint
+/// traversals never change it; a new layout pass may assign different IDs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct LineId(u32);
+
+impl LineId {
+    pub fn new(index: usize) -> Self {
+        let raw = u32::try_from(index).expect("line identity capacity exhausted");
+        assert_ne!(
+            raw,
+            u32::MAX,
+            "line identity collides with the absent-line sentinel"
+        );
+        Self(raw)
+    }
+
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
 #[derive(Default, Clone)]
 pub struct LineOutput {
+    /// Emission-order storage. Its indexes are stable line IDs, not spatial ranks.
     pub lines: Vec<Line>,
+    /// Stable IDs sorted by nominal bottom edge for pagination and viewport lookup.
+    pub spatial_order: Vec<LineId>,
+    /// Inverse spatial traversal, indexed by stable line ID.
+    pub spatial_ranks: Vec<u32>,
     /// Uncommon paint/inline data is retained only for lines that need it.
     pub line_details: Vec<LineDetails>,
     pub text_fragments: Vec<LineTextFragment>,
-    /// Line indexes in CSS paint order. Physical line storage remains sorted
-    /// by document geometry so pagination and viewport lookup can use it.
-    pub paint_order_indices: Vec<u32>,
-    /// Inverse of `paint_order_indices`: CSS paint rank for each spatial line
-    /// index. Page composition uses this to order only its visible lines
-    /// instead of rescanning the document-wide paint traversal.
+    /// Stable line IDs in CSS paint order, independent of spatial traversal.
+    pub paint_order_indices: Vec<LineId>,
+    /// CSS paint rank indexed by stable line ID, for ordering visible lines.
     pub paint_order_ranks: Vec<u32>,
     /// Contiguous non-text inline fragment arena. Each line owns a range into
     /// this buffer, avoiding one heap allocation per non-trivial line.
     pub inline_box_fragments: Vec<LineInlineBoxFragment>,
-    pub positioned_layers: Vec<bool>,
-    pub negative_positioned_layers: Vec<bool>,
-    pub independent_positioned_layers: Vec<bool>,
+    pub paint_layers: Vec<PaintLayers>,
     /// Sparse resolved overflow clips, indexed by line. Empty for the common
     /// case where every box uses `overflow: visible`.
     pub line_clips: Vec<Option<OverflowClip>>,
@@ -56,6 +78,10 @@ pub struct LineOutput {
 pub struct FragmentOutput {
     /// Combined CSS traversal for consumers that paint a complete scene.
     pub scene_paint_order: Vec<ScenePaintItem>,
+    /// Inverse indexes let partial surfaces replay visible items without
+    /// scanning the complete document's CSS stream every frame.
+    pub scene_line_ranks: Vec<u32>,
+    pub scene_decoration_ranks: Vec<u32>,
     pub decorations: DecorationStore,
     /// Owning line for inline decorations, or `u32::MAX` for block and
     /// line-independent fragments. Renderers must not infer this relationship
@@ -68,9 +94,7 @@ pub struct FragmentOutput {
     /// owning line. Line-owned backgrounds and borders replay with the line
     /// instead of in the document-wide block-decoration phase.
     pub decoration_fragments_by_line: GroupedArena<usize>,
-    pub decoration_positioned_layers: Vec<bool>,
-    pub decoration_negative_positioned_layers: Vec<bool>,
-    pub decoration_independent_positioned_layers: Vec<bool>,
+    pub decoration_paint_layers: Vec<PaintLayers>,
     /// Semantic block-paint traversal. Recursive formatting emits block
     /// fragments postorder; these ranges provide preorder traversal without
     /// flattening or physically reordering fragment storage.
@@ -121,7 +145,17 @@ impl LayoutState {
             self.line_output.text_fragments.capacity(),
             self.line_output.text_fragments.len(),
         );
+        report.add_slice_storage::<LineId>(
+            "LayoutState.line_output.spatial_order.storage",
+            self.line_output.spatial_order.capacity(),
+            self.line_output.spatial_order.len(),
+        );
         report.add_slice_storage::<u32>(
+            "LayoutState.line_output.spatial_ranks.storage",
+            self.line_output.spatial_ranks.capacity(),
+            self.line_output.spatial_ranks.len(),
+        );
+        report.add_slice_storage::<LineId>(
             "LayoutState.line_output.paint_order_indices.storage",
             self.line_output.paint_order_indices.capacity(),
             self.line_output.paint_order_indices.len(),
@@ -136,20 +170,10 @@ impl LayoutState {
             self.line_output.inline_box_fragments.capacity(),
             self.line_output.inline_box_fragments.len(),
         );
-        report.add_slice_storage::<bool>(
-            "LayoutState.line_output.positioned_layers.storage",
-            self.line_output.positioned_layers.capacity(),
-            self.line_output.positioned_layers.len(),
-        );
-        report.add_slice_storage::<bool>(
-            "LayoutState.line_output.negative_positioned_layers.storage",
-            self.line_output.negative_positioned_layers.capacity(),
-            self.line_output.negative_positioned_layers.len(),
-        );
-        report.add_slice_storage::<bool>(
-            "LayoutState.line_output.independent_positioned_layers.storage",
-            self.line_output.independent_positioned_layers.capacity(),
-            self.line_output.independent_positioned_layers.len(),
+        report.add_slice_storage::<PaintLayers>(
+            "LayoutState.line_output.paint_layers.storage",
+            self.line_output.paint_layers.capacity(),
+            self.line_output.paint_layers.len(),
         );
         report.add_slice_storage::<Option<OverflowClip>>(
             "LayoutState.line_output.line_clips.storage",
@@ -187,6 +211,16 @@ impl LayoutState {
             "LayoutState.fragment_output.scene_paint_order.storage",
             self.fragment_output.scene_paint_order.capacity(),
             self.fragment_output.scene_paint_order.len(),
+        );
+        report.add_slice_storage::<u32>(
+            "LayoutState.fragment_output.scene_line_ranks.storage",
+            self.fragment_output.scene_line_ranks.capacity(),
+            self.fragment_output.scene_line_ranks.len(),
+        );
+        report.add_slice_storage::<u32>(
+            "LayoutState.fragment_output.scene_decoration_ranks.storage",
+            self.fragment_output.scene_decoration_ranks.capacity(),
+            self.fragment_output.scene_decoration_ranks.len(),
         );
         report.add_slice_storage::<DecorationFragment>(
             "LayoutState.fragment_output.decorations.storage",
@@ -228,28 +262,10 @@ impl LayoutState {
                 .decoration_fragments_by_line
                 .memory_usage_report(),
         );
-        report.add_slice_storage::<bool>(
-            "LayoutState.fragment_output.decoration_positioned_layers.storage",
-            self.fragment_output.decoration_positioned_layers.capacity(),
-            self.fragment_output.decoration_positioned_layers.len(),
-        );
-        report.add_slice_storage::<bool>(
-            "LayoutState.fragment_output.decoration_negative_positioned_layers.storage",
-            self.fragment_output
-                .decoration_negative_positioned_layers
-                .capacity(),
-            self.fragment_output
-                .decoration_negative_positioned_layers
-                .len(),
-        );
-        report.add_slice_storage::<bool>(
-            "LayoutState.fragment_output.decoration_independent_positioned_layers.storage",
-            self.fragment_output
-                .decoration_independent_positioned_layers
-                .capacity(),
-            self.fragment_output
-                .decoration_independent_positioned_layers
-                .len(),
+        report.add_slice_storage::<PaintLayers>(
+            "LayoutState.fragment_output.decoration_paint_layers.storage",
+            self.fragment_output.decoration_paint_layers.capacity(),
+            self.fragment_output.decoration_paint_layers.len(),
         );
         report.add_slice_storage::<Range<u32>>(
             "LayoutState.fragment_output.block_paint_ranges.storage",
@@ -294,6 +310,19 @@ pub struct OverflowClip {
     pub rect: Rect,
     pub x: bool,
     pub y: bool,
+}
+
+impl OverflowClip {
+    /// Intersect a rectangle with the constrained axes. A disjoint result has
+    /// zero area, while an unconstrained axis retains the supplied bounds.
+    pub fn apply_to(self, rect: Rect) -> Rect {
+        rect.intersect(Rect::new(
+            if self.x { self.rect.x0 } else { rect.x0 },
+            if self.y { self.rect.y0 } else { rect.y0 },
+            if self.x { self.rect.x1 } else { rect.x1 },
+            if self.y { self.rect.y1 } else { rect.y1 },
+        ))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -492,6 +521,7 @@ pub struct GlyphAdvanceRun {
 /// selection, search, or CFI addressing.
 #[derive(Clone, Copy)]
 pub struct EllipsisFragment {
+    /// Stable line storage index; spatial rank is a separate traversal.
     pub line_idx: usize,
     pub glyph: crate::GlyphId,
     pub offset: Point,
@@ -502,6 +532,7 @@ pub struct EllipsisFragment {
 /// It has no source glyph index and therefore stays outside selection/CFI data.
 #[derive(Clone, Copy)]
 pub struct HyphenFragment {
+    /// Stable line storage index; spatial rank is a separate traversal.
     pub line_idx: usize,
     pub glyph: crate::GlyphId,
     pub offset: Point,
@@ -781,6 +812,7 @@ pub struct RoundedDecoration {
 
 #[derive(Clone)]
 pub struct ImageFragment {
+    /// Stable line storage index; spatial rank is a separate traversal.
     pub line_idx: usize,
     pub image_idx: u32,
     pub box_idx: u32,

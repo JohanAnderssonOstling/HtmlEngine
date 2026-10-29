@@ -4,13 +4,14 @@
 //! declaration such as `opacity: 0.5` can be valid CSS while still being a
 //! feature this renderer does not implement.
 
-use super::property_id::RendererPropertyId;
-use super::substitution::{contains_function, needs_substitution};
-use super::value::{css_wide_keyword, may_have_substitutions, parsed_property};
-use super::{inline_values, unit_algebra};
-use crate::{PropertyCapability, PropertySyntax, UnsupportedStyleFeature};
-use lightningcss::printer::PrinterOptions;
-use lightningcss::properties::custom::{Token, TokenList, TokenOrValue};
+use crate::style::property_catalogue::PropertyKey;
+use crate::style::support::{PropertyCapability, UnsupportedStyleFeature};
+use crate::style::syntax::property_id::RendererPropertyId;
+use crate::style::syntax::substitution::{contains_function, needs_substitution};
+#[cfg(test)]
+use crate::style::syntax::value::parsed_property;
+use crate::style::syntax::wide_keywords::token_list_css_wide_keyword;
+use lightningcss::properties::custom::{Token, TokenOrValue};
 use lightningcss::properties::display::Visibility;
 use lightningcss::properties::position::Position;
 use lightningcss::properties::{Property, PropertyId};
@@ -24,22 +25,6 @@ pub(crate) fn declaration_is_custom_property(property: &Property<'_>) -> bool {
     }
 }
 
-fn token_list_is_css_wide_keyword(tokens: &TokenList<'_>) -> bool {
-    let mut tokens = tokens.0.iter().filter(|token| {
-        !matches!(
-            token,
-            TokenOrValue::Token(Token::WhiteSpace(_) | Token::Comment(_))
-        )
-    });
-    let Some(TokenOrValue::Token(Token::Ident(keyword))) = tokens.next() else {
-        return false;
-    };
-    tokens.next().is_none()
-        && ["inherit", "initial", "unset", "revert", "revert-layer"]
-            .iter()
-            .any(|candidate| keyword.eq_ignore_ascii_case(candidate))
-}
-
 /// Target-independent eligibility that can be decided without serializing the
 /// parsed value. Raw declarations retain the runtime fallback.
 pub(crate) fn declaration_renderer_eligibility(property: &Property<'_>) -> Option<bool> {
@@ -47,57 +32,22 @@ pub(crate) fn declaration_renderer_eligibility(property: &Property<'_>) -> Optio
         return Some(false);
     }
     if matches!(property, Property::All(_))
-        || matches!(property, Property::Unparsed(value) if token_list_is_css_wide_keyword(&value.value) || needs_substitution(&value.value))
-        || matches!(property, Property::Custom(value) if token_list_is_css_wide_keyword(&value.value) || needs_substitution(&value.value))
+        || matches!(property, Property::Unparsed(value) if token_list_css_wide_keyword(&value.value).is_some() || needs_substitution(&value.value))
+        || matches!(property, Property::Custom(value) if token_list_css_wide_keyword(&value.value).is_some() || needs_substitution(&value.value))
     {
-        // Native var() arguments are already checked by the dependency.
-        // Other arbitrary-value functions are retained as unknown functions,
-        // so validate their grammar before admitting pending declarations.
-        let valid = match property {
-            Property::Unparsed(value) => super::substitution::substitutions(&value.value.0).is_ok(),
-            Property::Custom(value) => super::substitution::substitutions(&value.value.0).is_ok(),
-            _ => true,
-        };
-        return Some(valid);
+        return Some(true);
     }
     if property_uses_unsupported_text_decoration_style(property)
         || property_uses_unsupported_outline_style(property)
+        || super::grid::native_value_is_unsupported(property)
     {
         return Some(false);
     }
-    if matches!(property, Property::Unparsed(value) if matches!(value.property_id, PropertyId::Background))
-    {
-        return Some(false);
+    match property {
+        Property::Unparsed(_) => Some(false),
+        Property::Custom(_) => None,
+        _ => Some(true),
     }
-    if let Property::Unparsed(value) = property
-        && unit_algebra::size_property(&value.property_id)
-        && let Ok(source) = property.value_to_css_string(PrinterOptions::default())
-        && let Some(supported) = unit_algebra::value_is_supported(&value.property_id, &source)
-    {
-        return Some(supported);
-    }
-    if let Property::Unparsed(value) = property
-        && matches!(
-            value.property_id,
-            PropertyId::VerticalAlign | PropertyId::TextOverflow(_)
-        )
-    {
-        return Some(
-            property
-                .value_to_css_string(PrinterOptions::default())
-                .is_ok_and(|source| inline_values::value_is_supported(&value.property_id, &source)),
-        );
-    }
-    if super::grid::native_value_is_unsupported(property)
-        || matches!(property, Property::Unparsed(value)
-            if raw_value_is_unsupported(&value.property_id, &value.value))
-    {
-        return Some(false);
-    }
-    if matches!(property, Property::Unparsed(_) | Property::Custom(_)) {
-        return None;
-    }
-    Some(true)
 }
 
 /// Complete predicate for inline, substituted, and raw declarations whose
@@ -106,212 +56,23 @@ pub(crate) fn declaration_is_renderer_eligible(property: &Property<'_>) -> bool 
     if let Some(eligible) = declaration_renderer_eligibility(property) {
         return eligible;
     }
-    let Ok(value) = property.value_to_css_string(PrinterOptions::default()) else {
-        return false;
-    };
-    // Partial containment still applies its implemented size behavior even
-    // though @supports must report the full value as unsupported.
-    if RendererPropertyId::from_lightning(&property.property_id())
-        == Some(RendererPropertyId::Contain)
-    {
-        return super::contain::parse(&value).is_some();
+    if let Some((RendererPropertyId::Contain, tokens)) = RendererPropertyId::raw(property) {
+        return super::contain::parse_tokens(tokens).is_some();
     }
-    let support = crate::declaration_support(property.property_id().name(), &value);
-    support.syntax == PropertySyntax::Valid && support.capability == PropertyCapability::Supported
+    parsed_declaration_capability(property.property_id().name(), Some(property))
+        == PropertyCapability::Supported
 }
 
 pub(crate) fn is_supported_property_name(name: &str) -> bool {
     if name.starts_with('-') && !matches!(PropertyId::from(name), PropertyId::Custom(_)) {
         for prefix in ["-webkit-", "-moz-", "-ms-", "-o-"] {
-            if let Some(unprefixed) = name.strip_prefix(prefix) {
-                return is_supported_property_name(unprefixed);
+            if let Some(name) = name.strip_prefix(prefix) {
+                return is_supported_property_name(name);
             }
         }
     }
-    if RendererPropertyId::from_name(name).is_some() {
-        return true;
-    }
-    matches!(
-        name,
-        "all"
-            | "font-size"
-            | "font-weight"
-            | "font-style"
-            | "font-family"
-            | "font"
-            | "line-height"
-            | "letter-spacing"
-            | "word-spacing"
-            | "tab-size"
-            | "text-align"
-            | "text-align-last"
-            | "text-indent"
-            | "text-overflow"
-            | "text-transform"
-            | "direction"
-            | "unicode-bidi"
-            | "font-variant-caps"
-            | "text-decoration-line"
-            | "text-decoration"
-            | "text-decoration-color"
-            | "text-decoration-style"
-            | "text-decoration-thickness"
-            | "vertical-align"
-            | "white-space"
-            | "list-style-type"
-            | "list-style-position"
-            | "list-style-image"
-            | "list-style"
-            | "color"
-            | "background-color"
-            | "background"
-            | "width"
-            | "height"
-            | "aspect-ratio"
-            | "visibility"
-            | "min-width"
-            | "min-height"
-            | "max-width"
-            | "max-height"
-            | "inline-size"
-            | "block-size"
-            | "min-inline-size"
-            | "min-block-size"
-            | "max-inline-size"
-            | "max-block-size"
-            | "margin-top"
-            | "margin-bottom"
-            | "margin-left"
-            | "margin-right"
-            | "margin"
-            | "margin-block"
-            | "margin-block-start"
-            | "margin-block-end"
-            | "margin-inline"
-            | "margin-inline-start"
-            | "margin-inline-end"
-            | "padding-top"
-            | "padding-bottom"
-            | "padding-left"
-            | "padding-right"
-            | "padding"
-            | "padding-block"
-            | "padding-block-start"
-            | "padding-block-end"
-            | "padding-inline"
-            | "padding-inline-start"
-            | "padding-inline-end"
-            | "border-width"
-            | "border-top-width"
-            | "border-right-width"
-            | "border-bottom-width"
-            | "border-left-width"
-            | "border-block-start-width"
-            | "border-block-end-width"
-            | "border-inline-start-width"
-            | "border-inline-end-width"
-            | "border-block-width"
-            | "border-inline-width"
-            | "border-color"
-            | "border-top-color"
-            | "border-right-color"
-            | "border-bottom-color"
-            | "border-left-color"
-            | "border-block-start-color"
-            | "border-block-end-color"
-            | "border-inline-start-color"
-            | "border-inline-end-color"
-            | "border-block-color"
-            | "border-inline-color"
-            | "border-style"
-            | "border-top-style"
-            | "border-right-style"
-            | "border-bottom-style"
-            | "border-left-style"
-            | "border-block-start-style"
-            | "border-block-end-style"
-            | "border-inline-start-style"
-            | "border-inline-end-style"
-            | "border-block-style"
-            | "border-inline-style"
-            | "border"
-            | "border-top"
-            | "border-bottom"
-            | "border-left"
-            | "border-right"
-            | "border-block"
-            | "border-block-start"
-            | "border-block-end"
-            | "border-inline"
-            | "border-inline-start"
-            | "border-inline-end"
-            | "border-radius"
-            | "border-top-left-radius"
-            | "border-top-right-radius"
-            | "border-bottom-right-radius"
-            | "border-bottom-left-radius"
-            | "border-start-start-radius"
-            | "border-start-end-radius"
-            | "border-end-start-radius"
-            | "border-end-end-radius"
-            | "border-spacing"
-            | "outline"
-            | "outline-width"
-            | "outline-style"
-            | "outline-color"
-            | "hyphens"
-            | "word-break"
-            | "line-break"
-            | "overflow-wrap"
-            | "word-wrap"
-            | "overflow"
-            | "overflow-x"
-            | "overflow-y"
-            | "box-sizing"
-            | "display"
-            | "position"
-            | "z-index"
-            | "top"
-            | "right"
-            | "bottom"
-            | "left"
-            | "inset"
-            | "flex-direction"
-            | "flex-wrap"
-            | "flex-flow"
-            | "flex-grow"
-            | "flex-shrink"
-            | "flex-basis"
-            | "flex"
-            | "order"
-            | "align-content"
-            | "justify-content"
-            | "align-items"
-            | "align-self"
-            | "justify-items"
-            | "justify-self"
-            | "place-content"
-            | "place-items"
-            | "place-self"
-            | "row-gap"
-            | "column-gap"
-            | "gap"
-            | "grid-template-rows"
-            | "grid-template-columns"
-            | "grid-template-areas"
-            | "grid-auto-rows"
-            | "grid-auto-columns"
-            | "grid-auto-flow"
-            | "grid-template"
-            | "grid"
-            | "grid-row-start"
-            | "grid-row-end"
-            | "grid-column-start"
-            | "grid-column-end"
-            | "grid-row"
-            | "grid-column"
-            | "grid-area"
-    )
+    name.starts_with("--")
+        || PropertyKey::from_name(name).is_some_and(|key| key != PropertyKey::BackgroundImage)
 }
 
 pub fn property_name_is_supported(name: &str) -> bool {
@@ -321,7 +82,18 @@ pub fn property_name_is_supported(name: &str) -> bool {
 
 /// Decide renderer support before doing any property-specific validation.
 /// Unsupported features do not need a second implementation of their grammar.
-pub(crate) fn declaration_capability(name: &str, value: &str) -> PropertyCapability {
+#[cfg(test)]
+fn declaration_capability(name: &str, value: &str) -> PropertyCapability {
+    parsed_declaration_capability(
+        name,
+        parsed_property(PropertyId::from(name), value).as_ref(),
+    )
+}
+
+pub(crate) fn parsed_declaration_capability(
+    name: &str,
+    parsed: Option<&Property<'_>>,
+) -> PropertyCapability {
     let unsupported = if is_border_image_property_name(name) {
         Some(UnsupportedStyleFeature::BorderImage)
     } else if is_box_shadow_property_name(name) {
@@ -340,54 +112,38 @@ pub(crate) fn declaration_capability(name: &str, value: &str) -> PropertyCapabil
     if let Some(reason) = unsupported {
         return PropertyCapability::Unsupported(reason);
     }
-    if name.starts_with("--") || css_wide_keyword(value) || may_have_substitutions(value) {
+    if name.starts_with("--") {
         return PropertyCapability::Supported;
     }
-    let id = PropertyId::from(name);
-    let renderer_id = RendererPropertyId::from_name(name);
-    if renderer_id == Some(RendererPropertyId::Content) {
-        return match super::generated_content::content(value) {
-            super::generated_content::ValueSupport::Unsupported => {
-                PropertyCapability::Unsupported(UnsupportedStyleFeature::GeneratedContent)
-            }
-            _ => PropertyCapability::Supported,
-        };
+    if let Some((id, tokens)) = parsed.and_then(RendererPropertyId::raw) {
+        if !needs_substitution(tokens)
+            && token_list_css_wide_keyword(tokens).is_none()
+            && !super::renderer_owned::tokens_are_supported(id, tokens)
+        {
+            return PropertyCapability::Unsupported(UnsupportedStyleFeature::Value);
+        }
+
+        if matches!(
+            id,
+            RendererPropertyId::Content
+                | RendererPropertyId::CounterReset
+                | RendererPropertyId::CounterIncrement
+        ) && (tokens.0.iter().any(|token| {
+            matches!(
+                token,
+                TokenOrValue::Url(_) | TokenOrValue::Token(Token::Delim('/'))
+            )
+        }) || contains_function(tokens, |name| name.eq_ignore_ascii_case("reversed")))
+        {
+            return PropertyCapability::Unsupported(UnsupportedStyleFeature::GeneratedContent);
+        }
+        if id == RendererPropertyId::Contain
+            && super::contain::parse_tokens(tokens).is_some_and(|contain| !contain.fully_supported)
+        {
+            return PropertyCapability::Unsupported(UnsupportedStyleFeature::Value);
+        }
     }
-    if let Some(id @ (RendererPropertyId::CounterReset | RendererPropertyId::CounterIncrement)) =
-        renderer_id
-    {
-        return match super::generated_content::counter_directive(id, value) {
-            super::generated_content::ValueSupport::Unsupported => {
-                PropertyCapability::Unsupported(UnsupportedStyleFeature::GeneratedContent)
-            }
-            _ => PropertyCapability::Supported,
-        };
-    }
-    if renderer_id == Some(RendererPropertyId::Contain) {
-        return if super::contain::parse(value).is_none_or(|contain| contain.fully_supported) {
-            PropertyCapability::Supported
-        } else {
-            PropertyCapability::Unsupported(UnsupportedStyleFeature::Value)
-        };
-    }
-    // Guard native color conversion before parsing; these values cannot be
-    // computed by this renderer, so no surrogate grammar is necessary.
-    if super::color_syntax::declaration_is_unsupported(&id, value) {
-        return PropertyCapability::Unsupported(UnsupportedStyleFeature::Value);
-    }
-    if unit_algebra::value_is_supported(&id, value) == Some(false)
-        && unit_algebra::property_value_is_valid(&id, value) == Some(true)
-    {
-        return PropertyCapability::Unsupported(UnsupportedStyleFeature::Value);
-    }
-    if matches!(id, PropertyId::VerticalAlign | PropertyId::TextOverflow(_))
-        && inline_values::property_value_is_valid(&id, value) == Some(true)
-        && !inline_values::value_is_supported(&id, value)
-    {
-        return PropertyCapability::Unsupported(UnsupportedStyleFeature::Value);
-    }
-    let parsed = parsed_property(id, value);
-    if parsed.as_ref().is_some_and(|property| {
+    if parsed.is_some_and(|property| {
         super::grid::native_value_is_unsupported(property)
             || display_value_is_unsupported(property)
             || list_style_value_is_unsupported(property)
@@ -400,51 +156,18 @@ pub(crate) fn declaration_capability(name: &str, value: &str) -> PropertyCapabil
                     | Position::Relative
                     | Position::Absolute))
             || matches!(property, Property::Visibility(Visibility::Collapse))
-            || matches!(property, Property::Unparsed(raw)
-                if raw_value_is_unsupported(&raw.property_id, &raw.value))
     }) {
         return PropertyCapability::Unsupported(UnsupportedStyleFeature::Value);
     }
-    if contains_gradient_function(value)
-        && parsed.as_ref().is_none_or(|property| {
-            property_uses_gradient(property) || matches!(property, Property::Unparsed(_))
-        })
-    {
+    if parsed.is_some_and(property_uses_gradient) {
         return PropertyCapability::Unsupported(UnsupportedStyleFeature::Gradient);
     }
     if matches!(name, "background" | "background-image")
-        && parsed.as_ref().is_some_and(property_uses_background_image)
+        && parsed.is_some_and(property_uses_background_image)
     {
         return PropertyCapability::Unsupported(UnsupportedStyleFeature::BackgroundImage);
     }
     PropertyCapability::Supported
-}
-
-fn raw_value_is_unsupported(id: &PropertyId<'_>, tokens: &TokenList<'_>) -> bool {
-    matches!(
-        id,
-        PropertyId::Background
-            | PropertyId::ListStyleImage
-            | PropertyId::Outline
-            | PropertyId::OutlineColor
-            | PropertyId::TextTransform
-            | PropertyId::WordBreak
-    ) || super::flex::is_wrap_property(id)
-        || super::grid::raw_is_unsupported(id, tokens)
-        || super::color_syntax::raw_color_is_unsupported(id, tokens)
-        || contains_function(tokens, |name| {
-            name.eq_ignore_ascii_case("anchor")
-                || name.eq_ignore_ascii_case("anchor-size")
-                || name.eq_ignore_ascii_case("calc-size")
-        })
-        || tokens.0.iter().any(|token| {
-            matches!(token,
-            TokenOrValue::Token(Token::Ident(name))
-                if name.eq_ignore_ascii_case("anchor-center")
-                    || (matches!(id, PropertyId::Display)
-                        && (name.eq_ignore_ascii_case("grid-lanes")
-                            || name.eq_ignore_ascii_case("inline-grid-lanes"))))
-        })
 }
 
 fn is_border_image_property_name(name: &str) -> bool {
@@ -676,13 +399,6 @@ fn image_uses_gradient(image: &Image<'_>) -> bool {
             .any(|option| image_uses_gradient(&option.image)),
         Image::None | Image::Url(_) => false,
     }
-}
-
-fn contains_gradient_function(value: &str) -> bool {
-    value
-        .as_bytes()
-        .windows(b"gradient(".len())
-        .any(|window| window.eq_ignore_ascii_case(b"gradient("))
 }
 
 #[cfg(test)]
@@ -975,7 +691,7 @@ mod tests {
         );
         assert_eq!(
             declaration_capability("text-transform", "math-auto"),
-            PropertyCapability::Unsupported(UnsupportedStyleFeature::Value)
+            PropertyCapability::Supported
         );
     }
 }

@@ -6,8 +6,9 @@
 use crate::{InlineContent, InlineItem, InlineItemKind, LayoutMode, LayoutTree};
 use html_style_model::{ComputedStyles, TextDirection, UnicodeBidi};
 use html_text::get_style;
-use html_text::{is_bidi_control, whitespace_context_root};
+use html_text::{is_bidi_control};
 use rustc_data_structures::fx::FxHashMap;
+use std::ops::Range;
 use std::sync::Arc;
 use unicode_bidi::{BidiClass, BidiInfo, Level, bidi_class};
 use unicode_segmentation::UnicodeSegmentation;
@@ -32,7 +33,6 @@ impl ResolvedBidi {
             .characters()
             .iter()
             .copied()
-            .filter_map(char::from_u32)
             .any(|character| {
                 character > '\u{007f}'
                     && (matches!(
@@ -54,20 +54,8 @@ impl ResolvedBidi {
             ) {
                 continue;
             }
-            let owner = item.box_idx as usize;
-            let context_owner = if matches!(
-                item.kind,
-                InlineItemKind::Image { .. } | InlineItemKind::AtomicBox { .. }
-            ) {
-                tree.get_box_parent(owner).unwrap_or(owner)
-            } else {
-                owner
-            };
-            let root = if matches!(item.kind, InlineItemKind::Marker { .. }) {
-                owner
-            } else {
-                whitespace_context_root(tree, context_owner)
-            };
+            let context_owner = item.context_owner(tree);
+            let root = item.paragraph_root(tree);
             let paragraph = paragraphs.entry(root).or_default();
             let mut ancestors = vec![context_owner];
             while *ancestors.last().expect("bidi owner") != root {
@@ -84,7 +72,6 @@ impl ResolvedBidi {
                     for index in glyphs.clone() {
                         let character = content
                             .character_at(index as usize)
-                            .and_then(char::from_u32)
                             .unwrap_or('\u{fffd}');
                         if character == '\n' {
                             paragraph.close(styles, tree);
@@ -146,6 +133,29 @@ impl ResolvedBidi {
 
     pub fn level(&self, index: u32) -> u8 {
         self.levels.get(index as usize).copied().unwrap_or(0) & 0x7f
+    }
+
+    /// Consecutive logical character ranges with the same embedding level.
+    /// Unstored levels retain the default LTR value without scanning the tail.
+    pub fn level_runs(
+        &self,
+        mut range: Range<u32>,
+    ) -> impl Iterator<Item = (Range<u32>, u8)> + Clone + '_ {
+        let stored_end = range
+            .end
+            .min(u32::try_from(self.levels.len()).unwrap_or(u32::MAX));
+        std::iter::from_fn(move || {
+            if range.is_empty() {
+                return None;
+            }
+            let start = range.start;
+            let level = self.level(start);
+            let end = (start + 1..stored_end)
+                .find(|&index| self.level(index) != level)
+                .unwrap_or(if level == 0 { range.end } else { stored_end });
+            range.start = end;
+            Some((start..end, level))
+        })
     }
 
     pub fn paragraph_direction(&self, index: u32) -> TextDirection {
@@ -344,9 +354,38 @@ fn controls(
 
 #[cfg(test)]
 mod tests {
-    use super::grapheme_boundaries;
+    use super::{ResolvedBidi, grapheme_boundaries};
     use std::iter::once;
+    use std::ops::Range;
     use unicode_segmentation::UnicodeSegmentation;
+
+    #[test]
+    fn level_runs_preserve_embedding_levels_subranges_and_unstored_ltr_tails() {
+        let bidi = ResolvedBidi {
+            levels: vec![0, 0x80, 1, 0x81, 2, 0x82, 0],
+            ..Default::default()
+        };
+        assert_eq!(
+            bidi.level_runs(0..7).collect::<Vec<_>>(),
+            [(0..2, 0), (2..4, 1), (4..6, 2), (6..7, 0)]
+        );
+        assert_eq!(
+            bidi.level_runs(1..5).collect::<Vec<_>>(),
+            [(1..2, 0), (2..4, 1), (4..5, 2)]
+        );
+        assert_eq!(
+            bidi.level_runs(5..u32::MAX).collect::<Vec<_>>(),
+            [(5..6, 2), (6..u32::MAX, 0)]
+        );
+        assert_eq!(
+            ResolvedBidi::default()
+                .level_runs(0..u32::MAX)
+                .collect::<Vec<_>>(),
+            [(0..u32::MAX, 0)]
+        );
+        assert!(bidi.level_runs(2..2).next().is_none());
+        assert!(bidi.level_runs(Range { start: 6, end: 5 }).next().is_none());
+    }
 
     fn assert_unicode_boundaries(text: &str) {
         // Compare scalar-indexed output with the library's byte-indexed

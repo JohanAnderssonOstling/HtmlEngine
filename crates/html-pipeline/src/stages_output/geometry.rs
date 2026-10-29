@@ -33,7 +33,7 @@ impl<'a> RenderGeometryView<'a> {
         let line = view.text().line(line_idx)?;
         let mut bounds = line.point_y()..line.point_y() + line.height();
         for image in view.fragments().images_for_line(line_idx).iter() {
-            let rect = Rect::from_origin_size(image.offset(), image.size()).intersect(image.clip());
+            let rect = image.visible_rect();
             if rect.width() > 0.0 && rect.height() > 0.0 {
                 bounds.start = bounds.start.min(line.point_y() + rect.y0);
                 bounds.end = bounds.end.max(line.point_y() + rect.y1);
@@ -42,56 +42,61 @@ impl<'a> RenderGeometryView<'a> {
         Some(bounds)
     }
 
-    /// First traversal line extending below a document-space offset. Lines
-    /// are stored by nominal bottom edge; replaced-content overflow may extend
-    /// an earlier line beyond that ordering.
+    /// First spatial traversal rank extending below a document-space offset.
+    /// Use `text().spatial_order()[rank]` to obtain the stable line identity.
     pub fn start_line_at(self, offset_y: f64, epsilon: f64) -> usize {
         let view = self.doc.render_view(self.glyph_metrics);
+        let output = &self.doc.layout_state.line_output;
         let threshold = offset_y + epsilon;
-        let mut lo = self
-            .doc
-            .layout_state
-            .line_output
-            .lines
-            .partition_point(|line| line.point.y + line.height <= threshold);
+        let mut lo = output.spatial_order.partition_point(|id| {
+            let line = &output.lines[id.index()];
+            line.point.y + line.height <= threshold
+        });
         for image in view.fragments().images().iter() {
-            let index = image.line_idx();
-            if index < lo
+            let id = image.line_idx();
+            let Some(&rank) = output.spatial_ranks.get(id) else {
+                continue;
+            };
+            let rank = rank as usize;
+            if rank < lo
                 && self
-                    .line_vertical_bounds(index)
+                    .line_vertical_bounds(id)
                     .is_some_and(|bounds| bounds.end > threshold)
             {
-                lo = index;
+                lo = rank;
             }
         }
         lo
     }
 
-    /// Last traversal line ending at or above the document-space offset.
+    /// Last spatial traversal rank ending at or above the offset.
     pub fn end_line_at(self, offset_y: f64, epsilon: f64) -> Option<usize> {
+        let output = &self.doc.layout_state.line_output;
         let threshold = offset_y + epsilon;
-        let lo = self
-            .doc
-            .layout_state
-            .line_output
-            .lines
-            .partition_point(|line| line.point.y + line.height <= threshold);
-        (0..lo).rev().find(|&index| {
-            self.line_vertical_bounds(index)
+        let lo = output.spatial_order.partition_point(|id| {
+            let line = &output.lines[id.index()];
+            line.point.y + line.height <= threshold
+        });
+        (0..lo).rev().find(|&rank| {
+            self.line_vertical_bounds(output.spatial_order[rank].index())
                 .is_some_and(|bounds| bounds.end <= threshold)
         })
     }
 
-    /// First line intersecting a vertical decoration interval, including edge
-    /// contact. Top edges need not be monotonic when line heights differ.
+    /// First spatial rank intersecting a decoration interval, including edges.
     pub fn line_intersecting_vertical_range(self, top: f64, bottom: f64) -> Option<usize> {
         if top > bottom {
             return None;
         }
-        (0..self.doc.render_view(self.glyph_metrics).text().line_count()).find(|&index| {
-            self.line_vertical_bounds(index)
-                .is_some_and(|bounds| bounds.end >= top && bounds.start <= bottom)
-        })
+        self.doc
+            .layout_state
+            .line_output
+            .spatial_order
+            .iter()
+            .position(|id| {
+                self.line_vertical_bounds(id.index())
+                    .is_some_and(|bounds| bounds.end >= top && bounds.start <= bottom)
+            })
     }
 
     /// Horizontal caret coordinate relative to the layout line's origin.
@@ -168,7 +173,7 @@ impl<'a> RenderGeometryView<'a> {
         let text = self.doc.render_view(self.glyph_metrics).text();
         let line = text.line(line_idx)?;
         let conditional = line.glyphs().any(|index| {
-            self.doc.inputs.text.content().character_at(index as usize) == Some('\u{00ad}' as u32)
+            self.doc.inputs.text.content().character_at(index as usize) == Some('\u{00ad}')
         });
         let overrides = text
             .line_glyph_advances(line_idx)
@@ -226,7 +231,8 @@ impl<'a> RenderGeometryView<'a> {
         best.or(Some(line.start()))
     }
 
-    /// Rectangles in document coordinates, one per visible text fragment.
+    /// Overflow-clipped rectangles in document coordinates, one per visible
+    /// text fragment.
     /// They are independent of the application's viewport and pagination.
     pub fn line_selection_rects<'b>(
         self,
@@ -239,6 +245,7 @@ impl<'a> RenderGeometryView<'a> {
     {
         let text = self.doc.render_view(self.glyph_metrics).text();
         let line = text.line(line_idx);
+        let clip = text.line_overflow_clip(line_idx);
         text.line_text_fragments(line_idx)
             .into_iter()
             .flatten()
@@ -253,12 +260,14 @@ impl<'a> RenderGeometryView<'a> {
                 }
                 let line = line.as_ref()?;
                 let (x0, x1) = self.caret_span(line_idx, selected, shaped)?;
-                Some(Rect::new(
+                let rect = Rect::new(
                     line.point_x() + x0,
                     line.point_y(),
                     line.point_x() + x1,
                     line.point_y() + line.height(),
-                ))
+                );
+                let rect = clip.map_or(rect, |clip| clip.apply_to(rect));
+                (rect.width() > 0.0 && rect.height() > 0.0).then_some(rect)
             })
     }
 

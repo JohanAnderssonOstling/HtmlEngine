@@ -48,51 +48,70 @@ impl ContentSemantics {
         self.roles |= 1 << role as u8;
     }
 
-    fn add_book_tokens(&mut self, value: Option<&str>, aria: bool) {
-        for token in value.into_iter().flat_map(str::split_ascii_whitespace) {
-            let token = token.to_ascii_lowercase();
-            let exact = if aria {
-                token.strip_prefix("doc-")
-            } else {
-                Some(token.as_str())
-            };
-            match exact {
-                Some(
-                    "chapter" | "part" | "appendix" | "prologue" | "epilogue" | "foreword"
-                    | "preface" | "introduction" | "conclusion" | "acknowledgments" | "afterword"
-                    | "bibliography" | "glossary" | "index" | "colophon",
-                ) => self.insert(ContentRole::MajorSection),
-                Some(
-                    "titlepage" | "halftitlepage" | "copyright-page" | "frontmatter" | "bodymatter"
-                    | "backmatter",
-                ) if !aria => self.insert(ContentRole::MajorSection),
-                _ => {}
+    fn add_book_tokens<'a>(&mut self, tokens: impl IntoIterator<Item = &'a str>, aria: bool) {
+        for token in tokens {
+            let exact = if aria { doc_role(token) } else { Some(token) };
+            if token_is(
+                exact,
+                &[
+                    "chapter",
+                    "part",
+                    "appendix",
+                    "prologue",
+                    "epilogue",
+                    "foreword",
+                    "preface",
+                    "introduction",
+                    "conclusion",
+                    "acknowledgments",
+                    "afterword",
+                    "bibliography",
+                    "glossary",
+                    "index",
+                    "colophon",
+                ],
+            ) || (!aria
+                && token_is(
+                    exact,
+                    &[
+                        "titlepage",
+                        "halftitlepage",
+                        "copyright-page",
+                        "frontmatter",
+                        "bodymatter",
+                        "backmatter",
+                    ],
+                ))
+            {
+                self.insert(ContentRole::MajorSection);
             }
             // Compact structures accept vocabulary prefixes; chapter/sidebar
             // roles above intentionally require exact tokens.
             let suffix = token.rsplit(':').next().unwrap_or_default();
-            let kind = if aria {
-                suffix.strip_prefix("doc-")
-            } else {
-                Some(suffix)
-            };
-            match kind {
-                Some("example") => {
-                    self.insert(ContentRole::Statement);
-                    self.insert(ContentRole::CompactStructure);
-                }
-                Some("theorem" | "proof" | "exercise") if !aria => {
-                    self.insert(ContentRole::Statement);
-                    self.insert(ContentRole::CompactStructure);
-                }
-                Some(
-                    "epigraph" | "biblioentry" | "dedication" | "abstract" | "notice" | "pullquote",
-                ) => self.insert(ContentRole::CompactStructure),
-                Some("poem" | "verse" | "stanza") if !aria => {
-                    self.insert(ContentRole::CompactStructure)
-                }
-                Some("label") if !aria => self.insert(ContentRole::Label),
-                _ => {}
+            let kind = if aria { doc_role(suffix) } else { Some(suffix) };
+            let statement = token_is(kind, &["example"])
+                || (!aria && token_is(kind, &["theorem", "proof", "exercise"]));
+            if statement {
+                self.insert(ContentRole::Statement);
+            }
+            if statement
+                || token_is(
+                    kind,
+                    &[
+                        "epigraph",
+                        "biblioentry",
+                        "dedication",
+                        "abstract",
+                        "notice",
+                        "pullquote",
+                    ],
+                )
+                || (!aria && token_is(kind, &["poem", "verse", "stanza"]))
+            {
+                self.insert(ContentRole::CompactStructure);
+            }
+            if !aria && token_is(kind, &["label"]) {
+                self.insert(ContentRole::Label);
             }
         }
     }
@@ -124,10 +143,8 @@ impl RenderSemanticsView<'_> {
             return result;
         };
         let tag = element.tag();
-        let epub_type = element
-            .attr("epub:type")
-            .or_else(|| element.attr_expanded(Some("http://www.idpf.org/2007/ops"), "type"));
-        let aria_role = element.attr("role");
+        let epub_types = element.epub_types();
+        let aria_roles = element.aria_roles();
         if let Some(level) = ["h1", "h2", "h3", "h4", "h5", "h6"]
             .iter()
             .position(|heading| tag.eq_ignore_ascii_case(heading))
@@ -162,12 +179,12 @@ impl RenderSemanticsView<'_> {
         if element_is_note_reference(element) {
             result.insert(ContentRole::NoteReference);
         }
-        result.add_book_tokens(epub_type, false);
-        result.add_book_tokens(aria_role, true);
+        result.add_book_tokens(epub_types.clone(), false);
+        result.add_book_tokens(aria_roles.clone(), true);
         if !result.has_role(ContentRole::Note)
             && (tag.eq_ignore_ascii_case("aside")
-                || has_token(epub_type, "sidebar")
-                || has_token(aria_role, "complementary"))
+                || has_token(epub_types, "sidebar")
+                || has_token(aria_roles, "complementary"))
         {
             result.insert(ContentRole::Sidebar);
         }
@@ -226,10 +243,23 @@ impl RenderSemanticsView<'_> {
     }
 }
 
-fn has_token(value: Option<&str>, expected: &str) -> bool {
-    value.is_some_and(|value| {
-        value
-            .split_ascii_whitespace()
-            .any(|token| token.eq_ignore_ascii_case(expected))
+fn has_token<'a>(tokens: impl IntoIterator<Item = &'a str>, expected: &str) -> bool {
+    tokens
+        .into_iter()
+        .any(|token| token.eq_ignore_ascii_case(expected))
+}
+
+fn token_is(token: Option<&str>, candidates: &[&str]) -> bool {
+    token.is_some_and(|token| {
+        candidates
+            .iter()
+            .any(|candidate| token.eq_ignore_ascii_case(candidate))
     })
+}
+
+fn doc_role(token: &str) -> Option<&str> {
+    token
+        .get(..4)?
+        .eq_ignore_ascii_case("doc-")
+        .then(|| &token[4..])
 }

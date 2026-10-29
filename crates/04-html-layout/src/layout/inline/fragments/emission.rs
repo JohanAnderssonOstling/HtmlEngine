@@ -180,11 +180,7 @@ fn resolve_inline_fragment_ancestors(
                 let style = engine.reader.style(box_idx);
                 let font_size = style.font_size() as f64;
                 let font_metrics = engine.reader.font_metrics(box_idx);
-                let (ascent, descent) = font_metrics
-                    .line_box_ratios()
-                    .map_or((font_size * 0.8, font_size * 0.2), |(ascent, descent)| {
-                        (font_size * ascent as f64, font_size * descent as f64)
-                    });
+                let (ascent, descent) = font_metrics.line_box_extents(font_size);
                 let mut top = fragment_baseline - ascent as f32;
                 let mut bottom = fragment_baseline + descent as f32;
                 let trim = style.text_box_trim();
@@ -328,8 +324,13 @@ fn positioned_inline_box_fragments_from<'a>(
         // use each token's own ascent, descent, and placement below.
         if cached_owner != Some(owner) {
             resolve_inline_fragment_ancestors(
-                engine, container_box_idx, owner, line_height, baseline,
-                containing_width, &mut ancestors,
+                engine,
+                container_box_idx,
+                owner,
+                line_height,
+                baseline,
+                containing_width,
+                &mut ancestors,
             );
             cached_owner = Some(owner);
         }
@@ -337,19 +338,20 @@ fn positioned_inline_box_fragments_from<'a>(
             let box_idx = ancestor.box_idx;
             let relative_offset = ancestor.relative_offset;
             let fragment_baseline = ancestor.baseline;
-            let (fragment_top, fragment_bottom) = ancestor.content_bounds
-                .unwrap_or((token_top, token_bottom));
+            let (fragment_top, fragment_bottom) =
+                ancestor.content_bounds.unwrap_or((token_top, token_bottom));
             let own_boundary = boundary.filter(|boundary| boundary.0 == box_idx);
             let fragment_start = (own_boundary.map_or(placement.x, |boundary| boundary.1)
                 + relative_offset.x) as f32;
             let fragment_end = (own_boundary
                 .map_or(placement.x + placement.advance, |boundary| boundary.1)
                 + relative_offset.x) as f32;
-            if let Some(fragment) = bounds
-                .iter_mut()
-                .find(|fragment| fragment.box_idx as usize == box_idx
-                    && (!bidi || (fragment.start_x <= fragment_end + 0.001 && fragment.end_x >= fragment_start - 0.001)))
-            {
+            if let Some(fragment) = bounds.iter_mut().find(|fragment| {
+                fragment.box_idx as usize == box_idx
+                    && (!bidi
+                        || (fragment.start_x <= fragment_end + 0.001
+                            && fragment.end_x >= fragment_start - 0.001))
+            }) {
                 fragment.paint_order = fragment.paint_order.min(paint_order);
                 fragment.start_x = fragment.start_x.min(fragment_start);
                 fragment.end_x = fragment.end_x.max(fragment_end);
@@ -405,19 +407,27 @@ fn positioned_inline_box_fragments_from<'a>(
         }
     }
     if bidi {
-        bounds.sort_by(|a, b| a.box_idx.cmp(&b.box_idx).then(a.start_x.total_cmp(&b.start_x)));
+        bounds.sort_by(|a, b| {
+            a.box_idx
+                .cmp(&b.box_idx)
+                .then(a.start_x.total_cmp(&b.start_x))
+        });
         let mut merged: Vec<LineInlineBoxFragment> = Vec::with_capacity(bounds.len());
         for fragment in bounds {
-            if let Some(previous) = merged.last_mut().filter(|previous| previous.box_idx == fragment.box_idx
-                && (previous.flags ^ fragment.flags) & LineInlineBoxFragment::BORDER_BOX_BOUNDS == 0
-                && previous.end_x + 0.001 >= fragment.start_x)
-            {
+            if let Some(previous) = merged.last_mut().filter(|previous| {
+                previous.box_idx == fragment.box_idx
+                    && (previous.flags ^ fragment.flags) & LineInlineBoxFragment::BORDER_BOX_BOUNDS
+                        == 0
+                    && previous.end_x + 0.001 >= fragment.start_x
+            }) {
                 previous.end_x = previous.end_x.max(fragment.end_x);
                 previous.top = previous.top.min(fragment.top);
                 previous.bottom = previous.bottom.max(fragment.bottom);
                 previous.paint_order = previous.paint_order.min(fragment.paint_order);
                 previous.flags |= fragment.flags;
-            } else { merged.push(fragment); }
+            } else {
+                merged.push(fragment);
+            }
         }
         bounds = merged;
     }
@@ -484,15 +494,12 @@ fn inline_fragment_vertical_align_offset(
         let style = engine.reader.style(current_idx);
         let value = style.vertical_align();
         if !value.is_initial() {
-            let own_line_height = resolved_line_height(style);
+            let own_line_height = style.resolved_line_height();
             let font_size = style.font_size() as f64;
             let (ascent, descent) = engine
                 .reader
                 .font_metrics(current_idx)
-                .line_box_ratios()
-                .map_or((font_size * 0.8, font_size * 0.2), |(ascent, descent)| {
-                    (font_size * ascent as f64, font_size * descent as f64)
-                });
+                .line_box_extents(font_size);
             let half_leading = (own_line_height - ascent - descent) * 0.5;
             let (parent_ascent, parent_descent) = parent_font_content_extents(engine, current_idx);
             offset += vertical_align_metrics_offset(
@@ -625,8 +632,7 @@ pub(super) fn line_publishes(
                 }
             }
             InlineTokenKind::Glyph { glyph_idx } => {
-                let glyph = engine.text.glyph_at(glyph_idx as usize).unwrap_or_default();
-                let character = engine.text.glyph_metric(glyph).ch();
+                let character = engine.text.character(glyph_idx);
                 token.width != 0.0
                     || !character.is_whitespace()
                     || token.run_metrics(runs).white_space.preserves_spaces()
@@ -639,7 +645,7 @@ pub(super) fn line_publishes(
 ///
 /// The write phase only mutates the document; all layout decisions have
 /// already been made by `break_lines` and `measure_line`.
-pub(super) fn write_line_fragments(
+pub(in crate::layout::inline) fn write_line_fragments(
     engine: &mut crate::layout::LayoutEngine<'_, '_>,
     container_box_idx: usize,
     span: &[InlineToken],
@@ -669,7 +675,12 @@ pub(super) fn write_line_fragments(
             .fragments
             .push_inline_box_fragments(inline_box_fragments, engine.reader.box_count());
         let layout = engine.fragments.state_mut();
-        let details = layout.line_output.push_details(line.optical_offset_x, paint_color, None, inline_box_fragments);
+        let details = layout.line_output.push_details(
+            line.optical_offset_x,
+            paint_color,
+            None,
+            inline_box_fragments,
+        );
         layout.line_output.lines.push(Line {
             owner_box_idx: container_box_idx as u32,
             glyphs: line.glyph_range.clone(),
@@ -683,14 +694,17 @@ pub(super) fn write_line_fragments(
             native_text_runs_complete: false,
         });
         layout.line_output.line_glyph_offsets.push(Vec::new());
-        layout.line_output.line_glyph_advances.push(
-            line.punctuation_space_advances
-                .iter()
-                .map(|&(glyph_idx, advance)| GlyphAdvanceRun {
-                    range: glyph_idx..glyph_idx + 1,
-                    advance,
-                }),
-        );
+        layout
+            .line_output
+            .line_glyph_advances
+            .push(
+                line.punctuation_space_advances
+                    .iter()
+                    .map(|&(glyph_idx, advance)| GlyphAdvanceRun {
+                        range: glyph_idx..glyph_idx + 1,
+                        advance,
+                    }),
+            );
         if let Some((glyph, x)) = line.hyphen {
             layout.line_output.hyphen_fragments.push(HyphenFragment {
                 line_idx,
@@ -699,7 +713,7 @@ pub(super) fn write_line_fragments(
                 visible: true,
             });
         }
-        engine.push_line_owner(container_box_idx as u32);
+        engine.placement.record_line();
         engine.record_timing(|timings| {
             timings.write_line_fragments += timing_started.elapsed();
         });
@@ -759,7 +773,12 @@ pub(super) fn write_line_fragments(
             .fragments
             .push_inline_box_fragments(inline_box_fragments, engine.reader.box_count());
         let layout = engine.fragments.state_mut();
-        let details = layout.line_output.push_details(line.optical_offset_x, paint_color, text_fragments, inline_box_fragments);
+        let details = layout.line_output.push_details(
+            line.optical_offset_x,
+            paint_color,
+            text_fragments,
+            inline_box_fragments,
+        );
         layout.line_output.lines.push(Line {
             owner_box_idx: container_box_idx as u32,
             glyphs: line.glyph_range.clone(),
@@ -787,9 +806,7 @@ pub(super) fn write_line_fragments(
                 visible,
             });
         }
-        // Ownership is also the transient stacking-order key. Finalization
-        // drops it after sorting when overflow clips are not needed.
-        engine.push_line_owner(container_box_idx as u32);
+        engine.placement.record_line();
     }
 
     let Some(placements) = line.placements.as_deref() else {
@@ -888,10 +905,10 @@ pub(super) fn write_line_fragments(
             let height = engine.reader.style(*box_idx as usize).height();
             let authored_height_is_definite = match height {
                 UsedPreferredSize::Px(_) => true,
-                UsedPreferredSize::Percent(_)
-                | UsedPreferredSize::Stretch => containing_height.is_some(),
-                UsedPreferredSize::Calc { .. }
-                | UsedPreferredSize::Comparison { .. } => {
+                UsedPreferredSize::Percent(_) | UsedPreferredSize::Stretch => {
+                    containing_height.is_some()
+                }
+                UsedPreferredSize::Calc { .. } | UsedPreferredSize::Comparison { .. } => {
                     !height.percentage_dependent() || containing_height.is_some()
                 }
                 UsedPreferredSize::Auto
@@ -900,7 +917,7 @@ pub(super) fn write_line_fragments(
                 | UsedPreferredSize::MaxContent
                 | UsedPreferredSize::FitContent => false,
             };
-            let request = crate::layout::BoxLayoutRequest::atomic_assigned(
+            let request = crate::layout::BoxLayoutRequest::assigned(
                 *box_idx as usize,
                 *containing_width,
                 *containing_height,
@@ -908,7 +925,11 @@ pub(super) fn write_line_fragments(
                 authored_height_is_definite,
             );
             let _ = engine.layout_box(request);
-            engine.fragments.state_mut().paint_program.record_line_since(paint_start, line_idx, paint_order);
+            engine
+                .fragments
+                .state_mut()
+                .paint_program
+                .record_line_since(paint_start, line_idx, paint_order);
             // CSS paints an inline-block (and the non-positioned contents it
             // establishes) atomically at this point in the owning line. Keep
             // its block decorations with that line instead of replaying them
@@ -922,9 +943,19 @@ pub(super) fn write_line_fragments(
         } else if let InlineTokenKind::Glyph { glyph_idx } = token.kind() {
             debug_assert!(publishes_line);
             let metrics = token.run_metrics(runs);
-            let scaled_space = matches!(engine.text.glyph_metric(engine.text.glyph_at(glyph_idx as usize).unwrap_or_default()).ch(), ' ' | '\u{00a0}')
-                && engine.reader.style(metrics.owner_box_idx as usize).word_spacing_factor() != 1.0;
-            let justified_space = line.punctuation_space_advances.iter().find(|&&(index, _)| index == glyph_idx).map(|&(_, advance)| advance);
+            let scaled_space = matches!(
+                engine.text.character(glyph_idx),
+                ' ' | '\u{00a0}'
+            ) && engine
+                .reader
+                .style(metrics.owner_box_idx as usize)
+                .word_spacing_factor()
+                != 1.0;
+            let justified_space = line
+                .punctuation_space_advances
+                .iter()
+                .find(|&&(index, _)| index == glyph_idx)
+                .map(|&(_, advance)| advance);
             let layout = engine.fragments.state_mut();
             if offset != 0.0 {
                 push_glyph_offset_run(
@@ -935,10 +966,13 @@ pub(super) fn write_line_fragments(
                 );
             }
             if token.is_tab() || scaled_space || justified_space.is_some() {
-                layout.line_output.line_glyph_advances.push_to(line_idx, GlyphAdvanceRun {
-                    range: glyph_idx..glyph_idx + 1,
-                    advance: justified_space.unwrap_or(placement.advance as f32),
-                });
+                layout.line_output.line_glyph_advances.push_to(
+                    line_idx,
+                    GlyphAdvanceRun {
+                        range: glyph_idx..glyph_idx + 1,
+                        advance: justified_space.unwrap_or(placement.advance as f32),
+                    },
+                );
             }
         } else if let InlineTokenKind::Ellipsis { glyph } = token.kind() {
             debug_assert!(publishes_line);
@@ -978,16 +1012,24 @@ pub(super) fn write_line_fragments(
 ///
 /// Adjacent glyphs with the same vertical offset are merged so the document
 /// stores compact offset ranges instead of one entry per glyph.
-fn push_glyph_offset_run(offsets: &mut GroupedArena<GlyphOffsetRun>, line_idx: usize, glyph_idx: u32, offset: f32) {
+fn push_glyph_offset_run(
+    offsets: &mut GroupedArena<GlyphOffsetRun>,
+    line_idx: usize,
+    glyph_idx: u32,
+    offset: f32,
+) {
     if let Some(last) = offsets
         .last_mut(line_idx)
         .filter(|last| last.range.end == glyph_idx && last.offset == offset)
     {
         last.range.end = glyph_idx + 1;
     } else {
-        offsets.push_to(line_idx, GlyphOffsetRun {
-            range: glyph_idx..glyph_idx + 1,
-            offset,
-        });
+        offsets.push_to(
+            line_idx,
+            GlyphOffsetRun {
+                range: glyph_idx..glyph_idx + 1,
+                offset,
+            },
+        );
     }
 }

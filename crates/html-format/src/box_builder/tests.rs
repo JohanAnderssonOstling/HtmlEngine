@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::layout_model::{BlockBox, Children, GlyphId, InlineItemKind, LayoutMode};
+    use crate::layout_model::{BlockBox, Children, InlineItemKind, LayoutMode};
     use crate::parser::DocumentFactory;
 
     #[test]
@@ -146,13 +146,10 @@ mod tests {
             })
             .flatten()
             .map(|glyph| {
-                char::from_u32(
-                    document
-                        .inline_content()
-                        .character_at(glyph as usize)
-                        .expect("source glyph"),
-                )
-                .expect("Unicode scalar")
+                document
+                    .inline_content()
+                    .character_at(glyph as usize)
+                    .expect("source character")
             })
             .collect::<String>();
         assert_eq!(
@@ -610,7 +607,7 @@ mod tests {
             if let InlineItemKind::Text { glyphs } = &run.kind
                 && document.inline_content().characters()
                     [glyphs.start as usize..glyphs.end as usize]
-                    .contains(&(' ' as GlyphId))
+                    .contains(&' ')
             {
                 saw_space = true;
                 break;
@@ -639,7 +636,7 @@ mod tests {
                     document.inline_content().characters()
                         [glyphs.start as usize..glyphs.end as usize]
                         .iter()
-                        .map(|&glyph| char::from_u32(glyph).expect("glyph should be valid char"))
+                        .copied()
                         .collect::<String>(),
                 ),
                 _ => None,
@@ -996,7 +993,7 @@ mod tests {
                     document.inline_content().characters()
                         [glyphs.start as usize..glyphs.end as usize]
                         .iter()
-                        .filter_map(|glyph| char::from_u32(*glyph))
+                        .copied()
                         .collect::<String>(),
                 ),
                 _ => None,
@@ -1059,7 +1056,7 @@ mod tests {
                     document.inline_content().characters()
                         [glyphs.start as usize..glyphs.end as usize]
                         .iter()
-                        .filter_map(|glyph| char::from_u32(*glyph))
+                        .copied()
                         .collect::<String>(),
                 ),
                 _ => None,
@@ -1094,7 +1091,7 @@ mod tests {
                     document.inline_content().characters()
                         [glyphs.start as usize..glyphs.end as usize]
                         .iter()
-                        .filter_map(|glyph| char::from_u32(*glyph))
+                        .copied()
                         .collect::<String>(),
                 ),
                 _ => None,
@@ -1123,7 +1120,7 @@ mod tests {
                     if document.inline_content().characters()
                         [glyphs.start as usize..glyphs.end as usize]
                         .iter()
-                        .any(|glyph| char::from_u32(*glyph) == Some('\u{25aa}')) =>
+                        .any(|&glyph| glyph == '\u{25aa}') =>
                 {
                     Some(run.box_idx as usize)
                 }
@@ -1157,7 +1154,7 @@ mod tests {
                     document.inline_content().characters()
                         [glyphs.start as usize..glyphs.end as usize]
                         .iter()
-                        .filter_map(|glyph| char::from_u32(*glyph))
+                        .copied()
                         .collect::<String>(),
                 ),
                 _ => None,
@@ -1183,7 +1180,7 @@ mod tests {
                     document.inline_content().characters()
                         [glyphs.start as usize..glyphs.end as usize]
                         .iter()
-                        .filter_map(|glyph| char::from_u32(*glyph))
+                        .copied()
                         .collect::<String>(),
                 ),
                 _ => None,
@@ -1209,7 +1206,7 @@ mod tests {
                     document.inline_content().characters()
                         [glyphs.start as usize..glyphs.end as usize]
                         .iter()
-                        .filter_map(|glyph| char::from_u32(*glyph))
+                        .copied()
                         .collect::<String>(),
                 ),
                 _ => None,
@@ -1235,7 +1232,7 @@ mod tests {
                     document.inline_content().characters()
                         [glyphs.start as usize..glyphs.end as usize]
                         .iter()
-                        .filter_map(|glyph| char::from_u32(*glyph))
+                        .copied()
                         .collect::<String>(),
                 ),
                 _ => None,
@@ -1261,7 +1258,7 @@ mod tests {
                     document.inline_content().characters()
                         [glyphs.start as usize..glyphs.end as usize]
                         .iter()
-                        .filter_map(|glyph| char::from_u32(*glyph))
+                        .copied()
                         .collect::<String>(),
                 ),
                 _ => None,
@@ -1286,7 +1283,7 @@ mod tests {
                     document.inline_content().characters()
                         [glyphs.start as usize..glyphs.end as usize]
                         .iter()
-                        .filter_map(|glyph| char::from_u32(*glyph))
+                        .copied()
                         .collect::<String>(),
                 ),
                 _ => None,
@@ -1319,7 +1316,7 @@ mod tests {
                     document.inline_content().characters()
                         [glyphs.start as usize..glyphs.end as usize]
                         .iter()
-                        .filter_map(|glyph| char::from_u32(*glyph))
+                        .copied()
                         .collect::<String>(),
                 ),
                 _ => None,
@@ -1382,7 +1379,7 @@ mod tests {
                     document.inline_content().characters()
                         [glyphs.start as usize..glyphs.end as usize]
                         .iter()
-                        .filter_map(|glyph| char::from_u32(*glyph))
+                        .copied()
                         .collect::<String>(),
                 ),
                 _ => None,
@@ -1509,7 +1506,7 @@ mod tests {
                         document.inline_content().characters()
                             [glyphs.start as usize..glyphs.end as usize]
                             .iter()
-                            .filter_map(|glyph| char::from_u32(*glyph))
+                            .copied()
                             .collect::<String>(),
                     ),
                     _ => None,
@@ -1545,7 +1542,7 @@ mod tests {
                     document.inline_content().characters()
                         [glyphs.start as usize..glyphs.end as usize]
                         .iter()
-                        .filter_map(|glyph| char::from_u32(*glyph))
+                        .copied()
                         .collect::<String>(),
                 ),
                 _ => None,
@@ -1621,7 +1618,7 @@ mod tests {
                     document.inline_content().characters()
                         [glyphs.start as usize..glyphs.end as usize]
                         .iter()
-                        .filter_map(|glyph| char::from_u32(*glyph))
+                        .copied()
                         .collect::<String>(),
                 ),
                 _ => None,
@@ -1681,7 +1678,7 @@ mod tests {
                     document.inline_content().characters()
                         [glyphs.start as usize..glyphs.end as usize]
                         .iter()
-                        .filter_map(|glyph| char::from_u32(*glyph))
+                        .copied()
                         .collect::<String>(),
                 ),
                 _ => None,
@@ -1724,7 +1721,7 @@ mod tests {
                     document.inline_content().characters()
                         [glyphs.start as usize..glyphs.end as usize]
                         .iter()
-                        .filter_map(|glyph| char::from_u32(*glyph))
+                        .copied()
                         .collect::<String>(),
                 ),
                 _ => None,
@@ -1778,7 +1775,7 @@ mod tests {
                     document.inline_content().characters()
                         [glyphs.start as usize..glyphs.end as usize]
                         .iter()
-                        .filter_map(|glyph| char::from_u32(*glyph))
+                        .copied()
                         .collect::<String>(),
                 ),
                 _ => None,

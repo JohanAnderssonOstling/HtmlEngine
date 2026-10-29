@@ -1,18 +1,5 @@
 //! Font shaping of prepared logical text; no viewport layout or lifecycle ownership.
 #![cfg_attr(not(test), forbid(unsafe_code))]
-macro_rules! profile_scope {
-    ($name:literal) => {
-        #[cfg(feature = "profiling")]
-        let _profile_scope = crate::profiling::scope($name);
-    };
-}
-
-macro_rules! profile {
-    ($name:literal, $operation:expr) => {{
-        profile_scope!($name);
-        $operation
-    }};
-}
 
 #[cfg(test)]
 use html_engine_model as layout_model;
@@ -35,7 +22,7 @@ use html_text::{
     collapse_whitespace, first_letter_overrides_with_characters, first_letter_style_overrides,
     is_css_collapsible_space, transform_text,
 };
-use spans::{plan_shaping_spans, text_runs};
+use spans::plan_shaping_spans;
 #[cfg(test)]
 mod parser {
     pub(crate) use crate::test_support::DocumentFactory;

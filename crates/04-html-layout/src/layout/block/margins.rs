@@ -12,13 +12,13 @@ use super::margin_cache::MarginCache;
 /// CSS collapses the largest positive margin with the most-negative margin;
 /// summing every margin would be incorrect for chains of three or more boxes.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub(super) struct MarginStrut {
+pub(crate) struct MarginStrut {
     largest_positive: f64,
     smallest_negative: f64,
 }
 
 impl MarginStrut {
-    pub(super) fn from_margin(margin: f64) -> Self {
+    pub(in crate::layout) fn from_margin(margin: f64) -> Self {
         let mut result = Self::default();
         result.add(margin);
         result
@@ -187,10 +187,7 @@ pub(in crate::layout) fn stretch_margin_inset(
     let (before, after) = reader.vertical_margins(box_idx, cb_width);
     let both = before + after;
     if participation(style.float(), style.position()) != FlowParticipation::InFlow
-        || matches!(
-            style.display(),
-            Display::InlineBlock | Display::InlineTable | Display::InlineFlex | Display::InlineGrid
-        )
+        || style.display().is_atomic_inline()
     {
         return both;
     }
@@ -336,39 +333,11 @@ pub(super) fn permits_zero_height_collapse(size: PreferredSize) -> bool {
 #[derive(Default)]
 pub(in crate::layout) struct MarginAnalysis {
     cache: MarginCache,
-    natural_content_heights: Vec<Option<f64>>,
 }
 
 impl MarginAnalysis {
     pub(in crate::layout) fn reset(&mut self) {
         self.cache.clear();
-        self.natural_content_heights.clear();
-    }
-
-    pub fn record_natural_content_height(&mut self, box_idx: usize, height: f64) {
-        if self.natural_content_heights.len() <= box_idx {
-            self.natural_content_heights.resize(box_idx + 1, None);
-        }
-        self.natural_content_heights[box_idx] = Some(height);
-    }
-
-    pub fn natural_content_height(&self, box_idx: usize) -> f64 {
-        self.natural_content_heights
-            .get(box_idx)
-            .and_then(|height| *height)
-            .unwrap_or(0.0)
-    }
-
-    pub(super) fn record_used_after_margin(
-        &mut self,
-        box_idx: usize,
-        cb_width: f64,
-        parent_content_height: Option<f64>,
-        margin: MarginStrut,
-    ) {
-        let height_key = parent_content_height.map(f64::to_bits).unwrap_or(u64::MAX);
-        self.cache
-            .insert_after_margin(box_idx, cb_width.to_bits(), height_key, margin);
     }
 
     /// Computes the vertical margin set exposed by this box to its parent.
@@ -630,102 +599,60 @@ impl MarginAnalysis {
             leading_bfc_float_sides,
         }
     }
+}
 
-    /// Resolves the trailing margin after the box has been laid out. CSS bases
-    /// min/max-height exceptions on used values: a constraint only stops the
-    /// last child's bottom margin from escaping when it actually changes the
-    /// parent's natural content height.
-    pub(super) fn used_after_margin(
-        &mut self,
-        reader: &crate::layout::read_context::LayoutReader<'_>,
-        box_idx: usize,
-        cb_width: f64,
-        parent_content_height: Option<f64>,
-    ) -> MarginStrut {
-        let width_key = cb_width.to_bits();
-        let height_key = parent_content_height.map(f64::to_bits).unwrap_or(u64::MAX);
-        if let Some(margin) = self.cache.after_margin(box_idx, width_key, height_key) {
-            return margin;
-        }
-
-        let style = reader.style(box_idx);
-        let (_, own_after) = reader.vertical_margins(box_idx, cb_width);
-        let is_flex_grid_item = reader.get_parent(box_idx).is_some_and(|parent_idx| {
-            matches!(
-                reader.box_layout_mode(parent_idx),
-                Some(BoxType::Flex(_) | BoxType::Grid(_))
-            )
-        });
-        let (overflow_x, overflow_y) = reader.effective_overflow_modes(box_idx);
-        let establishes_context = establishes_formatting_context(
-            style.display(),
-            overflow_x,
-            overflow_y,
-            matches!(style.float(), Float::Left | Float::Right),
-            reader.root_box() == Some(box_idx),
-            reader.is_table_cell_box(box_idx),
-            is_flex_grid_item,
-        );
-        let edge_open = !establishes_context
-            && style.padding_bottom().is_zero()
-            && style.border_bottom_width() == 0.0
-            && matches!(style.height(), PreferredSize::Auto);
-        let vertical_inset = if matches!(style.box_sizing(), BoxSizing::BorderBox) {
-            style.get_vertical_padding(cb_width)
-                + style.border_top_width() as f64
-                + style.border_bottom_width() as f64
-        } else {
-            0.0
-        };
-        let minimum = crate::layout::box_constraints::resolve_vertical_min_size(
-            style.min_height(),
-            parent_content_height,
-            vertical_inset,
-        );
-        let maximum =
-            resolve_vertical_size(style.max_height(), parent_content_height, vertical_inset)
-                .map(|maximum| maximum.max(minimum.unwrap_or(0.0)));
-        let descendant_height_basis =
-            resolve_vertical_size(style.height(), parent_content_height, vertical_inset);
-        let natural_height = self.natural_content_height(box_idx);
-        let minimum_blocks_child = minimum.is_some_and(|minimum| natural_height < minimum);
-        let maximum_blocks_child = maximum.is_some_and(|maximum| natural_height > maximum);
-
-        let mut after = MarginStrut::from_margin(own_after);
-        let trailing_children = (edge_open && !minimum_blocks_child && !maximum_blocks_child)
-            .then(|| match reader.box_layout_mode(box_idx) {
-                Some(BoxType::Block(block)) => match &block.children {
-                    Children::Blocks(children) => Some(children.as_slice()),
-                    _ => None,
-                },
-                _ => None,
-            })
-            .flatten();
-        if let Some(children) = trailing_children {
-            for child in children.iter().rev() {
-                let child_idx = *child as usize;
-                let profile = self.margin_profile(reader, child_idx, cb_width);
-                if matches!(profile.participation, FlowParticipation::Float) {
-                    continue;
-                }
-                after.merge(self.used_after_margin(
-                    reader,
-                    child_idx,
-                    cb_width,
-                    descendant_height_basis,
-                ));
-                if profile.collapses_through {
-                    after.merge(profile.before);
-                    continue;
-                }
-                break;
-            }
-        }
-
-        self.cache
-            .insert_after_margin(box_idx, width_key, height_key, after);
-        after
+/// Resolve the parent's trailing margin from the completed flow result.
+pub(super) fn used_after_margin(
+    reader: &crate::layout::read_context::LayoutReader<'_>,
+    box_idx: usize,
+    cb_width: f64,
+    parent_content_height: Option<f64>,
+    natural_height: f64,
+    trailing_margin: MarginStrut,
+) -> MarginStrut {
+    let style = reader.style(box_idx);
+    let (_, own_after) = reader.vertical_margins(box_idx, cb_width);
+    let is_flex_grid_item = reader.get_parent(box_idx).is_some_and(|parent_idx| {
+        matches!(
+            reader.box_layout_mode(parent_idx),
+            Some(BoxType::Flex(_) | BoxType::Grid(_))
+        )
+    });
+    let (overflow_x, overflow_y) = reader.effective_overflow_modes(box_idx);
+    let establishes_context = establishes_formatting_context(
+        style.display(),
+        overflow_x,
+        overflow_y,
+        matches!(style.float(), Float::Left | Float::Right),
+        reader.root_box() == Some(box_idx),
+        reader.is_table_cell_box(box_idx),
+        is_flex_grid_item,
+    );
+    let edge_open = !establishes_context
+        && style.padding_bottom().is_zero()
+        && style.border_bottom_width() == 0.0
+        && matches!(style.height(), PreferredSize::Auto);
+    let vertical_inset = if matches!(style.box_sizing(), BoxSizing::BorderBox) {
+        style.get_vertical_padding(cb_width)
+            + style.border_top_width() as f64
+            + style.border_bottom_width() as f64
+    } else {
+        0.0
+    };
+    let minimum = crate::layout::box_constraints::resolve_vertical_min_size(
+        style.min_height(),
+        parent_content_height,
+        vertical_inset,
+    );
+    let maximum = resolve_vertical_size(style.max_height(), parent_content_height, vertical_inset)
+        .map(|maximum| maximum.max(minimum.unwrap_or(0.0)));
+    let minimum_blocks_child = minimum.is_some_and(|minimum| natural_height < minimum);
+    let maximum_blocks_child = maximum.is_some_and(|maximum| natural_height > maximum);
+    let mut after = MarginStrut::from_margin(own_after);
+    if edge_open && !minimum_blocks_child && !maximum_blocks_child {
+        after.merge(trailing_margin);
     }
+    after
 }
 
 #[cfg(test)]

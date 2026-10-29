@@ -1,15 +1,25 @@
 [package]
 license.workspace = true
-name = "html-resources"
-version = "0.1.0"
-edition = "2024"
-publish = false
+name = "skrift-resources"
+version.workspace = true
+edition.workspace = true
+publish = ["crates-io"]
+description = "Loads images and other document resources."
+repository.workspace = true
+homepage.workspace = true
+categories.workspace = true
+keywords.workspace = true
+readme = "README.md"
+include.workspace = true
+documentation = "https://docs.rs/skrift-resources"
+
+[lib]
+name = "html_resources"
 
 [dependencies]
 base64 = "0.22"
-html-dom = { path = "../html-dom" }
-html-source = { path = "../01-html-source" }
+html-dom = { version = "0.1.0", package = "skrift-dom", path = "../html-dom" }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
 peniko.workspace = true
-quick-xml = "0.38"
+quick-xml.workspace = true
 sha2 = "0.10"

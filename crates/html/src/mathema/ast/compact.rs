@@ -1,0 +1,1559 @@
+// Bundled from mathema, revision d9cce9ffeb7346181d4c3201dc0a13727269863b.
+// SPDX-License-Identifier: Apache-2.0
+// Modified for HtmlEngine: internal module paths and disabled upstream features.
+// See UPSTREAM.txt and LICENSE-APACHE in the mathema module directory.
+
+use smallvec::SmallVec;
+
+use super::arena::AstArena;
+use super::{
+    AccentPosition, ColumnAlign, DisplayStyle, FencedItem, FractionKind, LimitStyle, MathAtomType,
+    MathExpr, MathNode, OperatorAttr, PhantomKind, Rational, StrokeKind, SymbolKind, TextStyle,
+};
+
+// ── Index types ────────────────────────────────────────────────────────
+
+/// Index into `AstArena::nodes`. 4 bytes.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct NodeId(u32);
+
+impl NodeId {
+    /// Sentinel value representing "no node" (replaces `Option<Box<MathNode>>`).
+    pub const NONE: Self = Self(u32::MAX);
+
+    #[inline]
+    pub(crate) fn new(raw: u32) -> Self {
+        debug_assert!(
+            raw < u32::MAX,
+            "NodeId::new called with u32::MAX (reserved for NONE)"
+        );
+        Self(raw)
+    }
+
+    /// Returns `true` if this is the `NONE` sentinel (no node).
+    #[inline]
+    pub fn is_none(self) -> bool {
+        self.0 == u32::MAX
+    }
+
+    /// Returns `true` if this refers to an actual node (not the `NONE` sentinel).
+    #[inline]
+    pub fn is_some(self) -> bool {
+        self.0 != u32::MAX
+    }
+
+    /// Returns the raw `u32` index into `AstArena::nodes`.
+    #[inline]
+    pub fn raw(self) -> u32 {
+        self.0
+    }
+
+    #[inline]
+    pub(crate) fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// Contiguous range of children in `AstArena::children`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct NodeSpan {
+    start: u32,
+    len: u16,
+}
+
+impl NodeSpan {
+    /// Empty span: zero children starting at index 0.
+    pub const EMPTY: Self = Self { start: 0, len: 0 };
+
+    #[inline]
+    pub(crate) fn new(start: u32, len: u16) -> Self {
+        Self { start, len }
+    }
+
+    /// Returns the start offset into `AstArena::children`.
+    #[inline]
+    pub fn start(self) -> u32 {
+        self.start
+    }
+
+    /// Returns the number of children in this span.
+    #[inline]
+    pub fn len(self) -> u16 {
+        self.len
+    }
+
+    /// Returns `true` if the span contains no children.
+    #[inline]
+    pub fn is_empty(self) -> bool {
+        self.len == 0
+    }
+}
+
+/// Index into `AstArena`'s string pool. 4 bytes.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct StrId(u32);
+
+impl StrId {
+    #[inline]
+    pub(crate) fn new(raw: u32) -> Self {
+        Self(raw)
+    }
+
+    /// Returns the raw `u32` index into `AstArena`'s string pool.
+    #[inline]
+    pub fn raw(self) -> u32 {
+        self.0
+    }
+
+    #[inline]
+    pub(crate) fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+// ── CompactNode ────────────────────────────────────────────────────────
+
+/// Arena-backed AST node. 36 variants. All data lives in the owning `AstArena`.
+///
+/// This type is `Copy` — no heap allocations, no destructors. Nodes reference
+/// each other via `NodeId` and store strings via `StrId`, both indexing into
+/// the parent `AstArena`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CompactNode {
+    // ── Leaf nodes ─────────────────────────────────────────────────
+    /// A numeric literal; the string is interned in the arena's string pool.
+    Number(StrId),
+    /// An identifier (variable/function name); the string is interned.
+    Identifier(StrId),
+    /// An operator such as `+`, `=`, or `\sin`.
+    Operator {
+        /// Interned operator name/glyph.
+        name: StrId,
+        /// Whether sub/superscripts render as limits above/below the operator.
+        limits: LimitStyle,
+    },
+    /// A named symbol of a given category, with its interned glyph string.
+    Symbol(SymbolKind, StrId),
+    /// Literal text rendered in the given text style; the string is interned.
+    Text(TextStyle, StrId),
+    /// Explicit horizontal space of the given width.
+    Space(Rational),
+    /// A line break (e.g. `\\` inside an environment).
+    Newline,
+
+    // ── Grouping ───────────────────────────────────────────────────
+    /// A horizontal sequence of child nodes (a group/row).
+    Row(NodeSpan),
+    /// Delimited content wrapped by opening and closing fences.
+    Fenced {
+        /// Interned opening delimiter glyph (empty string for none).
+        open: StrId,
+        /// Interned closing delimiter glyph (empty string for none).
+        close: StrId,
+        /// The fenced children, possibly including `Middle` separator nodes.
+        content: NodeSpan,
+    },
+
+    // ── Scripts ────────────────────────────────────────────────────
+    /// Subscript: `base_sub`.
+    Subscript {
+        /// The base expression.
+        base: NodeId,
+        /// The subscript expression.
+        sub: NodeId,
+    },
+    /// Superscript: `base^sup`.
+    Superscript {
+        /// The base expression.
+        base: NodeId,
+        /// The superscript expression.
+        sup: NodeId,
+    },
+    /// Combined sub- and superscript: `base_sub^sup`.
+    SubSup {
+        /// The base expression.
+        base: NodeId,
+        /// The subscript expression.
+        sub: NodeId,
+        /// The superscript expression.
+        sup: NodeId,
+    },
+    /// Prescripts attached before the base (`\sideset`/`{}_sub^sup base`).
+    PreScripts {
+        /// The base expression.
+        base: NodeId,
+        /// The pre-subscript, or `NodeId::NONE` if absent.
+        pre_sub: NodeId,
+        /// The pre-superscript, or `NodeId::NONE` if absent.
+        pre_sup: NodeId,
+    },
+
+    // ── Over/Under ─────────────────────────────────────────────────
+    /// An expression with content placed above it.
+    Overscript {
+        /// The base expression.
+        base: NodeId,
+        /// The over-script expression.
+        over: NodeId,
+        /// Whether the script moves to a superscript position in inline style.
+        movable_limits: bool,
+    },
+    /// An expression with content placed below it.
+    Underscript {
+        /// The base expression.
+        base: NodeId,
+        /// The under-script expression.
+        under: NodeId,
+        /// Whether the script moves to a subscript position in inline style.
+        movable_limits: bool,
+    },
+    /// An expression with content both above and below it.
+    UnderOver {
+        /// The base expression.
+        base: NodeId,
+        /// The under-script expression.
+        under: NodeId,
+        /// The over-script expression.
+        over: NodeId,
+        /// Whether scripts move to sub/superscript positions in inline style.
+        movable_limits: bool,
+    },
+
+    // ── Fractions/roots ────────────────────────────────────────────
+    /// A fraction with numerator and denominator.
+    Fraction {
+        /// The fraction's visual kind (normal, binomial, line thickness, etc.).
+        kind: FractionKind,
+        /// The numerator expression.
+        num: NodeId,
+        /// The denominator expression.
+        den: NodeId,
+    },
+    /// A square root of its single child expression.
+    Sqrt(NodeId),
+    /// An nth root with an explicit index.
+    Root {
+        /// The root index (the small superscript degree).
+        index: NodeId,
+        /// The expression under the radical.
+        radicand: NodeId,
+    },
+
+    // ── N-ary ──────────────────────────────────────────────────────
+    /// A large n-ary operator (sum, integral, product, …) with optional bounds.
+    Nary {
+        /// The operator character (e.g. `∑`, `∫`, `∏`).
+        op: char,
+        /// The lower bound/subscript, or `NodeId::NONE` if absent.
+        sub: NodeId,
+        /// The upper bound/superscript, or `NodeId::NONE` if absent.
+        sup: NodeId,
+        /// The operand the operator applies to.
+        body: NodeId,
+        /// Whether bounds render as limits above/below the operator.
+        limits: LimitStyle,
+    },
+
+    // ── Accent ─────────────────────────────────────────────────────
+    /// An accent (hat, bar, tilde, arrow, …) placed over or under the base.
+    Accent {
+        /// The accented base expression.
+        base: NodeId,
+        /// The accent character to draw.
+        accent: char,
+        /// Whether the accent sits above or below the base.
+        position: AccentPosition,
+        /// Whether the accent stretches to the base's width.
+        wide: bool,
+    },
+
+    // ── Array ──────────────────────────────────────────────────────
+    /// Cells stored flat: `cells[row * num_cols + col]` gives the Row node for each cell.
+    /// Column alignments stored as `ColAlign` nodes in the `col_aligns` span.
+    Array {
+        /// Span of `ColAlign` nodes giving each column's alignment.
+        col_aligns: NodeSpan,
+        /// Span of cell `Row` nodes stored row-major (`row * num_cols + col`).
+        cells: NodeSpan,
+        /// Number of columns per row.
+        num_cols: u16,
+        /// Row-height scale as a percentage (`\arraystretch` × 100; 100 = default).
+        arraystretch_pct: u8,
+        /// Whether `\jot` extra inter-row spacing is added.
+        add_jot: bool,
+        /// `true` for LaTeX `array`/`cases`-style tables that add `\arraycolsep`
+        /// padding on both sides of every column (including the outer edges);
+        /// `false` for `matrix`-style tables with no outer padding.
+        array_style: bool,
+        /// Bitmask of vertical separator positions.
+        /// Bit i means "draw a vertical rule before column i" (i=0 is left edge).
+        /// Bit num_cols means "draw a vertical rule at the right edge".
+        col_seps: u32,
+        /// Bitmask of horizontal rule (`\hline`) positions.
+        /// Bit i means "draw a horizontal rule before row i" (i=0 is top edge).
+        /// Bit num_rows means "draw a horizontal rule at the bottom edge".
+        row_seps: u32,
+    },
+
+    // ── Decorators ─────────────────────────────────────────────────
+    /// Invisible (phantom) content occupying space per the given `PhantomKind`.
+    Phantom(NodeId, PhantomKind),
+    /// Boxed content, optionally with background and border colors.
+    Boxed {
+        /// The boxed inner expression.
+        content: NodeId,
+        /// Interned background color (empty string for none).
+        bg_color: StrId,
+        /// Interned border color (empty string for none).
+        border_color: StrId,
+    },
+    /// Content struck through with a cancellation line.
+    Cancel {
+        /// The cancellation stroke direction/style.
+        stroke: StrokeKind,
+        /// The content being cancelled.
+        content: NodeId,
+    },
+    /// Content scaled by a rational factor.
+    Scaled {
+        /// The scale factor applied to the content.
+        factor: Rational,
+        /// The scaled content.
+        content: NodeId,
+    },
+    /// Content raised/lowered with optional overridden height and depth.
+    RaiseBox {
+        /// Vertical shift (positive raises, negative lowers).
+        shift: Rational,
+        /// Overridden height when bit 0 of `extents` is set.
+        height: Rational,
+        /// Overridden depth when bit 1 of `extents` is set.
+        depth: Rational,
+        /// Bitflags: bit 0 = height set, bit 1 = depth set.
+        extents: u8,
+        /// The shifted content.
+        content: NodeId,
+    },
+    /// Children rendered in the given text/math style.
+    Styled(TextStyle, NodeSpan),
+
+    // ── MathChoice ─────────────────────────────────────────────────
+    /// Style-dependent content: \mathchoice{D}{T}{S}{SS}
+    MathChoice {
+        /// Variant used in display style.
+        display: NodeId,
+        /// Variant used in text (inline) style.
+        text: NodeId,
+        /// Variant used in script style.
+        script: NodeId,
+        /// Variant used in scriptscript style.
+        script_script: NodeId,
+    },
+
+    // ── Color ───────────────────────────────────────────────────────
+    /// Color wrapper: applies a named color to its content.
+    Color {
+        /// Interned color name/value.
+        color: StrId,
+        /// The colored content.
+        content: NodeId,
+    },
+
+    /// Explicit atom-type override: \mathop, \mathrel, \mathbin, etc.
+    MathAtom {
+        /// The math atom class to apply (op, rel, bin, …).
+        atom_type: MathAtomType,
+        /// The content reclassified by `atom_type`.
+        content: NodeId,
+    },
+
+    // ── Helpers (not in original MathNode) ──────────────────────────
+    /// `FencedItem::Middle` replacement. Fenced content spans mix regular nodes and middles.
+    Middle(StrId),
+    /// Array column alignment storage node.
+    ColAlign(ColumnAlign),
+
+    /// `\rule[lift]{width}{height}` — visible filled rectangle.
+    Rule {
+        /// Rectangle width.
+        width: Rational,
+        /// Rectangle height.
+        height: Rational,
+        /// Vertical lift of the rectangle above the baseline.
+        lift: Rational,
+    },
+
+    /// Math style switch: 0=Display, 1=Text, 2=Script, 3=ScriptScript.
+    StyleSwitch(u8),
+
+    /// Font size scale: 0=tiny..9=Huge. See SIZE_SCALE_TABLE in layout.rs.
+    SizeScale(u8),
+}
+
+// Compile-time size check: CompactNode must fit in 32 bytes.
+const _: () = assert!(
+    size_of::<CompactNode>() <= 32,
+    "CompactNode exceeds 32-byte limit"
+);
+
+// ── CompactExpr ────────────────────────────────────────────────────────
+
+/// A complete math expression stored in a compact arena.
+#[derive(Debug, Clone)]
+pub struct CompactExpr {
+    /// The arena owning all node, child, and string data.
+    pub arena: AstArena,
+    /// Span of the top-level root nodes within the arena.
+    pub roots: NodeSpan,
+    /// Display style (display vs. inline) of the whole expression.
+    pub display: DisplayStyle,
+}
+
+impl CompactExpr {
+    /// Creates a `CompactExpr` from an existing arena, root span, and display style.
+    #[must_use]
+    pub fn new(arena: AstArena, roots: NodeSpan, display: DisplayStyle) -> Self {
+        Self {
+            arena,
+            roots,
+            display,
+        }
+    }
+
+    /// Build a `CompactExpr` from a `MathExpr`, interning all data into an arena.
+    #[must_use]
+    pub fn from_math_expr(expr: &MathExpr) -> Self {
+        let mut arena = AstArena::new();
+        let mut root_ids: SmallVec<[NodeId; 4]> = SmallVec::new();
+        for node in &expr.nodes {
+            root_ids.push(push_math_node(&mut arena, node));
+        }
+        let roots = arena.push_children(&root_ids);
+        Self {
+            arena,
+            roots,
+            display: expr.display,
+        }
+    }
+
+    /// Reconstruct a `MathExpr` from the arena. O(n) walk.
+    #[must_use]
+    pub fn to_math_expr(&self) -> MathExpr {
+        let mut nodes = Vec::with_capacity(self.roots.len() as usize);
+        for &id in self.arena.children(self.roots) {
+            nodes.push(reconstruct_node(&self.arena, id));
+        }
+        MathExpr {
+            nodes,
+            display: self.display,
+        }
+    }
+}
+
+// ── MathNode → CompactNode (arena builder) ─────────────────────────────
+
+fn push_math_node(arena: &mut AstArena, node: &MathNode) -> NodeId {
+    match node {
+        MathNode::Number(s) => {
+            let sid = arena.push_str(s);
+            arena.push_node(CompactNode::Number(sid))
+        },
+        MathNode::Identifier(s) => {
+            let sid = arena.push_str(s);
+            arena.push_node(CompactNode::Identifier(sid))
+        },
+        MathNode::Operator(attr) => {
+            let name = arena.push_str(&attr.name);
+            arena.push_node(CompactNode::Operator {
+                name,
+                limits: attr.limit_style,
+            })
+        },
+        MathNode::Symbol(kind, s) => {
+            let sid = arena.push_str(s);
+            arena.push_node(CompactNode::Symbol(*kind, sid))
+        },
+        MathNode::Text(style, s) => {
+            let sid = arena.push_str(s);
+            arena.push_node(CompactNode::Text(*style, sid))
+        },
+        MathNode::Space(r) => arena.push_node(CompactNode::Space(*r)),
+        MathNode::Rule {
+            width,
+            height,
+            lift,
+        } => arena.push_node(CompactNode::Rule {
+            width: *width,
+            height: *height,
+            lift: *lift,
+        }),
+
+        MathNode::Row(children) => {
+            let span = push_children(arena, children);
+            arena.push_node(CompactNode::Row(span))
+        },
+        MathNode::Fenced {
+            open,
+            close,
+            content,
+        } => {
+            let open_id = arena.push_str(open);
+            let close_id = arena.push_str(close);
+            let mut ids: SmallVec<[NodeId; 4]> = SmallVec::new();
+            for item in content {
+                match item {
+                    FencedItem::Element(n) => ids.push(push_math_node(arena, n)),
+                    FencedItem::Middle(s) => {
+                        let sid = arena.push_str(s);
+                        ids.push(arena.push_node(CompactNode::Middle(sid)));
+                    },
+                }
+            }
+            let content_span = arena.push_children(&ids);
+            arena.push_node(CompactNode::Fenced {
+                open: open_id,
+                close: close_id,
+                content: content_span,
+            })
+        },
+
+        MathNode::Subscript { base, sub } => {
+            let base_id = push_math_node(arena, base);
+            let sub_id = push_math_node(arena, sub);
+            arena.push_node(CompactNode::Subscript {
+                base: base_id,
+                sub: sub_id,
+            })
+        },
+        MathNode::Superscript { base, sup } => {
+            let base_id = push_math_node(arena, base);
+            let sup_id = push_math_node(arena, sup);
+            arena.push_node(CompactNode::Superscript {
+                base: base_id,
+                sup: sup_id,
+            })
+        },
+        MathNode::SubSup { base, sub, sup } => {
+            let base_id = push_math_node(arena, base);
+            let sub_id = push_math_node(arena, sub);
+            let sup_id = push_math_node(arena, sup);
+            arena.push_node(CompactNode::SubSup {
+                base: base_id,
+                sub: sub_id,
+                sup: sup_id,
+            })
+        },
+        MathNode::PreScripts {
+            base,
+            pre_sub,
+            pre_sup,
+        } => {
+            let base_id = push_math_node(arena, base);
+            let pre_sub_id = push_opt(arena, pre_sub.as_deref());
+            let pre_sup_id = push_opt(arena, pre_sup.as_deref());
+            arena.push_node(CompactNode::PreScripts {
+                base: base_id,
+                pre_sub: pre_sub_id,
+                pre_sup: pre_sup_id,
+            })
+        },
+
+        MathNode::Overscript {
+            base,
+            over,
+            movable_limits,
+        } => {
+            let base_id = push_math_node(arena, base);
+            let over_id = push_math_node(arena, over);
+            arena.push_node(CompactNode::Overscript {
+                base: base_id,
+                over: over_id,
+                movable_limits: *movable_limits,
+            })
+        },
+        MathNode::Underscript {
+            base,
+            under,
+            movable_limits,
+        } => {
+            let base_id = push_math_node(arena, base);
+            let under_id = push_math_node(arena, under);
+            arena.push_node(CompactNode::Underscript {
+                base: base_id,
+                under: under_id,
+                movable_limits: *movable_limits,
+            })
+        },
+        MathNode::UnderOver {
+            base,
+            under,
+            over,
+            movable_limits,
+        } => {
+            let base_id = push_math_node(arena, base);
+            let under_id = push_math_node(arena, under);
+            let over_id = push_math_node(arena, over);
+            arena.push_node(CompactNode::UnderOver {
+                base: base_id,
+                under: under_id,
+                over: over_id,
+                movable_limits: *movable_limits,
+            })
+        },
+
+        MathNode::Fraction { kind, num, den } => {
+            let num_id = push_math_node(arena, num);
+            let den_id = push_math_node(arena, den);
+            arena.push_node(CompactNode::Fraction {
+                kind: *kind,
+                num: num_id,
+                den: den_id,
+            })
+        },
+        MathNode::Sqrt(inner) => {
+            let inner_id = push_math_node(arena, inner);
+            arena.push_node(CompactNode::Sqrt(inner_id))
+        },
+        MathNode::Root { index, radicand } => {
+            let index_id = push_math_node(arena, index);
+            let radicand_id = push_math_node(arena, radicand);
+            arena.push_node(CompactNode::Root {
+                index: index_id,
+                radicand: radicand_id,
+            })
+        },
+
+        MathNode::Nary {
+            op,
+            sub,
+            sup,
+            body,
+            limits,
+        } => {
+            let sub_id = push_opt(arena, sub.as_deref());
+            let sup_id = push_opt(arena, sup.as_deref());
+            let body_id = push_math_node(arena, body);
+            arena.push_node(CompactNode::Nary {
+                op: *op,
+                sub: sub_id,
+                sup: sup_id,
+                body: body_id,
+                limits: *limits,
+            })
+        },
+
+        MathNode::Accent {
+            base,
+            accent,
+            position,
+            wide,
+        } => {
+            let base_id = push_math_node(arena, base);
+            arena.push_node(CompactNode::Accent {
+                base: base_id,
+                accent: *accent,
+                position: *position,
+                wide: *wide,
+            })
+        },
+
+        MathNode::Array {
+            columns,
+            rows,
+            arraystretch,
+            add_jot,
+        } => {
+            // Push column alignments as ColAlign nodes
+            let mut align_ids: SmallVec<[NodeId; 4]> = SmallVec::new();
+            for col in columns {
+                align_ids.push(arena.push_node(CompactNode::ColAlign(*col)));
+            }
+            let col_aligns = arena.push_children(&align_ids);
+
+            let num_cols = columns.len().max(1) as u16;
+
+            // Push cells flat (row-major). Each cell Vec<MathNode> becomes a Row node.
+            let mut cell_ids: SmallVec<[NodeId; 8]> = SmallVec::new();
+            for row in rows {
+                for cell in row {
+                    let span = push_children(arena, cell);
+                    cell_ids.push(arena.push_node(CompactNode::Row(span)));
+                }
+                // Pad short rows to num_cols
+                for _ in row.len()..(num_cols as usize) {
+                    cell_ids.push(arena.push_node(CompactNode::Row(NodeSpan::EMPTY)));
+                }
+            }
+            let cells = arena.push_children(&cell_ids);
+
+            let arraystretch_pct = match arraystretch {
+                Some(v) => (v * 100.0).round() as u8,
+                None => 100,
+            };
+
+            arena.push_node(CompactNode::Array {
+                col_aligns,
+                cells,
+                num_cols,
+                arraystretch_pct,
+                add_jot: *add_jot,
+                array_style: false,
+                col_seps: 0,
+                row_seps: 0,
+            })
+        },
+
+        MathNode::Phantom(inner, kind) => {
+            let inner_id = push_math_node(arena, inner);
+            arena.push_node(CompactNode::Phantom(inner_id, *kind))
+        },
+        MathNode::Boxed {
+            content,
+            bg_color,
+            border_color,
+        } => {
+            let inner_id = push_math_node(arena, content);
+            let bg_sid = arena.push_str(bg_color.as_deref().unwrap_or(""));
+            let border_sid = arena.push_str(border_color.as_deref().unwrap_or(""));
+            arena.push_node(CompactNode::Boxed {
+                content: inner_id,
+                bg_color: bg_sid,
+                border_color: border_sid,
+            })
+        },
+        MathNode::Cancel { stroke, content } => {
+            let content_id = push_math_node(arena, content);
+            arena.push_node(CompactNode::Cancel {
+                stroke: *stroke,
+                content: content_id,
+            })
+        },
+        MathNode::Scaled { factor, content } => {
+            let content_id = push_math_node(arena, content);
+            arena.push_node(CompactNode::Scaled {
+                factor: *factor,
+                content: content_id,
+            })
+        },
+        MathNode::RaiseBox {
+            shift,
+            height,
+            depth,
+            content,
+        } => {
+            let content_id = push_math_node(arena, content);
+            arena.push_node(CompactNode::RaiseBox {
+                shift: *shift,
+                height: height.unwrap_or_else(Rational::zero),
+                depth: depth.unwrap_or_else(Rational::zero),
+                extents: u8::from(height.is_some()) | (u8::from(depth.is_some()) << 1),
+                content: content_id,
+            })
+        },
+        MathNode::Styled(style, children) => {
+            let span = push_children(arena, children);
+            arena.push_node(CompactNode::Styled(*style, span))
+        },
+        MathNode::MathChoice {
+            display,
+            text,
+            script,
+            script_script,
+        } => {
+            let display_id = push_math_node(arena, display);
+            let text_id = push_math_node(arena, text);
+            let script_id = push_math_node(arena, script);
+            let ss_id = push_math_node(arena, script_script);
+            arena.push_node(CompactNode::MathChoice {
+                display: display_id,
+                text: text_id,
+                script: script_id,
+                script_script: ss_id,
+            })
+        },
+        MathNode::MathAtom { atom_type, content } => {
+            let inner = push_math_node(arena, content);
+            arena.push_node(CompactNode::MathAtom {
+                atom_type: *atom_type,
+                content: inner,
+            })
+        },
+    }
+}
+
+/// Push a slice of MathNodes as children, returning their NodeSpan.
+fn push_children(arena: &mut AstArena, nodes: &[MathNode]) -> NodeSpan {
+    let mut ids: SmallVec<[NodeId; 2]> = SmallVec::new();
+    for node in nodes {
+        ids.push(push_math_node(arena, node));
+    }
+    arena.push_children(&ids)
+}
+
+/// Push an optional node, returning `NodeId::NONE` for `None`.
+fn push_opt(arena: &mut AstArena, node: Option<&MathNode>) -> NodeId {
+    match node {
+        Some(n) => push_math_node(arena, n),
+        None => NodeId::NONE,
+    }
+}
+
+// ── CompactNode → MathNode (arena reader) ──────────────────────────────
+
+fn reconstruct_node(arena: &AstArena, id: NodeId) -> MathNode {
+    match *arena.node(id) {
+        CompactNode::Number(sid) => MathNode::Number(arena.str_val(sid).to_owned()),
+        CompactNode::Identifier(sid) => MathNode::Identifier(arena.str_val(sid).to_owned()),
+        CompactNode::Operator { name, limits } => MathNode::Operator(OperatorAttr {
+            name: arena.str_val(name).to_owned(),
+            limit_style: limits,
+        }),
+        CompactNode::Symbol(kind, sid) => MathNode::Symbol(kind, arena.str_val(sid).to_owned()),
+        CompactNode::Text(style, sid) => MathNode::Text(style, arena.str_val(sid).to_owned()),
+        CompactNode::Space(r) => MathNode::Space(r),
+
+        CompactNode::Row(span) => MathNode::Row(reconstruct_children(arena, span)),
+        CompactNode::Fenced {
+            open,
+            close,
+            content,
+        } => {
+            let mut items = Vec::with_capacity(content.len() as usize);
+            for &child_id in arena.children(content) {
+                match *arena.node(child_id) {
+                    CompactNode::Middle(sid) => {
+                        items.push(FencedItem::Middle(arena.str_val(sid).to_owned()));
+                    },
+                    _ => {
+                        items.push(FencedItem::Element(reconstruct_node(arena, child_id)));
+                    },
+                }
+            }
+            MathNode::Fenced {
+                open: arena.str_val(open).to_owned(),
+                close: arena.str_val(close).to_owned(),
+                content: items,
+            }
+        },
+
+        CompactNode::Subscript { base, sub } => MathNode::Subscript {
+            base: Box::new(reconstruct_node(arena, base)),
+            sub: Box::new(reconstruct_node(arena, sub)),
+        },
+        CompactNode::Superscript { base, sup } => MathNode::Superscript {
+            base: Box::new(reconstruct_node(arena, base)),
+            sup: Box::new(reconstruct_node(arena, sup)),
+        },
+        CompactNode::SubSup { base, sub, sup } => MathNode::SubSup {
+            base: Box::new(reconstruct_node(arena, base)),
+            sub: Box::new(reconstruct_node(arena, sub)),
+            sup: Box::new(reconstruct_node(arena, sup)),
+        },
+        CompactNode::PreScripts {
+            base,
+            pre_sub,
+            pre_sup,
+        } => MathNode::PreScripts {
+            base: Box::new(reconstruct_node(arena, base)),
+            pre_sub: reconstruct_opt(arena, pre_sub),
+            pre_sup: reconstruct_opt(arena, pre_sup),
+        },
+
+        CompactNode::Overscript {
+            base,
+            over,
+            movable_limits,
+        } => MathNode::Overscript {
+            base: Box::new(reconstruct_node(arena, base)),
+            over: Box::new(reconstruct_node(arena, over)),
+            movable_limits,
+        },
+        CompactNode::Underscript {
+            base,
+            under,
+            movable_limits,
+        } => MathNode::Underscript {
+            base: Box::new(reconstruct_node(arena, base)),
+            under: Box::new(reconstruct_node(arena, under)),
+            movable_limits,
+        },
+        CompactNode::UnderOver {
+            base,
+            under,
+            over,
+            movable_limits,
+        } => MathNode::UnderOver {
+            base: Box::new(reconstruct_node(arena, base)),
+            under: Box::new(reconstruct_node(arena, under)),
+            over: Box::new(reconstruct_node(arena, over)),
+            movable_limits,
+        },
+
+        CompactNode::Fraction { kind, num, den } => MathNode::Fraction {
+            kind,
+            num: Box::new(reconstruct_node(arena, num)),
+            den: Box::new(reconstruct_node(arena, den)),
+        },
+        CompactNode::Sqrt(inner) => MathNode::Sqrt(Box::new(reconstruct_node(arena, inner))),
+        CompactNode::Root { index, radicand } => MathNode::Root {
+            index: Box::new(reconstruct_node(arena, index)),
+            radicand: Box::new(reconstruct_node(arena, radicand)),
+        },
+
+        CompactNode::Nary {
+            op,
+            sub,
+            sup,
+            body,
+            limits,
+        } => MathNode::Nary {
+            op,
+            sub: reconstruct_opt(arena, sub),
+            sup: reconstruct_opt(arena, sup),
+            body: Box::new(reconstruct_node(arena, body)),
+            limits,
+        },
+
+        CompactNode::Accent {
+            base,
+            accent,
+            position,
+            wide,
+        } => MathNode::Accent {
+            base: Box::new(reconstruct_node(arena, base)),
+            accent,
+            position,
+            wide,
+        },
+
+        CompactNode::Array {
+            col_aligns,
+            cells,
+            num_cols,
+            arraystretch_pct,
+            add_jot,
+            array_style: _,
+            col_seps: _,
+            row_seps: _,
+        } => {
+            // Reconstruct column alignments
+            let columns: Vec<ColumnAlign> = arena
+                .children(col_aligns)
+                .iter()
+                .map(|&id| match *arena.node(id) {
+                    CompactNode::ColAlign(a) => a,
+                    _ => ColumnAlign::Center, // fallback
+                })
+                .collect();
+
+            // Reconstruct rows from flat cells
+            let cell_ids = arena.children(cells);
+            let nc = num_cols as usize;
+            let mut rows = Vec::new();
+            for chunk in cell_ids.chunks(nc.max(1)) {
+                let mut row = Vec::with_capacity(chunk.len());
+                for &cell_id in chunk {
+                    // Each cell is a Row node wrapping the cell contents
+                    match *arena.node(cell_id) {
+                        CompactNode::Row(span) => {
+                            row.push(reconstruct_children(arena, span));
+                        },
+                        _ => {
+                            // Fallback: wrap single node
+                            row.push(vec![reconstruct_node(arena, cell_id)]);
+                        },
+                    }
+                }
+                rows.push(row);
+            }
+
+            let arraystretch = if arraystretch_pct == 100 {
+                None
+            } else {
+                Some(arraystretch_pct as f64 / 100.0)
+            };
+
+            MathNode::Array {
+                columns,
+                rows,
+                arraystretch,
+                add_jot,
+            }
+        },
+
+        CompactNode::Phantom(inner, kind) => {
+            MathNode::Phantom(Box::new(reconstruct_node(arena, inner)), kind)
+        },
+        CompactNode::Boxed {
+            content,
+            bg_color,
+            border_color,
+        } => {
+            let bg = {
+                let s = arena.str_val(bg_color);
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s.to_owned())
+                }
+            };
+            let border = {
+                let s = arena.str_val(border_color);
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s.to_owned())
+                }
+            };
+            MathNode::Boxed {
+                content: Box::new(reconstruct_node(arena, content)),
+                bg_color: bg,
+                border_color: border,
+            }
+        },
+        CompactNode::Cancel { stroke, content } => MathNode::Cancel {
+            stroke,
+            content: Box::new(reconstruct_node(arena, content)),
+        },
+        CompactNode::Scaled { factor, content } => MathNode::Scaled {
+            factor,
+            content: Box::new(reconstruct_node(arena, content)),
+        },
+        CompactNode::RaiseBox {
+            shift,
+            height,
+            depth,
+            extents,
+            content,
+        } => MathNode::RaiseBox {
+            shift,
+            height: (extents & 1 != 0).then_some(height),
+            depth: (extents & 2 != 0).then_some(depth),
+            content: Box::new(reconstruct_node(arena, content)),
+        },
+        CompactNode::Styled(style, span) => {
+            MathNode::Styled(style, reconstruct_children(arena, span))
+        },
+
+        CompactNode::MathChoice {
+            display,
+            text,
+            script,
+            script_script,
+        } => MathNode::MathChoice {
+            display: Box::new(reconstruct_node(arena, display)),
+            text: Box::new(reconstruct_node(arena, text)),
+            script: Box::new(reconstruct_node(arena, script)),
+            script_script: Box::new(reconstruct_node(arena, script_script)),
+        },
+
+        // Color wrapper — no MathNode::Color exists, so reconstruct content only.
+        // Color is handled directly in the compact/arena layout paths.
+        CompactNode::Color { content, .. } => reconstruct_node(arena, content),
+
+        CompactNode::MathAtom { atom_type, content } => MathNode::MathAtom {
+            atom_type,
+            content: Box::new(reconstruct_node(arena, content)),
+        },
+
+        // Helper nodes — should not appear as standalone roots, but handle gracefully
+        CompactNode::Middle(sid) => {
+            MathNode::Symbol(SymbolKind::Fence, arena.str_val(sid).to_owned())
+        },
+        CompactNode::ColAlign(_) => MathNode::Space(Rational::zero()),
+        CompactNode::Rule {
+            width,
+            height,
+            lift,
+        } => MathNode::Rule {
+            width,
+            height,
+            lift,
+        },
+        CompactNode::StyleSwitch(_) => {
+            // Style switches are layout-only directives; reconstruct as empty row
+            MathNode::Row(Vec::new())
+        },
+        CompactNode::SizeScale(_) => {
+            // Size scale nodes are layout-only directives; reconstruct as empty row
+            MathNode::Row(Vec::new())
+        },
+        CompactNode::Newline => {
+            // Newlines are layout-only directives; reconstruct as zero-width space
+            MathNode::Space(Rational::zero())
+        },
+    }
+}
+
+fn reconstruct_children(arena: &AstArena, span: NodeSpan) -> Vec<MathNode> {
+    arena
+        .children(span)
+        .iter()
+        .map(|&id| reconstruct_node(arena, id))
+        .collect()
+}
+
+fn reconstruct_opt(arena: &AstArena, id: NodeId) -> Option<Box<MathNode>> {
+    if id.is_none() {
+        None
+    } else {
+        Some(Box::new(reconstruct_node(arena, id)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mathema::ast::{FencedItem, MathExpr, MathNode, OperatorAttr};
+
+    #[test]
+    fn compact_node_is_copy() {
+        let s = StrId::new(0);
+        let node = CompactNode::Number(s);
+        let copy = node; // Copy
+        assert_eq!(node, copy);
+    }
+
+    #[test]
+    fn compact_node_size() {
+        let size = size_of::<CompactNode>();
+        // Should be well under 32 bytes. Print for visibility.
+        eprintln!("CompactNode size: {size} bytes");
+        assert!(size <= 32);
+    }
+
+    #[test]
+    fn node_id_size() {
+        assert_eq!(size_of::<NodeId>(), 4);
+    }
+
+    #[test]
+    fn str_id_size() {
+        assert_eq!(size_of::<StrId>(), 4);
+    }
+
+    #[test]
+    fn node_span_size() {
+        // u32 (4) + u16 (2) + padding (2) = 8 bytes
+        assert!(size_of::<NodeSpan>() <= 8);
+    }
+
+    #[test]
+    fn node_id_sentinel() {
+        assert!(NodeId::NONE.is_none());
+        assert!(!NodeId::NONE.is_some());
+        assert_eq!(NodeId::NONE.raw(), u32::MAX);
+    }
+
+    #[test]
+    fn node_span_empty() {
+        let span = NodeSpan::EMPTY;
+        assert!(span.is_empty());
+        assert_eq!(span.len(), 0);
+    }
+
+    #[test]
+    fn compact_expr_construction() {
+        let mut arena = AstArena::new();
+        let s = arena.push_str("42");
+        let n = arena.push_node(CompactNode::Number(s));
+        let roots = arena.push_children(&[n]);
+        let expr = CompactExpr::new(arena, roots, DisplayStyle::Inline);
+        assert_eq!(expr.display, DisplayStyle::Inline);
+        assert_eq!(expr.roots.len(), 1);
+    }
+
+    #[test]
+    fn all_28_variants_constructible() {
+        let mut arena = AstArena::new();
+        let s = arena.push_str("x");
+        let id = arena.push_node(CompactNode::Identifier(s));
+        let span = arena.push_children(&[id]);
+
+        let variants: Vec<CompactNode> = vec![
+            CompactNode::Number(s),
+            CompactNode::Identifier(s),
+            CompactNode::Operator {
+                name: s,
+                limits: LimitStyle::Default,
+            },
+            CompactNode::Symbol(SymbolKind::BinaryOp, s),
+            CompactNode::Text(TextStyle::Normal, s),
+            CompactNode::Space(Rational::new(1, 6)),
+            CompactNode::Row(span),
+            CompactNode::Fenced {
+                open: s,
+                close: s,
+                content: span,
+            },
+            CompactNode::Subscript { base: id, sub: id },
+            CompactNode::Superscript { base: id, sup: id },
+            CompactNode::SubSup {
+                base: id,
+                sub: id,
+                sup: id,
+            },
+            CompactNode::PreScripts {
+                base: id,
+                pre_sub: id,
+                pre_sup: id,
+            },
+            CompactNode::Overscript {
+                base: id,
+                over: id,
+                movable_limits: false,
+            },
+            CompactNode::Underscript {
+                base: id,
+                under: id,
+                movable_limits: false,
+            },
+            CompactNode::UnderOver {
+                base: id,
+                under: id,
+                over: id,
+                movable_limits: true,
+            },
+            CompactNode::Fraction {
+                kind: FractionKind::Normal,
+                num: id,
+                den: id,
+            },
+            CompactNode::Sqrt(id),
+            CompactNode::Root {
+                index: id,
+                radicand: id,
+            },
+            CompactNode::Nary {
+                op: '\u{2211}',
+                sub: id,
+                sup: id,
+                body: id,
+                limits: LimitStyle::AboveBelow,
+            },
+            CompactNode::Accent {
+                base: id,
+                accent: '\u{0302}',
+                position: AccentPosition::Above,
+                wide: false,
+            },
+            CompactNode::Array {
+                col_aligns: span,
+                cells: span,
+                num_cols: 1,
+                arraystretch_pct: 100,
+                add_jot: false,
+                array_style: false,
+                col_seps: 0,
+                row_seps: 0,
+            },
+            CompactNode::Phantom(id, PhantomKind::Full),
+            CompactNode::Boxed {
+                content: id,
+                bg_color: s,
+                border_color: s,
+            },
+            CompactNode::Cancel {
+                stroke: StrokeKind::Forward,
+                content: id,
+            },
+            CompactNode::Scaled {
+                factor: Rational::new(2, 1),
+                content: id,
+            },
+            CompactNode::Styled(TextStyle::Bold, span),
+            CompactNode::Color {
+                color: s,
+                content: id,
+            },
+            CompactNode::Middle(s),
+            CompactNode::ColAlign(ColumnAlign::Center),
+        ];
+        assert_eq!(variants.len(), 29);
+    }
+
+    /// Helper: round-trip a MathExpr through CompactExpr and assert equality.
+    fn assert_roundtrip(expr: &MathExpr) {
+        let compact = CompactExpr::from_math_expr(expr);
+        let restored = compact.to_math_expr();
+        assert_eq!(expr, &restored, "round-trip failed");
+    }
+
+    #[test]
+    fn roundtrip_leaf_nodes() {
+        assert_roundtrip(&MathExpr::inline(vec![
+            MathNode::Number("42".into()),
+            MathNode::Identifier("x".into()),
+            MathNode::Operator(OperatorAttr {
+                name: "sin".into(),
+                limit_style: LimitStyle::Default,
+            }),
+            MathNode::Symbol(SymbolKind::BinaryOp, "+".into()),
+            MathNode::Text(TextStyle::Normal, "hello".into()),
+            MathNode::Space(Rational::new(1, 6)),
+        ]));
+    }
+
+    #[test]
+    fn roundtrip_row_and_styled() {
+        assert_roundtrip(&MathExpr::inline(vec![
+            MathNode::Row(vec![
+                MathNode::Number("1".into()),
+                MathNode::Number("2".into()),
+            ]),
+            MathNode::Styled(TextStyle::Bold, vec![MathNode::Identifier("x".into())]),
+        ]));
+    }
+
+    #[test]
+    fn roundtrip_fenced_with_middles() {
+        assert_roundtrip(&MathExpr::inline(vec![MathNode::Fenced {
+            open: "(".into(),
+            close: ")".into(),
+            content: vec![
+                FencedItem::Element(MathNode::Number("1".into())),
+                FencedItem::Middle("|".into()),
+                FencedItem::Element(MathNode::Number("2".into())),
+            ],
+        }]));
+    }
+
+    #[test]
+    fn roundtrip_scripts() {
+        assert_roundtrip(&MathExpr::inline(vec![
+            MathNode::Subscript {
+                base: Box::new(MathNode::Identifier("x".into())),
+                sub: Box::new(MathNode::Number("2".into())),
+            },
+            MathNode::Superscript {
+                base: Box::new(MathNode::Identifier("x".into())),
+                sup: Box::new(MathNode::Number("3".into())),
+            },
+            MathNode::SubSup {
+                base: Box::new(MathNode::Identifier("x".into())),
+                sub: Box::new(MathNode::Number("1".into())),
+                sup: Box::new(MathNode::Number("2".into())),
+            },
+        ]));
+    }
+
+    #[test]
+    fn roundtrip_prescripts_with_none() {
+        assert_roundtrip(&MathExpr::inline(vec![
+            MathNode::PreScripts {
+                base: Box::new(MathNode::Identifier("C".into())),
+                pre_sub: Some(Box::new(MathNode::Number("6".into()))),
+                pre_sup: None,
+            },
+            MathNode::PreScripts {
+                base: Box::new(MathNode::Identifier("C".into())),
+                pre_sub: None,
+                pre_sup: Some(Box::new(MathNode::Number("14".into()))),
+            },
+        ]));
+    }
+
+    #[test]
+    fn roundtrip_over_under() {
+        assert_roundtrip(&MathExpr::inline(vec![
+            MathNode::Overscript {
+                base: Box::new(MathNode::Identifier("x".into())),
+                over: Box::new(MathNode::Symbol(SymbolKind::Ordinary, "\u{0302}".into())),
+                movable_limits: false,
+            },
+            MathNode::Underscript {
+                base: Box::new(MathNode::Identifier("x".into())),
+                under: Box::new(MathNode::Symbol(SymbolKind::Ordinary, "_".into())),
+                movable_limits: true,
+            },
+            MathNode::UnderOver {
+                base: Box::new(MathNode::Identifier("x".into())),
+                under: Box::new(MathNode::Number("0".into())),
+                over: Box::new(MathNode::Number("1".into())),
+                movable_limits: true,
+            },
+        ]));
+    }
+
+    #[test]
+    fn roundtrip_fraction_and_roots() {
+        assert_roundtrip(&MathExpr::inline(vec![
+            MathNode::Fraction {
+                kind: FractionKind::Normal,
+                num: Box::new(MathNode::Number("1".into())),
+                den: Box::new(MathNode::Number("2".into())),
+            },
+            MathNode::Sqrt(Box::new(MathNode::Number("2".into()))),
+            MathNode::Root {
+                index: Box::new(MathNode::Number("3".into())),
+                radicand: Box::new(MathNode::Number("8".into())),
+            },
+        ]));
+    }
+
+    #[test]
+    fn roundtrip_nary_with_none() {
+        assert_roundtrip(&MathExpr::inline(vec![
+            MathNode::Nary {
+                op: '\u{2211}',
+                sub: Some(Box::new(MathNode::Number("0".into()))),
+                sup: Some(Box::new(MathNode::Identifier("n".into()))),
+                body: Box::new(MathNode::Identifier("i".into())),
+                limits: LimitStyle::AboveBelow,
+            },
+            MathNode::Nary {
+                op: '\u{222B}',
+                sub: None,
+                sup: None,
+                body: Box::new(MathNode::Identifier("f".into())),
+                limits: LimitStyle::SubSup,
+            },
+        ]));
+    }
+
+    #[test]
+    fn roundtrip_accent() {
+        assert_roundtrip(&MathExpr::inline(vec![MathNode::Accent {
+            base: Box::new(MathNode::Identifier("x".into())),
+            accent: '\u{0302}',
+            position: AccentPosition::Above,
+            wide: false,
+        }]));
+    }
+
+    #[test]
+    fn roundtrip_array() {
+        assert_roundtrip(&MathExpr::inline(vec![MathNode::Array {
+            columns: vec![ColumnAlign::Left, ColumnAlign::Right],
+            rows: vec![
+                vec![
+                    vec![MathNode::Number("1".into())],
+                    vec![MathNode::Number("2".into())],
+                ],
+                vec![
+                    vec![MathNode::Number("3".into())],
+                    vec![MathNode::Number("4".into())],
+                ],
+            ],
+            arraystretch: None,
+            add_jot: false,
+        }]));
+    }
+
+    #[test]
+    fn roundtrip_decorators() {
+        assert_roundtrip(&MathExpr::inline(vec![
+            MathNode::Phantom(Box::new(MathNode::Number("0".into())), PhantomKind::Full),
+            MathNode::Boxed {
+                content: Box::new(MathNode::Number("1".into())),
+                bg_color: None,
+                border_color: None,
+            },
+            MathNode::Cancel {
+                stroke: StrokeKind::Forward,
+                content: Box::new(MathNode::Number("0".into())),
+            },
+            MathNode::Scaled {
+                factor: Rational::new(2, 1),
+                content: Box::new(MathNode::Number("1".into())),
+            },
+        ]));
+    }
+
+    #[test]
+    fn roundtrip_nested_expression() {
+        // x = \frac{-b \pm \sqrt{b^2 - 4ac}}{2a}
+        let expr = MathExpr::block(vec![
+            MathNode::Identifier("x".into()),
+            MathNode::Symbol(SymbolKind::Relation, "=".into()),
+            MathNode::Fraction {
+                kind: FractionKind::Normal,
+                num: Box::new(MathNode::Row(vec![
+                    MathNode::Symbol(SymbolKind::Ordinary, "\u{2212}".into()),
+                    MathNode::Identifier("b".into()),
+                    MathNode::Symbol(SymbolKind::BinaryOp, "\u{00B1}".into()),
+                    MathNode::Sqrt(Box::new(MathNode::Row(vec![
+                        MathNode::Superscript {
+                            base: Box::new(MathNode::Identifier("b".into())),
+                            sup: Box::new(MathNode::Number("2".into())),
+                        },
+                        MathNode::Symbol(SymbolKind::BinaryOp, "\u{2212}".into()),
+                        MathNode::Number("4".into()),
+                        MathNode::Identifier("a".into()),
+                        MathNode::Identifier("c".into()),
+                    ]))),
+                ])),
+                den: Box::new(MathNode::Row(vec![
+                    MathNode::Number("2".into()),
+                    MathNode::Identifier("a".into()),
+                ])),
+            },
+        ]);
+        assert_roundtrip(&expr);
+    }
+
+    #[test]
+    fn roundtrip_display_style() {
+        let block = MathExpr::block(vec![MathNode::Number("1".into())]);
+        let inline = MathExpr::inline(vec![MathNode::Number("1".into())]);
+        let compact_block = CompactExpr::from_math_expr(&block);
+        let compact_inline = CompactExpr::from_math_expr(&inline);
+        assert_eq!(compact_block.to_math_expr().display, DisplayStyle::Block);
+        assert_eq!(compact_inline.to_math_expr().display, DisplayStyle::Inline);
+    }
+
+    #[test]
+    fn roundtrip_empty_expr() {
+        assert_roundtrip(&MathExpr::inline(vec![]));
+    }
+
+    #[test]
+    fn memory_report() {
+        use crate::mathema::error::Config;
+        use crate::mathema::reader::Reader;
+        use crate::mathema::reader::latex::LatexReader;
+
+        let compact_size = size_of::<CompactNode>();
+        let legacy_size = size_of::<MathNode>();
+        let ratio = legacy_size as f64 / compact_size as f64;
+
+        eprintln!("=== Memory Report ===");
+        eprintln!("MathNode  size: {legacy_size} bytes");
+        eprintln!("CompactNode size: {compact_size} bytes");
+        eprintln!("Ratio (legacy/compact): {ratio:.1}x");
+
+        assert!(
+            compact_size <= 32,
+            "CompactNode should be <= 32 bytes, got {compact_size}"
+        );
+
+        let quadratic = r"x = \frac{-b \pm \sqrt{b^2 - 4ac}}{2a}";
+        let config = Config::default();
+
+        let compact_result = LatexReader::parse_compact(quadratic, &config).unwrap();
+        let arena = &compact_result.expr.arena;
+
+        let node_count = arena.node_count();
+        let children_count = arena.children_count();
+        let string_count = arena.string_count();
+        let heap_bytes = arena.heap_bytes();
+
+        eprintln!("--- Quadratic formula arena stats ---");
+        eprintln!("Nodes:    {node_count}");
+        eprintln!("Children: {children_count}");
+        eprintln!("Strings:  {string_count}");
+        eprintln!("Arena heap bytes: {heap_bytes}");
+        eprintln!(
+            "Bytes/node (arena): {:.1}",
+            heap_bytes as f64 / node_count as f64
+        );
+
+        // Sanity checks
+        assert!(node_count > 0, "quadratic formula should have nodes");
+        assert!(heap_bytes > 0, "arena should use heap memory");
+        assert!(
+            (heap_bytes as f64 / node_count as f64) < 100.0,
+            "bytes per node should be reasonable"
+        );
+    }
+}

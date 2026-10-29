@@ -1,6 +1,7 @@
 //! Construction of inline tokens and measurement of atomic inline content.
 
 use super::*;
+use crate::layout::{BoxLayoutRequest, ResolvedBoxModel, measure_box_isolated};
 use html_dom::ImageSource;
 
 fn create_image_token(
@@ -51,7 +52,7 @@ fn create_image_token(
         });
         let content_size = Size::new(max_width, content_height.max(0.0));
         let font_size = style.font_size();
-        let line_height = resolved_line_height(style);
+        let line_height = style.resolved_line_height();
         return (
             InlineToken::new(
                 InlineTokenKind::Image {
@@ -143,7 +144,7 @@ fn create_image_token(
         _ => 0.0,
     };
     let font_size = style.font_size();
-    let line_height = resolved_line_height(style);
+    let line_height = style.resolved_line_height();
     let position_offset = if style.position() == html_style_model::PositionMode::Relative {
         crate::layout::box_positioning::relative_position_offset(
             &style,
@@ -194,7 +195,7 @@ fn create_break_token(
     style: html_style_model::UsedStyleView,
     vertical_align: VerticalAlignValue,
 ) -> (InlineToken, InlineTokenMetrics) {
-    let line_height = resolved_line_height(style);
+    let line_height = style.resolved_line_height();
     (
         InlineToken::new(
             InlineTokenKind::Break { clear },
@@ -223,7 +224,7 @@ fn create_anchor_token(
     style: html_style_model::UsedStyleView,
     vertical_align: VerticalAlignValue,
 ) -> (InlineToken, InlineTokenMetrics) {
-    let line_height = resolved_line_height(style);
+    let line_height = style.resolved_line_height();
     (
         InlineToken::new(
             kind,
@@ -280,7 +281,7 @@ fn create_inline_boundary_token(
     } else {
         0.0
     };
-    let line_height = resolved_line_height(style);
+    let line_height = style.resolved_line_height();
     let font_size = style.font_size() as f64;
     // A boundary is the zero-content strut of its inline box. Its baseline
     // therefore uses the selected font's ascent/descent plus half-leading,
@@ -289,10 +290,7 @@ fn create_inline_boundary_token(
     let (font_ascent, font_descent) = engine
         .reader
         .font_metrics(box_idx as usize)
-        .line_box_ratios()
-        .map_or((font_size * 0.8, font_size * 0.2), |(ascent, descent)| {
-            (font_size * ascent as f64, font_size * descent as f64)
-        });
+        .line_box_extents(font_size);
     let half_leading = (line_height - font_ascent - font_descent) * 0.5;
     let (ascent, descent) = (font_ascent + half_leading, font_descent + half_leading);
     let token = InlineToken::new(
@@ -406,10 +404,7 @@ pub(super) fn build_inline_tokens_from_runs(
     let mut tokens = engine.inline_plans.working_tokens(glyph_capacity);
     for run in runs {
         let token_start = tokens.len();
-        let ownership_box = inline_item_ownership_box(engine, run);
-        if !ownership_box.is_some_and(|box_idx| {
-            run_belongs_to_inline_context(engine, box_idx, container_box_idx)
-        }) {
+        if !engine.reader.inline_item_belongs_to_context(run, container_box_idx) {
             continue;
         }
         let style = engine.reader.style(run.box_idx as usize);
@@ -593,17 +588,14 @@ pub(super) fn standalone_inline_image(
 ) -> Option<u32> {
     let mut candidate = None;
     for run in runs {
-        if !inline_item_ownership_box(engine, run).is_some_and(|box_idx| {
-            run_belongs_to_inline_context(engine, box_idx, container_box_idx)
-        }) {
+        if !engine.reader.inline_item_belongs_to_context(run, container_box_idx) {
             continue;
         }
         match &run.kind {
             InlineItemKind::Image { .. } if candidate.is_none() => candidate = Some(run.box_idx),
             InlineItemKind::Text { glyphs } => {
                 let has_text = glyphs.clone().any(|glyph_idx| {
-                    let glyph = engine.text.glyph_at(glyph_idx as usize).unwrap_or_default();
-                    !engine.text.glyph_metric(glyph).ch().is_whitespace()
+                    !engine.text.character(glyph_idx).is_whitespace()
                 });
                 if has_text {
                     return None;
@@ -623,49 +615,6 @@ pub(super) fn standalone_inline_image(
     candidate
 }
 
-pub(in crate::layout) fn inline_item_ownership_box(
-    engine: &crate::layout::LayoutEngine<'_, '_>,
-    item: &InlineItem,
-) -> Option<usize> {
-    match item.kind {
-        // The atomic box is a formatting-context root. Its parent owns the
-        // placeholder in the surrounding inline formatting context.
-        InlineItemKind::AtomicBox { box_idx } => engine.reader.get_parent(box_idx as usize),
-        _ => Some(item.box_idx as usize),
-    }
-}
-
-/// Shared inline items belonging to a nested formatting context must not be
-/// flattened into an ancestor line. Stop at the requested container; any
-/// block/table/flex/grid root encountered before it owns the run instead.
-pub(in crate::layout) fn run_belongs_to_inline_context(
-    engine: &crate::layout::LayoutEngine<'_, '_>,
-    run_box_idx: usize,
-    container_box_idx: usize,
-) -> bool {
-    let mut current = Some(run_box_idx);
-    while let Some(box_idx) = current {
-        if box_idx == container_box_idx {
-            return true;
-        }
-        if matches!(
-            engine.reader.box_layout_mode(box_idx),
-            Some(
-                crate::layout_model::LayoutMode::Block(_)
-                    | crate::layout_model::LayoutMode::Table(_)
-                    | crate::layout_model::LayoutMode::TableRow(_)
-                    | crate::layout_model::LayoutMode::TableCell(_)
-                    | crate::layout_model::LayoutMode::Flex(_)
-                    | crate::layout_model::LayoutMode::Grid(_)
-            )
-        ) {
-            return false;
-        }
-        current = engine.reader.get_parent(box_idx);
-    }
-    false
-}
-
 fn create_atomic_box_token(
     engine: &mut crate::layout::LayoutEngine<'_, '_>,
     box_idx: u32,
@@ -676,14 +625,7 @@ fn create_atomic_box_token(
 ) -> (InlineToken, InlineTokenMetrics, ReplacedToken) {
     profile_scope!("tokens.atomic_box");
     let max_width = max_width.max(0.0);
-    let margin_left = style.margin_left().resolve(max_width);
-    let margin_right = style.margin_right().resolve(max_width);
-    let margin_top = style.margin_top().resolve(max_width);
-    let margin_bottom = style.margin_bottom().resolve(max_width);
-    let resolved_padding = style.get_horizontal_padding(max_width);
-    let horizontal_border = style.border_left_width() as f64 + style.border_right_width() as f64;
-    let vertical_padding = style.get_vertical_padding(max_width);
-    let vertical_border = style.border_top_width() as f64 + style.border_bottom_width() as f64;
+    let model = ResolvedBoxModel::new(style, max_width).with_nonnegative_padding();
     // Anonymous inline tables carry an anonymous reset style whose computed
     // `display` is not `inline-table`; participation in this atomic inline
     // context is represented authoritatively by the layout mode instead.
@@ -703,16 +645,16 @@ fn create_atomic_box_token(
                 containing_block_height,
             )
             .with_box_model(
-                margin_left + margin_right,
-                margin_top + margin_bottom,
-                resolved_padding + horizontal_border,
-                vertical_padding + vertical_border,
+                model.margin_left + model.margin_right,
+                model.margin_top + model.margin_bottom,
+                model.horizontal_padding_border(),
+                model.vertical_padding_border(),
             ),
         );
         (
             Size::new(
-                content.width + resolved_padding + horizontal_border,
-                content.height + vertical_padding + vertical_border,
+                content.width + model.horizontal_padding_border(),
+                content.height + model.vertical_padding_border(),
             ),
             None,
             None,
@@ -726,24 +668,24 @@ fn create_atomic_box_token(
         // The collapsed edge grid, not the authored full borders, determines
         // the inline table's used border box. Let normal table layout resolve
         // that grid instead of duplicating box sizing here.
-        crate::layout::measure_box_and_baselines_isolated(
+        let measured = measure_box_isolated(
             engine,
-            box_idx as usize,
-            max_width,
-            containing_block_height,
-        )
+            BoxLayoutRequest::normal(box_idx as usize, max_width.max(0.0), containing_block_height),
+        );
+        (measured.size, measured.first_baseline, measured.last_baseline)
     } else {
         // Atomic inline sizing needs the raw content contributions here. The
         // outer intrinsic helper already applies the box's preferred width;
         // using it for `fit-content` collapses min-content to max-content and
         // prevents the available inline size from clamping between them.
         let (intrinsic_min, intrinsic_max) =
-            crate::layout::box_content_intrinsic_widths(engine, box_idx as usize);
-        let min_border_width = (intrinsic_min + resolved_padding + horizontal_border).max(0.0);
+            crate::layout::box_content_intrinsic_widths(engine, box_idx as usize, None);
+        let min_border_width = (intrinsic_min + model.horizontal_padding_border()).max(0.0);
         let max_border_width =
-            (intrinsic_max + resolved_padding + horizontal_border).max(min_border_width);
-        let border_inset = resolved_padding + horizontal_border;
-        let available_border_width = (max_width - margin_left - margin_right).max(border_inset);
+            (intrinsic_max + model.horizontal_padding_border()).max(min_border_width);
+        let border_inset = model.horizontal_padding_border();
+        let available_border_width =
+            (max_width - model.margin_left - model.margin_right).max(border_inset);
         let shrink_to_fit = max_border_width.min(available_border_width.max(min_border_width));
         let resolve_border_width = |size: PreferredSize, auto: f64| match size {
             PreferredSize::Auto => auto,
@@ -763,7 +705,7 @@ fn create_atomic_box_token(
             (|| {
                 let authored_ratio = style.aspect_ratio();
                 let ratio = authored_ratio.preferred().map(f64::from)?;
-                let vertical_border_inset = vertical_padding + vertical_border;
+                let vertical_border_inset = model.vertical_padding_border();
                 let vertical_box_sizing_inset = matches!(style.box_sizing(), BoxSizing::BorderBox)
                     .then_some(vertical_border_inset)
                     .unwrap_or(0.0);
@@ -798,16 +740,19 @@ fn create_atomic_box_token(
         let minimum = resolve_border_width(style.min_width(), automatic_minimum);
         let maximum = resolve_border_width(style.max_width(), f64::INFINITY).max(minimum);
         let assigned_width = preferred.clamp(minimum, maximum);
-        crate::layout::measure_box_width_and_baselines_isolated(
+        let measured = measure_box_isolated(
             engine,
-            box_idx as usize,
-            max_width,
-            assigned_width,
-            containing_block_height,
-        )
+            BoxLayoutRequest::width_assigned(
+                box_idx as usize,
+                max_width.max(0.0),
+                assigned_width.max(0.0),
+                containing_block_height,
+            ),
+        );
+        (measured.size, measured.first_baseline, measured.last_baseline)
     };
-    let outer_width = (border_size.width + margin_left + margin_right).max(0.0);
-    let outer_height = (border_size.height + margin_top + margin_bottom).max(0.0);
+    let outer_width = (border_size.width + model.margin_left + model.margin_right).max(0.0);
+    let outer_height = (border_size.height + model.margin_top + model.margin_bottom).max(0.0);
     let is_inline_block = matches!(style.display(), html_style_model::Display::InlineBlock);
     let is_inline_flex_or_grid = matches!(
         engine.reader.box_layout_mode(box_idx as usize),
@@ -819,7 +764,7 @@ fn create_atomic_box_token(
         // that row has no line boxes, its bottom edge is the fallback
         // baseline; treating the entire table as bottom-baseline incorrectly
         // adds the parent font strut below the table's margin box.
-        first_baseline.or_else(|| inline_table_first_row_bottom(engine, box_idx as usize))
+        first_baseline
     } else if is_inline_block && visible_overflow {
         last_baseline
     } else if is_inline_flex_or_grid {
@@ -828,7 +773,7 @@ fn create_atomic_box_token(
         None
     };
     let (ascent, descent) = if let Some(baseline) = propagated_baseline {
-        let ascent = margin_top + baseline;
+        let ascent = model.margin_top + baseline;
         (ascent, (outer_height - ascent).max(0.0))
     } else {
         (outer_height, 0.0)
@@ -836,7 +781,7 @@ fn create_atomic_box_token(
     let line_height = if is_inline_table {
         outer_height
     } else {
-        resolved_line_height(style)
+        style.resolved_line_height()
     };
     (
         InlineToken::new(
@@ -854,7 +799,11 @@ fn create_atomic_box_token(
             descent: descent as f32,
             line_height: line_height as f32,
             font_size: style.font_size(),
-            vertical_align: InlineVerticalAlign::resolve(vertical_align, line_height, style.font_size()),
+            vertical_align: InlineVerticalAlign::resolve(
+                vertical_align,
+                line_height,
+                style.font_size(),
+            ),
             white_space: style.white_space(),
             visible: style.visibility() == html_style_model::Visibility::Visible,
             placement_required: false,
@@ -864,23 +813,8 @@ fn create_atomic_box_token(
             border_size,
             containing_width: max_width,
             containing_height: containing_block_height,
-            margin_left,
-            margin_top,
+            margin_left: model.margin_left,
+            margin_top: model.margin_top,
         },
     )
-}
-
-fn inline_table_first_row_bottom(
-    engine: &crate::layout::LayoutEngine<'_, '_>,
-    table_idx: usize,
-) -> Option<f64> {
-    let crate::layout_model::LayoutMode::Table(table) = engine.reader.box_layout_mode(table_idx)?
-    else {
-        return None;
-    };
-    let row_idx = *table.rows.first()? as usize;
-    let table_y = engine.geometry.point(table_idx).y;
-    let row_point = engine.geometry.point(row_idx);
-    let row_size = engine.geometry.size(row_idx);
-    Some(row_point.y + row_size.height - table_y)
 }

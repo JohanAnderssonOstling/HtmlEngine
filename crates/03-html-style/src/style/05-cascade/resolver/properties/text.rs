@@ -1,14 +1,30 @@
-use super::*;
+use super::super::context::{ApplyResult, PropertyContext};
+use super::super::values::fonts::font_variant_caps_features;
+use super::super::values::lengths::{
+    border_width, computed_length_pct, length_to_px_from_length, spacing_to_text_spacing,
+    vertical_align_value,
+};
+use super::super::values::lists::{
+    list_style_image_to_interned, map_list_style_position, map_list_style_type,
+};
+use super::super::values::{
+    checked_line_height_components, decoration_color, outline_style, overflow_mode,
+    text_decoration_lines, text_decoration_style, text_decoration_thickness, text_end_alignment,
+    text_start_alignment,
+};
+use html_style_model::{
+    LogicalTextAlign, TabSize, TextAlign, TextOverflow, TextTransform, VerticalAlignValue,
+    Visibility, WhiteSpace,
+};
+use lightningcss::properties::Property;
+use lightningcss::properties::font::{LineHeight, VerticalAlign, VerticalAlignKeyword};
+use lightningcss::properties::overflow::TextOverflow as CssTextOverflow;
 
-#[allow(unused_variables)]
-pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'_>) -> ApplyResult {
-    let doc = context.doc;
+pub(super) fn apply(context: &mut PropertyContext<'_>, property: &Property<'_>) -> ApplyResult {
+    let root_font_size = context.root_font_size;
+    let resolution = context.resolution;
     let styles = &mut *context.styles;
     let style = &mut *context.style;
-    let resolved_root_font_size = context.resolved_root_font_size;
-    let parent_font_size = context.parent_font_size;
-    let parent_font_weight = context.parent_font_weight;
-    let parent_color = context.parent_color;
     match property {
         Property::LineBreak(value) => {
             use html_style_model::LineBreak;
@@ -38,38 +54,47 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             let Some((line_height, x_height_px)) = checked_line_height_components(
                 lh,
                 style.font.font_size,
-                doc.root_font_size(),
-                doc.resolution,
+                root_font_size,
+                resolution,
             ) else {
                 return ApplyResult::Invalid;
             };
             style.line_height_spec = Some(lh.clone());
-            style.text.line_height_number = line_height_number(lh);
+            style.text.line_height_number = match lh {
+                LineHeight::Number(value) => value.max(0.0),
+                _ => 0.0,
+            };
             style.text.line_height = line_height;
             style.text.line_height_x_height_px = x_height_px;
-            style.text.line_height_normal = line_height_is_normal(lh);
+            style.text.line_height_normal = matches!(lh, LineHeight::Normal);
         }
-        Property::LetterSpacing(spacing) => {
-            let Some(value) = spacing_to_text_spacing(
-                spacing,
-                style.font.font_size,
-                doc.root_font_size(),
-                doc.resolution,
-            ) else {
+        Property::TabSize(value, _) => {
+            use lightningcss::values::length::LengthOrNumber;
+            let value = match value {
+                LengthOrNumber::Number(value) => TabSize::spaces(value.max(0.0)),
+                LengthOrNumber::Length(value) => length_to_px_from_length(
+                    value,
+                    style.font.font_size,
+                    root_font_size,
+                    resolution,
+                )
+                .and_then(|value| TabSize::length_px(value.max(0.0))),
+            };
+            let Some(value) = value else {
                 return ApplyResult::Invalid;
             };
-            style.text.letter_spacing = value;
+            style.text.tab_size = value;
         }
-        Property::WordSpacing(spacing) => {
-            let Some(value) = spacing_to_text_spacing(
-                spacing,
-                style.font.font_size,
-                doc.root_font_size(),
-                doc.resolution,
-            ) else {
+        Property::LetterSpacing(spacing) | Property::WordSpacing(spacing) => {
+            let Some(value) =
+                spacing_to_text_spacing(spacing, style.font.font_size, root_font_size, resolution)
+            else {
                 return ApplyResult::Invalid;
             };
-            style.text.word_spacing = value;
+            *match property {
+                Property::LetterSpacing(_) => &mut style.text.letter_spacing,
+                _ => &mut style.text.word_spacing,
+            } = value;
         }
         Property::TextAlign(ta) => {
             use lightningcss::properties::text::TextAlign as LcTextAlign;
@@ -119,12 +144,9 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             };
         }
         Property::TextIndent(ti) => {
-            let Some(value) = length_percentage_to_lengthpct(
-                &ti.value,
-                style.font.font_size,
-                doc.root_font_size(),
-                doc.resolution,
-            ) else {
+            let Some(value) =
+                computed_length_pct(&ti.value, style.font.font_size, root_font_size, resolution)
+            else {
                 return ApplyResult::Invalid;
             };
             style.text.text_indent = value;
@@ -158,34 +180,11 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
         Property::ListStyleImage(image) => {
             style.text.list_style_image = list_style_image_to_interned(styles, image);
         }
-        Property::ListStyle(ls) => {
-            let Some(list_style_type) = map_list_style_type(&ls.list_style_type) else {
-                return ApplyResult::Invalid;
-            };
-            style.text.list_style_type = list_style_type;
-            style.text.list_style_position = map_list_style_position(&ls.position);
-            style.text.list_style_image = list_style_image_to_interned(styles, &ls.image);
-        }
+
         Property::TextDecorationLine(line, _) => {
             style.background.text_decoration.lines = text_decoration_lines(line);
         }
-        Property::TextDecoration(td, _) => {
-            let Some(decoration_style) = text_decoration_style(&td.style) else {
-                return ApplyResult::Invalid;
-            };
-            let Some(thickness) = text_decoration_thickness(
-                &td.thickness,
-                style.font.font_size,
-                doc.root_font_size(),
-                doc.resolution,
-            ) else {
-                return ApplyResult::Invalid;
-            };
-            style.background.text_decoration.lines = text_decoration_lines(&td.line);
-            style.background.text_decoration.style = decoration_style;
-            style.background.text_decoration.color = decoration_color(&td.color, style.text.color);
-            style.background.text_decoration.thickness = thickness;
-        }
+
         Property::TextDecorationColor(color, _) => {
             style.background.text_decoration.color = decoration_color(color, style.text.color);
         }
@@ -199,8 +198,8 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             let Some(thickness) = text_decoration_thickness(
                 thickness,
                 style.font.font_size,
-                doc.root_font_size(),
-                doc.resolution,
+                root_font_size,
+                resolution,
             ) else {
                 return ApplyResult::Invalid;
             };
@@ -214,29 +213,10 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                 CssVisibility::Collapse => return ApplyResult::Invalid,
             };
         }
-        Property::Outline(outline) => {
-            let Some(outline_style) = outline_style(&outline.style) else {
-                return ApplyResult::Invalid;
-            };
-            let Some(width) = border_width(
-                &outline.width,
-                style.font.font_size,
-                doc.root_font_size(),
-                doc.resolution,
-            ) else {
-                return ApplyResult::Invalid;
-            };
-            style.background.outline.set_width(width);
-            style.background.outline.style = outline_style;
-            style.background.outline.color = decoration_color(&outline.color, style.text.color);
-        }
+
         Property::OutlineWidth(width) => {
-            let Some(width) = border_width(
-                width,
-                style.font.font_size,
-                doc.root_font_size(),
-                doc.resolution,
-            ) else {
+            let Some(width) = border_width(width, style.font.font_size, root_font_size, resolution)
+            else {
                 return ApplyResult::Invalid;
             };
             style.background.outline.set_width(width);
@@ -263,12 +243,8 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
                     VerticalAlignKeyword::TextBottom => VerticalAlignValue::TextBottom,
                 },
                 VerticalAlign::Length(lp) => {
-                    match vertical_align_value(
-                        lp,
-                        style.font.font_size,
-                        doc.root_font_size(),
-                        doc.resolution,
-                    ) {
+                    match vertical_align_value(lp, style.font.font_size, root_font_size, resolution)
+                    {
                         Some(value) => value,
                         None => return ApplyResult::Invalid,
                     }
@@ -276,10 +252,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             };
             style.box_model.vertical_align = vertical_align;
         }
-        Property::Overflow(overflow) => {
-            style.box_model.overflow_x = overflow_mode(overflow.x);
-            style.box_model.overflow_y = overflow_mode(overflow.y);
-        }
+
         Property::OverflowX(overflow) => {
             style.box_model.overflow_x = overflow_mode(*overflow);
         }

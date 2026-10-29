@@ -1,0 +1,477 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Layout crate — pipeline graph</title>
+<style>
+  body { margin: 16px; font: 13px/1.4 sans-serif; color: #222; background: white; }
+  h1 { font-size: 18px; margin: 0 0 6px; }
+  p { margin: 4px 0 12px; }
+  svg { display: block; width: 100%; height: auto; max-width: 1600px; }
+  @media print { body { margin: 0; } }
+</style>
+</head>
+<body>
+<h1>Layout crate — pipeline</h1>
+<p>Solid arrows: forward flow. Dashed arrows: local iteration or shared measurements. ↳: recursive child box call. Numbering restarts within each subsystem; 00 coordinates its pipeline.</p>
+<svg role="img" aria-labelledby="graph-title graph-description" width="1083pt" height="803pt"
+ viewBox="0.00 0.00 1083.00 803.00" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<g id="graph0" class="graph" transform="scale(1 1) rotate(0) translate(8.64 794.09)">
+<title id="graph-title">Global layout pipeline</title><desc id="graph-description">The overall pass prepares recursive box layout. Each box resolves sizing and dispatches to block, inline, flex/grid, or table stages. Contexts return content metrics and subtree output. Geometry publication precedes paint replay. Inline composition owns float placement and local line retries.</desc>
+<polygon fill="white" stroke="none" points="-8.64,8.64 -8.64,-794.09 1074.64,-794.09 1074.64,8.64 -8.64,8.64"/>
+<g id="clust1" class="cluster">
+<title>cluster_pass</title>
+<polygon fill="white" stroke="#aaaaaa" points="8,-8 8,-777.45 1058,-777.45 1058,-8 8,-8"/>
+<text xml:space="preserve" text-anchor="middle" x="77.5" y="-761.1" font-family="sans-serif" font-size="13.00">Overall pass · layout/</text>
+</g>
+<g id="clust3" class="cluster">
+<title>cluster_box</title>
+<polygon fill="white" stroke="#aaaaaa" points="16,-59.39 16,-705.31 1050,-705.31 1050,-59.39 16,-59.39"/>
+<text xml:space="preserve" text-anchor="middle" x="88.88" y="-688.96" font-family="sans-serif" font-size="13.00">Each box · layout/box/</text>
+</g>
+<g id="clust5" class="cluster">
+<title>cluster_block</title>
+<polygon fill="white" stroke="#cccccc" points="24,-388.72 24,-633.17 346,-633.17 346,-388.72 24,-388.72"/>
+<text xml:space="preserve" text-anchor="middle" x="90.88" y="-616.82" font-family="sans-serif" font-size="13.00">Block · layout/block/</text>
+</g>
+<g id="clust6" class="cluster">
+<title>cluster_inline</title>
+<polygon fill="white" stroke="#cccccc" points="354,-313.94 354,-633.17 616,-633.17 616,-313.94 354,-313.94"/>
+<text xml:space="preserve" text-anchor="middle" x="420.5" y="-616.82" font-family="sans-serif" font-size="13.00">Inline · layout/inline/</text>
+</g>
+<g id="clust7" class="cluster">
+<title>cluster_flex</title>
+<polygon fill="white" stroke="#cccccc" points="624,-239.16 624,-633.17 839,-633.17 839,-239.16 624,-239.16"/>
+<text xml:space="preserve" text-anchor="middle" x="693.88" y="-616.82" font-family="sans-serif" font-size="13.00">Flex / grid · flex_grid/</text>
+</g>
+<g id="clust8" class="cluster">
+<title>cluster_table</title>
+<polygon fill="white" stroke="#cccccc" points="847,-153.38 847,-633.17 1042,-633.17 1042,-153.38 847,-153.38"/>
+<text xml:space="preserve" text-anchor="middle" x="893.25" y="-616.82" font-family="sans-serif" font-size="13.00">Table · table/</text>
+</g>
+<!-- p0 -->
+<g id="node1" class="node">
+<title>p0</title>
+<polygon fill="none" stroke="#555555" points="139.98,-748.7 46.02,-748.7 46.02,-724.31 139.98,-724.31 139.98,-748.7"/>
+<text xml:space="preserve" text-anchor="middle" x="93" y="-733.93" font-family="monospace" font-size="11.00">00&#45;layout.rs</text>
+</g>
+<!-- p1 -->
+<g id="node2" class="node">
+<title>p1</title>
+<polygon fill="none" stroke="#555555" points="276.36,-748.7 175.65,-748.7 175.65,-724.31 276.36,-724.31 276.36,-748.7"/>
+<text xml:space="preserve" text-anchor="middle" x="226" y="-733.93" font-family="monospace" font-size="11.00">01&#45;prepare.rs</text>
+</g>
+<!-- p0&#45;&gt;p1 -->
+<g id="edge1" class="edge">
+<title>p0&#45;&gt;p1</title>
+<path fill="none" stroke="#555555" d="M140.28,-736.51C149.53,-736.51 158.77,-736.51 168.02,-736.51"/>
+<polygon fill="#555555" stroke="#555555" points="167.92,-738.61 173.92,-736.51 167.92,-734.41 167.92,-738.61"/>
+</g>
+<!-- p2 -->
+<g id="node3" class="node">
+<title>p2</title>
+<polygon fill="none" stroke="#555555" points="439.86,-748.7 312.14,-748.7 312.14,-724.31 439.86,-724.31 439.86,-748.7"/>
+<text xml:space="preserve" text-anchor="middle" x="376" y="-733.93" font-family="monospace" font-size="11.00">02&#45;root_layout.rs</text>
+</g>
+<!-- p1&#45;&gt;p2 -->
+<g id="edge2" class="edge">
+<title>p1&#45;&gt;p2</title>
+<path fill="none" stroke="#555555" d="M276.68,-736.51C285.97,-736.51 295.25,-736.51 304.54,-736.51"/>
+<polygon fill="#555555" stroke="#555555" points="304.47,-738.61 310.47,-736.51 304.47,-734.41 304.47,-738.61"/>
+</g>
+<!-- x0 -->
+<g id="node6" class="node">
+<title>x0</title>
+<polygon fill="none" stroke="#555555" points="422.98,-676.56 329.02,-676.56 329.02,-652.17 422.98,-652.17 422.98,-676.56"/>
+<text xml:space="preserve" text-anchor="middle" x="376" y="-661.79" font-family="monospace" font-size="11.00">00&#45;layout.rs</text>
+</g>
+<!-- p2&#45;&gt;x0 -->
+<g id="edge36" class="edge">
+<title>p2&#45;&gt;x0</title>
+<path fill="none" stroke="#555555" d="M376,-723.92C376,-713.1 376,-696.74 376,-684.07"/>
+<polygon fill="#555555" stroke="#555555" points="378.1,-684.25 376,-678.25 373.9,-684.25 378.1,-684.25"/>
+</g>
+<!-- p3 -->
+<g id="node4" class="node">
+<title>p3</title>
+<polygon fill="none" stroke="#555555" points="647.73,-40.39 540.27,-40.39 540.27,-16 647.73,-16 647.73,-40.39"/>
+<text xml:space="preserve" text-anchor="middle" x="594" y="-25.62" font-family="monospace" font-size="11.00">03&#45;finalize.rs</text>
+</g>
+<!-- p4 -->
+<g id="node5" class="node">
+<title>p4</title>
+<polygon fill="none" stroke="#555555" points="770.61,-40.39 683.39,-40.39 683.39,-16 770.61,-16 770.61,-40.39"/>
+<text xml:space="preserve" text-anchor="middle" x="727" y="-25.62" font-family="monospace" font-size="11.00">04&#45;paint.rs</text>
+</g>
+<!-- p3&#45;&gt;p4 -->
+<g id="edge38" class="edge">
+<title>p3&#45;&gt;p4</title>
+<path fill="none" stroke="#555555" d="M648.03,-28.2C657.28,-28.2 666.53,-28.2 675.78,-28.2"/>
+<polygon fill="#555555" stroke="#555555" points="675.68,-30.3 681.68,-28.2 675.68,-26.1 675.68,-30.3"/>
+</g>
+<!-- x1 -->
+<g id="node7" class="node">
+<title>x1</title>
+<polygon fill="none" stroke="#555555" points="551.98,-676.56 458.02,-676.56 458.02,-652.17 551.98,-652.17 551.98,-676.56"/>
+<text xml:space="preserve" text-anchor="middle" x="505" y="-661.79" font-family="monospace" font-size="11.00">01&#45;sizing.rs</text>
+</g>
+<!-- x0&#45;&gt;x1 -->
+<g id="edge3" class="edge">
+<title>x0&#45;&gt;x1</title>
+<path fill="none" stroke="#555555" d="M423.37,-664.37C432.43,-664.37 441.48,-664.37 450.54,-664.37"/>
+<polygon fill="#555555" stroke="#555555" points="450.29,-666.46 456.29,-664.36 450.29,-662.26 450.29,-666.46"/>
+</g>
+<!-- x2 -->
+<g id="node8" class="node">
+<title>x2</title>
+<polygon fill="none" stroke="#555555" points="694.73,-676.56 587.27,-676.56 587.27,-652.17 694.73,-652.17 694.73,-676.56"/>
+<text xml:space="preserve" text-anchor="middle" x="641" y="-661.79" font-family="monospace" font-size="11.00">02&#45;contents.rs</text>
+</g>
+<!-- x1&#45;&gt;x2 -->
+<g id="edge4" class="edge">
+<title>x1&#45;&gt;x2</title>
+<path fill="none" stroke="#555555" d="M552.28,-664.37C561.4,-664.37 570.51,-664.37 579.63,-664.37"/>
+<polygon fill="#555555" stroke="#555555" points="579.42,-666.46 585.42,-664.36 579.42,-662.26 579.42,-666.46"/>
+</g>
+<!-- b0 -->
+<g id="node10" class="node">
+<title>b0</title>
+<polygon fill="none" stroke="#555555" points="242.23,-604.42 161.77,-604.42 161.77,-580.03 242.23,-580.03 242.23,-604.42"/>
+<text xml:space="preserve" text-anchor="middle" x="202" y="-589.65" font-family="monospace" font-size="11.00">00&#45;flow.rs</text>
+</g>
+<!-- x2&#45;&gt;b0 -->
+<g id="edge27" class="edge">
+<title>x2&#45;&gt;b0</title>
+<path fill="none" stroke="#555555" d="M586.82,-655.42C578.2,-654.26 569.36,-653.13 561,-652.17 467.46,-641.42 442.69,-649.72 350,-633.17 314.1,-626.76 274.24,-615.77 244.93,-606.94"/>
+<polygon fill="#555555" stroke="#555555" points="245.89,-605.03 239.54,-605.3 244.67,-609.05 245.89,-605.03"/>
+</g>
+<!-- i0 -->
+<g id="node14" class="node">
+<title>i0</title>
+<polygon fill="none" stroke="#555555" points="590.98,-604.42 497.02,-604.42 497.02,-580.03 590.98,-580.03 590.98,-604.42"/>
+<text xml:space="preserve" text-anchor="middle" x="544" y="-589.65" font-family="monospace" font-size="11.00">00&#45;layout.rs</text>
+</g>
+<!-- x2&#45;&gt;i0 -->
+<g id="edge28" class="edge">
+<title>x2&#45;&gt;i0</title>
+<path fill="none" stroke="#555555" d="M624.98,-651.78C608.84,-640.11 583.8,-622 565.84,-609.02"/>
+<polygon fill="#555555" stroke="#555555" points="567.36,-607.53 561.27,-605.71 564.9,-610.93 567.36,-607.53"/>
+</g>
+<!-- f0 -->
+<g id="node18" class="node">
+<title>f0</title>
+<polygon fill="none" stroke="#555555" points="726.98,-604.42 633.02,-604.42 633.02,-580.03 726.98,-580.03 726.98,-604.42"/>
+<text xml:space="preserve" text-anchor="middle" x="680" y="-589.65" font-family="monospace" font-size="11.00">00&#45;layout.rs</text>
+</g>
+<!-- x2&#45;&gt;f0 -->
+<g id="edge29" class="edge">
+<title>x2&#45;&gt;f0</title>
+<path fill="none" stroke="#555555" d="M647.44,-651.78C653.63,-640.65 663.07,-623.67 670.19,-610.86"/>
+<polygon fill="#555555" stroke="#555555" points="671.86,-612.18 672.94,-605.91 668.19,-610.14 671.86,-612.18"/>
+</g>
+<!-- t0 -->
+<g id="node23" class="node">
+<title>t0</title>
+<polygon fill="none" stroke="#555555" points="954.98,-604.42 861.02,-604.42 861.02,-580.03 954.98,-580.03 954.98,-604.42"/>
+<text xml:space="preserve" text-anchor="middle" x="908" y="-589.65" font-family="monospace" font-size="11.00">00&#45;layout.rs</text>
+</g>
+<!-- x2&#45;&gt;t0 -->
+<g id="edge30" class="edge">
+<title>x2&#45;&gt;t0</title>
+<path fill="none" stroke="#555555" d="M695.18,-661.16C736.71,-658.08 794.86,-650.73 843,-633.17 858.79,-627.41 874.89,-617.55 887.12,-609.06"/>
+<polygon fill="#555555" stroke="#555555" points="888.24,-610.85 891.91,-605.66 885.8,-607.43 888.24,-610.85"/>
+</g>
+<!-- x3 -->
+<g id="node9" class="node">
+<title>x3</title>
+<polygon fill="none" stroke="#555555" points="640.98,-91.78 547.02,-91.78 547.02,-67.39 640.98,-67.39 640.98,-91.78"/>
+<text xml:space="preserve" text-anchor="middle" x="594" y="-77.01" font-family="monospace" font-size="11.00">03&#45;finish.rs</text>
+</g>
+<!-- x3&#45;&gt;p3 -->
+<g id="edge37" class="edge">
+<title>x3&#45;&gt;p3</title>
+<path fill="none" stroke="#555555" d="M594,-67.13C594,-61.39 594,-54.31 594,-47.82"/>
+<polygon fill="#555555" stroke="#555555" points="596.1,-48.1 594,-42.1 591.9,-48.1 596.1,-48.1"/>
+</g>
+<!-- b1 -->
+<g id="node11" class="node">
+<title>b1</title>
+<polygon fill="none" stroke="#555555" points="243.61,-559.03 102.39,-559.03 102.39,-534.64 243.61,-534.64 243.61,-559.03"/>
+<text xml:space="preserve" text-anchor="middle" x="173" y="-544.26" font-family="monospace" font-size="11.00">01&#45;prepare_child.rs</text>
+</g>
+<!-- b0&#45;&gt;b1 -->
+<g id="edge5" class="edge">
+<title>b0&#45;&gt;b1</title>
+<path fill="none" stroke="#555555" d="M194.38,-579.82C191.41,-575.38 187.93,-570.17 184.66,-565.28"/>
+<polygon fill="#555555" stroke="#555555" points="186.59,-564.39 181.51,-560.57 183.1,-566.72 186.59,-564.39"/>
+</g>
+<!-- b2 -->
+<g id="node12" class="node">
+<title>b2</title>
+<polygon fill="none" stroke="#555555" points="179.98,-507.26 32.02,-507.26 32.02,-482.87 179.98,-482.87 179.98,-507.26"/>
+<text xml:space="preserve" text-anchor="middle" x="106" y="-492.49" font-family="monospace" font-size="11.00">02&#45;layout_child.rs ↳</text>
+</g>
+<!-- b1&#45;&gt;b2 -->
+<g id="edge6" class="edge">
+<title>b1&#45;&gt;b2</title>
+<path fill="none" stroke="#555555" d="M157.46,-534.29C148.5,-527.63 137.1,-519.17 127.31,-511.9"/>
+<polygon fill="#555555" stroke="#555555" points="128.74,-510.34 122.67,-508.45 126.23,-513.72 128.74,-510.34"/>
+</g>
+<!-- b2&#45;&gt;b2 -->
+<g id="edge8" class="edge">
+<title>b2:e&#45;&gt;b2:e</title>
+<path fill="none" stroke="#555555" stroke-dasharray="5,2" d="M179.98,-495.07C185.98,-502.34 197.98,-502.34 197.98,-495.07 197.98,-489.73 191.51,-488.32 185.69,-490.82"/>
+<polygon fill="#555555" stroke="#555555" points="184.75,-488.9 181.19,-494.17 187.26,-492.27 184.75,-488.9"/>
+<text xml:space="preserve" text-anchor="middle" x="229.11" y="-490.44" font-family="sans-serif" font-size="10.00">float&#45;fit probes</text>
+</g>
+<!-- b3 -->
+<g id="node13" class="node">
+<title>b3</title>
+<polygon fill="none" stroke="#555555" points="265.23,-421.11 130.77,-421.11 130.77,-396.72 265.23,-396.72 265.23,-421.11"/>
+<text xml:space="preserve" text-anchor="middle" x="198" y="-406.34" font-family="monospace" font-size="11.00">03&#45;finish_child.rs</text>
+</g>
+<!-- b2&#45;&gt;b3 -->
+<g id="edge7" class="edge">
+<title>b2&#45;&gt;b3</title>
+<path fill="none" stroke="#555555" d="M118.41,-482.72C134.32,-468.16 162.03,-442.82 180.19,-426.21"/>
+<polygon fill="#555555" stroke="#555555" points="181.37,-427.97 184.38,-422.38 178.53,-424.88 181.37,-427.97"/>
+</g>
+<!-- b3&#45;&gt;b1 -->
+<g id="edge9" class="edge">
+<title>b3:w&#45;&gt;b1:w</title>
+<path fill="none" stroke="#555555" stroke-dasharray="5,2" d="M129.77,-408.91C124.33,-408.91 127.3,-416.92 130.77,-421.11 141.42,-433.98 151.27,-425.48 167,-431.11 213.71,-447.84 241.97,-434.89 269,-476.5 277.99,-490.34 279.92,-501.26 269,-513.64 256.66,-527.63 115.3,-521.16 102.39,-534.64 101.1,-535.99 99.94,-537.85 99.19,-539.72"/>
+<polygon fill="#555555" stroke="#555555" points="97.16,-540.28 100.95,-545.39 101.17,-539.04 97.16,-540.28"/>
+<text xml:space="preserve" text-anchor="middle" x="297.48" y="-490.44" font-family="sans-serif" font-size="10.00">next child</text>
+</g>
+<!-- result -->
+<g id="node31" class="node">
+<title>result</title>
+<text xml:space="preserve" text-anchor="middle" x="594" y="-118.75" font-family="sans-serif" font-size="11.00">content metrics + subtree output</text>
+</g>
+<!-- b3&#45;&gt;result -->
+<g id="edge31" class="edge">
+<title>b3&#45;&gt;result</title>
+<path fill="none" stroke="#555555" d="M212.17,-396.39C226.64,-383.24 247,-360.27 247,-335.13 247,-335.13 247,-335.13 247,-172.57 247,-146.7 400.32,-134.02 503.13,-128.42"/>
+<polygon fill="#555555" stroke="#555555" points="503.05,-130.53 508.93,-128.11 502.83,-126.34 503.05,-130.53"/>
+</g>
+<!-- i1 -->
+<g id="node15" class="node">
+<title>i1</title>
+<polygon fill="none" stroke="#555555" points="517.48,-559.03 396.52,-559.03 396.52,-534.64 517.48,-534.64 517.48,-559.03"/>
+<text xml:space="preserve" text-anchor="middle" x="457" y="-544.26" font-family="monospace" font-size="11.00">01&#45;tokenize.rs ↳</text>
+</g>
+<!-- i0&#45;&gt;i1 -->
+<g id="edge10" class="edge">
+<title>i0&#45;&gt;i1</title>
+<path fill="none" stroke="#555555" d="M520.69,-579.6C510.35,-574.44 498.06,-568.31 487.04,-562.82"/>
+<polygon fill="#555555" stroke="#555555" points="488.04,-560.97 481.73,-560.17 486.17,-564.73 488.04,-560.97"/>
+</g>
+<!-- i2 -->
+<g id="node16" class="node">
+<title>i2</title>
+<polygon fill="none" stroke="#555555" points="476.11,-507.26 361.89,-507.26 361.89,-482.87 476.11,-482.87 476.11,-507.26"/>
+<text xml:space="preserve" text-anchor="middle" x="419" y="-492.49" font-family="monospace" font-size="11.00">02&#45;compose.rs ↳</text>
+</g>
+<!-- i1&#45;&gt;i2 -->
+<g id="edge11" class="edge">
+<title>i1&#45;&gt;i2</title>
+<path fill="none" stroke="#555555" d="M448.19,-534.29C443.39,-528.01 437.36,-520.12 432.04,-513.14"/>
+<polygon fill="#555555" stroke="#555555" points="433.99,-512.25 428.68,-508.75 430.66,-514.8 433.99,-512.25"/>
+</g>
+<!-- i2&#45;&gt;i2 -->
+<g id="edge13" class="edge">
+<title>i2:e&#45;&gt;i2:e</title>
+<path fill="none" stroke="#555555" stroke-dasharray="5,2" d="M476.11,-495.07C482.11,-502.34 494.11,-502.34 494.11,-495.07 494.11,-489.73 487.63,-488.32 481.82,-490.82"/>
+<polygon fill="#555555" stroke="#555555" points="480.88,-488.9 477.32,-494.17 483.39,-492.27 480.88,-488.9"/>
+<text xml:space="preserve" text-anchor="middle" x="551.11" y="-490.44" font-family="sans-serif" font-size="10.00">float placement / line retry</text>
+</g>
+<!-- i3 -->
+<g id="node17" class="node">
+<title>i3</title>
+<polygon fill="none" stroke="#555555" points="540.98,-346.33 447.02,-346.33 447.02,-321.94 540.98,-321.94 540.98,-346.33"/>
+<text xml:space="preserve" text-anchor="middle" x="494" y="-331.56" font-family="monospace" font-size="11.00">03&#45;emit.rs ↳</text>
+</g>
+<!-- i2&#45;&gt;i3 -->
+<g id="edge12" class="edge">
+<title>i2&#45;&gt;i3</title>
+<path fill="none" stroke="#555555" d="M424.51,-482.38C437.53,-454.81 470.2,-385.56 485.66,-352.82"/>
+<polygon fill="#555555" stroke="#555555" points="487.37,-354.1 488.03,-347.78 483.57,-352.31 487.37,-354.1"/>
+</g>
+<!-- i3&#45;&gt;result -->
+<g id="edge32" class="edge">
+<title>i3&#45;&gt;result</title>
+<path fill="none" stroke="#555555" d="M502.14,-321.92C511.33,-308.14 525,-283.7 525,-260.35 525,-260.35 525,-260.35 525,-172.57 525,-155.98 538.62,-144.65 553.76,-137.19"/>
+<polygon fill="#555555" stroke="#555555" points="554.33,-139.24 558.93,-134.85 552.6,-135.42 554.33,-139.24"/>
+</g>
+<!-- f1 -->
+<g id="node19" class="node">
+<title>f1</title>
+<polygon fill="none" stroke="#555555" points="732.36,-559.03 631.64,-559.03 631.64,-534.64 732.36,-534.64 732.36,-559.03"/>
+<text xml:space="preserve" text-anchor="middle" x="682" y="-544.26" font-family="monospace" font-size="11.00">01&#45;prepare.rs</text>
+</g>
+<!-- f0&#45;&gt;f1 -->
+<g id="edge14" class="edge">
+<title>f0&#45;&gt;f1</title>
+<path fill="none" stroke="#555555" d="M680.53,-579.82C680.71,-575.77 680.93,-571.09 681.14,-566.59"/>
+<polygon fill="#555555" stroke="#555555" points="683.22,-566.91 681.4,-560.82 679.03,-566.72 683.22,-566.91"/>
+</g>
+<!-- f2 -->
+<g id="node20" class="node">
+<title>f2</title>
+<polygon fill="none" stroke="#555555" points="732.36,-507.26 631.64,-507.26 631.64,-482.87 732.36,-482.87 732.36,-507.26"/>
+<text xml:space="preserve" text-anchor="middle" x="682" y="-492.49" font-family="monospace" font-size="11.00">02&#45;solve.rs ↳</text>
+</g>
+<!-- f1&#45;&gt;f2 -->
+<g id="edge15" class="edge">
+<title>f1&#45;&gt;f2</title>
+<path fill="none" stroke="#555555" d="M682,-534.29C682,-528.51 682,-521.37 682,-514.83"/>
+<polygon fill="#555555" stroke="#555555" points="684.1,-515.06 682,-509.06 679.9,-515.06 684.1,-515.06"/>
+</g>
+<!-- f2&#45;&gt;f2 -->
+<g id="edge18" class="edge">
+<title>f2:e&#45;&gt;f2:e</title>
+<path fill="none" stroke="#555555" stroke-dasharray="5,2" d="M732.36,-495.07C738.36,-502.34 750.36,-502.34 750.36,-495.07 750.36,-489.73 743.88,-488.32 738.07,-490.82"/>
+<polygon fill="#555555" stroke="#555555" points="737.13,-488.9 733.57,-494.17 739.64,-492.27 737.13,-488.9"/>
+<text xml:space="preserve" text-anchor="middle" x="790.48" y="-490.44" font-family="sans-serif" font-size="10.00">measure / re&#45;solve</text>
+</g>
+<!-- f3 -->
+<g id="node21" class="node">
+<title>f3</title>
+<polygon fill="none" stroke="#555555" points="732.36,-455.5 631.64,-455.5 631.64,-431.11 732.36,-431.11 732.36,-455.5"/>
+<text xml:space="preserve" text-anchor="middle" x="682" y="-440.73" font-family="monospace" font-size="11.00">03&#45;place.rs ↳</text>
+</g>
+<!-- f2&#45;&gt;f3 -->
+<g id="edge16" class="edge">
+<title>f2&#45;&gt;f3</title>
+<path fill="none" stroke="#555555" d="M682,-482.53C682,-476.75 682,-469.61 682,-463.07"/>
+<polygon fill="#555555" stroke="#555555" points="684.1,-463.3 682,-457.3 679.9,-463.3 684.1,-463.3"/>
+</g>
+<!-- f4 -->
+<g id="node22" class="node">
+<title>f4</title>
+<polygon fill="none" stroke="#555555" points="722.61,-271.55 635.39,-271.55 635.39,-247.16 722.61,-247.16 722.61,-271.55"/>
+<text xml:space="preserve" text-anchor="middle" x="679" y="-256.78" font-family="monospace" font-size="11.00">04&#45;align.rs</text>
+</g>
+<!-- f3&#45;&gt;f4 -->
+<g id="edge17" class="edge">
+<title>f3&#45;&gt;f4</title>
+<path fill="none" stroke="#555555" d="M681.81,-430.65C681.3,-399.89 679.92,-316.37 679.31,-278.94"/>
+<polygon fill="#555555" stroke="#555555" points="681.41,-279.16 679.21,-273.2 677.21,-279.23 681.41,-279.16"/>
+</g>
+<!-- f4&#45;&gt;result -->
+<g id="edge33" class="edge">
+<title>f4&#45;&gt;result</title>
+<path fill="none" stroke="#555555" d="M671.75,-246.95C656.58,-223.07 621.44,-167.76 604.08,-140.44"/>
+<polygon fill="#555555" stroke="#555555" points="605.87,-139.35 600.88,-135.41 602.33,-141.6 605.87,-139.35"/>
+</g>
+<!-- t1 -->
+<g id="node24" class="node">
+<title>t1</title>
+<polygon fill="none" stroke="#555555" points="952.23,-559.03 871.77,-559.03 871.77,-534.64 952.23,-534.64 952.23,-559.03"/>
+<text xml:space="preserve" text-anchor="middle" x="912" y="-544.26" font-family="monospace" font-size="11.00">01&#45;grid.rs</text>
+</g>
+<!-- t0&#45;&gt;t1 -->
+<g id="edge19" class="edge">
+<title>t0&#45;&gt;t1</title>
+<path fill="none" stroke="#555555" d="M909.05,-579.82C909.42,-575.77 909.86,-571.09 910.27,-566.59"/>
+<polygon fill="#555555" stroke="#555555" points="912.34,-566.98 910.8,-560.82 908.16,-566.6 912.34,-566.98"/>
+</g>
+<!-- tm -->
+<g id="node25" class="node">
+<title>tm</title>
+<text xml:space="preserve" text-anchor="middle" x="915" y="-499.82" font-family="monospace" font-size="10.00">column measurement</text>
+<text xml:space="preserve" text-anchor="middle" x="915" y="-485.57" font-family="monospace" font-size="10.00">(helper in 03)</text>
+</g>
+<!-- t1&#45;&gt;tm -->
+<g id="edge20" class="edge">
+<title>t1&#45;&gt;tm</title>
+<path fill="none" stroke="#555555" d="M912.7,-534.29C912.94,-530.22 913.23,-525.48 913.51,-520.74"/>
+<polygon fill="#555555" stroke="#555555" points="915.6,-521.03 913.86,-514.92 911.41,-520.78 915.6,-521.03"/>
+</g>
+<!-- t2 -->
+<g id="node26" class="node">
+<title>t2</title>
+<polygon fill="none" stroke="#555555" points="969.11,-455.5 854.89,-455.5 854.89,-431.11 969.11,-431.11 969.11,-455.5"/>
+<text xml:space="preserve" text-anchor="middle" x="912" y="-440.73" font-family="monospace" font-size="11.00">02&#45;intrinsic.rs</text>
+</g>
+<!-- tm&#45;&gt;t2 -->
+<g id="edge21" class="edge">
+<title>tm&#45;&gt;t2</title>
+<path fill="none" stroke="#555555" d="M913.95,-476.66C913.68,-472.21 913.39,-467.41 913.12,-462.9"/>
+<polygon fill="#555555" stroke="#555555" points="915.24,-463.07 912.78,-457.21 911.04,-463.33 915.24,-463.07"/>
+</g>
+<!-- t3 -->
+<g id="node27" class="node">
+<title>t3</title>
+<polygon fill="none" stroke="#555555" points="996.61,-380.72 855.39,-380.72 855.39,-356.33 996.61,-356.33 996.61,-380.72"/>
+<text xml:space="preserve" text-anchor="middle" x="926" y="-365.95" font-family="monospace" font-size="11.00">03&#45;column_sizing.rs</text>
+</g>
+<!-- tm&#45;&gt;t3 -->
+<g id="edge26" class="edge">
+<title>tm:e&#45;&gt;t3:e</title>
+<path fill="none" stroke="#555555" stroke-dasharray="5,2" d="M976.42,-495.07C1030.89,-495.07 1052.65,-379.64 1004.82,-369.27"/>
+<polygon fill="#555555" stroke="#555555" points="1005.29,-367.21 999.11,-368.68 1004.86,-371.38 1005.29,-367.21"/>
+<text xml:space="preserve" text-anchor="middle" x="1044.41" y="-438.68" font-family="sans-serif" font-size="10.00">shared</text>
+</g>
+<!-- t2&#45;&gt;t3 -->
+<g id="edge22" class="edge">
+<title>t2&#45;&gt;t3</title>
+<path fill="none" stroke="#555555" d="M914.25,-430.61C916.45,-419.19 919.83,-401.63 922.4,-388.26"/>
+<polygon fill="#555555" stroke="#555555" points="924.45,-388.72 923.52,-382.44 920.32,-387.93 924.45,-388.72"/>
+</g>
+<!-- t4 -->
+<g id="node28" class="node">
+<title>t4</title>
+<polygon fill="none" stroke="#555555" points="971.98,-305.94 878.02,-305.94 878.02,-281.55 971.98,-281.55 971.98,-305.94"/>
+<text xml:space="preserve" text-anchor="middle" x="925" y="-291.17" font-family="monospace" font-size="11.00">04&#45;rows.rs ↳</text>
+</g>
+<!-- t3&#45;&gt;t4 -->
+<g id="edge23" class="edge">
+<title>t3&#45;&gt;t4</title>
+<path fill="none" stroke="#555555" d="M925.84,-355.83C925.68,-344.41 925.44,-326.85 925.26,-313.48"/>
+<polygon fill="#555555" stroke="#555555" points="927.36,-313.65 925.18,-307.68 923.16,-313.71 927.36,-313.65"/>
+</g>
+<!-- t5 -->
+<g id="node29" class="node">
+<title>t5</title>
+<polygon fill="none" stroke="#555555" points="982.48,-231.16 861.52,-231.16 861.52,-206.77 982.48,-206.77 982.48,-231.16"/>
+<text xml:space="preserve" text-anchor="middle" x="922" y="-216.39" font-family="monospace" font-size="11.00">05&#45;row_sizing.rs</text>
+</g>
+<!-- t4&#45;&gt;t5 -->
+<g id="edge24" class="edge">
+<title>t4&#45;&gt;t5</title>
+<path fill="none" stroke="#555555" d="M924.52,-281.05C924.05,-269.63 923.32,-252.07 922.77,-238.7"/>
+<polygon fill="#555555" stroke="#555555" points="924.88,-238.81 922.53,-232.9 920.68,-238.98 924.88,-238.81"/>
+</g>
+<!-- t6 -->
+<g id="node30" class="node">
+<title>t6</title>
+<polygon fill="none" stroke="#555555" points="983.86,-185.77 856.14,-185.77 856.14,-161.38 983.86,-161.38 983.86,-185.77"/>
+<text xml:space="preserve" text-anchor="middle" x="920" y="-171" font-family="monospace" font-size="11.00">06&#45;placement.rs ↳</text>
+</g>
+<!-- t5&#45;&gt;t6 -->
+<g id="edge25" class="edge">
+<title>t5&#45;&gt;t6</title>
+<path fill="none" stroke="#555555" d="M921.47,-206.56C921.29,-202.51 921.07,-197.83 920.86,-193.33"/>
+<polygon fill="#555555" stroke="#555555" points="922.97,-193.46 920.6,-187.56 918.78,-193.65 922.97,-193.46"/>
+</g>
+<!-- t6&#45;&gt;result -->
+<g id="edge34" class="edge">
+<title>t6&#45;&gt;result</title>
+<path fill="none" stroke="#555555" d="M882.85,-160.9C872.91,-158.1 862.11,-155.36 852,-153.38 796.98,-142.62 734.52,-135.52 684.84,-131.06"/>
+<polygon fill="#555555" stroke="#555555" points="685.27,-128.99 679.11,-130.55 684.9,-133.17 685.27,-128.99"/>
+</g>
+<!-- result&#45;&gt;x3 -->
+<g id="edge35" class="edge">
+<title>result&#45;&gt;x3</title>
+<path fill="none" stroke="#555555" d="M594,-112.84C594,-108.87 594,-104.13 594,-99.52"/>
+<polygon fill="#555555" stroke="#555555" points="596.1,-99.57 594,-93.57 591.9,-99.57 596.1,-99.57"/>
+</g>
+</g>
+</svg>
+
+<p>Only main stages are numbered; 00 coordinates. Intrinsic queries, isolated measurement, caches, and math remain shared helpers. Paint-only updates may enter 04-paint directly.</p>
+<p><a href="layout-pipeline.dot">Graph source</a></p>
+</body>
+</html>

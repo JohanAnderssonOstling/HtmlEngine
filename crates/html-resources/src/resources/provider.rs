@@ -1,7 +1,7 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use html_source::ResourceProvider;
+use html_dom::{ResourceProvider, uri_path};
 
 pub struct FileSystemProvider;
 
@@ -18,10 +18,6 @@ impl FileSystemProvider {
 
     fn normalize_path(path: &Path) -> String {
         path.to_string_lossy().into_owned()
-    }
-
-    fn resource_path(uri: &str) -> &str {
-        uri.split(['?', '#']).next().unwrap_or(uri)
     }
 
     fn is_html(path: &Path) -> bool {
@@ -53,16 +49,16 @@ impl FileSystemProvider {
 
 impl ResourceProvider for FileSystemProvider {
     fn read_bytes(&self, uri: &str) -> io::Result<Vec<u8>> {
-        std::fs::read(Self::resource_path(uri))
+        std::fs::read(uri_path(uri))
     }
 
     fn exists(&self, uri: &str) -> bool {
-        std::fs::metadata(Self::resource_path(uri)).is_ok()
+        std::fs::metadata(uri_path(uri)).is_ok()
     }
 
     fn resolve(&self, base: &str, href: &str) -> String {
-        let href = Self::resource_path(href);
-        let base = Self::resource_path(base);
+        let href = uri_path(href);
+        let base = uri_path(base);
         if href.is_empty() {
             return base.to_owned();
         }

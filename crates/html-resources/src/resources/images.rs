@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io::{self, Cursor};
@@ -5,13 +6,15 @@ use std::sync::{Arc, Mutex, Weak};
 
 use base64::Engine;
 use peniko::{Blob, Format, Image as PenikoImage};
-use quick_xml::Reader;
+use quick_xml::{Reader, XmlVersion};
 use quick_xml::Writer;
 use quick_xml::events::{BytesStart, Event};
 use sha2::{Digest, Sha256};
 
 use crate::document::{ImageResource, ImageSource};
-use crate::resources::{ResourceMetadata, ResourceProvider};
+use crate::resources::{
+    ResourceMetadata, ResourceProvider, has_uri_scheme, media_type_essence, uri_path,
+};
 
 #[derive(Clone)]
 pub enum DecodedImage {
@@ -389,6 +392,12 @@ impl ImagePipeline {
         self.decoded_cache.get(&idx).map(AsRef::as_ref)
     }
 
+    /// Known intrinsic dimensions survive decoded-buffer release and are
+    /// invalidated when this index is rebound to another resource source.
+    pub fn intrinsic_dimensions(&self, idx: u32) -> Option<(u32, u32)> {
+        self.image_dimensions.get(&idx).copied()
+    }
+
     pub fn has_pending(&self) -> bool {
         if self.desired.iter().all(|idx| self.seen_revisions.contains_key(idx)) {
             return false;
@@ -493,15 +502,21 @@ fn decode_image(bytes: &[u8]) -> Result<DecodedImage, ()> {
     })
 }
 
+/// Inspect intrinsic dimensions from encoded source bytes. Embedded SVG and
+/// formula payloads are borrowed; URI sources are read once.
 pub fn probe_dimensions(
     provider: &dyn ResourceProvider,
     source: &ImageSource,
 ) -> Option<(u32, u32)> {
-    let bytes = load_image_bytes(provider, source).ok()?;
+    let bytes: Cow<'_, [u8]> = match source {
+        ImageSource::Uri(uri) => Cow::Owned(provider.read_bytes(uri).ok()?),
+        ImageSource::MathMl { svg, .. } => Cow::Borrowed(svg),
+        ImageSource::InlineSvg { bytes, .. } => Cow::Borrowed(bytes),
+    };
     if let Some(dimensions) = svg_dimensions(&bytes) {
         return Some(dimensions);
     }
-    if let Ok(reader) = image::ImageReader::new(Cursor::new(&bytes)).with_guessed_format()
+    if let Ok(reader) = image::ImageReader::new(Cursor::new(bytes.as_ref())).with_guessed_format()
         && let Ok(dimensions) = reader.into_dimensions()
     {
         return Some(dimensions);
@@ -569,20 +584,12 @@ pub fn load_image_bytes(
             let references =
                 svg_image_references(bytes, base_uri, |base, href| provider.resolve(base, href));
             let mut prepared = PreparedSvgResources::new(references);
-            for uri in &prepared.references.uris {
+            for reference in 0..prepared.references.uris.len() {
                 if prepared.byte_len >= MAX_EMBEDDED_BYTES {
                     break;
                 }
-                if let Ok(bytes) = provider.read_bytes(uri)
-                    && prepared.byte_len.saturating_add(bytes.len()) <= MAX_EMBEDDED_BYTES
-                {
-                    let metadata = provider.metadata(uri).ok();
-                    if let Some(media_type) = svg_image_media_type(metadata.as_ref(), uri, &bytes) {
-                        prepared.byte_len += bytes.len();
-                        prepared
-                            .resources
-                            .insert(uri.clone(), PreparedSvgImage { bytes, media_type });
-                    }
+                if let Ok(bytes) = provider.read_bytes(&prepared.references.uris[reference]) {
+                    prepared.insert_image(reference, bytes, |uri| provider.metadata(uri));
                 }
             }
             Ok(embed_svg_image_resources(&prepared, bytes))
@@ -609,20 +616,12 @@ where
             let references =
                 svg_image_references(bytes, base_uri, |base, href| context.resolve(base, href));
             let mut prepared = PreparedSvgResources::new(references);
-            for uri in &prepared.references.uris {
+            for reference in 0..prepared.references.uris.len() {
                 if prepared.byte_len >= MAX_EMBEDDED_BYTES {
                     break;
                 }
-                if let Ok(bytes) = read(uri.clone()).await
-                    && prepared.byte_len.saturating_add(bytes.len()) <= MAX_EMBEDDED_BYTES
-                {
-                    let metadata = context.metadata(uri).ok();
-                    if let Some(media_type) = svg_image_media_type(metadata.as_ref(), uri, &bytes) {
-                        prepared.byte_len += bytes.len();
-                        prepared
-                            .resources
-                            .insert(uri.clone(), PreparedSvgImage { bytes, media_type });
-                    }
+                if let Ok(bytes) = read(prepared.references.uris[reference].clone()).await {
+                    prepared.insert_image(reference, bytes, |uri| context.metadata(uri));
                 }
             }
             Ok(embed_svg_image_resources(&prepared, bytes))
@@ -658,7 +657,7 @@ fn svg_image_references(
                         .local_name()
                         .as_ref()
                         .eq_ignore_ascii_case(b"href")
-                        && let Ok(href) = attribute.unescape_value()
+                        && let Ok(href) = attribute.normalized_value(XmlVersion::Implicit1_0)
                     {
                         let href = href.trim();
                         if href.is_empty()
@@ -707,11 +706,32 @@ impl PreparedSvgResources {
         let uri = self.references.by_href.get(href.trim())?;
         self.resources.get(uri)
     }
+
+    fn insert_image(
+        &mut self,
+        reference: usize,
+        bytes: Vec<u8>,
+        metadata: impl FnOnce(&str) -> io::Result<ResourceMetadata>,
+    ) {
+        if self.byte_len.saturating_add(bytes.len()) > MAX_EMBEDDED_BYTES {
+            return;
+        }
+        let uri = &self.references.uris[reference];
+        let metadata = metadata(uri).ok();
+        if let Some(media_type) = svg_image_media_type(metadata.as_ref(), uri, &bytes) {
+            self.byte_len += bytes.len();
+            self.resources
+                .insert(uri.clone(), PreparedSvgImage { bytes, media_type });
+        }
+    }
 }
 
 /// Rewrite an SVG from a self-contained map. Resource I/O and path resolution
 /// are completed before this step, shared by synchronous and async loading.
 fn embed_svg_image_resources(prepared: &PreparedSvgResources, svg: &[u8]) -> Vec<u8> {
+    if prepared.resources.is_empty() {
+        return svg.to_vec();
+    }
     let mut reader = Reader::from_reader(svg);
     let mut writer = Writer::new(Vec::with_capacity(svg.len()));
     let mut changed = false;
@@ -777,7 +797,7 @@ fn embed_svg_image_element(
             .as_ref()
             .eq_ignore_ascii_case(b"href")
         {
-            let href = attribute.unescape_value().ok()?;
+            let href = attribute.normalized_value(XmlVersion::Implicit1_0).ok()?;
             if let Some(image) = prepared.image(&href)
                 && embedded_bytes.saturating_add(image.bytes.len()) <= MAX_EMBEDDED_BYTES
             {
@@ -796,16 +816,6 @@ fn embed_svg_image_element(
     Some(rewritten.into_owned())
 }
 
-fn has_uri_scheme(href: &str) -> bool {
-    let Some(colon) = href.find(':') else {
-        return false;
-    };
-    let Some(first_separator) = href.find(['/', '?', '#']) else {
-        return true;
-    };
-    colon < first_separator
-}
-
 fn svg_image_media_type(
     metadata: Option<&ResourceMetadata>,
     uri: &str,
@@ -820,21 +830,19 @@ fn svg_image_media_type(
 }
 
 fn canonical_image_media_type(media_type: &str) -> Option<&'static str> {
-    match media_type
-        .split(';')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "image/jpeg" | "image/jpg" => Some("image/jpeg"),
-        "image/png" => Some("image/png"),
-        "image/gif" => Some("image/gif"),
-        "image/webp" => Some("image/webp"),
-        "image/svg+xml" => Some("image/svg+xml"),
-        _ => None,
+    let media_type = media_type_essence(media_type);
+    if media_type.eq_ignore_ascii_case("image/jpg") {
+        return Some("image/jpeg");
     }
+    [
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "image/webp",
+        "image/svg+xml",
+    ]
+    .into_iter()
+    .find(|candidate| media_type.eq_ignore_ascii_case(candidate))
 }
 
 fn sniff_image_media_type(bytes: &[u8]) -> Option<&'static str> {
@@ -860,7 +868,7 @@ fn sniff_image_media_type(bytes: &[u8]) -> Option<&'static str> {
 }
 
 fn image_media_type_from_uri(uri: &str) -> Option<&'static str> {
-    let path = uri.split(['?', '#']).next().unwrap_or(uri);
+    let path = uri_path(uri);
     let extension = path.rsplit_once('.').map_or("", |(_, extension)| extension);
     if extension.eq_ignore_ascii_case("jpg") || extension.eq_ignore_ascii_case("jpeg") {
         Some("image/jpeg")
@@ -883,7 +891,7 @@ mod tests {
         BlockingJob, BlockingJobSpawner, DecodedImage, ImageKey, ImagePipeline, ImageService,
         ImageResourceContext, MAX_EMBEDDED_BYTES, PreparedSvgImage, PreparedSvgResources,
         decode_image, embed_svg_image_resources, load_image_bytes, load_image_bytes_async,
-        svg_image_references,
+        probe_dimensions, svg_image_references,
     };
     use crate::document::{ImageResource, ImageSource};
     use crate::resources::{ResourceMetadata, ResourceProvider};
@@ -957,12 +965,38 @@ mod tests {
     }
 
     #[test]
+    fn dimension_probes_borrow_embedded_svg_without_loading_dependencies() {
+        let provider = MemoryImageContext::default();
+        let svg: Arc<[u8]> =
+            Arc::from(br#"<svg width="32" height="16"><image href="cover.png"/></svg>"#.as_slice());
+        for source in [
+            ImageSource::InlineSvg {
+                bytes: svg.clone(),
+                base_uri: "OPS/chapter.xhtml".into(),
+            },
+            ImageSource::MathMl {
+                markup: "<math/>".into(),
+                svg,
+                baseline: 1.0,
+            },
+        ] {
+            assert_eq!(probe_dimensions(&provider, &source), Some((32, 16)));
+        }
+        let provider = CountingProvider(AtomicUsize::new(0));
+        assert_eq!(
+            probe_dimensions(&provider, &ImageSource::Uri("cover.svg".into())),
+            Some((20, 10))
+        );
+        assert_eq!(provider.0.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn async_inline_svg_uses_only_memory_context_and_deduplicates_fetches() {
         let context = MemoryImageContext {
             metadata: HashMap::from([(
                 "OPS/mark.jpg".to_owned(),
                 ResourceMetadata {
-                    media_type: Some("image/png; charset=binary".to_owned()),
+                    media_type: Some(" IMAGE/PNG; charset=binary".to_owned()),
                     charset: None,
                 },
             )]),

@@ -1,192 +1,268 @@
-//! HTML attributes whose rendering is expressed as CSS presentational hints.
-//!
-//! Hints are applied after normal UA declarations and before normal author
-//! declarations. Values cross this boundary as renderer-owned typed values;
-//! attribute values are never turned into CSS text and reparsed.
-
-use super::{CascadePhase, WorkingStyle, css_color_to_u32, resolve_logical_text_alignments};
+//! HTML attributes lowered to declarations below normal author CSS.
+//! Native values and renderer keyword tokens enter ordinary winner selection;
+//! attribute values are never serialized to CSS text and reparsed.
+use super::values::colors::css_color_to_u32;
 use html_dom::{Document, DomNodeId};
-use html_style_model::UnicodeBidi;
-use html_style_model::{BorderStyle, BoxSizing, CaptionSide, Clear, Display, Float, FontRelativeLength, LengthPct, LogicalTextAlign, PreferredSize, TextAlign, TextDirection, VerticalAlignValue, WhiteSpace};
+use html_style_model::PreferredSize;
+use lightningcss::properties::Property;
+use lightningcss::properties::border::{
+    BorderColor, BorderSideWidth, BorderStyle, BorderWidth, LineStyle,
+};
+use lightningcss::properties::custom::{
+    CustomProperty, CustomPropertyName, Token, TokenList, TokenOrValue,
+};
+use lightningcss::properties::display::{Display, DisplayKeyword};
+use lightningcss::properties::font::{FontSize, VerticalAlign, VerticalAlignKeyword};
+use lightningcss::properties::list::{CounterStyle, ListStyleType, PredefinedCounterStyle};
+use lightningcss::properties::size::{BoxSizing, Size};
+use lightningcss::properties::text::{Direction, TextAlign, UnicodeBidi, WhiteSpace};
 use lightningcss::traits::Parse;
-use lightningcss::values::color::CssColor;
+use lightningcss::values::color::{CssColor, RGBA};
+use lightningcss::values::ident::Ident;
+use lightningcss::values::length::{Length, LengthPercentage, LengthPercentageOrAuto};
+use lightningcss::values::percentage::Percentage;
+use lightningcss::values::size::Size2D;
+use lightningcss::vendor_prefix::VendorPrefix;
 
 const HTML_NAMESPACE: &str = "http://www.w3.org/1999/xhtml";
 const SVG_NAMESPACE: &str = "http://www.w3.org/2000/svg";
 
-pub(super) fn apply(doc: &Document, node_idx: DomNodeId, style: &mut WorkingStyle, phase: CascadePhase, font_size_scale: f32) {
-    let Some(tag) = doc.get_dom_tag(node_idx) else { return };
-    let namespace = doc.get_dom_namespace(node_idx);
+macro_rules! sides {
+    ($type:ident, $value:expr) => {{
+        let value = $value;
+        $type {
+            top: value.clone(),
+            right: value.clone(),
+            bottom: value.clone(),
+            left: value,
+        }
+    }};
+}
 
-    // SVG width and height attributes are current SVG presentation behavior,
-    // retained here because this is the single DOM-to-style hint boundary.
+pub(super) fn collect<'css>(doc: &Document, node: DomNodeId, hints: &mut Vec<Property<'css>>) {
+    hints.clear();
+    let Some(tag) = doc.get_dom_tag(node) else {
+        return;
+    };
+    let namespace = doc.get_dom_namespace(node);
     if namespace == Some(SVG_NAMESPACE) {
-        if phase == CascadePhase::Remaining && tag.eq_ignore_ascii_case("svg") {
-            apply_replaced_dimensions(doc, node_idx, style);
+        if tag.eq_ignore_ascii_case("svg") {
+            replaced_dimensions(doc, node, hints);
         }
         return;
     }
     if namespace != Some(HTML_NAMESPACE) {
         return;
     }
+    let tag = tag.to_ascii_lowercase();
+    let tag = tag.as_str();
+    let attr = |name| doc.get_dom_attr(node, name);
 
-    if phase == CascadePhase::Prerequisites {
-        apply_prerequisite_hints(doc, node_idx, tag, style, font_size_scale);
+    if tag == "bdi" {
+        hints.push(Property::UnicodeBidi(UnicodeBidi::Isolate));
+        hints.push(Property::Direction(html_direction(doc, node)));
+    } else if tag == "bdo" {
+        hints.push(Property::UnicodeBidi(UnicodeBidi::BidiOverride));
+    }
+    if let Some(direction) = attr("dir").and_then(|value| {
+        if value.eq_ignore_ascii_case("ltr") {
+            Some(Direction::Ltr)
+        } else if value.eq_ignore_ascii_case("rtl") {
+            Some(Direction::Rtl)
+        } else if value.eq_ignore_ascii_case("auto") {
+            Some(html_direction(doc, node))
+        } else {
+            None
+        }
+    }) {
+        hints.push(Property::Direction(direction));
+        if tag != "bdo" {
+            hints.push(Property::UnicodeBidi(UnicodeBidi::Isolate));
+        }
+    }
+    if let Some(color) = match tag {
+        "body" => attr("text"),
+        "font" | "hr" => attr("color"),
+        _ => None,
+    }
+    .and_then(html_color_hint)
+    {
+        hints.push(Property::Color(css_color(color)));
+    }
+    if tag == "font"
+        && let Some(size) = attr("size").and_then(html_legacy_font_size)
+    {
+        hints.push(Property::FontSize(FontSize::Length(LengthPercentage::px(
+            size,
+        ))));
+    }
+    if attr("hidden").is_some_and(|value| !value.eq_ignore_ascii_case("until-found")) {
+        hints.push(Property::Display(Display::Keyword(DisplayKeyword::None)));
+    }
+    if matches!(tag, "img" | "object" | "embed" | "iframe" | "input") {
+        replaced_dimensions(doc, node, hints);
+    }
+    if matches!(tag, "table" | "td" | "th" | "col" | "colgroup" | "hr")
+        && let Some(width) = attr("width").and_then(if tag == "hr" {
+            html_hr_width_hint
+        } else {
+            html_nonzero_dimension_hint
+        })
+    {
+        hints.push(Property::Width(css_size(width)));
+    }
+    if matches!(tag, "table" | "tr" | "td" | "th")
+        && let Some(height) = attr("height").and_then(html_nonzero_dimension_hint)
+    {
+        hints.push(Property::Height(css_size(height)));
+    }
+    if matches!(tag, "body" | "table" | "tr" | "td" | "th")
+        && let Some(color) = attr("bgcolor").and_then(html_color_hint)
+    {
+        hints.push(Property::BackgroundColor(css_color(color)));
+    }
+    if let Some(align) = attr("align") {
+        align_hint(tag, align, hints);
+    }
+    if matches!(
+        tag,
+        "col" | "colgroup" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th"
+    ) && let Some(align) = attr("valign").and_then(html_vertical_align_hint)
+    {
+        hints.push(Property::VerticalAlign(VerticalAlign::Keyword(align)));
+    }
+    if let Some(color) = attr("bordercolor").and_then(html_color_hint) {
+        hints.push(Property::BorderColor(sides!(BorderColor, css_color(color))));
+    }
+    if matches!(tag, "table" | "img" | "object")
+        && let Some(width) = attr("border").and_then(html_border_width_hint)
+    {
+        border_hint(hints, width);
+    }
+    if matches!(tag, "ol" | "ul" | "li")
+        && let Some(value) = attr("type").and_then(|value| html_list_style_hint(tag, value))
+    {
+        hints.push(Property::ListStyleType(value));
+    }
+    if tag == "br"
+        && let Some(clear) = attr("clear").and_then(html_clear_hint)
+    {
+        hints.push(keyword("clear", clear));
+    }
+    if matches!(tag, "img" | "object" | "input" | "embed") {
+        if let Some(value) = attr("align") {
+            if value.eq_ignore_ascii_case("left") {
+                hints.push(keyword("float", "left"));
+            } else if value.eq_ignore_ascii_case("right") {
+                hints.push(keyword("float", "right"));
+            } else if let Some(align) = html_vertical_align_hint(value) {
+                hints.push(Property::VerticalAlign(VerticalAlign::Keyword(align)));
+            }
+        }
+        if let Some(value) = attr("hspace").and_then(html_replaced_spacing_hint) {
+            hints.push(Property::MarginLeft(value.clone()));
+            hints.push(Property::MarginRight(value));
+        }
+        if let Some(value) = attr("vspace").and_then(html_replaced_spacing_hint) {
+            hints.push(Property::MarginTop(value.clone()));
+            hints.push(Property::MarginBottom(value));
+        }
+    }
+    if tag == "body" {
+        body_margin_hints(doc, node, hints);
+    }
+    if tag == "hr" {
+        hr_hints(doc, node, hints);
+    }
+    if tag == "table"
+        && let Some(spacing) = attr("cellspacing").and_then(html_nonnegative_pixel_hint)
+    {
+        hints.push(Property::BorderSpacing(Size2D(
+            Length::px(spacing),
+            Length::px(spacing),
+        )));
+    }
+    if !matches!(tag, "td" | "th") {
         return;
     }
-
-    // The hidden-until-found state retains a principal box. Its
-    // content-visibility behavior is separate from the ordinary hidden state.
-    if doc.get_dom_attr(node_idx, "hidden").is_some_and(|value| !value.eq_ignore_ascii_case("until-found")) {
-        style.box_model.display = Display::None;
-    }
-
-    if matches!(tag.to_ascii_lowercase().as_str(), "img" | "object" | "embed" | "iframe" | "input") {
-        apply_replaced_dimensions(doc, node_idx, style);
-    }
-    if matches!(tag.to_ascii_lowercase().as_str(), "table" | "td" | "th" | "col" | "colgroup" | "hr")
-        && let Some(width) = doc.get_dom_attr(node_idx, "width").and_then(|value| if tag.eq_ignore_ascii_case("hr") { html_hr_width_hint(value) } else { html_nonzero_dimension_hint(value) })
+    let table_attr = |name| {
+        doc.dom_ancestors(node)
+            .filter(|&ancestor| is_html_tag(doc, ancestor, "table"))
+            .filter_map(move |ancestor| doc.get_dom_attr(ancestor, name))
+    };
+    if table_attr("border")
+        .find_map(html_border_width_hint)
+        .is_some_and(|width| width > 0.0)
     {
-        style.box_model.width = width;
+        border_hint(hints, 1.0);
     }
-    if matches!(tag.to_ascii_lowercase().as_str(), "table" | "tr" | "td" | "th")
-        && let Some(height) = doc.get_dom_attr(node_idx, "height").and_then(html_nonzero_dimension_hint)
-    {
-        style.box_model.height = height;
+    if attr("nowrap").is_some() {
+        hints.push(Property::WhiteSpace(WhiteSpace::NoWrap));
     }
-    if matches!(tag.to_ascii_lowercase().as_str(), "body" | "table" | "tr" | "td" | "th")
-        && let Some(color) = doc.get_dom_attr(node_idx, "bgcolor").and_then(html_color_hint)
-    {
-        style.background.background_color = color;
-        style.background.background_color_current_color = false;
-    }
-    if let Some(align) = doc.get_dom_attr(node_idx, "align") {
-        apply_html_align_hint(tag, align, style);
-    }
-    if matches!(tag.to_ascii_lowercase().as_str(), "col" | "colgroup" | "thead" | "tbody" | "tfoot" | "tr" | "td" | "th")
-        && let Some(vertical_align) = doc.get_dom_attr(node_idx, "valign").and_then(html_vertical_align_hint)
-    {
-        style.box_model.vertical_align = vertical_align;
-    }
-    if let Some(color) = doc.get_dom_attr(node_idx, "bordercolor").and_then(html_color_hint) {
-        set_html_border_color(style, color);
-    }
-    if tag.eq_ignore_ascii_case("table")
-        && let Some(width) = doc.get_dom_attr(node_idx, "border").and_then(html_border_width_hint)
-    {
-        set_html_border(style, width);
-    }
-    if matches!(tag.to_ascii_lowercase().as_str(), "img" | "object")
-        && let Some(width) = doc.get_dom_attr(node_idx, "border").and_then(html_border_width_hint)
-    {
-        set_html_border(style, width);
-    }
-    if matches!(tag.to_ascii_lowercase().as_str(), "ol" | "ul" | "li")
-        && let Some(list_style) = doc.get_dom_attr(node_idx, "type").and_then(|value| html_list_style_hint(tag, value))
-    {
-        style.text.list_style_type = list_style;
-    }
-    if tag.eq_ignore_ascii_case("br")
-        && let Some(clear) = doc.get_dom_attr(node_idx, "clear").and_then(html_clear_hint)
-    {
-        style.box_model.clear = clear;
-    }
-    if matches!(tag.to_ascii_lowercase().as_str(), "img" | "object" | "input" | "embed") {
-        apply_html_replaced_alignment_hint(doc, node_idx, style);
-        apply_html_replaced_spacing_hints(doc, node_idx, style);
-    }
-    if tag.eq_ignore_ascii_case("body") {
-        apply_html_body_margin_hints(doc, node_idx, style);
-    }
-    if tag.eq_ignore_ascii_case("hr") {
-        apply_html_hr_hints(doc, node_idx, style);
-    }
-    if tag.eq_ignore_ascii_case("table")
-        && let Some(spacing) = doc.get_dom_attr(node_idx, "cellspacing").and_then(html_nonnegative_pixel_hint)
-    {
-        style.box_model.border_spacing_horizontal = spacing;
-        style.box_model.border_spacing_vertical = spacing;
-    }
-    if !matches!(tag.to_ascii_lowercase().as_str(), "td" | "th") {
-        return;
-    }
-    let ancestor_table_border = doc.dom_ancestors(node_idx).find_map(|ancestor| (is_html_tag(doc, ancestor, "table")).then(|| doc.get_dom_attr(ancestor, "border").and_then(html_border_width_hint)).flatten());
-    if ancestor_table_border.is_some_and(|width| width > 0.0) {
-        set_html_cell_border(style);
-    }
-    if doc.get_dom_attr(node_idx, "nowrap").is_some() {
-        style.text.white_space = WhiteSpace::NoWrap;
-    }
-    let padding = doc.dom_ancestors(node_idx).find_map(|ancestor| (is_html_tag(doc, ancestor, "table")).then(|| doc.get_dom_attr(ancestor, "cellpadding").and_then(html_nonnegative_pixel_hint)).flatten());
-    if let Some(padding) = padding {
-        let padding = LengthPct::Px(padding);
-        style.box_model.padding_top = padding;
-        style.box_model.padding_right = padding;
-        style.box_model.padding_bottom = padding;
-        style.box_model.padding_left = padding;
+    if let Some(padding) = table_attr("cellpadding").find_map(html_nonnegative_pixel_hint) {
+        hints.extend([
+            Property::PaddingTop(px(padding)),
+            Property::PaddingRight(px(padding)),
+            Property::PaddingBottom(px(padding)),
+            Property::PaddingLeft(px(padding)),
+        ]);
     }
 }
 
-fn apply_prerequisite_hints(doc: &Document, node_idx: DomNodeId, tag: &str, style: &mut WorkingStyle, font_size_scale: f32) {
-    if tag.eq_ignore_ascii_case("bdi") {
-        style.box_model.unicode_bidi = UnicodeBidi::Isolate;
-        style.text.direction = if doc.element_ref(node_idx).is_some_and(|element| element.html_state().is_rtl()) { TextDirection::Rtl } else { TextDirection::Ltr };
-    } else if tag.eq_ignore_ascii_case("bdo") {
-        style.box_model.unicode_bidi = UnicodeBidi::BidiOverride;
-    }
-    if let Some(direction) = doc.get_dom_attr(node_idx, "dir") {
-        if direction.eq_ignore_ascii_case("ltr") {
-            style.text.direction = TextDirection::Ltr;
-        } else if direction.eq_ignore_ascii_case("rtl") {
-            style.text.direction = TextDirection::Rtl;
-        } else if direction.eq_ignore_ascii_case("auto") {
-            style.text.direction = if doc.element_ref(node_idx).is_some_and(|element| element.html_state().is_rtl()) { TextDirection::Rtl } else { TextDirection::Ltr };
-        }
-        if !tag.eq_ignore_ascii_case("bdo")
-            && ["ltr", "rtl", "auto"].iter().any(|value| direction.eq_ignore_ascii_case(value))
-        {
-            style.box_model.unicode_bidi = UnicodeBidi::Isolate;
-        }
-        resolve_logical_text_alignments(&mut style.text);
-    }
-    if tag.eq_ignore_ascii_case("bdi") {
-        resolve_logical_text_alignments(&mut style.text);
-    }
-    if tag.eq_ignore_ascii_case("body")
-        && let Some(color) = doc.get_dom_attr(node_idx, "text").and_then(html_color_hint)
+fn html_direction(doc: &Document, node: DomNodeId) -> Direction {
+    if doc
+        .element_ref(node)
+        .is_some_and(|element| element.html_state().is_rtl())
     {
-        style.text.color = color;
+        Direction::Rtl
+    } else {
+        Direction::Ltr
     }
-    if tag.eq_ignore_ascii_case("font")
-        && let Some(color) = doc.get_dom_attr(node_idx, "color").and_then(html_color_hint)
+}
+
+fn css_color(color: u32) -> CssColor {
+    let [red, green, blue, alpha] = color.to_be_bytes();
+    CssColor::RGBA(RGBA {
+        red,
+        green,
+        blue,
+        alpha,
+    })
+}
+
+fn css_size(value: PreferredSize) -> Size {
+    Size::LengthPercentage(match value {
+        PreferredSize::Px(value) => LengthPercentage::px(value),
+        PreferredSize::Percent(value) => LengthPercentage::Percentage(Percentage(value)),
+        _ => unreachable!("HTML dimensions only produce pixels and percentages"),
+    })
+}
+
+fn px(value: f32) -> LengthPercentageOrAuto {
+    LengthPercentageOrAuto::LengthPercentage(LengthPercentage::px(value))
+}
+
+/// These renderer properties have no native Lightning CSS value. Construct
+/// their existing keyword tokens directly, without a second CSS parser.
+fn keyword<'css>(name: &'static str, value: &'static str) -> Property<'css> {
+    Property::Custom(CustomProperty {
+        name: CustomPropertyName::Unknown(Ident(name.into())),
+        value: TokenList(vec![TokenOrValue::Token(Token::Ident(value.into()))]),
+    })
+}
+
+fn replaced_dimensions<'css>(doc: &Document, node: DomNodeId, hints: &mut Vec<Property<'css>>) {
+    if let Some(value) = doc
+        .get_dom_attr(node, "width")
+        .and_then(html_dimension_hint)
     {
-        style.text.color = color;
+        hints.push(Property::Width(css_size(value)));
     }
-    if tag.eq_ignore_ascii_case("font")
-        && let Some(font_size) = doc.get_dom_attr(node_idx, "size").and_then(html_legacy_font_size)
+    if let Some(value) = doc
+        .get_dom_attr(node, "height")
+        .and_then(html_dimension_hint)
     {
-        // A font-size hint participates in the prerequisite cascade so em
-        // lengths declared later on the same element resolve against it.
-        let font_size = font_size * font_size_scale;
-        if !font_size.is_finite() {
-            return;
-        }
-        style.font.font_size = font_size;
-        style.font.font_size_x_height_px = 0.0;
-        style.font.font_size_ch_advance_px = 0.0;
-        style.font.font_size_cap_height_px = 0.0;
-        style.font.font_size_root_ch = 0.0;
-        style.font.font_size_root_cap_height = 0.0;
-        style.font.font_size_root_line_height = 0.0;
-        if style.text.line_height_number.is_finite() {
-            style.text.line_height = font_size * style.text.line_height_number;
-            style.text.line_height_x_height_px = 0.0;
-        }
-    }
-    if tag.eq_ignore_ascii_case("hr")
-        && let Some(color) = doc.get_dom_attr(node_idx, "color").and_then(html_color_hint)
-    {
-        style.text.color = color;
+        hints.push(Property::Height(css_size(value)));
     }
 }
 
@@ -219,17 +295,9 @@ fn is_html_tag(doc: &Document, node: DomNodeId, expected: &str) -> bool {
     doc.get_dom_namespace(node) == Some(HTML_NAMESPACE) && doc.get_dom_tag(node).is_some_and(|tag| tag.eq_ignore_ascii_case(expected))
 }
 
-fn apply_replaced_dimensions(doc: &Document, node_idx: DomNodeId, style: &mut WorkingStyle) {
-    if let Some(width) = doc.get_dom_attr(node_idx, "width").and_then(html_dimension_hint) {
-        style.box_model.width = width;
-    }
-    if let Some(height) = doc.get_dom_attr(node_idx, "height").and_then(html_dimension_hint) {
-        style.box_model.height = height;
-    }
-}
-
 fn html_color_hint(value: &str) -> Option<u32> {
-    let value = value.trim_matches(|character| matches!(character, '\t' | '\n' | '\u{000C}' | '\r' | ' '));
+    let value =
+        value.trim_matches(|character| matches!(character, '\t' | '\n' | '\u{000C}' | '\r' | ' '));
     if value.is_empty() || value.eq_ignore_ascii_case("transparent") {
         return None;
     }
@@ -263,28 +331,47 @@ fn html_color_hint(value: &str) -> Option<u32> {
     let green = &green[green.len().saturating_sub(8)..];
     let blue = &blue[blue.len().saturating_sub(8)..];
     let mut leading = 0usize;
-    while red.len().saturating_sub(leading) > 2 && red[leading] == b'0' && green[leading] == b'0' && blue[leading] == b'0' {
+    while red.len().saturating_sub(leading) > 2
+        && red[leading] == b'0'
+        && green[leading] == b'0'
+        && blue[leading] == b'0'
+    {
         leading += 1;
     }
     let parse = |component: &[u8]| {
         let component = &component[leading..];
         let end = component.len().min(2);
-        u8::from_str_radix(std::str::from_utf8(&component[..end]).expect("legacy color digits are ASCII"), 16).expect("legacy color digits are hexadecimal")
+        u8::from_str_radix(
+            std::str::from_utf8(&component[..end]).expect("legacy color digits are ASCII"),
+            16,
+        )
+        .expect("legacy color digits are hexadecimal")
     };
-    Some(((parse(red) as u32) << 24) | ((parse(green) as u32) << 16) | ((parse(blue) as u32) << 8) | 0xFF)
+    Some(
+        ((parse(red) as u32) << 24)
+            | ((parse(green) as u32) << 16)
+            | ((parse(blue) as u32) << 8)
+            | 0xFF,
+    )
 }
 
 fn opaque_named_or_hex_color(value: &str) -> Option<u32> {
     let hexadecimal = value.strip_prefix('#').unwrap_or(value);
-    if matches!(hexadecimal.len(), 3 | 6) && hexadecimal.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if matches!(hexadecimal.len(), 3 | 6)
+        && hexadecimal.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
         let color = CssColor::parse_string(&format!("#{hexadecimal}")).ok()?;
-        let CssColor::RGBA(color) = color else { return None };
+        let CssColor::RGBA(color) = color else {
+            return None;
+        };
         return (color.alpha == 0xFF).then(|| css_color_to_u32(&CssColor::RGBA(color), 0x000000FF));
     }
     if !value.bytes().all(|byte| byte.is_ascii_alphabetic()) {
         return None;
     }
-    let CssColor::RGBA(color) = CssColor::parse_string(value).ok()? else { return None };
+    let CssColor::RGBA(color) = CssColor::parse_string(value).ok()? else {
+        return None;
+    };
     (color.alpha == 0xFF).then(|| css_color_to_u32(&CssColor::RGBA(color), 0x000000FF))
 }
 
@@ -317,31 +404,34 @@ fn html_hr_width_hint(value: &str) -> Option<PreferredSize> {
     }
 }
 
-fn apply_html_align_hint(tag: &str, value: &str, style: &mut WorkingStyle) {
+fn align_hint<'css>(tag: &str, value: &str, hints: &mut Vec<Property<'css>>) {
     let value = value.trim();
-    if matches!(tag.to_ascii_lowercase().as_str(), "img" | "object" | "input" | "embed") {
+    if matches!(tag, "img" | "object" | "input" | "embed") {
         return;
     }
-    if tag.eq_ignore_ascii_case("table") {
+    if tag == "table" {
         if value.eq_ignore_ascii_case("left") {
-            style.box_model.float = Float::Left;
+            hints.push(keyword("float", "left"));
         } else if value.eq_ignore_ascii_case("right") {
-            style.box_model.float = Float::Right;
+            hints.push(keyword("float", "right"));
         } else if value.eq_ignore_ascii_case("center") {
-            style.layout.margin_left_auto = true;
-            style.layout.margin_right_auto = true;
+            hints.push(Property::MarginLeft(LengthPercentageOrAuto::Auto));
+            hints.push(Property::MarginRight(LengthPercentageOrAuto::Auto));
         }
         return;
     }
-    if tag.eq_ignore_ascii_case("caption") {
-        if value.eq_ignore_ascii_case("top") {
-            style.box_model.caption_side = CaptionSide::Top;
-            return;
-        }
-        if value.eq_ignore_ascii_case("bottom") {
-            style.box_model.caption_side = CaptionSide::Bottom;
-            return;
-        }
+    if tag == "caption"
+        && (value.eq_ignore_ascii_case("top") || value.eq_ignore_ascii_case("bottom"))
+    {
+        hints.push(keyword(
+            "caption-side",
+            if value.eq_ignore_ascii_case("top") {
+                "top"
+            } else {
+                "bottom"
+            },
+        ));
+        return;
     }
     let alignment = if value.eq_ignore_ascii_case("left") {
         Some(TextAlign::Left)
@@ -355,35 +445,22 @@ fn apply_html_align_hint(tag: &str, value: &str, style: &mut WorkingStyle) {
         None
     };
     if let Some(alignment) = alignment {
-        style.text.text_align = alignment;
-        style.text.text_align_logical = LogicalTextAlign::Physical;
-        if !style.text.text_align_last_explicit {
-            style.text.text_align_last = alignment;
-            style.text.text_align_last_logical = LogicalTextAlign::Physical;
-        }
+        hints.push(Property::TextAlign(alignment));
     }
 }
 
-fn html_vertical_align_hint(value: &str) -> Option<VerticalAlignValue> {
+fn html_vertical_align_hint(value: &str) -> Option<VerticalAlignKeyword> {
     if value.eq_ignore_ascii_case("top") {
-        Some(VerticalAlignValue::Top)
+        Some(VerticalAlignKeyword::Top)
     } else if value.eq_ignore_ascii_case("middle") || value.eq_ignore_ascii_case("center") {
-        Some(VerticalAlignValue::Middle)
+        Some(VerticalAlignKeyword::Middle)
     } else if value.eq_ignore_ascii_case("bottom") {
-        Some(VerticalAlignValue::Bottom)
+        Some(VerticalAlignKeyword::Bottom)
     } else if value.eq_ignore_ascii_case("baseline") {
-        Some(VerticalAlignValue::Baseline)
+        Some(VerticalAlignKeyword::Baseline)
     } else {
         None
     }
-}
-
-fn set_html_border_color(style: &mut WorkingStyle, color: u32) {
-    style.border.border_top_color = color;
-    style.border.border_right_color = color;
-    style.border.border_bottom_color = color;
-    style.border.border_left_color = color;
-    style.border.current_color_sides = 0;
 }
 
 fn html_border_width_hint(value: &str) -> Option<f32> {
@@ -403,145 +480,133 @@ fn html_border_width_hint(value: &str) -> Option<f32> {
     }
 }
 
-fn set_html_border(style: &mut WorkingStyle, width: f32) {
-    let border_style = if width == 0.0 { BorderStyle::None } else { BorderStyle::Solid };
-    let width = FontRelativeLength::px(width).expect("legacy HTML border width is finite and non-negative");
-    style.border.border_top_width = width;
-    style.border.border_right_width = width;
-    style.border.border_bottom_width = width;
-    style.border.border_left_width = width;
-    style.border.border_top_style = border_style;
-    style.border.border_right_style = border_style;
-    style.border.border_bottom_style = border_style;
-    style.border.border_left_style = border_style;
+fn border_hint<'css>(hints: &mut Vec<Property<'css>>, width: f32) {
+    hints.push(Property::BorderWidth(sides!(
+        BorderWidth,
+        BorderSideWidth::Length(Length::px(width))
+    )));
+    hints.push(Property::BorderStyle(sides!(
+        BorderStyle,
+        if width == 0.0 {
+            LineStyle::None
+        } else {
+            LineStyle::Solid
+        }
+    )));
 }
 
-fn set_html_cell_border(style: &mut WorkingStyle) {
-    let width = FontRelativeLength::px(1.0).expect("legacy HTML cell border width is finite and non-negative");
-    style.border.border_top_width = width;
-    style.border.border_right_width = width;
-    style.border.border_bottom_width = width;
-    style.border.border_left_width = width;
-    style.border.border_top_style = BorderStyle::Solid;
-    style.border.border_right_style = BorderStyle::Solid;
-    style.border.border_bottom_style = BorderStyle::Solid;
-    style.border.border_left_style = BorderStyle::Solid;
-}
-
-fn html_list_style_hint(tag: &str, value: &str) -> Option<html_style_model::ListStyleType> {
+fn html_list_style_hint<'css>(tag: &str, value: &str) -> Option<ListStyleType<'css>> {
     let value = value.trim();
     if tag.eq_ignore_ascii_case("ol") || tag.eq_ignore_ascii_case("li") {
         let ordered = match value {
-            "1" => Some(html_style_model::ListStyleType::Decimal),
-            "a" => Some(html_style_model::ListStyleType::LowerAlpha),
-            "A" => Some(html_style_model::ListStyleType::UpperAlpha),
-            "i" => Some(html_style_model::ListStyleType::LowerRoman),
-            "I" => Some(html_style_model::ListStyleType::UpperRoman),
+            "1" => Some(PredefinedCounterStyle::Decimal),
+            "a" => Some(PredefinedCounterStyle::LowerAlpha),
+            "A" => Some(PredefinedCounterStyle::UpperAlpha),
+            "i" => Some(PredefinedCounterStyle::LowerRoman),
+            "I" => Some(PredefinedCounterStyle::UpperRoman),
             _ => None,
         };
-        return ordered.or_else(|| tag.eq_ignore_ascii_case("li").then(|| html_bullet_style_hint(value)).flatten());
+        return ordered
+            .map(|value| ListStyleType::CounterStyle(CounterStyle::Predefined(value)))
+            .or_else(|| {
+                tag.eq_ignore_ascii_case("li")
+                    .then(|| html_bullet_style_hint(value))
+                    .flatten()
+            });
     }
     html_bullet_style_hint(value)
 }
 
-fn html_bullet_style_hint(value: &str) -> Option<html_style_model::ListStyleType> {
-    if value.eq_ignore_ascii_case("disc") {
-        Some(html_style_model::ListStyleType::Disc)
+fn html_bullet_style_hint<'css>(value: &str) -> Option<ListStyleType<'css>> {
+    let value = if value.eq_ignore_ascii_case("disc") {
+        PredefinedCounterStyle::Disc
     } else if value.eq_ignore_ascii_case("circle") {
-        Some(html_style_model::ListStyleType::Circle)
+        PredefinedCounterStyle::Circle
     } else if value.eq_ignore_ascii_case("square") {
-        Some(html_style_model::ListStyleType::Square)
+        PredefinedCounterStyle::Square
     } else if value.eq_ignore_ascii_case("none") {
-        Some(html_style_model::ListStyleType::None)
+        return Some(ListStyleType::None);
     } else {
-        None
-    }
+        return None;
+    };
+    Some(ListStyleType::CounterStyle(CounterStyle::Predefined(value)))
 }
 
-fn html_clear_hint(value: &str) -> Option<Clear> {
+fn html_clear_hint(value: &str) -> Option<&'static str> {
     if value.eq_ignore_ascii_case("left") {
-        Some(Clear::Left)
+        Some("left")
     } else if value.eq_ignore_ascii_case("right") {
-        Some(Clear::Right)
+        Some("right")
     } else if value.eq_ignore_ascii_case("all") || value.eq_ignore_ascii_case("both") {
-        Some(Clear::Both)
+        Some("both")
     } else if value.eq_ignore_ascii_case("none") {
-        Some(Clear::None)
+        Some("none")
     } else {
         None
     }
 }
 
-fn apply_html_replaced_alignment_hint(doc: &Document, node_idx: DomNodeId, style: &mut WorkingStyle) {
-    let Some(value) = doc.get_dom_attr(node_idx, "align") else { return };
-    if value.eq_ignore_ascii_case("left") {
-        style.box_model.float = Float::Left;
-    } else if value.eq_ignore_ascii_case("right") {
-        style.box_model.float = Float::Right;
-    } else if let Some(vertical_align) = html_vertical_align_hint(value) {
-        style.box_model.vertical_align = vertical_align;
-    }
+fn html_replaced_spacing_hint(value: &str) -> Option<LengthPercentageOrAuto> {
+    let Size::LengthPercentage(value) = css_size(html_dimension_hint(value)?) else {
+        unreachable!()
+    };
+    Some(LengthPercentageOrAuto::LengthPercentage(value))
 }
 
-fn apply_html_replaced_spacing_hints(doc: &Document, node_idx: DomNodeId, style: &mut WorkingStyle) {
-    if let Some(horizontal) = doc.get_dom_attr(node_idx, "hspace").and_then(html_replaced_spacing_hint) {
-        style.box_model.margin_left = horizontal;
-        style.box_model.margin_right = horizontal;
-    }
-    if let Some(vertical) = doc.get_dom_attr(node_idx, "vspace").and_then(html_replaced_spacing_hint) {
-        style.box_model.margin_top = vertical;
-        style.box_model.margin_bottom = vertical;
-    }
-}
-
-fn html_replaced_spacing_hint(value: &str) -> Option<LengthPct> {
-    match html_dimension_hint(value)? {
-        PreferredSize::Px(pixels) => Some(LengthPct::Px(pixels)),
-        PreferredSize::Percent(percentage) => Some(LengthPct::Pct(percentage)),
-        _ => None,
-    }
-}
-
-fn apply_html_body_margin_hints(doc: &Document, node_idx: DomNodeId, style: &mut WorkingStyle) {
-    if let Some(horizontal) = doc.get_dom_attr(node_idx, "marginwidth").and_then(html_nonnegative_pixel_hint) {
-        style.box_model.margin_left = LengthPct::Px(horizontal);
-        style.box_model.margin_right = LengthPct::Px(horizontal);
-    }
-    if let Some(vertical) = doc.get_dom_attr(node_idx, "marginheight").and_then(html_nonnegative_pixel_hint) {
-        style.box_model.margin_top = LengthPct::Px(vertical);
-        style.box_model.margin_bottom = LengthPct::Px(vertical);
-    }
-    for (attribute, side) in [("topmargin", 0), ("rightmargin", 1), ("bottommargin", 2), ("leftmargin", 3)] {
-        let Some(margin) = doc.get_dom_attr(node_idx, attribute).and_then(html_nonnegative_pixel_hint) else { continue };
-        match side {
-            0 => style.box_model.margin_top = LengthPct::Px(margin),
-            1 => style.box_model.margin_right = LengthPct::Px(margin),
-            2 => style.box_model.margin_bottom = LengthPct::Px(margin),
-            _ => style.box_model.margin_left = LengthPct::Px(margin),
+fn body_margin_hints<'css>(doc: &Document, node: DomNodeId, hints: &mut Vec<Property<'css>>) {
+    for (attribute, properties) in [
+        (
+            "marginwidth",
+            &[Property::MarginLeft as fn(_) -> _, Property::MarginRight][..],
+        ),
+        (
+            "marginheight",
+            &[Property::MarginTop as fn(_) -> _, Property::MarginBottom][..],
+        ),
+        ("topmargin", &[Property::MarginTop as fn(_) -> _][..]),
+        ("rightmargin", &[Property::MarginRight as fn(_) -> _][..]),
+        ("bottommargin", &[Property::MarginBottom as fn(_) -> _][..]),
+        ("leftmargin", &[Property::MarginLeft as fn(_) -> _][..]),
+    ] {
+        if let Some(margin) = doc
+            .get_dom_attr(node, attribute)
+            .and_then(html_nonnegative_pixel_hint)
+        {
+            hints.extend(properties.iter().map(|property| property(px(margin))));
         }
     }
 }
 
-fn apply_html_hr_hints(doc: &Document, node_idx: DomNodeId, style: &mut WorkingStyle) {
-    let flat_border = doc.get_dom_attr(node_idx, "color").is_some() || doc.get_dom_attr(node_idx, "noshade").is_some();
+fn hr_hints<'css>(doc: &Document, node: DomNodeId, hints: &mut Vec<Property<'css>>) {
+    let flat_border =
+        doc.get_dom_attr(node, "color").is_some() || doc.get_dom_attr(node, "noshade").is_some();
     if flat_border {
-        style.border.border_top_style = BorderStyle::Solid;
-        style.border.border_right_style = BorderStyle::Solid;
-        style.border.border_bottom_style = BorderStyle::Solid;
-        style.border.border_left_style = BorderStyle::Solid;
+        hints.push(Property::BorderStyle(sides!(BorderStyle, LineStyle::Solid)));
     }
-    let Some(size) = doc.get_dom_attr(node_idx, "size").and_then(html_border_width_hint).map(|size| size.max(1.0)) else { return };
+    let Some(size) = doc
+        .get_dom_attr(node, "size")
+        .and_then(html_border_width_hint)
+        .map(|size| size.max(1.0))
+    else {
+        return;
+    };
     if flat_border {
-        let width = FontRelativeLength::px(size / 2.0).expect("legacy HTML hr border width is finite and non-negative");
-        style.border.border_top_width = width;
-        style.border.border_right_width = width;
-        style.border.border_bottom_width = width;
-        style.border.border_left_width = width;
+        hints.push(Property::BorderWidth(sides!(
+            BorderWidth,
+            BorderSideWidth::Length(Length::px(size / 2.0))
+        )));
     } else {
-        style.box_model.height = PreferredSize::Px(size);
-        style.box_model.box_sizing = BoxSizing::BorderBox;
+        hints.push(Property::Height(Size::LengthPercentage(
+            LengthPercentage::px(size),
+        )));
+        hints.push(Property::BoxSizing(
+            BoxSizing::BorderBox,
+            VendorPrefix::None,
+        ));
         if size == 1.0 {
-            style.border.border_bottom_width = FontRelativeLength::ZERO;
+            hints.push(Property::BorderBottomWidth(BorderSideWidth::Length(
+                Length::px(0.0),
+            )));
         }
     }
 }
@@ -553,7 +618,10 @@ fn html_nonnegative_pixel_hint(value: &str) -> Option<f32> {
 
 #[cfg(test)]
 mod tests {
-    use super::{html_color_hint, html_dimension_hint, html_hr_width_hint, html_legacy_font_size, html_nonzero_dimension_hint};
+    use super::{
+        html_color_hint, html_dimension_hint, html_hr_width_hint, html_legacy_font_size,
+        html_nonzero_dimension_hint,
+    };
     use html_style_model::PreferredSize;
 
     #[test]

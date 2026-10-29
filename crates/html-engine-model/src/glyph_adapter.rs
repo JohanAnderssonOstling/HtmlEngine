@@ -1,7 +1,6 @@
-//! Small renderer-facing glyph requests and validated shaping results.
-use crate::{
-    FontSlant, GlyphId, GlyphMetric, GlyphMetricError, GlyphResourceGeneration, ShapeError,
-};
+//! Renderer-facing glyph requests, validated results, and native resource storage.
+use crate::glyph_metrics::validate_metric_value_non_negative;
+use crate::{FontSlant, GlyphMetric, GlyphMetricError};
 
 /// Opaque key into an adapter's native paint resources. This is independent
 /// of the dense glyph IDs assigned by HtmlEngine for layout.
@@ -13,7 +12,6 @@ pub struct GlyphRequest<'a> {
     pub font_size: f32,
     pub font_weight: u16,
     pub font_slant: FontSlant,
-    pub color: u32,
     pub font_family: Option<&'a str>,
 }
 
@@ -26,7 +24,8 @@ pub struct FontMetrics {
 
 impl FontMetrics {
     pub fn new(ascent: f32, descent: f32) -> Result<Self, GlyphMetricError> {
-        GlyphMetric::try_new('\0', 0.0, ascent, descent)?;
+        validate_metric_value_non_negative("ascent", ascent)?;
+        validate_metric_value_non_negative("descent", descent)?;
         Ok(Self { ascent, descent })
     }
     pub fn ascent(self) -> f32 {
@@ -52,7 +51,7 @@ impl ShapedGlyph {
         advance: f32,
         metrics: FontMetrics,
     ) -> Result<Self, GlyphMetricError> {
-        GlyphMetric::try_new('\0', advance, metrics.ascent, metrics.descent)?;
+        validate_metric_value_non_negative("advance", advance)?;
         Ok(Self {
             handle,
             advance,
@@ -63,10 +62,7 @@ impl ShapedGlyph {
         Self {
             handle,
             advance: metric.advance(),
-            metrics: FontMetrics {
-                ascent: metric.ascent(),
-                descent: metric.descent(),
-            },
+            metrics: metric.font_metrics(),
         }
     }
     pub fn handle(self) -> GlyphHandle {
@@ -79,55 +75,16 @@ impl ShapedGlyph {
         self.metrics
     }
     pub(crate) fn metric(self, character: char) -> GlyphMetric {
-        GlyphMetric::try_new(
-            character,
-            self.advance,
-            self.metrics.ascent,
-            self.metrics.descent,
-        )
-        .expect("validated shaping result")
-    }
-}
-
-/// Optional storage for simple adapters. Clearing native glyphs also changes
-/// their generation, keeping invalidation bookkeeping in one place.
-pub struct GlyphResources<T> {
-    values: Vec<T>,
-    generation: GlyphResourceGeneration,
-}
-impl<T> Default for GlyphResources<T> {
-    fn default() -> Self {
-        Self {
-            values: Vec::new(),
-            generation: GlyphResourceGeneration::default(),
-        }
-    }
-}
-impl<T> GlyphResources<T> {
-    pub fn generation(&self) -> GlyphResourceGeneration {
-        self.generation
-    }
-    pub fn clear(&mut self) {
-        self.values.clear();
-        self.generation = GlyphResourceGeneration::default();
-    }
-    pub fn insert(&mut self, value: T) -> Result<GlyphHandle, ShapeError> {
-        let id = GlyphId::try_from(self.values.len())
-            .ok()
-            .filter(|id| *id < GlyphId::MAX)
-            .ok_or_else(|| ShapeError::registry_capacity_exhausted(self.values.len()))?;
-        self.values.push(value);
-        Ok(id)
-    }
-    pub fn get(&self, handle: GlyphHandle) -> Option<&T> {
-        self.values.get(handle as usize)
+        GlyphMetric::from_shaped(character, self)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{GlyphResourceStore, GlyphShaper};
+    use crate::{
+        GlyphResourceGeneration, GlyphResourceStore, GlyphResources, GlyphShaper, ShapeError,
+    };
 
     #[test]
     fn engine_ids_are_independent_of_native_handles_and_survive_rollback() {
@@ -152,7 +109,7 @@ mod tests {
             font_size: 16.0,
             font_weight: 400,
             font_slant: FontSlant::Normal,
-            color: 0,
+
             font_family: None,
         };
         let id = resources.shape_glyph(&mut shaper, request('x')).unwrap();

@@ -1,5 +1,5 @@
 //! Per-line pseudo, overflow, and inline-strut preparation.
-use html_text::{whitespace_context_root, first_line_style_for_inline_root};
+use html_text::whitespace_context_root;
 
 use super::*;
 
@@ -12,15 +12,12 @@ pub(super) fn strut_for_inline_box(
     let line_height = if style.line_height_is_normal() && engine.reader.box_uses_ahem(box_idx) {
         font_size
     } else {
-        resolved_line_height(style)
+        style.resolved_line_height()
     };
     let (font_ascent, font_descent) = engine
         .reader
         .font_metrics(box_idx)
-        .line_box_ratios()
-        .map_or((font_size * 0.8, font_size * 0.2), |(ascent, descent)| {
-            (font_size * ascent as f64, font_size * descent as f64)
-        });
+        .line_box_extents(font_size);
     let half_leading = (line_height - font_ascent - font_descent) * 0.5;
     InlineBoxStrut {
         box_idx,
@@ -41,10 +38,7 @@ pub(super) fn parent_font_content_extents(
     engine
         .reader
         .font_metrics(parent_idx)
-        .line_box_ratios()
-        .map_or((font_size * 0.8, font_size * 0.2), |(ascent, descent)| {
-            (font_size * ascent as f64, font_size * descent as f64)
-        })
+        .line_box_extents(font_size)
 }
 
 pub(super) fn inline_box_struts(
@@ -88,12 +82,11 @@ pub(super) fn inline_box_struts(
             ) {
                 break;
             }
-            if !struts
-                .iter()
-                .any(|strut: &InlineBoxStrut| strut.box_idx == box_idx)
-            {
-                struts.push(strut_for_inline_box(engine, box_idx));
+            if struts.iter().any(|strut: &InlineBoxStrut| strut.box_idx == box_idx) {
+                // An earlier walk already collected this ancestor and its parents.
+                break;
             }
+            struts.push(strut_for_inline_box(engine, box_idx));
             current = engine.reader.get_parent(box_idx);
         }
     }
@@ -115,7 +108,7 @@ pub(super) fn include_container_strut(
         if style.line_height_is_normal() && engine.reader.box_uses_ahem(container_box_idx) {
             font_size
         } else {
-            resolved_line_height(style)
+            style.resolved_line_height()
         }
     });
     if !summary.has_baseline_relative_image && summary.line_height + f64::EPSILON >= line_height {
@@ -133,22 +126,20 @@ pub(super) fn include_container_strut(
     (summary.line_height, summary.baseline) = compute_baseline(max_ascent, max_descent, 0.0);
 }
 
-pub(super) fn first_line_color(
+pub(in crate::layout::inline) fn first_line_color(
     engine: &crate::layout::LayoutEngine<'_, '_>,
     container_box_idx: usize,
 ) -> Option<u32> {
     let styles = engine.reader.styles();
     let tree = engine.reader.layout_tree();
     let root = whitespace_context_root(tree, container_box_idx);
-    first_line_style_for_inline_root(
-        engine.reader.document(),
-        styles,
-        tree,
-        engine.text.content(),
-        root,
-    )
-    .and_then(|style| styles.view(style))
-    .map(|style| style.color())
+    engine
+        .text
+        .content()
+        .pseudo_styles()
+        .first_line(root)
+        .and_then(|style| styles.view(style))
+        .map(|style| style.color())
 }
 
 /// Returns pseudo-element line heights for the element that establishes
@@ -159,34 +150,20 @@ pub(in crate::layout::inline) fn pseudo_line_heights(
     engine: &crate::layout::LayoutEngine<'_, '_>,
     container_box_idx: usize,
 ) -> (Option<f64>, Option<f64>) {
-    let styles = engine.reader.styles();
     let tree = engine.reader.layout_tree();
     let root = whitespace_context_root(tree, container_box_idx);
-    let resolve = |style: html_style_model::StyleView<'_>| {
-        if style.line_height_is_normal() {
-            style.font_size() as f64 * 1.2
-        } else {
-            style.line_height().max(0.0) as f64
-        }
-    };
-    let line = first_line_style_for_inline_root(
-        engine.reader.document(),
-        styles,
-        tree,
-        engine.text.content(),
-        root,
-    )
-    .and_then(|style| styles.view(style))
-    .map(resolve);
-    let letter = html_text::first_letter_style_for_inline_root(
-        engine.reader.document(),
-        styles,
-        tree,
-        engine.text.content(),
-        root,
-    )
-    .and_then(|style| styles.view(style))
-    .map(resolve);
+    let line = engine
+        .text
+        .content()
+        .pseudo_styles()
+        .first_line(root)
+        .map(|style| engine.reader.used_style(style).resolved_line_height());
+    let letter = engine
+        .text
+        .content()
+        .pseudo_styles()
+        .first_letter(root)
+        .map(|style| engine.reader.used_style(style).resolved_line_height());
     (line, letter)
 }
 
@@ -218,53 +195,18 @@ pub(super) fn apply_first_line_pseudo_styles<'b>(
             set_token_line_height(engine, token, run_storage, height);
         }
     }
-    if let Some(height) = first_letter_height {
-        let mut selected_core = false;
-        let mut selection_started = false;
+    if first_letter_height.is_some() {
         for token in storage.iter_mut() {
-            let character = match token.kind() {
-                InlineTokenKind::Glyph { glyph_idx } => {
-                    let glyph = engine.text.glyph_at(glyph_idx as usize).unwrap_or_default();
-                    engine.text.glyph_metric(glyph).ch()
-                }
-                InlineTokenKind::Ellipsis { .. } => '\u{2026}',
-                InlineTokenKind::InlineBoundary { .. } | InlineTokenKind::Opportunity => continue,
-                _ if !selection_started => continue,
-                _ => break,
-            };
-            if !selection_started && character.is_whitespace() {
+            let InlineTokenKind::Glyph { glyph_idx } = token.kind() else {
                 continue;
-            }
-            let qualifying_punctuation = is_first_letter_punctuation(character);
-            let selected = if !selection_started {
-                selection_started = true;
-                if !qualifying_punctuation {
-                    selected_core = true;
-                }
-                true
-            } else if !selected_core && qualifying_punctuation {
-                true
-            } else if !selected_core {
-                selected_core = true;
-                true
-            } else {
-                qualifying_punctuation || character.is_mark()
             };
-            if !selected {
-                break;
+            if let Some(style) = engine.text.first_letter_style(glyph_idx) {
+                let height = engine.reader.used_style(style).resolved_line_height();
+                set_token_line_height(engine, token, run_storage, height);
             }
-            set_token_line_height(engine, token, run_storage, height);
         }
     }
     (storage.as_slice(), run_storage.as_slice())
-}
-
-fn is_first_letter_punctuation(character: char) -> bool {
-    character.is_punctuation_open()
-        || character.is_punctuation_close()
-        || character.is_punctuation_initial_quote()
-        || character.is_punctuation_final_quote()
-        || character.is_punctuation_other()
 }
 
 fn set_token_line_height(

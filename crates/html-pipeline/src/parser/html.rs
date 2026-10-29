@@ -1,12 +1,13 @@
 use encoding_rs::{Encoding, UTF_8};
-use html_dom::{Document, DomNodeId, ImageSource, NodeRef, RootFontSize};
+use html_dom::{Document, DomNodeId, ImageSource, RootFontSize};
 use crate::engine::{FormattingDocument, PreparedDocument};
 use html_style_model::ComputedStyles;
 #[cfg(feature = "profiling")]
 use crate::engine::profiling::scope;
-use html_parse::{ParsedHtml, StylesheetReference, style_type_is_css};
-use html_resources::{ResourceMetadata, ResourceProvider};
-use html_style::{FontFace, StylesheetEntry, resolve_font_face_urls};
+use html_parse::{ParsedHtml, StylesheetReference, document_stylesheets, encoding_for_label};
+use html_resources::{ResourceMetadata, ResourceProvider, media_type_essence, uri_path};
+use html_style::{AuthorStylesheetInput, FontFace, ResourceStylesheet, ResourceStylesheetEntry, StyleTimings};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::mem::take;
 use std::sync::{Arc, Mutex};
@@ -27,7 +28,7 @@ pub struct PreparationTimings {
     pub formatting: Duration,
     /// Logical text preparation and immutable paint bindings.
     pub text: Duration,
-    pub style_details: html_style::StyleTimings,
+    pub style_details: StyleTimings,
 }
 
 pub struct DocumentFactory {
@@ -38,7 +39,7 @@ pub struct DocumentFactory {
     style_program_cache: html_style::StyleProgramCache,
     reader_overrides: crate::engine::ReaderStyleOverrides,
     note_flow: crate::engine::NoteFlow,
-    font_faces: Vec<FontFace>,
+    font_faces: Arc<[FontFace]>,
 }
 
 /// Borrowed resources for one preparation operation. The provider and base
@@ -100,8 +101,14 @@ impl ResourceDocumentFactory<'_> {
 }
 
 struct ExpandedStylesheet {
-    css: String,
+    source: ResourceStylesheet,
     implicit_scope_root: Option<DomNodeId>,
+}
+
+#[derive(Eq, Hash, PartialEq)]
+enum StylesheetEncoding {
+    Transport(&'static str),
+    Fallback(&'static str),
 }
 
 /// Reuses decompressed external stylesheet text across document factories for
@@ -109,7 +116,7 @@ struct ExpandedStylesheet {
 /// stylesheet revision changes.
 #[derive(Clone, Default)]
 pub struct BookStylesheetCache {
-    entries: Arc<Mutex<HashMap<(String, Option<String>, Option<String>), String>>>,
+    entries: Arc<Mutex<HashMap<(String, StylesheetEncoding), Arc<str>>>>,
     programs: Arc<Mutex<html_style::StyleProgramCache>>,
 }
 
@@ -137,15 +144,26 @@ impl BookStylesheetCache {
     pub fn stats(&self) -> BookStylesheetCacheStats {
         let entries = self.entries.lock().expect("stylesheet cache lock");
         let programs = self.programs.lock().expect("style program cache lock").stats();
-        BookStylesheetCacheStats { entries: entries.len(), bytes: entries.values().map(String::len).sum(), compiled_entries: programs.entries, compiled_hits: programs.hits, compiled_misses: programs.misses, parsed_entries: programs.parsed_entries, parsed_hits: programs.parsed_hits, parsed_misses: programs.parsed_misses, inline_entries: programs.inline_entries, inline_hits: programs.inline_hits, inline_misses: programs.inline_misses }
+        BookStylesheetCacheStats { entries: entries.len(), bytes: entries.values().map(|css| css.len()).sum(), compiled_entries: programs.entries, compiled_hits: programs.hits, compiled_misses: programs.misses, parsed_entries: programs.parsed_entries, parsed_hits: programs.parsed_hits, parsed_misses: programs.parsed_misses, inline_entries: programs.inline_entries, inline_hits: programs.inline_hits, inline_misses: programs.inline_misses }
     }
 
-    fn read(&self, provider: &dyn ResourceProvider, uri: &str, transport_label: Option<&str>, fallback_label: Option<&str>) -> std::io::Result<String> {
-        let key = (uri.to_owned(), transport_label.map(str::to_ascii_lowercase), fallback_label.map(str::to_ascii_lowercase));
+    fn read(&self, provider: &dyn ResourceProvider, uri: &str, transport_label: Option<&str>, fallback_label: Option<&str>) -> std::io::Result<Arc<str>> {
+        let encoding = transport_label
+            .and_then(encoding_for_label)
+            .map(|encoding| StylesheetEncoding::Transport(encoding.name()))
+            .unwrap_or_else(|| {
+                StylesheetEncoding::Fallback(
+                    fallback_label
+                        .and_then(encoding_for_label)
+                        .unwrap_or(UTF_8)
+                        .name(),
+                )
+            });
+        let key = (uri.to_owned(), encoding);
         if let Some(css) = self.entries.lock().expect("stylesheet cache lock").get(&key).cloned() {
             return Ok(css);
         }
-        let css = decode_stylesheet_bytes(&provider.read_bytes(uri)?, transport_label, fallback_label);
+        let css: Arc<str> = decode_stylesheet_bytes(&provider.read_bytes(uri)?, transport_label, fallback_label).into();
         self.entries.lock().expect("stylesheet cache lock").insert(key, css.clone());
         Ok(css)
     }
@@ -160,7 +178,7 @@ impl Default for DocumentFactory {
 
 impl DocumentFactory {
     pub fn new() -> Self {
-        Self { root_font_size: RootFontSize::default(), media_environment: html_style::MediaEnvironment::default(), title: None, stylesheet_cache: None, style_program_cache: html_style::StyleProgramCache::default(), reader_overrides: Default::default(), note_flow: Default::default(), font_faces: Vec::new() }
+        Self { root_font_size: RootFontSize::default(), media_environment: html_style::MediaEnvironment::default(), title: None, stylesheet_cache: None, style_program_cache: html_style::StyleProgramCache::default(), reader_overrides: Default::default(), note_flow: Default::default(), font_faces: Arc::default() }
     }
 
     /// Active font declarations from the most recent preparation. Font bytes
@@ -170,7 +188,7 @@ impl DocumentFactory {
     }
 
     /// Transfer prepared declarations to the session that publishes them.
-    pub(crate) fn take_font_faces(&mut self) -> Vec<FontFace> {
+    pub(crate) fn take_font_faces(&mut self) -> Arc<[FontFace]> {
         take(&mut self.font_faces)
     }
 
@@ -270,7 +288,7 @@ impl DocumentFactory {
         #[cfg(feature = "profiling")]
         let stylesheets_scope = scope("factory.stylesheets");
         let expanded_css = self.expanded_document_stylesheets(&document, &base_uri, document_encoding, css_chunks, resources);
-        let all_css = expanded_css.iter().map(|stylesheet| html_style::AuthorStylesheetInput { css: stylesheet.css.as_str(), implicit_scope_root: stylesheet.implicit_scope_root }).collect::<Vec<_>>();
+        let all_css = expanded_css.iter().map(|stylesheet| AuthorStylesheetInput { css: stylesheet.source.css(), implicit_scope_root: stylesheet.implicit_scope_root }).collect::<Vec<_>>();
         #[cfg(feature = "profiling")]
         drop(stylesheets_scope);
         if let Some(timings) = timings.as_deref_mut() {
@@ -279,18 +297,7 @@ impl DocumentFactory {
         let started = timings.as_ref().map(|_| Instant::now());
         #[cfg(feature = "profiling")]
         let style_scope = scope("factory.style");
-        let (styled, style_details, media_queries) = if let Some(cache) = &self.stylesheet_cache {
-            let root_font_size = document.root_font_size();
-            let (program, compilation) = cache.programs.lock().expect("style program cache lock").get_or_compile(&all_css, self.media_environment, root_font_size);
-            let (styled, mut details, queries) = html_style::style_document_with_program_and_reader_overrides(document, &program, &all_css, &self.reader_overrides);
-            details.parse_default_css = compilation.parse_default_css;
-            details.parse_author_css = compilation.parse_author_css;
-            details.prepare_rules = compilation.prepare_rules;
-            details.selector_index = compilation.selector_index;
-            (styled, details, queries)
-        } else {
-            html_style::style_document_with_cached_program_and_reader_overrides(&mut self.style_program_cache, document, &all_css, self.media_environment, &self.reader_overrides)
-        };
+        let (styles, style_details, media_queries) = self.resolve_styles(&document, &all_css, &expanded_css);
         #[cfg(feature = "profiling")]
         drop(style_scope);
         if let Some(timings) = timings.as_deref_mut() {
@@ -298,8 +305,6 @@ impl DocumentFactory {
             timings.style_details = style_details;
         }
         let started = timings.as_ref().map(|_| Instant::now());
-        let font_faces = styled.font_faces().to_vec();
-        let (document, styles) = styled.into_parts();
         let language = resources.as_ref().and_then(|resources| resources.provider.primary_language());
         let styles = styles.with_hyphenation_fallback_language(language.as_deref());
         #[cfg(feature = "profiling")]
@@ -316,14 +321,13 @@ impl DocumentFactory {
         }
         #[cfg(feature = "profiling")]
         drop(prepare_scope);
-        self.font_faces = font_faces;
         if let Some(timings) = timings {
             timings.prepare = started.expect("timed preparation").elapsed();
         }
         (prepared, media_queries)
     }
 
-    fn expanded_document_stylesheets(&self, document: &Document, base_uri: &str, document_encoding: Option<&str>, css_chunks: &[&str], resources: Option<ResourceContext<'_>>) -> Vec<ExpandedStylesheet> {
+    fn expanded_document_stylesheets(&mut self, document: &Document, base_uri: &str, document_encoding: Option<&str>, css_chunks: &[&str], resources: Option<ResourceContext<'_>>) -> Vec<ExpandedStylesheet> {
         let mut expanded_css = Vec::new();
         for (stylesheet, implicit_scope_root) in document_stylesheets(document) {
             match stylesheet {
@@ -358,16 +362,21 @@ impl DocumentFactory {
     pub(crate) fn resolve_canonical_dom(&mut self, document: &Document, document_encoding: Option<&str>, css_chunks: &[&str], resources: Option<ResourceContext<'_>>) -> (ComputedStyles, html_style::MediaQuerySet) {
         let base_uri = resources.as_ref().map_or_else(String::new, |resources| effective_document_base_uri(document, resources));
         let expanded = self.expanded_document_stylesheets(document, &base_uri, document_encoding, css_chunks, resources);
-        let inputs: Vec<_> = expanded.iter().map(|sheet| html_style::AuthorStylesheetInput { css: &sheet.css, implicit_scope_root: sheet.implicit_scope_root }).collect();
-        let (program, timings) = if let Some(cache) = &self.stylesheet_cache {
-            cache.programs.lock().expect("stylesheet cache lock").get_or_compile(&inputs, self.media_environment, document.root_font_size())
-        } else {
-            self.style_program_cache.get_or_compile(&inputs, self.media_environment, document.root_font_size())
-        };
-        let (styles, _, queries) = html_style::resolve_document_with_program(document, &program, &inputs, timings, &self.reader_overrides);
-        self.font_faces = program.font_faces().to_vec();
+        let inputs: Vec<_> = expanded.iter().map(|sheet| AuthorStylesheetInput { css: sheet.source.css(), implicit_scope_root: sheet.implicit_scope_root }).collect();
+        let (styles, _, queries) = self.resolve_styles(document, &inputs, &expanded);
         let language = resources.as_ref().and_then(|resources| resources.provider.primary_language());
         (styles.with_hyphenation_fallback_language(language.as_deref()), queries)
+    }
+
+    fn resolve_styles(&mut self, document: &Document, inputs: &[AuthorStylesheetInput<'_>], expanded: &[ExpandedStylesheet]) -> (ComputedStyles, StyleTimings, html_style::MediaQuerySet) {
+        let sources = expanded.iter().map(|sheet| &sheet.source).collect::<Vec<_>>();
+        let (program, timings) = if let Some(cache) = &self.stylesheet_cache {
+            cache.programs.lock().expect("style program cache lock").get_or_compile_resources(&sources, self.media_environment, document.root_font_size())
+        } else {
+            self.style_program_cache.get_or_compile_resources(&sources, self.media_environment, document.root_font_size())
+        };
+        self.font_faces = program.shared_font_faces();
+        html_style::resolve_document_with_program(document, &program, inputs, timings, &self.reader_overrides)
     }
 
     fn configured_dom_and_base(&self, parsed: &ParsedHtml, resources: Option<ResourceContext<'_>>) -> (Document, String) {
@@ -391,7 +400,7 @@ impl DocumentFactory {
     }
 
     fn expand_stylesheet(
-        &self, css: &str, base_uri: &str, source_uri: Option<&str>, fallback_label: Option<&str>, implicit_scope_root: Option<DomNodeId>, active_imports: &mut HashSet<String>, depth: usize, output: &mut Vec<ExpandedStylesheet>, resources: Option<ResourceContext<'_>>,
+        &mut self, css: &str, base_uri: &str, source_uri: Option<&str>, fallback_label: Option<&str>, implicit_scope_root: Option<DomNodeId>, active_imports: &mut HashSet<String>, depth: usize, output: &mut Vec<ExpandedStylesheet>, resources: Option<ResourceContext<'_>>,
     ) {
         const MAX_IMPORT_DEPTH: usize = 32;
         if depth > MAX_IMPORT_DEPTH {
@@ -403,22 +412,22 @@ impl DocumentFactory {
             return;
         }
 
-        for entry in html_style::stylesheet_entries(css) {
+        let entries = if let Some(cache) = &self.stylesheet_cache {
+            cache.programs.lock().expect("stylesheet cache lock").resource_entries(css)
+        } else {
+            self.style_program_cache.resource_entries(css)
+        };
+        for entry in entries {
             match entry {
-                StylesheetEntry::Css(css) if !css.trim().is_empty() => {
-                    // Resolve before imports are flattened: each imported sheet
-                    // owns its font URL base, independent of the document base.
-                    let css = if let Some(resources) = &resources {
-                        resolve_font_face_urls(&css, |url| resources.provider.resolve(base_uri, url)).into_owned()
-                    } else {
-                        css
-                    };
-                    output.push(ExpandedStylesheet { css, implicit_scope_root });
+                ResourceStylesheetEntry::Rules(source) => {
+                    let source = source.resolve_font_urls(|url| resources.as_ref().map_or_else(
+                        || url.to_owned(), |resources| resources.provider.resolve(base_uri, url),
+                    ));
+                    output.push(ExpandedStylesheet { source, implicit_scope_root });
                 }
-                StylesheetEntry::Css(_) => {}
-                StylesheetEntry::Import(import) => {
+                ResourceStylesheetEntry::Import(import) => {
                     let Some(resources) = resources.as_ref() else { continue };
-                    let uri = resources.provider.resolve(base_uri, &import.url);
+                    let uri = resources.provider.resolve(base_uri, import.url());
                     if active_imports.contains(&uri) {
                         continue;
                     }
@@ -426,8 +435,8 @@ impl DocumentFactory {
                     let mut imported_output = Vec::new();
                     self.expand_stylesheet(&imported_css, &uri, Some(&uri), fallback_label, implicit_scope_root, active_imports, depth + 1, &mut imported_output, Some(*resources));
                     if !imported_output.is_empty() {
-                        let imported_css = imported_output.iter().map(|stylesheet| stylesheet.css.as_str()).collect::<Vec<_>>().join(" ");
-                        output.push(ExpandedStylesheet { css: import.wrap_resolved_css(&imported_css), implicit_scope_root });
+                        let sources = imported_output.into_iter().map(|stylesheet| stylesheet.source).collect();
+                        output.push(ExpandedStylesheet { source: import.wrap(sources), implicit_scope_root });
                     }
                 }
             }
@@ -438,52 +447,16 @@ impl DocumentFactory {
         }
     }
 
-    fn read_stylesheet(&self, provider: &dyn ResourceProvider, uri: &str, fallback_label: Option<&str>) -> std::io::Result<String> {
+    fn read_stylesheet(&self, provider: &dyn ResourceProvider, uri: &str, fallback_label: Option<&str>) -> std::io::Result<Arc<str>> {
         let ResourceMetadata { media_type, charset } = provider.metadata(uri)?;
-        if media_type.as_deref().is_some_and(|media_type| !media_type.split(';').next().unwrap_or_default().trim().eq_ignore_ascii_case("text/css")) {
+        if media_type.as_deref().is_some_and(|media_type| !media_type_essence(media_type).eq_ignore_ascii_case("text/css")) {
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "external stylesheet resource is not text/css"));
         }
         match &self.stylesheet_cache {
             Some(cache) => cache.read(provider, uri, charset.as_deref(), fallback_label),
-            None => provider.read_bytes(uri).map(|bytes| decode_stylesheet_bytes(&bytes, charset.as_deref(), fallback_label)),
+            None => provider.read_bytes(uri).map(|bytes| decode_stylesheet_bytes(&bytes, charset.as_deref(), fallback_label).into()),
         }
     }
-}
-
-fn document_stylesheets(document: &Document) -> Vec<(StylesheetReference, Option<DomNodeId>)> {
-    const HTML_NAMESPACE: &str = "http://www.w3.org/1999/xhtml";
-
-    fn text_content(document: &Document, node: DomNodeId, output: &mut String) {
-        match document.node_ref(node) {
-            Some(NodeRef::Text(text)) => output.push_str(text.text()),
-            Some(NodeRef::Element(element)) => element.children().for_each(|child| text_content(document, child, output)),
-            None => {}
-        }
-    }
-
-    let mut stylesheets = Vec::new();
-    for node in document.node_ids() {
-        let Some(element) = document.element_ref(node) else { continue };
-        if element.namespace() != Some(HTML_NAMESPACE) {
-            continue;
-        }
-        let implicit_scope_root = element.parent().or(document.dom_root());
-        if element.tag().eq_ignore_ascii_case("style") && style_type_is_css(element.attr("type")) {
-            let mut css = String::new();
-            element.children().for_each(|child| text_content(document, child, &mut css));
-            if !css.trim().is_empty() {
-                stylesheets.push((StylesheetReference::Inline(css), implicit_scope_root));
-            }
-        } else if element.tag().eq_ignore_ascii_case("link")
-            && let Some(stylesheet) = StylesheetReference::from_link(
-                element.attr("rel"), element.attr("type"),
-                element.attr("href"), element.attr("charset"),
-            )
-        {
-            stylesheets.push((stylesheet, implicit_scope_root));
-        }
-    }
-    stylesheets
 }
 
 fn effective_document_base_uri(document: &Document, resources: &ResourceContext<'_>) -> String {
@@ -496,7 +469,7 @@ fn effective_document_base_uri(document: &Document, resources: &ResourceContext<
     else {
         return resources.base_uri.to_owned();
     };
-    let path = href.split(['?', '#']).next().unwrap_or(href);
+    let path = uri_path(href);
     if path.is_empty() {
         return resources.base_uri.to_owned();
     }
@@ -511,14 +484,17 @@ fn effective_document_base_uri(document: &Document, resources: &ResourceContext<
 /// CSS. Encoding detection is necessarily byte-oriented: converting through
 /// `String::from_utf8_lossy` first destroys both legacy-encoded identifiers and
 /// the UTF BOM used by the CSS encoding algorithm.
-fn decode_stylesheet_bytes(bytes: &[u8], transport_label: Option<&str>, fallback_label: Option<&str>) -> String {
+fn decode_stylesheet_bytes<'a>(
+    bytes: &'a [u8],
+    transport_label: Option<&str>,
+    fallback_label: Option<&str>,
+) -> Cow<'a, str> {
     let (encoding, bom_len) = Encoding::for_bom(bytes)
-        .map(|(encoding, length)| (encoding, length))
-        .or_else(|| transport_label.and_then(|label| Encoding::for_label(label.trim().as_bytes())).map(|encoding| (encoding, 0)))
+        .or_else(|| transport_label.and_then(encoding_for_label).map(|encoding| (encoding, 0)))
         .or_else(|| css_charset_label(bytes).and_then(Encoding::for_label).map(|encoding| (encoding, 0)))
-        .or_else(|| fallback_label.and_then(|label| Encoding::for_label(label.trim().as_bytes())).map(|encoding| (encoding, 0)))
+        .or_else(|| fallback_label.and_then(encoding_for_label).map(|encoding| (encoding, 0)))
         .unwrap_or((UTF_8, 0));
-    encoding.decode_without_bom_handling(&bytes[bom_len..]).0.into_owned()
+    encoding.decode_without_bom_handling(&bytes[bom_len..]).0
 }
 
 /// CSS `@charset` participates in encoding detection only in its exact leading
@@ -577,6 +553,97 @@ mod tests {
         fn list_html_candidates(&self, _root: &str) -> io::Result<Vec<String>> {
             Ok(Vec::new())
         }
+    }
+
+    #[test]
+    fn stylesheet_cache_shares_text_and_keeps_encoding_keys_separate() {
+        let provider = MemoryProvider {
+            resources: HashMap::from([("book.css".to_owned(), b"/* caf\xe9 */".to_vec())]),
+        };
+        let cache = BookStylesheetCache::default();
+        let legacy = cache
+            .read(&provider, "book.css", None, Some("windows-1252"))
+            .unwrap();
+        let utf8 = cache
+            .read(&provider, "book.css", None, Some("utf-8"))
+            .unwrap();
+        assert_eq!(&*legacy, "/* café */");
+        assert_eq!(&*utf8, "/* caf\u{fffd} */");
+
+        let unavailable = MemoryProvider {
+            resources: HashMap::new(),
+        };
+        let reused = cache
+            .clone()
+            .read(&unavailable, "book.css", None, Some("WINDOWS-1252"))
+            .unwrap();
+        assert!(Arc::ptr_eq(&legacy, &reused));
+        for label in [" cp1252 ", "ISO-8859-1", "latin1"] {
+            let reused = cache
+                .read(&unavailable, "book.css", None, Some(label))
+                .unwrap();
+            assert!(Arc::ptr_eq(&legacy, &reused));
+        }
+        for label in [None, Some(" UTF8 "), Some("unsupported-encoding")] {
+            let reused = cache.read(&unavailable, "book.css", None, label).unwrap();
+            assert!(Arc::ptr_eq(&utf8, &reused));
+        }
+        let reused = cache
+            .read(&unavailable, "book.css", Some("invalid"), Some("cp1252"))
+            .unwrap();
+        assert!(Arc::ptr_eq(&legacy, &reused));
+        assert_eq!(
+            (cache.stats().entries, cache.stats().bytes),
+            (2, legacy.len() + utf8.len())
+        );
+        cache.clear();
+        assert!(
+            cache
+                .read(&unavailable, "book.css", None, Some("windows-1252"))
+                .is_err()
+        );
+        assert_eq!(&*reused, "/* café */");
+    }
+
+    #[test]
+    fn stylesheet_transport_keys_ignore_fallbacks_but_preserve_charset_precedence() {
+        use crate::allocation_test_support::count_allocations;
+
+        let provider = MemoryProvider {
+            resources: HashMap::from([(
+                "book.css".to_owned(),
+                b"@charset \"windows-1252\"; /* caf\xe9 */".to_vec(),
+            )]),
+        };
+        let cache = BookStylesheetCache::default();
+        let fallback = cache
+            .read(&provider, "book.css", None, Some("utf-8"))
+            .unwrap();
+        let transport = cache
+            .read(&provider, "book.css", Some("utf-8"), Some("windows-1252"))
+            .unwrap();
+        assert_eq!(&*fallback, "@charset \"windows-1252\"; /* café */");
+        assert_eq!(&*transport, "@charset \"windows-1252\"; /* caf� */");
+        let unavailable = MemoryProvider {
+            resources: HashMap::new(),
+        };
+        for label in [None, Some("shift_jis"), Some("windows-1252")] {
+            let reused = cache
+                .read(&unavailable, "book.css", Some(" UTF8 "), label)
+                .unwrap();
+            assert!(Arc::ptr_eq(&transport, &reused));
+        }
+        let (reused, allocations) = count_allocations(|| {
+            cache
+                .read(&unavailable, "book.css", Some("UTF8"), Some("latin1"))
+                .unwrap()
+        });
+        assert!(Arc::ptr_eq(&transport, &reused));
+        assert_eq!(
+            allocations, 1,
+            "only the URI key is allocated on a cache hit"
+        );
+        assert_eq!(cache.stats().entries, 2);
     }
 
     #[test]
@@ -687,6 +754,35 @@ mod tests {
         }
         let stats = cache.stats();
         assert_eq!((stats.compiled_entries, stats.compiled_hits, stats.compiled_misses), (1, 1, 1));
+    }
+
+    #[test]
+    fn font_metadata_is_shared_across_preparation_restyle_and_cache_clear() {
+        let cache = BookStylesheetCache::default();
+        let css = "@font-face {font-family: Reader; src: url(reader.woff2); font-weight: 100 900}";
+        let mut first = DocumentFactory::new();
+        first.set_book_stylesheet_cache(cache.clone());
+        first.parse_with_new_pipeline("<p>one</p>", Some(css));
+        let retained = first.take_font_faces();
+        assert!(first.font_faces().is_empty());
+
+        let mut second = DocumentFactory::new();
+        second.set_book_stylesheet_cache(cache.clone());
+        second.parse_with_new_pipeline("<p>two</p>", Some(css));
+        assert_eq!(retained.as_ptr(), second.font_faces().as_ptr());
+        let document = parse_html_document("<p>restyled</p>").into_dom();
+        second.resolve_canonical_dom(&document, None, &[css], None);
+        assert_eq!(retained.as_ptr(), second.font_faces().as_ptr());
+        assert_eq!(
+            (cache.stats().compiled_misses, cache.stats().compiled_hits),
+            (1, 2)
+        );
+
+        cache.clear();
+        second.parse_with_new_pipeline("<p>no fonts</p>", None);
+        assert!(second.font_faces().is_empty());
+        assert_eq!(retained[0].family, "Reader");
+        assert_eq!(retained[0].weight, 100.0..=900.0);
     }
 
     #[test]
@@ -849,6 +945,41 @@ mod tests {
         let prepared = factory.with_resources(factory_resources).parse_with_new_pipeline(html, None);
         let paragraph = (0..prepared.box_count()).find(|&box_idx| prepared.get_tag(box_idx) == "p").expect("paragraph box");
         assert_eq!(prepared.box_text_color(paragraph), Some(0xFF0000FF), "important layered imports outrank important unlayered author rules");
+    }
+
+    #[test]
+    fn anonymous_import_layer_keeps_chunks_together_and_honors_conditions() {
+        let provider = MemoryProvider { resources: HashMap::from([
+            ("book/theme.css".into(), b"@import 'nested.css'; p {color:red !important}".to_vec()),
+            ("book/nested.css".into(), b"p {color:blue !important}".to_vec()),
+        ]) };
+        for (condition, expected) in [
+            ("supports(width:1px) screen", 0xff0000ff),
+            ("supports(unknown-property:1px) screen", 0x008000ff),
+            ("supports(width:1px) print", 0x008000ff),
+        ] {
+            let source = format!("<style>@import 'theme.css' layer {condition}; p {{color:green}}</style><p>text</p>");
+            let mut factory = DocumentFactory::new();
+            let prepared = factory.with_resources(ResourceContext::new(&provider, "book/chapter.html"))
+                .parse_with_new_pipeline(&source, None);
+            let paragraph = (0..prepared.box_count()).find(|&index| prepared.get_tag(index) == "p").unwrap();
+            assert_eq!(prepared.box_text_color(paragraph), Some(expected), "{condition}");
+        }
+    }
+
+    #[test]
+    fn utf8_stylesheet_decoding_allocates_only_the_shared_result() {
+        use crate::allocation_test_support::count_allocations;
+
+        let css = "/* café 🙂 */ .example { color: green; }";
+        let mut bom = vec![0xef, 0xbb, 0xbf];
+        bom.extend_from_slice(css.as_bytes());
+        for bytes in [css.as_bytes(), bom.as_slice()] {
+            let (decoded, allocations) =
+                count_allocations(|| Arc::<str>::from(decode_stylesheet_bytes(bytes, None, None)));
+            assert_eq!(decoded.as_ref(), css);
+            assert_eq!(allocations, 1);
+        }
     }
 
     #[test]

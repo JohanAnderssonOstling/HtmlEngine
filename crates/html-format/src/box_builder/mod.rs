@@ -7,7 +7,7 @@ use html_engine_model::NoteFlow;
 use html_style_model::{ComputedStyles, Display, Float, ListStyleType, StyleIndices};
 use rustc_data_structures::fx::FxHashMap;
 use std::ops::Range;
-use unicode_categories::UnicodeCategories;
+use html_text::{FirstLetterPart, FirstLetterSelection};
 
 mod block;
 mod classification;
@@ -23,7 +23,7 @@ mod writer;
 use self::block::{BlockChildAction, plan_block_children};
 use self::classification::{
     display_for_element, empty_table_box, is_block_level_pseudo_display, is_clearing_break,
-    is_table_internal_display, layout_mode_for_display,
+    layout_mode_for_display,
 };
 use self::generated::GeneratedContentResolver;
 use self::inline::{
@@ -57,33 +57,17 @@ struct InlineFragmentFrame {
     first_fragment: bool,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum FirstLetterCapturePhase {
-    Leading,
-    Letter,
-    Trailing,
-    Done,
-}
-
 struct FloatedFirstLetterCapture {
     box_idx: u32,
     item_start: u32,
     item_end: Option<u32>,
-    phase: FirstLetterCapturePhase,
+    selection: FirstLetterSelection,
 }
 
 #[derive(Clone, Copy)]
 enum FlexInlineSource {
     Node(u32),
     GeneratedPseudo { origin: DomNodeId, before: bool },
-}
-
-fn is_first_letter_punctuation(character: char) -> bool {
-    character.is_punctuation_open()
-        || character.is_punctuation_close()
-        || character.is_punctuation_initial_quote()
-        || character.is_punctuation_final_quote()
-        || character.is_punctuation_other()
 }
 
 impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {

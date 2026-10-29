@@ -1,4 +1,4 @@
-use html_engine_model::PaintColorRun;
+use html_engine_model::{PaintColorRun, TextDirection};
 use std::ops::Range;
 
 use kurbo::Point;
@@ -64,23 +64,19 @@ fn prepare_fragment(
     let authoritative_runs = text.authoritative_runs(source_range.clone())?;
 
     for run in authoritative_runs {
-        if run.source_range.start >= source_range.end {
-            break;
-        }
-        let start = source_range.start.max(run.source_range.start);
-        let end = source_range.end.min(run.source_range.end);
-        if start >= end {
-            continue;
-        }
+        let start = run.source_range.start;
+        let end = run.source_range.end;
         if start != expected {
             return None;
         }
 
-        let local_start = start - run.source_range.start + run.run_offset;
+        let local_start = run.run_range().start;
         let mut natural_x = f64::from(*run.caret_stops.get(local_start as usize)?);
-        let rtl_origin_x = (text.bidi_level(start) % 2 == 1).then(|| {
-            x - f64::from(run.caret_stops[local_start as usize].min(run.caret_stops[(end - run.source_range.start + run.run_offset) as usize]))
-        });
+        let rtl_origin_x = if text.bidi_level(start) % 2 == 1 {
+            Some(x - f64::from(run.natural_offset(TextDirection::Rtl)?))
+        } else {
+            None
+        };
         let mut segment: Option<(u32, u32, Point, Option<u32>)> = None;
 
         for index in start..end {
@@ -129,8 +125,8 @@ fn flush_segment(run: crate::TextRunId, segment: &mut Option<(u32, u32, Point, O
 /// Prepare native paint slices after final geometry and palette resolution.
 /// Palette-only updates reuse the same path without rebuilding lines.
 pub fn prepare_text_paint(inputs: crate::layout::LayoutInputs<'_>, state: &mut crate::layout_model::LayoutState, colors: &[PaintColorRun]) {
-    let text = InlineReader::new(inputs.inline_content, inputs.glyphs, inputs.glyph_metrics, inputs.text_geometry, inputs.ellipsis_glyphs, inputs.hyphen_glyphs);
-    let mut fragments = FragmentWriter::new(state, Vec::new(), Vec::new());
+    let text = InlineReader::new(inputs.inline_content, inputs.first_letter_styles, inputs.glyphs, inputs.glyph_metrics, inputs.text_geometry, inputs.ellipsis_glyphs, inputs.hyphen_glyphs);
+    let mut fragments = FragmentWriter::new(state, Vec::new());
     prepare_line_text_runs(&text, &mut fragments, colors);
 }
 
@@ -161,11 +157,12 @@ mod tests {
             geometry.push_run(&[0, 1, 2, 3, 4], native, true);
             geometry.finish_runs();
             let empty = Default::default();
-            let text = InlineReader::new(&content, GlyphSlice::new(&glyphs, &[]), &metrics,
+            let first_letter_styles = html_text::FirstLetterStyles::default();
+            let text = InlineReader::new(&content, &first_letter_styles, GlyphSlice::new(&glyphs, &[]), &metrics,
                 Some(TextGeometryView::new(&geometry, None)), &empty, &empty);
             let mut state = LayoutState::default();
             state.line_output.lines.push(Line { glyphs: 0..5, baseline: 12.0, letter_spacing: 2.0, ..Default::default() });
-            let mut writer = FragmentWriter::new(&mut state, Vec::new(), Vec::new());
+            let mut writer = FragmentWriter::new(&mut state, Vec::new());
             prepare_line_text_runs(&text, &mut writer, &[PaintColorRun { glyphs: 0..5, color: 0x008000ff }]);
             assert!(state.line_output.lines[0].native_text_runs_complete);
             let carets = [0.0, 8.0, 16.0, 16.0, 24.0];

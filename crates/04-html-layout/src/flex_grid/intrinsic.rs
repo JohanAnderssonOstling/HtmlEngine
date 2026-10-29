@@ -1,18 +1,19 @@
+use super::item_sizing::ordered_children;
+use super::measurement::{MeasuredItem, measure_intrinsic_item};
 use super::style::{
     grid_definite_inline_minimum_exceeds_track_limit, layout_style, taffy_container_style,
     taffy_item_style,
 };
+use super::taffy_layout::TaffyLayoutTree;
 use super::tracks::template_tracks_have_percentage_calc;
 use super::{TaffyContainerKind, ensure_grid_algorithm_root, finite_f32};
-use crate::layout::{
-    LayoutEngine, measure_replaced_content, preferred_aspect_ratio, resolve_definite_content_size,
-};
+use crate::layout::{LayoutEngine, resolve_definite_content_size};
 use html_style_model::{
     GridRepeatCount, OverflowMode, PositionMode, UsedGridTemplateTrack, UsedGridTrackBreadth,
     UsedGridTrackSize, UsedPreferredSize as PreferredSize,
 };
 use taffy::geometry::Size as TaffySize;
-use taffy::prelude::{AvailableSpace, Dimension, TaffyTree};
+use taffy::prelude::{AvailableSpace, Dimension};
 
 struct FlexIntrinsicItem {
     min_contribution: f64,
@@ -23,33 +24,8 @@ struct FlexIntrinsicItem {
     flex_grow: f64,
 }
 
+/// Intrinsic contributions with explicit optional inline and block-size bases.
 pub fn intrinsic_widths(
-    session: &LayoutEngine<'_, '_>,
-    container_idx: usize,
-    children: &[u32],
-    kind: TaffyContainerKind,
-) -> (f64, f64) {
-    intrinsic_widths_with_constraints(session, container_idx, children, kind, None, None)
-}
-
-pub fn intrinsic_widths_with_available(
-    session: &LayoutEngine<'_, '_>,
-    container_idx: usize,
-    children: &[u32],
-    kind: TaffyContainerKind,
-    available_width: Option<f64>,
-) -> (f64, f64) {
-    intrinsic_widths_with_constraints(
-        session,
-        container_idx,
-        children,
-        kind,
-        available_width,
-        None,
-    )
-}
-
-pub fn intrinsic_widths_with_constraints(
     session: &LayoutEngine<'_, '_>,
     container_idx: usize,
     children: &[u32],
@@ -89,6 +65,7 @@ pub fn intrinsic_widths_with_constraints(
                 .resolve(0.0),
         );
     }
+    let ordered_children = ordered_children(session, sizing_children);
     let compute = |available_space: AvailableSpace| {
         // A definite block size determines how many columns contribute to a
         // column flex container's max-content width. Its min-content cross
@@ -97,32 +74,23 @@ pub fn intrinsic_widths_with_constraints(
         let probe_height = matches!(available_space, AvailableSpace::MaxContent)
             .then_some(definite_height)
             .flatten();
-        let mut ordered_children: Vec<(usize, u32)> =
-            sizing_children.iter().copied().enumerate().collect();
-        ordered_children.sort_by_key(|(source_order, child)| {
-            (layout_style(session, *child as usize).order, *source_order)
-        });
-        let mut taffy = TaffyTree::<u32>::with_capacity(ordered_children.len() + 1);
-        taffy.disable_rounding();
-        let mut child_nodes: Vec<_> = ordered_children
+        let mut child_styles: Vec<_> = ordered_children
             .iter()
-            .map(|(_, child)| {
-                taffy
-                    .new_leaf_with_context(
-                        taffy_item_style(
-                            session,
-                            *child as usize,
-                            0.0,
-                            probe_height,
-                            kind,
-                            None,
-                            None,
-                            probe_height,
-                            true,
-                        ),
-                        *child,
-                    )
-                    .expect("intrinsic Taffy leaf is valid")
+            .map(|&child| {
+                (
+                    taffy_item_style(
+                        session,
+                        child as usize,
+                        0.0,
+                        probe_height,
+                        kind,
+                        None,
+                        None,
+                        probe_height,
+                        true,
+                    ),
+                    Some(child),
+                )
             })
             .collect();
         let has_indefinite_calc_track = kind == TaffyContainerKind::Grid
@@ -131,7 +99,7 @@ pub fn intrinsic_widths_with_constraints(
                 session.reader.style(container_idx).grid_template_columns(),
             );
         if !has_indefinite_calc_track {
-            ensure_grid_algorithm_root(&mut taffy, &mut child_nodes, kind);
+            ensure_grid_algorithm_root(&mut child_styles, kind);
         }
         let floor_fixed_grid_column_maxima = grid_definite_inline_minimum_exceeds_track_limit(
             session,
@@ -260,32 +228,22 @@ pub fn intrinsic_widths_with_constraints(
                 }
             }
         }
-        let root = taffy
-            .new_with_children(root_style, &child_nodes)
-            .expect("intrinsic Taffy root is valid");
-        taffy
-            .compute_layout_with_measure(
-                root,
-                TaffySize {
-                    width: available_space,
-                    height: probe_height
-                        .map(|height| AvailableSpace::Definite(finite_f32(height)))
-                        .unwrap_or(AvailableSpace::MaxContent),
-                },
-                |known, available, _, context, _| {
-                    let Some(box_idx) = context.copied() else {
-                        return TaffySize::ZERO;
-                    };
-                    measure_item(session, box_idx as usize, known, available)
-                },
-            )
-            .expect("intrinsic Taffy layout succeeds");
-        taffy
-            .layout(root)
-            .expect("intrinsic Taffy root layout exists")
-            .size
-            .width
-            .max(0.0) as f64
+        let mut taffy = TaffyLayoutTree::new(
+            |box_idx, known, available| MeasuredItem {
+                size: measure_intrinsic_item(session, box_idx, known, available),
+                first_baseline: None,
+            },
+            kind,
+            root_style,
+            child_styles,
+        );
+        taffy.compute(TaffySize {
+            width: available_space,
+            height: probe_height
+                .map(|height| AvailableSpace::Definite(finite_f32(height)))
+                .unwrap_or(AvailableSpace::MaxContent),
+        });
+        taffy.root_layout().size.width.max(0.0) as f64
     };
     let mut min_width = compute(AvailableSpace::MinContent);
     if kind == TaffyContainerKind::Grid {
@@ -365,14 +323,19 @@ fn flex_intrinsic_item(session: &LayoutEngine<'_, '_>, box_idx: usize) -> FlexIn
         + style.border_left_width() as f64
         + style.border_right_width() as f64;
     let outer_inset = margin + padding_border;
-    let (content_min, content_max) = crate::layout::box_content_intrinsic_widths(session, box_idx);
+    let (content_min, content_max) = crate::layout::box_content_intrinsic_widths(session, box_idx, None);
     let raw_min = (content_min + outer_inset).max(0.0);
     let raw_max = (content_max + outer_inset).max(raw_min);
     let outer_preferred = outer_preferred_width(session, box_idx, style.width(), raw_min, raw_max);
     let outer_flex_base =
         outer_preferred_width(session, box_idx, style.flex_basis(), raw_min, raw_max)
-            .or_else(|| matches!(style.flex_basis(), PreferredSize::Auto)
-                .then(|| outer_preferred_width(session, box_idx, style.width(), raw_min, raw_max)).flatten())
+            .or_else(|| {
+                matches!(style.flex_basis(), PreferredSize::Auto)
+                    .then(|| {
+                        outer_preferred_width(session, box_idx, style.width(), raw_min, raw_max)
+                    })
+                    .flatten()
+            })
             .unwrap_or(raw_max);
     let automatic_min = if matches!(
         style.overflow_x(),
@@ -393,7 +356,10 @@ fn flex_intrinsic_item(session: &LayoutEngine<'_, '_>, box_idx: usize) -> FlexIn
     }
     .max(outer_min);
     let constraint_dependent_basis = style.flex_basis().percentage_dependent()
-        || matches!(style.flex_basis(), PreferredSize::Content | PreferredSize::FitContent | PreferredSize::Stretch);
+        || matches!(
+            style.flex_basis(),
+            PreferredSize::Content | PreferredSize::FitContent | PreferredSize::Stretch
+        );
     let contribution = |raw: f64, min_content: bool| {
         let mut value = outer_preferred.map_or(raw, |preferred| raw.max(preferred));
         if layout.flex_grow == 0.0 {
@@ -428,60 +394,11 @@ fn outer_preferred_width(
         + style.border_right_width() as f64;
     match value {
         PreferredSize::MinContent => Some(raw_min),
-        PreferredSize::Content | PreferredSize::MaxContent | PreferredSize::FitContent => Some(raw_max),
+        PreferredSize::Content | PreferredSize::MaxContent | PreferredSize::FitContent => {
+            Some(raw_max)
+        }
         _ => resolve_definite_content_size(value, None, margin, padding_border, style.box_sizing())
             .map(|content| content + padding_border + margin),
-    }
-}
-
-fn measure_item(
-    session: &LayoutEngine<'_, '_>,
-    box_idx: usize,
-    known: TaffySize<Option<f32>>,
-    available: TaffySize<AvailableSpace>,
-) -> TaffySize<f32> {
-    if let Some(intrinsic) = session.reader.image_intrinsic(box_idx) {
-        return measure_replaced_content(
-            intrinsic.size,
-            preferred_aspect_ratio(
-                session.reader.style(box_idx).aspect_ratio(),
-                intrinsic.aspect_ratio,
-            ),
-            known,
-            available,
-        );
-    }
-    let style = session.reader.style(box_idx);
-    let (outer_min_width, outer_max_width) = crate::layout::box_intrinsic_widths(session, box_idx);
-    let horizontal_inset = style.get_horizontal_margin_padding(0.0)
-        + style.border_left_width() as f64
-        + style.border_right_width() as f64;
-    let mut min_width = (outer_min_width - horizontal_inset).max(0.0);
-    let mut max_width = (outer_max_width - horizontal_inset).max(min_width);
-    let vertical_inset = style.get_vertical_padding(0.0)
-        + style.border_top_width() as f64
-        + style.border_bottom_width() as f64;
-    let available_height = known
-        .height
-        .or(match available.height {
-            AvailableSpace::Definite(value) => Some(value),
-            AvailableSpace::MinContent | AvailableSpace::MaxContent => None,
-        })
-        .map(|value| finite_f32((f64::from(value) - vertical_inset).max(0.0)));
-    if let Some(width) = available_height.and_then(|height| {
-        crate::layout::percentage_height_image_width(session, box_idx, f64::from(height))
-    }) {
-        min_width = width;
-        max_width = width;
-    }
-    let width = known.width.unwrap_or_else(|| match available.width {
-        AvailableSpace::Definite(value) => value,
-        AvailableSpace::MinContent => finite_f32(min_width),
-        AvailableSpace::MaxContent => finite_f32(max_width),
-    });
-    TaffySize {
-        width,
-        height: known.height.unwrap_or(0.0),
     }
 }
 

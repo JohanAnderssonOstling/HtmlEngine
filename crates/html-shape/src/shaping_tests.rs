@@ -36,13 +36,16 @@ mod tests {
         .map(|span| {
             let text = span
                 .character_indices()
-                .filter_map(|index| {
-                    content
-                        .character_at(index as usize)
-                        .and_then(char::from_u32)
-                })
+                .filter_map(|index| content.character_at(index as usize))
                 .collect();
-            let colors = span.paint_colors(prepared.test_styles(), prepared.layout_tree());
+            let colors = span
+                .paint_colors(prepared.test_styles(), prepared.layout_tree())
+                .unwrap_or_else(|| {
+                    vec![
+                        span.style(prepared.test_styles(), prepared.layout_tree()).color();
+                        span.character_count()
+                    ]
+                });
             (text, colors)
         })
         .collect()
@@ -68,7 +71,7 @@ mod tests {
         let text = content
             .characters()
             .iter()
-            .filter_map(|glyph| char::from_u32(*glyph))
+            .copied()
             .collect();
         let offsets = (0..content.characters().len())
             .map(|index| content.raw_glyph_source_offset(index))
@@ -992,6 +995,74 @@ mod tests {
             .with_paint_colors(&colors)
             .unwrap();
         assert_eq!(request.paint_colors(), Some(colors.as_slice()));
+    }
+
+    #[test]
+    fn shaping_requests_preserve_uniform_and_mixed_colors_across_bidi_splits() {
+        use crate::test_support::TestGlyphShaper;
+        use crate::{GlyphResourceGeneration, GlyphResourceStore, GlyphShaper, ShapeError};
+
+        struct Recorder {
+            fallback: TestGlyphShaper,
+            requests: Vec<(String, u32, Option<Vec<u32>>)>,
+        }
+        impl GlyphShaper for Recorder {
+            fn reset(&mut self) {
+                self.fallback.reset();
+                self.requests.clear();
+            }
+            fn resource_generation(&self) -> GlyphResourceGeneration {
+                self.fallback.resource_generation()
+            }
+            fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
+                self.fallback.shape_glyph(request)
+            }
+            fn shape_text_run(
+                &mut self,
+                request: TextRunShapeRequest<'_>,
+            ) -> Result<Option<ShapedTextRun>, ShapeError> {
+                self.requests.push((
+                    request.text().to_owned(),
+                    request.style().color(),
+                    request.paint_colors().map(|colors| colors.to_vec()),
+                ));
+                Ok(None)
+            }
+        }
+
+        let black = 0x000000ff;
+        let red = 0xff0000ff;
+        for (source, expected) in [
+            (
+                "<p style='color:#123456'>of<span>fi</span>ce</p>",
+                vec![("office".to_owned(), 0x123456ff, None)],
+            ),
+            (
+                "<p style='color:black'>of<span style='color:red'>fi</span>ce</p>",
+                vec![(
+                    "office".to_owned(),
+                    black,
+                    Some(vec![black, black, red, red, black, black]),
+                )],
+            ),
+            (
+                "<p style='color:black'>a<span style='color:red'>אב</span>b</p>",
+                vec![
+                    ("a".to_owned(), black, None),
+                    ("אב".to_owned(), black, Some(vec![red, red])),
+                    ("b".to_owned(), black, None),
+                ],
+            ),
+        ] {
+            let prepared = DocumentFactory::new().parse_with_new_pipeline(source, None);
+            let mut shaper = Recorder {
+                fallback: TestGlyphShaper::new(),
+                requests: Vec::new(),
+            };
+            let mut resources = GlyphResourceStore::default();
+            prepared.shape(&mut shaper, &mut resources).unwrap();
+            assert_eq!(shaper.requests, expected, "{source}");
+        }
     }
 
     #[test]

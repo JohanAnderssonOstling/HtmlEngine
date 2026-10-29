@@ -373,7 +373,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
                 continue;
             };
             let table_internal = self.document.element_ref(node_id).is_some_and(|element| {
-                is_table_internal_display(display_for_element(self.styles, element))
+                display_for_element(self.styles, element).is_table_internal()
             });
             if table_internal {
                 table_segment.append(&mut pending_table_whitespace);
@@ -440,7 +440,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
             if fragment_target.is_none()
                 && target == box_idx
                 && let Some(capture) = self.floated_first_letter.as_mut().filter(|capture| {
-                    capture.phase == FirstLetterCapturePhase::Done && capture.item_end.is_none()
+                    capture.selection.is_done() && capture.item_end.is_none()
                 })
             {
                 capture.item_end = Some(self.output.item_position());
@@ -525,7 +525,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
             box_idx: pseudo_box,
             item_start: self.output.item_position(),
             item_end: None,
-            phase: FirstLetterCapturePhase::Leading,
+            selection: FirstLetterSelection::default(),
         });
         true
     }
@@ -534,32 +534,11 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
         let Some(capture) = self.floated_first_letter.as_mut() else {
             return ordinary_box;
         };
-        let selected = match capture.phase {
-            FirstLetterCapturePhase::Leading if character.is_whitespace() => true,
-            FirstLetterCapturePhase::Leading if is_first_letter_punctuation(character) => true,
-            FirstLetterCapturePhase::Leading => {
-                capture.phase = FirstLetterCapturePhase::Letter;
-                true
-            }
-            FirstLetterCapturePhase::Letter if character.is_mark() => true,
-            FirstLetterCapturePhase::Letter if is_first_letter_punctuation(character) => {
-                capture.phase = FirstLetterCapturePhase::Trailing;
-                true
-            }
-            FirstLetterCapturePhase::Letter => false,
-            FirstLetterCapturePhase::Trailing
-                if character.is_mark() || is_first_letter_punctuation(character) =>
-            {
-                true
-            }
-            FirstLetterCapturePhase::Trailing => false,
-            FirstLetterCapturePhase::Done => false,
-        };
-        if selected {
-            capture.box_idx
-        } else {
-            capture.phase = FirstLetterCapturePhase::Done;
-            ordinary_box
+        // Retain leading whitespace in the float's source stream so the
+        // normalizer can apply the same context-wide collapse policy.
+        match capture.selection.push(character) {
+            FirstLetterPart::LeadingSpace | FirstLetterPart::Selected => capture.box_idx,
+            FirstLetterPart::After => ordinary_box,
         }
     }
 

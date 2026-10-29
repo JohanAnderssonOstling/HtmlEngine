@@ -5,9 +5,10 @@ use crate::GlyphRequest;
 #[cfg(feature = "profiling")]
 use crate::profiling::scope;
 use html_engine_model::grapheme_boundaries;
-use html_style_model::is_cjk_character;
-use html_text::is_bidi_control;
+use html_style_model::StyleView;
+use html_text::suppresses_glyph;
 use std::sync::Arc;
+use rustc_data_structures::fx::FxHashSet;
 
 /// Shapes prepared logical text without repeating whitespace or case conversion.
 /// The renderer supplies native run geometry when available; per-character
@@ -32,11 +33,10 @@ pub fn shape_document(
     profile_scope!("shape.document");
     #[cfg(feature = "profiling")]
     let font_setup_scope = scope("shape.font_setup");
-    let mut box_family: Vec<Option<String>> = vec![None; layout_tree.box_count()];
     let mut boxes_with_conditional_hyphens = vec![false; layout_tree.box_count()];
-    for (box_idx, range) in text_runs(inline_content) {
-        boxes_with_conditional_hyphens[box_idx] = range.clone().any(|glyph_idx| {
-            inline_content.character_at(glyph_idx as usize) == Some('\u{00ad}' as GlyphId)
+    for run in inline_content.text_runs().filter(|run| !run.glyphs.is_empty()) {
+        boxes_with_conditional_hyphens[run.box_idx as usize] |= run.glyphs.clone().any(|glyph_idx| {
+            inline_content.character_at(glyph_idx as usize) == Some('\u{00ad}')
         });
     }
     let mut ellipsis_boxes = Vec::new();
@@ -44,7 +44,7 @@ pub fn shape_document(
     let empty_inline_metrics_required = inline_content.inline_items().iter().any(|item| matches!(item.kind, InlineItemKind::InlineBoundary { inline_start, inline_end } if inline_start == inline_end));
     let mut dense_box_metrics_required = empty_inline_metrics_required;
     let mut font_content_extents_required = vec![false; layout_tree.box_count()];
-    for (idx, family) in box_family.iter_mut().enumerate() {
+    for idx in 0..layout_tree.box_count() {
         let style = get_style(styles, layout_tree, idx);
         let paints_inline_content_box = matches!(
             layout_tree
@@ -79,9 +79,6 @@ pub fn shape_document(
         dense_box_metrics_required |= style.requires_font_metrics();
         font_content_extents_required[idx] =
             !style.text_decoration_lines().is_empty() || paints_inline_content_box;
-        if let Some(family_idx) = style.font_family() {
-            *family = styles.string(family_idx).map(str::to_owned);
-        }
         if style.text_overflow() == TextOverflow::Ellipsis && style.overflow_x().clips() {
             ellipsis_boxes.push(idx);
         }
@@ -102,8 +99,7 @@ pub fn shape_document(
         .filter_map(|(box_idx, required)| required.then_some(box_idx))
         .collect::<Vec<_>>();
     for box_idx in extent_boxes {
-        let mut current = layout_tree.get_box_parent(box_idx);
-        while let Some(parent_idx) = current {
+        for parent_idx in layout_tree.ancestors(box_idx) {
             font_content_extents_required[parent_idx] = true;
             if !matches!(
                 layout_tree.get_box_layout_mode(parent_idx),
@@ -111,7 +107,6 @@ pub fn shape_document(
             ) {
                 break;
             }
-            current = layout_tree.get_box_parent(parent_idx);
         }
     }
 
@@ -120,39 +115,41 @@ pub fn shape_document(
     #[cfg(feature = "profiling")]
     let font_metrics_scope = scope("shape.font_metrics");
     let mut font_metric_cache = FxHashMap::<
-        (u32, u16, FontSlant, Option<String>, Option<LanguageId>),
+        (u32, u16, FontSlant, Option<&str>, Option<LanguageId>),
         FontRelativeMetrics,
     >::default();
+    let mut resolve_font_metrics = |style: StyleView<'_>| {
+        let family = style.font_family().and_then(|id| styles.string(id));
+        let key = (
+            style.font_size().to_bits(),
+            style.font_weight(),
+            style.font_style().into(),
+            family,
+            style.language(),
+        );
+        if let Some(metrics) = font_metric_cache.get(&key).copied() {
+            return Ok::<_, ShapeError>(metrics);
+        }
+        let metrics = if let Some(request) = FontMetricsRequest::new(
+            style.font_size(),
+            style.font_weight(),
+            style.font_style().into(),
+            family,
+        ) {
+            glyph_shaper.font_relative_metrics(
+                request.with_language(style.language().and_then(|id| styles.language(id))),
+            )?
+        } else {
+            FontRelativeMetrics::fallback()
+        };
+        font_metric_cache.insert(key, metrics);
+        Ok(metrics)
+    };
     let box_metrics = if dense_box_metrics_required {
         let mut metrics = Vec::with_capacity(layout_tree.box_count());
-        for (box_idx, family) in box_family.iter().enumerate() {
+        for box_idx in 0..layout_tree.box_count() {
             let style = get_style(styles, layout_tree, box_idx);
-            let key = (
-                style.font_size().to_bits(),
-                style.font_weight(),
-                style.font_style().into(),
-                family.clone(),
-                style.language(),
-            );
-            let font_metrics = if let Some(metrics) = font_metric_cache.get(&key).copied() {
-                metrics
-            } else {
-                let metrics = if let Some(request) = FontMetricsRequest::new(
-                    style.font_size(),
-                    style.font_weight(),
-                    style.font_style().into(),
-                    family.as_deref(),
-                ) {
-                    glyph_shaper.font_relative_metrics(
-                        request.with_language(style.language().and_then(|id| styles.language(id))),
-                    )?
-                } else {
-                    FontRelativeMetrics::fallback()
-                };
-                font_metric_cache.insert(key, metrics);
-                metrics
-            };
-            metrics.push(font_metrics);
+            metrics.push(resolve_font_metrics(style)?);
         }
         BoxFontMetrics::Dense(metrics)
     } else if font_content_extents_required
@@ -161,37 +158,11 @@ pub fn shape_document(
     {
         let mut metric_ids = vec![0; layout_tree.box_count()];
         let mut distinct_metrics = Vec::<FontRelativeMetrics>::new();
-        for (box_idx, family) in box_family
-            .iter()
-            .enumerate()
-            .filter(|(box_idx, _)| font_content_extents_required[*box_idx])
+        for box_idx in (0..layout_tree.box_count())
+            .filter(|&box_idx| font_content_extents_required[box_idx])
         {
             let style = get_style(styles, layout_tree, box_idx);
-            let key = (
-                style.font_size().to_bits(),
-                style.font_weight(),
-                style.font_style().into(),
-                family.clone(),
-                style.language(),
-            );
-            let font_metrics = if let Some(metrics) = font_metric_cache.get(&key).copied() {
-                metrics
-            } else {
-                let metrics = if let Some(request) = FontMetricsRequest::new(
-                    style.font_size(),
-                    style.font_weight(),
-                    style.font_style().into(),
-                    family.as_deref(),
-                ) {
-                    glyph_shaper.font_relative_metrics(
-                        request.with_language(style.language().and_then(|id| styles.language(id))),
-                    )?
-                } else {
-                    FontRelativeMetrics::fallback()
-                };
-                font_metric_cache.insert(key, metrics);
-                metrics
-            };
+            let font_metrics = resolve_font_metrics(style)?;
             let metric_idx = distinct_metrics
                 .iter()
                 .position(|metrics| *metrics == font_metrics)
@@ -210,23 +181,13 @@ pub fn shape_document(
         BoxFontMetrics::NotRequired
     };
 
-    // Table columns are style-bearing CSS boxes but do not generate layout
-    // boxes. Resolve metrics for their opaque style handles here so layout
-    // never needs to inspect an unresolved computed width.
-    let mut non_box_styles = Vec::new();
-    for box_idx in 0..layout_tree.box_count() {
-        let Some(LayoutMode::Table(table)) = layout_tree
-            .box_at(box_idx)
-            .map(|layout_box| layout_box.layout_mode())
-        else {
-            continue;
-        };
-        for hint in &table.column_width_hints {
-            if !non_box_styles.contains(&hint.style) {
-                non_box_styles.push(hint.style);
-            }
-        }
-    }
+    // Text pseudo styles and table columns do not necessarily have their own
+    // formatting box. Resolve their metrics before layout consumes used values.
+    let mut seen_styles = FxHashSet::default();
+    let non_box_styles = styles.text_pseudo_styles()
+        .chain(layout_tree.non_box_styles())
+        .filter(|&style| seen_styles.insert(style))
+        .collect::<Vec<_>>();
     let non_box_metrics_required = non_box_styles.iter().copied().any(|indices| {
         styles
             .view(indices)
@@ -237,35 +198,7 @@ pub fn shape_document(
         let mut metrics = FxHashMap::default();
         for indices in non_box_styles {
             let style = styles.view(indices).expect("validated style handle");
-            let family = style
-                .font_family()
-                .and_then(|family_idx| styles.string(family_idx));
-            let key = (
-                style.font_size().to_bits(),
-                style.font_weight(),
-                style.font_style().into(),
-                family.map(str::to_owned),
-                style.language(),
-            );
-            let font_metrics = if let Some(metrics) = font_metric_cache.get(&key).copied() {
-                metrics
-            } else {
-                let metrics = if let Some(request) = FontMetricsRequest::new(
-                    style.font_size(),
-                    style.font_weight(),
-                    style.font_style().into(),
-                    family,
-                ) {
-                    glyph_shaper.font_relative_metrics(
-                        request.with_language(style.language().and_then(|id| styles.language(id))),
-                    )?
-                } else {
-                    FontRelativeMetrics::fallback()
-                };
-                font_metric_cache.insert(key, metrics);
-                metrics
-            };
-            metrics.insert(indices, font_metrics);
+            metrics.insert(indices, resolve_font_metrics(style)?);
         }
         RequiredFontMetrics::Required(metrics)
     } else {
@@ -292,14 +225,9 @@ pub fn shape_document(
                     metrics.cap_height_ratio(),
                 )
                 .unwrap_or_else(|| style.font_size());
-            let line_height = if style.line_height_is_normal() {
-                font_size * 1.2
-            } else {
-                style
-                    .resolved_line_height(metrics.x_height_ratio())
-                    .unwrap_or_else(|| style.line_height())
-                    .max(0.0)
-            };
+            let line_height = style
+                .used_line_height(font_size, metrics.x_height_ratio())
+                .expect("shaping provides validated font metrics") as f32;
             (
                 font_size * metrics.ch_advance_ratio(),
                 font_size * metrics.cap_height_ratio(),
@@ -327,6 +255,7 @@ pub fn shape_document(
         ResolvedBidi::new(styles, layout_tree, inline_content)
     );
     let mut source_indices = Vec::<u32>::new();
+    let mut scattered_characters = Vec::new();
     let spans = profile!(
         "shape.plan_spans",
         plan_shaping_spans(
@@ -345,59 +274,31 @@ pub fn shape_document(
         source_indices.extend(span.character_indices());
         debug_assert_eq!(source_indices.len(), span.character_count());
         let contiguous_range = span.contiguous_range();
-        let style_override = span.style_override;
-        let style = style_override
-            .and_then(|indices| styles.view(indices))
-            .unwrap_or_else(|| get_style(styles, layout_tree, box_idx));
+        let style = span.style(styles, layout_tree);
         let font_size = font_metrics.resolved_font_size(style, box_idx);
-        let font_weight = style.font_weight();
-        let font_style = style.font_style();
-        let color = style.color();
-        let family = style
-            .font_family()
-            .and_then(|family_idx| styles.string(family_idx));
         let font_features = style.open_type_features();
 
-        let mut normalized_text = String::new();
-        let mut normalized_characters = Vec::with_capacity(source_indices.len());
-        for &i in &source_indices {
-            let character = char::from_u32(
-                inline_content
-                    .character_at(i as usize)
-                    .unwrap_or('?' as GlyphId),
-            )
-            .unwrap_or('?');
+        // Out-of-flow descendants can interleave source indices. Gather those
+        // spans in reusable scratch; ordinary spans borrow prepared characters.
+        let characters: &[char] = if let Some(range) = &contiguous_range {
+            &inline_content.characters()[range.start as usize..range.end as usize]
+        } else {
+            scattered_characters.clear();
+            scattered_characters.extend(source_indices.iter().map(|&index| {
+                inline_content.character_at(index as usize).unwrap_or('?')
+            }));
+            &scattered_characters
+        };
+        let normalized_text = characters.iter().collect::<String>();
 
-            normalized_text.push(character);
-            normalized_characters.push(character);
-        }
-
-        let style_span = TextStyleSpan::new(
-            0..normalized_text.len(),
+        let style_span = shaping_style_span(
+            styles,
+            style,
             font_size,
-            font_weight,
-            font_style.into(),
-            color,
-            family,
-        )
-        .map(|span| {
-            span.with_font_features(&font_features)
-                .with_cjk_font_family(
-                    style
-                        .cjk_font_family()
-                        .and_then(|family| styles.string(family)),
-                )
-                .with_language(
-                    style
-                        .language()
-                        .and_then(|language| styles.language(language)),
-                )
-                .with_direction(if bidi_level % 2 == 1 {
-                    TextDirection::Rtl
-                } else {
-                    TextDirection::Ltr
-                })
-        });
+            normalized_text.len(),
+            &font_features,
+            bidi_level,
+        );
         let paint_colors = span.paint_colors(styles, layout_tree);
         let mut scattered_glyphs = contiguous_range.is_none().then(|| {
             source_indices
@@ -405,7 +306,7 @@ pub fn shape_document(
                 .map(|&index| {
                     inline_content
                         .character_at(index as usize)
-                        .unwrap_or_default()
+                        .unwrap_or_default() as GlyphId
                 })
                 .collect::<Vec<_>>()
         });
@@ -413,9 +314,12 @@ pub fn shape_document(
         drop(span_buffers_scope);
         let native_geometry = profile!(
             "shape.backend_and_validation",
-            if let Some(request) = style_span
+            if let Some(request) = style_span.clone()
                 .and_then(|style| TextRunShapeRequest::new(&normalized_text, style))
-                .and_then(|request| request.with_paint_colors(&paint_colors))
+                .and_then(|request| match &paint_colors {
+                    Some(colors) => request.with_paint_colors(colors),
+                    None => Some(request),
+                })
             {
                 let run_glyphs = if let Some(range) = &contiguous_range {
                     &mut glyphs[range.start as usize..range.end as usize]
@@ -425,24 +329,12 @@ pub fn shape_document(
                         .expect("discontiguous shaping buffer")
                         .as_mut_slice()
                 };
-                let geometry = if normalized_characters.contains(&'\n') {
+                let geometry = if characters.contains(&'\n') {
                     // Segment breaks terminate shaping runs. Asking a backend to
                     // shape text and a newline together can change the preceding
                     // line's ascent/baseline (and is invalid for several native
                     // shaping APIs), so register these glyphs independently.
-                    for (glyph, &character) in run_glyphs.iter_mut().zip(&normalized_characters) {
-                        *glyph = resources.shape_glyph(
-                            glyph_shaper,
-                            GlyphRequest {
-                                character,
-                                font_size,
-                                font_weight,
-                                font_slant: font_style.into(),
-                                color,
-                                font_family: family,
-                            },
-                        )?;
-                    }
+                    resources.shape_characters(glyph_shaper, &request, run_glyphs)?;
                     None
                 } else {
                     glyph_shaper.shape_glyph_run(request, run_glyphs, resources)?
@@ -467,59 +359,23 @@ pub fn shape_document(
                 glyphs[index as usize] = glyph;
             }
         }
-        let mut geometry = native_geometry
-            .filter(|geometry| geometry.advances().len() == normalized_characters.len())
-            .map(|mut geometry| {
-                geometry.preserve_graphemes(&normalized_text);
-                geometry
-            })
-            .unwrap_or_else(|| {
-                let advances = source_indices
-                    .iter()
-                    .map(|&index| {
-                        let glyph = glyphs[index as usize];
-                        resources
-                            .get(glyph)
-                            .expect("registered glyph metric")
-                            .advance()
-                    })
-                    .collect::<Arc<[f32]>>();
-                // These exact boundaries are retained by the fallback run;
-                // only native cluster geometry needs the intersection above.
-                ShapedTextRun::new(
-                    advances,
-                    grapheme_boundaries(&normalized_text, normalized_characters.len()),
-                )
-                .expect("validated glyph metrics")
-            });
-        // U+00AD is conditional ink. Only copy the advance array when this run
-        // actually contains a soft hyphen; ordinary runs remain shared.
-        suppress_conditional_advances(&mut geometry, &normalized_characters);
-        if bidi_level % 2 == 1 {
-            for (&index, &character) in source_indices.iter().zip(&normalized_characters) {
-                if let Some(mirrored) = unicode_bidi_mirroring::get_mirrored(character) {
-                    let family = style
-                        .cjk_font_family()
-                        .filter(|_| is_cjk_character(mirrored))
-                        .and_then(|id| styles.string(id))
-                        .or(family);
-                    let glyph = resources.shape_glyph(
-                        glyph_shaper,
-                        GlyphRequest {
-                            character: mirrored,
-                            font_size,
-                            font_weight,
-                            font_slant: font_style.into(),
-                            color,
-                            font_family: family,
-                        },
-                    )?;
-                    if !resources.contains(glyph) {
-                        return Err(ShapeError::unregistered_glyph_id(glyph, resources.len()));
-                    }
-                    text_geometry.mirrored_glyphs.insert(index, glyph);
-                }
-            }
+        let geometry = resolve_run_geometry(
+            native_geometry,
+            &normalized_text,
+            characters,
+            source_indices.iter().map(|&index| glyphs[index as usize]),
+            resources,
+        );
+        if bidi_level % 2 == 1
+            && let Some(style_span) = &style_span
+        {
+            shape_mirrored_glyphs(
+                source_indices.iter().copied().zip(characters.iter().copied()),
+                style_span,
+                &mut text_geometry,
+                glyph_shaper,
+                resources,
+            )?;
         }
         #[cfg(feature = "profiling")]
         drop(geometry_scope);
@@ -542,48 +398,27 @@ pub fn shape_document(
     #[cfg(feature = "profiling")]
     let synthetic_scope = scope("shape.synthetic_glyphs");
     let mut ellipsis_glyphs = FxHashMap::default();
-    for box_idx in ellipsis_boxes {
-        let style = get_style(styles, layout_tree, box_idx);
-        let family = box_family[box_idx].as_deref();
-        let font_size = font_metrics.resolved_font_size(style, box_idx);
-        let glyph = resources.shape_glyph(
-            glyph_shaper,
-            GlyphRequest {
-                character: '\u{2026}',
-                font_size,
-                font_weight: style.font_weight(),
-                font_slant: style.font_style().into(),
-                color: style.color(),
-                font_family: family,
-            },
-        )?;
-        if !resources.contains(glyph) {
-            return Err(ShapeError::unregistered_glyph_id(glyph, resources.len()));
-        }
-        ellipsis_glyphs.insert(box_idx as u32, glyph);
-    }
     // Automatic hyphens are synthetic paint artifacts, just like ellipses:
     // shape them once per applicable style without assigning DOM positions.
     let mut hyphen_glyphs = FxHashMap::default();
-    for box_idx in hyphen_boxes {
-        let style = get_style(styles, layout_tree, box_idx);
-        let family = box_family[box_idx].as_deref();
-        let font_size = font_metrics.resolved_font_size(style, box_idx);
-        let glyph = resources.shape_glyph(
-            glyph_shaper,
-            GlyphRequest {
-                character: '\u{2010}',
-                font_size,
-                font_weight: style.font_weight(),
-                font_slant: style.font_style().into(),
-                color: style.color(),
-                font_family: family,
-            },
-        )?;
-        if !resources.contains(glyph) {
-            return Err(ShapeError::unregistered_glyph_id(glyph, resources.len()));
+    for (character, boxes, output) in [
+        ('\u{2026}', ellipsis_boxes, &mut ellipsis_glyphs),
+        ('\u{2010}', hyphen_boxes, &mut hyphen_glyphs),
+    ] {
+        for box_idx in boxes {
+            let style = get_style(styles, layout_tree, box_idx);
+            let glyph = resources.shape_glyph(
+                glyph_shaper,
+                GlyphRequest {
+                    character,
+                    font_size: font_metrics.resolved_font_size(style, box_idx),
+                    font_weight: style.font_weight(),
+                    font_slant: style.font_style().into(),
+                    font_family: style.font_family().and_then(|id| styles.string(id)),
+                },
+            )?;
+            output.insert(box_idx as u32, glyph);
         }
-        hyphen_glyphs.insert(box_idx as u32, glyph);
     }
 
     #[cfg(feature = "profiling")]
@@ -591,14 +426,94 @@ pub fn shape_document(
     Ok((ellipsis_glyphs, hyphen_glyphs, text_geometry, font_metrics))
 }
 
-/// Detach the shared advances once, only when a conditional character occurs.
-fn suppress_conditional_advances(geometry: &mut ShapedTextRun, characters: &[char]) {
+fn shaping_style_span<'a>(
+    styles: &'a ComputedStyles,
+    style: StyleView<'_>,
+    font_size: f32,
+    text_len: usize,
+    font_features: &'a [OpenTypeFeature],
+    bidi_level: u8,
+) -> Option<TextStyleSpan<'a>> {
+    TextStyleSpan::new(
+        0..text_len,
+        font_size,
+        style.font_weight(),
+        style.font_style().into(),
+        style.color(),
+        style.font_family().and_then(|id| styles.string(id)),
+    )
+    .map(|span| {
+        span.with_font_features(font_features)
+            .with_cjk_font_family(style.cjk_font_family().and_then(|id| styles.string(id)))
+            .with_language(style.language().and_then(|id| styles.language(id)))
+            .with_direction(if bidi_level % 2 == 1 {
+                TextDirection::Rtl
+            } else {
+                TextDirection::Ltr
+            })
+    })
+}
+
+fn shape_mirrored_glyphs(
+    characters: impl Iterator<Item = (u32, char)>,
+    style: &TextStyleSpan<'_>,
+    geometry: &mut ShapedTextGeometry,
+    glyph_shaper: &mut impl GlyphShaper,
+    resources: &mut GlyphResourceStore,
+) -> Result<(), ShapeError> {
+    for (index, character) in characters {
+        let Some(mirrored) = unicode_bidi_mirroring::get_mirrored(character) else {
+            continue;
+        };
+        let glyph = resources.shape_glyph(
+            glyph_shaper,
+            GlyphRequest {
+                character: mirrored,
+                font_size: style.font_size(),
+                font_weight: style.font_weight(),
+                font_slant: style.font_slant(),
+                font_family: style.font_family_for_character(mirrored),
+            },
+        )?;
+        geometry.mirrored_glyphs.insert(index, glyph);
+    }
+    Ok(())
+}
+
+/// Retain valid native geometry or derive a fallback from registered metrics.
+/// Both paths preserve Unicode graphemes and suppress conditional advances.
+fn resolve_run_geometry(
+    native: Option<ShapedTextRun>,
+    text: &str,
+    characters: &[char],
+    glyphs: impl Iterator<Item = GlyphId>,
+    resources: &GlyphResourceStore,
+) -> ShapedTextRun {
+    let mut geometry = native
+        .filter(|geometry| geometry.advances().len() == characters.len())
+        .map(|mut geometry| {
+            geometry.preserve_graphemes(text);
+            geometry
+        })
+        .unwrap_or_else(|| {
+            let advances = glyphs
+                .map(|glyph| {
+                    resources
+                        .get(glyph)
+                        .expect("registered glyph metric")
+                        .advance()
+                })
+                .collect::<Arc<[f32]>>();
+            // Fallback boundaries are already canonical; only native geometry
+            // needs its cluster boundaries intersected with Unicode graphemes.
+            ShapedTextRun::new(advances, grapheme_boundaries(text, characters.len()))
+                .expect("validated glyph metrics")
+        });
+    // Detach the shared advances once, only when a suppressed character occurs.
     let mut offsets = characters
         .iter()
         .enumerate()
-        .filter_map(|(offset, &character)| {
-            (character == '\u{00ad}' || is_bidi_control(character)).then_some(offset)
-        });
+        .filter_map(|(offset, &character)| suppresses_glyph(character).then_some(offset));
     if let Some(first) = offsets.next() {
         let advances = Arc::make_mut(&mut geometry.advances);
         advances[first] = 0.0;
@@ -606,6 +521,7 @@ fn suppress_conditional_advances(geometry: &mut ShapedTextRun, characters: &[cha
             advances[offset] = 0.0;
         }
     }
+    geometry
 }
 
 /// Re-shape one normalized source range with a dynamically selected pseudo
@@ -625,26 +541,20 @@ pub fn reshape_range_with_style(
     glyph_shaper: &mut impl GlyphShaper,
     resources: &mut GlyphResourceStore,
 ) -> Result<(), ShapeError> {
-    let mut start = range.start;
-    while start < range.end {
-        let level = bidi.level(start);
-        let end = (start + 1..range.end)
-            .find(|&index| bidi.level(index) != level)
-            .unwrap_or(range.end);
+    for (range, level) in bidi.level_runs(range) {
         reshape_directional_range(
             styles,
             inline_content,
             glyphs,
             glyph_start,
-            bidi,
+            level,
             text_geometry,
-            start..end,
+            range,
             style_indices,
             base_style_indices,
             glyph_shaper,
             resources,
         )?;
-        start = end;
     }
     Ok(())
 }
@@ -654,7 +564,7 @@ fn reshape_directional_range(
     inline_content: &InlineContent,
     glyphs: &mut [GlyphId],
     glyph_start: u32,
-    bidi: &ResolvedBidi,
+    level: u8,
     text_geometry: &mut ShapedTextGeometry,
     range: Range<u32>,
     style_indices: StyleIndices,
@@ -662,78 +572,31 @@ fn reshape_directional_range(
     glyph_shaper: &mut impl GlyphShaper,
     resources: &mut GlyphResourceStore,
 ) -> Result<(), ShapeError> {
-    if range.start >= range.end {
-        return Ok(());
-    }
-    let level = bidi.level(range.start);
     let style = styles
         .view(style_indices)
         .expect("validated pseudo style handle");
     let base_style = styles
         .view(base_style_indices)
         .expect("validated originating style handle");
-    let characters = range
-        .clone()
-        .map(|index| {
-            inline_content
-                .character_at(index as usize)
-                .and_then(char::from_u32)
-                .expect("prepared Unicode scalar")
-        })
-        .collect::<Vec<_>>();
+    let characters = &inline_content.characters()[range.start as usize..range.end as usize];
     let text = characters.iter().collect::<String>();
     // Inline token construction still contributes the originating run's CSS
     // spacing. Put only the pseudo/base delta into authoritative geometry so
     // the final total is the computed `::first-line` spacing.
     let letter_spacing_delta = style.letter_spacing() - base_style.letter_spacing();
     let word_spacing_delta = style.word_spacing() - base_style.word_spacing();
-    let spacing_deltas = characters
-        .iter()
-        .map(|character| {
-            if is_bidi_control(*character) {
-                return 0.0;
-            }
-            letter_spacing_delta
-                + if *character == ' ' {
-                    word_spacing_delta
-                } else {
-                    0.0
-                }
-        })
-        .collect::<Vec<_>>();
-    let family = style
-        .font_family()
-        .and_then(|family_idx| styles.string(family_idx));
     let font_features = style.open_type_features();
-    let Some(span) = TextStyleSpan::new(
-        0..text.len(),
+    let Some(span) = shaping_style_span(
+        styles,
+        style,
         style.font_size(),
-        style.font_weight(),
-        style.font_style().into(),
-        style.color(),
-        family,
-    )
-    .map(|span| {
-        span.with_font_features(&font_features)
-            .with_cjk_font_family(
-                style
-                    .cjk_font_family()
-                    .and_then(|family| styles.string(family)),
-            )
-            .with_language(
-                style
-                    .language()
-                    .and_then(|language| styles.language(language)),
-            )
-            .with_direction(if level % 2 == 1 {
-                TextDirection::Rtl
-            } else {
-                TextDirection::Ltr
-            })
-    }) else {
+        text.len(),
+        &font_features,
+        level,
+    ) else {
         return Ok(());
     };
-    let Some(request) = TextRunShapeRequest::new(&text, span) else {
+    let Some(request) = TextRunShapeRequest::new(&text, span.clone()) else {
         return Ok(());
     };
     let start = (range.start - glyph_start) as usize;
@@ -745,54 +608,36 @@ fn reshape_directional_range(
         }
     }
 
-    let mut geometry = native
-        .filter(|geometry| geometry.advances().len() == characters.len())
-        .map(|mut geometry| {
-            geometry.preserve_graphemes(&text);
-            geometry
-        })
-        .unwrap_or_else(|| {
-            let advances = glyphs[start..end]
-                .iter()
-                .map(|&glyph| {
-                    resources
-                        .get(glyph)
-                        .expect("registered pseudo glyph")
-                        .advance()
-                })
-                .collect::<Arc<[f32]>>();
-            // Reuse these boundaries throughout pseudo-style layout as well.
-            ShapedTextRun::new(advances, grapheme_boundaries(&text, characters.len()))
-                .expect("validated pseudo metrics")
-        });
-    suppress_conditional_advances(&mut geometry, &characters);
+    let mut geometry = resolve_run_geometry(
+        native,
+        &text,
+        characters,
+        glyphs[start..end].iter().copied(),
+        resources,
+    );
     if level % 2 == 1 {
-        for (index, &character) in range.clone().zip(&characters) {
-            if let Some(mirrored) = unicode_bidi_mirroring::get_mirrored(character) {
-                let family = style
-                    .cjk_font_family()
-                    .filter(|_| is_cjk_character(mirrored))
-                    .and_then(|id| styles.string(id))
-                    .or(family);
-                let glyph = resources.shape_glyph(
-                    glyph_shaper,
-                    GlyphRequest {
-                        character: mirrored,
-                        font_size: style.font_size(),
-                        font_weight: style.font_weight(),
-                        font_slant: style.font_style().into(),
-                        color: style.color(),
-                        font_family: family,
-                    },
-                )?;
-                if !resources.contains(glyph) {
-                    return Err(ShapeError::unregistered_glyph_id(glyph, resources.len()));
-                }
-                text_geometry.mirrored_glyphs.insert(index, glyph);
-            }
-        }
+        shape_mirrored_glyphs(
+            range.clone().zip(characters.iter().copied()),
+            &span,
+            text_geometry,
+            glyph_shaper,
+            resources,
+        )?;
     }
-    geometry.apply_spacing(&spacing_deltas, level % 2 == 1);
+    if letter_spacing_delta != 0.0 || word_spacing_delta != 0.0 {
+        let spacing_deltas = characters.iter().map(|character| {
+            if suppresses_glyph(*character) {
+                return 0.0;
+            }
+            letter_spacing_delta
+                + if *character == ' ' {
+                    word_spacing_delta
+                } else {
+                    0.0
+                }
+        });
+        geometry.apply_spacing_iter(spacing_deltas, level % 2 == 1);
+    }
     text_geometry.replace_range(
         range,
         geometry,

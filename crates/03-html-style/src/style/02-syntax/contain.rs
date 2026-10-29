@@ -1,6 +1,6 @@
-use lightningcss::properties::custom::{Token, TokenList, TokenOrValue};
-use lightningcss::stylesheet::ParserOptions;
-use lightningcss::traits::ParseWithOptions;
+use super::value::{significant_tokens, token_ident};
+use cssparser::match_ignore_ascii_case;
+use lightningcss::properties::custom::TokenList;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ParsedContain {
@@ -8,108 +8,93 @@ pub(crate) struct ParsedContain {
     pub(crate) fully_supported: bool,
 }
 
-pub(crate) fn parse(value: &str) -> Option<ParsedContain> {
-    let tokens = TokenList::parse_string_with_options(value, ParserOptions::default()).ok()?;
-    parse_tokens(&tokens)
-}
-
 pub(crate) fn parse_tokens(tokens: &TokenList<'_>) -> Option<ParsedContain> {
-    let keywords = tokens
-        .0
-        .iter()
-        .filter(|token| {
-            !matches!(
-                token,
-                TokenOrValue::Token(Token::WhiteSpace(_) | Token::Comment(_))
-            )
-        })
-        .map(|token| match token {
-            TokenOrValue::Token(Token::Ident(value)) => Some(value.as_ref().to_ascii_lowercase()),
-            _ => None,
-        })
-        .collect::<Option<Vec<_>>>()?;
-
-    match keywords.as_slice() {
-        [value] if value == "none" => Some(ParsedContain {
-            size: false,
-            fully_supported: true,
-        }),
-        [value] if value == "strict" => Some(ParsedContain {
-            size: true,
-            fully_supported: false,
-        }),
-        [value] if value == "content" => Some(ParsedContain {
-            size: false,
-            fully_supported: false,
-        }),
-        [] => None,
-        values => {
-            let mut size = false;
-            let mut inline_size = false;
-            let mut layout = false;
-            let mut style = false;
-            let mut paint = false;
-            for value in values {
-                let seen = match value.as_str() {
-                    "size" => &mut size,
-                    "inline-size" => &mut inline_size,
-                    "layout" => &mut layout,
-                    "style" => &mut style,
-                    "paint" => &mut paint,
-                    _ => return None,
-                };
-                if *seen {
-                    return None;
-                }
-                *seen = true;
-            }
-            if size && inline_size {
-                return None;
-            }
-            Some(ParsedContain {
-                size,
-                fully_supported: size && !inline_size && !layout && !style && !paint,
-            })
+    let mut keywords = significant_tokens(tokens);
+    let mut seen = 0u8;
+    while let Some(token) = keywords.next() {
+        let keyword = token_ident(token)?;
+        let bit = match_ignore_ascii_case! { keyword,
+            "none" | "strict" | "content" => return (seen == 0 && keywords.next().is_none())
+                .then_some(ParsedContain {
+                    size: keyword.eq_ignore_ascii_case("strict"),
+                    fully_supported: keyword.eq_ignore_ascii_case("none"),
+                }),
+            "size" => 1,
+            "inline-size" => 2,
+            "layout" => 4,
+            "style" => 8,
+            "paint" => 16,
+            _ => return None,
+        };
+        if seen & bit != 0 {
+            return None;
         }
+        seen |= bit;
     }
+    let size = seen & 1 != 0;
+    let inline_size = seen & 2 != 0;
+    (seen != 0 && !(size && inline_size)).then_some(ParsedContain {
+        size,
+        fully_supported: seen == 1,
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ParsedContain, parse};
+    use super::{ParsedContain, parse_tokens};
+    use crate::allocation_test_support::count_allocations;
+    use lightningcss::properties::custom::TokenList;
+    use lightningcss::stylesheet::ParserOptions;
+    use lightningcss::traits::ParseWithOptions;
+    fn parse(value: &str) -> Option<ParsedContain> {
+        let tokens = TokenList::parse_string_with_options(value, ParserOptions::default()).ok()?;
+        let (parsed, allocations) = count_allocations(|| parse_tokens(&tokens));
+        assert_eq!(allocations, 0, "{value}");
+        parsed
+    }
 
     #[test]
-    fn validates_the_contain_grammar_and_reports_the_supported_size_subset() {
-        assert_eq!(
-            parse("none"),
-            Some(ParsedContain {
-                size: false,
-                fully_supported: true
-            })
-        );
-        assert_eq!(
-            parse("size"),
-            Some(ParsedContain {
-                size: true,
-                fully_supported: true
-            })
-        );
-        assert_eq!(
-            parse("layout size"),
-            Some(ParsedContain {
-                size: true,
-                fully_supported: false
-            })
-        );
-        assert_eq!(
-            parse("strict"),
-            Some(ParsedContain {
-                size: true,
-                fully_supported: false
-            })
-        );
-        assert!(parse("size inline-size").is_none());
-        assert!(parse("layout layout").is_none());
-        assert!(parse("strict layout").is_none());
+    fn converts_containment_keywords_and_support_metadata_without_allocating() {
+        for (value, size, fully_supported) in [
+            ("none", false, true),
+            ("NoNe", false, true),
+            ("size", true, true),
+            ("\\73ize", true, true),
+            ("layout size", true, false),
+            ("SiZe /**/ LaYoUt StYlE PaInT", true, false),
+            ("inline-size layout style paint", false, false),
+            ("strict", true, false),
+            ("StRiCt", true, false),
+            ("content", false, false),
+        ] {
+            assert_eq!(
+                parse(value),
+                Some(ParsedContain {
+                    size,
+                    fully_supported
+                }),
+                "{value}"
+            );
+        }
+        for value in [
+            "",
+            "size inline-size",
+            "inline-size size",
+            "size size",
+            "inline-size inline-size",
+            "layout layout",
+            "style style",
+            "paint paint",
+            "strict layout",
+            "layout strict",
+            "none size",
+            "size none",
+            "content paint",
+            "paint content",
+            "size 1",
+            "sıze",
+        ] {
+            assert!(parse(value).is_none(), "{value}");
+        }
     }
 }

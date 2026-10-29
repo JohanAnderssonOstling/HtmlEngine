@@ -46,38 +46,25 @@ struct TokenArenas {
 }
 
 impl TokenArenas {
-    fn store(&mut self, previous: PlanRanges, tokens: &InlineTokens<'_>) -> PlanRanges {
-        self.store_changes(previous, tokens, [true; 4])
-    }
-
-    fn store_changes(
+    fn store(
         &mut self,
         previous: PlanRanges,
         tokens: &InlineTokens<'_>,
-        changed: [bool; 4],
+        changed_only: bool,
     ) -> PlanRanges {
         PlanRanges {
-            dense: if changed[0] {
-                self.dense.store(previous.dense, &tokens.dense)
-            } else {
-                previous.dense
-            },
-            runs: if changed[1] {
-                self.runs.store(previous.runs, &tokens.runs)
-            } else {
-                previous.runs
-            },
-            summaries: if changed[2] {
-                self.summaries
-                    .store(previous.summaries, &tokens.summary_blocks)
-            } else {
-                previous.summaries
-            },
-            replaced: if changed[3] {
-                self.replaced.store(previous.replaced, &tokens.replaced)
-            } else {
-                previous.replaced
-            },
+            dense: self
+                .dense
+                .store(previous.dense, &tokens.dense, changed_only),
+            runs: self.runs.store(previous.runs, &tokens.runs, changed_only),
+            summaries: self.summaries.store(
+                previous.summaries,
+                &tokens.summary_blocks,
+                changed_only,
+            ),
+            replaced: self
+                .replaced
+                .store(previous.replaced, &tokens.replaced, changed_only),
         }
     }
 
@@ -121,7 +108,7 @@ impl GenerationPlans {
         let ranges = previous
             .map(|index| self.entries[index].ranges)
             .unwrap_or_default();
-        let stored = self.arenas.store(ranges, tokens);
+        let stored = self.arenas.store(ranges, tokens, false);
         self.needs_compaction |= previous.is_some() && stored != ranges;
         let plan = PreparedInlinePlan {
             key,
@@ -163,7 +150,7 @@ impl GenerationPlans {
                     return false;
                 }
                 let tokens = self.arenas.view(plan.ranges);
-                plan.ranges = arenas.store(PlanRanges::default(), &tokens);
+                plan.ranges = arenas.store(PlanRanges::default(), &tokens, false);
                 true
             });
             self.arenas = arenas;
@@ -241,33 +228,20 @@ impl InlinePlanCache {
         if plan.key != key {
             return None;
         }
-        let (result, changed, mut working) = {
+        let (result, mut working) = {
             let mut tokens = self.active.arenas.view(plan.ranges);
             tokens.kp_plan = plan.kp_plan.take();
             let result = execute(&mut tokens);
-            let dense = tokens.dense.into_owned();
-            let runs = tokens.runs.into_owned();
-            let summaries = tokens.summary_blocks.into_owned();
-            let replaced = tokens.replaced.into_owned();
-            let changed = [
-                dense.is_some(),
-                runs.is_some(),
-                summaries.is_some(),
-                replaced.is_some(),
-            ];
             let working = InlineTokens {
-                dense: dense.unwrap_or_default().into(),
-                runs: runs.unwrap_or_default().into(),
-                summary_blocks: summaries.unwrap_or_default().into(),
-                replaced: replaced.unwrap_or_default().into(),
+                dense: tokens.dense.into_working(),
+                runs: tokens.runs.into_working(),
+                summary_blocks: tokens.summary_blocks.into_working(),
+                replaced: tokens.replaced.into_working(),
                 kp_plan: tokens.kp_plan,
             };
-            (result, changed, working)
+            (result, working)
         };
-        let stored = self
-            .active
-            .arenas
-            .store_changes(plan.ranges, &working, changed);
+        let stored = self.active.arenas.store(plan.ranges, &working, true);
         self.active.needs_compaction |= stored != plan.ranges;
         plan.ranges = stored;
         plan.kp_plan = working.kp_plan.take();
@@ -798,6 +772,46 @@ mod tests {
         cache
             .with_plan(key(2, false), |other| assert_eq!(other.runs[0].ascent, 8.0))
             .unwrap();
+    }
+
+    #[test]
+    fn emptying_a_cached_paragraph_preserves_its_neighbor() {
+        let mut cache = InlinePlanCache::default();
+        cache.begin_generation(InlinePlanGeneration::new());
+        insert(&mut cache, 1, 20);
+        insert(&mut cache, 2, 3);
+        cache.trim();
+        cache
+            .with_plan(key(1, false), |tokens| {
+                tokens.dense.clear();
+                tokens.runs.clear();
+                tokens.summary_blocks.clear();
+                tokens.replaced.clear();
+            })
+            .unwrap();
+        cache.trim();
+        cache
+            .with_plan(key(1, false), |empty| {
+                assert!(empty.dense.is_empty());
+                assert!(empty.runs.is_empty());
+                assert!(empty.summary_blocks.is_empty());
+                assert!(empty.replaced.is_empty());
+            })
+            .unwrap();
+        cache
+            .with_plan(key(2, false), |neighbor| {
+                assert_eq!(neighbor.dense.len(), 3);
+                assert_eq!(neighbor.dense[0].width(), 10.0);
+                assert_eq!(neighbor.runs[0].owner_box_idx, 2);
+            })
+            .unwrap();
+        assert_eq!(cache.active.arenas.dense.len(), 3);
+        assert_eq!(cache.active.arenas.runs.len(), 1);
+        assert_eq!(
+            cache.len(),
+            2,
+            "an empty cached paragraph remains available"
+        );
     }
 
     #[test]

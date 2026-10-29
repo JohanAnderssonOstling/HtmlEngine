@@ -1,0 +1,12 @@
+[workspace]
+resolver = "3"
+members = ["html-gpui", "html-fonts", "gpui-image-eviction"]
+exclude = ["examples/fragment-app"]
+
+[workspace.dependencies]
+html = { version = "0.1.0", package = "skrift", path = "../crates/html" }
+kurbo = "0.11.3"
+peniko = "0.2.0"
+blake3 = "1"
+reqwest = { version = "0.12.28", default-features = false, features = ["charset", "http2", "system-proxy"] }
+gpui = { path = "../../GPUI-Fork/crates/gpui", version = "=0.2.2", default-features = false }

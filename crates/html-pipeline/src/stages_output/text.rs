@@ -1,9 +1,25 @@
 //! Renderer-facing text, glyph, and line-layout queries.
 
 use super::*;
-use crate::layout_model::{LineDetails, LineTextFragment};
-use html_layout::LineTextPlacement;
-use html_style_model::TextDirection;
+use crate::layout_model::paint_program::PaintLayers;
+use crate::layout_model::{LineDetails, LineId, LineOutput, LineTextFragment, LineTextPlacement};
+use html_style_model::{TextDirection, Visibility};
+use html_text::{InlineTextKind as TextRunKind, suppresses_glyph};
+
+/// Merge overlapping and adjacent logical text intervals in place, removing
+/// empty and reversed ranges. Callers validate document bounds separately.
+pub fn merge_text_ranges(ranges: &mut Vec<Range<u32>>) {
+    ranges.retain(|range| !range.is_empty());
+    ranges.sort_unstable_by_key(|range| range.start);
+    ranges.dedup_by(|next, previous| {
+        if next.start <= previous.end {
+            previous.end = previous.end.max(next.end);
+            true
+        } else {
+            false
+        }
+    });
+}
 
 /// Stable renderer-facing line geometry.
 ///
@@ -31,9 +47,7 @@ pub struct RenderLine {
     letter_spacing: f64,
     optical_offset_x: f64,
     paint_color: Option<u32>,
-    positioned_layer: bool,
-    negative_positioned_layer: bool,
-    independent_positioned_layer: bool,
+    paint_layers: PaintLayers,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -138,9 +152,7 @@ impl RenderLine {
         index: usize,
         line: &Line,
         details: &[LineDetails],
-        positioned_layer: bool,
-        negative_positioned_layer: bool,
-        independent_positioned_layer: bool,
+        paint_layers: PaintLayers,
     ) -> Self {
         Self {
             index,
@@ -153,14 +165,16 @@ impl RenderLine {
             letter_spacing: line.letter_spacing,
             optical_offset_x: line.optical_offset_x(details),
             paint_color: line.paint_color(details),
-            positioned_layer,
-            negative_positioned_layer,
-            independent_positioned_layer,
+            paint_layers,
         }
     }
 
+    /// Stable storage identity, independent of the spatial iteration position.
     pub fn index(&self) -> usize {
         self.index
+    }
+    pub fn id(&self) -> LineId {
+        LineId::new(self.index)
     }
 
     /// Block box that emitted this line.
@@ -221,127 +235,64 @@ impl RenderLine {
     }
 
     pub fn is_in_positioned_layer(&self) -> bool {
-        self.positioned_layer
+        self.paint_layers.is_positioned()
     }
 
     pub fn is_in_negative_positioned_layer(&self) -> bool {
-        self.negative_positioned_layer
+        self.paint_layers.is_negative()
     }
 
     pub fn is_in_independent_positioned_layer(&self) -> bool {
-        self.independent_positioned_layer
+        self.paint_layers.is_independent()
     }
 }
 
+/// Spatially ordered line view. `get` takes a spatial rank; each returned
+/// line's `index`/`id` identifies storage and is used by the other line queries.
 pub struct RenderLines<'a> {
-    lines: &'a [Line],
-    details: &'a [LineDetails],
-    positioned_layers: &'a [bool],
-    negative_positioned_layers: &'a [bool],
-    independent_positioned_layers: &'a [bool],
+    output: &'a LineOutput,
 }
 
 impl<'a> RenderLines<'a> {
-    fn new(
-        lines: &'a [Line],
-        details: &'a [LineDetails],
-        positioned_layers: &'a [bool],
-        negative_positioned_layers: &'a [bool],
-        independent_positioned_layers: &'a [bool],
-    ) -> Self {
-        Self {
-            lines,
-            details,
-            positioned_layers,
-            negative_positioned_layers,
-            independent_positioned_layers,
-        }
+    fn new(output: &'a LineOutput) -> Self {
+        Self { output }
     }
 
     pub fn len(&self) -> usize {
-        self.lines.len()
+        self.output.lines.len()
     }
-
     pub fn is_empty(&self) -> bool {
-        self.lines.is_empty()
+        self.output.lines.is_empty()
     }
 
-    pub fn get(&self, idx: usize) -> Option<RenderLine> {
-        self.lines.get(idx).map(|line| {
-            RenderLine::from_line(
-                idx,
-                line,
-                self.details,
-                self.positioned_layers.get(idx).copied().unwrap_or(false),
-                self.negative_positioned_layers
-                    .get(idx)
-                    .copied()
-                    .unwrap_or(false),
-                self.independent_positioned_layers
-                    .get(idx)
-                    .copied()
-                    .unwrap_or(false),
-            )
-        })
+    pub fn get(&self, rank: usize) -> Option<RenderLine> {
+        let id = *self.output.spatial_order.get(rank)?;
+        render_line(self.output, id.index())
     }
 
     pub fn first(&self) -> Option<RenderLine> {
-        self.lines.first().map(|line| {
-            RenderLine::from_line(
-                0,
-                line,
-                self.details,
-                self.positioned_layers.first().copied().unwrap_or(false),
-                self.negative_positioned_layers
-                    .first()
-                    .copied()
-                    .unwrap_or(false),
-                self.independent_positioned_layers
-                    .first()
-                    .copied()
-                    .unwrap_or(false),
-            )
-        })
+        self.get(0)
     }
-
     pub fn last(&self) -> Option<RenderLine> {
-        let index = self.lines.len().checked_sub(1)?;
-        self.lines.last().map(|line| {
-            RenderLine::from_line(
-                index,
-                line,
-                self.details,
-                self.positioned_layers.get(index).copied().unwrap_or(false),
-                self.negative_positioned_layers
-                    .get(index)
-                    .copied()
-                    .unwrap_or(false),
-                self.independent_positioned_layers
-                    .get(index)
-                    .copied()
-                    .unwrap_or(false),
-            )
-        })
+        self.get(self.len().checked_sub(1)?)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = RenderLine> + '_ {
-        self.lines.iter().enumerate().map(|(index, line)| {
-            RenderLine::from_line(
-                index,
-                line,
-                self.details,
-                self.positioned_layers.get(index).copied().unwrap_or(false),
-                self.negative_positioned_layers
-                    .get(index)
-                    .copied()
-                    .unwrap_or(false),
-                self.independent_positioned_layers
-                    .get(index)
-                    .copied()
-                    .unwrap_or(false),
-            )
-        })
+        self.output
+            .spatial_order
+            .iter()
+            .map(|id| render_line(self.output, id.index()).expect("valid line identity"))
     }
+}
+
+fn render_line(output: &LineOutput, index: usize) -> Option<RenderLine> {
+    let line = output.lines.get(index)?;
+    Some(RenderLine::from_line(
+        index,
+        line,
+        &output.line_details,
+        output.paint_layers.get(index).copied().unwrap_or_default(),
+    ))
 }
 
 #[derive(Clone, Debug)]
@@ -506,12 +457,6 @@ pub struct RenderTextRun {
     glyphs: Range<u32>,
 }
 
-#[derive(Clone, Copy, Debug)]
-enum TextRunKind {
-    Text,
-    Marker,
-}
-
 impl RenderTextRun {
     pub fn is_marker(&self) -> bool {
         matches!(self.kind, TextRunKind::Marker)
@@ -531,8 +476,7 @@ impl RenderTextRun {
 }
 
 pub struct RenderTextRuns<'a> {
-    runs: &'a [InlineItem],
-    idx: usize,
+    runs: std::slice::Iter<'a, InlineItem>,
     kind_filter: Option<TextRunKind>,
     only_box: Option<usize>,
 }
@@ -540,8 +484,7 @@ pub struct RenderTextRuns<'a> {
 impl<'a> RenderTextRuns<'a> {
     fn new(runs: &'a [InlineItem], kind_filter: Option<TextRunKind>) -> Self {
         Self {
-            runs,
-            idx: 0,
+            runs: runs.iter(),
             kind_filter,
             only_box: None,
         }
@@ -561,60 +504,23 @@ impl<'a> Iterator for RenderTextRuns<'a> {
     type Item = RenderTextRun;
 
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let idx = self.idx;
-            self.idx += 1;
-
-            let run = self.runs.get(idx)?;
+        for item in self.runs.by_ref() {
+            let Some(run) = item.text_run() else { continue };
             if self
                 .only_box
                 .is_some_and(|box_idx| box_idx != run.box_idx as usize)
+                || self.kind_filter.is_some_and(|kind| kind != run.kind)
             {
                 continue;
             }
-
-            if let Some(kind_filter) = self.kind_filter {
-                match (&run.kind, kind_filter) {
-                    (InlineItemKind::Text { glyphs }, TextRunKind::Text) => {
-                        return Some(RenderTextRun {
-                            kind: TextRunKind::Text,
-                            box_idx: run.box_idx as usize,
-                            dom_text_node: run.dom_text_node,
-                            glyphs: glyphs.clone(),
-                        });
-                    }
-                    (InlineItemKind::Marker { glyphs }, TextRunKind::Marker) => {
-                        return Some(RenderTextRun {
-                            kind: TextRunKind::Marker,
-                            box_idx: run.box_idx as usize,
-                            dom_text_node: run.dom_text_node,
-                            glyphs: glyphs.clone(),
-                        });
-                    }
-                    _ => continue,
-                }
-            }
-
-            match &run.kind {
-                InlineItemKind::Text { glyphs } => {
-                    return Some(RenderTextRun {
-                        kind: TextRunKind::Text,
-                        box_idx: run.box_idx as usize,
-                        dom_text_node: run.dom_text_node,
-                        glyphs: glyphs.clone(),
-                    });
-                }
-                InlineItemKind::Marker { glyphs } => {
-                    return Some(RenderTextRun {
-                        kind: TextRunKind::Marker,
-                        box_idx: run.box_idx as usize,
-                        dom_text_node: run.dom_text_node,
-                        glyphs: glyphs.clone(),
-                    });
-                }
-                _ => continue,
-            }
+            return Some(RenderTextRun {
+                kind: run.kind,
+                box_idx: run.box_idx as usize,
+                dom_text_node: run.dom_text_node,
+                glyphs: run.glyphs.clone(),
+            });
         }
+        None
     }
 }
 
@@ -648,12 +554,12 @@ impl<'a> RenderTextView<'a> {
         ))
     }
 
-    /// Spatial line indexes in CSS paint order.
-    pub fn paint_order_indices(self) -> &'a [u32] {
+    /// Stable line IDs in CSS paint order.
+    pub fn paint_order_indices(self) -> &'a [LineId] {
         &self.doc.layout_state.line_output.paint_order_indices
     }
 
-    /// Returns the CSS paint rank for a spatial line index.
+    /// Returns the CSS paint rank for a stable line ID.
     pub fn paint_order_rank(self, line_idx: usize) -> Option<u32> {
         self.doc
             .layout_state
@@ -671,13 +577,19 @@ impl<'a> RenderTextView<'a> {
         self.doc.shaped().glyphs.get(glyph_idx).copied()
     }
 
+    /// Prepared logical character, including text transforms and generated
+    /// content. Bidi mirroring affects paint identity rather than this text.
+    pub fn character_at(self, index: usize) -> Option<char> {
+        self.doc.inputs.text.content().character_at(index)
+    }
+
     pub fn glyph_slice(self, range: Range<u32>) -> Option<crate::shaping::GlyphSlice<'a>> {
         let start = usize::try_from(range.start).ok()?;
         let end = usize::try_from(range.end).ok()?;
         self.doc.shaped().glyphs.slice(start..end)
     }
 
-    /// Updated source color, independent of the retained backend glyph/run.
+    /// Resolved source color, independent of the retained backend glyph/run.
     pub fn paint_color_at(self, character_index: u32) -> Option<u32> {
         let colors = &self.doc.paint_colors;
         let index = colors.partition_point(|run| run.glyphs.end <= character_index);
@@ -695,8 +607,8 @@ impl<'a> RenderTextView<'a> {
     /// Directional controls and discretionary hyphens have no ordinary ink.
     pub fn paint_glyph_at(self, index: u32) -> Option<GlyphId> {
         let glyph = self.glyph_at(index as usize)?;
-        let character = self.glyph_metric(glyph)?.ch();
-        if character == '\u{00ad}' || html_text::is_bidi_control(character) {
+        let character = self.character_at(index as usize)?;
+        if suppresses_glyph(character) {
             return None;
         }
         Some(self.doc.text_geometry().paint_glyph(index, glyph))
@@ -727,26 +639,16 @@ impl<'a> RenderTextView<'a> {
     ) -> impl Iterator<Item = RenderAuthoritativeTextRun> + 'a {
         self.doc
             .text_geometry()
-            .authoritative_runs(requested.clone())
+            .authoritative_runs(requested)
             .filter_map(move |run| {
-                let start = requested.start.max(run.source_range.start);
-                let end = requested.end.min(run.source_range.end);
-                if start >= end {
-                    return None;
-                }
-                let local_start = start - run.source_range.start + run.run_offset;
-                let local_end = end - run.source_range.start + run.run_offset;
+                let run_range = run.run_range();
+                let natural_offset =
+                    run.natural_offset(self.character_direction(run.source_range.start))?;
                 Some(RenderAuthoritativeTextRun {
-                    source_range: start..end,
-                    run_range: local_start..local_end,
+                    source_range: run.source_range,
+                    run_range,
                     run: run.backend_run,
-                    natural_offset: if self.doc.text_geometry().bidi().level(start) % 2 == 1 {
-                        run.caret_stops
-                            .get(local_start as usize)?
-                            .min(*run.caret_stops.get(local_end as usize)?)
-                    } else {
-                        *run.caret_stops.get(local_start as usize)?
-                    },
+                    natural_offset,
                     ascent: run.ascent,
                     placement_required: run.placement_required,
                 })
@@ -774,53 +676,27 @@ impl<'a> RenderTextView<'a> {
     }
 
     pub fn lines(self) -> RenderLines<'a> {
-        RenderLines::new(
-            &self.doc.layout_state.line_output.lines,
-            &self.doc.layout_state.line_output.line_details,
-            &self.doc.layout_state.line_output.positioned_layers,
-            &self.doc.layout_state.line_output.negative_positioned_layers,
-            &self
-                .doc
-                .layout_state
-                .line_output
-                .independent_positioned_layers,
-        )
+        RenderLines::new(&self.doc.layout_state.line_output)
     }
 
-    pub fn line(self, idx: usize) -> Option<RenderLine> {
+    /// Stable line IDs in spatial order. Geometry range queries return ranks
+    /// into this traversal, never ranges of line identities.
+    pub fn spatial_order(self) -> &'a [LineId] {
+        &self.doc.layout_state.line_output.spatial_order
+    }
+
+    pub fn spatial_rank(self, id: LineId) -> Option<usize> {
         self.doc
             .layout_state
             .line_output
-            .lines
-            .get(idx)
-            .map(|line| {
-                RenderLine::from_line(
-                    idx,
-                    line,
-                    &self.doc.layout_state.line_output.line_details,
-                    self.doc
-                        .layout_state
-                        .line_output
-                        .positioned_layers
-                        .get(idx)
-                        .copied()
-                        .unwrap_or(false),
-                    self.doc
-                        .layout_state
-                        .line_output
-                        .negative_positioned_layers
-                        .get(idx)
-                        .copied()
-                        .unwrap_or(false),
-                    self.doc
-                        .layout_state
-                        .line_output
-                        .independent_positioned_layers
-                        .get(idx)
-                        .copied()
-                        .unwrap_or(false),
-                )
-            })
+            .spatial_ranks
+            .get(id.index())
+            .map(|&rank| rank as usize)
+    }
+
+    /// Look up a stable line identity, rather than a spatial traversal rank.
+    pub fn line(self, id: usize) -> Option<RenderLine> {
+        render_line(&self.doc.layout_state.line_output, id)
     }
 
     /// Resolved overflow clip for the line's formatting context.
@@ -903,10 +779,51 @@ impl<'a> RenderTextView<'a> {
         )
     }
 
+    /// Source-backed text in logical order, excluding generated and hidden text.
+    /// Descendants with `visibility: visible` remain available under hidden parents.
+    pub fn visible_source_runs(self) -> impl Iterator<Item = RenderTextRun> + 'a {
+        self.text_runs().filter(move |run| {
+            run.dom_text_node().is_some()
+                && self
+                    .doc
+                    .box_used_style(run.box_idx())
+                    .is_some_and(|style| style.visibility() == Visibility::Visible)
+        })
+    }
+
     pub fn marker_runs(self) -> RenderTextRuns<'a> {
         RenderTextRuns::new(
             self.doc.inputs.text.content().inline_items(),
             Some(TextRunKind::Marker),
         )
+    }
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::merge_text_ranges;
+    use crate::allocation_test_support::count_allocations;
+    use std::ops::Range;
+
+    #[test]
+    fn range_merging_reuses_input_storage_at_u32_boundaries() {
+        let mut ranges = vec![
+            u32::MAX - 2..u32::MAX,
+            5..9,
+            2..6,
+            9..9,
+            0..1,
+            1..2,
+            8..10,
+            u32::MAX - 3..u32::MAX - 1,
+            Range { start: 12, end: 11 },
+        ];
+        let pointer = ranges.as_ptr();
+        let capacity = ranges.capacity();
+        let ((), allocations) = count_allocations(|| merge_text_ranges(&mut ranges));
+        assert_eq!(ranges, [0..10, u32::MAX - 3..u32::MAX]);
+        assert_eq!(allocations, 0);
+        assert_eq!(ranges.as_ptr(), pointer);
+        assert_eq!(ranges.capacity(), capacity);
     }
 }

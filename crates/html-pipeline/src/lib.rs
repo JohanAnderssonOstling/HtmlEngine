@@ -1,16 +1,5 @@
-macro_rules! profile_scope {
-    ($name:literal) => {
-        #[cfg(feature = "profiling")]
-        let _profile_scope = crate::profiling::scope($name);
-    };
-}
-
-macro_rules! profile {
-    ($name:literal, $operation:expr) => {{
-        profile_scope!($name);
-        $operation
-    }};
-}
+#[macro_use(profile, profile_scope)]
+extern crate html_engine_model;
 
 #[cfg(feature = "profiling")]
 pub use html_engine_model::profiling;
@@ -28,14 +17,14 @@ pub use html_engine_model::{
     ContentLanguage, FontMetrics, FontMetricsRequest, FontRelativeMetrics, FontSlant, GlyphHandle,
     GlyphId, GlyphMetric, GlyphMetricError, GlyphRequest, GlyphResourceCheckpoint,
     GlyphResourceGeneration, GlyphResourceStore, GlyphResources, GlyphShaper, GlyphSlice,
-    PreparedTextRunFragment, ShapeError, ShapedGlyph, ShapedLine, ShapedTextRun, TextDirection,
-    TextRunId, TextRunShapeRequest, TextShapeRequest, TextStyleSpan,
+    PreparedTextRunFragment, ResourceShaper, ShapeError, ShapedGlyph, ShapedLine, ShapedTextRun,
+    TextDirection, TextRunId, TextRunShapeRequest, TextShapeRequest, TextStyleSpan,
 };
 pub use html_layout::LayoutTimings;
 pub use stages::{
     DetachedLayout, FormattingDocument, LaidOutDocument, NoteLayout, PreparedDocument,
     ReadingFragment, ReadingTarget, RenderExportView, RenderTable, RenderView, ShapeLayoutTimings,
-    ShapedDocument, TextSearchOptions, find_text_matches,
+    ShapedDocument, TextSearchOptions, find_text_matches, text_matches,
 };
 
 /// Document lifecycle and render capabilities, orchestrated above the stage crates.
@@ -47,13 +36,14 @@ pub mod engine {
         CharacterPlacement, ContentLanguage, FontMetrics, FontMetricsRequest, FontRelativeMetrics,
         FontSlant, FontStyle, GlyphHandle, GlyphId, GlyphMetric, GlyphMetricError, GlyphRequest,
         GlyphResourceCheckpoint, GlyphResourceGeneration, GlyphResourceStore, GlyphResources,
-        GlyphShaper, GlyphSlice, LanguageTag, ListStylePosition, OpenTypeFeature,
-        PreparedTextRunFragment, ReaderStyleOverrides, ShapeError, ShapedGlyph, ShapedLine,
-        ShapedTextRun, StyleStringId, TextAlign, TextDecorationLines, TextDirection, TextRunId,
-        TextRunShapeRequest, TextShapeRequest, TextStyleSpan, ThemeAdaptation, UnicodeBidi,
-        UsedBorderRadii,
+        GlyphShaper, GlyphSlice, LanguageTag, LineCharacterPlacement, LineId, LineTextPlacement,
+        ListStylePosition, OpenTypeFeature,
+        PreparedTextRunFragment, ReaderStyleOverrides, ResourceShaper, ShapeError, ShapedGlyph,
+        ShapedLine, ShapedTextRun, StyleStringId, TextAlign, TextDecorationLines, TextDirection,
+        TextRunId, TextRunShapeRequest, TextShapeRequest, TextStyleSpan, ThemeAdaptation,
+        UnicodeBidi, UsedBorderRadii,
     };
-    pub use html_layout::{LayoutTimings, LineCharacterPlacement, LineTextPlacement};
+    pub use html_layout::LayoutTimings;
 }
 #[cfg(test)]
 include!("../../../test-support/stage-fixtures.rs");

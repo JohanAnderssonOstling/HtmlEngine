@@ -28,14 +28,6 @@ pub(super) fn inline_overflow(
     InlineOverflow { clips, ellipsis }
 }
 
-pub(super) fn resolved_line_height(style: UsedStyleView<'_>) -> f64 {
-    if style.line_height_is_normal() {
-        style.font_size() as f64 * 1.2
-    } else {
-        style.line_height().max(0.0) as f64
-    }
-}
-
 pub(super) fn append_text_tokens(
     engine: &crate::layout::LayoutEngine<'_, '_>,
     tokens: &mut InlineTokens,
@@ -53,14 +45,11 @@ pub(super) fn append_text_tokens(
     let word_spacing = style.word_spacing() as f64;
     let word_spacing_factor = style.word_spacing_factor() as f64;
     let font_size = style.font_size();
-    let authored_line_height = style.line_height();
     let uses_ahem = engine.reader.box_uses_ahem(box_idx);
-    let fixed_line_height = if !style.line_height_is_normal() {
-        Some(authored_line_height as f64)
-    } else if !uses_ahem {
-        Some(font_size as f64 * 1.2)
-    } else {
+    let fixed_line_height = if style.line_height_is_normal() && uses_ahem {
         None
+    } else {
+        Some(style.resolved_line_height())
     };
     let visible = style.visibility() == Visibility::Visible;
     let placement_required = letter_spacing != 0.0
@@ -99,7 +88,7 @@ pub(super) fn append_text_tokens(
         let unit = canonical_text_unit_from_facts(
             engine,
             glyph_idx,
-            metric.ch(),
+            engine.text.character(glyph_idx),
             advance,
             font_size,
             letter_spacing,
@@ -192,7 +181,7 @@ fn create_ellipsis_token(
     style: UsedStyleView,
 ) -> (InlineToken, InlineTokenMetrics) {
     let metric = engine.text.glyph_metric(glyph);
-    let line_height = resolved_line_height(style);
+    let line_height = style.resolved_line_height();
     (
         InlineToken::new(
             InlineTokenKind::Ellipsis { glyph },

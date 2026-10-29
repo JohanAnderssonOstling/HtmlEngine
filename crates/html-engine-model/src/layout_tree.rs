@@ -1,5 +1,6 @@
 use html_dom::{Document, ElementRef, MemoryUsageReport};
 use html_style_model::{ListStylePosition, StyleIndices};
+use std::iter::{once, successors};
 use rustc_data_structures::fx::FxHashMap;
 use std::ops::Range;
 
@@ -34,6 +35,35 @@ pub struct LayoutTree {
 }
 
 impl LayoutTree {
+    /// Style-bearing formatting structures without their own layout box.
+    /// Shaping must prepare these handles before layout or paint reads them.
+    pub fn non_box_styles(&self) -> impl Iterator<Item = StyleIndices> + '_ {
+        self.boxes
+            .iter()
+            .filter_map(|layout_box| match &layout_box.layout_mode {
+                LayoutMode::Table(table) => Some(table),
+                _ => None,
+            })
+            .flat_map(|table| {
+                table
+                    .columns
+                    .iter()
+                    .flat_map(|column| once(column.width_style).chain(column.background_style))
+                    .chain(table.column_groups.iter().map(|group| group.style))
+                    .chain(
+                        table
+                            .column_width_hints
+                            .iter()
+                            .flat_map(|hint| once(hint.style).chain(hint.fallback_style)),
+                    )
+            })
+            .chain(
+                self.split_inline_position_ancestors
+                    .values()
+                    .flat_map(|styles| styles.iter().copied()),
+            )
+    }
+
     pub fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
         report.add_slice_storage::<LayoutBox>(
@@ -118,6 +148,14 @@ impl LayoutTree {
 
     pub fn get_box_parent(&self, box_idx: usize) -> Option<usize> {
         self.boxes.get(box_idx)?.parent().map(|p| p as usize)
+    }
+
+    /// Formatting ancestors, starting with the immediate parent and ending at
+    /// the root. Anonymous and generated boxes follow their formatting parents.
+    pub fn ancestors(&self, box_idx: usize) -> impl Iterator<Item = usize> + Clone + '_ {
+        successors(self.get_box_parent(box_idx), |&parent| {
+            self.get_box_parent(parent)
+        })
     }
 
     pub fn get_box_layout_mode(&self, box_idx: usize) -> Option<&LayoutMode> {

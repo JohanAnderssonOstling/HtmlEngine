@@ -78,22 +78,36 @@ impl ShapedTextRun {
     /// Apply range-local CSS spacing to both layout widths and native caret
     /// positions. Backend cache geometry remains unchanged.
     pub fn apply_spacing(&mut self, deltas: &[f32], right_to_left: bool) {
+        self.apply_spacing_iter(deltas.iter().copied(), right_to_left);
+    }
+
+    /// Apply replayable per-character spacing without materializing a buffer.
+    /// Iterator clones must produce the same deltas in logical source order.
+    pub fn apply_spacing_iter(
+        &mut self,
+        deltas: impl ExactSizeIterator<Item = f32> + Clone,
+        right_to_left: bool,
+    ) {
         assert_eq!(deltas.len(), self.advances.len());
-        if !deltas.iter().any(|delta| *delta != 0.0) {
+        if !deltas.clone().any(|delta| delta != 0.0) {
             return;
         }
-        for (advance, delta) in Arc::make_mut(&mut self.advances).iter_mut().zip(deltas) {
-            *advance += *delta;
+        for (advance, delta) in Arc::make_mut(&mut self.advances)
+            .iter_mut()
+            .zip(deltas.clone())
+        {
+            *advance += delta;
         }
         if let Some(stops) = &mut self.caret_stops {
             let mut cumulative = 0.0;
-            for (offset, stop) in Arc::make_mut(stops).iter_mut().enumerate() {
+            let mut deltas = deltas;
+            for stop in Arc::make_mut(stops) {
                 *stop += if right_to_left {
                     -cumulative
                 } else {
                     cumulative
                 };
-                if let Some(delta) = deltas.get(offset) {
+                if let Some(delta) = deltas.next() {
                     cumulative += delta;
                 }
             }
@@ -168,6 +182,8 @@ impl<'a> TextRunShapeRequest<'a> {
         &self.style
     }
 
+    /// Per-character overrides. `None` means every character uses
+    /// [`TextStyleSpan::color`] from the shaping style.
     pub fn paint_colors(&self) -> Option<&'a [u32]> {
         self.paint_colors
     }
@@ -873,8 +889,16 @@ impl FontRelativeMetrics {
     pub fn ascent_ratio(self) -> Option<f32> {
         (self.ascent_ratio > 0.0).then_some(self.ascent_ratio)
     }
-    pub fn line_box_ratios(self) -> Option<(f32, f32)> {
-        (self.ascent_ratio > 0.0).then_some((self.ascent_ratio, self.descent_ratio))
+    /// Font content extents at a CSS font size, before line-height leading.
+    pub fn line_box_extents(self, font_size: f64) -> (f64, f64) {
+        if self.ascent_ratio > 0.0 {
+            (
+                font_size * self.ascent_ratio as f64,
+                font_size * self.descent_ratio as f64,
+            )
+        } else {
+            (font_size * 0.8, font_size * 0.2)
+        }
     }
 }
 
@@ -1291,6 +1315,12 @@ impl ShapeError {
     }
 }
 
+impl From<GlyphMetricError> for ShapeError {
+    fn from(reason: GlyphMetricError) -> Self {
+        Self::rejected_metric(reason)
+    }
+}
+
 impl fmt::Display for ShapeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.kind {
@@ -1467,6 +1497,31 @@ impl GlyphResourceStore {
         true
     }
 
+    /// Shape and register each character independently, using the run's font
+    /// selection. Native contextual run shaping is left to the caller.
+    pub fn shape_characters(
+        &mut self,
+        shaper: &mut (impl GlyphShaper + ?Sized),
+        request: &TextRunShapeRequest<'_>,
+        glyphs: &mut [GlyphId],
+    ) -> Result<(), ShapeError> {
+        debug_assert_eq!(request.text().chars().count(), glyphs.len());
+        let style = request.style();
+        for (slot, character) in glyphs.iter_mut().zip(request.text().chars()) {
+            *slot = self.shape_glyph(
+                shaper,
+                GlyphRequest {
+                    character,
+                    font_size: style.font_size(),
+                    font_weight: style.font_weight(),
+                    font_slant: style.font_slant(),
+                    font_family: style.font_family_for_character(character),
+                },
+            )?;
+        }
+        Ok(())
+    }
+
     /// Shape and intern a native result, assigning its layout ID here.
     pub fn shape_glyph(
         &mut self,
@@ -1525,8 +1580,7 @@ impl GlyphResourceStore {
                 shaped.advances.len(),
             ));
         }
-        let vertical = GlyphMetric::try_new('\0', 0.0, ascent, descent)
-            .map_err(ShapeError::rejected_metric)?;
+        let vertical = GlyphMetric::try_new('\0', 0.0, ascent, descent)?;
         self.metrics
             .register_run(characters, shaped.shared_advances(), vertical)
             .map_err(|_| ShapeError::registry_capacity_exhausted(self.len()))
@@ -1557,6 +1611,8 @@ impl GlyphResourceStore {
 /// Backend supplied by a renderer adapter for measuring styled characters
 /// and returning handles to its native paint resources. HtmlEngine assigns
 /// layout glyph IDs and stores the returned measurements.
+/// Basic adapters can use [`crate::ResourceShaper`] to supply a shaping callback
+/// with automatic native-resource lifecycle handling.
 pub trait GlyphShaper {
     /// Identity of the backend's active paint resources. Reset must assign a
     /// fresh generation; a failed document replacement restores the old one.
@@ -1617,21 +1673,7 @@ pub trait GlyphShaper {
         glyphs: &mut [GlyphId],
         resources: &mut GlyphResourceStore,
     ) -> Result<Option<ShapedTextRun>, ShapeError> {
-        debug_assert_eq!(request.text().chars().count(), glyphs.len());
-        let style = request.style();
-        for (slot, character) in glyphs.iter_mut().zip(request.text().chars()) {
-            *slot = resources.shape_glyph(
-                self,
-                GlyphRequest {
-                    character,
-                    font_size: style.font_size(),
-                    font_weight: style.font_weight(),
-                    font_slant: style.font_slant(),
-                    color: style.color(),
-                    font_family: style.font_family_for_character(character),
-                },
-            )?;
-        }
+        resources.shape_characters(self, &request, glyphs)?;
         self.shape_text_run(request)
     }
 
@@ -1668,6 +1710,18 @@ pub trait GlyphShaper {
 #[cfg(test)]
 mod geometry_tests {
     use super::*;
+
+    #[test]
+    fn font_extents_preserve_selected_line_ratios_and_fallback_without_metrics() {
+        let selected = FontRelativeMetrics::from_line_ratios(0.5, 0.5, 0.8, 1.0, 0.25)
+            .expect("valid selected font ratios");
+        assert_eq!(selected.line_box_extents(20.0), (20.0, 5.0));
+        assert_eq!(selected.line_box_extents(0.0), (0.0, 0.0));
+        assert_eq!(
+            FontRelativeMetrics::fallback().line_box_extents(20.0),
+            (16.0, 4.0)
+        );
+    }
 
     #[test]
     fn append_checkpoints_own_no_run_data_and_preserve_the_prefix() {

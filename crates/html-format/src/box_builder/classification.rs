@@ -1,8 +1,8 @@
 use crate::layout_model::{
     BlockBox, Children, FlexBox, GridBox, LayoutMode, TableBox, TableCellBox, TableRowBox,
 };
-use html_dom::ElementRef;
-use html_style_model::{Clear, ComputedStyles, Display, PositionMode, StyleIndices};
+use html_dom::{Document, ElementRef};
+use html_style_model::{Clear, ComputedStyles, Display, Float, PositionMode, StyleIndices};
 use std::ops::Range;
 
 pub(super) fn display_for_element(styles: &ComputedStyles, element: ElementRef<'_>) -> Display {
@@ -12,7 +12,7 @@ pub(super) fn display_for_element(styles: &ComputedStyles, element: ElementRef<'
         .unwrap_or(Display::Block);
     if display == Display::Contents && contents_computes_to_none(element) {
         Display::None
-    } else if element.image_idx().is_some() && is_table_internal_display(display) {
+    } else if element.image_idx().is_some() && display.is_table_internal() {
         Display::Inline
     } else {
         display
@@ -81,18 +81,19 @@ pub(super) fn empty_table_box() -> TableBox {
     }
 }
 
-pub(super) fn is_table_internal_display(display: Display) -> bool {
-    matches!(
-        display,
-        Display::TableRowGroup
-            | Display::TableHeaderGroup
-            | Display::TableFooterGroup
-            | Display::TableRow
-            | Display::TableColumnGroup
-            | Display::TableColumn
-            | Display::TableCell
-            | Display::TableCaption
-    )
+pub(super) fn has_table_internal_descendant(
+    document: &Document,
+    styles: &ComputedStyles,
+    element: ElementRef<'_>,
+) -> bool {
+    element.children().any(|child_id| {
+        document.element_ref(child_id).is_some_and(|child| {
+            let display = display_for_element(styles, child);
+            display.is_table_internal()
+                || (display == Display::Contents
+                    && has_table_internal_descendant(document, styles, child))
+        })
+    })
 }
 
 pub(super) fn starts_new_block_child(display: Display) -> bool {
@@ -105,7 +106,7 @@ pub(super) fn starts_new_block_child(display: Display) -> bool {
             | Display::ListItem
             | Display::FlowRootListItem
             | Display::Table
-    ) || is_table_internal_display(display)
+    ) || display.is_table_internal()
 }
 
 /// Out-of-flow boxes are blockified for layout even when their authored
@@ -164,12 +165,7 @@ pub(super) fn is_floated(styles: &ComputedStyles, element: ElementRef<'_>) -> bo
     styles
         .style_for_node(element.node_id())
         .and_then(|style| styles.box_model_style(style))
-        .is_some_and(|style| {
-            matches!(
-                style.float,
-                html_style_model::Float::Left | html_style_model::Float::Right
-            )
-        })
+        .is_some_and(|style| matches!(style.float, Float::Left | Float::Right))
 }
 
 pub(super) fn is_block_level_pseudo_display(display: Display) -> bool {

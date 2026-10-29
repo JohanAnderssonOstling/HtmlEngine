@@ -11,6 +11,6 @@ heap = []
 profiling = ["html/profiling"]
 borrowed-view = []
 [dependencies]
-html = { package = "html-engine", path = "../../crates/html" }
+html = { version = "0.1.0", package = "skrift", path = "../../crates/html" }
 libc = "0.2"
 serde_json = "1"

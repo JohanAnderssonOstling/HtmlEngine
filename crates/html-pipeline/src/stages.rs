@@ -26,7 +26,7 @@ pub use output::{
     RenderOverflowClip, RenderPaintItem, RenderSemanticsView, RenderTable, RenderTableCell,
     RenderTableRow, RenderTextRun, RenderTextRuns, RenderTextView, RenderView, SourceElementStep,
     SourceLocation, SourcePosition, TextSearchOptions, find_text_matches,
-    is_navigation_section_title,
+    is_navigation_section_title, merge_text_ranges, text_matches,
 };
 #[path = "stages/lifecycle.rs"]
 mod lifecycle;
@@ -88,13 +88,7 @@ fn first_line_style_ranges(
                 inputs.layout_tree.as_ref(),
                 run.box_idx as usize,
             );
-            let Some(first_line_style) = html_text::first_line_style_for_inline_root(
-                &inputs.document,
-                &inputs.styles,
-                inputs.layout_tree.as_ref(),
-                inputs.text.content(),
-                root,
-            ) else {
+            let Some(first_line_style) = inputs.text.content().pseudo_styles().first_line(root) else {
                 continue;
             };
             let base_style = inputs
@@ -270,26 +264,6 @@ fn refine_first_lines(
         ranges = next_ranges;
     }
     Err(crate::ShapeError::first_line_refinement_did_not_converge())
-}
-
-pub(crate) struct AncestorIter<'a> {
-    doc: DocumentRead<'a>,
-    current: Option<usize>,
-}
-
-impl<'a> Iterator for AncestorIter<'a> {
-    type Item = usize;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let idx = self.current?;
-        self.current = self
-            .doc
-            .inputs
-            .layout_tree
-            .box_at(idx)
-            .and_then(|b| b.parent().map(|parent| parent as usize));
-        Some(idx)
-    }
 }
 
 include!("stages_tests.rs");

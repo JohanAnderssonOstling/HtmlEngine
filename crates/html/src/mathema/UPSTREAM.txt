@@ -1,0 +1,30 @@
+Bundled component: mathema 0.1.0
+Upstream: https://github.com/DevExzh/mathema
+Revision: d9cce9ffeb7346181d4c3201dc0a13727269863b
+License: Apache-2.0; the complete upstream license is in LICENSE-APACHE.
+No NOTICE file is present at this revision.
+
+This is private source inside the html-engine package, compiled only with the
+math-export feature. There is no separate Cargo package or path dependency.
+The engine's own code remains GPL-3.0-or-later; bundled mathema source retains
+its Apache-2.0 license and upstream notices.
+
+Included upstream source:
+- src/lib.rs, renamed to mod.rs with shortened module documentation
+- src/ast, src/latex, src/reader, src/unicode, src/writer
+- src/convert.rs, src/error.rs, src/render/css_colors.rs
+The CLI, WASM bindings, optional rendering/raster code, fonts, examples, benches,
+and external test fixtures are omitted. Core inline unit tests are retained.
+
+Local source modifications:
+- Prefix crate-relative paths with crate::mathema::.
+- Replace upstream serde/render/raster/wasm feature conditions with any(),
+  preserving the feature-disabled configuration used by the previous dependency.
+- Ignore standalone upstream doctest examples referring to the separate crate.
+- Allow unused imports and dead code within this private bundled library.
+- Add a provenance/license/change notice to each copied Rust source file.
+- Share XML escaping with html-dom in the compact MathML and OMML writers.
+Conversion behavior and input limits are unchanged.
+
+Keep this file, LICENSE-APACHE, source notices, and all bundled source files in
+published packages. Update the revision and modification notes when rebundling.

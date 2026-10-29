@@ -1,4 +1,5 @@
 use super::box_model::ResolvedBoxModel;
+use super::inline::{BreakKind, tokens::indent_for_line};
 use crate::flex_grid::TaffyContainerKind;
 use crate::layout::LayoutEngine;
 use crate::layout_model::{Children, InlineItemKind, LayoutMode};
@@ -83,7 +84,7 @@ fn box_intrinsic_widths_with_available(
     let extras = margins + padding_border;
     let available_content = available_width.map(|available| (available - extras).max(0.0));
     let (content_min, content_max) =
-        box_content_intrinsic_widths_impl(engine, box_idx, available_content);
+        box_content_intrinsic_widths(engine, box_idx, available_content);
     let outer_min = content_min + extras;
     let outer_max = content_max + extras;
     let intrinsic_value = |size: PreferredSize, auto: f64| match size {
@@ -135,30 +136,14 @@ fn box_intrinsic_widths_with_available(
     (preferred_min, preferred_max)
 }
 
+/// Intrinsic content contributions. A definite available inline size supplies
+/// the stretch-fit limit needed by `fit-content`; `None` keeps it indefinite.
 pub fn box_content_intrinsic_widths(
-    engine: &LayoutEngine<'_, '_>,
-    box_idx: usize,
-) -> (f64, f64) {
-    box_content_intrinsic_widths_impl(engine, box_idx, None)
-}
-
-/// Intrinsic content contributions when the formatting context already knows
-/// the available inline size. This is the context required by `fit-content`:
-/// unlike min/max-content, its contribution is not meaningful without the
-/// stretch-fit limit supplied by the containing block.
-pub fn box_content_intrinsic_widths_with_available(
-    engine: &LayoutEngine<'_, '_>,
-    box_idx: usize,
-    available_width: f64,
-) -> (f64, f64) {
-    box_content_intrinsic_widths_impl(engine, box_idx, Some(available_width.max(0.0)))
-}
-
-fn box_content_intrinsic_widths_impl(
     engine: &LayoutEngine<'_, '_>,
     box_idx: usize,
     available_width: Option<f64>,
 ) -> (f64, f64) {
+    let available_width = available_width.map(|width| width.max(0.0));
     if let Some(intrinsic) = engine.reader.image_intrinsic(box_idx) {
         return (intrinsic.size.width, intrinsic.size.width);
     }
@@ -188,13 +173,16 @@ fn box_content_intrinsic_widths_impl(
             box_idx,
             &container.children,
             TaffyContainerKind::Flex,
+            None,
+            None,
         ),
-        Some(LayoutMode::Grid(container)) => crate::flex_grid::intrinsic_widths_with_available(
+        Some(LayoutMode::Grid(container)) => crate::flex_grid::intrinsic_widths(
             engine,
             box_idx,
             &container.children,
             TaffyContainerKind::Grid,
             available_width,
+            None,
         ),
         None => (0.0, 0.0),
     }
@@ -324,6 +312,49 @@ fn children_intrinsic_widths(
     }
 }
 
+/// Tracks either min-content segments or max-content lines. The caller owns
+/// break policy; this state owns width accumulation and one indent per line.
+struct IntrinsicWidth {
+    current: f64,
+    widest: f64,
+    pending_indent: Option<f64>,
+}
+
+impl IntrinsicWidth {
+    fn new(indent: f64) -> Self {
+        Self {
+            current: 0.0,
+            widest: 0.0,
+            pending_indent: Some(indent),
+        }
+    }
+
+    fn apply_indent(&mut self) {
+        if let Some(indent) = self.pending_indent.take() {
+            self.current += indent;
+        }
+    }
+
+    fn add(&mut self, width: f64) {
+        self.apply_indent();
+        self.current += width;
+    }
+
+    fn started(&self) -> bool {
+        self.current != 0.0 || self.pending_indent.is_none()
+    }
+
+    fn finish(&mut self, next_indent: f64) {
+        self.widest = self.value();
+        self.current = 0.0;
+        self.pending_indent = Some(next_indent);
+    }
+
+    fn value(&self) -> f64 {
+        self.widest.max(self.current.max(0.0))
+    }
+}
+
 fn runs_intrinsic_widths(
     engine: &LayoutEngine<'_, '_>,
     run_range: Range<u32>,
@@ -335,51 +366,25 @@ fn runs_intrinsic_widths(
     let text_indent = container_style.text_indent().resolve(0.0);
     let hanging_indent = container_style.text_indent_hanging();
     let each_line_indent = container_style.text_indent_each_line();
-    let mut min_content = 0.0f64;
-    let mut max_content = 0.0f64;
-    let mut current_line = 0.0f64;
-    let mut segment = 0.0f64;
+    let first_indent = indent_for_line(text_indent, hanging_indent, true);
+    let hard_indent = indent_for_line(text_indent, hanging_indent, each_line_indent);
+    let soft_indent = indent_for_line(text_indent, hanging_indent, false);
+    // Max-content breaks only at forced breaks; min-content also breaks at
+    // soft opportunities. Each accumulator consumes its own pending indent.
+    let mut minimum = IntrinsicWidth::new(first_indent);
+    let mut maximum = IntrinsicWidth::new(first_indent);
     let mut pending_collapsible_space = 0.0f64;
-    // Max-content only starts a new line at a forced break. Min-content also
-    // starts a hypothetical line at every soft wrap opportunity. Track the
-    // two independently so text-indent is charged to exactly the lines to
-    // which it would apply during layout.
-    let mut max_starts_indented_line = true;
-    let mut min_starts_indented_line = true;
-    let mut max_indent_applied = false;
-    let mut min_indent_applied = false;
-
-    let apply_max_indent =
-        |current_line: &mut f64, applied: &mut bool, starts_indented_line: bool| {
-            if !*applied {
-                *current_line += super::inline::tokens::indent_for_line(
-                    text_indent,
-                    hanging_indent,
-                    starts_indented_line,
-                );
-                *applied = true;
-            }
-        };
-    let apply_min_indent = |segment: &mut f64, applied: &mut bool, starts_indented_line: bool| {
-        if !*applied {
-            *segment += super::inline::tokens::indent_for_line(
-                text_indent,
-                hanging_indent,
-                starts_indented_line,
-            );
-            *applied = true;
-        }
-    };
 
     for run in &engine.text.inline_items()[run_range.start as usize..run_range.end as usize] {
-        let ownership_box = super::inline::tokens::inline_item_ownership_box(engine, run);
-        if !ownership_box.is_some_and(|box_idx| {
-            super::inline::run_belongs_to_inline_context(engine, box_idx, container_box_idx)
-        }) {
+        if !engine
+            .reader
+            .inline_item_belongs_to_context(run, container_box_idx)
+        {
             continue;
         }
         let style = engine.reader.style(run.box_idx as usize);
-        let tab_reference_style = super::inline::tab_reference_style(&engine.reader, run.box_idx as usize);
+        let tab_reference_style =
+            super::inline::tab_reference_style(&engine.reader, run.box_idx as usize);
         match &run.kind {
             InlineItemKind::Text { glyphs } => {
                 for glyph_idx in glyphs.clone() {
@@ -388,16 +393,10 @@ fn runs_intrinsic_widths(
                         super::inline::canonical_text_unit(engine, glyph_idx, style, white_space);
                     let c = unit.character;
                     let break_kind = unit.break_kind;
-                    if break_kind == super::inline::BreakKind::Hard {
-                        min_content = min_content.max(segment.max(0.0));
-                        max_content = max_content.max(current_line.max(0.0));
-                        segment = 0.0;
-                        current_line = 0.0;
+                    if break_kind == BreakKind::Hard {
+                        minimum.finish(hard_indent);
+                        maximum.finish(hard_indent);
                         pending_collapsible_space = 0.0;
-                        max_starts_indented_line = each_line_indent;
-                        min_starts_indented_line = each_line_indent;
-                        max_indent_applied = false;
-                        min_indent_applied = false;
                         continue;
                     }
 
@@ -409,12 +408,9 @@ fn runs_intrinsic_widths(
                         && (style.overflow_wrap() == OverflowWrap::Anywhere
                             || style.word_break() == WordBreak::BreakWord)
                         && engine.text.is_cluster_boundary(glyph_idx as usize)
-                        && (segment != 0.0 || min_indent_applied)
+                        && minimum.started()
                     {
-                        min_content = min_content.max(segment.max(0.0));
-                        segment = 0.0;
-                        min_starts_indented_line = false;
-                        min_indent_applied = false;
+                        minimum.finish(soft_indent);
                     }
 
                     let advance = if c == '\u{00ad}' {
@@ -428,7 +424,7 @@ fn runs_intrinsic_widths(
                         if interval <= 0.0 {
                             0.0
                         } else {
-                            let remainder = current_line.rem_euclid(interval);
+                            let remainder = maximum.current.rem_euclid(interval);
                             let mut to_stop = if remainder <= f64::EPSILON {
                                 interval
                             } else {
@@ -442,46 +438,31 @@ fn runs_intrinsic_widths(
                     } else {
                         unit.natural_advance
                     };
-                    if break_kind == super::inline::BreakKind::Discretionary
+                    if break_kind == BreakKind::Discretionary
                         && engine.text.is_cluster_boundary(glyph_idx as usize)
                     {
-                        min_content = min_content.max(segment.max(0.0));
-                        segment = 0.0;
-                        min_starts_indented_line = false;
-                        min_indent_applied = false;
+                        minimum.finish(soft_indent);
                         if c == '\u{200b}' {
                             continue;
                         }
                     }
-                    if break_kind == super::inline::BreakKind::Soft {
-                        min_content = min_content.max(segment.max(0.0));
-                        segment = 0.0;
-                        min_starts_indented_line = false;
-                        min_indent_applied = false;
+                    if break_kind == BreakKind::Soft {
+                        minimum.finish(soft_indent);
                         if white_space.collapses_spaces() && !white_space.preserves_spaces() {
-                            if current_line > 0.0 {
+                            if maximum.current > 0.0 {
                                 pending_collapsible_space = advance;
                             }
                             continue;
                         }
                     } else {
-                        apply_min_indent(
-                            &mut segment,
-                            &mut min_indent_applied,
-                            min_starts_indented_line,
-                        );
+                        minimum.apply_indent();
                         // Pre-wrap spaces and tabs hang at a hypothetical
                         // line end, so they do not enlarge min-content.
                         if white_space != WhiteSpace::PreWrap || !matches!(c, ' ' | '\t') {
-                            segment += advance;
+                            minimum.current += advance;
                         }
                     }
-                    apply_max_indent(
-                        &mut current_line,
-                        &mut max_indent_applied,
-                        max_starts_indented_line,
-                    );
-                    current_line += pending_collapsible_space + advance;
+                    maximum.add(pending_collapsible_space + advance);
                     pending_collapsible_space = 0.0;
                 }
             }
@@ -499,67 +480,35 @@ fn runs_intrinsic_widths(
                     .unwrap_or(1.0)
                     .max(0.0);
                 }
-                apply_max_indent(
-                    &mut current_line,
-                    &mut max_indent_applied,
-                    max_starts_indented_line,
-                );
-                apply_min_indent(
-                    &mut segment,
-                    &mut min_indent_applied,
-                    min_starts_indented_line,
-                );
-                current_line += pending_collapsible_space + width;
+                maximum.add(pending_collapsible_space + width);
                 pending_collapsible_space = 0.0;
-                segment += width;
+                minimum.add(width);
             }
             InlineItemKind::AtomicBox { box_idx } => {
                 let (atomic_min, atomic_max) = box_intrinsic_widths(engine, *box_idx as usize);
-                apply_max_indent(
-                    &mut current_line,
-                    &mut max_indent_applied,
-                    max_starts_indented_line,
-                );
                 // Atomic inline boxes admit a soft wrap on either side. They
                 // remain adjacent for max-content sizing, but each atomic box
                 // is its own unbreakable segment for min-content sizing.
-                if segment != 0.0 || min_indent_applied {
-                    min_content = min_content.max(segment.max(0.0));
-                    segment = 0.0;
-                    min_starts_indented_line = false;
-                    min_indent_applied = false;
+                if minimum.started() {
+                    minimum.finish(soft_indent);
                 }
-                apply_min_indent(
-                    &mut segment,
-                    &mut min_indent_applied,
-                    min_starts_indented_line,
-                );
-                current_line += pending_collapsible_space + atomic_max;
+                maximum.add(pending_collapsible_space + atomic_max);
                 pending_collapsible_space = 0.0;
-                segment += atomic_min;
-                min_content = min_content.max(segment.max(0.0));
-                segment = 0.0;
-                min_starts_indented_line = false;
-                min_indent_applied = false;
+                minimum.add(atomic_min);
+                minimum.finish(soft_indent);
             }
             InlineItemKind::Break { .. } => {
-                min_content = min_content.max(segment.max(0.0));
-                max_content = max_content.max(current_line.max(0.0));
-                segment = 0.0;
-                current_line = 0.0;
+                minimum.finish(hard_indent);
+                maximum.finish(hard_indent);
                 pending_collapsible_space = 0.0;
-                max_starts_indented_line = each_line_indent;
-                min_starts_indented_line = each_line_indent;
-                max_indent_applied = false;
-                min_indent_applied = false;
             }
             InlineItemKind::FloatAnchor { box_idx } => {
                 let (float_min, float_max) = box_intrinsic_widths(engine, *box_idx as usize);
                 // Consecutive floats may share a line at max-content size,
                 // while the min-content contribution only needs room for
                 // the widest individual float.
-                min_content = min_content.max(float_min);
-                current_line += pending_collapsible_space + float_max;
+                minimum.widest = minimum.widest.max(float_min);
+                maximum.current += pending_collapsible_space + float_max;
                 pending_collapsible_space = 0.0;
             }
             InlineItemKind::AbsoluteAnchor { .. } => {}
@@ -580,26 +529,15 @@ fn runs_intrinsic_widths(
                 } else {
                     0.0
                 };
-                apply_max_indent(
-                    &mut current_line,
-                    &mut max_indent_applied,
-                    max_starts_indented_line,
-                );
-                apply_min_indent(
-                    &mut segment,
-                    &mut min_indent_applied,
-                    min_starts_indented_line,
-                );
-                current_line += pending_collapsible_space + width;
+                maximum.add(pending_collapsible_space + width);
                 pending_collapsible_space = 0.0;
-                segment += width;
+                minimum.add(width);
             }
             // Markers are positioned outside the containing inline flow.
             InlineItemKind::Marker { .. } => {}
         }
     }
 
-    min_content = min_content.max(segment.max(0.0));
-    max_content = max_content.max(current_line.max(0.0));
-    (min_content, max_content.max(min_content))
+    let min_content = minimum.value();
+    (min_content, maximum.value().max(min_content))
 }

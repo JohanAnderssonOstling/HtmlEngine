@@ -1,6 +1,7 @@
 //! Cascade ordering for one style target.
 
-use super::*;
+use crate::style::compiled::{EffectiveRuleId, PreparedRuleSet};
+use std::hash::Hash;
 
 /// Matched rule with specificity for cascade sorting
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]

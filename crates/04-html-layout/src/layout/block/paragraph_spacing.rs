@@ -83,25 +83,26 @@ impl ParagraphSpacing {
                             | "nav"
                             | "header"
                             | "footer"
-                    ) || ["class", "epub:type"].iter().any(|attribute| {
-                        element.attr(attribute).is_some_and(|value| {
-                            value.split_ascii_whitespace().any(|token| {
-                                matches!(
-                                    token,
-                                    "verse"
-                                        | "poem"
-                                        | "poetry"
-                                        | "stanza"
-                                        | "z3998:poem"
-                                        | "z3998:verse"
-                                        | "z3998:stanza"
-                                )
-                            })
+                    ) || element
+                        .attr("class")
+                        .into_iter()
+                        .flat_map(str::split_ascii_whitespace)
+                        .chain(element.epub_types())
+                        .any(|token| {
+                            matches!(
+                                token,
+                                "verse"
+                                    | "poem"
+                                    | "poetry"
+                                    | "stanza"
+                                    | "z3998:poem"
+                                    | "z3998:verse"
+                                    | "z3998:stanza"
+                            )
                         })
-                    }) || element.attr("role").is_some_and(|role| {
-                        role.split_ascii_whitespace()
+                        || element
+                            .aria_roles()
                             .any(|role| matches!(role, "heading" | "list" | "listitem" | "table"))
-                    })
                 })
                 || boxes[index].white_space().preserves_spaces()
                 || boxes[index].display() != Display::Block
@@ -140,7 +141,6 @@ impl ParagraphSpacing {
                             glyphs.clone().any(|glyph| {
                                 content
                                     .character_at(glyph as usize)
-                                    .and_then(char::from_u32)
                                     .is_some_and(char::is_alphanumeric)
                             })
                         })

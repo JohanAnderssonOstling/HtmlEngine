@@ -1,13 +1,23 @@
 [package]
 license.workspace = true
-name = "html-render-core"
-version = "0.1.0"
-edition = "2024"
-publish = false
+name = "skrift-render-core"
+version.workspace = true
+edition.workspace = true
+publish = ["crates-io"]
+description = "Paints HTML documents through host painting interfaces."
+repository.workspace = true
+homepage.workspace = true
+categories.workspace = true
+keywords.workspace = true
+readme = "README.md"
+include.workspace = true
+documentation = "https://docs.rs/skrift-render-core"
+
+[lib]
+name = "html_render_core"
 
 [dependencies]
-html-layout = { path = "../04-html-layout" }
-html-pipeline = { path = "../html-pipeline" }
-html-resources = { path = "../html-resources" }
+html-pipeline = { version = "0.1.0", package = "skrift-pipeline", path = "../html-pipeline" }
+html-resources = { version = "0.1.0", package = "skrift-resources", path = "../html-resources" }
 kurbo.workspace = true
 peniko.workspace = true

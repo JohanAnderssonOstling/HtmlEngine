@@ -1,349 +1,129 @@
 //! Central property routing and property-family application.
 
-use super::*;
-use crate::style::syntax::{sign, unit_algebra, value};
-use static_self::IntoOwned;
-use std::borrow::Cow;
+use super::context::{ApplyResult, PropertyContext, ResolutionContext, ResolvedDeclaration};
+use super::state::WorkingStyle;
+use super::traversal::root_font_size_for_resolution;
+use super::values::fonts::checked_font_shorthand;
+use super::values::{rebind_line_height, resolve_logical_text_alignments};
+use crate::style::property_catalogue::PropertyKey;
+use crate::style::syntax::capabilities;
+use crate::style::syntax::property_id::RendererPropertyId;
+use html_dom::Document;
+use html_style_model::{ComputedStylesBuilder, InheritedText, TextDirection};
+use lightningcss::properties::{Property, PropertyId};
 
 mod box_model;
 mod generated;
 mod layout;
-mod legacy;
 mod misc;
 mod paint;
-mod raw;
 mod text;
 mod typography;
 mod unparsed;
 
-use generated::*;
-use legacy::*;
-use raw::*;
-use unparsed::apply_unparsed_property;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum ApplyResult {
-    Applied,
-    Invalid,
-    Unhandled,
-}
-
-impl ApplyResult {
-    fn conversion_result(self) -> Result<(), ()> {
-        if self == Self::Invalid {
-            Err(())
-        } else {
-            Ok(())
+/// Expand supported native longhands once, retaining the original declaration
+/// as the atomic validation group, including components that lose the cascade.
+pub(super) fn expand_declaration<'css>(
+    property: &Property<'css>,
+    output: &mut Vec<Property<'css>>,
+) -> Result<bool, ()> {
+    let Some(longhands) = property.property_id().longhands() else {
+        return Ok(false);
+    };
+    for id in longhands {
+        if PropertyKey::from_name(id.name()).is_none() {
+            continue;
         }
+        output.push(
+            property
+                .longhand(&id)
+                .or_else(|| match (property, &id) {
+                    (Property::TextDecoration(value, _), PropertyId::TextDecorationThickness) => {
+                        Some(Property::TextDecorationThickness(value.thickness.clone()))
+                    }
+                    _ => None,
+                })
+                .ok_or(())?,
+        );
     }
+    Ok(true)
 }
 
-/// Native property IDs whose dependency recovery tokens have an explicit
-/// renderer conversion, rather than representing an unsupported value.
-pub(super) fn supports_unparsed_property(id: &PropertyId<'_>) -> bool {
-    sign::supports(id) || unit_algebra::size_property(id) || matches!(
-        id,
-        PropertyId::ZIndex | PropertyId::JustifyItems | PropertyId::PlaceItems | PropertyId::FontWeight
-            | PropertyId::Order(_)
-            | PropertyId::LetterSpacing | PropertyId::WordSpacing
-            | PropertyId::Flex(_) | PropertyId::FlexBasis(_)
-    )
-}
-
-pub(super) struct PropertyContext<'a, 'doc> {
-    pub(super) doc: &'a ResolutionDocument<'doc>,
-    pub(super) styles: &'a mut ComputedStylesBuilder,
-    pub(super) style: &'a mut WorkingStyle,
-    pub(super) resolved_root_font_size: f32,
-    pub(super) parent_font_size: f32,
-    pub(super) parent_font_weight: u16,
-    pub(super) parent_color: u32,
-}
-
-pub(super) fn apply_property_in_phase<'a>(
+/// Compute the complete declaration atomically from its cached native values.
+pub(super) fn compute_declaration<'css>(
     doc: &Document,
     styles: &mut ComputedStylesBuilder,
     style: &mut WorkingStyle,
-    property: &Property<'a>,
-    parent_font_size: f32,
-    phase: CascadePhase,
-    parent: &ParentStyle,
+    property: &Property<'css>,
+    resolved: &ResolvedDeclaration<'css>,
+    parent: &WorkingStyle,
     resolution: &ResolutionContext,
 ) -> Result<(), ()> {
-    set_line_height_resolution_bases(doc, styles, property, style, parent, resolution);
-    let computed = if matches!(
-        property,
-        Property::Unparsed(_)
-            | Property::LineHeight(CssLineHeight::Length(LengthPercentage::Calc(_)))
-            | Property::VerticalAlign(VerticalAlign::Length(LengthPercentage::Calc(_)))
-    ) && sign::supports(&property.property_id()) {
-        resolve_sign_property(
-            property, style, parent_font_size,
-            root_font_size_for_resolution(doc, styles), resolution,
-        )?
+    let property = resolved.value.as_deref().unwrap_or(property);
+    if let Property::Font(font) = property {
+        set_line_height_resolution_bases(doc, styles, true, style, parent, resolution);
+        checked_font_shorthand(
+            font,
+            parent.font.font_size,
+            parent.font.font_weight,
+            doc.root_font_size(),
+            resolution,
+        )
+        .ok_or(())?;
+        // The font shorthand resets these renderer-owned features to auto/normal.
+        style.font.font_kerning_features.clear();
+        style.font.font_feature_settings.clear();
+        style.font.font_variant_numeric_features.clear();
+        style.font.font_variant_ligature_features.clear();
+    }
+    let longhands = if resolved.expanded {
+        resolved.longhands.as_slice()
     } else {
-        None
+        std::slice::from_ref(property)
     };
-    let property = computed.as_ref().unwrap_or(property);
-    // Preserve whether the winning background establishes an image layer even
-    // while image painting is unsupported. Canvas background propagation
-    // depends on the computed image being `none`, not merely on whether a
-    // drawable image fragment was produced.
-    if crate::style::syntax::capabilities::property_uses_background_image(property) {
-        if matches!(phase, CascadePhase::Remaining) {
-            style.background.background_image_present = true;
-        }
-        // A background shorthand's color remains independently paintable
-        // underneath an image that this renderer cannot draw. Keep rejecting
-        // standalone background-image declarations after recording their
-        // computed presence, but allow the shorthand's supported color through.
-        if !matches!(property, Property::Background(_)) {
-            return Ok(());
-        }
-    }
-    // Parsing a gradient does not imply that this renderer can paint it. Skip
-    // the entire declaration so an earlier usable fallback remains active.
-    if crate::style::syntax::capabilities::property_uses_gradient(property) {
-        return Ok(());
-    }
-    // Unsupported paint styles are rejected as whole declarations so their
-    // shorthand color/width/line components cannot leak into computed style.
-    if crate::style::syntax::capabilities::property_uses_unsupported_text_decoration_style(property)
-        || crate::style::syntax::capabilities::property_uses_unsupported_outline_style(property)
-    {
-        return Ok(());
-    }
-    if try_apply_legacy_grid_gap_alias(doc, style, property, parent, resolution) {
-        return Ok(());
-    }
-    // CSS-wide keywords copy already-computed values, so applying them in both
-    // phases is idempotent and keeps cascade order within each phase.
-    if let Property::All(keyword) = property {
-        match keyword {
-            CSSWideKeyword::Initial => {
-                let basis = parent.initial_for_child(doc.root_font_size()).to_working_style();
-                apply_all_from_basis(style, &basis, phase);
-            }
-            CSSWideKeyword::Inherit => {
-                let basis = parent.to_working_style();
-                apply_all_from_basis(style, &basis, phase);
-            }
-            CSSWideKeyword::Unset => {
-                let basis = parent.unset_working_style(doc.root_font_size());
-                apply_all_from_basis(style, &basis, phase);
-            }
-            // Winner selection consumes rollback keywords before conversion.
-            CSSWideKeyword::Revert | CSSWideKeyword::RevertLayer => {}
-        }
-        return Ok(());
-    }
-    if try_apply_css_wide_keyword(style, property, parent, doc.root_font_size(), phase) {
-        return Ok(());
-    }
-    if matches!(phase, CascadePhase::Remaining)
-        && let Some(result) = apply_legacy_items(style, property, parent)
-    {
-        return result.conversion_result();
-    }
-    match phase {
-        CascadePhase::Prerequisites => match property {
-            Property::Direction(direction) => {
-                use lightningcss::properties::text::Direction;
-                style.text.direction = match direction {
-                    Direction::Ltr => TextDirection::Ltr,
-                    Direction::Rtl => TextDirection::Rtl,
-                };
-                resolve_logical_text_alignments(&mut style.text);
-            }
-            Property::FontSize(_) | Property::LineHeight(_) | Property::Color(_) => {
-                return apply_property(
-                    doc,
-                    styles,
-                    style,
-                    property,
-                    parent_font_size,
-                    parent.font.font_weight,
-                    parent.text.color,
-                    resolution,
-                )
-                .conversion_result();
-            }
-            Property::Font(font) => {
-                let Some(values) = checked_font_shorthand(
-                    font,
-                    parent_font_size,
-                    parent.font.font_weight,
-                    doc.root_font_size(),
-                    resolution,
-                ) else {
-                    return Err(());
-                };
-                style.font.font_size = values.font_size;
-                style.font.font_size_x_height_px = 0.0;
-                style.font.font_size_ch_advance_px = 0.0;
-                style.font.font_size_cap_height_px = 0.0;
-                style.font.font_size_root_ch = 0.0;
-                style.font.font_size_root_cap_height = 0.0;
-                style.font.font_size_root_line_height = 0.0;
-                style.line_height_spec = Some(font.line_height.clone());
-                style.text.line_height_number = values.line_height_number;
-                style.text.line_height = values.line_height;
-                style.text.line_height_x_height_px = values.line_height_x_height_px;
-                style.text.line_height_normal = values.line_height_normal;
-            }
-            _ => {}
-        },
-        CascadePhase::Remaining => match property {
-            // Already final from the first pass.
-            Property::Direction(_)
-            | Property::FontSize(_)
-            | Property::LineHeight(_)
-            | Property::Color(_) => {}
-            // Apply the shorthand but keep the font size resolved by the first
-            // pass, re-binding the shorthand's line-height to it.
-            Property::Font(_) => {
-                let final_font_size = (
-                    style.font.font_size,
-                    style.font.font_size_x_height_px,
-                    style.font.font_size_ch_advance_px,
-                    style.font.font_size_cap_height_px,
-                    style.font.font_size_root_ch,
-                    style.font.font_size_root_cap_height,
-                    style.font.font_size_root_line_height,
-                );
-                let final_line_height = (
-                    style.line_height_spec.clone(),
-                    style.text.line_height_number,
-                    style.text.line_height,
-                    style.text.line_height_x_height_px,
-                    style.text.line_height_normal,
-                );
-                let result = apply_property(
-                    doc,
-                    styles,
-                    style,
-                    property,
-                    parent_font_size,
-                    parent.font.font_weight,
-                    parent.text.color,
-                    resolution,
-                );
-                style.font.font_size = final_font_size.0;
-                style.font.font_size_x_height_px = final_font_size.1;
-                style.font.font_size_ch_advance_px = final_font_size.2;
-                style.font.font_size_cap_height_px = final_font_size.3;
-                style.font.font_size_root_ch = final_font_size.4;
-                style.font.font_size_root_cap_height = final_font_size.5;
-                style.font.font_size_root_line_height = final_font_size.6;
-                style.line_height_spec = final_line_height.0;
-                style.text.line_height_number = final_line_height.1;
-                style.text.line_height = final_line_height.2;
-                style.text.line_height_x_height_px = final_line_height.3;
-                style.text.line_height_normal = final_line_height.4;
-                if let Some(spec) = style.line_height_spec.as_ref() {
-                    if let Some((line_height, x_height_px)) = checked_line_height_components(
-                        spec,
-                        final_font_size.0,
-                        doc.root_font_size(),
-                        resolution,
-                    ) {
-                        style.text.line_height = line_height;
-                        style.text.line_height_x_height_px = x_height_px;
-                    }
-                }
-                return result.conversion_result();
-            }
-            _ => {
-                return apply_property(
-                    doc,
-                    styles,
-                    style,
-                    property,
-                    parent_font_size,
-                    parent.font.font_weight,
-                    parent.text.color,
-                    resolution,
-                )
-                .conversion_result();
-            }
-        },
+    for property in longhands {
+        apply_longhand(doc, styles, style, property, parent, resolution)?;
     }
     Ok(())
 }
 
-pub(super) fn resolve_sign_property<'a>(
-    property: &Property<'_>,
-    style: &WorkingStyle,
-    parent_font_size: f32,
-    root_font_size: f32,
-    resolution: &ResolutionContext,
-) -> Result<Option<Property<'a>>, ()> {
-    let id = property.property_id();
-    let css = property
-        .value_to_css_string(PrinterOptions::default())
-        .map_err(|_| ())?;
-    let font_size = if matches!(id, PropertyId::FontSize) {
-        parent_font_size
-    } else {
-        style.font.font_size
-    };
-    let lower = |context: &ResolutionContext, scale| {
-        sign::lower(&css, |number| {
-            resolve_number(number, font_size / scale, root_font_size / scale, context)
-        })
-    };
-    let lowered = if matches!(id, PropertyId::FontSize | PropertyId::LineHeight) {
-        resolution.with_canonical_font_sizes(|context| lower(context, resolution.font_size_scale))
-    } else {
-        lower(resolution, 1.0)
-    }?;
-    if matches!(lowered, Cow::Borrowed(_)) {
-        return Ok(None);
-    }
-    let property = value::parsed_property(id, &lowered).ok_or(())?;
-    if matches!(property, Property::Unparsed(_))
-        && !(matches!(property.property_id(), PropertyId::Flex(_))
-            && crate::style::syntax::flex::parse(&lowered).is_some())
-    {
-        return Err(());
-    }
-    Ok(Some(property.into_owned()))
-}
-
-fn apply_property<'a>(
+fn apply_longhand(
     doc: &Document,
     styles: &mut ComputedStylesBuilder,
     style: &mut WorkingStyle,
-    property: &Property<'a>,
-    parent_font_size: f32,
-    parent_font_weight: u16,
-    parent_color: u32,
+    property: &Property<'_>,
+    parent: &WorkingStyle,
     resolution: &ResolutionContext,
-) -> ApplyResult {
-    let resolved_root_font_size = root_font_size_for_resolution(doc, styles);
-    let resolved_document = ResolutionDocument {
-        document: doc,
-        root_font_size: resolved_root_font_size,
-        resolution,
-    };
-    let doc = &resolved_document;
-    if let Some(result) = apply_unparsed_property(
-        styles,
-        style,
-        property,
-        resolved_root_font_size,
-        doc.resolution,
-    ) {
-        return result;
+) -> Result<(), ()> {
+    let parent_relative = matches!(
+        property.property_id(),
+        PropertyId::FontSize | PropertyId::LineHeight | PropertyId::Font
+    );
+    set_line_height_resolution_bases(doc, styles, parent_relative, style, parent, resolution);
+    if let Property::Direction(direction) = property {
+        use lightningcss::properties::text::Direction;
+        style.text.direction = match direction {
+            Direction::Ltr => TextDirection::Ltr,
+            Direction::Rtl => TextDirection::Rtl,
+        };
+        resolve_logical_text_alignments(&mut style.text);
+        return Ok(());
+    }
+    // Keep image presence even when the renderer cannot paint the image.
+    if capabilities::property_uses_background_image(property) {
+        style.background.background_image_present = true;
+        return Ok(());
+    }
+    let root_font_size = root_font_size_for_resolution(doc, styles);
+    if let Some((id, tokens)) = RendererPropertyId::raw(property) {
+        return unparsed::apply(styles, style, id, tokens, root_font_size, resolution).ok_or(());
     }
     let mut context = PropertyContext {
-        doc,
         styles,
         style,
-        resolved_root_font_size,
-        parent_font_size,
-        parent_font_weight,
-        parent_color,
+        resolution,
+        root_font_size,
+        parent,
     };
     for apply in [
         typography::apply,
@@ -353,34 +133,74 @@ fn apply_property<'a>(
         layout::apply,
         misc::apply,
     ] {
-        let result = apply(&mut context, property);
-        if result != ApplyResult::Unhandled {
-            return result;
+        match apply(&mut context, property) {
+            ApplyResult::Applied => return Ok(()),
+            ApplyResult::Invalid => return Err(()),
+            ApplyResult::Unhandled => {}
         }
     }
-    ApplyResult::Unhandled
+    Ok(())
 }
 
-pub(super) fn partially_selected_shorthand_is_computable(
+/// Rebind a selected line height after the final font-size winner is known.
+pub(super) fn finish_prerequisites(
     doc: &Document,
-    styles: &mut ComputedStylesBuilder,
-    scratch: &mut WorkingStyle,
-    base: &WorkingStyle,
-    property: &Property<'_>,
-    parent_font_size: f32,
-    parent: &ParentStyle,
+    styles: &ComputedStylesBuilder,
+    style: &mut WorkingStyle,
+    parent: &WorkingStyle,
     resolution: &ResolutionContext,
-) -> bool {
-    scratch.clone_from(base);
-    set_line_height_resolution_bases(doc, styles, property, scratch, parent, resolution);
-    apply_property(
-        doc,
-        styles,
-        scratch,
-        property,
-        parent_font_size,
-        parent.font.font_weight,
-        parent.text.color,
+) {
+    set_line_height_resolution_bases(doc, styles, true, style, parent, resolution);
+    rebind_line_height(
+        style,
+        || root_font_size_for_resolution(doc, styles),
         resolution,
-    ) != ApplyResult::Invalid
+    );
+}
+
+fn computed_line_height(font_size: f32, text: &InheritedText) -> Option<f32> {
+    // Keep `lh` aligned with the renderer's established used-value behavior
+    // for `normal` (the same 1.2 multiplier used by shaping and inline layout).
+    let value = if text.line_height_normal {
+        font_size * 1.2
+    } else {
+        text.line_height
+    };
+    value.is_finite().then_some(value)
+}
+
+/// CSS Values makes `lh` in font-size and line-height refer to the parent's
+/// computed line height, avoiding a dependency cycle. Other properties use
+/// the element's own (already prerequisite-resolved) computed line height.
+fn set_line_height_resolution_bases(
+    doc: &Document,
+    styles: &ComputedStylesBuilder,
+    parent_relative: bool,
+    style: &WorkingStyle,
+    parent: &WorkingStyle,
+    resolution: &ResolutionContext,
+) {
+    let basis = if parent_relative { parent } else { style };
+    let line_height = computed_line_height(basis.font.font_size, &basis.text);
+    resolution.line_height.set(line_height);
+
+    let root_line_height = stored_root_line_height(doc, styles).or_else(|| {
+        // While resolving the root itself, font-size and line-height must
+        // use their initial basis to avoid a cycle. Other root properties
+        // can use the prerequisite-resolved root line height.
+        if parent_relative {
+            computed_line_height(doc.root_font_size(), &InheritedText::default())
+        } else {
+            line_height
+        }
+    });
+    resolution.root_line_height.set(root_line_height);
+}
+
+fn stored_root_line_height(doc: &Document, styles: &ComputedStylesBuilder) -> Option<f32> {
+    let indices = styles.style_for_node(doc.dom_root()?)?;
+    computed_line_height(
+        styles.font_style(indices)?.font_size,
+        styles.text_style(indices)?,
+    )
 }

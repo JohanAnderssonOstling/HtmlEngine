@@ -125,7 +125,7 @@ pub(super) fn track_size(
             breadth_pair(*value, percentage_basis, cyclic_calc_is_auto)
         }
         UsedGridTrackSize::MinMax { min, max } => TrackSizingFunction {
-            min: min_breadth(*min, percentage_basis, cyclic_calc_is_auto),
+            min: max_breadth(*min, percentage_basis, cyclic_calc_is_auto).into(),
             max: if floor_fixed_auto_maximum {
                 max_breadth_with_auto_minimum_floor(
                     *min,
@@ -230,40 +230,10 @@ fn breadth_pair(
     percentage_basis: Option<f64>,
     cyclic_calc_is_auto: bool,
 ) -> TrackSizingFunction {
+    let max = max_breadth(value, percentage_basis, cyclic_calc_is_auto);
     TrackSizingFunction {
-        min: min_breadth(value, percentage_basis, cyclic_calc_is_auto),
-        max: max_breadth(value, percentage_basis, cyclic_calc_is_auto),
-    }
-}
-
-fn min_breadth(
-    value: UsedGridTrackBreadth,
-    percentage_basis: Option<f64>,
-    cyclic_calc_is_auto: bool,
-) -> MinTrackSizingFunction {
-    match value {
-        UsedGridTrackBreadth::Length(UsedLengthPct::Px(value)) => {
-            MinTrackSizingFunction::length(value)
-        }
-        UsedGridTrackBreadth::Length(UsedLengthPct::Pct(value)) => {
-            MinTrackSizingFunction::percent(value)
-        }
-        UsedGridTrackBreadth::Length(UsedLengthPct::Calc { percentage, .. })
-            if cyclic_calc_is_auto && percentage_basis.is_none() && percentage != 0.0 =>
-        {
-            MinTrackSizingFunction::auto()
-        }
-        UsedGridTrackBreadth::Length(UsedLengthPct::Calc {
-            absolute_px,
-            percentage,
-            ..
-        }) => {
-            MinTrackSizingFunction::length(resolve_calc(absolute_px, percentage, percentage_basis))
-        }
-        UsedGridTrackBreadth::Flex(_) => MinTrackSizingFunction::auto(),
-        UsedGridTrackBreadth::MinContent => MinTrackSizingFunction::min_content(),
-        UsedGridTrackBreadth::MaxContent => MinTrackSizingFunction::max_content(),
-        UsedGridTrackBreadth::Auto => MinTrackSizingFunction::auto(),
+        min: max.into(),
+        max,
     }
 }
 
@@ -359,57 +329,37 @@ pub(super) fn used_length_percentage(
 pub(super) fn template_tracks_use_percentage<'a>(
     tracks: impl IntoIterator<Item = UsedGridTemplateTrack<'a>>,
 ) -> bool {
-    fn length_uses_percentage(value: UsedLengthPct) -> bool {
-        match value {
-            UsedLengthPct::Pct(_) => true,
-            UsedLengthPct::Calc { percentage, .. } => percentage != 0.0,
-            UsedLengthPct::Px(_) => false,
-        }
-    }
-    fn breadth_uses_percentage(value: UsedGridTrackBreadth) -> bool {
-        matches!(value, UsedGridTrackBreadth::Length(length) if length_uses_percentage(length))
-    }
-    fn track_uses_percentage(value: UsedGridTrackSize) -> bool {
-        match value {
-            UsedGridTrackSize::Breadth(breadth) => breadth_uses_percentage(breadth),
-            UsedGridTrackSize::MinMax { min, max } => {
-                breadth_uses_percentage(min) || breadth_uses_percentage(max)
-            }
-            UsedGridTrackSize::FitContent(length) => length_uses_percentage(length),
-            UsedGridTrackSize::Auto => false,
-        }
-    }
-
-    tracks.into_iter().any(|component| match component {
-        UsedGridTemplateTrack::Single(track) => track_uses_percentage(track),
-        UsedGridTemplateTrack::Repeat { tracks, .. } => tracks.iter().any(track_uses_percentage),
+    template_tracks_any_length(tracks, |length| match length {
+        UsedLengthPct::Pct(_) => true,
+        UsedLengthPct::Calc { percentage, .. } => percentage != 0.0,
+        UsedLengthPct::Px(_) => false,
     })
 }
 
 pub(super) fn template_tracks_have_percentage_calc<'a>(
     tracks: impl IntoIterator<Item = UsedGridTemplateTrack<'a>>,
 ) -> bool {
-    fn breadth_has_percentage_calc(value: UsedGridTrackBreadth) -> bool {
-        matches!(value, UsedGridTrackBreadth::Length(UsedLengthPct::Calc { percentage, .. }) if percentage != 0.0)
-    }
-    fn track_has_percentage_calc(value: UsedGridTrackSize) -> bool {
-        match value {
-            UsedGridTrackSize::Breadth(breadth) => breadth_has_percentage_calc(breadth),
-            UsedGridTrackSize::MinMax { min, max } => {
-                breadth_has_percentage_calc(min) || breadth_has_percentage_calc(max)
-            }
-            UsedGridTrackSize::FitContent(UsedLengthPct::Calc { percentage, .. }) => {
-                percentage != 0.0
-            }
-            UsedGridTrackSize::Auto | UsedGridTrackSize::FitContent(_) => false,
-        }
-    }
+    template_tracks_any_length(
+        tracks,
+        |length| matches!(length, UsedLengthPct::Calc { percentage, .. } if percentage != 0.0),
+    )
+}
 
+fn template_tracks_any_length<'a>(
+    tracks: impl IntoIterator<Item = UsedGridTemplateTrack<'a>>,
+    predicate: impl Fn(UsedLengthPct) -> bool,
+) -> bool {
+    let breadth_matches =
+        |breadth| matches!(breadth, UsedGridTrackBreadth::Length(length) if predicate(length));
+    let track_matches = |track| match track {
+        UsedGridTrackSize::Breadth(breadth) => breadth_matches(breadth),
+        UsedGridTrackSize::MinMax { min, max } => breadth_matches(min) || breadth_matches(max),
+        UsedGridTrackSize::FitContent(length) => predicate(length),
+        UsedGridTrackSize::Auto => false,
+    };
     tracks.into_iter().any(|component| match component {
-        UsedGridTemplateTrack::Single(track) => track_has_percentage_calc(track),
-        UsedGridTemplateTrack::Repeat { tracks, .. } => {
-            tracks.iter().any(track_has_percentage_calc)
-        }
+        UsedGridTemplateTrack::Single(track) => track_matches(track),
+        UsedGridTemplateTrack::Repeat { tracks, .. } => tracks.iter().any(&track_matches),
     })
 }
 
@@ -429,5 +379,81 @@ pub(super) fn length_percentage_auto(
             percentage,
             ..
         } => LengthPercentageAuto::length(absolute_px + percentage_basis as f32 * percentage),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flexible_tracks_keep_an_auto_minimum() {
+        let track = breadth_pair(UsedGridTrackBreadth::Flex(2.0), None, false);
+        assert_eq!(track.min, MinTrackSizingFunction::auto());
+        assert_eq!(track.max, MaxTrackSizingFunction::fr(2.0));
+    }
+
+    #[test]
+    fn cyclic_calc_tracks_resolve_only_when_a_basis_is_available() {
+        let breadth = UsedGridTrackBreadth::Length(UsedLengthPct::Calc {
+            absolute_px: 10.0,
+            percentage: 0.5,
+            percentage_dependent: true,
+        });
+        let unresolved = breadth_pair(breadth, None, true);
+        assert_eq!(unresolved.min, MinTrackSizingFunction::auto());
+        assert_eq!(unresolved.max, MaxTrackSizingFunction::auto());
+        let resolved = breadth_pair(breadth, Some(100.0), true);
+        assert_eq!(resolved.min, MinTrackSizingFunction::length(60.0));
+        assert_eq!(resolved.max, MaxTrackSizingFunction::length(60.0));
+    }
+
+    #[test]
+    fn percentage_queries_distinguish_zero_percent_and_cancelled_calc() {
+        for (length, percentage, calc) in [
+            (UsedLengthPct::Px(10.0), false, false),
+            (UsedLengthPct::Pct(0.0), true, false),
+            (
+                UsedLengthPct::Calc {
+                    absolute_px: 10.0,
+                    percentage: 0.0,
+                    percentage_dependent: true,
+                },
+                false,
+                false,
+            ),
+            (
+                UsedLengthPct::Calc {
+                    absolute_px: 10.0,
+                    percentage: 0.5,
+                    percentage_dependent: true,
+                },
+                true,
+                true,
+            ),
+        ] {
+            let breadth = UsedGridTrackBreadth::Length(length);
+            for track in [
+                UsedGridTrackSize::Breadth(breadth),
+                UsedGridTrackSize::MinMax {
+                    min: breadth,
+                    max: UsedGridTrackBreadth::Auto,
+                },
+                UsedGridTrackSize::MinMax {
+                    min: UsedGridTrackBreadth::Auto,
+                    max: breadth,
+                },
+                UsedGridTrackSize::FitContent(length),
+            ] {
+                assert_eq!(
+                    template_tracks_use_percentage([UsedGridTemplateTrack::Single(track)]),
+                    percentage
+                );
+                assert_eq!(
+                    template_tracks_have_percentage_calc([UsedGridTemplateTrack::Single(track)]),
+                    calc
+                );
+            }
+        }
     }
 }

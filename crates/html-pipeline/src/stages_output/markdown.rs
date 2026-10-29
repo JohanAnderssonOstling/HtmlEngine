@@ -1,8 +1,8 @@
 //! Markdown clipboard payloads for logical text and box selections.
 
-use super::{DocumentRead, RenderTable};
-use crate::layout_model::InlineItemKind;
-use html_dom::{Document, DomNodeId, ElementRef};
+use super::{DocumentRead, RenderTable, merge_text_ranges};
+use crate::layout_model::{InlineItemKind, parse_positive_span};
+use html_dom::{Document, DomNodeId, ElementRef, write_escaped_html_attribute};
 use html_style_model::{ComputedStyles, Display, FontStyle, Visibility};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use std::ops::Range;
@@ -31,15 +31,40 @@ impl<'a> RenderExportView<'a> {
         let Some((root, selected)) = self.selection(glyphs) else {
             return (None, None);
         };
-        let plain = selected.plain(root).trim_matches('\n').to_owned();
-        ((!plain.is_empty()).then_some(plain), selected.finish(root))
+        (finish_plain_text(selected.plain(root)), selected.finish(root))
     }
 
     /// Visible source text for a logical selection, without generating Markdown.
     pub fn plain_text(self, glyphs: Range<u32>) -> Option<String> {
         let (root, selected) = self.selection(glyphs)?;
-        let plain = selected.plain(root).trim_matches('\n').to_owned();
-        (!plain.is_empty()).then_some(plain)
+        finish_plain_text(selected.plain(root))
+    }
+
+    /// Export visible source text with blank lines between text blocks.
+    /// Authored line breaks remain single newlines.
+    pub fn plain_text_with_paragraph_breaks(self, glyphs: Range<u32>) -> Option<String> {
+        let (root, selected) = self.selection(glyphs)?;
+        finish_plain_text(selected.plain_separated(root, "\n\n"))
+    }
+
+    /// Export disjoint source ranges once in document order. Duplicates and
+    /// overlaps are merged; generated content and hidden text are excluded.
+    pub fn plain_text_ranges(self, ranges: impl IntoIterator<Item = Range<u32>>) -> Option<String> {
+        let count = self.doc.inputs.text.content().characters().len();
+        let mut ranges: Vec<_> = ranges.into_iter().collect();
+        if ranges
+            .iter()
+            .any(|range| range.start > range.end || range.end as usize > count)
+        {
+            return None;
+        }
+        merge_text_ranges(&mut ranges);
+        if ranges.is_empty() {
+            return None;
+        }
+        let root = self.doc.document().dom_root()?;
+        let selected = Markdown::new_ranges(self.doc, Some(&ranges), root);
+        finish_plain_text(selected.plain(root))
     }
 
     /// Convert a half-open logical glyph range to Markdown. These are the same
@@ -74,6 +99,18 @@ impl<'a> RenderExportView<'a> {
     }
 }
 
+fn finish_plain_text(text: String) -> Option<String> {
+    finish_text(text, |character| character == '\n')
+}
+
+fn finish_text(mut text: String, trim: impl FnMut(char) -> bool + Copy) -> Option<String> {
+    let end = text.trim_end_matches(trim).len();
+    text.truncate(end);
+    let start = text.len() - text.trim_start_matches(trim).len();
+    text.drain(..start);
+    (!text.is_empty()).then_some(text)
+}
+
 struct Markdown<'a> {
     document: &'a Document,
     styles: &'a ComputedStyles,
@@ -86,6 +123,14 @@ struct Markdown<'a> {
 
 impl<'a> Markdown<'a> {
     fn new(doc: DocumentRead<'a>, selection: Option<Range<u32>>, root: DomNodeId) -> Self {
+        Self::new_ranges(doc, selection.as_ref().map(std::slice::from_ref), root)
+    }
+
+    fn new_ranges(
+        doc: DocumentRead<'a>,
+        selection: Option<&[Range<u32>]>,
+        root: DomNodeId,
+    ) -> Self {
         let document = doc.document();
         let mut result = Self {
             document,
@@ -140,34 +185,34 @@ impl<'a> Markdown<'a> {
                     {
                         continue;
                     }
-                    let start = selection
-                        .as_ref()
-                        .map_or(glyphs.start, |range| glyphs.start.max(range.start));
-                    let end = selection
-                        .as_ref()
-                        .map_or(glyphs.end, |range| glyphs.end.min(range.end));
-                    if start >= end {
-                        continue;
+                    let complete = [glyphs.clone()];
+                    let selected = selection.unwrap_or(&complete);
+                    let first = selected.partition_point(|range| range.end <= glyphs.start);
+                    for range in selected[first..]
+                        .iter()
+                        .take_while(|range| range.start < glyphs.end)
+                    {
+                        let start = glyphs.start.max(range.start);
+                        let end = glyphs.end.min(range.end);
+                        if start >= end {
+                            continue;
+                        }
+                        let pre = document
+                            .dom_ancestors(node)
+                            .find(|&ancestor| document.get_dom_tag(ancestor) == Some("pre"));
+                        common_pre = Some(match common_pre {
+                            None => pre,
+                            Some(previous) if previous == pre => pre,
+                            _ => None,
+                        });
+                        let text = result.text.entry(node).or_default();
+                        text.extend(
+                            (start..end)
+                                .filter_map(|index| content.character_at(index as usize))
+                                .filter(|&ch| ch != '\u{00ad}'),
+                        );
+                        result.activate(node);
                     }
-                    let pre = document
-                        .dom_ancestors(node)
-                        .find(|&ancestor| document.get_dom_tag(ancestor) == Some("pre"));
-                    common_pre = Some(match common_pre {
-                        None => pre,
-                        Some(previous) if previous == pre => pre,
-                        _ => None,
-                    });
-                    let text = result.text.entry(node).or_default();
-                    text.extend(
-                        (start..end)
-                            .filter_map(|index| {
-                                content
-                                    .character_at(index as usize)
-                                    .and_then(char::from_u32)
-                            })
-                            .filter(|&ch| ch != '\u{00ad}'),
-                    );
-                    result.activate(node);
                 }
                 _ => {}
             }
@@ -175,7 +220,7 @@ impl<'a> Markdown<'a> {
         if selection.is_some() {
             result.inline_pre = common_pre.flatten();
         }
-        result.include_objects(doc, root, &bounds, &mut 0, selection.as_ref());
+        result.include_objects(doc, root, &bounds, &mut 0, selection);
         result
     }
 
@@ -185,7 +230,7 @@ impl<'a> Markdown<'a> {
         node: DomNodeId,
         bounds: &FxHashMap<DomNodeId, Range<u32>>,
         cursor: &mut u32,
-        selection: Option<&Range<u32>>,
+        selection: Option<&[Range<u32>]>,
     ) {
         if let Some(range) = bounds.get(&node) {
             *cursor = range.end;
@@ -206,7 +251,11 @@ impl<'a> Markdown<'a> {
             && style.is_some_and(|style| style.visibility() == Visibility::Visible)
         {
             self.visible.insert(node);
-            if selection.is_none_or(|range| range.start < *cursor && *cursor < range.end) {
+            if selection.is_none_or(|ranges| {
+                ranges
+                    .iter()
+                    .any(|range| range.start < *cursor && *cursor < range.end)
+            }) {
                 self.activate(node);
             }
         }
@@ -229,9 +278,7 @@ impl<'a> Markdown<'a> {
     }
 
     fn finish(&self, root: DomNodeId) -> Option<String> {
-        let output = self.node(root);
-        let output = output.trim().to_owned();
-        (!output.is_empty()).then_some(output)
+        finish_text(self.node(root), char::is_whitespace)
     }
 
     fn children(&self, element: ElementRef<'_>) -> String {
@@ -437,6 +484,10 @@ impl<'a> Markdown<'a> {
     }
 
     fn plain(&self, node: DomNodeId) -> String {
+        self.plain_separated(node, "\n")
+    }
+
+    fn plain_separated(&self, node: DomNodeId, separator: &str) -> String {
         if let Some(text) = self.text.get(&node) {
             return text.clone();
         }
@@ -451,9 +502,12 @@ impl<'a> Markdown<'a> {
         }
         let mut output = String::new();
         for child in element.children() {
-            let content = self.plain(child);
-            if output.ends_with('\n') && content.starts_with('\n') {
-                output.push_str(content.trim_start_matches('\n'));
+            let content = self.plain_separated(child, separator);
+            if !separator.is_empty()
+                && output.ends_with(separator)
+                && content.starts_with(separator)
+            {
+                output.push_str(content.strip_prefix(separator).unwrap_or(&content));
             } else {
                 output.push_str(&content);
             }
@@ -475,7 +529,7 @@ impl<'a> Markdown<'a> {
             ))
             && !output.is_empty()
         {
-            format!("\n{}\n", output.trim_matches('\n'))
+            format!("{separator}{}{separator}", output.trim_matches('\n'))
         } else {
             output
         }
@@ -598,11 +652,8 @@ impl<'a> Markdown<'a> {
             .is_some_and(|row| !row.is_empty() && row.iter().all(|cell| cell.tag() == "th"));
         let complex = cells.iter().enumerate().any(|(index, row)| {
             row.iter().any(|cell| {
-                cell.attr("rowspan")
-                    .is_some_and(|span| span.parse::<usize>().is_ok_and(|span| span != 1))
-                    || cell
-                        .attr("colspan")
-                        .is_some_and(|span| span.parse::<usize>().is_ok_and(|span| span != 1))
+                parse_positive_span(cell.attr("rowspan")) > 1
+                    || parse_positive_span(cell.attr("colspan")) > 1
                     || (cell.tag() == "th" && !(index == 0 && header))
                     || self.has_block_children(*cell)
             })
@@ -719,7 +770,11 @@ impl<'a> Markdown<'a> {
             "rowspan", "colspan", "start", "reversed", "value", "href", "src", "alt", "title",
         ] {
             if let Some(value) = element.attr(name) {
-                output.push_str(&format!(" {name}=\"{}\"", escape_html(value)));
+                output.push(' ');
+                output.push_str(name);
+                output.push_str("=\"");
+                write_escaped_html_attribute(&mut output, value);
+                output.push('"');
             }
         }
         output.push('>');
@@ -751,7 +806,7 @@ impl RenderTable {
                     html.push_str(&format!(" colspan=\"{}\"", cell.colspan()));
                 }
                 html.push('>');
-                html.push_str(&escape_html(cell.text()));
+                write_escaped_html_attribute(&mut html, cell.text());
                 html.push_str("</");
                 html.push_str(tag);
                 html.push('>');
@@ -783,20 +838,20 @@ impl RenderTable {
         let width = column_end - columns.start;
         let mut grid = vec![vec![String::new(); width]; row_end - rows.start];
         let mut header = false;
-        for row in self.rows() {
-            for cell in row.cells() {
-                if cell.row().saturating_add(cell.rowspan()) <= rows.start
-                    || cell.row() >= row_end
-                    || cell.column().saturating_add(cell.colspan()) <= columns.start
-                    || cell.column() >= column_end
-                {
-                    continue;
-                }
-                header |= cell.row() == rows.start && cell.is_header();
-                let row = cell.row().max(rows.start) - rows.start;
-                let column = cell.column().max(columns.start) - columns.start;
-                grid[row][column] = escape_text(&cell.text().replace(['\r', '\n'], " "));
+        for cell in self.cells() {
+            let cell_rows = cell.row_range();
+            let cell_columns = cell.column_range();
+            if cell_rows.end <= rows.start
+                || cell_rows.start >= row_end
+                || cell_columns.end <= columns.start
+                || cell_columns.start >= column_end
+            {
+                continue;
             }
+            header |= cell.row() == rows.start && cell.is_header();
+            let row = cell_rows.start.max(rows.start) - rows.start;
+            let column = cell_columns.start.max(columns.start) - columns.start;
+            grid[row][column] = escape_text(&cell.text().replace(['\r', '\n'], " "));
         }
         let format_row = |row: &[String]| format!("| {} |", row.join(" | "));
         let mut lines = vec![if header {
@@ -934,23 +989,16 @@ fn title(value: Option<&str>) -> String {
 }
 
 fn escape_html(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
+    let mut output = String::with_capacity(value.len());
+    write_escaped_html_attribute(&mut output, value);
+    output
 }
 
-fn within(document: &Document, mut node: DomNodeId, root: DomNodeId) -> bool {
-    loop {
-        if node == root {
-            return true;
-        }
-        let Some(parent) = document.get_dom_parent(node) else {
-            return false;
-        };
-        node = parent;
-    }
+fn within(document: &Document, node: DomNodeId, root: DomNodeId) -> bool {
+    node == root
+        || document
+            .dom_ancestors(node)
+            .any(|ancestor| ancestor == root)
 }
 
 fn code_language(element: ElementRef<'_>) -> Option<&str> {
@@ -965,4 +1013,45 @@ fn code_language(element: ElementRef<'_>) -> Option<&str> {
         })
         .or_else(|| element.attr("data-language"))
         .filter(|language| !language.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{finish_plain_text, finish_text};
+    use crate::allocation_test_support::count_allocations;
+
+    #[test]
+    fn text_finishing_reuses_the_export_buffer() {
+        let cases: [(&str, &str, fn(char) -> bool); 3] = [
+            (
+                "\n\n \tcafé\u{a0}\r\n🙂e\u{301} \n\n",
+                " \tcafé\u{a0}\r\n🙂e\u{301} ",
+                |character| character == '\n',
+            ),
+            (
+                "\u{2003}\t café\n🙂e\u{301} \u{a0}",
+                "café\n🙂e\u{301}",
+                char::is_whitespace,
+            ),
+            ("already trimmed", "already trimmed", char::is_whitespace),
+        ];
+        for (source, expected, trim) in cases {
+            let mut text = String::with_capacity(source.len() + 64);
+            text.push_str(source);
+            let pointer = text.as_ptr();
+            let capacity = text.capacity();
+            let (result, allocations) = count_allocations(|| finish_text(text, trim));
+            let result = result.unwrap();
+            assert_eq!(result, expected);
+            assert_eq!(result.as_ptr(), pointer);
+            assert_eq!(result.capacity(), capacity);
+            assert_eq!(allocations, 0);
+        }
+        for source in ["", "\n\n"] {
+            let text = source.to_owned();
+            let (result, allocations) = count_allocations(|| finish_plain_text(text));
+            assert!(result.is_none());
+            assert_eq!(allocations, 0);
+        }
+    }
 }

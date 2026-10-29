@@ -3,7 +3,8 @@
 //! Only compact single-compound tag, ID, class, and universal selectors enter
 //! this cache. DOM-dependent selectors continue through the exact matcher.
 
-use super::*;
+use crate::style::compiled::EffectiveRuleId;
+use html_dom::{Document, DomNodeId};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxHasher};
 use std::hash::{Hash, Hasher};
 

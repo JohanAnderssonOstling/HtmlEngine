@@ -89,6 +89,9 @@ fn shrink_to_fit_intrinsic_widths_include_text_indent_on_the_applicable_line() {
         <div id='forced' style='float:left;clear:left;text-indent:30px'><span style='display:inline-block;width:10px'></span><br><span style='display:inline-block;width:20px'></span></div>
         <div id='negative' style='float:left;clear:left;text-indent:-30px'><span style='display:inline-block;width:50px'></span></div>
         <div id='negative-soft' style='float:left;clear:left;text-indent:-30px'><span style='display:inline-block;width:10px'></span>&#x200B;<span style='display:inline-block;width:30px'></span></div>
+        <div id='each-line' style='float:left;clear:left;text-indent:30px each-line'><span style='display:inline-block;width:10px'></span><br><span style='display:inline-block;width:20px'></span></div>
+        <div id='hanging' style='float:left;clear:left;text-indent:30px hanging'><span style='display:inline-block;width:10px'></span><br><span style='display:inline-block;width:20px'></span></div>
+        <div id='hanging-each-line' style='float:left;clear:left;text-indent:30px hanging each-line'><span style='display:inline-block;width:10px'></span><br><span style='display:inline-block;width:20px'></span></div>
     </body></html>";
     let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(html, 600.0, &mut document_resources);
@@ -121,6 +124,17 @@ fn shrink_to_fit_intrinsic_widths_include_text_indent_on_the_applicable_line() {
             .width,
         30.0
     );
+    for (id, expected) in [
+        ("each-line", 50.0),
+        ("hanging", 50.0),
+        ("hanging-each-line", 20.0),
+    ] {
+        assert_eq!(
+            id_geometry(&document, id, &document_resources).1.width,
+            expected,
+            "{id}"
+        );
+    }
 }
 
 #[test]
@@ -1262,6 +1276,39 @@ fn absolute_nested_table_text_translates_with_top_zero_container() {
 }
 
 #[test]
+fn nested_relative_split_ancestors_accumulate_offsets_and_negative_layers() {
+    let mut points = Vec::new();
+    for [outer_x, outer_y, inner_x, inner_y, block_x, block_y] in [[0; 6], [3, 5, 7, 11, 13, 17]] {
+        let mut resources = GlyphResourceStore::default();
+        let html = format!(
+            "<html><body style='margin:0'><div><span style='position:relative;left:{outer_x}px;top:{outer_y}px;z-index:-1'><span style='position:relative;left:{inner_x}px;top:{inner_y}px'><div id='block' style='position:relative;left:{block_x}px;top:{block_y}px;z-index:2;width:30px;background:green'>X</div></span></span></div></body></html>"
+        );
+        let document = layout_html(&html, 300.0, &mut resources);
+        let (point, size) = id_geometry(&document, "block", &resources);
+        let view = document.render_view(&resources);
+        let background = view
+            .fragments()
+            .decorations()
+            .iter()
+            .find(|fragment| fragment.color() == 0x008000ff)
+            .expect("block background");
+        assert_eq!(
+            background.rect(),
+            kurbo::Rect::from_origin_size(point, size)
+        );
+        assert!(background.is_in_positioned_layer());
+        assert!(background.is_in_negative_positioned_layer());
+        assert!(
+            view.text()
+                .lines()
+                .iter()
+                .any(|line| line.is_in_negative_positioned_layer())
+        );
+        points.push(point);
+    }
+    assert_eq!(points[1] - points[0], Vec2::new(23.0, 33.0));
+}
+#[test]
 fn z_index_orders_positioned_text_and_backgrounds_independently_of_dom_order() {
     let mut document_resources = GlyphResourceStore::default();
     let document = layout_html(
@@ -1275,7 +1322,7 @@ fn z_index_orders_positioned_text_and_backgrounds_independently_of_dom_order() {
     let painted_starts = text
         .paint_order_indices()
         .iter()
-        .map(|&index| lines[index as usize].start())
+        .map(|&id| text.line(id.index()).unwrap().start())
         .collect::<Vec<_>>();
     assert!(
         painted_starts[0] > painted_starts[1],
@@ -1396,11 +1443,11 @@ fn later_inline_text_paints_after_earlier_inline_block_text() {
     let paint_order = text.paint_order_indices();
     let earlier_position = paint_order
         .iter()
-        .position(|&line| line as usize == earlier_atomic_line)
+        .position(|&line| line.index() == earlier_atomic_line)
         .expect("inline-block line must occur in paint traversal");
     let later_position = paint_order
         .iter()
-        .position(|&line| line as usize == later_inline_line)
+        .position(|&line| line.index() == later_inline_line)
         .expect("later inline line must occur in paint traversal");
     assert!(
         earlier_position < later_position,
@@ -1485,6 +1532,60 @@ fn float_backgrounds_paint_after_ordinary_in_flow_block_backgrounds() {
         .filter(|color| matches!(color, 0x008000FF | 0xFF0000FF))
         .collect::<Vec<_>>();
     assert_eq!(colors, vec![0xFF0000FF, 0x008000FF]);
+}
+
+#[test]
+fn absolute_axes_preserve_auto_margin_overflow_and_percentage_bases() {
+    for (parent_style, target_style, expected) in [
+        (
+            "width:100px;height:80px",
+            "inset:10px;width:20px;height:20px;margin:auto",
+            Vec2::new(40.0, 30.0),
+        ),
+        (
+            "width:100px;height:80px",
+            "inset:10px;width:200px;height:160px;margin:auto;direction:ltr",
+            Vec2::new(10.0, -40.0),
+        ),
+        (
+            "width:100px;height:80px",
+            "inset:10px;width:200px;height:160px;margin:auto;direction:rtl",
+            Vec2::new(-110.0, -40.0),
+        ),
+        (
+            "width:100px;height:80px",
+            "inset:10px;width:20px;height:20px;margin:auto 7px 7px auto",
+            Vec2::new(63.0, 43.0),
+        ),
+        (
+            "width:100px;height:80px",
+            "right:10px;bottom:15px;width:20px;height:20px;margin-right:7px;margin-bottom:9px",
+            Vec2::new(63.0, 36.0),
+        ),
+        (
+            "width:200px;height:100px",
+            "inset:0;width:20px;height:20px;margin-left:25%;margin-top:25%",
+            Vec2::new(50.0, 50.0),
+        ),
+        (
+            "width:200px;height:100px;direction:rtl",
+            "width:20px;height:20px;direction:ltr",
+            Vec2::new(180.0, 0.0),
+        ),
+    ] {
+        let mut resources = GlyphResourceStore::default();
+        let html = format!(
+            "<html><body style='margin:0'><div id='parent' style='position:relative;{parent_style}'><div id='target' style='position:absolute;{target_style}'></div></div></body></html>"
+        );
+        let document = layout_html(&html, 400.0, &mut resources);
+        let (parent, _) = id_geometry(&document, "parent", &resources);
+        let (target, _) = id_geometry(&document, "target", &resources);
+        assert_eq!(
+            target - parent,
+            expected,
+            "{parent_style}; {target_style}"
+        );
+    }
 }
 
 #[test]
@@ -1766,6 +1867,31 @@ fn intrinsic_block_size_keywords_constrain_natural_content_height() {
             .height,
         30.0
     );
+}
+
+#[test]
+fn intrinsic_height_constraints_keep_minimum_precedence() {
+    for display in ["block", "inline-block", "flex"] {
+        let mut resources = GlyphResourceStore::default();
+        let html = format!(
+            "<html><body style='margin:0'>
+                <div id='intrinsic-min' style='display:{display};height:0;min-height:max-content;max-height:10px;padding:2px;border:3px solid'>
+                    <div style='height:40px'></div>
+                </div>
+                <div id='intrinsic-max' style='display:{display};height:200px;min-height:70px;max-height:min-content;padding:2px;border:3px solid'>
+                    <div style='height:40px'></div>
+                </div>
+            </body></html>"
+        );
+        let document = layout_html(&html, 300.0, &mut resources);
+        for (id, expected) in [("intrinsic-min", 50.0), ("intrinsic-max", 80.0)] {
+            assert_eq!(
+                id_geometry(&document, id, &resources).1.height,
+                expected,
+                "{display}: #{id} must honor the minimum over the maximum"
+            );
+        }
+    }
 }
 
 #[test]

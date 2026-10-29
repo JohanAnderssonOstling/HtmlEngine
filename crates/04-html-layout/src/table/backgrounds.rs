@@ -1,17 +1,9 @@
-use super::columns::{TableColumnLayout, span_extent};
+use super::columns::{TableCellPlacement, TableColumnLayout, span_extent};
 use crate::layout::LayoutEngine;
+use crate::layout::decorations::record_bound_background;
 use crate::layout::paint_program::PaintStyleSource;
 use crate::layout_model::{TableColumnGroupSpan, TableColumnTrack};
 use kurbo::{Point, Rect};
-
-fn emit_table_background_rect(
-    session: &mut LayoutEngine<'_, '_>,
-    table_box_idx: usize,
-    rect: Rect,
-    source: PaintStyleSource,
-) {
-    crate::layout::decorations::emit_bound_background(session, table_box_idx, rect, source);
-}
 
 pub(super) fn emit_collapsed_table_background(
     session: &mut LayoutEngine<'_, '_>,
@@ -27,7 +19,7 @@ pub(super) fn emit_collapsed_table_background(
     {
         return;
     }
-    emit_table_background_rect(
+    record_bound_background(
         session,
         table_box_idx,
         rect,
@@ -40,13 +32,10 @@ pub(super) fn emit_table_layers(
     table_box_idx: usize,
     table_content_pos: Point,
     table_height: f64,
-    h_spacing: f64,
-    v_spacing: f64,
     columns: &TableColumnLayout,
     column_tracks: &[TableColumnTrack],
     column_groups: &[TableColumnGroupSpan],
 ) {
-    let _ = (h_spacing, v_spacing);
     let grid_top = table_content_pos.y;
     let grid_height = table_height.max(0.0);
     let grid_left = table_content_pos.x;
@@ -72,7 +61,7 @@ pub(super) fn emit_table_layers(
         if start >= end {
             continue;
         }
-        let span_width = span_extent(&columns.starts, &columns.widths, start, end - start);
+        let span_width = columns.span_width(start, end - start);
         if span_width <= 0.0 {
             continue;
         }
@@ -82,11 +71,14 @@ pub(super) fn emit_table_layers(
         {
             continue;
         }
-        emit_table_background_rect(
+        record_bound_background(
             session,
             table_box_idx,
             Rect::new(x, table_grid.y0, x + span_width, table_grid.y1),
-            PaintStyleSource::Style {indices:group.style,context:table_box_idx as u32},
+            PaintStyleSource::Style {
+                indices: group.style,
+                context: table_box_idx as u32,
+            },
         );
     }
 
@@ -94,8 +86,7 @@ pub(super) fn emit_table_layers(
         let Some(style_idx) = track.background_style else {
             continue;
         };
-        let Some((&width, _)) = columns.widths.get(column).zip(columns.starts.get(column))
-        else {
+        let Some((&width, _)) = columns.widths.get(column).zip(columns.starts.get(column)) else {
             continue;
         };
         let x = table_content_pos.x + columns.physical_start(column, 1);
@@ -103,11 +94,48 @@ pub(super) fn emit_table_layers(
         {
             continue;
         }
-        emit_table_background_rect(
+        record_bound_background(
             session,
             table_box_idx,
             Rect::new(x, table_grid.y0, x + width, table_grid.y1),
-            PaintStyleSource::Style {indices:style_idx,context:table_box_idx as u32},
+            PaintStyleSource::Style {
+                indices: style_idx,
+                context: table_box_idx as u32,
+            },
+        );
+    }
+}
+
+pub(super) fn emit_table_row_layer_background<'a>(
+    session: &mut LayoutEngine<'_, '_>,
+    owner_box_idx: usize,
+    placements: impl Iterator<Item = &'a TableCellPlacement>,
+    table_content_pos: Point,
+    columns: &TableColumnLayout,
+    row_starts: &[f64],
+    row_heights: &[f64],
+) {
+    for placement in placements {
+        let width = columns.span_width(placement.col, placement.colspan);
+        let height = span_extent(row_starts, row_heights, placement.row, placement.rowspan);
+        let Some((_, &y)) = columns
+            .starts
+            .get(placement.col)
+            .zip(row_starts.get(placement.row))
+        else {
+            continue;
+        };
+        let x = columns.physical_start(placement.col, placement.colspan);
+        record_bound_background(
+            session,
+            owner_box_idx,
+            Rect::new(
+                table_content_pos.x + x,
+                table_content_pos.y + y,
+                table_content_pos.x + x + width,
+                table_content_pos.y + y + height,
+            ),
+            PaintStyleSource::Box(owner_box_idx as u32),
         );
     }
 }

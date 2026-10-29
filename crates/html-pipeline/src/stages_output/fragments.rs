@@ -1,7 +1,10 @@
 //! Renderer-facing decoration and image fragment queries.
 
 use super::*;
-use crate::layout_model::ScenePaintItem;
+pub use crate::layout_model::DecorationPattern as RenderDecorationPattern;
+use crate::layout_model::paint_program::PaintLayers;
+use crate::layout_model::{OverflowClip, ScenePaintItem};
+use kurbo::Rect;
 
 /// A decoration or text/image carrier line in the document's CSS paint order.
 pub enum RenderPaintItem {
@@ -11,7 +14,7 @@ pub enum RenderPaintItem {
 
 #[derive(Clone, Debug)]
 pub struct RenderDecoration {
-    rect: kurbo::Rect,
+    rect: Rect,
     color: u32,
     is_inline: bool,
     radii: Option<UsedBorderRadii>,
@@ -21,53 +24,37 @@ pub struct RenderDecoration {
     is_border: bool,
     pattern: RenderDecorationPattern,
     clip: Option<RenderOverflowClip>,
-    positioned_layer: bool,
-    negative_positioned_layer: bool,
-    independent_positioned_layer: bool,
+    paint_layers: PaintLayers,
     line_idx: Option<usize>,
     paint_order: u32,
-}
-
-/// Backend-neutral execution style for a resolved decoration span. Pattern
-/// tessellation is deliberately deferred to `html-render-core`.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum RenderDecorationPattern {
-    #[default]
-    Solid,
-    DoubleHorizontal,
-    DottedHorizontal,
-    DashedHorizontal,
-    DottedVertical,
-    DashedVertical,
 }
 
 /// Renderer-facing overflow clip with independent physical axes.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RenderOverflowClip {
-    rect: kurbo::Rect,
-    clip_x: bool,
-    clip_y: bool,
+    clip: OverflowClip,
 }
 
 impl RenderOverflowClip {
-    pub(super) fn from_clip(clip: crate::layout_model::OverflowClip) -> Self {
-        Self {
-            rect: clip.rect,
-            clip_x: clip.x,
-            clip_y: clip.y,
-        }
+    pub(super) fn from_clip(clip: OverflowClip) -> Self {
+        Self { clip }
     }
 
-    pub fn rect(self) -> kurbo::Rect {
-        self.rect
+    pub fn rect(self) -> Rect {
+        self.clip.rect
     }
 
     pub fn clips_x(self) -> bool {
-        self.clip_x
+        self.clip.x
     }
 
     pub fn clips_y(self) -> bool {
-        self.clip_y
+        self.clip.y
+    }
+
+    /// Restrict a rectangle on the axes selected by this overflow clip.
+    pub fn apply_to(self, rect: Rect) -> Rect {
+        self.clip.apply_to(rect)
     }
 }
 
@@ -75,10 +62,8 @@ impl RenderDecoration {
     fn from_fragment(
         fragment: &DecorationFragment,
         decorations: &DecorationStore,
-        clip: Option<crate::layout_model::OverflowClip>,
-        positioned_layer: bool,
-        negative_positioned_layer: bool,
-        independent_positioned_layer: bool,
+        clip: Option<OverflowClip>,
+        paint_layers: PaintLayers,
         line_idx: Option<u32>,
         paint_order: u32,
     ) -> Self {
@@ -92,28 +77,9 @@ impl RenderDecoration {
             is_foreground: fragment.is_foreground(),
             is_background: fragment.is_background(),
             is_border: fragment.is_border(),
-            pattern: match fragment.pattern() {
-                crate::layout_model::DecorationPattern::Solid => RenderDecorationPattern::Solid,
-                crate::layout_model::DecorationPattern::DoubleHorizontal => {
-                    RenderDecorationPattern::DoubleHorizontal
-                }
-                crate::layout_model::DecorationPattern::DottedHorizontal => {
-                    RenderDecorationPattern::DottedHorizontal
-                }
-                crate::layout_model::DecorationPattern::DashedHorizontal => {
-                    RenderDecorationPattern::DashedHorizontal
-                }
-                crate::layout_model::DecorationPattern::DottedVertical => {
-                    RenderDecorationPattern::DottedVertical
-                }
-                crate::layout_model::DecorationPattern::DashedVertical => {
-                    RenderDecorationPattern::DashedVertical
-                }
-            },
+            pattern: fragment.pattern(),
             clip: clip.map(RenderOverflowClip::from_clip),
-            positioned_layer,
-            negative_positioned_layer,
-            independent_positioned_layer,
+            paint_layers,
             line_idx: line_idx
                 .filter(|idx| *idx != u32::MAX)
                 .map(|idx| idx as usize),
@@ -121,7 +87,7 @@ impl RenderDecoration {
         }
     }
 
-    pub fn rect(&self) -> kurbo::Rect {
+    pub fn rect(&self) -> Rect {
         self.rect
     }
 
@@ -154,15 +120,15 @@ impl RenderDecoration {
     }
 
     pub fn is_in_positioned_layer(&self) -> bool {
-        self.positioned_layer
+        self.paint_layers.is_positioned()
     }
 
     pub fn is_in_negative_positioned_layer(&self) -> bool {
-        self.negative_positioned_layer
+        self.paint_layers.is_negative()
     }
 
     pub fn is_in_independent_positioned_layer(&self) -> bool {
-        self.independent_positioned_layer
+        self.paint_layers.is_independent()
     }
 
     pub fn line_idx(&self) -> Option<usize> {
@@ -185,10 +151,8 @@ impl RenderDecoration {
 
 pub struct RenderDecorations<'a> {
     decorations: &'a DecorationStore,
-    clips: &'a [Option<crate::layout_model::OverflowClip>],
-    positioned_layers: &'a [bool],
-    negative_positioned_layers: &'a [bool],
-    independent_positioned_layers: &'a [bool],
+    clips: &'a [Option<OverflowClip>],
+    paint_layers: &'a [PaintLayers],
     line_indices: &'a [u32],
     paint_orders: &'a [u32],
     selection: DecorationSelection<'a>,
@@ -280,9 +244,7 @@ impl<'a> RenderDecorations<'a> {
         Self {
             decorations: &output.decorations,
             clips: &output.decoration_clips,
-            positioned_layers: &output.decoration_positioned_layers,
-            negative_positioned_layers: &output.decoration_negative_positioned_layers,
-            independent_positioned_layers: &output.decoration_independent_positioned_layers,
+            paint_layers: &output.decoration_paint_layers,
             line_indices: &output.decoration_line_indices,
             paint_orders: &output.decoration_paint_orders,
             selection,
@@ -300,15 +262,7 @@ impl<'a> RenderDecorations<'a> {
             &self.decorations.fragments()[index],
             self.decorations,
             self.clips.get(index).copied().flatten(),
-            self.positioned_layers.get(index).copied().unwrap_or(false),
-            self.negative_positioned_layers
-                .get(index)
-                .copied()
-                .unwrap_or(false),
-            self.independent_positioned_layers
-                .get(index)
-                .copied()
-                .unwrap_or(false),
+            self.paint_layers.get(index).copied().unwrap_or_default(),
             self.line_indices.get(index).copied(),
             self.paint_orders.get(index).copied().unwrap_or(u32::MAX),
         )
@@ -330,12 +284,16 @@ pub struct RenderImageFragment {
     image_idx: u32,
     offset: Point,
     size: Size,
-    clip: kurbo::Rect,
+    clip: Rect,
     paint_order: u32,
     text_color: u32,
 }
 
 impl RenderImageFragment {
+    pub fn box_idx(&self) -> usize {
+        self.box_idx
+    }
+
     fn from_fragment(fragment: &ImageFragment, document: DocumentRead<'_>) -> Self {
         Self {
             box_idx: fragment.box_idx as usize,
@@ -369,7 +327,18 @@ impl RenderImageFragment {
         self.size
     }
 
-    pub fn clip(&self) -> kurbo::Rect {
+    /// Fitted image bounds relative to the carrier line's origin.
+    pub fn rect(&self) -> Rect {
+        Rect::from_origin_size(self.offset, self.size)
+    }
+
+    /// Fitted bounds restricted by the image's object-fit clip, relative to
+    /// the carrier line's origin. Ancestor overflow clips apply separately.
+    pub fn visible_rect(&self) -> Rect {
+        self.rect().intersect(self.clip)
+    }
+
+    pub fn clip(&self) -> Rect {
         self.clip
     }
 
@@ -378,6 +347,7 @@ impl RenderImageFragment {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct RenderImageFragments<'a> {
     fragments: &'a [ImageFragment],
     indexes: Option<&'a [usize]>,
@@ -413,7 +383,7 @@ impl<'a> RenderImageFragments<'a> {
         self.len() == 0
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = RenderImageFragment> + '_ {
+    pub fn iter(self) -> impl Iterator<Item = RenderImageFragment> + 'a {
         (0..self.len()).filter_map(move |position| {
             let index = self.indexes.map_or(position, |indexes| indexes[position]);
             self.fragments
@@ -455,6 +425,57 @@ impl<'a> RenderFragmentView<'a> {
                 }
                 ScenePaintItem::Line(index) => RenderPaintItem::Line(index as usize),
             })
+    }
+
+    /// Replay caller-selected content in the document's canonical CSS order.
+    /// Inline decorations are included with their owning lines. Duplicate
+    /// candidates are harmless, including repeated source regions.
+    pub fn paint_order_for(
+        self,
+        lines: &[usize],
+        block_decorations: &[usize],
+    ) -> Vec<RenderPaintItem> {
+        let output = &self.doc.layout_state.fragment_output;
+        let mut ranks = Vec::new();
+        for &line in lines {
+            ranks.extend(
+                output
+                    .scene_line_ranks
+                    .get(line)
+                    .copied()
+                    .filter(|rank| *rank != u32::MAX),
+            );
+            for &index in output.decoration_fragments_by_line.get(line).unwrap_or(&[]) {
+                ranks.extend(
+                    output
+                        .scene_decoration_ranks
+                        .get(index)
+                        .copied()
+                        .filter(|rank| *rank != u32::MAX),
+                );
+            }
+        }
+        for &index in block_decorations {
+            ranks.extend(
+                output
+                    .scene_decoration_ranks
+                    .get(index)
+                    .copied()
+                    .filter(|rank| *rank != u32::MAX),
+            );
+        }
+        ranks.sort_unstable();
+        ranks.dedup();
+        let decorations = self.decorations();
+        ranks
+            .into_iter()
+            .filter_map(|rank| match *output.scene_paint_order.get(rank as usize)? {
+                ScenePaintItem::Line(line) => Some(RenderPaintItem::Line(line as usize)),
+                ScenePaintItem::Decoration(index) => {
+                    Some(RenderPaintItem::Decoration(decorations.at(index as usize)))
+                }
+            })
+            .collect()
     }
 
     pub fn decorations(self) -> RenderDecorations<'a> {

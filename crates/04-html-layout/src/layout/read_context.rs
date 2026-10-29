@@ -1,6 +1,6 @@
 use super::block::ParagraphSpacing;
 use crate::layout_model::{
-    Children, InlineContent, InlineItemKind, LayoutBox, LayoutMode, LayoutTree,
+    Children, InlineContent, InlineItem, InlineItemKind, LayoutBox, LayoutMode, LayoutTree,
     ListItemMarker,
 };
 use crate::layout_model::{FontRelativeMetrics, ShapedFontMetrics};
@@ -323,13 +323,7 @@ impl<'input> LayoutReader<'input> {
         self.inline_content.inline_items()[runs.start as usize..runs.end as usize]
             .iter()
             .any(|run| {
-                let ownership_box = match run.kind {
-                    InlineItemKind::AtomicBox { box_idx } => self.get_parent(box_idx as usize),
-                    _ => Some(run.box_idx as usize),
-                };
-                if !ownership_box.is_some_and(|box_idx| {
-                    self.run_belongs_to_inline_context(box_idx, container_box_idx)
-                }) {
+                if !self.inline_item_belongs_to_context(run, container_box_idx) {
                     return false;
                 }
                 match &run.kind {
@@ -345,7 +339,6 @@ impl<'input> LayoutReader<'input> {
                             let character = self
                                 .inline_content
                                 .character_at(glyph_idx as usize)
-                                .and_then(char::from_u32)
                                 .unwrap_or_default();
                             preserves_space || !character.is_whitespace() || character == '\u{00A0}'
                         })
@@ -373,7 +366,7 @@ impl<'input> LayoutReader<'input> {
             let InlineItemKind::FloatAnchor { box_idx } = run.kind else {
                 continue;
             };
-            if !self.run_belongs_to_inline_context(run.box_idx as usize, container_box_idx) {
+            if !self.inline_item_belongs_to_context(run, container_box_idx) {
                 continue;
             }
             match self.style(box_idx as usize).float() {
@@ -385,8 +378,13 @@ impl<'input> LayoutReader<'input> {
         (left, right)
     }
 
-    fn run_belongs_to_inline_context(&self, run_box_idx: usize, container_box_idx: usize) -> bool {
-        let mut current = Some(run_box_idx);
+    /// Inline items stop at their formatting-context root rather than leaking
+    /// into ancestor lines. An atomic box's parent owns its placeholder.
+    pub fn inline_item_belongs_to_context(&self, item: &InlineItem, container_box_idx: usize) -> bool {
+        let mut current = match item.kind {
+            InlineItemKind::AtomicBox { box_idx } => self.get_parent(box_idx as usize),
+            _ => Some(item.box_idx as usize),
+        };
         while let Some(box_idx) = current {
             if box_idx == container_box_idx {
                 return true;

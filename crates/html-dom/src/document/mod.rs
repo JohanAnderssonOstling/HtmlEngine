@@ -2,10 +2,12 @@ pub mod cfi;
 mod dom;
 mod memory;
 mod resources;
+mod source;
 
 pub use dom::*;
 pub use memory::*;
 pub use resources::*;
+pub use source::*;
 
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU64, Ordering};

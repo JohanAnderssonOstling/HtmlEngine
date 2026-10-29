@@ -1,8 +1,8 @@
-//! Shared grammar and OpenType features for renderer-owned font switches.
+//! Conversion of native raw font tokens into OpenType feature settings.
 
-use super::property_id::RendererPropertyId;
-use super::value::{IntegerValue, normalize_math, parse_integer_value};
-use cssparser::{ParseError, Parser, ParserInput, match_ignore_ascii_case};
+use super::value::{significant_tokens, token_ident};
+use crate::style::syntax::property_id::RendererPropertyId;
+use cssparser::match_ignore_ascii_case;
 use html_style_model::OpenTypeFeature;
 use lightningcss::properties::custom::{Token, TokenList, TokenOrValue};
 use std::iter::once;
@@ -11,13 +11,8 @@ pub(crate) fn parse_tokens(
     id: RendererPropertyId,
     tokens: &TokenList<'_>,
 ) -> Option<Vec<OpenTypeFeature>> {
-    let mut tokens = tokens.0.iter().filter(|token| {
-        !matches!(
-            token,
-            TokenOrValue::Token(Token::WhiteSpace(_) | Token::Comment(_))
-        )
-    });
-    let first = ident(tokens.next()?)?;
+    let mut tokens = significant_tokens(tokens);
+    let first = token_ident(tokens.next()?)?;
     if tokens.clone().next().is_none() {
         if first.eq_ignore_ascii_case("normal") {
             return match id {
@@ -46,7 +41,7 @@ pub(crate) fn parse_tokens(
 
     let mut seen = 0u8;
     let mut features = Vec::new();
-    for keyword in once(Some(first)).chain(tokens.map(ident)) {
+    for keyword in once(Some(first)).chain(tokens.map(token_ident)) {
         let keyword = keyword?;
         let (category, tags, value): (u8, &[[u8; 4]], u32) = match id {
             RendererPropertyId::FontVariantNumeric => match_ignore_ascii_case! { keyword,
@@ -82,55 +77,43 @@ pub(crate) fn parse_tokens(
     Some(features)
 }
 
-fn ident<'a, 'css>(token: &'a TokenOrValue<'css>) -> Option<&'a str> {
-    match token {
-        TokenOrValue::Token(Token::Ident(value)) => Some(value.as_ref()),
-        _ => None,
-    }
-}
-
-pub(crate) struct FontFeatureSetting {
-    pub(crate) tag: [u8; 4],
-    pub(crate) value: IntegerValue,
-}
-
-pub(crate) fn parse_settings(css: &str) -> Option<Vec<FontFeatureSetting>> {
-    let normalized = normalize_math(css);
-    let mut input = ParserInput::new(&normalized);
-    let mut parser = Parser::new(&mut input);
-    if parser
-        .try_parse(|parser| {
-            parser.expect_ident_matching("normal")?;
-            parser.expect_exhausted()
-        })
-        .is_ok()
+pub(crate) fn parse_settings(tokens: &TokenList<'_>) -> Option<Vec<OpenTypeFeature>> {
+    let tokens: Vec<_> = significant_tokens(tokens).collect();
+    if matches!(tokens.as_slice(), [token] if token_ident(token).is_some_and(|word| word.eq_ignore_ascii_case("normal")))
     {
         return Some(Vec::new());
     }
-    let parsed: Result<_, ParseError<'_, ()>> = parser.parse_comma_separated(|parser| {
-        let text = parser.expect_string_cloned()?;
-        let bytes = text.as_bytes();
-        if bytes.len() != 4 || !bytes.iter().all(|byte| (0x20..=0x7e).contains(byte)) {
-            return Err(parser.new_custom_error(()));
-        }
-        let mut tag = [0; 4];
-        tag.copy_from_slice(bytes);
-        let value = if parser.is_exhausted() {
-            IntegerValue::Integer(1)
-        } else if parser
-            .try_parse(|parser| parser.expect_ident_matching("on"))
-            .is_ok()
-        {
-            IntegerValue::Integer(1)
-        } else if parser
-            .try_parse(|parser| parser.expect_ident_matching("off"))
-            .is_ok()
-        {
-            IntegerValue::Integer(0)
-        } else {
-            parse_integer_value(parser, 0)?
-        };
-        Ok(FontFeatureSetting { tag, value })
-    });
-    parsed.ok()
+    tokens
+        .split(|token| matches!(token, TokenOrValue::Token(Token::Comma)))
+        .map(|setting| {
+            let [TokenOrValue::Token(Token::String(tag)), rest @ ..] = setting else {
+                return None;
+            };
+            let bytes: [u8; 4] = tag.as_bytes().try_into().ok()?;
+            if !bytes.iter().all(|byte| (0x20..=0x7e).contains(byte)) {
+                return None;
+            }
+            let value = match rest {
+                [] => 1,
+                [
+                    TokenOrValue::Token(Token::Number {
+                        int_value: Some(value),
+                        ..
+                    }),
+                ] => u32::try_from(*value).ok()?,
+                [token]
+                    if token_ident(token).is_some_and(|word| word.eq_ignore_ascii_case("on")) =>
+                {
+                    1
+                }
+                [token]
+                    if token_ident(token).is_some_and(|word| word.eq_ignore_ascii_case("off")) =>
+                {
+                    0
+                }
+                _ => return None,
+            };
+            Some(OpenTypeFeature::new(bytes, value))
+        })
+        .collect()
 }

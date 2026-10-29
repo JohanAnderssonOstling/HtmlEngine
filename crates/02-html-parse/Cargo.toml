@@ -1,12 +1,23 @@
 [package]
 license.workspace = true
-name = "html-parse"
-version = "0.1.0"
-edition = "2024"
-publish = false
+name = "skrift-parse"
+version.workspace = true
+edition.workspace = true
+publish = ["crates-io"]
+description = "Parses HTML and XML documents."
+repository.workspace = true
+homepage.workspace = true
+categories.workspace = true
+keywords.workspace = true
+readme = "README.md"
+include.workspace = true
+documentation = "https://docs.rs/skrift-parse"
+
+[lib]
+name = "html_parse"
 
 [dependencies]
-html-dom = { path = "../html-dom" }
+html-dom = { version = "0.1.0", package = "skrift-dom", path = "../html-dom" }
 scraper.workspace = true
 html5ever.workspace = true
 quick-xml.workspace = true

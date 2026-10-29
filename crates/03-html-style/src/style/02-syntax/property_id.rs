@@ -1,6 +1,7 @@
 //! Property identities for CSS that Lightning CSS preserves as raw tokens.
 
-use cssparser::{CowRcStr, match_ignore_ascii_case};
+use crate::style::property_catalogue::PropertyKey;
+use cssparser::match_ignore_ascii_case;
 use lightningcss::properties::custom::TokenList;
 use lightningcss::properties::{Property, PropertyId};
 
@@ -85,20 +86,8 @@ impl RendererPropertyId {
         }
     }
 
-    /// Preserve the dependency's raw representation when parsing its tokens.
-    pub(crate) fn lightning_id(self) -> PropertyId<'static> {
-        PropertyId::Custom(CowRcStr::from(self.name()).into())
-    }
-
-    pub(crate) fn canonical_name(self) -> &'static str {
-        match self {
-            Self::PageBreakBefore => Self::BreakBefore.name(),
-            Self::PageBreakAfter => Self::BreakAfter.name(),
-            Self::PageBreakInside => Self::BreakInside.name(),
-            Self::GridRowGap => "row-gap",
-            Self::GridColumnGap => "column-gap",
-            _ => self.name(),
-        }
+    pub(crate) fn key(self) -> PropertyKey {
+        PropertyKey::from_name(self.name()).expect("renderer property is catalogued")
     }
 
     pub(crate) fn gap_property(self) -> Option<PropertyId<'static>> {

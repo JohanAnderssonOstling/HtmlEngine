@@ -1,40 +1,9 @@
-use super::*;
-
-pub(in crate::style::cascade::resolver) fn viewport_length_to_px(
-    length: &LengthValue,
-    resolution: &ResolutionContext,
-) -> Option<f32> {
-    let environment = resolution.environment;
-    let width = environment.viewport_width() as f32;
-    let height = environment.viewport_height().map(|value| value as f32);
-    let resolve = |factor: f32, basis: Option<f32>| {
-        resolution.uses_viewport_units.set(true);
-        let value = factor * basis? / 100.0;
-        value.is_finite().then_some(value)
-    };
-    // The renderer has one static viewport and horizontal writing axes.
-    // It has no eligible size-query containers: container units therefore
-    // use the specified small-viewport fallback on the corresponding axis.
-    match length {
-        LengthValue::Vw(value) | LengthValue::Vi(value)
-        | LengthValue::Svw(value) | LengthValue::Svi(value)
-        | LengthValue::Lvw(value) | LengthValue::Lvi(value)
-        | LengthValue::Dvw(value) | LengthValue::Dvi(value)
-        | LengthValue::Cqw(value) | LengthValue::Cqi(value) => resolve(*value, Some(width)),
-        LengthValue::Vh(value) | LengthValue::Vb(value)
-        | LengthValue::Svh(value) | LengthValue::Svb(value)
-        | LengthValue::Lvh(value) | LengthValue::Lvb(value)
-        | LengthValue::Dvh(value) | LengthValue::Dvb(value)
-        | LengthValue::Cqh(value) | LengthValue::Cqb(value) => resolve(*value, height),
-        LengthValue::Vmin(value) | LengthValue::Svmin(value)
-        | LengthValue::Lvmin(value) | LengthValue::Dvmin(value)
-        | LengthValue::Cqmin(value) => resolve(*value, height.map(|height| width.min(height))),
-        LengthValue::Vmax(value) | LengthValue::Svmax(value)
-        | LengthValue::Lvmax(value) | LengthValue::Dvmax(value)
-        | LengthValue::Cqmax(value) => resolve(*value, height.map(|height| width.max(height))),
-        _ => None,
-    }
-}
+use super::super::context::ResolutionContext;
+use super::checked_line_height_components;
+use super::lengths::{calc_box_length_percentage_components, length_percentage_to_px};
+use html_style_model::{Font, OpenTypeFeature};
+use lightningcss::properties::font::{AbsoluteFontWeight, Font as CssFont, FontSize, FontWeight};
+use lightningcss::values::length::LengthValue;
 
 pub(in crate::style::cascade::resolver) fn font_size_to_px(
     size: &FontSize,
@@ -87,91 +56,83 @@ pub(in crate::style::cascade::resolver) fn checked_font_size(
     value.is_finite().then_some(value.max(0.0))
 }
 
+/// Coefficients for px, ex, ch, cap, rch, rcap, and rlh, in that order.
 pub(in crate::style::cascade::resolver) fn checked_font_size_components(
     size: &FontSize,
     inherited_font: &Font,
     parent_font_size: f32,
     root_font_size: f32,
     resolution: &ResolutionContext,
-) -> Option<(f32, f32, f32, f32, f32, f32, f32)> {
-    let scale = resolution.font_size_scale;
-    let (px, ex, ch, cap, rch, rcap, rlh) = resolution.with_canonical_font_sizes(|canonical| {
-        canonical_font_size_components(
-            size,
-            inherited_font.font_size / scale,
-            parent_font_size / scale,
-            root_font_size / scale,
-            canonical,
-        )
-    })?;
-    // Root metric coefficients already consume the scaled root font at layout.
-    let result = (px * scale, ex * scale, ch * scale, cap * scale, rch, rcap, rlh);
-    (result.0.is_finite() && result.1.is_finite() && result.2.is_finite() && result.3.is_finite())
-        .then_some(result)
-}
+) -> Option<[f32; 7]> {
+    use FontSize::Length;
+    use LengthValue::{Cap, Rcap, Rch, Rlh};
+    use lightningcss::values::percentage::DimensionPercentage::{Calc, Dimension};
 
-fn canonical_font_size_components(
-    size: &FontSize,
-    inherited_font_size: f32,
-    parent_font_size: f32,
-    root_font_size: f32,
-    resolution: &ResolutionContext,
-) -> Option<(f32, f32, f32, f32, f32, f32, f32)> {
-    if let FontSize::Length(LengthPercentage::Dimension(length)) = size {
-        return match length {
-            LengthValue::Cap(value) if value.is_finite() && *value >= 0.0 => Some((
-                0.0,
-                0.0,
-                0.0,
-                *value * inherited_font_size,
-                0.0,
-                0.0,
-                0.0,
-            )),
-            LengthValue::Rch(value) if value.is_finite() && *value >= 0.0 => {
-                Some((0.0, 0.0, 0.0, 0.0, *value, 0.0, 0.0))
+    let scale = resolution.font_size_scale;
+    let mut result = resolution.with_canonical_font_sizes(|resolution| {
+        let inherited_font_size = inherited_font.font_size / scale;
+        let parent_font_size = parent_font_size / scale;
+        let root_font_size = root_font_size / scale;
+        match size {
+            Length(Dimension(Cap(value))) if value.is_finite() && *value >= 0.0 => {
+                Some([0.0, 0.0, 0.0, *value * inherited_font_size, 0.0, 0.0, 0.0])
             }
-            LengthValue::Rcap(value) if value.is_finite() && *value >= 0.0 => {
-                Some((0.0, 0.0, 0.0, 0.0, 0.0, *value, 0.0))
+            Length(Dimension(Rch(value))) if value.is_finite() && *value >= 0.0 => {
+                Some([0.0, 0.0, 0.0, 0.0, *value, 0.0, 0.0])
             }
-            LengthValue::Rlh(value) if value.is_finite() && *value >= 0.0 => {
-                Some((0.0, 0.0, 0.0, 0.0, 0.0, 0.0, *value))
+            Length(Dimension(Rcap(value))) if value.is_finite() && *value >= 0.0 => {
+                Some([0.0, 0.0, 0.0, 0.0, 0.0, *value, 0.0])
+            }
+            Length(Dimension(Rlh(value))) if value.is_finite() && *value >= 0.0 => {
+                Some([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, *value])
+            }
+            Length(Calc(calc)) => {
+                let [
+                    absolute_px,
+                    percentage,
+                    x_height_px,
+                    ch_advance_px,
+                    cap_height_px,
+                ] = calc_box_length_percentage_components(
+                    calc,
+                    inherited_font_size,
+                    root_font_size,
+                    resolution,
+                )?;
+                let absolute_px = absolute_px + percentage * parent_font_size;
+                let absolute_px =
+                    if x_height_px == 0.0 && ch_advance_px == 0.0 && cap_height_px == 0.0 {
+                        absolute_px.max(0.0)
+                    } else {
+                        absolute_px
+                    };
+                (absolute_px.is_finite()
+                    && absolute_px >= 0.0
+                    && x_height_px.is_finite()
+                    && ch_advance_px.is_finite()
+                    && cap_height_px.is_finite())
+                .then_some([
+                    absolute_px,
+                    x_height_px,
+                    ch_advance_px,
+                    cap_height_px,
+                    0.0,
+                    0.0,
+                    0.0,
+                ])
             }
             _ => checked_font_size(size, parent_font_size, root_font_size, resolution)
-                .map(|value| (value, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)),
-        };
+                .map(|value| [value, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        }
+    })?;
+    // Root metric coefficients already consume the scaled root font at layout.
+    for value in &mut result[..4] {
+        *value *= scale;
     }
-    if let FontSize::Length(LengthPercentage::Calc(calc)) = size {
-        let (absolute_px, percentage, x_height_px, ch_advance_px, cap_height_px) =
-            calc_box_length_percentage_components(
-                calc,
-                inherited_font_size,
-                root_font_size,
-                resolution,
-            )?;
-        let absolute_px = absolute_px + percentage * parent_font_size;
-        let absolute_px = if x_height_px == 0.0 && ch_advance_px == 0.0 && cap_height_px == 0.0 {
-            absolute_px.max(0.0)
-        } else {
-            absolute_px
-        };
-        return (absolute_px.is_finite()
-            && absolute_px >= 0.0
-            && x_height_px.is_finite()
-            && ch_advance_px.is_finite()
-            && cap_height_px.is_finite())
-        .then_some((
-            absolute_px,
-            x_height_px,
-            ch_advance_px,
-            cap_height_px,
-            0.0,
-            0.0,
-            0.0,
-        ));
-    }
-    checked_font_size(size, parent_font_size, root_font_size, resolution)
-        .map(|value| (value, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
+    result[..4]
+        .iter()
+        .all(|value| value.is_finite())
+        .then_some(result)
 }
 
 pub(in crate::style::cascade::resolver) fn checked_font_weight(
@@ -203,108 +164,17 @@ pub(in crate::style::cascade::resolver) fn checked_font_weight(
     Some(value)
 }
 
-pub(in crate::style::cascade::resolver) struct CheckedFontShorthand {
-    pub(in crate::style::cascade::resolver) font_size: f32,
-    pub(in crate::style::cascade::resolver) font_weight: u16,
-    pub(in crate::style::cascade::resolver) line_height: f32,
-    pub(in crate::style::cascade::resolver) line_height_x_height_px: f32,
-    pub(in crate::style::cascade::resolver) line_height_number: f32,
-    pub(in crate::style::cascade::resolver) line_height_normal: bool,
-}
-
 pub(in crate::style::cascade::resolver) fn checked_font_shorthand(
     font: &CssFont<'_>,
     parent_font_size: f32,
     parent_font_weight: u16,
     root_font_size: f32,
     resolution: &ResolutionContext,
-) -> Option<CheckedFontShorthand> {
+) -> Option<()> {
     let font_size = checked_font_size(&font.size, parent_font_size, root_font_size, resolution)?;
-    let font_weight = checked_font_weight(&font.weight, parent_font_weight)?;
-    let (line_height, line_height_x_height_px) =
-        checked_line_height_components(&font.line_height, font_size, root_font_size, resolution)?;
-    let line_height_number = line_height_number(&font.line_height);
-    let line_height_normal = line_height_is_normal(&font.line_height);
-    Some(CheckedFontShorthand {
-        font_size,
-        font_weight,
-        line_height,
-        line_height_x_height_px,
-        line_height_number,
-        line_height_normal,
-    })
-}
-
-pub(in crate::style::cascade::resolver) fn computed_line_height(
-    font: &Font,
-    text: &InheritedText,
-) -> Option<f32> {
-    // Keep `lh` aligned with the renderer's established used-value behavior
-    // for `normal` (the same 1.2 multiplier used by shaping and inline layout).
-    let value = if text.line_height_normal {
-        font.font_size * 1.2
-    } else {
-        text.line_height
-    };
-    value.is_finite().then_some(value)
-}
-
-/// CSS Values makes `lh` in font-size and line-height refer to the parent's
-/// computed line height, avoiding a dependency cycle. Other properties use
-/// the element's own (already prerequisite-resolved) computed line height.
-pub(in crate::style::cascade::resolver) fn set_line_height_resolution_bases(
-    doc: &Document,
-    styles: &ComputedStylesBuilder,
-    property: &Property<'_>,
-    style: &WorkingStyle,
-    parent: &ParentStyle,
-    resolution: &ResolutionContext,
-) {
-    let (font, text) = if matches!(
-        property.property_id(),
-        PropertyId::FontSize | PropertyId::LineHeight | PropertyId::Font
-    ) {
-        (&parent.font, &parent.text)
-    } else {
-        (&style.font, &style.text)
-    };
-    resolution.line_height.set(computed_line_height(font, text));
-
-    let root_line_height = stored_root_line_height(doc, styles).or_else(|| {
-        // While resolving the root itself, font-size and line-height must
-        // use their initial basis to avoid a cycle. Other root properties
-        // can use the prerequisite-resolved root line height.
-        if matches!(
-            property.property_id(),
-            PropertyId::FontSize | PropertyId::LineHeight | PropertyId::Font
-        ) {
-            let initial = ParentStyle::initial(doc.root_font_size());
-            computed_line_height(&initial.font, &initial.text)
-        } else {
-            computed_line_height(&style.font, &style.text)
-        }
-    });
-    resolution.root_line_height.set(root_line_height);
-}
-
-fn stored_root_line_height(doc: &Document, styles: &ComputedStylesBuilder) -> Option<f32> {
-    let indices = styles.style_for_node(doc.dom_root()?)?;
-    computed_line_height(styles.font_style(indices)?, styles.text_style(indices)?)
-}
-
-pub(in crate::style::cascade::resolver) fn set_marker_resolution_bases(
-    doc: &Document,
-    styles: &ComputedStylesBuilder,
-    style: &WorkingStyle,
-    resolution: &ResolutionContext,
-) {
-    resolution
-        .line_height
-        .set(computed_line_height(&style.font, &style.text));
-    resolution.root_line_height.set(
-        stored_root_line_height(doc, styles)
-            .or_else(|| computed_line_height(&style.font, &style.text)),
-    );
+    checked_font_weight(&font.weight, parent_font_weight)?;
+    checked_line_height_components(&font.line_height, font_size, root_font_size, resolution)?;
+    Some(())
 }
 
 // CSS math may produce positive infinity for a non-negative numeric property.
@@ -317,4 +187,25 @@ pub(in crate::style::cascade::resolver) fn computed_flex_factor(value: f32) -> f
     // Source validation rejects negative literals. Calculated results clamp
     // at computed-value time; NaN is censored to zero.
     value.max(0.0).min(MAX_COMPUTED_FLEX_FACTOR)
+}
+
+pub(in crate::style::cascade::resolver) fn font_variant_caps_features(
+    value: &lightningcss::properties::font::FontVariantCaps,
+) -> Vec<OpenTypeFeature> {
+    use lightningcss::properties::font::FontVariantCaps;
+    match value {
+        FontVariantCaps::Normal => Vec::new(),
+        FontVariantCaps::SmallCaps => vec![OpenTypeFeature::new(*b"smcp", 1)],
+        FontVariantCaps::AllSmallCaps => vec![
+            OpenTypeFeature::new(*b"smcp", 1),
+            OpenTypeFeature::new(*b"c2sc", 1),
+        ],
+        FontVariantCaps::PetiteCaps => vec![OpenTypeFeature::new(*b"pcap", 1)],
+        FontVariantCaps::AllPetiteCaps => vec![
+            OpenTypeFeature::new(*b"pcap", 1),
+            OpenTypeFeature::new(*b"c2pc", 1),
+        ],
+        FontVariantCaps::Unicase => vec![OpenTypeFeature::new(*b"unic", 1)],
+        FontVariantCaps::TitlingCaps => vec![OpenTypeFeature::new(*b"titl", 1)],
+    }
 }

@@ -595,7 +595,7 @@ fn cjk_newline_context_stops_at_atomic_boxes_and_other_blocks() {
             .inline_content()
             .characters()
             .iter()
-            .filter_map(|&glyph| char::from_u32(glyph))
+            .copied()
             .collect();
         assert_eq!(text, format!("{content} 文"));
     }
@@ -627,7 +627,7 @@ fn cjk_newline_normalization_ignores_bidi_controls_and_retains_their_order() {
                 .inline_content()
                 .characters()
                 .iter()
-                .filter_map(|&glyph| char::from_u32(glyph))
+                .copied()
                 .collect();
             assert_eq!(text, expected, "{source:?}");
         }

@@ -4,7 +4,9 @@
 //! the paragraph should wrap.
 
 use super::*;
-use crate::layout_model::{LayoutMode, LineInlineBoxFragment, LineTextFragment, paragraph_unicode_bidi};
+use crate::layout_model::{
+    LayoutMode, LineInlineBoxFragment, LineTextFragment, paragraph_unicode_bidi,
+};
 use unicode_categories::UnicodeCategories;
 
 #[derive(Clone, Copy)]
@@ -23,16 +25,18 @@ mod preparation;
 mod tracking;
 
 use alignment::{adjusted_line_metrics, build_token_placements};
-use emission::{inline_relative_position_offset, line_publishes, write_line_fragments};
-use measurement::{measure_line, summarize_token_span};
-pub(super) use preparation::pseudo_line_heights;
-pub(super) use tracking::TrackingCapacityIndex;
+pub(super) use emission::write_line_fragments;
+use emission::{inline_relative_position_offset, line_publishes};
 #[cfg(any(test, feature = "testing"))]
 pub(super) use measurement::measured_tracking_boundary_capacity;
+use measurement::{measure_line, summarize_token_span};
+pub(super) use preparation::first_line_color;
+pub(super) use preparation::pseudo_line_heights;
 use preparation::{
-    apply_first_line_pseudo_styles, apply_inline_overflow, first_line_color,
-    include_container_strut, inline_box_struts, parent_font_content_extents, strut_for_inline_box,
+    apply_first_line_pseudo_styles, apply_inline_overflow, include_container_strut,
+    inline_box_struts, parent_font_content_extents, strut_for_inline_box,
 };
+pub(super) use tracking::TrackingCapacityIndex;
 
 pub(super) struct LineLayout {
     pub(super) glyph_range: Range<u32>,
@@ -107,26 +111,48 @@ impl<'a> LineEmissionContext<'a> {
 }
 
 pub(super) fn prepare_line(
-    engine: &crate::layout::LayoutEngine<'_, '_>, context: &LineEmissionContext<'_>, line: &BrokenLine,
-    is_first_line: bool, origin: Point, line_index: usize, adjustments: &mut Vec<LineAdjustment>,
+    engine: &crate::layout::LayoutEngine<'_, '_>,
+    context: &LineEmissionContext<'_>,
+    line: &BrokenLine,
+    is_first_line: bool,
+    origin: Point,
+    line_index: usize,
+    adjustments: &mut Vec<LineAdjustment>,
 ) -> (PreparedLine, f64, f64) {
     let tokens = context.tokens;
     let original_span = &tokens[line.start..line.end];
     let style = engine.reader.style(context.input.container_box_idx);
-    let plaintext = paragraph_unicode_bidi(engine.reader.styles(), engine.reader.layout_tree(), context.input.container_box_idx) == UnicodeBidi::Plaintext;
+    let plaintext = paragraph_unicode_bidi(
+        engine.reader.styles(),
+        engine.reader.layout_tree(),
+        context.input.container_box_idx,
+    ) == UnicodeBidi::Plaintext;
     let direction = if plaintext {
-        original_span.iter().find_map(|token| match token.kind() {
-            InlineTokenKind::Glyph { glyph_idx } => Some(engine.text.paragraph_direction(glyph_idx)),
-            _ => None,
-        }).unwrap_or(context.input.paragraph.direction)
-    } else { context.input.paragraph.direction };
+        original_span
+            .iter()
+            .find_map(|token| match token.kind() {
+                InlineTokenKind::Glyph { glyph_idx } => {
+                    Some(engine.text.paragraph_direction(glyph_idx))
+                }
+                _ => None,
+            })
+            .unwrap_or(context.input.paragraph.direction)
+    } else {
+        context.input.paragraph.direction
+    };
     let mut resolved_line = line.clone();
     if plaintext {
         use html_style_model::{LogicalTextAlign, TextDirection};
-        let logical = if line.is_last_line { style.text_align_last_logical() } else { style.text_align_logical() };
+        let logical = if line.is_last_line {
+            style.text_align_last_logical()
+        } else {
+            style.text_align_logical()
+        };
         resolved_line.align = match (logical, direction) {
-            (LogicalTextAlign::Start, TextDirection::Rtl) | (LogicalTextAlign::End, TextDirection::Ltr) => TextAlign::Right,
-            (LogicalTextAlign::Start, TextDirection::Ltr) | (LogicalTextAlign::End, TextDirection::Rtl) => TextAlign::Left,
+            (LogicalTextAlign::Start, TextDirection::Rtl)
+            | (LogicalTextAlign::End, TextDirection::Ltr) => TextAlign::Right,
+            (LogicalTextAlign::Start, TextDirection::Ltr)
+            | (LogicalTextAlign::End, TextDirection::Rtl) => TextAlign::Left,
             _ => line.align,
         };
     }
@@ -191,56 +217,47 @@ pub(super) fn prepare_line(
         context.input.container_box_idx,
         context.input.area.width,
     );
-    bidi::place_visual_line(engine, span, line_runs, &tokens.replaced, line, direction, context.input.area.width, &mut layout);
-    let height = if line_publishes(engine, span, line_runs, &tokens.replaced, &layout) { layout.line_height } else { 0.0 };
+    bidi::place_visual_line(
+        engine,
+        span,
+        line_runs,
+        &tokens.replaced,
+        line,
+        direction,
+        context.input.area.width,
+        &mut layout,
+    );
+    let height = if line_publishes(engine, span, line_runs, &tokens.replaced, &layout) {
+        layout.line_height
+    } else {
+        0.0
+    };
     let width = layout.width + line.indent;
     let adjusted = span.as_ptr() != original_span.as_ptr() || span.len() != original_span.len();
     let pseudo = line_runs.as_ptr() != tokens.runs.as_ptr();
     if adjusted || pseudo {
         adjustments.push(LineAdjustment {
             line: line_index,
-            tokens: if pseudo { pseudo_adjusted.into_boxed_slice() } else { overflow_adjusted.into_boxed_slice() },
+            tokens: if pseudo {
+                pseudo_adjusted.into_boxed_slice()
+            } else {
+                overflow_adjusted.into_boxed_slice()
+            },
             runs: pseudo.then(|| pseudo_runs.into_boxed_slice()),
         });
     }
-    let indent = if direction == TextDirection::Rtl { 0.0 } else { line.indent };
-    (PreparedLine { tokens: line.start..line.end, origin: Point::new(origin.x + indent, origin.y), layout }, width, height)
-}
-
-/// Measure one selected line at a time and lend it directly to publication.
-/// No paragraph cache retains the resulting geometry or token placements.
-pub(super) fn emit_selected_lines(engine: &mut crate::layout::LayoutEngine<'_, '_>, input: &InlineFormattingInput, tokens: &InlineTokens, lines: &[BrokenLine], overflow: InlineOverflow, first_line_height: Option<f64>, first_letter_height: Option<f64>) -> Size {
-    let context = LineEmissionContext::new(tokens, input, overflow, first_line_height, first_letter_height);
-    let mut adjustments = Vec::new();
-    let mut y = 0.0; let mut width = 0.0f64;
-    for (index, selected) in lines.iter().enumerate() {
-        adjustments.clear();
-        let (line, measured_width, height) = prepare_line(engine, &context, selected, index == 0, Point::new(0.0, y), index, &mut adjustments);
-        let adjustment = adjustments.first();
-        let span = adjustment.map_or_else(|| &tokens[line.tokens.clone()], |entry| entry.tokens.as_ref());
-        let runs = adjustment.and_then(|entry| entry.runs.as_deref()).unwrap_or(&tokens.runs);
-        let color = (index == 0 && input.starts_block).then(|| first_line_color(engine, input.container_box_idx)).flatten();
-        write_line_fragments(engine, input.container_box_idx, span, runs, &tokens.replaced,
-            input.area.origin + line.origin.to_vec2(), &line.layout, color, input.area.width);
-        y += height; width = width.max(measured_width);
-    }
-    Size::new(width, y)
-}
-
-/// Project a paragraph-local result into the current chapter placement. Image,
-/// atomic-box, decoration and absolute-anchor publication still runs here.
-pub(super) fn emit_prepared_paragraph(engine: &mut crate::layout::LayoutEngine<'_, '_>, input: &InlineFormattingInput, tokens: &InlineTokens, paragraph: &PreparedParagraph) {
-    profile_scope!("lines.emit_paragraph");
-    let started = engine.start_timing();
-    let mut adjustments = paragraph.adjustments.iter().peekable();
-    for (index, line) in paragraph.lines.iter().enumerate() {
-        let adjustment = adjustments.peek().filter(|entry| entry.line == index).copied();
-        let span = adjustment.map_or_else(|| &tokens[line.tokens.clone()], |entry| entry.tokens.as_ref());
-        let runs = adjustment.and_then(|entry| entry.runs.as_deref()).unwrap_or(&tokens.runs);
-        let color = (index == 0 && input.starts_block).then(|| first_line_color(engine, input.container_box_idx)).flatten();
-        write_line_fragments(engine, input.container_box_idx, span, runs, &tokens.replaced,
-            input.area.origin + line.origin.to_vec2(), &line.layout, color, input.area.width);
-        if adjustment.is_some() { adjustments.next(); }
-    }
-    engine.record_timing(|timings| timings.emit_lines += started.elapsed());
+    let indent = if direction == TextDirection::Rtl {
+        0.0
+    } else {
+        line.indent
+    };
+    (
+        PreparedLine {
+            tokens: line.start..line.end,
+            origin: Point::new(origin.x + indent, origin.y),
+            layout,
+        },
+        width,
+        height,
+    )
 }

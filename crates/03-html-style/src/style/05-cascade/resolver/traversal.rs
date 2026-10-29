@@ -1,92 +1,6 @@
-use super::*;
-
-// Helper functions for DOM-based style resolution
 use crate::style::matching::selectors::AncestorFilter;
-
-pub(super) struct InlineStyleCache {
-    node_style_ids: Vec<Option<u32>>,
-    styles: Vec<Option<Arc<StyleAttribute<'static>>>>,
-}
-
-impl InlineStyleCache {
-    pub(super) fn new(doc: &Document, shared: &Arc<Mutex<ParsedInlineStyleCache>>) -> Self {
-        let mut node_style_ids = vec![None; doc.node_count()];
-        let mut sources = Vec::new();
-        let mut parsed = FxHashMap::<&str, u32>::default();
-        for node_idx in doc.node_ids() {
-            let Some(source) = doc.get_dom_attr(node_idx, "style").filter(|source| !source.trim().is_empty()) else { continue };
-            let style_id = *parsed.entry(source).or_insert_with(|| {
-                let id = u32::try_from(sources.len()).expect("inline style count fits in u32");
-                sources.push(source);
-                id
-            });
-            node_style_ids[node_idx.index()] = Some(style_id);
-        }
-        let styles = ParsedInlineStyleCache::get_or_parse_batch(shared, &sources);
-        Self { node_style_ids, styles }
-    }
-
-    pub(super) fn get(&self, node_idx: DomNodeId) -> Option<&StyleAttribute<'static>> {
-        let id = self
-            .node_style_ids
-            .get(node_idx.index())
-            .copied()
-            .flatten()?;
-        self.styles.get(id as usize)?.as_deref()
-    }
-}
-
-/// Build the starting style for an element: inherited groups (`font`, `text`)
-/// copied from the parent, reset groups (`box_model`, `border`, `background`)
-/// left at their defaults.
-pub(super) fn get_inherited_style_dom(
-    doc: &Document,
-    styles: &ComputedStylesBuilder,
-    node_idx: DomNodeId,
-) -> WorkingStyle {
-    let style = if let Some(parent_idx) = doc.get_dom_parent(node_idx) {
-        if let Some(parent_style) = styles.style_for_node(parent_idx) {
-            let parent_box_model = styles
-                .box_model_style(parent_style)
-                .expect("builder-issued parent style handle");
-            let mut style = WorkingStyle {
-                font: styles
-                    .font_style(parent_style)
-                    .expect("builder-issued parent style handle")
-                    .clone(),
-                text: styles
-                    .text_style(parent_style)
-                    .expect("builder-issued parent style handle")
-                    .clone(),
-                box_model: initial_box_model(),
-                border: initial_border(),
-                radii: BorderRadii::default(),
-                background: Background::default(),
-                layout: LayoutStyle::default(),
-                line_height_spec: None,
-                generated_content: None,
-                counters: CounterDirectives::default(),
-            };
-            style.layout.justify_items = default_justify_items(
-                styles.layout_style(parent_style)
-                    .expect("builder-issued parent style handle").justify_items,
-            );
-            inherit_box_model_properties(&mut style.box_model, parent_box_model);
-            style
-        } else {
-            let mut style = WorkingStyle::default();
-            style.font.font_size = doc.root_font_size();
-            style
-        }
-    } else {
-        // No parent - use root_font_size as the base font size.
-        let mut style = WorkingStyle::default();
-        style.font.font_size = doc.root_font_size();
-        style
-    };
-
-    style
-}
+use html_dom::{Document, DomNodeId};
+use html_style_model::ComputedStylesBuilder;
 
 /// `rem` on the root element uses the initial root size. Once that element has
 /// been computed, later elements use its computed font size. DOM style
@@ -99,37 +13,6 @@ pub(super) fn root_font_size_for_resolution(doc: &Document, styles: &ComputedSty
         .map(|font| font.font_size)
         .filter(|size| size.is_finite() && *size >= 0.0)
         .unwrap_or_else(|| doc.root_font_size())
-}
-
-/// Read-only document facade used while converting property values. It keeps
-/// all existing document queries available through `Deref`, while making
-/// every `rem` conversion in this stage observe the computed root size.
-pub(super) struct ResolutionDocument<'a> {
-    pub(super) document: &'a Document,
-    pub(super) root_font_size: f32,
-    pub(super) resolution: &'a ResolutionContext,
-}
-
-impl ResolutionDocument<'_> {
-    pub(super) fn root_font_size(&self) -> f32 {
-        self.root_font_size
-    }
-}
-
-impl Deref for ResolutionDocument<'_> {
-    type Target = Document;
-
-    fn deref(&self) -> &Self::Target {
-        self.document
-    }
-}
-
-pub(super) fn inherit_box_model_properties(style: &mut BoxModel, parent: &BoxModel) {
-    style.border_collapse = parent.border_collapse;
-    style.border_spacing_horizontal = parent.border_spacing_horizontal;
-    style.border_spacing_vertical = parent.border_spacing_vertical;
-    style.caption_side = parent.caption_side;
-    style.empty_cells = parent.empty_cells;
 }
 
 /// Build ancestor filter for DOM nodes (optimization)

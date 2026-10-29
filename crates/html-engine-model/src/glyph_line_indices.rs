@@ -1,121 +1,53 @@
-use html_dom::MemoryUsageReport;
+use html_dom::{MemoryUsageReport, storage::CompactU32Buffer};
 use std::ops::Range;
 
-/// Dense source-glyph ownership. One value is reserved for unowned glyphs;
+/// Source-glyph ownership by stable line ID, independent of spatial rank.
+/// One value is reserved for unowned glyphs;
 /// larger layouts use wide indexes rather than truncating a valid line ID.
-#[derive(Clone)]
-pub struct GlyphLineIndices {
-    storage: Storage,
-}
-
-#[derive(Clone)]
-enum Storage {
-    Narrow(Vec<u16>),
-    Wide(Vec<u32>),
-}
-
-impl Default for GlyphLineIndices {
-    fn default() -> Self {
-        Self {
-            storage: Storage::Narrow(Vec::new()),
-        }
-    }
-}
+#[derive(Clone, Default)]
+pub struct GlyphLineIndices(CompactU32Buffer);
 
 impl GlyphLineIndices {
     pub fn clear(&mut self) {
-        match &mut self.storage {
-            Storage::Narrow(values) => values.clear(),
-            Storage::Wide(values) => values.clear(),
-        }
+        self.0.clear();
     }
 
     /// Reuse the current buffer when its width still fits. Switching widths
     /// releases the old buffer before allocating its replacement.
     pub fn reset(&mut self, glyph_count: usize, line_count: usize) {
-        assert!(
-            line_count <= u32::MAX as usize,
-            "layout line count exceeds glyph-line index capacity"
-        );
-        let narrow = line_count <= u16::MAX as usize;
-        match (&self.storage, narrow) {
-            (Storage::Narrow(_), false) => self.storage = Storage::Wide(Vec::new()),
-            (Storage::Wide(_), true) => self.storage = Storage::Narrow(Vec::new()),
-            _ => {}
-        }
-        match &mut self.storage {
-            Storage::Narrow(values) => {
-                values.resize(glyph_count, u16::MAX);
-                values.fill(u16::MAX);
-            }
-            Storage::Wide(values) => {
-                values.resize(glyph_count, u32::MAX);
-                values.fill(u32::MAX);
-            }
-        }
+        self.0.reset(glyph_count, line_count);
     }
 
     pub fn assign(&mut self, glyphs: Range<usize>, line_index: usize) {
-        match &mut self.storage {
-            Storage::Narrow(values) => {
-                let line = u16::try_from(line_index)
-                    .expect("line index exceeds narrow glyph-line capacity");
-                assert!(
-                    line != u16::MAX,
-                    "line index collides with unowned-glyph sentinel"
-                );
-                values[glyphs].fill(line);
-            }
-            Storage::Wide(values) => {
-                let line =
-                    u32::try_from(line_index).expect("line index exceeds wide glyph-line capacity");
-                assert!(
-                    line != u32::MAX,
-                    "line index collides with unowned-glyph sentinel"
-                );
-                values[glyphs].fill(line);
-            }
-        }
+        let line = u32::try_from(line_index).expect("line index exceeds glyph-line capacity");
+        assert_ne!(
+            line,
+            u32::MAX,
+            "line index collides with unowned-glyph sentinel"
+        );
+        self.0.fill(glyphs, line);
     }
 
     #[inline]
     pub fn get(&self, glyph_index: usize) -> Option<usize> {
-        match &self.storage {
-            Storage::Narrow(values) => {
-                let line = *values.get(glyph_index)?;
-                (line != u16::MAX).then_some(line as usize)
-            }
-            Storage::Wide(values) => {
-                let line = *values.get(glyph_index)?;
-                (line != u32::MAX).then_some(line as usize)
-            }
-        }
+        self.0
+            .get(glyph_index)
+            .filter(|&line| line != u32::MAX)
+            .map(|line| line as usize)
     }
 
     pub fn memory_usage_report(&self) -> MemoryUsageReport {
-        let mut report = MemoryUsageReport::new();
-        match &self.storage {
-            Storage::Narrow(values) => {
-                report.add_slice_storage::<u16>("storage", values.capacity(), values.len())
-            }
-            Storage::Wide(values) => {
-                report.add_slice_storage::<u32>("storage", values.capacity(), values.len())
-            }
-        }
-        report
+        self.0.memory_usage_report()
     }
 
     #[cfg(any(test, feature = "testing"))]
     pub fn as_ptr(&self) -> *const () {
-        match &self.storage {
-            Storage::Narrow(values) => values.as_ptr().cast(),
-            Storage::Wide(values) => values.as_ptr().cast(),
-        }
+        self.0.as_ptr()
     }
 
     #[cfg(any(test, feature = "testing"))]
     pub fn is_narrow(&self) -> bool {
-        matches!(self.storage, Storage::Narrow(_))
+        self.0.is_narrow()
     }
 }
 

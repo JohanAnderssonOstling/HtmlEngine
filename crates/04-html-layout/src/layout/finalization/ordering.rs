@@ -1,97 +1,117 @@
-use html_style_model::{Display, Float, PositionMode};
+use crate::layout_model::LineId;
 use crate::layout_model::ScenePaintItem;
+use html_style_model::{Float, PositionMode, UsedStyleView};
 use std::ops::Range;
 
 use super::{FinalizationScratch, FragmentWriter, LayoutReader};
 
-type PaintOrderKey = Vec<(u8, i32, usize)>;
+type PaintOrderKey = Box<[(u8, i32, usize)]>;
 
 /// A path through real stacking contexts and the float/atomic-inline groups
 /// that paint atomically within them. Positioned descendants escape those
 /// temporary groups, while descendants of a real context stay inside it.
 fn paint_order_key(reader: &LayoutReader<'_>, box_idx: usize, ordinary_layer: u8) -> PaintOrderKey {
-    let source_order = |owner| reader.box_dom_element(owner).map_or(owner, |node| node as usize);
-    let mut ancestors = Vec::new();
+    let source_order = |owner| {
+        reader
+            .box_dom_element(owner)
+            .map_or(owner, |node| node as usize)
+    };
+    let root = reader.root_box();
+    let mut key = Vec::new();
+    let mut collect_groups = true;
+    let mut owns_group = false;
+    let mut append_ancestor = |owner: Option<usize>, style: UsedStyleView<'_>, source| {
+        let is_root = owner.is_some() && owner == root;
+        let is_context =
+            owner != root && style.position() != PositionMode::Static && style.z_index().is_some();
+        let group = if is_context {
+            let z = style.z_index().expect("stacking context has z-index");
+            Some((
+                if z < 0 {
+                    1
+                } else if z == 0 {
+                    5
+                } else {
+                    6
+                },
+                z,
+                source,
+            ))
+        } else if !collect_groups || is_root {
+            None
+        } else if style.position() != PositionMode::Static {
+            collect_groups = false;
+            Some((5, 0, source))
+        } else if matches!(style.float(), Float::Left | Float::Right) {
+            Some((3, 0, source))
+        } else if style.display().is_atomic_inline() {
+            Some((4, 0, source))
+        } else {
+            None
+        };
+        if let Some(group) = group {
+            // Leave room for the final item layer alongside the first group.
+            if key.is_empty() {
+                key.reserve_exact(2);
+            }
+            key.push(group);
+            owns_group |= owner == Some(box_idx);
+        }
+        if is_context || is_root {
+            collect_groups = false;
+            owns_group |= owner == Some(box_idx);
+        }
+    };
     let mut current = Some(box_idx);
     while let Some(owner) = current {
-        ancestors.push((Some(owner), reader.style(owner), source_order(owner)));
+        append_ancestor(Some(owner), reader.style(owner), source_order(owner));
         // Block-in-inline generation removes inline boxes from this layout
         // parent chain. Their retained position styles still establish paint
         // contexts. Recover each source identity from the DOM so separate
         // block fragments stay inside the same original inline context.
         let split = reader.split_inline_position_ancestors(owner);
         if !split.is_empty() {
-            let mut node = reader.box_dom_element(owner)
+            let mut node = reader
+                .box_dom_element(owner)
                 .and_then(|raw| reader.document().node_id_from_raw(raw))
                 .and_then(|node| reader.document().node_ref(node))
                 .and_then(|node| node.parent());
             for &indices in split.iter().rev() {
                 let mut source = source_order(owner);
                 while let Some(ancestor) = node {
-                    node = reader.document().node_ref(ancestor).and_then(|node| node.parent());
+                    node = reader
+                        .document()
+                        .node_ref(ancestor)
+                        .and_then(|node| node.parent());
                     if reader.styles().style_for_node(ancestor) == Some(indices) {
                         source = ancestor.raw() as usize;
                         break;
                     }
                 }
-                ancestors.push((None, reader.used_style(indices), source));
+                append_ancestor(None, reader.used_style(indices), source);
             }
         }
         current = reader.get_parent(owner);
     }
-    let contexts: Vec<_> = ancestors.iter().enumerate()
-        .filter(|(_, (owner, style, _))| {
-            *owner != reader.root_box()
-                && style.position() != PositionMode::Static
-                && style.z_index().is_some()
-        })
-        .map(|(index, _)| index).collect();
-    let context = contexts.first().copied().or_else(|| {
-        reader.root_box().and_then(|root| ancestors.iter().position(|&(owner, _, _)| owner == Some(root)))
-    });
-    let mut positioned = None;
-    let mut groups = Vec::new();
-    for (index, &(_, style, _)) in ancestors[..context.unwrap_or(ancestors.len())].iter().enumerate() {
-        if style.position() != PositionMode::Static {
-            positioned.get_or_insert(index);
-        }
-        if positioned.is_none() {
-            if matches!(style.float(), Float::Left | Float::Right) {
-                groups.push((index, 3));
-            } else if matches!(style.display(), Display::InlineBlock | Display::InlineTable | Display::InlineFlex | Display::InlineGrid) {
-                groups.push((index, 4));
-            }
-        }
-    }
-    let mut key = Vec::with_capacity(contexts.len() + groups.len() + usize::from(positioned.is_some()) + 1);
-    for &index in contexts.iter().rev() {
-        let (_, style, source) = ancestors[index];
-        let z = style.z_index().expect("stacking context has z-index");
-        let layer = if z < 0 { 1 } else if z == 0 { 5 } else { 6 };
-        key.push((layer, z, source));
-    }
-    if let Some(index) = positioned {
-        key.push((5, 0, ancestors[index].2));
-    }
-    for &(index, layer) in groups.iter().rev() {
-        key.push((layer, 0, ancestors[index].2));
-    }
-    let group_owner = groups.first().map(|&(index, _)| index).or(positioned).or(context);
+    // The upward walk emits inner groups first; the comparison key starts
+    // with outer stacking contexts, then temporary groups, then this item.
+    key.reverse();
     let layer = match ordinary_layer {
-        1 if group_owner == Some(0) => 0,
+        1 if owns_group => 0,
         1 => 2,
         4 => 7,
         _ => 4,
     };
+    key.reserve_exact(1);
     key.push((layer, 0, source_order(box_idx)));
-    key
+    key.into_boxed_slice()
 }
 
-pub(super) fn build_scene_paint_order(
+pub(in crate::layout) fn build_scene_paint_order(
     reader: &LayoutReader<'_>,
     fragments: &mut FragmentWriter<'_>,
 ) {
-    let (layout, _, owners) = fragments.finalization_parts();
+    let (layout, owners) = fragments.decoration_parts();
     let mut items = Vec::with_capacity(
         layout.fragment_output.decorations.len() + layout.line_output.lines.len(),
     );
@@ -104,24 +124,48 @@ pub(super) fn build_scene_paint_order(
             ScenePaintItem::Line(index as u32),
         ));
     }
-    for (index, decoration) in layout.fragment_output.decorations.fragments().iter().enumerate() {
+    for (index, decoration) in layout
+        .fragment_output
+        .decorations
+        .fragments()
+        .iter()
+        .enumerate()
+    {
         let foreground = decoration.is_foreground();
-        let line = layout.fragment_output.decoration_line_indices.get(index)
-            .copied().filter(|&line| line != u32::MAX);
+        let line = layout
+            .fragment_output
+            .decoration_line_indices
+            .get(index)
+            .copied()
+            .filter(|&line| line != u32::MAX);
         let (key, rank) = if index < layout.fragment_output.block_decoration_count as usize {
             (
-                paint_order_key(reader, owners[index] as usize, if foreground { 4 } else { 1 }),
+                paint_order_key(
+                    reader,
+                    owners[index] as usize,
+                    if foreground { 4 } else { 1 },
+                ),
                 0,
             )
         } else if let Some(line) = line {
             (
-                paint_order_key(reader, layout.line_output.lines[line as usize].owner_box_idx as usize, 3),
+                paint_order_key(
+                    reader,
+                    layout.line_output.lines[line as usize].owner_box_idx as usize,
+                    3,
+                ),
                 layout.line_output.paint_order_ranks[line as usize],
             )
         } else {
             continue;
         };
-        items.push((key, rank, if foreground { 2 } else { 0 }, index, ScenePaintItem::Decoration(index as u32)));
+        items.push((
+            key,
+            rank,
+            if foreground { 2 } else { 0 },
+            index,
+            ScenePaintItem::Decoration(index as u32),
+        ));
     }
     // Positioned backgrounds and their content share a context key. Keeping
     // that key across both kinds prevents a later background from being
@@ -129,170 +173,81 @@ pub(super) fn build_scene_paint_order(
     // before/after-text relationship within the same carrier line.
     items.sort_by(|a, b| (&a.0, a.1, a.2, a.3).cmp(&(&b.0, b.1, b.2, b.3)));
     layout.fragment_output.scene_paint_order.clear();
-    layout.fragment_output.scene_paint_order.extend(items.into_iter().map(|(_, _, _, _, item)| item));
+    layout
+        .fragment_output
+        .scene_paint_order
+        .extend(items.into_iter().map(|(_, _, _, _, item)| item));
+    let output = &mut layout.fragment_output;
+    output.scene_line_ranks.clear();
+    output.scene_line_ranks.resize(layout.line_output.lines.len(), u32::MAX);
+    output.scene_decoration_ranks.clear();
+    output.scene_decoration_ranks.resize(output.decorations.len(), u32::MAX);
+    for (rank, item) in output.scene_paint_order.iter().enumerate() {
+        match *item {
+            ScenePaintItem::Line(line) => output.scene_line_ranks[line as usize] = rank as u32,
+            ScenePaintItem::Decoration(index) => output.scene_decoration_ranks[index as usize] = rank as u32,
+        }
+    }
 }
 
-pub(super) fn sort_lines_and_remap_images(
-    reader: &LayoutReader<'_>,
-    fragments: &mut FragmentWriter<'_>,
-    scratch: &mut FinalizationScratch,
-) {
-    profile_scope!("finalize.sort_lines");
-    let (layout, line_owners, _) = fragments.finalization_parts();
-    let mut owners = std::mem::take(line_owners);
-    let mut lines = std::mem::take(&mut layout.line_output.lines);
-    let mut offsets_by_line = std::mem::take(&mut layout.line_output.line_glyph_offsets);
-    let mut advances_by_line = std::mem::take(&mut layout.line_output.line_glyph_advances);
-    offsets_by_line.freeze();
-    advances_by_line.freeze();
-    assert_eq!(
-        owners.len(),
-        lines.len(),
-        "every line must carry a formatting-context owner"
-    );
-    let mut line_pairs = std::mem::take(&mut scratch.line_pairs);
-    line_pairs.clear();
-    line_pairs.extend(lines.drain(..).enumerate().map(|(idx, line)| {
-        (
-            line,
-            offsets_by_line.range(idx),
-            advances_by_line.range(idx),
-            idx,
-        )
-    }));
-    offsets_by_line.clear_ranges();
-    advances_by_line.clear_ranges();
-
-    // CSS paint order and document geometry are different orderings. Keep a
-    // compact paint traversal, but store the lines themselves top-to-bottom;
-    // pagination, hit testing, and viewport binary searches require monotonic
-    // vertical geometry.
-    layout.line_output.paint_order_indices.clear();
-    layout.line_output.paint_order_indices.extend(
-        (0..line_pairs.len()).map(|index| {
-            u32::try_from(index).expect("line index exceeds paint traversal capacity")
-        }),
-    );
-    let line_keys: Vec<_> = owners.iter()
-        .map(|&owner| paint_order_key(reader, owner as usize, 3)).collect();
-    layout
-        .line_output
-        .paint_order_indices
-        .sort_by(|a_idx, b_idx| {
-            let a_idx = *a_idx as usize;
-            let b_idx = *b_idx as usize;
-            let a = &line_pairs[a_idx].0;
-            let b = &line_pairs[b_idx].0;
-            line_keys[a_idx].cmp(&line_keys[b_idx])
-                .then_with(|| {
-                    a.point
-                        .y
-                        .partial_cmp(&b.point.y)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .then_with(|| {
-                    a.point
-                        .x
-                        .partial_cmp(&b.point.x)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-        });
-
-    line_pairs.sort_by(|(a, _, _, a_idx), (b, _, _, b_idx)| {
-        (a.point.y + a.height)
-            .total_cmp(&(b.point.y + b.height))
-            .then_with(|| a.point.y.total_cmp(&b.point.y))
-            .then_with(|| a.point.x.total_cmp(&b.point.x))
-            .then_with(|| a_idx.cmp(b_idx))
+/// Build independent traversals over stable emission-order line storage.
+pub(super) fn build_line_traversals(reader: &LayoutReader<'_>, fragments: &mut FragmentWriter<'_>) {
+    profile_scope!("finalize.line_traversals");
+    let output = &mut fragments.state_mut().line_output;
+    output.line_glyph_offsets.freeze();
+    output.line_glyph_advances.freeze();
+    output.spatial_order.clear();
+    output
+        .spatial_order
+        .extend((0..output.lines.len()).map(LineId::new));
+    output.spatial_order.sort_unstable_by(|a, b| {
+        let left = &output.lines[a.index()];
+        let right = &output.lines[b.index()];
+        (left.point.y + left.height)
+            .total_cmp(&(right.point.y + right.height))
+            .then_with(|| left.point.y.total_cmp(&right.point.y))
+            .then_with(|| left.point.x.total_cmp(&right.point.x))
+            .then_with(|| a.cmp(b))
     });
-
-    let mut index_map = std::mem::take(&mut scratch.index_map);
-    index_map.resize(line_pairs.len(), 0);
-    for (new_idx, (_, _, _, old_idx)) in line_pairs.iter().enumerate() {
-        index_map[*old_idx] = new_idx;
+    output.spatial_ranks.resize(output.lines.len(), 0);
+    for (rank, &id) in output.spatial_order.iter().enumerate() {
+        output.spatial_ranks[id.index()] = rank as u32;
     }
-    layout.paint_program.remap_lines(&index_map);
-    for line_idx in &mut layout.line_output.paint_order_indices {
-        *line_idx = u32::try_from(index_map[*line_idx as usize])
-            .expect("line index exceeds paint traversal capacity");
+    let keys: Vec<_> = output
+        .lines
+        .iter()
+        .map(|line| paint_order_key(reader, line.owner_box_idx as usize, 3))
+        .collect();
+    output.paint_order_indices.clear();
+    output
+        .paint_order_indices
+        .extend((0..output.lines.len()).map(LineId::new));
+    output.paint_order_indices.sort_by(|a, b| {
+        let left = &output.lines[a.index()];
+        let right = &output.lines[b.index()];
+        keys[a.index()]
+            .cmp(&keys[b.index()])
+            .then_with(|| left.point.y.total_cmp(&right.point.y))
+            .then_with(|| left.point.x.total_cmp(&right.point.x))
+    });
+    output.paint_order_ranks.resize(output.lines.len(), 0);
+    for (rank, &id) in output.paint_order_indices.iter().enumerate() {
+        output.paint_order_ranks[id.index()] = rank as u32;
     }
-    layout.line_output.paint_order_ranks.clear();
-    layout
-        .line_output
-        .paint_order_ranks
-        .resize(layout.line_output.paint_order_indices.len(), 0);
-    for (rank, &line_idx) in layout.line_output.paint_order_indices.iter().enumerate() {
-        layout.line_output.paint_order_ranks[line_idx as usize] =
-            u32::try_from(rank).expect("paint rank exceeds traversal capacity");
-    }
-
-    let remap_flags = |flags: &mut Vec<bool>| {
-        let old = std::mem::take(flags);
-        flags.resize(index_map.len(), false);
-        for (old_idx, value) in old.into_iter().enumerate().take(index_map.len()) {
-            flags[index_map[old_idx]] = value;
-        }
-    };
-    remap_flags(&mut layout.line_output.positioned_layers);
-    remap_flags(&mut layout.line_output.negative_positioned_layers);
-    remap_flags(&mut layout.line_output.independent_positioned_layers);
-
-    for (line, offsets, advances, _) in line_pairs.drain(..) {
-        lines.push(line);
-        offsets_by_line.push_range(offsets);
-        advances_by_line.push_range(advances);
-    }
-    layout.line_output.lines = lines;
-    layout.line_output.line_glyph_offsets = offsets_by_line;
-    layout.line_output.line_glyph_advances = advances_by_line;
-    for frag in &mut layout.fragment_output.image_fragments {
-        if let Some(&new_idx) = index_map.get(frag.line_idx) {
-            frag.line_idx = new_idx;
-        }
-    }
-    for line_idx in &mut layout.fragment_output.decoration_line_indices {
-        if *line_idx != u32::MAX
-            && let Some(&new_idx) = index_map.get(*line_idx as usize)
-        {
-            *line_idx =
-                u32::try_from(new_idx).expect("line index exceeds decoration traversal capacity");
-        }
-    }
-    for frag in &mut layout.line_output.ellipsis_fragments {
-        if let Some(&new_idx) = index_map.get(frag.line_idx) {
-            frag.line_idx = new_idx;
-        }
-    }
-    layout
-        .line_output
+    output
         .ellipsis_fragments
         .sort_unstable_by_key(|fragment| fragment.line_idx);
-    for frag in &mut layout.line_output.hyphen_fragments {
-        if let Some(&new_idx) = index_map.get(frag.line_idx) {
-            frag.line_idx = new_idx;
-        }
-    }
-    layout
-        .line_output
+    output
         .hyphen_fragments
         .sort_unstable_by_key(|fragment| fragment.line_idx);
-    let mut sorted_owners = std::mem::take(&mut scratch.sorted_line_owners);
-    sorted_owners.resize(owners.len(), 0);
-    for (old_idx, owner) in owners.drain(..).enumerate() {
-        sorted_owners[index_map[old_idx]] = owner;
-    }
-    scratch.line_pairs = line_pairs;
-    scratch.index_map = index_map;
-    scratch.sorted_line_owners = owners;
-    *line_owners = sorted_owners;
 }
 
-pub(super) fn build_block_decoration_traversal(
+pub(in crate::layout) fn build_block_decoration_traversal(
     reader: &LayoutReader<'_>,
     fragments: &mut FragmentWriter<'_>,
     scratch: &mut FinalizationScratch,
 ) {
-    let (layout, _, decoration_owners) = fragments.finalization_parts();
+    let (layout, decoration_owners) = fragments.decoration_parts();
     let owners = std::mem::take(decoration_owners);
     assert_eq!(
         owners.len(),
@@ -321,7 +276,9 @@ pub(super) fn build_block_decoration_traversal(
     }
     // Topology IDs are preorder. Sorting compact semantic groups retains
     // edge order within an owner while leaving fragment storage untouched.
-    groups.sort_by_cached_key(|(owner, range)| (paint_order_key(reader, *owner as usize, 1), range.start));
+    groups.sort_by_cached_key(|(owner, range)| {
+        (paint_order_key(reader, *owner as usize, 1), range.start)
+    });
     layout
         .fragment_output
         .block_paint_ranges
@@ -388,7 +345,7 @@ pub(super) fn rebuild_image_fragments_by_line(fragments: &mut FragmentWriter<'_>
     by_line.freeze();
 }
 
-pub(super) fn rebuild_decoration_fragments_by_line(fragments: &mut FragmentWriter<'_>) {
+pub(in crate::layout) fn rebuild_decoration_fragments_by_line(fragments: &mut FragmentWriter<'_>) {
     let layout = fragments.state_mut();
     let paint_orders = &layout.fragment_output.decoration_paint_orders;
     let by_line = &mut layout.fragment_output.decoration_fragments_by_line;
@@ -414,40 +371,16 @@ pub(super) fn rebuild_decoration_fragments_by_line(fragments: &mut FragmentWrite
         }
         let same_paint_layer = layout
             .fragment_output
-            .decoration_positioned_layers
+            .decoration_paint_layers
             .get(decoration_idx)
             .copied()
-            .unwrap_or(false)
+            .unwrap_or_default()
             == layout
                 .line_output
-                .positioned_layers
+                .paint_layers
                 .get(line_idx as usize)
                 .copied()
-                .unwrap_or(false)
-            && layout
-                .fragment_output
-                .decoration_negative_positioned_layers
-                .get(decoration_idx)
-                .copied()
-                .unwrap_or(false)
-                == layout
-                    .line_output
-                    .negative_positioned_layers
-                    .get(line_idx as usize)
-                    .copied()
-                    .unwrap_or(false)
-            && layout
-                .fragment_output
-                .decoration_independent_positioned_layers
-                .get(decoration_idx)
-                .copied()
-                .unwrap_or(false)
-                == layout
-                    .line_output
-                    .independent_positioned_layers
-                    .get(line_idx as usize)
-                    .copied()
-                    .unwrap_or(false);
+                .unwrap_or_default();
         if same_paint_layer {
             if (line_idx as usize) < by_line.len() {
                 by_line.push_to(line_idx as usize, decoration_idx);

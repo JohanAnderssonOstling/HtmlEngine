@@ -105,51 +105,10 @@ impl<T> GroupedArena<T> {
         self.items.get(range.start as usize..range.end as usize)
     }
 
-    /// Move a published group's values into the next publication. The old
-    /// range remains valid for other groups; consumed values become empty.
-    pub fn take_group(&mut self, group: usize) -> impl Iterator<Item = T> + '_
-    where
-        T: Default,
-    {
-        assert!(self.frozen);
-        let range = self.ranges[group].clone();
-        self.items[range.start as usize..range.end as usize]
-            .iter_mut()
-            .map(std::mem::take)
-    }
-
-    /// Reuse the previous publication's allocation after all of its reads end.
-    pub fn recycle_storage(&mut self, mut storage: Self)
-    where
-        T: Default,
-    {
-        self.freeze();
-        storage.clear();
-        for group in 0..self.len() {
-            storage.push(self.take_group(group));
-        }
-        *self = storage;
-    }
-
     pub fn get_mut(&mut self, group: usize) -> Option<&mut [T]> {
         assert!(self.frozen);
         let range = self.ranges.get(group)?;
         self.items.get_mut(range.start as usize..range.end as usize)
-    }
-
-    pub fn range(&self, group: usize) -> Range<u32> {
-        assert!(self.frozen);
-        self.ranges[group].clone()
-    }
-
-    pub fn clear_ranges(&mut self) {
-        assert!(self.frozen);
-        self.ranges.clear();
-    }
-
-    pub fn push_range(&mut self, range: Range<u32>) {
-        assert!(self.frozen);
-        self.ranges.push(range);
     }
 
     pub fn len(&self) -> usize {
@@ -181,31 +140,6 @@ impl<T> GroupedArena<T> {
 #[cfg(test)]
 mod tests {
     use super::GroupedArena;
-
-    #[test]
-    fn publication_transfer_moves_groups_and_recycles_the_original_allocation() {
-        let mut previous = GroupedArena::<Vec<u32>>::default();
-        previous.reset_groups(2);
-        previous.push_to(0, vec![10, 11]);
-        previous.push_to(1, vec![20, 21]);
-        previous.freeze();
-        let storage = previous.ranges.as_ptr();
-        let payload = previous.get(1).unwrap()[0].as_ptr();
-        let mut current = GroupedArena::default();
-        current.clear();
-        current.push(previous.take_group(1));
-        current.push(previous.take_group(0));
-        assert!(
-            previous.get(1).unwrap()[0].is_empty(),
-            "the source no longer owns the moved payload"
-        );
-        current.recycle_storage(previous);
-        current.freeze();
-        assert_eq!(current.ranges.as_ptr(), storage);
-        assert_eq!(current.get(0).unwrap(), &[vec![20, 21]]);
-        assert_eq!(current.get(1).unwrap(), &[vec![10, 11]]);
-        assert_eq!(current.get(0).unwrap()[0].as_ptr(), payload);
-    }
 
     #[test]
     fn interleaved_groups_publish_contiguous_slices_and_reuse_storage() {

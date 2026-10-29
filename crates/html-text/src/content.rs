@@ -1,4 +1,5 @@
 use crate::source_offsets::SourceOffsets;
+use crate::{PseudoStyles, TextStructure, whitespace_context_root};
 use html_dom::MemoryUsageReport;
 use std::ops::Range;
 
@@ -24,13 +25,15 @@ impl WhitespaceWrapOverride {
 const _: () = assert!(std::mem::size_of::<WhitespaceWrapOverride>() == 1);
 
 /// Canonical logical text and source correspondence, owned by preparation.
+/// Characters are stored as validated Unicode scalar values.
 /// Shaping borrows this content and writes glyph IDs into a separate buffer;
 /// it never copies or modifies the source offsets, wrap flags, or inline items.
 #[derive(Default)]
 #[cfg_attr(any(test, feature = "testing"), derive(Clone))]
 pub struct InlineContent {
     unicode_wraps: bool,
-    characters: Vec<u32>,
+    pub(crate) pseudo_styles: PseudoStyles,
+    characters: Vec<char>,
     /// UTF-16 source offset within `InlineItem::dom_text_node` for each glyph.
     /// Synthetic characters such as list markers have no source position.
     glyph_source_offsets: SourceOffsets,
@@ -43,12 +46,16 @@ pub struct InlineContent {
 }
 
 impl InlineContent {
+    pub fn pseudo_styles(&self) -> &PseudoStyles {
+        &self.pseudo_styles
+    }
+
     pub fn has_unicode_wraps(&self) -> bool {
         self.unicode_wraps
     }
     pub fn memory_usage_report(&self) -> MemoryUsageReport {
-        let mut report = MemoryUsageReport::new();
-        report.add_slice_storage::<u32>(
+        let mut report = self.pseudo_styles.memory_usage_report();
+        report.add_slice_storage::<char>(
             "InlineContent.characters.storage",
             self.characters.capacity(),
             self.characters.len(),
@@ -72,11 +79,11 @@ impl InlineContent {
 }
 
 impl InlineContent {
-    pub fn characters(&self) -> &[u32] {
+    pub fn characters(&self) -> &[char] {
         self.characters.as_slice()
     }
 
-    pub fn character_at(&self, glyph_idx: usize) -> Option<u32> {
+    pub fn character_at(&self, glyph_idx: usize) -> Option<char> {
         self.characters.get(glyph_idx).copied()
     }
 
@@ -108,7 +115,7 @@ impl InlineContent {
 
     pub(crate) fn replace_characters(
         &mut self,
-        characters: Vec<u32>,
+        characters: Vec<char>,
         source_offsets: SourceOffsets,
         whitespace_wrap_before: Vec<WhitespaceWrapOverride>,
     ) {
@@ -122,6 +129,12 @@ impl InlineContent {
 
     pub fn inline_items(&self) -> &[InlineItem] {
         self.inline_items.as_slice()
+    }
+
+    /// Borrow ordinary text and generated marker runs in source order,
+    /// including empty ranges. Structural events stay in `inline_items`.
+    pub fn text_runs(&self) -> impl DoubleEndedIterator<Item = InlineTextRun<'_>> + Clone {
+        self.inline_items.iter().filter_map(InlineItem::text_run)
     }
 
     pub fn inline_items_mut(&mut self) -> &mut [InlineItem] {
@@ -141,14 +154,14 @@ impl InlineContent {
     }
 
     pub fn push_character(&mut self, character: char) {
-        self.characters.push(character as u32);
+        self.characters.push(character);
         self.glyph_source_offsets.push(u32::MAX);
         self.whitespace_wrap_before
             .push(WhitespaceWrapOverride::Style);
     }
 
     pub fn push_source_character(&mut self, character: char, source_offset: u32) {
-        self.characters.push(character as u32);
+        self.characters.push(character);
         self.glyph_source_offsets.push(source_offset);
         self.whitespace_wrap_before
             .push(WhitespaceWrapOverride::Style);
@@ -160,6 +173,61 @@ pub struct InlineItem {
     pub kind: InlineItemKind,
     pub box_idx: u32,
     pub dom_text_node: Option<u32>, // DOM text node that produced this item (None for synthetic/non-text items)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InlineTextKind {
+    Text,
+    Marker,
+}
+
+/// Borrowed logical text metadata, independent of shaping and layout output.
+#[derive(Clone, Copy, Debug)]
+pub struct InlineTextRun<'a> {
+    pub kind: InlineTextKind,
+    pub glyphs: &'a Range<u32>,
+    pub box_idx: u32,
+    pub dom_text_node: Option<u32>,
+}
+
+impl InlineItem {
+    /// Atomic content belongs to the surrounding flow, not its own descendants.
+    pub fn context_owner(&self, tree: &(impl TextStructure + ?Sized)) -> usize {
+        let owner = self.box_idx as usize;
+        match self.kind {
+            InlineItemKind::Image { .. } | InlineItemKind::AtomicBox { .. } => {
+                tree.get_box_parent(owner).unwrap_or(owner)
+            }
+            _ => owner,
+        }
+    }
+
+    pub fn flow_root(&self, tree: &(impl TextStructure + ?Sized)) -> usize {
+        whitespace_context_root(tree, self.context_owner(tree))
+    }
+
+    /// Markers form independent Unicode paragraphs beside their principal box.
+    pub fn paragraph_root(&self, tree: &(impl TextStructure + ?Sized)) -> usize {
+        if matches!(self.kind, InlineItemKind::Marker { .. }) {
+            self.box_idx as usize
+        } else {
+            self.flow_root(tree)
+        }
+    }
+
+    pub fn text_run(&self) -> Option<InlineTextRun<'_>> {
+        let (kind, glyphs) = match &self.kind {
+            InlineItemKind::Text { glyphs } => (InlineTextKind::Text, glyphs),
+            InlineItemKind::Marker { glyphs } => (InlineTextKind::Marker, glyphs),
+            _ => return None,
+        };
+        Some(InlineTextRun {
+            kind,
+            glyphs,
+            box_idx: self.box_idx,
+            dom_text_node: self.dom_text_node,
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -202,4 +270,55 @@ pub enum InlineItemKind {
     Marker {
         glyphs: Range<u32>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InlineContent, InlineItem, InlineItemKind, InlineTextKind};
+    use html_style_model::Clear;
+    use std::ptr;
+
+    #[test]
+    fn text_views_borrow_ranges_and_keep_empty_runs_markers_and_source_order() {
+        let mut content = InlineContent::default();
+        for character in "ab•".chars() {
+            content.push_character(character);
+        }
+        for (kind, box_idx, dom_text_node) in [
+            (InlineItemKind::Text { glyphs: 0..0 }, 1, Some(9)),
+            (InlineItemKind::Image { image_idx: 0 }, 2, None),
+            (InlineItemKind::Text { glyphs: 0..2 }, 1, Some(9)),
+            (InlineItemKind::Break { clear: Clear::None }, 1, None),
+            (InlineItemKind::Marker { glyphs: 2..3 }, 3, None),
+        ] {
+            content.push_inline_item(InlineItem {
+                kind,
+                box_idx,
+                dom_text_node,
+            });
+        }
+        let runs = content.text_runs().collect::<Vec<_>>();
+        assert_eq!(
+            runs.iter()
+                .map(|run| (run.kind, run.glyphs.clone(), run.box_idx, run.dom_text_node))
+                .collect::<Vec<_>>(),
+            [
+                (InlineTextKind::Text, 0..0, 1, Some(9)),
+                (InlineTextKind::Text, 0..2, 1, Some(9)),
+                (InlineTextKind::Marker, 2..3, 3, None),
+            ]
+        );
+        assert_eq!(
+            content
+                .text_runs()
+                .rev()
+                .map(|run| run.glyphs.clone())
+                .collect::<Vec<_>>(),
+            [2..3, 0..2, 0..0]
+        );
+        let InlineItemKind::Text { glyphs } = &content.inline_items()[2].kind else {
+            panic!("text item")
+        };
+        assert!(ptr::eq(runs[1].glyphs, glyphs));
+    }
 }

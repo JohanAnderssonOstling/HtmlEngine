@@ -1,8 +1,11 @@
 use crate::{
     HtmlFragmentContext, HtmlParserOptions, HtmlSyntaxNode, ParsedHtml, parse_html_fragment,
 };
-use html_dom::{Document, DocumentBuildError, DomNodeId, NodeRef};
+use html_dom::{
+    Document, DocumentBuildError, DomNodeId, NodeRef, TextChildPosition, collapse_whitespace,
+};
 use std::collections::HashMap;
+use std::ops::Range;
 
 /// A durable DOM address for one character in parse-level plain text.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -51,27 +54,61 @@ impl DocumentTextIndex {
             text: String::new(),
             text_chars: 0,
             runs: Vec::new(),
-            paths: HashMap::new(),
+            paths: Vec::new(),
+            parent_paths: HashMap::new(),
             text_offsets: HashMap::new(),
             pending_space: false,
         };
         if let Some(root) = document.dom_root() {
             builder.visit(root);
         }
-        let mut paths = vec![Box::<[usize]>::default(); builder.paths.len()];
-        for (path, index) in builder.paths {
-            paths[index] = path.into_boxed_slice();
-        }
-        Ok(Self { text: builder.text, runs: builder.runs, paths })
+        Ok(Self { text: builder.text, runs: builder.runs, paths: builder.paths })
     }
 
     pub fn text(&self) -> &str {
         &self.text
     }
 
+    /// Number of Unicode scalar values in the collapsed text.
+    pub fn character_count(&self) -> usize {
+        self.runs.last().map_or(0, |run| run.text_end)
+    }
+
+    /// Borrow a character-indexed range without retaining a second text copy.
+    /// Endpoints are located in the run index, then scanned within that run.
+    pub fn text_range(&self, range: Range<usize>) -> Option<&str> {
+        if range.start > range.end {
+            return None;
+        }
+        self.text
+            .get(self.byte_offset(range.start)?..self.byte_offset(range.end)?)
+    }
+
+    fn byte_offset(&self, position: usize) -> Option<usize> {
+        if position == 0 {
+            return Some(0);
+        }
+        // A collapsed separator is one ASCII space between source runs. Its
+        // start is the preceding run's end; its end is the next run's start.
+        let run = self
+            .runs
+            .get(self.runs.partition_point(|run| run.text_end < position))?;
+        if position == run.text_end {
+            return Some(run.byte_end);
+        }
+        let local = position.checked_sub(run.text_start)?;
+        let text = &self.text[run.byte_start..run.byte_end];
+        if text.len() == run.text_end - run.text_start {
+            return Some(run.byte_start + local);
+        }
+        text.char_indices()
+            .nth(local)
+            .map(|(offset, _)| run.byte_start + offset)
+    }
+
     /// Returns the first addressable source character in a matched interval.
     /// Inserted block-boundary spaces deliberately carry no source address.
-    pub fn source_position_in(&self, range: std::ops::Range<usize>) -> Option<SourceTextPosition> {
+    pub fn source_position_in(&self, range: Range<usize>) -> Option<SourceTextPosition> {
         let run_index = self.runs.partition_point(|run| run.text_end <= range.start);
         let run = self
             .runs
@@ -103,8 +140,9 @@ struct TextIndexBuilder<'a> {
     text: String,
     text_chars: usize,
     runs: Vec<SourceTextRun>,
-    paths: HashMap<Vec<usize>, usize>,
-    text_offsets: HashMap<(DomNodeId, usize), usize>,
+    paths: Vec<Box<[usize]>>,
+    parent_paths: HashMap<DomNodeId, usize>,
+    text_offsets: HashMap<DomNodeId, TextChildPosition>,
     pending_space: bool,
 }
 
@@ -138,23 +176,28 @@ impl TextIndexBuilder<'_> {
         let Some(parent) = self.document.node_ref(node).and_then(NodeRef::parent) else {
             return;
         };
-        let Some(text_step) = self.document.get_text_node_step(node) else {
+        if !self.text_offsets.contains_key(&node) {
+            self.text_offsets.extend(
+                self.document.text_child_positions(parent)
+                    .map(|position| (position.node, position)),
+            );
+        }
+        let Some(position) = self.text_offsets.get(&node) else {
             return;
         };
-        let chunk_offset = self.text_offsets.entry((parent, text_step)).or_default();
-        let current_chunk_offset = *chunk_offset;
-        *chunk_offset += value.encode_utf16().count();
-        let path = self.document.get_dom_path_to_node(parent);
-        let Some(element_steps) = path
-            .into_iter()
-            .skip(1)
-            .map(|element| self.document.get_element_step(element))
-            .collect::<Option<Vec<_>>>()
-        else {
-            return;
+        let text_step = position.text_step;
+        let current_chunk_offset = position.utf16_range.start;
+        let path_index = if let Some(&index) = self.parent_paths.get(&parent) {
+            index
+        } else {
+            let Some(path) = self.document.element_source_path(parent) else {
+                return;
+            };
+            let index = self.paths.len();
+            self.paths.push(path.into_iter().map(|element| element.step()).collect());
+            self.parent_paths.insert(parent, index);
+            index
         };
-        let next_index = self.paths.len();
-        let path_index = *self.paths.entry(element_steps).or_insert(next_index);
         let mut local_utf16 = 0usize;
         let mut run_start = None;
         for character in value.chars() {
@@ -209,7 +252,7 @@ pub fn plain_text_from_fragment(html: &str) -> String {
     );
     let mut text = String::new();
     append_plain_text(&parsed.syntax_tree().nodes, &mut text);
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
+    collapse_whitespace(&text)
 }
 
 fn append_plain_text(nodes: &[HtmlSyntaxNode], output: &mut String) {
@@ -283,4 +326,63 @@ fn is_text_boundary_element(name: &str) -> bool {
             | "tr"
             | "ul"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DocumentTextIndex;
+    use crate::parse_html_document;
+
+    #[test]
+    fn character_ranges_cross_unicode_runs_and_collapsed_separators() {
+        for source in [
+            "",
+            "<p> \n\t </p>",
+            "<p>Aé😀e\u{301}</p>",
+            "<p>a<!-- split -->b<em>é</em>c</p><p>d\u{a0}e</p>",
+            "<p>😀 \n β</p><br><div>z<!-- split -->終</div>",
+        ] {
+            let index = DocumentTextIndex::from_parsed(&parse_html_document(source)).unwrap();
+            let characters: Vec<_> = index.text().chars().collect();
+            assert_eq!(index.character_count(), characters.len());
+            for start in 0..=characters.len() {
+                for end in start..=characters.len() {
+                    let expected: String = characters[start..end].iter().collect();
+                    assert_eq!(
+                        index.text_range(start..end),
+                        Some(expected.as_str()),
+                        "{source}: {start}..{end}"
+                    );
+                }
+            }
+            assert_eq!(index.text_range(0..characters.len() + 1), None);
+            assert_eq!(index.text_range(usize::MAX..usize::MAX), None);
+            assert_eq!(index.text_range(1..0), None);
+        }
+    }
+
+    #[test]
+    fn cached_parent_paths_keep_sibling_chunks_and_nested_paths_distinct() {
+        let parsed = parse_html_document(
+            "<p>a<!-- split -->b<span>x</span>c<!-- split -->d</p><p>e<!-- split -->f</p>",
+        );
+        let index = DocumentTextIndex::from_parsed(&parsed).unwrap();
+        assert_eq!(index.text(), "abxcd ef");
+        assert_eq!(index.source_path_count(), 3);
+        let positions =
+            [0, 1, 2, 3, 4, 6, 7].map(|start| index.source_position_in(start..start + 1).unwrap());
+        for i in [1, 3, 4] {
+            assert_eq!(positions[0].element_steps(), positions[i].element_steps());
+        }
+        assert_ne!(positions[0].element_steps(), positions[2].element_steps());
+        assert_ne!(positions[0].element_steps(), positions[5].element_steps());
+        assert_eq!(positions[5].element_steps(), positions[6].element_steps());
+        assert_eq!(
+            positions
+                .iter()
+                .map(|position| (position.text_step(), position.utf16_offset()))
+                .collect::<Vec<_>>(),
+            [(1, 0), (1, 1), (1, 0), (3, 0), (3, 1), (1, 0), (1, 1)]
+        );
+    }
 }

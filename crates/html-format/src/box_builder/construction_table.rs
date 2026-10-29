@@ -325,7 +325,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
                     }
                     AnonymousCellPart::Block(node)
                         if self.document.element_ref(node).is_some_and(|element| {
-                            is_table_internal_display(display_for_element(self.styles, element))
+                            display_for_element(self.styles, element).is_table_internal()
                         }) =>
                     {
                         table_segment.push(node.raw());
