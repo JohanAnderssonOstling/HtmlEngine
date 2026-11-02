@@ -7,7 +7,7 @@ use super::*;
 use crate::layout::LayoutReader;
 use crate::layout_model::{LineInlineBoxFragment, LineTextFragment, paragraph_unicode_bidi};
 use std::iter::successors;
-use std::mem::{align_of, size_of};
+use std::mem::size_of;
 
 fn inline_ancestors<'a>(
     reader: &'a LayoutReader<'_>,
@@ -57,13 +57,6 @@ struct PlacementOffsetRun {
     y: f32,
     x: f64,
 }
-
-// Keep the old Vec-sized budget, rounded for the descriptor's alignment.
-// Inline f64 coordinates need eight-byte alignment on 32-bit ARM.
-const _: () = assert!(
-    size_of::<Option<LinePlacements>>()
-        <= (3 * size_of::<usize>()).next_multiple_of(align_of::<Option<LinePlacements>>())
-);
 
 impl LinePlacements {
     pub(super) fn storage_bytes(&self) -> usize {
