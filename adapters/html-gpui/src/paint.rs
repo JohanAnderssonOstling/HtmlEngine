@@ -328,7 +328,10 @@ impl<'a> GpuiCommandPainter<'a> {
         match native {
             Some(GpuiGlyph::Empty) => {}
             Some(GpuiGlyph::RunFragment { run, range }) => {
-                let natural_offset = run.caret_stops.get(range.start as usize).expect("validated run start").min(run.caret_stops.get(range.end as usize).expect("validated run end"));
+                let (Some(start), Some(end)) = (run.caret_stops.get(range.start as usize), run.caret_stops.get(range.end as usize)) else {
+                    return;
+                };
+                let natural_offset = start.min(end);
                 let origin = Point::new(origin.x - f64::from(natural_offset), origin.y);
                 self.push_text_fragment(GpuiTextRunFragment::new(run, range, origin, Some(color)));
             }
@@ -654,7 +657,10 @@ fn paint_commands_inner(commands: &[PaintCommand], glyphs: &GlyphStorage, bounds
                     }
                     GpuiGlyph::RunFragment { run, range } => {
                         let operation_started = profile_enabled.then(Instant::now);
-                        let natural_offset = run.caret_stops.get(range.start as usize).expect("validated run start").min(run.caret_stops.get(range.end as usize).expect("validated run end"));
+                        let (Some(start), Some(end)) = (run.caret_stops.get(range.start as usize), run.caret_stops.get(range.end as usize)) else {
+                            continue;
+                        };
+                        let natural_offset = start.min(end);
                         let glyph_ranges = run.glyph_ranges(range.clone());
                         let baseline = point(bounds.origin.x + px(origin.x as f32), bounds.origin.y + px(origin.y as f32));
                         let selected = glyph_ranges.iter().flat_map(|range| run.glyphs_in_range(range.clone()));

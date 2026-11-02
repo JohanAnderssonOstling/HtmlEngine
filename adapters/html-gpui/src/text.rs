@@ -370,8 +370,7 @@ impl NativeGlyphs {
                         .enumerate()
                         .filter_map(|(index, glyph)| {
                             let character = bytes
-                                .find_from(glyph.index, &mut character_cursor)
-                                .expect("validated glyph character boundary")
+                                .find_from(glyph.index, &mut character_cursor)?
                                 as u16;
                             let value = (character, glyph.id.0 as u16);
                             if let Some(first) = first.take() {
@@ -446,8 +445,8 @@ impl NativeGlyphs {
     }
 
     #[inline(always)]
-    fn glyph(&self, index: usize, bytes: &CharacterBytes, carets: &mut CaretCursor<'_>) -> NativeShapedGlyph {
-        match self {
+    fn glyph(&self, index: usize, bytes: &CharacterBytes, carets: &mut CaretCursor<'_>) -> Option<NativeShapedGlyph> {
+        Some(match self {
             Self::Horizontal { pairs, y, odd } => {
                 // The final pair can contain one padding slot, which is never a glyph.
                 assert!(index < pairs.len() * 2 - usize::from(*odd));
@@ -472,12 +471,10 @@ impl NativeGlyphs {
                 NativeShapedGlyph {
                     id: NativeGlyphId(u32::from(pair.id[slot])),
                     position: Point {
-                        x: px(carets.get(character).expect("validated glyph caret")),
+                        x: px(carets.get(character)?),
                         y: *y,
                     },
-                    index: bytes
-                        .get(character)
-                        .expect("validated glyph character boundary"),
+                    index: bytes.get(character)?,
                     is_emoji: *is_emoji,
                 }
             }
@@ -486,7 +483,7 @@ impl NativeGlyphs {
                 let glyph = glyphs[index];
                 NativeShapedGlyph { id: NativeGlyphId(u32::from(glyph.id)), position: Point { x: glyph.x, y: *y }, index: usize::from(glyph.index), is_emoji: *is_emoji }
             }
-        }
+        })
     }
 
     fn partition_point(
@@ -521,11 +518,10 @@ impl NativeGlyphs {
                 while left < right {
                     let middle = left + (right - left) / 2;
                     let character = usize::from(pairs[middle / 2].character[middle % 2]);
-                    if predicate(
-                        bytes
-                            .get(character)
-                            .expect("validated glyph character boundary"),
-                    ) {
+                    let Some(byte) = bytes.get(character) else {
+                        return left - start;
+                    };
+                    if predicate(byte) {
                         left = middle + 1;
                     } else {
                         right = middle;
@@ -659,7 +655,7 @@ impl GpuiTextRun {
     }
 
     #[inline(always)]
-    fn native_glyph(&self, index: usize, carets: &mut CaretCursor<'_>) -> NativeShapedGlyph {
+    fn native_glyph(&self, index: usize, carets: &mut CaretCursor<'_>) -> Option<NativeShapedGlyph> {
         self.glyphs
             .glyph(index, &self.character_bytes, carets)
     }
@@ -733,16 +729,16 @@ impl GpuiTextRun {
                 let start = span.glyphs.start.max(range.start);
                 let end = span.glyphs.end.min(range.end);
                 let mut carets = self.caret_stops.cursor();
-                (start..end).map(move |index| {
-                    let glyph = self.native_glyph(index, &mut carets);
-                    GpuiRunGlyph {
+                (start..end).filter_map(move |index| {
+                    let glyph = self.native_glyph(index, &mut carets)?;
+                    Some(GpuiRunGlyph {
                         font_id: span.font_id,
                         font_size: span.font_size,
                         glyph_id: glyph.id,
                         position: glyph.position,
                         byte_index: glyph.index,
                         is_emoji: glyph.is_emoji,
-                    }
+                    })
                 })
             })
     }
@@ -798,7 +794,7 @@ impl GpuiTextRun {
     }
 
     pub(crate) fn character_color(&self, character: u32) -> Hsla {
-        self.color_at(self.character_bytes.get(character as usize).expect("character outside shaped run"))
+        self.character_bytes.get(character as usize).map(|byte| self.color_at(byte)).unwrap_or_else(|| Hsla::from(rgba(0x000000ff)))
     }
 }
 
@@ -1440,17 +1436,21 @@ impl GpuiTextCache {
             }
             let mut cache = HashMap::<char, Font>::new();
             let mut start = 0;
-            let mut previous = None;
+            let mut previous: Option<Font> = None;
             for (byte, character) in chunk.char_indices() {
                 let font = cache.entry(character)
                     .or_insert_with(|| self.range_filtered_font(&run.font, character));
-                if previous.as_ref().is_some_and(|previous| previous != font) {
-                    output.push(TextRun { len: byte - start, font: previous.take().expect("preceding font"), ..run.clone() });
+                if previous.as_ref().is_some_and(|previous| previous != font)
+                    && let Some(previous) = previous.take()
+                {
+                    output.push(TextRun { len: byte - start, font: previous, ..run.clone() });
                     start = byte;
                 }
                 previous = Some(font.clone());
             }
-            output.push(TextRun { len: chunk.len() - start, font: previous.expect("nonempty text"), ..run });
+            if let Some(font) = previous {
+                output.push(TextRun { len: chunk.len() - start, font, ..run });
+            }
         }
     }
 
@@ -2468,7 +2468,7 @@ fn build_text_boundaries_from_clusters(text: &str, layout: &gpui::LineLayout, ch
         // Cluster boundaries are increasing in both paths. Each character
         // offset is visited once instead of being searched for every cluster.
         let mut char_end = char_start;
-        while char_end < character_bytes.len() && character_bytes.get(char_end).unwrap() < byte_offset + byte_end {
+        while character_bytes.get(char_end).is_some_and(|byte| byte < byte_offset + byte_end) {
             char_end += 1;
         }
         if char_start < char_end {

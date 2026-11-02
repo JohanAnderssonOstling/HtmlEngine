@@ -101,13 +101,10 @@ impl GpuiTextCache {
                     style.font_size()
                 };
                 if size != group_size && display.len() > group_start {
-                    display_styles.push(
-                        style
-                            .clone()
-                            .with_caps_synthesis(None)
-                            .with_display_range(group_start..display.len(), group_size)
-                            .expect("valid display span"),
-                    );
+                    let Some(display_style) = style.clone().with_caps_synthesis(None).with_display_range(group_start..display.len(), group_size) else {
+                        return Ok(None);
+                    };
+                    display_styles.push(display_style);
                     group_start = display.len();
                 }
                 group_size = size;
@@ -123,13 +120,10 @@ impl GpuiTextCache {
                 previous_small = small;
             }
             if display.len() > group_start {
-                display_styles.push(
-                    style
-                        .clone()
-                        .with_caps_synthesis(None)
-                        .with_display_range(group_start..display.len(), group_size)
-                        .expect("valid display span"),
-                );
+                let Some(display_style) = style.clone().with_caps_synthesis(None).with_display_range(group_start..display.len(), group_size) else {
+                    return Ok(None);
+                };
+                display_styles.push(display_style);
             }
         }
         display_bytes.push(display.len());
@@ -139,26 +133,25 @@ impl GpuiTextCache {
         };
         let native = &self.runs[line.run as usize];
         let mut caret_cursor = native.caret_stops.cursor();
-        let mut glyphs = (0..native.glyphs.len())
+        let Some(mut glyphs) = (0..native.glyphs.len())
             .map(|index| {
-                let mut glyph = native.native_glyph(index, &mut caret_cursor);
+                let mut glyph = native.native_glyph(index, &mut caret_cursor)?;
                 let character = display_bytes
                     .partition_point(|byte| *byte <= glyph.index)
                     .saturating_sub(1);
-                glyph.index = source_bytes
-                    .get(character)
-                    .expect("display glyph maps to source");
-                glyph
+                glyph.index = source_bytes.get(character)?;
+                Some(glyph)
             })
-            .collect::<Vec<_>>();
+            .collect::<Option<Vec<_>>>() else {
+            return Ok(None);
+        };
         let mut fonts = native
             .metadata
             .font_spans_in_range(0..glyphs.len(), glyphs.len())
             .collect::<FontSpans>();
-        let mut carets: Arc<[f32]> = display_characters
-            .iter()
-            .map(|index| line.caret_stops.get(*index).expect("display boundary maps to source"))
-            .collect();
+        let Some(mut carets) = display_characters.iter().map(|index| line.caret_stops.get(*index)).collect::<Option<Arc<[f32]>>>() else {
+            return Ok(None);
+        };
         let boundaries: Arc<[bool]> = display_characters
             .iter()
             .map(|index| line.cluster_boundaries[*index])
