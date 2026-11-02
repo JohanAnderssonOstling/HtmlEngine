@@ -2737,10 +2737,7 @@ mod ownership_tests {
                 let key = |font: Font| GlyphKey {
                     ch: '漢',
                     font_size: 19.0_f32.to_bits(),
-                    font_weight: 400,
-                    font_style: 0,
-                    family: font.family.to_string(),
-                    fallbacks: font.fallbacks,
+                    font,
                 };
                 assert_ne!(
                     key(font),
