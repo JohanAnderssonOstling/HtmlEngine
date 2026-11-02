@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::layout::inline::justification::tracking_boundary_limit;
-use crate::layout::text_placement::tracking_boundary_allowed;
+use html_text::tracking_boundary_allowed;
 
 #[derive(Clone, Copy, Default)]
 struct Prefix {
@@ -23,7 +23,7 @@ struct HeightRun {
 /// cheap for ordinary paragraphs with uniform metrics. This is temporary
 /// solver storage, rather than part of the retained token/breakpoint plan.
 pub(in crate::layout::inline) struct TrackingCapacityIndex<'a> {
-    tokens: &'a [InlineToken],
+    tokens: TokenSpan<'a>,
     prefix: Vec<Prefix>,
     heights: Vec<HeightRun>,
 }
@@ -31,17 +31,15 @@ pub(in crate::layout::inline) struct TrackingCapacityIndex<'a> {
 impl<'a> TrackingCapacityIndex<'a> {
     pub(in crate::layout::inline) fn new(
         engine: &crate::layout::LayoutEngine<'_, '_>,
-        tokens: &'a [InlineToken],
-        runs: &[InlineTokenMetrics],
+        tokens: TokenSpan<'a>,
+        metrics: MetricsView<'_>,
     ) -> Self {
         let mut prefix = Vec::with_capacity(tokens.len() + 1);
         let mut counts = Prefix::default();
         prefix.push(counts);
         let mut heights: Vec<HeightRun> = Vec::new();
         let mut previous_glyph = None;
-        let mut text_cursor = engine.text.cursor();
-        for (index, token) in tokens.iter().enumerate() {
-            let metrics = token.run_metrics(runs);
+        for (index, (token, metrics)) in metrics.iter(tokens).enumerate() {
             let mut unsupported = metrics.white_space.preserves_newlines();
             match token.kind() {
                 InlineTokenKind::Glyph { glyph_idx } => {
@@ -49,11 +47,7 @@ impl<'a> TrackingCapacityIndex<'a> {
                         || metrics.placement_required
                         || !metrics.visible
                         || !matches!(metrics.vertical_align, InlineVerticalAlign::Baseline);
-                    let glyph = engine.text.glyph_at(glyph_idx as usize).unwrap_or_default();
-                    let character = text_cursor
-                        .glyph_metric(glyph)
-                        .expect("registered text metric")
-                        .ch();
+                    let character = engine.text.character(glyph_idx);
                     if let Some((previous, previous_character)) = previous_glyph {
                         if previous + 1 != glyph_idx {
                             counts.gaps += 1;
@@ -101,8 +95,8 @@ impl<'a> TrackingCapacityIndex<'a> {
         if self.prefix[end].unsupported != self.prefix[start].unsupported {
             return 0.0;
         }
-        let Some(first) = self.tokens[start..end]
-            .iter()
+        let Some(first) = self.tokens.slice(start..end)
+            .metadata_iter()
             .position(|token| matches!(token.kind(), InlineTokenKind::Glyph { .. }))
         else {
             return 0.0;

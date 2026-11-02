@@ -1,21 +1,12 @@
 //! Materialization of planned table, row-group, row, and cell topology.
 
 use super::*;
+use html_dom::ElementRef;
 
 impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
-    pub(super) fn build_table_children(&mut self, elem_id: DomNodeId, table_box_idx: u32) {
-        let dom = self.document;
-        let Some(element) = dom.element_ref(elem_id) else {
-            return;
-        };
-        let children: Vec<u32> = element.children().map(|idx| idx.raw()).collect();
-
-        self.build_table_children_from_nodes(children, table_box_idx);
-    }
-
     pub(super) fn build_table_children_from_nodes(
         &mut self,
-        children: Vec<u32>,
+        children: impl IntoIterator<Item = u32>,
         table_box_idx: u32,
     ) {
         let plan = plan_table_children(self.document, self.styles, children);
@@ -32,12 +23,12 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
                 TableChildAction::Anonymous(nodes) => {
                     self.materialize_anonymous_table_children(nodes, table_box_idx, &mut body_rows)
                 }
-                TableChildAction::Principal(TablePrincipal { source: node, role }) => {
+                TableChildAction::Principal { node, role } => {
                     let group_display = self
                         .document
                         .element_ref(node)
                         .map(|element| display_for_element(self.styles, element));
-                    if let Some(box_idx) = self.build_box_for_node(node, Some(table_box_idx)) {
+                    if let Some(box_idx) = self.build_box_for_element(node, Some(table_box_idx)) {
                         match role {
                             TableRole::Caption(html_style_model::CaptionSide::Bottom) => {
                                 captions_bottom.push(box_idx)
@@ -48,10 +39,10 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
                             TableRole::Row => body_rows.push(box_idx),
                             TableRole::RowGroup => {
                                 let (rows, groups) = match group_display {
-                                    Some(html_style_model::Display::TableHeaderGroup) => {
+                                    Some(Display::TableHeaderGroup) if header_groups.is_empty() => {
                                         (&mut header_rows, &mut header_groups)
                                     }
-                                    Some(html_style_model::Display::TableFooterGroup) => {
+                                    Some(Display::TableFooterGroup) if footer_groups.is_empty() => {
                                         (&mut footer_rows, &mut footer_groups)
                                     }
                                     _ => (&mut body_rows, &mut body_groups),
@@ -69,9 +60,10 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
         }
 
         // CSS table layout has a visual group order independent of source
-        // order: headers precede ordinary rows and footers follow them. Keep
-        // construction in source order, but expose the normalized grid order
-        // to every sizing, border, and painting stage.
+        // order: the first header precedes ordinary rows and the first footer
+        // follows them. Later header/footer groups behave as ordinary groups.
+        // Keep construction in source order, but expose the normalized grid
+        // order to every sizing, border, and painting stage.
         let rows = header_rows
             .into_iter()
             .chain(body_rows)
@@ -85,13 +77,15 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
 
         self.output.finish_table(
             table_box_idx,
-            rows,
-            row_groups,
-            captions_top,
-            captions_bottom,
-            plan.columns,
-            plan.column_groups,
-            plan.column_width_hints,
+            TableBox {
+                rows,
+                row_groups,
+                captions_top,
+                captions_bottom,
+                columns: plan.columns,
+                column_groups: plan.column_groups,
+                column_width_hints: plan.column_width_hints,
+            },
         );
     }
 
@@ -114,26 +108,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
                 })
         }) {
             let row_idx = self.output.push_anonymous_row(table_box_idx);
-            let mut cells = Vec::new();
-            let mut out_of_flow = Vec::new();
-            for action in plan_table_row_children(self.document, self.styles, nodes) {
-                match action {
-                    TableRowChildAction::Anonymous(nodes) => {
-                        self.materialize_anonymous_row_children(nodes, row_idx, &mut cells)
-                    }
-                    TableRowChildAction::Cell(node) => {
-                        if let Some(cell) = self.build_box_for_node(node, Some(row_idx)) {
-                            cells.push(cell);
-                        }
-                    }
-                    TableRowChildAction::OutOfFlow(node) => {
-                        if let Some(child) = self.build_box_for_node(node, Some(row_idx)) {
-                            out_of_flow.push(child);
-                        }
-                    }
-                }
-            }
-            self.output.set_row_children(row_idx, cells, out_of_flow);
+            self.build_row_children(nodes, row_idx);
             rows.push(row_idx);
             return;
         }
@@ -143,71 +118,59 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
             .style_for_box(table_box_idx as usize)
             .white_space();
         let plan = plan_anonymous_table_children(self.document, self.styles, &nodes, white_space);
-        let (cell_nodes, parts) = match plan {
-            AnonymousTablePlan::Empty => return,
-            AnonymousTablePlan::Cells(cells) => (Some(cells), None),
-            AnonymousTablePlan::Cell(parts) => (None, Some(parts)),
-        };
-        let row_idx = self.output.push_anonymous_row(table_box_idx);
-        if let Some(cell_nodes) = cell_nodes {
-            let cells = cell_nodes
-                .into_iter()
-                .filter_map(|node| self.build_box_for_element(node, Some(row_idx)))
-                .collect();
-            self.output.set_row_cells(row_idx, cells);
-            rows.push(row_idx);
+        if matches!(plan, AnonymousTablePlan::Empty) {
             return;
         }
-
-        let cell_idx = self.output.push_anonymous_cell(row_idx, true);
-        let parts = parts.expect("anonymous cell plan has content parts");
-        self.materialize_anonymous_cell_parts(parts, cell_idx);
-
-        self.output.append_row_cell(row_idx, cell_idx);
+        let row_idx = self.output.push_anonymous_row(table_box_idx);
+        let mut row = TableRowBox::default();
+        self.materialize_anonymous_row_plan(plan, row_idx, &mut row.cells);
+        self.output.finish_row(row_idx, row);
         rows.push(row_idx);
     }
 
-    pub(super) fn build_table_row_children(&mut self, elem_id: DomNodeId, row_box_idx: u32) {
-        let Some(element) = self.document.element_ref(elem_id) else {
-            return;
-        };
-        let children: Vec<u32> = element.children().map(|idx| idx.raw()).collect();
-        let mut cells = Vec::new();
-        let mut out_of_flow = Vec::new();
-        for action in plan_table_row_children(self.document, self.styles, children) {
+    pub(super) fn build_row_children(
+        &mut self,
+        nodes: impl IntoIterator<Item = u32>,
+        row_box_idx: u32,
+    ) {
+        let mut row = TableRowBox::default();
+        for action in plan_table_row_children(self.document, self.styles, nodes) {
             match action {
                 TableRowChildAction::Anonymous(nodes) => {
-                    self.materialize_anonymous_row_children(nodes, row_box_idx, &mut cells)
+                    let white_space = self
+                        .output
+                        .style_for_box(row_box_idx as usize)
+                        .white_space();
+                    let plan = plan_anonymous_table_children(
+                        self.document,
+                        self.styles,
+                        &nodes,
+                        white_space,
+                    );
+                    self.materialize_anonymous_row_plan(plan, row_box_idx, &mut row.cells);
                 }
                 TableRowChildAction::Cell(node) => {
-                    if let Some(cell) = self.build_box_for_node(node, Some(row_box_idx)) {
-                        cells.push(cell);
-                    }
+                    row.cells
+                        .extend(self.build_box_for_element(node, Some(row_box_idx)));
                 }
                 TableRowChildAction::OutOfFlow(node) => {
-                    if let Some(child) = self.build_box_for_node(node, Some(row_box_idx)) {
-                        out_of_flow.push(child);
-                    }
+                    row.out_of_flow
+                        .extend(self.build_box_for_element(node, Some(row_box_idx)));
                 }
             }
         }
 
-        self.output
-            .set_row_children(row_box_idx, cells, out_of_flow);
+        self.output.finish_row(row_box_idx, row);
     }
 
     pub(super) fn build_table_row_group_children(
         &mut self,
-        elem_id: DomNodeId,
+        element: ElementRef<'_>,
         group_box_idx: u32,
     ) {
-        let Some(element) = self.document.element_ref(elem_id) else {
-            return;
-        };
-        let children = element.children().collect::<Vec<_>>();
         let mut rows = Vec::new();
         let mut anonymous = Vec::new();
-        for node in children {
+        for node in element.children() {
             let display = self
                 .document
                 .element_ref(node)
@@ -219,9 +182,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
                         group_box_idx,
                         &mut rows,
                     );
-                    if let Some(row) = self.build_box_for_node(node, Some(group_box_idx)) {
-                        rows.push(row);
-                    }
+                    rows.extend(self.build_box_for_element(node, Some(group_box_idx)));
                 }
                 Some(Display::None) => {}
                 _ => anonymous.push(node.raw()),
@@ -249,53 +210,29 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
             return;
         }
         let row_idx = self.output.push_anonymous_row(group_box_idx);
-        let mut cells = Vec::new();
-        let mut out_of_flow = Vec::new();
-        for action in plan_table_row_children(self.document, self.styles, nodes) {
-            match action {
-                TableRowChildAction::Anonymous(nodes) => {
-                    self.materialize_anonymous_row_children(nodes, row_idx, &mut cells)
-                }
-                TableRowChildAction::Cell(node) => {
-                    if let Some(cell) = self.build_box_for_node(node, Some(row_idx)) {
-                        cells.push(cell);
-                    }
-                }
-                TableRowChildAction::OutOfFlow(node) => {
-                    if let Some(child) = self.build_box_for_node(node, Some(row_idx)) {
-                        out_of_flow.push(child);
-                    }
-                }
-            }
-        }
-        self.output.set_row_children(row_idx, cells, out_of_flow);
+        self.build_row_children(nodes, row_idx);
         rows.push(row_idx);
     }
 
-    pub(super) fn materialize_anonymous_row_children(
+    fn materialize_anonymous_row_plan(
         &mut self,
-        nodes: Vec<u32>,
+        plan: AnonymousTablePlan,
         row_box_idx: u32,
         cells: &mut Vec<u32>,
     ) {
-        let white_space = self
-            .output
-            .style_for_box(row_box_idx as usize)
-            .white_space();
-        let parts =
-            match plan_anonymous_table_children(self.document, self.styles, &nodes, white_space) {
-                AnonymousTablePlan::Empty => return,
-                AnonymousTablePlan::Cells(cell_nodes) => {
-                    cells.extend(
-                        cell_nodes
-                            .into_iter()
-                            .filter_map(|node| self.build_box_for_element(node, Some(row_box_idx))),
-                    );
-                    return;
-                }
-                AnonymousTablePlan::Cell(parts) => parts,
-            };
-        let cell_idx = self.output.push_anonymous_cell(row_box_idx, true);
+        let parts = match plan {
+            AnonymousTablePlan::Empty => return,
+            AnonymousTablePlan::Cells(cell_nodes) => {
+                cells.extend(
+                    cell_nodes
+                        .into_iter()
+                        .filter_map(|node| self.build_box_for_element(node, Some(row_box_idx))),
+                );
+                return;
+            }
+            AnonymousTablePlan::Cell(parts) => parts,
+        };
+        let cell_idx = self.output.push_anonymous_cell(row_box_idx);
         self.materialize_anonymous_cell_parts(parts, cell_idx);
         cells.push(cell_idx);
     }
@@ -315,43 +252,35 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
                 match part {
                     AnonymousCellPart::Inline(mut nodes) => {
                         if table_segment.is_empty() {
-                            if let Some(anonymous) = self.flush_inline_segment(&mut nodes, cell_idx)
-                            {
-                                direct_children.push(anonymous);
-                            }
+                            direct_children.extend(self.flush_inline_segment(&mut nodes, cell_idx));
                         } else {
                             table_segment.append(&mut nodes);
                         }
                     }
                     AnonymousCellPart::Block(node)
                         if self.document.element_ref(node).is_some_and(|element| {
-                            is_table_internal_display(display_for_element(self.styles, element))
+                            display_for_element(self.styles, element).is_table_internal()
                         }) =>
                     {
                         table_segment.push(node.raw());
                     }
                     AnonymousCellPart::Block(node) => {
-                        if let Some(table) =
-                            self.flush_anonymous_table_segment(&mut table_segment, cell_idx)
-                        {
-                            direct_children.push(table);
-                        }
-                        if let Some(child) = self.build_box_for_node(node, Some(cell_idx)) {
-                            direct_children.push(child);
-                        }
+                        direct_children.extend(
+                            self.flush_anonymous_table_segment(&mut table_segment, cell_idx),
+                        );
+                        direct_children.extend(self.build_box_for_element(node, Some(cell_idx)));
                     }
                 }
             }
-            if let Some(table) = self.flush_anonymous_table_segment(&mut table_segment, cell_idx) {
-                direct_children.push(table);
-            }
+            direct_children
+                .extend(self.flush_anonymous_table_segment(&mut table_segment, cell_idx));
             self.output
                 .set_box_children(cell_idx, Children::Blocks(direct_children));
         } else {
             let start = self.output.item_position();
             for part in parts {
                 if let AnonymousCellPart::Inline(nodes) = part {
-                    self.process_inline_nodes(&nodes, cell_idx);
+                    self.process_inline_nodes(nodes, cell_idx);
                 }
             }
             let end = self.output.item_position();

@@ -1,18 +1,24 @@
 //! Owned font declarations for host text systems. No font bytes are loaded here.
 
-use super::declarations;
-use cssparser::{Parser, ParserInput};
+use html_dom::has_uri_scheme;
 use lightningcss::printer::PrinterOptions;
+use lightningcss::properties::custom::{Token, TokenList, TokenOrValue};
 use lightningcss::properties::font::{AbsoluteFontWeight, FontFamily, FontStretch, FontWeight};
 use lightningcss::rules::font_face::{
     FontFaceProperty, FontFaceRule, FontFormat, FontStyle, Source,
 };
 use lightningcss::rules::{CssRule, CssRuleList};
-use lightningcss::stylesheet::{ParserOptions, StyleSheet};
-use lightningcss::traits::ToCss;
+use lightningcss::stylesheet::ParserOptions;
+use lightningcss::traits::{Parse, ParseWithOptions, ToCss};
 use lightningcss::values::percentage::Percentage;
+use lightningcss::values::color::CssColor;
+use lightningcss::values::size::Size2D;
 use std::borrow::Cow;
 use std::ops::RangeInclusive;
+
+/// Active named palette definition, retained as Lightning CSS's owned AST.
+/// Hosts can inspect its descriptors without introducing another CSS parser.
+pub type FontPalette = lightningcss::rules::font_palette_values::FontPaletteValuesRule<'static>;
 
 /// A usable `@font-face` declaration. Hosts load and register these faces under
 /// `family`, which may differ from the font file's internal family name.
@@ -35,6 +41,9 @@ pub struct FontFace {
     /// Other descriptors, preserved as CSS for host policy (e.g. font-display).
     /// The engine does not apply these descriptors.
     pub additional_descriptors: Vec<FontFaceDescriptor>,
+    /// Explicit descriptors constrain variable axes; omission uses font capabilities.
+    pub style_explicit: bool,
+    pub stretch_explicit: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -67,8 +76,6 @@ pub struct FontFaceDescriptor {
 
 impl FontFace {
     pub(crate) fn from_rule(rule: &FontFaceRule<'_>) -> Option<Self> {
-        let mut family = None;
-        let mut sources = None;
         let mut face = Self {
             family: String::new(),
             sources: Vec::new(),
@@ -76,17 +83,19 @@ impl FontFace {
             style: FontFaceStyle::Normal,
             stretch: 100.0..=100.0,
             unicode_ranges: vec![0..=0x10ffff],
-            additional_descriptors: Vec::new(),
+            style_explicit: false, stretch_explicit: false, additional_descriptors: Vec::new(),
         };
+        let mut has_family = false;
         // Later valid descriptors replace earlier ones. Parser-recognized but
         // descriptor-invalid values must not replace the last valid value.
         for property in &rule.properties {
             match property {
                 FontFaceProperty::FontFamily(value) => {
                     if let FontFamily::FamilyName(_) = value
-                        && let Some(name) = decoded_family(value).filter(|name| !name.is_empty())
+                        && let Some(name) = decoded_family(value)
                     {
-                        family = Some(name);
+                        face.family = name;
+                        has_family = true;
                     }
                 }
                 FontFaceProperty::Source(values) => {
@@ -108,7 +117,7 @@ impl FontFace {
                         })
                         .collect::<Vec<_>>();
                     if !values.is_empty() {
-                        sources = Some(values);
+                        face.sources = values;
                     }
                 }
                 FontFaceProperty::FontWeight(value) => {
@@ -119,8 +128,8 @@ impl FontFace {
                     }
                 }
                 FontFaceProperty::FontStyle(value) => match value {
-                    FontStyle::Normal => face.style = FontFaceStyle::Normal,
-                    FontStyle::Italic => face.style = FontFaceStyle::Italic,
+                    FontStyle::Normal => { face.style = FontFaceStyle::Normal; face.style_explicit = true; },
+                    FontStyle::Italic => { face.style = FontFaceStyle::Italic; face.style_explicit = true; },
                     FontStyle::Oblique(angles) => {
                         let (start, end) = (angles.0.to_degrees(), angles.1.to_degrees());
                         if start.is_finite()
@@ -130,6 +139,7 @@ impl FontFace {
                             && start <= end
                         {
                             face.style = FontFaceStyle::Oblique(start..=end);
+                            face.style_explicit = true;
                         }
                     }
                 },
@@ -137,6 +147,7 @@ impl FontFace {
                     let (start, end) = (stretch(&value.0), stretch(&value.1));
                     if start.is_finite() && end.is_finite() && start >= 0.0 && start <= end {
                         face.stretch = start..=end;
+                        face.stretch_explicit = true;
                     }
                 }
                 FontFaceProperty::UnicodeRange(ranges) => {
@@ -145,6 +156,20 @@ impl FontFace {
                 }
                 FontFaceProperty::Custom(custom) => {
                     let name = custom.name.as_ref().to_ascii_lowercase();
+                    if name == "font-width" {
+                        if let Ok(css) = property.to_css_string(PrinterOptions::default())
+                            && let Some((_, source)) = css.split_once(':')
+                            && let Ok(value) = Size2D::<FontStretch>::parse_string(source.trim())
+                        {
+                            let (start, end) = (stretch(&value.0), stretch(&value.1));
+                            if start.is_finite() && end.is_finite() && start >= 0.0 && start <= end
+                            {
+                                face.stretch = start..=end;
+                                face.stretch_explicit = true;
+                            }
+                        }
+                        continue;
+                    }
                     if matches!(
                         name.as_str(),
                         "font-family"
@@ -167,9 +192,7 @@ impl FontFace {
                 }
             }
         }
-        face.family = family?;
-        face.sources = sources?;
-        Some(face)
+        (has_family && !face.sources.is_empty()).then_some(face)
     }
 }
 
@@ -203,17 +226,21 @@ fn font_format(format: &FontFormat<'_>) -> String {
 }
 
 fn decoded_family(family: &FontFamily<'_>) -> Option<String> {
-    // Lightning CSS keeps FamilyName's string private. Tokenizing its CSS
-    // serialization recovers the decoded name without hand-written unescaping.
+    // FamilyName's decoded string is private. Let Lightning CSS tokenize its
+    // serialization, then convert the parsed name tokens into host data.
     let css = family.to_css_string(PrinterOptions::default()).ok()?;
-    let mut input = ParserInput::new(&css);
-    let mut parser = Parser::new(&mut input);
-    let mut name = parser.expect_ident_or_string().ok()?.to_string();
-    while !parser.is_exhausted() {
-        name.push(' ');
-        name.push_str(parser.expect_ident().ok()?);
-    }
-    Some(name)
+    let tokens = TokenList::parse_string_with_options(&css, ParserOptions::default()).ok()?;
+    let words: Vec<&str> = tokens
+        .0
+        .iter()
+        .filter(|token| !token.is_whitespace())
+        .map(|token| match token {
+            TokenOrValue::Token(Token::Ident(value) | Token::String(value)) => Some(value.as_ref()),
+            TokenOrValue::DashedIdent(value) => Some(value.0.as_ref()),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    (!words.is_empty()).then(|| words.join(" "))
 }
 
 /// Resolve only `@font-face` URLs before flattening imported stylesheets.
@@ -236,17 +263,10 @@ pub fn resolve_font_face_urls<'a>(
     {
         return Cow::Borrowed(css);
     }
-    let normalized = declarations::normalize(css);
-    let Ok(mut sheet) = StyleSheet::parse(
-        &normalized,
-        ParserOptions {
-            error_recovery: true,
-            ..ParserOptions::default()
-        },
-    ) else {
+    let Some(mut sheet) = super::parse_stylesheet(css) else {
         return Cow::Borrowed(css);
     };
-    if !resolve_rule_urls(&mut sheet.rules, &mut resolve) {
+    if !resolve_rule_urls(&mut sheet.rules, &mut |url| Some(resolve(url))) {
         return Cow::Borrowed(css);
     }
     match sheet.to_css(PrinterOptions::default()) {
@@ -255,9 +275,10 @@ pub fn resolve_font_face_urls<'a>(
     }
 }
 
-fn resolve_rule_urls(
+/// Visit relative font URLs, keeping the current value when no replacement is returned.
+pub(super) fn resolve_rule_urls(
     rules: &mut CssRuleList<'_>,
-    resolve: &mut impl FnMut(&str) -> String,
+    resolve: &mut impl FnMut(&str) -> Option<String>,
 ) -> bool {
     let mut changed = false;
     for rule in &mut rules.0 {
@@ -270,11 +291,12 @@ fn resolve_rule_urls(
                                 let original = source.url.url.as_ref();
                                 // Resource providers may implement filesystem
                                 // paths only; absolute URIs need no rebasing.
-                                if has_url_scheme(original) {
+                                if has_uri_scheme(original) {
                                     continue;
                                 }
-                                let url = resolve(original);
-                                if url != source.url.url.as_ref() {
+                                if let Some(url) = resolve(original)
+                                    && url != original
+                                {
                                     source.url.url = url.into();
                                     changed = true;
                                 }
@@ -293,14 +315,74 @@ fn resolve_rule_urls(
     changed
 }
 
-fn has_url_scheme(url: &str) -> bool {
-    url.split_once(':').is_some_and(|(scheme, _)| {
-        scheme
-            .as_bytes()
-            .first()
-            .is_some_and(u8::is_ascii_alphabetic)
-            && scheme
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
-    })
+
+/// Convert parser-owned palette descriptors into renderer data. Private fields
+/// of OverrideColors are exposed through Lightning CSS's own serialization and
+/// token AST, as with FamilyName above; no alternate CSS grammar is used.
+pub(crate) fn resolved_font_palettes(
+    rules: &[FontPalette],
+    color_to_rgba: impl Fn(&lightningcss::values::color::CssColor) -> u32,
+) -> Vec<html_style_model::FontPaletteDefinition> {
+    use html_style_model::{FontPaletteBase, FontPaletteDefinition};
+    use lightningcss::rules::font_palette_values::{BasePalette, FontPaletteValuesProperty};
+    rules
+        .iter()
+        .filter_map(|rule| {
+            let mut family = None;
+            let mut base = FontPaletteBase::Normal;
+            let mut colors = Vec::new();
+            for property in &rule.properties {
+                match property {
+                    FontPaletteValuesProperty::FontFamily(value) => family = decoded_family(value),
+                    FontPaletteValuesProperty::BasePalette(value) => {
+                        base = match value {
+                            BasePalette::Light => FontPaletteBase::Light,
+                            BasePalette::Dark => FontPaletteBase::Dark,
+                            BasePalette::Integer(index) => FontPaletteBase::Index(*index),
+                        }
+                    }
+                    FontPaletteValuesProperty::OverrideColors(values) => {
+                        colors.clear();
+                        for value in values {
+                            let css = value.to_css_string(PrinterOptions::default()).ok()?;
+                            let tokens = TokenList::parse_string_with_options(
+                                &css,
+                                ParserOptions::default(),
+                            )
+                            .ok()?;
+                            let mut tokens = tokens.0.iter().filter(|token| !token.is_whitespace());
+                            let Some(TokenOrValue::Token(Token::Number {
+                                int_value: Some(index),
+                                ..
+                            })) = tokens.next()
+                            else {
+                                return None;
+                            };
+                            let color = match tokens.next()? {
+                                TokenOrValue::Color(color) => color.clone(),
+                                TokenOrValue::Token(Token::Ident(ident)) => {
+                                    CssColor::parse_string(ident.as_ref()).ok()?
+                                }
+                                _ => return None,
+                            };
+                            if tokens.next().is_some() {
+                                return None;
+                            }
+                            colors.push((
+                                u16::try_from(*index).ok()?,
+                                color_to_rgba(&color).to_be_bytes(),
+                            ));
+                        }
+                    }
+                    FontPaletteValuesProperty::Custom(_) => {}
+                }
+            }
+            Some(FontPaletteDefinition {
+                name: rule.name.0.to_string(),
+                family: family?,
+                base,
+                colors,
+            })
+        })
+        .collect()
 }

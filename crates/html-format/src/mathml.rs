@@ -4,6 +4,7 @@ use formulary::{Item, Layout, LayoutOptions, MathFont, layout, parse, svg};
 use html_dom::{Document, ImageSource};
 use html_style_model::ComputedStyles;
 use quick_xml::{Reader, events::Event};
+use std::mem::replace;
 use std::sync::{Arc, OnceLock};
 
 fn math_font() -> &'static MathFont<'static> {
@@ -43,25 +44,22 @@ pub fn prepare_with_undo(document: &mut Document, styles: &ComputedStyles) -> Ve
         .collect();
     let mut undo = Vec::with_capacity(equations.len());
     for (index, size, color) in equations {
-        let ImageSource::MathMl { markup, .. } = &document.images()[index].source else {
-            unreachable!()
-        };
-        let (svg, width, height, baseline) = render(markup, size, color);
         let image = &mut document.images_mut()[index];
         let ImageSource::MathMl {
+            markup,
             svg: old_svg,
             baseline: old_baseline,
-            ..
         } = &mut image.source
         else {
             unreachable!()
         };
+        let (svg, width, height, baseline) = render(markup, size, color);
         undo.push(MathMlUndo {
             index,
-            width: std::mem::replace(&mut image.width, width),
-            height: std::mem::replace(&mut image.height, height),
-            svg: std::mem::replace(old_svg, svg.into()),
-            baseline: std::mem::replace(old_baseline, baseline),
+            width: replace(&mut image.width, width),
+            height: replace(&mut image.height, height),
+            svg: replace(old_svg, svg.into()),
+            baseline: replace(old_baseline, baseline),
         });
     }
     undo

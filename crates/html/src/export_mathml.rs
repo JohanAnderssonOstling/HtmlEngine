@@ -1,6 +1,6 @@
 //! On-demand equation copying. Neither annotations nor converted LaTeX are cached.
 
-use mathema::{Format, convert};
+use crate::mathema::{Format, convert};
 
 /// Convert MathML on demand, preferring an authored TeX annotation of the whole
 /// formula. Malformed source and unsupported conversion return an error.

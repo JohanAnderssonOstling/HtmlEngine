@@ -1,4 +1,4 @@
-use html::document::{MarkupSyntax, parse_document};
+use html::document::{DocumentTextIndex, MarkupSyntax, parse_document};
 use html::layout::{
     CaretAffinity, ContentRole, LaidOutDocument, LayoutConstraints, PositionedShapedLine,
     SourceLocation,
@@ -6,7 +6,7 @@ use html::layout::{
 use html::pipeline::DocumentFactory;
 use html::text::{
     GlyphMetric, GlyphResourceGeneration, GlyphResourceStore, GlyphShaper, ShapeError, ShapedLine,
-    TextSearchOptions, find_text_matches,
+    TextSearchOptions, find_text_matches, text_matches,
 };
 use html::text::{GlyphRequest, ShapedGlyph};
 use std::ops::Range;
@@ -51,11 +51,162 @@ fn box_for(doc: &LaidOutDocument, id: &str, resources: &GlyphResourceStore) -> u
         .find(|&index| boxes.attribute(index, "id") == Some(id))
         .unwrap()
 }
+
+#[test]
+fn logical_characters_retain_transforms_bidi_controls_and_discretionary_hyphens() {
+    let mut resources = GlyphResourceStore::default();
+    let doc = layout(
+        "<p dir='rtl' style='text-transform:uppercase'>a(אב)\u{200f}&shy;🙂</p>",
+        &mut resources,
+    );
+    let view = doc.render_view(&resources);
+    let text = view.text();
+    let expected = "A(אב)\u{200f}\u{00ad}🙂";
+    let characters = (0..text.glyph_count())
+        .map(|index| text.character_at(index).unwrap())
+        .collect::<String>();
+    assert_eq!(characters, expected);
+    assert_eq!(text.character_at(text.glyph_count()), None);
+    assert_eq!(text.character_at(usize::MAX), None);
+    for (index, character) in expected.chars().enumerate() {
+        if matches!(character, '\u{200f}' | '\u{00ad}') {
+            assert!(text.paint_glyph_at(index as u32).is_none());
+        }
+    }
+    assert_eq!(view.addressing().reading_fragments(0)[0].text, expected);
+    assert_eq!(view.addressing().reading_boundary_after_word(3), 8);
+}
 fn range(doc: &LaidOutDocument, query: &str, resources: &GlyphResourceStore) -> Range<u32> {
     doc.render_view(resources)
         .text()
         .find_matches(query, TextSearchOptions::default())[0]
         .clone()
+}
+
+#[test]
+fn parse_and_render_source_addresses_agree_across_text_chunks_and_astral_characters() {
+    let body = "<p id='p'>😀<!-- split -->nee<span id='inline'>d</span>le</p>";
+    let source = format!("<!doctype html><html><body>{body}</body></html>");
+    let parsed = parse_document(&source, MarkupSyntax::Html).unwrap();
+    let index = DocumentTextIndex::from_parsed(&parsed).unwrap();
+    let mut resources = GlyphResourceStore::default();
+    let document = layout(body, &mut resources);
+    let addressing = document.render_view(&resources).addressing();
+    for query in ["😀", "nee", "d", "le"] {
+        let byte = index.text().find(query).unwrap();
+        let character = index.text()[..byte].chars().count();
+        let indexed = index.source_position_in(character..character + 1).unwrap();
+        let glyph = range(&document, query, &resources).start;
+        let rendered = addressing.source_position_for_glyph(glyph, false).unwrap();
+        assert_eq!(
+            rendered
+                .elements()
+                .map(|step| step.step())
+                .collect::<Vec<_>>(),
+            indexed.element_steps()
+        );
+        assert_eq!(rendered.text_step(), indexed.text_step());
+        assert_eq!(rendered.utf16_offset(), indexed.utf16_offset());
+        assert_eq!(
+            addressing.resolve_source_position(
+                indexed.element_steps(),
+                Some(indexed.text_step()),
+                Some(indexed.utf16_offset()),
+                false
+            ),
+            Some(glyph)
+        );
+        let after = addressing.source_position_for_glyph(glyph, true).unwrap();
+        assert_eq!(
+            after.utf16_offset(),
+            indexed.utf16_offset() + query.chars().next().unwrap().len_utf16()
+        );
+        assert!(rendered.elements().any(|step| step.id() == Some("p")));
+    }
+    let dom = parsed.into_dom();
+    let emoji = dom
+        .node_ids()
+        .find(|&node| dom.text_ref(node).is_some_and(|text| text.text() == "😀"))
+        .unwrap();
+    assert!(
+        dom.source_position_for_text_node(emoji, 1, true).is_none(),
+        "a surrogate's second code unit is not a character boundary"
+    );
+}
+
+#[test]
+fn element_and_text_chunk_addresses_share_utf16_offset_resolution() {
+    let mut resources = GlyphResourceStore::default();
+    let document = layout(
+        "<p>before</p><p style='text-transform:uppercase'>a   😀<!-- split -->ßZ</p>",
+        &mut resources,
+    );
+    let addressing = document.render_view(&resources).addressing();
+    let start = range(&document, "A 😀SSZ", &resources).start;
+    let position = addressing.source_position_for_glyph(start, false).unwrap();
+    let elements = position
+        .elements()
+        .map(|element| element.step())
+        .collect::<Vec<_>>();
+    for offset in [0, 1, 2, 3, 4, 5, 6, 7, 8, usize::MAX] {
+        for allow_end in [false, true] {
+            assert_eq!(
+                addressing.resolve_source_position(&elements, None, Some(offset), allow_end),
+                addressing.resolve_source_position(
+                    &elements,
+                    Some(position.text_step()),
+                    Some(offset),
+                    allow_end,
+                ),
+                "offset {offset}, allow_end {allow_end}",
+            );
+        }
+    }
+}
+
+#[test]
+fn element_addresses_choose_the_first_source_descendant_in_dom_order() {
+    let mut resources = GlyphResourceStore::default();
+    let document = layout(
+        "<style>p::before { content:'generated'; }</style><p><span style='display:none'>hidden</span><span>first😀</span>later</p>",
+        &mut resources,
+    );
+    let addressing = document.render_view(&resources).addressing();
+    let first = range(&document, "first", &resources).start;
+    let position = addressing.source_position_for_glyph(first, false).unwrap();
+    let mut elements = position
+        .elements()
+        .map(|element| element.step())
+        .collect::<Vec<_>>();
+    elements.pop();
+    assert_eq!(
+        addressing.resolve_source_position(&elements, None, None, false),
+        Some(first)
+    );
+}
+
+#[test]
+fn parse_only_excerpts_preserve_unicode_and_collapsed_context() {
+    let index = html::search::SearchIndex::from_source(
+        "<p>😀  Ca<em>fé</em></p><p>e\u{301}\u{a0}終</p>",
+        MarkupSyntax::Html,
+    )
+    .unwrap();
+    let characters: Vec<_> = index.text().chars().collect();
+    for start in 0..characters.len() {
+        for end in start + 1..=characters.len() {
+            for (before, after) in [(0, 0), (1, 2), (usize::MAX, usize::MAX)] {
+                let left = start.saturating_sub(before);
+                let right = end.saturating_add(after).min(characters.len());
+                let expected: String = characters[left..right].iter().collect();
+                let expected = expected.split_whitespace().collect::<Vec<_>>().join(" ");
+                assert_eq!(index.excerpt(start..end, before, after), Some(expected));
+            }
+        }
+    }
+    assert_eq!(index.excerpt(0..0, 1, 1), None);
+    assert_eq!(index.excerpt(1..0, 1, 1), None);
+    assert_eq!(index.excerpt(0..usize::MAX, 0, 0), None);
 }
 
 #[test]
@@ -146,6 +297,93 @@ fn xml_epub_semantics_use_the_namespace_uri() {
         box_for(&doc, "chapter", &doc_resources),
         ContentRole::MajorSection
     ));
+}
+
+#[test]
+fn xml_epub_verse_preserves_authored_spacing_with_reader_controls() {
+    use html::pipeline::ReaderStyleOverrides;
+
+    let parsed = parse_document(
+        "<html xmlns='http://www.w3.org/1999/xhtml' xmlns:book='http://www.idpf.org/2007/ops'><body style='margin:0;line-height:1'><div book:type='z3998:verse' style='text-indent:12px'>First.<br/><br/>Second.</div></body></html>",
+        MarkupSyntax::Xml,
+    ).unwrap();
+    let mut reference = None;
+    for controls in [false, true] {
+        let mut factory = DocumentFactory::new();
+        if controls {
+            factory.set_reader_overrides(ReaderStyleOverrides {
+                paragraph_spacing_em: Some(1.0),
+                first_line_indent_em: Some(2.0),
+                ..Default::default()
+            });
+        }
+        let mut resources = GlyphResourceStore::default();
+        let document = factory
+            .build_pipeline_from_parsed(&parsed, &[])
+            .shape(&mut TestShaper::default(), &mut resources)
+            .unwrap()
+            .layout(LayoutConstraints::new(600.0, 16.0).unwrap(), &resources)
+            .unwrap();
+        let geometry = document
+            .render_view(&resources)
+            .text()
+            .lines()
+            .iter()
+            .map(|line| (line.point(), line.height()))
+            .collect::<Vec<_>>();
+        if let Some(reference) = &reference {
+            assert_eq!(&geometry, reference);
+        } else {
+            reference = Some(geometry);
+        }
+    }
+}
+
+#[test]
+fn anchors_keep_empty_inline_fallbacks_inside_their_block() {
+    let mut resources = GlyphResourceStore::default();
+    let mut doc = layout(
+        "<p>outside</p><p id='paragraph'><a id='before'></a><span>first</span><a id='middle'></a><span>last</span><a id='after'></a></p><p id='empty'></p><img id='image' src='cover.png' style='display:block;width:20px;height:30px'><p><span id='repeat'>one</span><span id='repeat'>second</span></p>",
+        &mut resources,
+    );
+    let first = range(&doc, "first", &resources);
+    let last = range(&doc, "last", &resources);
+    let second = range(&doc, "second", &resources);
+    for width in [600.0, 45.0] {
+        doc.relayout(LayoutConstraints::new(width, 16.0).unwrap(), &resources)
+            .unwrap();
+        let view = doc.render_view(&resources);
+        let addressing = view.addressing();
+        for (id, glyph) in [
+            ("paragraph", first.start),
+            ("before", first.start),
+            ("middle", last.start),
+            ("after", last.end - 1),
+            ("repeat", second.start),
+        ] {
+            let key = view.lookup_string(id).unwrap();
+            assert_eq!(addressing.anchor_glyph(key), Some(glyph), "{id}");
+            let line = view.text().line_index_for_glyph(glyph).unwrap();
+            assert_eq!(
+                addressing.anchor_position(key).unwrap().y(),
+                view.text().line(line).unwrap().point_y(),
+                "{id}"
+            );
+        }
+        for id in ["empty", "image"] {
+            let key = view.lookup_string(id).unwrap();
+            assert_eq!(addressing.anchor_glyph(key), None, "{id}");
+            assert!(addressing.anchor_position(key).is_some(), "{id}");
+        }
+    }
+    let doc = layout(
+        "<style>body{margin:0}</style><div style='height:40px'><div id='zero' style='height:0'></div></div>",
+        &mut resources,
+    );
+    let view = doc.render_view(&resources);
+    let key = view.lookup_string("zero").unwrap();
+    assert_eq!(view.addressing().anchor_glyph(key), None);
+    assert_eq!(view.addressing().anchor_position(key).unwrap().y(), 0.0);
 }
 
 #[test]
@@ -242,6 +480,33 @@ fn word_selection_crosses_inline_styles_and_reflow_and_keeps_graphemes() {
 }
 
 #[test]
+fn indexed_words_exclude_hidden_and_generated_source_even_inside_a_word() {
+    let mut resources = GlyphResourceStore::default();
+    let doc = layout(
+        "<style>p::before{content:'Generated'}</style><p>hel<span style='visibility:hidden'>Secret</span><em>lo</em> cafe\u{301} 👩‍👧 🇸🇪 can't foo_bar 中文!</p><p style='visibility:hidden'>Ghost<span style='visibility:visible'>alive</span></p>",
+        &mut resources,
+    );
+    let view = doc.render_view(&resources);
+    let visible: std::collections::HashSet<_> = view.text().visible_source_runs()
+        .flat_map(|run| run.glyphs()).collect();
+    for word in ["hello", "cafe\u{301}", "👩‍👧", "🇸🇪", "can't", "foo_bar", "中", "文", "!", "alive"] {
+        let selected = if word == "hello" {
+            range(&doc, "hel", &resources).start..range(&doc, "lo", &resources).end
+        } else {
+            range(&doc, word, &resources)
+        };
+        for glyph in selected.clone().filter(|glyph| visible.contains(glyph)) {
+            assert_eq!(view.text().word_range_at(glyph), Some(selected.clone()), "{word}");
+        }
+    }
+    for glyph in 0..view.text().glyph_count() as u32 {
+        if !visible.contains(&glyph) {
+            assert_eq!(view.text().word_range_at(glyph), None, "non-source or hidden glyph {glyph}");
+        }
+    }
+}
+
+#[test]
 fn search_and_quote_queries_ignore_hidden_and_generated_content() {
     let mut doc_resources = GlyphResourceStore::default();
     let doc = layout(
@@ -277,6 +542,36 @@ fn search_and_quote_queries_ignore_hidden_and_generated_content() {
         text.find_matches("target", TextSearchOptions::default())[1]
     );
     assert_eq!(text.locate_quote("target", Some("missing"), None), None);
+}
+
+#[test]
+fn search_iterators_own_inputs_and_preserve_overlaps_and_original_graphemes() {
+    let mut matches = {
+        let text = "İİİ 😀 Cafe\u{301}".to_owned();
+        let query = "ii".to_owned();
+        text_matches(&text, &query, TextSearchOptions::default())
+    };
+    assert_eq!(matches.next(), Some((0, 2)));
+    assert_eq!(matches.next(), Some((1, 3)));
+    assert_eq!(matches.next(), None);
+    assert_eq!(matches.next(), None);
+    assert_eq!(
+        text_matches("İİİ 😀 Cafe\u{301}", "cafe", TextSearchOptions::default())
+            .collect::<Vec<_>>(),
+        vec![(6, 11)]
+    );
+    for (text, query) in [
+        ("", "a"),
+        ("a", "longer"),
+        ("abc", ""),
+        ("abc", "\u{301}"),
+        ("abc", "a\0"),
+    ] {
+        assert_eq!(
+            text_matches(text, query, TextSearchOptions::default()).next(),
+            None
+        );
+    }
 }
 
 #[test]
@@ -395,7 +690,7 @@ fn native_geometry_uses_backend_carets_and_avoids_cluster_interiors() {
 fn unstyled_table_export_preserves_spans_and_escapes_text() {
     let mut doc_resources = GlyphResourceStore::default();
     let doc = layout(
-        "<table id='table' style='color:red'><tr><th colspan='2'>A &amp; B</th></tr><tr><td rowspan='2'>&lt;tag&gt;</td><td>x</td></tr><tr><td>y</td></tr></table>",
+        "<table id='table' style='color:red'><tr><th colspan='2'>A &amp; B</th></tr><tr><td rowspan='2'>&lt;tag&gt;</td><td>x<br>y<span> z&#x2003; w </span><span></span>end<table><tr><td>nested</td></tr></table></td></tr><tr><td>y</td></tr></table>",
         &mut doc_resources,
     );
     let table = doc
@@ -405,7 +700,7 @@ fn unstyled_table_export_preserves_spans_and_escapes_text() {
         .unwrap();
     assert_eq!(
         table.unstyled_html().unwrap(),
-        "<table><tr><th colspan=\"2\">A &amp; B</th></tr><tr><td rowspan=\"2\">&lt;tag&gt;</td><td>x</td></tr><tr><td>y</td></tr></table>"
+        "<table><tr><th colspan=\"2\">A &amp; B</th></tr><tr><td rowspan=\"2\">&lt;tag&gt;</td><td>x y z w end</td></tr><tr><td>y</td></tr></table>"
     );
 }
 
@@ -506,6 +801,16 @@ fn generated_text_addresses_its_owner_and_invalid_element_steps_are_rejected() {
                 .is_some_and(|metric| metric.ch() == 'G')
         })
         .unwrap() as u32;
+    for glyph in [generated, view.text().glyph_count() as u32, u32::MAX] {
+        for after in [false, true] {
+            assert!(
+                view.addressing()
+                    .source_position_for_glyph(glyph, after)
+                    .is_none(),
+                "glyph {glyph}, after={after}"
+            );
+        }
+    }
     let line = view.text().line_index_for_glyph(generated).unwrap();
     let location = view
         .addressing()
@@ -591,15 +896,15 @@ fn line_bounds_preserve_text_height_and_include_offset_images() {
 fn vertical_queries_agree_with_intrinsic_bounds_for_overlapping_layout() {
     let mut doc_resources = GlyphResourceStore::default();
     let doc = layout(
-        "<table><caption style='caption-side:bottom'>Caption</caption><tr><td style='line-height:80px'>Tall</td><td>Small<br>Next</td></tr></table><p style='float:left'>Float</p><p>Flow</p><p style='position:relative;top:-30px'>Positioned</p>",
+        "<table><caption style='caption-side:bottom'>Caption</caption><tr><td style='line-height:80px'>Tall</td><td>Small<br>Next</td></tr></table><p style='float:left'>Float</p><p>Flow</p><p style='position:relative;top:-30px'>Positioned</p><p>Images<img src='low' width='12' height='8' style='position:relative;top:140px'><img src='high' width='12' height='8' style='position:relative;top:70px'><img src='empty' width='0' height='20' style='position:relative;top:300px'></p><p>Last</p>",
         &mut doc_resources,
     );
     let view = doc.render_view(&doc_resources);
     let geometry = view.geometry();
-    let bounds = (0..view.text().line_count())
-        .map(|index| geometry.line_vertical_bounds(index).unwrap())
+    let bounds = view.text().spatial_order().iter()
+        .map(|id| geometry.line_vertical_bounds(id.index()).unwrap())
         .collect::<Vec<_>>();
-    for y in (0..300).map(f64::from) {
+    for y in (0..500).map(f64::from) {
         assert_eq!(
             geometry.start_line_at(y, 0.1),
             bounds
@@ -617,6 +922,47 @@ fn vertical_queries_agree_with_intrinsic_bounds_for_overlapping_layout() {
                 .iter()
                 .position(|bounds| bounds.end >= y && bounds.start <= y + 2.0)
         );
+    }
+}
+
+#[test]
+fn table_queries_keep_reserved_columns_when_spanning_cells_overlap() {
+    for (rowspan, colspan) in [("3", "2"), (" 3 ", " 2 ")] {
+        let mut resources = GlyphResourceStore::default();
+        let document = layout(
+            &format!(
+                "<table id='grid'><tr><td>A</td><td rowspan='{rowspan}'>B</td></tr><tr><td colspan='{colspan}'>C</td></tr><tr><td>D</td><td>E</td></tr></table>",
+            ),
+            &mut resources,
+        );
+        let table = document
+            .render_view(&resources)
+            .boxes()
+            .table(box_for(&document, "grid", &resources))
+            .unwrap();
+        assert_eq!(table.column_count(), 3);
+        assert_eq!(table.rows()[0].cells()[1].rowspan(), 3);
+        assert_eq!(table.rows()[1].cells()[0].colspan(), 2);
+        assert_eq!(table.rows()[2].cells()[1].column(), 2);
+    }
+}
+
+#[test]
+fn table_copy_classifies_spans_with_the_same_rules_as_layout() {
+    for (span, complex) in [(" 2 ", true), ("0", false), ("-1", false), (" 1 ", false)] {
+        let mut resources = GlyphResourceStore::default();
+        let document = layout(
+            &format!(
+                "<table><tr><td colspan='{span}'>Merged</td></tr><tr><td>Left</td><td>Right</td></tr></table>",
+            ),
+            &mut resources,
+        );
+        let view = document.render_view(&resources);
+        let markdown = view
+            .export()
+            .markdown(0..view.text().glyph_count() as u32)
+            .unwrap();
+        assert_eq!(markdown.contains("<table>"), complex, "colspan={span}");
     }
 }
 

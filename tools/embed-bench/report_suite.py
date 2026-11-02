@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Update the project README from the three completed GPUI measurement reports."""
+"""Update README benchmark tables from a completed fixed-frequency suite summary."""
 
 import argparse
 from decimal import Decimal, ROUND_HALF_UP
@@ -10,118 +10,128 @@ from urllib.parse import quote
 
 ROOT = Path(__file__).resolve().parents[2]
 BASE = Path(__file__).resolve().parent
-GITHUB = 'https://github.com/JohanAnderssonOstling/HtmlEngine/blob/master/'
-FIXTURES = [
-    ('article.html', 'Article'), ('images.html', 'Images'), ('tables.html', 'Tables'),
-    ('languages/rtl-arabic.html', 'Arabic (RTL)'),
-    ('languages/cjk-japanese.html', 'Japanese (CJK)'),
-    ('large-document.html', 'Very large document'),
-    ('books/middlemarch/chapter-37.xhtml', 'Middlemarch chapter'),
-]
-CASES = [('cold', 'Cold first rendered frame'), ('warm', 'Warm first rendered frame'),
-         ('whole', 'Warm whole document render')]
+LABELS = {
+    'article': 'Article', 'images': 'Images', 'tables': 'Tables',
+    'arabic': 'Arabic (RTL)', 'japanese': 'Japanese (CJK)',
+    'large': 'Very large document', 'middlemarch': 'Middlemarch chapter',
+}
+MODES = [('cold-first', 'Cold first viewport'), ('warm-first', 'Warm first viewport'),
+         ('whole-surface', 'Warm whole document render')]
 
 
-def number(value, decimals=0):
+def number(value, decimals=1):
     rounded = Decimal(str(value)).quantize(Decimal(1).scaleb(-decimals), rounding=ROUND_HALF_UP)
     return format(rounded, f'.{decimals}f')
 
 
-def load_report(path, warm, whole):
-    report = json.loads(path.read_text())
-    if not report['complete'] or not report.get('shared_gpui'):
-        raise ValueError(f'incomplete or incompatible report: {path}')
-    if bool(report.get('warm_engine')) != warm or bool(report.get('full_document')) != whole:
-        raise ValueError(f'wrong workload scope: {path}')
-    pairs = {}
-    for row in report['runs']:
-        fixture = str(row['fixture']).replace('\\', '/')
-        relative = fixture.rsplit('/fixtures/', 1)[-1]
-        if relative.startswith('fixtures/'):
-            relative = relative[len('fixtures/'):]
-        pair = pairs.setdefault(relative, {})
-        if row['label'] in pair or row['label'] not in ('skrift', 'wry'):
-            raise ValueError(f'duplicate or unexpected host: {path}')
-        pair[row['label']] = row
-        if whole and not row.get('full_document_covered'):
-            raise ValueError(f'unverified whole-document coverage: {path}')
-    if any(set(pair) != {'skrift', 'wry'} for pair in pairs.values()):
-        raise ValueError(f'missing engine result: {path}')
-    return report, pairs
+def relative(path):
+    return quote(Path(path).resolve().relative_to(ROOT).as_posix())
 
 
-def table(pairs, warm):
+def table(cases, warm):
     ram_headers = ('<th colspan="3">RAM before (MiB)</th><th colspan="3">RAM after (MiB)</th>'
                    if warm else '<th colspan="3">Total RAM (MiB)</th>')
-    ram_columns = '<th>Skrift</th><th>Wry</th><th>Size ratio</th>' * (2 if warm else 1)
+    columns = '<th>Skrift</th><th>WebKitGTK</th><th>Size ratio</th>' * (2 if warm else 1)
     lines = ['<table>', '<thead>',
-             '<tr><th rowspan="2">Document</th><th colspan="3">CPU time (ms)</th>'
-             + ram_headers + '</tr>',
-             '<tr><th>Skrift</th><th>Wry</th><th>Speedup</th>' + ram_columns + '</tr>',
+             '<tr><th rowspan="2">Document</th>'
+             '<th colspan="3">CPU time (ms)</th>' + ram_headers + '</tr>',
+             '<tr><th>Skrift</th><th>WebKitGTK</th><th>CPU ratio</th>' + columns + '</tr>',
              '</thead>', '<tbody>']
-    for relative, label in FIXTURES:
-        if relative not in pairs:
+    for label in LABELS:
+        case = next((case for case in cases if case['fixture'] == label), None)
+        if case is None:
             continue
-        a, b = pairs[relative]['skrift'], pairs[relative]['wry']
-        after = [row['memory']['loaded']['pss_bytes'] for row in (a, b)]
-        values = [a['additional_cpu_ms'], b['additional_cpu_ms'],
-                  b['additional_cpu_ms'] / a['additional_cpu_ms']]
-        if warm:
-            before = [row['memory']['initialized']['pss_bytes'] for row in (a, b)]
-            values.extend([before[0] / 1048576, before[1] / 1048576, before[1] / before[0]])
-        values.extend([after[0] / 1048576, after[1] / 1048576, after[1] / after[0]])
-        url = GITHUB + quote('tools/embed-bench/fixtures/' + relative)
-        cells = ''.join('<td>' + number(value, 2 if i in (2, 5, 8) else 0) + ('×' if i in (2, 5, 8) else '') + '</td>'
-                        for i, value in enumerate(values))
-        lines.append(f'<tr><th scope="row"><a href="{escape(url)}">{escape(label)}</a></th>{cells}</tr>')
+        skrift, webkit = (case['engines'][engine] for engine in ('skrift', 'wry'))
+        window = case['windows_ms'][-1]
+        cpu = [engine['cpu_by_window_ms'][str(window)]['median'] for engine in (skrift, webkit)]
+        values = [number(cpu[0]), number(cpu[1]), number(cpu[1] / cpu[0], 2) + '×']
+        for field in (['baseline_pss_mib', 'loaded_pss_mib'] if warm else ['loaded_pss_mib']):
+            ram = [engine[field]['median'] for engine in (skrift, webkit)]
+            values.extend([number(ram[0]), number(ram[1]), number(ram[1] / ram[0], 2) + '×'])
+        lines.append('<tr><th scope="row"><a href="' + relative(case['path']) + '">'
+                     + escape(LABELS[label]) + '</a></th>'
+                     + ''.join('<td>' + value + '</td>' for value in values) + '</tr>')
     return '\n'.join(lines + ['</tbody>', '</table>'])
 
 
-def warm_baseline_table(pair):
-    skrift, wry = (pair[engine]['memory']['initialized']['pss_bytes'] for engine in ('skrift', 'wry'))
-    return ('<table>\n<thead>\n<tr><th>GPUI + Skrift</th><th>GPUI + Wry</th><th>Size ratio</th></tr>\n'
-            '</thead>\n<tbody>\n<tr><td>' + number(skrift / 1048576) + ' MiB</td><td>'
-            + number(wry / 1048576) + ' MiB</td><td>' + number(wry / skrift, 2)
-            + '×</td></tr>\n</tbody>\n</table>')
+def benchmark_section(summary, summary_path):
+    if not summary['complete'] or summary['completed_measurements'] != summary['planned_measurements']:
+        raise ValueError('the suite must be complete before updating README')
+    cases, config = summary['cases'], summary['configuration']
+    keys = {(case['mode'], case['fixture']) for case in cases}
+    if len(keys) != len(cases) or any(mode not in dict(MODES) for mode, _ in keys):
+        raise ValueError('duplicate or unsupported benchmark case')
+    for mode in ('cold-first', 'warm-first'):
+        if {fixture for scope, fixture in keys if scope == mode} != set(LABELS):
+            raise ValueError('first-viewport results must include all seven fixtures')
+    for reused in summary['reused_cases']:
+        if ((reused['mode'], reused['fixture']) in keys
+                or (reused['source_mode'], reused['fixture']) not in keys):
+            raise ValueError('whole-document result is duplicated or has no source')
+    samples = config['samples_per_engine']
+    for case in cases:
+        if set(case['engines']) != {'skrift', 'wry'}:
+            raise ValueError('missing engine results')
+        for engine in case['engines'].values():
+            if (engine['completed_samples'] != samples or not engine['kernel_cpuset_verified']
+                    or not engine['frequency_limits_verified']):
+                raise ValueError('incomplete samples or unverified CPU controls')
+    if sum(e['completed_samples'] for c in cases for e in c['engines'].values()) != summary['completed_measurements']:
+        raise ValueError('sample counts do not match the summary')
+    baseline = next(c for c in cases if c['mode'] == 'warm-first' and c['fixture'] == 'article')
+    ram = [baseline['engines'][e]['baseline_pss_mib']['median'] for e in ('skrift', 'wry')]
+    frequency = number(config['khz'] / 1000000)
+    cpus = ', '.join(map(str, config['cpus']))
+    parts = [f'''## Benchmark environment
+
+| Component | Version / configuration |
+| --- | --- |
+| CPU | AMD Ryzen 7 6800HS Creator Edition |
+| GPUI | 0.2.2 |
+| Wry binding (`lb-wry`) | 0.53.3 |
+| WebKitGTK runtime | 2.54.2 |
+| GTK runtime | 3.24.52 |
+| Host/helper CPU set | {cpus}: four physical cores, one SMT thread per core |
+| CPU frequency limits | {frequency} GHz minimum and maximum, including SMT siblings |
+| First viewport | 800 × 600 pixels, scale 1, X11 |
+| Samples | {samples} fresh processes per engine and case; {summary['completed_measurements']} measurements |
+
+## Warm engine RAM
+
+Median after empty-page warmup for the Article case, before loading its content.
+
+<table>
+<thead>
+<tr><th>GPUI + Skrift</th><th>GPUI + WebKitGTK</th><th>Size ratio</th></tr>
+</thead>
+<tbody>
+<tr><td>{number(ram[0])} MiB</td><td>{number(ram[1])} MiB</td><td>{number(ram[1] / ram[0], 2)}×</td></tr>
+</tbody>
+</table>''']
+    for mode, title in MODES:
+        parts.append('## ' + title + '\n\n' + table([c for c in cases if c['mode'] == mode], mode != 'cold-first'))
+    directory = summary_path.parent
+    parts.append('Raw results: [summary](toolpath), [measurement plan](planpath) and [validation](validationpath). '
+                 'Individual samples, CPU checkpoints and ranges are retained in the results directory.'
+                 .replace('toolpath', relative(summary_path))
+                 .replace('planpath', relative(directory / 'plan.json'))
+                 .replace('validationpath', relative(directory / 'validation.json')))
+    return '\n\n'.join(parts) + '\n\n'
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for mode, _ in CASES:
-        scope = {'cold': 'cold-first', 'warm': 'warm-first', 'whole': 'warm-whole'}[mode]
-        parser.add_argument('--' + mode, type=Path,
-                            default=BASE / f'results/gpui-culled-suite-{scope}-20261027.json')
+    parser.add_argument('--summary', type=Path,
+                        default=BASE / 'results/fixed-frequency-suite-20261101-204746/summary.json')
     parser.add_argument('--readme', type=Path, default=ROOT / 'README.md')
     args = parser.parse_args()
-    reports, pairs = {}, {}
-    for mode, _ in CASES:
-        reports[mode], pairs[mode] = load_report(getattr(args, mode), mode != 'cold', mode == 'whole')
-    expected = {relative for relative, _ in FIXTURES}
-    if set(pairs['cold']) != expected or set(pairs['warm']) != expected:
-        raise ValueError('cold and warm first-frame reports must contain all seven fixtures')
-    significant = {relative for relative, pair in pairs['cold'].items()
-                   if any(row['host']['page']['content_height'] >= 1800 for row in pair.values())}
-    if set(pairs['whole']) != significant:
-        raise ValueError('whole-document results must cover fixtures at least three viewports tall')
-    hashes = {host['sha256'] for report in reports.values() for host in report['hosts']}
-    if len(hashes) != 1:
-        raise ValueError('all measurements must use one common executable')
-    baseline = '## Warm engine RAM\n\n' + warm_baseline_table(pairs['warm'][FIXTURES[0][0]])
-    sections = '\n\n'.join('## ' + title + '\n\n' + table(pairs[mode], mode != 'cold')
-                            for mode, title in CASES)
-    note = ('One sample per engine and document. CPU includes viewport snapshot readback. '
-            'RAM is total process session PSS including helpers and excluding GPU VRAM. '
-            'Cold shows total RAM after rendering; warm tables show RAM before and after loading. '
-            'Cold starts from an empty GPUI window; warm starts after the engine renders an empty document. '
-            'Layout differences remain between engines.\n\nRaw results: '
-            '[cold](tools/embed-bench/results/gpui-culled-suite-cold-first-20261027.json), '
-            '[warm](tools/embed-bench/results/gpui-culled-suite-warm-first-20261027.json), '
-            '[whole document](tools/embed-bench/results/gpui-culled-suite-warm-whole-20261027.json).')
+    summary_path = args.summary.resolve(strict=True)
+    content = benchmark_section(json.loads(summary_path.read_text()), summary_path)
     readme = args.readme.read_text()
-    start = readme.index('## Warm engine RAM')
+    start = readme.index('## Benchmark environment')
     end = readme.index('## Executable size', start)
-    args.readme.write_text(readme[:start] + baseline + '\n\n' + sections + '\n\n' + note + '\n\n' + readme[end:])
-    print('Updated README measurement tables.')
+    args.readme.write_text(readme[:start] + content + readme[end:])
+    print('Updated README benchmark results and measurement notes.')
 
 
 if __name__ == '__main__':

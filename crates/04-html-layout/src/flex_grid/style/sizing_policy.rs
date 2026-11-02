@@ -45,9 +45,7 @@ pub fn grid_definite_inline_minimum_exceeds_track_limit(
         // retains fixed and calc-absolute terms without inventing a percentage
         // contribution from the container rather than the item grid area.
         let margin = style.get_horizontal_margin(0.0);
-        let padding_border = style.get_horizontal_padding(0.0)
-            + style.border_left_width() as f64
-            + style.border_right_width() as f64;
+        let padding_border = style.get_horizontal_padding_border(0.0);
         let outer = |width: f32| match style.box_sizing() {
             html_style_model::BoxSizing::ContentBox => {
                 width.max(0.0) as f64 + padding_border + margin
@@ -56,23 +54,16 @@ pub fn grid_definite_inline_minimum_exceeds_track_limit(
                 (width.max(0.0) as f64).max(padding_border) + margin
             }
         };
-        let preferred = match style.width() {
-            PreferredSize::Px(width) => Some(outer(width)),
-            _ => None,
-        };
-        let minimum = match style.min_width() {
-            PreferredSize::Px(width) => Some(outer(width)),
-            _ => None,
-        };
         // Even an auto-sized empty item has a definite outer lower bound:
         // its padding, border, and non-auto margins. Taffy otherwise loses
         // that contribution when every spanned `minmax(auto, fixed)` track
         // has a zero maximum.
-        let outer_insets = outer(0.0);
-        preferred
+        [style.width(), style.min_width(), PreferredSize::Px(0.0)]
             .into_iter()
-            .chain(minimum)
-            .chain(std::iter::once(outer_insets))
+            .filter_map(|size| match size {
+                PreferredSize::Px(width) => Some(outer(width)),
+                _ => None,
+            })
             .any(|contribution| contribution > track_limit + 0.01)
     })
 }

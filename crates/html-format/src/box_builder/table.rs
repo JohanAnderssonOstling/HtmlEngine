@@ -1,13 +1,15 @@
 use crate::layout_model::{
-    BlockBox, Children, LayoutMode, TableCellBox, TableColumnGroupSpan, TableColumnTrack,
-    TableColumnWidthHint, TableRowBox,
+    BlockBox, Children, LayoutMode, TableBox, TableCellBox, TableColumnGroupSpan, TableColumnTrack,
+    TableColumnWidthHint, TableRowBox, parse_positive_span,
 };
 use html_dom::{Document, DomNodeId, NodeRef};
-use html_style_model::{CaptionSide, ComputedStyles, Display, PositionMode, WhiteSpace};
+use html_style_model::{CaptionSide, ComputedStyles, Display, WhiteSpace};
 
-use super::classification::{display_for_element, empty_table_box, starts_new_block_child};
+use super::classification::{
+    display_for_element, is_absolutely_positioned, starts_new_block_child,
+};
 use super::generated::ResolvedGeneratedContent;
-use super::inline::text_is_ignorable_at_block_edge;
+use super::inline::{text_is_ignorable_at_block_edge, trim_node_edges};
 
 pub(super) struct TableChildrenPlan {
     pub(super) actions: Vec<TableChildAction>,
@@ -18,12 +20,7 @@ pub(super) struct TableChildrenPlan {
 
 pub(super) enum TableChildAction {
     Anonymous(Vec<u32>),
-    Principal(TablePrincipal<DomNodeId>),
-}
-
-pub(super) struct TablePrincipal<S> {
-    pub(super) source: S,
-    pub(super) role: TableRole,
+    Principal { node: DomNodeId, role: TableRole },
 }
 
 pub(super) enum AnonymousTablePlan {
@@ -55,14 +52,9 @@ pub(super) enum TableRole {
 impl TableRole {
     pub(super) fn layout_mode(self) -> LayoutMode {
         match self {
-            Self::Table => LayoutMode::Table(empty_table_box()),
-            Self::RowGroup | Self::Caption(_) => LayoutMode::Block(BlockBox {
-                children: Children::Empty,
-            }),
-            Self::Row => LayoutMode::TableRow(TableRowBox {
-                cells: Vec::new(),
-                out_of_flow: Vec::new(),
-            }),
+            Self::Table => LayoutMode::Table(TableBox::default()),
+            Self::RowGroup | Self::Caption(_) => LayoutMode::Block(BlockBox::default()),
+            Self::Row => LayoutMode::TableRow(TableRowBox::default()),
             Self::Cell => LayoutMode::TableCell(TableCellBox::new(Children::Empty)),
         }
     }
@@ -73,15 +65,13 @@ pub(super) struct PlannedTableBox {
     pub(super) parent: Option<usize>,
 }
 
-pub(super) struct TableTopologyPlan<S> {
-    pub(super) source: S,
+pub(super) struct GeneratedTablePlan {
+    pub(super) source: ResolvedGeneratedContent,
     pub(super) boxes: Vec<PlannedTableBox>,
     pub(super) principal_box: usize,
     pub(super) content_target: usize,
     pub(super) anonymous_text_box: bool,
 }
-
-pub(super) type GeneratedTablePlan = TableTopologyPlan<ResolvedGeneratedContent>;
 
 pub(super) fn plan_generated_table_principal(
     styles: &ComputedStyles,
@@ -95,15 +85,19 @@ pub(super) fn plan_generated_table_principal(
             .caption_side
     };
     let (boxes, principal_box, content_target, anonymous_text_box) = match display {
-        Display::Table => (
+        Display::Table | Display::TableRow | Display::TableCell => (
             vec![
                 planned(TableRole::Table, None),
                 planned(TableRole::Row, Some(0)),
                 planned(TableRole::Cell, Some(1)),
             ],
-            0,
+            match display {
+                Display::Table => 0,
+                Display::TableRow => 1,
+                _ => 2,
+            },
             2,
-            true,
+            display != Display::TableCell,
         ),
         Display::TableRowGroup | Display::TableHeaderGroup | Display::TableFooterGroup => (
             vec![
@@ -116,26 +110,6 @@ pub(super) fn plan_generated_table_principal(
             3,
             true,
         ),
-        Display::TableRow => (
-            vec![
-                planned(TableRole::Table, None),
-                planned(TableRole::Row, Some(0)),
-                planned(TableRole::Cell, Some(1)),
-            ],
-            1,
-            2,
-            true,
-        ),
-        Display::TableCell => (
-            vec![
-                planned(TableRole::Table, None),
-                planned(TableRole::Row, Some(0)),
-                planned(TableRole::Cell, Some(1)),
-            ],
-            2,
-            2,
-            false,
-        ),
         Display::TableCaption => (
             vec![
                 planned(TableRole::Table, None),
@@ -147,7 +121,7 @@ pub(super) fn plan_generated_table_principal(
         ),
         _ => return None,
     };
-    Some(TableTopologyPlan {
+    Some(GeneratedTablePlan {
         source: content,
         boxes,
         principal_box,
@@ -176,7 +150,7 @@ pub(super) fn nearest_table(
 pub(super) fn plan_table_children(
     document: &Document,
     styles: &ComputedStyles,
-    children: Vec<u32>,
+    children: impl IntoIterator<Item = u32>,
 ) -> TableChildrenPlan {
     let children = flattened_contents_children(document, styles, children);
     let mut actions = Vec::new();
@@ -206,10 +180,10 @@ pub(super) fn plan_table_children(
                             .caption_side
                     })
                     .unwrap_or(CaptionSide::Top);
-                actions.push(TableChildAction::Principal(TablePrincipal {
-                    source: node,
+                actions.push(TableChildAction::Principal {
+                    node,
                     role: TableRole::Caption(side),
-                }));
+                });
             }
             Display::TableColumn => {
                 flush_anonymous_action(&mut anonymous, &mut actions);
@@ -218,7 +192,7 @@ pub(super) fn plan_table_children(
                     &mut columns,
                     &mut column_width_hints,
                     style,
-                    parse_span(document, node),
+                    parse_positive_span(element.attr("span")),
                     Some(style),
                     None,
                 );
@@ -228,17 +202,14 @@ pub(super) fn plan_table_children(
                 let group_style = style.unwrap_or_else(|| styles.default_indices());
                 let start = columns.len();
                 let mut group_span = 0;
-                for child in element
-                    .children()
-                    .filter_map(|child| document.element_ref(child))
-                {
+                for child in element.child_elements() {
                     if display_for_element(styles, child) != Display::TableColumn {
                         continue;
                     }
                     let style = styles
                         .style_for_node(child.node_id())
                         .unwrap_or_else(|| styles.default_indices());
-                    let span = parse_span(document, child.node_id());
+                    let span = parse_positive_span(child.attr("span"));
                     append_columns(
                         &mut columns,
                         &mut column_width_hints,
@@ -250,7 +221,7 @@ pub(super) fn plan_table_children(
                     group_span += span;
                 }
                 if group_span == 0 {
-                    group_span = parse_span(document, node);
+                    group_span = parse_positive_span(element.attr("span"));
                     append_columns(
                         &mut columns,
                         &mut column_width_hints,
@@ -270,17 +241,17 @@ pub(super) fn plan_table_children(
             }
             Display::TableRow => {
                 flush_anonymous_action(&mut anonymous, &mut actions);
-                actions.push(TableChildAction::Principal(TablePrincipal {
-                    source: node,
+                actions.push(TableChildAction::Principal {
+                    node,
                     role: TableRole::Row,
-                }));
+                });
             }
             Display::TableRowGroup | Display::TableHeaderGroup | Display::TableFooterGroup => {
                 flush_anonymous_action(&mut anonymous, &mut actions);
-                actions.push(TableChildAction::Principal(TablePrincipal {
-                    source: node,
+                actions.push(TableChildAction::Principal {
+                    node,
                     role: TableRole::RowGroup,
-                }));
+                });
             }
             Display::None => {}
             _ => anonymous.push(raw),
@@ -308,7 +279,7 @@ pub(super) fn plan_anonymous_table_children(
             .and_then(|node| document.element_ref(node))
             .is_some_and(|element| display_for_element(styles, element) == Display::Contents)
     }) {
-        flattened = flattened_contents_children(document, styles, nodes.to_vec());
+        flattened = flattened_contents_children(document, styles, nodes.iter().copied());
         flattened.as_slice()
     } else {
         nodes
@@ -324,26 +295,12 @@ pub(super) fn plan_anonymous_table_children(
         return AnonymousTablePlan::Empty;
     }
 
-    let mut start = 0;
-    let mut end = nodes.len();
-    let collapsible_text = |raw| {
+    let nodes = trim_node_edges(nodes, |raw| {
         document
             .node_id_from_raw(raw)
-            .and_then(|node| match document.node_ref(node) {
-                Some(NodeRef::Text(text)) => {
-                    Some(text_is_ignorable_at_block_edge(text.text(), white_space))
-                }
-                Some(NodeRef::Element(_)) | None => None,
-            })
-            .unwrap_or(false)
-    };
-    while start < end && collapsible_text(nodes[start]) {
-        start += 1;
-    }
-    while start < end && collapsible_text(nodes[end - 1]) {
-        end -= 1;
-    }
-    let nodes = &nodes[start..end];
+            .and_then(|node| document.text_ref(node))
+            .is_some_and(|text| text_is_ignorable_at_block_edge(text.text(), white_space))
+    });
     if nodes.is_empty() {
         return AnonymousTablePlan::Empty;
     }
@@ -397,7 +354,7 @@ pub(super) fn plan_anonymous_table_children(
 pub(super) fn plan_table_row_children(
     document: &Document,
     styles: &ComputedStyles,
-    children: Vec<u32>,
+    children: impl IntoIterator<Item = u32>,
 ) -> Vec<TableRowChildAction> {
     let children = flattened_contents_children(document, styles, children);
     let mut actions = Vec::new();
@@ -411,10 +368,7 @@ pub(super) fn plan_table_row_children(
             continue;
         };
         let display = display_for_element(styles, element);
-        let out_of_flow = styles
-            .style_for_node(element.node_id())
-            .and_then(|style| styles.layout_style(style))
-            .is_some_and(|style| style.position == PositionMode::Absolute);
+        let out_of_flow = is_absolutely_positioned(styles, element);
         if display == Display::TableCell {
             flush_anonymous_row_action(&mut anonymous, &mut actions);
             actions.push(TableRowChildAction::Cell(node));
@@ -432,7 +386,7 @@ pub(super) fn plan_table_row_children(
 fn flattened_contents_children(
     document: &Document,
     styles: &ComputedStyles,
-    children: Vec<u32>,
+    children: impl IntoIterator<Item = u32>,
 ) -> Vec<u32> {
     fn append(document: &Document, styles: &ComputedStyles, raw: u32, output: &mut Vec<u32>) {
         let Some(node) = document.node_id_from_raw(raw) else {
@@ -453,7 +407,8 @@ fn flattened_contents_children(
         }
     }
 
-    let mut flattened = Vec::with_capacity(children.len());
+    let children = children.into_iter();
+    let mut flattened = Vec::with_capacity(children.size_hint().0);
     for raw in children {
         append(document, styles, raw, &mut flattened);
     }
@@ -490,8 +445,4 @@ fn flush_anonymous_row_action(nodes: &mut Vec<u32>, actions: &mut Vec<TableRowCh
     if !nodes.is_empty() {
         actions.push(TableRowChildAction::Anonymous(std::mem::take(nodes)));
     }
-}
-
-fn parse_span(document: &Document, node: DomNodeId) -> usize {
-    html_engine_model::parse_positive_span(document.get_dom_attr(node, "span"))
 }

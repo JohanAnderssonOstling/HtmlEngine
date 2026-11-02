@@ -1,12 +1,14 @@
 use super::block::ParagraphSpacing;
+use super::engine::LayoutInputs;
 use crate::layout_model::{
-    Children, InlineContent, InlineItemKind, LayoutBox, LayoutMode, LayoutTree,
+    Children, InlineContent, InlineItem, InlineItemKind, LayoutMode, LayoutTree,
     ListItemMarker,
 };
 use crate::layout_model::{FontRelativeMetrics, ShapedFontMetrics};
 use html_dom::Document;
 use html_style_model::{
-    ComputedStyles, Float, LayoutStyle, PositionMode, StyleIndices, UsedStyleView,
+    BoxSizing, ComputedStyles, Float, LayoutStyle, PositionMode, StyleIndices,
+    UsedPreferredSize as PreferredSize, UsedStyleView,
 };
 use kurbo::Size;
 
@@ -47,13 +49,15 @@ pub(super) struct BoxStyleSnapshot<'input> {
 }
 
 impl<'input> BoxStyleSnapshot<'input> {
-    pub(super) fn new(
-        document: &Document,
-        inline_content: &InlineContent,
-        styles: &'input ComputedStyles,
-        topology: &'input LayoutTree,
-        font_metrics: &'input ShapedFontMetrics,
-    ) -> Self {
+    pub(super) fn new(inputs: &LayoutInputs<'input>) -> Self {
+        let LayoutInputs {
+            document,
+            inline_content,
+            styles,
+            topology,
+            font_metrics,
+            ..
+        } = inputs;
         let mut resolved = Vec::with_capacity(topology.box_count());
         let mut tracks_overflow_clips = false;
         for box_idx in 0..topology.box_count() {
@@ -77,21 +81,16 @@ impl<'input> BoxStyleSnapshot<'input> {
 
 impl<'input> LayoutReader<'input> {
     pub(super) fn new(
-        document: &'input Document,
-        styles: &'input ComputedStyles,
-        topology: &'input LayoutTree,
-        inline_content: &'input InlineContent,
-        font_metrics: &'input ShapedFontMetrics,
-        image_metrics: &'input crate::ImageMetrics,
+        inputs: &LayoutInputs<'input>,
         box_styles: &'input BoxStyleSnapshot<'input>,
     ) -> Self {
         Self {
-            document,
-            styles,
-            topology,
-            inline_content,
-            font_metrics,
-            image_metrics,
+            document: inputs.document,
+            styles: inputs.styles,
+            topology: inputs.topology,
+            inline_content: inputs.inline_content,
+            font_metrics: inputs.font_metrics,
+            image_metrics: inputs.image_metrics,
             box_styles: &box_styles.styles,
             paragraph_spacing: &box_styles.paragraph_spacing,
             tracks_overflow_clips: box_styles.tracks_overflow_clips,
@@ -159,16 +158,16 @@ impl<'input> LayoutReader<'input> {
         self.font_metrics.for_box(box_idx)
     }
 
+    pub fn style_font_metrics(&self, indices: StyleIndices) -> FontRelativeMetrics {
+        self.font_metrics.for_non_box_style(indices)
+    }
+
     pub fn styles(&self) -> &'input ComputedStyles {
         self.styles
     }
 
     pub fn layout_tree(&self) -> &'input LayoutTree {
         self.topology
-    }
-
-    pub fn box_at(&self, box_idx: usize) -> Option<&LayoutBox> {
-        self.topology.box_at(box_idx)
     }
 
     pub fn box_dom_element(&self, box_idx: usize) -> Option<u32> {
@@ -199,20 +198,18 @@ impl<'input> LayoutReader<'input> {
     }
 
     fn image_intrinsic_ratio(&self, box_idx: usize, intrinsic: Size) -> Option<f64> {
-        if let Some(element) = self
-            .box_dom_element(box_idx)
-            .and_then(|raw| self.document.node_id_from_raw(raw))
-            .and_then(|node| self.document.element_ref(node))
+        if let Some(element) = self.topology.element_for_box(box_idx, self.document)
             && element.tag().eq_ignore_ascii_case("svg")
         {
             if let Some(view_box) = element.attr("viewBox").or_else(|| element.attr("viewbox")) {
-                let values = view_box
+                let mut parts = view_box
                     .split(|character: char| character.is_ascii_whitespace() || character == ',')
-                    .filter(|value| !value.is_empty())
-                    .map(str::parse::<f64>)
-                    .collect::<Result<Vec<_>, _>>()
-                    .ok()?;
-                if values.len() != 4 || values[2] <= 0.0 || values[3] <= 0.0 {
+                    .filter(|value| !value.is_empty());
+                let mut values = [0.0; 4];
+                for value in &mut values {
+                    *value = parts.next()?.parse::<f64>().ok()?;
+                }
+                if parts.next().is_some() || values[2] <= 0.0 || values[3] <= 0.0 {
                     return None;
                 }
                 return Some(values[2] / values[3]);
@@ -234,7 +231,7 @@ impl<'input> LayoutReader<'input> {
         horizontal_padding_border: f64,
         vertical_outer_inset: f64,
         standalone: bool,
-    ) -> Option<html_style_model::UsedPreferredSize> {
+    ) -> Option<PreferredSize> {
         const MIN_SOURCE_WIDTH: f64 = 96.0;
 
         if self.image_idx(box_idx).and_then(|index| self.document.image(index))
@@ -250,17 +247,14 @@ impl<'input> LayoutReader<'input> {
             return None;
         }
         let style = self.style(box_idx);
-        if style.height() != html_style_model::UsedPreferredSize::Auto
-            || style.min_height() != html_style_model::UsedPreferredSize::Auto
-            || style.max_height() != html_style_model::UsedPreferredSize::Auto
+        if style.height() != PreferredSize::Auto
+            || style.min_height() != PreferredSize::Auto
+            || style.max_height() != PreferredSize::Auto
         {
             return None;
         }
 
-        let node = self
-            .box_dom_element(box_idx)
-            .and_then(|raw| self.document.node_id_from_raw(raw))?;
-        let element = self.document.element_ref(node)?;
+        let element = self.topology.element_for_box(box_idx, self.document)?;
         if element.attr("height").is_some() {
             return None;
         }
@@ -274,12 +268,12 @@ impl<'input> LayoutReader<'input> {
                 .min(available_content_height * intrinsic.width / intrinsic.height);
         }
         let preferred = match style.box_sizing() {
-            html_style_model::BoxSizing::ContentBox => expanded_content_width,
-            html_style_model::BoxSizing::BorderBox => {
+            BoxSizing::ContentBox => expanded_content_width,
+            BoxSizing::BorderBox => {
                 expanded_content_width + horizontal_padding_border
             }
         };
-        Some(html_style_model::UsedPreferredSize::Px(preferred as f32))
+        Some(PreferredSize::Px(preferred as f32))
     }
 
     pub fn box_style_indices(&self, box_idx: usize) -> Option<StyleIndices> {
@@ -323,13 +317,7 @@ impl<'input> LayoutReader<'input> {
         self.inline_content.inline_items()[runs.start as usize..runs.end as usize]
             .iter()
             .any(|run| {
-                let ownership_box = match run.kind {
-                    InlineItemKind::AtomicBox { box_idx } => self.get_parent(box_idx as usize),
-                    _ => Some(run.box_idx as usize),
-                };
-                if !ownership_box.is_some_and(|box_idx| {
-                    self.run_belongs_to_inline_context(box_idx, container_box_idx)
-                }) {
+                if !self.inline_item_belongs_to_context(run, container_box_idx) {
                     return false;
                 }
                 match &run.kind {
@@ -345,9 +333,8 @@ impl<'input> LayoutReader<'input> {
                             let character = self
                                 .inline_content
                                 .character_at(glyph_idx as usize)
-                                .and_then(char::from_u32)
                                 .unwrap_or_default();
-                            preserves_space || !character.is_whitespace() || character == '\u{00A0}'
+                            preserves_space || !html_text::is_document_white_space(character)
                         })
                     }
                     InlineItemKind::Image { .. }
@@ -373,7 +360,7 @@ impl<'input> LayoutReader<'input> {
             let InlineItemKind::FloatAnchor { box_idx } = run.kind else {
                 continue;
             };
-            if !self.run_belongs_to_inline_context(run.box_idx as usize, container_box_idx) {
+            if !self.inline_item_belongs_to_context(run, container_box_idx) {
                 continue;
             }
             match self.style(box_idx as usize).float() {
@@ -385,8 +372,13 @@ impl<'input> LayoutReader<'input> {
         (left, right)
     }
 
-    fn run_belongs_to_inline_context(&self, run_box_idx: usize, container_box_idx: usize) -> bool {
-        let mut current = Some(run_box_idx);
+    /// Inline items stop at their formatting-context root rather than leaking
+    /// into ancestor lines. An atomic box's parent owns its placeholder.
+    pub fn inline_item_belongs_to_context(&self, item: &InlineItem, container_box_idx: usize) -> bool {
+        let mut current = match item.kind {
+            InlineItemKind::AtomicBox { box_idx } => self.get_parent(box_idx as usize),
+            _ => Some(item.box_idx as usize),
+        };
         while let Some(box_idx) = current {
             if box_idx == container_box_idx {
                 return true;
@@ -516,23 +508,25 @@ impl<'input> LayoutReader<'input> {
         self.topology.list_marker(box_idx)
     }
 
-    pub fn box_uses_float_context(&self, box_idx: usize) -> bool {
+    pub fn establishes_formatting_context(&self, box_idx: usize) -> bool {
         let style = self.style(box_idx);
         let (overflow_x, overflow_y) = self.effective_overflow_modes(box_idx);
-        let is_flex_grid_item = self
-            .get_parent(box_idx)
-            .is_some_and(|parent| self.is_flex_grid_box(parent));
+        super::block::establishes_formatting_context(
+            style.display(),
+            overflow_x,
+            overflow_y,
+            matches!(style.float(), Float::Left | Float::Right),
+            self.root_box() == Some(box_idx),
+            self.is_table_cell_box(box_idx),
+            self.get_parent(box_idx)
+                .is_some_and(|parent| self.is_flex_grid_box(parent)),
+        )
+    }
+
+    pub fn box_uses_float_context(&self, box_idx: usize) -> bool {
         self.is_table_box(box_idx)
-            || super::block::establishes_formatting_context(
-                style.display(),
-                overflow_x,
-                overflow_y,
-                matches!(style.float(), Float::Left | Float::Right),
-                self.root_box() == Some(box_idx),
-                self.is_table_cell_box(box_idx),
-                is_flex_grid_item,
-            )
-            || style.position() == PositionMode::Absolute
+            || self.establishes_formatting_context(box_idx)
+            || self.style(box_idx).position() == PositionMode::Absolute
     }
 
     pub fn box_uses_ahem(&self, box_idx: usize) -> bool {

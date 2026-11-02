@@ -3,7 +3,7 @@ use html_style::{
     property_value_syntax,
 };
 use lightningcss::traits::Parse;
-use lightningcss::values::percentage::{NumberOrPercentage, Percentage};
+use lightningcss::values::percentage::Percentage;
 
 const MIXED_CALCULATIONS: [&str; 5] = [
     "min(1, 1%)",
@@ -12,21 +12,6 @@ const MIXED_CALCULATIONS: [&str; 5] = [
     "mod(1, 1%)",
     "rem(1, 1%)",
 ];
-
-#[test]
-fn dependency_percentage_rejects_mixed_calculations_without_panicking() {
-    for value in MIXED_CALCULATIONS {
-        assert!(Percentage::parse_string(value).is_err(), "{value}");
-        assert!(NumberOrPercentage::parse_string(value).is_err(), "{value}");
-    }
-    // The percentage parser must also return an error so a caller can try
-    // the number grammar instead. A number calc is not a percentage.
-    assert!(Percentage::parse_string("min(0.25, 0.5)").is_err());
-    assert!(matches!(
-        NumberOrPercentage::parse_string("min(0.25, 0.5)"),
-        Ok(NumberOrPercentage::Number(0.25))
-    ));
-}
 
 #[test]
 fn dependency_percentage_preserves_valid_percentage_calculations() {

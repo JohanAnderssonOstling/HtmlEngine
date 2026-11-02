@@ -5,14 +5,14 @@ use super::tracks::{
     length_percentage_auto, line_names as grid_line_names, placement as grid_placement,
     template_track as grid_template_track, track_size as grid_track_size, used_length_percentage,
 };
-use super::{TaffyContainerKind, finite_f32};
+use super::{TaffyContainerKind, finite_f32, length_dimension};
 use crate::layout::{
     LayoutEngine, ResolvedBoxModel, clamp_replaced_definite_size_by_intrinsic_constraints,
     resolve_replaced_intrinsic_constraint,
 };
 use html_style_model::{
-    FlexDirection, GridAutoFlow, ItemAlignment, LayoutStyle, OverflowMode, PositionMode, TextDirection,
-    UsedPreferredSize as PreferredSize,
+    BoxSizing, FlexDirection, FlexWrap, GridAutoFlow, ItemAlignment, LayoutStyle, OverflowMode,
+    PositionMode, TextDirection, UsedPreferredSize as PreferredSize,
 };
 use taffy::geometry::{Line, Point as TaffyPoint, Rect, Size as TaffySize};
 use taffy::prelude::{Dimension, LengthPercentage, Style};
@@ -26,6 +26,22 @@ use taffy::style::{
 
 pub(super) fn layout_style<'a>(session: &LayoutEngine<'a, '_>, box_idx: usize) -> &'a LayoutStyle {
     session.reader.layout_style(box_idx)
+}
+
+pub(super) fn effective_align_self(
+    session: &LayoutEngine<'_, '_>,
+    box_idx: usize,
+) -> ItemAlignment {
+    let alignment = layout_style(session, box_idx).align_self;
+    if alignment != ItemAlignment::Auto {
+        return alignment;
+    }
+    session
+        .reader
+        .get_parent(box_idx)
+        .map_or(ItemAlignment::Normal, |parent| {
+            layout_style(session, parent).align_items
+        })
 }
 
 pub(super) fn taffy_container_style(
@@ -57,43 +73,34 @@ pub(super) fn taffy_container_style(
             TaffyContainerKind::Grid => TaffyDisplay::Grid,
         },
         size: TaffySize {
-            width: Dimension::length(finite_f32(content_width)),
-            height: explicit_height
-                .map(|value| Dimension::length(finite_f32(value)))
-                .unwrap_or_else(Dimension::auto),
+            width: length_dimension(content_width),
+            height: explicit_height.map_or_else(Dimension::auto, length_dimension),
         },
         min_size: TaffySize {
             width: Dimension::auto(),
-            height: min_height
-                .map(|value| Dimension::length(finite_f32(value)))
-                .unwrap_or_else(Dimension::auto),
+            height: min_height.map_or_else(Dimension::auto, length_dimension),
         },
         max_size: TaffySize {
             width: Dimension::auto(),
-            height: max_height
-                .map(|value| Dimension::length(finite_f32(value)))
-                .unwrap_or_else(Dimension::auto),
+            height: max_height.map_or_else(Dimension::auto, length_dimension),
         },
         gap: TaffySize {
-            width: used_length_percentage(
-                session.reader.style(box_idx).column_gap(),
-                content_width,
-            ),
-            height: used_length_percentage(session.reader.style(box_idx).row_gap(), content_width),
+            width: used_length_percentage(used.column_gap(), content_width),
+            height: used_length_percentage(used.row_gap(), content_width),
         },
         align_items: item_alignment(source.align_items, rtl && !inline_main),
         align_content: content_alignment(source.align_content, kind, false, rtl && !inline_main),
         justify_content: content_alignment(source.justify_content, kind, true, rtl && inline_main),
         flex_direction: match source.flex_direction {
-            html_style_model::FlexDirection::Row => TaffyFlexDirection::Row,
-            html_style_model::FlexDirection::RowReverse => TaffyFlexDirection::RowReverse,
-            html_style_model::FlexDirection::Column => TaffyFlexDirection::Column,
-            html_style_model::FlexDirection::ColumnReverse => TaffyFlexDirection::ColumnReverse,
+            FlexDirection::Row => TaffyFlexDirection::Row,
+            FlexDirection::RowReverse => TaffyFlexDirection::RowReverse,
+            FlexDirection::Column => TaffyFlexDirection::Column,
+            FlexDirection::ColumnReverse => TaffyFlexDirection::ColumnReverse,
         },
         flex_wrap: match source.flex_wrap {
-            html_style_model::FlexWrap::NoWrap => TaffyFlexWrap::NoWrap,
-            html_style_model::FlexWrap::Wrap => TaffyFlexWrap::Wrap,
-            html_style_model::FlexWrap::WrapReverse => TaffyFlexWrap::WrapReverse,
+            FlexWrap::NoWrap => TaffyFlexWrap::NoWrap,
+            FlexWrap::Wrap => TaffyFlexWrap::Wrap,
+            FlexWrap::WrapReverse => TaffyFlexWrap::WrapReverse,
         },
         justify_items: item_alignment(source.justify_items, rtl),
         grid_template_rows: grid_template_rows
@@ -223,7 +230,7 @@ pub(super) fn taffy_item_style(
         .map(|parent| {
             matches!(
                 layout_style(session, parent).flex_direction,
-                html_style_model::FlexDirection::Row | html_style_model::FlexDirection::RowReverse
+                FlexDirection::Row | FlexDirection::RowReverse
             )
         })
         .unwrap_or(true);
@@ -242,32 +249,25 @@ pub(super) fn taffy_item_style(
         };
         let border_size = (basis - margin).max(padding_border);
         let specified = match style.box_sizing() {
-            html_style_model::BoxSizing::ContentBox => (border_size - padding_border).max(0.0),
-            html_style_model::BoxSizing::BorderBox => border_size,
+            BoxSizing::ContentBox => (border_size - padding_border).max(0.0),
+            BoxSizing::BorderBox => border_size,
         };
-        Some(Dimension::length(finite_f32(specified)))
+        Some(length_dimension(specified))
     };
     let intrinsic_block_dimension = || {
         intrinsic_block_size
             .map(|border_size| match style.box_sizing() {
-                html_style_model::BoxSizing::ContentBox => {
+                BoxSizing::ContentBox => {
                     (border_size - box_model.vertical_padding_border()).max(0.0)
                 }
-                html_style_model::BoxSizing::BorderBox => {
+                BoxSizing::BorderBox => {
                     border_size.max(box_model.vertical_padding_border())
                 }
             })
-            .map(finite_f32)
-            .map(Dimension::length)
+            .map(length_dimension)
     };
     let taffy_handles_absolute_grid_item = kind == TaffyContainerKind::Grid
-        && style.position() == PositionMode::Absolute
-        && session.reader.get_parent(box_idx).is_some_and(|parent| {
-            matches!(
-                session.reader.style(parent).width(),
-                PreferredSize::MinContent | PreferredSize::MaxContent | PreferredSize::FitContent
-            )
-        });
+        && style.position() == PositionMode::Absolute;
     let taffy_handles_absolute_flex_item =
         kind == TaffyContainerKind::Flex && style.position() == PositionMode::Absolute;
     let taffy_handles_absolute_item =
@@ -280,9 +280,9 @@ pub(super) fn taffy_item_style(
         taffy_handles_absolute_grid_item && percentage_width_is_grid_area_stretch;
     let percentage_height_is_grid_area_stretch =
         grid_percentage_height_is_stretch_equivalent(session, box_idx, kind);
-    let width = if percentage_width_is_grid_area_stretch {
-        Dimension::auto()
-    } else if intrinsic_inline_sizing && style.width().percentage_dependent() {
+    let width = if percentage_width_is_grid_area_stretch
+        || (intrinsic_inline_sizing && style.width().percentage_dependent())
+    {
         // A cyclic percentage cross size is auto while finding a flex
         // container's intrinsic inline size. Leaving it as a percentage lets
         // the eventual container width feed back into its own contribution.
@@ -318,21 +318,20 @@ pub(super) fn taffy_item_style(
             intrinsic_inline_sizing,
         )
     };
-    let mut min_width = if kind == TaffyContainerKind::Flex
+    let mut min_width = if (kind == TaffyContainerKind::Flex
         && !horizontal_main_axis
-        && matches!(style.width(), PreferredSize::Stretch)
+        && matches!(style.width(), PreferredSize::Stretch))
+        || matches!(style.min_width(), PreferredSize::Stretch)
     {
         // A wrapped column flex line may grow wider than its container. The
         // stretch size is therefore a floor during line measurement, not a
         // definite preferred width.
         stretch_dimension(Some(containing_width), true).unwrap_or_else(Dimension::auto)
-    } else if matches!(style.min_width(), PreferredSize::Stretch) {
-        stretch_dimension(Some(containing_width), true).unwrap_or_else(Dimension::auto)
     } else if kind == TaffyContainerKind::Flex
         && horizontal_main_axis
         && matches!(style.min_width(), PreferredSize::Auto)
     {
-        Dimension::length(finite_f32(
+        length_dimension(
             flex_replaced_automatic_minimum(
                 session,
                 box_idx,
@@ -343,7 +342,7 @@ pub(super) fn taffy_item_style(
             .unwrap_or_else(|| {
                 flex_automatic_min_content_width(session, box_idx, containing_width)
             }),
-        ))
+        )
     } else if kind == TaffyContainerKind::Grid
         && matches!(style.width(), PreferredSize::FitContent)
         && matches!(style.min_width(), PreferredSize::Auto)
@@ -378,7 +377,7 @@ pub(super) fn taffy_item_style(
             box_idx,
             (containing_height - item_cross_inset).max(0.0),
         ) {
-            min_width = Dimension::length(finite_f32(width));
+            min_width = length_dimension(width);
         }
     }
     let intrinsic_height_constraint = |value| {
@@ -411,12 +410,11 @@ pub(super) fn taffy_item_style(
             intrinsic_min_height,
             intrinsic_max_height,
         )
-        .map(finite_f32)
-        .map(Dimension::length)
+        .map(length_dimension)
         .unwrap_or_else(|| dimension(style.height()))
     };
     let mut min_height = if let Some(value) = intrinsic_min_height {
-        Dimension::length(finite_f32(value))
+        length_dimension(value)
     } else if kind == TaffyContainerKind::Flex
         && !horizontal_main_axis
         && matches!(style.min_height(), PreferredSize::Auto)
@@ -434,8 +432,7 @@ pub(super) fn taffy_item_style(
                 containing_height,
                 false,
             )
-            .map(finite_f32)
-            .map(Dimension::length)
+            .map(length_dimension)
             .or_else(intrinsic_block_dimension)
             .unwrap_or_else(Dimension::auto)
         }
@@ -462,8 +459,7 @@ pub(super) fn taffy_item_style(
         max_width = stretch_dimension(Some(containing_width), true).unwrap_or_else(Dimension::auto);
     }
     let mut max_height = intrinsic_max_height
-        .map(finite_f32)
-        .map(Dimension::length)
+        .map(length_dimension)
         .unwrap_or_else(|| match style.max_height() {
             PreferredSize::MinContent | PreferredSize::MaxContent | PreferredSize::FitContent => {
                 intrinsic_block_dimension().unwrap_or_else(Dimension::auto)
@@ -473,16 +469,7 @@ pub(super) fn taffy_item_style(
             }
             value => dimension(value),
         });
-    let parent_alignment = session
-        .reader
-        .get_parent(box_idx)
-        .map(|parent| layout_style(session, parent).align_items)
-        .unwrap_or(ItemAlignment::Normal);
-    let effective_alignment = if layout.align_self == ItemAlignment::Auto {
-        parent_alignment
-    } else {
-        layout.align_self
-    };
+    let effective_alignment = effective_align_self(session, box_idx);
     let cross_auto_margins = if horizontal_main_axis {
         layout.margin_top_auto || layout.margin_bottom_auto
     } else {
@@ -502,34 +489,22 @@ pub(super) fn taffy_item_style(
     {
         let horizontal_inset = box_model.horizontal_padding_border();
         let vertical_inset = box_model.vertical_padding_border();
-        let constraint_to_content = |value: f32, inset: f64| match style.box_sizing() {
-            html_style_model::BoxSizing::ContentBox => value.max(0.0) as f64,
-            html_style_model::BoxSizing::BorderBox => (value.max(0.0) as f64 - inset).max(0.0),
+        let constraint_to_content = |value: PreferredSize, inset: f64, auto: f64| match value {
+            PreferredSize::Auto => Some(auto),
+            PreferredSize::Px(value) => Some(match style.box_sizing() {
+                BoxSizing::ContentBox => value.max(0.0) as f64,
+                BoxSizing::BorderBox => (value.max(0.0) as f64 - inset).max(0.0),
+            }),
+            _ => None,
         };
         let content_to_constraint = |value: f64, inset: f64| match style.box_sizing() {
-            html_style_model::BoxSizing::ContentBox => value,
-            html_style_model::BoxSizing::BorderBox => value + inset,
+            BoxSizing::ContentBox => value,
+            BoxSizing::BorderBox => value + inset,
         };
-        let min_w = match style.min_width() {
-            PreferredSize::Auto => Some(0.0),
-            PreferredSize::Px(value) => Some(constraint_to_content(value, horizontal_inset)),
-            _ => None,
-        };
-        let min_h = match style.min_height() {
-            PreferredSize::Auto => Some(0.0),
-            PreferredSize::Px(value) => Some(constraint_to_content(value, vertical_inset)),
-            _ => None,
-        };
-        let max_w = match style.max_width() {
-            PreferredSize::Auto => Some(f64::INFINITY),
-            PreferredSize::Px(value) => Some(constraint_to_content(value, horizontal_inset)),
-            _ => None,
-        };
-        let max_h = match style.max_height() {
-            PreferredSize::Auto => Some(f64::INFINITY),
-            PreferredSize::Px(value) => Some(constraint_to_content(value, vertical_inset)),
-            _ => None,
-        };
+        let min_w = constraint_to_content(style.min_width(), horizontal_inset, 0.0);
+        let min_h = constraint_to_content(style.min_height(), vertical_inset, 0.0);
+        let max_w = constraint_to_content(style.max_width(), horizontal_inset, f64::INFINITY);
+        let max_h = constraint_to_content(style.max_height(), vertical_inset, f64::INFINITY);
         if let (Some(min_w), Some(min_h), Some(max_w), Some(max_h)) = (min_w, min_h, max_w, max_h)
             && intrinsic.width > 0.0
             && intrinsic.height > 0.0
@@ -542,23 +517,23 @@ pub(super) fn taffy_item_style(
                 .min(1.0);
             if grow <= 1.0 || shrink >= 1.0 {
                 if grow > 1.0 {
-                    min_width = Dimension::length(finite_f32(content_to_constraint(
+                    min_width = length_dimension(content_to_constraint(
                         intrinsic.width * grow,
                         horizontal_inset,
-                    )));
-                    min_height = Dimension::length(finite_f32(content_to_constraint(
+                    ));
+                    min_height = length_dimension(content_to_constraint(
                         intrinsic.height * grow,
                         vertical_inset,
-                    )));
+                    ));
                 } else if shrink < 1.0 {
-                    max_width = Dimension::length(finite_f32(content_to_constraint(
+                    max_width = length_dimension(content_to_constraint(
                         intrinsic.width * shrink,
                         horizontal_inset,
-                    )));
-                    max_height = Dimension::length(finite_f32(content_to_constraint(
+                    ));
+                    max_height = length_dimension(content_to_constraint(
                         intrinsic.height * shrink,
                         vertical_inset,
-                    )));
+                    ));
                 }
             }
         }
@@ -571,8 +546,8 @@ pub(super) fn taffy_item_style(
         && style.width().percentage_dependent())
     .then(|| {
         let ratio = aspect_ratio?;
-        let (_, max_content_width) = crate::layout::box_content_intrinsic_widths(session, box_idx);
-        (ratio > 0.0).then(|| Dimension::length(finite_f32(max_content_width / f64::from(ratio))))
+        let (_, max_content_width) = crate::layout::box_content_intrinsic_widths(session, box_idx, None);
+        (ratio > 0.0).then(|| length_dimension(max_content_width / f64::from(ratio)))
     })
     .flatten();
     Style {
@@ -615,31 +590,16 @@ pub(super) fn taffy_item_style(
             ),
         },
         box_sizing: match style.box_sizing() {
-            html_style_model::BoxSizing::ContentBox => TaffyBoxSizing::ContentBox,
-            html_style_model::BoxSizing::BorderBox => TaffyBoxSizing::BorderBox,
+            BoxSizing::ContentBox => TaffyBoxSizing::ContentBox,
+            BoxSizing::BorderBox => TaffyBoxSizing::BorderBox,
         },
         margin: Rect {
-            left: length_percentage_auto(
-                style.margin_left(),
-                layout.margin_left_auto,
-                containing_width,
-            ),
-            right: length_percentage_auto(
-                style.margin_right(),
-                layout.margin_right_auto,
-                containing_width,
-            ),
-            top: length_percentage_auto(
-                style.margin_top(),
-                layout.margin_top_auto,
-                containing_width,
-            ),
-            bottom: length_percentage_auto(
-                style.margin_bottom(),
-                layout.margin_bottom_auto,
-                containing_width,
-            ),
-        },
+            left: (style.margin_left(), layout.margin_left_auto),
+            right: (style.margin_right(), layout.margin_right_auto),
+            top: (style.margin_top(), layout.margin_top_auto),
+            bottom: (style.margin_bottom(), layout.margin_bottom_auto),
+        }
+        .map(|(value, auto)| length_percentage_auto(value, auto, containing_width)),
         padding: Rect {
             left: used_length_percentage(style.padding_left(), containing_width),
             right: used_length_percentage(style.padding_right(), containing_width),

@@ -1,0 +1,14 @@
+[package]
+name = "html-gpui-fragment-example"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# A separate consumer workspace: no Bokheim or reader dependencies.
+[workspace]
+resolver = "3"
+
+[dependencies]
+html-gpui = { path = "../../html-gpui" }
+gpui = { path = "../../../../GPUI-Fork/crates/gpui", default-features = false, features = ["font-kit", "wayland", "x11", "windows-manifest"] }
+gpui_platform = { path = "../../../../GPUI-Fork/crates/gpui_platform", features = ["font-kit", "wayland", "x11"] }

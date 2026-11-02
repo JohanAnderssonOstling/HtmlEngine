@@ -4,6 +4,7 @@ use crate::{
 use html_dom::{
     Document, DocumentBuildError, DocumentBuilder, DocumentMode, DomAttribute,
     DomElementAttributeCache, DomElementData, DomNodeId, ImageResource, ImageSource, Rootless,
+    write_escaped_xml,
 };
 use std::sync::Arc;
 
@@ -15,7 +16,7 @@ pub fn parse_dom_document(html: &str) -> Result<Document, DocumentBuildError> {
 pub fn build_dom_document(parsed: &ParsedHtml) -> Result<Document, DocumentBuildError> {
     let mode = match parsed.syntax {
         MarkupSyntax::Html => DocumentMode::Html,
-        MarkupSyntax::Xml => DocumentMode::Xml,
+        MarkupSyntax::Xhtml | MarkupSyntax::Xml => DocumentMode::Xml,
     };
     build_dom_from_syntax_tree(&parsed.document, mode)
 }
@@ -23,7 +24,7 @@ pub fn build_dom_document(parsed: &ParsedHtml) -> Result<Document, DocumentBuild
 pub(crate) fn build_dom_document_owned(parsed: ParsedHtml) -> Result<Document, DocumentBuildError> {
     let mode = match parsed.syntax {
         MarkupSyntax::Html => DocumentMode::Html,
-        MarkupSyntax::Xml => DocumentMode::Xml,
+        MarkupSyntax::Xhtml | MarkupSyntax::Xml => DocumentMode::Xml,
     };
     let Some(root) = parsed
         .document
@@ -139,45 +140,41 @@ fn build_dom_syntax_element_data<State>(
         && element.namespace.as_deref() == Some("http://www.w3.org/2000/svg");
     let is_mathml = element.local_name == "math"
         && element.namespace.as_deref() == Some("http://www.w3.org/1998/Math/MathML");
-    let image_idx = if is_mathml {
-        Some(document.push_image(ImageResource {
-            source: ImageSource::MathMl {
-                markup: serialize_foreign_syntax_element(element).into(),
-                svg: Arc::from([]),
-                baseline: 1.0,
-            },
-            width: 0,
-            height: 0,
-            width_attr: None,
-            height_attr: None,
-        }))
+    let image_source = if is_mathml {
+        Some(ImageSource::MathMl {
+            markup: serialize_foreign_syntax_element(element).into(),
+            svg: Arc::from([]),
+            baseline: 1.0,
+        })
     } else if is_inline_svg {
-        let bytes: Arc<[u8]> = serialize_foreign_syntax_element(element).into_bytes().into();
-        Some(document.push_image(ImageResource {
-            source: ImageSource::InlineSvg {
-                bytes,
-                base_uri: String::new(),
-            },
-            width: 0,
-            height: 0,
-            width_attr: None,
-            height_attr: None,
-        }))
+        Some(ImageSource::InlineSvg {
+            bytes: serialize_foreign_syntax_element(element)
+                .into_bytes()
+                .into(),
+            base_uri: String::new(),
+        })
     } else if matches!(element.local_name.as_str(), "img" | "image") {
         source
-            .filter(|source| !source.trim().is_empty())
-            .map(|source| {
-                document.push_image(ImageResource {
-                    source: ImageSource::Uri(source.trim().to_owned()),
-                    width: 0,
-                    height: 0,
-                    width_attr: width,
-                    height_attr: height,
-                })
-            })
+            .map(str::trim)
+            .filter(|source| !source.is_empty())
+            .map(|source| ImageSource::Uri(source.to_owned()))
     } else {
         None
     };
+    let image_idx = image_source.map(|source| {
+        let (width_attr, height_attr) = if is_mathml || is_inline_svg {
+            (None, None)
+        } else {
+            (width, height)
+        };
+        document.push_image(ImageResource {
+            source,
+            width: 0,
+            height: 0,
+            width_attr,
+            height_attr,
+        })
+    });
     let attributes = element
         .attributes
         .iter()
@@ -205,7 +202,7 @@ fn serialize_foreign_syntax_element(element: &HtmlSyntaxElement) -> String {
         output.push(' ');
         output.push_str(name);
         output.push_str("=\"");
-        output.push_str(&quick_xml::escape::escape(value));
+        write_escaped_xml(output, value);
         output.push('"');
     }
 
@@ -214,7 +211,7 @@ fn serialize_foreign_syntax_element(element: &HtmlSyntaxElement) -> String {
             HtmlSyntaxNode::Element(element) => {
                 push_element(output, element, default_namespace)
             }
-            HtmlSyntaxNode::Text(text) => output.push_str(&quick_xml::escape::escape(text)),
+            HtmlSyntaxNode::Text(text) => write_escaped_xml(output, text),
             HtmlSyntaxNode::Comment(comment) => {
                 output.push_str("<!--");
                 output.push_str(comment);

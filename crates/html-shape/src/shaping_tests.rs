@@ -3,12 +3,13 @@ mod tests {
     use crate::{GlyphRequest, ShapedGlyph};
 
     use super::{
-        BoxFontMetrics, CharacterPlacement, FontSlant, RequiredFontMetrics, ShapedFontMetrics,
+        BoxFontMetrics, CharacterPlacement, FontSlant, RequiredFontMetrics, ResolvedBidi, ShapedFontMetrics,
         ShapedLine, ShapedTextGeometry, ShapedTextRun, TextRunShapeRequest, TextShapeRequest,
         TextStyleSpan, collapse_whitespace, first_letter_overrides_with_characters,
         first_letter_style_overrides, is_css_collapsible_space, plan_shaping_spans, transform_text,
     };
     use crate::parser::DocumentFactory;
+    use std::cell::Cell;
     use std::sync::Arc;
 
     fn planned_spans(html: &str, css: Option<&str>) -> Vec<(String, Vec<u32>)> {
@@ -31,18 +32,23 @@ mod tests {
             &content,
             &overrides,
             &metrics,
+            &ResolvedBidi::new(prepared.test_styles(), prepared.layout_tree(), &content),
         )
         .into_iter()
         .map(|span| {
             let text = span
                 .character_indices()
-                .filter_map(|index| {
-                    content
-                        .character_at(index as usize)
-                        .and_then(char::from_u32)
-                })
+                .filter_map(|index| content.character_at(index as usize))
                 .collect();
-            let colors = span.paint_colors(prepared.test_styles(), prepared.layout_tree());
+            let (colors, _) =
+                span.paint_and_placement(prepared.test_styles(), prepared.layout_tree(), &metrics);
+            let colors = colors.unwrap_or_else(|| {
+                vec![
+                    span.style(prepared.test_styles(), prepared.layout_tree())
+                        .color();
+                    span.character_count()
+                ]
+            });
             (text, colors)
         })
         .collect()
@@ -68,7 +74,7 @@ mod tests {
         let text = content
             .characters()
             .iter()
-            .filter_map(|glyph| char::from_u32(*glyph))
+            .copied()
             .collect();
         let offsets = (0..content.characters().len())
             .map(|index| content.raw_glyph_source_offset(index))
@@ -94,6 +100,43 @@ mod tests {
         );
         assert!(overrides.is_empty());
         assert_eq!(overrides.capacity(), 0);
+    }
+
+    #[test]
+    fn first_letter_selection_stops_reading_completed_roots() {
+        for length in [10, 40_000] {
+            let tail = "x".repeat(length);
+            let mut factory = DocumentFactory::new();
+            let prepared = factory.parse_with_new_pipeline(
+                &format!(
+                    "<p>“<span>A</span>!<em>\u{301}</em>{tail}</p><p><span>B</span>{tail}</p>"
+                ),
+                Some("p::first-letter {font-size:2em}"),
+            );
+            let content = prepared.inline_content();
+            let reads = Cell::new(0);
+            let overrides = first_letter_overrides_with_characters(
+                prepared.document(),
+                prepared.test_styles(),
+                prepared.layout_tree(),
+                content,
+                |index| {
+                    reads.set(reads.get() + 1);
+                    content.character_at(index as usize).unwrap()
+                },
+            );
+            let selected: String = content
+                .characters()
+                .iter()
+                .zip(overrides)
+                .filter_map(|(&character, style)| style.map(|_| character))
+                .collect();
+            assert_eq!(selected, "“A!\u{301}B");
+            assert!(
+                reads.get() <= 7,
+                "completed roots must not scan paragraph tails"
+            );
+        }
     }
 
     #[test]
@@ -135,6 +178,7 @@ mod tests {
                 &content,
                 &dense,
                 &metrics,
+                &ResolvedBidi::new(prepared.test_styles(), prepared.layout_tree(), &content),
             );
             let empty = plan_shaping_spans(
                 prepared.test_styles(),
@@ -142,12 +186,13 @@ mod tests {
                 &content,
                 &[],
                 &metrics,
+                &ResolvedBidi::new(prepared.test_styles(), prepared.layout_tree(), &content),
             );
             assert_eq!(format!("{empty:?}"), format!("{original:?}"), "{html}");
             for (before, after) in original.iter().zip(empty.iter()) {
                 assert_eq!(
-                    before.paint_colors(prepared.test_styles(), prepared.layout_tree()),
-                    after.paint_colors(prepared.test_styles(), prepared.layout_tree())
+                    before.paint_and_placement(prepared.test_styles(), prepared.layout_tree(), &metrics),
+                    after.paint_and_placement(prepared.test_styles(), prepared.layout_tree(), &metrics)
                 );
             }
         }
@@ -211,6 +256,7 @@ mod tests {
                 &empty_content,
                 &empty_overrides,
                 &metrics,
+                &ResolvedBidi::new(prepared.test_styles(), prepared.layout_tree(), &empty_content),
             );
             let dense = plan_shaping_spans(
                 prepared.test_styles(),
@@ -218,6 +264,7 @@ mod tests {
                 &dense_content,
                 &dense_overrides,
                 &metrics,
+                &ResolvedBidi::new(prepared.test_styles(), prepared.layout_tree(), &dense_content),
             );
             assert_eq!(format!("{empty:?}"), format!("{dense:?}"), "{html}");
         }
@@ -266,7 +313,7 @@ mod tests {
             text_range: 10..14,
             run: 0,
             ascent: 12.0,
-            caret_stops: Arc::from([0.0, 8.0, 15.0, 22.0, 30.0]),
+            caret_stops: [0.0, 8.0, 15.0, 22.0, 30.0].into(),
             cluster_boundaries: Arc::from([true, true, true, true, true]),
         }
     }
@@ -590,7 +637,7 @@ mod tests {
                 Arc::from([2.0, 3.0]),
                 Arc::from([true; 3]),
                 7,
-                Arc::from([0.0, 2.0, 5.0]),
+                [0.0, 2.0, 5.0].into(),
                 8.0,
             )
             .unwrap()
@@ -995,6 +1042,74 @@ mod tests {
     }
 
     #[test]
+    fn shaping_requests_preserve_uniform_and_mixed_colors_across_bidi_splits() {
+        use crate::test_support::TestGlyphShaper;
+        use crate::{GlyphResourceGeneration, GlyphResourceStore, GlyphShaper, ShapeError};
+
+        struct Recorder {
+            fallback: TestGlyphShaper,
+            requests: Vec<(String, u32, Option<Vec<u32>>)>,
+        }
+        impl GlyphShaper for Recorder {
+            fn reset(&mut self) {
+                self.fallback.reset();
+                self.requests.clear();
+            }
+            fn resource_generation(&self) -> GlyphResourceGeneration {
+                self.fallback.resource_generation()
+            }
+            fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
+                self.fallback.shape_glyph(request)
+            }
+            fn shape_text_run(
+                &mut self,
+                request: TextRunShapeRequest<'_>,
+            ) -> Result<Option<ShapedTextRun>, ShapeError> {
+                self.requests.push((
+                    request.text().to_owned(),
+                    request.style().color(),
+                    request.paint_colors().map(|colors| colors.to_vec()),
+                ));
+                Ok(None)
+            }
+        }
+
+        let black = 0x000000ff;
+        let red = 0xff0000ff;
+        for (source, expected) in [
+            (
+                "<p style='color:#123456'>of<span>fi</span>ce</p>",
+                vec![("office".to_owned(), 0x123456ff, None)],
+            ),
+            (
+                "<p style='color:black'>of<span style='color:red'>fi</span>ce</p>",
+                vec![(
+                    "office".to_owned(),
+                    black,
+                    Some(vec![black, black, red, red, black, black]),
+                )],
+            ),
+            (
+                "<p style='color:black'>a<span style='color:red'>אב</span>b</p>",
+                vec![
+                    ("a".to_owned(), black, None),
+                    ("אב".to_owned(), black, Some(vec![red, red])),
+                    ("b".to_owned(), black, None),
+                ],
+            ),
+        ] {
+            let prepared = DocumentFactory::new().parse_with_new_pipeline(source, None);
+            let mut shaper = Recorder {
+                fallback: TestGlyphShaper::new(),
+                requests: Vec::new(),
+            };
+            let mut resources = GlyphResourceStore::default();
+            prepared.shape(&mut shaper, &mut resources).unwrap();
+            assert_eq!(shaper.requests, expected, "{source}");
+        }
+    }
+
+    #[test]
     fn shaping_spans_cross_dom_and_paint_boundaries() {
         let spans = planned_spans(
             "<html><body><p>of<span style='color:red'>fi</span>ce</p></body></html>",
@@ -1148,14 +1263,22 @@ mod tests {
 
     #[test]
     fn preserved_newlines_split_runs_without_forcing_surrounding_text_to_scalar_shaping() {
-        let spans = planned_spans(
-            "<html><body><p style='white-space:pre'>of\nfice</p></body></html>",
-            None,
-        );
-        assert_eq!(
-            spans.iter().map(|span| span.0.as_str()).collect::<Vec<_>>(),
-            ["of", "\n", "fice"]
-        );
+        let cases: &[(&str, &[&str])] = &[
+            ("of\nfice", &["of", "\n", "fice"]),
+            ("\n\nof\n\nfice\n", &["\n", "\n", "of", "\n", "\n", "fice", "\n"]),
+            ("", &[]),
+        ];
+        for (text, expected) in cases {
+            let spans = planned_spans(
+                &format!("<html><body><p style='white-space:pre'>{text}</p></body></html>"),
+                None,
+            );
+            assert_eq!(
+                spans.iter().map(|span| span.0.as_str()).collect::<Vec<_>>(),
+                *expected,
+                "{text:?}",
+            );
+        }
     }
 
     #[test]

@@ -1,0 +1,14 @@
+[workspace]
+resolver = "3"
+members = ["html-gpui", "html-fonts", "gpui-image-eviction"]
+exclude = ["examples/fragment-app"]
+
+[workspace.dependencies]
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+html = { version = "0.1.0", package = "skrift", path = "../crates/html" }
+kurbo = "0.11.3"
+peniko = "0.2.0"
+quick-xml = "0.41"
+blake3 = "1"
+reqwest = { version = "0.13.5", default-features = false, features = ["charset", "http2", "system-proxy"] }
+gpui = { path = "../../GPUI-Fork/crates/gpui", version = "=0.2.2", default-features = false }

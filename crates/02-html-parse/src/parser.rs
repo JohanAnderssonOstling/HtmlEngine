@@ -1,4 +1,4 @@
-use html_dom::{Document, DocumentBuildError};
+use html_dom::{Document, DocumentBuildError, media_type_essence, uri_path};
 use html5ever::driver::{self, ParseOpts};
 use html5ever::tendril::TendrilSink;
 use html5ever::tree_builder::{QuirksMode as Html5everQuirksMode, TreeBuilderOpts};
@@ -17,7 +17,7 @@ pub struct ParsedHtml {
 }
 
 pub struct ParsedHtmlFragment {
-    document: HtmlSyntaxTree,
+    pub(crate) document: HtmlSyntaxTree,
     errors: Vec<String>,
 }
 
@@ -25,15 +25,41 @@ pub struct ParsedHtmlFragment {
 pub enum MarkupSyntax {
     #[default]
     Html,
+    /// Prefer XML semantics, recovering malformed XHTML with the HTML parser.
+    Xhtml,
     Xml,
 }
 
 impl MarkupSyntax {
+    /// Declared markup media types take precedence over the resource filename.
+    /// Missing or unrecognized types fall back to the URI extension.
+    pub fn from_resource(uri: &str, media_type: Option<&str>) -> Self {
+        match media_type.map(media_type_essence) {
+            Some(value) if value.eq_ignore_ascii_case("application/xhtml+xml") => Self::Xhtml,
+            Some(value)
+                if ["application/xml", "text/xml"]
+                    .iter()
+                    .any(|candidate| value.eq_ignore_ascii_case(candidate)) =>
+            {
+                Self::Xml
+            }
+            Some(value) if value.eq_ignore_ascii_case("text/html") => Self::Html,
+            _ => Self::from_uri(uri),
+        }
+    }
+
     pub fn from_uri(uri: &str) -> Self {
-        let path = uri.split(['?', '#']).next().unwrap_or(uri);
+        let path = uri_path(uri);
         match path.rsplit_once('.').map(|(_, extension)| extension) {
             Some(extension)
-                if ["xht", "xhtml", "xml", "svg"]
+                if ["xht", "xhtml"]
+                    .iter()
+                    .any(|candidate| extension.eq_ignore_ascii_case(candidate)) =>
+            {
+                Self::Xhtml
+            }
+            Some(extension)
+                if ["xml", "svg"]
                     .iter()
                     .any(|candidate| extension.eq_ignore_ascii_case(candidate)) =>
             {
@@ -194,6 +220,13 @@ pub fn parse_html_document_with_options(html: &str, options: HtmlParserOptions) 
 pub fn parse_document(source: &str, syntax: MarkupSyntax) -> Result<ParsedHtml, XmlParseError> {
     match syntax {
         MarkupSyntax::Html => Ok(parse_html_document(source)),
+        MarkupSyntax::Xhtml => Ok(parse_xml_document(source).unwrap_or_else(|error| {
+            let mut parsed = parse_html_document(source);
+            parsed
+                .errors
+                .insert(0, format!("Recovered XHTML using HTML parsing: {error}"));
+            parsed
+        })),
         MarkupSyntax::Xml => parse_xml_document(source),
     }
 }
@@ -389,7 +422,8 @@ fn syntax_node(node: ego_tree::NodeRef<'_, Node>) -> Option<HtmlSyntaxNode> {
 #[cfg(test)]
 mod tests {
     use super::{
-        HtmlQuirksMode, MarkupSyntax, StylesheetReference, parse_html_document, parse_xml_document,
+        HtmlQuirksMode, MarkupSyntax, StylesheetReference, parse_document, parse_html_document,
+        parse_xml_document,
     };
     use crate::{DocumentTextIndex, decode_html_bytes, plain_text_from_fragment};
     use html_dom::{Document, DocumentMode, DomNodeId, ElementRef, ImageSource, NodeRef};
@@ -438,13 +472,43 @@ mod tests {
 
     #[test]
     fn selects_xml_syntax_from_xml_family_extensions() {
-        assert_eq!(MarkupSyntax::from_uri("chapter.xhtml"), MarkupSyntax::Xml);
+        assert_eq!(MarkupSyntax::from_uri("chapter.xhtml"), MarkupSyntax::Xhtml);
         assert_eq!(
             MarkupSyntax::from_uri("reference.XHT?version=1"),
-            MarkupSyntax::Xml
+            MarkupSyntax::Xhtml
         );
         assert_eq!(MarkupSyntax::from_uri("image.svg#root"), MarkupSyntax::Xml);
         assert_eq!(MarkupSyntax::from_uri("chapter.html"), MarkupSyntax::Html);
+    }
+
+    #[test]
+    fn declared_markup_types_override_extensions_and_ignore_parameters() {
+        for (uri, media_type, expected) in [
+            (
+                "chapter.html",
+                Some(" Application/XHTML+XML ; charset=utf-8"),
+                MarkupSyntax::Xhtml,
+            ),
+            (
+                "chapter.xhtml",
+                Some("TEXT/HTML; charset=utf-8"),
+                MarkupSyntax::Html,
+            ),
+            ("chapter.html", Some("text/xml"), MarkupSyntax::Xml),
+            ("chapter.xhtml?mode=html#part", None, MarkupSyntax::Xhtml),
+            (
+                "chapter.xhtml",
+                Some("application/octet-stream"),
+                MarkupSyntax::Xhtml,
+            ),
+            ("chapter.html", Some(""), MarkupSyntax::Html),
+        ] {
+            assert_eq!(
+                MarkupSyntax::from_resource(uri, media_type),
+                expected,
+                "{uri}, {media_type:?}"
+            );
+        }
     }
 
     #[test]
@@ -540,6 +604,38 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn xhtml_recovers_void_tags_and_entities_but_keeps_valid_xml_semantics() {
+        let source = "<html xmlns='http://www.w3.org/1999/xhtml'><body><img src='cover.png'><p>Romeo<br>Julieta&nbsp;&copy;</p></body></html>";
+        assert!(parse_document(source, MarkupSyntax::Xml).is_err());
+        let parsed = parse_document(source, MarkupSyntax::Xhtml).unwrap();
+        assert!(parsed.errors().any(|error| error.contains("Recovered XHTML") && error.contains("line 1, column")));
+        let document = parsed.build_dom();
+        assert_eq!(document.images().len(), 1);
+        assert!(text_content(&document, body(&document).node_id()).contains("Julieta\u{a0}©"));
+
+        let source = "<html xmlns='http://www.w3.org/1999/xhtml'><body><p><a id='page'/>After</p><svg xmlns='http://www.w3.org/2000/svg'><rect/></svg></body></html>";
+        let parsed = parse_document(source, MarkupSyntax::Xhtml).unwrap();
+        assert_eq!(parsed.errors().len(), 0);
+        let document = parsed.build_dom();
+        assert_eq!(document.mode(), DocumentMode::Xml);
+        let paragraph = child_element(&document, body(&document), "p");
+        assert!(child_element(&document, paragraph, "a").children().next().is_none());
+        let svg = child_element(&document, body(&document), "svg");
+        assert_eq!(svg.namespace(), Some("http://www.w3.org/2000/svg"));
+    }
+
+    #[test]
+    fn xml_errors_report_line_and_unicode_character_column() {
+        let source = "<html>\n<body>é</bad>\n</html>";
+        let error = parse_xml_document(source).err().unwrap();
+        assert_eq!(error.line(), 2);
+        let prefix = &source[..error.offset() as usize];
+        assert_eq!(error.column(), prefix.rsplit('\n').next().unwrap().chars().count() + 1);
+        assert!(error.to_string().contains("line 2, column"));
+        assert!(error.message().contains("bad"));
     }
 
     #[test]

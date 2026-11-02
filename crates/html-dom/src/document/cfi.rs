@@ -7,7 +7,7 @@
 //! - /4/2  = path through DOM element children (even steps only)
 //! - /1:25 = first text node child (odd step), character offset 25
 
-use super::{Document, DomNode, DomNodeId};
+use super::{Document, DomNodeId};
 
 /// Parse just the spine doc index from a CFI without needing the content document.
 pub fn parse_cfi_spine_only(cfi: &str) -> Option<usize> {
@@ -32,25 +32,23 @@ fn parse_spine_position(spine_part: &str) -> Option<usize> {
 impl Document {
     /// Find which child index this node is in its parent's children list
     pub fn get_child_index(&self, node_id: DomNodeId) -> Option<usize> {
-        let parent_idx = self.dom_nodes.get(node_id.index())?.parent()?;
-        let parent = self.dom_nodes.get(parent_idx.index())?.as_element()?;
-        parent.children.iter().position(|&child| child == node_id)
+        let parent = self.element_ref(self.get_dom_parent(node_id)?)?;
+        parent.children().position(|child| child == node_id)
     }
 
     /// Get the CFI step number for this node (counting only element siblings before it)
     /// CFI uses step indirection: step = (element_index + 1) * 2
     pub fn get_element_step(&self, node_id: DomNodeId) -> Option<usize> {
-        let parent_idx = self.dom_nodes.get(node_id.index())?.parent()?;
-        let parent = self.dom_nodes.get(parent_idx.index())?.as_element()?;
+        let parent = self.element_ref(self.get_dom_parent(node_id)?)?;
 
         let mut element_count = 0;
-        for &child_idx in &parent.children {
+        for child_idx in parent.children() {
             if child_idx == node_id {
                 // CFI step indirection: (element_index + 1) * 2
                 return Some((element_count + 1) * 2);
             }
             // Only count element nodes, not text nodes
-            if self.dom_nodes.get(child_idx.index())?.as_element().is_some() {
+            if self.is_element_node(child_idx) {
                 element_count += 1;
             }
         }
@@ -60,23 +58,20 @@ impl Document {
     /// Returns the CFI odd step for a text node within its parent element.
     /// Step = 2 * (number of preceding element siblings) + 1.
     pub fn get_text_node_step(&self, text_node_id: DomNodeId) -> Option<usize> {
-        let parent_idx = self.dom_nodes.get(text_node_id.index())?.parent()?;
-        let parent = self.dom_nodes.get(parent_idx.index())?.as_element()?;
-        let mut elem_count = 0;
-        for &child_idx in &parent.children {
-            if child_idx == text_node_id {
-                return Some(elem_count * 2 + 1);
-            }
-            if self.dom_nodes.get(child_idx.index())?.as_element().is_some() {
-                elem_count += 1;
-            }
-        }
-        None
+        let parent = self.text_ref(text_node_id)?.parent()?;
+        self.text_children_with_steps(parent)
+            .find(|(text, _)| text.node_id() == text_node_id)
+            .map(|(_, step)| step)
     }
 
     /// Finds the text node at the given CFI odd step within a parent element.
     pub fn find_text_node_by_step(&self, parent_idx: DomNodeId, text_step: usize) -> Option<DomNodeId> {
-        self.find_text_nodes_by_step(parent_idx, text_step).into_iter().next()
+        if text_step == 0 || text_step.is_multiple_of(2) {
+            return None;
+        }
+        self.text_children_with_steps(parent_idx)
+            .find(|(_, step)| *step == text_step)
+            .map(|(text, _)| text.node_id())
     }
 
     /// Returns every adjacent character-data node represented by one odd CFI
@@ -86,24 +81,10 @@ impl Document {
         if text_step == 0 || text_step.is_multiple_of(2) {
             return Vec::new();
         }
-        let target_gap = (text_step - 1) / 2;
-        let Some(parent) = self.dom_nodes.get(parent_idx.index()).and_then(DomNode::as_element) else {
-            return Vec::new();
-        };
-        let mut elem_count = 0;
-        let mut result = Vec::new();
-        for &child_idx in &parent.children {
-            let Some(child) = self.dom_nodes.get(child_idx.index()) else { continue };
-            match child {
-                DomNode::Element(_) => elem_count += 1,
-                DomNode::Text(_) => {
-                    if elem_count == target_gap {
-                        result.push(child_idx);
-                    }
-                }
-            }
-        }
-        result
+        self.text_children_with_steps(parent_idx)
+            .filter(|(_, step)| *step == text_step)
+            .map(|(text, _)| text.node_id())
+            .collect()
     }
 
     /// Get all DOM nodes in the path from root to the given node
@@ -129,29 +110,14 @@ impl Document {
         let mut current = self.dom_root?;
 
         for &step in steps {
-            let element = self.dom_nodes.get(current.index())?.as_element()?;
-
-            // Convert CFI step to element index: (step / 2) - 1
-            if step == 0 || step % 2 != 0 {
-                // Odd steps point to text nodes, which we don't navigate through
+            if step == 0 || !step.is_multiple_of(2) {
                 return None;
             }
-            let target_element_index = (step / 2) - 1;
-
-            // Count element children to find the target
-            let mut element_count = 0;
-            let mut found = None;
-            for &child_idx in &element.children {
-                if self.dom_nodes.get(child_idx.index())?.as_element().is_some() {
-                    if element_count == target_element_index {
-                        found = Some(child_idx);
-                        break;
-                    }
-                    element_count += 1;
-                }
-            }
-
-            current = found?;
+            current = self
+                .element_ref(current)?
+                .child_elements()
+                .nth(step / 2 - 1)?
+                .node_id();
         }
 
         Some(current)

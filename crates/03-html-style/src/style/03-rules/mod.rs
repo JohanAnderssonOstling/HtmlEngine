@@ -1,5 +1,4 @@
-//! Stage 3: conditional-rule evaluation and effective-rule preparation.
-
-pub mod media;
-pub mod prepared;
-pub mod program;
+//! Compile native CSS into document-independent rule and selector data.
+pub(crate) mod compiler;
+pub(crate) mod prepared;
+mod selectors;

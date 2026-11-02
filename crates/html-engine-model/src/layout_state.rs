@@ -1,5 +1,7 @@
 use super::glyph_line_indices::GlyphLineIndices;
 use super::grouped_arena::GroupedArena;
+use super::paint_program::PaintLayers;
+use super::text_fragments::{LineTextFragments, OwnedTextFragments, TextFragmentStore};
 use html_dom::MemoryUsageReport;
 use html_style_model::UsedBorderRadii;
 use kurbo::{Point, Rect, Size};
@@ -17,25 +19,57 @@ pub struct LayoutState {
     pub semantic_indexes: SemanticIndexes,
 }
 
+/// Identity of an emitted line within one published layout. Spatial and paint
+/// traversals never change it; a new layout pass may assign different IDs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct LineId(u32);
+
+impl LineId {
+    pub fn new(index: usize) -> Self {
+        let raw = u32::try_from(index).expect("line identity capacity exhausted");
+        assert_ne!(
+            raw,
+            u32::MAX,
+            "line identity collides with the absent-line sentinel"
+        );
+        Self(raw)
+    }
+
+    pub fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
 #[derive(Default, Clone)]
 pub struct LineOutput {
+    /// Emission-order storage. Its indexes are stable line IDs, not spatial ranks.
     pub lines: Vec<Line>,
+    /// Stable IDs sorted by nominal bottom edge for pagination and viewport lookup.
+    pub spatial_order: Vec<LineId>,
+    /// Inverse spatial traversal, indexed by stable line ID.
+    pub spatial_ranks: Vec<u32>,
+    /// Pagination traversal packs each explicit attachment group together;
+    /// unrelated spatially interleaved lines retain independent membership.
+    pub pagination_order: Vec<LineId>,
+    pub pagination_ranks: Vec<u32>,
+    pub pagination_groups: Vec<LinePaginationGroup>,
+    pub pagination_anchors: Vec<LinePaginationAnchor>,
+    /// Group starts sorted by document-space origin for exact continuation lookup.
+    pub pagination_origins: Vec<u32>,
+    /// Stable carrier-line bounds for each box and its descendants. Empty
+    /// boxes use an empty range; images and inline spans retain their carriers.
+    pub box_line_ranges: Vec<Range<u32>>,
     /// Uncommon paint/inline data is retained only for lines that need it.
     pub line_details: Vec<LineDetails>,
-    pub text_fragments: Vec<LineTextFragment>,
-    /// Line indexes in CSS paint order. Physical line storage remains sorted
-    /// by document geometry so pagination and viewport lookup can use it.
-    pub paint_order_indices: Vec<u32>,
-    /// Inverse of `paint_order_indices`: CSS paint rank for each spatial line
-    /// index. Page composition uses this to order only its visible lines
-    /// instead of rescanning the document-wide paint traversal.
+    pub text_fragments: TextFragmentStore,
+    /// Stable line IDs in CSS paint order, independent of spatial traversal.
+    pub paint_order_indices: Vec<LineId>,
+    /// CSS paint rank indexed by stable line ID, for ordering visible lines.
     pub paint_order_ranks: Vec<u32>,
     /// Contiguous non-text inline fragment arena. Each line owns a range into
     /// this buffer, avoiding one heap allocation per non-trivial line.
     pub inline_box_fragments: Vec<LineInlineBoxFragment>,
-    pub positioned_layers: Vec<bool>,
-    pub negative_positioned_layers: Vec<bool>,
-    pub independent_positioned_layers: Vec<bool>,
+    pub paint_layers: Vec<PaintLayers>,
     /// Sparse resolved overflow clips, indexed by line. Empty for the common
     /// case where every box uses `overflow: visible`.
     pub line_clips: Vec<Option<OverflowClip>>,
@@ -52,15 +86,35 @@ pub struct LineOutput {
     pub hyphen_fragments: Vec<HyphenFragment>,
 }
 
+#[derive(Clone)]
+pub struct LinePaginationGroup {
+    /// Explicit members in `pagination_order`, independent of spatial ranges.
+    pub members: Range<u32>,
+    pub point: Point,
+    pub bounds: Range<f64>,
+}
+
+#[derive(Clone, Copy)]
+pub struct LinePaginationAnchor {
+    pub marker: LineId,
+    pub source: LineId,
+}
+
 #[derive(Default, Clone)]
 pub struct FragmentOutput {
     /// Combined CSS traversal for consumers that paint a complete scene.
     pub scene_paint_order: Vec<ScenePaintItem>,
+    /// Inverse indexes let partial surfaces replay visible items without
+    /// scanning the complete document's CSS stream every frame.
+    pub scene_line_ranks: Vec<u32>,
+    pub scene_decoration_ranks: Vec<u32>,
     pub decorations: DecorationStore,
     /// Owning line for inline decorations, or `u32::MAX` for block and
     /// line-independent fragments. Renderers must not infer this relationship
     /// from decoration geometry.
     pub decoration_line_indices: Vec<u32>,
+    /// Owning box for each block decoration, retained across paint replay.
+    pub block_decoration_owners: Vec<u32>,
     /// Sparse source-token order for line-owned inline decorations. Block and
     /// line-independent decorations use `u32::MAX`.
     pub decoration_paint_orders: Vec<u32>,
@@ -68,9 +122,7 @@ pub struct FragmentOutput {
     /// owning line. Line-owned backgrounds and borders replay with the line
     /// instead of in the document-wide block-decoration phase.
     pub decoration_fragments_by_line: GroupedArena<usize>,
-    pub decoration_positioned_layers: Vec<bool>,
-    pub decoration_negative_positioned_layers: Vec<bool>,
-    pub decoration_independent_positioned_layers: Vec<bool>,
+    pub decoration_paint_layers: Vec<PaintLayers>,
     /// Semantic block-paint traversal. Recursive formatting emits block
     /// fragments postorder; these ranges provide preorder traversal without
     /// flattening or physically reordering fragment storage.
@@ -106,55 +158,69 @@ impl LayoutState {
             "LayoutState.paint_program",
             self.paint_program.memory_usage_report(),
         );
-        report.add_slice_storage::<Line>(
+        report.add_vec_storage(
             "LayoutState.line_output.lines.storage",
-            self.line_output.lines.capacity(),
-            self.line_output.lines.len(),
+            &self.line_output.lines,
         );
-        report.add_slice_storage::<LineDetails>(
+        report.add_vec_storage(
             "LayoutState.line_output.line_details.storage",
-            self.line_output.line_details.capacity(),
-            self.line_output.line_details.len(),
+            &self.line_output.line_details,
         );
-        report.add_slice_storage::<LineTextFragment>(
-            "LayoutState.line_output.text_fragments.storage",
-            self.line_output.text_fragments.capacity(),
-            self.line_output.text_fragments.len(),
+        report.extend_prefixed(
+            "LayoutState.line_output.text_fragments",
+            self.line_output.text_fragments.memory_usage_report(),
         );
-        report.add_slice_storage::<u32>(
+        report.add_vec_storage(
+            "LayoutState.line_output.spatial_order.storage",
+            &self.line_output.spatial_order,
+        );
+        report.add_vec_storage(
+            "LayoutState.line_output.spatial_ranks.storage",
+            &self.line_output.spatial_ranks,
+        );
+        report.add_vec_storage(
+            "LayoutState.line_output.pagination_order.storage",
+            &self.line_output.pagination_order,
+        );
+        report.add_vec_storage(
+            "LayoutState.line_output.pagination_ranks.storage",
+            &self.line_output.pagination_ranks,
+        );
+        report.add_vec_storage(
+            "LayoutState.line_output.pagination_groups.storage",
+            &self.line_output.pagination_groups,
+        );
+        report.add_vec_storage(
+            "LayoutState.line_output.pagination_anchors.storage",
+            &self.line_output.pagination_anchors,
+        );
+        report.add_vec_storage(
+            "LayoutState.line_output.pagination_origins.storage",
+            &self.line_output.pagination_origins,
+        );
+        report.add_vec_storage(
+            "LayoutState.line_output.box_line_ranges.storage",
+            &self.line_output.box_line_ranges,
+        );
+        report.add_vec_storage(
             "LayoutState.line_output.paint_order_indices.storage",
-            self.line_output.paint_order_indices.capacity(),
-            self.line_output.paint_order_indices.len(),
+            &self.line_output.paint_order_indices,
         );
-        report.add_slice_storage::<u32>(
+        report.add_vec_storage(
             "LayoutState.line_output.paint_order_ranks.storage",
-            self.line_output.paint_order_ranks.capacity(),
-            self.line_output.paint_order_ranks.len(),
+            &self.line_output.paint_order_ranks,
         );
-        report.add_slice_storage::<LineInlineBoxFragment>(
+        report.add_vec_storage(
             "LayoutState.line_output.inline_box_fragments.storage",
-            self.line_output.inline_box_fragments.capacity(),
-            self.line_output.inline_box_fragments.len(),
+            &self.line_output.inline_box_fragments,
         );
-        report.add_slice_storage::<bool>(
-            "LayoutState.line_output.positioned_layers.storage",
-            self.line_output.positioned_layers.capacity(),
-            self.line_output.positioned_layers.len(),
+        report.add_vec_storage(
+            "LayoutState.line_output.paint_layers.storage",
+            &self.line_output.paint_layers,
         );
-        report.add_slice_storage::<bool>(
-            "LayoutState.line_output.negative_positioned_layers.storage",
-            self.line_output.negative_positioned_layers.capacity(),
-            self.line_output.negative_positioned_layers.len(),
-        );
-        report.add_slice_storage::<bool>(
-            "LayoutState.line_output.independent_positioned_layers.storage",
-            self.line_output.independent_positioned_layers.capacity(),
-            self.line_output.independent_positioned_layers.len(),
-        );
-        report.add_slice_storage::<Option<OverflowClip>>(
+        report.add_vec_storage(
             "LayoutState.line_output.line_clips.storage",
-            self.line_output.line_clips.capacity(),
-            self.line_output.line_clips.len(),
+            &self.line_output.line_clips,
         );
         report.extend_prefixed(
             "LayoutState.line_output.glyph_line_indices",
@@ -168,59 +234,58 @@ impl LayoutState {
             "LayoutState.line_output.line_glyph_advances",
             self.line_output.line_glyph_advances.memory_usage_report(),
         );
-        report.add_slice_storage::<PreparedTextRunFragment>(
+        report.add_vec_storage(
             "LayoutState.line_output.prepared_text_run_fragments.storage",
-            self.line_output.prepared_text_run_fragments.capacity(),
-            self.line_output.prepared_text_run_fragments.len(),
+            &self.line_output.prepared_text_run_fragments,
         );
-        report.add_slice_storage::<EllipsisFragment>(
+        report.add_vec_storage(
             "LayoutState.line_output.ellipsis_fragments.storage",
-            self.line_output.ellipsis_fragments.capacity(),
-            self.line_output.ellipsis_fragments.len(),
+            &self.line_output.ellipsis_fragments,
         );
-        report.add_slice_storage::<HyphenFragment>(
+        report.add_vec_storage(
             "LayoutState.line_output.hyphen_fragments.storage",
-            self.line_output.hyphen_fragments.capacity(),
-            self.line_output.hyphen_fragments.len(),
+            &self.line_output.hyphen_fragments,
         );
-        report.add_slice_storage::<ScenePaintItem>(
+        report.add_vec_storage(
             "LayoutState.fragment_output.scene_paint_order.storage",
-            self.fragment_output.scene_paint_order.capacity(),
-            self.fragment_output.scene_paint_order.len(),
+            &self.fragment_output.scene_paint_order,
+        );
+        report.add_vec_storage(
+            "LayoutState.fragment_output.scene_line_ranks.storage",
+            &self.fragment_output.scene_line_ranks,
+        );
+        report.add_vec_storage(
+            "LayoutState.fragment_output.scene_decoration_ranks.storage",
+            &self.fragment_output.scene_decoration_ranks,
         );
         report.add_slice_storage::<DecorationFragment>(
             "LayoutState.fragment_output.decorations.storage",
             self.fragment_output.decorations.fragment_capacity(),
             self.fragment_output.decorations.len(),
         );
-        report.add_slice_storage::<u32>(
+        report.add_vec_storage(
             "LayoutState.fragment_output.block_decoration_indices_by_y.storage",
-            self.fragment_output
-                .block_decoration_indices_by_y
-                .capacity(),
-            self.fragment_output.block_decoration_indices_by_y.len(),
+            &self.fragment_output.block_decoration_indices_by_y,
         );
-        report.add_slice_storage::<f64>(
+        report.add_vec_storage(
             "LayoutState.fragment_output.block_decoration_prefix_max_y1.storage",
-            self.fragment_output
-                .block_decoration_prefix_max_y1
-                .capacity(),
-            self.fragment_output.block_decoration_prefix_max_y1.len(),
+            &self.fragment_output.block_decoration_prefix_max_y1,
         );
-        report.add_slice_storage::<u32>(
+        report.add_vec_storage(
             "LayoutState.fragment_output.block_decoration_paint_ranks.storage",
-            self.fragment_output.block_decoration_paint_ranks.capacity(),
-            self.fragment_output.block_decoration_paint_ranks.len(),
+            &self.fragment_output.block_decoration_paint_ranks,
         );
-        report.add_slice_storage::<u32>(
+        report.add_vec_storage(
             "LayoutState.fragment_output.decoration_line_indices.storage",
-            self.fragment_output.decoration_line_indices.capacity(),
-            self.fragment_output.decoration_line_indices.len(),
+            &self.fragment_output.decoration_line_indices,
         );
-        report.add_slice_storage::<u32>(
+        report.add_vec_storage(
+            "LayoutState.fragment_output.block_decoration_owners.storage",
+            &self.fragment_output.block_decoration_owners,
+        );
+        report.add_vec_storage(
             "LayoutState.fragment_output.decoration_paint_orders.storage",
-            self.fragment_output.decoration_paint_orders.capacity(),
-            self.fragment_output.decoration_paint_orders.len(),
+            &self.fragment_output.decoration_paint_orders,
         );
         report.extend_prefixed(
             "LayoutState.fragment_output.decoration_fragments_by_line",
@@ -228,48 +293,26 @@ impl LayoutState {
                 .decoration_fragments_by_line
                 .memory_usage_report(),
         );
-        report.add_slice_storage::<bool>(
-            "LayoutState.fragment_output.decoration_positioned_layers.storage",
-            self.fragment_output.decoration_positioned_layers.capacity(),
-            self.fragment_output.decoration_positioned_layers.len(),
+        report.add_vec_storage(
+            "LayoutState.fragment_output.decoration_paint_layers.storage",
+            &self.fragment_output.decoration_paint_layers,
         );
-        report.add_slice_storage::<bool>(
-            "LayoutState.fragment_output.decoration_negative_positioned_layers.storage",
-            self.fragment_output
-                .decoration_negative_positioned_layers
-                .capacity(),
-            self.fragment_output
-                .decoration_negative_positioned_layers
-                .len(),
-        );
-        report.add_slice_storage::<bool>(
-            "LayoutState.fragment_output.decoration_independent_positioned_layers.storage",
-            self.fragment_output
-                .decoration_independent_positioned_layers
-                .capacity(),
-            self.fragment_output
-                .decoration_independent_positioned_layers
-                .len(),
-        );
-        report.add_slice_storage::<Range<u32>>(
+        report.add_vec_storage(
             "LayoutState.fragment_output.block_paint_ranges.storage",
-            self.fragment_output.block_paint_ranges.capacity(),
-            self.fragment_output.block_paint_ranges.len(),
+            &self.fragment_output.block_paint_ranges,
         );
-        report.add_slice_storage::<Option<OverflowClip>>(
+        report.add_vec_storage(
             "LayoutState.fragment_output.decoration_clips.storage",
-            self.fragment_output.decoration_clips.capacity(),
-            self.fragment_output.decoration_clips.len(),
+            &self.fragment_output.decoration_clips,
         );
         report.add_slice_storage::<RoundedDecoration>(
             "LayoutState.fragment_output.decorations.rounded_storage",
             self.fragment_output.decorations.rounded_capacity(),
             self.fragment_output.decorations.rounded_len(),
         );
-        report.add_slice_storage::<ImageFragment>(
+        report.add_vec_storage(
             "LayoutState.fragment_output.image_fragments.storage",
-            self.fragment_output.image_fragments.capacity(),
-            self.fragment_output.image_fragments.len(),
+            &self.fragment_output.image_fragments,
         );
         report.extend_prefixed(
             "LayoutState.fragment_output.image_fragments_by_line",
@@ -277,10 +320,9 @@ impl LayoutState {
                 .image_fragments_by_line
                 .memory_usage_report(),
         );
-        report.add_slice_storage::<(u16, AnchorPosition)>(
+        report.add_hash_map_storage(
             "LayoutState.semantic_indexes.anchor_positions.storage",
-            self.semantic_indexes.anchor_positions.capacity(),
-            self.semantic_indexes.anchor_positions.len(),
+            &self.semantic_indexes.anchor_positions,
         );
         report
     }
@@ -296,6 +338,19 @@ pub struct OverflowClip {
     pub y: bool,
 }
 
+impl OverflowClip {
+    /// Intersect a rectangle with the constrained axes. A disjoint result has
+    /// zero area, while an unconstrained axis retains the supplied bounds.
+    pub fn apply_to(self, rect: Rect) -> Rect {
+        rect.intersect(Rect::new(
+            if self.x { self.rect.x0 } else { rect.x0 },
+            if self.y { self.rect.y0 } else { rect.y0 },
+            if self.x { self.rect.x1 } else { rect.x1 },
+            if self.y { self.rect.y1 } else { rect.y1 },
+        ))
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct AnchorPosition {
     pub y: f64,
@@ -309,6 +364,9 @@ pub struct Line {
     /// walking every box or text run in the document.
     pub owner_box_idx: u32,
     pub glyphs: Range<u32>,
+    /// Every source glyph in `glyphs` belongs to this line's text fragments.
+    /// This cached proof permits a direct ownership fill even for RTL text.
+    pub owns_glyph_range: bool,
     pub point: Point,
     pub height: f64,
     pub baseline: f64,
@@ -354,6 +412,20 @@ impl Line {
         self.details(details)
             .and_then(|details| details.text_fragments.clone())
     }
+
+    /// Plain lines have one implicit fragment; an explicit empty list has none.
+    #[inline]
+    pub fn text_fragments<'a>(
+        &self,
+        details: &[LineDetails],
+        fragments: &'a TextFragmentStore,
+    ) -> LineTextFragments<'a> {
+        match self.text_fragment_range(details) {
+            Some(range) => fragments.iter(range),
+            None => LineTextFragments::implicit(self.glyphs.clone()),
+        }
+    }
+
     pub fn inline_box_fragments(&self, details: &[LineDetails]) -> Range<u32> {
         self.details(details)
             .map_or(0..0, |details| details.inline_box_fragments.clone())
@@ -365,7 +437,7 @@ impl LineOutput {
         &mut self,
         optical_offset_x: f64,
         paint_color: Option<u32>,
-        text_fragments: Option<Box<[LineTextFragment]>>,
+        text_fragments: Option<OwnedTextFragments>,
         inline_box_fragments: Range<u32>,
     ) -> Option<NonZeroU32> {
         if optical_offset_x == 0.0
@@ -375,14 +447,7 @@ impl LineOutput {
         {
             return None;
         }
-        let text_fragments = text_fragments.map(|fragments| {
-            let start = u32::try_from(self.text_fragments.len())
-                .expect("line text-fragment capacity exhausted");
-            self.text_fragments.extend(Vec::from(fragments));
-            let end = u32::try_from(self.text_fragments.len())
-                .expect("line text-fragment capacity exhausted");
-            start..end
-        });
+        let text_fragments = text_fragments.map(|fragments| self.text_fragments.append(fragments));
         let index = self
             .line_details
             .len()
@@ -492,6 +557,7 @@ pub struct GlyphAdvanceRun {
 /// selection, search, or CFI addressing.
 #[derive(Clone, Copy)]
 pub struct EllipsisFragment {
+    /// Stable line storage index; spatial rank is a separate traversal.
     pub line_idx: usize,
     pub glyph: crate::GlyphId,
     pub offset: Point,
@@ -502,6 +568,7 @@ pub struct EllipsisFragment {
 /// It has no source glyph index and therefore stays outside selection/CFI data.
 #[derive(Clone, Copy)]
 pub struct HyphenFragment {
+    /// Stable line storage index; spatial rank is a separate traversal.
     pub line_idx: usize,
     pub glyph: crate::GlyphId,
     pub offset: Point,
@@ -781,6 +848,7 @@ pub struct RoundedDecoration {
 
 #[derive(Clone)]
 pub struct ImageFragment {
+    /// Stable line storage index; spatial rank is a separate traversal.
     pub line_idx: usize,
     pub image_idx: u32,
     pub box_idx: u32,

@@ -470,7 +470,7 @@ impl GlyphShaper for DirectionalShaper {
             Arc::from(vec![advance; count]),
             Arc::from(vec![true; count + 1]),
             run,
-            Arc::from(stops),
+            stops.into(),
             12.0,
         ))
     }

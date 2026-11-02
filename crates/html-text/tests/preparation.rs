@@ -85,7 +85,6 @@ fn plain(text: &PreparedText) -> String {
         .characters()
         .iter()
         .copied()
-        .map(|value| char::from_u32(value).unwrap())
         .collect()
 }
 
@@ -110,22 +109,86 @@ fn collapses_across_inline_owners_and_moves_source_items_without_copying() {
 }
 
 #[test]
+fn whitespace_remaps_empty_and_single_character_items() {
+    for (parts, expected, ranges) in [
+        (["", ""], "", [0..0, 0..0]),
+        ([" ", " "], "", [0..0, 0..0]),
+        ([" ", " a "], "a", [0..0, 0..1]),
+        ([" a ", "   "], "a", [0..1, 0..0]),
+        ([" a ", " b "], "a b", [0..2, 2..3]),
+    ] {
+        let (document, styles, structure) = inputs(InheritedText::default());
+        let mut content = InlineContent::default();
+        for (index, part) in parts.iter().enumerate() {
+            append(&mut content, index as u32 + 1, part);
+        }
+        let text = PreparedText::new(&document, &styles, &structure, content);
+        assert_eq!(plain(&text), expected, "{parts:?}");
+        assert_eq!(
+            text.content()
+                .text_runs()
+                .map(|run| run.glyphs.clone())
+                .collect::<Vec<_>>(),
+            ranges,
+            "{parts:?}"
+        );
+    }
+}
+
+#[test]
 fn case_expansion_preserves_utf16_source_correspondence() {
-    let (document, styles, structure) = inputs(InheritedText {
-        text_transform: TextTransform::Uppercase,
-        ..Default::default()
-    });
-    let mut content = InlineContent::default();
-    append(&mut content, 1, "ß😀x");
-    let text = PreparedText::new(&document, &styles, &structure, content);
-    assert_eq!(plain(&text), "SS😀X");
-    let offsets: Vec<_> = (0..4)
-        .map(|index| text.content().glyph_source_offset(index))
-        .collect();
-    assert_eq!(offsets, [Some(0), Some(0), Some(1), Some(3)]);
-    assert!(
-        matches!(&text.content().inline_items()[0].kind, InlineItemKind::Text { glyphs } if glyphs == &(0..4))
-    );
+    for (transform, expected, offsets, ranges) in [
+        (
+            TextTransform::Uppercase,
+            "SSİ😀XSS",
+            vec![0, 0, 0, 1, 3, 4, 4],
+            [0..2, 0..0, 2..7, 0..0],
+        ),
+        (
+            TextTransform::Lowercase,
+            "ßi\u{307}😀xß",
+            vec![0, 0, 0, 1, 3, 4],
+            [0..1, 0..0, 1..6, 0..0],
+        ),
+        (
+            TextTransform::Capitalize,
+            "SSİ😀Xß",
+            vec![0, 0, 0, 1, 3, 4],
+            [0..2, 0..0, 2..6, 0..0],
+        ),
+        (
+            TextTransform::None,
+            "ßİ😀xß",
+            vec![0, 0, 1, 3, 4],
+            [0..1, 0..0, 1..5, 0..0],
+        ),
+    ] {
+        let (document, styles, structure) = inputs(InheritedText {
+            text_transform: transform,
+            ..Default::default()
+        });
+        let mut content = InlineContent::default();
+        for (owner, part) in [(1, "ß"), (1, ""), (2, "İ😀xß"), (2, "")] {
+            append(&mut content, owner, part);
+        }
+        let text = PreparedText::new(&document, &styles, &structure, content);
+        assert_eq!(plain(&text), expected, "{transform:?}");
+        assert_eq!(
+            (0..text.content().characters().len())
+                .map(|index| text.content().glyph_source_offset(index).unwrap())
+                .collect::<Vec<_>>(),
+            offsets,
+            "{transform:?}"
+        );
+        assert_eq!(
+            text.content()
+                .text_runs()
+                .map(|run| run.glyphs.clone())
+                .collect::<Vec<_>>(),
+            ranges,
+            "{transform:?}"
+        );
+    }
 }
 
 #[test]

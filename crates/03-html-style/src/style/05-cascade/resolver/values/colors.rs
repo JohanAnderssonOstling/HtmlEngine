@@ -1,4 +1,4 @@
-use super::*;
+use lightningcss::values::color::{CssColor, SystemColor};
 
 pub(in crate::style::cascade::resolver) fn css_color_to_u32(
     color: &CssColor,
@@ -23,10 +23,7 @@ pub(in crate::style::cascade::resolver) fn css_color_to_u32(
 pub(in crate::style::cascade::resolver) fn rgba_to_u32(
     rgba: &lightningcss::values::color::RGBA,
 ) -> u32 {
-    ((rgba.red as u32) << 24)
-        | ((rgba.green as u32) << 16)
-        | ((rgba.blue as u32) << 8)
-        | (rgba.alpha as u32)
+    u32::from_be_bytes([rgba.red, rgba.green, rgba.blue, rgba.alpha])
 }
 
 /// Resolve CSS system colors to fixed light-theme values (the renderer has no

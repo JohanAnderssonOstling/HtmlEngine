@@ -19,10 +19,7 @@ pub(super) const INF_PENALTY: f64 = 10_000.0;
 /// Extra demerits charged when two consecutive lines differ sharply in
 /// tightness (Knuth's adjacent-fitness penalty).
 const FITNESS_PENALTY: f64 = 3000.0;
-const FLAGGED_PENALTY: f64 = 100.0;
 const PENULTIMATE_HYPHEN_PENALTY: f64 = 2_500.0;
-const EXCESSIVE_HYPHEN_RUN_PENALTY: f64 = 100_000_000.0;
-const MAX_CONSECUTIVE_HYPHENATED_LINES: u8 = 2;
 const MIN_HYPHENATED_LINE_FILL: f64 = 0.5;
 const SHORT_HYPHENATED_LINE_DEMERITS: f64 = 25_000_000.0;
 const UNDERFULL_LINE_DEMERITS: f64 = 1_000_000.0;
@@ -300,6 +297,18 @@ impl CompactBreakpoint {
         }
     }
 
+    fn next_line_totals(&self) -> (f64, f64, f64) {
+        if self.is_discretionary() {
+            (self.width, self.stretch, self.shrink)
+        } else {
+            (
+                self.width + self.discard_width,
+                self.stretch + self.discarded_stretch(),
+                self.shrink + self.discarded_shrink(),
+            )
+        }
+    }
+
     pub(super) fn discarded_stretch(&self) -> f64 {
         f64::from(self.discard_stretch)
     }
@@ -326,9 +335,97 @@ struct CompactActiveNode {
     shrink: f64,
     demerits: f64,
     fitness: i8,
-    hyphen_run: u8,
+    previous_hyphen: bool,
     // Occupies padding in the 48-byte active record.
     tracking_start: u32,
+}
+
+/// A winning slot needs only its score and the parent identifiers. The next
+/// active node takes all geometry from the current breakpoint, not its parent.
+#[derive(Clone, Copy)]
+struct CompactBestNode {
+    demerits: f64,
+    previous_path: u32,
+    previous_line: u32,
+    previous_hyphen: bool,
+}
+
+#[derive(Clone, Copy)]
+struct CompactBestParent {
+    path: u32,
+    line: u32,
+}
+
+/// Scores are the only column read while comparing a populated slot. Parent
+/// identifiers and the previous-line hyphen flag are loaded only when
+/// emitting a winning path.
+struct CompactBestNodes<const N: usize> {
+    demerits: [f64; N],
+    parents: [CompactBestParent; N],
+    hyphenated: [bool; N],
+    occupied: u16,
+}
+
+const _: () = assert!(size_of::<CompactBestNodes<4>>() <= 80);
+const _: () = assert!(size_of::<CompactBestNodes<8>>() <= 144);
+
+impl<const N: usize> CompactBestNodes<N> {
+    fn new() -> Self {
+        assert!(N <= u16::BITS as usize);
+        Self {
+            demerits: [0.0; N],
+            parents: [CompactBestParent { path: 0, line: 0 }; N],
+            hyphenated: [false; N],
+            occupied: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn consider(
+        &mut self,
+        slot: usize,
+        demerits: f64,
+        previous_path: u32,
+        previous_line: u32,
+        previous_hyphen: bool,
+    ) -> bool {
+        let bit = 1u16 << slot;
+        // Match Option::is_none_or with a strict comparison, including NaNs.
+        if self.occupied & bit == 0 || demerits < self.demerits[slot] {
+            self.occupied |= bit;
+            self.demerits[slot] = demerits;
+            self.parents[slot] = CompactBestParent {
+                path: previous_path,
+                line: previous_line,
+            };
+            self.hyphenated[slot] = previous_hyphen;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (usize, CompactBestNode)> + '_ {
+        let mut occupied = self.occupied;
+        std::iter::from_fn(move || {
+            if occupied == 0 {
+                return None;
+            }
+            // Preserve ascending bucket order while skipping empty slots.
+            let slot = occupied.trailing_zeros() as usize;
+            occupied &= occupied - 1;
+            let parent = self.parents[slot];
+            Some((
+                slot,
+                CompactBestNode {
+                    demerits: self.demerits[slot],
+                    previous_path: parent.path,
+                    previous_line: parent.line,
+                    previous_hyphen: self.hyphenated[slot],
+                },
+            ))
+        })
+    }
 }
 
 struct CompactPathNode {
@@ -347,6 +444,23 @@ pub(in crate::layout::inline) struct CompactScratch {
 }
 
 impl CompactScratch {
+    fn collect_best_breaks(&mut self, mut visit: impl FnMut(usize)) -> Option<&[usize]> {
+        let best = self.active.iter().min_by(|a, b| {
+            a.demerits
+                .partial_cmp(&b.demerits)
+                .unwrap_or(Ordering::Equal)
+        })?;
+        let mut path = best.path;
+        while path != NO_COMPACT_PATH {
+            let node = &self.paths[path as usize];
+            visit(path as usize);
+            self.breaks.push(node.breakpoint as usize);
+            path = node.previous;
+        }
+        self.breaks.reverse();
+        Some(self.breaks.as_slice())
+    }
+
     #[cfg(any(test, feature = "testing"))]
     pub(in crate::layout::inline) fn capacities(&self) -> (usize, usize, usize) {
         (self.paths.capacity(), self.active.capacity(), self.breaks.capacity())
@@ -370,37 +484,81 @@ pub(super) fn break_compact_reusing_with_tracking<'s>(breakpoints: &BreakpointSt
     }
 }
 
-fn break_compact_iter<'s>(breakpoints: impl ExactSizeIterator<Item = CompactBreakpoint> + Clone, line_width: impl Fn(usize) -> f64, tolerance: f64, ragged: bool, quality: bool, admit_tracking: &impl Fn(u32, u32, f64, f64) -> bool, scratch: &'s mut CompactScratch) -> Option<&'s [usize]> {
+fn break_compact_iter<'s>(
+    breakpoints: impl ExactSizeIterator<Item = CompactBreakpoint> + Clone,
+    line_width: impl Fn(usize) -> f64,
+    tolerance: f64,
+    ragged: bool,
+    quality: bool,
+    admit_tracking: &impl Fn(u32, u32, f64, f64) -> bool,
+    scratch: &'s mut CompactScratch,
+) -> Option<&'s [usize]> {
     if ragged {
-        if quality && break_compact_ragged_with_mode(breakpoints.clone(), &line_width, false, true, scratch).is_some() {
-            return Some(&scratch.breaks);
-        }
-        break_compact_ragged_with_mode(breakpoints, &line_width, true, quality, scratch)
+        break_compact_ragged_with_mode(breakpoints, &line_width, quality, admit_tracking, scratch)
     } else {
-        if break_compact_with_mode(breakpoints.clone(), &line_width, tolerance, false, quality, admit_tracking, scratch).is_some() {
+        if break_compact_with_mode(
+            breakpoints.clone(),
+            &line_width,
+            tolerance,
+            false,
+            quality,
+            admit_tracking,
+            scratch,
+        )
+        .is_some()
+        {
             return Some(&scratch.breaks);
         }
         #[cfg(feature = "profiling")]
         if measurements_enabled() {
             // Counterfactual probes run only after a strict failure. Their
             // choices are discarded; the original emergency pass runs last.
-            macro_rules! probe {
-                ($policy:expr) => {
-                    let _ = break_compact_with_mode_impl::<true, $policy>(
-                        breakpoints.clone(), &line_width, tolerance, false, quality, admit_tracking, scratch,
-                    );
-                };
-            }
-            probe!(1); // Micro-tracking within the existing 0.5% capacity.
-            probe!(2); // Relax the consecutive-hyphen limit only.
-            probe!(3); // Tracking and hyphen-limit relaxation together.
-            probe!(4); // Permit underfull lines only.
-            probe!(8); // Permit tight lines only.
-            probe!(12); // Both spacing relaxations, keeping the hyphen limit.
-            probe!(6); // Underfull lines and hyphen-limit relaxation.
-            probe!(10); // Tight lines and hyphen-limit relaxation.
+            let _ = break_compact_with_mode_impl::<true, 1>(
+                breakpoints.clone(),
+                &line_width,
+                tolerance,
+                false,
+                quality,
+                admit_tracking,
+                scratch,
+            ); // Micro-tracking within the existing 0.5% capacity.
+            let _ = break_compact_with_mode_impl::<true, 4>(
+                breakpoints.clone(),
+                &line_width,
+                tolerance,
+                false,
+                quality,
+                admit_tracking,
+                scratch,
+            ); // Permit underfull lines only.
+            let _ = break_compact_with_mode_impl::<true, 8>(
+                breakpoints.clone(),
+                &line_width,
+                tolerance,
+                false,
+                quality,
+                admit_tracking,
+                scratch,
+            ); // Permit tight lines only.
+            let _ = break_compact_with_mode_impl::<true, 12>(
+                breakpoints.clone(),
+                &line_width,
+                tolerance,
+                false,
+                quality,
+                admit_tracking,
+                scratch,
+            ); // Both spacing relaxations.
         }
-        break_compact_with_mode(breakpoints, &line_width, tolerance, true, quality, admit_tracking, scratch)
+        break_compact_with_mode(
+            breakpoints,
+            &line_width,
+            tolerance,
+            true,
+            quality,
+            admit_tracking,
+            scratch,
+        )
     }
 }
 
@@ -434,11 +592,28 @@ pub(super) fn break_compact_emergency_book(breakpoints: &[CompactBreakpoint], li
 /// Knuth--Plass, unused line width is intentional and becomes the badness
 /// being minimized; word spaces retain their natural advances.
 #[cfg(any(test, feature = "testing"))]
-pub(super) fn break_compact_ragged(breakpoints: &[CompactBreakpoint], line_width: impl Fn(usize) -> f64) -> Option<Vec<usize>> {
-    break_compact_reusing(&BreakpointStorage::new(breakpoints.to_vec()), line_width, 1.0, true, true, &mut CompactScratch::default()).map(<[usize]>::to_vec)
+pub(super) fn break_compact_ragged(
+    breakpoints: &[CompactBreakpoint],
+    line_width: impl Fn(usize) -> f64,
+) -> Option<Vec<usize>> {
+    break_compact_reusing(
+        &BreakpointStorage::new(breakpoints.to_vec()),
+        line_width,
+        1.0,
+        true,
+        true,
+        &mut CompactScratch::default(),
+    )
+    .map(<[usize]>::to_vec)
 }
 
-fn break_compact_ragged_with_mode<'s>(breakpoints: impl ExactSizeIterator<Item = CompactBreakpoint>, line_width: &impl Fn(usize) -> f64, allow_excessive_hyphen_run: bool, hyphenation_quality: bool, scratch: &'s mut CompactScratch) -> Option<&'s [usize]> {
+fn break_compact_ragged_with_mode<'s>(
+    breakpoints: impl ExactSizeIterator<Item = CompactBreakpoint>,
+    line_width: &impl Fn(usize) -> f64,
+    hyphenation_quality: bool,
+    admit_overhang: &impl Fn(u32, u32, f64, f64) -> bool,
+    scratch: &'s mut CompactScratch,
+) -> Option<&'s [usize]> {
     profile_scope!("lines.ragged_solver");
     scratch.paths.clear();
     scratch.active.clear();
@@ -446,8 +621,18 @@ fn break_compact_ragged_with_mode<'s>(breakpoints: impl ExactSizeIterator<Item =
     if breakpoints.len() == 0 {
         return Some(&scratch.breaks);
     }
-    let CompactScratch { paths, active, breaks } = scratch;
-    active.push(CompactActiveNode { path: NO_COMPACT_PATH, line: 0, width: 0.0, stretch: 0.0, shrink: 0.0, demerits: 0.0, fitness: 1, hyphen_run: 0, tracking_start: 0 });
+    let CompactScratch { paths, active, .. } = scratch;
+    active.push(CompactActiveNode {
+        path: NO_COMPACT_PATH,
+        line: 0,
+        width: 0.0,
+        stretch: 0.0,
+        shrink: 0.0,
+        demerits: 0.0,
+        fitness: 1,
+        previous_hyphen: false,
+        tracking_start: 0,
+    });
 
     let breakpoint_count = breakpoints.len();
     for (breakpoint_index, breakpoint) in breakpoints.enumerate() {
@@ -455,22 +640,19 @@ fn break_compact_ragged_with_mode<'s>(breakpoints: impl ExactSizeIterator<Item =
         // The first line can have a different indent. After it, candidates at
         // this breakpoint are geometrically equivalent, so retain only the
         // cheapest path in each category.
-        let mut best: [Option<(f64, CompactActiveNode, u8)>; 6] = [None; 6];
+        let mut best = CompactBestNodes::<4>::new();
         let mut kept = 0usize;
 
         for read in 0..active.len() {
             let candidate = active[read];
             let available = line_width(candidate.line as usize).max(0.0);
             let width = breakpoint.width - candidate.width + breakpoint.penalty_width();
-            let fits = width <= available + 1.0e-9;
-            let next_hyphen_run = if breakpoint.is_hyphen() {
-                candidate.hyphen_run.saturating_add(1)
-            } else {
-                0
-            };
-            let excessive_hyphen_run =
-                hyphenation_quality && next_hyphen_run > MAX_CONSECUTIVE_HYPHENATED_LINES;
-            if fits && (!excessive_hyphen_run || allow_excessive_hyphen_run) {
+            let fits = width <= available + 1.0e-9
+                || (forced && admit_overhang(
+                    candidate.tracking_start, breakpoint.line_end() as u32, available, width - available,
+                ));
+            let next_hyphen = hyphenation_quality && breakpoint.is_hyphen();
+            if fits {
                 let fill = if available > 0.0 {
                     (width / available).clamp(0.0, 1.0)
                 } else {
@@ -490,7 +672,7 @@ fn break_compact_ragged_with_mode<'s>(breakpoints: impl ExactSizeIterator<Item =
                     (remaining * 100.0).powi(2)
                 };
                 let mut demerits = candidate.demerits + line_demerits;
-                if hyphenation_quality && forced && candidate.hyphen_run > 0 {
+                if hyphenation_quality && forced && candidate.previous_hyphen {
                     demerits += PENULTIMATE_HYPHEN_PENALTY;
                 }
                 if hyphenation_quality && breakpoint.is_hyphen() {
@@ -500,51 +682,43 @@ fn break_compact_ragged_with_mode<'s>(breakpoints: impl ExactSizeIterator<Item =
                 if penalty > 0.0 && penalty < INF_PENALTY {
                     demerits += penalty * penalty;
                 }
-                if breakpoint.is_hyphen() && candidate.hyphen_run > 0 {
-                    demerits += FLAGGED_PENALTY;
-                }
-                if excessive_hyphen_run {
-                    demerits += EXCESSIVE_HYPHEN_RUN_PENALTY;
-                }
-                let bucket = usize::from(candidate.line > 0) * 3
-                    + usize::from(next_hyphen_run.min(MAX_CONSECUTIVE_HYPHENATED_LINES));
-                if best[bucket].is_none_or(|(best_demerits, _, _)| demerits < best_demerits) {
-                    best[bucket] = Some((demerits, candidate, next_hyphen_run));
-                }
+                let bucket = usize::from(candidate.line > 0) * 2 + usize::from(next_hyphen);
+                best.consider(
+                    bucket,
+                    demerits,
+                    candidate.path,
+                    candidate.line,
+                    next_hyphen,
+                );
             }
 
             if fits && !forced {
-                active[kept] = candidate;
+                // Until a candidate is dropped, survivors are already in
+                // their final slots. Avoid rewriting their full records.
+                if kept != read {
+                    active[kept] = candidate;
+                }
                 kept += 1;
             }
         }
         active.truncate(kept);
 
-        let (next_width, next_stretch, next_shrink) = if breakpoint.is_discretionary() {
-            (breakpoint.width, breakpoint.stretch, breakpoint.shrink)
-        } else {
-            (
-                breakpoint.width + breakpoint.discard_width,
-                breakpoint.stretch + breakpoint.discarded_stretch(),
-                breakpoint.shrink + breakpoint.discarded_shrink(),
-            )
-        };
-        for candidate in best.into_iter().flatten() {
-            let (demerits, previous, hyphen_run) = candidate;
+        let (next_width, next_stretch, next_shrink) = breakpoint.next_line_totals();
+        for (_, candidate) in best.iter() {
             let path = u32::try_from(paths.len()).ok()?;
             paths.push(CompactPathNode {
                 breakpoint: breakpoint_index as u32,
-                previous: previous.path,
+                previous: candidate.previous_path,
             });
             active.push(CompactActiveNode {
                 path,
-                line: previous.line + 1,
+                line: candidate.previous_line + 1,
                 width: next_width,
                 stretch: next_stretch,
                 shrink: next_shrink,
-                demerits,
+                demerits: candidate.demerits,
                 fitness: 1,
-                hyphen_run,
+                previous_hyphen: candidate.previous_hyphen,
                 tracking_start: breakpoint.next_line_start,
             });
         }
@@ -554,19 +728,7 @@ fn break_compact_ragged_with_mode<'s>(breakpoints: impl ExactSizeIterator<Item =
         }
     }
 
-    let best = active.iter().min_by(|a, b| {
-        a.demerits
-            .partial_cmp(&b.demerits)
-            .unwrap_or(Ordering::Equal)
-    })?;
-    let mut path = best.path;
-    while path != NO_COMPACT_PATH {
-        let node = &paths[path as usize];
-        breaks.push(node.breakpoint as usize);
-        path = node.previous;
-    }
-    breaks.reverse();
-    Some(breaks.as_slice())
+    scratch.collect_best_breaks(|_| {})
 }
 
 #[cfg(feature = "profiling")]
@@ -591,11 +753,9 @@ struct SolverCounts {
     lines: usize,
     rejected_loose: usize,
     rejected_tight: usize,
-    rejected_hyphens: usize,
     tracking_feasible: usize,
     selected_loose: usize,
     selected_tight: usize,
-    selected_hyphens: usize,
     selected_tracking_fit: usize,
     selected_ragged: usize,
     selected_ragged_total_millipx: usize,
@@ -620,42 +780,58 @@ struct SolverMeasurements {
 impl Drop for SolverMeasurements {
     fn drop(&mut self) {
         let counts = &self.counts;
-        record_measurement(self.name, &[
-            ("breakpoints_requested", counts.requested),
-            ("breakpoints_processed", counts.processed),
-            ("candidate_evaluations", counts.evaluations),
-            ("geometry_reuses", counts.geometry_reuses),
-            ("scored_geometry_reuses", counts.scored_geometry_reuses),
-            ("max_active", counts.max_active),
-            ("first_line_candidates", counts.first_line),
-            ("max_line", counts.max_line),
-            ("scored_candidates", counts.scored),
-            ("emergency_underfull", counts.underfull),
-            ("emergency_tight", counts.tight),
-            ("tracking_candidates", counts.tracking),
-            ("best_updates", counts.best_updates),
-            ("dropped_candidates", counts.dropped),
-            ("paths_created", counts.paths),
-            ("success", counts.success),
-            ("selected_lines", counts.lines),
-            ("rejected_loose", counts.rejected_loose),
-            ("rejected_tight", counts.rejected_tight),
-            ("rejected_hyphens_with_valid_spacing", counts.rejected_hyphens),
-            ("tracking_feasible_candidates", counts.tracking_feasible),
-            ("selected_loose", counts.selected_loose),
-            ("selected_tight", counts.selected_tight),
-            ("selected_excessive_hyphen_run", counts.selected_hyphens),
-            ("selected_tracking_fits", counts.selected_tracking_fit),
-            ("selected_requires_ragged", counts.selected_ragged),
-            ("selected_ragged_total_millipx", counts.selected_ragged_total_millipx),
-            ("selected_ragged_max_millipx", counts.selected_ragged_max_millipx),
-            ("selected_ragged_over_1px", counts.selected_ragged_over_1px),
-            ("selected_ragged_over_3px", counts.selected_ragged_over_3px),
-            ("selected_ragged_over_10px", counts.selected_ragged_over_10px),
-            ("selected_tracking_fit_total_millipx", counts.selected_tracking_fit_total_millipx),
-            ("selected_tracking_fit_max_millipx", counts.selected_tracking_fit_max_millipx),
-            ("wall_ns", self.started.elapsed().as_nanos() as usize),
-        ]);
+        record_measurement(
+            self.name,
+            &[
+                ("breakpoints_requested", counts.requested),
+                ("breakpoints_processed", counts.processed),
+                ("candidate_evaluations", counts.evaluations),
+                ("geometry_reuses", counts.geometry_reuses),
+                ("scored_geometry_reuses", counts.scored_geometry_reuses),
+                ("max_active", counts.max_active),
+                ("first_line_candidates", counts.first_line),
+                ("max_line", counts.max_line),
+                ("scored_candidates", counts.scored),
+                ("emergency_underfull", counts.underfull),
+                ("emergency_tight", counts.tight),
+                ("tracking_candidates", counts.tracking),
+                ("best_updates", counts.best_updates),
+                ("dropped_candidates", counts.dropped),
+                ("paths_created", counts.paths),
+                ("success", counts.success),
+                ("selected_lines", counts.lines),
+                ("rejected_loose", counts.rejected_loose),
+                ("rejected_tight", counts.rejected_tight),
+                ("tracking_feasible_candidates", counts.tracking_feasible),
+                ("selected_loose", counts.selected_loose),
+                ("selected_tight", counts.selected_tight),
+                ("selected_tracking_fits", counts.selected_tracking_fit),
+                ("selected_requires_ragged", counts.selected_ragged),
+                (
+                    "selected_ragged_total_millipx",
+                    counts.selected_ragged_total_millipx,
+                ),
+                (
+                    "selected_ragged_max_millipx",
+                    counts.selected_ragged_max_millipx,
+                ),
+                ("selected_ragged_over_1px", counts.selected_ragged_over_1px),
+                ("selected_ragged_over_3px", counts.selected_ragged_over_3px),
+                (
+                    "selected_ragged_over_10px",
+                    counts.selected_ragged_over_10px,
+                ),
+                (
+                    "selected_tracking_fit_total_millipx",
+                    counts.selected_tracking_fit_total_millipx,
+                ),
+                (
+                    "selected_tracking_fit_max_millipx",
+                    counts.selected_tracking_fit_max_millipx,
+                ),
+                ("wall_ns", self.started.elapsed().as_nanos() as usize),
+            ],
+        );
     }
 }
 
@@ -669,18 +845,22 @@ fn break_compact_with_mode<'s>(breakpoints: impl ExactSizeIterator<Item = Compac
 }
 
 // RELAX is zero for the real solver. Diagnostic-only bits relax tracking
-// (1), hyphen runs (2), underfull lines (4), or tight lines (8) in isolation.
-fn break_compact_with_mode_impl<'s, const COLLECT: bool, const RELAX: u8>(breakpoints: impl ExactSizeIterator<Item = CompactBreakpoint>, line_width: impl Fn(usize) -> f64, tolerance: f64, allow_underfull: bool, book_hyphen_quality: bool, admit_tracking: &impl Fn(u32, u32, f64, f64) -> bool, scratch: &'s mut CompactScratch) -> Option<&'s [usize]> {
+// (1), underfull lines (4), or tight lines (8) in isolation.
+fn break_compact_with_mode_impl<'s, const COLLECT: bool, const RELAX: u8>(
+    breakpoints: impl ExactSizeIterator<Item = CompactBreakpoint>,
+    line_width: impl Fn(usize) -> f64,
+    tolerance: f64,
+    allow_underfull: bool,
+    book_hyphen_quality: bool,
+    admit_tracking: &impl Fn(u32, u32, f64, f64) -> bool,
+    scratch: &'s mut CompactScratch,
+) -> Option<&'s [usize]> {
     #[cfg(feature = "profiling")]
     let mode_name = match RELAX {
         1 => "lines.justified.probe.tracking",
-        2 => "lines.justified.probe.hyphens",
-        3 => "lines.justified.probe.tracking_hyphens",
         4 => "lines.justified.probe.underfull",
         8 => "lines.justified.probe.tight",
         12 => "lines.justified.probe.spacing",
-        6 => "lines.justified.probe.underfull_hyphens",
-        10 => "lines.justified.probe.tight_hyphens",
         _ if allow_underfull => "lines.justified.emergency",
         _ => "lines.justified.normal",
     };
@@ -701,16 +881,26 @@ fn break_compact_with_mode_impl<'s, const COLLECT: bool, const RELAX: u8>(breakp
         if let Some(measurements) = &mut measurements { measurements.counts.success = 1; }
         return Some(&scratch.breaks);
     }
-    let CompactScratch { paths, active, breaks } = scratch;
-    active.push(CompactActiveNode { path: NO_COMPACT_PATH, line: 0, width: 0.0, stretch: 0.0, shrink: 0.0, demerits: 0.0, fitness: 1, hyphen_run: 0, tracking_start: 0 });
+    let CompactScratch { paths, active, .. } = scratch;
+    active.push(CompactActiveNode {
+        path: NO_COMPACT_PATH,
+        line: 0,
+        width: 0.0,
+        stretch: 0.0,
+        shrink: 0.0,
+        demerits: 0.0,
+        fitness: 1,
+        previous_hyphen: false,
+        tracking_start: 0,
+    });
 
     let breakpoint_count = breakpoints.len();
     for (breakpoint_index, breakpoint) in breakpoints.enumerate() {
         let forced = breakpoint_index + 1 == breakpoint_count;
-        let mut best: [Option<(f64, CompactActiveNode, u8)>; 12] = [None; 12];
+        let mut best = CompactBestNodes::<8>::new();
         let mut kept = 0usize;
         #[cfg(feature = "profiling")]
-        let mut best_conditions = [(0u8, 0.0, 0.0); 12];
+        let mut best_conditions = [(0u8, 0.0, 0.0); 8];
         #[cfg(feature = "profiling")]
         if let Some(measurements) = &mut measurements {
             let counts = &mut measurements.counts;
@@ -786,36 +976,36 @@ fn break_compact_with_mode_impl<'s, const COLLECT: bool, const RELAX: u8>(breakp
                 && ratio < -1.0
                 && remaining_after_shrink > 0.0
                 && remaining_after_shrink <= tracking_capacity;
-            let counts_as_hyphen = if book_hyphen_quality {
-                breakpoint.is_hyphen()
-            } else {
-                breakpoint.is_discretionary()
-            };
-            let next_hyphen_run = if counts_as_hyphen {
-                candidate.hyphen_run.saturating_add(1)
-            } else {
-                0
-            };
-            let excessive_hyphen_run =
-                book_hyphen_quality && next_hyphen_run > MAX_CONSECUTIVE_HYPHENATED_LINES;
+            let next_hyphen = book_hyphen_quality && breakpoint.is_hyphen();
             let tracking_fits = tracking_capacity > 0.0
                 && ((ratio > tolerance && remaining_after_stretch <= tracking_capacity)
                     || (ratio < -1.0 && remaining_after_shrink <= tracking_capacity));
             let tracking_admitted = !allow_underfull
                 && tracking_fits
-                && (!excessive_hyphen_run || RELAX & 2 != 0)
-                && admit_tracking(candidate.tracking_start, breakpoint.line_end, width,
-                    if ratio > tolerance { remaining_after_stretch } else { remaining_after_shrink });
+                && admit_tracking(
+                    candidate.tracking_start,
+                    breakpoint.line_end,
+                    width,
+                    if ratio > tolerance {
+                        remaining_after_stretch
+                    } else {
+                        remaining_after_shrink
+                    },
+                );
             #[cfg(feature = "profiling")]
             if let Some(measurements) = &mut measurements {
                 let counts = &mut measurements.counts;
-                counts.rejected_loose += usize::from(!allow_underfull && ratio > tolerance && !tracking_admitted);
-                counts.rejected_tight += usize::from(!allow_underfull && ratio < -1.0 && !tracking_admitted);
-                counts.rejected_hyphens += usize::from(!allow_underfull && excessive_hyphen_run && ratio >= -1.0 && ratio <= tolerance);
+                counts.rejected_loose +=
+                    usize::from(!allow_underfull && ratio > tolerance && !tracking_admitted);
+                counts.rejected_tight +=
+                    usize::from(!allow_underfull && ratio < -1.0 && !tracking_admitted);
                 counts.tracking_feasible += usize::from(tracking_fits);
             }
-            if ((ratio >= -1.0 && ratio <= tolerance) || emergency_underfull || emergency_tight || tracking_admitted || (RELAX & 1 != 0 && tracking_fits))
-                && (!excessive_hyphen_run || allow_underfull || RELAX & 2 != 0)
+            if (ratio >= -1.0 && ratio <= tolerance)
+                || emergency_underfull
+                || emergency_tight
+                || tracking_admitted
+                || (RELAX & 1 != 0 && tracking_fits)
             {
                 #[cfg(feature = "profiling")]
                 if let Some(measurements) = &mut measurements {
@@ -829,7 +1019,7 @@ fn break_compact_with_mode_impl<'s, const COLLECT: bool, const RELAX: u8>(breakp
                 let effective_ratio = ratio.clamp(-1.0, tolerance);
                 let badness = 100.0 * effective_ratio.abs().powi(3);
                 let mut demerits = candidate.demerits + (1.0 + badness).powi(2);
-                if book_hyphen_quality && forced && candidate.hyphen_run > 0 {
+                if book_hyphen_quality && forced && candidate.previous_hyphen {
                     demerits += PENULTIMATE_HYPHEN_PENALTY;
                 }
                 if book_hyphen_quality && breakpoint.is_hyphen() {
@@ -849,28 +1039,16 @@ fn break_compact_with_mode_impl<'s, const COLLECT: bool, const RELAX: u8>(breakp
                 if penalty > 0.0 && penalty < INF_PENALTY {
                     demerits += penalty * penalty;
                 }
-                if counts_as_hyphen && candidate.hyphen_run > 0 {
-                    demerits += FLAGGED_PENALTY;
-                }
-                if excessive_hyphen_run {
-                    demerits += EXCESSIVE_HYPHEN_RUN_PENALTY;
-                }
-                let hyphen_slot = if book_hyphen_quality {
-                    next_hyphen_run.min(MAX_CONSECUTIVE_HYPHENATED_LINES)
-                } else {
-                    0
-                };
-                let slot = fitness as usize * 3 + usize::from(hyphen_slot);
-                if best[slot].is_none_or(|(best_demerits, _, _)| demerits < best_demerits) {
-                    best[slot] = Some((demerits, candidate, next_hyphen_run));
+                let slot = fitness as usize * 2 + usize::from(next_hyphen);
+                if best.consider(slot, demerits, candidate.path, candidate.line, next_hyphen) {
                     #[cfg(feature = "profiling")]
                     if let Some(measurements) = &mut measurements {
                         measurements.counts.best_updates += 1;
-                        best_conditions[slot] = (u8::from(ratio > tolerance)
-                            | (u8::from(ratio < -1.0) << 1)
-                            | (u8::from(excessive_hyphen_run) << 2)
-                            | (u8::from(tracking_fits) << 3)
-                            | (u8::from(ratio > tolerance && ragged_remainder > 0.0) << 4),
+                        best_conditions[slot] = (
+                            u8::from(ratio > tolerance)
+                                | (u8::from(ratio < -1.0) << 1)
+                                | (u8::from(tracking_fits) << 3)
+                                | (u8::from(ratio > tolerance && ragged_remainder > 0.0) << 4),
                             ragged_remainder,
                             if ratio > tolerance { remaining_after_stretch } else { remaining_after_shrink });
                     }
@@ -878,7 +1056,9 @@ fn break_compact_with_mode_impl<'s, const COLLECT: bool, const RELAX: u8>(breakp
             }
 
             if (ratio >= -1.0 || tracking_admitted || (RELAX & 1 != 0 && tracking_fits)) && !forced {
-                active[kept] = candidate;
+                if kept != read {
+                    active[kept] = candidate;
+                }
                 kept += 1;
             }
         }
@@ -886,38 +1066,28 @@ fn break_compact_with_mode_impl<'s, const COLLECT: bool, const RELAX: u8>(breakp
         if let Some(measurements) = &mut measurements { measurements.counts.dropped += active.len() - kept; }
         active.truncate(kept);
 
-        let (next_width, next_stretch, next_shrink) = if breakpoint.is_discretionary() {
-            (breakpoint.width, breakpoint.stretch, breakpoint.shrink)
-        } else {
-            (
-                breakpoint.width + breakpoint.discard_width,
-                breakpoint.stretch + breakpoint.discarded_stretch(),
-                breakpoint.shrink + breakpoint.discarded_shrink(),
-            )
-        };
-        for (slot, candidate) in best.into_iter().enumerate() {
-            if let Some((demerits, previous, hyphen_run)) = candidate {
-                let path = u32::try_from(paths.len()).ok()?;
-                paths.push(CompactPathNode {
-                    breakpoint: breakpoint_index as u32,
-                    previous: previous.path,
-                });
-                #[cfg(feature = "profiling")]
-                if let Some(measurements) = &mut measurements {
-                    measurements.path_conditions.push(best_conditions[slot]);
-                }
-                active.push(CompactActiveNode {
-                    path,
-                    line: previous.line + 1,
-                    width: next_width,
-                    stretch: next_stretch,
-                    shrink: next_shrink,
-                    demerits,
-                    fitness: (slot / 3) as i8,
-                    hyphen_run,
-                    tracking_start: breakpoint.next_line_start,
-                });
+        let (next_width, next_stretch, next_shrink) = breakpoint.next_line_totals();
+        for (slot, candidate) in best.iter() {
+            let path = u32::try_from(paths.len()).ok()?;
+            paths.push(CompactPathNode {
+                breakpoint: breakpoint_index as u32,
+                previous: candidate.previous_path,
+            });
+            #[cfg(feature = "profiling")]
+            if let Some(measurements) = &mut measurements {
+                measurements.path_conditions.push(best_conditions[slot]);
             }
+            active.push(CompactActiveNode {
+                path,
+                line: candidate.previous_line + 1,
+                width: next_width,
+                stretch: next_stretch,
+                shrink: next_shrink,
+                demerits: candidate.demerits,
+                fitness: (slot / 2) as i8,
+                previous_hyphen: candidate.previous_hyphen,
+                tracking_start: breakpoint.next_line_start,
+            });
         }
 
         #[cfg(feature = "profiling")]
@@ -927,21 +1097,13 @@ fn break_compact_with_mode_impl<'s, const COLLECT: bool, const RELAX: u8>(breakp
         }
     }
 
-    let best = active.iter().min_by(|a, b| {
-        a.demerits
-            .partial_cmp(&b.demerits)
-            .unwrap_or(Ordering::Equal)
-    })?;
-    let mut path = best.path;
-    while path != NO_COMPACT_PATH {
-        let node = &paths[path as usize];
+    let breaks = scratch.collect_best_breaks(|_path| {
         #[cfg(feature = "profiling")]
         if let Some(measurements) = &mut measurements {
-            let (conditions, residual, tracking_needed) = measurements.path_conditions[path as usize];
+            let (conditions, residual, tracking_needed) = measurements.path_conditions[_path];
             let counts = &mut measurements.counts;
             counts.selected_loose += usize::from(conditions & 1 != 0);
             counts.selected_tight += usize::from(conditions & 2 != 0);
-            counts.selected_hyphens += usize::from(conditions & 4 != 0);
             counts.selected_tracking_fit += usize::from(conditions & 8 != 0);
             counts.selected_ragged += usize::from(conditions & 16 != 0);
             if conditions & 16 != 0 {
@@ -958,16 +1120,13 @@ fn break_compact_with_mode_impl<'s, const COLLECT: bool, const RELAX: u8>(breakp
                 counts.selected_tracking_fit_max_millipx = counts.selected_tracking_fit_max_millipx.max(millipx);
             }
         }
-        breaks.push(node.breakpoint as usize);
-        path = node.previous;
-    }
-    breaks.reverse();
+    })?;
     #[cfg(feature = "profiling")]
     if let Some(measurements) = &mut measurements {
         measurements.counts.success = 1;
         measurements.counts.lines = breaks.len();
     }
-    Some(breaks.as_slice())
+    Some(breaks)
 }
 
 #[cfg(test)]
@@ -1100,10 +1259,22 @@ mod tests {
         assert_eq!(normal[0]["success"], 0);
         assert_eq!(emergency[0]["success"], 1);
         assert_eq!(emergency[0]["selected_lines"], 2);
-        assert_eq!(entries.iter().flat_map(|entry| &entry.measurements).map(|row| row["candidate_evaluations"]).sum::<usize>(), queries.get());
-        let probe = |name| &entries.iter().find(|entry| entry.name == name).unwrap().measurements[0];
+        assert_eq!(
+            entries
+                .iter()
+                .flat_map(|entry| &entry.measurements)
+                .map(|row| row["candidate_evaluations"])
+                .sum::<usize>(),
+            queries.get()
+        );
+        let probe = |name| {
+            &entries
+                .iter()
+                .find(|entry| entry.name == name)
+                .unwrap()
+                .measurements[0]
+        };
         assert_eq!(probe("lines.justified.probe.tracking")["success"], 0);
-        assert_eq!(probe("lines.justified.probe.hyphens")["success"], 0);
         assert_eq!(probe("lines.justified.probe.underfull")["success"], 1);
         assert!(emergency[0]["selected_requires_ragged"] > 0);
         for row in normal.iter().chain(emergency) {
@@ -1120,7 +1291,7 @@ mod tests {
 
     #[cfg(feature = "profiling")]
     #[test]
-    fn diagnostic_probes_isolate_tracking_and_hyphen_constraints() {
+    fn diagnostic_probes_isolate_tracking_constraints() {
         use crate::profiling::capture_with_measurements;
         use std::time::Duration;
 
@@ -1135,25 +1306,11 @@ mod tests {
             let row = |name| &entries.iter().find(|entry| entry.name == name).unwrap().measurements[0];
             assert_eq!(row("lines.justified.normal")["success"], 0);
             assert_eq!(row("lines.justified.probe.tracking")["success"], 1);
-            assert_eq!(row("lines.justified.probe.tracking")["selected_tracking_fits"], 1);
-            assert_eq!(row("lines.justified.probe.hyphens")["success"], 0);
+            assert_eq!(
+                row("lines.justified.probe.tracking")["selected_tracking_fits"],
+                1
+            );
         }
-        let plan = BreakpointStorage::new(vec![
-            CompactBreakpoint::discretionary(30.0, 0.0, 0.0, 2.0, 50.0, 1, 1),
-            CompactBreakpoint::discretionary(60.0, 0.0, 0.0, 2.0, 50.0, 2, 2),
-            CompactBreakpoint::discretionary(90.0, 0.0, 0.0, 2.0, 50.0, 3, 3),
-            CompactBreakpoint::final_(120.0, 0.0, 0.0, 4),
-        ]);
-        let (result, entries) = capture_with_measurements(Duration::default, true, || {
-            break_compact_reusing(&plan, |_| 32.0, 1.0, false, true, &mut CompactScratch::default()).map(<[usize]>::to_vec)
-        });
-        assert_eq!(result, Some(vec![0, 1, 2, 3]));
-        let row = |name| &entries.iter().find(|entry| entry.name == name).unwrap().measurements[0];
-        assert_eq!(row("lines.justified.normal")["success"], 0);
-        assert_eq!(row("lines.justified.probe.hyphens")["success"], 1);
-        assert_eq!(row("lines.justified.probe.hyphens")["selected_excessive_hyphen_run"], 1);
-        assert_eq!(row("lines.justified.probe.tracking")["success"], 0);
-        assert_eq!(row("lines.justified.probe.spacing")["success"], 0);
     }
 
     #[test]
@@ -1194,7 +1351,7 @@ mod tests {
     }
 
     #[test]
-    fn third_consecutive_hyphen_requires_the_emergency_pass() {
+    fn consecutive_hyphens_remain_feasible_in_all_composition_paths() {
         let compact = vec![
             CompactBreakpoint::discretionary(30.0, 0.0, 0.0, 2.0, 50.0, 1, 1),
             CompactBreakpoint::discretionary(60.0, 0.0, 0.0, 2.0, 50.0, 2, 2),
@@ -1204,8 +1361,8 @@ mod tests {
 
         assert_eq!(
             break_compact_book(&compact, |_| 32.0, 8.0),
-            None,
-            "the normal justified pass must reject a third consecutive hyphen"
+            Some(vec![0, 1, 2, 3]),
+            "the normal justified pass must allow consecutive hyphens"
         );
         assert_eq!(
             break_compact_emergency_book(&compact, |_| 32.0, 8.0),
@@ -1220,42 +1377,7 @@ mod tests {
         assert_eq!(
             break_compact_ragged(&compact, |_| 32.0),
             Some(vec![0, 1, 2, 3]),
-            "ragged composition must use the same best-effort fallback"
-        );
-    }
-
-    #[test]
-    fn book_emergency_interrupts_an_avoidable_long_hyphen_run() {
-        // Monospace model of the visual fixture in a twenty-cell measure.
-        // Continuing at every discretionary point fills each line, while the
-        // thirteen-letter bridge words provide feasible normal boundaries.
-        let compact = vec![
-            CompactBreakpoint::discretionary(19.0, 0.5, 0.33, 1.0, 50.0, 1, 1),
-            ordinary_soft(21.0, 0.5, 0.33, 1.0, 2, 3),
-            ordinary_soft(35.0, 1.0, 0.66, 1.0, 4, 5),
-            CompactBreakpoint::discretionary(38.0, 1.5, 0.99, 1.0, 50.0, 6, 6),
-            ordinary_soft(40.0, 1.5, 0.99, 1.0, 7, 8),
-            ordinary_soft(54.0, 2.0, 1.32, 1.0, 9, 10),
-            CompactBreakpoint::discretionary(57.0, 2.5, 1.65, 1.0, 50.0, 11, 11),
-            ordinary_soft(59.0, 2.5, 1.65, 1.0, 12, 13),
-            ordinary_soft(73.0, 3.0, 1.98, 1.0, 14, 15),
-            CompactBreakpoint::discretionary(76.0, 3.5, 2.31, 1.0, 50.0, 16, 16),
-            CompactBreakpoint::final_(79.0, 3.5, 2.31, 17),
-        ];
-
-        let web = break_compact(&compact, |_| 20.0, 8.0).expect("web path");
-        let book = break_compact_book(&compact, |_| 20.0, 8.0)
-            .expect("the normal-boundary reset should make a strict book path feasible");
-        assert_ne!(
-            web, book,
-            "book quality must alter a long but avoidable hyphen chain"
-        );
-        assert_eq!(web, vec![0, 3, 6, 9, 10]);
-        assert!(
-            book.windows(3)
-                .all(|window| !(compact[window[0]].is_hyphen()
-                    && compact[window[1]].is_hyphen()
-                    && compact[window[2]].is_hyphen()))
+            "ragged composition must allow consecutive hyphens"
         );
     }
 

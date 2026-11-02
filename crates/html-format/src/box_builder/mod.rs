@@ -1,13 +1,14 @@
 use crate::layout_model::{
-    BlockBox, Children, InlineContent, InlineItemKind, LayoutMode, LayoutTree,
+    BlockBox, Children, InlineContent, InlineItemKind, LayoutMode, LayoutTree, TableBox,
+    TableRowBox, parse_positive_span,
 };
 use html_dom::element_is_note_target;
 use html_dom::{Document, DomNodeId, NodeRef};
 use html_engine_model::NoteFlow;
-use html_style_model::{ComputedStyles, Display, Float, ListStyleType, StyleIndices};
+use html_style_model::{ComputedStyles, Display, StyleIndices};
+use html_text::{FirstLetterPart, FirstLetterSelection};
 use rustc_data_structures::fx::FxHashMap;
 use std::ops::Range;
-use unicode_categories::UnicodeCategories;
 
 mod block;
 mod classification;
@@ -22,20 +23,20 @@ mod writer;
 
 use self::block::{BlockChildAction, plan_block_children};
 use self::classification::{
-    display_for_element, empty_table_box, is_block_level_pseudo_display, is_clearing_break,
-    is_table_internal_display, layout_mode_for_display,
+    display_for_element, is_absolutely_positioned,
+    is_clearing_break, is_floated, layout_mode_for_display, pseudo_display, pseudo_is_block_level,
 };
 use self::generated::GeneratedContentResolver;
 use self::inline::{
-    InlineElementPlan, InlineFragmentPlan, InlineNodePlan, SplitInlineEvent, SplitInlinePart,
+    InlineFragmentPlan, InlineNodePlan, SplitInlineEvent, SplitInlinePart,
     has_block_child, plan_generated_inline, plan_inline_node, plan_split_inline,
     trim_inline_segment_nodes,
 };
 use self::lists::ListItemOrdinals;
 use self::table::{
-    AnonymousCellPart, AnonymousTablePlan, TableChildAction, TablePrincipal, TableRole,
-    TableRowChildAction, plan_anonymous_table_children, plan_generated_table_principal,
-    plan_table_children, plan_table_row_children,
+    AnonymousCellPart, AnonymousTablePlan, TableChildAction, TableRole, TableRowChildAction,
+    plan_anonymous_table_children, plan_generated_table_principal, plan_table_children,
+    plan_table_row_children,
 };
 use self::writer::BoxTreeWriter;
 
@@ -57,33 +58,17 @@ struct InlineFragmentFrame {
     first_fragment: bool,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum FirstLetterCapturePhase {
-    Leading,
-    Letter,
-    Trailing,
-    Done,
-}
-
 struct FloatedFirstLetterCapture {
     box_idx: u32,
     item_start: u32,
     item_end: Option<u32>,
-    phase: FirstLetterCapturePhase,
+    selection: FirstLetterSelection,
 }
 
 #[derive(Clone, Copy)]
 enum FlexInlineSource {
-    Node(u32),
+    Node(DomNodeId),
     GeneratedPseudo { origin: DomNodeId, before: bool },
-}
-
-fn is_first_letter_punctuation(character: char) -> bool {
-    character.is_punctuation_open()
-        || character.is_punctuation_close()
-        || character.is_punctuation_initial_quote()
-        || character.is_punctuation_final_quote()
-        || character.is_punctuation_other()
 }
 
 impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
@@ -112,21 +97,13 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
 
     fn build(&mut self) {
         if let Some(root_idx) = self.document.dom_root() {
-            let root_box = self.build_box_for_node(root_idx, None);
-            self.output.set_root_box(root_box);
+            self.build_from(root_idx);
         }
     }
 
     fn build_from(&mut self, root: DomNodeId) {
-        let root_box = self.build_box_for_node(root, None);
+        let root_box = self.build_box_for_element(root, None);
         self.output.set_root_box(root_box);
-    }
-
-    fn build_box_for_node(&mut self, node_id: DomNodeId, parent_box: Option<u32>) -> Option<u32> {
-        match self.document.node_ref(node_id)? {
-            NodeRef::Element(_) => self.build_box_for_element(node_id, parent_box),
-            NodeRef::Text(_) => None,
-        }
     }
 
     fn build_box_for_element(
@@ -161,46 +138,29 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
             return None;
         }
 
-        if let Some(directives) = self.styles.counter_directives_for_node(elem_id) {
-            self.generated.apply(directives);
-        }
+        self.generated.apply_for_node(elem_id);
 
-        let has_block_child = has_block_child(self.document, self.styles, element);
         let mut layout_mode = layout_mode_for_display(display)?;
         if is_clearing_break(self.styles, element) {
-            layout_mode = LayoutMode::Block(BlockBox {
-                children: Children::Empty,
-            });
+            layout_mode = LayoutMode::Block(BlockBox::default());
         }
         if let LayoutMode::TableCell(cell) = &mut layout_mode {
-            cell.colspan =
-                html_engine_model::parse_positive_span(self.document.get_dom_attr(elem_id, "colspan"));
-            cell.rowspan =
-                html_engine_model::parse_positive_span(self.document.get_dom_attr(elem_id, "rowspan"));
+            cell.colspan = parse_positive_span(element.attr("colspan"));
+            // Zero grows to the end of the row group once all rows are built.
+            cell.rowspan = element
+                .attr("rowspan")
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .unwrap_or(1)
+                .min(65_534);
         }
-        if matches!(
-            self.styles
-                .box_model_style(style_indices)
-                .expect("validated style handle")
-                .float,
-            Float::Left | Float::Right
-        ) && matches!(layout_mode, LayoutMode::Inline(_))
+        if let LayoutMode::Inline(_) = layout_mode
+            && (is_floated(self.styles, element) || is_absolutely_positioned(self.styles, element))
         {
-            layout_mode = LayoutMode::Block(BlockBox {
-                children: Children::Empty,
-            });
+            layout_mode = LayoutMode::Block(BlockBox::default());
         }
-        if self
-            .styles
-            .layout_style(style_indices)
-            .is_some_and(|style| style.position == html_style_model::PositionMode::Absolute)
-            && matches!(layout_mode, LayoutMode::Inline(_))
-        {
-            layout_mode = LayoutMode::Block(BlockBox {
-                children: Children::Empty,
-            });
-        }
-        let box_idx = self.push_layout_box(elem_id, parent_box, Some(style_indices), layout_mode);
+        let box_idx =
+            self.output
+                .push_dom_box(element, parent_box, Some(style_indices), layout_mode);
 
         self.generated.enter_sibling_scope();
 
@@ -208,29 +168,32 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
             self.build_replaced_content(box_idx, image_idx);
         } else {
             match display {
-                Display::Table | Display::InlineTable => {
-                    self.build_table_children(elem_id, box_idx)
-                }
+                Display::Table | Display::InlineTable => self.build_table_children_from_nodes(
+                    element.children().map(DomNodeId::raw),
+                    box_idx,
+                ),
                 Display::TableRowGroup | Display::TableHeaderGroup | Display::TableFooterGroup => {
-                    self.build_table_row_group_children(elem_id, box_idx)
+                    self.build_table_row_group_children(element, box_idx)
                 }
-                Display::TableRow => self.build_table_row_children(elem_id, box_idx),
-                Display::TableCell => self.build_cell_children(elem_id, box_idx),
+                Display::TableRow => {
+                    self.build_row_children(element.children().map(DomNodeId::raw), box_idx)
+                }
                 Display::Flex | Display::InlineFlex | Display::Grid | Display::InlineGrid => {
-                    self.build_flex_grid_children(elem_id, box_idx)
+                    self.build_flex_grid_children(element, box_idx)
                 }
                 _ => {
-                    if has_block_child {
+                    if has_block_child(self.styles, element) {
                         self.build_block_children(elem_id, box_idx);
                     } else {
-                        self.build_inline_children(elem_id, box_idx);
+                        self.build_inline_children(element, box_idx);
                     }
                 }
             }
         }
 
         if matches!(display, Display::ListItem | Display::FlowRootListItem) {
-            self.build_list_marker(box_idx, elem_id, style_indices);
+            let ordinal = self.list_item_ordinals.get(elem_id);
+            self.build_list_marker(box_idx, style_indices, ordinal);
         }
 
         self.generated.leave_sibling_scope();
@@ -238,41 +201,13 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
         Some(box_idx)
     }
 
-    fn build_list_marker(
-        &mut self,
-        list_item_box: u32,
-        elem_id: DomNodeId,
-        style_indices: StyleIndices,
-    ) {
-        let list_style_type = self
-            .styles
-            .view(style_indices)
-            .expect("validated style handle")
-            .list_style_type();
-        let ordinal = if list_style_type.is_bullet() {
-            0
-        } else {
-            self.list_item_ordinals.get(elem_id)
-        };
-        self.build_list_marker_for_ordinal(list_item_box, style_indices, ordinal);
-    }
-
-    fn build_list_marker_for_ordinal(
-        &mut self,
-        list_item_box: u32,
-        style_indices: StyleIndices,
-        ordinal: i64,
-    ) {
+    fn build_list_marker(&mut self, list_item_box: u32, style_indices: StyleIndices, ordinal: i64) {
         let style = self
             .styles
             .view(style_indices)
             .expect("validated style handle");
         let list_style_type = style.list_style_type();
         let position = style.list_style_position();
-        if list_style_type == ListStyleType::None {
-            return;
-        }
-
         let Some(text) = super::list_marker::marker_text(list_style_type, ordinal) else {
             return;
         };
@@ -295,48 +230,37 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
         direct_children: &mut Vec<u32>,
     ) {
         for action in plan_block_children(self.document, self.styles, elem_id) {
-            match action {
+            let child = match action {
                 BlockChildAction::GeneratedPseudo { before } => {
-                    if let Some(pseudo) =
-                        self.build_generated_block_pseudo(elem_id, box_idx, before)
-                    {
-                        direct_children.push(pseudo);
-                    }
+                    self.build_generated_block_pseudo(elem_id, box_idx, before)
                 }
                 BlockChildAction::InlineSegment {
                     mut nodes,
                     before,
                     after,
-                } => {
-                    if let Some(anonymous) = self.flush_inline_segment_with_generated_edges(
-                        &mut nodes,
-                        box_idx,
-                        before.then_some(elem_id),
-                        after.then_some(elem_id),
-                    ) {
-                        direct_children.push(anonymous);
-                    }
-                }
+                } => self.flush_inline_segment_with_generated_edges(
+                    &mut nodes,
+                    box_idx,
+                    before.then_some(elem_id),
+                    after.then_some(elem_id),
+                ),
                 BlockChildAction::AnonymousTable(mut nodes) => {
-                    if let Some(table) = self.flush_anonymous_table_segment(&mut nodes, box_idx) {
-                        direct_children.push(table);
-                    }
+                    self.flush_anonymous_table_segment(&mut nodes, box_idx)
                 }
                 BlockChildAction::Principal(node) => {
-                    if let Some(child) = self.build_box_for_node(node, Some(box_idx)) {
-                        direct_children.push(child);
-                    }
+                    self.build_box_for_element(node, Some(box_idx))
                 }
                 BlockChildAction::SplitInline(node) => {
-                    self.build_split_inline_child(node, box_idx, direct_children)
+                    self.build_split_inline_child(node, box_idx, direct_children);
+                    continue;
                 }
                 BlockChildAction::ContentsWithTableInternals(node) => {
-                    if let Some(directives) = self.styles.counter_directives_for_node(node) {
-                        self.generated.apply(directives);
-                    }
+                    self.generated.apply_for_node(node);
                     self.append_block_children(node, box_idx, direct_children);
+                    continue;
                 }
-            }
+            };
+            direct_children.extend(child);
         }
     }
 
@@ -350,31 +274,9 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
         }
         let table_idx = self
             .output
-            .push_anonymous_table(parent_box_idx, LayoutMode::Table(empty_table_box()));
+            .push_anonymous_child(parent_box_idx, LayoutMode::Table(TableBox::default()));
         self.build_table_children_from_nodes(std::mem::take(nodes), table_idx);
         Some(table_idx)
-    }
-
-    fn push_layout_box(
-        &mut self,
-        dom_node_id: DomNodeId,
-        parent: Option<u32>,
-        style: Option<StyleIndices>,
-        layout_mode: LayoutMode,
-    ) -> u32 {
-        let element = self
-            .document
-            .element_ref(dom_node_id)
-            .expect("layout boxes are only created for element nodes");
-        let is_body = element.tag().eq_ignore_ascii_case("body");
-        self.output.push_dom_box(
-            dom_node_id.raw(),
-            element.image_idx(),
-            parent,
-            style,
-            layout_mode,
-            is_body,
-        )
     }
 }
 

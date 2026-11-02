@@ -1,6 +1,8 @@
 //! Source addresses resolved directly against the current document's DOM.
 
-use super::RenderAddressingView;
+use super::{LineId, RenderAddressingView};
+use html_dom::SourcePosition;
+use std::iter::once;
 
 /// An owned document-relative source address. Publication/spine identifiers and
 /// encodings such as EPUB CFI belong to the embedding application.
@@ -8,6 +10,20 @@ use super::RenderAddressingView;
 pub struct SourceLocation {
     pub path: Vec<usize>,
     pub utf16_offset: Option<usize>,
+}
+
+impl From<SourcePosition<'_>> for SourceLocation {
+    fn from(position: SourcePosition<'_>) -> Self {
+        let path = position
+            .elements()
+            .map(|element| element.step())
+            .chain(once(position.text_step()))
+            .collect();
+        Self {
+            path,
+            utf16_offset: Some(position.utf16_offset()),
+        }
+    }
 }
 
 impl RenderAddressingView<'_> {
@@ -18,28 +34,13 @@ impl RenderAddressingView<'_> {
         line: usize,
         glyph: Option<u32>,
     ) -> Option<SourceLocation> {
-        let layout_line = self.doc.render_view(self.glyph_metrics).text().line(line)?;
+        let view = self.doc.render_view(self.glyph_metrics);
+        let layout_line = view.text().line(line)?;
         let glyph = glyph.filter(|glyph| layout_line.glyphs().contains(glyph));
         let mut source = glyph
             .and_then(|glyph| self.source_position_for_glyph(glyph, false))
-            .map(|position| {
-                let mut path = position
-                    .elements()
-                    .map(|step| step.step())
-                    .collect::<Vec<_>>();
-                path.push(position.text_step());
-                SourceLocation {
-                    path,
-                    utf16_offset: Some(position.utf16_offset()),
-                }
-            });
-        for image in self
-            .doc
-            .render_view(self.glyph_metrics)
-            .fragments()
-            .images_for_line(line)
-            .iter()
-        {
+            .map(SourceLocation::from);
+        for image in view.fragments().images_for_line(line).iter() {
             let Some(location) = self.element_location(image.box_idx) else {
                 continue;
             };
@@ -52,26 +53,40 @@ impl RenderAddressingView<'_> {
         }
         source.or_else(|| {
             let glyph = glyph?;
-            let view = self.doc.render_view(self.glyph_metrics);
             let run = view
                 .text()
                 .text_runs()
                 .find(|run| run.glyphs().contains(&glyph))?;
-            std::iter::once(run.box_idx())
+            once(run.box_idx())
                 .chain(view.boxes().ancestors(run.box_idx()))
                 .find_map(|owner| self.element_location(owner))
         })
     }
 
+    /// First stable carrier line for an element address. Unlike its y
+    /// coordinate, this retains identity when independent boxes overlap.
+    pub fn source_element_line(self, location: &SourceLocation) -> Option<LineId> {
+        if location.utf16_offset.is_some() || location.path.is_empty() {
+            return None;
+        }
+        let node = self
+            .doc
+            .document()
+            .find_dom_node_by_steps(&location.path)?
+            .raw();
+        let boxes = self.doc.render_view(self.glyph_metrics).boxes();
+        (0..boxes.len())
+            .filter(|&index| self.doc.box_dom_element_idx(index) == Some(node))
+            .map(|index| boxes.content_line_range(index))
+            .filter(|range| !range.is_empty())
+            .map(|range| LineId::new(range.start))
+            .min()
+    }
+
     /// Document-space vertical coordinate for an element-only source address.
     /// Text addresses must be resolved through `resolve_source_position`.
     pub fn source_element_y(self, location: &SourceLocation) -> Option<f64> {
-        if location.utf16_offset.is_some()
-            || location
-                .path
-                .iter()
-                .any(|step| *step == 0 || !step.is_multiple_of(2))
-        {
+        if location.utf16_offset.is_some() {
             return None;
         }
         if location.path.is_empty() {
@@ -93,11 +108,10 @@ impl RenderAddressingView<'_> {
         let document = self.doc.document();
         let node = document.node_id_from_raw(self.doc.box_dom_element_idx(box_idx)?)?;
         let path = document
-            .get_dom_path_to_node(node)
+            .element_source_path(node)?
             .into_iter()
-            .skip(1)
-            .map(|node| document.get_element_step(node))
-            .collect::<Option<Vec<_>>>()?;
+            .map(|element| element.step())
+            .collect();
         Some(SourceLocation {
             path,
             utf16_offset: None,

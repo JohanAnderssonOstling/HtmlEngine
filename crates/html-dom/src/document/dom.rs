@@ -154,16 +154,9 @@ impl<State> DocumentBuilder<State> {
 
 impl<State> DocumentBuilder<State> {
     fn append_dom_element_raw(&mut self, parent: Option<DomNodeId>, data: DomElementData) -> Result<DomNodeId, DocumentBuildError> {
-        let parent = if let Some(parent) = parent {
-            let parent_idx = self.document.validate_node_id(parent)?;
-            match self.document.dom_nodes.get(parent_idx) {
-                Some(DomNode::Element(_)) => Some(parent),
-                Some(DomNode::Text(_)) => return Err(DocumentBuildError::NodeTypeMismatch { raw: parent.raw, expected_text_parent: false }),
-                None => return Err(DocumentBuildError::InvalidNodeId { raw: parent.raw }),
-            }
-        } else {
-            None
-        };
+        if let Some(parent) = parent {
+            self.document.element_mut_for_build(parent)?;
+        }
 
         let raw = self.document.dom_nodes.len().try_into().map_err(|_| DocumentBuildError::TooManyNodes)?;
         let node_id = DomNodeId { raw, document_token: self.document.lineage_token() };
@@ -184,18 +177,19 @@ impl<State> DocumentBuilder<State> {
     }
 
     fn append_dom_text_raw(&mut self, parent: DomNodeId, text: impl Into<String>) -> Result<DomNodeId, DocumentBuildError> {
-        let parent_idx = self.document.validate_node_id(parent)?;
-        match self.document.dom_nodes.get(parent_idx) {
-            Some(DomNode::Element(_)) => {}
-            Some(DomNode::Text(_)) => return Err(DocumentBuildError::NodeTypeMismatch { raw: parent.raw, expected_text_parent: false }),
-            None => return Err(DocumentBuildError::InvalidNodeId { raw: parent.raw }),
-        }
+        self.document.element_mut_for_build(parent)?;
 
         let raw = self.document.dom_nodes.len().try_into().map_err(|_| DocumentBuildError::TooManyNodes)?;
         let node_id = DomNodeId { raw, document_token: self.document.lineage_token() };
         self.document.dom_nodes.push(DomNode::Text(DomText { text: text.into(), parent: Some(parent) }));
         self.document.append_child(parent, node_id)?;
         Ok(node_id)
+    }
+
+    fn finish_document(mut self) -> Result<Document, DocumentBuildError> {
+        self.document.dom_root = self.document.validate_for_build()?;
+        self.document.rebuild_html_semantics();
+        Ok(self.document)
     }
 
     fn validate_and_set_root(&mut self, node_id: DomNodeId) -> Result<(), DocumentBuildError> {
@@ -214,10 +208,7 @@ impl<State> DocumentBuilder<State> {
     }
 
     pub fn set_dom_id_attribute(&mut self, node_id: DomNodeId, id_idx: u16, id_name_idx: u16) -> Result<(), DocumentBuildError> {
-        let idx = self.document.validate_node_id(node_id)?;
-        let Some(DomNode::Element(element)) = self.document.dom_nodes.get_mut(idx) else {
-            return Err(DocumentBuildError::NodeTypeMismatch { raw: node_id.raw, expected_text_parent: false });
-        };
+        let element = self.document.element_mut_for_build(node_id)?;
         element.attribute_cache.id = Some(id_idx);
         element.attributes.push(DomAttribute { name: id_name_idx, local_name: id_name_idx, namespace: None, value: id_idx });
         Ok(())
@@ -248,11 +239,7 @@ impl DocumentBuilder<NeedsRoot> {
     /// This is only valid when no DOM nodes were added. The call site must use
     /// this path explicitly so non-empty DOMs must be rooted before finalization.
     pub fn finish_without_root(self) -> Result<Document, DocumentBuildError> {
-        let root = self.document.validate_for_build()?;
-        let mut document = self.document;
-        document.dom_root = root;
-        document.rebuild_html_semantics();
-        Ok(document)
+        self.finish_document()
     }
 }
 
@@ -291,11 +278,7 @@ impl DocumentBuilder<Rooted> {
     }
 
     pub fn finish(self) -> Result<Document, DocumentBuildError> {
-        let root = self.document.validate_for_build()?;
-        let mut document = self.document;
-        document.dom_root = root;
-        document.rebuild_html_semantics();
-        Ok(document)
+        self.finish_document()
     }
 }
 
@@ -459,8 +442,8 @@ impl HtmlElementState {
 impl DomElement {
     pub fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
-        report.add_slice_storage::<DomNodeId>("DomElement.children.storage", self.children.capacity(), self.children.len());
-        report.add_slice_storage::<DomAttribute>("DomElement.attributes.storage", self.attributes.capacity(), self.attributes.len());
+        report.add_vec_storage("DomElement.children.storage", &self.children);
+        report.add_vec_storage("DomElement.attributes.storage", &self.attributes);
         report
     }
 }
@@ -514,7 +497,7 @@ pub struct DomText {
 impl DomText {
     pub fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
-        report.add_slice_storage::<u8>("DomText.text.storage", self.text.capacity(), self.text.len());
+        report.add_string_storage("DomText.text.storage", &self.text);
         report
     }
 }
@@ -551,6 +534,20 @@ impl Document {
         if idx >= self.dom_nodes.len() { Err(DocumentBuildError::InvalidNodeId { raw: node_id.raw() }) } else { Ok(idx) }
     }
 
+    fn element_mut_for_build(
+        &mut self,
+        node_id: DomNodeId,
+    ) -> Result<&mut DomElement, DocumentBuildError> {
+        let idx = self.validate_node_id(node_id)?;
+        match &mut self.dom_nodes[idx] {
+            DomNode::Element(element) => Ok(element),
+            DomNode::Text(_) => Err(DocumentBuildError::NodeTypeMismatch {
+                raw: node_id.raw(),
+                expected_text_parent: false,
+            }),
+        }
+    }
+
     fn lineage_token(&self) -> u64 {
         self.lineage.0.get()
     }
@@ -568,11 +565,8 @@ impl Document {
     }
 
     fn append_child(&mut self, parent: DomNodeId, child: DomNodeId) -> Result<(), DocumentBuildError> {
-        let parent_idx = self.validate_node_id(parent)?;
         let parent_id = parent;
-        let Some(DomNode::Element(parent)) = self.dom_nodes.get_mut(parent_idx) else {
-            return Err(DocumentBuildError::NodeTypeMismatch { raw: parent.raw(), expected_text_parent: false });
-        };
+        let parent = self.element_mut_for_build(parent)?;
 
         if parent.children.iter().any(|candidate| candidate.raw() == child.raw() && candidate.token() == child.token()) {
             return Err(DocumentBuildError::DuplicateChild { parent: parent_id.raw(), child: child.raw() });
@@ -638,19 +632,19 @@ impl Document {
             state.set(HtmlElementState::RTL, rtl);
             state.set(HtmlElementState::DEFINED, !tag.contains('-'));
 
-            let children = element.children.clone();
+            let children = &element.children;
             let fieldset_disables_children = tag_is("fieldset") && has_attr("disabled");
             let first_legend = fieldset_disables_children.then(|| children.iter().copied().find(|child| self.element_ref(*child).is_some_and(|element| element.tag().eq_ignore_ascii_case("legend")))).flatten();
             let optgroup_disables_children = tag_is("optgroup") && disabled;
-            if let Some(DomNode::Element(element)) = self.dom_nodes.get_mut(node.index()) {
-                element.html_state = state;
-            }
-            for child in children.into_iter().rev() {
+            for &child in children.iter().rev() {
                 if self.element_ref(child).is_none() {
                     continue;
                 }
                 let child_disabled_by_fieldset = disabled_by_fieldset || (fieldset_disables_children && Some(child) != first_legend);
                 stack.push((child, rtl, child_disabled_by_fieldset, editable, optgroup_disables_children));
+            }
+            if let Some(DomNode::Element(element)) = self.dom_nodes.get_mut(node.index()) {
+                element.html_state = state;
             }
         }
         self.rebuild_static_radio_indeterminate_state();
@@ -665,9 +659,9 @@ impl Document {
                     .then(|| (node, radio_group_owner(self, element), element.attr("name").unwrap_or("").to_owned(), element.html_state().is_checked()))
             })
             .collect::<Vec<_>>();
-        let checked_groups = radios.iter().filter(|(_, _, _, checked)| *checked).map(|(_, owner, name, _)| (*owner, name.clone())).collect::<HashSet<_>>();
-        for (node, owner, name, checked) in radios {
-            let indeterminate = !checked && !checked_groups.contains(&(owner, name));
+        let checked_groups = radios.iter().filter(|(_, _, _, checked)| *checked).map(|(_, owner, name, _)| (*owner, name.as_str())).collect::<HashSet<_>>();
+        for (node, owner, name, checked) in &radios {
+            let indeterminate = !*checked && !checked_groups.contains(&(*owner, name.as_str()));
             if let Some(DomNode::Element(element)) = self.dom_nodes.get_mut(node.index()) {
                 element.html_state.set(HtmlElementState::INDETERMINATE, indeterminate);
             }
@@ -864,6 +858,15 @@ impl Document {
         Some(ElementRef { doc: self, node_id })
     }
 
+    /// Find an exact, case-sensitive ID, searching in [`Self::node_ids`] order.
+    /// Duplicate IDs resolve to the first matching element.
+    pub fn element_by_id(&self, id: &str) -> Option<ElementRef<'_>> {
+        self.lookup_string(id)?;
+        self.node_ids()
+            .filter_map(|node| self.element_ref(node))
+            .find(|element| element.id() == Some(id))
+    }
+
     pub fn text_ref(&self, node_id: DomNodeId) -> Option<TextRef<'_>> {
         let idx = self.node_or_err(node_id)?;
         self.dom_nodes.get(idx)?.as_text()?;
@@ -939,6 +942,11 @@ impl Document {
         DomAncestorIter { doc: self, current }
     }
 
+    /// Whether `node` is `root` itself or a descendant in the source DOM.
+    pub fn dom_contains(&self, root: DomNodeId, node: DomNodeId) -> bool {
+        node == root || self.dom_ancestors(node).any(|ancestor| ancestor == root)
+    }
+
     pub fn get_dom_href(&self, node_id: DomNodeId) -> Option<&str> {
         self.element_ref(node_id).and_then(|element| element.href())
     }
@@ -989,8 +997,7 @@ fn html_auto_direction(doc: &Document, root: DomNodeId) -> Option<bool> {
             }
         }
     }
-    let mut pending: Vec<_> = element.children().collect();
-    pending.reverse();
+    let mut pending: Vec<_> = element.children().rev().collect();
     let mut content = String::new();
     while let Some(node) = pending.pop() {
         if let Some(text) = doc.text_ref(node) {
@@ -1001,8 +1008,7 @@ fn html_auto_direction(doc: &Document, root: DomNodeId) -> Option<bool> {
             {
                 continue;
             }
-            let children: Vec<_> = element.children().collect();
-            pending.extend(children.into_iter().rev());
+            pending.extend(element.children().rev());
         }
     }
     first_strong_direction(&content)
@@ -1017,15 +1023,25 @@ fn first_strong_direction(text: &str) -> Option<bool> {
 }
 
 fn input_type_supports_required(kind: &str) -> bool {
-    matches!(kind.to_ascii_lowercase().as_str(), "text" | "search" | "url" | "tel" | "email" | "password" | "date" | "month" | "week" | "time" | "datetime-local" | "number" | "checkbox" | "radio" | "file")
+    input_type_supports_readonly(kind)
+        || ["checkbox", "radio", "file"]
+            .iter()
+            .any(|candidate| kind.eq_ignore_ascii_case(candidate))
 }
 
 fn input_type_supports_readonly(kind: &str) -> bool {
-    matches!(kind.to_ascii_lowercase().as_str(), "text" | "search" | "url" | "tel" | "email" | "password" | "date" | "month" | "week" | "time" | "datetime-local" | "number")
+    input_type_supports_placeholder(kind)
+        || ["date", "month", "week", "time", "datetime-local"]
+            .iter()
+            .any(|candidate| kind.eq_ignore_ascii_case(candidate))
 }
 
 fn input_type_supports_placeholder(kind: &str) -> bool {
-    matches!(kind.to_ascii_lowercase().as_str(), "text" | "search" | "url" | "tel" | "email" | "password" | "number")
+    [
+        "text", "search", "url", "tel", "email", "password", "number",
+    ]
+    .iter()
+    .any(|candidate| kind.eq_ignore_ascii_case(candidate))
 }
 
 fn element_text_is_empty(document: &Document, root: DomNodeId) -> bool {
@@ -1095,8 +1111,13 @@ impl<'a> ElementRef<'a> {
         self.element().parent
     }
 
-    pub fn children(self) -> impl Iterator<Item = DomNodeId> + 'a {
+    pub fn children(self) -> impl DoubleEndedIterator<Item = DomNodeId> + Clone + 'a {
         self.element().children.iter().copied()
+    }
+
+    /// Direct element children in source order, skipping text nodes.
+    pub fn child_elements(self) -> impl Iterator<Item = ElementRef<'a>> + Clone + 'a {
+        self.children().filter_map(move |node| self.doc.element_ref(node))
     }
 
     pub fn namespace(self) -> Option<&'a str> {
@@ -1318,6 +1339,39 @@ mod tests {
     }
 
     #[test]
+    fn element_lookup_preserves_first_duplicate_and_exact_id_matching() {
+        let mut builder = DocumentBuilder::new();
+        let tag = builder.intern_string("span");
+        let id_name = builder.intern_string("id");
+        let element = || DomElementData {
+            tag,
+            namespace: None,
+            attributes: Vec::new(),
+            attribute_cache: DomElementAttributeCache::new(None, 0..0),
+            image_idx: None,
+        };
+        let (root, builder) = builder.append_dom_element(None, element()).unwrap();
+        let mut builder = builder.set_dom_root(root).unwrap();
+        builder.append_dom_text(root, "dup").unwrap();
+        let mut nodes = Vec::new();
+        for id in ["dup", "Dup", "", "dup"] {
+            let node = builder.append_dom_element(Some(root), element()).unwrap();
+            let id_idx = builder.intern_string(id);
+            builder.set_dom_id_attribute(node, id_idx, id_name).unwrap();
+            nodes.push(node);
+        }
+        let document = builder.finish().unwrap();
+        for (id, expected) in [("dup", nodes[0]), ("Dup", nodes[1]), ("", nodes[2])] {
+            assert_eq!(
+                document.element_by_id(id).map(ElementRef::node_id),
+                Some(expected)
+            );
+        }
+        assert!(document.element_by_id("span").is_none());
+        assert!(document.element_by_id("not-interned").is_none());
+    }
+
+    #[test]
     fn html_attribute_names_are_ascii_case_insensitive() {
         let mut builder = DocumentBuilder::new();
         builder.set_mode(DocumentMode::Html);
@@ -1384,6 +1438,57 @@ mod tests {
         let forged_id = DomNodeId::new(foreign_root.raw(), 0);
 
         assert!(matches!(local_builder.set_dom_root(forged_id), Err(DocumentBuildError::ForeignNodeId { raw }) if raw == foreign_root.raw()));
+    }
+
+    #[test]
+    fn invalid_element_targets_are_rejected_before_builder_mutation() {
+        let mut builder = DocumentBuilder::new();
+        let tag = builder.intern_string("div");
+        let id_name = builder.intern_string("id");
+        let id_value = builder.intern_string("target");
+        let element = || DomElementData {
+            tag,
+            namespace: None,
+            attributes: Vec::new(),
+            attribute_cache: DomElementAttributeCache::new(None, 0..0),
+            image_idx: None,
+        };
+        let (root, mut builder) = builder.append_dom_element(None, element()).unwrap();
+        let text = builder.append_dom_text(root, "text").unwrap();
+        let foreign = DomNodeId::new(root.raw(), 0);
+        let missing = DomNodeId::new(u32::MAX, root.token());
+        for (node, expected) in [
+            (
+                foreign,
+                DocumentBuildError::ForeignNodeId { raw: foreign.raw() },
+            ),
+            (
+                missing,
+                DocumentBuildError::InvalidNodeId { raw: missing.raw() },
+            ),
+            (
+                text,
+                DocumentBuildError::NodeTypeMismatch {
+                    raw: text.raw(),
+                    expected_text_parent: false,
+                },
+            ),
+        ] {
+            assert_eq!(
+                builder.append_dom_element(Some(node), element()),
+                Err(expected)
+            );
+            assert_eq!(builder.append_dom_text(node, "rejected"), Err(expected));
+            assert_eq!(
+                builder.set_dom_id_attribute(node, id_value, id_name),
+                Err(expected)
+            );
+            assert_eq!(builder.document().node_count(), 2);
+        }
+        let document = builder.set_dom_root(root).unwrap().finish().unwrap();
+        let root = document.element_ref(root).unwrap();
+        assert_eq!(root.children().collect::<Vec<_>>(), [text]);
+        assert_eq!(root.attr("id"), None);
     }
 
     #[test]

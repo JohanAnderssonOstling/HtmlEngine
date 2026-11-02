@@ -77,30 +77,6 @@ Skrift is a framework agnostic HTML and CSS rendering engine built with the purp
   - [ ] Background images, gradients, and border images
   - [ ] Shadows, opacity, transforms, and filters
 
-## CSS support limits
-
-Parser acceptance alone does not imply rendering support. `@supports` checks
-the implemented property and value, and reports unsupported features as false.
-An implemented property can still have unsupported values.
-Selector syntax checks follow the native parser; newer pseudo-element chains
-that require parser extensions are outside their scope.
-
-| Area | Unsupported features |
-| --- | --- |
-| Painting | CSS background images, gradients, border images, box and text shadows, opacity, transforms, masks, `clip-path`, and filters including backdrop filters |
-| Motion | CSS animations, transitions, and `@keyframes` |
-| Layout | Fixed and sticky positioning, subgrid, grid lanes, anchor positioning, `calc-size()`, vertical and sideways writing, and containment beyond `contain: size` |
-| Typography | Ruby annotations, advanced baseline alignment modes, custom text overflow strings, fading overflow, custom counter styles, and string list markers |
-| Generated content | `content: url(...)`, CSS `reversed()` counters, and alternative text forms such as `content: 'text' / 'alternative'` |
-| Colors | `color-layers()`, `contrast-color()`, and relative color values the backend cannot resolve |
-| At-rules | `@container` queries, `@page` styling, `@property` registration, `@position-try`, `@custom-media` aliases, and `@counter-style` definitions |
-
-Document images such as `<img>` and SVG are supported. Ordinary grid tracks,
-`text-overflow: ellipsis`, generated text and counters, and HTML reversed lists
-are also supported within the feature checklist above. The
-[renderer capability checks](crates/03-html-style/src/style/02-syntax/capabilities.rs)
-define the implemented CSS subset.
-
 ## Additional features
 
 - Knuth Plass paragraph line breaking
@@ -115,57 +91,64 @@ define the implemented CSS subset.
 
 ## Benchmark environment
 
-| Component | Version |
+| Component | Version / configuration |
 | --- | --- |
+| CPU | AMD Ryzen 7 6800HS Creator Edition |
 | GPUI | 0.2.2 |
 | Wry binding (`lb-wry`) | 0.53.3 |
 | WebKitGTK runtime | 2.54.2 |
 | GTK runtime | 3.24.52 |
+| Host/helper CPU set | 8, 10, 12, 14: four physical cores, one SMT thread per core |
+| CPU frequency limits | 3.0 GHz minimum and maximum, including SMT siblings |
+| First viewport | 800 × 600 pixels, scale 1, X11 |
+| Samples | 5 fresh processes per engine and case; 160 measurements |
 
 ## Warm engine RAM
 
+Median after empty-page warmup for the Article case, before loading its content.
+
 <table>
 <thead>
-<tr><th>GPUI + Skrift</th><th>GPUI + Wry</th><th>Size ratio</th></tr>
+<tr><th>GPUI + Skrift</th><th>GPUI + WebKitGTK</th><th>Size ratio</th></tr>
 </thead>
 <tbody>
-<tr><td>88 MiB</td><td>215 MiB</td><td>2.43×</td></tr>
+<tr><td>73.2 MiB</td><td>210.1 MiB</td><td>2.87×</td></tr>
 </tbody>
 </table>
 
-## Cold first rendered frame
+## Cold first viewport
 
 <table>
 <thead>
 <tr><th rowspan="2">Document</th><th colspan="3">CPU time (ms)</th><th colspan="3">Total RAM (MiB)</th></tr>
-<tr><th>Skrift</th><th>Wry</th><th>Speedup</th><th>Skrift</th><th>Wry</th><th>Size ratio</th></tr>
+<tr><th>Skrift</th><th>WebKitGTK</th><th>CPU ratio</th><th>Skrift</th><th>WebKitGTK</th><th>Size ratio</th></tr>
 </thead>
 <tbody>
-<tr><th scope="row"><a href="https://github.com/JohanAnderssonOstling/HtmlEngine/blob/master/tools/embed-bench/fixtures/article.html">Article</a></th><td>53</td><td>280</td><td>5.32×</td><td>94</td><td>213</td><td>2.26×</td></tr>
-<tr><th scope="row"><a href="https://github.com/JohanAnderssonOstling/HtmlEngine/blob/master/tools/embed-bench/fixtures/images.html">Images</a></th><td>44</td><td>308</td><td>7.04×</td><td>83</td><td>208</td><td>2.50×</td></tr>
-<tr><th scope="row"><a href="https://github.com/JohanAnderssonOstling/HtmlEngine/blob/master/tools/embed-bench/fixtures/tables.html">Tables</a></th><td>45</td><td>284</td><td>6.25×</td><td>98</td><td>219</td><td>2.23×</td></tr>
-<tr><th scope="row"><a href="https://github.com/JohanAnderssonOstling/HtmlEngine/blob/master/tools/embed-bench/fixtures/languages/rtl-arabic.html">Arabic (RTL)</a></th><td>26</td><td>274</td><td>10.61×</td><td>96</td><td>221</td><td>2.30×</td></tr>
-<tr><th scope="row"><a href="https://github.com/JohanAnderssonOstling/HtmlEngine/blob/master/tools/embed-bench/fixtures/languages/cjk-japanese.html">Japanese (CJK)</a></th><td>31</td><td>294</td><td>9.58×</td><td>98</td><td>219</td><td>2.23×</td></tr>
-<tr><th scope="row"><a href="https://github.com/JohanAnderssonOstling/HtmlEngine/blob/master/tools/embed-bench/fixtures/large-document.html">Very large document</a></th><td>682</td><td>593</td><td>0.87×</td><td>285</td><td>299</td><td>1.05×</td></tr>
-<tr><th scope="row"><a href="https://github.com/JohanAnderssonOstling/HtmlEngine/blob/master/tools/embed-bench/fixtures/books/middlemarch/chapter-37.xhtml">Middlemarch chapter</a></th><td>95</td><td>448</td><td>4.70×</td><td>103</td><td>222</td><td>2.16×</td></tr>
+<tr><th scope="row"><a href="tools/embed-bench/fixtures/article.html">Article</a></th><td>108.1</td><td>465.6</td><td>4.31×</td><td>74.1</td><td>216.3</td><td>2.92×</td></tr>
+<tr><th scope="row"><a href="tools/embed-bench/fixtures/images.html">Images</a></th><td>92.3</td><td>432.7</td><td>4.69×</td><td>77.9</td><td>220.4</td><td>2.83×</td></tr>
+<tr><th scope="row"><a href="tools/embed-bench/fixtures/tables.html">Tables</a></th><td>94.2</td><td>508.4</td><td>5.39×</td><td>78.0</td><td>219.3</td><td>2.81×</td></tr>
+<tr><th scope="row"><a href="tools/embed-bench/fixtures/languages/rtl-arabic.html">Arabic (RTL)</a></th><td>93.5</td><td>407.7</td><td>4.36×</td><td>75.6</td><td>218.6</td><td>2.89×</td></tr>
+<tr><th scope="row"><a href="tools/embed-bench/fixtures/languages/cjk-japanese.html">Japanese (CJK)</a></th><td>129.0</td><td>496.8</td><td>3.85×</td><td>78.0</td><td>220.7</td><td>2.83×</td></tr>
+<tr><th scope="row"><a href="tools/embed-bench/fixtures/large-document.html">Very large document</a></th><td>2353.4</td><td>1030.8</td><td>0.44×</td><td>235.5</td><td>295.2</td><td>1.25×</td></tr>
+<tr><th scope="row"><a href="tools/embed-bench/results/middlemarch-hyphenation-performance-20261101-180925/inputs/hyphens-auto.xhtml">Middlemarch chapter</a></th><td>108.2</td><td>527.7</td><td>4.88×</td><td>80.0</td><td>234.5</td><td>2.93×</td></tr>
 </tbody>
 </table>
 
-## Warm first rendered frame
+## Warm first viewport
 
 <table>
 <thead>
 <tr><th rowspan="2">Document</th><th colspan="3">CPU time (ms)</th><th colspan="3">RAM before (MiB)</th><th colspan="3">RAM after (MiB)</th></tr>
-<tr><th>Skrift</th><th>Wry</th><th>Speedup</th><th>Skrift</th><th>Wry</th><th>Size ratio</th><th>Skrift</th><th>Wry</th><th>Size ratio</th></tr>
+<tr><th>Skrift</th><th>WebKitGTK</th><th>CPU ratio</th><th>Skrift</th><th>WebKitGTK</th><th>Size ratio</th><th>Skrift</th><th>WebKitGTK</th><th>Size ratio</th></tr>
 </thead>
 <tbody>
-<tr><th scope="row"><a href="https://github.com/JohanAnderssonOstling/HtmlEngine/blob/master/tools/embed-bench/fixtures/article.html">Article</a></th><td>44</td><td>28</td><td>0.64×</td><td>88</td><td>215</td><td>2.43×</td><td>98</td><td>221</td><td>2.26×</td></tr>
-<tr><th scope="row"><a href="https://github.com/JohanAnderssonOstling/HtmlEngine/blob/master/tools/embed-bench/fixtures/images.html">Images</a></th><td>38</td><td>21</td><td>0.56×</td><td>89</td><td>215</td><td>2.43×</td><td>102</td><td>223</td><td>2.19×</td></tr>
-<tr><th scope="row"><a href="https://github.com/JohanAnderssonOstling/HtmlEngine/blob/master/tools/embed-bench/fixtures/tables.html">Tables</a></th><td>40</td><td>29</td><td>0.71×</td><td>88</td><td>214</td><td>2.42×</td><td>99</td><td>221</td><td>2.23×</td></tr>
-<tr><th scope="row"><a href="https://github.com/JohanAnderssonOstling/HtmlEngine/blob/master/tools/embed-bench/fixtures/languages/rtl-arabic.html">Arabic (RTL)</a></th><td>24</td><td>18</td><td>0.74×</td><td>89</td><td>212</td><td>2.39×</td><td>99</td><td>217</td><td>2.20×</td></tr>
-<tr><th scope="row"><a href="https://github.com/JohanAnderssonOstling/HtmlEngine/blob/master/tools/embed-bench/fixtures/languages/cjk-japanese.html">Japanese (CJK)</a></th><td>28</td><td>39</td><td>1.42×</td><td>88</td><td>214</td><td>2.42×</td><td>101</td><td>222</td><td>2.20×</td></tr>
-<tr><th scope="row"><a href="https://github.com/JohanAnderssonOstling/HtmlEngine/blob/master/tools/embed-bench/fixtures/large-document.html">Very large document</a></th><td>680</td><td>382</td><td>0.56×</td><td>88</td><td>213</td><td>2.42×</td><td>286</td><td>299</td><td>1.05×</td></tr>
-<tr><th scope="row"><a href="https://github.com/JohanAnderssonOstling/HtmlEngine/blob/master/tools/embed-bench/fixtures/books/middlemarch/chapter-37.xhtml">Middlemarch chapter</a></th><td>98</td><td>95</td><td>0.98×</td><td>89</td><td>211</td><td>2.38×</td><td>105</td><td>226</td><td>2.15×</td></tr>
+<tr><th scope="row"><a href="tools/embed-bench/fixtures/article.html">Article</a></th><td>56.2</td><td>54.8</td><td>0.98×</td><td>73.2</td><td>210.1</td><td>2.87×</td><td>75.6</td><td>216.6</td><td>2.87×</td></tr>
+<tr><th scope="row"><a href="tools/embed-bench/fixtures/images.html">Images</a></th><td>57.4</td><td>51.5</td><td>0.90×</td><td>73.7</td><td>211.5</td><td>2.87×</td><td>78.2</td><td>219.9</td><td>2.81×</td></tr>
+<tr><th scope="row"><a href="tools/embed-bench/fixtures/tables.html">Tables</a></th><td>55.6</td><td>63.2</td><td>1.14×</td><td>75.0</td><td>214.7</td><td>2.86×</td><td>78.3</td><td>223.0</td><td>2.85×</td></tr>
+<tr><th scope="row"><a href="tools/embed-bench/fixtures/languages/rtl-arabic.html">Arabic (RTL)</a></th><td>53.5</td><td>37.0</td><td>0.69×</td><td>73.8</td><td>210.3</td><td>2.85×</td><td>76.0</td><td>216.0</td><td>2.84×</td></tr>
+<tr><th scope="row"><a href="tools/embed-bench/fixtures/languages/cjk-japanese.html">Japanese (CJK)</a></th><td>75.8</td><td>42.2</td><td>0.56×</td><td>73.3</td><td>213.7</td><td>2.92×</td><td>78.4</td><td>221.9</td><td>2.83×</td></tr>
+<tr><th scope="row"><a href="tools/embed-bench/fixtures/large-document.html">Very large document</a></th><td>2267.9</td><td>587.1</td><td>0.26×</td><td>73.4</td><td>217.7</td><td>2.96×</td><td>234.3</td><td>303.4</td><td>1.29×</td></tr>
+<tr><th scope="row"><a href="tools/embed-bench/results/middlemarch-hyphenation-performance-20261101-180925/inputs/hyphens-auto.xhtml">Middlemarch chapter</a></th><td>71.2</td><td>124.4</td><td>1.75×</td><td>73.5</td><td>212.2</td><td>2.89×</td><td>80.5</td><td>229.0</td><td>2.84×</td></tr>
 </tbody>
 </table>
 
@@ -174,18 +157,15 @@ define the implemented CSS subset.
 <table>
 <thead>
 <tr><th rowspan="2">Document</th><th colspan="3">CPU time (ms)</th><th colspan="3">RAM before (MiB)</th><th colspan="3">RAM after (MiB)</th></tr>
-<tr><th>Skrift</th><th>Wry</th><th>Speedup</th><th>Skrift</th><th>Wry</th><th>Size ratio</th><th>Skrift</th><th>Wry</th><th>Size ratio</th></tr>
+<tr><th>Skrift</th><th>WebKitGTK</th><th>CPU ratio</th><th>Skrift</th><th>WebKitGTK</th><th>Size ratio</th><th>Skrift</th><th>WebKitGTK</th><th>Size ratio</th></tr>
 </thead>
 <tbody>
-<tr><th scope="row"><a href="https://github.com/JohanAnderssonOstling/HtmlEngine/blob/master/tools/embed-bench/fixtures/tables.html">Tables</a></th><td>46</td><td>84</td><td>1.83×</td><td>88</td><td>211</td><td>2.39×</td><td>100</td><td>220</td><td>2.20×</td></tr>
-<tr><th scope="row"><a href="https://github.com/JohanAnderssonOstling/HtmlEngine/blob/master/tools/embed-bench/fixtures/large-document.html">Very large document</a></th><td>5401</td><td>18275</td><td>3.38×</td><td>88</td><td>208</td><td>2.37×</td><td>288</td><td>349</td><td>1.21×</td></tr>
-<tr><th scope="row"><a href="https://github.com/JohanAnderssonOstling/HtmlEngine/blob/master/tools/embed-bench/fixtures/books/middlemarch/chapter-37.xhtml">Middlemarch chapter</a></th><td>125</td><td>335</td><td>2.69×</td><td>89</td><td>211</td><td>2.38×</td><td>108</td><td>231</td><td>2.14×</td></tr>
+<tr><th scope="row"><a href="tools/embed-bench/fixtures/tables.html">Tables</a></th><td>59.6</td><td>65.4</td><td>1.10×</td><td>73.9</td><td>219.0</td><td>2.96×</td><td>79.0</td><td>228.4</td><td>2.89×</td></tr>
+<tr><th scope="row"><a href="tools/embed-bench/results/middlemarch-hyphenation-performance-20261101-180925/inputs/hyphens-auto.xhtml">Middlemarch chapter</a></th><td>105.6</td><td>147.4</td><td>1.40×</td><td>73.4</td><td>226.2</td><td>3.08×</td><td>91.5</td><td>243.9</td><td>2.66×</td></tr>
 </tbody>
 </table>
 
-One sample per engine and document. CPU includes viewport snapshot readback. RAM is total process session PSS including helpers and excluding GPU VRAM. Cold shows total RAM after rendering; warm tables show RAM before and after loading. Cold starts from an empty GPUI window; warm starts after the engine renders an empty document. Layout differences remain between engines.
-
-Raw results: [cold](tools/embed-bench/results/gpui-culled-suite-cold-first-20261027.json), [warm](tools/embed-bench/results/gpui-culled-suite-warm-first-20261027.json), [whole document](tools/embed-bench/results/gpui-culled-suite-warm-whole-20261027.json).
+Raw results: [summary](tools/embed-bench/results/fixed-frequency-suite-20261101-204746/summary.json), [measurement plan](tools/embed-bench/results/fixed-frequency-suite-20261101-204746/plan.json) and [validation](tools/embed-bench/results/fixed-frequency-suite-20261101-204746/validation.json). Individual samples, CPU checkpoints and ranges are retained in the results directory.
 
 ## Executable size
 
@@ -214,3 +194,12 @@ Raw results: [cold](tools/embed-bench/results/gpui-culled-suite-cold-first-20261
 
 Host applications can provide navigation and input handling around the rendered
 document.
+
+Optional GPUI rendering and font/image support live in the separate
+[`adapters` workspace](adapters/README.md). Core engine crates remain independent
+of GPUI and application repositories.
+
+Saved WPT dependency limitations are tracked in the
+[dependency registry](testdata/wpt/dependency-limitations/README.txt), with exact
+assertion keys, parser evidence, and separate classifications for confirmed
+limitations, candidates requiring investigation, and engine implementation gaps.

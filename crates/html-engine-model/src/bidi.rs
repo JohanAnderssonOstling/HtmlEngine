@@ -5,9 +5,9 @@
 
 use crate::{InlineContent, InlineItem, InlineItemKind, LayoutMode, LayoutTree};
 use html_style_model::{ComputedStyles, TextDirection, UnicodeBidi};
-use html_text::get_style;
-use html_text::{is_bidi_control, whitespace_context_root};
+use html_text::{TextChunk, for_each_text_chunk, get_style, is_bidi_control, is_mandatory_line_break};
 use rustc_data_structures::fx::FxHashMap;
+use std::ops::Range;
 use std::sync::Arc;
 use unicode_bidi::{BidiClass, BidiInfo, Level, bidi_class};
 use unicode_segmentation::UnicodeSegmentation;
@@ -32,7 +32,6 @@ impl ResolvedBidi {
             .characters()
             .iter()
             .copied()
-            .filter_map(char::from_u32)
             .any(|character| {
                 character > '\u{007f}'
                     && (matches!(
@@ -47,6 +46,7 @@ impl ResolvedBidi {
             return Self::default();
         }
         let mut paragraphs = FxHashMap::<usize, Paragraph>::default();
+        let mut ancestors = Vec::new();
         for item in content.inline_items() {
             if matches!(
                 item.kind,
@@ -54,22 +54,11 @@ impl ResolvedBidi {
             ) {
                 continue;
             }
-            let owner = item.box_idx as usize;
-            let context_owner = if matches!(
-                item.kind,
-                InlineItemKind::Image { .. } | InlineItemKind::AtomicBox { .. }
-            ) {
-                tree.get_box_parent(owner).unwrap_or(owner)
-            } else {
-                owner
-            };
-            let root = if matches!(item.kind, InlineItemKind::Marker { .. }) {
-                owner
-            } else {
-                whitespace_context_root(tree, context_owner)
-            };
+            let context_owner = item.context_owner(tree);
+            let root = item.paragraph_root(tree);
             let paragraph = paragraphs.entry(root).or_default();
-            let mut ancestors = vec![context_owner];
+            ancestors.clear();
+            ancestors.push(context_owner);
             while *ancestors.last().expect("bidi owner") != root {
                 let Some(parent) = tree.get_box_parent(*ancestors.last().expect("bidi owner"))
                 else {
@@ -84,14 +73,13 @@ impl ResolvedBidi {
                     for index in glyphs.clone() {
                         let character = content
                             .character_at(index as usize)
-                            .and_then(char::from_u32)
                             .unwrap_or('\u{fffd}');
-                        if character == '\n' {
+                        if character == '\n' || is_mandatory_line_break(character) {
                             paragraph.close(styles, tree);
                         }
                         paragraph.glyphs.push((index, paragraph.text.len()));
                         paragraph.text.push(character);
-                        if character == '\n' {
+                        if character == '\n' || is_mandatory_line_break(character) {
                             paragraph.open(styles, tree);
                         }
                     }
@@ -124,11 +112,34 @@ impl ResolvedBidi {
             let base = (paragraph_unicode_bidi(styles, tree, root) != UnicodeBidi::Plaintext)
                 .then(|| direction_level(style.direction()));
             let info = BidiInfo::new(&paragraph.text, base);
+            // CSS plaintext line-box alignment inherits the preceding line's
+            // direction when this paragraph has no strong text. Keep that
+            // alignment bit separate from UAX9's resolved character levels.
+            let alignment_bases = base.is_none().then(|| {
+                let mut previous = direction_level(style.direction()).number();
+                info.paragraphs.iter().map(|paragraph_info| {
+                    let mut isolates = 0usize;
+                    let strong = paragraph.text[paragraph_info.range.clone()].chars().any(|ch| {
+                        match bidi_class(ch) {
+                            BidiClass::LRI | BidiClass::RLI | BidiClass::FSI => isolates += 1,
+                            BidiClass::PDI => isolates = isolates.saturating_sub(1),
+                            BidiClass::L | BidiClass::R | BidiClass::AL if isolates == 0 => return true,
+                            _ => {}
+                        }
+                        false
+                    });
+                    if strong { previous = paragraph_info.level.number(); }
+                    previous
+                }).collect::<Vec<_>>()
+            });
             for (glyph, byte) in paragraph.glyphs {
                 let paragraph = info
                     .paragraphs
                     .partition_point(|paragraph| paragraph.range.end <= byte);
-                let base = info.paragraphs[paragraph].level.number();
+                let base = alignment_bases.as_ref().map_or_else(
+                    || info.paragraphs[paragraph].level.number(),
+                    |bases| bases[paragraph],
+                );
                 result.levels[glyph as usize] = info.levels[byte].number() | (base << 7);
             }
             for (item, byte) in paragraph.items {
@@ -144,8 +155,37 @@ impl ResolvedBidi {
         result
     }
 
+    /// All character and item levels use the implicit LTR defaults.
+    #[inline]
+    pub fn is_default_ltr(&self) -> bool {
+        self.levels.is_empty() && self.items.is_empty()
+    }
+
     pub fn level(&self, index: u32) -> u8 {
         self.levels.get(index as usize).copied().unwrap_or(0) & 0x7f
+    }
+
+    /// Consecutive logical character ranges with the same embedding level.
+    /// Unstored levels retain the default LTR value without scanning the tail.
+    pub fn level_runs(
+        &self,
+        mut range: Range<u32>,
+    ) -> impl Iterator<Item = (Range<u32>, u8)> + Clone + '_ {
+        let stored_end = range
+            .end
+            .min(u32::try_from(self.levels.len()).unwrap_or(u32::MAX));
+        std::iter::from_fn(move || {
+            if range.is_empty() {
+                return None;
+            }
+            let start = range.start;
+            let level = self.level(start);
+            let end = (start + 1..stored_end)
+                .find(|&index| self.level(index) != level)
+                .unwrap_or(if level == 0 { range.end } else { stored_end });
+            range.start = end;
+            Some((start..end, level))
+        })
     }
 
     pub fn paragraph_direction(&self, index: u32) -> TextDirection {
@@ -184,28 +224,33 @@ pub fn grapheme_boundaries(text: &str, character_count: usize) -> Arc<[bool]> {
     // scanning the UTF-8 text again just to size this array.
     debug_assert_eq!(text.chars().count(), character_count);
     let mut boundaries = vec![true; character_count + 1];
-    if text.is_ascii() {
-        // Every ASCII scalar stands alone except the CR/LF pair. This also
-        // covers control characters without entering the Unicode iterator.
-        for (index, pair) in text.as_bytes().windows(2).enumerate() {
-            if pair == b"\r\n" {
-                boundaries[index + 1] = false;
+    let mut index = 0;
+    for_each_text_chunk(text, |chunk| match chunk {
+        TextChunk::Ascii(text) => {
+            // ASCII scalars stand alone except CR/LF. Most stretches need
+            // only their length, without a Unicode or per-character walk.
+            let bytes = text.as_bytes();
+            if bytes.contains(&b'\r') {
+                for (offset, pair) in bytes.windows(2).enumerate() {
+                    if pair == b"\r\n" {
+                        boundaries[index + offset + 1] = false;
+                    }
+                }
+            }
+            index += bytes.len();
+        }
+        TextChunk::Unicode(text) => {
+            for grapheme in text.graphemes(true) {
+                if grapheme.len() == 1 {
+                    index += 1;
+                } else {
+                    let scalars = grapheme.chars().count();
+                    boundaries[index + 1..index + scalars].fill(false);
+                    index += scalars;
+                }
             }
         }
-        return boundaries.into();
-    }
-
-    let mut index = 0;
-    for grapheme in text.graphemes(true) {
-        if grapheme.len() == 1 {
-            // Most graphemes in mixed Latin text are single-byte ASCII.
-            index += 1;
-        } else {
-            let scalars = grapheme.chars().count();
-            boundaries[index + 1..index + scalars].fill(false);
-            index += scalars;
-        }
-    }
+    });
     debug_assert_eq!(index, character_count);
     boundaries.into()
 }
@@ -227,7 +272,7 @@ pub fn paragraph_unicode_bidi(
 ) -> UnicodeBidi {
     let mut anonymous = false;
     while matches!(
-        tree.box_at(owner).map(|box_| box_.layout_mode()),
+        tree.get_box_layout_mode(owner),
         Some(LayoutMode::Anonymous(_))
     ) {
         let Some(parent) = tree.get_box_parent(owner) else {
@@ -257,56 +302,35 @@ impl Paragraph {
             .zip(ancestors)
             .take_while(|(a, b)| a == b)
             .count();
-        for &owner in self.ancestors[shared..].iter().rev() {
-            self.text.push_str(
-                controls(
-                    paragraph_unicode_bidi(styles, tree, owner),
-                    get_style(styles, tree, owner).direction(),
-                    self.ancestors.first() == Some(&owner),
-                )
-                .1,
-            );
-        }
+        self.append_controls((shared..self.ancestors.len()).rev(), styles, tree, false);
         self.ancestors.truncate(shared);
-        for &owner in &ancestors[shared..] {
-            let style = get_style(styles, tree, owner);
-            self.text.push_str(
-                controls(
-                    paragraph_unicode_bidi(styles, tree, owner),
-                    style.direction(),
-                    ancestors.first() == Some(&owner),
-                )
-                .0,
-            );
-            self.ancestors.push(owner);
-        }
+        self.ancestors.extend_from_slice(&ancestors[shared..]);
+        self.append_controls(shared..self.ancestors.len(), styles, tree, true);
     }
 
     fn close(&mut self, styles: &ComputedStyles, tree: &LayoutTree) {
-        for &owner in self.ancestors.iter().rev() {
-            let style = get_style(styles, tree, owner);
-            self.text.push_str(
-                controls(
-                    paragraph_unicode_bidi(styles, tree, owner),
-                    style.direction(),
-                    self.ancestors.first() == Some(&owner),
-                )
-                .1,
-            );
-        }
+        self.append_controls((0..self.ancestors.len()).rev(), styles, tree, false);
     }
 
     fn open(&mut self, styles: &ComputedStyles, tree: &LayoutTree) {
-        for &owner in &self.ancestors {
-            let style = get_style(styles, tree, owner);
-            self.text.push_str(
-                controls(
-                    paragraph_unicode_bidi(styles, tree, owner),
-                    style.direction(),
-                    self.ancestors.first() == Some(&owner),
-                )
-                .0,
+        self.append_controls(0..self.ancestors.len(), styles, tree, true);
+    }
+
+    fn append_controls(
+        &mut self,
+        indices: impl Iterator<Item = usize>,
+        styles: &ComputedStyles,
+        tree: &LayoutTree,
+        opening: bool,
+    ) {
+        for index in indices {
+            let owner = self.ancestors[index];
+            let (open, close) = controls(
+                paragraph_unicode_bidi(styles, tree, owner),
+                get_style(styles, tree, owner).direction(),
+                self.ancestors.first() == Some(&owner),
             );
+            self.text.push_str(if opening { open } else { close });
         }
     }
 }
@@ -344,9 +368,38 @@ fn controls(
 
 #[cfg(test)]
 mod tests {
-    use super::grapheme_boundaries;
+    use super::{ResolvedBidi, grapheme_boundaries};
     use std::iter::once;
+    use std::ops::Range;
     use unicode_segmentation::UnicodeSegmentation;
+
+    #[test]
+    fn level_runs_preserve_embedding_levels_subranges_and_unstored_ltr_tails() {
+        let bidi = ResolvedBidi {
+            levels: vec![0, 0x80, 1, 0x81, 2, 0x82, 0],
+            ..Default::default()
+        };
+        assert_eq!(
+            bidi.level_runs(0..7).collect::<Vec<_>>(),
+            [(0..2, 0), (2..4, 1), (4..6, 2), (6..7, 0)]
+        );
+        assert_eq!(
+            bidi.level_runs(1..5).collect::<Vec<_>>(),
+            [(1..2, 0), (2..4, 1), (4..5, 2)]
+        );
+        assert_eq!(
+            bidi.level_runs(5..u32::MAX).collect::<Vec<_>>(),
+            [(5..6, 2), (6..u32::MAX, 0)]
+        );
+        assert_eq!(
+            ResolvedBidi::default()
+                .level_runs(0..u32::MAX)
+                .collect::<Vec<_>>(),
+            [(0..u32::MAX, 0)]
+        );
+        assert!(bidi.level_runs(2..2).next().is_none());
+        assert!(bidi.level_runs(Range { start: 6, end: 5 }).next().is_none());
+    }
 
     fn assert_unicode_boundaries(text: &str) {
         // Compare scalar-indexed output with the library's byte-indexed

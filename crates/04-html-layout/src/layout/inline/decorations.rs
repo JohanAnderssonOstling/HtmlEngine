@@ -1,32 +1,30 @@
 use super::super::border_geometry::{
-    emit_border_fragments, emit_horizontal_pattern, emit_outline_fragments, uniform_solid_border,
+    emit_horizontal_pattern, emit_outline_fragments, physical_borders,
 };
 use super::super::decorations::DecorationEmitter;
-use crate::layout_model::{LayoutMode, Line, LineInlineBoxFragment, RoundedDecoration};
+use crate::layout_model::{Line, LineInlineBoxFragment};
 use html_style_model::BorderStyle;
 use kurbo::Rect;
 
 impl DecorationEmitter<'_, '_, '_> {
     pub(in crate::layout) fn collect_inline_decorations(&mut self) {
-        if self.fragments.state().line_output.lines.is_empty()
-            || self.inline_content.inline_items_empty()
-        {
+        if self.inline_content.inline_items_empty() {
             return;
         }
 
-        let lines = self.fragments.state().line_output.lines.to_vec();
-        for (line_idx, line) in lines.into_iter().enumerate() {
-            let inline_range = line.inline_box_fragments(&self.fragments.state().line_output.line_details);
-            let fragment_range = inline_range.start as usize..inline_range.end as usize;
-            let fragments = self
-                .fragments
-                .state()
-                .line_output
+        // Emission appends paint output without changing the source line/fragment arenas.
+        for line_idx in 0..self.fragments.line_len() {
+            let output = &self.fragments.state().line_output;
+            let line = output.lines[line_idx].clone();
+            let inline_range = line.inline_box_fragments(&output.line_details);
+            let start = inline_range.start as usize;
+            let count = output
                 .inline_box_fragments
-                .get(fragment_range)
-                .unwrap_or_default()
-                .to_vec();
-            for fragment in fragments {
+                .get(start..inline_range.end as usize)
+                .map_or(0, |fragments| fragments.len());
+            for fragment_idx in start..start + count {
+                let fragment =
+                    self.fragments.state().line_output.inline_box_fragments[fragment_idx];
                 self.emit_inline_segment(line_idx, &line, &fragment);
             }
         }
@@ -50,36 +48,23 @@ impl DecorationEmitter<'_, '_, '_> {
         let inline_start = fragment.flags & LineInlineBoxFragment::INLINE_START != 0;
         let inline_end = fragment.flags & LineInlineBoxFragment::INLINE_END != 0;
         let border_box_bounds = fragment.flags & LineInlineBoxFragment::BORDER_BOX_BOUNDS != 0;
-        let is_inline_box = matches!(
-            self.reader.box_layout_mode(box_idx),
-            Some(LayoutMode::Inline(_))
-        );
+        let is_inline_box = self.reader.is_inline_box(box_idx);
         let style = self.reader.paint_style(box_idx);
         if style.visibility() == html_style_model::Visibility::Hidden {
             return;
         }
         let background_color = style.background_color();
         let color_alpha = background_color & 0xFF;
-        let top_border = matches!(style.border_top_style(), BorderStyle::Solid)
-            .then_some((style.border_top_width() as f64, style.border_top_color()));
-        let right_border = (inline_end && matches!(style.border_right_style(), BorderStyle::Solid))
-            .then_some((
-                style.border_right_width() as f64,
-                style.border_right_color(),
-            ));
-        let bottom_border = matches!(style.border_bottom_style(), BorderStyle::Solid).then_some((
-            style.border_bottom_width() as f64,
-            style.border_bottom_color(),
-        ));
-        let left_border = (inline_start && matches!(style.border_left_style(), BorderStyle::Solid))
-            .then_some((style.border_left_width() as f64, style.border_left_color()));
+        let borders = physical_borders(&style);
+        let top_border = borders.top.solid();
+        let right_border = inline_end.then(|| borders.right.solid()).flatten();
+        let bottom_border = borders.bottom.solid();
+        let left_border = inline_start.then(|| borders.left.solid()).flatten();
         let uniform_border = (inline_start && inline_end)
-            .then(|| uniform_solid_border(&style))
+            .then(|| borders.uniform().and_then(|border| border.solid()))
             .flatten();
-        let has_any_border = top_border.is_some()
-            || right_border.is_some()
-            || bottom_border.is_some()
-            || left_border.is_some();
+        let solid_borders = [top_border, right_border, bottom_border, left_border];
+        let has_any_border = solid_borders.iter().any(Option::is_some);
         let cb_width = self.geometry.size(box_idx).width;
         let pad_left = if inline_start {
             style.padding_left().resolve(cb_width)
@@ -132,36 +117,12 @@ impl DecorationEmitter<'_, '_, '_> {
                 rect,
                 background_color,
                 true,
-                (!radii.is_zero()).then_some(RoundedDecoration {
-                    radii,
-                    border_width: None,
-                }),
+                (!radii.is_zero()).then_some(radii),
             );
         }
         if is_inline_box && has_any_border {
             let radii = style.border_radii().resolve(rect.width(), rect.height());
-            if let Some((border_width, border_color)) = uniform_border.filter(|_| !radii.is_zero())
-            {
-                self.push_decoration(
-                    rect,
-                    border_color,
-                    true,
-                    Some(RoundedDecoration {
-                        radii,
-                        border_width: Some(border_width as f32),
-                    }),
-                );
-            } else {
-                emit_border_fragments(
-                    self.fragments.decoration_store_mut(),
-                    rect,
-                    top_border,
-                    right_border,
-                    bottom_border,
-                    left_border,
-                    true,
-                );
-            }
+            self.emit_solid_border(rect, radii, uniform_border, solid_borders, true);
         }
         if is_inline_box && outline.style != BorderStyle::None && outline.width() > 0.0 {
             emit_outline_fragments(
@@ -184,53 +145,34 @@ impl DecorationEmitter<'_, '_, '_> {
                     .map_or(line.baseline, |ratio| f64::from(font_size * ratio));
                 let x_height = f64::from(font_size * font_metrics.x_height_ratio());
                 let fragments = self.fragments.decoration_store_mut();
-                if text_decoration.lines.underline() {
-                    let y = baseline + thickness * 0.5;
+                let mut emit = |y, foreground| {
                     emit_horizontal_pattern(
                         fragments,
                         Rect::new(start_x, y, end_x, y + thickness),
                         text_decoration_color,
                         text_decoration.style,
                         true,
-                        false,
+                        foreground,
                         false,
                     );
+                };
+                if text_decoration.lines.underline() {
+                    emit(baseline + thickness * 0.5, false);
                 }
                 if text_decoration.lines.overline() {
                     // The overline follows the selected font's ascent from
                     // the fragment baseline. It may sit above the nominal
                     // line top when the font metrics exceed the line-height.
-                    let y = baseline - ascent;
-                    emit_horizontal_pattern(
-                        fragments,
-                        Rect::new(start_x, y, end_x, y + thickness),
-                        text_decoration_color,
-                        text_decoration.style,
-                        true,
-                        false,
-                        false,
-                    );
+                    emit(baseline - ascent, false);
                 }
                 if text_decoration.lines.line_through() {
-                    let y = baseline - x_height * 0.5 - thickness * 0.5;
-                    emit_horizontal_pattern(
-                        fragments,
-                        Rect::new(start_x, y, end_x, y + thickness),
-                        text_decoration_color,
-                        text_decoration.style,
-                        true,
-                        true,
-                        false,
-                    );
+                    emit(baseline - x_height * 0.5 - thickness * 0.5, true);
                 }
             }
         }
-        if self.track_overflow_clips {
-            self.fragments.record_decoration_owner_since(
-                self.placement,
-                box_idx as u32,
-                decoration_start,
-            );
+        if self.reader.tracks_overflow_clips() {
+            self.fragments
+                .record_decoration_owner_since(box_idx as u32, decoration_start);
         }
         self.fragments
             .inherit_line_layer_for_decorations_since(line_idx, decoration_start);

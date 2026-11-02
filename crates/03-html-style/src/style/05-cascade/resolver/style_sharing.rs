@@ -4,7 +4,9 @@
 //! and relational selectors have already contributed their exact matched-rule
 //! identity. DOM-dependent presentational hints stay on the uncached path.
 
-use super::*;
+use super::plan::MatchedRule;
+use html_dom::ElementRef;
+use html_style_model::{CounterDirectives, StyleIndices};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxHasher};
 use std::hash::{Hash, Hasher};
 
@@ -46,13 +48,10 @@ pub(super) enum StyleSharingProbe {
     Miss(StyleSharingSignature),
 }
 
-fn element_is_shareable(doc: &Document, node: DomNodeId, has_inline_style: bool) -> bool {
+fn element_is_shareable(element: ElementRef<'_>, has_inline_style: bool) -> bool {
     if has_inline_style {
         return false;
     }
-    let Some(element) = doc.element_ref(node) else {
-        return false;
-    };
     // Cell hints can inherit border and padding from an ancestor table, an
     // input not represented by the parent computed style.
     if element.tag().eq_ignore_ascii_case("td") || element.tag().eq_ignore_ascii_case("th") {
@@ -64,20 +63,23 @@ fn element_is_shareable(doc: &Document, node: DomNodeId, has_inline_style: bool)
     const OUT_OF_BAND_ATTRIBUTES: &[&str] = &[
         "style", "lang", "dir", "hidden", "text", "color", "size", "width", "height", "bgcolor", "align", "valign", "border", "bordercolor", "type", "clear", "hspace", "vspace", "marginwidth", "marginheight", "topmargin", "rightmargin", "bottommargin", "leftmargin", "cellspacing", "cellpadding", "nowrap", "noshade",
     ];
-    !element.attributes().any(|attribute| OUT_OF_BAND_ATTRIBUTES.iter().any(|name| attribute.local_name().eq_ignore_ascii_case(name)))
+    !element.attributes().any(|attribute| {
+        OUT_OF_BAND_ATTRIBUTES
+            .iter()
+            .any(|name| attribute.local_name().eq_ignore_ascii_case(name))
+    })
 }
 
 impl StyleSharingCache {
     pub(super) fn probe(
         &mut self,
-        doc: &Document,
-        node: DomNodeId,
+        element: ElementRef<'_>,
         has_inline_style: bool,
         parent_style: Option<StyleIndices>,
         parent_custom_map_id: u32,
         matched_rules: &[MatchedRule],
     ) -> StyleSharingProbe {
-        if !element_is_shareable(doc, node, has_inline_style) {
+        if !element_is_shareable(element, has_inline_style) {
             return StyleSharingProbe::Uncacheable;
         }
         let mut hasher = FxHasher::default();
@@ -148,6 +150,7 @@ impl StyleSharingCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use html_style_model::ComputedStylesBuilder;
 
     #[test]
     fn exact_rule_and_parent_inputs_share_only_hint_free_elements() {
@@ -155,22 +158,40 @@ mod tests {
             "<!doctype html><html><body><p class='same'></p><p id='other' class='same'></p><p class='same' align='right'></p><p class='same' data-index='different'></p><table><tr><td class='same'></td></tr></table></body></html>",
         )
         .unwrap();
-        let paragraphs = doc.node_ids().filter(|&node| doc.get_dom_tag(node) == Some("p")).collect::<Vec<_>>();
-        let cell = doc.node_ids().find(|&node| doc.get_dom_tag(node) == Some("td")).unwrap();
+        let elements = || doc.node_ids().filter_map(|node| doc.element_ref(node));
+        let paragraphs = elements()
+            .filter(|element| element.tag() == "p")
+            .collect::<Vec<_>>();
+        let cell = elements().find(|element| element.tag() == "td").unwrap();
         let styles = ComputedStylesBuilder::new(&doc);
         let style = styles.default_indices();
         let mut cache = StyleSharingCache::default();
 
-        assert!(matches!(cache.probe(&doc, paragraphs[0], false, Some(style), 0, &[]), StyleSharingProbe::Uncacheable));
-        let signature = match cache.probe(&doc, paragraphs[1], false, Some(style), 0, &[]) {
+        assert!(matches!(
+            cache.probe(paragraphs[0], false, Some(style), 0, &[]),
+            StyleSharingProbe::Uncacheable
+        ));
+        let signature = match cache.probe(paragraphs[1], false, Some(style), 0, &[]) {
             StyleSharingProbe::Miss(signature) => signature,
             _ => panic!("a repeated hash must request an exact signature"),
         };
         cache.insert(signature, style, 0, CounterDirectives::default());
-        assert!(matches!(cache.probe(&doc, paragraphs[1], true, Some(style), 0, &[]), StyleSharingProbe::Uncacheable));
-        assert!(matches!(cache.probe(&doc, paragraphs[2], false, Some(style), 0, &[]), StyleSharingProbe::Uncacheable));
-        assert!(matches!(cache.probe(&doc, paragraphs[3], false, Some(style), 0, &[]), StyleSharingProbe::Hit(_)));
+        assert!(matches!(
+            cache.probe(paragraphs[1], true, Some(style), 0, &[]),
+            StyleSharingProbe::Uncacheable
+        ));
+        assert!(matches!(
+            cache.probe(paragraphs[2], false, Some(style), 0, &[]),
+            StyleSharingProbe::Uncacheable
+        ));
+        assert!(matches!(
+            cache.probe(paragraphs[3], false, Some(style), 0, &[]),
+            StyleSharingProbe::Hit(_)
+        ));
         assert_eq!(cache.hit_count(), 1);
-        assert!(matches!(cache.probe(&doc, cell, false, Some(style), 0, &[]), StyleSharingProbe::Uncacheable));
+        assert!(matches!(
+            cache.probe(cell, false, Some(style), 0, &[]),
+            StyleSharingProbe::Uncacheable
+        ));
     }
 }

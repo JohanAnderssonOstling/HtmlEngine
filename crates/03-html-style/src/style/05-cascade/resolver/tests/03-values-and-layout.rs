@@ -176,7 +176,7 @@ fn rtl_unicode_bidi_is_reset_and_css_wide_keywords_preserve_its_semantics() {
 
 #[test]
 fn invalid_font_shorthand_is_atomic() {
-    let html = "<html><body><div style='font:italic 700 20px/30px serif;font:4em/-2em monospace'></div></body></html>";
+    let html = "<html><body><div style='font:italic 700 20px/30px serif;font:4em/bogus monospace'></div></body></html>";
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, None);
     let node = find_body(document.document()).children().next().expect("test element");
@@ -193,13 +193,59 @@ fn invalid_font_shorthand_is_atomic() {
 }
 
 #[test]
+fn rejected_winners_preserve_atomic_fallbacks_across_retries_and_elements() {
+    let baseline = "font-size:20px;line-height:1.5;width:17px;padding:5px;\
+        font-feature-settings:&#34;ss04&#34; 3";
+    let rejected = "font-size:1ic;font-size:2ic;font:italic 900 3ic/4em monospace;\
+        width:1ic;width:2ic;padding:2px 3px 4px 1ic;\
+        color:red;color:var(--missing);height:99px;height:var(--missing)";
+    let html = format!(
+        "<body style='color:green;font-kerning:none;\
+         font-feature-settings:&#34;ss03&#34; 2;font-variant-numeric:tabular-nums;\
+         font-variant-ligatures:no-common-ligatures'>\
+         <p style='{baseline}'></p><p style='{baseline};{rejected}'></p>\
+         <p style='{baseline}'></p></body>"
+    );
+    let document = DocumentFactory::new().parse_with_new_pipeline(&html, None);
+    let styles = find_body(document.document())
+        .children()
+        .map(|node| document.style_for_node(node).expect("computed style"))
+        .collect::<Vec<_>>();
+    let font = document.font_style(styles[0]).unwrap();
+    let text = document.text_style(styles[0]).unwrap();
+    let box_model = document.box_model_style(styles[0]).unwrap();
+    assert_eq!(font.font_size, 20.0);
+    assert_eq!(font.font_feature_settings.len(), 1);
+    assert_eq!(text.line_height, 30.0);
+    assert_eq!(box_model.width, PreferredSize::Px(17.0));
+    for indices in &styles[1..] {
+        assert_eq!(document.font_style(*indices).unwrap(), font);
+        assert_eq!(document.text_style(*indices).unwrap(), text);
+        assert_eq!(document.box_model_style(*indices).unwrap(), box_model);
+    }
+}
+
+#[test]
 fn italic_and_oblique_remain_distinct_computed_font_styles() {
     let html = "<html><body><span id='italic' style='font-style:italic'></span><span id='oblique' style='font-style:oblique 12deg'></span></body></html>";
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, None);
     let font_style_for = |id| {
-        let node = document.document().node_ids().find(|&node| document.document().element_ref(node).and_then(|element| element.attr("id")) == Some(id)).expect("font style test element");
-        document.font_style(document.style_for_node(node).expect("computed style")).expect("font style").font_style
+        let node = document
+            .document()
+            .node_ids()
+            .find(|&node| {
+                document
+                    .document()
+                    .element_ref(node)
+                    .and_then(|element| element.attr("id"))
+                    == Some(id)
+            })
+            .expect("font style test element");
+        document
+            .font_style(document.style_for_node(node).expect("computed style"))
+            .expect("font style")
+            .font_style
     };
 
     assert_eq!(font_style_for("italic"), crate::document::FontStyle::Italic);
@@ -222,7 +268,7 @@ fn positive_infinite_flex_factor_is_normalized_before_storage() {
 
 #[test]
 fn invalid_var_substitution_uses_unset_instead_of_the_losing_declaration() {
-    let html = "<html><body style='font-size:22px'><div style='--bad:-1px;font-size:30px;font-size:var(--bad)'></div><div style='font-size:31px;font-size:var(--missing)'></div></body></html>";
+    let html = "<html><body style='font-size:22px'><div style='--bad:bogus;font-size:30px;font-size:var(--bad)'></div><div style='font-size:31px;font-size:var(--missing)'></div></body></html>";
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, None);
     let sizes = find_body(document.document())
@@ -328,8 +374,21 @@ fn logical_text_alignment_re_resolves_when_descendant_direction_changes() {
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, None);
     let alignment = |id| {
-        let node = document.document().node_ids().find(|&node| document.document().element_ref(node).and_then(|element| element.attr("id")) == Some(id)).expect("alignment test element");
-        document.text_style(document.style_for_node(node).expect("computed style")).expect("text style").text_align
+        let node = document
+            .document()
+            .node_ids()
+            .find(|&node| {
+                document
+                    .document()
+                    .element_ref(node)
+                    .and_then(|element| element.attr("id"))
+                    == Some(id)
+            })
+            .expect("alignment test element");
+        document
+            .text_style(document.style_for_node(node).expect("computed style"))
+            .expect("text style")
+            .text_align
     };
 
     assert_eq!(alignment("initial"), TextAlign::Right, "the initial logical start follows an HTML rtl direction hint");
@@ -368,11 +427,17 @@ fn stretch_size_keyword_reaches_computed_box_style() {
 
 #[test]
 fn border_radius_crosses_style_boundary_as_physical_length_percentages() {
-    let html = "<html><body><div style='direction:rtl;border-radius:10px 20% / 30px 40%;border-start-start-radius:7px 9px'></div></body></html>";
+    let html = "<html><body><div style='direction:rtl;border-radius:10px 20% / 30px 40%;border-start-start-radius:7px 9px'></div><div style='border-start-start-radius:1px;border-start-end-radius:2px;border-end-start-radius:3px;border-end-end-radius:4px'></div><div style='direction:rtl;border-start-start-radius:1px;border-start-end-radius:2px;border-end-start-radius:3px;border-end-end-radius:4px'></div></body></html>";
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, None);
-    let node = find_body(document.document()).children().next().expect("rounded box");
-    let indices = document.style_for_node(node).expect("computed rounded style");
+    let nodes = find_body(document.document())
+        .children()
+        .collect::<Vec<_>>();
+    assert_eq!(nodes.len(), 3);
+    let node = nodes[0];
+    let indices = document
+        .style_for_node(node)
+        .expect("computed rounded style");
     let radii = *document.border_radii_style(indices).expect("radius style");
 
     // In horizontal RTL, start-start is the physical top-right corner.
@@ -384,6 +449,25 @@ fn border_radius_crosses_style_boundary_as_physical_length_percentages() {
     assert_eq!(radii.bottom_right.y, LengthPct::Px(30.0));
     assert_eq!(radii.bottom_left.x, LengthPct::Pct(0.2));
     assert_eq!(radii.bottom_left.y, LengthPct::Pct(0.4));
+    for (&node, expected) in nodes[1..]
+        .iter()
+        .zip([[1.0, 2.0, 4.0, 3.0], [2.0, 1.0, 3.0, 4.0]])
+    {
+        let style = document.style_for_node(node).unwrap();
+        let radii = document.border_radii_style(style).unwrap();
+        for (corner, expected) in [
+            radii.top_left,
+            radii.top_right,
+            radii.bottom_right,
+            radii.bottom_left,
+        ]
+        .into_iter()
+        .zip(expected)
+        {
+            assert_eq!(corner.x, LengthPct::Px(expected));
+            assert_eq!(corner.y, LengthPct::Px(expected));
+        }
+    }
 }
 
 #[test]
@@ -415,11 +499,23 @@ fn html_dir_and_css_direction_inherit_for_logical_resolution() {
     let values = find_body(document.document())
         .children()
         .map(|parent| {
-            let child = document.document().element_ref(parent).expect("section").children().next().expect("child");
-            let indices = document.style_for_node(child).expect("computed child style");
+            let child = document
+                .document()
+                .element_ref(parent)
+                .expect("section")
+                .children()
+                .next()
+                .expect("child");
+            let indices = document
+                .style_for_node(child)
+                .expect("computed child style");
             let text = document.text_style(indices).expect("text style");
             let box_model = document.box_model_style(indices).expect("box style");
-            (text.direction, box_model.margin_right, box_model.padding_left)
+            (
+                text.direction,
+                box_model.margin_right,
+                box_model.padding_left,
+            )
         })
         .collect::<Vec<_>>();
 
@@ -429,7 +525,7 @@ fn html_dir_and_css_direction_inherit_for_logical_resolution() {
 
 #[test]
 fn invalid_typed_logical_lengths_preserve_valid_fallbacks() {
-    let html = "<html><body><div style='direction:rtl;inline-size:40px;inline-size:-10px;padding-inline-start:6px;padding-inline-start:-2px;border-inline-start:3px solid;border-inline-start-width:-4px'></div></body></html>";
+    let html = "<html><body><div style='direction:rtl;inline-size:40px;inline-size:bogus;padding-inline-start:6px;padding-inline-start:bogus;border-inline-start:3px solid;border-inline-start-width:bogus'></div></body></html>";
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, None);
     let node = find_body(document.document()).children().next().expect("logical box");
@@ -444,14 +540,22 @@ fn invalid_typed_logical_lengths_preserve_valid_fallbacks() {
 
 #[test]
 fn flex_properties_cross_the_style_boundary_as_renderer_owned_values() {
-    use crate::document::{ContentAlignment, FlexDirection, FlexWrap, ItemAlignment, LengthPct, PreferredSize};
+    use crate::document::{
+        ContentAlignment, FlexDirection, FlexWrap, ItemAlignment, LengthPct, PreferredSize,
+    };
     let html = "<html><body><div style='display:flex;flex-flow:column wrap;flex:2 3 40px;order:-2;align-items:center;justify-content:space-between;gap:5px 10px'></div></body></html>";
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, None);
-    let node = find_body(document.document()).children().next().expect("flex element");
+    let node = find_body(document.document())
+        .children()
+        .next()
+        .expect("flex element");
     let indices = document.style_for_node(node).expect("computed flex style");
     let box_model = document.box_model_style(indices).expect("box style");
-    let layout = document.styles().layout_style(indices).expect("layout style");
+    let layout = document
+        .styles()
+        .layout_style(indices)
+        .expect("layout style");
 
     assert_eq!(box_model.display, Display::Flex);
     assert_eq!(layout.flex_direction, FlexDirection::Column);
@@ -476,8 +580,18 @@ fn physical_justify_alignment_remains_distinct_from_logical_alignment() {
     let mut children = body.children();
     let left = children.next().expect("left alignment element");
     let right = children.next().expect("right alignment element");
-    let left_layout = document.styles().layout_style(document.style_for_node(left).expect("left computed style")).expect("left layout style");
-    let right_layout = document.styles().layout_style(document.style_for_node(right).expect("right computed style")).expect("right layout style");
+    let left_layout = document
+        .styles()
+        .layout_style(document.style_for_node(left).expect("left computed style"))
+        .expect("left layout style");
+    let right_layout = document
+        .styles()
+        .layout_style(
+            document
+                .style_for_node(right)
+                .expect("right computed style"),
+        )
+        .expect("right layout style");
 
     assert_eq!(left_layout.justify_self, ItemAlignment::Left);
     assert_eq!(left_layout.justify_items, ItemAlignment::Right);
@@ -507,24 +621,54 @@ fn legacy_grid_gap_aliases_share_the_canonical_computed_values() {
     let document = factory.parse_with_new_pipeline(html, None);
 
     for id in ["parent", "child"] {
-        let node = document.document().node_ids().find(|&node| document.document().element_ref(node).and_then(|element| element.attr("id")) == Some(id)).expect("gap alias element");
-        let indices = document.style_for_node(node).expect("computed gap alias style");
-        let layout = document.styles().layout_style(indices).expect("layout style");
+        let node = document
+            .document()
+            .node_ids()
+            .find(|&node| {
+                document
+                    .document()
+                    .element_ref(node)
+                    .and_then(|element| element.attr("id"))
+                    == Some(id)
+            })
+            .expect("gap alias element");
+        let indices = document
+            .style_for_node(node)
+            .expect("computed gap alias style");
+        let layout = document
+            .styles()
+            .layout_style(indices)
+            .expect("layout style");
         assert_eq!(layout.row_gap, LengthPct::Px(12.0));
         assert_eq!(layout.column_gap, LengthPct::Px(14.0));
     }
 
-    let shorthand = document.document().node_ids().find(|&node| document.document().element_ref(node).and_then(|element| element.attr("id")) == Some("shorthand")).expect("grid-gap shorthand element");
-    let indices = document.style_for_node(shorthand).expect("computed grid-gap shorthand style");
-    let layout = document.styles().layout_style(indices).expect("layout style");
+    let shorthand = document
+        .document()
+        .node_ids()
+        .find(|&node| {
+            document
+                .document()
+                .element_ref(node)
+                .and_then(|element| element.attr("id"))
+                == Some("shorthand")
+        })
+        .expect("grid-gap shorthand element");
+    let indices = document
+        .style_for_node(shorthand)
+        .expect("computed grid-gap shorthand style");
+    let layout = document
+        .styles()
+        .layout_style(indices)
+        .expect("layout style");
     assert_eq!(layout.row_gap, LengthPct::Px(6.0));
     assert_eq!(layout.column_gap, LengthPct::Px(9.0));
 }
 
 #[test]
-fn negative_typed_flex_basis_does_not_override_the_last_valid_basis() {
+fn native_rejected_flex_basis_does_not_override_the_last_valid_basis() {
     use crate::document::PreferredSize;
-    let html = "<html><body><div style='display:flex;flex-basis:40px;flex-basis:-10px'></div></body></html>";
+    let html = "<html><body><div style='display:flex;flex-basis:40px;flex-basis:bogus'></div></body></html>";
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, None);
     let node = find_body(document.document()).children().next().expect("flex element");
@@ -600,13 +744,21 @@ fn invalid_typed_grid_tracks_do_not_override_the_last_valid_template() {
 
 #[test]
 fn grid_tracks_names_flow_and_placement_cross_as_typed_values() {
-    use crate::document::{GridAutoFlow, GridPlacement, GridTemplateTrack, GridTrackBreadth, GridTrackSize, LengthPct};
+    use crate::document::{
+        GridAutoFlow, GridPlacement, GridTemplateTrack, GridTrackBreadth, GridTrackSize, LengthPct,
+    };
     let html = "<html><body><div style='display:grid;grid-template-columns:[start] 100px [middle] 1fr [end];grid-template-rows:20px;grid-auto-flow:column dense;gap:5px 10px;grid-column:2 / span 2'></div></body></html>";
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, None);
-    let node = find_body(document.document()).children().next().expect("grid element");
+    let node = find_body(document.document())
+        .children()
+        .next()
+        .expect("grid element");
     let indices = document.style_for_node(node).expect("computed grid style");
-    let layout = document.styles().layout_style(indices).expect("layout style");
+    let layout = document
+        .styles()
+        .layout_style(indices)
+        .expect("layout style");
 
     assert_eq!(document.box_model_style(indices).expect("box style").display, Display::Grid);
     assert_eq!(layout.grid_auto_flow, GridAutoFlow::ColumnDense);
@@ -616,7 +768,16 @@ fn grid_tracks_names_flow_and_placement_cross_as_typed_values() {
     assert_eq!(layout.grid_template_rows, vec![GridTemplateTrack::Single(GridTrackSize::Breadth(GridTrackBreadth::Length(LengthPct::Px(20.0))))]);
     assert_eq!(layout.grid_column.start, GridPlacement::Line(std::num::NonZeroI16::new(2).unwrap()));
     assert_eq!(layout.grid_column.end, GridPlacement::Span(std::num::NonZeroU16::new(2).unwrap()));
-    let line_names: Vec<Vec<&str>> = layout.grid_template_column_names.iter().map(|names| names.iter().map(|&name| document.styles().string(name).expect("interned line name")).collect()).collect();
+    let line_names: Vec<Vec<&str>> = layout
+        .grid_template_column_names
+        .iter()
+        .map(|names| {
+            names
+                .iter()
+                .map(|&name| document.styles().string(name).expect("interned line name"))
+                .collect()
+        })
+        .collect();
     assert_eq!(line_names, vec![vec!["start"], vec!["middle"], vec!["end"]]);
 }
 
@@ -647,9 +808,18 @@ fn authored_font_family_is_preserved_and_inherited() {
 #[test]
 fn later_font_shorthand_overrides_universal_inherit_shorthand() {
     let mut factory = DocumentFactory::new();
-    let document = factory.parse_with_new_pipeline("<html><body><div id='target'>X</div></body></html>", Some("* { font: inherit; } div { font: 20px/1 Ahem; }"));
-    let target = document.document().node_ids().find(|&node| document.document().get_dom_id(node) == Some("target")).expect("target element");
-    let style = document.style_for_node(target).expect("computed target style");
+    let document = factory.parse_with_new_pipeline(
+        "<html><body><div id='target'>X</div></body></html>",
+        Some("* { font: inherit; } div { font: 20px/1 Ahem; }"),
+    );
+    let target = document
+        .document()
+        .node_ids()
+        .find(|&node| document.document().get_dom_id(node) == Some("target"))
+        .expect("target element");
+    let style = document
+        .style_for_node(target)
+        .expect("computed target style");
 
     assert_eq!(document.font_style(style).expect("font style").font_size, 20.0);
     assert_eq!(document.text_style(style).expect("text style").line_height, 20.0);
@@ -658,9 +828,18 @@ fn later_font_shorthand_overrides_universal_inherit_shorthand() {
 #[test]
 fn relative_font_shorthand_line_height_uses_its_resolved_font_size() {
     let mut factory = DocumentFactory::new();
-    let document = factory.parse_with_new_pipeline("<html><body><div id='target'>X</div></body></html>", Some("div { font: 1.25em/1 Ahem; }"));
-    let target = document.document().node_ids().find(|&node| document.document().get_dom_id(node) == Some("target")).expect("target element");
-    let style = document.style_for_node(target).expect("computed target style");
+    let document = factory.parse_with_new_pipeline(
+        "<html><body><div id='target'>X</div></body></html>",
+        Some("div { font: 1.25em/1 Ahem; }"),
+    );
+    let target = document
+        .document()
+        .node_ids()
+        .find(|&node| document.document().get_dom_id(node) == Some("target"))
+        .expect("target element");
+    let style = document
+        .style_for_node(target)
+        .expect("computed target style");
 
     assert_eq!(document.font_style(style).expect("font style").font_size, 20.0);
     assert_eq!(document.text_style(style).expect("text style").line_height, 20.0);

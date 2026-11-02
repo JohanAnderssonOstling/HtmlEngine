@@ -1,0 +1,647 @@
+// Bundled from mathema, revision d9cce9ffeb7346181d4c3201dc0a13727269863b.
+// SPDX-License-Identifier: Apache-2.0
+// Modified for HtmlEngine: internal module paths and disabled upstream features.
+// See UPSTREAM.txt and LICENSE-APACHE in the mathema module directory.
+
+//! Top-level conversion entry points: the one-shot [`convert`] function and the
+//! parse-once [`from_latex`]/[`from_mathml`]/… builders returning [`ConvertResult`].
+
+use crate::mathema::ast::MathExpr;
+use crate::mathema::ast::compact::CompactExpr;
+use crate::mathema::ast::normalize::normalize_compact_expr;
+use crate::mathema::error::{CompactParseResult, Config, Format, Result};
+use crate::mathema::reader::Reader;
+use crate::mathema::reader::latex::LatexReader;
+use crate::mathema::reader::mathml::MathmlReader;
+use crate::mathema::reader::mtef::MtefReader;
+use crate::mathema::reader::omml::OmmlReader;
+use crate::mathema::reader::unicode_math::UnicodeMathReader;
+use crate::mathema::writer::Writer;
+use crate::mathema::writer::latex::LatexWriter;
+use crate::mathema::writer::mathml::MathmlWriter;
+use crate::mathema::writer::mtef::MtefWriter;
+use crate::mathema::writer::omml::OmmlWriter;
+use crate::mathema::writer::unicode_math::UnicodeMathWriter;
+
+/// One-liner conversion between any two supported formats.
+///
+/// ```ignore
+/// use mathema::{convert, Format};
+/// let mathml = convert("x^2", Format::LaTeX, Format::MathML).unwrap();
+/// ```
+pub fn convert(input: &str, from: Format, to: Format) -> Result<String> {
+    let config = Config::default();
+    convert_with(input, from, to, &config)
+}
+
+/// Conversion with custom configuration.
+pub fn convert_with(input: &str, from: Format, to: Format, config: &Config) -> Result<String> {
+    let mut compact = parse_compact(input, from, config)?;
+    crate::mathema::ast::validate_compact_depth(&compact.expr.arena, compact.expr.roots)?;
+    normalize_compact_expr(&mut compact.expr);
+    write_compact(&compact.expr, to, config)
+}
+
+fn parse_compact(input: &str, format: Format, config: &Config) -> Result<CompactParseResult> {
+    match format {
+        Format::LaTeX => LatexReader::parse_compact(input, config),
+        Format::MathML => MathmlReader::parse_compact(input, config),
+        Format::Omml => OmmlReader::parse_compact(input, config),
+        Format::Mtef => MtefReader::parse_compact(input, config),
+        Format::UnicodeMath => UnicodeMathReader::parse_compact(input, config),
+        #[cfg(any())]
+        Format::Svg => Err(crate::mathema::error::Error::Unsupported(
+            "SVG is an output-only format and cannot be parsed".into(),
+        )),
+        #[cfg(any())]
+        Format::Png | Format::Jpeg => Err(crate::mathema::error::Error::Unsupported(
+            "raster formats (PNG/JPEG) are output-only and cannot be parsed".into(),
+        )),
+    }
+}
+
+fn write_compact(
+    expr: &crate::mathema::ast::compact::CompactExpr,
+    format: Format,
+    config: &Config,
+) -> Result<String> {
+    match format {
+        Format::LaTeX => LatexWriter::write_compact(expr, config),
+        Format::MathML => MathmlWriter::write_compact(expr, config),
+        Format::Omml => OmmlWriter::write_compact(expr, config),
+        Format::Mtef => MtefWriter::write_compact(expr, config),
+        Format::UnicodeMath => UnicodeMathWriter::write_compact(expr, config),
+        #[cfg(any())]
+        Format::Svg => {
+            let options = crate::mathema::render::RenderOptions::default();
+            crate::mathema::render::render_to_svg_compact(expr, &options)
+        },
+        #[cfg(any())]
+        Format::Png | Format::Jpeg => Err(crate::mathema::error::Error::Unsupported(
+            "raster formats produce binary output; use render_to_image() instead".into(),
+        )),
+    }
+}
+
+/// Builder-style conversion result. Parse once, write to multiple formats.
+pub struct ConvertResult {
+    compact: CompactParseResult,
+    config: Config,
+}
+
+impl ConvertResult {
+    /// Serialize the parsed expression to LaTeX.
+    pub fn to_latex(&self) -> Result<String> {
+        LatexWriter::write_compact(&self.compact.expr, &self.config)
+    }
+
+    /// Serialize the parsed expression to Presentation MathML.
+    pub fn to_mathml(&self) -> Result<String> {
+        MathmlWriter::write_compact(&self.compact.expr, &self.config)
+    }
+
+    /// Serialize to LaTeX using the given configuration.
+    pub fn to_latex_with(&self, config: &Config) -> Result<String> {
+        LatexWriter::write_compact(&self.compact.expr, config)
+    }
+
+    /// Serialize to Presentation MathML using the given configuration.
+    pub fn to_mathml_with(&self, config: &Config) -> Result<String> {
+        MathmlWriter::write_compact(&self.compact.expr, config)
+    }
+
+    /// Serialize the parsed expression to OMML (Office MathML).
+    pub fn to_omml(&self) -> Result<String> {
+        OmmlWriter::write_compact(&self.compact.expr, &self.config)
+    }
+
+    /// Serialize to OMML using the given configuration.
+    pub fn to_omml_with(&self, config: &Config) -> Result<String> {
+        OmmlWriter::write_compact(&self.compact.expr, config)
+    }
+
+    /// Serialize the parsed expression to MTEF (hex-encoded MathType bytes).
+    pub fn to_mtef(&self) -> Result<String> {
+        MtefWriter::write_compact(&self.compact.expr, &self.config)
+    }
+
+    /// Serialize to MTEF using the given configuration.
+    pub fn to_mtef_with(&self, config: &Config) -> Result<String> {
+        MtefWriter::write_compact(&self.compact.expr, config)
+    }
+
+    /// Serialize the parsed expression to UnicodeMath linear notation.
+    pub fn to_unicode_math(&self) -> Result<String> {
+        UnicodeMathWriter::write_compact(&self.compact.expr, &self.config)
+    }
+
+    /// Serialize to UnicodeMath using the given configuration.
+    pub fn to_unicode_math_with(&self, config: &Config) -> Result<String> {
+        UnicodeMathWriter::write_compact(&self.compact.expr, config)
+    }
+
+    /// Serialize to Presentation MathML, also returning diagnostics for any
+    /// information that the target format cannot represent (writer-side loss).
+    ///
+    /// Unlike [`diagnostics`](Self::diagnostics) — which reports *reader-side*
+    /// warnings from parsing — this surfaces *writer-side* loss (e.g. a node
+    /// kind the target cannot express). Use it when round-trip fidelity matters.
+    pub fn to_mathml_with_diagnostics(&self) -> Result<(String, Vec<crate::mathema::error::Diagnostic>)> {
+        MathmlWriter::write_compact_with_diagnostics(&self.compact.expr, &self.config)
+    }
+
+    /// Serialize to OMML, also returning writer-side loss diagnostics.
+    /// See [`to_mathml_with_diagnostics`](Self::to_mathml_with_diagnostics).
+    pub fn to_omml_with_diagnostics(&self) -> Result<(String, Vec<crate::mathema::error::Diagnostic>)> {
+        OmmlWriter::write_compact_with_diagnostics(&self.compact.expr, &self.config)
+    }
+
+    /// Serialize to MTEF, also returning writer-side loss diagnostics. MTEF
+    /// silently drops several decorations (rules, colors, scale, phantoms), so
+    /// this is the recommended entry point when targeting MathType.
+    /// See [`to_mathml_with_diagnostics`](Self::to_mathml_with_diagnostics).
+    pub fn to_mtef_with_diagnostics(&self) -> Result<(String, Vec<crate::mathema::error::Diagnostic>)> {
+        MtefWriter::write_compact_with_diagnostics(&self.compact.expr, &self.config)
+    }
+
+    /// Serialize to UnicodeMath, also returning writer-side loss diagnostics.
+    /// UnicodeMath is an intentionally lossy linear notation; this reports the
+    /// node kinds that could not be represented faithfully.
+    /// See [`to_mathml_with_diagnostics`](Self::to_mathml_with_diagnostics).
+    pub fn to_unicode_math_with_diagnostics(
+        &self,
+    ) -> Result<(String, Vec<crate::mathema::error::Diagnostic>)> {
+        UnicodeMathWriter::write_compact_with_diagnostics(&self.compact.expr, &self.config)
+    }
+
+    /// Render to a standalone SVG with embedded glyph outlines.
+    ///
+    /// This is the default for [`to_svg`](Self::to_svg): the output embeds
+    /// Latin Modern Math glyph outlines as `<path>`/`<use>` elements, so it
+    /// renders identically everywhere (no client-side fonts required) and
+    /// visually matches the PNG/JPEG raster output.
+    #[cfg(any())]
+    pub fn to_svg(&self) -> Result<String> {
+        let options = crate::mathema::render::RenderOptions::default();
+        crate::mathema::render::render_to_svg_standalone_compact(&self.compact.expr, &options)
+    }
+
+    /// Render a standalone SVG using custom [`RenderOptions`](crate::mathema::render::RenderOptions).
+    #[cfg(any())]
+    pub fn to_svg_with(&self, options: &crate::mathema::render::RenderOptions) -> Result<String> {
+        crate::mathema::render::render_to_svg_standalone_compact(&self.compact.expr, options)
+    }
+
+    /// Render to a text-based SVG that relies on client-side fonts (`<text>`
+    /// elements). Smaller output, but appearance depends on the fonts the
+    /// viewer has installed and will not match the raster output.
+    #[cfg(any())]
+    pub fn to_svg_text(&self) -> Result<String> {
+        let options = crate::mathema::render::RenderOptions::default();
+        crate::mathema::render::render_to_svg_compact(&self.compact.expr, &options)
+    }
+
+    /// Render a text-based (client-font) SVG using custom [`RenderOptions`](crate::mathema::render::RenderOptions).
+    #[cfg(any())]
+    pub fn to_svg_text_with(&self, options: &crate::mathema::render::RenderOptions) -> Result<String> {
+        crate::mathema::render::render_to_svg_compact(&self.compact.expr, options)
+    }
+
+    /// Render the expression to PNG image bytes.
+    #[cfg(any())]
+    pub fn to_png(&self) -> Result<Vec<u8>> {
+        let options = crate::mathema::render::raster::RasterOptions::default();
+        crate::mathema::render::raster::render_to_image_compact(&self.compact.expr, &options)
+    }
+
+    /// Render to PNG image bytes using custom [`RasterOptions`](crate::mathema::render::raster::RasterOptions).
+    #[cfg(any())]
+    pub fn to_png_with(&self, options: &crate::mathema::render::raster::RasterOptions) -> Result<Vec<u8>> {
+        crate::mathema::render::raster::render_to_image_compact(&self.compact.expr, options)
+    }
+
+    /// Render the expression to JPEG image bytes.
+    #[cfg(any())]
+    pub fn to_jpeg(&self) -> Result<Vec<u8>> {
+        let options = crate::mathema::render::raster::RasterOptions {
+            format: crate::mathema::render::raster::ImageFormat::Jpeg,
+            ..crate::mathema::render::raster::RasterOptions::default()
+        };
+        crate::mathema::render::raster::render_to_image_compact(&self.compact.expr, &options)
+    }
+
+    /// Render to JPEG image bytes using custom [`RasterOptions`](crate::mathema::render::raster::RasterOptions).
+    #[cfg(any())]
+    pub fn to_jpeg_with(&self, options: &crate::mathema::render::raster::RasterOptions) -> Result<Vec<u8>> {
+        crate::mathema::render::raster::render_to_image_compact(&self.compact.expr, options)
+    }
+
+    /// Access the parsed AST as a legacy [`MathExpr`].
+    ///
+    /// **Cost:** this *materializes* a full heap `Box`/`Vec`/`String` tree from
+    /// the compact arena representation and is measurably expensive — roughly
+    /// 60% of a full parse for a typical formula. Throughput-sensitive callers
+    /// should prefer [`compact_expr`](Self::compact_expr) together with the
+    /// `*_compact` writers/renderers (e.g. [`to_mathml`](Self::to_mathml),
+    /// [`to_svg`](Self::to_svg)), which operate on the compact tree with no
+    /// legacy materialization.
+    #[must_use]
+    pub fn expr(&self) -> MathExpr {
+        self.compact.expr.to_math_expr()
+    }
+
+    /// Take ownership of the parsed AST as a legacy [`MathExpr`].
+    ///
+    /// Like [`expr`](Self::expr), this materializes a full heap tree; see that
+    /// method's cost note and prefer [`compact_expr`](Self::compact_expr) on hot
+    /// paths.
+    #[must_use]
+    pub fn into_expr(self) -> MathExpr {
+        self.compact.expr.to_math_expr()
+    }
+
+    /// Access the compact arena-based expression directly (zero-copy).
+    ///
+    /// This is the fast path: it borrows the already-parsed compact tree with no
+    /// allocation. Pair it with the `*_compact` writers/renderers for the lowest
+    /// per-conversion cost.
+    #[must_use]
+    pub fn compact_expr(&self) -> &CompactExpr {
+        &self.compact.expr
+    }
+
+    /// Diagnostics collected while *parsing* the input (e.g. lenient-mode
+    /// recovery warnings, and metadata-dropping macros such as `\href` /
+    /// `\includegraphics`).
+    ///
+    /// Note: these are **reader-side** diagnostics. Writer-side loss (e.g. a
+    /// format that cannot represent color) is reported separately by
+    /// [`crate::mathema::writer::Writer::write_compact_with_diagnostics`].
+    #[must_use]
+    pub fn diagnostics(&self) -> &[crate::mathema::error::Diagnostic] {
+        &self.compact.diagnostics
+    }
+}
+
+/// Parse LaTeX input into a reusable conversion result.
+pub fn from_latex(input: &str) -> Result<ConvertResult> {
+    from_latex_with(input, &Config::default())
+}
+
+/// Parse LaTeX with custom configuration.
+pub fn from_latex_with(input: &str, config: &Config) -> Result<ConvertResult> {
+    let compact = LatexReader::parse_compact(input, config)?;
+    Ok(ConvertResult {
+        compact,
+        config: *config,
+    })
+}
+
+/// Parse MathML input into a reusable conversion result.
+pub fn from_mathml(input: &str) -> Result<ConvertResult> {
+    from_mathml_with(input, &Config::default())
+}
+
+/// Parse MathML with custom configuration.
+pub fn from_mathml_with(input: &str, config: &Config) -> Result<ConvertResult> {
+    let compact = MathmlReader::parse_compact(input, config)?;
+    Ok(ConvertResult {
+        compact,
+        config: *config,
+    })
+}
+
+/// Parse OMML input into a reusable conversion result.
+pub fn from_omml(input: &str) -> Result<ConvertResult> {
+    from_omml_with(input, &Config::default())
+}
+
+/// Parse OMML with custom configuration.
+pub fn from_omml_with(input: &str, config: &Config) -> Result<ConvertResult> {
+    let compact = OmmlReader::parse_compact(input, config)?;
+    Ok(ConvertResult {
+        compact,
+        config: *config,
+    })
+}
+
+/// Parse MTEF input (hex-encoded binary) into a reusable conversion result.
+pub fn from_mtef(input: &str) -> Result<ConvertResult> {
+    from_mtef_with(input, &Config::default())
+}
+
+/// Parse MTEF with custom configuration.
+pub fn from_mtef_with(input: &str, config: &Config) -> Result<ConvertResult> {
+    let compact = MtefReader::parse_compact(input, config)?;
+    Ok(ConvertResult {
+        compact,
+        config: *config,
+    })
+}
+
+/// Parse UnicodeMath input into a reusable conversion result.
+pub fn from_unicode_math(input: &str) -> Result<ConvertResult> {
+    from_unicode_math_with(input, &Config::default())
+}
+
+/// Parse UnicodeMath with custom configuration.
+pub fn from_unicode_math_with(input: &str, config: &Config) -> Result<ConvertResult> {
+    let compact = UnicodeMathReader::parse_compact(input, config)?;
+    Ok(ConvertResult {
+        compact,
+        config: *config,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // === convert() one-liner API ===
+
+    #[test]
+    fn latex_to_mathml() {
+        let result = convert("x^2", Format::LaTeX, Format::MathML).unwrap();
+        assert!(result.contains("<math"));
+        assert!(result.contains("</math>"));
+    }
+
+    #[test]
+    fn latex_to_omml() {
+        let result = convert("x^2", Format::LaTeX, Format::Omml).unwrap();
+        assert!(result.contains("<m:oMath"));
+    }
+
+    #[test]
+    fn latex_to_unicode_math() {
+        let result = convert("x^2", Format::LaTeX, Format::UnicodeMath).unwrap();
+        assert!(!result.is_empty());
+    }
+
+    #[test]
+    fn latex_to_latex_identity() {
+        let result = convert("x", Format::LaTeX, Format::LaTeX).unwrap();
+        assert!(result.contains("x"));
+    }
+
+    #[cfg(any())]
+    #[test]
+    fn latex_to_svg() {
+        let result = convert("x^2", Format::LaTeX, Format::Svg).unwrap();
+        assert!(result.starts_with("<svg"));
+        assert!(result.ends_with("</svg>"));
+    }
+
+    #[cfg(any())]
+    #[test]
+    fn svg_is_output_only() {
+        let result = convert("<svg></svg>", Format::Svg, Format::LaTeX);
+        assert!(result.is_err(), "SVG should not be parseable");
+    }
+
+    #[test]
+    fn mathml_to_latex() {
+        let mathml = "<math><mi>x</mi></math>";
+        let result = convert(mathml, Format::MathML, Format::LaTeX).unwrap();
+        assert!(result.contains("x"));
+    }
+
+    // === from_* builder API ===
+
+    #[test]
+    fn from_latex_builder() {
+        let result = from_latex("x^2").unwrap();
+        let mathml = result.to_mathml().unwrap();
+        assert!(mathml.contains("<math"));
+        let latex = result.to_latex().unwrap();
+        assert!(!latex.is_empty());
+    }
+
+    #[test]
+    fn from_latex_multiple_outputs() {
+        let result = from_latex("\\frac{1}{2}").unwrap();
+        let mathml = result.to_mathml().unwrap();
+        let omml = result.to_omml().unwrap();
+        let umath = result.to_unicode_math().unwrap();
+        assert!(mathml.contains("<mfrac"));
+        assert!(omml.contains("<m:f>"));
+        assert!(!umath.is_empty());
+    }
+
+    #[test]
+    fn from_mathml_builder() {
+        let result = from_mathml("<math><mn>42</mn></math>").unwrap();
+        let latex = result.to_latex().unwrap();
+        assert!(latex.contains("42"));
+    }
+
+    #[test]
+    fn from_latex_expr_access() {
+        let result = from_latex("x").unwrap();
+        let expr = result.expr();
+        assert!(!expr.nodes.is_empty());
+    }
+
+    #[test]
+    fn from_latex_into_expr() {
+        let result = from_latex("x").unwrap();
+        let expr = result.into_expr();
+        assert!(!expr.nodes.is_empty());
+    }
+
+    #[cfg(any())]
+    #[test]
+    fn builder_to_svg() {
+        let result = from_latex("x^2").unwrap();
+        let svg = result.to_svg().unwrap();
+        assert!(svg.starts_with("<svg"));
+    }
+
+    #[cfg(any())]
+    #[test]
+    fn builder_to_svg_with_options() {
+        let result = from_latex("x").unwrap();
+        let options = crate::mathema::render::RenderOptions {
+            font_size_px: 24.0,
+            ..crate::mathema::render::RenderOptions::default()
+        };
+        let svg = result.to_svg_with(&options).unwrap();
+        assert!(svg.starts_with("<svg"));
+    }
+
+    // === with_config variants ===
+
+    #[test]
+    fn convert_with_custom_config() {
+        let config = Config::default();
+        let result = convert_with("x", Format::LaTeX, Format::MathML, &config).unwrap();
+        assert!(result.contains("<math"));
+    }
+
+    #[test]
+    fn from_latex_with_config() {
+        let config = Config::default();
+        let result = from_latex_with("x", &config).unwrap();
+        let latex = result.to_latex_with(&config).unwrap();
+        assert!(latex.contains("x"));
+    }
+
+    // === Error cases ===
+
+    #[test]
+    fn invalid_latex_errors() {
+        // Unmatched brace
+        let result = convert("{", Format::LaTeX, Format::MathML);
+        // This may or may not error depending on parser leniency,
+        // but shouldn't panic
+        let _ = result;
+    }
+
+    #[test]
+    fn invalid_mathml_errors() {
+        let result = convert("not xml at all<<<", Format::MathML, Format::LaTeX);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn empty_input() {
+        let result = convert("", Format::LaTeX, Format::MathML).unwrap();
+        assert!(result.contains("<math"));
+    }
+
+    #[test]
+    fn oversized_input_is_rejected() {
+        let config = Config {
+            max_input_bytes: Some(1024),
+            ..Config::default()
+        };
+        let big = "x".repeat(2048);
+        let result = convert_with(&big, Format::LaTeX, Format::MathML, &config);
+        assert!(matches!(
+            result,
+            Err(crate::mathema::error::Error::InputTooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn input_limit_can_be_disabled() {
+        // The same input that a small explicit limit rejects is accepted when
+        // the limit is disabled (None).
+        let input = "x + y + z".repeat(64); // ~576 bytes
+        let rejected = convert_with(
+            &input,
+            Format::LaTeX,
+            Format::MathML,
+            &Config {
+                max_input_bytes: Some(64),
+                ..Config::default()
+            },
+        );
+        assert!(matches!(
+            rejected,
+            Err(crate::mathema::error::Error::InputTooLarge { .. })
+        ));
+        let accepted = convert_with(
+            &input,
+            Format::LaTeX,
+            Format::MathML,
+            &Config {
+                max_input_bytes: None,
+                ..Config::default()
+            },
+        );
+        assert!(accepted.is_ok(), "None limit should accept the same input");
+    }
+
+    #[test]
+    fn from_latex_respects_input_limit() {
+        let config = Config {
+            max_input_bytes: Some(8),
+            ..Config::default()
+        };
+        let result = from_latex_with("x + y + z + w", &config);
+        assert!(matches!(
+            result,
+            Err(crate::mathema::error::Error::InputTooLarge { .. })
+        ));
+    }
+
+    #[cfg(any())]
+    #[test]
+    fn colorbox_renders_with_fill() {
+        let result = from_latex(r"\colorbox{teal}{B}").unwrap();
+        let svg = result.to_svg().unwrap();
+        assert!(
+            svg.contains(r#"fill="teal""#),
+            "colorbox SVG should contain fill=teal, got: {svg}"
+        );
+    }
+
+    #[cfg(any())]
+    #[test]
+    fn fcolorbox_renders_with_fill_and_border() {
+        let result = from_latex(r"\fcolorbox{blue}{red}{C}").unwrap();
+        let svg = result.to_svg().unwrap();
+        assert!(
+            svg.contains(r#"fill="red""#),
+            "fcolorbox SVG should contain fill=red, got: {svg}"
+        );
+        assert!(
+            svg.contains(r#"stroke="blue""#),
+            "fcolorbox SVG should contain stroke=blue, got: {svg}"
+        );
+    }
+
+    #[cfg(any())]
+    #[test]
+    fn color_switch_colors_rest_of_group() {
+        // \color is a switch: it should colorize the following content.
+        let result = from_latex(r"\color{red} x + y").unwrap();
+        let svg = result.to_svg().unwrap();
+        assert!(
+            svg.contains(r#"fill="red""#),
+            "\\color should colorize following content, got: {svg}"
+        );
+    }
+
+    #[cfg(any())]
+    #[test]
+    fn definecolor_resolves_to_hex() {
+        let result = from_latex(r"\definecolor{myc}{rgb}{1,0,0}\color{myc}A").unwrap();
+        let svg = result.to_svg().unwrap();
+        assert!(
+            svg.contains(r##"fill="#ff0000""##),
+            "\\definecolor rgb 1,0,0 should resolve to #ff0000, got: {svg}"
+        );
+    }
+
+    #[cfg(any())]
+    #[test]
+    fn color_model_html_arg() {
+        let result = from_latex(r"\color[HTML]{00FF00}B").unwrap();
+        let svg = result.to_svg().unwrap();
+        assert!(
+            svg.contains(r##"fill="#00ff00""##),
+            "\\color[HTML]{{00FF00}} should resolve to #00ff00, got: {svg}"
+        );
+    }
+
+    #[cfg(any())]
+    #[test]
+    fn xcolor_mixing_expression() {
+        let result = from_latex(r"\textcolor{red!50!blue}{M}").unwrap();
+        let svg = result.to_svg().unwrap();
+        assert!(
+            svg.contains(r##"fill="#800080""##),
+            "red!50!blue should resolve to #800080, got: {svg}"
+        );
+        let mml = from_latex(r"\textcolor{red!50!blue}{M}")
+            .unwrap()
+            .to_mathml()
+            .unwrap();
+        assert!(
+            mml.contains(r##"mathcolor="#800080""##),
+            "MathML should carry resolved mathcolor, got: {mml}"
+        );
+    }
+}

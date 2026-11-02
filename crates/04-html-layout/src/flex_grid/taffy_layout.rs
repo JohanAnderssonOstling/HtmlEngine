@@ -1,6 +1,7 @@
-use super::measurement::measure_item_with_baseline;
+use super::measurement::MeasurementMode;
 use super::{TaffyContainerKind, finite_f32};
-use crate::layout::LayoutEngine;
+use std::iter::Map;
+use std::ops::Range;
 use taffy::geometry::Size;
 use taffy::prelude::{
     AvailableSpace, Dimension, Layout, LayoutPartialTree, NodeId, Style, TraversePartialTree,
@@ -10,51 +11,45 @@ use taffy::{
     compute_grid_layout, compute_leaf_layout, compute_root_layout,
 };
 
-/// A shallow Taffy tree for one renderer-owned Flex/Grid formatting context.
-///
-/// Taffy's high-level `TaffyTree::compute_layout_with_measure` callback only
-/// returns a size, so leaf baselines are discarded before Grid's own baseline
-/// shim algorithm runs. This adapter implements Taffy's public low-level tree
-/// traits and returns the renderer's measured baselines in `LayoutOutput`.
-/// Track sizing, placement, and alignment remain entirely Taffy-owned.
-pub(super) struct TaffyLayoutTree<'tree, 'document, 'output> {
-    session: &'tree mut LayoutEngine<'document, 'output>,
-    kind: TaffyContainerKind,
-    styles: Vec<Style>,
-    contexts: Vec<Option<u32>>,
-    children: Vec<Vec<NodeId>>,
-    layouts: Vec<Layout>,
-    outputs: Vec<LayoutOutput>,
+struct Node {
+    style: Style,
+    context: Option<u32>,
+    layout: Layout,
 }
 
-impl<'tree, 'document, 'output> TaffyLayoutTree<'tree, 'document, 'output> {
+/// A shallow Taffy tree for one renderer-owned Flex/Grid formatting context.
+///
+/// Intrinsic probes and final solves share this backend. An explicit measurement
+/// mode selects renderer sizing; the adapter translates sizes and baselines
+/// into Taffy's low-level tree contract. It retains only root children and the
+/// root baseline because renderer-owned items are opaque leaves here.
+pub(super) struct TaffyLayoutTree<'session, 'input, 'out> {
+    measurement: MeasurementMode<'session, 'input, 'out>,
+    kind: TaffyContainerKind,
+    nodes: Vec<Node>,
+    root_first_baseline: Option<f32>,
+}
+
+impl<'session, 'input, 'out> TaffyLayoutTree<'session, 'input, 'out> {
     pub(super) fn new(
-        session: &'tree mut LayoutEngine<'document, 'output>,
+        measurement: MeasurementMode<'session, 'input, 'out>,
         kind: TaffyContainerKind,
         root_style: Style,
         child_styles: Vec<(Style, Option<u32>)>,
     ) -> Self {
-        let mut styles = Vec::with_capacity(child_styles.len() + 1);
-        let mut contexts = Vec::with_capacity(child_styles.len() + 1);
-        styles.push(root_style);
-        contexts.push(None);
-        for (style, context) in child_styles {
-            styles.push(style);
-            contexts.push(context);
-        }
-        let root_children = (1..styles.len()).map(NodeId::from).collect::<Vec<_>>();
-        let mut children = vec![Vec::new(); styles.len()];
-        children[0] = root_children;
-        let layouts = vec![Layout::new(); styles.len()];
-        let outputs = vec![LayoutOutput::DEFAULT; styles.len()];
+        let nodes: Vec<_> = std::iter::once((root_style, None))
+            .chain(child_styles)
+            .map(|(style, context)| Node {
+                style,
+                context,
+                layout: Layout::new(),
+            })
+            .collect();
         Self {
-            session,
+            measurement,
             kind,
-            styles,
-            contexts,
-            children,
-            layouts,
-            outputs,
+            nodes,
+            root_first_baseline: None,
         }
     }
 
@@ -67,43 +62,48 @@ impl<'tree, 'document, 'output> TaffyLayoutTree<'tree, 'document, 'output> {
         available_space: Size<AvailableSpace>,
         height: f32,
     ) {
-        self.styles[0].size.height = Dimension::length(height.max(0.0));
-        compute_root_layout(self, NodeId::from(0usize), available_space);
+        self.nodes[0].style.size.height = Dimension::length(height.max(0.0));
+        self.compute(available_space);
     }
 
-    pub(super) fn layout(&self, node: NodeId) -> Layout {
-        self.layouts[usize::from(node)]
-    }
-
-    pub(super) fn root(&self) -> NodeId {
-        NodeId::from(0usize)
+    pub(super) fn root_layout(&self) -> Layout {
+        self.nodes[0].layout
     }
 
     pub(super) fn root_first_baseline(&self) -> Option<f32> {
-        self.outputs[0].first_baselines.y
+        self.root_first_baseline
     }
 
-    pub(super) fn child(&self, index: usize) -> NodeId {
-        NodeId::from(index + 1)
+    pub(super) fn item_layouts(&self) -> impl Iterator<Item = (Layout, u32)> + '_ {
+        self.nodes
+            .iter()
+            .filter_map(|node| node.context.map(|box_idx| (node.layout, box_idx)))
     }
 }
 
 impl TraversePartialTree for TaffyLayoutTree<'_, '_, '_> {
     type ChildIter<'a>
-        = std::iter::Copied<std::slice::Iter<'a, NodeId>>
+        = Map<Range<usize>, fn(usize) -> NodeId>
     where
         Self: 'a;
 
     fn child_ids(&self, parent_node_id: NodeId) -> Self::ChildIter<'_> {
-        self.children[usize::from(parent_node_id)].iter().copied()
+        let end = if usize::from(parent_node_id) == 0 {
+            self.nodes.len()
+        } else {
+            1
+        };
+        (1..end).map(NodeId::from)
     }
 
     fn child_count(&self, parent_node_id: NodeId) -> usize {
-        self.children[usize::from(parent_node_id)].len()
+        self.child_ids(parent_node_id).len()
     }
 
     fn get_child_id(&self, parent_node_id: NodeId, child_index: usize) -> NodeId {
-        self.children[usize::from(parent_node_id)][child_index]
+        self.child_ids(parent_node_id)
+            .nth(child_index)
+            .expect("child index out of bounds")
     }
 }
 
@@ -115,46 +115,47 @@ impl LayoutPartialTree for TaffyLayoutTree<'_, '_, '_> {
     type CustomIdent = String;
 
     fn get_core_container_style(&self, node_id: NodeId) -> Self::CoreContainerStyle<'_> {
-        &self.styles[usize::from(node_id)]
+        &self.nodes[usize::from(node_id)].style
     }
 
     fn set_unrounded_layout(&mut self, node_id: NodeId, layout: &Layout) {
-        self.layouts[usize::from(node_id)] = *layout;
+        self.nodes[usize::from(node_id)].layout = *layout;
     }
 
     fn compute_child_layout(&mut self, node_id: NodeId, inputs: LayoutInput) -> LayoutOutput {
         let index = usize::from(node_id);
-        if !self.children[index].is_empty() {
+        if index == 0 && self.nodes.len() > 1 {
             let output = match self.kind {
                 TaffyContainerKind::Flex => compute_flexbox_layout(self, node_id, inputs),
                 TaffyContainerKind::Grid => compute_grid_layout(self, node_id, inputs),
             };
-            self.outputs[index] = output;
+            self.root_first_baseline = output.first_baselines.y;
             return output;
         }
-        if self.styles[index].display == taffy::style::Display::None {
+        if self.nodes[index].style.display == taffy::style::Display::None {
             return LayoutOutput::HIDDEN;
         }
 
-        let style = self.styles[index].clone();
-        let context = self.contexts[index];
+        let style = &self.nodes[index].style;
+        let context = self.nodes[index].context;
         let mut first_baseline = None;
         let mut output = compute_leaf_layout(
             inputs,
-            &style,
+            style,
             |_, _| 0.0,
             |known, available| {
                 let Some(box_idx) = context else {
                     return Size::ZERO;
                 };
-                let measured =
-                    measure_item_with_baseline(self.session, box_idx as usize, known, available);
+                let measured = self.measurement.measure(box_idx as usize, known, available);
                 first_baseline = measured.first_baseline;
                 measured.size
             },
         );
         output.first_baselines.y = first_baseline.map(finite_f32);
-        self.outputs[index] = output;
+        if index == 0 {
+            self.root_first_baseline = output.first_baselines.y;
+        }
         output
     }
 }
@@ -170,11 +171,11 @@ impl LayoutFlexboxContainer for TaffyLayoutTree<'_, '_, '_> {
         Self: 'a;
 
     fn get_flexbox_container_style(&self, node_id: NodeId) -> Self::FlexboxContainerStyle<'_> {
-        &self.styles[usize::from(node_id)]
+        self.get_core_container_style(node_id)
     }
 
     fn get_flexbox_child_style(&self, child_node_id: NodeId) -> Self::FlexboxItemStyle<'_> {
-        &self.styles[usize::from(child_node_id)]
+        self.get_core_container_style(child_node_id)
     }
 }
 
@@ -189,10 +190,63 @@ impl LayoutGridContainer for TaffyLayoutTree<'_, '_, '_> {
         Self: 'a;
 
     fn get_grid_container_style(&self, node_id: NodeId) -> Self::GridContainerStyle<'_> {
-        &self.styles[usize::from(node_id)]
+        self.get_core_container_style(node_id)
     }
 
     fn get_grid_child_style(&self, child_node_id: NodeId) -> Self::GridItemStyle<'_> {
-        &self.styles[usize::from(child_node_id)]
+        self.get_core_container_style(child_node_id)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::allocation_test_support::count_allocations;
+    use crate::flex_grid::measurement::MeasuredItem;
+    use taffy::RunMode;
+
+    #[test]
+    fn leaf_measurement_borrows_the_style_without_allocating() {
+        let leaf_style = Style {
+            grid_template_column_names: vec![vec!["column".to_owned()]],
+            grid_template_row_names: vec![vec!["row".to_owned()]],
+            ..Style::default()
+        };
+        let mut tree = TaffyLayoutTree::new(
+            MeasurementMode::Fixed {
+                box_idx: 7,
+                result: MeasuredItem {
+                    size: Size {
+                        width: 20.0,
+                        height: 30.0,
+                    },
+                    first_baseline: Some(17.0),
+                },
+            },
+            TaffyContainerKind::Flex,
+            Style::default(),
+            vec![(leaf_style, Some(7))],
+        );
+        let (output, allocations) = count_allocations(|| {
+            tree.compute_child_layout(
+                NodeId::from(1usize),
+                LayoutInput {
+                    run_mode: RunMode::ComputeSize,
+                    ..LayoutInput::HIDDEN
+                },
+            )
+        });
+        assert_eq!(
+            output.size,
+            Size {
+                width: 20.0,
+                height: 30.0
+            }
+        );
+        assert_eq!(output.first_baselines.y, Some(17.0));
+        assert_eq!(
+            allocations, 0,
+            "leaf measurement must borrow named grid styles"
+        );
     }
 }

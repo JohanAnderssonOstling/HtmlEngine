@@ -224,8 +224,7 @@ pub(crate) mod test_support {
             let ascent = request.font_size * self.ascent_ratio.unwrap_or(0.75);
             let descent = (request.font_size - ascent).max(0.0);
             let metric =
-                GlyphMetric::try_new(request.character, request.font_size * 0.5, ascent, descent)
-                    .map_err(crate::ShapeError::rejected_metric)?;
+                GlyphMetric::try_new(request.character, request.font_size * 0.5, ascent, descent)?;
             if let Some(&glyph) = self.glyphs.get(&key) {
                 return Ok(ShapedGlyph::from_metric(glyph, metric));
             }

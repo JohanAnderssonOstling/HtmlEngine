@@ -1,6 +1,10 @@
 //! Renderer-facing box geometry, semantics, and table queries.
 
+use super::text::enclosing_text_range;
 use super::*;
+use crate::layout_model::{parse_positive_span, place_table_cells};
+use html_dom::{DomNodeId, ElementRef, write_escaped_html_attribute, write_escaped_html_text};
+use html_style_model::{BreakBetween, Float, PositionMode};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum RenderForcedBreak {
@@ -73,6 +77,11 @@ impl RenderTable {
         &self.rows
     }
 
+    /// Cells in source row order, visiting each spanning cell once.
+    pub fn cells(&self) -> impl Iterator<Item = &RenderTableCell> + Clone {
+        self.rows.iter().flat_map(|row| row.cells())
+    }
+
     /// Sanitized authored markup for rich table export. This preserves
     /// classes, inline styles, and structural attributes while dropping event
     /// handlers; consumers that want portable structure without styling can
@@ -113,6 +122,16 @@ impl RenderTableCell {
         self.colspan
     }
 
+    /// Half-open logical row coordinates covered by this cell.
+    pub fn row_range(&self) -> Range<usize> {
+        self.row..self.row.saturating_add(self.rowspan)
+    }
+
+    /// Half-open logical column coordinates covered by this cell.
+    pub fn column_range(&self) -> Range<usize> {
+        self.column..self.column.saturating_add(self.colspan)
+    }
+
     pub fn is_header(&self) -> bool {
         self.header
     }
@@ -142,6 +161,101 @@ pub struct BoxTextFormat {
 }
 
 impl<'a> RenderBoxView<'a> {
+    /// Whether a line carries content belonging to this box or a descendant.
+    /// Replaced and inline content may use an ancestor's carrier line.
+    pub fn contains_line(self, box_idx: usize, line_idx: usize) -> bool {
+        if !self.content_line_range(box_idx).contains(&line_idx) {
+            return false;
+        }
+        let view = self.doc.render_view(self.glyph_metrics);
+        let output = &self.doc.layout_state.line_output;
+        let Some(line) = output.lines.get(line_idx) else {
+            return false;
+        };
+        let contains = |owner| view.semantics().contains(box_idx, owner);
+        if contains(line.owner_box_idx as usize) {
+            return true;
+        }
+        let inline = line.inline_box_fragments(&output.line_details);
+        output.inline_box_fragments[inline.start as usize..inline.end as usize]
+            .iter()
+            .any(|fragment| contains(fragment.box_idx as usize))
+            || view
+                .fragments()
+                .images_for_line(line_idx)
+                .iter()
+                .any(|image| contains(image.box_idx()))
+    }
+
+    /// Distance to the enclosing box whose flow can carry this box's geometry
+    /// alongside a visible line. Absolutely positioned and floating subtrees do
+    /// not establish continuations for one another.
+    pub fn fragmentation_distance(self, box_idx: usize, line_idx: usize) -> Option<usize> {
+        if self.contains_line(box_idx, line_idx) {
+            return Some(0);
+        }
+        let view = self.doc.render_view(self.glyph_metrics);
+        let line = view.text().line(line_idx)?;
+        let images = view.fragments().images_for_line(line_idx);
+        if line.glyphs().is_empty() && !images.is_empty() {
+            images
+                .iter()
+                .filter_map(|image| self.shared_flow_distance(box_idx, image.box_idx()))
+                .min()
+        } else {
+            self.shared_flow_distance(box_idx, line.owner_box_idx())
+        }
+    }
+
+    fn shared_flow_distance(self, box_idx: usize, line_owner: usize) -> Option<usize> {
+        let contains = |ancestor| {
+            self.doc
+                .render_view(self.glyph_metrics)
+                .semantics()
+                .contains(ancestor, line_owner)
+        };
+        let independent = |owner| {
+            self.used_style(owner).is_some_and(|style| {
+                style.position() == PositionMode::Absolute
+                    || matches!(style.float(), Float::Left | Float::Right)
+            })
+        };
+        let mut ancestor = box_idx;
+        let mut distance = 0;
+        loop {
+            if contains(ancestor) {
+                let mut carrier = line_owner;
+                while carrier != ancestor {
+                    if independent(carrier) {
+                        return None;
+                    }
+                    carrier = self.parent(carrier)?;
+                }
+                return Some(distance);
+            }
+            // A contentless decoration has no independently placed group;
+            // retain its enclosing flow's mapping even if it is positioned.
+            if independent(ancestor)
+                && (ancestor != box_idx || !self.content_line_range(box_idx).is_empty())
+            {
+                return None;
+            }
+            ancestor = self.parent(ancestor)?;
+            distance += 1;
+        }
+    }
+
+    /// Bounds in stable line storage for content carried by this box and its
+    /// descendants, including image carriers and split inline spans.
+    pub fn content_line_range(self, box_idx: usize) -> Range<usize> {
+        self.doc
+            .layout_state
+            .line_output
+            .box_line_ranges
+            .get(box_idx)
+            .map_or(0..0, |range| range.start as usize..range.end as usize)
+    }
+
     pub fn len(self) -> usize {
         self.doc.box_count()
     }
@@ -152,26 +266,14 @@ impl<'a> RenderBoxView<'a> {
 
     pub fn tag(self, box_idx: usize) -> Option<&'a str> {
         self.doc
-            .inputs
-            .layout_tree
-            .box_at(box_idx)
-            .and_then(|layout_box| {
-                layout_box
-                    .get_element(self.doc.document())
-                    .map(|element| element.tag())
-            })
+            .element_for_box(box_idx)
+            .map(|element| element.tag())
     }
 
     pub fn attribute(self, box_idx: usize, name: &str) -> Option<&'a str> {
         self.doc
-            .inputs
-            .layout_tree
-            .box_at(box_idx)
-            .and_then(|layout_box| {
-                layout_box
-                    .get_element(self.doc.document())
-                    .and_then(|element| element.attr(name))
-            })
+            .element_for_box(box_idx)
+            .and_then(|element| element.attr(name))
     }
 
     pub fn attribute_expanded(
@@ -181,22 +283,13 @@ impl<'a> RenderBoxView<'a> {
         local_name: &str,
     ) -> Option<&'a str> {
         self.doc
-            .inputs
-            .layout_tree
-            .box_at(box_idx)
-            .and_then(|layout_box| {
-                layout_box
-                    .get_element(self.doc.document())
-                    .and_then(|element| element.attr_expanded(namespace, local_name))
-            })
+            .element_for_box(box_idx)
+            .and_then(|element| element.attr_expanded(namespace, local_name))
     }
 
     pub fn id(self, box_idx: usize) -> Option<u16> {
         self.doc
-            .inputs
-            .layout_tree
-            .box_at(box_idx)?
-            .get_element(self.doc.document())
+            .element_for_box(box_idx)
             .and_then(|element| element.id_idx())
     }
 
@@ -209,14 +302,8 @@ impl<'a> RenderBoxView<'a> {
     pub fn href(self, box_idx: usize) -> Option<u16> {
         let href_name = self.doc.document().lookup_string("href")?;
         self.doc
-            .inputs
-            .layout_tree
-            .box_at(box_idx)
-            .and_then(|layout_box| {
-                layout_box
-                    .get_element(self.doc.document())
-                    .and_then(|element| element.attr_value_idx_no_namespace(href_name))
-            })
+            .element_for_box(box_idx)
+            .and_then(|element| element.attr_value_idx_no_namespace(href_name))
     }
 
     pub fn point(self, box_idx: usize) -> Option<Point> {
@@ -242,61 +329,27 @@ impl<'a> RenderBoxView<'a> {
             return None;
         }
         let document = self.doc.document();
-        let table_element = self
-            .doc
-            .inputs
-            .layout_tree
-            .box_at(box_idx)?
-            .get_element(document)?;
+        let table_element = self.doc.element_for_box(box_idx)?;
         if !table_element.tag().eq_ignore_ascii_case("table") {
             return None;
         }
 
-        fn collect_rows(
-            document: &Document,
-            node: html_dom::DomNodeId,
-            root_table: html_dom::DomNodeId,
-            rows: &mut Vec<html_dom::DomNodeId>,
-        ) {
-            let Some(element) = document.element_ref(node) else {
-                return;
-            };
-            for child in element.children() {
-                let Some(child_element) = document.element_ref(child) else {
-                    continue;
-                };
-                if child_element.tag().eq_ignore_ascii_case("table") && child != root_table {
+        fn collect_rows<'dom>(element: ElementRef<'dom>, rows: &mut Vec<ElementRef<'dom>>) {
+            for child in element.child_elements() {
+                if child.tag().eq_ignore_ascii_case("table") {
                     continue;
                 }
-                if child_element.tag().eq_ignore_ascii_case("tr") {
+                if child.tag().eq_ignore_ascii_case("tr") {
                     rows.push(child);
                 } else {
-                    collect_rows(document, child, root_table, rows);
+                    collect_rows(child, rows);
                 }
             }
         }
 
-        fn escape_html(value: &str, attribute: bool) -> String {
-            let mut escaped = String::with_capacity(value.len());
-            for character in value.chars() {
-                match character {
-                    '&' => escaped.push_str("&amp;"),
-                    '<' => escaped.push_str("&lt;"),
-                    '>' => escaped.push_str("&gt;"),
-                    '"' if attribute => escaped.push_str("&quot;"),
-                    _ => escaped.push(character),
-                }
-            }
-            escaped
-        }
-
-        fn serialize_authored_html(
-            document: &Document,
-            node: html_dom::DomNodeId,
-            output: &mut String,
-        ) {
+        fn serialize_authored_html(document: &Document, node: DomNodeId, output: &mut String) {
             match document.node_ref(node) {
-                Some(NodeRef::Text(text)) => output.push_str(&escape_html(text.text(), false)),
+                Some(NodeRef::Text(text)) => write_escaped_html_text(output, text.text()),
                 Some(NodeRef::Element(element)) => {
                     let tag = element.tag();
                     output.push('<');
@@ -314,7 +367,7 @@ impl<'a> RenderBoxView<'a> {
                         output.push(' ');
                         output.push_str(name);
                         output.push_str("=\"");
-                        output.push_str(&escape_html(attribute.value(), true));
+                        write_escaped_html_attribute(output, attribute.value());
                         output.push('"');
                     }
                     output.push('>');
@@ -329,18 +382,19 @@ impl<'a> RenderBoxView<'a> {
             }
         }
 
-        fn collect_text(document: &Document, node: html_dom::DomNodeId, text: &mut String) {
+        fn collect_text(document: &Document, node: DomNodeId, text: &mut String) {
             match document.node_ref(node) {
                 Some(NodeRef::Text(value)) => {
-                    text.push_str(value.text());
-                    text.push(' ');
+                    for word in value.text().split_whitespace() {
+                        if !text.is_empty() {
+                            text.push(' ');
+                        }
+                        text.push_str(word);
+                    }
                 }
                 Some(NodeRef::Element(element)) => {
                     if element.tag().eq_ignore_ascii_case("table") {
                         return;
-                    }
-                    if element.tag().eq_ignore_ascii_case("br") {
-                        text.push(' ');
                     }
                     for child in element.children() {
                         collect_text(document, child, text);
@@ -357,67 +411,52 @@ impl<'a> RenderBoxView<'a> {
             }
         }
 
-        let table_node = table_element.node_id();
-        let mut row_nodes = Vec::new();
-        collect_rows(document, table_node, table_node, &mut row_nodes);
-        let mut occupied_until = Vec::<usize>::new();
-        let mut rows = Vec::with_capacity(row_nodes.len());
-        let mut column_count = 0;
-        for (row, row_node) in row_nodes.into_iter().enumerate() {
-            let row_element = document.element_ref(row_node)?;
-            let mut column = 0;
-            let mut cells = Vec::new();
-            for cell_node in row_element.children() {
-                let Some(cell_element) = document.element_ref(cell_node) else {
-                    continue;
-                };
-                let header = cell_element.tag().eq_ignore_ascii_case("th");
-                if !header && !cell_element.tag().eq_ignore_ascii_case("td") {
-                    continue;
-                }
-                while occupied_until.get(column).is_some_and(|&until| until > row) {
-                    column += 1;
-                }
-                let rowspan = cell_element
-                    .attr("rowspan")
-                    .and_then(|value| value.parse::<usize>().ok())
-                    .unwrap_or(1)
-                    .max(1);
-                let colspan = cell_element
-                    .attr("colspan")
-                    .and_then(|value| value.parse::<usize>().ok())
-                    .unwrap_or(1)
-                    .max(1);
-                if occupied_until.len() < column + colspan {
-                    occupied_until.resize(column + colspan, 0);
-                }
-                for occupied in &mut occupied_until[column..column + colspan] {
-                    *occupied = row.saturating_add(rowspan);
-                }
-                let Some(&cell_box) = box_for_node.get(&cell_element.node_idx()) else {
-                    column += colspan;
-                    continue;
-                };
-                let mut raw_text = String::new();
-                for child in cell_element.children() {
-                    collect_text(document, child, &mut raw_text);
-                }
-                let text = raw_text.split_whitespace().collect::<Vec<_>>().join(" ");
-                cells.push(RenderTableCell {
-                    box_idx: cell_box,
-                    row,
-                    column,
-                    rowspan,
-                    colspan,
-                    header,
-                    text,
-                    glyphs: None,
-                });
-                column += colspan;
+        let mut row_elements = Vec::new();
+        collect_rows(table_element, &mut row_elements);
+        let mut rows = vec![RenderTableRow { cells: Vec::new() }; row_elements.len()];
+        let source_rows = row_elements.into_iter().map(|row| {
+            row.child_elements()
+                .filter(|cell| {
+                    cell.tag().eq_ignore_ascii_case("th") || cell.tag().eq_ignore_ascii_case("td")
+                })
+                .map(|cell| {
+                    let rowspan = box_for_node
+                        .get(&cell.node_idx())
+                        .and_then(|&box_idx| match self.doc.box_layout_mode(box_idx) {
+                            Some(LayoutMode::TableCell(cell)) => Some(cell.rowspan),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| parse_positive_span(cell.attr("rowspan")));
+                    (
+                        cell.node_idx(),
+                        parse_positive_span(cell.attr("colspan")),
+                        rowspan,
+                    )
+                })
+        });
+        let column_count = place_table_cells(source_rows, |placement| {
+            let Some(&cell_box) = box_for_node.get(&placement.cell_idx) else {
+                return;
+            };
+            let cell_element = document
+                .node_id_from_raw(placement.cell_idx as u32)
+                .and_then(|node| document.element_ref(node))
+                .expect("grid cells originate from source table elements");
+            let mut text = String::new();
+            for child in cell_element.children() {
+                collect_text(document, child, &mut text);
             }
-            column_count = column_count.max(occupied_until.len()).max(column);
-            rows.push(RenderTableRow { cells });
-        }
+            rows[placement.row].cells.push(RenderTableCell {
+                box_idx: cell_box,
+                row: placement.row,
+                column: placement.col,
+                rowspan: placement.rowspan,
+                colspan: placement.colspan,
+                header: cell_element.tag().eq_ignore_ascii_case("th"),
+                text,
+                glyphs: None,
+            });
+        });
         // Resolve all cell intervals in one traversal rather than rescanning
         // the document for every cell during semantic selection.
         let cells = rows
@@ -443,8 +482,7 @@ impl<'a> RenderBoxView<'a> {
                         let glyphs = &mut rows[row].cells[column].glyphs;
                         let range = run.glyphs();
                         if let Some(existing) = glyphs {
-                            existing.start = existing.start.min(range.start);
-                            existing.end = existing.end.max(range.end);
+                            *existing = enclosing_text_range(existing.clone(), range);
                         } else if !range.is_empty() {
                             *glyphs = Some(range);
                         }
@@ -490,30 +528,29 @@ impl<'a> RenderBoxView<'a> {
     }
 
     pub fn forces_break_before(self, box_idx: usize) -> bool {
-        self.used_style(box_idx)
-            .is_some_and(|style| style.break_before().is_forced())
+        self.break_before(box_idx).is_forced()
     }
 
     pub fn forces_break_after(self, box_idx: usize) -> bool {
-        self.used_style(box_idx)
-            .is_some_and(|style| style.break_after().is_forced())
+        self.break_after(box_idx).is_forced()
     }
 
     pub fn avoids_break_before(self, box_idx: usize) -> bool {
-        self.used_style(box_idx)
-            .is_some_and(|style| style.break_before() == html_style_model::BreakBetween::Avoid)
+        self.break_before(box_idx) == BreakBetween::Avoid
     }
 
     pub fn avoids_break_after(self, box_idx: usize) -> bool {
-        self.used_style(box_idx)
-            .is_some_and(|style| style.break_after() == html_style_model::BreakBetween::Avoid)
+        self.break_after(box_idx) == BreakBetween::Avoid
     }
 
-    pub fn break_before(self, box_idx: usize) -> html_style_model::BreakBetween {
+    pub fn break_before(self, box_idx: usize) -> BreakBetween {
         self.used_style(box_idx)
-            .map_or(html_style_model::BreakBetween::Auto, |style| {
-                style.break_before()
-            })
+            .map_or(BreakBetween::Auto, |style| style.break_before())
+    }
+
+    fn break_after(self, box_idx: usize) -> BreakBetween {
+        self.used_style(box_idx)
+            .map_or(BreakBetween::Auto, |style| style.break_after())
     }
 
     pub fn forced_break_before(self, box_idx: usize) -> Option<RenderForcedBreak> {
@@ -521,12 +558,7 @@ impl<'a> RenderBoxView<'a> {
     }
 
     pub fn forced_break_after(self, box_idx: usize) -> Option<RenderForcedBreak> {
-        render_forced_break(
-            self.used_style(box_idx)
-                .map_or(html_style_model::BreakBetween::Auto, |style| {
-                    style.break_after()
-                }),
-        )
+        render_forced_break(self.break_after(box_idx))
     }
 
     pub fn avoids_break_inside(self, box_idx: usize) -> bool {
@@ -545,11 +577,7 @@ impl<'a> RenderBoxView<'a> {
     }
 
     pub fn parent(self, box_idx: usize) -> Option<usize> {
-        self.doc
-            .inputs
-            .layout_tree
-            .box_at(box_idx)
-            .and_then(|layout_box| layout_box.parent().map(|parent| parent as usize))
+        self.doc.inputs.layout_tree.get_box_parent(box_idx)
     }
 
     pub fn text_format(self, box_idx: usize) -> BoxTextFormat {
@@ -564,11 +592,16 @@ impl<'a> RenderBoxView<'a> {
         self.doc.is_block_container_box(box_idx)
     }
 
+    /// Flex and grid containers, including their inline display variants.
+    pub fn is_flex_or_grid_container(self, box_idx: usize) -> bool {
+        matches!(
+            self.doc.inputs.layout_tree.get_box_layout_mode(box_idx),
+            Some(LayoutMode::Flex(_) | LayoutMode::Grid(_))
+        )
+    }
+
     pub fn ancestors(self, box_idx: usize) -> impl Iterator<Item = usize> + 'a {
-        AncestorIter {
-            doc: self.doc,
-            current: self.parent(box_idx),
-        }
+        self.doc.inputs.layout_tree.ancestors(box_idx)
     }
 
     fn used_style(self, box_idx: usize) -> Option<html_style_model::UsedStyleView<'a>> {
@@ -576,10 +609,10 @@ impl<'a> RenderBoxView<'a> {
     }
 }
 
-fn render_forced_break(value: html_style_model::BreakBetween) -> Option<RenderForcedBreak> {
+fn render_forced_break(value: BreakBetween) -> Option<RenderForcedBreak> {
     match value {
-        html_style_model::BreakBetween::Column => Some(RenderForcedBreak::Column),
-        html_style_model::BreakBetween::Page => Some(RenderForcedBreak::Page),
-        html_style_model::BreakBetween::Auto | html_style_model::BreakBetween::Avoid => None,
+        BreakBetween::Column => Some(RenderForcedBreak::Column),
+        BreakBetween::Page => Some(RenderForcedBreak::Page),
+        BreakBetween::Auto | BreakBetween::Avoid => None,
     }
 }

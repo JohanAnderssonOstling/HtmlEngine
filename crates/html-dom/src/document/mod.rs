@@ -2,10 +2,12 @@ pub mod cfi;
 mod dom;
 mod memory;
 mod resources;
+mod source;
 
 pub use dom::*;
 pub use memory::*;
 pub use resources::*;
+pub use source::*;
 
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -128,19 +130,19 @@ impl Document {
 
     pub fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
-        report.add_slice_storage::<DomNode>("Document.dom_nodes.storage", self.dom_nodes.capacity(), self.dom_nodes.len());
+        report.add_vec_storage("Document.dom_nodes.storage", &self.dom_nodes);
         for node in &self.dom_nodes {
             report.extend_prefixed("Document.dom_nodes", node.memory_usage_report());
         }
-        report.add_slice_storage::<ImageResource>("Document.images.storage", self.images.capacity(), self.images.len());
+        report.add_vec_storage("Document.images.storage", &self.images);
         for image in &self.images {
             report.extend_prefixed("Document.images", image.memory_usage_report());
         }
         if let Some(title) = &self.title {
-            report.add_slice_storage::<u8>("Document.title.storage", title.capacity(), title.len());
+            report.add_string_storage("Document.title.storage", title);
         }
         report.extend_prefixed("Document.strings", self.strings.memory_usage_report());
-        report.add_slice_storage::<u16>("Document.class_list.storage", self.class_list.capacity(), self.class_list.len());
+        report.add_vec_storage("Document.class_list.storage", &self.class_list);
         report
     }
 }

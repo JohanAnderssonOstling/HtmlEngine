@@ -1,0 +1,115 @@
+Percentage spacing expression cache: performance repair
+Recorded 2026-11-02
+
+Mixed stylesheet spacing expressions are parsed once with Lightning CSS and
+shared during element styling. Font-dependent conversion still runs per element.
+Literal percentages need no retained AST. Inline/substituted values retain the
+native element-local path. Raw spacing uses the existing raw-property dispatch.
+Lightning CSS remains unchanged and the only CSS parser.
+
+Validation
+
+Fresh before/after audit: 16,467 / 18,469 pass (89.16%), exactly the same 2,002
+mismatch keys, 13,434 unrepresented assertions, zero dependency parser panics.
+No test selections, expectations, existing tests or benchmark code changed.
+304 style tests pass; one pre-existing font-metric test fails identically in
+both rebuilt versions (letter_spacing(): observed 0.0, expected 3.0). Another
+32 declaration-validation and five reader font-scaling tests pass; cargo check
+passes. No image suite was rerun.
+
+Performance
+
+Both versions apply the same spacing features and share freshly rebuilt current
+support crates. Existing benchmark sources unchanged. Ten cases, 15 alternating
+pairs, 300 processes pinned to CPU 6. opt-level=2, debuginfo=0. Uncontrolled
+host boost/frequency/load; diagnostic 95% bootstrap intervals, 5,000 resamples,
+no multiple-comparison adjustment. EPUB totals sum five fixture medians.
+Cold means uncached author programs with machine/default CSS caches warmed.
+Positive means slower. An interval containing zero is inconclusive.
+
+Workload                         Paired change    95% bootstrap range    Assessment
+cascade-plain                      -1.64%    [  -2.15%,   -1.26%]   speedup
+cascade-vars-inline                -2.77%    [  -3.40%,   -1.81%]   speedup
+epub-cold                          +0.00%    [  -0.56%,   +2.39%]   inconclusive
+epub-cached                        -1.43%    [  -2.50%,   -1.06%]   speedup
+spacing-equivalent-cold           -13.83%    [ -14.46%,  -13.53%]   speedup
+spacing-equivalent-cached         -20.99%    [ -22.28%,  -20.62%]   speedup
+spacing-feature-cold              -10.31%    [ -11.42%,   -7.32%]   speedup
+spacing-feature-cached            -17.77%    [ -21.11%,   -5.62%]   speedup
+normalization                      +2.17%    [  -2.09%,   +3.84%]   inconclusive
+normalization-retry                +3.10%    [  -4.13%,  +11.80%]   inconclusive
+
+Allocation/peak-byte changes for the first fixture of each spacing workload:
+  spacing-equivalent-cold / small-classic/style_allocations: 4981 -> 3408 (-31.58%)
+  spacing-equivalent-cold / small-classic/style_peak_bytes: 403310 -> 421094 (+4.41%)
+  spacing-equivalent-cached / small-classic/style_allocations: 2351 -> 701 (-70.18%)
+  spacing-equivalent-cached / small-classic/style_peak_bytes: 106693 -> 106693 (+0.00%)
+  spacing-feature-cold / small-classic/style_allocations: 4633 -> 3280 (-29.20%)
+  spacing-feature-cold / small-classic/style_peak_bytes: 403118 -> 420902 (+4.41%)
+  spacing-feature-cached / small-classic/style_allocations: 2131 -> 701 (-67.10%)
+  spacing-feature-cached / small-classic/style_peak_bytes: 106693 -> 106693 (+0.00%)
+
+Every measured timing slowdown, including individual stages:
+  epub-cold / small-classic/index_us: +4.44% [+2.22%, +4.55%]
+  epub-cold / trade-book/index_us: +3.33% [+3.23%, +6.67%]
+  epub-cold / visual/index_us: +4.17% [+4.00%, +8.33%]
+  epub-cold / reference/index_us: +4.00% [+1.96%, +6.00%]
+  epub-cold / all_samples/prepare_us: +2.82% [+1.41%, +8.70%]
+  spacing-equivalent-cold / small-classic/html_parse_us: +1.15% [+0.23%, +1.65%]
+  spacing-equivalent-cold / small-classic/css_parse_us: +3.68% [+2.96%, +4.58%]
+  spacing-equivalent-cold / small-classic/prepare_us: +25.00% [+15.38%, +25.00%]
+  spacing-equivalent-cold / small-classic/index_us: +2.94% [+2.94%, +3.03%]
+  spacing-equivalent-cold / trade-book/html_parse_us: +0.94% [+0.47%, +1.42%]
+  spacing-equivalent-cold / trade-book/css_parse_us: +4.23% [+3.30%, +4.93%]
+  spacing-equivalent-cold / trade-book/prepare_us: +25.00% [+15.38%, +25.00%]
+  spacing-equivalent-cold / technical/css_parse_us: +3.91% [+2.94%, +5.00%]
+  spacing-equivalent-cold / technical/prepare_us: +26.67% [+18.75%, +26.67%]
+  spacing-equivalent-cold / visual/css_parse_us: +3.61% [+2.27%, +4.29%]
+  spacing-equivalent-cold / visual/prepare_us: +26.67% [+18.75%, +33.33%]
+  spacing-equivalent-cold / reference/css_parse_us: +3.63% [+2.29%, +4.61%]
+  spacing-equivalent-cold / reference/prepare_us: +23.08% [+15.38%, +25.00%]
+  spacing-equivalent-cold / all_samples/prepare_us: +23.88% [+18.06%, +27.27%]
+  spacing-feature-cold / small-classic/css_parse_us: +4.90% [+2.01%, +6.62%]
+  spacing-feature-cold / trade-book/html_parse_us: +2.19% [+1.92%, +2.91%]
+  spacing-feature-cold / trade-book/css_parse_us: +6.95% [+3.70%, +10.10%]
+  spacing-feature-cold / trade-book/prepare_us: +28.57% [+19.05%, +58.82%]
+  spacing-feature-cold / trade-book/index_us: +5.71% [+2.56%, +12.50%]
+  spacing-feature-cold / technical/html_parse_us: +2.03% [+0.76%, +3.38%]
+  spacing-feature-cold / technical/css_parse_us: +6.73% [+4.23%, +8.11%]
+  spacing-feature-cold / technical/prepare_us: +41.18% [+15.00%, +45.45%]
+  spacing-feature-cold / visual/html_parse_us: +2.50% [+1.31%, +3.70%]
+  spacing-feature-cold / visual/css_parse_us: +5.92% [+4.71%, +8.83%]
+  spacing-feature-cold / visual/prepare_us: +30.43% [+18.18%, +45.00%]
+  spacing-feature-cold / visual/index_us: +2.56% [+2.38%, +9.09%]
+  spacing-feature-cold / reference/html_parse_us: +2.70% [+2.21%, +6.13%]
+  spacing-feature-cold / reference/css_parse_us: +6.02% [+5.47%, +11.61%]
+  spacing-feature-cold / reference/prepare_us: +21.43% [+5.88%, +60.00%]
+  spacing-feature-cold / all_samples/prepare_us: +35.44% [+25.53%, +40.00%]
+  spacing-feature-cached / small-classic/html_parse_us: +1.96% [+1.34%, +4.68%]
+  spacing-feature-cached / trade-book/html_parse_us: +1.09% [+0.46%, +5.66%]
+  spacing-feature-cached / technical/html_parse_us: +4.19% [+0.88%, +6.16%]
+  spacing-feature-cached / visual/html_parse_us: +3.91% [+1.77%, +42.86%]
+  spacing-feature-cached / reference/html_parse_us: +2.58% [+0.22%, +5.78%]
+
+The first implementation also scanned uncached declarations while linking.
+It measured +1.68% normalization-retry time; a 30-run repeat measured +3.35%.
+The final implementation skips this scan for fragments without cached values.
+All 300 initial and 30 repeat runs remain alongside the 300 final runs.
+The primary table above describes the final implementation only.
+The cache trades retained native AST/map memory for less repeated parser work.
+Cached-run counters start after warmup and exclude already retained cache
+memory. An unchanged cached peak does not establish zero retained-memory cost.
+Every timing, allocation and peak-byte observation is retained in the JSON
+performance artifact and raw runs, including negative or inconclusive results.
+
+Unrelated font-metric work was already present in the workspace at the start
+of this change. Both baseline and current style were rebuilt against the same
+freshly frozen support crates. Older saved libraries are incompatible with that
+source graph and were excluded from the primary comparison. The historical
++6.09% plain-cascade finding is retained in spacing-fix-report.txt; this cache
+comparison alone does not establish its removal.
+
+Historical registry evidence is unchanged. There are still 234 fixed records,
+178 confirmed dependency blocks and 1,824 unresolved records among the 2,236
+original observations. Sources, compiler commands, package verification and
+validation provenance are in spacing-cache-report.json. Builds stay on disk.

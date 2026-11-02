@@ -1,17 +1,10 @@
-use super::columns::{TableColumnLayout, span_extent};
+use super::columns::{TableCellPlacement, TableColumnLayout, span_extent};
+use super::grid::PreparedTableGrid;
 use crate::layout::LayoutEngine;
+use crate::layout::decorations::record_bound_background;
 use crate::layout::paint_program::PaintStyleSource;
-use crate::layout_model::{TableColumnGroupSpan, TableColumnTrack};
+use html_style_model::{StyleIndices, Visibility};
 use kurbo::{Point, Rect};
-
-fn emit_table_background_rect(
-    session: &mut LayoutEngine<'_, '_>,
-    table_box_idx: usize,
-    rect: Rect,
-    source: PaintStyleSource,
-) {
-    crate::layout::decorations::emit_bound_background(session, table_box_idx, rect, source);
-}
 
 pub(super) fn emit_collapsed_table_background(
     session: &mut LayoutEngine<'_, '_>,
@@ -27,7 +20,7 @@ pub(super) fn emit_collapsed_table_background(
     {
         return;
     }
-    emit_table_background_rect(
+    record_bound_background(
         session,
         table_box_idx,
         rect,
@@ -40,13 +33,11 @@ pub(super) fn emit_table_layers(
     table_box_idx: usize,
     table_content_pos: Point,
     table_height: f64,
-    h_spacing: f64,
-    v_spacing: f64,
     columns: &TableColumnLayout,
-    column_tracks: &[TableColumnTrack],
-    column_groups: &[TableColumnGroupSpan],
+    prepared: &PreparedTableGrid,
+    row_starts: &[f64],
+    row_heights: &[f64],
 ) {
-    let _ = (h_spacing, v_spacing);
     let grid_top = table_content_pos.y;
     let grid_height = table_height.max(0.0);
     let grid_left = table_content_pos.x;
@@ -63,51 +54,143 @@ pub(super) fn emit_table_layers(
     // their padding and border-spacing also belong to the background area.
     emit_collapsed_table_background(session, table_box_idx, table_grid);
 
-    for group in column_groups {
-        if group.span == 0 {
-            continue;
-        }
-        let start = group.start.min(columns.starts.len());
-        let end = start.saturating_add(group.span).min(columns.starts.len());
-        if start >= end {
-            continue;
-        }
-        let span_width = span_extent(&columns.starts, &columns.widths, start, end - start);
-        if span_width <= 0.0 {
-            continue;
-        }
-        let x = table_content_pos.x + columns.physical_start(start, end - start);
-        if session.reader.used_style(group.style).visibility()
-            == html_style_model::Visibility::Hidden
-        {
-            continue;
-        }
-        emit_table_background_rect(
-            session,
-            table_box_idx,
-            Rect::new(x, table_grid.y0, x + span_width, table_grid.y1),
-            PaintStyleSource::Style {indices:group.style,context:table_box_idx as u32},
-        );
-    }
+    // Column layers cover their originating cells, including spans, while
+    // border-spacing remains part of the table's own background. Look up the
+    // source per cell instead of scanning the grid separately for each column.
+    emit_table_column_background(
+        session,
+        table_box_idx,
+        prepared,
+        table_content_pos,
+        columns,
+        row_starts,
+        row_heights,
+        |cell| {
+            let index = prepared
+                .column_groups
+                .partition_point(|group| group.start <= cell.col);
+            let index = index.checked_sub(1)?;
+            let group = prepared.column_groups.get(index)?;
+            (cell.col < group.start.saturating_add(group.span)).then_some((index, group.style))
+        },
+    );
+    emit_table_column_background(
+        session,
+        table_box_idx,
+        prepared,
+        table_content_pos,
+        columns,
+        row_starts,
+        row_heights,
+        |cell| Some((cell.col, prepared.columns.get(cell.col)?.background_style?)),
+    );
+}
 
-    for (column, track) in column_tracks.iter().enumerate() {
-        let Some(style_idx) = track.background_style else {
+fn emit_table_column_background(
+    session: &mut LayoutEngine<'_, '_>,
+    table_box_idx: usize,
+    prepared: &PreparedTableGrid,
+    table_content_pos: Point,
+    columns: &TableColumnLayout,
+    row_starts: &[f64],
+    row_heights: &[f64],
+    style_for_cell: impl Fn(&TableCellPlacement) -> Option<(usize, StyleIndices)>,
+) {
+    let mut pending = None::<(usize, StyleIndices, Rect)>;
+    for cell in &prepared.grid.placements {
+        let Some((part, style)) = style_for_cell(cell) else {
             continue;
         };
-        let Some((&width, _)) = columns.widths.get(column).zip(columns.starts.get(column))
+        if session.reader.used_style(style).visibility() == Visibility::Hidden {
+            continue;
+        }
+        let Some(rect) =
+            cell_background_rect(cell, table_content_pos, columns, row_starts, row_heights)
         else {
             continue;
         };
-        let x = table_content_pos.x + columns.physical_start(column, 1);
-        if session.reader.used_style(style_idx).visibility() == html_style_model::Visibility::Hidden
-        {
-            continue;
+        if let Some((previous_part, previous_style, previous)) = &mut pending {
+            let adjacent = (previous.y0 == rect.y0
+                && previous.y1 == rect.y1
+                && (previous.x1 == rect.x0 || rect.x1 == previous.x0))
+                || (previous.x0 == rect.x0
+                    && previous.x1 == rect.x1
+                    && (previous.y1 == rect.y0 || rect.y1 == previous.y0));
+            if *previous_part == part && *previous_style == style && adjacent {
+                *previous = previous.union(rect);
+                continue;
+            }
+            record_bound_background(
+                session,
+                table_box_idx,
+                *previous,
+                PaintStyleSource::Style {
+                    indices: *previous_style,
+                    context: table_box_idx as u32,
+                },
+            );
         }
-        emit_table_background_rect(
+        pending = Some((part, style, rect));
+    }
+    if let Some((_, style, rect)) = pending {
+        record_bound_background(
             session,
             table_box_idx,
-            Rect::new(x, table_grid.y0, x + width, table_grid.y1),
-            PaintStyleSource::Style {indices:style_idx,context:table_box_idx as u32},
+            rect,
+            PaintStyleSource::Style {
+                indices: style,
+                context: table_box_idx as u32,
+            },
         );
     }
+}
+
+pub(super) fn emit_table_row_layer_background<'a>(
+    session: &mut LayoutEngine<'_, '_>,
+    owner_box_idx: usize,
+    placements: impl Iterator<Item = &'a TableCellPlacement>,
+    table_content_pos: Point,
+    columns: &TableColumnLayout,
+    row_starts: &[f64],
+    row_heights: &[f64],
+) {
+    for placement in placements {
+        let Some(rect) = cell_background_rect(
+            placement,
+            table_content_pos,
+            columns,
+            row_starts,
+            row_heights,
+        ) else {
+            continue;
+        };
+        record_bound_background(
+            session,
+            owner_box_idx,
+            rect,
+            PaintStyleSource::Box(owner_box_idx as u32),
+        );
+    }
+}
+
+fn cell_background_rect(
+    placement: &TableCellPlacement,
+    table_content_pos: Point,
+    columns: &TableColumnLayout,
+    row_starts: &[f64],
+    row_heights: &[f64],
+) -> Option<Rect> {
+    let width = columns.span_width(placement.col, placement.colspan);
+    let height = span_extent(row_starts, row_heights, placement.row, placement.rowspan);
+    columns.starts.get(placement.col)?;
+    let y = *row_starts.get(placement.row)?;
+    let x = columns.physical_start(placement.col, placement.colspan);
+    (width > 0.0 && height > 0.0).then(|| {
+        Rect::new(
+            table_content_pos.x + x,
+            table_content_pos.y + y,
+            table_content_pos.x + x + width,
+            table_content_pos.y + y + height,
+        )
+    })
 }

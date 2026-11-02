@@ -1,397 +1,156 @@
-//! Syntax and renderer support for generated-content declarations.
-
-use super::property_id::RendererPropertyId;
+//! Shared consumers of native generated-content tokens.
+use super::value::{significant_tokens, token_ident, token_list_to_css_string};
 use lightningcss::properties::Property;
-use lightningcss::properties::custom::{Token, TokenList, TokenOrValue};
-use lightningcss::stylesheet::ParserOptions;
+use lightningcss::properties::custom::{Function, Token, TokenList, TokenOrValue};
+use lightningcss::properties::list::CounterStyle;
+use lightningcss::traits::Parse;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ValueSupport {
-    Supported,
-    Unsupported,
-    Invalid,
+fn counter_ident_is_valid(name: &str) -> bool {
+    ![
+        "initial",
+        "inherit",
+        "unset",
+        "default",
+        "revert",
+        "revert-layer",
+        "none",
+    ]
+    .iter()
+    .any(|keyword| name.eq_ignore_ascii_case(keyword))
 }
 
-impl ValueSupport {
-    pub(crate) fn is_valid(self) -> bool {
-        self != Self::Invalid
+pub(crate) struct CounterArguments<'a, 'css> {
+    pub name: &'a str,
+    pub separator: Option<&'a str>,
+    pub style: Option<&'a TokenOrValue<'css>>,
+}
+
+/// Shared by syntax checks and renderer conversion, without interning strings.
+pub(crate) fn counter_arguments<'a, 'css>(
+    function: &'a Function<'css>,
+) -> Option<CounterArguments<'a, 'css>> {
+    let mut arguments = significant_tokens(&function.arguments);
+    let name = token_ident(arguments.next()?)?;
+    if !counter_ident_is_valid(name) {
+        return None;
     }
-}
-
-fn parsed_tokens(id: RendererPropertyId, value: &str) -> Option<TokenList<'_>> {
-    match Property::parse_string(id.lightning_id(), value, ParserOptions::default()).ok()? {
-        Property::Unparsed(value) => Some(value.value),
-        Property::Custom(value) => Some(value.value),
-        _ => None,
+    let separator = if function.name.as_ref().eq_ignore_ascii_case("counters") {
+        let (
+            Some(TokenOrValue::Token(Token::Comma)),
+            Some(TokenOrValue::Token(Token::String(separator))),
+        ) = (arguments.next(), arguments.next())
+        else {
+            return None;
+        };
+        Some(separator.as_ref())
+    } else {
+        None
+    };
+    let style = match arguments.next() {
+        None => None,
+        Some(TokenOrValue::Token(Token::Comma)) => Some(arguments.next()?),
+        _ => return None,
+    };
+    if arguments.next().is_some() {
+        return None;
     }
+    if let Some(style) = style {
+        let valid = if let Some(name) = token_ident(style) {
+            counter_ident_is_valid(name)
+        } else if matches!(style, TokenOrValue::Function(_)) {
+            // Keep custom styles and symbols() distinct from renderer support.
+            let tokens = TokenList(vec![style.clone()]);
+            token_list_to_css_string(&tokens)
+                .is_some_and(|css| CounterStyle::parse_string(&css).is_ok())
+        } else {
+            false
+        };
+        if !valid {
+            return None;
+        }
+    }
+    Some(CounterArguments {
+        name,
+        separator,
+        style,
+    })
 }
 
-fn significant<'a, 'i>(tokens: &'a TokenList<'i>) -> Vec<&'a TokenOrValue<'i>> {
-    tokens
+/// Existing counter conversion, shared with syntax checking for literal lists.
+pub(crate) fn for_each_counter_directive(
+    tokens: &TokenList<'_>,
+    default_value: i32,
+    mut emit: impl FnMut(&str, i32),
+) -> Option<()> {
+    let mut tokens = significant_tokens(tokens);
+    let mut found = false;
+    while let Some(token) = tokens.next() {
+        let name = token_ident(token)?;
+        if name.eq_ignore_ascii_case("none") {
+            return (!found && tokens.next().is_none()).then_some(());
+        }
+        if !counter_ident_is_valid(name) {
+            return None;
+        }
+        let value = match tokens.clone().next() {
+            Some(TokenOrValue::Token(Token::Number {
+                int_value: Some(value),
+                ..
+            })) => {
+                tokens.next();
+                *value
+            }
+            _ => default_value,
+        };
+        emit(name, value);
+        found = true;
+    }
+    found.then_some(())
+}
+
+/// Check retained constraints, without treating unsupported rendering as invalid
+/// CSS. Deferred substitutions and counter expressions keep their native tokens.
+pub(crate) fn native_value_is_valid(property: &Property<'_>) -> bool {
+    let Property::Custom(raw) = property else {
+        return true;
+    };
+    let content = raw.name.as_ref().eq_ignore_ascii_case("content");
+    if !content
+        && !raw.name.as_ref().eq_ignore_ascii_case("counter-reset")
+        && !raw.name.as_ref().eq_ignore_ascii_case("counter-increment")
+    {
+        return true;
+    }
+    let tokens = &raw.value;
+    if super::wide_keywords::token_list_css_wide_keyword(tokens).is_some()
+        || super::substitution::needs_substitution(tokens)
+    {
+        return true;
+    }
+    if content {
+        return significant_tokens(tokens).all(|token| match token {
+            TokenOrValue::Function(function)
+                if function.name.as_ref().eq_ignore_ascii_case("counter")
+                    || function.name.as_ref().eq_ignore_ascii_case("counters") =>
+            {
+                counter_arguments(function).is_some()
+            }
+            TokenOrValue::Function(function)
+                if function.name.as_ref().eq_ignore_ascii_case("attr") =>
+            {
+                significant_tokens(&function.arguments).next().is_some()
+            }
+            _ => true,
+        });
+    }
+    // The renderer's literal-list conversion does not implement reversed() or
+    // computed integer expressions. Do not misclassify those valid forms here.
+    if tokens
         .0
         .iter()
-        .filter(|token| {
-            !matches!(
-                token,
-                TokenOrValue::Token(Token::WhiteSpace(_) | Token::Comment(_))
-            )
-        })
-        .collect()
-}
-
-fn ident<'a, 'i>(token: &'a TokenOrValue<'i>) -> Option<&'a str> {
-    match token {
-        TokenOrValue::Token(Token::Ident(value)) => Some(value.as_ref()),
-        _ => None,
-    }
-}
-
-fn equals_any(value: &str, candidates: &[&str]) -> bool {
-    candidates
-        .iter()
-        .any(|candidate| value.eq_ignore_ascii_case(candidate))
-}
-
-fn css_wide(value: &str) -> bool {
-    equals_any(
-        value,
-        &["inherit", "initial", "unset", "revert", "revert-layer"],
-    )
-}
-
-fn valid_counter_name(value: &str) -> bool {
-    !css_wide(value) && !equals_any(value, &["none", "default"])
-}
-
-fn supported_counter_style(value: &str) -> bool {
-    equals_any(
-        value,
-        &[
-            "decimal",
-            "decimal-leading-zero",
-            "lower-roman",
-            "upper-roman",
-            "lower-greek",
-            "lower-alpha",
-            "lower-latin",
-            "upper-alpha",
-            "upper-latin",
-            "armenian",
-            "georgian",
-            "disc",
-            "circle",
-            "square",
-        ],
-    )
-}
-
-fn content_function(function: &lightningcss::properties::custom::Function<'_>) -> ValueSupport {
-    let arguments = significant(&function.arguments);
-    if function.name.as_ref().eq_ignore_ascii_case("attr") {
-        return match arguments.as_slice() {
-            [name] if ident(name).is_some() => ValueSupport::Supported,
-            [name, ..] if ident(name).is_some() => ValueSupport::Unsupported,
-            _ => ValueSupport::Invalid,
-        };
-    }
-    if function.name.as_ref().eq_ignore_ascii_case("counter") {
-        return match arguments.as_slice() {
-            [name] if ident(name).is_some_and(valid_counter_name) => ValueSupport::Supported,
-            [name, TokenOrValue::Token(Token::Comma), style]
-                if ident(name).is_some_and(valid_counter_name) && ident(style).is_some() =>
-            {
-                if supported_counter_style(ident(style).unwrap()) {
-                    ValueSupport::Supported
-                } else {
-                    ValueSupport::Unsupported
-                }
-            }
-            _ => ValueSupport::Invalid,
-        };
-    }
-    if function.name.as_ref().eq_ignore_ascii_case("counters") {
-        return match arguments.as_slice() {
-            [
-                name,
-                TokenOrValue::Token(Token::Comma),
-                TokenOrValue::Token(Token::String(_)),
-            ] if ident(name).is_some_and(valid_counter_name) => ValueSupport::Supported,
-            [
-                name,
-                TokenOrValue::Token(Token::Comma),
-                TokenOrValue::Token(Token::String(_)),
-                TokenOrValue::Token(Token::Comma),
-                style,
-            ] if ident(name).is_some_and(valid_counter_name) && ident(style).is_some() => {
-                if supported_counter_style(ident(style).unwrap()) {
-                    ValueSupport::Supported
-                } else {
-                    ValueSupport::Unsupported
-                }
-            }
-            _ => ValueSupport::Invalid,
-        };
-    }
-    if equals_any(
-        function.name.as_ref(),
-        &[
-            "url",
-            "image",
-            "image-set",
-            "-webkit-image-set",
-            "cross-fade",
-            "linear-gradient",
-            "radial-gradient",
-            "conic-gradient",
-            "target-counter",
-            "target-counters",
-            "leader",
-            "string",
-        ],
-    ) {
-        ValueSupport::Unsupported
-    } else {
-        ValueSupport::Invalid
-    }
-}
-
-pub(crate) fn content(value: &str) -> ValueSupport {
-    let Some(tokens) = parsed_tokens(RendererPropertyId::Content, value) else {
-        return ValueSupport::Invalid;
-    };
-    let tokens = significant(&tokens);
-    if tokens.len() == 1
-        && let Some(keyword) = ident(tokens[0])
-        && (css_wide(keyword) || equals_any(keyword, &["normal", "none"]))
+        .any(|token| matches!(token, TokenOrValue::Function(_)))
     {
-        return ValueSupport::Supported;
+        return true;
     }
-    if tokens.is_empty() {
-        return ValueSupport::Invalid;
-    }
-
-    let mut support = ValueSupport::Supported;
-    let mut after_alt_separator = false;
-    let mut main_items = 0;
-    let mut alt_items = 0;
-    for token in tokens {
-        if matches!(token, TokenOrValue::Token(Token::Delim('/'))) {
-            if after_alt_separator || main_items == 0 {
-                return ValueSupport::Invalid;
-            }
-            after_alt_separator = true;
-            support = ValueSupport::Unsupported;
-            continue;
-        }
-        if after_alt_separator {
-            let item = match token {
-                TokenOrValue::Token(Token::String(_)) => ValueSupport::Supported,
-                TokenOrValue::Function(function)
-                    if equals_any(function.name.as_ref(), &["attr", "counter", "counters"]) =>
-                {
-                    content_function(function)
-                }
-                TokenOrValue::Var(_) | TokenOrValue::Env(_) => ValueSupport::Supported,
-                _ => ValueSupport::Invalid,
-            };
-            if item == ValueSupport::Invalid {
-                return item;
-            }
-            alt_items += 1;
-            continue;
-        }
-        let item = match token {
-            TokenOrValue::Token(Token::String(_)) => ValueSupport::Supported,
-            TokenOrValue::Token(Token::Ident(value))
-                if equals_any(
-                    value.as_ref(),
-                    &[
-                        "open-quote",
-                        "close-quote",
-                        "no-open-quote",
-                        "no-close-quote",
-                    ],
-                ) =>
-            {
-                ValueSupport::Supported
-            }
-            TokenOrValue::Url(_) | TokenOrValue::Token(Token::UnquotedUrl(_)) => {
-                ValueSupport::Unsupported
-            }
-            TokenOrValue::Function(function) => content_function(function),
-            TokenOrValue::Var(_) | TokenOrValue::Env(_) => ValueSupport::Supported,
-            _ => ValueSupport::Invalid,
-        };
-        if item == ValueSupport::Invalid {
-            return item;
-        }
-        if item == ValueSupport::Unsupported {
-            support = item;
-        }
-        main_items += 1;
-    }
-    if after_alt_separator && alt_items == 0 {
-        ValueSupport::Invalid
-    } else {
-        support
-    }
-}
-
-pub(crate) fn counter_directive(id: RendererPropertyId, value: &str) -> ValueSupport {
-    let Some(tokens) = parsed_tokens(id, value) else {
-        return ValueSupport::Invalid;
-    };
-    let tokens = significant(&tokens);
-    if tokens.len() == 1
-        && ident(tokens[0])
-            .is_some_and(|value| css_wide(value) || value.eq_ignore_ascii_case("none"))
-    {
-        return ValueSupport::Supported;
-    }
-    if tokens.is_empty() {
-        return ValueSupport::Invalid;
-    }
-    let mut cursor = 0;
-    let mut support = ValueSupport::Supported;
-    while cursor < tokens.len() {
-        let is_reset = id == RendererPropertyId::CounterReset;
-        let (counter_name, unsupported_name_form) = match tokens[cursor] {
-            TokenOrValue::Token(Token::Ident(counter_name)) => (counter_name.as_ref(), false),
-            TokenOrValue::Function(function)
-                if is_reset && function.name.as_ref().eq_ignore_ascii_case("reversed") =>
-            {
-                let arguments = significant(&function.arguments);
-                match arguments.as_slice() {
-                    [TokenOrValue::Token(Token::Ident(counter_name))] => {
-                        (counter_name.as_ref(), true)
-                    }
-                    _ => return ValueSupport::Invalid,
-                }
-            }
-            _ => return ValueSupport::Invalid,
-        };
-        if !valid_counter_name(counter_name) {
-            return ValueSupport::Invalid;
-        }
-        cursor += 1;
-        let mut item_support = if unsupported_name_form {
-            ValueSupport::Unsupported
-        } else {
-            ValueSupport::Supported
-        };
-        if matches!(
-            tokens.get(cursor),
-            Some(TokenOrValue::Token(Token::Number {
-                int_value: Some(_),
-                ..
-            }))
-        ) {
-            cursor += 1;
-        } else if matches!(
-            tokens.get(cursor),
-            Some(TokenOrValue::Function(function))
-                if function.name.as_ref().eq_ignore_ascii_case("calc")
-        ) {
-            cursor += 1;
-            item_support = ValueSupport::Unsupported;
-        }
-        if item_support == ValueSupport::Unsupported {
-            support = ValueSupport::Unsupported;
-        }
-    }
-    support
-}
-
-pub(crate) fn quotes(value: &str) -> ValueSupport {
-    let Some(tokens) = parsed_tokens(RendererPropertyId::Quotes, value) else {
-        return ValueSupport::Invalid;
-    };
-    let tokens = significant(&tokens);
-    if tokens.len() == 1
-        && ident(tokens[0])
-            .is_some_and(|value| css_wide(value) || equals_any(value, &["auto", "none"]))
-    {
-        return ValueSupport::Supported;
-    }
-    if !tokens.is_empty()
-        && tokens.len().is_multiple_of(2)
-        && tokens
-            .iter()
-            .all(|token| matches!(token, TokenOrValue::Token(Token::String(_))))
-    {
-        ValueSupport::Supported
-    } else {
-        ValueSupport::Invalid
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn classifies_renderer_supported_content_forms() {
-        for value in [
-            "none",
-            "'prefix' attr(title)",
-            "counter(chapter, upper-roman)",
-            "counters(section, '.')",
-            "open-quote 'hello' close-quote",
-        ] {
-            assert_eq!(content(value), ValueSupport::Supported, "{value}");
-        }
-    }
-
-    #[test]
-    fn separates_unsupported_and_invalid_content_forms() {
-        for value in [
-            "url(icon.png)",
-            "'label' / 'alternative'",
-            "\"\" / counter(chapter)",
-            "attr(title string)",
-            "-webkit-image-set(url(icon.png) 1x)",
-            "leader(dotted)",
-        ] {
-            assert_eq!(content(value), ValueSupport::Unsupported, "{value}");
-        }
-        for value in [
-            "",
-            "/ 'alternative'",
-            "open-quote none",
-            "counter()",
-            "'label' 12px",
-        ] {
-            assert_eq!(content(value), ValueSupport::Invalid, "{value}");
-        }
-    }
-
-    #[test]
-    fn validates_related_generated_content_properties() {
-        assert_eq!(
-            counter_directive(RendererPropertyId::CounterReset, "chapter 1 section"),
-            ValueSupport::Supported
-        );
-        assert_eq!(
-            counter_directive(RendererPropertyId::CounterIncrement, "none extra"),
-            ValueSupport::Invalid
-        );
-        assert_eq!(
-            counter_directive(RendererPropertyId::CounterReset, "reversed(chapter)"),
-            ValueSupport::Unsupported
-        );
-        assert_eq!(
-            counter_directive(RendererPropertyId::CounterIncrement, "reversed(chapter)"),
-            ValueSupport::Invalid
-        );
-        assert_eq!(
-            counter_directive(RendererPropertyId::CounterIncrement, "chapter calc(1)"),
-            ValueSupport::Unsupported
-        );
-        assert_eq!(
-            counter_directive(RendererPropertyId::CounterReset, "default 1"),
-            ValueSupport::Invalid
-        );
-        assert_eq!(quotes("'«' '»' '‹' '›'"), ValueSupport::Supported);
-        assert_eq!(quotes("'open'"), ValueSupport::Invalid);
-    }
+    for_each_counter_directive(tokens, 0, |_, _| {}).is_some()
 }

@@ -1,11 +1,10 @@
-use super::{AncestorIter, DocumentRead};
+use super::DocumentRead;
 use crate::layout_model::{
-    AnchorPosition, DecorationFragment, DecorationStore, EllipsisFragment, GlyphAdvanceRun,
-    GlyphId, GlyphOffsetRun, HyphenFragment, ImageFragment, InlineItem, InlineItemKind, LayoutMode,
-    Line, ListItemMarker,
+    AnchorPosition, EllipsisFragment, GlyphAdvanceRun, GlyphId, GlyphOffsetRun, HyphenFragment,
+    ImageFragment, InlineItem, LayoutMode, ListItemMarker,
 };
 use html_dom::{Document, ImageResource, ImageSource, NodeRef};
-use html_style_model::{ListStylePosition, TextDecorationLines, UsedBorderRadii};
+use html_style_model::{ListStylePosition, TextDecorationLines, UsedBorderRadii, Visibility};
 use kurbo::{Point, Size};
 use rustc_data_structures::fx::FxHashMap;
 use std::ops::Range;
@@ -15,15 +14,20 @@ mod boxes;
 mod fragments;
 mod geometry;
 mod markdown;
+mod pagination;
 mod reading;
 mod search;
 mod semantics;
 mod source;
 mod text;
+mod words;
 pub use geometry::{CaretAffinity, PositionedShapedLine, RenderGeometryView};
+pub(super) use html_engine_model::WordIndex;
+pub(super) use words::build_word_index;
 pub use markdown::RenderExportView;
+pub use pagination::{PaginationGroup, PaginationLine, PaginationLines};
 pub use reading::{ReadingFragment, ReadingTarget, is_navigation_section_title};
-pub use search::{TextSearchOptions, find_text_matches};
+pub use search::{TextPatternMatch, TextPatternMatcher, TextSearchOptions, find_text_matches, text_matches};
 pub use semantics::{ContentRole, ContentSemantics, RenderSemanticsView};
 pub use source::SourceLocation;
 
@@ -39,12 +43,12 @@ pub use fragments::{
     RenderDecoration, RenderDecorationPattern, RenderDecorations, RenderFragmentView,
     RenderImageFragment, RenderImageFragments, RenderOverflowClip, RenderPaintItem,
 };
-pub use html_engine_model::ImageMetrics;
+pub use html_engine_model::{ImageMetrics, LineId};
 pub use text::{
     RenderAuthoritativeTextRun, RenderEllipsisFragment, RenderGlyphAdvanceRun,
     RenderGlyphAdvanceRuns, RenderGlyphOffsetRun, RenderGlyphOffsetRuns, RenderHyphenFragment,
     RenderLine, RenderLineTextFragment, RenderLineTextFragments, RenderLines, RenderTextRun,
-    RenderTextRuns, RenderTextView,
+    RenderTextRuns, RenderTextView, merge_text_ranges,
 };
 
 #[derive(Clone, Copy)]
@@ -56,6 +60,11 @@ pub struct RenderView<'a> {
 /// Text and line-layout queries. This capability deliberately excludes box
 /// topology, resolved decorations, and document source details.
 impl<'a> RenderView<'a> {
+    /// Ordered lines with their identities and content bounds already resolved.
+    pub fn pagination_lines(self) -> PaginationLines<'a> {
+        PaginationLines { view: self }
+    }
+
     pub fn text(self) -> RenderTextView<'a> {
         RenderTextView {
             doc: self.doc,
@@ -112,40 +121,25 @@ impl<'a> RenderView<'a> {
     /// A root background suppresses body propagation even when its only
     /// drawable layer is an image that this renderer cannot paint yet.
     pub fn canvas_background_color(&self) -> Option<u32> {
-        let root_box = self.doc.inputs.layout_tree.root_box()?;
-        let root_indices = self
-            .doc
-            .inputs
-            .layout_tree
-            .get_box_style_indices(root_box)?;
-        let root = self.doc.inputs.styles.view(root_indices)?;
-        let root_color = self
-            .doc
-            .inputs
-            .paint
-            .box_colors(root_box)
-            .map_or_else(|| root.background_color(), |paint| paint.background);
+        let background = |box_idx| {
+            let indices = self.doc.inputs.layout_tree.get_box_style_indices(box_idx)?;
+            let style = self.doc.inputs.styles.view(indices)?;
+            let color = self
+                .doc
+                .inputs
+                .paint
+                .box_colors(box_idx)
+                .map_or_else(|| style.background_color(), |paint| paint.background);
+            Some((style, color))
+        };
+        let (root, root_color) = background(self.doc.inputs.layout_tree.root_box()?)?;
         if root.background_image_present() || root_color & 0xFF != 0 {
-            return (root.visibility() == html_style_model::Visibility::Visible
-                && root_color & 0xFF != 0)
+            return (root.visibility() == Visibility::Visible && root_color & 0xFF != 0)
                 .then_some(root_color);
         }
 
-        let body_box = self.doc.inputs.layout_tree.body_box()?;
-        let body_indices = self
-            .doc
-            .inputs
-            .layout_tree
-            .get_box_style_indices(body_box)?;
-        let body = self.doc.inputs.styles.view(body_indices)?;
-        let body_color = self
-            .doc
-            .inputs
-            .paint
-            .box_colors(body_box)
-            .map_or_else(|| body.background_color(), |paint| paint.background);
-        (body.visibility() == html_style_model::Visibility::Visible && body_color & 0xFF != 0)
-            .then_some(body_color)
+        let (body, body_color) = background(self.doc.inputs.layout_tree.body_box()?)?;
+        (body.visibility() == Visibility::Visible && body_color & 0xFF != 0).then_some(body_color)
     }
 
     pub fn title(&self) -> Option<&'a str> {
@@ -165,14 +159,7 @@ impl<'a> RenderView<'a> {
     }
 
     pub fn image_uri(&self, image_idx: u32) -> Option<&'a str> {
-        match &self
-            .doc
-            .inputs
-            .document
-            .images()
-            .get(image_idx as usize)?
-            .source
-        {
+        match &self.images().get(image_idx as usize)?.source {
             ImageSource::Uri(uri) => Some(uri.as_str()),
             ImageSource::InlineSvg { .. } | ImageSource::MathMl { .. } => None,
         }

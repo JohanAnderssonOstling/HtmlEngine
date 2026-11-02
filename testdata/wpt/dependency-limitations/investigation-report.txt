@@ -1,0 +1,164 @@
+Historical investigation snapshot. The 173 candidates below were subsequently
+fixed; see local-fix-report.txt for current results and performance.
+
+Remaining CSS syntax mismatches: deeper investigation
+Recorded 2026-11-01
+
+Result
+
+All 2,113 previously uncertain assertions received fresh native dependency
+probes. Among the 2,236 saved mismatches, 178 are now confirmed blocks under the
+current AST-only constraints, 173 have plausible local implementation routes,
+and 1,885 remain unresolved. These counts describe assertions, not defects.
+There was no fresh full WPT audit and no production change; the saved pass rate
+remains 16,220 / 18,456 (87.88%).
+
+55 additional confirmed blocks
+
+48 distinct-source comparisons produce equal native Property values using the
+native PartialEq implementation. These include color normalization/mixing,
+grid line-name merging, unitless/range normalization and negative font-width
+and font-stretch. Some serialization controls round floating-point components;
+exact native components were used where needed, and equality was verified,
+not inferred from similar output. All 48 chosen proofs use different source
+strings. Together with the previous 121, this establishes 169 collisions.
+
+The historical tab-size and text-decoration-thickness self-comparisons remain
+invalid evidence. New comparisons of direct negative values against calc()
+independently establish collisions. A blanket negative-result rejection would
+also reject the valid ranged math spelling; native source-form provenance or
+validation is needed to distinguish them.
+
+Six valid slotted pseudo-element chains fail native parsing because
+PseudoElement::valid_after_slotted has a fixed whitelist. Checkmark, picker-icon,
+picker(select) and details-content are absent. Parcel rejects the chains before
+returning an AST; an AST guard cannot add the missing acceptance.
+
+One invalid :has(.a, 123) selector becomes :has(.a). The original and control
+produce identical native stylesheet AST debug dumps, and Parcel source shows
+forgiving list recovery with no discarded-branch marker. This proof uses debug
+AST comparison plus source inspection, not Property PartialEq. The two previous
+@scope recovery blocks remain unchanged.
+
+These blocks apply to the inspected native parsing path and current constraints.
+They do not establish permanent impossibility or rule out future native APIs.
+
+173 local-fix candidates, in suggested investigation order
+
+1. Reuse existing native value parsers: 10 assertions.
+
+   Seven flex-basis cases (fit-content, min-content, max-content and stretch)
+   become typed values through Lightning CSS's existing width/Size parser.
+   FlexBasis itself uses the narrower LengthPercentageOrAuto representation.
+   Reusing the existing preferred-size conversion may therefore be possible
+   without adding CSS grammar or changing Lightning CSS.
+
+   Three z-index numeric-math assertions succeed through the existing native
+   number parser, while CSSInteger only expects a literal integer and has a
+   calc TODO. Implementing a shared native-number route would still require
+   correct CSS integer rounding, range handling and rejection of invalid literal
+   fractions. The alternate probes demonstrate native parsing, not completed
+   z-index integration or computed-value correctness.
+
+2. Validate retained native selector components: 114 assertions.
+
+   64 :has() cases retain empty/nested/forbidden components suitable for semantic
+   review. 42 cases retain known functional pseudo-element names without their
+   required arguments. Four retain bare functional pseudo-class names. Three
+   use the nonfunctional view-transition pseudo-element as a function. One
+   retains an invalid picker identifier.
+
+   These are candidate AST guards, not 114 guaranteed safe fixes. In particular,
+   recovery can erase distinctions and functional placement rules need checking
+   against valid cases. Rerun the full selected syntax corpus after changes.
+   Improving syntax acceptance/rejection does not implement feature rendering.
+
+3. Review existing generated-content/counter conversion: 49 assertions.
+
+   The syntax path currently accepts opaque Custom declarations that the
+   existing engine converter already interprets using native token structures.
+   Reuse may avoid a new parallel parser. However, the renderer converter also
+   rejects valid custom counter styles, images and other unsupported content;
+   its attr() strictness and reserved-name handling need review. This group is
+   a review bucket, not proof that all 49 can be fixed by wiring in conversion.
+
+1,885 unresolved assertions
+
+  1,742 native property Unparsed cases after the ten alternate routes above
+    133 remaining selector cases
+      6 normalization candidates without a distinct-source equality proof
+      4 layer-import fallback cases
+
+The six normalization cases include negative Lab/Oklab lightness and legacy
+color none/NaN behavior. Approximate serialization or NaN debug output is not
+sufficient evidence of native equality. No new block was inferred from it.
+
+Native Unparsed diagnosis buckets
+
+Each assertion gets one priority bucket; these are neither distinct bugs nor
+proof that all local routes are exhausted:
+
+  380  native-color-interpolation-space-gap
+  270  other-native-color-rejection
+  191  native-linear-p3-space-gap
+  170  native-color-layers-function-gap
+  170  other-native-property-rejection
+  130  native-subgrid-model-gap
+  115  native-random-function-gap
+   61  native-color-needs-currentcolor-context
+   38  native-calc-size-function-gap
+   36  native-clamp-none-boundary-gap
+   36  native-contrast-color-function-gap
+   36  native-modern-white-space-shorthand-gap
+   34  native-anchor-function-gap
+   28  native-dashed-function-gap
+   27  native-tree-counting-function-gap
+    8  native-calc-whitespace-before-comma-rejection
+    6  native-inherit-function-gap
+    6  native-non-finite-color-rejection
+
+The largest source findings are missing color interpolation spaces (380),
+missing display-p3-linear color-space support (191), color-layers (170),
+subgrid representation (130) and random functions (115). Another 61 color cases
+need currentColor/system-color context that native eager interpolation or
+relative-color conversion cannot resolve at parse time. Generic tokens remain,
+but using them is not permission to add a second CSS grammar.
+
+Lightning CSS already supports relative colors, alpha(), light-dark() and
+color-mix() in multiple spaces. It also already recognizes NaN and infinity
+math constants. Neither entire relative colors nor all non-finite math should
+be reported as unsupported. Missing spaces/functions and eager evaluation are
+more precise diagnoses.
+
+The native clamp parser lacks none-boundary parsing. Eight additional failures
+involve whitespace/comments before commas: parse_sum consumes the whitespace
+then errors on the comma. These remain unresolved, since a compliant native
+route or normalization has not been established. No raw CSS string rewriting
+or replacement math parser is proposed.
+
+Other observed gaps include calc-size, anchor functions, tree-counting,
+dashed functions, inherit(), and the modern white-space shorthand. An Unparsed
+result alone is not enough to certify a dependency block: other native parsers
+or existing AST consumers must still be investigated.
+
+Evidence and validation
+
+Exact assertions and evidence references are in css-syntax.jsonl. Fresh probe
+outputs, chosen native equality proofs, alternate parser routes, selector
+controls and package source anchors are retained alongside this report.
+The existing Rust diagnostic was recompiled unchanged against the saved native
+dependency bundle. No production or test code was added. Inspected Lightning
+CSS and Parcel source files match their cached packaged crate archives.
+
+Registry validation checks the unchanged 2,236 assertion identities, all prior
+blocks, new proofs, candidate counts, evidence references, source/artifact
+hashes, original WPT file/line locations and unchanged selection/expectation
+ledgers. Rendering records remain byte-for-byte unchanged. A full WPT regression
+run remains necessary when candidates are implemented.
+
+Primary specification references used in investigation:
+https://www.w3.org/TR/css-values-4/#calc-range
+https://drafts.csswg.org/selectors/#relational
+https://drafts.csswg.org/css-view-transitions-1/#pseudo-elements
+https://drafts.csswg.org/css-color-5/#color-mix
+https://drafts.csswg.org/css-pseudo-4/#tree-abiding

@@ -2,7 +2,7 @@
 mod tests {
     use crate::GlyphResourceStore;
 
-    use super::columns::{TableCellPlacement, TableGrid, build_table_grid};
+    use super::columns::build_table_grid;
     use crate::parser::DocumentFactory;
     use crate::test_support::TestGlyphShaper;
     use crate::{LaidOutDocument, LayoutConstraints};
@@ -470,48 +470,16 @@ mod tests {
     }
 
     #[test]
-    fn placements_assign_columns_in_row_order() {
-        let rows = vec![
-            vec![(10usize, 2usize, 1usize), (11usize, 1usize, 2usize)],
-            vec![(20usize, 1usize, 1usize), (21usize, 1usize, 1usize)],
-        ];
-        let TableGrid {
-            placements,
-            column_count: cols,
-        } = build_table_grid(rows);
-        assert_eq!(cols, 3);
-        assert_eq!(placements.len(), 4);
-        let first: TableCellPlacement = placements[0];
-        let second: TableCellPlacement = placements[1];
-        let third: TableCellPlacement = placements[2];
-        let fourth: TableCellPlacement = placements[3];
-        assert_eq!(
-            (first.row, first.col, first.colspan, first.cell_idx),
-            (0, 0, 2, 10)
+    fn streamed_grid_rows_avoid_per_row_allocations() {
+        let (grid, allocations) = crate::allocation_test_support::count_allocations(|| {
+            build_table_grid((0..1024).map(|row| std::iter::once((row, 1, 1))))
+        });
+        assert_eq!(grid.column_count, 1);
+        assert_eq!(grid.placements.len(), 1024);
+        assert!(
+            allocations < 32,
+            "streamed rows should need only arena growth, got {allocations} allocations"
         );
-        assert_eq!(
-            (second.row, second.col, second.rowspan, second.cell_idx),
-            (0, 2, 2, 11)
-        );
-        assert_eq!((third.row, third.col, third.cell_idx), (1, 0, 20));
-        assert_eq!((fourth.row, fourth.col, fourth.cell_idx), (1, 1, 21));
-    }
-
-    #[test]
-    fn placements_respect_rowspan_reserved_slots() {
-        let rows = vec![
-            vec![(10usize, 1usize, 2usize), (11usize, 1usize, 1usize)],
-            vec![(20usize, 1usize, 1usize)],
-        ];
-        let TableGrid {
-            placements,
-            column_count: cols,
-        } = build_table_grid(rows);
-        assert_eq!(cols, 2);
-        assert_eq!(placements.len(), 3);
-        assert_eq!((placements[0].row, placements[0].col), (0, 0));
-        assert_eq!((placements[1].row, placements[1].col), (0, 1));
-        assert_eq!((placements[2].row, placements[2].col), (1, 1));
     }
 
     #[test]
@@ -926,6 +894,52 @@ mod tests {
             decoration_rects_by_color(&wider_table, 0xff0000ff, &wider_table_resources).is_empty(),
             "the narrower cell border loses the outer conflict"
         );
+    }
+
+    #[test]
+    fn collapsed_border_source_precedence_covers_spanning_cells_in_both_directions() {
+        let colors = [
+            ("#ff0000", 0xff0000ff),
+            ("#00ff00", 0x00ff00ff),
+            ("#0000ff", 0x0000ffff),
+            ("#ffff00", 0xffff00ff),
+            ("#ff00ff", 0xff00ffff),
+            ("#00ffff", 0x00ffffff),
+        ];
+        for direction in ["ltr", "rtl"] {
+            for winner in 0..colors.len() {
+                let borders = colors
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (color, _))| {
+                        if index <= winner {
+                            format!("border-top:4px solid {color}")
+                        } else {
+                            String::new()
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let html = format!(
+                    "<html><body style='margin:0'>\
+                    <table style='border-collapse:collapse;direction:{direction};{}'>\
+                    <colgroup style='{}'><col span='2' style='width:30px;{}'></colgroup>\
+                    <tbody style='{}'><tr style='{}'>\
+                    <td colspan='2' rowspan='2' style='height:30px;padding:0;{}'></td>\
+                    </tr><tr></tr></tbody></table></body></html>",
+                    borders[0], borders[1], borders[2], borders[3], borders[4], borders[5],
+                );
+                let mut resources = GlyphResourceStore::default();
+                let document = layout_html(&html, 200.0, &mut resources);
+                for (index, &(_, color)) in colors.iter().enumerate() {
+                    let rects = decoration_rects_by_color(&document, color, &resources);
+                    assert_eq!(
+                        !rects.is_empty(),
+                        index == winner,
+                        "{direction}: source {winner} must win over source {index}",
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1798,6 +1812,25 @@ mod tests {
     }
 
     #[test]
+    fn percentage_height_descendants_resolve_inside_nested_cell_containers() {
+        for display in ["block", "flex", "grid", "inline-block"] {
+            let mut resources = GlyphResourceStore::default();
+            let document = layout_html(
+                &format!(
+                    "<html><body style='margin:0'><table style='border-spacing:0'><tr>\
+                    <td id='cell' style='height:100px;padding:0'>\
+                    <div style='display:{display};height:100px;width:40px'>\
+                    <div id='child' style='height:50%;overflow:auto'>content</div>\
+                    </div></td></tr></table></body></html>"
+                ),
+                300.0,
+                &mut resources,
+            );
+            assert_eq!(box_size_by_id(&document, "child", &resources).height, 50.0, "{display}");
+        }
+    }
+
+    #[test]
     fn restricted_percentage_height_cell_descendant_uses_definite_table_height() {
         let mut document_resources = GlyphResourceStore::default();
         let document = layout_html_css(
@@ -1836,6 +1869,28 @@ mod tests {
                 .abs()
                 < 0.01
         );
+    }
+
+    #[test]
+    fn empty_tables_include_bottom_caption_margins_after_height_distribution() {
+        for contents in ["", "<tbody></tbody>", "<tr></tr><tr></tr>"] {
+            let mut resources = GlyphResourceStore::default();
+            let document = layout_html(
+                &format!(
+                    "<html><body style='margin:0'><table id='table' style='height:80px;width:100px;border-spacing:6px'>\
+                    <caption id='caption' style='caption-side:bottom;height:10px;margin:3px 0 7px'></caption>\
+                    {contents}</table><div id='after' style='height:1px'></div></body></html>"
+                ),
+                300.0,
+                &mut resources,
+            );
+            let table = box_point_by_id(&document, "table", &resources);
+            let caption = box_point_by_id(&document, "caption", &resources);
+            let after = box_point_by_id(&document, "after", &resources);
+            assert_eq!(box_size_by_id(&document, "table", &resources).height, 90.0, "{contents}");
+            assert_eq!(caption.y - table.y, 73.0, "{contents}");
+            assert_eq!(after.y - table.y, 90.0, "{contents}");
+        }
     }
 
     #[test]
@@ -1992,7 +2047,7 @@ mod tests {
     /// Manual release-mode benchmark for table layout architecture changes.
     ///
     /// Run with:
-    /// `cargo test --release -p html-layout benchmark_table_relayout -- --ignored --exact --nocapture`
+    /// `cargo test --release -p skrift-layout benchmark_table_relayout -- --ignored --exact --nocapture`
     #[test]
     #[ignore = "manual performance benchmark"]
     fn benchmark_table_relayout() {

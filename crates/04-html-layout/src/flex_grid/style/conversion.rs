@@ -1,7 +1,9 @@
+use crate::layout::resolve_definite_size_value;
 use html_style_model::{
-    ContentAlignment, ItemAlignment, OverflowMode, UsedPreferredSize as PreferredSize,
+    ContentAlignment, ItemAlignment, OverflowMode, UsedLengthPct,
+    UsedPreferredSize as PreferredSize,
 };
-use taffy::prelude::Dimension;
+use taffy::prelude::{Dimension, LengthPercentageAuto};
 use taffy::style::{
     AlignContent as TaffyAlignContent, AlignItems as TaffyAlignItems, Overflow as TaffyOverflow,
 };
@@ -11,55 +13,37 @@ use super::super::tracks::length_percentage_auto;
 
 pub fn dimension(value: PreferredSize) -> Dimension {
     match value {
+        // Percentages remain symbolic for Taffy. Stretch participates through
+        // alignment, so it must not become a percentage of an indefinite size.
+        PreferredSize::Percent(value) => Dimension::percent(value.max(0.0)),
         PreferredSize::Auto
         | PreferredSize::Content
         | PreferredSize::MinContent
         | PreferredSize::MaxContent
-        | PreferredSize::FitContent => Dimension::auto(),
-        // Stretch participates through flex/grid alignment; encoding it as
-        // 100% would resolve an indefinite cross size against the container.
-        PreferredSize::Stretch => Dimension::auto(),
-        PreferredSize::Px(value) => Dimension::length(value.max(0.0)),
-        PreferredSize::Percent(value) => Dimension::percent(value.max(0.0)),
-        // Callers with a definite percentage basis resolve calc before this
-        // fallback. With an indefinite basis, only the absolute term remains.
-        PreferredSize::Calc {
-            absolute_px,
-            percentage_dependent: false,
-            ..
-        } => Dimension::length(absolute_px.max(0.0)),
-        PreferredSize::Calc {
-            percentage_dependent: true,
-            ..
-        } => Dimension::auto(),
-        PreferredSize::Comparison { .. } if value.percentage_dependent() => Dimension::auto(),
-        PreferredSize::Comparison { .. } => Dimension::length(
-            html_style_model::resolve_used_preferred_size(value, 0.0, 0.0).max(0.0) as f32,
-        ),
+        | PreferredSize::FitContent
+        | PreferredSize::Stretch => Dimension::auto(),
+        // Callers with a definite basis resolve percentage-dependent sizes
+        // before this fallback; use the shared numeric resolver otherwise.
+        PreferredSize::Px(_) | PreferredSize::Calc { .. } | PreferredSize::Comparison { .. } => {
+            resolve_definite_size_value(value, None).map_or_else(Dimension::auto, |value| {
+                Dimension::length(value.max(0.0) as f32)
+            })
+        }
     }
-}
-fn optional_length_percentage_auto(
-    value: Option<html_style_model::UsedLengthPct>,
-    percentage_basis: f64,
-) -> taffy::prelude::LengthPercentageAuto {
-    value.map_or_else(taffy::prelude::LengthPercentageAuto::auto, |value| {
-        length_percentage_auto(value, false, percentage_basis)
-    })
 }
 
 pub(super) fn absolute_grid_inset(
-    value: Option<html_style_model::UsedLengthPct>,
+    value: Option<UsedLengthPct>,
     percentage_basis: f64,
     taffy_handles_absolute: bool,
     stretch_area: bool,
-) -> taffy::prelude::LengthPercentageAuto {
-    if !taffy_handles_absolute {
-        return taffy::prelude::LengthPercentageAuto::auto();
-    }
-    if stretch_area && value.is_none() {
-        taffy::prelude::LengthPercentageAuto::length(0.0)
-    } else {
-        optional_length_percentage_auto(value, percentage_basis)
+) -> LengthPercentageAuto {
+    match value {
+        Some(value) if taffy_handles_absolute => {
+            length_percentage_auto(value, false, percentage_basis)
+        }
+        None if taffy_handles_absolute && stretch_area => LengthPercentageAuto::length(0.0),
+        _ => LengthPercentageAuto::auto(),
     }
 }
 
@@ -82,7 +66,7 @@ pub(super) fn content_alignment(
         ContentAlignment::Normal if kind == TaffyContainerKind::Flex && main_axis => {
             TaffyAlignContent::FLEX_START
         }
-        ContentAlignment::Normal => TaffyAlignContent::STRETCH,
+        ContentAlignment::Normal | ContentAlignment::Stretch => TaffyAlignContent::STRETCH,
         ContentAlignment::Start => TaffyAlignContent::START,
         ContentAlignment::End => TaffyAlignContent::END,
         ContentAlignment::Left => if rtl { TaffyAlignContent::END } else { TaffyAlignContent::START },
@@ -90,34 +74,37 @@ pub(super) fn content_alignment(
         ContentAlignment::FlexStart => TaffyAlignContent::FLEX_START,
         ContentAlignment::FlexEnd => TaffyAlignContent::FLEX_END,
         ContentAlignment::Center => TaffyAlignContent::CENTER,
-        ContentAlignment::Stretch => TaffyAlignContent::STRETCH,
         ContentAlignment::SpaceBetween => TaffyAlignContent::SPACE_BETWEEN,
         ContentAlignment::SpaceAround => TaffyAlignContent::SPACE_AROUND,
         ContentAlignment::SpaceEvenly => TaffyAlignContent::SPACE_EVENLY,
     })
 }
 
-pub(super) fn item_alignment(
-    value: ItemAlignment,
-    rtl: bool,
-) -> Option<TaffyAlignItems> {
-    match value {
-        ItemAlignment::Auto => None,
-        ItemAlignment::Normal => Some(TaffyAlignItems::STRETCH),
-        ItemAlignment::Start => {
-            Some(TaffyAlignItems::START)
+pub(super) fn item_alignment(value: ItemAlignment, rtl: bool) -> Option<TaffyAlignItems> {
+    Some(match value {
+        ItemAlignment::Auto => return None,
+        ItemAlignment::Normal | ItemAlignment::Stretch => TaffyAlignItems::STRETCH,
+        ItemAlignment::Start => TaffyAlignItems::START,
+        ItemAlignment::End => TaffyAlignItems::END,
+        ItemAlignment::FlexStart => TaffyAlignItems::FLEX_START,
+        ItemAlignment::Left | ItemAlignment::LegacyLeft => {
+            if rtl {
+                TaffyAlignItems::END
+            } else {
+                TaffyAlignItems::START
+            }
         }
-        ItemAlignment::End => {
-            Some(TaffyAlignItems::END)
+        ItemAlignment::Right | ItemAlignment::LegacyRight => {
+            if rtl {
+                TaffyAlignItems::START
+            } else {
+                TaffyAlignItems::END
+            }
         }
-        ItemAlignment::FlexStart => Some(TaffyAlignItems::FLEX_START),
-        ItemAlignment::Left | ItemAlignment::LegacyLeft => Some(if rtl { TaffyAlignItems::END } else { TaffyAlignItems::START }),
-        ItemAlignment::Right | ItemAlignment::LegacyRight => Some(if rtl { TaffyAlignItems::START } else { TaffyAlignItems::END }),
-        ItemAlignment::SelfStart => Some(TaffyAlignItems::SELF_START),
-        ItemAlignment::SelfEnd => Some(TaffyAlignItems::SELF_END),
-        ItemAlignment::FlexEnd => Some(TaffyAlignItems::FLEX_END),
-        ItemAlignment::Center | ItemAlignment::LegacyCenter => Some(TaffyAlignItems::CENTER),
-        ItemAlignment::Stretch => Some(TaffyAlignItems::STRETCH),
-        ItemAlignment::Baseline => Some(TaffyAlignItems::BASELINE),
-    }
+        ItemAlignment::SelfStart => TaffyAlignItems::SELF_START,
+        ItemAlignment::SelfEnd => TaffyAlignItems::SELF_END,
+        ItemAlignment::FlexEnd => TaffyAlignItems::FLEX_END,
+        ItemAlignment::Center | ItemAlignment::LegacyCenter => TaffyAlignItems::CENTER,
+        ItemAlignment::Baseline => TaffyAlignItems::BASELINE,
+    })
 }

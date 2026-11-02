@@ -50,8 +50,8 @@ pub enum TextCompositionPolicy {
     /// Paragraph-wide book composition with conservative hyphenation quality
     /// controls enabled.
     BookOptimized,
-    /// Paragraph-wide book composition without the optional consecutive-run,
-    /// paragraph-ending, fragment-length, and short-line hyphen safeguards.
+    /// Paragraph-wide book composition without the optional paragraph-ending,
+    /// fragment-length, and short-line hyphen safeguards.
     BookOptimizedUnrestrictedHyphenation,
 }
 

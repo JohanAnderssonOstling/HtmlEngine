@@ -3,7 +3,8 @@
 //! Only compact single-compound tag, ID, class, and universal selectors enter
 //! this cache. DOM-dependent selectors continue through the exact matcher.
 
-use super::*;
+use crate::style::compiled::EffectiveRuleId;
+use html_dom::{Document, DomNodeId, ElementRef};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet, FxHasher};
 use std::hash::{Hash, Hasher};
 
@@ -40,13 +41,11 @@ impl LocalMatchCache {
     pub(super) fn probe(
         &mut self,
         doc: &Document,
-        node: DomNodeId,
+        element: ElementRef<'_>,
         candidates: &mut Vec<EffectiveRuleId>,
         specificities: &mut Vec<Option<u32>>,
     ) -> LocalMatchProbe {
-        let Some(element) = doc.element_ref(node) else {
-            return LocalMatchProbe::Uncached;
-        };
+        let node = element.node_id();
         let mut hasher = FxHasher::default();
         element.tag().hash(&mut hasher);
         element.id().hash(&mut hasher);
@@ -58,7 +57,7 @@ impl LocalMatchCache {
         if let Some(entries) = self.buckets.get(&hash)
             && let Some(entry) = entries
                 .iter()
-                .find(|entry| same_element_signature(doc, entry.signature.representative, node))
+                .find(|entry| same_element_signature(doc, entry.signature.representative, element))
         {
             candidates.clear();
             candidates.extend_from_slice(&entry.candidates);
@@ -109,11 +108,8 @@ impl LocalMatchCache {
     }
 }
 
-fn same_element_signature(doc: &Document, left: DomNodeId, right: DomNodeId) -> bool {
+fn same_element_signature(doc: &Document, left: DomNodeId, right: ElementRef<'_>) -> bool {
     let Some(left) = doc.element_ref(left) else {
-        return false;
-    };
-    let Some(right) = doc.element_ref(right) else {
         return false;
     };
     left.tag() == right.tag()
@@ -129,29 +125,30 @@ mod tests {
     #[test]
     fn exact_element_signatures_reuse_local_selector_results() {
         let doc = html_parse::parse_dom_document("<html><body><p class='same'></p><p class='same'></p><p class='different'></p></body></html>").unwrap();
-        let nodes = doc
+        let elements = doc
             .node_ids()
-            .filter(|&node| doc.get_dom_tag(node) == Some("p"))
+            .filter_map(|node| doc.element_ref(node))
+            .filter(|element| element.tag() == "p")
             .collect::<Vec<_>>();
         let mut cache = LocalMatchCache::default();
         let mut candidates = Vec::new();
         let mut specificities = Vec::new();
         assert!(matches!(
-            cache.probe(&doc, nodes[0], &mut candidates, &mut specificities),
+            cache.probe(&doc, elements[0], &mut candidates, &mut specificities),
             LocalMatchProbe::Uncached
         ));
-        let signature = match cache.probe(&doc, nodes[1], &mut candidates, &mut specificities) {
+        let signature = match cache.probe(&doc, elements[1], &mut candidates, &mut specificities) {
             LocalMatchProbe::Miss(signature) => signature,
             _ => panic!("the repeated local signature should be admitted"),
         };
         cache.insert(signature, &[], &[]);
         assert!(matches!(
-            cache.probe(&doc, nodes[1], &mut candidates, &mut specificities),
+            cache.probe(&doc, elements[1], &mut candidates, &mut specificities),
             LocalMatchProbe::Hit
         ));
         assert_eq!(cache.hit_count(), 1);
         assert!(matches!(
-            cache.probe(&doc, nodes[2], &mut candidates, &mut specificities),
+            cache.probe(&doc, elements[2], &mut candidates, &mut specificities),
             LocalMatchProbe::Uncached
         ));
     }

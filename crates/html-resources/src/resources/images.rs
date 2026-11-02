@@ -1,17 +1,20 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io::{self, Cursor};
 use std::sync::{Arc, Mutex, Weak};
 
-use base64::Engine;
+use base64::{Engine, engine::general_purpose::STANDARD};
 use peniko::{Blob, Format, Image as PenikoImage};
-use quick_xml::Reader;
+use quick_xml::{Reader, XmlVersion};
 use quick_xml::Writer;
 use quick_xml::events::{BytesStart, Event};
 use sha2::{Digest, Sha256};
 
 use crate::document::{ImageResource, ImageSource};
-use crate::resources::{ResourceMetadata, ResourceProvider};
+use crate::resources::{
+    ResourceMetadata, ResourceProvider, has_uri_scheme, media_type_essence, uri_path,
+};
 
 #[derive(Clone)]
 pub enum DecodedImage {
@@ -40,7 +43,7 @@ impl DecodedImage {
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 enum ImageKey {
     Uri(String),
-    InlineSvg { hash: Vec<u8>, base_uri: String },
+    InlineSvg { hash: [u8; 32], base_uri: String },
 }
 
 impl ImageKey {
@@ -61,11 +64,11 @@ impl ImageKey {
         match source {
             ImageSource::Uri(uri) => Self::Uri(uri.clone()),
             ImageSource::MathMl { svg, .. } => Self::InlineSvg {
-                hash: Sha256::digest(svg).to_vec(),
+                hash: Sha256::digest(svg).into(),
                 base_uri: String::new(),
             },
             ImageSource::InlineSvg { bytes, base_uri } => Self::InlineSvg {
-                hash: Sha256::digest(bytes).to_vec(),
+                hash: Sha256::digest(bytes).into(),
                 base_uri: base_uri.clone(),
             },
         }
@@ -166,6 +169,15 @@ struct SharedState {
     completion_waker: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
+impl SharedState {
+    fn image(&mut self, key: &ImageKey) -> Option<&SharedImage> {
+        self.clock = self.clock.wrapping_add(1);
+        let image = self.decoded.get_mut(key)?;
+        image.last_used = self.clock;
+        Some(image)
+    }
+}
+
 /// Source-keyed image jobs and decoded-image memory shared by every document
 /// in one reader. Cloning this handle creates no workers.
 #[derive(Clone)]
@@ -239,13 +251,9 @@ impl ImageService {
         );
     }
 
-    fn get(&self, key: &ImageKey) -> Option<(Arc<DecodedImage>, u64)> {
+    fn get(&self, key: &ImageKey) -> Option<Arc<DecodedImage>> {
         let mut state = self.state.lock().expect("image service mutex poisoned");
-        state.clock = state.clock.wrapping_add(1);
-        let clock = state.clock;
-        let image = state.decoded.get_mut(key)?;
-        image.last_used = clock;
-        Some((image.decoded.clone(), image.revision))
+        Some(state.image(key)?.decoded.clone())
     }
 
     fn trim(&self) {
@@ -324,10 +332,7 @@ impl ImagePipeline {
         let mut state = self.service.state.lock().expect("image service mutex poisoned");
         for &idx in &self.desired {
             let key = &self.resource_keys[&idx];
-            state.clock = state.clock.wrapping_add(1);
-            let clock = state.clock;
-            let Some(image) = state.decoded.get_mut(key) else { continue };
-            image.last_used = clock;
+            let Some(image) = state.image(key) else { continue };
             if self.seen_revisions.get(&idx) == Some(&image.revision) { continue; }
             self.seen_revisions.insert(idx, image.revision);
             let dimensions = image.decoded.dimensions();
@@ -339,7 +344,6 @@ impl ImagePipeline {
         }
         drop(state);
         changed.dimensions_changed.sort_unstable();
-        changed.dimensions_changed.dedup();
         changed
     }
 
@@ -359,7 +363,7 @@ impl ImagePipeline {
             if self.decoded_cache.contains_key(&idx) {
                 continue;
             }
-            if let Some((decoded, _)) = self.service.get(key) {
+            if let Some(decoded) = self.service.get(key) {
                 // Paint a shared hit immediately. Leaving its revision
                 // unseen makes `has_pending` schedule one poll so intrinsic
                 // dimensions are still reported to this document.
@@ -387,6 +391,12 @@ impl ImagePipeline {
 
     pub fn get_decoded(&self, idx: u32) -> Option<&DecodedImage> {
         self.decoded_cache.get(&idx).map(AsRef::as_ref)
+    }
+
+    /// Known intrinsic dimensions survive decoded-buffer release and are
+    /// invalidated when this index is rebound to another resource source.
+    pub fn intrinsic_dimensions(&self, idx: u32) -> Option<(u32, u32)> {
+        self.image_dimensions.get(&idx).copied()
     }
 
     pub fn has_pending(&self) -> bool {
@@ -493,15 +503,21 @@ fn decode_image(bytes: &[u8]) -> Result<DecodedImage, ()> {
     })
 }
 
+/// Inspect intrinsic dimensions from encoded source bytes. Embedded SVG and
+/// formula payloads are borrowed; URI sources are read once.
 pub fn probe_dimensions(
     provider: &dyn ResourceProvider,
     source: &ImageSource,
 ) -> Option<(u32, u32)> {
-    let bytes = load_image_bytes(provider, source).ok()?;
+    let bytes: Cow<'_, [u8]> = match source {
+        ImageSource::Uri(uri) => Cow::Owned(provider.read_bytes(uri).ok()?),
+        ImageSource::MathMl { svg, .. } => Cow::Borrowed(svg),
+        ImageSource::InlineSvg { bytes, .. } => Cow::Borrowed(bytes),
+    };
     if let Some(dimensions) = svg_dimensions(&bytes) {
         return Some(dimensions);
     }
-    if let Ok(reader) = image::ImageReader::new(Cursor::new(&bytes)).with_guessed_format()
+    if let Ok(reader) = image::ImageReader::new(Cursor::new(bytes.as_ref())).with_guessed_format()
         && let Ok(dimensions) = reader.into_dimensions()
     {
         return Some(dimensions);
@@ -569,20 +585,12 @@ pub fn load_image_bytes(
             let references =
                 svg_image_references(bytes, base_uri, |base, href| provider.resolve(base, href));
             let mut prepared = PreparedSvgResources::new(references);
-            for uri in &prepared.references.uris {
+            for reference in 0..prepared.references.uris.len() {
                 if prepared.byte_len >= MAX_EMBEDDED_BYTES {
                     break;
                 }
-                if let Ok(bytes) = provider.read_bytes(uri)
-                    && prepared.byte_len.saturating_add(bytes.len()) <= MAX_EMBEDDED_BYTES
-                {
-                    let metadata = provider.metadata(uri).ok();
-                    if let Some(media_type) = svg_image_media_type(metadata.as_ref(), uri, &bytes) {
-                        prepared.byte_len += bytes.len();
-                        prepared
-                            .resources
-                            .insert(uri.clone(), PreparedSvgImage { bytes, media_type });
-                    }
+                if let Ok(bytes) = provider.read_bytes(&prepared.references.uris[reference]) {
+                    prepared.insert_image(reference, bytes, |uri| provider.metadata(uri));
                 }
             }
             Ok(embed_svg_image_resources(&prepared, bytes))
@@ -609,20 +617,12 @@ where
             let references =
                 svg_image_references(bytes, base_uri, |base, href| context.resolve(base, href));
             let mut prepared = PreparedSvgResources::new(references);
-            for uri in &prepared.references.uris {
+            for reference in 0..prepared.references.uris.len() {
                 if prepared.byte_len >= MAX_EMBEDDED_BYTES {
                     break;
                 }
-                if let Ok(bytes) = read(uri.clone()).await
-                    && prepared.byte_len.saturating_add(bytes.len()) <= MAX_EMBEDDED_BYTES
-                {
-                    let metadata = context.metadata(uri).ok();
-                    if let Some(media_type) = svg_image_media_type(metadata.as_ref(), uri, &bytes) {
-                        prepared.byte_len += bytes.len();
-                        prepared
-                            .resources
-                            .insert(uri.clone(), PreparedSvgImage { bytes, media_type });
-                    }
+                if let Ok(bytes) = read(prepared.references.uris[reference].clone()).await {
+                    prepared.insert_image(reference, bytes, |uri| context.metadata(uri));
                 }
             }
             Ok(embed_svg_image_resources(&prepared, bytes))
@@ -631,7 +631,7 @@ where
 }
 
 struct SvgImageReferences {
-    by_href: HashMap<String, String>,
+    by_href: HashMap<String, usize>,
     // Preserve source order so the byte limit does not choose images randomly.
     uris: Vec<String>,
 }
@@ -645,7 +645,7 @@ fn svg_image_references(
         by_href: HashMap::new(),
         uris: Vec::new(),
     };
-    let mut seen = HashSet::new();
+    let mut seen = HashMap::new();
     let mut reader = Reader::from_reader(svg);
     loop {
         match reader.read_event() {
@@ -658,7 +658,7 @@ fn svg_image_references(
                         .local_name()
                         .as_ref()
                         .eq_ignore_ascii_case(b"href")
-                        && let Ok(href) = attribute.unescape_value()
+                        && let Ok(href) = attribute.normalized_value(XmlVersion::Implicit1_0)
                     {
                         let href = href.trim();
                         if href.is_empty()
@@ -669,10 +669,12 @@ fn svg_image_references(
                             continue;
                         }
                         let uri = resolve(base_uri, href);
-                        if seen.insert(uri.clone()) {
+                        let reference = *seen.entry(uri).or_insert_with_key(|uri| {
+                            let reference = references.uris.len();
                             references.uris.push(uri.clone());
-                        }
-                        references.by_href.insert(href.to_owned(), uri);
+                            reference
+                        });
+                        references.by_href.insert(href.to_owned(), reference);
                     }
                 }
             }
@@ -684,13 +686,13 @@ fn svg_image_references(
 }
 
 struct PreparedSvgImage {
-    bytes: Vec<u8>,
-    media_type: &'static str,
+    data_url: String,
+    byte_len: usize,
 }
 
 struct PreparedSvgResources {
     references: SvgImageReferences,
-    resources: HashMap<String, PreparedSvgImage>,
+    resources: HashMap<usize, PreparedSvgImage>,
     byte_len: usize,
 }
 
@@ -704,14 +706,43 @@ impl PreparedSvgResources {
     }
 
     fn image(&self, href: &str) -> Option<&PreparedSvgImage> {
-        let uri = self.references.by_href.get(href.trim())?;
-        self.resources.get(uri)
+        let reference = self.references.by_href.get(href.trim())?;
+        self.resources.get(reference)
+    }
+
+    fn insert_image(
+        &mut self,
+        reference: usize,
+        bytes: Vec<u8>,
+        metadata: impl FnOnce(&str) -> io::Result<ResourceMetadata>,
+    ) {
+        if self.byte_len.saturating_add(bytes.len()) > MAX_EMBEDDED_BYTES {
+            return;
+        }
+        let uri = &self.references.uris[reference];
+        let metadata = metadata(uri).ok();
+        if let Some(media_type) = svg_image_media_type(metadata.as_ref(), uri, &bytes) {
+            let byte_len = bytes.len();
+            let mut data_url = String::with_capacity(
+                byte_len.div_ceil(3) * 4 + media_type.len() + "data:;base64,".len(),
+            );
+            data_url.push_str("data:");
+            data_url.push_str(media_type);
+            data_url.push_str(";base64,");
+            STANDARD.encode_string(&bytes, &mut data_url);
+            self.byte_len += byte_len;
+            self.resources
+                .insert(reference, PreparedSvgImage { data_url, byte_len });
+        }
     }
 }
 
 /// Rewrite an SVG from a self-contained map. Resource I/O and path resolution
 /// are completed before this step, shared by synchronous and async loading.
 fn embed_svg_image_resources(prepared: &PreparedSvgResources, svg: &[u8]) -> Vec<u8> {
+    if prepared.resources.is_empty() {
+        return svg.to_vec();
+    }
     let mut reader = Reader::from_reader(svg);
     let mut writer = Writer::new(Vec::with_capacity(svg.len()));
     let mut changed = false;
@@ -722,29 +753,23 @@ fn embed_svg_image_resources(prepared: &PreparedSvgResources, svg: &[u8]) -> Vec
             Ok(event) => event,
             Err(_) => return svg.to_vec(),
         };
-        let event = match event {
-            Event::Start(element)
+        let event = match &event {
+            Event::Start(element) | Event::Empty(element)
                 if element.local_name().as_ref().eq_ignore_ascii_case(b"image") =>
             {
                 let Some(element) =
-                    embed_svg_image_element(prepared, &element, &mut embedded_bytes, &mut changed)
+                    embed_svg_image_element(prepared, element, &mut embedded_bytes, &mut changed)
                 else {
                     return svg.to_vec();
                 };
-                Event::Start(element)
-            }
-            Event::Empty(element)
-                if element.local_name().as_ref().eq_ignore_ascii_case(b"image") =>
-            {
-                let Some(element) =
-                    embed_svg_image_element(prepared, &element, &mut embedded_bytes, &mut changed)
-                else {
-                    return svg.to_vec();
-                };
-                Event::Empty(element)
+                if matches!(event, Event::Start(_)) {
+                    Event::Start(element)
+                } else {
+                    Event::Empty(element)
+                }
             }
             Event::Eof => break,
-            event => event.into_owned(),
+            _ => event,
         };
         if writer.write_event(event).is_err() {
             return svg.to_vec();
@@ -777,15 +802,13 @@ fn embed_svg_image_element(
             .as_ref()
             .eq_ignore_ascii_case(b"href")
         {
-            let href = attribute.unescape_value().ok()?;
+            let href = attribute.normalized_value(XmlVersion::Implicit1_0).ok()?;
             if let Some(image) = prepared.image(&href)
-                && embedded_bytes.saturating_add(image.bytes.len()) <= MAX_EMBEDDED_BYTES
+                && embedded_bytes.saturating_add(image.byte_len) <= MAX_EMBEDDED_BYTES
             {
-                *embedded_bytes += image.bytes.len();
-                let encoded = base64::engine::general_purpose::STANDARD.encode(&image.bytes);
-                let data_url = format!("data:{};base64,{encoded}", image.media_type);
+                *embedded_bytes += image.byte_len;
                 let key = std::str::from_utf8(attribute.key.as_ref()).ok()?;
-                rewritten.push_attribute((key, data_url.as_str()));
+                rewritten.push_attribute((key, image.data_url.as_str()));
                 *changed = true;
                 continue;
             }
@@ -794,16 +817,6 @@ fn embed_svg_image_element(
     }
 
     Some(rewritten.into_owned())
-}
-
-fn has_uri_scheme(href: &str) -> bool {
-    let Some(colon) = href.find(':') else {
-        return false;
-    };
-    let Some(first_separator) = href.find(['/', '?', '#']) else {
-        return true;
-    };
-    colon < first_separator
 }
 
 fn svg_image_media_type(
@@ -820,21 +833,19 @@ fn svg_image_media_type(
 }
 
 fn canonical_image_media_type(media_type: &str) -> Option<&'static str> {
-    match media_type
-        .split(';')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "image/jpeg" | "image/jpg" => Some("image/jpeg"),
-        "image/png" => Some("image/png"),
-        "image/gif" => Some("image/gif"),
-        "image/webp" => Some("image/webp"),
-        "image/svg+xml" => Some("image/svg+xml"),
-        _ => None,
+    let media_type = media_type_essence(media_type);
+    if media_type.eq_ignore_ascii_case("image/jpg") {
+        return Some("image/jpeg");
     }
+    [
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "image/webp",
+        "image/svg+xml",
+    ]
+    .into_iter()
+    .find(|candidate| media_type.eq_ignore_ascii_case(candidate))
 }
 
 fn sniff_image_media_type(bytes: &[u8]) -> Option<&'static str> {
@@ -860,7 +871,7 @@ fn sniff_image_media_type(bytes: &[u8]) -> Option<&'static str> {
 }
 
 fn image_media_type_from_uri(uri: &str) -> Option<&'static str> {
-    let path = uri.split(['?', '#']).next().unwrap_or(uri);
+    let path = uri_path(uri);
     let extension = path.rsplit_once('.').map_or("", |(_, extension)| extension);
     if extension.eq_ignore_ascii_case("jpg") || extension.eq_ignore_ascii_case("jpeg") {
         Some("image/jpeg")
@@ -881,9 +892,9 @@ fn image_media_type_from_uri(uri: &str) -> Option<&'static str> {
 mod tests {
     use super::{
         BlockingJob, BlockingJobSpawner, DecodedImage, ImageKey, ImagePipeline, ImageService,
-        ImageResourceContext, MAX_EMBEDDED_BYTES, PreparedSvgImage, PreparedSvgResources,
+        ImageResourceContext, MAX_EMBEDDED_BYTES, PreparedSvgResources,
         decode_image, embed_svg_image_resources, load_image_bytes, load_image_bytes_async,
-        svg_image_references,
+        probe_dimensions, svg_image_references,
     };
     use crate::document::{ImageResource, ImageSource};
     use crate::resources::{ResourceMetadata, ResourceProvider};
@@ -957,12 +968,38 @@ mod tests {
     }
 
     #[test]
+    fn dimension_probes_borrow_embedded_svg_without_loading_dependencies() {
+        let provider = MemoryImageContext::default();
+        let svg: Arc<[u8]> =
+            Arc::from(br#"<svg width="32" height="16"><image href="cover.png"/></svg>"#.as_slice());
+        for source in [
+            ImageSource::InlineSvg {
+                bytes: svg.clone(),
+                base_uri: "OPS/chapter.xhtml".into(),
+            },
+            ImageSource::MathMl {
+                markup: "<math/>".into(),
+                svg,
+                baseline: 1.0,
+            },
+        ] {
+            assert_eq!(probe_dimensions(&provider, &source), Some((32, 16)));
+        }
+        let provider = CountingProvider(AtomicUsize::new(0));
+        assert_eq!(
+            probe_dimensions(&provider, &ImageSource::Uri("cover.svg".into())),
+            Some((20, 10))
+        );
+        assert_eq!(provider.0.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn async_inline_svg_uses_only_memory_context_and_deduplicates_fetches() {
         let context = MemoryImageContext {
             metadata: HashMap::from([(
                 "OPS/mark.jpg".to_owned(),
                 ResourceMetadata {
-                    media_type: Some("image/png; charset=binary".to_owned()),
+                    media_type: Some(" IMAGE/PNG; charset=binary".to_owned()),
                     charset: None,
                 },
             )]),
@@ -1072,19 +1109,19 @@ mod tests {
 
     #[test]
     fn svg_rewriting_needs_no_context_and_limits_repeated_embeddings() {
-        let svg = br#"<svg><image href="large.png"/><image href="large.png"/></svg>"#;
+        let svg = br#"<svg><!--keep--><text>before &amp; <![CDATA[<raw>]]><?keep value?></text><image href="large.png"/><image href="large.png"></image></svg>"#;
         let references = svg_image_references(svg, "OPS/chapter.xhtml", |_, href| href.to_owned());
         let mut prepared = PreparedSvgResources::new(references);
-        prepared.resources.insert(
-            "large.png".to_owned(),
-            PreparedSvgImage {
-                bytes: vec![0; MAX_EMBEDDED_BYTES / 2 + 1],
-                media_type: "image/png",
-            },
-        );
+        prepared.insert_image(0, vec![0; MAX_EMBEDDED_BYTES / 2 + 1], |_| {
+            Ok(ResourceMetadata::default())
+        });
         let rewritten = String::from_utf8(embed_svg_image_resources(&prepared, svg)).unwrap();
         assert_eq!(rewritten.matches("data:image/png;base64,").count(), 1);
         assert_eq!(rewritten.matches(r#"href="large.png""#).count(), 1);
+        assert!(rewritten.starts_with(
+            "<svg><!--keep--><text>before &amp; <![CDATA[<raw>]]><?keep value?></text>"
+        ));
+        assert!(rewritten.ends_with(r#"<image href="large.png"></image></svg>"#));
     }
 
     struct CountingProvider(AtomicUsize);

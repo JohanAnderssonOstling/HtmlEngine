@@ -1,0 +1,114 @@
+Selector validation cache: implementation and performance
+Recorded 2026-11-01
+
+Native :host-context() argument validation now reuses results during one stylesheet
+preparation. The cache borrows native TokenList keys, stores booleans, allocates
+only for host-context arguments and is discarded when the rule walk completes.
+Both valid and invalid results are cached. Native parsing and compound-selector
+checks are unchanged. No CSS strings or parser trees are retained by the cache.
+
+Syntax result unchanged: 16,451 / 18,469 selected assertions pass (89.07%).
+Exactly the same 2,018 mismatch keys remain, with zero new failures or exclusions.
+No additional assertions were fixed in this performance follow-up.
+The 178 dependency blocks and 1,840 unresolved cases remain recorded.
+
+The repeated-argument workload measured preparation 30.35% faster and 7.52-13.78%
+fewer allocations. Its aggregate timing change is inconclusive. The variables/
+inline workload measured +5.33% initially and +2.96% on repeat; normalization
+and retry measured +3.32% and +2.89%. These slowdowns are retained, with host/
+code-layout uncertainty, rather than reporting an unconditional performance win.
+
+Validation
+
+305 existing style tests and 32 declaration-validation tests passed. Offline
+cargo check passed. The full pinned syntax audit scanned 35,417 files and 32,021
+literal helper calls with zero dependency parser panics. Its diagnostic exit 101
+is expected while mismatches remain. Test/benchmark sources and all expectation
+ledgers are unchanged. Lightning CSS remains unchanged and the sole CSS parser.
+No rendering or image-comparison suite was rerun.
+
+Performance
+
+The baseline is the previous 45-assertion selector stage, not the earlier
+pre-selector build. Existing benchmark sources were compiled unchanged using
+the same frozen native/support artifacts, rustc opt-level=2, debuginfo=0.
+Ten workloads, 15 alternating before/after pairs each: 300 primary process runs,
+plus 30 repeat runs for the variables/inline slowdown. All are pinned to
+CPU 6. CPU frequency/boost and shared-host load are uncontrolled. Positive means
+slower. Diagnostic 95% bootstrap intervals use 5,000 resamples of paired median
+percentage changes, without multiple-comparison correction. An interval including
+zero is inconclusive. EPUB totals sum five fixture medians, not a single page.
+
+Workload                      Paired change    95% bootstrap range    Assessment
+cascade-plain                   -1.50%    [  -3.06%,   -0.78%]   speedup
+cascade-vars-inline             +5.33%    [  +3.29%,  +72.42%]   slowdown
+epub-cold                       -2.01%    [  -7.55%,   +2.56%]   inconclusive
+epub-cached                     -2.97%    [ -21.20%,   +0.24%]   inconclusive
+selector-cold                   -3.68%    [ -22.16%,   +0.40%]   inconclusive
+selector-cached                 -0.37%    [  -6.26%,   +2.26%]   inconclusive
+unique-selector-cold            +1.02%    [  -1.59%,  +21.60%]   inconclusive
+unique-selector-cached          +4.80%    [  -2.22%,  +41.02%]   inconclusive
+normalization                   +3.32%    [  +0.52%,   +5.15%]   slowdown
+normalization-retry             +2.89%    [  +1.19%,   +4.09%]   slowdown
+cascade-vars-inline-repeat      +2.96%    [  +0.13%,   +7.14%]   slowdown
+
+Repeated selector fixtures use 64 classes with identical :host-context(.scope)
+arguments, ::selection, and view-transition :only-child selectors. Unique fixtures
+use distinct .scopeN arguments per CSS file. Single-file fixtures expose lookup
+cost without reuse. Technical/visual fixtures combine two files with the same
+64 arguments, so they still benefit from cross-file reuse.
+Both builds accept the same CSS and produce equivalent synthetic matching outcomes.
+Cold means uncached author programs with machine/default-CSS caches warmed.
+
+Allocation and peak-byte observations for selector fixtures:
+  selector-cold / small-classic/style_allocations: 2500 -> 2312 (-7.52%)
+  selector-cold / small-classic/style_peak_bytes: 588646 -> 588646 (+0.00%)
+  selector-cold / technical/style_allocations: 2758 -> 2378 (-13.78%)
+  selector-cold / technical/style_peak_bytes: 696478 -> 696478 (+0.00%)
+  selector-cached / small-classic/style_allocations: 373 -> 373 (+0.00%)
+  selector-cached / small-classic/style_peak_bytes: 164569 -> 164569 (+0.00%)
+  selector-cached / technical/style_allocations: 374 -> 374 (+0.00%)
+  selector-cached / technical/style_peak_bytes: 254273 -> 254273 (+0.00%)
+  unique-selector-cold / small-classic/style_allocations: 2709 -> 2715 (+0.22%)
+  unique-selector-cold / small-classic/style_peak_bytes: 717312 -> 717312 (+0.00%)
+  unique-selector-cold / technical/style_allocations: 2967 -> 2781 (-6.27%)
+  unique-selector-cold / technical/style_peak_bytes: 909636 -> 909636 (+0.00%)
+  unique-selector-cached / small-classic/style_allocations: 582 -> 582 (+0.00%)
+  unique-selector-cached / small-classic/style_peak_bytes: 293005 -> 293005 (+0.00%)
+  unique-selector-cached / technical/style_allocations: 583 -> 583 (+0.00%)
+  unique-selector-cached / technical/style_peak_bytes: 467201 -> 467201 (+0.00%)
+
+Every measured timing slowdown, including individual stages/samples:
+  cascade-vars-inline / all/cascade_median_us: +5.33% [+3.29%, +72.42%]
+  cascade-vars-inline / all/resolve_median_us: +5.09% [+2.60%, +71.47%]
+  unique-selector-cold / small-classic/prepare_us: +33.33% [+12.63%, +72.22%]
+  unique-selector-cold / trade-book/prepare_us: +17.54% [+7.45%, +75.93%]
+  unique-selector-cold / technical/html_parse_us: +4.14% [+0.30%, +7.28%]
+  unique-selector-cold / technical/index_us: +7.25% [+4.27%, +11.59%]
+  unique-selector-cold / technical/matching_us: +2.00% [+0.06%, +7.48%]
+  unique-selector-cold / reference/prepare_us: +16.07% [+11.48%, +25.93%]
+  unique-selector-cached / reference/html_parse_us: +4.54% [+1.60%, +39.60%]
+  normalization / all/normalization_cascade_median_us: +3.32% [+0.52%, +5.15%]
+  normalization-retry / all/normalization_cascade_median_us: +2.89% [+1.19%, +4.09%]
+  cascade-vars-inline-repeat / all/cascade_median_us: +2.96% [+0.13%, +7.14%]
+
+All comparisons, including allocation increases and inconclusive timing changes,
+are retained in selector-cache-performance.json. Raw stdout, paired observations
+and binary hashes are retained with the compressed raw runs. Shared-host noise
+and code layout can affect unrelated stages; these intervals do not isolate
+causal cost or establish performance on every document.
+
+Further syntax investigation
+
+The column hover assertion needs specification-version review before a new
+rejection is justified. The current Selectors 4 user-action rule also warrants
+review of 31 earlier pinned-audit fixes; their original scoped results and statuses
+are retained. Sources and exact keys are in selector-followup-review.json.
+Other column-chain and native grammar gaps were not changed in this follow-up.
+
+The current production delta is confined to selectors.rs and prepared.rs in the
+style crate. No test code, Lightning CSS, renderer/GPUI, expectations, exclusions
+or image-comparison changes were introduced. Original registry observations and
+earlier reports remain byte-for-byte unchanged.
+
+Full baseline source, audit/build logs and binaries: /home/johan/.cache/html-wpt-selector-cache

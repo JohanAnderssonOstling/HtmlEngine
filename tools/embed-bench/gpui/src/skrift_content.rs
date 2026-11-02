@@ -1,5 +1,5 @@
 use crate::common::Options;
-use anyhow::{Context as _, Result, ensure};
+use anyhow::{Context as _, Result};
 use data_url::DataUrl;
 use gpui::{ContentMask, IntoElement, Window, canvas, div, prelude::*, px, rgb};
 use html::engine::Engine;
@@ -9,13 +9,13 @@ use html::pipeline::{
     ResourceRevision, SourceRevision, StyleEnvironment, StylesheetRevision, TextCompositionPolicy,
 };
 use html::render::{
-    FragmentImagePolicy, FragmentRenderOptions, Painter, RenderCommand, RenderScene,
-    paint_line_text_runs,
+    DocumentPainter, FragmentImagePolicy, FragmentRenderOptions,
 };
-use html::resources::{DecodedImage, FileSystemProvider, ImagePipeline, ResourceProvider};
+use html::resources::{FileSystemProvider, ImagePipeline, ResourceProvider};
 use html_gpui::backend::{
     GlyphStore, GpuiCommandPainter, GpuiTextCache, ImageCache, PaintCommand, paint_commands,
 };
+use kurbo::{Point, Rect};
 use std::collections::HashSet;
 use std::io;
 use std::sync::Arc;
@@ -179,83 +179,34 @@ impl DocumentView {
             .engine
             .render_view()
             .context("missing laid-out document")?;
-        let scene = RenderScene::for_view(document, &settings);
-        self.content_height = scene.content_height();
+        // Keep native text and decorations in the engine's shared CSS paint
+        // order. Painting all text after all backgrounds lets text cover
+        // positioned descendants that should paint above it.
+        self.content_height = document.text().lines().iter()
+            .filter_map(|line| document.geometry().line_vertical_bounds(line.index()))
+            .map(|bounds| bounds.end)
+            .chain(document.fragments().decorations().iter().map(|decoration| decoration.rect().y1))
+            .fold(0.0_f64, f64::max);
+        let height = if self.paint_all {
+            self.content_height.max(f64::from(options.height))
+        } else {
+            f64::from(options.height)
+        };
         let mut painter = GpuiCommandPainter::new(
             &mut self.images,
             self.shaper.store(),
             self.shaper.run_store(),
             Vec::new(),
         );
-        self.image_count = 0;
-        for command in scene.commands() {
-            match command {
-                RenderCommand::PushClip { rect } => painter.push_clip(*rect),
-                RenderCommand::PopClip => painter.pop_clip(),
-                RenderCommand::Fill { rect, color } => painter.fill_rect(*rect, *color),
-                RenderCommand::RoundedFill { rect, radii, color } => {
-                    painter.fill_rounded_rect(*rect, *radii, *color)
-                }
-                RenderCommand::RoundedBorder {
-                    rect,
-                    radii,
-                    width,
-                    color,
-                } => painter.stroke_rounded_rect(*rect, *radii, *width, *color),
-                RenderCommand::Glyph { .. } => {}
-                RenderCommand::Image { image, hash, rect } => {
-                    painter.draw_image(image, hash, *rect)
-                }
-                RenderCommand::Svg {
-                    bytes,
-                    hash,
-                    intrinsic_size,
-                    rect,
-                } => painter.draw_svg(bytes, hash, *intrinsic_size, *rect),
-                RenderCommand::ResourceImage {
-                    image_idx, rect, ..
-                } => {
-                    match decoded
-                        .get_decoded(*image_idx)
-                        .context("missing decoded image")?
-                    {
-                        DecodedImage::Raster { image, hash, .. } => {
-                            painter.draw_image(image, hash, *rect)
-                        }
-                        DecodedImage::Svg {
-                            bytes,
-                            hash,
-                            width,
-                            height,
-                        } => painter.draw_svg(bytes, hash, (*width, *height), *rect),
-                    }
-                    self.image_count += 1;
-                }
-            }
-        }
-        let text = document.text();
-        for index in text.paint_order_indices() {
-            let index = *index as usize;
-            let Some(line) = text.line(index) else {
-                continue;
-            };
-            if !self.paint_all && line.point().y >= f64::from(options.height) {
-                continue;
-            }
-            ensure!(
-                paint_line_text_runs(document, index, line.point(), 1.0, None, &mut painter),
-                "native text run painting unavailable for line {index}"
-            );
-        }
-        self.commands = Arc::new(painter.into_commands());
-        ensure!(
-            self.commands
-                .iter()
-                .filter(|command| matches!(command, PaintCommand::Image { .. }))
-                .count()
-                >= self.image_count,
-            "an image failed to rasterize"
+        DocumentPainter::new(document).with_images(&decoded).paint_region(
+            Rect::new(0.0, 0.0, f64::from(options.width), height),
+            Point::ORIGIN,
+            &mut painter,
         );
+        self.commands = Arc::new(painter.into_commands());
+        self.image_count = self.commands.iter()
+            .filter(|command| matches!(command, PaintCommand::Image { .. }))
+            .count();
         self.decoded = Some(decoded);
 
         Ok(())
@@ -285,23 +236,39 @@ impl DocumentView {
         )
     }
 
-    pub(super) fn inspect(&self) -> serde_json::Value {
+    pub(super) fn inspect(&self, full_layout: bool) -> serde_json::Value {
         let view = self.engine.render_view().expect("loaded document");
         let boxes = view.boxes();
-        let entries: Vec<_> = (0..boxes.len().min(45))
+        let entries: Vec<_> = (0..if full_layout { boxes.len() } else { boxes.len().min(45) })
             .map(|index| {
                 let format = boxes.text_format(index);
                 let point = boxes.point(index);
                 let size = boxes.size(index);
+                let lines = boxes.content_line_range(index);
                 serde_json::json!({"index":index,"tag":boxes.tag(index),
                 "class":boxes.attribute(index,"class"),"parent":boxes.parent(index),
                 "x":point.map(|p|p.x),"y":point.map(|p|p.y),
                 "width":size.map(|s|s.width),"height":size.map(|s|s.height),
+                "lines":[lines.start, lines.end],
                 "table":boxes.is_table(index),"font_size":format.font_size,
                 "font_weight":format.font_weight,"font_style":format!("{:?}",format.font_style),
                 "font_family":format.font_family.and_then(|id|view.style_string(id))})
             })
             .collect();
-        serde_json::json!({"boxes":entries,"line_count":view.text().lines().len()})
+        let text = view.text();
+        let lines = full_layout.then(|| text.lines().iter().map(|line| {
+            let value = line.glyphs().filter_map(|index| text.character_at(index as usize)).collect::<String>();
+            let advances = line.glyphs().map(|index| text.character_advance(index)
+                .or_else(|| text.glyph_at(index as usize).and_then(|glyph| text.glyph_metric(glyph)).map(|metric| metric.advance())))
+                .collect::<Vec<_>>();
+            let font_extents = line.glyphs().map(|index| text.glyph_at(index as usize)
+                .and_then(|glyph| text.glyph_metric(glyph))
+                .map(|metric| [metric.ascent(), metric.descent()]))
+                .collect::<Vec<_>>();
+            serde_json::json!({"index":line.index(),"owner":line.owner_box_idx(),
+                "x":line.point_x(),"y":line.point_y(),"height":line.height(),"baseline":line.baseline(),
+                "text":value,"advances":advances,"font_extents":font_extents,"hyphen":text.hyphen_for_line(line.index()).is_some()})
+        }).collect::<Vec<_>>());
+        serde_json::json!({"boxes":entries,"line_count":text.lines().len(),"lines":lines})
     }
 }

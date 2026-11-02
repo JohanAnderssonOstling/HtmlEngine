@@ -1,6 +1,6 @@
 //! Wry child webview and GLib event integration for the shared GPUI host.
 
-use crate::common::{Options, emit};
+use crate::common::{Options, PhaseTimings, emit};
 use anyhow::{Context, Result, bail, ensure};
 use cairo::ImageSurface;
 use gpui::{AsyncApp, Task, Window};
@@ -11,7 +11,7 @@ use raw_window_handle::{
 };
 use serde_json::{Value, json};
 use std::borrow::Cow;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::fs::File;
 use std::io;
 use std::path::Path;
@@ -27,8 +27,18 @@ window.addEventListener('DOMContentLoaded', async () => {
   try {
     await document.fonts.ready;
     await Promise.all(Array.from(document.images, image => image.decode()));
+    if (new URL(location.href).searchParams.get('skrift-bench-scroll') === '1') {
+      skriftBenchScrollDocument();
+      return;
+    }
+    const documentFrames = new URL(location.href).searchParams.get('skrift-bench-frames') === '1';
+    // Force the final layout before giving the document two paint opportunities.
+    if (documentFrames) {
+      document.documentElement.getBoundingClientRect();
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    }
     window.ipc.postMessage(JSON.stringify({
-      event: 'document_ready', width: innerWidth, height: innerHeight,
+      event: 'document_ready', document_frames: documentFrames, width: innerWidth, height: innerHeight,
       scale: devicePixelRatio, layout_width: document.documentElement.clientWidth,
       content_width: document.documentElement.scrollWidth,
       content_height: Math.max(document.documentElement.scrollHeight, document.body.scrollHeight),
@@ -38,6 +48,56 @@ window.addEventListener('DOMContentLoaded', async () => {
     window.ipc.postMessage(JSON.stringify({event:'error', message:String(error)}));
   }
 }, {once:true});
+"#;
+
+const SCROLL_DOCUMENT: &str = r#"
+function skriftBenchScrollDocument() {
+  const contentHeight = () => Math.max(document.documentElement.scrollHeight, document.body.scrollHeight);
+  const height = contentHeight();
+  const viewportWidth = innerWidth;
+  const viewportHeight = innerHeight;
+  const scale = devicePixelRatio;
+  const bottom = Math.max(0, height - viewportHeight);
+  if (!Number.isFinite(height) || height <= 0 || viewportHeight <= 0)
+    throw new Error('invalid simulated scroll geometry');
+  scrollTo(0, 0);
+  let offset = scrollY;
+  if (Math.abs(offset) > 1) throw new Error('simulated scroll must start at the top');
+  let viewports = 0;
+  let remainingCallbacks = 2;
+  function advance() {
+    try {
+      if (--remainingCallbacks > 0) {
+        requestAnimationFrame(advance);
+        return;
+      }
+      viewports++;
+      if (offset + viewportHeight >= height - 1) {
+        if (Math.abs(contentHeight() - height) > 1 || innerWidth !== viewportWidth
+            || innerHeight !== viewportHeight || devicePixelRatio !== scale)
+          throw new Error('geometry changed during simulated scrolling');
+        window.ipc.postMessage(JSON.stringify({
+          event:'scroll_complete',width:viewportWidth,height:viewportHeight,scale,
+          layout_width:document.documentElement.clientWidth,content_width:document.documentElement.scrollWidth,
+          content_height:height,scroll_y:scrollY,compatibility:document.compatMode,
+          scroll:{viewports,start_y:0,step_px:viewportHeight,frame_callbacks_per_viewport:2}
+        }));
+        return;
+      }
+      const requested = Math.min(offset + viewportHeight, bottom);
+      scrollTo(0, requested);
+      const actual = scrollY;
+      if (!Number.isFinite(actual) || actual <= offset || Math.abs(actual - requested) > 1)
+        throw new Error('simulated scroll did not reach the next viewport');
+      offset = actual;
+      remainingCallbacks = 2;
+      requestAnimationFrame(advance);
+    } catch (error) {
+      window.ipc.postMessage(JSON.stringify({event:'error',message:String(error)}));
+    }
+  }
+  requestAnimationFrame(advance);
+}
 "#;
 
 struct NativeParent<'a>(&'a Window);
@@ -63,6 +123,8 @@ pub struct WryContent {
     began: Rc<Cell<Option<Instant>>>,
     pending: Rc<Cell<bool>>,
     phase: Rc<Cell<&'static str>>,
+    timings: Rc<RefCell<Option<PhaseTimings>>>,
+    phase_timings: bool,
 }
 
 impl WryContent {
@@ -87,12 +149,15 @@ impl WryContent {
         let callback_pending = pending.clone();
         let phase = Rc::new(Cell::new("document"));
         let callback_phase = phase.clone();
+        let timings: Rc<RefCell<Option<PhaseTimings>>> = Rc::default();
+        let callback_timings = timings.clone();
         let callback_options = options.clone();
         let resource_root = options
             .fixture
             .parent()
             .context("fixture has no parent")?
             .to_owned();
+        let ready_script = format!("{SCROLL_DOCUMENT}\n{READY}");
         let webview = WebViewBuilder::new()
             .with_bounds(wry::Rect {
                 position: wry::dpi::LogicalPosition::new(0, 0).into(),
@@ -106,7 +171,7 @@ impl WryContent {
                         .body(Cow::Owned(error.to_string().into_bytes())).expect("error response"),
                 }
             })
-            .with_initialization_script_for_main_only(READY, true)
+            .with_initialization_script_for_main_only(&ready_script, true)
             .with_ipc_handler(move |request| {
                 let result = (|| -> Result<()> {
                     let metadata: Value = serde_json::from_str(request.body())?;
@@ -116,24 +181,74 @@ impl WryContent {
                         && metadata["height"].as_u64() == Some(callback_options.height.into()),
                         "Wry child viewport mismatch: {metadata}");
                     let began: Instant = callback_began.get().context("page ready before document load")?;
+                    let phase = callback_phase.get();
+                    let mut timings = callback_timings.borrow_mut().take();
+                    if callback_options.document_frames && matches!(phase, "warm" | "document") {
+                        ensure!(metadata["document_frames"] == true,
+                            "document did not run its frame callbacks");
+                        if let Some(timings) = timings.as_mut() {
+                            timings.mark("document_and_frames")?;
+                        }
+                        let elapsed = began.elapsed().as_secs_f64() * 1000.0;
+                        emit(json!({"event":"ready", "phase":phase, "engine":"wry-in-gpui",
+                            "document_frames":true, "document_to_render_ms":elapsed,
+                            "frame_width":(metadata["width"].as_f64().context("viewport width")?
+                                * metadata["scale"].as_f64().context("viewport scale")?).round() as u32,
+                            "frame_height":(metadata["height"].as_f64().context("viewport height")?
+                                * metadata["scale"].as_f64().context("viewport scale")?).round() as u32,
+                            "frame_callbacks":2, "readback":false, "gpu_completion_fenced":false,
+                            "page":metadata, "phase_timings":timings.and_then(PhaseTimings::into_value),
+                            "endpoint":"document-sized viewport after two frame callbacks; no snapshot/readback; GPU completion is not fenced"}));
+                        return Ok(());
+                    }
+                    if metadata["event"] == "scroll_complete" {
+                        ensure!(callback_options.simulate_scroll && phase == "document",
+                            "unexpected simulated scroll completion");
+                        let mut timings = timings.context("missing simulated scroll timings")?;
+                        // There is no host callback at page readiness now that
+                        // the page starts scrolling without a round trip.
+                        timings.mark("document_and_scroll")?;
+                        let elapsed = timings.began.elapsed().as_secs_f64() * 1000.0;
+                        emit(json!({"event":"ready", "phase":phase, "engine":"wry-in-gpui",
+                            "simulated_scroll":true, "document_to_render_ms":elapsed,
+                            "frame_width":(metadata["width"].as_f64().context("viewport width")?
+                                * metadata["scale"].as_f64().context("viewport scale")?).round() as u32,
+                            "frame_height":(metadata["height"].as_f64().context("viewport height")?
+                                * metadata["scale"].as_f64().context("viewport scale")?).round() as u32,
+                            "scroll":metadata["scroll"], "page":metadata,
+                            "phase_timings":timings.into_value(),
+                            "endpoint":"internal viewport scroll traversal after frame callbacks; no snapshot/readback; GPU completion is not fenced"}));
+                        return Ok(());
+                    }
+                    ensure!(!(callback_options.simulate_scroll && phase == "document"),
+                        "simulated scroll page did not run its traversal");
+                    if let Some(timings) = timings.as_mut() {
+                        timings.mark(if phase == "tile" { "scroll_ready" } else { "document_ready" })?;
+                    }
                     let native = callback_native.upgrade().context("missing native WebView")?;
                     let screenshot = callback_options.screenshot.clone();
-                    let phase = callback_phase.get();
+                    let document_surface = callback_options.document_surface && phase == "document";
                     native.snapshot(SnapshotRegion::Visible, SnapshotOptions::NONE,
                         None::<&gtk::gio::Cancellable>, move |snapshot| {
                         let snapshot_at = Instant::now();
                         let result = (|| -> Result<Value> {
                             let surface = ImageSurface::try_from(snapshot?)
                                 .map_err(|_| anyhow::anyhow!("snapshot is not an image surface"))?;
+                            if let Some(timings) = timings.as_mut() {
+                                timings.mark("snapshot")?;
+                            }
                             let dimensions = (surface.width(), surface.height());
                             if let Some(path) = screenshot { surface.write_to_png(&mut File::create(path)?)?; }
                             Ok(json!({"event":"ready", "phase":phase, "engine":"wry-in-gpui",
+                                "document_surface":document_surface,
                                 "pid":std::process::id(), "webview_version":wry::webview_version()?,
                                 "parent_x11_window":parent_xid, "embedded_as_child":true,
                                 "document_to_snapshot_ms":(snapshot_at-began).as_secs_f64()*1000.0,
+                                "phase_timings":timings.and_then(PhaseTimings::into_value),
                                 "snapshot_width":dimensions.0, "snapshot_height":dimensions.1,
                                 "page":metadata,
-                                "endpoint":"WebKit child viewport snapshot complete; includes readback; excludes PNG encoding"}))
+                                "endpoint":if document_surface { "single document-sized WebKit surface snapshot complete; includes readback; excludes PNG encoding" }
+                                    else { "WebKit child viewport snapshot complete; includes readback; excludes PNG encoding" }}))
                         })();
                         match result {
                             Ok(event) => emit(event),
@@ -145,6 +260,14 @@ impl WryContent {
                 if let Err(error) = result { emit(json!({"event":"error", "message":error.to_string()})); }
             })
             .build_as_child(&parent)?;
+        if options.document_surface || options.document_frames {
+            // Explicitly allocate GTK's child after realization as well as the
+            // X11 container; initial GTK requisitions can change tall bounds.
+            webview.set_bounds(wry::Rect {
+                position: wry::dpi::LogicalPosition::new(0, 0).into(),
+                size: wry::dpi::LogicalSize::new(options.width, options.height).into(),
+            })?;
+        }
         let native = webview.webview();
         native.set_background_color(&gtk::gdk::RGBA::WHITE);
         let settings = native.settings().context("missing WebKit settings")?;
@@ -156,6 +279,8 @@ impl WryContent {
             began,
             pending,
             phase,
+            timings,
+            phase_timings: options.phase_timings,
         })
     }
 
@@ -182,8 +307,10 @@ impl WryContent {
         source: &str,
         xml: bool,
         phase: &'static str,
+        timings: PhaseTimings,
     ) -> Result<()> {
-        self.began.set(Some(Instant::now()));
+        self.began.set(Some(timings.began));
+        self.timings.replace(Some(timings));
         self.phase.set(phase);
         self.pending.set(false);
         let mut base = Url::parse("skrift-bench://fixture/")?;
@@ -195,6 +322,12 @@ impl WryContent {
                 .to_str()
                 .context("UTF-8 filename")?,
         );
+        if options.simulate_scroll && phase == "document" {
+            base.query_pairs_mut().append_pair("skrift-bench-scroll", "1");
+        }
+        if options.document_frames {
+            base.query_pairs_mut().append_pair("skrift-bench-frames", "1");
+        }
         self.native.load_bytes(
             &glib::Bytes::from(source.as_bytes()),
             Some(if xml {
@@ -215,8 +348,10 @@ impl WryContent {
         Ok(())
     }
 
-    pub fn tile(&self, y: f64) {
-        self.began.set(Some(Instant::now()));
+    pub fn tile(&self, y: f64) -> Result<()> {
+        let timings = PhaseTimings::new(self.phase_timings)?;
+        self.began.set(Some(timings.began));
+        self.timings.replace(Some(timings));
         self.phase.set("tile");
         self.pending.set(false);
         let script = format!(
@@ -234,6 +369,7 @@ impl WryContent {
                     emit(json!({"event":"error","message":error.to_string()}));
                 }
             });
+        Ok(())
     }
 
     pub fn capture(&self, path: &Path) {

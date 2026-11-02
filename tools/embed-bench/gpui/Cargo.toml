@@ -36,8 +36,8 @@ gpui = { path = "../../../../GPUI-Fork/crates/gpui", default-features = false, f
 gpui_platform = { path = "../../../../GPUI-Fork/crates/gpui_platform", features = ["wayland", "x11"] }
 gpui_linux = { path = "../../../../GPUI-Fork/crates/gpui_linux", features = ["snapshot"] }
 gpui_wgpu = { path = "../../../../GPUI-Fork/crates/gpui_wgpu", features = ["font-kit"] }
-html = { package = "html-engine", path = "../../../crates/html", optional = true }
-html-gpui = { path = "../../../../Html-Prototype/shared/html-gpui", optional = true }
+html = { version = "0.1.0", package = "skrift", path = "../../../crates/html", optional = true }
+html-gpui = { path = "../../../adapters/html-gpui", optional = true }
 kurbo = { version = "0.11", optional = true }
 pollster = "0.4"
 libc = "0.2"
@@ -51,4 +51,4 @@ percent-encoding = { version = "2", optional = true }
 raw-window-handle = { version = "0.6", optional = true }
 
 [patch."https://github.com/JohanAnderssonOstling/HtmlEngine"]
-html-engine = { path = "../../../crates/html" }
+skrift = { path = "../../../crates/html" }

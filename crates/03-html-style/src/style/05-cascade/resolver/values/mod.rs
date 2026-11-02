@@ -1,90 +1,102 @@
 //! Conversion from parser-owned CSS values to renderer-owned computed values.
 
-use super::*;
+use super::context::ResolutionContext;
+use super::state::WorkingStyle;
+use colors::css_color_to_u32;
+use html_style_model::{
+    BorderStyle, ComputedStylesBuilder, ContentAlignment, CornerRadius, DecorationColor,
+    FlexDirection, FlexWrap, Font, FontRelativeLength, InheritedText, ItemAlignment, LengthPct,
+    LogicalTextAlign, OverflowMode, PreferredSize, StyleStringId, TextAlign, TextDecorationLines,
+    TextDecorationThickness, TextDirection,
+};
+use lengths::{
+    calc_box_length_percentage_components, computed_length_pct, length_percentage_to_preferred,
+    length_percentage_to_px,
+};
+use lightningcss::printer::{Printer, PrinterOptions};
+use lightningcss::properties::align::{ContentDistribution, ContentPosition};
+use lightningcss::properties::font::{FontFamily, LineHeight};
+use lightningcss::properties::overflow::OverflowKeyword;
+use lightningcss::traits::ToCss;
+use lightningcss::values::color::CssColor;
+use lightningcss::values::length::{LengthPercentage, LengthPercentageOrAuto, LengthValue};
+use lightningcss::values::size::Size2D;
 
-mod colors;
-mod font_features;
-mod fonts;
-mod grid;
-mod integers;
-mod lengths;
-mod lists;
-
-pub(super) use colors::*;
-pub(super) use font_features::{font_variant_caps_features, resolve_font_feature_settings};
-pub(super) use fonts::*;
-pub(super) use grid::*;
-pub(super) use integers::{resolve_integer, resolve_number, resolve_signed_integer};
-pub(super) use lengths::*;
-pub(super) use lists::*;
-
-pub(super) fn parse_line_height(
-    lh: &lightningcss::properties::font::LineHeight,
-    font_size: f32,
-    root_font_size: f32,
-    resolution: &ResolutionContext,
-) -> Option<f32> {
-    use lightningcss::properties::font::LineHeight;
-    match lh {
-        LineHeight::Normal => Some(0.0),
-        LineHeight::Number(n) => Some(font_size * n),
-        LineHeight::Length(lp) => {
-            length_percentage_to_px(lp, font_size, root_font_size, resolution)
-        }
-    }
-}
+pub(in crate::style::cascade::resolver) mod colors;
+pub(in crate::style::cascade::resolver) mod fonts;
+pub(in crate::style::cascade::resolver) mod grid;
+pub(in crate::style::cascade::resolver) mod lengths;
+pub(in crate::style::cascade::resolver) mod lists;
 
 pub(super) fn checked_line_height_components(
-    lh: &lightningcss::properties::font::LineHeight,
+    lh: &LineHeight,
     font_size: f32,
     root_font_size: f32,
     resolution: &ResolutionContext,
 ) -> Option<(f32, f32)> {
     let scale = resolution.font_size_scale;
-    let (px, ex) = resolution.with_canonical_font_sizes(|canonical| {
-        canonical_line_height_components(
-            lh,
-            font_size / scale,
-            root_font_size / scale,
-            canonical,
-        )
+    let (px, ex) = resolution.with_canonical_font_sizes(|resolution| {
+        let font_size = font_size / scale;
+        let root_font_size = root_font_size / scale;
+        let mut components = match lh {
+            LineHeight::Length(LengthPercentage::Dimension(LengthValue::Ex(value))) => {
+                (0.0, value * font_size)
+            }
+            LineHeight::Length(LengthPercentage::Calc(calc)) => {
+                let [
+                    absolute_px,
+                    percentage,
+                    x_height_px,
+                    ch_advance_px,
+                    cap_height_px,
+                ] = calc_box_length_percentage_components(
+                    calc,
+                    font_size,
+                    root_font_size,
+                    resolution,
+                )?;
+                if ch_advance_px != 0.0 || cap_height_px != 0.0 {
+                    return None;
+                }
+                (absolute_px + percentage * font_size, x_height_px)
+            }
+            LineHeight::Normal => (0.0, 0.0),
+            LineHeight::Number(value) => (font_size * value, 0.0),
+            LineHeight::Length(value) => (
+                length_percentage_to_px(value, font_size, root_font_size, resolution)?,
+                0.0,
+            ),
+        };
+        if components.1 == 0.0 {
+            components.0 = components.0.max(0.0);
+        }
+        (components.0.is_finite()
+            && components.0 >= 0.0
+            && components.1.is_finite()
+            && components.1 >= 0.0)
+            .then_some(components)
     })?;
     let result = (px * scale, ex * scale);
     (result.0.is_finite() && result.1.is_finite()).then_some(result)
 }
 
-fn canonical_line_height_components(
-    lh: &lightningcss::properties::font::LineHeight,
-    font_size: f32,
-    root_font_size: f32,
+/// Rebind authored and inherited unitless line heights after a font-size change.
+pub(super) fn rebind_line_height(
+    style: &mut WorkingStyle,
+    root_font_size: impl FnOnce() -> f32,
     resolution: &ResolutionContext,
-) -> Option<(f32, f32)> {
-    use lightningcss::properties::font::LineHeight;
-    let mut components = match lh {
-        LineHeight::Length(LengthPercentage::Dimension(LengthValue::Ex(value))) => {
-            (0.0, value * font_size)
+) {
+    if let Some(spec) = style.line_height_spec.as_ref() {
+        if let Some((px, ex)) =
+            checked_line_height_components(spec, style.font.font_size, root_font_size(), resolution)
+        {
+            style.text.line_height = px;
+            style.text.line_height_x_height_px = ex;
         }
-        LineHeight::Length(LengthPercentage::Calc(calc)) => {
-            let (absolute_px, percentage, x_height_px, ch_advance_px, cap_height_px) =
-                calc_box_length_percentage_components(calc, font_size, root_font_size, resolution)?;
-            if ch_advance_px != 0.0 || cap_height_px != 0.0 {
-                return None;
-            }
-            (absolute_px + percentage * font_size, x_height_px)
-        }
-        _ => (
-            parse_line_height(lh, font_size, root_font_size, resolution)?,
-            0.0,
-        ),
-    };
-    if components.1 == 0.0 {
-        components.0 = components.0.max(0.0);
+    } else if style.text.line_height_number != 0.0 {
+        style.text.line_height = style.font.font_size * style.text.line_height_number;
+        style.text.line_height_x_height_px = 0.0;
     }
-    (components.0.is_finite()
-        && components.0 >= 0.0
-        && components.1.is_finite()
-        && components.1 >= 0.0)
-        .then_some(components)
 }
 
 pub(super) fn overflow_mode(value: OverflowKeyword) -> OverflowMode {
@@ -134,236 +146,70 @@ pub(super) fn flex_basis(
     non_negative_preferred_size(value)
 }
 
-pub(super) fn non_negative_preferred_size(value: PreferredSize) -> Option<PreferredSize> {
-    match value {
+pub(super) fn non_negative_preferred_size(mut value: PreferredSize) -> Option<PreferredSize> {
+    let valid = match &mut value {
         PreferredSize::Auto
         | PreferredSize::Content
         | PreferredSize::MinContent
         | PreferredSize::MaxContent
         | PreferredSize::FitContent
-        | PreferredSize::Stretch => Some(value),
+        | PreferredSize::Stretch
+        | PreferredSize::Comparison(_) => true,
         // Negative literals are rejected before cascade selection. The parser
         // can fold a negative calculation to a plain dimension, whose computed
         // value must be clamped rather than exposing a losing declaration.
-        PreferredSize::Px(value) if value.is_finite() => Some(PreferredSize::Px(value.max(0.0))),
-        PreferredSize::Percent(value) if value.is_finite() => Some(PreferredSize::Percent(value.max(0.0))),
-        PreferredSize::Ex(value) if value.is_finite() => Some(PreferredSize::Ex(value.max(0.0))),
-        PreferredSize::Ch(value) if value.is_finite() => Some(PreferredSize::Ch(value.max(0.0))),
-        PreferredSize::Cap(value) if value.is_finite() => Some(PreferredSize::Cap(value.max(0.0))),
+        PreferredSize::Px(value)
+        | PreferredSize::Percent(value)
+        | PreferredSize::Ex(value)
+        | PreferredSize::Ch(value)
+        | PreferredSize::Cap(value) => {
+            if !value.is_finite() {
+                return None;
+            }
+            *value = value.max(0.0);
+            true
+        }
         PreferredSize::Calc {
             absolute_px,
             percentage,
             x_height_px,
             ch_advance_px,
             cap_height_px,
-            percentage_dependent,
-        } if absolute_px.is_finite()
-            && percentage.is_finite()
-            && x_height_px.is_finite()
-            && ch_advance_px.is_finite()
-            && cap_height_px.is_finite() =>
-        {
-            Some(PreferredSize::Calc {
-                absolute_px,
-                percentage,
-                x_height_px,
-                ch_advance_px,
-                cap_height_px,
-                percentage_dependent,
-            })
+            ..
+        } => {
+            absolute_px.is_finite()
+                && percentage.is_finite()
+                && x_height_px.is_finite()
+                && ch_advance_px.is_finite()
+                && cap_height_px.is_finite()
         }
-        PreferredSize::Comparison(_) => Some(value),
-        PreferredSize::Px(_)
-        | PreferredSize::Percent(_)
-        | PreferredSize::Ex(_)
-        | PreferredSize::Ch(_)
-        | PreferredSize::Cap(_)
-        | PreferredSize::Calc { .. } => None,
-    }
-}
-
-pub(super) fn length_percentage_to_preferred(
-    value: &LengthPercentage,
-    font: &Font,
-    root_font_size: f32,
-    styles: &mut ComputedStylesBuilder,
-    resolution: &ResolutionContext,
-) -> Option<PreferredSize> {
-    match value {
-        LengthPercentage::Dimension(value) => {
-            preferred_from_length(value, font, root_font_size, resolution)
-        }
-        LengthPercentage::Percentage(value) => Some(PreferredSize::Percent(value.0)),
-        LengthPercentage::Calc(value) => {
-            comparison_preferred_size(value, font.font_size, root_font_size, styles, resolution)
-                .or_else(|| {
-                    let (absolute_px, percentage, x_height_px, ch_advance_px, cap_height_px) =
-                        calc_box_length_percentage_components(
-                            value,
-                            font.font_size,
-                            root_font_size,
-                            resolution,
-                        )?;
-                    Some(PreferredSize::Calc {
-                        absolute_px,
-                        percentage,
-                        x_height_px,
-                        ch_advance_px,
-                        cap_height_px,
-                        percentage_dependent: calc_depends_on_percentage(value),
-                    })
-                })
-        }
-    }
-}
-
-pub(super) fn comparison_preferred_size(
-    calc: &Calc<LengthPercentage>,
-    font_size: f32,
-    root_font_size: f32,
-    styles: &mut ComputedStylesBuilder,
-    resolution: &ResolutionContext,
-) -> Option<PreferredSize> {
-    let Calc::Function(function) = calc else {
-        return None;
     };
-    match function.as_ref() {
-        MathFunction::Min(values) => comparison_from_operands(
-            SizeComparison::Min,
-            values.iter(),
-            values.len(),
-            font_size,
-            root_font_size,
-            styles,
-            resolution,
-        ),
-        MathFunction::Max(values) => comparison_from_operands(
-            SizeComparison::Max,
-            values.iter(),
-            values.len(),
-            font_size,
-            root_font_size,
-            styles,
-            resolution,
-        ),
-        MathFunction::Clamp(min, value, max) => comparison_from_operands(
-            SizeComparison::Clamp,
-            [min, value, max],
-            3,
-            font_size,
-            root_font_size,
-            styles,
-            resolution,
-        ),
-        MathFunction::Calc(value) => {
-            return comparison_preferred_size(value, font_size, root_font_size, styles, resolution);
-        }
-        _ => None,
-    }
-}
-
-pub(super) fn comparison_from_operands<'a>(
-    kind: SizeComparison,
-    operands: impl IntoIterator<Item = &'a Calc<LengthPercentage>>,
-    count: usize,
-    font_size: f32,
-    root_font_size: f32,
-    styles: &mut ComputedStylesBuilder,
-    resolution: &ResolutionContext,
-) -> Option<PreferredSize> {
-    if count == 0 || count > 3 {
-        return None;
-    }
-    let mut values = [ComputedSizeComponent::default(); 3];
-    for (slot, operand) in values.iter_mut().zip(operands) {
-        let (absolute_px, percentage, x_height_px, ch_advance_px, cap_height_px) =
-            calc_box_length_percentage_components(operand, font_size, root_font_size, resolution)?;
-        *slot = ComputedSizeComponent {
-            absolute_px,
-            percentage,
-            x_height_px,
-            ch_advance_px,
-            cap_height_px,
-            percentage_dependent: calc_depends_on_percentage(operand),
-        };
-    }
-    styles.intern_size_comparison(kind, values, u8::try_from(count).ok()?)
-}
-
-pub(super) fn computed_length_pct(
-    value: &LengthPercentage,
-    font_size: f32,
-    root_font_size: f32,
-    resolution: &ResolutionContext,
-) -> Option<LengthPct> {
-    match value {
-        LengthPercentage::Dimension(value) => {
-            length_pct_from_length(value, font_size, root_font_size, resolution)
-        }
-        LengthPercentage::Percentage(value) => Some(LengthPct::Pct(value.0)),
-        LengthPercentage::Calc(value) => {
-            let (absolute_px, percentage, x_height_px, ch_advance_px, cap_height_px) =
-                calc_box_length_percentage_components(
-                    value,
-                    font_size,
-                    root_font_size,
-                    resolution,
-                )?;
-            if !calc_depends_on_percentage(value)
-                && x_height_px == 0.0
-                && ch_advance_px == 0.0
-                && cap_height_px == 0.0
-            {
-                return Some(LengthPct::Px(absolute_px));
-            }
-            Some(LengthPct::Calc {
-                absolute_px,
-                percentage,
-                x_height_px,
-                ch_advance_px,
-                cap_height_px,
-                percentage_dependent: calc_depends_on_percentage(value),
-            })
-        }
-    }
+    valid.then_some(value)
 }
 
 pub(super) fn non_negative_length_pct(value: LengthPct) -> Option<LengthPct> {
-    match value {
-        LengthPct::Px(value) if value >= 0.0 => Some(LengthPct::Px(value)),
-        LengthPct::Pct(value) if value >= 0.0 => Some(LengthPct::Pct(value)),
-        LengthPct::Ex(value) if value >= 0.0 => Some(LengthPct::Ex(value)),
-        LengthPct::Ch(value) if value >= 0.0 => Some(LengthPct::Ch(value)),
-        LengthPct::Cap(value) if value >= 0.0 => Some(LengthPct::Cap(value)),
+    let valid = match value {
+        LengthPct::Px(value)
+        | LengthPct::Pct(value)
+        | LengthPct::Ex(value)
+        | LengthPct::Ch(value)
+        | LengthPct::Cap(value) => value >= 0.0,
         LengthPct::Calc {
             absolute_px,
             percentage,
             x_height_px,
             ch_advance_px,
             cap_height_px,
-            percentage_dependent,
-        } if absolute_px.is_finite()
-            && percentage.is_finite()
-            && x_height_px.is_finite()
-            && ch_advance_px.is_finite()
-            && cap_height_px.is_finite() =>
-        {
-            Some(LengthPct::Calc {
-                absolute_px,
-                percentage,
-                x_height_px,
-                ch_advance_px,
-                cap_height_px,
-                percentage_dependent,
-            })
+            ..
+        } => {
+            absolute_px.is_finite()
+                && percentage.is_finite()
+                && x_height_px.is_finite()
+                && ch_advance_px.is_finite()
+                && cap_height_px.is_finite()
         }
-        LengthPct::Px(_)
-        | LengthPct::Pct(_)
-        | LengthPct::Ex(_)
-        | LengthPct::Ch(_)
-        | LengthPct::Cap(_)
-        | LengthPct::Calc { .. } => None,
-    }
+    };
+    valid.then_some(value)
 }
 
 pub(super) fn corner_radius(
@@ -373,9 +219,9 @@ pub(super) fn corner_radius(
     resolution: &ResolutionContext,
 ) -> Option<CornerRadius> {
     Some(CornerRadius {
-        x: length_percentage_to_lengthpct(&value.0, font_size, root_font_size, resolution)
+        x: computed_length_pct(&value.0, font_size, root_font_size, resolution)
             .and_then(non_negative_length_pct)?,
-        y: length_percentage_to_lengthpct(&value.1, font_size, root_font_size, resolution)
+        y: computed_length_pct(&value.1, font_size, root_font_size, resolution)
             .and_then(non_negative_length_pct)?,
     })
 }
@@ -388,17 +234,6 @@ pub(super) fn set_corner_radius(style: &mut WorkingStyle, corner: usize, value: 
         3 => style.radii.bottom_left = value,
         _ => unreachable!("physical corner index"),
     }
-}
-
-pub(super) fn copy_corner_radius(style: &mut WorkingStyle, source: &ParentStyle, corner: usize) {
-    let value = match corner {
-        0 => source.radii.top_left,
-        1 => source.radii.top_right,
-        2 => source.radii.bottom_right,
-        3 => source.radii.bottom_left,
-        _ => unreachable!("physical corner index"),
-    };
-    set_corner_radius(style, corner, value);
 }
 
 /// Physical side indices use CSS clockwise order: top, right, bottom, left.
@@ -429,46 +264,23 @@ pub(super) fn resolve_logical_text_alignments(text: &mut InheritedText) {
         LogicalTextAlign::Start => text_start_alignment(text.direction),
         LogicalTextAlign::End => text_end_alignment(text.direction),
     };
+    if !text.text_align_last_explicit {
+        if text.text_align_justify_all {
+            text.text_align_last = TextAlign::Justify;
+            text.text_align_last_logical = LogicalTextAlign::Physical;
+        } else if text.text_align == TextAlign::Justify {
+            text.text_align_last = text_start_alignment(text.direction);
+            text.text_align_last_logical = LogicalTextAlign::Start;
+        } else {
+            text.text_align_last = text.text_align;
+            text.text_align_last_logical = text.text_align_logical;
+        }
+    }
     text.text_align_last = match text.text_align_last_logical {
         LogicalTextAlign::Physical => text.text_align_last,
         LogicalTextAlign::Start => text_start_alignment(text.direction),
         LogicalTextAlign::End => text_end_alignment(text.direction),
     };
-}
-
-pub(super) fn logical_float(value: &str, direction: TextDirection, fallback: Float) -> Float {
-    match value {
-        "left" => Float::Left,
-        "right" => Float::Right,
-        "inline-start" => match direction {
-            TextDirection::Ltr => Float::Left,
-            TextDirection::Rtl => Float::Right,
-        },
-        "inline-end" => match direction {
-            TextDirection::Ltr => Float::Right,
-            TextDirection::Rtl => Float::Left,
-        },
-        "none" => Float::None,
-        _ => fallback,
-    }
-}
-
-pub(super) fn logical_clear(value: &str, direction: TextDirection, fallback: Clear) -> Clear {
-    match value {
-        "left" => Clear::Left,
-        "right" => Clear::Right,
-        "inline-start" => match direction {
-            TextDirection::Ltr => Clear::Left,
-            TextDirection::Rtl => Clear::Right,
-        },
-        "inline-end" => match direction {
-            TextDirection::Ltr => Clear::Right,
-            TextDirection::Rtl => Clear::Left,
-        },
-        "both" => Clear::Both,
-        "none" => Clear::None,
-        _ => fallback,
-    }
 }
 
 pub(super) fn set_margin_side(style: &mut WorkingStyle, side: usize, value: (LengthPct, bool)) {
@@ -486,23 +298,6 @@ pub(super) fn set_margin_side(style: &mut WorkingStyle, side: usize, value: (Len
     }
 }
 
-pub(super) fn copy_margin_side(style: &mut WorkingStyle, source: &ParentStyle, side: usize) {
-    let value = match side {
-        0 => (source.box_model.margin_top, source.layout.margin_top_auto),
-        1 => (
-            source.box_model.margin_right,
-            source.layout.margin_right_auto,
-        ),
-        2 => (
-            source.box_model.margin_bottom,
-            source.layout.margin_bottom_auto,
-        ),
-        3 => (source.box_model.margin_left, source.layout.margin_left_auto),
-        _ => unreachable!("physical side index"),
-    };
-    set_margin_side(style, side, value);
-}
-
 pub(super) fn set_padding_side(style: &mut WorkingStyle, side: usize, value: LengthPct) {
     match side {
         0 => style.box_model.padding_top = value,
@@ -511,17 +306,6 @@ pub(super) fn set_padding_side(style: &mut WorkingStyle, side: usize, value: Len
         3 => style.box_model.padding_left = value,
         _ => unreachable!("physical side index"),
     }
-}
-
-pub(super) fn copy_padding_side(style: &mut WorkingStyle, source: &ParentStyle, side: usize) {
-    let value = match side {
-        0 => source.box_model.padding_top,
-        1 => source.box_model.padding_right,
-        2 => source.box_model.padding_bottom,
-        3 => source.box_model.padding_left,
-        _ => unreachable!("physical side index"),
-    };
-    set_padding_side(style, side, value);
 }
 
 pub(super) fn set_border_width(style: &mut WorkingStyle, side: usize, value: FontRelativeLength) {
@@ -564,35 +348,6 @@ pub(super) fn set_border_css_color(style: &mut WorkingStyle, side: usize, value:
     }
 }
 
-pub(super) fn checked_border_width(
-    value: &BorderSideWidth,
-    font_size: f32,
-    root_font_size: f32,
-    resolution: &ResolutionContext,
-) -> Option<FontRelativeLength> {
-    border_width(value, font_size, root_font_size, resolution)
-}
-
-pub(super) fn apply_logical_border<const P: u8>(
-    style: &mut WorkingStyle,
-    side: usize,
-    value: &lightningcss::properties::border::GenericBorder<LineStyle, P>,
-    root_font_size: f32,
-    resolution: &ResolutionContext,
-) {
-    let Some(width) = checked_border_width(
-        &value.width,
-        style.font.font_size,
-        root_font_size,
-        resolution,
-    ) else {
-        return;
-    };
-    set_border_width(style, side, width);
-    set_border_style(style, side, line_style_to_border_style(&value.style));
-    set_border_css_color(style, side, &value.color);
-}
-
 pub(super) fn gap_value(
     value: &lightningcss::properties::align::GapValue,
     font_size: f32,
@@ -614,52 +369,47 @@ pub(super) fn gap_value(
     non_negative_length_pct(value)
 }
 
+fn content_distribution(value: &ContentDistribution) -> ContentAlignment {
+    match value {
+        ContentDistribution::SpaceBetween => ContentAlignment::SpaceBetween,
+        ContentDistribution::SpaceAround => ContentAlignment::SpaceAround,
+        ContentDistribution::SpaceEvenly => ContentAlignment::SpaceEvenly,
+        ContentDistribution::Stretch => ContentAlignment::Stretch,
+    }
+}
+
+fn content_position(value: &ContentPosition) -> ContentAlignment {
+    match value {
+        ContentPosition::Center => ContentAlignment::Center,
+        ContentPosition::Start => ContentAlignment::Start,
+        ContentPosition::End => ContentAlignment::End,
+        ContentPosition::FlexStart => ContentAlignment::FlexStart,
+        ContentPosition::FlexEnd => ContentAlignment::FlexEnd,
+    }
+}
+
 pub(super) fn content_alignment(
     value: &lightningcss::properties::align::AlignContent,
 ) -> Option<ContentAlignment> {
-    use lightningcss::properties::align::{
-        AlignContent, BaselinePosition, ContentDistribution, ContentPosition,
-    };
+    use lightningcss::properties::align::{AlignContent, BaselinePosition};
     Some(match value {
         AlignContent::Normal => ContentAlignment::Normal,
         AlignContent::BaselinePosition(BaselinePosition::First | BaselinePosition::Last) => {
             return None;
         }
-        AlignContent::ContentDistribution(value) => match value {
-            ContentDistribution::SpaceBetween => ContentAlignment::SpaceBetween,
-            ContentDistribution::SpaceAround => ContentAlignment::SpaceAround,
-            ContentDistribution::SpaceEvenly => ContentAlignment::SpaceEvenly,
-            ContentDistribution::Stretch => ContentAlignment::Stretch,
-        },
-        AlignContent::ContentPosition { value, .. } => match value {
-            ContentPosition::Center => ContentAlignment::Center,
-            ContentPosition::Start => ContentAlignment::Start,
-            ContentPosition::End => ContentAlignment::End,
-            ContentPosition::FlexStart => ContentAlignment::FlexStart,
-            ContentPosition::FlexEnd => ContentAlignment::FlexEnd,
-        },
+        AlignContent::ContentDistribution(value) => content_distribution(value),
+        AlignContent::ContentPosition { value, .. } => content_position(value),
     })
 }
 
 pub(super) fn justify_content(
     value: &lightningcss::properties::align::JustifyContent,
 ) -> ContentAlignment {
-    use lightningcss::properties::align::{ContentDistribution, ContentPosition, JustifyContent};
+    use lightningcss::properties::align::JustifyContent;
     match value {
         JustifyContent::Normal => ContentAlignment::Normal,
-        JustifyContent::ContentDistribution(value) => match value {
-            ContentDistribution::SpaceBetween => ContentAlignment::SpaceBetween,
-            ContentDistribution::SpaceAround => ContentAlignment::SpaceAround,
-            ContentDistribution::SpaceEvenly => ContentAlignment::SpaceEvenly,
-            ContentDistribution::Stretch => ContentAlignment::Stretch,
-        },
-        JustifyContent::ContentPosition { value, .. } => match value {
-            ContentPosition::Center => ContentAlignment::Center,
-            ContentPosition::Start => ContentAlignment::Start,
-            ContentPosition::End => ContentAlignment::End,
-            ContentPosition::FlexStart => ContentAlignment::FlexStart,
-            ContentPosition::FlexEnd => ContentAlignment::FlexEnd,
-        },
+        JustifyContent::ContentDistribution(value) => content_distribution(value),
+        JustifyContent::ContentPosition { value, .. } => content_position(value),
         JustifyContent::Left { .. } => ContentAlignment::Left,
         JustifyContent::Right { .. } => ContentAlignment::Right,
     }
@@ -750,18 +500,6 @@ pub(super) fn justify_self(
     })
 }
 
-pub(super) fn line_height_number(lh: &lightningcss::properties::font::LineHeight) -> f32 {
-    use lightningcss::properties::font::LineHeight;
-    match lh {
-        LineHeight::Number(n) => n.max(0.0),
-        _ => 0.0,
-    }
-}
-
-pub(super) fn line_height_is_normal(lh: &lightningcss::properties::font::LineHeight) -> bool {
-    matches!(lh, lightningcss::properties::font::LineHeight::Normal)
-}
-
 pub(super) fn text_decoration_lines(
     line: &lightningcss::properties::text::TextDecorationLine,
 ) -> TextDecorationLines {
@@ -771,19 +509,6 @@ pub(super) fn text_decoration_lines(
         line.contains(CssLine::Overline),
         line.contains(CssLine::LineThrough),
     )
-}
-
-pub(super) fn text_decoration_style(
-    style: &lightningcss::properties::text::TextDecorationStyle,
-) -> Option<TextDecorationStyle> {
-    use lightningcss::properties::text::TextDecorationStyle as CssStyle;
-    match style {
-        CssStyle::Solid => Some(TextDecorationStyle::Solid),
-        CssStyle::Double => Some(TextDecorationStyle::Double),
-        CssStyle::Dotted => Some(TextDecorationStyle::Dotted),
-        CssStyle::Dashed => Some(TextDecorationStyle::Dashed),
-        CssStyle::Wavy => None,
-    }
 }
 
 pub(super) fn text_decoration_thickness(
@@ -807,26 +532,6 @@ pub(super) fn decoration_color(color: &CssColor, current_color: u32) -> Decorati
         DecorationColor::CurrentColor
     } else {
         DecorationColor::Rgba(css_color_to_u32(color, current_color))
-    }
-}
-
-pub(super) fn outline_style(
-    style: &lightningcss::properties::outline::OutlineStyle,
-) -> Option<BorderStyle> {
-    use lightningcss::properties::outline::OutlineStyle;
-    match style {
-        OutlineStyle::Auto => Some(BorderStyle::Solid),
-        OutlineStyle::LineStyle(LineStyle::None | LineStyle::Hidden) => Some(BorderStyle::None),
-        OutlineStyle::LineStyle(LineStyle::Solid) => Some(BorderStyle::Solid),
-        OutlineStyle::LineStyle(LineStyle::Dashed) => Some(BorderStyle::Dashed),
-        OutlineStyle::LineStyle(LineStyle::Dotted) => Some(BorderStyle::Dotted),
-        OutlineStyle::LineStyle(
-            LineStyle::Double
-            | LineStyle::Groove
-            | LineStyle::Ridge
-            | LineStyle::Inset
-            | LineStyle::Outset,
-        ) => None,
     }
 }
 

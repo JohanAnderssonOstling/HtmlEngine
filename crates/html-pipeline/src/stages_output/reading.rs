@@ -2,7 +2,6 @@
 use super::RenderAddressingView;
 use crate::layout_model::InlineItemKind;
 use html_dom::{DomNodeId, ElementRef, element_is_note_reference, element_is_note_target};
-use html_style_model::Visibility;
 use html_text::whitespace_context_root;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -82,14 +81,15 @@ impl RenderAddressingView<'_> {
             .filter(|id| !id.is_empty())
             .collect();
         let mut rendered = HashMap::<DomNodeId, Vec<Range<u32>>>::new();
-        for run in self.doc.render_view(self.glyph_metrics).text().text_runs() {
-            if run.is_marker()
-                || run.glyphs().end <= start
-                || run.glyphs().start >= end
-                || self
-                    .doc
-                    .box_used_style(run.box_idx())
-                    .is_some_and(|style| style.visibility() == Visibility::Hidden)
+        for run in self
+            .doc
+            .render_view(self.glyph_metrics)
+            .text()
+            .visible_source_runs()
+        {
+            let glyphs = run.glyphs();
+            if glyphs.end <= start
+                || glyphs.start >= end
                 || boxes
                     .ancestors(run.box_idx())
                     .any(|index| boxes.is_table(index))
@@ -103,7 +103,7 @@ impl RenderAddressingView<'_> {
                 rendered
                     .entry(node)
                     .or_default()
-                    .push(run.glyphs().start.max(start)..run.glyphs().end.min(end));
+                    .push(glyphs.start.max(start)..glyphs.end.min(end));
             }
         }
         let mut targets = Vec::<ReadingTarget>::new();
@@ -111,13 +111,12 @@ impl RenderAddressingView<'_> {
             let Some(text) = document.text_ref(node) else {
                 continue;
             };
-            let Some(glyph_ranges) = rendered.get(&node) else {
+            let Some(glyph_ranges) = rendered.remove(&node) else {
                 continue;
             };
-            let mut parent = document.get_dom_parent(node);
             let mut owner = None;
             let mut excluded = false;
-            while let Some(ancestor) = parent {
+            for ancestor in document.dom_ancestors(node) {
                 let Some(element) = document.element_ref(ancestor) else {
                     break;
                 };
@@ -130,40 +129,36 @@ impl RenderAddressingView<'_> {
                 if owner.is_none() && block_element(element.tag()) {
                     owner = Some(ancestor);
                 }
-                parent = element.parent();
             }
             if excluded {
                 continue;
             }
             let Some(owner) = owner else { continue };
-            let value = text.text();
-            if value.trim().starts_with("https://")
-                || value.trim().starts_with("http://")
-                || value.trim().starts_with("www.")
+            let value = text.text().trim();
+            if value.starts_with("https://")
+                || value.starts_with("http://")
+                || value.starts_with("www.")
             {
                 continue;
             }
-            if targets
-                .last()
-                .is_none_or(|target| target.element != owner.raw())
+            if let Some(target) = targets
+                .last_mut()
+                .filter(|target| target.element == owner.raw())
             {
+                target.glyph_ranges.extend(glyph_ranges);
+            } else {
                 targets.push(ReadingTarget {
                     element: owner.raw(),
-                    glyph_ranges: Vec::new(),
+                    glyph_ranges,
                 });
             }
-            targets
-                .last_mut()
-                .expect("reading item")
-                .glyph_ranges
-                .extend(glyph_ranges.iter().cloned());
         }
         targets
     }
 
     /// Materialize only the requested item's normalized visible text.
     pub fn reading_text(self, target: &ReadingTarget) -> String {
-        self.reading_characters(target)
+        self.reading_characters_from(target, 0)
             .map(|(character, _)| character)
             .collect()
     }
@@ -185,9 +180,8 @@ impl RenderAddressingView<'_> {
             .by_ref()
             .take(max_chars.saturating_add(1))
             .map(|(character, glyph)| {
-                let offset = text.len();
                 text.push(character);
-                (offset, character, glyph)
+                glyph
             })
             .collect();
         let span = select(&text)?;
@@ -198,24 +192,26 @@ impl RenderAddressingView<'_> {
             element: target.element,
             glyph_ranges: Vec::new(),
         };
-        for glyph in positions
-            .iter()
-            .filter_map(|(offset, _, glyph)| span.contains(offset).then_some(*glyph).flatten())
-        {
-            match chunk_target.glyph_ranges.last_mut() {
-                Some(range) if range.end == glyph => range.end = glyph + 1,
-                _ => chunk_target.glyph_ranges.push(glyph..glyph + 1),
+        let mut next = None;
+        for ((offset, character), &glyph) in text.char_indices().zip(&positions) {
+            if span.contains(&offset)
+                && let Some(glyph) = glyph
+            {
+                match chunk_target.glyph_ranges.last_mut() {
+                    Some(range) if range.end == glyph => range.end = glyph + 1,
+                    _ => chunk_target.glyph_ranges.push(glyph..glyph + 1),
+                }
+            }
+            if offset >= span.end && !character.is_whitespace() {
+                next = glyph;
+                break;
             }
         }
-        let next = positions
-            .iter()
-            .find(|(offset, character, _)| *offset >= span.end && !character.is_whitespace())
-            .and_then(|(_, _, glyph)| *glyph)
-            .or_else(|| {
-                characters
-                    .find(|(character, _)| !character.is_whitespace())
-                    .and_then(|(_, glyph)| glyph)
-            });
+        let next = next.or_else(|| {
+            characters
+                .find(|(character, _)| !character.is_whitespace())
+                .and_then(|(_, glyph)| glyph)
+        });
         text.truncate(span.end);
         text.drain(..span.start);
         Some((
@@ -225,16 +221,6 @@ impl RenderAddressingView<'_> {
             },
             next,
         ))
-    }
-
-    fn reading_characters<'a>(
-        self,
-        target: &'a ReadingTarget,
-    ) -> impl Iterator<Item = (char, Option<u32>)> + 'a
-    where
-        Self: 'a,
-    {
-        self.reading_characters_from(target, 0)
     }
 
     fn reading_characters_from<'a>(
@@ -267,10 +253,7 @@ impl RenderAddressingView<'_> {
                         pending_space = Some(None);
                     }
                 }
-                let character = text
-                    .glyph_at(index as usize)
-                    .and_then(|glyph| text.glyph_metric(glyph))
-                    .map(|metric| metric.ch());
+                let character = text.character_at(index as usize);
                 match character {
                     Some(character) if character.is_whitespace() => {
                         pending_space = Some(Some(index));
@@ -303,14 +286,13 @@ impl RenderAddressingView<'_> {
             .inline_items()
             .iter()
             .filter_map(move |item| {
-                let (InlineItemKind::Text { glyphs } | InlineItemKind::Marker { glyphs }) =
-                    &item.kind
-                else {
+                let Some(text) = item.text_run() else {
                     if matches!(item.kind, InlineItemKind::Break { .. }) {
                         explicit_break = true;
                     }
                     return None;
                 };
+                let glyphs = text.glyphs;
                 if glyphs.is_empty() {
                     return None;
                 }
@@ -326,11 +308,7 @@ impl RenderAddressingView<'_> {
     /// Avoid cutting a spoken word at a visual hyphenation/page boundary.
     pub fn reading_boundary_after_word(self, mut boundary: u32) -> u32 {
         let text = self.doc.render_view(self.glyph_metrics).text();
-        let character = |index: u32| {
-            text.glyph_at(index as usize)
-                .and_then(|glyph| text.glyph_metric(glyph))
-                .map(|metric| metric.ch())
-        };
+        let character = |index: u32| text.character_at(index as usize);
         let limit = self
             .reading_separators()
             .find(|&separator| separator >= boundary)
@@ -370,17 +348,21 @@ fn block_element(tag: &str) -> bool {
 }
 
 fn note_reference_class(classes: &str) -> bool {
-    classes.split_ascii_whitespace().any(|class| {
-        ["noteref", "footnote-ref", "footnote-reference", "fnanchor"]
-            .iter()
-            .any(|name| class.eq_ignore_ascii_case(name))
-    })
+    classes
+        .split_ascii_whitespace()
+        .any(note_reference_class_token)
+}
+
+fn note_reference_class_token(class: &str) -> bool {
+    ["noteref", "footnote-ref", "footnote-reference", "fnanchor"]
+        .iter()
+        .any(|name| class.eq_ignore_ascii_case(name))
 }
 
 fn note_class(classes: &str) -> bool {
-    note_reference_class(classes)
-        || classes.split_ascii_whitespace().any(|class| {
-            [
+    classes.split_ascii_whitespace().any(|class| {
+        note_reference_class_token(class)
+            || [
                 "footnote",
                 "footnotes",
                 "endnote",
@@ -390,7 +372,7 @@ fn note_class(classes: &str) -> bool {
             ]
             .iter()
             .any(|name| class.eq_ignore_ascii_case(name))
-        })
+    })
 }
 
 fn excluded_element(element: ElementRef<'_>) -> bool {
@@ -404,23 +386,16 @@ fn excluded_element(element: ElementRef<'_>) -> bool {
         || element
             .attr("aria-hidden")
             .is_some_and(|value| value.eq_ignore_ascii_case("true"))
-        || element.attr("role").is_some_and(|value| {
-            value.split_ascii_whitespace().any(|role| {
-                matches!(
-                    role,
-                    "doc-toc" | "doc-endnotes" | "doc-backlink" | "navigation"
-                )
-            })
+        || element.aria_roles().any(|role| {
+            matches!(
+                role,
+                "doc-toc" | "doc-endnotes" | "doc-backlink" | "navigation"
+            )
         })
-        || element
-            .attr("epub:type")
-            .or_else(|| element.attr_expanded(Some("http://www.idpf.org/2007/ops"), "type"))
-            .is_some_and(|value| {
-                value.split_ascii_whitespace().any(|kind| {
-                    matches!(
-                        kind,
-                        "toc" | "landmarks" | "page-list" | "endnotes" | "rearnotes" | "backlink"
-                    )
-                })
-            })
+        || element.epub_types().any(|kind| {
+            matches!(
+                kind,
+                "toc" | "landmarks" | "page-list" | "endnotes" | "rearnotes" | "backlink"
+            )
+        })
 }

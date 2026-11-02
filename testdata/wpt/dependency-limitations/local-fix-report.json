@@ -1,0 +1,1009 @@
+{
+  "scope": "Local CSS syntax candidates; no Lightning CSS changes and no parallel CSS text parser.",
+  "wpt_revision": "7ea3d665ff9ae1df1f742433d51bd1e9c6499a3b",
+  "before": {
+    "selected_assertions": 18466,
+    "passing": 16230,
+    "mismatches": 2236,
+    "unsupported_assertions": 13437,
+    "pass_percent": 87.89125961226037
+  },
+  "after": {
+    "selected_assertions": 18469,
+    "passing": 16406,
+    "mismatches": 2063,
+    "unsupported_assertions": 13434,
+    "pass_percent": 88.8299312361254
+  },
+  "comparison": {
+    "fixed_candidates": 173,
+    "new_mismatches": 0,
+    "additional_assertions_now_classified_and_passing": 3,
+    "common_baseline_assertions": 18466,
+    "common_baseline_passing_after": 16403,
+    "common_baseline_pass_percent_after": 88.8281165385032,
+    "historical_saved_audit_selected": 18456,
+    "historical_saved_audit_passing": 16220,
+    "historical_vs_fresh_baseline_note": "The current baseline already classifies ten more passing assertions than the saved audit. They are not attributed to this change.",
+    "fixed_by_finding": {
+      "reuse-existing-generated-content-consumer": 49,
+      "reuse-native-size-parser": 7,
+      "picker-identifier-validation": 1,
+      "missing-functional-pseudo-arguments": 42,
+      "reuse-native-number-parser": 3,
+      "missing-functional-class-arguments": 4,
+      "has-ast-validation": 64,
+      "nonfunctional-pseudo-used-as-function": 3
+    }
+  },
+  "test_results": {
+    "existing_style_unit_tests": {
+      "passed": 305,
+      "failed": 0
+    },
+    "existing_declaration_validation_tests": {
+      "passed": 32,
+      "failed": 0
+    },
+    "existing_allocation_checks": "Passed, including zero-allocation rejection checks.",
+    "new_test_code_added": false,
+    "syntax_audit_process_exit": 101,
+    "syntax_audit_exit_explanation": "The diagnostic audit asserts zero mismatches and therefore exits nonzero for the 2063 remaining mismatches. All target candidates clear; the fresh before/after comparison has zero regressions.",
+    "dependency_parser_panics": 0,
+    "rendering_image_comparisons_rerun": false
+  },
+  "implementation": [
+    "Intrinsic flex-basis reuses native Size parsing and existing preferred-size conversion.",
+    "z-index math reuses native CSSNumber parsing, rounds ties toward positive infinity, and saturates at the engine integer bounds. Literal fractions stay invalid; non-finite results remain outside the new path.",
+    "Native selector AST validation covers retained Has constraints, known functional pseudo names/arguments and picker identifiers, including uppercase SELECT. Forgiving :is/:where lists retain their existing behavior.",
+    "Existing counter argument/list consumers are shared by syntax checking and renderer conversion. Custom styles remain syntactically distinct from rendering support. Empty attr() is rejected; the full modern attr grammar is not implemented.",
+    "Native fallback and supported generated-content/counter eligibility are cached at stylesheet preparation. Value conversions remain in their property-family handlers; unsupported generated images retain the previous fallback."
+  ],
+  "initial_issues_corrected": [
+    "An uppercase SELECT regression found by the full WPT audit was corrected.",
+    "An existing allocation test found five unnecessary allocations when rejecting a string counter-style argument. A primitive-token guard removed them.",
+    "First timing run showed about 3% synthetic cascade slowdown. Follow-up work removed unrelated custom-property lookup work and moved native conversions out of the central application path. Final paired measurements are recorded separately.",
+    "The feature-heavy comparison exposed repeated content/counter eligibility validation per styled element. Supported declarations now cache this decision during preparation."
+  ],
+  "remaining": {
+    "blocked_under_current_constraints": 178,
+    "needs_investigation": 1885
+  },
+  "production_sources": [
+    {
+      "file": "crates/03-html-style/src/style/02-syntax/ast_validation.rs",
+      "before_sha256": "fec799e8a8f2e743a880b106a105e90b1db22eec361840e2a66e6fecfea1854b",
+      "after_sha256": "19bc2c0fc69dca97a565d87c5c57e2ba44d7027fa80023f6a25e99eea1b21db2"
+    },
+    {
+      "file": "crates/03-html-style/src/style/02-syntax/capabilities.rs",
+      "before_sha256": "0856368f75f5e46a4acf49b676fc2d11c53da837ca27461094a93fa5005b326d",
+      "after_sha256": "cf3bbd5c5be1968b7e58c1ce44d37aff6b36fcfb9a9fa97247e7eeeb57b93f05"
+    },
+    {
+      "file": "crates/03-html-style/src/style/02-syntax/generated_content.rs",
+      "before_sha256": null,
+      "after_sha256": "29c3fb1e47aeae44490e044c64f594b70df32bedcb6c5b49fdd5f6fc688fb995"
+    },
+    {
+      "file": "crates/03-html-style/src/style/02-syntax/mod.rs",
+      "before_sha256": "4165a1e33683ed1e85888d1014a65660f99e79f521d20dc94e86caa0212fbf0b",
+      "after_sha256": "45c87d04c3f56f8f834a2d9e2f3ea8da848faa0e6f5e9eff26942ae8a51c7b9d"
+    },
+    {
+      "file": "crates/03-html-style/src/style/02-syntax/native_fallback.rs",
+      "before_sha256": null,
+      "after_sha256": "75e9b6ba1c6b0f626077069c56fb760ef117434534d377d0780930e8f0fe2905"
+    },
+    {
+      "file": "crates/03-html-style/src/style/02-syntax/selectors.rs",
+      "before_sha256": "3f3c1c6c1b3d74d86819afa504526018662c2ac46838426e269df131295497e1",
+      "after_sha256": "6c6d3fb1c832439f42a58f1f51d076a5293258d72336ef9f8a3ce8136f5abcda"
+    },
+    {
+      "file": "crates/03-html-style/src/style/02-syntax/validation.rs",
+      "before_sha256": "74ee7a0c1f351da90fbb65ccc6ae46349f43acdc8b88cfaf598d20a4d7a2f40d",
+      "after_sha256": "bf971be0171ae0967a33146258985db994fa772bde28ffe2fa0ccc0130c9aa89"
+    },
+    {
+      "file": "crates/03-html-style/src/style/05-cascade/resolver/properties/box_model.rs",
+      "before_sha256": "accf21e7afb2250cae6478c1fa463488c0e3ac9d968a6fdb5e10c5334a200ef0",
+      "after_sha256": "5d5e2f7c2844edef3ac7461861a0bf49120f00bbf74a54f9a2321c36565ebc32"
+    },
+    {
+      "file": "crates/03-html-style/src/style/05-cascade/resolver/properties/generated.rs",
+      "before_sha256": "7400833c4825f01b4a867716a8b70807e8ab6fde3a1fe3681d12a98b84cdef87",
+      "after_sha256": "b51da53f08fb5c78b414ae2e9b028ec20ee2024b82fdccb01f9c73ec6e7e31c0"
+    },
+    {
+      "file": "crates/03-html-style/src/style/05-cascade/resolver/properties/layout.rs",
+      "before_sha256": "cf6778c65bbb349ab1300990a43e782528f68c2bf6d4622e0500055279e559ad",
+      "after_sha256": "746aaf66f43bb767dc2e279fae53f502f9b45f81aa65f3663037fa4b7b67e847"
+    }
+  ],
+  "benchmark_sources": [
+    {
+      "file": "crates/03-html-style/examples/cascade_benchmark.rs",
+      "sha256": "b80e07cd03daee4f8af716b57002e401ad6bb7c1161e19c06eb8ae5d3aaf544c",
+      "unchanged_from_baseline": true
+    },
+    {
+      "file": "crates/03-html-style/examples/epub_css_benchmark.rs",
+      "sha256": "35f87009ca9ec031885938a32eef00015d87bbe0546d7fc1387ed72e683eafd6",
+      "unchanged_from_baseline": true
+    },
+    {
+      "file": "crates/03-html-style/examples/normalization_benchmark.rs",
+      "sha256": "e26a9cc1208af9ec38637c84f8f44ff23b370b647b0639cdddad3e056a4fd2f1",
+      "unchanged_from_baseline": true
+    }
+  ],
+  "native_dependency": "Exact unchanged cached Lightning CSS 1.0.0-alpha.72 / Parcel selectors 0.28.3 bundle, with freshly rebuilt baseline support crates reused by both versions. Production style built with rustc opt-level=2, debuginfo=0.",
+  "performance": "local-fix-performance.json",
+  "specification_references": [
+    "https://drafts.csswg.org/selectors/#relational",
+    "https://drafts.csswg.org/css-values-4/#calc-integer",
+    "https://drafts.csswg.org/css-lists-3/#counter-functions"
+  ],
+  "baseline_cache_directory": "/home/johan/.cache/html-wpt-local-fixes/before",
+  "compiler_temporary_directory": "/home/johan/.cache/html-wpt-local-fixes/compiler-tmp",
+  "source_integrity": {
+    "html-dom": {
+      "unchanged_from_baseline": true,
+      "changed_files": []
+    },
+    "html-style-model": {
+      "unchanged_from_baseline": true,
+      "changed_files": []
+    },
+    "02-html-parse": {
+      "unchanged_from_baseline": true,
+      "changed_files": []
+    }
+  },
+  "performance_summary": {
+    "primary_metrics": [
+      {
+        "case": "cascade-plain",
+        "metric": "all/cascade_median_us",
+        "before_median": 1031.0,
+        "after_median": 1017.0,
+        "paired_observations": [
+          [
+            1559.0,
+            1114.0
+          ],
+          [
+            1545.0,
+            1013.0
+          ],
+          [
+            1039.0,
+            1029.0
+          ],
+          [
+            1019.0,
+            1032.0
+          ],
+          [
+            1004.0,
+            1031.0
+          ],
+          [
+            1019.0,
+            1089.0
+          ],
+          [
+            1014.0,
+            985.0
+          ],
+          [
+            1031.0,
+            1017.0
+          ],
+          [
+            1035.0,
+            1017.0
+          ],
+          [
+            1047.0,
+            1004.0
+          ],
+          [
+            1007.0,
+            1093.0
+          ],
+          [
+            1025.0,
+            1011.0
+          ],
+          [
+            1045.0,
+            995.0
+          ],
+          [
+            1051.0,
+            1002.0
+          ],
+          [
+            1013.0,
+            1019.0
+          ]
+        ],
+        "median_paired_change_percent": -1.3658536585365866,
+        "bootstrap_median_95_percent_interval": [
+          -4.106972301814704,
+          1.2757605495583801
+        ],
+        "assessment": "inconclusive"
+      },
+      {
+        "case": "cascade-vars-inline",
+        "metric": "all/cascade_median_us",
+        "before_median": 4817.0,
+        "after_median": 4813.0,
+        "paired_observations": [
+          [
+            4758.0,
+            4813.0
+          ],
+          [
+            4866.0,
+            4830.0
+          ],
+          [
+            4758.0,
+            4741.0
+          ],
+          [
+            4790.0,
+            4727.0
+          ],
+          [
+            4758.0,
+            4797.0
+          ],
+          [
+            4741.0,
+            4766.0
+          ],
+          [
+            4817.0,
+            4842.0
+          ],
+          [
+            4837.0,
+            4811.0
+          ],
+          [
+            4805.0,
+            4890.0
+          ],
+          [
+            4778.0,
+            4800.0
+          ],
+          [
+            4850.0,
+            4797.0
+          ],
+          [
+            4823.0,
+            4839.0
+          ],
+          [
+            4884.0,
+            4821.0
+          ],
+          [
+            5141.0,
+            4987.0
+          ],
+          [
+            5144.0,
+            5246.0
+          ]
+        ],
+        "median_paired_change_percent": 0.3317437279701352,
+        "bootstrap_median_95_percent_interval": [
+          -1.0927835051546375,
+          0.8196721311475308
+        ],
+        "assessment": "inconclusive"
+      },
+      {
+        "case": "epub-cold",
+        "metric": "all_samples/style_total_us",
+        "before_median": 6687.0,
+        "after_median": 6731.0,
+        "paired_observations": [
+          [
+            6186.0,
+            6844.0
+          ],
+          [
+            6646.0,
+            6533.0
+          ],
+          [
+            6623.0,
+            6433.0
+          ],
+          [
+            6590.0,
+            6619.0
+          ],
+          [
+            9114.0,
+            6977.0
+          ],
+          [
+            6687.0,
+            6731.0
+          ],
+          [
+            6488.0,
+            6696.0
+          ],
+          [
+            6917.0,
+            6752.0
+          ],
+          [
+            6758.0,
+            6617.0
+          ],
+          [
+            6586.0,
+            6696.0
+          ],
+          [
+            6792.0,
+            6731.0
+          ],
+          [
+            7740.0,
+            6753.0
+          ],
+          [
+            6947.0,
+            7053.0
+          ],
+          [
+            7195.0,
+            8901.0
+          ],
+          [
+            6571.0,
+            6823.0
+          ]
+        ],
+        "median_paired_change_percent": 0.4400606980273114,
+        "bootstrap_median_95_percent_interval": [
+          -2.0864160994377046,
+          1.6702095353780644
+        ],
+        "assessment": "inconclusive"
+      },
+      {
+        "case": "epub-cached",
+        "metric": "all_samples/style_total_us",
+        "before_median": 5002.0,
+        "after_median": 4895.0,
+        "paired_observations": [
+          [
+            5120.0,
+            4906.0
+          ],
+          [
+            4925.0,
+            4899.0
+          ],
+          [
+            5032.0,
+            5177.0
+          ],
+          [
+            4708.0,
+            4895.0
+          ],
+          [
+            4775.0,
+            4892.0
+          ],
+          [
+            5025.0,
+            5060.0
+          ],
+          [
+            4793.0,
+            4901.0
+          ],
+          [
+            5852.0,
+            4928.0
+          ],
+          [
+            5792.0,
+            6193.0
+          ],
+          [
+            5904.0,
+            4720.0
+          ],
+          [
+            4863.0,
+            4741.0
+          ],
+          [
+            5002.0,
+            4807.0
+          ],
+          [
+            5123.0,
+            4785.0
+          ],
+          [
+            4787.0,
+            4680.0
+          ],
+          [
+            4773.0,
+            4709.0
+          ]
+        ],
+        "median_paired_change_percent": -1.3408757594804088,
+        "bootstrap_median_95_percent_interval": [
+          -4.179687499999996,
+          2.450261780104701
+        ],
+        "assessment": "inconclusive"
+      },
+      {
+        "case": "candidate-cold",
+        "metric": "all_samples/style_total_us",
+        "before_median": 12171.0,
+        "after_median": 11264.0,
+        "paired_observations": [
+          [
+            11850.0,
+            19407.0
+          ],
+          [
+            12171.0,
+            17475.0
+          ],
+          [
+            12574.0,
+            11370.0
+          ],
+          [
+            12991.0,
+            11489.0
+          ],
+          [
+            13221.0,
+            11264.0
+          ],
+          [
+            13945.0,
+            11767.0
+          ],
+          [
+            12453.0,
+            11309.0
+          ],
+          [
+            12816.0,
+            11656.0
+          ],
+          [
+            12281.0,
+            11008.0
+          ],
+          [
+            11344.0,
+            10348.0
+          ],
+          [
+            11993.0,
+            11124.0
+          ],
+          [
+            11703.0,
+            11100.0
+          ],
+          [
+            11440.0,
+            10347.0
+          ],
+          [
+            11235.0,
+            10220.0
+          ],
+          [
+            11345.0,
+            10836.0
+          ]
+        ],
+        "median_paired_change_percent": -9.051186017478152,
+        "bootstrap_median_95_percent_interval": [
+          -9.575314140289482,
+          -5.15252499359139
+        ],
+        "assessment": "speedup"
+      },
+      {
+        "case": "candidate-cached",
+        "metric": "all_samples/style_total_us",
+        "before_median": 9637.0,
+        "after_median": 8308.0,
+        "paired_observations": [
+          [
+            15969.0,
+            8330.0
+          ],
+          [
+            9470.0,
+            8183.0
+          ],
+          [
+            9637.0,
+            8262.0
+          ],
+          [
+            9600.0,
+            8180.0
+          ],
+          [
+            10313.0,
+            8340.0
+          ],
+          [
+            9755.0,
+            8139.0
+          ],
+          [
+            9773.0,
+            8315.0
+          ],
+          [
+            9419.0,
+            8490.0
+          ],
+          [
+            9792.0,
+            8178.0
+          ],
+          [
+            9514.0,
+            8184.0
+          ],
+          [
+            9697.0,
+            8308.0
+          ],
+          [
+            9395.0,
+            8281.0
+          ],
+          [
+            9540.0,
+            8343.0
+          ],
+          [
+            9821.0,
+            8517.0
+          ],
+          [
+            9501.0,
+            8548.0
+          ]
+        ],
+        "median_paired_change_percent": -14.267925703019612,
+        "bootstrap_median_95_percent_interval": [
+          -14.918653432927453,
+          -12.547169811320757
+        ],
+        "assessment": "speedup"
+      },
+      {
+        "case": "fallback-cold",
+        "metric": "all_samples/style_total_us",
+        "before_median": 13522.0,
+        "after_median": 13658.0,
+        "paired_observations": [
+          [
+            12458.0,
+            13156.0
+          ],
+          [
+            12114.0,
+            13172.0
+          ],
+          [
+            12495.0,
+            13063.0
+          ],
+          [
+            26764.0,
+            24525.0
+          ],
+          [
+            13820.0,
+            13327.0
+          ],
+          [
+            12429.0,
+            13594.0
+          ],
+          [
+            12229.0,
+            13246.0
+          ],
+          [
+            14927.0,
+            14907.0
+          ],
+          [
+            13522.0,
+            14429.0
+          ],
+          [
+            25074.0,
+            18563.0
+          ],
+          [
+            17930.0,
+            13692.0
+          ],
+          [
+            14416.0,
+            13422.0
+          ],
+          [
+            12997.0,
+            13952.0
+          ],
+          [
+            14661.0,
+            13658.0
+          ],
+          [
+            13097.0,
+            14552.0
+          ]
+        ],
+        "median_paired_change_percent": 4.545818327330942,
+        "bootstrap_median_95_percent_interval": [
+          -6.841279585294313,
+          8.316297326028298
+        ],
+        "assessment": "inconclusive"
+      },
+      {
+        "case": "fallback-cached",
+        "metric": "all_samples/style_total_us",
+        "before_median": 9784.0,
+        "after_median": 9615.0,
+        "paired_observations": [
+          [
+            11257.0,
+            10214.0
+          ],
+          [
+            10533.0,
+            12096.0
+          ],
+          [
+            11957.0,
+            10368.0
+          ],
+          [
+            9761.0,
+            10068.0
+          ],
+          [
+            10243.0,
+            10334.0
+          ],
+          [
+            9784.0,
+            9947.0
+          ],
+          [
+            9358.0,
+            9170.0
+          ],
+          [
+            9299.0,
+            9568.0
+          ],
+          [
+            9628.0,
+            9388.0
+          ],
+          [
+            9592.0,
+            9615.0
+          ],
+          [
+            9407.0,
+            9260.0
+          ],
+          [
+            9878.0,
+            9304.0
+          ],
+          [
+            9844.0,
+            9296.0
+          ],
+          [
+            9285.0,
+            9310.0
+          ],
+          [
+            10418.0,
+            10349.0
+          ]
+        ],
+        "median_paired_change_percent": -0.6623152236513774,
+        "bootstrap_median_95_percent_interval": [
+          -5.566842746850876,
+          1.6659852820932075
+        ],
+        "assessment": "inconclusive"
+      },
+      {
+        "case": "normalization",
+        "metric": "all/normalization_cascade_median_us",
+        "before_median": 11615.0,
+        "after_median": 11595.0,
+        "paired_observations": [
+          [
+            11080.0,
+            11202.0
+          ],
+          [
+            11202.0,
+            10821.0
+          ],
+          [
+            11326.0,
+            11659.0
+          ],
+          [
+            23583.0,
+            16233.0
+          ],
+          [
+            11615.0,
+            10659.0
+          ],
+          [
+            15495.0,
+            11000.0
+          ],
+          [
+            23065.0,
+            11725.0
+          ],
+          [
+            21690.0,
+            10929.0
+          ],
+          [
+            25376.0,
+            22439.0
+          ],
+          [
+            11592.0,
+            11818.0
+          ],
+          [
+            11537.0,
+            11693.0
+          ],
+          [
+            13548.0,
+            11595.0
+          ],
+          [
+            25423.0,
+            11345.0
+          ],
+          [
+            11527.0,
+            11444.0
+          ],
+          [
+            11544.0,
+            11776.0
+          ]
+        ],
+        "median_paired_change_percent": -8.230736117089965,
+        "bootstrap_median_95_percent_interval": [
+          -29.00935785737334,
+          1.35217127502818
+        ],
+        "assessment": "inconclusive"
+      },
+      {
+        "case": "normalization-retry",
+        "metric": "all/normalization_cascade_median_us",
+        "before_median": 13860.0,
+        "after_median": 14090.0,
+        "paired_observations": [
+          [
+            15333.0,
+            15780.0
+          ],
+          [
+            16490.0,
+            15293.0
+          ],
+          [
+            34320.0,
+            26070.0
+          ],
+          [
+            17322.0,
+            33365.0
+          ],
+          [
+            13564.0,
+            13797.0
+          ],
+          [
+            13783.0,
+            13928.0
+          ],
+          [
+            13884.0,
+            14075.0
+          ],
+          [
+            13567.0,
+            14363.0
+          ],
+          [
+            13771.0,
+            13946.0
+          ],
+          [
+            13826.0,
+            14090.0
+          ],
+          [
+            13860.0,
+            13878.0
+          ],
+          [
+            13724.0,
+            15952.0
+          ],
+          [
+            13920.0,
+            13972.0
+          ],
+          [
+            14092.0,
+            14057.0
+          ],
+          [
+            13705.0,
+            14272.0
+          ]
+        ],
+        "median_paired_change_percent": 1.3756842408527703,
+        "bootstrap_median_95_percent_interval": [
+          0.3735632183908155,
+          4.1371762130609335
+        ],
+        "assessment": "slowdown"
+      }
+    ],
+    "individual_epub_slowdowns": [
+      {
+        "case": "epub-cold",
+        "metric": "reference/style_total_us",
+        "before_median": 1796.0,
+        "after_median": 1822.0,
+        "paired_observations": [
+          [
+            1694.0,
+            1825.0
+          ],
+          [
+            1806.0,
+            1798.0
+          ],
+          [
+            1777.0,
+            1718.0
+          ],
+          [
+            1787.0,
+            1788.0
+          ],
+          [
+            1815.0,
+            1777.0
+          ],
+          [
+            1772.0,
+            1822.0
+          ],
+          [
+            1838.0,
+            1794.0
+          ],
+          [
+            1835.0,
+            1900.0
+          ],
+          [
+            1783.0,
+            1832.0
+          ],
+          [
+            1796.0,
+            1853.0
+          ],
+          [
+            1773.0,
+            1775.0
+          ],
+          [
+            1821.0,
+            1868.0
+          ],
+          [
+            1874.0,
+            2014.0
+          ],
+          [
+            2074.0,
+            2099.0
+          ],
+          [
+            1787.0,
+            1797.0
+          ]
+        ],
+        "median_paired_change_percent": 1.2054001928640368,
+        "bootstrap_median_95_percent_interval": [
+          0.05595970900951208,
+          2.8216704288938965
+        ],
+        "assessment": "slowdown"
+      }
+    ],
+    "raw_runs_recorded": 840,
+    "final_runs": 300,
+    "final_pairs_per_case": 15,
+    "retained_intermediate_runs": 540,
+    "ordinary_style_allocations": "Allocation counts are retained per workload/sample in local-fix-performance.json; no new test code was added.",
+    "allocation_regressions_in_existing_checks": 0,
+    "newly_supported_values_allocation_example": [
+      {
+        "case": "fallback-cold",
+        "sample": "small-classic label with generated CSS, not the original EPUB",
+        "before": 6863.0,
+        "after": 7908.0,
+        "paired_percent_change": 15.226577298557476,
+        "comparison_scope": "Baseline ignores the new intrinsic/numeric declarations; changed build applies them."
+      },
+      {
+        "case": "fallback-cached",
+        "sample": "small-classic label with generated CSS, not the original EPUB",
+        "before": 1863.0,
+        "after": 2524.0,
+        "paired_percent_change": 35.480407944176065,
+        "comparison_scope": "Baseline ignores the new intrinsic/numeric declarations; changed build applies them."
+      }
+    ]
+  },
+  "production_sources_sha256": "9dc9622158e23cd808e98d3dee0e954d0e0e22e1df41c1bb2f6877a2db3e79c8"
+}

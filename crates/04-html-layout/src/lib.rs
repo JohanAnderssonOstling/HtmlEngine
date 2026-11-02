@@ -1,19 +1,14 @@
 //! Backend-neutral geometry execution over immutable prepared/shaped inputs.
 //! Document ownership and stage orchestration live in html-pipeline.
 #![cfg_attr(not(test), forbid(unsafe_code))]
-macro_rules! profile_scope {
-    ($name:literal) => {
-        #[cfg(feature = "profiling")]
-        let _profile_scope = crate::profiling::scope($name);
-    };
-}
+#[macro_use(profile_scope)]
+extern crate html_engine_model;
 
 use html_engine_model as layout_model;
 #[cfg(feature = "profiling")]
 pub use html_engine_model::profiling;
 pub use html_engine_model::*;
 mod layout;
-pub use layout::text_placement::{LineCharacterPlacement, LineTextPlacement};
 mod flex_grid;
 mod table;
 #[cfg(test)]

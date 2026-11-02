@@ -12,25 +12,11 @@ pub fn resolve_vertical_size(
     parent_content_height: Option<f64>,
     border_box_inset: f64,
 ) -> Option<f64> {
-    resolve_vertical_size_with_stretch_inset(
-        size,
-        parent_content_height,
-        border_box_inset,
-        border_box_inset,
-    )
-}
-
-pub fn resolve_vertical_size_with_stretch_inset(
-    size: PreferredSize,
-    parent_content_height: Option<f64>,
-    border_box_inset: f64,
-    stretch_inset: f64,
-) -> Option<f64> {
     resolve_definite_content_size_with_insets(
         size,
         parent_content_height,
         border_box_inset,
-        stretch_inset,
+        border_box_inset,
     )
 }
 
@@ -155,13 +141,19 @@ pub fn resolve_vertical_min_size_with_stretch_inset(
             None,
         ) => Some((absolute_px as f64 - border_box_inset).max(0.0)),
         (PreferredSize::Comparison { .. }, None) if size.percentage_dependent() => Some(0.0),
-        _ => resolve_vertical_size_with_stretch_inset(
+        _ => resolve_definite_content_size_with_insets(
             size,
             parent_content_height,
             border_box_inset,
             stretch_inset,
         ),
     }
+}
+
+/// Apply definite bounds, with the minimum winning when they conflict.
+pub fn constrain_size(size: f64, minimum: Option<f64>, maximum: Option<f64>) -> f64 {
+    let size = maximum.map_or(size, |maximum| size.min(maximum));
+    minimum.map_or(size, |minimum| size.max(minimum))
 }
 
 pub(super) fn resolve_content_width(
@@ -223,9 +215,7 @@ pub(super) fn resolve_block_margin_left(
     border_width: f64,
 ) -> f64 {
     let left = style.margin_left().resolve(containing_width);
-    let right = style.margin_right().resolve(containing_width);
     let left_auto = style.margin_left_auto();
-    let right_auto = style.margin_right_auto();
 
     // With an automatic width, the width absorbs the remaining inline space
     // and automatic margins resolve to zero.
@@ -233,7 +223,26 @@ pub(super) fn resolve_block_margin_left(
         return if left_auto { 0.0 } else { left };
     }
 
-    let remaining = containing_width
+    resolve_margin_left_for_used_width(style, containing_direction, containing_width, containing_width, border_width)
+}
+
+/// Tables resolve automatic margins against their final intrinsic width,
+/// even when their authored width is `auto`.
+pub(super) fn resolve_margin_left_for_used_width(
+    style: UsedStyleView<'_>,
+    containing_direction: TextDirection,
+    containing_width: f64,
+    available_width: f64,
+    border_width: f64,
+) -> f64 {
+    let left = style.margin_left().resolve(containing_width);
+    let right = style.margin_right().resolve(containing_width);
+    let left_auto = style.margin_left_auto();
+    let right_auto = style.margin_right_auto();
+
+    // Floats can reduce the available inline space without changing the
+    // containing block used to resolve percentage margins.
+    let remaining = available_width
         - border_width
         - if left_auto { 0.0 } else { left }
         - if right_auto { 0.0 } else { right };
@@ -349,10 +358,10 @@ impl BoxLayoutRequest {
         self
     }
 
-    /// Final geometry for an atomic inline box. A measured height fixes the
-    /// box geometry without necessarily establishing a definite percentage
-    /// basis for its descendants.
-    pub fn atomic_assigned(
+    /// Final geometry for an atomic inline or Flex/Grid item. An assigned height
+    /// fixes geometry without necessarily establishing a definite percentage
+    /// basis for descendants.
+    pub fn assigned(
         box_idx: usize,
         containing_width: f64,
         containing_height: Option<f64>,
@@ -360,41 +369,12 @@ impl BoxLayoutRequest {
         height_is_definite: bool,
     ) -> Self {
         Self {
-            box_idx,
-            available_width: containing_width,
-            auto_width_limit: None,
-            parent_content_height: containing_height,
-            first_line_indent: 0.0,
             assigned_border_size: Some(AssignedBorderSize {
                 width: Some(assigned.width),
                 height: Some(assigned.height),
                 height_is_definite,
             }),
-            purpose: BoxLayoutPurpose::Ordinary,
-            measurement_mode: BoxMeasurementMode::Layout,
-        }
-    }
-
-    pub fn taffy_assigned(
-        box_idx: usize,
-        containing_width: f64,
-        parent_content_height: Option<f64>,
-        assigned: Size,
-        height_is_definite: bool,
-    ) -> Self {
-        Self {
-            box_idx,
-            available_width: containing_width,
-            auto_width_limit: None,
-            parent_content_height,
-            first_line_indent: 0.0,
-            assigned_border_size: Some(AssignedBorderSize {
-                width: Some(assigned.width),
-                height: Some(assigned.height),
-                height_is_definite,
-            }),
-            purpose: BoxLayoutPurpose::Ordinary,
-            measurement_mode: BoxMeasurementMode::Layout,
+            ..Self::normal(box_idx, containing_width, containing_height)
         }
     }
 
@@ -405,18 +385,12 @@ impl BoxLayoutRequest {
         parent_content_height: Option<f64>,
     ) -> Self {
         Self {
-            box_idx,
-            available_width: containing_width,
-            auto_width_limit: None,
-            parent_content_height,
-            first_line_indent: 0.0,
             assigned_border_size: Some(AssignedBorderSize {
                 width: Some(assigned_width),
                 height: None,
                 height_is_definite: false,
             }),
-            purpose: BoxLayoutPurpose::Ordinary,
-            measurement_mode: BoxMeasurementMode::Layout,
+            ..Self::normal(box_idx, containing_width, parent_content_height)
         }
     }
 
@@ -428,18 +402,12 @@ impl BoxLayoutRequest {
         assigned_height: Option<f64>,
     ) -> Self {
         Self {
-            box_idx,
-            available_width: containing_width,
-            auto_width_limit: None,
-            parent_content_height: Some(containing_height),
-            first_line_indent: 0.0,
             assigned_border_size: Some(AssignedBorderSize {
                 width: assigned_width,
                 height: assigned_height,
                 height_is_definite: assigned_height.is_some(),
             }),
-            purpose: BoxLayoutPurpose::Ordinary,
-            measurement_mode: BoxMeasurementMode::Layout,
+            ..Self::normal(box_idx, containing_width, Some(containing_height))
         }
     }
 

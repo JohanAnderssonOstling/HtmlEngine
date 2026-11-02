@@ -152,6 +152,30 @@ fn inline_and_block_code_use_safe_backtick_delimiters() {
 }
 
 #[test]
+fn code_text_keeps_authored_newlines_while_plain_exports_separate_blocks() {
+    let mut resources = GlyphResourceStore::default();
+    let document = layout(
+        "<pre id='code'><code><div>\nA\n\n</div><div>B<br>C\n</div></code></pre><p>After</p>",
+        &mut resources,
+    );
+    let view = document.render_view(&resources);
+    let export = view.export();
+    assert_eq!(
+        export.markdown_for_box(box_for(&document, "code", &resources)),
+        Some("```\n\nA\n\nB\nC\n```".into())
+    );
+    let all = 0..view.text().glyph_count() as u32;
+    assert_eq!(
+        export.plain_text(all.clone()).as_deref(),
+        Some("A\nB\nC\nAfter")
+    );
+    assert_eq!(
+        export.plain_text_with_paragraph_breaks(all).as_deref(),
+        Some("A\n\nB\nC\n\nAfter")
+    );
+}
+
+#[test]
 fn lists_keep_nesting_and_selected_item_numbering() {
     let mut document_resources = GlyphResourceStore::default();
     let document = layout(
@@ -434,6 +458,25 @@ fn unsupported_list_numbering_keeps_html_list_semantics() {
             .markdown_for_box(box_for(&document, "list", &document_resources)),
         Some("<ol reversed=\"\"><li>First</li><li>Second</li></ol>".into())
     );
+    for (attributes, item_value, expected) in [
+        ("reversed", "", 1),
+        ("reversed start='8'", "", 7),
+        ("start='3'", "value='9'", 10),
+        ("reversed", "value='9'", 8),
+    ] {
+        let mut resources = GlyphResourceStore::default();
+        let document = layout(
+            &format!("<ol {attributes}><li {item_value}>First</li><li id='item'>Second</li></ol>"),
+            &mut resources,
+        );
+        assert_eq!(
+            document
+                .render_view(&resources)
+                .export()
+                .markdown_for_box(box_for(&document, "item", &resources)),
+            Some(format!("{expected}. Second"))
+        );
+    }
 }
 
 #[test]

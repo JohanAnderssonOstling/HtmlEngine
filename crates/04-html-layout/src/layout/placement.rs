@@ -1,5 +1,5 @@
 use super::fragment_writer::FragmentWriter;
-use super::geometry_writer::GeometryWriter;
+use crate::layout_model::BoxGeometry;
 use kurbo::Vec2;
 
 pub type PlacementId = u32;
@@ -53,7 +53,6 @@ pub struct PlacementState {
     resolved_offsets: Vec<Vec2>,
     box_groups: Vec<PlacementId>,
     line_groups: Vec<PlacementId>,
-    decoration_groups: Vec<PlacementId>,
     current_group: PlacementId,
     has_transforms: bool,
     retain_output: bool,
@@ -69,7 +68,6 @@ impl PlacementState {
         self.box_groups.resize(box_count, 0);
         self.box_groups.fill(0);
         self.line_groups.clear();
-        self.decoration_groups.clear();
         self.current_group = 0;
         self.has_transforms = false;
         self.retain_output = true;
@@ -83,7 +81,6 @@ impl PlacementState {
         self.resolved_offsets.clear();
         self.box_groups.clear();
         self.line_groups.clear();
-        self.decoration_groups.clear();
         self.current_group = 0;
         self.has_transforms = false;
         self.retain_output = false;
@@ -141,33 +138,11 @@ impl PlacementState {
         }
     }
 
-    /// Records decorations emitted in local coordinates. Decorations created
-    /// after publication (inline decorations derived from absolute lines) need
-    /// no retained owner and are deliberately ignored.
-    pub fn record_decorations_since(&mut self, start: usize, end: usize) {
-        if !self.retain_output || self.phase == PlacementPhase::Published {
-            return;
-        }
-        assert!(
-            start <= end,
-            "decoration cursor must precede emitted output"
-        );
-        assert!(
-            start <= self.decoration_groups.len(),
-            "decoration placement ownership must not leave an unowned gap"
-        );
-        assert!(
-            self.decoration_groups.len() <= end,
-            "decoration placement ownership cannot extend past emitted output"
-        );
-        self.decoration_groups.resize(end, self.current_group);
-    }
-
     /// Publishes absolute coordinates directly in the owning output buffers.
     /// Borrowed readers observe this single representation after publication.
     pub(super) fn publish_absolute(
         &mut self,
-        geometry: &mut GeometryWriter<'_>,
+        geometry: &mut BoxGeometry,
         fragments: &mut FragmentWriter<'_>,
     ) {
         self.assert_building();
@@ -177,9 +152,9 @@ impl PlacementState {
             "every line must retain placement ownership until publication"
         );
         assert_eq!(
-            self.decoration_groups.len(),
             fragments.decoration_len(),
-            "every pre-publication decoration must retain placement ownership"
+            0,
+            "paint runs only after geometry publication"
         );
 
         if self.has_transforms {
@@ -190,14 +165,13 @@ impl PlacementState {
                     geometry.set_point(box_idx, geometry.point(box_idx) + offset);
                 }
             }
-            fragments.materialize_absolute_positions(
-                &self.line_groups,
-                &self.decoration_groups,
-                &self.resolved_offsets,
-            );
+            fragments.materialize_line_positions(&self.line_groups, &self.resolved_offsets);
         }
 
-        fragments.state_mut().paint_program.publish(&self.resolved_offsets);
+        fragments
+            .state_mut()
+            .paint_program
+            .publish(&self.resolved_offsets);
         self.phase = PlacementPhase::Published;
         self.current_group = 0;
     }
@@ -208,7 +182,6 @@ impl PlacementState {
             + self.resolved_offsets.capacity() * std::mem::size_of::<Vec2>()
             + self.box_groups.capacity() * std::mem::size_of::<PlacementId>()
             + self.line_groups.capacity() * std::mem::size_of::<PlacementId>()
-            + self.decoration_groups.capacity() * std::mem::size_of::<PlacementId>()
     }
 
     fn assert_building(&self) {
@@ -247,7 +220,6 @@ impl PlacementState {
 mod tests {
     use super::PlacementState;
     use crate::layout::fragment_writer::FragmentWriter;
-    use crate::layout::geometry_writer::GeometryWriter;
     use crate::layout_model::{BoxGeometry, LayoutState};
     use kurbo::{Point, Vec2};
 
@@ -274,17 +246,16 @@ mod tests {
     fn absolute_publication_updates_the_owning_box_coordinates() {
         let mut geometry_output = BoxGeometry::default();
         let mut fragment_output = LayoutState::default();
-        let mut geometry = GeometryWriter::new(&mut geometry_output);
-        let mut fragments = FragmentWriter::new(&mut fragment_output, Vec::new(), Vec::new());
+        let mut fragments = FragmentWriter::new(&mut fragment_output, Vec::new());
         let mut placement = PlacementState::default();
-        geometry.reset(1);
+        geometry_output.reset(1);
         fragments.reset();
         placement.reset(1);
 
-        geometry.set_point(0, Point::new(10.0, 20.0));
+        geometry_output.set_point(0, Point::new(10.0, 20.0));
         let box_placement = placement.begin_box(0, false);
         placement.translate(box_placement.box_group, Vec2::new(5.0, 7.0));
-        placement.publish_absolute(&mut geometry, &mut fragments);
+        placement.publish_absolute(&mut geometry_output, &mut fragments);
 
         assert_eq!(geometry_output.point(0), Point::new(15.0, 27.0));
     }
@@ -294,14 +265,13 @@ mod tests {
     fn absolute_publication_is_a_one_shot_transition() {
         let mut geometry_output = BoxGeometry::default();
         let mut fragment_output = LayoutState::default();
-        let mut geometry = GeometryWriter::new(&mut geometry_output);
-        let mut fragments = FragmentWriter::new(&mut fragment_output, Vec::new(), Vec::new());
+        let mut fragments = FragmentWriter::new(&mut fragment_output, Vec::new());
         let mut placement = PlacementState::default();
-        geometry.reset(0);
+        geometry_output.reset(0);
         fragments.reset();
         placement.reset(0);
 
-        placement.publish_absolute(&mut geometry, &mut fragments);
-        placement.publish_absolute(&mut geometry, &mut fragments);
+        placement.publish_absolute(&mut geometry_output, &mut fragments);
+        placement.publish_absolute(&mut geometry_output, &mut fragments);
     }
 }

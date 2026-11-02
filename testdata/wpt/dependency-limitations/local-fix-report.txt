@@ -1,0 +1,136 @@
+Local CSS syntax fixes and performance
+Recorded 2026-11-01
+
+All 173 local-fix candidate assertions now pass the selected syntax audit:
+  7 intrinsic flex-basis values through the existing native Size parser
+  3 z-index numeric-math values through the native number parser
+114 retained selector AST constraints
+ 49 generated-content/counter constraints using shared existing AST consumers
+
+Fresh baseline: 16,230 / 18,466 assertions pass (87.89%); 2,236 mismatches.
+After fixes:    16,406 / 18,469 assertions pass (88.83%); 2,063 mismatches.
+There are zero new mismatch keys. Three previously unrepresented assertions
+are now classified as passing by the earlier invalid-value checks. On the
+unchanged baseline selection, 16,403 / 18,466 pass (88.83%). The earlier saved
+audit had ten fewer classified passing assertions; those ten are not credited
+to this change.
+
+These are assertion counts from extracted literal CSS helpers. Computed-style
+helper calls still check syntax only. They are not complete WPT file passes,
+computed-value checks, rendering coverage, or a new overall image-suite result.
+
+Implementation
+
+Lightning CSS remains unchanged and the sole CSS parser. The new value routes
+serialize native tokens and call existing native value parsers. Intrinsic sizes
+use the existing preferred-size conversion. Numeric math rounds integer ties
+toward positive infinity and saturates at engine integer bounds; literal
+fractions remain invalid and non-finite results stay outside the new path.
+
+Selector validation inspects the native AST for retained :has() constraints,
+required function arguments, nonfunctional pseudo-elements used as functions,
+and picker identifiers. Uppercase SELECT remains valid. Forgiving :is/:where
+lists retain their existing handling; this is not a replacement selector parser.
+
+Existing counter argument/list consumers are shared between syntax and renderer
+conversion. Custom counter styles remain separate from rendering support.
+Unsupported images, reversed counters and unresolved expressions retain their
+existing handling. The attr() change rejects empty arguments; it does not claim
+full modern attr() grammar support.
+
+Supported content/counter eligibility and native value fallback eligibility are
+cached during stylesheet preparation. Conversions live in their property-family
+handlers. Ordinary declarations avoid the initial unrelated-property lookup.
+
+Validation
+
+- Existing style tests: 305 passed, including allocation checks.
+- Existing declaration-validation tests: 32 passed.
+- cargo check -p skrift-style --offline passed.
+- The full pinned syntax audit scanned 35,417 files / 32,021 literal calls,
+  with zero dependency parser panics and zero new mismatch keys.
+- The diagnostic audit exits 101 because 2,063 existing mismatches remain;
+  this is not reported as an all-green WPT suite.
+- New modules pass rustfmt checks. No test code or expectations were changed.
+- No image comparisons were rerun. Rendering records remain unchanged.
+
+Performance
+
+Positive changes below mean slower. Changes are median percentages from 15
+paired process runs per workload, alternating before/after order, pinned to
+CPU 6. Existing benchmark sources were compiled unchanged with rustc opt-level=2,
+identical native dependencies and identical freshly rebuilt support crates.
+Final measurements comprise 300 process runs; 540 intermediate runs are also
+retained. Each invocation has its own warmups and measured iterations.
+
+EPUB/workload totals sum the five fixture medians per process, rather than
+representing one page. Cold means an uncached author style program with warmed
+default CSS and machine caches. CPU frequency/boost was uncontrolled on a shared
+machine. Intervals below are diagnostic 95% bootstrap ranges of paired median
+changes, without multiple-comparison correction; they do not prove performance
+equality when they contain zero.
+
+Workload                      Change       Bootstrap range       Assessment
+Plain cascade                   -1.37%   [  -4.11%,   +1.28%]   inconclusive
+Variables/inline cascade        +0.33%   [  -1.09%,   +0.82%]   inconclusive
+EPUB, uncached author program   +0.44%   [  -2.09%,   +1.67%]   inconclusive
+EPUB, cached author program     -1.34%   [  -4.18%,   +2.45%]   inconclusive
+Content/counter, uncached       -9.05%   [  -9.58%,   -5.15%]   speedup
+Content/counter, cached        -14.27%   [ -14.92%,  -12.55%]   speedup
+New values, uncached (*)        +4.55%   [  -6.84%,   +8.32%]   inconclusive
+New values, cached (*)          -0.66%   [  -5.57%,   +1.67%]   inconclusive
+Normalization                   -8.23%   [ -29.01%,   +1.35%]   inconclusive
+Normalization with retry        +1.38%   [  +0.37%,   +4.14%]   slowdown
+
+Individual EPUB samples with wholly positive timing ranges:
+  epub-cold / reference/style_total_us: +1.21% [+0.06%, +2.82%]
+
+The small normalization-retry and reference-EPUB slowdowns remain recorded.
+The equivalent content/counter/:has workload is about 9-14% faster following
+eligibility caching. Ordinary aggregate EPUB/cascade timing ranges include zero.
+
+(*) The new-value workload adds flex-basis:min-content and z-index:calc(3 - 2).
+The baseline ignores those declarations; the changed build applies them.
+This includes additional feature work and is not an equivalent-output regression
+measurement. Its positive uncached point estimate remains recorded as
+inconclusive. Allocation counts and per-sample stage timings, including all
+positive results, are retained in local-fix-performance.json.
+
+The new native-value paths also allocate while serializing/reparsing native
+tokens. In the first generated fixture, allocation counts rise from 6,863 to
+7,908 (+15.2%) without author-program reuse and from 1,863 to 2,524 (+35.5%)
+with reuse. Peak tracked bytes increase about 0.2-0.8%. The baseline skips the
+new values, so these are added-feature costs. Equivalent content/counter and
+ordinary small-classic allocation/peak counts stay unchanged. Complete counts
+for every fixture are retained in the performance JSON.
+
+Intermediate regressions found and corrected
+
+The initial full audit caught rejecting ::picker(SELECT); case handling was
+corrected. An existing test caught five unnecessary allocations when rejecting
+a string counter-style argument; a primitive-token guard restored rejection
+without allocations. First timing runs showed roughly 3% synthetic cascade
+slowdown; later runs exposed repeated per-element counter validation. The
+unrelated lookup, central dispatch branch and repeated validation were removed
+or cached. Intermediate measurement summaries and raw runs remain in the record.
+
+Remaining work and evidence
+
+The remaining 2,063 mismatches comprise 178 confirmed native-parser blocks and
+1,885 unresolved assertions. Original observations remain in css-syntax.jsonl;
+173 entries now have fixed_in_syntax_audit status and a resolution, while their
+original keys/actual/native fields remain historical. Exact fixed keys and
+before/after syntax outcomes are in local-fix-results.jsonl. The original
+investigation report and native equality/source evidence are retained.
+
+local-fix-report.json records counts, source hashes and scope.
+local-fix-performance.json records methods, all timing/allocation comparisons,
+intermediate stages and both generated CSS workloads. Compressed raw runs are
+in local-fix-performance-runs.jsonl.gz. Original build commands, complete logs
+and the before-source snapshot are retained on disk at:
+/home/johan/.cache/html-wpt-local-fixes
+
+No Lightning CSS changes, second CSS text parser, test code, expectation edits,
+capability exclusion edits, rendering comparison changes or GPUI changes were
+introduced. All new build outputs and compiler scratch use the disk-backed
+cache directory above.

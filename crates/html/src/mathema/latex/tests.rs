@@ -1,0 +1,1078 @@
+// Bundled from mathema, revision d9cce9ffeb7346181d4c3201dc0a13727269863b.
+// SPDX-License-Identifier: Apache-2.0
+// Modified for HtmlEngine: internal module paths and disabled upstream features.
+// See UPSTREAM.txt and LICENSE-APACHE in the mathema module directory.
+
+use crate::mathema::ast::normalize::normalize_compact_expr;
+use crate::mathema::error::Config;
+use crate::mathema::reader::Reader;
+use crate::mathema::reader::latex::LatexReader;
+use crate::mathema::writer::Writer;
+use crate::mathema::writer::latex::LatexWriter;
+
+/// Round-trip idempotency: parse → normalize → write → parse → normalize → write
+/// must produce identical canonical LaTeX.
+#[test]
+fn round_trip_simple() {
+    let config = Config::default();
+    let cases = [
+        "x^2 + 1",
+        "\\frac{a}{b}",
+        "\\sqrt{x}",
+        "\\sqrt[3]{x}",
+        "x_i^2",
+    ];
+    for input in &cases {
+        let mut r1 = LatexReader::parse_compact(input, &config).unwrap();
+        normalize_compact_expr(&mut r1.expr);
+        let out1 = LatexWriter::write_compact(&r1.expr, &config).unwrap();
+
+        let mut r2 = LatexReader::parse_compact(&out1, &config).unwrap();
+        normalize_compact_expr(&mut r2.expr);
+        let out2 = LatexWriter::write_compact(&r2.expr, &config).unwrap();
+
+        assert_eq!(out1, out2, "round-trip failed for input: {input}");
+    }
+}
+#[test]
+fn round_trip_spacing() {
+    let config = Config::default();
+    let cases = [
+        "a\\,b",
+        "a\\:b",
+        "a\\;b",
+        "a\\!b",
+        "a\\ b",
+        "a\\quad b",
+        "a\\qquad b",
+        "a\\enspace b",
+    ];
+    for input in &cases {
+        let mut r1 = LatexReader::parse_compact(input, &config).unwrap();
+        normalize_compact_expr(&mut r1.expr);
+        let out1 = LatexWriter::write_compact(&r1.expr, &config).unwrap();
+
+        let mut r2 = LatexReader::parse_compact(&out1, &config).unwrap();
+        normalize_compact_expr(&mut r2.expr);
+        let out2 = LatexWriter::write_compact(&r2.expr, &config).unwrap();
+
+        assert_eq!(out1, out2, "spacing round-trip failed for input: {input}");
+    }
+}
+
+#[test]
+fn round_trip_scaled_delimiters() {
+    let config = Config::default();
+    let cases = ["\\big(", "\\Big[", "\\bigg|", "\\Bigg)"];
+    for input in &cases {
+        let mut r1 = LatexReader::parse_compact(input, &config).unwrap();
+        normalize_compact_expr(&mut r1.expr);
+        let out1 = LatexWriter::write_compact(&r1.expr, &config).unwrap();
+
+        let mut r2 = LatexReader::parse_compact(&out1, &config).unwrap();
+        normalize_compact_expr(&mut r2.expr);
+        let out2 = LatexWriter::write_compact(&r2.expr, &config).unwrap();
+
+        assert_eq!(
+            out1, out2,
+            "scaled delimiter round-trip failed for input: {input}"
+        );
+    }
+}
+
+#[test]
+fn round_trip_command_spacing() {
+    let config = Config::default();
+    // \nabla followed by a plain letter needs space separation
+    let input = "\\nabla p";
+    let mut r1 = LatexReader::parse_compact(input, &config).unwrap();
+    normalize_compact_expr(&mut r1.expr);
+    let out1 = LatexWriter::write_compact(&r1.expr, &config).unwrap();
+
+    let mut r2 = LatexReader::parse_compact(&out1, &config).unwrap();
+    normalize_compact_expr(&mut r2.expr);
+    let out2 = LatexWriter::write_compact(&r2.expr, &config).unwrap();
+
+    assert_eq!(out1, out2, "command spacing round-trip failed");
+    assert!(out1.contains("\\nabla"), "output should contain \\nabla");
+}
+
+#[test]
+fn depth_exceeded() {
+    let config = Config::default();
+    let depth = 130;
+    let mut input = String::new();
+    for _ in 0..depth {
+        input.push('{');
+    }
+    input.push('x');
+    for _ in 0..depth {
+        input.push('}');
+    }
+    let result = LatexReader::parse(&input, &config);
+    assert!(result.is_err(), "expected depth exceeded error");
+}
+
+#[test]
+fn empty_group() {
+    let config = Config::default();
+    let result = LatexReader::parse("{}", &config).unwrap();
+    assert!(result.expr.nodes.is_empty() || result.expr.nodes.len() == 1);
+}
+
+#[test]
+fn nested_fractions() {
+    let config = Config::default();
+    let input = "\\frac{\\frac{a}{b}}{\\frac{c}{d}}";
+    let result = LatexReader::parse(input, &config);
+    assert!(result.is_ok(), "nested fractions should parse");
+}
+
+#[test]
+fn navier_stokes() {
+    let config = Config::default();
+    let input = "\\rho \\left( \\frac{\\partial \\mathbf{v}}{\\partial t} + \\mathbf{v} \\cdot \\nabla \\mathbf{v} \\right) = -\\nabla p + \\mu \\nabla^2 \\mathbf{v} + \\mathbf{f}";
+    let result = LatexReader::parse(input, &config);
+    assert!(
+        result.is_ok(),
+        "Navier-Stokes equation should parse: {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn navier_stokes_round_trip() {
+    let config = Config::default();
+    let input = "\\rho \\left( \\frac{\\partial \\mathbf{v}}{\\partial t} + \\mathbf{v} \\cdot \\nabla \\mathbf{v} \\right) = -\\nabla p + \\mu \\nabla^2 \\mathbf{v} + \\mathbf{f}";
+    let mut r1 = LatexReader::parse_compact(input, &config).unwrap();
+    normalize_compact_expr(&mut r1.expr);
+    let out1 = LatexWriter::write_compact(&r1.expr, &config).unwrap();
+
+    let mut r2 = LatexReader::parse_compact(&out1, &config).unwrap();
+    normalize_compact_expr(&mut r2.expr);
+    let out2 = LatexWriter::write_compact(&r2.expr, &config).unwrap();
+
+    assert_eq!(out1, out2, "Navier-Stokes round-trip not idempotent");
+}
+
+#[test]
+fn unmatched_delimiter_strict() {
+    let config = Config::default();
+    let result = LatexReader::parse("\\left( x", &config);
+    assert!(
+        result.is_err(),
+        "unmatched \\left should fail in strict mode"
+    );
+}
+
+#[test]
+fn unicode_commands_round_trip() {
+    let config = Config::default();
+    let cases = [
+        "\\alpha + \\beta",
+        "\\Gamma \\Delta",
+        "\\infty",
+        "\\partial",
+        "\\nabla",
+    ];
+    for input in &cases {
+        let mut r1 = LatexReader::parse_compact(input, &config).unwrap();
+        normalize_compact_expr(&mut r1.expr);
+        let out1 = LatexWriter::write_compact(&r1.expr, &config).unwrap();
+
+        let mut r2 = LatexReader::parse_compact(&out1, &config).unwrap();
+        normalize_compact_expr(&mut r2.expr);
+        let out2 = LatexWriter::write_compact(&r2.expr, &config).unwrap();
+
+        assert_eq!(out1, out2, "unicode command round-trip failed for: {input}");
+    }
+}
+
+#[test]
+fn stretchy_accents_parse() {
+    use crate::mathema::ast::compact::CompactNode;
+
+    let config = Config::default();
+
+    // These commands should parse without error and produce Accent nodes
+    let accent_cases = [
+        "\\overrightarrow{AB}",
+        "\\overleftarrow{AB}",
+        "\\overleftrightarrow{AB}",
+        "\\overrightharpoon{x}",
+        "\\overleftharpoon{x}",
+        "\\widehat{abc}",
+        "\\widetilde{abc}",
+        "\\widecheck{abc}",
+    ];
+    for input in &accent_cases {
+        let result = LatexReader::parse_compact(input, &config);
+        assert!(
+            result.is_ok(),
+            "failed to parse stretchy accent: {input}: {:?}",
+            result.err()
+        );
+        let expr = result.unwrap().expr;
+        let roots = expr.arena.children(expr.roots);
+        assert!(
+            !roots.is_empty(),
+            "stretchy accent produced empty AST: {input}"
+        );
+        // The root node should be an Accent
+        let root_node = expr.arena.node(roots[0]);
+        assert!(
+            matches!(root_node, CompactNode::Accent { .. }),
+            "stretchy accent did not produce Accent node for {input}, got: {:?}",
+            root_node
+        );
+    }
+}
+
+#[test]
+fn horizontal_braces_parse() {
+    use crate::mathema::ast::compact::CompactNode;
+
+    let config = Config::default();
+
+    // Overbrace/underbrace/bracket commands should parse into Overscript/Underscript nodes
+    let brace_cases = [
+        ("\\overbrace{x+y}", true),     // Overscript
+        ("\\underbrace{x+y}", false),   // Underscript
+        ("\\overbracket{x+y}", true),   // Overscript
+        ("\\underbracket{x+y}", false), // Underscript
+    ];
+    for (input, is_over) in &brace_cases {
+        let result = LatexReader::parse_compact(input, &config);
+        assert!(
+            result.is_ok(),
+            "failed to parse brace command: {input}: {:?}",
+            result.err()
+        );
+        let expr = result.unwrap().expr;
+        let roots = expr.arena.children(expr.roots);
+        assert!(
+            !roots.is_empty(),
+            "brace command produced empty AST: {input}"
+        );
+        let root_node = expr.arena.node(roots[0]);
+        if *is_over {
+            assert!(
+                matches!(root_node, CompactNode::Overscript { .. }),
+                "overbrace/bracket did not produce Overscript for {input}, got: {:?}",
+                root_node
+            );
+        } else {
+            assert!(
+                matches!(root_node, CompactNode::Underscript { .. }),
+                "underbrace/bracket did not produce Underscript for {input}, got: {:?}",
+                root_node
+            );
+        }
+    }
+}
+
+#[test]
+#[cfg(any())]
+fn stretchy_accents_render_svg() {
+    use crate::mathema::convert::from_latex;
+
+    // These should produce SVG output (not error, not empty) containing path elements
+    let cases = [
+        "\\overrightarrow{AB}",
+        "\\overleftarrow{AB}",
+        "\\widehat{abc}",
+        "\\widetilde{abc}",
+        "\\widecheck{abc}",
+        "\\overbrace{x+y}",
+        "\\underbrace{a+b}",
+        "\\overbracket{x+y}",
+        "\\underbracket{a+b}",
+        "\\overbrace{x+y}^{n}",
+        "\\underbrace{a+b}_{sum}",
+    ];
+    for input in &cases {
+        let result = from_latex(input).unwrap().to_svg();
+        assert!(
+            result.is_ok(),
+            "SVG rendering failed for {input}: {:?}",
+            result.err()
+        );
+        let svg = result.unwrap();
+        assert!(!svg.is_empty(), "SVG output empty for {input}");
+        // Stretchy decorations should produce <path> elements (not literal text)
+        assert!(
+            svg.contains("<path") || svg.contains("<text"),
+            "SVG for {input} should contain rendered elements, got:\n{svg}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// amscd `CD` commutative-diagram environment
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cd_basic_square_parses_to_array() {
+    use crate::mathema::convert::from_latex;
+    let src = r"\begin{CD} A @>f>> B \\ @VVV @VVV \\ C @>>g> D \end{CD}";
+    let mathml = from_latex(src).unwrap().to_mathml().unwrap();
+    // Laid out as an <mtable> grid.
+    assert!(
+        mathml.contains("<mtable>"),
+        "expected mtable, got:\n{mathml}"
+    );
+    // Object letters present.
+    for obj in ["A", "B", "C", "D"] {
+        assert!(mathml.contains(obj), "missing object {obj} in:\n{mathml}");
+    }
+    // Horizontal right arrow and vertical down arrow glyphs.
+    assert!(mathml.contains('\u{2192}'), "missing → arrow in:\n{mathml}");
+    assert!(mathml.contains('\u{2193}'), "missing ↓ arrow in:\n{mathml}");
+    // Labels appear above/below the horizontal arrows.
+    assert!(
+        mathml.contains("<mover"),
+        "expected over-label for f in:\n{mathml}"
+    );
+    assert!(
+        mathml.contains("<munder"),
+        "expected under-label for g in:\n{mathml}"
+    );
+    assert!(mathml.contains(">f<"), "missing label f in:\n{mathml}");
+    assert!(mathml.contains(">g<"), "missing label g in:\n{mathml}");
+}
+
+#[test]
+fn cd_horizontal_chain_parses() {
+    use crate::mathema::convert::from_latex;
+    let src = r"\begin{CD} X @>>> Y @>>> Z \end{CD}";
+    let mathml = from_latex(src).unwrap().to_mathml().unwrap();
+    assert!(mathml.contains("<mtable>"));
+    for obj in ["X", "Y", "Z"] {
+        assert!(mathml.contains(obj), "missing object {obj}");
+    }
+    // Two right arrows in a single row.
+    assert_eq!(
+        mathml.matches('\u{2192}').count(),
+        2,
+        "expected two → in:\n{mathml}"
+    );
+}
+
+#[test]
+fn cd_equals_and_double_line_parse() {
+    use crate::mathema::convert::from_latex;
+    let src = r"\begin{CD} A @= B \\ @VVV @| \\ C @>>> D \end{CD}";
+    let mathml = from_latex(src).unwrap().to_mathml().unwrap();
+    assert!(mathml.contains("<mtable>"));
+    // Horizontal equals (`@=`).
+    assert!(mathml.contains(">=<"), "missing = for @= in:\n{mathml}");
+    // Vertical double line (`@|`).
+    assert!(
+        mathml.contains('\u{2016}'),
+        "missing ‖ for @| in:\n{mathml}"
+    );
+    // Down arrow and right arrow.
+    assert!(mathml.contains('\u{2193}'));
+    assert!(mathml.contains('\u{2192}'));
+}
+
+#[test]
+fn cd_vert_is_single_bar_distinct_from_double() {
+    use crate::mathema::convert::from_latex;
+    // `@\vert` is a single bar `|`; `@|` / `@\Vert` are the double bar `‖`.
+    let single = from_latex(r"\begin{CD} A @VVV B \\ @\vert @\vert \\ C @>>> D \end{CD}")
+        .unwrap()
+        .to_mathml()
+        .unwrap();
+    assert!(
+        single.contains(">|</mo>"),
+        "expected single bar | for @\\vert, got:\n{single}"
+    );
+    let double = from_latex(r"\begin{CD} A @VVV B \\ @\Vert @\Vert \\ C @>>> D \end{CD}")
+        .unwrap()
+        .to_mathml()
+        .unwrap();
+    assert!(
+        double.contains('\u{2016}'),
+        "expected double bar ‖ for @\\Vert, got:\n{double}"
+    );
+}
+
+#[test]
+fn cd_vertical_labels_and_left_arrow() {
+    use crate::mathema::convert::from_latex;
+    let src = r"\begin{CD} A @V{g}V{h}V B @<<< C \end{CD}";
+    let mathml = from_latex(src).unwrap().to_mathml().unwrap();
+    assert!(mathml.contains('\u{2193}'), "missing ↓ in:\n{mathml}");
+    assert!(mathml.contains('\u{2190}'), "missing ← in:\n{mathml}");
+    assert!(
+        mathml.contains(">g<") && mathml.contains(">h<"),
+        "missing v-labels in:\n{mathml}"
+    );
+}
+
+#[test]
+fn cd_malformed_does_not_panic() {
+    use crate::mathema::convert::from_latex;
+    // Bodies that are degenerate must recover (no panic).
+    let _ = from_latex(r"\begin{CD} \end{CD}");
+    let _ = from_latex(r"\begin{CD} @>>> \end{CD}");
+    let _ = from_latex(r"\begin{CD} @ @. @VV \end{CD}");
+    let _ = from_latex(r"\begin{CD} A @>{f\circ g}>> B \end{CD}");
+}
+
+#[test]
+#[cfg(any())]
+fn cd_renders_svg() {
+    use crate::mathema::convert::from_latex;
+    let src = r"\begin{CD} A @>f>> B \\ @VVV @VVV \\ C @>>g> D \end{CD}";
+    let svg = from_latex(src).unwrap().to_svg().unwrap();
+    assert!(!svg.is_empty(), "SVG output empty for CD");
+    assert!(
+        svg.contains("<path") || svg.contains("<text"),
+        "no rendered elements:\n{svg}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// cases package: numcases / subnumcases
+// ---------------------------------------------------------------------------
+
+#[test]
+fn numcases_builds_braced_grid_with_number_labels() {
+    use crate::mathema::convert::from_latex;
+    let src = r"\begin{numcases}{|x|} x, & x\ge0\\ -x, & x<0 \end{numcases}";
+    let mathml = from_latex(src).unwrap().to_mathml().unwrap();
+    // Cases rows live in an <mtable> grid wrapped in a big left brace fence.
+    assert!(
+        mathml.contains("<mtable>"),
+        "expected mtable, got:\n{mathml}"
+    );
+    assert!(
+        mathml.contains('{'),
+        "expected big left brace, got:\n{mathml}"
+    );
+    // Shared left expression and the `=`.
+    assert!(mathml.contains(">x<"), "missing x in:\n{mathml}");
+    assert!(mathml.contains(">=<"), "missing = in:\n{mathml}");
+    // `numcases` numbers each row with a full master number: (1), (2).
+    assert!(mathml.contains("(1)"), "missing (1) label in:\n{mathml}");
+    assert!(mathml.contains("(2)"), "missing (2) label in:\n{mathml}");
+    // Conditions present.
+    assert!(mathml.contains('\u{2265}'), "missing ≥ in:\n{mathml}");
+}
+
+#[test]
+fn numcases_and_subnumcases_label_differently() {
+    use crate::mathema::convert::from_latex;
+    // numcases → (1),(2); subnumcases → (1a),(1b). They must not be identical.
+    let num = from_latex(r"\begin{numcases}{f} a & p\\ b & q \end{numcases}")
+        .unwrap()
+        .to_mathml()
+        .unwrap();
+    let sub = from_latex(r"\begin{subnumcases}{f} a & p\\ b & q \end{subnumcases}")
+        .unwrap()
+        .to_mathml()
+        .unwrap();
+    assert!(num.contains("(1)") && num.contains("(2)"), "got:\n{num}");
+    assert!(
+        !num.contains("(1a)"),
+        "numcases must not use sub-letters:\n{num}"
+    );
+    assert!(sub.contains("(1a)") && sub.contains("(1b)"), "got:\n{sub}");
+    assert_ne!(num, sub, "numcases and subnumcases must differ");
+}
+
+#[test]
+fn subnumcases_uses_sub_letter_labels() {
+    use crate::mathema::convert::from_latex;
+    let src = r"\begin{subnumcases}{f} a & p\\ b & q \end{subnumcases}";
+    let mathml = from_latex(src).unwrap().to_mathml().unwrap();
+    assert!(
+        mathml.contains("<mtable>"),
+        "expected mtable, got:\n{mathml}"
+    );
+    assert!(mathml.contains("(1a)"), "missing (1a) label in:\n{mathml}");
+    assert!(mathml.contains("(1b)"), "missing (1b) label in:\n{mathml}");
+    // Shared left expression `f`.
+    assert!(mathml.contains(">f<"), "missing f in:\n{mathml}");
+}
+
+#[test]
+fn numcases_malformed_does_not_panic() {
+    use crate::mathema::convert::from_latex;
+    let _ = from_latex(r"\begin{numcases} \end{numcases}");
+    let _ = from_latex(r"\begin{numcases}{ \end{numcases}");
+    let _ = from_latex(r"\begin{numcases}{x}\end{numcases}");
+    let _ = from_latex(r"\begin{subnumcases}{}\end{subnumcases}");
+}
+
+// ---------------------------------------------------------------------------
+// empheq package: boxed / delimited displays
+// ---------------------------------------------------------------------------
+
+#[test]
+fn empheq_box_wraps_inner_align_in_boxed() {
+    use crate::mathema::convert::from_latex;
+    let src = r"\begin{empheq}[box=\fbox]{align} a &= b\\ c &= d \end{empheq}";
+    let mathml = from_latex(src).unwrap().to_mathml().unwrap();
+    // Boxed renders as <menclose notation="box">.
+    assert!(
+        mathml.contains("menclose notation=\"box\""),
+        "expected boxed menclose, got:\n{mathml}"
+    );
+    // Inner aligned grid is preserved.
+    assert!(
+        mathml.contains("<mtable>"),
+        "expected mtable, got:\n{mathml}"
+    );
+    assert!(
+        mathml.contains(">a<") && mathml.contains(">d<"),
+        "missing cells in:\n{mathml}"
+    );
+}
+
+#[test]
+fn empheq_left_brace_delimiter_and_combined_box() {
+    use crate::mathema::convert::from_latex;
+    // `left=\{` (escaped brace) plus a combined `box=` key must both apply.
+    let src = r"\begin{empheq}[left=\{,box=\fbox]{align} a &= b\\ c &= d \end{empheq}";
+    let mathml = from_latex(src).unwrap().to_mathml().unwrap();
+    assert!(
+        mathml.contains(">{</mo>"),
+        "expected a left brace delimiter, got:\n{mathml}"
+    );
+    assert!(
+        mathml.contains("menclose notation=\"box\""),
+        "expected the box to also apply, got:\n{mathml}"
+    );
+}
+
+#[test]
+fn empheq_innerbox_key_and_empheqset_accepted() {
+    use crate::mathema::convert::from_latex;
+    // `\empheqset{...}` is accepted/ignored; `innerbox=` is a box alias.
+    let src = r"\empheqset{box=\fbox}\begin{empheq}[innerbox=\fbox]{align} a &= b \end{empheq}";
+    let mathml = from_latex(src).unwrap().to_mathml().unwrap();
+    assert!(
+        mathml.contains("menclose notation=\"box\""),
+        "expected innerbox to wrap in a box, got:\n{mathml}"
+    );
+}
+
+#[test]
+fn colorbox_optional_model_resolves() {
+    use crate::mathema::convert::from_latex;
+    // \colorbox[rgb]{1,0,0}{x} — optional model must parse and resolve to red.
+    let mathml = from_latex(r"\colorbox[rgb]{1,0,0}{x}")
+        .unwrap()
+        .to_mathml()
+        .unwrap();
+    assert!(
+        mathml.contains("background-color: #ff0000"),
+        "expected red background from rgb model, got:\n{mathml}"
+    );
+    // \fcolorbox[RGB]{0,0,255}{255,255,0}{z} — both specs use the model.
+    let m2 = from_latex(r"\fcolorbox[RGB]{0,0,255}{255,255,0}{z}")
+        .unwrap()
+        .to_mathml()
+        .unwrap();
+    assert!(
+        m2.contains("border-color: #0000ff") && m2.contains("background-color: #ffff00"),
+        "expected blue border + yellow bg, got:\n{m2}"
+    );
+}
+
+#[test]
+fn empheq_colorbox_sets_background() {
+    use crate::mathema::convert::from_latex;
+    let src = r"\begin{empheq}[box=\colorbox{yellow}]{align} a &= b \end{empheq}";
+    let mathml = from_latex(src).unwrap().to_mathml().unwrap();
+    assert!(
+        mathml.contains("menclose notation=\"box\""),
+        "expected boxed menclose, got:\n{mathml}"
+    );
+    assert!(
+        mathml.contains("background-color"),
+        "expected background color, got:\n{mathml}"
+    );
+}
+
+#[test]
+fn empheq_without_options_renders_inner_unchanged() {
+    use crate::mathema::convert::from_latex;
+    let src = r"\begin{empheq}{gather} x \end{empheq}";
+    let mathml = from_latex(src).unwrap().to_mathml().unwrap();
+    // No box.
+    assert!(
+        !mathml.contains("menclose notation=\"box\""),
+        "did not expect a box, got:\n{mathml}"
+    );
+    // Inner gather grid present.
+    assert!(
+        mathml.contains("<mtable>"),
+        "expected mtable, got:\n{mathml}"
+    );
+    assert!(mathml.contains(">x<"), "missing x in:\n{mathml}");
+}
+
+#[test]
+fn empheq_left_delimiter_wraps_in_fence() {
+    use crate::mathema::convert::from_latex;
+    let src = r"\begin{empheq}[left=\Rightarrow]{align*} a &= b \end{empheq}";
+    let mathml = from_latex(src).unwrap().to_mathml().unwrap();
+    // Left delimiter ⇒ should appear as a fence operator.
+    assert!(
+        mathml.contains('\u{21D2}'),
+        "missing ⇒ delimiter in:\n{mathml}"
+    );
+    assert!(
+        mathml.contains("<mtable>"),
+        "expected mtable, got:\n{mathml}"
+    );
+}
+
+#[test]
+fn empheq_malformed_does_not_panic() {
+    use crate::mathema::convert::from_latex;
+    let _ = from_latex(r"\begin{empheq}{align}\end{empheq}");
+    let _ = from_latex(r"\begin{empheq}[box=]{align} a \end{empheq}");
+    let _ = from_latex(r"\begin{empheq}[box=\fbox]{}\end{empheq}");
+    let _ = from_latex(r"\begin{empheq}[bogus=1]{align} a &= b \end{empheq}");
+    let _ = from_latex(r"\begin{empheq}\end{empheq}");
+}
+
+// ---------------------------------------------------------------------------
+// colortbl: \cellcolor / \rowcolor / \columncolor / \arrayrulecolor
+// ---------------------------------------------------------------------------
+
+#[test]
+fn colortbl_rowcolor_and_cellcolor_set_backgrounds() {
+    use crate::mathema::convert::from_latex;
+    let src = r"\begin{array}{cc} \rowcolor{gray} a & b \\ \cellcolor{yellow} c & d \end{array}";
+    let res = from_latex(src).unwrap();
+    let mathml = res.to_mathml().unwrap();
+    // \rowcolor colors both cells of row 1; \cellcolor colors one cell of row 2.
+    assert_eq!(
+        mathml.matches("background-color").count(),
+        3,
+        "expected 3 colored cells, got:\n{mathml}"
+    );
+    assert!(
+        mathml.contains("menclose notation=\"box\""),
+        "expected boxed menclose, got:\n{mathml}"
+    );
+    // Cell contents survive the Boxed wrapping.
+    assert!(
+        mathml.contains(">a<") && mathml.contains(">d<"),
+        "missing cells in:\n{mathml}"
+    );
+}
+
+#[cfg(any())]
+#[test]
+fn colortbl_cellcolor_renders_filled_rect_in_svg() {
+    use crate::mathema::convert::from_latex;
+    let src = r"\begin{array}{c} \cellcolor{red!30} x \end{array}";
+    let res = from_latex(src).unwrap();
+    let mathml = res.to_mathml().unwrap();
+    // `red!30` is a computed xcolor mix, so it resolves to a #rrggbb value.
+    assert!(
+        mathml.contains("background-color: #"),
+        "expected resolved hex background, got:\n{mathml}"
+    );
+    let svg = res.to_svg().unwrap();
+    // Boxed background paints a filled <rect>.
+    assert!(svg.contains("<rect"), "expected a rect in svg:\n{svg}");
+    assert!(
+        svg.contains("fill=\"#"),
+        "expected a filled rect in svg:\n{svg}"
+    );
+}
+
+#[test]
+fn colortbl_inline_columncolor_colors_its_cell() {
+    use crate::mathema::convert::from_latex;
+    let src = r"\begin{array}{cc} \columncolor{blue} p & q \end{array}";
+    let mathml = from_latex(src).unwrap().to_mathml().unwrap();
+    assert_eq!(
+        mathml.matches("background-color").count(),
+        1,
+        "expected the columncolor cell to be filled, got:\n{mathml}"
+    );
+}
+
+#[test]
+fn colortbl_rowcolors_alternates_rows() {
+    use crate::mathema::convert::from_latex;
+    // \rowcolors{1}{red}{blue} → row1 red, row2 blue, row3 red.
+    let src = r"\rowcolors{1}{red}{blue}\begin{array}{cc} a & b \\ c & d \\ e & f \end{array}";
+    let mathml = from_latex(src).unwrap().to_mathml().unwrap();
+    assert_eq!(
+        mathml.matches("background-color: red").count(),
+        4,
+        "rows 1 and 3 (4 cells) should be red, got:\n{mathml}"
+    );
+    assert_eq!(
+        mathml.matches("background-color: blue").count(),
+        2,
+        "row 2 (2 cells) should be blue, got:\n{mathml}"
+    );
+}
+
+#[test]
+fn colortbl_rowcolors_respects_cellcolor_override() {
+    use crate::mathema::convert::from_latex;
+    let src =
+        r"\rowcolors{1}{red}{blue}\begin{array}{cc} \cellcolor{yellow} a & b \\ c & d \end{array}";
+    let mathml = from_latex(src).unwrap().to_mathml().unwrap();
+    assert_eq!(mathml.matches("background-color: yellow").count(), 1);
+    assert_eq!(mathml.matches("background-color: red").count(), 1);
+    assert_eq!(mathml.matches("background-color: blue").count(), 2);
+}
+
+#[test]
+fn colortbl_columncolor_spec_colors_whole_column() {
+    use crate::mathema::convert::from_latex;
+    // >{\columncolor{green}} in the spec colors the entire first column.
+    let src = r"\begin{array}{>{\columncolor{green}}c c} a & b \\ c & d \end{array}";
+    let mathml = from_latex(src).unwrap().to_mathml().unwrap();
+    assert_eq!(
+        mathml.matches("background-color: green").count(),
+        2,
+        "both first-column cells should be green, got:\n{mathml}"
+    );
+}
+
+#[test]
+fn colortbl_arrayrulecolor_is_accepted_but_ignored() {
+    use crate::mathema::convert::from_latex;
+    let src = r"\begin{array}{cc} \arrayrulecolor{green} a & b \end{array}";
+    let mathml = from_latex(src).unwrap().to_mathml().unwrap();
+    // Deferred: no background is produced for rule colors.
+    assert!(
+        !mathml.contains("background-color"),
+        "arrayrulecolor should not produce a cell background, got:\n{mathml}"
+    );
+    assert!(
+        mathml.contains(">a<") && mathml.contains(">b<"),
+        "missing cells in:\n{mathml}"
+    );
+}
+
+#[test]
+fn colortbl_overhang_args_are_ignored() {
+    use crate::mathema::convert::from_latex;
+    let src = r"\begin{array}{cc} \rowcolor{gray}[2pt][3pt] a & b \end{array}";
+    let mathml = from_latex(src).unwrap().to_mathml().unwrap();
+    assert_eq!(
+        mathml.matches("background-color").count(),
+        2,
+        "expected overhang args ignored and row colored, got:\n{mathml}"
+    );
+}
+
+#[test]
+fn colortbl_malformed_color_does_not_panic() {
+    use crate::mathema::convert::from_latex;
+    // Missing braces / args must degrade gracefully without panicking.
+    let _ = from_latex(r"\begin{array}{cc} \cellcolor a & b \end{array}");
+    let _ = from_latex(r"\begin{array}{cc} \rowcolor & b \end{array}");
+    let _ = from_latex(r"\begin{array}{c} \cellcolor{ \end{array}");
+    let _ = from_latex(r"\begin{matrix} \rowcolor{red} a & b \end{matrix}");
+}
+
+// ── bussproofs (proof trees) ───────────────────────────────────────────
+
+#[test]
+fn bussproofs_binary_inference() {
+    use crate::mathema::convert::from_latex;
+    let r =
+        from_latex(r"\begin{prooftree}\AxiomC{A}\AxiomC{B}\BinaryInfC{C}\end{prooftree}").unwrap();
+    let ml = r.to_mathml().unwrap();
+    // Leaves and conclusion present.
+    assert!(ml.contains("<mi>A</mi>"), "missing A:\n{ml}");
+    assert!(ml.contains("<mi>B</mi>"), "missing B:\n{ml}");
+    assert!(ml.contains("<mi>C</mi>"), "missing C:\n{ml}");
+    // Inference line: Rule renders as <mspace> with explicit height.
+    assert!(ml.contains("<mspace"), "missing inference rule:\n{ml}");
+    assert!(ml.contains("height=\"0.1em\""), "rule has no height:\n{ml}");
+    // Composed from an Array → <mtable>.
+    assert!(ml.contains("<mtable>"), "not an Array:\n{ml}");
+    // SVG must render without panic.
+    #[cfg(any())]
+    assert!(r.to_svg().is_ok());
+}
+
+#[test]
+fn bussproofs_unary_chain_with_label() {
+    use crate::mathema::convert::from_latex;
+    let r = from_latex(
+        r"\begin{prooftree}\AxiomC{$P$}\UnaryInfC{$Q$}\RightLabel{r}\UnaryInfC{$R$}\end{prooftree}",
+    )
+    .unwrap();
+    let ml = r.to_mathml().unwrap();
+    assert!(ml.contains("<mi>P</mi>"), "missing P:\n{ml}");
+    assert!(ml.contains("<mi>Q</mi>"), "missing Q:\n{ml}");
+    assert!(ml.contains("<mi>R</mi>"), "missing R:\n{ml}");
+    assert!(ml.contains("<mi>r</mi>"), "missing label r:\n{ml}");
+    assert!(ml.contains("<mspace"), "missing inference rule:\n{ml}");
+}
+
+#[test]
+fn bussproofs_inline_display_proof() {
+    use crate::mathema::convert::from_latex;
+    let r = from_latex(r"\AxiomC{A}\UnaryInfC{B}\DisplayProof").unwrap();
+    let ml = r.to_mathml().unwrap();
+    assert!(
+        ml.contains("<mi>A</mi>") && ml.contains("<mi>B</mi>"),
+        "{ml}"
+    );
+    assert!(ml.contains("<mtable>"), "{ml}");
+}
+
+#[test]
+fn bussproofs_lenient_underflow() {
+    use crate::mathema::convert::from_latex;
+    // Stack underflow / leftovers must not panic.
+    assert!(from_latex(r"\begin{prooftree}\UnaryInfC{X}\end{prooftree}").is_ok());
+    assert!(from_latex(r"\begin{prooftree}\BinaryInfC{X}\end{prooftree}").is_ok());
+    assert!(from_latex(r"\begin{prooftree}\AxiomC{A}\AxiomC{B}\end{prooftree}").is_ok());
+    assert!(from_latex(r"\begin{prooftree}\end{prooftree}").is_ok());
+}
+
+#[test]
+fn bussproofs_line_styles() {
+    use crate::mathema::convert::from_latex;
+    // \noLine suppresses the inference rule (no filled rect / mspace gap only).
+    let no_line = from_latex(r"\begin{prooftree}\AxiomC{A}\noLine\UnaryInfC{B}\end{prooftree}")
+        .unwrap()
+        .to_mathml()
+        .unwrap();
+    assert!(
+        no_line.contains("<mtable"),
+        "expected proof grid: {no_line}"
+    );
+    // \doubleLine draws two stacked rules (nested table) and must not panic.
+    assert!(
+        from_latex(r"\begin{prooftree}\AxiomC{A}\doubleLine\UnaryInfC{B}\end{prooftree}").is_ok()
+    );
+    // \singleLine / \solidLine / \dottedLine are accepted.
+    assert!(
+        from_latex(r"\begin{prooftree}\AxiomC{A}\dottedLine\UnaryInfC{B}\end{prooftree}").is_ok()
+    );
+}
+
+// ── xypic (xymatrix) ───────────────────────────────────────────────────
+
+#[test]
+fn xymatrix_grid_with_arrows() {
+    use crate::mathema::convert::from_latex;
+    let r = from_latex(r"\xymatrix{ A \ar[r]^f & B \ar[d] \\ C & D \ar[l] }").unwrap();
+    let ml = r.to_mathml().unwrap();
+    // Array grid.
+    assert!(ml.contains("<mtable>"), "not an Array:\n{ml}");
+    // Objects present.
+    for obj in ["A", "B", "C", "D"] {
+        assert!(
+            ml.contains(&format!("<mi>{obj}</mi>")),
+            "missing {obj}:\n{ml}"
+        );
+    }
+    // Arrow glyphs for each direction.
+    assert!(ml.contains('\u{2192}'), "missing → :\n{ml}"); // r
+    assert!(ml.contains('\u{2193}'), "missing ↓ :\n{ml}"); // d
+    assert!(ml.contains('\u{2190}'), "missing ← :\n{ml}"); // l
+    // Arrow label.
+    assert!(ml.contains("<mi>f</mi>"), "missing label f:\n{ml}");
+    #[cfg(any())]
+    assert!(r.to_svg().is_ok());
+}
+
+#[test]
+fn xymatrix_tolerates_ar_modifiers_and_spacing() {
+    use crate::mathema::convert::from_latex;
+    // `\ar` shaft/curve modifiers and `@R=`/`@C=` spacing must not break the
+    // arrow direction.
+    let ml = from_latex(r"\xymatrix@R=1pc@C=2pc{ A \ar@{->}[r] & B \ar@/^1pc/[d]^f \\ C & D }")
+        .unwrap()
+        .to_mathml()
+        .unwrap();
+    assert!(ml.contains("<mtable>"), "expected grid:\n{ml}");
+    assert!(
+        ml.contains('\u{2192}'),
+        "missing → from \\ar@{{->}}[r]:\n{ml}"
+    );
+    assert!(
+        ml.contains('\u{2193}'),
+        "missing ↓ from \\ar@/^1pc/[d]:\n{ml}"
+    );
+    assert!(
+        ml.contains("<mi>f</mi>"),
+        "missing curved-arrow label:\n{ml}"
+    );
+}
+
+#[test]
+fn xymatrix_diagonal_and_env() {
+    use crate::mathema::convert::from_latex;
+    let r = from_latex(r"\begin{xy}\xymatrix{ A \ar[ur]^g & B }\end{xy}").unwrap();
+    let ml = r.to_mathml().unwrap();
+    assert!(ml.contains('\u{2197}'), "missing ↗ :\n{ml}"); // ur
+    assert!(ml.contains("<mi>g</mi>"), "missing label g:\n{ml}");
+}
+
+#[test]
+fn xymatrix_lenient_malformed() {
+    use crate::mathema::convert::from_latex;
+    // Must never panic (unterminated input may report a parse error, but a
+    // well-formed-but-empty diagram parses cleanly).
+    let _ = from_latex(r"\xymatrix{");
+    let _ = from_latex(r"\xymatrix{ A \ar[ & B }");
+    assert!(from_latex(r"\xymatrix{}").is_ok());
+    assert!(from_latex(r"\begin{xy}\end{xy}").is_ok());
+}
+
+#[test]
+fn fuzz_repro_dd() {
+    let config = Config::default();
+    // These inputs previously caused parser panics: span underflow after
+    // builtin-macro expansion, and out-of-bounds indexing when a \big-like
+    // command is followed by an empty or non-ASCII delimiter argument.
+    for input in [
+        r"*\*\dd",
+        "\0\0\0\0\0\0\\dd",
+        r"\d\big",
+        "\\bigg\u{06C5}",
+        r"\url{",
+        r"\middle~",
+    ] {
+        if let Ok(parsed) = LatexReader::parse(input, &config) {
+            let _ = LatexWriter::write(&parsed.expr, &config);
+        }
+    }
+}
+
+#[test]
+fn fuzz_repro_roundtrip_misc() {
+    use crate::mathema::ast::normalize::normalize_compact_expr;
+    let config = Config::default();
+    // Inputs that previously broke LaTeX round-trip idempotency:
+    // "~" was mangled by trimming, "\&" was written as a bare "&",
+    // "'/\n'" triggered a prime-handling regression, "^$" is an empty-base
+    // superscript with a special char, and "26$\n \n'1" mixes $/newline/primes.
+    for input in [
+        "\n\\&",
+        "~",
+        "/\n'",
+        "^$",
+        "^6\n6",
+        "\\Z\\,f,\\,f,ffff6*ff6)?\n^66)??\n^6\n6",
+        "26$\n \n'1",
+        "P6$\n6'\n1",
+        "'ev$'ev",
+        "''\t_\t$",
+        "'_`_@",
+        "'^'^\\prim",
+        "mapmodx'\\verb*an\\cw\\o\\mand",
+        "p'pmod;;;;\\verb_;;;;;;;;;;;;\n'pp'`p'p'p''p'`",
+        "\\verb*&d'7vvvv~vvvo_'\n^oc|",
+        "\\bigg\\bg",
+        "\\bigg\\b_ ? \\b_ ?i",
+        "f^6)\\p!\\ip\\ip?\n^2)6)?\n^?\n^6)?\n^6)6)?\n^6)",
+        "\\red\n\n\\lnc",
+        "5.\r6'~''''",
+        ",\\boxed\\tfracboxed\\redlime?6",
+        "\\ip!le_3",
+        "2_\r2\r2",
+        "$\\$\\intop$\\$jitt",
+        "6$\n1\n6$\r\n\n1\n6(\n1$\n$\n1\n6$^7_1\n1",
+        "d_7^\\newcommand",
+        "<<\\,<<<\\,<d\\def=f_dd\\def=f_\\over]f\\;s\\overd",
+        "\\verb*arg&d^o\u{2}\0\0 \0\0\0:Big~,\n,=,=i!p~\\\n,$g|,\\ip!\n\\",
+        "\\unders\\underset\\undet\\und",
+        "_6$\n1\n$\n0$\n1\n'_9A",
+        "_'^$",
+        "\\atop^o",
+        "Bigp\\Bigg\\o'",
+        "\\tt a\\brace b",
+        "/\\nGGGGGGGLGGGGGGGGYYY++6\\ip+{\\ip+{ot}YYYYYYYYYYYYYYYYYY}YYYYYYYYYYYYYYYYYYYYYYYYBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBYYYY  ,YYYY",
+        "\\genfrac'{\\}.{\\}{}{}{}{}",
+        "6_'^1\n1$\n_\'^1\n1'",
+        "\\genfrac;;;;;;;;\\|v;;;!!!!!!!!!!!",
+        "\\verb's`_\\verb's`_*e\\middle *er_\\verb's .;H_{",
+        "\\not< <",
+        "\\lll+ llllll(",
+        "\\intop_\\t$ '",
+        r"\\left\\{\\frac{a}{\\left\\langle \\brace \\right|}\\right\\}",
+        "_'sTfc(\\middle~\\s-'",
+        ";\\int\\pod \\int\\podop ",
+        "$\\\\$\\\\$\\idotsint$\\\\$jitt",
+        "\\text{\\fonment{e\\\t- *\\} '\\t& (*a\\ngln#}  (",
+        "\\verb*&%\\verbb*&\\ver{} irnB cig)t\\ip!\\newe!\\color\t {+'\t\t\\ip!\\newbox]onmeox]onmeXXXXX\r\nB)\\newenv      \t{} irnBJJJJJJJJJJJJJJJJJJ\\middle^oc|",
+        "xAg'\\ov       {} irn\\middle\"!\\newe \\color\t {+Yp!\\newe!\\color\t ~   {+Yp n!{e\\ov       {} irn\\midd~e !\\newe \\color\t {+YvvoBivv&ip    e\\ov       {} irn\\middlvev\\%",
+        "]//\\su7\r        m{7{mbox'}$6}'-\\i7\r*\\} '\\text{t\\kad[4`1quad[ `;.etxd[ lan`\\{}(",
+        "6 '\r\r\r\r\r\r\r7^7\r\r\r\r\r\r.\r\r7^7_$'7",
+        "\\ip{op$'},",
+        "Tdv  dman;sm\\Big\\label:'r]    m\\label:     dman;sm\\label:'r]'f\\otw''6d\\{\\d",
+        "\\d\\begin{1}''~\n\n,'ddefe\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\22222222222\\\\      ",
+        "\\Big\\ggg-gggggggggggggggggggggggggggggggggggggggggggggggggg  ",
+        "_ss\n\nss\nsf\\Big\t/g\t_\tf",
+        "~\\color\t {+{} _o",
+        "\\floor\n\nv\r\\bigg\\t",
+        ")\\color\t{ {}'@",
+        "\n\\genfrac\\eo>>>eo",
+        "$\\$\\choose   \\newmmncaod ",
+        "\u{03C1}\u{02C1}\r'",
+        "m\\textcolor{'_'}=m",
+        "]_1.$_W",
+        r#",[[f{]
+?\ce{[[[{[f]
+{
+\f{]
+  [^07Qne{{
+\sf{d     b}}  b}}}}}}"#,
+        "\\choose|\r'",
+        ",\\bigm\\pu{rm #}c",
+        r#"e\\substack{o\\kern}o"#,
+        "=\\\\kern\r",
+        r#"\\v/\\kern+a"#,
+        r#"=\\kern'"#,
+        "\\ip \\idotsint t\t",
+        " {\\,\\xymatrix[{ {\\cr}+}}",
+        "\\big \\int\\ ",
+        ".$'$\\choose",
+        "1F_\\AXC\\AXC ",
+        "' \\kern_O",
+    ] {
+        let Ok(mut r1) = LatexReader::parse_compact(input, &config) else {
+            continue;
+        };
+        normalize_compact_expr(&mut r1.expr);
+        let Ok(out1) = LatexWriter::write_compact(&r1.expr, &config) else {
+            continue;
+        };
+        let Ok(mut r2) = LatexReader::parse_compact(&out1, &config) else {
+            panic!(
+                "round-trip failed: first write output could not be re-parsed.\n\
+                 input:  {input:?}\n\
+                 write1: {out1:?}"
+            );
+        };
+        normalize_compact_expr(&mut r2.expr);
+        let Ok(out2) = LatexWriter::write_compact(&r2.expr, &config) else {
+            panic!(
+                "round-trip failed: second write panicked.\n\
+                 input:  {input:?}\n\
+                 write1: {out1:?}"
+            );
+        };
+        assert_eq!(
+            out1, out2,
+            "LaTeX round-trip not idempotent.\n\
+             input:  {input:?}\n\
+             write1: {out1:?}\n\
+             write2: {out2:?}"
+        );
+    }
+}

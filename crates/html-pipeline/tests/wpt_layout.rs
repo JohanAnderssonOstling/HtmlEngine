@@ -102,8 +102,7 @@ impl GlyphShaper for DeterministicShaper {
             advance,
             request.font_size * 0.75,
             request.font_size * 0.25,
-        )
-        .map_err(ShapeError::rejected_metric)?;
+        )?;
         if let Some(&glyph) = self.glyphs.get(&key) {
             return Ok(ShapedGlyph::from_metric(glyph, metric));
         }

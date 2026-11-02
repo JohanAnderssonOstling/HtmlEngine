@@ -1,28 +1,46 @@
 [package]
-license.workspace = true
-name = "html-engine"
-version = "0.1.0"
-edition = "2024"
-publish = false
+license = "GPL-3.0-or-later AND Apache-2.0"
+name = "skrift"
+version.workspace = true
+edition.workspace = true
+publish = ["crates-io"]
+description = "Renders HTML and CSS in native applications."
+repository.workspace = true
+homepage.workspace = true
+categories.workspace = true
+keywords.workspace = true
+readme = "README.md"
+include.workspace = true
+documentation = "https://docs.rs/skrift"
 
 [lib]
 name = "html"
 
 [features]
-profiling = ["html-layout/profiling", "html-pipeline/profiling"]
-testing = ["dep:html-wpt-test-support"]
-math-export = ["dep:mathema", "dep:roxmltree"]
+profiling = ["html-pipeline/profiling"]
+testing = []
+font-data = ["dep:data-url", "dep:ttf-parser", "dep:wuff"]
+math-export = ["dep:nom", "dep:phf", "dep:quick-xml", "dep:roxmltree", "dep:smallvec", "dep:thiserror"]
 
 [dependencies]
-mathema = { git = "https://github.com/DevExzh/mathema", rev = "d9cce9ffeb7346181d4c3201dc0a13727269863b", default-features = false, optional = true }
+web-time = "1"
+kurbo.workspace = true
+data-url = { version = "0.3", optional = true }
+ttf-parser = { version = "0.25", optional = true }
+wuff = { version = "0.2.9", optional = true }
+nom = { version = "8", optional = true }
+phf = { version = "0.14", features = ["macros"], optional = true }
+quick-xml = { workspace = true, optional = true }
 roxmltree = { version = "0.21", optional = true }
-html-dom = { path = "../html-dom" }
-html-layout = { path = "../04-html-layout" }
-html-parse = { path = "../02-html-parse" }
-html-pipeline = { path = "../html-pipeline" }
-html-render-core = { path = "../05-html-render-core" }
-html-resources = { path = "../html-resources" }
-html-source = { path = "../01-html-source" }
-html-style = { path = "../03-html-style" }
-html-style-model = { path = "../html-style-model" }
-html-wpt-test-support = { path = "../../test-support/html-wpt", optional = true }
+smallvec = { version = "1", optional = true }
+thiserror = { version = "2", optional = true }
+html-dom = { version = "0.1.0", package = "skrift-dom", path = "../html-dom" }
+html-parse = { version = "0.1.0", package = "skrift-parse", path = "../02-html-parse" }
+html-pipeline = { version = "0.1.0", package = "skrift-pipeline", path = "../html-pipeline" }
+html-render-core = { version = "0.1.0", package = "skrift-render-core", path = "../05-html-render-core" }
+html-resources = { version = "0.1.0", package = "skrift-resources", path = "../html-resources" }
+html-style = { version = "0.1.0", package = "skrift-style", path = "../03-html-style" }
+html-style-model = { version = "0.1.0", package = "skrift-style-model", path = "../html-style-model" }
+
+[package.metadata.docs.rs]
+features = ["math-export", "font-data"]

@@ -1,7 +1,10 @@
 //! Renderer-facing link, anchor, and source-correlation queries.
 
-use super::text::text_runs;
+use super::text::{enclosing_text_range, text_runs};
 use super::*;
+use crate::layout_model::GlyphMetrics;
+use html_dom::{DomNodeId, element_is_note_reference};
+use html_text::InlineTextKind;
 
 pub struct RenderAnchorPosition {
     y: f64,
@@ -49,49 +52,30 @@ impl<'a> RenderAnchorPositions<'a> {
 
 pub struct RenderAddressingView<'a> {
     pub(super) doc: DocumentRead<'a>,
-    pub(super) glyph_metrics: &'a crate::layout_model::GlyphMetrics,
+    pub(super) glyph_metrics: &'a GlyphMetrics,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SourceElementStep<'a> {
-    step: usize,
-    id: Option<&'a str>,
-}
-
-impl<'a> SourceElementStep<'a> {
-    pub fn step(self) -> usize {
-        self.step
-    }
-
-    pub fn id(self) -> Option<&'a str> {
-        self.id
-    }
-}
-
-/// Generic source position corresponding to a laid-out glyph boundary.
-/// Publication-specific syntaxes such as EPUB CFI are built outside layout.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SourcePosition<'a> {
-    elements: Vec<SourceElementStep<'a>>,
-    text_step: usize,
-    utf16_offset: usize,
-}
-
-impl<'a> SourcePosition<'a> {
-    pub fn elements(&self) -> impl ExactSizeIterator<Item = SourceElementStep<'a>> + '_ {
-        self.elements.iter().copied()
-    }
-
-    pub fn text_step(&self) -> usize {
-        self.text_step
-    }
-
-    pub fn utf16_offset(&self) -> usize {
-        self.utf16_offset
-    }
-}
+pub use html_dom::{SourceElementStep, SourcePosition};
 
 impl<'a> RenderAddressingView<'a> {
+    /// Link semantics for replaced content, including images inside inline
+    /// ancestors that do not introduce their own layout box.
+    pub fn link_for_box(self, box_idx: usize) -> Option<(&'a str, bool)> {
+        let document = self.doc.document();
+        let node = document.node_id_from_raw(self.doc.box_dom_element_idx(box_idx)?)?;
+        std::iter::once(node)
+            .chain(document.dom_ancestors(node))
+            .find_map(|node| {
+                let element = document.element_ref(node)?;
+                if !element.tag().eq_ignore_ascii_case("a")
+                    && !element.tag().eq_ignore_ascii_case("area")
+                {
+                    return None;
+                }
+                Some((element.attr("href")?, element_is_note_reference(element)))
+            })
+    }
+
     pub fn link_for_glyph(self, glyph_idx: u32) -> Option<u16> {
         self.doc.link_href_for_glyph(glyph_idx)
     }
@@ -117,33 +101,15 @@ impl<'a> RenderAddressingView<'a> {
 
     pub fn glyph_range_for_anchor(self, id: &str) -> Option<Range<u32>> {
         let document = self.doc.document();
-        let target = document
-            .node_ids()
-            .find(|node| document.get_dom_id(*node) == Some(id))?;
-        let mut start = u32::MAX;
-        let mut end = 0u32;
-        for run in text_runs(self.doc.inputs.text.content().inline_items()) {
-            let Some(mut node) = run
-                .dom_text_node()
-                .and_then(|raw| document.node_id_from_raw(raw))
-            else {
-                continue;
-            };
-            let mut belongs = node == target;
-            while !belongs {
-                let Some(parent) = document.get_dom_parent(node) else {
-                    break;
-                };
-                node = parent;
-                belongs = node == target;
-            }
-            if belongs {
-                let glyphs = run.glyphs();
-                start = start.min(glyphs.start);
-                end = end.max(glyphs.end);
-            }
-        }
-        (start < end).then_some(start..end)
+        let target = document.element_by_id(id)?.node_id();
+        text_runs(self.doc.inputs.text.content().inline_items())
+            .filter_map(|run| {
+                let node = document.node_id_from_raw(run.dom_text_node()?)?;
+                let belongs = document.dom_contains(target, node);
+                belongs.then(|| run.glyphs())
+            })
+            .reduce(enclosing_text_range)
+            .filter(|range| !range.is_empty())
     }
 
     pub fn anchor_positions(self) -> RenderAnchorPositions<'a> {
@@ -159,45 +125,18 @@ impl<'a> RenderAddressingView<'a> {
         glyph_idx: u32,
         after_glyph: bool,
     ) -> Option<SourcePosition<'a>> {
-        let (text_node_idx, local_offset) = self.doc.get_dom_node_for_glyph(glyph_idx)?;
+        let local_offset = self.doc.glyph_source_offset(glyph_idx)? as usize;
+        let run = self.doc.inputs.text.content().text_runs().find(|run| {
+            run.kind == InlineTextKind::Text && run.glyphs.contains(&glyph_idx)
+        })?;
         let document = self.doc.document();
-        let text_node = document.node_id_from_raw(text_node_idx)?;
-        let parent = document.node_ref(text_node)?.parent()?;
-        let text_step = document.get_text_node_step(text_node)?;
-        let mut chunk_offset = 0usize;
-        for node in document.find_text_nodes_by_step(parent, text_step) {
-            if node == text_node {
-                break;
-            }
-            chunk_offset += document.text_ref(node)?.text().encode_utf16().count();
-        }
-        let local_offset = if after_glyph {
-            utf16_offset_after_character(document.text_ref(text_node)?.text(), local_offset)?
-        } else {
-            local_offset
-        };
-        let path = document.get_dom_path_to_node(parent);
-        if path.is_empty() {
-            return None;
-        }
-        let elements = path
-            .into_iter()
-            .skip(1)
-            .map(|node| {
-                Some(SourceElementStep {
-                    step: document.get_element_step(node)?,
-                    id: document.get_dom_id(node),
-                })
-            })
-            .collect::<Option<Vec<_>>>()?;
-        Some(SourcePosition {
-            elements,
-            text_step,
-            utf16_offset: chunk_offset + local_offset,
-        })
+        let text_node = document.node_id_from_raw(run.dom_text_node?)?;
+        document.source_position_for_text_node(text_node, local_offset, after_glyph)
     }
 
     /// Resolves a generic element/text path to a source glyph boundary.
+    /// Without a text step, uses the first addressable descendant in DOM order.
+    /// Offsets are UTF-16 positions within that descendant's source text chunk.
     pub fn resolve_source_position(
         self,
         element_steps: &[usize],
@@ -212,56 +151,18 @@ impl<'a> RenderAddressingView<'a> {
             document.find_dom_node_by_steps(element_steps)?
         };
         match text_step {
-            Some(step) => find_glyph_in_text_chunk(
-                self.doc,
-                parent,
-                step,
-                utf16_offset,
-                allow_end,
-                self.glyph_metrics,
-            ),
-            None => find_glyph_in_node(
-                self.doc,
-                parent,
-                utf16_offset,
-                allow_end,
-                self.glyph_metrics,
-            ),
+            Some(step) => find_glyph_in_text_chunk(self.doc, parent, step, utf16_offset, allow_end),
+            None => find_glyph_in_node(self.doc, parent, utf16_offset, allow_end),
         }
     }
 }
 
-fn utf16_offset_after_character(text: &str, wanted: usize) -> Option<usize> {
-    let mut offset = 0usize;
-    for character in text.chars() {
-        if offset == wanted {
-            return Some(offset + character.len_utf16());
-        }
-        if offset > wanted {
-            return None;
-        }
-        offset += character.len_utf16();
-    }
-    None
-}
-
-fn glyph_range_for_text_node(
-    doc: DocumentRead<'_>,
-    node: html_dom::DomNodeId,
-    glyph_metrics: &crate::layout_model::GlyphMetrics,
-) -> Option<Range<u32>> {
-    let mut runs = doc
-        .render_view(glyph_metrics)
-        .text()
-        .text_runs()
+fn glyph_range_for_text_node(doc: DocumentRead<'_>, node: DomNodeId) -> Option<Range<u32>> {
+    text_runs(doc.inputs.text.content().inline_items())
         .filter(|run| run.dom_text_node() == Some(node.raw()))
-        .map(|run| run.glyphs());
-    let mut range = runs.next()?;
-    for run in runs {
-        range.start = range.start.min(run.start);
-        range.end = range.end.max(run.end);
-    }
-    Some(range)
+        .map(|run| run.glyphs())
+        .filter(|range| !range.is_empty())
+        .reduce(enclosing_text_range)
 }
 
 fn glyph_for_source_offset(
@@ -290,23 +191,28 @@ fn glyph_for_source_offset(
 
 fn find_glyph_in_text_chunk(
     doc: DocumentRead<'_>,
-    parent: html_dom::DomNodeId,
+    parent: DomNodeId,
     text_step: usize,
     source_offset: Option<usize>,
     allow_end: bool,
-    glyph_metrics: &crate::layout_model::GlyphMetrics,
 ) -> Option<u32> {
     let mut nodes = doc
         .document()
-        .find_text_nodes_by_step(parent, text_step)
-        .into_iter()
+        .text_children_with_steps(parent)
+        .filter(|(_, step)| *step == text_step)
         .peekable();
     let mut remaining = source_offset.unwrap_or(0);
     let mut last_end = None;
-    while let Some(node) = nodes.next() {
-        let text = doc.document().text_ref(node)?.text();
-        let utf16_len = text.encode_utf16().count();
-        let Some(range) = glyph_range_for_text_node(doc, node, glyph_metrics) else {
+    while let Some((text, _)) = nodes.next() {
+        let range = glyph_range_for_text_node(doc, text.node_id());
+        if remaining == 0 {
+            if let Some(range) = range {
+                return Some(range.start);
+            }
+            continue;
+        }
+        let utf16_len = text.text().encode_utf16().count();
+        let Some(range) = range else {
             remaining = remaining.saturating_sub(utf16_len);
             continue;
         };
@@ -334,43 +240,20 @@ fn find_glyph_in_text_chunk(
 
 fn find_glyph_in_node(
     doc: DocumentRead<'_>,
-    node: html_dom::DomNodeId,
+    node: DomNodeId,
     source_offset: Option<usize>,
     allow_end: bool,
-    glyph_metrics: &crate::layout_model::GlyphMetrics,
 ) -> Option<u32> {
     match doc.document().node_ref(node)? {
-        NodeRef::Text(_) => glyph_range_for_text_node(doc, node, glyph_metrics)
-            .map(|range| apply_source_offset(range, source_offset, allow_end)),
-        NodeRef::Element(element) => {
-            if let Some(glyph) = doc
-                .render_view(glyph_metrics)
-                .text()
-                .text_runs()
-                .find_map(|run| {
-                    let box_node = doc
-                        .box_dom_element_idx(run.box_idx())
-                        .and_then(|raw| doc.document().node_id_from_raw(raw))?;
-                    (box_node == node)
-                        .then(|| apply_source_offset(run.glyphs(), source_offset, allow_end))
-                })
-            {
-                return Some(glyph);
-            }
-            element
-                .children()
-                .find_map(|child| find_glyph_in_node(doc, child, None, allow_end, glyph_metrics))
-        }
+        NodeRef::Text(text) => find_glyph_in_text_chunk(
+            doc,
+            text.parent()?,
+            doc.document().get_text_node_step(node)?,
+            source_offset,
+            allow_end,
+        ),
+        NodeRef::Element(element) => element
+            .children()
+            .find_map(|child| find_glyph_in_node(doc, child, source_offset, allow_end)),
     }
-}
-
-fn apply_source_offset(range: Range<u32>, source_offset: Option<usize>, allow_end: bool) -> u32 {
-    let maximum = if allow_end {
-        range.end
-    } else {
-        range.end.saturating_sub(1)
-    };
-    source_offset
-        .map(|offset| (range.start + offset as u32).min(maximum))
-        .unwrap_or(range.start)
 }
