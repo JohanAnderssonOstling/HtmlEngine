@@ -152,7 +152,7 @@ fn case_expansion_preserves_utf16_source_correspondence() {
         ),
         (
             TextTransform::Capitalize,
-            "SSİ😀Xß",
+            "Ssİ😀Xß",
             vec![0, 0, 0, 1, 3, 4],
             [0..2, 0..0, 2..6, 0..0],
         ),

@@ -1,4 +1,4 @@
-use super::{MemoryUsage, MemoryUsageReport};
+use super::{DocumentBuildError, MemoryUsage, MemoryUsageReport};
 use crate::storage::StringTable;
 use std::sync::Arc;
 
@@ -76,7 +76,15 @@ impl StringInterner {
     }
 
     pub fn intern(&mut self, s: &str) -> u16 {
-        self.strings.intern(s) as u16
+        self.try_intern(s).expect("DOM string capacity exhausted")
+    }
+
+    /// A failed insertion leaves the string table unchanged.
+    pub fn try_intern(&mut self, s: &str) -> Result<u16, DocumentBuildError> {
+        self.strings
+            .try_intern(s, usize::from(u16::MAX))
+            .map(|index| index as u16)
+            .ok_or(DocumentBuildError::TooManyStrings)
     }
 
     pub fn get(&self, idx: u16) -> &str {
@@ -84,7 +92,7 @@ impl StringInterner {
     }
 
     pub fn lookup(&self, s: &str) -> Option<u16> {
-        self.strings.lookup(s).map(|index| index as u16)
+        self.strings.lookup(s).and_then(|index| u16::try_from(index).ok())
     }
 
     pub fn len(&self) -> usize {

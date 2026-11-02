@@ -1,12 +1,12 @@
-use html::engine::Engine;
-use html::pipeline::{PipelineInputs, SourceRevision, StyleEnvironment};
+use html_pipeline::PipelineSession;
+use html_pipeline::{PipelineInputs, SourceRevision, StyleEnvironment};
 use html::resources::FileSystemProvider;
-use html::style::{FontFaceSource, FontFaceStyle};
+use html::text::{FontFaceSource, FontFaceStyle};
 use std::sync::Arc;
 
 #[test]
-fn engine_exposes_font_faces_before_a_text_backend_is_attached() {
-    let mut engine = Engine::new(Arc::new(FileSystemProvider::new()));
+fn pipeline_exposes_font_faces_before_a_text_backend_is_attached() {
+    let mut engine = PipelineSession::new(Arc::new(FileSystemProvider::new()));
     assert!(engine.font_faces().is_empty());
     let inputs = PipelineInputs {
         source: r#"<!doctype html><html><head><style>
@@ -29,10 +29,12 @@ fn engine_exposes_font_faces_before_a_text_backend_is_attached() {
 }
 
 fn inputs_defaults() -> PipelineInputs {
-    use html::pipeline::{
-        FontEnvironmentRevision, ImageMetricsRevision, LayoutConstraints, MarkupSyntax,
-        PaintSettingsRevision, ResourceRevision, StylesheetRevision,
+    use html_pipeline::{
+        FontEnvironmentRevision, ImageMetricsRevision, PaintSettingsRevision, ResourceRevision,
+        StylesheetRevision,
     };
+use html_pipeline::engine::LayoutConstraints;
+use html::{document::MarkupSyntax, };
     PipelineInputs {
         source: String::new().into(),
         source_revision: SourceRevision::INITIAL,
@@ -46,13 +48,7 @@ fn inputs_defaults() -> PipelineInputs {
         stylesheet_revision: StylesheetRevision::INITIAL,
         font_environment: FontEnvironmentRevision::INITIAL,
         image_metrics_revision: ImageMetricsRevision::INITIAL,
-        layout: LayoutConstraints {
-            viewport_width: 600.0,
-            viewport_height: None,
-            line_height: 16.0,
-            image_sizing_policy: html::layout::ImageSizingPolicy::WebCompatible,
-            text_composition_policy: html::layout::TextCompositionPolicy::WebCompatible,
-        },
+        layout: LayoutConstraints::new(600.0, 16.0).unwrap(),
         image_metrics: Default::default(),
         paint: PaintSettingsRevision::INITIAL,
     }
@@ -60,7 +56,8 @@ fn inputs_defaults() -> PipelineInputs {
 
 #[test]
 fn independent_reader_fonts_reach_portable_shaping_for_mixed_text() {
-    use html::pipeline::{DocumentFactory, ReaderStyleOverrides};
+    use html_pipeline::DocumentFactory;
+use html::style::ReaderStyleOverrides;
     use html::text::{
         GlyphMetric, GlyphRequest, GlyphResourceGeneration, GlyphResourceStore, GlyphShaper,
         ShapeError, ShapedGlyph,
@@ -80,14 +77,19 @@ fn independent_reader_fonts_reach_portable_shaping_for_mixed_text() {
             self.generation
         }
         fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
-            self.selected
-                .push((request.character, request.font_family.map(str::to_owned)));
-            let metric = GlyphMetric::try_new(
+            self.selected.push((
                 request.character,
-                request.font_size * 0.5,
-                request.font_size * 0.8,
-                request.font_size * 0.2,
-            )?;
+                request
+                    .style
+                    .font_family_for_character(request.character)
+                    .map(str::to_owned),
+            ));
+            let metric = GlyphMetric::new(
+                request.character,
+                request.style.font_size * 0.5,
+                request.style.font_size * 0.8,
+                request.style.font_size * 0.2,
+            );
             Ok(ShapedGlyph::from_metric(request.character as u32, metric))
         }
     }
@@ -131,7 +133,7 @@ fn independent_reader_fonts_reach_portable_shaping_for_mixed_text() {
             }
         }
     }
-    let mut engine = Engine::new(Arc::new(FileSystemProvider::new()));
+    let mut engine = PipelineSession::new(Arc::new(FileSystemProvider::new()));
     let mut inputs = inputs_defaults();
     inputs.source = "<p style='font-family:Publisher'>Latin 漢字</p>".into();
     let mut shaper = Recorder::default();
@@ -167,8 +169,9 @@ fn independent_reader_fonts_reach_portable_shaping_for_mixed_text() {
 
 #[test]
 fn mirrored_cjk_glyphs_keep_selected_fonts_and_first_line_typography() {
-    use html::layout::LayoutConstraints;
-    use html::pipeline::{DocumentFactory, ReaderStyleOverrides};
+    use html_pipeline::engine::LayoutConstraints;
+    use html_pipeline::DocumentFactory;
+use html::style::ReaderStyleOverrides;
     use html::text::{
         FontSlant, GlyphMetric, GlyphRequest, GlyphResourceStore, GlyphResources, ResourceShaper,
         ShapedGlyph,
@@ -179,17 +182,20 @@ fn mirrored_cjk_glyphs_keep_selected_fonts_and_first_line_typography() {
         |request: GlyphRequest<'_>, native: &mut GlyphResources<Selection>| {
             let handle = native.insert((
                 request.character,
-                request.font_size,
-                request.font_weight,
-                request.font_slant,
-                request.font_family.map(str::to_owned),
+                request.style.font_size,
+                request.style.font_weight,
+                request.style.font_slant,
+                request
+                    .style
+                    .font_family_for_character(request.character)
+                    .map(str::to_owned),
             ))?;
-            let metric = GlyphMetric::try_new(
+            let metric = GlyphMetric::new(
                 request.character,
-                request.font_size * 0.5,
-                request.font_size * 0.8,
-                request.font_size * 0.2,
-            )?;
+                request.style.font_size * 0.5,
+                request.style.font_size * 0.8,
+                request.style.font_size * 0.2,
+            );
             Ok(ShapedGlyph::from_metric(handle, metric))
         },
     );

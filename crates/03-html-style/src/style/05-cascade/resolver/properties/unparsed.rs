@@ -50,10 +50,6 @@ pub(super) fn apply(
                 _ => &mut style.text.word_spacing,
             } = value;
         }
-        RendererPropertyId::FontPalette => {
-            let keyword = renderer_owned::font_palette_keyword(tokens)?;
-            style.font.font_palette = (keyword != "normal").then(|| styles.intern_string(keyword));
-        }
         RendererPropertyId::WhiteSpaceCollapse => {
             style.text.white_space = renderer_owned::white_space_collapse(tokens)?
                 .with_wrapping(style.text.white_space.allows_wrap());
@@ -104,8 +100,8 @@ pub(super) fn apply(
             let mut features = font_features::parse_settings(tokens)?;
             // Stable sorting after reversing keeps the last authored value per tag.
             features.reverse();
-            features.sort_by_key(|feature| feature.tag());
-            features.dedup_by_key(|feature| feature.tag());
+            features.sort_by_key(|feature| feature.tag_bytes());
+            features.dedup_by_key(|feature| feature.tag_bytes());
             style.font.font_feature_settings = features;
         }
         RendererPropertyId::FontKerning

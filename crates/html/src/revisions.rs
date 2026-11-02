@@ -29,7 +29,7 @@ impl DocumentRevisions {
         *value = value.wrapping_add(1).max(1);
     }
 
-    pub fn invalidate_from(&mut self, stage: EarliestStage) {
+    pub(crate) fn invalidate_from(&mut self, stage: EarliestStage) {
         match stage {
             EarliestStage::Parse => {
                 Self::next(&mut self.document);
@@ -53,7 +53,7 @@ impl DocumentRevisions {
         Self::next(&mut self.paint);
     }
 
-    pub fn invalidate_resources(&mut self) {
+    pub(crate) fn invalidate_resources(&mut self) {
         Self::next(&mut self.resources);
         Self::next(&mut self.paint);
     }

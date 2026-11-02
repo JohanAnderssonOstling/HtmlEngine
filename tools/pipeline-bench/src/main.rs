@@ -1,5 +1,5 @@
-use html::pipeline::ResourceContext;
 use html::text::{GlyphRequest, ShapedGlyph};
+use html_pipeline::ResourceContext;
 mod access;
 mod book_css;
 mod counter;
@@ -8,21 +8,28 @@ mod opening;
 #[cfg(feature = "profiling")]
 mod opening_deep;
 mod queries;
-use html::layout::{
+use html::text::{
     GlyphId, GlyphMetric, GlyphResourceGeneration, GlyphResourceStore, GlyphShaper, ShapeError,
-    ShapedTextRun, TextRunShapeRequest,
 };
-use html::pipeline::*;
+use html_pipeline::engine::{LaidOutDocument, LayoutConstraints};
+use html_pipeline::{
+    DocumentFactory, FontEnvironmentRevision, ImageMetricsRevision, PaintSettingsRevision,
+    PipelineChanges, PipelineInputs, PipelineSession, ResourceRevision, SourceRevision,
+    StylesheetRevision,
+};
+use html::style::{ReaderStyleOverrides, ThemeAdaptation};
+use html::{
+    document::{MarkupSyntax, parse_document},
+    layout::TextCompositionPolicy,
+    
+};
 use html::resources::FileSystemProvider;
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
 use std::hint::black_box;
 use std::sync::Arc;
 use std::time::Instant;
-fn layout_fingerprint(
-    document: &html::layout::LaidOutDocument,
-    resources: &GlyphResourceStore,
-) -> u64 {
+fn layout_fingerprint(document: &LaidOutDocument, resources: &GlyphResourceStore) -> u64 {
     let view = document.render_view(resources);
     let text = view.text();
     let mut hash = 0xcbf29ce484222325u64;
@@ -179,7 +186,6 @@ fn layout_fingerprint(
 }
 #[derive(Default)]
 struct Shaper {
-    register_runs: bool,
     append_checkpoint: Option<usize>,
     generation: GlyphResourceGeneration,
     cache: HashMap<(char, u32), GlyphId>,
@@ -208,65 +214,19 @@ impl GlyphShaper for Shaper {
     }
     fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
         self.calls += 1;
-        let key = (request.character, request.font_size.to_bits());
-        let metric = GlyphMetric::try_new(
+        let key = (request.character, request.style.font_size.to_bits());
+        let metric = GlyphMetric::new(
             request.character,
-            request.font_size * 0.5,
-            request.font_size * 0.75,
-            request.font_size * 0.25,
-        )
-        .unwrap();
+            request.style.font_size * 0.5,
+            request.style.font_size * 0.75,
+            request.style.font_size * 0.25,
+        );
         if let Some(&glyph) = self.cache.get(&key) {
             return Ok(ShapedGlyph::from_metric(glyph, metric));
         }
         let glyph = self.cache.len() as GlyphId;
         self.cache.insert(key, glyph);
         Ok(ShapedGlyph::from_metric(glyph, metric))
-    }
-    fn shape_glyph_run(
-        &mut self,
-        request: TextRunShapeRequest<'_>,
-        glyphs: &mut [GlyphId],
-        resources: &mut GlyphResourceStore,
-    ) -> Result<Option<ShapedTextRun>, ShapeError> {
-        #[cfg(feature = "profiling")]
-        let _profile_scope = html::layout::profiling::scope("shape.mock_backend");
-        let style = request.style();
-        if self.register_runs {
-            let count = glyphs.len();
-            let geometry = ShapedTextRun::new(
-                vec![style.font_size() * 0.5; count].into(),
-                vec![true; count + 1].into(),
-            )
-            .unwrap();
-            let range = resources.register_run(
-                request.text(),
-                &geometry,
-                style.font_size() * 0.75,
-                style.font_size() * 0.25,
-            )?;
-            for (slot, glyph) in glyphs.iter_mut().zip(range) {
-                *slot = glyph;
-            }
-            return Ok(Some(geometry));
-        }
-        for (glyph, ch) in glyphs.iter_mut().zip(request.text().chars()) {
-            *glyph = resources.shape_glyph(
-                self,
-                GlyphRequest {
-                    font_stretch: 100.0,
-                    font_oblique_angle: 0.0,
-                    font_palette: None,
-                    character: ch,
-                    font_size: style.font_size(),
-                    font_weight: style.font_weight(),
-                    font_slant: style.font_slant(),
-                    font_synthesis_style: style.font_synthesis_style(),
-                    font_family: style.font_family(),
-                },
-            )?;
-        }
-        Ok(None)
     }
 }
 
@@ -288,13 +248,7 @@ fn input(source: String) -> PipelineInputs {
         style_environment: Default::default(),
         font_environment: FontEnvironmentRevision::INITIAL,
         image_metrics_revision: ImageMetricsRevision::INITIAL,
-        layout: LayoutConstraints {
-            viewport_width: 600.0,
-            viewport_height: None,
-            line_height: 16.0,
-            image_sizing_policy: Default::default(),
-            text_composition_policy: Default::default(),
-        },
+        layout: LayoutConstraints::new(600.0, 16.0).unwrap(),
         image_metrics: Default::default(),
         paint: PaintSettingsRevision::INITIAL,
     }
@@ -388,7 +342,7 @@ fn median(values: &mut [f64]) -> f64 {
     values.sort_by(f64::total_cmp);
     values[values.len() / 2]
 }
-fn source_fingerprint(doc: &html::layout::LaidOutDocument, resources: &GlyphResourceStore) -> u64 {
+fn source_fingerprint(doc: &LaidOutDocument, resources: &GlyphResourceStore) -> u64 {
     let addressing = doc.render_view(resources).addressing();
     let mut hash = 0xcbf29ce484222325u64;
     let mut mix = |value: u64| {
@@ -418,10 +372,7 @@ fn source_fingerprint(doc: &html::layout::LaidOutDocument, resources: &GlyphReso
     }
     hash
 }
-fn text_color_fingerprint(
-    document: &html::layout::LaidOutDocument,
-    resources: &GlyphResourceStore,
-) -> u64 {
+fn text_color_fingerprint(document: &LaidOutDocument, resources: &GlyphResourceStore) -> u64 {
     let text = document.render_view(resources).text();
     let mut hash = 0xcbf29ce484222325u64;
     for index in 0..text.glyph_count() {
@@ -462,7 +413,9 @@ fn main() {
     inputs.base_uri = path.clone();
     inputs.markup_syntax = MarkupSyntax::from_uri(path);
     if case.ends_with("_book") {
-        inputs.layout.text_composition_policy = TextCompositionPolicy::BookOptimized;
+        inputs.layout = inputs
+            .layout
+            .with_text_composition_policy(TextCompositionPolicy::BookOptimized);
     }
     let palette = args.get(4).map(String::as_str).unwrap_or("links");
     match palette {
@@ -472,7 +425,7 @@ fn main() {
             inputs.reader_overrides.link_foreground = None;
         }
         "theme" => {
-            inputs.reader_overrides.theme = Some(html::layout::ThemeAdaptation {
+            inputs.reader_overrides.theme = Some(ThemeAdaptation {
                 ink: 0xeeeeeeff,
                 surface: 0x222222ff,
             });
@@ -521,7 +474,7 @@ fn main() {
             let shaped_at = cpu_seconds();
             let document = shaped
                 .layout_with_metrics_and_shaper(
-                    html::layout::LayoutConstraints::new(600.0, 16.0).unwrap(),
+                    html_pipeline::engine::LayoutConstraints::new(600.0, 16.0).unwrap(),
                     &inputs.image_metrics,
                     &mut shaper,
                     &mut shaped_resources,
@@ -572,7 +525,7 @@ fn main() {
             .shape(&mut shaper, &mut doc_resources)
             .unwrap()
             .layout_with_metrics_and_shaper(
-                html::layout::LayoutConstraints::new(600.0, 16.0).unwrap(),
+                html_pipeline::engine::LayoutConstraints::new(600.0, 16.0).unwrap(),
                 &inputs.image_metrics,
                 &mut shaper,
                 &mut doc_resources,
@@ -627,12 +580,10 @@ fn main() {
             .get(index as u32)
             .unwrap_or((image.width.max(1), image.height.max(1)));
         let metric = (index as u32, width, height);
-        let revision = session.inputs().unwrap().image_metrics_revision.next();
         session
             .apply_changes(
                 PipelineChanges {
                     image_metrics: Some(metrics),
-                    image_metrics_revision: Some(revision),
                     ..Default::default()
                 },
                 &mut shaper,
@@ -663,7 +614,9 @@ fn main() {
             }
             "resize" | "handoff" | "resize_book" => {
                 let mut layout = session.inputs().unwrap().layout;
-                layout.viewport_width = if iteration % 2 == 0 { 620.0 } else { 600.0 };
+                layout = layout
+                    .with_viewport_width(if iteration % 2 == 0 { 620.0 } else { 600.0 })
+                    .unwrap();
                 changes.layout = Some(layout);
             }
             "paint" => {
@@ -693,7 +646,6 @@ fn main() {
                     },
                 );
                 changes.image_metrics = Some(metrics);
-                changes.image_metrics_revision = Some(current.image_metrics_revision.next());
             }
             _ => panic!("unknown case"),
         }

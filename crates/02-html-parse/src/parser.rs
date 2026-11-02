@@ -304,7 +304,12 @@ impl ParsedHtml {
 
     /// Move parsed text into the canonical DOM and release the syntax tree.
     pub fn into_dom(self) -> Document {
-        crate::dom::build_dom_document_owned(self).expect("parsed markup must form a valid DOM")
+        self.into_dom_checked().expect("parsed markup must form a valid DOM")
+    }
+
+    /// Move parsed text into the DOM, reporting storage capacity failures.
+    pub fn into_dom_checked(self) -> Result<Document, DocumentBuildError> {
+        crate::dom::build_dom_document_owned(self)
     }
 
     pub fn build_dom_checked(&self) -> Result<Document, DocumentBuildError> {

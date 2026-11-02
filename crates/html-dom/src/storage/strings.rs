@@ -9,6 +9,17 @@ pub struct StringTable {
 }
 
 impl StringTable {
+    /// Intern without exceeding the caller's representable index range.
+    pub fn try_intern(&mut self, value: &str, max_index: usize) -> Option<usize> {
+        if let Some(index) = self.lookup(value) {
+            return (index <= max_index).then_some(index);
+        }
+        if self.values.len() > max_index {
+            return None;
+        }
+        Some(self.values.insert_full(value.into()).0)
+    }
+
     pub fn intern(&mut self, value: &str) -> usize {
         if let Some(index) = self.lookup(value) {
             return index;

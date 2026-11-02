@@ -39,7 +39,7 @@ pub(crate) fn build_dom_document_owned(parsed: ParsedHtml) -> Result<Document, D
     };
     let mut document = DocumentBuilder::new();
     document.set_mode(mode);
-    let root_data = build_dom_syntax_element_data(&mut document, &root);
+    let root_data = build_dom_syntax_element_data(&mut document, &root)?;
     let (root_node, mut document) = document.append_dom_element(None, root_data)?;
     build_dom_owned_children(&mut document, root.children, root_node)?;
     document.set_dom_root(root_node)?.finish()
@@ -53,7 +53,7 @@ fn build_dom_owned_children(
     for child in children {
         match child {
             HtmlSyntaxNode::Element(element) => {
-                let data = build_dom_syntax_element_data(document, &element);
+                let data = build_dom_syntax_element_data(document, &element)?;
                 let node = document.append_dom_element(Some(parent), data)?;
                 build_dom_owned_children(document, element.children, node)?;
             }
@@ -79,7 +79,7 @@ fn build_dom_from_syntax_tree(
 
     let mut document = DocumentBuilder::new();
     document.set_mode(mode);
-    let root_data = build_dom_syntax_element_data(&mut document, root);
+    let root_data = build_dom_syntax_element_data(&mut document, root)?;
     let (root_node, mut document) = document.append_dom_element(None, root_data)?;
     build_dom_syntax_children(&mut document, &root.children, root_node)?;
     document.set_dom_root(root_node)?.finish()
@@ -93,7 +93,7 @@ fn build_dom_syntax_children(
     for child in children {
         match child {
             HtmlSyntaxNode::Element(element) => {
-                let data = build_dom_syntax_element_data(document, element);
+                let data = build_dom_syntax_element_data(document, element)?;
                 let node = document.append_dom_element(Some(parent), data)?;
                 build_dom_syntax_children(document, &element.children, node)?;
             }
@@ -116,16 +116,16 @@ fn build_dom_syntax_children(
 fn build_dom_syntax_element_data<State>(
     document: &mut DocumentBuilder<State>,
     element: &HtmlSyntaxElement,
-) -> DomElementData {
-    let tag = document.intern_string(&element.local_name);
+) -> Result<DomElementData, DocumentBuildError> {
+    let tag = document.try_intern_string(&element.local_name)?;
     let namespace = element
         .namespace
         .as_deref()
-        .map(|namespace| document.intern_string(namespace));
+        .map(|namespace| document.try_intern_string(namespace)).transpose()?;
     let id = element
         .attribute("id")
-        .map(|value| document.intern_string(value));
-    let classes = document.intern_classes(element.attribute("class"));
+        .map(|value| document.try_intern_string(value)).transpose()?;
+    let classes = document.try_intern_classes(element.attribute("class"))?;
     let source = element
         .attribute("src")
         .or_else(|| element.attribute("href"))
@@ -175,26 +175,23 @@ fn build_dom_syntax_element_data<State>(
             height_attr,
         })
     });
-    let attributes = element
-        .attributes
-        .iter()
-        .map(|attribute| DomAttribute {
-            name: document.intern_string(&attribute.name),
-            local_name: document.intern_string(&attribute.local_name),
-            namespace: attribute
-                .namespace
-                .as_deref()
-                .map(|namespace| document.intern_string(namespace)),
-            value: document.intern_string(&attribute.value),
-        })
-        .collect();
-    DomElementData {
+    let mut attributes = Vec::with_capacity(element.attributes.len());
+    for attribute in &element.attributes {
+        attributes.push(DomAttribute {
+            name: document.try_intern_string(&attribute.name)?,
+            local_name: document.try_intern_string(&attribute.local_name)?,
+            namespace: attribute.namespace.as_deref()
+                .map(|namespace| document.try_intern_string(namespace)).transpose()?,
+            value: document.try_intern_string(&attribute.value)?,
+        });
+    }
+    Ok(DomElementData {
         tag,
         namespace,
         attributes,
         attribute_cache: DomElementAttributeCache::new(id, classes),
         image_idx,
-    }
+    })
 }
 
 fn serialize_foreign_syntax_element(element: &HtmlSyntaxElement) -> String {

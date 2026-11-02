@@ -1,11 +1,11 @@
 use crate::parser::DocumentFactory;
 use crate::test_support::TestGlyphShaper;
 use crate::{
-    FontMetricsRequest, FontRelativeMetrics, GlyphResourceGeneration, GlyphResourceStore,
-    GlyphShaper, LaidOutDocument, LayoutConstraints, ShapeError, ShapedTextRun,
-    TextCompositionPolicy, TextRunShapeRequest,
+    FontRelativeMetrics, GlyphResourceGeneration, GlyphResourceStore, GlyphShaper, LaidOutDocument,
+    LayoutConstraints, ShapeError, ShapedTextRun, ShapingStyle, TextCompositionPolicy,
+    TextRunShapeRequest,
 };
-use crate::{GlyphRequest, ShapedGlyph};
+use crate::{GlyphRequest, ShapedGlyph, ShapedRun};
 use std::sync::Arc;
 
 #[derive(Default)]
@@ -19,11 +19,11 @@ struct RecordingShaper {
 impl GlyphShaper for RecordingShaper {
     fn font_relative_metrics(
         &mut self,
-        request: FontMetricsRequest<'_>,
+        request: &ShapingStyle<'_>,
     ) -> Result<FontRelativeMetrics, ShapeError> {
         self.metric_languages.push(
             request
-                .language()
+                .language
                 .map(|language| language.as_str().to_owned()),
         );
         Ok(FontRelativeMetrics::fallback())
@@ -46,25 +46,25 @@ impl GlyphShaper for RecordingShaper {
     fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
         self.fallback.shape_glyph(request)
     }
-    fn shape_text_run(
+    fn shape_run(
         &mut self,
         request: TextRunShapeRequest<'_>,
-    ) -> Result<Option<ShapedTextRun>, ShapeError> {
+    ) -> Result<Option<ShapedRun>, ShapeError> {
         self.languages.push((
             request.text().to_owned(),
             request
                 .style()
-                .language()
+                .language
                 .map(|language| language.as_str().to_owned()),
         ));
         if self.cluster_text == Some(request.text()) {
             let count = request.text().chars().count();
             let mut boundaries = vec![true; count + 1];
             boundaries[1] = false;
-            return Ok(ShapedTextRun::new(
+            return Ok(Some(ShapedRun::geometry(ShapedTextRun::new(
                 Arc::from(vec![10.0; count]),
                 Arc::from(boundaries),
-            ));
+            ))));
         }
         Ok(None)
     }

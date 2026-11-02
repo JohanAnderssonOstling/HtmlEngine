@@ -3,7 +3,7 @@
 //! matches DOM nodes, manages caches, or invokes the coordinator.
 use crate::style::environment::{MediaEnvironment, MediaQuerySet};
 use crate::style::property_catalogue::PropertyKey;
-use crate::style::source::fonts::{FontFace, FontPalette};
+use crate::style::source::fonts::FontFace;
 use lightningcss::rules::style::StyleRule;
 use lightningcss::selector::SelectorList;
 use lightningcss::values::ident::Ident;
@@ -221,7 +221,6 @@ pub(crate) struct PreparedRuleSet<'css> {
     pub(super) text_spacing_values: Option<Arc<PreparedTextSpacing>>,
     pub(super) media_queries: MediaQuerySet,
     pub(super) font_faces: Arc<[FontFace]>,
-    pub(super) font_palettes: Option<Arc<[FontPalette]>>,
     pub(super) environment: MediaEnvironment,
 }
 

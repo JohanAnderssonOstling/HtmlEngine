@@ -147,7 +147,7 @@ mod tests {
             };
             glyphs.push(
                 metrics
-                    .register(GlyphMetric::try_new(character, advance, 12.0, 4.0).unwrap())
+                    .register(GlyphMetric::new(character, advance, 12.0, 4.0))
                     .unwrap(),
             );
         }
@@ -203,8 +203,7 @@ mod tests {
             ShapedTextRun::new(
                 vec![5.0, 0.0, 9.0].into(),
                 vec![true, false, true, true].into(),
-            )
-            .unwrap(),
+            ),
             false,
         );
         geometry.finish_runs();

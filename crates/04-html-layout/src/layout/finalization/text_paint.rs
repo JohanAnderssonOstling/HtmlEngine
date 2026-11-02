@@ -156,13 +156,24 @@ mod tests {
             let mut glyphs = Vec::new();
             for (index, character) in source.chars().enumerate() {
                 content.push_character(character);
-                glyphs.push(metrics.register(GlyphMetric::try_new(character,
-                    if index == 2 { 0.0 } else { 8.0 }, 12.0, 4.0).unwrap()).unwrap());
+                glyphs.push(
+                    metrics
+                        .register(GlyphMetric::new(
+                            character,
+                            if index == 2 { 0.0 } else { 8.0 },
+                            12.0,
+                            4.0,
+                        ))
+                        .unwrap(),
+                );
             }
             let native = ShapedTextRun::with_backend_run(
-                vec![8.0, 8.0, 0.0, 8.0, 8.0].into(), vec![true; 6].into(), 0,
-                vec![0.0, 8.0, 16.0, 16.0, 24.0, 32.0].into(), 12.0,
-            ).unwrap();
+                vec![8.0, 8.0, 0.0, 8.0, 8.0].into(),
+                vec![true; 6].into(),
+                0,
+                vec![0.0, 8.0, 16.0, 16.0, 24.0, 32.0].into(),
+                12.0,
+            );
             let mut geometry = ShapedTextGeometry::with_len(5);
             geometry.push_run(&[0, 1, 2, 3, 4], native, true);
             geometry.finish_runs();

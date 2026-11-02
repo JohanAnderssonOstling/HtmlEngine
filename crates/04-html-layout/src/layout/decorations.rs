@@ -2,7 +2,7 @@ use super::border_geometry::emit_border_fragments;
 use super::paint_program::{PaintCommand, PaintLayers, PaintOperation, PaintStyleSource};
 use crate::layout::{FragmentWriter, LayoutEngine};
 use crate::layout_model::{BoxGeometry, DecorationFragment, InlineContent, RoundedDecoration};
-use html_style_model::UsedBorderRadii;
+use html_style_model::CornerRadii;
 use kurbo::Rect;
 
 /// Paint reads finalized geometry and writes decoration output only.
@@ -18,7 +18,7 @@ impl DecorationEmitter<'_, '_, '_> {
     pub(super) fn emit_solid_border(
         &mut self,
         rect: Rect,
-        radii: UsedBorderRadii,
+        radii: CornerRadii,
         uniform_border: Option<(f64, u32)>,
         borders: [Option<(f64, u32)>; 4],
         is_inline: bool,
@@ -44,7 +44,7 @@ impl DecorationEmitter<'_, '_, '_> {
         rect: Rect,
         color: u32,
         is_inline: bool,
-        radii: Option<UsedBorderRadii>,
+        radii: Option<CornerRadii>,
     ) {
         if let Some(radii) = radii {
             let rounded = RoundedDecoration {

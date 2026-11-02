@@ -14,17 +14,20 @@ use html_layout as layout;
 use html_shape as shaping;
 mod stages;
 pub use html_engine_model::{
-    ContentLanguage, FontMetrics, FontMetricsRequest, FontRelativeMetrics, FontSlant, GlyphHandle,
-    GlyphId, GlyphMetric, GlyphMetricError, GlyphRequest, GlyphResourceCheckpoint,
+    CapsSynthesis, ContentLanguage, FontFeatures, FontMetrics, FontRelativeMetrics, FontSlant,
+    ObliqueAngle, GlyphHandle, GlyphId, GlyphMetric, GlyphRequest, GlyphResourceCheckpoint,
     GlyphResourceGeneration, GlyphResourceStore, GlyphResources, GlyphShaper, GlyphSlice,
-    PreparedTextRunFragment, ResourceShaper, ShapeError, ShapedGlyph, ShapedLine, ShapedTextRun,
-    TextDirection, TextRunId, TextRunShapeRequest, TextShapeRequest, TextStyleSpan,
+    CursiveJoining, PreparedTextRunFragment, ResourceShaper, RunFontMetrics, ShapeError,
+    ShapedGlyph, ShapedLine, ShapedRun, ShapedTextRun, ShapingStyle, TextDirection, TextRunId,
+    TextRunShapeRequest, TextStyleSpan,
 };
 pub use html_layout::LayoutTimings;
+pub use html_engine_model::NativeResourceCheckpoint;
 pub use stages::{
-    DetachedLayout, FormattingDocument, LaidOutDocument, NoteLayout, PreparedDocument,
-    ReadingFragment, ReadingTarget, RenderExportView, RenderTable, RenderView, ShapeLayoutTimings,
-    ShapedDocument, TextPatternMatch, TextPatternMatcher, TextSearchOptions, find_text_matches, text_matches,
+    DetachedLayout, FormattingDocument, LaidOutDocument, LayoutConstraintError, LayoutRequest,
+    NoteLayout, PreparedDocument, ReadingFragment, ReadingTarget, RenderExportView, RenderTable,
+    RenderResourceLease, RenderView, ShapeLayoutTimings, ShapedDocument, TextPatternMatch,
+    TextPatternMatcher, TextSearchOptions, find_text_matches, text_matches,
 };
 
 /// Document lifecycle and render capabilities, orchestrated above the stage crates.
@@ -33,16 +36,16 @@ pub mod engine {
     #[cfg(feature = "profiling")]
     pub use html_engine_model::profiling;
     pub use html_engine_model::{
-        CaretCursor, CaretIter, CaretPositions, CharacterPlacement, ContentLanguage, FontMetrics,
-        FontMetricsRequest, FontRelativeMetrics,
-        FontSlant, FontStyle, GlyphHandle, GlyphId, GlyphMetric, GlyphMetricError, GlyphRequest,
-        GlyphResourceCheckpoint, GlyphResourceGeneration, GlyphResourceStore, GlyphResources,
-        GlyphShaper, GlyphSlice, LanguageTag, LineCharacterPlacement, LineId, LineTextPlacement,
-        ListStylePosition, OpenTypeFeature,
-        PreparedTextRunFragment, ReaderStyleOverrides, ResourceShaper, ShapeError, ShapedGlyph,
-        ShapedLine, ShapedTextRun, StyleStringId, TextAlign, TextDecorationLines, TextDirection,
-        TextRunId, TextRunShapeRequest, TextShapeRequest, TextStyleSpan, ThemeAdaptation,
-        UnicodeBidi, UsedBorderRadii,
+        CapsSynthesis, FontFeatures, CaretCursor, CaretIter, CaretPositions, ContentLanguage,
+        CornerRadii, FontMetrics, FontRelativeMetrics, FontSlant, ObliqueAngle, FontStyle,
+        GlyphHandle, GlyphId, GlyphMetric, GlyphRequest, GlyphResourceCheckpoint,
+        GlyphResourceGeneration, GlyphResourceStore, GlyphResources, GlyphShaper, GlyphSlice,
+        CursiveJoining, LanguageTag, LineCharacterPlacement, LineId, LineTextPlacement,
+        ListStylePosition, NativeResourceCheckpoint, OpenTypeFeature, OpenTypeFeatureKind,
+        PreparedTextRunFragment, ReaderStyleOverrides, ResourceShaper, RunFontMetrics, ShapeError,
+        ShapedGlyph, ShapedLine, ShapedRun, ShapedTextRun, ShapingStyle, StyleStringId, TextAlign,
+        TextDecorationLines, TextDirection, TextRunId, TextRunShapeRequest, TextStyleSpan,
+        ThemeAdaptation, UnicodeBidi,
     };
     pub use html_layout::LayoutTimings;
 }
@@ -61,14 +64,14 @@ pub use parser::{
     ResourceContext, ResourceDocumentFactory,
 };
 pub use session::{
-    ActivePipelineSession, CacheEntry, OwnedActivePipelineSession, PipelineCacheState,
+    ActivePipelineSession, OwnedActivePipelineSession,
     PipelineSession,
 };
 pub use types::{
     EarliestStage, FontEnvironmentRevision, ImageMetricsRevision, LayoutConstraints,
-    PaintSettingsRevision, PipelineCacheKey, PipelineChange, PipelineChangeMask, PipelineChanges,
-    PipelineError, PipelineInputs, PipelineUpdate, ResourceRevision, Reuse, ReuseReport,
-    SourceRevision, StyleCacheEnvironment, StyleEnvironment, StylesheetRevision,
+    PaintSettingsRevision, PipelineChanges, PipelineError, PipelineErrorKind, PipelineInputs,
+    PipelineUpdate, ResourceRevision, Reuse, ReuseReport, SourceRevision, StyleEnvironment,
+    StylesheetRevision,
 };
 
 #[cfg(test)]

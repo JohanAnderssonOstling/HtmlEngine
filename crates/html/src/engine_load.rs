@@ -1,14 +1,20 @@
 //! Provider-backed loading for the public engine facade.
 
+use crate::configuration::normalized_font_size;
 use crate::document::read_document_source;
 use crate::engine::{Engine, Error};
-use crate::layout::GlyphShaper;
-use crate::pipeline::{
-    FontEnvironmentRevision, ImageMetricsRevision, ImageSizingPolicy, LayoutConstraints,
-    MediaEnvironment, NoteFlow, PaintSettingsRevision, PipelineInputs, ReaderStyleOverrides,
-    ResourceRevision, SourceRevision, StyleEnvironment, StylesheetRevision, TextCompositionPolicy,
+use crate::text::GlyphShaper;
+use crate::{
+    layout::{ImageSizingPolicy, NoteFlow, TextCompositionPolicy},
+    pipeline::{
+        FontEnvironmentRevision, ImageMetricsRevision, PaintSettingsRevision, PipelineInputs,
+        ResourceRevision, SourceRevision, StyleEnvironment, StylesheetRevision,
+    },
+    style::ReaderStyleOverrides,
 };
 use crate::resources::ResourceProvider;
+use html_style::MediaEnvironment;
+use html_pipeline::engine::LayoutConstraints;
 use std::sync::Arc;
 use std::time::Duration;
 use web_time::Instant;
@@ -38,8 +44,7 @@ impl LoadTimings {
 /// Pagination, columns, and publication identity are outside this API.
 #[derive(Clone, Debug)]
 pub struct DocumentOptions {
-    pub width: f64,
-    pub root_font_size: f32,
+    style_environment: StyleEnvironment,
     pub user_styles: Vec<String>,
     pub reader_overrides: ReaderStyleOverrides,
     pub image_sizing_policy: ImageSizingPolicy,
@@ -48,32 +53,38 @@ pub struct DocumentOptions {
 }
 
 impl DocumentOptions {
-    pub fn new(width: f64) -> Self {
-        Self {
-            width,
-            root_font_size: 16.0,
+    /// Validate the available width before any resource is read. Zero is valid
+    /// for hosts that prepare documents before their viewport is measured.
+    pub fn new(width: f64) -> Result<Self, Error> {
+        let media = MediaEnvironment::screen(width, None)
+            .ok_or_else(|| Error::message("document width must be finite and nonnegative"))?;
+        Ok(Self {
+            style_environment: StyleEnvironment {
+                media,
+                ..StyleEnvironment::default()
+            },
             user_styles: Vec::new(),
             reader_overrides: ReaderStyleOverrides::default(),
             image_sizing_policy: ImageSizingPolicy::WebCompatible,
             text_composition_policy: TextCompositionPolicy::WebCompatible,
             note_flow: NoteFlow::InFlow,
-        }
+        })
+    }
+
+    /// Reject non-finite or non-positive sizes, then apply the loader's
+    /// whole-pixel rounding with a minimum of one pixel.
+    pub fn with_root_font_size(mut self, size: f32) -> Result<Self, Error> {
+        self.style_environment.root_font_size = normalized_font_size(size)?;
+        Ok(self)
     }
 
     /// Read and decode a resource, honoring its declared charset and media type.
     /// Linked and inline CSS are handled by the engine during preparation.
     ///
-    /// Most consumers should use [`Engine::load`] or [`Engine::prepare`]. This
-    /// lower-level entry point lets adapters instrument loading or customize
-    /// pipeline revisions before submitting the initial inputs.
-    pub fn read(self, provider: &dyn ResourceProvider, uri: &str) -> Result<PipelineInputs, Error> {
-        let media = MediaEnvironment::screen(self.width, None)
-            .ok_or_else(|| Error("document width must be finite and positive".into()))?;
-        if !self.root_font_size.is_finite() || self.root_font_size <= 0.0 {
-            return Err(Error("root font size must be finite and positive".into()));
-        }
+    /// Resource decoding and initial pipeline revisions are engine-owned.
+    pub(crate) fn read(self, provider: &dyn ResourceProvider, uri: &str) -> Result<PipelineInputs, Error> {
         let (source, markup_syntax) = read_document_source(provider, uri)
-            .map_err(|error| Error(format!("failed to load HTML resource {uri}: {error}")))?;
+            .map_err(|error| Error::from(error).with_context(format!("failed to load HTML resource {uri}")))?;
         Ok(PipelineInputs {
             source,
             markup_syntax,
@@ -84,20 +95,15 @@ impl DocumentOptions {
             base_uri: uri.to_owned(),
             resource_revision: ResourceRevision::INITIAL,
             stylesheet_revision: StylesheetRevision::INITIAL,
-            style_environment: StyleEnvironment {
-                root_font_size: self.root_font_size.max(1.0).round() as u32,
-                media,
-                direction: 0,
-            },
+            style_environment: self.style_environment,
             font_environment: FontEnvironmentRevision::INITIAL,
             image_metrics_revision: ImageMetricsRevision::INITIAL,
-            layout: LayoutConstraints {
-                viewport_width: self.width,
-                viewport_height: None,
-                line_height: f64::from(self.root_font_size),
-                image_sizing_policy: self.image_sizing_policy,
-                text_composition_policy: self.text_composition_policy,
-            },
+            layout: LayoutConstraints::new(
+                self.style_environment.media.viewport_width(),
+                f64::from(self.style_environment.root_font_size.get() as u32),
+            )?
+                .with_image_sizing_policy(self.image_sizing_policy)
+                .with_text_composition_policy(self.text_composition_policy),
             image_metrics: Default::default(),
             paint: PaintSettingsRevision::INITIAL,
         })
@@ -117,7 +123,7 @@ impl Engine {
         let start = Instant::now();
         let mut engine = Self::new(provider);
         engine.update(inputs, shaper)
-            .map_err(|error| Error(format!("failed to render document {uri}: {error}")))?;
+            .map_err(|error| error.with_context(format!("failed to render document {uri}")))?;
         Ok((
             engine,
             LoadTimings {
@@ -137,14 +143,15 @@ impl Engine {
         let inputs = options.read(provider.as_ref(), uri)?;
         let mut engine = Self::new(provider);
         engine.update(inputs, shaper)
-            .map_err(|error| Error(format!("failed to render document {uri}: {error}")))?;
+            .map_err(|error| error.with_context(format!("failed to render document {uri}")))?;
         Ok(engine)
     }
 
     /// Load and style a document without a platform text backend.
     ///
-    /// Inspect [`Self::font_faces`] and load fonts on the host, then finish with
-    /// [`Self::rehydrate_glyphs`] on the thread owning the shaper. Preparation
+    /// Inspect [`Self::font_faces`] and load fonts on the host, then submit a
+    /// default [`crate::configuration::DocumentUpdate`] to
+    /// [`Self::apply`] on the thread owning the shaper. Preparation
     /// can run on a worker; it creates no pagination or UI state.
     pub fn prepare(
         provider: Arc<dyn ResourceProvider>,
@@ -154,7 +161,7 @@ impl Engine {
         let inputs = options.read(provider.as_ref(), uri)?;
         let mut engine = Self::new(provider);
         engine.prepare_through_style(inputs)
-            .map_err(|error| Error(format!("failed to prepare document {uri}: {error}")))?;
+            .map_err(|error| error.with_context(format!("failed to prepare document {uri}")))?;
         Ok(engine)
     }
 }
@@ -219,6 +226,7 @@ mod tests {
     fn document_and_search_loading_share_encoding_syntax_and_one_metadata_snapshot() {
         let provider = CountingProvider::default();
         let inputs = DocumentOptions::new(600.0)
+            .unwrap()
             .read(&provider, "chapter.html")
             .unwrap();
         assert_eq!(provider.reads.load(Ordering::Relaxed), 1);
@@ -238,6 +246,7 @@ mod tests {
             ..Default::default()
         };
         let inputs = DocumentOptions::new(600.0)
+            .unwrap()
             .read(&provider, "chapter.xhtml")
             .unwrap();
         assert_eq!(inputs.markup_syntax, MarkupSyntax::Xhtml);
@@ -259,6 +268,7 @@ mod tests {
             ..Default::default()
         };
         let error = DocumentOptions::new(600.0)
+            .unwrap()
             .read(&provider, "chapter.html")
             .err()
             .unwrap();
@@ -274,8 +284,17 @@ mod tests {
 
     #[test]
     fn preparation_errors_identify_the_resource_and_source_location() {
-        let provider = Arc::new(CountingProvider { malformed_xml: true, ..Default::default() });
-        let error = super::Engine::prepare(provider, "OPS/chapter2.xml", DocumentOptions::new(600.0)).err().unwrap();
+        let provider = Arc::new(CountingProvider {
+            malformed_xml: true,
+            ..Default::default()
+        });
+        let error = super::Engine::prepare(
+            provider,
+            "OPS/chapter2.xml",
+            DocumentOptions::new(600.0).unwrap(),
+        )
+        .err()
+        .unwrap();
         let diagnostic = error.to_string();
         assert!(diagnostic.contains("failed to prepare document OPS/chapter2.xml"), "{diagnostic}");
         assert!(diagnostic.contains("line 2, column"), "{diagnostic}");

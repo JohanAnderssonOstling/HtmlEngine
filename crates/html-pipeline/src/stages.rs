@@ -25,9 +25,10 @@ pub use output::{
     RenderGlyphOffsetRuns, RenderHyphenFragment, RenderImageFragment, RenderImageFragments,
     RenderLine, RenderLineTextFragment, RenderLineTextFragments, RenderLines, RenderListItemMarker,
     RenderOverflowClip, RenderPaintItem, RenderSemanticsView, RenderTable, RenderTableCell,
-    RenderTableRow, RenderTextRun, RenderTextRuns, RenderTextView, RenderView, SourceElementStep,
-    SourceLocation, SourcePosition, TextPatternMatch, TextPatternMatcher, TextSearchOptions,
-    find_text_matches, is_navigation_section_title, merge_text_ranges, text_matches,
+    RenderTableRow, RenderTextRun, RenderTextRuns, RenderTextView, RenderResourceLease, RenderView,
+    SourceElementStep, SourceLocation, SourcePosition, TextPatternMatch, TextPatternMatcher,
+    TextSearchOptions, find_text_matches, is_navigation_section_title, merge_text_ranges,
+    text_matches,
 };
 #[path = "stages/lifecycle.rs"]
 mod lifecycle;
@@ -43,7 +44,7 @@ mod semantics;
 pub(crate) use html_dom::element_is_note_target;
 pub(crate) use html_engine_model::TextPaintRange;
 pub use lifecycle::{
-    DetachedLayout, FormattingDocument, LaidOutDocument, NoteLayout, PreparedDocument,
+    DetachedLayout, FormattingDocument, LaidOutDocument, LayoutRequest, NoteLayout, PreparedDocument,
     ShapeLayoutTimings, ShapedDocument,
 };
 pub(crate) use lifecycle::{FirstLineRefinement, PreparedInputs, ShapedText};

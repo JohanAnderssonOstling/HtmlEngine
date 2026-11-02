@@ -1271,7 +1271,7 @@ fn feature_settings_at(css: &str, inline: &str, width: f64) -> (Vec<([u8; 4], u3
     (
         font.font_feature_settings
             .iter()
-            .map(|feature| (feature.tag(), feature.value()))
+            .map(|feature| (feature.tag_bytes(), feature.value()))
             .collect(),
         queries.uses_viewport_units(),
     )

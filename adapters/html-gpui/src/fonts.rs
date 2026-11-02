@@ -1,7 +1,7 @@
 //! Per-reader CSS aliases over private platform font families.
 use gpui::{Font, FontFallbacks, FontStyle, FontVariations, FontWeight, WindowTextSystem, font};
-use html::pipeline::ReaderStyleOverrides;
-use html::style::{FontFace, FontFaceStyle, FontSynthesisStyle};
+use html::style::ReaderStyleOverrides;
+use html::text::{FontFace, FontFaceStyle, FontSynthesisStyle};
 use std::ops::RangeInclusive;
 use html::text::FontSlant;
 use html_fonts::{LoadedFontFace, face_key};
@@ -58,12 +58,6 @@ impl PublicationFonts {
 
     pub fn has_loaded_active_faces(&self) -> bool {
         self.active_keys.iter().any(|key| self.loaded.contains_key(key))
-    }
-
-    pub(crate) fn family_matches(&self, registered: &str, authored: &str) -> bool {
-        registered.eq_ignore_ascii_case(authored) || self.active.iter().zip(&self.active_keys)
-            .any(|(face, key)| face.family.eq_ignore_ascii_case(authored)
-                && self.loaded.get(key).is_some_and(|loaded| loaded.family == registered))
     }
 
     /// Installed faces have an unrestricted CSS range, even if their cmap
@@ -125,7 +119,6 @@ impl PublicationFonts {
         weight: u16,
         slant: FontSlant,
         stretch: f32,
-        oblique_angle: f32,
         synthesis: FontSynthesisStyle,
     ) -> Option<Font> {
         let mut candidates = self
@@ -152,11 +145,7 @@ impl PublicationFonts {
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| style_rank(&a.style).cmp(&style_rank(&b.style)))
                 .then_with(|| {
-                    oblique_distance(&a.style, slant, oblique_angle).total_cmp(&oblique_distance(
-                        &b.style,
-                        slant,
-                        oblique_angle,
-                    ))
+                    oblique_distance(&a.style, slant).total_cmp(&oblique_distance(&b.style, slant))
                 })
                 .then_with(|| {
                     weight_rank(a, weight)
@@ -172,22 +161,26 @@ impl PublicationFonts {
         } else {
             f32::from(loaded.weight)
         });
-        let (effective_slant, angle) = if selected.style_explicit {
+        let (effective_style, angle) = if selected.style_explicit {
             match &selected.style {
                 FontFaceStyle::Oblique(range) => {
-                    let angle = if slant == FontSlant::Normal { 0.0 }
-                        else if slant == FontSlant::Italic { 14.0 } else { oblique_angle };
-                    (FontSlant::Oblique, Some(angle.clamp(*range.start(), *range.end())))
+                    let angle = match slant {
+                        FontSlant::Normal => 0.0,
+                        FontSlant::Italic => 14.0,
+                        FontSlant::Oblique { angle } => angle.degrees(),
+                    };
+                    (
+                        FontStyle::Oblique,
+                        Some(angle.clamp(*range.start(), *range.end())),
+                    )
                 }
-                FontFaceStyle::Italic => (FontSlant::Italic, None),
-                FontFaceStyle::Normal => (slant, (slant == FontSlant::Oblique).then_some(oblique_angle)),
+                FontFaceStyle::Italic => (FontStyle::Italic, None),
+                FontFaceStyle::Normal => native_slant(slant),
             }
-        } else { (slant, (slant == FontSlant::Oblique).then_some(oblique_angle)) };
-        resolved.style = match effective_slant {
-            FontSlant::Normal => FontStyle::Normal,
-            FontSlant::Italic => FontStyle::Italic,
-            FontSlant::Oblique => FontStyle::Oblique,
+        } else {
+            native_slant(slant)
         };
+        resolved.style = effective_style;
         let width = width_range(selected, loaded);
         resolved.variations = FontVariations::new(stretch.clamp(*width.start(), *width.end()), angle)
             .unwrap_or_default()
@@ -226,8 +219,18 @@ fn stretch_rank(stretch: &RangeInclusive<f32>, requested: f32) -> (u8, f32) {
     }
 }
 
-fn oblique_distance(style: &FontFaceStyle, slant: FontSlant, angle: f32) -> f32 {
-    if let (FontSlant::Oblique, FontFaceStyle::Oblique(range)) = (slant, style) {
+/// Translate the engine's resolved posture at the native font boundary.
+pub(crate) fn native_slant(slant: FontSlant) -> (FontStyle, Option<f32>) {
+    match slant {
+        FontSlant::Normal => (FontStyle::Normal, None),
+        FontSlant::Italic => (FontStyle::Italic, None),
+        FontSlant::Oblique { angle } => (FontStyle::Oblique, Some(angle.degrees())),
+    }
+}
+
+fn oblique_distance(style: &FontFaceStyle, slant: FontSlant) -> f32 {
+    if let (FontSlant::Oblique { angle }, FontFaceStyle::Oblique(range)) = (slant, style) {
+        let angle = angle.degrees();
         (angle - angle.clamp(*range.start(), *range.end())).abs()
     } else {
         0.0
@@ -236,8 +239,11 @@ fn oblique_distance(style: &FontFaceStyle, slant: FontSlant, angle: f32) -> f32 
 
 fn style_rank(style: &FontFaceStyle, requested: FontSlant) -> u8 {
     match (requested, style) {
-        (FontSlant::Normal, FontFaceStyle::Normal) | (FontSlant::Italic, FontFaceStyle::Italic) | (FontSlant::Oblique, FontFaceStyle::Oblique(_)) => 0,
-        (FontSlant::Normal | FontSlant::Italic, FontFaceStyle::Oblique(_)) | (FontSlant::Oblique, FontFaceStyle::Normal) => 1,
+        (FontSlant::Normal, FontFaceStyle::Normal)
+        | (FontSlant::Italic, FontFaceStyle::Italic)
+        | (FontSlant::Oblique { .. }, FontFaceStyle::Oblique(_)) => 0,
+        (FontSlant::Normal | FontSlant::Italic, FontFaceStyle::Oblique(_))
+        | (FontSlant::Oblique { .. }, FontFaceStyle::Normal) => 1,
         _ => 2,
     }
 }
@@ -315,7 +321,13 @@ mod tests {
         registry.set_active(&[regular, bold]);
         assert_eq!(
             registry
-                .resolve("publisher", 400, FontSlant::Normal, 100.0, 14.0, FontSynthesisStyle::Auto)
+                .resolve(
+                    "publisher",
+                    400,
+                    FontSlant::Normal,
+                    100.0,
+                    FontSynthesisStyle::Auto
+                )
                 .unwrap()
                 .family
                 .as_ref(),
@@ -323,7 +335,13 @@ mod tests {
         );
         assert_eq!(
             registry
-                .resolve("Publisher", 700, FontSlant::Normal, 100.0, 14.0, FontSynthesisStyle::Auto)
+                .resolve(
+                    "Publisher",
+                    700,
+                    FontSlant::Normal,
+                    100.0,
+                    FontSynthesisStyle::Auto
+                )
                 .unwrap()
                 .family
                 .as_ref(),
@@ -332,7 +350,13 @@ mod tests {
         registry.set_active(&[]);
         assert!(
             registry
-                .resolve("Publisher", 400, FontSlant::Normal, 100.0, 14.0, FontSynthesisStyle::Auto)
+                .resolve(
+                    "Publisher",
+                    400,
+                    FontSlant::Normal,
+                    100.0,
+                    FontSynthesisStyle::Auto
+                )
                 .is_none()
         );
     }

@@ -3,13 +3,14 @@ use anyhow::{Context as _, Result};
 use data_url::DataUrl;
 use gpui::{ContentMask, IntoElement, Window, canvas, div, prelude::*, px, rgb};
 use html::engine::Engine;
-use html::pipeline::{
-    FontEnvironmentRevision, ImageMetricsRevision, ImageSizingPolicy, LayoutConstraints,
-    MarkupSyntax, MediaEnvironment, PaintSettingsRevision, PipelineChanges, PipelineInputs,
-    ResourceRevision, SourceRevision, StyleEnvironment, StylesheetRevision, TextCompositionPolicy,
-};
-use html::render::{
-    DocumentPainter, FragmentImagePolicy, FragmentRenderOptions,
+use html::{
+    document::MarkupSyntax,
+    layout::LayoutConstraints,
+    pipeline::{
+        FontEnvironmentRevision, ImageMetricsRevision, PaintSettingsRevision, PipelineChanges,
+        PipelineInputs, ResourceRevision, SourceRevision, StyleEnvironment, StylesheetRevision,
+    },
+    style::MediaEnvironment,
 };
 use html::resources::{FileSystemProvider, ImagePipeline, ResourceProvider};
 use html_gpui::backend::{
@@ -113,25 +114,21 @@ impl DocumentView {
             resource_revision: ResourceRevision::INITIAL,
             stylesheet_revision: StylesheetRevision::INITIAL,
             style_environment: StyleEnvironment {
-                root_font_size: 16,
+                root_font_size: Default::default(),
                 media: MediaEnvironment::screen(
                     f64::from(options.width),
                     Some(f64::from(options.height)),
                 )
                 .context("invalid media dimensions")?,
-                direction: 0,
             },
             font_environment: FontEnvironmentRevision::INITIAL,
             image_metrics_revision: ImageMetricsRevision::INITIAL,
-            layout: LayoutConstraints {
-                viewport_width: f64::from(options.width),
+            layout: LayoutConstraints::new(f64::from(options.width), 16.0)?
                 // Screen media keeps the window height above. An unbounded
                 // flow height disables page fragmentation for native embedding.
-                viewport_height: (!options.native_window).then_some(f64::from(options.height)),
-                line_height: 16.0,
-                image_sizing_policy: ImageSizingPolicy::WebCompatible,
-                text_composition_policy: TextCompositionPolicy::WebCompatible,
-            },
+                .with_viewport_height(
+                    (!options.native_window).then_some(f64::from(options.height)),
+                )?,
             image_metrics: Default::default(),
             paint: PaintSettingsRevision::INITIAL,
         };

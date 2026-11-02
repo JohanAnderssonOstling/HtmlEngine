@@ -23,86 +23,9 @@ pub mod selection;
 pub mod structure;
 pub mod targets;
 
-pub mod document {
-    pub use html_dom::*;
-    pub use html_parse::{
-        DocumentTextIndex, HtmlFragmentContext, HtmlParserOptions, HtmlQuirksMode,
-        HtmlScriptingMode, HtmlSyntaxAttribute, HtmlSyntaxElement, HtmlSyntaxNode, HtmlSyntaxTree,
-        MarkupSyntax, ParsedHtml, ParsedHtmlFragment, SourceTextPosition, StylesheetReference,
-        XmlParseError, build_dom_document, decode_html_bytes, parse_document, parse_dom_document,
-        parse_html_document, parse_html_document_bytes, parse_html_document_with_options,
-        parse_html_fragment, parse_xml_document, plain_text_from_fragment, read_document_source,
-    };
-
-    /// Declared media type takes precedence over the resource filename.
-    pub fn markup_syntax_for_resource(
-        provider: &dyn crate::resources::ResourceProvider,
-        uri: &str,
-    ) -> MarkupSyntax {
-        let media_type = provider
-            .metadata(uri)
-            .ok()
-            .and_then(|metadata| metadata.media_type);
-        MarkupSyntax::from_resource(uri, media_type.as_deref())
-    }
-
-    /// Build a parse-only text/source index for search without loading fonts,
-    /// images, styles, or a reader viewport.
-    pub fn text_index_for_resource(
-        source: &str,
-        provider: &dyn crate::resources::ResourceProvider,
-        uri: &str,
-    ) -> Option<DocumentTextIndex> {
-        let parsed = parse_document(source, markup_syntax_for_resource(provider, uri)).ok()?;
-        DocumentTextIndex::from_parsed(&parsed).ok()
-    }
-}
-
-/// Transitional access to parsing diagnostics. Normal consumers should prefer
-/// [`document`] and [`engine`].
-pub mod parse {
-    pub use html_parse::*;
-}
-
-pub mod resources {
-    pub use crate::engine_resources::image_metric_changes;
-    pub use html_resources::*;
-    pub use html_dom::{ResourceMetadata, ResourceProvider};
-
-    pub use html_dom::ResourceMetadata as Metadata;
-    pub use html_dom::ResourceProvider as Provider;
-}
-
-pub mod style {
-    pub use html_style::*;
-    pub use html_style_model::*;
-}
-
-pub mod text {
-    pub use html_pipeline::engine::{
-        CaretCursor, CaretIter, CaretPositions, CharacterPlacement, ContentLanguage, FontMetrics, FontMetricsRequest, FontRelativeMetrics,
-        FontSlant, GlyphHandle, GlyphId, GlyphMetric, GlyphMetricError, GlyphRequest,
-        GlyphResourceCheckpoint, GlyphResourceGeneration, GlyphResourceStore, GlyphResources,
-        GlyphShaper, LanguageTag, OpenTypeFeature, ResourceShaper, ShapeError, ShapedGlyph,
-        ShapedLine, ShapedTextRun, TextDirection, TextRunId, TextRunShapeRequest, TextShapeRequest,
-        TextStyleSpan,
-    };
-    pub use html_pipeline::engine::{TextPatternMatch, TextPatternMatcher, TextSearchOptions, find_text_matches, text_matches};
-}
-
-pub mod layout {
-    pub use html_pipeline::engine::*;
-}
-
-/// Incremental parse/style/layout engine API.
-pub mod pipeline {
-    pub use html_pipeline::*;
-}
-
-/// Framework-neutral painting and basic, non-paginated fragment rendering.
-pub mod render {
-    pub use html_render_core::*;
-}
+mod facade;
+pub use facade::{document, layout, render, resources, style, text};
+use html_pipeline as pipeline;
 
 #[cfg(feature = "testing")]
 pub mod testing {
@@ -160,7 +83,8 @@ pub mod engine {
 
     use crate::content::Content;
     use crate::geometry::Geometry;
-    use crate::layout::{GlyphShaper, LaidOutDocument};
+    use crate::text::GlyphShaper;
+    use html_pipeline::engine::{ImageMetrics, LaidOutDocument, LayoutConstraints, NoteLayout};
     use crate::pipeline::{
         EarliestStage, PipelineChanges, PipelineError, PipelineInputs, PipelineSession, PipelineUpdate,
     };
@@ -170,7 +94,7 @@ pub mod engine {
     use crate::revisions::DocumentRevisions;
     use crate::reading::Reading;
     use crate::selection::Selection;
-    use crate::style::FontFace;
+    use crate::text::FontFace;
     use crate::structure::Structure;
     use crate::targets::Targets;
 
@@ -180,18 +104,22 @@ pub mod engine {
     pub struct Engine {
         pub(super) session: PipelineSession,
         pub(super) images: ImagePipeline,
+        pub(super) image_resource_revision: Option<crate::pipeline::ResourceRevision>,
         pub(super) provider: Arc<dyn ResourceProvider>,
         pub(super) pending_image_metrics: Vec<u32>,
+        pub(super) pending_image_snapshot: Option<ImageMetrics>,
         pub(super) revisions: DocumentRevisions,
     }
 
     impl Engine {
-        pub fn new(provider: Arc<dyn ResourceProvider>) -> Self {
+        pub(crate) fn new(provider: Arc<dyn ResourceProvider>) -> Self {
             Self {
                 session: PipelineSession::new(provider.clone()),
                 images: ImagePipeline::new(provider.clone()),
+                image_resource_revision: None,
                 provider,
                 pending_image_metrics: Vec::new(),
+                pending_image_snapshot: None,
                 revisions: DocumentRevisions::default(),
             }
         }
@@ -199,7 +127,7 @@ pub mod engine {
         /// Load or replace a complete set of owned document inputs. For
         /// subsequent updates, use [`Self::apply_changes`] to retain unchanged
         /// source text and configuration in the session.
-        pub fn update(
+        pub(crate) fn update(
             &mut self,
             inputs: PipelineInputs,
             glyph_shaper: &mut impl GlyphShaper,
@@ -218,18 +146,19 @@ pub mod engine {
 
         /// The session owns the committed source and configuration. Hosts can
         /// borrow these values instead of retaining a second input snapshot.
-        pub fn inputs(&self) -> Option<&PipelineInputs> {
+        pub(crate) fn inputs(&self) -> Option<&PipelineInputs> {
             self.session.inputs()
         }
 
         /// Applies proposed fields while borrowing unchanged source and inputs.
-        pub fn apply_changes(
+        pub(crate) fn apply_changes(
             &mut self,
             changes: PipelineChanges,
             glyph_shaper: &mut impl GlyphShaper,
         ) -> Result<PipelineUpdate, PipelineError> {
+            let was_published = self.session.document().is_some();
             let update = self.session.attach(glyph_shaper).apply_changes(changes)?;
-            if update.stage <= EarliestStage::Prepare {
+            if !was_published || update.stage <= EarliestStage::Prepare {
                 self.sync_resources();
             }
             self.revisions.invalidate_from(update.stage);
@@ -237,9 +166,9 @@ pub mod engine {
         }
 
         /// Prepares provider-backed HTML through parse and style without
-        /// borrowing a platform text system. Finish with [`Self::rehydrate_glyphs`]
+        /// borrowing a platform text system. Finish with [`Self::apply`]
         /// on the host thread that owns its glyph shaper.
-        pub fn prepare_through_style(
+        pub(crate) fn prepare_through_style(
             &mut self,
             inputs: PipelineInputs,
         ) -> Result<(), PipelineError> {
@@ -248,48 +177,22 @@ pub mod engine {
             Ok(())
         }
 
-        /// Active named palettes for host color-font rendering.
-        pub fn font_palettes(&self) -> &[html_style::FontPalette] {
-            self.session.font_palettes()
-        }
-
-        /// Active font declarations, available before shaping after
-        /// [`Self::prepare_through_style`]. Load/register these faces in the
-        /// host text backend, then call [`Self::rehydrate_glyphs`].
+        /// Active font declarations, available after [`Self::prepare`].
+        /// Load/register these faces in the
+        /// host text backend, then submit a default [`crate::configuration::DocumentUpdate`] to [`Self::apply`].
         /// URL sources are resolved against their declaring stylesheet.
         pub fn font_faces(&self) -> &[FontFace] {
             self.session.font_faces()
         }
 
-        pub fn media_environment_change_affects_style(
-            &self,
-            media: crate::pipeline::MediaEnvironment,
-            root_font_size: u32,
-        ) -> bool {
-            self.session
-                .media_environment_change_affects_style(media, root_font_size)
-        }
-
-        /// Rebuild glyph resources and publish the layout in place. Borrow
-        /// the resulting chapter with [`Self::document`].
-        pub fn rehydrate_glyphs(
-            &mut self,
-            glyph_shaper: &mut impl GlyphShaper,
-        ) -> Result<(), PipelineError> {
-            self.session.attach(glyph_shaper).rehydrate_glyphs()?;
-            self.sync_resources();
-            self.revisions.invalidate_from(EarliestStage::Shape);
-            Ok(())
-        }
-
         /// Lays out one note body under its own constraints, for embedders
         /// that hold notes out of the reading flow and present them elsewhere.
-        pub fn layout_note(
+        pub(crate) fn layout_note(
             &mut self,
             id: &str,
-            constraints: crate::layout::LayoutConstraints,
+            constraints: LayoutConstraints,
             glyph_shaper: &mut impl GlyphShaper,
-        ) -> Option<crate::layout::NoteLayout> {
+        ) -> Result<Option<NoteLayout>, PipelineError> {
             self.session
                 .attach(glyph_shaper)
                 .layout_note(id, constraints)
@@ -300,12 +203,17 @@ pub mod engine {
             self.session.note_ids()
         }
 
-        pub fn document(&self) -> Option<&LaidOutDocument<'static>> {
+        pub(crate) fn document(&self) -> Option<&LaidOutDocument<'static>> {
             self.session.document()
         }
 
-        pub fn glyph_resources(&self) -> &crate::text::GlyphResourceStore {
+        pub(crate) fn glyph_resources(&self) -> &crate::text::GlyphResourceStore {
             self.session.glyph_resources()
+        }
+
+        /// Version of the native resources used by the published text.
+        pub fn glyph_resource_generation(&self) -> crate::text::GlyphResourceGeneration {
+            self.session.glyph_resources().generation()
         }
 
         /// Select document content without creating a reader or a viewport.
@@ -341,32 +249,21 @@ pub mod engine {
 
         /// Paint this document using any caller-selected geometric projection.
         pub fn painter(&self) -> Option<DocumentPainter<'_>> {
-            Some(DocumentPainter::new(self.render_view()?).with_images(self.images()))
+            Some(
+                DocumentPainter::new(
+                    self.render_view()
+                        .filter(|view| view.paint_resources_valid())?,
+                )
+                .with_images(self.images()),
+            )
         }
 
         pub fn render_view(&self) -> Option<crate::layout::RenderView<'_>> {
             self.session.render_view()
         }
 
-        pub fn document_mut_and_resources(
-            &mut self,
-        ) -> Option<(
-            &mut LaidOutDocument<'static>,
-            &crate::text::GlyphResourceStore,
-        )> {
-            self.session.document()?;
-            self.revisions.invalidate_from(EarliestStage::Layout);
-            self.session.document_mut_and_resources()
-        }
 
-        pub fn document_mut(&mut self) -> Option<&mut LaidOutDocument<'static>> {
-            self.session.document()?;
-            self.revisions.invalidate_from(EarliestStage::Layout);
-            self.session.document_mut()
-        }
     }
 
-    pub use crate::pipeline::{
-        PipelineError as Error, PipelineInputs as Input, PipelineUpdate as Update,
-    };
+    pub use crate::pipeline::{PipelineError as Error, PipelineErrorKind as ErrorKind};
 }

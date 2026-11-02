@@ -1,6 +1,7 @@
 use html_style_model::ComputedStylesValidationError;
 use std::fmt;
 
+/// Validated dimensions and policies shared by pipeline inputs and layout.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LayoutConstraints {
     viewport_width: f64,
@@ -75,6 +76,9 @@ pub enum LayoutConstraintError {
     InvalidLineHeight,
 }
 
+// Constructors and setters exclude NaN, so equality is reflexive.
+impl Eq for LayoutConstraints {}
+
 impl LayoutConstraints {
     pub fn new(viewport_width: f64, line_height: f64) -> Result<Self, LayoutConstraintError> {
         if !viewport_width.is_finite() || viewport_width < 0.0 {
@@ -91,6 +95,17 @@ impl LayoutConstraints {
             text_composition_policy: TextCompositionPolicy::WebCompatible,
             parallel_workers: 1,
         })
+    }
+
+    pub fn with_viewport_width(
+        mut self,
+        viewport_width: f64,
+    ) -> Result<Self, LayoutConstraintError> {
+        if !viewport_width.is_finite() || viewport_width < 0.0 {
+            return Err(LayoutConstraintError::InvalidViewportWidth);
+        }
+        self.viewport_width = viewport_width;
+        Ok(self)
     }
 
     pub fn viewport_width(self) -> f64 {
@@ -110,6 +125,14 @@ impl LayoutConstraints {
 
     pub fn viewport_height(self) -> Option<f64> {
         self.viewport_height
+    }
+
+    pub fn with_line_height(mut self, line_height: f64) -> Result<Self, LayoutConstraintError> {
+        if !line_height.is_finite() || line_height <= 0.0 {
+            return Err(LayoutConstraintError::InvalidLineHeight);
+        }
+        self.line_height = line_height;
+        Ok(self)
     }
 
     pub fn line_height(self) -> f64 {

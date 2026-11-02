@@ -1,9 +1,10 @@
 use crate::{Shaper, cpu_seconds, layout_fingerprint};
-use html::layout::{LayoutConstraints, LayoutTimings};
-use html::pipeline::ResourceContext;
-use html::pipeline::{DocumentFactory, PipelineInputs, parse_document};
+use html_pipeline::engine::{LayoutConstraints, LayoutTimings};
+use html_pipeline::ResourceContext;
+use html_pipeline::{DocumentFactory, PipelineInputs};
+use html::document::parse_document;
 use html::resources::FileSystemProvider;
-use html::style::StyleTimings;
+use html_style::StyleTimings;
 use html::text::GlyphResourceStore;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -94,7 +95,7 @@ pub fn run(path: &str, case: &str, count: usize, inputs: &PipelineInputs) {
     let mut output = Value::Null;
     let constraints = LayoutConstraints::new(600.0, 16.0)
         .unwrap()
-        .with_text_composition_policy(inputs.layout.text_composition_policy);
+        .with_text_composition_policy(inputs.layout.text_composition_policy());
     for iteration in 0..count + 3 {
         let mut factory = DocumentFactory::new();
         let factory_provider = FileSystemProvider;
@@ -198,7 +199,7 @@ pub fn run(path: &str, case: &str, count: usize, inputs: &PipelineInputs) {
                 "source_bytes": source.len(),
                 "font_backend": "deterministic mock",
                 "heap_instrumented": cfg!(feature = "heap"),
-                "composition": format!("{:?}", inputs.layout.text_composition_policy),
+                "composition": format!("{:?}", inputs.layout.text_composition_policy()),
                 "glyphs": document.render_view(&shaped_resources).text().glyph_count(),
                 "lines": document.render_view(&shaped_resources).text().line_count(),
                 "render_fingerprint": format!("{fingerprint:016x}"),

@@ -115,10 +115,10 @@ impl<'a> PaginationLines<'a> {
     }
     pub fn cursor(self, id: LineId) -> Option<usize> {
         let output = self.output();
-        let ranks = if output.pagination_ranks.len() == output.lines.len() {
-            &output.pagination_ranks
+        let ranks = if output.pagination_order.ranks().len() == output.lines.len() {
+            &output.pagination_order.ranks()
         } else {
-            &output.spatial_ranks
+            &output.spatial_order.ranks()
         };
         ranks.get(id.index()).map(|&rank| rank as usize)
     }

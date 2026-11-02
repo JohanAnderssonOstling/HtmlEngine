@@ -643,7 +643,7 @@ mod tests {
                 assert_eq!(format("default").font_weight, 400);
                 assert_eq!(format("authored").font_size, 24.0);
                 assert_eq!(format("authored").font_weight, 700);
-                assert_eq!(format("authored").font_style, html::layout::FontStyle::Italic);
+                assert_eq!(format("authored").font_style, html::text::FontStyle::Italic);
             })
             .unwrap();
     }

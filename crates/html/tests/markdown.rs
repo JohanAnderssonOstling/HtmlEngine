@@ -1,5 +1,6 @@
-use html::layout::{LaidOutDocument, LayoutConstraints, RenderExportView, TextCompositionPolicy};
-use html::pipeline::DocumentFactory;
+use html_pipeline::engine::{LaidOutDocument, LayoutConstraints};
+use html::layout::{RenderExportView, TextCompositionPolicy};
+use html_pipeline::DocumentFactory;
 use html::text::{
     GlyphMetric, GlyphResourceGeneration, GlyphResourceStore, GlyphShaper, ShapeError,
 };
@@ -19,13 +20,12 @@ impl GlyphShaper for TestShaper {
     fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
         Ok(ShapedGlyph::from_metric(
             request.character as u32,
-            GlyphMetric::try_new(
+            GlyphMetric::new(
                 request.character,
-                request.font_size / 2.0,
-                request.font_size,
+                request.style.font_size / 2.0,
+                request.style.font_size,
                 0.0,
-            )
-            .unwrap(),
+            ),
         ))
     }
 }

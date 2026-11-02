@@ -5,7 +5,7 @@ use crate::style::document::{AuthorStylesheetInput, StyledDocument};
 use crate::style::environment::{MediaEnvironment, MediaQuerySet};
 use crate::style::rules::compiler;
 use crate::style::rules::prepared::PreparedStylesheetFragment;
-use crate::style::source::fonts::{FontFace, FontPalette};
+use crate::style::source::fonts::FontFace;
 use crate::style::source::inline::{InlineStyles, ParsedInlineStyleCache, cached_entry};
 use crate::style::source::resource::{ResourceStylesheet, ResourceStylesheetEntry};
 use crate::style::timings::StyleTimings;
@@ -255,19 +255,6 @@ impl StyleProgramCache {
 }
 
 impl StyleProgram {
-    /// Active named color palettes, in stylesheet order.
-    pub fn font_palettes(&self) -> &[FontPalette] {
-        self.compiled
-            .rules
-            .font_palettes
-            .as_deref()
-            .unwrap_or_default()
-    }
-
-    pub fn shared_font_palettes(&self) -> Option<Arc<[FontPalette]>> {
-        self.compiled.rules.font_palettes.clone()
-    }
-
     /// Active font declarations for this program's media environment.
     pub fn font_faces(&self) -> &[FontFace] {
         self.compiled.rules.font_faces()
@@ -365,7 +352,6 @@ fn apply(
             document,
             styles,
             font_faces: program.compiled.rules.font_faces().clone(),
-            font_palettes: program.shared_font_palettes(),
         },
         timings,
         queries,

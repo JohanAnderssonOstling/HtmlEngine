@@ -24,6 +24,7 @@ mod bidi;
 mod caret_positions;
 mod constraints;
 mod geometry;
+mod font_features;
 mod glyph_adapter;
 mod glyph_line_indices;
 mod glyph_metrics;
@@ -47,6 +48,7 @@ mod word_index;
 pub use bidi::{ResolvedBidi, grapheme_boundaries, paragraph_unicode_bidi};
 pub use constraints::*;
 pub use geometry::*;
+pub use font_features::FontFeatures;
 pub use glyph_adapter::*;
 pub use glyph_line_indices::*;
 pub use glyph_metrics::*;
@@ -54,9 +56,9 @@ pub use glyph_resources::*;
 pub use grouped_arena::*;
 use html_style_model::{ComputedStyles, StyleIndices, StyleView, UsedStyleView};
 pub use html_style_model::{
-    ContentLanguage, FontPaletteBase, FontPaletteDefinition, FontStyle, FontSynthesisStyle, LanguageTag, ListStylePosition, OpenTypeFeature,
-    ReaderStyleOverrides, StyleStringId, TextAlign, TextDecorationLines, TextDirection,
-    ThemeAdaptation, UnicodeBidi, UsedBorderRadii,
+    ContentLanguage, FontStyle, FontSynthesisStyle, LanguageTag, ListStylePosition,
+    OpenTypeFeature, OpenTypeFeatureKind, ReaderStyleOverrides, StyleStringId, TextAlign,
+    TextDecorationLines, TextDirection, ThemeAdaptation, UnicodeBidi, CornerRadii,
 };
 pub use html_text::{InlineContent, InlineItem, InlineItemKind, WhitespaceWrapOverride};
 pub use image_metrics::*;

@@ -1,6 +1,6 @@
 use crate::parser::DocumentFactory;
 use crate::test_support::TestGlyphShaper;
-use crate::{GlyphRequest, ShapedGlyph};
+use crate::{GlyphRequest, ShapedGlyph, ShapedRun};
 use crate::{
     GlyphResourceGeneration, GlyphResourceStore, GlyphShaper, LaidOutDocument, LayoutConstraints,
     ShapeError, ShapedTextRun, TextDirection, TextRunShapeRequest,
@@ -447,12 +447,12 @@ impl GlyphShaper for DirectionalShaper {
     fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
         self.fallback.shape_glyph(request)
     }
-    fn shape_text_run(
+    fn shape_run(
         &mut self,
         request: TextRunShapeRequest<'_>,
-    ) -> Result<Option<ShapedTextRun>, ShapeError> {
-        let direction = request.style().direction();
-        let advance = request.style().font_size() * 0.25;
+    ) -> Result<Option<ShapedRun>, ShapeError> {
+        let direction = request.style().direction;
+        let advance = request.style().font_size * 0.25;
         let run = self.requests.len() as u32;
         self.requests.push((request.text().to_owned(), direction));
         let count = request.text().chars().count();
@@ -466,13 +466,13 @@ impl GlyphShaper for DirectionalShaper {
                     * advance
             })
             .collect();
-        Ok(ShapedTextRun::with_backend_run(
+        Ok(Some(ShapedRun::geometry(ShapedTextRun::with_backend_run(
             Arc::from(vec![advance; count]),
             Arc::from(vec![true; count + 1]),
             run,
             stops.into(),
             12.0,
-        ))
+        ))))
     }
 }
 

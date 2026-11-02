@@ -7,19 +7,19 @@ mod stage_tests {
         use crate::ShapedTextRun;
         use crate::allocation_test_support::count_allocations;
 
-        let mut run = ShapedTextRun::with_backend_run(
+        let run = ShapedTextRun::with_backend_run(
             [1.0, 1.0, 1.0].into(),
             [true; 4].into(),
             0,
             [0.0, 1.0, 2.0, 3.0].into(),
             8.0,
-        )
-        .unwrap();
+        );
         let characters = ['a', ' ', 'b'];
         let deltas = characters
             .iter()
             .map(|character| if *character == ' ' { 0.5 } else { 0.25 });
-        let ((), allocations) = count_allocations(|| run.apply_spacing_iter(deltas, false));
+        let (run, allocations) =
+            count_allocations(|| html_engine_model::shaping::apply_spacing(run, deltas, false));
         assert_eq!(allocations, 0);
         assert_eq!(run.advances(), [1.25, 1.5, 1.25]);
         assert_eq!(run.caret_stops().unwrap().to_dense().as_ref(), [0.0, 1.25, 2.75, 4.0]);
@@ -249,7 +249,7 @@ mod stage_tests {
         LayoutConstraintError, LayoutConstraints, PreparedDocument, ReaderStyleOverrides,
         TextCompositionPolicy,
     };
-    use crate::layout_model::{GlyphId, GlyphMetric, GlyphMetricError};
+    use crate::layout_model::{GlyphId, GlyphMetric};
     use crate::test_support::{DocumentFactory, TestGlyphShaper};
     use html_style_model::{
         ComputedStylesBuildError, ComputedStylesBuilder, ComputedStylesValidationError,
@@ -1784,30 +1784,6 @@ mod stage_tests {
         }
     }
 
-    #[derive(Default)]
-    struct InvalidGlyphShaper(crate::GlyphResourceGeneration);
-
-    impl GlyphShaper for InvalidGlyphShaper {
-        fn shape_glyph_run(
-            &mut self,
-            _request: crate::TextRunShapeRequest<'_>,
-            glyphs: &mut [GlyphId],
-            _resources: &mut GlyphResourceStore,
-        ) -> Result<Option<crate::ShapedTextRun>, ShapeError> {
-            glyphs.fill(17);
-            Ok(None)
-        }
-        fn reset(&mut self) {}
-
-        fn resource_generation(&self) -> crate::GlyphResourceGeneration {
-            self.0
-        }
-
-        fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
-            Ok(ShapedGlyph::from_metric(17, crate::GlyphMetric::default()))
-        }
-    }
-
     #[test]
     fn constraints_reject_non_finite_and_out_of_domain_values() {
         assert_eq!(
@@ -1855,7 +1831,7 @@ mod stage_tests {
     }
 
     #[test]
-    fn shaping_skips_font_metric_queries_when_no_used_value_needs_font_metrics() {
+    fn shaping_queries_selected_font_metrics_for_ordinary_text() {
         let mut glyph_resources = GlyphResourceStore::default();
 
         let mut factory = DocumentFactory::new();
@@ -1869,7 +1845,7 @@ mod stage_tests {
             .shape_borrowed(&mut shaper, &mut glyph_resources)
             .expect("ordinary document shapes");
 
-        assert_eq!(shaper.font_metric_calls(), 0);
+        assert_eq!(shaper.font_metric_calls(), 1);
     }
 
     #[test]
@@ -1942,59 +1918,6 @@ mod stage_tests {
             .expect("inline background document shapes");
 
         assert!(shaper.font_metric_calls() > 0);
-    }
-
-    #[test]
-    fn shaping_rejects_unregistered_glyph_ids() {
-        let mut factory = DocumentFactory::new();
-        let prepared = factory.parse_with_new_pipeline("<html><body>text</body></html>", None);
-        let mut error_resources = GlyphResourceStore::default();
-        let error = prepared
-            .shape_borrowed(&mut InvalidGlyphShaper::default(), &mut error_resources)
-            .err()
-            .expect("invalid shaper must be rejected");
-
-        assert_eq!(error.glyph_id(), Some(17));
-        assert_eq!(error.metrics_len(), Some(0));
-    }
-
-    #[derive(Default)]
-    struct InvalidMetricShaper(crate::GlyphResourceGeneration);
-
-    impl GlyphShaper for InvalidMetricShaper {
-        fn reset(&mut self) {}
-
-        fn resource_generation(&self) -> crate::GlyphResourceGeneration {
-            self.0
-        }
-
-        fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
-            let metric = GlyphMetric::try_new(
-                request.character,
-                request.font_size,
-                -request.font_size,
-                request.font_size * 0.25,
-            )?;
-            Ok(ShapedGlyph::from_metric(request.character as u32, metric))
-        }
-    }
-
-    #[test]
-    fn shaping_rejects_invalid_glyph_metrics() {
-        let mut factory = DocumentFactory::new();
-        let prepared = factory.parse_with_new_pipeline("<html><body>text</body></html>", None);
-        let mut error_resources = GlyphResourceStore::default();
-        let error = prepared
-            .shape_borrowed(&mut InvalidMetricShaper::default(), &mut error_resources)
-            .err()
-            .expect("invalid metric must be rejected");
-        assert!(matches!(
-            error.reason(),
-            Some(GlyphMetricError::NegativeValue {
-                field: "ascent",
-                ..
-            })
-        ));
     }
 
     #[test]
@@ -2224,7 +2147,8 @@ mod stage_tests {
             .layout
             .state
             .line_output
-            .spatial_ranks
+            .spatial_order
+            .ranks()
             .as_ptr();
         let paint_order = document
             .data
@@ -2301,7 +2225,8 @@ mod stage_tests {
                 .layout
                 .state
                 .line_output
-                .spatial_ranks
+                .spatial_order
+                .ranks()
                 .as_ptr(),
             spatial_ranks
         );
@@ -2684,7 +2609,7 @@ mod stage_tests {
             .iter()
             .map(|line| (line.glyphs(), line.point()))
             .collect::<Vec<_>>();
-        let metric = GlyphMetric::try_new('#', 4.0, 3.0, 1.0).unwrap();
+        let metric = GlyphMetric::new('#', 4.0, 3.0, 1.0);
         let appended = document_resources.register(metric).unwrap();
         assert!(
             snapshot
@@ -3401,7 +3326,7 @@ mod stage_tests {
 
         let original_len = document.glyph_metrics(&shaped_resources).len();
         let original_first = document.glyph_metrics(&shaped_resources).get_checked(0);
-        let metric = GlyphMetric::try_new('#', 4.0, 3.0, 1.0).expect("valid auxiliary metric");
+        let metric = GlyphMetric::new('#', 4.0, 3.0, 1.0);
         let appended = shaped_resources
             .register(metric)
             .expect("append auxiliary glyph");

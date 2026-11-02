@@ -1,5 +1,5 @@
 use crate::{LoadedFontFace, PRIVATE_FAMILY_PREFIX};
-use html::style::FontFace;
+use html::text::FontFace;
 use html::text::FontSlant;
 use std::collections::BTreeMap;
 
@@ -10,7 +10,7 @@ pub(crate) fn prepare(bytes: &[u8], declaration: &FontFace) -> Result<LoadedFont
     let slant = if face.is_italic() {
         FontSlant::Italic
     } else if face.is_oblique() {
-        FontSlant::Oblique
+        FontSlant::oblique(14.0)
     } else {
         FontSlant::Normal
     };
@@ -25,9 +25,9 @@ pub(crate) fn prepare(bytes: &[u8], declaration: &FontFace) -> Result<LoadedFont
         &hasher.finalize().to_hex()[..32]
     );
     let subfamily = match (weight >= 600, slant) {
-        (true, FontSlant::Italic | FontSlant::Oblique) => "Bold Italic",
+        (true, FontSlant::Italic | FontSlant::Oblique { .. }) => "Bold Italic",
         (true, _) => "Bold",
-        (false, FontSlant::Italic | FontSlant::Oblique) => "Italic",
+        (false, FontSlant::Italic | FontSlant::Oblique { .. }) => "Italic",
         _ => "Regular",
     };
     let mut tables = BTreeMap::new();
@@ -214,7 +214,7 @@ fn put_u32(output: &mut Vec<u8>, value: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use html::style::FontFaceStyle;
+    use html::text::FontFaceStyle;
 
     fn declaration() -> FontFace {
         FontFace {

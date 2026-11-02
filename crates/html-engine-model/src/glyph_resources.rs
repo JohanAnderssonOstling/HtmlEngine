@@ -1,6 +1,7 @@
 //! Native glyph storage and lifecycle handling for basic renderer adapters.
 use crate::{
-    GlyphHandle, GlyphRequest, GlyphResourceGeneration, GlyphShaper, ShapeError, ShapedGlyph,
+    GlyphHandle, GlyphRequest, GlyphResourceGeneration, GlyphShaper, NativeResourceCheckpoint,
+    ShapeError, ShapedGlyph,
 };
 use std::mem::take;
 
@@ -148,6 +149,26 @@ impl<T, F> GlyphShaper for ResourceShaper<T, F>
 where
     F: FnMut(GlyphRequest<'_>, &mut GlyphResources<T>) -> Result<ShapedGlyph, ShapeError>,
 {
+    fn resource_checkpoint(&self) -> Option<NativeResourceCheckpoint> {
+        Some(NativeResourceCheckpoint::new(
+            self.resources.generation,
+            [self.resources.values.len(), 0],
+        ))
+    }
+
+    fn restore_resource_checkpoint(&mut self, checkpoint: NativeResourceCheckpoint) -> bool {
+        let [len, _] = checkpoint.lengths();
+        if checkpoint.generation() != self.resources.generation
+            || len > self.resources.values.len()
+            || self.resources.previous_document.is_some()
+            || self.resources.append_checkpoint.is_some()
+        {
+            return false;
+        }
+        self.resources.values.truncate(len);
+        true
+    }
+
     fn resource_generation(&self) -> GlyphResourceGeneration {
         self.resources.generation()
     }
@@ -188,8 +209,10 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::shaping;
+
     use super::*;
-    use crate::{FontMetrics, FontSlant, GlyphResourceStore, TextRunShapeRequest, TextStyleSpan};
+    use crate::{FontMetrics, FontSlant, GlyphResourceStore, TextStyleSpan};
     use std::cell::Cell;
 
     struct Native<'a> {
@@ -306,15 +329,17 @@ mod tests {
         let native_system = system.as_str();
         let mut shaper = ResourceShaper::new(|request, resources| {
             let handle = resources.insert((native_system, request.character))?;
-            Ok(ShapedGlyph::new(handle, 8.0, FontMetrics::new(12.0, 4.0)?)?)
+            Ok(ShapedGlyph::new(handle, 8.0, FontMetrics::new(12.0, 4.0)))
         });
         let generation = shaper.resource_generation();
-        let style = TextStyleSpan::new(0..2, 16.0, 400, FontSlant::Normal, 0, None).unwrap();
-        let request = TextRunShapeRequest::new("ab", style).unwrap();
+        let style = shaping::style(16.0, 400, FontSlant::Normal, 0, None)
+            .and_then(|resolved_style| shaping::span(0..2, resolved_style))
+            .unwrap();
+        let request = shaping::run("ab", style, None).unwrap();
         let mut metrics = GlyphResourceStore::new(generation);
         let mut glyphs = [0; 2];
-        shaper
-            .shape_glyph_run(request, &mut glyphs, &mut metrics)
+        metrics
+            .shape_run(&mut shaper, request, &mut glyphs)
             .unwrap();
         assert_eq!(metrics.len(), 2);
         assert_eq!(shaper.resources().get(0), Some(&(native_system, 'a')));

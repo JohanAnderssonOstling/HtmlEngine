@@ -20,8 +20,7 @@ pub(super) struct ShapingSpan {
     pub(super) formatting_root: usize,
     pub(super) style_override: Option<StyleIndices>,
     paint_spans: Vec<ShapingPaintSpan>,
-    pub(super) join_before: bool,
-    pub(super) join_after: bool,
+    pub(super) cursive_joining: CursiveJoining,
 }
 
 impl ShapingSpan {
@@ -62,7 +61,6 @@ impl ShapingSpan {
             && left.font_style() == right.font_style()
             && left.font.font_stretch == right.font.font_stretch
             && left.font.font_oblique_angle == right.font.font_oblique_angle
-            && left.font.font_palette == right.font.font_palette
             && left.font_family() == right.font_family()
             && left.cjk_font_family() == right.cjk_font_family()
             && left.open_type_features() == right.open_type_features()
@@ -92,8 +90,7 @@ impl ShapingSpan {
                             formatting_root: self.formatting_root,
                             style_override: self.style_override,
                             paint_spans: vec![part],
-                            join_before: false,
-                            join_after: false,
+                            cursive_joining: CursiveJoining::Isolated,
                         },
                         level,
                     ));
@@ -101,10 +98,16 @@ impl ShapingSpan {
             }
         }
         if let Some((first, _)) = result.first_mut() {
-            first.join_before = self.join_before;
+            first.cursive_joining = shaping::cursive_joining(
+                self.cursive_joining.connects_to_previous(),
+                first.cursive_joining.connects_to_next(),
+            );
         }
         if let Some((last, _)) = result.last_mut() {
-            last.join_after = self.join_after;
+            last.cursive_joining = shaping::cursive_joining(
+                last.cursive_joining.connects_to_previous(),
+                self.cursive_joining.connects_to_next(),
+            );
         }
         result
     }
@@ -462,7 +465,8 @@ fn append_shaping_range(
                 previous.character_indices().map(|index| inline_content.characters()[index as usize]),
                 paint_span.characters.clone().map(|index| inline_content.characters()[index as usize]),
             );
-        previous.join_after = join_before;
+        previous.cursive_joining =
+            shaping::cursive_joining(previous.cursive_joining.connects_to_previous(), join_before);
     }
     let index = result.len();
     result.push(ShapingSpan {
@@ -470,8 +474,7 @@ fn append_shaping_range(
         formatting_root,
         style_override,
         paint_spans: vec![paint_span],
-        join_before,
-        join_after: false,
+        cursive_joining: shaping::cursive_joining(join_before, false),
     });
     index
 }

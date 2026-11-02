@@ -1,6 +1,6 @@
 use super::super::context::ResolutionContext;
 use super::lengths::{calc_box_length_percentage_components, length_percentage_to_px};
-use html_style_model::{Font, OpenTypeFeature};
+use html_style_model::{Font, OpenTypeFeature, OpenTypeFeatureKind};
 use lightningcss::properties::font::{AbsoluteFontWeight, FontSize, FontWeight};
 use lightningcss::values::length::LengthValue;
 
@@ -164,17 +164,22 @@ pub(in crate::style::cascade::resolver) fn font_variant_caps_features(
     use lightningcss::properties::font::FontVariantCaps;
     match value {
         FontVariantCaps::Normal => Vec::new(),
-        FontVariantCaps::SmallCaps => vec![OpenTypeFeature::new(*b"smcp", 1)],
+        FontVariantCaps::SmallCaps => vec![OpenTypeFeature::new(OpenTypeFeatureKind::SmallCaps, 1)],
         FontVariantCaps::AllSmallCaps => vec![
-            OpenTypeFeature::new(*b"smcp", 1),
-            OpenTypeFeature::new(*b"c2sc", 1),
+            OpenTypeFeature::new(OpenTypeFeatureKind::SmallCaps, 1),
+            OpenTypeFeature::new(OpenTypeFeatureKind::CapitalsToSmallCaps, 1),
         ],
-        FontVariantCaps::PetiteCaps => vec![OpenTypeFeature::new(*b"pcap", 1)],
+        FontVariantCaps::PetiteCaps => {
+            vec![OpenTypeFeature::new(OpenTypeFeatureKind::PetiteCaps, 1)]
+        }
         FontVariantCaps::AllPetiteCaps => vec![
-            OpenTypeFeature::new(*b"pcap", 1),
-            OpenTypeFeature::new(*b"c2pc", 1),
+            OpenTypeFeature::new(OpenTypeFeatureKind::PetiteCaps, 1),
+            OpenTypeFeature::new(OpenTypeFeatureKind::CapitalsToPetiteCaps, 1),
         ],
-        FontVariantCaps::Unicase => vec![OpenTypeFeature::new(*b"unic", 1)],
-        FontVariantCaps::TitlingCaps => vec![OpenTypeFeature::new(*b"titl", 1)],
+        FontVariantCaps::Unicase => vec![OpenTypeFeature::new(OpenTypeFeatureKind::Unicase, 1)],
+        FontVariantCaps::TitlingCaps => vec![OpenTypeFeature::new(
+            OpenTypeFeatureKind::TitlingCapitals,
+            1,
+        )],
     }
 }

@@ -1,7 +1,7 @@
 use std::io;
 use std::path::Path;
 
-use html_dom::{ResourceProvider, uri_path};
+use html_dom::{ResourceProvider, has_uri_scheme, uri_path};
 
 #[derive(Default)]
 pub struct FileSystemProvider;
@@ -52,6 +52,9 @@ impl ResourceProvider for FileSystemProvider {
     }
 
     fn resolve(&self, base: &str, href: &str) -> String {
+        if has_uri_scheme(href) || href.starts_with("//") {
+            return href.to_owned();
+        }
         let href = uri_path(href);
         let base = uri_path(base);
         if href.is_empty() {

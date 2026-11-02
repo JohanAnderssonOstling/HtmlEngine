@@ -20,7 +20,7 @@ mod web;
 
 use html::fonts::{FontData, FontLoadFuture, FontSourceLoader, prepare_face};
 use html::resources::ResourceProvider;
-use html::style::FontFace;
+use html::text::FontFace;
 use html::text::FontSlant;
 use std::sync::Arc;
 
@@ -140,7 +140,7 @@ impl FontSourceLoader for FontLoader<'_> {
 mod tests {
     use super::*;
     use base64::{Engine as _, engine::general_purpose::STANDARD};
-    use html::style::{FontFaceSource, FontFaceStyle};
+    use html::text::{FontFaceSource, FontFaceStyle};
     use std::future::Future;
     use std::io;
     use std::pin::Pin;

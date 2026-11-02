@@ -7,7 +7,7 @@ use crate::style::compiled::{
 };
 use crate::style::environment::{MediaEnvironment, MediaQuerySet, evaluate_media_list};
 use crate::style::property_catalogue::PropertyKey;
-use crate::style::source::fonts::{FontFace, FontPalette};
+use crate::style::source::fonts::FontFace;
 use crate::style::syntax::capabilities::declaration_renderer_eligibility;
 use crate::style::syntax::native_fallback::{self, NativeFallback};
 use crate::style::syntax::selectors::{
@@ -305,7 +305,6 @@ pub(crate) fn prepare<'css>(
         output: Vec::with_capacity(capacity),
         scopes: Vec::new(),
         font_faces: Vec::new(),
-        font_palettes: Vec::new(),
         source_order: 0,
         environment,
         initial_font_size,
@@ -328,7 +327,6 @@ pub(crate) fn prepare<'css>(
         output: rules,
         scopes,
         font_faces,
-        font_palettes,
         media_queries,
         ..
     } = walk;
@@ -394,7 +392,6 @@ pub(crate) fn prepare<'css>(
             .then(|| Arc::new(text_spacing_values)),
         media_queries,
         font_faces: font_faces.into(),
-        font_palettes: (!font_palettes.is_empty()).then(|| font_palettes.into()),
         environment,
     }
 }
@@ -451,7 +448,6 @@ struct RuleWalk<'fragment, 'css> {
     output: Vec<PendingRule<'fragment, 'css>>,
     scopes: Vec<ScopeDescriptor<'css>>,
     font_faces: Vec<FontFace>,
-    font_palettes: Vec<FontPalette>,
     source_order: u32,
     environment: MediaEnvironment,
     initial_font_size: f64,
@@ -542,15 +538,6 @@ impl<'fragment, 'css: 'fragment> RuleWalk<'fragment, 'css> {
                         self.source_order = self.source_order.checked_add(1).expect(
                             "a stylesheet cannot contain more than u32::MAX effective rules",
                         );
-                    }
-                }
-                CssRule::FontPaletteValues(rule) => {
-                    if !skipped {
-                        self.media_queries.record_dependency(&self.media_path);
-                        if active {
-                            self.font_palettes
-                                .push(static_self::IntoOwned::into_owned(rule.clone()));
-                        }
                     }
                 }
                 CssRule::FontFace(rule) => {

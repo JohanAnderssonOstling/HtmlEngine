@@ -1,5 +1,5 @@
 use encoding_rs::{Encoding, UTF_8};
-use html_dom::{Document, DomNodeId, ImageSource, RootFontSize};
+use html_dom::{Document, DocumentBuildError, DomNodeId, ImageSource, RootFontSize};
 use crate::engine::{FormattingDocument, PreparedDocument};
 use html_style_model::ComputedStyles;
 #[cfg(feature = "profiling")]
@@ -7,7 +7,7 @@ use crate::engine::profiling::scope;
 use html_parse::{ParsedHtml, StylesheetReference, document_stylesheets, encoding_for_label};
 use html_resources::{ResourceMetadata, ResourceProvider, media_type_essence, uri_path};
 use html_style::{
-    AuthorStylesheetInput, FontFace, FontPalette, ResourceStylesheet, ResourceStylesheetEntry,
+    AuthorStylesheetInput, FontFace, ResourceStylesheet, ResourceStylesheetEntry,
     StyleTimings,
 };
 use std::borrow::Cow;
@@ -44,7 +44,6 @@ pub struct DocumentFactory {
     reader_overrides: crate::engine::ReaderStyleOverrides,
     note_flow: crate::engine::NoteFlow,
     font_faces: Arc<[FontFace]>,
-    font_palettes: Option<Arc<[FontPalette]>>,
 }
 
 /// Borrowed resources for one preparation operation. The provider and base
@@ -72,7 +71,8 @@ impl ResourceDocumentFactory<'_> {
     pub fn parse_to_dom(&mut self, source: &str) -> Document {
         let parsed = parse_html_document(source);
         let title = parsed.title();
-        self.factory.configure_dom(parsed.into_dom(), title, Some(self.resources)).0
+        self.factory
+            .configure_dom(parsed.into_dom(), title, Some(self.resources))
     }
 
     pub fn parse_with_new_pipeline(&mut self, source: &str, css: Option<&str>) -> PreparedDocument<'static> {
@@ -94,7 +94,12 @@ impl ResourceDocumentFactory<'_> {
     }
 
     pub(crate) fn build_pipeline_from_owned_parsed(&mut self, parsed: ParsedHtml, css: &[impl AsRef<str>]) -> (PreparedDocument<'static>, html_style::MediaQuerySet) {
-        self.factory.build_pipeline_from_owned_parsed(parsed, css, Some(self.resources))
+        self.try_build_pipeline_from_owned_parsed(parsed, css)
+            .expect("parsed markup must form a valid DOM")
+    }
+
+    pub(crate) fn try_build_pipeline_from_owned_parsed(&mut self, parsed: ParsedHtml, css: &[impl AsRef<str>]) -> Result<(PreparedDocument<'static>, html_style::MediaQuerySet), DocumentBuildError> {
+        self.factory.try_build_pipeline_from_owned_parsed(parsed, css, Some(self.resources))
     }
 
     pub(crate) fn resolve_canonical_dom(&mut self, document: &Document, encoding: Option<&str>, css: &[impl AsRef<str>]) -> (ComputedStyles, html_style::MediaQuerySet) {
@@ -176,15 +181,6 @@ impl DocumentFactory {
         Self::default()
     }
 
-    /// Active named palettes for host color-font rendering.
-    pub fn font_palettes(&self) -> &[FontPalette] {
-        self.font_palettes.as_deref().unwrap_or_default()
-    }
-
-    pub(crate) fn take_font_palettes(&mut self) -> Option<Arc<[FontPalette]>> {
-        take(&mut self.font_palettes)
-    }
-
     /// Active font declarations from the most recent preparation. Font bytes
     /// are left to the host; URLs are resolved through the resource provider.
     pub fn font_faces(&self) -> &[FontFace] {
@@ -238,7 +234,7 @@ impl DocumentFactory {
     pub fn parse_to_dom(&mut self, html: &str) -> Document {
         let parsed = parse_html_document(html);
         let title = parsed.title();
-        self.configure_dom(parsed.into_dom(), title, None).0
+        self.configure_dom(parsed.into_dom(), title, None)
     }
 
     pub fn parse_with_new_pipeline(&mut self, html: &str, css: Option<&str>) -> PreparedDocument<'static> {
@@ -264,27 +260,57 @@ impl DocumentFactory {
         #[cfg(feature = "profiling")]
         let dom_scope = scope("factory.dom");
         let started = timings.as_ref().map(|_| Instant::now());
-        let (document, base_uri) = self.configure_dom(parsed_html.build_dom(), parsed_html.title(), resources);
+        let document = self.configure_dom(parsed_html.build_dom(), parsed_html.title(), resources);
         #[cfg(feature = "profiling")]
         drop(dom_scope);
         if let Some(timings) = timings.as_deref_mut() {
             timings.dom = started.expect("timed preparation").elapsed();
         }
-        self.build_pipeline_from_dom_instrumented(document, base_uri, parsed_html.source_encoding(), css_chunks, timings, resources)
+        self.build_pipeline_from_dom_instrumented(
+            document,
+            parsed_html.source_encoding(),
+            css_chunks,
+            timings,
+            resources,
+        )
     }
 
     pub(crate) fn build_pipeline_from_owned_parsed(&mut self, parsed: ParsedHtml, css_chunks: &[impl AsRef<str>], resources: Option<ResourceContext<'_>>) -> (PreparedDocument<'static>, html_style::MediaQuerySet) {
-        let title = parsed.title();
-        let encoding = parsed.source_encoding().map(str::to_owned);
-        let (document, base_uri) = self.configure_dom(parsed.into_dom(), title, resources);
-        self.build_pipeline_from_dom_instrumented(document, base_uri, encoding.as_deref(), css_chunks, None, resources)
+        self.try_build_pipeline_from_owned_parsed(parsed, css_chunks, resources)
+            .expect("parsed markup must form a valid DOM")
     }
 
-    fn build_pipeline_from_dom_instrumented(&mut self, document: Document, base_uri: String, document_encoding: Option<&str>, css_chunks: &[impl AsRef<str>], mut timings: Option<&mut PreparationTimings>, resources: Option<ResourceContext<'_>>) -> (PreparedDocument<'static>, html_style::MediaQuerySet) {
+    fn try_build_pipeline_from_owned_parsed(&mut self, parsed: ParsedHtml, css_chunks: &[impl AsRef<str>], resources: Option<ResourceContext<'_>>) -> Result<(PreparedDocument<'static>, html_style::MediaQuerySet), DocumentBuildError> {
+        let title = parsed.title();
+        let encoding = parsed.source_encoding().map(str::to_owned);
+        let document = self.configure_dom(parsed.into_dom_checked()?, title, resources);
+        Ok(self.build_pipeline_from_dom_instrumented(
+            document,
+            encoding.as_deref(),
+            css_chunks,
+            None,
+            resources,
+        ))
+    }
+
+    fn build_pipeline_from_dom_instrumented(
+        &mut self,
+        document: Document,
+        document_encoding: Option<&str>,
+        css_chunks: &[impl AsRef<str>],
+        mut timings: Option<&mut PreparationTimings>,
+        resources: Option<ResourceContext<'_>>,
+    ) -> (PreparedDocument<'static>, html_style::MediaQuerySet) {
         let started = timings.as_ref().map(|_| Instant::now());
         #[cfg(feature = "profiling")]
         let stylesheets_scope = scope("factory.stylesheets");
-        let expanded_css = self.expanded_document_stylesheets(&document, &base_uri, document_encoding, css_chunks, resources);
+        let expanded_css = self.expanded_document_stylesheets(
+            &document,
+            document.resource_base_uri().unwrap_or(""),
+            document_encoding,
+            css_chunks,
+            resources,
+        );
         #[cfg(feature = "profiling")]
         drop(stylesheets_scope);
         if let Some(timings) = timings.as_deref_mut() {
@@ -351,12 +377,29 @@ impl DocumentFactory {
         expanded_css
     }
 
-    pub(crate) fn resolve_canonical_dom(&mut self, document: &Document, document_encoding: Option<&str>, css_chunks: &[impl AsRef<str>], resources: Option<ResourceContext<'_>>) -> (ComputedStyles, html_style::MediaQuerySet) {
-        let base_uri = resources.as_ref().map_or_else(String::new, |resources| effective_document_base_uri(document, resources));
-        let expanded = self.expanded_document_stylesheets(document, &base_uri, document_encoding, css_chunks, resources);
+    pub(crate) fn resolve_canonical_dom(
+        &mut self,
+        document: &Document,
+        document_encoding: Option<&str>,
+        css_chunks: &[impl AsRef<str>],
+        resources: Option<ResourceContext<'_>>,
+    ) -> (ComputedStyles, html_style::MediaQuerySet) {
+        let base_uri = document.resource_base_uri().unwrap_or("");
+        let expanded = self.expanded_document_stylesheets(
+            document,
+            base_uri,
+            document_encoding,
+            css_chunks,
+            resources,
+        );
         let (styles, _, queries) = self.resolve_styles(document, &expanded);
-        let language = resources.as_ref().and_then(|resources| resources.provider.primary_language());
-        (styles.with_hyphenation_fallback_language(language.as_deref()), queries)
+        let language = resources
+            .as_ref()
+            .and_then(|resources| resources.provider.primary_language());
+        (
+            styles.with_hyphenation_fallback_language(language.as_deref()),
+            queries,
+        )
     }
 
     fn resolve_styles(&mut self, document: &Document, expanded: &[ExpandedStylesheet]) -> (ComputedStyles, StyleTimings, html_style::MediaQuerySet) {
@@ -368,7 +411,6 @@ impl DocumentFactory {
             self.style_program_cache.get_or_compile_resources(&sources, self.media_environment, document.root_font_size())
         };
         self.font_faces = program.shared_font_faces();
-        self.font_palettes = program.shared_font_palettes();
         html_style::resolve_document_with_program(
             document,
             &program,
@@ -378,7 +420,12 @@ impl DocumentFactory {
         )
     }
 
-    fn configure_dom(&self, mut document: Document, title: Option<String>, resources: Option<ResourceContext<'_>>) -> (Document, String) {
+    fn configure_dom(
+        &self,
+        mut document: Document,
+        title: Option<String>,
+        resources: Option<ResourceContext<'_>>,
+    ) -> Document {
         document.set_root_font_size(self.root_font_size);
         document.set_title(self.title.clone().or(title));
         let base_uri = resources.as_ref().map_or_else(String::new, |resources| effective_document_base_uri(&document, resources));
@@ -391,7 +438,8 @@ impl DocumentFactory {
                 }
             }
         }
-        (document, base_uri)
+        document.set_resource_base_uri(base_uri);
+        document
     }
 
     fn expand_stylesheet(

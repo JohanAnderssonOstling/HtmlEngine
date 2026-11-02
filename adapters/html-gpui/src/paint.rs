@@ -5,8 +5,12 @@ use web_time::Instant;
 
 use gpui::{App, Bounds, ContentMask, Corners, Edges, Hsla, PaintGlyph, Pixels, RenderImage, SvgRenderer, Window, fill, point, px, rgba, size};
 use gpui_image_eviction::track_image;
-use html::layout::{PreparedTextRunFragment, ThemeAdaptation, UsedBorderRadii};
-use html::render::{Painter, TextRunFragment};
+use html_render_core::CornerRadii;
+use html::{
+    style::ThemeAdaptation,
+    text::PreparedTextRunFragment,
+};
+use html_render_core::{Painter, TextRunFragment};
 use html::text::{GlyphId, TextRunId};
 use image::Frame;
 use kurbo::{Point, Rect};
@@ -208,8 +212,8 @@ pub enum PaintCommand {
     PushClip { rect: Rect },
     PopClip,
     Fill { rect: Rect, color: Hsla },
-    RoundedFill { rect: Rect, radii: UsedBorderRadii, color: Hsla },
-    RoundedBorder { rect: Rect, radii: UsedBorderRadii, width: f32, color: Hsla },
+    RoundedFill { rect: Rect, radii: CornerRadii, color: Hsla },
+    RoundedBorder { rect: Rect, radii: CornerRadii, width: f32, color: Hsla },
     Glyph { glyph: GlyphId, origin: Point, color: Hsla },
     TextBatch { fragments: Arc<Vec<GpuiTextRunFragment>> },
     Image { rect: Rect, image: Arc<RenderImage> },
@@ -418,11 +422,11 @@ impl Painter for GpuiCommandPainter<'_> {
         self.commands.push(PaintCommand::Fill { rect, color: gpui_color(color) });
     }
 
-    fn fill_rounded_rect(&mut self, rect: Rect, radii: UsedBorderRadii, color: Color) {
+    fn fill_rounded_rect(&mut self, rect: Rect, radii: CornerRadii, color: Color) {
         self.commands.push(PaintCommand::RoundedFill { rect, radii, color: gpui_color(color) });
     }
 
-    fn stroke_rounded_rect(&mut self, rect: Rect, radii: UsedBorderRadii, width: f32, color: Color) {
+    fn stroke_rounded_rect(&mut self, rect: Rect, radii: CornerRadii, width: f32, color: Color) {
         self.commands.push(PaintCommand::RoundedBorder { rect, radii, width, color: gpui_color(color) });
     }
 
@@ -734,7 +738,7 @@ fn paint_commands_inner(commands: &[PaintCommand], glyphs: &GlyphStorage, bounds
     }
 }
 
-fn gpui_radii(radii: UsedBorderRadii) -> Corners<Pixels> {
+fn gpui_radii(radii: CornerRadii) -> Corners<Pixels> {
     // GPUI's quad primitive has circular rather than elliptical corners. The
     // smaller axis stays inside the CSS ellipse and avoids overpainting.
     Corners {

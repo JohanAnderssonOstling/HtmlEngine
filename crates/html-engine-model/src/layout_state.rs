@@ -3,10 +3,12 @@ use super::grouped_arena::GroupedArena;
 use super::paint_program::PaintLayers;
 use super::text_fragments::{LineTextFragments, OwnedTextFragments, TextFragmentStore};
 use html_dom::MemoryUsageReport;
-use html_style_model::UsedBorderRadii;
+use html_style_model::CornerRadii;
 use kurbo::{Point, Rect, Size};
 use rustc_data_structures::fx::FxHashMap;
+use std::cmp::Ordering;
 use std::num::NonZeroU32;
+use std::ops::Deref;
 use std::ops::Range;
 
 /// Output of the layout phase: line boxes, glyph offsets, and paint fragments.
@@ -45,13 +47,13 @@ pub struct LineOutput {
     /// Emission-order storage. Its indexes are stable line IDs, not spatial ranks.
     pub lines: Vec<Line>,
     /// Stable IDs sorted by nominal bottom edge for pagination and viewport lookup.
-    pub spatial_order: Vec<LineId>,
-    /// Inverse spatial traversal, indexed by stable line ID.
-    pub spatial_ranks: Vec<u32>,
+    pub spatial_order: LineTraversal,
+    /// Maximum visible distances above/below a nominal line bottom.
+    pub hit_test_above: f64,
+    pub hit_test_below: f64,
     /// Pagination traversal packs each explicit attachment group together;
     /// unrelated spatially interleaved lines retain independent membership.
-    pub pagination_order: Vec<LineId>,
-    pub pagination_ranks: Vec<u32>,
+    pub pagination_order: LineTraversal,
     pub pagination_groups: Vec<LinePaginationGroup>,
     pub pagination_anchors: Vec<LinePaginationAnchor>,
     /// Group starts sorted by document-space origin for exact continuation lookup.
@@ -63,9 +65,7 @@ pub struct LineOutput {
     pub line_details: Vec<LineDetails>,
     pub text_fragments: TextFragmentStore,
     /// Stable line IDs in CSS paint order, independent of spatial traversal.
-    pub paint_order_indices: Vec<LineId>,
-    /// CSS paint rank indexed by stable line ID, for ordering visible lines.
-    pub paint_order_ranks: Vec<u32>,
+    pub paint_order_indices: LineTraversal,
     /// Contiguous non-text inline fragment arena. Each line owns a range into
     /// this buffer, avoiding one heap allocation per non-trivial line.
     pub inline_box_fragments: Vec<LineInlineBoxFragment>,
@@ -86,6 +86,68 @@ pub struct LineOutput {
     pub hyphen_fragments: Vec<HyphenFragment>,
 }
 
+/// A permutation and its inverse, rebuilt and cleared as one operation.
+/// Readers borrow slices; writers cannot independently edit either index.
+#[derive(Default, Clone)]
+pub struct LineTraversal {
+    order: Vec<LineId>,
+    ranks: Vec<u32>,
+}
+
+impl Deref for LineTraversal {
+    type Target = [LineId];
+    fn deref(&self) -> &[LineId] {
+        &self.order
+    }
+}
+
+impl LineTraversal {
+    #[inline]
+    pub fn ranks(&self) -> &[u32] {
+        &self.ranks
+    }
+
+    #[inline]
+    pub fn clear(&mut self) {
+        self.order.clear();
+        self.ranks.clear();
+    }
+
+    #[inline]
+    pub fn rebuild(&mut self, len: usize, compare: impl FnMut(&LineId, &LineId) -> Ordering) {
+        self.rebuild_impl(len, compare, true);
+    }
+
+    #[inline]
+    pub fn rebuild_unstable(
+        &mut self,
+        len: usize,
+        compare: impl FnMut(&LineId, &LineId) -> Ordering,
+    ) {
+        self.rebuild_impl(len, compare, false);
+    }
+
+    #[inline]
+    fn rebuild_impl(
+        &mut self,
+        len: usize,
+        compare: impl FnMut(&LineId, &LineId) -> Ordering,
+        stable: bool,
+    ) {
+        self.order.clear();
+        self.order.extend((0..len).map(LineId::new));
+        if stable {
+            self.order.sort_by(compare);
+        } else {
+            self.order.sort_unstable_by(compare);
+        }
+        self.ranks.resize(len, 0);
+        for (rank, id) in self.order.iter().enumerate() {
+            self.ranks[id.index()] = rank as u32;
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct LinePaginationGroup {
     /// Explicit members in `pagination_order`, independent of spatial ranges.
@@ -102,12 +164,8 @@ pub struct LinePaginationAnchor {
 
 #[derive(Default, Clone)]
 pub struct FragmentOutput {
-    /// Combined CSS traversal for consumers that paint a complete scene.
-    pub scene_paint_order: Vec<ScenePaintItem>,
-    /// Inverse indexes let partial surfaces replay visible items without
-    /// scanning the complete document's CSS stream every frame.
-    pub scene_line_ranks: Vec<u32>,
-    pub scene_decoration_ranks: Vec<u32>,
+    /// Combined CSS traversal and inverse indexes for complete and partial scenes.
+    pub scene_paint_order: SceneTraversal,
     pub decorations: DecorationStore,
     /// Owning line for inline decorations, or `u32::MAX` for block and
     /// line-independent fragments. Renderers must not infer this relationship
@@ -146,12 +204,105 @@ pub enum ScenePaintItem {
     Line(u32),
 }
 
+/// CSS traversal and sparse inverse indexes published together.
+#[derive(Default, Clone)]
+pub struct SceneTraversal {
+    order: Vec<ScenePaintItem>,
+    line_ranks: Vec<u32>,
+    decoration_ranks: Vec<u32>,
+}
+
+impl Deref for SceneTraversal {
+    type Target = [ScenePaintItem];
+    fn deref(&self) -> &[ScenePaintItem] {
+        &self.order
+    }
+}
+
+impl SceneTraversal {
+    #[inline]
+    pub fn line_ranks(&self) -> &[u32] {
+        &self.line_ranks
+    }
+    #[inline]
+    pub fn decoration_ranks(&self) -> &[u32] {
+        &self.decoration_ranks
+    }
+    #[inline]
+    pub fn clear(&mut self) {
+        self.order.clear();
+        self.line_ranks.clear();
+        self.decoration_ranks.clear();
+    }
+    #[inline]
+    pub fn rebuild(
+        &mut self,
+        items: impl IntoIterator<Item = ScenePaintItem>,
+        lines: usize,
+        decorations: usize,
+    ) {
+        self.clear();
+        self.order.extend(items);
+        self.line_ranks.resize(lines, u32::MAX);
+        self.decoration_ranks.resize(decorations, u32::MAX);
+        for (rank, item) in self.order.iter().enumerate() {
+            let target = match *item {
+                ScenePaintItem::Line(line) => &mut self.line_ranks[line as usize],
+                ScenePaintItem::Decoration(index) => &mut self.decoration_ranks[index as usize],
+            };
+            debug_assert_eq!(*target, u32::MAX, "duplicate scene item");
+            *target = rank as u32;
+        }
+    }
+}
+
 #[derive(Default, Clone)]
 pub struct SemanticIndexes {
     pub anchor_positions: FxHashMap<u16, AnchorPosition>,
 }
 
 impl LayoutState {
+    /// Clear derived output together while retaining all reusable buffers.
+    #[inline]
+    pub fn clear(&mut self) {
+        self.paint_program.clear();
+        self.line_output.lines.clear();
+        self.line_output.spatial_order.clear();
+        self.line_output.pagination_order.clear();
+        self.line_output.pagination_groups.clear();
+        self.line_output.pagination_anchors.clear();
+        self.line_output.pagination_origins.clear();
+        self.line_output.box_line_ranges.clear();
+        self.line_output.line_details.clear();
+        self.line_output.text_fragments.clear();
+        self.line_output.paint_order_indices.clear();
+        self.line_output.inline_box_fragments.clear();
+        self.line_output.paint_layers.clear();
+        self.line_output.line_clips.clear();
+        self.line_output.glyph_line_indices.clear();
+        self.line_output.line_glyph_offsets.clear();
+        self.line_output.line_glyph_advances.clear();
+        self.line_output.prepared_text_run_fragments.clear();
+        self.line_output.ellipsis_fragments.clear();
+        self.line_output.hyphen_fragments.clear();
+        self.fragment_output.decorations.clear();
+        self.fragment_output.scene_paint_order.clear();
+        self.fragment_output.decoration_line_indices.clear();
+        self.fragment_output.block_decoration_owners.clear();
+        self.fragment_output.decoration_paint_orders.clear();
+        self.fragment_output.decoration_fragments_by_line.clear();
+        self.fragment_output.decoration_paint_layers.clear();
+        self.fragment_output.block_paint_ranges.clear();
+        self.fragment_output.block_decoration_indices_by_y.clear();
+        self.fragment_output.block_decoration_prefix_max_y1.clear();
+        self.fragment_output.block_decoration_paint_ranks.clear();
+        self.fragment_output.block_decoration_count = 0;
+        self.fragment_output.decoration_clips.clear();
+        self.fragment_output.image_fragments.clear();
+        self.fragment_output.image_fragments_by_line.clear();
+        self.semantic_indexes.anchor_positions.clear();
+    }
+
     pub fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
         report.extend_prefixed(
@@ -172,19 +323,19 @@ impl LayoutState {
         );
         report.add_vec_storage(
             "LayoutState.line_output.spatial_order.storage",
-            &self.line_output.spatial_order,
+            &self.line_output.spatial_order.order,
         );
         report.add_vec_storage(
             "LayoutState.line_output.spatial_ranks.storage",
-            &self.line_output.spatial_ranks,
+            &self.line_output.spatial_order.ranks,
         );
         report.add_vec_storage(
             "LayoutState.line_output.pagination_order.storage",
-            &self.line_output.pagination_order,
+            &self.line_output.pagination_order.order,
         );
         report.add_vec_storage(
             "LayoutState.line_output.pagination_ranks.storage",
-            &self.line_output.pagination_ranks,
+            &self.line_output.pagination_order.ranks,
         );
         report.add_vec_storage(
             "LayoutState.line_output.pagination_groups.storage",
@@ -204,11 +355,11 @@ impl LayoutState {
         );
         report.add_vec_storage(
             "LayoutState.line_output.paint_order_indices.storage",
-            &self.line_output.paint_order_indices,
+            &self.line_output.paint_order_indices.order,
         );
         report.add_vec_storage(
             "LayoutState.line_output.paint_order_ranks.storage",
-            &self.line_output.paint_order_ranks,
+            &self.line_output.paint_order_indices.ranks,
         );
         report.add_vec_storage(
             "LayoutState.line_output.inline_box_fragments.storage",
@@ -248,15 +399,15 @@ impl LayoutState {
         );
         report.add_vec_storage(
             "LayoutState.fragment_output.scene_paint_order.storage",
-            &self.fragment_output.scene_paint_order,
+            &self.fragment_output.scene_paint_order.order,
         );
         report.add_vec_storage(
             "LayoutState.fragment_output.scene_line_ranks.storage",
-            &self.fragment_output.scene_line_ranks,
+            &self.fragment_output.scene_paint_order.line_ranks,
         );
         report.add_vec_storage(
             "LayoutState.fragment_output.scene_decoration_ranks.storage",
-            &self.fragment_output.scene_decoration_ranks,
+            &self.fragment_output.scene_paint_order.decoration_ranks,
         );
         report.add_slice_storage::<DecorationFragment>(
             "LayoutState.fragment_output.decorations.storage",
@@ -841,7 +992,7 @@ impl DecorationFragment {
 
 #[derive(Clone, Copy, Debug)]
 pub struct RoundedDecoration {
-    pub radii: UsedBorderRadii,
+    pub radii: CornerRadii,
     /// `None` is a filled background; `Some` is a uniform solid border width.
     pub border_width: Option<f32>,
 }
@@ -904,9 +1055,9 @@ mod tests {
     fn decoration_store_owns_sparse_rounded_geometry() {
         let mut decorations = DecorationStore::default();
         decorations.push(DecorationFragment::background_rect(Rect::ZERO, 1, false));
-        let radii = UsedBorderRadii {
+        let radii = CornerRadii {
             top_left: (4.0, 5.0),
-            ..UsedBorderRadii::default()
+            ..CornerRadii::default()
         };
         decorations.push_rounded_background(
             Rect::ZERO,

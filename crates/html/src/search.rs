@@ -32,9 +32,9 @@ impl SearchIndex {
     }
 
     pub fn from_source(source: &str, syntax: MarkupSyntax) -> Result<Self, Error> {
-        let parsed = parse_document(source, syntax).map_err(|error| Error(error.to_string()))?;
+        let parsed = parse_document(source, syntax).map_err(Error::from)?;
         let index =
-            DocumentTextIndex::from_parsed(&parsed).map_err(|error| Error(error.to_string()))?;
+            DocumentTextIndex::from_parsed(&parsed).map_err(Error::from)?;
         Ok(Self::from_index(index))
     }
 
@@ -42,7 +42,7 @@ impl SearchIndex {
     /// fonts, images, or constructing layout.
     pub fn load(provider: &dyn ResourceProvider, uri: &str) -> Result<Self, Error> {
         let (source, syntax) = read_document_source(provider, uri)
-            .map_err(|error| Error(error.to_string()))?;
+            .map_err(Error::from)?;
         Self::from_source(&source, syntax)
     }
 

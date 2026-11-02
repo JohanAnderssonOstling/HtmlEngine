@@ -1,14 +1,15 @@
 //! Independently laid-out content from one document. Hosts choose its placement.
 
-use crate::engine::Engine;
+use crate::engine::{Engine, Error};
 use crate::export::DocumentExport;
 use crate::geometry::{Geometry, WordHitPolicy};
-use crate::layout::{GlyphShaper, LayoutConstraints, NoteLayout, RenderView};
-use crate::render::{FragmentRenderOptions, RenderScene};
+use crate::{layout::RenderView, text::GlyphShaper};
+use crate::render::{FragmentImagePolicy, FragmentRenderOptions, RenderScene};
 use crate::selection::{
     Selection, SelectionGeometry, SelectionMode, SelectionState, SelectionText,
 };
 use kurbo::Point;
+use html_pipeline::engine::{LayoutConstraints, NoteLayout};
 use std::ops::Range;
 
 /// A subtree's layout and logical selection, sharing DOM, styles and native
@@ -23,17 +24,23 @@ pub struct ScopedContent {
 impl Engine {
     /// Lay out any element with this ID, including a note excluded from flow.
     /// Existing document paint resources remain valid while scope resources append.
+    /// An absent element returns `Ok(None)`; backend failures return `Err`.
     pub fn scope(
         &mut self,
         id: &str,
-        constraints: LayoutConstraints,
+        width: f64,
         shaper: &mut impl GlyphShaper,
-    ) -> Option<ScopedContent> {
-        Some(ScopedContent {
-            layout: self.layout_note(id, constraints, shaper)?,
+    ) -> Result<Option<ScopedContent>, Error> {
+        let inputs = self.inputs().expect("loaded engine owns document inputs");
+        let constraints = LayoutConstraints::new(
+            width, f64::from(inputs.style_environment.root_font_size.get() as u32),
+        )?;
+        let Some(layout) = self.layout_note(id, constraints, shaper)? else { return Ok(None) };
+        Ok(Some(ScopedContent {
+            layout,
             selection: SelectionState::default(),
             constraints,
-        })
+        }))
     }
 }
 
@@ -52,8 +59,14 @@ impl ScopedContent {
     }
 
     pub fn scene(&self, owner: &Engine) -> Option<RenderScene> {
-        let options = FragmentRenderOptions::new(self.constraints.viewport_width(), None).ok()?;
-        Some(RenderScene::for_view(self.render_view(owner)?, &options))
+        let options = FragmentRenderOptions::new(self.constraints.viewport_width(), None)
+            .ok()?
+            .with_image_policy(FragmentImagePolicy::Reference);
+        Some(RenderScene::for_view_with_images(
+            self.render_view(owner)?,
+            &options,
+            owner.images(),
+        ))
     }
 
     pub fn selection<'a>(&'a self, owner: &'a Engine) -> Option<Selection<'a>> {

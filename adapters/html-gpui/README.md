@@ -43,6 +43,20 @@ text shaping contract. `backend::GpuiCommandPainter` records engine paint output
 publication font registration and image caching. The host chooses document
 placement, scrolling or pagination.
 
+Typography defaults and CSS feature overrides are resolved by the engine.
+The adapter translates the supplied `FontFeatures` record into native OpenType
+settings and caches that translation with font selection. Native run advances
+and cluster geometry drive engine layout, including the effects of kerning and
+ligatures; no separate capability report is needed.
+
+The adapter implements one run-shaping operation and returns geometry plus
+adapter-owned paint handles. Engine metric registration and layout glyph IDs
+stay inside the engine. Font keys and preparation are private to this adapter.
+Native runs supply painting resources across scripts without a second per-character
+shaping pass. Mixed-font vertical extents come from the retained native font spans.
+GPUI feature settings are immutable shared values with a cached hash, so repeated
+font lookups avoid hashing feature strings and shared values compare by pointer.
+
 Publication face selection uses `font-stretch`/`font-width` before style and
 weight matching, and uses oblique angles when choosing between declared face
 ranges. The shared COSMIC Text GPUI backend applies variable-font weight, width,
@@ -52,12 +66,9 @@ outline fonts, the backend synthesizes the remaining oblique angle;
 synthesized angles are limited to ±89° to keep the shear finite. Width and angle
 are part of the font and glyph cache identities, including fallback glyphs.
 These settings are not yet applied by the separate CoreText and DirectWrite
-backends. The shared backend also renders built-in `light`/`dark` font palettes
-and named `@font-palette-values`, including base palette selection and color
-overrides for COLR fonts supported by Swash. Palette definitions are scoped to
-the active document and participate in font and glyph cache identities. Each
-fallback glyph selects its palette using its resolved font family. Color layers
-use unhinted outlines so Unicode subsetting keeps their authored geometry. Empty
+backends. Color fonts use their default colors; CSS `font-palette` and
+`@font-palette-values` customization is unsupported. Color layers use unhinted
+outlines so Unicode subsetting keeps their authored geometry. Empty
 quoted font family names are preserved when extracting and selecting publication
 faces.
 

@@ -3,8 +3,9 @@
 
 use crate::{Shaper, cpu_seconds, heap, layout_fingerprint, median};
 use html::document::{ImageResource, ImageSource};
-use html::layout::LayoutConstraints;
-use html::pipeline::{BookStylesheetCache, DocumentFactory, parse_html_document};
+use html_pipeline::engine::LayoutConstraints;
+use html_pipeline::{BookStylesheetCache, DocumentFactory};
+use html::document::parse_html_document;
 use html::resources::{FileSystemProvider, ImagePipeline};
 use html::text::GlyphResourceStore;
 use serde_json::{Value, json};
@@ -76,10 +77,10 @@ pub(super) fn run(path: &str, case: &str, count: usize) {
                 .collect::<Vec<_>>();
             let mut pipeline = ImagePipeline::new(Arc::new(FileSystemProvider));
             pipeline.ensure_window(&images, &(0..256).collect::<HashSet<_>>());
-            assert!(pipeline.poll().decoded);
+            assert!(pipeline.poll(&images).decoded);
             let mut result = measure(count, || {
                 for _ in 0..100 {
-                    assert!(!black_box(pipeline.poll()).decoded);
+                    assert!(!black_box(pipeline.poll(&images)).decoded);
                 }
             });
             let dimensions: Vec<_> = (0..256)

@@ -2,9 +2,9 @@
 //! Shapes afresh each frame; images and native text-run shaping are omitted.
 
 use gpui::{
-    App, Bounds, Context, Font, FontStyle, FontWeight, PaintGlyph, Pixels, Point, ShapedLine,
-    TextRun, Window, WindowOptions, WindowTextSystem, canvas, div, fill, point, prelude::*, px,
-    rgb, rgba, size,
+    App, Bounds, Context, Font, FontStyle, FontVariations, FontWeight, PaintGlyph, Pixels, Point,
+    ShapedLine, TextRun, Window, WindowOptions, WindowTextSystem, canvas, div, fill, point,
+    prelude::*, px, rgb, rgba, size,
 };
 use html::render::{FragmentImagePolicy, FragmentRenderOptions, FragmentRenderer, Painter};
 use html::text::{
@@ -19,13 +19,15 @@ fn shape_glyph(
     request: GlyphRequest<'_>,
     glyphs: &mut GlyphResources<ShapedLine>,
 ) -> Result<ShapedGlyph, ShapeError> {
+    let (style, angle) = match request.style.font_slant {
+        FontSlant::Normal => (FontStyle::Normal, None),
+        FontSlant::Italic => (FontStyle::Italic, None),
+        FontSlant::Oblique { angle } => (FontStyle::Oblique, Some(angle.degrees())),
+    };
     let font = Font {
-        weight: FontWeight(f32::from(request.font_weight)),
-        style: match request.font_slant {
-            FontSlant::Normal => FontStyle::Normal,
-            FontSlant::Italic => FontStyle::Italic,
-            FontSlant::Oblique => FontStyle::Oblique,
-        },
+        weight: FontWeight(f32::from(request.style.font_weight)),
+        style,
+        variations: FontVariations::new(request.style.font_stretch, angle).unwrap_or_default(),
         ..Font::default() // System font for this minimal adapter.
     };
     let text = request.character.to_string();
@@ -34,15 +36,15 @@ fn shape_glyph(
         font,
         ..Default::default()
     };
-    let line = if request.font_size == 0.0 || request.character.is_control() {
+    let line = if request.style.font_size == 0.0 || request.character.is_control() {
         ShapedLine::default()
     } else {
-        system.shape_line(text.into(), px(request.font_size), &[run], None)
+        system.shape_line(text.into(), px(request.style.font_size), &[run], None)
     };
-    let metrics = FontMetrics::new(f32::from(line.ascent), f32::from(line.descent))?;
+    let metrics = FontMetrics::new(f32::from(line.ascent), f32::from(line.descent));
     let advance = f32::from(line.width());
     let handle = glyphs.insert(line)?;
-    Ok(ShapedGlyph::new(handle, advance, metrics)?)
+    Ok(ShapedGlyph::new(handle, advance, metrics))
 }
 
 struct GpuiPainter<'a> {

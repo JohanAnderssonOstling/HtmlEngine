@@ -1,4 +1,5 @@
 use html_dom::{Document, ImageResource, ImageSource};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Intrinsic image sizes shared by input and layout snapshots. Updating one
@@ -6,7 +7,22 @@ use std::sync::Arc;
 #[derive(Clone, Debug, Default)]
 pub struct ImageMetrics {
     sizes: Arc<Vec<(u32, u32)>>,
+    generation: u64,
 }
+
+fn next_generation() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.try_update(Ordering::Relaxed, Ordering::Relaxed, |value| value.checked_add(1))
+        .expect("image metric generation space exhausted")
+}
+
+impl PartialEq for ImageMetrics {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.sizes, &other.sizes) || self.sizes == other.sizes
+    }
+}
+
+impl Eq for ImageMetrics {}
 
 impl ImageMetrics {
     pub fn from_document(document: &Document) -> Self {
@@ -15,8 +31,17 @@ impl ImageMetrics {
             sizes.push((image.width, image.height));
         }
         Self {
+            generation: if sizes.is_empty() { 0 } else { next_generation() },
             sizes: Arc::new(sizes),
         }
+    }
+
+    /// Identity of this snapshot for cache invalidation. Clones and unchanged
+    /// writes preserve it; a changed size assigns a fresh identity. Empty
+    /// default snapshots share zero, so preparing another empty input is free.
+    #[inline]
+    pub fn cache_generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn set(&mut self, image_idx: u32, width: u32, height: u32) {
@@ -29,6 +54,7 @@ impl ImageMetrics {
             sizes.resize(idx + 1, (0, 0));
         }
         sizes[idx] = (width, height);
+        self.generation = next_generation();
     }
 
     pub fn get(&self, image_idx: u32) -> Option<(u32, u32)> {

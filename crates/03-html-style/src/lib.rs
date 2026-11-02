@@ -54,8 +54,7 @@ pub use style::DEFAULT_CSS;
 pub use style::document::{AuthorStylesheetInput, StyledDocument};
 pub use style::timings::StyleTimings;
 pub use style::source::fonts::{
-    FontFace, FontFaceDescriptor, FontFaceSource, FontFaceStyle, FontPalette,
-    resolve_font_face_urls,
+    FontFace, FontFaceDescriptor, FontFaceSource, FontFaceStyle, resolve_font_face_urls,
 };
 pub use style::source::resource::{ResourceImport, ResourceStylesheet, ResourceStylesheetEntry};
 pub use style::source::imports::{

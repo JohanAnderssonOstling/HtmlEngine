@@ -1,6 +1,6 @@
 //! Optional font-data preparation. Hosts supply I/O and local-font discovery;
 //! native registration, private family rewriting and cache policy stay outside.
-use crate::style::{FontFace, FontFaceSource};
+use crate::text::{FontFace, FontFaceSource};
 use std::borrow::Cow;
 use std::future::Future;
 use std::pin::Pin;

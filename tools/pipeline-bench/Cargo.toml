@@ -8,9 +8,12 @@ edition = "2024"
 # Disable default features only when building the frozen pre-ownership engine.
 default = ["borrowed-view"]
 heap = []
-profiling = ["html/profiling"]
+profiling = ["html/profiling", "html-pipeline/profiling"]
 borrowed-view = []
 [dependencies]
+html-engine-model = { package = "skrift-engine-model", path = "../../crates/html-engine-model" }
 html = { version = "0.1.0", package = "skrift", path = "../../crates/html" }
 libc = "0.2"
 serde_json = "1"
+html-pipeline = { package = "skrift-pipeline", path = "../../crates/html-pipeline" }
+html-style = { package = "skrift-style", path = "../../crates/03-html-style" }

@@ -1,4 +1,4 @@
-use crate::layout_model::{LayoutMode, LineId, ScenePaintItem};
+use crate::layout_model::{LayoutMode, ScenePaintItem};
 use html_style_model::{BorderCollapseMode, Float, PositionMode, UsedStyleView};
 use std::ops::Range;
 
@@ -149,7 +149,7 @@ pub(in crate::layout) fn build_scene_paint_order(
     for (index, line) in layout.line_output.lines.iter().enumerate() {
         items.push((
             paint_order_key(reader, line.owner_box_idx as usize, 3),
-            layout.line_output.paint_order_ranks[index],
+            layout.line_output.paint_order_indices.ranks()[index],
             1u8,
             index,
             ScenePaintItem::Line(index as u32),
@@ -196,7 +196,7 @@ pub(in crate::layout) fn build_scene_paint_order(
                     layout.line_output.lines[line as usize].owner_box_idx as usize,
                     3,
                 ),
-                layout.line_output.paint_order_ranks[line as usize],
+                layout.line_output.paint_order_indices.ranks()[line as usize],
             )
         } else {
             continue;
@@ -214,28 +214,12 @@ pub(in crate::layout) fn build_scene_paint_order(
     // painted before an earlier context's text. Line decorations retain their
     // before/after-text relationship within the same carrier line.
     items.sort_by(|a, b| (&a.0, a.1, a.2, a.3).cmp(&(&b.0, b.1, b.2, b.3)));
-    layout.fragment_output.scene_paint_order.clear();
-    layout
-        .fragment_output
-        .scene_paint_order
-        .extend(items.into_iter().map(|(_, _, _, _, item)| item));
     let output = &mut layout.fragment_output;
-    output.scene_line_ranks.clear();
-    output
-        .scene_line_ranks
-        .resize(layout.line_output.lines.len(), u32::MAX);
-    output.scene_decoration_ranks.clear();
-    output
-        .scene_decoration_ranks
-        .resize(output.decorations.len(), u32::MAX);
-    for (rank, item) in output.scene_paint_order.iter().enumerate() {
-        match *item {
-            ScenePaintItem::Line(line) => output.scene_line_ranks[line as usize] = rank as u32,
-            ScenePaintItem::Decoration(index) => {
-                output.scene_decoration_ranks[index as usize] = rank as u32
-            }
-        }
-    }
+    output.scene_paint_order.rebuild(
+        items.into_iter().map(|(_, _, _, _, item)| item),
+        layout.line_output.lines.len(),
+        output.decorations.len(),
+    );
 }
 
 /// Build independent traversals over stable emission-order line storage.
@@ -244,44 +228,38 @@ pub(super) fn build_line_traversals(reader: &LayoutReader<'_>, fragments: &mut F
     let output = &mut fragments.state_mut().line_output;
     output.line_glyph_offsets.freeze();
     output.line_glyph_advances.freeze();
-    output.spatial_order.clear();
     output
         .spatial_order
-        .extend((0..output.lines.len()).map(LineId::new));
-    output.spatial_order.sort_unstable_by(|a, b| {
-        let left = &output.lines[a.index()];
-        let right = &output.lines[b.index()];
-        (left.point.y + left.height)
-            .total_cmp(&(right.point.y + right.height))
-            .then_with(|| left.point.y.total_cmp(&right.point.y))
-            .then_with(|| left.point.x.total_cmp(&right.point.x))
-            .then_with(|| a.cmp(b))
-    });
-    output.spatial_ranks.resize(output.lines.len(), 0);
-    for (rank, &id) in output.spatial_order.iter().enumerate() {
-        output.spatial_ranks[id.index()] = rank as u32;
-    }
+        .rebuild_unstable(output.lines.len(), |a, b| {
+            let left = &output.lines[a.index()];
+            let right = &output.lines[b.index()];
+            (left.point.y + left.height)
+                .total_cmp(&(right.point.y + right.height))
+                .then_with(|| left.point.y.total_cmp(&right.point.y))
+                .then_with(|| left.point.x.total_cmp(&right.point.x))
+                .then_with(|| a.cmp(b))
+        });
     let keys: Vec<_> = output
         .lines
         .iter()
         .map(|line| paint_order_key(reader, line.owner_box_idx as usize, 3))
         .collect();
-    output.paint_order_indices.clear();
+    output.hit_test_above = output
+        .lines
+        .iter()
+        .map(|line| line.height)
+        .fold(0.0_f64, f64::max);
+    output.hit_test_below = 0.0;
     output
         .paint_order_indices
-        .extend((0..output.lines.len()).map(LineId::new));
-    output.paint_order_indices.sort_by(|a, b| {
-        let left = &output.lines[a.index()];
-        let right = &output.lines[b.index()];
-        keys[a.index()]
-            .cmp(&keys[b.index()])
-            .then_with(|| left.point.y.total_cmp(&right.point.y))
-            .then_with(|| left.point.x.total_cmp(&right.point.x))
-    });
-    output.paint_order_ranks.resize(output.lines.len(), 0);
-    for (rank, &id) in output.paint_order_indices.iter().enumerate() {
-        output.paint_order_ranks[id.index()] = rank as u32;
-    }
+        .rebuild(output.lines.len(), |a, b| {
+            let left = &output.lines[a.index()];
+            let right = &output.lines[b.index()];
+            keys[a.index()]
+                .cmp(&keys[b.index()])
+                .then_with(|| left.point.y.total_cmp(&right.point.y))
+                .then_with(|| left.point.x.total_cmp(&right.point.x))
+        });
     output
         .ellipsis_fragments
         .sort_unstable_by_key(|fragment| fragment.line_idx);
@@ -412,7 +390,18 @@ pub(super) fn rebuild_image_fragments_by_line(fragments: &mut FragmentWriter<'_>
     let by_line = &mut layout.fragment_output.image_fragments_by_line;
     by_line.reset_groups(layout.line_output.lines.len());
     for (idx, fragment) in layout.fragment_output.image_fragments.iter().enumerate() {
-        if fragment.line_idx < by_line.len() { by_line.push_to(fragment.line_idx, idx); }
+        if fragment.line_idx < by_line.len() {
+            by_line.push_to(fragment.line_idx, idx);
+            let visible = kurbo::Rect::from_origin_size(fragment.offset, fragment.size)
+                .intersect(fragment.clip);
+            let height = layout.line_output.lines[fragment.line_idx].height;
+            if visible.width() > 0.0 && visible.height() > 0.0 {
+                layout.line_output.hit_test_above =
+                    layout.line_output.hit_test_above.max(height - visible.y0);
+                layout.line_output.hit_test_below =
+                    layout.line_output.hit_test_below.max(visible.y1 - height);
+            }
+        }
     }
     by_line.freeze();
 }

@@ -3,7 +3,8 @@
 use crate::*;
 use html_dom::MemoryUsageReport;
 use html_style_model::TextSpacing;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 /// Backend-owned immutable shaped-line identifier. It is only meaningful for
 /// the `GlyphShaper` instance that produced it.
@@ -16,7 +17,7 @@ pub type TextRunId = u32;
 /// the only boundaries at which layout may split the run.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ShapedTextRun {
-    pub advances: Arc<[f32]>,
+    advances: Arc<[f32]>,
     cluster_boundaries: Arc<[bool]>,
     backend_run: Option<TextRunId>,
     caret_stops: Option<CaretPositions>,
@@ -24,49 +25,41 @@ pub struct ShapedTextRun {
 }
 
 impl ShapedTextRun {
-    pub fn new(advances: Arc<[f32]>, cluster_boundaries: Arc<[bool]>) -> Option<Self> {
-        if cluster_boundaries.len() != advances.len().checked_add(1)?
-            || !cluster_boundaries.first().copied().unwrap_or(false)
-            || !cluster_boundaries.last().copied().unwrap_or(false)
-            || advances
-                .iter()
-                .any(|advance| !advance.is_finite() || *advance < 0.0)
-        {
-            return None;
-        }
-        Some(Self {
+    /// The adapter supplies finite, non-negative advances and one more cluster
+    /// boundary than advances, with both outer boundaries enabled.
+    pub fn new(advances: Arc<[f32]>, cluster_boundaries: Arc<[bool]>) -> Self {
+        Self {
             advances,
             cluster_boundaries,
             backend_run: None,
             caret_stops: None,
             ascent: 0.0,
-        })
+        }
     }
 
+    /// The adapter also supplies finite ascent and caret positions, with one
+    /// caret per character boundary. All arrays refer to the same logical run.
     pub fn with_backend_run(
         advances: Arc<[f32]>,
         cluster_boundaries: Arc<[bool]>,
         backend_run: TextRunId,
         caret_stops: CaretPositions,
         ascent: f32,
-    ) -> Option<Self> {
-        let run = Self::new(advances, cluster_boundaries)?;
-        (caret_stops.len() == run.advances.len() + 1
-            && caret_stops.is_finite()
-            && ascent.is_finite())
-        .then_some(Self {
+    ) -> Self {
+        Self {
+            advances,
+            cluster_boundaries,
             backend_run: Some(backend_run),
             caret_stops: Some(caret_stops),
             ascent,
-            ..run
-        })
+        }
     }
 
     pub fn advances(&self) -> &[f32] {
         &self.advances
     }
 
-    /// Share validated geometry with resource ledgers and layout without
+    /// Share geometry with resource ledgers and layout without
     /// copying character arrays at adapter boundaries.
     pub fn shared_advances(&self) -> Arc<[f32]> {
         self.advances.clone()
@@ -74,79 +67,6 @@ impl ShapedTextRun {
 
     pub fn cluster_boundaries(&self) -> &[bool] {
         &self.cluster_boundaries
-    }
-
-    /// Apply range-local CSS spacing to both layout widths and native caret
-    /// positions. Backend cache geometry remains unchanged.
-    pub fn apply_spacing(&mut self, deltas: &[f32], right_to_left: bool) {
-        self.apply_spacing_iter(deltas.iter().copied(), right_to_left);
-    }
-
-    /// Apply replayable per-character spacing without materializing a buffer.
-    /// Iterator clones must produce the same deltas in logical source order.
-    pub fn apply_spacing_iter(
-        &mut self,
-        deltas: impl ExactSizeIterator<Item = f32> + Clone,
-        right_to_left: bool,
-    ) {
-        assert_eq!(deltas.len(), self.advances.len());
-        if !deltas.clone().any(|delta| delta != 0.0) {
-            return;
-        }
-        for (advance, delta) in Arc::make_mut(&mut self.advances)
-            .iter_mut()
-            .zip(deltas.clone())
-        {
-            *advance += delta;
-        }
-        if let Some(stops) = &mut self.caret_stops {
-            let derived = matches!(stops, CaretPositions::Derived(_));
-            if derived {
-                *stops = CaretPositions::Dense(stops.to_dense());
-            }
-            let CaretPositions::Dense(dense) = stops else {
-                unreachable!()
-            };
-            let mut cumulative = 0.0;
-            let mut deltas = deltas;
-            for stop in Arc::make_mut(dense) {
-                *stop += if right_to_left {
-                    -cumulative
-                } else {
-                    cumulative
-                };
-                if let Some(delta) = deltas.next() {
-                    cumulative += delta;
-                }
-            }
-            if derived {
-                *stops = CaretPositions::from_advances(
-                    self.advances.clone(),
-                    std::mem::take(dense),
-                );
-            }
-        }
-    }
-
-    pub fn preserve_graphemes(&mut self, text: &str) {
-        profile_scope!("shape.preserve_graphemes");
-        if text.is_ascii() && !text.as_bytes().contains(&b'\r') {
-            return;
-        }
-        let graphemes = super::bidi::grapheme_boundaries(text, self.advances.len());
-        if self
-            .cluster_boundaries
-            .iter()
-            .zip(graphemes.iter())
-            .any(|(&native, &grapheme)| native && !grapheme)
-        {
-            for (native, &grapheme) in Arc::make_mut(&mut self.cluster_boundaries)
-                .iter_mut()
-                .zip(graphemes.iter())
-            {
-                *native &= grapheme;
-            }
-        }
     }
 
     pub fn backend_run(&self) -> Option<TextRunId> {
@@ -162,7 +82,59 @@ impl ShapedTextRun {
     }
 }
 
-/// A request to measure one already-normalized, single-style logical run.
+/// Font extents measured from the faces that actually supplied each character.
+#[derive(Clone, Debug)]
+pub enum RunFontMetrics {
+    Uniform(FontMetrics),
+    PerCharacter(Arc<[FontMetrics]>),
+}
+
+/// A backend run result. The engine owns registration and layout
+/// glyph IDs; native paint handles belong to the backend's resource generation.
+#[derive(Clone, Debug)]
+pub struct ShapedRun {
+    geometry: ShapedTextRun,
+    paint: Option<RunPaint>,
+}
+
+#[derive(Clone, Debug)]
+struct RunPaint {
+    first_handle: GlyphHandle,
+    metrics: RunFontMetrics,
+}
+
+impl ShapedRun {
+    /// Native geometry with individual glyph painting supplied by `shape_glyph`.
+    pub fn geometry(geometry: ShapedTextRun) -> Self {
+        Self {
+            geometry,
+            paint: None,
+        }
+    }
+
+    /// Geometry whose characters occupy consecutive native paint handles.
+    /// The adapter supplies a representable handle range and either uniform
+    /// extents or one font metric per character. Shared arrays are retained.
+    pub fn painted(
+        geometry: ShapedTextRun,
+        first_handle: GlyphHandle,
+        metrics: RunFontMetrics,
+    ) -> Self {
+        Self {
+            geometry,
+            paint: Some(RunPaint {
+                first_handle,
+                metrics,
+            }),
+        }
+    }
+
+    pub fn into_geometry(self) -> ShapedTextRun {
+        self.geometry
+    }
+}
+
+/// A request to shape one already-normalized, single-style logical run.
 /// CSS values have been resolved before this reaches the renderer backend.
 pub struct TextRunShapeRequest<'a> {
     text: &'a str,
@@ -171,20 +143,18 @@ pub struct TextRunShapeRequest<'a> {
 }
 
 impl<'a> TextRunShapeRequest<'a> {
-    pub fn new(text: &'a str, style: TextStyleSpan<'a>) -> Option<Self> {
-        (style.byte_range() == (0..text.len()) && !text.is_empty()).then_some(Self {
+    fn new(
+        text: &'a str,
+        style: TextStyleSpan<'a>,
+        paint_colors: Option<&'a [u32]>,
+    ) -> Option<Self> {
+        (style.byte_range() == (0..text.len())
+            && !text.is_empty()
+            && paint_colors.is_none_or(|colors| colors.len() == text.chars().count()))
+        .then_some(Self {
             text,
             style,
-            paint_colors: None,
-        })
-    }
-
-    /// Attach paint colors without turning them into shaping boundaries.
-    /// There is one color per Unicode scalar value in `text`.
-    pub fn with_paint_colors(mut self, paint_colors: &'a [u32]) -> Option<Self> {
-        (paint_colors.len() == self.text.chars().count()).then(|| {
-            self.paint_colors = Some(paint_colors);
-            self
+            paint_colors,
         })
     }
 
@@ -192,12 +162,17 @@ impl<'a> TextRunShapeRequest<'a> {
         self.text
     }
 
-    pub fn style(&self) -> &TextStyleSpan<'a> {
-        &self.style
+    pub fn style(&self) -> &ShapingStyle<'a> {
+        &self.style.style
+    }
+
+    /// Borrow the existing span for backends sharing run and line shaping.
+    pub fn styles(&self) -> &[TextStyleSpan<'a>] {
+        std::slice::from_ref(&self.style)
     }
 
     /// Per-character overrides. `None` means every character uses
-    /// [`TextStyleSpan::color`] from the shaping style.
+    /// [`ShapingStyle::color`] from the shaping style.
     pub fn paint_colors(&self) -> Option<&'a [u32]> {
         self.paint_colors
     }
@@ -596,105 +571,39 @@ impl ShapedLine {
     }
 }
 
+/// Resolved font posture. An oblique angle exists only for oblique text.
 #[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]
 pub enum FontSlant {
     #[default]
     Normal,
     Italic,
-    Oblique,
+    Oblique {
+        angle: ObliqueAngle,
+    },
 }
 
-/// Renderer-neutral description of the font face whose relative metrics are
-/// needed before layout. It is valid for boxes with no text content as well as
-/// ordinary text runs.
-#[derive(Clone, Copy, Debug)]
-pub struct FontMetricsRequest<'a> {
-    font_size: f32,
-    font_weight: u16,
-    font_slant: FontSlant,
-    font_stretch: f32,
-    font_oblique_angle: f32,
-    font_palette: Option<&'a str>,
-    font_synthesis_style: FontSynthesisStyle,
-    font_family: Option<&'a str>,
-    language: Option<&'a ContentLanguage>,
+impl FontSlant {
+    /// The caller supplies a resolved CSS angle from -90 through 90 degrees.
+    pub fn oblique(degrees: f32) -> Self {
+        Self::Oblique {
+            angle: ObliqueAngle(degrees.to_bits()),
+        }
+    }
 }
 
-impl<'a> FontMetricsRequest<'a> {
-    pub fn new(
-        font_size: f32,
-        font_weight: u16,
-        font_slant: FontSlant,
-        font_family: Option<&'a str>,
-    ) -> Option<Self> {
-        (font_size.is_finite() && font_size > 0.0 && font_weight > 0).then_some(Self {
-            font_size,
-            font_weight,
-            font_slant,
-            font_stretch: 100.0,
-            font_oblique_angle: if font_slant == FontSlant::Oblique {
-                14.0
-            } else {
-                0.0
-            },
-            font_palette: None,
-            font_synthesis_style: FontSynthesisStyle::Auto,
-            font_family,
-            language: None,
-        })
-    }
+/// An angle in degrees, attached only to [`FontSlant::Oblique`].
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+pub struct ObliqueAngle(u32);
 
-    /// Content language used when selecting the face whose metrics are measured.
-    pub fn with_language(mut self, language: Option<&'a ContentLanguage>) -> Self {
-        self.language = language;
-        self
+impl ObliqueAngle {
+    pub fn degrees(self) -> f32 {
+        f32::from_bits(self.0)
     }
+}
 
-    pub fn language(self) -> Option<&'a ContentLanguage> {
-        self.language
-    }
-
-    pub fn font_size(self) -> f32 {
-        self.font_size
-    }
-    /// Resolved CSS face selection. Width is a percentage and angle is degrees.
-    pub fn with_font_selection(
-        mut self,
-        stretch: f32,
-        oblique_angle: f32,
-        palette: Option<&'a str>,
-    ) -> Self {
-        self.font_stretch = stretch;
-        self.font_oblique_angle = oblique_angle;
-        self.font_palette = palette;
-        self
-    }
-
-    pub fn font_stretch(&self) -> f32 {
-        self.font_stretch
-    }
-    pub fn font_oblique_angle(&self) -> f32 {
-        self.font_oblique_angle
-    }
-    pub fn with_style_synthesis(mut self, synthesis: FontSynthesisStyle) -> Self {
-        self.font_synthesis_style = synthesis;
-        self
-    }
-
-    pub fn font_synthesis_style(&self) -> FontSynthesisStyle { self.font_synthesis_style }
-
-    pub fn font_palette(&self) -> Option<&'a str> {
-        self.font_palette
-    }
-
-    pub fn font_weight(self) -> u16 {
-        self.font_weight
-    }
-    pub fn font_slant(self) -> FontSlant {
-        self.font_slant
-    }
-    pub fn font_family(self) -> Option<&'a str> {
-        self.font_family
+impl fmt::Debug for ObliqueAngle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.degrees(), formatter)
     }
 }
 
@@ -1015,373 +924,267 @@ impl FontRelativeMetrics {
     }
 }
 
-impl From<FontStyle> for FontSlant {
-    fn from(style: FontStyle) -> Self {
-        match style {
-            FontStyle::Normal => Self::Normal,
-            FontStyle::Italic => Self::Italic,
-            FontStyle::Oblique => Self::Oblique,
-        }
+/// Caps synthesis allowed when the selected font lacks native caps glyphs.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CapsSynthesis {
+    #[default]
+    None,
+    SmallCaps,
+    AllSmallCaps,
+}
+
+/// Cursive connections preserved when a font or style change splits text into
+/// shaping runs. Previous and next refer to logical character order, including
+/// in right-to-left text; these are not visual left and right edges.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CursiveJoining {
+    #[default]
+    Isolated,
+    ConnectedToPrevious,
+    ConnectedToNext,
+    ConnectedToBoth,
+}
+
+impl CursiveJoining {
+    #[inline]
+    pub const fn connects_to_previous(self) -> bool {
+        matches!(self, Self::ConnectedToPrevious | Self::ConnectedToBoth)
+    }
+
+    #[inline]
+    pub const fn connects_to_next(self) -> bool {
+        matches!(self, Self::ConnectedToNext | Self::ConnectedToBoth)
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct TextStyleSpan<'a> {
-    byte_range: Range<usize>,
-    direction: TextDirection,
-    font_size: f32,
-    font_weight: u16,
-    font_slant: FontSlant,
-    font_stretch: f32,
-    font_oblique_angle: f32,
-    font_palette: Option<&'a str>,
-    font_synthesis_style: FontSynthesisStyle,
-    color: u32,
-    font_family: Option<&'a str>,
-    cjk_font_family: Option<&'a str>,
-    language: Option<&'a ContentLanguage>,
-    font_features: &'a [OpenTypeFeature],
-    caps_synthesis: Option<bool>,
-    joining_context: (bool, bool),
+/// Resolved properties shared by font measurement, glyph and run shaping.
+/// Requests expose these values for reading; the engine constructs the styles.
+/// All text and font data remain borrowed from the current document.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug)]
+pub struct ShapingStyle<'a> {
+    pub direction: TextDirection,
+    pub font_size: f32,
+    pub font_weight: u16,
+    pub font_slant: FontSlant,
+    /// Resolved font width as a percentage.
+    pub font_stretch: f32,
+    pub font_synthesis_style: FontSynthesisStyle,
+    pub color: u32,
+    pub font_family: Option<&'a str>,
+    pub cjk_font_family: Option<&'a str>,
+    pub language: Option<&'a ContentLanguage>,
+    pub font_features: &'a FontFeatures<'a>,
+    pub caps_synthesis: CapsSynthesis,
+    /// Cursive connections to the preceding and following shaping runs.
+    pub cursive_joining: CursiveJoining,
 }
 
-impl<'a> TextStyleSpan<'a> {
-    pub fn new(
-        byte_range: Range<usize>,
-        font_size: f32,
-        font_weight: u16,
-        font_slant: FontSlant,
-        color: u32,
-        font_family: Option<&'a str>,
-    ) -> Option<Self> {
-        // CSS permits `font-size: 0`. It still needs a real shaping request so
-        // character identities and backend paint resources stay registered;
-        // the resulting advances and ink geometry are simply zero-sized.
-        if byte_range.start >= byte_range.end || !font_size.is_finite() || font_size < 0.0 {
-            return None;
-        }
-        Some(Self {
-            byte_range,
-            direction: TextDirection::Ltr,
-            font_size,
-            font_weight,
-            font_slant,
-            font_stretch: 100.0,
-            font_oblique_angle: if font_slant == FontSlant::Oblique {
-                14.0
-            } else {
-                0.0
-            },
-            font_palette: None,
-            font_synthesis_style: FontSynthesisStyle::Auto,
-            color,
-            font_family,
-            cjk_font_family: None,
-            language: None,
-            font_features: &[],
-            caps_synthesis: None,
-            joining_context: (false, false),
-        })
-    }
-
-    pub fn with_font_features(mut self, font_features: &'a [OpenTypeFeature]) -> Self {
-        self.font_features = font_features;
-        self
-    }
-
-    /// Preserve high-level caps intent separately from raw OpenType settings.
-    /// `Some(false)` requests small caps; `Some(true)` requests all small caps.
-    pub fn with_caps_synthesis(mut self, all_small_caps: Option<bool>) -> Self {
-        self.caps_synthesis = all_small_caps;
-        self
-    }
-
-    pub fn caps_synthesis(&self) -> Option<bool> {
-        self.caps_synthesis
-    }
-
-    /// Cursive connections to adjacent runs shaped with a different font.
-    /// These affect glyph selection without changing logical source text.
-    pub fn with_joining_context(mut self, before: bool, after: bool) -> Self {
-        self.joining_context = (before, after);
-        self
-    }
-
-    pub fn joining_context(&self) -> (bool, bool) {
-        self.joining_context
-    }
-
-    /// Rebase a display span while keeping its font selection and paint style.
-    pub fn with_display_range(mut self, range: Range<usize>, font_size: f32) -> Option<Self> {
-        if range.is_empty() || !font_size.is_finite() || font_size < 0.0 {
-            return None;
-        }
-        self.byte_range = range;
-        self.font_size = font_size;
-        Some(self)
-    }
-
-    /// Inherited BCP 47 content language, for font selection and localized glyphs.
-    pub fn with_language(mut self, language: Option<&'a ContentLanguage>) -> Self {
-        self.language = language;
-        self
-    }
-
-    pub fn language(&self) -> Option<&'a ContentLanguage> {
-        self.language
-    }
-
-    /// Resolved direction of this shaping run, after paragraph bidi analysis.
-    pub fn with_direction(mut self, direction: TextDirection) -> Self {
-        self.direction = direction;
-        self
-    }
-
-    pub fn direction(&self) -> TextDirection {
-        self.direction
-    }
-
-    pub fn byte_range(&self) -> Range<usize> {
-        self.byte_range.clone()
-    }
-
-    pub fn font_size(&self) -> f32 {
-        self.font_size
-    }
-
-    /// Resolved CSS face selection. Width is a percentage and angle is degrees.
-    pub fn with_font_selection(
-        mut self,
-        stretch: f32,
-        oblique_angle: f32,
-        palette: Option<&'a str>,
-    ) -> Self {
-        self.font_stretch = stretch;
-        self.font_oblique_angle = oblique_angle;
-        self.font_palette = palette;
-        self
-    }
-
-    pub fn font_stretch(&self) -> f32 {
-        self.font_stretch
-    }
-    pub fn font_oblique_angle(&self) -> f32 {
-        self.font_oblique_angle
-    }
-    pub fn with_style_synthesis(mut self, synthesis: FontSynthesisStyle) -> Self {
-        self.font_synthesis_style = synthesis;
-        self
-    }
-
-    pub fn font_synthesis_style(&self) -> FontSynthesisStyle { self.font_synthesis_style }
-
-    pub fn font_palette(&self) -> Option<&'a str> {
-        self.font_palette
-    }
-
-    pub fn font_weight(&self) -> u16 {
-        self.font_weight
-    }
-
-    pub fn font_slant(&self) -> FontSlant {
-        self.font_slant
-    }
-
-    pub fn color(&self) -> u32 {
-        self.color
-    }
-
-    pub fn font_family(&self) -> Option<&'a str> {
-        self.font_family
-    }
-
-    pub fn with_cjk_font_family(mut self, family: Option<&'a str>) -> Self {
-        self.cjk_font_family = family;
-        self
-    }
-
-    pub fn cjk_font_family(&self) -> Option<&'a str> {
-        self.cjk_font_family
-    }
-
+impl<'a> ShapingStyle<'a> {
+    /// Select a character's resolved family, including the reader's CJK override.
     pub fn font_family_for_character(&self, character: char) -> Option<&'a str> {
         self.cjk_font_family
             .filter(|_| html_style_model::is_cjk_character(character))
             .or(self.font_family)
     }
+}
 
-    /// Character shaping with this span's font and per-character family selection.
-    pub fn glyph_request(&self, character: char) -> GlyphRequest<'a> {
-        GlyphRequest {
-            font_stretch: self.font_stretch,
-            font_oblique_angle: self.font_oblique_angle,
-            font_palette: self.font_palette,
-            font_synthesis_style: self.font_synthesis_style,
-            character,
-            font_size: self.font_size,
-            font_weight: self.font_weight,
-            font_slant: self.font_slant,
-            font_family: self.font_family_for_character(character),
+/// A validated UTF-8 byte span and its resolved shaping properties.
+#[derive(Clone, Debug)]
+pub struct TextStyleSpan<'a> {
+    byte_range: Range<usize>,
+    pub style: ShapingStyle<'a>,
+}
+
+impl TextStyleSpan<'_> {
+    pub fn byte_range(&self) -> Range<usize> {
+        self.byte_range.clone()
+    }
+}
+
+/// Engine-side construction and geometry adjustment. Backend-facing request
+/// types expose no builders.
+/// This module is intentionally absent from the application facade.
+pub mod shaping {
+    use super::*;
+
+    /// Apply replayable per-character spacing without materializing a buffer.
+    /// Iterator clones must produce the same finite deltas in logical source
+    /// order, with one delta per advance and finite resulting coordinates.
+    pub fn apply_spacing(
+        mut run: ShapedTextRun,
+        deltas: impl ExactSizeIterator<Item = f32> + Clone,
+        right_to_left: bool,
+    ) -> ShapedTextRun {
+        if !deltas.clone().any(|delta| delta != 0.0) {
+            return run;
         }
-    }
-
-    pub fn font_features(&self) -> &[OpenTypeFeature] {
-        self.font_features
-    }
-}
-
-/// Framework-neutral placement requested for one logical character after the
-/// platform shaper has produced its natural geometry.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct CharacterPlacement {
-    extra_advance: f32,
-    advance_override: Option<f32>,
-    baseline_shift: f32,
-    paint: bool,
-}
-
-impl CharacterPlacement {
-    pub fn new(extra_advance: f32, advance_override: Option<f32>, paint: bool) -> Option<Self> {
-        Self::with_baseline_shift(extra_advance, advance_override, 0.0, paint)
-    }
-
-    pub fn with_baseline_shift(
-        extra_advance: f32,
-        advance_override: Option<f32>,
-        baseline_shift: f32,
-        paint: bool,
-    ) -> Option<Self> {
-        if !extra_advance.is_finite()
-            || !baseline_shift.is_finite()
-            || advance_override.is_some_and(|advance| !advance.is_finite() || advance < 0.0)
+        for (advance, delta) in Arc::make_mut(&mut run.advances)
+            .iter_mut()
+            .zip(deltas.clone())
         {
-            return None;
+            *advance += delta;
         }
-        Some(Self {
-            extra_advance,
-            advance_override,
-            baseline_shift,
-            paint,
-        })
-    }
-
-    pub fn extra_advance(self) -> f32 {
-        self.extra_advance
-    }
-
-    pub fn advance_override(self) -> Option<f32> {
-        self.advance_override
-    }
-
-    /// Positive values move the shaped character upward from the line baseline.
-    pub fn baseline_shift(self) -> f32 {
-        self.baseline_shift
-    }
-
-    pub fn paints(self) -> bool {
-        self.paint
-    }
-}
-
-impl Default for CharacterPlacement {
-    fn default() -> Self {
-        Self {
-            extra_advance: 0.0,
-            advance_override: None,
-            baseline_shift: 0.0,
-            paint: true,
-        }
-    }
-}
-
-pub struct TextShapeRequest<'a> {
-    line_index: usize,
-    text_range: Range<u32>,
-    text: &'a str,
-    styles: &'a [TextStyleSpan<'a>],
-    /// One entry per logical character in `text`. The layout layer resolves
-    /// CSS semantics before this request reaches a renderer backend.
-    placements: &'a [CharacterPlacement],
-}
-
-impl<'a> TextShapeRequest<'a> {
-    pub fn new(
-        line_index: usize,
-        text_range: Range<u32>,
-        text: &'a str,
-        styles: &'a [TextStyleSpan<'a>],
-        placements: &'a [CharacterPlacement],
-    ) -> Option<Self> {
-        let character_count = text.chars().count();
-        if text.is_empty()
-            || styles.is_empty()
-            || character_count != text_range.end.checked_sub(text_range.start)? as usize
-            || placements.len() != character_count
-        {
-            return None;
-        }
-        let mut next_byte = 0;
-        for style in styles {
-            let range = style.byte_range();
-            if range.start != next_byte
-                || range.end > text.len()
-                || !text.is_char_boundary(range.start)
-                || !text.is_char_boundary(range.end)
-            {
-                return None;
+        if let Some(stops) = &mut run.caret_stops {
+            let derived = matches!(stops, CaretPositions::Derived(_));
+            if derived {
+                *stops = CaretPositions::Dense(stops.to_dense());
             }
-            next_byte = range.end;
+            let CaretPositions::Dense(dense) = stops else {
+                unreachable!()
+            };
+            let mut cumulative = 0.0;
+            let mut deltas = deltas;
+            for stop in Arc::make_mut(dense) {
+                *stop += if right_to_left {
+                    -cumulative
+                } else {
+                    cumulative
+                };
+                if let Some(delta) = deltas.next() {
+                    cumulative += delta;
+                }
+            }
+            if derived {
+                *stops = CaretPositions::from_advances(run.advances.clone(), std::mem::take(dense));
+            }
         }
-        if next_byte != text.len() {
-            return None;
+        run
+    }
+
+    pub fn preserve_graphemes(run: &mut ShapedTextRun, text: &str) {
+        profile_scope!("shape.preserve_graphemes");
+        if text.is_ascii() && !text.as_bytes().contains(&b'\r') {
+            return;
         }
-        Some(Self {
-            line_index,
-            text_range,
-            text,
-            styles,
-            placements,
+        let graphemes = crate::bidi::grapheme_boundaries(text, run.advances.len());
+        if run
+            .cluster_boundaries
+            .iter()
+            .zip(graphemes.iter())
+            .any(|(&native, &grapheme)| native && !grapheme)
+        {
+            for (native, &grapheme) in Arc::make_mut(&mut run.cluster_boundaries)
+                .iter_mut()
+                .zip(graphemes.iter())
+            {
+                *native &= grapheme;
+            }
+        }
+    }
+
+    /// Suppress character widths and shift native carets together. The mask is
+    /// indexed by logical scalar value; native cached geometry stays unchanged.
+    pub fn suppress_advances(
+        run: &mut ShapedTextRun,
+        suppressed: impl ExactSizeIterator<Item = bool> + Clone,
+        right_to_left: bool,
+    ) {
+        let Some(first) = suppressed
+            .clone()
+            .zip(run.advances.iter())
+            .position(|(suppress, &advance)| suppress && advance != 0.0)
+        else {
+            return;
+        };
+        let derived = matches!(run.caret_stops, Some(CaretPositions::Derived(_)));
+        if let Some(stops) = &mut run.caret_stops {
+            let mut suppressed = suppressed.clone();
+            let mut removed = 0.0;
+            for (index, stop) in stops.make_dense().iter_mut().enumerate() {
+                *stop += if right_to_left { removed } else { -removed };
+                if let Some(&advance) = run.advances.get(index)
+                    && suppressed.next().expect("validated suppression mask")
+                {
+                    removed += advance;
+                }
+            }
+        }
+        for (advance, suppress) in Arc::make_mut(&mut run.advances)
+            .iter_mut()
+            .zip(suppressed)
+            .skip(first)
+        {
+            if suppress {
+                *advance = 0.0;
+            }
+        }
+        if derived {
+            let Some(CaretPositions::Dense(stops)) = &mut run.caret_stops else {
+                unreachable!()
+            };
+            run.caret_stops = Some(CaretPositions::from_advances(
+                run.advances.clone(),
+                std::mem::take(stops),
+            ));
+        }
+    }
+
+    pub fn font_features<'a>(
+        settings: &'a mut Vec<OpenTypeFeature>,
+        explicit: &[OpenTypeFeature],
+        has_tracking: bool,
+    ) -> FontFeatures<'a> {
+        crate::font_features::resolve_font_features(settings, explicit, has_tracking)
+    }
+
+    /// Combine connections computed by span planning or native run grouping.
+    #[inline]
+    pub const fn cursive_joining(previous: bool, next: bool) -> CursiveJoining {
+        match (previous, next) {
+            (false, false) => CursiveJoining::Isolated,
+            (true, false) => CursiveJoining::ConnectedToPrevious,
+            (false, true) => CursiveJoining::ConnectedToNext,
+            (true, true) => CursiveJoining::ConnectedToBoth,
+        }
+    }
+
+    pub fn style<'a>(
+        font_size: f32,
+        font_weight: u16,
+        font_slant: FontSlant,
+        color: u32,
+        font_family: Option<&'a str>,
+    ) -> Option<ShapingStyle<'a>> {
+        // CSS permits zero-size text, which still needs character identities.
+        (font_size.is_finite() && font_size >= 0.0).then_some(ShapingStyle {
+            direction: TextDirection::Ltr,
+            font_size,
+            font_weight,
+            font_slant,
+            font_stretch: 100.0,
+            font_synthesis_style: FontSynthesisStyle::Auto,
+            color,
+            font_family,
+            cjk_font_family: None,
+            language: None,
+            font_features: &FontFeatures::DEFAULT,
+            caps_synthesis: CapsSynthesis::None,
+            cursive_joining: CursiveJoining::Isolated,
         })
     }
 
-    pub fn line_index(&self) -> usize {
-        self.line_index
+    pub fn span<'a>(
+        byte_range: Range<usize>,
+        style: ShapingStyle<'a>,
+    ) -> Option<TextStyleSpan<'a>> {
+        (!byte_range.is_empty() && style.font_size.is_finite() && style.font_size >= 0.0)
+            .then_some(TextStyleSpan { byte_range, style })
     }
 
-    pub fn text_range(&self) -> Range<u32> {
-        self.text_range.clone()
+    #[inline]
+    pub fn glyph<'a>(character: char, style: &'a ShapingStyle<'a>) -> GlyphRequest<'a> {
+        GlyphRequest { character, style }
     }
 
-    pub fn text(&self) -> &'a str {
-        self.text
-    }
-
-    pub fn styles(&self) -> &'a [TextStyleSpan<'a>] {
-        self.styles
-    }
-
-    pub fn placements(&self) -> &'a [CharacterPlacement] {
-        self.placements
-    }
-
-    pub fn adjusted_caret_stops(&self, raw: &[f32]) -> Option<Arc<[f32]>> {
-        if raw.len() != self.placements.len().checked_add(1)?
-            || raw.iter().any(|value| !value.is_finite())
-        {
-            return None;
-        }
-        let mut adjusted = Vec::with_capacity(raw.len());
-        adjusted.push(raw[0]);
-        for (index, placement) in self.placements.iter().enumerate() {
-            let natural_advance = raw[index + 1] - raw[index];
-            let direction = if natural_advance < 0.0 { -1.0 } else { 1.0 };
-            let advance = placement.advance_override().map_or(
-                natural_advance + direction * placement.extra_advance(),
-                |advance| direction * advance,
-            );
-            adjusted.push(adjusted[index] + advance);
-        }
-        Some(Arc::from(adjusted))
+    pub fn run<'a>(
+        text: &'a str,
+        style: TextStyleSpan<'a>,
+        paint_colors: Option<&'a [u32]>,
+    ) -> Option<TextRunShapeRequest<'a>> {
+        TextRunShapeRequest::new(text, style, paint_colors)
     }
 }
 
@@ -1392,16 +1195,9 @@ pub struct ShapeError {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum ShapeErrorKind {
-    RunLengthMismatch {
-        characters: usize,
-        advances: usize,
-    },
     UnregisteredGlyphId {
         glyph_id: GlyphId,
         metrics_len: usize,
-    },
-    RejectedMetric {
-        reason: GlyphMetricError,
     },
     RegistryCapacityExhausted {
         metrics_len: usize,
@@ -1430,12 +1226,6 @@ impl ShapeError {
                 glyph_id,
                 metrics_len,
             },
-        }
-    }
-
-    pub fn rejected_metric(reason: GlyphMetricError) -> Self {
-        Self {
-            kind: ShapeErrorKind::RejectedMetric { reason },
         }
     }
 
@@ -1469,15 +1259,6 @@ impl ShapeError {
         }
     }
 
-    fn run_length_mismatch(characters: usize, advances: usize) -> Self {
-        Self {
-            kind: ShapeErrorKind::RunLengthMismatch {
-                characters,
-                advances,
-            },
-        }
-    }
-
     pub fn glyph_id(self) -> Option<GlyphId> {
         match self.kind {
             ShapeErrorKind::UnregisteredGlyphId { glyph_id, .. } => Some(glyph_id),
@@ -1492,31 +1273,11 @@ impl ShapeError {
             _ => None,
         }
     }
-
-    pub fn reason(self) -> Option<GlyphMetricError> {
-        match self.kind {
-            ShapeErrorKind::RejectedMetric { reason } => Some(reason),
-            _ => None,
-        }
-    }
-}
-
-impl From<GlyphMetricError> for ShapeError {
-    fn from(reason: GlyphMetricError) -> Self {
-        Self::rejected_metric(reason)
-    }
 }
 
 impl fmt::Display for ShapeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.kind {
-            ShapeErrorKind::RunLengthMismatch {
-                characters,
-                advances,
-            } => write!(
-                formatter,
-                "shaped run has {characters} characters but {advances} advances"
-            ),
             ShapeErrorKind::UnregisteredGlyphId {
                 glyph_id,
                 metrics_len,
@@ -1527,10 +1288,6 @@ impl fmt::Display for ShapeError {
                     glyph_id, metrics_len
                 )
             }
-            ShapeErrorKind::RejectedMetric { reason } => write!(
-                formatter,
-                "glyph shaper returned invalid glyph metric: {reason:?}"
-            ),
             ShapeErrorKind::RegistryCapacityExhausted { metrics_len } => {
                 write!(
                     formatter,
@@ -1580,6 +1337,25 @@ pub struct GlyphResourceStore {
     metrics: GlyphMetrics,
     generation: GlyphResourceGeneration,
     shaped_ids: FxHashMap<(GlyphHandle, char, u32, u32, u32), GlyphId>,
+    paint_invalid: bool,
+    paint_lease: OnceLock<GlyphResourceLease>,
+}
+
+/// Validity of retained paint commands. Owning the lease does not keep a
+/// replaced backend alive; consumers must check validity before replaying.
+#[derive(Clone)]
+pub struct GlyphResourceLease(Arc<AtomicBool>);
+
+impl GlyphResourceLease {
+    pub fn is_valid(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for GlyphResourceStore {
+    fn drop(&mut self) {
+        self.invalidate_paint_resources();
+    }
 }
 
 /// An append-only ledger checkpoint. It owns no glyph data and can be consumed
@@ -1589,6 +1365,29 @@ pub struct GlyphResourceStore {
 pub struct GlyphResourceCheckpoint {
     generation: GlyphResourceGeneration,
     len: usize,
+}
+
+/// Backend-owned append boundary. Restoring it preserves the resource generation
+/// and every handle in its prefix; callers must first release appended views.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeResourceCheckpoint {
+    generation: GlyphResourceGeneration,
+    lengths: [usize; 2],
+}
+
+impl NativeResourceCheckpoint {
+    pub fn new(generation: GlyphResourceGeneration, lengths: [usize; 2]) -> Self {
+        Self {
+            generation,
+            lengths,
+        }
+    }
+    pub fn generation(self) -> GlyphResourceGeneration {
+        self.generation
+    }
+    pub fn lengths(self) -> [usize; 2] {
+        self.lengths
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1621,6 +1420,36 @@ impl GlyphResourceStore {
             metrics: GlyphMetrics::default(),
             generation,
             shaped_ids: FxHashMap::default(),
+            paint_invalid: false,
+            paint_lease: OnceLock::new(),
+        }
+    }
+
+    #[inline]
+    pub fn paint_resources_valid(&self) -> bool {
+        !self.paint_invalid
+    }
+
+    pub fn paint_lease(&self) -> GlyphResourceLease {
+        self.paint_lease
+            .get_or_init(|| GlyphResourceLease(Arc::new(AtomicBool::new(!self.paint_invalid))))
+            .clone()
+    }
+
+    /// Backend invalidation preserves the metric ledger for geometry queries.
+    pub fn invalidate_paint_resources(&mut self) {
+        self.paint_invalid = true;
+        self.invalidate_render_scenes();
+    }
+
+    /// Successful publication replaces commands while preserving native handles.
+    #[inline]
+    pub fn invalidate_render_scenes(&mut self) {
+        if self.paint_lease.get().is_none() {
+            return;
+        }
+        if let Some(lease) = self.paint_lease.take() {
+            lease.0.store(false, Ordering::Release);
         }
     }
 
@@ -1669,6 +1498,58 @@ impl GlyphResourceStore {
         true
     }
 
+    /// Ask the backend for native geometry and paint handles, then assign layout
+    /// IDs here. Backends never receive the engine's registry or glyph buffer.
+    pub fn shape_run(
+        &mut self,
+        shaper: &mut (impl GlyphShaper + ?Sized),
+        request: TextRunShapeRequest<'_>,
+        glyphs: &mut [GlyphId],
+    ) -> Result<Option<ShapedTextRun>, ShapeError> {
+        let text = request.text();
+        let style = *request.style();
+        let shaped = shaper.shape_run(request)?;
+        if let Some(ShapedRun {
+            geometry,
+            paint:
+                Some(RunPaint {
+                    first_handle,
+                    metrics,
+                }),
+        }) = shaped
+        {
+            let range = self
+                .metrics
+                .register_run(text, geometry.shared_advances(), metrics, first_handle)
+                .map_err(|_| ShapeError::registry_capacity_exhausted(self.len()))?;
+            for (slot, id) in glyphs.iter_mut().zip(range) {
+                *slot = id;
+            }
+            return Ok(Some(geometry));
+        }
+        let mut ascii = [GlyphId::MAX; 128];
+        let mut non_ascii = FxHashMap::<char, GlyphId>::default();
+        for (slot, character) in glyphs.iter_mut().zip(text.chars()) {
+            let cached = if character.is_ascii() {
+                ascii[character as usize]
+            } else {
+                non_ascii.get(&character).copied().unwrap_or(GlyphId::MAX)
+            };
+            *slot = if cached != GlyphId::MAX {
+                cached
+            } else {
+                let id = self.shape_glyph(shaper, shaping::glyph(character, &style))?;
+                if character.is_ascii() {
+                    ascii[character as usize] = id;
+                } else {
+                    non_ascii.insert(character, id);
+                }
+                id
+            };
+        }
+        Ok(shaped.map(ShapedRun::into_geometry))
+    }
+
     /// Shape and register each character independently, using the run's font
     /// selection. Native contextual run shaping is left to the caller.
     pub fn shape_characters(
@@ -1680,7 +1561,7 @@ impl GlyphResourceStore {
         debug_assert_eq!(request.text().chars().count(), glyphs.len());
         let style = request.style();
         for (slot, character) in glyphs.iter_mut().zip(request.text().chars()) {
-            *slot = self.shape_glyph(shaper, style.glyph_request(character))?;
+            *slot = self.shape_glyph(shaper, shaping::glyph(character, style))?;
         }
         Ok(())
     }
@@ -1708,9 +1589,8 @@ impl GlyphResourceStore {
         Ok(id)
     }
 
-    /// Register a newly produced result without interning. Batch backends use
-    /// this when each native resource is already unique to its shaped run.
-    pub fn register_shaped(
+    /// Register a native single-character result without interning.
+    fn register_shaped(
         &mut self,
         character: char,
         shaped: ShapedGlyph,
@@ -1723,29 +1603,6 @@ impl GlyphResourceStore {
     pub fn register(&mut self, metric: GlyphMetric) -> Result<GlyphId, ShapeError> {
         self.metrics
             .register(metric)
-            .map_err(|_| ShapeError::registry_capacity_exhausted(self.len()))
-    }
-
-    /// Register a whole run using its existing validated advance allocation.
-    /// IDs remain dense for compatibility with individual-glyph paint APIs;
-    /// no per-character GlyphMetric records are created.
-    pub fn register_run(
-        &mut self,
-        text: &str,
-        shaped: &ShapedTextRun,
-        ascent: f32,
-        descent: f32,
-    ) -> Result<Range<GlyphId>, ShapeError> {
-        let characters = text.chars().count();
-        if characters != shaped.advances.len() {
-            return Err(ShapeError::run_length_mismatch(
-                characters,
-                shaped.advances.len(),
-            ));
-        }
-        let vertical = GlyphMetric::try_new('\0', 0.0, ascent, descent)?;
-        self.metrics
-            .register_run(text, shaped.shared_advances(), vertical)
             .map_err(|_| ShapeError::registry_capacity_exhausted(self.len()))
     }
 
@@ -1777,8 +1634,14 @@ impl GlyphResourceStore {
 /// Basic adapters can use [`crate::ResourceShaper`] to supply a shaping callback
 /// with automatic native-resource lifecycle handling.
 pub trait GlyphShaper {
-    /// Replace the active document's resolved color-font palettes before shaping.
-    fn set_font_palettes(&mut self, _palettes: &[FontPaletteDefinition]) {}
+    /// Optional reclamation of completed scope batches. Backends which support
+    /// this must preserve all prefix handles and retained painter snapshots.
+    fn resource_checkpoint(&self) -> Option<NativeResourceCheckpoint> {
+        None
+    }
+    fn restore_resource_checkpoint(&mut self, _checkpoint: NativeResourceCheckpoint) -> bool {
+        false
+    }
 
     /// Identity of the backend's active paint resources. Reset must assign a
     /// fresh generation; a failed document replacement restores the old one.
@@ -1820,7 +1683,7 @@ pub trait GlyphShaper {
     /// missing vertical metrics from its shaped line geometry.
     fn font_relative_metrics(
         &mut self,
-        _request: FontMetricsRequest<'_>,
+        _style: &ShapingStyle<'_>,
     ) -> Result<FontRelativeMetrics, ShapeError> {
         Ok(FontRelativeMetrics::fallback())
     }
@@ -1829,48 +1692,16 @@ pub trait GlyphShaper {
     /// handle, advance, and measured font extents; no metric registration is needed.
     fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError>;
 
-    /// Shapes one normalized, single-style logical run into a caller-owned
-    /// dense glyph-ID buffer. Backends can override this to resolve shared
-    /// style state once and batch character lookup; the default preserves the
-    /// established per-character contract.
-    fn shape_glyph_run(
-        &mut self,
-        request: TextRunShapeRequest<'_>,
-        glyphs: &mut [GlyphId],
-        resources: &mut GlyphResourceStore,
-    ) -> Result<Option<ShapedTextRun>, ShapeError> {
-        resources.shape_characters(self, &request, glyphs)?;
-        self.shape_text_run(request)
-    }
-
-    /// Optionally supplies native cluster geometry for a logical style run.
-    /// Backends without run shaping retain the per-character metric fallback.
-    fn shape_text_run(
+    /// Shape a complete logical run using the supplied resolved style. Font
+    /// selection, supported feature translation and native caching belong to
+    /// the backend. Actual advances and cluster geometry drive engine layout.
+    /// Returning `None` selects the engine's per-character fallback.
+    fn shape_run(
         &mut self,
         _request: TextRunShapeRequest<'_>,
-    ) -> Result<Option<ShapedTextRun>, ShapeError> {
+    ) -> Result<Option<ShapedRun>, ShapeError> {
         Ok(None)
     }
-
-    /// Optionally measures a complete candidate line at its actual start and
-    /// end boundaries without creating a paint resource.
-    fn measure_line(
-        &mut self,
-        _request: TextShapeRequest<'_>,
-    ) -> Result<Option<ShapedTextRun>, ShapeError> {
-        Ok(None)
-    }
-
-    /// Optionally shapes a final visual line as one platform text layout. The
-    /// default keeps non-native backends on the established glyph path.
-    fn shape_line(
-        &mut self,
-        _request: TextShapeRequest<'_>,
-    ) -> Result<Option<ShapedLine>, ShapeError> {
-        Ok(None)
-    }
-
-    fn begin_line_shaping(&mut self) {}
 }
 
 #[cfg(test)]
@@ -1894,12 +1725,20 @@ mod geometry_tests {
         let mut resources = GlyphResourceStore::default();
         let generation = resources.generation();
         let advances: Arc<[f32]> = [2.0, 3.0].into();
-        let run = ShapedTextRun::new(advances.clone(), vec![true; 3].into()).unwrap();
-        resources.register_run("ab", &run, 8.0, 2.0).unwrap();
+        let run = ShapedTextRun::new(advances.clone(), vec![true; 3].into());
+        resources
+            .metrics
+            .register_run(
+                "ab",
+                run.shared_advances(),
+                RunFontMetrics::Uniform(FontMetrics::new(8.0, 2.0)),
+                0,
+            )
+            .unwrap();
         let owners = Arc::strong_count(&advances);
         let checkpoint = resources.checkpoint();
         assert_eq!(Arc::strong_count(&advances), owners);
-        let extra = GlyphMetric::try_new('x', 1.0, 8.0, 2.0).unwrap();
+        let extra = GlyphMetric::new('x', 1.0, 8.0, 2.0);
         assert_eq!(resources.register(extra).unwrap(), 2);
         assert!(resources.rollback_to(checkpoint));
         assert_eq!(resources.generation(), generation);
@@ -1915,7 +1754,7 @@ mod geometry_tests {
         let mut resources = GlyphResourceStore::default();
         let other = GlyphResourceStore::default().checkpoint();
         let empty = resources.checkpoint();
-        let extra = GlyphMetric::try_new('x', 1.0, 8.0, 2.0).unwrap();
+        let extra = GlyphMetric::new('x', 1.0, 8.0, 2.0);
         resources.register(extra).unwrap();
         assert!(!resources.rollback_to(other));
         assert_eq!(resources.len(), 1);
@@ -1931,7 +1770,7 @@ mod geometry_tests {
     }
 
     fn fallback(len: usize, advance: f32) -> ShapedTextRun {
-        ShapedTextRun::new(vec![advance; len].into(), vec![true; len + 1].into()).unwrap()
+        ShapedTextRun::new(vec![advance; len].into(), vec![true; len + 1].into())
     }
 
     #[test]
@@ -1945,8 +1784,7 @@ mod geometry_tests {
             7,
             carets.clone().into(),
             8.0,
-        )
-        .unwrap();
+        );
         let mut geometry = ShapedTextGeometry::with_len(10);
         geometry.push_run(&[4, 5, 8, 9], run, true);
         geometry.finish_runs();
@@ -1987,8 +1825,7 @@ mod geometry_tests {
             3,
             carets.clone().into(),
             8.0,
-        )
-        .unwrap();
+        );
         let mut geometry = ShapedTextGeometry::with_len(6);
         geometry.push_run(&[0, 1, 2, 3, 4, 5], run, false);
         geometry.replace_range(2..4, fallback(2, 2.0), false);
@@ -2046,12 +1883,14 @@ mod geometry_tests {
                 0,
                 carets.clone().into(),
                 8.0,
-            )
-            .unwrap();
-            run.apply_spacing(&[0.0, 0.0], right_to_left);
+            );
+            run = shaping::apply_spacing(run, [0.0, 0.0].into_iter(), right_to_left);
             assert_eq!(run.advances().as_ptr(), advances.as_ptr());
-            assert_eq!(run.caret_stops().unwrap().to_dense().as_ptr(), carets.as_ptr());
-            run.apply_spacing(&[1.0, -0.5], right_to_left);
+            assert_eq!(
+                run.caret_stops().unwrap().to_dense().as_ptr(),
+                carets.as_ptr()
+            );
+            run = shaping::apply_spacing(run, [1.0, -0.5].into_iter(), right_to_left);
             assert_eq!(run.advances(), [3.0, 2.5]);
             assert_eq!(run.caret_stops().unwrap().to_dense().as_ref(), expected);
             assert_eq!(&*advances, &[2.0, 3.0]);

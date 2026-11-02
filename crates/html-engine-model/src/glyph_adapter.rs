@@ -1,22 +1,16 @@
-//! Renderer-facing glyph requests, validated results, and native resource storage.
-use crate::glyph_metrics::validate_metric_value_non_negative;
-use crate::{FontSlant, FontSynthesisStyle, GlyphMetric, GlyphMetricError};
+//! Renderer-facing glyph requests, measurements, and native resource storage.
+use crate::{GlyphMetric, ShapingStyle};
 
 /// Opaque key into an adapter's native paint resources. This is independent
 /// of the dense glyph IDs assigned by HtmlEngine for layout.
 pub type GlyphHandle = u32;
 
+/// One character and the resolved properties borrowed from its shaping span.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug)]
 pub struct GlyphRequest<'a> {
     pub character: char,
-    pub font_size: f32,
-    pub font_weight: u16,
-    pub font_slant: FontSlant,
-    pub font_stretch: f32,
-    pub font_oblique_angle: f32,
-    pub font_palette: Option<&'a str>,
-    pub font_synthesis_style: FontSynthesisStyle,
-    pub font_family: Option<&'a str>,
+    pub style: &'a ShapingStyle<'a>,
 }
 
 /// Font/run extents measured by the native text system, in layout pixels.
@@ -27,10 +21,9 @@ pub struct FontMetrics {
 }
 
 impl FontMetrics {
-    pub fn new(ascent: f32, descent: f32) -> Result<Self, GlyphMetricError> {
-        validate_metric_value_non_negative("ascent", ascent)?;
-        validate_metric_value_non_negative("descent", descent)?;
-        Ok(Self { ascent, descent })
+    /// The adapter supplies finite, non-negative extents.
+    pub fn new(ascent: f32, descent: f32) -> Self {
+        Self { ascent, descent }
     }
     pub fn ascent(self) -> f32 {
         self.ascent
@@ -50,17 +43,13 @@ pub struct ShapedGlyph {
 }
 
 impl ShapedGlyph {
-    pub fn new(
-        handle: GlyphHandle,
-        advance: f32,
-        metrics: FontMetrics,
-    ) -> Result<Self, GlyphMetricError> {
-        validate_metric_value_non_negative("advance", advance)?;
-        Ok(Self {
+    /// The adapter supplies a valid paint handle and finite, non-negative advance.
+    pub fn new(handle: GlyphHandle, advance: f32, metrics: FontMetrics) -> Self {
+        Self {
             handle,
             advance,
             metrics,
-        })
+        }
     }
     pub fn from_metric(handle: GlyphHandle, metric: GlyphMetric) -> Self {
         Self {
@@ -84,14 +73,15 @@ impl ShapedGlyph {
 mod tests {
     use super::*;
     use crate::{
-        GlyphResourceGeneration, GlyphResourceStore, GlyphResources, GlyphShaper, ShapeError,
+        FontSlant, GlyphResourceGeneration, GlyphResourceStore, GlyphResources, GlyphShaper,
+        ShapeError, shaping,
     };
 
     #[test]
     fn engine_ids_are_independent_of_native_handles_and_survive_rollback() {
         let mut resources = GlyphResourceStore::default();
-        let metrics = FontMetrics::new(12.0, 4.0).unwrap();
-        let native = ShapedGlyph::new(700, 8.0, metrics).unwrap();
+        let metrics = FontMetrics::new(12.0, 4.0);
+        let native = ShapedGlyph::new(700, 8.0, metrics);
         struct Fixed(ShapedGlyph, GlyphResourceGeneration);
         impl GlyphShaper for Fixed {
             fn resource_generation(&self) -> GlyphResourceGeneration {
@@ -105,18 +95,8 @@ mod tests {
             }
         }
         let mut shaper = Fixed(native, resources.generation());
-        let request = |character| GlyphRequest {
-            font_stretch: 100.0,
-            font_oblique_angle: 0.0,
-            font_palette: None,
-            font_synthesis_style: FontSynthesisStyle::Auto,
-            character,
-            font_size: 16.0,
-            font_weight: 400,
-            font_slant: FontSlant::Normal,
-
-            font_family: None,
-        };
+        let style = shaping::style(16.0, 400, FontSlant::Normal, 0, None).unwrap();
+        let request = |character| shaping::glyph(character, &style);
         let id = resources.shape_glyph(&mut shaper, request('x')).unwrap();
         assert_eq!(id, 0);
         assert_eq!(resources.metrics().paint_handle(id), Some(700));
@@ -125,7 +105,7 @@ mod tests {
             id
         );
         let checkpoint = resources.checkpoint();
-        shaper.0 = ShapedGlyph::new(900, 9.0, metrics).unwrap();
+        shaper.0 = ShapedGlyph::new(900, 9.0, metrics);
         assert_eq!(resources.shape_glyph(&mut shaper, request('y')).unwrap(), 1);
         assert!(resources.rollback_to(checkpoint));
         assert_eq!(resources.metrics().paint_handle(1), None);
@@ -143,13 +123,5 @@ mod tests {
         assert_ne!(resources.generation(), generation);
         assert!(resources.get(handle).is_none());
         assert_eq!(resources.insert("new").unwrap(), handle);
-    }
-
-    #[test]
-    fn shaping_measurements_reject_invalid_values() {
-        assert!(FontMetrics::new(f32::NAN, 2.0).is_err());
-        assert!(FontMetrics::new(8.0, -1.0).is_err());
-        assert!(FontMetrics::new(8.0, f32::INFINITY).is_err());
-        assert!(ShapedGlyph::new(7, -1.0, FontMetrics::default()).is_err());
     }
 }

@@ -3,8 +3,8 @@ use html_parse::HtmlQuirksMode;
 use html_pipeline::GlyphResourceStore;
 use html_pipeline::ResourceContext;
 use html_pipeline::engine::{
-    FontMetricsRequest, FontRelativeMetrics, GlyphId, GlyphMetric, GlyphShaper, ImageMetrics,
-    LayoutConstraints, ShapeError,
+    FontRelativeMetrics, GlyphId, GlyphMetric, GlyphShaper, ImageMetrics, LayoutConstraints,
+    ShapeError, ShapingStyle,
 };
 use html_pipeline::{DocumentFactory, LaidOutDocument, PreparedDocument, parse_html_document};
 use html_pipeline::{GlyphRequest, ShapedGlyph};
@@ -67,9 +67,9 @@ impl GlyphShaper for DeterministicShaper {
 
     fn font_relative_metrics(
         &mut self,
-        request: FontMetricsRequest<'_>,
+        request: &ShapingStyle<'_>,
     ) -> Result<FontRelativeMetrics, ShapeError> {
-        if request.font_family().is_some_and(|family| {
+        if request.font_family.is_some_and(|family| {
             family.split(',').next().is_some_and(|name| {
                 name.trim()
                     .trim_matches(['\'', '"'])
@@ -86,23 +86,28 @@ impl GlyphShaper for DeterministicShaper {
 
     fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
         let is_ahem = request
-            .font_family
+            .style
+            .font_family_for_character(request.character)
             .and_then(|families| families.split(',').next())
             .map(str::trim)
             .map(|family| family.trim_matches(['\'', '"']))
             .is_some_and(|family| family.eq_ignore_ascii_case("ahem"));
-        let key = (request.character, request.font_size.to_bits(), is_ahem);
+        let key = (
+            request.character,
+            request.style.font_size.to_bits(),
+            is_ahem,
+        );
         let advance = if is_ahem {
-            request.font_size
+            request.style.font_size
         } else {
-            request.font_size * 0.5
+            request.style.font_size * 0.5
         };
-        let metric = GlyphMetric::try_new(
+        let metric = GlyphMetric::new(
             request.character,
             advance,
-            request.font_size * 0.75,
-            request.font_size * 0.25,
-        )?;
+            request.style.font_size * 0.75,
+            request.style.font_size * 0.25,
+        );
         if let Some(&glyph) = self.glyphs.get(&key) {
             return Ok(ShapedGlyph::from_metric(glyph, metric));
         }

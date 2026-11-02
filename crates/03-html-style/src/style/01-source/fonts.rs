@@ -11,14 +11,9 @@ use lightningcss::rules::{CssRule, CssRuleList};
 use lightningcss::stylesheet::ParserOptions;
 use lightningcss::traits::{Parse, ParseWithOptions, ToCss};
 use lightningcss::values::percentage::Percentage;
-use lightningcss::values::color::CssColor;
 use lightningcss::values::size::Size2D;
 use std::borrow::Cow;
 use std::ops::RangeInclusive;
-
-/// Active named palette definition, retained as Lightning CSS's owned AST.
-/// Hosts can inspect its descriptors without introducing another CSS parser.
-pub type FontPalette = lightningcss::rules::font_palette_values::FontPaletteValuesRule<'static>;
 
 /// A usable `@font-face` declaration. Hosts load and register these faces under
 /// `family`, which may differ from the font file's internal family name.
@@ -313,76 +308,4 @@ pub(super) fn resolve_rule_urls(
         }
     }
     changed
-}
-
-
-/// Convert parser-owned palette descriptors into renderer data. Private fields
-/// of OverrideColors are exposed through Lightning CSS's own serialization and
-/// token AST, as with FamilyName above; no alternate CSS grammar is used.
-pub(crate) fn resolved_font_palettes(
-    rules: &[FontPalette],
-    color_to_rgba: impl Fn(&lightningcss::values::color::CssColor) -> u32,
-) -> Vec<html_style_model::FontPaletteDefinition> {
-    use html_style_model::{FontPaletteBase, FontPaletteDefinition};
-    use lightningcss::rules::font_palette_values::{BasePalette, FontPaletteValuesProperty};
-    rules
-        .iter()
-        .filter_map(|rule| {
-            let mut family = None;
-            let mut base = FontPaletteBase::Normal;
-            let mut colors = Vec::new();
-            for property in &rule.properties {
-                match property {
-                    FontPaletteValuesProperty::FontFamily(value) => family = decoded_family(value),
-                    FontPaletteValuesProperty::BasePalette(value) => {
-                        base = match value {
-                            BasePalette::Light => FontPaletteBase::Light,
-                            BasePalette::Dark => FontPaletteBase::Dark,
-                            BasePalette::Integer(index) => FontPaletteBase::Index(*index),
-                        }
-                    }
-                    FontPaletteValuesProperty::OverrideColors(values) => {
-                        colors.clear();
-                        for value in values {
-                            let css = value.to_css_string(PrinterOptions::default()).ok()?;
-                            let tokens = TokenList::parse_string_with_options(
-                                &css,
-                                ParserOptions::default(),
-                            )
-                            .ok()?;
-                            let mut tokens = tokens.0.iter().filter(|token| !token.is_whitespace());
-                            let Some(TokenOrValue::Token(Token::Number {
-                                int_value: Some(index),
-                                ..
-                            })) = tokens.next()
-                            else {
-                                return None;
-                            };
-                            let color = match tokens.next()? {
-                                TokenOrValue::Color(color) => color.clone(),
-                                TokenOrValue::Token(Token::Ident(ident)) => {
-                                    CssColor::parse_string(ident.as_ref()).ok()?
-                                }
-                                _ => return None,
-                            };
-                            if tokens.next().is_some() {
-                                return None;
-                            }
-                            colors.push((
-                                u16::try_from(*index).ok()?,
-                                color_to_rgba(&color).to_be_bytes(),
-                            ));
-                        }
-                    }
-                    FontPaletteValuesProperty::Custom(_) => {}
-                }
-            }
-            Some(FontPaletteDefinition {
-                name: rule.name.0.to_string(),
-                family: family?,
-                base,
-                colors,
-            })
-        })
-        .collect()
 }

@@ -1,9 +1,7 @@
 use html::document::{DocumentTextIndex, MarkupSyntax, parse_document};
-use html::layout::{
-    CaretAffinity, ContentRole, LaidOutDocument, LayoutConstraints, PositionedShapedLine,
-    SourceLocation,
-};
-use html::pipeline::DocumentFactory;
+use html_pipeline::engine::{LaidOutDocument, LayoutConstraints};
+use html::layout::{CaretAffinity, ContentRole, PositionedShapedLine, SourceLocation};
+use html_pipeline::DocumentFactory;
 use html::text::{
     GlyphMetric, GlyphResourceGeneration, GlyphResourceStore, GlyphShaper, ShapeError, ShapedLine,
     TextSearchOptions, find_text_matches, text_matches,
@@ -23,13 +21,12 @@ impl GlyphShaper for TestShaper {
     fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
         Ok(ShapedGlyph::from_metric(
             request.character as u32,
-            GlyphMetric::try_new(
+            GlyphMetric::new(
                 request.character,
-                request.font_size / 2.0,
-                request.font_size,
+                request.style.font_size / 2.0,
+                request.style.font_size,
                 0.0,
-            )
-            .unwrap(),
+            ),
         ))
     }
 }
@@ -301,7 +298,7 @@ fn xml_epub_semantics_use_the_namespace_uri() {
 
 #[test]
 fn xml_epub_verse_preserves_authored_spacing_with_reader_controls() {
-    use html::pipeline::ReaderStyleOverrides;
+    use html::style::ReaderStyleOverrides;
 
     let parsed = parse_document(
         "<html xmlns='http://www.w3.org/1999/xhtml' xmlns:book='http://www.idpf.org/2007/ops'><body style='margin:0;line-height:1'><div book:type='z3998:verse' style='text-indent:12px'>First.<br/><br/>Second.</div></body></html>",

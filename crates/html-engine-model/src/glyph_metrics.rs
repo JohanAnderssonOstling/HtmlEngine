@@ -1,12 +1,12 @@
-use crate::{FontMetrics, GlyphHandle, GlyphId, ShapedGlyph};
+use crate::{FontMetrics, GlyphHandle, GlyphId, RunFontMetrics, ShapedGlyph};
 use html_dom::MemoryUsageReport;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use std::ops::Range;
 use std::sync::Arc;
 
-/// Immutable validated layout data for one shaped glyph.
+/// Immutable layout data for one shaped glyph.
 ///
-/// Metric fields cannot be populated without validation:
+/// Metric fields are private; callers supply finite, non-negative measurements:
 ///
 /// ```compile_fail
 /// let _ = html_engine_model::GlyphMetric {
@@ -22,33 +22,19 @@ pub struct GlyphMetric {
     metrics: FontMetrics,
 }
 
-/// Error returned when glyph metric values violate boundary invariants.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum GlyphMetricError {
-    NonFiniteValue { field: &'static str, value: f32 },
-    NegativeValue { field: &'static str, value: f32 },
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GlyphMetricsError {
     CapacityExceeded,
 }
 
 impl GlyphMetric {
-    pub fn try_new(
-        ch: char,
-        advance: f32,
-        ascent: f32,
-        descent: f32,
-    ) -> Result<Self, GlyphMetricError> {
-        validate_metric_value_non_negative("advance", advance)?;
-        let metrics = FontMetrics::new(ascent, descent)?;
-
-        Ok(Self {
+    /// Store adapter-supplied measurements without validating their values.
+    pub fn new(ch: char, advance: f32, ascent: f32, descent: f32) -> Self {
+        Self {
             ch,
             advance,
-            metrics,
-        })
+            metrics: FontMetrics::new(ascent, descent),
+        }
     }
 
     pub(crate) fn from_shaped(ch: char, shaped: ShapedGlyph) -> Self {
@@ -80,36 +66,28 @@ impl GlyphMetric {
     }
 }
 
-pub(crate) fn validate_metric_value_non_negative(
-    field: &'static str,
-    value: f32,
-) -> Result<(), GlyphMetricError> {
-    if !value.is_finite() {
-        return Err(GlyphMetricError::NonFiniteValue { field, value });
-    }
-    if value < 0.0 {
-        return Err(GlyphMetricError::NegativeValue { field, value });
-    }
-    Ok(())
-}
-
 /// Dense IDs backed by compact run records. Character metrics are resolved on
-/// demand from shared advances and uniform vertical metrics, rather than
-/// materialized and cloned for every character in a document.
+/// demand from shared advances and vertical metrics, rather than materialized
+/// and cloned for every character in a document.
 ///
-/// Raw run registration is internal. Public callers register validated runs
-/// through [`crate::GlyphResourceStore`].
+/// Raw run registration is internal. [`crate::GlyphResourceStore`] owns run
+/// registration and assigns layout IDs.
 ///
 /// ```compile_fail,E0624
-/// use html_engine_model::{GlyphMetric, GlyphMetrics};
+/// use html_engine_model::{FontMetrics, GlyphMetrics, RunFontMetrics};
 /// let mut metrics = GlyphMetrics::default();
-/// let _ = metrics.register_run("x", vec![1.0].into(), GlyphMetric::default());
+/// let _ = metrics.register_run(
+///     "x", vec![1.0].into(), RunFontMetrics::Uniform(FontMetrics::default()), 0,
+/// );
 /// ```
 #[derive(Debug, Default)]
 pub struct GlyphMetrics {
     records: Vec<MetricRecord>,
     len: usize,
     paint_handles: FxHashMap<GlyphId, GlyphHandle>,
+    // Preserve identity lookup before the first run with independent handles.
+    // This boundary also lets truncation discard the slow path in constant time.
+    first_offset_run: Option<GlyphId>,
 }
 
 #[derive(Debug)]
@@ -131,7 +109,8 @@ enum MetricData {
 struct RunMetrics<T> {
     characters: Box<[T]>,
     advances: Arc<[f32]>,
-    vertical: FontMetrics,
+    vertical: RunFontMetrics,
+    first_paint_handle: GlyphHandle,
 }
 
 /// A traversal-local view of glyph advances and vertical metrics. Source
@@ -152,6 +131,11 @@ enum MetricDimensions<'a> {
         advances: &'a [f32],
         vertical: FontMetrics,
     },
+    MixedRun {
+        start: GlyphId,
+        advances: &'a [f32],
+        vertical: &'a [FontMetrics],
+    },
 }
 
 impl MetricDimensions<'_> {
@@ -171,6 +155,17 @@ impl MetricDimensions<'_> {
             } => {
                 let offset = glyph.checked_sub(*start)? as usize;
                 advances.get(offset).map(|&advance| (advance, *vertical))
+            }
+            Self::MixedRun {
+                start,
+                advances,
+                vertical,
+            } => {
+                let offset = glyph.checked_sub(*start)? as usize;
+                advances
+                    .get(offset)
+                    .zip(vertical.get(offset))
+                    .map(|(&advance, &metrics)| (advance, metrics))
             }
         }
     }
@@ -214,7 +209,26 @@ impl<T> RunMetrics<T> {
         GlyphMetric {
             ch,
             advance: self.advances[offset],
-            metrics: self.vertical,
+            metrics: match &self.vertical {
+                RunFontMetrics::Uniform(metrics) => *metrics,
+                RunFontMetrics::PerCharacter(metrics) => metrics[offset],
+            },
+        }
+    }
+
+    fn dimensions(&self, start: GlyphId, len: usize) -> MetricDimensions<'_> {
+        let advances = &self.advances[..len];
+        match &self.vertical {
+            RunFontMetrics::Uniform(vertical) => MetricDimensions::Run {
+                start,
+                advances,
+                vertical: *vertical,
+            },
+            RunFontMetrics::PerCharacter(vertical) => MetricDimensions::MixedRun {
+                start,
+                advances,
+                vertical: &vertical[..len],
+            },
         }
     }
 
@@ -224,6 +238,11 @@ impl<T> RunMetrics<T> {
         }
         if seen.insert(self.advances.as_ptr().cast()) {
             report.add_slice("GlyphMetrics.run.advances.shared", &self.advances);
+        }
+        if let RunFontMetrics::PerCharacter(vertical) = &self.vertical
+            && seen.insert(vertical.as_ptr().cast())
+        {
+            report.add_slice("GlyphMetrics.run.vertical.shared", vertical);
         }
     }
 }
@@ -245,8 +264,23 @@ impl GlyphMetrics {
 
     /// Resolve a layout glyph to its adapter-owned native paint handle.
     pub fn paint_handle(&self, glyph: GlyphId) -> Option<GlyphHandle> {
-        ((glyph as usize) < self.len)
-            .then(|| self.paint_handles.get(&glyph).copied().unwrap_or(glyph))
+        if glyph as usize >= self.len {
+            return None;
+        }
+        if self.first_offset_run.is_none_or(|start| glyph < start) {
+            return Some(self.paint_handles.get(&glyph).copied().unwrap_or(glyph));
+        }
+        let record =
+            &self.records[self.records.partition_point(|record| record.start <= glyph) - 1];
+        let first_handle = match &record.data {
+            MetricData::Singles(_) => {
+                return Some(self.paint_handles.get(&glyph).copied().unwrap_or(glyph));
+            }
+            MetricData::AsciiRun(run) => run.first_paint_handle,
+            MetricData::BmpRun(run) => run.first_paint_handle,
+            MetricData::UnicodeRun(run) => run.first_paint_handle,
+        };
+        Some(first_handle + (glyph - record.start))
     }
     pub(crate) fn set_paint_handle(&mut self, glyph: GlyphId, handle: GlyphHandle) {
         if glyph != handle {
@@ -286,13 +320,19 @@ impl GlyphMetrics {
         &mut self,
         text: &str,
         advances: Arc<[f32]>,
-        vertical: GlyphMetric,
+        vertical: RunFontMetrics,
+        first_paint_handle: GlyphHandle,
     ) -> Result<Range<GlyphId>, GlyphMetricsError> {
         // The caller validates the scalar count against these advances.
         // Keep scalar indexing for every encoding, including supplementary
         // characters, rather than indexing UTF-16 code units.
         let count = advances.len();
         debug_assert_eq!(text.chars().count(), count);
+        debug_assert!(match &vertical {
+            RunFontMetrics::Uniform(_) => true,
+            RunFontMetrics::PerCharacter(values) => values.len() == count,
+        });
+        debug_assert!(u64::from(first_paint_handle) + count as u64 <= u64::from(u32::MAX));
         let end = self
             .len
             .checked_add(count)
@@ -300,12 +340,12 @@ impl GlyphMetrics {
             .ok_or(GlyphMetricsError::CapacityExceeded)?;
         let range = self.len as GlyphId..end as GlyphId;
         if count != 0 {
-            let vertical = vertical.font_metrics();
             let data = if text.is_ascii() {
                 MetricData::AsciiRun(RunMetrics {
                     characters: text.as_bytes().into(),
                     advances,
                     vertical,
+                    first_paint_handle,
                 })
             } else if text.chars().all(|ch| (ch as u32) <= u16::MAX as u32) {
                 let mut characters = Vec::with_capacity(count);
@@ -314,6 +354,7 @@ impl GlyphMetrics {
                     characters: characters.into_boxed_slice(),
                     advances,
                     vertical,
+                    first_paint_handle,
                 })
             } else {
                 let mut characters = Vec::with_capacity(count);
@@ -322,8 +363,12 @@ impl GlyphMetrics {
                     characters: characters.into_boxed_slice(),
                     advances,
                     vertical,
+                    first_paint_handle,
                 })
             };
+            if first_paint_handle != range.start && self.first_offset_run.is_none() {
+                self.first_offset_run = Some(range.start);
+            }
             self.records.push(MetricRecord {
                 start: range.start,
                 end: range.end,
@@ -389,6 +434,12 @@ impl GlyphMetrics {
             }
         }
         self.paint_handles.retain(|id, _| (*id as usize) < len);
+        if self
+            .first_offset_run
+            .is_some_and(|start| start as usize >= len)
+        {
+            self.first_offset_run = None;
+        }
         self.len = len;
     }
 
@@ -423,21 +474,14 @@ impl GlyphMetrics {
 impl MetricRecord {
     fn dimensions(&self) -> MetricDimensions<'_> {
         let len = (self.end - self.start) as usize;
-        let (advances, vertical) = match &self.data {
-            MetricData::Singles(values) => {
-                return MetricDimensions::Singles {
-                    start: self.start,
-                    values,
-                };
-            }
-            MetricData::AsciiRun(run) => (&run.advances[..len], run.vertical),
-            MetricData::BmpRun(run) => (&run.advances[..len], run.vertical),
-            MetricData::UnicodeRun(run) => (&run.advances[..len], run.vertical),
-        };
-        MetricDimensions::Run {
-            start: self.start,
-            advances,
-            vertical,
+        match &self.data {
+            MetricData::Singles(values) => MetricDimensions::Singles {
+                start: self.start,
+                values,
+            },
+            MetricData::AsciiRun(run) => run.dimensions(self.start, len),
+            MetricData::BmpRun(run) => run.dimensions(self.start, len),
+            MetricData::UnicodeRun(run) => run.dimensions(self.start, len),
         }
     }
 
@@ -462,7 +506,7 @@ mod tests {
     use super::*;
 
     fn metric(ch: char) -> GlyphMetric {
-        GlyphMetric::try_new(ch, 2.0, 8.0, 2.0).unwrap()
+        GlyphMetric::new(ch, 2.0, 8.0, 2.0)
     }
 
     #[test]
@@ -494,7 +538,12 @@ mod tests {
         let advances: Arc<[f32]> = [2.0, 3.0].into();
         metrics.register(metric('a')).unwrap();
         metrics
-            .register_run("bc", advances.clone(), metric('\0'))
+            .register_run(
+                "bc",
+                advances.clone(),
+                RunFontMetrics::Uniform(metric('\0').font_metrics()),
+                1,
+            )
             .unwrap();
         metrics.register(metric('d')).unwrap();
         metrics.register(metric('e')).unwrap();
@@ -522,7 +571,8 @@ mod tests {
                 .register_run(
                     "ab",
                     advances.clone(),
-                    GlyphMetric::default(),
+                    RunFontMetrics::Uniform(FontMetrics::default()),
+                    metrics.len() as GlyphHandle,
                 )
                 .unwrap();
         }
@@ -534,35 +584,5 @@ mod tests {
             .map(|entry| entry.bytes)
             .sum();
         assert_eq!(reported, 2 * size_of::<f32>());
-    }
-
-    #[test]
-    fn glyph_metric_rejects_negative_advance() {
-        assert!(GlyphMetric::try_new('x', -1.0, 0.0, 0.0).is_err());
-    }
-
-    #[test]
-    fn glyph_metric_rejects_negative_ascent() {
-        assert!(GlyphMetric::try_new('x', 1.0, -0.25, 0.0).is_err());
-    }
-
-    #[test]
-    fn glyph_metric_rejects_negative_descent() {
-        assert!(GlyphMetric::try_new('x', 1.0, 0.0, -0.25).is_err());
-    }
-
-    #[test]
-    fn glyph_metric_rejects_nan_advance() {
-        assert!(GlyphMetric::try_new('x', f32::NAN, 0.0, 0.0).is_err());
-    }
-
-    #[test]
-    fn glyph_metric_rejects_nan_ascent() {
-        assert!(GlyphMetric::try_new('x', 1.0, f32::NAN, 0.0).is_err());
-    }
-
-    #[test]
-    fn glyph_metric_rejects_nan_descent() {
-        assert!(GlyphMetric::try_new('x', 1.0, 0.0, f32::NAN).is_err());
     }
 }

@@ -19,7 +19,7 @@ fn open_type_controls_resolve_to_normalized_feature_tags() {
     let value = |tag| {
         features
             .iter()
-            .find(|feature| feature.tag() == tag)
+            .find(|feature| feature.tag_bytes() == tag)
             .map(|feature| feature.value())
     };
 
@@ -52,7 +52,13 @@ fn inherited_font_feature_settings_reach_inline_descendants() {
         .expect("font style")
         .open_type_features();
 
-    assert_eq!(features.iter().find(|feature| feature.tag() == *b"kern").map(|feature| feature.value()), Some(0));
+    assert_eq!(
+        features
+            .iter()
+            .find(|feature| feature.tag_bytes() == *b"kern")
+            .map(|feature| feature.value()),
+        Some(0)
+    );
 }
 
 #[test]

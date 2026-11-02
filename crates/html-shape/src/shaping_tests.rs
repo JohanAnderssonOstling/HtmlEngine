@@ -1,12 +1,14 @@
 #[cfg(test)]
 mod tests {
-    use crate::{GlyphRequest, ShapedGlyph};
+    use html_engine_model::shaping;
+
+    use crate::{GlyphRequest, ShapedGlyph, ShapedRun};
 
     use super::{
-        BoxFontMetrics, CharacterPlacement, FontSlant, RequiredFontMetrics, ResolvedBidi, ShapedFontMetrics,
-        ShapedLine, ShapedTextGeometry, ShapedTextRun, TextRunShapeRequest, TextShapeRequest,
-        TextStyleSpan, collapse_whitespace, first_letter_overrides_with_characters,
-        first_letter_style_overrides, is_css_collapsible_space, plan_shaping_spans, transform_text,
+        BoxFontMetrics, FontSlant, RequiredFontMetrics, ResolvedBidi, ShapedFontMetrics,
+        ShapedLine, ShapedTextGeometry, ShapedTextRun, TextRunShapeRequest, collapse_whitespace,
+        first_letter_overrides_with_characters, first_letter_style_overrides,
+        is_css_collapsible_space, plan_shaping_spans, transform_text,
     };
     use crate::parser::DocumentFactory;
     use std::cell::Cell;
@@ -319,23 +321,12 @@ mod tests {
     }
 
     #[test]
-    fn shaped_run_requires_complete_valid_cluster_geometry() {
-        assert!(
-            ShapedTextRun::new(Arc::from([4.0, 4.0]), Arc::from([true, false, true])).is_some()
-        );
-        assert!(ShapedTextRun::new(Arc::from([4.0, 4.0]), Arc::from([true, true])).is_none());
-        assert!(ShapedTextRun::new(Arc::from([4.0]), Arc::from([false, true])).is_none());
-        assert!(ShapedTextRun::new(Arc::from([f32::NAN]), Arc::from([true, true])).is_none());
-    }
-
-    #[test]
     fn native_ascii_boundaries_preserve_crlf_and_ligatures() {
         let mut run = ShapedTextRun::new(
             Arc::from([4.0; 4]),
             Arc::from([true, false, true, true, true]),
-        )
-        .unwrap();
-        run.preserve_graphemes("fi\r\n");
+        );
+        shaping::preserve_graphemes(&mut run, "fi\r\n");
         assert_eq!(run.cluster_boundaries(), &[true, false, true, false, true]);
     }
 
@@ -343,7 +334,7 @@ mod tests {
     fn graphemes_are_segmented_once_per_run_and_keep_native_ligatures() {
         use crate::test_support::TestGlyphShaper;
         use crate::{
-            GlyphId, GlyphResourceGeneration, GlyphResourceStore, GlyphShaper, ImageMetrics,
+            GlyphResourceGeneration, GlyphResourceStore, GlyphShaper, ImageMetrics,
             LayoutConstraints, ShapeError,
         };
 
@@ -375,32 +366,30 @@ mod tests {
             ) -> Result<ShapedGlyph, ShapeError> {
                 self.fallback.shape_glyph(request)
             }
-            fn shape_glyph_run(
+            fn shape_run(
                 &mut self,
                 request: TextRunShapeRequest<'_>,
-                glyphs: &mut [GlyphId],
-                resources: &mut GlyphResourceStore,
-            ) -> Result<Option<ShapedTextRun>, ShapeError> {
+            ) -> Result<Option<ShapedRun>, ShapeError> {
                 self.run_calls += 1;
-                let size = request.style().font_size();
+                let size = request.style().font_size;
                 let ligature_boundary = request
                     .text()
                     .find("fi")
                     .map(|byte| request.text()[..byte].chars().count() + 1);
-                self.fallback.shape_glyph_run(request, glyphs, resources)?;
+                let count = request.text().chars().count();
                 if !self.native {
                     return Ok(None);
                 }
                 // The backend merges "fi" but leaves combining/emoji clusters
                 // too permissive, so both native and Unicode constraints matter.
-                let mut boundaries = vec![true; glyphs.len() + 1];
+                let mut boundaries = vec![true; count + 1];
                 if let Some(boundary) = ligature_boundary {
                     boundaries[boundary] = false;
                 }
-                Ok(Some(
-                    ShapedTextRun::new(vec![size * 0.5; glyphs.len()].into(), boundaries.into())
-                        .unwrap(),
-                ))
+                Ok(Some(ShapedRun::geometry(ShapedTextRun::new(
+                    vec![size * 0.5; count].into(),
+                    boundaries.into(),
+                ))))
             }
         }
 
@@ -547,87 +536,15 @@ mod tests {
     #[test]
     fn geometry_change_detection_uses_cumulative_caret_deltas() {
         let mut geometry = ShapedTextGeometry::with_len(200);
-        let initial =
-            ShapedTextRun::new(Arc::from(vec![1.0; 200]), Arc::from(vec![true; 201])).unwrap();
+        let initial = ShapedTextRun::new(Arc::from(vec![1.0; 200]), Arc::from(vec![true; 201]));
         assert!(geometry.update_range(0..200, &initial));
 
         let sub_epsilon_per_character =
-            ShapedTextRun::new(Arc::from(vec![1.009; 200]), Arc::from(vec![true; 201])).unwrap();
+            ShapedTextRun::new(Arc::from(vec![1.009; 200]), Arc::from(vec![true; 201]));
         assert!(
             geometry.update_range(0..200, &sub_epsilon_per_character),
             "small scalar changes that accumulate across a line must trigger relayout"
         );
-    }
-
-    #[test]
-    fn run_metric_registration_shares_advances_and_borrows_the_ledger() {
-        use crate::{GlyphMetric, GlyphResourceStore};
-        let mut resources = GlyphResourceStore::default();
-        let single = GlyphMetric::try_new('x', 3.0, 8.0, 2.0).unwrap();
-        assert_eq!(resources.register(single).unwrap(), 0);
-        let advances: Arc<[f32]> = Arc::from([2.0, 0.0, 4.0, 5.0]);
-        let run = ShapedTextRun::new(advances.clone(), Arc::from([true, false, true, true, true]))
-            .unwrap();
-        assert_eq!(
-            resources
-                .register_run("a\u{301}😀ב", &run, 8.0, 2.0)
-                .unwrap(),
-            1..5
-        );
-        // Both the run and ledger retain the original advance allocation.
-        assert_eq!(Arc::strong_count(&advances), 3);
-        assert_eq!(resources.record_count(), 2);
-        for (id, (ch, advance)) in "a\u{301}😀ב"
-            .chars()
-            .zip(advances.iter().copied())
-            .enumerate()
-        {
-            assert_eq!(
-                resources.get(id as u32 + 1),
-                Some(GlyphMetric::try_new(ch, advance, 8.0, 2.0).unwrap())
-            );
-        }
-        {
-            let metrics = resources.metrics();
-            assert_eq!(metrics.len(), 5);
-            assert_eq!(metrics.get_checked(4).unwrap().ch(), 'ב');
-            assert!(metrics.get_checked(5).is_none());
-            let mut hint = usize::MAX;
-            for id in [4, 0, 2, 3, 1, 5, u32::MAX] {
-                assert_eq!(
-                    metrics.get_with_hint(id, &mut hint),
-                    metrics.get_checked(id)
-                );
-            }
-            assert_eq!(
-                Arc::strong_count(&advances),
-                3,
-                "borrowing metrics adds no owners"
-            );
-        }
-        resources.register(single).unwrap();
-        resources.register(single).unwrap();
-        assert_eq!(resources.record_count(), 3);
-        assert_eq!(resources.get(0), Some(single));
-        assert_eq!(resources.get(4).unwrap().ch(), 'ב');
-        resources.clear();
-        assert!(resources.is_empty());
-    }
-
-    #[test]
-    fn run_metric_registration_rejects_invalid_input_without_allocating_ids() {
-        use crate::GlyphResourceStore;
-        let mut resources = GlyphResourceStore::default();
-        let run = ShapedTextRun::new(Arc::from([1.0, 2.0]), Arc::from([true; 3])).unwrap();
-        assert!(resources.register_run("x", &run, 8.0, 2.0).is_err());
-        for (ascent, descent) in [(f32::NAN, 2.0), (8.0, -1.0), (8.0, f32::INFINITY)] {
-            assert!(resources.register_run("ab", &run, ascent, descent).is_err());
-        }
-        assert_eq!(resources.len(), 0);
-        assert_eq!(resources.record_count(), 0);
-        let empty = ShapedTextRun::new(Arc::from([]), Arc::from([true])).unwrap();
-        assert_eq!(resources.register_run("", &empty, 0.0, 0.0).unwrap(), 0..0);
-        assert_eq!(resources.record_count(), 0);
     }
 
     #[test]
@@ -640,7 +557,6 @@ mod tests {
                 [0.0, 2.0, 5.0].into(),
                 8.0,
             )
-            .unwrap()
         };
         let geometry = |shared: bool| {
             let first = run();
@@ -675,7 +591,7 @@ mod tests {
                 .collect::<Arc<[f32]>>();
             let mut clusters = vec![true; indices.len() + 1];
             clusters[1..indices.len()].fill(false);
-            let shaped = ShapedTextRun::new(widths, Arc::from(clusters)).unwrap();
+            let shaped = ShapedTextRun::new(widths, Arc::from(clusters));
             for (offset, &index) in indices.iter().enumerate() {
                 advances[index as usize] = shaped.advances()[offset];
                 boundaries[index as usize] &= shaped.cluster_boundaries()[offset];
@@ -728,8 +644,7 @@ mod tests {
             if count > 1 {
                 clusters[1] = false;
             }
-            let shaped =
-                ShapedTextRun::new(Arc::from(vec![7.5; count]), Arc::from(clusters)).unwrap();
+            let shaped = ShapedTextRun::new(Arc::from(vec![7.5; count]), Arc::from(clusters));
             advances[range.start as usize..range.end as usize].copy_from_slice(shaped.advances());
             boundaries[range.start as usize..=range.end as usize]
                 .copy_from_slice(shaped.cluster_boundaries());
@@ -774,7 +689,7 @@ mod tests {
                 .collect::<Arc<[f32]>>();
             base.push_run(
                 &indices,
-                ShapedTextRun::new(advances, boundaries.into()).unwrap(),
+                ShapedTextRun::new(advances, boundaries.into()),
                 false,
             );
         }
@@ -788,7 +703,7 @@ mod tests {
             boundaries[1..length].fill(false);
             refined.replace_range(
                 range,
-                ShapedTextRun::new(vec![7.5; length].into(), boundaries.into()).unwrap(),
+                ShapedTextRun::new(vec![7.5; length].into(), boundaries.into()),
                 false,
             );
             assert_cursor(TextGeometryView::new(&base, Some(&refined)));
@@ -796,248 +711,24 @@ mod tests {
     }
 
     #[test]
-    fn run_backed_metrics_preserve_layout_and_source_geometry() {
-        use crate::test_support::TestGlyphShaper;
-        use crate::{
-            GlyphId, GlyphMetric, GlyphResourceGeneration, GlyphResourceStore, GlyphShaper,
-            ImageMetrics, LaidOutDocument, LayoutConstraints, ReaderStyleOverrides, ShapeError,
-        };
-        struct LedgerShaper {
-            fallback: TestGlyphShaper,
-            compact: bool,
-        }
-        impl GlyphShaper for LedgerShaper {
-            fn reset(&mut self) {
-                self.fallback.reset();
-            }
-            fn resource_generation(&self) -> GlyphResourceGeneration {
-                self.fallback.resource_generation()
-            }
-            fn begin_append_shaping(&mut self) -> Result<(), ShapeError> {
-                self.fallback.begin_append_shaping()
-            }
-            fn commit_append_shaping(&mut self) {
-                self.fallback.commit_append_shaping();
-            }
-            fn rollback_append_shaping(&mut self) {
-                self.fallback.rollback_append_shaping();
-            }
-            fn shape_glyph(
-                &mut self,
-                request: GlyphRequest<'_>,
-            ) -> Result<ShapedGlyph, ShapeError> {
-                self.fallback.shape_glyph(request)
-            }
-            fn shape_glyph_run(
-                &mut self,
-                request: TextRunShapeRequest<'_>,
-                glyphs: &mut [GlyphId],
-                resources: &mut GlyphResourceStore,
-            ) -> Result<Option<ShapedTextRun>, ShapeError> {
-                let size = request.style().font_size();
-                let geometry = ShapedTextRun::new(
-                    Arc::from(vec![size * 0.5; glyphs.len()]),
-                    Arc::from(vec![true; glyphs.len() + 1]),
-                )
-                .unwrap();
-                if self.compact {
-                    let ids = resources.register_run(
-                        request.text(),
-                        &geometry,
-                        size * 0.75,
-                        size * 0.25,
-                    )?;
-                    for (slot, id) in glyphs.iter_mut().zip(ids) {
-                        *slot = id;
-                    }
-                } else {
-                    for (slot, ch) in glyphs.iter_mut().zip(request.text().chars()) {
-                        *slot = resources.register(
-                            GlyphMetric::try_new(ch, size * 0.5, size * 0.75, size * 0.25).unwrap(),
-                        )?;
-                    }
-                }
-                Ok(Some(geometry))
-            }
-        }
-        for (html, css) in [
-            (
-                "<p>office a\u{301} 😀 אבג soft\u{ad}hyphen with more words</p>",
-                None,
-            ),
-            (
-                "<p>of<span style='position:absolute'>nested</span>fice <em>again</em></p><pre>a\nb\tc</pre>",
-                None,
-            ),
-            (
-                "<p>aa aa aa aa aa aa aa</p><p>second paragraph</p>",
-                Some(
-                    "p {font-size:10px} p::first-line {font-size:20px;letter-spacing:1px;word-spacing:2px}",
-                ),
-            ),
-            (
-                "<p>first <span style='font-size:24px'>large</span> end</p><ul><li>marker</li></ul>",
-                None,
-            ),
-            (
-                "<section><h2>Contents</h2><p>Chapter One ... 1</p></section><p>Story<br>resumes<a class='fnanchor' href='#fn1'>[1]</a> here.</p><div class='footnotes'><p id='fn1'>Note body.</p></div>",
-                None,
-            ),
-        ] {
-            let mut factory = DocumentFactory::new();
-            let prepared = factory.parse_with_new_pipeline(html, css);
-            let mut dense = LedgerShaper {
-                fallback: TestGlyphShaper::new(),
-                compact: false,
-            };
-            let mut compact = LedgerShaper {
-                fallback: TestGlyphShaper::new(),
-                compact: true,
-            };
-
-            let palettes: Vec<_> = [
-                ReaderStyleOverrides {
-                    foreground: Some(0xeeeeeeff),
-                    background: Some(0x222222ff),
-                    ..Default::default()
-                },
-                ReaderStyleOverrides::default(),
-            ]
-            .iter()
-            .map(|palette| prepared.with_reader_paint_overrides(palette).unwrap())
-            .collect();
-            let mut compact_shaped_resources = GlyphResourceStore::default();
-            let compact_shaped = prepared
-                .shape_borrowed(&mut compact, &mut compact_shaped_resources)
-                .unwrap();
-            let metrics = ImageMetrics::default();
-            let mut compact_doc = compact_shaped
-                .layout_with_metrics_and_shaper(
-                    LayoutConstraints::new(40.0, 16.0).unwrap(),
-                    &metrics,
-                    &mut compact,
-                    &mut compact_shaped_resources,
-                )
-                .unwrap();
-            for width in [40.0, 120.0, 350.0, 350.0, 40.0] {
-                let constraints = LayoutConstraints::new(width, 16.0).unwrap();
-                let mut dense_doc_resources = GlyphResourceStore::default();
-                let mut dense_doc = prepared
-                    .shape_borrowed(&mut dense, &mut dense_doc_resources)
-                    .unwrap()
-                    .layout_with_metrics_and_shaper(
-                        constraints,
-                        &metrics,
-                        &mut dense,
-                        &mut dense_doc_resources,
-                    )
-                    .unwrap();
-                compact_doc
-                    .relayout_with_metrics_and_shaper(
-                        constraints,
-                        &metrics,
-                        &mut compact,
-                        &mut compact_shaped_resources,
-                    )
-                    .unwrap();
-                let expected = dense_doc.render_view(&dense_doc_resources).text();
-                let actual = compact_doc.render_view(&compact_shaped_resources).text();
-                assert_eq!(actual.glyph_count(), expected.glyph_count());
-                assert_eq!(
-                    compact_doc.line_count(),
-                    dense_doc.line_count(),
-                    "{html} at {width}"
-                );
-                for line in 0..dense_doc.line_count() {
-                    assert_eq!(
-                        format!("{:?}", actual.line(line)),
-                        format!("{:?}", expected.line(line)),
-                        "{html} at {width}"
-                    );
-                }
-                for index in 0..expected.glyph_count() {
-                    assert_eq!(
-                        actual.glyph_metric(actual.glyph_at(index).unwrap()),
-                        expected.glyph_metric(expected.glyph_at(index).unwrap())
-                    );
-                    assert_eq!(
-                        actual.character_advance(index as u32),
-                        expected.character_advance(index as u32)
-                    );
-                    assert_eq!(
-                        actual.is_character_cluster_boundary(index as u32),
-                        expected.is_character_cluster_boundary(index as u32)
-                    );
-                    assert_eq!(
-                        compact_doc.glyph_source_offset(index as u32),
-                        dense_doc.glyph_source_offset(index as u32)
-                    );
-                }
-                for painted in &palettes {
-                    assert!(dense_doc.repaint_from(painted, &dense_doc_resources));
-                    assert!(compact_doc.repaint_from(painted, &compact_shaped_resources));
-                    let reading = |document: &LaidOutDocument, resources: &GlyphResourceStore| {
-                        document
-                            .render_view(resources)
-                            .addressing()
-                            .reading_fragments(0)
-                            .into_iter()
-                            .map(|fragment| {
-                                (
-                                    fragment.text,
-                                    fragment.target.element,
-                                    fragment.target.glyph_ranges,
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                    };
-                    assert_eq!(
-                        reading(&compact_doc, &compact_shaped_resources),
-                        reading(&dense_doc, &dense_doc_resources)
-                    );
-                    let text = compact_doc.render_view(&compact_shaped_resources).text();
-                    let reference = dense_doc.render_view(&dense_doc_resources).text();
-                    for index in 0..text.glyph_count() {
-                        assert_eq!(
-                            text.paint_color_at(index as u32),
-                            reference.paint_color_at(index as u32)
-                        );
-                    }
-                    let decorations =
-                        |document: &LaidOutDocument, resources: &GlyphResourceStore| {
-                            document
-                                .render_view(resources)
-                                .fragments()
-                                .decorations()
-                                .iter()
-                                .map(|decoration| format!("{decoration:?}"))
-                                .collect::<Vec<_>>()
-                        };
-                    assert_eq!(
-                        decorations(&compact_doc, &compact_shaped_resources),
-                        decorations(&dense_doc, &dense_doc_resources)
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
     fn run_shape_request_requires_one_full_nonempty_style_span() {
-        let full = TextStyleSpan::new(0..2, 16.0, 400, FontSlant::Normal, 0, None).unwrap();
-        let partial = TextStyleSpan::new(0..1, 16.0, 400, FontSlant::Normal, 0, None).unwrap();
-        assert!(TextRunShapeRequest::new("fi", full).is_some());
-        assert!(TextRunShapeRequest::new("fi", partial).is_none());
+        let full = shaping::style(16.0, 400, FontSlant::Normal, 0, None)
+            .and_then(|resolved_style| shaping::span(0..2, resolved_style))
+            .unwrap();
+        let partial = shaping::style(16.0, 400, FontSlant::Normal, 0, None)
+            .and_then(|resolved_style| shaping::span(0..1, resolved_style))
+            .unwrap();
+        assert!(shaping::run("fi", full, None).is_some());
+        assert!(shaping::run("fi", partial, None).is_none());
     }
 
     #[test]
     fn run_shape_request_keeps_paint_colors_out_of_style_segmentation() {
-        let style = TextStyleSpan::new(0..2, 16.0, 400, FontSlant::Normal, 0, None).unwrap();
-        let colors = [0x112233ff, 0x445566ff];
-        let request = TextRunShapeRequest::new("fi", style)
-            .unwrap()
-            .with_paint_colors(&colors)
+        let style = shaping::style(16.0, 400, FontSlant::Normal, 0, None)
+            .and_then(|resolved_style| shaping::span(0..2, resolved_style))
             .unwrap();
+        let colors = [0x112233ff, 0x445566ff];
+        let request = shaping::run("fi", style, Some(&colors)).unwrap();
         assert_eq!(request.paint_colors(), Some(colors.as_slice()));
     }
 
@@ -1061,13 +752,13 @@ mod tests {
             fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
                 self.fallback.shape_glyph(request)
             }
-            fn shape_text_run(
+            fn shape_run(
                 &mut self,
                 request: TextRunShapeRequest<'_>,
-            ) -> Result<Option<ShapedTextRun>, ShapeError> {
+            ) -> Result<Option<ShapedRun>, ShapeError> {
                 self.requests.push((
                     request.text().to_owned(),
-                    request.style().color(),
+                    request.style().color,
                     request.paint_colors().map(|colors| colors.to_vec()),
                 ));
                 Ok(None)
@@ -1299,43 +990,16 @@ mod tests {
     }
 
     #[test]
-    fn placements_add_or_replace_natural_character_advances() {
-        let placements = [
-            CharacterPlacement::new(2.0, None, true).unwrap(),
-            CharacterPlacement::new(99.0, Some(4.0), false).unwrap(),
-        ];
-        let styles = [TextStyleSpan::new(0..2, 16.0, 400, FontSlant::Normal, 0, None).unwrap()];
-        let request = TextShapeRequest::new(0, 0..2, "ab", &styles, &placements).unwrap();
-        assert_eq!(
-            request.adjusted_caret_stops(&[0.0, 8.0, 15.0]).as_deref(),
-            Some([0.0, 10.0, 14.0].as_slice())
-        );
-    }
-
-    #[test]
-    fn placements_preserve_the_direction_of_natural_advances() {
-        let placements = [CharacterPlacement::new(2.0, None, true).unwrap()];
-        let styles = [TextStyleSpan::new(0..1, 16.0, 400, FontSlant::Normal, 0, None).unwrap()];
-        let request = TextShapeRequest::new(0, 0..1, "a", &styles, &placements).unwrap();
-        assert_eq!(
-            request.adjusted_caret_stops(&[10.0, 4.0]).as_deref(),
-            Some([10.0, 2.0].as_slice())
-        );
-    }
-
-    #[test]
     fn text_backend_contract_rejects_invalid_geometry_at_construction() {
-        assert!(CharacterPlacement::new(f32::NAN, None, true).is_none());
-        assert!(CharacterPlacement::new(0.0, Some(-1.0), true).is_none());
-        assert!(CharacterPlacement::with_baseline_shift(0.0, None, f32::NAN, true).is_none());
-        assert!(TextStyleSpan::new(0..1, 0.0, 400, FontSlant::Normal, 0, None).is_some());
-        assert!(TextStyleSpan::new(0..1, -1.0, 400, FontSlant::Normal, 0, None).is_none());
-
-        let placement = [CharacterPlacement::default()];
-        let gap = [TextStyleSpan::new(1..2, 16.0, 400, FontSlant::Normal, 0, None).unwrap()];
-        assert!(TextShapeRequest::new(0, 0..1, "a", &gap, &placement).is_none());
-
-        let complete = [TextStyleSpan::new(0..1, 16.0, 400, FontSlant::Normal, 0, None).unwrap()];
-        assert!(TextShapeRequest::new(0, 0..2, "a", &complete, &placement).is_none());
+        assert!(
+            shaping::style(0.0, 400, FontSlant::Normal, 0, None)
+                .and_then(|resolved_style| shaping::span(0..1, resolved_style))
+                .is_some()
+        );
+        assert!(
+            shaping::style(-1.0, 400, FontSlant::Normal, 0, None)
+                .and_then(|resolved_style| shaping::span(0..1, resolved_style))
+                .is_none()
+        );
     }
 }

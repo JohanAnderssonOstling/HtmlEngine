@@ -9,7 +9,7 @@ use rustc_data_structures::fx::{FxHashMap, FxHasher};
 use std::hash::{Hash, Hasher};
 use std::num::{NonZeroI16, NonZeroU16, NonZeroU32};
 use std::sync::atomic::{AtomicU32, Ordering};
-use crate::{ContentLanguage, FontPaletteDefinition, LanguageId};
+use crate::{ContentLanguage, LanguageId, OpenTypeFeature};
 use std::sync::Arc;
 
 /// Implement bitwise `PartialEq`/`Eq`/`Hash` for a style sub-struct so it can be
@@ -156,27 +156,6 @@ impl TabSize {
 
 impl_style_key!(TabSize { kind } floats { value });
 
-/// Font properties (inherited)
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct OpenTypeFeature {
-    tag: [u8; 4],
-    value: u32,
-}
-
-impl OpenTypeFeature {
-    pub const fn new(tag: [u8; 4], value: u32) -> Self {
-        Self { tag, value }
-    }
-
-    pub const fn tag(self) -> [u8; 4] {
-        self.tag
-    }
-
-    pub const fn value(self) -> u32 {
-        self.value
-    }
-}
-
 /// Permission to synthesize a slanted design when the selected face lacks one.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
 pub enum FontSynthesisStyle {
@@ -210,8 +189,6 @@ pub struct Font {
     pub font_stretch: f32,
     /// Authored oblique angle in degrees; zero for normal and italic faces.
     pub font_oblique_angle: f32,
-    /// Named color palette, resolved by the host against active palette rules.
-    pub font_palette: Option<StyleStringId>,
     pub font_family: Option<StyleStringId>,
     /// Independently selected family list for CJK glyphs.
     pub cjk_font_family: Option<StyleStringId>,
@@ -254,7 +231,6 @@ impl Clone for Font {
         self.font_style = source.font_style;
         self.font_stretch = source.font_stretch;
         self.font_oblique_angle = source.font_oblique_angle;
-        self.font_palette = source.font_palette;
         self.font_family = source.font_family;
         self.cjk_font_family = source.cjk_font_family;
         self.font_variant_caps_features.clone_from(&source.font_variant_caps_features);
@@ -292,7 +268,7 @@ impl Font {
         {
             if let Some(index) = merged
                 .iter()
-                .position(|existing: &OpenTypeFeature| existing.tag == feature.tag)
+                .position(|existing: &OpenTypeFeature| existing.tag_bytes() == feature.tag_bytes())
             {
                 merged[index] = feature;
             } else {
@@ -667,7 +643,7 @@ pub struct BorderRadii {
 
 /// Used corner radii after percentages and CSS overlap scaling are resolved.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct UsedBorderRadii {
+pub struct CornerRadii {
     pub top_left: (f32, f32),
     pub top_right: (f32, f32),
     pub bottom_right: (f32, f32),
@@ -726,7 +702,7 @@ fn ratio(available: f64, requested: f32) -> f32 {
     }
 }
 
-impl UsedBorderRadii {
+impl CornerRadii {
     pub fn is_zero(self) -> bool {
         [
             self.top_left,
@@ -749,14 +725,14 @@ impl UsedBorderRadii {
 }
 
 impl UsedBorderRadiiSpec {
-    pub fn resolve(self, width: f64, height: f64) -> UsedBorderRadii {
+    pub fn resolve(self, width: f64, height: f64) -> CornerRadii {
         let resolve = |radius: UsedCornerRadius| {
             (
                 radius.x.resolve(width).max(0.0) as f32,
                 radius.y.resolve(height).max(0.0) as f32,
             )
         };
-        let mut used = UsedBorderRadii {
+        let mut used = CornerRadii {
             top_left: resolve(self.top_left),
             top_right: resolve(self.top_right),
             bottom_right: resolve(self.bottom_right),
@@ -1002,7 +978,7 @@ pub struct Background {
 }
 
 impl_style_key!(Font {
-    font_weight, reader_font_weight, font_style, font_palette, font_family, cjk_font_family, font_variant_caps_features, font_synthesis_small_caps, font_synthesis_style, font_variant_numeric_features,
+    font_weight, reader_font_weight, font_style, font_family, cjk_font_family, font_variant_caps_features, font_synthesis_small_caps, font_synthesis_style, font_variant_numeric_features,
     font_variant_ligature_features, font_kerning_features, font_feature_settings
 } floats { font_stretch, font_oblique_angle, font_size, font_size_x_height_px, font_size_ch_advance_px, font_size_cap_height_px, font_size_root_ch, font_size_root_cap_height, font_size_root_line_height });
 impl_style_key!(InheritedText {
@@ -1152,7 +1128,6 @@ struct GeneratedPseudoStyle {
 /// DOM, while style resolution produces this value. Downstream stages can
 /// retain or replace either representation independently.
 pub struct ComputedStyles {
-    font_palettes: Arc<[FontPaletteDefinition]>,
     hyphenation_fallback_language: Option<ContentLanguage>,
     reader_paragraph_spacing_em: Option<f32>,
     reader_first_line_indent_em: Option<f32>,
@@ -1959,9 +1934,6 @@ impl Font {
         must_be_non_negative("Font", "font_size", self.font_size)?;
         must_be_non_negative("Font", "font_stretch", self.font_stretch)?;
         must_be_finite("Font", "font_oblique_angle", self.font_oblique_angle)?;
-        if let Some(palette) = self.font_palette {
-            validate_style_string_id("Font", "font_palette", palette, store_id)?;
-        }
         must_be_finite("Font", "font_size_x_height_px", self.font_size_x_height_px)?;
         must_be_finite(
             "Font",
@@ -3046,7 +3018,6 @@ impl ComputedStylesBuilder {
         }
         self.store.discard_deduplication_maps();
         Ok(ComputedStyles {
-            font_palettes: Arc::default(),
             hyphenation_fallback_language: None,
             reader_paragraph_spacing_em: self.reader_paragraph_spacing_em,
             reader_first_line_indent_em: self.reader_first_line_indent_em,
@@ -3351,10 +3322,6 @@ fn reintern_with_reader_overrides(
         .font_style(indices)
         .expect("validated font style")
         .clone();
-    font.font_palette = font
-        .font_palette
-        .and_then(|id| source.string(id))
-        .map(|name| builder.intern_string(name));
     font.cjk_font_family = overrides
         .cjk_family_for(font.font_family.and_then(|id| source.string(id)))
         .or_else(|| {
@@ -3446,14 +3413,6 @@ fn reintern_with_reader_overrides(
 }
 
 impl ComputedStyles {
-    /// Active named font palettes for the renderer shaping this document.
-    pub fn font_palettes(&self) -> &[FontPaletteDefinition] { &self.font_palettes }
-
-    pub fn with_font_palettes(mut self, palettes: Arc<[FontPaletteDefinition]>) -> Self {
-        self.font_palettes = palettes;
-        self
-    }
-
     pub fn default_indices(&self) -> StyleIndices {
         self.store.default_indices()
     }
@@ -3896,16 +3855,6 @@ impl ComputedStyles {
         report.add_vec_storage("ComputedStyles.strings.storage", &self.strings);
         for value in &self.strings {
             report.add("ComputedStyles.strings.contents", value.len(), value.len());
-        }
-        report.add(
-            "ComputedStyles.font_palettes.storage",
-            std::mem::size_of_val(self.font_palettes.as_ref()),
-            self.font_palettes.len(),
-        );
-        for palette in self.font_palettes.iter() {
-            report.add("ComputedStyles.font_palettes.names", palette.name.capacity(), palette.name.len());
-            report.add("ComputedStyles.font_palettes.families", palette.family.capacity(), palette.family.len());
-            report.add_vec_storage("ComputedStyles.font_palettes.colors", &palette.colors);
         }
         report
     }
@@ -4472,7 +4421,7 @@ impl<'a> StyleView<'a> {
         self.font
             .font_variant_caps_features
             .iter()
-            .any(|feature| feature.tag == *b"smcp" && feature.value != 0)
+            .any(|feature| feature.tag_bytes() == *b"smcp" && feature.value() != 0)
     }
     pub fn open_type_features(&self) -> Vec<OpenTypeFeature> {
         self.font.open_type_features()
@@ -5503,7 +5452,6 @@ impl Default for Font {
             font_style: FontStyle::Normal,
             font_stretch: 100.0,
             font_oblique_angle: 0.0,
-            font_palette: None,
             font_family: None,
             cjk_font_family: None,
             font_variant_caps_features: Vec::new(),

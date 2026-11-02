@@ -29,8 +29,9 @@ struct CaretException {
 impl CaretPositions {
     /// Build advances and exact compact carets together. The producer pushes
     /// each character's starting position and advance, then returns the final
-    /// boundary. Return `None` to let the caller use its dense fallback when
-    /// the input is unordered, invalid, or does not compress economically.
+    /// boundary. The producer supplies one finite position and non-negative
+    /// advance per character, in logical order. Return `None` to use the dense
+    /// fallback when compact storage would not save memory.
     pub fn build_compact(
         character_count: usize,
         produce: impl FnOnce(&mut CaretPositionsBuilder<'_>) -> Option<f32>,
@@ -58,9 +59,6 @@ impl CaretPositions {
                 dense_bytes,
             };
             let terminal = produce(&mut builder)?;
-            if builder.index != character_count {
-                return None;
-            }
             builder.push_boundary(terminal)?;
             (
                 builder.checkpoints.into_boxed_slice(),
@@ -76,17 +74,12 @@ impl CaretPositions {
     }
 
     /// Retain the dense representation whenever deriving exact positions would
-    /// cost more space. The advances allocation is already owned by layout.
+    /// cost more space. The caller supplies finite positions and advances,
+    /// with exactly one more position than advances. The advances
+    /// allocation is already owned by layout.
     pub fn from_advances(advances: Arc<[f32]>, positions: Arc<[f32]>) -> Self {
         let len = positions.len();
-        if len < CHECKPOINT_STRIDE * 2
-            || len.checked_sub(1) != Some(advances.len())
-            || u32::try_from(len).is_err()
-            || advances
-                .iter()
-                .any(|value| !value.is_finite() || *value < 0.0)
-            || positions.iter().any(|value| !value.is_finite())
-        {
+        if len < CHECKPOINT_STRIDE * 2 || u32::try_from(len).is_err() {
             return Self::Dense(positions);
         }
         let checkpoint_count = len.div_ceil(CHECKPOINT_STRIDE);
@@ -145,15 +138,6 @@ impl CaretPositions {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
-    }
-
-    /// Compact storage only has validating constructors, so its positions do
-    /// not need to be reconstructed for another finite-value check.
-    pub fn is_finite(&self) -> bool {
-        match self {
-            Self::Dense(values) => values.iter().all(|position| position.is_finite()),
-            Self::Derived(_) => true,
-        }
     }
 
     #[inline]
@@ -243,12 +227,9 @@ pub struct CaretPositionsBuilder<'a> {
 
 impl CaretPositionsBuilder<'_> {
     /// Append one character's exact native starting position and advance.
-    /// A failed push requests the producer's existing dense fallback.
+    /// A failed push means compact storage would no longer save memory.
     #[inline]
     pub fn push(&mut self, position: f32, advance: f32) -> Option<()> {
-        if self.index >= self.advances.len() || !advance.is_finite() || advance < 0.0 {
-            return None;
-        }
         let index = self.index;
         self.push_boundary(position)?;
         self.advances[index] = advance;
@@ -258,9 +239,6 @@ impl CaretPositionsBuilder<'_> {
 
     #[inline]
     fn push_boundary(&mut self, position: f32) -> Option<()> {
-        if !position.is_finite() {
-            return None;
-        }
         if self.index % CHECKPOINT_STRIDE == 0 {
             self.checkpoints.push(position);
         } else if (self.position + self.previous_advance).to_bits() != position.to_bits() {

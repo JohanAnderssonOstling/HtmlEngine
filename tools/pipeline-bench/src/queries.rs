@@ -5,8 +5,9 @@
 use html::text::GlyphResourceStore;
 
 use crate::{Shaper, access::measure, layout_fingerprint};
-use html::layout::{ContentRole, LayoutConstraints};
-use html::pipeline::DocumentFactory;
+use html_pipeline::engine::LayoutConstraints;
+use html::layout::ContentRole;
+use html_pipeline::DocumentFactory;
 use html::text::TextSearchOptions;
 use serde_json::json;
 use std::hint::black_box;

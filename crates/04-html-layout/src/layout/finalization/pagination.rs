@@ -34,7 +34,6 @@ pub(super) fn build_pagination_groups(
     output.pagination_groups.clear();
     output.pagination_origins.clear();
     output.pagination_order.clear();
-    output.pagination_ranks.clear();
     output.box_line_ranges.clear();
     output.box_line_ranges.resize(reader.box_count(), 0..0);
     for (index, line) in output.lines.iter().enumerate() {
@@ -89,8 +88,14 @@ pub(super) fn build_pagination_groups(
         output
             .pagination_anchors
             .push(LinePaginationAnchor { marker, source });
-        let a = root(&mut parents, output.spatial_ranks[marker.index()] as usize);
-        let b = root(&mut parents, output.spatial_ranks[source.index()] as usize);
+        let a = root(
+            &mut parents,
+            output.spatial_order.ranks()[marker.index()] as usize,
+        );
+        let b = root(
+            &mut parents,
+            output.spatial_order.ranks()[source.index()] as usize,
+        );
         parents[a.max(b)] = a.min(b);
     }
     output
@@ -100,25 +105,21 @@ pub(super) fn build_pagination_groups(
         root(&mut parents, index);
     }
 
-    output.pagination_order.clear();
-    output
-        .pagination_order
-        .extend_from_slice(&output.spatial_order);
-    output.pagination_order.sort_unstable_by_key(|id| {
-        let rank = output.spatial_ranks[id.index()] as usize;
-        (parents[rank], rank)
+    output.pagination_order.rebuild_unstable(output.lines.len(), |a, b| {
+        let key = |id: &LineId| {
+            let rank = output.spatial_order.ranks()[id.index()] as usize;
+            (parents[rank], rank)
+        };
+        key(a).cmp(&key(b))
     });
-    output.pagination_ranks.resize(output.lines.len(), 0);
-    for (cursor, id) in output.pagination_order.iter().enumerate() {
-        output.pagination_ranks[id.index()] = cursor as u32;
-    }
     let mut start = 0;
     while start < output.pagination_order.len() {
         let id = output.pagination_order[start];
-        let group = parents[output.spatial_ranks[id.index()] as usize];
+        let group = parents[output.spatial_order.ranks()[id.index()] as usize];
         let mut end = start + 1;
         while end < output.pagination_order.len()
-            && parents[output.spatial_ranks[output.pagination_order[end].index()] as usize] == group
+            && parents[output.spatial_order.ranks()[output.pagination_order[end].index()] as usize]
+                == group
         {
             end += 1;
         }
@@ -141,7 +142,7 @@ pub(super) fn build_pagination_groups(
         start = end;
     }
     for image in &state.fragment_output.image_fragments {
-        let Some(&cursor) = output.pagination_ranks.get(image.line_idx) else {
+        let Some(&cursor) = output.pagination_order.ranks().get(image.line_idx) else {
             continue;
         };
         let index = output

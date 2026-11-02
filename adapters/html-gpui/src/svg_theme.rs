@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use html::layout::ThemeAdaptation;
+use html::style::ThemeAdaptation;
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::{Reader, Writer};
 use roxmltree::{Document, Node};

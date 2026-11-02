@@ -4,10 +4,12 @@ use crate::layout_model::{
     ImageFragment, InlineItem, LayoutMode, ListItemMarker,
 };
 use html_dom::{Document, ImageResource, ImageSource, NodeRef};
-use html_style_model::{ListStylePosition, TextDecorationLines, UsedBorderRadii, Visibility};
+use html_style_model::{ListStylePosition, TextDecorationLines, CornerRadii, Visibility};
 use kurbo::{Point, Size};
 use rustc_data_structures::fx::FxHashMap;
 use std::ops::Range;
+use std::sync::Arc;
+use html_engine_model::GlyphResourceLease;
 
 mod addressing;
 mod boxes;
@@ -51,15 +53,42 @@ pub use text::{
     RenderTextRuns, RenderTextView, merge_text_ranges,
 };
 
+/// Retains appended scope resources and detects replacement of paint products.
+#[derive(Clone)]
+pub struct RenderResourceLease {
+    native: GlyphResourceLease,
+    _scope: Option<Arc<()>>,
+}
+
+impl RenderResourceLease {
+    pub fn is_valid(&self) -> bool {
+        self.native.is_valid()
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct RenderView<'a> {
     pub(super) doc: DocumentRead<'a>,
     pub(super) glyph_metrics: &'a crate::layout_model::GlyphMetrics,
+    pub(super) resources: Option<&'a crate::GlyphResourceStore>,
+    pub(super) scope_lifetime: Option<&'a Arc<()>>,
 }
 
 /// Text and line-layout queries. This capability deliberately excludes box
 /// topology, resolved decorations, and document source details.
 impl<'a> RenderView<'a> {
+    pub fn paint_resources_valid(self) -> bool {
+        self.resources
+            .is_none_or(|resources| resources.paint_resources_valid())
+    }
+
+    pub fn retain_paint_resources(self) -> Option<RenderResourceLease> {
+        Some(RenderResourceLease {
+            native: self.resources?.paint_lease(),
+            _scope: self.scope_lifetime.cloned(),
+        })
+    }
+
     /// Ordered lines with their identities and content bounds already resolved.
     pub fn pagination_lines(self) -> PaginationLines<'a> {
         PaginationLines { view: self }

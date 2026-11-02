@@ -220,11 +220,15 @@ pub(crate) mod test_support {
             &mut self,
             request: GlyphRequest<'_>,
         ) -> Result<ShapedGlyph, crate::ShapeError> {
-            let key = (request.character, request.font_size.to_bits());
-            let ascent = request.font_size * self.ascent_ratio.unwrap_or(0.75);
-            let descent = (request.font_size - ascent).max(0.0);
-            let metric =
-                GlyphMetric::try_new(request.character, request.font_size * 0.5, ascent, descent)?;
+            let key = (request.character, request.style.font_size.to_bits());
+            let ascent = request.style.font_size * self.ascent_ratio.unwrap_or(0.75);
+            let descent = (request.style.font_size - ascent).max(0.0);
+            let metric = GlyphMetric::new(
+                request.character,
+                request.style.font_size * 0.5,
+                ascent,
+                descent,
+            );
             if let Some(&glyph) = self.glyphs.get(&key) {
                 return Ok(ShapedGlyph::from_metric(glyph, metric));
             }
@@ -235,7 +239,7 @@ pub(crate) mod test_support {
 
         fn font_relative_metrics(
             &mut self,
-            _request: crate::FontMetricsRequest<'_>,
+            _request: &crate::ShapingStyle<'_>,
         ) -> Result<crate::FontRelativeMetrics, crate::ShapeError> {
             self.font_metric_calls += 1;
             let metrics = match self.ascent_ratio {

@@ -49,9 +49,6 @@ pub(crate) fn declaration_renderer_eligibility(property: &Property<'_>) -> Optio
         return Some(false);
     }
     match property {
-        Property::Unparsed(raw) if raw.property_id == PropertyId::FontPalette => {
-            Some(super::renderer_owned::font_palette_keyword(&raw.value).is_some())
-        }
         Property::Unparsed(raw) if super::native_fallback::applies_to(&raw.property_id) => {
             Some(super::native_fallback::parse(property).is_some())
         }

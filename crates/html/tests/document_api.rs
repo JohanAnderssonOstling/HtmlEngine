@@ -1,10 +1,11 @@
 use html::document::ImageSource;
 use html::document::MarkupSyntax;
 use html::engine::{DocumentOptions, Engine};
-use html::geometry::LinePlacement;
+use html::render::LinePlacement;
 use html::geometry::{WordHit, WordHitPolicy};
-use html::pipeline::PipelineChanges;
-use html::render::{DocumentPainter, FragmentRenderOptions, RecordingPainter, RenderScene};
+use html::configuration::{DocumentUpdate, Update};
+use html_render_core::{RecordingPainter};
+use html::render::{DocumentPainter, FragmentRenderOptions, RenderScene};
 use html::resources::{
     ImageLoadCompletion, ImageLoader, ImageService, InlineJobSpawner, ResourceMetadata,
     ResourceProvider,
@@ -42,12 +43,12 @@ impl GlyphShaper for Shaper {
     fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
         Ok(ShapedGlyph::from_metric(
             request.character as u32,
-            GlyphMetric::try_new(
+            GlyphMetric::new(
                 request.character,
-                request.font_size / 2.0,
-                request.font_size,
+                request.style.font_size / 2.0,
+                request.style.font_size,
                 0.0,
-            )?,
+            ),
         ))
     }
 }
@@ -101,7 +102,7 @@ fn load(source: &str) -> Engine {
     Engine::load(
         provider(source),
         "document.html",
-        DocumentOptions::new(600.0),
+        DocumentOptions::new(600.0).unwrap(),
         &mut Shaper::default(),
     )
     .unwrap()
@@ -513,24 +514,20 @@ fn document_revisions_track_successful_changes_without_viewport_state() {
     let mut engine = Engine::load(
         provider("<p>text</p>"),
         "document.html",
-        DocumentOptions::new(600.0),
+        DocumentOptions::new(600.0).unwrap(),
         &mut shaper,
     )
     .unwrap();
     let before = engine.revisions();
     let update = engine
-        .apply_changes(PipelineChanges::default(), &mut shaper)
+        .apply(DocumentUpdate::default(), &mut shaper)
         .unwrap();
-    assert_eq!(update.stage, html::pipeline::EarliestStage::Paint);
+    assert_eq!(update, Update::Unchanged);
     assert_eq!(engine.revisions().layout, before.layout);
     assert_eq!(engine.revisions().shape, before.shape);
-    let paint = engine.inputs().unwrap().paint.next();
     engine
-        .apply_changes(
-            PipelineChanges {
-                paint: Some(paint),
-                ..Default::default()
-            },
+        .apply(
+            DocumentUpdate::default().reader_overrides(html::style::ReaderStyleOverrides { foreground: Some(0x112233ff), ..Default::default() }),
             &mut shaper,
         )
         .unwrap();
@@ -538,11 +535,8 @@ fn document_revisions_track_successful_changes_without_viewport_state() {
     assert!(engine.revisions().paint > before.paint);
     let painted = engine.revisions();
     engine
-        .apply_changes(
-            PipelineChanges {
-                source: Some("<p>replacement</p>".into()),
-                ..Default::default()
-            },
+        .apply(
+            DocumentUpdate::default().source("<p>replacement</p>".into()),
             &mut shaper,
         )
         .unwrap();
@@ -551,19 +545,7 @@ fn document_revisions_track_successful_changes_without_viewport_state() {
             && engine.revisions().layout > painted.layout
     );
     let revised = engine.revisions();
-    let mut invalid = engine.inputs().unwrap().layout;
-    invalid.viewport_width = f64::NAN;
-    assert!(
-        engine
-            .apply_changes(
-                PipelineChanges {
-                    layout: Some(invalid),
-                    ..Default::default()
-                },
-                &mut shaper
-            )
-            .is_err()
-    );
+    assert!(engine.apply(DocumentUpdate::default().width(f64::NAN), &mut shaper).is_err());
     assert_eq!(engine.revisions(), revised);
     engine.release_resources();
     assert_eq!(engine.revisions().layout, revised.layout);
@@ -585,11 +567,11 @@ fn loading_reports_only_measured_phases_and_preserves_resource_payloads() {
     let (engine, timings) = Engine::load_timed(
         provider,
         "document.html",
-        DocumentOptions::new(600.0),
+        DocumentOptions::new(600.0).unwrap(),
         &mut Shaper::default(),
     )
     .unwrap();
-    assert!(engine.document().is_some());
+    assert!(engine.render_view().is_some());
     assert_eq!(timings.total(), timings.resource + timings.pipeline);
     let source = engine.image_source_request(0).unwrap().read().unwrap();
     assert_eq!(source.uri, "pic.svg");
@@ -616,22 +598,8 @@ fn image_queries_painting_and_scene_extent_agree_on_object_fit_and_placement() {
         ("cover", Size::new(500.0, 100.0)),
     ] {
         let mut engine = load(&format!(
-            "<body style='margin:0'><img src='wide.png' style='width:100px;height:100px;object-fit:{fit};position:relative;top:80px;vertical-align:top'></body>",
+            "<body style='margin:0'><img src='wide.png' width='100' height='20' style='width:100px;height:100px;object-fit:{fit};position:relative;top:80px;vertical-align:top'></body>",
         ));
-        let inputs = engine.inputs().unwrap();
-        let mut metrics = inputs.image_metrics.clone();
-        metrics.set(0, 100, 20);
-        let revision = inputs.image_metrics_revision.next();
-        engine
-            .apply_changes(
-                PipelineChanges {
-                    image_metrics: Some(metrics),
-                    image_metrics_revision: Some(revision),
-                    ..Default::default()
-                },
-                &mut Shaper::default(),
-            )
-            .unwrap();
         let view = engine.render_view().unwrap();
         let image = view.fragments().images().iter().next().unwrap();
         let line = view.text().line(image.line_idx()).unwrap();
@@ -922,7 +890,7 @@ fn resource_loading_preserves_transport_metadata_css_and_worker_preparation() {
     let mut prepared = Engine::prepare(
         provider.clone(),
         "books/chapter.html",
-        DocumentOptions::new(320.0),
+        DocumentOptions::new(320.0).unwrap(),
     )
     .unwrap();
     assert_eq!(
@@ -931,20 +899,15 @@ fn resource_loading_preserves_transport_metadata_css_and_worker_preparation() {
             .text(),
         "Café"
     );
-    assert!(prepared.document().is_none());
+    assert!(prepared.render_view().is_none());
     assert!(prepared.selection(0..1).is_none());
-    assert_eq!(
-        prepared.inputs().unwrap().markup_syntax,
-        MarkupSyntax::Xhtml
-    );
-    assert!(prepared.inputs().unwrap().source.contains("Café"));
     assert_eq!(prepared.font_faces()[0].family, "Custom");
-    prepared.rehydrate_glyphs(&mut Shaper::default()).unwrap();
+    prepared.apply(DocumentUpdate::default(), &mut Shaper::default()).unwrap();
 
     let loaded = Engine::load(
         provider,
         "books/chapter.html",
-        DocumentOptions::new(320.0),
+        DocumentOptions::new(320.0).unwrap(),
         &mut Shaper::default(),
     )
     .unwrap();
@@ -967,31 +930,27 @@ fn resource_loading_preserves_transport_metadata_css_and_worker_preparation() {
                 .paint_color_at(range.start),
             Some(0xff0000ff)
         );
-        assert_eq!(engine.inputs().unwrap().layout.viewport_height, None);
+        assert_eq!(engine.configuration().height(), None);
     }
 }
 
 #[test]
 fn resource_loading_returns_errors_for_invalid_options_and_missing_sources() {
-    for width in [0.0, -1.0, f64::NAN, f64::INFINITY] {
-        assert!(
-            Engine::prepare(
-                provider("<p>text</p>"),
-                "document.html",
-                DocumentOptions::new(width)
-            )
-            .is_err()
-        );
+    for width in [-1.0, f64::NAN, f64::INFINITY] {
+        assert!(DocumentOptions::new(width).is_err());
     }
     for size in [0.0, -1.0, f32::NAN, f32::INFINITY] {
-        let mut options = DocumentOptions::new(320.0);
-        options.root_font_size = size;
-        assert!(Engine::prepare(provider("<p>text</p>"), "document.html", options).is_err());
+        assert!(
+            DocumentOptions::new(320.0)
+                .unwrap()
+                .with_root_font_size(size)
+                .is_err()
+        );
     }
     let error = Engine::load(
         provider("<p>text</p>"),
         "missing.html",
-        DocumentOptions::new(320.0),
+        DocumentOptions::new(320.0).unwrap(),
         &mut Shaper::default(),
     )
     .err()
@@ -1172,14 +1131,9 @@ fn source_anchors_survive_reflow_and_recover_from_changed_text_offsets() {
         .capture(original.clone(), 3)
         .unwrap();
     assert_eq!(engine.targets().unwrap().resolve(&anchor), Some(original));
-    let mut layout = engine.inputs().unwrap().layout;
-    layout.viewport_width = 90.0;
     engine
-        .apply_changes(
-            PipelineChanges {
-                layout: Some(layout),
-                ..Default::default()
-            },
+        .apply(
+            DocumentUpdate::default().width(90.0),
             &mut Shaper::default(),
         )
         .unwrap();
@@ -1187,14 +1141,9 @@ fn source_anchors_survive_reflow_and_recover_from_changed_text_offsets() {
         engine.targets().unwrap().resolve(&anchor),
         Some(find(&engine, "target"))
     );
-    let revision = engine.inputs().unwrap().source_revision.next();
     engine
-        .apply_changes(
-            PipelineChanges {
-                source: Some("<p>Inserted before prefix target suffix</p>".into()),
-                source_revision: Some(revision),
-                ..Default::default()
-            },
+        .apply(
+            DocumentUpdate::default().source("<p>Inserted before prefix target suffix</p>".into()),
             &mut Shaper::default(),
         )
         .unwrap();
@@ -1329,7 +1278,7 @@ impl ImageLoader for SvgLoader {
 #[test]
 fn document_resources_update_intrinsic_layout_and_drop_replaced_image_identity() {
     use std::collections::HashSet;
-    let mut engine = load("<p><img src='picture.svg'/></p>");
+    let mut engine = load("<p><img src='picture.svg' width='7' height='9' style='width:auto;height:auto'/></p>");
     engine.set_image_service(ImageService::with_loader(
         Arc::new(SvgLoader),
         Arc::new(InlineJobSpawner),
@@ -1363,21 +1312,16 @@ fn document_resources_update_intrinsic_layout_and_drop_replaced_image_identity()
     );
     assert!(omitted.svgs.is_empty());
     assert_eq!(
-        engine.inputs().unwrap().image_metrics.get(0),
+        engine.render_view().unwrap().fragments().images().iter().next()
+            .map(|image| (image.size().width as u32, image.size().height as u32)),
         Some((42, 31))
     );
     let update = engine.update_resources(&mut Shaper::default()).unwrap();
     assert!(!update.decoded);
-    assert!(update.pipeline.is_none());
-
-    let revision = engine.inputs().unwrap().source_revision.next();
+    assert!(update.update.is_none());
     engine
-        .apply_changes(
-            PipelineChanges {
-                source: Some("<p><img src='replacement.svg'/></p>".into()),
-                source_revision: Some(revision),
-                ..Default::default()
-            },
+        .apply(
+            DocumentUpdate::default().source("<p><img src='replacement.svg'/></p>".into()),
             &mut Shaper::default(),
         )
         .unwrap();
@@ -1385,13 +1329,14 @@ fn document_resources_update_intrinsic_layout_and_drop_replaced_image_identity()
     engine.request_images(&HashSet::from([0]));
     // A host may defer an update, or fail to apply it. The proposed intrinsic
     // sizes remain pending until the document accepts them.
-    assert!(engine.poll_resources().changes.is_some());
+    assert!(engine.poll_resources().layout_needed);
     engine.release_resources();
     assert!(engine.resources_pending());
     engine.update_resources(&mut Shaper::default()).unwrap();
     assert!(!engine.resources_pending());
     assert_eq!(
-        engine.inputs().unwrap().image_metrics.get(0),
+        engine.render_view().unwrap().fragments().images().iter().next()
+            .map(|image| (image.size().width as u32, image.size().height as u32)),
         Some((90, 31))
     );
     engine.request_images(&HashSet::from([0]));
@@ -1403,7 +1348,8 @@ fn document_resources_update_intrinsic_layout_and_drop_replaced_image_identity()
     engine.release_resources();
     assert!(engine.images().get_decoded(0).is_none());
     assert_eq!(
-        engine.inputs().unwrap().image_metrics.get(0),
+        engine.render_view().unwrap().fragments().images().iter().next()
+            .map(|image| (image.size().width as u32, image.size().height as u32)),
         Some((90, 31))
     );
 }
@@ -1565,7 +1511,6 @@ mod document_operations {
     use super::*;
     use html::annotations::{AnnotationAnchor, AnnotationIndex, DocumentAnnotation};
     use html::export::{ExportFormat, ExportPayload, ExportTarget, ImagePayload};
-    use html::layout::LayoutConstraints;
     use html::search::DocumentSearch;
     use html::selection::SelectionMode;
 
@@ -1576,12 +1521,12 @@ mod document_operations {
         let mut engine = Engine::load(
             provider(source),
             "document.html",
-            DocumentOptions::new(600.0),
+            DocumentOptions::new(600.0).unwrap(),
             &mut shaper,
         )
         .unwrap();
-        let constraints = LayoutConstraints::new(160.0, 16.0).unwrap();
-        let mut scope = engine.scope("part", constraints, &mut shaper).unwrap();
+        let width = 160.0;
+        let mut scope = engine.scope("part", width, &mut shaper).unwrap().unwrap();
         let view = scope.render_view(&engine).unwrap();
         let count = view.text().glyph_count() as u32;
         let exported = scope
@@ -1614,25 +1559,20 @@ mod document_operations {
                 .text_ranges
                 .is_empty()
         );
-        let second = engine.scope("note", constraints, &mut shaper).unwrap();
+        let second = engine.scope("note", width, &mut shaper).unwrap().unwrap();
         assert!(second.render_view(&engine).is_some());
         assert!(
             scope.render_view(&engine).is_some(),
             "appending a second scope preserves the first"
         );
-        assert!(engine.scope("missing", constraints, &mut shaper).is_none());
+        assert!(engine.scope("missing", width, &mut shaper).unwrap().is_none());
         assert!(
             scope.render_view(&load(source)).is_none(),
             "an unrelated owner cannot supply DOM or resources"
         );
-        let revision = engine.inputs().unwrap().source_revision.next();
         engine
-            .apply_changes(
-                PipelineChanges {
-                    source: Some("<p id='part'>replacement</p>".into()),
-                    source_revision: Some(revision),
-                    ..Default::default()
-                },
+            .apply(
+                DocumentUpdate::default().source("<p id='part'>replacement</p>".into()),
                 &mut shaper,
             )
             .unwrap();
@@ -1820,16 +1760,10 @@ mod document_operations {
         );
         assert_eq!(index.overlapping(range.end..range.end + 1).count(), 0);
         assert_eq!(index.overlapping(range.start..range.start).count(), 0);
-        let revision = engine.inputs().unwrap().source_revision.next();
         engine
-            .apply_changes(
-                PipelineChanges {
-                    source: Some(
-                        "<p>Inserted before prefix target suffix; other target later.</p>".into(),
-                    ),
-                    source_revision: Some(revision),
-                    ..Default::default()
-                },
+            .apply(
+                DocumentUpdate::default().source(
+                        "<p>Inserted before prefix target suffix; other target later.</p>".into()),
                 &mut Shaper::default(),
             )
             .unwrap();
@@ -1862,14 +1796,9 @@ mod document_operations {
         assert_eq!(search.results().ranges().len(), 2);
         assert!(search.results_mut().next_match());
         assert_eq!(search.results().current_index(), 1);
-        let revision = engine.inputs().unwrap().source_revision.next();
         engine
-            .apply_changes(
-                PipelineChanges {
-                    source: Some("<p>cafe</p>".into()),
-                    source_revision: Some(revision),
-                    ..Default::default()
-                },
+            .apply(
+                DocumentUpdate::default().source("<p>cafe</p>".into()),
                 &mut Shaper::default(),
             )
             .unwrap();
@@ -2042,83 +1971,29 @@ mod document_refinement {
     use super::*;
     use html::configuration::DocumentUpdate;
     use html::geometry::RangeRect;
-    use html::pipeline::{MediaEnvironment, MediaType};
     use html::reading::Reading;
 
     #[test]
-    fn configuration_keeps_layout_and_media_in_sync_and_preserves_print() {
+    fn configuration_applies_batched_dimensions_and_typography() {
         let mut engine = load("<p>configuration</p>");
-        let mut environment = engine.inputs().unwrap().style_environment;
-        environment.media = MediaEnvironment::new(MediaType::Print, 600.0, None).unwrap();
-        engine
-            .apply_changes(
-                PipelineChanges {
-                    style_environment: Some(environment),
-                    ..Default::default()
-                },
-                &mut Shaper::default(),
-            )
-            .unwrap();
-        let changes = engine
-            .configuration_changes(
-                DocumentUpdate::default()
-                    .width(320.0)
-                    .height(Some(480.0))
-                    .font_size(21.6),
-            )
-            .unwrap();
-        // Building changes leaves the document intact until the host accepts them.
-        assert_eq!(engine.inputs().unwrap().layout.viewport_width, 600.0);
-        let layout = changes.layout.unwrap();
-        let style = changes.style_environment.unwrap();
-        assert_eq!(layout.viewport_width, style.media.viewport_width());
-        assert_eq!(layout.viewport_height, style.media.viewport_height());
-        assert_eq!(style.media.media_type(), MediaType::Print);
-        assert_eq!(style.root_font_size, 22);
-        assert_eq!(layout.line_height, 22.0);
-        engine
-            .apply_changes(changes, &mut Shaper::default())
-            .unwrap();
-        let keep = engine
-            .configuration_changes(DocumentUpdate::default().width(400.0))
-            .unwrap();
-        assert_eq!(keep.layout.unwrap().viewport_height, Some(480.0));
-        let clear = engine
-            .configuration_changes(DocumentUpdate::default().height(None))
-            .unwrap();
-        assert_eq!(clear.layout.unwrap().viewport_height, None);
-        assert_eq!(
-            clear.style_environment.unwrap().media.viewport_height(),
-            None
-        );
-        let zero = engine
-            .configuration_changes(DocumentUpdate::default().height(Some(0.0)))
-            .unwrap();
-        assert_eq!(zero.layout.unwrap().viewport_height, Some(0.0));
-        assert_eq!(
-            zero.style_environment.unwrap().media.viewport_height(),
-            None
-        );
-        for value in [0.0, -1.0, f64::NAN, f64::INFINITY] {
-            assert!(
-                engine
-                    .configuration_changes(DocumentUpdate::default().width(value))
-                    .is_err()
-            );
-        }
+        let changes = DocumentUpdate::default().width(320.0).height(Some(480.0)).font_size(21.6);
+        assert_eq!(engine.configuration().width(), 600.0);
+        engine.apply(changes, &mut Shaper::default()).unwrap();
+        assert_eq!(engine.configuration().width(), 320.0);
+        assert_eq!(engine.configuration().height(), Some(480.0));
+        assert_eq!(engine.configuration().font_size().get(), 22.0);
+        engine.apply(DocumentUpdate::default().width(400.0), &mut Shaper::default()).unwrap();
+        assert_eq!(engine.configuration().height(), Some(480.0));
+        engine.apply(DocumentUpdate::default().height(None), &mut Shaper::default()).unwrap();
+        assert_eq!(engine.configuration().height(), None);
+        engine.apply(DocumentUpdate::default().height(Some(0.0)), &mut Shaper::default()).unwrap();
+        assert_eq!(engine.configuration().height(), Some(0.0));
         for value in [-1.0, f64::NAN, f64::INFINITY] {
-            assert!(
-                engine
-                    .configuration_changes(DocumentUpdate::default().height(Some(value)))
-                    .is_err()
-            );
+            assert!(engine.apply(DocumentUpdate::default().width(value), &mut Shaper::default()).is_err());
+            assert!(engine.apply(DocumentUpdate::default().height(Some(value)), &mut Shaper::default()).is_err());
         }
         for value in [0.0, -1.0, f32::NAN, f32::INFINITY] {
-            assert!(
-                engine
-                    .configuration_changes(DocumentUpdate::default().font_size(value))
-                    .is_err()
-            );
+            assert!(engine.apply(DocumentUpdate::default().font_size(value), &mut Shaper::default()).is_err());
         }
     }
 
@@ -2273,10 +2148,9 @@ mod document_refinement {
 mod font_preparation {
     use super::*;
     use html::fonts::{
-        FontData, FontLoadFuture, FontSourceLoader, MAX_FONT_BYTES, decode, prepare_face,
-        resolve_face,
+        FontData, FontLoadFuture, FontSourceLoader, MAX_FONT_BYTES, decode, prepare_face, resolve_face,
     };
-    use html::style::FontFaceSource;
+    use html::text::FontFaceSource;
     use std::future::Future;
     use std::sync::Mutex;
     use std::task::{Context, Poll, Wake, Waker};

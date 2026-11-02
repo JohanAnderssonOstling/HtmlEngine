@@ -11,7 +11,7 @@ use gpui::{
     AnyWindowHandle, App, AppContext, Bounds, Context, Entity, IntoElement, Render, Window, WindowBounds,
     WindowKind, WindowOptions, div, prelude::*, px, rgb, size,
 };
-use html::pipeline::MarkupSyntax;
+use html::document::MarkupSyntax;
 use serde_json::json;
 use skrift_content::DocumentView;
 use std::cell::Cell;

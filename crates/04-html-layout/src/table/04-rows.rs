@@ -170,17 +170,19 @@ fn measure_dependent_cells(
                 })
                 .collect::<Vec<ParallelBoxMeasurement>>()
         });
-        for (task, measurement) in tasks.iter().zip(measurements) {
-            cells[task.index].height = measurement.layout.size.height;
-            cells[task.index].baseline = measurement.layout.first_baseline;
-            session.retain_measurement_plans(measurement);
+        if let Some(measurements) = measurements {
+            for (task, measurement) in tasks.iter().zip(measurements) {
+                cells[task.index].height = measurement.layout.size.height;
+                cells[task.index].baseline = measurement.layout.first_baseline;
+                session.retain_measurement_plans(measurement);
+            }
+            return;
         }
-    } else {
-        for task in tasks {
-            let (size, baseline) = measure_cell_isolated(session, task.point, task.request);
-            cells[task.index].height = size.height;
-            cells[task.index].baseline = baseline;
-        }
+    }
+    for task in tasks {
+        let (size, baseline) = measure_cell_isolated(session, task.point, task.request);
+        cells[task.index].height = size.height;
+        cells[task.index].baseline = baseline;
     }
 }
 

@@ -3,7 +3,7 @@
 use super::value::{significant_tokens, token_ident};
 use crate::style::syntax::property_id::RendererPropertyId;
 use cssparser::match_ignore_ascii_case;
-use html_style_model::OpenTypeFeature;
+use html_style_model::{OpenTypeFeature, OpenTypeFeatureKind};
 use lightningcss::properties::custom::{Token, TokenList, TokenOrValue};
 use lightningcss::properties::font::FontVariantCaps;
 use lightningcss::traits::Parse;
@@ -78,7 +78,9 @@ pub(crate) fn parse_tokens(
     if tokens.clone().next().is_none() {
         if first.eq_ignore_ascii_case("normal") {
             return match id {
-                RendererPropertyId::FontKerning => Some(vec![OpenTypeFeature::new(*b"kern", 1)]),
+                RendererPropertyId::FontKerning => {
+                    Some(vec![OpenTypeFeature::new(OpenTypeFeatureKind::Kerning, 1)])
+                }
                 RendererPropertyId::FontVariantNumeric
                 | RendererPropertyId::FontVariantLigatures => Some(Vec::new()),
                 _ => None,
@@ -86,12 +88,20 @@ pub(crate) fn parse_tokens(
         }
         if first.eq_ignore_ascii_case("none") {
             return match id {
-                RendererPropertyId::FontKerning => Some(vec![OpenTypeFeature::new(*b"kern", 0)]),
+                RendererPropertyId::FontKerning => {
+                    Some(vec![OpenTypeFeature::new(OpenTypeFeatureKind::Kerning, 0)])
+                }
                 RendererPropertyId::FontVariantLigatures => Some(
-                    [*b"liga", *b"clig", *b"dlig", *b"hlig", *b"calt"]
-                        .into_iter()
-                        .map(|tag| OpenTypeFeature::new(tag, 0))
-                        .collect(),
+                    [
+                        OpenTypeFeatureKind::StandardLigatures,
+                        OpenTypeFeatureKind::ContextualLigatures,
+                        OpenTypeFeatureKind::DiscretionaryLigatures,
+                        OpenTypeFeatureKind::HistoricalLigatures,
+                        OpenTypeFeatureKind::ContextualAlternates,
+                    ]
+                    .into_iter()
+                    .map(|tag| OpenTypeFeature::new(tag, 0))
+                    .collect(),
                 ),
                 _ => None,
             };
@@ -105,27 +115,27 @@ pub(crate) fn parse_tokens(
     let mut features = Vec::new();
     for keyword in once(Some(first)).chain(tokens.map(token_ident)) {
         let keyword = keyword?;
-        let (category, tags, value): (u8, &[[u8; 4]], u32) = match id {
+        let (category, tags, value): (u8, &[OpenTypeFeatureKind], u32) = match id {
             RendererPropertyId::FontVariantNumeric => match_ignore_ascii_case! { keyword,
-                "lining-nums" => (1, &[*b"lnum"], 1),
-                "oldstyle-nums" => (1, &[*b"onum"], 1),
-                "proportional-nums" => (2, &[*b"pnum"], 1),
-                "tabular-nums" => (2, &[*b"tnum"], 1),
-                "diagonal-fractions" => (4, &[*b"frac"], 1),
-                "stacked-fractions" => (4, &[*b"afrc"], 1),
-                "ordinal" => (8, &[*b"ordn"], 1),
-                "slashed-zero" => (16, &[*b"zero"], 1),
+                "lining-nums" => (1, &[OpenTypeFeatureKind::LiningFigures], 1),
+                "oldstyle-nums" => (1, &[OpenTypeFeatureKind::OldstyleFigures], 1),
+                "proportional-nums" => (2, &[OpenTypeFeatureKind::ProportionalFigures], 1),
+                "tabular-nums" => (2, &[OpenTypeFeatureKind::TabularFigures], 1),
+                "diagonal-fractions" => (4, &[OpenTypeFeatureKind::DiagonalFractions], 1),
+                "stacked-fractions" => (4, &[OpenTypeFeatureKind::StackedFractions], 1),
+                "ordinal" => (8, &[OpenTypeFeatureKind::Ordinals], 1),
+                "slashed-zero" => (16, &[OpenTypeFeatureKind::SlashedZero], 1),
                 _ => return None,
             },
             RendererPropertyId::FontVariantLigatures => match_ignore_ascii_case! { keyword,
-                "common-ligatures" => (1, &[*b"liga", *b"clig"], 1),
-                "no-common-ligatures" => (1, &[*b"liga", *b"clig"], 0),
-                "discretionary-ligatures" => (2, &[*b"dlig"], 1),
-                "no-discretionary-ligatures" => (2, &[*b"dlig"], 0),
-                "historical-ligatures" => (4, &[*b"hlig"], 1),
-                "no-historical-ligatures" => (4, &[*b"hlig"], 0),
-                "contextual" => (8, &[*b"calt"], 1),
-                "no-contextual" => (8, &[*b"calt"], 0),
+                "common-ligatures" => (1, &[OpenTypeFeatureKind::StandardLigatures, OpenTypeFeatureKind::ContextualLigatures], 1),
+                "no-common-ligatures" => (1, &[OpenTypeFeatureKind::StandardLigatures, OpenTypeFeatureKind::ContextualLigatures], 0),
+                "discretionary-ligatures" => (2, &[OpenTypeFeatureKind::DiscretionaryLigatures], 1),
+                "no-discretionary-ligatures" => (2, &[OpenTypeFeatureKind::DiscretionaryLigatures], 0),
+                "historical-ligatures" => (4, &[OpenTypeFeatureKind::HistoricalLigatures], 1),
+                "no-historical-ligatures" => (4, &[OpenTypeFeatureKind::HistoricalLigatures], 0),
+                "contextual" => (8, &[OpenTypeFeatureKind::ContextualAlternates], 1),
+                "no-contextual" => (8, &[OpenTypeFeatureKind::ContextualAlternates], 0),
                 _ => return None,
             },
             _ => return None,
@@ -151,10 +161,7 @@ pub(crate) fn parse_settings(tokens: &TokenList<'_>) -> Option<Vec<OpenTypeFeatu
             let [TokenOrValue::Token(Token::String(tag)), rest @ ..] = setting else {
                 return None;
             };
-            let bytes: [u8; 4] = tag.as_bytes().try_into().ok()?;
-            if !bytes.iter().all(|byte| (0x20..=0x7e).contains(byte)) {
-                return None;
-            }
+            let tag = tag.as_bytes().try_into().ok()?;
             let value = match rest {
                 [] => 1,
                 [
@@ -175,7 +182,7 @@ pub(crate) fn parse_settings(tokens: &TokenList<'_>) -> Option<Vec<OpenTypeFeatu
                 }
                 _ => return None,
             };
-            Some(OpenTypeFeature::new(bytes, value))
+            OpenTypeFeature::from_tag_bytes(tag, value)
         })
         .collect()
 }

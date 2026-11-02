@@ -19,13 +19,12 @@ impl GlyphShaper for Shaper {
     fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
         Ok(ShapedGlyph::from_metric(
             request.character as u32,
-            GlyphMetric::try_new(
+            GlyphMetric::new(
                 request.character,
-                request.font_size / 2.0,
-                request.font_size,
+                request.style.font_size / 2.0,
+                request.style.font_size,
                 0.0,
-            )
-            .unwrap(),
+            ),
         ))
     }
 }

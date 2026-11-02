@@ -48,46 +48,7 @@ impl<'out> FragmentWriter<'out> {
         self.block_decoration_owners.clear();
         self.last_inline_fragments.clear();
 
-        let state = &mut self.state;
-        state.paint_program.clear();
-        state.line_output.lines.clear();
-        state.line_output.spatial_order.clear();
-        state.line_output.spatial_ranks.clear();
-        state.line_output.pagination_order.clear();
-        state.line_output.pagination_ranks.clear();
-        state.line_output.pagination_groups.clear();
-        state.line_output.pagination_anchors.clear();
-        state.line_output.pagination_origins.clear();
-        state.line_output.box_line_ranges.clear();
-        state.line_output.line_details.clear();
-        state.line_output.text_fragments.clear();
-        state.line_output.paint_order_indices.clear();
-        state.line_output.paint_order_ranks.clear();
-        state.line_output.inline_box_fragments.clear();
-        state.line_output.paint_layers.clear();
-        state.line_output.line_clips.clear();
-        state.line_output.glyph_line_indices.clear();
-        state.line_output.line_glyph_offsets.clear();
-        state.line_output.line_glyph_advances.clear();
-        state.line_output.prepared_text_run_fragments.clear();
-        state.line_output.ellipsis_fragments.clear();
-        state.line_output.hyphen_fragments.clear();
-        state.fragment_output.decorations.clear();
-        state.fragment_output.scene_paint_order.clear();
-        state.fragment_output.decoration_line_indices.clear();
-        state.fragment_output.block_decoration_owners.clear();
-        state.fragment_output.decoration_paint_orders.clear();
-        state.fragment_output.decoration_fragments_by_line.clear();
-        state.fragment_output.decoration_paint_layers.clear();
-        state.fragment_output.block_paint_ranges.clear();
-        state.fragment_output.block_decoration_indices_by_y.clear();
-        state.fragment_output.block_decoration_prefix_max_y1.clear();
-        state.fragment_output.block_decoration_paint_ranks.clear();
-        state.fragment_output.block_decoration_count = 0;
-        state.fragment_output.decoration_clips.clear();
-        state.fragment_output.image_fragments.clear();
-        state.fragment_output.image_fragments_by_line.clear();
-        state.semantic_indexes.anchor_positions.clear();
+        self.state.clear();
     }
 
     pub fn state(&self) -> &LayoutState {

@@ -53,9 +53,6 @@ pub(super) fn apply(context: &mut PropertyContext<'_>, property: &Property<'_>) 
             }
             style.font.font_stretch = stretch;
         }
-        Property::FontPalette(value) => {
-            style.font.font_palette = Some(styles.intern_string(value.ident.0.as_ref()));
-        }
         Property::FontStyle(fs) => {
             style.font.font_oblique_angle = match fs {
                 CssFontStyle::Oblique(angle) => angle.to_degrees(),

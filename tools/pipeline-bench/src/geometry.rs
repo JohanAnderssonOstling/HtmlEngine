@@ -2,7 +2,7 @@
 
 use html::text::GlyphResourceStore;
 
-use html::layout::LaidOutDocument;
+use html_pipeline::engine::LaidOutDocument;
 use serde_json::{Value, json};
 
 pub(super) fn snapshot(document: &LaidOutDocument, resources: &GlyphResourceStore) -> Value {

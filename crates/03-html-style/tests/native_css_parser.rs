@@ -132,7 +132,7 @@ fn raw_token_conversion_preserves_floats_tables_font_features_and_generated_cont
         style.box_model.border_collapse,
         BorderCollapseMode::Collapse
     );
-    assert_eq!(style.font.font_feature_settings[0].tag(), *b"liga");
+    assert_eq!(style.font.font_feature_settings[0].tag_bytes(), *b"liga");
     assert_eq!(style.font.font_feature_settings[0].value(), 0);
     let (_, content, _) = document
         .styles()
@@ -192,7 +192,8 @@ fn whitespace_and_spacing_extensions_are_not_rewritten_into_other_declarations()
         "white-space:pre;white-space:preserve nowrap;letter-spacing:2px;letter-spacing:120%",
     );
     assert_eq!(view(&document).text.white_space, WhiteSpace::Pre);
-    assert_eq!(view(&document).text.letter_spacing.absolute_px(), 2.0);
+    assert_eq!(view(&document).text.letter_spacing.absolute_px(), 0.0);
+    assert_eq!(view(&document).text.letter_spacing.font_size_fraction(), 1.2);
 }
 
 #[test]
@@ -411,9 +412,12 @@ fn raw_token_conversions_preserve_values_surrounded_by_comments() {
     let style = view(&document);
     assert_eq!(style.box_model.float, Float::Left);
     assert!(style.box_model.size_containment);
-    assert_eq!(style.font.font_feature_settings[0].tag(), *b"liga");
+    assert_eq!(style.font.font_feature_settings[0].tag_bytes(), *b"liga");
     assert_eq!(style.font.font_feature_settings[0].value(), 0);
-    assert_eq!(style.font.font_variant_numeric_features[0].tag(), *b"tnum");
+    assert_eq!(
+        style.font.font_variant_numeric_features[0].tag_bytes(),
+        *b"tnum"
+    );
     let (_, content, _) = document
         .styles()
         .before_style_for_node(target(&document))

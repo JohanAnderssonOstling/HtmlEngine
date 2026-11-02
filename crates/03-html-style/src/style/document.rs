@@ -1,5 +1,5 @@
 //! Public styling inputs, timing records, and immutable styled-document output.
-use crate::style::source::fonts::{FontFace, FontPalette};
+use crate::style::source::fonts::FontFace;
 use html_dom::{Document, DomNodeId};
 use html_style_model::{
     Background, Border, BorderRadii, BoxModel, ComputedStyles, Font, InheritedText, StyleIndices,
@@ -16,15 +16,9 @@ pub struct StyledDocument {
     pub(super) document: Document,
     pub(super) styles: ComputedStyles,
     pub(super) font_faces: Arc<[FontFace]>,
-    pub(super) font_palettes: Option<Arc<[FontPalette]>>,
 }
 
 impl StyledDocument {
-    /// Active named color palettes, in stylesheet order.
-    pub fn font_palettes(&self) -> &[FontPalette] {
-        self.font_palettes.as_deref().unwrap_or_default()
-    }
-
     /// Active `@font-face` declarations in stylesheet order. Relative URLs
     /// remain relative when styling CSS directly; the pipeline resolves them.
     pub fn font_faces(&self) -> &[FontFace] {

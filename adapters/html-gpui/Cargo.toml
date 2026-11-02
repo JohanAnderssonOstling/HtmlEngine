@@ -7,6 +7,8 @@ description = "GPUI shaping, painting and continuous HTML elements for skrift"
 readme = "README.md"
 
 [dependencies]
+html-engine-model = { package = "skrift-engine-model", path = "../../crates/html-engine-model" }
+html-render-core = { package = "skrift-render-core", path = "../../crates/05-html-render-core" }
 cssparser = "0.37"
 html-fonts = { path = "../html-fonts" }
 gpui.workspace = true

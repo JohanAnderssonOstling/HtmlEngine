@@ -540,7 +540,8 @@ impl<'a> RenderTextView<'a> {
         self.doc
             .layout_state
             .line_output
-            .paint_order_ranks
+            .paint_order_indices
+            .ranks()
             .get(line_idx)
             .copied()
     }
@@ -660,7 +661,8 @@ impl<'a> RenderTextView<'a> {
         self.doc
             .layout_state
             .line_output
-            .spatial_ranks
+            .spatial_order
+            .ranks()
             .get(id.index())
             .map(|&rank| rank as usize)
     }

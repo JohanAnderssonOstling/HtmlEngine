@@ -26,6 +26,21 @@ pub struct RenderGeometryView<'a> {
 }
 
 impl<'a> RenderGeometryView<'a> {
+    /// Narrow document-space ink candidates without allocating or scanning
+    /// every image. Bounds include tall and overflowing image carriers.
+    pub fn lines_at_y(self, y: f64) -> impl Iterator<Item = super::LineId> + 'a {
+        let output = &self.doc.layout_state.line_output;
+        let start = output.spatial_order.partition_point(|id| {
+            let line = &output.lines[id.index()];
+            line.point.y + line.height < y - output.hit_test_below
+        });
+        let end = output.spatial_order.partition_point(|id| {
+            let line = &output.lines[id.index()];
+            line.point.y + line.height <= y + output.hit_test_above
+        });
+        output.spatial_order[start..end.max(start)].iter().copied()
+    }
+
     /// Intrinsic vertical extent of a line and its visible replaced content,
     /// in document coordinates. Image offsets and object-fit clipping apply.
     pub fn line_vertical_bounds(self, line_idx: usize) -> Option<Range<f64>> {
@@ -54,7 +69,7 @@ impl<'a> RenderGeometryView<'a> {
         });
         for image in view.fragments().images().iter() {
             let id = image.line_idx();
-            let Some(&rank) = output.spatial_ranks.get(id) else {
+            let Some(&rank) = output.spatial_order.ranks().get(id) else {
                 continue;
             };
             let rank = rank as usize;

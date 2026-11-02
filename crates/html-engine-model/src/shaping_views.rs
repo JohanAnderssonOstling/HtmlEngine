@@ -308,16 +308,14 @@ mod tests {
             10,
             [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0].into(),
             8.0,
-        )
-        .unwrap();
+        );
         let patch_run = ShapedTextRun::with_backend_run(
             Arc::from([4.0; 2]),
             Arc::from([true, false, true]),
             20,
             [0.0, 4.0, 8.0].into(),
             12.0,
-        )
-        .unwrap();
+        );
         let mut base = ShapedTextGeometry::with_len(6);
         base.push_run(&[0, 1, 2, 3, 4, 5], base_run, true);
         let mut patch = ShapedTextGeometry::with_len(6);
@@ -362,7 +360,7 @@ mod tests {
         let mut fallback = ShapedTextGeometry::with_len(6);
         fallback.replace_range(
             2..4,
-            ShapedTextRun::new(Arc::from([2.0; 2]), Arc::from([true; 3])).unwrap(),
+            ShapedTextRun::new(Arc::from([2.0; 2]), Arc::from([true; 3])),
             false,
         );
         let runs = TextGeometryView::new(&base, Some(&fallback))
@@ -399,16 +397,14 @@ mod tests {
                 10,
                 base_carets.into(),
                 8.0,
-            )
-            .unwrap();
+            );
             let patch_run = ShapedTextRun::with_backend_run(
                 Arc::from([7.0]),
                 Arc::from([true; 2]),
                 20,
                 patch_carets.into(),
                 12.0,
-            )
-            .unwrap();
+            );
             let mut base = ShapedTextGeometry::with_len(6);
             // One backend run contributes two disjoint logical source ranges.
             base.push_run(&[0, 1, 4, 5], base_run, true);

@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use html::layout::ThemeAdaptation;
+use html::style::ThemeAdaptation;
 use image::{
     RgbaImage,
     imageops::{FilterType, resize},

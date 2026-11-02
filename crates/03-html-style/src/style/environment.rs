@@ -38,8 +38,8 @@ impl MediaEnvironment {
         viewport_height: Option<f64>,
     ) -> Option<Self> {
         if !viewport_width.is_finite()
-            || viewport_width <= 0.0
-            || viewport_height.is_some_and(|height| !height.is_finite() || height <= 0.0)
+            || viewport_width < 0.0
+            || viewport_height.is_some_and(|height| !height.is_finite() || height < 0.0)
         {
             return None;
         }

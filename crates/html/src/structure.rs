@@ -113,6 +113,7 @@ pub struct BoundaryIndex {
     line_indices: Vec<usize>,
     last_line: HashMap<usize, usize>,
     line_owners: Vec<(usize, usize)>,
+    next_owner_lines: Vec<(usize, usize)>,
 }
 
 impl BoundaryIndex {
@@ -342,15 +343,9 @@ impl<'a> Structure<'a> {
         // Empty boxes publish no line owner, but break-before/after on an empty
         // sibling applies to the following visible line. Layout boxes are in
         // source preorder, so only inspect the bounded gaps between local owners.
-        for pair in line_owners.windows(2) {
-            let [(_, left), (_, right)] = pair else {
-                continue;
-            };
-            let (start, end) = if left <= right {
-                (*left, *right)
-            } else {
-                (*right, *left)
-            };
+        if line_owners.len() > 1 {
+            let start = line_owners.iter().map(|&(_, owner)| owner).min().unwrap();
+            let end = line_owners.iter().map(|&(_, owner)| owner).max().unwrap();
             for box_idx in start..=end {
                 candidates.insert(box_idx);
                 for ancestor in boxes.ancestors(box_idx) {
@@ -360,17 +355,26 @@ impl<'a> Structure<'a> {
         }
 
         let next_line = &mut anchors.next_line;
+        let by_owner = &mut anchors.next_owner_lines;
+        by_owner.clear();
         for box_idx in candidates.iter().copied() {
             let next = if let Some(last) = last_line.get(&box_idx).copied() {
-                line_owners.iter().find_map(|&(line_idx, owner)| {
-                    (line_idx > last && !self.view.semantics().contains(box_idx, owner))
-                        .then_some(line_idx)
-                })
+                // Every indexed descendant contributed to last_line, so the
+                // first later cursor necessarily belongs outside this box.
+                let next = line_owners.partition_point(|&(cursor, _)| cursor <= last);
+                line_owners.get(next).map(|&(cursor, _)| cursor)
             } else {
-                line_owners.iter().find_map(|&(line_idx, owner)| {
-                    (owner > box_idx && !self.view.semantics().contains(box_idx, owner))
-                        .then_some(line_idx)
-                })
+                if by_owner.is_empty() && !line_owners.is_empty() {
+                    by_owner.extend(line_owners.iter().map(|&(cursor, owner)| (owner, cursor)));
+                    by_owner.sort_unstable_by_key(|&(owner, _)| owner);
+                    let mut next = usize::MAX;
+                    for (_, cursor) in by_owner.iter_mut().rev() {
+                        next = next.min(*cursor);
+                        *cursor = next;
+                    }
+                }
+                let next = by_owner.partition_point(|&(owner, _)| owner <= box_idx);
+                by_owner.get(next).map(|&(_, cursor)| cursor)
             };
             if let Some(next) = next {
                 next_line.insert(box_idx, next);

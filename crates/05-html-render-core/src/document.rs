@@ -134,6 +134,9 @@ impl<'a> DocumentPainter<'a> {
     }
 
     pub fn paint(&self, projection: &impl PaintProjection, painter: &mut impl Painter) {
+        if !self.view.paint_resources_valid() {
+            return;
+        }
         let bounds = projection.bounds();
         if bounds.width() <= 0.0 || bounds.height() <= 0.0 {
             return;

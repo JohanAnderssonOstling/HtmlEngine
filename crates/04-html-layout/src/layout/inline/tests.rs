@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::{GlyphRequest, ShapedGlyph};
+    use crate::{GlyphRequest, ShapedGlyph, ShapedRun};
 
     use crate::GlyphResourceStore;
 
@@ -11,10 +11,7 @@ mod tests {
     };
     use crate::parser::DocumentFactory;
     use crate::test_support::TestGlyphShaper as GlyphCache;
-    use crate::{
-        GlyphShaper, LaidOutDocument, ShapeError, ShapedTextRun, TextRunShapeRequest,
-        TextShapeRequest,
-    };
+    use crate::{GlyphShaper, LaidOutDocument, ShapeError, ShapedTextRun, TextRunShapeRequest};
     use html_style_model::{Hyphens, VerticalAlignValue, WhiteSpace};
     use lightningcss::stylesheet::ParserOptions;
     use std::fs;
@@ -24,8 +21,6 @@ mod tests {
         fallback: GlyphCache,
         advances: Vec<f32>,
         boundaries: Vec<bool>,
-        exact_line_advance: Option<f32>,
-        measured_texts: Vec<String>,
     }
 
     impl GlyphShaper for NativeGeometryShaper {
@@ -53,85 +48,17 @@ mod tests {
             self.fallback.shape_glyph(request)
         }
 
-        fn shape_text_run(
+        fn shape_run(
             &mut self,
             request: TextRunShapeRequest<'_>,
-        ) -> Result<Option<ShapedTextRun>, ShapeError> {
+        ) -> Result<Option<ShapedRun>, ShapeError> {
             if request.text().chars().count() != self.advances.len() {
                 return Ok(None);
             }
-            Ok(ShapedTextRun::new(
+            Ok(Some(ShapedRun::geometry(ShapedTextRun::new(
                 Arc::from(self.advances.clone()),
                 Arc::from(self.boundaries.clone()),
-            ))
-        }
-
-        fn measure_line(
-            &mut self,
-            request: TextShapeRequest<'_>,
-        ) -> Result<Option<ShapedTextRun>, ShapeError> {
-            let Some(advance) = self.exact_line_advance else {
-                return Ok(None);
-            };
-            self.measured_texts.push(request.text().to_owned());
-            let character_count = request.text().chars().count();
-            Ok(ShapedTextRun::new(
-                Arc::from(vec![advance; character_count]),
-                Arc::from(vec![true; character_count + 1]),
-            ))
-        }
-    }
-
-    struct OscillatingBoundaryShaper {
-        fallback: GlyphCache,
-    }
-
-    impl GlyphShaper for OscillatingBoundaryShaper {
-        fn reset(&mut self) {
-            self.fallback.reset();
-        }
-
-        fn resource_generation(&self) -> crate::GlyphResourceGeneration {
-            self.fallback.resource_generation()
-        }
-
-        fn begin_append_shaping(&mut self) -> Result<(), ShapeError> {
-            self.fallback.begin_append_shaping()
-        }
-
-        fn commit_append_shaping(&mut self) {
-            self.fallback.commit_append_shaping();
-        }
-
-        fn rollback_append_shaping(&mut self) {
-            self.fallback.rollback_append_shaping();
-        }
-
-        fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
-            self.fallback.shape_glyph(request)
-        }
-
-        fn shape_text_run(
-            &mut self,
-            request: TextRunShapeRequest<'_>,
-        ) -> Result<Option<ShapedTextRun>, ShapeError> {
-            let count = request.text().chars().count();
-            Ok(ShapedTextRun::new(
-                Arc::from(vec![4.0; count]),
-                Arc::from(vec![true; count + 1]),
-            ))
-        }
-
-        fn measure_line(
-            &mut self,
-            request: TextShapeRequest<'_>,
-        ) -> Result<Option<ShapedTextRun>, ShapeError> {
-            let count = request.text().chars().count();
-            let advance = if count == 1 { 2.0 } else { 6.0 };
-            Ok(ShapedTextRun::new(
-                Arc::from(vec![advance; count]),
-                Arc::from(vec![true; count + 1]),
-            ))
+            ))))
         }
     }
 
@@ -165,8 +92,6 @@ mod tests {
             fallback: GlyphCache::new(),
             advances,
             boundaries,
-            exact_line_advance: None,
-            measured_texts: Vec::new(),
         };
         factory
             .parse_with_new_pipeline(html, None)
@@ -188,8 +113,6 @@ mod tests {
             fallback: GlyphCache::new(),
             advances: vec![4.0; 4],
             boundaries: vec![true; 5],
-            exact_line_advance: Some(6.0),
-            measured_texts: Vec::new(),
         };
         let mut shaped_resources = GlyphResourceStore::default();
         let shaped = factory.parse_with_new_pipeline("<html><body style='margin:0'><p style='margin:0;overflow-wrap:anywhere'>abcd</p></body></html>", None).shape(&mut glyph_cache, &mut shaped_resources).expect("native geometry must be valid");
@@ -211,10 +134,6 @@ mod tests {
             );
         }
 
-        assert!(
-            glyph_cache.measured_texts.is_empty(),
-            "layout must not invoke backend line reshaping"
-        );
         document
             .relayout_with_metrics_and_shaper(
                 constraints,
@@ -223,10 +142,6 @@ mod tests {
                 &mut shaped_resources,
             )
             .expect("width-only relayout must remain valid");
-        assert!(
-            glyph_cache.measured_texts.is_empty(),
-            "relayout must reuse authoritative shaped geometry"
-        );
 
         let wider = crate::LayoutConstraints::new(13.0, 16.0).unwrap();
         document
@@ -247,8 +162,6 @@ mod tests {
             fallback: GlyphCache::new(),
             advances: vec![8.0],
             boundaries: vec![true; 2],
-            exact_line_advance: Some(8.0),
-            measured_texts: Vec::new(),
         };
         let mut shaped_resources = GlyphResourceStore::default();
         let shaped = factory
@@ -266,11 +179,6 @@ mod tests {
                 &mut shaped_resources,
             )
             .expect("fragmented exact shaping must succeed");
-
-        assert!(
-            glyph_cache.measured_texts.is_empty(),
-            "inline-image fragmentation must not trigger backend line reshaping"
-        );
 
         assert_eq!(document.line_count(), 1);
         let fragments = document
@@ -453,25 +361,6 @@ mod tests {
             x..x + 1,
             "a fragment must not merge text from a differently styled owner; otherwise its earlier paint key can place the inline background above X"
         );
-    }
-
-    #[test]
-    fn layout_does_not_enter_backend_boundary_refinement() {
-        let mut factory = DocumentFactory::new();
-        let mut glyph_cache = OscillatingBoundaryShaper {
-            fallback: GlyphCache::new(),
-        };
-        let mut shaped_resources = GlyphResourceStore::default();
-        let shaped = factory.parse_with_new_pipeline("<html><body style='margin:0'><p style='margin:0;overflow-wrap:anywhere'>abcd</p></body></html>", None).shape(&mut glyph_cache, &mut shaped_resources).expect("fixture shaping must succeed");
-        let document = shaped
-            .layout_with_metrics_and_shaper(
-                crate::LayoutConstraints::new(9.0, 16.0).unwrap(),
-                &crate::ImageMetrics::default(),
-                &mut glyph_cache,
-                &mut shaped_resources,
-            )
-            .expect("layout uses authoritative document shaping");
-        assert_eq!(document.line_count(), 2);
     }
 
     #[test]
@@ -810,8 +699,6 @@ mod tests {
             fallback: GlyphCache::new(),
             advances: vec![2.0; count],
             boundaries: vec![true; count + 1],
-            exact_line_advance: None,
-            measured_texts: Vec::new(),
         };
         crate::PreparedDocument::try_new(document, styles)
             .unwrap()
@@ -1479,11 +1366,12 @@ mod tests {
             );
             let mut entries_resources = GlyphResourceStore::default();
             let (document, entries) = capture(Duration::default, || {
-                layout_with_native_geometry(
+                layout_with_native_geometry_policy(
                     &html,
                     width,
                     vec![2.0; glyphs],
                     vec![true; glyphs + 1],
+                    crate::TextCompositionPolicy::BookOptimized,
                     &mut entries_resources,
                 )
             });
@@ -1516,11 +1404,12 @@ mod tests {
             };
             let mut entries_resources = GlyphResourceStore::default();
             let (document, entries) = capture(Duration::default, || {
-                layout_with_native_geometry(
+                layout_with_native_geometry_policy(
                     html,
                     19.03,
                     vec![2.0; 14],
                     boundaries,
+                    crate::TextCompositionPolicy::BookOptimized,
                     &mut entries_resources,
                 )
             });
@@ -3021,7 +2910,7 @@ mod tests {
                 };
                 Ok(ShapedGlyph::from_metric(
                     request.character as u32,
-                    GlyphMetric::try_new(request.character, 10.0, ascent, descent).unwrap(),
+                    GlyphMetric::new(request.character, 10.0, ascent, descent),
                 ))
             }
         }

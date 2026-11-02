@@ -16,7 +16,6 @@ macro_rules! property_catalogue {
             FontWeight => "font-weight", true, Remaining, [font.font_weight], plain;
             FontStyle => "font-style", true, Remaining, [font.font_style, font.font_oblique_angle], plain;
             FontStretch => "font-stretch", true, Remaining, [font.font_stretch], plain;
-            FontPalette => "font-palette", true, Remaining, [font.font_palette], plain;
             FontFamily => "font-family", true, Remaining, [font.font_family], plain;
             Font => "font", true, Remaining, [], shorthand;
             LineHeight => "line-height", true, Prerequisites, [

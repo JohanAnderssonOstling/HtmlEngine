@@ -1,7 +1,7 @@
 //! Document-local reading units. Playback, region splitting, and following the
 //! active passage belong to the embedding application.
 use crate::layout::RenderView;
-pub use crate::layout::{ReadingFragment, ReadingTarget};
+pub use html_pipeline::engine::{ReadingFragment, ReadingTarget};
 use std::ops::Range;
 
 #[derive(Clone, Copy)]

@@ -403,7 +403,6 @@ pub(crate) fn tokens_are_supported(id: RendererPropertyId, tokens: &TokenList<'_
         RendererPropertyId::TextWrap => text_wrap(tokens).is_some(),
         RendererPropertyId::HangingPunctuation => hanging_punctuation(tokens).is_some(),
         RendererPropertyId::FontVariant => super::font_features::parse_variant(tokens).is_some(),
-        RendererPropertyId::FontPalette => font_palette_keyword(tokens).is_some(),
         RendererPropertyId::FontSynthesisStyle => font_synthesis_style(id, tokens).is_some(),
         RendererPropertyId::FontSynthesis | RendererPropertyId::FontSynthesisSmallCaps => {
             font_synthesis_small_caps(id, tokens).is_some()
@@ -440,16 +439,6 @@ pub(crate) fn tokens_are_supported(id: RendererPropertyId, tokens: &TokenList<'_
         }
         RendererPropertyId::Contain => super::contain::parse_tokens(tokens).is_some(),
         _ => true,
-    }
-}
-
-/// Resolve built-in palette keywords from Lightning CSS's token AST.
-pub(crate) fn font_palette_keyword(tokens: &TokenList<'_>) -> Option<&'static str> {
-    match_ignore_ascii_case! { single_ident_keyword(tokens)?,
-        "normal" => Some("normal"),
-        "light" => Some("light"),
-        "dark" => Some("dark"),
-        _ => None,
     }
 }
 

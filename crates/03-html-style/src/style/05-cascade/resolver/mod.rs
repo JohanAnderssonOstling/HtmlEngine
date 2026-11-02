@@ -317,11 +317,7 @@ pub(crate) fn resolve_styles_for_dom_timed(
     computed_styles.apply_reader_overrides(doc, reader_overrides);
     let styles = computed_styles
         .finish()
-        .expect("resolver must assign a valid computed style to every element")
-        .with_font_palettes(crate::style::source::fonts::resolved_font_palettes(
-            prepared.font_palettes.as_deref().unwrap_or_default(),
-            |color| values::colors::css_color_to_u32(color, 0x000000ff),
-        ).into());
+        .expect("resolver must assign a valid computed style to every element");
     timings.style_store += started.elapsed();
     let mut media_queries = prepared.media_queries().clone();
     if resolution.uses_viewport_units.get() {

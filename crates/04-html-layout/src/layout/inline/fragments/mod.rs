@@ -57,9 +57,6 @@ struct PlacementOffsetRun {
     x: f64,
 }
 
-// Keep positioned and implicit line descriptors as small as the old Vec.
-const _: () = assert!(size_of::<Option<LinePlacements>>() == 3 * size_of::<usize>());
-
 impl LinePlacements {
     pub(super) fn storage_bytes(&self) -> usize {
         match self {

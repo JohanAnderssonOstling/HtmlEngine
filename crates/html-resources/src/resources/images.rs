@@ -1,8 +1,11 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::error::Error;
+use std::fmt;
 use std::future::Future;
 use std::io::{self, Cursor};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LockResult, Mutex, MutexGuard, Weak};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use peniko::{Blob, Format, Image as PenikoImage};
@@ -162,11 +165,48 @@ struct SharedImage {
 struct SharedState {
     decoded: HashMap<ImageKey, SharedImage>,
     pending: HashSet<ImageKey>,
+    failed: HashMap<ImageKey, (u64, Arc<ImageLoadError>)>,
     decoded_bytes: usize,
     byte_budget: usize,
     clock: u64,
     revision: u64,
     completion_waker: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+struct ImageServiceState {
+    epoch: AtomicU64,
+    inner: Mutex<SharedState>,
+}
+
+impl ImageServiceState {
+    fn lock(&self) -> LockResult<MutexGuard<'_, SharedState>> {
+        self.inner.lock()
+    }
+}
+
+/// A completed resource request that requires an explicit retry.
+#[derive(Debug)]
+pub enum ImageLoadError {
+    Read(io::Error),
+    Decode,
+}
+
+impl fmt::Display for ImageLoadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read(error) => error.fmt(f),
+            Self::Decode => f.write_str("unsupported or invalid image data"),
+        }
+    }
+}
+
+impl Error for ImageLoadError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Read(error) => Some(error),
+            Self::Decode => None,
+        }
+    }
 }
 
 impl SharedState {
@@ -182,13 +222,15 @@ impl SharedState {
 /// in one reader. Cloning this handle creates no workers.
 #[derive(Clone)]
 pub struct ImageService {
-    state: Arc<Mutex<SharedState>>,
+    state: Arc<ImageServiceState>,
     loader: Arc<dyn ImageLoader>,
     jobs: Arc<dyn BlockingJobSpawner>,
 }
 
 impl ImageService {
     pub const DEFAULT_BYTE_BUDGET: usize = 128 * 1024 * 1024;
+    /// Bound retained failures independently of decoded image bytes.
+    const MAX_FAILURES: usize = 256;
 
     pub fn new(provider: Arc<dyn ResourceProvider>, byte_budget: usize) -> Self {
         Self::with_job_spawner(provider, Arc::new(InlineJobSpawner), byte_budget)
@@ -208,15 +250,19 @@ impl ImageService {
         jobs: Arc<dyn BlockingJobSpawner>,
         byte_budget: usize,
     ) -> Self {
-        let state = Arc::new(Mutex::new(SharedState {
-            decoded: HashMap::new(),
-            pending: HashSet::new(),
-            decoded_bytes: 0,
-            byte_budget,
-            clock: 0,
-            revision: 0,
-            completion_waker: None,
-        }));
+        let state = Arc::new(ImageServiceState {
+            epoch: AtomicU64::new(0),
+            inner: Mutex::new(SharedState {
+                decoded: HashMap::new(),
+                pending: HashSet::new(),
+                failed: HashMap::new(),
+                decoded_bytes: 0,
+                byte_budget,
+                clock: 0,
+                revision: 0,
+                completion_waker: None,
+            }),
+        });
         Self {
             state,
             loader,
@@ -232,12 +278,16 @@ impl ImageService {
     }
 
     fn request(&self, source: &ImageSource, key: ImageKey) {
-        {
+        let epoch = {
             let mut state = self.state.lock().expect("image service mutex poisoned");
-            if state.decoded.contains_key(&key) || !state.pending.insert(key.clone()) {
+            if state.decoded.contains_key(&key)
+                || state.failed.contains_key(&key)
+                || !state.pending.insert(key.clone())
+            {
                 return;
             }
-        }
+            self.state.epoch.load(Ordering::Relaxed)
+        };
         let state = Arc::downgrade(&self.state);
         let jobs = self.jobs.clone();
         self.loader.load(
@@ -246,7 +296,9 @@ impl ImageService {
                 if state.strong_count() == 0 {
                     return;
                 }
-                jobs.spawn(Box::new(move || execute_image_job(state, key, bytes)));
+                jobs.spawn(Box::new(move || {
+                    execute_image_job(state, epoch, key, bytes)
+                }));
             }),
         );
     }
@@ -261,6 +313,18 @@ impl ImageService {
         trim_decoded_cache(&mut state, None);
     }
 
+    fn invalidate(&self) {
+        let mut state = self.state.lock().expect("image service mutex poisoned");
+        self.state.epoch.fetch_add(1, Ordering::Release);
+        state.decoded.clear();
+        state.pending.clear();
+        state.failed.clear();
+        state.decoded_bytes = 0;
+        let waker = state.completion_waker.clone();
+        drop(state);
+        wake_completion(waker);
+    }
+
     fn wake_completion(&self) {
         let waker = self
             .state
@@ -272,15 +336,20 @@ impl ImageService {
     }
 }
 
+struct ImageRequest {
+    key: ImageKey,
+    seen_revision: Option<u64>,
+}
+
 /// Document-local image state. Image metadata stays with the document and is
 /// borrowed by operations; only asynchronous job identities are retained.
 pub struct ImagePipeline {
-    resource_keys: HashMap<u32, ImageKey>,
+    resource_keys: HashMap<u32, ImageRequest>,
     service: ImageService,
     decoded_cache: HashMap<u32, Arc<DecodedImage>>,
-    seen_revisions: HashMap<u32, u64>,
     desired: HashSet<u32>,
     image_dimensions: HashMap<u32, (u32, u32)>,
+    service_epoch: u64,
 }
 
 #[derive(Debug, Default)]
@@ -290,20 +359,67 @@ pub struct ImagePipelinePoll {
 }
 
 impl ImagePipeline {
+    /// A failed request stays settled until retried, invalidated, or evicted
+    /// from the bounded failure cache. Querying a
+    /// failure does not schedule I/O or change the visible image working set.
+    pub fn failure(&self, index: u32) -> Option<Arc<ImageLoadError>> {
+        let request = self.resource_keys.get(&index)?;
+        self.service
+            .state
+            .lock()
+            .expect("image service mutex poisoned")
+            .failed
+            .get(&request.key)
+            .map(|(_, error)| error.clone())
+    }
+
+    /// Allow the next working-set request to retry this failed image.
+    pub fn retry_failed(&mut self, index: u32) {
+        if let Some(request) = self.resource_keys.get(&index) {
+            self.service
+                .state
+                .lock()
+                .expect("image service mutex poisoned")
+                .failed
+                .remove(&request.key);
+        }
+    }
+
     pub fn new(provider: Arc<dyn ResourceProvider>) -> Self {
         let service = ImageService::new(provider, ImageService::DEFAULT_BYTE_BUDGET);
         Self::with_service(service)
     }
 
     pub fn with_service(service: ImageService) -> Self {
+        let service_epoch = service.state.epoch.load(Ordering::Acquire);
         Self {
             resource_keys: HashMap::new(),
             service,
             decoded_cache: HashMap::new(),
-            seen_revisions: HashMap::new(),
             desired: HashSet::new(),
             image_dimensions: HashMap::new(),
+            service_epoch,
         }
+    }
+
+    /// Provider bytes changed, including resources whose URI stayed the same.
+    /// All documents sharing this service observe the new epoch before reuse.
+    pub fn invalidate_resources(&mut self) {
+        self.service.invalidate();
+    }
+
+    fn sync_epoch(&mut self) -> bool {
+        let epoch = self.service.state.epoch.load(Ordering::Acquire);
+        if epoch != self.service_epoch {
+            self.decoded_cache.clear();
+            for request in self.resource_keys.values_mut() {
+                request.seen_revision = None;
+            }
+            self.image_dimensions.clear();
+            self.service_epoch = epoch;
+            return true;
+        }
+        false
     }
 
     /// Install the current document's resource metadata after a pipeline update.
@@ -311,30 +427,51 @@ impl ImagePipeline {
     /// removed sources lose their local state; the next visible window requests
     /// their new content through the shared service.
     pub fn update_resources(&mut self, images: &[ImageResource]) {
-        self.resource_keys.retain(|&index, key| {
-            if images.get(index as usize).is_some_and(|image| key.matches_source(&image.source)) {
+        let invalidated = self.sync_epoch();
+        self.resource_keys.retain(|&index, request| {
+            if images
+                .get(index as usize)
+                .is_some_and(|image| request.key.matches_source(&image.source))
+            {
                 return true;
             }
             self.decoded_cache.remove(&index);
-            self.seen_revisions.remove(&index);
             self.desired.remove(&index);
             self.image_dimensions.remove(&index);
             false
         });
+        if invalidated && !self.desired.is_empty() {
+            let desired = self.desired.clone();
+            self.ensure_window(images, &desired);
+        }
     }
 
-    pub fn poll(&mut self) -> ImagePipelinePoll {
+    /// Poll using the current borrowed catalog. A shared-service invalidation
+    /// automatically renews this document's desired requests before polling.
+    pub fn poll(&mut self, images: &[ImageResource]) -> ImagePipelinePoll {
+        if self.service_epoch != self.service.state.epoch.load(Ordering::Acquire) {
+            self.renew_requests(images);
+        }
         let mut changed = ImagePipelinePoll::default();
-        if self.desired.is_empty() { return changed; }
+        if self.desired.is_empty() {
+            return changed;
+        }
         // Keys are retained for the visible window. Polling neither rebuilds
         // SVG hashes nor takes one mutex per image; unchanged revisions borrow
         // the shared entry without incrementing its Arc count.
         let mut state = self.service.state.lock().expect("image service mutex poisoned");
         for &idx in &self.desired {
-            let key = &self.resource_keys[&idx];
-            let Some(image) = state.image(key) else { continue };
-            if self.seen_revisions.get(&idx) == Some(&image.revision) { continue; }
-            self.seen_revisions.insert(idx, image.revision);
+            let request = self
+                .resource_keys
+                .get_mut(&idx)
+                .expect("desired image request");
+            let Some(image) = state.image(&request.key) else {
+                continue;
+            };
+            if request.seen_revision == Some(image.revision) {
+                continue;
+            }
+            request.seen_revision = Some(image.revision);
             let dimensions = image.decoded.dimensions();
             self.decoded_cache.insert(idx, image.decoded.clone());
             changed.decoded = true;
@@ -347,30 +484,49 @@ impl ImagePipeline {
         changed
     }
 
+    #[cold]
+    fn renew_requests(&mut self, images: &[ImageResource]) {
+        self.update_resources(images);
+    }
+
     /// Request visible images by borrowing their owning document's catalog.
     /// After document resource replacement, call [`Self::update_resources`]
     /// before reusing this pipeline with the new catalog.
     pub fn ensure_window(&mut self, images: &[ImageResource], desired: &HashSet<u32>) {
+        self.sync_epoch();
         self.decoded_cache.retain(|idx, _| desired.contains(idx));
-        self.seen_revisions.retain(|idx, _| desired.contains(idx));
+        for idx in self.desired.difference(desired) {
+            self.resource_keys
+                .get_mut(idx)
+                .expect("desired image request")
+                .seen_revision = None;
+        }
         self.desired.retain(|idx| desired.contains(idx));
 
         let mut shared_cache_hit = false;
         for &idx in desired {
-            let Some(resource) = images.get(idx as usize) else { continue };
-            let key = self.resource_keys.entry(idx).or_insert_with(|| ImageKey::for_source(&resource.source));
+            let Some(resource) = images.get(idx as usize) else {
+                continue;
+            };
+            let request = self
+                .resource_keys
+                .entry(idx)
+                .or_insert_with(|| ImageRequest {
+                    key: ImageKey::for_source(&resource.source),
+                    seen_revision: None,
+                });
             self.desired.insert(idx);
             if self.decoded_cache.contains_key(&idx) {
                 continue;
             }
-            if let Some(decoded) = self.service.get(key) {
+            if let Some(decoded) = self.service.get(&request.key) {
                 // Paint a shared hit immediately. Leaving its revision
                 // unseen makes `has_pending` schedule one poll so intrinsic
                 // dimensions are still reported to this document.
                 self.decoded_cache.insert(idx, decoded);
                 shared_cache_hit = true;
             } else {
-                self.service.request(&resource.source, key.clone());
+                self.service.request(&resource.source, request.key.clone());
             }
         }
         if shared_cache_hit {
@@ -384,46 +540,75 @@ impl ImagePipeline {
     /// budget. A later `ensure_window` reactivates the required images.
     pub fn deactivate(&mut self) {
         self.decoded_cache.clear();
-        self.seen_revisions.clear();
+        for idx in &self.desired {
+            self.resource_keys
+                .get_mut(idx)
+                .expect("desired image request")
+                .seen_revision = None;
+        }
         self.desired.clear();
         self.service.trim();
     }
 
     pub fn get_decoded(&self, idx: u32) -> Option<&DecodedImage> {
+        if self.service_epoch != self.service.state.epoch.load(Ordering::Acquire) {
+            return None;
+        }
         self.decoded_cache.get(&idx).map(AsRef::as_ref)
     }
 
     /// Known intrinsic dimensions survive decoded-buffer release and are
     /// invalidated when this index is rebound to another resource source.
     pub fn intrinsic_dimensions(&self, idx: u32) -> Option<(u32, u32)> {
+        if self.service_epoch != self.service.state.epoch.load(Ordering::Acquire) {
+            return None;
+        }
         self.image_dimensions.get(&idx).copied()
     }
 
     pub fn has_pending(&self) -> bool {
-        if self.desired.iter().all(|idx| self.seen_revisions.contains_key(idx)) {
+        if self.service_epoch != self.service.state.epoch.load(Ordering::Acquire) {
+            return !self.desired.is_empty();
+        }
+        if self
+            .desired
+            .iter()
+            .all(|idx| self.resource_keys[idx].seen_revision.is_some())
+        {
             return false;
         }
         let state = self.service.state.lock().expect("image service mutex poisoned");
         self.desired.iter().any(|idx| {
-            !self.seen_revisions.contains_key(idx)
-                && (self.decoded_cache.contains_key(idx) || state.pending.contains(&self.resource_keys[idx]))
+            self.resource_keys[idx].seen_revision.is_none()
+                && (self.decoded_cache.contains_key(idx)
+                    || state.pending.contains(&self.resource_keys[idx].key))
         })
     }
 
 }
 
 fn execute_image_job(
-    state: Weak<Mutex<SharedState>>,
+    state: Weak<ImageServiceState>,
+    epoch: u64,
     key: ImageKey,
     bytes: std::io::Result<Vec<u8>>,
 ) {
     let Some(state) = state.upgrade() else {
         return;
     };
-    let decoded = bytes.ok().and_then(|bytes| decode_image(&bytes).ok());
-    let mut state = state.lock().expect("image service mutex poisoned");
+    if state.epoch.load(Ordering::Acquire) != epoch {
+        return;
+    }
+    let decoded = bytes
+        .map_err(ImageLoadError::Read)
+        .and_then(|bytes| decode_image(&bytes).map_err(|()| ImageLoadError::Decode));
+    let mut locked = state.lock().expect("image service mutex poisoned");
+    if state.epoch.load(Ordering::Relaxed) != epoch {
+        return;
+    }
+    let state = &mut *locked;
     state.pending.remove(&key);
-    if let Some(decoded) = decoded {
+    if let Ok(decoded) = decoded {
         let byte_len = match &decoded {
             DecodedImage::Raster { byte_len, .. } => *byte_len,
             DecodedImage::Svg { bytes, .. } => bytes.len(),
@@ -443,10 +628,23 @@ fn execute_image_job(
         // Keep a newly completed decode available for at least one poll. If
         // the visible working set itself exceeds the cache budget, inactive
         // pipelines retrim it as soon as they release their pins.
-        trim_decoded_cache(&mut state, Some(&key));
+        trim_decoded_cache(state, Some(&key));
+    } else if let Err(error) = decoded {
+        if state.failed.len() >= ImageService::MAX_FAILURES {
+            let oldest = state
+                .failed
+                .iter()
+                .min_by_key(|(_, (age, _))| age)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                state.failed.remove(&oldest);
+            }
+        }
+        state.clock = state.clock.wrapping_add(1);
+        state.failed.insert(key, (state.clock, Arc::new(error)));
     }
     let waker = state.completion_waker.clone();
-    drop(state);
+    drop(locked);
     wake_completion(waker);
 }
 
@@ -1270,21 +1468,22 @@ mod tests {
         let mut resources = vec![resource("first.svg"), resource("second.svg")];
         let mut pipeline = ImagePipeline::with_service(service);
         pipeline.ensure_window(&resources, &HashSet::from([0, 1]));
-        assert!(pipeline.poll().decoded);
+        assert!(pipeline.poll(&resources).decoded);
         let unchanged = pipeline.decoded_cache[&1].clone();
         pipeline.update_resources(&resources);
         assert!(Arc::ptr_eq(&unchanged, &pipeline.decoded_cache[&1]));
-        assert!(!pipeline.poll().decoded);
+        assert!(!pipeline.poll(&resources).decoded);
 
         resources[0] = resource("replacement.svg");
         resources.push(resource("added.svg"));
+        pipeline.invalidate_resources();
         pipeline.update_resources(&resources);
         assert!(pipeline.get_decoded(0).is_none());
-        assert!(Arc::ptr_eq(&unchanged, &pipeline.decoded_cache[&1]));
+        assert!(pipeline.get_decoded(1).is_none());
         pipeline.ensure_window(&resources, &HashSet::from([0, 1, 2]));
-        assert!(pipeline.poll().decoded);
+        assert!(pipeline.poll(&resources).decoded);
         assert!(pipeline.get_decoded(0).is_some() && pipeline.get_decoded(2).is_some());
-        assert_eq!(provider.0.load(Ordering::Relaxed), 4);
+        assert_eq!(provider.0.load(Ordering::Relaxed), 5);
 
         pipeline.update_resources(&resources[..1]);
         assert!(pipeline.get_decoded(1).is_none() && pipeline.get_decoded(2).is_none());
@@ -1302,9 +1501,12 @@ mod tests {
             width: 20, height: 10, width_attr: None, height_attr: None,
         }];
         pipeline.ensure_window(&resources, &HashSet::from([0]));
-        assert!(pipeline.poll().decoded);
+        assert!(pipeline.poll(&resources).decoded);
         drop(resources);
-        assert!(source_owner.upgrade().is_none(), "only the document owns its inline source bytes");
+        assert!(
+            source_owner.upgrade().is_none(),
+            "only the document owns its inline source bytes"
+        );
         assert_eq!(pipeline.get_decoded(0).unwrap().dimensions(), (20, 10));
     }
 
@@ -1322,17 +1524,17 @@ mod tests {
         let mut resources = vec![resource(20, "first.xhtml")];
         let desired = HashSet::from([0]);
         pipeline.ensure_window(&resources, &desired);
-        assert_eq!(pipeline.poll().dimensions_changed, vec![0]);
+        assert_eq!(pipeline.poll(&resources).dimensions_changed, vec![0]);
         resources[0] = resource(20, "second.xhtml");
         pipeline.update_resources(&resources);
         assert!(pipeline.get_decoded(0).is_none());
         pipeline.ensure_window(&resources, &desired);
-        assert_eq!(pipeline.poll().dimensions_changed, vec![0]);
+        assert_eq!(pipeline.poll(&resources).dimensions_changed, vec![0]);
         pipeline.deactivate();
         resources[0] = resource(40, "second.xhtml");
         pipeline.update_resources(&resources);
         pipeline.ensure_window(&resources, &desired);
-        assert_eq!(pipeline.poll().dimensions_changed, vec![0]);
+        assert_eq!(pipeline.poll(&resources).dimensions_changed, vec![0]);
         assert_eq!(pipeline.get_decoded(0).unwrap().dimensions(), (40, 10));
         pipeline.update_resources(&[]);
         assert!(pipeline.get_decoded(0).is_none());
@@ -1362,8 +1564,8 @@ mod tests {
         while (first.get_decoded(0).is_none() || second.get_decoded(0).is_none())
             && Instant::now() < deadline
         {
-            first.poll();
-            second.poll();
+            first.poll(from_ref(&resource));
+            second.poll(from_ref(&resource));
             std::thread::yield_now();
         }
 
@@ -1405,7 +1607,7 @@ mod tests {
         }
 
         assert_eq!(wake_count.load(Ordering::Relaxed), 1);
-        assert!(pipeline.poll().decoded);
+        assert!(pipeline.poll(from_ref(&resource)).decoded);
     }
 
     #[test]
@@ -1432,12 +1634,12 @@ mod tests {
         pipeline.ensure_window(&resources, &HashSet::from([0]));
         let deadline = Instant::now() + Duration::from_secs(2);
         while pipeline.get_decoded(0).is_none() && Instant::now() < deadline {
-            pipeline.poll();
+            pipeline.poll(&resources);
             std::thread::yield_now();
         }
         pipeline.ensure_window(&resources, &HashSet::from([1]));
         while pipeline.get_decoded(1).is_none() && Instant::now() < deadline {
-            pipeline.poll();
+            pipeline.poll(&resources);
             std::thread::yield_now();
         }
 
@@ -1466,7 +1668,7 @@ mod tests {
         first.ensure_window(&[resource("first.svg")], &desired);
         let deadline = Instant::now() + Duration::from_secs(2);
         while first.get_decoded(0).is_none() && Instant::now() < deadline {
-            first.poll();
+            first.poll(&[resource("first.svg")]);
             std::thread::yield_now();
         }
         assert!(first.get_decoded(0).is_some());
@@ -1476,7 +1678,7 @@ mod tests {
         second.ensure_window(&[resource("second.svg")], &desired);
         let second_deadline = Instant::now() + Duration::from_secs(2);
         while second.get_decoded(0).is_none() && Instant::now() < second_deadline {
-            second.poll();
+            second.poll(&[resource("second.svg")]);
             std::thread::yield_now();
         }
         assert!(

@@ -40,7 +40,6 @@ macro_rules! renderer_property_ids {
 
 renderer_property_ids! {
     FontWidth => "font-width",
-    FontPalette => "font-palette",
     LetterSpacing => "letter-spacing",
     WordSpacing => "word-spacing",
     Float => "float",
@@ -89,7 +88,6 @@ renderer_property_ids! {
 impl RendererPropertyId {
     pub(crate) fn from_lightning(id: &PropertyId<'_>) -> Option<Self> {
         match id {
-            PropertyId::FontPalette => Some(Self::FontPalette),
             PropertyId::LetterSpacing => Some(Self::LetterSpacing),
             PropertyId::WordSpacing => Some(Self::WordSpacing),
             PropertyId::Custom(name) => Self::from_name(name.as_ref()),

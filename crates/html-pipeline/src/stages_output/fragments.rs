@@ -26,7 +26,7 @@ pub struct RenderDecoration {
     rect: Rect,
     color: u32,
     is_inline: bool,
-    radii: Option<UsedBorderRadii>,
+    radii: Option<CornerRadii>,
     border_width: Option<f32>,
     is_foreground: bool,
     is_background: bool,
@@ -81,7 +81,7 @@ impl RenderDecoration {
         self.is_inline
     }
 
-    pub fn radii(&self) -> Option<UsedBorderRadii> {
+    pub fn radii(&self) -> Option<CornerRadii> {
         self.radii
     }
 
@@ -379,6 +379,16 @@ pub struct RenderFragmentView<'a> {
 }
 
 impl<'a> RenderFragmentView<'a> {
+    pub fn line_paint_rank(self, line: usize) -> Option<u32> {
+        self.doc
+            .layout_state
+            .fragment_output
+            .scene_paint_order
+            .line_ranks()
+            .get(line)
+            .copied()
+    }
+
     /// Interleaves positioned decorations and content without consulting
     /// execution scratch or inferring stacking order from screen geometry.
     pub fn paint_order(self) -> impl Iterator<Item = RenderPaintItem> + 'a {
@@ -416,8 +426,11 @@ impl<'a> RenderFragmentView<'a> {
             .chain(block_decorations);
         let mut ranks = lines
             .iter()
-            .filter_map(|&line| output.scene_line_ranks.get(line))
-            .chain(decoration_indices.filter_map(|&index| output.scene_decoration_ranks.get(index)))
+            .filter_map(|&line| output.scene_paint_order.line_ranks().get(line))
+            .chain(
+                decoration_indices
+                    .filter_map(|&index| output.scene_paint_order.decoration_ranks().get(index)),
+            )
             .copied()
             .filter(|rank| *rank != u32::MAX)
             .collect::<Vec<_>>();

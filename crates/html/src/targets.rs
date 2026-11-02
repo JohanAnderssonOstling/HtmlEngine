@@ -55,7 +55,11 @@ impl crate::engine::Engine {
     /// Resolve a link through the document's resource provider. Whether to
     /// navigate, open a popup, or launch another application is a host decision.
     pub fn resolve_link(&self, href: &str) -> Option<ResolvedLink> {
-        let base = &self.inputs()?.base_uri;
+        let base = self
+            .document()?
+            .document()
+            .resource_base_uri()
+            .unwrap_or(&self.inputs()?.base_uri);
         Some(resolve_link(self.provider.as_ref(), base, href))
     }
 }

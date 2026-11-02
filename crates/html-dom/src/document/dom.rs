@@ -46,6 +46,8 @@ pub enum DocumentBuildError {
     RecursionCycle { raw: u32 },
     UnreachableNodes { raw: u32 },
     TooManyNodes,
+    TooManyStrings,
+    TooManyClasses,
 }
 
 impl fmt::Display for DocumentBuildError {
@@ -74,6 +76,8 @@ impl fmt::Display for DocumentBuildError {
             Self::RecursionCycle { raw } => write!(formatter, "recursion cycle detected near node {raw}"),
             Self::UnreachableNodes { raw } => write!(formatter, "node {raw} is not reachable from root"),
             Self::TooManyNodes => formatter.write_str("document has too many nodes"),
+            Self::TooManyStrings => formatter.write_str("document exceeds the 65536 distinct DOM string limit"),
+            Self::TooManyClasses => formatter.write_str("document exceeds the 65535 class occurrence limit"),
         }
     }
 }
@@ -135,6 +139,10 @@ impl<State> DocumentBuilder<State> {
         self.document.strings.intern(value)
     }
 
+    pub fn try_intern_string(&mut self, value: &str) -> Result<u16, DocumentBuildError> {
+        self.document.strings.try_intern(value)
+    }
+
     pub fn images(&self) -> &[crate::ImageResource] {
         &self.document.images
     }
@@ -149,6 +157,10 @@ impl<State> DocumentBuilder<State> {
 
     pub fn intern_classes(&mut self, classes: Option<&str>) -> Range<u16> {
         self.document.intern_classes(classes)
+    }
+
+    pub fn try_intern_classes(&mut self, classes: Option<&str>) -> Result<Range<u16>, DocumentBuildError> {
+        self.document.try_intern_classes(classes)
     }
 }
 
@@ -976,15 +988,29 @@ impl Document {
     }
 
     pub fn intern_classes(&mut self, classes: Option<&str>) -> Range<u16> {
-        let start = self.class_list.len() as u16;
+        self.try_intern_classes(classes).expect("DOM class capacity exhausted")
+    }
+
+    pub fn try_intern_classes(&mut self, classes: Option<&str>) -> Result<Range<u16>, DocumentBuildError> {
+        let start = self.class_list.len();
         if let Some(classes) = classes {
             for class in classes.split_whitespace() {
-                let idx = self.strings.intern(class);
+                if self.class_list.len() == usize::from(u16::MAX) {
+                    self.class_list.truncate(start);
+                    return Err(DocumentBuildError::TooManyClasses);
+                }
+                let idx = match self.strings.try_intern(class) {
+                    Ok(idx) => idx,
+                    Err(error) => {
+                        self.class_list.truncate(start);
+                        return Err(error);
+                    }
+                };
                 self.class_list.push(idx);
             }
         }
         let end = self.class_list.len() as u16;
-        start..end
+        Ok(start as u16..end)
     }
 }
 

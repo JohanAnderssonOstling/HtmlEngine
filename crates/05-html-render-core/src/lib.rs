@@ -2,14 +2,15 @@ mod document;
 pub use document::{DocumentPainter, LinePlacement, PaintFragment, PaintProjection, ProjectedLine, RegionProjection};
 
 use html_pipeline::GlyphResourceStore;
+pub use html_pipeline::engine::CornerRadii;
 use html_pipeline::engine::{
     GlyphHandle, GlyphShaper, LaidOutDocument, PreparedTextRunFragment,
-    RenderView, TextRunId, UsedBorderRadii,
+    RenderView, TextRunId,
 };
 use html_pipeline::{
     FontEnvironmentRevision, ImageMetricsRevision, LayoutConstraints, PaintSettingsRevision,
-    PipelineInputs, PipelineSession, ResourceRevision, SourceRevision, StyleEnvironment,
-    StylesheetRevision,
+    PipelineInputs, PipelineSession, ResourceRevision, RootFontSize, SourceRevision,
+    StyleEnvironment, StylesheetRevision,
 };
 use html_resources::ResourceProvider;
 use kurbo::{Point, Rect, Size};
@@ -73,20 +74,20 @@ fn pixel_snapper(scale: f64) -> impl Fn(f64) -> f64 {
 
 pub trait Painter {
     /// Restricts subsequent paint operations until the matching `pop_clip`.
-    /// Legacy adapters keep their previous behavior until they opt in.
-    fn push_clip(&mut self, _rect: Rect) {}
-    fn pop_clip(&mut self) {}
+    /// Implementations must intersect nested clips and restore them on pop.
+    fn push_clip(&mut self, rect: Rect);
+    fn pop_clip(&mut self);
     fn fill_rect(&mut self, rect: Rect, color: Color);
     /// Optional rounded primitive. Existing adapters intentionally get a safe
     /// square fallback, so adding CSS radius support is not a breaking change.
-    fn fill_rounded_rect(&mut self, rect: Rect, _radii: UsedBorderRadii, color: Color) {
+    fn fill_rounded_rect(&mut self, rect: Rect, _radii: CornerRadii, color: Color) {
         self.fill_rect(rect, color);
     }
     /// Optional uniform solid rounded border primitive.
     fn stroke_rounded_rect(
         &mut self,
         rect: Rect,
-        _radii: UsedBorderRadii,
+        _radii: CornerRadii,
         width: f32,
         color: Color,
     ) {
@@ -105,6 +106,7 @@ pub trait Painter {
     }
     /// Draw a native glyph at its baseline using the resolved RGBA foreground color.
     fn draw_glyph(&mut self, glyph: GlyphHandle, origin: Point, color: u32);
+    /// True requires range-aware fragment drawing or a prepared-batch override.
     fn supports_text_runs(&self) -> bool {
         false
     }
@@ -112,12 +114,12 @@ pub trait Painter {
     fn draw_text_run(&mut self, _run: TextRunId, _origin: Point, _color: Option<u32>) {}
     fn draw_text_run_fragment(
         &mut self,
-        run: TextRunId,
+        _run: TextRunId,
         _range: Range<u32>,
-        origin: Point,
-        color: Option<u32>,
+        _origin: Point,
+        _color: Option<u32>,
     ) {
-        self.draw_text_run(run, origin, color);
+        panic!("native text painters must implement range-aware fragments or prepared batches");
     }
     /// Draws the positioned run fragments that make up one text line.
     ///
@@ -184,8 +186,8 @@ pub struct RecordingPainter {
     pub images: Vec<Rect>,
     pub svgs: Vec<Rect>,
     pub resource_images: Vec<(u32, Option<String>, Rect)>,
-    pub rounded_fills: Vec<(Rect, UsedBorderRadii, Color)>,
-    pub rounded_borders: Vec<(Rect, UsedBorderRadii, f32, Color)>,
+    pub rounded_fills: Vec<(Rect, CornerRadii, Color)>,
+    pub rounded_borders: Vec<(Rect, CornerRadii, f32, Color)>,
 }
 
 impl Painter for RecordingPainter {
@@ -201,14 +203,14 @@ impl Painter for RecordingPainter {
         self.fills.push((rect, color));
     }
 
-    fn fill_rounded_rect(&mut self, rect: Rect, radii: UsedBorderRadii, color: Color) {
+    fn fill_rounded_rect(&mut self, rect: Rect, radii: CornerRadii, color: Color) {
         self.rounded_fills.push((rect, radii, color));
     }
 
     fn stroke_rounded_rect(
         &mut self,
         rect: Rect,
-        radii: UsedBorderRadii,
+        radii: CornerRadii,
         width: f32,
         color: Color,
     ) {
@@ -246,12 +248,12 @@ pub enum RenderCommand {
     },
     RoundedFill {
         rect: Rect,
-        radii: UsedBorderRadii,
+        radii: CornerRadii,
         color: Color,
     },
     RoundedBorder {
         rect: Rect,
-        radii: UsedBorderRadii,
+        radii: CornerRadii,
         width: f32,
         color: Color,
     },
@@ -270,6 +272,7 @@ pub enum RenderCommand {
         hash: Vec<u8>,
         intrinsic_size: (u32, u32),
         rect: Rect,
+        text_color: Option<u32>,
     },
     ResourceImage {
         image_idx: u32,
@@ -284,6 +287,7 @@ pub struct RenderScene {
     content_height: f64,
     clipped: bool,
     commands: Arc<[RenderCommand]>,
+    resources: Option<html_pipeline::engine::RenderResourceLease>,
 }
 
 impl RenderScene {
@@ -307,7 +311,16 @@ impl RenderScene {
         &self.commands
     }
 
-    pub fn paint(&self, painter: &mut impl Painter) {
+    /// Whether the originating document still publishes these paint products.
+    pub fn is_valid(&self) -> bool {
+        self.resources.as_ref().is_none_or(|lease| lease.is_valid())
+    }
+
+    /// Returns false without submitting commands after resource invalidation.
+    pub fn paint(&self, painter: &mut impl Painter) -> bool {
+        if !self.is_valid() {
+            return false;
+        }
         for command in self.commands.iter() {
             match command {
                 RenderCommand::PushClip { rect } => painter.push_clip(*rect),
@@ -335,7 +348,13 @@ impl RenderScene {
                     hash,
                     intrinsic_size,
                     rect,
-                } => painter.draw_svg(bytes, hash, *intrinsic_size, *rect),
+                    text_color,
+                } => match text_color {
+                    Some(color) => {
+                        painter.draw_math_svg(bytes, hash, *intrinsic_size, *rect, *color)
+                    }
+                    None => painter.draw_svg(bytes, hash, *intrinsic_size, *rect),
+                },
                 RenderCommand::ResourceImage {
                     image_idx,
                     uri,
@@ -343,6 +362,7 @@ impl RenderScene {
                 } => painter.draw_resource_image(*image_idx, uri.as_deref(), *rect),
             }
         }
+        true
     }
 }
 
@@ -364,7 +384,7 @@ pub struct FragmentRenderOptions {
     viewport_width: f64,
     maximum_height: Option<f64>,
     line_height: f64,
-    root_font_size: u32,
+    root_font_size: RootFontSize,
     base_uri: String,
     user_styles: Vec<String>,
     image_policy: FragmentImagePolicy,
@@ -389,7 +409,7 @@ impl FragmentRenderOptions {
             viewport_width,
             maximum_height,
             line_height: 16.0,
-            root_font_size: 16,
+            root_font_size: RootFontSize::default(),
             base_uri: "fragment.xhtml".to_owned(),
             user_styles: Vec::new(),
             image_policy: FragmentImagePolicy::default(),
@@ -401,7 +421,9 @@ impl FragmentRenderOptions {
         root_font_size: u32,
         line_height: f64,
     ) -> Result<Self, FragmentRenderError> {
-        if root_font_size == 0 || !line_height.is_finite() || line_height <= 0.0 {
+        let root_font_size = RootFontSize::new(root_font_size as f32)
+            .map_err(|error| FragmentRenderError::new(error.to_string()))?;
+        if !line_height.is_finite() || line_height <= 0.0 {
             return Err(FragmentRenderError::new(
                 "fragment typography must use a positive font size and line height",
             ));
@@ -470,7 +492,7 @@ impl FragmentRenderOptions {
         self.line_height
     }
 
-    pub fn root_font_size(&self) -> u32 {
+    pub fn root_font_size(&self) -> RootFontSize {
         self.root_font_size
     }
 
@@ -533,10 +555,6 @@ impl Default for FragmentRenderer {
 }
 
 impl FragmentRenderer {
-    pub fn glyph_resources_mut(&mut self) -> &mut GlyphResourceStore {
-        self.session.glyph_resources_mut()
-    }
-
     pub fn glyph_resources(&self) -> &GlyphResourceStore {
         self.session.glyph_resources()
     }
@@ -596,17 +614,13 @@ impl FragmentRenderer {
                     options.maximum_height,
                 )
                 .expect("validated fragment dimensions must form a media environment"),
-                direction: 0,
             },
             font_environment: self.font_revision,
             image_metrics_revision: self.image_metrics_revision,
-            layout: LayoutConstraints {
-                viewport_width: options.viewport_width,
-                viewport_height: options.maximum_height,
-                line_height: options.line_height,
-                image_sizing_policy: html_pipeline::ImageSizingPolicy::WebCompatible,
-                text_composition_policy: html_pipeline::TextCompositionPolicy::WebCompatible,
-            },
+            layout: LayoutConstraints::new(options.viewport_width, options.line_height)
+                .map_err(|error| FragmentRenderError::new(error.to_string()))?
+                .with_viewport_height(options.maximum_height)
+                .map_err(|error| FragmentRenderError::new(error.to_string()))?,
             image_metrics: Default::default(),
             paint: PaintSettingsRevision::INITIAL,
         };
@@ -677,7 +691,7 @@ pub fn paint_line_glyph_fragment<'a>(
     painter: &mut impl Painter,
 ) {
     let document = document.into();
-    if !fragment.visible() {
+    if !document.paint_resources_valid() || !fragment.visible() {
         return;
     }
     let text = document.text();
@@ -713,7 +727,8 @@ pub fn paint_line_glyph_fragment<'a>(
 /// Paints a line from document-owned native shaping resources. Layout
 /// placement adjustments are represented as positioned slices of those runs;
 /// they never require abandoning retained shaping. Returns false only when the
-/// painter has no native-run support or shaping coverage is incomplete.
+/// resources are invalid, the painter has no native-run support, or shaping
+/// coverage is incomplete.
 pub fn paint_line_text_runs<'a>(
     document: impl Into<RenderView<'a>>,
     line_idx: usize,
@@ -723,7 +738,7 @@ pub fn paint_line_text_runs<'a>(
     painter: &mut impl Painter,
 ) -> bool {
     let document = document.into();
-    if !painter.supports_text_runs() {
+    if !document.paint_resources_valid() || !painter.supports_text_runs() {
         return false;
     }
     let Some(fragments) = document.text().prepared_text_runs(line_idx) else {
@@ -746,6 +761,9 @@ pub fn paint_line_ellipsis<'a>(
     painter: &mut impl Painter,
 ) {
     let document = document.into();
+    if !document.paint_resources_valid() {
+        return;
+    }
     let text = document.text();
     let Some(line) = text.line(line_idx) else {
         return;
@@ -801,7 +819,15 @@ impl RenderScene {
     }
 
     pub fn for_view(view: RenderView<'_>, options: &FragmentRenderOptions) -> Self {
-        build_fragment_view(view, options)
+        build_fragment_view(view, options, None)
+    }
+
+    pub fn for_view_with_images(
+        view: RenderView<'_>,
+        options: &FragmentRenderOptions,
+        images: &html_resources::ImagePipeline,
+    ) -> Self {
+        build_fragment_view(view, options, Some(images))
     }
 }
 
@@ -810,10 +836,14 @@ fn build_fragment_scene(
     options: &FragmentRenderOptions,
     resources: &GlyphResourceStore,
 ) -> RenderScene {
-    build_fragment_view(document.render_view(resources), options)
+    build_fragment_view(document.render_view(resources), options, None)
 }
 
-fn build_fragment_view(view: RenderView<'_>, options: &FragmentRenderOptions) -> RenderScene {
+fn build_fragment_view(
+    view: RenderView<'_>,
+    options: &FragmentRenderOptions,
+    images: Option<&html_resources::ImagePipeline>,
+) -> RenderScene {
     let text = view.text();
     let fragments = view.fragments();
     let natural_height = text
@@ -834,6 +864,9 @@ fn build_fragment_view(view: RenderView<'_>, options: &FragmentRenderOptions) ->
     let clip = Rect::new(0.0, 0.0, options.viewport_width, height);
     let mut recorder = SceneRecorder::default();
     let mut painter = DocumentPainter::new(view);
+    if let Some(images) = images {
+        painter = painter.with_images(images);
+    }
     painter.image_policy = options.image_policy;
     painter.paint_region(clip, Point::ORIGIN, &mut recorder);
     RenderScene {
@@ -841,6 +874,7 @@ fn build_fragment_view(view: RenderView<'_>, options: &FragmentRenderOptions) ->
         content_height: natural_height,
         clipped: height < natural_height,
         commands: recorder.commands.into(),
+        resources: view.retain_paint_resources(),
     }
 }
 
@@ -870,7 +904,7 @@ pub fn paint_projected_decoration(
     painter: &mut impl Painter,
     decoration: &html_pipeline::engine::RenderDecoration,
     rect: Rect,
-    radii: Option<UsedBorderRadii>,
+    radii: Option<CornerRadii>,
 ) {
     use html_pipeline::engine::RenderDecorationPattern;
 
@@ -931,7 +965,7 @@ pub fn paint_decoration_style(
     painter: &mut impl Painter,
     rect: Rect,
     color: u32,
-    radii: Option<UsedBorderRadii>,
+    radii: Option<CornerRadii>,
     border_width: Option<f32>,
 ) {
     let color = color_from_u32(color);
@@ -960,7 +994,7 @@ impl Painter for SceneRecorder {
         self.commands.push(RenderCommand::Fill { rect, color });
     }
 
-    fn fill_rounded_rect(&mut self, rect: Rect, radii: UsedBorderRadii, color: Color) {
+    fn fill_rounded_rect(&mut self, rect: Rect, radii: CornerRadii, color: Color) {
         self.commands
             .push(RenderCommand::RoundedFill { rect, radii, color });
     }
@@ -968,7 +1002,7 @@ impl Painter for SceneRecorder {
     fn stroke_rounded_rect(
         &mut self,
         rect: Rect,
-        radii: UsedBorderRadii,
+        radii: CornerRadii,
         width: f32,
         color: Color,
     ) {
@@ -1002,6 +1036,24 @@ impl Painter for SceneRecorder {
             hash: hash.to_vec(),
             intrinsic_size,
             rect,
+            text_color: None,
+        });
+    }
+
+    fn draw_math_svg(
+        &mut self,
+        bytes: &[u8],
+        hash: &[u8],
+        intrinsic_size: (u32, u32),
+        rect: Rect,
+        color: u32,
+    ) {
+        self.commands.push(RenderCommand::Svg {
+            bytes: Arc::from(bytes),
+            hash: hash.to_vec(),
+            intrinsic_size,
+            rect,
+            text_color: Some(color),
         });
     }
 
@@ -1043,7 +1095,7 @@ mod tests {
     use html_pipeline::engine::GlyphResourceGeneration;
     use html_pipeline::engine::{GlyphId, GlyphRequest, ShapedGlyph};
     use html_pipeline::engine::{
-        GlyphMetric, ShapeError, ShapedTextRun, TextDirection, TextRunShapeRequest,
+        GlyphMetric, ShapeError, ShapedRun, ShapedTextRun, TextDirection, TextRunShapeRequest,
     };
     use std::collections::HashMap;
 
@@ -1082,13 +1134,13 @@ mod tests {
         }
 
         fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
-            let key = (request.character, request.font_size.to_bits());
-            let metric = GlyphMetric::try_new(
+            let key = (request.character, request.style.font_size.to_bits());
+            let metric = GlyphMetric::new(
                 request.character,
-                request.font_size * 0.5,
-                request.font_size * 0.75,
-                request.font_size * 0.25,
-            )?;
+                request.style.font_size * 0.5,
+                request.style.font_size * 0.75,
+                request.style.font_size * 0.25,
+            );
             if let Some(glyph) = self.glyphs.get(&key) {
                 return Ok(ShapedGlyph::from_metric(*glyph, metric));
             }
@@ -1114,7 +1166,7 @@ mod tests {
                 &mut self,
                 _request: GlyphRequest<'_>,
             ) -> Result<ShapedGlyph, ShapeError> {
-                Ok(ShapedGlyph::new(700, 8.0, FontMetrics::new(12.0, 4.0).unwrap()).unwrap())
+                Ok(ShapedGlyph::new(700, 8.0, FontMetrics::new(12.0, 4.0)))
             }
         }
         let mut renderer = FragmentRenderer::new();
@@ -1183,18 +1235,21 @@ mod tests {
 
     #[test]
     fn standard_shaper_restores_native_resources_when_rendering_fails() {
-        use html_pipeline::{FontMetrics, GlyphMetricError, GlyphResources, ResourceShaper};
+        use html_pipeline::{FontMetrics, GlyphResources, ResourceShaper, ShapeError};
         let mut shaper = ResourceShaper::new(|request, resources: &mut GlyphResources<char>| {
             if request.character == '!' {
-                return Err(GlyphMetricError::NegativeValue {
-                    field: "advance",
-                    value: -1.0,
-                }
-                .into());
+                return Err(ShapeError::registry_capacity_exhausted(0));
             }
-            let metrics = FontMetrics::new(request.font_size * 0.75, request.font_size * 0.25)?;
+            let metrics = FontMetrics::new(
+                request.style.font_size * 0.75,
+                request.style.font_size * 0.25,
+            );
             let handle = resources.insert(request.character)?;
-            Ok(ShapedGlyph::new(handle, request.font_size * 0.5, metrics)?)
+            Ok(ShapedGlyph::new(
+                handle,
+                request.style.font_size * 0.5,
+                metrics,
+            ))
         });
         let mut renderer = FragmentRenderer::new();
         let options = FragmentRenderOptions::new(200.0, None).unwrap();
@@ -1261,10 +1316,10 @@ mod tests {
             self.fallback.shape_glyph(request)
         }
 
-        fn shape_text_run(
+        fn shape_run(
             &mut self,
             request: TextRunShapeRequest<'_>,
-        ) -> Result<Option<ShapedTextRun>, ShapeError> {
+        ) -> Result<Option<ShapedRun>, ShapeError> {
             let count = request.text().chars().count();
             let advances: Vec<f32> = request.text().chars().map(|character| {
                 if matches!(character, '\u{00ad}' | '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') { 0.0 } else { 8.0 }
@@ -1276,20 +1331,20 @@ mod tests {
                 x += advance;
                 caret_stops.push(x);
             }
-            if request.style().direction() == TextDirection::Rtl {
+            if request.style().direction == TextDirection::Rtl {
                 for stop in &mut caret_stops {
                     *stop = x - *stop;
                 }
             }
             let run = self.next_run;
             self.next_run += 1;
-            Ok(ShapedTextRun::with_backend_run(
+            Ok(Some(ShapedRun::geometry(ShapedTextRun::with_backend_run(
                 Arc::from(advances),
                 Arc::from(vec![true; count + 1]),
                 run,
                 caret_stops.into(),
                 12.0,
-            ))
+            ))))
         }
     }
 
@@ -1298,6 +1353,8 @@ mod tests {
         #[derive(Default)]
         struct BaselinePainter(Vec<Point>);
         impl Painter for BaselinePainter {
+            fn push_clip(&mut self, _: Rect) {}
+            fn pop_clip(&mut self) {}
             fn fill_rect(&mut self, _: Rect, _: Color) {}
             fn draw_glyph(&mut self, _: GlyphHandle, _: Point, _color: u32) {
                 panic!("expected native run painting");
@@ -1305,7 +1362,13 @@ mod tests {
             fn supports_text_runs(&self) -> bool {
                 true
             }
-            fn draw_text_run(&mut self, _: TextRunId, origin: Point, _: Option<u32>) {
+            fn draw_text_run_fragment(
+                &mut self,
+                _: TextRunId,
+                _: Range<u32>,
+                origin: Point,
+                _: Option<u32>,
+            ) {
                 self.0.push(origin);
             }
             fn draw_image(&mut self, _: &Image, _: &[u8], _: Rect) {}
@@ -1350,6 +1413,8 @@ mod tests {
     }
 
     impl Painter for PreparedBatchPainter {
+        fn push_clip(&mut self, _: Rect) {}
+        fn pop_clip(&mut self) {}
         fn fill_rect(&mut self, _rect: Rect, _color: Color) {}
 
         fn draw_glyph(&mut self, _glyph: GlyphId, _origin: Point, _color: u32) {
@@ -1382,6 +1447,8 @@ mod tests {
     }
 
     impl Painter for ColorPainter {
+        fn push_clip(&mut self, _: Rect) {}
+        fn pop_clip(&mut self) {}
         fn fill_rect(&mut self, _: Rect, _: Color) {}
 
         fn draw_glyph(&mut self, _: GlyphId, _: Point, color: u32) {
@@ -1885,6 +1952,8 @@ mod tests {
     }
 
     impl Painter for LegacyPainter {
+        fn push_clip(&mut self, _: Rect) {}
+        fn pop_clip(&mut self) {}
         fn fill_rect(&mut self, _rect: Rect, _color: Color) {
             self.fills += 1;
         }
@@ -1898,7 +1967,7 @@ mod tests {
     fn rounded_primitives_are_optional_for_painter_implementers() {
         let mut painter = LegacyPainter::default();
         let rect = Rect::new(0.0, 0.0, 20.0, 20.0);
-        let radii = UsedBorderRadii {
+        let radii = CornerRadii {
             top_left: (4.0, 4.0),
             top_right: (4.0, 4.0),
             bottom_right: (4.0, 4.0),

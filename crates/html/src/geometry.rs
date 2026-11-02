@@ -6,9 +6,7 @@ use crate::targets::{LinkTarget, Targets};
 use kurbo::{Point, Rect};
 use std::ops::Range;
 
-/// A caller-chosen position for a document line. It can belong to a scrolled
-/// surface, a page, a popup, or another arrangement of the same document.
-pub use crate::render::LinePlacement;
+use crate::render::LinePlacement;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TextHit {
@@ -70,6 +68,41 @@ pub struct Geometry<'a> {
 }
 
 impl<'a> Geometry<'a> {
+    fn point_placements(self, point: Point) -> impl Iterator<Item = LinePlacement> + 'a {
+        self.view
+            .geometry()
+            .lines_at_y(point.y)
+            .filter_map(move |id| {
+                let line = self.view.text().line(id.index())?;
+                Some(LinePlacement {
+                    line: id.index(),
+                    origin: line.point(),
+                })
+            })
+    }
+
+    fn paint_rank(self, line: usize) -> u32 {
+        self.view.fragments().line_paint_rank(line).unwrap_or(0)
+    }
+
+    fn content_hits(
+        self,
+        point: Point,
+        placements: &[LinePlacement],
+    ) -> (Option<TextHit>, Option<(ImageHit, usize, usize)>) {
+        let mut text = self.ink_hit(point, placements);
+        let mut image = self.image_hit_at_lines(point, placements.iter().copied());
+        if let (Some(text_hit), Some((_, _, image_line))) = (text, image) {
+            // Images paint before text on a shared carrier line.
+            if self.paint_rank(text_hit.line) >= self.paint_rank(image_line) {
+                image = None;
+            } else {
+                text = None;
+            }
+        }
+        (text, image)
+    }
+
     fn line_placements(self) -> impl Iterator<Item = LinePlacement> + 'a {
         self.view.text().lines().iter().map(|line| LinePlacement {
             line: line.index(),
@@ -153,7 +186,7 @@ impl<'a> Geometry<'a> {
     }
 
     pub fn content_at(self, point: Point) -> Option<ContentHit<'a>> {
-        self.content_at_lines(point, self.line_placements(), |index| {
+        self.content_at_lines(point, self.point_placements(point), |index| {
             self.box_contains(index, point)
         })
     }
@@ -170,13 +203,13 @@ impl<'a> Geometry<'a> {
             return None;
         }
         let placements: Vec<_> = placements.into_iter().collect();
-        let text = self.ink_hit(point, &placements);
-        let image_hit = self.image_hit_at_lines(point, placements);
+        let (text, image_hit) = self.content_hits(point, &placements);
         let targets = Targets::new(self.view);
-        let link = image_hit
-            .and_then(|(_, box_idx)| targets.box_link(box_idx))
-            .or_else(|| text.and_then(|hit| targets.link(hit.glyph)));
-        let image = image_hit.map(|(image, _)| image);
+        let link = match image_hit {
+            Some((_, box_idx, _)) => targets.box_link(box_idx),
+            None => text.and_then(|hit| targets.link(hit.glyph)),
+        };
+        let image = image_hit.map(|(image, _, _)| image);
         let table = self.table_at_where(contains_box);
         (text.is_some() || image.is_some() || table.is_some()).then_some(ContentHit {
             text,
@@ -187,7 +220,7 @@ impl<'a> Geometry<'a> {
     }
 
     pub fn link_at(self, point: Point) -> Option<LinkTarget<'a>> {
-        self.link_at_lines(point, self.line_placements())
+        self.link_at_lines(point, self.point_placements(point))
     }
 
     /// Link-only hover queries avoid traversing unrelated table cells.
@@ -201,12 +234,11 @@ impl<'a> Geometry<'a> {
         }
         let placements: Vec<_> = placements.into_iter().collect();
         let targets = Targets::new(self.view);
-        self.image_hit_at_lines(point, placements.iter().copied())
-            .and_then(|(_, box_idx)| targets.box_link(box_idx))
-            .or_else(|| {
-                self.ink_hit(point, &placements)
-                    .and_then(|hit| targets.link(hit.glyph))
-            })
+        let (text, image) = self.content_hits(point, &placements);
+        match image {
+            Some((_, box_idx, _)) => targets.box_link(box_idx),
+            None => text.and_then(|hit| targets.link(hit.glyph)),
+        }
     }
 
     fn ink_hit(self, point: Point, placements: &[LinePlacement]) -> Option<TextHit> {
@@ -565,7 +597,12 @@ impl<'a> Geometry<'a> {
                 })
                 .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
             if let Some((candidate, x)) = nearest {
-                if candidate < distance {
+                if candidate < distance
+                    || (candidate == distance
+                        && best.is_some_and(|(previous, _): (LinePlacement, f64)| {
+                            self.paint_rank(placement.line) > self.paint_rank(previous.line)
+                        }))
+                {
                     distance = candidate;
                     best = Some((placement, x));
                 }
@@ -599,7 +636,7 @@ impl<'a> Geometry<'a> {
     }
 
     pub fn image_at(self, point: Point) -> Option<u32> {
-        self.image_at_lines(point, self.line_placements())
+        self.image_at_lines(point, self.point_placements(point))
     }
 
     /// Find a table cell in document coordinates, including its spanned rows
@@ -615,17 +652,22 @@ impl<'a> Geometry<'a> {
     /// and span interpretation. This also supports cells split across regions.
     pub fn table_at_where(self, mut contains_box: impl FnMut(usize) -> bool) -> Option<TableHit> {
         let boxes = self.view.boxes();
+        let mut hit: Option<(TableHit, usize)> = None;
         for table_box in (0..boxes.len()).filter(|&index| boxes.is_table(index)) {
             let Some(table) = boxes.table(table_box) else {
                 continue;
             };
             for cell in table.cells() {
                 if contains_box(cell.box_idx()) {
-                    return Some(TableHit::from_cell(table_box, cell));
+                    if hit.as_ref().is_none_or(|previous| {
+                        self.view.semantics().contains(previous.1, cell.box_idx())
+                    }) {
+                        hit = Some((TableHit::from_cell(table_box, cell), cell.box_idx()));
+                    }
                 }
             }
         }
-        None
+        hit.map(|(hit, _)| hit)
     }
 
     pub fn image_at_lines(
@@ -634,14 +676,15 @@ impl<'a> Geometry<'a> {
         placements: impl IntoIterator<Item = LinePlacement>,
     ) -> Option<u32> {
         self.image_hit_at_lines(point, placements)
-            .map(|(hit, _)| hit.image)
+            .map(|(hit, _, _)| hit.image)
     }
 
     fn image_hit_at_lines(
         self,
         point: Point,
         placements: impl IntoIterator<Item = LinePlacement>,
-    ) -> Option<(ImageHit, usize)> {
+    ) -> Option<(ImageHit, usize, usize)> {
+        let mut best = None;
         for placement in placements {
             let Some(line) = self.view.text().line(placement.line) else {
                 continue;
@@ -653,16 +696,22 @@ impl<'a> Geometry<'a> {
                 let visible = clip.map_or(visible, |clip| clip.apply_to(visible - delta) + delta);
                 if visible.width() > 0.0 && visible.height() > 0.0 && visible.contains(point) {
                     let index = image.image_idx();
-                    return Some((
+                    if best.is_some_and(|(_, _, line)| {
+                        self.paint_rank(line) > self.paint_rank(placement.line)
+                    }) {
+                        continue;
+                    }
+                    best = Some((
                         ImageHit {
                             image: index,
                             is_equation: self.view.export().is_equation(index),
                         },
                         image.box_idx(),
+                        placement.line,
                     ));
                 }
             }
         }
-        None
+        best
     }
 }

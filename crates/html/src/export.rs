@@ -3,7 +3,6 @@
 use crate::layout::RenderView;
 use crate::resources::{DecodedImage, ImagePipeline};
 use crate::selection::{Selection, TableCellRange, table_selection_markdown};
-pub use html_pipeline::engine::{RenderExportView, RenderTable};
 use std::ops::Range;
 
 /// Content identities use document-local logical ranges and resource/box IDs.

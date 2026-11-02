@@ -69,10 +69,6 @@ pub(crate) fn declaration_syntax_impl(property: Option<&Property<'_>>) -> Proper
         Some(property @ Property::Unparsed(raw))
             if super::native_fallback::applies_to(&raw.property_id)
                 && super::native_fallback::parse(property).is_some() => PropertySyntax::Valid,
-        Some(Property::Unparsed(raw)) if raw.property_id == PropertyId::FontPalette
-            && super::renderer_owned::font_palette_keyword(&raw.value).is_some() => {
-            PropertySyntax::Valid
-        }
         Some(Property::Unparsed(raw)) if !super::substitution::needs_substitution(&raw.value) => {
             PropertySyntax::Invalid
         }
