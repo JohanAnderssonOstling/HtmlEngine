@@ -1,3 +1,5 @@
+use html_engine_model::shaping::requires_first_line_shaper;
+use crate::engine::text_paint;
 use crate::engine::{GlyphResourceStore, ImageMetrics, LayoutConstraints};
 use crate::test_support::{DocumentFactory, TestGlyphShaper};
 
@@ -6,6 +8,43 @@ fn first_line_document() -> crate::PreparedDocument<'static> {
         "<!doctype html><p>aa aa aa aa aa</p>",
         Some("html,body,p {margin:0} p {font-size:10px} p::first-line {font-size:20px}"),
     )
+}
+
+#[test]
+fn first_line_spacing_keeps_suppressed_characters_zero_width() {
+    for (base_spacing, first_line_spacing) in [(0, 2), (2, 0)] {
+        let css = format!(
+            "html,body,p {{margin:0}} p {{letter-spacing:{base_spacing}px}} \
+             p::first-line {{letter-spacing:{first_line_spacing}px}}"
+        );
+        let prepared = DocumentFactory::new()
+            .parse_with_new_pipeline("<p>A\u{00ad}B\u{200e}C</p>", Some(&css));
+        let mut shaper = TestGlyphShaper::new();
+        let mut resources = GlyphResourceStore::default();
+        let document = prepared
+            .shape_and_layout(
+                LayoutConstraints::new(1000.0, 16.0).unwrap(),
+                &mut shaper,
+                &mut resources,
+            )
+            .unwrap();
+        let text = document.render_view(&resources).text();
+        let metric =
+            text_paint::glyph_metric(text, text_paint::glyph_at(text, 0).unwrap()).unwrap();
+        assert_eq!(
+            text_paint::character_advance(text, 0),
+            Some(metric.advance() + (first_line_spacing - base_spacing) as f32),
+            "the first-line spacing adjustment must be active"
+        );
+        for index in [1, 3] {
+            assert_eq!(
+                text_paint::character_advance(text, index),
+                Some(0.0),
+                "{css}, index {index}"
+            );
+            assert_eq!(text_paint::paint_glyph_at(text, index), None);
+        }
+    }
 }
 
 #[test]
@@ -22,7 +61,7 @@ fn static_layout_cannot_skip_required_first_line_shaping() {
     let Err(error) = result else {
         panic!("a shaper is required for first-line styles")
     };
-    assert!(error.requires_first_line_shaper());
+    assert!(requires_first_line_shaper(&error));
 }
 
 #[test]
@@ -39,39 +78,33 @@ fn rejected_static_resize_preserves_the_published_document() {
             .text()
             .lines()
             .iter()
-            .map(|line| (line.glyphs(), line.point(), line.height()))
+            .map(|line| (text_paint::render_line_glyphs(&line), line.point(), line.height()))
             .collect::<Vec<_>>()
     };
     let before = snapshot(&document, &document_resources);
-    assert!(
-        document
-            .relayout(changed, &document_resources)
-            .unwrap_err()
-            .requires_first_line_shaper()
-    );
+    assert!(requires_first_line_shaper(
+        &document.relayout(changed, &document_resources).unwrap_err()
+    ));
     assert_eq!(snapshot(&document, &document_resources), before);
-    assert!(
-        document
+    assert!(requires_first_line_shaper(
+        &document
             .relayout_with_metrics(changed, &ImageMetrics::default(), &document_resources)
             .unwrap_err()
-            .requires_first_line_shaper()
-    );
-    assert!(
-        document
+    ));
+    assert!(requires_first_line_shaper(
+        &document
             .relayout_with_timings(changed, &document_resources)
             .unwrap_err()
-            .requires_first_line_shaper()
-    );
-    assert!(
-        document
+    ));
+    assert!(requires_first_line_shaper(
+        &document
             .relayout_with_metrics_and_timings(
                 changed,
                 &ImageMetrics::default(),
                 &document_resources
             )
             .unwrap_err()
-            .requires_first_line_shaper()
-    );
+    ));
     assert_eq!(snapshot(&document, &document_resources), before);
     document
         .relayout_with_shaper(changed, &mut shaper, &mut document_resources)
@@ -132,7 +165,7 @@ fn timed_layout_uses_the_same_first_line_coordinator() {
             .text()
             .lines()
             .iter()
-            .map(|line| (line.glyphs(), line.point(), line.height()))
+            .map(|line| (text_paint::render_line_glyphs(&line), line.point(), line.height()))
             .collect::<Vec<_>>()
     };
     assert_eq!(

@@ -1,42 +1,37 @@
 use rayon::{ThreadPool, ThreadPoolBuilder};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 
-// Common worker caps need no registry lock or Arc clone after initialization.
-static COMMON_POOLS: [OnceLock<ThreadPool>; 17] = [const { OnceLock::new() }; 17];
-
-static POOLS: OnceLock<Mutex<HashMap<usize, Arc<ThreadPool>>>> = OnceLock::new();
+// Retain one configuration. In-flight work keeps a replaced pool alive only
+// until its last operation finishes.
+static POOL: Mutex<Option<(usize, Arc<ThreadPool>)>> = Mutex::new(None);
 
 #[cfg(any(test, feature = "testing"))]
 static OBSERVED_WORKERS: std::sync::LazyLock<
     Mutex<std::collections::HashSet<std::thread::ThreadId>>,
 > = std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 
-/// Runs dependency-independent layout work on a reusable, size-specific pool.
-/// Keeping pools outside documents avoids retaining operating-system threads
-/// in every cached layout while still making the worker cap deterministic.
-pub fn install<R: Send>(workers: usize, operation: impl FnOnce() -> R + Send) -> R {
-    debug_assert!(workers > 1);
-    if let Some(slot) = COMMON_POOLS.get(workers) {
-        return slot.get_or_init(|| build_pool(workers)).install(operation);
-    }
-    let pools = POOLS.get_or_init(|| Mutex::new(HashMap::new()));
+/// Return None when workers cannot be created, so the caller can execute its
+/// ordinary sequential path without accidentally using Rayon's global pool.
+pub fn install<R: Send>(workers: usize, operation: impl FnOnce() -> R + Send) -> Option<R> {
     let pool = {
-        let mut pools = pools.lock().expect("layout worker-pool registry poisoned");
-        pools
-            .entry(workers)
-            .or_insert_with(|| Arc::new(build_pool(workers)))
-            .clone()
+        let mut cached = POOL.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some((count, pool)) = &*cached
+            && *count == workers
+        {
+            pool.clone()
+        } else {
+            let pool = Arc::new(
+                ThreadPoolBuilder::new()
+                    .num_threads(workers)
+                    .thread_name(move |index| format!("html-layout-{workers}-{index}"))
+                    .build()
+                    .ok()?,
+            );
+            *cached = Some((workers, pool.clone()));
+            pool
+        }
     };
-    pool.install(operation)
-}
-
-fn build_pool(workers: usize) -> ThreadPool {
-    ThreadPoolBuilder::new()
-        .num_threads(workers)
-        .thread_name(move |index| format!("html-layout-{workers}-{index}"))
-        .build()
-        .expect("layout worker pool must initialize")
+    Some(pool.install(operation))
 }
 
 #[cfg(any(test, feature = "testing"))]

@@ -1,6 +1,17 @@
+use html_dom as dom_values;
+#[cfg(test)]
+use html_engine_model::layout_state;
+#[cfg(test)]
+use html_engine_model::shaping_contracts;
 #[cfg(test)]
 mod tests {
-    use crate::{GlyphRequest, ShapedGlyph};
+    use html_pipeline::engine::fragment_paint;
+
+    use html_pipeline::engine::{box_queries, text_paint};
+
+    use crate::layout_model::BoxId;
+    use crate::layout_model::LineId;
+    use crate::{GlyphRequest, FontMetrics, GlyphHandle, ShapedGlyph, ShapedRun};
 
     use crate::GlyphResourceStore;
 
@@ -11,10 +22,7 @@ mod tests {
     };
     use crate::parser::DocumentFactory;
     use crate::test_support::TestGlyphShaper as GlyphCache;
-    use crate::{
-        GlyphShaper, LaidOutDocument, ShapeError, ShapedTextRun, TextRunShapeRequest,
-        TextShapeRequest,
-    };
+    use crate::{GlyphShaper, LaidOutDocument, ShapeError, ShapedTextRun, TextRunShapeRequest};
     use html_style_model::{Hyphens, VerticalAlignValue, WhiteSpace};
     use lightningcss::stylesheet::ParserOptions;
     use std::fs;
@@ -24,8 +32,6 @@ mod tests {
         fallback: GlyphCache,
         advances: Vec<f32>,
         boundaries: Vec<bool>,
-        exact_line_advance: Option<f32>,
-        measured_texts: Vec<String>,
     }
 
     impl GlyphShaper for NativeGeometryShaper {
@@ -53,85 +59,15 @@ mod tests {
             self.fallback.shape_glyph(request)
         }
 
-        fn shape_text_run(
+        fn shape_run(
             &mut self,
             request: TextRunShapeRequest<'_>,
-        ) -> Result<Option<ShapedTextRun>, ShapeError> {
-            if request.text().chars().count() != self.advances.len() {
+        ) -> Result<Option<ShapedRun>, ShapeError> {
+            if shaping_contracts::text_run_shape_request_text(&request).chars().count() != self.advances.len() {
                 return Ok(None);
             }
-            Ok(ShapedTextRun::new(
-                Arc::from(self.advances.clone()),
-                Arc::from(self.boundaries.clone()),
-            ))
-        }
-
-        fn measure_line(
-            &mut self,
-            request: TextShapeRequest<'_>,
-        ) -> Result<Option<ShapedTextRun>, ShapeError> {
-            let Some(advance) = self.exact_line_advance else {
-                return Ok(None);
-            };
-            self.measured_texts.push(request.text().to_owned());
-            let character_count = request.text().chars().count();
-            Ok(ShapedTextRun::new(
-                Arc::from(vec![advance; character_count]),
-                Arc::from(vec![true; character_count + 1]),
-            ))
-        }
-    }
-
-    struct OscillatingBoundaryShaper {
-        fallback: GlyphCache,
-    }
-
-    impl GlyphShaper for OscillatingBoundaryShaper {
-        fn reset(&mut self) {
-            self.fallback.reset();
-        }
-
-        fn resource_generation(&self) -> crate::GlyphResourceGeneration {
-            self.fallback.resource_generation()
-        }
-
-        fn begin_append_shaping(&mut self) -> Result<(), ShapeError> {
-            self.fallback.begin_append_shaping()
-        }
-
-        fn commit_append_shaping(&mut self) {
-            self.fallback.commit_append_shaping();
-        }
-
-        fn rollback_append_shaping(&mut self) {
-            self.fallback.rollback_append_shaping();
-        }
-
-        fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
-            self.fallback.shape_glyph(request)
-        }
-
-        fn shape_text_run(
-            &mut self,
-            request: TextRunShapeRequest<'_>,
-        ) -> Result<Option<ShapedTextRun>, ShapeError> {
-            let count = request.text().chars().count();
-            Ok(ShapedTextRun::new(
-                Arc::from(vec![4.0; count]),
-                Arc::from(vec![true; count + 1]),
-            ))
-        }
-
-        fn measure_line(
-            &mut self,
-            request: TextShapeRequest<'_>,
-        ) -> Result<Option<ShapedTextRun>, ShapeError> {
-            let count = request.text().chars().count();
-            let advance = if count == 1 { 2.0 } else { 6.0 };
-            Ok(ShapedTextRun::new(
-                Arc::from(vec![advance; count]),
-                Arc::from(vec![true; count + 1]),
-            ))
+            Ok(Some(shaping_contracts::shaped_run_geometry(shaping_contracts::shaped_text_run_new(Arc::from(self.advances.clone()),
+                Arc::from(self.boundaries.clone()),))))
         }
     }
 
@@ -165,8 +101,6 @@ mod tests {
             fallback: GlyphCache::new(),
             advances,
             boundaries,
-            exact_line_advance: None,
-            measured_texts: Vec::new(),
         };
         factory
             .parse_with_new_pipeline(html, None)
@@ -188,8 +122,6 @@ mod tests {
             fallback: GlyphCache::new(),
             advances: vec![4.0; 4],
             boundaries: vec![true; 5],
-            exact_line_advance: Some(6.0),
-            measured_texts: Vec::new(),
         };
         let mut shaped_resources = GlyphResourceStore::default();
         let shaped = factory.parse_with_new_pipeline("<html><body style='margin:0'><p style='margin:0;overflow-wrap:anywhere'>abcd</p></body></html>", None).shape(&mut glyph_cache, &mut shaped_resources).expect("native geometry must be valid");
@@ -206,15 +138,11 @@ mod tests {
         assert_eq!(document.line_count(), 2);
         for (line_index, expected) in ["ab", "cd"].iter().enumerate() {
             assert_eq!(
-                line_text(&document, line_index, &shaped_resources),
+                line_text(&document, LineId::new(line_index), &shaped_resources),
                 *expected
             );
         }
 
-        assert!(
-            glyph_cache.measured_texts.is_empty(),
-            "layout must not invoke backend line reshaping"
-        );
         document
             .relayout_with_metrics_and_shaper(
                 constraints,
@@ -223,10 +151,6 @@ mod tests {
                 &mut shaped_resources,
             )
             .expect("width-only relayout must remain valid");
-        assert!(
-            glyph_cache.measured_texts.is_empty(),
-            "relayout must reuse authoritative shaped geometry"
-        );
 
         let wider = crate::LayoutConstraints::new(13.0, 16.0).unwrap();
         document
@@ -247,8 +171,6 @@ mod tests {
             fallback: GlyphCache::new(),
             advances: vec![8.0],
             boundaries: vec![true; 2],
-            exact_line_advance: Some(8.0),
-            measured_texts: Vec::new(),
         };
         let mut shaped_resources = GlyphResourceStore::default();
         let shaped = factory
@@ -267,29 +189,24 @@ mod tests {
             )
             .expect("fragmented exact shaping must succeed");
 
-        assert!(
-            glyph_cache.measured_texts.is_empty(),
-            "inline-image fragmentation must not trigger backend line reshaping"
-        );
-
         assert_eq!(document.line_count(), 1);
-        let fragments = document
-            .render_view(&shaped_resources)
-            .text()
-            .line_text_fragments(0)
-            .unwrap()
-            .collect::<Vec<_>>();
+        let fragments = text_paint::render_text_view_line_text_fragments(
+            document.render_view(&shaped_resources).text(),
+            LineId::new(0),
+        )
+        .unwrap()
+        .collect::<Vec<_>>();
         assert_eq!(fragments.len(), 2);
         assert_eq!(fragments[0].glyphs(), 0..1);
         assert_eq!(fragments[1].glyphs(), 1..2);
-        assert_eq!(fragments[1].offset_x(), 28.0);
+        assert_eq!(text_paint::fragment_offset_x(&fragments[1]), 28.0);
     }
 
     #[test]
     fn nested_atomic_text_has_unambiguous_line_ownership() {
         let mut document_resources = GlyphResourceStore::default();
         let document = layout_html(
-            "<html><body style='margin:0'><p style='margin:0;white-space:nowrap'>A<span style='display:inline-flex'>INNER</span>B</p></body></html>",
+            "<html><body style='margin:0'><p style='margin:0;white-space:nowrap;width:100px;overflow-x:clip;overflow-y:visible'>A<span style='display:inline-flex;height:10px;overflow-x:visible;overflow-y:clip'>INNER</span>B</p></body></html>",
             200.0,
             &mut document_resources,
         );
@@ -297,8 +214,8 @@ mod tests {
         let glyph_for = |target| {
             (0..view.glyph_count() as u32)
                 .find(|index| {
-                    view.glyph_at(*index as usize)
-                        .and_then(|glyph| view.glyph_metric(glyph))
+                    text_paint::glyph_at(view, *index as usize)
+                        .and_then(|glyph| text_paint::glyph_metric(view, glyph))
                         .is_some_and(|metric| metric.ch() == target)
                 })
                 .expect("fixture character must be shaped")
@@ -306,22 +223,27 @@ mod tests {
         let before = glyph_for('A');
         let nested = glyph_for('I');
         let after = glyph_for('B');
-        let outer_line = view
-            .line_index_for_glyph(before)
+        let outer_line = text_paint::render_text_view_line_for_glyph(view, before)
             .expect("leading outer text must own a line");
 
         assert_eq!(
-            view.line_index_for_glyph(after),
+            text_paint::render_text_view_line_for_glyph(view, after),
             Some(outer_line),
             "text after an atomic inline must remain owned by its outer line"
         );
+        let nested_line = text_paint::render_text_view_line_for_glyph(view, nested)
+            .expect("nested atomic text must own a line");
         assert_ne!(
-            view.line_index_for_glyph(nested),
-            Some(outer_line),
+            nested_line, outer_line,
             "nested atomic text must retain its own line identity"
         );
+        let outer_clip = text_paint::line_overflow_clip(view, outer_line).expect("outer x clip");
+        assert!(outer_clip.clips_x() && !outer_clip.clips_y());
+        let nested_clip =
+            text_paint::line_overflow_clip(view, nested_line).expect("nested axis clips");
+        assert!(nested_clip.clips_x() && nested_clip.clips_y());
         assert_eq!(
-            view.line(outer_line).map(|line| line.index()),
+            view.line(outer_line).map(|line| line.id()),
             Some(outer_line)
         );
     }
@@ -337,25 +259,25 @@ mod tests {
         let text = document.render_view(&document_resources).text();
         let leading = (0..text.glyph_count() as u32)
             .find(|index| {
-                text.glyph_at(*index as usize)
-                    .and_then(|glyph| text.glyph_metric(glyph))
+                text_paint::glyph_at(text, *index as usize)
+                    .and_then(|glyph| text_paint::glyph_metric(text, glyph))
                     .is_some_and(|metric| metric.ch() == 'l')
             })
             .expect("outer text must be shaped");
-        let outer_line = text
-            .line_index_for_glyph(leading)
+        let outer_line = text_paint::render_text_view_line_for_glyph(text, leading)
             .expect("outer text must own a line");
-        let borders = document
-            .render_view(&document_resources)
-            .fragments()
-            .decorations()
-            .iter()
-            .filter(|fragment| fragment.is_inline() && fragment.color() == 0x000000ff)
-            .collect::<Vec<_>>();
+        let borders =
+            fragment_paint::decorations(document.render_view(&document_resources).fragments())
+                .iter()
+                .filter(|fragment| {
+                    fragment.is_inline()
+                        && fragment_paint::decoration_color(&fragment) == 0x000000ff
+                })
+                .collect::<Vec<_>>();
 
         let owned = borders
             .iter()
-            .filter(|fragment| fragment.line_idx().is_some())
+            .filter(|fragment| fragment_paint::render_decoration_line(&fragment).is_some())
             .collect::<Vec<_>>();
 
         assert_eq!(
@@ -366,7 +288,8 @@ mod tests {
         assert!(
             owned
                 .iter()
-                .all(|fragment| fragment.line_idx() == Some(outer_line)),
+                .all(|fragment| fragment_paint::render_decoration_line(&fragment)
+                    == Some(outer_line)),
             "every segment edge must project through the outer line rather than infer ownership from y geometry"
         );
     }
@@ -379,13 +302,14 @@ mod tests {
             200.0,
             &mut document_resources,
         );
-        let borders = document
-            .render_view(&document_resources)
-            .fragments()
-            .decorations()
-            .iter()
-            .filter(|decoration| decoration.is_inline() && decoration.color() == 0x00ff00ff)
-            .collect::<Vec<_>>();
+        let borders =
+            fragment_paint::decorations(document.render_view(&document_resources).fragments())
+                .iter()
+                .filter(|decoration| {
+                    decoration.is_inline()
+                        && fragment_paint::decoration_color(&decoration) == 0x00ff00ff
+                })
+                .collect::<Vec<_>>();
 
         let top = borders
             .iter()
@@ -414,58 +338,39 @@ mod tests {
         let text = document.render_view(&document_resources).text();
         let x = (0..text.glyph_count() as u32)
             .find(|index| {
-                text.glyph_at(*index as usize)
-                    .and_then(|glyph| text.glyph_metric(glyph))
+                text_paint::glyph_at(text, *index as usize)
+                    .and_then(|glyph| text_paint::glyph_metric(text, glyph))
                     .is_some_and(|metric| metric.ch() == 'X')
             })
             .expect("fixture X");
-        let line_idx = text.line_index_for_glyph(x).expect("X line");
-        let text_fragment = text
-            .line_text_fragments(line_idx)
+        let line_idx = text_paint::render_text_view_line_for_glyph(text, x).expect("X line");
+        let text_fragment = text_paint::render_text_view_line_text_fragments(text, line_idx)
             .expect("fragmented line")
             .find(|fragment| fragment.glyphs().contains(&x))
             .expect("X fragment");
-        let background = document
-            .render_view(&document_resources)
-            .fragments()
-            .decorations_for_line(line_idx)
-            .iter()
-            .find(|decoration| decoration.color() == 0xff0000ff)
-            .expect("red inline background");
+        let background = fragment_paint::render_fragment_view_decorations_for_line(
+            document.render_view(&document_resources).fragments(),
+            line_idx,
+        )
+        .iter()
+        .find(|decoration| fragment_paint::decoration_color(&decoration) == 0xff0000ff)
+        .expect("red inline background");
 
         assert!(
-            background.paint_order() <= text_fragment.paint_order(),
+            fragment_paint::decoration_paint_order(&background)
+                <= text_paint::fragment_paint_order(&text_fragment),
             "inline background must not paint after its descendant text"
         );
         assert!(
-            text_fragment.offset_x() >= 15.0,
+            text_paint::fragment_offset_x(&text_fragment) >= 15.0,
             "text after an atomic inline must retain its placed x position: {}",
-            text_fragment.offset_x()
+            text_paint::fragment_offset_x(&text_fragment)
         );
         assert_eq!(
             text_fragment.glyphs(),
             x..x + 1,
             "a fragment must not merge text from a differently styled owner; otherwise its earlier paint key can place the inline background above X"
         );
-    }
-
-    #[test]
-    fn layout_does_not_enter_backend_boundary_refinement() {
-        let mut factory = DocumentFactory::new();
-        let mut glyph_cache = OscillatingBoundaryShaper {
-            fallback: GlyphCache::new(),
-        };
-        let mut shaped_resources = GlyphResourceStore::default();
-        let shaped = factory.parse_with_new_pipeline("<html><body style='margin:0'><p style='margin:0;overflow-wrap:anywhere'>abcd</p></body></html>", None).shape(&mut glyph_cache, &mut shaped_resources).expect("fixture shaping must succeed");
-        let document = shaped
-            .layout_with_metrics_and_shaper(
-                crate::LayoutConstraints::new(9.0, 16.0).unwrap(),
-                &crate::ImageMetrics::default(),
-                &mut glyph_cache,
-                &mut shaped_resources,
-            )
-            .expect("layout uses authoritative document shaping");
-        assert_eq!(document.line_count(), 2);
     }
 
     #[test]
@@ -487,25 +392,22 @@ mod tests {
             .expect("first-line refinement must shape successfully");
 
         assert_eq!(
-            line_text(&document, 0, &shaped_resources).trim_end(),
+            line_text(&document, LineId::new(0), &shaped_resources).trim_end(),
             "aa",
             "20px pseudo text must not retain the 10px-font boundary"
         );
         let first = document
             .render_view(&shaped_resources)
             .text()
-            .line(0)
+            .line(LineId::new(0))
             .expect("first line");
         let first_glyph = document
             .render_view(&shaped_resources)
             .text()
-            .glyph_slice(first.glyphs())
+            .glyph_slice(text_paint::render_line_glyphs(&first))
             .expect("first-line glyphs")[0];
         assert_eq!(
-            document
-                .render_view(&shaped_resources)
-                .text()
-                .glyph_metric(first_glyph)
+            text_paint::glyph_metric(document.render_view(&shaped_resources).text(), first_glyph)
                 .expect("first glyph metric")
                 .advance(),
             10.0
@@ -524,21 +426,23 @@ mod tests {
             .layout_with_shaper(crate::LayoutConstraints::new(500.0, 16.0).unwrap(), &mut glyph_cache, &mut document_resources).expect("layout requires the shaper-aware API for first-line styles");
 
         assert_eq!(
-            document
-                .render_view(&document_resources)
-                .text()
-                .line(0)
-                .expect("first line")
-                .paint_color(),
+            text_paint::line_paint_color(
+                &document
+                    .render_view(&document_resources)
+                    .text()
+                    .line(LineId::new(0))
+                    .expect("first line")
+            ),
             Some(0x008000ff)
         );
         assert_eq!(
-            document
-                .render_view(&document_resources)
-                .text()
-                .line(1)
-                .expect("second block line")
-                .paint_color(),
+            text_paint::line_paint_color(
+                &document
+                    .render_view(&document_resources)
+                    .text()
+                    .line(LineId::new(1))
+                    .expect("second block line")
+            ),
             None
         );
     }
@@ -562,7 +466,7 @@ mod tests {
             .expect("first-line spacing refinement must shape successfully");
 
         assert_eq!(
-            line_text(&document, 0, &shaped_resources).trim_end(),
+            line_text(&document, LineId::new(0), &shaped_resources).trim_end(),
             "aa",
             "pseudo spacing must be visible to the line breaker"
         );
@@ -588,7 +492,10 @@ mod tests {
                 &mut shaped_resources,
             )
             .expect("initial first-line refinement must succeed");
-        assert_eq!(line_text(&document, 0, &shaped_resources).trim_end(), "aa");
+        assert_eq!(
+            line_text(&document, LineId::new(0), &shaped_resources).trim_end(),
+            "aa"
+        );
 
         document
             .relayout_with_metrics_and_shaper(
@@ -599,25 +506,22 @@ mod tests {
             )
             .expect("width-dependent first-line refinement must succeed");
         assert_eq!(
-            line_text(&document, 0, &shaped_resources).trim_end(),
+            line_text(&document, LineId::new(0), &shaped_resources).trim_end(),
             "aa aa"
         );
 
         let second = document
             .render_view(&shaped_resources)
             .text()
-            .line(1)
+            .line(LineId::new(1))
             .expect("second line");
         let second_glyph = document
             .render_view(&shaped_resources)
             .text()
-            .glyph_slice(second.glyphs())
+            .glyph_slice(text_paint::render_line_glyphs(&second))
             .expect("second-line glyphs")[0];
         assert_eq!(
-            document
-                .render_view(&shaped_resources)
-                .text()
-                .glyph_metric(second_glyph)
+            text_paint::glyph_metric(document.render_view(&shaped_resources).text(), second_glyph)
                 .expect("second-line metric")
                 .advance(),
             5.0,
@@ -651,27 +555,30 @@ mod tests {
             400.0,
             &mut document_resources,
         );
-        let fragments = document
-            .render_view(&document_resources)
-            .text()
-            .line_text_fragments(0)
-            .expect("inline text line")
-            .collect::<Vec<_>>();
+        let fragments = text_paint::render_text_view_line_text_fragments(
+            document.render_view(&document_resources).text(),
+            LineId::new(0),
+        )
+        .expect("inline text line")
+        .collect::<Vec<_>>();
 
         assert_eq!(fragments.len(), 1);
         assert_eq!(
-            fragments[0].offset_x(),
+            text_paint::fragment_offset_x(&fragments[0]),
             60.0,
             "5px outer border + 50px padding + 5px nested border must precede the text"
         );
-        let borders = document
-            .render_view(&document_resources)
-            .fragments()
-            .decorations()
-            .iter()
-            .filter(|decoration| decoration.is_inline())
-            .map(|decoration| (decoration.color(), decoration.rect()))
-            .collect::<Vec<_>>();
+        let borders =
+            fragment_paint::decorations(document.render_view(&document_resources).fragments())
+                .iter()
+                .filter(|decoration| decoration.is_inline())
+                .map(|decoration| {
+                    (
+                        fragment_paint::decoration_color(&decoration),
+                        decoration.rect(),
+                    )
+                })
+                .collect::<Vec<_>>();
         assert!(
             borders
                 .iter()
@@ -694,14 +601,18 @@ mod tests {
             200.0,
             &mut document_resources,
         );
-        let decorations = document
-            .render_view(&document_resources)
-            .fragments()
-            .decorations()
-            .iter()
-            .filter(|fragment| fragment.is_inline())
-            .map(|fragment| (fragment.color(), fragment.rect(), fragment.line_idx()))
-            .collect::<Vec<_>>();
+        let decorations =
+            fragment_paint::decorations(document.render_view(&document_resources).fragments())
+                .iter()
+                .filter(|fragment| fragment.is_inline())
+                .map(|fragment| {
+                    (
+                        fragment_paint::decoration_color(&fragment),
+                        fragment.rect(),
+                        fragment_paint::render_decoration_line(&fragment),
+                    )
+                })
+                .collect::<Vec<_>>();
         let blue = decorations
             .iter()
             .filter(|(color, _, _)| *color == 0x0000ffff)
@@ -759,12 +670,12 @@ mod tests {
         let candidate_line = candidate
             .render_view(&candidate_resources)
             .text()
-            .line(0)
+            .line(LineId::new(0))
             .expect("candidate line");
         let reference_line = reference
             .render_view(&reference_resources)
             .text()
-            .line(0)
+            .line(LineId::new(0))
             .expect("reference line");
 
         assert!(
@@ -772,7 +683,10 @@ mod tests {
             "candidate={candidate_line:?}, reference={reference_line:?}"
         );
         assert!(
-            (candidate_line.baseline() - reference_line.baseline()).abs() < 1e-5,
+            (text_paint::line_baseline(&candidate_line)
+                - text_paint::line_baseline(&reference_line))
+            .abs()
+                < 1e-5,
             "candidate={candidate_line:?}, reference={reference_line:?}"
         );
     }
@@ -804,8 +718,6 @@ mod tests {
             fallback: GlyphCache::new(),
             advances: vec![2.0; count],
             boundaries: vec![true; count + 1],
-            exact_line_advance: None,
-            measured_texts: Vec::new(),
         };
         crate::PreparedDocument::try_new(document, styles)
             .unwrap()
@@ -833,18 +745,19 @@ mod tests {
                 &mut document_resources,
             );
             let text = document.render_view(&document_resources).text();
-            let fragments = text.line_text_fragments(0).unwrap().collect::<Vec<_>>();
+            let fragments = text_paint::render_text_view_line_text_fragments(text, LineId::new(0))
+                .unwrap()
+                .collect::<Vec<_>>();
             let last = fragments
                 .iter()
                 .find(|fragment| fragment.glyphs().contains(&2))
                 .unwrap();
             assert!(
-                (last.offset_x() - (2.0 + expected)).abs() < 1.0e-6,
+                (text_paint::fragment_offset_x(&last) - (2.0 + expected)).abs() < 1.0e-6,
                 "the next word's painted origin must use the scaled gap: {factor}"
             );
             if factor != 1.0 {
-                let space = text
-                    .line_glyph_advances(0)
+                let space = text_paint::line_glyph_advances(text, LineId::new(0))
                     .unwrap()
                     .iter()
                     .find(|run| run.range().contains(&1))
@@ -877,8 +790,8 @@ mod tests {
             crate::TextCompositionPolicy::WebCompatible,
             &mut wider_resources,
         );
-        assert_eq!(line_text(&normal, 0, &normal_resources), "a a");
-        assert_eq!(line_text(&wider, 0, &wider_resources), "a");
+        assert_eq!(line_text(&normal, LineId::new(0), &normal_resources), "a a");
+        assert_eq!(line_text(&wider, LineId::new(0), &wider_resources), "a");
         let mut nonbreaking_resources = GlyphResourceStore::default();
         let nonbreaking = layout_with_word_spacing(
             "a\u{00a0}a",
@@ -894,15 +807,15 @@ mod tests {
             "a wider nonbreaking space must remain nonbreaking"
         );
         assert_eq!(
-            nonbreaking
-                .render_view(&nonbreaking_resources)
-                .text()
-                .line_glyph_advances(0)
-                .unwrap()
-                .iter()
-                .next()
-                .unwrap()
-                .advance(),
+            text_paint::line_glyph_advances(
+                nonbreaking.render_view(&nonbreaking_resources).text(),
+                LineId::new(0)
+            )
+            .unwrap()
+            .iter()
+            .next()
+            .unwrap()
+            .advance(),
             4.0
         );
     }
@@ -922,10 +835,12 @@ mod tests {
                 policy,
                 &mut document_resources,
             );
-            assert_eq!(line_text(&document, 0, &document_resources), "a a");
+            assert_eq!(
+                line_text(&document, LineId::new(0), &document_resources),
+                "a a"
+            );
             let text = document.render_view(&document_resources).text();
-            let space = text
-                .line_glyph_advances(0)
+            let space = text_paint::line_glyph_advances(text, LineId::new(0))
                 .unwrap()
                 .iter()
                 .find(|run| run.range().contains(&1))
@@ -934,18 +849,20 @@ mod tests {
                 (space.advance() - 3.0).abs() < 1.0e-6,
                 "justification must fill the column after scaling the preferred gap: {policy:?}, actual {}, line adjustment {}",
                 space.advance(),
-                text.line(0).unwrap().word_spacing()
+                text_paint::line_word_spacing(&text.line(LineId::new(0)).unwrap())
             );
-            let last_word = text
-                .line_text_fragments(0)
+            let last_word = text_paint::render_text_view_line_text_fragments(text, LineId::new(0))
                 .unwrap()
                 .find(|fragment| fragment.glyphs().contains(&2))
                 .unwrap();
             assert!(
-                (last_word.offset_x() - 5.0).abs() < 1.0e-6,
+                (text_paint::fragment_offset_x(&last_word) - 5.0).abs() < 1.0e-6,
                 "painted word positions must include justification"
             );
-            assert_eq!(text.line(1).unwrap().word_spacing(), 0.0);
+            assert_eq!(
+                text_paint::line_word_spacing(&text.line(LineId::new(1)).unwrap()),
+                0.0
+            );
         }
         let mut last_resources = GlyphResourceStore::default();
         let last = layout_with_word_spacing(
@@ -957,14 +874,15 @@ mod tests {
             &mut last_resources,
         );
         assert_eq!(
-            last.render_view(&last_resources)
-                .text()
-                .line_glyph_advances(0)
-                .unwrap()
-                .iter()
-                .next()
-                .unwrap()
-                .advance(),
+            text_paint::line_glyph_advances(
+                last.render_view(&last_resources).text(),
+                LineId::new(0)
+            )
+            .unwrap()
+            .iter()
+            .next()
+            .unwrap()
+            .advance(),
             3.0
         );
     }
@@ -981,8 +899,14 @@ mod tests {
         );
 
         assert_eq!(document.line_count(), 2);
-        assert_eq!(line_text(&document, 0, &document_resources), "ab");
-        assert_eq!(line_text(&document, 1, &document_resources), "cd");
+        assert_eq!(
+            line_text(&document, LineId::new(0), &document_resources),
+            "ab"
+        );
+        assert_eq!(
+            line_text(&document, LineId::new(1), &document_resources),
+            "cd"
+        );
     }
 
     #[test]
@@ -997,8 +921,14 @@ mod tests {
         );
 
         assert_eq!(document.line_count(), 2);
-        assert_eq!(line_text(&document, 0, &document_resources), "ab");
-        assert_eq!(line_text(&document, 1, &document_resources), "c");
+        assert_eq!(
+            line_text(&document, LineId::new(0), &document_resources),
+            "ab"
+        );
+        assert_eq!(
+            line_text(&document, LineId::new(1), &document_resources),
+            "c"
+        );
     }
 
     #[test]
@@ -1015,10 +945,13 @@ mod tests {
         let first = document
             .render_view(&document_resources)
             .text()
-            .line(0)
+            .line(LineId::new(0))
             .expect("wrapped first line");
-        assert_eq!(line_text(&document, 0, &document_resources), "a a");
-        assert!((first.word_spacing() - 1.0).abs() < f64::EPSILON);
+        assert_eq!(
+            line_text(&document, LineId::new(0), &document_resources),
+            "a a"
+        );
+        assert!((text_paint::line_word_spacing(&first) - 1.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1047,33 +980,33 @@ mod tests {
 
         assert_eq!(
             (
-                line_text(&web, 0, &web_resources),
-                line_text(&web, 1, &web_resources)
+                line_text(&web, LineId::new(0), &web_resources),
+                line_text(&web, LineId::new(1), &web_resources)
             ),
             ("aa aa b".to_owned(), "c".to_owned()),
             "web-compatible layout must retain greedy first-fit wrapping"
         );
         assert_eq!(
             (
-                line_text(&book, 0, &book_resources),
-                line_text(&book, 1, &book_resources)
+                line_text(&book, LineId::new(0), &book_resources),
+                line_text(&book, LineId::new(1), &book_resources)
             ),
             ("aa aa".to_owned(), "b c".to_owned()),
             "book composition should improve the paragraph shape globally"
         );
-        for line_idx in 0..book.line_count() {
+        for line_idx in (0..book.line_count()).map(LineId::new) {
             let line = book
                 .render_view(&book_resources)
                 .text()
                 .line(line_idx)
                 .expect("book line");
             assert_eq!(
-                line.word_spacing(),
+                text_paint::line_word_spacing(&line),
                 0.0,
                 "ragged composition must preserve natural word spacing"
             );
             assert_eq!(
-                line.letter_spacing(),
+                text_paint::line_letter_spacing(&line),
                 0.0,
                 "ragged composition must not justify through tracking"
             );
@@ -1105,25 +1038,27 @@ mod tests {
         );
 
         assert_eq!(
-            web.render_view(&web_resources)
-                .text()
-                .line(0)
-                .expect("web line")
-                .optical_offset_x(),
+            text_paint::line_optical_offset_x(
+                &web.render_view(&web_resources)
+                    .text()
+                    .line(LineId::new(0))
+                    .expect("web line")
+            ),
             0.0
         );
         assert!(
-            book.render_view(&book_resources)
-                .text()
-                .line(0)
-                .expect("book line")
-                .optical_offset_x()
-                < 0.0,
+            text_paint::line_optical_offset_x(
+                &book
+                    .render_view(&book_resources)
+                    .text()
+                    .line(LineId::new(0))
+                    .expect("book line")
+            ) < 0.0,
             "the opening quote should protrude into the left margin"
         );
         assert_eq!(
-            line_text(&web, 0, &web_resources),
-            line_text(&book, 0, &book_resources),
+            line_text(&web, LineId::new(0), &web_resources),
+            line_text(&book, LineId::new(0), &book_resources),
             "optical alignment must not alter source ranges or line breaking"
         );
     }
@@ -1144,12 +1079,13 @@ mod tests {
         );
 
         assert!(
-            book.render_view(&book_resources)
-                .text()
-                .line(0)
-                .expect("book line")
-                .optical_offset_x()
-                > 0.0,
+            text_paint::line_optical_offset_x(
+                &book
+                    .render_view(&book_resources)
+                    .text()
+                    .line(LineId::new(0))
+                    .expect("book line")
+            ) > 0.0,
             "the closing quote should protrude into the right margin"
         );
     }
@@ -1172,15 +1108,16 @@ mod tests {
         let first = book
             .render_view(&book_resources)
             .text()
-            .line(0)
+            .line(LineId::new(0))
             .expect("first justified line");
-        assert_eq!(line_text(&book, 0, &book_resources), "a a.”");
+        assert_eq!(line_text(&book, LineId::new(0), &book_resources), "a a.”");
         assert!(
-            first.word_spacing() > 0.0 || first.letter_spacing() > 0.0,
+            text_paint::line_word_spacing(&first) > 0.0
+                || text_paint::line_letter_spacing(&first) > 0.0,
             "terminal punctuation should receive bounded optical room beyond the logical measure"
         );
         assert_eq!(
-            first.optical_offset_x(),
+            text_paint::line_optical_offset_x(&first),
             0.0,
             "right protrusion must not disturb the aligned left edge"
         );
@@ -1202,12 +1139,13 @@ mod tests {
         );
 
         assert!(
-            book.render_view(&book_resources)
-                .text()
-                .line(0)
-                .expect("book line")
-                .optical_offset_x()
-                > 0.0,
+            text_paint::line_optical_offset_x(
+                &book
+                    .render_view(&book_resources)
+                    .text()
+                    .line(LineId::new(0))
+                    .expect("book line")
+            ) > 0.0,
             "the terminal dash should protrude into the right margin"
         );
     }
@@ -1228,11 +1166,13 @@ mod tests {
         );
 
         assert_eq!(
-            book.render_view(&book_resources)
-                .text()
-                .line(0)
-                .expect("book line")
-                .optical_offset_x(),
+            text_paint::line_optical_offset_x(
+                &book
+                    .render_view(&book_resources)
+                    .text()
+                    .line(LineId::new(0))
+                    .expect("book line")
+            ),
             0.0
         );
     }
@@ -1240,24 +1180,28 @@ mod tests {
     #[test]
     fn justification_shrinks_spaces_when_knuth_plass_selects_a_tight_line() {
         let mut document_resources = GlyphResourceStore::default();
-        let document = layout_with_native_geometry(
+        let document = layout_with_native_geometry_policy(
             "<html><body style='margin:0'><p style='margin:0;text-align:justify'>a a a</p></body></html>",
             5.5,
             vec![2.0; 5],
             vec![true; 6],
+            crate::TextCompositionPolicy::BookOptimized,
             &mut document_resources,
         );
 
         let first = document
             .render_view(&document_resources)
             .text()
-            .line(0)
+            .line(LineId::new(0))
             .expect("wrapped first line");
-        assert_eq!(line_text(&document, 0, &document_resources), "a a");
+        assert_eq!(
+            line_text(&document, LineId::new(0), &document_resources),
+            "a a"
+        );
         assert!(
-            (first.word_spacing() + 0.5).abs() < f64::EPSILON,
+            (text_paint::line_word_spacing(&first) + 0.5).abs() < f64::EPSILON,
             "tight line must shrink its one space by 0.5px, got {}",
-            first.word_spacing()
+            text_paint::line_word_spacing(&first)
         );
     }
 
@@ -1274,17 +1218,19 @@ mod tests {
             &mut document_resources,
         );
         let text = document.render_view(&document_resources).text();
-        let first = text.line(0).expect("first justified line");
-        let advances = text
-            .line_glyph_advances(0)
+        let first = text.line(LineId::new(0)).expect("first justified line");
+        let advances = text_paint::line_glyph_advances(text, LineId::new(0))
             .expect("line advance overrides")
             .iter()
             .map(|run| (run.range().start, run.advance()))
             .collect::<Vec<_>>();
 
-        assert_eq!(line_text(&document, 0, &document_resources), "a, a a— a");
         assert_eq!(
-            first.word_spacing(),
+            line_text(&document, LineId::new(0), &document_resources),
+            "a, a a— a"
+        );
+        assert_eq!(
+            text_paint::line_word_spacing(&first),
             0.0,
             "specialized spaces use exact advances instead of one uniform line value"
         );
@@ -1324,12 +1270,15 @@ mod tests {
             &mut document_resources,
         );
         let text = document.render_view(&document_resources).text();
-        let first = text.line(0).expect("first justified line");
+        let first = text.line(LineId::new(0)).expect("first justified line");
 
-        assert_eq!(line_text(&document, 0, &document_resources), "a, a a— a");
-        assert!((first.word_spacing() - 1.0).abs() < 1.0e-9);
+        assert_eq!(
+            line_text(&document, LineId::new(0), &document_resources),
+            "a, a a— a"
+        );
+        assert!((text_paint::line_word_spacing(&first) - 1.0).abs() < 1.0e-9);
         assert!(
-            text.line_glyph_advances(0)
+            text_paint::line_glyph_advances(text, LineId::new(0))
                 .expect("line advance list")
                 .is_empty(),
             "web-compatible justification must not add book punctuation overrides"
@@ -1349,14 +1298,16 @@ mod tests {
             &mut document_resources,
         );
         let text = document.render_view(&document_resources).text();
-        let advances = text
-            .line_glyph_advances(0)
+        let advances = text_paint::line_glyph_advances(text, LineId::new(0))
             .expect("line advance overrides")
             .iter()
             .map(|run| run.advance())
             .collect::<Vec<_>>();
 
-        assert_eq!(line_text(&document, 0, &document_resources), "a, a a— a");
+        assert_eq!(
+            line_text(&document, LineId::new(0), &document_resources),
+            "a, a a— a"
+        );
         assert_eq!(advances.len(), 3);
         assert!(
             advances[1] < advances[0],
@@ -1377,7 +1328,7 @@ mod tests {
     }
 
     #[test]
-    fn emergency_justification_leaves_residual_space_on_the_right() {
+    fn web_justification_fills_space_beyond_book_expansion_limits() {
         let mut document_resources = GlyphResourceStore::default();
         let document = layout_with_native_geometry(
             "<html><body style='margin:0'><p style='margin:0;text-align:justify'>a a a a</p></body></html>",
@@ -1390,18 +1341,21 @@ mod tests {
         let first = document
             .render_view(&document_resources)
             .text()
-            .line(0)
+            .line(LineId::new(0))
             .expect("emergency short first line");
-        assert_eq!(line_text(&document, 0, &document_resources), "a a");
-        assert!(
-            (first.word_spacing() - 1.0).abs() < f64::EPSILON,
-            "space expansion must stop at 50%; got {}",
-            first.word_spacing()
+        assert_eq!(
+            line_text(&document, LineId::new(0), &document_resources),
+            "a a"
         );
         assert!(
-            (first.letter_spacing() - 0.015).abs() < 1.0e-9,
-            "micro-tracking must stop after consuming 0.5% of the 6px natural line width; got {}",
-            first.letter_spacing()
+            (text_paint::line_word_spacing(&first) - 2.5).abs() < f64::EPSILON,
+            "web justification must fill the available line; got {}",
+            text_paint::line_word_spacing(&first)
+        );
+        assert!(
+            text_paint::line_letter_spacing(&first).abs() < 1.0e-9,
+            "word spaces must absorb expansion beyond the book limits; got {}",
+            text_paint::line_letter_spacing(&first)
         );
     }
 
@@ -1419,39 +1373,46 @@ mod tests {
         let first = document
             .render_view(&document_resources)
             .text()
-            .line(0)
+            .line(LineId::new(0))
             .expect("micro-tracked first line");
-        assert_eq!(line_text(&document, 0, &document_resources), "aaaa aaaa");
-        assert!((first.word_spacing() - 1.0).abs() < 1.0e-9);
+        assert_eq!(
+            line_text(&document, LineId::new(0), &document_resources),
+            "aaaa aaaa"
+        );
+        assert!((text_paint::line_word_spacing(&first) - 1.0).abs() < 1.0e-9);
         assert!(
-            (first.letter_spacing() * 8.0 - 0.04).abs() < 1.0e-6,
+            (text_paint::line_letter_spacing(&first) * 8.0 - 0.04).abs() < 1.0e-6,
             "eight shaped-cluster boundaries must share the 0.04px residual; got {}",
-            first.letter_spacing()
+            text_paint::line_letter_spacing(&first)
         );
     }
 
     #[test]
     fn justification_uses_tiny_negative_cluster_tracking_after_space_shrink() {
         let mut document_resources = GlyphResourceStore::default();
-        let document = layout_with_native_geometry(
+        let document = layout_with_native_geometry_policy(
             "<html><body style='margin:0'><p style='margin:0;text-align:justify'>aa aa aa</p></body></html>",
             9.32,
             vec![2.0; 8],
             vec![true; 9],
+            crate::TextCompositionPolicy::BookOptimized,
             &mut document_resources,
         );
 
         let first = document
             .render_view(&document_resources)
             .text()
-            .line(0)
+            .line(LineId::new(0))
             .expect("micro-tracked tight first line");
-        assert_eq!(line_text(&document, 0, &document_resources), "aa aa");
-        assert!((first.word_spacing() + 0.66).abs() < 1.0e-9);
+        assert_eq!(
+            line_text(&document, LineId::new(0), &document_resources),
+            "aa aa"
+        );
+        assert!((text_paint::line_word_spacing(&first) + 0.66).abs() < 1.0e-9);
         assert!(
-            (first.letter_spacing() * 4.0 + 0.02).abs() < 1.0e-6,
+            (text_paint::line_letter_spacing(&first) * 4.0 + 0.02).abs() < 1.0e-6,
             "four shaped-cluster boundaries must share the -0.02px residual; got {}",
-            first.letter_spacing()
+            text_paint::line_letter_spacing(&first)
         );
     }
 
@@ -1471,11 +1432,12 @@ mod tests {
             );
             let mut entries_resources = GlyphResourceStore::default();
             let (document, entries) = capture(Duration::default, || {
-                layout_with_native_geometry(
+                layout_with_native_geometry_policy(
                     &html,
                     width,
                     vec![2.0; glyphs],
                     vec![true; glyphs + 1],
+                    crate::TextCompositionPolicy::BookOptimized,
                     &mut entries_resources,
                 )
             });
@@ -1490,9 +1452,15 @@ mod tests {
                     .any(|entry| entry.name == "lines.justified.emergency"),
                 "tracking-feasible text must finish in the normal pass"
             );
-            let first = document.render_view().text().line(0).unwrap();
+            let first = document
+                .render_view(&entries_resources)
+                .text()
+                .line(0)
+                .unwrap();
             let boundaries = if adjustment > 0.0 { 8.0 } else { 4.0 };
-            assert!((first.letter_spacing() * boundaries - adjustment).abs() < 1.0e-6);
+            assert!(
+                (text_paint::line_letter_spacing(&first) * boundaries - adjustment).abs() < 1.0e-6
+            );
         }
 
         // The same requested expansion fits eight boundaries but exceeds
@@ -1508,11 +1476,12 @@ mod tests {
             };
             let mut entries_resources = GlyphResourceStore::default();
             let (document, entries) = capture(Duration::default, || {
-                layout_with_native_geometry(
+                layout_with_native_geometry_policy(
                     html,
                     19.03,
                     vec![2.0; 14],
                     boundaries,
+                    crate::TextCompositionPolicy::BookOptimized,
                     &mut entries_resources,
                 )
             });
@@ -1523,9 +1492,13 @@ mod tests {
                 clustered
             );
             assert_eq!(line_text(&document, 0, &entries_resources), "aaaa aaaa");
-            let first = document.render_view().text().line(0).unwrap();
+            let first = document
+                .render_view(&entries_resources)
+                .text()
+                .line(0)
+                .unwrap();
             assert!(
-                first.letter_spacing().abs() <= 0.005 + 1.0e-9,
+                text_paint::line_letter_spacing(&first).abs() <= 0.005 + 1.0e-9,
                 "placement must retain its per-boundary tracking limit"
             );
         }
@@ -1569,12 +1542,12 @@ mod tests {
         let document = layout_html(html, 72.0, &mut document_resources);
         let text = document.render_view(&document_resources).text();
         let mut paragraphs = vec![false; 3];
-        for index in 0..document.line_count() {
+        for index in (0..document.line_count()).map(LineId::new) {
             let line = text.line(index).unwrap();
             let paragraph_length =
                 "internationalization internationalization".chars().count() as u32;
             let paragraph = (line.start() / paragraph_length) as usize;
-            paragraphs[paragraph] |= text.hyphen_for_line(index).is_some();
+            paragraphs[paragraph] |= text_paint::hyphen_for_line(text, index).is_some();
         }
         assert_eq!(
             paragraphs,
@@ -1632,12 +1605,8 @@ mod tests {
 
         let content = "internationalization internationalization";
         let has_hyphen = |document: &LaidOutDocument, resources: &GlyphResourceStore| {
-            (0..document.line_count()).any(|index| {
-                document
-                    .render_view(resources)
-                    .text()
-                    .hyphen_for_line(index)
-                    .is_some()
+            (0..document.line_count()).map(LineId::new).any(|index| {
+                text_paint::hyphen_for_line(document.render_view(resources).text(), index).is_some()
             })
         };
         assert!(!has_hyphen(
@@ -1727,19 +1696,14 @@ mod tests {
             Some(Hyphens::None),
             &mut off_resources,
         );
-        assert!((0..book.line_count()).any(|index| {
-            book.render_view(&book_resources)
-                .text()
-                .hyphen_for_line(index)
-                .is_some()
+        assert!((0..book.line_count()).map(LineId::new).any(|index| {
+            text_paint::hyphen_for_line(book.render_view(&book_resources).text(), index).is_some()
         }));
-        assert!((0..off.line_count()).all(|index| {
-            off.render_view(&off_resources)
-                .text()
-                .hyphen_for_line(index)
-                .is_none()
+        assert!((0..off.line_count()).map(LineId::new).all(|index| {
+            text_paint::hyphen_for_line(off.render_view(&off_resources).text(), index).is_none()
         }));
         let source = (0..off.line_count())
+            .map(LineId::new)
             .map(|index| line_text(&off, index, &off_resources))
             .collect::<String>();
         assert!(source.contains("state-of-the-art"));
@@ -1754,14 +1718,16 @@ mod tests {
             &mut document_resources,
         );
         let text = document.render_view(&document_resources).text();
-        let hyphenated_line =
-            (0..document.line_count()).find(|&line_idx| text.hyphen_for_line(line_idx).is_some());
+        let hyphenated_line = (0..document.line_count())
+            .map(LineId::new)
+            .find(|&line_idx| text_paint::hyphen_for_line(text, line_idx).is_some());
 
         assert!(
             hyphenated_line.is_some(),
             "a narrow English justified paragraph should select at least one dictionary breakpoint"
         );
         let source = (0..document.line_count())
+            .map(LineId::new)
             .map(|line_idx| line_text(&document, line_idx, &document_resources))
             .collect::<String>();
         assert!(
@@ -1789,22 +1755,25 @@ mod tests {
         let text = document.render_view(&document_resources).text();
         let soft_hyphen = (0..text.glyph_count() as u32)
             .find(|&index| {
-                text.glyph_at(index as usize)
-                    .and_then(|glyph| text.glyph_metric(glyph))
+                text_paint::glyph_at(text, index as usize)
+                    .and_then(|glyph| text_paint::glyph_metric(text, glyph))
                     .is_some_and(|metric| metric.ch() == '\u{00ad}')
             })
             .expect("fixture contains a source soft hyphen");
 
         assert_eq!(
-            text.character_advance(soft_hyphen),
+            text_paint::character_advance(text, soft_hyphen),
             Some(0.0),
             "an unbroken soft hyphen must consume no inline width"
         );
         assert!(
-            (0..document.line_count()).any(|line_idx| text.hyphen_for_line(line_idx).is_some()),
+            (0..document.line_count())
+                .map(LineId::new)
+                .any(|line_idx| text_paint::hyphen_for_line(text, line_idx).is_some()),
             "manual hyphenation should use the authored conditional break"
         );
         let source = (0..document.line_count())
+            .map(LineId::new)
             .map(|line_idx| line_text(&document, line_idx, &document_resources))
             .collect::<String>();
         assert!(
@@ -1818,6 +1787,30 @@ mod tests {
     }
 
     #[test]
+    fn manual_soft_hyphens_survive_later_text_runs_in_the_same_box() {
+        for content in [
+            "extra&shy;ordinary tail",
+            "extra&shy;ord<!-- split -->inary tail",
+        ] {
+            let mut resources = GlyphResourceStore::default();
+            let document = layout_html(
+                &format!(
+                    "<html lang='en'><body style='margin:0'><p style='margin:0;hyphens:manual'>{content}</p></body></html>"
+                ),
+                56.0,
+                &mut resources,
+            );
+            let text = document.render_view(&resources).text();
+            assert!(
+                (0..document.line_count())
+                    .map(LineId::new)
+                    .any(|line| text_paint::hyphen_for_line(text, line).is_some()),
+                "a later source run must not erase the box's conditional hyphen: {content}"
+            );
+        }
+    }
+
+    #[test]
     fn hyphens_none_suppresses_an_authored_soft_hyphen_break() {
         let mut document_resources = GlyphResourceStore::default();
         let document = layout_html(
@@ -1828,19 +1821,21 @@ mod tests {
         let text = document.render_view(&document_resources).text();
         let soft_hyphen = (0..text.glyph_count() as u32)
             .find(|&index| {
-                text.glyph_at(index as usize)
-                    .and_then(|glyph| text.glyph_metric(glyph))
+                text_paint::glyph_at(text, index as usize)
+                    .and_then(|glyph| text_paint::glyph_metric(text, glyph))
                     .is_some_and(|metric| metric.ch() == '\u{00ad}')
             })
             .expect("fixture contains a source soft hyphen");
 
         assert_eq!(
-            text.character_advance(soft_hyphen),
+            text_paint::character_advance(text, soft_hyphen),
             Some(0.0),
             "a suppressed soft hyphen must remain invisible"
         );
         assert!(
-            (0..document.line_count()).all(|line_idx| text.hyphen_for_line(line_idx).is_none()),
+            (0..document.line_count())
+                .map(LineId::new)
+                .all(|line_idx| text_paint::hyphen_for_line(text, line_idx).is_none()),
             "hyphens:none must suppress conditional hyphen rendering"
         );
     }
@@ -1860,7 +1855,7 @@ mod tests {
             1,
             "a conditional hyphen is still a soft wrap opportunity and must obey nowrap"
         );
-        assert!(text.hyphen_for_line(0).is_none());
+        assert!(text_paint::hyphen_for_line(text, LineId::new(0)).is_none());
     }
 
     #[test]
@@ -1873,7 +1868,8 @@ mod tests {
         );
         let text = document.render_view(&document_resources).text();
         let hyphenated_line = (0..document.line_count())
-            .find(|&line_idx| text.hyphen_for_line(line_idx).is_some())
+            .map(LineId::new)
+            .find(|&line_idx| text_paint::hyphen_for_line(text, line_idx).is_some())
             .expect("the authored conditional break should fit the narrow line");
 
         assert!(
@@ -1902,14 +1898,15 @@ mod tests {
             let actual = layout(styled, &mut layout_resources);
             let lines = |document: &LaidOutDocument, resources: &GlyphResourceStore| {
                 (0..document.line_count())
+                    .map(LineId::new)
                     .map(|index| {
                         (
                             line_text(document, index, resources),
-                            document
-                                .render_view(resources)
-                                .text()
-                                .hyphen_for_line(index)
-                                .is_some(),
+                            text_paint::hyphen_for_line(
+                                document.render_view(resources).text(),
+                                index,
+                            )
+                            .is_some(),
                         )
                     })
                     .collect::<Vec<_>>()
@@ -1928,11 +1925,9 @@ mod tests {
         let mut document_resources = GlyphResourceStore::default();
         let document = layout_html(html, 56.0, &mut document_resources);
         let hyphenated = (0..document.line_count())
+            .map(LineId::new)
             .filter(|&index| {
-                document
-                    .render_view(&document_resources)
-                    .text()
-                    .hyphen_for_line(index)
+                text_paint::hyphen_for_line(document.render_view(&document_resources).text(), index)
                     .is_some()
             })
             .collect::<Vec<_>>();
@@ -1955,11 +1950,13 @@ mod tests {
             let mut document_resources = GlyphResourceStore::default();
             let document = layout_html(&html, 48.0, &mut document_resources);
             assert!(
-                (0..document.line_count()).all(|index| document
-                    .render_view(&document_resources)
-                    .text()
-                    .hyphen_for_line(index)
-                    .is_none()),
+                (0..document.line_count()).map(LineId::new).all(|index| {
+                    text_paint::hyphen_for_line(
+                        document.render_view(&document_resources).text(),
+                        index,
+                    )
+                    .is_none()
+                }),
                 "a word with {attributes} must not be hyphenated as separate fragments"
             );
         }
@@ -1979,14 +1976,12 @@ mod tests {
         };
         let lines = |document: &LaidOutDocument, resources: &GlyphResourceStore| {
             (0..document.line_count())
+                .map(LineId::new)
                 .map(|index| {
                     (
                         line_text(document, index, resources)
                             .replace(['\u{2019}', '\u{02bc}'], "'"),
-                        document
-                            .render_view(resources)
-                            .text()
-                            .hyphen_for_line(index)
+                        text_paint::hyphen_for_line(document.render_view(resources).text(), index)
                             .is_some(),
                     )
                 })
@@ -2026,11 +2021,8 @@ mod tests {
             boundaries,
             &mut document_resources,
         );
-        assert!((0..document.line_count()).all(|index| {
-            document
-                .render_view(&document_resources)
-                .text()
-                .hyphen_for_line(index)
+        assert!((0..document.line_count()).map(LineId::new).all(|index| {
+            text_paint::hyphen_for_line(document.render_view(&document_resources).text(), index)
                 .is_none()
         }));
     }
@@ -2065,15 +2057,13 @@ mod tests {
         let actual = layout(&decomposed, &mut layout_resources);
         let lines = |document: &LaidOutDocument, resources: &GlyphResourceStore| {
             (0..document.line_count())
+                .map(LineId::new)
                 .map(|index| {
                     (
                         line_text(document, index, resources)
                             .nfc()
                             .collect::<String>(),
-                        document
-                            .render_view(resources)
-                            .text()
-                            .hyphen_for_line(index)
+                        text_paint::hyphen_for_line(document.render_view(resources).text(), index)
                             .is_some(),
                     )
                 })
@@ -2083,14 +2073,12 @@ mod tests {
             lines(&actual, &layout_resources),
             lines(&expected, &expected_resources)
         );
-        assert!((0..actual.line_count()).any(|index| {
-            actual
-                .render_view(&layout_resources)
-                .text()
-                .hyphen_for_line(index)
+        assert!((0..actual.line_count()).map(LineId::new).any(|index| {
+            text_paint::hyphen_for_line(actual.render_view(&layout_resources).text(), index)
                 .is_some()
         }));
         let original_source = (0..actual.line_count())
+            .map(LineId::new)
             .map(|index| line_text(&actual, index, &layout_resources))
             .collect::<String>();
         assert_eq!(
@@ -2143,14 +2131,14 @@ mod tests {
         resources: &GlyphResourceStore,
     ) -> kurbo::Size {
         let boxes = document.render_view(resources).boxes();
-        let box_idx = (0..boxes.len())
+        let box_idx = (0..box_queries::len(boxes))
+            .map(layout_state::box_id_new)
             .find(|&idx| {
-                boxes
-                    .tag(idx)
+                box_queries::tag(boxes, idx)
                     .is_some_and(|candidate| candidate.eq_ignore_ascii_case(tag))
             })
             .unwrap_or_else(|| panic!("{tag} box should exist"));
-        boxes.size(box_idx).expect("box index in range")
+        box_queries::render_box_view_size(boxes, box_idx).expect("box index in range")
     }
 
     fn tag_point(
@@ -2159,19 +2147,19 @@ mod tests {
         resources: &GlyphResourceStore,
     ) -> kurbo::Point {
         let boxes = document.render_view(resources).boxes();
-        let box_idx = (0..boxes.len())
+        let box_idx = (0..box_queries::len(boxes))
+            .map(layout_state::box_id_new)
             .find(|&idx| {
-                boxes
-                    .tag(idx)
+                box_queries::tag(boxes, idx)
                     .is_some_and(|candidate| candidate.eq_ignore_ascii_case(tag))
             })
             .unwrap_or_else(|| panic!("{tag} box should exist"));
-        boxes.point(box_idx).expect("box index in range")
+        box_queries::render_box_view_point(boxes, box_idx).expect("box index in range")
     }
 
     fn line_text(
         document: &LaidOutDocument,
-        line_idx: usize,
+        line_idx: LineId,
         resources: &GlyphResourceStore,
     ) -> String {
         let line = document
@@ -2180,22 +2168,23 @@ mod tests {
             .line(line_idx)
             .expect("line index in range");
         let text = document.render_view(resources).text();
-        text.glyph_slice(line.glyphs())
+        text.glyph_slice(text_paint::render_line_glyphs(&line))
             .expect("line glyph range")
             .iter()
-            .map(|&glyph| text.glyph_metric(glyph).expect("registered glyph").ch())
+            .map(|&glyph| {
+                text_paint::glyph_metric(text, glyph)
+                    .expect("registered glyph")
+                    .ch()
+            })
             .collect()
     }
 
     fn tab_advance(
         document: &LaidOutDocument,
-        line_idx: usize,
+        line_idx: LineId,
         resources: &GlyphResourceStore,
     ) -> f64 {
-        document
-            .render_view(resources)
-            .text()
-            .line_glyph_advances(line_idx)
+        text_paint::line_glyph_advances(document.render_view(resources).text(), line_idx)
             .expect("advance list for line")
             .iter()
             .next()
@@ -2222,6 +2211,7 @@ mod tests {
             font_size: 16.0,
             vertical_align: InlineVerticalAlign::resolve(vertical_align, 12.0, 16.0),
             white_space: WhiteSpace::Normal,
+            contributes_line_metrics: true,
             visible: true,
             placement_required: false,
         }];
@@ -2252,7 +2242,7 @@ mod tests {
         let index = InlineToken::MAX_DATA;
         let kinds = [
             InlineTokenKind::Glyph { glyph_idx: index },
-            InlineTokenKind::Ellipsis { glyph: index },
+            InlineTokenKind::Ellipsis { glyph: crate::layout_model::GlyphId(index) },
             InlineTokenKind::Image { payload_idx: index },
             InlineTokenKind::AtomicBox { payload_idx: index },
             InlineTokenKind::Break {
@@ -2260,7 +2250,7 @@ mod tests {
             },
             InlineTokenKind::FloatAnchor { box_idx: index },
             InlineTokenKind::InlineBoundary { payload_idx: index },
-            InlineTokenKind::Discretionary { glyph: index },
+            InlineTokenKind::Discretionary { glyph: crate::layout_model::GlyphId(index) },
             InlineTokenKind::Opportunity,
             InlineTokenKind::AbsoluteAnchor { box_idx: index },
         ];
@@ -2282,7 +2272,7 @@ mod tests {
                     assert!(token.wrap() == wrap);
                     assert!(token.break_kind() == break_kind);
                     assert!(token.is_cluster_boundary() && token.is_space() && token.is_tab());
-                    assert_eq!(token.space_glue_class(), SpaceGlueClass::Clause);
+                    assert_eq!(token.metadata().space_glue_class(), SpaceGlueClass::Clause);
                     assert_eq!(token.run_idx(), InlineToken::MAX_RUN_IDX);
                     assert_eq!(token.bidi_level(), u8::MAX);
                     assert_eq!(f64::from(token.width), 12.5);
@@ -2293,7 +2283,7 @@ mod tests {
                     assert!(token.break_kind() == break_kind && token.wrap() == wrap);
                     assert_eq!(token.run_idx(), 0);
                     assert_eq!(token.bidi_level(), 0);
-                    assert_eq!(token.space_glue_class(), SpaceGlueClass::Clause);
+                    assert_eq!(token.metadata().space_glue_class(), SpaceGlueClass::Clause);
                     assert!(token.is_cluster_boundary() && token.is_space() && token.is_tab());
                 }
             }
@@ -2354,13 +2344,13 @@ mod tests {
             200.0,
             &mut document_resources,
         );
-        let offsets = document
-            .render_view(&document_resources)
-            .text()
-            .line_glyph_offsets(0)
-            .expect("plain line offset runs")
-            .iter()
-            .collect::<Vec<_>>();
+        let offsets = text_paint::line_glyph_offsets(
+            document.render_view(&document_resources).text(),
+            LineId::new(0),
+        )
+        .expect("plain line offset runs")
+        .iter()
+        .collect::<Vec<_>>();
 
         assert!(offsets.is_empty(), "zero is the implicit glyph offset");
     }
@@ -2434,15 +2424,15 @@ mod tests {
             200.0,
             &mut document_resources,
         );
-        let offset = document
-            .render_view(&document_resources)
-            .text()
-            .line_glyph_offsets(0)
-            .expect("first line offset runs")
-            .iter()
-            .find(|run| run.range().contains(&1))
-            .expect("the shifted glyph has an offset")
-            .offset();
+        let offset = text_paint::line_glyph_offsets(
+            document.render_view(&document_resources).text(),
+            LineId::new(0),
+        )
+        .expect("first line offset runs")
+        .iter()
+        .find(|run| run.range().contains(&1))
+        .expect("the shifted glyph has an offset")
+        .offset();
 
         assert!(
             (offset - 4.0).abs() < 0.001,
@@ -2502,15 +2492,15 @@ mod tests {
                     &mut document_resources,
                 )
                 .expect("layout requires the shaper-aware API for first-line styles");
-            let offset = document
-                .render_view(&document_resources)
-                .text()
-                .line_glyph_offsets(0)
-                .expect("aligned first line")
-                .iter()
-                .find(|run| run.range().contains(&1))
-                .expect("shifted B")
-                .offset();
+            let offset = text_paint::line_glyph_offsets(
+                document.render_view(&document_resources).text(),
+                LineId::new(0),
+            )
+            .expect("aligned first line")
+            .iter()
+            .find(|run| run.range().contains(&1))
+            .expect("shifted B")
+            .offset();
             assert!(
                 (offset - expected).abs() < 0.001,
                 "{alignment} should resolve against the 40px first-line height, got {offset}"
@@ -2527,10 +2517,12 @@ mod tests {
             &mut document_resources,
         );
         let text = document.render_view(&document_resources).text();
-        let line_idx = (0..text.line_count())
+        let line_idx = text_paint::render_text_view_spatial_order(text)
+            .iter()
+            .copied()
             .find(|&line_idx| line_text(&document, line_idx, &document_resources) == "XXXXXXXXXX")
             .expect("table cell text line");
-        let offsets = text.line_glyph_offsets(line_idx).expect("line offset runs");
+        let offsets = text_paint::line_glyph_offsets(text, line_idx).expect("line offset runs");
         let offset_for = |glyph| {
             offsets
                 .iter()
@@ -2559,13 +2551,13 @@ mod tests {
         let line = document
             .render_view(&document_resources)
             .text()
-            .line(0)
+            .line(LineId::new(0))
             .expect("text produces one line");
-        let offsets = document
-            .render_view(&document_resources)
-            .text()
-            .line_glyph_offsets(0)
-            .expect("raised glyph requires explicit offsets");
+        let offsets = text_paint::line_glyph_offsets(
+            document.render_view(&document_resources).text(),
+            LineId::new(0),
+        )
+        .expect("raised glyph requires explicit offsets");
         let offset_for = |glyph| {
             offsets
                 .iter()
@@ -2593,7 +2585,7 @@ mod tests {
         let line = document
             .render_view(&document_resources)
             .text()
-            .line(0)
+            .line(LineId::new(0))
             .expect("text produces one line");
 
         assert!(
@@ -2611,11 +2603,11 @@ mod tests {
             200.0,
             &mut document_resources,
         );
-        let offsets = document
-            .render_view(&document_resources)
-            .text()
-            .line_glyph_offsets(0)
-            .expect("aligned descendants require explicit offsets");
+        let offsets = text_paint::line_glyph_offsets(
+            document.render_view(&document_resources).text(),
+            LineId::new(0),
+        )
+        .expect("aligned descendants require explicit offsets");
         let offset_for = |glyph| {
             offsets
                 .iter()
@@ -2644,13 +2636,13 @@ mod tests {
         let line = document
             .render_view(&document_resources)
             .text()
-            .line(0)
+            .line(LineId::new(0))
             .expect("grouped inline line");
-        let offsets = document
-            .render_view(&document_resources)
-            .text()
-            .line_glyph_offsets(0)
-            .expect("grouped inline offsets");
+        let offsets = text_paint::line_glyph_offsets(
+            document.render_view(&document_resources).text(),
+            LineId::new(0),
+        )
+        .expect("grouped inline offsets");
         let offset_for = |glyph| {
             offsets
                 .iter()
@@ -2679,17 +2671,17 @@ mod tests {
             &mut document_resources,
         );
         let text = document.render_view(&document_resources).text();
-        let bottom = text.line(0).expect("bottom-aligned line");
-        let top = text.line(1).expect("top-aligned line");
+        let bottom = text.line(LineId::new(0)).expect("bottom-aligned line");
+        let top = text.line(LineId::new(1)).expect("top-aligned line");
 
         assert_eq!(bottom.height(), 60.0);
         assert_eq!(top.height(), 60.0);
         assert!(
-            (bottom.baseline() - 52.5).abs() < 0.001,
+            (text_paint::line_baseline(&bottom) - 52.5).abs() < 0.001,
             "a taller bottom group expands above the ordinary strut"
         );
         assert!(
-            (top.baseline() - 24.0).abs() < 0.001,
+            (text_paint::line_baseline(&top) - 24.0).abs() < 0.001,
             "a taller top group expands below the ordinary strut"
         );
     }
@@ -2705,7 +2697,7 @@ mod tests {
         let line = document
             .render_view(&document_resources)
             .text()
-            .line(0)
+            .line(LineId::new(0))
             .expect("text produces one line");
 
         assert!(
@@ -2723,8 +2715,8 @@ mod tests {
             &mut document_resources,
         );
         let text = document.render_view(&document_resources).text();
-        let first = text.line(0).expect("first wrapped line");
-        let second = text.line(1).expect("second wrapped line");
+        let first = text.line(LineId::new(0)).expect("first wrapped line");
+        let second = text.line(LineId::new(1)).expect("second wrapped line");
 
         assert_eq!(first.height(), 0.0);
         assert_eq!(second.height(), 0.0);
@@ -2745,8 +2737,18 @@ mod tests {
         );
         let text = document.render_view(&document_resources).text();
 
-        assert_eq!(text.line(0).expect("first wrapped line").height(), 10.0);
-        assert_eq!(text.line(1).expect("second wrapped line").height(), 10.0);
+        assert_eq!(
+            text.line(LineId::new(0))
+                .expect("first wrapped line")
+                .height(),
+            10.0
+        );
+        assert_eq!(
+            text.line(LineId::new(1))
+                .expect("second wrapped line")
+                .height(),
+            10.0
+        );
     }
 
     #[test]
@@ -2760,7 +2762,7 @@ mod tests {
         let line = document
             .render_view(&document_resources)
             .text()
-            .line(0)
+            .line(LineId::new(0))
             .expect("zero-sized descendant still creates the parent's line box");
 
         assert!(
@@ -2809,8 +2811,8 @@ mod tests {
                 "line {line_idx} height"
             );
             assert_eq!(
-                candidate_line.baseline(),
-                reference_line.baseline(),
+                text_paint::line_baseline(&candidate_line),
+                text_paint::line_baseline(&reference_line),
                 "line {line_idx} baseline"
             );
         }
@@ -2836,16 +2838,20 @@ mod tests {
             &mut compact_resources,
         );
         let point_for = |document: &LaidOutDocument, id: &str, resources: &GlyphResourceStore| {
-            let box_idx = (0..document.render_view(resources).boxes().len())
+            let box_idx = (0..box_queries::len(document.render_view(resources).boxes()))
                 .find(|&idx| {
-                    document.render_view(resources).boxes().attribute(idx, "id") == Some(id)
+                    box_queries::attribute(
+                        document.render_view(resources).boxes(),
+                        layout_state::box_id_new(idx),
+                        "id",
+                    ) == Some(id)
                 })
                 .expect("fixture box");
-            document
-                .render_view(resources)
-                .boxes()
-                .point(box_idx)
-                .expect("box geometry")
+            box_queries::render_box_view_point(
+                document.render_view(resources).boxes(),
+                layout_state::box_id_new(box_idx),
+            )
+            .expect("box geometry")
         };
 
         for id in ["host", "a", "b", "after"] {
@@ -2874,17 +2880,14 @@ mod tests {
         );
         let view = document.render_view(&document_resources);
         let box_for_id = |id| {
-            (0..view.boxes().len())
-                .find(|&idx| view.boxes().id(idx).map(|value| view.string(value)) == Some(id))
+            (0..box_queries::len(view.boxes()))
+                .map(layout_state::box_id_new)
+                .find(|&idx| box_queries::attribute(view.boxes(), idx, "id") == Some(id))
                 .expect("image box")
         };
-        let shifted = view
-            .boxes()
-            .point(box_for_id("shifted"))
+        let shifted = box_queries::render_box_view_point(view.boxes(), box_for_id("shifted"))
             .expect("shifted image geometry");
-        let following = view
-            .boxes()
-            .point(box_for_id("following"))
+        let following = box_queries::render_box_view_point(view.boxes(), box_for_id("following"))
             .expect("following image geometry");
 
         assert_eq!(shifted.x, 2.0);
@@ -2902,28 +2905,24 @@ mod tests {
             800.0,
             &mut document_resources,
         );
-        let blue = document
-            .render_view(&document_resources)
-            .fragments()
-            .decorations()
-            .iter()
-            .filter(|fragment| fragment.color() == 0x0000ffff)
-            .map(|fragment| {
-                (
-                    fragment.rect(),
-                    fragment.line_idx(),
-                    fragment.is_in_positioned_layer(),
-                )
-            })
-            .collect::<Vec<_>>();
-        let orange = document
-            .render_view(&document_resources)
-            .fragments()
-            .decorations()
-            .iter()
-            .filter(|fragment| fragment.color() == 0xffa500ff)
-            .map(|fragment| fragment.rect())
-            .collect::<Vec<_>>();
+        let blue =
+            fragment_paint::decorations(document.render_view(&document_resources).fragments())
+                .iter()
+                .filter(|fragment| fragment_paint::decoration_color(&fragment) == 0x0000ffff)
+                .map(|fragment| {
+                    (
+                        fragment.rect(),
+                        fragment_paint::render_decoration_line(&fragment),
+                        fragment_paint::decoration_is_in_positioned_layer(&fragment),
+                    )
+                })
+                .collect::<Vec<_>>();
+        let orange =
+            fragment_paint::decorations(document.render_view(&document_resources).fragments())
+                .iter()
+                .filter(|fragment| fragment_paint::decoration_color(&fragment) == 0xffa500ff)
+                .map(|fragment| fragment.rect())
+                .collect::<Vec<_>>();
 
         assert_eq!(
             blue.len(),
@@ -2943,7 +2942,9 @@ mod tests {
                     .render_view(&document_resources)
                     .text()
                     .line(line_idx)
-                    .is_some_and(|line| line.is_in_positioned_layer() == *positioned)
+                    .is_some_and(|line| {
+                        text_paint::line_is_in_positioned_layer(&line) == *positioned
+                    })
             }),
             "split decorations and their owning lines must remain in the same paint layer: {blue:?}"
         );
@@ -2963,13 +2964,13 @@ mod tests {
         );
         let text = document.render_view(&document_resources).text();
 
-        assert_eq!(text.line(0).expect("A line").point().y, 0.0);
-        assert_eq!(text.line(1).expect("B line").point().y, 20.0);
+        assert_eq!(text.line(LineId::new(0)).expect("A line").point().y, 0.0);
+        assert_eq!(text.line(LineId::new(1)).expect("B line").point().y, 20.0);
     }
 
     #[test]
     fn text_run_metrics_keep_varying_glyph_extents_and_tab_transitions() {
-        use crate::{GlyphMetric, GlyphResourceGeneration, GlyphResourceStore};
+        use crate::{GlyphResourceGeneration, GlyphResourceStore};
 
         struct VaryingMetrics(GlyphResourceGeneration);
         impl GlyphShaper for VaryingMetrics {
@@ -2988,9 +2989,10 @@ mod tests {
                 } else {
                     (8.0, 2.0)
                 };
-                Ok(ShapedGlyph::from_metric(
-                    request.character as u32,
-                    GlyphMetric::try_new(request.character, 10.0, ascent, descent).unwrap(),
+                Ok(ShapedGlyph::new(
+                    GlyphHandle(request.character as u32),
+                    10.0,
+                    FontMetrics { ascent, descent },
                 ))
             }
         }
@@ -3001,11 +3003,20 @@ mod tests {
             "<html><body style='margin:0'><div style='font:10px Ahem;white-space:pre;tab-size:4;text-decoration:underline'>X\tYX\nX</div></body></html>", None,
         ).shape(&mut shaper, &mut document_resources).unwrap().layout(crate::LayoutConstraints::new(200.0, 10.0).unwrap(), &document_resources).expect("layout requires the shaper-aware API for first-line styles");
         let text = document.render_view(&document_resources).text();
-        assert_eq!(line_text(&document, 0, &document_resources), "X\tYX");
-        assert_eq!(line_text(&document, 1, &document_resources), "X");
-        assert_eq!(text.line(0).unwrap().height(), 20.0);
-        assert_eq!(text.line(1).unwrap().height(), 10.0);
-        assert_eq!(tab_advance(&document, 0, &document_resources), 30.0);
+        assert_eq!(
+            line_text(&document, LineId::new(0), &document_resources),
+            "X\tYX"
+        );
+        assert_eq!(
+            line_text(&document, LineId::new(1), &document_resources),
+            "X"
+        );
+        assert_eq!(text.line(LineId::new(0)).unwrap().height(), 20.0);
+        assert_eq!(text.line(LineId::new(1)).unwrap().height(), 10.0);
+        assert_eq!(
+            tab_advance(&document, LineId::new(0), &document_resources),
+            30.0
+        );
     }
 
     #[test]
@@ -3029,18 +3040,20 @@ mod tests {
                 let view = document.render_view(&document_resources);
                 let text = view.text();
                 assert!(text.line_count() > 1);
-                let borders: Vec<_> = view
-                    .fragments()
-                    .decorations()
+                let borders: Vec<_> = fragment_paint::decorations(view.fragments())
                     .iter()
-                    .filter(|fragment| fragment.is_inline() && fragment.color() == 0x0000ffff)
+                    .filter(|fragment| {
+                        fragment.is_inline()
+                            && fragment_paint::decoration_color(&fragment) == 0x0000ffff
+                    })
                     .collect();
                 assert!(!borders.is_empty());
                 for border in borders {
-                    let line = text.line(border.line_idx().unwrap() as usize).unwrap();
+                    let line = text.line(border.line().unwrap()).unwrap();
                     // The owner's 16px font has 0.2em descent. Its relative
                     // top offset is 3px, independently of descendant owners.
-                    let expected = line.point().y + line.baseline() + 3.0 + 16.0 * 0.2;
+                    let expected =
+                        line.point().y + text_paint::line_baseline(&line) + 3.0 + 16.0 * 0.2;
                     assert!(
                         (border.rect().y0 - expected).abs() < 0.001,
                         "{direction}: border {:?}, line {line:?}",
@@ -3070,7 +3083,7 @@ mod tests {
             (ahem
                 .render_view(&ahem_resources)
                 .text()
-                .line(0)
+                .line(LineId::new(0))
                 .expect("Ahem line")
                 .height()
                 - 16.0)
@@ -3081,7 +3094,7 @@ mod tests {
             (ordinary
                 .render_view(&ordinary_resources)
                 .text()
-                .line(0)
+                .line(LineId::new(0))
                 .expect("ordinary line")
                 .height()
                 - 19.2)
@@ -3342,25 +3355,28 @@ mod tests {
             &mut document_resources,
         );
         let image_box = tag_point(&document, "img", &document_resources);
-        let fragment = document
-            .render_view(&document_resources)
-            .fragments()
-            .images()
-            .iter()
-            .next()
-            .expect("image fragment");
+        let fragment = fragment_paint::render_fragment_view_images(
+            document.render_view(&document_resources).fragments(),
+        )
+        .iter()
+        .next()
+        .expect("image fragment");
         let line = document
             .render_view(&document_resources)
             .text()
-            .line(fragment.line_idx())
+            .line(fragment_paint::render_image_fragment_line(&fragment))
             .expect("image carrier line");
 
-        let painted = line.point() + fragment.offset().to_vec2();
+        let painted =
+            line.point() + fragment_paint::render_image_fragment_offset(&fragment).to_vec2();
         assert!(
             (painted.x - image_box.x).abs() < 0.001 && (painted.y - image_box.y).abs() < 0.001,
             "painted image {painted:?} must start at its box {image_box:?}"
         );
-        assert_eq!(fragment.size(), kurbo::Size::new(15.0, 15.0));
+        assert_eq!(
+            fragment_paint::render_image_fragment_size(&fragment),
+            kurbo::Size::new(15.0, 15.0)
+        );
     }
 
     #[test]
@@ -3375,17 +3391,15 @@ mod tests {
         );
         let image_point = tag_point(&document, "img", &document_resources);
         let image_size = tag_size(&document, "img", &document_resources);
-        let decorations = document
-            .render_view(&document_resources)
-            .fragments()
-            .decorations();
+        let decorations =
+            fragment_paint::decorations(document.render_view(&document_resources).fragments());
         let background = decorations
             .iter()
-            .find(|fragment| fragment.color() == 0x123456FF)
+            .find(|fragment| fragment_paint::decoration_color(&fragment) == 0x123456FF)
             .expect("inline image background");
         let borders = decorations
             .iter()
-            .filter(|fragment| fragment.color() == 0xABCDEFFF)
+            .filter(|fragment| fragment_paint::decoration_color(&fragment) == 0xABCDEFFF)
             .collect::<Vec<_>>();
 
         assert_eq!(
@@ -3414,16 +3428,15 @@ mod tests {
             crate::ImageSizingPolicy::WebCompatible,
             &mut document_resources,
         );
-        let fragments = document
-            .render_view(&document_resources)
-            .fragments()
-            .images()
-            .iter()
-            .collect::<Vec<_>>();
+        let fragments = fragment_paint::render_fragment_view_images(
+            document.render_view(&document_resources).fragments(),
+        )
+        .iter()
+        .collect::<Vec<_>>();
         assert_eq!(fragments.len(), 2);
         assert_ne!(
-            fragments[0].line_idx(),
-            fragments[1].line_idx(),
+            fragment_paint::render_image_fragment_line(&fragments[0]),
+            fragment_paint::render_image_fragment_line(&fragments[1]),
             "adjacent atomic inline boxes have a soft wrap opportunity between them"
         );
 
@@ -3431,8 +3444,10 @@ mod tests {
         let painted = fragments
             .iter()
             .map(|fragment| {
-                text.line(fragment.line_idx()).expect("image line").point()
-                    + fragment.offset().to_vec2()
+                text.line(fragment_paint::render_image_fragment_line(&fragment))
+                    .expect("image line")
+                    .point()
+                    + fragment_paint::render_image_fragment_offset(&fragment).to_vec2()
             })
             .collect::<Vec<_>>();
         assert!((painted[0].x - painted[1].x).abs() < 0.001);
@@ -3450,19 +3465,20 @@ mod tests {
             &mut document_resources,
         );
         let text = document.render_view(&document_resources).text();
-        let inline_image = document
-            .render_view(&document_resources)
-            .fragments()
-            .images()
-            .iter()
-            .find(|fragment| {
-                fragment.size().height == 96.0
-                    && text
-                        .line(fragment.line_idx())
-                        .is_some_and(|line| line.point().x < 100.0)
-            })
-            .expect("in-flow image fragment");
-        let line = text.line(inline_image.line_idx()).expect("image line");
+        let inline_image = fragment_paint::render_fragment_view_images(
+            document.render_view(&document_resources).fragments(),
+        )
+        .iter()
+        .find(|fragment| {
+            fragment_paint::render_image_fragment_size(&fragment).height == 96.0
+                && text
+                    .line(fragment_paint::render_image_fragment_line(&fragment))
+                    .is_some_and(|line| line.point().x < 100.0)
+        })
+        .expect("in-flow image fragment");
+        let line = text
+            .line(fragment_paint::render_image_fragment_line(&inline_image))
+            .expect("image line");
 
         assert!(
             (line.height() - 96.0).abs() < 0.001,
@@ -3480,18 +3496,19 @@ mod tests {
             crate::ImageSizingPolicy::WebCompatible,
             &mut document_resources,
         );
-        let fragments = document
-            .render_view(&document_resources)
-            .fragments()
-            .images()
-            .iter()
-            .collect::<Vec<_>>();
+        let fragments = fragment_paint::render_fragment_view_images(
+            document.render_view(&document_resources).fragments(),
+        )
+        .iter()
+        .collect::<Vec<_>>();
         let text = document.render_view(&document_resources).text();
         let mut painted = fragments
             .iter()
             .map(|fragment| {
-                text.line(fragment.line_idx()).expect("image line").point()
-                    + fragment.offset().to_vec2()
+                text.line(fragment_paint::render_image_fragment_line(&fragment))
+                    .expect("image line")
+                    .point()
+                    + fragment_paint::render_image_fragment_offset(&fragment).to_vec2()
             })
             .collect::<Vec<_>>();
         painted.sort_by(|left, right| left.x.total_cmp(&right.x));
@@ -3527,7 +3544,7 @@ mod tests {
             .iter()
             .filter(|line| {
                 matches!(
-                    line_text(&document, line.index(), &document_resources).as_str(),
+                    line_text(&document, line.id(), &document_resources).as_str(),
                     "x" | "z"
                 )
             })
@@ -3555,26 +3572,26 @@ mod tests {
             crate::ImageSizingPolicy::WebCompatible,
             &mut document_resources,
         );
-        let fragment = document
-            .render_view(&document_resources)
-            .fragments()
-            .images()
-            .iter()
-            .next()
-            .expect("image fragment");
+        let fragment = fragment_paint::render_fragment_view_images(
+            document.render_view(&document_resources).fragments(),
+        )
+        .iter()
+        .next()
+        .expect("image fragment");
         let line = document
             .render_view(&document_resources)
             .text()
-            .line(fragment.line_idx())
+            .line(fragment_paint::render_image_fragment_line(&fragment))
             .expect("image line");
-        let painted = line.point() + fragment.offset().to_vec2();
+        let painted =
+            line.point() + fragment_paint::render_image_fragment_offset(&fragment).to_vec2();
 
         assert!(
             (painted.y - line.point().y).abs() < 0.001,
             "baseline image should occupy the top of its line, not receive symmetric half-leading"
         );
         assert!(
-            line.height() > fragment.size().height,
+            line.height() > fragment_paint::render_image_fragment_size(&fragment).height,
             "the parent font strut should retain descender space below the image"
         );
     }
@@ -3589,17 +3606,28 @@ mod tests {
             crate::ImageSizingPolicy::WebCompatible,
             &mut contain_resources,
         );
-        let contain = contain
-            .render_view(&contain_resources)
-            .fragments()
-            .images()
-            .iter()
-            .next()
-            .expect("contained image fragment");
-        assert_eq!(contain.size(), kurbo::Size::new(100.0, 50.0));
-        assert_eq!(contain.offset().x, contain.clip().x0);
-        assert_eq!(contain.offset().y, contain.clip().y0 + 25.0);
-        assert_eq!(contain.clip().size(), kurbo::Size::new(100.0, 100.0));
+        let contain = fragment_paint::render_fragment_view_images(
+            contain.render_view(&contain_resources).fragments(),
+        )
+        .iter()
+        .next()
+        .expect("contained image fragment");
+        assert_eq!(
+            fragment_paint::render_image_fragment_size(&contain),
+            kurbo::Size::new(100.0, 50.0)
+        );
+        assert_eq!(
+            fragment_paint::render_image_fragment_offset(&contain).x,
+            fragment_paint::render_image_fragment_clip(&contain).x0
+        );
+        assert_eq!(
+            fragment_paint::render_image_fragment_offset(&contain).y,
+            fragment_paint::render_image_fragment_clip(&contain).y0 + 25.0
+        );
+        assert_eq!(
+            fragment_paint::render_image_fragment_clip(&contain).size(),
+            kurbo::Size::new(100.0, 100.0)
+        );
 
         let mut cover_resources = GlyphResourceStore::default();
         let cover = layout_html_with_images(
@@ -3609,17 +3637,28 @@ mod tests {
             crate::ImageSizingPolicy::WebCompatible,
             &mut cover_resources,
         );
-        let cover = cover
-            .render_view(&cover_resources)
-            .fragments()
-            .images()
-            .iter()
-            .next()
-            .expect("covered image fragment");
-        assert_eq!(cover.size(), kurbo::Size::new(200.0, 100.0));
-        assert_eq!(cover.offset().x, cover.clip().x0 - 50.0);
-        assert_eq!(cover.offset().y, cover.clip().y0);
-        assert_eq!(cover.clip().size(), kurbo::Size::new(100.0, 100.0));
+        let cover = fragment_paint::render_fragment_view_images(
+            cover.render_view(&cover_resources).fragments(),
+        )
+        .iter()
+        .next()
+        .expect("covered image fragment");
+        assert_eq!(
+            fragment_paint::render_image_fragment_size(&cover),
+            kurbo::Size::new(200.0, 100.0)
+        );
+        assert_eq!(
+            fragment_paint::render_image_fragment_offset(&cover).x,
+            fragment_paint::render_image_fragment_clip(&cover).x0 - 50.0
+        );
+        assert_eq!(
+            fragment_paint::render_image_fragment_offset(&cover).y,
+            fragment_paint::render_image_fragment_clip(&cover).y0
+        );
+        assert_eq!(
+            fragment_paint::render_image_fragment_clip(&cover).size(),
+            kurbo::Size::new(100.0, 100.0)
+        );
     }
 
     #[test]
@@ -3632,21 +3671,24 @@ mod tests {
             crate::ImageSizingPolicy::WebCompatible,
             &mut document_resources,
         );
-        let fragment = document
-            .render_view(&document_resources)
-            .fragments()
-            .images()
-            .iter()
-            .next()
-            .expect("image fragment");
+        let fragment = fragment_paint::render_fragment_view_images(
+            document.render_view(&document_resources).fragments(),
+        )
+        .iter()
+        .next()
+        .expect("image fragment");
         let line = document
             .render_view(&document_resources)
             .text()
-            .line(fragment.line_idx())
+            .line(fragment_paint::render_image_fragment_line(&fragment))
             .expect("image line");
-        let painted = line.point() + fragment.offset().to_vec2();
+        let painted =
+            line.point() + fragment_paint::render_image_fragment_offset(&fragment).to_vec2();
 
-        assert_eq!(fragment.size().height, 96.0);
+        assert_eq!(
+            fragment_paint::render_image_fragment_size(&fragment).height,
+            96.0
+        );
         assert!(
             (painted.y - line.point().y).abs() < 0.001,
             "the image's own line-height must not add leading around its box"
@@ -3667,17 +3709,16 @@ mod tests {
             crate::ImageSizingPolicy::WebCompatible,
             &mut document_resources,
         );
-        let fragment = document
-            .render_view(&document_resources)
-            .fragments()
-            .images()
-            .iter()
-            .next()
-            .expect("image fragment");
+        let fragment = fragment_paint::render_fragment_view_images(
+            document.render_view(&document_resources).fragments(),
+        )
+        .iter()
+        .next()
+        .expect("image fragment");
         let line = document
             .render_view(&document_resources)
             .text()
-            .line(fragment.line_idx())
+            .line(fragment_paint::render_image_fragment_line(&fragment))
             .expect("image line");
 
         assert!(
@@ -3708,16 +3749,85 @@ mod tests {
         let text = document.render_view(&document_resources).text();
         let advances = (0..text.glyph_count())
             .map(|index| {
-                text.glyph_at(index)
-                    .and_then(|glyph| text.glyph_metric(glyph))
+                text_paint::glyph_at(text, index)
+                    .and_then(|glyph| text_paint::glyph_metric(text, glyph))
                     .expect("shaped glyph")
                     .advance()
             })
             .collect::<Vec<_>>();
         assert_eq!(advances, vec![18.0, 18.0, 18.0, 8.0, 8.0, 8.0]);
-        assert_eq!(text.line(0).expect("first line").height(), 72.0);
+        assert_eq!(
+            text.line(LineId::new(0)).expect("first line").height(),
+            72.0
+        );
     }
 
+    #[test]
+    fn floated_and_inline_first_letters_share_selection_across_source_runs() {
+        for (body, selected) in [
+            (
+                "\u{201c}<span>A</span>!<em>\u{301}</em>rest",
+                "\u{201c}A!\u{301}",
+            ),
+            ("! A", "!"),
+            ("!?", "!?"),
+            ("  <span>A\u{301}</span>rest", "A\u{301}"),
+        ] {
+            for float in ["none", "left"] {
+                let mut factory = DocumentFactory::new();
+                let mut shaper = GlyphCache::new();
+                let mut resources = GlyphResourceStore::default();
+                let document = factory.parse_with_new_pipeline(
+                    &format!("<html><body><div>{body}</div></body></html>"),
+                    Some(&format!("html,body,div {{ margin:0; font-size:16px }} div::first-letter {{ float:{float}; font-size:36px; line-height:72px }}")),
+                ).shape(&mut shaper, &mut resources).unwrap()
+                    .layout(crate::LayoutConstraints::new(500.0, 16.0).unwrap(), &resources).unwrap();
+                let text = document.render_view(&resources).text();
+                let selected_text = (0..text.glyph_count())
+                    .filter_map(|index| {
+                        let metric =
+                            text_paint::glyph_metric(text, text_paint::glyph_at(text, index)?)
+                                .unwrap();
+                        (metric.advance() == 18.0 && !metric.ch().is_whitespace())
+                            .then_some(metric.ch())
+                    })
+                    .collect::<String>();
+                assert_eq!(selected_text, selected, "{float}: {body:?}");
+                assert!(
+                    text.lines()
+                        .iter()
+                        .any(|line| (line.height() - 72.0).abs() < 1e-5),
+                    "selected text keeps the pseudo line height"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pseudo_line_heights_use_shaped_metrics_alongside_table_column_metrics() {
+        for pseudo in ["first-line", "first-letter"] {
+            for (height, expected) in [("10ex", 150.0), ("normal", 24.0)] {
+                let mut factory = DocumentFactory::new();
+                let mut shaper = GlyphCache::with_x_height_ratio(0.75);
+                let mut resources = GlyphResourceStore::default();
+                let document = factory.parse_with_new_pipeline(
+                    "<html><body><span style='position:relative;left:1ex'><div>Ab</div></span><table><col style='width:2ex'><tr><td>X</td></tr></table></body></html>",
+                    Some(&format!("html,body,div,table {{ margin:0; font-size:20px; line-height:20px }} div::{pseudo} {{ line-height:{height} }}")),
+                ).shape(&mut shaper, &mut resources).unwrap()
+                    .layout_with_shaper(crate::LayoutConstraints::new(500.0, 20.0).unwrap(), &mut shaper, &mut resources).unwrap();
+                let line = document
+                    .render_view(&resources)
+                    .text()
+                    .line(LineId::new(0))
+                    .unwrap();
+                assert!(
+                    (line.height() - expected).abs() < 1e-5,
+                    "{pseudo}, {height}: {}",
+                    line.height()
+                );
+            }
+        }
+    }
     #[test]
     fn ancestor_first_letter_reaches_the_first_in_flow_block_descendant() {
         let mut factory = DocumentFactory::new();
@@ -3732,8 +3842,8 @@ mod tests {
         let text = document.render_view(&document_resources).text();
         let advances = (0..text.glyph_count())
             .map(|index| {
-                text.glyph_at(index)
-                    .and_then(|glyph| text.glyph_metric(glyph))
+                text_paint::glyph_at(text, index)
+                    .and_then(|glyph| text_paint::glyph_metric(text, glyph))
                     .expect("shaped glyph")
                     .advance()
             })
@@ -3757,7 +3867,7 @@ mod tests {
 
         assert_eq!(document.line_count(), 1);
         assert_eq!(
-            line_text(&document, 0, &document_resources),
+            line_text(&document, LineId::new(0), &document_resources),
             "First sentence. Second sentence!"
         );
     }
@@ -3787,10 +3897,13 @@ mod tests {
             300.0,
             &mut document_resources,
         );
-        assert_eq!(line_text(&document, 0, &document_resources), "a\tb");
+        assert_eq!(
+            line_text(&document, LineId::new(0), &document_resources),
+            "a\tb"
+        );
         // Test shaper: every 16px glyph/space advances 8px. After `a`, a
         // four-space tab interval reaches the 32px stop, hence 24px.
-        assert!((tab_advance(&document, 0, &document_resources) - 24.0).abs() < 0.001);
+        assert!((tab_advance(&document, LineId::new(0), &document_resources) - 24.0).abs() < 0.001);
     }
 
     #[test]
@@ -3802,8 +3915,7 @@ mod tests {
             &mut document_resources,
         );
         let text = document.render_view(&document_resources).text();
-        let advances: Vec<_> = text
-            .line_glyph_advances(0)
+        let advances: Vec<_> = text_paint::line_glyph_advances(text, LineId::new(0))
             .unwrap()
             .iter()
             .map(|run| (run.range(), run.advance()))
@@ -3836,9 +3948,11 @@ mod tests {
                 1,
                 "zero-width opportunities must not expand tabs for {white_space}"
             );
-            assert_eq!(line_text(&document, 0, &document_resources), "a\tb\tc");
-            let advances: Vec<_> = text
-                .line_glyph_advances(0)
+            assert_eq!(
+                line_text(&document, LineId::new(0), &document_resources),
+                "a\tb\tc"
+            );
+            let advances: Vec<_> = text_paint::line_glyph_advances(text, LineId::new(0))
                 .unwrap()
                 .iter()
                 .map(|run| (run.range(), run.advance()))
@@ -3856,8 +3970,7 @@ mod tests {
             &mut document_resources,
         );
         let text = document.render_view(&document_resources).text();
-        let advances: Vec<_> = text
-            .line_glyph_advances(0)
+        let advances: Vec<_> = text_paint::line_glyph_advances(text, LineId::new(0))
             .unwrap()
             .iter()
             .map(|run| (run.range(), run.advance()))
@@ -3874,7 +3987,10 @@ mod tests {
             &mut document_resources,
         );
         // At x=16 the next stop is only 2px away, below the 4px minimum.
-        assert_eq!(tab_advance(&document, 0, &document_resources), 20.0);
+        assert_eq!(
+            tab_advance(&document, LineId::new(0), &document_resources),
+            20.0
+        );
     }
 
     #[test]
@@ -3886,7 +4002,7 @@ mod tests {
             &mut document_resources,
         );
         assert!(
-            (tab_advance(&document, 0, &document_resources) - 24.0).abs() < 0.001,
+            (tab_advance(&document, LineId::new(0), &document_resources) - 24.0).abs() < 0.001,
             "the inline span's larger font must not redefine the block's tab stops"
         );
     }
@@ -3899,7 +4015,7 @@ mod tests {
             300.0,
             &mut document_resources,
         );
-        assert!((tab_advance(&document, 0, &document_resources) - 16.0).abs() < 0.001);
+        assert!((tab_advance(&document, LineId::new(0), &document_resources) - 16.0).abs() < 0.001);
     }
 
     #[test]
@@ -3910,7 +4026,7 @@ mod tests {
             300.0,
             &mut length_resources,
         );
-        assert!((tab_advance(&length, 0, &length_resources) - 12.0).abs() < 0.001);
+        assert!((tab_advance(&length, LineId::new(0), &length_resources) - 12.0).abs() < 0.001);
 
         let mut zero_resources = GlyphResourceStore::default();
         let zero = layout_html(
@@ -3918,7 +4034,7 @@ mod tests {
             300.0,
             &mut zero_resources,
         );
-        assert_eq!(tab_advance(&zero, 0, &zero_resources), 0.0);
+        assert_eq!(tab_advance(&zero, LineId::new(0), &zero_resources), 0.0);
     }
 
     #[test]
@@ -3929,14 +4045,17 @@ mod tests {
             300.0,
             &mut document_resources,
         );
-        assert_eq!(line_text(&document, 0, &document_resources), "a b");
+        assert_eq!(
+            line_text(&document, LineId::new(0), &document_resources),
+            "a b"
+        );
         assert!(
-            document
-                .render_view(&document_resources)
-                .text()
-                .line_glyph_advances(0)
-                .expect("line advances")
-                .is_empty()
+            text_paint::line_glyph_advances(
+                document.render_view(&document_resources).text(),
+                LineId::new(0)
+            )
+            .expect("line advances")
+            .is_empty()
         );
     }
 
@@ -3968,7 +4087,7 @@ mod tests {
         let html = fs::read_to_string(&html_path).expect("chapter html");
         let mut factory = DocumentFactory::new();
         let mut document = factory.parse_to_dom(&html);
-        document.set_root_font_size(html_dom::RootFontSize::new(16.0).unwrap());
+        document.set_root_font_size(dom_values::root_font_size_new(16.0).unwrap());
         println!(
             "step 2 dom: root={:?}",
             document.dom_root().map(|n| n.raw())
@@ -4068,16 +4187,16 @@ mod tests {
             .expect("layout requires the shaper-aware API for first-line styles");
         println!("step 6 layout: lines={}", laid_out.line_count());
 
-        let float_point = laid_out
-            .render_view(&shaped_resources)
-            .boxes()
-            .point(float_box_idx)
-            .expect("box index in range");
-        let float_size = laid_out
-            .render_view(&shaped_resources)
-            .boxes()
-            .size(float_box_idx)
-            .expect("box index in range");
+        let float_point = box_queries::render_box_view_point(
+            laid_out.render_view(&shaped_resources).boxes(),
+            layout_state::box_id_new(float_box_idx),
+        )
+        .expect("box index in range");
+        let float_size = box_queries::render_box_view_size(
+            laid_out.render_view(&shaped_resources).boxes(),
+            layout_state::box_id_new(float_box_idx),
+        )
+        .expect("box index in range");
         for (idx, line) in laid_out
             .render_view(&shaped_resources)
             .text()
@@ -4088,12 +4207,11 @@ mod tests {
         {
             let text_view = laid_out.render_view(&shaped_resources).text();
             let text: String = text_view
-                .glyph_slice(line.glyphs())
+                .glyph_slice(text_paint::render_line_glyphs(&line))
                 .expect("line glyph range")
                 .iter()
                 .map(|&glyph| {
-                    text_view
-                        .glyph_metric(glyph)
+                    text_paint::glyph_metric(text_view, glyph)
                         .expect("registered glyph")
                         .ch()
                 })
@@ -4102,7 +4220,7 @@ mod tests {
                 "line {idx}: point=({:.2},{:.2}) baseline={:.2} height={:.2} text={:?}",
                 line.point().x,
                 line.point().y,
-                line.baseline(),
+                text_paint::line_baseline(&line),
                 line.height(),
                 text
             );
@@ -4120,8 +4238,7 @@ mod tests {
                     .expect("line glyph range")
                     .iter()
                     .map(|&glyph| {
-                        text_view
-                            .glyph_metric(glyph)
+                        text_paint::glyph_metric(text_view, glyph)
                             .expect("registered glyph")
                             .ch()
                     })
@@ -4138,7 +4255,7 @@ mod tests {
             float_line.0,
             float_line.1.point().x,
             float_line.1.point().y,
-            float_line.1.baseline(),
+            text_paint::line_baseline(&float_line.1),
             float_line.1.height()
         );
         assert!(
@@ -4157,7 +4274,10 @@ mod tests {
         );
 
         assert_eq!(document.line_count(), 1);
-        assert_eq!(line_text(&document, 0, &document_resources), "a");
+        assert_eq!(
+            line_text(&document, LineId::new(0), &document_resources),
+            "a"
+        );
     }
 
     #[test]
@@ -4170,7 +4290,10 @@ mod tests {
         );
 
         assert_eq!(document.line_count(), 1);
-        assert_eq!(line_text(&document, 0, &document_resources), "word");
+        assert_eq!(
+            line_text(&document, LineId::new(0), &document_resources),
+            "word"
+        );
     }
 
     #[test]
@@ -4184,7 +4307,7 @@ mod tests {
 
         assert_eq!(document.line_count(), 1);
         assert_eq!(
-            line_text(&document, 0, &document_resources),
+            line_text(&document, LineId::new(0), &document_resources),
             "one two three"
         );
     }
@@ -4199,7 +4322,10 @@ mod tests {
         );
 
         assert_eq!(document.line_count(), 1);
-        assert_eq!(line_text(&document, 0, &document_resources), "  word");
+        assert_eq!(
+            line_text(&document, LineId::new(0), &document_resources),
+            "  word"
+        );
     }
 
     #[test]
@@ -4212,17 +4338,27 @@ mod tests {
         );
 
         let lines = (0..document.line_count())
+            .map(LineId::new)
             .map(|index| line_text(&document, index, &document_resources))
             .collect::<Vec<_>>();
         assert_eq!(document.line_count(), 7, "published lines: {lines:?}");
-        assert_eq!(line_text(&document, 0, &document_resources), "");
-        assert_eq!(line_text(&document, 6, &document_resources), "   ");
+        assert_eq!(
+            line_text(&document, LineId::new(0), &document_resources),
+            ""
+        );
+        assert_eq!(
+            line_text(&document, LineId::new(6), &document_resources),
+            "   "
+        );
         let view = document.render_view(&document_resources);
-        let target = (0..view.boxes().len())
-            .find(|&idx| view.boxes().id(idx).map(|value| view.string(value)) == Some("target"))
+        let target = (0..box_queries::len(view.boxes()))
+            .map(layout_state::box_id_new)
+            .find(|&idx| box_queries::attribute(view.boxes(), idx, "id") == Some("target"))
             .expect("target box");
         assert_eq!(
-            view.boxes().size(target).expect("target geometry").height,
+            box_queries::render_box_view_size(view.boxes(), target)
+                .expect("target geometry")
+                .height,
             140.0
         );
     }
@@ -4242,21 +4378,24 @@ mod tests {
          &mut document_resources);
 
         let view = document.render_view(&document_resources);
-        let grid = (0..view.boxes().len())
-            .find(|&idx| view.boxes().id(idx).map(|value| view.string(value)) == Some("grid"))
+        let grid = (0..box_queries::len(view.boxes()))
+            .map(layout_state::box_id_new)
+            .find(|&idx| box_queries::attribute(view.boxes(), idx, "id") == Some("grid"))
             .expect("grid box");
-        let item = (0..view.boxes().len())
-            .find(|&idx| view.boxes().id(idx).map(|value| view.string(value)) == Some("item"))
+        let item = (0..box_queries::len(view.boxes()))
+            .map(layout_state::box_id_new)
+            .find(|&idx| box_queries::attribute(view.boxes(), idx, "id") == Some("item"))
             .expect("item box");
         let lines = (0..document.line_count())
+            .map(LineId::new)
             .map(|idx| line_text(&document, idx, &document_resources))
             .collect::<Vec<_>>();
         assert_eq!(
             document.line_count(),
             5,
             "the exact-width `X XX` pair should share a line; grid={:?}, item={:?}, lines={lines:?}",
-            view.boxes().size(grid),
-            view.boxes().size(item)
+            box_queries::render_box_view_size(view.boxes(), grid),
+            box_queries::render_box_view_size(view.boxes(), item)
         );
     }
 
@@ -4287,6 +4426,7 @@ mod tests {
             "overflow-wrap should break the long word across lines"
         );
         let combined: String = (0..document.line_count())
+            .map(LineId::new)
             .map(|i| line_text(&document, i, &document_resources))
             .collect();
         assert_eq!(
@@ -4305,8 +4445,14 @@ mod tests {
         let document = layout_html(html, 39.0, &mut document_resources);
 
         assert_eq!(document.line_count(), 2);
-        assert_eq!(line_text(&document, 0, &document_resources), "aa");
-        assert_eq!(line_text(&document, 1, &document_resources), "bb");
+        assert_eq!(
+            line_text(&document, LineId::new(0), &document_resources),
+            "aa"
+        );
+        assert_eq!(
+            line_text(&document, LineId::new(1), &document_resources),
+            "bb"
+        );
     }
 
     #[test]
@@ -4323,6 +4469,7 @@ mod tests {
             "word-break: break-all should wrap the long word"
         );
         let combined: String = (0..document.line_count())
+            .map(LineId::new)
             .map(|i| line_text(&document, i, &document_resources))
             .collect();
         assert_eq!(combined, "a".repeat(40));
@@ -4355,27 +4502,30 @@ mod tests {
         let line = document
             .render_view(&document_resources)
             .text()
-            .line(0)
+            .line(LineId::new(0))
             .expect("overflowing paragraph should emit one line");
-        let marker = document
-            .render_view(&document_resources)
-            .text()
-            .ellipsis_for_line(0)
-            .expect("ellipsis marker should be emitted");
+        let marker = text_paint::ellipsis_for_line(
+            document.render_view(&document_resources).text(),
+            LineId::new(0),
+        )
+        .expect("ellipsis marker should be emitted");
 
-        assert_eq!(line_text(&document, 0, &document_resources), "ab");
         assert_eq!(
-            document
-                .render_view(&document_resources)
-                .text()
-                .glyph_metric(marker.glyph())
-                .expect("registered marker metric")
-                .ch(),
+            line_text(&document, LineId::new(0), &document_resources),
+            "ab"
+        );
+        assert_eq!(
+            text_paint::glyph_metric(
+                document.render_view(&document_resources).text(),
+                marker.glyph()
+            )
+            .expect("registered marker metric")
+            .ch(),
             '\u{2026}'
         );
         assert!((marker.offset().x - 16.0).abs() < 0.001);
         assert_eq!(
-            line.glyphs(),
+            text_paint::render_line_glyphs(&line),
             0..2,
             "synthetic marker must not enter the source glyph range"
         );
@@ -4390,20 +4540,23 @@ mod tests {
             &mut document_resources,
         );
 
-        assert_eq!(line_text(&document, 0, &document_resources), "abcdef");
-        assert!(
-            document
-                .render_view(&document_resources)
-                .text()
-                .ellipsis_for_line(0)
-                .is_none()
+        assert_eq!(
+            line_text(&document, LineId::new(0), &document_resources),
+            "abcdef"
         );
         assert!(
-            document
-                .render_view(&document_resources)
-                .text()
-                .line_overflow_clip(0)
-                .is_some()
+            text_paint::ellipsis_for_line(
+                document.render_view(&document_resources).text(),
+                LineId::new(0)
+            )
+            .is_none()
+        );
+        assert!(
+            text_paint::line_overflow_clip(
+                document.render_view(&document_resources).text(),
+                LineId::new(0)
+            )
+            .is_some()
         );
     }
 
@@ -4416,13 +4569,16 @@ mod tests {
             &mut document_resources,
         );
 
-        assert_eq!(line_text(&document, 0, &document_resources), "abcdef");
+        assert_eq!(
+            line_text(&document, LineId::new(0), &document_resources),
+            "abcdef"
+        );
         assert!(
-            document
-                .render_view(&document_resources)
-                .text()
-                .ellipsis_for_line(0)
-                .is_none()
+            text_paint::ellipsis_for_line(
+                document.render_view(&document_resources).text(),
+                LineId::new(0)
+            )
+            .is_none()
         );
     }
 
@@ -4443,11 +4599,11 @@ mod tests {
             .expect("layout requires the shaper-aware API for first-line styles");
 
         assert!(
-            document
-                .render_view(&shaped_resources)
-                .text()
-                .ellipsis_for_line(0)
-                .is_none()
+            text_paint::ellipsis_for_line(
+                document.render_view(&shaped_resources).text(),
+                LineId::new(0)
+            )
+            .is_none()
         );
         document
             .relayout(
@@ -4456,11 +4612,11 @@ mod tests {
             )
             .expect("layout requires the shaper-aware API for first-line styles");
         assert!(
-            document
-                .render_view(&shaped_resources)
-                .text()
-                .ellipsis_for_line(0)
-                .is_some()
+            text_paint::ellipsis_for_line(
+                document.render_view(&shaped_resources).text(),
+                LineId::new(0)
+            )
+            .is_some()
         );
     }
 
@@ -4474,14 +4630,16 @@ mod tests {
             &mut document_resources,
         );
 
-        let frag = document
-            .render_view(&document_resources)
-            .fragments()
-            .images()
-            .iter()
-            .next()
-            .expect("expected an image fragment");
-        assert_eq!(frag.size().width, 16.0);
+        let frag = fragment_paint::render_fragment_view_images(
+            document.render_view(&document_resources).fragments(),
+        )
+        .iter()
+        .next()
+        .expect("expected an image fragment");
+        assert_eq!(
+            fragment_paint::render_image_fragment_size(&frag).width,
+            16.0
+        );
     }
 
     #[test]
@@ -4494,13 +4652,12 @@ mod tests {
             crate::ImageSizingPolicy::WebCompatible,
             &mut document_resources,
         );
-        let sizes = document
-            .render_view(&document_resources)
-            .fragments()
-            .images()
-            .iter()
-            .map(|fragment| fragment.size())
-            .collect::<Vec<_>>();
+        let sizes = fragment_paint::render_fragment_view_images(
+            document.render_view(&document_resources).fragments(),
+        )
+        .iter()
+        .map(|fragment| fragment_paint::render_image_fragment_size(&fragment))
+        .collect::<Vec<_>>();
 
         assert_eq!(
             sizes,
@@ -4524,19 +4681,20 @@ mod tests {
             &mut document_resources,
         );
 
-        let frag = document
-            .render_view(&document_resources)
-            .fragments()
-            .images()
-            .iter()
-            .next()
-            .expect("expected an image fragment");
+        let frag = fragment_paint::render_fragment_view_images(
+            document.render_view(&document_resources).fragments(),
+        )
+        .iter()
+        .next()
+        .expect("expected an image fragment");
         assert!(
-            frag.size().width < 2000.0 && frag.size().width <= 600.0,
+            fragment_paint::render_image_fragment_size(&frag).width < 2000.0
+                && fragment_paint::render_image_fragment_size(&frag).width <= 600.0,
             "image should shrink to the column, got {}",
-            frag.size().width
+            fragment_paint::render_image_fragment_size(&frag).width
         );
-        let ratio = frag.size().height / frag.size().width;
+        let ratio = fragment_paint::render_image_fragment_size(&frag).height
+            / fragment_paint::render_image_fragment_size(&frag).width;
         assert!(
             (ratio - 0.5).abs() < 0.01,
             "aspect ratio should be preserved (0.5), got {ratio}"
@@ -4557,6 +4715,7 @@ mod tests {
         // Joining the per-line text (restoring the space discarded at each line
         // break) must reproduce the source in order with no glyph lost.
         let combined = (0..document.line_count())
+            .map(LineId::new)
             .map(|i| line_text(&document, i, &document_resources))
             .collect::<Vec<_>>()
             .join(" ");
@@ -4578,18 +4737,21 @@ mod tests {
             .text()
             .lines()
             .iter()
-            .enumerate()
-            .find(|(_, line)| {
+            .find(|line| {
                 let text = document.render_view(&document_resources).text();
                 let chars: String = text
-                    .glyph_slice(line.glyphs())
+                    .glyph_slice(text_paint::render_line_glyphs(&line))
                     .expect("line glyph range")
                     .iter()
-                    .map(|&glyph| text.glyph_metric(glyph).expect("registered glyph").ch())
+                    .map(|&glyph| {
+                        text_paint::glyph_metric(text, glyph)
+                            .expect("registered glyph")
+                            .ch()
+                    })
                     .collect();
                 chars == "T"
             })
-            .map(|(idx, _)| idx)
+            .map(|line| line.id())
             .expect("drop cap line should exist");
 
         let line = document
@@ -4600,14 +4762,14 @@ mod tests {
         let glyph = document
             .render_view(&document_resources)
             .text()
-            .glyph_slice(line.glyphs())
+            .glyph_slice(text_paint::render_line_glyphs(&line))
             .expect("line glyph range")[0];
         let metric = document.glyph_metrics(&document_resources).get(glyph);
         let baseline_offset = metric.ascent() as f64;
         let half_leading = (line.height() - (metric.ascent() + metric.descent()) as f64) / 2.0;
 
         assert!(
-            (line.baseline() - baseline_offset - half_leading).abs() < 1.0,
+            (text_paint::line_baseline(&line) - baseline_offset - half_leading).abs() < 1.0,
             "a float's contents must use the same half-leading baseline placement as ordinary inline content"
         );
     }
@@ -4653,10 +4815,13 @@ mod tests {
             "expected wrapping to produce multiple lines"
         );
         assert!(
-            line_text(&document, 0, &document_resources).ends_with("  "),
+            line_text(&document, LineId::new(0), &document_resources).ends_with("  "),
             "the preserved spaces stay before the break"
         );
-        assert_eq!(line_text(&document, 1, &document_resources), "x");
+        assert_eq!(
+            line_text(&document, LineId::new(1), &document_resources),
+            "x"
+        );
     }
 
     #[test]
@@ -4674,8 +4839,14 @@ mod tests {
         );
 
         assert_eq!(document.line_count(), 2);
-        assert_eq!(line_text(&document, 0, &document_resources), "A");
-        assert_eq!(line_text(&document, 1, &document_resources), "B");
+        assert_eq!(
+            line_text(&document, LineId::new(0), &document_resources),
+            "A"
+        );
+        assert_eq!(
+            line_text(&document, LineId::new(1), &document_resources),
+            "B"
+        );
     }
 
     #[test]
@@ -4691,8 +4862,8 @@ mod tests {
             .text()
             .lines()
             .iter()
-            .filter(|line| !line.glyphs().is_empty())
-            .map(|line| line_text(&document, line.index(), &document_resources))
+            .filter(|line| !text_paint::render_line_glyphs(&line).is_empty())
+            .map(|line| line_text(&document, line.id(), &document_resources))
             .collect::<Vec<_>>();
 
         assert_eq!(nonempty, ["XX"]);
@@ -4711,8 +4882,8 @@ mod tests {
             .text()
             .lines()
             .iter()
-            .filter(|line| !line.glyphs().is_empty())
-            .map(|line| line_text(&document, line.index(), &document_resources))
+            .filter(|line| !text_paint::render_line_glyphs(&line).is_empty())
+            .map(|line| line_text(&document, line.id(), &document_resources))
             .collect::<Vec<_>>();
 
         assert_eq!(lines, ["X  X", "A", "B"]);
@@ -4731,8 +4902,8 @@ mod tests {
             .text()
             .lines()
             .iter()
-            .filter(|line| !line.glyphs().is_empty())
-            .map(|line| line_text(&document, line.index(), &document_resources))
+            .filter(|line| !text_paint::render_line_glyphs(&line).is_empty())
+            .map(|line| line_text(&document, line.id(), &document_resources))
             .collect::<Vec<_>>();
 
         assert_eq!(lines, ["X    X"]);
@@ -4753,7 +4924,7 @@ mod tests {
             .iter()
             .map(|line| {
                 (
-                    line_text(&document, line.index(), &document_resources),
+                    line_text(&document, line.id(), &document_resources),
                     line.point(),
                 )
             })
@@ -4780,28 +4951,37 @@ mod tests {
             &mut trailing_resources,
         );
 
-        assert_eq!(line_text(&leading, 0, &leading_resources), "X");
-        assert_eq!(line_text(&trailing, 0, &trailing_resources), "X");
+        assert_eq!(line_text(&leading, LineId::new(0), &leading_resources), "X");
+        assert_eq!(
+            line_text(&trailing, LineId::new(0), &trailing_resources),
+            "X"
+        );
     }
 
     #[test]
     fn collapsed_sequence_keeps_wrap_opportunity_from_normal_ancestor() {
-        let mut document_resources = GlyphResourceStore::default();
-        let document = layout_html(
-            "<html><body><div style='width:24px'><span style='white-space:nowrap'>XX </span> XX</div></body></html>",
-            200.0,
-            &mut document_resources,
-        );
-        let lines = document
-            .render_view(&document_resources)
-            .text()
-            .lines()
-            .iter()
-            .filter(|line| !line.glyphs().is_empty())
-            .map(|line| line_text(&document, line.index(), &document_resources))
-            .collect::<Vec<_>>();
+        for first in [" ", "\t", "\n", " \n\t"] {
+            for second in [" ", "\t", "\n", "\n "] {
+                let mut document_resources = GlyphResourceStore::default();
+                let document = layout_html(
+                    &format!(
+                        "<html><body><div style='width:24px'><span style='white-space:nowrap'>XX{first}</span>{second}XX</div></body></html>"
+                    ),
+                    200.0,
+                    &mut document_resources,
+                );
+                let lines = document
+                    .render_view(&document_resources)
+                    .text()
+                    .lines()
+                    .iter()
+                    .filter(|line| !text_paint::render_line_glyphs(&line).is_empty())
+                    .map(|line| line_text(&document, line.id(), &document_resources))
+                    .collect::<Vec<_>>();
 
-        assert_eq!(lines, ["XX", "XX"]);
+                assert_eq!(lines, ["XX", "XX"], "{first:?} followed by {second:?}");
+            }
+        }
     }
 
     #[test]
@@ -4819,7 +4999,7 @@ mod tests {
             .text()
             .lines()
             .iter()
-            .map(|line| line_text(&document, line.index(), &document_resources))
+            .map(|line| line_text(&document, line.id(), &document_resources))
             .collect::<Vec<_>>();
 
         assert_eq!(lines, ["aa", "bb"]);
@@ -4838,7 +5018,7 @@ mod tests {
             .lines()
             .iter()
             .map(|line| {
-                text.line_text_fragments(line.index())
+                text_paint::render_text_view_line_text_fragments(text, line.id())
                     .expect("line fragments")
                     .flat_map(|fragment| {
                         text.glyph_slice(fragment.glyphs())
@@ -4846,7 +5026,11 @@ mod tests {
                             .iter()
                             .copied()
                     })
-                    .map(|glyph| text.glyph_metric(glyph).expect("registered glyph").ch())
+                    .map(|glyph| {
+                        text_paint::glyph_metric(text, glyph)
+                            .expect("registered glyph")
+                            .ch()
+                    })
                     .collect::<String>()
             })
             .collect::<Vec<_>>();
@@ -4893,11 +5077,11 @@ mod tests {
                 true,
             );
             token.set_run_idx(InlineToken::MAX_RUN_IDX);
-            assert!(!token.is_authored_break());
+            assert!(!token.metadata().is_authored_break());
             token.mark_authored_break();
             for level in [0, 1, u8::MAX] {
                 token.set_bidi_level(level);
-                assert!(token.is_authored_break());
+                assert!(token.metadata().is_authored_break());
                 assert!(token.kind() == InlineTokenKind::Break { clear });
                 assert_eq!(token.run_idx(), InlineToken::MAX_RUN_IDX);
                 assert_eq!(token.bidi_level(), level);
@@ -4916,7 +5100,10 @@ mod tests {
             first_line_indent_em: Some(1.5),
             ..Default::default()
         };
-        assert!(!controls.same_layout_preferences(&crate::ReaderStyleOverrides::default()));
+        assert!(!reader_style::same_layout_preferences(
+            &controls,
+            &crate::ReaderStyleOverrides::default()
+        ));
         let adjusted = book.with_reader_overrides(&document, &controls).unwrap();
         assert_eq!(adjusted.reader_paragraph_spacing_em(), Some(0.5));
         assert_eq!(adjusted.reader_first_line_indent_em(), Some(1.5));
@@ -5062,7 +5249,7 @@ mod tests {
         let first = document
             .render_view(&document_resources)
             .text()
-            .line(0)
+            .line(LineId::new(0))
             .expect("line should exist");
         assert!(
             (first.point().x - 100.0).abs() < 1.0,
@@ -5081,16 +5268,16 @@ mod tests {
             .text()
             .lines()
             .iter()
-            .filter(|line| !line.glyphs().is_empty())
+            .filter(|line| !text_paint::render_line_glyphs(&line).is_empty())
             .collect::<Vec<_>>();
 
         assert_eq!(text_lines.len(), 2);
         assert_eq!(
-            line_text(&document, text_lines[0].index(), &document_resources),
+            line_text(&document, text_lines[0].id(), &document_resources),
             "first"
         );
         assert_eq!(
-            line_text(&document, text_lines[1].index(), &document_resources),
+            line_text(&document, text_lines[1].id(), &document_resources),
             "second"
         );
         assert!(
@@ -5110,7 +5297,7 @@ mod tests {
         let first = document
             .render_view(&document_resources)
             .text()
-            .line(0)
+            .line(LineId::new(0))
             .expect("line should exist");
         assert!(
             (first.point().x - 50.0).abs() < 1.0,

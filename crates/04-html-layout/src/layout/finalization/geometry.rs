@@ -1,17 +1,18 @@
+use crate::layout_model::{BoxGeometry, LineInlineBoxFragment};
 use kurbo::Rect;
 
-use super::{FinalizationScratch, FragmentWriter, GeometryWriter, LayoutReader};
+use super::{FinalizationScratch, FragmentWriter, LayoutReader};
 
 pub(super) fn publish_inline_box_geometry(
     reader: &LayoutReader<'_>,
-    geometry: &mut GeometryWriter<'_>,
+    geometry: &mut BoxGeometry,
     fragments: &FragmentWriter<'_>,
     scratch: &mut FinalizationScratch,
 ) {
     profile_scope!("finalize.inline_geometry");
-    let mut bounds = std::mem::take(&mut scratch.inline_bounds);
+    let bounds = &mut scratch.inline_bounds;
+    bounds.clear();
     bounds.resize(reader.box_count(), None);
-    bounds.fill(None);
     let state = fragments.state();
     for line in &state.line_output.lines {
         let inline_range = line.inline_box_fragments(&state.line_output.line_details);
@@ -25,11 +26,8 @@ pub(super) fn publish_inline_box_geometry(
             let box_idx = fragment.box_idx as usize;
             // Replaced inline fragments already publish their independently
             // resolved border-box geometry during line placement.
-            if fragment.flags & crate::layout_model::LineInlineBoxFragment::BORDER_BOX_BOUNDS != 0
-                || !matches!(
-                    reader.box_layout_mode(box_idx),
-                    Some(crate::layout_model::LayoutMode::Inline(_))
-                )
+            if fragment.flags & LineInlineBoxFragment::BORDER_BOX_BOUNDS != 0
+                || !reader.is_inline_box(box_idx)
             {
                 continue;
             }
@@ -37,10 +35,8 @@ pub(super) fn publish_inline_box_geometry(
             let containing_width = reader
                 .get_parent(box_idx)
                 .map_or(0.0, |parent| geometry.size(parent).width);
-            let inline_start =
-                fragment.flags & crate::layout_model::LineInlineBoxFragment::INLINE_START != 0;
-            let inline_end =
-                fragment.flags & crate::layout_model::LineInlineBoxFragment::INLINE_END != 0;
+            let inline_start = fragment.flags & LineInlineBoxFragment::INLINE_START != 0;
+            let inline_end = fragment.flags & LineInlineBoxFragment::INLINE_END != 0;
             let left = if inline_start {
                 style.padding_left().resolve(containing_width) + style.border_left_width() as f64
             } else {
@@ -70,5 +66,4 @@ pub(super) fn publish_inline_box_geometry(
             geometry.set_size(box_idx, rect.size());
         }
     }
-    scratch.inline_bounds = bounds;
 }

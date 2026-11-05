@@ -1,17 +1,24 @@
+use html_dom as dom_values;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::error::Error;
+use std::fmt;
 use std::future::Future;
 use std::io::{self, Cursor};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LockResult, Mutex, MutexGuard, Weak};
 
-use base64::Engine;
+use base64::{Engine, engine::general_purpose::STANDARD};
 use peniko::{Blob, Format, Image as PenikoImage};
-use quick_xml::Reader;
+use quick_xml::{Reader, XmlVersion};
 use quick_xml::Writer;
 use quick_xml::events::{BytesStart, Event};
 use sha2::{Digest, Sha256};
 
-use crate::document::{ImageResource, ImageSource};
-use crate::resources::{ResourceMetadata, ResourceProvider};
+use crate::document::{ImageId, ImageResource, ImageSource};
+use crate::resources::{
+    ResourceMetadata, ResourceProvider, has_uri_scheme, media_type_essence, uri_path,
+};
 
 #[derive(Clone)]
 pub enum DecodedImage {
@@ -28,19 +35,10 @@ pub enum DecodedImage {
     },
 }
 
-impl DecodedImage {
-    pub fn dimensions(&self) -> (u32, u32) {
-        match self {
-            Self::Raster { image, .. } => (image.width, image.height),
-            Self::Svg { width, height, .. } => (*width, *height),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 enum ImageKey {
     Uri(String),
-    InlineSvg { hash: Vec<u8>, base_uri: String },
+    InlineSvg { hash: [u8; 32], base_uri: String },
 }
 
 impl ImageKey {
@@ -61,11 +59,11 @@ impl ImageKey {
         match source {
             ImageSource::Uri(uri) => Self::Uri(uri.clone()),
             ImageSource::MathMl { svg, .. } => Self::InlineSvg {
-                hash: Sha256::digest(svg).to_vec(),
+                hash: Sha256::digest(svg).into(),
                 base_uri: String::new(),
             },
             ImageSource::InlineSvg { bytes, base_uri } => Self::InlineSvg {
-                hash: Sha256::digest(bytes).to_vec(),
+                hash: Sha256::digest(bytes).into(),
                 base_uri: base_uri.clone(),
             },
         }
@@ -159,6 +157,7 @@ struct SharedImage {
 struct SharedState {
     decoded: HashMap<ImageKey, SharedImage>,
     pending: HashSet<ImageKey>,
+    failed: HashMap<ImageKey, (u64, Arc<ImageLoadError>)>,
     decoded_bytes: usize,
     byte_budget: usize,
     clock: u64,
@@ -166,19 +165,66 @@ struct SharedState {
     completion_waker: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
+struct ImageServiceState {
+    epoch: AtomicU64,
+    inner: Mutex<SharedState>,
+}
+
+impl ImageServiceState {
+    fn lock(&self) -> LockResult<MutexGuard<'_, SharedState>> {
+        self.inner.lock()
+    }
+}
+
+/// A completed resource request that requires an explicit retry.
+#[derive(Debug)]
+pub enum ImageLoadError {
+    Read(io::Error),
+    Decode,
+}
+
+impl fmt::Display for ImageLoadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read(error) => error.fmt(f),
+            Self::Decode => f.write_str("unsupported or invalid image data"),
+        }
+    }
+}
+
+impl Error for ImageLoadError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Read(error) => Some(error),
+            Self::Decode => None,
+        }
+    }
+}
+
+impl SharedState {
+    fn image(&mut self, key: &ImageKey) -> Option<&SharedImage> {
+        self.clock = self.clock.wrapping_add(1);
+        let image = self.decoded.get_mut(key)?;
+        image.last_used = self.clock;
+        Some(image)
+    }
+}
+
 /// Source-keyed image jobs and decoded-image memory shared by every document
 /// in one reader. Cloning this handle creates no workers.
 #[derive(Clone)]
 pub struct ImageService {
-    state: Arc<Mutex<SharedState>>,
+    state: Arc<ImageServiceState>,
     loader: Arc<dyn ImageLoader>,
     jobs: Arc<dyn BlockingJobSpawner>,
 }
 
 impl ImageService {
     pub const DEFAULT_BYTE_BUDGET: usize = 128 * 1024 * 1024;
+    /// Bound retained failures independently of decoded image bytes.
+    const MAX_FAILURES: usize = 256;
 
-    pub fn new(provider: Arc<dyn ResourceProvider>, byte_budget: usize) -> Self {
+    pub(crate) fn new(provider: Arc<dyn ResourceProvider>, byte_budget: usize) -> Self {
         Self::with_job_spawner(provider, Arc::new(InlineJobSpawner), byte_budget)
     }
 
@@ -196,15 +242,19 @@ impl ImageService {
         jobs: Arc<dyn BlockingJobSpawner>,
         byte_budget: usize,
     ) -> Self {
-        let state = Arc::new(Mutex::new(SharedState {
-            decoded: HashMap::new(),
-            pending: HashSet::new(),
-            decoded_bytes: 0,
-            byte_budget,
-            clock: 0,
-            revision: 0,
-            completion_waker: None,
-        }));
+        let state = Arc::new(ImageServiceState {
+            epoch: AtomicU64::new(0),
+            inner: Mutex::new(SharedState {
+                decoded: HashMap::new(),
+                pending: HashSet::new(),
+                failed: HashMap::new(),
+                decoded_bytes: 0,
+                byte_budget,
+                clock: 0,
+                revision: 0,
+                completion_waker: None,
+            }),
+        });
         Self {
             state,
             loader,
@@ -220,12 +270,16 @@ impl ImageService {
     }
 
     fn request(&self, source: &ImageSource, key: ImageKey) {
-        {
+        let epoch = {
             let mut state = self.state.lock().expect("image service mutex poisoned");
-            if state.decoded.contains_key(&key) || !state.pending.insert(key.clone()) {
+            if state.decoded.contains_key(&key)
+                || state.failed.contains_key(&key)
+                || !state.pending.insert(key.clone())
+            {
                 return;
             }
-        }
+            self.state.epoch.load(Ordering::Relaxed)
+        };
         let state = Arc::downgrade(&self.state);
         let jobs = self.jobs.clone();
         self.loader.load(
@@ -234,23 +288,33 @@ impl ImageService {
                 if state.strong_count() == 0 {
                     return;
                 }
-                jobs.spawn(Box::new(move || execute_image_job(state, key, bytes)));
+                jobs.spawn(Box::new(move || {
+                    execute_image_job(state, epoch, key, bytes)
+                }));
             }),
         );
     }
 
-    fn get(&self, key: &ImageKey) -> Option<(Arc<DecodedImage>, u64)> {
+    fn get(&self, key: &ImageKey) -> Option<Arc<DecodedImage>> {
         let mut state = self.state.lock().expect("image service mutex poisoned");
-        state.clock = state.clock.wrapping_add(1);
-        let clock = state.clock;
-        let image = state.decoded.get_mut(key)?;
-        image.last_used = clock;
-        Some((image.decoded.clone(), image.revision))
+        Some(state.image(key)?.decoded.clone())
     }
 
     fn trim(&self) {
         let mut state = self.state.lock().expect("image service mutex poisoned");
         trim_decoded_cache(&mut state, None);
+    }
+
+    fn invalidate(&self) {
+        let mut state = self.state.lock().expect("image service mutex poisoned");
+        self.state.epoch.fetch_add(1, Ordering::Release);
+        state.decoded.clear();
+        state.pending.clear();
+        state.failed.clear();
+        state.decoded_bytes = 0;
+        let waker = state.completion_waker.clone();
+        drop(state);
+        wake_completion(waker);
     }
 
     fn wake_completion(&self) {
@@ -264,38 +328,97 @@ impl ImageService {
     }
 }
 
+struct ImageRequest {
+    key: ImageKey,
+    seen_revision: Option<u64>,
+}
+
 /// Document-local image state. Image metadata stays with the document and is
 /// borrowed by operations; only asynchronous job identities are retained.
 pub struct ImagePipeline {
-    resource_keys: HashMap<u32, ImageKey>,
+    resource_keys: HashMap<ImageId, ImageRequest>,
     service: ImageService,
-    decoded_cache: HashMap<u32, Arc<DecodedImage>>,
-    seen_revisions: HashMap<u32, u64>,
-    desired: HashSet<u32>,
-    image_dimensions: HashMap<u32, (u32, u32)>,
+    decoded_cache: HashMap<ImageId, Arc<DecodedImage>>,
+    desired: HashSet<ImageId>,
+    image_dimensions: HashMap<ImageId, (u32, u32)>,
+    service_epoch: u64,
+}
+
+/// Borrowed decoded images for painting and export. Each lookup observes
+/// invalidation of the shared image service before returning cached data.
+#[derive(Clone, Copy)]
+pub struct DecodedImages<'a> {
+    pipeline: &'a ImagePipeline,
 }
 
 #[derive(Debug, Default)]
 pub struct ImagePipelinePoll {
     pub decoded: bool,
-    pub dimensions_changed: Vec<u32>,
+    pub dimensions_changed: Vec<ImageId>,
 }
 
 impl ImagePipeline {
+    /// A failed request stays settled until retried, invalidated, or evicted
+    /// from the bounded failure cache. Querying a
+    /// failure does not schedule I/O or change the visible image working set.
+    pub fn failure(&self, image: ImageId) -> Option<Arc<ImageLoadError>> {
+        let request = self.resource_keys.get(&image)?;
+        self.service
+            .state
+            .lock()
+            .expect("image service mutex poisoned")
+            .failed
+            .get(&request.key)
+            .map(|(_, error)| error.clone())
+    }
+
+    /// Allow the next working-set request to retry this failed image.
+    pub fn retry_failed(&mut self, image: ImageId) {
+        if let Some(request) = self.resource_keys.get(&image) {
+            self.service
+                .state
+                .lock()
+                .expect("image service mutex poisoned")
+                .failed
+                .remove(&request.key);
+        }
+    }
+
     pub fn new(provider: Arc<dyn ResourceProvider>) -> Self {
         let service = ImageService::new(provider, ImageService::DEFAULT_BYTE_BUDGET);
         Self::with_service(service)
     }
 
     pub fn with_service(service: ImageService) -> Self {
+        let service_epoch = service.state.epoch.load(Ordering::Acquire);
         Self {
             resource_keys: HashMap::new(),
             service,
             decoded_cache: HashMap::new(),
-            seen_revisions: HashMap::new(),
             desired: HashSet::new(),
             image_dimensions: HashMap::new(),
+            service_epoch,
         }
+    }
+
+    /// Provider bytes changed, including resources whose URI stayed the same.
+    /// All documents sharing this service observe the new epoch before reuse.
+    pub fn invalidate_resources(&mut self) {
+        self.service.invalidate();
+    }
+
+    fn sync_epoch(&mut self) -> bool {
+        let epoch = self.service.state.epoch.load(Ordering::Acquire);
+        if epoch != self.service_epoch {
+            self.decoded_cache.clear();
+            for request in self.resource_keys.values_mut() {
+                request.seen_revision = None;
+            }
+            self.image_dimensions.clear();
+            self.service_epoch = epoch;
+            return true;
+        }
+        false
     }
 
     /// Install the current document's resource metadata after a pipeline update.
@@ -303,34 +426,56 @@ impl ImagePipeline {
     /// removed sources lose their local state; the next visible window requests
     /// their new content through the shared service.
     pub fn update_resources(&mut self, images: &[ImageResource]) {
-        self.resource_keys.retain(|&index, key| {
-            if images.get(index as usize).is_some_and(|image| key.matches_source(&image.source)) {
+        let invalidated = self.sync_epoch();
+        self.resource_keys.retain(|&index, request| {
+            if images
+                .get(index.index())
+                .is_some_and(|image| request.key.matches_source(&image.source))
+            {
                 return true;
             }
             self.decoded_cache.remove(&index);
-            self.seen_revisions.remove(&index);
             self.desired.remove(&index);
             self.image_dimensions.remove(&index);
             false
         });
+        if invalidated && !self.desired.is_empty() {
+            let desired = self.desired.clone();
+            self.ensure_window(images, &desired);
+        }
     }
 
-    pub fn poll(&mut self) -> ImagePipelinePoll {
+    /// Poll using the current borrowed catalog. A shared-service invalidation
+    /// automatically renews this document's desired requests before polling.
+    pub fn poll(&mut self, images: &[ImageResource]) -> ImagePipelinePoll {
+        if self.service_epoch != self.service.state.epoch.load(Ordering::Acquire) {
+            self.renew_requests(images);
+        }
         let mut changed = ImagePipelinePoll::default();
-        if self.desired.is_empty() { return changed; }
+        if self.desired.is_empty() {
+            return changed;
+        }
         // Keys are retained for the visible window. Polling neither rebuilds
         // SVG hashes nor takes one mutex per image; unchanged revisions borrow
         // the shared entry without incrementing its Arc count.
-        let mut state = self.service.state.lock().expect("image service mutex poisoned");
+        let mut state = self
+            .service
+            .state
+            .lock()
+            .expect("image service mutex poisoned");
         for &idx in &self.desired {
-            let key = &self.resource_keys[&idx];
-            state.clock = state.clock.wrapping_add(1);
-            let clock = state.clock;
-            let Some(image) = state.decoded.get_mut(key) else { continue };
-            image.last_used = clock;
-            if self.seen_revisions.get(&idx) == Some(&image.revision) { continue; }
-            self.seen_revisions.insert(idx, image.revision);
-            let dimensions = image.decoded.dimensions();
+            let request = self
+                .resource_keys
+                .get_mut(&idx)
+                .expect("desired image request");
+            let Some(image) = state.image(&request.key) else {
+                continue;
+            };
+            if request.seen_revision == Some(image.revision) {
+                continue;
+            }
+            request.seen_revision = Some(image.revision);
+            let dimensions = decoded_image_dimensions(&image.decoded);
             self.decoded_cache.insert(idx, image.decoded.clone());
             changed.decoded = true;
             if self.image_dimensions.insert(idx, dimensions) != Some(dimensions) {
@@ -339,34 +484,52 @@ impl ImagePipeline {
         }
         drop(state);
         changed.dimensions_changed.sort_unstable();
-        changed.dimensions_changed.dedup();
         changed
+    }
+
+    #[cold]
+    fn renew_requests(&mut self, images: &[ImageResource]) {
+        self.update_resources(images);
     }
 
     /// Request visible images by borrowing their owning document's catalog.
     /// After document resource replacement, call [`Self::update_resources`]
     /// before reusing this pipeline with the new catalog.
-    pub fn ensure_window(&mut self, images: &[ImageResource], desired: &HashSet<u32>) {
+    pub fn ensure_window(&mut self, images: &[ImageResource], desired: &HashSet<ImageId>) {
+        self.sync_epoch();
         self.decoded_cache.retain(|idx, _| desired.contains(idx));
-        self.seen_revisions.retain(|idx, _| desired.contains(idx));
+        for idx in self.desired.difference(desired) {
+            self.resource_keys
+                .get_mut(idx)
+                .expect("desired image request")
+                .seen_revision = None;
+        }
         self.desired.retain(|idx| desired.contains(idx));
 
         let mut shared_cache_hit = false;
         for &idx in desired {
-            let Some(resource) = images.get(idx as usize) else { continue };
-            let key = self.resource_keys.entry(idx).or_insert_with(|| ImageKey::for_source(&resource.source));
+            let Some(resource) = images.get(idx.index()) else {
+                continue;
+            };
+            let request = self
+                .resource_keys
+                .entry(idx)
+                .or_insert_with(|| ImageRequest {
+                    key: ImageKey::for_source(&resource.source),
+                    seen_revision: None,
+                });
             self.desired.insert(idx);
             if self.decoded_cache.contains_key(&idx) {
                 continue;
             }
-            if let Some((decoded, _)) = self.service.get(key) {
+            if let Some(decoded) = self.service.get(&request.key) {
                 // Paint a shared hit immediately. Leaving its revision
                 // unseen makes `has_pending` schedule one poll so intrinsic
                 // dimensions are still reported to this document.
                 self.decoded_cache.insert(idx, decoded);
                 shared_cache_hit = true;
             } else {
-                self.service.request(&resource.source, key.clone());
+                self.service.request(&resource.source, request.key.clone());
             }
         }
         if shared_cache_hit {
@@ -380,40 +543,73 @@ impl ImagePipeline {
     /// budget. A later `ensure_window` reactivates the required images.
     pub fn deactivate(&mut self) {
         self.decoded_cache.clear();
-        self.seen_revisions.clear();
+        for idx in &self.desired {
+            self.resource_keys
+                .get_mut(idx)
+                .expect("desired image request")
+                .seen_revision = None;
+        }
         self.desired.clear();
         self.service.trim();
     }
 
-    pub fn get_decoded(&self, idx: u32) -> Option<&DecodedImage> {
-        self.decoded_cache.get(&idx).map(AsRef::as_ref)
+    #[inline]
+    pub fn decoded_images(&self) -> DecodedImages<'_> {
+        DecodedImages { pipeline: self }
+    }
+
+    /// Known intrinsic dimensions survive decoded-buffer release and are
+    /// invalidated when this index is rebound to another resource source.
+    pub fn intrinsic_dimensions(&self, idx: ImageId) -> Option<(u32, u32)> {
+        if self.service_epoch != self.service.state.epoch.load(Ordering::Acquire) {
+            return None;
+        }
+        self.image_dimensions.get(&idx).copied()
     }
 
     pub fn has_pending(&self) -> bool {
-        if self.desired.iter().all(|idx| self.seen_revisions.contains_key(idx)) {
+        if self.service_epoch != self.service.state.epoch.load(Ordering::Acquire) {
+            return !self.desired.is_empty();
+        }
+        if self
+            .desired
+            .iter()
+            .all(|idx| self.resource_keys[idx].seen_revision.is_some())
+        {
             return false;
         }
         let state = self.service.state.lock().expect("image service mutex poisoned");
         self.desired.iter().any(|idx| {
-            !self.seen_revisions.contains_key(idx)
-                && (self.decoded_cache.contains_key(idx) || state.pending.contains(&self.resource_keys[idx]))
+            self.resource_keys[idx].seen_revision.is_none()
+                && (self.decoded_cache.contains_key(idx)
+                    || state.pending.contains(&self.resource_keys[idx].key))
         })
     }
 
 }
 
 fn execute_image_job(
-    state: Weak<Mutex<SharedState>>,
+    state: Weak<ImageServiceState>,
+    epoch: u64,
     key: ImageKey,
     bytes: std::io::Result<Vec<u8>>,
 ) {
     let Some(state) = state.upgrade() else {
         return;
     };
-    let decoded = bytes.ok().and_then(|bytes| decode_image(&bytes).ok());
-    let mut state = state.lock().expect("image service mutex poisoned");
+    if state.epoch.load(Ordering::Acquire) != epoch {
+        return;
+    }
+    let decoded = bytes
+        .map_err(ImageLoadError::Read)
+        .and_then(|bytes| decode_image(&bytes).map_err(|()| ImageLoadError::Decode));
+    let mut locked = state.lock().expect("image service mutex poisoned");
+    if state.epoch.load(Ordering::Relaxed) != epoch {
+        return;
+    }
+    let state = &mut *locked;
     state.pending.remove(&key);
-    if let Some(decoded) = decoded {
+    if let Ok(decoded) = decoded {
         let byte_len = match &decoded {
             DecodedImage::Raster { byte_len, .. } => *byte_len,
             DecodedImage::Svg { bytes, .. } => bytes.len(),
@@ -433,10 +629,23 @@ fn execute_image_job(
         // Keep a newly completed decode available for at least one poll. If
         // the visible working set itself exceeds the cache budget, inactive
         // pipelines retrim it as soon as they release their pins.
-        trim_decoded_cache(&mut state, Some(&key));
+        trim_decoded_cache(state, Some(&key));
+    } else if let Err(error) = decoded {
+        if state.failed.len() >= ImageService::MAX_FAILURES {
+            let oldest = state
+                .failed
+                .iter()
+                .min_by_key(|(_, (age, _))| age)
+                .map(|(key, _)| key.clone());
+            if let Some(oldest) = oldest {
+                state.failed.remove(&oldest);
+            }
+        }
+        state.clock = state.clock.wrapping_add(1);
+        state.failed.insert(key, (state.clock, Arc::new(error)));
     }
     let waker = state.completion_waker.clone();
-    drop(state);
+    drop(locked);
     wake_completion(waker);
 }
 
@@ -493,15 +702,21 @@ fn decode_image(bytes: &[u8]) -> Result<DecodedImage, ()> {
     })
 }
 
+/// Inspect intrinsic dimensions from encoded source bytes. Embedded SVG and
+/// formula payloads are borrowed; URI sources are read once.
 pub fn probe_dimensions(
     provider: &dyn ResourceProvider,
     source: &ImageSource,
 ) -> Option<(u32, u32)> {
-    let bytes = load_image_bytes(provider, source).ok()?;
+    let bytes: Cow<'_, [u8]> = match source {
+        ImageSource::Uri(uri) => Cow::Owned(provider.read_bytes(uri).ok()?),
+        ImageSource::MathMl { svg, .. } => Cow::Borrowed(svg),
+        ImageSource::InlineSvg { bytes, .. } => Cow::Borrowed(bytes),
+    };
     if let Some(dimensions) = svg_dimensions(&bytes) {
         return Some(dimensions);
     }
-    if let Ok(reader) = image::ImageReader::new(Cursor::new(&bytes)).with_guessed_format()
+    if let Ok(reader) = image::ImageReader::new(Cursor::new(bytes.as_ref())).with_guessed_format()
         && let Ok(dimensions) = reader.into_dimensions()
     {
         return Some(dimensions);
@@ -569,20 +784,12 @@ pub fn load_image_bytes(
             let references =
                 svg_image_references(bytes, base_uri, |base, href| provider.resolve(base, href));
             let mut prepared = PreparedSvgResources::new(references);
-            for uri in &prepared.references.uris {
+            for reference in 0..prepared.references.uris.len() {
                 if prepared.byte_len >= MAX_EMBEDDED_BYTES {
                     break;
                 }
-                if let Ok(bytes) = provider.read_bytes(uri)
-                    && prepared.byte_len.saturating_add(bytes.len()) <= MAX_EMBEDDED_BYTES
-                {
-                    let metadata = provider.metadata(uri).ok();
-                    if let Some(media_type) = svg_image_media_type(metadata.as_ref(), uri, &bytes) {
-                        prepared.byte_len += bytes.len();
-                        prepared
-                            .resources
-                            .insert(uri.clone(), PreparedSvgImage { bytes, media_type });
-                    }
+                if let Ok(bytes) = provider.read_bytes(&prepared.references.uris[reference]) {
+                    prepared.insert_image(reference, bytes, |uri| provider.metadata(uri));
                 }
             }
             Ok(embed_svg_image_resources(&prepared, bytes))
@@ -609,20 +816,12 @@ where
             let references =
                 svg_image_references(bytes, base_uri, |base, href| context.resolve(base, href));
             let mut prepared = PreparedSvgResources::new(references);
-            for uri in &prepared.references.uris {
+            for reference in 0..prepared.references.uris.len() {
                 if prepared.byte_len >= MAX_EMBEDDED_BYTES {
                     break;
                 }
-                if let Ok(bytes) = read(uri.clone()).await
-                    && prepared.byte_len.saturating_add(bytes.len()) <= MAX_EMBEDDED_BYTES
-                {
-                    let metadata = context.metadata(uri).ok();
-                    if let Some(media_type) = svg_image_media_type(metadata.as_ref(), uri, &bytes) {
-                        prepared.byte_len += bytes.len();
-                        prepared
-                            .resources
-                            .insert(uri.clone(), PreparedSvgImage { bytes, media_type });
-                    }
+                if let Ok(bytes) = read(prepared.references.uris[reference].clone()).await {
+                    prepared.insert_image(reference, bytes, |uri| context.metadata(uri));
                 }
             }
             Ok(embed_svg_image_resources(&prepared, bytes))
@@ -631,7 +830,7 @@ where
 }
 
 struct SvgImageReferences {
-    by_href: HashMap<String, String>,
+    by_href: HashMap<String, usize>,
     // Preserve source order so the byte limit does not choose images randomly.
     uris: Vec<String>,
 }
@@ -645,7 +844,7 @@ fn svg_image_references(
         by_href: HashMap::new(),
         uris: Vec::new(),
     };
-    let mut seen = HashSet::new();
+    let mut seen = HashMap::new();
     let mut reader = Reader::from_reader(svg);
     loop {
         match reader.read_event() {
@@ -658,7 +857,7 @@ fn svg_image_references(
                         .local_name()
                         .as_ref()
                         .eq_ignore_ascii_case(b"href")
-                        && let Ok(href) = attribute.unescape_value()
+                        && let Ok(href) = attribute.normalized_value(XmlVersion::Implicit1_0)
                     {
                         let href = href.trim();
                         if href.is_empty()
@@ -669,10 +868,12 @@ fn svg_image_references(
                             continue;
                         }
                         let uri = resolve(base_uri, href);
-                        if seen.insert(uri.clone()) {
+                        let reference = *seen.entry(uri).or_insert_with_key(|uri| {
+                            let reference = references.uris.len();
                             references.uris.push(uri.clone());
-                        }
-                        references.by_href.insert(href.to_owned(), uri);
+                            reference
+                        });
+                        references.by_href.insert(href.to_owned(), reference);
                     }
                 }
             }
@@ -684,13 +885,13 @@ fn svg_image_references(
 }
 
 struct PreparedSvgImage {
-    bytes: Vec<u8>,
-    media_type: &'static str,
+    data_url: String,
+    byte_len: usize,
 }
 
 struct PreparedSvgResources {
     references: SvgImageReferences,
-    resources: HashMap<String, PreparedSvgImage>,
+    resources: HashMap<usize, PreparedSvgImage>,
     byte_len: usize,
 }
 
@@ -704,14 +905,43 @@ impl PreparedSvgResources {
     }
 
     fn image(&self, href: &str) -> Option<&PreparedSvgImage> {
-        let uri = self.references.by_href.get(href.trim())?;
-        self.resources.get(uri)
+        let reference = self.references.by_href.get(href.trim())?;
+        self.resources.get(reference)
+    }
+
+    fn insert_image(
+        &mut self,
+        reference: usize,
+        bytes: Vec<u8>,
+        metadata: impl FnOnce(&str) -> io::Result<ResourceMetadata>,
+    ) {
+        if self.byte_len.saturating_add(bytes.len()) > MAX_EMBEDDED_BYTES {
+            return;
+        }
+        let uri = &self.references.uris[reference];
+        let metadata = metadata(uri).ok();
+        if let Some(media_type) = svg_image_media_type(metadata.as_ref(), uri, &bytes) {
+            let byte_len = bytes.len();
+            let mut data_url = String::with_capacity(
+                byte_len.div_ceil(3) * 4 + media_type.len() + "data:;base64,".len(),
+            );
+            data_url.push_str("data:");
+            data_url.push_str(media_type);
+            data_url.push_str(";base64,");
+            STANDARD.encode_string(&bytes, &mut data_url);
+            self.byte_len += byte_len;
+            self.resources
+                .insert(reference, PreparedSvgImage { data_url, byte_len });
+        }
     }
 }
 
 /// Rewrite an SVG from a self-contained map. Resource I/O and path resolution
 /// are completed before this step, shared by synchronous and async loading.
 fn embed_svg_image_resources(prepared: &PreparedSvgResources, svg: &[u8]) -> Vec<u8> {
+    if prepared.resources.is_empty() {
+        return svg.to_vec();
+    }
     let mut reader = Reader::from_reader(svg);
     let mut writer = Writer::new(Vec::with_capacity(svg.len()));
     let mut changed = false;
@@ -722,29 +952,23 @@ fn embed_svg_image_resources(prepared: &PreparedSvgResources, svg: &[u8]) -> Vec
             Ok(event) => event,
             Err(_) => return svg.to_vec(),
         };
-        let event = match event {
-            Event::Start(element)
+        let event = match &event {
+            Event::Start(element) | Event::Empty(element)
                 if element.local_name().as_ref().eq_ignore_ascii_case(b"image") =>
             {
                 let Some(element) =
-                    embed_svg_image_element(prepared, &element, &mut embedded_bytes, &mut changed)
+                    embed_svg_image_element(prepared, element, &mut embedded_bytes, &mut changed)
                 else {
                     return svg.to_vec();
                 };
-                Event::Start(element)
-            }
-            Event::Empty(element)
-                if element.local_name().as_ref().eq_ignore_ascii_case(b"image") =>
-            {
-                let Some(element) =
-                    embed_svg_image_element(prepared, &element, &mut embedded_bytes, &mut changed)
-                else {
-                    return svg.to_vec();
-                };
-                Event::Empty(element)
+                if matches!(event, Event::Start(_)) {
+                    Event::Start(element)
+                } else {
+                    Event::Empty(element)
+                }
             }
             Event::Eof => break,
-            event => event.into_owned(),
+            _ => event,
         };
         if writer.write_event(event).is_err() {
             return svg.to_vec();
@@ -777,15 +1001,13 @@ fn embed_svg_image_element(
             .as_ref()
             .eq_ignore_ascii_case(b"href")
         {
-            let href = attribute.unescape_value().ok()?;
+            let href = attribute.normalized_value(XmlVersion::Implicit1_0).ok()?;
             if let Some(image) = prepared.image(&href)
-                && embedded_bytes.saturating_add(image.bytes.len()) <= MAX_EMBEDDED_BYTES
+                && embedded_bytes.saturating_add(image.byte_len) <= MAX_EMBEDDED_BYTES
             {
-                *embedded_bytes += image.bytes.len();
-                let encoded = base64::engine::general_purpose::STANDARD.encode(&image.bytes);
-                let data_url = format!("data:{};base64,{encoded}", image.media_type);
+                *embedded_bytes += image.byte_len;
                 let key = std::str::from_utf8(attribute.key.as_ref()).ok()?;
-                rewritten.push_attribute((key, data_url.as_str()));
+                rewritten.push_attribute((key, image.data_url.as_str()));
                 *changed = true;
                 continue;
             }
@@ -794,16 +1016,6 @@ fn embed_svg_image_element(
     }
 
     Some(rewritten.into_owned())
-}
-
-fn has_uri_scheme(href: &str) -> bool {
-    let Some(colon) = href.find(':') else {
-        return false;
-    };
-    let Some(first_separator) = href.find(['/', '?', '#']) else {
-        return true;
-    };
-    colon < first_separator
 }
 
 fn svg_image_media_type(
@@ -820,21 +1032,19 @@ fn svg_image_media_type(
 }
 
 fn canonical_image_media_type(media_type: &str) -> Option<&'static str> {
-    match media_type
-        .split(';')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "image/jpeg" | "image/jpg" => Some("image/jpeg"),
-        "image/png" => Some("image/png"),
-        "image/gif" => Some("image/gif"),
-        "image/webp" => Some("image/webp"),
-        "image/svg+xml" => Some("image/svg+xml"),
-        _ => None,
+    let media_type = media_type_essence(media_type);
+    if media_type.eq_ignore_ascii_case("image/jpg") {
+        return Some("image/jpeg");
     }
+    [
+        "image/jpeg",
+        "image/png",
+        "image/gif",
+        "image/webp",
+        "image/svg+xml",
+    ]
+    .into_iter()
+    .find(|candidate| media_type.eq_ignore_ascii_case(candidate))
 }
 
 fn sniff_image_media_type(bytes: &[u8]) -> Option<&'static str> {
@@ -860,7 +1070,7 @@ fn sniff_image_media_type(bytes: &[u8]) -> Option<&'static str> {
 }
 
 fn image_media_type_from_uri(uri: &str) -> Option<&'static str> {
-    let path = uri.split(['?', '#']).next().unwrap_or(uri);
+    let path = uri_path(uri);
     let extension = path.rsplit_once('.').map_or("", |(_, extension)| extension);
     if extension.eq_ignore_ascii_case("jpg") || extension.eq_ignore_ascii_case("jpeg") {
         Some("image/jpeg")
@@ -881,11 +1091,11 @@ fn image_media_type_from_uri(uri: &str) -> Option<&'static str> {
 mod tests {
     use super::{
         BlockingJob, BlockingJobSpawner, DecodedImage, ImageKey, ImagePipeline, ImageService,
-        ImageResourceContext, MAX_EMBEDDED_BYTES, PreparedSvgImage, PreparedSvgResources,
+        ImageResourceContext, MAX_EMBEDDED_BYTES, PreparedSvgResources,
         decode_image, embed_svg_image_resources, load_image_bytes, load_image_bytes_async,
-        svg_image_references,
+        probe_dimensions, svg_image_references,
     };
-    use crate::document::{ImageResource, ImageSource};
+    use crate::document::{ImageId, ImageResource, ImageSource};
     use crate::resources::{ResourceMetadata, ResourceProvider};
     use std::collections::{HashMap, HashSet};
     use std::future::{Future, ready};
@@ -957,12 +1167,38 @@ mod tests {
     }
 
     #[test]
+    fn dimension_probes_borrow_embedded_svg_without_loading_dependencies() {
+        let provider = MemoryImageContext::default();
+        let svg: Arc<[u8]> =
+            Arc::from(br#"<svg width="32" height="16"><image href="cover.png"/></svg>"#.as_slice());
+        for source in [
+            ImageSource::InlineSvg {
+                bytes: svg.clone(),
+                base_uri: "OPS/chapter.xhtml".into(),
+            },
+            ImageSource::MathMl {
+                markup: "<math/>".into(),
+                svg,
+                baseline: 1.0,
+            },
+        ] {
+            assert_eq!(probe_dimensions(&provider, &source), Some((32, 16)));
+        }
+        let provider = CountingProvider(AtomicUsize::new(0));
+        assert_eq!(
+            probe_dimensions(&provider, &ImageSource::Uri("cover.svg".into())),
+            Some((20, 10))
+        );
+        assert_eq!(provider.0.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn async_inline_svg_uses_only_memory_context_and_deduplicates_fetches() {
         let context = MemoryImageContext {
             metadata: HashMap::from([(
                 "OPS/mark.jpg".to_owned(),
                 ResourceMetadata {
-                    media_type: Some("image/png; charset=binary".to_owned()),
+                    media_type: Some(" IMAGE/PNG; charset=binary".to_owned()),
                     charset: None,
                 },
             )]),
@@ -1072,19 +1308,19 @@ mod tests {
 
     #[test]
     fn svg_rewriting_needs_no_context_and_limits_repeated_embeddings() {
-        let svg = br#"<svg><image href="large.png"/><image href="large.png"/></svg>"#;
+        let svg = br#"<svg><!--keep--><text>before &amp; <![CDATA[<raw>]]><?keep value?></text><image href="large.png"/><image href="large.png"></image></svg>"#;
         let references = svg_image_references(svg, "OPS/chapter.xhtml", |_, href| href.to_owned());
         let mut prepared = PreparedSvgResources::new(references);
-        prepared.resources.insert(
-            "large.png".to_owned(),
-            PreparedSvgImage {
-                bytes: vec![0; MAX_EMBEDDED_BYTES / 2 + 1],
-                media_type: "image/png",
-            },
-        );
+        prepared.insert_image(0, vec![0; MAX_EMBEDDED_BYTES / 2 + 1], |_| {
+            Ok(ResourceMetadata::default())
+        });
         let rewritten = String::from_utf8(embed_svg_image_resources(&prepared, svg)).unwrap();
         assert_eq!(rewritten.matches("data:image/png;base64,").count(), 1);
         assert_eq!(rewritten.matches(r#"href="large.png""#).count(), 1);
+        assert!(rewritten.starts_with(
+            "<svg><!--keep--><text>before &amp; <![CDATA[<raw>]]><?keep value?></text>"
+        ));
+        assert!(rewritten.ends_with(r#"<image href="large.png"></image></svg>"#));
     }
 
     struct CountingProvider(AtomicUsize);
@@ -1169,7 +1405,7 @@ mod tests {
     fn relative_svg_viewport_is_retained_for_backend_rendering() {
         let decoded = decode_image(br#"<svg xmlns="http://www.w3.org/2000/svg" height="50%"><rect width="20" height="10" fill="blue"/></svg>"#).expect("SVG should decode as a vector resource");
         assert!(matches!(decoded, DecodedImage::Svg { .. }));
-        assert_eq!(decoded.dimensions(), (300, 150));
+        assert_eq!(decoded_image_dimensions(&decoded), (300, 150));
     }
 
     #[test]
@@ -1232,25 +1468,41 @@ mod tests {
         };
         let mut resources = vec![resource("first.svg"), resource("second.svg")];
         let mut pipeline = ImagePipeline::with_service(service);
-        pipeline.ensure_window(&resources, &HashSet::from([0, 1]));
-        assert!(pipeline.poll().decoded);
-        let unchanged = pipeline.decoded_cache[&1].clone();
+        pipeline.ensure_window(
+            &resources,
+            &HashSet::from([dom_values::image_id_new(0), dom_values::image_id_new(1)]),
+        );
+        assert!(pipeline.poll(&resources).decoded);
+        let unchanged = pipeline.decoded_cache[&dom_values::image_id_new(1)].clone();
         pipeline.update_resources(&resources);
-        assert!(Arc::ptr_eq(&unchanged, &pipeline.decoded_cache[&1]));
-        assert!(!pipeline.poll().decoded);
+        assert!(Arc::ptr_eq(
+            &unchanged,
+            &pipeline.decoded_cache[&dom_values::image_id_new(1)]
+        ));
+        assert!(!pipeline.poll(&resources).decoded);
 
         resources[0] = resource("replacement.svg");
         resources.push(resource("added.svg"));
+        pipeline.invalidate_resources();
         pipeline.update_resources(&resources);
-        assert!(pipeline.get_decoded(0).is_none());
-        assert!(Arc::ptr_eq(&unchanged, &pipeline.decoded_cache[&1]));
-        pipeline.ensure_window(&resources, &HashSet::from([0, 1, 2]));
-        assert!(pipeline.poll().decoded);
-        assert!(pipeline.get_decoded(0).is_some() && pipeline.get_decoded(2).is_some());
-        assert_eq!(provider.0.load(Ordering::Relaxed), 4);
+        assert!(decoded_images_get(pipeline.decoded_images(), dom_values::image_id_new(0)).is_none());
+        assert!(decoded_images_get(pipeline.decoded_images(), dom_values::image_id_new(1)).is_none());
+        pipeline.ensure_window(
+            &resources,
+            &HashSet::from([dom_values::image_id_new(0), dom_values::image_id_new(1), dom_values::image_id_new(2)]),
+        );
+        assert!(pipeline.poll(&resources).decoded);
+        assert!(
+            decoded_images_get(pipeline.decoded_images(), dom_values::image_id_new(0)).is_some()
+                && decoded_images_get(pipeline.decoded_images(), dom_values::image_id_new(2)).is_some()
+        );
+        assert_eq!(provider.0.load(Ordering::Relaxed), 5);
 
         pipeline.update_resources(&resources[..1]);
-        assert!(pipeline.get_decoded(1).is_none() && pipeline.get_decoded(2).is_none());
+        assert!(
+            decoded_images_get(pipeline.decoded_images(), dom_values::image_id_new(1)).is_none()
+                && decoded_images_get(pipeline.decoded_images(), dom_values::image_id_new(2)).is_none()
+        );
         assert!(!pipeline.has_pending());
     }
 
@@ -1264,11 +1516,19 @@ mod tests {
             source: ImageSource::InlineSvg { bytes, base_uri: "chapter.xhtml".to_owned() },
             width: 20, height: 10, width_attr: None, height_attr: None,
         }];
-        pipeline.ensure_window(&resources, &HashSet::from([0]));
-        assert!(pipeline.poll().decoded);
+        pipeline.ensure_window(&resources, &HashSet::from([dom_values::image_id_new(0)]));
+        assert!(pipeline.poll(&resources).decoded);
         drop(resources);
-        assert!(source_owner.upgrade().is_none(), "only the document owns its inline source bytes");
-        assert_eq!(pipeline.get_decoded(0).unwrap().dimensions(), (20, 10));
+        assert!(
+            source_owner.upgrade().is_none(),
+            "only the document owns its inline source bytes"
+        );
+        assert_eq!(
+            decoded_image_dimensions(&decoded_images_get(pipeline
+                .decoded_images(), dom_values::image_id_new(0))
+                .unwrap()),
+            (20, 10)
+        );
     }
 
     #[test]
@@ -1283,22 +1543,36 @@ mod tests {
             width, height: 10, width_attr: None, height_attr: None,
         };
         let mut resources = vec![resource(20, "first.xhtml")];
-        let desired = HashSet::from([0]);
+        let desired = HashSet::from([dom_values::image_id_new(0)]);
         pipeline.ensure_window(&resources, &desired);
-        assert_eq!(pipeline.poll().dimensions_changed, vec![0]);
+        assert_eq!(
+            pipeline.poll(&resources).dimensions_changed,
+            vec![dom_values::image_id_new(0)]
+        );
         resources[0] = resource(20, "second.xhtml");
         pipeline.update_resources(&resources);
-        assert!(pipeline.get_decoded(0).is_none());
+        assert!(decoded_images_get(pipeline.decoded_images(), dom_values::image_id_new(0)).is_none());
         pipeline.ensure_window(&resources, &desired);
-        assert_eq!(pipeline.poll().dimensions_changed, vec![0]);
+        assert_eq!(
+            pipeline.poll(&resources).dimensions_changed,
+            vec![dom_values::image_id_new(0)]
+        );
         pipeline.deactivate();
         resources[0] = resource(40, "second.xhtml");
         pipeline.update_resources(&resources);
         pipeline.ensure_window(&resources, &desired);
-        assert_eq!(pipeline.poll().dimensions_changed, vec![0]);
-        assert_eq!(pipeline.get_decoded(0).unwrap().dimensions(), (40, 10));
+        assert_eq!(
+            pipeline.poll(&resources).dimensions_changed,
+            vec![dom_values::image_id_new(0)]
+        );
+        assert_eq!(
+            decoded_image_dimensions(&decoded_images_get(pipeline
+                .decoded_images(), dom_values::image_id_new(0))
+                .unwrap()),
+            (40, 10)
+        );
         pipeline.update_resources(&[]);
-        assert!(pipeline.get_decoded(0).is_none());
+        assert!(decoded_images_get(pipeline.decoded_images(), dom_values::image_id_new(0)).is_none());
         assert!(!pipeline.has_pending());
     }
 
@@ -1317,20 +1591,24 @@ mod tests {
         let mut first =
             ImagePipeline::with_service(service.clone());
         let mut second = ImagePipeline::with_service(service);
-        let desired = HashSet::from([0]);
+        let desired = HashSet::from([dom_values::image_id_new(0)]);
         first.ensure_window(from_ref(&resource), &desired);
         second.ensure_window(from_ref(&resource), &desired);
 
         let deadline = Instant::now() + Duration::from_secs(2);
-        while (first.get_decoded(0).is_none() || second.get_decoded(0).is_none())
+        while (decoded_images_get(first.decoded_images(), dom_values::image_id_new(0)).is_none()
+            || decoded_images_get(second.decoded_images(), dom_values::image_id_new(0)).is_none())
             && Instant::now() < deadline
         {
-            first.poll();
-            second.poll();
+            first.poll(from_ref(&resource));
+            second.poll(from_ref(&resource));
             std::thread::yield_now();
         }
 
-        assert!(first.get_decoded(0).is_some() && second.get_decoded(0).is_some());
+        assert!(
+            decoded_images_get(first.decoded_images(), dom_values::image_id_new(0)).is_some()
+                && decoded_images_get(second.decoded_images(), dom_values::image_id_new(0)).is_some()
+        );
         assert_eq!(
             provider.0.load(Ordering::Relaxed),
             1,
@@ -1360,7 +1638,7 @@ mod tests {
             height_attr: None,
         };
         let mut pipeline = ImagePipeline::with_service(service);
-        pipeline.ensure_window(from_ref(&resource), &HashSet::from([0]));
+        pipeline.ensure_window(from_ref(&resource), &HashSet::from([dom_values::image_id_new(0)]));
 
         let deadline = Instant::now() + Duration::from_secs(2);
         while wake_count.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
@@ -1368,7 +1646,7 @@ mod tests {
         }
 
         assert_eq!(wake_count.load(Ordering::Relaxed), 1);
-        assert!(pipeline.poll().decoded);
+        assert!(pipeline.poll(from_ref(&resource)).decoded);
     }
 
     #[test]
@@ -1392,15 +1670,17 @@ mod tests {
             },
         ];
         let mut pipeline = ImagePipeline::with_service(service.clone());
-        pipeline.ensure_window(&resources, &HashSet::from([0]));
+        pipeline.ensure_window(&resources, &HashSet::from([dom_values::image_id_new(0)]));
         let deadline = Instant::now() + Duration::from_secs(2);
-        while pipeline.get_decoded(0).is_none() && Instant::now() < deadline {
-            pipeline.poll();
+        while decoded_images_get(pipeline.decoded_images(), dom_values::image_id_new(0)).is_none() && Instant::now() < deadline
+        {
+            pipeline.poll(&resources);
             std::thread::yield_now();
         }
-        pipeline.ensure_window(&resources, &HashSet::from([1]));
-        while pipeline.get_decoded(1).is_none() && Instant::now() < deadline {
-            pipeline.poll();
+        pipeline.ensure_window(&resources, &HashSet::from([dom_values::image_id_new(1)]));
+        while decoded_images_get(pipeline.decoded_images(), dom_values::image_id_new(1)).is_none() && Instant::now() < deadline
+        {
+            pipeline.poll(&resources);
             std::thread::yield_now();
         }
 
@@ -1423,27 +1703,29 @@ mod tests {
             width_attr: None,
             height_attr: None,
         };
-        let desired = HashSet::from([0]);
+        let desired = HashSet::from([dom_values::image_id_new(0)]);
         let mut first =
             ImagePipeline::with_service(service.clone());
         first.ensure_window(&[resource("first.svg")], &desired);
         let deadline = Instant::now() + Duration::from_secs(2);
-        while first.get_decoded(0).is_none() && Instant::now() < deadline {
-            first.poll();
+        while decoded_images_get(first.decoded_images(), dom_values::image_id_new(0)).is_none() && Instant::now() < deadline {
+            first.poll(&[resource("first.svg")]);
             std::thread::yield_now();
         }
-        assert!(first.get_decoded(0).is_some());
+        assert!(decoded_images_get(first.decoded_images(), dom_values::image_id_new(0)).is_some());
 
         let mut second =
             ImagePipeline::with_service(service.clone());
         second.ensure_window(&[resource("second.svg")], &desired);
         let second_deadline = Instant::now() + Duration::from_secs(2);
-        while second.get_decoded(0).is_none() && Instant::now() < second_deadline {
-            second.poll();
+        while decoded_images_get(second.decoded_images(), dom_values::image_id_new(0)).is_none()
+            && Instant::now() < second_deadline
+        {
+            second.poll(&[resource("second.svg")]);
             std::thread::yield_now();
         }
         assert!(
-            second.get_decoded(0).is_some(),
+            decoded_images_get(second.decoded_images(), dom_values::image_id_new(0)).is_some(),
             "the newly decoded visible image must not evict itself"
         );
         {
@@ -1456,13 +1738,32 @@ mod tests {
         }
 
         first.deactivate();
-        assert!(first.get_decoded(0).is_none());
+        assert!(decoded_images_get(first.decoded_images(), dom_values::image_id_new(0)).is_none());
         let state = service.state.lock().expect("image service mutex poisoned");
         assert_eq!(
             state.decoded.len(),
             1,
             "releasing an inactive document immediately retrims the cache"
         );
-        assert!(second.get_decoded(0).is_some());
+        assert!(decoded_images_get(second.decoded_images(), dom_values::image_id_new(0)).is_some());
     }
+}
+
+pub fn decoded_image_dimensions(value: &DecodedImage) -> (u32, u32) {
+    match value {
+        DecodedImage::Raster { image, .. } => (image.width, image.height),
+        DecodedImage::Svg { width, height, .. } => (*width, *height),
+    }
+}
+
+#[inline]
+pub fn decoded_images_get<'a>(
+    value: DecodedImages<'a>,
+    image: ImageId,
+) -> Option<&'a DecodedImage> {
+    let pipeline = value.pipeline;
+    if pipeline.service_epoch != pipeline.service.state.epoch.load(Ordering::Acquire) {
+        return None;
+    }
+    pipeline.decoded_cache.get(&image).map(AsRef::as_ref)
 }

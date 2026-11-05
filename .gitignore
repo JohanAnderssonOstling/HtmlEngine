@@ -1,3 +1,6 @@
-/target/
+target/
 Cargo.lock
 __pycache__/
+
+# Generated benchmark runs, captured source trees, and profiling binaries.
+/tools/pipeline-bench/results/

@@ -1,7 +1,7 @@
 //! Reproducible micro-benchmark for the style resolver's cascade stage.
 //!
 //! Run with:
-//! `cargo run -p html-style --release --example cascade_benchmark -- 1500 25 48 8`
+//! `cargo run -p skrift-style --release --example cascade_benchmark -- 1500 25 48 8`
 //!
 //! Arguments are element count, measured iterations, overriding rule count,
 //! the interval at which generated rules contain an important declaration,

@@ -1,176 +1,140 @@
 //! Owned font declarations for host text systems. No font bytes are loaded here.
 
-use super::declarations;
-use cssparser::{Parser, ParserInput};
+use html_dom::has_uri_scheme;
+use html_style_model::{FontFace, FontFaceDescriptor, FontFaceSource, FontFaceStyle};
 use lightningcss::printer::PrinterOptions;
+use lightningcss::properties::custom::{Token, TokenList, TokenOrValue};
 use lightningcss::properties::font::{AbsoluteFontWeight, FontFamily, FontStretch, FontWeight};
 use lightningcss::rules::font_face::{
     FontFaceProperty, FontFaceRule, FontFormat, FontStyle, Source,
 };
 use lightningcss::rules::{CssRule, CssRuleList};
-use lightningcss::stylesheet::{ParserOptions, StyleSheet};
-use lightningcss::traits::ToCss;
+use lightningcss::stylesheet::ParserOptions;
+use lightningcss::traits::{Parse, ParseWithOptions, ToCss};
 use lightningcss::values::percentage::Percentage;
+use lightningcss::values::size::Size2D;
 use std::borrow::Cow;
-use std::ops::RangeInclusive;
 
-/// A usable `@font-face` declaration. Hosts load and register these faces under
-/// `family`, which may differ from the font file's internal family name.
-/// Faces retain stylesheet order, including multiple faces for the same family.
-#[derive(Clone, Debug, PartialEq)]
-pub struct FontFace {
-    /// Decoded family name, without CSS quotes or escapes.
-    pub family: String,
-    /// Alternatives in authored order. Try the next source if one is unavailable
-    /// or its format/technology is unsupported by the host.
-    pub sources: Vec<FontFaceSource>,
-    /// Inclusive CSS weight range; defaults to 400..=400.
-    pub weight: RangeInclusive<f32>,
-    pub style: FontFaceStyle,
-    /// Inclusive percentages, where 100 is normal width.
-    pub stretch: RangeInclusive<f32>,
-    /// Inclusive Unicode code point ranges. Defaults to U+0-10FFFF.
-    /// The host intersects this coverage with the font's actual character map.
-    pub unicode_ranges: Vec<RangeInclusive<u32>>,
-    /// Other descriptors, preserved as CSS for host policy (e.g. font-display).
-    /// The engine does not apply these descriptors.
-    pub additional_descriptors: Vec<FontFaceDescriptor>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub enum FontFaceStyle {
-    Normal,
-    Italic,
-    /// Inclusive angles in degrees; plain `oblique` is 14..=14.
-    Oblique(RangeInclusive<f32>),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum FontFaceSource {
-    /// A decoded local face name, without CSS quotes or escapes.
-    Local(String),
-    Url {
-        /// Decoded URL. Pipeline APIs resolve this using ResourceProvider.
-        url: String,
-        /// Decoded format hint, e.g. "woff2". Unknown hints are preserved.
-        format: Option<String>,
-        /// Required technology keywords, e.g. "variations".
-        technologies: Vec<String>,
-    },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FontFaceDescriptor {
-    pub name: String,
-    pub value: String,
-}
-
-impl FontFace {
-    pub(crate) fn from_rule(rule: &FontFaceRule<'_>) -> Option<Self> {
-        let mut family = None;
-        let mut sources = None;
-        let mut face = Self {
-            family: String::new(),
-            sources: Vec::new(),
-            weight: 400.0..=400.0,
-            style: FontFaceStyle::Normal,
-            stretch: 100.0..=100.0,
-            unicode_ranges: vec![0..=0x10ffff],
-            additional_descriptors: Vec::new(),
-        };
-        // Later valid descriptors replace earlier ones. Parser-recognized but
-        // descriptor-invalid values must not replace the last valid value.
-        for property in &rule.properties {
-            match property {
-                FontFaceProperty::FontFamily(value) => {
-                    if let FontFamily::FamilyName(_) = value
-                        && let Some(name) = decoded_family(value).filter(|name| !name.is_empty())
-                    {
-                        family = Some(name);
-                    }
+/// Converts a parsed rule into a usable declaration. Rules without a family or
+/// any usable source are skipped.
+pub(crate) fn font_face_from_rule(rule: &FontFaceRule<'_>) -> Option<FontFace> {
+    let mut face = FontFace {
+        family: String::new(),
+        sources: Vec::new(),
+        weight: 400.0..=400.0,
+        style: FontFaceStyle::Normal,
+        stretch: 100.0..=100.0,
+        unicode_ranges: vec![0..=0x10ffff],
+        style_explicit: false, stretch_explicit: false, additional_descriptors: Vec::new(),
+    };
+    let mut has_family = false;
+    // Later valid descriptors replace earlier ones. Parser-recognized but
+    // descriptor-invalid values must not replace the last valid value.
+    for property in &rule.properties {
+        match property {
+            FontFaceProperty::FontFamily(value) => {
+                if let FontFamily::FamilyName(_) = value
+                    && let Some(name) = decoded_family(value)
+                {
+                    face.family = name;
+                    has_family = true;
                 }
-                FontFaceProperty::Source(values) => {
-                    let values = values
-                        .iter()
-                        .filter_map(|source| match source {
-                            Source::Local(name) => decoded_family(name).map(FontFaceSource::Local),
-                            Source::Url(source) => Some(FontFaceSource::Url {
-                                url: source.url.url.as_ref().to_owned(),
-                                format: source.format.as_ref().map(font_format),
-                                technologies: source
-                                    .tech
-                                    .iter()
-                                    .filter_map(|tech| {
-                                        tech.to_css_string(PrinterOptions::default()).ok()
-                                    })
-                                    .collect(),
-                            }),
-                        })
-                        .collect::<Vec<_>>();
-                    if !values.is_empty() {
-                        sources = Some(values);
-                    }
+            }
+            FontFaceProperty::Source(values) => {
+                let values = values
+                    .iter()
+                    .filter_map(|source| match source {
+                        Source::Local(name) => decoded_family(name).map(FontFaceSource::Local),
+                        Source::Url(source) => Some(FontFaceSource::Url {
+                            url: source.url.url.as_ref().to_owned(),
+                            format: source.format.as_ref().map(font_format),
+                            technologies: source
+                                .tech
+                                .iter()
+                                .filter_map(|tech| {
+                                    tech.to_css_string(PrinterOptions::default()).ok()
+                                })
+                                .collect(),
+                        }),
+                    })
+                    .collect::<Vec<_>>();
+                if !values.is_empty() {
+                    face.sources = values;
                 }
-                FontFaceProperty::FontWeight(value) => {
-                    if let (Some(start), Some(end)) = (weight(&value.0), weight(&value.1))
+            }
+            FontFaceProperty::FontWeight(value) => {
+                if let (Some(start), Some(end)) = (weight(&value.0), weight(&value.1))
+                    && start <= end
+                {
+                    face.weight = start..=end;
+                }
+            }
+            FontFaceProperty::FontStyle(value) => match value {
+                FontStyle::Normal => { face.style = FontFaceStyle::Normal; face.style_explicit = true; },
+                FontStyle::Italic => { face.style = FontFaceStyle::Italic; face.style_explicit = true; },
+                FontStyle::Oblique(angles) => {
+                    let (start, end) = (angles.0.to_degrees(), angles.1.to_degrees());
+                    if start.is_finite()
+                        && end.is_finite()
+                        && start >= -90.0
+                        && end <= 90.0
                         && start <= end
                     {
-                        face.weight = start..=end;
+                        face.style = FontFaceStyle::Oblique(start..=end);
+                        face.style_explicit = true;
                     }
                 }
-                FontFaceProperty::FontStyle(value) => match value {
-                    FontStyle::Normal => face.style = FontFaceStyle::Normal,
-                    FontStyle::Italic => face.style = FontFaceStyle::Italic,
-                    FontStyle::Oblique(angles) => {
-                        let (start, end) = (angles.0.to_degrees(), angles.1.to_degrees());
-                        if start.is_finite()
-                            && end.is_finite()
-                            && start >= -90.0
-                            && end <= 90.0
-                            && start <= end
+            },
+            FontFaceProperty::FontStretch(value) => {
+                let (start, end) = (stretch(&value.0), stretch(&value.1));
+                if start.is_finite() && end.is_finite() && start >= 0.0 && start <= end {
+                    face.stretch = start..=end;
+                    face.stretch_explicit = true;
+                }
+            }
+            FontFaceProperty::UnicodeRange(ranges) => {
+                face.unicode_ranges =
+                    ranges.iter().map(|range| range.start..=range.end).collect();
+            }
+            FontFaceProperty::Custom(custom) => {
+                let name = custom.name.as_ref().to_ascii_lowercase();
+                if name == "font-width" {
+                    if let Ok(css) = property.to_css_string(PrinterOptions::default())
+                        && let Some((_, source)) = css.split_once(':')
+                        && let Ok(value) = Size2D::<FontStretch>::parse_string(source.trim())
+                    {
+                        let (start, end) = (stretch(&value.0), stretch(&value.1));
+                        if start.is_finite() && end.is_finite() && start >= 0.0 && start <= end
                         {
-                            face.style = FontFaceStyle::Oblique(start..=end);
+                            face.stretch = start..=end;
+                            face.stretch_explicit = true;
                         }
                     }
-                },
-                FontFaceProperty::FontStretch(value) => {
-                    let (start, end) = (stretch(&value.0), stretch(&value.1));
-                    if start.is_finite() && end.is_finite() && start >= 0.0 && start <= end {
-                        face.stretch = start..=end;
-                    }
+                    continue;
                 }
-                FontFaceProperty::UnicodeRange(ranges) => {
-                    face.unicode_ranges =
-                        ranges.iter().map(|range| range.start..=range.end).collect();
+                if matches!(
+                    name.as_str(),
+                    "font-family"
+                        | "src"
+                        | "font-weight"
+                        | "font-style"
+                        | "font-stretch"
+                        | "unicode-range"
+                ) {
+                    continue;
                 }
-                FontFaceProperty::Custom(custom) => {
-                    let name = custom.name.as_ref().to_ascii_lowercase();
-                    if matches!(
-                        name.as_str(),
-                        "font-family"
-                            | "src"
-                            | "font-weight"
-                            | "font-style"
-                            | "font-stretch"
-                            | "unicode-range"
-                    ) {
-                        continue;
-                    }
-                    if let Ok(css) = property.to_css_string(PrinterOptions::default())
-                        && let Some((_, value)) = css.split_once(':')
-                    {
-                        face.additional_descriptors.push(FontFaceDescriptor {
-                            name,
-                            value: value.trim().to_owned(),
-                        });
-                    }
+                if let Ok(css) = property.to_css_string(PrinterOptions::default())
+                    && let Some((_, value)) = css.split_once(':')
+                {
+                    face.additional_descriptors.push(FontFaceDescriptor {
+                        name,
+                        value: value.trim().to_owned(),
+                    });
                 }
             }
         }
-        face.family = family?;
-        face.sources = sources?;
-        Some(face)
     }
+    (has_family && !face.sources.is_empty()).then_some(face)
 }
 
 fn weight(value: &FontWeight) -> Option<f32> {
@@ -203,17 +167,21 @@ fn font_format(format: &FontFormat<'_>) -> String {
 }
 
 fn decoded_family(family: &FontFamily<'_>) -> Option<String> {
-    // Lightning CSS keeps FamilyName's string private. Tokenizing its CSS
-    // serialization recovers the decoded name without hand-written unescaping.
+    // FamilyName's decoded string is private. Let Lightning CSS tokenize its
+    // serialization, then convert the parsed name tokens into host data.
     let css = family.to_css_string(PrinterOptions::default()).ok()?;
-    let mut input = ParserInput::new(&css);
-    let mut parser = Parser::new(&mut input);
-    let mut name = parser.expect_ident_or_string().ok()?.to_string();
-    while !parser.is_exhausted() {
-        name.push(' ');
-        name.push_str(parser.expect_ident().ok()?);
-    }
-    Some(name)
+    let tokens = TokenList::parse_string_with_options(&css, ParserOptions::default()).ok()?;
+    let words: Vec<&str> = tokens
+        .0
+        .iter()
+        .filter(|token| !token.is_whitespace())
+        .map(|token| match token {
+            TokenOrValue::Token(Token::Ident(value) | Token::String(value)) => Some(value.as_ref()),
+            TokenOrValue::DashedIdent(value) => Some(value.0.as_ref()),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    (!words.is_empty()).then(|| words.join(" "))
 }
 
 /// Resolve only `@font-face` URLs before flattening imported stylesheets.
@@ -236,17 +204,10 @@ pub fn resolve_font_face_urls<'a>(
     {
         return Cow::Borrowed(css);
     }
-    let normalized = declarations::normalize(css);
-    let Ok(mut sheet) = StyleSheet::parse(
-        &normalized,
-        ParserOptions {
-            error_recovery: true,
-            ..ParserOptions::default()
-        },
-    ) else {
+    let Some(mut sheet) = super::parse_stylesheet(css) else {
         return Cow::Borrowed(css);
     };
-    if !resolve_rule_urls(&mut sheet.rules, &mut resolve) {
+    if !resolve_rule_urls(&mut sheet.rules, &mut |url| Some(resolve(url))) {
         return Cow::Borrowed(css);
     }
     match sheet.to_css(PrinterOptions::default()) {
@@ -255,9 +216,10 @@ pub fn resolve_font_face_urls<'a>(
     }
 }
 
-fn resolve_rule_urls(
+/// Visit relative font URLs, keeping the current value when no replacement is returned.
+pub(super) fn resolve_rule_urls(
     rules: &mut CssRuleList<'_>,
-    resolve: &mut impl FnMut(&str) -> String,
+    resolve: &mut impl FnMut(&str) -> Option<String>,
 ) -> bool {
     let mut changed = false;
     for rule in &mut rules.0 {
@@ -270,11 +232,12 @@ fn resolve_rule_urls(
                                 let original = source.url.url.as_ref();
                                 // Resource providers may implement filesystem
                                 // paths only; absolute URIs need no rebasing.
-                                if has_url_scheme(original) {
+                                if has_uri_scheme(original) {
                                     continue;
                                 }
-                                let url = resolve(original);
-                                if url != source.url.url.as_ref() {
+                                if let Some(url) = resolve(original)
+                                    && url != original
+                                {
                                     source.url.url = url.into();
                                     changed = true;
                                 }
@@ -291,16 +254,4 @@ fn resolve_rule_urls(
         }
     }
     changed
-}
-
-fn has_url_scheme(url: &str) -> bool {
-    url.split_once(':').is_some_and(|(scheme, _)| {
-        scheme
-            .as_bytes()
-            .first()
-            .is_some_and(u8::is_ascii_alphabetic)
-            && scheme
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
-    })
 }

@@ -10,7 +10,7 @@ autobins = false
 
 [features]
 default = ["skrift"]
-skrift = ["dep:data-url", "dep:html", "dep:html-gpui", "dep:kurbo"]
+skrift = ["dep:html-dom", "dep:html-render-core", "dep:data-url", "dep:html", "dep:html-gpui", "dep:html-pipeline", "dep:html-resources", "dep:kurbo"]
 wry-in-gpui = ["dep:gtk", "dep:cairo-rs", "dep:webkit2gtk", "dep:wry", "dep:url", "dep:percent-encoding", "dep:raw-window-handle"]
 
 [[bin]]
@@ -29,6 +29,9 @@ path = "src/wry_size.rs"
 required-features = ["wry-in-gpui"]
 
 [dependencies]
+html-dom = { version = "0.1.0", package = "skrift-dom", path = "../../../crates/html-dom", optional = true }
+html-render-core = { version = "0.1.0", package = "skrift-render-core", path = "../../../crates/05-html-render-core", optional = true }
+html-engine-model = { package = "skrift-engine-model", path = "../../../crates/html-engine-model" }
 anyhow = "1"
 async-channel = "2"
 data-url = { version = "0.3", optional = true }
@@ -36,8 +39,10 @@ gpui = { path = "../../../../GPUI-Fork/crates/gpui", default-features = false, f
 gpui_platform = { path = "../../../../GPUI-Fork/crates/gpui_platform", features = ["wayland", "x11"] }
 gpui_linux = { path = "../../../../GPUI-Fork/crates/gpui_linux", features = ["snapshot"] }
 gpui_wgpu = { path = "../../../../GPUI-Fork/crates/gpui_wgpu", features = ["font-kit"] }
-html = { package = "html-engine", path = "../../../crates/html", optional = true }
-html-gpui = { path = "../../../../Html-Prototype/shared/html-gpui", optional = true }
+html = { version = "0.1.0", package = "skrift", path = "../../../crates/html", optional = true }
+html-gpui = { path = "../../../adapters/html-gpui", optional = true }
+html-pipeline = { version = "0.1.0", package = "skrift-pipeline", path = "../../../crates/html-pipeline", optional = true }
+html-resources = { version = "0.1.0", package = "skrift-resources", path = "../../../crates/html-resources", optional = true }
 kurbo = { version = "0.11", optional = true }
 pollster = "0.4"
 libc = "0.2"
@@ -51,4 +56,4 @@ percent-encoding = { version = "2", optional = true }
 raw-window-handle = { version = "0.6", optional = true }
 
 [patch."https://github.com/JohanAnderssonOstling/HtmlEngine"]
-html-engine = { path = "../../../crates/html" }
+skrift = { path = "../../../crates/html" }

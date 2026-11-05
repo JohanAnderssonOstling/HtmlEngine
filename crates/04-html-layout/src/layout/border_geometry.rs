@@ -24,6 +24,18 @@ pub struct PhysicalBorders {
     pub left: PhysicalBorderEdge,
 }
 
+impl PhysicalBorders {
+    pub fn uniform(self) -> Option<PhysicalBorderEdge> {
+        (self.top.width > 0.0
+            && [self.right, self.bottom, self.left].into_iter().all(|edge| {
+                edge.style == self.top.style
+                    && edge.width == self.top.width
+                    && edge.color == self.top.color
+            }))
+        .then_some(self.top)
+    }
+}
+
 pub fn physical_borders(style: &UsedStyleView<'_>) -> PhysicalBorders {
     PhysicalBorders {
         top: PhysicalBorderEdge {
@@ -107,25 +119,6 @@ pub(super) fn emit_horizontal_pattern(
     });
 }
 
-fn emit_vertical_pattern(
-    fragments: &mut DecorationStore,
-    rect: Rect,
-    color: u32,
-    style: BorderStyle,
-    is_inline: bool,
-    foreground: bool,
-) {
-    if rect.width() <= 0.0 || rect.height() <= 0.0 {
-        return;
-    }
-    let Some(pattern) = border_pattern(style, false) else {
-        return;
-    };
-    fragments.push(DecorationFragment::border_patterned(
-        rect, color, is_inline, foreground, pattern,
-    ));
-}
-
 pub fn border_pattern(style: BorderStyle, horizontal: bool) -> Option<DecorationPattern> {
     match (style, horizontal) {
         (BorderStyle::Solid, _) => Some(DecorationPattern::Solid),
@@ -170,55 +163,43 @@ pub(super) fn emit_outline_fragments(
             emit_border_rect_layer(fragments, outer, width, color, is_inline, true)
         }
         BorderStyle::Dotted | BorderStyle::Dashed => {
-            let text_style = if style == BorderStyle::Dotted {
-                TextDecorationStyle::Dotted
-            } else {
-                TextDecorationStyle::Dashed
-            };
-            emit_horizontal_pattern(
-                fragments,
-                Rect::new(outer.x0, outer.y0, outer.x1, outer.y0 + width),
-                color,
-                text_style,
-                is_inline,
-                true,
-                true,
-            );
-            emit_horizontal_pattern(
-                fragments,
-                Rect::new(outer.x0, outer.y1 - width, outer.x1, outer.y1),
-                color,
-                text_style,
-                is_inline,
-                true,
-                true,
-            );
-            emit_vertical_pattern(
-                fragments,
-                Rect::new(
-                    outer.x0,
-                    outer.y0 + width,
-                    outer.x0 + width,
-                    outer.y1 - width,
+            for (horizontal, edge) in [
+                (
+                    true,
+                    Rect::new(outer.x0, outer.y0, outer.x1, outer.y0 + width),
                 ),
-                color,
-                style,
-                is_inline,
-                true,
-            );
-            emit_vertical_pattern(
-                fragments,
-                Rect::new(
-                    outer.x1 - width,
-                    outer.y0 + width,
-                    outer.x1,
-                    outer.y1 - width,
+                (
+                    true,
+                    Rect::new(outer.x0, outer.y1 - width, outer.x1, outer.y1),
                 ),
-                color,
-                style,
-                is_inline,
-                true,
-            );
+                (
+                    false,
+                    Rect::new(
+                        outer.x0,
+                        outer.y0 + width,
+                        outer.x0 + width,
+                        outer.y1 - width,
+                    ),
+                ),
+                (
+                    false,
+                    Rect::new(
+                        outer.x1 - width,
+                        outer.y0 + width,
+                        outer.x1,
+                        outer.y1 - width,
+                    ),
+                ),
+            ] {
+                if edge.width() <= 0.0 || edge.height() <= 0.0 {
+                    continue;
+                }
+                if let Some(pattern) = border_pattern(style, horizontal) {
+                    fragments.push(DecorationFragment::border_patterned(
+                        edge, color, is_inline, true, pattern,
+                    ));
+                }
+            }
         }
         BorderStyle::Groove | BorderStyle::Ridge => {
             emit_uniform_3d_border(fragments, outer, width, color, style, is_inline)
@@ -236,17 +217,9 @@ pub fn emit_uniform_3d_border(
     is_inline: bool,
 ) {
     let half = (width * 0.5).max(0.5);
-    let (r, g, b, a) = (
-        ((color >> 24) & 0xff) as u8,
-        ((color >> 16) & 0xff) as u8,
-        ((color >> 8) & 0xff) as u8,
-        (color & 0xff) as u8,
-    );
+    let [r, g, b, a] = color.to_be_bytes();
     let light_channel = |channel: u8| channel.saturating_add((255 - channel) / 2);
-    let light = ((light_channel(r) as u32) << 24)
-        | ((light_channel(g) as u32) << 16)
-        | ((light_channel(b) as u32) << 8)
-        | a as u32;
+    let light = u32::from_be_bytes([light_channel(r), light_channel(g), light_channel(b), a]);
     let (outer, inner) = if style == BorderStyle::Groove {
         (color, light)
     } else {
@@ -255,10 +228,12 @@ pub fn emit_uniform_3d_border(
     emit_border_fragments(
         fragments,
         rect,
-        Some((half, outer)),
-        Some((half, light)),
-        Some((half, light)),
-        Some((half, outer)),
+        [
+            Some((half, outer)),
+            Some((half, light)),
+            Some((half, light)),
+            Some((half, outer)),
+        ],
         is_inline,
     );
     let inner_rect = Rect::new(
@@ -271,94 +246,42 @@ pub fn emit_uniform_3d_border(
         emit_border_fragments(
             fragments,
             inner_rect,
-            Some((half, inner)),
-            Some((half, color)),
-            Some((half, color)),
-            Some((half, inner)),
+            [
+                Some((half, inner)),
+                Some((half, color)),
+                Some((half, color)),
+                Some((half, inner)),
+            ],
             is_inline,
         );
     }
 }
 
-pub(super) fn uniform_solid_border(style: &UsedStyleView<'_>) -> Option<(f64, u32)> {
-    let width = style.border_top_width();
-    let color = style.border_top_color();
-    (width > 0.0
-        && [
-            style.border_top_style(),
-            style.border_right_style(),
-            style.border_bottom_style(),
-            style.border_left_style(),
-        ]
-        .into_iter()
-        .all(|side| matches!(side, BorderStyle::Solid))
-        && [
-            style.border_right_width(),
-            style.border_bottom_width(),
-            style.border_left_width(),
-        ]
-        .into_iter()
-        .all(|other| other == width)
-        && [
-            style.border_right_color(),
-            style.border_bottom_color(),
-            style.border_left_color(),
-        ]
-        .into_iter()
-        .all(|other| other == color))
-    .then_some((width as f64, color))
-}
-
 pub(super) fn emit_border_fragments(
     fragments: &mut DecorationStore,
     rect: Rect,
-    top: Option<(f64, u32)>,
-    right: Option<(f64, u32)>,
-    bottom: Option<(f64, u32)>,
-    left: Option<(f64, u32)>,
+    borders: [Option<(f64, u32)>; 4],
     is_inline: bool,
 ) {
-    if let Some((w, c)) = top {
-        let h = w.min(rect.height());
-        if h > 0.0 {
+    for (side, border) in borders.into_iter().enumerate() {
+        let Some((width, color)) = border else {
+            continue;
+        };
+        let extent = if side == 0 || side == 2 {
+            rect.height()
+        } else {
+            rect.width()
+        };
+        let width = width.min(extent);
+        if width > 0.0 {
+            let edge = match side {
+                0 => Rect::new(rect.x0, rect.y0, rect.x1, rect.y0 + width),
+                1 => Rect::new(rect.x1 - width, rect.y0, rect.x1, rect.y1),
+                2 => Rect::new(rect.x0, rect.y1 - width, rect.x1, rect.y1),
+                _ => Rect::new(rect.x0, rect.y0, rect.x0 + width, rect.y1),
+            };
             fragments.push(DecorationFragment::border_rect(
-                Rect::new(rect.x0, rect.y0, rect.x1, rect.y0 + h),
-                c,
-                is_inline,
-                false,
-            ));
-        }
-    }
-    if let Some((w, c)) = right {
-        let bw = w.min(rect.width());
-        if bw > 0.0 {
-            fragments.push(DecorationFragment::border_rect(
-                Rect::new(rect.x1 - bw, rect.y0, rect.x1, rect.y1),
-                c,
-                is_inline,
-                false,
-            ));
-        }
-    }
-    if let Some((w, c)) = bottom {
-        let h = w.min(rect.height());
-        if h > 0.0 {
-            fragments.push(DecorationFragment::border_rect(
-                Rect::new(rect.x0, rect.y1 - h, rect.x1, rect.y1),
-                c,
-                is_inline,
-                false,
-            ));
-        }
-    }
-    if let Some((w, c)) = left {
-        let bw = w.min(rect.width());
-        if bw > 0.0 {
-            fragments.push(DecorationFragment::border_rect(
-                Rect::new(rect.x0, rect.y0, rect.x0 + bw, rect.y1),
-                c,
-                is_inline,
-                false,
+                edge, color, is_inline, false,
             ));
         }
     }

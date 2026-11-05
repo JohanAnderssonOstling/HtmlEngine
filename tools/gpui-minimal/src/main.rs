@@ -1,69 +1,66 @@
 //! Basic Latin text and rectangles, using HtmlEngine and GPUI directly.
 //! Shapes afresh each frame; images and native text-run shaping are omitted.
 
+use html_engine_model::shaping_contracts;
 use gpui::{
-    App, Bounds, Context, Font, FontStyle, FontWeight, Pixels, Point, ShapedLine, TextAlign,
-    TextRun, Window, WindowOptions, WindowTextSystem, canvas, div, fill, point, prelude::*, px,
-    rgb, rgba, size,
+    App, Bounds, Context, Font, FontStyle, FontVariations, FontWeight, PaintGlyph, Pixels, Point,
+    ShapedLine, TextRun, Window, WindowOptions, WindowTextSystem, canvas, div, fill, point,
+    prelude::*, px, rgb, rgba, size,
 };
-use html::render::{FragmentImagePolicy, FragmentRenderOptions, FragmentRenderer, Painter};
-use html::text::{
-    FontMetrics, FontSlant, GlyphHandle, GlyphRequest, GlyphResourceGeneration, GlyphResources,
-    GlyphShaper, ShapeError, ShapedGlyph,
-};
+use html::render::{Painter, SceneImagePolicy};
+use html::{Document, DocumentOptions};
+use html::text::FontMetrics;
+use html::text::FontSlant;
+use html::text::GlyphHandle;
+use html::text::GlyphRequest;
+use html_engine_model::GlyphResources;
+use html_engine_model::GlyphWriter;
+use html_engine_model::ResourceShaper;
+use html::text::ShapeError;
+use html::text::ShapedGlyph;
 use kurbo::{Point as HtmlPoint, Rect};
 use peniko::{Color, Image};
 
-struct Shaper<'a> {
-    system: &'a WindowTextSystem,
-    glyphs: GlyphResources<ShapedLine>,
-}
-
-impl GlyphShaper for Shaper<'_> {
-    fn resource_generation(&self) -> GlyphResourceGeneration {
-        self.glyphs.generation()
-    }
-
-    fn reset(&mut self) {
-        self.glyphs.clear();
-    }
-
-    fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
-        let font = Font {
-            weight: FontWeight(f32::from(request.font_weight)),
-            style: match request.font_slant {
-                FontSlant::Normal => FontStyle::Normal,
-                FontSlant::Italic => FontStyle::Italic,
-                FontSlant::Oblique => FontStyle::Oblique,
-            },
-            ..Font::default() // System font for this minimal adapter.
-        };
-        let text = request.character.to_string();
-        let run = TextRun {
-            len: text.len(),
-            font,
-            color: rgba(request.color).into(),
-            ..Default::default()
-        };
-        let line = if request.font_size == 0.0 || request.character.is_control() {
-            ShapedLine::default()
-        } else {
-            self.system
-                .shape_line(text.into(), px(request.font_size), &[run], None)
-        };
-        let metrics = FontMetrics::new(f32::from(line.ascent), f32::from(line.descent))
-            .map_err(ShapeError::rejected_metric)?;
-        let advance = f32::from(line.width());
-        let handle = self.glyphs.insert(line)?;
-        ShapedGlyph::new(handle, advance, metrics).map_err(ShapeError::rejected_metric)
-    }
+fn shape_glyph(
+    system: &WindowTextSystem,
+    request: GlyphRequest<'_>,
+    glyphs: &mut GlyphWriter<'_, ShapedLine>,
+) -> Result<ShapedGlyph, ShapeError> {
+    let (style, angle) = match request.style.font_slant {
+        FontSlant::Normal => (FontStyle::Normal, None),
+        FontSlant::Italic => (FontStyle::Italic, None),
+        FontSlant::Oblique { angle } => (FontStyle::Oblique, Some(shaping_contracts::oblique_angle_degrees(angle))),
+    };
+    let font = Font {
+        weight: FontWeight(f32::from(request.style.font_weight)),
+        style,
+        variations: FontVariations::new(request.style.font_stretch, angle).unwrap_or_default(),
+        ..Font::default() // System font for this minimal adapter.
+    };
+    let text = request.character.to_string();
+    let run = TextRun {
+        len: text.len(),
+        font,
+        ..Default::default()
+    };
+    let line = if request.style.font_size == 0.0 || request.character.is_control() {
+        ShapedLine::default()
+    } else {
+        system.shape_line(text.into(), px(request.style.font_size), &[run], None)
+    };
+    let metrics = FontMetrics {
+        ascent: f32::from(line.ascent),
+        descent: f32::from(line.descent),
+    };
+    let advance = f32::from(line.width());
+    let handle = glyphs.insert(line)?;
+    Ok(ShapedGlyph::new(handle, advance, metrics))
 }
 
 struct GpuiPainter<'a> {
     glyphs: &'a GlyphResources<ShapedLine>,
     origin: Point<Pixels>,
     window: &'a mut Window,
-    cx: &'a mut App,
 }
 
 impl Painter for GpuiPainter<'_> {
@@ -78,21 +75,21 @@ impl Painter for GpuiPainter<'_> {
         ));
     }
 
-    fn draw_glyph(&mut self, glyph: GlyphHandle, origin: HtmlPoint) {
+    fn draw_glyph(&mut self, glyph: GlyphHandle, origin: HtmlPoint, color: u32) {
         let line = self.glyphs.get(glyph).expect("native glyph handle");
-        if line.len() == 0 {
-            return;
-        }
-        let origin = self.origin + point(px(origin.x as f32), px(origin.y as f32) - line.ascent);
-        line.paint(
-            origin,
-            line.ascent + line.descent,
-            TextAlign::Left,
-            None,
-            self.window,
-            self.cx,
-        )
-        .expect("paint glyph");
+        let origin = self.origin + point(px(origin.x as f32), px(origin.y as f32));
+        let color = rgba(color).into();
+        let glyphs = line.runs.iter().flat_map(|run| {
+            run.glyphs.iter().map(move |glyph| PaintGlyph {
+                origin: origin + glyph.position,
+                font_id: run.font_id,
+                glyph_id: glyph.id,
+                font_size: line.font_size,
+                color,
+                is_emoji: glyph.is_emoji,
+            })
+        });
+        self.window.paint_glyphs(glyphs).expect("paint glyph");
     }
 
     fn draw_image(&mut self, _: &Image, _: &[u8], _: Rect) {}
@@ -105,33 +102,27 @@ impl Render for Example {
         div().size_full().p_4().bg(rgb(0xffffff)).child(
             canvas(
                 |bounds, window, _| {
-                    let mut renderer = FragmentRenderer::new();
-                    let mut shaper = Shaper {
-                        system: window.text_system(),
-                        glyphs: GlyphResources::default(),
-                    };
-                    let options = FragmentRenderOptions::new(
-                        f64::from(f32::from(bounds.size.width)).max(1.0),
-                        None,
+                    let mut shaper = ResourceShaper::new(|request, glyphs| {
+                        shape_glyph(window.text_system(), request, glyphs)
+                    });
+                    let options =
+                        DocumentOptions::new(f64::from(f32::from(bounds.size.width)).max(1.0))
+                            .expect("valid width");
+                    let scene = Document::from_source(
+                        "<p>Hello <strong>HtmlEngine</strong>!</p>".to_owned(),
+                        options,
+                        &mut shaper,
                     )
-                    .expect("valid width")
-                    .with_image_policy(FragmentImagePolicy::Omit);
-                    let scene = renderer
-                        .render(
-                            "<p>Hello <strong>HtmlEngine</strong>!</p>",
-                            &options,
-                            &mut shaper,
-                        )
-                        .expect("render HTML")
-                        .into_scene();
-                    (scene, shaper.glyphs)
+                    .expect("render HTML")
+                    .scene(SceneImagePolicy::Omit)
+                    .expect("positive width");
+                    (scene, shaper.into_resources())
                 },
-                |bounds, (scene, glyphs), window, cx| {
+                |bounds, (scene, glyphs), window, _| {
                     scene.paint(&mut GpuiPainter {
                         glyphs: &glyphs,
                         origin: bounds.origin,
                         window,
-                        cx,
                     });
                 },
             )

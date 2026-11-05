@@ -76,7 +76,7 @@ impl<'a> PaintView<'a> {
         styles
             .reader_paint_colors(
                 indices,
-                &self.overrides,
+                self.overrides,
                 flags & ROOT != 0,
                 flags & LINK != 0,
             )
@@ -94,4 +94,10 @@ pub struct TextPaintRange {
 pub struct PaintColorRun {
     pub glyphs: Range<u32>,
     pub color: u32,
+}
+
+/// Find a logical character's resolved color in ordered paint runs.
+pub fn paint_color_at(runs: &[PaintColorRun], index: u32) -> Option<u32> {
+    let run = runs.get(runs.partition_point(|run| run.glyphs.end <= index))?;
+    run.glyphs.contains(&index).then_some(run.color)
 }

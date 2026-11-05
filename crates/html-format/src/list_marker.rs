@@ -1,14 +1,5 @@
 use html_style_model::{CounterStyle, ListStyleType};
-
-/// Bullet glyph used for the symbolic list-style-types.
-fn bullet_char(list_style_type: ListStyleType) -> Option<char> {
-    match list_style_type {
-        ListStyleType::Disc => Some('\u{2022}'),   // •
-        ListStyleType::Circle => Some('\u{25E6}'), // ◦
-        ListStyleType::Square => Some('\u{25AA}'), // ▪
-        _ => None,
-    }
-}
+use std::fmt::Write;
 
 /// The text of a list item's marker: a bullet glyph for the symbolic types, or
 /// the counter value followed by its `.` suffix for the numeric/alphabetic
@@ -18,107 +9,113 @@ fn bullet_char(list_style_type: ListStyleType) -> Option<char> {
 /// hang gap, or the inline advance for inside markers), not by this string —
 /// matching how browsers position the `::marker` box rather than padding text.
 pub fn marker_text(list_style_type: ListStyleType, ordinal: i64) -> Option<String> {
-    if let Some(bullet) = bullet_char(list_style_type) {
-        return Some(bullet.to_string());
-    }
-    let body = match list_style_type {
+    let style = match list_style_type {
         ListStyleType::None => return None,
-        ListStyleType::Disc | ListStyleType::Circle | ListStyleType::Square => {
-            unreachable!("handled by bullet_char")
-        }
-        ListStyleType::Decimal => decimal(ordinal),
-        ListStyleType::DecimalLeadingZero => decimal_leading_zero(ordinal),
-        ListStyleType::LowerAlpha => alphabetic(ordinal, false),
-        ListStyleType::UpperAlpha => alphabetic(ordinal, true),
-        ListStyleType::LowerRoman => roman(ordinal, false),
-        ListStyleType::UpperRoman => roman(ordinal, true),
+        ListStyleType::Disc => CounterStyle::Disc,
+        ListStyleType::Circle => CounterStyle::Circle,
+        ListStyleType::Square => CounterStyle::Square,
+        ListStyleType::Decimal => CounterStyle::Decimal,
+        ListStyleType::DecimalLeadingZero => CounterStyle::DecimalLeadingZero,
+        ListStyleType::LowerAlpha => CounterStyle::LowerAlpha,
+        ListStyleType::UpperAlpha => CounterStyle::UpperAlpha,
+        ListStyleType::LowerRoman => CounterStyle::LowerRoman,
+        ListStyleType::UpperRoman => CounterStyle::UpperRoman,
     };
-    Some(format!("{body}."))
+    let mut text = counter_text(style, ordinal);
+    if !list_style_type.is_bullet() {
+        text.push('.');
+    }
+    Some(text)
 }
 
 pub fn counter_text(style: CounterStyle, value: i64) -> String {
+    let mut output = String::new();
+    append_counter(style, value, &mut output);
+    output
+}
+
+pub(super) fn append_counter(style: CounterStyle, value: i64, output: &mut String) {
     match style {
-        CounterStyle::Decimal => decimal(value),
-        CounterStyle::DecimalLeadingZero => decimal_leading_zero(value),
-        CounterStyle::LowerRoman => roman(value, false),
-        CounterStyle::UpperRoman => roman(value, true),
+        CounterStyle::Decimal => decimal(value, output),
+        CounterStyle::DecimalLeadingZero => decimal_leading_zero(value, output),
+        CounterStyle::LowerRoman => roman(value, false, output),
+        CounterStyle::UpperRoman => roman(value, true, output),
         CounterStyle::LowerGreek => alphabetic_chars(
             value,
             &[
                 'α', 'β', 'γ', 'δ', 'ε', 'ζ', 'η', 'θ', 'ι', 'κ', 'λ', 'μ', 'ν', 'ξ', 'ο', 'π',
                 'ρ', 'σ', 'τ', 'υ', 'φ', 'χ', 'ψ', 'ω',
             ],
+            output,
         ),
-        CounterStyle::LowerAlpha => alphabetic(value, false),
-        CounterStyle::UpperAlpha => alphabetic(value, true),
-        CounterStyle::Armenian => additive(value, &ARMENIAN_NUMERALS),
-        CounterStyle::Georgian => additive(value, &GEORGIAN_NUMERALS),
-        CounterStyle::Disc => "\u{2022}".to_owned(),
-        CounterStyle::Circle => "\u{25e6}".to_owned(),
-        CounterStyle::Square => "\u{25aa}".to_owned(),
+        CounterStyle::LowerAlpha => alphabetic(value, false, output),
+        CounterStyle::UpperAlpha => alphabetic(value, true, output),
+        CounterStyle::Armenian => additive(value, &ARMENIAN_NUMERALS, output),
+        CounterStyle::Georgian => additive(value, &GEORGIAN_NUMERALS, output),
+        CounterStyle::Disc => output.push('\u{2022}'),
+        CounterStyle::Circle => output.push('\u{25e6}'),
+        CounterStyle::Square => output.push('\u{25aa}'),
     }
 }
 
-fn decimal(n: i64) -> String {
-    n.to_string()
+fn decimal(n: i64, output: &mut String) {
+    write!(output, "{n}").expect("writing to a string cannot fail");
 }
 
 /// `decimal-leading-zero`: pad to at least two digits (CSS pads to the width of
 /// the list's largest value, but two-digit padding matches the common case and
 /// every UA for n < 100).
-fn decimal_leading_zero(n: i64) -> String {
+fn decimal_leading_zero(n: i64, output: &mut String) {
     if n < 0 {
-        return format!("-{:02}", n.unsigned_abs());
+        output.push('-');
     }
-    format!("{n:02}")
+    write!(output, "{:02}", n.unsigned_abs()).expect("writing to a string cannot fail");
 }
 
 /// Bijective base-26 (`a`..`z`, `aa`, `ab`, …). Defined only for n >= 1; other
 /// values fall back to `decimal` per CSS counter-style fallback.
-fn alphabetic(n: i64, upper: bool) -> String {
+fn alphabetic(n: i64, upper: bool, output: &mut String) {
     if n < 1 {
-        return decimal(n);
+        return decimal(n, output);
     }
     let base = if upper { b'A' } else { b'a' };
-    let mut value = n as u64;
-    let mut letters = Vec::new();
-    while value > 0 {
-        value -= 1;
-        letters.push(base + (value % 26) as u8);
-        value /= 26;
-    }
-    letters.reverse();
-    String::from_utf8(letters).expect("ascii letters")
+    alphabetic_digits(n as u64, 26, &mut |digit| {
+        output.push((base + digit as u8) as char)
+    });
 }
 
-fn alphabetic_chars(n: i64, alphabet: &[char]) -> String {
+fn alphabetic_chars(n: i64, alphabet: &[char], output: &mut String) {
     if n < 1 {
-        return decimal(n);
+        return decimal(n, output);
     }
-    let mut value = n as u64;
-    let radix = alphabet.len() as u64;
-    let mut output = Vec::new();
-    while value > 0 {
-        value -= 1;
-        output.push(alphabet[(value % radix) as usize]);
-        value /= radix;
-    }
-    output.into_iter().rev().collect()
+    alphabetic_digits(n as u64, alphabet.len() as u64, &mut |digit| {
+        output.push(alphabet[digit])
+    });
 }
 
-fn additive(n: i64, symbols: &[(i64, char)]) -> String {
-    if !(1..=19_999).contains(&n) {
-        return decimal(n);
+/// Emit bijective-base digits from most to least significant without a reversal buffer.
+fn alphabetic_digits(value: u64, radix: u64, emit: &mut impl FnMut(usize)) {
+    if value > 0 {
+        let value = value - 1;
+        alphabetic_digits(value / radix, radix, emit);
+        emit((value % radix) as usize);
     }
-    let mut remaining = n;
-    let mut output = String::new();
-    for &(value, symbol) in symbols {
-        while remaining >= value {
-            output.push(symbol);
-            remaining -= value;
+}
+
+fn additive(n: i64, symbols: &[(i64, char)], output: &mut String) {
+    if !(1..=19_999).contains(&n) {
+        return decimal(n, output);
+    }
+    additive_symbols(n, symbols, |symbol| output.push(symbol));
+}
+
+fn additive_symbols<T: Copy>(mut value: i64, symbols: &[(i64, T)], mut emit: impl FnMut(T)) {
+    for &(weight, symbol) in symbols {
+        while value >= weight {
+            emit(symbol);
+            value -= weight;
         }
     }
-    output
 }
 
 const ARMENIAN_NUMERALS: [(i64, char); 36] = [
@@ -201,9 +198,9 @@ const GEORGIAN_NUMERALS: [(i64, char); 37] = [
 ];
 
 /// Roman numerals, defined for 1..=3999; other values fall back to `decimal`.
-fn roman(n: i64, upper: bool) -> String {
+fn roman(n: i64, upper: bool, output: &mut String) {
     if !(1..=3999).contains(&n) {
-        return decimal(n);
+        return decimal(n, output);
     }
     const TABLE: [(i64, &str); 13] = [
         (1000, "m"),
@@ -220,22 +217,52 @@ fn roman(n: i64, upper: bool) -> String {
         (4, "iv"),
         (1, "i"),
     ];
-    let mut remaining = n;
-    let mut out = String::new();
-    for (value, numeral) in TABLE {
-        while remaining >= value {
-            out.push_str(numeral);
-            remaining -= value;
+    additive_symbols(n, &TABLE, |numeral| {
+        if upper {
+            output.extend(
+                numeral
+                    .chars()
+                    .map(|character| character.to_ascii_uppercase()),
+            );
+        } else {
+            output.push_str(numeral);
         }
-    }
-    if upper { out.to_uppercase() } else { out }
+    });
 }
 
 #[cfg(test)]
 mod marker_text_tests {
-    use super::{counter_text, marker_text};
+    use super::{append_counter, counter_text, marker_text};
     use html_style_model::CounterStyle;
     use html_style_model::ListStyleType::*;
+
+    #[test]
+    fn counter_writer_appends_without_temporary_allocations() {
+        use crate::allocation_test_support::count_allocations;
+        for (style, value, expected) in [
+            (CounterStyle::Decimal, i64::MIN, "-9223372036854775808"),
+            (CounterStyle::DecimalLeadingZero, -1, "-01"),
+            (CounterStyle::DecimalLeadingZero, 0, "00"),
+            (CounterStyle::LowerRoman, 49, "xlix"),
+            (CounterStyle::UpperRoman, 3999, "MMMCMXCIX"),
+            (CounterStyle::UpperRoman, 4000, "4000"),
+            (CounterStyle::LowerAlpha, 703, "aaa"),
+            (CounterStyle::UpperAlpha, 703, "AAA"),
+            (CounterStyle::LowerGreek, 601, "ααα"),
+            (CounterStyle::Armenian, 2024, "ՍԻԴ"),
+            (CounterStyle::Georgian, 19_999, "ჵჰშჟთ"),
+            (CounterStyle::Georgian, 20_000, "20000"),
+            (CounterStyle::Disc, 1, "•"),
+            (CounterStyle::Circle, 1, "◦"),
+            (CounterStyle::Square, 1, "▪"),
+        ] {
+            let mut output = String::with_capacity(128);
+            output.push_str("前:");
+            let (_, allocations) = count_allocations(|| append_counter(style, value, &mut output));
+            assert_eq!(output, format!("前:{expected}"));
+            assert_eq!(allocations, 0, "{style:?} {value}");
+        }
+    }
 
     #[test]
     fn bullets_ignore_ordinal() {
@@ -265,6 +292,8 @@ mod marker_text_tests {
         assert_eq!(marker_text(LowerAlpha, 27).as_deref(), Some("aa."));
         assert_eq!(marker_text(LowerAlpha, 52).as_deref(), Some("az."));
         assert_eq!(marker_text(UpperAlpha, 28).as_deref(), Some("AB."));
+        assert_eq!(marker_text(LowerAlpha, 702).as_deref(), Some("zz."));
+        assert_eq!(marker_text(UpperAlpha, 703).as_deref(), Some("AAA."));
         // Out of range falls back to decimal.
         assert_eq!(marker_text(LowerAlpha, 0).as_deref(), Some("0."));
     }
@@ -283,7 +312,10 @@ mod marker_text_tests {
 
     #[test]
     fn generated_counter_formats_cover_css2_additive_and_alphabetic_styles() {
+        assert_eq!(counter_text(CounterStyle::LowerGreek, 24), "ω");
         assert_eq!(counter_text(CounterStyle::LowerGreek, 25), "αα");
+        assert_eq!(counter_text(CounterStyle::LowerGreek, 600), "ωω");
+        assert_eq!(counter_text(CounterStyle::LowerGreek, 601), "ααα");
         assert_eq!(counter_text(CounterStyle::Armenian, 2024), "ՍԻԴ");
         assert_eq!(counter_text(CounterStyle::Georgian, 400), "ჳ");
         assert_eq!(counter_text(CounterStyle::Georgian, 19_999), "ჵჰშჟთ");

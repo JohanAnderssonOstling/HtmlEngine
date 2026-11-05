@@ -1,10 +1,8 @@
 use crate::{Shaper, cpu_seconds, layout_fingerprint};
-use html::layout::{LayoutConstraints, LayoutTimings};
-use html::pipeline::ResourceContext;
-use html::pipeline::{DocumentFactory, PipelineInputs, parse_document};
+use html_pipeline::parse_document;
 use html::resources::FileSystemProvider;
-use html::style::StyleTimings;
-use html::text::GlyphResourceStore;
+use html_style::StyleTimings;
+use html_pipeline::engine::GlyphResourceStore;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::hint::black_box;
@@ -42,7 +40,7 @@ fn layout_details(t: &LayoutTimings) -> [(&'static str, Duration); 25] {
         ("layout_tree_traversal", t.layout_tree_traversal),
         ("root_box_layout", t.root_box_layout),
         ("finalize_layout", t.finalize_layout),
-        ("sort_lines_and_remap_images", t.sort_lines_and_remap_images),
+        ("build_line_traversals", t.build_line_traversals),
         ("collect_inline_decorations", t.collect_inline_decorations),
         (
             "rebuild_image_fragments_by_line",
@@ -78,7 +76,7 @@ fn layout_details(t: &LayoutTimings) -> [(&'static str, Duration); 25] {
         (
             "finalize_other",
             t.finalize_layout.saturating_sub(
-                t.sort_lines_and_remap_images
+                t.build_line_traversals
                     + t.collect_inline_decorations
                     + t.rebuild_image_fragments_by_line,
             ),
@@ -94,12 +92,12 @@ pub fn run(path: &str, case: &str, count: usize, inputs: &PipelineInputs) {
     let mut output = Value::Null;
     let constraints = LayoutConstraints::new(600.0, 16.0)
         .unwrap()
-        .with_text_composition_policy(inputs.layout.text_composition_policy);
+        .with_text_composition_policy(inputs.layout.text_composition_policy());
     for iteration in 0..count + 3 {
         let mut factory = DocumentFactory::new();
         let factory_provider = FileSystemProvider;
         let factory_resources = ResourceContext::new(&factory_provider, (path).as_ref());
-        factory.set_reader_overrides(inputs.reader_overrides.layout_overrides());
+        factory.set_reader_overrides(reader_style::layout_overrides(&inputs.reader_overrides));
         factory.set_media_environment(inputs.style_environment.media);
         let cpu = cpu_seconds();
         let start = Instant::now();
@@ -198,7 +196,7 @@ pub fn run(path: &str, case: &str, count: usize, inputs: &PipelineInputs) {
                 "source_bytes": source.len(),
                 "font_backend": "deterministic mock",
                 "heap_instrumented": cfg!(feature = "heap"),
-                "composition": format!("{:?}", inputs.layout.text_composition_policy),
+                "composition": format!("{:?}", inputs.layout.text_composition_policy()),
                 "glyphs": document.render_view(&shaped_resources).text().glyph_count(),
                 "lines": document.render_view(&shaped_resources).text().line_count(),
                 "render_fingerprint": format!("{fingerprint:016x}"),

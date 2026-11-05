@@ -1,7 +1,7 @@
 //! Immutable logical text prepared independently of renderer font resources.
 
 use crate::normalization::{collapse_whitespace, transform_text};
-use crate::pseudo_styles::first_letter_style_overrides;
+use crate::pseudo_styles::{PseudoStyles, prepare_first_letters};
 use crate::{InlineContent, TextStructure};
 use html_dom::{Document, MemoryUsageReport};
 use html_style_model::{ComputedStyles, StyleIndices};
@@ -56,9 +56,12 @@ impl PreparedText {
                 collapse_whitespace(styles, tree, &mut content)
             }
         };
+        content.pseudo_styles = PseudoStyles::new(document, styles, tree, &content);
         let mut first_letter_styles = {
             let _scope = observe("prepare.first_letter");
-            first_letter_style_overrides(document, styles, tree, &content)
+            prepare_first_letters(styles, tree, &content, content.pseudo_styles(), |index| {
+                content.character_at(index as usize).unwrap_or('?')
+            })
         };
         if !content.characters().is_empty() {
             let _scope = observe("prepare.text_transform");
@@ -87,10 +90,9 @@ impl PreparedText {
 
     pub fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = self.content.memory_usage_report();
-        report.add_slice_storage::<StyleOverrideRun>(
+        report.add_slice(
             "PreparedText.first_letter_styles.storage",
-            self.first_letter_styles.runs.len(),
-            self.first_letter_styles.runs.len(),
+            &self.first_letter_styles.runs,
         );
         report
     }
@@ -103,6 +105,7 @@ pub trait StyleOverrides {
     fn segment_at(&self, start: u32, end: u32) -> (Option<StyleIndices>, u32);
 }
 
+#[derive(Default)]
 pub struct FirstLetterStyles {
     runs: Box<[StyleOverrideRun]>,
 }

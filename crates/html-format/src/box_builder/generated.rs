@@ -4,7 +4,9 @@ use html_style_model::{
     GeneratedContentItem, QuoteStyle, StyleIndices, StyleStringId,
 };
 
-use super::classification::is_block_level_pseudo_display;
+use crate::list_marker::append_counter;
+
+use super::classification::display_for_style;
 
 pub(super) struct ResolvedGeneratedContent {
     pub(super) style: StyleIndices,
@@ -12,7 +14,6 @@ pub(super) struct ResolvedGeneratedContent {
     pub(super) text: String,
 }
 
-#[derive(Default)]
 struct CounterScope {
     frames: Vec<Vec<(StyleStringId, i64)>>,
 }
@@ -22,6 +23,12 @@ impl CounterScope {
         Self {
             frames: vec![Vec::new()],
         }
+    }
+
+    fn current_frame(&mut self) -> &mut Vec<(StyleStringId, i64)> {
+        self.frames
+            .last_mut()
+            .expect("counter scope always has a frame")
     }
 
     fn enter(&mut self) {
@@ -43,10 +50,7 @@ impl CounterScope {
     }
 
     fn reset(&mut self, directive: CounterDirective) {
-        let frame = self
-            .frames
-            .last_mut()
-            .expect("counter scope always has a frame");
+        let frame = self.current_frame();
         if let Some((_, value)) = frame
             .iter_mut()
             .rev()
@@ -69,35 +73,21 @@ impl CounterScope {
                 return;
             }
         }
-        self.frames
-            .last_mut()
-            .expect("counter scope always has a frame")
+        self.current_frame()
             .push((directive.name, i64::from(directive.value)));
     }
 
     fn value(&self, name: StyleStringId) -> i64 {
-        self.frames
-            .iter()
-            .rev()
-            .find_map(|frame| {
-                frame
-                    .iter()
-                    .rev()
-                    .find_map(|(candidate, value)| (*candidate == name).then_some(*value))
-            })
-            .unwrap_or(0)
+        self.values(name).next_back().unwrap_or(0)
     }
 
-    fn values(&self, name: StyleStringId) -> Vec<i64> {
-        self.frames
-            .iter()
-            .filter_map(|frame| {
-                frame
-                    .iter()
-                    .rev()
-                    .find_map(|(candidate, value)| (*candidate == name).then_some(*value))
-            })
-            .collect()
+    fn values(&self, name: StyleStringId) -> impl DoubleEndedIterator<Item = i64> + '_ {
+        self.frames.iter().filter_map(move |frame| {
+            frame
+                .iter()
+                .rev()
+                .find_map(|(candidate, value)| (*candidate == name).then_some(*value))
+        })
     }
 }
 
@@ -128,22 +118,10 @@ impl<'a> GeneratedContentResolver<'a> {
         self.counters.leave();
     }
 
-    pub(super) fn apply(&mut self, directives: &CounterDirectives) {
-        self.counters.apply(directives);
-    }
-
-    pub(super) fn pseudo_display(&self, origin: DomNodeId, before: bool) -> Option<Display> {
-        self.pseudo(origin, before).map(|(style, _, _)| {
-            self.styles
-                .box_model_style(style)
-                .expect("validated generated pseudo style")
-                .display
-        })
-    }
-
-    pub(super) fn pseudo_is_block_level(&self, origin: DomNodeId, before: bool) -> bool {
-        self.pseudo_display(origin, before)
-            .is_some_and(is_block_level_pseudo_display)
+    pub(super) fn apply_for_node(&mut self, node: DomNodeId) {
+        if let Some(directives) = self.styles.counter_directives_for_node(node) {
+            self.counters.apply(directives);
+        }
     }
 
     pub(super) fn resolve_pseudo(
@@ -151,33 +129,15 @@ impl<'a> GeneratedContentResolver<'a> {
         origin: DomNodeId,
         before: bool,
     ) -> Option<ResolvedGeneratedContent> {
-        let (style, content, directives) = self.pseudo(origin, before)?;
-        let content = content.clone();
-        let directives = directives.clone();
-        let display = self
-            .styles
-            .box_model_style(style)
-            .expect("validated generated pseudo style")
-            .display;
-        self.counters.apply(&directives);
-        let text = self.resolve_text(origin, &content, style);
+        let (style, content, directives) = self.styles.generated_pseudo_for_node(origin, before)?;
+        let display = display_for_style(self.styles, style);
+        self.counters.apply(directives);
+        let text = self.resolve_text(origin, content, style);
         Some(ResolvedGeneratedContent {
             style,
             display,
             text,
         })
-    }
-
-    fn pseudo(
-        &self,
-        origin: DomNodeId,
-        before: bool,
-    ) -> Option<(StyleIndices, &GeneratedContent, &CounterDirectives)> {
-        if before {
-            self.styles.before_style_for_node(origin)
-        } else {
-            self.styles.after_style_for_node(origin)
-        }
     }
 
     fn resolve_text(
@@ -190,8 +150,7 @@ impl<'a> GeneratedContentResolver<'a> {
         let quotes = self
             .styles
             .view(style)
-            .map(|view| view.quotes())
-            .unwrap_or(QuoteStyle::Auto);
+            .map_or(QuoteStyle::Auto, |view| view.quotes());
         for item in &content.items {
             match *item {
                 GeneratedContentItem::Text(id) => {
@@ -204,20 +163,20 @@ impl<'a> GeneratedContentResolver<'a> {
                         text.push_str(value);
                     }
                 }
-                GeneratedContentItem::Counter { name, style } => text.push_str(
-                    &super::super::list_marker::counter_text(style, self.counters.value(name)),
-                ),
+                GeneratedContentItem::Counter { name, style } => {
+                    append_counter(style, self.counters.value(name), &mut text)
+                }
                 GeneratedContentItem::Counters {
                     name,
                     separator,
                     style,
                 } => {
                     let separator = self.styles.string(separator).unwrap_or_default();
-                    for (index, value) in self.counters.values(name).into_iter().enumerate() {
+                    for (index, value) in self.counters.values(name).enumerate() {
                         if index > 0 {
                             text.push_str(separator);
                         }
-                        text.push_str(&super::super::list_marker::counter_text(style, value));
+                        append_counter(style, value, &mut text);
                     }
                 }
                 GeneratedContentItem::OpenQuote => {

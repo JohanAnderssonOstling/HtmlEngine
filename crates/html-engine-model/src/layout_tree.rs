@@ -1,5 +1,6 @@
 use html_dom::{Document, ElementRef, MemoryUsageReport};
 use html_style_model::{ListStylePosition, StyleIndices};
+use std::iter::{once, successors};
 use rustc_data_structures::fx::FxHashMap;
 use std::ops::Range;
 
@@ -34,41 +35,55 @@ pub struct LayoutTree {
 }
 
 impl LayoutTree {
+    /// Style-bearing formatting structures without their own layout box.
+    /// Shaping must prepare these handles before layout or paint reads them.
+    pub fn non_box_styles(&self) -> impl Iterator<Item = StyleIndices> + '_ {
+        self.boxes
+            .iter()
+            .filter_map(|layout_box| match &layout_box.layout_mode {
+                LayoutMode::Table(table) => Some(table),
+                _ => None,
+            })
+            .flat_map(|table| {
+                table
+                    .columns
+                    .iter()
+                    .flat_map(|column| once(column.width_style).chain(column.background_style))
+                    .chain(table.column_groups.iter().map(|group| group.style))
+                    .chain(
+                        table
+                            .column_width_hints
+                            .iter()
+                            .flat_map(|hint| once(hint.style).chain(hint.fallback_style)),
+                    )
+            })
+            .chain(
+                self.split_inline_position_ancestors
+                    .values()
+                    .flat_map(|styles| styles.iter().copied()),
+            )
+    }
+
     pub fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
-        report.add_slice_storage::<LayoutBox>(
-            "LayoutTree.boxes.storage",
-            self.boxes.capacity(),
-            self.boxes.len(),
-        );
+        report.add_vec_storage("LayoutTree.boxes.storage", &self.boxes);
         for layout_box in &self.boxes {
             report.extend_prefixed("LayoutTree.boxes", layout_box.memory_usage_report());
         }
-        report.add_slice_storage::<(u32, ListItemMarker)>(
-            "LayoutTree.list_markers.storage",
-            self.list_markers.capacity(),
-            self.list_markers.len(),
-        );
-        report.add_slice_storage::<(u32, u32)>(
-            "LayoutTree.image_indices.storage",
-            self.image_indices.capacity(),
-            self.image_indices.len(),
-        );
-        report.add_slice_storage::<(u32, (bool, bool))>(
+        report.add_hash_map_storage("LayoutTree.list_markers.storage", &self.list_markers);
+        report.add_hash_map_storage("LayoutTree.image_indices.storage", &self.image_indices);
+        report.add_hash_map_storage(
             "LayoutTree.inline_fragment_edges.storage",
-            self.inline_fragment_edges.capacity(),
-            self.inline_fragment_edges.len(),
+            &self.inline_fragment_edges,
         );
-        report.add_slice_storage::<(u32, Box<[StyleIndices]>)>(
+        report.add_hash_map_storage(
             "LayoutTree.split_inline_position_ancestors.storage",
-            self.split_inline_position_ancestors.capacity(),
-            self.split_inline_position_ancestors.len(),
+            &self.split_inline_position_ancestors,
         );
         for ancestors in self.split_inline_position_ancestors.values() {
-            report.add_slice_storage::<StyleIndices>(
+            report.add_slice(
                 "LayoutTree.split_inline_position_ancestors.entries",
-                ancestors.len(),
-                ancestors.len(),
+                ancestors,
             );
         }
         report
@@ -112,12 +127,29 @@ impl LayoutTree {
         self.boxes.get(box_idx)?.dom_element()
     }
 
+    /// Resolve the source element of a formatting box, if it has one.
+    pub fn element_for_box<'a>(
+        &self,
+        box_idx: usize,
+        document: &'a Document,
+    ) -> Option<ElementRef<'a>> {
+        self.box_at(box_idx)?.get_element(document)
+    }
+
     pub fn get_box_image_idx(&self, box_idx: usize) -> Option<u32> {
         self.image_indices.get(&(box_idx as u32)).copied()
     }
 
     pub fn get_box_parent(&self, box_idx: usize) -> Option<usize> {
         self.boxes.get(box_idx)?.parent().map(|p| p as usize)
+    }
+
+    /// Formatting ancestors, starting with the immediate parent and ending at
+    /// the root. Anonymous and generated boxes follow their formatting parents.
+    pub fn ancestors(&self, box_idx: usize) -> impl Iterator<Item = usize> + Clone + '_ {
+        successors(self.get_box_parent(box_idx), |&parent| {
+            self.get_box_parent(parent)
+        })
     }
 
     pub fn get_box_layout_mode(&self, box_idx: usize) -> Option<&LayoutMode> {
@@ -303,11 +335,7 @@ pub struct FlexBox {
 impl FlexBox {
     pub fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
-        report.add_slice_storage::<u32>(
-            "FlexBox.children.storage",
-            self.children.capacity(),
-            self.children.len(),
-        );
+        report.add_vec_storage("FlexBox.children.storage", &self.children);
         report
     }
 }
@@ -320,16 +348,12 @@ pub struct GridBox {
 impl GridBox {
     pub fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
-        report.add_slice_storage::<u32>(
-            "GridBox.children.storage",
-            self.children.capacity(),
-            self.children.len(),
-        );
+        report.add_vec_storage("GridBox.children.storage", &self.children);
         report
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct BlockBox {
     pub children: Children,
 }
@@ -340,7 +364,7 @@ impl BlockBox {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct TableBox {
     pub rows: Vec<u32>,
     pub row_groups: Vec<u32>,
@@ -377,46 +401,21 @@ pub struct TableColumnWidthHint {
 impl TableBox {
     pub fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
-        report.add_slice_storage::<u32>(
-            "TableBox.rows.storage",
-            self.rows.capacity(),
-            self.rows.len(),
-        );
-        report.add_slice_storage::<u32>(
-            "TableBox.row_groups.storage",
-            self.row_groups.capacity(),
-            self.row_groups.len(),
-        );
-        report.add_slice_storage::<u32>(
-            "TableBox.captions_top.storage",
-            self.captions_top.capacity(),
-            self.captions_top.len(),
-        );
-        report.add_slice_storage::<u32>(
-            "TableBox.captions_bottom.storage",
-            self.captions_bottom.capacity(),
-            self.captions_bottom.len(),
-        );
-        report.add_slice_storage::<TableColumnTrack>(
-            "TableBox.columns.storage",
-            self.columns.capacity(),
-            self.columns.len(),
-        );
-        report.add_slice_storage::<TableColumnGroupSpan>(
-            "TableBox.column_groups.storage",
-            self.column_groups.capacity(),
-            self.column_groups.len(),
-        );
-        report.add_slice_storage::<TableColumnWidthHint>(
+        report.add_vec_storage("TableBox.rows.storage", &self.rows);
+        report.add_vec_storage("TableBox.row_groups.storage", &self.row_groups);
+        report.add_vec_storage("TableBox.captions_top.storage", &self.captions_top);
+        report.add_vec_storage("TableBox.captions_bottom.storage", &self.captions_bottom);
+        report.add_vec_storage("TableBox.columns.storage", &self.columns);
+        report.add_vec_storage("TableBox.column_groups.storage", &self.column_groups);
+        report.add_vec_storage(
             "TableBox.column_width_hints.storage",
-            self.column_width_hints.capacity(),
-            self.column_width_hints.len(),
+            &self.column_width_hints,
         );
         report
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct TableRowBox {
     pub cells: Vec<u32>,
     /// Positioned descendants that are not table cells still belong to the
@@ -427,16 +426,8 @@ pub struct TableRowBox {
 impl TableRowBox {
     pub fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
-        report.add_slice_storage::<u32>(
-            "TableRowBox.cells.storage",
-            self.cells.capacity(),
-            self.cells.len(),
-        );
-        report.add_slice_storage::<u32>(
-            "TableRowBox.out_of_flow.storage",
-            self.out_of_flow.capacity(),
-            self.out_of_flow.len(),
-        );
+        report.add_vec_storage("TableRowBox.cells.storage", &self.cells);
+        report.add_vec_storage("TableRowBox.out_of_flow.storage", &self.out_of_flow);
         report
     }
 }
@@ -462,10 +453,11 @@ impl TableCellBox {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum Children {
     Blocks(Vec<u32>),
     InlineItems(Range<u32>),
+    #[default]
     Empty,
 }
 
@@ -473,11 +465,7 @@ impl Children {
     pub fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
         if let Children::Blocks(children) = self {
-            report.add_slice_storage::<u32>(
-                "Children::Blocks.storage",
-                children.capacity(),
-                children.len(),
-            );
+            report.add_vec_storage("Children::Blocks.storage", children);
         }
         report
     }
@@ -498,14 +486,14 @@ impl html_text::TextStructure for LayoutTree {
 
     fn is_inline(&self, context: usize) -> bool {
         matches!(
-            self.box_at(context).map(|value| value.layout_mode()),
+            self.get_box_layout_mode(context),
             Some(LayoutMode::Inline(_))
         )
     }
 
     fn is_flex_or_grid(&self, context: usize) -> bool {
         matches!(
-            self.box_at(context).map(|value| value.layout_mode()),
+            self.get_box_layout_mode(context),
             Some(LayoutMode::Flex(_) | LayoutMode::Grid(_))
         )
     }

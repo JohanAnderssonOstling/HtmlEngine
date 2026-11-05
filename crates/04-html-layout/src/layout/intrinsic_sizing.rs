@@ -1,8 +1,10 @@
 use super::box_model::ResolvedBoxModel;
+use super::inline::{BreakKind, tokens::indent_for_line};
 use crate::flex_grid::TaffyContainerKind;
 use crate::layout::LayoutEngine;
 use crate::layout_model::{Children, InlineItemKind, LayoutMode};
 use html_style_model::{Float, OverflowWrap, UsedPreferredSize as PreferredSize, WhiteSpace, WordBreak};
+use html_text::is_other_space_separator;
 use std::ops::Range;
 
 /// Shared intrinsic inline-size calculation for every formatting context.
@@ -19,11 +21,10 @@ pub fn percentage_height_image_width(
     box_idx: usize,
     content_height: f64,
 ) -> Option<f64> {
-    let node = engine
+    let element = engine
         .reader
-        .box_dom_element(box_idx)
-        .and_then(|raw| engine.reader.document().node_id_from_raw(raw))?;
-    let element = engine.reader.document().element_ref(node)?;
+        .layout_tree()
+        .element_for_box(box_idx, engine.reader.document())?;
     let mut width: Option<f64> = None;
     for child_id in element.children() {
         let child_raw = child_id.raw();
@@ -83,7 +84,7 @@ fn box_intrinsic_widths_with_available(
     let extras = margins + padding_border;
     let available_content = available_width.map(|available| (available - extras).max(0.0));
     let (content_min, content_max) =
-        box_content_intrinsic_widths_impl(engine, box_idx, available_content);
+        box_content_intrinsic_widths(engine, box_idx, available_content);
     let outer_min = content_min + extras;
     let outer_max = content_max + extras;
     let intrinsic_value = |size: PreferredSize, auto: f64| match size {
@@ -93,37 +94,17 @@ fn box_intrinsic_widths_with_available(
         PreferredSize::FitContent => available_width.map_or(outer_max, |available| {
             outer_max.min(available.max(outer_min))
         }),
-        PreferredSize::Px(_) => super::resolve_definite_outer_inline_size(
-            size,
-            style.box_sizing(),
-            padding_border,
-            margins,
-        )
-        .expect("pixel sizes are definite"),
-        // During intrinsic sizing the percentage has an indefinite basis;
-        // preserve the definite length contribution of a linear calc.
-        PreferredSize::Calc {
-            percentage_dependent: false,
-            ..
-        } => super::resolve_definite_outer_inline_size(
-            size,
-            style.box_sizing(),
-            padding_border,
-            margins,
-        )
-        .expect("percentage-independent calc is definite"),
-        PreferredSize::Calc {
-            percentage_dependent: true,
-            ..
-        } => auto,
-        PreferredSize::Comparison { .. } if size.percentage_dependent() => auto,
-        PreferredSize::Comparison { .. } => super::resolve_definite_outer_inline_size(
-            size,
-            style.box_sizing(),
-            padding_border,
-            margins,
-        )
-        .expect("percentage-independent comparison is definite"),
+        // Intrinsic sizing has no percentage basis. The shared resolver
+        // accepts numeric sizes only when they are independent of that basis.
+        PreferredSize::Px(_) | PreferredSize::Calc { .. } | PreferredSize::Comparison { .. } => {
+            super::resolve_definite_outer_inline_size(
+                size,
+                style.box_sizing(),
+                padding_border,
+                margins,
+            )
+            .unwrap_or(auto)
+        }
     };
 
     let mut preferred_min = intrinsic_value(style.width(), outer_min);
@@ -132,33 +113,23 @@ fn box_intrinsic_widths_with_available(
     let maximum = intrinsic_value(style.max_width(), f64::INFINITY).max(minimum);
     preferred_min = preferred_min.clamp(minimum, maximum);
     preferred_max = preferred_max.clamp(minimum, maximum).max(preferred_min);
+    if engine.reader.is_table_box(box_idx) {
+        // Table tracks retain their min-content floor even when an authored
+        // width or max-width is smaller. Wrappers must measure that used size.
+        preferred_min = preferred_min.max(outer_min);
+        preferred_max = preferred_max.max(preferred_min);
+    }
     (preferred_min, preferred_max)
 }
 
+/// Intrinsic content contributions. A definite available inline size supplies
+/// the stretch-fit limit needed by `fit-content`; `None` keeps it indefinite.
 pub fn box_content_intrinsic_widths(
-    engine: &LayoutEngine<'_, '_>,
-    box_idx: usize,
-) -> (f64, f64) {
-    box_content_intrinsic_widths_impl(engine, box_idx, None)
-}
-
-/// Intrinsic content contributions when the formatting context already knows
-/// the available inline size. This is the context required by `fit-content`:
-/// unlike min/max-content, its contribution is not meaningful without the
-/// stretch-fit limit supplied by the containing block.
-pub fn box_content_intrinsic_widths_with_available(
-    engine: &LayoutEngine<'_, '_>,
-    box_idx: usize,
-    available_width: f64,
-) -> (f64, f64) {
-    box_content_intrinsic_widths_impl(engine, box_idx, Some(available_width.max(0.0)))
-}
-
-fn box_content_intrinsic_widths_impl(
     engine: &LayoutEngine<'_, '_>,
     box_idx: usize,
     available_width: Option<f64>,
 ) -> (f64, f64) {
+    let available_width = available_width.map(|width| width.max(0.0));
     if let Some(intrinsic) = engine.reader.image_intrinsic(box_idx) {
         return (intrinsic.size.width, intrinsic.size.width);
     }
@@ -188,13 +159,16 @@ fn box_content_intrinsic_widths_impl(
             box_idx,
             &container.children,
             TaffyContainerKind::Flex,
+            None,
+            None,
         ),
-        Some(LayoutMode::Grid(container)) => crate::flex_grid::intrinsic_widths_with_available(
+        Some(LayoutMode::Grid(container)) => crate::flex_grid::intrinsic_widths(
             engine,
             box_idx,
             &container.children,
             TaffyContainerKind::Grid,
             available_width,
+            None,
         ),
         None => (0.0, 0.0),
     }
@@ -204,23 +178,16 @@ fn box_content_intrinsic_widths_impl(
 /// contribution until a containing width is chosen. Preserve that fact
 /// through auto-table shrink-to-fit sizing without feeding infinities into
 /// the concrete column-width solver.
-pub fn contains_full_width_percentage_table(
-    engine: &LayoutEngine<'_, '_>,
-    box_idx: usize,
-) -> bool {
-    if matches!(
-        engine.reader.box_layout_mode(box_idx),
-        Some(LayoutMode::Table(_))
-    ) && matches!(engine.reader.style(box_idx).width(), PreferredSize::Percent(value) if value >= 1.0)
+pub fn contains_full_width_percentage_table(engine: &LayoutEngine<'_, '_>, box_idx: usize) -> bool {
+    if engine.reader.is_table_box(box_idx)
+        && matches!(engine.reader.style(box_idx).width(), PreferredSize::Percent(value) if value >= 1.0)
     {
         return true;
     }
 
-    let children_contain = |children: &Children| match children {
-        Children::Blocks(children) => children
-            .iter()
-            .any(|&child| contains_full_width_percentage_table(engine, child as usize)),
-        Children::InlineItems(range) => range.clone().any(|run_idx| {
+    let contains_box = |&child: &u32| contains_full_width_percentage_table(engine, child as usize);
+    let inline_contains = |mut range: Range<u32>| {
+        range.any(|run_idx| {
             engine
                 .text
                 .inline_item(run_idx as usize)
@@ -229,10 +196,13 @@ pub fn contains_full_width_percentage_table(
                     | InlineItemKind::FloatAnchor { box_idx } => {
                         contains_full_width_percentage_table(engine, *box_idx as usize)
                     }
-                    InlineItemKind::AbsoluteAnchor { .. } => false,
                     _ => false,
                 })
-        }),
+        })
+    };
+    let children_contain = |children: &Children| match children {
+        Children::Blocks(children) => children.iter().any(contains_box),
+        Children::InlineItems(range) => inline_contains(range.clone()),
         Children::Empty => false,
     };
 
@@ -243,34 +213,13 @@ pub fn contains_full_width_percentage_table(
             .iter()
             .chain(&table.captions_top)
             .chain(&table.captions_bottom)
-            .any(|&child| contains_full_width_percentage_table(engine, child as usize)),
-        Some(LayoutMode::TableRow(row)) => row
-            .cells
-            .iter()
-            .any(|&child| contains_full_width_percentage_table(engine, child as usize)),
+            .any(contains_box),
+        Some(LayoutMode::TableRow(row)) => row.cells.iter().any(contains_box),
         Some(LayoutMode::TableCell(cell)) => children_contain(&cell.children),
-        Some(LayoutMode::Flex(container)) => container
-            .children
-            .iter()
-            .any(|&child| contains_full_width_percentage_table(engine, child as usize)),
-        Some(LayoutMode::Grid(container)) => container
-            .children
-            .iter()
-            .any(|&child| contains_full_width_percentage_table(engine, child as usize)),
+        Some(LayoutMode::Flex(container)) => container.children.iter().any(contains_box),
+        Some(LayoutMode::Grid(container)) => container.children.iter().any(contains_box),
         Some(LayoutMode::Inline(range)) | Some(LayoutMode::Anonymous(range)) => {
-            range.clone().any(|run_idx| {
-                engine
-                    .text
-                    .inline_item(run_idx as usize)
-                    .is_some_and(|run| match &run.kind {
-                        InlineItemKind::AtomicBox { box_idx }
-                        | InlineItemKind::FloatAnchor { box_idx } => {
-                            contains_full_width_percentage_table(engine, *box_idx as usize)
-                        }
-                        InlineItemKind::AbsoluteAnchor { .. } => false,
-                        _ => false,
-                    })
-            })
+            inline_contains(range.clone())
         }
         None => false,
     }
@@ -324,6 +273,61 @@ fn children_intrinsic_widths(
     }
 }
 
+/// Tracks either min-content segments or max-content lines. The caller owns
+/// break policy; this state owns width accumulation and one indent per line.
+struct IntrinsicWidth {
+    current: f64,
+    trailing_removable: f64,
+    widest: f64,
+    pending_indent: Option<f64>,
+}
+
+impl IntrinsicWidth {
+    fn new(indent: f64) -> Self {
+        Self {
+            current: 0.0,
+            trailing_removable: 0.0,
+            widest: 0.0,
+            pending_indent: Some(indent),
+        }
+    }
+
+    fn apply_indent(&mut self) {
+        if let Some(indent) = self.pending_indent.take() {
+            self.current += indent;
+        }
+    }
+
+    fn add(&mut self, width: f64) {
+        self.apply_indent();
+        if width != 0.0 {
+            self.trailing_removable = 0.0;
+        }
+        self.current += width;
+    }
+
+    fn add_removable(&mut self, width: f64) {
+        self.apply_indent();
+        self.current += width;
+        self.trailing_removable += width;
+    }
+
+    fn started(&self) -> bool {
+        self.current != 0.0 || self.pending_indent.is_none()
+    }
+
+    fn finish(&mut self, next_indent: f64) {
+        self.widest = self.value();
+        self.current = 0.0;
+        self.trailing_removable = 0.0;
+        self.pending_indent = Some(next_indent);
+    }
+
+    fn value(&self) -> f64 {
+        self.widest.max((self.current - self.trailing_removable).max(0.0))
+    }
+}
+
 fn runs_intrinsic_widths(
     engine: &LayoutEngine<'_, '_>,
     run_range: Range<u32>,
@@ -335,69 +339,53 @@ fn runs_intrinsic_widths(
     let text_indent = container_style.text_indent().resolve(0.0);
     let hanging_indent = container_style.text_indent_hanging();
     let each_line_indent = container_style.text_indent_each_line();
-    let mut min_content = 0.0f64;
-    let mut max_content = 0.0f64;
-    let mut current_line = 0.0f64;
-    let mut segment = 0.0f64;
+    let first_indent = indent_for_line(text_indent, hanging_indent, true);
+    let hard_indent = indent_for_line(text_indent, hanging_indent, each_line_indent);
+    let soft_indent = indent_for_line(text_indent, hanging_indent, false);
+    // Max-content breaks only at forced breaks; min-content also breaks at
+    // soft opportunities. Each accumulator consumes its own pending indent.
+    let mut minimum = IntrinsicWidth::new(first_indent);
+    let mut maximum = IntrinsicWidth::new(first_indent);
     let mut pending_collapsible_space = 0.0f64;
-    // Max-content only starts a new line at a forced break. Min-content also
-    // starts a hypothetical line at every soft wrap opportunity. Track the
-    // two independently so text-indent is charged to exactly the lines to
-    // which it would apply during layout.
-    let mut max_starts_indented_line = true;
-    let mut min_starts_indented_line = true;
-    let mut max_indent_applied = false;
-    let mut min_indent_applied = false;
-
-    let apply_max_indent =
-        |current_line: &mut f64, applied: &mut bool, starts_indented_line: bool| {
-            if !*applied {
-                *current_line += super::inline::tokens::indent_for_line(
-                    text_indent,
-                    hanging_indent,
-                    starts_indented_line,
-                );
-                *applied = true;
-            }
-        };
-    let apply_min_indent = |segment: &mut f64, applied: &mut bool, starts_indented_line: bool| {
-        if !*applied {
-            *segment += super::inline::tokens::indent_for_line(
-                text_indent,
-                hanging_indent,
-                starts_indented_line,
-            );
-            *applied = true;
-        }
-    };
+    let mut preserved_space_break = false;
+    let mut text_cursor = engine.text.cursor();
 
     for run in &engine.text.inline_items()[run_range.start as usize..run_range.end as usize] {
-        let ownership_box = super::inline::tokens::inline_item_ownership_box(engine, run);
-        if !ownership_box.is_some_and(|box_idx| {
-            super::inline::run_belongs_to_inline_context(engine, box_idx, container_box_idx)
-        }) {
+        if !engine
+            .reader
+            .inline_item_belongs_to_context(run, container_box_idx)
+        {
             continue;
         }
         let style = engine.reader.style(run.box_idx as usize);
-        let tab_reference_style = super::inline::tab_reference_style(&engine.reader, run.box_idx as usize);
         match &run.kind {
             InlineItemKind::Text { glyphs } => {
                 for glyph_idx in glyphs.clone() {
                     let white_space = style.white_space();
-                    let unit =
-                        super::inline::canonical_text_unit(engine, glyph_idx, style, white_space);
+                    let (unit, cluster_boundary) = super::inline::canonical_text_unit(
+                        engine,
+                        &mut text_cursor,
+                        glyph_idx,
+                        run.box_idx as usize,
+                        glyphs.end,
+                        style,
+                        white_space,
+                    );
                     let c = unit.character;
                     let break_kind = unit.break_kind;
-                    if break_kind == super::inline::BreakKind::Hard {
-                        min_content = min_content.max(segment.max(0.0));
-                        max_content = max_content.max(current_line.max(0.0));
-                        segment = 0.0;
-                        current_line = 0.0;
+                    if preserved_space_break && !matches!(c, ' ' | '\t') {
+                        minimum.finish(soft_indent);
+                        preserved_space_break = false;
+                    }
+                    if break_kind == BreakKind::Hard {
+                        if matches!(c, '\u{000b}' | '\u{000c}' | '\u{0085}') {
+                            minimum.add(unit.natural_advance);
+                            maximum.add(pending_collapsible_space + unit.natural_advance);
+                        }
+                        minimum.finish(hard_indent);
+                        maximum.finish(hard_indent);
                         pending_collapsible_space = 0.0;
-                        max_starts_indented_line = each_line_indent;
-                        min_starts_indented_line = each_line_indent;
-                        max_indent_applied = false;
-                        min_indent_applied = false;
+                        preserved_space_break = false;
                         continue;
                     }
 
@@ -408,27 +396,23 @@ fn runs_intrinsic_widths(
                         && !(white_space == WhiteSpace::PreWrap && matches!(c, ' ' | '\t'))
                         && (style.overflow_wrap() == OverflowWrap::Anywhere
                             || style.word_break() == WordBreak::BreakWord)
-                        && engine.text.is_cluster_boundary(glyph_idx as usize)
-                        && (segment != 0.0 || min_indent_applied)
+                        && cluster_boundary
+                        && minimum.started()
                     {
-                        min_content = min_content.max(segment.max(0.0));
-                        segment = 0.0;
-                        min_starts_indented_line = false;
-                        min_indent_applied = false;
+                        minimum.finish(soft_indent);
                     }
 
                     let advance = if c == '\u{00ad}' {
                         0.0
                     } else if c == '\t' && white_space.preserves_spaces() {
                         let (interval, minimum_advance) = super::inline::preserved_tab_metrics(
-                            style,
-                            tab_reference_style,
-                            engine.reader.box_uses_ahem(run.box_idx as usize),
+                            &engine.reader,
+                            run.box_idx as usize,
                         );
                         if interval <= 0.0 {
                             0.0
                         } else {
-                            let remainder = current_line.rem_euclid(interval);
+                            let remainder = maximum.current.rem_euclid(interval);
                             let mut to_stop = if remainder <= f64::EPSILON {
                                 interval
                             } else {
@@ -442,46 +426,54 @@ fn runs_intrinsic_widths(
                     } else {
                         unit.natural_advance
                     };
-                    if break_kind == super::inline::BreakKind::Discretionary
-                        && engine.text.is_cluster_boundary(glyph_idx as usize)
+                    if break_kind == BreakKind::Discretionary
+                        && cluster_boundary
                     {
-                        min_content = min_content.max(segment.max(0.0));
-                        segment = 0.0;
-                        min_starts_indented_line = false;
-                        min_indent_applied = false;
+                        minimum.finish(soft_indent);
                         if c == '\u{200b}' {
                             continue;
                         }
                     }
-                    if break_kind == super::inline::BreakKind::Soft {
-                        min_content = min_content.max(segment.max(0.0));
-                        segment = 0.0;
-                        min_starts_indented_line = false;
-                        min_indent_applied = false;
-                        if white_space.collapses_spaces() && !white_space.preserves_spaces() {
-                            if current_line > 0.0 {
-                                pending_collapsible_space = advance;
-                            }
-                            continue;
+                    if is_other_space_separator(c) && white_space.collapses_spaces() {
+                        // Other separators hang at an intrinsic line end;
+                        // Ogham is trimmed instead. Both leave internal spaces
+                        // in the width once following content commits the run.
+                        // Collapsed spaces between separators belong to that
+                        // same hanging suffix, rather than committing it.
+                        minimum.add_removable(advance);
+                        maximum.add_removable(pending_collapsible_space + advance);
+                        pending_collapsible_space = 0.0;
+                        continue;
+                    }
+                    if white_space.collapses_spaces() && matches!(c, ' ' | '\t' | '\n') {
+                        if break_kind == BreakKind::Soft {
+                            minimum.finish(soft_indent);
+                        } else {
+                            // A suppressed wrap (notably nowrap) still retains
+                            // internal spaces while excluding a hanging suffix.
+                            minimum.add_removable(advance);
                         }
+                        if maximum.current > 0.0 { pending_collapsible_space = advance; }
+                        continue;
+                    }
+                    if break_kind == BreakKind::Soft {
+                        minimum.finish(soft_indent);
                     } else {
-                        apply_min_indent(
-                            &mut segment,
-                            &mut min_indent_applied,
-                            min_starts_indented_line,
-                        );
+                        minimum.apply_indent();
                         // Pre-wrap spaces and tabs hang at a hypothetical
                         // line end, so they do not enlarge min-content.
                         if white_space != WhiteSpace::PreWrap || !matches!(c, ' ' | '\t') {
-                            segment += advance;
+                            minimum.add(advance);
+                        }
+                        if matches!(c, ' ' | '\t') {
+                            if white_space == WhiteSpace::BreakSpaces {
+                                minimum.finish(soft_indent);
+                            } else if white_space == WhiteSpace::PreWrap {
+                                preserved_space_break = true;
+                            }
                         }
                     }
-                    apply_max_indent(
-                        &mut current_line,
-                        &mut max_indent_applied,
-                        max_starts_indented_line,
-                    );
-                    current_line += pending_collapsible_space + advance;
+                    maximum.add(pending_collapsible_space + advance);
                     pending_collapsible_space = 0.0;
                 }
             }
@@ -499,67 +491,35 @@ fn runs_intrinsic_widths(
                     .unwrap_or(1.0)
                     .max(0.0);
                 }
-                apply_max_indent(
-                    &mut current_line,
-                    &mut max_indent_applied,
-                    max_starts_indented_line,
-                );
-                apply_min_indent(
-                    &mut segment,
-                    &mut min_indent_applied,
-                    min_starts_indented_line,
-                );
-                current_line += pending_collapsible_space + width;
+                maximum.add(pending_collapsible_space + width);
                 pending_collapsible_space = 0.0;
-                segment += width;
+                minimum.add(width);
             }
             InlineItemKind::AtomicBox { box_idx } => {
                 let (atomic_min, atomic_max) = box_intrinsic_widths(engine, *box_idx as usize);
-                apply_max_indent(
-                    &mut current_line,
-                    &mut max_indent_applied,
-                    max_starts_indented_line,
-                );
                 // Atomic inline boxes admit a soft wrap on either side. They
                 // remain adjacent for max-content sizing, but each atomic box
                 // is its own unbreakable segment for min-content sizing.
-                if segment != 0.0 || min_indent_applied {
-                    min_content = min_content.max(segment.max(0.0));
-                    segment = 0.0;
-                    min_starts_indented_line = false;
-                    min_indent_applied = false;
+                if minimum.started() {
+                    minimum.finish(soft_indent);
                 }
-                apply_min_indent(
-                    &mut segment,
-                    &mut min_indent_applied,
-                    min_starts_indented_line,
-                );
-                current_line += pending_collapsible_space + atomic_max;
+                maximum.add(pending_collapsible_space + atomic_max);
                 pending_collapsible_space = 0.0;
-                segment += atomic_min;
-                min_content = min_content.max(segment.max(0.0));
-                segment = 0.0;
-                min_starts_indented_line = false;
-                min_indent_applied = false;
+                minimum.add(atomic_min);
+                minimum.finish(soft_indent);
             }
             InlineItemKind::Break { .. } => {
-                min_content = min_content.max(segment.max(0.0));
-                max_content = max_content.max(current_line.max(0.0));
-                segment = 0.0;
-                current_line = 0.0;
+                minimum.finish(hard_indent);
+                maximum.finish(hard_indent);
                 pending_collapsible_space = 0.0;
-                max_starts_indented_line = each_line_indent;
-                min_starts_indented_line = each_line_indent;
-                max_indent_applied = false;
-                min_indent_applied = false;
             }
             InlineItemKind::FloatAnchor { box_idx } => {
                 let (float_min, float_max) = box_intrinsic_widths(engine, *box_idx as usize);
                 // Consecutive floats may share a line at max-content size,
                 // while the min-content contribution only needs room for
                 // the widest individual float.
-                min_content = min_content.max(float_min);
-                current_line += pending_collapsible_space + float_max;
+                minimum.widest = minimum.widest.max(float_min);
+                maximum.current += pending_collapsible_space + float_max;
                 pending_collapsible_space = 0.0;
             }
             InlineItemKind::AbsoluteAnchor { .. } => {}
@@ -580,26 +540,17 @@ fn runs_intrinsic_widths(
                 } else {
                     0.0
                 };
-                apply_max_indent(
-                    &mut current_line,
-                    &mut max_indent_applied,
-                    max_starts_indented_line,
-                );
-                apply_min_indent(
-                    &mut segment,
-                    &mut min_indent_applied,
-                    min_starts_indented_line,
-                );
-                current_line += pending_collapsible_space + width;
-                pending_collapsible_space = 0.0;
-                segment += width;
+                if width != 0.0 {
+                    maximum.add(pending_collapsible_space + width);
+                    pending_collapsible_space = 0.0;
+                    minimum.add(width);
+                }
             }
             // Markers are positioned outside the containing inline flow.
             InlineItemKind::Marker { .. } => {}
         }
     }
 
-    min_content = min_content.max(segment.max(0.0));
-    max_content = max_content.max(current_line.max(0.0));
-    (min_content, max_content.max(min_content))
+    let min_content = minimum.value();
+    (min_content, maximum.value().max(min_content))
 }

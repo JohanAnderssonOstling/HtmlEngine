@@ -2,4 +2,5 @@
 
 mod compiled;
 pub mod dom;
+pub(crate) mod scope;
 pub mod selectors;

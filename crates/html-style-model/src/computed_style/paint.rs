@@ -1,5 +1,6 @@
 //! Resolve reader paint independently of the computed typography tables.
 
+use crate::computed_style;
 use super::{
     ComputedStyles, ReaderStyleOverrides, StyleIndices, apply_reader_background,
     apply_reader_border, apply_reader_root_background,
@@ -33,7 +34,7 @@ impl ComputedStyles {
         let foreground = overrides.foreground.unwrap_or_else(|| {
             overrides
                 .theme
-                .map_or(style.color(), |theme| theme.adapt(style.color()))
+                .map_or(style.color(), |theme| computed_style::theme_adaptation_adapt(theme, style.color()))
         });
         let mut background = style.background.clone();
         let mut border = style.border.clone();

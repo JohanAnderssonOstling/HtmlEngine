@@ -1,5 +1,29 @@
-use crate::{ParsedHtml, parse_html_document};
+use crate::{MarkupSyntax, ParsedHtml, parse_html_document};
 use encoding_rs::{Encoding, UTF_8};
+use html_dom::ResourceProvider;
+use std::borrow::Cow;
+use std::io;
+
+/// Resolve a transport or fallback charset label to its canonical encoding.
+/// Whitespace and standard encoding aliases are accepted without allocation.
+pub fn encoding_for_label(label: &str) -> Option<&'static Encoding> {
+    Encoding::for_label(label.trim().as_bytes())
+}
+
+/// Read and decode markup using one transport metadata snapshot for both the
+/// character encoding and HTML/XML syntax. Unavailable metadata uses defaults;
+/// resource read errors are returned to the caller.
+pub fn read_document_source(
+    provider: &dyn ResourceProvider,
+    uri: &str,
+) -> io::Result<(String, MarkupSyntax)> {
+    let bytes = provider.read_bytes(uri)?;
+    let metadata = provider.metadata(uri).unwrap_or_default();
+    Ok((
+        decode_owned_html_bytes(bytes, metadata.charset.as_deref()),
+        MarkupSyntax::from_resource(uri, metadata.media_type.as_deref()),
+    ))
+}
 
 /// Decodes and parses an HTML byte stream before invalid sequences can be
 /// replaced by a resource adapter. Transport metadata takes precedence over
@@ -17,14 +41,25 @@ pub fn decode_html_bytes(bytes: &[u8], transport_encoding: Option<&str>) -> Stri
         .into_owned()
 }
 
+fn decode_owned_html_bytes(mut bytes: Vec<u8>, transport_encoding: Option<&str>) -> String {
+    match decode_html_bytes_with_encoding(&bytes, transport_encoding).0 {
+        Cow::Borrowed(source) => {
+            let bom_len = bytes.len() - source.len();
+            bytes.drain(..bom_len);
+            String::from_utf8(bytes).expect("borrowed decoding validates UTF-8 bytes")
+        }
+        Cow::Owned(source) => source,
+    }
+}
+
 fn decode_html_bytes_with_encoding<'a>(
     bytes: &'a [u8],
     transport_encoding: Option<&str>,
-) -> (std::borrow::Cow<'a, str>, &'static Encoding) {
+) -> (Cow<'a, str>, &'static Encoding) {
     let (encoding, bom_len) = Encoding::for_bom(bytes)
         .or_else(|| {
             transport_encoding
-                .and_then(|label| Encoding::for_label(label.trim().as_bytes()))
+                .and_then(encoding_for_label)
                 .map(|encoding| (encoding, 0))
         })
         .or_else(|| prescan_html_encoding(bytes).map(|encoding| (encoding, 0)))
@@ -46,19 +81,16 @@ fn prescan_html_encoding(bytes: &[u8]) -> Option<&'static Encoding> {
             cursor = find_bytes(bytes, cursor + 4, b"-->").map_or(bytes.len(), |end| end + 3);
             continue;
         }
-        if starts_raw_text_element(bytes, cursor, b"style")
-            || starts_raw_text_element(bytes, cursor, b"title")
+        if let Some(close) = [(b"style", b"</style"), (b"title", b"</title")]
+            .into_iter()
+            .find_map(|(name, close)| {
+                starts_raw_text_element(bytes, cursor, name).then_some(close)
+            })
         {
-            let name = if starts_raw_text_element(bytes, cursor, b"style") {
-                b"style".as_slice()
-            } else {
-                b"title".as_slice()
-            };
-            let close = [b"</".as_slice(), name].concat();
             cursor = find_ascii_case_insensitive(
                 bytes,
                 tag_end(bytes, cursor + 1).saturating_add(1),
-                &close,
+                close,
             )
             .map_or(bytes.len(), |start| {
                 tag_end(bytes, start + close.len()).saturating_add(1)
@@ -141,10 +173,7 @@ fn meta_encoding(attributes: &[u8]) -> Option<&'static Encoding> {
     let mut cursor = 0usize;
     let mut charset = None;
     let mut content = None;
-    let mut has_content_type_pragma = false;
-    let mut seen_charset = false;
-    let mut seen_content = false;
-    let mut seen_http_equiv = false;
+    let mut content_type_pragma = None;
     while cursor < attributes.len() {
         while attributes
             .get(cursor)
@@ -198,21 +227,18 @@ fn meta_encoding(attributes: &[u8]) -> Option<&'static Encoding> {
             None => return None,
         };
         let value = &attributes[value_start..value_end];
-        if name.eq_ignore_ascii_case(b"charset") && !seen_charset {
-            charset = Some(value);
-            seen_charset = true;
-        } else if name.eq_ignore_ascii_case(b"content") && !seen_content {
-            content = Some(value);
-            seen_content = true;
-        } else if name.eq_ignore_ascii_case(b"http-equiv") && !seen_http_equiv {
-            has_content_type_pragma = value.eq_ignore_ascii_case(b"content-type");
-            seen_http_equiv = true;
+        if name.eq_ignore_ascii_case(b"charset") {
+            charset.get_or_insert(value);
+        } else if name.eq_ignore_ascii_case(b"content") {
+            content.get_or_insert(value);
+        } else if name.eq_ignore_ascii_case(b"http-equiv") {
+            content_type_pragma.get_or_insert(value.eq_ignore_ascii_case(b"content-type"));
         }
         cursor = cursor.saturating_add(1);
     }
     let label = match charset {
         Some(label) => label,
-        None if has_content_type_pragma => content_charset_label(content?)?,
+        None if content_type_pragma == Some(true) => content_charset_label(content?)?,
         None => return None,
     };
     Encoding::for_label(label).or_else(|| {
@@ -291,4 +317,58 @@ fn tag_end(bytes: &[u8], start: usize) -> usize {
         cursor += 1;
     }
     bytes.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_owned_html_bytes;
+
+    #[test]
+    fn owned_decoding_reuses_valid_utf8_and_ascii_buffers() {
+        for (source, encoding) in [
+            ("<p>café 🙂</p>", None),
+            ("<p>café 🙂</p>", Some("utf-8")),
+            ("<p>ASCII</p>", Some("windows-1252")),
+            ("\u{feff}<p>café 🙂</p>", None),
+            ("\u{feff}<p>café 🙂</p>", Some("windows-1252")),
+            ("\u{feff}\u{feff}<p>café</p>", None),
+            ("\u{feff}", None),
+            ("", None),
+        ] {
+            let mut bytes = Vec::with_capacity(source.len() + 64);
+            bytes.extend_from_slice(source.as_bytes());
+            let pointer = bytes.as_ptr();
+            let capacity = bytes.capacity();
+            let decoded = decode_owned_html_bytes(bytes, encoding);
+            assert_eq!(decoded, source.strip_prefix('\u{feff}').unwrap_or(source));
+            assert_eq!(decoded.as_ptr(), pointer);
+            assert_eq!(decoded.capacity(), capacity);
+        }
+    }
+
+    #[test]
+    fn owned_decoding_preserves_bom_charset_prescan_and_replacement_rules() {
+        let cases: &[(&[u8], Option<&str>, &str)] = &[
+            (
+                b"\xef\xbb\xbf<p>caf\xc3\xa9</p>",
+                Some("windows-1252"),
+                "<p>café</p>",
+            ),
+            (
+                b"\xff\xfe<\0p\0>\0\xe9\0<\0/\0p\0>\0",
+                Some("windows-1252"),
+                "<p>é</p>",
+            ),
+            (b"<p>caf\xe9</p>", Some("windows-1252"), "<p>café</p>"),
+            (
+                b"<meta charset=windows-1252><p>caf\xe9</p>",
+                None,
+                "<meta charset=windows-1252><p>café</p>",
+            ),
+            (b"<p>\xff</p>", None, "<p>�</p>"),
+        ];
+        for &(bytes, encoding, expected) in cases {
+            assert_eq!(decode_owned_html_bytes(bytes.to_vec(), encoding), expected);
+        }
+    }
 }

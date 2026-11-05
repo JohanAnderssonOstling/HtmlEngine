@@ -1,8 +1,17 @@
 #[cfg(test)]
+use html_engine_model::layout_state;
+#[cfg(test)]
 mod tests {
-    use crate::GlyphResourceStore;
+    use html_pipeline::engine::fragment_paint;
 
-    use super::columns::{TableCellPlacement, TableGrid, build_table_grid};
+    use html_pipeline::engine::text_paint;
+
+    use html_pipeline::engine::box_queries;
+
+    use crate::GlyphResourceStore;
+    use crate::layout_model::BoxId;
+
+    use super::columns::build_table_grid;
     use crate::parser::DocumentFactory;
     use crate::test_support::TestGlyphShaper;
     use crate::{LaidOutDocument, LayoutConstraints};
@@ -73,10 +82,11 @@ mod tests {
         resources: &GlyphResourceStore,
     ) -> kurbo::Size {
         let view = document.render_view(resources);
-        let index = (0..view.boxes().len())
-            .find(|&index| view.boxes().id(index).map(|value| view.string(value)) == Some(id))
+        let index = (0..box_queries::len(view.boxes()))
+            .map(layout_state::box_id_new)
+            .find(|&index| box_queries::attribute(view.boxes(), index, "id") == Some(id))
             .unwrap_or_else(|| panic!("layout box #{id} should exist"));
-        view.boxes().size(index).expect("box index in range")
+        box_queries::render_box_view_size(view.boxes(), index).expect("box index in range")
     }
 
     fn box_point_by_id(
@@ -85,10 +95,11 @@ mod tests {
         resources: &GlyphResourceStore,
     ) -> kurbo::Point {
         let view = document.render_view(resources);
-        let index = (0..view.boxes().len())
-            .find(|&index| view.boxes().id(index).map(|value| view.string(value)) == Some(id))
+        let index = (0..box_queries::len(view.boxes()))
+            .map(layout_state::box_id_new)
+            .find(|&index| box_queries::attribute(view.boxes(), index, "id") == Some(id))
             .unwrap_or_else(|| panic!("layout box #{id} should exist"));
-        view.boxes().point(index).expect("box index in range")
+        box_queries::render_box_view_point(view.boxes(), index).expect("box index in range")
     }
 
     fn decoration_rects_by_color(
@@ -96,12 +107,9 @@ mod tests {
         color: u32,
         resources: &GlyphResourceStore,
     ) -> Vec<kurbo::Rect> {
-        document
-            .render_view(resources)
-            .fragments()
-            .decorations()
+        fragment_paint::decorations(document.render_view(resources).fragments())
             .iter()
-            .filter(|fragment| fragment.color() == color)
+            .filter(|fragment| fragment_paint::decoration_color(&fragment) == color)
             .map(|fragment| fragment.rect())
             .collect()
     }
@@ -111,13 +119,10 @@ mod tests {
         color: u32,
         resources: &GlyphResourceStore,
     ) -> Vec<usize> {
-        document
-            .render_view(resources)
-            .fragments()
-            .decorations()
+        fragment_paint::decorations(document.render_view(resources).fragments())
             .iter()
             .enumerate()
-            .filter(|(_, fragment)| fragment.color() == color)
+            .filter(|(_, fragment)| fragment_paint::decoration_color(&fragment) == color)
             .map(|(index, _)| index)
             .collect()
     }
@@ -175,15 +180,30 @@ mod tests {
 
         let sequential_view = sequential.render_view(&sequential_resources);
         let parallel_view = parallel.render_view(&parallel_resources);
-        assert_eq!(sequential_view.boxes().len(), parallel_view.boxes().len());
-        for box_idx in 0..sequential_view.boxes().len() {
+        assert_eq!(
+            box_queries::len(sequential_view.boxes()),
+            box_queries::len(parallel_view.boxes())
+        );
+        for box_idx in 0..box_queries::len(sequential_view.boxes()) {
             assert_eq!(
-                sequential_view.boxes().point(box_idx),
-                parallel_view.boxes().point(box_idx)
+                box_queries::render_box_view_point(
+                    sequential_view.boxes(),
+                    layout_state::box_id_new(box_idx)
+                ),
+                box_queries::render_box_view_point(
+                    parallel_view.boxes(),
+                    layout_state::box_id_new(box_idx)
+                )
             );
             assert_eq!(
-                sequential_view.boxes().size(box_idx),
-                parallel_view.boxes().size(box_idx)
+                box_queries::render_box_view_size(
+                    sequential_view.boxes(),
+                    layout_state::box_id_new(box_idx)
+                ),
+                box_queries::render_box_view_size(
+                    parallel_view.boxes(),
+                    layout_state::box_id_new(box_idx)
+                )
             );
         }
         let sequential_lines = sequential_view
@@ -192,11 +212,11 @@ mod tests {
             .iter()
             .map(|line| {
                 (
-                    line.owner_box_idx(),
-                    line.glyphs(),
+                    text_paint::render_line_owner_box(&line),
+                    text_paint::render_line_glyphs(&line),
                     line.point(),
                     line.height(),
-                    line.baseline(),
+                    text_paint::line_baseline(&line),
                 )
             })
             .collect::<Vec<_>>();
@@ -206,26 +226,22 @@ mod tests {
             .iter()
             .map(|line| {
                 (
-                    line.owner_box_idx(),
-                    line.glyphs(),
+                    text_paint::render_line_owner_box(&line),
+                    text_paint::render_line_glyphs(&line),
                     line.point(),
                     line.height(),
-                    line.baseline(),
+                    text_paint::line_baseline(&line),
                 )
             })
             .collect::<Vec<_>>();
         assert_eq!(sequential_lines, parallel_lines);
-        let sequential_decorations = sequential_view
-            .fragments()
-            .decorations()
+        let sequential_decorations = fragment_paint::decorations(sequential_view.fragments())
             .iter()
-            .map(|fragment| (fragment.rect(), fragment.color()))
+            .map(|fragment| (fragment.rect(), fragment_paint::decoration_color(&fragment)))
             .collect::<Vec<_>>();
-        let parallel_decorations = parallel_view
-            .fragments()
-            .decorations()
+        let parallel_decorations = fragment_paint::decorations(parallel_view.fragments())
             .iter()
-            .map(|fragment| (fragment.rect(), fragment.color()))
+            .map(|fragment| (fragment.rect(), fragment_paint::decoration_color(&fragment)))
             .collect::<Vec<_>>();
         assert_eq!(sequential_decorations, parallel_decorations);
     }
@@ -470,48 +486,16 @@ mod tests {
     }
 
     #[test]
-    fn placements_assign_columns_in_row_order() {
-        let rows = vec![
-            vec![(10usize, 2usize, 1usize), (11usize, 1usize, 2usize)],
-            vec![(20usize, 1usize, 1usize), (21usize, 1usize, 1usize)],
-        ];
-        let TableGrid {
-            placements,
-            column_count: cols,
-        } = build_table_grid(rows);
-        assert_eq!(cols, 3);
-        assert_eq!(placements.len(), 4);
-        let first: TableCellPlacement = placements[0];
-        let second: TableCellPlacement = placements[1];
-        let third: TableCellPlacement = placements[2];
-        let fourth: TableCellPlacement = placements[3];
-        assert_eq!(
-            (first.row, first.col, first.colspan, first.cell_idx),
-            (0, 0, 2, 10)
+    fn streamed_grid_rows_avoid_per_row_allocations() {
+        let (grid, allocations) = crate::allocation_test_support::count_allocations(|| {
+            build_table_grid((0..1024).map(|row| std::iter::once((row, 1, 1))))
+        });
+        assert_eq!(grid.column_count, 1);
+        assert_eq!(grid.placements.len(), 1024);
+        assert!(
+            allocations < 32,
+            "streamed rows should need only arena growth, got {allocations} allocations"
         );
-        assert_eq!(
-            (second.row, second.col, second.rowspan, second.cell_idx),
-            (0, 2, 2, 11)
-        );
-        assert_eq!((third.row, third.col, third.cell_idx), (1, 0, 20));
-        assert_eq!((fourth.row, fourth.col, fourth.cell_idx), (1, 1, 21));
-    }
-
-    #[test]
-    fn placements_respect_rowspan_reserved_slots() {
-        let rows = vec![
-            vec![(10usize, 1usize, 2usize), (11usize, 1usize, 1usize)],
-            vec![(20usize, 1usize, 1usize)],
-        ];
-        let TableGrid {
-            placements,
-            column_count: cols,
-        } = build_table_grid(rows);
-        assert_eq!(cols, 2);
-        assert_eq!(placements.len(), 3);
-        assert_eq!((placements[0].row, placements[0].col), (0, 0));
-        assert_eq!((placements[1].row, placements[1].col), (0, 1));
-        assert_eq!((placements[2].row, placements[2].col), (1, 1));
     }
 
     #[test]
@@ -929,6 +913,52 @@ mod tests {
     }
 
     #[test]
+    fn collapsed_border_source_precedence_covers_spanning_cells_in_both_directions() {
+        let colors = [
+            ("#ff0000", 0xff0000ff),
+            ("#00ff00", 0x00ff00ff),
+            ("#0000ff", 0x0000ffff),
+            ("#ffff00", 0xffff00ff),
+            ("#ff00ff", 0xff00ffff),
+            ("#00ffff", 0x00ffffff),
+        ];
+        for direction in ["ltr", "rtl"] {
+            for winner in 0..colors.len() {
+                let borders = colors
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (color, _))| {
+                        if index <= winner {
+                            format!("border-top:4px solid {color}")
+                        } else {
+                            String::new()
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let html = format!(
+                    "<html><body style='margin:0'>\
+                    <table style='border-collapse:collapse;direction:{direction};{}'>\
+                    <colgroup style='{}'><col span='2' style='width:30px;{}'></colgroup>\
+                    <tbody style='{}'><tr style='{}'>\
+                    <td colspan='2' rowspan='2' style='height:30px;padding:0;{}'></td>\
+                    </tr><tr></tr></tbody></table></body></html>",
+                    borders[0], borders[1], borders[2], borders[3], borders[4], borders[5],
+                );
+                let mut resources = GlyphResourceStore::default();
+                let document = layout_html(&html, 200.0, &mut resources);
+                for (index, &(_, color)) in colors.iter().enumerate() {
+                    let rects = decoration_rects_by_color(&document, color, &resources);
+                    assert_eq!(
+                        !rects.is_empty(),
+                        index == winner,
+                        "{direction}: source {winner} must win over source {index}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn hidden_collapsed_borders_retain_table_geometry_without_painting() {
         let source = |visibility| {
             format!(
@@ -1081,8 +1111,8 @@ mod tests {
         );
         let boxes = document.render_view(&document_resources).boxes();
         assert_eq!(
-            boxes.size(tables[0]),
-            boxes.size(tables[1]),
+            box_queries::render_box_view_size(boxes, layout_state::box_id_new(tables[0])),
+            box_queries::render_box_view_size(boxes, layout_state::box_id_new(tables[1])),
             "the inferred CSS table and equivalent native table must resolve the same used size"
         );
         let rows = tables
@@ -1103,14 +1133,38 @@ mod tests {
             assert_eq!(cells[0].len(), cells[1].len());
             for column in 0..cells[0].len() {
                 assert_eq!(
-                    boxes.size(cells[0][column] as usize),
-                    boxes.size(cells[1][column] as usize),
+                    box_queries::render_box_view_size(
+                        boxes,
+                        layout_state::box_id_new(cells[0][column] as usize)
+                    ),
+                    box_queries::render_box_view_size(
+                        boxes,
+                        layout_state::box_id_new(cells[1][column] as usize)
+                    ),
                     "row {row}, column {column}"
                 );
-                let first_offset = boxes.point(cells[0][column] as usize).unwrap().y
-                    - boxes.point(tables[0]).unwrap().y;
-                let second_offset = boxes.point(cells[1][column] as usize).unwrap().y
-                    - boxes.point(tables[1]).unwrap().y;
+                let first_offset = box_queries::render_box_view_point(
+                    boxes,
+                    layout_state::box_id_new(cells[0][column] as usize),
+                )
+                .unwrap()
+                .y - box_queries::render_box_view_point(
+                    boxes,
+                    layout_state::box_id_new(tables[0]),
+                )
+                .unwrap()
+                .y;
+                let second_offset = box_queries::render_box_view_point(
+                    boxes,
+                    layout_state::box_id_new(cells[1][column] as usize),
+                )
+                .unwrap()
+                .y - box_queries::render_box_view_point(
+                    boxes,
+                    layout_state::box_id_new(tables[1]),
+                )
+                .unwrap()
+                .y;
                 assert!(
                     (first_offset - second_offset).abs() < 0.01,
                     "row {row}, column {column} vertical offset: {first_offset} vs {second_offset}"
@@ -1798,6 +1852,25 @@ mod tests {
     }
 
     #[test]
+    fn percentage_height_descendants_resolve_inside_nested_cell_containers() {
+        for display in ["block", "flex", "grid", "inline-block"] {
+            let mut resources = GlyphResourceStore::default();
+            let document = layout_html(
+                &format!(
+                    "<html><body style='margin:0'><table style='border-spacing:0'><tr>\
+                    <td id='cell' style='height:100px;padding:0'>\
+                    <div style='display:{display};height:100px;width:40px'>\
+                    <div id='child' style='height:50%;overflow:auto'>content</div>\
+                    </div></td></tr></table></body></html>"
+                ),
+                300.0,
+                &mut resources,
+            );
+            assert_eq!(box_size_by_id(&document, "child", &resources).height, 50.0, "{display}");
+        }
+    }
+
+    #[test]
     fn restricted_percentage_height_cell_descendant_uses_definite_table_height() {
         let mut document_resources = GlyphResourceStore::default();
         let document = layout_html_css(
@@ -1836,6 +1909,28 @@ mod tests {
                 .abs()
                 < 0.01
         );
+    }
+
+    #[test]
+    fn empty_tables_include_bottom_caption_margins_after_height_distribution() {
+        for contents in ["", "<tbody></tbody>", "<tr></tr><tr></tr>"] {
+            let mut resources = GlyphResourceStore::default();
+            let document = layout_html(
+                &format!(
+                    "<html><body style='margin:0'><table id='table' style='height:80px;width:100px;border-spacing:6px'>\
+                    <caption id='caption' style='caption-side:bottom;height:10px;margin:3px 0 7px'></caption>\
+                    {contents}</table><div id='after' style='height:1px'></div></body></html>"
+                ),
+                300.0,
+                &mut resources,
+            );
+            let table = box_point_by_id(&document, "table", &resources);
+            let caption = box_point_by_id(&document, "caption", &resources);
+            let after = box_point_by_id(&document, "after", &resources);
+            assert_eq!(box_size_by_id(&document, "table", &resources).height, 90.0, "{contents}");
+            assert_eq!(caption.y - table.y, 73.0, "{contents}");
+            assert_eq!(after.y - table.y, 90.0, "{contents}");
+        }
     }
 
     #[test]
@@ -1992,7 +2087,7 @@ mod tests {
     /// Manual release-mode benchmark for table layout architecture changes.
     ///
     /// Run with:
-    /// `cargo test --release -p html-layout benchmark_table_relayout -- --ignored --exact --nocapture`
+    /// `cargo test --release -p skrift-layout benchmark_table_relayout -- --ignored --exact --nocapture`
     #[test]
     #[ignore = "manual performance benchmark"]
     fn benchmark_table_relayout() {
@@ -2075,10 +2170,12 @@ mod tests {
         }
         let elapsed = started.elapsed();
         let view = document.render_view(&shaped_resources);
-        let checksum = view.boxes().len()
+        let checksum = box_queries::len(view.boxes())
             + view.text().lines().len()
-            + view.fragments().decorations().len()
-            + view.fragments().images().len();
+            + fragment_paint::render_decorations_len(&fragment_paint::decorations(
+                view.fragments(),
+            ))
+            + fragment_paint::render_fragment_view_images(view.fragments()).len();
         std::hint::black_box(checksum);
         println!(
             "TABLE_BENCH case={} workers={} iterations={} total_ns={} ns_per_relayout={} checksum={checksum}",

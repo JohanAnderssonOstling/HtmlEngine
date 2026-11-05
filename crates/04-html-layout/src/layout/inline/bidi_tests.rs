@@ -1,9 +1,15 @@
+use html_pipeline::engine::box_queries;
+use html_engine_model::layout_state;
+use html_engine_model::shaping_contracts;
+use html_pipeline::engine::text_paint;
+use crate::layout_model::BoxId;
+use crate::layout_model::LineId;
 use crate::parser::DocumentFactory;
 use crate::test_support::TestGlyphShaper;
-use crate::{GlyphRequest, ShapedGlyph};
+use crate::{GlyphRequest, ShapedGlyph, ShapedRun};
 use crate::{
     GlyphResourceGeneration, GlyphResourceStore, GlyphShaper, LaidOutDocument, LayoutConstraints,
-    ShapeError, ShapedTextRun, TextDirection, TextRunShapeRequest,
+    ShapeError, ShapedTextRun, TextDirection, TextRunId, TextRunShapeRequest,
 };
 use std::sync::Arc;
 
@@ -16,16 +22,20 @@ fn layout(html: &str, width: f64, resources: &mut GlyphResourceStore) -> LaidOut
         .expect("layout requires the shaper-aware API for first-line styles")
 }
 
-fn visual_text(document: &LaidOutDocument, line: usize, resources: &GlyphResourceStore) -> String {
+fn visual_text(document: &LaidOutDocument, line: LineId, resources: &GlyphResourceStore) -> String {
     let text = document.render_view(resources).text();
-    let mut fragments: Vec<_> = text.line_text_fragments(line).unwrap().collect();
-    fragments.sort_by(|a, b| a.offset_x().total_cmp(&b.offset_x()));
+    let mut fragments: Vec<_> = text_paint::render_text_view_line_text_fragments(text, line)
+        .unwrap()
+        .collect();
+    fragments.sort_by(|a, b| {
+        text_paint::fragment_offset_x(&a).total_cmp(&text_paint::fragment_offset_x(&b))
+    });
     fragments
         .into_iter()
         .flat_map(|fragment| fragment.glyphs())
         .filter_map(|index| {
-            let glyph = text.paint_glyph_at(index)?;
-            Some(text.glyph_metric(glyph)?.ch())
+            let glyph = text_paint::paint_glyph_at(text, index)?;
+            Some(text_paint::glyph_metric(text, glyph)?.ch())
         })
         .collect()
 }
@@ -39,19 +49,21 @@ fn rtl_paragraph_reorders_text_without_changing_source_order() {
         &mut document_resources,
     );
     let text = document.render_view(&document_resources).text();
-    let logical: String = text
-        .line(0)
-        .unwrap()
-        .glyphs()
+    let logical: String = text_paint::render_line_glyphs(&text
+        .line(LineId::new(0))
+        .unwrap())
         .map(|index| {
-            text.glyph_metric(text.glyph_at(index as usize).unwrap())
+            text_paint::glyph_metric(text, text_paint::glyph_at(text, index as usize).unwrap())
                 .unwrap()
                 .ch()
         })
         .collect();
     assert_eq!(logical, "אבג");
-    assert_eq!(visual_text(&document, 0, &document_resources), "גבא");
-    assert!(text.line(0).unwrap().point_x() > 50.0);
+    assert_eq!(
+        visual_text(&document, LineId::new(0), &document_resources),
+        "גבא"
+    );
+    assert!(text.line(LineId::new(0)).unwrap().point().x > 50.0);
 }
 
 #[test]
@@ -63,7 +75,7 @@ fn rtl_keeps_numbers_and_latin_runs_in_ltr_order() {
         &mut document_resources,
     );
     assert_eq!(
-        visual_text(&document, 0, &document_resources),
+        visual_text(&document, LineId::new(0), &document_resources),
         "abc 123 גבא"
     );
 }
@@ -73,7 +85,7 @@ fn rtl_also_reorders_embedded_text_in_an_ltr_paragraph() {
     let mut document_resources = GlyphResourceStore::default();
     let document = layout("<p>abc אבג def</p>", 300.0, &mut document_resources);
     assert_eq!(
-        visual_text(&document, 0, &document_resources),
+        visual_text(&document, LineId::new(0), &document_resources),
         "abc גבא def"
     );
 }
@@ -82,7 +94,10 @@ fn rtl_also_reorders_embedded_text_in_an_ltr_paragraph() {
 fn rtl_mirrors_brackets_without_changing_logical_characters() {
     let mut document_resources = GlyphResourceStore::default();
     let document = layout("<p dir='rtl'>(אבג)</p>", 300.0, &mut document_resources);
-    assert_eq!(visual_text(&document, 0, &document_resources), "(גבא)");
+    assert_eq!(
+        visual_text(&document, LineId::new(0), &document_resources),
+        "(גבא)"
+    );
 }
 
 #[test]
@@ -93,7 +108,10 @@ fn rtl_html_override_reverses_latin_text() {
         300.0,
         &mut document_resources,
     );
-    assert_eq!(visual_text(&document, 0, &document_resources), "AcbaZ");
+    assert_eq!(
+        visual_text(&document, LineId::new(0), &document_resources),
+        "AcbaZ"
+    );
 }
 
 #[test]
@@ -106,6 +124,7 @@ fn rtl_block_override_applies_to_anonymous_text_but_does_not_inherit() {
     );
     assert_eq!(
         (0..document.line_count())
+            .map(LineId::new)
             .map(|line| visual_text(&document, line, &document_resources))
             .collect::<Vec<_>>(),
         ["cba", "DEF", "ihg"]
@@ -120,7 +139,10 @@ fn rtl_auto_direction_ignores_nested_directional_elements() {
         300.0,
         &mut document_resources,
     );
-    assert_eq!(visual_text(&document, 0, &document_resources), "גבא abc");
+    assert_eq!(
+        visual_text(&document, LineId::new(0), &document_resources),
+        "גבא abc"
+    );
 }
 
 #[test]
@@ -134,6 +156,7 @@ fn rtl_wraps_in_logical_order_and_reorders_each_line() {
     assert_eq!(document.line_count(), 3);
     assert_eq!(
         (0..3)
+            .map(LineId::new)
             .map(|line| visual_text(&document, line, &document_resources))
             .collect::<Vec<_>>(),
         ["גבא", "והד", "טחז"]
@@ -149,7 +172,7 @@ fn rtl_preserves_combining_marks_with_their_base() {
         &mut document_resources,
     );
     assert_eq!(
-        visual_text(&document, 0, &document_resources),
+        visual_text(&document, LineId::new(0), &document_resources),
         "א\u{05b0} ב"
     );
 }
@@ -169,22 +192,24 @@ fn rtl_directional_controls_have_no_advance_with_letter_spacing() {
         &mut control_resources,
     );
     assert_eq!(
-        visual_text(&plain, 0, &plain_resources),
-        visual_text(&control, 0, &control_resources)
+        visual_text(&plain, LineId::new(0), &plain_resources),
+        visual_text(&control, LineId::new(0), &control_resources)
     );
     assert_eq!(
         plain
             .render_view(&plain_resources)
             .text()
-            .line(0)
+            .line(LineId::new(0))
             .unwrap()
-            .point_x(),
+            .point()
+            .x,
         control
             .render_view(&control_resources)
             .text()
-            .line(0)
+            .line(LineId::new(0))
             .unwrap()
-            .point_x()
+            .point()
+            .x
     );
 }
 
@@ -197,10 +222,12 @@ fn rtl_out_of_flow_anchors_do_not_split_visual_runs() {
         &mut document_resources,
     );
     let text = document.render_view(&document_resources).text();
-    let line = (0..document.line_count())
+    let line = text_paint::render_text_view_spatial_order(text)
+        .iter()
+        .copied()
         .find(|&line| {
-            text.line(line).unwrap().glyphs().any(|index| {
-                text.glyph_metric(text.glyph_at(index as usize).unwrap())
+            text_paint::render_line_glyphs(&text.line(line).unwrap()).any(|index| {
+                text_paint::glyph_metric(text, text_paint::glyph_at(text, index as usize).unwrap())
                     .unwrap()
                     .ch()
                     == 'א'
@@ -218,11 +245,17 @@ fn rtl_plaintext_uses_each_paragraphs_first_strong_direction() {
         100.0,
         &mut document_resources,
     );
-    assert_eq!(visual_text(&document, 0, &document_resources), "גבא");
-    assert_eq!(visual_text(&document, 1, &document_resources), "abc");
+    assert_eq!(
+        visual_text(&document, LineId::new(0), &document_resources),
+        "גבא"
+    );
+    assert_eq!(
+        visual_text(&document, LineId::new(1), &document_resources),
+        "abc"
+    );
     let text = document.render_view(&document_resources).text();
-    assert!(text.line(0).unwrap().point_x() > 50.0);
-    assert_eq!(text.line(1).unwrap().point_x(), 0.0);
+    assert!(text.line(LineId::new(0)).unwrap().point().x > 50.0);
+    assert_eq!(text.line(LineId::new(1)).unwrap().point().x, 0.0);
 }
 
 #[test]
@@ -248,16 +281,18 @@ fn rtl_indent_and_unexpanded_justification_align_from_the_right() {
     let x = plain
         .render_view(&plain_resources)
         .text()
-        .line(0)
+        .line(LineId::new(0))
         .unwrap()
-        .point_x();
+        .point()
+        .x;
     assert!(
         (indented
             .render_view(&indented_resources)
             .text()
-            .line(0)
+            .line(LineId::new(0))
             .unwrap()
-            .point_x()
+            .point()
+            .x
             - (x - 10.0))
             .abs()
             < 0.001
@@ -266,9 +301,10 @@ fn rtl_indent_and_unexpanded_justification_align_from_the_right() {
         (justified
             .render_view(&justified_resources)
             .text()
-            .line(0)
+            .line(LineId::new(0))
             .unwrap()
-            .point_x()
+            .point()
+            .x
             - x)
             .abs()
             < 0.001
@@ -287,11 +323,10 @@ fn rtl_overflow_ellipsis_is_placed_at_the_left_end() {
             &mut document_resources,
         );
         let text = document.render_view(&document_resources).text();
-        let marker = text.ellipsis_for_line(0).unwrap();
-        let leftmost = text
-            .line_text_fragments(0)
+        let marker = text_paint::ellipsis_for_line(text, LineId::new(0)).unwrap();
+        let leftmost = text_paint::render_text_view_line_text_fragments(text, LineId::new(0))
             .unwrap()
-            .map(|fragment| fragment.offset_x())
+            .map(|fragment| text_paint::fragment_offset_x(&fragment))
             .fold(f64::INFINITY, f64::min);
         assert!(marker.offset().x < leftmost, "{direction}");
     }
@@ -304,10 +339,14 @@ fn geometry(
 ) -> (kurbo::Point, kurbo::Size) {
     let view = document.render_view(resources);
     let boxes = view.boxes();
-    let index = (0..boxes.len())
-        .find(|&index| boxes.id(index).map(|value| view.string(value)) == Some(id))
+    let index = (0..box_queries::len(boxes))
+        .map(layout_state::box_id_new)
+        .find(|&index| box_queries::attribute(boxes, index, "id") == Some(id))
         .unwrap();
-    (boxes.point(index).unwrap(), boxes.size(index).unwrap())
+    (
+        box_queries::render_box_view_point(boxes, index).unwrap(),
+        box_queries::render_box_view_size(boxes, index).unwrap(),
+    )
 }
 
 #[test]
@@ -360,18 +399,16 @@ fn rtl_inline_padding_consumes_the_corresponding_physical_edges() {
         &mut document_resources,
     );
     let text = document.render_view(&document_resources).text();
-    let left = text
-        .line_text_fragments(0)
+    let left = text_paint::render_text_view_line_text_fragments(text, LineId::new(0))
         .unwrap()
-        .map(|fragment| fragment.offset_x())
+        .map(|fragment| text_paint::fragment_offset_x(&fragment))
         .fold(f64::INFINITY, f64::min);
     assert!((left - 5.0).abs() < 0.001, "physical left padding: {left}");
-    let right = text
-        .line_text_fragments(0)
+    let right = text_paint::render_text_view_line_text_fragments(text, LineId::new(0))
         .unwrap()
-        .map(|fragment| fragment.offset_x() + 8.0)
+        .map(|fragment| text_paint::fragment_offset_x(&fragment) + 8.0)
         .fold(0.0, f64::max);
-    assert!((100.0 - (text.line(0).unwrap().point_x() + right) - 15.0).abs() < 0.001);
+    assert!((100.0 - (text.line(LineId::new(0)).unwrap().point().x + right) - 15.0).abs() < 0.001);
 }
 
 #[test]
@@ -405,12 +442,13 @@ fn rtl_outside_list_marker_hangs_to_the_right() {
     );
     let view = document.render_view(&document_resources);
     let boxes = view.boxes();
-    let item = (0..boxes.len())
-        .find(|&index| boxes.id(index).map(|value| view.string(value)) == Some("item"))
+    let item = (0..box_queries::len(boxes))
+        .map(layout_state::box_id_new)
+        .find(|&index| box_queries::attribute(boxes, index, "id") == Some("item"))
         .unwrap();
-    let marker = boxes.list_marker(item).unwrap().marker_box();
+    let marker = box_queries::list_marker(boxes, item).unwrap().marker_box();
     let (point, size) = geometry(&document, "item", &document_resources);
-    assert!(boxes.point(marker).unwrap().x > point.x + size.width);
+    assert!(box_queries::render_box_view_point(boxes, marker).unwrap().x > point.x + size.width);
 }
 
 #[derive(Default)]
@@ -447,15 +485,15 @@ impl GlyphShaper for DirectionalShaper {
     fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
         self.fallback.shape_glyph(request)
     }
-    fn shape_text_run(
+    fn shape_run(
         &mut self,
         request: TextRunShapeRequest<'_>,
-    ) -> Result<Option<ShapedTextRun>, ShapeError> {
-        let direction = request.style().direction();
-        let advance = request.style().font_size() * 0.25;
-        let run = self.requests.len() as u32;
-        self.requests.push((request.text().to_owned(), direction));
-        let count = request.text().chars().count();
+    ) -> Result<Option<ShapedRun>, ShapeError> {
+        let direction = shaping_contracts::text_run_shape_request_style(&request).direction;
+        let advance = shaping_contracts::text_run_shape_request_style(&request).font_size * 0.25;
+        let run = TextRunId(self.requests.len() as u32);
+        self.requests.push((shaping_contracts::text_run_shape_request_text(&request).to_owned(), direction));
+        let count = shaping_contracts::text_run_shape_request_text(&request).chars().count();
         let stops: Vec<_> = (0..=count)
             .map(|index| {
                 (if direction == TextDirection::Rtl {
@@ -466,13 +504,11 @@ impl GlyphShaper for DirectionalShaper {
                     * advance
             })
             .collect();
-        Ok(ShapedTextRun::with_backend_run(
-            Arc::from(vec![advance; count]),
+        Ok(Some(shaping_contracts::shaped_run_geometry(shaping_contracts::shaped_text_run_with_backend_run(Arc::from(vec![advance; count]),
             Arc::from(vec![true; count + 1]),
             run,
-            Arc::from(stops),
-            12.0,
-        ))
+            stops.into(),
+            12.0,))))
     }
 }
 
@@ -502,9 +538,8 @@ fn rtl_native_runs_receive_resolved_direction_and_share_the_correct_origin() {
             .any(|(text, direction)| text.contains("abc") && *direction == TextDirection::Ltr)
     );
     let text = document.render_view(&document_resources).text();
-    let fragments = text
-        .prepared_text_runs(0)
-        .expect("complete native coverage");
+    let fragments =
+        text_paint::prepared_text_runs(text, LineId::new(0)).expect("complete native coverage");
     let rtl_run = shaper
         .requests
         .iter()
@@ -512,8 +547,8 @@ fn rtl_native_runs_receive_resolved_direction_and_share_the_correct_origin() {
         .unwrap() as u32;
     let origins: Vec<_> = fragments
         .iter()
-        .filter(|fragment| fragment.run() == rtl_run)
-        .map(|fragment| fragment.offset().x)
+        .filter(|fragment| fragment.run.0 == rtl_run)
+        .map(|fragment| fragment.offset.x)
         .collect();
     assert_eq!(
         origins.len(),
@@ -548,16 +583,18 @@ fn rtl_first_line_refinement_preserves_native_coverage_of_later_lines() {
         .unwrap();
     let text = document.render_view(&shaped_resources).text();
     assert!(document.line_count() > 1);
-    for line in 0..document.line_count() {
+    for line in text_paint::render_text_view_spatial_order(text).iter().copied() {
         assert!(
-            text.prepared_text_runs(line).is_some(),
-            "native coverage for line {line}"
+            text_paint::prepared_text_runs(text, line).is_some(),
+            "native coverage for line {line:?}"
         );
     }
-    let last = text.prepared_text_runs(document.line_count() - 1).unwrap();
+    let last =
+        text_paint::prepared_text_runs(text, text_paint::render_text_view_spatial_order(text).iter().copied().last().unwrap())
+            .unwrap();
     assert!(
         last.iter()
-            .any(|fragment| fragment.run() == 0 && fragment.range().start > 0)
+            .any(|fragment| fragment.run == TextRunId(0) && fragment.range.start > 0)
     );
 }
 
@@ -578,19 +615,20 @@ fn rtl_native_runs_keep_offsets_across_out_of_flow_source_gaps() {
         )
         .expect("layout requires the shaper-aware API for first-line styles");
     let text = document.render_view(&document_resources).text();
-    let line = (0..document.line_count())
+    let line = text_paint::render_text_view_spatial_order(text)
+        .iter()
+        .copied()
         .find(|&line| {
-            text.line(line).unwrap().glyphs().any(|index| {
-                text.glyph_metric(text.glyph_at(index as usize).unwrap())
+            text_paint::render_line_glyphs(&text.line(line).unwrap()).any(|index| {
+                text_paint::glyph_metric(text, text_paint::glyph_at(text, index as usize).unwrap())
                     .unwrap()
                     .ch()
                     == 'א'
             })
         })
         .unwrap();
-    let native = text
-        .prepared_text_runs(line)
-        .expect("native coverage across a source gap");
+    let native =
+        text_paint::prepared_text_runs(text, line).expect("native coverage across a source gap");
     let run = shaper
         .requests
         .iter()
@@ -599,7 +637,7 @@ fn rtl_native_runs_keep_offsets_across_out_of_flow_source_gaps() {
     assert!(
         native
             .iter()
-            .any(|fragment| fragment.run() == run && fragment.range().start >= 2)
+            .any(|fragment| fragment.run.0 == run && fragment.range.start >= 2)
     );
 }
 
@@ -629,7 +667,7 @@ fn rtl_arabic_shaping_keeps_joining_context_across_paint_styles() {
             .any(|(text, direction)| text == "١٢٣" && *direction == TextDirection::Ltr)
     );
     assert_eq!(
-        visual_text(&document, 0, &document_resources),
+        visual_text(&document, LineId::new(0), &document_resources),
         "١٢٣ مكيلع مالسلا"
     );
 }

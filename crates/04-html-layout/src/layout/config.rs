@@ -1,3 +1,4 @@
+use html_engine_model::constraints;
 #[derive(Clone, Copy, PartialEq)]
 pub struct LayoutConfig {
     viewport_width: f64,
@@ -33,7 +34,7 @@ impl LayoutConfig {
         self.text_composition_policy.is_book_optimized()
     }
     pub fn hyphenation_quality(&self) -> bool {
-        self.text_composition_policy.uses_hyphenation_quality()
+        constraints::text_composition_policy_uses_hyphenation_quality(self.text_composition_policy)
     }
     pub fn image_sizing_policy(&self) -> crate::ImageSizingPolicy {
         self.image_sizing_policy

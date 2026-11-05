@@ -1,8 +1,10 @@
+use html_pipeline::engine::text_paint;
+use html_pipeline::engine::{FontMetrics, GlyphHandle, GlyphRequest, ShapedGlyph};
 use html_pipeline::engine::{
-    FormattingDocument, GlyphMetric, GlyphResourceGeneration, GlyphResourceStore, GlyphShaper,
+    FormattingDocument, GlyphResourceGeneration, GlyphResourceStore, GlyphShaper,
     LayoutConstraints, PreparedDocument, ShapeError,
 };
-use html_pipeline::{GlyphRequest, ShapedGlyph};
+use html_pipeline::engine::{GlyphRequest, FontMetrics, GlyphHandle, ShapedGlyph};
 
 #[derive(Default)]
 struct Shaper(GlyphResourceGeneration);
@@ -17,15 +19,13 @@ impl GlyphShaper for Shaper {
     }
 
     fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
-        Ok(ShapedGlyph::from_metric(
-            request.character as u32,
-            GlyphMetric::try_new(
-                request.character,
-                request.font_size / 2.0,
-                request.font_size,
-                0.0,
-            )
-            .unwrap(),
+        Ok(ShapedGlyph::new(
+            GlyphHandle(request.character as u32),
+            request.style.font_size / 2.0,
+            FontMetrics {
+                ascent: request.style.font_size,
+                descent: 0.0,
+            },
         ))
     }
 }
@@ -52,7 +52,7 @@ fn text(prepared: PreparedDocument<'_>) -> String {
     let view = document.render_view(&document_resources).text();
     (0..view.glyph_count())
         .map(|index| {
-            view.glyph_metric(view.glyph_at(index).unwrap())
+            text_paint::glyph_metric(view, text_paint::glyph_at(view, index).unwrap())
                 .unwrap()
                 .ch()
         })

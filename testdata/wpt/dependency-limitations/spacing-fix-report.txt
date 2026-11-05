@@ -1,0 +1,187 @@
+Percentage letter/word spacing: fixes and performance
+Recorded 2026-11-02
+
+Fixed 16 selected CSS syntax assertions across four files, with no new mismatch
+keys. Before: 16,451 / 18,469 pass (89.07%); after: 16,467 / 18,469 (89.16%).
+The same selection and 13,434 unrepresented assertions remain.
+
+Implementation
+
+Lightning CSS remains unchanged and the sole CSS parser. Its shared native
+LengthPercentage parser accepts percentage values that its property-specific
+Spacing representation cannot store. The existing native math-type guard is
+reused before the text handler applies the existing TextSpacing conversion.
+Standalone percentage tokens are converted directly from the native token AST,
+avoiding printing/reparsing. Mixed expressions still use the native value parser.
+
+Examples include letter-spacing:120%, word-spacing:-10%, and mixed expressions
+such as calc(2ch - 30%). Negative spacing remains valid. Absolute lengths and
+percentage coefficients remain separate in the existing model, preserving
+percentage inheritance relative to the recipient used font size. Existing normal/
+length declarations retain their path. No renderer or GPUI change is needed.
+
+The existing converter does not represent mixed non-linear percentage math.
+Those expressions keep its current rejection behavior; this change does not
+claim every CSS Text math expression is rendered. Font-metric-dependent lengths
+also retain existing resolution requirements. Sources:
+https://drafts.csswg.org/css-text-4/#letter-spacing-property
+https://drafts.csswg.org/css-text-4/#word-spacing-property
+
+Validation
+
+305 existing style tests, 32 declaration-validation tests and five reader font-
+scaling tests pass (342 total). Offline cargo check passes. The full pinned audit
+scanned 35,417 files / 32,021 literal calls, with zero dependency parser panics
+and no new mismatch keys. Its diagnostic exit 101 is expected while 2,002
+mismatches remain. Computed helpers check syntax only, not computed output.
+No image suite was rerun. Existing test/benchmark sources and all expectation/
+selection ledgers are unchanged.
+
+Performance
+
+The baseline is the preceding selector-cache stage. Existing benchmark sources
+were compiled unchanged with identical frozen native/support dependencies,
+rustc opt-level=2 and debuginfo=0. Ten cases, 15 alternating before/after pairs
+each: 300 final process runs, pinned CPU 6. Another 300 initial implementation
+runs are retained. Host load/frequency/boost are uncontrolled.
+Positive means slower. Diagnostic 95% bootstrap intervals use 5,000 resamples of
+paired median percentage changes, without multiple-comparison adjustment.
+Intervals containing zero are inconclusive. EPUB totals sum five fixture medians,
+not a single page. Cold means uncached author programs with machine/default-CSS
+caches warmed.
+
+Workload                         Paired change    95% bootstrap range    Assessment
+cascade-plain                      +6.09%    [  +5.04%,   +6.37%]   slowdown
+cascade-vars-inline                -0.09%    [  -2.52%,   +1.26%]   inconclusive
+epub-cold                          +0.61%    [  -0.95%,   +1.38%]   inconclusive
+epub-cached                        -0.29%    [  -0.99%,   +0.51%]   inconclusive
+spacing-equivalent-cold           +29.56%    [ +28.74%,  +30.50%]   slowdown
+spacing-equivalent-cached         +31.83%    [ +31.00%,  +32.54%]   slowdown
+spacing-feature-cold              +25.37%    [ +24.85%,  +25.56%]   slowdown
+spacing-feature-cached            +26.38%    [ +25.08%,  +27.90%]   slowdown
+normalization                      +0.73%    [  -1.39%,   +2.38%]   inconclusive
+normalization-retry                -1.50%    [  -2.29%,   +0.32%]   inconclusive
+
+Both spacing workloads add feature work: the baseline ignores the new percentage
+declarations and the changed build applies them. With 64 classes at 16px, the
+first uses 0% and calc(2px - 6.25%) after literal 0px/1px fallbacks, designed to
+retain the same used spacing. Pixel equality was not checked. The second uses
+2% and calc(2px + 5%), intentionally producing different spacing. Neither is a
+comparison of equivalent parsing/conversion work.
+
+Allocation/peak-byte changes for the first fixture of each spacing workload:
+  spacing-equivalent-cold / small-classic/style_allocations: 2371 -> 4981 (+110.08%)
+  spacing-equivalent-cold / small-classic/style_peak_bytes: 402990 -> 403182 (+0.05%)
+  spacing-equivalent-cached / small-classic/style_allocations: 701 -> 2351 (+235.38%)
+  spacing-equivalent-cached / small-classic/style_peak_bytes: 106373 -> 106565 (+0.18%)
+  spacing-feature-cold / small-classic/style_allocations: 2371 -> 4633 (+95.40%)
+  spacing-feature-cold / small-classic/style_peak_bytes: 402798 -> 402990 (+0.05%)
+  spacing-feature-cached / small-classic/style_allocations: 701 -> 2131 (+203.99%)
+  spacing-feature-cached / small-classic/style_peak_bytes: 106373 -> 106565 (+0.18%)
+
+Every measured timing slowdown, including individual sample/stage results:
+  cascade-plain / all/cascade_median_us: +6.09% [+5.04%, +6.37%]
+  cascade-plain / all/cascade_p95_us: +5.83% [+5.60%, +6.60%]
+  cascade-plain / all/resolve_median_us: +2.68% [+1.91%, +3.07%]
+  cascade-plain / all/resolve_p95_us: +2.72% [+1.21%, +5.69%]
+  epub-cold / small-classic/css_parse_us: +0.63% [+0.62%, +4.32%]
+  epub-cold / small-classic/cascade_us: +1.29% [+0.64%, +2.28%]
+  epub-cold / technical/css_parse_us: +2.22% [+0.23%, +5.13%]
+  epub-cold / all_samples/prepare_us: +4.11% [+2.63%, +5.80%]
+  spacing-equivalent-cold / small-classic/style_total_us: +29.23% [+28.77%, +29.95%]
+  spacing-equivalent-cold / small-classic/css_parse_us: +34.98% [+33.18%, +35.91%]
+  spacing-equivalent-cold / small-classic/matching_us: +2.53% [+1.90%, +3.18%]
+  spacing-equivalent-cold / small-classic/cascade_us: +56.39% [+55.11%, +59.25%]
+  spacing-equivalent-cold / trade-book/style_total_us: +29.72% [+28.80%, +30.61%]
+  spacing-equivalent-cold / trade-book/css_parse_us: +35.40% [+34.53%, +35.91%]
+  spacing-equivalent-cold / trade-book/matching_us: +3.21% [+2.53%, +3.80%]
+  spacing-equivalent-cold / trade-book/cascade_us: +56.52% [+55.69%, +59.81%]
+  spacing-equivalent-cold / technical/style_total_us: +29.47% [+28.37%, +31.47%]
+  spacing-equivalent-cold / technical/css_parse_us: +35.91% [+34.82%, +36.12%]
+  spacing-equivalent-cold / technical/matching_us: +3.57% [+2.98%, +4.88%]
+  spacing-equivalent-cold / technical/cascade_us: +55.26% [+53.76%, +58.62%]
+  spacing-equivalent-cold / visual/style_total_us: +29.59% [+29.20%, +30.31%]
+  spacing-equivalent-cold / visual/css_parse_us: +36.53% [+34.98%, +37.44%]
+  spacing-equivalent-cold / visual/matching_us: +3.59% [+2.94%, +4.22%]
+  spacing-equivalent-cold / visual/cascade_us: +55.65% [+54.39%, +58.79%]
+  spacing-equivalent-cold / reference/style_total_us: +30.23% [+29.61%, +31.30%]
+  spacing-equivalent-cold / reference/css_parse_us: +36.00% [+35.00%, +37.79%]
+  spacing-equivalent-cold / reference/matching_us: +4.43% [+2.56%, +6.92%]
+  spacing-equivalent-cold / reference/cascade_us: +57.86% [+56.27%, +60.73%]
+  spacing-equivalent-cold / all_samples/style_total_us: +29.56% [+28.74%, +30.50%]
+  spacing-equivalent-cold / all_samples/cascade_us: +56.70% [+55.49%, +60.02%]
+  spacing-equivalent-cached / small-classic/style_total_us: +31.67% [+30.88%, +32.77%]
+  spacing-equivalent-cached / small-classic/matching_us: +3.27% [+2.61%, +5.26%]
+  spacing-equivalent-cached / small-classic/cascade_us: +59.49% [+58.10%, +61.17%]
+  spacing-equivalent-cached / trade-book/style_total_us: +32.45% [+30.57%, +32.92%]
+  spacing-equivalent-cached / trade-book/matching_us: +4.58% [+3.23%, +4.64%]
+  spacing-equivalent-cached / trade-book/cascade_us: +60.65% [+58.33%, +61.17%]
+  spacing-equivalent-cached / technical/style_total_us: +31.66% [+30.15%, +32.69%]
+  spacing-equivalent-cached / technical/matching_us: +3.68% [+2.45%, +4.91%]
+  spacing-equivalent-cached / technical/cascade_us: +57.69% [+55.99%, +59.64%]
+  spacing-equivalent-cached / visual/style_total_us: +31.41% [+30.69%, +31.61%]
+  spacing-equivalent-cached / visual/matching_us: +4.27% [+2.42%, +5.52%]
+  spacing-equivalent-cached / visual/cascade_us: +57.27% [+56.46%, +58.01%]
+  spacing-equivalent-cached / reference/style_total_us: +31.78% [+31.10%, +33.33%]
+  spacing-equivalent-cached / reference/matching_us: +3.95% [+2.61%, +4.64%]
+  spacing-equivalent-cached / reference/cascade_us: +60.06% [+57.91%, +61.36%]
+  spacing-equivalent-cached / all_samples/style_total_us: +31.83% [+31.00%, +32.54%]
+  spacing-equivalent-cached / all_samples/cascade_us: +59.53% [+57.37%, +60.85%]
+  spacing-feature-cold / small-classic/style_total_us: +25.11% [+24.65%, +27.10%]
+  spacing-feature-cold / small-classic/css_parse_us: +30.73% [+29.09%, +31.80%]
+  spacing-feature-cold / small-classic/matching_us: +3.23% [+1.90%, +4.52%]
+  spacing-feature-cold / small-classic/cascade_us: +48.58% [+47.32%, +50.16%]
+  spacing-feature-cold / trade-book/style_total_us: +25.62% [+24.57%, +27.09%]
+  spacing-feature-cold / trade-book/css_parse_us: +31.19% [+30.14%, +31.80%]
+  spacing-feature-cold / trade-book/matching_us: +3.23% [+2.56%, +3.90%]
+  spacing-feature-cold / trade-book/cascade_us: +48.09% [+47.19%, +51.42%]
+  spacing-feature-cold / technical/style_total_us: +24.95% [+24.56%, +25.49%]
+  spacing-feature-cold / technical/css_parse_us: +30.59% [+29.68%, +32.57%]
+  spacing-feature-cold / technical/matching_us: +3.64% [+2.42%, +4.24%]
+  spacing-feature-cold / technical/cascade_us: +45.91% [+45.24%, +48.53%]
+  spacing-feature-cold / visual/style_total_us: +25.05% [+24.20%, +25.80%]
+  spacing-feature-cold / visual/css_parse_us: +31.34% [+30.18%, +32.57%]
+  spacing-feature-cold / visual/matching_us: +3.01% [+2.41%, +3.64%]
+  spacing-feature-cold / visual/cascade_us: +46.49% [+45.29%, +48.38%]
+  spacing-feature-cold / reference/style_total_us: +25.70% [+24.86%, +26.71%]
+  spacing-feature-cold / reference/css_parse_us: +30.63% [+29.55%, +32.11%]
+  spacing-feature-cold / reference/matching_us: +3.23% [+1.94%, +4.49%]
+  spacing-feature-cold / reference/cascade_us: +48.58% [+46.73%, +51.27%]
+  spacing-feature-cold / all_samples/style_total_us: +25.37% [+24.85%, +25.56%]
+  spacing-feature-cold / all_samples/cascade_us: +47.51% [+46.54%, +48.60%]
+  spacing-feature-cached / small-classic/style_total_us: +26.17% [+25.64%, +26.64%]
+  spacing-feature-cached / small-classic/matching_us: +3.27% [+2.61%, +4.64%]
+  spacing-feature-cached / small-classic/cascade_us: +48.55% [+47.02%, +50.32%]
+  spacing-feature-cached / trade-book/style_total_us: +26.55% [+25.38%, +28.04%]
+  spacing-feature-cached / trade-book/matching_us: +3.31% [+2.61%, +4.00%]
+  spacing-feature-cached / trade-book/cascade_us: +49.36% [+47.63%, +51.13%]
+  spacing-feature-cached / technical/style_total_us: +25.70% [+24.12%, +27.14%]
+  spacing-feature-cached / technical/matching_us: +3.73% [+1.82%, +5.00%]
+  spacing-feature-cached / technical/cascade_us: +46.55% [+45.35%, +49.10%]
+  spacing-feature-cached / visual/style_total_us: +26.78% [+24.27%, +27.22%]
+  spacing-feature-cached / visual/matching_us: +4.29% [+3.07%, +4.32%]
+  spacing-feature-cached / visual/cascade_us: +47.63% [+43.99%, +49.40%]
+  spacing-feature-cached / reference/style_total_us: +27.15% [+25.66%, +28.48%]
+  spacing-feature-cached / reference/matching_us: +3.95% [+3.27%, +4.61%]
+  spacing-feature-cached / reference/cascade_us: +48.87% [+47.95%, +52.43%]
+  spacing-feature-cached / all_samples/style_total_us: +26.38% [+25.08%, +27.90%]
+  spacing-feature-cached / all_samples/cascade_us: +47.88% [+46.02%, +51.00%]
+
+The first implementation reparsed every percentage, measuring about 31-37%
+extra style time on the feature workloads. Standalone native percentage tokens
+now avoid that round trip. The 300 initial runs, original source hashes and all
+initial metrics remain in the performance artifacts alongside final results.
+Mixed-expression serialization/reparsing still adds allocations. All
+positive, negative and inconclusive timings, allocations and peak-byte counts
+are retained in spacing-fix-performance.json, with raw stdout and binary hashes
+in spacing-fix-performance-runs.jsonl.gz. No unconditional speed claim is made.
+
+Registry
+
+2,002 mismatches remain: 178 confirmed dependency blocks and 1,824 unresolved.
+All 2,236 original observations are retained, including 234 now fixed across
+the syntax-fix stages. Original actual/native observations retain snapshot meaning.
+Earlier selector and local-fix reports remain historical evidence. Exact new
+fixed keys are in spacing-fix-results.jsonl; current mismatches are in
+spacing-fix-after-mismatches.jsonl. All build outputs and compiler scratch use
+disk-backed storage. Full baseline, audit/build logs and binaries: /home/johan/.cache/html-wpt-spacing-fixes

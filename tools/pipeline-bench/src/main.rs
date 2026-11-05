@@ -1,5 +1,10 @@
-use html::pipeline::ResourceContext;
-use html::text::{GlyphRequest, ShapedGlyph};
+use html_dom as dom_values;
+use html_engine_model::layout_state;
+use html_pipeline::engine::fragment_paint;
+use html::text::{FontMetrics, GlyphRequest, ShapedGlyph};
+use html_pipeline::ResourceContext;
+use html_pipeline::engine::reader_style;
+use html_pipeline::engine::text_paint;
 mod access;
 mod book_css;
 mod counter;
@@ -8,21 +13,21 @@ mod opening;
 #[cfg(feature = "profiling")]
 mod opening_deep;
 mod queries;
-use html::layout::{
-    GlyphId, GlyphMetric, GlyphResourceGeneration, GlyphResourceStore, GlyphShaper, ShapeError,
-    ShapedTextRun, TextRunShapeRequest,
-};
-use html::pipeline::*;
+use html::text::{GlyphHandle, GlyphResourceGeneration, GlyphShaper, ShapeError};
+use html_pipeline::engine::GlyphResourceStore;
+use html_pipeline::engine::{LaidOutDocument, LayoutConstraints};
+use html_pipeline::{DocumentFactory, PipelineChanges, PipelineInputs, PipelineSession};
+use html::style::{ReaderStyleOverrides, ThemeAdaptation};
+use html_pipeline::MarkupSyntax;
+use html_pipeline::parse_document;
+use html::layout::TextCompositionPolicy;
 use html::resources::FileSystemProvider;
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap};
 use std::hint::black_box;
 use std::sync::Arc;
 use std::time::Instant;
-fn layout_fingerprint(
-    document: &html::layout::LaidOutDocument,
-    resources: &GlyphResourceStore,
-) -> u64 {
+fn layout_fingerprint(document: &LaidOutDocument, resources: &GlyphResourceStore) -> u64 {
     let view = document.render_view(resources);
     let text = view.text();
     let mut hash = 0xcbf29ce484222325u64;
@@ -32,17 +37,16 @@ fn layout_fingerprint(
     let bits = |value: f64| if value == 0.0 { 0 } else { value.to_bits() };
     mix(text.glyph_count() as u64);
     mix(text.line_count() as u64);
-    mix(view.canvas_background_color().unwrap_or(0) as u64);
+    mix(text_paint::render_view_canvas_background_color(&view).unwrap_or(0) as u64);
     for index in 0..text.glyph_count() {
-        mix(text
-            .glyph_at(index)
-            .and_then(|glyph| text.glyph_metric(glyph))
+        mix(text_paint::glyph_at(text, index)
+            .and_then(|glyph| text_paint::glyph_metric(text, glyph))
             .map_or(0, |metric| metric.ch() as u64));
-        mix(text
-            .line_index_for_glyph(index as u32)
-            .unwrap_or(usize::MAX) as u64);
-        mix(text
-            .character_advance(index as u32)
+        mix(
+            text_paint::render_text_view_line_for_glyph(text, index as u32)
+                .map_or(usize::MAX, |line| layout_state::line_id_index(line)) as u64,
+        );
+        mix(text_paint::character_advance(text, index as u32)
             .unwrap_or_default()
             .to_bits() as u64);
     }
@@ -53,16 +57,16 @@ fn layout_fingerprint(
             line.point().x,
             line.point().y,
             line.height(),
-            line.baseline(),
-            line.word_spacing(),
-            line.letter_spacing(),
-            line.optical_offset_x(),
+            text_paint::line_baseline(&line),
+            text_paint::line_word_spacing(&line),
+            text_paint::line_letter_spacing(&line),
+            text_paint::line_optical_offset_x(&line),
         ] {
             mix(bits(value));
         }
-        mix(line.paint_color().is_some() as u64);
-        mix(line.paint_color().unwrap_or_default() as u64);
-        if let Some(clip) = text.line_overflow_clip(line.index()) {
+        mix(text_paint::line_paint_color(&line).is_some() as u64);
+        mix(text_paint::line_paint_color(&line).unwrap_or_default() as u64);
+        if let Some(clip) = text_paint::line_overflow_clip(text, line.id()) {
             mix(1);
             let rect = clip.rect();
             for value in [rect.x0, rect.y0, rect.x1, rect.y1] {
@@ -73,10 +77,9 @@ fn layout_fingerprint(
         } else {
             mix(0);
         }
-        mix(line.is_in_positioned_layer() as u64);
-        mix(line.is_in_negative_positioned_layer() as u64);
-        for run in text
-            .line_glyph_offsets(line.index())
+        mix(text_paint::line_is_in_positioned_layer(&line) as u64);
+        mix(text_paint::line_is_in_negative_positioned_layer(&line) as u64);
+        for run in text_paint::line_glyph_offsets(text, line.id())
             .into_iter()
             .flat_map(|runs| runs.iter().collect::<Vec<_>>())
         {
@@ -84,8 +87,7 @@ fn layout_fingerprint(
             mix(run.range().end as u64);
             mix(bits(run.offset()));
         }
-        for run in text
-            .line_glyph_advances(line.index())
+        for run in text_paint::line_glyph_advances(text, line.id())
             .into_iter()
             .flat_map(|runs| runs.iter().collect::<Vec<_>>())
         {
@@ -93,43 +95,55 @@ fn layout_fingerprint(
             mix(run.range().end as u64);
             mix(bits(run.advance()));
         }
-        for fragment in text.line_text_fragments(line.index()).into_iter().flatten() {
+        for fragment in text_paint::render_text_view_line_text_fragments(text, line.id())
+            .into_iter()
+            .flatten()
+        {
             mix(fragment.glyphs().start as u64);
             mix(fragment.glyphs().end as u64);
-            mix(bits(fragment.offset_x()));
-            mix(fragment.paint_order() as u64);
+            mix(bits(text_paint::fragment_offset_x(&fragment)));
+            mix(text_paint::fragment_paint_order(&fragment) as u64);
             mix(fragment.visible() as u64);
         }
-        for image in view.fragments().images_for_line(line.index()).iter() {
-            mix(image.image_idx() as u64);
-            mix(image.line_idx() as u64);
+        for image in
+            fragment_paint::render_fragment_view_images_for_line(view.fragments(), line.id()).iter()
+        {
+            mix(image.image().raw() as u64);
+            mix(
+                layout_state::line_id_index(fragment_paint::render_image_fragment_line(&image))
+                    as u64,
+            );
         }
-        for decoration in view.fragments().decorations_for_line(line.index()).iter() {
+        for decoration in
+            fragment_paint::render_fragment_view_decorations_for_line(view.fragments(), line.id())
+                .iter()
+        {
             let rect = decoration.rect();
             for value in [rect.x0, rect.y0, rect.x1, rect.y1] {
                 mix(bits(value));
             }
-            mix(decoration.color() as u64);
+            mix(fragment_paint::decoration_color(&decoration) as u64);
         }
     }
-    for decoration in view.fragments().decorations().iter() {
+    for decoration in fragment_paint::decorations(view.fragments()).iter() {
         let rect = decoration.rect();
         for value in [rect.x0, rect.y0, rect.x1, rect.y1] {
             mix(bits(value));
         }
-        mix(decoration.color() as u64);
+        mix(fragment_paint::decoration_color(&decoration) as u64);
         mix(decoration.is_inline() as u64);
-        mix(decoration.is_background() as u64);
-        mix(decoration.is_border() as u64);
-        mix(decoration.is_foreground() as u64);
-        mix(decoration.pattern() as u64);
-        mix(decoration.is_in_positioned_layer() as u64);
-        mix(decoration.is_in_negative_positioned_layer() as u64);
-        mix(decoration.is_in_independent_positioned_layer() as u64);
-        mix(decoration.line_idx().unwrap_or(usize::MAX) as u64);
-        mix(decoration.paint_order() as u64);
+        mix(fragment_paint::decoration_is_background(&decoration) as u64);
+        mix(fragment_paint::decoration_is_border(&decoration) as u64);
+        mix(fragment_paint::decoration_is_foreground(&decoration) as u64);
+        mix(fragment_paint::decoration_pattern(&decoration) as u64);
+        mix(fragment_paint::decoration_is_in_positioned_layer(&decoration) as u64);
+        mix(fragment_paint::decoration_is_in_negative_positioned_layer(&decoration) as u64);
+        mix(fragment_paint::decoration_is_in_independent_positioned_layer(&decoration) as u64);
+        mix(fragment_paint::render_decoration_line(&decoration)
+            .map_or(usize::MAX, |line| layout_state::line_id_index(line)) as u64);
+        mix(fragment_paint::decoration_paint_order(&decoration) as u64);
         mix(decoration.border_width().map_or(0, |width| width.to_bits()) as u64);
-        if let Some(radii) = decoration.radii() {
+        if let Some(radii) = fragment_paint::decoration_radii(&decoration) {
             mix(1);
             for (x, y) in [
                 radii.top_left,
@@ -144,7 +158,7 @@ fn layout_fingerprint(
             mix(0);
         }
 
-        if let Some(clip) = decoration.overflow_clip() {
+        if let Some(clip) = fragment_paint::decoration_overflow_clip(&decoration) {
             mix(1);
             let rect = clip.rect();
             for value in [rect.x0, rect.y0, rect.x1, rect.y1] {
@@ -156,12 +170,12 @@ fn layout_fingerprint(
             mix(0);
         }
     }
-    for image in view.fragments().images().iter() {
-        mix(image.image_idx() as u64);
-        mix(image.line_idx() as u64);
-        let p = image.offset();
-        let size = image.size();
-        let rect = image.clip();
+    for image in fragment_paint::render_fragment_view_images(view.fragments()).iter() {
+        mix(image.image().raw() as u64);
+        mix(layout_state::line_id_index(fragment_paint::render_image_fragment_line(&image)) as u64);
+        let p = fragment_paint::render_image_fragment_offset(&image);
+        let size = fragment_paint::render_image_fragment_size(&image);
+        let rect = fragment_paint::render_image_fragment_clip(&image);
         for v in [
             p.x,
             p.y,
@@ -179,10 +193,9 @@ fn layout_fingerprint(
 }
 #[derive(Default)]
 struct Shaper {
-    register_runs: bool,
     append_checkpoint: Option<usize>,
     generation: GlyphResourceGeneration,
-    cache: HashMap<(char, u32, u32), GlyphId>,
+    cache: HashMap<(char, u32), GlyphHandle>,
     calls: usize,
 }
 impl GlyphShaper for Shaper {
@@ -196,7 +209,8 @@ impl GlyphShaper for Shaper {
     }
     fn rollback_append_shaping(&mut self) {
         if let Some(checkpoint) = self.append_checkpoint.take() {
-            self.cache.retain(|_, glyph| (*glyph as usize) < checkpoint);
+            self.cache
+                .retain(|_, glyph| (glyph.0 as usize) < checkpoint);
         }
     }
     fn reset(&mut self) {
@@ -208,99 +222,35 @@ impl GlyphShaper for Shaper {
     }
     fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
         self.calls += 1;
-        let key = (
-            request.character,
-            request.font_size.to_bits(),
-            request.color,
-        );
-        let metric = GlyphMetric::try_new(
-            request.character,
-            request.font_size * 0.5,
-            request.font_size * 0.75,
-            request.font_size * 0.25,
-        )
-        .unwrap();
+        let key = (request.character, request.style.font_size.to_bits());
+        let advance = request.style.font_size * 0.5;
+        let metrics = FontMetrics {
+            ascent: request.style.font_size * 0.75,
+            descent: request.style.font_size * 0.25,
+        };
         if let Some(&glyph) = self.cache.get(&key) {
-            return Ok(ShapedGlyph::from_metric(glyph, metric));
+            return Ok(ShapedGlyph::new(glyph, advance, metrics));
         }
-        let glyph = self.cache.len() as GlyphId;
+        let glyph = GlyphHandle(self.cache.len() as u32);
         self.cache.insert(key, glyph);
-        Ok(ShapedGlyph::from_metric(glyph, metric))
-    }
-    fn shape_glyph_run(
-        &mut self,
-        request: TextRunShapeRequest<'_>,
-        glyphs: &mut [GlyphId],
-        resources: &mut GlyphResourceStore,
-    ) -> Result<Option<ShapedTextRun>, ShapeError> {
-        #[cfg(feature = "profiling")]
-        let _profile_scope = html::layout::profiling::scope("shape.mock_backend");
-        let style = request.style();
-        if self.register_runs {
-            let count = glyphs.len();
-            let geometry = ShapedTextRun::new(
-                vec![style.font_size() * 0.5; count].into(),
-                vec![true; count + 1].into(),
-            )
-            .unwrap();
-            let range = resources.register_run(
-                request.text(),
-                &geometry,
-                style.font_size() * 0.75,
-                style.font_size() * 0.25,
-            )?;
-            for (slot, glyph) in glyphs.iter_mut().zip(range) {
-                *slot = glyph;
-            }
-            return Ok(Some(geometry));
-        }
-        for (index, (glyph, ch)) in glyphs.iter_mut().zip(request.text().chars()).enumerate() {
-            *glyph = resources.shape_glyph(
-                self,
-                GlyphRequest {
-                    character: ch,
-                    font_size: style.font_size(),
-                    font_weight: style.font_weight(),
-                    font_slant: style.font_slant(),
-                    color: request
-                        .paint_colors()
-                        .map_or(style.color(), |colors| colors[index]),
-                    font_family: style.font_family(),
-                },
-            )?;
-        }
-        Ok(None)
+        Ok(ShapedGlyph::new(glyph, advance, metrics))
     }
 }
 
 fn input(source: String) -> PipelineInputs {
-    PipelineInputs {
+    let mut inputs = PipelineInputs::new(
         source,
-        markup_syntax: MarkupSyntax::Html,
-        user_styles: vec![],
-        reader_overrides: ReaderStyleOverrides {
-            canonical_font_size: Some(16.0),
-            link_foreground: Some(0x466853ff),
-            ..Default::default()
-        },
-        note_flow: Default::default(),
-        source_revision: SourceRevision::INITIAL,
-        base_uri: "index.html".into(),
-        resource_revision: ResourceRevision::INITIAL,
-        stylesheet_revision: StylesheetRevision::INITIAL,
-        style_environment: Default::default(),
-        font_environment: FontEnvironmentRevision::INITIAL,
-        image_metrics_revision: ImageMetricsRevision::INITIAL,
-        layout: LayoutConstraints {
-            viewport_width: 600.0,
-            viewport_height: None,
-            line_height: 16.0,
-            image_sizing_policy: Default::default(),
-            text_composition_policy: Default::default(),
-        },
-        image_metrics: Default::default(),
-        paint: PaintSettingsRevision::INITIAL,
-    }
+        MarkupSyntax::Html,
+        "index.html".into(),
+        Default::default(),
+        LayoutConstraints::new(600.0, 16.0).unwrap(),
+    );
+    inputs.reader_overrides = ReaderStyleOverrides {
+        canonical_font_size: Some(16.0),
+        link_foreground: Some(0x466853ff),
+        ..Default::default()
+    };
+    inputs
 }
 
 #[cfg(feature = "heap")]
@@ -391,13 +341,13 @@ fn median(values: &mut [f64]) -> f64 {
     values.sort_by(f64::total_cmp);
     values[values.len() / 2]
 }
-fn source_fingerprint(doc: &html::layout::LaidOutDocument, resources: &GlyphResourceStore) -> u64 {
+fn source_fingerprint(doc: &LaidOutDocument, resources: &GlyphResourceStore) -> u64 {
     let addressing = doc.render_view(resources).addressing();
     let mut hash = 0xcbf29ce484222325u64;
     let mut mix = |value: u64| {
         hash = (hash ^ value).wrapping_mul(0x100000001b3);
     };
-    for run in doc.render_view(resources).text().text_runs() {
+    for run in text_paint::render_text_view_text_runs(doc.render_view(resources).text()) {
         let range = run.glyphs();
         if range.is_empty() {
             continue;
@@ -421,24 +371,12 @@ fn source_fingerprint(doc: &html::layout::LaidOutDocument, resources: &GlyphReso
     }
     hash
 }
-fn text_color_fingerprint(
-    document: &html::layout::LaidOutDocument,
-    shaper: &Shaper,
-    resources: &GlyphResourceStore,
-) -> u64 {
-    let mut glyph_colors = HashMap::new();
-    for (&(_, _, color), &glyph) in &shaper.cache {
-        glyph_colors.insert(glyph, color);
-    }
+fn text_color_fingerprint(document: &LaidOutDocument, resources: &GlyphResourceStore) -> u64 {
     let text = document.render_view(resources).text();
     let mut hash = 0xcbf29ce484222325u64;
     for index in 0..text.glyph_count() {
-        let glyph = text.glyph_at(index).unwrap();
-        let color = text.paint_color_at(index as u32).unwrap_or_else(|| {
-            text.paint_handle(glyph)
-                .and_then(|handle| glyph_colors.get(&handle).copied())
-                .unwrap_or_default()
-        });
+        let color = text_paint::paint_color_at(text, index as u32)
+            .expect("styled text has a resolved foreground");
         hash = (hash ^ u64::from(color)).wrapping_mul(0x100000001b3);
     }
     hash
@@ -473,7 +411,9 @@ fn main() {
     inputs.base_uri = path.clone();
     inputs.markup_syntax = MarkupSyntax::from_uri(path);
     if case.ends_with("_book") {
-        inputs.layout.text_composition_policy = TextCompositionPolicy::BookOptimized;
+        inputs.layout = inputs
+            .layout
+            .with_text_composition_policy(TextCompositionPolicy::BookOptimized);
     }
     let palette = args.get(4).map(String::as_str).unwrap_or("links");
     match palette {
@@ -483,7 +423,7 @@ fn main() {
             inputs.reader_overrides.link_foreground = None;
         }
         "theme" => {
-            inputs.reader_overrides.theme = Some(html::layout::ThemeAdaptation {
+            inputs.reader_overrides.theme = Some(ThemeAdaptation {
                 ink: 0xeeeeeeff,
                 surface: 0x222222ff,
             });
@@ -513,7 +453,7 @@ fn main() {
             let mut factory = DocumentFactory::new();
             let factory_provider = FileSystemProvider;
             let factory_resources = ResourceContext::new(&factory_provider, (path).as_ref());
-            factory.set_reader_overrides(inputs.reader_overrides.layout_overrides());
+            factory.set_reader_overrides(reader_style::layout_overrides(&inputs.reader_overrides));
             factory.set_media_environment(inputs.style_environment.media);
             let start = cpu_seconds();
             let parsed = parse_document(&inputs.source, inputs.markup_syntax).unwrap();
@@ -532,7 +472,7 @@ fn main() {
             let shaped_at = cpu_seconds();
             let document = shaped
                 .layout_with_metrics_and_shaper(
-                    html::layout::LayoutConstraints::new(600.0, 16.0).unwrap(),
+                    html_pipeline::engine::LayoutConstraints::new(600.0, 16.0).unwrap(),
                     &inputs.image_metrics,
                     &mut shaper,
                     &mut shaped_resources,
@@ -571,7 +511,7 @@ fn main() {
         let mut factory = DocumentFactory::new();
         let factory_provider = FileSystemProvider;
         let factory_resources = ResourceContext::new(&factory_provider, (path).as_ref());
-        factory.set_reader_overrides(inputs.reader_overrides.layout_overrides());
+        factory.set_reader_overrides(reader_style::layout_overrides(&inputs.reader_overrides));
         factory.set_media_environment(inputs.style_environment.media);
         let parsed = parse_document(&inputs.source, inputs.markup_syntax).unwrap();
         let prepared = factory
@@ -583,7 +523,7 @@ fn main() {
             .shape(&mut shaper, &mut doc_resources)
             .unwrap()
             .layout_with_metrics_and_shaper(
-                html::layout::LayoutConstraints::new(600.0, 16.0).unwrap(),
+                html_pipeline::engine::LayoutConstraints::new(600.0, 16.0).unwrap(),
                 &inputs.image_metrics,
                 &mut shaper,
                 &mut doc_resources,
@@ -591,7 +531,7 @@ fn main() {
             .unwrap();
         println!(
             "{}",
-            json!({"case":case,"chapter":path.rsplit('/').next().unwrap(),"glyphs":doc.render_view(&doc_resources).text().glyph_count(),"lines":doc.render_view(&doc_resources).text().line_count(),"render_fingerprint":format!("{:016x}",layout_fingerprint(&doc, &doc_resources)),"source_fingerprint":format!("{:016x}",source_fingerprint(&doc, &doc_resources)),"text_color_fingerprint":format!("{:016x}",text_color_fingerprint(&doc,&shaper, &doc_resources))})
+            json!({"case":case,"chapter":path.rsplit('/').next().unwrap(),"glyphs":doc.render_view(&doc_resources).text().glyph_count(),"lines":doc.render_view(&doc_resources).text().line_count(),"render_fingerprint":format!("{:016x}",layout_fingerprint(&doc, &doc_resources)),"source_fingerprint":format!("{:016x}",source_fingerprint(&doc, &doc_resources)),"text_color_fingerprint":format!("{:016x}",text_color_fingerprint(&doc, &doc_resources))})
         );
         return;
     }
@@ -611,26 +551,23 @@ fn main() {
     let image_metric = if case.starts_with("image") {
         let doc = session.document().unwrap();
         let mut metrics = session.inputs().unwrap().image_metrics.clone();
-        for (index, image) in doc
-            .render_view(session.glyph_resources())
-            .images()
+        for (index, image) in text_paint::render_view_images(&doc
+            .render_view(session.glyph_resources()))
             .iter()
             .enumerate()
         {
             if let Some((width, height)) =
-                html::resources::probe_dimensions(&FileSystemProvider, &image.source)
+                html_resources::probe_dimensions(&FileSystemProvider, &image.source)
             {
                 metrics.set(index as u32, width, height);
             }
         }
-        let (index, image) = doc
-            .render_view(session.glyph_resources())
-            .images()
+        let (index, image) = text_paint::render_view_images(&doc
+            .render_view(session.glyph_resources()))
             .iter()
             .enumerate()
             .find(|(index, _)| {
-                doc.render_view(session.glyph_resources())
-                    .image_uri(*index as u32)
+                text_paint::render_view_image_uri(&doc.render_view(session.glyph_resources()), dom_values::image_id_new(*index as u32))
                     .is_some_and(|uri| !uri.contains("square"))
             })
             .expect("real chapter contains a figure");
@@ -638,12 +575,10 @@ fn main() {
             .get(index as u32)
             .unwrap_or((image.width.max(1), image.height.max(1)));
         let metric = (index as u32, width, height);
-        let revision = session.inputs().unwrap().image_metrics_revision.next();
         session
             .apply_changes(
                 PipelineChanges {
                     image_metrics: Some(metrics),
-                    image_metrics_revision: Some(revision),
                     ..Default::default()
                 },
                 &mut shaper,
@@ -674,7 +609,9 @@ fn main() {
             }
             "resize" | "handoff" | "resize_book" => {
                 let mut layout = session.inputs().unwrap().layout;
-                layout.viewport_width = if iteration % 2 == 0 { 620.0 } else { 600.0 };
+                layout = layout
+                    .with_viewport_width(if iteration % 2 == 0 { 620.0 } else { 600.0 })
+                    .unwrap();
                 changes.layout = Some(layout);
             }
             "paint" => {
@@ -686,9 +623,7 @@ fn main() {
                 });
                 changes.reader_overrides = Some(overrides);
             }
-            "font" => {
-                changes.font_environment = Some(session.inputs().unwrap().font_environment.next())
-            }
+            "font" => changes.fonts_changed = true,
             "rehydrate" => {}
             "image" | "image_book" => {
                 let (index, width, height) = image_metric.unwrap();
@@ -704,7 +639,6 @@ fn main() {
                     },
                 );
                 changes.image_metrics = Some(metrics);
-                changes.image_metrics_revision = Some(current.image_metrics_revision.next());
             }
             _ => panic!("unknown case"),
         }
@@ -767,7 +701,7 @@ fn main() {
         .into_iter()
         .map(|(label, (bytes, count))| json!({"label":label,"bytes":bytes,"count":count}))
         .collect();
-    let output = json!({"case":case,"chapter":path.rsplit('/').next().unwrap(),"samples":count,"font_backend":"deterministic mock","heap_instrumented":cfg!(feature="heap"),"reader_borrows_layout":true,"image_metric":image_metric,"paragraph_cache":paragraph_cache,"memory_breakdown":memory_breakdown,"wall_median_ms":median(&mut walls),"cpu_median_ms":median(&mut cpus),"user_instructions":if instructions.len()==count {Some(median(&mut instructions) as u64)} else {None},"heap_live_bytes":median(&mut retained) as usize,"heap_peak_bytes":median(&mut peaks) as usize,"allocation_requests":median(&mut allocations) as usize,"allocated_bytes":median(&mut allocated_bytes) as usize,"rss_peak_bytes":rss,"reported_document_bytes":reported,"glyphs":doc.render_view(session.glyph_resources()).text().glyph_count(),"lines":doc.render_view(session.glyph_resources()).text().line_count(),"render_fingerprint":format!("{:016x}",layout_fingerprint(doc, session.glyph_resources())),"text_color_fingerprint":format!("{:016x}",text_color_fingerprint(doc,&shaper, session.glyph_resources())),"source_fingerprint":format!("{:016x}",source_fingerprint(doc, session.glyph_resources()))});
+    let output = json!({"case":case,"chapter":path.rsplit('/').next().unwrap(),"samples":count,"font_backend":"deterministic mock","heap_instrumented":cfg!(feature="heap"),"reader_borrows_layout":true,"image_metric":image_metric,"paragraph_cache":paragraph_cache,"memory_breakdown":memory_breakdown,"wall_median_ms":median(&mut walls),"cpu_median_ms":median(&mut cpus),"user_instructions":if instructions.len()==count {Some(median(&mut instructions) as u64)} else {None},"heap_live_bytes":median(&mut retained) as usize,"heap_peak_bytes":median(&mut peaks) as usize,"allocation_requests":median(&mut allocations) as usize,"allocated_bytes":median(&mut allocated_bytes) as usize,"rss_peak_bytes":rss,"reported_document_bytes":reported,"glyphs":doc.render_view(session.glyph_resources()).text().glyph_count(),"lines":doc.render_view(session.glyph_resources()).text().line_count(),"render_fingerprint":format!("{:016x}",layout_fingerprint(doc, session.glyph_resources())),"text_color_fingerprint":format!("{:016x}",text_color_fingerprint(doc, session.glyph_resources())),"source_fingerprint":format!("{:016x}",source_fingerprint(doc, session.glyph_resources()))});
     let mut output = output;
     if args.get(5).is_some_and(|argument| argument == "geometry") {
         output["geometry"] = geometry::snapshot(doc, session.glyph_resources());

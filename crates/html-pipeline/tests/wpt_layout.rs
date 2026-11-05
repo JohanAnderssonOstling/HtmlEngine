@@ -1,13 +1,17 @@
+use crate::stages::box_queries;
+use html_engine_model::layout_state;
+use html_engine_model::shaping_contracts;
 use html_dom::{Document, ImageSource};
 use html_parse::HtmlQuirksMode;
-use html_pipeline::GlyphResourceStore;
+use html_pipeline::engine::GlyphResourceStore;
 use html_pipeline::ResourceContext;
 use html_pipeline::engine::{
-    FontMetricsRequest, FontRelativeMetrics, GlyphId, GlyphMetric, GlyphShaper, ImageMetrics,
-    LayoutConstraints, ShapeError,
+    FontRelativeMetrics, FontLineMetrics, GlyphHandle, GlyphShaper, ImageMetrics,
+    LayoutConstraints, ShapeError, ShapingStyle,
 };
-use html_pipeline::{DocumentFactory, LaidOutDocument, PreparedDocument, parse_html_document};
-use html_pipeline::{GlyphRequest, ShapedGlyph};
+use html_pipeline::engine::{LaidOutDocument, PreparedDocument};
+use html_pipeline::{DocumentFactory, parse_html_document};
+use html_pipeline::engine::{GlyphRequest, FontMetrics, ShapedGlyph};
 use html_resources::{ResourceProvider, probe_dimensions};
 use html_wpt_test_support::wpt_root;
 use std::borrow::Cow;
@@ -30,10 +34,10 @@ const WPT_LAYOUT_TOLERANCE: f64 = 1.0;
 
 #[derive(Default)]
 struct DeterministicShaper {
-    glyphs: HashMap<(char, u32, bool), GlyphId>,
+    glyphs: HashMap<(char, u32, bool), GlyphHandle>,
     generation: html_pipeline::engine::GlyphResourceGeneration,
     append_checkpoint: Option<(
-        HashMap<(char, u32, bool), GlyphId>,
+        HashMap<(char, u32, bool), GlyphHandle>,
         html_pipeline::engine::GlyphResourceGeneration,
     )>,
 }
@@ -67,49 +71,56 @@ impl GlyphShaper for DeterministicShaper {
 
     fn font_relative_metrics(
         &mut self,
-        request: FontMetricsRequest<'_>,
+        request: &ShapingStyle<'_>,
     ) -> Result<FontRelativeMetrics, ShapeError> {
-        if request.font_family().is_some_and(|family| {
+        if request.font_family.is_some_and(|family| {
             family.split(',').next().is_some_and(|name| {
                 name.trim()
                     .trim_matches(['\'', '"'])
                     .eq_ignore_ascii_case("BaselineDiagnosticAlphabeticZero")
             })
         }) {
-            return Ok(
-                FontRelativeMetrics::from_line_ratios(0.25, 0.5, 0.55, 0.8, 0.2)
-                    .expect("the pinned diagnostic font metrics are valid"),
-            );
+            return Ok(FontRelativeMetrics {
+                x_height_ratio: 0.25,
+                ch_advance_ratio: 0.5,
+                cap_height_ratio: 0.55,
+                line_metrics: Some(FontLineMetrics {
+                    ascent_ratio: 0.8,
+                    descent_ratio: 0.2,
+                }),
+                ..FontRelativeMetrics::default()
+            });
         }
-        Ok(FontRelativeMetrics::fallback())
+        Ok(FontRelativeMetrics::default())
     }
 
     fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
-        let is_ahem = request
-            .font_family
+        let is_ahem = shaping_contracts::shaping_style_font_family_for_character(&request
+            .style, request.character)
             .and_then(|families| families.split(',').next())
             .map(str::trim)
             .map(|family| family.trim_matches(['\'', '"']))
             .is_some_and(|family| family.eq_ignore_ascii_case("ahem"));
-        let key = (request.character, request.font_size.to_bits(), is_ahem);
-        let advance = if is_ahem {
-            request.font_size
-        } else {
-            request.font_size * 0.5
-        };
-        let metric = GlyphMetric::try_new(
+        let key = (
             request.character,
-            advance,
-            request.font_size * 0.75,
-            request.font_size * 0.25,
-        )
-        .map_err(ShapeError::rejected_metric)?;
+            request.style.font_size.to_bits(),
+            is_ahem,
+        );
+        let advance = if is_ahem {
+            request.style.font_size
+        } else {
+            request.style.font_size * 0.5
+        };
+        let metrics = FontMetrics {
+            ascent: request.style.font_size * 0.75,
+            descent: request.style.font_size * 0.25,
+        };
         if let Some(&glyph) = self.glyphs.get(&key) {
-            return Ok(ShapedGlyph::from_metric(glyph, metric));
+            return Ok(ShapedGlyph::new(glyph, advance, metrics));
         }
-        let glyph = self.glyphs.len() as GlyphId;
+        let glyph = GlyphHandle(self.glyphs.len() as u32);
         self.glyphs.insert(key, glyph);
-        Ok(ShapedGlyph::from_metric(glyph, metric))
+        Ok(ShapedGlyph::new(glyph, advance, metrics))
     }
 }
 
@@ -356,11 +367,10 @@ fn runs_pinned_noninteractive_wpt_layout_assertions() {
             panic!("failed to shape and lay out pinned WPT {relative}: {error}")
         });
         let boxes = document.render_view(&document_resources).boxes();
-        let boxes_by_dom_node = (0..boxes.len())
+        let boxes_by_dom_node = (0..box_queries::len(boxes))
+            .map(layout_state::box_id_new)
             .filter_map(|box_idx| {
-                boxes
-                    .dom_node_index(box_idx)
-                    .map(|node_idx| (node_idx, box_idx))
+                box_queries::dom_node(boxes, box_idx).map(|node| (node.raw() as usize, box_idx))
             })
             .collect::<HashMap<_, _>>();
 
@@ -378,14 +388,15 @@ fn runs_pinned_noninteractive_wpt_layout_assertions() {
             if known.remove(&missing_box) {
                 unexpected_passes.push(missing_box);
             }
-            let size = boxes.size(box_idx).expect("a correlated box has geometry");
+            let size = box_queries::render_box_view_size(boxes, box_idx)
+                .expect("a correlated box has geometry");
             if let Some(expected) = expectation.width {
                 let run_key = assertion_run_key(relative, &expectation, "width", expected);
                 if verbose {
                     eprintln!(
-                        "layout assertion-run: {run_key}|actual={}|box={box_idx}|parent={:?}|class={:?}|style={:?}",
+                        "layout assertion-run: {run_key}|actual={}|box={box_idx:?}|parent={:?}|class={:?}|style={:?}",
                         size.width,
-                        boxes.parent(box_idx),
+                        box_queries::parent(boxes, box_idx),
                         expectation.class,
                         expectation.style
                     );
@@ -407,9 +418,9 @@ fn runs_pinned_noninteractive_wpt_layout_assertions() {
                 let run_key = assertion_run_key(relative, &expectation, "height", expected);
                 if verbose {
                     eprintln!(
-                        "layout assertion-run: {run_key}|actual={}|box={box_idx}|parent={:?}|class={:?}|style={:?}",
+                        "layout assertion-run: {run_key}|actual={}|box={box_idx:?}|parent={:?}|class={:?}|style={:?}",
                         size.height,
-                        boxes.parent(box_idx),
+                        box_queries::parent(boxes, box_idx),
                         expectation.class,
                         expectation.style
                     );

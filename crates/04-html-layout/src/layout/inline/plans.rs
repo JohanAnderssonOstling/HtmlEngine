@@ -1,15 +1,18 @@
 //! Owned retained token arenas. Cache hits borrow scoped slices; only
 //! construction and changed buffers need mutable working storage.
 
-use super::storage::{ArenaRange, TokenArena};
+use super::hyphenation::DeferredHyphenationCache;
+use super::metrics::{MetricsMode, MetricsRange};
+use super::storage::{ArenaRange, TokenArena, WidthArena};
 use super::tokens::{
     INLINE_SUMMARY_BLOCK_TOKENS, InlineSummaryBlock, InlineToken, InlineTokenMetrics, InlineTokens,
-    PreparedInlinePlanKey, ReplacedToken,
+    PreparedInlinePlanKey, PreparedTokenFeatures, ReplacedToken,
 };
 use super::wrapping::KpPlan;
 use html_dom::MemoryUsageReport;
 use rustc_data_structures::fx::FxHashMap;
-use std::mem::{size_of, swap};
+use std::mem::swap;
+use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,6 +38,30 @@ struct PlanRanges {
     runs: ArenaRange,
     summaries: ArenaRange,
     replaced: ArenaRange,
+    metrics_ranges: ArenaRange,
+    metrics_mode: MetricsMode,
+    metadata: ArenaRange,
+    widths: ArenaRange,
+    // Defaults occupy at most 52 bits. Reserve zero for wide storage so the
+    // option and paragraph features fit without enlarging retained entries.
+    compact_defaults: Option<NonZeroU64>,
+    features: PreparedTokenFeatures,
+}
+
+impl PlanRanges {
+    fn add_lengths_to(self, totals: &mut [usize; 7]) {
+        for (total, range) in totals.iter_mut().zip([
+            self.dense,
+            self.runs,
+            self.summaries,
+            self.replaced,
+            self.metrics_ranges,
+            self.metadata,
+            self.widths,
+        ]) {
+            *total += range.len as usize;
+        }
+    }
 }
 
 #[derive(Default)]
@@ -43,51 +70,64 @@ struct TokenArenas {
     runs: TokenArena<InlineTokenMetrics>,
     summaries: TokenArena<InlineSummaryBlock>,
     replaced: TokenArena<ReplacedToken>,
+    metrics_ranges: TokenArena<MetricsRange>,
+    metadata: TokenArena<u32>,
+    widths: WidthArena,
 }
 
 impl TokenArenas {
-    fn store(&mut self, previous: PlanRanges, tokens: &InlineTokens<'_>) -> PlanRanges {
-        self.store_changes(previous, tokens, [true; 4])
-    }
-
-    fn store_changes(
+    fn store(
         &mut self,
         previous: PlanRanges,
         tokens: &InlineTokens<'_>,
-        changed: [bool; 4],
+        changed_only: bool,
     ) -> PlanRanges {
         PlanRanges {
-            dense: if changed[0] {
-                self.dense.store(previous.dense, &tokens.dense)
-            } else {
-                previous.dense
-            },
-            runs: if changed[1] {
-                self.runs.store(previous.runs, &tokens.runs)
-            } else {
-                previous.runs
-            },
-            summaries: if changed[2] {
-                self.summaries
-                    .store(previous.summaries, &tokens.summary_blocks)
-            } else {
-                previous.summaries
-            },
-            replaced: if changed[3] {
-                self.replaced.store(previous.replaced, &tokens.replaced)
-            } else {
-                previous.replaced
-            },
+            dense: self
+                .dense
+                .store(previous.dense, &tokens.dense, changed_only),
+            runs: self.runs.store(previous.runs, &tokens.runs, changed_only),
+            summaries: self.summaries.store(
+                previous.summaries,
+                &tokens.summary_blocks,
+                changed_only,
+            ),
+            replaced: self
+                .replaced
+                .store(previous.replaced, &tokens.replaced, changed_only),
+            metrics_ranges: self.metrics_ranges.store(
+                previous.metrics_ranges,
+                &tokens.metrics_ranges,
+                changed_only,
+            ),
+            metrics_mode: tokens.metrics_mode,
+            metadata: self
+                .metadata
+                .store(previous.metadata, &tokens.metadata, changed_only),
+            widths: self
+                .widths
+                .store(previous.widths, &tokens.widths, changed_only),
+            compact_defaults: tokens.compact_defaults.map(|defaults| {
+                NonZeroU64::new(defaults + 1).expect("compact defaults fit in 60 bits")
+            }),
+            features: tokens.features,
         }
     }
 
     fn view(&self, ranges: PlanRanges) -> InlineTokens<'_> {
         InlineTokens {
             dense: self.dense.view(ranges.dense),
+            metadata: self.metadata.view(ranges.metadata),
+            widths: self.widths.view(ranges.widths),
+            compact_defaults: ranges.compact_defaults.map(|defaults| defaults.get() - 1),
             runs: self.runs.view(ranges.runs),
             summary_blocks: self.summaries.view(ranges.summaries),
             replaced: self.replaced.view(ranges.replaced),
+            metrics_mode: ranges.metrics_mode,
+            metrics_ranges: self.metrics_ranges.view(ranges.metrics_ranges),
+            features: ranges.features,
             kp_plan: None,
+            deferred_hyphens: None,
         }
     }
 
@@ -96,6 +136,9 @@ impl TokenArenas {
         self.runs.shrink_to_fit();
         self.summaries.shrink_to_fit();
         self.replaced.shrink_to_fit();
+        self.metrics_ranges.shrink_to_fit();
+        self.metadata.shrink_to_fit();
+        self.widths.shrink_to_fit();
     }
 }
 
@@ -103,6 +146,7 @@ struct PreparedInlinePlan {
     key: PreparedInlinePlanKey,
     ranges: PlanRanges,
     kp_plan: Option<KpPlan>,
+    deferred_hyphens: Option<Box<DeferredHyphenationCache>>,
     available: bool,
 }
 
@@ -113,20 +157,40 @@ struct GenerationPlans {
     entries: Vec<PreparedInlinePlan>,
     arenas: TokenArenas,
     needs_compaction: bool,
+    initial_token_capacity: u32,
 }
 
 impl GenerationPlans {
     fn insert(&mut self, key: PreparedInlinePlanKey, tokens: &mut InlineTokens) {
+        // Reserve only when compact storage is actually published. Wide-only
+        // generations do not allocate unused metadata or width columns.
+        if self.initial_token_capacity != 0 && !tokens.metadata.is_empty() {
+            // Keep the existing growth quantum: synthetic hyphen tokens can
+            // exceed the character hint and must not double an almost-full
+            // reservation into a larger allocation than ordinary growth.
+            let mut capacity = tokens.metadata.len();
+            while capacity < self.initial_token_capacity as usize {
+                capacity = capacity.saturating_mul(2);
+            }
+            if self.arenas.metadata.capacity() == 0 {
+                self.arenas.metadata.reserve_exact(capacity.max(tokens.metadata.len()));
+            }
+            if self.arenas.widths.capacity() == 0 {
+                self.arenas.widths.reserve_exact(capacity.max(tokens.widths.len()));
+            }
+            self.initial_token_capacity = 0;
+        }
         let previous = self.lookup.get(&key.container_box_idx).copied();
         let ranges = previous
             .map(|index| self.entries[index].ranges)
             .unwrap_or_default();
-        let stored = self.arenas.store(ranges, tokens);
+        let stored = self.arenas.store(ranges, tokens, false);
         self.needs_compaction |= previous.is_some() && stored != ranges;
         let plan = PreparedInlinePlan {
             key,
             ranges: stored,
             kp_plan: tokens.kp_plan.take(),
+            deferred_hyphens: tokens.deferred_hyphens.take(),
             available: true,
         };
         if let Some(index) = previous {
@@ -143,27 +207,23 @@ impl GenerationPlans {
         // across policy changes or shaping refinements.
         if self.needs_compaction || self.entries.iter().any(|plan| !plan.available) {
             let mut arenas = TokenArenas::default();
-            let mut totals = [0; 4];
+            let mut totals = [0; 7];
             for plan in self.entries.iter().filter(|plan| plan.available) {
-                for (total, range) in totals.iter_mut().zip([
-                    plan.ranges.dense,
-                    plan.ranges.runs,
-                    plan.ranges.summaries,
-                    plan.ranges.replaced,
-                ]) {
-                    *total += range.len as usize;
-                }
+                plan.ranges.add_lengths_to(&mut totals);
             }
             arenas.dense.reserve_exact(totals[0]);
             arenas.runs.reserve_exact(totals[1]);
             arenas.summaries.reserve_exact(totals[2]);
             arenas.replaced.reserve_exact(totals[3]);
+            arenas.metrics_ranges.reserve_exact(totals[4]);
+            arenas.metadata.reserve_exact(totals[5]);
+            arenas.widths.reserve_exact(totals[6]);
             self.entries.retain_mut(|plan| {
                 if !plan.available {
                     return false;
                 }
                 let tokens = self.arenas.view(plan.ranges);
-                plan.ranges = arenas.store(PlanRanges::default(), &tokens);
+                plan.ranges = arenas.store(PlanRanges::default(), &tokens, false);
                 true
             });
             self.arenas = arenas;
@@ -175,6 +235,7 @@ impl GenerationPlans {
         }
         self.arenas.shrink_to_fit();
         self.entries.shrink_to_fit();
+        self.initial_token_capacity = 0;
     }
 }
 
@@ -188,6 +249,12 @@ pub(in crate::layout) struct InlinePlanCache {
 }
 
 impl InlinePlanCache {
+    pub(in crate::layout) fn set_compact_token_capacity_hint(&mut self, capacity: usize) {
+        if self.active.entries.is_empty() {
+            self.active.initial_token_capacity = u32::try_from(capacity).unwrap_or(u32::MAX);
+        }
+    }
+
     pub(in crate::layout) fn begin_generation(&mut self, generation: InlinePlanGeneration) {
         if self.active.generation == Some(generation) {
             return;
@@ -199,6 +266,17 @@ impl InlinePlanCache {
                 ..Default::default()
             };
         }
+    }
+
+    pub(super) fn working_compact_tokens(&mut self, capacity: usize) -> InlineTokens<'static> {
+        let mut tokens = self.working.pop().unwrap_or_default();
+        tokens.metadata.reserve(capacity);
+        tokens.widths.reserve(capacity);
+        tokens
+            .summary_blocks
+            .reserve(capacity.div_ceil(INLINE_SUMMARY_BLOCK_TOKENS));
+        tokens.compact_defaults = Some(0);
+        tokens
     }
 
     pub(super) fn working_tokens(&mut self, capacity: usize) -> InlineTokens<'static> {
@@ -241,36 +319,32 @@ impl InlinePlanCache {
         if plan.key != key {
             return None;
         }
-        let (result, changed, mut working) = {
+        let (result, mut working) = {
             let mut tokens = self.active.arenas.view(plan.ranges);
             tokens.kp_plan = plan.kp_plan.take();
+            tokens.deferred_hyphens = plan.deferred_hyphens.take();
             let result = execute(&mut tokens);
-            let dense = tokens.dense.into_owned();
-            let runs = tokens.runs.into_owned();
-            let summaries = tokens.summary_blocks.into_owned();
-            let replaced = tokens.replaced.into_owned();
-            let changed = [
-                dense.is_some(),
-                runs.is_some(),
-                summaries.is_some(),
-                replaced.is_some(),
-            ];
             let working = InlineTokens {
-                dense: dense.unwrap_or_default().into(),
-                runs: runs.unwrap_or_default().into(),
-                summary_blocks: summaries.unwrap_or_default().into(),
-                replaced: replaced.unwrap_or_default().into(),
+                dense: tokens.dense.into_working(),
+                metadata: tokens.metadata.into_working(),
+                widths: tokens.widths.into_working(),
+                compact_defaults: tokens.compact_defaults,
+                runs: tokens.runs.into_working(),
+                summary_blocks: tokens.summary_blocks.into_working(),
+                replaced: tokens.replaced.into_working(),
+                metrics_mode: tokens.metrics_mode,
+                metrics_ranges: tokens.metrics_ranges.into_working(),
+                features: tokens.features,
                 kp_plan: tokens.kp_plan,
+                deferred_hyphens: tokens.deferred_hyphens,
             };
-            (result, changed, working)
+            (result, working)
         };
-        let stored = self
-            .active
-            .arenas
-            .store_changes(plan.ranges, &working, changed);
+        let stored = self.active.arenas.store(plan.ranges, &working, true);
         self.active.needs_compaction |= stored != plan.ranges;
         plan.ranges = stored;
         plan.kp_plan = working.kp_plan.take();
+        plan.deferred_hyphens = working.deferred_hyphens.take();
         plan.available = true;
         self.restore(None, working);
         Some(result)
@@ -285,14 +359,24 @@ impl InlinePlanCache {
             self.active.insert(key, &mut tokens);
         }
         tokens.dense.clear();
+        tokens.metadata.clear();
+        tokens.widths.clear();
+        tokens.compact_defaults = None;
         tokens.runs.clear();
         tokens.summary_blocks.clear();
         tokens.replaced.clear();
+        tokens.metrics_mode = MetricsMode::Unprepared;
+        tokens.features = PreparedTokenFeatures::default();
+        tokens.metrics_ranges.clear();
         tokens.kp_plan = None;
-        if tokens.dense.capacity()
+        tokens.deferred_hyphens = None;
+        if tokens.metadata.capacity()
+            + tokens.widths.capacity()
+            + tokens.dense.capacity()
             + tokens.runs.capacity()
             + tokens.summary_blocks.capacity()
             + tokens.replaced.capacity()
+            + tokens.metrics_ranges.capacity()
             > 0
         {
             self.working.push(tokens);
@@ -325,6 +409,7 @@ impl InlinePlanCache {
             for mut plan in plans.entries.into_iter().filter(|plan| plan.available) {
                 let mut tokens = plans.arenas.view(plan.ranges);
                 tokens.kp_plan = plan.kp_plan.take();
+                tokens.deferred_hyphens = plan.deferred_hyphens.take();
                 destination.insert(plan.key, &mut tokens);
             }
         }
@@ -354,25 +439,43 @@ impl InlinePlanCache {
                 cache.entries.capacity(),
                 available.clone().count(),
             );
-            report.add(
-                "entry_lookup",
-                cache.lookup.capacity() * size_of::<(u32, usize)>(),
-                cache.lookup.len(),
-            );
-            let mut counts = [0; 4];
+            report.add_hash_map_storage("entry_lookup", &cache.lookup);
+            let mut counts = [0; 7];
             for plan in available {
-                for (count, range) in counts.iter_mut().zip([
-                    plan.ranges.dense,
-                    plan.ranges.runs,
-                    plan.ranges.summaries,
-                    plan.ranges.replaced,
-                ]) {
-                    *count += range.len as usize;
-                }
+                plan.ranges.add_lengths_to(&mut counts);
+                let (label, range_count) = match plan.ranges.metrics_mode {
+                    MetricsMode::Uniform(_) => ("metrics_uniform_tokens", 1),
+                    MetricsMode::Ranges => {
+                        ("metrics_ranged_tokens", plan.ranges.metrics_ranges.len)
+                    }
+                    MetricsMode::Dense(count) => ("metrics_dense_tokens", count),
+                    MetricsMode::Unprepared => ("metrics_unprepared_tokens", 0),
+                };
+                // Zero-byte entries describe coverage without counting it as
+                // an additional allocation in the storage report.
+                report.add(
+                    label,
+                    0,
+                    (plan.ranges.dense.len + plan.ranges.metadata.len) as usize,
+                );
+                report.add(
+                    "metrics_transitions",
+                    0,
+                    range_count.saturating_sub(1) as usize,
+                );
                 if let Some(plan) = &plan.kp_plan {
                     report.add("line_break_plans", plan.memory_usage_bytes(), 1);
                 }
+                if let Some(cache) = &plan.deferred_hyphens {
+                    report.add("deferred_hyphenation", cache.memory_usage_bytes(), 1);
+                }
             }
+            report.add_slice_storage::<u32>(
+                "token_metadata",
+                cache.arenas.metadata.capacity(),
+                counts[5],
+            );
+            report.add("token_widths", cache.arenas.widths.storage_bytes(), counts[6]);
             report.add_slice_storage::<InlineToken>(
                 "tokens",
                 cache.arenas.dense.capacity(),
@@ -393,6 +496,11 @@ impl InlinePlanCache {
                 cache.arenas.replaced.capacity(),
                 counts[3],
             );
+            report.add_slice_storage::<MetricsRange>(
+                "metrics_ranges",
+                cache.arenas.metrics_ranges.capacity(),
+                counts[4],
+            );
         }
         report.add_slice_storage::<InlineTokens<'static>>(
             "working_buffers",
@@ -400,6 +508,8 @@ impl InlinePlanCache {
             self.working.len(),
         );
         for tokens in &self.working {
+            report.add_slice_storage::<u32>("working_metadata", tokens.metadata.capacity(), 0);
+            report.add_slice_storage::<f32>("working_widths", tokens.widths.capacity(), 0);
             report.add_slice_storage::<InlineToken>("working_tokens", tokens.dense.capacity(), 0);
             report.add_slice_storage::<InlineTokenMetrics>(
                 "working_run_metrics",
@@ -414,6 +524,11 @@ impl InlinePlanCache {
             report.add_slice_storage::<ReplacedToken>(
                 "working_replaced",
                 tokens.replaced.capacity(),
+                0,
+            );
+            report.add_slice_storage::<MetricsRange>(
+                "working_metrics_ranges",
+                tokens.metrics_ranges.capacity(),
                 0,
             );
         }
@@ -436,7 +551,13 @@ impl InlinePlanCache {
             .entries
             .iter()
             .find(|plan| plan.available)
-            .map(|plan| self.active.arenas.dense.view(plan.ranges.dense).as_ptr() as usize)
+            .map(|plan| {
+                if plan.ranges.compact_defaults.is_some() {
+                    self.active.arenas.metadata.view(plan.ranges.metadata).as_ptr() as usize
+                } else {
+                    self.active.arenas.dense.view(plan.ranges.dense).as_ptr() as usize
+                }
+            })
     }
 }
 
@@ -466,6 +587,7 @@ mod tests {
             font_size: 16.0,
             vertical_align: InlineVerticalAlign::Baseline,
             white_space: WhiteSpace::Normal,
+            contributes_line_metrics: true,
             visible: true,
             placement_required: false,
         };
@@ -677,7 +799,7 @@ mod tests {
                 metrics,
             );
             tokens.rebuild_summary_blocks();
-            tokens.kp_plan = Some(KpPlan::build(&tokens.dense, &tokens.runs, false));
+            tokens.kp_plan = Some(KpPlan::build(tokens.span(), &tokens.runs, false));
             cache.restore(Some(key(owner, false)), tokens);
         }
         cache.begin_generation(InlinePlanGeneration::new());
@@ -798,6 +920,46 @@ mod tests {
         cache
             .with_plan(key(2, false), |other| assert_eq!(other.runs[0].ascent, 8.0))
             .unwrap();
+    }
+
+    #[test]
+    fn emptying_a_cached_paragraph_preserves_its_neighbor() {
+        let mut cache = InlinePlanCache::default();
+        cache.begin_generation(InlinePlanGeneration::new());
+        insert(&mut cache, 1, 20);
+        insert(&mut cache, 2, 3);
+        cache.trim();
+        cache
+            .with_plan(key(1, false), |tokens| {
+                tokens.dense.clear();
+                tokens.runs.clear();
+                tokens.summary_blocks.clear();
+                tokens.replaced.clear();
+            })
+            .unwrap();
+        cache.trim();
+        cache
+            .with_plan(key(1, false), |empty| {
+                assert!(empty.dense.is_empty());
+                assert!(empty.runs.is_empty());
+                assert!(empty.summary_blocks.is_empty());
+                assert!(empty.replaced.is_empty());
+            })
+            .unwrap();
+        cache
+            .with_plan(key(2, false), |neighbor| {
+                assert_eq!(neighbor.dense.len(), 3);
+                assert_eq!(neighbor.dense[0].width(), 10.0);
+                assert_eq!(neighbor.runs[0].owner_box_idx, 2);
+            })
+            .unwrap();
+        assert_eq!(cache.active.arenas.dense.len(), 3);
+        assert_eq!(cache.active.arenas.runs.len(), 1);
+        assert_eq!(
+            cache.len(),
+            2,
+            "an empty cached paragraph remains available"
+        );
     }
 
     #[test]

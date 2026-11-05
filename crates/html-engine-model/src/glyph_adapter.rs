@@ -1,40 +1,27 @@
-//! Small renderer-facing glyph requests and validated shaping results.
-use crate::{
-    FontSlant, GlyphId, GlyphMetric, GlyphMetricError, GlyphResourceGeneration, ShapeError,
-};
+//! Renderer-facing glyph requests, measurements, and native resource storage.
+use crate::ShapingStyle;
 
 /// Opaque key into an adapter's native paint resources. This is independent
 /// of the dense glyph IDs assigned by HtmlEngine for layout.
-pub type GlyphHandle = u32;
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct GlyphHandle(pub u32);
 
+/// One character and the resolved properties borrowed from its shaping span.
+#[non_exhaustive]
 #[derive(Clone, Copy, Debug)]
 pub struct GlyphRequest<'a> {
     pub character: char,
-    pub font_size: f32,
-    pub font_weight: u16,
-    pub font_slant: FontSlant,
-    pub color: u32,
-    pub font_family: Option<&'a str>,
+    pub style: &'a ShapingStyle<'a>,
 }
 
 /// Font/run extents measured by the native text system, in layout pixels.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct FontMetrics {
-    ascent: f32,
-    descent: f32,
-}
-
-impl FontMetrics {
-    pub fn new(ascent: f32, descent: f32) -> Result<Self, GlyphMetricError> {
-        GlyphMetric::try_new('\0', 0.0, ascent, descent)?;
-        Ok(Self { ascent, descent })
-    }
-    pub fn ascent(self) -> f32 {
-        self.ascent
-    }
-    pub fn descent(self) -> f32 {
-        self.descent
-    }
+    /// Finite, non-negative ascent in layout pixels.
+    pub ascent: f32,
+    /// Finite, non-negative descent in layout pixels.
+    pub descent: f32,
 }
 
 /// A native paint handle and its measurements. Registration belongs to the
@@ -47,93 +34,41 @@ pub struct ShapedGlyph {
 }
 
 impl ShapedGlyph {
-    pub fn new(
-        handle: GlyphHandle,
-        advance: f32,
-        metrics: FontMetrics,
-    ) -> Result<Self, GlyphMetricError> {
-        GlyphMetric::try_new('\0', advance, metrics.ascent, metrics.descent)?;
-        Ok(Self {
+    /// The adapter supplies a valid paint handle and finite, non-negative advance.
+    pub fn new(handle: GlyphHandle, advance: f32, metrics: FontMetrics) -> Self {
+        Self {
             handle,
             advance,
             metrics,
-        })
-    }
-    pub fn from_metric(handle: GlyphHandle, metric: GlyphMetric) -> Self {
-        Self {
-            handle,
-            advance: metric.advance(),
-            metrics: FontMetrics {
-                ascent: metric.ascent(),
-                descent: metric.descent(),
-            },
         }
     }
-    pub fn handle(self) -> GlyphHandle {
+    pub(crate) fn handle(self) -> GlyphHandle {
         self.handle
     }
-    pub fn advance(self) -> f32 {
+    pub(crate) fn advance(self) -> f32 {
         self.advance
     }
-    pub fn metrics(self) -> FontMetrics {
+    pub(crate) fn metrics(self) -> FontMetrics {
         self.metrics
-    }
-    pub(crate) fn metric(self, character: char) -> GlyphMetric {
-        GlyphMetric::try_new(
-            character,
-            self.advance,
-            self.metrics.ascent,
-            self.metrics.descent,
-        )
-        .expect("validated shaping result")
-    }
-}
-
-/// Optional storage for simple adapters. Clearing native glyphs also changes
-/// their generation, keeping invalidation bookkeeping in one place.
-pub struct GlyphResources<T> {
-    values: Vec<T>,
-    generation: GlyphResourceGeneration,
-}
-impl<T> Default for GlyphResources<T> {
-    fn default() -> Self {
-        Self {
-            values: Vec::new(),
-            generation: GlyphResourceGeneration::default(),
-        }
-    }
-}
-impl<T> GlyphResources<T> {
-    pub fn generation(&self) -> GlyphResourceGeneration {
-        self.generation
-    }
-    pub fn clear(&mut self) {
-        self.values.clear();
-        self.generation = GlyphResourceGeneration::default();
-    }
-    pub fn insert(&mut self, value: T) -> Result<GlyphHandle, ShapeError> {
-        let id = GlyphId::try_from(self.values.len())
-            .ok()
-            .filter(|id| *id < GlyphId::MAX)
-            .ok_or_else(|| ShapeError::registry_capacity_exhausted(self.values.len()))?;
-        self.values.push(value);
-        Ok(id)
-    }
-    pub fn get(&self, handle: GlyphHandle) -> Option<&T> {
-        self.values.get(handle as usize)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{GlyphResourceStore, GlyphShaper};
+    use crate::{
+        FontSlant, GlyphId, GlyphResourceGeneration, GlyphResourceStore, ResourceShaper,
+        GlyphWriter, GlyphShaper, ShapeError, shaping,
+    };
 
     #[test]
     fn engine_ids_are_independent_of_native_handles_and_survive_rollback() {
         let mut resources = GlyphResourceStore::default();
-        let metrics = FontMetrics::new(12.0, 4.0).unwrap();
-        let native = ShapedGlyph::new(700, 8.0, metrics).unwrap();
+        let metrics = FontMetrics {
+            ascent: 12.0,
+            descent: 4.0,
+        };
+        let native = ShapedGlyph::new(GlyphHandle(700), 8.0, metrics);
         struct Fixed(ShapedGlyph, GlyphResourceGeneration);
         impl GlyphShaper for Fixed {
             fn resource_generation(&self) -> GlyphResourceGeneration {
@@ -147,47 +82,55 @@ mod tests {
             }
         }
         let mut shaper = Fixed(native, resources.generation());
-        let request = |character| GlyphRequest {
-            character,
-            font_size: 16.0,
-            font_weight: 400,
-            font_slant: FontSlant::Normal,
-            color: 0,
-            font_family: None,
-        };
+        let style = shaping::style(16.0, 400, FontSlant::Normal, 0, None);
+        let request = |character| shaping::glyph(character, &style);
         let id = resources.shape_glyph(&mut shaper, request('x')).unwrap();
-        assert_eq!(id, 0);
-        assert_eq!(resources.metrics().paint_handle(id), Some(700));
+        assert_eq!(id, GlyphId(0));
+        assert_eq!(resources.metrics().paint_handle(id), Some(GlyphHandle(700)));
         assert_eq!(
             resources.shape_glyph(&mut shaper, request('x')).unwrap(),
             id
         );
         let checkpoint = resources.checkpoint();
-        shaper.0 = ShapedGlyph::new(900, 9.0, metrics).unwrap();
-        assert_eq!(resources.shape_glyph(&mut shaper, request('y')).unwrap(), 1);
+        shaper.0 = ShapedGlyph::new(GlyphHandle(900), 9.0, metrics);
+        assert_eq!(
+            resources.shape_glyph(&mut shaper, request('y')).unwrap(),
+            GlyphId(1)
+        );
         assert!(resources.rollback_to(checkpoint));
-        assert_eq!(resources.metrics().paint_handle(1), None);
-        assert_eq!(resources.shape_glyph(&mut shaper, request('y')).unwrap(), 1);
-        assert_eq!(resources.metrics().paint_handle(1), Some(900));
+        assert_eq!(resources.metrics().paint_handle(GlyphId(1)), None);
+        assert_eq!(
+            resources.shape_glyph(&mut shaper, request('y')).unwrap(),
+            GlyphId(1)
+        );
+        assert_eq!(
+            resources.metrics().paint_handle(GlyphId(1)),
+            Some(GlyphHandle(900))
+        );
     }
 
     #[test]
     fn native_storage_reset_invalidates_its_generation() {
-        let mut resources = GlyphResources::default();
-        let generation = resources.generation();
-        let handle = resources.insert("old").unwrap();
-        assert_eq!(resources.get(handle), Some(&"old"));
-        resources.clear();
-        assert_ne!(resources.generation(), generation);
-        assert!(resources.get(handle).is_none());
-        assert_eq!(resources.insert("new").unwrap(), handle);
-    }
-
-    #[test]
-    fn shaping_measurements_reject_invalid_values() {
-        assert!(FontMetrics::new(f32::NAN, 2.0).is_err());
-        assert!(FontMetrics::new(8.0, -1.0).is_err());
-        assert!(FontMetrics::new(8.0, f32::INFINITY).is_err());
-        assert!(ShapedGlyph::new(7, -1.0, FontMetrics::default()).is_err());
+        let mut shaper = ResourceShaper::new(|_, resources: &mut GlyphWriter<'_, &str>| {
+            let handle = resources.insert("old")?;
+            Ok(ShapedGlyph::new(handle, 1.0, FontMetrics::default()))
+        });
+        let style = shaping::style(16.0, 400, FontSlant::Normal, 0, None);
+        let handle = shaper
+            .shape_glyph(shaping::glyph('x', &style))
+            .unwrap()
+            .handle();
+        let generation = shaper.resource_generation();
+        assert_eq!(shaper.resources().get(handle), Some(&"old"));
+        shaper.reset();
+        assert_ne!(shaper.resource_generation(), generation);
+        assert!(shaper.resources().get(handle).is_none());
+        assert_eq!(
+            shaper
+                .shape_glyph(shaping::glyph('x', &style))
+                .unwrap()
+                .handle(),
+            handle
+        );
     }
 }

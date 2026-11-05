@@ -2,45 +2,44 @@ use crate::ElementRef;
 
 const EPUB_NAMESPACE: &str = "http://www.idpf.org/2007/ops";
 
-fn element_has_token(
-    element: ElementRef<'_>,
-    attribute: &str,
-    namespace: Option<&str>,
-    local_name: &str,
-    expected: &str,
-) -> bool {
-    element
-        .attr(attribute)
-        .or_else(|| element.attr_expanded(namespace, local_name))
-        .is_some_and(|value| {
-            value
-                .split_ascii_whitespace()
-                .any(|token| token.eq_ignore_ascii_case(expected))
-        })
+impl<'a> ElementRef<'a> {
+    /// Borrow EPUB type tokens, accepting either the literal HTML attribute or
+    /// an XML attribute bound to the EPUB namespace. Token case is preserved.
+    pub fn epub_types(self) -> impl Iterator<Item = &'a str> + Clone + 'a {
+        self.attr("epub:type")
+            .or_else(|| self.attr_expanded(Some(EPUB_NAMESPACE), "type"))
+            .into_iter()
+            .flat_map(str::split_ascii_whitespace)
+    }
+
+    /// Borrow ASCII-whitespace-separated role tokens without normalizing case.
+    pub fn aria_roles(self) -> impl Iterator<Item = &'a str> + Clone + 'a {
+        self.attr("role")
+            .or_else(|| self.attr_expanded(None, "role"))
+            .into_iter()
+            .flat_map(str::split_ascii_whitespace)
+    }
 }
 
 pub fn element_is_note_reference(element: ElementRef<'_>) -> bool {
-    element_has_token(
-        element,
-        "epub:type",
-        Some(EPUB_NAMESPACE),
-        "type",
-        "noteref",
-    ) || element_has_token(element, "role", None, "role", "doc-noteref")
+    element
+        .epub_types()
+        .any(|token| token.eq_ignore_ascii_case("noteref"))
+        || element
+            .aria_roles()
+            .any(|token| token.eq_ignore_ascii_case("doc-noteref"))
 }
 
 pub fn element_is_note_target(element: ElementRef<'_>) -> bool {
-    ["footnote", "endnote", "rearnote"].iter().any(|kind| {
-        element_has_token(
-            element,
-            "epub:type",
-            Some(EPUB_NAMESPACE),
-            "type",
-            kind,
-        )
-    }) || ["doc-footnote", "doc-endnote"]
-        .iter()
-        .any(|role| element_has_token(element, "role", None, "role", role))
+    element.epub_types().any(|token| {
+        ["footnote", "endnote", "rearnote"]
+            .iter()
+            .any(|kind| token.eq_ignore_ascii_case(kind))
+    }) || element.aria_roles().any(|token| {
+        ["doc-footnote", "doc-endnote"]
+            .iter()
+            .any(|role| token.eq_ignore_ascii_case(role))
+    })
 }
 
 #[cfg(test)]

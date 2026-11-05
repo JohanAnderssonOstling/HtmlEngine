@@ -1,0 +1,62 @@
+{
+  "recorded_on": "2026-11-01",
+  "wpt_revision": "7ea3d665ff9ae1df1f742433d51bd1e9c6499a3b",
+  "scope": "Version alignment notes; no changes to pinned syntax acceptance, assertion statuses or denominators in this optimization stage.",
+  "findings": [
+    {
+      "finding": "column-user-action-syntax-version-review",
+      "keys": [
+        "css-multicol/parsing/column-pseudo-invalid.html|line=8|ordinal=0|kind=InvalidSelector|expected=invalid|actual=valid"
+      ],
+      "observation": "The pinned test expects ::column:hover to be invalid. Current Selectors 4 section 3.6.3 broadly allows user-action pseudo-classes after pseudo-elements. Multi-column 2 specifies only a scroll-marker sub-pseudo-element, without an explicit user-action grammar prohibition in the inspected text.",
+      "decision": "Do not introduce a new column hover rejection while specification targeting remains unresolved. Other column-chain candidates require ordering checks in the native AST; they were not changed in this performance follow-up.",
+      "sources": [
+        "https://drafts.csswg.org/selectors-4/#pseudo-element-states",
+        "https://drafts.csswg.org/css-multicol-2/#column-pseudo"
+      ]
+    },
+    {
+      "finding": "previous-user-action-fixes-remain-pinned-audit-results",
+      "keys": [
+        "css-pseudo/parsing/highlight-pseudos-search-text.tentative.html|line=24|ordinal=0|kind=InvalidSelector|expected=invalid|actual=valid",
+        "css-pseudo/parsing/highlight-pseudos.html|line=19|ordinal=0|kind=InvalidSelector|expected=invalid|actual=valid",
+        "css-pseudo/parsing/highlight-pseudos.html|line=19|ordinal=1|kind=InvalidSelector|expected=invalid|actual=valid",
+        "css-pseudo/parsing/highlight-pseudos.html|line=19|ordinal=2|kind=InvalidSelector|expected=invalid|actual=valid",
+        "css-pseudo/parsing/highlight-pseudos.html|line=19|ordinal=3|kind=InvalidSelector|expected=invalid|actual=valid",
+        "css-view-transitions/parsing/pseudo-elements-invalid.html|line=31|ordinal=2|kind=InvalidSelector|expected=invalid|actual=valid",
+        "css-view-transitions/parsing/pseudo-elements-invalid.html|line=31|ordinal=3|kind=InvalidSelector|expected=invalid|actual=valid",
+        "css-view-transitions/parsing/pseudo-elements-invalid.html|line=39|ordinal=101|kind=InvalidSelector|expected=invalid|actual=valid",
+        "css-view-transitions/parsing/pseudo-elements-invalid.html|line=39|ordinal=102|kind=InvalidSelector|expected=invalid|actual=valid",
+        "css-view-transitions/parsing/pseudo-elements-invalid.html|line=39|ordinal=112|kind=InvalidSelector|expected=invalid|actual=valid",
+        "css-view-transitions/parsing/pseudo-elements-invalid.html|line=39|ordinal=113|kind=InvalidSelector|expected=invalid|actual=valid",
+        "css-view-transitions/parsing/pseudo-elements-invalid.html|line=39|ordinal=123|kind=InvalidSelector|expected=invalid|actual=valid",
+        "css-view-transitions/parsing/pseudo-elements-invalid.html|line=39|ordinal=124|kind=InvalidSelector|expected=invalid|actual=valid",
+        "css-view-transitions/parsing/pseudo-elements-invalid.html|line=39|ordinal=13|kind=InvalidSelector|expected=invalid|actual=valid",
+        "css-view-transitions/parsing/pseudo-elements-invalid.html|line=39|ordinal=14|kind=InvalidSelector|expected=invalid|actual=valid",
+        "css-view-transitions/parsing/pseudo-elements-invalid.html|line=39|ordinal=24|kind=InvalidSelector|expected=invalid|actual=valid",
+        "css-view-transitions/parsing/pseudo-elements-invalid.html|line=39|ordinal=25|kind=InvalidSelector|expected=invalid|actual=valid",
+        "css-view-transitions/parsing/pseudo-elements-invalid.html|line=39|ordinal=2|kind=InvalidSelector|expected=invalid|actual=valid",
+        "css-view-transitions/parsing/pseudo-elements-invalid.html|line=39|ordinal=35|kind=InvalidSelector|expected=invalid|actual=valid",
+        "css-view-transitions/parsing/pseudo-elements-invalid.html|line=39|ordinal=36|kind=InvalidSelector|expected=invalid|actual=valid",
+        "css-view-transitions/parsing/pseudo-elements-invalid.html|line=39|ordinal=3|kind=InvalidSelector|expected=invalid|actual=valid",
+        "css-view-transitions/parsing/pseudo-elements-invalid.html|line=39|ordinal=46|kind=InvalidSelector|expected=invalid|actual=valid",
+        "css-view-transitions/parsing/pseudo-elements-invalid.html|line=39|ordinal=47|kind=InvalidSelector|expected=invalid|actual=valid",
+        "css-view-transitions/parsing/pseudo-elements-invalid.html|line=39|ordinal=57|kind=InvalidSelector|expected=invalid|actual=valid",
+        "css-view-transitions/parsing/pseudo-elements-invalid.html|line=39|ordinal=58|kind=InvalidSelector|expected=invalid|actual=valid",
+        "css-view-transitions/parsing/pseudo-elements-invalid.html|line=39|ordinal=68|kind=InvalidSelector|expected=invalid|actual=valid",
+        "css-view-transitions/parsing/pseudo-elements-invalid.html|line=39|ordinal=69|kind=InvalidSelector|expected=invalid|actual=valid",
+        "css-view-transitions/parsing/pseudo-elements-invalid.html|line=39|ordinal=79|kind=InvalidSelector|expected=invalid|actual=valid",
+        "css-view-transitions/parsing/pseudo-elements-invalid.html|line=39|ordinal=80|kind=InvalidSelector|expected=invalid|actual=valid",
+        "css-view-transitions/parsing/pseudo-elements-invalid.html|line=39|ordinal=90|kind=InvalidSelector|expected=invalid|actual=valid",
+        "css-view-transitions/parsing/pseudo-elements-invalid.html|line=39|ordinal=91|kind=InvalidSelector|expected=invalid|actual=valid"
+      ],
+      "observation": "The previous 31 rejection fixes satisfy pinned WPT assertions. Current Selectors 4 section 3.6.3 has broader user-action syntax permission. Highlight/view-transition module-specific rules and pinned tests need reconciliation before claiming current-draft conformance for those rejections.",
+      "decision": "Preserve existing pinned-audit behavior in this optimization stage and retain the earlier fixed statuses with their original scope. This note does not establish current-draft conformance or matching support.",
+      "sources": [
+        "https://drafts.csswg.org/selectors-4/#pseudo-element-states",
+        "https://drafts.csswg.org/css-pseudo-4/#highlight-selectors",
+        "https://drafts.csswg.org/css-view-transitions-1/#pseudo-elements"
+      ]
+    }
+  ]
+}

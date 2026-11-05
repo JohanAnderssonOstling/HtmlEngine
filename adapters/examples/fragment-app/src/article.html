@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Embedded HTML</title></head>
+<body>
+<h1>HTML inside your application</h1>
+<p>This window uses <strong>html-gpui</strong> directly. The application supplies
+the window and scroll container; the element lays out ordinary HTML and CSS.</p>
+<h2>Selection and copying</h2>
+<p>Drag to select text, double-click a word, or triple-click a paragraph. Use the
+platform copy shortcut to copy your selection.</p>
+<p>Text can contain Unicode: café, Ελληνικά, 日本語, and emoji 👩‍💻.</p>
+<h2>Layout belongs to the host</h2>
+<p>Resize this window to reflow the paragraphs. Scroll to see the rest of the
+document. This application has no reader session, page count, or column settings.</p>
+<ul>
+<li>Use this element for descriptions, help panels, and document previews.</li>
+<li>Supply CSS to control typography, spacing, and colors.</li>
+<li>Enable selection independently for each element.</li>
+</ul>
+<h2>Custom document surfaces</h2>
+<p>Applications that manage their own document layout can use the adapter's
+public shaping and painting backend with the framework-independent HTML engine.</p>
+<p>The reader adapter builds on the same backend when an application needs
+publication navigation and pagination.</p>
+</body>
+</html>

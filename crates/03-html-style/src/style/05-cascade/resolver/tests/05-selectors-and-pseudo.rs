@@ -1,3 +1,4 @@
+use html_style_model::computed_style;
 use super::*;
 
 #[test]
@@ -100,7 +101,7 @@ fn note_references_keep_link_color_without_default_underlines() {
         for (index, anchor) in anchors.into_iter().enumerate() {
             let style = document.style_for_node(anchor).expect("anchor style");
             assert_eq!(document.text_style(style).expect("text style").color, 0x0000FFFF, "all links retain their link color");
-            assert_eq!(document.background_style(style).expect("paint style").text_decoration.lines.underline(), index == 0, "only the ordinary link has a default underline (document {document_index}, anchor {index})");
+            assert_eq!(computed_style::text_decoration_lines_underline(document.background_style(style).expect("paint style").text_decoration.lines), index == 0, "only the ordinary link has a default underline (document {document_index}, anchor {index})");
         }
     }
 }

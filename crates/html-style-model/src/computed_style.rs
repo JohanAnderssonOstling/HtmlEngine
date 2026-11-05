@@ -1,21 +1,26 @@
+use crate::language;
+use crate::open_type;
+use crate::reader_style;
 mod paint;
-use unicode_script::{Script, UnicodeScript};
 pub use paint::StylePaintColors;
+use unicode_script::{Script, UnicodeScript};
 
 use html_dom::{Document, DocumentLineage, DomNodeId, MemoryUsageReport, NodeRef};
+use html_dom::storage::StringTable;
 use kurbo::Vec2;
 use rustc_data_structures::fx::{FxHashMap, FxHasher};
 use std::hash::{Hash, Hasher};
 use std::num::{NonZeroI16, NonZeroU16, NonZeroU32};
 use std::sync::atomic::{AtomicU32, Ordering};
-use crate::{ContentLanguage, LanguageId};
+use crate::{ContentLanguage, LanguageId, OpenTypeFeature};
+use std::sync::Arc;
 
 /// Implement bitwise `PartialEq`/`Eq`/`Hash` for a style sub-struct so it can be
 /// deduplicated in `StyleStore`. Float fields are compared and hashed by their
 /// bit pattern (exact equality), which is exactly what sharing identical computed
 /// styles needs.
 macro_rules! impl_style_key {
-    ($t:ty { $($f:ident),* } floats { $($ff:ident),* }) => {
+    ($t:ty { $($f:ident),* } floats { $($ff:tt),* }) => {
         impl PartialEq for $t {
             fn eq(&self, other: &Self) -> bool {
                 $( self.$f == other.$f && )* $( self.$ff.to_bits() == other.$ff.to_bits() && )* true
@@ -39,25 +44,36 @@ macro_rules! impl_style_key {
 ///
 /// CSS percentages remain relative to the used font size of the element where
 /// the inherited value is finally used. Lengths are resolved to absolute pixels
-/// during style computation, so keeping the two components separate preserves
-/// CSS inheritance semantics without exposing parser-specific calc trees to
-/// layout.
+/// during style computation. Metric-relative lengths retain their declaring
+/// font until shaping provides selected-face metrics. Neither form exposes
+/// parser-specific calc trees to layout.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TextSpacing {
     absolute_px: f32,
     font_size_fraction: f32,
+    x_height_px: f32,
+    ch_advance_px: f32,
+    cap_height_px: f32,
+    // One-based index of the declaring font in the style store. Inherited
+    // metric-relative lengths keep that font rather than using a child's.
+    metric_origin: u32,
 }
 
 impl TextSpacing {
     pub const ZERO: Self = Self {
         absolute_px: 0.0,
         font_size_fraction: 0.0,
+        x_height_px: 0.0,
+        ch_advance_px: 0.0,
+        cap_height_px: 0.0,
+        metric_origin: 0,
     };
 
     pub fn new(absolute_px: f32, font_size_fraction: f32) -> Option<Self> {
         (absolute_px.is_finite() && font_size_fraction.is_finite()).then_some(Self {
             absolute_px,
             font_size_fraction,
+            ..Self::ZERO
         })
     }
 
@@ -79,26 +95,22 @@ impl TextSpacing {
         resolved.clamp(-(f32::MAX as f64), f32::MAX as f64) as f32
     }
 
+    pub fn resolve_with_metrics(self, used_font_size: f32, x_height: f32, ch: f32, cap: f32) -> f32 {
+        let resolved = f64::from(self.absolute_px)
+            + f64::from(self.font_size_fraction) * f64::from(used_font_size)
+            + f64::from(self.x_height_px) * f64::from(x_height)
+            + f64::from(self.ch_advance_px) * f64::from(ch)
+            + f64::from(self.cap_height_px) * f64::from(cap);
+        resolved.clamp(-f64::from(f32::MAX), f64::from(f32::MAX)) as f32
+    }
+
     fn is_finite(self) -> bool {
-        self.absolute_px.is_finite() && self.font_size_fraction.is_finite()
+        [self.absolute_px, self.font_size_fraction, self.x_height_px,
+            self.ch_advance_px, self.cap_height_px].into_iter().all(f32::is_finite)
     }
 }
 
-impl PartialEq for TextSpacing {
-    fn eq(&self, other: &Self) -> bool {
-        self.absolute_px.to_bits() == other.absolute_px.to_bits()
-            && self.font_size_fraction.to_bits() == other.font_size_fraction.to_bits()
-    }
-}
-
-impl Eq for TextSpacing {}
-
-impl Hash for TextSpacing {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write_u32(self.absolute_px.to_bits());
-        state.write_u32(self.font_size_fraction.to_bits());
-    }
-}
+impl_style_key!(TextSpacing { metric_origin } floats { absolute_px, font_size_fraction, x_height_px, ch_advance_px, cap_height_px });
 
 /// Computed `tab-size`, represented without parser-specific units.
 ///
@@ -145,40 +157,15 @@ impl TabSize {
     }
 }
 
-impl PartialEq for TabSize {
-    fn eq(&self, other: &Self) -> bool {
-        self.kind == other.kind && self.value.to_bits() == other.value.to_bits()
-    }
-}
+impl_style_key!(TabSize { kind } floats { value });
 
-impl Eq for TabSize {}
-
-impl Hash for TabSize {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.kind.hash(state);
-        state.write_u32(self.value.to_bits());
-    }
-}
-
-/// Font properties (inherited)
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct OpenTypeFeature {
-    tag: [u8; 4],
-    value: u32,
-}
-
-impl OpenTypeFeature {
-    pub const fn new(tag: [u8; 4], value: u32) -> Self {
-        Self { tag, value }
-    }
-
-    pub const fn tag(self) -> [u8; 4] {
-        self.tag
-    }
-
-    pub const fn value(self) -> u32 {
-        self.value
-    }
+/// Permission to synthesize a slanted design when the selected face lacks one.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash)]
+pub enum FontSynthesisStyle {
+    #[default]
+    Auto,
+    None,
+    ObliqueOnly,
 }
 
 #[derive(Debug)]
@@ -201,6 +188,10 @@ pub struct Font {
     /// and for identifying the original weight level in the settings UI.
     pub reader_font_weight: Option<u16>,
     pub font_style: FontStyle,
+    /// CSS percentage: 100 selects normal width.
+    pub font_stretch: f32,
+    /// Authored oblique angle in degrees; zero for normal and italic faces.
+    pub font_oblique_angle: f32,
     pub font_family: Option<StyleStringId>,
     /// Independently selected family list for CJK glyphs.
     pub cjk_font_family: Option<StyleStringId>,
@@ -208,6 +199,8 @@ pub struct Font {
     /// `font-feature-settings` overrides the higher-level variant controls for
     /// duplicate tags regardless of declaration order.
     pub font_variant_caps_features: Vec<OpenTypeFeature>,
+    pub font_synthesis_small_caps: bool,
+    pub font_synthesis_style: FontSynthesisStyle,
     pub font_variant_numeric_features: Vec<OpenTypeFeature>,
     pub font_variant_ligature_features: Vec<OpenTypeFeature>,
     pub font_kerning_features: Vec<OpenTypeFeature>,
@@ -218,23 +211,12 @@ impl Clone for Font {
     #[inline]
     fn clone(&self) -> Self {
         Self {
-            font_size: self.font_size,
-            font_size_x_height_px: self.font_size_x_height_px,
-            font_size_ch_advance_px: self.font_size_ch_advance_px,
-            font_size_cap_height_px: self.font_size_cap_height_px,
-            font_size_root_ch: self.font_size_root_ch,
-            font_size_root_cap_height: self.font_size_root_cap_height,
-            font_size_root_line_height: self.font_size_root_line_height,
-            font_weight: self.font_weight,
-            reader_font_weight: self.reader_font_weight,
-            font_style: self.font_style,
-            font_family: self.font_family,
-            cjk_font_family: self.cjk_font_family,
             font_variant_caps_features: self.font_variant_caps_features.clone(),
             font_variant_numeric_features: self.font_variant_numeric_features.clone(),
             font_variant_ligature_features: self.font_variant_ligature_features.clone(),
             font_kerning_features: self.font_kerning_features.clone(),
             font_feature_settings: self.font_feature_settings.clone(),
+            ..*self
         }
     }
 
@@ -250,9 +232,13 @@ impl Clone for Font {
         self.font_weight = source.font_weight;
         self.reader_font_weight = source.reader_font_weight;
         self.font_style = source.font_style;
+        self.font_stretch = source.font_stretch;
+        self.font_oblique_angle = source.font_oblique_angle;
         self.font_family = source.font_family;
         self.cjk_font_family = source.cjk_font_family;
         self.font_variant_caps_features.clone_from(&source.font_variant_caps_features);
+        self.font_synthesis_small_caps = source.font_synthesis_small_caps;
+        self.font_synthesis_style = source.font_synthesis_style;
         self.font_variant_numeric_features.clone_from(&source.font_variant_numeric_features);
         self.font_variant_ligature_features.clone_from(&source.font_variant_ligature_features);
         self.font_kerning_features.clone_from(&source.font_kerning_features);
@@ -285,7 +271,7 @@ impl Font {
         {
             if let Some(index) = merged
                 .iter()
-                .position(|existing: &OpenTypeFeature| existing.tag == feature.tag)
+                .position(|existing: &OpenTypeFeature| open_type::open_type_feature_tag_bytes(*existing) == open_type::open_type_feature_tag_bytes(feature))
             {
                 merged[index] = feature;
             } else {
@@ -330,6 +316,8 @@ pub struct InheritedText {
     /// an inherited `start`/`end` can be re-resolved when a descendant changes
     /// `direction`.
     pub text_align_logical: LogicalTextAlign,
+    /// `justify-all` also justifies the last line when no explicit override exists.
+    pub text_align_justify_all: bool,
     pub text_align_last: TextAlign,
     pub text_align_last_logical: LogicalTextAlign,
     /// True when `text-align-last` was explicitly set to a non-`auto` value, so
@@ -339,6 +327,8 @@ pub struct InheritedText {
     pub text_indent_hanging: bool,
     pub text_indent_each_line: bool,
     pub white_space: WhiteSpace,
+    pub text_wrap_style: TextWrapStyle,
+    pub hanging_punctuation: HangingPunctuation,
     pub hyphens: Hyphens,
     /// Reader override; the publication value remains available when Book is selected.
     pub reader_hyphens: Option<Hyphens>,
@@ -428,20 +418,7 @@ impl Default for AspectRatio {
     }
 }
 
-impl PartialEq for AspectRatio {
-    fn eq(&self, other: &Self) -> bool {
-        self.auto == other.auto && self.preferred.to_bits() == other.preferred.to_bits()
-    }
-}
-
-impl Eq for AspectRatio {}
-
-impl Hash for AspectRatio {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.auto.hash(state);
-        state.write_u32(self.preferred.to_bits());
-    }
-}
+impl_style_key!(AspectRatio { auto } floats { preferred });
 
 /// Box model properties (reset)
 #[derive(Clone, Debug)]
@@ -563,6 +540,8 @@ pub struct TextBoxEdge {
 /// default entry rather than carrying grid track vectors in every box style.
 #[derive(Clone, Debug)]
 pub struct LayoutStyle {
+    /// Whether an absolute box would participate inline before blockification.
+    pub static_position_inline: bool,
     pub margin_top_auto: bool,
     pub margin_right_auto: bool,
     pub margin_bottom_auto: bool,
@@ -667,7 +646,7 @@ pub struct BorderRadii {
 
 /// Used corner radii after percentages and CSS overlap scaling are resolved.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct UsedBorderRadii {
+pub struct CornerRadii {
     pub top_left: (f32, f32),
     pub top_right: (f32, f32),
     pub bottom_right: (f32, f32),
@@ -726,37 +705,15 @@ fn ratio(available: f64, requested: f32) -> f32 {
     }
 }
 
-impl UsedBorderRadii {
-    pub fn is_zero(self) -> bool {
-        [
-            self.top_left,
-            self.top_right,
-            self.bottom_right,
-            self.bottom_left,
-        ]
-        .into_iter()
-        .all(|(x, y)| x == 0.0 && y == 0.0)
-    }
-
-    pub fn map(self, mut f: impl FnMut(f32, f32) -> (f32, f32)) -> Self {
-        Self {
-            top_left: f(self.top_left.0, self.top_left.1),
-            top_right: f(self.top_right.0, self.top_right.1),
-            bottom_right: f(self.bottom_right.0, self.bottom_right.1),
-            bottom_left: f(self.bottom_left.0, self.bottom_left.1),
-        }
-    }
-}
-
 impl UsedBorderRadiiSpec {
-    pub fn resolve(self, width: f64, height: f64) -> UsedBorderRadii {
+    pub fn resolve(self, width: f64, height: f64) -> CornerRadii {
         let resolve = |radius: UsedCornerRadius| {
             (
                 radius.x.resolve(width).max(0.0) as f32,
                 radius.y.resolve(height).max(0.0) as f32,
             )
         };
-        let mut used = UsedBorderRadii {
+        let mut used = CornerRadii {
             top_left: resolve(self.top_left),
             top_right: resolve(self.top_right),
             bottom_right: resolve(self.bottom_right),
@@ -794,29 +751,6 @@ impl TextDecorationLines {
     const OVERLINE: u8 = 2;
     const LINE_THROUGH: u8 = 4;
 
-    pub fn new(underline: bool, overline: bool, line_through: bool) -> Self {
-        Self(
-            ((underline as u8) * Self::UNDERLINE)
-                | ((overline as u8) * Self::OVERLINE)
-                | ((line_through as u8) * Self::LINE_THROUGH),
-        )
-    }
-
-    pub fn is_empty(self) -> bool {
-        self.0 == 0
-    }
-
-    pub fn underline(self) -> bool {
-        self.0 & Self::UNDERLINE != 0
-    }
-
-    pub fn overline(self) -> bool {
-        self.0 & Self::OVERLINE != 0
-    }
-
-    pub fn line_through(self) -> bool {
-        self.0 & Self::LINE_THROUGH != 0
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
@@ -1002,11 +936,11 @@ pub struct Background {
 }
 
 impl_style_key!(Font {
-    font_weight, reader_font_weight, font_style, font_family, cjk_font_family, font_variant_caps_features, font_variant_numeric_features,
+    font_weight, reader_font_weight, font_style, font_family, cjk_font_family, font_variant_caps_features, font_synthesis_small_caps, font_synthesis_style, font_variant_numeric_features,
     font_variant_ligature_features, font_kerning_features, font_feature_settings
-} floats { font_size, font_size_x_height_px, font_size_ch_advance_px, font_size_cap_height_px, font_size_root_ch, font_size_root_cap_height, font_size_root_line_height });
+} floats { font_stretch, font_oblique_angle, font_size, font_size_x_height_px, font_size_ch_advance_px, font_size_cap_height_px, font_size_root_ch, font_size_root_cap_height, font_size_root_line_height });
 impl_style_key!(InheritedText {
-    color, visibility, language, direction, letter_spacing, word_spacing, tab_size, text_align, text_align_logical, text_align_last, text_align_last_logical, text_align_last_explicit, text_indent, text_indent_hanging, text_indent_each_line, white_space, hyphens, reader_hyphens, word_break, line_break, overflow_wrap, widows, orphans, text_transform,
+    color, visibility, language, direction, letter_spacing, word_spacing, tab_size, text_align, text_align_logical, text_align_justify_all, text_align_last, text_align_last_logical, text_align_last_explicit, text_indent, text_indent_hanging, text_indent_each_line, white_space, text_wrap_style, hanging_punctuation, hyphens, reader_hyphens, word_break, line_break, overflow_wrap, widows, orphans, text_transform,
     quotes, list_style_type, list_style_position, list_style_image, line_height_normal, text_box_edge
 } floats { line_height, line_height_x_height_px, line_height_number, reader_word_spacing_factor });
 impl_style_key!(BoxModel {
@@ -1018,6 +952,7 @@ impl_style_key!(BoxModel {
     border_spacing_horizontal, border_spacing_vertical
 });
 impl_style_key!(LayoutStyle {
+    static_position_inline,
     margin_top_auto, margin_right_auto, margin_bottom_auto, margin_left_auto,
     position, z_index, inset_top, inset_right, inset_bottom, inset_left, break_before, break_after, break_inside,
     flex_direction, flex_wrap, flex_basis, order,
@@ -1164,7 +1099,7 @@ pub struct ComputedStyles {
     counter_directives: Vec<(u32, CounterDirectives)>,
     anonymous_box_styles: Vec<u32>,
     store: StyleStore,
-    strings: Vec<String>,
+    strings: Vec<Box<str>>,
 }
 
 /// Script and punctuation coverage for a reader's independent CJK font choice.
@@ -1246,58 +1181,6 @@ pub struct ThemeAdaptation {
     pub surface: u32,
 }
 
-impl ThemeAdaptation {
-    /// Places `colour` between [`Self::ink`] and [`Self::surface`] by its own
-    /// lightness, keeping its alpha.
-    ///
-    /// How much of its own colour it keeps depends on how much it had. A grey
-    /// is interpolated between the two ends outright, so a publication's white
-    /// becomes the reader's page — tint and all — rather than a neutral of the
-    /// same lightness sitting visibly on top of it. A colour keeps its hue and
-    /// saturation and moves only in lightness, because a red heading is a red
-    /// heading in any theme. Everything between is mixed in proportion.
-    ///
-    /// Fully transparent colours are returned untouched: they are not invisible
-    /// black, they are the absence of a colour, and re-lighting them would turn
-    /// a transparent background into a painted one.
-    pub fn adapt(self, colour: u32) -> u32 {
-        let alpha = colour & 0xff;
-        if alpha == 0 {
-            return colour;
-        }
-        let (ink_l, ink_a, ink_b) = srgb_to_oklab(self.ink);
-        let (surface_l, surface_a, surface_b) = srgb_to_oklab(self.surface);
-        let (l, a, b) = srgb_to_oklab(colour);
-        let position = l.clamp(0.0, 1.0);
-        let lightness = ink_l + (surface_l - ink_l) * position;
-
-        // Where the theme itself would put a neutral of this lightness.
-        let (themed_a, themed_b) = (
-            ink_a + (surface_a - ink_a) * position,
-            ink_b + (surface_b - ink_b) * position,
-        );
-        // Chroma rides on the a/b pair, so scaling it with the lightness change
-        // keeps a colour from turning fluorescent as it is lightened.
-        let scale = if l > 1e-6 {
-            (lightness / l).clamp(0.35, 1.6)
-        } else {
-            1.0
-        };
-        let (authored_a, authored_b) = (a * scale, b * scale);
-
-        // NEUTRAL_CHROMA is where a colour stops reading as a grey. Below it the
-        // theme's own tint takes over; above it the publisher's hue does.
-        const NEUTRAL_CHROMA: f32 = 0.035;
-        let weight = (a.hypot(b) / NEUTRAL_CHROMA).clamp(0.0, 1.0);
-        oklab_to_srgb(
-            lightness,
-            themed_a + (authored_a - themed_a) * weight,
-            themed_b + (authored_b - themed_b) * weight,
-            alpha,
-        )
-    }
-}
-
 fn srgb_to_linear(channel: u32) -> f32 {
     let value = channel as f32 / 255.0;
     if value <= 0.04045 {
@@ -1343,6 +1226,12 @@ fn oklab_to_srgb(lightness: f32, a: f32, b: f32, alpha: u32) -> u32 {
 }
 
 impl ReaderStyleOverrides {
+    /// Publisher faces remain needed when any reader font role uses them.
+    pub fn uses_publication_fonts(&self) -> bool {
+        self.font_family.is_none()
+            || (self.cjk_font_family.is_none() && self.cjk_font_fallback.is_some())
+    }
+
     fn cjk_family_for(&self, publication: Option<&str>) -> Option<String> {
         let family = self.cjk_font_family.as_deref().or(publication);
         match (family, self.cjk_font_fallback.as_deref()) {
@@ -1402,59 +1291,12 @@ impl ReaderStyleOverrides {
         }
         None
     }
-
-    /// Preferences that can affect text metrics, box generation, or geometry.
-    pub fn layout_overrides(&self) -> Self {
-        Self { foreground: None, link_foreground: None, background: None, theme: None, ..self.clone() }
-    }
-
-    /// Color preferences applied to the retained publication styles.
-    pub fn paint_overrides(&self) -> Self {
-        Self { foreground: self.foreground, link_foreground: self.link_foreground, background: self.background, theme: self.theme, ..Self::default() }
-    }
-
-    pub fn same_layout_preferences(&self, other: &Self) -> bool {
-        self.hyphens == other.hyphens
-            && self.font_weight_adjustment == other.font_weight_adjustment
-            && self.font_family == other.font_family
-            && self.cjk_font_family == other.cjk_font_family
-            && self.cjk_font_fallback == other.cjk_font_fallback
-            && self.serif_font_family == other.serif_font_family
-            && self.sans_serif_font_family == other.sans_serif_font_family
-            && self.monospace_font_family == other.monospace_font_family
-            && self.text_align == other.text_align
-            && self.word_spacing_factor.map(f32::to_bits) == other.word_spacing_factor.map(f32::to_bits)
-            && self.line_height.map(f32::to_bits) == other.line_height.map(f32::to_bits)
-            && self.paragraph_spacing_em.map(f32::to_bits) == other.paragraph_spacing_em.map(f32::to_bits)
-            && self.first_line_indent_em.map(f32::to_bits) == other.first_line_indent_em.map(f32::to_bits)
-            && self.canonical_font_size.map(f32::to_bits) == other.canonical_font_size.map(f32::to_bits)
-            && self.minimum_font_size.map(f32::to_bits) == other.minimum_font_size.map(f32::to_bits)
-            && self.strip_root_spacing == other.strip_root_spacing
-    }
 }
 
 impl PartialEq for ReaderStyleOverrides {
     fn eq(&self, other: &Self) -> bool {
-        self.hyphens == other.hyphens
-            && self.font_weight_adjustment == other.font_weight_adjustment
-            && self.font_family == other.font_family
-            && self.cjk_font_family == other.cjk_font_family
-            && self.cjk_font_fallback == other.cjk_font_fallback
-            && self.serif_font_family == other.serif_font_family
-            && self.sans_serif_font_family == other.sans_serif_font_family
-            && self.monospace_font_family == other.monospace_font_family
-            && self.text_align == other.text_align
-            && self.word_spacing_factor.map(f32::to_bits) == other.word_spacing_factor.map(f32::to_bits)
-            && self.line_height.map(f32::to_bits) == other.line_height.map(f32::to_bits)
-            && self.paragraph_spacing_em.map(f32::to_bits) == other.paragraph_spacing_em.map(f32::to_bits)
-            && self.first_line_indent_em.map(f32::to_bits) == other.first_line_indent_em.map(f32::to_bits)
-            && self.canonical_font_size.map(f32::to_bits) == other.canonical_font_size.map(f32::to_bits)
-            && self.minimum_font_size.map(f32::to_bits) == other.minimum_font_size.map(f32::to_bits)
-            && self.foreground == other.foreground
-            && self.link_foreground == other.link_foreground
-            && self.background == other.background
-            && self.strip_root_spacing == other.strip_root_spacing
-            && self.theme == other.theme
+        reader_style::same_layout_preferences(self, other)
+            && reader_style::same_paint_preferences(self, other)
     }
 }
 
@@ -1479,8 +1321,17 @@ mod custom_font_tests {
         for authored in [Hyphens::None, Hyphens::Manual, Hyphens::Auto] {
             let mut text = InheritedText { hyphens: authored, ..Default::default() };
             for selection in [Some(Hyphens::Auto), Some(Hyphens::None), None] {
-                let overrides = ReaderStyleOverrides { hyphens: selection, ..Default::default() };
-                assert_eq!(overrides.same_layout_preferences(&ReaderStyleOverrides::default()), selection.is_none());
+                let overrides = ReaderStyleOverrides {
+                    hyphens: selection,
+                    ..Default::default()
+                };
+                assert_eq!(
+                    reader_style::same_layout_preferences(
+                        &overrides,
+                        &ReaderStyleOverrides::default()
+                    ),
+                    selection.is_none()
+                );
                 apply_reader_text(&mut text, 16.0, 16.0, &overrides);
                 assert_eq!(text.hyphens, authored);
                 assert_eq!(text.reader_hyphens, selection);
@@ -1490,9 +1341,18 @@ mod custom_font_tests {
 
     #[test]
     fn reader_word_spacing_preserves_authored_values_without_accumulating() {
-        let mut text = InheritedText { word_spacing: TextSpacing::from_px(2.0).unwrap(), ..Default::default() };
-        let overrides = ReaderStyleOverrides { word_spacing_factor: Some(1.2), ..Default::default() };
-        assert!(!overrides.same_layout_preferences(&ReaderStyleOverrides::default()));
+        let mut text = InheritedText {
+            word_spacing: TextSpacing::from_px(2.0).unwrap(),
+            ..Default::default()
+        };
+        let overrides = ReaderStyleOverrides {
+            word_spacing_factor: Some(1.2),
+            ..Default::default()
+        };
+        assert!(!reader_style::same_layout_preferences(
+            &overrides,
+            &ReaderStyleOverrides::default()
+        ));
         for _ in 0..2 {
             apply_reader_text(&mut text, 16.0, 16.0, &overrides);
             assert_eq!(text.reader_word_spacing_factor, 1.2);
@@ -1511,10 +1371,35 @@ mod custom_font_tests {
     fn reader_weight_mapping_preserves_originals_and_resets_without_accumulating() {
         let document = Document::new();
         let mut builder = ComputedStylesBuilder::new(&document);
-        let regular = builder.push(Font::default(), Default::default(), Default::default(), Default::default(), Default::default()).unwrap();
-        let bold = builder.push(Font { font_weight: 600, ..Default::default() }, Default::default(), Default::default(), Default::default(), Default::default()).unwrap();
-        let overrides = ReaderStyleOverrides { font_weight_adjustment: 100, ..Default::default() };
-        assert!(!overrides.same_layout_preferences(&ReaderStyleOverrides::default()));
+        let regular = builder
+            .push(
+                Font::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            )
+            .unwrap();
+        let bold = builder
+            .push(
+                Font {
+                    font_weight: 600,
+                    ..Default::default()
+                },
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+            )
+            .unwrap();
+        let overrides = ReaderStyleOverrides {
+            font_weight_adjustment: 100,
+            ..Default::default()
+        };
+        assert!(!reader_style::same_layout_preferences(
+            &overrides,
+            &ReaderStyleOverrides::default()
+        ));
         builder.apply_reader_overrides(&document, &overrides);
         assert_eq!(builder.font_style(regular).unwrap().font_weight, 400);
         assert_eq!(builder.font_style(regular).unwrap().reader_font_weight, Some(500));
@@ -1562,9 +1447,18 @@ mod custom_font_tests {
             let indices = builder.push(Font { font_family: Some(family), ..Default::default() }, InheritedText::default(), Default::default(), Default::default(), Default::default()).unwrap();
             builder.apply_reader_overrides(&document, &overrides);
             let font = builder.font_style(indices).unwrap();
-            assert_eq!(font.font_family.and_then(|id| builder.string(id)), Some("Selected Latin"));
-            assert_eq!(font.cjk_font_family.and_then(|id| builder.string(id)), Some(expected.as_str()));
-            assert!(!ReaderStyleOverrides::default().same_layout_preferences(&overrides));
+            assert_eq!(
+                font.font_family.and_then(|id| builder.string(id)),
+                Some("Selected Latin")
+            );
+            assert_eq!(
+                font.cjk_font_family.and_then(|id| builder.string(id)),
+                Some(expected.as_str())
+            );
+            assert!(!reader_style::same_layout_preferences(
+                &ReaderStyleOverrides::default(),
+                &overrides
+            ));
         }
     }
 
@@ -1601,10 +1495,13 @@ mod custom_font_tests {
     fn changing_a_generic_font_invalidates_layout_but_not_paint_preferences() {
         let original = ReaderStyleOverrides::default();
         let changed = profile();
-        assert!(!original.same_layout_preferences(&changed));
+        assert!(!reader_style::same_layout_preferences(&original, &changed));
         assert_ne!(original, changed);
-        assert_eq!(original.paint_overrides(), changed.paint_overrides());
-        assert_eq!(changed.layout_overrides(), changed);
+        assert_eq!(
+            reader_style::paint_overrides(&original),
+            reader_style::paint_overrides(&changed)
+        );
+        assert_eq!(reader_style::layout_overrides(&changed), changed);
     }
 
     #[test]
@@ -1684,7 +1581,7 @@ mod theme_adaptation_tests {
     fn the_ends_of_the_range_land_on_the_reader_ink_and_surface() {
         for theme in [DARK, LIGHT] {
             for (author, expected) in [(0x000000ffu32, theme.ink), (0xffffffff, theme.surface)] {
-                let adapted = theme.adapt(author);
+                let adapted = theme_adaptation_adapt(theme, author);
                 for (got, want) in channels(adapted).iter().zip(channels(expected)) {
                     assert!(
                         got.abs_diff(want) <= 3,
@@ -1700,12 +1597,12 @@ mod theme_adaptation_tests {
     #[test]
     fn text_stays_on_the_far_side_of_its_background() {
         let (text, background) = (0x333333ff, 0xf0f0f0ff);
-        let dark = (DARK.adapt(text), DARK.adapt(background));
+        let dark = (theme_adaptation_adapt(DARK, text), theme_adaptation_adapt(DARK, background));
         assert!(
             luminance(dark.0) > luminance(dark.1),
             "on a dark page the darker ink must come out lighter than its background"
         );
-        let light = (LIGHT.adapt(text), LIGHT.adapt(background));
+        let light = (theme_adaptation_adapt(LIGHT, text), theme_adaptation_adapt(LIGHT, background));
         assert!(
             luminance(light.0) < luminance(light.1),
             "on a light page it must stay darker"
@@ -1717,7 +1614,7 @@ mod theme_adaptation_tests {
     #[test]
     fn a_colour_keeps_its_hue() {
         let crimson = 0xa13029ff;
-        let adapted = DARK.adapt(crimson);
+        let adapted = theme_adaptation_adapt(DARK, crimson);
         let [r, g, b, _] = channels(adapted);
         assert!(
             r > g && r > b,
@@ -1760,8 +1657,7 @@ pub struct ComputedStylesBuilder {
     counter_directives: Vec<(u32, CounterDirectives)>,
     element_nodes: Vec<bool>,
     store: StyleStore,
-    strings: Vec<String>,
-    string_dedup: FxHashMap<String, StyleStringId>,
+    strings: StringTable,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1968,6 +1864,8 @@ fn validate_style_string_id(
 impl Font {
     pub fn validate(&self, store_id: NonZeroU32) -> Result<(), ComputedStyleValueError> {
         must_be_non_negative("Font", "font_size", self.font_size)?;
+        must_be_non_negative("Font", "font_stretch", self.font_stretch)?;
+        must_be_finite("Font", "font_oblique_angle", self.font_oblique_angle)?;
         must_be_finite("Font", "font_size_x_height_px", self.font_size_x_height_px)?;
         must_be_finite(
             "Font",
@@ -2340,21 +2238,18 @@ impl LengthPct {
         allow_negative: bool,
     ) -> Result<(), ComputedStyleValueError> {
         match self {
-            LengthPct::Px(px) | LengthPct::Ex(px) | LengthPct::Ch(px) | LengthPct::Cap(px) => {
+            Self::Px(value)
+            | Self::Pct(value)
+            | Self::Ex(value)
+            | Self::Ch(value)
+            | Self::Cap(value) => {
                 if allow_negative {
-                    must_be_finite(property, field, *px)
+                    must_be_finite(property, field, *value)
                 } else {
-                    must_be_non_negative(property, field, *px)
+                    must_be_non_negative(property, field, *value)
                 }
             }
-            LengthPct::Pct(pct) => {
-                if allow_negative {
-                    must_be_finite(property, field, *pct)
-                } else {
-                    must_be_non_negative(property, field, *pct)
-                }
-            }
-            LengthPct::Calc {
+            Self::Calc {
                 absolute_px,
                 percentage,
                 x_height_px,
@@ -2383,18 +2278,15 @@ impl PreferredSize {
             Self::Auto | Self::Content | Self::MinContent | Self::MaxContent | Self::FitContent | Self::Stretch => {
                 Ok(())
             }
-            Self::Px(px) | Self::Ex(px) | Self::Ch(px) | Self::Cap(px) => {
+            Self::Px(value)
+            | Self::Percent(value)
+            | Self::Ex(value)
+            | Self::Ch(value)
+            | Self::Cap(value) => {
                 if allow_negative {
-                    must_be_finite(property, field, *px)
+                    must_be_finite(property, field, *value)
                 } else {
-                    must_be_non_negative(property, field, *px)
-                }
-            }
-            Self::Percent(pct) => {
-                if allow_negative {
-                    must_be_finite(property, field, *pct)
-                } else {
-                    must_be_non_negative(property, field, *pct)
+                    must_be_non_negative(property, field, *value)
                 }
             }
             Self::Calc {
@@ -2453,6 +2345,46 @@ impl std::fmt::Display for ComputedStylesValidationError {
 impl std::error::Error for ComputedStylesValidationError {}
 
 impl ComputedStylesBuilder {
+    pub fn default_indices(&self) -> StyleIndices {
+        self.store.default_indices()
+    }
+
+    pub fn style_for_node(&self, node_idx: DomNodeId) -> Option<StyleIndices> {
+        self.node_styles.get(node_idx.index()).copied().flatten()
+    }
+
+    pub fn view(&self, indices: StyleIndices) -> Option<StyleView<'_>> {
+        self.store.view(indices)
+    }
+
+    pub fn font_style(&self, indices: StyleIndices) -> Option<&Font> {
+        self.store.font_style(indices)
+    }
+
+    pub fn text_style(&self, indices: StyleIndices) -> Option<&InheritedText> {
+        self.store.text_style(indices)
+    }
+
+    pub fn box_model_style(&self, indices: StyleIndices) -> Option<&BoxModel> {
+        self.store.box_model_style(indices)
+    }
+
+    pub fn border_style(&self, indices: StyleIndices) -> Option<&Border> {
+        self.store.border_style(indices)
+    }
+
+    pub fn border_radii_style(&self, indices: StyleIndices) -> Option<&BorderRadii> {
+        self.store.border_radii_style(indices)
+    }
+
+    pub fn background_style(&self, indices: StyleIndices) -> Option<&Background> {
+        self.store.background_style(indices)
+    }
+
+    pub fn layout_style(&self, indices: StyleIndices) -> Option<&LayoutStyle> {
+        self.store.layout_style(indices)
+    }
+
     pub fn new(document: &Document) -> Self {
         let mut store = StyleStore::new(next_style_store_id());
         store.ensure_defaults();
@@ -2473,23 +2405,31 @@ impl ComputedStylesBuilder {
             counter_directives: Vec::new(),
             element_nodes,
             store,
-            strings: Vec::new(),
-            string_dedup: FxHashMap::default(),
+            strings: StringTable::default(),
         }
     }
 
-    pub fn intern_string(&mut self, value: &str) -> StyleStringId {
-        if let Some(&id) = self.string_dedup.get(value) {
-            return id;
+    /// Store a metric-relative computed length with its declaring font.
+    /// The coefficients already include that element's computed font size.
+    pub fn font_relative_text_spacing(&mut self, font: Font, components: [f32; 4]) -> Option<TextSpacing> {
+        if !components.into_iter().all(f32::is_finite) { return None; }
+        let [absolute_px, x_height_px, ch_advance_px, cap_height_px] = components;
+        if x_height_px == 0.0 && ch_advance_px == 0.0 && cap_height_px == 0.0 {
+            return TextSpacing::from_px(absolute_px);
         }
-        let id = StyleStringId {
+        let font_idx = intern_style(&mut self.store.font_styles, &mut self.store.font_dedup, font);
+        Some(TextSpacing {
+            absolute_px, x_height_px, ch_advance_px, cap_height_px,
+            metric_origin: font_idx.checked_add(1)?,
+            ..TextSpacing::ZERO
+        })
+    }
+
+    pub fn intern_string(&mut self, value: &str) -> StyleStringId {
+        StyleStringId {
             store_id: self.store.store_id,
-            index: self.strings.len() as u32,
-        };
-        let owned = value.to_owned();
-        self.string_dedup.insert(owned.clone(), id);
-        self.strings.push(owned);
-        id
+            index: self.strings.intern(value) as u32,
+        }
     }
 
     /// Parse each distinct declaration once, retaining a compact inherited ID.
@@ -2502,7 +2442,7 @@ impl ComputedStylesBuilder {
             return Some(id);
         }
         let language = ContentLanguage::parse(value);
-        let id = if let Some(&id) = self.store.language_dedup.get(language.as_str()) {
+        let id = if let Some(&id) = self.store.language_dedup.get(language::content_language_as_str(&language)) {
             id
         } else {
             let id = LanguageId {
@@ -2511,7 +2451,7 @@ impl ComputedStylesBuilder {
             };
             self.store
                 .language_dedup
-                .insert(language.as_str().to_owned(), id);
+                .insert(language::content_language_as_str(&language).to_owned(), id);
             self.store.languages.push(language);
             id
         };
@@ -2556,7 +2496,6 @@ impl ComputedStylesBuilder {
         (id.store_id == self.store.store_id)
             .then(|| self.strings.get(id.index as usize))
             .flatten()
-            .map(String::as_str)
     }
 
     pub fn push(
@@ -2620,8 +2559,13 @@ impl ComputedStylesBuilder {
             .push(font, text, box_model, border, background, layout, radii))
     }
 
-    pub fn default_indices(&self) -> StyleIndices {
-        self.store.default_indices()
+    fn element_node_index(&self, node_idx: DomNodeId) -> Result<usize, ComputedStylesBuildError> {
+        let node = node_idx.index();
+        match self.element_nodes.get(node) {
+            Some(true) => Ok(node),
+            Some(false) => Err(ComputedStylesBuildError::TextNodeCannotHaveStyle { node }),
+            None => Err(ComputedStylesBuildError::NodeOutOfBounds { node }),
+        }
     }
 
     pub fn set_node_style(
@@ -2629,13 +2573,7 @@ impl ComputedStylesBuilder {
         node_idx: DomNodeId,
         style: StyleIndices,
     ) -> Result<(), ComputedStylesBuildError> {
-        let node = node_idx.index();
-        let Some(is_element) = self.element_nodes.get(node).copied() else {
-            return Err(ComputedStylesBuildError::NodeOutOfBounds { node });
-        };
-        if !is_element {
-            return Err(ComputedStylesBuildError::TextNodeCannotHaveStyle { node });
-        }
+        let node = self.element_node_index(node_idx)?;
         let slot = &mut self.node_styles[node];
         *slot = Some(style);
         Ok(())
@@ -2662,25 +2600,11 @@ impl ComputedStylesBuilder {
         node_idx: DomNodeId,
         style: StyleIndices,
     ) -> Result<(), ComputedStylesBuildError> {
-        let node = node_idx.index();
-        let Some(is_element) = self.element_nodes.get(node).copied() else {
-            return Err(ComputedStylesBuildError::NodeOutOfBounds { node });
-        };
-        if !is_element {
-            return Err(ComputedStylesBuildError::TextNodeCannotHaveStyle { node });
-        }
+        let node = self.element_node_index(node_idx)?;
         if !self.store.contains(style) {
             return Err(ComputedStylesBuildError::InvalidStyleIndex { node });
         }
-        if let Some((_, existing)) = self
-            .before_first_letter_styles
-            .iter_mut()
-            .find(|(candidate, _)| *candidate == node as u32)
-        {
-            *existing = style;
-        } else {
-            self.before_first_letter_styles.push((node as u32, style));
-        }
+        set_node_value(&mut self.before_first_letter_styles, node as u32, style);
         Ok(())
     }
 
@@ -2712,13 +2636,7 @@ impl ComputedStylesBuilder {
         counters: CounterDirectives,
         before: bool,
     ) -> Result<(), ComputedStylesBuildError> {
-        let node = node_idx.index();
-        let Some(is_element) = self.element_nodes.get(node).copied() else {
-            return Err(ComputedStylesBuildError::NodeOutOfBounds { node });
-        };
-        if !is_element {
-            return Err(ComputedStylesBuildError::TextNodeCannotHaveStyle { node });
-        }
+        let node = self.element_node_index(node_idx)?;
         if !self.store.contains(style) {
             return Err(ComputedStylesBuildError::InvalidStyleIndex { node });
         }
@@ -2750,22 +2668,8 @@ impl ComputedStylesBuilder {
         node_idx: DomNodeId,
         counters: CounterDirectives,
     ) -> Result<(), ComputedStylesBuildError> {
-        let node = node_idx.index();
-        let Some(is_element) = self.element_nodes.get(node).copied() else {
-            return Err(ComputedStylesBuildError::NodeOutOfBounds { node });
-        };
-        if !is_element {
-            return Err(ComputedStylesBuildError::TextNodeCannotHaveStyle { node });
-        }
-        if let Some((_, existing)) = self
-            .counter_directives
-            .iter_mut()
-            .find(|(candidate, _)| *candidate == node as u32)
-        {
-            *existing = counters;
-        } else {
-            self.counter_directives.push((node as u32, counters));
-        }
+        let node = self.element_node_index(node_idx)?;
+        set_node_value(&mut self.counter_directives, node as u32, counters);
         Ok(())
     }
 
@@ -2775,13 +2679,7 @@ impl ComputedStylesBuilder {
         style: StyleIndices,
         first_line: bool,
     ) -> Result<(), ComputedStylesBuildError> {
-        let node = node_idx.index();
-        let Some(is_element) = self.element_nodes.get(node).copied() else {
-            return Err(ComputedStylesBuildError::NodeOutOfBounds { node });
-        };
-        if !is_element {
-            return Err(ComputedStylesBuildError::TextNodeCannotHaveStyle { node });
-        }
+        let node = self.element_node_index(node_idx)?;
         if !self.store.contains(style) {
             return Err(ComputedStylesBuildError::InvalidStyleIndex { node });
         }
@@ -2790,51 +2688,8 @@ impl ComputedStylesBuilder {
         } else {
             &mut self.first_letter_styles
         };
-        if let Some((_, existing)) = target
-            .iter_mut()
-            .find(|(candidate, _)| *candidate == node as u32)
-        {
-            *existing = style;
-        } else {
-            target.push((node as u32, style));
-        }
+        set_node_value(target, node as u32, style);
         Ok(())
-    }
-
-    pub fn style_for_node(&self, node_idx: DomNodeId) -> Option<StyleIndices> {
-        self.node_styles.get(node_idx.index()).copied().flatten()
-    }
-
-    pub fn view(&self, indices: StyleIndices) -> Option<StyleView<'_>> {
-        self.store.view(indices)
-    }
-
-    pub fn font_style(&self, indices: StyleIndices) -> Option<&Font> {
-        self.store.font_style(indices)
-    }
-
-    pub fn text_style(&self, indices: StyleIndices) -> Option<&InheritedText> {
-        self.store.text_style(indices)
-    }
-
-    pub fn box_model_style(&self, indices: StyleIndices) -> Option<&BoxModel> {
-        self.store.box_model_style(indices)
-    }
-
-    pub fn border_style(&self, indices: StyleIndices) -> Option<&Border> {
-        self.store.border_style(indices)
-    }
-
-    pub fn border_radii_style(&self, indices: StyleIndices) -> Option<&BorderRadii> {
-        self.store.border_radii_style(indices)
-    }
-
-    pub fn background_style(&self, indices: StyleIndices) -> Option<&Background> {
-        self.store.background_style(indices)
-    }
-
-    pub fn layout_style(&self, indices: StyleIndices) -> Option<&LayoutStyle> {
-        self.store.layout_style(indices)
     }
 
     /// Apply reader preferences after the author cascade, while styles still
@@ -3108,8 +2963,16 @@ impl ComputedStylesBuilder {
             counter_directives: self.counter_directives,
             anonymous_box_styles,
             store: self.store,
-            strings: self.strings,
+            strings: self.strings.into_strings(),
         })
+    }
+}
+
+fn set_node_value<T>(entries: &mut Vec<(u32, T)>, node: u32, value: T) {
+    if let Some((_, existing)) = entries.iter_mut().find(|(candidate, _)| *candidate == node) {
+        *existing = value;
+    } else {
+        entries.push((node, value));
     }
 }
 
@@ -3301,7 +3164,7 @@ fn apply_reader_text(
         text.line_height_normal = false;
     }
     if let Some(theme) = overrides.theme {
-        text.color = theme.adapt(text.color);
+        text.color = theme_adaptation_adapt(theme, text.color);
     }
     if let Some(color) = overrides.foreground {
         text.color = color;
@@ -3310,21 +3173,21 @@ fn apply_reader_text(
 
 fn apply_reader_background(background: &mut Background, theme: Option<ThemeAdaptation>) {
     let Some(theme) = theme else { return };
-    background.background_color = theme.adapt(background.background_color);
+    background.background_color = theme_adaptation_adapt(theme, background.background_color);
     if let DecorationColor::Rgba(color) = background.text_decoration.color {
-        background.text_decoration.color = DecorationColor::Rgba(theme.adapt(color));
+        background.text_decoration.color = DecorationColor::Rgba(theme_adaptation_adapt(theme, color));
     }
     if let DecorationColor::Rgba(color) = background.outline.color {
-        background.outline.color = DecorationColor::Rgba(theme.adapt(color));
+        background.outline.color = DecorationColor::Rgba(theme_adaptation_adapt(theme, color));
     }
 }
 
 fn apply_reader_border(border: &mut Border, text_color: u32, overrides: &ReaderStyleOverrides) {
     if let Some(theme) = overrides.theme {
-        border.border_top_color = theme.adapt(border.border_top_color);
-        border.border_right_color = theme.adapt(border.border_right_color);
-        border.border_bottom_color = theme.adapt(border.border_bottom_color);
-        border.border_left_color = theme.adapt(border.border_left_color);
+        border.border_top_color = theme_adaptation_adapt(theme, border.border_top_color);
+        border.border_right_color = theme_adaptation_adapt(theme, border.border_right_color);
+        border.border_bottom_color = theme_adaptation_adapt(theme, border.border_bottom_color);
+        border.border_left_color = theme_adaptation_adapt(theme, border.border_left_color);
     }
     if overrides.theme.is_some() || overrides.foreground.is_some() {
         border.cache_current_color(text_color);
@@ -3368,8 +3231,11 @@ fn apply_reader_text_alignment(text: &mut InheritedText, alignment: Option<TextA
     text.text_align = alignment;
     text.text_align_logical = LogicalTextAlign::Physical;
     if !text.text_align_last_explicit {
-        text.text_align_last = alignment;
-        text.text_align_last_logical = LogicalTextAlign::Physical;
+        (text.text_align_last, text.text_align_last_logical) = if alignment == TextAlign::Justify {
+            (if text.direction == TextDirection::Rtl { TextAlign::Right } else { TextAlign::Left }, LogicalTextAlign::Start)
+        } else {
+            (alignment, LogicalTextAlign::Physical)
+        };
     }
 }
 
@@ -3388,9 +3254,15 @@ fn reintern_with_reader_overrides(
         .font_style(indices)
         .expect("validated font style")
         .clone();
-    font.cjk_font_family = overrides.cjk_family_for(font.font_family.and_then(|id| source.string(id)))
-        .or_else(|| font.cjk_font_family.and_then(|id| source.string(id)).map(str::to_owned))
-        .as_deref().map(|family| builder.intern_string(family));
+    font.cjk_font_family = overrides
+        .cjk_family_for(font.font_family.and_then(|id| source.string(id)))
+        .or_else(|| {
+            font.cjk_font_family
+                .and_then(|id| source.string(id))
+                .map(str::to_owned)
+        })
+        .as_deref()
+        .map(|family| builder.intern_string(family));
     font.font_family = match overrides.family_for(font.font_family.and_then(|id| source.string(id)))
     {
         Some(family) => Some(builder.intern_string(family)),
@@ -3406,11 +3278,17 @@ fn reintern_with_reader_overrides(
         .expect("validated text style")
         .clone();
     apply_reader_text(&mut text, font.font_size, original_font_size, overrides);
+    for spacing in [&mut text.letter_spacing, &mut text.word_spacing] {
+        if let Some(origin) = source.text_spacing_origin(*spacing) {
+            let mapped = reintern_with_reader_overrides(source, builder, origin, overrides, false)?;
+            spacing.metric_origin = mapped.font_idx + 1;
+        }
+    }
     text.list_style_image = text
         .list_style_image
         .map(|id| reintern_style_string(source, builder, id));
     text.language = text.language.and_then(|id| {
-        builder.intern_language(source.language(id).expect("validated language handle").as_str())
+        builder.intern_language(language::content_language_as_str(&source.language(id).expect("validated language handle")))
     });
     if let QuoteStyle::Pairs(pairs) = text.quotes {
         text.quotes = QuoteStyle::Pairs(reintern_style_string(source, builder, pairs));
@@ -3467,6 +3345,46 @@ fn reintern_with_reader_overrides(
 }
 
 impl ComputedStyles {
+    pub fn default_indices(&self) -> StyleIndices {
+        self.store.default_indices()
+    }
+
+    pub fn style_for_node(&self, node_idx: DomNodeId) -> Option<StyleIndices> {
+        self.node_styles.get(node_idx.index()).copied().flatten()
+    }
+
+    pub fn view(&self, indices: StyleIndices) -> Option<StyleView<'_>> {
+        self.store.view(indices)
+    }
+
+    pub fn font_style(&self, indices: StyleIndices) -> Option<&Font> {
+        self.store.font_style(indices)
+    }
+
+    pub fn text_style(&self, indices: StyleIndices) -> Option<&InheritedText> {
+        self.store.text_style(indices)
+    }
+
+    pub fn box_model_style(&self, indices: StyleIndices) -> Option<&BoxModel> {
+        self.store.box_model_style(indices)
+    }
+
+    pub fn border_style(&self, indices: StyleIndices) -> Option<&Border> {
+        self.store.border_style(indices)
+    }
+
+    pub fn border_radii_style(&self, indices: StyleIndices) -> Option<&BorderRadii> {
+        self.store.border_radii_style(indices)
+    }
+
+    pub fn background_style(&self, indices: StyleIndices) -> Option<&Background> {
+        self.store.background_style(indices)
+    }
+
+    pub fn layout_style(&self, indices: StyleIndices) -> Option<&LayoutStyle> {
+        self.store.layout_style(indices)
+    }
+
     /// Apply preferences to existing computed styles. Changing
     /// `canonical_font_size` requires resolving the cascade again, since it
     /// also changes inherited values and font-relative box dimensions.
@@ -3585,10 +3503,6 @@ impl ComputedStyles {
         self.node_styles.len()
     }
 
-    pub fn style_for_node(&self, node_idx: DomNodeId) -> Option<StyleIndices> {
-        self.node_styles.get(node_idx.index()).copied().flatten()
-    }
-
     /// Whether a first-letter style can apply to publication or generated text.
     pub fn has_first_letter_styles(&self) -> bool {
         !self.first_letter_styles.is_empty() || !self.before_first_letter_styles.is_empty()
@@ -3600,6 +3514,47 @@ impl ComputedStyles {
         !self.first_line_styles.is_empty()
     }
 
+    /// Handles bound to document nodes or pseudo-elements, including generated
+    /// text variants. Traversal is linear in the stored bindings; handles may
+    /// repeat. Formatting-created anonymous styles belong to the box tree.
+    pub fn bound_styles(&self) -> impl Iterator<Item = StyleIndices> + '_ {
+        self.node_styles
+            .iter()
+            .flatten()
+            .copied()
+            .chain(self.text_pseudo_styles())
+            .chain(
+                self.before_styles
+                    .iter()
+                    .chain(&self.after_styles)
+                    .map(|pseudo| pseudo.style),
+            )
+    }
+
+    /// Fonts captured by inherited spacing lengths may have no formatting
+    /// box (for example, display:contents). Shaping resolves them explicitly.
+    pub fn text_spacing_origins(&self) -> impl Iterator<Item = StyleIndices> + '_ {
+        self.store.text_styles.iter()
+            .flat_map(|text| [text.letter_spacing, text.word_spacing])
+            .filter_map(|spacing| self.text_spacing_origin(spacing))
+    }
+
+    pub fn text_spacing_origin(&self, spacing: TextSpacing) -> Option<StyleIndices> {
+        spacing.metric_origin.checked_sub(1).map(|font_idx| StyleIndices {
+            font_idx,
+            ..self.default_indices()
+        })
+    }
+
+    /// Style handles used by first-line and first-letter text without their
+    /// own formatting boxes. Shaping resolves their font-relative metrics.
+    pub fn text_pseudo_styles(&self) -> impl Iterator<Item = StyleIndices> + '_ {
+        self.first_line_styles
+            .iter()
+            .chain(&self.first_letter_styles)
+            .chain(&self.before_first_letter_styles)
+            .map(|&(_, style)| style)
+    }
     pub fn first_line_style_for_node(&self, node_idx: DomNodeId) -> Option<StyleIndices> {
         self.first_line_styles
             .iter()
@@ -3622,17 +3577,28 @@ impl ComputedStyles {
         &self,
         node_idx: DomNodeId,
     ) -> Option<(StyleIndices, &GeneratedContent, &CounterDirectives)> {
-        self.before_styles
-            .iter()
-            .find(|pseudo| pseudo.node == node_idx.raw())
-            .map(|pseudo| (pseudo.style, &pseudo.content, &pseudo.counters))
+        self.generated_pseudo_for_node(node_idx, true)
     }
 
     pub fn after_style_for_node(
         &self,
         node_idx: DomNodeId,
     ) -> Option<(StyleIndices, &GeneratedContent, &CounterDirectives)> {
-        self.after_styles
+        self.generated_pseudo_for_node(node_idx, false)
+    }
+
+    /// Computed content and counters for an element's `::before` or `::after`.
+    pub fn generated_pseudo_for_node(
+        &self,
+        node_idx: DomNodeId,
+        before: bool,
+    ) -> Option<(StyleIndices, &GeneratedContent, &CounterDirectives)> {
+        let pseudos = if before {
+            &self.before_styles
+        } else {
+            &self.after_styles
+        };
+        pseudos
             .iter()
             .find(|pseudo| pseudo.node == node_idx.raw())
             .map(|pseudo| (pseudo.style, &pseudo.content, &pseudo.counters))
@@ -3648,17 +3614,13 @@ impl ComputedStyles {
         (id.store_id == self.store.store_id)
             .then(|| self.strings.get(id.index as usize))
             .flatten()
-            .map(String::as_str)
+            .map(Box::as_ref)
     }
 
     pub fn language(&self, id: LanguageId) -> Option<&ContentLanguage> {
         (id.store_id == self.store.store_id)
             .then(|| self.store.languages.get(id.index as usize))
             .flatten()
-    }
-
-    pub fn default_indices(&self) -> StyleIndices {
-        self.store.default_indices()
     }
 
     /// Preserve inherited parts for an anonymous box while resetting its
@@ -3746,10 +3708,6 @@ impl ComputedStyles {
         Ok(())
     }
 
-    pub fn view(&self, indices: StyleIndices) -> Option<StyleView<'_>> {
-        self.store.view(indices)
-    }
-
     /// Construct the only style view accepted by layout for font-relative
     /// lengths. The ratio is supplied by shaping after selecting a font face.
     pub fn used_view(
@@ -3785,102 +3743,50 @@ impl ComputedStyles {
         let root_relative =
             RootRelativeLengths::new(root_ch_px, root_cap_height_px, root_line_height_px)?;
         self.view(indices).map(|computed| UsedStyleView {
+            resolved_text_spacing: (
+                computed.text.letter_spacing.resolve_with_metrics(computed.font_size(), x_height_ratio, ch_advance_ratio, cap_height_ratio),
+                computed.text.word_spacing.resolve_with_metrics(computed.font_size(), x_height_ratio, ch_advance_ratio, cap_height_ratio),
+            ),
             computed,
             font_relative,
             root_relative,
             paint: None,
+            normal_line_height_ratio: None,
         })
-    }
-
-    pub fn font_style(&self, indices: StyleIndices) -> Option<&Font> {
-        self.store.font_style(indices)
-    }
-
-    pub fn text_style(&self, indices: StyleIndices) -> Option<&InheritedText> {
-        self.store.text_style(indices)
-    }
-
-    pub fn box_model_style(&self, indices: StyleIndices) -> Option<&BoxModel> {
-        self.store.box_model_style(indices)
-    }
-
-    pub fn border_style(&self, indices: StyleIndices) -> Option<&Border> {
-        self.store.border_style(indices)
-    }
-
-    pub fn border_radii_style(&self, indices: StyleIndices) -> Option<&BorderRadii> {
-        self.store.border_radii_style(indices)
-    }
-
-    pub fn background_style(&self, indices: StyleIndices) -> Option<&Background> {
-        self.store.background_style(indices)
-    }
-
-    pub fn layout_style(&self, indices: StyleIndices) -> Option<&LayoutStyle> {
-        self.store.layout_style(indices)
     }
 
     pub fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
-        report.add_slice_storage::<Option<StyleIndices>>(
-            "ComputedStyles.node_styles.storage",
-            self.node_styles.capacity(),
-            self.node_styles.len(),
-        );
-        report.add_slice_storage::<(u32, StyleIndices)>(
+        report.add_vec_storage("ComputedStyles.node_styles.storage", &self.node_styles);
+        report.add_vec_storage(
             "ComputedStyles.first_line_styles.storage",
-            self.first_line_styles.capacity(),
-            self.first_line_styles.len(),
+            &self.first_line_styles,
         );
-        report.add_slice_storage::<(u32, StyleIndices)>(
+        report.add_vec_storage(
             "ComputedStyles.first_letter_styles.storage",
-            self.first_letter_styles.capacity(),
-            self.first_letter_styles.len(),
+            &self.first_letter_styles,
         );
-        report.add_slice_storage::<(u32, StyleIndices)>(
+        report.add_vec_storage(
             "ComputedStyles.before_first_letter_styles.storage",
-            self.before_first_letter_styles.capacity(),
-            self.before_first_letter_styles.len(),
+            &self.before_first_letter_styles,
         );
-        report.add_slice_storage::<GeneratedPseudoStyle>(
-            "ComputedStyles.before_styles.storage",
-            self.before_styles.capacity(),
-            self.before_styles.len(),
-        );
-        report.add_slice_storage::<GeneratedPseudoStyle>(
-            "ComputedStyles.after_styles.storage",
-            self.after_styles.capacity(),
-            self.after_styles.len(),
-        );
-        report.add_slice_storage::<(u32, CounterDirectives)>(
+        report.add_vec_storage("ComputedStyles.before_styles.storage", &self.before_styles);
+        report.add_vec_storage("ComputedStyles.after_styles.storage", &self.after_styles);
+        report.add_vec_storage(
             "ComputedStyles.counter_directives.storage",
-            self.counter_directives.capacity(),
-            self.counter_directives.len(),
+            &self.counter_directives,
         );
         for (_, counters) in &self.counter_directives {
-            report.add_slice_storage::<CounterDirective>(
-                "ComputedStyles.counter_directives.resets",
-                counters.resets.capacity(),
-                counters.resets.len(),
-            );
-            report.add_slice_storage::<CounterDirective>(
+            report.add_vec_storage("ComputedStyles.counter_directives.resets", &counters.resets);
+            report.add_vec_storage(
                 "ComputedStyles.counter_directives.increments",
-                counters.increments.capacity(),
-                counters.increments.len(),
+                &counters.increments,
             );
         }
         report.extend_prefixed("ComputedStyles.store", self.store.memory_usage_report());
-        report.add_slice_storage::<String>(
-            "ComputedStyles.strings.storage",
-            self.strings.capacity(),
-            self.strings.len(),
-        );
+        report.add_vec_storage("ComputedStyles.strings.storage", &self.strings);
         for value in &self.strings {
-            report.add(
-                "ComputedStyles.strings.contents",
-                value.capacity(),
-                value.len(),
-            );
+            report.add("ComputedStyles.strings.contents", value.len(), value.len());
         }
         report
     }
@@ -4256,69 +4162,31 @@ impl StyleStore {
 
     pub fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
-        report.add_slice_storage::<Font>(
-            "StyleStore.font_styles.storage",
-            self.font_styles.capacity(),
-            self.font_styles.len(),
-        );
-        report.add_slice_storage::<ContentLanguage>(
-            "StyleStore.languages.storage",
-            self.languages.capacity(),
-            self.languages.len(),
-        );
+        report.add_vec_storage("StyleStore.font_styles.storage", &self.font_styles);
+        report.add_vec_storage("StyleStore.languages.storage", &self.languages);
         for language in &self.languages {
             report.add(
                 "StyleStore.languages.contents",
-                language.as_str().len(),
-                language.as_str().len(),
+                language::content_language_as_str(&language).len(),
+                language::content_language_as_str(&language).len(),
             );
         }
-        report.add_slice_storage::<(String, LanguageId)>(
-            "StyleStore.language_dedup.storage",
-            self.language_dedup.capacity(),
-            self.language_dedup.len(),
-        );
+        report.add_hash_map_storage("StyleStore.language_dedup.storage", &self.language_dedup);
         for declaration in self.language_dedup.keys() {
-            report.add(
-                "StyleStore.language_dedup.keys",
-                declaration.capacity(),
-                declaration.len(),
-            );
+            report.add_string_storage("StyleStore.language_dedup.keys", declaration);
         }
-        report.add_slice_storage::<InheritedText>(
-            "StyleStore.text_styles.storage",
-            self.text_styles.capacity(),
-            self.text_styles.len(),
-        );
-        report.add_slice_storage::<BoxModel>(
-            "StyleStore.box_styles.storage",
-            self.box_styles.capacity(),
-            self.box_styles.len(),
-        );
-        report.add_slice_storage::<Border>(
-            "StyleStore.border_styles.storage",
-            self.border_styles.capacity(),
-            self.border_styles.len(),
-        );
-        report.add_slice_storage::<BorderRadii>(
+        report.add_vec_storage("StyleStore.text_styles.storage", &self.text_styles);
+        report.add_vec_storage("StyleStore.box_styles.storage", &self.box_styles);
+        report.add_vec_storage("StyleStore.border_styles.storage", &self.border_styles);
+        report.add_vec_storage(
             "StyleStore.border_radii_styles.storage",
-            self.border_radii_styles.capacity(),
-            self.border_radii_styles.len(),
+            &self.border_radii_styles,
         );
-        report.add_slice_storage::<Background>(
-            "StyleStore.bg_styles.storage",
-            self.bg_styles.capacity(),
-            self.bg_styles.len(),
-        );
-        report.add_slice_storage::<LayoutStyle>(
-            "StyleStore.layout_styles.storage",
-            self.layout_styles.capacity(),
-            self.layout_styles.len(),
-        );
-        report.add_slice_storage::<ComputedSizeExpression>(
+        report.add_vec_storage("StyleStore.bg_styles.storage", &self.bg_styles);
+        report.add_vec_storage("StyleStore.layout_styles.storage", &self.layout_styles);
+        report.add_vec_storage(
             "StyleStore.size_expressions.storage",
-            self.size_expressions.capacity(),
-            self.size_expressions.len(),
+            &self.size_expressions,
         );
         for (label, dedup) in [
             ("font", &self.font_dedup),
@@ -4330,21 +4198,16 @@ impl StyleStore {
             ("layout", &self.layout_dedup),
             ("size_expression", &self.size_expression_dedup),
         ] {
-            report.add_slice_storage::<(u64, u32)>(
-                format!("StyleStore.{label}_dedup.storage"),
-                dedup.indices.capacity(),
-                dedup.indices.len(),
-            );
-            report.add_slice_storage::<(u64, Vec<u32>)>(
+            report
+                .add_hash_map_storage(format!("StyleStore.{label}_dedup.storage"), &dedup.indices);
+            report.add_hash_map_storage(
                 format!("StyleStore.{label}_dedup_collisions.storage"),
-                dedup.collisions.capacity(),
-                dedup.collisions.len(),
+                &dedup.collisions,
             );
             for indices in dedup.collisions.values() {
-                report.add_slice_storage::<u32>(
+                report.add_vec_storage(
                     format!("StyleStore.{label}_dedup_collisions.indices"),
-                    indices.capacity(),
-                    indices.len(),
+                    indices,
                 );
             }
         }
@@ -4371,9 +4234,11 @@ pub struct StyleView<'a> {
 #[derive(Clone, Copy, Debug)]
 pub struct UsedStyleView<'a> {
     computed: StyleView<'a>,
+    resolved_text_spacing: (f32, f32),
     paint: Option<&'a StylePaintColors>,
     font_relative: FontRelativeRatios,
     root_relative: RootRelativeLengths,
+    normal_line_height_ratio: Option<f32>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -4422,7 +4287,27 @@ impl FontRelativeRatios {
     }
 }
 
+// Computed and used styles apply the same edge policy with different length types.
+macro_rules! inline_edges_accessor {
+    ($zero:expr) => {
+        /// Horizontal edges that interrupt otherwise adjacent inline text.
+        pub fn inline_edges(&self) -> (bool, bool) {
+            (
+                !self.margin_left().is_zero()
+                    || !self.padding_left().is_zero()
+                    || (self.border_left_width() != $zero
+                        && self.border_left_style().paints_stroke()),
+                !self.margin_right().is_zero()
+                    || !self.padding_right().is_zero()
+                    || (self.border_right_width() != $zero
+                        && self.border_right_style().paints_stroke()),
+            )
+        }
+    };
+}
+
 impl<'a> StyleView<'a> {
+    inline_edges_accessor!(FontRelativeLength::ZERO);
     // Font accessors
     pub fn font_size(&self) -> f32 {
         self.font.font_size
@@ -4468,7 +4353,7 @@ impl<'a> StyleView<'a> {
         self.font
             .font_variant_caps_features
             .iter()
-            .any(|feature| feature.tag == *b"smcp" && feature.value != 0)
+            .any(|feature| open_type::open_type_feature_tag_bytes(*(feature)) == *b"smcp" && open_type::open_type_feature_value(*(feature)) != 0)
     }
     pub fn open_type_features(&self) -> Vec<OpenTypeFeature> {
         self.font.open_type_features()
@@ -4499,6 +4384,12 @@ impl<'a> StyleView<'a> {
     pub fn resolved_line_height(&self, x_height_ratio: f32) -> Option<f32> {
         (x_height_ratio.is_finite() && x_height_ratio > 0.0)
             .then_some(self.text.line_height + self.text.line_height_x_height_px * x_height_ratio)
+    }
+    /// Resolve normal leading or an authored height using the selected
+    /// font's resolved size and x-height ratio.
+    pub fn used_line_height(&self, font_size: f32, x_height_ratio: f32) -> Option<f64> {
+        self.resolved_line_height(x_height_ratio)
+            .map(|height| used_line_height(self.line_height_is_normal(), font_size, height))
     }
     pub fn line_height_is_normal(&self) -> bool {
         self.text.line_height_normal
@@ -4534,6 +4425,12 @@ impl<'a> StyleView<'a> {
     }
     pub fn white_space(&self) -> WhiteSpace {
         self.text.white_space
+    }
+    pub fn text_wrap_style(&self) -> TextWrapStyle {
+        self.text.text_wrap_style
+    }
+    pub fn hanging_punctuation(&self) -> HangingPunctuation {
+        self.text.hanging_punctuation
     }
     pub fn hyphens(&self) -> Hyphens {
         self.text.reader_hyphens.unwrap_or(self.text.hyphens)
@@ -4858,6 +4755,8 @@ impl<'a> StyleView<'a> {
             ]
             .into_iter()
             .any(FontRelativeLength::requires_font_metrics)
+            || self.text.letter_spacing.metric_origin != 0
+            || self.text.word_spacing.metric_origin != 0
             || radii
             || decoration
             || self.background.outline.width.requires_font_metrics()
@@ -4878,15 +4777,23 @@ impl<'a> StyleView<'a> {
     }
 }
 
-fn used_border_width(style: BorderStyle, width: f32) -> f32 {
-    if matches!(style, BorderStyle::None | BorderStyle::Hidden) {
-        0.0
+fn used_line_height(normal: bool, font_size: f32, authored_height: f32) -> f64 {
+    if normal {
+        f64::from(font_size) * 1.2
     } else {
+        f64::from(authored_height.max(0.0))
+    }
+}
+fn used_border_width(style: BorderStyle, width: f32) -> f32 {
+    if style.paints_stroke() {
         width
+    } else {
+        0.0
     }
 }
 
 impl<'a> UsedStyleView<'a> {
+    inline_edges_accessor!(0.0);
     /// Attach paint values while retaining the same resolved geometry style.
     pub fn with_paint_colors(mut self, colors: &'a StylePaintColors) -> Self {
         self.paint = Some(colors);
@@ -4929,14 +4836,36 @@ impl<'a> UsedStyleView<'a> {
         self.computed.text.line_height
             + self.computed.text.line_height_x_height_px * self.font_relative.x_height
     }
+    /// Line-box height with normal leading and font-relative units resolved.
+    /// Font-specific conformance policies (such as Ahem) remain in layout.
+    pub fn resolved_line_height(&self) -> f64 {
+        if self.line_height_is_normal()
+            && let Some(ratio) = self.normal_line_height_ratio
+        {
+            return f64::from(self.font_size() * ratio);
+        }
+        self.computed
+            .used_line_height(self.font_size(), self.font_relative.x_height)
+            .expect("used styles have validated font metrics")
+    }
+
+    /// Add selected-face normal leading without changing authored line heights.
+    pub fn with_normal_line_height_ratio(mut self, ratio: Option<f32>) -> Self {
+        self.normal_line_height_ratio = ratio.filter(|ratio| ratio.is_finite() && *ratio > 0.0);
+        self
+    }
     pub fn line_height_is_normal(&self) -> bool {
         self.computed.line_height_is_normal()
     }
+    pub fn with_resolved_text_spacing(mut self, letter: f32, word: f32) -> Self {
+        self.resolved_text_spacing = (letter, word);
+        self
+    }
     pub fn letter_spacing(&self) -> f32 {
-        self.computed.letter_spacing()
+        self.resolved_text_spacing.0
     }
     pub fn word_spacing(&self) -> f32 {
-        self.computed.word_spacing()
+        self.resolved_text_spacing.1
     }
     pub fn word_spacing_factor(&self) -> f32 {
         self.computed.word_spacing_factor()
@@ -4960,6 +4889,12 @@ impl<'a> UsedStyleView<'a> {
     }
     pub fn white_space(&self) -> WhiteSpace {
         self.computed.white_space()
+    }
+    pub fn text_wrap_style(&self) -> TextWrapStyle {
+        self.computed.text_wrap_style()
+    }
+    pub fn hanging_punctuation(&self) -> HangingPunctuation {
+        self.computed.hanging_punctuation()
     }
     pub fn hyphens(&self) -> Hyphens {
         self.computed.hyphens()
@@ -5409,6 +5344,16 @@ impl<'a> UsedStyleView<'a> {
         self.padding_top().resolve(cb_width).max(0.0)
             + self.padding_bottom().resolve(cb_width).max(0.0)
     }
+    pub fn get_horizontal_padding_border(&self, cb_width: f64) -> f64 {
+        self.get_horizontal_padding(cb_width)
+            + self.border_left_width() as f64
+            + self.border_right_width() as f64
+    }
+    pub fn get_vertical_padding_border(&self, cb_width: f64) -> f64 {
+        self.get_vertical_padding(cb_width)
+            + self.border_top_width() as f64
+            + self.border_bottom_width() as f64
+    }
     pub fn get_top_left_padding(&self, cb_width: f64) -> Vec2 {
         Vec2::new(
             self.padding_left().resolve(cb_width),
@@ -5437,9 +5382,13 @@ impl Default for Font {
             font_weight: 400,
             reader_font_weight: None,
             font_style: FontStyle::Normal,
+            font_stretch: 100.0,
+            font_oblique_angle: 0.0,
             font_family: None,
             cjk_font_family: None,
             font_variant_caps_features: Vec::new(),
+            font_synthesis_small_caps: true,
+            font_synthesis_style: FontSynthesisStyle::Auto,
             font_variant_numeric_features: Vec::new(),
             font_variant_ligature_features: Vec::new(),
             font_kerning_features: Vec::new(),
@@ -5465,6 +5414,7 @@ impl Default for InheritedText {
             tab_size: TabSize::DEFAULT,
             text_align: TextAlign::Left,
             text_align_logical: LogicalTextAlign::Start,
+            text_align_justify_all: false,
             text_align_last: TextAlign::Left,
             text_align_last_logical: LogicalTextAlign::Start,
             text_align_last_explicit: false,
@@ -5472,6 +5422,8 @@ impl Default for InheritedText {
             text_indent_hanging: false,
             text_indent_each_line: false,
             white_space: WhiteSpace::Normal,
+            text_wrap_style: TextWrapStyle::Auto,
+            hanging_punctuation: HangingPunctuation::default(),
             hyphens: Hyphens::Manual,
             reader_hyphens: None,
             word_break: WordBreak::Normal,
@@ -5491,49 +5443,14 @@ impl Default for InheritedText {
 
 impl Default for BoxModel {
     fn default() -> Self {
-        Self {
-            layout_idx: 0,
-            display: Display::Block,
-            unicode_bidi: UnicodeBidi::Normal,
-            box_sizing: BoxSizing::ContentBox,
-            overflow_x: OverflowMode::Visible,
-            overflow_y: OverflowMode::Visible,
-            text_overflow: TextOverflow::Clip,
-            text_box_trim: TextBoxTrim::None,
-            size_containment: false,
-            vertical_align: VerticalAlignValue::Baseline,
-            float: Float::None,
-            clear: Clear::None,
-            table_layout: TableLayoutMode::Auto,
-            border_collapse: BorderCollapseMode::Separate,
-            border_spacing_horizontal: 0.0,
-            border_spacing_vertical: 0.0,
-            empty_cells: EmptyCellsMode::Show,
-            caption_side: CaptionSide::Top,
-            width: PreferredSize::Auto,
-            height: PreferredSize::Auto,
-            min_width: PreferredSize::Auto,
-            min_height: PreferredSize::Auto,
-            max_width: PreferredSize::Auto,
-            max_height: PreferredSize::Auto,
-            aspect_ratio: AspectRatio::AUTO,
-            object_fit: ObjectFit::Fill,
-            object_position: ObjectPosition::default(),
-            margin_top: LengthPct::Px(0.0),
-            margin_bottom: LengthPct::Px(0.0),
-            margin_left: LengthPct::Px(0.0),
-            margin_right: LengthPct::Px(0.0),
-            padding_top: LengthPct::Px(0.0),
-            padding_bottom: LengthPct::Px(0.0),
-            padding_left: LengthPct::Px(0.0),
-            padding_right: LengthPct::Px(0.0),
-        }
+        DEFAULT_BOX_MODEL
     }
 }
 
 impl Default for LayoutStyle {
     fn default() -> Self {
         Self {
+            static_position_inline: false,
             margin_top_auto: false,
             margin_right_auto: false,
             margin_bottom_auto: false,
@@ -5579,22 +5496,7 @@ impl Default for LayoutStyle {
 
 impl Default for Border {
     fn default() -> Self {
-        Self {
-            radii_idx: 0,
-            current_color_sides: 0,
-            border_top_width: FontRelativeLength::ZERO,
-            border_right_width: FontRelativeLength::ZERO,
-            border_bottom_width: FontRelativeLength::ZERO,
-            border_left_width: FontRelativeLength::ZERO,
-            border_top_color: 0x000000FF,
-            border_right_color: 0x000000FF,
-            border_bottom_color: 0x000000FF,
-            border_left_color: 0x000000FF,
-            border_top_style: BorderStyle::None,
-            border_right_style: BorderStyle::None,
-            border_bottom_style: BorderStyle::None,
-            border_left_style: BorderStyle::None,
-        }
+        DEFAULT_BORDER
     }
 }
 
@@ -6014,19 +5916,7 @@ impl FontRelativeLength {
     }
 }
 
-impl PartialEq for FontRelativeLength {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.to_bits() == other.0.to_bits()
-    }
-}
-
-impl Eq for FontRelativeLength {}
-
-impl Hash for FontRelativeLength {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write_u32(self.0.to_bits());
-    }
-}
+impl_style_key!(FontRelativeLength {} floats { 0 });
 
 impl std::fmt::Debug for FontRelativeLength {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -6152,6 +6042,19 @@ pub enum WhiteSpace {
 }
 
 impl WhiteSpace {
+    /// Change wrapping independently of whitespace collapsing/preservation.
+    pub fn with_wrapping(self, wraps: bool) -> Self {
+        match (self, wraps) {
+            (Self::Normal | Self::NoWrap, true) => Self::Normal,
+            (Self::Normal | Self::NoWrap, false) => Self::NoWrap,
+            (Self::Pre | Self::PreWrap, true) => Self::PreWrap,
+            (Self::Pre | Self::PreWrap, false) => Self::Pre,
+            (Self::PreLine | Self::PreserveBreaksNoWrap, true) => Self::PreLine,
+            (Self::PreLine | Self::PreserveBreaksNoWrap, false) => Self::PreserveBreaksNoWrap,
+            (Self::BreakSpaces | Self::BreakSpacesNoWrap, true) => Self::BreakSpaces,
+            (Self::BreakSpaces | Self::BreakSpacesNoWrap, false) => Self::BreakSpacesNoWrap,
+        }
+    }
     pub fn allows_wrap(self) -> bool {
         !matches!(
             self,
@@ -6176,6 +6079,23 @@ impl WhiteSpace {
             Self::Pre | Self::PreWrap | Self::BreakSpaces | Self::BreakSpacesNoWrap
         )
     }
+}
+
+/// Quality policy for choosing soft line breaks, independent of whitespace.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum TextWrapStyle {
+    #[default]
+    Auto,
+    Stable,
+    Pretty,
+    Balance,
+}
+
+/// Hanging opening/closing punctuation on the first/last formatted line.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct HangingPunctuation {
+    pub first: bool,
+    pub last: bool,
 }
 
 /// Computed `word-break`, including its legacy `break-word` value.
@@ -6283,6 +6203,13 @@ pub enum BorderStyle {
     Ridge,
 }
 
+impl BorderStyle {
+    /// Whether the style paints a stroke when its width and color allow it.
+    pub fn paints_stroke(self) -> bool {
+        !matches!(self, Self::None | Self::Hidden)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum TextTransform {
     #[default]
@@ -6352,6 +6279,31 @@ pub enum Display {
     TableColumn,
     TableCell,
     TableCaption,
+}
+
+impl Display {
+    /// Inline-level formatting roots that participate as atomic inline boxes.
+    pub fn is_atomic_inline(self) -> bool {
+        matches!(
+            self,
+            Self::InlineBlock | Self::InlineFlex | Self::InlineGrid | Self::InlineTable
+        )
+    }
+
+    /// Internal table roles, including captions and column metadata.
+    pub fn is_table_internal(self) -> bool {
+        matches!(
+            self,
+            Self::TableRowGroup
+                | Self::TableHeaderGroup
+                | Self::TableFooterGroup
+                | Self::TableRow
+                | Self::TableColumnGroup
+                | Self::TableColumn
+                | Self::TableCell
+                | Self::TableCaption
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -6890,27 +6842,9 @@ impl ComputedSizeComponent {
     }
 }
 
-impl PartialEq for ComputedSizeComponent {
-    fn eq(&self, other: &Self) -> bool {
-        self.absolute_px.to_bits() == other.absolute_px.to_bits()
-            && self.percentage.to_bits() == other.percentage.to_bits()
-            && self.x_height_px.to_bits() == other.x_height_px.to_bits()
-            && self.ch_advance_px.to_bits() == other.ch_advance_px.to_bits()
-            && self.cap_height_px.to_bits() == other.cap_height_px.to_bits()
-            && self.percentage_dependent == other.percentage_dependent
-    }
-}
-impl Eq for ComputedSizeComponent {}
-impl Hash for ComputedSizeComponent {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write_u32(self.absolute_px.to_bits());
-        state.write_u32(self.percentage.to_bits());
-        state.write_u32(self.x_height_px.to_bits());
-        state.write_u32(self.ch_advance_px.to_bits());
-        state.write_u32(self.cap_height_px.to_bits());
-        self.percentage_dependent.hash(state);
-    }
-}
+impl_style_key!(ComputedSizeComponent { percentage_dependent } floats {
+    absolute_px, percentage, x_height_px, ch_advance_px, cap_height_px
+});
 
 impl PreferredSize {
     fn resolve_font_relative(
@@ -7104,15 +7038,15 @@ mod boundary_tests {
         let id = builder.intern_language("ZH-hant-tw-u-nu-hanidec-x-reader").unwrap();
         assert_eq!(builder.intern_language("zh-Hant-TW-u-nu-hanidec-x-reader"), Some(id));
         assert_eq!(builder.store.languages.len(), 1);
-        let tag = builder.language(id).unwrap().tag().unwrap();
+        let tag = language::content_language_tag(&builder.language(id).unwrap()).unwrap();
         assert_eq!(tag.primary_language(), "zh");
         assert_eq!(tag.script(), Some("Hant"));
         assert_eq!(tag.region(), Some("TW"));
         assert_eq!(tag.extension(), Some("u-nu-hanidec"));
         assert_eq!(tag.private_use(), Some("x-reader"));
         let invalid = builder.intern_language("en_US").unwrap();
-        assert!(builder.language(invalid).unwrap().tag().is_none());
-        assert_eq!(builder.language(invalid).unwrap().as_str(), "en_US");
+        assert!(language::content_language_tag(&builder.language(invalid).unwrap()).is_none());
+        assert_eq!(language::content_language_as_str(&builder.language(invalid).unwrap()), "en_US");
         assert_ne!(builder.intern_language("en_UK"), Some(invalid));
         let foreign = ComputedStylesBuilder::new(&document);
         assert!(foreign.language(id).is_none());
@@ -7387,12 +7321,12 @@ mod boundary_tests {
 
     #[test]
     fn decoration_lines_expose_only_supported_combinations() {
-        let lines = super::TextDecorationLines::new(true, true, true);
-        assert!(lines.underline());
-        assert!(lines.overline());
-        assert!(lines.line_through());
-        assert!(!lines.is_empty());
-        assert!(super::TextDecorationLines::default().is_empty());
+        let lines = text_decoration_lines_new(true, true, true);
+        assert!(text_decoration_lines_underline(lines));
+        assert!(text_decoration_lines_overline(lines));
+        assert!(text_decoration_lines_line_through(lines));
+        assert!(!text_decoration_lines_is_empty(lines));
+        assert!(text_decoration_lines_is_empty(super::TextDecorationLines::default()));
         assert!(super::TextDecorationThickness::length(super::LengthPct::Px(-1.0)).is_none());
     }
 
@@ -7614,4 +7548,155 @@ mod boundary_tests {
             })
         ));
     }
+}
+
+#[cfg(test)]
+mod line_height_policy_tests {
+    use super::{ComputedStylesBuilder, Font, InheritedText};
+    use html_dom::Document;
+
+    #[test]
+    fn used_line_height_distinguishes_normal_zero_and_font_relative_lengths() {
+        let document = Document::default();
+        let mut builder = ComputedStylesBuilder::new(&document);
+        let styles = [
+            InheritedText::default(),
+            InheritedText {
+                line_height_normal: false,
+                ..Default::default()
+            },
+            InheritedText {
+                line_height: 12.0,
+                line_height_x_height_px: 8.0,
+                line_height_normal: false,
+                ..Default::default()
+            },
+        ]
+        .map(|text| {
+            builder
+                .push(
+                    Font {
+                        font_size: 20.0,
+                        font_size_x_height_px: 8.0,
+                        ..Default::default()
+                    },
+                    text,
+                    Default::default(),
+                    Default::default(),
+                    Default::default(),
+                )
+                .unwrap()
+        });
+        let computed = builder.finish().unwrap();
+        for (indices, expected) in styles.into_iter().zip([28.8, 0.0, 16.0]) {
+            let used = computed.used_view(indices, 0.5, 0.5, 0.8).unwrap();
+            assert_eq!(used.font_size(), 24.0);
+            assert!((used.resolved_line_height() - expected).abs() < 1e-6);
+            assert_eq!(
+                computed.view(indices).unwrap().used_line_height(24.0, 0.5),
+                Some(used.resolved_line_height())
+            );
+        }
+    }
+}
+
+pub fn text_decoration_lines_underline(value: TextDecorationLines) -> bool {
+    value.0 & TextDecorationLines::UNDERLINE != 0
+}
+
+pub fn text_decoration_lines_new(
+    underline: bool,
+    overline: bool,
+    line_through: bool,
+) -> TextDecorationLines {
+    TextDecorationLines(
+        ((underline as u8) * TextDecorationLines::UNDERLINE)
+            | ((overline as u8) * TextDecorationLines::OVERLINE)
+            | ((line_through as u8) * TextDecorationLines::LINE_THROUGH),
+    )
+}
+
+pub fn corner_radii_map(
+    value: CornerRadii,
+    mut f: impl FnMut(f32, f32) -> (f32, f32),
+) -> CornerRadii {
+    CornerRadii {
+        top_left: f(value.top_left.0, value.top_left.1),
+        top_right: f(value.top_right.0, value.top_right.1),
+        bottom_right: f(value.bottom_right.0, value.bottom_right.1),
+        bottom_left: f(value.bottom_left.0, value.bottom_left.1),
+    }
+}
+
+pub fn corner_radii_is_zero(value: CornerRadii) -> bool {
+    [
+        value.top_left,
+        value.top_right,
+        value.bottom_right,
+        value.bottom_left,
+    ]
+    .into_iter()
+    .all(|(x, y)| x == 0.0 && y == 0.0)
+}
+
+pub fn text_decoration_lines_is_empty(value: TextDecorationLines) -> bool {
+    value.0 == 0
+}
+
+pub fn text_decoration_lines_line_through(value: TextDecorationLines) -> bool {
+    value.0 & TextDecorationLines::LINE_THROUGH != 0
+}
+
+/// Places `colour` between [`Self::ink`] and [`Self::surface`] by its own
+/// lightness, keeping its alpha.
+///
+/// How much of its own colour it keeps depends on how much it had. A grey
+/// is interpolated between the two ends outright, so a publication's white
+/// becomes the reader's page — tint and all — rather than a neutral of the
+/// same lightness sitting visibly on top of it. A colour keeps its hue and
+/// saturation and moves only in lightness, because a red heading is a red
+/// heading in any theme. Everything between is mixed in proportion.
+///
+/// Fully transparent colours are returned untouched: they are not invisible
+/// black, they are the absence of a colour, and re-lighting them would turn
+/// a transparent background into a painted one.
+pub fn theme_adaptation_adapt(value: ThemeAdaptation, colour: u32) -> u32 {
+    let alpha = colour & 0xff;
+    if alpha == 0 {
+        return colour;
+    }
+    let (ink_l, ink_a, ink_b) = srgb_to_oklab(value.ink);
+    let (surface_l, surface_a, surface_b) = srgb_to_oklab(value.surface);
+    let (l, a, b) = srgb_to_oklab(colour);
+    let position = l.clamp(0.0, 1.0);
+    let lightness = ink_l + (surface_l - ink_l) * position;
+
+    // Where the theme itself would put a neutral of this lightness.
+    let (themed_a, themed_b) = (
+        ink_a + (surface_a - ink_a) * position,
+        ink_b + (surface_b - ink_b) * position,
+    );
+    // Chroma rides on the a/b pair, so scaling it with the lightness change
+    // keeps a colour from turning fluorescent as it is lightened.
+    let scale = if l > 1e-6 {
+        (lightness / l).clamp(0.35, 1.6)
+    } else {
+        1.0
+    };
+    let (authored_a, authored_b) = (a * scale, b * scale);
+
+    // NEUTRAL_CHROMA is where a colour stops reading as a grey. Below it the
+    // theme's own tint takes over; above it the publisher's hue does.
+    const NEUTRAL_CHROMA: f32 = 0.035;
+    let weight = (a.hypot(b) / NEUTRAL_CHROMA).clamp(0.0, 1.0);
+    oklab_to_srgb(
+        lightness,
+        themed_a + (authored_a - themed_a) * weight,
+        themed_b + (authored_b - themed_b) * weight,
+        alpha,
+    )
+}
+
+pub fn text_decoration_lines_overline(value: TextDecorationLines) -> bool {
+    value.0 & TextDecorationLines::OVERLINE != 0
 }

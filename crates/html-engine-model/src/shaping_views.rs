@@ -1,7 +1,8 @@
 //! Borrowed views over canonical shaping and range-local first-line changes.
 
+use crate::shaping_contracts;
 use crate::GlyphId;
-use crate::{ResolvedBidi, ShapedTextGeometry, TextRunId};
+use crate::{CaretPositions, ResolvedBidi, ShapedTextGeometry, TextDirection, TextRunId};
 use std::ops::{Index, Range};
 
 pub struct GlyphPatch {
@@ -67,8 +68,11 @@ impl<'a> GlyphSlice<'a> {
             let start = patch.source.start as usize;
             let end = patch.source.end as usize;
             if start < self.end && self.start < end {
-                return (start <= self.start && self.end <= end)
-                    .then(|| &patch.glyphs[self.start - start..self.end - start]);
+                return if start <= self.start && self.end <= end {
+                    patch.glyphs.get(self.start - start..self.end - start)
+                } else {
+                    None
+                };
             }
         }
         self.base.get(self.start..self.end)
@@ -150,6 +154,8 @@ impl<'a> TextGeometryView<'a> {
             .paint_glyph(index, fallback)
     }
 
+    /// Native runs clipped to the requested logical source range. Refinements
+    /// replace base geometry; missing native coverage remains a gap.
     pub fn authoritative_runs(self, range: Range<u32>) -> NativeRuns<'a> {
         NativeRuns {
             geometry: self,
@@ -172,9 +178,27 @@ pub struct NativeRunView<'a> {
     pub source_range: Range<u32>,
     pub run_offset: u32,
     pub backend_run: TextRunId,
-    pub caret_stops: &'a [f32],
+    pub caret_stops: &'a CaretPositions,
     pub ascent: f32,
     pub placement_required: bool,
+}
+
+impl NativeRunView<'_> {
+    /// The source slice expressed in backend-run character coordinates.
+    pub fn run_range(&self) -> Range<u32> {
+        self.run_offset..self.run_offset + (self.source_range.end - self.source_range.start)
+    }
+
+    /// Natural horizontal origin of this slice in backend-run coordinates.
+    /// RTL slices use the leftmost of their endpoint carets.
+    pub fn natural_offset(&self, direction: TextDirection) -> Option<f32> {
+        let range = self.run_range();
+        let start = self.caret_stops.get(range.start as usize)?;
+        Some(match direction {
+            TextDirection::Ltr => start,
+            TextDirection::Rtl => start.min(self.caret_stops.get(range.end as usize)?),
+        })
+    }
 }
 
 pub struct NativeRuns<'a> {
@@ -239,30 +263,51 @@ impl<'a> Iterator for NativeRuns<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ShapedTextRun;
+    use crate::{TextRunId, ShapedTextRun};
     use std::sync::Arc;
 
     #[test]
     fn glyph_slices_borrow_base_and_overlapping_patches_without_flattening() {
-        let base = [0, 1, 2, 3, 4, 5];
+        let base = [
+            GlyphId(0),
+            GlyphId(1),
+            GlyphId(2),
+            GlyphId(3),
+            GlyphId(4),
+            GlyphId(5),
+        ];
         let patches = [
             GlyphPatch {
                 source: 1..4,
-                glyphs: vec![10, 20, 30],
+                glyphs: vec![GlyphId(10), GlyphId(20), GlyphId(30)],
             },
             GlyphPatch {
                 source: 3..5,
-                glyphs: vec![300, 400],
+                glyphs: vec![GlyphId(300), GlyphId(400)],
             },
         ];
         let view = GlyphSlice::new(&base, &patches);
         assert_eq!(
             view.iter().copied().collect::<Vec<_>>(),
-            [0, 10, 20, 300, 400, 5]
+            [
+                GlyphId(0),
+                GlyphId(10),
+                GlyphId(20),
+                GlyphId(300),
+                GlyphId(400),
+                GlyphId(5)
+            ]
         );
         assert_eq!(
             view.iter().rev().copied().collect::<Vec<_>>(),
-            [5, 400, 300, 20, 10, 0]
+            [
+                GlyphId(5),
+                GlyphId(400),
+                GlyphId(300),
+                GlyphId(20),
+                GlyphId(10),
+                GlyphId(0)
+            ]
         );
         assert!(view.as_contiguous().is_none());
         assert!(view.slice(2..5).unwrap().as_contiguous().is_none());
@@ -279,22 +324,16 @@ mod tests {
 
     #[test]
     fn geometry_overlays_split_native_runs_and_preserve_replacement_boundaries() {
-        let base_run = ShapedTextRun::with_backend_run(
-            Arc::from([1.0; 6]),
+        let base_run = shaping_contracts::shaped_text_run_with_backend_run(Arc::from([1.0; 6]),
             Arc::from([true, false, true, false, false, true, true]),
-            10,
-            Arc::from([0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
-            8.0,
-        )
-        .unwrap();
-        let patch_run = ShapedTextRun::with_backend_run(
-            Arc::from([4.0; 2]),
+            TextRunId(10),
+            [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0].into(),
+            8.0,);
+        let patch_run = shaping_contracts::shaped_text_run_with_backend_run(Arc::from([4.0; 2]),
             Arc::from([true, false, true]),
-            20,
-            Arc::from([0.0, 4.0, 8.0]),
-            12.0,
-        )
-        .unwrap();
+            TextRunId(20),
+            [0.0, 4.0, 8.0].into(),
+            12.0,);
         let mut base = ShapedTextGeometry::with_len(6);
         base.push_run(&[0, 1, 2, 3, 4, 5], base_run, true);
         let mut patch = ShapedTextGeometry::with_len(6);
@@ -317,29 +356,33 @@ mod tests {
             runs.iter()
                 .map(|run| (run.source_range.clone(), run.backend_run, run.run_offset))
                 .collect::<Vec<_>>(),
-            [(1..2, 10, 1), (2..4, 20, 0), (4..5, 10, 4)]
+            [
+                (1..2, TextRunId(10), 1),
+                (2..4, TextRunId(20), 0),
+                (4..5, TextRunId(10), 4)
+            ]
         );
         assert_eq!(
-            runs[0].caret_stops.as_ptr(),
+            runs[0].caret_stops.to_dense().as_ptr(),
             base.authoritative_runs()
                 .next()
                 .unwrap()
                 .caret_stops
-                .as_ptr()
+                .to_dense().as_ptr()
         );
         assert_eq!(
-            runs[1].caret_stops.as_ptr(),
+            runs[1].caret_stops.to_dense().as_ptr(),
             patch
                 .authoritative_runs()
                 .next()
                 .unwrap()
                 .caret_stops
-                .as_ptr()
+                .to_dense().as_ptr()
         );
         let mut fallback = ShapedTextGeometry::with_len(6);
         fallback.replace_range(
             2..4,
-            ShapedTextRun::new(Arc::from([2.0; 2]), Arc::from([true; 3])).unwrap(),
+            shaping_contracts::shaped_text_run_new(Arc::from([2.0; 2]), Arc::from([true; 3])),
             false,
         );
         let runs = TextGeometryView::new(&base, Some(&fallback))
@@ -352,5 +395,59 @@ mod tests {
             [1..2, 4..5],
             "fallback geometry masks the old native run"
         );
+    }
+
+    #[test]
+    fn clipped_native_slices_preserve_backend_coordinates_in_both_directions() {
+        for (direction, base_carets, patch_carets, expected_offsets) in [
+            (
+                TextDirection::Ltr,
+                [0.0, 5.0, 9.0, 12.0, 14.0],
+                [0.0, 7.0],
+                [0.0, 0.0, 9.0],
+            ),
+            (
+                TextDirection::Rtl,
+                [14.0, 9.0, 5.0, 2.0, 0.0],
+                [7.0, 0.0],
+                [9.0, 0.0, 2.0],
+            ),
+        ] {
+            let base_run = shaping_contracts::shaped_text_run_with_backend_run(Arc::from([5.0, 4.0, 3.0, 2.0]),
+                Arc::from([true; 5]),
+                TextRunId(10),
+                base_carets.into(),
+                8.0,);
+            let patch_run = shaping_contracts::shaped_text_run_with_backend_run(Arc::from([7.0]),
+                Arc::from([true; 2]),
+                TextRunId(20),
+                patch_carets.into(),
+                12.0,);
+            let mut base = ShapedTextGeometry::with_len(6);
+            // One backend run contributes two disjoint logical source ranges.
+            base.push_run(&[0, 1, 4, 5], base_run, true);
+            base.finish_runs();
+            let mut patch = ShapedTextGeometry::with_len(6);
+            patch.replace_range(1..2, patch_run, true);
+            let view = TextGeometryView::new(&base, Some(&patch));
+            let slices = view
+                .authoritative_runs(0..5)
+                .map(|run| {
+                    let range = run.run_range();
+                    let offset = run.natural_offset(direction).unwrap();
+                    (run.source_range, run.backend_run, range, offset)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                slices,
+                [
+                    (0..1, TextRunId(10), 0..1, expected_offsets[0]),
+                    (1..2, TextRunId(20), 0..1, expected_offsets[1]),
+                    (4..5, TextRunId(10), 2..3, expected_offsets[2]),
+                ],
+            );
+            assert_eq!(view.authoritative_runs(2..4).count(), 0);
+            assert_eq!(view.authoritative_runs(5..5).count(), 0);
+        }
     }
 }

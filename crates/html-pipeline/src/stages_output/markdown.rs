@@ -1,11 +1,45 @@
 //! Markdown clipboard payloads for logical text and box selections.
 
-use super::{DocumentRead, RenderTable};
-use crate::layout_model::InlineItemKind;
-use html_dom::{Document, DomNodeId, ElementRef};
+use html_engine_model::layout_state;
+use crate::stages::text_paint;
+use html_style_model::computed_style;
+use super::text::{enclosing_text_range, text_runs};
+use super::{BoxId, DocumentRead, ImageId, LineId, RenderTable, merge_text_ranges};
+use crate::layout_model::parse_positive_span;
+use html_dom::{Document, DomNodeId, ElementRef, write_escaped_html_attribute};
 use html_style_model::{ComputedStyles, Display, FontStyle, Visibility};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
+use std::iter::repeat_n;
 use std::ops::Range;
+
+/// Text representations requested from one logical range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextExportFormat {
+    Plain,
+    PlainWithParagraphBreaks,
+    Markdown,
+    PlainAndMarkdown,
+}
+
+/// Requested text representations. Unrequested, empty or invalid output is `None`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TextExport {
+    pub plain: Option<String>,
+    pub markdown: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableExportFormat {
+    Markdown,
+    Html,
+    AuthoredHtml,
+}
+
+/// Export an owned table snapshot, including a bounded logical cell rectangle.
+pub enum TableExportRequest {
+    Whole(TableExportFormat),
+    CellsMarkdown { rows: Range<usize>, columns: Range<usize> },
+}
 
 /// Read-only selection conversion. Applications own selection gestures and
 /// write the returned UTF-8 string to their platform clipboard.
@@ -16,31 +50,48 @@ pub struct RenderExportView<'a> {
 }
 
 impl<'a> RenderExportView<'a> {
-    /// Whether an image resource represents a retained mathematical formula.
-    pub fn is_equation(self, image: u32) -> bool {
-        self.doc
-            .render_view(self.glyph_metrics)
-            .image_mathml(image)
-            .is_some()
-    }
 
     /// Build plain-text and Markdown versions of the same logical selection.
     /// The tuple contains `(plain_text, markdown)`; invalid or empty selections
     /// return `(None, None)`. Selection and clipboard state remain with callers.
-    pub fn selection_text(self, glyphs: Range<u32>) -> (Option<String>, Option<String>) {
+    fn selection_text(self, glyphs: Range<u32>) -> (Option<String>, Option<String>) {
         let Some((root, selected)) = self.selection(glyphs) else {
             return (None, None);
         };
-        let plain = selected.plain(root).trim_matches('\n').to_owned();
-        ((!plain.is_empty()).then_some(plain), selected.finish(root))
+        (finish_plain_text(selected.plain(root)), selected.finish(root))
     }
 
     /// Visible source text for a logical selection, without generating Markdown.
-    pub fn plain_text(self, glyphs: Range<u32>) -> Option<String> {
+    fn plain_text(self, glyphs: Range<u32>) -> Option<String> {
         let (root, selected) = self.selection(glyphs)?;
-        let plain = selected.plain(root).trim_matches('\n').to_owned();
-        (!plain.is_empty()).then_some(plain)
+        finish_plain_text(selected.plain(root))
     }
+
+    /// Export visible source text with blank lines between text blocks.
+    /// Authored line breaks remain single newlines.
+    fn plain_text_with_paragraph_breaks(self, glyphs: Range<u32>) -> Option<String> {
+        let (root, selected) = self.selection(glyphs)?;
+        finish_plain_text(selected.plain_separated(root, Some("\n\n")))
+    }
+
+    /// A preview with caller-selected character context and collapsed
+    /// whitespace. Hidden text and generated markers are excluded.
+    pub fn excerpt(self, range: Range<u32>, before: u32, after: u32) -> Option<String> {
+        let count = self
+            .doc
+            .render_view(self.glyph_metrics)
+            .text()
+            .glyph_count()
+            .min(u32::MAX as usize) as u32;
+        if range.start >= range.end || range.end > count {
+            return None;
+        }
+        let text = self.plain_text(
+            range.start.saturating_sub(before)..range.end.saturating_add(after).min(count),
+        )?;
+        Some(html_dom::collapse_whitespace(&text))
+    }
+
 
     /// Convert a half-open logical glyph range to Markdown. These are the same
     /// indices used by `RenderTextRun::glyphs`, not UTF-8 byte offsets.
@@ -51,7 +102,7 @@ impl<'a> RenderExportView<'a> {
     /// is copied, in source order, without generated markers or layout hyphens.
     /// Inline images and authored breaks between selected characters survive;
     /// use `markdown_for_box` for objects without selectable text.
-    pub fn markdown(self, glyphs: Range<u32>) -> Option<String> {
+    fn markdown(self, glyphs: Range<u32>) -> Option<String> {
         let (root, selected) = self.selection(glyphs)?;
         selected.finish(root)
     }
@@ -65,13 +116,18 @@ impl<'a> RenderExportView<'a> {
         Some((root, Markdown::new(self.doc, Some(glyphs), root)))
     }
 
-    /// Convert a selected source-backed box, such as a table, code block, or
-    /// image. Invalid and synthetic boxes return `None`.
-    pub fn markdown_for_box(self, box_idx: usize) -> Option<String> {
-        let document = self.doc.document();
-        let root = document.node_id_from_raw(self.doc.box_dom_element_idx(box_idx)?)?;
-        Markdown::new(self.doc, None, root).finish(root)
-    }
+}
+
+fn finish_plain_text(text: String) -> Option<String> {
+    finish_text(text, |character| character == '\n')
+}
+
+fn finish_text(mut text: String, trim: impl FnMut(char) -> bool + Copy) -> Option<String> {
+    let end = text.trim_end_matches(trim).len();
+    text.truncate(end);
+    let start = text.len() - text.trim_start_matches(trim).len();
+    text.drain(..start);
+    (!text.is_empty()).then_some(text)
 }
 
 struct Markdown<'a> {
@@ -86,10 +142,18 @@ struct Markdown<'a> {
 
 impl<'a> Markdown<'a> {
     fn new(doc: DocumentRead<'a>, selection: Option<Range<u32>>, root: DomNodeId) -> Self {
+        Self::new_ranges(doc, selection.as_ref().map(std::slice::from_ref), root)
+    }
+
+    fn new_ranges(
+        doc: DocumentRead<'a>,
+        selection: Option<&[Range<u32>]>,
+        root: DomNodeId,
+    ) -> Self {
         let document = doc.document();
         let mut result = Self {
             document,
-            styles: &doc.inputs.styles,
+            styles: doc.inputs.styles,
             text: FxHashMap::default(),
             active: FxHashSet::default(),
             visible: FxHashSet::default(),
@@ -100,13 +164,11 @@ impl<'a> Markdown<'a> {
         // retain empty visible cells and objects within their source subtree.
         if selection.is_none() {
             for index in 0..doc.box_count() {
-                if doc
-                    .box_used_style(index)
-                    .is_some_and(|style| style.visibility() == Visibility::Visible)
+                if doc.box_is_visible(index)
                     && let Some(node) = doc
                         .box_dom_element_idx(index)
                         .and_then(|raw| document.node_id_from_raw(raw))
-                    && within(document, node, root)
+                    && document.dom_contains(root, node)
                 {
                     result.visible.insert(node);
                 }
@@ -115,67 +177,60 @@ impl<'a> Markdown<'a> {
         let content = doc.inputs.text.content();
         let mut bounds = FxHashMap::default();
         let mut common_pre = None;
-        for item in content.inline_items() {
-            match &item.kind {
-                InlineItemKind::Text { glyphs } => {
-                    let Some(node) = item
-                        .dom_text_node
-                        .and_then(|raw| document.node_id_from_raw(raw))
-                    else {
-                        continue;
-                    };
-                    if !within(document, node, root) {
-                        continue;
-                    }
-                    bounds
-                        .entry(node)
-                        .and_modify(|range: &mut Range<u32>| {
-                            range.start = range.start.min(glyphs.start);
-                            range.end = range.end.max(glyphs.end);
-                        })
-                        .or_insert_with(|| glyphs.clone());
-                    if !doc
-                        .box_used_style(item.box_idx as usize)
-                        .is_some_and(|style| style.visibility() == Visibility::Visible)
-                    {
-                        continue;
-                    }
-                    let start = selection
-                        .as_ref()
-                        .map_or(glyphs.start, |range| glyphs.start.max(range.start));
-                    let end = selection
-                        .as_ref()
-                        .map_or(glyphs.end, |range| glyphs.end.min(range.end));
-                    if start >= end {
-                        continue;
-                    }
-                    let pre = document
-                        .dom_ancestors(node)
-                        .find(|&ancestor| document.get_dom_tag(ancestor) == Some("pre"));
-                    common_pre = Some(match common_pre {
-                        None => pre,
-                        Some(previous) if previous == pre => pre,
-                        _ => None,
-                    });
-                    let text = result.text.entry(node).or_default();
-                    text.extend(
-                        (start..end)
-                            .filter_map(|index| {
-                                content
-                                    .character_at(index as usize)
-                                    .and_then(char::from_u32)
-                            })
-                            .filter(|&ch| ch != '\u{00ad}'),
-                    );
-                    result.activate(node);
+        for run in text_runs(content.inline_items()) {
+            let glyphs = run.glyphs();
+            let Some(node) = run
+                .dom_text_node()
+                .and_then(|raw| document.node_id_from_raw(raw))
+            else {
+                continue;
+            };
+            if !document.dom_contains(root, node) {
+                continue;
+            }
+            bounds
+                .entry(node)
+                .and_modify(|range: &mut Range<u32>| {
+                    *range = enclosing_text_range(range.clone(), glyphs.clone());
+                })
+                .or_insert_with(|| glyphs.clone());
+            if !doc.box_is_visible(layout_state::box_id_index(text_paint::render_text_run_box_id(&run))) {
+                continue;
+            }
+            let complete = [glyphs.clone()];
+            let selected = selection.unwrap_or(&complete);
+            let first = selected.partition_point(|range| range.end <= glyphs.start);
+            for range in selected[first..]
+                .iter()
+                .take_while(|range| range.start < glyphs.end)
+            {
+                let start = glyphs.start.max(range.start);
+                let end = glyphs.end.min(range.end);
+                if start >= end {
+                    continue;
                 }
-                _ => {}
+                let pre = document
+                    .dom_ancestors(node)
+                    .find(|&ancestor| document.get_dom_tag(ancestor) == Some("pre"));
+                common_pre = Some(match common_pre {
+                    None => pre,
+                    Some(previous) if previous == pre => pre,
+                    _ => None,
+                });
+                let text = result.text.entry(node).or_default();
+                text.extend(
+                    (start..end)
+                        .filter_map(|index| content.character_at(index as usize))
+                        .filter(|&ch| ch != '\u{00ad}'),
+                );
+                result.activate(node);
             }
         }
+
         if selection.is_some() {
             result.inline_pre = common_pre.flatten();
         }
-        result.include_objects(doc, root, &bounds, &mut 0, selection.as_ref());
+        result.include_objects(doc, root, &bounds, &mut 0, selection);
         result
     }
 
@@ -185,7 +240,7 @@ impl<'a> Markdown<'a> {
         node: DomNodeId,
         bounds: &FxHashMap<DomNodeId, Range<u32>>,
         cursor: &mut u32,
-        selection: Option<&Range<u32>>,
+        selection: Option<&[Range<u32>]>,
     ) {
         if let Some(range) = bounds.get(&node) {
             *cursor = range.end;
@@ -206,7 +261,11 @@ impl<'a> Markdown<'a> {
             && style.is_some_and(|style| style.visibility() == Visibility::Visible)
         {
             self.visible.insert(node);
-            if selection.is_none_or(|range| range.start < *cursor && *cursor < range.end) {
+            if selection.is_none_or(|ranges| {
+                ranges
+                    .iter()
+                    .any(|range| range.start < *cursor && *cursor < range.end)
+            }) {
                 self.activate(node);
             }
         }
@@ -229,22 +288,13 @@ impl<'a> Markdown<'a> {
     }
 
     fn finish(&self, root: DomNodeId) -> Option<String> {
-        let output = self.node(root);
-        let output = output.trim().to_owned();
-        (!output.is_empty()).then_some(output)
+        finish_text(self.node(root), char::is_whitespace)
     }
 
     fn children(&self, element: ElementRef<'_>) -> String {
         let mut output = String::new();
         for node in element.children() {
-            let content = self.node(node);
-            if output.ends_with('\n') && content.starts_with('\n') {
-                output.truncate(output.trim_end_matches('\n').len());
-                output.push_str("\n\n");
-                output.push_str(content.trim_start_matches('\n'));
-            } else {
-                output.push_str(&content);
-            }
+            append_markdown(&mut output, &self.node(node));
         }
         output
     }
@@ -283,8 +333,7 @@ impl<'a> Markdown<'a> {
                 let language = code_language(element)
                     .or_else(|| {
                         element
-                            .children()
-                            .filter_map(|child| self.document.element_ref(child))
+                            .child_elements()
                             .find(|child| child.tag() == "code")
                             .and_then(code_language)
                     })
@@ -306,16 +355,12 @@ impl<'a> Markdown<'a> {
                     .parent()
                     .and_then(|node| self.document.element_ref(node));
                 let marker = if let Some(parent) = parent.filter(|parent| parent.tag() == "ol") {
-                    let items = parent
-                        .children()
-                        .filter_map(|node| self.document.element_ref(node))
-                        .filter(|child| child.tag() == "li")
-                        .collect::<Vec<_>>();
+                    let items = parent.child_elements().filter(|child| child.tag() == "li");
                     let step = if parent.has_attr("reversed") { -1 } else { 1 };
                     let mut number = parent
                         .attr("start")
                         .and_then(|value| value.parse::<i64>().ok())
-                        .unwrap_or(if step < 0 { items.len() as i64 } else { 1 });
+                        .unwrap_or_else(|| if step < 0 { items.clone().count() as i64 } else { 1 });
                     for item in items {
                         number = item
                             .attr("value")
@@ -329,7 +374,7 @@ impl<'a> Markdown<'a> {
                     if !(0..=999_999_999).contains(&number) {
                         return block(&format!(
                             "<ol start=\"{number}\">{}</ol>",
-                            self.html(node, false)
+                            self.html(node)
                         ));
                     }
                     format!("{number}. ")
@@ -345,16 +390,17 @@ impl<'a> Markdown<'a> {
                     return content;
                 }
                 match tag {
-                    "h1" => block(&format!("# {}", content.trim())),
-                    "h2" => block(&format!("## {}", content.trim())),
-                    "h3" => block(&format!("### {}", content.trim())),
-                    "h4" => block(&format!("#### {}", content.trim())),
-                    "h5" => block(&format!("##### {}", content.trim())),
-                    "h6" => block(&format!("###### {}", content.trim())),
+                    "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+                        let marker = &"######"[..usize::from(tag.as_bytes()[1] - b'0')];
+                        block(&format!("{marker} {}", content.trim()))
+                    }
                     "strong" | "b" => inline(&content, "**"),
                     "em" | "i" => inline(&content, "*"),
                     "del" | "s" | "strike" => inline(&content, "~~"),
-                    "a" => element.attr("href").map_or(content.clone(), |href| {
+                    "a" => {
+                        let Some(href) = element.attr("href") else {
+                            return content;
+                        };
                         let trimmed = content.trim();
                         content.replacen(
                             trimmed,
@@ -365,15 +411,16 @@ impl<'a> Markdown<'a> {
                             ),
                             1,
                         )
-                    }),
-                    "blockquote" => block(
-                        &content
-                            .trim()
-                            .lines()
-                            .map(|line| format!("> {line}"))
-                            .collect::<Vec<_>>()
-                            .join("\n"),
-                    ),
+                    }
+                    "blockquote" => {
+                        let mut quoted = String::new();
+                        for line in content.trim().lines() {
+                            quoted.push_str("> ");
+                            quoted.push_str(line);
+                            quoted.push('\n');
+                        }
+                        block(&quoted)
+                    }
                     tag if block_tag(tag) => block(&content),
                     _ => content,
                 }
@@ -408,8 +455,8 @@ impl<'a> Markdown<'a> {
         {
             content = inline(&content, "*");
         }
-        if current.text_decoration_lines().line_through()
-            && parent.is_none_or(|parent| !parent.text_decoration_lines().line_through())
+        if computed_style::text_decoration_lines_line_through(current.text_decoration_lines())
+            && parent.is_none_or(|parent| !computed_style::text_decoration_lines_line_through(parent.text_decoration_lines()))
             && !matches!(element.tag(), "s" | "del" | "strike")
         {
             content = inline(&content, "~~");
@@ -418,25 +465,15 @@ impl<'a> Markdown<'a> {
     }
 
     fn raw_text(&self, node: DomNodeId) -> String {
-        if let Some(text) = self.text.get(&node) {
-            return text.clone();
-        }
-        let Some(element) = self.document.element_ref(node) else {
-            return String::new();
-        };
-        if !self.includes(node) || excluded(element.tag()) {
-            return String::new();
-        }
-        if element.tag() == "br" {
-            return "\n".into();
-        }
-        element
-            .children()
-            .map(|child| self.raw_text(child))
-            .collect()
+        self.plain_separated(node, None)
     }
 
     fn plain(&self, node: DomNodeId) -> String {
+        self.plain_separated(node, Some("\n"))
+    }
+
+    /// With no block separator, preserve every authored newline.
+    fn plain_separated(&self, node: DomNodeId, separator: Option<&str>) -> String {
         if let Some(text) = self.text.get(&node) {
             return text.clone();
         }
@@ -449,33 +486,40 @@ impl<'a> Markdown<'a> {
         if element.tag() == "br" {
             return "\n".into();
         }
-        let mut output = String::new();
-        for child in element.children() {
-            let content = self.plain(child);
-            if output.ends_with('\n') && content.starts_with('\n') {
-                output.push_str(content.trim_start_matches('\n'));
+        let mut children = element
+            .children()
+            .map(|child| self.plain_separated(child, separator));
+        let mut output = children.next().unwrap_or_default();
+        for content in children {
+            if let Some(separator) = separator
+                && !separator.is_empty()
+                && output.ends_with(separator)
+                && content.starts_with(separator)
+            {
+                output.push_str(content.strip_prefix(separator).unwrap_or(&content));
             } else {
                 output.push_str(&content);
             }
         }
-        if (block_tag(element.tag())
-            || matches!(
-                element.tag(),
-                "h1" | "h2"
-                    | "h3"
-                    | "h4"
-                    | "h5"
-                    | "h6"
-                    | "li"
-                    | "tr"
-                    | "td"
-                    | "th"
-                    | "pre"
-                    | "blockquote"
-            ))
+        if let Some(separator) = separator
+            && (block_tag(element.tag())
+                || matches!(
+                    element.tag(),
+                    "h1" | "h2"
+                        | "h3"
+                        | "h4"
+                        | "h5"
+                        | "h6"
+                        | "li"
+                        | "tr"
+                        | "td"
+                        | "th"
+                        | "pre"
+                        | "blockquote"
+                ))
             && !output.is_empty()
         {
-            format!("\n{}\n", output.trim_matches('\n'))
+            format!("{separator}{}{separator}", output.trim_matches('\n'))
         } else {
             output
         }
@@ -483,11 +527,7 @@ impl<'a> Markdown<'a> {
 
     fn list(&self, element: ElementRef<'_>) -> String {
         let ordered = element.tag() == "ol";
-        let items = element
-            .children()
-            .filter_map(|node| self.document.element_ref(node))
-            .filter(|child| child.tag() == "li")
-            .collect::<Vec<_>>();
+        let items = element.child_elements().filter(|child| child.tag() == "li");
         let mut number = element
             .attr("start")
             .and_then(|start| start.parse::<i64>().ok())
@@ -496,11 +536,11 @@ impl<'a> Markdown<'a> {
         if ordered
             && (element.has_attr("reversed")
                 || !(0..=999_999_999).contains(&number)
-                || items.iter().any(|item| item.has_attr("value")))
+                || items.clone().any(|item| item.has_attr("value")))
         {
-            return block(&self.html(element.node_id(), false));
+            return block(&self.html(element.node_id()));
         }
-        let mut output = Vec::new();
+        let mut output = String::new();
         for item in items {
             let marker = if ordered {
                 format!("{number}. ")
@@ -509,11 +549,12 @@ impl<'a> Markdown<'a> {
             };
             let text = self.list_item(item, &marker);
             if !text.is_empty() {
-                output.push(text);
+                output.push_str(&text);
+                output.push_str("\n\n");
             }
             number = number.saturating_add(1);
         }
-        block(&output.join("\n\n"))
+        block(&output)
     }
 
     fn list_item(&self, element: ElementRef<'_>, marker: &str) -> String {
@@ -529,12 +570,8 @@ impl<'a> Markdown<'a> {
                 content.push('\n');
                 content.push_str(value.trim_matches('\n'));
                 content.push('\n');
-            } else if content.ends_with('\n') && value.starts_with('\n') {
-                content.truncate(content.trim_end_matches('\n').len());
-                content.push_str("\n\n");
-                content.push_str(value.trim_start_matches('\n'));
             } else {
-                content.push_str(&value);
+                append_markdown(&mut content, &value);
             }
         }
         if content.trim().is_empty() {
@@ -554,38 +591,29 @@ impl<'a> Markdown<'a> {
     }
 
     fn table(&self, table: ElementRef<'_>) -> String {
-        fn collect<'a>(
-            document: &'a Document,
-            element: ElementRef<'a>,
-            rows: &mut Vec<ElementRef<'a>>,
-        ) {
-            for child in element
-                .children()
-                .filter_map(|node| document.element_ref(node))
-            {
+        fn collect<'a>(element: ElementRef<'a>, rows: &mut Vec<ElementRef<'a>>) {
+            for child in element.child_elements() {
                 match child.tag() {
                     "tr" => rows.push(child),
-                    "thead" | "tbody" | "tfoot" => collect(document, child, rows),
+                    "thead" | "tbody" | "tfoot" => collect(child, rows),
                     _ => {}
                 }
             }
         }
         let mut rows = Vec::new();
-        collect(self.document, table, &mut rows);
+        collect(table, &mut rows);
         rows.retain(|row| self.includes(row.node_id()));
         let cells = rows
             .iter()
             .map(|row| {
-                row.children()
-                    .filter_map(|node| self.document.element_ref(node))
+                row.child_elements()
                     .filter(|cell| matches!(cell.tag(), "td" | "th"))
                     .filter(|cell| self.includes(cell.node_id()) || self.partial)
                     .collect::<Vec<_>>()
             })
             .collect::<Vec<_>>();
         let caption = table
-            .children()
-            .filter_map(|node| self.document.element_ref(node))
+            .child_elements()
             .filter(|child| child.tag() == "caption")
             .map(|caption| self.children(caption))
             .collect::<String>();
@@ -598,60 +626,64 @@ impl<'a> Markdown<'a> {
             .is_some_and(|row| !row.is_empty() && row.iter().all(|cell| cell.tag() == "th"));
         let complex = cells.iter().enumerate().any(|(index, row)| {
             row.iter().any(|cell| {
-                cell.attr("rowspan")
-                    .is_some_and(|span| span.parse::<usize>().is_ok_and(|span| span != 1))
-                    || cell
-                        .attr("colspan")
-                        .is_some_and(|span| span.parse::<usize>().is_ok_and(|span| span != 1))
+                parse_positive_span(cell.attr("rowspan")) > 1
+                    || parse_positive_span(cell.attr("colspan")) > 1
                     || (cell.tag() == "th" && !(index == 0 && header))
                     || self.has_block_children(*cell)
             })
         });
         if complex {
-            return block(&self.html(table.node_id(), false));
+            return block(&self.html(table.node_id()));
         }
-        let mut output = if header {
-            self.table_row(&cells[0], columns)
+        let mut output = String::new();
+        if header {
+            self.write_table_row(&mut output, &cells[0], columns);
         } else {
-            format!("|{}", " |".repeat(columns))
-        };
+            output.push('|');
+            output.extend(repeat_n(" |", columns));
+        }
         output.push('\n');
-        output.push_str(&format!("|{}", " --- |".repeat(columns)));
+        write_markdown_table_row(&mut output, repeat_n("---", columns));
         for row in cells.iter().skip(usize::from(header)) {
             output.push('\n');
-            output.push_str(&self.table_row(row, columns));
+            self.write_table_row(&mut output, row, columns);
         }
         format!("{}{}", block(&caption), block(&output))
     }
 
-    fn table_row(&self, cells: &[ElementRef<'_>], columns: usize) -> String {
-        let mut result = "|".to_owned();
-        for column in 0..columns {
-            let value = cells
-                .get(column)
-                .map_or_else(String::new, |cell| self.children(*cell));
-            // GFM parses pipes before inline Markdown, including code spans.
-            let mut escaped = String::new();
-            let mut slashes = 0;
-            for ch in value.trim().chars() {
-                if ch == '|' && slashes % 2 == 0 {
-                    escaped.push('\\');
+    fn write_table_row(&self, output: &mut String, cells: &[ElementRef<'_>], columns: usize) {
+        write_markdown_table_row(
+            output,
+            (0..columns).map(|column| {
+                let value = cells
+                    .get(column)
+                    .map_or_else(String::new, |cell| self.children(*cell));
+                // GFM parses pipes before inline Markdown, including code spans.
+                let value = value.trim();
+                let mut escaped = String::with_capacity(value.len());
+                let mut slashes = 0;
+                for ch in value.chars() {
+                    if ch == '\n' {
+                        if escaped.ends_with("  ") {
+                            escaped.truncate(escaped.len() - 2);
+                        }
+                        escaped.push_str("<br>");
+                    } else {
+                        if ch == '|' && slashes % 2 == 0 {
+                            escaped.push('\\');
+                        }
+                        escaped.push(ch);
+                    }
+                    slashes = if ch == '\\' { slashes + 1 } else { 0 };
                 }
-                escaped.push(ch);
-                slashes = if ch == '\\' { slashes + 1 } else { 0 };
-            }
-            result.push_str(&format!(
-                " {} |",
-                escaped.replace("  \n", "<br>").replace('\n', "<br>")
-            ));
-        }
-        result
+                escaped
+            }),
+        );
     }
 
     fn has_block_children(&self, element: ElementRef<'_>) -> bool {
         element
-            .children()
-            .filter_map(|node| self.document.element_ref(node))
+            .child_elements()
             .any(|child| {
                 matches!(child.tag(), "table" | "pre" | "ul" | "ol" | "blockquote")
                     || block_tag(child.tag())
@@ -661,29 +693,25 @@ impl<'a> Markdown<'a> {
 
     /// Structural HTML fallback uses selected text and a small attribute set;
     /// it never copies styles, event handlers, or unselected authored text.
-    fn html(&self, node: DomNodeId, empty_cell: bool) -> String {
+    fn html(&self, node: DomNodeId) -> String {
+        let mut output = String::new();
+        self.write_html(node, false, &mut output);
+        output
+    }
+
+    fn write_html(&self, node: DomNodeId, empty_cell: bool, output: &mut String) {
         if let Some(text) = self.text.get(&node) {
-            return escape_html(text);
+            write_escaped_html_attribute(output, text);
+            return;
         }
         let Some(element) = self.document.element_ref(node) else {
-            return String::new();
+            return;
         };
         let tag = element.tag();
         if excluded(tag) || (!self.includes(node) && !empty_cell) {
-            return String::new();
+            return;
         }
-        let content = element
-            .children()
-            .map(|child| {
-                let cell = tag == "tr"
-                    && self
-                        .document
-                        .element_ref(child)
-                        .is_some_and(|child| matches!(child.tag(), "td" | "th"));
-                self.html(child, cell)
-            })
-            .collect::<String>();
-        if !matches!(
+        let wrapped = matches!(
             tag,
             "table"
                 | "caption"
@@ -711,29 +739,52 @@ impl<'a> Markdown<'a> {
                 | "a"
                 | "img"
                 | "br"
-        ) {
-            return content;
-        }
-        let mut output = format!("<{tag}");
-        for name in [
-            "rowspan", "colspan", "start", "reversed", "value", "href", "src", "alt", "title",
-        ] {
-            if let Some(value) = element.attr(name) {
-                output.push_str(&format!(" {name}=\"{}\"", escape_html(value)));
+        );
+        if wrapped {
+            output.push('<');
+            output.push_str(tag);
+            for name in [
+                "rowspan", "colspan", "start", "reversed", "value", "href", "src", "alt", "title",
+            ] {
+                if let Some(value) = element.attr(name) {
+                    output.push(' ');
+                    output.push_str(name);
+                    output.push_str("=\"");
+                    write_escaped_html_attribute(output, value);
+                    output.push('"');
+                }
             }
+            output.push('>');
         }
-        output.push('>');
-        output.push_str(&content);
-        if !matches!(tag, "br" | "img") {
-            output.push_str(&format!("</{tag}>"));
+        for child in element.children() {
+            let cell = tag == "tr"
+                && self
+                    .document
+                    .element_ref(child)
+                    .is_some_and(|child| matches!(child.tag(), "td" | "th"));
+            self.write_html(child, cell, output);
         }
-        output
+        if wrapped && !matches!(tag, "br" | "img") {
+            output.push_str("</");
+            output.push_str(tag);
+            output.push('>');
+        }
     }
 }
 
 impl RenderTable {
+    pub fn export(&self, request: TableExportRequest) -> Option<String> {
+        match request {
+            TableExportRequest::Whole(TableExportFormat::Markdown) => self.markdown(),
+            TableExportRequest::Whole(TableExportFormat::Html) => self.unstyled_html(),
+            TableExportRequest::Whole(TableExportFormat::AuthoredHtml) =>
+                (!self.authored_html().is_empty()).then(|| self.authored_html().to_owned()),
+            TableExportRequest::CellsMarkdown { rows, columns } => self.markdown_in(rows, columns),
+        }
+    }
+
     /// Portable structural table HTML, retaining cell spans without author styling.
-    pub fn unstyled_html(&self) -> Option<String> {
+    fn unstyled_html(&self) -> Option<String> {
         if self.rows().is_empty() {
             return None;
         }
@@ -751,7 +802,7 @@ impl RenderTable {
                     html.push_str(&format!(" colspan=\"{}\"", cell.colspan()));
                 }
                 html.push('>');
-                html.push_str(&escape_html(cell.text()));
+                write_escaped_html_attribute(&mut html, cell.text());
                 html.push_str("</");
                 html.push_str(tag);
                 html.push('>');
@@ -765,7 +816,7 @@ impl RenderTable {
     /// Copy the logical table grid as a GFM pipe table. Merged cells put their
     /// text in the first covered slot and leave the other slots empty. Tables
     /// without headers receive an empty header, preserving every data row.
-    pub fn markdown(&self) -> Option<String> {
+    fn markdown(&self) -> Option<String> {
         self.markdown_in(0..self.rows().len(), 0..self.column_count())
     }
 
@@ -774,7 +825,7 @@ impl RenderTable {
     /// reversed selection returns `None`. Cell contents are exported as text.
     /// Use `RenderExportView::markdown_for_box` to retain inline formatting or
     /// structural HTML for merged and nested tables instead.
-    pub fn markdown_in(&self, rows: Range<usize>, columns: Range<usize>) -> Option<String> {
+    fn markdown_in(&self, rows: Range<usize>, columns: Range<usize>) -> Option<String> {
         let row_end = rows.end.min(self.rows().len());
         let column_end = columns.end.min(self.column_count());
         if rows.start >= row_end || columns.start >= column_end {
@@ -783,34 +834,44 @@ impl RenderTable {
         let width = column_end - columns.start;
         let mut grid = vec![vec![String::new(); width]; row_end - rows.start];
         let mut header = false;
-        for row in self.rows() {
-            for cell in row.cells() {
-                if cell.row().saturating_add(cell.rowspan()) <= rows.start
-                    || cell.row() >= row_end
-                    || cell.column().saturating_add(cell.colspan()) <= columns.start
-                    || cell.column() >= column_end
-                {
-                    continue;
-                }
-                header |= cell.row() == rows.start && cell.is_header();
-                let row = cell.row().max(rows.start) - rows.start;
-                let column = cell.column().max(columns.start) - columns.start;
-                grid[row][column] = escape_text(&cell.text().replace(['\r', '\n'], " "));
+        for cell in self.cells() {
+            let cell_rows = cell.row_range();
+            let cell_columns = cell.column_range();
+            if cell_rows.end <= rows.start
+                || cell_rows.start >= row_end
+                || cell_columns.end <= columns.start
+                || cell_columns.start >= column_end
+            {
+                continue;
             }
+            header |= cell.row() == rows.start && cell.is_header();
+            let row = cell_rows.start.max(rows.start) - rows.start;
+            let column = cell_columns.start.max(columns.start) - columns.start;
+            grid[row][column] = escape_text(&cell.text().replace(['\r', '\n'], " "));
         }
-        let format_row = |row: &[String]| format!("| {} |", row.join(" | "));
-        let mut lines = vec![if header {
-            format_row(&grid[0])
+        let mut output = String::new();
+        if header {
+            write_markdown_table_row(&mut output, &grid[0]);
         } else {
-            format_row(&vec![String::new(); width])
-        }];
-        lines.push(format!("| {} |", vec!["---"; width].join(" | ")));
-        lines.extend(
-            grid.iter()
-                .skip(usize::from(header))
-                .map(|row| format_row(row)),
-        );
-        Some(lines.join("\n"))
+            write_markdown_table_row(&mut output, repeat_n("", width));
+        }
+        output.push('\n');
+        write_markdown_table_row(&mut output, repeat_n("---", width));
+        for row in grid.iter().skip(usize::from(header)) {
+            output.push('\n');
+            write_markdown_table_row(&mut output, row);
+        }
+        Some(output)
+    }
+}
+
+/// Append already-escaped table cells to the export buffer.
+fn write_markdown_table_row(output: &mut String, cells: impl IntoIterator<Item = impl AsRef<str>>) {
+    output.push('|');
+    for cell in cells {
+        output.push(' ');
+        output.push_str(cell.as_ref());
+        output.push_str(" |");
     }
 }
 
@@ -838,6 +899,16 @@ fn block_tag(tag: &str) -> bool {
             | "dt"
             | "dd"
     )
+}
+
+fn append_markdown(output: &mut String, content: &str) {
+    if output.ends_with('\n') && content.starts_with('\n') {
+        output.truncate(output.trim_end_matches('\n').len());
+        output.push_str("\n\n");
+        output.push_str(content.trim_start_matches('\n'));
+    } else {
+        output.push_str(content);
+    }
 }
 
 fn block(content: &str) -> String {
@@ -898,17 +969,26 @@ fn code_span(text: &str) -> String {
     if text.is_empty() {
         return String::new();
     }
-    let text = text.replace('\n', " ");
-    let fence = "`".repeat(longest_backticks(&text) + 1);
+    let fence = longest_backticks(text) + 1;
     let pad = text.starts_with('`')
         || text.ends_with('`')
-        || (text.starts_with(' ') && text.ends_with(' ') && !text.chars().all(|ch| ch == ' '));
-    let pad = if pad { " " } else { "" };
-    format!("{fence}{pad}{text}{pad}{fence}")
+        || (text.starts_with([' ', '\n'])
+            && text.ends_with([' ', '\n'])
+            && !text.bytes().all(|byte| byte == b' ' || byte == b'\n'));
+    let mut output = String::with_capacity(text.len() + 2 * fence + 2 * usize::from(pad));
+    output.extend(
+        repeat_n('`', fence)
+            .chain(pad.then_some(' '))
+            .chain(text.chars().map(|ch| if ch == '\n' { ' ' } else { ch }))
+            .chain(pad.then_some(' '))
+            .chain(repeat_n('`', fence)),
+    );
+    output
 }
 
 fn destination(value: &str) -> String {
-    let mut output = String::new();
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut output = String::with_capacity(value.len());
     for ch in value.chars() {
         if ch.is_whitespace()
             || ch.is_control()
@@ -916,7 +996,9 @@ fn destination(value: &str) -> String {
         {
             let mut buffer = [0; 4];
             for byte in ch.encode_utf8(&mut buffer).bytes() {
-                output.push_str(&format!("%{byte:02X}"));
+                output.push('%');
+                output.push(HEX[(byte >> 4) as usize] as char);
+                output.push(HEX[(byte & 0x0f) as usize] as char);
             }
         } else if ch == '&' {
             output.push_str("&amp;");
@@ -929,28 +1011,17 @@ fn destination(value: &str) -> String {
 
 fn title(value: Option<&str>) -> String {
     value.map_or_else(String::new, |value| {
-        format!(" \"{}\"", escape_html(value).replace('\n', " "))
-    })
-}
-
-fn escape_html(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-}
-
-fn within(document: &Document, mut node: DomNodeId, root: DomNodeId) -> bool {
-    loop {
-        if node == root {
-            return true;
+        let mut output = String::with_capacity(value.len() + 3);
+        output.push_str(" \"");
+        for (index, line) in value.split('\n').enumerate() {
+            if index != 0 {
+                output.push(' ');
+            }
+            write_escaped_html_attribute(&mut output, line);
         }
-        let Some(parent) = document.get_dom_parent(node) else {
-            return false;
-        };
-        node = parent;
-    }
+        output.push('"');
+        output
+    })
 }
 
 fn code_language(element: ElementRef<'_>) -> Option<&str> {
@@ -965,4 +1036,157 @@ fn code_language(element: ElementRef<'_>) -> Option<&str> {
         })
         .or_else(|| element.attr("data-language"))
         .filter(|language| !language.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Markdown, finish_plain_text, finish_text};
+    use crate::allocation_test_support::count_allocations;
+
+    #[test]
+    fn structural_html_reuses_one_buffer_across_nested_elements() {
+        let prepared = crate::DocumentFactory::new().parse_with_new_pipeline(
+            "<table id='table' onclick='bad()'><tr><td colspan='2' title='a&amp;\"b'><small>café &amp; <strong>bold</strong></small><br><img src='x&amp;y'></td></tr></table>",
+            None,
+        );
+        let document = prepared.document();
+        let selected = Markdown {
+            document,
+            styles: prepared.styles(),
+            text: document
+                .node_ids()
+                .filter_map(|node| {
+                    document
+                        .text_ref(node)
+                        .map(|text| (node, text.text().to_owned()))
+                })
+                .collect(),
+            active: document.node_ids().collect(),
+            visible: Default::default(),
+            partial: true,
+            inline_pre: None,
+        };
+        let table = document.element_by_id("table").unwrap().node_id();
+        let mut output = String::with_capacity(1024);
+        output.push_str("prefix:");
+        let pointer = output.as_ptr();
+        let (_, allocations) = count_allocations(|| selected.write_html(table, false, &mut output));
+        assert_eq!(
+            output,
+            "prefix:<table><tbody><tr><td colspan=\"2\" title=\"a&amp;&quot;b\">café &amp; <strong>bold</strong><br><img src=\"x&amp;y\"></td></tr></tbody></table>"
+        );
+        assert_eq!(output.as_ptr(), pointer);
+        assert_eq!(allocations, 0);
+    }
+
+    #[test]
+    fn text_finishing_reuses_the_export_buffer() {
+        let cases: [(&str, &str, fn(char) -> bool); 3] = [
+            (
+                "\n\n \tcafé\u{a0}\r\n🙂e\u{301} \n\n",
+                " \tcafé\u{a0}\r\n🙂e\u{301} ",
+                |character| character == '\n',
+            ),
+            (
+                "\u{2003}\t café\n🙂e\u{301} \u{a0}",
+                "café\n🙂e\u{301}",
+                char::is_whitespace,
+            ),
+            ("already trimmed", "already trimmed", char::is_whitespace),
+        ];
+        for (source, expected, trim) in cases {
+            let mut text = String::with_capacity(source.len() + 64);
+            text.push_str(source);
+            let pointer = text.as_ptr();
+            let capacity = text.capacity();
+            let (result, allocations) = count_allocations(|| finish_text(text, trim));
+            let result = result.unwrap();
+            assert_eq!(result, expected);
+            assert_eq!(result.as_ptr(), pointer);
+            assert_eq!(result.capacity(), capacity);
+            assert_eq!(allocations, 0);
+        }
+        for source in ["", "\n\n"] {
+            let text = source.to_owned();
+            let (result, allocations) = count_allocations(|| finish_plain_text(text));
+            assert!(result.is_none());
+            assert_eq!(allocations, 0);
+        }
+    }
+}
+
+/// Convert one range without preparing unrequested representations.
+pub fn render_export_view_text<'a>(
+    value: RenderExportView<'a>,
+    glyphs: Range<u32>,
+    format: TextExportFormat,
+) -> TextExport {
+    let (plain, markdown) = match format {
+        TextExportFormat::Plain => (value.plain_text(glyphs), None),
+        TextExportFormat::PlainWithParagraphBreaks => {
+            (value.plain_text_with_paragraph_breaks(glyphs), None)
+        }
+        TextExportFormat::Markdown => (None, value.markdown(glyphs)),
+        TextExportFormat::PlainAndMarkdown => value.selection_text(glyphs),
+    };
+    TextExport { plain, markdown }
+}
+
+/// Whether an image resource represents a retained mathematical formula.
+pub fn render_export_view_is_equation<'a>(value: RenderExportView<'a>, image: ImageId) -> bool {
+    text_paint::render_view_image_mathml(&value.doc.render_view(value.glyph_metrics), image)
+        .is_some()
+}
+
+/// Export disjoint source ranges once in document order. Duplicates and
+/// overlaps are merged; generated content and hidden text are excluded.
+pub fn render_export_view_plain_text_ranges<'a>(
+    value: RenderExportView<'a>,
+    ranges: impl IntoIterator<Item = Range<u32>>,
+) -> Option<String> {
+    let count = value.doc.inputs.text.content().characters().len();
+    let mut ranges: Vec<_> = ranges.into_iter().collect();
+    if ranges
+        .iter()
+        .any(|range| range.start > range.end || range.end as usize > count)
+    {
+        return None;
+    }
+    merge_text_ranges(&mut ranges);
+    if ranges.is_empty() {
+        return None;
+    }
+    let root = value.doc.document().dom_root()?;
+    let selected = Markdown::new_ranges(value.doc, Some(&ranges), root);
+    finish_plain_text(selected.plain(root))
+}
+
+/// Convert a selected source-backed box, such as a table, code block, or
+/// image. Invalid and synthetic boxes return `None`.
+pub fn render_export_view_markdown_for_box<'a>(
+    value: RenderExportView<'a>,
+    box_id: BoxId,
+) -> Option<String> {
+    let box_idx = layout_state::box_id_index(box_id);
+    let document = value.doc.document();
+    let root = document.node_id_from_raw(value.doc.box_dom_element_idx(box_idx)?)?;
+    Markdown::new(value.doc, None, root).finish(root)
+}
+
+pub fn text_for_lines(
+    value: RenderExportView<'_>,
+    lines: impl IntoIterator<Item = LineId>,
+) -> Option<String> {
+    let view = value.doc.render_view(value.glyph_metrics);
+    let text = view.text();
+    render_export_view_plain_text_ranges(
+        value,
+        lines.into_iter().flat_map(|line| {
+            text_paint::render_text_view_line_text_fragments(text, line)
+                .into_iter()
+                .flatten()
+                .filter(|fragment| fragment.visible())
+                .map(|fragment| fragment.glyphs())
+        }),
+    )
 }

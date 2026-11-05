@@ -1,10 +1,8 @@
+use html_style_model::computed_style;
 use super::super::border_geometry::{
-    emit_border_fragments, emit_outline_fragments, emit_uniform_3d_border, physical_borders,
-    uniform_solid_border,
+    emit_outline_fragments, emit_uniform_3d_border, physical_borders,
 };
-use super::super::decorations::DecorationEmitter;
-use super::super::paint_program::PaintOperation;
-use crate::layout_model::RoundedDecoration;
+use super::super::decorations::{DecorationEmitter, block_border_box_rect};
 use html_style_model::BorderStyle;
 use kurbo::Rect;
 
@@ -12,26 +10,16 @@ impl DecorationEmitter<'_, '_, '_> {
     /// Returns the used border box produced by layout. Margins affect its
     /// position and available size earlier; they are not part of its stored size.
     fn block_border_box_rect(&self, box_idx: usize) -> Rect {
-        if let Some(rect) = self.retained_rect { return rect; }
-        self.geometry
-            .decoration_rect(box_idx)
-            .map(|rect| rect + self.geometry.point(box_idx).to_vec2())
-            .unwrap_or_else(|| {
-                Rect::from_origin_size(self.geometry.point(box_idx), self.geometry.size(box_idx))
-            })
+        self.retained_rect
+            .unwrap_or_else(|| block_border_box_rect(self.geometry, box_idx))
     }
 
     fn record_block_decoration_owners(&mut self, box_idx: usize, start: usize) {
         self.fragments
-            .record_decoration_owner_since(self.placement, box_idx as u32, start);
+            .record_decoration_owner_since(box_idx as u32, start);
     }
 
     pub(in crate::layout) fn emit_block_background(&mut self, box_idx: usize) {
-        let rect = self.block_border_box_rect(box_idx);
-        if self.reader.background_can_change(box_idx) {
-            self.fragments.record_paint(self.placement, PaintOperation::Background { owner: box_idx as u32, rect });
-        }
-        if !self.fragments.is_paint_replay() { return; }
         if self.reader.background_paints_on_canvas(box_idx) {
             return;
         }
@@ -50,26 +38,13 @@ impl DecorationEmitter<'_, '_, '_> {
             rect,
             background_color,
             false,
-            (!radii.is_zero()).then_some(RoundedDecoration {
-                radii,
-                border_width: None,
-            }),
+            (!computed_style::corner_radii_is_zero(radii)).then_some(radii),
         );
         self.record_block_decoration_owners(box_idx, start);
     }
 
-    pub(in crate::layout) fn emit_block_decorations(&mut self, box_idx: usize) {
-        self.emit_block_background(box_idx);
-        self.emit_block_border_and_outline(box_idx);
-    }
-
     pub(in crate::layout) fn emit_block_border_and_outline(&mut self, box_idx: usize) {
         let style = self.reader.paint_style(box_idx);
-        if [style.border_top_width(), style.border_right_width(), style.border_bottom_width(), style.border_left_width()].into_iter().any(|width| width > 0.0) || (style.outline().style != BorderStyle::None && style.outline().width() > 0.0) {
-            let rect = self.block_border_box_rect(box_idx);
-            self.fragments.record_paint(self.placement, PaintOperation::BorderOutline { owner: box_idx as u32, rect });
-        }
-        if !self.fragments.is_paint_replay() { return; }
         if style.visibility() == html_style_model::Visibility::Hidden {
             return;
         }
@@ -78,42 +53,12 @@ impl DecorationEmitter<'_, '_, '_> {
         let right_border = borders.right.solid();
         let bottom_border = borders.bottom.solid();
         let left_border = borders.left.solid();
-        let uniform_border = uniform_solid_border(&style);
-        let uniform_3d = [BorderStyle::Groove, BorderStyle::Ridge]
-            .into_iter()
-            .find_map(|border_style| {
-                let width = style.border_top_width();
-                let color = style.border_top_color();
-                (width > 0.0
-                    && [
-                        style.border_top_style(),
-                        style.border_right_style(),
-                        style.border_bottom_style(),
-                        style.border_left_style(),
-                    ]
-                    .into_iter()
-                    .all(|side| side == border_style)
-                    && [
-                        style.border_right_width(),
-                        style.border_bottom_width(),
-                        style.border_left_width(),
-                    ]
-                    .into_iter()
-                    .all(|other| other == width)
-                    && [
-                        style.border_right_color(),
-                        style.border_bottom_color(),
-                        style.border_left_color(),
-                    ]
-                    .into_iter()
-                    .all(|other| other == color))
-                .then_some((width as f64, color, border_style))
-            });
-        let has_any_border = uniform_3d.is_some()
-            || top_border.is_some()
-            || right_border.is_some()
-            || bottom_border.is_some()
-            || left_border.is_some();
+        let uniform_border = borders.uniform();
+        let uniform_3d = uniform_border
+            .filter(|border| matches!(border.style, BorderStyle::Groove | BorderStyle::Ridge));
+        let uniform_solid = uniform_border.and_then(|border| border.solid());
+        let solid_borders = [top_border, right_border, bottom_border, left_border];
+        let has_any_border = uniform_3d.is_some() || solid_borders.iter().any(Option::is_some);
         let outline = style.outline();
         let outline_color = style.outline_color();
 
@@ -121,35 +66,17 @@ impl DecorationEmitter<'_, '_, '_> {
         if has_any_border {
             let rect = self.block_border_box_rect(box_idx);
             let radii = style.border_radii().resolve(rect.width(), rect.height());
-            if let Some((width, color, border_style)) = uniform_3d {
+            if let Some(border) = uniform_3d {
                 emit_uniform_3d_border(
                     self.fragments.decoration_store_mut(),
                     rect,
-                    width,
-                    color,
-                    border_style,
+                    border.width,
+                    border.color,
+                    border.style,
                     false,
-                );
-            } else if let Some((width, color)) = uniform_border.filter(|_| !radii.is_zero()) {
-                self.push_decoration(
-                    rect,
-                    color,
-                    false,
-                    Some(RoundedDecoration {
-                        radii,
-                        border_width: Some(width as f32),
-                    }),
                 );
             } else {
-                emit_border_fragments(
-                    self.fragments.decoration_store_mut(),
-                    rect,
-                    top_border,
-                    right_border,
-                    bottom_border,
-                    left_border,
-                    false,
-                );
+                self.emit_solid_border(rect, radii, uniform_solid, solid_borders, false);
             }
         }
         if outline.style != BorderStyle::None && outline.width() > 0.0 {

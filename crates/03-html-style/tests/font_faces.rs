@@ -133,10 +133,8 @@ fn font_faces_skip_unusable_rules_and_preserve_duplicate_family_faces() {
         @font-face { font-family: Reader; src: url(bold.ttf); font-weight: bold; }
     "#],
     );
-    assert_eq!(styled.font_faces().len(), 2);
-    assert_eq!(styled.font_faces()[0].family, "Reader");
-    assert_eq!(styled.font_faces()[1].family, "Reader");
-    assert_eq!(styled.font_faces()[1].weight, 700.0..=700.0);
+    assert_eq!(styled.font_faces().iter().map(|face| face.family.as_str()).collect::<Vec<_>>(), ["", "Reader", "Reader"]);
+    assert_eq!(styled.font_faces()[2].weight, 700.0..=700.0);
 }
 
 #[test]

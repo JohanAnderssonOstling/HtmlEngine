@@ -1,6 +1,7 @@
 //! Cascade ordering for one style target.
 
-use super::*;
+use crate::style::compiled::{EffectiveRuleId, PreparedRuleSet};
+use std::hash::Hash;
 
 /// Matched rule with specificity for cascade sorting
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
@@ -35,22 +36,18 @@ impl CascadePlan {
                 .important_declarations
                 .is_empty()
         }));
-        normal.sort_by(|a, b| {
-            prepared.get(a.id).priority().compare_normal(
-                a.specificity,
-                a.scope_proximity,
-                prepared.get(b.id).priority(),
-                b.specificity,
-                b.scope_proximity,
+        normal.sort_by_key(|matched| {
+            prepared.get(matched.id).priority().order_key(
+                matched.specificity,
+                matched.scope_proximity,
+                false,
             )
         });
-        important.sort_by(|a, b| {
-            prepared.get(a.id).priority().compare_important(
-                a.specificity,
-                a.scope_proximity,
-                prepared.get(b.id).priority(),
-                b.specificity,
-                b.scope_proximity,
+        important.sort_by_key(|matched| {
+            prepared.get(matched.id).priority().order_key(
+                matched.specificity,
+                matched.scope_proximity,
+                true,
             )
         });
         Self { normal, important }

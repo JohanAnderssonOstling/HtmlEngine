@@ -1,13 +1,16 @@
+use html_dom::storage;
 use crate::layout_model::{
-    Children, InlineContent, InlineItem, InlineItemKind, LayoutBox, LayoutMode, LayoutTree,
-    ListItemMarker, TableCellBox, TableColumnGroupSpan, TableColumnTrack, TableColumnWidthHint,
-    TableRowBox,
+    BlockBox, Children, InlineContent, InlineItem, InlineItemKind, LayoutBox, LayoutMode,
+    LayoutTree, ListItemMarker, TableBox, TableCellBox, TableRowBox,
 };
-use html_style_model::{ComputedStyles, Display, ListStylePosition, StyleIndices, StyleView};
+use html_dom::ElementRef;
+use html_style_model::{CaptionSide, ComputedStyles, Display, Float, ListStylePosition, PositionMode, StyleIndices, StyleView};
+use html_text::get_style;
 use std::ops::Range;
 
+use super::generated::ResolvedGeneratedContent;
 use super::inline::GeneratedInlinePlan;
-use super::table::{GeneratedTablePlan, TableRole, nearest_table};
+use super::table::{GeneratedTablePlan, TableRole, nearest_table, plan_generated_table_principal};
 
 /// Owns the invariant-sensitive construction of the two box-building outputs.
 /// DOM traversal and CSS generated-content state deliberately stay outside.
@@ -38,87 +41,60 @@ impl<'styles, 'out> BoxTreeWriter<'styles, 'out> {
         self.inline.inline_items().len() as u32
     }
 
-    pub(super) fn style_for_box(&self, box_idx: usize) -> StyleView<'_> {
-        let indices = self
-            .tree
-            .box_at(box_idx)
-            .and_then(LayoutBox::style)
-            .unwrap_or_else(|| self.styles.default_indices());
-        self.styles.view(indices).expect("validated style handle")
+    fn layout_mode_mut(&mut self, box_idx: u32) -> Option<&mut LayoutMode> {
+        self.tree
+            .box_at_mut(box_idx as usize)
+            .map(LayoutBox::layout_mode_mut)
     }
 
-    pub(super) fn anonymous_style_for_box(&self, box_idx: u32) -> Option<StyleIndices> {
-        self.tree
-            .box_at(box_idx as usize)
-            .and_then(LayoutBox::style)
-            .and_then(|style| self.styles.anonymous_box_indices(style))
+    pub(super) fn style_for_box(&self, box_idx: usize) -> StyleView<'_> {
+        get_style(self.styles, self.tree, box_idx)
     }
 
     pub(super) fn push_dom_box(
         &mut self,
-        dom_element: u32,
-        image_idx: Option<u32>,
+        element: ElementRef<'_>,
         parent: Option<u32>,
         style: Option<StyleIndices>,
         layout_mode: LayoutMode,
-        is_body: bool,
     ) -> u32 {
         let box_idx = self.tree.push_box(LayoutBox {
             layout_mode,
-            dom_element: Some(dom_element),
+            dom_element: Some(element.node_id().raw()),
             parent,
             style,
         });
-        if let Some(image_idx) = image_idx {
+        if let Some(image_idx) = storage::image_idx(element) {
             self.tree.set_box_image_idx(box_idx, image_idx);
         }
-        if is_body {
+        if element.tag().eq_ignore_ascii_case("body") {
             self.tree.set_body_box(box_idx);
         }
         box_idx
     }
 
-    pub(super) fn push_anonymous_table(&mut self, parent: u32, layout_mode: LayoutMode) -> u32 {
-        let style = self.anonymous_style_for_box(parent);
-        self.tree.push_box(LayoutBox {
-            layout_mode,
-            dom_element: None,
-            parent: Some(parent),
-            style,
-        })
+    pub(super) fn push_anonymous_child(&mut self, parent: u32, layout_mode: LayoutMode) -> u32 {
+        let style = self
+            .tree
+            .get_box_style_indices(parent as usize)
+            .and_then(|style| self.styles.anonymous_box_indices(style));
+        self.push_synthetic_box(parent, style, layout_mode)
     }
 
     pub(super) fn push_anonymous_row(&mut self, parent: u32) -> u32 {
-        let style = self.anonymous_style_for_box(parent);
-        self.tree.push_box(LayoutBox {
-            layout_mode: LayoutMode::TableRow(TableRowBox {
-                cells: Vec::new(),
-                out_of_flow: Vec::new(),
-            }),
-            dom_element: None,
-            parent: Some(parent),
-            style,
-        })
+        self.push_anonymous_child(parent, LayoutMode::TableRow(TableRowBox::default()))
     }
 
-    pub(super) fn push_anonymous_cell(&mut self, parent: u32, inherit_style: bool) -> u32 {
-        let style = inherit_style
-            .then(|| self.anonymous_style_for_box(parent))
-            .flatten();
-        self.tree.push_box(LayoutBox {
-            layout_mode: LayoutMode::TableCell(TableCellBox::new(Children::Empty)),
-            dom_element: None,
-            parent: Some(parent),
-            style,
-        })
+    pub(super) fn push_anonymous_cell(&mut self, parent: u32) -> u32 {
+        self.push_anonymous_child(
+            parent,
+            LayoutMode::TableCell(TableCellBox::new(Children::Empty)),
+        )
     }
 
     pub(super) fn push_anonymous_inline(&mut self, parent: u32) -> (u32, u32) {
         let start = self.item_position();
-        let style = self.anonymous_style_for_box(parent);
-        let mut box_ = LayoutBox::new_anonymous_box(start..start, Some(parent));
-        box_.set_style(style);
-        let box_idx = self.tree.push_box(box_);
+        let box_idx = self.push_anonymous_child(parent, LayoutMode::Anonymous(start..start));
         (box_idx, start)
     }
 
@@ -132,13 +108,7 @@ impl<'styles, 'out> BoxTreeWriter<'styles, 'out> {
     ) -> (u32, u32) {
         let start = self.item_position();
         let style = self.styles.anonymous_box_indices(inherited_from);
-        let box_ = LayoutBox {
-            layout_mode: LayoutMode::Inline(start..start),
-            dom_element: None,
-            parent: Some(parent),
-            style,
-        };
-        let box_idx = self.tree.push_box(box_);
+        let box_idx = self.push_synthetic_box(parent, style, LayoutMode::Inline(start..start));
         (box_idx, start)
     }
 
@@ -153,6 +123,22 @@ impl<'styles, 'out> BoxTreeWriter<'styles, 'out> {
             box_idx,
             dom_text_node,
         });
+    }
+
+    pub(super) fn push_inline_boundary(
+        &mut self,
+        box_idx: u32,
+        inline_start: bool,
+        inline_end: bool,
+    ) {
+        self.push_item(
+            InlineItemKind::InlineBoundary {
+                inline_start,
+                inline_end,
+            },
+            box_idx,
+            None,
+        );
     }
 
     pub(super) fn push_source_text(&mut self, text: &str, box_idx: u32, dom_text_node: u32) {
@@ -185,6 +171,14 @@ impl<'styles, 'out> BoxTreeWriter<'styles, 'out> {
         );
     }
 
+    pub(super) fn push_word_break(&mut self, box_idx: u32) {
+        // HTML represents wbr as a zero-width space for line breaking. It has
+        // no DOM text node or authored UTF-16 offset.
+        self.push_generated_text("\u{200b}", box_idx, |glyphs| InlineItemKind::Text {
+            glyphs,
+        });
+    }
+
     fn push_generated_text(
         &mut self,
         text: &str,
@@ -199,17 +193,12 @@ impl<'styles, 'out> BoxTreeWriter<'styles, 'out> {
         self.push_item(kind(glyph_start..glyph_end), box_idx, None);
     }
 
-    pub(super) fn finish_inline_box(&mut self, box_idx: u32, start: u32) {
+    pub(super) fn finish_inline_box(&mut self, box_idx: u32, start: u32) -> bool {
         let end = self.item_position();
-        if let Some(box_) = self.tree.box_at_mut(box_idx as usize) {
-            *box_.layout_mode_mut() = LayoutMode::Inline(start..end);
-        }
-    }
-
-    pub(super) fn finish_anonymous_box(&mut self, box_idx: u32, start: u32) -> bool {
-        let end = self.item_position();
-        if let Some(box_) = self.tree.box_at_mut(box_idx as usize) {
-            *box_.layout_mode_mut() = LayoutMode::Anonymous(start..end);
+        if let Some(LayoutMode::Inline(range) | LayoutMode::Anonymous(range)) =
+            self.layout_mode_mut(box_idx)
+        {
+            *range = start..end;
         }
         start < end
     }
@@ -228,25 +217,15 @@ impl<'styles, 'out> BoxTreeWriter<'styles, 'out> {
     }
 
     pub(super) fn set_box_children(&mut self, box_idx: u32, children: Children) {
-        if let Some(layout_mode) = self
-            .tree
-            .box_at_mut(box_idx as usize)
-            .map(LayoutBox::layout_mode_mut)
-        {
-            match layout_mode {
-                LayoutMode::Block(block) => block.children = children,
-                LayoutMode::TableCell(cell) => cell.children = children,
-                _ => {}
-            }
+        match self.layout_mode_mut(box_idx) {
+            Some(LayoutMode::Block(block)) => block.children = children,
+            Some(LayoutMode::TableCell(cell)) => cell.children = children,
+            _ => {}
         }
     }
 
     pub(super) fn set_flex_grid_children(&mut self, box_idx: u32, children: Vec<u32>) {
-        match self
-            .tree
-            .box_at_mut(box_idx as usize)
-            .map(LayoutBox::layout_mode_mut)
-        {
+        match self.layout_mode_mut(box_idx) {
             Some(LayoutMode::Flex(container)) => container.children = children,
             Some(LayoutMode::Grid(container)) => container.children = children,
             _ => unreachable!("flex/grid child construction requires a flex/grid layout mode"),
@@ -254,81 +233,61 @@ impl<'styles, 'out> BoxTreeWriter<'styles, 'out> {
     }
 
     pub(super) fn extend_with_group_rows(&self, group_idx: u32, rows: &mut Vec<u32>) {
-        if let Some(LayoutMode::Block(group)) = self
-            .tree
-            .box_at(group_idx as usize)
-            .map(LayoutBox::layout_mode)
+        if let Some(LayoutMode::Block(group)) = self.tree.get_box_layout_mode(group_idx as usize)
             && let Children::Blocks(group_rows) = &group.children
         {
             rows.extend(group_rows.iter().copied().filter(|&row| {
                 matches!(
-                    self.tree.box_at(row as usize).map(LayoutBox::layout_mode),
+                    self.tree.get_box_layout_mode(row as usize),
                     Some(LayoutMode::TableRow(_))
                 )
             }));
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn finish_table(
-        &mut self,
-        table_idx: u32,
-        rows: Vec<u32>,
-        row_groups: Vec<u32>,
-        captions_top: Vec<u32>,
-        captions_bottom: Vec<u32>,
-        columns: Vec<TableColumnTrack>,
-        column_groups: Vec<TableColumnGroupSpan>,
-        column_width_hints: Vec<TableColumnWidthHint>,
-    ) {
-        if let Some(LayoutMode::Table(table)) = self
-            .tree
-            .box_at_mut(table_idx as usize)
-            .map(LayoutBox::layout_mode_mut)
-        {
-            table.rows = rows;
-            table.row_groups = row_groups;
-            table.captions_top = captions_top;
-            table.captions_bottom = captions_bottom;
-            table.columns = columns;
-            table.column_groups = column_groups;
-            table.column_width_hints = column_width_hints;
+    pub(super) fn finish_table(&mut self, table_idx: u32, table: TableBox) {
+        // HTML rowspan=0 covers the remaining rows of the current row group.
+        // Resolve it before publishing the table so layout and queries share
+        // the same positive spans, including for anonymous row groups.
+        let mut group_start = 0;
+        while group_start < table.rows.len() {
+            let parent = self.tree.get_box_parent(table.rows[group_start] as usize);
+            let mut group_end = group_start + 1;
+            while group_end < table.rows.len()
+                && self.tree.get_box_parent(table.rows[group_end] as usize) == parent
+            {
+                group_end += 1;
+            }
+            for (offset, &row_idx) in table.rows[group_start..group_end].iter().enumerate() {
+                let Some(LayoutMode::TableRow(row)) = self.tree.get_box_layout_mode(row_idx as usize)
+                else {
+                    continue;
+                };
+                let cell_count = row.cells.len();
+                for position in 0..cell_count {
+                    let Some(LayoutMode::TableRow(row)) =
+                        self.tree.get_box_layout_mode(row_idx as usize)
+                    else {
+                        continue;
+                    };
+                    let cell_idx = row.cells[position];
+                    if let Some(LayoutMode::TableCell(cell)) = self.layout_mode_mut(cell_idx)
+                        && cell.rowspan == 0
+                    {
+                        cell.rowspan = group_end - group_start - offset;
+                    }
+                }
+            }
+            group_start = group_end;
+        }
+        if let Some(LayoutMode::Table(current)) = self.layout_mode_mut(table_idx) {
+            *current = table;
         }
     }
 
-    pub(super) fn set_row_children(
-        &mut self,
-        row_idx: u32,
-        cells: Vec<u32>,
-        out_of_flow: Vec<u32>,
-    ) {
-        if let Some(LayoutMode::TableRow(row)) = self
-            .tree
-            .box_at_mut(row_idx as usize)
-            .map(LayoutBox::layout_mode_mut)
-        {
-            row.cells = cells;
-            row.out_of_flow = out_of_flow;
-        }
-    }
-
-    pub(super) fn set_row_cells(&mut self, row_idx: u32, cells: Vec<u32>) {
-        if let Some(LayoutMode::TableRow(row)) = self
-            .tree
-            .box_at_mut(row_idx as usize)
-            .map(LayoutBox::layout_mode_mut)
-        {
-            row.cells = cells;
-        }
-    }
-
-    pub(super) fn append_row_cell(&mut self, row_idx: u32, cell_idx: u32) {
-        if let Some(LayoutMode::TableRow(row)) = self
-            .tree
-            .box_at_mut(row_idx as usize)
-            .map(LayoutBox::layout_mode_mut)
-        {
-            row.cells.push(cell_idx);
+    pub(super) fn finish_row(&mut self, row_idx: u32, row: TableRowBox) {
+        if let Some(LayoutMode::TableRow(current)) = self.layout_mode_mut(row_idx) {
+            *current = row;
         }
     }
 
@@ -340,12 +299,11 @@ impl<'styles, 'out> BoxTreeWriter<'styles, 'out> {
         text: &str,
     ) {
         let marker_style = self.styles.anonymous_box_indices(style).unwrap_or(style);
-        let marker_box = self.tree.push_box(LayoutBox {
-            layout_mode: LayoutMode::Inline(Range::default()),
-            dom_element: None,
-            parent: Some(list_item_box),
-            style: Some(marker_style),
-        });
+        let marker_box = self.push_synthetic_box(
+            list_item_box,
+            Some(marker_style),
+            LayoutMode::Inline(Range::default()),
+        );
         let start = self.item_position();
         self.push_generated_text(text, marker_box, |glyphs| InlineItemKind::Marker { glyphs });
         self.finish_inline_box(marker_box, start);
@@ -364,19 +322,29 @@ impl<'styles, 'out> BoxTreeWriter<'styles, 'out> {
             start_edge,
             end_edge,
         } = plan;
+        let style = self.styles.view(content.style).expect("validated generated style");
+        let absolute = style.layout.position == PositionMode::Absolute;
+        if absolute || style.float() != Float::None {
+            // Blockification does not put a positioned/floated pseudo into
+            // normal block flow. Materialize its own principal box, then
+            // retain the same zero-width source anchor as a real element.
+            let pseudo_box = if matches!(content.display, Display::Table | Display::InlineTable) {
+                let Some(plan) = plan_generated_table_principal(self.styles, content) else { return; };
+                let Some(principal) = self.materialize_generated_table(parent, plan) else { return; };
+                principal
+            } else {
+                self.push_generated_text_box(parent, &content)
+            };
+            let kind = if absolute { InlineItemKind::AbsoluteAnchor { box_idx: pseudo_box } }
+                else { InlineItemKind::FloatAnchor { box_idx: pseudo_box } };
+            self.push_item(kind, parent, None);
+            return;
+        }
         if content.display == Display::InlineBlock {
             // Generated inline-blocks are atomic inline-level boxes. Keeping
             // them as text-only inline fragments would discard their authored
             // width, height, and baseline contribution when `content` is empty.
-            let pseudo_box = self.tree.push_box(LayoutBox {
-                layout_mode: LayoutMode::Block(crate::layout_model::BlockBox {
-                    children: Children::Empty,
-                }),
-                dom_element: None,
-                parent: Some(parent),
-                style: Some(content.style),
-            });
-            self.set_generated_text_children(pseudo_box, content.style, &content.text, false);
+            let pseudo_box = self.push_generated_text_box(parent, &content);
             self.push_item(
                 InlineItemKind::AtomicBox {
                     box_idx: pseudo_box,
@@ -392,21 +360,10 @@ impl<'styles, 'out> BoxTreeWriter<'styles, 'out> {
         } else {
             Some(content.style)
         };
-        let pseudo_box = self.tree.push_box(LayoutBox {
-            layout_mode: LayoutMode::Inline(Range::default()),
-            dom_element: None,
-            parent: Some(parent),
-            style,
-        });
+        let pseudo_box =
+            self.push_synthetic_box(parent, style, LayoutMode::Inline(Range::default()));
         if content.text.is_empty() {
-            self.push_item(
-                InlineItemKind::InlineBoundary {
-                    inline_start: start_edge,
-                    inline_end: end_edge,
-                },
-                pseudo_box,
-                None,
-            );
+            self.push_inline_boundary(pseudo_box, start_edge, end_edge);
         } else {
             self.push_generated_text(&content.text, pseudo_box, |glyphs| InlineItemKind::Text {
                 glyphs,
@@ -418,14 +375,14 @@ impl<'styles, 'out> BoxTreeWriter<'styles, 'out> {
     pub(super) fn push_synthetic_box(
         &mut self,
         parent: u32,
-        style: StyleIndices,
+        style: Option<StyleIndices>,
         layout_mode: LayoutMode,
     ) -> u32 {
         self.tree.push_box(LayoutBox {
             layout_mode,
             dom_element: None,
             parent: Some(parent),
-            style: Some(style),
+            style,
         })
     }
 
@@ -436,12 +393,21 @@ impl<'styles, 'out> BoxTreeWriter<'styles, 'out> {
         inherited_from: StyleIndices,
     ) -> u32 {
         let style = self.styles.anonymous_box_indices(inherited_from);
-        self.tree.push_box(LayoutBox {
-            layout_mode,
-            dom_element: None,
-            parent: Some(parent),
-            style,
-        })
+        self.push_synthetic_box(parent, style, layout_mode)
+    }
+
+    pub(super) fn push_generated_text_box(
+        &mut self,
+        parent: u32,
+        content: &ResolvedGeneratedContent,
+    ) -> u32 {
+        let box_idx = self.push_synthetic_box(
+            parent,
+            Some(content.style),
+            LayoutMode::Block(BlockBox::default()),
+        );
+        self.set_generated_text_children(box_idx, content.style, &content.text, false);
+        box_idx
     }
 
     pub(super) fn set_generated_text_children(
@@ -486,42 +452,35 @@ impl<'styles, 'out> BoxTreeWriter<'styles, 'out> {
         for (index, planned) in boxes.iter().enumerate() {
             let parent = planned
                 .parent
-                .map(|parent| box_indices[parent])
-                .unwrap_or(parent_box);
+                .map_or(parent_box, |parent| box_indices[parent]);
             let box_idx = if index == principal_box {
-                self.push_synthetic_box(parent, style, planned.role.layout_mode())
+                self.push_synthetic_box(parent, Some(style), planned.role.layout_mode())
             } else {
                 self.push_anonymous_box(parent, planned.role.layout_mode(), style)
             };
             box_indices.push(box_idx);
             match planned.role {
                 TableRole::Table => {}
-                TableRole::RowGroup => {
+                TableRole::RowGroup | TableRole::Row | TableRole::Caption(_) => {
                     if let Some(table) = nearest_table(&boxes, planned.parent)
-                        && let Some(LayoutMode::Table(table)) = self
-                            .tree
-                            .box_at_mut(box_indices[table] as usize)
-                            .map(LayoutBox::layout_mode_mut)
+                        && let Some(LayoutMode::Table(table)) =
+                            self.layout_mode_mut(box_indices[table])
                     {
-                        table.row_groups.push(box_idx);
+                        let children = match planned.role {
+                            TableRole::RowGroup => &mut table.row_groups,
+                            TableRole::Row => &mut table.rows,
+                            TableRole::Caption(CaptionSide::Top) => &mut table.captions_top,
+                            TableRole::Caption(CaptionSide::Bottom) => &mut table.captions_bottom,
+                            _ => unreachable!("only table children enter this branch"),
+                        };
+                        children.push(box_idx);
                     }
-                }
-                TableRole::Row => {
-                    if let Some(table) = nearest_table(&boxes, planned.parent)
-                        && let Some(LayoutMode::Table(table)) = self
-                            .tree
-                            .box_at_mut(box_indices[table] as usize)
-                            .map(LayoutBox::layout_mode_mut)
-                    {
-                        table.rows.push(box_idx);
-                    }
-                    if let Some(group) = planned
-                        .parent
-                        .filter(|parent| matches!(boxes[*parent].role, TableRole::RowGroup))
-                        && let Some(LayoutMode::Block(group)) = self
-                            .tree
-                            .box_at_mut(box_indices[group] as usize)
-                            .map(LayoutBox::layout_mode_mut)
+                    if matches!(planned.role, TableRole::Row)
+                        && let Some(group) = planned
+                            .parent
+                            .filter(|parent| matches!(boxes[*parent].role, TableRole::RowGroup))
+                        && let Some(LayoutMode::Block(group)) =
+                            self.layout_mode_mut(box_indices[group])
                     {
                         match &mut group.children {
                             children @ Children::Empty => {
@@ -538,27 +497,10 @@ impl<'styles, 'out> BoxTreeWriter<'styles, 'out> {
                     if let Some(row) = planned
                         .parent
                         .filter(|parent| matches!(boxes[*parent].role, TableRole::Row))
-                        && let Some(LayoutMode::TableRow(row)) = self
-                            .tree
-                            .box_at_mut(box_indices[row] as usize)
-                            .map(LayoutBox::layout_mode_mut)
+                        && let Some(LayoutMode::TableRow(row)) =
+                            self.layout_mode_mut(box_indices[row])
                     {
                         row.cells.push(box_idx);
-                    }
-                }
-                TableRole::Caption(side) => {
-                    if let Some(table) = nearest_table(&boxes, planned.parent)
-                        && let Some(LayoutMode::Table(table)) = self
-                            .tree
-                            .box_at_mut(box_indices[table] as usize)
-                            .map(LayoutBox::layout_mode_mut)
-                    {
-                        match side {
-                            html_style_model::CaptionSide::Top => table.captions_top.push(box_idx),
-                            html_style_model::CaptionSide::Bottom => {
-                                table.captions_bottom.push(box_idx)
-                            }
-                        }
                     }
                 }
             }

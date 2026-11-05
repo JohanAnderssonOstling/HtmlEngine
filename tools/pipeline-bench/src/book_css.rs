@@ -1,13 +1,17 @@
 //! Compare fresh chapter factories with and without a book-owned CSS cache.
 
-use html::text::GlyphResourceStore;
+use html_pipeline::engine::GlyphResourceStore;
+use html_pipeline::engine::reader_style;
 
 use crate::counter::CacheCounters;
 use crate::opening::{style_details, summary};
 use crate::{Shaper, cpu_seconds, input, layout_fingerprint};
-use html::layout::{LayoutConstraints, TextCompositionPolicy};
-use html::pipeline::ResourceContext;
-use html::pipeline::{BookStylesheetCache, DocumentFactory, MarkupSyntax, parse_document};
+use html_pipeline::engine::LayoutConstraints;
+use html::layout::TextCompositionPolicy;
+use html_pipeline::ResourceContext;
+use html_pipeline::{BookStylesheetCache, DocumentFactory};
+use html_pipeline::MarkupSyntax;
+use html_pipeline::parse_document;
 use html::resources::FileSystemProvider;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -19,11 +23,13 @@ pub(super) fn run(manifest: &str, count: usize, detailed: bool, cache_counters: 
         serde_json::from_str(&std::fs::read_to_string(manifest).unwrap()).unwrap();
     assert!(!paths.is_empty());
     let mut inputs = input(String::new());
-    inputs.layout.text_composition_policy = TextCompositionPolicy::BookOptimized;
+    inputs.layout = inputs
+        .layout
+        .with_text_composition_policy(TextCompositionPolicy::BookOptimized);
     inputs.reader_overrides.link_foreground = None;
     let constraints = LayoutConstraints::new(600.0, 16.0)
         .unwrap()
-        .with_text_composition_policy(inputs.layout.text_composition_policy);
+        .with_text_composition_policy(inputs.layout.text_composition_policy());
     let mut samples = BTreeMap::<String, Vec<f64>>::new();
     let mut identities = vec![Value::Null; paths.len()];
     let mut cache_records = Vec::new();
@@ -46,7 +52,8 @@ pub(super) fn run(manifest: &str, count: usize, detailed: bool, cache_counters: 
                 let mut factory = DocumentFactory::new();
                 let factory_provider = FileSystemProvider;
                 let factory_resources = ResourceContext::new(&factory_provider, (path).as_ref());
-                factory.set_reader_overrides(inputs.reader_overrides.layout_overrides());
+                factory
+                    .set_reader_overrides(reader_style::layout_overrides(&inputs.reader_overrides));
                 factory.set_media_environment(inputs.style_environment.media);
                 if shared {
                     factory.set_book_stylesheet_cache(cache.clone());

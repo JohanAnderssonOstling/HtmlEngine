@@ -1,9 +1,20 @@
 [package]
 license.workspace = true
-name = "html-dom"
-version = "0.1.0"
-edition = "2024"
-publish = false
+name = "skrift-dom"
+version.workspace = true
+edition.workspace = true
+publish = ["crates-io"]
+description = "Provides DOM structures and resource interfaces."
+repository.workspace = true
+homepage.workspace = true
+categories.workspace = true
+keywords.workspace = true
+readme = "README.md"
+include.workspace = true
+documentation = "https://docs.rs/skrift-dom"
+
+[lib]
+name = "html_dom"
 
 [dependencies]
 kurbo.workspace = true

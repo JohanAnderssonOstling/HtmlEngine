@@ -1,0 +1,127 @@
+{
+  "recorded_on": "2026-11-02",
+  "wpt_revision": "7ea3d665ff9ae1df1f742433d51bd1e9c6499a3b",
+  "scope": "Selected literal-helper CSS syntax audit, plus production text-spacing conversion. Computed helpers check syntax only; no new image suite result.",
+  "before": {
+    "selected_assertions": 18469,
+    "passing": 16451,
+    "mismatches": 2018,
+    "unsupported_assertions": 13434,
+    "pass_percent": 89.07358276030105
+  },
+  "after": {
+    "selected_assertions": 18469,
+    "passing": 16467,
+    "mismatches": 2002,
+    "unsupported_assertions": 13434,
+    "pass_percent": 89.16021441334128
+  },
+  "comparison": {
+    "fixed_assertions": 16,
+    "new_mismatches": 0,
+    "selection_changed": false,
+    "additional_assertions_classified": 0,
+    "fixed_by_file": {
+      "css-text/parsing/letter-spacing-computed.html": 4,
+      "css-text/parsing/letter-spacing-valid.html": 4,
+      "css-text/parsing/word-spacing-computed.html": 4,
+      "css-text/parsing/word-spacing-valid.html": 4
+    }
+  },
+  "implementation": [
+    "Unparsed letter-spacing and word-spacing values reuse native LengthPercentage::parse_string, with full-input consumption supplied by the native Parse trait.",
+    "Standalone percentages use the native percentage token directly, avoiding serialization and reparsing. Mixed expressions use the shared native length-percentage parser.",
+    "The existing native math-type guard rejects number-valued calculations where a length/percentage is required. Negative spacing remains valid.",
+    "The text property handler uses existing length_percentage_to_text_spacing conversion and the existing TextSpacing model. Absolute lengths and percentage coefficients remain separate, so inherited percentages use the recipient used font size.",
+    "Existing typed normal/length handling stays in its original path. Eligibility checks for the new native fallback are cached during stylesheet preparation.",
+    "No Lightning CSS changes, parallel CSS grammar or renderer/GPUI changes were introduced."
+  ],
+  "limitations": [
+    "Mixed non-linear math that cannot be represented by the existing two-component TextSpacing converter is still rejected by that converter. This does not implement every CSS Text math expression.",
+    "Font-metric-dependent lengths keep existing resolution requirements.",
+    "The 16 computed/valid helper outcomes establish syntax acceptance, not computed-value equality or pixel-level WPT passes."
+  ],
+  "test_results": {
+    "existing_style_unit_tests_passed": 305,
+    "existing_declaration_validation_tests_passed": 32,
+    "existing_reader_font_scaling_tests_passed": 5,
+    "cargo_check": "cargo check -p skrift-style --offline passed",
+    "scanned_files": 35417,
+    "literal_calls": 32021,
+    "dependency_parser_panics": 0,
+    "audit_exit": 101,
+    "audit_exit_reason": "Expected diagnostic assertion while 2002 mismatches remain."
+  },
+  "production_sources": [
+    {
+      "file": "crates/03-html-style/src/style/02-syntax/ast_validation.rs",
+      "before_sha256": "19bc2c0fc69dca97a565d87c5c57e2ba44d7027fa80023f6a25e99eea1b21db2",
+      "after_sha256": "303f44a412049719c181d7c2bd9a11f56f9907a90e5636b3ff4622d043ec1401"
+    },
+    {
+      "file": "crates/03-html-style/src/style/02-syntax/native_fallback.rs",
+      "before_sha256": "75e9b6ba1c6b0f626077069c56fb760ef117434534d377d0780930e8f0fe2905",
+      "after_sha256": "fe48640a9c24cd0ef97499c3e21afc1e7dd3a655a14a8855d617b42ef3019fba"
+    },
+    {
+      "file": "crates/03-html-style/src/style/05-cascade/resolver/properties/text.rs",
+      "before_sha256": "7491ed55af4fda6f0343a577c6cb3e73683d8e1a6ba8e5d2b1b4dc0768849567",
+      "after_sha256": "1d5b911347a1258a5c69643ff93c6098edcd61fd7e5e025453aad040385630bd"
+    }
+  ],
+  "first_implementation_source_hashes": {
+    "crates/03-html-style/src/style/02-syntax/ast_validation.rs": "303f44a412049719c181d7c2bd9a11f56f9907a90e5636b3ff4622d043ec1401",
+    "crates/03-html-style/src/style/02-syntax/native_fallback.rs": "63cd43a9b1da2f40d8a3937498d7fac150b7182e49515dd3eb1b1851f5c9d67a",
+    "crates/03-html-style/src/style/05-cascade/resolver/properties/text.rs": "1d5b911347a1258a5c69643ff93c6098edcd61fd7e5e025453aad040385630bd"
+  },
+  "benchmark_sources": [
+    {
+      "file": "crates/03-html-style/examples/shadow_filter_benchmark.rs",
+      "sha256": "8d1d2613582570c3068a36cf4662536d995845494f2820e8025a8d072f054130",
+      "unchanged_from_baseline": true
+    },
+    {
+      "file": "crates/03-html-style/examples/epub_css_benchmark.rs",
+      "sha256": "35f87009ca9ec031885938a32eef00015d87bbe0546d7fc1387ed72e683eafd6",
+      "unchanged_from_baseline": true
+    },
+    {
+      "file": "crates/03-html-style/examples/grid_benchmark.rs",
+      "sha256": "8a5e40b78dbfa8c66801bf363c01ec31a455c6f8c0402a785b7b183cbc3cb8fa",
+      "unchanged_from_baseline": true
+    },
+    {
+      "file": "crates/03-html-style/examples/normalization_benchmark.rs",
+      "sha256": "e26a9cc1208af9ec38637c84f8f44ff23b370b647b0639cdddad3e056a4fd2f1",
+      "unchanged_from_baseline": true
+    },
+    {
+      "file": "crates/03-html-style/examples/cascade_benchmark.rs",
+      "sha256": "b80e07cd03daee4f8af716b57002e401ad6bb7c1161e19c06eb8ae5d3aaf544c",
+      "unchanged_from_baseline": true
+    }
+  ],
+  "native_dependency": "Exact unchanged Lightning CSS 1.0.0-alpha.72 / Parcel selectors 0.28.3 bundle and frozen support crates shared between both builds; rustc opt-level=2 debuginfo=0.",
+  "before_style_library_sha256": "776bca1020be50874c9b55dd8a167324a76637a644a7d885788886cbce423d83",
+  "after_style_library_sha256": "16c2f42ce153543c4dd63e3e025ecc5b8781214eb60deba57526ee71f338a1d5",
+  "performance": "spacing-fix-performance.json",
+  "specification_references": [
+    "https://drafts.csswg.org/css-text-4/#letter-spacing-property",
+    "https://drafts.csswg.org/css-text-4/#word-spacing-property"
+  ],
+  "baseline_cache_directory": "/home/johan/.cache/html-wpt-spacing-fixes",
+  "compiler_temporary_directory": "/home/johan/.cache/html-wpt-spacing-fixes/compiler-tmp",
+  "source_integrity": {
+    "new_test_or_benchmark_code_added": false,
+    "existing_test_and_benchmark_sources_unchanged": true,
+    "lightningcss_changed": false,
+    "parallel_css_parser_added": false,
+    "renderer_or_gpui_changed": false,
+    "expectations_changed": false
+  },
+  "remaining": {
+    "total": 2002,
+    "blocked_under_current_constraints": 178,
+    "needs_investigation": 1824
+  }
+}

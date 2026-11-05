@@ -111,26 +111,13 @@ impl BoxGeometry {
 
     pub fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
-        report.add_slice_storage::<Point>(
-            "BoxGeometry.points.storage",
-            self.points.capacity(),
-            self.points.len(),
-        );
-        report.add_slice_storage::<Size>(
-            "BoxGeometry.sizes.storage",
-            self.sizes.capacity(),
-            self.sizes.len(),
-        );
-        report.add_slice_storage::<Option<Rect>>(
+        report.add_vec_storage("BoxGeometry.points.storage", &self.points);
+        report.add_vec_storage("BoxGeometry.sizes.storage", &self.sizes);
+        report.add_vec_storage(
             "BoxGeometry.decoration_rects.storage",
-            self.decoration_rects.capacity(),
-            self.decoration_rects.len(),
+            &self.decoration_rects,
         );
-        report.add_slice_storage::<u32>(
-            "BoxGeometry.generations.storage",
-            self.generations.capacity(),
-            self.generations.len(),
-        );
+        report.add_vec_storage("BoxGeometry.generations.storage", &self.generations);
         report
     }
 }

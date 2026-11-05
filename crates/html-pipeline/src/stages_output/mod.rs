@@ -1,36 +1,52 @@
-use super::{AncestorIter, DocumentRead};
+use super::DocumentRead;
 use crate::layout_model::{
-    AnchorPosition, DecorationFragment, DecorationStore, EllipsisFragment, GlyphAdvanceRun,
-    GlyphId, GlyphOffsetRun, HyphenFragment, ImageFragment, InlineItem, InlineItemKind, LayoutMode,
-    Line, ListItemMarker,
+    AnchorPosition, EllipsisFragment, GlyphAdvanceRun, GlyphId, GlyphOffsetRun, HyphenFragment,
+    ImageFragment, InlineItem, LayoutMode, ListItemMarker,
 };
 use html_dom::{Document, ImageResource, ImageSource, NodeRef};
-use html_style_model::{ListStylePosition, TextDecorationLines, UsedBorderRadii};
+use html_style_model::{ListStylePosition, TextDecorationLines, CornerRadii, Visibility};
 use kurbo::{Point, Size};
 use rustc_data_structures::fx::FxHashMap;
 use std::ops::Range;
+use std::sync::Arc;
+use html_engine_model::GlyphResourceLease;
 
-mod addressing;
-mod boxes;
-mod fragments;
-mod geometry;
-mod markdown;
-mod reading;
-mod search;
-mod semantics;
-mod source;
-mod text;
-pub use geometry::{CaretAffinity, PositionedShapedLine, RenderGeometryView};
-pub use markdown::RenderExportView;
-pub use reading::{ReadingFragment, ReadingTarget, is_navigation_section_title};
-pub use search::{TextSearchOptions, find_text_matches};
+pub mod addressing;
+pub mod boxes;
+pub mod fragments;
+pub mod geometry;
+pub mod markdown;
+pub mod pagination;
+pub mod reading;
+pub mod search;
+pub mod semantics;
+pub mod source;
+pub mod text;
+mod words;
+pub use geometry::{CaretAffinity, RenderGeometryView};
+pub(super) use html_engine_model::WordIndex;
+pub(super) use words::build_word_index;
+pub use markdown::{RenderExportView, TableExportFormat, TableExportRequest, TextExport, TextExportFormat};
+pub use pagination::{
+    Pagination, PaginationGroup, PaginationLine, PaginationPosition, PaginationTarget,
+};
+pub use pagination as pagination_queries;
+pub use reading::{ReadingFragment, ReadingPage, ReadingTarget};
+pub use search::{
+    SourceTextMatch, SourceTextMatches, TextPatternError, TextPatternMatch, TextPatternMatcher,
+    TextSearchOptions, find_text_matches, text_matches,
+};
 pub use semantics::{ContentRole, ContentSemantics, RenderSemanticsView};
 pub use source::SourceLocation;
 
 pub use addressing::{
-    RenderAddressingView, RenderAnchorPosition, RenderAnchorPositions, SourceElementStep,
-    SourcePosition,
+    DocumentTarget, ElementTarget, LinkTarget, RenderAddressingView, ResolvedDestination,
+    SourceElementStep, SourcePosition, TextQuote,
 };
+pub use boxes as box_queries;
+pub use fragments as fragment_paint;
+pub use text as text_paint;
+
 pub use boxes::{
     BoxTextFormat, RenderBoxView, RenderForcedBreak, RenderListItemMarker, RenderTable,
     RenderTableCell, RenderTableRow,
@@ -39,23 +55,40 @@ pub use fragments::{
     RenderDecoration, RenderDecorationPattern, RenderDecorations, RenderFragmentView,
     RenderImageFragment, RenderImageFragments, RenderOverflowClip, RenderPaintItem,
 };
-pub use html_engine_model::ImageMetrics;
+pub use html_dom::ImageId;
+pub use html_engine_model::{BoxId, ImageMetrics, LineId};
 pub use text::{
     RenderAuthoritativeTextRun, RenderEllipsisFragment, RenderGlyphAdvanceRun,
     RenderGlyphAdvanceRuns, RenderGlyphOffsetRun, RenderGlyphOffsetRuns, RenderHyphenFragment,
-    RenderLine, RenderLineTextFragment, RenderLineTextFragments, RenderLines, RenderTextRun,
-    RenderTextRuns, RenderTextView,
+    RenderLine, RenderLinePlacement, RenderLineTextFragment, RenderLineTextFragments, RenderLines,
+    RenderTextRun, RenderTextRuns, RenderTextView, merge_text_ranges,
 };
+
+/// Retains appended scope resources and detects replacement of paint products.
+#[derive(Clone)]
+pub struct RenderResourceLease {
+    native: GlyphResourceLease,
+    _scope: Option<Arc<()>>,
+}
+
+impl RenderResourceLease {
+    pub fn is_valid(&self) -> bool {
+        self.native.is_valid()
+    }
+}
 
 #[derive(Clone, Copy)]
 pub struct RenderView<'a> {
     pub(super) doc: DocumentRead<'a>,
     pub(super) glyph_metrics: &'a crate::layout_model::GlyphMetrics,
+    pub(super) resources: Option<&'a crate::GlyphResourceStore>,
+    pub(super) scope_lifetime: Option<&'a Arc<()>>,
 }
 
 /// Text and line-layout queries. This capability deliberately excludes box
 /// topology, resolved decorations, and document source details.
 impl<'a> RenderView<'a> {
+
     pub fn text(self) -> RenderTextView<'a> {
         RenderTextView {
             doc: self.doc,
@@ -89,104 +122,32 @@ impl<'a> RenderView<'a> {
         }
     }
 
-    pub fn semantics(self) -> RenderSemanticsView<'a> {
-        RenderSemanticsView {
-            doc: self.doc,
-            glyph_metrics: self.glyph_metrics,
-        }
-    }
 
-    pub fn geometry(self) -> RenderGeometryView<'a> {
-        RenderGeometryView {
-            doc: self.doc,
-            glyph_metrics: self.glyph_metrics,
-        }
-    }
+
+
 
     pub fn root_font_size(&self) -> f32 {
         self.doc.inputs.document.root_font_size()
     }
 
-    /// The CSS canvas background color, after root/body propagation.
-    ///
-    /// A root background suppresses body propagation even when its only
-    /// drawable layer is an image that this renderer cannot paint yet.
-    pub fn canvas_background_color(&self) -> Option<u32> {
-        let root_box = self.doc.inputs.layout_tree.root_box()?;
-        let root_indices = self
-            .doc
-            .inputs
-            .layout_tree
-            .get_box_style_indices(root_box)?;
-        let root = self.doc.inputs.styles.view(root_indices)?;
-        let root_color = self
-            .doc
-            .inputs
-            .paint
-            .box_colors(root_box)
-            .map_or_else(|| root.background_color(), |paint| paint.background);
-        if root.background_image_present() || root_color & 0xFF != 0 {
-            return (root.visibility() == html_style_model::Visibility::Visible
-                && root_color & 0xFF != 0)
-                .then_some(root_color);
-        }
 
-        let body_box = self.doc.inputs.layout_tree.body_box()?;
-        let body_indices = self
-            .doc
-            .inputs
-            .layout_tree
-            .get_box_style_indices(body_box)?;
-        let body = self.doc.inputs.styles.view(body_indices)?;
-        let body_color = self
-            .doc
-            .inputs
-            .paint
-            .box_colors(body_box)
-            .map_or_else(|| body.background_color(), |paint| paint.background);
-        (body.visibility() == html_style_model::Visibility::Visible && body_color & 0xFF != 0)
-            .then_some(body_color)
-    }
 
     pub fn title(&self) -> Option<&'a str> {
         self.doc.inputs.document.title()
     }
 
-    pub fn images(&self) -> &'a [ImageResource] {
-        self.doc.inputs.document.images()
-    }
 
-    /// Preserved source for equation-specific actions; ordinary images return None.
-    pub fn image_mathml(&self, image_idx: u32) -> Option<&'a str> {
-        match &self.images().get(image_idx as usize)?.source {
-            ImageSource::MathMl { markup, .. } => Some(markup),
-            _ => None,
-        }
-    }
 
-    pub fn image_uri(&self, image_idx: u32) -> Option<&'a str> {
-        match &self
-            .doc
-            .inputs
-            .document
-            .images()
-            .get(image_idx as usize)?
-            .source
-        {
-            ImageSource::Uri(uri) => Some(uri.as_str()),
-            ImageSource::InlineSvg { .. } | ImageSource::MathMl { .. } => None,
-        }
-    }
 
-    pub fn string(&self, index: u16) -> &'a str {
-        self.doc.inputs.document.string(index)
-    }
 
-    pub fn style_string(&self, index: html_style_model::StyleStringId) -> Option<&'a str> {
-        self.doc.inputs.styles.string(index)
-    }
 
-    pub fn lookup_string(&self, value: &str) -> Option<u16> {
-        self.doc.inputs.document.lookup_string(value)
-    }
 }
+
+pub use addressing as address_queries;
+pub use geometry as geometry_queries;
+pub use markdown as export_queries;
+pub use reading as reading_queries;
+pub use search as search_queries;
+pub use semantics as semantic_queries;
+
+pub use source as source_queries;

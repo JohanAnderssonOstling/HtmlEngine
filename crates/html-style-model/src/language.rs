@@ -19,19 +19,6 @@ impl ContentLanguage {
         }
     }
 
-    pub fn tag(&self) -> Option<&LanguageTag> {
-        match self {
-            Self::Tag(tag) => Some(tag),
-            Self::Unrecognized(_) => None,
-        }
-    }
-
-    pub fn as_str(&self) -> &str {
-        match self {
-            Self::Tag(tag) => tag.as_str(),
-            Self::Unrecognized(value) => value,
-        }
-    }
 }
 
 /// Opaque reference into one computed-style result's structured language table.
@@ -40,4 +27,18 @@ impl ContentLanguage {
 pub struct LanguageId {
     pub(crate) store_id: NonZeroU32,
     pub(crate) index: u32,
+}
+
+pub fn content_language_tag(value: &ContentLanguage) -> Option<&LanguageTag> {
+    match value {
+        ContentLanguage::Tag(tag) => Some(tag),
+        ContentLanguage::Unrecognized(_) => None,
+    }
+}
+
+pub fn content_language_as_str(value: &ContentLanguage) -> &str {
+    match value {
+        ContentLanguage::Tag(tag) => tag.as_str(),
+        ContentLanguage::Unrecognized(value) => value,
+    }
 }

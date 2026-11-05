@@ -1,14 +1,11 @@
-use super::*;
+use super::super::context::{ApplyResult, PropertyContext};
+use super::super::values::colors::css_color_to_u32;
+use lightningcss::properties::Property;
+use lightningcss::values::color::CssColor;
 
-#[allow(unused_variables)]
-pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'_>) -> ApplyResult {
-    let doc = context.doc;
-    let styles = &mut *context.styles;
+pub(super) fn apply(context: &mut PropertyContext<'_>, property: &Property<'_>) -> ApplyResult {
     let style = &mut *context.style;
-    let resolved_root_font_size = context.resolved_root_font_size;
-    let parent_font_size = context.parent_font_size;
-    let parent_font_weight = context.parent_font_weight;
-    let parent_color = context.parent_color;
+    let parent_color = context.parent.text.color;
     match property {
         // Color
         Property::Color(c) => {
@@ -21,18 +18,7 @@ pub(super) fn apply(context: &mut PropertyContext<'_, '_>, property: &Property<'
             style.background.background_color = css_color_to_u32(c, style.text.color);
             style.background.background_color_current_color = matches!(c, CssColor::CurrentColor);
         }
-        Property::Background(bg) => {
-            style.background.background_image_present =
-                crate::style::syntax::capabilities::property_uses_background_image(property);
-            // The color may only appear in the shorthand's last layer; earlier
-            // layers carry the transparent default.
-            if let Some(layer) = bg.last() {
-                style.background.background_color =
-                    css_color_to_u32(&layer.color, style.text.color);
-                style.background.background_color_current_color =
-                    matches!(layer.color, CssColor::CurrentColor);
-            }
-        }
+
         Property::BackgroundImage(_) => {
             style.background.background_image_present = false;
         }

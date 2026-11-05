@@ -1,0 +1,43 @@
+{
+  "recorded_on": "2026-11-01",
+  "wpt_revision": "7ea3d665ff9ae1df1f742433d51bd1e9c6499a3b",
+  "scope": "Version review notes only. Counts and expectation ledgers unchanged; these assertions remain needs_investigation.",
+  "findings": [
+    {
+      "finding": "part-structural-syntax-draft-version-drift",
+      "keys": [
+        "css-shadow/part/pseudo-classes-after-part.html|line=61|ordinal=0|kind=InvalidSelector|expected=invalid|actual=valid",
+        "css-shadow/part/pseudo-classes-after-part.html|line=62|ordinal=0|kind=InvalidSelector|expected=invalid|actual=valid",
+        "css-shadow/part/pseudo-classes-after-part.html|line=63|ordinal=0|kind=InvalidSelector|expected=invalid|actual=valid",
+        "css-shadow/part/pseudo-classes-after-part.html|line=64|ordinal=0|kind=InvalidSelector|expected=invalid|actual=valid",
+        "css-shadow/part/pseudo-classes-after-part.html|line=65|ordinal=0|kind=InvalidSelector|expected=invalid|actual=valid",
+        "css-shadow/part/pseudo-classes-after-part.html|line=70|ordinal=0|kind=InvalidSelector|expected=invalid|actual=valid",
+        "css-shadow/part/pseudo-classes-after-part.html|line=71|ordinal=0|kind=InvalidSelector|expected=invalid|actual=valid",
+        "css-shadow/part/pseudo-classes-after-part.html|line=74|ordinal=0|kind=InvalidSelector|expected=invalid|actual=valid",
+        "css-shadow/part/pseudo-classes-after-part.html|line=78|ordinal=0|kind=InvalidSelector|expected=invalid|actual=valid",
+        "css-shadow/part/pseudo-classes-after-part.html|line=89|ordinal=0|kind=InvalidSelector|expected=invalid|actual=valid"
+      ],
+      "observation": "Pinned assertions expect structural/tree-related pseudo-classes after ::part() to be syntactically invalid. Current CSS Pseudo 4 draft allows pseudo-classes syntactically after element-backed pseudo-elements; structural, :has, :scope and :host selectors never match instead.",
+      "decision": "Do not introduce syntax rejections just to clear these pinned assertions. Review pinned WPT expectations against the intended specification revision; no exclusions or expectation changes made.",
+      "sources": [
+        "https://drafts.csswg.org/css-pseudo-4/#element-backed",
+        "https://drafts.csswg.org/css-shadow-1/#part"
+      ],
+      "caveat": "This does not establish matching support. Previously fixed :has-related assertions are retained as historical pinned-audit results; those should also be reviewed when changing specification targets."
+    },
+    {
+      "finding": "functional-has-slotted-tentative-grammar-unsettled",
+      "keys": [
+        "selectors/parsing/parse-has-slotted.tentative.html|line=29|ordinal=0|kind=InvalidSelector|expected=invalid|actual=valid",
+        "selectors/parsing/parse-has-slotted.tentative.html|line=30|ordinal=0|kind=InvalidSelector|expected=invalid|actual=valid",
+        "selectors/parsing/parse-has-slotted.tentative.html|line=31|ordinal=0|kind=InvalidSelector|expected=invalid|actual=valid"
+      ],
+      "observation": "The pinned tentative test accepts a sibling combinator argument but rejects a child combinator. The open proposal describes a compound-selector argument, which would exclude both.",
+      "decision": "Keep functional :has-slotted() grammar unchanged pending version review. The unambiguous wrong pseudo-element spelling ::has-slotted(foo) is fixed in this stage.",
+      "sources": [
+        "https://github.com/w3c/csswg-drafts/pull/10586",
+        "https://github.com/web-platform-tests/wpt/blob/7ea3d665ff9ae1df1f742433d51bd1e9c6499a3b/css/selectors/parsing/parse-has-slotted.tentative.html"
+      ]
+    }
+  ]
+}

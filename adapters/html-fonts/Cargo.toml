@@ -1,0 +1,35 @@
+[package]
+name = "html-fonts"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+html-style-model = { package = "skrift-style-model", path = "../../crates/html-style-model" }
+html-engine-model = { package = "skrift-engine-model", path = "../../crates/html-engine-model" }
+data-url = "0.3"
+html.workspace = true
+html-resources = { package = "skrift-resources", path = "../../crates/html-resources", features = ["font-data"] }
+blake3.workspace = true
+ttf-parser = "0.25"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rustls.workspace = true
+dirs = "6"
+fs2 = "0.4"
+reqwest = { workspace = true, features = ["blocking", "rustls-no-provider"] }
+tempfile = "3"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
+futures-util = "0.3"
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["Window", "WorkerGlobalScope", "Cache", "CacheStorage", "Response", "ResponseInit"] }
+
+[dev-dependencies]
+wuff = "0.2.9"
+base64 = "0.22"
+futures-lite = "2"
+tempfile = "3"

@@ -1,27 +1,87 @@
-//! Shared grammar and OpenType features for renderer-owned font switches.
+//! Conversion of native raw font tokens into OpenType feature settings.
 
-use super::property_id::RendererPropertyId;
-use super::value::{IntegerValue, normalize_math, parse_integer_value};
-use cssparser::{ParseError, Parser, ParserInput, match_ignore_ascii_case};
-use html_style_model::OpenTypeFeature;
+use html_style_model::open_type;
+use super::value::{significant_tokens, token_ident};
+use crate::style::syntax::property_id::RendererPropertyId;
+use cssparser::match_ignore_ascii_case;
+use html_style_model::{OpenTypeFeature, OpenTypeFeatureKind};
 use lightningcss::properties::custom::{Token, TokenList, TokenOrValue};
+use lightningcss::properties::font::FontVariantCaps;
+use lightningcss::traits::Parse;
 use std::iter::once;
+
+/// The supported caps, numeric and ligature portions of `font-variant`.
+/// Unknown or conflicting components invalidate the complete declaration.
+pub(crate) fn parse_variant(
+    tokens: &TokenList<'_>,
+) -> Option<(FontVariantCaps, Vec<OpenTypeFeature>, Vec<OpenTypeFeature>)> {
+    let values = significant_tokens(tokens).collect::<Vec<_>>();
+    if values.len() == 1 {
+        let value = token_ident(values[0])?;
+        if value.eq_ignore_ascii_case("normal") {
+            return Some((FontVariantCaps::Normal, Vec::new(), Vec::new()));
+        }
+        if value.eq_ignore_ascii_case("none") {
+            return Some((
+                FontVariantCaps::Normal,
+                Vec::new(),
+                parse_tokens(RendererPropertyId::FontVariantLigatures, tokens)?,
+            ));
+        }
+    }
+    let mut caps = None;
+    let mut numeric = TokenList(Vec::new());
+    let mut ligatures = TokenList(Vec::new());
+    for token in values {
+        let value = token_ident(token)?;
+        if value.eq_ignore_ascii_case("normal") || value.eq_ignore_ascii_case("none") {
+            return None;
+        }
+        if let Ok(value) = FontVariantCaps::parse_string(value) {
+            if caps.replace(value).is_some() {
+                return None;
+            }
+        } else {
+            let single = TokenList(vec![token.clone()]);
+            if parse_tokens(RendererPropertyId::FontVariantNumeric, &single).is_some() {
+                numeric.0.push(token.clone());
+            } else if parse_tokens(RendererPropertyId::FontVariantLigatures, &single).is_some() {
+                ligatures.0.push(token.clone());
+            } else {
+                return None;
+            }
+        }
+    }
+    if caps.is_none() && numeric.0.is_empty() && ligatures.0.is_empty() {
+        return None;
+    }
+    Some((
+        caps.unwrap_or(FontVariantCaps::Normal),
+        if numeric.0.is_empty() {
+            Vec::new()
+        } else {
+            parse_tokens(RendererPropertyId::FontVariantNumeric, &numeric)?
+        },
+        if ligatures.0.is_empty() {
+            Vec::new()
+        } else {
+            parse_tokens(RendererPropertyId::FontVariantLigatures, &ligatures)?
+        },
+    ))
+}
 
 pub(crate) fn parse_tokens(
     id: RendererPropertyId,
     tokens: &TokenList<'_>,
 ) -> Option<Vec<OpenTypeFeature>> {
-    let mut tokens = tokens.0.iter().filter(|token| {
-        !matches!(
-            token,
-            TokenOrValue::Token(Token::WhiteSpace(_) | Token::Comment(_))
-        )
-    });
-    let first = ident(tokens.next()?)?;
+    let mut tokens = significant_tokens(tokens);
+    let first = token_ident(tokens.next()?)?;
     if tokens.clone().next().is_none() {
         if first.eq_ignore_ascii_case("normal") {
             return match id {
-                RendererPropertyId::FontKerning => Some(vec![OpenTypeFeature::new(*b"kern", 1)]),
+                RendererPropertyId::FontKerning => {
+                    Some(vec![open_type::open_type_feature_new(OpenTypeFeatureKind::Kerning, 1)])
+                }
                 RendererPropertyId::FontVariantNumeric
                 | RendererPropertyId::FontVariantLigatures => Some(Vec::new()),
                 _ => None,
@@ -29,12 +89,20 @@ pub(crate) fn parse_tokens(
         }
         if first.eq_ignore_ascii_case("none") {
             return match id {
-                RendererPropertyId::FontKerning => Some(vec![OpenTypeFeature::new(*b"kern", 0)]),
+                RendererPropertyId::FontKerning => {
+                    Some(vec![open_type::open_type_feature_new(OpenTypeFeatureKind::Kerning, 0)])
+                }
                 RendererPropertyId::FontVariantLigatures => Some(
-                    [*b"liga", *b"clig", *b"dlig", *b"hlig", *b"calt"]
-                        .into_iter()
-                        .map(|tag| OpenTypeFeature::new(tag, 0))
-                        .collect(),
+                    [
+                        OpenTypeFeatureKind::StandardLigatures,
+                        OpenTypeFeatureKind::ContextualLigatures,
+                        OpenTypeFeatureKind::DiscretionaryLigatures,
+                        OpenTypeFeatureKind::HistoricalLigatures,
+                        OpenTypeFeatureKind::ContextualAlternates,
+                    ]
+                    .into_iter()
+                    .map(|tag| open_type::open_type_feature_new(tag, 0))
+                    .collect(),
                 ),
                 _ => None,
             };
@@ -46,29 +114,29 @@ pub(crate) fn parse_tokens(
 
     let mut seen = 0u8;
     let mut features = Vec::new();
-    for keyword in once(Some(first)).chain(tokens.map(ident)) {
+    for keyword in once(Some(first)).chain(tokens.map(token_ident)) {
         let keyword = keyword?;
-        let (category, tags, value): (u8, &[[u8; 4]], u32) = match id {
+        let (category, tags, value): (u8, &[OpenTypeFeatureKind], u32) = match id {
             RendererPropertyId::FontVariantNumeric => match_ignore_ascii_case! { keyword,
-                "lining-nums" => (1, &[*b"lnum"], 1),
-                "oldstyle-nums" => (1, &[*b"onum"], 1),
-                "proportional-nums" => (2, &[*b"pnum"], 1),
-                "tabular-nums" => (2, &[*b"tnum"], 1),
-                "diagonal-fractions" => (4, &[*b"frac"], 1),
-                "stacked-fractions" => (4, &[*b"afrc"], 1),
-                "ordinal" => (8, &[*b"ordn"], 1),
-                "slashed-zero" => (16, &[*b"zero"], 1),
+                "lining-nums" => (1, &[OpenTypeFeatureKind::LiningFigures], 1),
+                "oldstyle-nums" => (1, &[OpenTypeFeatureKind::OldstyleFigures], 1),
+                "proportional-nums" => (2, &[OpenTypeFeatureKind::ProportionalFigures], 1),
+                "tabular-nums" => (2, &[OpenTypeFeatureKind::TabularFigures], 1),
+                "diagonal-fractions" => (4, &[OpenTypeFeatureKind::DiagonalFractions], 1),
+                "stacked-fractions" => (4, &[OpenTypeFeatureKind::StackedFractions], 1),
+                "ordinal" => (8, &[OpenTypeFeatureKind::Ordinals], 1),
+                "slashed-zero" => (16, &[OpenTypeFeatureKind::SlashedZero], 1),
                 _ => return None,
             },
             RendererPropertyId::FontVariantLigatures => match_ignore_ascii_case! { keyword,
-                "common-ligatures" => (1, &[*b"liga", *b"clig"], 1),
-                "no-common-ligatures" => (1, &[*b"liga", *b"clig"], 0),
-                "discretionary-ligatures" => (2, &[*b"dlig"], 1),
-                "no-discretionary-ligatures" => (2, &[*b"dlig"], 0),
-                "historical-ligatures" => (4, &[*b"hlig"], 1),
-                "no-historical-ligatures" => (4, &[*b"hlig"], 0),
-                "contextual" => (8, &[*b"calt"], 1),
-                "no-contextual" => (8, &[*b"calt"], 0),
+                "common-ligatures" => (1, &[OpenTypeFeatureKind::StandardLigatures, OpenTypeFeatureKind::ContextualLigatures], 1),
+                "no-common-ligatures" => (1, &[OpenTypeFeatureKind::StandardLigatures, OpenTypeFeatureKind::ContextualLigatures], 0),
+                "discretionary-ligatures" => (2, &[OpenTypeFeatureKind::DiscretionaryLigatures], 1),
+                "no-discretionary-ligatures" => (2, &[OpenTypeFeatureKind::DiscretionaryLigatures], 0),
+                "historical-ligatures" => (4, &[OpenTypeFeatureKind::HistoricalLigatures], 1),
+                "no-historical-ligatures" => (4, &[OpenTypeFeatureKind::HistoricalLigatures], 0),
+                "contextual" => (8, &[OpenTypeFeatureKind::ContextualAlternates], 1),
+                "no-contextual" => (8, &[OpenTypeFeatureKind::ContextualAlternates], 0),
                 _ => return None,
             },
             _ => return None,
@@ -77,60 +145,45 @@ pub(crate) fn parse_tokens(
             return None;
         }
         seen |= category;
-        features.extend(tags.iter().map(|tag| OpenTypeFeature::new(*tag, value)));
+        features.extend(tags.iter().map(|tag| open_type::open_type_feature_new(*tag, value)));
     }
     Some(features)
 }
 
-fn ident<'a, 'css>(token: &'a TokenOrValue<'css>) -> Option<&'a str> {
-    match token {
-        TokenOrValue::Token(Token::Ident(value)) => Some(value.as_ref()),
-        _ => None,
-    }
-}
-
-pub(crate) struct FontFeatureSetting {
-    pub(crate) tag: [u8; 4],
-    pub(crate) value: IntegerValue,
-}
-
-pub(crate) fn parse_settings(css: &str) -> Option<Vec<FontFeatureSetting>> {
-    let normalized = normalize_math(css);
-    let mut input = ParserInput::new(&normalized);
-    let mut parser = Parser::new(&mut input);
-    if parser
-        .try_parse(|parser| {
-            parser.expect_ident_matching("normal")?;
-            parser.expect_exhausted()
-        })
-        .is_ok()
+pub(crate) fn parse_settings(tokens: &TokenList<'_>) -> Option<Vec<OpenTypeFeature>> {
+    let tokens: Vec<_> = significant_tokens(tokens).collect();
+    if matches!(tokens.as_slice(), [token] if token_ident(token).is_some_and(|word| word.eq_ignore_ascii_case("normal")))
     {
         return Some(Vec::new());
     }
-    let parsed: Result<_, ParseError<'_, ()>> = parser.parse_comma_separated(|parser| {
-        let text = parser.expect_string_cloned()?;
-        let bytes = text.as_bytes();
-        if bytes.len() != 4 || !bytes.iter().all(|byte| (0x20..=0x7e).contains(byte)) {
-            return Err(parser.new_custom_error(()));
-        }
-        let mut tag = [0; 4];
-        tag.copy_from_slice(bytes);
-        let value = if parser.is_exhausted() {
-            IntegerValue::Integer(1)
-        } else if parser
-            .try_parse(|parser| parser.expect_ident_matching("on"))
-            .is_ok()
-        {
-            IntegerValue::Integer(1)
-        } else if parser
-            .try_parse(|parser| parser.expect_ident_matching("off"))
-            .is_ok()
-        {
-            IntegerValue::Integer(0)
-        } else {
-            parse_integer_value(parser, 0)?
-        };
-        Ok(FontFeatureSetting { tag, value })
-    });
-    parsed.ok()
+    tokens
+        .split(|token| matches!(token, TokenOrValue::Token(Token::Comma)))
+        .map(|setting| {
+            let [TokenOrValue::Token(Token::String(tag)), rest @ ..] = setting else {
+                return None;
+            };
+            let tag = tag.as_bytes().try_into().ok()?;
+            let value = match rest {
+                [] => 1,
+                [
+                    TokenOrValue::Token(Token::Number {
+                        int_value: Some(value),
+                        ..
+                    }),
+                ] => u32::try_from(*value).ok()?,
+                [token]
+                    if token_ident(token).is_some_and(|word| word.eq_ignore_ascii_case("on")) =>
+                {
+                    1
+                }
+                [token]
+                    if token_ident(token).is_some_and(|word| word.eq_ignore_ascii_case("off")) =>
+                {
+                    0
+                }
+                _ => return None,
+            };
+            open_type::open_type_feature_from_tag_bytes(tag, value)
+        })
+        .collect()
 }

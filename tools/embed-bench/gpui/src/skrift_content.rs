@@ -1,21 +1,27 @@
+use html_pipeline::engine::box_queries;
+use html_dom as dom_values;
+use html_engine_model::layout_state;
+use html_pipeline::engine::geometry_queries;
+use html_render_core as render_core;
+use html_resources::resources::images as image_resources;
+use html_pipeline::engine::fragment_paint;
+use html_pipeline::engine::text_paint;
 use crate::common::Options;
-use anyhow::{Context as _, Result, ensure};
+use anyhow::{Context as _, Result};
 use data_url::DataUrl;
 use gpui::{ContentMask, IntoElement, Window, canvas, div, prelude::*, px, rgb};
-use html::engine::Engine;
-use html::pipeline::{
-    FontEnvironmentRevision, ImageMetricsRevision, ImageSizingPolicy, LayoutConstraints,
-    MarkupSyntax, MediaEnvironment, PaintSettingsRevision, PipelineChanges, PipelineInputs,
-    ResourceRevision, SourceRevision, StyleEnvironment, StylesheetRevision, TextCompositionPolicy,
+use html::document::ImageId;
+use html_pipeline::MarkupSyntax;
+use html::layout::BoxId;
+use html::render::DocumentPainter;
+use html_pipeline::engine::LayoutConstraints;
+use html_pipeline::{
+    MediaEnvironment, PipelineChanges, PipelineInputs, PipelineSession, StyleEnvironment,
 };
-use html::render::{
-    FragmentImagePolicy, FragmentRenderOptions, Painter, RenderCommand, RenderScene,
-    paint_line_text_runs,
-};
-use html::resources::{DecodedImage, FileSystemProvider, ImagePipeline, ResourceProvider};
-use html_gpui::backend::{
-    GlyphStore, GpuiCommandPainter, GpuiTextCache, ImageCache, PaintCommand, paint_commands,
-};
+use html::resources::{FileSystemProvider, ResourceProvider};
+use html_resources::ImagePipeline;
+use html_gpui::backend::{GpuiCommandPainter, GpuiScene, GpuiTextCache, ImageCache};
+use kurbo::{Point, Rect};
 use std::collections::HashSet;
 use std::io;
 use std::sync::Arc;
@@ -56,13 +62,12 @@ impl ResourceProvider for LocalResources {
 }
 
 pub(super) struct DocumentView {
-    engine: Engine,
-    source_revision: SourceRevision,
+    engine: PipelineSession,
     shaper: GpuiTextCache,
     provider: Arc<dyn ResourceProvider>,
     decoded: Option<ImagePipeline>,
     images: ImageCache,
-    commands: Arc<Vec<PaintCommand>>,
+    scene: Option<GpuiScene>,
     pub(super) content_height: f64,
     pub(super) image_count: usize,
     pub(super) paint_all: bool,
@@ -75,13 +80,12 @@ impl DocumentView {
         let provider: Arc<dyn ResourceProvider> =
             Arc::new(LocalResources(FileSystemProvider::new()));
         Self {
-            engine: Engine::new(provider.clone()),
-            source_revision: SourceRevision::INITIAL,
+            engine: PipelineSession::new(provider.clone()),
             shaper: GpuiTextCache::new(window.text_system().clone()),
             provider,
             decoded: None,
             images: ImageCache::default(),
-            commands: Arc::default(),
+            scene: None,
             content_height: 0.0,
             image_count: 0,
             paint_all: false,
@@ -91,171 +95,101 @@ impl DocumentView {
     }
 
     pub(super) fn load(&mut self, source: &str, options: &Options) -> Result<()> {
-
-        let settings =
-            FragmentRenderOptions::new(f64::from(options.width), Some(f64::from(options.height)))?
-                .with_base_uri(options.fixture.to_string_lossy().into_owned())?
-                .with_image_policy(FragmentImagePolicy::Reference);
-        self.source_revision = self.source_revision.next();
-        let inputs = PipelineInputs {
-            source: source.into(),
-            markup_syntax: self.markup_syntax,
-            user_styles: self
-                .default_font_family
-                .as_ref()
-                .map(|family| format!(":where(html) {{ font-family: {family:?}; }}"))
-                .into_iter()
-                .collect(),
-            reader_overrides: Default::default(),
-            note_flow: Default::default(),
-            source_revision: self.source_revision,
-            base_uri: settings.base_uri().to_owned(),
-            resource_revision: ResourceRevision::INITIAL,
-            stylesheet_revision: StylesheetRevision::INITIAL,
-            style_environment: StyleEnvironment {
-                root_font_size: 16,
+        let base_uri = options.fixture.to_string_lossy().into_owned();
+        let mut inputs = PipelineInputs::new(
+            source.into(),
+            self.markup_syntax,
+            base_uri,
+            StyleEnvironment {
+                root_font_size: Default::default(),
                 media: MediaEnvironment::screen(
                     f64::from(options.width),
                     Some(f64::from(options.height)),
                 )
                 .context("invalid media dimensions")?,
-                direction: 0,
             },
-            font_environment: FontEnvironmentRevision::INITIAL,
-            image_metrics_revision: ImageMetricsRevision::INITIAL,
-            layout: LayoutConstraints {
-                viewport_width: f64::from(options.width),
+            LayoutConstraints::new(f64::from(options.width), 16.0)?
                 // Screen media keeps the window height above. An unbounded
                 // flow height disables page fragmentation for native embedding.
-                viewport_height: (!options.native_window).then_some(f64::from(options.height)),
-                line_height: 16.0,
-                image_sizing_policy: ImageSizingPolicy::WebCompatible,
-                text_composition_policy: TextCompositionPolicy::WebCompatible,
-            },
-            image_metrics: Default::default(),
-            paint: PaintSettingsRevision::INITIAL,
-        };
-        self.engine.update(inputs, &mut self.shaper)?;
+                .with_viewport_height(
+                    (!options.native_window).then_some(f64::from(options.height)),
+                )?,
+        );
+        inputs.user_styles = self
+            .default_font_family
+            .as_ref()
+            .map(|family| format!(":where(html) {{ font-family: {family:?}; }}"))
+            .into_iter()
+            .collect();
+        self.engine.attach(&mut self.shaper).update(inputs)?;
 
-        let resources = self
-            .engine
-            .render_view()
-            .context("missing document")?
-            .images();
-        let desired = (0..resources.len() as u32).collect::<HashSet<_>>();
+        let resources =
+            text_paint::render_view_images(&self.engine.render_view().context("missing document")?);
+        let desired = (0..resources.len() as u32)
+            .map(dom_values::image_id_new)
+            .collect::<HashSet<_>>();
         let mut decoded = ImagePipeline::new(self.provider.clone());
         decoded.ensure_window(resources, &desired);
-        decoded.poll();
+        decoded.poll(resources);
         let mut image_metrics = self
             .engine
             .inputs()
             .context("missing inputs")?
             .image_metrics
             .clone();
-        for index in &desired {
-            let image = decoded
-                .get_decoded(*index)
-                .with_context(|| format!("image {index} did not decode"))?;
+        for &index in &desired {
+            let image = image_resources::decoded_images_get(decoded.decoded_images(), index)
+                .with_context(|| format!("image {} did not decode", index.raw()))?;
             let (width, height) = image.dimensions();
-            image_metrics.set(*index, width, height);
+            image_metrics.set(index.raw(), width, height);
         }
         if !desired.is_empty() {
-            let revision = self
-                .engine
-                .inputs()
-                .context("missing inputs")?
-                .image_metrics_revision
-                .next();
-            self.engine.apply_changes(
-                PipelineChanges {
+            self.engine
+                .attach(&mut self.shaper)
+                .apply_changes(PipelineChanges {
                     image_metrics: Some(image_metrics),
-                    image_metrics_revision: Some(revision),
                     ..Default::default()
-                },
-                &mut self.shaper,
-            )?;
+                })?;
         }
         let document = self
             .engine
             .render_view()
             .context("missing laid-out document")?;
-        let scene = RenderScene::for_view(document, &settings);
-        self.content_height = scene.content_height();
-        let mut painter = GpuiCommandPainter::new(
-            &mut self.images,
-            self.shaper.store(),
-            self.shaper.run_store(),
-            Vec::new(),
+        // Keep native text and decorations in the engine's shared CSS paint
+        // order. Painting all text after all backgrounds lets text cover
+        // positioned descendants that should paint above it.
+        self.content_height = document
+            .text()
+            .lines()
+            .iter()
+            .filter_map(|line| {
+                geometry_queries::render_geometry_view_line_vertical_bounds(
+                    geometry_queries::render_view_geometry(document),
+                    line.id(),
+                )
+            })
+            .map(|bounds| bounds.end)
+            .chain(
+                fragment_paint::decorations(document.fragments())
+                    .iter()
+                    .map(|decoration| decoration.rect().y1),
+            )
+            .fold(0.0_f64, f64::max);
+        let height = if self.paint_all {
+            self.content_height.max(f64::from(options.height))
+        } else {
+            f64::from(options.height)
+        };
+        let mut painter = GpuiCommandPainter::new(&mut self.images, self.shaper.resources());
+        render_core::document_painter_paint_region(
+            &DocumentPainter::new(document).with_images(decoded.decoded_images()),
+            Rect::new(0.0, 0.0, f64::from(options.width), height),
+            Point::ORIGIN,
+            &mut painter,
         );
-        self.image_count = 0;
-        for command in scene.commands() {
-            match command {
-                RenderCommand::PushClip { rect } => painter.push_clip(*rect),
-                RenderCommand::PopClip => painter.pop_clip(),
-                RenderCommand::Fill { rect, color } => painter.fill_rect(*rect, *color),
-                RenderCommand::RoundedFill { rect, radii, color } => {
-                    painter.fill_rounded_rect(*rect, *radii, *color)
-                }
-                RenderCommand::RoundedBorder {
-                    rect,
-                    radii,
-                    width,
-                    color,
-                } => painter.stroke_rounded_rect(*rect, *radii, *width, *color),
-                RenderCommand::Glyph { .. } => {}
-                RenderCommand::Image { image, hash, rect } => {
-                    painter.draw_image(image, hash, *rect)
-                }
-                RenderCommand::Svg {
-                    bytes,
-                    hash,
-                    intrinsic_size,
-                    rect,
-                } => painter.draw_svg(bytes, hash, *intrinsic_size, *rect),
-                RenderCommand::ResourceImage {
-                    image_idx, rect, ..
-                } => {
-                    match decoded
-                        .get_decoded(*image_idx)
-                        .context("missing decoded image")?
-                    {
-                        DecodedImage::Raster { image, hash, .. } => {
-                            painter.draw_image(image, hash, *rect)
-                        }
-                        DecodedImage::Svg {
-                            bytes,
-                            hash,
-                            width,
-                            height,
-                        } => painter.draw_svg(bytes, hash, (*width, *height), *rect),
-                    }
-                    self.image_count += 1;
-                }
-            }
-        }
-        let text = document.text();
-        for index in text.paint_order_indices() {
-            let index = *index as usize;
-            let Some(line) = text.line(index) else {
-                continue;
-            };
-            if !self.paint_all && line.point().y >= f64::from(options.height) {
-                continue;
-            }
-            ensure!(
-                paint_line_text_runs(document, index, line.point(), 1.0, None, &mut painter),
-                "native text run painting unavailable for line {index}"
-            );
-        }
-        self.commands = Arc::new(painter.into_commands());
-        ensure!(
-            self.commands
-                .iter()
-                .filter(|command| matches!(command, PaintCommand::Image { .. }))
-                .count()
-                >= self.image_count,
-            "an image failed to rasterize"
-        );
+        let scene = painter.finish();
+        self.image_count = scene.image_count();
+        self.scene = Some(scene);
         self.decoded = Some(decoded);
 
         Ok(())
@@ -268,8 +202,7 @@ impl DocumentView {
     }
 
     pub(super) fn element_at(&self, scroll_y: f32) -> impl IntoElement {
-        let commands = self.commands.clone();
-        let glyphs: GlyphStore = self.shaper.store();
+        let scene = self.scene.clone();
         div().size_full().bg(rgb(0xffffff)).overflow_hidden().child(
             canvas(
                 |_, _, _| (),
@@ -277,7 +210,9 @@ impl DocumentView {
                     window.with_content_mask(Some(ContentMask { bounds }), |window| {
                         let mut shifted = bounds;
                         shifted.origin.y -= px(scroll_y);
-                        paint_commands(&commands, &glyphs, shifted, window, cx);
+                        if let Some(scene) = &scene {
+                            scene.paint(shifted, window, cx);
+                        }
                     });
                 },
             )
@@ -285,23 +220,40 @@ impl DocumentView {
         )
     }
 
-    pub(super) fn inspect(&self) -> serde_json::Value {
+    pub(super) fn inspect(&self, full_layout: bool) -> serde_json::Value {
         let view = self.engine.render_view().expect("loaded document");
         let boxes = view.boxes();
-        let entries: Vec<_> = (0..boxes.len().min(45))
-            .map(|index| {
-                let format = boxes.text_format(index);
-                let point = boxes.point(index);
-                let size = boxes.size(index);
-                serde_json::json!({"index":index,"tag":boxes.tag(index),
-                "class":boxes.attribute(index,"class"),"parent":boxes.parent(index),
+        let entries: Vec<_> = (0..if full_layout { box_queries::len(boxes) } else { box_queries::len(boxes).min(45) })
+            .map(|raw_index| {
+                let index = layout_state::box_id_new(raw_index);
+                let format = box_queries::text_format(boxes, index);
+                let point = box_queries::render_box_view_point(boxes, index);
+                let size = box_queries::render_box_view_size(boxes, index);
+                let lines = box_queries::content_line_range(boxes, index);
+                serde_json::json!({"index":raw_index,"tag":box_queries::tag(boxes, index),
+                "class":box_queries::attribute(boxes, index,"class"),"parent":box_queries::parent(boxes, index).map(layout_state::box_id_index),
                 "x":point.map(|p|p.x),"y":point.map(|p|p.y),
                 "width":size.map(|s|s.width),"height":size.map(|s|s.height),
-                "table":boxes.is_table(index),"font_size":format.font_size,
+                "lines":[lines.start.index(), lines.end.index()],
+                "table":box_queries::is_table(boxes, index),"font_size":format.font_size,
                 "font_weight":format.font_weight,"font_style":format!("{:?}",format.font_style),
-                "font_family":format.font_family.and_then(|id|view.style_string(id))})
+                "font_family":format.font_family})
             })
             .collect();
-        serde_json::json!({"boxes":entries,"line_count":view.text().lines().len()})
+        let text = view.text();
+        let lines = full_layout.then(|| text.lines().iter().map(|line| {
+            let value = text_paint::render_line_glyphs(&line).filter_map(|index| text_paint::render_text_view_character_at(text, index as usize)).collect::<String>();
+            let advances = text_paint::render_line_glyphs(&line).map(|index| text_paint::character_advance(text, index)
+                .or_else(|| text_paint::glyph_at(text, index as usize).and_then(|glyph| text_paint::glyph_metric(text, glyph)).map(|metric| metric.advance())))
+                .collect::<Vec<_>>();
+            let font_extents = text_paint::render_line_glyphs(&line).map(|index| text_paint::glyph_at(text, index as usize)
+                .and_then(|glyph| text_paint::glyph_metric(text, glyph))
+                .map(|metric| [metric.ascent(), metric.descent()]))
+                .collect::<Vec<_>>();
+            serde_json::json!({"index":line.id().index(),"owner":line.owner_box().index(),
+                "x":line.point().x,"y":line.point().y,"height":line.height(),"baseline":text_paint::line_baseline(&line),
+                "text":value,"advances":advances,"font_extents":font_extents,"hyphen":text_paint::hyphen_for_line(text, line.id()).is_some()})
+        }).collect::<Vec<_>>());
+        serde_json::json!({"boxes":entries,"line_count":text.lines().len(),"lines":lines})
     }
 }

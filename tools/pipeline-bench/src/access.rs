@@ -1,12 +1,18 @@
 //! Focused workloads for the clone/lock/Arc audit. Setup and integrity checks
 //! are outside the measured region; heap and timing builds run separately.
 
+use html_dom as dom_values;
+use html_resources::resources::images as image_resources;
 use crate::{Shaper, cpu_seconds, heap, layout_fingerprint, median};
-use html::document::{ImageResource, ImageSource};
-use html::layout::LayoutConstraints;
-use html::pipeline::{BookStylesheetCache, DocumentFactory, parse_html_document};
-use html::resources::{FileSystemProvider, ImagePipeline};
-use html::text::GlyphResourceStore;
+use html::document::ImageId;
+use html_dom::ImageResource;
+use html_dom::ImageSource;
+use html_pipeline::engine::LayoutConstraints;
+use html_pipeline::{BookStylesheetCache, DocumentFactory};
+use html_pipeline::parse_html_document;
+use html::resources::FileSystemProvider;
+use html_resources::ImagePipeline;
+use html_pipeline::engine::GlyphResourceStore;
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::hint::black_box;
@@ -75,15 +81,19 @@ pub(super) fn run(path: &str, case: &str, count: usize) {
                 })
                 .collect::<Vec<_>>();
             let mut pipeline = ImagePipeline::new(Arc::new(FileSystemProvider));
-            pipeline.ensure_window(&images, &(0..256).collect::<HashSet<_>>());
-            assert!(pipeline.poll().decoded);
+            pipeline.ensure_window(&images, &(0..256).map(dom_values::image_id_new).collect::<HashSet<_>>());
+            assert!(pipeline.poll(&images).decoded);
             let mut result = measure(count, || {
                 for _ in 0..100 {
-                    assert!(!black_box(pipeline.poll()).decoded);
+                    assert!(!black_box(pipeline.poll(&images)).decoded);
                 }
             });
             let dimensions: Vec<_> = (0..256)
-                .map(|index| pipeline.get_decoded(index).unwrap().dimensions())
+                .map(|index| {
+                    image_resources::decoded_image_dimensions(&image_resources::decoded_images_get(pipeline
+                        .decoded_images(), dom_values::image_id_new(index))
+                        .unwrap())
+                })
                 .collect();
             result["integrity"] = json!(dimensions);
             result["operations_per_sample"] = json!(100);

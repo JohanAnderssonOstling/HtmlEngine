@@ -1,57 +1,42 @@
-use super::paint_program::{PaintCommand, PaintOperation, PaintStyleSource};
+use html_style_model::computed_style;
+use super::border_geometry::emit_border_fragments;
+use super::paint_program::{PaintCommand, PaintLayers, PaintOperation, PaintStyleSource};
 use crate::layout::{FragmentWriter, LayoutEngine};
-use crate::layout_model::{DecorationFragment, InlineContent, RoundedDecoration};
+use crate::layout_model::{BoxGeometry, DecorationFragment, InlineContent, RoundedDecoration};
+use html_style_model::CornerRadii;
 use kurbo::Rect;
 
-/// Emits geometry-dependent decoration fragments while limiting mutation to
-/// fragment output and its transient decoration-order owner keys.
+/// Paint reads finalized geometry and writes decoration output only.
 pub(super) struct DecorationEmitter<'scope, 'input, 'output> {
     pub(super) reader: &'scope super::read_context::LayoutReader<'input>,
     pub(super) inline_content: &'input InlineContent,
-    pub(super) geometry: &'scope super::geometry_writer::GeometryWriter<'output>,
+    pub(super) geometry: &'scope BoxGeometry,
     pub(super) fragments: &'scope mut FragmentWriter<'output>,
-    pub(super) placement: &'scope mut super::placement::PlacementState,
-    pub(super) track_overflow_clips: bool,
     pub(super) retained_rect: Option<Rect>,
 }
 
-impl<'scope, 'input, 'output> DecorationEmitter<'scope, 'input, 'output> {
-    fn new(
-        reader: &'scope super::read_context::LayoutReader<'input>,
-        inline_content: &'input InlineContent,
-        geometry: &'scope super::geometry_writer::GeometryWriter<'output>,
-        fragments: &'scope mut FragmentWriter<'output>,
-        placement: &'scope mut super::placement::PlacementState,
-        track_overflow_clips: bool,
-    ) -> Self {
-        Self {
-            reader,
-            inline_content,
-            geometry,
-            fragments,
-            placement,
-            track_overflow_clips,
-            retained_rect: None,
-        }
-    }
-}
-
 impl DecorationEmitter<'_, '_, '_> {
-    pub(super) fn push_decoration(
+    pub(super) fn emit_solid_border(
         &mut self,
         rect: Rect,
-        color: u32,
+        radii: CornerRadii,
+        uniform_border: Option<(f64, u32)>,
+        borders: [Option<(f64, u32)>; 4],
         is_inline: bool,
-        rounded: Option<RoundedDecoration>,
     ) {
-        if let Some(rounded) = rounded {
-            self.fragments
-                .push_rounded_decoration(self.placement, rect, color, is_inline, rounded);
-        } else {
-            self.fragments.push_decoration(
-                self.placement,
-                DecorationFragment::border_rect(rect, color, is_inline, false),
+        let fragments = self.fragments.decoration_store_mut();
+        if let Some((width, color)) = uniform_border.filter(|_| !computed_style::corner_radii_is_zero(radii)) {
+            fragments.push_rounded_border(
+                rect,
+                color,
+                is_inline,
+                RoundedDecoration {
+                    radii,
+                    border_width: Some(width as f32),
+                },
             );
+        } else {
+            emit_border_fragments(fragments, rect, borders, is_inline);
         }
     }
 
@@ -60,56 +45,80 @@ impl DecorationEmitter<'_, '_, '_> {
         rect: Rect,
         color: u32,
         is_inline: bool,
-        rounded: Option<RoundedDecoration>,
+        radii: Option<CornerRadii>,
     ) {
-        if let Some(rounded) = rounded {
+        if let Some(radii) = radii {
+            let rounded = RoundedDecoration {
+                radii,
+                border_width: None,
+            };
             self.fragments
-                .push_rounded_background(self.placement, rect, color, is_inline, rounded);
+                .decoration_store_mut()
+                .push_rounded_background(rect, color, is_inline, rounded);
         } else {
-            self.fragments.push_decoration(
-                self.placement,
-                DecorationFragment::background_rect(rect, color, is_inline),
-            );
+            self.fragments
+                .push_decoration(DecorationFragment::background_rect(rect, color, is_inline));
         }
     }
 }
 
-pub fn emit_block_background(engine: &mut LayoutEngine<'_, '_>, box_idx: usize) {
-    with_decoration_emitter(engine, |emitter| emitter.emit_block_background(box_idx));
+pub(super) fn block_border_box_rect(geometry: &BoxGeometry, box_idx: usize) -> Rect {
+    geometry
+        .decoration_rect(box_idx)
+        .map(|rect| rect + geometry.point(box_idx).to_vec2())
+        .unwrap_or_else(|| Rect::from_origin_size(geometry.point(box_idx), geometry.size(box_idx)))
 }
 
-pub fn emit_block_decorations(engine: &mut LayoutEngine<'_, '_>, box_idx: usize) {
-    with_decoration_emitter(engine, |emitter| emitter.emit_block_decorations(box_idx));
+pub fn record_block_background(engine: &mut LayoutEngine<'_, '_>, box_idx: usize) {
+    if engine.reader.background_can_change(box_idx) {
+        let rect = block_border_box_rect(engine.geometry, box_idx);
+        engine.fragments.record_paint(
+            &engine.placement,
+            PaintOperation::Background {
+                owner: box_idx as u32,
+                rect,
+            },
+        );
+    }
 }
 
-pub fn emit_block_border_and_outline(engine: &mut LayoutEngine<'_, '_>, box_idx: usize) {
-    with_decoration_emitter(engine, |emitter| {
-        emitter.emit_block_border_and_outline(box_idx)
-    });
+pub fn record_block_decorations(engine: &mut LayoutEngine<'_, '_>, box_idx: usize) {
+    record_block_background(engine, box_idx);
+    record_block_border_and_outline(engine, box_idx);
 }
 
-pub fn collect_inline_decorations(engine: &mut LayoutEngine<'_, '_>) {
-    with_decoration_emitter(engine, |emitter| emitter.collect_inline_decorations());
-}
-
-fn with_decoration_emitter<'input, R>(
-    engine: &mut LayoutEngine<'input, '_>,
-    operation: impl FnOnce(&mut DecorationEmitter<'_, 'input, '_>) -> R,
-) -> R {
-    let mut emitter = DecorationEmitter::new(
-        &engine.reader,
-        engine.text.content(),
-        &engine.geometry,
-        &mut engine.fragments,
-        &mut engine.placement,
-        engine.track_overflow_clips,
-    );
-    operation(&mut emitter)
+pub fn record_block_border_and_outline(engine: &mut LayoutEngine<'_, '_>, box_idx: usize) {
+    let style = engine.reader.style(box_idx);
+    if [
+        style.border_top_width(),
+        style.border_right_width(),
+        style.border_bottom_width(),
+        style.border_left_width(),
+    ]
+    .into_iter()
+    .any(|width| width > 0.0)
+        || (style.outline().style != html_style_model::BorderStyle::None
+            && style.outline().width() > 0.0)
+    {
+        let rect = block_border_box_rect(engine.geometry, box_idx);
+        engine.fragments.record_paint(
+            &engine.placement,
+            PaintOperation::BorderOutline {
+                owner: box_idx as u32,
+                rect,
+            },
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use html_pipeline::engine::fragment_paint;
+
+    use html_pipeline::engine::text_paint;
+
     use crate::GlyphResourceStore;
+    use crate::layout_model::LineId;
 
     use crate::LaidOutDocument;
     use crate::parser::DocumentFactory;
@@ -155,13 +164,11 @@ mod tests {
             "<html><body><p style='text-decoration:underline 2px solid #123456'><span>Decorated</span></p></body></html>",
             &mut document_resources,
         );
-        let decorations = document
-            .render_view(&document_resources)
-            .fragments()
-            .decorations()
-            .iter()
-            .filter(|fragment| fragment.color() == 0x123456FF)
-            .collect::<Vec<_>>();
+        let decorations =
+            fragment_paint::decorations(document.render_view(&document_resources).fragments())
+                .iter()
+                .filter(|fragment| fragment_paint::decoration_color(&fragment) == 0x123456FF)
+                .collect::<Vec<_>>();
 
         assert!(
             !decorations.is_empty(),
@@ -182,13 +189,11 @@ mod tests {
             "<html><body><table style='text-decoration:underline 2px solid #123456'><tr><td>Decorated</td></tr></table></body></html>",
             &mut document_resources,
         );
-        let decorations = document
-            .render_view(&document_resources)
-            .fragments()
-            .decorations()
-            .iter()
-            .filter(|fragment| fragment.color() == 0x123456FF)
-            .collect::<Vec<_>>();
+        let decorations =
+            fragment_paint::decorations(document.render_view(&document_resources).fragments())
+                .iter()
+                .filter(|fragment| fragment_paint::decoration_color(&fragment) == 0x123456FF)
+                .collect::<Vec<_>>();
 
         assert!(
             !decorations.is_empty(),
@@ -204,13 +209,11 @@ mod tests {
             "<html><body><span style='text-decoration:line-through 2px dashed #654321'>Long decorated text</span></body></html>",
             &mut document_resources,
         );
-        let decorations = document
-            .render_view(&document_resources)
-            .fragments()
-            .decorations()
-            .iter()
-            .filter(|fragment| fragment.color() == 0x654321FF)
-            .collect::<Vec<_>>();
+        let decorations =
+            fragment_paint::decorations(document.render_view(&document_resources).fragments())
+                .iter()
+                .filter(|fragment| fragment_paint::decoration_color(&fragment) == 0x654321FF)
+                .collect::<Vec<_>>();
 
         assert_eq!(
             decorations.len(),
@@ -225,11 +228,13 @@ mod tests {
         assert!(
             decorations
                 .iter()
-                .all(|fragment| fragment.pattern()
+                .all(|fragment| fragment_paint::decoration_pattern(&fragment)
                     == crate::RenderDecorationPattern::DashedHorizontal)
         );
         assert!(
-            decorations.iter().all(|fragment| fragment.is_foreground()),
+            decorations
+                .iter()
+                .all(|fragment| fragment_paint::decoration_is_foreground(&fragment)),
             "line-through paints above glyphs"
         );
     }
@@ -242,12 +247,9 @@ mod tests {
         let mut high_ascent_resources = GlyphResourceStore::default();
         let high_ascent = layout_html_with_font_metrics(html, 0.5, 0.7, &mut high_ascent_resources);
         let overline_y = |document: &LaidOutDocument, resources: &GlyphResourceStore| {
-            document
-                .render_view(resources)
-                .fragments()
-                .decorations()
+            fragment_paint::decorations(document.render_view(resources).fragments())
                 .iter()
-                .find(|fragment| fragment.color() == 0x123456FF)
+                .find(|fragment| fragment_paint::decoration_color(&fragment) == 0x123456FF)
                 .expect("overline fragment")
                 .rect()
                 .y0
@@ -256,9 +258,9 @@ mod tests {
             let line = document
                 .render_view(resources)
                 .text()
-                .line(0)
+                .line(LineId::new(0))
                 .expect("decorated line");
-            line.point().y + line.baseline()
+            line.point().y + text_paint::line_baseline(&line)
         };
 
         let low_offset = baseline_y(&low_ascent, &low_ascent_resources)
@@ -281,12 +283,9 @@ mod tests {
         let high_x_height =
             layout_html_with_font_metrics(html, 0.7, 0.7, &mut high_x_height_resources);
         let strike_y = |document: &LaidOutDocument, resources: &GlyphResourceStore| {
-            document
-                .render_view(resources)
-                .fragments()
-                .decorations()
+            fragment_paint::decorations(document.render_view(resources).fragments())
                 .iter()
-                .find(|fragment| fragment.color() == 0x654321FF)
+                .find(|fragment| fragment_paint::decoration_color(&fragment) == 0x654321FF)
                 .expect("line-through fragment")
                 .rect()
                 .y0
@@ -308,13 +307,11 @@ mod tests {
             "<html><body><div style='width:200px'><span style='font-size:200px;line-height:200px;border-right:200px solid #008000;margin-right:-200px'><div></div></span></div></body></html>",
             &mut document_resources,
         );
-        let green = document
-            .render_view(&document_resources)
-            .fragments()
-            .decorations()
-            .iter()
-            .find(|fragment| fragment.color() == 0x008000ff)
-            .expect("the trailing inline boundary must paint its right border");
+        let green =
+            fragment_paint::decorations(document.render_view(&document_resources).fragments())
+                .iter()
+                .find(|fragment| fragment_paint::decoration_color(&fragment) == 0x008000ff)
+                .expect("the trailing inline boundary must paint its right border");
 
         assert!(
             (green.rect().width() - 200.0).abs() < 0.001,
@@ -341,12 +338,9 @@ mod tests {
             &mut margined_resources,
         );
         let border_rects = |document: &LaidOutDocument, resources: &GlyphResourceStore| {
-            document
-                .render_view(resources)
-                .fragments()
-                .decorations()
+            fragment_paint::decorations(document.render_view(resources).fragments())
                 .iter()
-                .filter(|fragment| fragment.color() == 0x123456FF)
+                .filter(|fragment| fragment_paint::decoration_color(&fragment) == 0x123456FF)
                 .map(|fragment| fragment.rect())
                 .collect::<Vec<_>>()
         };
@@ -371,15 +365,12 @@ mod tests {
             "<html><body><div style='height:40px;margin-top:40px;overflow:hidden'><div style='height:20px;margin-top:40px;background:#ff0000'></div></div></body></html>",
             &mut document_resources,
         );
-        let red = document
-            .render_view(&document_resources)
-            .fragments()
-            .decorations()
-            .iter()
-            .find(|fragment| fragment.color() == 0xff0000ff)
-            .expect("red overflowing descendant background");
-        let clip = red
-            .overflow_clip()
+        let red =
+            fragment_paint::decorations(document.render_view(&document_resources).fragments())
+                .iter()
+                .find(|fragment| fragment_paint::decoration_color(&fragment) == 0xff0000ff)
+                .expect("red overflowing descendant background");
+        let clip = fragment_paint::decoration_overflow_clip(&red)
             .expect("overflow ancestor must publish a clip");
         assert!(
             red.rect().y0 >= clip.rect().y1 - 0.001,
@@ -397,13 +388,17 @@ mod tests {
         );
         let root = document.render_view(&document_resources);
         assert!(
-            root.fragments()
-                .decorations()
+            fragment_paint::decorations(root.fragments())
                 .iter()
-                .all(|fragment| fragment.overflow_clip().is_none())
+                .all(|fragment| fragment_paint::decoration_overflow_clip(&fragment).is_none())
         );
         let text = root.text();
-        assert!((0..text.line_count()).all(|line| text.line_overflow_clip(line).is_none()));
+        assert!(
+            text_paint::render_text_view_spatial_order(text)
+                .iter()
+                .copied()
+                .all(|line| text_paint::line_overflow_clip(text, line).is_none())
+        );
     }
 
     #[test]
@@ -413,14 +408,13 @@ mod tests {
             "<html><body><div style='width:20px;height:10px;overflow-x:clip;overflow-y:visible'><div style='width:40px;height:20px;background:#ff0000'></div></div></body></html>",
             &mut document_resources,
         );
-        let red = document
-            .render_view(&document_resources)
-            .fragments()
-            .decorations()
-            .iter()
-            .find(|fragment| fragment.color() == 0xff0000ff)
-            .expect("red descendant background");
-        let clip = red.overflow_clip().expect("horizontal overflow clip");
+        let red =
+            fragment_paint::decorations(document.render_view(&document_resources).fragments())
+                .iter()
+                .find(|fragment| fragment_paint::decoration_color(&fragment) == 0xff0000ff)
+                .expect("red descendant background");
+        let clip =
+            fragment_paint::decoration_overflow_clip(&red).expect("horizontal overflow clip");
         assert!(clip.clips_x());
         assert!(
             !clip.clips_y(),
@@ -440,43 +434,37 @@ mod tests {
             "<html><body><div style='width:50px;height:20px;outline:2px solid #abcdef'>A</div></body></html>",
             &mut outlined_resources,
         );
-        let outline_fragments = outlined
-            .render_view(&outlined_resources)
-            .fragments()
-            .decorations()
-            .iter()
-            .filter(|fragment| fragment.color() == 0xABCDEFFF)
-            .collect::<Vec<_>>();
+        let outline_fragments =
+            fragment_paint::decorations(outlined.render_view(&outlined_resources).fragments())
+                .iter()
+                .filter(|fragment| fragment_paint::decoration_color(&fragment) == 0xABCDEFFF)
+                .collect::<Vec<_>>();
 
         assert_eq!(
-            plain
+            text_paint::render_lines_get(&plain
                 .render_view(&plain_resources)
                 .text()
-                .lines()
-                .get(0)
+                .lines(), 0)
                 .unwrap()
                 .point(),
-            outlined
+            text_paint::render_lines_get(&outlined
                 .render_view(&outlined_resources)
                 .text()
-                .lines()
-                .get(0)
+                .lines(), 0)
                 .unwrap()
                 .point()
         );
         assert_eq!(
-            plain
+            text_paint::render_lines_get(&plain
                 .render_view(&plain_resources)
                 .text()
-                .lines()
-                .get(0)
+                .lines(), 0)
                 .unwrap()
                 .height(),
-            outlined
+            text_paint::render_lines_get(&outlined
                 .render_view(&outlined_resources)
                 .text()
-                .lines()
-                .get(0)
+                .lines(), 0)
                 .unwrap()
                 .height()
         );
@@ -493,7 +481,7 @@ mod tests {
         assert!(
             outline_fragments
                 .iter()
-                .all(|fragment| fragment.is_foreground()),
+                .all(|fragment| fragment_paint::decoration_is_foreground(&fragment)),
             "outlines paint above box contents"
         );
     }
@@ -511,29 +499,24 @@ mod tests {
             &mut block_offset_resources,
         );
         let bounds = |document: &LaidOutDocument, resources: &GlyphResourceStore| {
-            document
-                .render_view(resources)
-                .fragments()
-                .decorations()
+            fragment_paint::decorations(document.render_view(resources).fragments())
                 .iter()
-                .filter(|fragment| fragment.color() == 0xABCDEFFF)
+                .filter(|fragment| fragment_paint::decoration_color(&fragment) == 0xABCDEFFF)
                 .map(|fragment| fragment.rect())
                 .reduce(|a, b| a.union(b))
                 .expect("outline fragments")
         };
         assert_eq!(
-            block_zero
+            text_paint::render_lines_get(&block_zero
                 .render_view(&block_zero_resources)
                 .text()
-                .lines()
-                .get(0)
+                .lines(), 0)
                 .unwrap()
                 .point(),
-            block_offset
+            text_paint::render_lines_get(&block_offset
                 .render_view(&block_offset_resources)
                 .text()
-                .lines()
-                .get(0)
+                .lines(), 0)
                 .unwrap()
                 .point()
         );
@@ -553,12 +536,9 @@ mod tests {
             &mut inline_inset_resources,
         );
         let inline_bounds = |document: &LaidOutDocument, resources: &GlyphResourceStore| {
-            document
-                .render_view(resources)
-                .fragments()
-                .decorations()
+            fragment_paint::decorations(document.render_view(resources).fragments())
                 .iter()
-                .filter(|fragment| fragment.color() == 0x123456FF)
+                .filter(|fragment| fragment_paint::decoration_color(&fragment) == 0x123456FF)
                 .map(|fragment| fragment.rect())
                 .reduce(|a, b| a.union(b))
                 .expect("inline outline fragments")
@@ -568,18 +548,16 @@ mod tests {
         assert_eq!(inset.x0, zero.x0 + 1.0);
         assert_eq!(inset.x1, zero.x1 - 1.0);
         assert_eq!(
-            inline_zero
+            text_paint::render_lines_get(&inline_zero
                 .render_view(&inline_zero_resources)
                 .text()
-                .lines()
-                .get(0)
+                .lines(), 0)
                 .unwrap()
                 .height(),
-            inline_inset
+            text_paint::render_lines_get(&inline_inset
                 .render_view(&inline_inset_resources)
                 .text()
-                .lines()
-                .get(0)
+                .lines(), 0)
                 .unwrap()
                 .height()
         );
@@ -614,44 +592,40 @@ mod tests {
             &mut hidden_resources,
         );
         assert_eq!(
-            visible
+            text_paint::render_lines_get(&visible
                 .render_view(&visible_resources)
                 .text()
-                .lines()
-                .get(0)
+                .lines(), 0)
                 .unwrap()
                 .point(),
-            hidden
+            text_paint::render_lines_get(&hidden
                 .render_view(&hidden_resources)
                 .text()
-                .lines()
-                .get(0)
+                .lines(), 0)
                 .unwrap()
                 .point()
         );
         assert_eq!(
-            visible
+            text_paint::render_lines_get(&visible
                 .render_view(&visible_resources)
                 .text()
-                .lines()
-                .get(0)
+                .lines(), 0)
                 .unwrap()
                 .height(),
-            hidden
+            text_paint::render_lines_get(&hidden
                 .render_view(&hidden_resources)
                 .text()
-                .lines()
-                .get(0)
+                .lines(), 0)
                 .unwrap()
                 .height()
         );
         assert!(
-            !hidden
-                .render_view(&hidden_resources)
-                .fragments()
-                .decorations()
+            !fragment_paint::decorations(hidden.render_view(&hidden_resources).fragments())
                 .iter()
-                .any(|fragment| matches!(fragment.color(), 0x123456FF | 0xABCDEFFF | 0xFEDCBAFF))
+                .any(|fragment| matches!(
+                    fragment_paint::decoration_color(&fragment),
+                    0x123456FF | 0xABCDEFFF | 0xFEDCBAFF
+                ))
         );
     }
 
@@ -662,20 +636,22 @@ mod tests {
             "<html><body><div style='width:80px;height:20px;outline:2px dotted #13579b'>A</div></body></html>",
             &mut document_resources,
         );
-        let fragments = document
-            .render_view(&document_resources)
-            .fragments()
-            .decorations()
-            .iter()
-            .filter(|fragment| fragment.color() == 0x13579BFF)
-            .collect::<Vec<_>>();
+        let fragments =
+            fragment_paint::decorations(document.render_view(&document_resources).fragments())
+                .iter()
+                .filter(|fragment| fragment_paint::decoration_color(&fragment) == 0x13579BFF)
+                .collect::<Vec<_>>();
 
         assert_eq!(fragments.len(), 4);
-        assert!(fragments.iter().all(|fragment| fragment.is_foreground()));
+        assert!(
+            fragments
+                .iter()
+                .all(|fragment| fragment_paint::decoration_is_foreground(&fragment))
+        );
         assert_eq!(
             fragments
                 .iter()
-                .filter(|fragment| fragment.pattern()
+                .filter(|fragment| fragment_paint::decoration_pattern(&fragment)
                     == crate::RenderDecorationPattern::DottedHorizontal)
                 .count(),
             2
@@ -683,9 +659,8 @@ mod tests {
         assert_eq!(
             fragments
                 .iter()
-                .filter(
-                    |fragment| fragment.pattern() == crate::RenderDecorationPattern::DottedVertical
-                )
+                .filter(|fragment| fragment_paint::decoration_pattern(&fragment)
+                    == crate::RenderDecorationPattern::DottedVertical)
                 .count(),
             2
         );
@@ -698,20 +673,18 @@ mod tests {
             "<html><body><span style='color:#2468ac;text-decoration-line:underline overline line-through;text-decoration-style:double;text-decoration-thickness:2px'>Decorated</span></body></html>",
             &mut document_resources,
         );
-        let fragments = document
-            .render_view(&document_resources)
-            .fragments()
-            .decorations()
-            .iter()
-            .filter(|fragment| fragment.color() == 0x2468ACFF)
-            .collect::<Vec<_>>();
+        let fragments =
+            fragment_paint::decorations(document.render_view(&document_resources).fragments())
+                .iter()
+                .filter(|fragment| fragment_paint::decoration_color(&fragment) == 0x2468ACFF)
+                .collect::<Vec<_>>();
         let background_count = fragments
             .iter()
-            .filter(|fragment| !fragment.is_foreground())
+            .filter(|fragment| !fragment_paint::decoration_is_foreground(&fragment))
             .count();
         let foreground_count = fragments
             .iter()
-            .filter(|fragment| fragment.is_foreground())
+            .filter(|fragment| fragment_paint::decoration_is_foreground(&fragment))
             .count();
 
         assert_eq!(
@@ -725,7 +698,7 @@ mod tests {
         assert!(
             fragments
                 .iter()
-                .all(|fragment| fragment.pattern()
+                .all(|fragment| fragment_paint::decoration_pattern(&fragment)
                     == crate::RenderDecorationPattern::DoubleHorizontal)
         );
         assert!(
@@ -742,21 +715,19 @@ mod tests {
             "<html><body><p style='text-decoration:underline 2px solid #112233'>Before <span style='text-decoration:none;color:#abcdef'>inside</span> after</p></body></html>",
             &mut document_resources,
         );
-        let fragments = document
-            .render_view(&document_resources)
-            .fragments()
-            .decorations();
+        let fragments =
+            fragment_paint::decorations(document.render_view(&document_resources).fragments());
 
         assert!(
             fragments
                 .iter()
-                .any(|fragment| fragment.color() == 0x112233FF),
+                .any(|fragment| fragment_paint::decoration_color(&fragment) == 0x112233FF),
             "an ancestor-established decoration propagates through descendant text"
         );
         assert!(
             !fragments
                 .iter()
-                .any(|fragment| fragment.color() == 0xABCDEFFF),
+                .any(|fragment| fragment_paint::decoration_color(&fragment) == 0xABCDEFFF),
             "text color alone must not establish a descendant decoration"
         );
     }
@@ -773,43 +744,37 @@ mod tests {
             "<html><body><span style='color:#3579bd;outline:3px dashed currentColor'>Outlined text</span></body></html>",
             &mut outlined_resources,
         );
-        let fragments = outlined
-            .render_view(&outlined_resources)
-            .fragments()
-            .decorations()
-            .iter()
-            .filter(|fragment| fragment.color() == 0x3579BDFF)
-            .collect::<Vec<_>>();
+        let fragments =
+            fragment_paint::decorations(outlined.render_view(&outlined_resources).fragments())
+                .iter()
+                .filter(|fragment| fragment_paint::decoration_color(&fragment) == 0x3579BDFF)
+                .collect::<Vec<_>>();
 
         assert_eq!(
-            plain
+            text_paint::render_lines_get(&plain
                 .render_view(&plain_resources)
                 .text()
-                .lines()
-                .get(0)
+                .lines(), 0)
                 .unwrap()
                 .point(),
-            outlined
+            text_paint::render_lines_get(&outlined
                 .render_view(&outlined_resources)
                 .text()
-                .lines()
-                .get(0)
+                .lines(), 0)
                 .unwrap()
                 .point()
         );
         assert_eq!(
-            plain
+            text_paint::render_lines_get(&plain
                 .render_view(&plain_resources)
                 .text()
-                .lines()
-                .get(0)
+                .lines(), 0)
                 .unwrap()
                 .height(),
-            outlined
+            text_paint::render_lines_get(&outlined
                 .render_view(&outlined_resources)
                 .text()
-                .lines()
-                .get(0)
+                .lines(), 0)
                 .unwrap()
                 .height()
         );
@@ -819,14 +784,13 @@ mod tests {
             "layout publishes four semantic outline edges"
         );
         assert!(fragments.iter().all(|fragment| matches!(
-            fragment.pattern(),
+            fragment_paint::decoration_pattern(&fragment),
             crate::RenderDecorationPattern::DashedHorizontal
                 | crate::RenderDecorationPattern::DashedVertical
         )));
         assert!(
-            fragments
-                .iter()
-                .all(|fragment| fragment.is_inline() && fragment.is_foreground())
+            fragments.iter().all(|fragment| fragment.is_inline()
+                && fragment_paint::decoration_is_foreground(&fragment))
         );
     }
 
@@ -839,20 +803,14 @@ mod tests {
         );
 
         assert!(
-            !document
-                .render_view(&document_resources)
-                .fragments()
-                .decorations()
+            !fragment_paint::decorations(document.render_view(&document_resources).fragments())
                 .iter()
-                .any(|fragment| fragment.color() == 0xFF0000FF)
+                .any(|fragment| fragment_paint::decoration_color(&fragment) == 0xFF0000FF)
         );
         assert!(
-            !document
-                .render_view(&document_resources)
-                .fragments()
-                .decorations()
+            !fragment_paint::decorations(document.render_view(&document_resources).fragments())
                 .iter()
-                .any(|fragment| fragment.color() & 0xFF == 0)
+                .any(|fragment| fragment_paint::decoration_color(&fragment) & 0xFF == 0)
         );
     }
 
@@ -863,13 +821,11 @@ mod tests {
             "<html><body><div style='width:50px;height:20px;margin:11px 13px 17px 19px;background:#123456'></div></body></html>",
             &mut document_resources,
         );
-        let fragment = document
-            .render_view(&document_resources)
-            .fragments()
-            .decorations()
-            .iter()
-            .find(|fragment| fragment.color() == 0x123456FF)
-            .expect("block background should be emitted");
+        let fragment =
+            fragment_paint::decorations(document.render_view(&document_resources).fragments())
+                .iter()
+                .find(|fragment| fragment_paint::decoration_color(&fragment) == 0x123456FF)
+                .expect("block background should be emitted");
 
         assert_eq!(fragment.rect().width(), 50.0);
         assert_eq!(fragment.rect().height(), 20.0);
@@ -882,13 +838,11 @@ mod tests {
             "<html><body><p>lead</p><div style='border-color:blue;border-style:solid;border-width:10px;height:96px'></div></body></html>",
             &mut document_resources,
         );
-        let blue = document
-            .render_view(&document_resources)
-            .fragments()
-            .decorations()
-            .iter()
-            .filter(|fragment| fragment.color() == 0x0000ffff)
-            .collect::<Vec<_>>();
+        let blue =
+            fragment_paint::decorations(document.render_view(&document_resources).fragments())
+                .iter()
+                .filter(|fragment| fragment_paint::decoration_color(&fragment) == 0x0000ffff)
+                .collect::<Vec<_>>();
 
         assert_eq!(
             blue.len(),
@@ -896,7 +850,7 @@ mod tests {
             "a uniform block border must publish four physical edges"
         );
         assert!(
-            blue.iter().all(|fragment| fragment.line_idx().is_none()),
+            blue.iter().all(|fragment| fragment_paint::render_decoration_line(&fragment).is_none()),
             "block edges must not be consumed as decorations of the preceding text line: {blue:?}"
         );
     }
@@ -909,24 +863,19 @@ mod tests {
             &mut root_resources,
         );
         assert_eq!(
-            root.render_view(&root_resources).canvas_background_color(),
+            text_paint::render_view_canvas_background_color(&root.render_view(&root_resources)),
             Some(0x123456FF)
         );
         assert!(
-            !root
-                .render_view(&root_resources)
-                .fragments()
-                .decorations()
+            !fragment_paint::decorations(root.render_view(&root_resources).fragments())
                 .iter()
-                .any(|fragment| fragment.color() == 0x123456FF),
+                .any(|fragment| fragment_paint::decoration_color(&fragment) == 0x123456FF),
             "the propagated root background must not also paint as an element box"
         );
         assert!(
-            root.render_view(&root_resources)
-                .fragments()
-                .decorations()
+            fragment_paint::decorations(root.render_view(&root_resources).fragments())
                 .iter()
-                .any(|fragment| fragment.color() == 0xABCDEFFF),
+                .any(|fragment| fragment_paint::decoration_color(&fragment) == 0xABCDEFFF),
             "an unpropagated body background still paints its element box"
         );
 
@@ -936,16 +885,13 @@ mod tests {
             &mut body_resources,
         );
         assert_eq!(
-            body.render_view(&body_resources).canvas_background_color(),
+            text_paint::render_view_canvas_background_color(&body.render_view(&body_resources)),
             Some(0x2468ACFF)
         );
         assert!(
-            !body
-                .render_view(&body_resources)
-                .fragments()
-                .decorations()
+            !fragment_paint::decorations(body.render_view(&body_resources).fragments())
                 .iter()
-                .any(|fragment| fragment.color() == 0x2468ACFF),
+                .any(|fragment| fragment_paint::decoration_color(&fragment) == 0x2468ACFF),
             "the propagated body background must not also paint as an element box"
         );
 
@@ -955,9 +901,8 @@ mod tests {
             &mut image_root_resources,
         );
         assert_eq!(
-            image_root
-                .render_view(&image_root_resources)
-                .canvas_background_color(),
+            text_paint::render_view_canvas_background_color(&image_root
+                .render_view(&image_root_resources)),
             None,
             "a root image layer suppresses body propagation even before image painting is implemented"
         );
@@ -968,19 +913,15 @@ mod tests {
             &mut contents_body_resources,
         );
         assert_eq!(
-            contents_body
-                .render_view(&contents_body_resources)
-                .canvas_background_color(),
+            text_paint::render_view_canvas_background_color(&contents_body
+                .render_view(&contents_body_resources)),
             None,
             "a body without a principal box cannot propagate its background to the canvas"
         );
         assert!(
-            image_root
-                .render_view(&image_root_resources)
-                .fragments()
-                .decorations()
+            fragment_paint::decorations(image_root.render_view(&image_root_resources).fragments())
                 .iter()
-                .any(|fragment| fragment.color() == 0x13579BFF)
+                .any(|fragment| fragment_paint::decoration_color(&fragment) == 0x13579BFF)
         );
 
         let mut hidden_root_resources = GlyphResourceStore::default();
@@ -989,9 +930,8 @@ mod tests {
             &mut hidden_root_resources,
         );
         assert_eq!(
-            hidden_root
-                .render_view(&hidden_root_resources)
-                .canvas_background_color(),
+            text_paint::render_view_canvas_background_color(&hidden_root
+                .render_view(&hidden_root_resources)),
             None,
             "the propagated root background still obeys visibility"
         );
@@ -1004,13 +944,11 @@ mod tests {
             "<html><body><div style='width:40px;height:6px;margin-right:-90px;margin-bottom:-70px;background:#234567'></div></body></html>",
             &mut document_resources,
         );
-        let fragment = document
-            .render_view(&document_resources)
-            .fragments()
-            .decorations()
-            .iter()
-            .find(|fragment| fragment.color() == 0x234567FF)
-            .expect("block background should be emitted");
+        let fragment =
+            fragment_paint::decorations(document.render_view(&document_resources).fragments())
+                .iter()
+                .find(|fragment| fragment_paint::decoration_color(&fragment) == 0x234567FF)
+                .expect("block background should be emitted");
 
         assert_eq!(fragment.rect().width(), 40.0);
         assert_eq!(fragment.rect().height(), 6.0);
@@ -1023,13 +961,11 @@ mod tests {
             "<html><body><div style='width:50px;height:20px;background:#345678'><div style='width:20px;height:10px;background:#456789'></div></div></body></html>",
             &mut document_resources,
         );
-        let colors = document
-            .render_view(&document_resources)
-            .fragments()
-            .decorations()
-            .iter()
-            .map(|fragment| fragment.color())
-            .collect::<Vec<_>>();
+        let colors =
+            fragment_paint::decorations(document.render_view(&document_resources).fragments())
+                .iter()
+                .map(|fragment| fragment_paint::decoration_color(&fragment))
+                .collect::<Vec<_>>();
         let ancestor = colors
             .iter()
             .position(|color| *color == 0x345678FF)
@@ -1058,13 +994,15 @@ mod tests {
             &mut backgrounds_resources,
         );
         let colored_rects = |document: &LaidOutDocument, resources: &GlyphResourceStore| {
-            document
-                .render_view(resources)
-                .fragments()
-                .decorations()
+            fragment_paint::decorations(document.render_view(resources).fragments())
                 .iter()
-                .filter(|fragment| matches!(fragment.color(), 0x0000FFFF | 0xFFA500FF))
-                .map(|fragment| (fragment.color(), fragment.rect()))
+                .filter(|fragment| {
+                    matches!(
+                        fragment_paint::decoration_color(&fragment),
+                        0x0000FFFF | 0xFFA500FF
+                    )
+                })
+                .map(|fragment| (fragment_paint::decoration_color(&fragment), fragment.rect()))
                 .collect::<Vec<_>>()
         };
 
@@ -1086,30 +1024,24 @@ mod tests {
             "<html><body><p>same lead-in</p><div style='border-top:96px solid black;margin-top:112px'></div></body></html>",
             &mut reference_resources,
         );
-        let red = document
-            .render_view(&document_resources)
-            .fragments()
-            .decorations()
-            .iter()
-            .find(|fragment| fragment.color() == 0xFF0000FF)
-            .expect("red border")
-            .rect();
-        let black = document
-            .render_view(&document_resources)
-            .fragments()
-            .decorations()
-            .iter()
-            .find(|fragment| fragment.color() == 0x000000FF)
-            .expect("black border")
-            .rect();
-        let reference_black = reference
-            .render_view(&reference_resources)
-            .fragments()
-            .decorations()
-            .iter()
-            .find(|fragment| fragment.color() == 0x000000FF)
-            .expect("reference black border")
-            .rect();
+        let red =
+            fragment_paint::decorations(document.render_view(&document_resources).fragments())
+                .iter()
+                .find(|fragment| fragment_paint::decoration_color(&fragment) == 0xFF0000FF)
+                .expect("red border")
+                .rect();
+        let black =
+            fragment_paint::decorations(document.render_view(&document_resources).fragments())
+                .iter()
+                .find(|fragment| fragment_paint::decoration_color(&fragment) == 0x000000FF)
+                .expect("black border")
+                .rect();
+        let reference_black =
+            fragment_paint::decorations(reference.render_view(&reference_resources).fragments())
+                .iter()
+                .find(|fragment| fragment_paint::decoration_color(&fragment) == 0x000000FF)
+                .expect("reference black border")
+                .rect();
 
         assert_eq!(
             red, black,
@@ -1122,35 +1054,23 @@ mod tests {
     }
 }
 
-pub fn emit_bound_background(
+pub fn record_bound_background(
     engine: &mut LayoutEngine<'_, '_>,
     owner: usize,
     rect: Rect,
     source: PaintStyleSource,
 ) {
-    with_decoration_emitter(engine, |emitter| {
-        emitter.fragments.record_paint(
-            emitter.placement,
-            PaintOperation::BackgroundRect {
-                owner: owner as u32,
-                source,
-                rect,
-            },
-        );
-        if !emitter.fragments.is_paint_replay() {
-            return;
-        }
-        let style = match source {
-            PaintStyleSource::Box(index) => emitter.reader.paint_style(index as usize),
-            PaintStyleSource::Style { indices, context } => {
-                emitter.reader.paint_used_style(indices, context as usize)
-            }
-        };
-        emitter.emit_color_rect_for_owner(owner, rect, style.background_color());
-    });
+    engine.fragments.record_paint(
+        &engine.placement,
+        PaintOperation::BackgroundRect {
+            owner: owner as u32,
+            source,
+            rect,
+        },
+    );
 }
 
-pub fn emit_bound_border(
+pub fn record_bound_border(
     engine: &mut LayoutEngine<'_, '_>,
     owner: usize,
     rect: Rect,
@@ -1158,77 +1078,75 @@ pub fn emit_bound_border(
     side: u8,
     pattern: crate::layout_model::DecorationPattern,
 ) {
-    with_decoration_emitter(engine, |emitter| {
-        emitter.fragments.record_paint(
-            emitter.placement,
-            PaintOperation::CollapsedBorder {
-                owner: owner as u32,
-                source,
-                side,
-                pattern,
-                rect,
-            },
-        );
-        if !emitter.fragments.is_paint_replay() {
-            return;
-        }
-        let style = match source {
-            PaintStyleSource::Box(index) => emitter.reader.paint_style(index as usize),
-            PaintStyleSource::Style { indices, context } => {
-                emitter.reader.paint_used_style(indices, context as usize)
-            }
-        };
-        let color = [
-            style.border_top_color(),
-            style.border_right_color(),
-            style.border_bottom_color(),
-            style.border_left_color(),
-        ][side as usize];
-        if color & 0xff != 0 {
-            emitter.fragments.push_block_decoration(
-                emitter.placement,
-                owner as u32,
-                DecorationFragment::patterned(rect, color, false, false, pattern),
-            );
-        }
-    });
-}
-
-pub(super) fn replay_command(engine: &mut LayoutEngine<'_, '_>, command: PaintCommand) {
-    let start = engine.fragments.decoration_len();
-    match command.operation {
-        PaintOperation::Background { owner, rect } => with_decoration_emitter(engine, |emitter| {
-            emitter.retained_rect = Some(rect);
-            emitter.emit_block_background(owner as usize);
-        }),
-        PaintOperation::BorderOutline { owner, rect } => {
-            with_decoration_emitter(engine, |emitter| {
-                emitter.retained_rect = Some(rect);
-                emitter.emit_block_border_and_outline(owner as usize);
-            })
-        }
-        PaintOperation::BackgroundRect {
-            owner,
-            source,
-            rect,
-        } => emit_bound_background(engine, owner as usize, rect, source),
+    engine.fragments.record_paint(
+        &engine.placement,
         PaintOperation::CollapsedBorder {
-            owner,
+            owner: owner as u32,
             source,
             side,
             pattern,
             rect,
-        } => emit_bound_border(engine, owner as usize, rect, source, side, pattern),
-    }
-    engine
-        .fragments
-        .apply_paint_layers_since(start, command.layers);
-    if command.line != u32::MAX {
-        engine
-            .fragments
-            .record_decoration_line_since(command.line as usize, start);
-        engine
-            .fragments
-            .record_decoration_paint_order_since(command.paint_order, start);
+        },
+    );
+}
+
+impl DecorationEmitter<'_, '_, '_> {
+    pub(super) fn replay_command(&mut self, mut command: PaintCommand) {
+        let reader = self.reader;
+        let resolve_style = |source| match source {
+            PaintStyleSource::Box(index) => reader.paint_style(index as usize),
+            PaintStyleSource::Style { indices, context } => {
+                reader.paint_used_style(indices, context as usize)
+            }
+        };
+        let start = self.fragments.decoration_len();
+        match command.operation {
+            PaintOperation::Background { owner, rect } => {
+                self.retained_rect = Some(rect);
+                self.emit_block_background(owner as usize);
+            }
+            PaintOperation::BorderOutline { owner, rect } => {
+                self.retained_rect = Some(rect);
+                self.emit_block_border_and_outline(owner as usize);
+            }
+            PaintOperation::BackgroundRect {
+                owner,
+                source,
+                rect,
+            } => {
+                let style = resolve_style(source);
+                self.emit_color_rect_for_owner(owner as usize, rect, style.background_color());
+            }
+            PaintOperation::CollapsedBorder {
+                owner,
+                source,
+                side,
+                pattern,
+                rect,
+            } => {
+                command.layers.include(PaintLayers::collapsed_border());
+                let style = resolve_style(source);
+                let color = [
+                    style.border_top_color(),
+                    style.border_right_color(),
+                    style.border_bottom_color(),
+                    style.border_left_color(),
+                ][side as usize];
+                if color & 0xff != 0 {
+                    self.fragments.push_block_decoration(
+                        owner,
+                        DecorationFragment::patterned(rect, color, false, false, pattern),
+                    );
+                }
+            }
+        }
+        self.fragments
+            .apply_paint_layers_since(start, command.layers);
+        if command.line != u32::MAX {
+            self.fragments
+                .record_decoration_line_since(command.line as usize, start);
+            self.fragments
+                .record_decoration_paint_order_since(command.paint_order, start);
+        }
     }
 }

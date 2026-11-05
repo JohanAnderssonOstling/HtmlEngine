@@ -1,11 +1,17 @@
+use html_pipeline::engine::box_queries;
+use html_pipeline::engine::text_paint;
+use html_engine_model::layout_state;
+use html_engine_model::shaping_contracts;
+use html_style_model::language;
+use crate::layout_model::BoxId;
 use crate::parser::DocumentFactory;
 use crate::test_support::TestGlyphShaper;
 use crate::{
-    FontMetricsRequest, FontRelativeMetrics, GlyphResourceGeneration, GlyphResourceStore,
-    GlyphShaper, LaidOutDocument, LayoutConstraints, ShapeError, ShapedTextRun,
-    TextCompositionPolicy, TextRunShapeRequest,
+    FontRelativeMetrics, GlyphResourceGeneration, GlyphResourceStore, GlyphShaper, LaidOutDocument,
+    LayoutConstraints, ShapeError, ShapedTextRun, ShapingStyle, TextCompositionPolicy,
+    TextRunShapeRequest,
 };
-use crate::{GlyphRequest, ShapedGlyph};
+use crate::{GlyphRequest, ShapedGlyph, ShapedRun};
 use std::sync::Arc;
 
 #[derive(Default)]
@@ -19,14 +25,14 @@ struct RecordingShaper {
 impl GlyphShaper for RecordingShaper {
     fn font_relative_metrics(
         &mut self,
-        request: FontMetricsRequest<'_>,
+        request: &ShapingStyle<'_>,
     ) -> Result<FontRelativeMetrics, ShapeError> {
         self.metric_languages.push(
             request
-                .language()
-                .map(|language| language.as_str().to_owned()),
+                .language
+                .map(|language| language::content_language_as_str(&language).to_owned()),
         );
-        Ok(FontRelativeMetrics::fallback())
+        Ok(FontRelativeMetrics::default())
     }
     fn reset(&mut self) {
         self.fallback.reset();
@@ -46,25 +52,22 @@ impl GlyphShaper for RecordingShaper {
     fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
         self.fallback.shape_glyph(request)
     }
-    fn shape_text_run(
+    fn shape_run(
         &mut self,
         request: TextRunShapeRequest<'_>,
-    ) -> Result<Option<ShapedTextRun>, ShapeError> {
+    ) -> Result<Option<ShapedRun>, ShapeError> {
         self.languages.push((
-            request.text().to_owned(),
-            request
-                .style()
-                .language()
-                .map(|language| language.as_str().to_owned()),
+            shaping_contracts::text_run_shape_request_text(&request).to_owned(),
+            shaping_contracts::text_run_shape_request_style(&request)
+                .language
+                .map(|language| language::content_language_as_str(&language).to_owned()),
         ));
-        if self.cluster_text == Some(request.text()) {
-            let count = request.text().chars().count();
+        if self.cluster_text == Some(shaping_contracts::text_run_shape_request_text(&request)) {
+            let count = shaping_contracts::text_run_shape_request_text(&request).chars().count();
             let mut boundaries = vec![true; count + 1];
             boundaries[1] = false;
-            return Ok(ShapedTextRun::new(
-                Arc::from(vec![10.0; count]),
-                Arc::from(boundaries),
-            ));
+            return Ok(Some(shaping_contracts::shaped_run_geometry(shaping_contracts::shaped_text_run_new(Arc::from(vec![10.0; count]),
+                Arc::from(boundaries),))));
         }
         Ok(None)
     }
@@ -95,11 +98,14 @@ fn lines(document: &LaidOutDocument, resources: &GlyphResourceStore) -> Vec<Stri
     text.lines()
         .iter()
         .map(|line| {
-            line.glyphs()
+            text_paint::render_line_glyphs(&line)
                 .map(|index| {
-                    text.glyph_metric(text.glyph_at(index as usize).unwrap())
-                        .unwrap()
-                        .ch()
+                    text_paint::glyph_metric(
+                        text,
+                        text_paint::glyph_at(text, index as usize).unwrap(),
+                    )
+                    .unwrap()
+                    .ch()
                 })
                 .collect()
         })
@@ -376,10 +382,17 @@ fn cjk_inline_boundary_min_content_uses_the_common_ancestors_white_space() {
             &mut document_resources,
         );
         let view = document.render_view(&document_resources);
-        let target = (0..view.boxes().len())
-            .find(|&index| view.boxes().id(index).map(|id| view.string(id)) == Some("target"))
+        let target = (0..box_queries::len(view.boxes()))
+            .map(layout_state::box_id_new)
+            .find(|&index| box_queries::attribute(view.boxes(), index, "id") == Some("target"))
             .unwrap();
-        assert_eq!(view.boxes().size(target).unwrap().width, expected, "{css}");
+        assert_eq!(
+            box_queries::render_box_view_size(view.boxes(), target)
+                .unwrap()
+                .width,
+            expected,
+            "{css}"
+        );
     }
 }
 
@@ -410,13 +423,19 @@ fn cjk_intrinsic_min_content_uses_the_same_unicode_boundaries() {
             &mut document_resources,
         );
         let view = document.render_view(&document_resources);
-        let target = (0..view.boxes().len())
-            .find(|&index| view.boxes().id(index).map(|id| view.string(id)) == Some("target"))
+        let target = (0..box_queries::len(view.boxes()))
+            .map(layout_state::box_id_new)
+            .find(|&index| box_queries::attribute(view.boxes(), index, "id") == Some("target"))
             .unwrap();
         assert!(
-            (view.boxes().size(target).unwrap().width - 10.0).abs() < 0.01,
+            (box_queries::render_box_view_size(view.boxes(), target)
+                .unwrap()
+                .width
+                - 10.0)
+                .abs()
+                < 0.01,
             "{container}: {:?}",
-            view.boxes().size(target)
+            box_queries::render_box_view_size(view.boxes(), target)
         );
         // Inline-block carriers also publish a line containing the atomic
         // box; it has no source glyphs of its own.
@@ -472,10 +491,16 @@ fn cjk_native_clusters_are_respected_by_layout_and_intrinsic_sizing() {
             )
             .expect("layout requires the shaper-aware API for first-line styles");
         let view = document.render_view(&document_resources);
-        let target = (0..view.boxes().len())
-            .find(|&index| view.boxes().id(index).map(|id| view.string(id)) == Some("target"))
+        let target = (0..box_queries::len(view.boxes()))
+            .map(layout_state::box_id_new)
+            .find(|&index| box_queries::attribute(view.boxes(), index, "id") == Some("target"))
             .unwrap();
-        assert_eq!(view.boxes().size(target).unwrap().width, 20.0);
+        assert_eq!(
+            box_queries::render_box_view_size(view.boxes(), target)
+                .unwrap()
+                .width,
+            20.0
+        );
         assert_eq!(
             lines(&document, &document_resources)
                 .into_iter()
@@ -595,7 +620,7 @@ fn cjk_newline_context_stops_at_atomic_boxes_and_other_blocks() {
             .inline_content()
             .characters()
             .iter()
-            .filter_map(|&glyph| char::from_u32(glyph))
+            .copied()
             .collect();
         assert_eq!(text, format!("{content} 文"));
     }
@@ -627,7 +652,7 @@ fn cjk_newline_normalization_ignores_bidi_controls_and_retains_their_order() {
                 .inline_content()
                 .characters()
                 .iter()
-                .filter_map(|&glyph| char::from_u32(glyph))
+                .copied()
                 .collect();
             assert_eq!(text, expected, "{source:?}");
         }
@@ -671,11 +696,14 @@ fn cjk_min_content_keeps_punctuation_groups_and_max_content_remains_unwrapped() 
             &mut document_resources,
         );
         let view = document.render_view(&document_resources);
-        let target = (0..view.boxes().len())
-            .find(|&index| view.boxes().id(index).map(|id| view.string(id)) == Some("target"))
+        let target = (0..box_queries::len(view.boxes()))
+            .map(layout_state::box_id_new)
+            .find(|&index| box_queries::attribute(view.boxes(), index, "id") == Some("target"))
             .unwrap();
         assert_eq!(
-            view.boxes().size(target).unwrap().width,
+            box_queries::render_box_view_size(view.boxes(), target)
+                .unwrap()
+                .width,
             expected,
             "{css}, {text}"
         );
@@ -747,10 +775,16 @@ fn cjk_breaks_inside_tables_and_around_atomic_inline_and_floated_content() {
         &mut document_resources,
     );
     let view = document.render_view(&document_resources);
-    let target = (0..view.boxes().len())
-        .find(|&index| view.boxes().id(index).map(|id| view.string(id)) == Some("target"))
+    let target = (0..box_queries::len(view.boxes()))
+        .map(layout_state::box_id_new)
+        .find(|&index| box_queries::attribute(view.boxes(), index, "id") == Some("target"))
         .unwrap();
-    assert_eq!(view.boxes().size(target).unwrap().width, 10.0);
+    assert_eq!(
+        box_queries::render_box_view_size(view.boxes(), target)
+            .unwrap()
+            .width,
+        10.0
+    );
     assert_eq!(
         lines(&document, &document_resources),
         ["中", "文", "測", "試"]
@@ -791,6 +825,12 @@ fn cjk_bidi_wrapping_preserves_source_characters() {
         ["中文", "אבג", "測試"]
     );
     let text = document.render_view(&document_resources).text();
-    assert_eq!(text.character_direction(0), crate::TextDirection::Ltr);
-    assert_eq!(text.character_direction(2), crate::TextDirection::Rtl);
+    assert_eq!(
+        text_paint::character_direction(text, 0),
+        crate::TextDirection::Ltr
+    );
+    assert_eq!(
+        text_paint::character_direction(text, 2),
+        crate::TextDirection::Rtl
+    );
 }

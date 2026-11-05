@@ -1,0 +1,96 @@
+{
+  "recorded_on": "2026-11-01",
+  "scope": "Performance follow-up for native selector AST validation. No syntax acceptance or exclusion changes.",
+  "wpt_revision": "7ea3d665ff9ae1df1f742433d51bd1e9c6499a3b",
+  "before": {
+    "selected_assertions": 18469,
+    "passing": 16451,
+    "mismatches": 2018,
+    "unsupported_assertions": 13434,
+    "pass_percent": 89.07358276030105
+  },
+  "after": {
+    "selected_assertions": 18469,
+    "passing": 16451,
+    "mismatches": 2018,
+    "unsupported_assertions": 13434,
+    "pass_percent": 89.07358276030105
+  },
+  "comparison": {
+    "fixed_assertions": 0,
+    "new_mismatches": 0,
+    "identical_mismatch_keys": true,
+    "selection_changed": false
+  },
+  "implementation": [
+    "A preparation-local FxHashMap borrows native TokenList keys and stores validation booleans. It is allocated only if host-context is present.",
+    "Identical native argument lists reuse the result of the existing native Selector parser and compound-selector AST checks, including invalid results.",
+    "The table lasts for one RuleWalk and is discarded before returning the prepared rule set. It retains no additional CSS strings or parser trees. Recursive argument reparsing keeps its separate short-lived validation context.",
+    "Ordinary public syntax queries use the same validation logic with a fresh context; no persistent or cross-thread cache is introduced."
+  ],
+  "test_results": {
+    "existing_style_unit_tests_passed": 305,
+    "existing_declaration_validation_tests_passed": 32,
+    "cargo_check": "cargo check -p skrift-style --offline passed",
+    "scanned_files": 35417,
+    "literal_calls": 32021,
+    "dependency_parser_panics": 0,
+    "audit_exit": 101,
+    "audit_exit_reason": "Expected diagnostic assertion while 2018 mismatches remain."
+  },
+  "production_sources": [
+    {
+      "file": "crates/03-html-style/src/style/02-syntax/selectors.rs",
+      "before_sha256": "1f4def8ef93dd3e628c9219b31f1f2e71462f1b0f02ff603448be9fcd264fbc8",
+      "after_sha256": "83ea70c6968fee194f4d318b138d6f1f57b1664656d44914913877a2f2ee4f1f"
+    },
+    {
+      "file": "crates/03-html-style/src/style/03-rules/prepared.rs",
+      "before_sha256": "0318db02710ba2c30c9ccc060f843970b6502e49804a99df10f48c14cf1f71ff",
+      "after_sha256": "bfe3140ff292827a5adf694d5e79bba42e95f85323a8ba95fc395cffa7f18330"
+    }
+  ],
+  "benchmark_sources": [
+    {
+      "file": "crates/03-html-style/examples/shadow_filter_benchmark.rs",
+      "sha256": "8d1d2613582570c3068a36cf4662536d995845494f2820e8025a8d072f054130",
+      "unchanged_from_baseline": true
+    },
+    {
+      "file": "crates/03-html-style/examples/epub_css_benchmark.rs",
+      "sha256": "35f87009ca9ec031885938a32eef00015d87bbe0546d7fc1387ed72e683eafd6",
+      "unchanged_from_baseline": true
+    },
+    {
+      "file": "crates/03-html-style/examples/grid_benchmark.rs",
+      "sha256": "8a5e40b78dbfa8c66801bf363c01ec31a455c6f8c0402a785b7b183cbc3cb8fa",
+      "unchanged_from_baseline": true
+    },
+    {
+      "file": "crates/03-html-style/examples/normalization_benchmark.rs",
+      "sha256": "e26a9cc1208af9ec38637c84f8f44ff23b370b647b0639cdddad3e056a4fd2f1",
+      "unchanged_from_baseline": true
+    },
+    {
+      "file": "crates/03-html-style/examples/cascade_benchmark.rs",
+      "sha256": "b80e07cd03daee4f8af716b57002e401ad6bb7c1161e19c06eb8ae5d3aaf544c",
+      "unchanged_from_baseline": true
+    }
+  ],
+  "before_style_library_sha256": "39dea3587dbe21894f8effc934d55449ba6d8b6a1eb042fa8de188055f722a43",
+  "after_style_library_sha256": "776bca1020be50874c9b55dd8a167324a76637a644a7d885788886cbce423d83",
+  "native_dependency": "Unchanged Lightning CSS 1.0.0-alpha.72 / Parcel selectors 0.28.3, identical frozen native/support artifacts and rustc opt-level=2 debuginfo=0 builds.",
+  "performance": "selector-cache-performance.json",
+  "specification_review": "selector-followup-review.json",
+  "baseline_cache_directory": "/home/johan/.cache/html-wpt-selector-cache",
+  "compiler_temporary_directory": "/home/johan/.cache/html-wpt-selector-cache/compiler-tmp",
+  "source_integrity": {
+    "new_test_or_benchmark_code_added": false,
+    "existing_test_and_benchmark_sources_unchanged": true,
+    "lightningcss_changed": false,
+    "parallel_css_parser_added": false,
+    "renderer_or_gpui_changed": false,
+    "expectations_changed": false,
+    "syntax_registry_observations_and_statuses_unchanged": true
+  }
+}

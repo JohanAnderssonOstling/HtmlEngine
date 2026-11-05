@@ -1,80 +1,55 @@
-use html_pipeline::GlyphResourceStore;
+#[cfg(test)]
+use html_engine_model::layout_state;
+#[cfg(test)]
+use html_style_model::computed_style;
+#[cfg(test)]
+use html_engine_model::shaping_contracts;
+use html_pipeline::engine::geometry_queries;
+use document::document_painter_paint_region;
+use html_pipeline::engine::fragment_paint;
+use html_pipeline::engine::{box_queries, text_paint};
+mod document;
+pub use document::{
+    DocumentPainter, LinePlacement, PaintCandidates, PaintFragment, PaintProjection, ProjectedLine,
+    RegionProjection,
+};
+
+pub use html_pipeline::engine::CornerRadii;
 use html_pipeline::engine::{
-    GlyphHandle, GlyphShaper, LaidOutDocument, PreparedTextRunFragment, RenderPaintItem,
-    RenderView, TextRunId, UsedBorderRadii,
+    GlyphHandle, ImageId, LayoutConstraintError, LineId, PreparedTextRunFragment, RenderView,
+    TextRunId,
 };
-use html_pipeline::{
-    FontEnvironmentRevision, ImageMetricsRevision, LayoutConstraints, PaintSettingsRevision,
-    PipelineInputs, PipelineSession, ResourceRevision, SourceRevision, StyleEnvironment,
-    StylesheetRevision,
-};
-use html_resources::ResourceProvider;
+use html_resources::DecodedImages;
 use kurbo::{Point, Rect, Size};
 use peniko::{Color, Image};
-use std::fmt;
-use std::io;
 use std::ops::Range;
 use std::sync::Arc;
 
-/// One positioned slice of a renderer-owned shaped text run.
-///
-/// A line may contain several fragments because font, bidi, inline layout, or
-/// source ownership changes within it. Painters that can submit heterogeneous
-/// glyphs together should consume the complete line through
-/// [`Painter::draw_text_run_batch`] rather than treating every fragment as a
-/// separate scene submission.
-#[derive(Clone, Debug)]
-pub struct TextRunFragment {
-    run: TextRunId,
-    range: Range<u32>,
-    origin: Point,
-    color: Option<u32>,
-}
-
-impl TextRunFragment {
-    pub fn new(run: TextRunId, range: Range<u32>, origin: Point, color: Option<u32>) -> Self {
-        Self {
-            run,
-            range,
-            origin,
-            color,
-        }
-    }
-
-    pub fn run(&self) -> TextRunId {
-        self.run
-    }
-
-    pub fn range(&self) -> Range<u32> {
-        self.range.clone()
-    }
-
-    /// Baseline origin in document coordinates.
-    pub fn origin(&self) -> Point {
-        self.origin
-    }
-
-    pub fn color(&self) -> Option<u32> {
-        self.color
-    }
+fn pixel_snapper(scale: f64) -> impl Fn(f64) -> f64 {
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    move |value| (value * scale).round() / scale
 }
 
 pub trait Painter {
     /// Restricts subsequent paint operations until the matching `pop_clip`.
-    /// Legacy adapters keep their previous behavior until they opt in.
-    fn push_clip(&mut self, _rect: Rect) {}
-    fn pop_clip(&mut self) {}
+    /// Implementations must intersect nested clips and restore them on pop.
+    fn push_clip(&mut self, rect: Rect);
+    fn pop_clip(&mut self);
     fn fill_rect(&mut self, rect: Rect, color: Color);
     /// Optional rounded primitive. Existing adapters intentionally get a safe
     /// square fallback, so adding CSS radius support is not a breaking change.
-    fn fill_rounded_rect(&mut self, rect: Rect, _radii: UsedBorderRadii, color: Color) {
+    fn fill_rounded_rect(&mut self, rect: Rect, _radii: CornerRadii, color: Color) {
         self.fill_rect(rect, color);
     }
     /// Optional uniform solid rounded border primitive.
     fn stroke_rounded_rect(
         &mut self,
         rect: Rect,
-        _radii: UsedBorderRadii,
+        _radii: CornerRadii,
         width: f32,
         color: Color,
     ) {
@@ -82,49 +57,31 @@ pub trait Painter {
         if width == 0.0 {
             return;
         }
-        self.fill_rect(Rect::new(rect.x0, rect.y0, rect.x1, rect.y0 + width), color);
-        self.fill_rect(Rect::new(rect.x0, rect.y1 - width, rect.x1, rect.y1), color);
-        self.fill_rect(
+        for edge in [
+            Rect::new(rect.x0, rect.y0, rect.x1, rect.y0 + width),
+            Rect::new(rect.x0, rect.y1 - width, rect.x1, rect.y1),
             Rect::new(rect.x0, rect.y0 + width, rect.x0 + width, rect.y1 - width),
-            color,
-        );
-        self.fill_rect(
             Rect::new(rect.x1 - width, rect.y0 + width, rect.x1, rect.y1 - width),
-            color,
-        );
+        ] {
+            self.fill_rect(edge, color);
+        }
     }
-    /// Draw a native glyph with `origin` at its baseline.
-    fn draw_glyph(&mut self, glyph: GlyphHandle, origin: Point);
-    fn draw_glyph_with_color(&mut self, glyph: GlyphHandle, origin: Point, _color: u32) {
-        self.draw_glyph(glyph, origin);
-    }
+    /// Draw a native glyph at its baseline using the resolved RGBA foreground color.
+    fn draw_glyph(&mut self, glyph: GlyphHandle, origin: Point, color: u32);
+    /// True requires range-aware fragment drawing or a prepared-batch override.
     fn supports_text_runs(&self) -> bool {
         false
     }
-    /// Draw a native text run with `origin` at its baseline.
-    fn draw_text_run(&mut self, _run: TextRunId, _origin: Point, _color: Option<u32>) {}
+    /// Draw a native run slice at its baseline. The default prepared-batch
+    /// implementation uses this callback after translating line-relative offsets.
     fn draw_text_run_fragment(
         &mut self,
-        run: TextRunId,
+        _run: TextRunId,
         _range: Range<u32>,
-        origin: Point,
-        color: Option<u32>,
+        _origin: Point,
+        _color: Option<u32>,
     ) {
-        self.draw_text_run(run, origin, color);
-    }
-    /// Draws the positioned run fragments that make up one text line.
-    ///
-    /// The default preserves the fragment-at-a-time contract. GPU painters
-    /// can override this to retain one batch and perform one scene submission.
-    fn draw_text_run_batch(&mut self, fragments: &[TextRunFragment]) {
-        for fragment in fragments {
-            self.draw_text_run_fragment(
-                fragment.run(),
-                fragment.range(),
-                fragment.origin(),
-                fragment.color(),
-            );
-        }
+        panic!("native text painters must implement range-aware fragments or prepared batches");
     }
     /// Draws layout-prepared, line-relative shaped-run slices.
     ///
@@ -139,19 +96,14 @@ pub trait Painter {
         scale: f64,
         color: Option<u32>,
     ) {
-        let scale = if scale.is_finite() && scale > 0.0 {
-            scale
-        } else {
-            1.0
-        };
-        let snap = |value: f64| (value * scale).round() / scale;
+        let snap = pixel_snapper(scale);
         for fragment in fragments {
-            let offset = fragment.offset();
+            let offset = fragment.offset;
             self.draw_text_run_fragment(
-                fragment.run(),
-                fragment.range(),
+                fragment.run,
+                fragment.range.clone(),
                 Point::new(line_origin.x + offset.x, snap(line_origin.y + offset.y)),
-                color.or(fragment.color()),
+                color.or(fragment.color),
             );
         }
     }
@@ -169,7 +121,7 @@ pub trait Painter {
     ) {
         self.draw_svg(bytes, hash, intrinsic_size, rect);
     }
-    fn draw_resource_image(&mut self, _image_idx: u32, _uri: Option<&str>, _rect: Rect) {}
+    fn draw_resource_image(&mut self, _image_idx: ImageId, _uri: Option<&str>, _rect: Rect) {}
 }
 
 #[derive(Default)]
@@ -177,12 +129,13 @@ pub struct RecordingPainter {
     pub clips: Vec<Rect>,
     pub clip_pops: usize,
     pub glyphs: Vec<(GlyphHandle, Point)>,
+    pub glyph_colors: Vec<u32>,
     pub fills: Vec<(Rect, Color)>,
     pub images: Vec<Rect>,
     pub svgs: Vec<Rect>,
-    pub resource_images: Vec<(u32, Option<String>, Rect)>,
-    pub rounded_fills: Vec<(Rect, UsedBorderRadii, Color)>,
-    pub rounded_borders: Vec<(Rect, UsedBorderRadii, f32, Color)>,
+    pub resource_images: Vec<(ImageId, Option<String>, Rect)>,
+    pub rounded_fills: Vec<(Rect, CornerRadii, Color)>,
+    pub rounded_borders: Vec<(Rect, CornerRadii, f32, Color)>,
 }
 
 impl Painter for RecordingPainter {
@@ -198,22 +151,23 @@ impl Painter for RecordingPainter {
         self.fills.push((rect, color));
     }
 
-    fn fill_rounded_rect(&mut self, rect: Rect, radii: UsedBorderRadii, color: Color) {
+    fn fill_rounded_rect(&mut self, rect: Rect, radii: CornerRadii, color: Color) {
         self.rounded_fills.push((rect, radii, color));
     }
 
     fn stroke_rounded_rect(
         &mut self,
         rect: Rect,
-        radii: UsedBorderRadii,
+        radii: CornerRadii,
         width: f32,
         color: Color,
     ) {
         self.rounded_borders.push((rect, radii, width, color));
     }
 
-    fn draw_glyph(&mut self, glyph: GlyphHandle, origin: Point) {
+    fn draw_glyph(&mut self, glyph: GlyphHandle, origin: Point, color: u32) {
         self.glyphs.push((glyph, origin));
+        self.glyph_colors.push(color);
     }
 
     fn draw_image(&mut self, _image: &Image, _hash: &[u8], rect: Rect) {
@@ -224,14 +178,13 @@ impl Painter for RecordingPainter {
         self.svgs.push(rect);
     }
 
-    fn draw_resource_image(&mut self, image_idx: u32, uri: Option<&str>, rect: Rect) {
+    fn draw_resource_image(&mut self, image_idx: ImageId, uri: Option<&str>, rect: Rect) {
         self.resource_images
             .push((image_idx, uri.map(str::to_owned), rect));
     }
 }
 
-#[derive(Clone)]
-pub enum RenderCommand {
+enum RenderCommand {
     PushClip {
         rect: Rect,
     },
@@ -242,19 +195,19 @@ pub enum RenderCommand {
     },
     RoundedFill {
         rect: Rect,
-        radii: UsedBorderRadii,
+        radii: CornerRadii,
         color: Color,
     },
     RoundedBorder {
         rect: Rect,
-        radii: UsedBorderRadii,
+        radii: CornerRadii,
         width: f32,
         color: Color,
     },
     Glyph {
         glyph: GlyphHandle,
         origin: Point,
-        color: Option<u32>,
+        color: u32,
     },
     Image {
         image: Image,
@@ -266,9 +219,10 @@ pub enum RenderCommand {
         hash: Vec<u8>,
         intrinsic_size: (u32, u32),
         rect: Rect,
+        text_color: Option<u32>,
     },
     ResourceImage {
-        image_idx: u32,
+        image_idx: ImageId,
         uri: Option<String>,
         rect: Rect,
     },
@@ -280,6 +234,7 @@ pub struct RenderScene {
     content_height: f64,
     clipped: bool,
     commands: Arc<[RenderCommand]>,
+    resources: Option<html_pipeline::engine::RenderResourceLease>,
 }
 
 impl RenderScene {
@@ -291,19 +246,11 @@ impl RenderScene {
         self.content_height
     }
 
-    pub fn is_clipped(&self) -> bool {
-        self.clipped
-    }
-
-    pub fn clip_rect(&self) -> Rect {
-        Rect::from_origin_size(Point::ORIGIN, self.size)
-    }
-
-    pub fn commands(&self) -> &[RenderCommand] {
-        &self.commands
-    }
-
-    pub fn paint(&self, painter: &mut impl Painter) {
+    /// Returns false without submitting commands after resource invalidation.
+    pub fn paint(&self, painter: &mut impl Painter) -> bool {
+        if !render_scene_is_valid(&self) {
+            return false;
+        }
         for command in self.commands.iter() {
             match command {
                 RenderCommand::PushClip { rect } => painter.push_clip(*rect),
@@ -321,13 +268,8 @@ impl RenderScene {
                 RenderCommand::Glyph {
                     glyph,
                     origin,
-                    color: Some(color),
-                } => painter.draw_glyph_with_color(*glyph, *origin, *color),
-                RenderCommand::Glyph {
-                    glyph,
-                    origin,
-                    color: None,
-                } => painter.draw_glyph(*glyph, *origin),
+                    color,
+                } => painter.draw_glyph(*glyph, *origin, *color),
                 RenderCommand::Image { image, hash, rect } => {
                     painter.draw_image(image, hash, *rect)
                 }
@@ -336,7 +278,13 @@ impl RenderScene {
                     hash,
                     intrinsic_size,
                     rect,
-                } => painter.draw_svg(bytes, hash, *intrinsic_size, *rect),
+                    text_color,
+                } => match text_color {
+                    Some(color) => {
+                        painter.draw_math_svg(bytes, hash, *intrinsic_size, *rect, *color)
+                    }
+                    None => painter.draw_svg(bytes, hash, *intrinsic_size, *rect),
+                },
                 RenderCommand::ResourceImage {
                     image_idx,
                     uri,
@@ -344,117 +292,51 @@ impl RenderScene {
                 } => painter.draw_resource_image(*image_idx, uri.as_deref(), *rect),
             }
         }
+        true
     }
 }
 
+/// How a recorded scene represents replaced images.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum FragmentImagePolicy {
+pub enum SceneImagePolicy {
     Omit,
     Placeholder(u32),
     Reference,
 }
 
-impl Default for FragmentImagePolicy {
+impl Default for SceneImagePolicy {
     fn default() -> Self {
         Self::Placeholder(0xe6e6e6ff)
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct FragmentRenderOptions {
+/// The region and image representation of a recorded scene.
+#[derive(Clone, Copy, Debug)]
+pub struct SceneOptions {
     viewport_width: f64,
     maximum_height: Option<f64>,
-    line_height: f64,
-    root_font_size: u32,
-    base_uri: String,
-    user_styles: Vec<String>,
-    image_policy: FragmentImagePolicy,
+    image_policy: SceneImagePolicy,
 }
 
-impl FragmentRenderOptions {
+impl SceneOptions {
     pub fn new(
         viewport_width: f64,
         maximum_height: Option<f64>,
-    ) -> Result<Self, FragmentRenderError> {
+    ) -> Result<Self, LayoutConstraintError> {
         if !viewport_width.is_finite() || viewport_width <= 0.0 {
-            return Err(FragmentRenderError::new(
-                "fragment viewport width must be finite and positive",
-            ));
+            return Err(LayoutConstraintError::InvalidViewportWidth);
         }
         if maximum_height.is_some_and(|height| !height.is_finite() || height <= 0.0) {
-            return Err(FragmentRenderError::new(
-                "fragment maximum height must be finite and positive",
-            ));
+            return Err(LayoutConstraintError::InvalidViewportHeight);
         }
         Ok(Self {
             viewport_width,
             maximum_height,
-            line_height: 16.0,
-            root_font_size: 16,
-            base_uri: "fragment.xhtml".to_owned(),
-            user_styles: Vec::new(),
-            image_policy: FragmentImagePolicy::default(),
+            image_policy: SceneImagePolicy::default(),
         })
     }
 
-    pub fn with_typography(
-        mut self,
-        root_font_size: u32,
-        line_height: f64,
-    ) -> Result<Self, FragmentRenderError> {
-        if root_font_size == 0 || !line_height.is_finite() || line_height <= 0.0 {
-            return Err(FragmentRenderError::new(
-                "fragment typography must use a positive font size and line height",
-            ));
-        }
-        self.root_font_size = root_font_size;
-        self.line_height = line_height;
-        Ok(self)
-    }
-
-    pub fn with_viewport_width(mut self, viewport_width: f64) -> Result<Self, FragmentRenderError> {
-        if !viewport_width.is_finite() || viewport_width <= 0.0 {
-            return Err(FragmentRenderError::new(
-                "fragment viewport width must be finite and positive",
-            ));
-        }
-        self.viewport_width = viewport_width;
-        Ok(self)
-    }
-
-    pub fn with_maximum_height(
-        mut self,
-        maximum_height: Option<f64>,
-    ) -> Result<Self, FragmentRenderError> {
-        if maximum_height.is_some_and(|height| !height.is_finite() || height <= 0.0) {
-            return Err(FragmentRenderError::new(
-                "fragment maximum height must be finite and positive",
-            ));
-        }
-        self.maximum_height = maximum_height;
-        Ok(self)
-    }
-
-    pub fn with_base_uri(
-        mut self,
-        base_uri: impl Into<String>,
-    ) -> Result<Self, FragmentRenderError> {
-        let base_uri = base_uri.into();
-        if base_uri.trim().is_empty() || base_uri.chars().any(char::is_control) {
-            return Err(FragmentRenderError::new(
-                "fragment base URI must be non-empty and contain no control characters",
-            ));
-        }
-        self.base_uri = base_uri;
-        Ok(self)
-    }
-
-    pub fn with_user_styles(mut self, user_styles: Vec<String>) -> Self {
-        self.user_styles = user_styles;
-        self
-    }
-
-    pub fn with_image_policy(mut self, image_policy: FragmentImagePolicy) -> Self {
+    pub fn with_image_policy(mut self, image_policy: SceneImagePolicy) -> Self {
         self.image_policy = image_policy;
         self
     }
@@ -467,197 +349,21 @@ impl FragmentRenderOptions {
         self.maximum_height
     }
 
-    pub fn line_height(&self) -> f64 {
-        self.line_height
-    }
-
-    pub fn root_font_size(&self) -> u32 {
-        self.root_font_size
-    }
-
-    pub fn base_uri(&self) -> &str {
-        &self.base_uri
-    }
-
-    pub fn user_styles(&self) -> &[String] {
-        &self.user_styles
-    }
-
-    pub fn image_policy(&self) -> FragmentImagePolicy {
+    pub fn image_policy(&self) -> SceneImagePolicy {
         self.image_policy
     }
 }
 
-pub struct RenderedFragment<'a> {
-    document: &'a LaidOutDocument<'a>,
-    resources: &'a GlyphResourceStore,
-    scene: RenderScene,
-}
-
-impl<'a> RenderedFragment<'a> {
-    pub fn render_view(&self) -> RenderView<'_> {
-        self.document.render_view(self.resources)
-    }
-    pub fn glyph_resources(&self) -> &GlyphResourceStore {
-        self.resources
-    }
-    pub fn into_scene(self) -> RenderScene {
-        self.scene
-    }
-
-    pub fn document(&self) -> &LaidOutDocument<'a> {
-        self.document
-    }
-
-    pub fn scene(&self) -> &RenderScene {
-        &self.scene
-    }
-
-    /// Split the scene from its borrowed document and glyph metrics.
-    pub fn into_parts(self) -> (RenderView<'a>, RenderScene) {
-        (self.document.render_view(self.resources), self.scene)
-    }
-}
-
-pub struct FragmentRenderer {
-    session: PipelineSession,
-    resource_revision: ResourceRevision,
-    stylesheet_revision: StylesheetRevision,
-    font_revision: FontEnvironmentRevision,
-    image_metrics_revision: ImageMetricsRevision,
-}
-
-impl Default for FragmentRenderer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl FragmentRenderer {
-    pub fn glyph_resources_mut(&mut self) -> &mut GlyphResourceStore {
-        self.session.glyph_resources_mut()
-    }
-
-    pub fn glyph_resources(&self) -> &GlyphResourceStore {
-        self.session.glyph_resources()
-    }
-    pub fn render_view(&self) -> Option<RenderView<'_>> {
-        self.session.render_view()
-    }
-
-    pub fn new() -> Self {
-        Self::with_provider(Arc::new(DenyResourceProvider))
-    }
-
-    pub fn with_provider(provider: Arc<dyn ResourceProvider>) -> Self {
-        Self {
-            session: PipelineSession::new(provider),
-            resource_revision: ResourceRevision::INITIAL,
-            stylesheet_revision: StylesheetRevision::INITIAL,
-            font_revision: FontEnvironmentRevision::INITIAL,
-            image_metrics_revision: ImageMetricsRevision::INITIAL,
-        }
-    }
-
-    pub fn invalidate_resources(&mut self) {
-        self.resource_revision = self.resource_revision.next();
-        self.stylesheet_revision = self.stylesheet_revision.next();
-        self.image_metrics_revision = self.image_metrics_revision.next();
-    }
-
-    pub fn invalidate_fonts(&mut self) {
-        self.font_revision = self.font_revision.next();
-    }
-
-    /// The last laid-out fragment, retained by the rendering session.
-    pub fn document(&self) -> Option<&LaidOutDocument<'static>> {
-        self.session.document()
-    }
-
-    pub fn render(
-        &mut self,
-        source: &str,
-        options: &FragmentRenderOptions,
-        glyph_shaper: &mut impl GlyphShaper,
-    ) -> Result<RenderedFragment<'_>, FragmentRenderError> {
-        let inputs = PipelineInputs {
-            source: source.into(),
-            markup_syntax: html_pipeline::MarkupSyntax::Html,
-            user_styles: options.user_styles.clone(),
-            reader_overrides: Default::default(),
-            note_flow: Default::default(),
-            source_revision: SourceRevision::INITIAL,
-            base_uri: options.base_uri.clone(),
-            resource_revision: self.resource_revision,
-            stylesheet_revision: self.stylesheet_revision,
-            style_environment: StyleEnvironment {
-                root_font_size: options.root_font_size,
-                media: html_pipeline::MediaEnvironment::screen(
-                    options.viewport_width,
-                    options.maximum_height,
-                )
-                .expect("validated fragment dimensions must form a media environment"),
-                direction: 0,
-            },
-            font_environment: self.font_revision,
-            image_metrics_revision: self.image_metrics_revision,
-            layout: LayoutConstraints {
-                viewport_width: options.viewport_width,
-                viewport_height: options.maximum_height,
-                line_height: options.line_height,
-                image_sizing_policy: html_pipeline::ImageSizingPolicy::WebCompatible,
-                text_composition_policy: html_pipeline::TextCompositionPolicy::WebCompatible,
-            },
-            image_metrics: Default::default(),
-            paint: PaintSettingsRevision::INITIAL,
-        };
-        self.session
-            .attach(glyph_shaper)
-            .update(inputs)
-            .map_err(|error| FragmentRenderError::new(error.to_string()))?;
-
-        let document = self.session.document().ok_or_else(|| {
-            FragmentRenderError::new("fragment pipeline produced no laid-out document")
-        })?;
-        let resources = self.session.glyph_resources();
-        let scene = build_fragment_scene(document, options, resources);
-        Ok(RenderedFragment {
-            document,
-            resources,
-            scene,
-        })
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FragmentRenderError(String);
-
-impl FragmentRenderError {
-    fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
-    }
-}
-
-impl fmt::Display for FragmentRenderError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for FragmentRenderError {}
-
-pub fn paint_line_glyphs<'a>(
+pub(crate) fn paint_line_glyphs<'a>(
     document: impl Into<RenderView<'a>>,
-    line_idx: usize,
+    line_idx: LineId,
     origin: Point,
     scale: f64,
     color: Option<u32>,
     painter: &mut impl Painter,
 ) {
     let view = document.into();
-    for fragment in view
-        .text()
-        .line_text_fragments(line_idx)
+    for fragment in text_paint::render_text_view_line_text_fragments(view.text(), line_idx)
         .into_iter()
         .flatten()
     {
@@ -668,9 +374,9 @@ pub fn paint_line_glyphs<'a>(
 
 /// Paints one sparse text fragment from a line that requires source-ordered
 /// interleaving with inline decorations or replaced content.
-pub fn paint_line_glyph_fragment<'a>(
+pub(crate) fn paint_line_glyph_fragment<'a>(
     document: impl Into<RenderView<'a>>,
-    line_idx: usize,
+    line_idx: LineId,
     fragment: &html_pipeline::engine::RenderLineTextFragment,
     origin: Point,
     scale: f64,
@@ -678,24 +384,21 @@ pub fn paint_line_glyph_fragment<'a>(
     painter: &mut impl Painter,
 ) {
     let document = document.into();
-    if !fragment.visible() {
+    if !text_paint::paint_resources_valid(document) || !fragment.visible() {
         return;
     }
     let text = document.text();
     let Some(line) = text.line(line_idx) else {
         return;
     };
-    let scale = if scale.is_finite() && scale > 0.0 {
-        scale
-    } else {
-        1.0
-    };
-    let snap = |value: f64| (value * scale).round() / scale;
-    let baseline_y = origin.y + line.baseline();
-    let Some(mut placement) = text.line_placement(line_idx) else {
+    let snap = pixel_snapper(scale);
+    let baseline_y = origin.y + text_paint::line_baseline(&line);
+    let Some(mut placement) = text_paint::line_placement(text, line_idx) else {
         return;
     };
-    let mut current_x = origin.x + line.optical_offset_x() + fragment.offset_x();
+    let mut current_x = origin.x
+        + text_paint::line_optical_offset_x(&line)
+        + text_paint::fragment_offset_x(&fragment);
     for index in fragment.glyphs() {
         let Some(character) = placement.at(index) else {
             continue;
@@ -705,12 +408,12 @@ pub fn paint_line_glyph_fragment<'a>(
         let draw_point = Point::new(current_x, snap(baseline_y - character.offset_y));
         if let Some(glyph) = character
             .paint_glyph
-            .and_then(|glyph| text.paint_handle(glyph))
+            .and_then(|glyph| text_paint::paint_handle(text, glyph))
         {
-            match color.or_else(|| text.paint_color_at(index)) {
-                Some(color) => painter.draw_glyph_with_color(glyph, draw_point, color),
-                None => painter.draw_glyph(glyph, draw_point),
-            }
+            let color = color
+                .or_else(|| text_paint::paint_color_at(text, index))
+                .expect("painted text has a resolved foreground color");
+            painter.draw_glyph(glyph, draw_point, color);
         }
         current_x += character.advance;
     }
@@ -719,20 +422,21 @@ pub fn paint_line_glyph_fragment<'a>(
 /// Paints a line from document-owned native shaping resources. Layout
 /// placement adjustments are represented as positioned slices of those runs;
 /// they never require abandoning retained shaping. Returns false only when the
-/// painter has no native-run support or shaping coverage is incomplete.
-pub fn paint_line_text_runs<'a>(
+/// resources are invalid, the painter has no native-run support, or shaping
+/// coverage is incomplete.
+pub(crate) fn paint_line_text_runs<'a>(
     document: impl Into<RenderView<'a>>,
-    line_idx: usize,
+    line_idx: LineId,
     origin: Point,
     scale: f64,
     color: Option<u32>,
     painter: &mut impl Painter,
 ) -> bool {
     let document = document.into();
-    if !painter.supports_text_runs() {
+    if !text_paint::paint_resources_valid(document) || !painter.supports_text_runs() {
         return false;
     }
-    let Some(fragments) = document.text().prepared_text_runs(line_idx) else {
+    let Some(fragments) = text_paint::prepared_text_runs(document.text(), line_idx) else {
         return false;
     };
     painter.draw_prepared_text_run_batch(fragments, origin, scale, color);
@@ -743,236 +447,97 @@ pub fn paint_line_text_runs<'a>(
 /// Paints the synthetic overflow marker separately from selectable source
 /// text. Native text-run painters can use this without falling back to drawing
 /// the source line character by character.
-pub fn paint_line_ellipsis<'a>(
+pub(crate) fn paint_line_ellipsis<'a>(
     document: impl Into<RenderView<'a>>,
-    line_idx: usize,
+    line_idx: LineId,
     origin: Point,
     scale: f64,
     color: Option<u32>,
     painter: &mut impl Painter,
 ) {
-    let text = document.into().text();
+    let document = document.into();
+    if !text_paint::paint_resources_valid(document) {
+        return;
+    }
+    let text = document.text();
     let Some(line) = text.line(line_idx) else {
         return;
     };
-    let scale = if scale.is_finite() && scale > 0.0 {
-        scale
-    } else {
-        1.0
+    let snap = pixel_snapper(scale);
+    let baseline_y = origin.y + text_paint::line_baseline(&line);
+    let mut paint = |glyph, offset: Point, source: Option<u32>| {
+        if let Some(glyph) = text_paint::paint_handle(text, glyph) {
+            let point = Point::new(
+                // Synthetic text uses the same fractional inline origin as
+                // ordinary glyphs and shaped runs. Snapping its x coordinate
+                // changes the raster phase at discretionary hyphens.
+                origin.x + text_paint::line_optical_offset_x(&line) + offset.x,
+                snap(baseline_y - offset.y),
+            );
+            let color = color
+                .or_else(|| source.and_then(|index| text_paint::paint_color_at(text, index)))
+                .unwrap_or_else(|| {
+                    box_queries::text_format(document.boxes(), text_paint::render_line_owner_box(&line)).color
+                });
+            painter.draw_glyph(glyph, point, color);
+        }
     };
-    let snap = |value: f64| (value * scale).round() / scale;
-    let baseline_y = origin.y + line.baseline();
-    if let Some(ellipsis) = text.ellipsis_for_line(line_idx)
+    if let Some(ellipsis) = text_paint::ellipsis_for_line(text, line_idx)
         && ellipsis.visible()
-        && let Some(glyph) = text.paint_handle(ellipsis.glyph())
     {
-        let offset = ellipsis.offset();
-        let point = Point::new(
-            snap(origin.x + line.optical_offset_x() + offset.x),
-            snap(baseline_y - offset.y),
-        );
-        match color.or_else(|| text.paint_color_at(line.start())) {
-            Some(color) => painter.draw_glyph_with_color(glyph, point, color),
-            None => painter.draw_glyph(glyph, point),
-        }
+        paint(ellipsis.glyph(), ellipsis.offset(), None);
     }
-    if let Some(hyphen) = text.hyphen_for_line(line_idx)
+    if let Some(hyphen) = text_paint::hyphen_for_line(text, line_idx)
         && hyphen.visible()
-        && let Some(glyph) = text.paint_handle(hyphen.glyph())
     {
-        let offset = hyphen.offset();
-        let point = Point::new(
-            snap(origin.x + line.optical_offset_x() + offset.x),
-            snap(baseline_y - offset.y),
+        paint(
+            hyphen.glyph(),
+            hyphen.offset(),
+            Some(line.end().saturating_sub(1)),
         );
-        match color.or_else(|| text.paint_color_at(line.end().saturating_sub(1))) {
-            Some(color) => painter.draw_glyph_with_color(glyph, point, color),
-            None => painter.draw_glyph(glyph, point),
-        }
     }
 }
 
-impl RenderScene {
-    /// Builds a scene for a document that is already laid out, for callers that
-    /// produced one themselves rather than rendering a fragment from source.
-    ///
-    /// A reader laying out a note keeps the containing document's computed
-    /// styles, so it cannot go through [`FragmentRenderer::render`], which
-    /// re-renders from source in a session of its own. It still wants this:
-    /// natural height over lines, decorations and images, content in paint
-    /// order, and clipping to the height the caller can show.
-    pub fn for_document(
-        document: &LaidOutDocument,
-        options: &FragmentRenderOptions,
-        resources: &GlyphResourceStore,
-    ) -> Self {
-        build_fragment_scene(document, options, resources)
-    }
-
-    pub fn for_view(view: RenderView<'_>, options: &FragmentRenderOptions) -> Self {
-        build_fragment_view(view, options)
-    }
-}
-
-fn build_fragment_scene(
-    document: &LaidOutDocument,
-    options: &FragmentRenderOptions,
-    resources: &GlyphResourceStore,
+fn build_fragment_view(
+    view: RenderView<'_>,
+    options: &SceneOptions,
+    images: Option<DecodedImages<'_>>,
 ) -> RenderScene {
-    build_fragment_view(document.render_view(resources), options)
-}
-
-fn build_fragment_view(view: RenderView<'_>, options: &FragmentRenderOptions) -> RenderScene {
     let text = view.text();
     let fragments = view.fragments();
-    let mut natural_height = text
+    let natural_height = text
         .lines()
         .iter()
-        .map(|line| line.point().y + line.height())
+        .filter_map(|line| {
+            geometry_queries::render_geometry_view_line_vertical_bounds(
+                geometry_queries::render_view_geometry(view),
+                line.id(),
+            )
+        })
+        .map(|bounds| bounds.end)
         .fold(0.0_f64, f64::max);
-    natural_height = fragments
-        .decorations()
+    let natural_height = fragment_paint::decorations(fragments)
         .iter()
         .map(|decoration| decoration.rect().y1)
         .fold(natural_height, f64::max);
-    for (line_idx, line) in text.lines().iter().enumerate() {
-        natural_height = fragments
-            .images_for_line(line_idx)
-            .iter()
-            .map(|image| line.point().y + image.clip().y1)
-            .fold(natural_height, f64::max);
-    }
     let height = options
         .maximum_height
         .map(|maximum| natural_height.min(maximum))
         .unwrap_or(natural_height);
     let clip = Rect::new(0.0, 0.0, options.viewport_width, height);
     let mut recorder = SceneRecorder::default();
-    for item in fragments.paint_order() {
-        match item {
-            RenderPaintItem::Decoration(decoration) => {
-                paint_scene_decoration(&decoration, clip, &mut recorder)
-            }
-            RenderPaintItem::Line(line_idx) => {
-                paint_fragment_line(view, line_idx, options, clip, &mut recorder)
-            }
-        }
+    let mut painter = DocumentPainter::new(view);
+    if let Some(images) = images {
+        painter = painter.with_images(images);
     }
+    painter.image_policy = options.image_policy;
+    document_painter_paint_region(&painter, clip, Point::ORIGIN, &mut recorder);
     RenderScene {
         size: Size::new(options.viewport_width, height),
         content_height: natural_height,
         clipped: height < natural_height,
         commands: recorder.commands.into(),
-    }
-}
-
-fn paint_fragment_line(
-    view: RenderView<'_>,
-    line_idx: usize,
-    options: &FragmentRenderOptions,
-    clip: Rect,
-    recorder: &mut SceneRecorder,
-) {
-    let text = view.text();
-    let fragments = view.fragments();
-    let height = clip.y1;
-    let Some(line) = text.line(line_idx) else {
-        return;
-    };
-    if line.point().y >= height {
-        return;
-    }
-    let overflow_clip = text.line_overflow_clip(line_idx).map(|overflow| {
-        let value = overflow.rect();
-        Rect::new(
-            if overflow.clips_x() {
-                value.x0
-            } else {
-                clip.x0
-            },
-            if overflow.clips_y() {
-                value.y0
-            } else {
-                clip.y0
-            },
-            if overflow.clips_x() {
-                value.x1
-            } else {
-                clip.x1
-            },
-            if overflow.clips_y() {
-                value.y1
-            } else {
-                clip.y1
-            },
-        )
-        .intersect(clip)
-    });
-    if let Some(overflow_clip) = overflow_clip {
-        recorder.push_clip(overflow_clip);
-    }
-    for image in fragments.images_for_line(line_idx).iter() {
-        let rect = Rect::from_origin_size(line.point() + image.offset().to_vec2(), image.size());
-        let image_clip = (image.clip() + line.point().to_vec2()).intersect(clip);
-        if rect.intersect(image_clip).is_zero_area() {
-            continue;
-        }
-        match options.image_policy {
-            FragmentImagePolicy::Omit => {}
-            FragmentImagePolicy::Placeholder(color) => {
-                recorder.fill_rect(rect.intersect(image_clip), color_from_u32(color))
-            }
-            FragmentImagePolicy::Reference if rect.intersect(image_clip) == rect => recorder
-                .draw_resource_image(image.image_idx(), view.image_uri(image.image_idx()), rect),
-            FragmentImagePolicy::Reference => {
-                recorder.push_clip(image_clip);
-                recorder.draw_resource_image(
-                    image.image_idx(),
-                    view.image_uri(image.image_idx()),
-                    rect,
-                );
-                recorder.pop_clip();
-            }
-        }
-    }
-    paint_line_glyphs(view, line_idx, line.point(), 1.0, None, recorder);
-    if overflow_clip.is_some() {
-        recorder.pop_clip();
-    }
-}
-
-fn paint_scene_decoration(
-    decoration: &html_pipeline::engine::RenderDecoration,
-    clip: Rect,
-    recorder: &mut SceneRecorder,
-) {
-    let mut rect = decoration.rect().intersect(clip);
-    if let Some(overflow) = decoration.overflow_clip() {
-        let overflow_rect = overflow.rect();
-        let x0 = if overflow.clips_x() {
-            rect.x0.max(overflow_rect.x0)
-        } else {
-            rect.x0
-        };
-        let x1 = if overflow.clips_x() {
-            rect.x1.min(overflow_rect.x1)
-        } else {
-            rect.x1
-        };
-        let y0 = if overflow.clips_y() {
-            rect.y0.max(overflow_rect.y0)
-        } else {
-            rect.y0
-        };
-        let y1 = if overflow.clips_y() {
-            rect.y1.min(overflow_rect.y1)
-        } else {
-            rect.y1
-        };
-        rect = Rect::new(x0, y0, x1, y1);
-    }
-    if rect.width() > 0.0 && rect.height() > 0.0 {
-        paint_resolved_decoration(recorder, decoration, rect);
+        resources: text_paint::retain_paint_resources(view),
     }
 }
 
@@ -985,71 +550,75 @@ fn color_from_u32(color: u32) -> Color {
     )
 }
 
-/// Converts one backend-neutral layout fragment into painter operations.
-/// Pagination may provide a clipped/split rectangle, but CSS color, rounded
-/// fill, and border execution have one shared owner here.
-pub fn paint_resolved_decoration(
-    painter: &mut impl Painter,
-    decoration: &html_pipeline::engine::RenderDecoration,
-    rect: Rect,
-) {
-    paint_projected_decoration(painter, decoration, rect, decoration.radii());
-}
-
 /// Paint a semantic decoration after an outer projection (pagination,
 /// columns, or clipping) has adjusted its rectangle and exposed corners.
-pub fn paint_projected_decoration(
+/// CSS color, rounded fill, and border execution have one shared owner here.
+pub(crate) fn paint_projected_decoration(
     painter: &mut impl Painter,
     decoration: &html_pipeline::engine::RenderDecoration,
     rect: Rect,
-    radii: Option<UsedBorderRadii>,
+    radii: Option<CornerRadii>,
 ) {
     use html_pipeline::engine::RenderDecorationPattern;
 
-    let color = color_from_u32(decoration.color());
-    match decoration.pattern() {
-        RenderDecorationPattern::Solid => paint_decoration_style(
-            painter,
-            rect,
-            decoration.color(),
-            radii,
-            decoration.border_width(),
-        ),
+    let color = color_from_u32(fragment_paint::decoration_color(&decoration));
+    let (vertical, dash_units, gap_units) = match fragment_paint::decoration_pattern(&decoration) {
+        RenderDecorationPattern::Solid => {
+            paint_decoration_style(
+                painter,
+                rect,
+                fragment_paint::decoration_color(&decoration),
+                radii,
+                decoration.border_width(),
+            );
+            return;
+        }
         RenderDecorationPattern::DoubleHorizontal => {
             let thickness = rect.height() / 3.0;
             if thickness > 0.0 {
-                painter.fill_rect(
+                for stripe in [
                     Rect::new(rect.x0, rect.y0, rect.x1, rect.y0 + thickness),
-                    color,
-                );
-                painter.fill_rect(
                     Rect::new(rect.x0, rect.y1 - thickness, rect.x1, rect.y1),
-                    color,
-                );
+                ] {
+                    painter.fill_rect(stripe, color);
+                }
             }
+            return;
         }
-        RenderDecorationPattern::DottedHorizontal => {
-            paint_horizontal_pattern(painter, rect, color, 1.0, 1.0)
-        }
-        RenderDecorationPattern::DashedHorizontal => {
-            paint_horizontal_pattern(painter, rect, color, 3.0, 2.0)
-        }
-        RenderDecorationPattern::DottedVertical => {
-            paint_vertical_pattern(painter, rect, color, 1.0, 1.0)
-        }
-        RenderDecorationPattern::DashedVertical => {
-            paint_vertical_pattern(painter, rect, color, 3.0, 2.0)
-        }
+        RenderDecorationPattern::DottedHorizontal => (false, 1.0, 1.0),
+        RenderDecorationPattern::DashedHorizontal => (false, 3.0, 2.0),
+        RenderDecorationPattern::DottedVertical => (true, 1.0, 1.0),
+        RenderDecorationPattern::DashedVertical => (true, 3.0, 2.0),
+    };
+    let (thickness, extent, mut position, limit) = if vertical {
+        (rect.width(), rect.height(), rect.y0, rect.y1)
+    } else {
+        (rect.height(), rect.width(), rect.x0, rect.x1)
+    };
+    if thickness <= 0.0 || extent <= 0.0 {
+        return;
+    }
+    let dash = thickness * dash_units;
+    let gap = thickness * gap_units;
+    while position < limit {
+        let end = (position + dash).min(limit);
+        let segment = if vertical {
+            Rect::new(rect.x0, position, rect.x1, end)
+        } else {
+            Rect::new(position, rect.y0, end, rect.y1)
+        };
+        painter.fill_rect(segment, color);
+        position = end + gap;
     }
 }
 
 /// Paints a resolved decoration after an outer projection (for example,
 /// pagination) has adjusted which physical corners remain exposed.
-pub fn paint_decoration_style(
+pub(crate) fn paint_decoration_style(
     painter: &mut impl Painter,
     rect: Rect,
     color: u32,
-    radii: Option<UsedBorderRadii>,
+    radii: Option<CornerRadii>,
     border_width: Option<f32>,
 ) {
     let color = color_from_u32(color);
@@ -1057,48 +626,6 @@ pub fn paint_decoration_style(
         (Some(radii), Some(width)) => painter.stroke_rounded_rect(rect, radii, width, color),
         (Some(radii), None) => painter.fill_rounded_rect(rect, radii, color),
         (None, _) => painter.fill_rect(rect, color),
-    }
-}
-
-fn paint_horizontal_pattern(
-    painter: &mut impl Painter,
-    rect: Rect,
-    color: Color,
-    dash_units: f64,
-    gap_units: f64,
-) {
-    let thickness = rect.height();
-    if thickness <= 0.0 || rect.width() <= 0.0 {
-        return;
-    }
-    let dash = thickness * dash_units;
-    let gap = thickness * gap_units;
-    let mut x = rect.x0;
-    while x < rect.x1 {
-        let end = (x + dash).min(rect.x1);
-        painter.fill_rect(Rect::new(x, rect.y0, end, rect.y1), color);
-        x = end + gap;
-    }
-}
-
-fn paint_vertical_pattern(
-    painter: &mut impl Painter,
-    rect: Rect,
-    color: Color,
-    dash_units: f64,
-    gap_units: f64,
-) {
-    let thickness = rect.width();
-    if thickness <= 0.0 || rect.height() <= 0.0 {
-        return;
-    }
-    let dash = thickness * dash_units;
-    let gap = thickness * gap_units;
-    let mut y = rect.y0;
-    while y < rect.y1 {
-        let end = (y + dash).min(rect.y1);
-        painter.fill_rect(Rect::new(rect.x0, y, rect.x1, end), color);
-        y = end + gap;
     }
 }
 
@@ -1120,7 +647,7 @@ impl Painter for SceneRecorder {
         self.commands.push(RenderCommand::Fill { rect, color });
     }
 
-    fn fill_rounded_rect(&mut self, rect: Rect, radii: UsedBorderRadii, color: Color) {
+    fn fill_rounded_rect(&mut self, rect: Rect, radii: CornerRadii, color: Color) {
         self.commands
             .push(RenderCommand::RoundedFill { rect, radii, color });
     }
@@ -1128,7 +655,7 @@ impl Painter for SceneRecorder {
     fn stroke_rounded_rect(
         &mut self,
         rect: Rect,
-        radii: UsedBorderRadii,
+        radii: CornerRadii,
         width: f32,
         color: Color,
     ) {
@@ -1140,19 +667,11 @@ impl Painter for SceneRecorder {
         });
     }
 
-    fn draw_glyph(&mut self, glyph: GlyphHandle, origin: Point) {
+    fn draw_glyph(&mut self, glyph: GlyphHandle, origin: Point, color: u32) {
         self.commands.push(RenderCommand::Glyph {
             glyph,
             origin,
-            color: None,
-        });
-    }
-
-    fn draw_glyph_with_color(&mut self, glyph: GlyphHandle, origin: Point, color: u32) {
-        self.commands.push(RenderCommand::Glyph {
-            glyph,
-            origin,
-            color: Some(color),
+            color,
         });
     }
 
@@ -1170,10 +689,28 @@ impl Painter for SceneRecorder {
             hash: hash.to_vec(),
             intrinsic_size,
             rect,
+            text_color: None,
         });
     }
 
-    fn draw_resource_image(&mut self, image_idx: u32, uri: Option<&str>, rect: Rect) {
+    fn draw_math_svg(
+        &mut self,
+        bytes: &[u8],
+        hash: &[u8],
+        intrinsic_size: (u32, u32),
+        rect: Rect,
+        color: u32,
+    ) {
+        self.commands.push(RenderCommand::Svg {
+            bytes: Arc::from(bytes),
+            hash: hash.to_vec(),
+            intrinsic_size,
+            rect,
+            text_color: Some(color),
+        });
+    }
+
+    fn draw_resource_image(&mut self, image_idx: ImageId, uri: Option<&str>, rect: Rect) {
         self.commands.push(RenderCommand::ResourceImage {
             image_idx,
             uri: uri.map(str::to_owned),
@@ -1182,44 +719,123 @@ impl Painter for SceneRecorder {
     }
 }
 
-struct DenyResourceProvider;
-
-impl ResourceProvider for DenyResourceProvider {
-    fn read_bytes(&self, _uri: &str) -> io::Result<Vec<u8>> {
-        Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "fragment external resources are disabled",
-        ))
-    }
-
-    fn exists(&self, _uri: &str) -> bool {
-        false
-    }
-
-    fn resolve(&self, _base: &str, href: &str) -> String {
-        href.to_owned()
-    }
-
-    fn list_html_candidates(&self, _root: &str) -> io::Result<Vec<String>> {
-        Ok(Vec::new())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use html_pipeline::engine::GlyphResourceGeneration;
-    use html_pipeline::engine::{GlyphId, GlyphRequest, ShapedGlyph};
     use html_pipeline::engine::{
-        GlyphMetric, ShapeError, ShapedTextRun, TextDirection, TextRunShapeRequest,
+        GlyphResourceStore, GlyphShaper, LaidOutDocument, LayoutConstraints,
+    };
+    use html_pipeline::{
+        MarkupSyntax, MediaEnvironment, PipelineError, PipelineInputs, PipelineSession,
+        StyleEnvironment,
+    };
+    use html_resources::ResourceProvider;
+    use std::io;
+    use html_pipeline::engine::GlyphResourceGeneration;
+    use html_pipeline::engine::GlyphRequest;
+    use html_pipeline::engine::FontMetrics;
+    use html_pipeline::engine::ShapedGlyph;
+    use html_pipeline::engine::{
+        ShapeError, ShapedRun, ShapedTextRun, TextDirection, TextRunShapeRequest,
     };
     use std::collections::HashMap;
 
+    struct DenyResourceProvider;
+
+    impl ResourceProvider for DenyResourceProvider {
+        fn read_bytes(&self, _uri: &str) -> io::Result<Vec<u8>> {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "fragment external resources are disabled",
+            ))
+        }
+
+        fn exists(&self, _uri: &str) -> bool {
+            false
+        }
+
+        fn resolve(&self, _base: &str, href: &str) -> String {
+            href.to_owned()
+        }
+
+        fn list_html_candidates(&self, _root: &str) -> io::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
+    /// Lays out one source string per call, replacing the previous fragment.
+    struct FragmentRenderer {
+        session: PipelineSession,
+    }
+
+    struct RenderedFragment<'a> {
+        document: &'a LaidOutDocument<'a>,
+        resources: &'a GlyphResourceStore,
+        scene: RenderScene,
+    }
+
+    impl RenderedFragment<'_> {
+        fn render_view(&self) -> RenderView<'_> {
+            self.document.render_view(self.resources)
+        }
+
+        fn scene(&self) -> &RenderScene {
+            &self.scene
+        }
+
+        fn into_scene(self) -> RenderScene {
+            self.scene
+        }
+    }
+
+    impl FragmentRenderer {
+        fn new() -> Self {
+            Self {
+                session: PipelineSession::new(Arc::new(DenyResourceProvider)),
+            }
+        }
+
+        fn render_view(&self) -> Option<RenderView<'_>> {
+            self.session.render_view()
+        }
+
+        fn render(
+            &mut self,
+            source: &str,
+            options: &SceneOptions,
+            shaper: &mut impl GlyphShaper,
+        ) -> Result<RenderedFragment<'_>, PipelineError> {
+            let style_environment = StyleEnvironment {
+                root_font_size: Default::default(),
+                media: MediaEnvironment::screen(options.viewport_width(), options.maximum_height())
+                    .expect("scene options are valid media dimensions"),
+            };
+            let layout = LayoutConstraints::new(options.viewport_width(), 16.0)?
+                .with_viewport_height(options.maximum_height())?;
+            let inputs = PipelineInputs::new(
+                source.into(),
+                MarkupSyntax::Html,
+                "fragment.xhtml".into(),
+                style_environment,
+                layout,
+            );
+            self.session.attach(shaper).update(inputs)?;
+            let document = self.session.document().expect("updated fragment is laid out");
+            let resources = self.session.glyph_resources();
+            let scene = render_scene_for_view(document.render_view(resources), options);
+            Ok(RenderedFragment {
+                document,
+                resources,
+                scene,
+            })
+        }
+    }
+
     #[derive(Default)]
     struct TestShaper {
-        glyphs: HashMap<(char, u32), GlyphId>,
+        glyphs: HashMap<(char, u32), GlyphHandle>,
         generation: GlyphResourceGeneration,
-        append_checkpoint: Option<(HashMap<(char, u32), GlyphId>, GlyphResourceGeneration)>,
+        append_checkpoint: Option<(HashMap<(char, u32), GlyphHandle>, GlyphResourceGeneration)>,
     }
 
     impl GlyphShaper for TestShaper {
@@ -1250,26 +866,24 @@ mod tests {
         }
 
         fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
-            let key = (request.character, request.font_size.to_bits());
-            let metric = GlyphMetric::try_new(
-                request.character,
-                request.font_size * 0.5,
-                request.font_size * 0.75,
-                request.font_size * 0.25,
-            )
-            .map_err(ShapeError::rejected_metric)?;
+            let key = (request.character, request.style.font_size.to_bits());
+            let advance = request.style.font_size * 0.5;
+            let metrics = FontMetrics {
+                ascent: request.style.font_size * 0.75,
+                descent: request.style.font_size * 0.25,
+            };
             if let Some(glyph) = self.glyphs.get(&key) {
-                return Ok(ShapedGlyph::from_metric(*glyph, metric));
+                return Ok(ShapedGlyph::new(*glyph, advance, metrics));
             }
-            let glyph = self.glyphs.len() as GlyphId;
+            let glyph = GlyphHandle(self.glyphs.len() as u32);
             self.glyphs.insert(key, glyph);
-            Ok(ShapedGlyph::from_metric(glyph, metric))
+            Ok(ShapedGlyph::new(glyph, advance, metrics))
         }
     }
 
     #[test]
     fn scalar_paint_uses_native_handles_and_baseline_coordinates() {
-        use html_pipeline::FontMetrics;
+        use html_pipeline::engine::FontMetrics;
         #[derive(Default)]
         struct NativeHandles(GlyphResourceGeneration);
         impl GlyphShaper for NativeHandles {
@@ -1283,12 +897,19 @@ mod tests {
                 &mut self,
                 _request: GlyphRequest<'_>,
             ) -> Result<ShapedGlyph, ShapeError> {
-                Ok(ShapedGlyph::new(700, 8.0, FontMetrics::new(12.0, 4.0).unwrap()).unwrap())
+                Ok(ShapedGlyph::new(
+                    GlyphHandle(700),
+                    8.0,
+                    FontMetrics {
+                        ascent: 12.0,
+                        descent: 4.0,
+                    },
+                ))
             }
         }
         let mut renderer = FragmentRenderer::new();
         let mut shaper = NativeHandles::default();
-        let options = FragmentRenderOptions::new(200.0, None).unwrap();
+        let options = SceneOptions::new(200.0, None).unwrap();
         let rendered = renderer
             .render(
                 "<p style='margin:0;line-height:30px'>x</p>",
@@ -1300,15 +921,105 @@ mod tests {
         let line = text
             .lines()
             .iter()
-            .find(|line| !line.glyphs().is_empty())
+            .find(|line| !text_paint::render_line_glyphs(&line).is_empty())
             .unwrap();
-        assert_ne!(text.glyph_at(line.start() as usize), Some(700));
+        assert_ne!(
+            text_paint::glyph_at(text, line.start() as usize).map(|id| id.0),
+            Some(700)
+        );
         let mut painter = RecordingPainter::default();
         rendered.scene().paint(&mut painter);
         assert_eq!(painter.glyphs.len(), 1);
         let (handle, origin) = painter.glyphs[0];
-        assert_eq!(handle, 700);
-        assert_eq!(origin.y, (line.point().y + line.baseline()).round());
+        assert_eq!(handle, GlyphHandle(700));
+        assert_eq!(
+            origin.y,
+            (line.point().y + text_paint::line_baseline(&line)).round()
+        );
+    }
+
+    #[test]
+    fn scalar_glyph_geometry_is_shared_across_authored_colors() {
+        let mut renderer = FragmentRenderer::new();
+        let mut shaper = TestShaper::default();
+        let rendered = renderer
+            .render(
+                "<p><span style='color:red'>x</span><span style='color:blue'>x</span></p>",
+                &SceneOptions::new(200.0, None).unwrap(),
+                &mut shaper,
+            )
+            .unwrap();
+        let text = rendered.render_view().text();
+        assert_eq!(text.glyph_count(), 2);
+        assert_eq!(text_paint::glyph_at(text, 0), text_paint::glyph_at(text, 1));
+        assert_eq!(text_paint::paint_color_at(text, 0), Some(0xff0000ff));
+        assert_eq!(text_paint::paint_color_at(text, 1), Some(0x0000ffff));
+        let mut painter = RecordingPainter::default();
+        rendered.scene().paint(&mut painter);
+        assert_eq!(painter.glyphs[0].0, painter.glyphs[1].0);
+        assert_eq!(painter.glyph_colors, [0xff0000ff, 0x0000ffff]);
+    }
+
+    #[test]
+    fn ellipsis_uses_the_container_foreground_color() {
+        let mut renderer = FragmentRenderer::new();
+        let mut shaper = TestShaper::default();
+        let rendered = renderer.render(
+            "<p style='width:40px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;color:green'><span style='color:red'>xxxxxxxxxx</span></p>",
+            &SceneOptions::new(200.0, None).unwrap(), &mut shaper,
+        ).unwrap();
+        let handle = shaper
+            .glyphs
+            .iter()
+            .find_map(|(&(character, _), &handle)| (character == '…').then_some(handle))
+            .unwrap();
+        assert!(rendered.scene().commands.as_ref().iter().any(|command|
+            matches!(command, RenderCommand::Glyph { glyph, color, .. } if *glyph == handle && *color == 0x008000ff)));
+    }
+
+    #[test]
+    fn standard_shaper_restores_native_resources_when_rendering_fails() {
+        use html_pipeline::engine::GlyphWriter;
+        use html_pipeline::engine::ResourceShaper;
+        let mut shaper = ResourceShaper::new(|request, resources: &mut GlyphWriter<'_, char>| {
+            if request.character == '!' {
+                return Err(shaping_contracts::shape_error_registry_capacity_exhausted(0));
+            }
+            let metrics = FontMetrics {
+                ascent: request.style.font_size * 0.75,
+                descent: request.style.font_size * 0.25,
+            };
+            let handle = resources.insert(request.character)?;
+            Ok(ShapedGlyph::new(
+                handle,
+                request.style.font_size * 0.5,
+                metrics,
+            ))
+        });
+        let mut renderer = FragmentRenderer::new();
+        let options = SceneOptions::new(200.0, None).unwrap();
+        // First-line refinement appends resources while replacement is pending.
+        let scene = renderer
+            .render(
+                "<style>p::first-line {font-size:24px}</style><p>x</p>",
+                &options,
+                &mut shaper,
+            )
+            .unwrap()
+            .into_scene();
+        let generation = shaper.resource_generation();
+        assert!(renderer.render("<p>y!</p>", &options, &mut shaper).is_err());
+        assert_eq!(shaper.resource_generation(), generation);
+        assert_eq!(renderer.render_view().unwrap().text().glyph_count(), 1);
+        let mut painter = RecordingPainter::default();
+        scene.paint(&mut painter);
+        assert!(!painter.glyphs.is_empty());
+        for (handle, _) in painter.glyphs {
+            assert_eq!(shaper.resources().get(handle), Some(&'x'));
+        }
+        renderer.render("<p>z</p>", &options, &mut shaper).unwrap();
+        assert_ne!(shaper.resource_generation(), generation);
+        assert_eq!(shaper.resources().get(GlyphHandle(0)), Some(&'z'));
     }
 
     #[derive(Default)]
@@ -1321,7 +1032,7 @@ mod tests {
     impl GlyphShaper for NativeTestShaper {
         fn reset(&mut self) {
             self.fallback.reset();
-            self.next_run = 0;
+            self.next_run = TextRunId(0);
         }
 
         fn resource_generation(&self) -> GlyphResourceGeneration {
@@ -1350,12 +1061,12 @@ mod tests {
             self.fallback.shape_glyph(request)
         }
 
-        fn shape_text_run(
+        fn shape_run(
             &mut self,
             request: TextRunShapeRequest<'_>,
-        ) -> Result<Option<ShapedTextRun>, ShapeError> {
-            let count = request.text().chars().count();
-            let advances: Vec<f32> = request.text().chars().map(|character| {
+        ) -> Result<Option<ShapedRun>, ShapeError> {
+            let count = shaping_contracts::text_run_shape_request_text(&request).chars().count();
+            let advances: Vec<f32> = shaping_contracts::text_run_shape_request_text(&request).chars().map(|character| {
                 if matches!(character, '\u{00ad}' | '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') { 0.0 } else { 8.0 }
             }).collect();
             let mut caret_stops = Vec::with_capacity(count + 1);
@@ -1365,20 +1076,18 @@ mod tests {
                 x += advance;
                 caret_stops.push(x);
             }
-            if request.style().direction() == TextDirection::Rtl {
+            if shaping_contracts::text_run_shape_request_style(&request).direction == TextDirection::Rtl {
                 for stop in &mut caret_stops {
                     *stop = x - *stop;
                 }
             }
             let run = self.next_run;
-            self.next_run += 1;
-            Ok(ShapedTextRun::with_backend_run(
-                Arc::from(advances),
+            self.next_run.0 += 1;
+            Ok(Some(shaping_contracts::shaped_run_geometry(shaping_contracts::shaped_text_run_with_backend_run(Arc::from(advances),
                 Arc::from(vec![true; count + 1]),
                 run,
-                Arc::from(caret_stops),
-                12.0,
-            ))
+                caret_stops.into(),
+                12.0,))))
         }
     }
 
@@ -1387,21 +1096,29 @@ mod tests {
         #[derive(Default)]
         struct BaselinePainter(Vec<Point>);
         impl Painter for BaselinePainter {
+            fn push_clip(&mut self, _: Rect) {}
+            fn pop_clip(&mut self) {}
             fn fill_rect(&mut self, _: Rect, _: Color) {}
-            fn draw_glyph(&mut self, _: GlyphHandle, _: Point) {
+            fn draw_glyph(&mut self, _: GlyphHandle, _: Point, _color: u32) {
                 panic!("expected native run painting");
             }
             fn supports_text_runs(&self) -> bool {
                 true
             }
-            fn draw_text_run(&mut self, _: TextRunId, origin: Point, _: Option<u32>) {
+            fn draw_text_run_fragment(
+                &mut self,
+                _: TextRunId,
+                _: Range<u32>,
+                origin: Point,
+                _: Option<u32>,
+            ) {
                 self.0.push(origin);
             }
             fn draw_image(&mut self, _: &Image, _: &[u8], _: Rect) {}
         }
         let mut renderer = FragmentRenderer::new();
         let mut shaper = NativeTestShaper::default();
-        let options = FragmentRenderOptions::new(200.0, None).unwrap();
+        let options = SceneOptions::new(200.0, None).unwrap();
         let rendered = renderer
             .render(
                 "<p style='margin:0;line-height:30px'><span style='font-size:24px'>x</span>y</p>",
@@ -1414,20 +1131,20 @@ mod tests {
         let line = text
             .lines()
             .iter()
-            .find(|line| !line.glyphs().is_empty())
+            .find(|line| !text_paint::render_line_glyphs(&line).is_empty())
             .unwrap();
         let origin = Point::new(10.0, 20.25);
         let mut painter = BaselinePainter::default();
         assert!(paint_line_text_runs(
             view,
-            line.index(),
+            line.id(),
             origin,
             2.0,
             None,
             &mut painter
         ));
         assert!(!painter.0.is_empty());
-        let expected_y = ((origin.y + line.baseline()) * 2.0).round() / 2.0;
+        let expected_y = ((origin.y + text_paint::line_baseline(&line)) * 2.0).round() / 2.0;
         assert!(painter.0.iter().all(|point| point.y == expected_y));
     }
 
@@ -1439,9 +1156,11 @@ mod tests {
     }
 
     impl Painter for PreparedBatchPainter {
+        fn push_clip(&mut self, _: Rect) {}
+        fn pop_clip(&mut self) {}
         fn fill_rect(&mut self, _rect: Rect, _color: Color) {}
 
-        fn draw_glyph(&mut self, _glyph: GlyphId, _origin: Point) {
+        fn draw_glyph(&mut self, _glyph: GlyphHandle, _origin: Point, _color: u32) {
             self.scalar_glyphs += 1;
         }
 
@@ -1471,11 +1190,11 @@ mod tests {
     }
 
     impl Painter for ColorPainter {
+        fn push_clip(&mut self, _: Rect) {}
+        fn pop_clip(&mut self) {}
         fn fill_rect(&mut self, _: Rect, _: Color) {}
-        fn draw_glyph(&mut self, _: GlyphId, _: Point) {
-            self.glyph_colors.push(None);
-        }
-        fn draw_glyph_with_color(&mut self, _: GlyphId, _: Point, color: u32) {
+
+        fn draw_glyph(&mut self, _: GlyphHandle, _: Point, color: u32) {
             self.glyph_colors.push(Some(color));
         }
         fn supports_text_runs(&self) -> bool {
@@ -1506,10 +1225,8 @@ mod tests {
             .unwrap()
             .layout(constraints, &document_resources)
             .expect("layout requires the shaper-aware API for first-line styles");
-        let retained_color = document
-            .render_view(&document_resources)
-            .text()
-            .paint_color_at(1);
+        let retained_color =
+            text_paint::paint_color_at(document.render_view(&document_resources).text(), 1);
         let run_count = shaper.next_run;
         let preferences = html_pipeline::engine::ReaderStyleOverrides {
             foreground: Some(0x008000ff),
@@ -1523,12 +1240,12 @@ mod tests {
         let line = text
             .lines()
             .iter()
-            .find(|line| !line.glyphs().is_empty())
+            .find(|line| !text_paint::render_line_glyphs(&line).is_empty())
             .unwrap()
-            .index();
-        assert_eq!(text.paint_color_at(0), Some(0x008000ff));
-        assert_eq!(text.paint_color_at(1), Some(0xff0000ff));
-        assert_eq!(retained_color, None);
+            .id();
+        assert_eq!(text_paint::paint_color_at(text, 0), Some(0x008000ff));
+        assert_eq!(text_paint::paint_color_at(text, 1), Some(0xff0000ff));
+        assert_eq!(retained_color, Some(0x0000ffff));
         let mut native = ColorPainter {
             native: true,
             ..Default::default()
@@ -1636,10 +1353,10 @@ mod tests {
                 .lines()
                 .iter()
                 .flat_map(|line| {
-                    text.prepared_text_runs(line.index())
+                    text_paint::prepared_text_runs(text, line.id())
                         .expect("native coverage is published")
                 })
-                .map(|fragment| fragment.color())
+                .map(|fragment| fragment.color)
                 .collect();
             assert_eq!(colors, [Some(0x008000ff), Some(0xff0000ff)]);
             assert_eq!(
@@ -1661,15 +1378,16 @@ mod tests {
             .unwrap()
             .layout(constraints, &document_resources)
             .expect("layout requires the shaper-aware API for first-line styles");
-        let clips: Vec<_> = (0..document
+        let clips: Vec<_> = text_paint::render_text_view_spatial_order(document
             .render_view(&document_resources)
-            .text()
-            .line_count())
+            .text())
+            .iter()
+            .copied()
             .map(|index| {
-                document
-                    .render_view(&document_resources)
-                    .text()
-                    .line_overflow_clip(index)
+                text_paint::line_overflow_clip(
+                    document.render_view(&document_resources).text(),
+                    index,
+                )
             })
             .collect();
         assert!(clips.iter().any(Option::is_some));
@@ -1681,29 +1399,31 @@ mod tests {
             })
             .unwrap();
         assert!(document.repaint_from(&painted, &document_resources));
-        let repainted_clips: Vec<_> = (0..document
+        let repainted_clips: Vec<_> = text_paint::render_text_view_spatial_order(document
             .render_view(&document_resources)
-            .text()
-            .line_count())
+            .text())
+            .iter()
+            .copied()
             .map(|index| {
-                document
-                    .render_view(&document_resources)
-                    .text()
-                    .line_overflow_clip(index)
+                text_paint::line_overflow_clip(
+                    document.render_view(&document_resources).text(),
+                    index,
+                )
             })
             .collect();
         assert_eq!(clips, repainted_clips);
         assert_eq!(shaper.next_run, run_count);
         assert!(document.repaint_from(&base, &document_resources));
-        let restored_clips: Vec<_> = (0..document
+        let restored_clips: Vec<_> = text_paint::render_text_view_spatial_order(document
             .render_view(&document_resources)
-            .text()
-            .line_count())
+            .text())
+            .iter()
+            .copied()
             .map(|index| {
-                document
-                    .render_view(&document_resources)
-                    .text()
-                    .line_overflow_clip(index)
+                text_paint::line_overflow_clip(
+                    document.render_view(&document_resources).text(),
+                    index,
+                )
             })
             .collect();
         assert_eq!(clips, restored_clips);
@@ -1741,11 +1461,17 @@ mod tests {
             .unwrap();
         assert!(document.repaint_from(&painted, &document_resources));
         let text = document.render_view(&document_resources).text();
-        assert_eq!(text.paint_color_at(0), Some(theme.adapt(0x800080ff)));
-        assert_eq!(text.paint_color_at(1), Some(theme.adapt(0x800080ff)));
         assert_eq!(
-            text.line(0).unwrap().paint_color(),
-            Some(theme.adapt(0x0000ffff))
+            text_paint::paint_color_at(text, 0),
+            Some(computed_style::theme_adaptation_adapt(theme, 0x800080ff))
+        );
+        assert_eq!(
+            text_paint::paint_color_at(text, 1),
+            Some(computed_style::theme_adaptation_adapt(theme, 0x800080ff))
+        );
+        assert_eq!(
+            text_paint::line_paint_color(&text.line(LineId::new(0)).unwrap()),
+            Some(computed_style::theme_adaptation_adapt(theme, 0x0000ffff))
         );
         document
             .relayout_with_metrics_and_shaper(
@@ -1756,11 +1482,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            document
-                .render_view(&document_resources)
-                .text()
-                .paint_color_at(0),
-            Some(theme.adapt(0x800080ff))
+            text_paint::paint_color_at(document.render_view(&document_resources).text(), 0),
+            Some(computed_style::theme_adaptation_adapt(theme, 0x800080ff))
         );
     }
 
@@ -1786,18 +1509,20 @@ mod tests {
                 .unwrap();
             let view = document.render_view(&document_resources);
             let text = view.text();
-            let line = text.line(0).unwrap();
+            let line = text.line(LineId::new(0)).unwrap();
             assert!(
-                line.letter_spacing() > 0.0,
+                text_paint::line_letter_spacing(&line) > 0.0,
                 "fixture must exercise justified tracking"
             );
             let mut scalar = RecordingPainter::default();
-            paint_line_glyphs(view, 0, Point::ZERO, 1.0, None, &mut scalar);
+            paint_line_glyphs(view, LineId::new(0), Point::ZERO, 1.0, None, &mut scalar);
             let mut separate = RecordingPainter::default();
-            for fragment in text.line_text_fragments(0).unwrap() {
+            for fragment in
+                text_paint::render_text_view_line_text_fragments(text, LineId::new(0)).unwrap()
+            {
                 paint_line_glyph_fragment(
                     view,
-                    0,
+                    LineId::new(0),
                     &fragment,
                     Point::ZERO,
                     1.0,
@@ -1807,43 +1532,43 @@ mod tests {
             }
             assert_eq!(scalar.glyphs, separate.glyphs);
             for &(glyph, point) in &scalar.glyphs {
-                let index = line
-                    .glyphs()
-                    .find(|&index| text.paint_glyph_at(index) == Some(glyph))
+                let index = text_paint::render_line_glyphs(&line)
+                    .find(|&index| {
+                        text_paint::paint_glyph_at(text, index)
+                            .and_then(|id| text_paint::paint_handle(text, id))
+                            == Some(glyph)
+                    })
                     .unwrap();
-                let caret = view
-                    .geometry()
-                    .caret_x(0, index, CaretAffinity::Leading, &[])
+                let caret = geometry_queries::render_view_geometry(view)
+                    .caret_x(LineId::new(0), index, CaretAffinity::Leading)
                     .unwrap();
                 assert!(
                     (point.x - caret).abs() < 1.0e-6,
                     "scalar paint and caret disagree at {index}"
                 );
             }
-            let runs: Vec<_> = text.authoritative_runs(line.glyphs()).collect();
-            for fragment in text
-                .prepared_text_runs(0)
+            let runs: Vec<_> =
+                text_paint::authoritative_runs(text, text_paint::render_line_glyphs(&line))
+                    .collect();
+            for fragment in text_paint::prepared_text_runs(text, LineId::new(0))
                 .expect("complete native coverage")
             {
                 let run = runs
                     .iter()
                     .find(|run| {
-                        run.run() == fragment.run()
-                            && run.run_range().contains(&fragment.range().start)
+                        run.run() == fragment.run && run.run_range().contains(&fragment.range.start)
                     })
                     .unwrap();
-                let index =
-                    run.source_range().start + fragment.range().start - run.run_range().start;
+                let index = run.source_range().start + fragment.range.start - run.run_range().start;
                 let natural = f64::from(run.natural_offset())
                     + (run.source_range().start..index)
-                        .map(|index| f64::from(text.character_advance(index).unwrap()))
+                        .map(|index| f64::from(text_paint::character_advance(text, index).unwrap()))
                         .sum::<f64>();
-                let caret = view
-                    .geometry()
-                    .caret_x(0, index, CaretAffinity::Leading, &[])
+                let caret = geometry_queries::render_view_geometry(view)
+                    .caret_x(LineId::new(0), index, CaretAffinity::Leading)
                     .unwrap();
                 assert!(
-                    (fragment.offset().x + natural - caret).abs() < 1.0e-6,
+                    (fragment.offset.x + natural - caret).abs() < 1.0e-6,
                     "native paint and caret disagree at {index}"
                 );
             }
@@ -1854,7 +1579,7 @@ mod tests {
     fn incomplete_native_coverage_uses_scalar_painting() {
         let mut renderer = FragmentRenderer::new();
         let mut shaper = TestShaper::default();
-        let options = FragmentRenderOptions::new(200.0, None).unwrap();
+        let options = SceneOptions::new(200.0, None).unwrap();
         let rendered = renderer
             .render("<p>fallback text</p>", &options, &mut shaper)
             .unwrap();
@@ -1864,7 +1589,7 @@ mod tests {
         };
         assert!(!paint_line_text_runs(
             rendered.render_view(),
-            0,
+            LineId::new(0),
             Point::ZERO,
             1.0,
             None,
@@ -1874,7 +1599,7 @@ mod tests {
         let mut scalar = RecordingPainter::default();
         paint_line_glyphs(
             rendered.render_view(),
-            0,
+            LineId::new(0),
             Point::ZERO,
             1.0,
             None,
@@ -1887,7 +1612,7 @@ mod tests {
     fn native_line_paint_replays_layout_prepared_run_fragments() {
         let mut renderer = FragmentRenderer::new();
         let mut shaper = NativeTestShaper::default();
-        let options = FragmentRenderOptions::new(200.0, None).unwrap();
+        let options = SceneOptions::new(200.0, None).unwrap();
         let rendered = renderer
             .render("<p>prepared native text</p>", &options, &mut shaper)
             .unwrap();
@@ -1896,10 +1621,11 @@ mod tests {
         let line_idx = text
             .lines()
             .iter()
-            .position(|line| !line.glyphs().is_empty())
+            .find(|line| !text_paint::render_line_glyphs(&line).is_empty())
+            .map(|line| line.id())
             .expect("fixture emits text");
         assert!(
-            text.prepared_text_runs(line_idx).is_some(),
+            text_paint::prepared_text_runs(text, line_idx).is_some(),
             "layout retains authoritative run slices"
         );
 
@@ -1924,7 +1650,7 @@ mod tests {
     fn rtl_scalar_paint_places_mirrored_brackets_and_hides_directional_controls() {
         let mut renderer = FragmentRenderer::new();
         let mut shaper = TestShaper::default();
-        let options = FragmentRenderOptions::new(200.0, None).unwrap();
+        let options = SceneOptions::new(200.0, None).unwrap();
         let rendered = renderer
             .render("<p dir='rtl'>(אבג)\u{200f}</p>", &options, &mut shaper)
             .unwrap();
@@ -1933,7 +1659,7 @@ mod tests {
         let mut painter = RecordingPainter::default();
         paint_line_glyphs(
             rendered.render_view(),
-            0,
+            LineId::new(0),
             Point::ZERO,
             1.0,
             None,
@@ -1943,7 +1669,13 @@ mod tests {
         let actual: String = painter
             .glyphs
             .iter()
-            .map(|(glyph, _)| text.glyph_metric(*glyph).unwrap().ch())
+            .map(|(glyph, _)| {
+                shaper
+                    .glyphs
+                    .iter()
+                    .find_map(|(&(character, _), &handle)| (handle == *glyph).then_some(character))
+                    .unwrap()
+            })
             .collect();
         assert_eq!(actual, "(גבא)");
     }
@@ -1952,14 +1684,14 @@ mod tests {
     fn rtl_native_paint_uses_document_owned_directional_slices() {
         let mut renderer = FragmentRenderer::new();
         let mut shaper = NativeTestShaper::default();
-        let options = FragmentRenderOptions::new(200.0, None).unwrap();
+        let options = SceneOptions::new(200.0, None).unwrap();
         let rendered = renderer
             .render("<p dir='rtl'>אבג abc</p>", &options, &mut shaper)
             .unwrap();
         let mut painter = PreparedBatchPainter::default();
         assert!(paint_line_text_runs(
             rendered.render_view(),
-            0,
+            LineId::new(0),
             Point::ZERO,
             1.0,
             None,
@@ -1976,11 +1708,13 @@ mod tests {
     }
 
     impl Painter for LegacyPainter {
+        fn push_clip(&mut self, _: Rect) {}
+        fn pop_clip(&mut self) {}
         fn fill_rect(&mut self, _rect: Rect, _color: Color) {
             self.fills += 1;
         }
 
-        fn draw_glyph(&mut self, _glyph: GlyphId, _origin: Point) {}
+        fn draw_glyph(&mut self, _glyph: GlyphHandle, _origin: Point, _color: u32) {}
 
         fn draw_image(&mut self, _image: &Image, _hash: &[u8], _rect: Rect) {}
     }
@@ -1989,7 +1723,7 @@ mod tests {
     fn rounded_primitives_are_optional_for_painter_implementers() {
         let mut painter = LegacyPainter::default();
         let rect = Rect::new(0.0, 0.0, 20.0, 20.0);
-        let radii = UsedBorderRadii {
+        let radii = CornerRadii {
             top_left: (4.0, 4.0),
             top_right: (4.0, 4.0),
             bottom_right: (4.0, 4.0),
@@ -2007,17 +1741,18 @@ mod tests {
     fn rounded_background_and_uniform_border_reach_the_render_scene() {
         let mut renderer = FragmentRenderer::new();
         let mut shaper = TestShaper::default();
-        let options = FragmentRenderOptions::new(200.0, None).unwrap();
+        let options = SceneOptions::new(200.0, None).unwrap();
         let rendered = renderer.render("<div style='width:100px;height:30px;background:red;border:2px solid blue;border-radius:12px'>rounded</div>", &options, &mut shaper).unwrap();
 
         assert!(
             rendered
                 .scene()
-                .commands()
+                .commands
+                .as_ref()
                 .iter()
                 .any(|command| matches!(command, RenderCommand::RoundedFill { .. }))
         );
-        assert!(rendered.scene().commands().iter().any(
+        assert!(rendered.scene().commands.as_ref().iter().any(
             |command| matches!(command, RenderCommand::RoundedBorder { width, .. } if *width == 2.0)
         ));
         let mut recording = RecordingPainter::default();
@@ -2030,9 +1765,9 @@ mod tests {
     fn foreground_text_decoration_is_recorded_after_glyphs() {
         let mut renderer = FragmentRenderer::new();
         let mut shaper = TestShaper::default();
-        let options = FragmentRenderOptions::new(200.0, None).unwrap();
+        let options = SceneOptions::new(200.0, None).unwrap();
         let rendered = renderer.render("<span style='text-decoration-line:line-through;text-decoration-color:#ff0000'>marked</span>", &options, &mut shaper).unwrap();
-        let commands = rendered.scene().commands();
+        let commands = rendered.scene().commands.as_ref();
         let last_glyph = commands
             .iter()
             .rposition(|command| matches!(command, RenderCommand::Glyph { .. }))
@@ -2048,15 +1783,12 @@ mod tests {
     fn render_core_tessellates_semantic_dashed_decorations() {
         let mut renderer = FragmentRenderer::new();
         let mut shaper = TestShaper::default();
-        let options = FragmentRenderOptions::new(240.0, None).unwrap();
+        let options = SceneOptions::new(240.0, None).unwrap();
         let rendered = renderer.render("<span style='text-decoration:line-through 2px dashed #ff0000'>patterned decoration</span>", &options, &mut shaper).unwrap();
 
-        let semantic = rendered
-            .render_view()
-            .fragments()
-            .decorations()
+        let semantic = fragment_paint::decorations(rendered.render_view().fragments())
             .iter()
-            .filter(|decoration| decoration.color() == 0xff0000ff)
+            .filter(|decoration| fragment_paint::decoration_color(&decoration) == 0xff0000ff)
             .collect::<Vec<_>>();
         assert_eq!(
             semantic.len(),
@@ -2064,11 +1796,11 @@ mod tests {
             "layout publishes one semantic dashed span"
         );
         assert_eq!(
-            semantic[0].pattern(),
+            fragment_paint::decoration_pattern(&semantic[0]),
             html_pipeline::engine::RenderDecorationPattern::DashedHorizontal
         );
 
-        let painter_rects = rendered.scene().commands().iter().filter(|command| matches!(command, RenderCommand::Fill { color, .. } if color.r == 255 && color.g == 0 && color.b == 0)).count();
+        let painter_rects = rendered.scene().commands.as_ref().iter().filter(|command| matches!(command, RenderCommand::Fill { color, .. } if color.r == 255 && color.g == 0 && color.b == 0)).count();
         assert!(
             painter_rects > 1,
             "render core expands the semantic span into painter primitives"
@@ -2076,16 +1808,54 @@ mod tests {
     }
 
     #[test]
+    fn image_overflow_uses_line_identity_when_spatial_order_is_different() {
+        let mut renderer = FragmentRenderer::new();
+        let mut shaper = TestShaper::default();
+        let options = SceneOptions::new(200.0, None).unwrap();
+        let rendered = renderer.render("<html><body style='margin:0;font-size:10px;line-height:10px'><div style='position:relative;top:80px'>A<img src='x' width='10' height='10' style='position:relative;top:60px;vertical-align:top'></div><div>B</div></body></html>", &options, &mut shaper).unwrap();
+        let view = rendered.render_view();
+        let text = view.text();
+        assert_ne!(
+            layout_state::line_id_index(text_paint::render_text_view_spatial_order(text)[0]),
+            0
+        );
+        let nominal_bottom = text
+            .lines()
+            .iter()
+            .map(|line| line.point().y + line.height())
+            .fold(0.0, f64::max);
+        let image = fragment_paint::render_fragment_view_images(view.fragments())
+            .iter()
+            .next()
+            .unwrap();
+        let image_bottom = geometry_queries::render_geometry_view_line_vertical_bounds(
+            geometry_queries::render_view_geometry(view),
+            fragment_paint::render_image_fragment_line(&image),
+        )
+        .unwrap()
+        .end;
+        assert!(
+            image_bottom > nominal_bottom,
+            "fixture must overflow its carrier line"
+        );
+        assert!(
+            rendered.scene().size().height >= image_bottom,
+            "image remains inside the scene despite non-spatial storage"
+        );
+    }
+
+    #[test]
     fn renders_bounded_html_fragment_into_a_replayable_scene() {
         let mut renderer = FragmentRenderer::new();
         let mut shaper = TestShaper::default();
-        let options = FragmentRenderOptions::new(160.0, Some(24.0)).unwrap();
+        let options = SceneOptions::new(160.0, Some(24.0)).unwrap();
         let rendered = renderer.render("<div style='background:#eee'><p>Hello <strong>fragment</strong></p><p>second line</p></div>", &options, &mut shaper).unwrap();
         assert!(rendered.scene().is_clipped());
         assert!(
             rendered
                 .scene()
-                .commands()
+                .commands
+                .as_ref()
                 .iter()
                 .any(|command| matches!(command, RenderCommand::Glyph { .. }))
         );
@@ -2098,27 +1868,39 @@ mod tests {
     fn overflow_hidden_clips_descendant_backgrounds_and_records_text_masks() {
         let mut renderer = FragmentRenderer::new();
         let mut shaper = TestShaper::default();
-        let options = FragmentRenderOptions::new(200.0, None).unwrap();
-        let rendered = renderer.render("<div style='height:40px;overflow:hidden'><div style='height:20px;margin-top:40px;background:#ff0000'>outside</div></div>", &options, &mut shaper).unwrap();
+        let options = SceneOptions::new(200.0, None).unwrap();
+        let rendered = renderer.render("<div style='height:40px;overflow:hidden'>inside<div style='height:20px;margin-top:40px;background:#ff0000'>outside</div></div>", &options, &mut shaper).unwrap();
 
-        assert!(!rendered.scene().commands().iter().any(|command| matches!(command, RenderCommand::Fill { color, .. } if color.r == 255 && color.g == 0 && color.b == 0)));
+        assert!(!rendered.scene().commands.as_ref().iter().any(|command| matches!(command, RenderCommand::Fill { color, .. } if color.r == 255 && color.g == 0 && color.b == 0)));
         assert!(
             rendered
                 .scene()
-                .commands()
+                .commands
+                .as_ref()
+                .iter()
+                .any(|command| matches!(command, RenderCommand::Glyph { .. })),
+            "visible text exercises the overflow clip"
+        );
+        assert!(
+            rendered
+                .scene()
+                .commands
+                .as_ref()
                 .iter()
                 .any(|command| matches!(command, RenderCommand::PushClip { .. }))
         );
         assert_eq!(
             rendered
                 .scene()
-                .commands()
+                .commands
+                .as_ref()
                 .iter()
                 .filter(|command| matches!(command, RenderCommand::PushClip { .. }))
                 .count(),
             rendered
                 .scene()
-                .commands()
+                .commands
+                .as_ref()
                 .iter()
                 .filter(|command| matches!(command, RenderCommand::PopClip))
                 .count(),
@@ -2126,21 +1908,71 @@ mod tests {
     }
 
     #[test]
+    fn text_and_background_clips_preserve_the_visible_overflow_axis() {
+        for (overflow, expected_background) in [
+            (
+                "overflow-x:clip;overflow-y:visible",
+                Rect::new(0.0, 0.0, 40.0, 80.0),
+            ),
+            (
+                "overflow-x:visible;overflow-y:clip",
+                Rect::new(0.0, 0.0, 80.0, 40.0),
+            ),
+        ] {
+            let mut renderer = FragmentRenderer::new();
+            let mut shaper = TestShaper::default();
+            let options = SceneOptions::new(200.0, None).unwrap();
+            let source = format!(
+                "<body style='margin:0'><div style='width:40px;height:40px;{overflow}'>\
+                 <div style='width:80px;height:80px;line-height:80px;background:#ff0000'>X</div>\
+                 </div></body>"
+            );
+            let rendered = renderer.render(&source, &options, &mut shaper).unwrap();
+            let scene = rendered.scene();
+            let background = scene
+                .commands
+                .as_ref()
+                .iter()
+                .find_map(|command| match command {
+                    RenderCommand::Fill { rect, color }
+                        if color.r == 255 && color.g == 0 && color.b == 0 =>
+                    {
+                        Some(*rect)
+                    }
+                    _ => None,
+                })
+                .expect("visible child background");
+            assert_eq!(background, expected_background, "{overflow}");
+
+            let expected_text_clip = if overflow.starts_with("overflow-x:clip") {
+                Rect::new(0.0, 0.0, 40.0, render_scene_clip_rect(&scene).y1)
+            } else {
+                Rect::new(0.0, 0.0, render_scene_clip_rect(&scene).x1, 40.0)
+            };
+            assert!(scene.commands.as_ref().iter().any(|command| {
+                matches!(command, RenderCommand::PushClip { rect } if *rect == expected_text_clip)
+            }));
+        }
+    }
+
+    #[test]
     fn renders_atom_xhtml_without_flattening_its_structure() {
         let mut renderer = FragmentRenderer::new();
         let mut shaper = TestShaper::default();
-        let options = FragmentRenderOptions::new(240.0, None).unwrap();
+        let options = SceneOptions::new(240.0, None).unwrap();
         let rendered = renderer.render(r#"<div xmlns="http://www.w3.org/1999/xhtml"><p>This edition has <strong>images</strong>.</p><p>Title: Carmen</p></div>"#, &options, &mut shaper).unwrap();
 
         let view = rendered.render_view().text();
         let text = rendered
             .scene()
-            .commands()
+            .commands
+            .as_ref()
             .iter()
             .filter_map(|command| match command {
-                RenderCommand::Glyph { glyph, .. } => {
-                    view.glyph_metric(*glyph).map(|metric| metric.ch())
-                }
+                RenderCommand::Glyph { glyph, .. } => shaper
+                    .glyphs
+                    .iter()
+                    .find_map(|(&(character, _), &handle)| (handle == *glyph).then_some(character)),
                 _ => None,
             })
             .collect::<String>();
@@ -2152,18 +1984,25 @@ mod tests {
     fn fallback_painting_preserves_inline_replaced_content_offsets() {
         let mut renderer = FragmentRenderer::new();
         let mut shaper = TestShaper::default();
-        let options = FragmentRenderOptions::new(200.0, None).unwrap();
+        let options = SceneOptions::new(200.0, None).unwrap();
         let rendered = renderer.render("<p style='margin:0;white-space:nowrap'>a<img src='missing.png' style='width:20px;height:10px'>b</p>", &options, &mut shaper).unwrap();
 
         let view = rendered.render_view().text();
         let positions = rendered
             .scene()
-            .commands()
+            .commands
+            .as_ref()
             .iter()
             .filter_map(|command| match command {
-                RenderCommand::Glyph { glyph, origin, .. } => {
-                    Some((view.glyph_metric(*glyph)?.ch(), origin.x))
-                }
+                RenderCommand::Glyph { glyph, origin, .. } => Some((
+                    shaper
+                        .glyphs
+                        .iter()
+                        .find_map(|(&(character, _), &handle)| {
+                            (handle == *glyph).then_some(character)
+                        })?,
+                    origin.x,
+                )),
                 _ => None,
             })
             .collect::<HashMap<_, _>>();
@@ -2180,7 +2019,7 @@ mod tests {
     fn fallback_painting_preserves_fractional_inline_origins() {
         let mut renderer = FragmentRenderer::new();
         let mut shaper = TestShaper::default();
-        let options = FragmentRenderOptions::new(200.0, None).unwrap();
+        let options = SceneOptions::new(200.0, None).unwrap();
         let rendered = renderer
             .render(
                 "<span style='margin-left:0.5px'>X</span>",
@@ -2190,7 +2029,8 @@ mod tests {
             .unwrap();
         let origin = rendered
             .scene()
-            .commands()
+            .commands
+            .as_ref()
             .iter()
             .find_map(|command| match command {
                 RenderCommand::Glyph { origin, .. } => Some(*origin),
@@ -2209,33 +2049,36 @@ mod tests {
     fn visibility_hides_paint_but_allows_visible_descendants_and_preserves_advance() {
         let mut renderer = FragmentRenderer::new();
         let mut shaper = TestShaper::default();
-        let options = FragmentRenderOptions::new(240.0, None).unwrap();
+        let options = SceneOptions::new(240.0, None).unwrap();
         let rendered = renderer.render("<p style='visibility:hidden;margin:0'>hidden <span style='visibility:visible;background:#123456'>shown</span> hidden</p><p style='margin:0'>after</p>", &options, &mut shaper).unwrap();
 
         let text = rendered.render_view().text();
         let painted = rendered
             .scene()
-            .commands()
+            .commands
+            .as_ref()
             .iter()
             .filter_map(|command| match command {
-                RenderCommand::Glyph { glyph, .. } => {
-                    text.glyph_metric(*glyph).map(|metric| metric.ch())
-                }
+                RenderCommand::Glyph { glyph, .. } => shaper
+                    .glyphs
+                    .iter()
+                    .find_map(|(&(character, _), &handle)| (handle == *glyph).then_some(character)),
                 _ => None,
             })
             .collect::<String>();
 
         assert_eq!(painted, "shownafter");
-        assert!(rendered.scene().commands().iter().any(|command| matches!(command, RenderCommand::Fill { color, .. } if color.r == 0x12 && color.g == 0x34 && color.b == 0x56)));
+        assert!(rendered.scene().commands.as_ref().iter().any(|command| matches!(command, RenderCommand::Fill { color, .. } if color.r == 0x12 && color.g == 0x34 && color.b == 0x56)));
         let shown_x = rendered
             .scene()
-            .commands()
+            .commands
+            .as_ref()
             .iter()
             .find_map(|command| match command {
                 RenderCommand::Glyph { glyph, origin, .. }
-                    if text
-                        .glyph_metric(*glyph)
-                        .is_some_and(|metric| metric.ch() == 's') =>
+                    if shaper.glyphs.iter().find_map(|(&(character, _), &handle)| {
+                        (handle == *glyph).then_some(character)
+                    }) == Some('s') =>
                 {
                     Some(origin.x)
                 }
@@ -2252,14 +2095,15 @@ mod tests {
     fn hidden_replaced_image_keeps_its_inline_advance_without_painting() {
         let mut renderer = FragmentRenderer::new();
         let mut shaper = TestShaper::default();
-        let options = FragmentRenderOptions::new(240.0, None)
+        let options = SceneOptions::new(240.0, None)
             .unwrap()
-            .with_image_policy(FragmentImagePolicy::Reference);
+            .with_image_policy(SceneImagePolicy::Reference);
         let rendered = renderer.render("<p style='margin:0'>a<img src='cover.png' style='visibility:hidden;width:20px;height:10px'>b</p>", &options, &mut shaper).unwrap();
         assert!(
             !rendered
                 .scene()
-                .commands()
+                .commands
+                .as_ref()
                 .iter()
                 .any(|command| matches!(command, RenderCommand::ResourceImage { .. }))
         );
@@ -2267,12 +2111,19 @@ mod tests {
         let text = rendered.render_view().text();
         let positions = rendered
             .scene()
-            .commands()
+            .commands
+            .as_ref()
             .iter()
             .filter_map(|command| match command {
-                RenderCommand::Glyph { glyph, origin, .. } => {
-                    Some((text.glyph_metric(*glyph)?.ch(), origin.x))
-                }
+                RenderCommand::Glyph { glyph, origin, .. } => Some((
+                    shaper
+                        .glyphs
+                        .iter()
+                        .find_map(|(&(character, _), &handle)| {
+                            (handle == *glyph).then_some(character)
+                        })?,
+                    origin.x,
+                )),
                 _ => None,
             })
             .collect::<HashMap<_, _>>();
@@ -2290,7 +2141,7 @@ mod tests {
         let wide = renderer
             .render(
                 source,
-                &FragmentRenderOptions::new(480.0, None).unwrap(),
+                &SceneOptions::new(480.0, None).unwrap(),
                 &mut shaper,
             )
             .unwrap()
@@ -2299,7 +2150,7 @@ mod tests {
         let narrow = renderer
             .render(
                 source,
-                &FragmentRenderOptions::new(100.0, None).unwrap(),
+                &SceneOptions::new(100.0, None).unwrap(),
                 &mut shaper,
             )
             .unwrap()
@@ -2315,9 +2166,9 @@ mod tests {
     fn can_retain_image_references_for_a_target_adapter() {
         let mut renderer = FragmentRenderer::new();
         let mut shaper = TestShaper::default();
-        let options = FragmentRenderOptions::new(240.0, None)
+        let options = SceneOptions::new(240.0, None)
             .unwrap()
-            .with_image_policy(FragmentImagePolicy::Reference);
+            .with_image_policy(SceneImagePolicy::Reference);
         let rendered = renderer
             .render(
                 r#"<p>Before</p><img src="cover.png" width="20" height="40"><p>After</p>"#,
@@ -2325,30 +2176,44 @@ mod tests {
                 &mut shaper,
             )
             .unwrap();
-        assert!(rendered.scene().commands().iter().any(|command| matches!(command, RenderCommand::ResourceImage { uri: Some(uri), .. } if uri == "cover.png")));
+        assert!(rendered.scene().commands.as_ref().iter().any(|command| matches!(command, RenderCommand::ResourceImage { uri: Some(uri), .. } if uri == "cover.png")));
     }
 
     #[test]
-    fn rejects_invalid_fragment_constraints() {
-        assert!(FragmentRenderOptions::new(0.0, None).is_err());
-        assert!(FragmentRenderOptions::new(100.0, Some(f64::NAN)).is_err());
-        assert!(
-            FragmentRenderOptions::new(100.0, None)
-                .unwrap()
-                .with_viewport_width(f64::INFINITY)
-                .is_err()
-        );
-        assert!(
-            FragmentRenderOptions::new(100.0, None)
-                .unwrap()
-                .with_maximum_height(Some(0.0))
-                .is_err()
-        );
-        assert!(
-            FragmentRenderOptions::new(100.0, None)
-                .unwrap()
-                .with_base_uri("\n")
-                .is_err()
-        );
+    fn rejects_invalid_scene_constraints() {
+        assert!(SceneOptions::new(0.0, None).is_err());
+        assert!(SceneOptions::new(f64::INFINITY, None).is_err());
+        assert!(SceneOptions::new(100.0, Some(f64::NAN)).is_err());
+        assert!(SceneOptions::new(100.0, Some(0.0)).is_err());
     }
+}
+
+/// Build a scene from published geometry, retaining inherited styles,
+/// document paint order and clipping, including independently laid-out scopes.
+pub fn render_scene_for_view(view: RenderView<'_>, options: &SceneOptions) -> RenderScene {
+    build_fragment_view(view, options, None)
+}
+
+pub fn render_scene_for_view_with_images(
+    view: RenderView<'_>,
+    options: &SceneOptions,
+    images: DecodedImages<'_>,
+) -> RenderScene {
+    build_fragment_view(view, options, Some(images))
+}
+
+pub fn render_scene_clip_rect(value: &RenderScene) -> Rect {
+    Rect::from_origin_size(Point::ORIGIN, value.size)
+}
+
+/// Whether the originating document still publishes these paint products.
+pub fn render_scene_is_valid(value: &RenderScene) -> bool {
+    value
+        .resources
+        .as_ref()
+        .is_none_or(|lease| lease.is_valid())
+}
+
+pub fn render_scene_is_clipped(value: &RenderScene) -> bool {
+    value.clipped
 }

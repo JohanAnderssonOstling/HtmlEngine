@@ -1,8 +1,16 @@
 //! Property identities for CSS that Lightning CSS preserves as raw tokens.
 
-use cssparser::{CowRcStr, match_ignore_ascii_case};
+use crate::style::property_catalogue::PropertyKey;
+use cssparser::match_ignore_ascii_case;
 use lightningcss::properties::custom::TokenList;
 use lightningcss::properties::{Property, PropertyId};
+
+/// Send aliases through their existing native property grammar.
+pub(crate) fn canonical_property_id(id: PropertyId<'_>) -> PropertyId<'_> {
+    RendererPropertyId::from_lightning(&id)
+        .and_then(RendererPropertyId::native_property)
+        .unwrap_or(id)
+}
 
 macro_rules! renderer_property_ids {
     ($($variant:ident => $name:literal),+ $(,)?) => {
@@ -31,6 +39,9 @@ macro_rules! renderer_property_ids {
 }
 
 renderer_property_ids! {
+    FontWidth => "font-width",
+    LetterSpacing => "letter-spacing",
+    WordSpacing => "word-spacing",
     Float => "float",
     Clear => "clear",
     ObjectFit => "object-fit",
@@ -42,9 +53,18 @@ renderer_property_ids! {
     EmptyCells => "empty-cells",
     FontKerning => "font-kerning",
     FontFeatureSettings => "font-feature-settings",
+    FontSynthesis => "font-synthesis",
+    FontSynthesisStyle => "font-synthesis-style",
+    FontSynthesisSmallCaps => "font-synthesis-small-caps",
     FontVariantNumeric => "font-variant-numeric",
+    FontVariant => "font-variant",
     FontVariantLigatures => "font-variant-ligatures",
     TextBox => "text-box",
+    WhiteSpaceCollapse => "white-space-collapse",
+    TextWrapMode => "text-wrap-mode",
+    TextWrapStyle => "text-wrap-style",
+    TextWrap => "text-wrap",
+    HangingPunctuation => "hanging-punctuation",
     TextBoxTrim => "text-box-trim",
     TextBoxEdge => "text-box-edge",
     Contain => "contain",
@@ -68,6 +88,8 @@ renderer_property_ids! {
 impl RendererPropertyId {
     pub(crate) fn from_lightning(id: &PropertyId<'_>) -> Option<Self> {
         match id {
+            PropertyId::LetterSpacing => Some(Self::LetterSpacing),
+            PropertyId::WordSpacing => Some(Self::WordSpacing),
             PropertyId::Custom(name) => Self::from_name(name.as_ref()),
             _ => None,
         }
@@ -85,24 +107,13 @@ impl RendererPropertyId {
         }
     }
 
-    /// Preserve the dependency's raw representation when parsing its tokens.
-    pub(crate) fn lightning_id(self) -> PropertyId<'static> {
-        PropertyId::Custom(CowRcStr::from(self.name()).into())
+    pub(crate) fn key(self) -> PropertyKey {
+        PropertyKey::from_name(self.name()).expect("renderer property is catalogued")
     }
 
-    pub(crate) fn canonical_name(self) -> &'static str {
+    pub(crate) fn native_property(self) -> Option<PropertyId<'static>> {
         match self {
-            Self::PageBreakBefore => Self::BreakBefore.name(),
-            Self::PageBreakAfter => Self::BreakAfter.name(),
-            Self::PageBreakInside => Self::BreakInside.name(),
-            Self::GridRowGap => "row-gap",
-            Self::GridColumnGap => "column-gap",
-            _ => self.name(),
-        }
-    }
-
-    pub(crate) fn gap_property(self) -> Option<PropertyId<'static>> {
-        match self {
+            Self::FontWidth => Some(PropertyId::FontStretch),
             Self::GridGap => Some(PropertyId::Gap),
             Self::GridRowGap => Some(PropertyId::RowGap),
             Self::GridColumnGap => Some(PropertyId::ColumnGap),

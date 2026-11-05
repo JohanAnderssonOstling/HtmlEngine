@@ -1,11 +1,13 @@
 //! On-demand equation copying. Neither annotations nor converted LaTeX are cached.
 
+use super::ExportError;
 use mathema::{Format, convert};
 
 /// Convert MathML on demand, preferring an authored TeX annotation of the whole
 /// formula. Malformed source and unsupported conversion return an error.
-pub fn mathml_to_latex(markup: &str) -> Result<String, String> {
-    let document = roxmltree::Document::parse(markup).map_err(|error| error.to_string())?;
+pub(super) fn mathml_to_latex(markup: &str) -> Result<String, ExportError> {
+    let document =
+        roxmltree::Document::parse(markup).map_err(|error| ExportError::Conversion(error.into()))?;
     let root = document.root_element();
     // Only an annotation of the complete formula can replace conversion.
     // An annotation nested inside a subexpression describes that subtree.
@@ -37,7 +39,7 @@ pub fn mathml_to_latex(markup: &str) -> Result<String, String> {
             }
         }
     }
-    convert(markup, Format::MathML, Format::LaTeX).map_err(|error| error.to_string())
+    convert(markup, Format::MathML, Format::LaTeX).map_err(|error| ExportError::Conversion(error.into()))
 }
 
 #[cfg(test)]

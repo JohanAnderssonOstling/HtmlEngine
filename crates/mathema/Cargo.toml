@@ -1,0 +1,23 @@
+[package]
+license = "Apache-2.0"
+name = "skrift-mathema"
+version.workspace = true
+edition.workspace = true
+publish = ["crates-io"]
+description = "Bundled mathema formula conversion used by Skrift's equation export."
+repository.workspace = true
+homepage.workspace = true
+categories.workspace = true
+keywords.workspace = true
+include = ["src/**", "LICENSE-APACHE", "UPSTREAM.txt"]
+
+[lib]
+name = "mathema"
+
+[dependencies]
+html-dom = { version = "0.1.0", package = "skrift-dom", path = "../html-dom" }
+nom = "8"
+phf = { version = "0.14", features = ["macros"] }
+quick-xml = { workspace = true }
+smallvec = "1"
+thiserror = "2"

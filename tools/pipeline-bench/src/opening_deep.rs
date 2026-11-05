@@ -1,13 +1,17 @@
 use crate::opening::{style_details, summary};
 use crate::{Shaper, cpu_seconds, layout_fingerprint};
-use html::layout::{
-    LayoutConstraints,
-    profiling::{capture, capture_with_measurements, scope},
+#[cfg(test)]
+use html_pipeline::profiling;
+use html_pipeline::engine::LayoutConstraints;
+use html::{
+    ::{capture, capture_with_measurements, scope},
+
 };
-use html::pipeline::ResourceContext;
-use html::pipeline::{DocumentFactory, PipelineInputs, parse_document};
+use html_pipeline::ResourceContext;
+use html_pipeline::{DocumentFactory, PipelineInputs};
+use html_pipeline::parse_document;
 use html::resources::FileSystemProvider;
-use html::text::GlyphResourceStore;
+use html_pipeline::engine::GlyphResourceStore;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -34,13 +38,13 @@ pub(super) fn run(path: &str, case: &str, count: usize, inputs: &PipelineInputs)
     let mut measurements = BTreeMap::<String, Vec<Vec<BTreeMap<&str, usize>>>>::new();
     let constraints = LayoutConstraints::new(600.0, 16.0)
         .unwrap()
-        .with_text_composition_policy(inputs.layout.text_composition_policy);
+        .with_text_composition_policy(inputs.layout.text_composition_policy());
     let mut output = Value::Null;
     for iteration in 0..count + 3 {
         let mut factory = DocumentFactory::new();
         let factory_provider = FileSystemProvider;
         let factory_resources = ResourceContext::new(&factory_provider, (path).as_ref());
-        factory.set_reader_overrides(inputs.reader_overrides.layout_overrides());
+        factory.set_reader_overrides(reader_style::layout_overrides(&inputs.reader_overrides));
         factory.set_media_environment(inputs.style_environment.media);
         let cpu = cpu_seconds();
         let wall = Instant::now();
@@ -165,7 +169,7 @@ pub(super) fn run(path: &str, case: &str, count: usize, inputs: &PipelineInputs)
             output = json!({
                 "case": case, "path": path, "samples": count, "warmups": 3,
                 "source_bytes": source_bytes, "font_backend": "deterministic mock", "heap_instrumented": cfg!(feature="heap"),
-                "composition": format!("{:?}", inputs.layout.text_composition_policy),
+                "composition": format!("{:?}", inputs.layout.text_composition_policy()),
                 "glyphs": document.render_view(&resources).text().glyph_count(), "lines": document.render_view(&resources).text().line_count(),
                 "render_fingerprint": format!("{:016x}", layout_fingerprint(&document, &resources)),
                 "exclusive_times_partition_root": true,

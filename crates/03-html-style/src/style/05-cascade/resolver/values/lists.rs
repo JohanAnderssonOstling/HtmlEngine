@@ -1,4 +1,4 @@
-use super::*;
+use html_style_model::{ComputedStylesBuilder, StyleStringId};
 
 pub(in crate::style::cascade::resolver) fn map_list_style_position(
     pos: &lightningcss::properties::list::ListStylePosition,
@@ -9,35 +9,6 @@ pub(in crate::style::cascade::resolver) fn map_list_style_position(
         Lc::Inside => Out::Inside,
         Lc::Outside => Out::Outside,
     }
-}
-
-/// Map Lightning CSS `list-style-type` onto the renderer's exact supported
-/// set. Values requiring custom counter-style or marker-string rendering are
-/// kept out of computed state instead of being silently approximated.
-pub(in crate::style::cascade::resolver) fn map_list_style_type(
-    lst: &lightningcss::properties::list::ListStyleType,
-) -> Option<html_style_model::ListStyleType> {
-    use html_style_model::ListStyleType as Out;
-    use lightningcss::properties::list::{
-        CounterStyle, ListStyleType as Lc, PredefinedCounterStyle as P,
-    };
-    Some(match lst {
-        Lc::None => Out::None,
-        Lc::String(_) => return None,
-        Lc::CounterStyle(CounterStyle::Predefined(p)) => match p {
-            P::Disc => Out::Disc,
-            P::Circle => Out::Circle,
-            P::Square => Out::Square,
-            P::Decimal => Out::Decimal,
-            P::DecimalLeadingZero => Out::DecimalLeadingZero,
-            P::LowerAlpha | P::LowerLatin => Out::LowerAlpha,
-            P::UpperAlpha | P::UpperLatin => Out::UpperAlpha,
-            P::LowerRoman => Out::LowerRoman,
-            P::UpperRoman => Out::UpperRoman,
-            _ => return None,
-        },
-        Lc::CounterStyle(CounterStyle::Name(_) | CounterStyle::Symbols { .. }) => return None,
-    })
 }
 
 /// Intern the URL of a `list-style-image`. Gradients / `image-set()` / `none`

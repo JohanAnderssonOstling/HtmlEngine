@@ -11,6 +11,8 @@ use std::fmt;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct XmlParseError {
     offset: u64,
+    line: usize,
+    column: usize,
     message: String,
 }
 
@@ -18,6 +20,8 @@ impl XmlParseError {
     fn new(offset: u64, message: impl Into<String>) -> Self {
         Self {
             offset,
+            line: 1,
+            column: 1,
             message: message.into(),
         }
     }
@@ -29,21 +33,36 @@ impl XmlParseError {
     pub fn message(&self) -> &str {
         &self.message
     }
+
+    /// One-based line and character column in the decoded source.
+    pub fn line(&self) -> usize {
+        self.line
+    }
+
+    pub fn column(&self) -> usize {
+        self.column
+    }
 }
 
 impl fmt::Display for XmlParseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             formatter,
-            "XML parse error at byte {}: {}",
-            self.offset, self.message
+            "XML parse error at line {}, column {} (byte {}): {}",
+            self.line, self.column, self.offset, self.message
         )
     }
 }
 
 impl std::error::Error for XmlParseError {}
 pub fn parse_xml_document(xml: &str) -> Result<ParsedHtml, XmlParseError> {
-    let document = parse_xml_syntax_tree(xml)?;
+    let document = parse_xml_syntax_tree(xml).map_err(|mut error| {
+        let prefix = &xml.as_bytes()[..(error.offset as usize).min(xml.len())];
+        error.line = prefix.iter().filter(|&&byte| byte == b'\n').count() + 1;
+        let line_start = prefix.iter().rposition(|&byte| byte == b'\n').map_or(0, |index| index + 1);
+        error.column = prefix[line_start..].iter().filter(|&&byte| byte & 0xc0 != 0x80).count() + 1;
+        error
+    })?;
     Ok(ParsedHtml {
         document,
         syntax: MarkupSyntax::Xml,
@@ -79,17 +98,19 @@ fn parse_xml_syntax_tree(xml: &str) -> Result<HtmlSyntaxTree, XmlParseError> {
         let event = reader
             .read_event()
             .map_err(|error| xml_reader_error(&reader, error))?;
+        if let Event::Start(_) | Event::Empty(_) = &event
+            && elements.is_empty()
+        {
+            if root_seen {
+                return Err(XmlParseError::new(
+                    reader.buffer_position(),
+                    "an XML document must have exactly one root element",
+                ));
+            }
+            root_seen = true;
+        }
         match event {
             Event::Start(start) => {
-                if elements.is_empty() {
-                    if root_seen {
-                        return Err(XmlParseError::new(
-                            reader.buffer_position(),
-                            "an XML document must have exactly one root element",
-                        ));
-                    }
-                    root_seen = true;
-                }
                 elements.push(xml_syntax_element(
                     &reader,
                     &start,
@@ -98,15 +119,6 @@ fn parse_xml_syntax_tree(xml: &str) -> Result<HtmlSyntaxTree, XmlParseError> {
                 )?);
             }
             Event::Empty(start) => {
-                if elements.is_empty() {
-                    if root_seen {
-                        return Err(XmlParseError::new(
-                            reader.buffer_position(),
-                            "an XML document must have exactly one root element",
-                        ));
-                    }
-                    root_seen = true;
-                }
                 let element = xml_syntax_element(&reader, &start, version, xhtml_entities)?;
                 push_xml_node(&mut nodes, &mut elements, HtmlSyntaxNode::Element(element));
             }

@@ -1,10 +1,13 @@
 //! Per-line pseudo, overflow, and inline-strut preparation.
-use html_text::{whitespace_context_root, first_line_style_for_inline_root};
+use html_engine_model::shaping_contracts;
+use html_text::whitespace_context_root;
+use rustc_data_structures::fx::FxHashSet;
 
 use super::*;
+use crate::layout::LayoutEngine;
 
 pub(super) fn strut_for_inline_box(
-    engine: &crate::layout::LayoutEngine<'_, '_>,
+    engine: &LayoutEngine<'_, '_>,
     box_idx: usize,
 ) -> InlineBoxStrut {
     let style = engine.reader.style(box_idx);
@@ -12,15 +15,11 @@ pub(super) fn strut_for_inline_box(
     let line_height = if style.line_height_is_normal() && engine.reader.box_uses_ahem(box_idx) {
         font_size
     } else {
-        resolved_line_height(style)
+        style.resolved_line_height()
     };
-    let (font_ascent, font_descent) = engine
+    let (font_ascent, font_descent) = shaping_contracts::font_relative_metrics_line_box_extents(engine
         .reader
-        .font_metrics(box_idx)
-        .line_box_ratios()
-        .map_or((font_size * 0.8, font_size * 0.2), |(ascent, descent)| {
-            (font_size * ascent as f64, font_size * descent as f64)
-        });
+        .font_metrics(box_idx), font_size);
     let half_leading = (line_height - font_ascent - font_descent) * 0.5;
     InlineBoxStrut {
         box_idx,
@@ -32,38 +31,29 @@ pub(super) fn strut_for_inline_box(
 }
 
 pub(super) fn parent_font_content_extents(
-    engine: &crate::layout::LayoutEngine<'_, '_>,
+    engine: &LayoutEngine<'_, '_>,
     box_idx: usize,
 ) -> (f64, f64) {
     let parent_idx = engine.reader.get_parent(box_idx).unwrap_or(box_idx);
     let style = engine.reader.style(parent_idx);
     let font_size = style.font_size() as f64;
-    engine
+    shaping_contracts::font_relative_metrics_line_box_extents(engine
         .reader
-        .font_metrics(parent_idx)
-        .line_box_ratios()
-        .map_or((font_size * 0.8, font_size * 0.2), |(ascent, descent)| {
-            (font_size * ascent as f64, font_size * descent as f64)
-        })
+        .font_metrics(parent_idx), font_size)
 }
 
 pub(super) fn inline_box_struts(
-    engine: &crate::layout::LayoutEngine<'_, '_>,
+    engine: &LayoutEngine<'_, '_>,
     container_box_idx: usize,
-    tokens: &[InlineToken],
-    runs: &[InlineTokenMetrics],
+    tokens: TokenSpan<'_>,
+    metrics: MetricsView<'_>,
 ) -> Vec<InlineBoxStrut> {
     let mut struts = Vec::new();
-    for token in tokens {
-        if matches!(
-            token.kind(),
-            InlineTokenKind::Opportunity
-                | InlineTokenKind::FloatAnchor { .. }
-                | InlineTokenKind::AbsoluteAnchor { .. }
-        ) {
-            continue;
-        }
-        let owner = token.run_metrics(runs).owner_box_idx;
+    let all_tokens = tokens;
+    let all_metrics = metrics;
+    let mut owners_with_boxes = None;
+    for (tokens, metrics) in metrics.chunks(tokens) {
+        let owner = metrics.owner_box_idx;
         if owner == u32::MAX {
             continue;
         }
@@ -74,27 +64,48 @@ pub(super) fn inline_box_struts(
         if owner as usize == container_box_idx {
             continue;
         }
-        // The token metrics are the direct owner's strut (or the replaced
-        // element's own geometry). Explicit struts fill only the otherwise
-        // missing non-replaced inline ancestors.
-        let mut current = engine.reader.get_parent(owner as usize);
-        while let Some(box_idx) = current {
+        let start = if metrics.contributes_line_metrics {
+            if !tokens
+                .metadata_iter()
+                .any(|token| token_contributes_line_metrics(&token, metrics))
+            {
+                continue;
+            }
+            // Glyph boxes supply the direct owner's metrics; explicit struts
+            // fill only the otherwise missing inline ancestors.
+            engine.reader.get_parent(owner as usize)
+        } else {
+            // A control-only inline still has its CSS font strut. A sibling
+            // glyph box or boundary already supplies that owner's metrics.
+            // Build this lookup only for controls inside non-root inlines.
+            let owners = owners_with_boxes.get_or_insert_with(|| {
+                all_metrics
+                    .chunks(all_tokens)
+                    .filter_map(|(tokens, metrics)| {
+                        tokens
+                            .metadata_iter()
+                            .any(|token| token_contributes_line_metrics(&token, metrics))
+                            .then_some(metrics.owner_box_idx)
+                    })
+                    .collect::<FxHashSet<_>>()
+            });
+            if owners.contains(&owner) {
+                continue;
+            }
+            Some(owner as usize)
+        };
+        for box_idx in inline_ancestors(&engine.reader, start) {
             if box_idx == container_box_idx {
                 break;
             }
-            if !matches!(
-                engine.reader.box_layout_mode(box_idx),
-                Some(LayoutMode::Inline(_))
-            ) {
-                break;
-            }
-            if !struts
+            if struts
                 .iter()
                 .any(|strut: &InlineBoxStrut| strut.box_idx == box_idx)
             {
-                struts.push(strut_for_inline_box(engine, box_idx));
+                // An earlier walk already collected this ancestor and its parents.
+                break;
             }
-            current = engine.reader.get_parent(box_idx);
+            struts.push(strut_for_inline_box(engine, box_idx));
         }
     }
     struts
@@ -104,7 +115,7 @@ pub(super) fn inline_box_struts(
 /// font strut. Descendant text can enlarge it, but a descendant with
 /// `font-size: 0` cannot remove the parent's normal line height.
 pub(super) fn include_container_strut(
-    engine: &crate::layout::LayoutEngine<'_, '_>,
+    engine: &LayoutEngine<'_, '_>,
     container_box_idx: usize,
     first_line_height: Option<f64>,
     summary: &mut TokenSpanSummary,
@@ -115,40 +126,35 @@ pub(super) fn include_container_strut(
         if style.line_height_is_normal() && engine.reader.box_uses_ahem(container_box_idx) {
             font_size
         } else {
-            resolved_line_height(style)
+            style.resolved_line_height()
         }
     });
     if !summary.has_baseline_relative_image && summary.line_height + f64::EPSILON >= line_height {
         return;
     }
-    let ascent = engine
+    let (ascent, descent) = shaping_contracts::font_relative_metrics_line_box_extents(engine
         .reader
-        .font_metrics(container_box_idx)
-        .ascent_ratio()
-        .map_or(font_size * 0.8, |ratio| font_size * ratio as f64);
-    let descent = font_size - ascent;
-    let half_leading = (line_height - font_size) / 2.0;
+        .font_metrics(container_box_idx), font_size);
+    let half_leading = (line_height - ascent - descent) / 2.0;
     let max_ascent = summary.baseline.max(ascent + half_leading);
     let max_descent = (summary.line_height - summary.baseline).max(descent + half_leading);
     (summary.line_height, summary.baseline) = compute_baseline(max_ascent, max_descent, 0.0);
 }
 
-pub(super) fn first_line_color(
-    engine: &crate::layout::LayoutEngine<'_, '_>,
+pub(in crate::layout::inline) fn first_line_color(
+    engine: &LayoutEngine<'_, '_>,
     container_box_idx: usize,
 ) -> Option<u32> {
     let styles = engine.reader.styles();
     let tree = engine.reader.layout_tree();
     let root = whitespace_context_root(tree, container_box_idx);
-    first_line_style_for_inline_root(
-        engine.reader.document(),
-        styles,
-        tree,
-        engine.text.content(),
-        root,
-    )
-    .and_then(|style| styles.view(style))
-    .map(|style| style.color())
+    engine
+        .text
+        .content()
+        .pseudo_styles()
+        .first_line(root)
+        .and_then(|style| styles.view(style))
+        .map(|style| style.color())
 }
 
 /// Returns pseudo-element line heights for the element that establishes
@@ -156,37 +162,23 @@ pub(super) fn first_line_color(
 /// have no DOM node, so pseudo-elements on their container cannot leak into
 /// the anonymous item's text.
 pub(in crate::layout::inline) fn pseudo_line_heights(
-    engine: &crate::layout::LayoutEngine<'_, '_>,
+    engine: &LayoutEngine<'_, '_>,
     container_box_idx: usize,
 ) -> (Option<f64>, Option<f64>) {
-    let styles = engine.reader.styles();
     let tree = engine.reader.layout_tree();
     let root = whitespace_context_root(tree, container_box_idx);
-    let resolve = |style: html_style_model::StyleView<'_>| {
-        if style.line_height_is_normal() {
-            style.font_size() as f64 * 1.2
-        } else {
-            style.line_height().max(0.0) as f64
-        }
-    };
-    let line = first_line_style_for_inline_root(
-        engine.reader.document(),
-        styles,
-        tree,
-        engine.text.content(),
-        root,
-    )
-    .and_then(|style| styles.view(style))
-    .map(resolve);
-    let letter = html_text::first_letter_style_for_inline_root(
-        engine.reader.document(),
-        styles,
-        tree,
-        engine.text.content(),
-        root,
-    )
-    .and_then(|style| styles.view(style))
-    .map(resolve);
+    let line = engine
+        .text
+        .content()
+        .pseudo_styles()
+        .first_line(root)
+        .map(|style| engine.reader.used_style(style).resolved_line_height());
+    let letter = engine
+        .text
+        .content()
+        .pseudo_styles()
+        .first_letter(root)
+        .map(|style| engine.reader.used_style(style).resolved_line_height());
     (line, letter)
 }
 
@@ -194,86 +186,100 @@ pub(in crate::layout::inline) fn pseudo_line_heights(
 /// stage separately refines width-affecting `::first-line` font and spacing
 /// properties, while this pass establishes the final line box strut.
 pub(super) fn apply_first_line_pseudo_styles<'b>(
-    engine: &crate::layout::LayoutEngine<'_, '_>,
-    span: &'b [InlineToken],
+    engine: &LayoutEngine<'_, '_>,
+    span: TokenSpan<'b>,
     runs: &'b [InlineTokenMetrics],
     first_line_height: Option<f64>,
     first_letter_height: Option<f64>,
     storage: &'b mut Vec<InlineToken>,
     run_storage: &'b mut Vec<InlineTokenMetrics>,
-) -> (&'b [InlineToken], &'b [InlineTokenMetrics]) {
+) -> (TokenSpan<'b>, &'b [InlineTokenMetrics]) {
     if first_line_height.is_none() && first_letter_height.is_none() {
         return (span, runs);
     }
 
-    storage.extend_from_slice(span);
+    let first_line_normal = span.metrics_view(runs).chunks(span).next()
+        .filter(|(_, metrics)| metrics.owner_box_idx != u32::MAX)
+        .map(|(_, metrics)| whitespace_context_root(engine.reader.layout_tree(), metrics.owner_box_idx as usize))
+        .and_then(|root| engine.text.content().pseudo_styles().first_line(root))
+        .is_some_and(|indices| engine.reader.used_style(indices).line_height_is_normal());
+
+    // A uniform text line only needs a new metrics record. Its glyph IDs,
+    // flags and widths still belong to the canonical paragraph columns.
+    if let Some(height) = first_line_height
+        && first_letter_height.is_none()
+        && !span.is_empty()
+        && let MetricsView::Uniform(metrics) = span.metrics_view(runs)
+        && span.metadata_iter().all(|token| {
+            matches!(
+                token.kind(),
+                InlineTokenKind::Glyph { .. } | InlineTokenKind::Ellipsis { .. }
+            )
+        })
+    {
+        run_storage.push(metrics_with_line_height(engine, *metrics, height, first_line_normal));
+        return (span, run_storage.as_slice());
+    }
+
+    span.append_to(storage);
     run_storage.extend_from_slice(runs);
     if let Some(height) = first_line_height {
+        let mut previous_metrics = None;
         for token in storage.iter_mut().filter(|token| {
             matches!(
                 token.kind(),
                 InlineTokenKind::Glyph { .. } | InlineTokenKind::Ellipsis { .. }
             )
         }) {
-            set_token_line_height(engine, token, run_storage, height);
-        }
-    }
-    if let Some(height) = first_letter_height {
-        let mut selected_core = false;
-        let mut selection_started = false;
-        for token in storage.iter_mut() {
-            let character = match token.kind() {
-                InlineTokenKind::Glyph { glyph_idx } => {
-                    let glyph = engine.text.glyph_at(glyph_idx as usize).unwrap_or_default();
-                    engine.text.glyph_metric(glyph).ch()
-                }
-                InlineTokenKind::Ellipsis { .. } => '\u{2026}',
-                InlineTokenKind::InlineBoundary { .. } | InlineTokenKind::Opportunity => continue,
-                _ if !selection_started => continue,
-                _ => break,
-            };
-            if !selection_started && character.is_whitespace() {
-                continue;
-            }
-            let qualifying_punctuation = is_first_letter_punctuation(character);
-            let selected = if !selection_started {
-                selection_started = true;
-                if !qualifying_punctuation {
-                    selected_core = true;
-                }
-                true
-            } else if !selected_core && qualifying_punctuation {
-                true
-            } else if !selected_core {
-                selected_core = true;
-                true
+            let source = token.run_idx();
+            if let Some((previous, rewritten)) = previous_metrics
+                && source == previous
+            {
+                token.set_run_idx(rewritten);
             } else {
-                qualifying_punctuation || character.is_mark()
-            };
-            if !selected {
-                break;
+                let rewritten = set_token_line_height(engine, token, run_storage, height, first_line_normal);
+                previous_metrics = Some((source, rewritten));
             }
-            set_token_line_height(engine, token, run_storage, height);
         }
     }
-    (storage.as_slice(), run_storage.as_slice())
-}
-
-fn is_first_letter_punctuation(character: char) -> bool {
-    character.is_punctuation_open()
-        || character.is_punctuation_close()
-        || character.is_punctuation_initial_quote()
-        || character.is_punctuation_final_quote()
-        || character.is_punctuation_other()
+    if first_letter_height.is_some() {
+        for token in storage.iter_mut() {
+            let InlineTokenKind::Glyph { glyph_idx } = token.kind() else {
+                continue;
+            };
+            if let Some(style) = engine.text.first_letter_style(glyph_idx) {
+                let style = engine.reader.used_style(style);
+                set_token_line_height(engine, token, run_storage, style.resolved_line_height(), style.line_height_is_normal());
+            }
+        }
+    }
+    (storage.as_slice().into(), run_storage.as_slice())
 }
 
 fn set_token_line_height(
-    engine: &crate::layout::LayoutEngine<'_, '_>,
+    engine: &LayoutEngine<'_, '_>,
     token: &mut InlineToken,
     runs: &mut Vec<InlineTokenMetrics>,
     height: f64,
-) {
-    let mut metrics = *token.run_metrics(runs);
+    normal: bool,
+) -> u32 {
+    let metrics = metrics_with_line_height(engine, *token.run_metrics(runs), height, normal);
+    let run_idx =
+        u32::try_from(runs.len()).expect("inline pseudo run-metrics arena capacity exhausted");
+    runs.push(metrics);
+    token.set_run_idx(run_idx);
+    run_idx
+}
+
+fn metrics_with_line_height(
+    engine: &LayoutEngine<'_, '_>,
+    mut metrics: InlineTokenMetrics,
+    height: f64,
+    normal: bool,
+) -> InlineTokenMetrics {
+    // A normal pseudo line height must not discard the actual fallback
+    // font's larger layout bounds already established during tokenization.
+    let height = if normal { height.max(f64::from(metrics.line_height)) } else { height };
     metrics.line_height = height as f32;
     if metrics.owner_box_idx != u32::MAX {
         metrics.vertical_align = InlineVerticalAlign::resolve(
@@ -282,10 +288,7 @@ fn set_token_line_height(
             metrics.font_size,
         );
     }
-    let run_idx =
-        u32::try_from(runs.len()).expect("inline pseudo run-metrics arena capacity exhausted");
-    runs.push(metrics);
-    token.set_run_idx(run_idx);
+    metrics
 }
 
 /// Applies the block container's inline overflow policy to one already
@@ -293,20 +296,23 @@ fn set_token_line_height(
 /// path; storage is populated only when a line actually overflows.
 pub(super) fn apply_inline_overflow<'b>(
     reader: &LayoutReader<'_>,
-    span: &'b [InlineToken],
+    span: TokenSpan<'b>,
     runs: &[InlineTokenMetrics],
     tab_origin: f64,
     line_width_limit: f64,
     overflow: InlineOverflow,
     storage: &'b mut Vec<InlineToken>,
-) -> &'b [InlineToken] {
+) -> TokenSpan<'b> {
     if !overflow.clips {
         return span;
     }
 
+    let metrics = span.metrics_view(runs);
+    let widths = span.widths();
     let mut full_width = 0.0;
-    for token in span {
-        full_width += token.advance_at(reader, runs, tab_origin + full_width);
+    for (index, (token, record)) in metrics.iter(span).enumerate() {
+        full_width +=
+            token.advance_with_metrics(widths.at(index), reader, record, tab_origin + full_width);
     }
     if full_width <= line_width_limit {
         return span;
@@ -329,8 +335,9 @@ pub(super) fn apply_inline_overflow<'b>(
     };
     let mut width = 0.0;
     let mut end = 0usize;
-    for (idx, token) in span.iter().enumerate() {
-        let advance = token.advance_at(reader, runs, tab_origin + width);
+    for (idx, (token, record)) in metrics.iter(span).enumerate() {
+        let advance =
+            token.advance_with_metrics(widths.at(idx), reader, record, tab_origin + width);
         if width + advance > prefix_limit {
             break;
         }
@@ -338,9 +345,10 @@ pub(super) fn apply_inline_overflow<'b>(
         end = idx + 1;
     }
 
-    storage.extend_from_slice(&span[..end]);
+    storage.reserve(end + usize::from(show_marker));
+    span.slice(..end).append_to(storage);
     if show_marker {
         storage.push(marker);
     }
-    storage.as_slice()
+    storage.as_slice().into()
 }

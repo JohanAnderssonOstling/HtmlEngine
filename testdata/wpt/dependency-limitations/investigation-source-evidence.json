@@ -1,0 +1,227 @@
+{
+  "dependencies": {
+    "lightningcss": "1.0.0-alpha.72",
+    "parcel_selectors": "0.28.3",
+    "taffy": "0.13.0",
+    "gpui": "local GPUI-Fork, declared 0.2.2; not stock upstream GPUI"
+  },
+  "packages": [
+    {
+      "package": "lightningcss-1.0.0-alpha.72",
+      "archive_sha256": "d31b760f96e8fdfe1d0c295e4bf76c503d6f15d2d470d53bd8cd1f7aa8c7d934",
+      "all_inspected_files_match_archive": true
+    },
+    {
+      "package": "parcel_selectors-0.28.3",
+      "archive_sha256": "d05f71e01edca03d245ab0a9f7ce13a974ceb79baaae8faf2ba0b11de6b90913",
+      "all_inspected_files_match_archive": true
+    }
+  ],
+  "sources": [
+    {
+      "package": "lightningcss-1.0.0-alpha.72",
+      "file": "src/selector.rs",
+      "sha256": "c96c1ad8df9d068f3caa7b54664fb28c3b622afe44917f72791a8007ff495426",
+      "matches_packaged_archive": true,
+      "anchors": [
+        {
+          "line": 1325,
+          "symbol": "valid_after_slotted",
+          "finding": "Only before, after, marker, placeholder and file-selector-button are allowed after slotted; rejected chains produce no typed selector AST."
+        }
+      ]
+    },
+    {
+      "package": "lightningcss-1.0.0-alpha.72",
+      "file": "src/values/color.rs",
+      "sha256": "6ce11dc66e07fb894f27dea0691d9cf92bead0d5d2a60ac93844e9455cca4383",
+      "matches_packaged_archive": true,
+      "anchors": [
+        {
+          "line": 250,
+          "symbol": "ColorSpaceName",
+          "finding": "Interpolation spaces exclude display-p3, a98-rgb, prophoto-rgb and rec2020."
+        },
+        {
+          "line": 1106,
+          "symbol": "parse_color_function",
+          "finding": "No contrast-color or color-layers branch; relative colors, alpha, light-dark and color-mix are present."
+        },
+        {
+          "line": 1319,
+          "symbol": "parse_predefined_relative",
+          "finding": "Predefined color spaces omit display-p3-linear."
+        },
+        {
+          "line": 3481,
+          "symbol": "CssColor::interpolate",
+          "finding": "Eager conversion requires concrete colors; currentColor and system colors cannot be interpolated here."
+        }
+      ]
+    },
+    {
+      "package": "lightningcss-1.0.0-alpha.72",
+      "file": "src/values/calc.rs",
+      "sha256": "6960b3676a4d4025eb8998feb6b557c1513c24c0b9eba2d796f103f91524f82c",
+      "matches_packaged_archive": true,
+      "anchors": [
+        {
+          "line": 33,
+          "symbol": "MathFunction",
+          "finding": "Typed enum has existing arithmetic functions but no random, calc-size or anchor functions."
+        },
+        {
+          "line": 283,
+          "symbol": "CalcConstant",
+          "finding": "Infinity and NaN are supported; non-finite color failures do not prove missing constant grammar."
+        },
+        {
+          "line": 376,
+          "symbol": "clamp parsing",
+          "finding": "Bounds are parsed as sums, without a none-boundary branch."
+        },
+        {
+          "line": 540,
+          "symbol": "parse_sum",
+          "finding": "Whitespace followed by a comma can produce an error instead of ending the sum."
+        }
+      ]
+    },
+    {
+      "package": "lightningcss-1.0.0-alpha.72",
+      "file": "src/values/number.rs",
+      "sha256": "edf3f53558f566abf11640c7d760edbc48265cde759843bb4239fd6b4892afc8",
+      "matches_packaged_archive": true,
+      "anchors": [
+        {
+          "line": 17,
+          "symbol": "CSSNumber::parse",
+          "finding": "Uses native Calc parsing and resolves numeric math."
+        },
+        {
+          "line": 116,
+          "symbol": "CSSInteger::parse",
+          "finding": "Direct integer parsing; calc handling is a TODO."
+        }
+      ]
+    },
+    {
+      "package": "lightningcss-1.0.0-alpha.72",
+      "file": "src/properties/grid.rs",
+      "sha256": "ae2de3ae770534a02e54115a5bcbdea60b3fb77ff5123afa5c412d289487ee55",
+      "matches_packaged_archive": true,
+      "anchors": [
+        {
+          "line": 36,
+          "symbol": "TrackSizing",
+          "finding": "Typed representation has None and TrackList, without Subgrid."
+        }
+      ]
+    },
+    {
+      "package": "lightningcss-1.0.0-alpha.72",
+      "file": "src/properties/text.rs",
+      "sha256": "f3ba049064e990f2f863103d797555cf850a5e9dc490fd2229d37e017f9d5609",
+      "matches_packaged_archive": true,
+      "anchors": [
+        {
+          "line": 221,
+          "symbol": "WhiteSpace",
+          "finding": "Legacy keyword enum does not represent the modern multi-component shorthand."
+        }
+      ]
+    },
+    {
+      "package": "lightningcss-1.0.0-alpha.72",
+      "file": "src/properties/flex.rs",
+      "sha256": "d7376fa39fb112386ca62364d0a43052b218200815345c041390b2e22b3dcb36",
+      "matches_packaged_archive": true,
+      "anchors": [
+        {
+          "line": 135,
+          "symbol": "FlexBasis declaration",
+          "finding": "FlexBasis uses LengthPercentageOrAuto rather than the broader intrinsic Size model."
+        }
+      ]
+    },
+    {
+      "package": "lightningcss-1.0.0-alpha.72",
+      "file": "src/properties/size.rs",
+      "sha256": "a1f4b7114f35aa84c01d036fb7b1788438df4ee876714fc6e665d0930fee90cd",
+      "matches_packaged_archive": true,
+      "anchors": [
+        {
+          "line": 36,
+          "symbol": "Size",
+          "finding": "Existing native sizing parser provides intrinsic values that the flex-basis parser rejects."
+        }
+      ]
+    },
+    {
+      "package": "parcel_selectors-0.28.3",
+      "file": "parser.rs",
+      "sha256": "ee0bbfcc4e8533175c8f1836ba6ba2e2f6d645b4b99f4778d147a0ff82f27608",
+      "matches_packaged_archive": true,
+      "anchors": [
+        {
+          "line": 292,
+          "symbol": "is_and_where_error_recovery",
+          "finding": "Default is IgnoreInvalidSelector."
+        },
+        {
+          "line": 2832,
+          "symbol": "parse_has",
+          "finding": "Uses is/where recovery and stores only recovered Has components."
+        },
+        {
+          "line": 3061,
+          "symbol": "AFTER_SLOTTED validation",
+          "finding": "Rejects when valid_after_slotted is false."
+        }
+      ]
+    },
+    {
+      "package": "working-tree engine",
+      "file": "crates/03-html-style/src/style/05-cascade/resolver/properties/generated.rs",
+      "sha256": "7400833c4825f01b4a867716a8b70807e8ab6fde3a1fe3681d12a98b84cdef87",
+      "anchors": [
+        {
+          "line": 12,
+          "symbol": "parse_generated_content",
+          "finding": "Existing native-token renderer conversion; accepts a subset of valid syntax and is not yet a syntax validator."
+        },
+        {
+          "line": 117,
+          "symbol": "parse_counter_directives",
+          "finding": "Existing native-token counter conversion; strictness and reserved identifiers need review."
+        }
+      ]
+    }
+  ],
+  "probe": {
+    "source_origin": "html-wpt-css-survey/probe.rs",
+    "source_sha256": "f51263d560e7feb03b2a20b29bbfeba4b95ea9e251f497bcdb9dde7cd676a3e9",
+    "binary_sha256": "6c6f3fe9b2f5bf03007c2c870df5d8631dd898a71fa5d56f907722f96d6f8e8b",
+    "implementation": "Existing diagnostic source recompiled unchanged; no Rust diagnostic code added.",
+    "dependency_bundle": {
+      "lightningcss": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/gpui/target/release/deps/liblightningcss-acb6a64ded835176.rlib",
+      "serde_json": "/home/johan/Hem/Programmering/RustroverProjects/HtmlEngine/tools/embed-bench/gpui/target/release/deps/libserde_json-01cd4e48005187da.rlib",
+      "source": "/home/johan/.cache/html-wpt-css-survey/probe.rs",
+      "compiler_temporary_files": "/home/johan/.cache/html-wpt-dependency-investigation/compiler-tmp"
+    },
+    "fresh_observations": 2113,
+    "followup_observations": 88,
+    "alternate_native_parser_observations": 35
+  },
+  "equality_methods": {
+    "property_collisions": "Native Property PartialEq on distinct value/compare strings.",
+    "has_recovery": "Identical native stylesheet AST debug dumps for distinct selectors, plus source inspection of forgiving recovery; not Property PartialEq."
+  },
+  "specification_references": [
+    "https://www.w3.org/TR/css-values-4/#calc-range",
+    "https://drafts.csswg.org/selectors/#relational",
+    "https://drafts.csswg.org/css-view-transitions-1/#pseudo-elements",
+    "https://drafts.csswg.org/css-color-5/#color-mix",
+    "https://drafts.csswg.org/css-pseudo-4/#tree-abiding"
+  ]
+}

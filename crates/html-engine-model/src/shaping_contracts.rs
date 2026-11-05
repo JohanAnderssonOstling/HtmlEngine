@@ -1,12 +1,19 @@
-//! Renderer-neutral shaping contracts and validated font metrics.
+//! Renderer-neutral shaping contracts and measured font metrics.
 
 use crate::*;
+use crate::caret_positions::CaretStorage;
 use html_dom::MemoryUsageReport;
-use std::sync::atomic::{AtomicU64, Ordering};
+use html_style_model::{
+    ComputedStyles, FontFace, StyleIndices, StyleView, TextSpacing, UsedStyleView,
+};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 /// Backend-owned immutable shaped-line identifier. It is only meaningful for
 /// the `GlyphShaper` instance that produced it.
-pub type TextRunId = u32;
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct TextRunId(pub u32);
 
 /// Renderer-neutral geometry for a styled logical text run.
 ///
@@ -15,162 +22,55 @@ pub type TextRunId = u32;
 /// the only boundaries at which layout may split the run.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ShapedTextRun {
-    pub advances: Arc<[f32]>,
+    advances: Arc<[f32]>,
     cluster_boundaries: Arc<[bool]>,
-    backend_run: Option<TextRunId>,
-    caret_stops: Option<Arc<[f32]>>,
+    native: Option<NativeRunGeometry>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct NativeRunGeometry {
+    run: TextRunId,
+    caret_stops: CaretPositions,
     ascent: f32,
 }
 
 impl ShapedTextRun {
-    pub fn new(advances: Arc<[f32]>, cluster_boundaries: Arc<[bool]>) -> Option<Self> {
-        if cluster_boundaries.len() != advances.len().checked_add(1)?
-            || !cluster_boundaries.first().copied().unwrap_or(false)
-            || !cluster_boundaries.last().copied().unwrap_or(false)
-            || advances
-                .iter()
-                .any(|advance| !advance.is_finite() || *advance < 0.0)
-        {
-            return None;
-        }
-        Some(Self {
-            advances,
-            cluster_boundaries,
-            backend_run: None,
-            caret_stops: None,
-            ascent: 0.0,
-        })
-    }
 
-    pub fn with_backend_run(
-        advances: Arc<[f32]>,
-        cluster_boundaries: Arc<[bool]>,
-        backend_run: TextRunId,
-        caret_stops: Arc<[f32]>,
-        ascent: f32,
-    ) -> Option<Self> {
-        let run = Self::new(advances, cluster_boundaries)?;
-        (caret_stops.len() == run.advances.len() + 1
-            && caret_stops.iter().all(|stop| stop.is_finite())
-            && ascent.is_finite())
-        .then_some(Self {
-            backend_run: Some(backend_run),
-            caret_stops: Some(caret_stops),
-            ascent,
-            ..run
-        })
-    }
-
-    pub fn advances(&self) -> &[f32] {
-        &self.advances
-    }
-
-    /// Share validated geometry with resource ledgers and layout without
+    /// Share geometry with resource ledgers and layout without
     /// copying character arrays at adapter boundaries.
-    pub fn shared_advances(&self) -> Arc<[f32]> {
+    pub(crate) fn shared_advances(&self) -> Arc<[f32]> {
         self.advances.clone()
     }
 
-    pub fn cluster_boundaries(&self) -> &[bool] {
-        &self.cluster_boundaries
-    }
-
-    /// Apply range-local CSS spacing to both layout widths and native caret
-    /// positions. Backend cache geometry remains unchanged.
-    pub fn apply_spacing(&mut self, deltas: &[f32], right_to_left: bool) {
-        assert_eq!(deltas.len(), self.advances.len());
-        if !deltas.iter().any(|delta| *delta != 0.0) {
-            return;
-        }
-        for (advance, delta) in Arc::make_mut(&mut self.advances).iter_mut().zip(deltas) {
-            *advance += *delta;
-        }
-        if let Some(stops) = &mut self.caret_stops {
-            let mut cumulative = 0.0;
-            for (offset, stop) in Arc::make_mut(stops).iter_mut().enumerate() {
-                *stop += if right_to_left {
-                    -cumulative
-                } else {
-                    cumulative
-                };
-                if let Some(delta) = deltas.get(offset) {
-                    cumulative += delta;
-                }
-            }
-        }
-    }
-
-    pub fn preserve_graphemes(&mut self, text: &str) {
-        profile_scope!("shape.preserve_graphemes");
-        if text.is_ascii() && !text.as_bytes().contains(&b'\r') {
-            return;
-        }
-        let graphemes = super::bidi::grapheme_boundaries(text, self.advances.len());
-        if self
-            .cluster_boundaries
-            .iter()
-            .zip(graphemes.iter())
-            .any(|(&native, &grapheme)| native && !grapheme)
-        {
-            for (native, &grapheme) in Arc::make_mut(&mut self.cluster_boundaries)
-                .iter_mut()
-                .zip(graphemes.iter())
-            {
-                *native &= grapheme;
-            }
-        }
-    }
-
-    pub fn backend_run(&self) -> Option<TextRunId> {
-        self.backend_run
-    }
-
-    pub fn caret_stops(&self) -> Option<&[f32]> {
-        self.caret_stops.as_deref()
-    }
-
-    pub fn ascent(&self) -> f32 {
-        self.ascent
-    }
 }
 
-/// A request to measure one already-normalized, single-style logical run.
+/// Font extents measured from the faces that actually supplied each character.
+#[derive(Clone, Debug)]
+pub enum RunFontMetrics {
+    Uniform(FontMetrics),
+    PerCharacter(Arc<[FontMetrics]>),
+}
+
+/// A backend run result. The engine owns registration and layout
+/// glyph IDs; native paint handles belong to the backend's resource generation.
+#[derive(Clone, Debug)]
+pub struct ShapedRun {
+    geometry: ShapedTextRun,
+    paint: Option<RunPaint>,
+}
+
+#[derive(Clone, Debug)]
+struct RunPaint {
+    first_handle: GlyphHandle,
+    metrics: RunFontMetrics,
+}
+
+/// A request to shape one already-normalized, single-style logical run.
 /// CSS values have been resolved before this reaches the renderer backend.
 pub struct TextRunShapeRequest<'a> {
     text: &'a str,
-    style: TextStyleSpan<'a>,
+    style: ShapingStyle<'a>,
     paint_colors: Option<&'a [u32]>,
-}
-
-impl<'a> TextRunShapeRequest<'a> {
-    pub fn new(text: &'a str, style: TextStyleSpan<'a>) -> Option<Self> {
-        (style.byte_range() == (0..text.len()) && !text.is_empty()).then_some(Self {
-            text,
-            style,
-            paint_colors: None,
-        })
-    }
-
-    /// Attach paint colors without turning them into shaping boundaries.
-    /// There is one color per Unicode scalar value in `text`.
-    pub fn with_paint_colors(mut self, paint_colors: &'a [u32]) -> Option<Self> {
-        (paint_colors.len() == self.text.chars().count()).then(|| {
-            self.paint_colors = Some(paint_colors);
-            self
-        })
-    }
-
-    pub fn text(&self) -> &'a str {
-        self.text
-    }
-
-    pub fn style(&self) -> &TextStyleSpan<'a> {
-        &self.style
-    }
-
-    pub fn paint_colors(&self) -> Option<&'a [u32]> {
-        self.paint_colors
-    }
 }
 
 #[derive(Debug)]
@@ -225,12 +125,13 @@ impl ShapedTextGeometry {
 
     pub(crate) fn native_run(&self, range: &TextGeometryRange) -> Option<NativeRunView<'_>> {
         let run = self.runs[range.run].as_ref().expect("live geometry run");
+        let native = run.geometry.native.as_ref()?;
         Some(NativeRunView {
             source_range: range.source.clone(),
             run_offset: range.offset as u32,
-            backend_run: run.geometry.backend_run()?,
-            caret_stops: run.geometry.caret_stops()?,
-            ascent: run.geometry.ascent(),
+            backend_run: native.run,
+            caret_stops: &native.caret_stops,
+            ascent: native.ascent,
             placement_required: run.placement_required,
         })
     }
@@ -368,25 +269,34 @@ impl ShapedTextGeometry {
     /// Store a run once. Discontiguous DOM spans identify its slices by run ID
     /// and offset, and native paint queries borrow the same geometry.
     pub fn push_run(&mut self, indices: &[u32], geometry: ShapedTextRun, placement_required: bool) {
-        if indices.is_empty() {
+        self.push_run_iter(indices.iter().copied(), geometry, placement_required);
+    }
+
+    /// Store streamed source indices without an intermediate index buffer.
+    pub fn push_run_iter(
+        &mut self,
+        indices: impl Iterator<Item = u32>,
+        geometry: ShapedTextRun,
+        placement_required: bool,
+    ) {
+        let mut indices = indices.enumerate().peekable();
+        if indices.peek().is_none() {
             return;
         }
         let run = self.store_run(geometry, placement_required, 0);
         let mut range_count = 0;
-        let mut start = 0;
-        while start < indices.len() {
+        while let Some((offset, start)) = indices.next() {
             let mut end = start + 1;
-            while end < indices.len() && indices[end] == indices[end - 1] + 1 {
+            while indices.next_if(|&(_, index)| index == end).is_some() {
                 end += 1;
             }
             self.ranges.push(TextGeometryRange {
-                source: indices[start]..indices[end - 1] + 1,
-                offset: start,
+                source: start..end,
+                offset,
                 run,
                 apply_start_boundary: true,
             });
             range_count += 1;
-            start = end;
         }
         self.runs[run].as_mut().unwrap().range_count = range_count;
     }
@@ -398,6 +308,18 @@ impl ShapedTextGeometry {
     pub fn replace_range(
         &mut self,
         range: Range<u32>,
+        geometry: ShapedTextRun,
+        placement_required: bool,
+    ) {
+        self.replace_indexed_range(range.clone(), range, geometry, placement_required);
+    }
+
+    /// Replace a source range with geometry whose native character positions
+    /// can omit source-only controls such as conditional hyphens.
+    pub fn replace_indexed_range(
+        &mut self,
+        range: Range<u32>,
+        indices: impl Iterator<Item = u32>,
         geometry: ShapedTextRun,
         placement_required: bool,
     ) {
@@ -434,14 +356,9 @@ impl ShapedTextGeometry {
                 });
             }
         }
-        ranges.push(TextGeometryRange {
-            source: range,
-            offset: 0,
-            run: self.store_run(geometry, placement_required, 1),
-            apply_start_boundary: true,
-        });
-        ranges.sort_by_key(|run| run.source.start);
         self.ranges = ranges;
+        self.push_run_iter(indices, geometry, placement_required);
+        self.finish_runs();
     }
 
     #[cfg(any(test, feature = "testing"))]
@@ -474,11 +391,9 @@ impl ShapedTextGeometry {
                 .map(|run| {
                     allocation_bytes(&run.geometry.advances, seen)
                         + allocation_bytes(&run.geometry.cluster_boundaries, seen)
-                        + run
-                            .geometry
-                            .caret_stops
-                            .as_ref()
-                            .map_or(0, |stops| allocation_bytes(stops, seen))
+                        + shaped_text_run_caret_stops(&run
+                            .geometry)
+                            .map_or(0, |stops| stops.memory_usage_bytes_with_shared(seen))
                 })
                 .sum::<usize>()
     }
@@ -493,18 +408,18 @@ impl ShapedTextGeometry {
     pub fn update_range(&mut self, range: Range<u32>, shaped: &ShapedTextRun) -> bool {
         if range.start >= range.end
             || range.end as usize > self.len
-            || shaped.advances().len() != (range.end - range.start) as usize
+            || shaped_text_run_advances(&shaped).len() != (range.end - range.start) as usize
         {
             return false;
         }
         let mut cumulative_delta = 0.0f32;
-        let advances_changed = range.clone().zip(shaped.advances()).any(|(index, new)| {
+        let advances_changed = range.clone().zip(shaped_text_run_advances(&shaped)).any(|(index, new)| {
             cumulative_delta += new - self.advance(index as usize).unwrap_or(0.0);
             cumulative_delta.abs() > 0.01
         });
         let changed = advances_changed
             || (range.start..=range.end)
-                .zip(shaped.cluster_boundaries())
+                .zip(shaped_text_run_cluster_boundaries(&shaped))
                 .any(|(index, new)| self.is_cluster_boundary(index as usize) != *new);
         self.replace_range(range, shaped.clone(), false);
         changed
@@ -519,111 +434,68 @@ pub struct ShapedLine {
     pub ascent: f32,
     /// One horizontal caret position per logical text boundary. Positions are
     /// relative to the shaped line and may be non-monotonic for bidirectional
-    /// text. The immutable allocation is shared with the backend shape cache.
-    pub caret_stops: Arc<[f32]>,
+    /// text. The immutable representation is shared with the backend shape cache.
+    pub caret_stops: CaretPositions,
     /// True at logical character boundaries where a line may split without
     /// bisecting a native shaping cluster.
     pub cluster_boundaries: Arc<[bool]>,
 }
 
-impl ShapedLine {
-    pub fn x_for_text_position(&self, position: u32) -> Option<f64> {
-        if position < self.text_range.start || position > self.text_range.end {
-            return None;
-        }
-        let offset = position.checked_sub(self.text_range.start)? as usize;
-        self.caret_stops.get(offset).copied().map(f64::from)
-    }
-
-    pub fn closest_text_position(&self, x: f64) -> u32 {
-        let mut closest = self.text_range.start;
-        let mut distance = f64::INFINITY;
-        for (offset, stop) in self.caret_stops.iter().copied().enumerate() {
-            let position = (self.text_range.start + offset as u32).min(self.text_range.end);
-            let candidate_distance = (x - f64::from(stop)).abs();
-            if candidate_distance < distance {
-                closest = position;
-                distance = candidate_distance;
-            }
-        }
-        closest
-    }
-}
-
+/// Resolved font posture. An oblique angle exists only for oblique text.
 #[derive(Clone, Copy, Debug, Default, Hash, PartialEq, Eq)]
 pub enum FontSlant {
     #[default]
     Normal,
     Italic,
-    Oblique,
+    Oblique {
+        angle: ObliqueAngle,
+    },
 }
 
-/// Renderer-neutral description of the font face whose relative metrics are
-/// needed before layout. It is valid for boxes with no text content as well as
-/// ordinary text runs.
-#[derive(Clone, Copy, Debug)]
-pub struct FontMetricsRequest<'a> {
-    font_size: f32,
-    font_weight: u16,
-    font_slant: FontSlant,
-    font_family: Option<&'a str>,
-    language: Option<&'a ContentLanguage>,
-}
+/// An angle in degrees, attached only to [`FontSlant::Oblique`].
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+pub struct ObliqueAngle(u32);
 
-impl<'a> FontMetricsRequest<'a> {
-    pub fn new(
-        font_size: f32,
-        font_weight: u16,
-        font_slant: FontSlant,
-        font_family: Option<&'a str>,
-    ) -> Option<Self> {
-        (font_size.is_finite() && font_size > 0.0 && font_weight > 0).then_some(Self {
-            font_size,
-            font_weight,
-            font_slant,
-            font_family,
-            language: None,
-        })
-    }
-
-    /// Content language used when selecting the face whose metrics are measured.
-    pub fn with_language(mut self, language: Option<&'a ContentLanguage>) -> Self {
-        self.language = language;
-        self
-    }
-
-    pub fn language(self) -> Option<&'a ContentLanguage> {
-        self.language
-    }
-
-    pub fn font_size(self) -> f32 {
-        self.font_size
-    }
-    pub fn font_weight(self) -> u16 {
-        self.font_weight
-    }
-    pub fn font_slant(self) -> FontSlant {
-        self.font_slant
-    }
-    pub fn font_family(self) -> Option<&'a str> {
-        self.font_family
+impl fmt::Debug for ObliqueAngle {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&oblique_angle_degrees(*self), formatter)
     }
 }
 
-/// Font-relative metrics normalized by the em size. Construction rejects
-/// unusable backend values so downstream layout always receives a valid ratio.
+/// Measurements normalized by the em size. Backends supply the available
+/// values directly; missing vertical measurements retain engine defaults.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FontRelativeMetrics {
-    x_height_ratio: f32,
-    ch_advance_ratio: f32,
-    cap_height_ratio: f32,
-    ascent_ratio: f32,
-    descent_ratio: f32,
+    pub x_height_ratio: f32,
+    pub ch_advance_ratio: f32,
+    pub space_advance_ratio: f32,
+    pub cap_height_ratio: f32,
+    pub line_metrics: Option<FontLineMetrics>,
+    pub normal_line_height_ratio: Option<f32>,
 }
 
-/// Complete font-relative metrics produced by shaping for the immutable
-/// topology consumed by layout. Its fields are private so incomplete metric
-/// collections cannot be assembled at the layout boundary.
+/// Measured font extents normalized by the em size.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FontLineMetrics {
+    pub ascent_ratio: f32,
+    pub descent_ratio: f32,
+}
+
+impl Default for FontRelativeMetrics {
+    fn default() -> Self {
+        Self {
+            x_height_ratio: 0.5,
+            ch_advance_ratio: 0.5,
+            space_advance_ratio: 0.5,
+            cap_height_ratio: 0.8,
+            line_metrics: None,
+            normal_line_height_ratio: None,
+        }
+    }
+}
+
+/// Engine-owned metrics assembled by shaping for the immutable layout topology.
+/// Layout borrows the finished collections without repeating assembly checks.
 #[derive(Clone)]
 pub struct ShapedFontMetrics {
     box_metrics: BoxFontMetrics,
@@ -646,6 +518,21 @@ pub enum BoxFontMetrics {
     },
 }
 
+impl BoxFontMetrics {
+    pub fn for_box(&self, box_idx: usize) -> FontRelativeMetrics {
+        match self {
+            Self::NotRequired => FontRelativeMetrics::default(),
+            Self::Dense(values) => values[box_idx],
+            Self::Indexed {
+                metric_ids,
+                metrics,
+            } => metric_ids[box_idx]
+                .checked_sub(1)
+                .map_or_else(FontRelativeMetrics::default, |id| metrics[id as usize]),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub enum RequiredFontMetrics<T> {
     NotRequired,
@@ -656,35 +543,10 @@ impl ShapedFontMetrics {
     pub fn new(
         box_metrics: BoxFontMetrics,
         non_box_metrics: RequiredFontMetrics<FxHashMap<StyleIndices, FontRelativeMetrics>>,
-        expected_box_count: usize,
         root_ch_px: f32,
         root_cap_height_px: f32,
         root_line_height_px: f32,
     ) -> Self {
-        match &box_metrics {
-            BoxFontMetrics::NotRequired => {}
-            BoxFontMetrics::Dense(values) => assert_eq!(
-                values.len(),
-                expected_box_count,
-                "dense shaping metrics must provide one entry per layout box"
-            ),
-            BoxFontMetrics::Indexed {
-                metric_ids,
-                metrics,
-            } => {
-                assert_eq!(
-                    metric_ids.len(),
-                    expected_box_count,
-                    "indexed shaping metrics must provide one ID per layout box"
-                );
-                assert!(
-                    metric_ids
-                        .iter()
-                        .all(|id| *id == 0 || (*id as usize) <= metrics.len()),
-                    "indexed shaping metric ID is out of range"
-                );
-            }
-        }
         Self {
             box_metrics,
             non_box_metrics,
@@ -695,21 +557,12 @@ impl ShapedFontMetrics {
     }
 
     pub fn for_box(&self, box_idx: usize) -> FontRelativeMetrics {
-        match &self.box_metrics {
-            BoxFontMetrics::NotRequired => FontRelativeMetrics::fallback(),
-            BoxFontMetrics::Dense(values) => values[box_idx],
-            BoxFontMetrics::Indexed {
-                metric_ids,
-                metrics,
-            } => metric_ids[box_idx]
-                .checked_sub(1)
-                .map_or_else(FontRelativeMetrics::fallback, |id| metrics[id as usize]),
-        }
+        self.box_metrics.for_box(box_idx)
     }
 
     pub fn for_non_box_style(&self, indices: StyleIndices) -> FontRelativeMetrics {
         match &self.non_box_metrics {
-            RequiredFontMetrics::NotRequired => FontRelativeMetrics::fallback(),
+            RequiredFontMetrics::NotRequired => FontRelativeMetrics::default(),
             RequiredFontMetrics::Required(values) => values[&indices],
         }
     }
@@ -735,14 +588,34 @@ impl ShapedFontMetrics {
         let metrics = self.for_box(box_idx);
         style
             .resolved_font_size_with_root(
-                metrics.x_height_ratio(),
-                metrics.ch_advance_ratio(),
-                metrics.cap_height_ratio(),
+                metrics.x_height_ratio,
+                metrics.ch_advance_ratio,
+                metrics.cap_height_ratio,
                 self.root_ch_px,
                 self.root_cap_height_px,
                 self.root_line_height_px,
             )
             .unwrap_or_else(|| style.font_size())
+    }
+
+    /// Resolve inherited font-relative spacing against its declaring font.
+    pub fn resolve_text_spacing(
+        &self,
+        styles: &ComputedStyles,
+        spacing: TextSpacing,
+        used_font_size: f32,
+    ) -> f32 {
+        let relative = styles
+            .text_spacing_origin(spacing)
+            .map_or_else(FontRelativeMetrics::default, |origin| {
+                self.for_non_box_style(origin)
+            });
+        spacing.resolve_with_metrics(
+            used_font_size,
+            relative.x_height_ratio,
+            relative.ch_advance_ratio,
+            relative.cap_height_ratio,
+        )
     }
 
     fn used_style_with_metrics<'styles>(
@@ -751,15 +624,27 @@ impl ShapedFontMetrics {
         indices: StyleIndices,
         metrics: FontRelativeMetrics,
     ) -> Option<UsedStyleView<'styles>> {
-        styles.used_view_with_root(
-            indices,
-            metrics.x_height_ratio(),
-            metrics.ch_advance_ratio(),
-            metrics.cap_height_ratio(),
-            self.root_ch_px,
-            self.root_cap_height_px,
-            self.root_line_height_px,
-        )
+        styles
+            .used_view_with_root(
+                indices,
+                metrics.x_height_ratio,
+                metrics.ch_advance_ratio,
+                metrics.cap_height_ratio,
+                self.root_ch_px,
+                self.root_cap_height_px,
+                self.root_line_height_px,
+            )
+            .map(|style| {
+                let computed = styles.view(indices).expect("validated style");
+                let resolve =
+                    |spacing| self.resolve_text_spacing(styles, spacing, style.font_size());
+                style
+                    .with_normal_line_height_ratio(metrics.normal_line_height_ratio)
+                    .with_resolved_text_spacing(
+                        resolve(computed.text.letter_spacing),
+                        resolve(computed.text.word_spacing),
+                    )
+            })
     }
 
     pub fn memory_usage_bytes(&self) -> usize {
@@ -786,375 +671,271 @@ impl ShapedFontMetrics {
     }
 }
 
-impl FontRelativeMetrics {
-    pub fn new(x_height_ratio: f32, ch_advance_ratio: f32, cap_height_ratio: f32) -> Option<Self> {
-        (x_height_ratio.is_finite()
-            && x_height_ratio > 0.0
-            && ch_advance_ratio.is_finite()
-            && ch_advance_ratio >= 0.0
-            && cap_height_ratio.is_finite()
-            && cap_height_ratio > 0.0)
-            .then_some(Self {
-                x_height_ratio,
-                ch_advance_ratio,
-                cap_height_ratio,
-                ascent_ratio: 0.0,
-                descent_ratio: 0.0,
-            })
+/// Caps synthesis allowed when the selected font lacks native caps glyphs.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CapsSynthesis {
+    #[default]
+    None,
+    SmallCaps,
+    AllSmallCaps,
+}
+
+/// Cursive connections preserved when a font or style change splits text into
+/// shaping runs. Previous and next refer to logical character order, including
+/// in right-to-left text; these are not visual left and right edges.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CursiveJoining {
+    #[default]
+    Isolated,
+    ConnectedToPrevious,
+    ConnectedToNext,
+    ConnectedToBoth,
+}
+
+/// Resolved properties shared by font measurement, glyph and run shaping.
+/// Requests expose these values for reading; the engine constructs the styles.
+/// All text and font data remain borrowed from the current document.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug)]
+pub struct ShapingStyle<'a> {
+    pub direction: TextDirection,
+    pub font_size: f32,
+    pub font_weight: u16,
+    pub font_slant: FontSlant,
+    /// Resolved font width as a percentage.
+    pub font_stretch: f32,
+    pub font_synthesis_style: FontSynthesisStyle,
+    pub color: u32,
+    pub font_family: Option<&'a str>,
+    pub cjk_font_family: Option<&'a str>,
+    pub language: Option<&'a ContentLanguage>,
+    pub font_features: &'a FontFeatures<'a>,
+    pub caps_synthesis: CapsSynthesis,
+    /// Cursive connections to the preceding and following shaping runs.
+    pub cursive_joining: CursiveJoining,
+}
+
+/// Engine-side construction and geometry adjustment. Backend-facing request
+/// types expose no builders.
+/// This module is intentionally absent from the application facade.
+pub mod shaping {
+    use super::*;
+
+    /// Classify the engine-only first-line shaping requirement.
+    pub fn requires_first_line_shaper(error: &ShapeError) -> bool {
+        matches!(error.kind, ShapeErrorKind::FirstLineShaperRequired)
     }
 
-    pub fn from_ratios(
-        x_height_ratio: f32,
-        ch_advance_ratio: f32,
-        cap_height_ratio: f32,
-        ascent_ratio: f32,
-    ) -> Option<Self> {
-        (x_height_ratio.is_finite()
-            && x_height_ratio > 0.0
-            && ch_advance_ratio.is_finite()
-            && ch_advance_ratio >= 0.0
-            && cap_height_ratio.is_finite()
-            && cap_height_ratio > 0.0
-            && ascent_ratio.is_finite()
-            && ascent_ratio > 0.0)
-            .then_some(Self {
-                x_height_ratio,
-                ch_advance_ratio,
-                cap_height_ratio,
-                ascent_ratio,
-                descent_ratio: (1.0 - ascent_ratio).max(0.0),
-            })
-    }
-
-    pub fn from_line_ratios(
-        x_height_ratio: f32,
-        ch_advance_ratio: f32,
-        cap_height_ratio: f32,
-        ascent_ratio: f32,
-        descent_ratio: f32,
-    ) -> Option<Self> {
-        (x_height_ratio.is_finite()
-            && x_height_ratio > 0.0
-            && ch_advance_ratio.is_finite()
-            && ch_advance_ratio >= 0.0
-            && cap_height_ratio.is_finite()
-            && cap_height_ratio > 0.0
-            && ascent_ratio.is_finite()
-            && ascent_ratio > 0.0
-            && descent_ratio.is_finite()
-            && descent_ratio >= 0.0)
-            .then_some(Self {
-                x_height_ratio,
-                ch_advance_ratio,
-                cap_height_ratio,
-                ascent_ratio,
-                descent_ratio,
-            })
-    }
-
-    pub fn fallback() -> Self {
-        Self {
-            x_height_ratio: 0.5,
-            ch_advance_ratio: 0.5,
-            cap_height_ratio: 0.8,
-            ascent_ratio: 0.0,
-            descent_ratio: 0.0,
+    /// Report layout that needs its shaping backend for first-line styles.
+    pub fn first_line_shaper_required() -> ShapeError {
+        ShapeError {
+            kind: ShapeErrorKind::FirstLineShaperRequired,
         }
     }
-    pub fn x_height_ratio(self) -> f32 {
-        self.x_height_ratio
-    }
-    pub fn ch_advance_ratio(self) -> f32 {
-        self.ch_advance_ratio
-    }
-    pub fn cap_height_ratio(self) -> f32 {
-        self.cap_height_ratio
-    }
-    pub fn ascent_ratio(self) -> Option<f32> {
-        (self.ascent_ratio > 0.0).then_some(self.ascent_ratio)
-    }
-    pub fn line_box_ratios(self) -> Option<(f32, f32)> {
-        (self.ascent_ratio > 0.0).then_some((self.ascent_ratio, self.descent_ratio))
-    }
-}
 
-impl From<FontStyle> for FontSlant {
-    fn from(style: FontStyle) -> Self {
-        match style {
-            FontStyle::Normal => Self::Normal,
-            FontStyle::Italic => Self::Italic,
-            FontStyle::Oblique => Self::Oblique,
+    /// Report first-line refinement that did not reach a stable layout.
+    pub fn first_line_refinement_did_not_converge() -> ShapeError {
+        ShapeError {
+            kind: ShapeErrorKind::FirstLineRefinementDidNotConverge,
         }
     }
-}
 
-#[derive(Clone, Debug)]
-pub struct TextStyleSpan<'a> {
-    byte_range: Range<usize>,
-    direction: TextDirection,
-    font_size: f32,
-    font_weight: u16,
-    font_slant: FontSlant,
-    color: u32,
-    font_family: Option<&'a str>,
-    cjk_font_family: Option<&'a str>,
-    language: Option<&'a ContentLanguage>,
-    font_features: &'a [OpenTypeFeature],
-}
+    /// Report a document paired with another generation of native resources.
+    pub fn resource_generation_mismatch() -> ShapeError {
+        ShapeError {
+            kind: ShapeErrorKind::ResourceGenerationMismatch,
+        }
+    }
 
-impl<'a> TextStyleSpan<'a> {
-    pub fn new(
-        byte_range: Range<usize>,
+    /// Report repreparation that requires an owning document.
+    pub fn borrowed_document() -> ShapeError {
+        ShapeError {
+            kind: ShapeErrorKind::BorrowedDocument,
+        }
+    }
+
+    /// Apply replayable per-character spacing without materializing a buffer.
+    /// Iterator clones must produce the same finite deltas in logical source
+    /// order, with one delta per advance and finite resulting coordinates.
+    pub fn apply_spacing(
+        mut run: ShapedTextRun,
+        deltas: impl ExactSizeIterator<Item = f32> + Clone,
+        right_to_left: bool,
+    ) -> ShapedTextRun {
+        if !deltas.clone().any(|delta| delta != 0.0) {
+            return run;
+        }
+        for (advance, delta) in Arc::make_mut(&mut run.advances)
+            .iter_mut()
+            .zip(deltas.clone())
+        {
+            *advance += delta;
+        }
+        if let Some(native) = &mut run.native {
+            let stops = &mut native.caret_stops;
+            let derived = matches!(stops.0, CaretStorage::Derived(_));
+            if derived {
+                *stops = stops.to_dense().into();
+            }
+            let CaretStorage::Dense(dense) = &mut stops.0 else {
+                unreachable!()
+            };
+            let mut cumulative = 0.0;
+            let mut deltas = deltas;
+            for stop in Arc::make_mut(dense) {
+                *stop += if right_to_left {
+                    -cumulative
+                } else {
+                    cumulative
+                };
+                if let Some(delta) = deltas.next() {
+                    cumulative += delta;
+                }
+            }
+            if derived {
+                *stops = CaretPositions::from_advances(&run.advances, std::mem::take(dense));
+            }
+        }
+        run
+    }
+
+    pub fn preserve_graphemes(run: &mut ShapedTextRun, text: &str) {
+        profile_scope!("shape.preserve_graphemes");
+        if text.is_ascii() && !text.as_bytes().contains(&b'\r') {
+            return;
+        }
+        let graphemes = crate::bidi::grapheme_boundaries(text, run.advances.len());
+        if run
+            .cluster_boundaries
+            .iter()
+            .zip(graphemes.iter())
+            .any(|(&native, &grapheme)| native && !grapheme)
+        {
+            for (native, &grapheme) in Arc::make_mut(&mut run.cluster_boundaries)
+                .iter_mut()
+                .zip(graphemes.iter())
+            {
+                *native &= grapheme;
+            }
+        }
+    }
+
+    /// Suppress character widths and shift native carets together. The mask is
+    /// indexed by logical scalar value; native cached geometry stays unchanged.
+    pub fn suppress_advances(
+        run: &mut ShapedTextRun,
+        suppressed: impl ExactSizeIterator<Item = bool> + Clone,
+        right_to_left: bool,
+    ) {
+        let Some(first) = suppressed
+            .clone()
+            .zip(run.advances.iter())
+            .position(|(suppress, &advance)| suppress && advance != 0.0)
+        else {
+            return;
+        };
+        let derived = run
+            .native
+            .as_ref()
+            .is_some_and(|native| matches!(native.caret_stops.0, CaretStorage::Derived(_)));
+        if let Some(native) = &mut run.native {
+            let mut suppressed = suppressed.clone();
+            let mut removed = 0.0;
+            for (index, stop) in native.caret_stops.make_dense().iter_mut().enumerate() {
+                *stop += if right_to_left { removed } else { -removed };
+                if let Some(&advance) = run.advances.get(index)
+                    && suppressed.next().expect("validated suppression mask")
+                {
+                    removed += advance;
+                }
+            }
+        }
+        for (advance, suppress) in Arc::make_mut(&mut run.advances)
+            .iter_mut()
+            .zip(suppressed)
+            .skip(first)
+        {
+            if suppress {
+                *advance = 0.0;
+            }
+        }
+        if derived {
+            let native = run.native.as_mut().expect("native run with derived carets");
+            let CaretStorage::Dense(stops) = &mut native.caret_stops.0 else {
+                unreachable!()
+            };
+            native.caret_stops =
+                CaretPositions::from_advances(&run.advances, std::mem::take(stops));
+        }
+    }
+
+    pub fn font_features<'a>(
+        settings: &'a mut Vec<OpenTypeFeature>,
+        explicit: &[OpenTypeFeature],
+        has_tracking: bool,
+    ) -> FontFeatures<'a> {
+        crate::font_features::resolve_font_features(settings, explicit, has_tracking)
+    }
+
+    /// Combine connections computed by span planning or native run grouping.
+    #[inline]
+    pub const fn cursive_joining(previous: bool, next: bool) -> CursiveJoining {
+        match (previous, next) {
+            (false, false) => CursiveJoining::Isolated,
+            (true, false) => CursiveJoining::ConnectedToPrevious,
+            (false, true) => CursiveJoining::ConnectedToNext,
+            (true, true) => CursiveJoining::ConnectedToBoth,
+        }
+    }
+
+    pub fn style<'a>(
         font_size: f32,
         font_weight: u16,
         font_slant: FontSlant,
         color: u32,
         font_family: Option<&'a str>,
-    ) -> Option<Self> {
-        // CSS permits `font-size: 0`. It still needs a real shaping request so
-        // character identities and backend paint resources stay registered;
-        // the resulting advances and ink geometry are simply zero-sized.
-        if byte_range.start >= byte_range.end || !font_size.is_finite() || font_size < 0.0 {
-            return None;
-        }
-        Some(Self {
-            byte_range,
+    ) -> ShapingStyle<'a> {
+        // CSS permits zero-size text, which still needs character identities.
+        ShapingStyle {
             direction: TextDirection::Ltr,
             font_size,
             font_weight,
             font_slant,
+            font_stretch: 100.0,
+            font_synthesis_style: FontSynthesisStyle::Auto,
             color,
             font_family,
             cjk_font_family: None,
             language: None,
-            font_features: &[],
-        })
-    }
-
-    pub fn with_font_features(mut self, font_features: &'a [OpenTypeFeature]) -> Self {
-        self.font_features = font_features;
-        self
-    }
-
-    /// Inherited BCP 47 content language, for font selection and localized glyphs.
-    pub fn with_language(mut self, language: Option<&'a ContentLanguage>) -> Self {
-        self.language = language;
-        self
-    }
-
-    pub fn language(&self) -> Option<&'a ContentLanguage> {
-        self.language
-    }
-
-    /// Resolved direction of this shaping run, after paragraph bidi analysis.
-    pub fn with_direction(mut self, direction: TextDirection) -> Self {
-        self.direction = direction;
-        self
-    }
-
-    pub fn direction(&self) -> TextDirection {
-        self.direction
-    }
-
-    pub fn byte_range(&self) -> Range<usize> {
-        self.byte_range.clone()
-    }
-
-    pub fn font_size(&self) -> f32 {
-        self.font_size
-    }
-
-    pub fn font_weight(&self) -> u16 {
-        self.font_weight
-    }
-
-    pub fn font_slant(&self) -> FontSlant {
-        self.font_slant
-    }
-
-    pub fn color(&self) -> u32 {
-        self.color
-    }
-
-    pub fn font_family(&self) -> Option<&'a str> {
-        self.font_family
-    }
-
-    pub fn with_cjk_font_family(mut self, family: Option<&'a str>) -> Self {
-        self.cjk_font_family = family;
-        self
-    }
-
-    pub fn cjk_font_family(&self) -> Option<&'a str> {
-        self.cjk_font_family
-    }
-
-    pub fn font_family_for_character(&self, character: char) -> Option<&'a str> {
-        self.cjk_font_family
-            .filter(|_| html_style_model::is_cjk_character(character))
-            .or(self.font_family)
-    }
-
-    pub fn font_features(&self) -> &[OpenTypeFeature] {
-        &self.font_features
-    }
-}
-
-/// Framework-neutral placement requested for one logical character after the
-/// platform shaper has produced its natural geometry.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct CharacterPlacement {
-    extra_advance: f32,
-    advance_override: Option<f32>,
-    baseline_shift: f32,
-    paint: bool,
-}
-
-impl CharacterPlacement {
-    pub fn new(extra_advance: f32, advance_override: Option<f32>, paint: bool) -> Option<Self> {
-        Self::with_baseline_shift(extra_advance, advance_override, 0.0, paint)
-    }
-
-    pub fn with_baseline_shift(
-        extra_advance: f32,
-        advance_override: Option<f32>,
-        baseline_shift: f32,
-        paint: bool,
-    ) -> Option<Self> {
-        if !extra_advance.is_finite()
-            || !baseline_shift.is_finite()
-            || advance_override.is_some_and(|advance| !advance.is_finite() || advance < 0.0)
-        {
-            return None;
-        }
-        Some(Self {
-            extra_advance,
-            advance_override,
-            baseline_shift,
-            paint,
-        })
-    }
-
-    pub fn extra_advance(self) -> f32 {
-        self.extra_advance
-    }
-
-    pub fn advance_override(self) -> Option<f32> {
-        self.advance_override
-    }
-
-    /// Positive values move the shaped character upward from the line baseline.
-    pub fn baseline_shift(self) -> f32 {
-        self.baseline_shift
-    }
-
-    pub fn paints(self) -> bool {
-        self.paint
-    }
-}
-
-impl Default for CharacterPlacement {
-    fn default() -> Self {
-        Self {
-            extra_advance: 0.0,
-            advance_override: None,
-            baseline_shift: 0.0,
-            paint: true,
+            font_features: &FontFeatures::DEFAULT,
+            caps_synthesis: CapsSynthesis::None,
+            cursive_joining: CursiveJoining::Isolated,
         }
     }
-}
 
-pub struct TextShapeRequest<'a> {
-    line_index: usize,
-    text_range: Range<u32>,
-    text: &'a str,
-    styles: &'a [TextStyleSpan<'a>],
-    /// One entry per logical character in `text`. The layout layer resolves
-    /// CSS semantics before this request reaches a renderer backend.
-    placements: &'a [CharacterPlacement],
-}
+    #[inline]
+    pub fn glyph<'a>(character: char, style: &'a ShapingStyle<'a>) -> GlyphRequest<'a> {
+        GlyphRequest { character, style }
+    }
 
-impl<'a> TextShapeRequest<'a> {
-    pub fn new(
-        line_index: usize,
-        text_range: Range<u32>,
+    pub fn run<'a>(
         text: &'a str,
-        styles: &'a [TextStyleSpan<'a>],
-        placements: &'a [CharacterPlacement],
-    ) -> Option<Self> {
-        let character_count = text.chars().count();
-        if text.is_empty()
-            || styles.is_empty()
-            || character_count != text_range.end.checked_sub(text_range.start)? as usize
-            || placements.len() != character_count
-        {
-            return None;
-        }
-        let mut next_byte = 0;
-        for style in styles {
-            let range = style.byte_range();
-            if range.start != next_byte
-                || range.end > text.len()
-                || !text.is_char_boundary(range.start)
-                || !text.is_char_boundary(range.end)
-            {
-                return None;
-            }
-            next_byte = range.end;
-        }
-        if next_byte != text.len() {
-            return None;
-        }
-        Some(Self {
-            line_index,
-            text_range,
+        style: ShapingStyle<'a>,
+        paint_colors: Option<&'a [u32]>,
+    ) -> TextRunShapeRequest<'a> {
+        TextRunShapeRequest {
             text,
-            styles,
-            placements,
-        })
-    }
-
-    pub fn line_index(&self) -> usize {
-        self.line_index
-    }
-
-    pub fn text_range(&self) -> Range<u32> {
-        self.text_range.clone()
-    }
-
-    pub fn text(&self) -> &'a str {
-        self.text
-    }
-
-    pub fn styles(&self) -> &'a [TextStyleSpan<'a>] {
-        self.styles
-    }
-
-    pub fn placements(&self) -> &'a [CharacterPlacement] {
-        self.placements
-    }
-
-    pub fn adjusted_caret_stops(&self, raw: &[f32]) -> Option<Arc<[f32]>> {
-        if raw.len() != self.placements.len().checked_add(1)?
-            || raw.iter().any(|value| !value.is_finite())
-        {
-            return None;
+            style,
+            paint_colors,
         }
-        let mut adjusted = Vec::with_capacity(raw.len());
-        adjusted.push(raw[0]);
-        for (index, placement) in self.placements.iter().enumerate() {
-            let natural_advance = raw[index + 1] - raw[index];
-            let direction = if natural_advance < 0.0 { -1.0 } else { 1.0 };
-            let advance = placement.advance_override().map_or(
-                natural_advance + direction * placement.extra_advance(),
-                |advance| direction * advance,
-            );
-            adjusted.push(adjusted[index] + advance);
-        }
-        Some(Arc::from(adjusted))
     }
 }
 
+/// Shaping failure propagated by the engine or reported by a backend.
+/// Backends construct resource-capacity and unsupported-transaction errors;
+/// document lifecycle failures are constructed by the engine implementation.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ShapeError {
     kind: ShapeErrorKind,
@@ -1162,20 +943,7 @@ pub struct ShapeError {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum ShapeErrorKind {
-    RunLengthMismatch {
-        characters: usize,
-        advances: usize,
-    },
-    UnregisteredGlyphId {
-        glyph_id: GlyphId,
-        metrics_len: usize,
-    },
-    RejectedMetric {
-        reason: GlyphMetricError,
-    },
-    RegistryCapacityExhausted {
-        metrics_len: usize,
-    },
+    RegistryCapacityExhausted { metrics_len: usize },
     FirstLineRefinementDidNotConverge,
     FirstLineShaperRequired,
     AppendTransactionUnsupported,
@@ -1184,109 +952,10 @@ enum ShapeErrorKind {
 }
 
 impl ShapeError {
-    pub fn first_line_shaper_required() -> Self {
-        Self {
-            kind: ShapeErrorKind::FirstLineShaperRequired,
-        }
-    }
 
-    pub fn requires_first_line_shaper(&self) -> bool {
-        matches!(self.kind, ShapeErrorKind::FirstLineShaperRequired)
-    }
-
-    pub fn unregistered_glyph_id(glyph_id: GlyphId, metrics_len: usize) -> Self {
-        Self {
-            kind: ShapeErrorKind::UnregisteredGlyphId {
-                glyph_id,
-                metrics_len,
-            },
-        }
-    }
-
-    pub fn rejected_metric(reason: GlyphMetricError) -> Self {
-        Self {
-            kind: ShapeErrorKind::RejectedMetric { reason },
-        }
-    }
-
-    pub fn registry_capacity_exhausted(metrics_len: usize) -> Self {
-        Self {
-            kind: ShapeErrorKind::RegistryCapacityExhausted { metrics_len },
-        }
-    }
-
-    pub fn first_line_refinement_did_not_converge() -> Self {
-        Self {
-            kind: ShapeErrorKind::FirstLineRefinementDidNotConverge,
-        }
-    }
-
-    pub fn append_transaction_unsupported() -> Self {
+    pub(crate) fn append_transaction_unsupported() -> Self {
         Self {
             kind: ShapeErrorKind::AppendTransactionUnsupported,
-        }
-    }
-
-    pub fn resource_generation_mismatch() -> Self {
-        Self {
-            kind: ShapeErrorKind::ResourceGenerationMismatch,
-        }
-    }
-
-    pub fn borrowed_document() -> Self {
-        Self {
-            kind: ShapeErrorKind::BorrowedDocument,
-        }
-    }
-
-    fn run_length_mismatch(characters: usize, advances: usize) -> Self {
-        Self {
-            kind: ShapeErrorKind::RunLengthMismatch {
-                characters,
-                advances,
-            },
-        }
-    }
-
-    pub fn glyph_id(self) -> Option<GlyphId> {
-        match self.kind {
-            ShapeErrorKind::UnregisteredGlyphId { glyph_id, .. } => Some(glyph_id),
-            ShapeErrorKind::RunLengthMismatch { .. }
-            | ShapeErrorKind::RejectedMetric { .. }
-            | ShapeErrorKind::RegistryCapacityExhausted { .. }
-            | ShapeErrorKind::FirstLineRefinementDidNotConverge
-            | ShapeErrorKind::FirstLineShaperRequired
-            | ShapeErrorKind::AppendTransactionUnsupported
-            | ShapeErrorKind::ResourceGenerationMismatch
-            | ShapeErrorKind::BorrowedDocument => None,
-        }
-    }
-
-    pub fn metrics_len(self) -> Option<usize> {
-        match self.kind {
-            ShapeErrorKind::UnregisteredGlyphId { metrics_len, .. }
-            | ShapeErrorKind::RegistryCapacityExhausted { metrics_len } => Some(metrics_len),
-            ShapeErrorKind::RunLengthMismatch { .. }
-            | ShapeErrorKind::RejectedMetric { .. }
-            | ShapeErrorKind::FirstLineRefinementDidNotConverge
-            | ShapeErrorKind::FirstLineShaperRequired
-            | ShapeErrorKind::AppendTransactionUnsupported
-            | ShapeErrorKind::ResourceGenerationMismatch
-            | ShapeErrorKind::BorrowedDocument => None,
-        }
-    }
-
-    pub fn reason(self) -> Option<GlyphMetricError> {
-        match self.kind {
-            ShapeErrorKind::RejectedMetric { reason } => Some(reason),
-            ShapeErrorKind::RunLengthMismatch { .. }
-            | ShapeErrorKind::UnregisteredGlyphId { .. }
-            | ShapeErrorKind::RegistryCapacityExhausted { .. } => None,
-            ShapeErrorKind::FirstLineRefinementDidNotConverge
-            | ShapeErrorKind::FirstLineShaperRequired
-            | ShapeErrorKind::AppendTransactionUnsupported
-            | ShapeErrorKind::ResourceGenerationMismatch
-            | ShapeErrorKind::BorrowedDocument => None,
         }
     }
 }
@@ -1294,27 +963,6 @@ impl ShapeError {
 impl fmt::Display for ShapeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.kind {
-            ShapeErrorKind::RunLengthMismatch {
-                characters,
-                advances,
-            } => write!(
-                formatter,
-                "shaped run has {characters} characters but {advances} advances"
-            ),
-            ShapeErrorKind::UnregisteredGlyphId {
-                glyph_id,
-                metrics_len,
-            } => {
-                write!(
-                    formatter,
-                    "glyph shaper returned ID {} with only {} registered metrics",
-                    glyph_id, metrics_len
-                )
-            }
-            ShapeErrorKind::RejectedMetric { reason } => write!(
-                formatter,
-                "glyph shaper returned invalid glyph metric: {reason:?}"
-            ),
             ShapeErrorKind::RegistryCapacityExhausted { metrics_len } => {
                 write!(
                     formatter,
@@ -1359,10 +1007,30 @@ impl std::error::Error for ShapeError {}
 /// resources.clear();
 /// assert_eq!(metrics.len(), 0);
 /// ```
+#[derive(Default)]
 pub struct GlyphResourceStore {
     metrics: GlyphMetrics,
     generation: GlyphResourceGeneration,
     shaped_ids: FxHashMap<(GlyphHandle, char, u32, u32, u32), GlyphId>,
+    paint_invalid: bool,
+    paint_lease: OnceLock<GlyphResourceLease>,
+}
+
+/// Validity of retained paint commands. Owning the lease does not keep a
+/// replaced backend alive; consumers must check validity before replaying.
+#[derive(Clone)]
+pub struct GlyphResourceLease(Arc<AtomicBool>);
+
+impl GlyphResourceLease {
+    pub fn is_valid(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for GlyphResourceStore {
+    fn drop(&mut self) {
+        self.invalidate_paint_resources();
+    }
 }
 
 /// An append-only ledger checkpoint. It owns no glyph data and can be consumed
@@ -1372,6 +1040,15 @@ pub struct GlyphResourceStore {
 pub struct GlyphResourceCheckpoint {
     generation: GlyphResourceGeneration,
     len: usize,
+}
+
+/// Backend-owned append boundary. Restoring it preserves the resource generation
+/// and every handle in its prefix; callers must first release appended views.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeResourceCheckpoint {
+    pub generation: GlyphResourceGeneration,
+    pub glyph_count: usize,
+    pub run_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1398,22 +1075,42 @@ impl Default for GlyphResourceGeneration {
     }
 }
 
-impl Default for GlyphResourceStore {
-    fn default() -> Self {
-        Self {
-            metrics: GlyphMetrics::default(),
-            generation: GlyphResourceGeneration::new(),
-            shaped_ids: FxHashMap::default(),
-        }
-    }
-}
-
 impl GlyphResourceStore {
     pub fn new(generation: GlyphResourceGeneration) -> Self {
         Self {
             metrics: GlyphMetrics::default(),
             generation,
             shaped_ids: FxHashMap::default(),
+            paint_invalid: false,
+            paint_lease: OnceLock::new(),
+        }
+    }
+
+    #[inline]
+    pub fn paint_resources_valid(&self) -> bool {
+        !self.paint_invalid
+    }
+
+    pub fn paint_lease(&self) -> GlyphResourceLease {
+        self.paint_lease
+            .get_or_init(|| GlyphResourceLease(Arc::new(AtomicBool::new(!self.paint_invalid))))
+            .clone()
+    }
+
+    /// Backend invalidation preserves the metric ledger for geometry queries.
+    pub fn invalidate_paint_resources(&mut self) {
+        self.paint_invalid = true;
+        self.invalidate_render_scenes();
+    }
+
+    /// Successful publication replaces commands while preserving native handles.
+    #[inline]
+    pub fn invalidate_render_scenes(&mut self) {
+        if self.paint_lease.get().is_none() {
+            return;
+        }
+        if let Some(lease) = self.paint_lease.take() {
+            lease.0.store(false, Ordering::Release);
         }
     }
 
@@ -1430,12 +1127,7 @@ impl GlyphResourceStore {
         seen: &mut FxHashSet<*const ()>,
     ) -> MemoryUsageReport {
         let mut report = self.metrics.memory_usage_report_with_shared(seen);
-        report.add(
-            "GlyphResourceStore.shaped_ids",
-            self.shaped_ids.capacity()
-                * std::mem::size_of::<((GlyphHandle, char, u32, u32, u32), GlyphId)>(),
-            self.shaped_ids.len(),
-        );
+        report.add_hash_map_storage("GlyphResourceStore.shaped_ids", &self.shaped_ids);
         report
     }
 
@@ -1463,8 +1155,79 @@ impl GlyphResourceStore {
         }
         self.metrics.truncate(checkpoint.len);
         self.shaped_ids
-            .retain(|_, id| (*id as usize) < checkpoint.len);
+            .retain(|_, id| (id.0 as usize) < checkpoint.len);
         true
+    }
+
+    /// Ask the backend for native geometry and paint handles, then assign layout
+    /// IDs here. Backends never receive the engine's registry or glyph buffer.
+    pub fn shape_run(
+        &mut self,
+        shaper: &mut (impl GlyphShaper + ?Sized),
+        request: TextRunShapeRequest<'_>,
+        glyphs: &mut [GlyphId],
+    ) -> Result<Option<ShapedTextRun>, ShapeError> {
+        let text = text_run_shape_request_text(&request);
+        let style = *text_run_shape_request_style(&request);
+        let shaped = shaper.shape_run(request)?;
+        if let Some(ShapedRun {
+            geometry,
+            paint:
+                Some(RunPaint {
+                    first_handle,
+                    metrics,
+                }),
+        }) = shaped
+        {
+            let range = self
+                .metrics
+                .register_run(text, geometry.shared_advances(), metrics, first_handle)
+                .map_err(|_| shape_error_registry_capacity_exhausted(self.len()))?;
+            for (slot, id) in glyphs.iter_mut().zip(range) {
+                *slot = GlyphId(id);
+            }
+            return Ok(Some(geometry));
+        }
+        let mut ascii = [GlyphId(u32::MAX); 128];
+        let mut non_ascii = FxHashMap::<char, GlyphId>::default();
+        for (slot, character) in glyphs.iter_mut().zip(text.chars()) {
+            let cached = if character.is_ascii() {
+                ascii[character as usize]
+            } else {
+                non_ascii
+                    .get(&character)
+                    .copied()
+                    .unwrap_or(GlyphId(u32::MAX))
+            };
+            *slot = if cached != GlyphId(u32::MAX) {
+                cached
+            } else {
+                let id = self.shape_glyph(shaper, shaping::glyph(character, &style))?;
+                if character.is_ascii() {
+                    ascii[character as usize] = id;
+                } else {
+                    non_ascii.insert(character, id);
+                }
+                id
+            };
+        }
+        Ok(shaped.map(shaped_run_into_geometry))
+    }
+
+    /// Shape and register each character independently, using the run's font
+    /// selection. Native contextual run shaping is left to the caller.
+    pub fn shape_characters(
+        &mut self,
+        shaper: &mut (impl GlyphShaper + ?Sized),
+        request: &TextRunShapeRequest<'_>,
+        glyphs: &mut [GlyphId],
+    ) -> Result<(), ShapeError> {
+        debug_assert_eq!(text_run_shape_request_text(&request).chars().count(), glyphs.len());
+        let style = text_run_shape_request_style(&request);
+        for (slot, character) in glyphs.iter_mut().zip(text_run_shape_request_text(&request).chars()) {
+            *slot = self.shape_glyph(shaper, shaping::glyph(character, style))?;
+        }
+        Ok(())
     }
 
     /// Shape and intern a native result, assigning its layout ID here.
@@ -1474,13 +1237,13 @@ impl GlyphResourceStore {
         request: GlyphRequest<'_>,
     ) -> Result<GlyphId, ShapeError> {
         let shaped = shaper.shape_glyph(request)?;
-        let metric = shaped.metric(request.character);
+        let metrics = shaped.metrics();
         let key = (
             shaped.handle(),
             request.character,
-            metric.advance().to_bits(),
-            metric.ascent().to_bits(),
-            metric.descent().to_bits(),
+            shaped.advance().to_bits(),
+            metrics.ascent.to_bits(),
+            metrics.descent.to_bits(),
         );
         if let Some(&id) = self.shaped_ids.get(&key) {
             return Ok(id);
@@ -1490,46 +1253,21 @@ impl GlyphResourceStore {
         Ok(id)
     }
 
-    /// Register a newly produced result without interning. Batch backends use
-    /// this when each native resource is already unique to its shaped run.
-    pub fn register_shaped(
+    /// Register a native single-character result without interning.
+    fn register_shaped(
         &mut self,
         character: char,
         shaped: ShapedGlyph,
     ) -> Result<GlyphId, ShapeError> {
-        let id = self.register(shaped.metric(character))?;
+        let id = self.register(GlyphMetric::from_shaped(character, shaped))?;
         self.metrics.set_paint_handle(id, shaped.handle());
         Ok(id)
     }
 
-    pub fn register(&mut self, metric: GlyphMetric) -> Result<GlyphId, ShapeError> {
+    fn register(&mut self, metric: GlyphMetric) -> Result<GlyphId, ShapeError> {
         self.metrics
             .register(metric)
-            .map_err(|_| ShapeError::registry_capacity_exhausted(self.len()))
-    }
-
-    /// Register a whole run using its existing validated advance allocation.
-    /// IDs remain dense for compatibility with individual-glyph paint APIs;
-    /// no per-character GlyphMetric records are created.
-    pub fn register_run(
-        &mut self,
-        text: &str,
-        shaped: &ShapedTextRun,
-        ascent: f32,
-        descent: f32,
-    ) -> Result<Range<GlyphId>, ShapeError> {
-        let characters: Box<[char]> = text.chars().collect();
-        if characters.len() != shaped.advances.len() {
-            return Err(ShapeError::run_length_mismatch(
-                characters.len(),
-                shaped.advances.len(),
-            ));
-        }
-        let vertical = GlyphMetric::try_new('\0', 0.0, ascent, descent)
-            .map_err(ShapeError::rejected_metric)?;
-        self.metrics
-            .register_run(characters, shaped.shared_advances(), vertical)
-            .map_err(|_| ShapeError::registry_capacity_exhausted(self.len()))
+            .map_err(|_| shape_error_registry_capacity_exhausted(self.len()))
     }
 
     /// Number of stored metric records, independent of the logical ID count.
@@ -1550,14 +1288,34 @@ impl GlyphResourceStore {
     }
 
     pub fn contains(&self, glyph: GlyphId) -> bool {
-        (glyph as usize) < self.len()
+        (glyph.0 as usize) < self.len()
     }
 }
 
 /// Backend supplied by a renderer adapter for measuring styled characters
 /// and returning handles to its native paint resources. HtmlEngine assigns
 /// layout glyph IDs and stores the returned measurements.
+/// Basic adapters can use [`crate::ResourceShaper`] to supply a shaping callback
+/// with automatic native-resource lifecycle handling.
 pub trait GlyphShaper {
+    /// Optional reclamation of completed scope batches. Backends which support
+    /// this must preserve all prefix handles and retained painter snapshots.
+    fn resource_checkpoint(&self) -> Option<NativeResourceCheckpoint> {
+        None
+    }
+    fn restore_resource_checkpoint(&mut self, _checkpoint: NativeResourceCheckpoint) -> bool {
+        false
+    }
+
+    /// Selects the publication `@font-face` declarations and reader font
+    /// policy of the document about to be shaped. The engine calls this before
+    /// every document and append shaping pass, so a backend's active faces
+    /// always belong to the document it shapes. Backends that register
+    /// publication fonts resolve authored families through these faces;
+    /// others ignore them.
+    fn select_publication_fonts(&mut self, _faces: &[FontFace], _overrides: &ReaderStyleOverrides) {
+    }
+
     /// Identity of the backend's active paint resources. Reset must assign a
     /// fresh generation; a failed document replacement restores the old one.
     fn resource_generation(&self) -> GlyphResourceGeneration;
@@ -1598,71 +1356,25 @@ pub trait GlyphShaper {
     /// missing vertical metrics from its shaped line geometry.
     fn font_relative_metrics(
         &mut self,
-        _request: FontMetricsRequest<'_>,
+        _style: &ShapingStyle<'_>,
     ) -> Result<FontRelativeMetrics, ShapeError> {
-        Ok(FontRelativeMetrics::fallback())
+        Ok(FontRelativeMetrics::default())
     }
 
     /// Shape one character using the native text system. Return its paint
     /// handle, advance, and measured font extents; no metric registration is needed.
     fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError>;
 
-    /// Shapes one normalized, single-style logical run into a caller-owned
-    /// dense glyph-ID buffer. Backends can override this to resolve shared
-    /// style state once and batch character lookup; the default preserves the
-    /// established per-character contract.
-    fn shape_glyph_run(
-        &mut self,
-        request: TextRunShapeRequest<'_>,
-        glyphs: &mut [GlyphId],
-        resources: &mut GlyphResourceStore,
-    ) -> Result<Option<ShapedTextRun>, ShapeError> {
-        debug_assert_eq!(request.text().chars().count(), glyphs.len());
-        let style = request.style();
-        for (slot, character) in glyphs.iter_mut().zip(request.text().chars()) {
-            *slot = resources.shape_glyph(
-                self,
-                GlyphRequest {
-                    character,
-                    font_size: style.font_size(),
-                    font_weight: style.font_weight(),
-                    font_slant: style.font_slant(),
-                    color: style.color(),
-                    font_family: style.font_family_for_character(character),
-                },
-            )?;
-        }
-        self.shape_text_run(request)
-    }
-
-    /// Optionally supplies native cluster geometry for a logical style run.
-    /// Backends without run shaping retain the per-character metric fallback.
-    fn shape_text_run(
+    /// Shape a complete logical run using the supplied resolved style. Font
+    /// selection, supported feature translation and native caching belong to
+    /// the backend. Actual advances and cluster geometry drive engine layout.
+    /// Returning `None` selects the engine's per-character fallback.
+    fn shape_run(
         &mut self,
         _request: TextRunShapeRequest<'_>,
-    ) -> Result<Option<ShapedTextRun>, ShapeError> {
+    ) -> Result<Option<ShapedRun>, ShapeError> {
         Ok(None)
     }
-
-    /// Optionally measures a complete candidate line at its actual start and
-    /// end boundaries without creating a paint resource.
-    fn measure_line(
-        &mut self,
-        _request: TextShapeRequest<'_>,
-    ) -> Result<Option<ShapedTextRun>, ShapeError> {
-        Ok(None)
-    }
-
-    /// Optionally shapes a final visual line as one platform text layout. The
-    /// default keeps non-native backends on the established glyph path.
-    fn shape_line(
-        &mut self,
-        _request: TextShapeRequest<'_>,
-    ) -> Result<Option<ShapedLine>, ShapeError> {
-        Ok(None)
-    }
-
-    fn begin_line_shaping(&mut self) {}
 }
 
 #[cfg(test)]
@@ -1670,24 +1382,55 @@ mod geometry_tests {
     use super::*;
 
     #[test]
+    fn font_extents_preserve_selected_line_ratios_and_fallback_without_metrics() {
+        let selected = FontRelativeMetrics {
+            x_height_ratio: 0.5,
+            ch_advance_ratio: 0.5,
+            cap_height_ratio: 0.8,
+            line_metrics: Some(FontLineMetrics {
+                ascent_ratio: 1.0,
+                descent_ratio: 0.25,
+            }),
+            ..FontRelativeMetrics::default()
+        };
+        assert_eq!(font_relative_metrics_line_box_extents(selected, 20.0), (20.0, 5.0));
+        assert_eq!(font_relative_metrics_line_box_extents(selected, 0.0), (0.0, 0.0));
+        assert_eq!(
+            font_relative_metrics_line_box_extents(FontRelativeMetrics::default(), 20.0),
+            (16.0, 4.0)
+        );
+    }
+
+    #[test]
     fn append_checkpoints_own_no_run_data_and_preserve_the_prefix() {
         let mut resources = GlyphResourceStore::default();
         let generation = resources.generation();
         let advances: Arc<[f32]> = [2.0, 3.0].into();
-        let run = ShapedTextRun::new(advances.clone(), vec![true; 3].into()).unwrap();
-        resources.register_run("ab", &run, 8.0, 2.0).unwrap();
+        let run = shaped_text_run_new(advances.clone(), vec![true; 3].into());
+        resources
+            .metrics
+            .register_run(
+                "ab",
+                run.shared_advances(),
+                RunFontMetrics::Uniform(FontMetrics {
+                    ascent: 8.0,
+                    descent: 2.0,
+                }),
+                GlyphHandle(0),
+            )
+            .unwrap();
         let owners = Arc::strong_count(&advances);
         let checkpoint = resources.checkpoint();
         assert_eq!(Arc::strong_count(&advances), owners);
-        let extra = GlyphMetric::try_new('x', 1.0, 8.0, 2.0).unwrap();
-        assert_eq!(resources.register(extra).unwrap(), 2);
+        let extra = GlyphMetric::new('x', 1.0, 8.0, 2.0);
+        assert_eq!(resources.register(extra).unwrap(), GlyphId(2));
         assert!(resources.rollback_to(checkpoint));
         assert_eq!(resources.generation(), generation);
         assert_eq!(resources.len(), 2);
         assert_eq!(resources.record_count(), 1);
-        assert_eq!(resources.get(0).unwrap().ch(), 'a');
-        assert!(resources.get(2).is_none());
-        assert_eq!(resources.register(extra).unwrap(), 2);
+        assert_eq!(resources.get(GlyphId(0)).unwrap().ch(), 'a');
+        assert!(resources.get(GlyphId(2)).is_none());
+        assert_eq!(resources.register(extra).unwrap(), GlyphId(2));
     }
 
     #[test]
@@ -1695,7 +1438,7 @@ mod geometry_tests {
         let mut resources = GlyphResourceStore::default();
         let other = GlyphResourceStore::default().checkpoint();
         let empty = resources.checkpoint();
-        let extra = GlyphMetric::try_new('x', 1.0, 8.0, 2.0).unwrap();
+        let extra = GlyphMetric::new('x', 1.0, 8.0, 2.0);
         resources.register(extra).unwrap();
         assert!(!resources.rollback_to(other));
         assert_eq!(resources.len(), 1);
@@ -1711,7 +1454,7 @@ mod geometry_tests {
     }
 
     fn fallback(len: usize, advance: f32) -> ShapedTextRun {
-        ShapedTextRun::new(vec![advance; len].into(), vec![true; len + 1].into()).unwrap()
+        shaped_text_run_new(vec![advance; len].into(), vec![true; len + 1].into())
     }
 
     #[test]
@@ -1719,14 +1462,11 @@ mod geometry_tests {
         let advances: Arc<[f32]> = [1.0, 2.0, 3.0, 4.0].into();
         let boundaries: Arc<[bool]> = [true, false, true, false, true].into();
         let carets: Arc<[f32]> = [0.0, 1.0, 3.0, 6.0, 10.0].into();
-        let run = ShapedTextRun::with_backend_run(
-            advances.clone(),
+        let run = shaped_text_run_with_backend_run(advances.clone(),
             boundaries.clone(),
-            7,
-            carets.clone(),
-            8.0,
-        )
-        .unwrap();
+            TextRunId(7),
+            carets.clone().into(),
+            8.0,);
         let mut geometry = ShapedTextGeometry::with_len(10);
         geometry.push_run(&[4, 5, 8, 9], run, true);
         geometry.finish_runs();
@@ -1743,8 +1483,8 @@ mod geometry_tests {
         assert_eq!(native[1].run_offset, 2);
         for run in native {
             assert!(run.placement_required);
-            assert_eq!(run.backend_run, 7);
-            assert_eq!(run.caret_stops.as_ptr(), carets.as_ptr());
+            assert_eq!(run.backend_run, TextRunId(7));
+            assert_eq!(run.caret_stops.to_dense().as_ptr(), carets.as_ptr());
         }
         for count in [
             Arc::strong_count(&advances),
@@ -1761,14 +1501,11 @@ mod geometry_tests {
     #[test]
     fn replacements_preserve_slices_and_release_runs_after_the_last_range() {
         let carets: Arc<[f32]> = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0].into();
-        let run = ShapedTextRun::with_backend_run(
-            vec![1.0; 6].into(),
+        let run = shaped_text_run_with_backend_run(vec![1.0; 6].into(),
             vec![true; 7].into(),
-            3,
-            carets.clone(),
-            8.0,
-        )
-        .unwrap();
+            TextRunId(3),
+            carets.clone().into(),
+            8.0,);
         let mut geometry = ShapedTextGeometry::with_len(6);
         geometry.push_run(&[0, 1, 2, 3, 4, 5], run, false);
         geometry.replace_range(2..4, fallback(2, 2.0), false);
@@ -1778,8 +1515,8 @@ mod geometry_tests {
         assert_eq!(native[1].source_range, 4..6);
         assert_eq!(native[1].run_offset, 4);
         assert_eq!(
-            native[0].caret_stops.as_ptr(),
-            native[1].caret_stops.as_ptr()
+            native[0].caret_stops.to_dense().as_ptr(),
+            native[1].caret_stops.to_dense().as_ptr()
         );
         assert_eq!(Arc::strong_count(&carets), 2);
         drop(native);
@@ -1820,20 +1557,20 @@ mod geometry_tests {
         for (right_to_left, expected) in [(false, [0.0, 3.0, 5.5]), (true, [0.0, 1.0, 4.5])] {
             let advances: Arc<[f32]> = [2.0, 3.0].into();
             let carets: Arc<[f32]> = [0.0, 2.0, 5.0].into();
-            let mut run = ShapedTextRun::with_backend_run(
-                advances.clone(),
+            let mut run = shaped_text_run_with_backend_run(advances.clone(),
                 vec![true; 3].into(),
-                0,
-                carets.clone(),
-                8.0,
-            )
-            .unwrap();
-            run.apply_spacing(&[0.0, 0.0], right_to_left);
-            assert_eq!(run.advances().as_ptr(), advances.as_ptr());
-            assert_eq!(run.caret_stops().unwrap().as_ptr(), carets.as_ptr());
-            run.apply_spacing(&[1.0, -0.5], right_to_left);
-            assert_eq!(run.advances(), [3.0, 2.5]);
-            assert_eq!(run.caret_stops().unwrap(), expected);
+                TextRunId(0),
+                carets.clone().into(),
+                8.0,);
+            run = shaping::apply_spacing(run, [0.0, 0.0].into_iter(), right_to_left);
+            assert_eq!(shaped_text_run_advances(&run).as_ptr(), advances.as_ptr());
+            assert_eq!(
+                shaped_text_run_caret_stops(&run).unwrap().to_dense().as_ptr(),
+                carets.as_ptr()
+            );
+            run = shaping::apply_spacing(run, [1.0, -0.5].into_iter(), right_to_left);
+            assert_eq!(shaped_text_run_advances(&run), [3.0, 2.5]);
+            assert_eq!(shaped_text_run_caret_stops(&run).unwrap().to_dense().as_ref(), expected);
             assert_eq!(&*advances, &[2.0, 3.0]);
             assert_eq!(&*carets, &[0.0, 2.0, 5.0]);
         }
@@ -1849,4 +1586,161 @@ mod geometry_tests {
         assert_eq!(geometry.runs.len(), 1);
         assert_eq!(geometry.advance(1), Some(2.0));
     }
+}
+
+/// Geometry whose characters occupy consecutive native paint handles.
+/// The adapter supplies a representable handle range and either uniform
+/// extents or one font metric per character. Shared arrays are retained.
+pub fn shaped_run_painted(
+    geometry: ShapedTextRun,
+    first_handle: GlyphHandle,
+    metrics: RunFontMetrics,
+) -> ShapedRun {
+    ShapedRun {
+        geometry,
+        paint: Some(RunPaint {
+            first_handle,
+            metrics,
+        }),
+    }
+}
+
+pub fn shaped_text_run_caret_stops(value: &ShapedTextRun) -> Option<&CaretPositions> {
+    value.native.as_ref().map(|native| &native.caret_stops)
+}
+
+/// Native geometry with individual glyph painting supplied by `shape_glyph`.
+pub fn shaped_run_geometry(geometry: ShapedTextRun) -> ShapedRun {
+    ShapedRun {
+        geometry,
+        paint: None,
+    }
+}
+
+/// The caller supplies a resolved CSS angle from -90 through 90 degrees.
+pub fn font_slant_oblique(degrees: f32) -> FontSlant {
+    FontSlant::Oblique {
+        angle: ObliqueAngle(degrees.to_bits()),
+    }
+}
+
+pub fn text_run_shape_request_style<'a, 's>(
+    value: &'s TextRunShapeRequest<'a>,
+) -> &'s ShapingStyle<'a> {
+    &value.style
+}
+
+/// Per-character overrides. `None` means every character uses
+/// [`ShapingStyle::color`] from the shaping style.
+pub fn text_run_shape_request_paint_colors<'a>(
+    value: &TextRunShapeRequest<'a>,
+) -> Option<&'a [u32]> {
+    value.paint_colors
+}
+
+pub fn shaped_text_run_advances(value: &ShapedTextRun) -> &[f32] {
+    &value.advances
+}
+
+/// The adapter supplies finite, non-negative advances and one more cluster
+/// boundary than advances, with both outer boundaries enabled.
+pub fn shaped_text_run_new(advances: Arc<[f32]>, cluster_boundaries: Arc<[bool]>) -> ShapedTextRun {
+    ShapedTextRun {
+        advances,
+        cluster_boundaries,
+        native: None,
+    }
+}
+
+#[inline]
+pub const fn cursive_joining_connects_to_next(value: CursiveJoining) -> bool {
+    matches!(
+        value,
+        CursiveJoining::ConnectedToNext | CursiveJoining::ConnectedToBoth
+    )
+}
+
+pub fn shaped_text_run_cluster_boundaries(value: &ShapedTextRun) -> &[bool] {
+    &value.cluster_boundaries
+}
+
+/// The adapter also supplies finite ascent and caret positions, with one
+/// caret per character boundary. All arrays refer to the same logical run.
+pub fn shaped_text_run_with_backend_run(
+    advances: Arc<[f32]>,
+    cluster_boundaries: Arc<[bool]>,
+    backend_run: TextRunId,
+    caret_stops: CaretPositions,
+    ascent: f32,
+) -> ShapedTextRun {
+    ShapedTextRun {
+        advances,
+        cluster_boundaries,
+        native: Some(NativeRunGeometry {
+            run: backend_run,
+            caret_stops,
+            ascent,
+        }),
+    }
+}
+
+pub fn text_run_shape_request_text<'a>(value: &TextRunShapeRequest<'a>) -> &'a str {
+    value.text
+}
+
+#[inline]
+pub const fn cursive_joining_connects_to_previous(value: CursiveJoining) -> bool {
+    matches!(
+        value,
+        CursiveJoining::ConnectedToPrevious | CursiveJoining::ConnectedToBoth
+    )
+}
+
+/// Select a character's resolved family, including the reader's CJK override.
+pub fn shaping_style_font_family_for_character<'a>(
+    value: &ShapingStyle<'a>,
+    character: char,
+) -> Option<&'a str> {
+    value
+        .cjk_font_family
+        .filter(|_| html_style_model::is_cjk_character(character))
+        .or(value.font_family)
+}
+
+/// Font content extents at a CSS font size, before line-height leading.
+pub fn font_relative_metrics_line_box_extents(
+    value: FontRelativeMetrics,
+    font_size: f64,
+) -> (f64, f64) {
+    value.line_metrics.map_or_else(
+        || (font_size * 0.8, font_size * 0.2),
+        |metrics| {
+            (
+                font_size * f64::from(metrics.ascent_ratio),
+                font_size * f64::from(metrics.descent_ratio),
+            )
+        },
+    )
+}
+
+pub fn shape_error_registry_capacity_exhausted(metrics_len: usize) -> ShapeError {
+    ShapeError {
+        kind: ShapeErrorKind::RegistryCapacityExhausted { metrics_len },
+    }
+}
+
+pub fn oblique_angle_degrees(value: ObliqueAngle) -> f32 {
+    f32::from_bits(value.0)
+}
+
+pub fn shaped_text_run_backend_run(value: &ShapedTextRun) -> Option<TextRunId> {
+    value.native.as_ref().map(|native| native.run)
+}
+
+pub fn shaped_text_run_ascent(value: &ShapedTextRun) -> f32 {
+    value.native.as_ref().map_or(0.0, |native| native.ascent)
+}
+
+pub fn shaped_run_into_geometry(value: ShapedRun) -> ShapedTextRun {
+    value.geometry
 }

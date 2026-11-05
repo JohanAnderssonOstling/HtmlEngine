@@ -6,6 +6,7 @@ use html_dom::{Document, MemoryUsageReport};
 use html_style_model::{ComputedStyles, ReaderStyleOverrides, StyleIndices, StylePaintColors};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use std::mem::replace;
+use html_style_model::reader_style;
 
 use html_engine_model::{PAINT_LINK as LINK, PAINT_ROOT as ROOT, PaintView};
 
@@ -130,20 +131,8 @@ impl<'a> PaintStyles<'a> {
                     .unwrap_or_else(|| styles.default_indices()),
             );
         }
-        for node in document.node_ids() {
-            for indices in [
-                styles.style_for_node(node),
-                styles.first_line_style_for_node(node),
-                styles.first_letter_style_for_node(node),
-                styles.before_first_letter_style_for_node(node),
-                styles.before_style_for_node(node).map(|entry| entry.0),
-                styles.after_style_for_node(node).map(|entry| entry.0),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                retain(indices);
-            }
+        for indices in styles.bound_styles().chain(tree.non_box_styles()) {
+            retain(indices);
         }
         Self {
             overrides: ReaderStyleOverrides::default(),
@@ -164,7 +153,7 @@ impl<'a> PaintStyles<'a> {
         tree: &LayoutTree,
         overrides: &ReaderStyleOverrides,
     ) -> PaintStyles<'_> {
-        let overrides = overrides.paint_overrides();
+        let overrides = reader_style::paint_overrides(&overrides);
         if overrides == ReaderStyleOverrides::default() {
             return PaintStyles {
                 overrides,
@@ -176,23 +165,7 @@ impl<'a> PaintStyles<'a> {
         }
         // Palette changes evaluate each distinct style once. They never walk
         // DOM ancestry, rebuild topology, or reintern typography properties.
-        let other_styles: FxHashMap<_, _> = self
-            .bindings
-            .styles
-            .iter()
-            .copied()
-            .map(|indices| {
-                (
-                    indices,
-                    styles
-                        .reader_paint_colors(indices, &overrides, false, false)
-                        .expect("validated publication style"),
-                )
-            })
-            .collect();
-        let linked_styles: FxHashMap<_, _> = if overrides.link_foreground.is_some()
-            && self.bindings.linked_nodes.iter().any(|&linked| linked != 0)
-        {
+        let colors_for = |is_link| {
             self.bindings
                 .styles
                 .iter()
@@ -201,11 +174,17 @@ impl<'a> PaintStyles<'a> {
                     (
                         indices,
                         styles
-                            .reader_paint_colors(indices, &overrides, false, true)
-                            .expect("validated linked paint binding"),
+                            .reader_paint_colors(indices, &overrides, false, is_link)
+                            .expect("validated paint binding"),
                     )
                 })
-                .collect()
+                .collect::<FxHashMap<_, _>>()
+        };
+        let other_styles = colors_for(false);
+        let linked_styles = if overrides.link_foreground.is_some()
+            && self.bindings.linked_nodes.iter().any(|&linked| linked != 0)
+        {
+            colors_for(true)
         } else {
             FxHashMap::default()
         };
@@ -300,20 +279,18 @@ impl<'a> PaintStyles<'a> {
     }
 
     pub(crate) fn replace_palette(&mut self, palette: PaintPalette) -> PaintPalette {
-        let old = PaintPalette {
+        PaintPalette {
             overrides: replace(&mut self.overrides, palette.overrides),
             boxes: replace(&mut self.boxes, palette.boxes),
-            other_styles: replace(&mut self.other_styles, Storage::owned(palette.other_styles))
-                .into_owned()
+            other_styles: self
+                .other_styles
+                .replace_owned(palette.other_styles)
                 .expect("palette owner"),
-            linked_styles: replace(
-                &mut self.linked_styles,
-                Storage::owned(palette.linked_styles),
-            )
-            .into_owned()
-            .expect("palette owner"),
-        };
-        old
+            linked_styles: self
+                .linked_styles
+                .replace_owned(palette.linked_styles)
+                .expect("palette owner"),
+        }
     }
 
     pub(crate) fn into_note_paint(self) -> NotePaint {
@@ -330,36 +307,12 @@ impl<'a> PaintStyles<'a> {
 
     pub(crate) fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
-        report.add_slice_storage::<u8>(
-            "PaintBindings.contexts",
-            self.bindings.contexts.len(),
-            self.bindings.contexts.len(),
-        );
-        report.add_slice_storage::<u8>(
-            "PaintBindings.linked_nodes",
-            self.bindings.linked_nodes.len(),
-            self.bindings.linked_nodes.len(),
-        );
-        report.add_slice_storage::<StyleIndices>(
-            "PaintBindings.styles",
-            self.bindings.styles.len(),
-            self.bindings.styles.len(),
-        );
-        report.add_slice_storage::<StylePaintColors>(
-            "PaintStyles.boxes",
-            self.boxes.len(),
-            self.boxes.len(),
-        );
-        report.add_slice_storage::<(StyleIndices, StylePaintColors)>(
-            "PaintStyles.other_styles",
-            self.other_styles.capacity(),
-            self.other_styles.len(),
-        );
-        report.add_slice_storage::<(StyleIndices, StylePaintColors)>(
-            "PaintStyles.linked_styles",
-            self.linked_styles.capacity(),
-            self.linked_styles.len(),
-        );
+        report.add_slice("PaintBindings.contexts", &self.bindings.contexts);
+        report.add_slice("PaintBindings.linked_nodes", &self.bindings.linked_nodes);
+        report.add_slice("PaintBindings.styles", &self.bindings.styles);
+        report.add_slice("PaintStyles.boxes", &self.boxes);
+        report.add_hash_map_storage("PaintStyles.other_styles", &self.other_styles);
+        report.add_hash_map_storage("PaintStyles.linked_styles", &self.linked_styles);
         report
     }
 }

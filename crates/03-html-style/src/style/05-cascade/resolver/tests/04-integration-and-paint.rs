@@ -331,7 +331,7 @@ fn metric_dependent_values_cross_only_when_the_model_has_a_closed_representation
     assert_eq!(view.font_size(), 20.0);
     assert_eq!(view.line_height(), 0.0);
     assert_eq!(used.line_height(), 24.0);
-    assert_eq!(view.letter_spacing(), 3.0);
+    assert_eq!(used.letter_spacing(), 24.0);
     assert_eq!(view.width(), PreferredSize::Ch(40.0));
 }
 

@@ -1,9 +1,9 @@
-use html_dom::{Document, DomNodeId, NodeRef};
+use html_dom::{Document, DomNodeId, ElementRef, NodeRef};
 use html_style_model::{ComputedStyles, Display};
 
 use super::classification::{
-    display_for_element, display_for_style, is_block_level_pseudo_display,
-    is_table_internal_display, starts_new_block_child_for_element,
+    display_for_element, has_table_internal_descendant, pseudo_is_block_level,
+    pseudo_display, starts_new_block_child_for_element,
 };
 use super::inline::has_block_child;
 
@@ -83,7 +83,7 @@ pub(super) fn plan_block_children(
 fn append_children(
     document: &Document,
     styles: &ComputedStyles,
-    element: html_dom::ElementRef<'_>,
+    element: ElementRef<'_>,
     wrap_table_internals: bool,
     before_pending: &mut bool,
     inline_segment: &mut Vec<u32>,
@@ -95,7 +95,7 @@ fn append_children(
             Some(NodeRef::Element(child)) => {
                 let display = display_for_element(styles, child);
                 if display == Display::Contents
-                    && has_table_internal_descendant(document, styles, child)
+                    && has_table_internal_descendant(styles, child)
                 {
                     // A box-suppressed ancestor must be transparent to table
                     // fixup. Keep its descendants in the current table
@@ -125,7 +125,7 @@ fn append_children(
                     actions.push(BlockChildAction::ContentsWithTableInternals(child_id));
                     continue;
                 }
-                if wrap_table_internals && is_table_internal_display(display) {
+                if wrap_table_internals && display.is_table_internal() {
                     flush_inline(inline_segment, before_pending, false, actions);
                     table_segment.push(child_id.raw());
                     continue;
@@ -136,7 +136,7 @@ fn append_children(
                     flush_inline(inline_segment, before_pending, false, actions);
                     actions.push(BlockChildAction::Principal(child_id));
                 } else if matches!(display, Display::Inline | Display::Contents)
-                    && has_block_child(document, styles, child)
+                    && has_block_child(styles, child)
                 {
                     flush_inline(inline_segment, before_pending, false, actions);
                     actions.push(BlockChildAction::SplitInline(child_id));
@@ -156,32 +156,10 @@ fn append_children(
     }
 }
 
-fn has_table_internal_descendant(
-    document: &Document,
-    styles: &ComputedStyles,
-    element: html_dom::ElementRef<'_>,
-) -> bool {
-    element.children().any(|child_id| {
-        document.element_ref(child_id).is_some_and(|child| {
-            let display = display_for_element(styles, child);
-            is_table_internal_display(display)
-                || (display == Display::Contents
-                    && has_table_internal_descendant(document, styles, child))
-        })
-    })
-}
-
 fn generated_edge(styles: &ComputedStyles, origin: DomNodeId, before: bool) -> GeneratedEdge {
-    let pseudo = if before {
-        styles.before_style_for_node(origin)
-    } else {
-        styles.after_style_for_node(origin)
-    };
-    match pseudo {
+    match pseudo_display(styles, origin, before) {
         None => GeneratedEdge::None,
-        Some((style, _, _)) if is_block_level_pseudo_display(display_for_style(styles, style)) => {
-            GeneratedEdge::Block
-        }
+        Some(_) if pseudo_is_block_level(styles, origin, before) => GeneratedEdge::Block,
         Some(_) => GeneratedEdge::Inline,
     }
 }

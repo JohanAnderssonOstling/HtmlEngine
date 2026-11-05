@@ -1,4 +1,5 @@
-use html_dom::{Document, DomNodeId};
+use html_dom::storage;
+use html_dom::{Document, DomNodeId, ElementRef};
 use html_style_model::{ComputedStyles, Display};
 use rustc_data_structures::fx::FxHashMap;
 
@@ -15,13 +16,37 @@ pub(super) struct ListItemOrdinals {
 impl ListItemOrdinals {
     pub(super) fn new(document: &Document, styles: &ComputedStyles) -> Self {
         let mut groups = FxHashMap::<DomNodeId, Vec<DomNodeId>>::default();
-        if let Some(root) = document.dom_root() {
-            collect_rendered_list_items(document, styles, root, None, &mut groups);
+        if let Some(root) = document.dom_root()
+            && let Some(root) = document.element_ref(root)
+        {
+            collect_rendered_list_items(styles, root, None, &mut groups);
         }
 
         let mut values = vec![1; document.node_count()];
         for (owner, items) in groups {
-            assign_group_ordinals(document, owner, &items, &mut values);
+            let owner = document
+                .element_ref(owner)
+                .expect("list ordinal owner must be an element");
+            let ordered = owner.namespace() == Some("http://www.w3.org/1999/xhtml")
+                && owner.tag().eq_ignore_ascii_case("ol");
+            let reversed = ordered && storage::html_list_reversed(owner);
+            let start = ordered.then(|| storage::html_list_start(owner)).flatten();
+            let mut current = start.unwrap_or(if reversed { items.len() as i64 } else { 1 });
+            let step = if reversed { -1 } else { 1 };
+
+            for &item in &items {
+                if ordered
+                    && let Some(value) = document
+                        .element_ref(item)
+                        .and_then(|element| storage::html_list_item_value(element))
+                {
+                    current = value;
+                }
+                if let Some(slot) = values.get_mut(item.index()) {
+                    *slot = current;
+                }
+                current = current.saturating_add(step);
+            }
         }
         Self { values }
     }
@@ -32,15 +57,12 @@ impl ListItemOrdinals {
 }
 
 fn collect_rendered_list_items(
-    document: &Document,
     styles: &ComputedStyles,
-    node: DomNodeId,
+    element: ElementRef<'_>,
     nearest_list_owner: Option<DomNodeId>,
     groups: &mut FxHashMap<DomNodeId, Vec<DomNodeId>>,
 ) {
-    let Some(element) = document.element_ref(node) else {
-        return;
-    };
+    let node = element.node_id();
     let display = display_for_element(styles, element);
 
     // A display:none subtree generates no list-item boxes and does not
@@ -64,10 +86,8 @@ fn collect_rendered_list_items(
     } else {
         nearest_list_owner
     };
-    for child in element.children() {
-        if document.element_ref(child).is_some() {
-            collect_rendered_list_items(document, styles, child, child_list_owner, groups);
-        }
+    for child in element.child_elements() {
+        collect_rendered_list_items(styles, child, child_list_owner, groups);
     }
 }
 
@@ -80,37 +100,6 @@ fn resets_list_item_counter(styles: &ComputedStyles, node: DomNodeId) -> bool {
                 .iter()
                 .any(|directive| styles.string(directive.name) == Some("list-item"))
         })
-}
-
-fn assign_group_ordinals(
-    document: &Document,
-    owner: DomNodeId,
-    items: &[DomNodeId],
-    values: &mut [i64],
-) {
-    let owner = document
-        .element_ref(owner)
-        .expect("list ordinal owner must be an element");
-    let ordered = owner.namespace() == Some("http://www.w3.org/1999/xhtml")
-        && owner.tag().eq_ignore_ascii_case("ol");
-    let reversed = ordered && owner.html_list_reversed();
-    let start = ordered.then(|| owner.html_list_start()).flatten();
-    let mut current = start.unwrap_or_else(|| if reversed { items.len() as i64 } else { 1 });
-    let step = if reversed { -1 } else { 1 };
-
-    for &item in items {
-        if ordered
-            && let Some(value) = document
-                .element_ref(item)
-                .and_then(|element| element.html_list_item_value())
-        {
-            current = value;
-        }
-        if let Some(slot) = values.get_mut(item.index()) {
-            *slot = current;
-        }
-        current = current.saturating_add(step);
-    }
 }
 
 #[cfg(test)]

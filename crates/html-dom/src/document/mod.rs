@@ -2,10 +2,12 @@ pub mod cfi;
 mod dom;
 mod memory;
 mod resources;
+mod source;
 
 pub use dom::*;
 pub use memory::*;
 pub use resources::*;
+pub use source::*;
 
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -36,13 +38,13 @@ pub enum DocumentMode {
 #[repr(transparent)]
 pub struct RootFontSize(f32);
 
+// Construction excludes NaN, so equality is reflexive.
+impl Eq for RootFontSize {}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct InvalidRootFontSize;
 
 impl RootFontSize {
-    pub fn new(value: f32) -> Result<Self, InvalidRootFontSize> {
-        if value.is_finite() && value > 0.0 { Ok(Self(value)) } else { Err(InvalidRootFontSize) }
-    }
 
     pub fn get(self) -> f32 {
         self.0
@@ -88,6 +90,15 @@ impl Document {
         self.root_font_size = root_font_size;
     }
 
+    /// Effective resource base after resolving the first HTML base element.
+    pub fn resource_base_uri(&self) -> Option<&str> {
+        self.resource_base_uri.as_deref()
+    }
+
+    pub fn set_resource_base_uri(&mut self, uri: String) {
+        self.resource_base_uri = Some(uri);
+    }
+
     pub fn title(&self) -> Option<&str> {
         self.title.as_deref()
     }
@@ -98,6 +109,11 @@ impl Document {
 
     pub fn intern_string(&mut self, value: &str) -> u16 {
         self.strings.intern(value)
+    }
+
+    /// Intern a string without exceeding compact DOM storage capacity.
+    pub fn try_intern_string(&mut self, value: &str) -> Result<u16, DocumentBuildError> {
+        self.strings.try_intern(value)
     }
 
     pub fn string(&self, idx: u16) -> &str {
@@ -128,19 +144,22 @@ impl Document {
 
     pub fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
-        report.add_slice_storage::<DomNode>("Document.dom_nodes.storage", self.dom_nodes.capacity(), self.dom_nodes.len());
+        report.add_vec_storage("Document.dom_nodes.storage", &self.dom_nodes);
         for node in &self.dom_nodes {
             report.extend_prefixed("Document.dom_nodes", node.memory_usage_report());
         }
-        report.add_slice_storage::<ImageResource>("Document.images.storage", self.images.capacity(), self.images.len());
+        report.add_vec_storage("Document.images.storage", &self.images);
         for image in &self.images {
             report.extend_prefixed("Document.images", image.memory_usage_report());
         }
         if let Some(title) = &self.title {
-            report.add_slice_storage::<u8>("Document.title.storage", title.capacity(), title.len());
+            report.add_string_storage("Document.title.storage", title);
+        }
+        if let Some(uri) = &self.resource_base_uri {
+            report.add_string_storage("Document.resource_base_uri.storage", uri);
         }
         report.extend_prefixed("Document.strings", self.strings.memory_usage_report());
-        report.add_slice_storage::<u16>("Document.class_list.storage", self.class_list.capacity(), self.class_list.len());
+        report.add_vec_storage("Document.class_list.storage", &self.class_list);
         report
     }
 }
@@ -158,6 +177,7 @@ pub struct Document {
     // Resources
     images: Vec<ImageResource>,
     title: Option<String>,
+    resource_base_uri: Option<String>,
 
     // Interning
     strings: StringInterner,
@@ -176,6 +196,7 @@ impl Default for Document {
             mode: DocumentMode::Html,
             images: Vec::new(),
             title: None,
+            resource_base_uri: None,
             strings: StringInterner::new(),
             class_list: Vec::new(),
             root_font_size: RootFontSize::default(),
@@ -189,10 +210,18 @@ mod invariant_tests {
 
     #[test]
     fn root_font_size_rejects_values_that_poison_style_math() {
-        assert!(RootFontSize::new(12.0).is_ok());
-        assert!(RootFontSize::new(0.0).is_err());
-        assert!(RootFontSize::new(-1.0).is_err());
-        assert!(RootFontSize::new(f32::NAN).is_err());
-        assert!(RootFontSize::new(f32::INFINITY).is_err());
+        assert!(root_font_size_new(12.0).is_ok());
+        assert!(root_font_size_new(0.0).is_err());
+        assert!(root_font_size_new(-1.0).is_err());
+        assert!(root_font_size_new(f32::NAN).is_err());
+        assert!(root_font_size_new(f32::INFINITY).is_err());
+    }
+}
+
+pub fn root_font_size_new(value: f32) -> Result<RootFontSize, InvalidRootFontSize> {
+    if value.is_finite() && value > 0.0 {
+        Ok(RootFontSize(value))
+    } else {
+        Err(InvalidRootFontSize)
     }
 }

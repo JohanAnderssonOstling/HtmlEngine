@@ -1,39 +1,41 @@
+use html_text::is_document_white_space;
+use html_dom::storage;
 use html_dom::{Document, DomNodeId, ElementRef, NodeRef};
 use html_style_model::{
-    BorderStyle, Clear, ComputedStyles, Display, Float, PositionMode, StyleIndices, StyleView,
-    WhiteSpace,
+    Clear, ComputedStyles, Display, PositionMode, StyleIndices, StyleView, WhiteSpace,
 };
 
 use super::classification::{
-    display_for_element, display_for_style, is_absolutely_positioned,
-    is_block_level_pseudo_display, is_floated, is_table_internal_display,
-    starts_inline_split_child, starts_new_block_child_for_element,
+    display_for_element, display_for_style, has_table_internal_descendant,
+    is_absolutely_positioned, is_floated, pseudo_display,
+    pseudo_is_block_level, starts_inline_split_child, starts_new_block_child_for_element,
 };
 use super::generated::ResolvedGeneratedContent;
 
-pub(super) enum InlineNodePlan {
+pub(super) enum InlineNodePlan<'a> {
     Ignore,
     Text(DomNodeId),
     Break {
         clear: Clear,
     },
-    GeneratedBreak {
-        node: DomNodeId,
+    WordBreak {
+        element: ElementRef<'a>,
         style: Option<StyleIndices>,
     },
-    OutOfFlow(DomNodeId),
-    Atomic(DomNodeId),
-    Contents {
-        node: DomNodeId,
-        children: Vec<u32>,
+    GeneratedBreak {
+        element: ElementRef<'a>,
+        style: Option<StyleIndices>,
     },
-    Element(InlineElementPlan),
-}
-
-pub(super) struct InlineElementPlan {
-    pub(super) fragment: InlineFragmentPlan,
-    pub(super) image: Option<u32>,
-    pub(super) children: Vec<u32>,
+    OutOfFlow {
+        node: DomNodeId,
+        absolute: bool,
+    },
+    Atomic(DomNodeId),
+    Contents(ElementRef<'a>),
+    Element {
+        fragment: InlineFragmentPlan,
+        element: ElementRef<'a>,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -50,11 +52,11 @@ pub(super) struct GeneratedInlinePlan {
     pub(super) end_edge: bool,
 }
 
-pub(super) fn plan_inline_node(
-    document: &Document,
+pub(super) fn plan_inline_node<'a>(
+    document: &'a Document,
     styles: &ComputedStyles,
     node: DomNodeId,
-) -> InlineNodePlan {
+) -> InlineNodePlan<'a> {
     let Some(node_ref) = document.node_ref(node) else {
         return InlineNodePlan::Ignore;
     };
@@ -67,10 +69,7 @@ pub(super) fn plan_inline_node(
     }
 
     if display == Display::Contents {
-        return InlineNodePlan::Contents {
-            node,
-            children: element.children().map(DomNodeId::raw).collect(),
-        };
+        return InlineNodePlan::Contents(element);
     }
 
     let style = styles.style_for_node(node);
@@ -78,7 +77,7 @@ pub(super) fn plan_inline_node(
         if styles.before_style_for_node(node).is_some()
             || styles.after_style_for_node(node).is_some()
         {
-            return InlineNodePlan::GeneratedBreak { node, style };
+            return InlineNodePlan::GeneratedBreak { element, style };
         }
         let clear = style
             .and_then(|indices| styles.box_model_style(indices))
@@ -86,28 +85,20 @@ pub(super) fn plan_inline_node(
         return InlineNodePlan::Break { clear };
     }
 
-    let float = style
-        .and_then(|indices| styles.box_model_style(indices))
-        .map_or(Float::None, |box_style| box_style.float);
-    let absolute = style
-        .and_then(|indices| styles.layout_style(indices))
-        .is_some_and(|layout_style| layout_style.position == PositionMode::Absolute);
-    if absolute || matches!(float, Float::Left | Float::Right) {
-        return InlineNodePlan::OutOfFlow(node);
+    if element.tag().eq_ignore_ascii_case("wbr") {
+        return InlineNodePlan::WordBreak { element, style };
     }
-    if matches!(
-        display,
-        Display::InlineBlock | Display::InlineFlex | Display::InlineGrid | Display::InlineTable
-    ) {
+
+    let absolute = is_absolutely_positioned(styles, element);
+    if absolute || is_floated(styles, element) {
+        return InlineNodePlan::OutOfFlow { node, absolute };
+    }
+    if display.is_atomic_inline() {
         return InlineNodePlan::Atomic(node);
     }
 
     let fragment = plan_inline_fragment(styles, node, style);
-    InlineNodePlan::Element(InlineElementPlan {
-        fragment,
-        image: element.image_idx(),
-        children: element.children().map(DomNodeId::raw).collect(),
-    })
+    InlineNodePlan::Element { fragment, element }
 }
 
 fn plan_inline_fragment(
@@ -143,27 +134,7 @@ pub(super) fn plan_generated_inline(
 fn inline_edges(styles: &ComputedStyles, style: Option<StyleIndices>) -> (bool, bool) {
     style
         .and_then(|indices| styles.view(indices))
-        .map(|view| inline_edges_for_view(&view))
-        .unwrap_or((false, false))
-}
-
-fn inline_edges_for_view(view: &StyleView<'_>) -> (bool, bool) {
-    (
-        !view.margin_left().is_zero()
-            || !view.padding_left().is_zero()
-            || (view.border_left_width() != html_style_model::FontRelativeLength::ZERO
-                && !matches!(
-                    view.border_left_style(),
-                    BorderStyle::None | BorderStyle::Hidden
-                )),
-        !view.margin_right().is_zero()
-            || !view.padding_right().is_zero()
-            || (view.border_right_width() != html_style_model::FontRelativeLength::ZERO
-                && !matches!(
-                    view.border_right_style(),
-                    BorderStyle::None | BorderStyle::Hidden
-                )),
-    )
+        .map_or((false, false), |view| view.inline_edges())
 }
 
 #[derive(Clone, Copy)]
@@ -204,15 +175,11 @@ enum CollectedSplitInlineEvent {
     GeneratedBlock { origin: DomNodeId, before: bool },
 }
 
-pub(super) fn has_block_child(
-    document: &Document,
-    styles: &ComputedStyles,
-    element: ElementRef<'_>,
-) -> bool {
+pub(super) fn has_block_child(styles: &ComputedStyles, element: ElementRef<'_>) -> bool {
     // Replaced elements are atomic CSS boxes. Their source DOM can describe
     // the resource (for example an inline SVG tree), but those descendants
     // never participate in block-in-inline splitting of the surrounding HTML.
-    if element.image_idx().is_some() {
+    if storage::image_idx(element).is_some() {
         return false;
     }
     let inline_container = matches!(
@@ -220,40 +187,22 @@ pub(super) fn has_block_child(
         Display::Inline | Display::Contents
     );
     pseudo_is_block_level(styles, element.node_id(), true)
-        || element.children().any(|child_idx| {
-            document.element_ref(child_idx).is_some_and(|child| {
-                let display = display_for_element(styles, child);
-                let starts_block =
-                    if is_absolutely_positioned(styles, child) || is_floated(styles, child) {
-                        false
-                    } else if inline_container {
-                        starts_inline_split_child(styles, child)
-                    } else {
-                        starts_new_block_child_for_element(styles, child)
-                    };
-                starts_block
-                    || (display == Display::Contents
-                        && has_table_internal_descendant(document, styles, child))
-                    || (matches!(display, Display::Inline | Display::Contents)
-                        && has_inline_splitting_block_descendant(document, styles, child))
-            })
+        || element.child_elements().any(|child| {
+            let display = display_for_element(styles, child);
+            let starts_block =
+                if is_absolutely_positioned(styles, child) || is_floated(styles, child) {
+                    false
+                } else if inline_container {
+                    starts_inline_split_child(styles, child)
+                } else {
+                    starts_new_block_child_for_element(styles, child)
+                };
+            starts_block
+                || (display == Display::Contents && has_table_internal_descendant(styles, child))
+                || (matches!(display, Display::Inline | Display::Contents)
+                    && has_inline_splitting_block_descendant(styles, child))
         })
         || pseudo_is_block_level(styles, element.node_id(), false)
-}
-
-fn has_table_internal_descendant(
-    document: &Document,
-    styles: &ComputedStyles,
-    element: ElementRef<'_>,
-) -> bool {
-    element.children().any(|child_id| {
-        document.element_ref(child_id).is_some_and(|child| {
-            let display = display_for_element(styles, child);
-            is_table_internal_display(display)
-                || (display == Display::Contents
-                    && has_table_internal_descendant(document, styles, child))
-        })
-    })
 }
 
 pub(super) fn plan_split_inline(
@@ -278,7 +227,8 @@ pub(super) fn plan_split_inline(
                 debug_assert_eq!(active.pop().map(|active| active.node), Some(fragment.node));
             }
             CollectedSplitInlineEvent::Inline(event) => segment.push(event),
-            CollectedSplitInlineEvent::Block(block) => {
+            block @ (CollectedSplitInlineEvent::Block(node)
+            | CollectedSplitInlineEvent::GeneratedBlock { origin: node, .. }) => {
                 segment.extend(active.iter().rev().copied().map(|fragment| {
                     SplitInlineEvent::Close {
                         fragment,
@@ -295,42 +245,20 @@ pub(super) fn plan_split_inline(
                             .is_some_and(|layout| layout.position == PositionMode::Relative)
                     })
                     .collect();
-                parts.push(SplitInlinePart::Block {
-                    node: block,
-                    position_ancestors,
-                });
-                segment.extend(
-                    active
-                        .iter()
-                        .copied()
-                        .map(|fragment| SplitInlineEvent::Open {
-                            fragment,
-                            first_fragment: false,
-                        }),
+                parts.push(
+                    if let CollectedSplitInlineEvent::GeneratedBlock { before, .. } = block {
+                        SplitInlinePart::GeneratedBlock {
+                            origin: node,
+                            before,
+                            position_ancestors,
+                        }
+                    } else {
+                        SplitInlinePart::Block {
+                            node,
+                            position_ancestors,
+                        }
+                    },
                 );
-            }
-            CollectedSplitInlineEvent::GeneratedBlock { origin, before } => {
-                segment.extend(active.iter().rev().copied().map(|fragment| {
-                    SplitInlineEvent::Close {
-                        fragment,
-                        last_fragment: false,
-                    }
-                }));
-                finish_split_inline_segment(document, styles, &mut segment, &mut parts);
-                let position_ancestors = active
-                    .iter()
-                    .filter_map(|fragment| fragment.style)
-                    .filter(|&style| {
-                        styles
-                            .layout_style(style)
-                            .is_some_and(|layout| layout.position == PositionMode::Relative)
-                    })
-                    .collect();
-                parts.push(SplitInlinePart::GeneratedBlock {
-                    origin,
-                    before,
-                    position_ancestors,
-                });
                 segment.extend(
                     active
                         .iter()
@@ -398,7 +326,7 @@ fn collect_split_children(
         if starts_inline_split_child(styles, child) {
             events.push(CollectedSplitInlineEvent::Block(child_id));
         } else if matches!(display, Display::Inline | Display::Contents)
-            && has_inline_splitting_block_descendant(document, styles, child)
+            && has_inline_splitting_block_descendant(styles, child)
         {
             collect_split_inline_events(document, styles, child_id, events);
         } else {
@@ -415,18 +343,13 @@ fn collect_split_pseudo(
     before: bool,
     events: &mut Vec<CollectedSplitInlineEvent>,
 ) {
-    let Some((style, _, _)) = (if before {
-        styles.before_style_for_node(origin)
-    } else {
-        styles.after_style_for_node(origin)
-    }) else {
+    let Some(display) = pseudo_display(styles, origin, before) else {
         return;
     };
-    let display = display_for_style(styles, style);
     if display == Display::None {
         return;
     }
-    if is_block_level_pseudo_display(display) {
+    if pseudo_is_block_level(styles, origin, before) {
         events.push(CollectedSplitInlineEvent::GeneratedBlock { origin, before });
     } else {
         events.push(CollectedSplitInlineEvent::Inline(
@@ -444,24 +367,23 @@ fn finish_split_inline_segment(
     if events.is_empty() {
         return;
     }
-    let first_content = events.iter().position(|event| match event {
-        SplitInlineEvent::Node(node) => !node_is_ignorable_at_block_edge(
+    let ignorable = |node| {
+        node_is_ignorable_at_block_edge(
             document,
             styles,
-            *node,
-            white_space_for_node(document, styles, *node),
-        ),
-        _ => false,
-    });
-    let last_content = events.iter().rposition(|event| match event {
-        SplitInlineEvent::Node(node) => !node_is_ignorable_at_block_edge(
-            document,
-            styles,
-            *node,
-            white_space_for_node(document, styles, *node),
-        ),
-        _ => false,
-    });
+            node,
+            style_for_dom_node(document, styles, node).white_space(),
+        )
+    };
+    let mut content = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| match event {
+            SplitInlineEvent::Node(node) if !ignorable(*node) => Some(index),
+            _ => None,
+        });
+    let first_content = content.next();
+    let last_content = content.next_back().or(first_content);
     let events = std::mem::take(events)
         .into_iter()
         .enumerate()
@@ -470,12 +392,7 @@ fn finish_split_inline_segment(
                 if first_content
                     .zip(last_content)
                     .is_none_or(|(first, last)| event_idx < first || event_idx > last)
-                    && node_is_ignorable_at_block_edge(
-                        document,
-                        styles,
-                        node,
-                        white_space_for_node(document, styles, node),
-                    ) =>
+                    && ignorable(node) =>
             {
                 None
             }
@@ -485,35 +402,18 @@ fn finish_split_inline_segment(
     parts.push(SplitInlinePart::Segment(events));
 }
 
-fn has_inline_splitting_block_descendant(
-    document: &Document,
-    styles: &ComputedStyles,
-    element: ElementRef<'_>,
-) -> bool {
-    if element.image_idx().is_some() {
+fn has_inline_splitting_block_descendant(styles: &ComputedStyles, element: ElementRef<'_>) -> bool {
+    if storage::image_idx(element).is_some() {
         return false;
     }
     pseudo_is_block_level(styles, element.node_id(), true)
-        || element.children().any(|child_idx| {
-            document.element_ref(child_idx).is_some_and(|child| {
-                let display = display_for_element(styles, child);
-                starts_inline_split_child(styles, child)
-                    || (matches!(display, Display::Inline | Display::Contents)
-                        && has_inline_splitting_block_descendant(document, styles, child))
-            })
+        || element.child_elements().any(|child| {
+            let display = display_for_element(styles, child);
+            starts_inline_split_child(styles, child)
+                || (matches!(display, Display::Inline | Display::Contents)
+                    && has_inline_splitting_block_descendant(styles, child))
         })
         || pseudo_is_block_level(styles, element.node_id(), false)
-}
-
-fn pseudo_is_block_level(styles: &ComputedStyles, origin: DomNodeId, before: bool) -> bool {
-    let pseudo = if before {
-        styles.before_style_for_node(origin)
-    } else {
-        styles.after_style_for_node(origin)
-    };
-    pseudo.is_some_and(|(style, _, _)| {
-        is_block_level_pseudo_display(display_for_style(styles, style))
-    })
 }
 
 pub(super) fn trim_inline_segment_nodes<'a>(
@@ -522,37 +422,34 @@ pub(super) fn trim_inline_segment_nodes<'a>(
     nodes: &'a [u32],
     white_space: WhiteSpace,
 ) -> &'a [u32] {
-    let mut start = 0usize;
-    let mut end = nodes.len();
-
-    while start < end
-        && document.node_id_from_raw(nodes[start]).is_some_and(|node| {
+    let segment = trim_node_edges(nodes, |raw| {
+        document.node_id_from_raw(raw).is_some_and(|node| {
             node_is_ignorable_at_block_edge(document, styles, node, white_space)
         })
+    });
+    if segment
+        .iter()
+        .copied()
+        .filter_map(|raw| document.node_id_from_raw(raw))
+        .any(|node| node_has_renderable_inline_content(document, styles, node))
     {
-        start += 1;
-    }
-    while start < end
-        && document
-            .node_id_from_raw(nodes[end - 1])
-            .is_some_and(|node| {
-                node_is_ignorable_at_block_edge(document, styles, node, white_space)
-            })
-    {
-        end -= 1;
-    }
-
-    if start >= end
-        || !nodes[start..end]
-            .iter()
-            .copied()
-            .filter_map(|raw| document.node_id_from_raw(raw))
-            .any(|node| node_has_renderable_inline_content(document, styles, node))
-    {
-        &nodes[0..0]
+        segment
     } else {
-        &nodes[start..end]
+        &nodes[0..0]
     }
+}
+
+pub(super) fn trim_node_edges(nodes: &[u32], mut ignorable: impl FnMut(u32) -> bool) -> &[u32] {
+    let start = nodes
+        .iter()
+        .position(|&node| !ignorable(node))
+        .unwrap_or(nodes.len());
+    let nodes = &nodes[start..];
+    let end = nodes
+        .iter()
+        .rposition(|&node| !ignorable(node))
+        .map_or(0, |index| index + 1);
+    &nodes[..end]
 }
 
 fn node_is_ignorable_at_block_edge(
@@ -568,14 +465,6 @@ fn node_is_ignorable_at_block_edge(
     }
 }
 
-fn white_space_for_node(
-    document: &Document,
-    styles: &ComputedStyles,
-    node: DomNodeId,
-) -> WhiteSpace {
-    style_for_dom_node(document, styles, node).white_space()
-}
-
 pub(super) fn text_is_ignorable_at_block_edge(text: &str, white_space: WhiteSpace) -> bool {
     if white_space.preserves_spaces() {
         false
@@ -583,12 +472,12 @@ pub(super) fn text_is_ignorable_at_block_edge(text: &str, white_space: WhiteSpac
         !text.is_empty()
             && text
                 .chars()
-                .all(|character| matches!(character, ' ' | '\t' | '\r' | '\u{000C}'))
+                .all(|character| matches!(character, ' ' | '\t' | '\r'))
     } else {
         !text.is_empty()
             && text
                 .chars()
-                .all(|character| character.is_whitespace() && character != '\u{00A0}')
+                .all(|character| is_document_white_space(character))
     }
 }
 
@@ -626,21 +515,13 @@ fn node_has_renderable_inline_content(
             {
                 return true;
             }
-            let style = styles.view(style_indices).expect("validated style handle");
-            if matches!(
-                display,
-                Display::InlineBlock
-                    | Display::InlineFlex
-                    | Display::InlineGrid
-                    | Display::InlineTable
-            ) || matches!(style.float(), Float::Left | Float::Right)
-                || styles
-                    .layout_style(style_indices)
-                    .is_some_and(|layout| layout.position == PositionMode::Absolute)
+            if display.is_atomic_inline()
+                || is_floated(styles, element)
+                || is_absolutely_positioned(styles, element)
             {
                 return true;
             }
-            if element.tag().eq_ignore_ascii_case("br") || element.image_idx().is_some() {
+            if element.tag().eq_ignore_ascii_case("br") || storage::image_idx(element).is_some() {
                 return true;
             }
             // CSS 2 line-height calculation includes empty inline boxes even
@@ -662,11 +543,11 @@ fn text_has_renderable_content(text: &str, white_space: WhiteSpace) -> bool {
         !text.is_empty()
     } else if white_space.preserves_newlines() {
         text.chars().any(|character| {
-            character == '\n' || !character.is_whitespace() || character == '\u{00A0}'
+            character == '\n' || !is_document_white_space(character)
         })
     } else {
         text.chars()
-            .any(|character| !character.is_whitespace() || character == '\u{00A0}')
+            .any(|character| !is_document_white_space(character))
     }
 }
 
@@ -675,15 +556,13 @@ fn style_for_dom_node<'a>(
     styles: &'a ComputedStyles,
     node: DomNodeId,
 ) -> StyleView<'a> {
-    let indices = match document.node_ref(node) {
-        Some(NodeRef::Element(element)) => styles
-            .style_for_node(element.node_id())
-            .unwrap_or_else(|| styles.default_indices()),
-        Some(NodeRef::Text(text)) => text
-            .parent()
-            .and_then(|parent| styles.style_for_node(parent))
-            .unwrap_or_else(|| styles.default_indices()),
-        None => styles.default_indices(),
+    let owner = match document.node_ref(node) {
+        Some(NodeRef::Element(element)) => Some(element.node_id()),
+        Some(NodeRef::Text(text)) => text.parent(),
+        None => None,
     };
+    let indices = owner
+        .and_then(|owner| styles.style_for_node(owner))
+        .unwrap_or_else(|| styles.default_indices());
     styles.view(indices).expect("validated style handle")
 }

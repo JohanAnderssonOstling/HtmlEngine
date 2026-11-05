@@ -1,26 +1,71 @@
+use crate::layout::{LayoutReader, resolve_definite_outer_inline_size};
+use crate::layout_model::TableColumnWidthHint;
+pub(super) use crate::layout_model::{TableCellPlacement, TableGrid, build_table_grid};
+use html_style_model::{UsedPreferredSize, UsedStyleView};
 use std::ops::Range;
 
-#[derive(Clone, Copy)]
-pub(super) struct TableCellPlacement {
-    pub(super) cell_idx: usize,
-    pub(super) row: usize,
-    pub(super) col: usize,
-    pub(super) colspan: usize,
-    pub(super) source_colspan: usize,
-    pub(super) rowspan: usize,
-}
-
-impl TableCellPlacement {
-    pub(super) fn column_range(self, column_count: usize) -> Option<Range<usize>> {
-        let start = self.col.min(column_count);
-        let end = self.col.saturating_add(self.colspan).min(column_count);
-        (start < end).then_some(start..end)
+pub(super) fn column_width_style<'a>(
+    reader: &LayoutReader<'a>,
+    hint: TableColumnWidthHint,
+) -> UsedStyleView<'a> {
+    let primary = reader.used_style(hint.style);
+    if matches!(primary.width(), UsedPreferredSize::Auto) {
+        hint.fallback_style
+            .map_or(primary, |style| reader.used_style(style))
+    } else {
+        primary
     }
 }
 
-pub(super) struct TableGrid {
-    pub(super) placements: Vec<TableCellPlacement>,
-    pub(super) column_count: usize,
+pub(super) fn definite_width_constraints(
+    style: UsedStyleView<'_>,
+    extras: f64,
+) -> (f64, f64, Option<f64>) {
+    let resolve = |size| resolve_definite_outer_inline_size(size, style.box_sizing(), extras, 0.0);
+    let minimum = resolve(style.min_width()).unwrap_or(0.0);
+    let maximum = resolve(style.max_width())
+        .unwrap_or(f64::INFINITY)
+        .max(minimum);
+    let width = resolve(style.width()).map(|width| width.clamp(minimum, maximum));
+    (minimum, maximum, width)
+}
+
+pub(super) fn column_width_constraints(
+    reader: &LayoutReader<'_>,
+    hint: TableColumnWidthHint,
+) -> (f64, Option<f64>) {
+    let primary = reader.used_style(hint.style);
+    let (own_minimum, own_maximum, _) = definite_width_constraints(primary, 0.0);
+    let (minimum, _, width) = definite_width_constraints(column_width_style(reader, hint), 0.0);
+    // A group's width fallback must still respect the column's own bounds.
+    let minimum = minimum.max(own_minimum);
+    let width = width.map(|width| width.clamp(minimum, own_maximum.max(minimum)));
+    (minimum, width)
+}
+
+pub(super) fn percentage_component(value: UsedPreferredSize) -> Option<f64> {
+    match value {
+        UsedPreferredSize::Percent(percentage) => Some(percentage as f64),
+        UsedPreferredSize::Calc {
+            absolute_px: 0.0,
+            percentage,
+            ..
+        } => Some(percentage as f64),
+        _ => None,
+    }
+}
+
+pub(super) fn row_group_range(
+    reader: &LayoutReader<'_>,
+    rows: &[u32],
+    group_idx: usize,
+) -> Option<Range<usize>> {
+    let mut positions = rows.iter().enumerate().filter_map(|(row, &row_idx)| {
+        (reader.get_parent(row_idx as usize) == Some(group_idx)).then_some(row)
+    });
+    let first = positions.next()?;
+    let last = positions.next_back().unwrap_or(first);
+    Some(first..last + 1)
 }
 
 pub(super) struct TableColumnLayout {
@@ -31,66 +76,17 @@ pub(super) struct TableColumnLayout {
 }
 
 impl TableColumnLayout {
+    pub(super) fn span_width(&self, column: usize, span: usize) -> f64 {
+        span_extent(&self.starts, &self.widths, column, span)
+    }
+
     pub(super) fn physical_start(&self, column: usize, span: usize) -> f64 {
         let start = self.starts.get(column).copied().unwrap_or(0.0);
         if self.rtl {
-            self.table_width - start - span_extent(&self.starts, &self.widths, column, span)
+            self.table_width - start - self.span_width(column, span)
         } else {
             start
         }
-    }
-}
-
-pub(super) fn build_table_grid(
-    rows: impl IntoIterator<Item = Vec<(usize, usize, usize)>>,
-) -> TableGrid {
-    let mut placements = Vec::new();
-    let mut carry_rowspans: Vec<usize> = Vec::new();
-    let mut max_columns = 0usize;
-
-    for (row_idx, cells) in rows.into_iter().enumerate() {
-        if row_idx > 0 {
-            for span in &mut carry_rowspans {
-                if *span > 0 {
-                    *span -= 1;
-                }
-            }
-            while matches!(carry_rowspans.last(), Some(0)) {
-                carry_rowspans.pop();
-            }
-        }
-
-        let mut col = 0usize;
-        for (cell_idx, colspan, rowspan) in cells {
-            while col < carry_rowspans.len() && carry_rowspans[col] > 0 {
-                col += 1;
-            }
-
-            let colspan = colspan.max(1);
-            let rowspan = rowspan.max(1);
-            let end_col = col + colspan;
-            if carry_rowspans.len() < end_col {
-                carry_rowspans.resize(end_col, 0);
-            }
-            for covered_col in col..end_col {
-                carry_rowspans[covered_col] = carry_rowspans[covered_col].max(rowspan);
-            }
-            placements.push(TableCellPlacement {
-                cell_idx,
-                row: row_idx,
-                col,
-                colspan,
-                source_colspan: colspan,
-                rowspan,
-            });
-            col = end_col;
-            max_columns = max_columns.max(end_col);
-        }
-    }
-
-    TableGrid {
-        placements,
-        column_count: max_columns,
     }
 }
 

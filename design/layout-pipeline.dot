@@ -1,0 +1,97 @@
+digraph Layout {
+  graph [rankdir=TB, newrank=true, compound=true, bgcolor="white", fontname="sans-serif", fontsize=13, nodesep=0.25, ranksep=0.28, pad=0.12];
+  node [shape=box, fontname="monospace", fontsize=11, margin="0.09,0.06", height=0.3, color="#555555"];
+  edge [color="#555555", arrowsize=0.6, fontname="sans-serif", fontsize=10];
+
+  subgraph cluster_pass {
+    label="Overall pass · layout/";
+    labeljust=l;
+    color="#aaaaaa";
+
+    p0 [label="00-layout.rs"];
+    p1 [label="01-prepare.rs"];
+    p2 [label="02-root_layout.rs"];
+    p3 [label="03-finalize.rs"];
+    p4 [label="04-paint.rs"];
+    { rank=same; p0; p1; p2; }
+    p0 -> p1 -> p2;
+
+    subgraph cluster_box {
+      label="Each box · layout/box/";
+      labeljust=l;
+      color="#aaaaaa";
+
+      x0 [label="00-layout.rs"];
+      x1 [label="01-sizing.rs"];
+      x2 [label="02-contents.rs"];
+      x3 [label="03-finish.rs"];
+      { rank=same; x0; x1; x2; }
+      x0 -> x1 -> x2;
+
+      subgraph cluster_block {
+        label="Block · layout/block/";
+        labeljust=l;
+        color="#cccccc";
+        b0 [label="00-flow.rs"];
+        b1 [label="01-prepare_child.rs"];
+        b2 [label="02-layout_child.rs ↳"];
+        b3 [label="03-finish_child.rs"];
+        b0 -> b1 -> b2 -> b3;
+        b2:e -> b2:e [style=dashed, label="float-fit probes"];
+        b3:w -> b1:w [style=dashed, label="next child", constraint=false];
+      }
+
+      subgraph cluster_inline {
+        label="Inline · layout/inline/";
+        labeljust=l;
+        color="#cccccc";
+        i0 [label="00-layout.rs"];
+        i1 [label="01-tokenize.rs ↳"];
+        i2 [label="02-compose.rs ↳"];
+        i3 [label="03-emit.rs ↳"];
+        i0 -> i1 -> i2 -> i3;
+        i2:e -> i2:e [style=dashed, label="float placement / line retry"];
+      }
+
+      subgraph cluster_flex {
+        label="Flex / grid · flex_grid/";
+        labeljust=l;
+        color="#cccccc";
+        f0 [label="00-layout.rs"];
+        f1 [label="01-prepare.rs"];
+        f2 [label="02-solve.rs ↳"];
+        f3 [label="03-place.rs ↳"];
+        f4 [label="04-align.rs"];
+        f0 -> f1 -> f2 -> f3 -> f4;
+        f2:e -> f2:e [style=dashed, label="measure / re-solve"];
+      }
+
+      subgraph cluster_table {
+        label="Table · table/";
+        labeljust=l;
+        color="#cccccc";
+        t0 [label="00-layout.rs"];
+        t1 [label="01-grid.rs"];
+        tm [label="column measurement\n(helper in 03)", shape=plaintext, fontsize=10];
+        t2 [label="02-intrinsic.rs"];
+        t3 [label="03-column_sizing.rs"];
+        t4 [label="04-rows.rs ↳"];
+        t5 [label="05-row_sizing.rs"];
+        t6 [label="06-placement.rs ↳"];
+        t0 -> t1 -> tm -> t2 -> t3 -> t4 -> t5 -> t6;
+        tm:e -> t3:e [style=dashed, label="shared", constraint=false];
+      }
+
+      { rank=same; b0; i0; f0; t0; }
+      x2 -> { b0; i0; f0; t0; };
+      result [label="content metrics + subtree output", shape=plaintext, fontname="sans-serif", fontsize=11];
+      { b3; i3; f4; t6; } -> result;
+      result -> x3;
+    }
+
+    p2 -> x0;
+    x3 -> p3;
+    p3 -> p4;
+    { rank=same; p3; p4; }
+  }
+}

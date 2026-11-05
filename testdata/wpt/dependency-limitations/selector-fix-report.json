@@ -1,0 +1,122 @@
+{
+  "scope": "Full pinned literal-helper CSS syntax selection. Computed and selector-serialization helpers check syntax only; no fresh rendering comparisons.",
+  "recorded_on": "2026-11-01",
+  "wpt_revision": "7ea3d665ff9ae1df1f742433d51bd1e9c6499a3b",
+  "before": {
+    "selected_assertions": 18469,
+    "passing": 16406,
+    "mismatches": 2063,
+    "unsupported_assertions": 13434,
+    "pass_percent": 88.8299312361254
+  },
+  "after": {
+    "selected_assertions": 18469,
+    "passing": 16451,
+    "mismatches": 2018,
+    "unsupported_assertions": 13434,
+    "pass_percent": 89.07358276030105
+  },
+  "comparison": {
+    "fixed_assertions": 45,
+    "new_mismatches": 0,
+    "selection_changed": false,
+    "additional_assertions_classified": 0,
+    "fixed_by_finding": {
+      "required-functional-pseudo-arguments": 4,
+      "pseudo-element-user-action-restriction": 31,
+      "native-host-context-compound-validation": 4,
+      "pseudo-class-versus-pseudo-element-kind": 6
+    },
+    "fixed_by_file": {
+      "css-overflow/parsing/scroll-buttons-invalid.html": 1,
+      "css-pseudo/parsing/highlight-pseudos-search-text.tentative.html": 1,
+      "css-pseudo/parsing/highlight-pseudos.html": 4,
+      "css-shadow/host-context-parsing.html": 4,
+      "css-shadow/slotted-parsing.html": 1,
+      "css-view-transitions/parsing/pseudo-elements-invalid.html": 26,
+      "selectors/parsing/parse-has-slotted.tentative.html": 1,
+      "selectors/parsing/parse-part.html": 4,
+      "selectors/parsing/parse-slotted.html": 2,
+      "selectors/parsing/parse-state.html": 1
+    }
+  },
+  "test_results": {
+    "existing_style_unit_tests_passed": 305,
+    "existing_declaration_validation_tests_passed": 32,
+    "cargo_check": "cargo check -p skrift-style --offline passed",
+    "scanned_files": 35417,
+    "literal_calls": 32021,
+    "dependency_parser_panics": 0,
+    "audit_exit": 101,
+    "audit_exit_reason": "Diagnostic assertion fails while 2018 mismatches remain; not an all-green WPT run."
+  },
+  "implementation": [
+    "Inspect native selector AST to reject hover/active on view-transition and highlight pseudo-elements. Retain valid view-transition :only-child handling.",
+    "Reject bare functional pseudo names and wrong pseudo-class/pseudo-element spellings.",
+    "Validate opaque :host-context() native argument tokens using the existing native Selector parser with full-input consumption, then require a compound selector AST. Lightning CSS stays the sole CSS parser."
+  ],
+  "production_sources": [
+    {
+      "file": "crates/03-html-style/src/style/02-syntax/selectors.rs",
+      "before_sha256": "6c6d3fb1c832439f42a58f1f51d076a5293258d72336ef9f8a3ce8136f5abcda",
+      "after_sha256": "1f4def8ef93dd3e628c9219b31f1f2e71462f1b0f02ff603448be9fcd264fbc8"
+    }
+  ],
+  "benchmark_sources": [
+    {
+      "file": "crates/03-html-style/examples/shadow_filter_benchmark.rs",
+      "sha256": "8d1d2613582570c3068a36cf4662536d995845494f2820e8025a8d072f054130",
+      "unchanged_from_baseline": true
+    },
+    {
+      "file": "crates/03-html-style/examples/epub_css_benchmark.rs",
+      "sha256": "35f87009ca9ec031885938a32eef00015d87bbe0546d7fc1387ed72e683eafd6",
+      "unchanged_from_baseline": true
+    },
+    {
+      "file": "crates/03-html-style/examples/grid_benchmark.rs",
+      "sha256": "8a5e40b78dbfa8c66801bf363c01ec31a455c6f8c0402a785b7b183cbc3cb8fa",
+      "unchanged_from_baseline": true
+    },
+    {
+      "file": "crates/03-html-style/examples/normalization_benchmark.rs",
+      "sha256": "e26a9cc1208af9ec38637c84f8f44ff23b370b647b0639cdddad3e056a4fd2f1",
+      "unchanged_from_baseline": true
+    },
+    {
+      "file": "crates/03-html-style/examples/cascade_benchmark.rs",
+      "sha256": "b80e07cd03daee4f8af716b57002e401ad6bb7c1161e19c06eb8ae5d3aaf544c",
+      "unchanged_from_baseline": true
+    }
+  ],
+  "native_dependency": "Exact unchanged Lightning CSS 1.0.0-alpha.72 / Parcel selectors 0.28.3 cached bundle. Identical frozen native dependencies and support crate artifacts in both builds.",
+  "support_crates_sha256": {
+    "libhtml_style.rlib": "a509db8405bb7406c131775998f8e27503a2e97af36f0333c8aec6c8af4625f3",
+    "libhtml_parse.rlib": "089260b5f92b198ddeb7733c8316b26a2e1f1d753ca06d97873efbfd277d34db",
+    "libhtml_dom.rlib": "82f17235d1ffa359ff30e4bc32af04f66cf07e6390fe647646756200af5cd1b4",
+    "libhtml_style_model.rlib": "d669c3d0cf08086b100c39a3bdd13f14cb32d89c2800b0d963bd3155138a9d9a"
+  },
+  "baseline_style_library_sha256": "7e74d7aaec053e36663f1ee99759976de8f4de8b4458516a2121dbfabf37abed",
+  "after_style_library_sha256": "39dea3587dbe21894f8effc934d55449ba6d8b6a1eb042fa8de188055f722a43",
+  "performance": "selector-fix-performance.json",
+  "specification_review": "selector-specification-review.json",
+  "intermediate_corrections": [
+    "An initial blanket functional :has-slotted() rejection introduced 18 valid-case mismatches. It was removed; final full audit has zero new mismatches.",
+    "Native Selector parsing must consume the entire argument to reject comma-separated :host-context() lists. parse_entirely now enforces this."
+  ],
+  "remaining": {
+    "total": 2018,
+    "blocked_under_current_constraints": 178,
+    "needs_investigation": 1840
+  },
+  "source_integrity": {
+    "test_and_benchmark_code_added": false,
+    "existing_test_and_benchmark_sources_unchanged": true,
+    "lightningcss_changed": false,
+    "parallel_css_parser_added": false,
+    "rendering_or_gpui_changed": false,
+    "expectations_changed": false
+  },
+  "baseline_cache_directory": "/home/johan/.cache/html-wpt-selector-next",
+  "compiler_temporary_directory": "/home/johan/.cache/html-wpt-selector-next/compiler-tmp"
+}

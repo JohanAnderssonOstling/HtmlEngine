@@ -60,11 +60,11 @@ static TEST_ALLOCATOR: allocation_test_support::TrackingAllocator =
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use crate::{GlyphRequest, ShapedGlyph};
+    use crate::{GlyphRequest, FontMetrics, ShapedGlyph};
 
     use std::collections::HashMap;
 
-    use crate::layout_model::{GlyphId, GlyphMetric};
+    use crate::layout_model::{GlyphHandle};
 
     use crate::GlyphShaper;
 
@@ -105,7 +105,7 @@ pub(crate) mod test_support {
     }
 
     pub(crate) struct TestGlyphShaper {
-        glyphs: HashMap<(char, u32), GlyphId>,
+        glyphs: HashMap<(char, u32), GlyphHandle>,
         generation: crate::GlyphResourceGeneration,
         append_checkpoint: Option<usize>,
         x_height_ratio: f32,
@@ -212,7 +212,7 @@ pub(crate) mod test_support {
         fn rollback_append_shaping(&mut self) {
             if let Some(checkpoint) = self.append_checkpoint.take() {
                 self.glyphs
-                    .retain(|_, glyph| (*glyph as usize) < checkpoint);
+                    .retain(|_, glyph| (glyph.0 as usize) < checkpoint);
             }
         }
 
@@ -220,39 +220,36 @@ pub(crate) mod test_support {
             &mut self,
             request: GlyphRequest<'_>,
         ) -> Result<ShapedGlyph, crate::ShapeError> {
-            let key = (request.character, request.font_size.to_bits());
-            let ascent = request.font_size * self.ascent_ratio.unwrap_or(0.75);
-            let descent = (request.font_size - ascent).max(0.0);
-            let metric =
-                GlyphMetric::try_new(request.character, request.font_size * 0.5, ascent, descent)
-                    .map_err(crate::ShapeError::rejected_metric)?;
+            let key = (request.character, request.style.font_size.to_bits());
+            let ascent = request.style.font_size * self.ascent_ratio.unwrap_or(0.75);
+            let descent = (request.style.font_size - ascent).max(0.0);
+            let advance = request.style.font_size * 0.5;
+            let metrics = FontMetrics { ascent, descent };
             if let Some(&glyph) = self.glyphs.get(&key) {
-                return Ok(ShapedGlyph::from_metric(glyph, metric));
+                return Ok(ShapedGlyph::new(glyph, advance, metrics));
             }
-            let glyph = self.glyphs.len() as GlyphId;
+            let glyph = GlyphHandle(self.glyphs.len() as u32);
             self.glyphs.insert(key, glyph);
-            Ok(ShapedGlyph::from_metric(glyph, metric))
+            Ok(ShapedGlyph::new(glyph, advance, metrics))
         }
 
         fn font_relative_metrics(
             &mut self,
-            _request: crate::FontMetricsRequest<'_>,
+            _request: &crate::ShapingStyle<'_>,
         ) -> Result<crate::FontRelativeMetrics, crate::ShapeError> {
             self.font_metric_calls += 1;
-            let metrics = match self.ascent_ratio {
-                Some(ascent_ratio) => crate::FontRelativeMetrics::from_ratios(
-                    self.x_height_ratio,
-                    self.ch_advance_ratio,
-                    self.cap_height_ratio,
-                    ascent_ratio,
-                ),
-                None => crate::FontRelativeMetrics::new(
-                    self.x_height_ratio,
-                    self.ch_advance_ratio,
-                    self.cap_height_ratio,
-                ),
-            };
-            Ok(metrics.expect("test font-relative metrics must be valid"))
+            Ok(crate::FontRelativeMetrics {
+                x_height_ratio: self.x_height_ratio,
+                ch_advance_ratio: self.ch_advance_ratio,
+                cap_height_ratio: self.cap_height_ratio,
+                line_metrics: self
+                    .ascent_ratio
+                    .map(|ascent_ratio| crate::FontLineMetrics {
+                        ascent_ratio,
+                        descent_ratio: (1.0 - ascent_ratio).max(0.0),
+                    }),
+                ..crate::FontRelativeMetrics::default()
+            })
         }
     }
 }

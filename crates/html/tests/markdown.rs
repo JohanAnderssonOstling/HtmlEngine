@@ -1,9 +1,18 @@
-use html::layout::{LaidOutDocument, LayoutConstraints, RenderExportView, TextCompositionPolicy};
-use html::pipeline::DocumentFactory;
-use html::text::{
-    GlyphMetric, GlyphResourceGeneration, GlyphResourceStore, GlyphShaper, ShapeError,
-};
-use html::text::{GlyphRequest, ShapedGlyph};
+use html_pipeline::engine::text_paint;
+use html_engine_model::layout_state;
+use html_pipeline::engine::box_queries;
+use html_pipeline::engine::export_queries;
+use crate::export::TableExportFormat;
+use html_pipeline::engine::TableExportRequest;
+use html_pipeline::engine::TextExport;
+use html_pipeline::engine::TextExportFormat;
+use crate::layout::BoxId;
+use html_pipeline::engine::{LaidOutDocument, LayoutConstraints};
+use crate::layout::{RenderExportView, TextCompositionPolicy};
+use html_pipeline::DocumentFactory;
+use crate::text::{GlyphResourceGeneration, GlyphShaper, ShapeError};
+use html_pipeline::engine::GlyphResourceStore;
+use crate::text::{GlyphRequest, FontMetrics, GlyphHandle, ShapedGlyph};
 use std::ops::Range;
 
 #[derive(Default)]
@@ -17,15 +26,13 @@ impl GlyphShaper for TestShaper {
         self.0
     }
     fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
-        Ok(ShapedGlyph::from_metric(
-            request.character as u32,
-            GlyphMetric::try_new(
-                request.character,
-                request.font_size / 2.0,
-                request.font_size,
-                0.0,
-            )
-            .unwrap(),
+        Ok(ShapedGlyph::new(
+            GlyphHandle(request.character as u32),
+            request.style.font_size / 2.0,
+            FontMetrics {
+                ascent: request.style.font_size,
+                descent: 0.0,
+            },
         ))
     }
 }
@@ -45,8 +52,7 @@ fn layout(body: &str, resources: &mut GlyphResourceStore) -> LaidOutDocument<'st
 fn all(document: &LaidOutDocument, resources: &GlyphResourceStore) -> String {
     let view = document.render_view(resources);
     let export: RenderExportView<'_> = view.export();
-    export
-        .markdown(0..view.text().glyph_count() as u32)
+    export_queries::render_export_view_text(export, 0..view.text().glyph_count() as u32, TextExportFormat::Markdown).markdown
         .unwrap()
 }
 
@@ -54,7 +60,7 @@ fn range(document: &LaidOutDocument, wanted: &str, resources: &GlyphResourceStor
     let text = document.render_view(resources).text();
     let characters: String = (0..text.glyph_count())
         .map(|index| {
-            text.glyph_metric(text.glyph_at(index).unwrap())
+            text_paint::glyph_metric(text, text_paint::glyph_at(text, index).unwrap())
                 .unwrap()
                 .ch()
         })
@@ -64,10 +70,11 @@ fn range(document: &LaidOutDocument, wanted: &str, resources: &GlyphResourceStor
     start..start + wanted.chars().count() as u32
 }
 
-fn box_for(document: &LaidOutDocument, id: &str, resources: &GlyphResourceStore) -> usize {
+fn box_for(document: &LaidOutDocument, id: &str, resources: &GlyphResourceStore) -> BoxId {
     let boxes = document.render_view(resources).boxes();
-    (0..boxes.len())
-        .find(|&index| boxes.attribute(index, "id") == Some(id))
+    (0..box_queries::len(boxes))
+        .map(layout_state::box_id_new)
+        .find(|&index| box_queries::attribute(boxes, index, "id") == Some(id))
         .unwrap()
 }
 
@@ -79,17 +86,15 @@ fn public_api_copies_partial_formatted_text_without_neighbors() {
         &mut document_resources,
     );
     assert_eq!(
-        document
+        export_queries::render_export_view_text(document
             .render_view(&document_resources)
-            .export()
-            .markdown(range(&document, "café 😀", &document_resources)),
+            .export(), range(&document, "café 😀", &document_resources), TextExportFormat::Markdown).markdown,
         Some("***café 😀***".into())
     );
     assert_eq!(
-        document
+        export_queries::render_export_view_text(document
             .render_view(&document_resources)
-            .export()
-            .markdown(range(&document, "bold café 😀", &document_resources)),
+            .export(), range(&document, "bold café 😀", &document_resources), TextExportFormat::Markdown).markdown,
         Some("**bold *café 😀***".into())
     );
 }
@@ -143,11 +148,34 @@ fn inline_and_block_code_use_safe_backtick_delimiters() {
     );
     assert!(all(&document, &document_resources).starts_with("Use ``a`b`` and `` `x` ``."));
     assert_eq!(
-        document
+        export_queries::render_export_view_markdown_for_box(document
             .render_view(&document_resources)
-            .export()
-            .markdown_for_box(box_for(&document, "code", &document_resources)),
+            .export(), box_for(&document, "code", &document_resources)),
         Some("````rust\nlet x = \"```\";\n  x\n````".into())
+    );
+}
+
+#[test]
+fn code_text_keeps_authored_newlines_while_plain_exports_separate_blocks() {
+    let mut resources = GlyphResourceStore::default();
+    let document = layout(
+        "<pre id='code'><code><div>\nA\n\n</div><div>B<br>C\n</div></code></pre><p>After</p>",
+        &mut resources,
+    );
+    let view = document.render_view(&resources);
+    let export = view.export();
+    assert_eq!(
+        export_queries::render_export_view_markdown_for_box(export, box_for(&document, "code", &resources)),
+        Some("```\n\nA\n\nB\nC\n```".into())
+    );
+    let all = 0..view.text().glyph_count() as u32;
+    assert_eq!(
+        export_queries::render_export_view_text(export, all.clone(), TextExportFormat::Plain).plain.as_deref(),
+        Some("A\nB\nC\nAfter")
+    );
+    assert_eq!(
+        export_queries::render_export_view_text(export, all, TextExportFormat::PlainWithParagraphBreaks).plain.as_deref(),
+        Some("A\n\nB\nC\n\nAfter")
     );
 }
 
@@ -163,10 +191,9 @@ fn lists_keep_nesting_and_selected_item_numbering() {
         "3. First\n    - *Nested*\n\n4. Second"
     );
     assert_eq!(
-        document
+        export_queries::render_export_view_text(document
             .render_view(&document_resources)
-            .export()
-            .markdown(range(&document, "Second", &document_resources)),
+            .export(), range(&document, "Second", &document_resources), TextExportFormat::Markdown).markdown,
         Some("4. Second".into())
     );
 }
@@ -179,10 +206,9 @@ fn simple_tables_preserve_headers_formatting_pipes_and_data_rows() {
         &mut document_resources,
     );
     assert_eq!(
-        document
+        export_queries::render_export_view_markdown_for_box(document
             .render_view(&document_resources)
-            .export()
-            .markdown_for_box(box_for(&document, "table", &document_resources)),
+            .export(), box_for(&document, "table", &document_resources)),
         Some("| Name | Value |\n| --- | --- |\n| **A\\|B** | `x\\|y`<br>next |".into())
     );
     let mut document_resources = GlyphResourceStore::default();
@@ -191,10 +217,9 @@ fn simple_tables_preserve_headers_formatting_pipes_and_data_rows() {
         &mut document_resources,
     );
     assert_eq!(
-        document
+        export_queries::render_export_view_markdown_for_box(document
             .render_view(&document_resources)
-            .export()
-            .markdown_for_box(box_for(&document, "table", &document_resources)),
+            .export(), box_for(&document, "table", &document_resources)),
         Some("| | |\n| --- | --- |\n| A | B |".into())
     );
 }
@@ -207,10 +232,9 @@ fn partial_tables_never_include_unselected_text() {
         &mut document_resources,
     );
     assert_eq!(
-        document
+        export_queries::render_export_view_text(document
             .render_view(&document_resources)
-            .export()
-            .markdown(range(&document, "Selected", &document_resources)),
+            .export(), range(&document, "Selected", &document_resources), TextExportFormat::Markdown).markdown,
         Some("| | |\n| --- | --- |\n| Selected |  |".into())
     );
 }
@@ -222,20 +246,18 @@ fn merged_and_nested_tables_fall_back_to_selected_structural_html() {
         "<table id='table' onclick='bad()'><tr><td colspan='2' style='color:red'>Joined</td></tr><tr><td>One</td><td>SECRET</td></tr></table>",
         &mut document_resources,
     );
-    let markdown = document
+    let markdown = export_queries::render_export_view_markdown_for_box(document
         .render_view(&document_resources)
-        .export()
-        .markdown_for_box(box_for(&document, "table", &document_resources))
+        .export(), box_for(&document, "table", &document_resources))
         .unwrap();
     assert_eq!(
         markdown,
         "<table><tbody><tr><td colspan=\"2\">Joined</td></tr><tr><td>One</td><td>SECRET</td></tr></tbody></table>"
     );
     assert_eq!(
-        document
+        export_queries::render_export_view_text(document
             .render_view(&document_resources)
-            .export()
-            .markdown(range(&document, "Joined", &document_resources)),
+            .export(), range(&document, "Joined", &document_resources), TextExportFormat::Markdown).markdown,
         Some("<table><tbody><tr><td colspan=\"2\">Joined</td></tr></tbody></table>".into())
     );
     let mut document_resources = GlyphResourceStore::default();
@@ -243,10 +265,9 @@ fn merged_and_nested_tables_fall_back_to_selected_structural_html() {
         "<table id='table'><tr><td>Outer<table><tr><td>Inner</td></tr></table></td></tr></table>",
         &mut document_resources,
     );
-    let markdown = document
+    let markdown = export_queries::render_export_view_markdown_for_box(document
         .render_view(&document_resources)
-        .export()
-        .markdown_for_box(box_for(&document, "table", &document_resources))
+        .export(), box_for(&document, "table", &document_resources))
         .unwrap();
     assert_eq!(markdown.matches("<table>").count(), 2);
     assert!(markdown.contains("Outer") && markdown.contains("Inner"));
@@ -264,10 +285,9 @@ fn images_and_explicit_breaks_survive_copying() {
         "Before![A \\[picture\\]](a%28b%29.png)after  \nNext"
     );
     assert_eq!(
-        document
+        export_queries::render_export_view_markdown_for_box(document
             .render_view(&document_resources)
-            .export()
-            .markdown_for_box(box_for(&document, "image", &document_resources)),
+            .export(), box_for(&document, "image", &document_resources)),
         Some("![A \\[picture\\]](a%28b%29.png)".into())
     );
 }
@@ -278,9 +298,9 @@ fn empty_reversed_and_invalid_selections_return_none() {
     let document = layout("<p>Text</p>", &mut document_resources);
     let export = document.render_view(&document_resources).export();
     for selected in [0..0, 3..1, 0..100, u32::MAX..u32::MAX] {
-        assert_eq!(export.markdown(selected), None);
+        assert_eq!(export_queries::render_export_view_text(export, selected, TextExportFormat::Markdown).markdown, None);
     }
-    assert_eq!(export.markdown_for_box(usize::MAX), None);
+    assert_eq!(export_queries::render_export_view_markdown_for_box(export, layout_state::box_id_new(u32::MAX as usize)), None);
 }
 
 #[test]
@@ -319,13 +339,13 @@ fn plain_and_markdown_payloads_share_the_same_selection() {
     let end = range(&document, "Third", &document_resources).end;
     let export = document.render_view(&document_resources).export();
     assert_eq!(
-        export.selection_text(start..end),
-        (
-            Some("first\nsecond\nThird".into()),
-            Some("*first*  \nsecond\n\nThird".into())
-        )
+        export_queries::render_export_view_text(export, start..end, TextExportFormat::PlainAndMarkdown),
+        TextExport {
+            plain: Some("first\nsecond\nThird".into()),
+            markdown: Some("*first*  \nsecond\n\nThird".into()),
+        }
     );
-    assert_eq!(export.selection_text(2..2), (None, None));
+    assert_eq!(export_queries::render_export_view_text(export, 2..2, TextExportFormat::PlainAndMarkdown), TextExport::default());
 }
 
 #[test]
@@ -337,11 +357,11 @@ fn selected_list_items_and_language_hints_are_exported_independently() {
     );
     let export = document.render_view(&document_resources).export();
     assert_eq!(
-        export.markdown_for_box(box_for(&document, "item", &document_resources)),
+        export_queries::render_export_view_markdown_for_box(export, box_for(&document, "item", &document_resources)),
         Some("5. Selected\n    - Nested".into())
     );
     assert_eq!(
-        export.markdown_for_box(box_for(&document, "code", &document_resources)),
+        export_queries::render_export_view_markdown_for_box(export, box_for(&document, "code", &document_resources)),
         Some("```rust\nlet x = 1;\n```".into())
     );
 }
@@ -353,22 +373,21 @@ fn rectangular_table_api_preserves_grid_slots_and_clips_selections() {
         "<table id='table'><tr><th colspan='2'>A | B</th></tr><tr><td rowspan='2'>One</td><td>Two &amp; more</td></tr><tr><td>Three</td></tr></table>",
         &mut document_resources,
     );
-    let table = document
+    let table = box_queries::render_box_view_table(document
         .render_view(&document_resources)
-        .boxes()
-        .table(box_for(&document, "table", &document_resources))
+        .boxes(), box_for(&document, "table", &document_resources))
         .unwrap();
     assert_eq!(
-        table.markdown(),
+        table.export(TableExportRequest::Whole(TableExportFormat::Markdown)),
         Some("| A \\| B |  |\n| --- | --- |\n| One | Two & more |\n|  | Three |".into())
     );
     assert_eq!(
-        table.markdown_in(1..usize::MAX, 1..usize::MAX),
+        table.export(TableExportRequest::CellsMarkdown { rows: 1..usize::MAX, columns: 1..usize::MAX }),
         Some("|  |\n| --- |\n| Two & more |\n| Three |".into())
     );
-    assert_eq!(table.markdown_in(0..0, 0..1), None);
-    assert_eq!(table.markdown_in(0..1, 3..1), None);
-    assert_eq!(table.markdown_in(9..10, 0..1), None);
+    assert_eq!(table.export(TableExportRequest::CellsMarkdown { rows: 0..0, columns: 0..1 }), None);
+    assert_eq!(table.export(TableExportRequest::CellsMarkdown { rows: 0..1, columns: 3..1 }), None);
+    assert_eq!(table.export(TableExportRequest::CellsMarkdown { rows: 9..10, columns: 0..1 }), None);
 }
 
 #[test]
@@ -393,17 +412,17 @@ fn granular_code_selections_remain_inline_until_a_block_boundary_is_crossed() {
     );
     let export = document.render_view(&document_resources).export();
     assert_eq!(
-        export.markdown(range(&document, "x", &document_resources)),
+        export_queries::render_export_view_text(export, range(&document, "x", &document_resources), TextExportFormat::Markdown).markdown,
         Some("`x`".into())
     );
     let start = range(&document, "Before", &document_resources).start;
     let end = range(&document, "x", &document_resources).end;
     assert_eq!(
-        export.markdown(start..end),
+        export_queries::render_export_view_text(export, start..end, TextExportFormat::Markdown).markdown,
         Some("Before\n\n```rust\nlet x\n```".into())
     );
     assert_eq!(
-        export.markdown_for_box(box_for(&document, "code", &document_resources)),
+        export_queries::render_export_view_markdown_for_box(export, box_for(&document, "code", &document_resources)),
         Some("```rust\nlet x = 1;\n```".into())
     );
 }
@@ -416,10 +435,9 @@ fn unsupported_list_numbering_keeps_html_list_semantics() {
         &mut document_resources,
     );
     assert_eq!(
-        document
+        export_queries::render_export_view_markdown_for_box(document
             .render_view(&document_resources)
-            .export()
-            .markdown_for_box(box_for(&document, "item", &document_resources)),
+            .export(), box_for(&document, "item", &document_resources)),
         Some("<ol start=\"-2\"><li>Second</li></ol>".into())
     );
     let mut document_resources = GlyphResourceStore::default();
@@ -428,12 +446,29 @@ fn unsupported_list_numbering_keeps_html_list_semantics() {
         &mut document_resources,
     );
     assert_eq!(
-        document
+        export_queries::render_export_view_markdown_for_box(document
             .render_view(&document_resources)
-            .export()
-            .markdown_for_box(box_for(&document, "list", &document_resources)),
+            .export(), box_for(&document, "list", &document_resources)),
         Some("<ol reversed=\"\"><li>First</li><li>Second</li></ol>".into())
     );
+    for (attributes, item_value, expected) in [
+        ("reversed", "", 1),
+        ("reversed start='8'", "", 7),
+        ("start='3'", "value='9'", 10),
+        ("reversed", "value='9'", 8),
+    ] {
+        let mut resources = GlyphResourceStore::default();
+        let document = layout(
+            &format!("<ol {attributes}><li {item_value}>First</li><li id='item'>Second</li></ol>"),
+            &mut resources,
+        );
+        assert_eq!(
+            export_queries::render_export_view_markdown_for_box(document
+                .render_view(&resources)
+                .export(), box_for(&document, "item", &resources)),
+            Some(format!("{expected}. Second"))
+        );
+    }
 }
 
 #[test]
@@ -444,19 +479,17 @@ fn captions_and_visible_breaks_remain_bounded_by_the_selection() {
         &mut document_resources,
     );
     assert_eq!(
-        document
+        export_queries::render_export_view_text(document
             .render_view(&document_resources)
-            .export()
-            .markdown(range(&document, "Caption", &document_resources)),
+            .export(), range(&document, "Caption", &document_resources), TextExportFormat::Markdown).markdown,
         Some("Caption".into())
     );
     let start = range(&document, "Before", &document_resources).start;
     let end = range(&document, "After", &document_resources).end;
     assert_eq!(
-        document
+        export_queries::render_export_view_text(document
             .render_view(&document_resources)
-            .export()
-            .markdown(start..end),
+            .export(), start..end, TextExportFormat::Markdown).markdown,
         Some("Before  \nAfter".into())
     );
 }
@@ -473,8 +506,8 @@ fn plain_export_matches_selection_payload_without_markdown() {
         .render_view(&document_resources)
         .text()
         .glyph_count() as u32;
-    assert_eq!(export.plain_text(all.clone()), export.selection_text(all).0);
+    assert_eq!(export_queries::render_export_view_text(export, all.clone(), TextExportFormat::Plain).plain, export_queries::render_export_view_text(export, all, TextExportFormat::PlainAndMarkdown).plain);
     for invalid in [0..0, 8..2, 0..u32::MAX] {
-        assert_eq!(export.plain_text(invalid), None);
+        assert_eq!(export_queries::render_export_view_text(export, invalid, TextExportFormat::Plain).plain, None);
     }
 }
