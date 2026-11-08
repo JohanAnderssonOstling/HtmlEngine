@@ -8,10 +8,10 @@ use crate::parser::DocumentFactory;
 use crate::test_support::TestGlyphShaper;
 use crate::{
     FontRelativeMetrics, GlyphResourceGeneration, GlyphResourceStore, GlyphShaper, LaidOutDocument,
-    LayoutConstraints, ShapeError, ShapedTextRun, ShapingStyle, TextCompositionPolicy,
+    LayoutConstraints, ShapedTextRun, ShapingStyle, TextCompositionPolicy,
     TextRunShapeRequest,
 };
-use crate::{GlyphRequest, ShapedGlyph, ShapedRun};
+use crate::{ShapedRun};
 use std::sync::Arc;
 
 #[derive(Default)]
@@ -23,39 +23,19 @@ struct RecordingShaper {
 }
 
 impl GlyphShaper for RecordingShaper {
-    fn font_relative_metrics(
-        &mut self,
-        request: &ShapingStyle<'_>,
-    ) -> Result<FontRelativeMetrics, ShapeError> {
+    fn font_relative_metrics(&mut self, request: &ShapingStyle<'_>) -> FontRelativeMetrics {
         self.metric_languages.push(
             request
                 .language
                 .map(|language| language::content_language_as_str(&language).to_owned()),
         );
-        Ok(FontRelativeMetrics::default())
-    }
-    fn reset(&mut self) {
-        self.fallback.reset();
-    }
-    fn begin_append_shaping(&mut self) -> Result<(), ShapeError> {
-        self.fallback.begin_append_shaping()
-    }
-    fn commit_append_shaping(&mut self) {
-        self.fallback.commit_append_shaping();
-    }
-    fn rollback_append_shaping(&mut self) {
-        self.fallback.rollback_append_shaping();
+        FontRelativeMetrics::default()
     }
     fn resource_generation(&self) -> GlyphResourceGeneration {
         self.fallback.resource_generation()
     }
-    fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
-        self.fallback.shape_glyph(request)
-    }
-    fn shape_run(
-        &mut self,
-        request: TextRunShapeRequest<'_>,
-    ) -> Result<Option<ShapedRun>, ShapeError> {
+
+    fn shape_run(&mut self, request: TextRunShapeRequest<'_>) -> ShapedRun {
         self.languages.push((
             shaping_contracts::text_run_shape_request_text(&request).to_owned(),
             shaping_contracts::text_run_shape_request_style(&request)
@@ -63,13 +43,20 @@ impl GlyphShaper for RecordingShaper {
                 .map(|language| language::content_language_as_str(&language).to_owned()),
         ));
         if self.cluster_text == Some(shaping_contracts::text_run_shape_request_text(&request)) {
-            let count = shaping_contracts::text_run_shape_request_text(&request).chars().count();
+            let count = shaping_contracts::text_run_shape_request_text(&request)
+                .chars()
+                .count();
             let mut boundaries = vec![true; count + 1];
             boundaries[1] = false;
-            return Ok(Some(shaping_contracts::shaped_run_geometry(shaping_contracts::shaped_text_run_new(Arc::from(vec![10.0; count]),
-                Arc::from(boundaries),))));
+            return shaping_contracts::shaped_run_geometry(
+                shaping_contracts::shaped_text_run_new(
+                    Arc::from(vec![10.0; count]),
+                    Arc::from(boundaries),
+                ),
+                self.fallback.shape_run(request),
+            );
         }
-        Ok(None)
+        self.fallback.shape_run(request)
     }
 }
 

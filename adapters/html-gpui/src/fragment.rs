@@ -12,9 +12,9 @@ use std::sync::Arc;
 
 use gpui::{
     App, AvailableSpace, Bounds, ClipboardItem, ContentMask, CursorStyle, Element, ElementId,
-    Entity, GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement,
-    KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    SharedString, Size, Style, Window, fill, point, px, relative, size,
+    Entity, FocusHandle, GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId,
+    IntoElement, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseExitEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, SharedString, Size, Style, Window, px, relative, size,
 };
 use html::layout::RenderView;
 use html::render::SceneImagePolicy;
@@ -102,7 +102,8 @@ struct FragmentState {
     document: Option<PipelineSession>,
     shaper: GpuiTextCache,
     display: Option<FragmentDisplay>,
-    selection: Option<FragmentSelection>,
+    selection: FragmentSelection,
+    focus: Option<FocusHandle>,
     selection_key: Option<FragmentLayoutKey>,
 }
 
@@ -112,7 +113,8 @@ impl FragmentState {
             document: None,
             shaper: GpuiTextCache::for_window(window, cx),
             display: None,
-            selection: None,
+            selection: FragmentSelection::default(),
+            focus: None,
             selection_key: None,
         }
     }
@@ -122,9 +124,7 @@ impl FragmentState {
         if result.is_err() {
             self.display = None;
             self.selection_key = None;
-            if let Some(selection) = &mut self.selection {
-                selection.clear();
-            }
+            self.selection.clear();
         }
         result
     }
@@ -164,7 +164,7 @@ impl FragmentState {
             ).map_err(|error| error.to_string())?),
         };
         let scene = fragment_scene(document).ok_or("fragment width must be positive")?;
-        let mut painter = GpuiCommandPainter::commands_only(self.shaper.resources());
+        let mut painter = GpuiCommandPainter::commands_only();
         if let Some(previous) = self.display.take() {
             painter = painter.reusing(previous.scene);
         }
@@ -186,19 +186,14 @@ impl FragmentState {
         // final width. Those probes must not clear an ongoing selection.
         let layout = self.display.as_ref().map(|display| &display.key.layout);
         if self.selection_key.as_ref() != layout {
-            if let Some(selection) = &mut self.selection {
-                selection.clear();
-                self.selection_key = layout.cloned();
-            }
+            self.selection.clear();
+            self.selection_key = layout.cloned();
         }
     }
 
     fn selection_context(&mut self) -> Option<(&mut FragmentSelection, RenderView<'_>)> {
         self.display.as_ref()?;
-        Some((
-            self.selection.as_mut()?,
-            self.document.as_ref()?.render_view()?,
-        ))
+        Some((&mut self.selection, self.document.as_ref()?.render_view()?))
     }
 }
 
@@ -261,8 +256,12 @@ impl Element for HtmlFragmentElement {
             FragmentState::new(window, cx)
         });
         state.update(cx, |state, cx| {
-            if self.selection_color.is_some() && state.selection.is_none() {
-                state.selection = Some(FragmentSelection::new(cx.focus_handle()));
+            if self.selection_color.is_some() {
+                state.focus.get_or_insert_with(|| cx.focus_handle());
+            } else if state.focus.take().is_some()
+                && let Some((selection, document)) = state.selection_context()
+            {
+                selection.clear_selection(document);
             }
         });
         self.state = Some(state.clone());
@@ -312,18 +311,14 @@ impl Element for HtmlFragmentElement {
                     eprintln!("HTML fragment layout failed: {error}");
                 }
             }
-            if self.selection_color.is_some() {
-                state.prepare_selection();
-            }
+            state.prepare_selection();
         });
+        let state = self.state.as_ref()?.read(cx);
+        state.display.as_ref()?;
         if self.selection_color.is_some() {
-            let state = self.state.as_ref()?.read(cx);
-            state.display.as_ref()?;
-            window.set_focus_handle(&state.selection.as_ref()?.focus, cx);
-            Some(window.insert_hitbox(bounds, HitboxBehavior::Normal))
-        } else {
-            None
+            window.set_focus_handle(state.focus.as_ref()?, cx);
         }
+        Some(window.insert_hitbox(bounds, HitboxBehavior::Normal))
     }
 
     fn paint(
@@ -351,32 +346,42 @@ impl Element for HtmlFragmentElement {
             scene.paint(bounds, window, cx)
         });
         let Some(hitbox) = hitbox else { return };
-        let Some(color) = self.selection_color else {
-            return;
-        };
+        let selectable = self.selection_color.is_some();
+        let rgba = self
+            .selection_color
+            .map(|color| u32::from(color.to_rgb()))
+            .unwrap_or(0);
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
-            let state = state.read(cx);
-            let Some(selection) = state.selection.as_ref() else {
-                return;
-            };
-            let Some(document) = state
-                .document
-                .as_ref()
-                .and_then(PipelineSession::render_view)
-            else {
-                return;
-            };
-            for rect in selection.rects(document) {
-                window.paint_quad(fill(
-                    Bounds::new(
-                        bounds.origin + point(px(rect.x0 as f32), px(rect.y0 as f32)),
-                        size(px(rect.width() as f32), px(rect.height() as f32)),
-                    ),
+            state.update(cx, |state, cx| {
+                let Some((selection, document)) = state.selection_context() else {
+                    return;
+                };
+                let color = peniko::Color::rgba8(
+                    (rgba >> 24) as u8,
+                    (rgba >> 16) as u8,
+                    (rgba >> 8) as u8,
+                    rgba as u8,
+                );
+                if let Some(scene) = selection.paint(
+                    document,
                     color,
-                ));
-            }
+                    self.text_color.map(|color| u32::from(color.to_rgb())),
+                ) {
+                    scene.paint(bounds, window, cx);
+                }
+            });
         });
-        window.set_cursor_style(CursorStyle::IBeam, hitbox);
+        let link_hovered = state.read(cx).selection.link_hovered();
+        if selectable || link_hovered {
+            window.set_cursor_style(
+                if link_hovered {
+                    CursorStyle::PointingHand
+                } else {
+                    CursorStyle::IBeam
+                },
+                hitbox,
+            );
+        }
 
         let target = state.clone();
         let hit = hitbox.clone();
@@ -389,26 +394,35 @@ impl Element for HtmlFragmentElement {
                     let Some((selection, document)) = state.selection_context() else {
                         return;
                     };
-                    if !selection.is_empty(document) || selection.dragging() {
+                    if !selection.is_empty(document) || selection.pointer_active() {
                         selection.clear();
                         cx.notify();
                     }
                 });
             } else if phase.bubble() && hit.is_hovered(window) {
                 target.update(cx, |state, cx| {
+                    if selectable && let Some(focus) = &state.focus {
+                        focus.focus(window, cx);
+                    }
                     let Some((selection, document)) = state.selection_context() else {
                         return;
                     };
-                    selection.begin(document, event.position - bounds.origin, event.click_count);
-                    selection.focus.focus(window, cx);
-                    window.prevent_default();
-                    cx.stop_propagation();
-                    cx.notify();
+                    if selection.pointer_down(
+                        document,
+                        event.position - bounds.origin,
+                        event.click_count,
+                        selectable,
+                    ) {
+                        window.prevent_default();
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
                 });
             }
         });
         let target = state.clone();
-        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+        let hit = hitbox.clone();
+        window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
             if !phase.bubble() {
                 return;
             }
@@ -416,19 +430,42 @@ impl Element for HtmlFragmentElement {
                 let Some((selection, document)) = state.selection_context() else {
                     return;
                 };
+                if selection.pointer_active() && event.pressed_button != Some(MouseButton::Left) {
+                    selection.finish(document);
+                    cx.notify();
+                }
+                let position = hit
+                    .is_hovered(window)
+                    .then_some(event.position - bounds.origin);
+                if selection.pointer_move(document, position) {
+                    cx.notify();
+                }
                 if selection.dragging() {
-                    if event.pressed_button == Some(MouseButton::Left) {
+                    if position.is_none() {
                         selection.extend(document, event.position - bounds.origin);
-                        cx.stop_propagation();
-                    } else {
-                        selection.finish(document);
+                        selection.pointer_move(document, None);
                     }
+                    cx.stop_propagation();
                     cx.notify();
                 }
             });
         });
         let target = state.clone();
-        window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+        window.on_mouse_event(move |_: &MouseExitEvent, phase, _, cx| {
+            if !phase.bubble() {
+                return;
+            }
+            target.update(cx, |state, cx| {
+                if let Some((selection, document)) = state.selection_context()
+                    && selection.pointer_move(document, None)
+                {
+                    cx.notify();
+                }
+            });
+        });
+        let target = state.clone();
+        let hit = hitbox.clone();
+        window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
             if !phase.bubble() || event.button != MouseButton::Left {
                 return;
             }
@@ -436,21 +473,34 @@ impl Element for HtmlFragmentElement {
                 let Some((selection, document)) = state.selection_context() else {
                     return;
                 };
-                if selection.dragging() {
-                    selection.extend(document, event.position - bounds.origin);
-                    selection.finish(document);
+                if selection.pointer_active() {
+                    if let Some(href) = selection.pointer_up(
+                        document,
+                        event.position - bounds.origin,
+                        hit.is_hovered(window),
+                    ) {
+                        let href = href.trim();
+                        if href.split_once(':').is_some_and(|(scheme, _)| {
+                            ["http", "https", "mailto", "tel"]
+                                .iter()
+                                .any(|external| scheme.eq_ignore_ascii_case(external))
+                        }) {
+                            cx.open_url(href);
+                        }
+                    }
                     cx.notify();
                     cx.stop_propagation();
                 }
             });
         });
         window.on_key_event(move |event: &KeyDownEvent, phase, window, cx| {
-            if !phase.bubble()
+            if !selectable
+                || !phase.bubble()
                 || !state
                     .read(cx)
-                    .selection
+                    .focus
                     .as_ref()
-                    .is_some_and(|selection| selection.focus.is_focused(window))
+                    .is_some_and(|focus| focus.is_focused(window))
             {
                 return;
             }
@@ -469,7 +519,7 @@ impl Element for HtmlFragmentElement {
                         ClipboardItem::new_string(selection.selected_text(document)),
                     ),
                     "a" if shortcut => selection.select_all(document),
-                    "escape" => selection.clear(),
+                    "escape" => selection.clear_selection(document),
                     _ => return,
                 }
                 cx.stop_propagation();
@@ -557,11 +607,10 @@ mod tests {
         window
             .update(cx, |_, window, cx| {
                 let mut state = FragmentState::new(window, cx);
-                state.selection = Some(FragmentSelection::new(cx.focus_handle()));
                 let source = "<p>First &amp; <em>café</em> Åsa</p><p>Second paragraph</p>";
                 state.layout(key(source.into(), 300.)).unwrap();
                 state.prepare_selection();
-                let selection = state.selection.as_mut().unwrap();
+                let selection = &mut state.selection;
                 let document = state
                     .document
                     .as_ref()
@@ -598,7 +647,7 @@ mod tests {
                 assert_eq!(selection.selected_text(document), "café");
                 state.layout(key(source.into(), 110.)).unwrap();
                 state.prepare_selection();
-                let selection = state.selection.as_mut().unwrap();
+                let selection = &mut state.selection;
                 let document = state
                     .document
                     .as_ref()
@@ -619,7 +668,7 @@ mod tests {
                     .as_ref()
                     .and_then(PipelineSession::render_view)
                     .unwrap();
-                let selection = state.selection.as_mut().unwrap();
+                let selection = &mut state.selection;
                 selection.select_all(document);
                 assert_eq!(selection.selected_text(document), "Replacement");
             })

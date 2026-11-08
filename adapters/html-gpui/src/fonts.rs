@@ -127,11 +127,16 @@ impl PublicationFonts {
     /// Returns whether a new face was loaded.
     pub(crate) fn register(
         &mut self,
-        loaded: LoadedFontFace,
+        mut loaded: LoadedFontFace,
         text_system: &WindowTextSystem,
     ) -> Result<bool, String> {
         let key = face_key(&loaded.declaration);
-        if self.loaded.contains_key(&key) {
+        if self.loaded.get(&key).is_some_and(|previous| {
+            previous.family == loaded.family
+                && previous.weight == loaded.weight
+                && previous.slant == loaded.slant
+                && previous.variable == loaded.variable
+        }) {
             return Ok(false);
         }
         if let Some(bytes) = &loaded.bytes
@@ -141,6 +146,7 @@ impl PublicationFonts {
             self.registered.insert(loaded.family.clone());
         }
         if let Some(range) = loaded.stretch_range() { self.native_widths.insert(loaded.family.clone(), range); }
+        loaded.bytes = None;
         self.loaded.insert(key, loaded);
         Ok(true)
     }

@@ -523,36 +523,8 @@ fn greek_uppercase_mappings(
     }
     fn publish(text: &mut String, sources: &mut Vec<usize>, mappings: &mut FxHashMap<usize, Vec<char>>) {
         if text.is_empty() { return; }
-        let upper = CaseMapper::new().uppercase_to_string(text, &"el".parse().expect("valid Greek language"));
-        let mut output = upper.graphemes(true);
-        let mut pending = Vec::new();
-        let mut source = 0;
-        let mut valid = true;
-        for grapheme in text.graphemes(true) {
-            // Tailoring changes diacritics within a grapheme. The number of
-            // base-letter graphemes, including full-uppercase expansions of
-            // ypogegrammeni, follows the root full uppercase mapping.
-            let root: String = grapheme.chars().flat_map(char::to_uppercase).collect();
-            let mut mapped = Vec::new();
-            for _ in root.graphemes(true) {
-                if let Some(grapheme) = output.next() {
-                    mapped.extend(grapheme.chars());
-                } else {
-                    valid = false;
-                    break;
-                }
-            }
-            let count = grapheme.chars().count();
-            pending.push((sources[source], mapped));
-            for &index in &sources[source + 1..source + count] {
-                pending.push((index, Vec::new()));
-            }
-            source += count;
-        }
-        // Keep the scalar mapping as a safe fallback if a future Unicode
-        // version adds a tailoring with different grapheme expansion rules.
-        if valid && output.next().is_none() {
-            mappings.extend(pending);
+        if let Some(mapping) = greek_uppercase_mapping(text) {
+            mappings.extend(sources.iter().copied().zip(mapping));
         }
         text.clear();
         sources.clear();
@@ -587,7 +559,41 @@ fn greek_uppercase_mappings(
     mappings
 }
 
-fn append_css_uppercase(character: char, append: &mut impl FnMut(char)) {
+/// Contextual Greek uppercase mapped to logical scalar slots. Continuation
+/// slots of a grapheme are empty; `None` retains the scalar fallback if Unicode
+/// tailoring ever changes the expected grapheme expansion rules.
+pub fn greek_uppercase_mapping(text: &str) -> Option<Vec<Vec<char>>> {
+    let upper =
+        CaseMapper::new().uppercase_to_string(text, &"el".parse().expect("valid Greek language"));
+    let mut output = upper.graphemes(true);
+    let mut mapping = Vec::new();
+    let mut valid = true;
+    for grapheme in text.graphemes(true) {
+        // Tailoring changes diacritics within a grapheme. The number of
+        // base-letter graphemes, including full-uppercase expansions of
+        // ypogegrammeni, follows the root full uppercase mapping.
+        let root: String = grapheme.chars().flat_map(char::to_uppercase).collect();
+        let mut mapped = Vec::new();
+        for _ in root.graphemes(true) {
+            if let Some(grapheme) = output.next() {
+                mapped.extend(grapheme.chars());
+            } else {
+                valid = false;
+                break;
+            }
+        }
+        let count = grapheme.chars().count();
+        mapping.push(mapped);
+        mapping.extend((1..count).map(|_| Vec::new()));
+    }
+    // Keep the scalar mapping as a safe fallback if a future Unicode
+    // version adds a tailoring with different grapheme expansion rules.
+    (valid && output.next().is_none()).then_some(mapping)
+}
+
+/// Append the CSS scalar uppercase fallback, including the engine's pinned
+/// Georgian compatibility policy.
+pub fn append_css_uppercase(character: char, append: &mut impl FnMut(char)) {
     // The pinned CSS2 oracle treats Georgian Mkhedruli as a unicase script.
     // Keep that compatibility mapping explicit instead of inheriting changes
     // in the Rust toolchain's Unicode data version.

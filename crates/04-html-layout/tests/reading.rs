@@ -1,31 +1,28 @@
 use html_pipeline::engine::reading_queries;
-use html_pipeline::engine::{FontMetrics, GlyphHandle, GlyphRequest, ShapedGlyph};
+use html_pipeline::engine::{FontMetrics, GlyphHandle, ShapedRun, TextRunShapeRequest, ShapedGlyph};
 use html_pipeline::engine::{
     GlyphResourceGeneration, GlyphResourceStore, GlyphShaper, LaidOutDocument, LayoutConstraints,
-    PreparedDocument, ReadingFragment, ShapeError,
-};
+    PreparedDocument, ReadingFragment, };
 
 #[derive(Default)]
 struct TestShaper(GlyphResourceGeneration);
 
 impl GlyphShaper for TestShaper {
-    fn reset(&mut self) {
-        self.0 = GlyphResourceGeneration::default();
-    }
-
     fn resource_generation(&self) -> GlyphResourceGeneration {
         self.0
     }
 
-    fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
-        Ok(ShapedGlyph::new(
-            GlyphHandle(request.character as u32),
-            request.style.font_size / 2.0,
-            FontMetrics {
-                ascent: request.style.font_size,
-                descent: 0.0,
-            },
-        ))
+    fn shape_run(&mut self, request: TextRunShapeRequest<'_>) -> ShapedRun {
+        ShapedRun::characters(request, |character, style| {
+            ShapedGlyph::new(
+                GlyphHandle(character as u32),
+                style.font_size / 2.0,
+                FontMetrics {
+                    ascent: style.font_size,
+                    descent: 0.0,
+                },
+            )
+        })
     }
 }
 

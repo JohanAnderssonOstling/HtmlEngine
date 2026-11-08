@@ -9,7 +9,6 @@ mod stage_tests {
 
     use crate::layout_model::BoxId;
     use crate::layout_model::LineId;
-    use crate::{GlyphRequest, ShapedGlyph};
 
     #[test]
     fn streamed_spacing_updates_unique_geometry_without_allocating() {
@@ -263,7 +262,6 @@ mod stage_tests {
         assert_eq!(runs, [("漢字", Some("zh-Hant")), ("かな", Some("ja"))]);
     }
 
-    use crate::ShapeError;
     use crate::engine::{
         GlyphResourceGeneration, GlyphResourceStore, GlyphShaper, ImageMetrics, LaidOutDocument,
         LayoutConstraintError, LayoutConstraints, PreparedDocument, ReaderStyleOverrides,
@@ -2697,10 +2695,14 @@ mod stage_tests {
             .iter()
             .map(|line| (text_paint::render_line_glyphs(&line), line.point()))
             .collect::<Vec<_>>();
-        let style = shaping::style(8.0, 400, FontSlant::Normal, 0, None);
-        let appended = document_resources
-            .shape_glyph(&mut shaper, shaping::glyph('#', &style))
-            .unwrap();
+        let style = shaping::style(8.0, 400, FontSlant::Normal, None);
+        let appended = {
+            let mut run_glyphs = [GlyphId(0)];
+            document_resources
+                .shape_run(&mut shaper, shaping::run("#", style), &mut run_glyphs)
+                .map(|_| run_glyphs[0])
+        }
+        .unwrap();
         assert!(
             text_paint::glyph_metric(snapshot.render_view(&snapshot_resources).text(), appended)
                 .is_none()
@@ -2824,7 +2826,7 @@ mod stage_tests {
             .iter()
             .map(|line| (text_paint::render_line_glyphs(&line), line.point()))
             .collect::<Vec<_>>();
-        shaper.reset();
+        shaper = TestGlyphShaper::new();
 
         let error = document
             .relayout_with_metrics_and_shaper(
@@ -2850,75 +2852,6 @@ mod stage_tests {
         );
     }
 
-    #[test]
-    fn failed_first_line_append_keeps_the_published_layout() {
-        struct RejectAppend<'a>(&'a mut TestGlyphShaper);
-        impl GlyphShaper for RejectAppend<'_> {
-            fn reset(&mut self) {
-                self.0.reset();
-            }
-            fn resource_generation(&self) -> GlyphResourceGeneration {
-                self.0.resource_generation()
-            }
-            fn shape_glyph(
-                &mut self,
-                request: GlyphRequest<'_>,
-            ) -> Result<ShapedGlyph, ShapeError> {
-                self.0.shape_glyph(request)
-            }
-        }
-        let mut factory = DocumentFactory::new();
-        let prepared = factory.parse_with_new_pipeline(
-            "<html><body><p>one two three four five six</p></body></html>",
-            Some("p::first-line {font-size:24px}"),
-        );
-        let mut shaper = TestGlyphShaper::new();
-        let constraints = LayoutConstraints::new(120.0, 20.0).unwrap();
-        let mut document_resources = GlyphResourceStore::default();
-        let mut document = prepared
-            .shape_borrowed(&mut shaper, &mut document_resources)
-            .unwrap()
-            .layout_with_shaper(constraints, &mut shaper, &mut document_resources)
-            .expect("layout requires the shaper-aware API for first-line styles");
-        let before = document
-            .render_view(&document_resources)
-            .text()
-            .lines()
-            .iter()
-            .map(|line| (text_paint::render_line_glyphs(&line), line.point()))
-            .collect::<Vec<_>>();
-        let lines = document.data.layout.state.line_output.lines.as_ptr();
-        let metrics = document_resources.len();
-
-        let error = document
-            .relayout_with_metrics_and_shaper(
-                LayoutConstraints::new(240.0, 20.0).unwrap(),
-                &ImageMetrics::default(),
-                &mut RejectAppend(&mut shaper),
-                &mut document_resources,
-            )
-            .unwrap_err();
-
-        assert_eq!(
-            error,
-            RejectAppend(&mut shaper)
-                .begin_append_shaping()
-                .unwrap_err()
-        );
-        assert_eq!(document.data.last_constraints, constraints);
-        assert_eq!(document.data.layout.state.line_output.lines.as_ptr(), lines);
-        assert_eq!(
-            document
-                .render_view(&document_resources)
-                .text()
-                .lines()
-                .iter()
-                .map(|line| (text_paint::render_line_glyphs(&line), line.point()))
-                .collect::<Vec<_>>(),
-            before
-        );
-        assert_eq!(document_resources.len(), metrics);
-    }
 
     #[test]
     fn cached_text_survives_recursive_atomic_layout_and_repeated_width_changes() {

@@ -181,7 +181,7 @@ pub fn render_geometry_view_end_spatial_rank_at<'a>(
 pub fn render_geometry_view_lines_at_y<'a>(
     value: RenderGeometryView<'a>,
     y: f64,
-) -> impl Iterator<Item = LineId> + 'a {
+) -> impl Iterator<Item = LineId> + Clone + 'a {
     let output = &value.doc.layout_state.line_output;
     let start = output.spatial_order.partition_point(|id| {
         let line = &output.lines[layout_state::line_id_index(*id)];

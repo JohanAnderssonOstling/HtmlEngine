@@ -130,7 +130,7 @@ impl VisibleLinePositions {
     }
 
     /// Stable line identities and their placements, in pagination order.
-    pub fn iter(&self) -> impl Iterator<Item = (LineId, LineScreen)> + '_ {
+    pub fn iter(&self) -> impl Iterator<Item = (LineId, LineScreen)> + Clone + '_ {
         self.ids
             .iter()
             .zip(&self.positions)

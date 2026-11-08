@@ -13,7 +13,9 @@ use html_dom::{ElementRef, NodeRef, RootFontSize};
 use html_engine_model::shaping::{
     borrowed_document, first_line_shaper_required, resource_generation_mismatch,
 };
-use html_engine_model::{GlyphResourceCheckpoint, PaintColorRun, PaintView, TextPaintRange};
+use html_engine_model::{
+    GlyphResourceCheckpoint, GlyphResourceId, PaintColorRun, PaintView, TextPaintRange,
+};
 use html_style_model::{
     ContentLanguage, Display, FontFace, ObjectFit, UsedPreferredSize, Visibility,
 };
@@ -314,6 +316,7 @@ pub struct PreparedDocument<'a> {
 }
 
 pub(crate) struct ShapedText {
+    resource_id: GlyphResourceId,
     pub(super) resource_generation: crate::GlyphResourceGeneration,
     preparation: PreparationGeneration,
     geometry_box_count: usize,
@@ -442,8 +445,8 @@ impl ShapedText {
     }
 }
 
-/// Retains the published ledger until native document replacement commits.
-/// Unfinished shaping restores native resources and metrics when dropped.
+/// Keep published engine registrations until a candidate layout succeeds.
+/// Native caches belong to the backend and retain their valid entries.
 struct DocumentShapingTransaction<'a, S: GlyphShaper> {
     glyph_shaper: &'a mut S,
     resources: &'a mut GlyphResourceStore,
@@ -452,7 +455,6 @@ struct DocumentShapingTransaction<'a, S: GlyphShaper> {
 
 impl<'a, S: GlyphShaper> DocumentShapingTransaction<'a, S> {
     fn begin(glyph_shaper: &'a mut S, resources: &'a mut GlyphResourceStore) -> Self {
-        glyph_shaper.begin_document_shaping();
         let previous_resources = replace(
             resources,
             GlyphResourceStore::new(glyph_shaper.resource_generation()),
@@ -465,7 +467,6 @@ impl<'a, S: GlyphShaper> DocumentShapingTransaction<'a, S> {
     }
 
     fn commit(mut self) {
-        self.glyph_shaper.commit_document_shaping();
         self.previous_resources = None;
     }
 }
@@ -473,9 +474,9 @@ impl<'a, S: GlyphShaper> DocumentShapingTransaction<'a, S> {
 impl<S: GlyphShaper> Drop for DocumentShapingTransaction<'_, S> {
     fn drop(&mut self) {
         if let Some(previous_resources) = self.previous_resources.take() {
-            self.glyph_shaper.rollback_document_shaping();
             *self.resources = previous_resources;
         }
+        self.glyph_shaper.finish_shaping();
     }
 }
 
@@ -494,7 +495,6 @@ impl<'a, S: GlyphShaper> AppendShapingTransaction<'a, S> {
         if glyph_shaper.resource_generation() != resources.generation() {
             return Err(resource_generation_mismatch());
         }
-        glyph_shaper.begin_append_shaping()?;
         let checkpoint = resources.checkpoint();
         Ok(Self {
             glyph_shaper,
@@ -504,7 +504,6 @@ impl<'a, S: GlyphShaper> AppendShapingTransaction<'a, S> {
     }
 
     fn commit(mut self) {
-        self.glyph_shaper.commit_append_shaping();
         self.checkpoint = None;
     }
 }
@@ -512,9 +511,9 @@ impl<'a, S: GlyphShaper> AppendShapingTransaction<'a, S> {
 impl<S: GlyphShaper> Drop for AppendShapingTransaction<'_, S> {
     fn drop(&mut self) {
         if let Some(checkpoint) = self.checkpoint.take() {
-            self.glyph_shaper.rollback_append_shaping();
             assert!(self.resources.rollback_to(checkpoint));
         }
+        self.glyph_shaper.finish_shaping();
     }
 }
 
@@ -933,9 +932,9 @@ impl<'a> PreparedDocument<'a> {
         )
     }
 
-    /// Shapes and lays out a document as one renderer-resource transaction.
-    /// A shaping or exact-line-refinement failure leaves the previous renderer
-    /// resources active.
+    /// Publish a complete engine layout, preserving its previous registrations
+    /// if engine registration or first-line refinement fails. Native cache
+    /// entries remain owned and managed by the backend.
     pub fn shape_and_layout_with_metrics_and_shaper(
         &self,
         constraints: LayoutConstraints,
@@ -999,42 +998,6 @@ impl<'a> PreparedDocument<'a> {
         )
     }
 
-    /// Shapes and lays out a subtree of the document whose renderer resources
-    /// are already active, using a rollback-capable append transaction.
-    ///
-    /// A document shaping transaction *replaces* the shaper's glyphs and runs
-    /// on commit. That is right for a new document and wrong for a note, which
-    /// belongs to the document it was taken from: committing the note's
-    /// resources strands every glyph the page still refers to, and rolling
-    /// them back discards the note's own. An append transaction retains both
-    /// on success and restores the page's resources on failure.
-    ///
-    /// Glyph ids and metrics both append to the shaper's active resource
-    /// store. A failed append restores that store to the previous dense ID.
-    pub fn shape_and_layout_into_active_resources(
-        &self,
-        constraints: LayoutConstraints,
-        image_metrics: &ImageMetrics,
-        glyph_shaper: &mut impl GlyphShaper,
-        resources: &mut GlyphResourceStore,
-    ) -> Result<LaidOutDocument<'_>, ShapeError> {
-        with_append_shaping(
-            glyph_shaper,
-            &self.inputs.publication_fonts,
-            |glyph_shaper, resources| {
-                let shaped = self.inputs.shape_active_document(glyph_shaper, resources)?;
-                shaped.layout_coordinated(
-                    constraints,
-                    image_metrics,
-                    glyph_shaper,
-                    None,
-                    resources,
-                    RefinementTransaction::Existing,
-                )
-            },
-            resources,
-        )
-    }
 }
 
 fn shape_text(
@@ -1070,6 +1033,7 @@ fn shape_text(
     let inline_plan_generation = InlinePlanGeneration::new();
     let words = build_word_index(inputs, &font_metrics);
     Ok(Box::new(ShapedText {
+        resource_id: resources.id(),
         resource_generation: resources.generation(),
         preparation: inputs.generation,
         geometry_box_count: inputs.layout_tree.box_count(),
@@ -1154,7 +1118,7 @@ impl<'a> ShapedDocument<'a> {
 
     #[cfg(any(test, feature = "testing"))]
     pub fn glyph_metrics<'r>(&self, resources: &'r GlyphResourceStore) -> &'r GlyphMetrics {
-        assert_eq!(self.shaped.resource_generation, resources.generation());
+        assert_eq!(self.shaped.resource_id, resources.id());
         resources.metrics()
     }
 
@@ -1275,10 +1239,10 @@ impl<'a> ShapedDocument<'a> {
     ) -> Result<LaidOutDocument<'a>, ShapeError> {
         match transaction {
             RefinementTransaction::Existing => {
-                debug_assert_eq!(self.shaped.resource_generation, resources.generation());
+                debug_assert_eq!(self.shaped.resource_id, resources.id());
             }
             RefinementTransaction::Append => {
-                if self.shaped.resource_generation != resources.generation()
+                if self.shaped.resource_id != resources.id()
                     || glyph_shaper.resource_generation() != resources.generation()
                 {
                     return Err(resource_generation_mismatch());
@@ -1326,7 +1290,7 @@ impl<'a> ShapedDocument<'a> {
         resources: &GlyphResourceStore,
     ) -> Result<LaidOutDocument<'a>, ShapeError> {
         self.inputs.require_static_text()?;
-        if self.shaped.resource_generation != resources.generation() {
+        if self.shaped.resource_id != resources.id() {
             return Err(resource_generation_mismatch());
         }
         Ok(LayoutProducts::new(
@@ -1546,7 +1510,8 @@ pub struct DetachedLayout {
 /// Scoped layout products. DOM and styles remain in the parent document.
 /// Querying requires that same preparation owner; replacing it invalidates the note.
 pub struct NoteLayout {
-    pub(crate) resource_lifetime: Option<Arc<()>>,
+    resources: Arc<GlyphResourceStore>,
+    owner_resources: GlyphResourceId,
     owner: PreparationGeneration,
     layout_tree: LayoutTree,
     text: PreparedText,
@@ -1566,10 +1531,9 @@ impl NoteLayout {
         resources: &'a GlyphResourceStore,
     ) -> Option<RenderView<'a>> {
         if !resources.paint_resources_valid()
-            || self.layout.data.base_shaped.resource_generation != resources.generation()
+            || resources.id() != self.owner_resources
+            || owner.data.base_shaped.resource_id != self.owner_resources
             || !self.belongs_to(owner)
-            || self.layout.data.base_shaped.resource_generation
-                != owner.data.base_shaped.resource_generation
         {
             return None;
         }
@@ -1588,19 +1552,17 @@ impl NoteLayout {
             return None;
         }
         Some(RenderView {
-            resources: Some(resources),
-            scope_lifetime: self.resource_lifetime.as_ref(),
-            glyph_metrics: resources.metrics(),
+            resources: Some(self.resources.as_ref()),
+            parent_resources: Some(resources),
+            native_paint_resources: self.resources.native_paint_resources(),
+            scope_resources: Some(&self.resources),
+            glyph_metrics: self.resources.metrics(),
             doc,
         })
     }
 }
 
 impl<'a> LaidOutDocument<'a> {
-    pub(crate) fn shaping_generation(&self) -> InlinePlanGeneration {
-        ShapedTextView::new(&self.data.base_shaped, self.data.layout.refinement.as_ref())
-            .inline_plan_generation
-    }
 
     /// Only omit geometry work when resolved sizing proves it independent of
     /// changed natural dimensions. Intrinsic formatting contexts stay conservative.
@@ -1617,7 +1579,11 @@ impl<'a> LaidOutDocument<'a> {
     }
 
     /// Detach scoped products while retaining only the parent's preparation identity.
-    pub fn into_note(self, owner: &LaidOutDocument<'_>) -> NoteLayout {
+    pub(crate) fn into_note(
+        self,
+        owner: &LaidOutDocument<'_>,
+        resources: GlyphResourceStore,
+    ) -> NoteLayout {
         assert!(std::ptr::eq(
             self.inputs.document.as_ref(),
             owner.inputs.document.as_ref()
@@ -1627,7 +1593,8 @@ impl<'a> LaidOutDocument<'a> {
             owner.inputs.styles.as_ref()
         ));
         NoteLayout {
-            resource_lifetime: None,
+            resources: Arc::new(resources),
+            owner_resources: owner.data.base_shaped.resource_id,
             owner: owner.inputs.generation,
             layout_tree: self
                 .inputs
@@ -2008,9 +1975,11 @@ impl<'a> LaidOutDocument<'a> {
         &'r self,
         resources: &'r GlyphResourceStore,
     ) -> Option<RenderView<'r>> {
-        (self.data.base_shaped.resource_generation == resources.generation()).then(|| RenderView {
+        (self.data.base_shaped.resource_id == resources.id()).then(|| RenderView {
             resources: Some(resources),
-            scope_lifetime: None,
+            parent_resources: None,
+            native_paint_resources: resources.native_paint_resources(),
+            scope_resources: None,
             doc: self.read(),
             glyph_metrics: resources.metrics(),
         })
@@ -2073,7 +2042,7 @@ impl<'a> LaidOutDocument<'a> {
         glyph_shaper: &mut impl GlyphShaper,
         resources: &mut GlyphResourceStore,
     ) -> Result<(), ShapeError> {
-        if self.data.base_shaped.resource_generation != resources.generation()
+        if self.data.base_shaped.resource_id != resources.id()
             || glyph_shaper.resource_generation() != resources.generation()
         {
             return Err(resource_generation_mismatch());
@@ -2125,7 +2094,7 @@ impl<'a> LaidOutDocument<'a> {
                 resources,
             );
         }
-        if self.data.base_shaped.resource_generation != resources.generation()
+        if self.data.base_shaped.resource_id != resources.id()
             || glyph_shaper.resource_generation() != resources.generation()
         {
             return Err(resource_generation_mismatch());
@@ -2181,7 +2150,7 @@ impl<'a> LaidOutDocument<'a> {
         resources: &GlyphResourceStore,
     ) -> Result<(), ShapeError> {
         self.inputs.require_static_text()?;
-        if self.data.base_shaped.resource_generation != resources.generation() {
+        if self.data.base_shaped.resource_id != resources.id() {
             return Err(resource_generation_mismatch());
         }
         self.data.layout.relayout(
@@ -2245,10 +2214,7 @@ impl<'a> LaidOutDocument<'a> {
 
     #[cfg(any(test, feature = "testing"))]
     pub fn glyph_metrics<'r>(&self, resources: &'r GlyphResourceStore) -> &'r GlyphMetrics {
-        assert_eq!(
-            self.data.base_shaped.resource_generation,
-            resources.generation()
-        );
+        assert_eq!(self.data.base_shaped.resource_id, resources.id());
         resources.metrics()
     }
 
@@ -2292,10 +2258,7 @@ impl<'a> LaidOutDocument<'a> {
         &self,
         resources: &GlyphResourceStore,
     ) -> MemoryUsageReport {
-        assert_eq!(
-            self.data.base_shaped.resource_generation,
-            resources.generation()
-        );
+        assert_eq!(self.data.base_shaped.resource_id, resources.id());
         let mut seen = FxHashSet::default();
         let mut report = self.memory_usage_report_with_shared(&mut seen);
         report.extend_prefixed(
@@ -2532,7 +2495,9 @@ impl<'a> DocumentRead<'a> {
     pub(super) fn render_view(self, glyph_metrics: &'a GlyphMetrics) -> RenderView<'a> {
         RenderView {
             resources: None,
-            scope_lifetime: None,
+            parent_resources: None,
+            native_paint_resources: None,
+            scope_resources: None,
             doc: self,
             glyph_metrics,
         }

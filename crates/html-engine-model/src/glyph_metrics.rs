@@ -37,7 +37,7 @@ impl GlyphMetric {
         }
     }
 
-    pub(crate) fn from_shaped(ch: char, shaped: ShapedGlyph) -> Self {
+    pub(crate) fn from_shaped(ch: char, shaped: &ShapedGlyph) -> Self {
         Self {
             ch,
             advance: shaped.advance(),
@@ -259,7 +259,7 @@ impl GlyphMetrics {
         }
     }
 
-    /// Resolve a layout glyph to its adapter-owned native paint handle.
+    /// Resolve a layout glyph to its borrowed or document-local native paint key.
     pub fn paint_handle(&self, glyph: GlyphId) -> Option<GlyphHandle> {
         if glyph.0 as usize >= self.len {
             return None;

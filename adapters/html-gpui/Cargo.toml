@@ -11,6 +11,7 @@ html-render-core = { package = "skrift-render-core", path = "../../crates/05-htm
 html-resources = { package = "skrift-resources", path = "../../crates/html-resources" }
 html-pipeline = { package = "skrift-pipeline", path = "../../crates/html-pipeline" }
 html-style-model = { package = "skrift-style-model", path = "../../crates/html-style-model" }
+html-text = { package = "skrift-text", path = "../../crates/html-text" }
 html-engine-model = { package = "skrift-engine-model", path = "../../crates/html-engine-model" }
 cssparser = "0.37"
 html-fonts = { path = "../html-fonts" }

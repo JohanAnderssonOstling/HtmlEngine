@@ -12,49 +12,52 @@ use html::{Document, DocumentOptions};
 use html::text::FontMetrics;
 use html::text::FontSlant;
 use html::text::GlyphHandle;
-use html::text::GlyphRequest;
+use html_engine_model::ShapingStyle;
 use html_engine_model::GlyphResources;
 use html_engine_model::GlyphWriter;
 use html_engine_model::ResourceShaper;
-use html::text::ShapeError;
 use html::text::ShapedGlyph;
 use kurbo::{Point as HtmlPoint, Rect};
 use peniko::{Color, Image};
 
-fn shape_glyph(
+fn paint_character(
     system: &WindowTextSystem,
-    request: GlyphRequest<'_>,
+    character: char,
+    properties: &ShapingStyle<'_>,
     glyphs: &mut GlyphWriter<'_, ShapedLine>,
-) -> Result<ShapedGlyph, ShapeError> {
-    let (style, angle) = match request.style.font_slant {
+) -> ShapedGlyph {
+    let (style, angle) = match properties.font_slant {
         FontSlant::Normal => (FontStyle::Normal, None),
         FontSlant::Italic => (FontStyle::Italic, None),
-        FontSlant::Oblique { angle } => (FontStyle::Oblique, Some(shaping_contracts::oblique_angle_degrees(angle))),
+        FontSlant::Oblique { angle } => (
+            FontStyle::Oblique,
+            Some(shaping_contracts::oblique_angle_degrees(angle)),
+        ),
     };
     let font = Font {
-        weight: FontWeight(f32::from(request.style.font_weight)),
+        weight: FontWeight(f32::from(properties.font_weight)),
         style,
-        variations: FontVariations::new(request.style.font_stretch, angle).unwrap_or_default(),
+        variations: FontVariations::new(properties.font_stretch, angle).unwrap_or_default(),
         ..Font::default() // System font for this minimal adapter.
     };
-    let text = request.character.to_string();
+    let text = character.to_string();
     let run = TextRun {
         len: text.len(),
         font,
         ..Default::default()
     };
-    let line = if request.style.font_size == 0.0 || request.character.is_control() {
+    let line = if properties.font_size == 0.0 || character.is_control() {
         ShapedLine::default()
     } else {
-        system.shape_line(text.into(), px(request.style.font_size), &[run], None)
+        system.shape_line(text.into(), px(properties.font_size), &[run], None)
     };
     let metrics = FontMetrics {
         ascent: f32::from(line.ascent),
         descent: f32::from(line.descent),
     };
     let advance = f32::from(line.width());
-    let handle = glyphs.insert(line)?;
-    Ok(ShapedGlyph::new(handle, advance, metrics))
+    let handle = glyphs.insert(line);
+    ShapedGlyph::new(handle, advance, metrics)
 }
 
 struct GpuiPainter<'a> {
@@ -102,8 +105,8 @@ impl Render for Example {
         div().size_full().p_4().bg(rgb(0xffffff)).child(
             canvas(
                 |bounds, window, _| {
-                    let mut shaper = ResourceShaper::new(|request, glyphs| {
-                        shape_glyph(window.text_system(), request, glyphs)
+                    let mut shaper = ResourceShaper::new(|character, style, glyphs| {
+                        paint_character(window.text_system(), character, style, glyphs)
                     });
                     let options =
                         DocumentOptions::new(f64::from(f32::from(bounds.size.width)).max(1.0))

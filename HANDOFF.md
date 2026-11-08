@@ -1,8 +1,16 @@
 # Software design and API cleanup handoff
 
-Updated 6 November 2026. The requested cleanup and final source review are complete. The application boundary is an opaque `html::Document`; consumers submit input changes and use published services rather than manipulating pipeline state. Live reader and application consumers were migrated with the API changes.
+Updated 8 November 2026. The requested cleanup and final source review are complete. The application boundary is an opaque `html::Document`; consumers submit input changes and use published services rather than manipulating pipeline state. Live reader and application consumers were migrated with the API changes.
 
-This handoff is for the next maintainer or coding agent. It records the intended boundaries, recent implementation changes, checks performed, and constraints that must carry forward. Native release type checks cover the cleanup, explicit-ownership changes, review fixes, and simplification passes through the follow-up review below. The later GPUI cache ownership, fragment recovery, API surface fixes, session API reduction, reader operation consolidation, the reader API boundary fixes, and the HtmlEngine facade boundary fixes are source-checked only. Runtime behavior and performance have not been verified; tests and benchmarks were not run.
+This handoff records intended boundaries, implementation changes and checks.
+The current resource/interaction cleanup is source-checked only. Earlier release
+checks apply only to the revisions explicitly identified in the history below;
+they do not establish type correctness of later changes. Compilation, tests and
+benchmarks were not run for the current cleanup. Runtime behavior and performance
+remain unmeasured.
+
+The current contracts below and the final dated entry supersede older dated
+entries. Earlier entries are a chronological record, including APIs since removed.
 
 ## Working rules
 
@@ -30,7 +38,7 @@ The shared workspace contains substantial existing changes and untracked artifac
 | `crates/html-engine-model` | Backend shaping contracts, geometry and resource identities |
 | `crates/05-html-render-core` | Scene recording and replay |
 | `adapters/html-gpui` | Native shaping resources, font integration, GPUI painting and fragment widget |
-| `../HtmlViewCore` | Reader placement, pagination, navigation and reader GPUI integration |
+| `../HtmlViewCore` | Reader navigation, host placement and reader GPUI integration |
 | `../Html-Prototype/apps/components` | Application font-loading callback and other host integration |
 | `tools/embed-bench/gpui` | A live consumer of the adapter recording and replay API |
 
@@ -44,7 +52,7 @@ Applications supply reader overrides through document options, and viewport, typ
 
 The engine owns measured geometry and logical glyph identities. Adapters own native glyphs, shaped runs, native caches, and paint handles. Text backends receive a unified shaping style whose defaults are resolved by the engine. The host does not negotiate a separate advanced-feature capability protocol; whole-run shaping supplies the advances and cluster geometry that layout actually uses.
 
-The reader owns navigation, page placement, annotation storage and activation, and persistent addresses. The facade retains the geometry, selection, search, target, scoped-layout and export operations used by HtmlViewCore. Font preparation and broader content services remain in native implementation crates. Diagnostic tools may depend directly on implementation crates. Internal visibility at the application boundary does not require deleting those implementation services.
+The engine owns pagination, page content placement, selection interpretation and link hover. The reader owns navigation, host display transforms, annotation storage and activation, and persistent addresses. The facade retains the geometry, selection, search, target, scoped-layout and export operations used by HtmlViewCore. Font preparation and broader content services remain in native implementation crates. Diagnostic tools may depend directly on implementation crates. Internal visibility at the application boundary does not require deleting those implementation services.
 
 Do not reinstate unused table-selection inspection queries. The user explicitly declined those APIs. Preserve the table-hit and selection behavior required by current consumers.
 
@@ -74,22 +82,26 @@ Primary files: [caret_positions.rs](crates/html-engine-model/src/caret_positions
 
 ### Native resources and painting
 
-The GPUI adapter exposes opaque resource snapshots instead of raw glyph and run registries:
+The backend owns native cache entries and returns either borrowed handles or
+retained entry references. The engine owns document-local glyph registrations
+and their identity; native generation identifies the backend namespace.
 
 | API | Contract |
 | --- | --- |
-| `GpuiTextCache::resources()` | Capture generation plus shared glyph and native-run storage for recording |
-| `GpuiTextResources::generation()` | Read the captured resource generation |
+| `GpuiCommandPainter::new(images)` | Record content with image support |
+| `GpuiCommandPainter::commands_only()` | Record content without an image cache |
+| `GpuiCommandPainter::reusing(scene)` / `finish()` | Reuse a previous command buffer and return a scene |
+| `GpuiScene::paint(bounds, window, cx)` | Replay valid commands with retained native entries |
+| `GpuiTextCache::reset()` | Caller-controlled cache clearing and native generation change |
 
-| `GpuiCommandPainter::new(images, resources)` | Record with the supplied snapshot |
-| `GpuiCommandPainter::commands_only(resources)` | Record commands with the supplied snapshot |
-| `GpuiCommandPainter::reusing(scene)` / `finish()` | Reuse a previous buffer; pair the commands with their glyph storage |
-| `GpuiScene::paint(bounds, window, cx)` | Replay with the resources the scene was recorded against |
+Scenes retain the entries they use rather than snapshots of the caller's cache.
+Each scope owns its registration ledger. Its scenes retain that ledger and a
+parent validity lease, so scenes can outlive the scope wrapper but reject parent
+replacement. Engine checkpoints affect registrations only; no native checkpoint
+hooks remain. The GPUI one-character run cache is bounded at 4,096 entries with batch eviction.
 
-Raw `GlyphStore`, `RunStore`, `GlyphStorage`, and `GpuiTextRun` are no longer exported. Snapshots share existing allocations with `Rc`; capturing recording resources retains one glyph store and one run registry. Replay resources retain only the glyph store because recorded text batches own their native runs. The painter implementation and replay kernel were preserved.
-
-Migrated the fragment widget, HtmlViewCore document and note painting, and the embed benchmark. Do not reintroduce a parallel reader-specific resource snapshot or raw registry getters.
-
+`GlyphShaper` has five methods (two required: resource generation and run shaping). Do not reintroduce raw registry
+getters, caller registration coordination or traits used only to hide stages.
 Primary files: [text.rs](adapters/html-gpui/src/text.rs), [paint.rs](adapters/html-gpui/src/paint.rs), [fragment.rs](adapters/html-gpui/src/fragment.rs), `../HtmlViewCore/adapters/html-view-gpui/src/view.rs`, and [benchmark consumer](tools/embed-bench/gpui/src/skrift_content.rs).
 
 ### Font loading
@@ -1467,6 +1479,711 @@ Items 13–15 remain for discussion before implementation:
 
 Snapshots, scoped diff, syntax, caller, source-contract, inventory and line reports:
 `/home/johan/.cache/htmlengine-reader-cleanup-1-12-20261105-220755`.
+
+### Link hover underlining (6 November 2026; source-only)
+
+Links now receive a hover underline through the engine's existing text-overlay
+painter. `html::pagination::LinkHover` owns the hovered source-element identity
+and text range; its three production operations update from page-local pointer
+data, report active hover and paint the underline. DOM identity distinguishes
+separate links that share a destination. Source lookup includes inline
+descendants; visible fragments use the existing page/column/overflow projection.
+Linked images retain hover/cursor behavior; an image-only link has no text to
+underline. Underline color follows the reader foreground override or the link's
+resolved text color. This is a link interaction overlay, not general CSS
+`:hover` selector matching.
+
+The reader stores engine hover state instead of a boolean and passes it to the
+page painter. Hover transitions invalidate the interaction overlay, including
+moves between two links, while retaining the base display layer. Reader palette
+changes refresh the underline color; geometry/document changes clear stale
+hover. Removed the old cursor activation/deactivation helpers.
+
+The GPUI adapter now clears hover when leaving the document hitbox or the
+window, including window exits without a final mouse-move event.
+`RendererSession::pointer_leave` now clears hover only: it preserves the saved
+press position and active selection until release. The adapter continues routing
+movement and release outside the document for captured gestures. This completes
+the hover-leave integration discussed in review item 15. Actual focus-loss or
+lost-release gesture cancellation remains a separate lifecycle question; no
+cancellation API or policy was introduced here. Review items 13–14 remain
+unchanged.
+
+Validation: all eleven changed Rust files parse through rustfmt and tree-sitter.
+Source comparisons confirm unchanged pointer-down/up function bodies and all
+thirteen existing test function bodies in the changed files. Caller searches
+confirm production use of all three engine hover operations and the leave hooks,
+and no remaining cursor-activation helper calls. No tests or test-only production
+helpers were added. **Compilation, tests and benchmarks were not run** under the
+current instructions; rendering and Rust type correctness remain unverified.
+
+Snapshots, scoped diff, syntax, caller, inventory and source-contract reports:
+`/home/johan/.cache/htmlengine-link-hover-20261105-232631`.
+
+### Font-load effect deduplication: review item 13 (6 November 2026; source-only)
+
+Document updates now emit a font-load effect only when the committed font-face
+list or the publication-font policy changes. The reader captures the two inputs
+before applying an update and compares them with the successful result. Shared
+face snapshots use an Arc identity check; rebuilt snapshots with equal contents
+also suppress emission. Unchanged updates, paint changes, resize/reflow and
+`RefreshFonts` therefore do not issue another request unless the actual font
+inputs changed. Both disabling and re-enabling publication fonts still emit the
+policy transition, and media-dependent declaration changes are detected by value.
+
+Initial construction and prepared-document loading retain their existing
+unconditional requests, covering chapter navigation and cross-document notes.
+The resource provider is fixed for a renderer's lifetime; a new renderer retains
+its initial request. No persistent cache, state field, public API, dependency or
+test-only helper was introduced. The host's existing per-face loading/registration
+and failure handling code is unchanged. Incidental redraws no longer trigger
+retries of failed font loads; later loading or font-input transitions still pass
+through the existing host request tracking.
+
+Only `apply_document_update_impl` changed in Rust source. Static syntax parsing
+through rustfmt and tree-sitter passes. Source comparisons confirm unchanged
+initial/chapter request producers, host handling, effect types, struct definitions,
+existing test inventory and the update control flow after font-effect emission.
+The pipeline's existing rollback on failed updates preserves the comparison's
+committed-input boundary. **Compilation, tests and benchmarks were not run** under
+the current instructions; source checks do not establish type or runtime
+correctness. Review item 14 remains open.
+
+Snapshots, scoped diff, syntax and source-contract reports:
+`/home/johan/.cache/htmlengine-font-effects-20261105-235903`.
+
+### Shared CFI syntax: review item 14 (6 November 2026; source-only)
+
+The CFI crate now has one private lexical scanner and parsed point/range model
+in `syntax.rs`. Source-position parsing, glyph point/range resolution, package
+mapping and document-index queries use this model. Delimiters are structural
+only outside assertions; escaped assertion characters remain data. The same
+reserved-character predicate drives assertion writing and escape validation.
+
+The supported address syntax consistently rejects unmatched/nested unescaped
+brackets, unescaped parentheses, dangling or invalid escapes, zero steps,
+leading zeros, integer overflow, trailing numeric junk, missing path components
+and extra unescaped indirections. Offsets can be zero and retain UTF-16 units.
+Both range endpoints are parsed even when the caller requests only its start.
+ID/text assertions and their parameters remain advisory: they are not compared
+against document content. Unsupported spatial/temporal offsets now fail instead
+of being silently truncated to numeric prefixes. Document-only publication
+anchors and the existing empty/slash document-start forms are retained.
+
+Range generation compares structured source elements, including their IDs,
+then writes common and relative paths directly into the final string. It no
+longer splits serialized paths at slashes inside IDs and no longer allocates the
+two temporary serialized address strings. Publication source-position parsing
+and document-index lookup no longer convert through a temporary synthetic CFI.
+Unknown EPUB documents still receive no fabricated address, and invalid package
+bases cannot be serialized.
+
+Syntax validation remains separate from DOM address resolution. Syntactically
+numeric paths that no longer identify content can still reach the existing
+annotation quote-recovery path; the `/999` recovery fixture remains applicable.
+The engine resolver and annotation recovery code were not changed.
+
+All sixteen existing public function signatures are unchanged; the syntax types
+and helpers are private to the CFI crate. No dependency, trait, stored cache,
+engine Rust source or application source was introduced or changed. Existing
+CFI test names and expectation literals are preserved; one existing comma-split
+fixture calls the shared scanner in place of the removed helper. No new tests or
+test-only production helpers were added.
+
+Validation: all three changed/new Rust files parse through rustfmt and
+tree-sitter. Source audits confirm signature preservation, fixture preservation,
+shared lexical scanning, both-endpoint parsing, checked numeric conversion and
+structured range generation. **Compilation, tests and benchmarks were not run**
+under the current instructions. These are source checks, not type, runtime or
+performance verification.
+
+Syntax reference: [EPUB CFI 1.1](https://w3c.github.io/epub-specs/epub33/epubcfi/#sec-epubcfi-syntax).
+The reader implements structural/text addresses and retains its documented
+recovery behavior; this change does not claim full CFI feature support.
+
+Review items 13–15 are now addressed. Lost-release/focus-loss gesture cancellation
+remains the separate follow-up identified during hover integration.
+
+Snapshots, scoped diff, syntax, public-signature, fixture and source-contract reports:
+`/home/johan/.cache/htmlengine-cfi-syntax-20261106-000900`.
+
+## Shaping geometry no longer owns foreground color (2026-11-06)
+
+Theme changes already followed the paint-only path. Removed the redundant color
+state rather than introducing a new theme invalidation path:
+
+- `ShapingStyle` contains geometry/font properties only; `TextRunShapeRequest`
+  no longer carries per-character paint colors. Migrated engine callers,
+  existing fixtures and the reader's two native profiling examples.
+- Shaping-span scans now determine spacing placement without allocating color
+  vectors. The engine's resolved paint-color runs remain the source for authored,
+  generated, first-line and theme colors.
+- GPUI run metadata contains fonts and glyph ordering only. Paint fragments own
+  resolved colors, and replay reads them directly. The painter uses its existing
+  text override before line/fragment colors and defaults unspecified ink to black.
+- Removed native recoloring, byte-color conversion and recoloring rollback state.
+  Retained scenes still share immutable run geometry; removed the now-redundant
+  inner glyph `Arc` and use owned metadata arrays. Document/append transactions
+  remain in place; `GlyphShaper` still has 14 methods.
+- Adapted existing geometry, retention and paint fixtures. Removed the two unit
+  cases whose request-color field/helper no longer exist; added no test cases or
+  test-only production helpers.
+
+Validation: tree-sitter and rustfmt parsed all 13 changed Rust files. A source
+caller audit checked all 31 shaping-constructor calls, including macro bodies.
+Removed color accessors/mutators have no remaining Rust references in the engine,
+reader core or reader apps. **Compilation and tests were not run** under the
+repository instructions; syntax/caller checks do not verify types or runtime behavior.
+
+Task snapshots, scoped diff and source reports: `/home/johan/.cache/htmlengine-shaping-color-20261106-004519`.
+
+## Published paint inputs retain native resources (2026-11-06)
+
+Established the ownership boundary before attempting to remove the shaping
+transaction protocol. Published GPUI geometry no longer requires the host to
+supply a snapshot of the currently active shaper.
+
+- Added `NativePaintResources`, an opaque shared snapshot of immutable,
+  `Send + Sync` native data. `GlyphShaper::retain_paint_resources` lets the engine
+  capture it after a successful document/append pass; failed passes preserve
+  the published ledger and snapshot. Compact glyph/run IDs remain unchanged.
+- The metric ledger, detached note output and retained render scene keep the
+  appropriate snapshot. Immediate and recorded paint bind resources from their
+  input through `Painter::bind_text_resources`; a backend rejects incompatible
+  native payloads before drawing.
+- GPUI glyph/run stores now use `Arc` copy-on-write storage for the owned boundary.
+  The font-loading callback keeps its existing `Rc`; no backend or callback
+  receives new thread bounds. Adapters with borrowed native resources, including
+  `ResourceShaper`, can keep the existing generation-based contract by returning
+  `None`; their borrowing/non-Clone support is unchanged.
+- GPUI commands retain native layouts or runs directly. Removed the separate
+  replay registry and its unreachable run-fragment fallback. A painter can bind
+  another input without changing the meaning of already recorded commands.
+- Removed HtmlViewCore's document/note snapshots, synchronization method,
+  generation comparisons and generation-forwarding APIs. GPUI painter
+  constructors now take only the image cache when needed. The snapshot type and
+  shaper snapshot accessor are private to the GPUI adapter. Migrated the
+  continuous fragment renderer and live embedding benchmark consumer.
+- Backend generation changes still invalidate reusable shaping. They do not
+  invalidate published GPUI paint backed by an owned snapshot. Stale scene and
+  note ownership checks remain. Scope reclamation refreshes the retained prefix
+  after truncating active native storage and the metric ledger.
+
+Document/append rollback and checkpoint hooks remain: they still protect mutable
+active registries and reclaim metric registrations. This pass establishes owned
+publication; it does not claim to eliminate that protocol. `GlyphShaper` now has
+15 methods, including the new snapshot handoff. No traits were introduced to
+hide pipeline stages.
+
+Validation: tree-sitter and rustfmt parsed all 17 changed Rust files. Source
+caller checks cover all 10 GPUI painter constructions. Existing test names/counts
+are unchanged; fixtures were migrated to the new ownership contract, including
+prefix-value preservation rather than copy-on-write allocation identity.
+**Compilation, tests and benchmarks were not run.** Syntax and caller checks do
+not establish type correctness, runtime behavior or performance.
+
+Before snapshots, scoped diff and source reports: `/home/johan/.cache/htmlengine-owned-paint-resources-20261106-024601`.
+
+## Native paint data belongs to caller cache entries (2026-11-06)
+
+Replaced pass-wide backend snapshots with references returned by each shaping
+result. The caller providing the backend owns native glyph/run data, cache
+storage and eviction policy. The engine retains shared entry references and
+assigns compact document-local paint IDs.
+
+- `NativePaintResource` shares an existing `Arc<T>` without wrapping or retaining
+  a cache registry. `ShapedGlyph::retained` and `shaped_run_retained` accept the
+  caller's `Arc` directly (or an already erased entry reference). Painters can
+  recover that original typed `Arc` through `downcast` without copying native
+  data. Native payloads need not implement `Clone`. Retained payloads keep the
+  existing `Send + Sync` boundary; borrowed callbacks retain their previous
+  lifetime/thread support.
+- `NativePaintResources` is now the engine's compact table of registered entry
+  references. One run occupies one entry, regardless of character count. Run
+  lookup remains constant-time; scalar lookup uses the sorted glyph intervals.
+  The table contains no backend cache keys or registry ownership. Entries and
+  their distinct native payload types share one reference-counted table, so
+  binding a table needs one `Arc` clone. Compatibility checks inspect distinct types once
+  per binding, rather than scanning document entries or allocating per command.
+  Hot lookups allow cross-crate inlining; geometry and native arrays stay shared.
+- Retained glyph handles and run IDs are assigned by the engine. Backend cache
+  indices do not escape into retained document paint commands. Single-character
+  interning uses native-entry identity plus measurements, so independent cache
+  entries cannot alias through reused backend handles.
+- GPUI returns the existing `Arc<GpuiTextRun>` / `Arc<LineLayout>` cache entries
+  directly. There is no extra `Arc<GpuiGlyph>` wrapper allocation. Painting
+  moves the recovered typed reference into commands, with one reference-count
+  increment per painted fragment/glyph. Zero-ink glyphs share one empty marker
+  per cache. Scalar cache hits use a compact record index for constant-time
+  lookup; the result handoff does not search the glyph intervals.
+  Removed `GpuiTextResources`, the pass snapshot accessor/hook and publication
+  snapshot collection. Backend registries remain private cache implementation
+  details; clearing/replacing them does not release entries retained by layouts.
+- Metric rollback truncates entry references together with registrations. An
+  unchanged cache prefix keeps entry identity; partial truncation changes only
+  range metadata. A no-op entry-table truncation avoids copying shared storage.
+  Existing note and scene ownership checks remain.
+- Borrowed-handle constructors remain supported. One document must consistently
+  use retained entries or borrowed handles; mixed ownership is rejected before
+  registration to prevent overlapping paint-ID namespaces.
+
+`ShapedGlyph` now implements `Clone` rather than `Copy` because it may hold an
+entry reference; migrated the existing fixed-result fixture. The backend trait
+is back to **14 methods** after removing the whole-cache snapshot hook. Active
+cache transactions and metric reclamation remain separate follow-up concerns.
+No traits were introduced to hide pipeline stages, and no native cache policy
+was added to the engine.
+
+Validation: tree-sitter and rustfmt parsed all seven changed Rust files; source
+reference checks found no remaining whole-cache snapshot type/hook consumers.
+All 87 existing test names/counts in the affected files are unchanged; no test
+cases or test-only production helpers were added. **Compilation, tests and
+benchmarks were not run.** Source checks do not establish type correctness,
+runtime behavior or performance. The performance review removed avoidable
+wrapper allocations, duplicate paint-time reference increments and new binary
+searches on shaping cache hits. Ownership still adds entry references and
+registration metadata; no measured claim of unchanged performance is made.
+
+Before snapshots, scoped diff and source reports: `/home/johan/.cache/htmlengine-native-entry-references-20261106-031557`.
+
+## Direct GPUI native results without duplicate registries (2026-11-06)
+
+Removed the GPUI run-ID round trip and the parallel native glyph/run registries.
+`shape_line_geometry` returns `(ShapedTextRun, GpuiTextRun)` directly. Synthetic
+caps remaps that returned native data and geometry directly; only the final
+retained shaping result allocates its `Arc<GpuiTextRun>`. The engine assigns the
+published run ID during registration; the adapter's geometry uses an unassigned
+placeholder rather than an index into a native registry.
+
+- Removed `GpuiGlyph`, `GlyphStorage`, `GlyphRecord`, `GlyphStore`, `RunStore`
+  and `shaped_text_run_from_line`. Normal runs no longer append to either a
+  native-run vector or a second glyph-record vector. There are no backend run
+  lookups or extra native-reference clones during the result handoff.
+- The scalar cache owns its native entry reference and measurements directly.
+  A hit uses one map lookup and clones that shared reference. Zero-ink results
+  still share one marker per backend. Font changes can clear the cache without
+  releasing native data retained by documents or scenes.
+- Generation checks, document/append transactions and scope reclamation remain.
+  Logical glyph/run append counters preserve checkpoint comparisons without
+  retaining native runs. Scalar cache entries retain their logical start, so
+  append rollback and note reclamation remove suffix cache entries. Document
+  rollback moves back the previous scalar cache, generation and counters.
+  Engine entry-reference and metric reclamation are unchanged.
+- `TextShapeCacheStats::backend_glyph_records` now reports actual scalar cache
+  entries; native runs allocate no backend registry records. `registered_glyphs`
+  remains the active generation's logical registration count. The backend trait
+  remains at 14 methods; this change adds no trait or public API.
+
+This removes **114 physical production Rust lines** across the two changed
+adapter files, excluding existing test modules. Normal native shaping loops and
+shared geometry arrays are unchanged. The source review confirms removal of two
+run registry writes, their retained references and lookup, plus the intermediate
+native `Arc` allocation for synthetic caps. Runtime performance was not measured.
+
+Validation: tree-sitter and rustfmt parsed both changed Rust files, removed-symbol
+searches found no live callers, and scoped whitespace checks passed. Migrated the
+existing geometry/ownership fixtures to direct native results and retained engine
+references; all 19 existing test names/counts are preserved. No test cases or
+test-only production helpers were added. **Compilation, tests and benchmarks
+were not run.** Source checks do not establish type correctness, runtime behavior
+or unchanged performance.
+
+Before snapshots, scoped diff and source reports: `/home/johan/.cache/htmlengine-direct-native-runs-20261106-035925`.
+
+## Infallible native shaping and caller-owned cache lifetime (2026-11-06)
+
+Native character shaping, run shaping and font metrics now return `ShapedGlyph`,
+`Option<ShapedRun>` and `FontRelativeMetrics` directly. Run conversion can still
+choose the scalar fallback with `None`. GPUI's internal line/caps conversion
+returns `Option` directly. Native shaping no longer exposes a recoverable error
+channel for failures the implementations never produced.
+
+`GlyphShaper` has **9 methods, down from 14**. Removed document/append begin,
+commit and rollback callbacks. Added one non-transactional `finish_shaping`
+notification so GPUI releases native scratch once at batch end on success or an
+engine/layout error, preserving scratch reuse between runs. The private engine
+publication guards invoke it; no per-run scratch clearing was added. No traits
+were introduced to hide pipeline stages.
+
+- Engine metric/entry registration still reports capacity and ownership errors.
+  First-line layout convergence and other stage errors remain reported at engine
+  boundaries. `ShapeError` is no longer re-exported from `html::text`; document
+  errors still preserve the original engine diagnostic chain. Its capacity
+  constructor is now crate-private, and unsupported-append errors are removed.
+- Private engine guards preserve the committed ledger for a failed same-document
+  candidate, or discard partial appended registrations on layout failure. They
+  never snapshot, reset, commit or roll back caller cache contents. Optional
+  checkpoint reclamation still protects note batches and borrowed native handle
+  prefixes; explicit reset/generation invalidation remains supported.
+- A failed initial/new document request has no published document. For source,
+  base URI or markup-syntax replacement failures, the session discards the old
+  publication, resource ledger, scene leases and note batch, while retaining the
+  requested inputs for retry. Failed same-document configuration changes retain
+  their committed inputs. Worker preparation applies the same replacement rule.
+- `ResourceShaper` callbacks and `GlyphWriter::insert` are infallible. Native
+  resources may still borrow platform state and need not implement `Clone` or
+  `Send + Sync`. The basic adapter retains values until explicit reset or note
+  checkpoint reclamation. Exhausting its 32-bit native handle space now triggers
+  an invariant panic; engine metric-capacity exhaustion remains a reported error.
+- GPUI drops the previous-document/append state and moves font-cache refresh to
+  publication-font selection. The harness keeps its book-wide handle namespace
+  without transaction checkpoints. Native caches can now survive document work
+  and failures; font changes, explicit reset and optional note reclamation govern
+  their retention. This changes cache lifetime, and its memory/performance effect
+  has not been measured. Native geometry loops, shared arrays, compact entry
+  storage, constant-time run lookup and the native reference handoff are unchanged.
+
+Migrated live adapters, profiling/example callers and existing fixtures in all
+three workspaces, including the shared `test-support/stage-fixtures.rs`. Removed
+10 obsolete existing cases that depended on injected native shaping errors or
+the deleted transaction protocol. Remaining fixture behaviors were migrated;
+no new test cases or test-only production helpers were added. The affected Rust
+files contain 731 existing cases after this cleanup; none were run.
+
+The change removes **257 physical production-source Rust lines**, excluding test
+files and `cfg(test)`/testing-only items. Source validation parsed all 38 changed
+Rust files with tree-sitter and rustfmt, audited 32 live backend implementations
+and 46 native declarations, checked caller chains and removed symbols, and passed
+task-scoped whitespace checks. **Compilation, tests and benchmarks were not run.**
+These checks do not establish type correctness, runtime behavior or unchanged
+performance.
+
+Before snapshots, scoped diff and source reports: `/home/johan/.cache/htmlengine-infallible-shaping-20261106-055023`.
+
+## Engine-owned note reclamation (2026-11-07)
+
+Note batches now track the engine ledger prefix, its appended end and the
+owner's shaping generation independently of native checkpoint support. On the
+next update, note layout or rehydration, a closed batch releases its engine
+metrics and retained entry references even when the backend supplies no native
+checkpoint or refuses native reclamation. Owner or ledger-boundary changes
+abandon reclamation so resources used by the published layout survive.
+
+One shared lifetime token per batch replaces the vector of weak tokens. Every
+note and its retained render-resource leases keep that token alive. Collection
+checks one weak token; it does not scan all previous notes.
+
+Borrowed adapters keep optional native checkpoint cleanup. Foreign native
+allocations disable only native truncation, including before another note joins
+the batch; they no longer prevent engine cleanup. `ResourceShaper` keeps its
+borrowed-value storage and existing prefix-preserving reclamation hooks.
+`GlyphShaper` remains at **9 methods**; GPUI implements **7**, relying on the
+defaults for the two optional native checkpoint methods.
+
+Removed GPUI's checkpoint methods, logical glyph/run counts and cached scalar
+append offsets. Its scalar cache survives note closure independently of engine
+registrations. Removed the synthetic `TextShapeCacheStats::registered_glyphs`
+field and migrated the live reader-load profiling caller; `backend_glyph_records`
+continues to report actual cached scalar entries. Native run/scalar shaping is
+identical apart from removed checkpoint bookkeeping. The GPUI README now describes
+retained entries and engine binding instead of the removed backend snapshot API.
+
+Net change: **27 fewer production Rust lines**, excluding existing test modules.
+Migrated the two existing GPUI ownership fixtures; all **74 existing cases** in
+the changed Rust files retain their names and count. No cases or test-only
+production helpers were added. Tree-sitter and rustfmt parsed all four changed
+Rust files, live caller searches found no removed statistics/checkpoint uses,
+and scoped whitespace checks passed across both affected workspaces.
+**Compilation, tests and benchmarks were not run.** Source checks do not establish
+type correctness, runtime behavior or unchanged performance.
+
+Before snapshots, scoped diff and source reports: `/home/johan/.cache/htmlengine-note-cleanup-20261107-142101`.
+
+## Caller-owned cache reset (2026-11-07)
+
+Removed `reset` from `GlyphShaper`: the trait now has **8 methods**, of which
+only `resource_generation` and `shape_glyph` are required. The engine does not
+clear caller caches. Backends report invalidated borrowed handles by changing
+their resource generation, and existing engine generation checks are unchanged.
+
+`GpuiTextCache::reset` and `ResourceShaper::reset` are public inherent methods
+with the same bodies as their former trait implementations. The live native
+shape profiler continues to call GPUI's concrete method. Deleted the other
+**30 backend reset implementations**, including unused harness/profile methods
+and fixture boilerplate. Three existing invalidation fixtures now create fresh
+concrete shapers to exercise generation mismatch; no reset helper, new trait,
+test case or test-only production code was added.
+
+Source audit covered 1,378 live Rust files and all 32 backend implementations.
+Every backend method other than the removed reset is byte-for-byte unchanged;
+the two retained concrete reset bodies are also unchanged. Updated the adapter
+README and native-resource generation contract to document caller ownership.
+Net change: **13 fewer production Rust lines**, excluding fixtures and test-only
+items. The 28 affected Rust files retain all **730 existing test names/counts**.
+
+Validation: tree-sitter and rustfmt parsed every changed Rust file; method and
+caller audits found no remaining reset in the shaping trait or its live
+implementations, and scoped whitespace checks passed across all three
+workspaces. **Compilation, tests and benchmarks were not run.** These checks do
+not establish type correctness, runtime behavior or measured performance.
+
+Before snapshots, scoped diff and source reports: `/home/johan/.cache/htmlengine-caller-reset-20261107-151424`.
+
+## Unassigned retained run keys (2026-11-08)
+
+Retained GPUI shaping no longer constructs placeholder `TextRunId(0)` values.
+Normal shaping, synthetic caps and the existing geometry conversion fixture use
+`shaped_text_run_with_carets`, which returns advances, cluster boundaries, carets
+and ascent with no paint key. Native entries remain caller-owned references.
+`GlyphResourceStore::shape_run` assigns the real document-local key after the
+nonempty retained run is registered in its native entry table.
+
+The private native geometry key is now `Option<TextRunId>`. Paint run views
+require `Some(key)`; unregistered geometry cannot be interpreted as native run
+zero. Caret/ascent accessors, spacing and grapheme adjustments continue to work
+before registration. The profiler can still consume `shaped_run_into_geometry`
+without registering resources. Borrowed backends keep
+`shaped_text_run_with_backend_run`, preserving the supplied key as `Some(key)`.
+`GlyphShaper` remains at **8 methods**, with 2 required.
+
+The new constructor moves existing arrays and caret storage without allocating.
+Native shaping, metrics, spacing and geometry loops are unchanged except for
+removing placeholder constructor arguments. Run-key metadata is now optional;
+its binary layout and runtime performance have not been measured. This is a
+contract/state cleanup, with **21 additional production Rust lines** for the
+unkeyed constructor, documentation and validity checks.
+
+Validation: surveyed 1,378 live Rust files, checked all new-constructor/key-access
+callers and borrowed-key construction, and compared shaping/geometry functions
+against task-start snapshots. Tree-sitter and rustfmt parsed all 3 changed Rust
+files; all 26 existing test names/counts are preserved. No test cases or test-only
+production helpers were added. Scoped whitespace checks passed.
+**Compilation, tests and benchmarks were not run.** Source checks do not establish
+type correctness, runtime behavior or unchanged performance.
+
+Before snapshots, scoped diff and source reports: `/home/johan/.cache/htmlengine-retained-run-keys-20261108-175342`.
+
+## Shared scalar/run paint ownership (2026-11-08)
+
+`ShapedGlyph` now stores one crate-private `NativePaintSource`: either a borrowed
+handle or a retained native entry. Run results use that same enum instead of a
+separate `RunPaintSource`. The retained scalar constructor no longer fills an
+unused `GlyphHandle(0)`; public constructor signatures are unchanged.
+
+Removed the three private scalar source accessors (`resource`, `into_resource`,
+`handle`) and folded the one-call `register_shaped` helper into `shape_glyph`.
+Scalar interning still uses the same borrowed handle/retained pointer identity,
+character and metric bits. A cache miss checks ownership before registering
+metrics, moves the native source into its paint mapping/table, then records the
+interned ID. Borrowed native handles and retained entry identity stay intact.
+
+No native resource clones, allocations, geometry passes or backend callbacks
+were added. Other shaping-contract functions are unchanged apart from the shared
+enum name. `GlyphShaper` remains at 8 methods, with 2 required. No traits or public
+API types were added. Net change: **22 fewer production Rust lines**, excluding
+test-only items.
+
+Migrated the existing borrowed-storage fixture away from the removed accessor,
+including its stale unwrap on an infallible shaping result. All 9 existing test
+names/counts in the affected files are preserved; no test cases or test-only
+production helpers were added. Tree-sitter and rustfmt parsed both changed Rust
+files. Public signatures, registration order, resource moves and removed-symbol
+searches were checked against task-start snapshots; scoped whitespace checks
+passed. **Compilation, tests and benchmarks were not run.** These source checks
+do not establish type correctness, runtime behavior or measured performance.
+
+Before snapshots, scoped diff and source reports: `/home/johan/.cache/htmlengine-scalar-source-20261108-191429`.
+
+## Resource and interaction review fixes (2026-11-08; source-only)
+
+- Engine ledgers now carry distinct identities. Shaped products and scopes
+  validate those identities independently of the shared backend generation.
+- Append checkpoints track discarded prefixes, reject wrong-ledger and stale
+  checkpoints after regrowth, preserve surviving outer checkpoints, and return
+  immediately for a valid no-op rollback. No registration adds branch metadata.
+- Removed the two borrowed-native checkpoint hooks and their token type.
+  Native callbacks own their storage until explicit reset. `GlyphShaper` is
+  reduced from eight methods to six, with two required.
+- Notes own independent registration ledgers. Removed parent scope batching,
+  retired-note accumulation and the reader's cross-document-popup image-relayout
+  workaround. Scene leases retain scope ledgers and track parent invalidation.
+- Bounded the GPUI scalar cache at 4,096 entries. Old entries are evicted in
+  batches using the existing miss counter; cache hits retain one lookup.
+  Referenced native entries survive eviction without copying glyph data.
+- Engine memory reports include retained native table metadata and checkpoint
+  history, deduplicating shared tables. Native payload sizes remain opaque and
+  belong to adapter accounting.
+- Continuous fragments delegate selection painting and plain-text clipboard
+  export to the engine, record overlays only when interaction or colors change,
+  and reuse paint scratch and command buffers.
+- Selection controllers now own per-view link hover for pages, notes and
+  fragments. Movement updates selection and hover together. Pointer leave and
+  window exit clear the underline without ending a captured drag. Text color
+  overrides also apply to hover ink; nonselectable fragments can still hover.
+- Updated current ownership documentation and renamed profiling batch timing
+  from `batch_commit_ms` to `batch_finalize_ms`, matching scratch finalization.
+
+No tests or test-only production helpers were added. Existing fixtures were
+migrated only where the contract changed. Verification is limited to Rust source
+parsing, caller/signature and removed-symbol audits, fixture inventory and scoped
+whitespace checks. **Compilation, tests and benchmarks were not run.** No measured
+performance claim is made. The changes retain lazy placement traversal, reused
+paint buffers and caller-owned native data.
+
+Before snapshots and audit reports:
+`/home/johan/.cache/htmlengine-review-cleanup-20261108-193452`.
+
+## Hover and interrupted-gesture fixes (2026-11-08; source-only)
+
+Link/content hit testing now replays cloneable placement iterators rather than
+collecting a temporary vector. Paint-rank precedence, intrinsic clipping and
+text-over-image rules are retained. Idle pointer movement in scopes and native
+fragments uses the existing vertical spatial index, which includes tall and
+overflowing image carriers. Active gestures retain the full nearest-text path.
+
+Note movement now receives the host's current left-button state and finishes a
+missed release before any selection update. GPUI routes moves outside the panel
+so re-entry can recover a release missed outside the window; explicit leave
+continues to clear hover without ending a held drag. Fragment recovery also
+finishes before extending selection. The native harness forwards its button state.
+
+Fragment interaction is always initialized, independently of optional focus.
+Only selectable fragments allocate a focus handle. Disabling selection clears
+text/table state and releases focus while preserving hovered links. Existing
+fixtures use the focus-independent interaction state; no cases or test-only
+helpers were added.
+
+Source parsing, caller/signature checks, fixture inventory and scoped whitespace
+checks were performed. **Compilation, tests and benchmarks were not run.** Source
+checks do not establish type correctness, runtime behavior or measured performance.
+Before snapshots and audit reports:
+`/home/johan/.cache/htmlengine-interaction-fixes-20261108-201349`.
+
+## Run-only shaping and remaining review fixes (2026-11-08; source-only)
+
+- Removed `GlyphRequest`, the scalar backend method/factory and the engine's
+  character-shaping entry point. All requests use required `shape_run`, including
+  synthetic hyphens, ellipses, mirrored characters and source-only soft hyphens.
+  Existing adapters, consumers, profiling tools and fixtures were migrated.
+- Run results contain their paint entries. Basic adapters measure each distinct
+  character once per run; the engine registers each once. Native results retain
+  shared geometry and caller-owned paint data. GPUI caches complete one-character
+  runs with full feature, direction, caps and joining keys, retaining its bounded
+  eviction policy. Repeated isolated results reuse engine registrations.
+- Mandatory line breaks split contextual text runs instead of forcing the whole
+  span through individual-character shaping. Synthetic characters receive the
+  same resolved font/style features as authored text.
+- Link fragments are percent-decoded. Reader navigation uses the resolved resource
+  identity, including the document's effective `<base href>`.
+- Publication font registration accepts changed loaded content for an unchanged
+  declaration. Native registration releases the adapter's redundant byte reference
+  after decoding width capabilities; metadata and native registration remain.
+- Escape clears fragment selection and preserves hover. Scope relayout clears stale
+  hover while preserving selection. Idle off-panel note movement skips hit testing
+  and repaint churn, retaining captured-drag and missed-release recovery behavior.
+- Command painters allocate no empty native paint-resource table before binding.
+
+No tests or test-only production helpers were added. Existing fixtures were
+migrated for the new contract. Verification used Rust source parsing, signature
+and removed-symbol audits, fixture inventory and scoped whitespace checks.
+**Compilation, tests and benchmarks were not run.** These checks do not establish
+type correctness, runtime behavior or measured performance.
+
+Before snapshots and audit reports:
+`/home/johan/.cache/htmlengine-run-cleanup-20261108-212516`.
+
+## Feature-aware metrics and link edge cases (2026-11-08; source-only)
+
+Font-relative metric requests now carry resolved OpenType features. Their cache
+keys borrow all five CSS feature groups, so feature differences cannot reuse
+incompatible measurements and cache hits allocate no feature vectors. GPUI uses
+its prepared font cache for measurement; nondefault space features use a shaped
+probe while default spacing retains the direct native advance path.
+
+Link resolution removes any existing fragment from the base URI before resolving
+the new href, preserving query strings. Native runs containing at most one scalar
+skip grapheme-boundary allocation; multi-character CRLF and combining sequences
+retain the existing boundary processing.
+
+Source parsing, changed-source audits and scoped whitespace checks were used.
+No tests or test-only helpers were added. **Compilation, tests and benchmarks were
+not run.** Before snapshots and audit reports: `/home/johan/.cache/htmlengine-metric-link-fixes-20261108-214808`.
+
+## Small-caps fallback fixes (2026-11-08; source-only)
+
+Native small-caps capability probes now apply the same publication `unicode-range`
+filtering as display-text shaping. Filtering happens after the capability-cache
+lookup; cache hits keep their existing path. Active publication or loaded-font
+changes already invalidate capability results.
+
+Caps results preserve their full-size primary-font strut and include the shaped
+run's ascent/descent, so taller fallback faces and independent CJK fonts contribute
+to the returned geometry and paint metrics. This uses existing run aggregates;
+it adds no glyph traversal or shaping call.
+
+Source parsing, changed-source audits and scoped whitespace checks were used.
+No tests or test-only helpers were added. **Compilation, tests and benchmarks were
+not run.** Before snapshots and audit reports: `/home/johan/.cache/htmlengine-caps-fallback-fixes-20261108-222206`.
+
+## Main-page missed-release recovery (2026-11-08; source-only)
+
+`RendererSession::pointer_move` now receives the current primary-button state.
+When a press is pending but the button is released, it clears the pending press
+and finishes the engine gesture before hit testing the move. Finishing preserves
+the existing selection and publishes its normal completion event without link
+activation. GPUI clears its capture and tap state on that unpressed move, so a
+later mouse-up cannot activate the old gesture or emit a document tap.
+
+Held drags still continue outside the hitbox; hover continues after recovery and
+pointer leave retains its existing behavior. The harness and the two existing
+fixture call sites were migrated to the new signature. No new methods or tests
+were added.
+
+Source parsing, caller/signature audits and scoped whitespace checks were used.
+**Compilation, tests and benchmarks were not run.** Before snapshots and audit
+reports: `/home/johan/.cache/htmlengine-page-release-fix-20261108-224626`.
+
+## Font-level caps capabilities and shared uppercase mapping (2026-11-08; source-only)
+
+Native caps support now comes from the supplying face's feature metadata. GPUI
+exposes a substitution-feature query implemented by its Cosmic, CoreText and
+DirectWrite backends; the inert backend reports no support. Cosmic reads Swash
+feature metadata and the other backends inspect borrowed GSUB tables. Unchanged
+glyphs are no longer treated as evidence that a font lacks a feature.
+
+The adapter selects the face using CSS Unicode subsets and native fallback.
+Face selections and per-font/tag capabilities have bounded caches, invalidated
+with publication/fallback font changes. Missing primary glyphs require at most
+one uncached fallback-selection layout per cached character; capability checking
+itself never shapes text.
+
+Text preparation and synthetic caps now share the scalar uppercase fallback and
+contextual Greek uppercase mapping from `html-text`. Greek mapping is computed
+lazily only when synthesis is needed. Removed marks and expanded forms retain
+logical scalar slots. Cached one-character runs distinguish Greek casing, so a
+result from another language cannot mask the tailored form.
+
+The direct `html-text` dependency uses the already locked package and versions.
+The GPUI repository's required README review marker was already present and was
+preserved. No tests or test-only helpers were added. **Compilation, tests and
+benchmarks were not run.** Source parsing, contract/caller and dependency-edge
+audits, existing-fixture inventory and scoped whitespace checks were used. The
+local tree-sitter grammar still rejects one unchanged preexisting trait signature
+in GPUI's `platform.rs`; rustfmt parses that file and all changed Rust files.
+Before snapshots and audit reports: `/home/johan/.cache/htmlengine-caps-capabilities-20261108-235153`.
+
+## Fragment external links and component theme (2026-11-09; source-only)
+
+`HtmlFragmentElement` now opens external HTTP(S), mail and telephone links through
+GPUI's system URL handler. Link presses are independent of text selection; a
+matching hovered destination is required on release. Movement beyond the drag
+threshold, pointer leave, source/layout replacement and missed-release recovery
+cancel pending activation. Selection still receives the final release position
+outside the hitbox. Internal fragment and relative-document navigation remain
+host concerns.
+
+`SelectionController::hovered_link` resolves its retained hovered text range on
+demand, so the adapter does not repeat engine hit testing or allocate URLs during
+hover. The adapter retains one owned destination only during a link press.
+
+The prototype component's fragment stylesheet overrides the default blue,
+permanently underlined link rule. Links inherit the component's foreground and
+use the existing theme-colored hover underline. The generic HTML default remains
+browser-compatible; paint-time text overrides still do not recolor CSS fills.
+
+Rustfmt/source parsing and scoped whitespace checks passed. Existing tests were
+unchanged. **Compilation, tests and benchmarks were not run.** Before snapshots
+and audit reports: `/home/johan/.cache/htmlengine-fragment-links-20261109-002619`.
 
 ## Local audit artifacts
 

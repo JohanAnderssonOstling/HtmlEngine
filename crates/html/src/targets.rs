@@ -15,6 +15,7 @@ pub struct ResolvedLink {
 }
 
 pub fn resolve_link(provider: &dyn ResourceProvider, base: &str, href: &str) -> ResolvedLink {
+    let base = base.split_once('#').map_or(base, |(resource, _)| resource);
     let (path, fragment) = href.split_once('#').unwrap_or((href, ""));
     ResolvedLink {
         resource: if path.is_empty() {
@@ -22,8 +23,32 @@ pub fn resolve_link(provider: &dyn ResourceProvider, base: &str, href: &str) -> 
         } else {
             provider.resolve(base, path)
         },
-        fragment: (!fragment.is_empty()).then(|| fragment.to_owned()),
+        fragment: (!fragment.is_empty()).then(|| decode_fragment(fragment)),
     }
+}
+
+fn decode_fragment(fragment: &str) -> String {
+    if !fragment.contains('%') {
+        return fragment.to_owned();
+    }
+    let mut decoded = Vec::with_capacity(fragment.len());
+    let mut bytes = fragment.as_bytes();
+    while let Some((&first, rest)) = bytes.split_first() {
+        if first == b'%'
+            && bytes.len() >= 3
+            && let Some(value) = char::from(bytes[1])
+                .to_digit(16)
+                .zip(char::from(bytes[2]).to_digit(16))
+                .map(|(high, low)| (high * 16 + low) as u8)
+        {
+            decoded.push(value);
+            bytes = &bytes[3..];
+        } else {
+            decoded.push(first);
+            bytes = rest;
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
 }
 
 impl crate::Document {

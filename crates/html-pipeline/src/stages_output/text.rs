@@ -177,7 +177,7 @@ impl<'a> RenderLines<'a> {
         render_lines_get(&self, self.len().checked_sub(1)?)
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = RenderLine> + 'a + use<'a> {
+    pub fn iter(&self) -> impl Iterator<Item = RenderLine> + Clone + 'a + use<'a> {
         let output = self.output;
         output
             .spatial_order
@@ -747,10 +747,20 @@ pub fn paint_resources_valid(view: RenderView<'_>) -> bool {
         .is_none_or(|resources| resources.paint_resources_valid())
 }
 
+pub fn native_paint_resources<'a>(
+    view: RenderView<'a>,
+) -> Option<&'a html_engine_model::NativePaintResources> {
+    view.native_paint_resources
+}
+
 pub fn retain_paint_resources(view: RenderView<'_>) -> Option<RenderResourceLease> {
     Some(RenderResourceLease {
         native: view.resources?.paint_lease(),
-        _scope: view.scope_lifetime.cloned(),
+        parent: view
+            .parent_resources
+            .map(crate::GlyphResourceStore::paint_lease),
+        paint_resources: view.native_paint_resources.cloned(),
+        _scope: view.scope_resources.cloned(),
     })
 }
 

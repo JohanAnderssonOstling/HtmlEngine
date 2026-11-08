@@ -464,15 +464,61 @@ fn find_glyph_in_node(
     }
 }
 
-/// Link semantics for replaced content, including images inside inline
-/// ancestors that do not introduce their own layout box.
-pub fn render_addressing_view_link_for_box<'a>(
-    value: RenderAddressingView<'a>,
-    box_id: BoxId,
-) -> Option<LinkTarget<'a>> {
-    let box_idx = layout_state::box_id_index(box_id);
+/// Source identity for the link that owns a laid-out glyph.
+pub fn render_addressing_view_link_node_for_glyph(
+    value: RenderAddressingView<'_>,
+    glyph: u32,
+) -> Option<u32> {
+    value.doc.link_for_glyph(glyph)?;
+    let owner = value
+        .doc
+        .inputs
+        .text
+        .content()
+        .text_runs()
+        .find(|run| run.kind == InlineTextKind::Text && run.glyphs.contains(&glyph))?
+        .box_idx as usize;
+    std::iter::once(owner)
+        .chain(value.doc.inputs.layout_tree.ancestors(owner))
+        .find_map(|index| {
+            let element = value.doc.element_for_box(index)?;
+            element.attr("href")?;
+            Some(element.node_id().raw())
+        })
+}
+
+/// Text owned by one link element, including nested inline descendants.
+pub fn render_addressing_view_link_text_range(
+    value: RenderAddressingView<'_>,
+    node: u32,
+) -> Option<Range<u32>> {
     let document = value.doc.document();
-    let node = document.node_id_from_raw(value.doc.box_dom_element_idx(box_idx)?)?;
+    let target = document.node_id_from_raw(node)?;
+    text_runs(value.doc.inputs.text.content().inline_items())
+        .filter_map(|run| {
+            let owner = run.dom_text_node().or_else(|| {
+                value.doc.box_dom_element_idx(layout_state::box_id_index(
+                    text_paint::render_text_run_box_id(&run),
+                ))
+            })?;
+            let owner = document.node_id_from_raw(owner)?;
+            document.dom_contains(target, owner).then(|| run.glyphs())
+        })
+        .reduce(enclosing_text_range)
+        .filter(|range| !range.is_empty())
+}
+
+/// Source identity for the enclosing link of replaced content.
+pub fn render_addressing_view_link_node_for_box(
+    value: RenderAddressingView<'_>,
+    box_id: BoxId,
+) -> Option<u32> {
+    let document = value.doc.document();
+    let node = document.node_id_from_raw(
+        value
+            .doc
+            .box_dom_element_idx(layout_state::box_id_index(box_id))?,
+    )?;
     std::iter::once(node)
         .chain(document.dom_ancestors(node))
         .find_map(|node| {
@@ -482,9 +528,22 @@ pub fn render_addressing_view_link_for_box<'a>(
             {
                 return None;
             }
-            Some(LinkTarget {
-                href: element.attr("href")?,
-                is_note_reference: element_is_note_reference(element),
-            })
+            element.attr("href")?;
+            Some(node.raw())
         })
+}
+
+/// Link semantics for replaced content, including inline ancestors.
+pub fn render_addressing_view_link_for_box<'a>(
+    value: RenderAddressingView<'a>,
+    box_id: BoxId,
+) -> Option<LinkTarget<'a>> {
+    let document = value.doc.document();
+    let node =
+        document.node_id_from_raw(render_addressing_view_link_node_for_box(value, box_id)?)?;
+    let element = document.element_ref(node)?;
+    Some(LinkTarget {
+        href: element.attr("href")?,
+        is_note_reference: element_is_note_reference(element),
+    })
 }

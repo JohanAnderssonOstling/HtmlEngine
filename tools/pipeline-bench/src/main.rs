@@ -1,7 +1,7 @@
 use html_dom as dom_values;
 use html_engine_model::layout_state;
 use html_pipeline::engine::fragment_paint;
-use html::text::{FontMetrics, GlyphRequest, ShapedGlyph};
+use html::text::{FontMetrics, ShapedRun, TextRunShapeRequest, ShapedGlyph};
 use html_pipeline::ResourceContext;
 use html_pipeline::engine::reader_style;
 use html_pipeline::engine::text_paint;
@@ -13,7 +13,7 @@ mod opening;
 #[cfg(feature = "profiling")]
 mod opening_deep;
 mod queries;
-use html::text::{GlyphHandle, GlyphResourceGeneration, GlyphShaper, ShapeError};
+use html::text::{GlyphHandle, GlyphResourceGeneration, GlyphShaper};
 use html_pipeline::engine::GlyphResourceStore;
 use html_pipeline::engine::{LaidOutDocument, LayoutConstraints};
 use html_pipeline::{DocumentFactory, PipelineChanges, PipelineInputs, PipelineSession};
@@ -193,47 +193,30 @@ fn layout_fingerprint(document: &LaidOutDocument, resources: &GlyphResourceStore
 }
 #[derive(Default)]
 struct Shaper {
-    append_checkpoint: Option<usize>,
     generation: GlyphResourceGeneration,
     cache: HashMap<(char, u32), GlyphHandle>,
     calls: usize,
 }
 impl GlyphShaper for Shaper {
-    fn begin_append_shaping(&mut self) -> Result<(), ShapeError> {
-        assert!(self.append_checkpoint.is_none());
-        self.append_checkpoint = Some(self.cache.len());
-        Ok(())
-    }
-    fn commit_append_shaping(&mut self) {
-        self.append_checkpoint = None;
-    }
-    fn rollback_append_shaping(&mut self) {
-        if let Some(checkpoint) = self.append_checkpoint.take() {
-            self.cache
-                .retain(|_, glyph| (glyph.0 as usize) < checkpoint);
-        }
-    }
-    fn reset(&mut self) {
-        self.generation = GlyphResourceGeneration::default();
-        self.cache.clear();
-    }
     fn resource_generation(&self) -> GlyphResourceGeneration {
         self.generation
     }
-    fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
-        self.calls += 1;
-        let key = (request.character, request.style.font_size.to_bits());
-        let advance = request.style.font_size * 0.5;
-        let metrics = FontMetrics {
-            ascent: request.style.font_size * 0.75,
-            descent: request.style.font_size * 0.25,
-        };
-        if let Some(&glyph) = self.cache.get(&key) {
-            return Ok(ShapedGlyph::new(glyph, advance, metrics));
-        }
-        let glyph = GlyphHandle(self.cache.len() as u32);
-        self.cache.insert(key, glyph);
-        Ok(ShapedGlyph::new(glyph, advance, metrics))
+    fn shape_run(&mut self, request: TextRunShapeRequest<'_>) -> ShapedRun {
+        ShapedRun::characters(request, |character, style| {
+            self.calls += 1;
+            let key = (character, style.font_size.to_bits());
+            let advance = style.font_size * 0.5;
+            let metrics = FontMetrics {
+                ascent: style.font_size * 0.75,
+                descent: style.font_size * 0.25,
+            };
+            if let Some(&glyph) = self.cache.get(&key) {
+                return ShapedGlyph::new(glyph, advance, metrics);
+            }
+            let glyph = GlyphHandle(self.cache.len() as u32);
+            self.cache.insert(key, glyph);
+            ShapedGlyph::new(glyph, advance, metrics)
+        })
     }
 }
 

@@ -9,7 +9,7 @@ use kurbo::{Point, Size};
 use rustc_data_structures::fx::FxHashMap;
 use std::ops::Range;
 use std::sync::Arc;
-use html_engine_model::GlyphResourceLease;
+use html_engine_model::{GlyphResourceLease, NativePaintResources};
 
 pub mod addressing;
 pub mod boxes;
@@ -64,16 +64,26 @@ pub use text::{
     RenderTextRun, RenderTextRuns, RenderTextView, merge_text_ranges,
 };
 
-/// Retains appended scope resources and detects replacement of paint products.
+/// Retains native entries and scoped ledgers, and detects replaced paint products.
 #[derive(Clone)]
 pub struct RenderResourceLease {
     native: GlyphResourceLease,
-    _scope: Option<Arc<()>>,
+    parent: Option<GlyphResourceLease>,
+    paint_resources: Option<NativePaintResources>,
+    _scope: Option<Arc<crate::GlyphResourceStore>>,
 }
 
 impl RenderResourceLease {
+    pub fn native_paint_resources(&self) -> Option<&NativePaintResources> {
+        self.paint_resources.as_ref()
+    }
+
     pub fn is_valid(&self) -> bool {
         self.native.is_valid()
+            && self
+                .parent
+                .as_ref()
+                .is_none_or(GlyphResourceLease::is_valid)
     }
 }
 
@@ -82,7 +92,9 @@ pub struct RenderView<'a> {
     pub(super) doc: DocumentRead<'a>,
     pub(super) glyph_metrics: &'a crate::layout_model::GlyphMetrics,
     pub(super) resources: Option<&'a crate::GlyphResourceStore>,
-    pub(super) scope_lifetime: Option<&'a Arc<()>>,
+    pub(super) parent_resources: Option<&'a crate::GlyphResourceStore>,
+    pub(super) native_paint_resources: Option<&'a NativePaintResources>,
+    pub(super) scope_resources: Option<&'a Arc<crate::GlyphResourceStore>>,
 }
 
 /// Text and line-layout queries. This capability deliberately excludes box

@@ -141,6 +141,11 @@ impl<'a> DocumentPainter<'a> {
         if !text_paint::paint_resources_valid(self.view) {
             return;
         }
+        if let Some(resources) = text_paint::native_paint_resources(self.view)
+            && !painter.bind_text_resources(resources)
+        {
+            return;
+        }
         let bounds = projection.bounds();
         if bounds.width() <= 0.0 || bounds.height() <= 0.0 {
             return;

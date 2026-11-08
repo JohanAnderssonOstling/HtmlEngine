@@ -1,106 +1,229 @@
 //! GPUI focus and gestures backed by the engine's logical selection and geometry.
-use html_pipeline::engine::{export_queries, geometry_queries, text_paint};
+use html_pipeline::engine::geometry_queries;
 #[cfg(test)]
 use html_pipeline::engine::search_queries;
-use html_pipeline::engine::TextExportFormat;
 
-use gpui::{FocusHandle, Pixels, Point};
+use crate::paint::{GpuiCommandPainter, GpuiScene};
+use gpui::{Pixels, Point};
 use html::layout::RenderView;
 use html::selection::{
-    SelectionController, SelectionInput, SelectionLayout, SelectionMode, SelectionOutcome,
+    SelectionController, SelectionExport, SelectionInput, SelectionKind, SelectionLayout,
+    SelectionMode, SelectionOutcome, SelectionPaintScratch, SelectionPaintStyle,
 };
 use html_render_core::RegionProjection;
 use html::render::LinePlacement;
 use kurbo::{Point as DocumentPoint, Rect};
+use peniko::Color;
 
 const WORD_SELECTION_DRAG_DISTANCE: f64 = 4.0;
 
+#[derive(Default)]
 pub(crate) struct FragmentSelection {
-    pub focus: FocusHandle,
     logical: SelectionController,
     interaction: SelectionOutcome,
+    paint_scratch: SelectionPaintScratch,
+    scene: Option<GpuiScene>,
+    paint_style: Option<(Color, Option<u32>)>,
+    pressed_link: Option<(DocumentPoint, String)>,
 }
 
 fn document_point(point: Point<Pixels>) -> DocumentPoint {
     DocumentPoint::new(f64::from(f32::from(point.x)), f64::from(f32::from(point.y)))
 }
 
-impl FragmentSelection {
-    pub fn new(focus: FocusHandle) -> Self {
-        Self {
-            focus,
-            logical: SelectionController::default(),
-            interaction: SelectionOutcome::default(),
-        }
+fn fragment_projection() -> RegionProjection {
+    RegionProjection {
+        source: Rect::new(
+            -f64::MAX / 2.0,
+            -f64::MAX / 2.0,
+            f64::MAX / 2.0,
+            f64::MAX / 2.0,
+        ),
+        destination: DocumentPoint::new(-f64::MAX / 2.0, -f64::MAX / 2.0),
     }
+}
 
+impl FragmentSelection {
     pub fn clear(&mut self) {
         self.logical = SelectionController::default();
         self.interaction = SelectionOutcome::default();
+        self.paint_style = None;
+        self.pressed_link = None;
     }
+    pub fn clear_selection(&mut self, view: RenderView<'_>) {
+        self.pressed_link = None;
+        self.interact(view, SelectionInput::Clear(SelectionKind::Text));
+        self.interact(view, SelectionInput::Clear(SelectionKind::Table));
+    }
+
     pub fn is_empty(&self, view: RenderView<'_>) -> bool {
         self.logical.selection(view).is_none()
     }
     pub fn dragging(&self) -> bool {
         self.interaction.dragging
     }
+    pub fn pointer_active(&self) -> bool {
+        self.dragging() || self.pressed_link.is_some()
+    }
     pub fn finish(&mut self, view: RenderView<'_>) {
+        self.pressed_link = None;
         self.interact(view, SelectionInput::Finish);
+    }
+
+    pub fn pointer_down(
+        &mut self,
+        view: RenderView<'_>,
+        position: Point<Pixels>,
+        clicks: usize,
+        selectable: bool,
+    ) -> bool {
+        self.pressed_link = None;
+        if selectable {
+            self.begin(view, position, clicks);
+        } else {
+            self.pointer_move(view, Some(position));
+        }
+        if clicks == 1 {
+            self.pressed_link = self
+                .logical
+                .hovered_link(view)
+                .map(|link| (document_point(position), link.href.to_owned()));
+        }
+        selectable || self.pressed_link.is_some()
+    }
+
+    pub fn pointer_up(
+        &mut self,
+        view: RenderView<'_>,
+        position: Point<Pixels>,
+        hovered: bool,
+    ) -> Option<String> {
+        let pressed = self.pressed_link.take();
+        let position = document_point(position);
+        self.interact(
+            view,
+            SelectionInput::PointerUp {
+                position,
+                mode: SelectionMode::Plain,
+                drag_distance: WORD_SELECTION_DRAG_DISTANCE,
+            },
+        );
+        if !hovered {
+            self.pointer_move(view, None);
+            return None;
+        }
+        let (start, href) = pressed?;
+        (start.distance_squared(position) < WORD_SELECTION_DRAG_DISTANCE.powi(2)
+            && self
+                .logical
+                .hovered_link(view)
+                .is_some_and(|link| link.href == href))
+        .then_some(href)
     }
 
     pub fn selected_text(&self, view: RenderView<'_>) -> String {
         self.logical
-            .selection(view)
-            .map(|selection| selection.range())
-            .and_then(|range| {
-                export_queries::render_export_view_text(
-                    view.export(),
-                    range,
-                    TextExportFormat::PlainWithParagraphBreaks,
-                )
-                .plain
-            })
+            .export(
+                SelectionLayout {
+                    view,
+                    placements: std::iter::empty(),
+                    projection: &fragment_projection(),
+                },
+                SelectionExport::PlainText,
+            )
             .unwrap_or_default()
     }
 
-    pub fn rects(&self, view: RenderView<'_>) -> Vec<Rect> {
-        let Some(range) = self
-            .logical
-            .selection(view)
-            .map(|selection| selection.range())
-        else {
-            return Vec::new();
-        };
-        view.text()
-            .lines()
-            .iter()
-            .flat_map(|line| {
-                let clip = text_paint::line_overflow_clip(view.text(), line.id());
-                geometry_queries::render_geometry_view_line_selection_rects(
-                    geometry_queries::render_view_geometry(view),
-                    line.id(),
-                    range.clone(),
-                )
-                .map(move |rect| clip.map_or(rect, |clip| clip.apply_to(rect)))
-                .filter(|rect| rect.width() > 0.0 && rect.height() > 0.0)
+    pub fn paint(
+        &mut self,
+        view: RenderView<'_>,
+        color: Color,
+        hover_foreground: Option<u32>,
+    ) -> Option<&GpuiScene> {
+        if self.is_empty(view) && !self.link_hovered() {
+            return None;
+        }
+        if self.paint_style != Some((color, hover_foreground)) {
+            let mut painter = GpuiCommandPainter::commands_only();
+            if let Some(previous) = self.scene.take() {
+                painter = painter.reusing(previous);
+            }
+            self.logical.paint(
+                SelectionLayout {
+                    view,
+                    placements: view.text().lines().iter().map(|line| LinePlacement {
+                        line: line.id(),
+                        origin: line.point(),
+                    }),
+                    projection: &fragment_projection(),
+                },
+                SelectionPaintStyle {
+                    selection: color,
+                    hover_foreground,
+                },
+                &mut painter,
+                &mut self.paint_scratch,
+            );
+            self.scene = Some(painter.finish());
+            self.paint_style = Some((color, hover_foreground));
+        }
+        self.scene.as_ref()
+    }
+
+    pub fn link_hovered(&self) -> bool {
+        self.logical.link_hovered()
+    }
+
+    pub fn pointer_move(&mut self, view: RenderView<'_>, position: Option<Point<Pixels>>) -> bool {
+        if self.pressed_link.as_ref().is_some_and(|(start, _)| {
+            position.is_none_or(|position| {
+                start.distance_squared(document_point(position))
+                    >= WORD_SELECTION_DRAG_DISTANCE.powi(2)
             })
-            .collect()
+        }) {
+            self.pressed_link = None;
+        }
+        match position {
+            Some(position) => self.interact(
+                view,
+                SelectionInput::PointerMove {
+                    position: document_point(position),
+                    mode: SelectionMode::Plain,
+                    drag_distance: WORD_SELECTION_DRAG_DISTANCE,
+                },
+            ),
+            None => self.interact(view, SelectionInput::PointerLeave),
+        }
     }
 
     fn interact(&mut self, view: RenderView<'_>, input: SelectionInput) -> bool {
-        let placements = view.text().lines().iter().map(|line| LinePlacement {
-            line: line.id(),
-            origin: line.point(),
-        });
-        let projection = RegionProjection {
-            source: Rect::new(
-                -f64::MAX / 2.0,
-                -f64::MAX / 2.0,
-                f64::MAX / 2.0,
-                f64::MAX / 2.0,
-            ),
-            destination: DocumentPoint::new(-f64::MAX / 2.0, -f64::MAX / 2.0),
+        let hover = match &input {
+            SelectionInput::PointerMove { position, .. } if !self.dragging() => Some(*position),
+            _ => None,
         };
+        let nearby = hover.into_iter().flat_map(move |point| {
+            geometry_queries::render_geometry_view_lines_at_y(
+                geometry_queries::render_view_geometry(view),
+                point.y,
+            )
+            .filter_map(move |id| view.text().line(id))
+            .map(|line| LinePlacement {
+                line: line.id(),
+                origin: line.point(),
+            })
+        });
+        let all = hover
+            .is_none()
+            .then_some(view)
+            .into_iter()
+            .flat_map(|view| {
+                view.text().lines().iter().map(|line| LinePlacement {
+                    line: line.id(),
+                    origin: line.point(),
+                })
+            });
+        let placements = nearby.chain(all);
+        let projection = fragment_projection();
         self.interaction = self.logical.interact(
             SelectionLayout {
                 view,
@@ -109,7 +232,10 @@ impl FragmentSelection {
             },
             input,
         );
-        self.interaction.handled
+        if self.interaction.changed {
+            self.paint_style = None;
+        }
+        self.interaction.handled || self.interaction.changed
     }
 
     pub fn select_all(&mut self, view: RenderView<'_>) {
@@ -184,7 +310,7 @@ mod tests {
     fn double_click_drag_extends_and_shrinks_around_the_initial_word(cx: &mut TestAppContext) {
         let window = cx.add_window(|_, _| EmptyView);
         window
-            .update(cx, |_, window, cx| {
+            .update(cx, |_, window, _| {
                 let mut renderer = None;
                 let mut shaper = GpuiTextCache::new(window.text_system().clone());
                 let view = render(&mut renderer, &mut shaper, "<p>alpha beta gamma</p>");
@@ -213,7 +339,7 @@ mod tests {
                     .center();
                     point(px(center.x as f32), px(center.y as f32))
                 };
-                let mut selection = FragmentSelection::new(cx.focus_handle());
+                let mut selection = FragmentSelection::default();
                 assert!(selection.begin(view, word_point("beta"), 2));
                 assert!(selection.dragging());
                 assert_eq!(selection.selected_text(view), "beta");
@@ -237,11 +363,11 @@ mod tests {
     fn description_selection_can_start_in_paragraph_padding(cx: &mut TestAppContext) {
         let window = cx.add_window(|_, _| EmptyView);
         window
-            .update(cx, |_, window, cx| {
+            .update(cx, |_, window, _| {
                 let mut renderer = None;
                 let mut shaper = GpuiTextCache::new(window.text_system().clone());
                 let view = render(&mut renderer, &mut shaper, "<p>Hi</p>");
-                let mut selection = FragmentSelection::new(cx.focus_handle());
+                let mut selection = FragmentSelection::default();
                 assert!(selection.begin(view, point(px(-10.), px(15.)), 1));
                 selection.extend(view, point(px(300.), px(15.)));
                 assert_eq!(selection.selected_text(view), "Hi");
@@ -256,7 +382,7 @@ mod tests {
     fn selection_keeps_words_and_graphemes_whole_and_respects_rtl_carets(cx: &mut TestAppContext) {
         let window = cx.add_window(|_, _| EmptyView);
         window
-            .update(cx, |_, window, cx| {
+            .update(cx, |_, window, _| {
                 let mut renderer = None;
                 let mut shaper = GpuiTextCache::new(window.text_system().clone());
                 let view = render(&mut renderer, &mut shaper, "<p>A👩‍👧e\u{301}Z</p>");
@@ -290,7 +416,7 @@ mod tests {
                 .unwrap();
                 let start = point(px(emoji.x0 as f32 + 0.1), px(emoji.center().y as f32));
                 let end = point(px(accent.x1 as f32 - 0.1), px(accent.center().y as f32));
-                let mut selection = FragmentSelection::new(cx.focus_handle());
+                let mut selection = FragmentSelection::default();
                 assert!(selection.begin(view, start, 1));
                 selection.extend(view, end);
                 assert_eq!(selection.selected_text(view), "👩‍👧e\u{301}Z");
@@ -325,16 +451,16 @@ mod tests {
     #[gpui::test]
     fn selection_respects_overflow_clip_and_triple_clicks_authored_blocks(cx: &mut TestAppContext) {
         let window = cx.add_window(|_, _| EmptyView);
-        window.update(cx, |_, window, cx| {
+        window.update(cx, |_, window, _| {
             let mut renderer = None;
             let mut shaper = GpuiTextCache::new(window.text_system().clone());
             let view = render(&mut renderer, &mut shaper, "<div style='height:30px;overflow:hidden'><p>Visible</p><p>Clipped</p></div><p>Last <em>paragraph</em></p>");
-            let mut selection = FragmentSelection::new(cx.focus_handle());
+            let mut selection = FragmentSelection::default();
             selection.select_all(view);
             // The hidden line must never be chosen when dragging through its original position.
             let hidden = search_queries::render_text_view_find_matches(view.text(), "Clipped", Default::default())[0].clone();
             selection.interact(view, SelectionInput::SetRange { range: hidden.clone(), mode: SelectionMode::Plain });
-            assert!(selection.rects(view).is_empty(), "clipped text must have no selection ink");
+            assert!(selection.paint(view, Color::rgba8(0, 0, 0, 255), None).is_none_or(|scene| scene.len() == 0), "clipped text must have no selection ink");
             assert!(selection.begin(view, point(px(10.0), px(45.0)), 1));
             selection.finish(view);
             assert!(!hidden.contains(&selection.interaction.click.unwrap()));

@@ -11,7 +11,7 @@ use html_pipeline::engine::{
 };
 use html_pipeline::engine::{LaidOutDocument, PreparedDocument};
 use html_pipeline::{DocumentFactory, parse_html_document};
-use html_pipeline::engine::{GlyphRequest, FontMetrics, ShapedGlyph};
+use html_pipeline::engine::{FontMetrics, ShapedRun, TextRunShapeRequest, ShapedGlyph};
 use html_resources::{ResourceProvider, probe_dimensions};
 use html_wpt_test_support::wpt_root;
 use std::borrow::Cow;
@@ -36,43 +36,14 @@ const WPT_LAYOUT_TOLERANCE: f64 = 1.0;
 struct DeterministicShaper {
     glyphs: HashMap<(char, u32, bool), GlyphHandle>,
     generation: html_pipeline::engine::GlyphResourceGeneration,
-    append_checkpoint: Option<(
-        HashMap<(char, u32, bool), GlyphHandle>,
-        html_pipeline::engine::GlyphResourceGeneration,
-    )>,
 }
 
 impl GlyphShaper for DeterministicShaper {
-    fn reset(&mut self) {
-        self.glyphs.clear();
-        self.generation = html_pipeline::engine::GlyphResourceGeneration::default();
-    }
-
     fn resource_generation(&self) -> html_pipeline::engine::GlyphResourceGeneration {
         self.generation
     }
 
-    fn begin_append_shaping(&mut self) -> Result<(), ShapeError> {
-        assert!(self.append_checkpoint.is_none());
-        self.append_checkpoint = Some((self.glyphs.clone(), self.generation.clone()));
-        Ok(())
-    }
-
-    fn commit_append_shaping(&mut self) {
-        self.append_checkpoint = None;
-    }
-
-    fn rollback_append_shaping(&mut self) {
-        if let Some((glyphs, glyph_store)) = self.append_checkpoint.take() {
-            self.glyphs = glyphs;
-            self.generation = glyph_store;
-        }
-    }
-
-    fn font_relative_metrics(
-        &mut self,
-        request: &ShapingStyle<'_>,
-    ) -> Result<FontRelativeMetrics, ShapeError> {
+    fn font_relative_metrics(&mut self, request: &ShapingStyle<'_>) -> FontRelativeMetrics {
         if request.font_family.is_some_and(|family| {
             family.split(',').next().is_some_and(|name| {
                 name.trim()
@@ -80,7 +51,7 @@ impl GlyphShaper for DeterministicShaper {
                     .eq_ignore_ascii_case("BaselineDiagnosticAlphabeticZero")
             })
         }) {
-            return Ok(FontRelativeMetrics {
+            return FontRelativeMetrics {
                 x_height_ratio: 0.25,
                 ch_advance_ratio: 0.5,
                 cap_height_ratio: 0.55,
@@ -89,38 +60,36 @@ impl GlyphShaper for DeterministicShaper {
                     descent_ratio: 0.2,
                 }),
                 ..FontRelativeMetrics::default()
-            });
+            };
         }
-        Ok(FontRelativeMetrics::default())
+        FontRelativeMetrics::default()
     }
 
-    fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
-        let is_ahem = shaping_contracts::shaping_style_font_family_for_character(&request
-            .style, request.character)
-            .and_then(|families| families.split(',').next())
-            .map(str::trim)
-            .map(|family| family.trim_matches(['\'', '"']))
-            .is_some_and(|family| family.eq_ignore_ascii_case("ahem"));
-        let key = (
-            request.character,
-            request.style.font_size.to_bits(),
-            is_ahem,
-        );
-        let advance = if is_ahem {
-            request.style.font_size
-        } else {
-            request.style.font_size * 0.5
-        };
-        let metrics = FontMetrics {
-            ascent: request.style.font_size * 0.75,
-            descent: request.style.font_size * 0.25,
-        };
-        if let Some(&glyph) = self.glyphs.get(&key) {
-            return Ok(ShapedGlyph::new(glyph, advance, metrics));
-        }
-        let glyph = GlyphHandle(self.glyphs.len() as u32);
-        self.glyphs.insert(key, glyph);
-        Ok(ShapedGlyph::new(glyph, advance, metrics))
+    fn shape_run(&mut self, request: TextRunShapeRequest<'_>) -> ShapedRun {
+        ShapedRun::characters(request, |character, style| {
+            let is_ahem =
+                shaping_contracts::shaping_style_font_family_for_character(&style, character)
+                    .and_then(|families| families.split(',').next())
+                    .map(str::trim)
+                    .map(|family| family.trim_matches(['\'', '"']))
+                    .is_some_and(|family| family.eq_ignore_ascii_case("ahem"));
+            let key = (character, style.font_size.to_bits(), is_ahem);
+            let advance = if is_ahem {
+                style.font_size
+            } else {
+                style.font_size * 0.5
+            };
+            let metrics = FontMetrics {
+                ascent: style.font_size * 0.75,
+                descent: style.font_size * 0.25,
+            };
+            if let Some(&glyph) = self.glyphs.get(&key) {
+                return ShapedGlyph::new(glyph, advance, metrics);
+            }
+            let glyph = GlyphHandle(self.glyphs.len() as u32);
+            self.glyphs.insert(key, glyph);
+            ShapedGlyph::new(glyph, advance, metrics)
+        })
     }
 }
 

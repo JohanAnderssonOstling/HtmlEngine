@@ -146,9 +146,9 @@ pub fn prepare_text_paint(inputs: crate::layout::LayoutInputs<'_>, state: &mut c
 mod tests {
     use super::*;
     use crate::{
-        shaping, GlyphRequest, GlyphWriter, FontMetrics, FontSlant, GlyphResourceStore,
-        ResourceShaper, ShapedGlyph, GlyphSlice, InlineContent, LayoutState, ShapedTextGeometry,
-        TextRunId, ShapedTextRun, TextGeometryView,
+        shaping, GlyphWriter, FontMetrics, FontSlant, GlyphId, GlyphResourceStore, ResourceShaper,
+        ShapedGlyph, GlyphSlice, InlineContent, LayoutState, ShapedTextGeometry, TextRunId,
+        ShapedTextRun, TextGeometryView,
     };
 
     #[test]
@@ -159,12 +159,12 @@ mod tests {
         ] {
             let mut content = InlineContent::default();
             let mut resources = GlyphResourceStore::default();
-            let mut shaper = ResourceShaper::new(
-                |request: GlyphRequest<'_>, native: &mut GlyphWriter<'_, ()>| {
-                    let handle = native.insert(())?;
-                    Ok(ShapedGlyph::new(
+            let mut shaper =
+                ResourceShaper::new(|character, style, native: &mut GlyphWriter<'_, ()>| {
+                    let handle = native.insert(());
+                    ShapedGlyph::new(
                         handle,
-                        if matches!(request.character, '\u{00ad}' | '\u{200e}') {
+                        if matches!(character, '\u{00ad}' | '\u{200e}') {
                             0.0
                         } else {
                             8.0
@@ -173,17 +173,25 @@ mod tests {
                             ascent: 12.0,
                             descent: 4.0,
                         },
-                    ))
+                    )
                 },
             );
-            let style = shaping::style(16.0, 400, FontSlant::Normal, 0, None);
+            let style = shaping::style(16.0, 400, FontSlant::Normal, None);
             let mut glyphs = Vec::new();
             for character in source.chars() {
                 content.push_character(character);
                 glyphs.push(
-                    resources
-                        .shape_glyph(&mut shaper, shaping::glyph(character, &style))
-                        .unwrap(),
+                    {
+                        let mut run_glyphs = [GlyphId(0)];
+                        resources
+                            .shape_run(
+                                &mut shaper,
+                                shaping::run((character).encode_utf8(&mut [0; 4]), style),
+                                &mut run_glyphs,
+                            )
+                            .map(|_| run_glyphs[0])
+                    }
+                    .unwrap(),
                 );
             }
             let metrics = resources.metrics();

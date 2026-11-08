@@ -170,8 +170,9 @@ pub(crate) struct InputRevisions {
 
 /// Proposed changes to an existing session. Omitted fields keep their values.
 ///
-/// Values move into the session on success. Failed updates restore the previous
-/// inputs without cloning the source, stylesheets, or image metrics.
+/// Values move into the session without cloning unchanged inputs. Failed
+/// same-document updates retain committed inputs; failed source replacements
+/// leave the requested document unavailable.
 #[derive(Debug, Default)]
 pub struct PipelineChanges {
     pub source: Option<String>,

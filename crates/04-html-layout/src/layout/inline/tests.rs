@@ -11,7 +11,7 @@ mod tests {
 
     use crate::layout_model::BoxId;
     use crate::layout_model::LineId;
-    use crate::{GlyphRequest, FontMetrics, GlyphHandle, ShapedGlyph, ShapedRun};
+    use crate::{FontMetrics, GlyphHandle, ShapedGlyph, ShapedRun};
 
     use crate::GlyphResourceStore;
 
@@ -22,7 +22,7 @@ mod tests {
     };
     use crate::parser::DocumentFactory;
     use crate::test_support::TestGlyphShaper as GlyphCache;
-    use crate::{GlyphShaper, LaidOutDocument, ShapeError, ShapedTextRun, TextRunShapeRequest};
+    use crate::{GlyphShaper, LaidOutDocument, ShapedTextRun, TextRunShapeRequest};
     use html_style_model::{Hyphens, VerticalAlignValue, WhiteSpace};
     use lightningcss::stylesheet::ParserOptions;
     use std::fs;
@@ -35,39 +35,25 @@ mod tests {
     }
 
     impl GlyphShaper for NativeGeometryShaper {
-        fn reset(&mut self) {
-            self.fallback.reset();
-        }
-
         fn resource_generation(&self) -> crate::GlyphResourceGeneration {
             self.fallback.resource_generation()
         }
 
-        fn begin_append_shaping(&mut self) -> Result<(), ShapeError> {
-            self.fallback.begin_append_shaping()
-        }
-
-        fn commit_append_shaping(&mut self) {
-            self.fallback.commit_append_shaping();
-        }
-
-        fn rollback_append_shaping(&mut self) {
-            self.fallback.rollback_append_shaping();
-        }
-
-        fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
-            self.fallback.shape_glyph(request)
-        }
-
-        fn shape_run(
-            &mut self,
-            request: TextRunShapeRequest<'_>,
-        ) -> Result<Option<ShapedRun>, ShapeError> {
-            if shaping_contracts::text_run_shape_request_text(&request).chars().count() != self.advances.len() {
-                return Ok(None);
+        fn shape_run(&mut self, request: TextRunShapeRequest<'_>) -> ShapedRun {
+            if shaping_contracts::text_run_shape_request_text(&request)
+                .chars()
+                .count()
+                != self.advances.len()
+            {
+                return self.fallback.shape_run(request);
             }
-            Ok(Some(shaping_contracts::shaped_run_geometry(shaping_contracts::shaped_text_run_new(Arc::from(self.advances.clone()),
-                Arc::from(self.boundaries.clone()),))))
+            shaping_contracts::shaped_run_geometry(
+                shaping_contracts::shaped_text_run_new(
+                    Arc::from(self.advances.clone()),
+                    Arc::from(self.boundaries.clone()),
+                ),
+                self.fallback.shape_run(request),
+            )
         }
     }
 
@@ -2974,26 +2960,22 @@ mod tests {
 
         struct VaryingMetrics(GlyphResourceGeneration);
         impl GlyphShaper for VaryingMetrics {
-            fn reset(&mut self) {
-                self.0 = GlyphResourceGeneration::default();
-            }
             fn resource_generation(&self) -> GlyphResourceGeneration {
                 self.0
             }
-            fn shape_glyph(
-                &mut self,
-                request: GlyphRequest<'_>,
-            ) -> Result<ShapedGlyph, ShapeError> {
-                let (ascent, descent) = if request.character == 'Y' {
-                    (16.0, 4.0)
-                } else {
-                    (8.0, 2.0)
-                };
-                Ok(ShapedGlyph::new(
-                    GlyphHandle(request.character as u32),
-                    10.0,
-                    FontMetrics { ascent, descent },
-                ))
+            fn shape_run(&mut self, request: TextRunShapeRequest<'_>) -> ShapedRun {
+                ShapedRun::characters(request, |character, style| {
+                    let (ascent, descent) = if character == 'Y' {
+                        (16.0, 4.0)
+                    } else {
+                        (8.0, 2.0)
+                    };
+                    ShapedGlyph::new(
+                        GlyphHandle(character as u32),
+                        10.0,
+                        FontMetrics { ascent, descent },
+                    )
+                })
             }
         }
         let mut factory = DocumentFactory::new();

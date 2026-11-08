@@ -20,29 +20,28 @@ use html_pipeline::engine::{LaidOutDocument, LayoutConstraints};
 use crate::layout::{CaretAffinity, ContentRole, LineId, SourceLocation};
 use crate::targets::ElementTarget;
 use html_pipeline::DocumentFactory;
-use crate::text::{GlyphResourceGeneration, GlyphShaper, ShapeError, TextSearchOptions};
+use crate::text::{GlyphResourceGeneration, GlyphShaper, TextSearchOptions};
 use html_pipeline::engine::{GlyphResourceStore, find_text_matches, text_matches};
-use crate::text::{GlyphRequest, FontMetrics, GlyphHandle, ShapedGlyph};
+use crate::text::{FontMetrics, GlyphHandle, ShapedRun, TextRunShapeRequest, ShapedGlyph};
 use std::ops::Range;
 
 #[derive(Default)]
 struct TestShaper(GlyphResourceGeneration);
 impl GlyphShaper for TestShaper {
-    fn reset(&mut self) {
-        self.0 = GlyphResourceGeneration::default();
-    }
     fn resource_generation(&self) -> GlyphResourceGeneration {
         self.0
     }
-    fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
-        Ok(ShapedGlyph::new(
-            GlyphHandle(request.character as u32),
-            request.style.font_size / 2.0,
-            FontMetrics {
-                ascent: request.style.font_size,
-                descent: 0.0,
-            },
-        ))
+    fn shape_run(&mut self, request: TextRunShapeRequest<'_>) -> ShapedRun {
+        ShapedRun::characters(request, |character, style| {
+            ShapedGlyph::new(
+                GlyphHandle(character as u32),
+                style.font_size / 2.0,
+                FontMetrics {
+                    ascent: style.font_size,
+                    descent: 0.0,
+                },
+            )
+        })
     }
 }
 

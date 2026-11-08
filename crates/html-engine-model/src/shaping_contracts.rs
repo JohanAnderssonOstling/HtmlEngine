@@ -2,6 +2,7 @@
 
 use crate::*;
 use crate::caret_positions::CaretStorage;
+use crate::glyph_adapter::NativePaintSource;
 use html_dom::MemoryUsageReport;
 use html_style_model::{
     ComputedStyles, FontFace, StyleIndices, StyleView, TextSpacing, UsedStyleView,
@@ -9,8 +10,8 @@ use html_style_model::{
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 
-/// Backend-owned immutable shaped-line identifier. It is only meaningful for
-/// the `GlyphShaper` instance that produced it.
+/// An opaque native-run key. Retained results receive document-local keys;
+/// borrowed results use the backend's resource-generation namespace.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TextRunId(pub u32);
@@ -29,7 +30,7 @@ pub struct ShapedTextRun {
 
 #[derive(Clone, Debug, PartialEq)]
 struct NativeRunGeometry {
-    run: TextRunId,
+    run: Option<TextRunId>,
     caret_stops: CaretPositions,
     ascent: f32,
 }
@@ -41,7 +42,6 @@ impl ShapedTextRun {
     pub(crate) fn shared_advances(&self) -> Arc<[f32]> {
         self.advances.clone()
     }
-
 }
 
 /// Font extents measured from the faces that actually supplied each character.
@@ -52,25 +52,30 @@ pub enum RunFontMetrics {
 }
 
 /// A backend run result. The engine owns registration and layout
-/// glyph IDs; native paint handles belong to the backend's resource generation.
+/// glyph IDs. Native data can be retained by entry reference, or borrowed from
+/// a backend resource generation. Use one ownership mode per native backend.
 #[derive(Clone, Debug)]
 pub struct ShapedRun {
-    geometry: ShapedTextRun,
-    paint: Option<RunPaint>,
+    geometry: Option<ShapedTextRun>,
+    paint: RunPaint,
 }
 
 #[derive(Clone, Debug)]
-struct RunPaint {
-    first_handle: GlyphHandle,
-    metrics: RunFontMetrics,
+enum RunPaint {
+    Native {
+        source: NativePaintSource,
+        metrics: RunFontMetrics,
+    },
+    Character(ShapedGlyph),
+    Characters(Vec<(char, ShapedGlyph)>),
 }
 
 /// A request to shape one already-normalized, single-style logical run.
-/// CSS values have been resolved before this reaches the renderer backend.
+/// CSS geometry has been resolved before this reaches the renderer backend.
+/// Foreground colors belong to paint fragments and are absent from shaping requests.
 pub struct TextRunShapeRequest<'a> {
     text: &'a str,
     style: ShapingStyle<'a>,
-    paint_colors: Option<&'a [u32]>,
 }
 
 #[derive(Debug)]
@@ -129,7 +134,7 @@ impl ShapedTextGeometry {
         Some(NativeRunView {
             source_range: range.source.clone(),
             run_offset: range.offset as u32,
-            backend_run: native.run,
+            backend_run: native.run?,
             caret_stops: &native.caret_stops,
             ascent: native.ascent,
             placement_required: run.placement_required,
@@ -707,7 +712,6 @@ pub struct ShapingStyle<'a> {
     /// Resolved font width as a percentage.
     pub font_stretch: f32,
     pub font_synthesis_style: FontSynthesisStyle,
-    pub color: u32,
     pub font_family: Option<&'a str>,
     pub cjk_font_family: Option<&'a str>,
     pub language: Option<&'a ContentLanguage>,
@@ -803,7 +807,7 @@ pub mod shaping {
 
     pub fn preserve_graphemes(run: &mut ShapedTextRun, text: &str) {
         profile_scope!("shape.preserve_graphemes");
-        if text.is_ascii() && !text.as_bytes().contains(&b'\r') {
+        if run.advances.len() <= 1 || (text.is_ascii() && !text.as_bytes().contains(&b'\r')) {
             return;
         }
         let graphemes = crate::bidi::grapheme_boundaries(text, run.advances.len());
@@ -894,7 +898,6 @@ pub mod shaping {
         font_size: f32,
         font_weight: u16,
         font_slant: FontSlant,
-        color: u32,
         font_family: Option<&'a str>,
     ) -> ShapingStyle<'a> {
         // CSS permits zero-size text, which still needs character identities.
@@ -905,7 +908,6 @@ pub mod shaping {
             font_slant,
             font_stretch: 100.0,
             font_synthesis_style: FontSynthesisStyle::Auto,
-            color,
             font_family,
             cjk_font_family: None,
             language: None,
@@ -916,26 +918,13 @@ pub mod shaping {
     }
 
     #[inline]
-    pub fn glyph<'a>(character: char, style: &'a ShapingStyle<'a>) -> GlyphRequest<'a> {
-        GlyphRequest { character, style }
-    }
-
-    pub fn run<'a>(
-        text: &'a str,
-        style: ShapingStyle<'a>,
-        paint_colors: Option<&'a [u32]>,
-    ) -> TextRunShapeRequest<'a> {
-        TextRunShapeRequest {
-            text,
-            style,
-            paint_colors,
-        }
+    pub fn run<'a>(text: &'a str, style: ShapingStyle<'a>) -> TextRunShapeRequest<'a> {
+        TextRunShapeRequest { text, style }
     }
 }
 
-/// Shaping failure propagated by the engine or reported by a backend.
-/// Backends construct resource-capacity and unsupported-transaction errors;
-/// document lifecycle failures are constructed by the engine implementation.
+/// Engine registration, ownership or layout failure. Native shaping returns
+/// measurements and resources directly; it has no recoverable error channel.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ShapeError {
     kind: ShapeErrorKind,
@@ -946,18 +935,9 @@ enum ShapeErrorKind {
     RegistryCapacityExhausted { metrics_len: usize },
     FirstLineRefinementDidNotConverge,
     FirstLineShaperRequired,
-    AppendTransactionUnsupported,
     ResourceGenerationMismatch,
     BorrowedDocument,
-}
-
-impl ShapeError {
-
-    pub(crate) fn append_transaction_unsupported() -> Self {
-        Self {
-            kind: ShapeErrorKind::AppendTransactionUnsupported,
-        }
-    }
+    MixedPaintOwnership,
 }
 
 impl fmt::Display for ShapeError {
@@ -974,22 +954,22 @@ impl fmt::Display for ShapeError {
             ShapeErrorKind::FirstLineRefinementDidNotConverge => {
                 formatter.write_str("first-line layout did not converge")
             }
-            ShapeErrorKind::AppendTransactionUnsupported => {
-                formatter.write_str("glyph shaper does not support append rollback")
-            }
             ShapeErrorKind::BorrowedDocument => formatter.write_str(
                 "repreparation requires the owning document; this stage borrows its preparation",
             ),
             ShapeErrorKind::ResourceGenerationMismatch => {
                 formatter.write_str("glyph shaper resources do not belong to this document")
             }
+            ShapeErrorKind::MixedPaintOwnership => formatter.write_str(
+                "a native backend must consistently return retained entries or borrowed handles",
+            ),
         }
     }
 }
 
 impl std::error::Error for ShapeError {}
 
-/// Glyph metrics owned once by the pipeline session or standalone caller.
+/// Glyph metrics and native paint snapshots owned by the pipeline or caller.
 /// Shaping borrows the store mutably; layout and queries borrow its metrics.
 ///
 /// ```compile_fail
@@ -1010,10 +990,20 @@ impl std::error::Error for ShapeError {}
 #[derive(Default)]
 pub struct GlyphResourceStore {
     metrics: GlyphMetrics,
+    id: GlyphResourceId,
     generation: GlyphResourceGeneration,
-    shaped_ids: FxHashMap<(GlyphHandle, char, u32, u32, u32), GlyphId>,
+    branch: u64,
+    discarded_prefixes: Vec<(u64, usize)>,
+    shaped_ids: FxHashMap<(GlyphPaintIdentity, char, u32, u32, u32), GlyphId>,
     paint_invalid: bool,
+    native_paint_resources: Option<NativePaintResources>,
     paint_lease: OnceLock<GlyphResourceLease>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum GlyphPaintIdentity {
+    Borrowed(GlyphHandle),
+    Retained(usize),
 }
 
 /// Validity of retained paint commands. Owning the lease does not keep a
@@ -1035,20 +1025,22 @@ impl Drop for GlyphResourceStore {
 
 /// An append-only ledger checkpoint. It owns no glyph data and can be consumed
 /// once to discard registrations made after it. Use only while this store has
-/// been appended to; document replacement and branching rollback invalidate it.
+/// been appended to; replacement or discarding its prefix invalidates it.
 #[derive(Debug)]
 pub struct GlyphResourceCheckpoint {
-    generation: GlyphResourceGeneration,
+    id: GlyphResourceId,
+    branch: u64,
     len: usize,
 }
 
-/// Backend-owned append boundary. Restoring it preserves the resource generation
-/// and every handle in its prefix; callers must first release appended views.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct NativeResourceCheckpoint {
-    pub generation: GlyphResourceGeneration,
-    pub glyph_count: usize,
-    pub run_count: usize,
+/// Identity of one engine ledger, independent of a caller's native namespace.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GlyphResourceId(u64);
+
+impl Default for GlyphResourceId {
+    fn default() -> Self {
+        Self(GlyphResourceGeneration::new().0)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1079,9 +1071,13 @@ impl GlyphResourceStore {
     pub fn new(generation: GlyphResourceGeneration) -> Self {
         Self {
             metrics: GlyphMetrics::default(),
+            id: GlyphResourceId::default(),
             generation,
+            branch: 0,
+            discarded_prefixes: Vec::new(),
             shaped_ids: FxHashMap::default(),
             paint_invalid: false,
+            native_paint_resources: None,
             paint_lease: OnceLock::new(),
         }
     }
@@ -1114,6 +1110,10 @@ impl GlyphResourceStore {
         }
     }
 
+    pub fn native_paint_resources(&self) -> Option<&NativePaintResources> {
+        self.native_paint_resources.as_ref()
+    }
+
     pub fn metrics(&self) -> &GlyphMetrics {
         &self.metrics
     }
@@ -1128,11 +1128,25 @@ impl GlyphResourceStore {
     ) -> MemoryUsageReport {
         let mut report = self.metrics.memory_usage_report_with_shared(seen);
         report.add_hash_map_storage("GlyphResourceStore.shaped_ids", &self.shaped_ids);
+        report.add_vec_storage(
+            "GlyphResourceStore.discarded_prefixes",
+            &self.discarded_prefixes,
+        );
+        if let Some(resources) = &self.native_paint_resources {
+            report.extend_prefixed(
+                "native_entries",
+                resources.memory_usage_report_with_shared(seen),
+            );
+        }
         report
     }
 
     pub fn clear(&mut self) {
         *self = Self::default();
+    }
+
+    pub fn id(&self) -> GlyphResourceId {
+        self.id
     }
 
     pub fn generation(&self) -> GlyphResourceGeneration {
@@ -1141,26 +1155,59 @@ impl GlyphResourceStore {
 
     pub fn checkpoint(&self) -> GlyphResourceCheckpoint {
         GlyphResourceCheckpoint {
-            generation: self.generation,
+            id: self.id,
+            branch: self.branch,
             len: self.len(),
         }
     }
 
     /// Restore an append checkpoint without cloning the ledger or its arrays.
     /// Returns false without changing this store if it belongs to another
-    /// generation or its prefix has already been discarded.
+    /// ledger or its prefix has already been discarded, including after regrowth.
     pub fn rollback_to(&mut self, checkpoint: GlyphResourceCheckpoint) -> bool {
-        if checkpoint.generation != self.generation || checkpoint.len > self.len() {
+        let next_cut = self
+            .discarded_prefixes
+            .partition_point(|&(branch, _)| branch <= checkpoint.branch);
+        if checkpoint.id != self.id
+            || checkpoint.len > self.len()
+            || self
+                .discarded_prefixes
+                .get(next_cut)
+                .is_some_and(|&(_, len)| len < checkpoint.len)
+        {
             return false;
         }
+        if checkpoint.len == self.len() {
+            return true;
+        }
+        self.branch = self
+            .branch
+            .checked_add(1)
+            .expect("glyph ledger branch space exhausted");
+        // Later, shorter cuts subsume earlier cuts. Prefix lengths remain
+        // strictly increasing, so the first cut after a checkpoint is decisive.
+        while self
+            .discarded_prefixes
+            .last()
+            .is_some_and(|&(_, len)| len >= checkpoint.len)
+        {
+            self.discarded_prefixes.pop();
+        }
+        self.discarded_prefixes.push((self.branch, checkpoint.len));
         self.metrics.truncate(checkpoint.len);
+        if checkpoint.len == 0 {
+            self.native_paint_resources = None;
+        } else if let Some(resources) = &mut self.native_paint_resources {
+            resources.truncate(checkpoint.len);
+        }
         self.shaped_ids
             .retain(|_, id| (id.0 as usize) < checkpoint.len);
         true
     }
 
-    /// Ask the backend for native geometry and paint handles, then assign layout
-    /// IDs here. Backends never receive the engine's registry or glyph buffer.
+    /// Register geometry and native entry references or borrowed paint handles.
+    /// The engine assigns layout IDs and retained paint IDs; backends never
+    /// receive its registry or glyph buffer.
     pub fn shape_run(
         &mut self,
         shaper: &mut (impl GlyphShaper + ?Sized),
@@ -1168,79 +1215,118 @@ impl GlyphResourceStore {
         glyphs: &mut [GlyphId],
     ) -> Result<Option<ShapedTextRun>, ShapeError> {
         let text = text_run_shape_request_text(&request);
-        let style = *text_run_shape_request_style(&request);
-        let shaped = shaper.shape_run(request)?;
-        if let Some(ShapedRun {
-            geometry,
-            paint:
-                Some(RunPaint {
-                    first_handle,
-                    metrics,
-                }),
-        }) = shaped
-        {
-            let range = self
-                .metrics
-                .register_run(text, geometry.shared_advances(), metrics, first_handle)
-                .map_err(|_| shape_error_registry_capacity_exhausted(self.len()))?;
-            for (slot, id) in glyphs.iter_mut().zip(range) {
-                *slot = GlyphId(id);
+        let ShapedRun {
+            mut geometry,
+            paint,
+        } = shaper.shape_run(request);
+        match paint {
+            RunPaint::Character(paint) => {
+                glyphs[0] =
+                    self.register_shaped(text.chars().next().expect("one-character run"), paint)?;
             }
-            return Ok(Some(geometry));
-        }
-        let mut ascii = [GlyphId(u32::MAX); 128];
-        let mut non_ascii = FxHashMap::<char, GlyphId>::default();
-        for (slot, character) in glyphs.iter_mut().zip(text.chars()) {
-            let cached = if character.is_ascii() {
-                ascii[character as usize]
-            } else {
-                non_ascii
-                    .get(&character)
-                    .copied()
-                    .unwrap_or(GlyphId(u32::MAX))
-            };
-            *slot = if cached != GlyphId(u32::MAX) {
-                cached
-            } else {
-                let id = self.shape_glyph(shaper, shaping::glyph(character, &style))?;
-                if character.is_ascii() {
-                    ascii[character as usize] = id;
-                } else {
-                    non_ascii.insert(character, id);
+            RunPaint::Characters(paints) => {
+                let mut ascii = [GlyphId(u32::MAX); 128];
+                let mut non_ascii = FxHashMap::default();
+                for (character, paint) in paints {
+                    let id = self.register_shaped(character, paint)?;
+                    if character.is_ascii() {
+                        ascii[character as usize] = id;
+                    } else {
+                        non_ascii.insert(character, id);
+                    }
                 }
-                id
-            };
+                for (slot, character) in glyphs.iter_mut().zip(text.chars()) {
+                    *slot = if character.is_ascii() {
+                        ascii[character as usize]
+                    } else {
+                        non_ascii[&character]
+                    };
+                }
+            }
+            RunPaint::Native { source, metrics } => {
+                self.ensure_paint_ownership(matches!(&source, NativePaintSource::Retained(_)))?;
+                let first_handle = match &source {
+                    NativePaintSource::Borrowed(handle) => *handle,
+                    NativePaintSource::Retained(_) => GlyphHandle(self.len() as u32),
+                };
+                // Repeated isolated runs reuse registrations as well as native cache entries.
+                let mut characters = text.chars();
+                if let Some(character) = characters.next()
+                    && characters.next().is_none()
+                    && let RunFontMetrics::Uniform(font_metrics) = &metrics
+                {
+                    let advance =
+                        shaped_text_run_advances(geometry.as_ref().expect("native run geometry"))
+                            [0];
+                    let shaped = match source {
+                        NativePaintSource::Borrowed(handle) => {
+                            ShapedGlyph::new(handle, advance, *font_metrics)
+                        }
+                        NativePaintSource::Retained(resource) => {
+                            ShapedGlyph::retained(resource, advance, *font_metrics)
+                        }
+                    };
+                    let glyph = self.register_shaped(character, shaped)?;
+                    glyphs[0] = glyph;
+                    if let Some(native) = geometry
+                        .as_mut()
+                        .and_then(|geometry| geometry.native.as_mut())
+                        && let Some(resources) = &self.native_paint_resources
+                    {
+                        native.run = resources.run_for_glyph(glyph.0);
+                    }
+                } else {
+                    let range = self
+                        .metrics
+                        .register_run(
+                            text,
+                            geometry
+                                .as_ref()
+                                .expect("native run geometry")
+                                .shared_advances(),
+                            metrics,
+                            first_handle,
+                        )
+                        .map_err(|_| shape_error_registry_capacity_exhausted(self.len()))?;
+                    if let NativePaintSource::Retained(resource) = source
+                        && !range.is_empty()
+                    {
+                        let run = self
+                            .native_paint_resources
+                            .get_or_insert_with(NativePaintResources::default)
+                            .push(range.clone(), resource);
+                        if let Some(native) = geometry
+                            .as_mut()
+                            .and_then(|geometry| geometry.native.as_mut())
+                        {
+                            native.run = Some(run);
+                        }
+                    }
+                    for (slot, id) in glyphs.iter_mut().zip(range) {
+                        *slot = GlyphId(id);
+                    }
+                }
+            }
         }
-        Ok(shaped.map(shaped_run_into_geometry))
+        Ok(geometry)
     }
 
-    /// Shape and register each character independently, using the run's font
-    /// selection. Native contextual run shaping is left to the caller.
-    pub fn shape_characters(
+    /// Intern one paint entry supplied as part of a complete run result.
+    fn register_shaped(
         &mut self,
-        shaper: &mut (impl GlyphShaper + ?Sized),
-        request: &TextRunShapeRequest<'_>,
-        glyphs: &mut [GlyphId],
-    ) -> Result<(), ShapeError> {
-        debug_assert_eq!(text_run_shape_request_text(&request).chars().count(), glyphs.len());
-        let style = text_run_shape_request_style(&request);
-        for (slot, character) in glyphs.iter_mut().zip(text_run_shape_request_text(&request).chars()) {
-            *slot = self.shape_glyph(shaper, shaping::glyph(character, style))?;
-        }
-        Ok(())
-    }
-
-    /// Shape and intern a native result, assigning its layout ID here.
-    pub fn shape_glyph(
-        &mut self,
-        shaper: &mut (impl GlyphShaper + ?Sized),
-        request: GlyphRequest<'_>,
+        character: char,
+        shaped: ShapedGlyph,
     ) -> Result<GlyphId, ShapeError> {
-        let shaped = shaper.shape_glyph(request)?;
         let metrics = shaped.metrics();
+        let identity = match &shaped.source {
+            NativePaintSource::Borrowed(handle) => GlyphPaintIdentity::Borrowed(*handle),
+            NativePaintSource::Retained(resource) => {
+                GlyphPaintIdentity::Retained(resource.identity())
+            }
+        };
         let key = (
-            shaped.handle(),
-            request.character,
+            identity,
+            character,
             shaped.advance().to_bits(),
             metrics.ascent.to_bits(),
             metrics.descent.to_bits(),
@@ -1248,20 +1334,29 @@ impl GlyphResourceStore {
         if let Some(&id) = self.shaped_ids.get(&key) {
             return Ok(id);
         }
-        let id = self.register_shaped(request.character, shaped)?;
+        self.ensure_paint_ownership(matches!(&shaped.source, NativePaintSource::Retained(_)))?;
+        let id = self.register(GlyphMetric::from_shaped(character, &shaped))?;
+        match shaped.source {
+            NativePaintSource::Borrowed(handle) => self.metrics.set_paint_handle(id, handle),
+            NativePaintSource::Retained(resource) => {
+                self.metrics.set_paint_handle(id, GlyphHandle(id.0));
+                self.native_paint_resources
+                    .get_or_insert_with(NativePaintResources::default)
+                    .push(id.0..id.0 + 1, resource);
+            }
+        }
         self.shaped_ids.insert(key, id);
         Ok(id)
     }
 
-    /// Register a native single-character result without interning.
-    fn register_shaped(
-        &mut self,
-        character: char,
-        shaped: ShapedGlyph,
-    ) -> Result<GlyphId, ShapeError> {
-        let id = self.register(GlyphMetric::from_shaped(character, shaped))?;
-        self.metrics.set_paint_handle(id, shaped.handle());
-        Ok(id)
+    fn ensure_paint_ownership(&self, retained: bool) -> Result<(), ShapeError> {
+        if self.is_empty() || retained == self.native_paint_resources.is_some() {
+            Ok(())
+        } else {
+            Err(ShapeError {
+                kind: ShapeErrorKind::MixedPaintOwnership,
+            })
+        }
     }
 
     fn register(&mut self, metric: GlyphMetric) -> Result<GlyphId, ShapeError> {
@@ -1292,21 +1387,12 @@ impl GlyphResourceStore {
     }
 }
 
-/// Backend supplied by a renderer adapter for measuring styled characters
-/// and returning handles to its native paint resources. HtmlEngine assigns
-/// layout glyph IDs and stores the returned measurements.
-/// Basic adapters can use [`crate::ResourceShaper`] to supply a shaping callback
-/// with automatic native-resource lifecycle handling.
+/// Backend supplied by a renderer adapter for shaping styled text runs
+/// and returning its native paint resources. HtmlEngine assigns layout glyph
+/// IDs and reports its own registration and layout errors separately.
+/// Basic adapters can use [`crate::ResourceShaper`] for native storage and
+/// explicit reset support while borrowing a platform text system.
 pub trait GlyphShaper {
-    /// Optional reclamation of completed scope batches. Backends which support
-    /// this must preserve all prefix handles and retained painter snapshots.
-    fn resource_checkpoint(&self) -> Option<NativeResourceCheckpoint> {
-        None
-    }
-    fn restore_resource_checkpoint(&mut self, _checkpoint: NativeResourceCheckpoint) -> bool {
-        false
-    }
-
     /// Selects the publication `@font-face` declarations and reader font
     /// policy of the document about to be shaped. The engine calls this before
     /// every document and append shaping pass, so a backend's active faces
@@ -1316,65 +1402,27 @@ pub trait GlyphShaper {
     fn select_publication_fonts(&mut self, _faces: &[FontFace], _overrides: &ReaderStyleOverrides) {
     }
 
-    /// Identity of the backend's active paint resources. Reset must assign a
-    /// fresh generation; a failed document replacement restores the old one.
+    /// Identity of the backend's native resource namespace. Caller-controlled
+    /// invalidation must change it when borrowed handles stop being valid.
     fn resource_generation(&self) -> GlyphResourceGeneration;
 
-    fn reset(&mut self);
+    /// Release temporary native scratch after a complete shaping/layout batch.
+    /// Called on success and engine/layout errors; cached results remain valid.
+    fn finish_shaping(&mut self) {}
 
-    /// Checkpoint active resources before an operation that appends glyphs.
-    /// The default rejects appends so failed shaping cannot leave native
-    /// resources ahead of the published glyph metrics. Resource-backed shapers should
-    /// restore all glyph and run resources in `rollback_append_shaping`.
-    fn begin_append_shaping(&mut self) -> Result<(), ShapeError> {
-        Err(ShapeError::append_transaction_unsupported())
-    }
-
-    fn commit_append_shaping(&mut self) {}
-
-    fn rollback_append_shaping(&mut self) {}
-
-    /// Starts replacing the renderer-owned resources for a shaped document.
-    ///
-    /// Resource-backed implementations should retain the previous document's
-    /// resources until either [`GlyphShaper::commit_document_shaping`] or
-    /// [`GlyphShaper::rollback_document_shaping`] is called. Implementations
-    /// without renderer-owned resources can rely on this reset-only default;
-    /// `reset` must assign a fresh resource generation.
-    fn begin_document_shaping(&mut self) {
-        self.reset();
-    }
-
-    /// Commits resources produced since `begin_document_shaping`.
-    fn commit_document_shaping(&mut self) {}
-
-    /// Restores resources retained by `begin_document_shaping` after failure.
-    fn rollback_document_shaping(&mut self) {}
-
-    /// Resolve metrics for the selected primary font face. Backends without a
+    /// Resolve metrics for the selected primary font face, applying the supplied
+    /// font features to glyph advances such as `ch`. Backends without a
     /// metrics API use the CSS-defined 0.5em x-height fallback; layout derives
     /// missing vertical metrics from its shaped line geometry.
-    fn font_relative_metrics(
-        &mut self,
-        _style: &ShapingStyle<'_>,
-    ) -> Result<FontRelativeMetrics, ShapeError> {
-        Ok(FontRelativeMetrics::default())
+    fn font_relative_metrics(&mut self, _style: &ShapingStyle<'_>) -> FontRelativeMetrics {
+        FontRelativeMetrics::default()
     }
 
-    /// Shape one character using the native text system. Return its paint
-    /// handle, advance, and measured font extents; no metric registration is needed.
-    fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError>;
-
-    /// Shape a complete logical run using the supplied resolved style. Font
-    /// selection, supported feature translation and native caching belong to
-    /// the backend. Actual advances and cluster geometry drive engine layout.
-    /// Returning `None` selects the engine's per-character fallback.
-    fn shape_run(
-        &mut self,
-        _request: TextRunShapeRequest<'_>,
-    ) -> Result<Option<ShapedRun>, ShapeError> {
-        Ok(None)
-    }
+    /// Shape a complete logical run using resolved CSS properties. This includes
+    /// isolated inserted characters and isolated mandatory line breaks. Native
+    /// backends return contextual geometry; basic adapters return character paint
+    /// entries through [`ShapedRun::characters`]. Neither requires an engine fallback.
+    fn shape_run(&mut self, request: TextRunShapeRequest<'_>) -> ShapedRun;
 }
 
 #[cfg(test)]
@@ -1597,11 +1645,63 @@ pub fn shaped_run_painted(
     metrics: RunFontMetrics,
 ) -> ShapedRun {
     ShapedRun {
-        geometry,
-        paint: Some(RunPaint {
-            first_handle,
+        geometry: Some(geometry),
+        paint: RunPaint::Native {
+            source: NativePaintSource::Borrowed(first_handle),
             metrics,
-        }),
+        },
+    }
+}
+
+/// Return measurements together with a reference to a caller-owned native run.
+/// The engine assigns document-local paint IDs when it registers the result.
+pub fn shaped_run_retained(
+    geometry: ShapedTextRun,
+    resource: impl Into<NativePaintResource>,
+    metrics: RunFontMetrics,
+) -> ShapedRun {
+    ShapedRun {
+        geometry: Some(geometry),
+        paint: RunPaint::Native {
+            source: NativePaintSource::Retained(resource.into()),
+            metrics,
+        },
+    }
+}
+
+impl ShapedRun {
+    /// A complete run for adapters that paint individual characters. The callback
+    /// stays inside the adapter; repeated characters are measured once per run.
+    pub fn characters(
+        request: TextRunShapeRequest<'_>,
+        mut shape: impl FnMut(char, &ShapingStyle<'_>) -> ShapedGlyph,
+    ) -> ShapedRun {
+        let mut characters = request.text.chars();
+        if let Some(character) = characters.next()
+            && characters.next().is_none()
+        {
+            return ShapedRun {
+                geometry: None,
+                paint: RunPaint::Character(shape(character, &request.style)),
+            };
+        }
+        let mut ascii = [false; 128];
+        let mut non_ascii = FxHashSet::default();
+        let mut glyphs = Vec::new();
+        for character in request.text.chars() {
+            let fresh = if character.is_ascii() {
+                !std::mem::replace(&mut ascii[character as usize], true)
+            } else {
+                non_ascii.insert(character)
+            };
+            if fresh {
+                glyphs.push((character, shape(character, &request.style)));
+            }
+        }
+        ShapedRun {
+            geometry: None,
+            paint: RunPaint::Characters(glyphs),
+        }
     }
 }
 
@@ -1609,12 +1709,10 @@ pub fn shaped_text_run_caret_stops(value: &ShapedTextRun) -> Option<&CaretPositi
     value.native.as_ref().map(|native| &native.caret_stops)
 }
 
-/// Native geometry with individual glyph painting supplied by `shape_glyph`.
-pub fn shaped_run_geometry(geometry: ShapedTextRun) -> ShapedRun {
-    ShapedRun {
-        geometry,
-        paint: None,
-    }
+/// Supply contextual geometry while retaining a complete run's paint entries.
+pub fn shaped_run_geometry(geometry: ShapedTextRun, mut paint: ShapedRun) -> ShapedRun {
+    paint.geometry = Some(geometry);
+    paint
 }
 
 /// The caller supplies a resolved CSS angle from -90 through 90 degrees.
@@ -1628,14 +1726,6 @@ pub fn text_run_shape_request_style<'a, 's>(
     value: &'s TextRunShapeRequest<'a>,
 ) -> &'s ShapingStyle<'a> {
     &value.style
-}
-
-/// Per-character overrides. `None` means every character uses
-/// [`ShapingStyle::color`] from the shaping style.
-pub fn text_run_shape_request_paint_colors<'a>(
-    value: &TextRunShapeRequest<'a>,
-) -> Option<&'a [u32]> {
-    value.paint_colors
 }
 
 pub fn shaped_text_run_advances(value: &ShapedTextRun) -> &[f32] {
@@ -1664,8 +1754,30 @@ pub fn shaped_text_run_cluster_boundaries(value: &ShapedTextRun) -> &[bool] {
     &value.cluster_boundaries
 }
 
-/// The adapter also supplies finite ascent and caret positions, with one
-/// caret per character boundary. All arrays refer to the same logical run.
+/// Native caret geometry without a paint key. Retained backends return this
+/// with their native entry; engine registration assigns its document-local key.
+/// Supply finite ascent and one caret per character boundary, all referring to
+/// the same logical run. Shared arrays are retained without copying.
+pub fn shaped_text_run_with_carets(
+    advances: Arc<[f32]>,
+    cluster_boundaries: Arc<[bool]>,
+    caret_stops: CaretPositions,
+    ascent: f32,
+) -> ShapedTextRun {
+    ShapedTextRun {
+        advances,
+        cluster_boundaries,
+        native: Some(NativeRunGeometry {
+            run: None,
+            caret_stops,
+            ascent,
+        }),
+    }
+}
+
+/// Native geometry with a borrowed backend paint key. Supply finite ascent and
+/// one caret per character boundary, all referring to the same logical run.
+/// Retained backends use [`shaped_text_run_with_carets`] instead.
 pub fn shaped_text_run_with_backend_run(
     advances: Arc<[f32]>,
     cluster_boundaries: Arc<[bool]>,
@@ -1677,7 +1789,7 @@ pub fn shaped_text_run_with_backend_run(
         advances,
         cluster_boundaries,
         native: Some(NativeRunGeometry {
-            run: backend_run,
+            run: Some(backend_run),
             caret_stops,
             ascent,
         }),
@@ -1723,7 +1835,7 @@ pub fn font_relative_metrics_line_box_extents(
     )
 }
 
-pub fn shape_error_registry_capacity_exhausted(metrics_len: usize) -> ShapeError {
+pub(crate) fn shape_error_registry_capacity_exhausted(metrics_len: usize) -> ShapeError {
     ShapeError {
         kind: ShapeErrorKind::RegistryCapacityExhausted { metrics_len },
     }
@@ -1733,14 +1845,16 @@ pub fn oblique_angle_degrees(value: ObliqueAngle) -> f32 {
     f32::from_bits(value.0)
 }
 
+/// The registered engine key or borrowed backend key, when one is assigned.
+/// Unregistered caret geometry has no paint key.
 pub fn shaped_text_run_backend_run(value: &ShapedTextRun) -> Option<TextRunId> {
-    value.native.as_ref().map(|native| native.run)
+    value.native.as_ref()?.run
 }
 
 pub fn shaped_text_run_ascent(value: &ShapedTextRun) -> f32 {
     value.native.as_ref().map_or(0.0, |native| native.ascent)
 }
 
-pub fn shaped_run_into_geometry(value: ShapedRun) -> ShapedTextRun {
+pub fn shaped_run_into_geometry(value: ShapedRun) -> Option<ShapedTextRun> {
     value.geometry
 }

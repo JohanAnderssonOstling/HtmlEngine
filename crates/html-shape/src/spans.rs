@@ -71,18 +71,28 @@ impl ShapingSpan {
             && left.direction() == right.direction()
     }
 
-    pub(super) fn split_bidi(self, bidi: &ResolvedBidi) -> Vec<(Self, u8)> {
+    pub(super) fn split_bidi(self, bidi: &ResolvedBidi, source: &[char]) -> Vec<(Self, u8)> {
         profile_scope!("shape.split_bidi");
         let mut result: Vec<(Self, u8)> = Vec::new();
         for paint in self.paint_spans {
-            for (characters, level) in bidi.level_runs(paint.characters) {
+            for (characters, level) in
+                bidi.level_runs(paint.characters.clone())
+                    .flat_map(|(range, level)| {
+                        split_line_breaks(range, source).map(move |range| (range, level))
+                    })
+            {
                 let part = ShapingPaintSpan {
                     characters,
                     ..paint
                 };
-                if let Some((span, _)) =
-                    result.last_mut().filter(|(_, previous)| *previous == level)
-                {
+                if let Some((span, _)) = result.last_mut().filter(|(span, previous)| {
+                    *previous == level
+                        && !is_run_break(source[part.characters.start as usize])
+                        && !is_run_break(
+                            source[(span.paint_spans.last().expect("span paint").characters.end - 1)
+                                as usize],
+                        )
+                }) {
                     span.paint_spans.push(part);
                 } else {
                     result.push((
@@ -137,43 +147,20 @@ impl ShapingSpan {
         Some(range)
     }
 
-    /// Collect colors and the need for spacing-aware placement in one style scan.
-    /// Omit per-character colors when the shaping style already describes them.
-    pub(super) fn paint_and_placement(
+    /// Whether any paint span needs spacing-aware glyph placement.
+    pub(super) fn placement_required(
         &self,
         styles: &ComputedStyles,
         layout_tree: &LayoutTree,
         font_metrics: &ShapedFontMetrics,
-    ) -> (Option<Vec<u32>>, bool) {
-        let default_color = self.style(styles, layout_tree).color();
-        let mut colors = None;
-        let mut placement_required = false;
-        let mut prefix_len = 0;
-        for span in &self.paint_spans {
-            let style = span
-                .style_override
-                .and_then(|indices| styles.view(indices))
+    ) -> bool {
+        self.paint_spans.iter().any(|span| {
+            let style = span.style_override.and_then(|indices| styles.view(indices))
                 .unwrap_or_else(|| get_style(styles, layout_tree, span.box_idx));
             let font_size = font_metrics.resolved_font_size(style, span.box_idx);
-            placement_required |= font_metrics.resolve_text_spacing(styles, style.text.letter_spacing, font_size) != 0.0
-                || font_metrics.resolve_text_spacing(styles, style.text.word_spacing, font_size) != 0.0;
-            let color = style.color();
-            if colors.is_none() && color != default_color {
-                let mut values = Vec::with_capacity(self.character_count());
-                values.resize(prefix_len, default_color);
-                colors = Some(values);
-            }
-            if let Some(colors) = &mut colors {
-                colors.extend(std::iter::repeat_n(color, span.characters.len()));
-            }
-            prefix_len += span.characters.len();
-        }
-        debug_assert!(
-            colors
-                .as_ref()
-                .is_none_or(|colors| colors.len() == self.character_count())
-        );
-        (colors, placement_required)
+            font_metrics.resolve_text_spacing(styles, style.text.letter_spacing, font_size) != 0.0
+                || font_metrics.resolve_text_spacing(styles, style.text.word_spacing, font_size) != 0.0
+        })
     }
 
     pub(super) fn has_tracking(&self, styles: &ComputedStyles, layout_tree: &LayoutTree, font_metrics: &ShapedFontMetrics) -> bool {
@@ -185,6 +172,39 @@ impl ShapingSpan {
         })
     }
 
+}
+
+fn is_run_break(character: char) -> bool {
+    matches!(character, '\r' | '\n') || html_text::is_mandatory_line_break(character)
+}
+
+/// Isolate mandatory breaks without destroying contextual shaping on either side.
+/// A CRLF pair stays together so its grapheme boundary remains canonical.
+pub(super) fn split_line_breaks(
+    range: Range<u32>,
+    source: &[char],
+) -> impl Iterator<Item = Range<u32>> + '_ {
+    let mut cursor = range.start;
+    std::iter::from_fn(move || {
+        if cursor >= range.end {
+            return None;
+        }
+        let start = cursor;
+        if is_run_break(source[cursor as usize]) {
+            cursor += 1;
+            if source[start as usize] == '\r'
+                && cursor < range.end
+                && source[cursor as usize] == '\n'
+            {
+                cursor += 1;
+            }
+        } else {
+            while cursor < range.end && !is_run_break(source[cursor as usize]) {
+                cursor += 1;
+            }
+        }
+        Some(start..cursor)
+    })
 }
 
 /// Derive typographic spans from the complete inline item stream. This must

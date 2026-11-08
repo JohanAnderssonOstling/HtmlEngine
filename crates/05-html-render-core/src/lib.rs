@@ -20,6 +20,7 @@ use html_pipeline::engine::{
     TextRunId,
 };
 use html_resources::DecodedImages;
+use html_engine_model::NativePaintResources;
 use kurbo::{Point, Rect, Size};
 use peniko::{Color, Image};
 use std::ops::Range;
@@ -35,6 +36,12 @@ fn pixel_snapper(scale: f64) -> impl Fn(f64) -> f64 {
 }
 
 pub trait Painter {
+    /// Select the immutable native resources owned by this paint input.
+    /// Return false when the snapshot belongs to a different backend.
+    fn bind_text_resources(&mut self, _resources: &NativePaintResources) -> bool {
+        true
+    }
+
     /// Restricts subsequent paint operations until the matching `pop_clip`.
     /// Implementations must intersect nested clips and restore them on pop.
     fn push_clip(&mut self, rect: Rect);
@@ -249,6 +256,14 @@ impl RenderScene {
     /// Returns false without submitting commands after resource invalidation.
     pub fn paint(&self, painter: &mut impl Painter) -> bool {
         if !render_scene_is_valid(&self) {
+            return false;
+        }
+        if let Some(resources) = self
+            .resources
+            .as_ref()
+            .and_then(|lease| lease.native_paint_resources())
+            && !painter.bind_text_resources(resources)
+        {
             return false;
         }
         for command in self.commands.iter() {
@@ -732,11 +747,10 @@ mod tests {
     use html_resources::ResourceProvider;
     use std::io;
     use html_pipeline::engine::GlyphResourceGeneration;
-    use html_pipeline::engine::GlyphRequest;
     use html_pipeline::engine::FontMetrics;
     use html_pipeline::engine::ShapedGlyph;
     use html_pipeline::engine::{
-        ShapeError, ShapedRun, ShapedTextRun, TextDirection, TextRunShapeRequest,
+        ShapedRun, ShapedTextRun, TextDirection, TextRunShapeRequest,
     };
     use std::collections::HashMap;
 
@@ -835,49 +849,28 @@ mod tests {
     struct TestShaper {
         glyphs: HashMap<(char, u32), GlyphHandle>,
         generation: GlyphResourceGeneration,
-        append_checkpoint: Option<(HashMap<(char, u32), GlyphHandle>, GlyphResourceGeneration)>,
     }
 
     impl GlyphShaper for TestShaper {
-        fn reset(&mut self) {
-            self.glyphs.clear();
-            self.generation = GlyphResourceGeneration::default();
-        }
-
         fn resource_generation(&self) -> GlyphResourceGeneration {
             self.generation
         }
 
-        fn begin_append_shaping(&mut self) -> Result<(), ShapeError> {
-            assert!(self.append_checkpoint.is_none());
-            self.append_checkpoint = Some((self.glyphs.clone(), self.generation.clone()));
-            Ok(())
-        }
-
-        fn commit_append_shaping(&mut self) {
-            self.append_checkpoint = None;
-        }
-
-        fn rollback_append_shaping(&mut self) {
-            if let Some((glyphs, glyph_store)) = self.append_checkpoint.take() {
-                self.glyphs = glyphs;
-                self.generation = glyph_store;
-            }
-        }
-
-        fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
-            let key = (request.character, request.style.font_size.to_bits());
-            let advance = request.style.font_size * 0.5;
-            let metrics = FontMetrics {
-                ascent: request.style.font_size * 0.75,
-                descent: request.style.font_size * 0.25,
-            };
-            if let Some(glyph) = self.glyphs.get(&key) {
-                return Ok(ShapedGlyph::new(*glyph, advance, metrics));
-            }
-            let glyph = GlyphHandle(self.glyphs.len() as u32);
-            self.glyphs.insert(key, glyph);
-            Ok(ShapedGlyph::new(glyph, advance, metrics))
+        fn shape_run(&mut self, request: TextRunShapeRequest<'_>) -> ShapedRun {
+            ShapedRun::characters(request, |character, style| {
+                let key = (character, style.font_size.to_bits());
+                let advance = style.font_size * 0.5;
+                let metrics = FontMetrics {
+                    ascent: style.font_size * 0.75,
+                    descent: style.font_size * 0.25,
+                };
+                if let Some(glyph) = self.glyphs.get(&key) {
+                    return ShapedGlyph::new(*glyph, advance, metrics);
+                }
+                let glyph = GlyphHandle(self.glyphs.len() as u32);
+                self.glyphs.insert(key, glyph);
+                ShapedGlyph::new(glyph, advance, metrics)
+            })
         }
     }
 
@@ -890,21 +883,17 @@ mod tests {
             fn resource_generation(&self) -> GlyphResourceGeneration {
                 self.0
             }
-            fn reset(&mut self) {
-                self.0 = GlyphResourceGeneration::default();
-            }
-            fn shape_glyph(
-                &mut self,
-                _request: GlyphRequest<'_>,
-            ) -> Result<ShapedGlyph, ShapeError> {
-                Ok(ShapedGlyph::new(
-                    GlyphHandle(700),
-                    8.0,
-                    FontMetrics {
-                        ascent: 12.0,
-                        descent: 4.0,
-                    },
-                ))
+            fn shape_run(&mut self, request: TextRunShapeRequest<'_>) -> ShapedRun {
+                ShapedRun::characters(request, |character, style| {
+                    ShapedGlyph::new(
+                        GlyphHandle(700),
+                        8.0,
+                        FontMetrics {
+                            ascent: 12.0,
+                            descent: 4.0,
+                        },
+                    )
+                })
             }
         }
         let mut renderer = FragmentRenderer::new();
@@ -977,95 +966,22 @@ mod tests {
             matches!(command, RenderCommand::Glyph { glyph, color, .. } if *glyph == handle && *color == 0x008000ff)));
     }
 
-    #[test]
-    fn standard_shaper_restores_native_resources_when_rendering_fails() {
-        use html_pipeline::engine::GlyphWriter;
-        use html_pipeline::engine::ResourceShaper;
-        let mut shaper = ResourceShaper::new(|request, resources: &mut GlyphWriter<'_, char>| {
-            if request.character == '!' {
-                return Err(shaping_contracts::shape_error_registry_capacity_exhausted(0));
-            }
-            let metrics = FontMetrics {
-                ascent: request.style.font_size * 0.75,
-                descent: request.style.font_size * 0.25,
-            };
-            let handle = resources.insert(request.character)?;
-            Ok(ShapedGlyph::new(
-                handle,
-                request.style.font_size * 0.5,
-                metrics,
-            ))
-        });
-        let mut renderer = FragmentRenderer::new();
-        let options = SceneOptions::new(200.0, None).unwrap();
-        // First-line refinement appends resources while replacement is pending.
-        let scene = renderer
-            .render(
-                "<style>p::first-line {font-size:24px}</style><p>x</p>",
-                &options,
-                &mut shaper,
-            )
-            .unwrap()
-            .into_scene();
-        let generation = shaper.resource_generation();
-        assert!(renderer.render("<p>y!</p>", &options, &mut shaper).is_err());
-        assert_eq!(shaper.resource_generation(), generation);
-        assert_eq!(renderer.render_view().unwrap().text().glyph_count(), 1);
-        let mut painter = RecordingPainter::default();
-        scene.paint(&mut painter);
-        assert!(!painter.glyphs.is_empty());
-        for (handle, _) in painter.glyphs {
-            assert_eq!(shaper.resources().get(handle), Some(&'x'));
-        }
-        renderer.render("<p>z</p>", &options, &mut shaper).unwrap();
-        assert_ne!(shaper.resource_generation(), generation);
-        assert_eq!(shaper.resources().get(GlyphHandle(0)), Some(&'z'));
-    }
 
     #[derive(Default)]
     struct NativeTestShaper {
         fallback: TestShaper,
         next_run: TextRunId,
-        append_checkpoint_run: Option<TextRunId>,
     }
 
     impl GlyphShaper for NativeTestShaper {
-        fn reset(&mut self) {
-            self.fallback.reset();
-            self.next_run = TextRunId(0);
-        }
-
         fn resource_generation(&self) -> GlyphResourceGeneration {
             self.fallback.resource_generation()
         }
 
-        fn begin_append_shaping(&mut self) -> Result<(), ShapeError> {
-            self.fallback.begin_append_shaping()?;
-            self.append_checkpoint_run = Some(self.next_run);
-            Ok(())
-        }
-
-        fn commit_append_shaping(&mut self) {
-            self.fallback.commit_append_shaping();
-            self.append_checkpoint_run = None;
-        }
-
-        fn rollback_append_shaping(&mut self) {
-            self.fallback.rollback_append_shaping();
-            if let Some(next_run) = self.append_checkpoint_run.take() {
-                self.next_run = next_run;
-            }
-        }
-
-        fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
-            self.fallback.shape_glyph(request)
-        }
-
-        fn shape_run(
-            &mut self,
-            request: TextRunShapeRequest<'_>,
-        ) -> Result<Option<ShapedRun>, ShapeError> {
-            let count = shaping_contracts::text_run_shape_request_text(&request).chars().count();
+        fn shape_run(&mut self, request: TextRunShapeRequest<'_>) -> ShapedRun {
+            let count = shaping_contracts::text_run_shape_request_text(&request)
+                .chars()
+                .count();
             let advances: Vec<f32> = shaping_contracts::text_run_shape_request_text(&request).chars().map(|character| {
                 if matches!(character, '\u{00ad}' | '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') { 0.0 } else { 8.0 }
             }).collect();
@@ -1076,18 +992,25 @@ mod tests {
                 x += advance;
                 caret_stops.push(x);
             }
-            if shaping_contracts::text_run_shape_request_style(&request).direction == TextDirection::Rtl {
+            if shaping_contracts::text_run_shape_request_style(&request).direction
+                == TextDirection::Rtl
+            {
                 for stop in &mut caret_stops {
                     *stop = x - *stop;
                 }
             }
             let run = self.next_run;
             self.next_run.0 += 1;
-            Ok(Some(shaping_contracts::shaped_run_geometry(shaping_contracts::shaped_text_run_with_backend_run(Arc::from(advances),
-                Arc::from(vec![true; count + 1]),
-                run,
-                caret_stops.into(),
-                12.0,))))
+            shaping_contracts::shaped_run_geometry(
+                shaping_contracts::shaped_text_run_with_backend_run(
+                    Arc::from(advances),
+                    Arc::from(vec![true; count + 1]),
+                    run,
+                    caret_stops.into(),
+                    12.0,
+                ),
+                self.fallback.shape_run(request),
+            )
         }
     }
 

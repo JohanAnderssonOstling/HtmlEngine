@@ -6,10 +6,10 @@ use crate::layout_model::BoxId;
 use crate::layout_model::LineId;
 use crate::parser::DocumentFactory;
 use crate::test_support::TestGlyphShaper;
-use crate::{GlyphRequest, ShapedGlyph, ShapedRun};
+use crate::{ShapedRun};
 use crate::{
     GlyphResourceGeneration, GlyphResourceStore, GlyphShaper, LaidOutDocument, LayoutConstraints,
-    ShapeError, ShapedTextRun, TextDirection, TextRunId, TextRunShapeRequest,
+    ShapedTextRun, TextDirection, TextRunId, TextRunShapeRequest,
 };
 use std::sync::Arc;
 
@@ -459,41 +459,21 @@ struct DirectionalShaper {
 }
 
 impl GlyphShaper for DirectionalShaper {
-    fn reset(&mut self) {
-        self.fallback.reset();
-        self.requests.clear();
-        self.checkpoint = None;
-    }
-    fn begin_append_shaping(&mut self) -> Result<(), ShapeError> {
-        self.fallback.begin_append_shaping()?;
-        self.checkpoint = Some(self.requests.len());
-        Ok(())
-    }
-    fn commit_append_shaping(&mut self) {
-        self.fallback.commit_append_shaping();
-        self.checkpoint = None;
-    }
-    fn rollback_append_shaping(&mut self) {
-        self.fallback.rollback_append_shaping();
-        if let Some(checkpoint) = self.checkpoint.take() {
-            self.requests.truncate(checkpoint);
-        }
-    }
     fn resource_generation(&self) -> GlyphResourceGeneration {
         self.fallback.resource_generation()
     }
-    fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
-        self.fallback.shape_glyph(request)
-    }
-    fn shape_run(
-        &mut self,
-        request: TextRunShapeRequest<'_>,
-    ) -> Result<Option<ShapedRun>, ShapeError> {
+
+    fn shape_run(&mut self, request: TextRunShapeRequest<'_>) -> ShapedRun {
         let direction = shaping_contracts::text_run_shape_request_style(&request).direction;
         let advance = shaping_contracts::text_run_shape_request_style(&request).font_size * 0.25;
         let run = TextRunId(self.requests.len() as u32);
-        self.requests.push((shaping_contracts::text_run_shape_request_text(&request).to_owned(), direction));
-        let count = shaping_contracts::text_run_shape_request_text(&request).chars().count();
+        self.requests.push((
+            shaping_contracts::text_run_shape_request_text(&request).to_owned(),
+            direction,
+        ));
+        let count = shaping_contracts::text_run_shape_request_text(&request)
+            .chars()
+            .count();
         let stops: Vec<_> = (0..=count)
             .map(|index| {
                 (if direction == TextDirection::Rtl {
@@ -504,11 +484,16 @@ impl GlyphShaper for DirectionalShaper {
                     * advance
             })
             .collect();
-        Ok(Some(shaping_contracts::shaped_run_geometry(shaping_contracts::shaped_text_run_with_backend_run(Arc::from(vec![advance; count]),
-            Arc::from(vec![true; count + 1]),
-            run,
-            stops.into(),
-            12.0,))))
+        shaping_contracts::shaped_run_geometry(
+            shaping_contracts::shaped_text_run_with_backend_run(
+                Arc::from(vec![advance; count]),
+                Arc::from(vec![true; count + 1]),
+                run,
+                stops.into(),
+                12.0,
+            ),
+            self.fallback.shape_run(request),
+        )
     }
 }
 

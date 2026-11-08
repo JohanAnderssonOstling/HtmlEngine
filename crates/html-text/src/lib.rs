@@ -24,7 +24,9 @@ pub use first_letter::{FirstLetterPart, FirstLetterSelection};
 pub use joining::{is_cursive_character, joins_cursively};
 pub use line_breaks::atomic_boundary_wraps;
 use html_style_model::StyleIndices;
-pub use normalization::{get_style, whitespace_context_root};
+pub use normalization::{
+    append_css_uppercase, get_style, greek_uppercase_mapping, whitespace_context_root,
+};
 pub use prepared_text::{FirstLetterStyles, PreparedText, StyleOverrides};
 pub use pseudo_styles::PseudoStyles;
 pub use spacing::{

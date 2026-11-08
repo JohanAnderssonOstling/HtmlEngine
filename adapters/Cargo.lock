@@ -1507,6 +1507,7 @@ dependencies = [
  "skrift-render-core",
  "skrift-resources",
  "skrift-style-model",
+ "skrift-text",
  "smallvec",
  "unicode-segmentation",
  "unicode_categories",

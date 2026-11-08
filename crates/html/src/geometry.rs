@@ -94,7 +94,10 @@ pub(crate) struct Geometry<'a> {
 }
 
 impl<'a> Geometry<'a> {
-    fn point_placements(self, point: Point) -> impl Iterator<Item = LinePlacement> + 'a {
+    pub(crate) fn point_placements(
+        self,
+        point: Point,
+    ) -> impl Iterator<Item = LinePlacement> + Clone + 'a {
         geometry_queries::render_geometry_view_lines_at_y(
             geometry_queries::render_view_geometry(self.view),
             point.y,
@@ -115,10 +118,10 @@ impl<'a> Geometry<'a> {
     fn painted_hit(
         self,
         point: Point,
-        placements: &[LinePlacement],
+        placements: impl IntoIterator<Item = LinePlacement> + Clone,
     ) -> (Option<PaintedHit>, Option<ImageHit>) {
-        let text = self.ink_hit(point, placements);
-        let image = self.image_hit_at_lines(point, placements.iter().copied());
+        let text = self.ink_hit(point, placements.clone());
+        let image = self.image_hit_at_lines(point, placements);
         let foreground = match (text, image) {
             // Images paint before text on a shared carrier line.
             (Some(text), Some((_, _, image_line)))
@@ -323,14 +326,13 @@ impl<'a> Geometry<'a> {
     pub(crate) fn content_at_lines(
         self,
         point: Point,
-        placements: impl IntoIterator<Item = LinePlacement>,
+        placements: impl IntoIterator<Item = LinePlacement> + Clone,
         contains_box: impl FnMut(BoxId) -> bool,
     ) -> Option<ContentHit<'a>> {
         if !point.x.is_finite() || !point.y.is_finite() {
             return None;
         }
-        let placements: Vec<_> = placements.into_iter().collect();
-        let (hit, underlying_image) = self.painted_hit(point, &placements);
+        let (hit, underlying_image) = self.painted_hit(point, placements);
         let targets = self.view.addressing();
         let (text, image, link) = match hit {
             Some(PaintedHit::Text(text)) => (Some(text), None, targets.link_for_glyph(text.glyph)),
@@ -355,14 +357,13 @@ impl<'a> Geometry<'a> {
     pub(crate) fn link_at_lines(
         self,
         point: Point,
-        placements: impl IntoIterator<Item = LinePlacement>,
+        placements: impl IntoIterator<Item = LinePlacement> + Clone,
     ) -> Option<LinkTarget<'a>> {
         if !point.x.is_finite() || !point.y.is_finite() {
             return None;
         }
-        let placements: Vec<_> = placements.into_iter().collect();
         let targets = self.view.addressing();
-        match self.painted_hit(point, &placements).0 {
+        match self.painted_hit(point, placements).0 {
             Some(PaintedHit::Text(text)) => targets.link_for_glyph(text.glyph),
             Some(PaintedHit::Image { box_idx, .. }) => {
                 address_queries::render_addressing_view_link_for_box(targets, box_idx)
@@ -371,8 +372,31 @@ impl<'a> Geometry<'a> {
         }
     }
 
-    fn ink_hit(self, point: Point, placements: &[LinePlacement]) -> Option<TextHit> {
-        self.hit_test_lines(point, placements.iter().copied())
+    pub(crate) fn link_node_at_lines(
+        self,
+        point: Point,
+        placements: impl IntoIterator<Item = LinePlacement> + Clone,
+    ) -> Option<u32> {
+        if !point.x.is_finite() || !point.y.is_finite() {
+            return None;
+        }
+        let targets = self.view.addressing();
+        match self.painted_hit(point, placements).0? {
+            PaintedHit::Text(text) => {
+                address_queries::render_addressing_view_link_node_for_glyph(targets, text.glyph)
+            }
+            PaintedHit::Image { box_idx, .. } => {
+                address_queries::render_addressing_view_link_node_for_box(targets, box_idx)
+            }
+        }
+    }
+
+    fn ink_hit(
+        self,
+        point: Point,
+        placements: impl IntoIterator<Item = LinePlacement> + Clone,
+    ) -> Option<TextHit> {
+        self.hit_test_lines(point, placements.clone())
             .and_then(|hit| {
                 [Some(hit.glyph), hit.glyph.checked_sub(1)]
                     .into_iter()
@@ -380,7 +404,7 @@ impl<'a> Geometry<'a> {
                     .find_map(|glyph| {
                         self.selection_bounds_lines(
                             glyph..glyph.saturating_add(1),
-                            placements.iter().copied(),
+                            placements.clone(),
                         )
                         .is_some_and(|bounds| bounds.contains(point))
                         .then_some(TextHit {

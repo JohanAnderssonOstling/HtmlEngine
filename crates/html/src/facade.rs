@@ -25,8 +25,8 @@ pub mod style {
 pub mod text {
     pub use html_pipeline::engine::TextSearchOptions;
     pub use html_pipeline::engine::{
-        FontMetrics, FontSlant, GlyphHandle, GlyphRequest, GlyphResourceGeneration, GlyphShaper,
-        ShapeError, ShapedGlyph,
+        FontMetrics, FontSlant, GlyphHandle, GlyphResourceGeneration, GlyphShaper, ShapedRun,
+        TextRunShapeRequest, ShapedGlyph,
     };
     pub use html_style_model::FontFace;
 }

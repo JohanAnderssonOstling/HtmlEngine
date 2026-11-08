@@ -90,8 +90,8 @@ mod engine {
             self.revisions
         }
 
-        /// The session owns the committed source and configuration. Hosts can
-        /// borrow these values instead of retaining a second input snapshot.
+        /// The session owns the current source and configuration. A failed
+        /// replacement keeps its request without a published document.
         pub(crate) fn inputs(&self) -> Option<&PipelineInputs> {
             self.session.inputs()
         }
@@ -149,10 +149,6 @@ mod engine {
             self.session.glyph_resources()
         }
 
-        /// Version of the native resources used by the published text.
-        pub fn glyph_resource_generation(&self) -> crate::text::GlyphResourceGeneration {
-            self.session.glyph_resources().generation()
-        }
 
         /// Select document content without creating a reader or a viewport.
         pub(crate) fn selection(&self, range: Range<u32>) -> Option<Selection<'_>> {

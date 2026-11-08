@@ -1,46 +1,59 @@
 //! Synthetic caps retain logical source indices, including case expansions.
 use super::*;
 use unicode_categories::UnicodeCategories;
+use html_text::{append_css_uppercase, greek_uppercase_mapping};
 
 const SMALL_CAPS_SCALE: f32 = 0.7;
 
 impl GpuiTextCache {
-    fn has_native_caps(&mut self, font: &Font, character: char, tag: &'static str) -> bool {
-        let key = (self.text_system.resolve_font(font), character, tag);
-        if let Some(supported) = self.native_caps.get(&key) {
-            return *supported;
+    fn caps_font(&mut self, font: &Font, character: char) -> FontId {
+        let key = (self.text_system.resolve_font(font), character);
+        if let Some(&font) = self.caps_fonts.get(&key) {
+            return font;
         }
-        let mut bytes = [0; 4];
-        let text = character.encode_utf8(&mut bytes);
-        let probe = |enabled| {
-            let mut font = font.clone();
-            let mut features = font.features.tag_value_list().to_vec();
-            features.retain(|(name, _)| name != tag);
-            features.push((tag.to_owned(), enabled));
-            font.features = gpui::FontFeatures::new(features);
-            self.text_system.layout_line(
-                text,
-                px(16.0),
-                &[TextRun {
-                    len: text.len(),
-                    font,
-                    ..Default::default()
-                }],
-                None,
-            )
-        };
-        let enabled = probe(1);
-        let disabled = probe(0);
-        let supported = enabled
-            .runs
-            .iter()
-            .flat_map(|run| &run.glyphs)
-            .map(|glyph| glyph.id)
-            .ne(disabled
+        let font = self.range_filtered_font(font, character);
+        let primary = self.text_system.resolve_font(&font);
+        let selected = if self
+            .text_system
+            .advance(primary, px(16.0), character)
+            .is_ok()
+        {
+            primary
+        } else {
+            // Capability belongs to the face that actually supplies the glyph,
+            // including implicit native fallback beyond the authored family list.
+            let mut utf8 = [0; 4];
+            let text = character.encode_utf8(&mut utf8);
+            let run = TextRun {
+                len: text.len(),
+                font,
+                ..Default::default()
+            };
+            let layout = self
+                .text_system
+                .layout_line_uncached(text, px(16.0), &[run]);
+            let selected = layout
                 .runs
                 .iter()
-                .flat_map(|run| &run.glyphs)
-                .map(|glyph| glyph.id));
+                .find(|run| !run.glyphs.is_empty())
+                .map_or(primary, |run| run.font_id);
+            self.text_system.recycle_line_clusters(layout.clusters);
+            selected
+        };
+        if self.caps_fonts.len() == 1024 {
+            self.caps_fonts.clear();
+        }
+        self.caps_fonts.insert(key, selected);
+        selected
+    }
+
+    fn has_native_caps(&mut self, font: &Font, character: char, tag: [u8; 4]) -> bool {
+        let font = self.caps_font(font, character);
+        let key = (font, tag);
+        if let Some(&supported) = self.native_caps.get(&key) {
+            return supported;
+        }
+        let supported = self.text_system.font_has_substitution_feature(font, tag);
         if self.native_caps.len() == 1024 {
             self.native_caps.clear();
         }
@@ -52,7 +65,7 @@ impl GpuiTextCache {
         &mut self,
         text: &str,
         styles: &[TextStyleSpan<'_>],
-    ) -> Result<Option<(ShapedLine, Arc<[f32]>)>, ShapeError> {
+    ) -> Option<(ShapedTextRun, GpuiTextRun)> {
         let source_bytes = CharacterBytes::new(text);
         let mut display = String::with_capacity(text.len());
         let mut display_styles = Vec::new();
@@ -70,17 +83,24 @@ impl GpuiTextCache {
             descent = descent.max(-f32::from(
                 self.text_system.descent(id, px(style.style.font_size)),
             ));
+            let source = &text[style.byte_range()];
+            let greek_uppercase = style
+                .style
+                .language
+                .and_then(language::content_language_tag)
+                .is_some_and(|tag| tag.primary_language() == "el");
+            let mut uppercase = None;
             let mut group_start = display.len();
             let mut group_size = style.style.font_size;
             let mut previous_small = false;
-            for character in text[style.byte_range()].chars() {
+            for (index, character) in source.chars().enumerate() {
                 display_bytes.push(display.len());
                 display_characters.push(display_count);
                 let caps = style.style.caps_synthesis;
                 let tag = if character.is_lowercase() {
-                    Some("smcp")
+                    Some(*b"smcp")
                 } else if caps == CapsSynthesis::AllSmallCaps && character.is_uppercase() {
-                    Some("c2sc")
+                    Some(*b"c2sc")
                 } else {
                     None
                 };
@@ -109,9 +129,21 @@ impl GpuiTextCache {
                 }
                 group_size = size;
                 if small {
-                    for upper in character.to_uppercase() {
+                    let mapping = if greek_uppercase {
+                        uppercase
+                            .get_or_insert_with(|| greek_uppercase_mapping(source))
+                            .as_ref()
+                    } else {
+                        None
+                    };
+                    let mut append = |upper| {
                         display.push(upper);
                         display_count += 1;
+                    };
+                    if let Some(mapping) = mapping {
+                        mapping[index].iter().copied().for_each(append);
+                    } else {
+                        append_css_uppercase(character, &mut append);
                     }
                 } else {
                     display.push(character);
@@ -129,10 +161,14 @@ impl GpuiTextCache {
         }
         display_bytes.push(display.len());
         display_characters.push(display_count);
-        let Some((mut line, _)) = self.shape_line_geometry(&display, &display_styles)? else {
-            return Ok(None);
+        self.ensure_text_fonts(&display);
+        let Some((line, native)) = self.shape_line_geometry(&display, &display_styles) else {
+            return None;
         };
-        let native = &self.runs[line.run.0 as usize];
+        // Preserve the full-size primary strut and include the actual fallback
+        // faces at their shaped sizes, including the independent CJK font.
+        ascent = ascent.max(f32::from(native.ascent));
+        descent = descent.max(f32::from(native.descent).abs());
         let mut caret_cursor = native.caret_stops.cursor();
         let Some(glyphs) = (0..native.glyphs.len())
             .map(|index| {
@@ -144,7 +180,7 @@ impl GpuiTextCache {
                 Some(glyph)
             })
             .collect::<Option<Vec<_>>>() else {
-            return Ok(None);
+            return None;
         };
         let fonts = native
             .metadata
@@ -152,25 +188,23 @@ impl GpuiTextCache {
             .collect::<FontSpans>();
         let Some(carets) = display_characters
             .iter()
-            .map(|index| line.caret_stops.get(*index))
+            .map(|index| native.caret_stops.get(*index))
             .collect::<Option<Arc<[f32]>>>()
         else {
-            return Ok(None);
+            return None;
         };
         let boundaries: Arc<[bool]> = display_characters
             .iter()
-            .map(|index| line.cluster_boundaries[*index])
+            .map(|index| shaping_contracts::shaped_text_run_cluster_boundaries(&line)[*index])
             .collect();
         let advances = advances_from_carets(&carets, &boundaries);
-        line.text_range = 0..(source_bytes.len() - 1) as u32;
-        line.ascent = ascent;
         let carets = CaretPositions::from_advances(&advances, carets);
-        line.caret_stops = carets.clone();
-        line.cluster_boundaries = boundaries;
-        let colors = styles
-            .iter()
-            .map(|style| (style.byte_range(), Hsla::from(rgba(style.style.color))))
-            .collect();
+        let geometry = shaping_contracts::shaped_text_run_with_carets(
+            advances,
+            boundaries,
+            carets.clone(),
+            ascent,
+        );
         let paint_bounds = GpuiTextRun::native_paint_bounds(&glyphs, &fonts, &self.text_system);
         let mut native = GpuiTextRun::new(
             glyphs,
@@ -178,11 +212,9 @@ impl GpuiTextCache {
             px(ascent),
             px(descent),
             source_bytes,
-            colors,
             carets,
         );
         native.paint_bounds = paint_bounds;
-        Rc::make_mut(&mut self.runs)[line.run.0 as usize] = Arc::new(native);
-        Ok(Some((line, advances)))
+        Some((geometry, native))
     }
 }

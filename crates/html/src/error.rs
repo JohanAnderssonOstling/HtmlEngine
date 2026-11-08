@@ -3,9 +3,8 @@
 use html_dom::InvalidRootFontSize;
 use html_parse::XmlParseError;
 use html_dom::DocumentBuildError;
-use html_pipeline::engine::LayoutConstraintError;
+use html_pipeline::engine::{LayoutConstraintError, ShapeError};
 use crate::pipeline::{PipelineError, PipelineErrorKind};
-use crate::text::ShapeError;
 use std::{error, fmt, io};
 
 #[derive(Clone, Debug)]

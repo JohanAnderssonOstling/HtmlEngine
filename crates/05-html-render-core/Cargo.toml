@@ -17,6 +17,7 @@ documentation = "https://docs.rs/skrift-render-core"
 name = "html_render_core"
 
 [dependencies]
+html-engine-model = { version = "0.1.0", package = "skrift-engine-model", path = "../html-engine-model" }
 html-pipeline = { version = "0.1.0", package = "skrift-pipeline", path = "../html-pipeline" }
 html-resources = { version = "0.1.0", package = "skrift-resources", path = "../html-resources" }
 kurbo.workspace = true
@@ -24,4 +25,3 @@ peniko.workspace = true
 
 [dev-dependencies]
 html-style-model = { package = "skrift-style-model", path = "../html-style-model" }
-html-engine-model = { package = "skrift-engine-model", path = "../html-engine-model" }

@@ -18,7 +18,7 @@ mod stages;
 #[allow(unused_imports)]
 pub(crate) use html_engine_model::{
     CapsSynthesis, ContentLanguage, FontFeatures, FontMetrics, FontRelativeMetrics,
-    FontLineMetrics, FontSlant, ObliqueAngle, GlyphHandle, GlyphId, GlyphMetric, GlyphRequest,
+    FontLineMetrics, FontSlant, ObliqueAngle, GlyphHandle, GlyphId, GlyphMetric,
     GlyphResourceCheckpoint, GlyphResourceGeneration, GlyphResourceStore, GlyphResources,
     GlyphWriter, GlyphShaper, GlyphSlice, CursiveJoining, PreparedTextRunFragment, ResourceShaper,
     RunFontMetrics, ShapeError, ShapedGlyph, ShapedRun, ShapedTextRun, ShapingStyle, TextDirection,
@@ -26,7 +26,6 @@ pub(crate) use html_engine_model::{
 };
 #[allow(unused_imports)]
 pub(crate) use html_layout::LayoutTimings;
-pub(crate) use html_engine_model::NativeResourceCheckpoint;
 #[allow(unused_imports)]
 pub(crate) use stages::{
     DetachedLayout, FormattingDocument, LaidOutDocument, LayoutConstraintError, LayoutRequest,
@@ -45,12 +44,12 @@ pub mod engine {
     #[cfg(feature = "profiling")]
     pub use html_engine_model::profiling;
     pub use html_engine_model::{
-        BoxId, CapsSynthesis, FontFeatures, CaretCursor, CaretIter, CaretPositions, CaretPositionsBuilder, ContentLanguage,
-        CornerRadii, FontMetrics, FontRelativeMetrics, FontLineMetrics, FontSlant, ObliqueAngle,
-        FontStyle, GlyphHandle, GlyphId, GlyphMetric, GlyphRequest, GlyphResourceCheckpoint,
-        GlyphResourceGeneration, GlyphResourceStore, GlyphResources, GlyphWriter, GlyphShaper,
-        GlyphSlice, CursiveJoining, LanguageTag, LineCharacterPlacement, LineId,
-        ListStylePosition, NativeResourceCheckpoint, OpenTypeFeature, OpenTypeFeatureKind,
+        BoxId, CapsSynthesis, CaretCursor, CaretIter, CaretPositions, CaretPositionsBuilder,
+        ContentLanguage, CornerRadii, CursiveJoining, FontFeatures, FontLineMetrics, FontMetrics,
+        FontRelativeMetrics, FontSlant, FontStyle, GlyphHandle, GlyphId, GlyphMetric,
+        GlyphResourceCheckpoint, GlyphResourceGeneration, GlyphResourceStore, GlyphResources,
+        GlyphShaper, GlyphSlice, GlyphWriter, LanguageTag, LineCharacterPlacement, LineId,
+        ListStylePosition, ObliqueAngle, OpenTypeFeature, OpenTypeFeatureKind,
         PreparedTextRunFragment, ReaderStyleOverrides, ResourceShaper, RunFontMetrics, ShapeError,
         ShapedGlyph, ShapedRun, ShapedTextRun, ShapingStyle, StyleStringId, TextAlign,
         TextDecorationLines, TextDirection, TextRunId, TextRunShapeRequest, ThemeAdaptation,

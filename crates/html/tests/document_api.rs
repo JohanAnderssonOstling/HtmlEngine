@@ -43,7 +43,7 @@ use crate::targets::ElementTarget;
 use crate::selection::{Selection, SelectionAnchor, SelectionInput, TableSelectionState};
 use crate::structure::{Structure, HeaderPolicy, TableGroupKind};
 use crate::text::{
-    GlyphRequest, GlyphResourceGeneration, GlyphShaper, ShapeError, FontMetrics, GlyphHandle,
+    GlyphResourceGeneration, GlyphShaper, FontMetrics, GlyphHandle, ShapedRun, TextRunShapeRequest,
     ShapedGlyph, TextSearchOptions,
 };
 use kurbo::{Point, Rect, Size, Vec2};
@@ -57,27 +57,22 @@ struct Shaper(GlyphResourceGeneration);
 
 impl GlyphShaper for Shaper {
     // Handles are character codes, so this fixture has no native append state.
-    fn begin_append_shaping(&mut self) -> Result<(), ShapeError> {
-        Ok(())
-    }
-
-    fn reset(&mut self) {
-        self.0 = GlyphResourceGeneration::default();
-    }
 
     fn resource_generation(&self) -> GlyphResourceGeneration {
         self.0
     }
 
-    fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
-        Ok(ShapedGlyph::new(
-            GlyphHandle(request.character as u32),
-            request.style.font_size / 2.0,
-            FontMetrics {
-                ascent: request.style.font_size,
-                descent: 0.0,
-            },
-        ))
+    fn shape_run(&mut self, request: TextRunShapeRequest<'_>) -> ShapedRun {
+        ShapedRun::characters(request, |character, style| {
+            ShapedGlyph::new(
+                GlyphHandle(character as u32),
+                style.font_size / 2.0,
+                FontMetrics {
+                    ascent: style.font_size,
+                    descent: 0.0,
+                },
+            )
+        })
     }
 }
 

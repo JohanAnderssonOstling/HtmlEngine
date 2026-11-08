@@ -6,7 +6,7 @@ mod tests {
 
     use html_engine_model::shaping;
 
-    use crate::{GlyphRequest, ShapedGlyph, ShapedRun};
+    use crate::{ShapedRun};
 
     use super::{
         BoxFontMetrics, FontSlant, RequiredFontMetrics, ResolvedBidi, ShapedFontMetrics,
@@ -45,16 +45,8 @@ mod tests {
                 .character_indices()
                 .filter_map(|index| content.character_at(index as usize))
                 .collect();
-            let (colors, _) =
-                span.paint_and_placement(prepared.test_styles(), prepared.layout_tree(), &metrics);
-            let colors = colors.unwrap_or_else(|| {
-                vec![
-                    span.style(prepared.test_styles(), prepared.layout_tree())
-                        .color();
-                    span.character_count()
-                ]
-            });
-            (text, colors)
+            let indices = span.character_indices().collect();
+            (text, indices)
         })
         .collect()
     }
@@ -195,8 +187,8 @@ mod tests {
             assert_eq!(format!("{empty:?}"), format!("{original:?}"), "{html}");
             for (before, after) in original.iter().zip(empty.iter()) {
                 assert_eq!(
-                    before.paint_and_placement(prepared.test_styles(), prepared.layout_tree(), &metrics),
-                    after.paint_and_placement(prepared.test_styles(), prepared.layout_tree(), &metrics)
+                    before.placement_required(prepared.test_styles(), prepared.layout_tree(), &metrics),
+                    after.placement_required(prepared.test_styles(), prepared.layout_tree(), &metrics)
                 );
             }
         }
@@ -323,8 +315,7 @@ mod tests {
         use crate::test_support::TestGlyphShaper;
         use crate::{
             GlyphResourceGeneration, GlyphResourceStore, GlyphShaper, ImageMetrics,
-            LayoutConstraints, ShapeError,
-        };
+            LayoutConstraints, };
 
         struct Shaper {
             fallback: TestGlyphShaper,
@@ -332,40 +323,26 @@ mod tests {
             run_calls: usize,
         }
         impl GlyphShaper for Shaper {
-            fn reset(&mut self) {
-                self.fallback.reset();
-                self.run_calls = 0;
-            }
             fn resource_generation(&self) -> GlyphResourceGeneration {
                 self.fallback.resource_generation()
             }
-            fn begin_append_shaping(&mut self) -> Result<(), ShapeError> {
-                self.fallback.begin_append_shaping()
-            }
-            fn commit_append_shaping(&mut self) {
-                self.fallback.commit_append_shaping();
-            }
-            fn rollback_append_shaping(&mut self) {
-                self.fallback.rollback_append_shaping();
-            }
-            fn shape_glyph(
-                &mut self,
-                request: GlyphRequest<'_>,
-            ) -> Result<ShapedGlyph, ShapeError> {
-                self.fallback.shape_glyph(request)
-            }
-            fn shape_run(
-                &mut self,
-                request: TextRunShapeRequest<'_>,
-            ) -> Result<Option<ShapedRun>, ShapeError> {
+
+            fn shape_run(&mut self, request: TextRunShapeRequest<'_>) -> ShapedRun {
                 self.run_calls += 1;
                 let size = shaping_contracts::text_run_shape_request_style(&request).font_size;
                 let ligature_boundary = shaping_contracts::text_run_shape_request_text(&request)
                     .find("fi")
-                    .map(|byte| shaping_contracts::text_run_shape_request_text(&request)[..byte].chars().count() + 1);
-                let count = shaping_contracts::text_run_shape_request_text(&request).chars().count();
+                    .map(|byte| {
+                        shaping_contracts::text_run_shape_request_text(&request)[..byte]
+                            .chars()
+                            .count()
+                            + 1
+                    });
+                let count = shaping_contracts::text_run_shape_request_text(&request)
+                    .chars()
+                    .count();
                 if !self.native {
-                    return Ok(None);
+                    return self.fallback.shape_run(request);
                 }
                 // The backend merges "fi" but leaves combining/emoji clusters
                 // too permissive, so both native and Unicode constraints matter.
@@ -373,8 +350,13 @@ mod tests {
                 if let Some(boundary) = ligature_boundary {
                     boundaries[boundary] = false;
                 }
-                Ok(Some(shaping_contracts::shaped_run_geometry(shaping_contracts::shaped_text_run_new(vec![size * 0.5; count].into(),
-                    boundaries.into(),))))
+                shaping_contracts::shaped_run_geometry(
+                    shaping_contracts::shaped_text_run_new(
+                        vec![size * 0.5; count].into(),
+                        boundaries.into(),
+                    ),
+                    self.fallback.shape_run(request),
+                )
             }
         }
 
@@ -694,69 +676,30 @@ mod tests {
     }
 
     #[test]
-    fn run_shape_request_keeps_paint_colors_out_of_style_segmentation() {
-        let style = shaping::style(16.0, 400, FontSlant::Normal, 0, None);
-        let colors = [0x112233ff, 0x445566ff];
-        let request = shaping::run("fi", style, Some(&colors));
-        assert_eq!(request.paint_colors(), Some(colors.as_slice()));
-    }
-
-    #[test]
-    fn shaping_requests_preserve_uniform_and_mixed_colors_across_bidi_splits() {
+    fn shaping_requests_ignore_paint_boundaries_and_preserve_bidi_splits() {
         use crate::test_support::TestGlyphShaper;
-        use crate::{GlyphResourceGeneration, GlyphResourceStore, GlyphShaper, ShapeError};
+        use crate::{GlyphResourceGeneration, GlyphResourceStore, GlyphShaper};
 
         struct Recorder {
             fallback: TestGlyphShaper,
-            requests: Vec<(String, u32, Option<Vec<u32>>)>,
+            requests: Vec<String>,
         }
         impl GlyphShaper for Recorder {
-            fn reset(&mut self) {
-                self.fallback.reset();
-                self.requests.clear();
-            }
             fn resource_generation(&self) -> GlyphResourceGeneration {
                 self.fallback.resource_generation()
             }
-            fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
-                self.fallback.shape_glyph(request)
-            }
-            fn shape_run(
-                &mut self,
-                request: TextRunShapeRequest<'_>,
-            ) -> Result<Option<ShapedRun>, ShapeError> {
-                self.requests.push((
-                    shaping_contracts::text_run_shape_request_text(&request).to_owned(),
-                    shaping_contracts::text_run_shape_request_style(&request).color,
-                    shaping_contracts::text_run_shape_request_paint_colors(&request).map(|colors| colors.to_vec()),
-                ));
-                Ok(None)
+
+            fn shape_run(&mut self, request: TextRunShapeRequest<'_>) -> ShapedRun {
+                self.requests
+                    .push(shaping_contracts::text_run_shape_request_text(&request).to_owned());
+                self.fallback.shape_run(request)
             }
         }
 
-        let black = 0x000000ff;
-        let red = 0xff0000ff;
         for (source, expected) in [
-            (
-                "<p style='color:#123456'>of<span>fi</span>ce</p>",
-                vec![("office".to_owned(), 0x123456ff, None)],
-            ),
-            (
-                "<p style='color:black'>of<span style='color:red'>fi</span>ce</p>",
-                vec![(
-                    "office".to_owned(),
-                    black,
-                    Some(vec![black, black, red, red, black, black]),
-                )],
-            ),
-            (
-                "<p style='color:black'>a<span style='color:red'>אב</span>b</p>",
-                vec![
-                    ("a".to_owned(), black, None),
-                    ("אב".to_owned(), black, Some(vec![red, red])),
-                    ("b".to_owned(), black, None),
-                ],
-            ),
+            ("<p style='color:#123456'>of<span>fi</span>ce</p>", vec!["office"]),
+            ("<p style='color:black'>of<span style='color:red'>fi</span>ce</p>", vec!["office"]),
+            ("<p style='color:black'>a<span style='color:red'>אב</span>b</p>", vec!["a", "אב", "b"]),
         ] {
             let prepared = DocumentFactory::new().parse_with_new_pipeline(source, None);
             let mut shaper = Recorder {
@@ -778,9 +721,9 @@ mod tests {
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].0, "office");
         assert_eq!(spans[0].1.len(), 6);
-        assert_ne!(
-            spans[0].1[1], spans[0].1[2],
-            "the shared shaping span must retain its independent paint colors"
+        assert_eq!(
+            spans[0].1[1] + 1, spans[0].1[2],
+            "the shaping span must preserve contiguous source indices"
         );
     }
 

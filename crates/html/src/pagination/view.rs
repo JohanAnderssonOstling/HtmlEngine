@@ -1,10 +1,5 @@
 //! One composed page used consistently for painting and pointer interaction.
 
-
-use html_pipeline::engine::search_queries;
-use html_pipeline::engine::fragment_paint;
-use html_pipeline::engine::export_queries;
-use html_pipeline::engine::box_queries;
 use super::PagePositions;
 use crate::document::ImageId;
 use crate::geometry::{ContentHit, Geometry};
@@ -15,13 +10,13 @@ use crate::render::{
 };
 use crate::selection::{
     SelectionController, SelectionExport, SelectionGeometry, SelectionHit, SelectionInput,
-    SelectionLayout, SelectionOutcome, SelectionPaintScratch,
+    SelectionLayout, SelectionOutcome, SelectionPaintScratch, SelectionPaintStyle,
 };
 use crate::targets::{DocumentTarget, LinkTarget, ResolvedDestination};
 use crate::search::{SourceTextMatches, TextPatternMatcher};
 use html_engine_model::page_placements;
+use html_pipeline::engine::{box_queries, export_queries, fragment_paint, search_queries};
 use kurbo::{Point, Rect, Vec2};
-use peniko::Color;
 use std::ops::Range;
 
 /// A document and the engine-produced page that places its content. Pointer
@@ -244,7 +239,7 @@ impl<'a> PageView<'a> {
         }
     }
 
-    fn placements(&self) -> impl Iterator<Item = LinePlacement> + '_ {
+    fn placements(&self) -> impl Iterator<Item = LinePlacement> + Clone + '_ {
         self.page
             .positions
             .iter()
@@ -255,7 +250,7 @@ impl<'a> PageView<'a> {
     }
 
     // Select the page column before intrinsic hit testing.
-    fn column_placements(&self, point: Point) -> impl Iterator<Item = LinePlacement> + '_ {
+    fn column_placements(&self, point: Point) -> impl Iterator<Item = LinePlacement> + Clone + '_ {
         let count = self.page.geometry.col_count as i32;
         let column = ((point.x / (self.page.geometry.col_width + self.page.geometry.col_gap))
             .floor() as i32)
@@ -499,7 +494,7 @@ impl<'a> PageView<'a> {
     pub fn paint_selection(
         &self,
         state: &SelectionController,
-        color: Color,
+        style: SelectionPaintStyle,
         painter: &mut impl Painter,
         scratch: &mut SelectionPaintScratch,
     ) {
@@ -512,7 +507,7 @@ impl<'a> PageView<'a> {
                 placements: self.placements(),
                 projection: self,
             },
-            color,
+            style,
             painter,
             scratch,
         );

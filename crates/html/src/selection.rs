@@ -22,7 +22,8 @@ mod state;
 mod controller;
 pub use controller::{
     SelectionController, SelectionExport, SelectionGeometry, SelectionHit, SelectionInput,
-    SelectionKind, SelectionLayout, SelectionOutcome, SelectionPaintScratch, SelectionUnit,
+    SelectionKind, SelectionLayout, SelectionOutcome, SelectionPaintScratch, SelectionPaintStyle,
+    SelectionUnit,
 };
 pub use state::{SelectionMode, TableHit};
 pub(crate) use state::{SelectionAnchor, SelectionState, TableCellRange, TableSelectionState};

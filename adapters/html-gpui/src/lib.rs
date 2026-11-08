@@ -33,6 +33,5 @@ pub mod backend {
     pub use crate::paint::{GpuiCommandPainter, GpuiScene, ImageCache};
     pub use crate::text::{
         configure_font_loader, FontLoadRequest, FontLoader, GpuiTextCache,
-        GpuiTextResources,
     };
 }

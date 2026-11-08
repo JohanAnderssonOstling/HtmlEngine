@@ -180,7 +180,7 @@ impl DocumentView {
         } else {
             f64::from(options.height)
         };
-        let mut painter = GpuiCommandPainter::new(&mut self.images, self.shaper.resources());
+        let mut painter = GpuiCommandPainter::new(&mut self.images);
         render_core::document_painter_paint_region(
             &DocumentPainter::new(document).with_images(decoded.decoded_images()),
             Rect::new(0.0, 0.0, f64::from(options.width), height),
