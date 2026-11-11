@@ -1,7 +1,6 @@
 //! Search within one document. Hosts choose publication scope, highlights, and
 //! whether moving the logical result cursor should change the visible region.
 
-use html_pipeline::engine::search_queries;
 use crate::layout::RenderView;
 use crate::text::TextSearchOptions;
 use std::ops::Range;
@@ -151,7 +150,7 @@ impl DocumentSearch {
         if self.query.is_empty() {
             return;
         }
-        self.ranges = search_queries::render_text_view_find_matches(view.text(), &self.query, self.options);
+        self.ranges = (view.text()).find_matches(&self.query, self.options);
         self.focus(self.current);
     }
 }

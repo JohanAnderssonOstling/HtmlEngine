@@ -3,7 +3,7 @@ use super::floats::clearance_offset;
 use super::margins::{FlowParticipation, MarginStrut, clear_matches_float_sides};
 use super::{BlockFlowInput, BlockFlowState, PreparedChild};
 use crate::layout::{BoxLayoutRequest, LayoutEngine};
-use crate::layout_model::BoxType;
+use html_engine_model::BoxType;
 use html_style_model::{Float, PositionMode, TextDirection};
 use kurbo::Vec2;
 
@@ -41,6 +41,7 @@ pub(super) fn prepare_child(
     );
     let mut profile =
         engine
+            .scratch
             .margins
             .margin_profile(&engine.reader, child_idx, input.available_width);
     let child_style = engine.reader.style(child_idx);
@@ -62,7 +63,7 @@ pub(super) fn prepare_child(
         && leading_clear != html_style_model::Clear::None
     {
         let leading_clearance = clearance_offset(
-            &engine.floats,
+            &engine.scratch.floats,
             input.position.y,
             flow.y_offset,
             flow.pending_margin,
@@ -97,6 +98,7 @@ pub(super) fn prepare_child(
     // the real containing width before allowing its margin to escape
     // through the wrapper.
     let has_active_float = engine
+        .scratch
         .floats
         .current_float_context()
         .is_some_and(|context| !context.is_empty());
@@ -131,7 +133,7 @@ pub(super) fn prepare_child(
             profile.before
         };
     let cleared_offset = clearance_offset(
-        &engine.floats,
+        &engine.scratch.floats,
         input.position.y,
         flow.y_offset,
         flow.pending_margin,

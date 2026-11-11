@@ -13,8 +13,8 @@ use web_time::Instant;
 /// evaluates its media conditions and cascade order for each environment.
 pub(crate) fn default_stylesheet(
     timings: &mut StyleTimings,
-) -> &'static PreparedStylesheetFragment<'static> {
-    static STYLESHEET: OnceLock<PreparedStylesheetFragment<'static>> = OnceLock::new();
+) -> &'static Arc<PreparedStylesheetFragment<'static>> {
+    static STYLESHEET: OnceLock<Arc<PreparedStylesheetFragment<'static>>> = OnceLock::new();
     STYLESHEET.get_or_init(|| {
         let started = Instant::now();
         let stylesheet = StyleSheet::parse(DEFAULT_CSS, ParserOptions::default())
@@ -22,7 +22,7 @@ pub(crate) fn default_stylesheet(
             .into_owned();
         let fragment = PreparedStylesheetFragment::compile(stylesheet);
         timings.parse_default_css = started.elapsed();
-        fragment
+        Arc::new(fragment)
     })
 }
 

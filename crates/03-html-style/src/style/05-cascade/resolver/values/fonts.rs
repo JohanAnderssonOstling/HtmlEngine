@@ -1,122 +1,5 @@
-use html_style_model::open_type;
-use super::super::context::ResolutionContext;
-use super::lengths::{calc_box_length_percentage_components, length_percentage_to_px};
-use html_style_model::{Font, OpenTypeFeature, OpenTypeFeatureKind};
-use lightningcss::properties::font::{AbsoluteFontWeight, FontSize, FontWeight};
-use lightningcss::values::length::LengthValue;
-
-fn font_size_to_px(
-    size: &FontSize,
-    parent_font_size: f32,
-    root_font_size: f32,
-    resolution: &mut ResolutionContext,
-) -> Option<f32> {
-    match size {
-        FontSize::Length(lp) => {
-            length_percentage_to_px(lp, parent_font_size, root_font_size, resolution)
-        }
-        FontSize::Absolute(abs) => Some({
-            use lightningcss::properties::font::AbsoluteFontSize;
-            match abs {
-                AbsoluteFontSize::XXSmall => 9.0,
-                AbsoluteFontSize::XSmall => 10.0,
-                AbsoluteFontSize::Small => 13.0,
-                AbsoluteFontSize::Medium => 16.0,
-                AbsoluteFontSize::Large => 18.0,
-                AbsoluteFontSize::XLarge => 24.0,
-                AbsoluteFontSize::XXLarge => 32.0,
-                AbsoluteFontSize::XXXLarge => 48.0,
-            }
-        }),
-        FontSize::Relative(rel) => Some({
-            use lightningcss::properties::font::RelativeFontSize;
-            match rel {
-                RelativeFontSize::Smaller => parent_font_size * 0.833,
-                RelativeFontSize::Larger => parent_font_size * 1.2,
-            }
-        }),
-    }
-}
-
-/// Coefficients for px, ex, ch, cap, rch, rcap, and rlh, in that order.
-pub(in crate::style::cascade::resolver) fn checked_font_size_components(
-    size: &FontSize,
-    inherited_font: &Font,
-    parent_font_size: f32,
-    root_font_size: f32,
-    resolution: &mut ResolutionContext,
-) -> Option<[f32; 7]> {
-    use FontSize::Length;
-    use LengthValue::{Cap, Rcap, Rch, Rlh};
-    use lightningcss::values::percentage::DimensionPercentage::{Calc, Dimension};
-
-    let scale = resolution.font_size_scale;
-    let mut result = resolution.with_canonical_font_sizes(|resolution| {
-        let inherited_font_size = inherited_font.font_size / scale;
-        let parent_font_size = parent_font_size / scale;
-        let root_font_size = root_font_size / scale;
-        match size {
-            Length(Dimension(Cap(value))) if value.is_finite() && *value >= 0.0 => {
-                Some([0.0, 0.0, 0.0, *value * inherited_font_size, 0.0, 0.0, 0.0])
-            }
-            Length(Dimension(Rch(value))) if value.is_finite() && *value >= 0.0 => {
-                Some([0.0, 0.0, 0.0, 0.0, *value, 0.0, 0.0])
-            }
-            Length(Dimension(Rcap(value))) if value.is_finite() && *value >= 0.0 => {
-                Some([0.0, 0.0, 0.0, 0.0, 0.0, *value, 0.0])
-            }
-            Length(Dimension(Rlh(value))) if value.is_finite() && *value >= 0.0 => {
-                Some([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, *value])
-            }
-            Length(Calc(calc)) => {
-                let [
-                    absolute_px,
-                    percentage,
-                    x_height_px,
-                    ch_advance_px,
-                    cap_height_px,
-                ] = calc_box_length_percentage_components(
-                    calc,
-                    inherited_font_size,
-                    root_font_size,
-                    resolution,
-                )?;
-                let absolute_px = absolute_px + percentage * parent_font_size;
-                let absolute_px =
-                    if x_height_px == 0.0 && ch_advance_px == 0.0 && cap_height_px == 0.0 {
-                        absolute_px.max(0.0)
-                    } else {
-                        absolute_px
-                    };
-                (absolute_px.is_finite()
-                    && absolute_px >= 0.0
-                    && x_height_px.is_finite()
-                    && ch_advance_px.is_finite()
-                    && cap_height_px.is_finite())
-                .then_some([
-                    absolute_px,
-                    x_height_px,
-                    ch_advance_px,
-                    cap_height_px,
-                    0.0,
-                    0.0,
-                    0.0,
-                ])
-            }
-            _ => font_size_to_px(size, parent_font_size, root_font_size, resolution)
-                .filter(|value| value.is_finite())
-                .map(|value| [value.max(0.0), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-        }
-    })?;
-    // Root metric coefficients already consume the scaled root font at layout.
-    for value in &mut result[..4] {
-        *value *= scale;
-    }
-    result[..4]
-        .iter()
-        .all(|value| value.is_finite())
-        .then_some(result)
-}
+use html_style_model::{OpenTypeFeature, OpenTypeFeatureKind, open_type};
+use lightningcss::properties::font::{AbsoluteFontWeight, FontWeight};
 
 pub(in crate::style::cascade::resolver) fn checked_font_weight(
     weight: &FontWeight,
@@ -165,20 +48,31 @@ pub(in crate::style::cascade::resolver) fn font_variant_caps_features(
     use lightningcss::properties::font::FontVariantCaps;
     match value {
         FontVariantCaps::Normal => Vec::new(),
-        FontVariantCaps::SmallCaps => vec![open_type::open_type_feature_new(OpenTypeFeatureKind::SmallCaps, 1)],
+        FontVariantCaps::SmallCaps => vec![open_type::open_type_feature_new(
+            OpenTypeFeatureKind::SmallCaps,
+            1,
+        )],
         FontVariantCaps::AllSmallCaps => vec![
             open_type::open_type_feature_new(OpenTypeFeatureKind::SmallCaps, 1),
             open_type::open_type_feature_new(OpenTypeFeatureKind::CapitalsToSmallCaps, 1),
         ],
         FontVariantCaps::PetiteCaps => {
-            vec![open_type::open_type_feature_new(OpenTypeFeatureKind::PetiteCaps, 1)]
+            vec![open_type::open_type_feature_new(
+                OpenTypeFeatureKind::PetiteCaps,
+                1,
+            )]
         }
         FontVariantCaps::AllPetiteCaps => vec![
             open_type::open_type_feature_new(OpenTypeFeatureKind::PetiteCaps, 1),
             open_type::open_type_feature_new(OpenTypeFeatureKind::CapitalsToPetiteCaps, 1),
         ],
-        FontVariantCaps::Unicase => vec![open_type::open_type_feature_new(OpenTypeFeatureKind::Unicase, 1)],
-        FontVariantCaps::TitlingCaps => vec![open_type::open_type_feature_new(OpenTypeFeatureKind::TitlingCapitals,
-            1,)],
+        FontVariantCaps::Unicase => vec![open_type::open_type_feature_new(
+            OpenTypeFeatureKind::Unicase,
+            1,
+        )],
+        FontVariantCaps::TitlingCaps => vec![open_type::open_type_feature_new(
+            OpenTypeFeatureKind::TitlingCapitals,
+            1,
+        )],
     }
 }

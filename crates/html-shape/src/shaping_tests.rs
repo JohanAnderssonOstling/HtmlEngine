@@ -1,12 +1,10 @@
 #[cfg(test)]
-use html_engine_model::shaping_contracts;
 #[cfg(test)]
 mod tests {
-    use html_pipeline::engine::text_paint;
 
     use html_engine_model::shaping;
 
-    use crate::{GlyphRequest, ShapedGlyph, ShapedRun};
+    use crate::{ShapedRun};
 
     use super::{
         BoxFontMetrics, FontSlant, RequiredFontMetrics, ResolvedBidi, ShapedFontMetrics,
@@ -39,22 +37,14 @@ mod tests {
             &metrics,
             &ResolvedBidi::new(prepared.test_styles(), prepared.layout_tree(), &content),
         )
-        .into_iter()
+        .iter()
         .map(|span| {
             let text = span
                 .character_indices()
                 .filter_map(|index| content.character_at(index as usize))
                 .collect();
-            let (colors, _) =
-                span.paint_and_placement(prepared.test_styles(), prepared.layout_tree(), &metrics);
-            let colors = colors.unwrap_or_else(|| {
-                vec![
-                    span.style(prepared.test_styles(), prepared.layout_tree())
-                        .color();
-                    span.character_count()
-                ]
-            });
-            (text, colors)
+            let indices = span.character_indices().collect();
+            (text, indices)
         })
         .collect()
     }
@@ -195,8 +185,8 @@ mod tests {
             assert_eq!(format!("{empty:?}"), format!("{original:?}"), "{html}");
             for (before, after) in original.iter().zip(empty.iter()) {
                 assert_eq!(
-                    before.paint_and_placement(prepared.test_styles(), prepared.layout_tree(), &metrics),
-                    after.paint_and_placement(prepared.test_styles(), prepared.layout_tree(), &metrics)
+                    before.placement_required(prepared.test_styles(), prepared.layout_tree(), &metrics),
+                    after.placement_required(prepared.test_styles(), prepared.layout_tree(), &metrics)
                 );
             }
         }
@@ -312,10 +302,9 @@ mod tests {
 
     #[test]
     fn native_ascii_boundaries_preserve_crlf_and_ligatures() {
-        let mut run = shaping_contracts::shaped_text_run_new(Arc::from([4.0; 4]),
-            Arc::from([true, false, true, true, true]),);
+        let mut run = ShapedTextRun::new(Arc::from([4.0; 4]), Arc::from([true, false, true, true, true]));
         shaping::preserve_graphemes(&mut run, "fi\r\n");
-        assert_eq!(shaping_contracts::shaped_text_run_cluster_boundaries(&run), &[true, false, true, false, true]);
+        assert_eq!(run.cluster_boundaries(), &[true, false, true, false, true]);
     }
 
     #[test]
@@ -323,8 +312,7 @@ mod tests {
         use crate::test_support::TestGlyphShaper;
         use crate::{
             GlyphResourceGeneration, GlyphResourceStore, GlyphShaper, ImageMetrics,
-            LayoutConstraints, ShapeError,
-        };
+            LayoutConstraints};
 
         struct Shaper {
             fallback: TestGlyphShaper,
@@ -332,40 +320,26 @@ mod tests {
             run_calls: usize,
         }
         impl GlyphShaper for Shaper {
-            fn reset(&mut self) {
-                self.fallback.reset();
-                self.run_calls = 0;
-            }
             fn resource_generation(&self) -> GlyphResourceGeneration {
                 self.fallback.resource_generation()
             }
-            fn begin_append_shaping(&mut self) -> Result<(), ShapeError> {
-                self.fallback.begin_append_shaping()
-            }
-            fn commit_append_shaping(&mut self) {
-                self.fallback.commit_append_shaping();
-            }
-            fn rollback_append_shaping(&mut self) {
-                self.fallback.rollback_append_shaping();
-            }
-            fn shape_glyph(
-                &mut self,
-                request: GlyphRequest<'_>,
-            ) -> Result<ShapedGlyph, ShapeError> {
-                self.fallback.shape_glyph(request)
-            }
-            fn shape_run(
-                &mut self,
-                request: TextRunShapeRequest<'_>,
-            ) -> Result<Option<ShapedRun>, ShapeError> {
+
+            fn shape_run(&mut self, request: TextRunShapeRequest<'_>) -> ShapedRun {
                 self.run_calls += 1;
-                let size = shaping_contracts::text_run_shape_request_style(&request).font_size;
-                let ligature_boundary = shaping_contracts::text_run_shape_request_text(&request)
+                let size = request.style().font_size;
+                let ligature_boundary = request.text()
                     .find("fi")
-                    .map(|byte| shaping_contracts::text_run_shape_request_text(&request)[..byte].chars().count() + 1);
-                let count = shaping_contracts::text_run_shape_request_text(&request).chars().count();
+                    .map(|byte| {
+                        request.text()[..byte]
+                            .chars()
+                            .count()
+                            + 1
+                    });
+                let count = request.text()
+                    .chars()
+                    .count();
                 if !self.native {
-                    return Ok(None);
+                    return self.fallback.shape_run(request);
                 }
                 // The backend merges "fi" but leaves combining/emoji clusters
                 // too permissive, so both native and Unicode constraints matter.
@@ -373,8 +347,7 @@ mod tests {
                 if let Some(boundary) = ligature_boundary {
                     boundaries[boundary] = false;
                 }
-                Ok(Some(shaping_contracts::shaped_run_geometry(shaping_contracts::shaped_text_run_new(vec![size * 0.5; count].into(),
-                    boundaries.into(),))))
+                (self.fallback.shape_run(request)).with_geometry(ShapedTextRun::new(vec![size * 0.5; count].into(), boundaries.into()))
             }
         }
 
@@ -432,7 +405,7 @@ mod tests {
                 assert_eq!(text.glyph_count(), expected.len() - 1);
                 for (index, expected) in expected.into_iter().enumerate() {
                     assert_eq!(
-                        text_paint::is_character_cluster_boundary(text, index as u32),
+                        text.is_character_cluster_boundary(index as u32),
                         expected,
                         "boundary {index}, native={native}, first_line={first_line}"
                     );
@@ -521,11 +494,11 @@ mod tests {
     #[test]
     fn geometry_change_detection_uses_cumulative_caret_deltas() {
         let mut geometry = ShapedTextGeometry::with_len(200);
-        let initial = shaping_contracts::shaped_text_run_new(Arc::from(vec![1.0; 200]), Arc::from(vec![true; 201]));
+        let initial = ShapedTextRun::new(Arc::from(vec![1.0; 200]), Arc::from(vec![true; 201]));
         assert!(geometry.update_range(0..200, &initial));
 
         let sub_epsilon_per_character =
-            shaping_contracts::shaped_text_run_new(Arc::from(vec![1.009; 200]), Arc::from(vec![true; 201]));
+            ShapedTextRun::new(Arc::from(vec![1.009; 200]), Arc::from(vec![true; 201]));
         assert!(
             geometry.update_range(0..200, &sub_epsilon_per_character),
             "small scalar changes that accumulate across a line must trigger relayout"
@@ -535,11 +508,7 @@ mod tests {
     #[test]
     fn shared_geometry_memory_counts_each_retained_allocation_once() {
         let run = || {
-            shaping_contracts::shaped_text_run_with_backend_run(Arc::from([2.0, 3.0]),
-                Arc::from([true; 3]),
-                TextRunId(7),
-                [0.0, 2.0, 5.0].into(),
-                8.0,)
+            ShapedTextRun::with_backend_run(Arc::from([2.0, 3.0]), Arc::from([true; 3]), TextRunId(7), [0.0, 2.0, 5.0].into(), 8.0)
         };
         let geometry = |shared: bool| {
             let first = run();
@@ -574,13 +543,13 @@ mod tests {
                 .collect::<Arc<[f32]>>();
             let mut clusters = vec![true; indices.len() + 1];
             clusters[1..indices.len()].fill(false);
-            let shaped = shaping_contracts::shaped_text_run_new(widths, Arc::from(clusters));
+            let shaped = ShapedTextRun::new(widths, Arc::from(clusters));
             for (offset, &index) in indices.iter().enumerate() {
-                advances[index as usize] = shaping_contracts::shaped_text_run_advances(&shaped)[offset];
-                boundaries[index as usize] &= shaping_contracts::shaped_text_run_cluster_boundaries(&shaped)[offset];
+                advances[index as usize] = shaped.advances()[offset];
+                boundaries[index as usize] &= shaped.cluster_boundaries()[offset];
             }
             boundaries[*indices.last().unwrap() as usize + 1] &=
-                shaping_contracts::shaped_text_run_cluster_boundaries(&shaped)[indices.len()];
+                shaped.cluster_boundaries()[indices.len()];
             geometry.push_run(&indices, shaped, false);
         }
         geometry.finish_runs();
@@ -627,10 +596,10 @@ mod tests {
             if count > 1 {
                 clusters[1] = false;
             }
-            let shaped = shaping_contracts::shaped_text_run_new(Arc::from(vec![7.5; count]), Arc::from(clusters));
-            advances[range.start as usize..range.end as usize].copy_from_slice(shaping_contracts::shaped_text_run_advances(&shaped));
+            let shaped = ShapedTextRun::new(Arc::from(vec![7.5; count]), Arc::from(clusters));
+            advances[range.start as usize..range.end as usize].copy_from_slice(shaped.advances());
             boundaries[range.start as usize..=range.end as usize]
-                .copy_from_slice(shaping_contracts::shaped_text_run_cluster_boundaries(&shaped));
+                .copy_from_slice(shaped.cluster_boundaries());
             geometry.replace_range(range, shaped, false);
             check(&geometry, &advances, &boundaries);
         }
@@ -672,7 +641,7 @@ mod tests {
                 .collect::<Arc<[f32]>>();
             base.push_run(
                 &indices,
-                shaping_contracts::shaped_text_run_new(advances, boundaries.into()),
+                ShapedTextRun::new(advances, boundaries.into()),
                 false,
             );
         }
@@ -686,7 +655,7 @@ mod tests {
             boundaries[1..length].fill(false);
             refined.replace_range(
                 range,
-                shaping_contracts::shaped_text_run_new(vec![7.5; length].into(), boundaries.into()),
+                ShapedTextRun::new(vec![7.5; length].into(), boundaries.into()),
                 false,
             );
             assert_cursor(TextGeometryView::new(&base, Some(&refined)));
@@ -694,69 +663,30 @@ mod tests {
     }
 
     #[test]
-    fn run_shape_request_keeps_paint_colors_out_of_style_segmentation() {
-        let style = shaping::style(16.0, 400, FontSlant::Normal, 0, None);
-        let colors = [0x112233ff, 0x445566ff];
-        let request = shaping::run("fi", style, Some(&colors));
-        assert_eq!(request.paint_colors(), Some(colors.as_slice()));
-    }
-
-    #[test]
-    fn shaping_requests_preserve_uniform_and_mixed_colors_across_bidi_splits() {
+    fn shaping_requests_ignore_paint_boundaries_and_preserve_bidi_splits() {
         use crate::test_support::TestGlyphShaper;
-        use crate::{GlyphResourceGeneration, GlyphResourceStore, GlyphShaper, ShapeError};
+        use crate::{GlyphResourceGeneration, GlyphResourceStore, GlyphShaper};
 
         struct Recorder {
             fallback: TestGlyphShaper,
-            requests: Vec<(String, u32, Option<Vec<u32>>)>,
+            requests: Vec<String>,
         }
         impl GlyphShaper for Recorder {
-            fn reset(&mut self) {
-                self.fallback.reset();
-                self.requests.clear();
-            }
             fn resource_generation(&self) -> GlyphResourceGeneration {
                 self.fallback.resource_generation()
             }
-            fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
-                self.fallback.shape_glyph(request)
-            }
-            fn shape_run(
-                &mut self,
-                request: TextRunShapeRequest<'_>,
-            ) -> Result<Option<ShapedRun>, ShapeError> {
-                self.requests.push((
-                    shaping_contracts::text_run_shape_request_text(&request).to_owned(),
-                    shaping_contracts::text_run_shape_request_style(&request).color,
-                    shaping_contracts::text_run_shape_request_paint_colors(&request).map(|colors| colors.to_vec()),
-                ));
-                Ok(None)
+
+            fn shape_run(&mut self, request: TextRunShapeRequest<'_>) -> ShapedRun {
+                self.requests
+                    .push(request.text().to_owned());
+                self.fallback.shape_run(request)
             }
         }
 
-        let black = 0x000000ff;
-        let red = 0xff0000ff;
         for (source, expected) in [
-            (
-                "<p style='color:#123456'>of<span>fi</span>ce</p>",
-                vec![("office".to_owned(), 0x123456ff, None)],
-            ),
-            (
-                "<p style='color:black'>of<span style='color:red'>fi</span>ce</p>",
-                vec![(
-                    "office".to_owned(),
-                    black,
-                    Some(vec![black, black, red, red, black, black]),
-                )],
-            ),
-            (
-                "<p style='color:black'>a<span style='color:red'>אב</span>b</p>",
-                vec![
-                    ("a".to_owned(), black, None),
-                    ("אב".to_owned(), black, Some(vec![red, red])),
-                    ("b".to_owned(), black, None),
-                ],
-            ),
+            ("<p style='color:#123456'>of<span>fi</span>ce</p>", vec!["office"]),
+            ("<p style='color:black'>of<span style='color:red'>fi</span>ce</p>", vec!["office"]),
+            ("<p style='color:black'>a<span style='color:red'>אב</span>b</p>", vec!["a", "אב", "b"]),
         ] {
             let prepared = DocumentFactory::new().parse_with_new_pipeline(source, None);
             let mut shaper = Recorder {
@@ -778,9 +708,9 @@ mod tests {
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].0, "office");
         assert_eq!(spans[0].1.len(), 6);
-        assert_ne!(
-            spans[0].1[1], spans[0].1[2],
-            "the shared shaping span must retain its independent paint colors"
+        assert_eq!(
+            spans[0].1[1] + 1, spans[0].1[2],
+            "the shaping span must preserve contiguous source indices"
         );
     }
 

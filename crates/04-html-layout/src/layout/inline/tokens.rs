@@ -8,11 +8,10 @@ use super::justification::{SpaceGlueClass, classify_space};
 use super::storage::{TokenBuffer, WidthBuffer};
 use super::wrapping::KpPlan;
 use super::*;
-use crate::layout::LayoutEngine;
 use crate::layout::inline_reader::TextCursor;
-use crate::layout_model::WhitespaceWrapOverride;
-use html_engine_model::GlyphId;
-use html_text::{is_mandatory_line_break, is_word_separator, suppresses_glyph, tracking_boundary_allowed};
+use html_engine_model::{GlyphId, WhitespaceWrapOverride};
+use html_text::{
+    is_mandatory_line_break, is_word_separator, suppresses_glyph, tracking_boundary_allowed};
 use std::mem::{discriminant, size_of};
 use unicode_bidi::UNICODE_VERSION;
 
@@ -80,6 +79,7 @@ pub(super) fn vertical_align_offset(
         baseline,
         ascent,
         descent,
+        f64::from(metrics.font_size) * 0.5,
     )
 }
 
@@ -94,8 +94,8 @@ pub(super) fn vertical_align_metrics_offset(
     baseline: f64,
     parent_font_ascent: f64,
     parent_font_descent: f64,
+    parent_x_height: f64,
 ) -> f64 {
-    let middle = baseline - ascent + (ascent + descent - line_height) / 2.0;
     match value {
         VerticalAlignValue::Baseline => 0.0,
         VerticalAlignValue::Super => font_size * 0.5,
@@ -115,7 +115,9 @@ pub(super) fn vertical_align_metrics_offset(
         // parent font. They must not follow growth of the final line box.
         VerticalAlignValue::TextTop => parent_font_ascent - ascent - half_leading,
         VerticalAlignValue::TextBottom => descent + half_leading - parent_font_descent,
-        VerticalAlignValue::Middle => middle,
+        // Align the margin-box midpoint with the parent baseline plus half
+        // its x-height. This must not depend on the evolving line box.
+        VerticalAlignValue::Middle => (descent - ascent + parent_x_height) * 0.5,
     }
 }
 
@@ -142,21 +144,21 @@ pub(in crate::layout) fn indent_for_line(
 /// cell's own value aligns the cell within its row; it must not also shift the
 /// cell's text inside the line box.  A real inline owner, on the other hand,
 /// contributes its authored alignment to the complete inline subtree.
-pub(super) fn text_vertical_align(doc: &LayoutEngine, box_idx: usize) -> VerticalAlignValue {
-    if doc.reader.is_inline_box(box_idx) {
-        doc.reader.style(box_idx).vertical_align()
+pub(super) fn text_vertical_align(doc: &LayoutReader<'_>, box_idx: usize) -> VerticalAlignValue {
+    if doc.is_inline_box(box_idx) {
+        doc.style(box_idx).vertical_align()
     } else {
         VerticalAlignValue::Baseline
     }
 }
 
-pub(super) fn has_aligned_inline_ancestor(doc: &LayoutEngine, box_idx: usize) -> bool {
+pub(super) fn has_aligned_inline_ancestor(doc: &LayoutReader<'_>, box_idx: usize) -> bool {
     // Source text is wrapped by a conceptual anonymous inline box. Its own
     // non-inherited `vertical-align` is therefore `baseline`; alignment on
     // the element owning the text is movement of the enclosing box.
     let mut current = Some(box_idx);
     while let Some(ancestor_idx) = current {
-        let ancestor_style = doc.reader.style(ancestor_idx);
+        let ancestor_style = doc.style(ancestor_idx);
         if ancestor_style.display() != html_style_model::Display::Inline {
             break;
         }
@@ -165,7 +167,7 @@ pub(super) fn has_aligned_inline_ancestor(doc: &LayoutEngine, box_idx: usize) ->
         {
             return true;
         }
-        current = doc.reader.get_parent(ancestor_idx);
+        current = doc.get_parent(ancestor_idx);
     }
     false
 }
@@ -702,7 +704,7 @@ pub(super) enum InlineTokenKind {
         glyph_idx: u32,
     },
     Ellipsis {
-        glyph: crate::GlyphId,
+        glyph: GlyphId,
     },
     Image {
         payload_idx: u32,
@@ -723,7 +725,7 @@ pub(super) enum InlineTokenKind {
         payload_idx: u32,
     },
     Discretionary {
-        glyph: crate::GlyphId,
+        glyph: GlyphId,
     },
     /// A zero-width soft wrapping opportunity after an atomic inline box.
     /// It uses discretionary break metadata, but unlike a discretionary
@@ -953,6 +955,16 @@ impl PreparedTokenFeatures {
     const NO_BIDI_GLYPH_SEPARATORS: u8 = 1 << 1;
     const HAS_BREAKS: u8 = 1 << 2;
     const DEFERRED_HYPHENATION: u8 = 1 << 3;
+    // Construction-only fact; summary rebuilding clears it after expansion.
+    const HAS_UNICODE_BREAKS: u8 = 1 << 4;
+
+    pub(super) fn has_unicode_breaks(self) -> bool {
+        self.flags & Self::HAS_UNICODE_BREAKS != 0
+    }
+
+    pub(super) fn record_unicode_break(&mut self) {
+        self.flags |= Self::HAS_UNICODE_BREAKS;
+    }
 
     pub(super) fn deferred_hyphenation(self) -> bool {
         self.flags & Self::DEFERRED_HYPHENATION != 0
@@ -1009,6 +1021,7 @@ pub(super) struct InlineTokens<'a> {
 }
 
 impl<'a> InlineTokens<'a> {
+
     pub(super) fn span(&self) -> TokenSpan<'_> {
         if self.compact_defaults.is_some() {
             TokenSpan::Compact {
@@ -1059,10 +1072,9 @@ impl<'a> InlineTokens<'a> {
         self.metrics_ranges.clear();
     }
 
-    fn classify_compact_space_glue(&mut self, engine: &LayoutEngine<'_, '_>) {
-        profile_scope!("tokens.classify_glue");
+    fn classify_compact_space_glue(&mut self, inputs: &TextPreparationInputs<'_>) {
         fn context(
-            engine: &LayoutEngine<'_, '_>,
+            inputs: &TextPreparationInputs<'_>,
             headers: &[u32],
             mut index: usize,
             direction: isize,
@@ -1071,7 +1083,7 @@ impl<'a> InlineTokens<'a> {
                 index = index.checked_add_signed(direction)?;
                 match TokenMetadata::from_compact_with_bidi(*headers.get(index)?, 0).kind() {
                     InlineTokenKind::Glyph { glyph_idx } => {
-                        return Some(engine.text.character(glyph_idx));
+                        return Some(inputs.text.character(glyph_idx));
                     }
                     InlineTokenKind::Opportunity => {}
                     _ => return None,
@@ -1083,8 +1095,8 @@ impl<'a> InlineTokens<'a> {
             if !TokenMetadata::from_compact_with_bidi(headers[index], 0).is_space() {
                 continue;
             }
-            let previous = context(engine, headers, index, -1);
-            let next = context(engine, headers, index, 1);
+            let previous = context(inputs, headers, index, -1);
+            let next = context(inputs, headers, index, 1);
             let class = classify_space(previous, next);
             // Direct construction contains ordinary glyph spaces, whose five
             // glue classes occupy tags 10..14 in the low metadata word.
@@ -1094,7 +1106,6 @@ impl<'a> InlineTokens<'a> {
     }
 
     fn rebuild_direct_summary_blocks(&mut self) {
-        profile_scope!("tokens.summary_blocks");
         if self.metadata.is_empty() {
             self.compact_defaults = None;
             self.rebuild_summary_blocks();
@@ -1109,7 +1120,7 @@ impl<'a> InlineTokens<'a> {
         self.finish_compact_metrics();
         // Eligibility excludes preserved spaces and transparent non-text
         // tokens. Edge trimming therefore reads only contiguous metadata;
-        // neither direction needs glyph or metrics lookups.
+        // neither direction needs glyph or metrics lookup(s).
         let soft = |header: &u32| {
             TokenMetadata::from_compact_with_bidi(*header, 0).break_kind() == BreakKind::Soft
         };
@@ -1399,19 +1410,16 @@ impl<'a> InlineTokens<'a> {
 
     /// Resolve synthetic object opportunities against their actual logical
     /// neighbours, including styles outside transparent inline wrappers.
-    fn resolve_atomic_break_opportunities(&mut self, engine: &LayoutEngine<'_, '_>) {
+    fn resolve_atomic_break_opportunities(&mut self, inputs: &TextPreparationInputs<'_>) {
         let atomic = |token: InlineToken| {
             matches!(
                 token.kind(),
                 InlineTokenKind::Image { .. } | InlineTokenKind::AtomicBox { .. }
             )
         };
-        if !self.dense.iter().copied().any(atomic) {
-            return;
-        }
         let neighbour = |token: InlineToken| {
             let character = match token.kind() {
-                InlineTokenKind::Glyph { glyph_idx } => engine.text.character(glyph_idx),
+                InlineTokenKind::Glyph { glyph_idx } => inputs.text.character(glyph_idx),
                 InlineTokenKind::Image { .. } | InlineTokenKind::AtomicBox { .. } => '\u{fffc}',
                 InlineTokenKind::Break { .. } => '\n',
                 _ => return None,
@@ -1441,8 +1449,8 @@ impl<'a> InlineTokens<'a> {
                             left.1 != '\n'
                                 && right.1 != '\n'
                                 && html_text::atomic_boundary_wraps(
-                                    engine.reader.styles(),
-                                    engine.reader.layout_tree(),
+                                    inputs.reader.styles(),
+                                    inputs.reader.layout_tree(),
                                     left,
                                     right,
                                 )
@@ -1465,7 +1473,6 @@ impl<'a> InlineTokens<'a> {
     /// inline boundaries retain their geometry while adjacent collapsible
     /// spaces lose their advance. Only affected summary blocks are rebuilt.
     pub(super) fn rebuild_summary_blocks(&mut self) {
-        profile_scope!("tokens.summary_blocks");
         let transparent_boundary = |token: &InlineToken| {
             matches!(
                 token.kind(),
@@ -1585,17 +1592,19 @@ impl<'a> InlineTokens<'a> {
     /// Stores the local punctuation context on each ordinary space. The token
     /// owns only this compact semantic classification; both Knuth--Plass and
     /// final placement resolve it through the shared glue policy.
-    fn classify_space_glue(&mut self, engine: &LayoutEngine<'_, '_>) {
-        profile_scope!("tokens.classify_glue");
-        fn glyph_character(engine: &LayoutEngine<'_, '_>, token: &InlineToken) -> Option<char> {
+    fn classify_space_glue(&mut self, inputs: &TextPreparationInputs<'_>) {
+        fn glyph_character(
+            inputs: &TextPreparationInputs<'_>,
+            token: &InlineToken,
+        ) -> Option<char> {
             let InlineTokenKind::Glyph { glyph_idx } = token.kind() else {
                 return None;
             };
-            Some(engine.text.character(glyph_idx))
+            Some(inputs.text.character(glyph_idx))
         }
 
         fn context_character(
-            engine: &LayoutEngine<'_, '_>,
+            inputs: &TextPreparationInputs<'_>,
             tokens: &[InlineToken],
             mut index: usize,
             direction: isize,
@@ -1603,7 +1612,7 @@ impl<'a> InlineTokens<'a> {
             loop {
                 index = index.checked_add_signed(direction)?;
                 let token = tokens.get(index)?;
-                if let Some(character) = glyph_character(engine, token) {
+                if let Some(character) = glyph_character(inputs, token) {
                     return Some(character);
                 }
                 match token.kind() {
@@ -1623,22 +1632,22 @@ impl<'a> InlineTokens<'a> {
             }
             // Glue classes preserve token kinds and glyph identities, so
             // later spaces still observe the same neighboring characters.
-            let previous = context_character(engine, dense, index, -1);
-            let next = context_character(engine, dense, index, 1);
+            let previous = context_character(inputs, dense, index, -1);
+            let next = context_character(inputs, dense, index, 1);
             dense[index].set_space_glue_class(classify_space(previous, next));
         }
     }
 
     /// Expand only Unicode paragraphs into the already-supported opportunity
     /// tokens. The ordinary Latin line-selection loops remain unchanged.
-    fn insert_unicode_break_opportunities(&mut self, engine: &LayoutEngine<'_, '_>) {
-        profile_scope!("tokens.unicode_breaks");
+    fn insert_unicode_break_opportunities(&mut self, inputs: &TextPreparationInputs<'_>) {
         let allow = |token: &InlineToken| match token.kind() {
-            InlineTokenKind::Glyph { glyph_idx } =>
-                engine.text.whitespace_wrap_before(glyph_idx as usize) == WhitespaceWrapOverride::UnicodeAllow,
+            InlineTokenKind::Glyph { glyph_idx } => {
+                inputs.text.whitespace_wrap_before(glyph_idx as usize)
+                    == WhitespaceWrapOverride::UnicodeAllow
+            }
             _ => false,
         };
-        if !self.dense.iter().any(allow) { return; }
         let dense = self.dense.make_mut();
         let mut expanded: Vec<InlineToken> = Vec::with_capacity(dense.len());
         for mut token in dense.iter().copied() {
@@ -1672,11 +1681,7 @@ impl<'a> InlineTokens<'a> {
     /// `break-spaces` breaks after every preserved space. A normal soft token
     /// represents a break before discardable whitespace, so use explicit
     /// zero-width opportunities for these after-space rules.
-    fn insert_preserved_space_break_opportunities(&mut self, engine: &LayoutEngine<'_, '_>) {
-        profile_scope!("tokens.preserved_space_breaks");
-        if !self.runs.iter().any(|run| matches!(run.white_space, WhiteSpace::PreWrap | WhiteSpace::BreakSpaces)) {
-            return;
-        }
+    fn insert_preserved_space_break_opportunities(&mut self, inputs: &TextPreparationInputs<'_>) {
         let dense = self.dense.make_mut();
         let mut expanded = Vec::with_capacity(dense.len());
         for (index, token) in dense.iter().copied().enumerate() {
@@ -1684,7 +1689,7 @@ impl<'a> InlineTokens<'a> {
             let InlineTokenKind::Glyph { glyph_idx } = token.kind() else {
                 continue;
             };
-            let character = engine.text.character(glyph_idx);
+            let character = inputs.text.character(glyph_idx);
             let white_space = token.run_metrics(&self.runs).white_space;
             if !matches!(character, ' ' | '\t')
                 && !(white_space == WhiteSpace::BreakSpaces
@@ -1708,7 +1713,7 @@ impl<'a> InlineTokens<'a> {
                         let InlineTokenKind::Glyph { glyph_idx } = next.kind() else {
                             return true;
                         };
-                        let next_character = engine.text.character(glyph_idx);
+                        let next_character = inputs.text.character(glyph_idx);
                         !matches!(next_character, ' ' | '\t')
                             || !next.run_metrics(&self.runs).white_space.preserves_spaces()
                     }),
@@ -1731,7 +1736,6 @@ impl<'a> InlineTokens<'a> {
     }
 
     pub(super) fn prepare_kp_plan(&mut self, punctuation_aware: bool) {
-        profile_scope!("lines.prepare_kp_plan");
         if self.kp_plan.is_none() {
             self.kp_plan = Some(KpPlan::build(self.span(), &self.runs, punctuation_aware));
         }
@@ -1781,7 +1785,7 @@ pub(super) enum TokenWrap {
 
 mod build;
 
-pub(super) use build::{build_inline_tokens, cached_inline_plan_key};
+pub(super) use build::{TextPreparationRequest, build_inline_tokens};
 
 /// Box supplying the space/ch metric used by number-valued `tab-size`.
 /// CSS defines it on the nearest block container rather than the inline
@@ -1843,11 +1847,12 @@ pub(in crate::layout) fn preserved_tab_metrics(
 pub(in crate::layout) struct CanonicalTextUnit {
     pub(in crate::layout) character: char,
     pub(in crate::layout) break_kind: BreakKind,
+    pub(super) unicode_break_before: bool,
     pub(in crate::layout) natural_advance: f64,
 }
 
 pub(in crate::layout) fn canonical_text_unit(
-    engine: &crate::layout::LayoutEngine<'_, '_>,
+    inputs: &TextPreparationInputs<'_>,
     cursor: &mut TextCursor<'_>,
     glyph_idx: u32,
     box_idx: usize,
@@ -1855,16 +1860,19 @@ pub(in crate::layout) fn canonical_text_unit(
     style: html_style_model::UsedStyleView<'_>,
     white_space: WhiteSpace,
 ) -> (CanonicalTextUnit, bool) {
-    let glyph = engine.text.glyph_at(glyph_idx as usize).unwrap_or_default();
-    let (fallback_advance, _) = cursor.glyph_dimensions(glyph).expect("registered glyph metric");
-    let (advance, cluster_boundary) = cursor.character_geometry(glyph_idx as usize, fallback_advance);
+    let glyph = inputs.text.glyph_at(glyph_idx as usize).unwrap_or_default();
+    let (fallback_advance, _) = cursor
+        .glyph_dimensions(glyph)
+        .expect("registered glyph metric");
+    let (advance, cluster_boundary) =
+        cursor.character_geometry(glyph_idx as usize, fallback_advance);
     (
         canonical_text_unit_from_facts(
-            engine,
+            inputs,
             glyph_idx,
             box_idx,
             run_end,
-            engine.text.character(glyph_idx),
+            inputs.text.character(glyph_idx),
             advance,
             style.font_size(),
             style.letter_spacing() as f64,
@@ -1876,10 +1884,10 @@ pub(in crate::layout) fn canonical_text_unit(
     )
 }
 
-#[inline]
+#[inline(always)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn canonical_text_unit_from_facts(
-    engine: &crate::layout::LayoutEngine<'_, '_>,
+    inputs: &TextPreparationInputs<'_>,
     glyph_idx: u32,
     box_idx: usize,
     run_end: u32,
@@ -1891,38 +1899,48 @@ pub(super) fn canonical_text_unit_from_facts(
     word_spacing_factor: f64,
     white_space: WhiteSpace,
 ) -> CanonicalTextUnit {
-    let wrap_override = engine.text.whitespace_wrap_before(glyph_idx as usize);
-    let break_kind = if is_mandatory_line_break(character) { BreakKind::Hard } else { match wrap_override {
-        WhitespaceWrapOverride::Style => break_kind(character, white_space),
-        WhitespaceWrapOverride::Allow => BreakKind::Soft,
-        WhitespaceWrapOverride::Suppress => BreakKind::None,
-        WhitespaceWrapOverride::UnicodeAllow => BreakKind::Discretionary,
-        WhitespaceWrapOverride::UnicodeSuppress => BreakKind::None,
-    }};
-    let natural_advance =
-        if suppresses_glyph(character) || character == '\u{200b}' || font_size <= 0.0 {
-            0.0
-        } else {
-            let advance = glyph_advance as f64
-                + if glyph_advance > 0.0 && is_word_separator(character) {
-                    word_spacing
-                } else {
-                    0.0
-                };
-            let advance = if matches!(character, ' ' | '\u{00a0}') {
-                advance * word_spacing_factor
+    let wrap_override = inputs.text.whitespace_wrap_before(glyph_idx as usize);
+    let break_kind = if is_mandatory_line_break(character) {
+        BreakKind::Hard
+    } else {
+        match wrap_override {
+            WhitespaceWrapOverride::Style => break_kind(character, white_space),
+            WhitespaceWrapOverride::Allow => BreakKind::Soft,
+            WhitespaceWrapOverride::Suppress => BreakKind::None,
+            WhitespaceWrapOverride::UnicodeAllow => BreakKind::Discretionary,
+            WhitespaceWrapOverride::UnicodeSuppress => BreakKind::None,
+        }
+    };
+    let natural_advance = if suppresses_glyph(character)
+        || character == '\u{200b}'
+        || font_size <= 0.0
+    {
+        0.0
+    } else {
+        let advance = glyph_advance as f64
+            + if glyph_advance > 0.0 && is_word_separator(character) {
+                word_spacing
             } else {
-                advance
+                0.0
             };
-            let mut resolved_tracking = 0.0;
-            let tracking = (letter_spacing != 0.0 || glyph_idx + 1 >= run_end
-                || engine.text.bidi_level(glyph_idx) != engine.text.bidi_level(glyph_idx + 1)) && {
+        let advance = if matches!(character, ' ' | '\u{00a0}') {
+            advance * word_spacing_factor
+        } else {
+            advance
+        };
+        let mut resolved_tracking = 0.0;
+        let tracking = (letter_spacing != 0.0
+            || (inputs.reader.has_tracking_spacing()
+                && !inputs.config.book_optimized_text()
+                && (glyph_idx + 1 >= run_end
+                    || inputs.text.bidi_level(glyph_idx) != inputs.text.bidi_level(glyph_idx + 1))))
+            && {
                 // Format controls keep source positions and shaping effects, but
                 // do not create extra typographic units. Test the boundary before
                 // the next visible unit, including after a ZWJ attached to this
                 // character; an emoji joining sequence still has no such boundary.
                 let mut next = glyph_idx as usize + 1;
-                while engine
+                while inputs
                     .text
                     .content()
                     .character_at(next)
@@ -1930,11 +1948,20 @@ pub(super) fn canonical_text_unit_from_facts(
                 {
                     next += 1;
                 }
-                resolved_tracking = tracking_spacing_after(engine, box_idx, run_end, glyph_idx, next, letter_spacing);
-                resolved_tracking != 0.0 && engine.text.is_cluster_boundary(next)
+                resolved_tracking = if letter_spacing == 0.0 && inputs.config.book_optimized_text() {
+                    0.0
+                } else if next < run_end as usize
+                    && inputs.text.bidi_level(glyph_idx) == inputs.text.bidi_level(next as u32)
+                {
+                    letter_spacing
+                } else {
+                    inputs.reader.tracking_spacing_after(glyph_idx, box_idx)
+                };
+                resolved_tracking != 0.0
+                    && inputs.text.is_cluster_boundary(next)
                     && tracking_boundary_allowed(
                         character,
-                        engine.text.content().character_at(next).unwrap_or('\0'),
+                        inputs.text.content().character_at(next).unwrap_or('\0'),
                     )
             };
             advance + if tracking { resolved_tracking } else { 0.0 }
@@ -1942,69 +1969,12 @@ pub(super) fn canonical_text_unit_from_facts(
     CanonicalTextUnit {
         character,
         break_kind,
+        unicode_break_before: wrap_override == WhitespaceWrapOverride::UnicodeAllow,
         // Token storage uses f32 widths. Intrinsic sizing must accumulate
         // those same values, otherwise a shrink-to-fit line can overflow its
         // own max-content width solely through per-token rounding.
         natural_advance: f64::from(natural_advance as f32),
     }
-}
-
-/// A gap between inline fragments belongs to their common containing
-/// element. A bidi level change also fragments every intervening inline,
-/// even when a narrow line later brings the pieces next to each other.
-fn tracking_spacing_after(
-    engine: &crate::layout::LayoutEngine<'_, '_>,
-    owner: usize,
-    run_end: u32,
-    glyph: u32,
-    next: usize,
-    default: f64,
-) -> f64 {
-    let fragmented = engine.text.bidi_level(glyph) != engine.text.bidi_level(next as u32);
-    if next < run_end as usize && !fragmented { return default; }
-    let Some(other) = engine.text.content().text_runs()
-        .find(|run| run.glyphs.contains(&(next as u32)))
-        .map(|run| run.box_idx as usize) else { return 0.0; };
-    let context = |mut node| {
-        while engine.reader.is_inline_box(node) {
-            let Some(parent) = engine.reader.get_parent(node) else { break; };
-            node = parent;
-        }
-        node
-    };
-    if context(owner) != context(other) { return 0.0; }
-    let next_character = engine.text.character(next as u32);
-    if next_character == '\n' || is_mandatory_line_break(next_character) { return 0.0; }
-    let mut left = owner;
-    let mut right = other;
-    let depth = |mut node| {
-        let mut depth = 0;
-        while let Some(parent) = engine.reader.get_parent(node) {
-            depth += 1; node = parent;
-        }
-        depth
-    };
-    let left_depth = depth(left);
-    let right_depth = depth(right);
-    for _ in right_depth..left_depth {
-        let Some(parent) = engine.reader.get_parent(left) else { return default; };
-        left = parent;
-    }
-    for _ in left_depth..right_depth {
-        let Some(parent) = engine.reader.get_parent(right) else { return default; };
-        right = parent;
-    }
-    while left != right {
-        let (Some(a), Some(b)) = (engine.reader.get_parent(left), engine.reader.get_parent(right)) else { return default; };
-        left = a; right = b;
-    }
-    if fragmented {
-        while engine.reader.is_inline_box(left) {
-            let Some(parent) = engine.reader.get_parent(left) else { break; };
-            left = parent;
-        }
-    }
-    f64::from(engine.reader.style(left).letter_spacing())
 }
 
 /// Measures a token span as a fully placed line without mutating the document.

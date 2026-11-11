@@ -1,18 +1,26 @@
-//! Token preparation flows into composition and fragment publication.
+//! Stage 00 coordinates tokenization (01), composition (02), and emission (03).
 //! Retained caches can skip work; float-sensitive line feedback stays inside composition.
+
+#[path = "00-layout.rs"]
+mod s00_layout;
+#[path = "01-tokenize.rs"]
+mod s01_tokenize;
+#[path = "02-compose.rs"]
+mod s02_compose;
+#[path = "03-emit.rs"]
+mod s03_emit;
 
 use crate::layout::read_context::LayoutReader;
 use crate::layout::replaced::{
     ReplacedSizeInput, preferred_aspect_ratio, resolve_replaced_content_size,
 };
-use crate::layout_model::{
+use html_engine_model::{
     EllipsisFragment, GlyphAdvanceRun, GlyphOffsetRun, HyphenFragment, ImageFragment, InlineItem,
-    InlineItemKind, Line,
-};
+    InlineItemKind, Line};
 use html_style_model::{
-    BoxSizing, HangingPunctuation, Hyphens, LineBreak, OverflowWrap, TabSizeKind, TextAlign, TextBoxOverEdge,
-    TextBoxTrim, TextBoxUnderEdge, TextDirection, TextOverflow, TextWrapStyle, UnicodeBidi,
-    UsedPreferredSize as PreferredSize, VerticalAlignValue, WhiteSpace, WordBreak,
+    BoxSizing, HangingPunctuation, Hyphens, LineBreak, OverflowWrap, TabSizeKind, TextAlign,
+    TextBoxOverEdge, TextBoxTrim, TextBoxUnderEdge, TextDirection, TextOverflow, TextWrapStyle,
+    UnicodeBidi, UsedPreferredSize as PreferredSize, VerticalAlignValue, WhiteSpace, WordBreak,
     resolve_used_preferred_size,
 };
 use kurbo::{Point, Size, Vec2};
@@ -31,14 +39,10 @@ impl ParagraphScratch {
     }
 }
 
-#[path = "00-layout.rs"]
-mod algorithm;
 #[cfg(test)]
 mod bidi_tests;
 #[cfg(test)]
 mod cjk_tests;
-#[path = "02-compose.rs"]
-mod composition;
 mod decorations;
 mod fragments;
 mod hyphenation;
@@ -48,12 +52,10 @@ mod metrics;
 mod token_span;
 use token_span::{CompactTokens, TokenRead, TokenSpan};
 use metrics::{MetricsMode, MetricsRange, MetricsView};
-#[path = "03-emit.rs"]
-mod publication;
-#[path = "01-tokenize.rs"]
-mod token_preparation;
 pub(in crate::layout) use hyphenation::HyphenationDictionaryCache;
 use hyphenation::*;
+mod preparation_inputs;
+use preparation_inputs::TextPreparationInputs;
 mod plans;
 mod storage;
 pub(in crate::layout) use plans::InlinePlanCache;
@@ -70,7 +72,7 @@ use text_tokens::*;
 use tokens::*;
 use wrapping::*;
 
-pub(in crate::layout) use algorithm::layout_inline_content;
+pub(in crate::layout) use s00_layout::{layout_inline_box, layout_inline_content};
 pub(in crate::layout) struct InlineFormattingInput {
     pub(in crate::layout) container_box_idx: usize,
     pub(in crate::layout) starts_block: bool,

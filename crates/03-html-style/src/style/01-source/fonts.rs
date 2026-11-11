@@ -217,6 +217,30 @@ pub fn resolve_font_face_urls<'a>(
 }
 
 /// Visit relative font URLs, keeping the current value when no replacement is returned.
+pub(super) fn visit_relative_font_urls(rules: &CssRuleList<'_>, visit: &mut impl FnMut(&str)) {
+    for rule in &rules.0 {
+        match rule {
+            CssRule::FontFace(face) => {
+                for property in &face.properties {
+                    if let FontFaceProperty::Source(sources) = property {
+                        for source in sources {
+                            if let Source::Url(source) = source {
+                                let url = source.url.url.as_ref();
+                                if !has_uri_scheme(url) { visit(url); }
+                            }
+                        }
+                    }
+                }
+            }
+            CssRule::Media(rule) => visit_relative_font_urls(&rule.rules, visit),
+            CssRule::Supports(rule) => visit_relative_font_urls(&rule.rules, visit),
+            CssRule::LayerBlock(rule) => visit_relative_font_urls(&rule.rules, visit),
+            CssRule::Scope(rule) => visit_relative_font_urls(&rule.rules, visit),
+            _ => {}
+        }
+    }
+}
+
 pub(super) fn resolve_rule_urls(
     rules: &mut CssRuleList<'_>,
     resolve: &mut impl FnMut(&str) -> Option<String>,

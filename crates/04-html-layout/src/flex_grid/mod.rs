@@ -1,5 +1,16 @@
-//! Owned stage results carry preparation through solving, placement, and alignment.
+//! Stage 00 carries owned results through prepare (01), solve (02), place (03), and align (04).
 //! Taffy measurement and repeated solves stay within the solver stage.
+
+#[path = "00-layout.rs"]
+mod s00_layout;
+#[path = "01-prepare.rs"]
+mod s01_prepare;
+#[path = "02-solve.rs"]
+mod s02_solve;
+#[path = "03-place.rs"]
+mod s03_place;
+#[path = "04-align.rs"]
+mod s04_align;
 
 use kurbo::{Point, Size};
 use taffy::geometry::Size as TaffySize;
@@ -20,27 +31,17 @@ pub enum TaffyContainerKind {
     Grid,
 }
 
-#[path = "04-align.rs"]
-mod alignment;
-#[path = "00-layout.rs"]
-mod coordinator;
-#[path = "03-place.rs"]
-mod placement;
-#[path = "01-prepare.rs"]
-mod preparation;
-#[path = "02-solve.rs"]
-mod solver;
-pub use coordinator::layout;
+pub(crate) use s00_layout::layout;
 
-struct FlexGridInput<'a> {
-    container_idx: usize,
-    children: &'a [u32],
-    content_origin: Point,
-    content_width: f64,
-    explicit_height: Option<f64>,
-    min_height: Option<f64>,
-    max_height: Option<f64>,
-    kind: TaffyContainerKind,
+pub(crate) struct FlexGridInput<'a> {
+    pub(crate) container_idx: usize,
+    pub(crate) children: &'a [u32],
+    pub(crate) content_origin: Point,
+    pub(crate) content_width: f64,
+    pub(crate) explicit_height: Option<f64>,
+    pub(crate) min_height: Option<f64>,
+    pub(crate) max_height: Option<f64>,
+    pub(crate) kind: TaffyContainerKind,
 }
 
 struct FlexGridPolicy {

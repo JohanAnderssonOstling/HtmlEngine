@@ -1,5 +1,5 @@
 use super::fragment_writer::FragmentWriter;
-use crate::layout_model::BoxGeometry;
+use html_engine_model::BoxGeometry;
 use kurbo::Vec2;
 
 pub type PlacementId = u32;
@@ -89,6 +89,15 @@ impl PlacementState {
 
     pub fn current_group(&self) -> PlacementId { self.current_group }
     pub fn retains_output(&self) -> bool { self.retain_output }
+
+    /// Geometry produced directly by a formatting context (such as a table
+    /// row) belongs to that context even though it never calls begin_box.
+    pub fn bind_box(&mut self, box_idx: usize) {
+        self.assert_building();
+        if self.retain_output {
+            self.box_groups[box_idx] = self.current_group;
+        }
+    }
 
     pub fn select(&mut self, group: PlacementId) {
         self.assert_building();
@@ -220,7 +229,7 @@ impl PlacementState {
 mod tests {
     use super::PlacementState;
     use crate::layout::fragment_writer::FragmentWriter;
-    use crate::layout_model::{BoxGeometry, LayoutState};
+    use html_engine_model::{BoxGeometry, LayoutState};
     use kurbo::{Point, Vec2};
 
     #[test]
@@ -246,7 +255,7 @@ mod tests {
     fn absolute_publication_updates_the_owning_box_coordinates() {
         let mut geometry_output = BoxGeometry::default();
         let mut fragment_output = LayoutState::default();
-        let mut fragments = FragmentWriter::new(&mut fragment_output, Vec::new());
+        let mut fragments = FragmentWriter::new(&mut fragment_output);
         let mut placement = PlacementState::default();
         geometry_output.reset(1);
         fragments.reset();
@@ -265,7 +274,7 @@ mod tests {
     fn absolute_publication_is_a_one_shot_transition() {
         let mut geometry_output = BoxGeometry::default();
         let mut fragment_output = LayoutState::default();
-        let mut fragments = FragmentWriter::new(&mut fragment_output, Vec::new());
+        let mut fragments = FragmentWriter::new(&mut fragment_output);
         let mut placement = PlacementState::default();
         geometry_output.reset(0);
         fragments.reset();

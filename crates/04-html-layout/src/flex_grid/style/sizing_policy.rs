@@ -4,7 +4,7 @@ use super::super::{TaffyContainerKind, tracks::fixed_auto_track_limit};
 use super::{LayoutEngine, layout_style};
 
 pub fn grid_definite_inline_minimum_exceeds_track_limit(
-    session: &LayoutEngine<'_, '_>,
+    engine: &LayoutEngine<'_, '_>,
     container_idx: usize,
     children: &[u32],
     kind: TaffyContainerKind,
@@ -14,8 +14,8 @@ pub fn grid_definite_inline_minimum_exceeds_track_limit(
         return false;
     }
     let size_contained_intrinsic_minimum = containing_width <= 0.01
-        && session.reader.style(container_idx).size_containment()
-        && session
+        && engine.reader.style(container_idx).size_containment()
+        && engine
             .reader
             .style(container_idx)
             .grid_template_columns()
@@ -31,13 +31,13 @@ pub fn grid_definite_inline_minimum_exceeds_track_limit(
         return true;
     }
     let Some(track_limit) = fixed_auto_track_limit(
-        session.reader.style(container_idx).grid_template_columns(),
+        engine.reader.style(container_idx).grid_template_columns(),
         containing_width,
     ) else {
         return false;
     };
     children.iter().any(|&child| {
-        let style = session.reader.style(child as usize);
+        let style = engine.reader.style(child as usize);
         // Percentage item insets are cyclic at this track-sizing stage: their
         // definite lower-bound contribution is zero until the grid area is
         // known. Resolving them against the whole container would incorrectly
@@ -83,15 +83,15 @@ fn intrinsic_minimum_has_definite_maximum(track: html_style_model::UsedGridTrack
 /// item's default stretch behavior when the adapter needs to avoid a cyclic
 /// percentage contribution.
 pub(super) fn grid_percentage_width_is_stretch_equivalent(
-    session: &LayoutEngine<'_, '_>,
+    engine: &LayoutEngine<'_, '_>,
     box_idx: usize,
     kind: TaffyContainerKind,
 ) -> bool {
     if kind != TaffyContainerKind::Grid {
         return false;
     }
-    let style = session.reader.style(box_idx);
-    let layout = layout_style(session, box_idx);
+    let style = engine.reader.style(box_idx);
+    let layout = layout_style(engine, box_idx);
     matches!(style.width(), PreferredSize::Percent(value) if (value - 1.0).abs() <= f32::EPSILON)
         && matches!(style.min_width(), PreferredSize::Auto)
         && matches!(style.max_width(), PreferredSize::Auto)
@@ -110,13 +110,13 @@ pub(super) fn grid_percentage_width_is_stretch_equivalent(
 /// percentage back into the intrinsic minimum, however. Keep the old
 /// stretch-equivalent encoding only for that remaining Taffy cycle.
 pub(super) fn grid_percentage_width_needs_intrinsic_track_workaround(
-    session: &LayoutEngine<'_, '_>,
+    engine: &LayoutEngine<'_, '_>,
     box_idx: usize,
 ) -> bool {
-    let Some(parent) = session.reader.get_parent(box_idx) else {
+    let Some(parent) = engine.reader.get_parent(box_idx) else {
         return false;
     };
-    session
+    engine
         .reader
         .style(parent)
         .grid_template_columns()
@@ -134,15 +134,15 @@ pub(super) fn grid_percentage_width_needs_intrinsic_track_workaround(
 }
 
 pub(super) fn grid_percentage_height_is_stretch_equivalent(
-    session: &LayoutEngine<'_, '_>,
+    engine: &LayoutEngine<'_, '_>,
     box_idx: usize,
     kind: TaffyContainerKind,
 ) -> bool {
     if kind != TaffyContainerKind::Grid {
         return false;
     }
-    let style = session.reader.style(box_idx);
-    let layout = layout_style(session, box_idx);
+    let style = engine.reader.style(box_idx);
+    let layout = layout_style(engine, box_idx);
     matches!(style.height(), PreferredSize::Percent(value) if (value - 1.0).abs() <= f32::EPSILON)
         && matches!(style.min_height(), PreferredSize::Auto)
         && matches!(style.max_height(), PreferredSize::Auto)

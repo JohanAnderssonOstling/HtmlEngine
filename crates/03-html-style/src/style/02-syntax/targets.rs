@@ -64,3 +64,31 @@ pub(crate) fn compile_property_targets(property: &Property<'_>, targets: &mut Ve
     targets.clear();
     append_property_targets(property, targets);
 }
+
+/// Expand supported native longhands once, retaining the original declaration
+/// as the atomic validation group, including components that lose the cascade.
+pub(crate) fn expand_declaration<'css>(
+    property: &Property<'css>,
+    output: &mut Vec<Property<'css>>,
+) -> Result<bool, ()> {
+    let Some(longhands) = property.property_id().longhands() else {
+        return Ok(false);
+    };
+    for id in longhands {
+        if PropertyKey::from_name(id.name()).is_none() {
+            continue;
+        }
+        output.push(
+            property
+                .longhand(&id)
+                .or_else(|| match (property, &id) {
+                    (Property::TextDecoration(value, _), PropertyId::TextDecorationThickness) => {
+                        Some(Property::TextDecorationThickness(value.thickness.clone()))
+                    }
+                    _ => None,
+                })
+                .ok_or(())?,
+        );
+    }
+    Ok(true)
+}

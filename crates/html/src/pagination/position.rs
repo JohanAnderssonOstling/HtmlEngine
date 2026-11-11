@@ -1,10 +1,8 @@
 //! Document-local position facts shared by navigation and progress reporting.
 
 
-use html_pipeline::engine::pagination_queries;
 use super::{PageAnchor, PagePositions, PageRequest};
 use crate::layout::{LineId, RenderView, SourceLocation};
-use html_pipeline::engine::source_queries;
 
 /// Position facts for one page origin. Source paths are resolved on demand so
 /// callers querying only the glyph or progress allocate no source address.
@@ -73,7 +71,7 @@ impl DocumentPosition<'_> {
             return Some(SourceLocation::default());
         }
         let (line, glyph) = self.source_line?;
-        source_queries::source_location_on_line(self.doc.addressing(), line, glyph)
+        (self.doc.addressing()).source_location_on_line(line, glyph)
     }
 }
 
@@ -88,12 +86,12 @@ pub fn document_position<'a>(
 ) -> DocumentPosition<'a> {
     let text = doc.text();
     let cursor = origin.cursor.unwrap_or_else(|| {
-        pagination_queries::render_view_pagination(doc).start_at(origin.offset_y, 0.1)
+        doc.pagination().start_at(origin.offset_y, 0.1)
     });
     let line = if text.lines().is_empty() {
         None
     } else {
-        pagination_queries::render_view_pagination(doc).source_line(cursor)
+        doc.pagination().source_line(cursor)
     };
     let glyph = line.as_ref().map(|line| line.glyphs().start);
     let selected_glyph = preferred_glyph.or(glyph);

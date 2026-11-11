@@ -1,6 +1,6 @@
 use super::columns::{TableCellPlacement, percentage_component, row_group_range};
-use super::grid::PreparedTableGrid;
-use super::rows::PreparedCell;
+use super::s01_grid::PreparedTableGrid;
+use super::s04_rows::PreparedCell;
 use crate::layout::{LayoutEngine, resolve_vertical_size};
 use html_style_model::UsedPreferredSize as PreferredSize;
 use std::cmp::Ordering;
@@ -27,7 +27,7 @@ impl RowspanRequirement {
 }
 
 pub(super) fn resolve_row_heights(
-    session: &LayoutEngine<'_, '_>,
+    engine: &LayoutEngine<'_, '_>,
     prepared: &PreparedTableGrid,
     rows: &[u32],
     row_groups: &[u32],
@@ -38,7 +38,7 @@ pub(super) fn resolve_row_heights(
     let placements = &prepared.grid.placements;
     let spacing = prepared.vertical_spacing;
     let outer_border_height = prepared.outer_borders.vertical();
-    let mut measures = initial_row_measures(session, rows, placements, cells);
+    let mut measures = initial_row_measures(engine, rows, placements, cells);
 
     let mut spanning = placements
         .iter()
@@ -70,13 +70,13 @@ pub(super) fn resolve_row_heights(
 
     for &group_idx in row_groups {
         let Some(group_height) = resolve_vertical_size(
-            session.reader.style(group_idx as usize).height(),
+            engine.reader.style(group_idx as usize).height(),
             explicit_table_height,
             0.0,
         ) else {
             continue;
         };
-        let Some(range) = row_group_range(&session.reader, rows, group_idx as usize) else {
+        let Some(range) = row_group_range(&engine.reader, rows, group_idx as usize) else {
             continue;
         };
         distribute_excess(
@@ -108,14 +108,14 @@ pub(super) fn resolve_row_heights(
 }
 
 fn initial_row_measures(
-    session: &LayoutEngine<'_, '_>,
+    engine: &LayoutEngine<'_, '_>,
     rows: &[u32],
     placements: &[TableCellPlacement],
     cells: &[PreparedCell],
 ) -> Vec<RowMeasure> {
     let mut measures = vec![RowMeasure::default(); rows.len()];
     for (row, &row_box_idx) in rows.iter().enumerate() {
-        let height = session.reader.style(row_box_idx as usize).height();
+        let height = engine.reader.style(row_box_idx as usize).height();
         if let Some(minimum) = resolve_vertical_size(height, None, 0.0) {
             measures[row].block_size = minimum;
         }
@@ -134,7 +134,7 @@ fn initial_row_measures(
         measures[placement.row].block_size = measures[placement.row]
             .block_size
             .max(cells.get(index).map_or(0.0, |cell| cell.height));
-        let height = session.reader.style(placement.cell_idx).height();
+        let height = engine.reader.style(placement.cell_idx).height();
         measures[placement.row].percent = max_option(
             measures[placement.row].percent,
             percentage_component(height).map(|percent| percent.max(0.0)),

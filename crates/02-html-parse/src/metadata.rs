@@ -1,4 +1,4 @@
-use crate::{HeadMetadata, HtmlSyntaxNode, HtmlSyntaxTree, StylesheetReference};
+use crate::StylesheetReference;
 use html_dom::{Document, DomNodeId, NodeRef, media_type_essence};
 
 pub(crate) fn nonempty(mut value: String) -> Option<String> {
@@ -32,86 +32,51 @@ fn stylesheet_for_element<'a>(
     }
 }
 
-pub(crate) fn head_metadata_from_syntax_tree(tree: &HtmlSyntaxTree) -> HeadMetadata {
-    let mut metadata = HeadMetadata::default();
-    collect_syntax_metadata(&tree.nodes, false, &mut metadata, true);
-    metadata
-}
-
-pub(crate) fn title_from_syntax_tree(tree: &HtmlSyntaxTree) -> Option<String> {
-    let mut metadata = HeadMetadata::default();
-    collect_syntax_metadata(&tree.nodes, false, &mut metadata, false);
-    metadata.title
-}
-
-fn collect_syntax_metadata(
-    nodes: &[HtmlSyntaxNode],
-    inside_head: bool,
-    metadata: &mut HeadMetadata,
-    include_stylesheets: bool,
-) {
-    for node in nodes {
-        if !include_stylesheets && metadata.title.is_some() {
-            break;
-        }
-        let HtmlSyntaxNode::Element(element) = node else {
-            continue;
-        };
-        let inside_head = inside_head || element.local_name == "head";
-        if inside_head && element.local_name == "title" && metadata.title.is_none() {
-            metadata.title = nonempty(syntax_text_content(&element.children));
-        } else if include_stylesheets {
-            if let Some(sheet) = stylesheet_for_element(
-                element.namespace.as_deref(),
-                &element.local_name,
-                |name| element.attribute(name),
-                || syntax_text_content(&element.children),
-            ) {
-                metadata.stylesheets.push(sheet);
-            }
-        }
-        collect_syntax_metadata(
-            &element.children,
-            inside_head,
-            metadata,
-            include_stylesheets,
-        );
-    }
-}
-
-fn syntax_text_content(nodes: &[HtmlSyntaxNode]) -> String {
-    fn append(nodes: &[HtmlSyntaxNode], text: &mut String) {
-        for node in nodes {
-            match node {
-                HtmlSyntaxNode::Text(value) => text.push_str(value),
-                HtmlSyntaxNode::Element(element) => append(&element.children, text),
-                HtmlSyntaxNode::TemplateContents(children) => append(children, text),
-                _ => {}
+pub(crate) fn document_title(document: &Document) -> Option<String> {
+    fn text(document: &Document, node: DomNodeId, output: &mut String) {
+        match document.node_ref(node) {
+            NodeRef::Text(value) => output.push_str(value.text()),
+            NodeRef::Element(element) => {
+                for child in element.children() {
+                    text(document, child, output);
+                }
             }
         }
     }
-
-    let mut text = String::new();
-    append(nodes, &mut text);
-    text
+    fn find(document: &Document, node: DomNodeId, inside_head: bool) -> Option<String> {
+        let element = document.try_element_ref(node)?;
+        let inside_head = inside_head || element.tag() == "head";
+        if inside_head && element.tag() == "title" {
+            let mut value = String::new();
+            for child in element.children() {
+                text(document, child, &mut value);
+            }
+            if let Some(value) = nonempty(value) {
+                return Some(value);
+            }
+        }
+        element
+            .children()
+            .find_map(|child| find(document, child, inside_head))
+    }
+    find(document, document.dom_root()?, false)
 }
 
 /// Collect active sheets in source order, retaining DOM owners for implicit scopes.
 pub fn document_stylesheets(document: &Document) -> Vec<(StylesheetReference, Option<DomNodeId>)> {
     fn append_text(document: &Document, node: DomNodeId, text: &mut String) {
         match document.node_ref(node) {
-            Some(NodeRef::Text(value)) => text.push_str(value.text()),
-            Some(NodeRef::Element(element)) => element
+            NodeRef::Text(value) => text.push_str(value.text()),
+            NodeRef::Element(element) => element
                 .children()
                 .for_each(|child| append_text(document, child, text)),
-            None => {}
         }
     }
 
     document
         .node_ids()
         .filter_map(|node| {
-            let element = document.element_ref(node)?;
+            let element = document.try_element_ref(node)?;
             let sheet = stylesheet_for_element(
                 element.namespace(),
                 element.tag(),
@@ -179,41 +144,10 @@ pub fn style_type_is_css(media_type: Option<&str>) -> bool {
         media_type.trim().is_empty() || media_type.trim().eq_ignore_ascii_case("text/css")
     })
 }
-
 #[cfg(test)]
 mod tests {
     use super::document_stylesheets;
-    use crate::{StylesheetReference, parse_html_document, parse_xml_document};
-
-    #[test]
-    fn syntax_and_dom_share_stylesheet_order_and_exclusions() {
-        let parsed = parse_html_document(
-            r#"<html><head>
-            <style> p {color:red} </style>
-            <link rel="stylesheet" href="theme.css">
-            <link rel="alternate stylesheet" href="inactive.css">
-            <template><style>template {color:red}</style></template>
-            </head><body><svg><style>foreign {color:red}</style></svg>
-            <section id="scope"><style> p {color:green} </style></section>
-            </body></html>"#,
-        );
-        let expected = vec![
-            StylesheetReference::Inline("p {color:red}".into()),
-            StylesheetReference::External("theme.css".into()),
-            StylesheetReference::Inline("p {color:green}".into()),
-        ];
-        assert_eq!(parsed.head_metadata().stylesheets, expected);
-        let document = parsed.into_dom();
-        let sheets = document_stylesheets(&document);
-        assert_eq!(
-            sheets
-                .iter()
-                .map(|(sheet, _)| sheet.clone())
-                .collect::<Vec<_>>(),
-            expected
-        );
-        assert_eq!(document.get_dom_id(sheets[2].1.unwrap()), Some("scope"));
-    }
+    use crate::{StylesheetReference, parse_xml_document};
 
     #[test]
     fn xml_stylesheets_require_html_namespace_and_exact_names() {

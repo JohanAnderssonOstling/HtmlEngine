@@ -1,7 +1,8 @@
-use html_dom::{Document, ElementRef, MemoryUsageReport};
+use html_dom::{DomNodeId, Document, ElementRef, MemoryUsageReport};
 use html_style_model::{ListStylePosition, StyleIndices};
-use std::iter::{once, successors};
 use rustc_data_structures::fx::FxHashMap;
+use std::iter::{once, successors};
+use std::num::NonZeroU32;
 use std::ops::Range;
 
 /// A list item's generated marker (`::marker`). `marker_box` is a real layout
@@ -20,6 +21,8 @@ pub struct ListItemMarker {
 #[derive(Default, Clone)]
 pub struct LayoutTree {
     pub boxes: Vec<LayoutBox>,
+    /// Cold table payloads, addressed by compact handles in layout boxes.
+    tables: Vec<TableBox>,
     pub root_box: Option<u32>,
     pub body_box: Option<u32>,
     /// Generated markers keyed by their list-item box index.
@@ -38,12 +41,8 @@ impl LayoutTree {
     /// Style-bearing formatting structures without their own layout box.
     /// Shaping must prepare these handles before layout or paint reads them.
     pub fn non_box_styles(&self) -> impl Iterator<Item = StyleIndices> + '_ {
-        self.boxes
+        self.tables
             .iter()
-            .filter_map(|layout_box| match &layout_box.layout_mode {
-                LayoutMode::Table(table) => Some(table),
-                _ => None,
-            })
             .flat_map(|table| {
                 table
                     .columns
@@ -67,6 +66,10 @@ impl LayoutTree {
     pub fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
         report.add_vec_storage("LayoutTree.boxes.storage", &self.boxes);
+        report.add_vec_storage("LayoutTree.tables.storage", &self.tables);
+        for table in &self.tables {
+            report.extend_prefixed("LayoutTree.tables", table.memory_usage_report());
+        }
         for layout_box in &self.boxes {
             report.extend_prefixed("LayoutTree.boxes", layout_box.memory_usage_report());
         }
@@ -123,7 +126,7 @@ impl LayoutTree {
         self.boxes.get(box_idx)?.style()
     }
 
-    pub fn get_box_dom_element(&self, box_idx: usize) -> Option<u32> {
+    pub fn get_box_dom_element(&self, box_idx: usize) -> Option<DomNodeId> {
         self.boxes.get(box_idx)?.dom_element()
     }
 
@@ -158,7 +161,39 @@ impl LayoutTree {
             .map(|layout_box| layout_box.layout_mode())
     }
 
-    pub fn push_box(&mut self, layout_box: LayoutBox) -> u32 {
+    pub fn table(&self, id: TableId) -> Option<&TableBox> {
+        self.tables.get(id.0?.get() as usize - 1)
+    }
+
+    pub fn get_box_table(&self, box_idx: usize) -> Option<&TableBox> {
+        let LayoutMode::Table(id) = self.get_box_layout_mode(box_idx)? else {
+            return None;
+        };
+        self.table(*id)
+    }
+
+    pub fn get_box_table_mut(&mut self, box_idx: usize) -> Option<&mut TableBox> {
+        let LayoutMode::Table(id) = self.get_box_layout_mode(box_idx)? else {
+            return None;
+        };
+        let index = id.0?.get() as usize - 1;
+        self.tables.get_mut(index)
+    }
+
+    pub fn push_box(&mut self, mut layout_box: LayoutBox) -> u32 {
+        if let LayoutMode::Table(id) = &mut layout_box.layout_mode {
+            // A default handle requests an empty table. Existing handles remain
+            // valid when a box is moved within this tree.
+            if id.0.is_none() {
+                let index = u32::try_from(self.tables.len())
+                    .ok()
+                    .and_then(|index| index.checked_add(1))
+                    .and_then(NonZeroU32::new)
+                    .expect("layout table pool exceeds u32 capacity");
+                self.tables.push(TableBox::default());
+                *id = TableId(Some(index));
+            }
+        }
         let idx = self.boxes.len() as u32;
         self.boxes.push(layout_box);
         idx
@@ -218,7 +253,7 @@ pub struct LayoutBox {
 
     // DOM node backing this box (None for anonymous boxes). Element identity
     // (tag/id/classes/href) is read through this rather than duplicated here.
-    pub dom_element: Option<u32>,
+    pub dom_element: Option<DomNodeId>,
 
     // Tree structure (layout tree)
     pub parent: Option<u32>, // index of parent box
@@ -254,8 +289,7 @@ impl LayoutBox {
     /// Get element data from DOM tree
     pub fn get_element<'a>(&self, doc: &'a Document) -> Option<ElementRef<'a>> {
         self.dom_element
-            .and_then(|idx| doc.node_id_from_raw(idx))
-            .and_then(|node_id| doc.element_ref(node_id))
+            .map(|node_id| doc.element_ref(node_id))
     }
 
     pub fn layout_mode(&self) -> &LayoutMode {
@@ -274,7 +308,7 @@ impl LayoutBox {
         self.style = style;
     }
 
-    pub fn dom_element(&self) -> Option<u32> {
+    pub fn dom_element(&self) -> Option<DomNodeId> {
         self.dom_element
     }
 
@@ -283,10 +317,15 @@ impl LayoutBox {
     }
 }
 
+/// Tree-local table handle. The default requests allocation in `push_box`.
+#[derive(Clone, Copy, Default)]
+#[repr(transparent)]
+pub struct TableId(Option<NonZeroU32>);
+
 #[derive(Clone)]
 pub enum LayoutMode {
     Block(BlockBox),
-    Table(TableBox),
+    Table(TableId),
     TableRow(TableRowBox),
     TableCell(TableCellBox),
     Flex(FlexBox),
@@ -305,9 +344,7 @@ impl LayoutMode {
             LayoutMode::Block(block) => {
                 report.extend_prefixed("LayoutMode::Block", block.memory_usage_report())
             }
-            LayoutMode::Table(table) => {
-                report.extend_prefixed("LayoutMode::Table", table.memory_usage_report())
-            }
+            LayoutMode::Table(_) => {} // Payloads are counted by LayoutTree.
             LayoutMode::TableRow(row) => {
                 report.extend_prefixed("LayoutMode::TableRow", row.memory_usage_report())
             }
@@ -480,7 +517,7 @@ impl html_text::TextStructure for LayoutTree {
         self.get_box_style_indices(context)
     }
 
-    fn get_box_dom_element(&self, context: usize) -> Option<u32> {
+    fn get_box_dom_element(&self, context: usize) -> Option<DomNodeId> {
         self.get_box_dom_element(context)
     }
 

@@ -1,9 +1,8 @@
-use crate::layout::{LayoutEngine, ResolvedBoxModel};
-use crate::layout_model::LayoutMode;
+use crate::layout::{LayoutEngine};
 
 use super::captions::minimum_width as caption_minimum_width;
-use super::column_sizing::{WidthMeasure, measure_table_columns};
-use super::grid::{PreparedTableGrid, prepare_table_grid};
+use super::s03_column_sizing::{WidthMeasure, measure_table_columns};
+use super::s01_grid::{PreparedTableGrid, prepare_table_grid};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct TableIntrinsicSizes {
@@ -14,12 +13,12 @@ pub(super) struct TableIntrinsicSizes {
 }
 
 fn caption_minimum_grid_contribution(
-    session: &LayoutEngine<'_, '_>,
+    engine: &LayoutEngine<'_, '_>,
     table_box_idx: usize,
     caption_minimum: f64,
 ) -> f64 {
-    let style = session.reader.style(table_box_idx);
-    let mut box_model = ResolvedBoxModel::new(style, 0.0);
+    let style = engine.reader.style(table_box_idx);
+    let mut box_model = engine.reader.box_model(table_box_idx, 0.0);
     if matches!(
         style.border_collapse(),
         html_style_model::BorderCollapseMode::Collapse
@@ -35,31 +34,31 @@ fn caption_minimum_grid_contribution(
     (caption_minimum - table_outer_extras).max(0.0)
 }
 
-pub fn table_intrinsic_widths(session: &LayoutEngine<'_, '_>, table_box_idx: usize) -> (f64, f64) {
-    let Some(LayoutMode::Table(table)) = session.reader.box_layout_mode(table_box_idx) else {
+pub fn table_intrinsic_widths(engine: &mut LayoutEngine<'_, '_>, table_box_idx: usize) -> (f64, f64) {
+    let Some(table) = engine.reader.box_table(table_box_idx) else {
         return (0.0, 0.0);
     };
-    let prepared = prepare_table_grid(session, table_box_idx, &table.rows);
-    let measures = measure_table_columns(session, &prepared);
-    let sizes = intrinsic_sizes_for_grid(session, table_box_idx, &prepared, &measures);
+    let prepared = prepare_table_grid(engine, table_box_idx, &table.rows);
+    let measures = measure_table_columns(engine, &prepared);
+    let sizes = intrinsic_sizes_for_grid(engine, table_box_idx, &prepared, &measures);
     (sizes.minimum, sizes.maximum)
 }
 
 pub(super) fn intrinsic_sizes_for_grid(
-    session: &LayoutEngine<'_, '_>,
+    engine: &mut LayoutEngine<'_, '_>,
     table_box_idx: usize,
     prepared: &PreparedTableGrid,
     measures: &[WidthMeasure],
 ) -> TableIntrinsicSizes {
-    let Some(LayoutMode::Table(table)) = session.reader.box_layout_mode(table_box_idx) else {
+    let Some(table) = engine.reader.box_table(table_box_idx) else {
         return TableIntrinsicSizes::default();
     };
-    let style = session.reader.style(table_box_idx);
+    let style = engine.reader.style(table_box_idx);
     let grid = &prepared.grid;
     let caption_minimum =
-        caption_minimum_width(session, &table.captions_top, &table.captions_bottom);
+        caption_minimum_width(engine, &table.captions_top, &table.captions_bottom);
     let caption_grid_minimum =
-        caption_minimum_grid_contribution(session, table_box_idx, caption_minimum);
+        caption_minimum_grid_contribution(engine, table_box_idx, caption_minimum);
     if grid.column_count == 0 {
         let minimum = caption_grid_minimum;
         return TableIntrinsicSizes {
@@ -98,10 +97,10 @@ pub(super) fn intrinsic_sizes_for_grid(
     // `max-content` deliberately uses the direct sum. Auto and fit-content
     // tables also honor the inverse constraint implied by percentage tracks.
     let nested_in_table_cell =
-        std::iter::successors(session.reader.get_parent(table_box_idx), |&box_idx| {
-            session.reader.get_parent(box_idx)
+        std::iter::successors(engine.reader.get_parent(table_box_idx), |&box_idx| {
+            engine.reader.get_parent(box_idx)
         })
-        .any(|box_idx| session.reader.is_table_cell_box(box_idx));
+        .any(|box_idx| engine.reader.is_table_cell_box(box_idx));
     let grid_content_maximum = if matches!(
         style.width(),
         html_style_model::UsedPreferredSize::MaxContent

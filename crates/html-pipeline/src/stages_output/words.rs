@@ -1,22 +1,19 @@
-//! Word boundaries owned by shaping, independent of width and glyph resources.
+//! Word boundaries owned by preparation, independent of width and glyph resources.
 
-use crate::shaping::ShapedFontMetrics;
-use crate::stages::lifecycle::PreparedInputs;
 use crate::stages::semantics::is_block_container;
-use html_engine_model::WordIndex;
-use html_style_model::Visibility;
-use html_text::{InlineTextKind, TextChunk, for_each_text_chunk};
+use html_engine_model::{LayoutTree, WordIndex};
+use html_style_model::{ComputedStyles, Visibility};
+use html_text::{InlineContent, InlineTextKind, TextChunk, for_each_text_chunk};
 use rustc_data_structures::fx::FxHashMap;
 use std::iter::once;
 use std::ops::Range;
 use unicode_segmentation::{UNICODE_VERSION, UnicodeSegmentation};
 
 pub(in crate::stages) fn build_word_index(
-    inputs: &PreparedInputs<'_>,
-    metrics: &ShapedFontMetrics,
+    styles: &ComputedStyles,
+    tree: &LayoutTree,
+    content: &InlineContent,
 ) -> WordIndex {
-    let tree = &inputs.layout_tree;
-    let content = inputs.text.content();
     let mut blocks: FxHashMap<usize, Vec<Range<u32>>> = FxHashMap::default();
     for run in content.text_runs().filter(|run| {
         run.kind == InlineTextKind::Text && run.dom_text_node.is_some() && !run.glyphs.is_empty()
@@ -24,9 +21,9 @@ pub(in crate::stages) fn build_word_index(
         let owner = run.box_idx as usize;
         let style = tree
             .get_box_style_indices(owner)
-            .unwrap_or_else(|| inputs.styles.default_indices());
-        if !metrics
-            .used_style(&inputs.styles, style, owner)
+            .unwrap_or_else(|| styles.default_indices());
+        if !styles
+            .view(style)
             .is_some_and(|style| style.visibility() == Visibility::Visible)
         {
             continue;

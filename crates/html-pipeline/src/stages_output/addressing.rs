@@ -1,17 +1,12 @@
 //! Renderer-facing link, anchor, and source-correlation queries.
 
-use crate::stages::pagination_queries;
-use crate::stages::source_queries;
-use crate::stages::text_paint;
-use html_engine_model::layout_state;
-use crate::stages::export_queries;
-use crate::stages::search_queries;
 use super::text::{enclosing_text_range, text_runs};
 use super::*;
-use kurbo::Point;
 use crate::layout_model::GlyphMetrics;
 use html_dom::{DomNodeId, element_is_note_reference};
+use html_engine_model::layout_state;
 use html_text::InlineTextKind;
+use kurbo::Point;
 
 /// A borrowed link destination and its activation semantics.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -137,24 +132,39 @@ pub struct RenderAddressingView<'a> {
 pub use html_dom::{SourceElementStep, SourcePosition};
 
 impl<'a> RenderAddressingView<'a> {
+    /// Inherited source language at a logical character, including `xml:lang`.
+    /// An empty authored language resets inheritance.
+    pub fn language_at(self, glyph: u32) -> Option<&'a str> {
+        let document = self.doc.document();
+        let node = text_runs(self.doc.inputs.text.content().inline_items())
+            .find(|run| run.glyphs().contains(&glyph))?
+            .dom_text_node()?;
+        std::iter::once(node)
+            .chain(document.dom_ancestors(node))
+            .find_map(|node| {
+                let element = document.try_element_ref(node)?;
+                element
+                    .attr_expanded(Some("http://www.w3.org/XML/1998/namespace"), "lang")
+                    .or_else(|| element.attr("lang"))
+            })
+    }
+
     /// Resolve document facts together; the host chooses how to reveal them.
     pub fn destination(self, target: DocumentTarget<'_>) -> Option<ResolvedDestination> {
         let view = self.doc.render_view(self.glyph_metrics);
         let glyph_destination = |glyph| {
-            let line = text_paint::render_text_view_line_for_glyph(view.text(), glyph)?;
+            let line = (view.text()).line_for_glyph(glyph)?;
             Some(ResolvedDestination::Line {
                 line,
-                cursor: pagination_queries::pagination_cursor(
-                    pagination_queries::render_view_pagination(view),
-                    line,
-                )?,
+                cursor: (view.pagination()).cursor(line)?,
                 point: view.text().line(line)?.point(),
                 glyph: Some(glyph),
             })
         };
         match target {
             DocumentTarget::Cursor(cursor) => {
-                let position = pagination_queries::render_view_pagination(view)
+                let position = (view)
+                    .pagination()
                     .locate(PaginationTarget::Cursor(cursor))?;
                 let group = position.group;
                 Some(ResolvedDestination::Line {
@@ -165,12 +175,12 @@ impl<'a> RenderAddressingView<'a> {
                 })
             }
             DocumentTarget::NextLine(cursor) => {
-                let lines = pagination_queries::render_view_pagination(view);
+                let lines = view.pagination();
                 let next = lines.groups(cursor..lines.len()).nth(1)?;
                 self.destination(DocumentTarget::Cursor(next.cursors().start))
             }
             DocumentTarget::PreviousLine(cursor) => {
-                let lines = pagination_queries::render_view_pagination(view);
+                let lines = view.pagination();
                 if cursor >= lines.len() {
                     return None;
                 }
@@ -181,8 +191,8 @@ impl<'a> RenderAddressingView<'a> {
                 if view.text().lines().is_empty() {
                     return None;
                 }
-                let cursor = pagination_queries::render_view_pagination(view).start_at(y, 0.1);
-                let line = pagination_queries::render_view_pagination(view).source_line(cursor)?;
+                let cursor = view.pagination().start_at(y, 0.1);
+                let line = view.pagination().source_line(cursor)?;
                 let glyphs = line.glyphs();
                 Some(ResolvedDestination::Line {
                     line: line.id(),
@@ -192,7 +202,7 @@ impl<'a> RenderAddressingView<'a> {
                 })
             }
             DocumentTarget::End => {
-                let lines = pagination_queries::render_view_pagination(view);
+                let lines = view.pagination();
                 let Some(position) = lines
                     .len()
                     .checked_sub(1)
@@ -221,12 +231,8 @@ impl<'a> RenderAddressingView<'a> {
                 ElementTarget::Note => None,
             },
             DocumentTarget::Source(source) => {
-                if let Some(line) =
-                    source_queries::render_addressing_view_source_element_line(self, source)
-                    && let Some(cursor) = pagination_queries::pagination_cursor(
-                        pagination_queries::render_view_pagination(view),
-                        line,
-                    )
+                if let Some(line) = self.source_element_line(source)
+                    && let Some(cursor) = (view.pagination()).cursor(line)
                 {
                     return Some(ResolvedDestination::Line {
                         line,
@@ -235,7 +241,7 @@ impl<'a> RenderAddressingView<'a> {
                         glyph: None,
                     });
                 }
-                source_queries::render_addressing_view_source_element_y(self, source)
+                self.source_element_y(source)
                     .map(|y| ResolvedDestination::Position { y })
             }
         }
@@ -251,7 +257,7 @@ impl<'a> RenderAddressingView<'a> {
             .map(|position| position.y())
             .or_else(|| {
                 let glyph = self.anchor_glyph(key)?;
-                let line = text_paint::render_text_view_line_for_glyph(view.text(), glyph)?;
+                let line = (view.text()).line_for_glyph(glyph)?;
                 Some(view.text().line(line)?.point().y)
             });
         let is_note = self.is_note_target(id);
@@ -271,11 +277,15 @@ impl<'a> RenderAddressingView<'a> {
     ) -> Option<Range<u32>> {
         let view = self.doc.render_view(self.glyph_metrics);
         if let Some(range) = preferred
-            && export_queries::render_export_view_text(view.export(), range.clone(), TextExportFormat::Plain).plain.as_deref() == Some(quote.exact)
+            && (view.export())
+                .text(range.clone(), TextExportFormat::Plain)
+                .plain
+                .as_deref()
+                == Some(quote.exact)
         {
             return Some(range);
         }
-        search_queries::render_text_view_locate_quote(view.text(), quote.exact, quote.prefix, quote.suffix)
+        (view.text()).locate_quote(quote.exact, quote.prefix, quote.suffix)
     }
 
     /// Check published anchors without scanning text. A scoped-only note may
@@ -310,7 +320,7 @@ impl<'a> RenderAddressingView<'a> {
         let target = document.element_by_id(id)?.node_id();
         text_runs(self.doc.inputs.text.content().inline_items())
             .filter_map(|run| {
-                let node = document.node_id_from_raw(run.dom_text_node()?)?;
+                let node = run.dom_text_node()?;
                 let belongs = document.dom_contains(target, node);
                 belongs.then(|| run.glyphs())
             })
@@ -332,11 +342,15 @@ impl<'a> RenderAddressingView<'a> {
         after_glyph: bool,
     ) -> Option<SourcePosition<'a>> {
         let local_offset = self.doc.glyph_source_offset(glyph_idx)? as usize;
-        let run = self.doc.inputs.text.content().text_runs().find(|run| {
-            run.kind == InlineTextKind::Text && run.glyphs.contains(&glyph_idx)
-        })?;
+        let run = self
+            .doc
+            .inputs
+            .text
+            .content()
+            .text_runs()
+            .find(|run| run.kind == InlineTextKind::Text && run.glyphs.contains(&glyph_idx))?;
         let document = self.doc.document();
-        let text_node = document.node_id_from_raw(run.dom_text_node?)?;
+        let text_node = run.dom_text_node?;
         document.source_position_for_text_node(text_node, local_offset, after_glyph)
     }
 
@@ -361,11 +375,77 @@ impl<'a> RenderAddressingView<'a> {
             None => find_glyph_in_node(self.doc, parent, utf16_offset, allow_end),
         }
     }
+
+    /// Source identity for the link that owns a laid-out glyph.
+    pub fn link_node_for_glyph(self, glyph: u32) -> Option<DomNodeId> {
+        self.doc.link_for_glyph(glyph)?;
+        let owner = self
+            .doc
+            .inputs
+            .text
+            .content()
+            .text_runs()
+            .find(|run| run.kind == InlineTextKind::Text && run.glyphs.contains(&glyph))?
+            .box_idx as usize;
+        std::iter::once(owner)
+            .chain(self.doc.inputs.layout_tree.ancestors(owner))
+            .find_map(|index| {
+                let element = self.doc.element_for_box(index)?;
+                element.attr("href")?;
+                Some(element.node_id())
+            })
+    }
+
+    /// Text owned by one link element, including nested inline descendants.
+    pub fn link_text_range(self, node: DomNodeId) -> Option<Range<u32>> {
+        let document = self.doc.document();
+        text_runs(self.doc.inputs.text.content().inline_items())
+            .filter_map(|run| {
+                let owner = run.dom_text_node().or_else(|| {
+                    self.doc
+                        .box_dom_element_idx(layout_state::box_id_index(run.box_id()))
+                })?;
+                document.dom_contains(node, owner).then(|| run.glyphs())
+            })
+            .reduce(enclosing_text_range)
+            .filter(|range| !range.is_empty())
+    }
+
+    /// Source identity for the enclosing link of replaced content.
+    pub fn link_node_for_box(self, box_id: BoxId) -> Option<DomNodeId> {
+        let document = self.doc.document();
+        let node = self
+            .doc
+            .box_dom_element_idx(layout_state::box_id_index(box_id))?;
+        std::iter::once(node)
+            .chain(document.dom_ancestors(node))
+            .find_map(|node| {
+                let element = document.element_ref(node);
+                if !element.tag().eq_ignore_ascii_case("a")
+                    && !element.tag().eq_ignore_ascii_case("area")
+                {
+                    return None;
+                }
+                element.attr("href")?;
+                Some(node)
+            })
+    }
+
+    /// Link semantics for replaced content, including inline ancestors.
+    pub fn link_for_box(self, box_id: BoxId) -> Option<LinkTarget<'a>> {
+        let document = self.doc.document();
+        let node = self.link_node_for_box(box_id)?;
+        let element = document.element_ref(node);
+        Some(LinkTarget {
+            href: element.attr("href")?,
+            is_note_reference: element_is_note_reference(element),
+        })
+    }
 }
 
 fn glyph_range_for_text_node(doc: DocumentRead<'_>, node: DomNodeId) -> Option<Range<u32>> {
     text_runs(doc.inputs.text.content().inline_items())
-        .filter(|run| run.dom_text_node() == Some(node.raw()))
+        .filter(|run| run.dom_text_node() == Some(node))
         .map(|run| run.glyphs())
         .filter(|range| !range.is_empty())
         .reduce(enclosing_text_range)
@@ -450,7 +530,7 @@ fn find_glyph_in_node(
     source_offset: Option<usize>,
     allow_end: bool,
 ) -> Option<u32> {
-    match doc.document().node_ref(node)? {
+    match doc.document().node_ref(node) {
         NodeRef::Text(text) => find_glyph_in_text_chunk(
             doc,
             text.parent()?,
@@ -462,29 +542,4 @@ fn find_glyph_in_node(
             .children()
             .find_map(|child| find_glyph_in_node(doc, child, source_offset, allow_end)),
     }
-}
-
-/// Link semantics for replaced content, including images inside inline
-/// ancestors that do not introduce their own layout box.
-pub fn render_addressing_view_link_for_box<'a>(
-    value: RenderAddressingView<'a>,
-    box_id: BoxId,
-) -> Option<LinkTarget<'a>> {
-    let box_idx = layout_state::box_id_index(box_id);
-    let document = value.doc.document();
-    let node = document.node_id_from_raw(value.doc.box_dom_element_idx(box_idx)?)?;
-    std::iter::once(node)
-        .chain(document.dom_ancestors(node))
-        .find_map(|node| {
-            let element = document.element_ref(node)?;
-            if !element.tag().eq_ignore_ascii_case("a")
-                && !element.tag().eq_ignore_ascii_case("area")
-            {
-                return None;
-            }
-            Some(LinkTarget {
-                href: element.attr("href")?,
-                is_note_reference: element_is_note_reference(element),
-            })
-        })
 }

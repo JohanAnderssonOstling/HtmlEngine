@@ -2,15 +2,14 @@ use html_style_model::open_type;
 use html_parse::parse_dom_document;
 use html_style::{
     MediaEnvironment, PropertyValueSyntax, StyledDocument, property_value_syntax,
-    selector_syntax_is_valid, style_document, style_document_with_environment,
-};
+    selector_syntax_is_valid, style_document};
 use html_style_model::StyleView;
 
 fn style_by_id<'a>(styled: &'a StyledDocument, id: &str) -> StyleView<'a> {
     let node = styled
         .document()
         .node_ids()
-        .find(|node| styled.document().get_dom_id(*node) == Some(id))
+        .find(|node| styled.document().try_element_ref(*node).and_then(|element| element.id()) == Some(id))
         .unwrap();
     styled
         .style_view(styled.style_for_node(node).unwrap())
@@ -351,7 +350,7 @@ fn unsupported_part_states_do_not_match_or_enable_supports() {
     let node = styled
         .document()
         .node_ids()
-        .find(|node| styled.document().get_dom_id(*node) == Some("target"))
+        .find(|node| styled.document().try_element_ref(*node).and_then(|element| element.id()) == Some("target"))
         .unwrap();
     let before = styled
         .style_view(styled.styles().before_style_for_node(node).unwrap().0)
@@ -393,7 +392,7 @@ fn unsupported_pseudo_chains_do_not_match_or_enable_supports() {
     let node = styled
         .document()
         .node_ids()
-        .find(|node| styled.document().get_dom_id(*node) == Some("target"))
+        .find(|node| styled.document().try_element_ref(*node).and_then(|element| element.id()) == Some("target"))
         .unwrap();
     let before = styled
         .style_view(styled.styles().before_style_for_node(node).unwrap().0)
@@ -437,7 +436,7 @@ fn scroll_button_selector_grammar_keeps_controls_unmatched_and_feature_queries_f
     let node = styled
         .document()
         .node_ids()
-        .find(|node| styled.document().get_dom_id(*node) == Some("target"))
+        .find(|node| styled.document().try_element_ref(*node).and_then(|element| element.id()) == Some("target"))
         .unwrap();
     let before = styled
         .style_view(styled.styles().before_style_for_node(node).unwrap().0)
@@ -950,7 +949,7 @@ fn computed(css: &str, inline: &str) -> String {
     let target = styled
         .document()
         .node_ids()
-        .find(|id| styled.document().get_dom_id(*id) == Some("target"))
+        .find(|id| styled.document().try_element_ref(*id).and_then(|element| element.id()) == Some("target"))
         .unwrap();
     let view = styled
         .style_view(styled.style_for_node(target).unwrap())
@@ -1256,15 +1255,11 @@ fn feature_settings_at(css: &str, inline: &str, width: f64) -> (Vec<([u8; 4], u3
         "<!doctype html><html><body><p id='target' style=\"{inline}\">Text</p></body></html>"
     ))
     .unwrap();
-    let (styled, queries) = style_document_with_environment(
-        document,
-        &[css],
-        MediaEnvironment::screen(width, Some(600.0)).unwrap(),
-    );
+    let (styled, queries) = { let (styled, _, queries) = html_style::StyleRequest::from_css(document, &[css]).environment(MediaEnvironment::screen(width, Some(600.0)).unwrap()).compile(); (styled, queries) };
     let target = styled
         .document()
         .node_ids()
-        .find(|id| styled.document().get_dom_id(*id) == Some("target"))
+        .find(|id| styled.document().try_element_ref(*id).and_then(|element| element.id()) == Some("target"))
         .unwrap();
     let font = styled
         .font_style(styled.style_for_node(target).unwrap())

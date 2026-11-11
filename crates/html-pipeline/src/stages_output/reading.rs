@@ -1,7 +1,5 @@
 //! Readable blocks addressed by DOM and glyph array indices.
-use crate::stages::text_paint;
 use super::RenderAddressingView;
-use super::box_queries;
 use crate::layout_model::InlineItemKind;
 use html_dom::{DomNodeId, ElementRef, element_is_note_reference, element_is_note_target};
 use html_text::whitespace_context_root;
@@ -12,7 +10,7 @@ use std::ops::Range;
 /// Font shaping and pagination preserve its identity while text stays fixed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReadingTarget {
-    element: u32,
+    element: DomNodeId,
     pub glyph_ranges: Vec<Range<u32>>,
 }
 
@@ -29,33 +27,159 @@ pub struct ReadingPage {
     pub next: u32,
 }
 
-pub fn reading_page(
-    value: RenderAddressingView<'_>,
-    interval: Range<u32>,
-    page_end: u32,
-) -> ReadingPage {
-    let next = if interval.is_empty() {
-        interval.start
-    } else if page_end >= interval.end {
-        interval.end
-    } else {
-        render_addressing_view_reading_boundary_after_word(value, page_end)
-            .min(interval.end)
-            .max(interval.start)
-    };
-    let fragments = if next > interval.start {
-        render_addressing_view_reading_fragments_in(value, interval.start..next)
-    } else {
-        Vec::new()
-    };
-    ReadingPage { fragments, next }
+impl<'a> RenderAddressingView<'a> {
+    pub fn reading_page(self, interval: Range<u32>, page_end: u32) -> ReadingPage {
+        let next = if interval.is_empty() {
+            interval.start
+        } else if page_end >= interval.end {
+            interval.end
+        } else {
+            self.reading_boundary_after_word(page_end)
+                .min(interval.end)
+                .max(interval.start)
+        };
+        let fragments = if next > interval.start {
+            self.reading_fragments_in(interval.start..next)
+        } else {
+            Vec::new()
+        };
+        ReadingPage { fragments, next }
+    }
+
+    /// Index readable items without copying chapter text or consulting pagination.
+    pub fn reading_targets_in(self, interval: Range<u32>) -> Vec<ReadingTarget> {
+        let value = self;
+        let (start, end) = (interval.start, interval.end);
+        let document = value.doc.document();
+        let boxes = value.doc.render_view(value.glyph_metrics).boxes();
+        // Explicit references also identify note bodies without EPUB/ARIA
+        // attributes. Only local fragments belong to this document.
+        let note_ids: HashSet<_> = document
+            .node_ids()
+            .filter_map(|node| document.try_element_ref(node))
+            .filter(|element| {
+                element_is_note_reference(*element)
+                    || element.attr("class").is_some_and(note_reference_class)
+            })
+            .filter_map(|element| element.attr("href").and_then(|href| href.strip_prefix('#')))
+            .filter(|id| !id.is_empty())
+            .collect();
+        let mut rendered = HashMap::<DomNodeId, Vec<Range<u32>>>::new();
+        for run in (value.doc.render_view(value.glyph_metrics).text()).visible_source_runs() {
+            let glyphs = run.glyphs();
+            if glyphs.end <= start
+                || glyphs.start >= end
+                || (boxes)
+                    .ancestors(run.box_id())
+                    .any(|index| boxes.is_table(index))
+            {
+                continue;
+            }
+            if let Some(node) = run.dom_text_node() {
+                rendered
+                    .entry(node)
+                    .or_default()
+                    .push(glyphs.start.max(start)..glyphs.end.min(end));
+            }
+        }
+        let mut targets = Vec::<ReadingTarget>::new();
+        for node in document.node_ids() {
+            let Some(text) = document.try_text_ref(node) else {
+                continue;
+            };
+            let Some(glyph_ranges) = rendered.remove(&node) else {
+                continue;
+            };
+            let mut owner = None;
+            let mut excluded = false;
+            for ancestor in document.dom_ancestors(node) {
+                let Some(element) = document.try_element_ref(ancestor) else {
+                    break;
+                };
+                if excluded_element(element)
+                    || element.attr("id").is_some_and(|id| note_ids.contains(id))
+                {
+                    excluded = true;
+                    break;
+                }
+                if owner.is_none() && block_element(element.tag()) {
+                    owner = Some(ancestor);
+                }
+            }
+            if excluded {
+                continue;
+            }
+            let Some(owner) = owner else { continue };
+            let value = text.text().trim();
+            if value.starts_with("https://")
+                || value.starts_with("http://")
+                || value.starts_with("www.")
+            {
+                continue;
+            }
+            if let Some(target) = targets.last_mut().filter(|target| target.element == owner) {
+                target.glyph_ranges.extend(glyph_ranges);
+            } else {
+                targets.push(ReadingTarget {
+                    element: owner,
+                    glyph_ranges,
+                });
+            }
+        }
+        targets
+    }
+
+    /// Materialize only the requested item's normalized visible text.
+    pub fn reading_text(self, target: &ReadingTarget) -> String {
+        self.reading_characters_from(target, 0)
+            .map(|(character, _)| character)
+            .collect()
+    }
+
+    /// Returns non-overlapping readable blocks in source order. `start` clips
+    /// the first block to a current layout position, including mid-paragraph
+    /// page starts. Inline markup remains inside its owning block.
+    pub fn reading_fragments(self, start: u32) -> Vec<ReadingFragment> {
+        self.reading_fragments_in(start..u32::MAX)
+    }
+
+    pub(crate) fn reading_fragments_in(self, interval: Range<u32>) -> Vec<ReadingFragment> {
+        self.reading_targets_in(interval)
+            .into_iter()
+            .filter_map(|target| {
+                let text = self.reading_text(&target);
+                (!text.is_empty()).then_some(ReadingFragment { text, target })
+            })
+            .collect()
+    }
+
+    pub(crate) fn reading_boundary_after_word(self, mut boundary: u32) -> u32 {
+        let text = self.doc.render_view(self.glyph_metrics).text();
+        let character = |index: u32| text.character_at(index as usize);
+        let limit = self
+            .reading_separators()
+            .find(|&separator| separator >= boundary)
+            .unwrap_or(u32::MAX);
+        if boundary > 0
+            && character(boundary - 1).is_some_and(char::is_alphanumeric)
+            && character(boundary).is_some_and(char::is_alphanumeric)
+        {
+            while boundary < limit && character(boundary).is_some_and(|ch| !ch.is_whitespace()) {
+                boundary += 1;
+            }
+        }
+        while boundary < limit && character(boundary).is_some_and(char::is_whitespace) {
+            boundary += 1;
+        }
+        boundary
+    }
 }
 
 impl RenderAddressingView<'_> {
     /// All reading units and the first unit extending beyond `glyph`. The index
     /// equals the unit count when the position is past all units.
     pub fn reading_targets_at(self, glyph: u32) -> (usize, Vec<ReadingTarget>) {
-        let targets = render_addressing_view_reading_targets_in(self, 0..u32::MAX);
+        let targets = self.reading_targets_in(0..u32::MAX);
         let index = targets
             .iter()
             .position(|target| target.glyph_ranges.iter().any(|range| range.end > glyph))
@@ -88,7 +212,7 @@ impl RenderAddressingView<'_> {
         if span.is_empty() || text.get(span.clone()).is_none() {
             return None;
         }
-        let mut chunk_target = reading_target_with_glyph_ranges(&target, Vec::new());
+        let mut chunk_target = target.with_glyph_ranges(Vec::new());
         let mut next = None;
         for ((offset, character), &glyph) in text.char_indices().zip(&positions) {
             if span.contains(&offset)
@@ -150,7 +274,7 @@ impl RenderAddressingView<'_> {
                         pending_space = Some(None);
                     }
                 }
-                let character = text_paint::render_text_view_character_at(text, index as usize);
+                let character = text.character_at(index as usize);
                 match character {
                     Some(character) if character.is_whitespace() => {
                         pending_space = Some(Some(index));
@@ -201,7 +325,6 @@ impl RenderAddressingView<'_> {
                 separate.then_some(glyphs.start)
             })
     }
-
 }
 
 fn block_element(tag: &str) -> bool {
@@ -276,165 +399,14 @@ fn excluded_element(element: ElementRef<'_>) -> bool {
         })
 }
 
-/// Index readable items without copying chapter text or consulting pagination.
-pub fn render_addressing_view_reading_targets_in(
-    value: RenderAddressingView<'_>,
-    interval: Range<u32>,
-) -> Vec<ReadingTarget> {
-    let (start, end) = (interval.start, interval.end);
-    let document = value.doc.document();
-    let boxes = value.doc.render_view(value.glyph_metrics).boxes();
-    // Explicit references also identify note bodies without EPUB/ARIA
-    // attributes. Only local fragments belong to this document.
-    let note_ids: HashSet<_> = document
-        .node_ids()
-        .filter_map(|node| document.element_ref(node))
-        .filter(|element| {
-            element_is_note_reference(*element)
-                || element.attr("class").is_some_and(note_reference_class)
-        })
-        .filter_map(|element| element.attr("href").and_then(|href| href.strip_prefix('#')))
-        .filter(|id| !id.is_empty())
-        .collect();
-    let mut rendered = HashMap::<DomNodeId, Vec<Range<u32>>>::new();
-    for run in text_paint::render_text_view_visible_source_runs(
-        value.doc.render_view(value.glyph_metrics).text(),
-    ) {
-        let glyphs = run.glyphs();
-        if glyphs.end <= start
-            || glyphs.start >= end
-            || box_queries::ancestors(boxes, text_paint::render_text_run_box_id(&run))
-                .any(|index| box_queries::is_table(boxes, index))
-        {
-            continue;
-        }
-        if let Some(node) = run
-            .dom_text_node()
-            .and_then(|raw| document.node_id_from_raw(raw))
-        {
-            rendered
-                .entry(node)
-                .or_default()
-                .push(glyphs.start.max(start)..glyphs.end.min(end));
+impl ReadingTarget {
+    /// Derive a passage or speech-chunk target while preserving its source identity.
+    /// Ranges belong to the same document; the caller's vector is moved without copying.
+    #[inline]
+    pub fn with_glyph_ranges(&self, glyph_ranges: Vec<Range<u32>>) -> ReadingTarget {
+        ReadingTarget {
+            element: self.element,
+            glyph_ranges,
         }
     }
-    let mut targets = Vec::<ReadingTarget>::new();
-    for node in document.node_ids() {
-        let Some(text) = document.text_ref(node) else {
-            continue;
-        };
-        let Some(glyph_ranges) = rendered.remove(&node) else {
-            continue;
-        };
-        let mut owner = None;
-        let mut excluded = false;
-        for ancestor in document.dom_ancestors(node) {
-            let Some(element) = document.element_ref(ancestor) else {
-                break;
-            };
-            if excluded_element(element)
-                || element.attr("id").is_some_and(|id| note_ids.contains(id))
-            {
-                excluded = true;
-                break;
-            }
-            if owner.is_none() && block_element(element.tag()) {
-                owner = Some(ancestor);
-            }
-        }
-        if excluded {
-            continue;
-        }
-        let Some(owner) = owner else { continue };
-        let value = text.text().trim();
-        if value.starts_with("https://")
-            || value.starts_with("http://")
-            || value.starts_with("www.")
-        {
-            continue;
-        }
-        if let Some(target) = targets
-            .last_mut()
-            .filter(|target| target.element == owner.raw())
-        {
-            target.glyph_ranges.extend(glyph_ranges);
-        } else {
-            targets.push(ReadingTarget {
-                element: owner.raw(),
-                glyph_ranges,
-            });
-        }
-    }
-    targets
-}
-
-/// Materialize only the requested item's normalized visible text.
-pub fn render_addressing_view_reading_text(
-    value: RenderAddressingView<'_>,
-    target: &ReadingTarget,
-) -> String {
-    value
-        .reading_characters_from(target, 0)
-        .map(|(character, _)| character)
-        .collect()
-}
-
-/// Returns non-overlapping readable blocks in source order. `start` clips
-/// the first block to a current layout position, including mid-paragraph
-/// page starts. Inline markup remains inside its owning block.
-pub fn render_addressing_view_reading_fragments(
-    value: RenderAddressingView<'_>,
-    start: u32,
-) -> Vec<ReadingFragment> {
-    render_addressing_view_reading_fragments_in(value, start..u32::MAX)
-}
-
-/// Derive a passage or speech-chunk target while preserving its source identity.
-/// Ranges belong to the same document; the caller's vector is moved without copying.
-#[inline]
-pub fn reading_target_with_glyph_ranges(
-    value: &ReadingTarget,
-    glyph_ranges: Vec<Range<u32>>,
-) -> ReadingTarget {
-    ReadingTarget {
-        element: value.element,
-        glyph_ranges,
-    }
-}
-
-pub(crate) fn render_addressing_view_reading_fragments_in(
-    value: RenderAddressingView<'_>,
-    interval: Range<u32>,
-) -> Vec<ReadingFragment> {
-    render_addressing_view_reading_targets_in(value, interval)
-        .into_iter()
-        .filter_map(|target| {
-            let text = render_addressing_view_reading_text(value, &target);
-            (!text.is_empty()).then_some(ReadingFragment { text, target })
-        })
-        .collect()
-}
-
-pub(crate) fn render_addressing_view_reading_boundary_after_word(
-    value: RenderAddressingView<'_>,
-    mut boundary: u32,
-) -> u32 {
-    let text = value.doc.render_view(value.glyph_metrics).text();
-    let character = |index: u32| text_paint::render_text_view_character_at(text, index as usize);
-    let limit = value
-        .reading_separators()
-        .find(|&separator| separator >= boundary)
-        .unwrap_or(u32::MAX);
-    if boundary > 0
-        && character(boundary - 1).is_some_and(char::is_alphanumeric)
-        && character(boundary).is_some_and(char::is_alphanumeric)
-    {
-        while boundary < limit && character(boundary).is_some_and(|ch| !ch.is_whitespace()) {
-            boundary += 1;
-        }
-    }
-    while boundary < limit && character(boundary).is_some_and(char::is_whitespace) {
-        boundary += 1;
-    }
-    boundary
 }

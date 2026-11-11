@@ -1,10 +1,7 @@
-use html_engine_model::shaping_contracts;
+use html_engine_model::{FontRelativeMetrics, GlyphId};
 use super::*;
-use crate::GlyphId;
 use crate::layout::LayoutEngine;
 use crate::layout::inline_reader::TextCursor;
-#[cfg(feature = "profiling")]
-use crate::profiling::scope;
 use html_style_model::{UsedStyleView, Visibility};
 use html_text::{is_bidi_control, is_mandatory_line_break};
 use unicode_bidi::{BidiClass, bidi_class};
@@ -35,7 +32,7 @@ pub(super) fn inline_overflow(
 }
 
 pub(super) fn append_text_tokens(
-    engine: &LayoutEngine<'_, '_>,
+    inputs: &TextPreparationInputs<'_>,
     tokens: &mut InlineTokens,
     text_cursor: &mut TextCursor<'_>,
     glyphs: Range<u32>,
@@ -47,10 +44,9 @@ pub(super) fn append_text_tokens(
     prepare_bidi_clusters: bool,
     glyph_capacity: usize,
 ) {
-    profile_scope!("tokens.text_glyphs");
     if tokens.compact_defaults.is_some() {
         append_text_tokens_with_storage::<true>(
-            engine,
+            inputs,
             tokens,
             text_cursor,
             glyphs,
@@ -64,7 +60,7 @@ pub(super) fn append_text_tokens(
         );
     } else {
         append_text_tokens_with_storage::<false>(
-            engine,
+            inputs,
             tokens,
             text_cursor,
             glyphs,
@@ -80,7 +76,7 @@ pub(super) fn append_text_tokens(
 }
 
 fn append_text_tokens_with_storage<const COMPACT: bool>(
-    engine: &LayoutEngine<'_, '_>,
+    inputs: &TextPreparationInputs<'_>,
     tokens: &mut InlineTokens,
     text_cursor: &mut TextCursor<'_>,
     glyphs: Range<u32>,
@@ -97,18 +93,18 @@ fn append_text_tokens_with_storage<const COMPACT: bool>(
     let glyph_range = glyphs.clone();
     let glyph_end = glyphs.end;
     let range = glyphs.start as usize..glyphs.end as usize;
-    let contiguous = engine
+    let contiguous = inputs
         .text
         .glyphs()
         .slice(range.clone())
         .and_then(|glyphs| glyphs.as_contiguous())
-        .zip(engine.text.content().characters().get(range));
+        .zip(inputs.text.content().characters().get(range));
     let remaining = if let Some((ids, characters)) = contiguous {
         let input = glyphs
             .zip(ids.iter().zip(characters))
             .map(|(index, (&glyph, &character))| (index, glyph, character));
         append_text_tokens_from_iter::<COMPACT>(
-            engine,
+            inputs,
             tokens,
             text_cursor,
             input,
@@ -125,12 +121,12 @@ fn append_text_tokens_with_storage<const COMPACT: bool>(
         let input = glyphs.map(|index| {
             (
                 index,
-                engine.text.glyph_at(index as usize).unwrap_or_default(),
-                engine.text.character(index),
+                inputs.text.glyph_at(index as usize).unwrap_or_default(),
+                inputs.text.character(index),
             )
         });
         append_text_tokens_from_iter::<COMPACT>(
-            engine,
+            inputs,
             tokens,
             text_cursor,
             input,
@@ -149,7 +145,7 @@ fn append_text_tokens_with_storage<const COMPACT: bool>(
         // prefix already emitted and continue at the unconsumed glyph.
         tokens.expand_compact_for_build(glyph_capacity);
         append_text_tokens_with_storage::<false>(
-            engine,
+            inputs,
             tokens,
             text_cursor,
             start..glyph_end,
@@ -165,7 +161,7 @@ fn append_text_tokens_with_storage<const COMPACT: bool>(
 }
 
 fn append_text_tokens_from_iter<const COMPACT: bool>(
-    engine: &LayoutEngine<'_, '_>,
+    inputs: &TextPreparationInputs<'_>,
     tokens: &mut InlineTokens,
     text_cursor: &mut TextCursor<'_>,
     glyphs: impl Iterator<Item = (u32, GlyphId, char)>,
@@ -178,14 +174,12 @@ fn append_text_tokens_from_iter<const COMPACT: bool>(
     prepare_bidi_clusters: bool,
     glyph_capacity: usize,
 ) -> Option<u32> {
-    #[cfg(feature = "profiling")]
-    let setup_scope = scope("tokens.text_run_setup");
     let run_end = run_range.end;
     let letter_spacing = style.letter_spacing() as f64;
     let word_spacing = style.word_spacing() as f64;
     let word_spacing_factor = style.word_spacing_factor() as f64;
     let font_size = style.font_size();
-    let uses_ahem = engine.reader.box_uses_ahem(box_idx);
+    let uses_ahem = inputs.reader.box_uses_ahem(box_idx);
     let fixed_line_height = if style.line_height_is_normal() && uses_ahem {
         None
     } else {
@@ -195,16 +189,16 @@ fn append_text_tokens_from_iter<const COMPACT: bool>(
     // fallback glyphs can paint outside them without changing the baseline.
     // Backends without selected-face extents retain their glyph metrics.
     let selected_extents = (!style.line_height_is_normal())
-        .then(|| engine.reader.font_metrics(box_idx))
+        .then(|| inputs.reader.font_metrics(box_idx))
         .filter(|metrics| metrics.line_metrics.is_some())
         .map(|metrics| {
-            let (ascent, descent) = shaping_contracts::font_relative_metrics_line_box_extents(metrics, f64::from(font_size));
+            let (ascent, descent) = metrics.line_box_extents(f64::from(font_size));
             (ascent as f32, descent as f32)
         });
     let visible = style.visibility() == Visibility::Visible;
     let placement_required = letter_spacing != 0.0
         || word_spacing != 0.0
-        || has_aligned_inline_ancestor(engine, box_idx);
+        || has_aligned_inline_ancestor(&inputs.reader, box_idx);
     let allows_wrap = white_space.allows_wrap();
     let preserves_spaces = white_space.preserves_spaces();
     let wrap = token_wrap(style, white_space);
@@ -215,10 +209,10 @@ fn append_text_tokens_from_iter<const COMPACT: bool>(
             style.hyphens()
         };
     let hyphen_glyph = (hyphens != Hyphens::None)
-        .then(|| engine.text.hyphen_glyph(box_idx))
+        .then(|| inputs.text.hyphen_glyph(box_idx))
         .flatten();
     let discretionary_hyphen =
-        hyphen_glyph.map(|glyph| (glyph, engine.text.glyph_metric(glyph).advance() as f64));
+        hyphen_glyph.map(|glyph| (glyph, inputs.text.glyph_metric(glyph).advance() as f64));
     let mut no_bidi_glyph_separators =
         tokens.features.no_bidi_glyph_separators() && prepare_bidi_clusters;
     let (dense, metadata, widths, runs, metric_ranges) = (
@@ -237,11 +231,11 @@ fn append_text_tokens_from_iter<const COMPACT: bool>(
     let mut selected_style = None;
     let mut selected_style_end = 0;
     let mut effective_extents = selected_extents;
-    let primary_height = |metrics: html_engine_model::FontRelativeMetrics, size: f32| {
-        let (ascent, descent) = shaping_contracts::font_relative_metrics_line_box_extents(metrics, f64::from(size));
+    let primary_height = |metrics: FontRelativeMetrics, size: f32| {
+        let (ascent, descent) = metrics.line_box_extents(f64::from(size));
         ascent + descent
     };
-    let selected_primary_height = primary_height(engine.reader.font_metrics(box_idx), font_size);
+    let selected_primary_height = primary_height(inputs.reader.font_metrics(box_idx), font_size);
     let mut effective_primary_height = selected_primary_height;
     // Each iterator visits a contiguous source range. A new run or compact
     // fallback starts its own cursor, including when source ranges overlap.
@@ -250,9 +244,6 @@ fn append_text_tokens_from_iter<const COMPACT: bool>(
     // The exclusive Range<u32> iterator cannot yield this sentinel.
     let mut next_hyphen = hyphen_offsets.next().unwrap_or(u32::MAX);
 
-    #[cfg(feature = "profiling")]
-    drop(setup_scope);
-    profile_scope!("tokens.text_emit");
     for (glyph_idx, glyph, source_character) in glyphs {
         let (fallback_advance, metric) = text_cursor
             .glyph_dimensions(glyph)
@@ -266,7 +257,7 @@ fn append_text_tokens_from_iter<const COMPACT: bool>(
             no_bidi_glyph_separators = false;
         }
         let unit = canonical_text_unit_from_facts(
-            engine,
+            inputs,
             glyph_idx,
             box_idx,
             run_end,
@@ -289,6 +280,11 @@ fn append_text_tokens_from_iter<const COMPACT: bool>(
         } else {
             InlineTokenKind::Glyph { glyph_idx }
         };
+        // Reuse the policy already read for the canonical unit instead of
+        // scanning completed tokens to discover Unicode opportunities.
+        if unit.unicode_break_before && matches!(token_kind, InlineTokenKind::Glyph { .. }) {
+            tokens.features.record_unicode_break();
+        }
         let mut token = InlineToken::new(
             token_kind,
             width,
@@ -324,13 +320,13 @@ fn append_text_tokens_from_iter<const COMPACT: bool>(
         // Glyphs arrive in logical order. A selection (including no override)
         // remains valid until the next first-line or first-letter boundary.
         if glyph_idx >= selected_style_end {
-            let ranges = engine.text_style_ranges;
+            let ranges = inputs.text_style_ranges;
             let range = ranges.get(ranges.partition_point(|range| range.glyphs.end <= glyph_idx));
             let (refined_style, end) = match range {
                 Some(range) if range.glyphs.start <= glyph_idx => {
                     (Some(range.style), range.glyphs.end)
                 }
-                next => engine.text.first_letter_style_segment(
+                next => inputs.text.first_letter_style_segment(
                     glyph_idx,
                     next.map_or(u32::MAX, |range| range.glyphs.start),
                 ),
@@ -338,18 +334,19 @@ fn append_text_tokens_from_iter<const COMPACT: bool>(
             selected_style_end = end;
             if refined_style != selected_style {
                 selected_style = refined_style;
-                effective_primary_height = refined_style.map_or(selected_primary_height, |indices| {
-                    let style = engine.reader.used_style(indices);
-                    primary_height(engine.reader.style_font_metrics(indices), style.font_size())
-                });
+                effective_primary_height =
+                    refined_style.map_or(selected_primary_height, |indices| {
+                        let style = inputs.reader.used_style(indices);
+                        primary_height(inputs.reader.style_font_metrics(indices), style.font_size())
+                    });
                 effective_extents = refined_style.map_or(selected_extents, |indices| {
-                    let style = engine.reader.used_style(indices);
+                    let style = inputs.reader.used_style(indices);
                     (!style.line_height_is_normal())
-                        .then(|| engine.reader.style_font_metrics(indices))
+                        .then(|| inputs.reader.style_font_metrics(indices))
                         .filter(|metrics| metrics.line_metrics.is_some())
                         .map(|metrics| {
                             let (ascent, descent) =
-                                shaping_contracts::font_relative_metrics_line_box_extents(metrics, f64::from(style.font_size()));
+                                metrics.line_box_extents(f64::from(style.font_size()));
                             (ascent as f32, descent as f32)
                         })
                 });

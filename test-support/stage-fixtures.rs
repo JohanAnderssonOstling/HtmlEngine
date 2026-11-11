@@ -60,11 +60,11 @@ static TEST_ALLOCATOR: allocation_test_support::TrackingAllocator =
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use crate::{GlyphRequest, FontMetrics, ShapedGlyph};
+    use crate::{FontMetrics, ShapedRun, TextRunShapeRequest, ShapedGlyph};
 
     use std::collections::HashMap;
 
-    use crate::layout_model::{GlyphHandle};
+    use html_engine_model::GlyphHandle;
 
     use crate::GlyphShaper;
 
@@ -107,7 +107,6 @@ pub(crate) mod test_support {
     pub(crate) struct TestGlyphShaper {
         glyphs: HashMap<(char, u32), GlyphHandle>,
         generation: crate::GlyphResourceGeneration,
-        append_checkpoint: Option<usize>,
         x_height_ratio: f32,
         ch_advance_ratio: f32,
         cap_height_ratio: f32,
@@ -120,7 +119,6 @@ pub(crate) mod test_support {
             Self {
                 glyphs: HashMap::new(),
                 generation: crate::GlyphResourceGeneration::default(),
-                append_checkpoint: None,
                 x_height_ratio: 0.5,
                 ch_advance_ratio: 0.5,
                 cap_height_ratio: 0.8,
@@ -147,7 +145,6 @@ pub(crate) mod test_support {
             Self {
                 glyphs: HashMap::new(),
                 generation: crate::GlyphResourceGeneration::default(),
-                append_checkpoint: None,
                 x_height_ratio,
                 ch_advance_ratio: 0.5,
                 cap_height_ratio: 0.8,
@@ -160,7 +157,6 @@ pub(crate) mod test_support {
             Self {
                 glyphs: HashMap::new(),
                 generation: crate::GlyphResourceGeneration::default(),
-                append_checkpoint: None,
                 x_height_ratio,
                 ch_advance_ratio: 0.5,
                 cap_height_ratio: 0.8,
@@ -176,7 +172,6 @@ pub(crate) mod test_support {
             Self {
                 glyphs: HashMap::new(),
                 generation: crate::GlyphResourceGeneration::default(),
-                append_checkpoint: None,
                 x_height_ratio,
                 ch_advance_ratio,
                 cap_height_ratio: 0.8,
@@ -187,58 +182,32 @@ pub(crate) mod test_support {
     }
 
     impl GlyphShaper for TestGlyphShaper {
-        fn reset(&mut self) {
-            self.glyphs.clear();
-            self.generation = crate::GlyphResourceGeneration::default();
-        }
-
         fn resource_generation(&self) -> crate::GlyphResourceGeneration {
             self.generation
         }
 
-        fn begin_append_shaping(&mut self) -> Result<(), crate::ShapeError> {
-            assert!(
-                self.append_checkpoint.is_none(),
-                "append shaping transactions cannot be nested"
-            );
-            self.append_checkpoint = Some(self.glyphs.len());
-            Ok(())
-        }
-
-        fn commit_append_shaping(&mut self) {
-            self.append_checkpoint = None;
-        }
-
-        fn rollback_append_shaping(&mut self) {
-            if let Some(checkpoint) = self.append_checkpoint.take() {
-                self.glyphs
-                    .retain(|_, glyph| (glyph.0 as usize) < checkpoint);
-            }
-        }
-
-        fn shape_glyph(
-            &mut self,
-            request: GlyphRequest<'_>,
-        ) -> Result<ShapedGlyph, crate::ShapeError> {
-            let key = (request.character, request.style.font_size.to_bits());
-            let ascent = request.style.font_size * self.ascent_ratio.unwrap_or(0.75);
-            let descent = (request.style.font_size - ascent).max(0.0);
-            let advance = request.style.font_size * 0.5;
-            let metrics = FontMetrics { ascent, descent };
-            if let Some(&glyph) = self.glyphs.get(&key) {
-                return Ok(ShapedGlyph::new(glyph, advance, metrics));
-            }
-            let glyph = GlyphHandle(self.glyphs.len() as u32);
-            self.glyphs.insert(key, glyph);
-            Ok(ShapedGlyph::new(glyph, advance, metrics))
+        fn shape_run(&mut self, request: TextRunShapeRequest<'_>) -> ShapedRun {
+            ShapedRun::characters(request, |character, style| {
+                let key = (character, style.font_size.to_bits());
+                let ascent = style.font_size * self.ascent_ratio.unwrap_or(0.75);
+                let descent = (style.font_size - ascent).max(0.0);
+                let advance = style.font_size * 0.5;
+                let metrics = FontMetrics { ascent, descent };
+                if let Some(&glyph) = self.glyphs.get(&key) {
+                    return ShapedGlyph::new(glyph, advance, metrics);
+                }
+                let glyph = GlyphHandle(self.glyphs.len() as u32);
+                self.glyphs.insert(key, glyph);
+                ShapedGlyph::new(glyph, advance, metrics)
+            })
         }
 
         fn font_relative_metrics(
             &mut self,
             _request: &crate::ShapingStyle<'_>,
-        ) -> Result<crate::FontRelativeMetrics, crate::ShapeError> {
+        ) -> crate::FontRelativeMetrics {
             self.font_metric_calls += 1;
-            Ok(crate::FontRelativeMetrics {
+            crate::FontRelativeMetrics {
                 x_height_ratio: self.x_height_ratio,
                 ch_advance_ratio: self.ch_advance_ratio,
                 cap_height_ratio: self.cap_height_ratio,
@@ -249,7 +218,7 @@ pub(crate) mod test_support {
                         descent_ratio: (1.0 - ascent_ratio).max(0.0),
                     }),
                 ..crate::FontRelativeMetrics::default()
-            })
+            }
         }
     }
 }

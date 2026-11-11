@@ -1,9 +1,9 @@
+use html_pipeline::engine::LayoutRequest;
 use html_pipeline::engine::LaidOutDocument;
-use html_pipeline::engine::source_queries;
 use html_pipeline::engine::ContentRole;
-use html_pipeline::engine::{box_queries, text_paint};
 
-use crate::text::{FontMetrics, GlyphRequest, ShapedGlyph};
+
+use crate::text::{FontMetrics, ShapedRun, TextRunShapeRequest, ShapedGlyph};
 use html_pipeline::engine::TextExport;
 use html_pipeline::engine::TextExportFormat;
 
@@ -17,59 +17,35 @@ use html_pipeline::DocumentFactory;
 use html_pipeline::engine::GlyphResourceStore;
 use html_pipeline::engine::LayoutConstraints;
 use html_pipeline::engine::find_text_matches;
-use html_pipeline::engine::{export_queries, geometry_queries, search_queries, semantic_queries};
+
 use std::collections::HashMap;
 
 #[derive(Default)]
 struct TestShaper {
     glyphs: HashMap<(char, u32), GlyphHandle>,
     generation: GlyphResourceGeneration,
-    append_checkpoint: Option<(HashMap<(char, u32), GlyphHandle>, GlyphResourceGeneration)>,
 }
 
 impl GlyphShaper for TestShaper {
-    fn reset(&mut self) {
-        self.glyphs.clear();
-        self.generation = GlyphResourceGeneration::default();
-    }
-
     fn resource_generation(&self) -> GlyphResourceGeneration {
         self.generation
     }
 
-    fn begin_append_shaping(&mut self) -> Result<(), crate::text::ShapeError> {
-        assert!(self.append_checkpoint.is_none());
-        self.append_checkpoint = Some((self.glyphs.clone(), self.generation.clone()));
-        Ok(())
-    }
-
-    fn commit_append_shaping(&mut self) {
-        self.append_checkpoint = None;
-    }
-
-    fn rollback_append_shaping(&mut self) {
-        if let Some((glyphs, glyph_store)) = self.append_checkpoint.take() {
-            self.glyphs = glyphs;
-            self.generation = glyph_store;
-        }
-    }
-
-    fn shape_glyph(
-        &mut self,
-        request: GlyphRequest<'_>,
-    ) -> Result<ShapedGlyph, crate::text::ShapeError> {
-        let key = (request.character, request.style.font_size.to_bits());
-        let advance = request.style.font_size * 0.5;
-        let metrics = FontMetrics {
-            ascent: request.style.font_size * 0.75,
-            descent: request.style.font_size * 0.25,
-        };
-        if let Some(&glyph) = self.glyphs.get(&key) {
-            return Ok(ShapedGlyph::new(glyph, advance, metrics));
-        }
-        let glyph = GlyphHandle(self.glyphs.len() as u32);
-        self.glyphs.insert(key, glyph);
-        Ok(ShapedGlyph::new(glyph, advance, metrics))
+    fn shape_run(&mut self, request: TextRunShapeRequest<'_>) -> ShapedRun {
+        ShapedRun::characters(request, |character, style| {
+            let key = (character, style.font_size.to_bits());
+            let advance = style.font_size * 0.5;
+            let metrics = FontMetrics {
+                ascent: style.font_size * 0.75,
+                descent: style.font_size * 0.25,
+            };
+            if let Some(&glyph) = self.glyphs.get(&key) {
+                return ShapedGlyph::new(glyph, advance, metrics);
+            }
+            let glyph = GlyphHandle(self.glyphs.len() as u32);
+            self.glyphs.insert(key, glyph);
+            ShapedGlyph::new(glyph, advance, metrics)
+        })
     }
 }
 
@@ -81,7 +57,10 @@ fn layout(html: &str, resources: &mut GlyphResourceStore) -> LaidOutDocument<'st
         .shape(&mut shaper, resources)
         .expect("the test shaper registers every glyph")
         .layout(
-            LayoutConstraints::new(600.0, 16.0).expect("constraints must be valid"),
+            LayoutRequest::new(
+                LayoutConstraints::new(600.0, 16.0).expect("constraints must be valid"),
+            ),
+            &mut shaper,
             resources,
         )
         .expect("test layout succeeds")
@@ -100,8 +79,8 @@ fn glyph_of(doc: RenderView<'_>, wanted: char) -> u32 {
     let text = doc.text();
     (0..text.glyph_count() as u32)
         .find(|index| {
-            text_paint::glyph_at(text, *index as usize)
-                .and_then(|glyph| text_paint::glyph_metric(text, glyph))
+            text.glyph_at(*index as usize)
+                .and_then(|glyph| text.glyph_metric(glyph))
                 .is_some_and(|metric| metric.ch() == wanted)
         })
         .expect("character must be present")
@@ -171,10 +150,17 @@ fn line_rectangles_follow_recorded_inline_placement() {
         LineScreen {
             point: destination,
             col_index: 1,
+            visible_y: None,
         },
     );
     let page = PagePositions {
         positions,
+        geometry: super::super::PageGeometry {
+            col_width: 100.0,
+            col_gap: 10.0,
+            col_count: 2.0,
+            size: kurbo::Size::new(210.0, 100.0),
+        },
         ..PagePositions::default()
     };
     let geometry = PageView::new(doc, &page);
@@ -194,15 +180,11 @@ fn unavailable_line_addresses_remain_unavailable() {
     let document = layout("<p>Text</p>", &mut document_resources);
     let doc = (&document).render_view(&document_resources);
     assert_eq!(
-        source_queries::source_location_on_line(
-            doc.addressing(),
-            LineId::new(u32::MAX as usize - 1),
-            Some(0)
-        ),
+        (doc.addressing()).source_location_on_line(LineId::new(u32::MAX as usize - 1), Some(0)),
         None
     );
     assert_eq!(
-        source_queries::source_location_on_line(doc.addressing(), LineId::new(0), Some(u32::MAX)),
+        (doc.addressing()).source_location_on_line(LineId::new(0), Some(u32::MAX)),
         None
     );
 }
@@ -214,11 +196,7 @@ fn selection_text_spans_block_boundaries_with_newlines() {
     let mut document_resources = GlyphResourceStore::default();
     let document = layout("<p>alpha</p><p>beta</p>", &mut document_resources);
     let doc = (&document).render_view(&document_resources);
-    let TextExport { plain, .. } = export_queries::render_export_view_text(
-        doc.export(),
-        0..doc.text().glyph_count() as u32,
-        TextExportFormat::PlainAndMarkdown,
-    );
+    let TextExport { plain, .. } = (doc.export()).text(0..doc.text().glyph_count() as u32, TextExportFormat::PlainAndMarkdown);
 
     let plain = plain.expect("a non-empty selection yields text");
     assert!(plain.contains("alpha") && plain.contains("beta"));
@@ -236,11 +214,7 @@ fn selection_markdown_marks_emphasis_and_headings() {
         &mut document_resources,
     );
     let doc = (&document).render_view(&document_resources);
-    let TextExport { markdown, .. } = export_queries::render_export_view_text(
-        doc.export(),
-        0..doc.text().glyph_count() as u32,
-        TextExportFormat::PlainAndMarkdown,
-    );
+    let TextExport { markdown, .. } = (doc.export()).text(0..doc.text().glyph_count() as u32, TextExportFormat::PlainAndMarkdown);
 
     let markdown = markdown.expect("a non-empty selection yields markdown");
     assert!(
@@ -276,14 +250,10 @@ fn touch_words_span_inline_runs_preserve_unicode_and_stop_at_blocks() {
         ('n', "can't"),
     ] {
         let range =
-            search_queries::render_text_view_word_range_at(doc.text(), glyph_of(doc, character))
+            (doc.text()).word_range_at(glyph_of(doc, character))
                 .unwrap();
         assert_eq!(
-            export_queries::render_export_view_text(
-                doc.export(),
-                range,
-                TextExportFormat::PlainAndMarkdown
-            )
+            (doc.export()).text(range, TextExportFormat::PlainAndMarkdown)
             .plain
             .unwrap_or_default(),
             expected
@@ -293,21 +263,13 @@ fn touch_words_span_inline_runs_preserve_unicode_and_stop_at_blocks() {
     let document = layout("<p>alpha</p><p>beta</p>", &mut document_resources);
     let doc = (&document).render_view(&document_resources);
     assert_eq!(
-        export_queries::render_export_view_text(
-            doc.export(),
-            search_queries::render_text_view_word_range_at(doc.text(), glyph_of(doc, 'a')).unwrap(),
-            TextExportFormat::PlainAndMarkdown
-        )
+        (doc.export()).text((doc.text()).word_range_at(glyph_of(doc, 'a')).unwrap(), TextExportFormat::PlainAndMarkdown)
         .plain
         .unwrap_or_default(),
         "alpha"
     );
     assert_eq!(
-        export_queries::render_export_view_text(
-            doc.export(),
-            search_queries::render_text_view_word_range_at(doc.text(), glyph_of(doc, 'b')).unwrap(),
-            TextExportFormat::PlainAndMarkdown
-        )
+        (doc.export()).text((doc.text()).word_range_at(glyph_of(doc, 'b')).unwrap(), TextExportFormat::PlainAndMarkdown)
         .plain
         .unwrap_or_default(),
         "beta"
@@ -316,7 +278,7 @@ fn touch_words_span_inline_runs_preserve_unicode_and_stop_at_blocks() {
     let document = layout("<p>one two</p>", &mut document_resources);
     let doc = (&document).render_view(&document_resources);
     assert!(
-        search_queries::render_text_view_word_range_at(doc.text(), glyph_of(doc, ' ')).is_none()
+        (doc.text()).word_range_at(glyph_of(doc, ' ')).is_none()
     );
 }
 
@@ -326,11 +288,7 @@ fn an_empty_range_yields_no_text() {
     let document = layout("<p>alpha</p>", &mut document_resources);
     let doc = (&document).render_view(&document_resources);
     assert_eq!(
-        export_queries::render_export_view_text(
-            doc.export(),
-            3..3,
-            TextExportFormat::PlainAndMarkdown
-        ),
+        (doc.export()).text(3..3, TextExportFormat::PlainAndMarkdown),
         TextExport::default()
     );
 }
@@ -340,11 +298,7 @@ fn code_spans_use_delimiters_longer_than_their_contents() {
     let mut document_resources = GlyphResourceStore::default();
     let document = layout("<p><code>a`b</code></p>", &mut document_resources);
     let doc = (&document).render_view(&document_resources);
-    let TextExport { markdown, .. } = export_queries::render_export_view_text(
-        doc.export(),
-        0..doc.text().glyph_count() as u32,
-        TextExportFormat::PlainAndMarkdown,
-    );
+    let TextExport { markdown, .. } = (doc.export()).text(0..doc.text().glyph_count() as u32, TextExportFormat::PlainAndMarkdown);
     assert_eq!(markdown.as_deref(), Some("``a`b``"));
 }
 
@@ -359,36 +313,20 @@ fn ancestor_lookup_finds_the_nearest_match_and_stops_at_the_root() {
     );
     let doc = (&document).render_view(&document_resources);
     let boxes = doc.boxes();
-    let paragraph = (0..box_queries::len(boxes))
+    let paragraph = (0..boxes.len())
         .map(layout_state::box_id_new)
-        .find(|&i| box_queries::attribute(boxes, i, "id") == Some("cell"))
+        .find(|&i| boxes.attribute(i, "id") == Some("cell"))
         .expect("the paragraph is in the box tree");
 
-    let table = semantic_queries::render_semantics_view_nearest(
-        semantic_queries::render_view_semantics(doc),
-        paragraph,
-        ContentRole::Table,
-    )
+    let table = (doc.semantics()).nearest(paragraph, ContentRole::Table)
     .expect("the paragraph sits in a table");
-    assert!(semantic_queries::render_semantics_view_contains(
-        semantic_queries::render_view_semantics(doc),
-        table,
-        paragraph
-    ));
+    assert!((doc.semantics()).contains(table, paragraph));
     assert!(
-        semantic_queries::render_semantics_view_nearest(
-            semantic_queries::render_view_semantics(doc),
-            paragraph,
-            ContentRole::TableCell
-        )
+        (doc.semantics()).nearest(paragraph, ContentRole::TableCell)
         .is_some()
     );
     assert!(
-        semantic_queries::render_semantics_view_nearest(
-            semantic_queries::render_view_semantics(doc),
-            paragraph,
-            ContentRole::Quote
-        )
+        (doc.semantics()).nearest(paragraph, ContentRole::Quote)
         .is_none(),
         "a tag that is not an ancestor must not match"
     );
@@ -399,11 +337,7 @@ fn a_box_descends_from_itself() {
     let mut document_resources = GlyphResourceStore::default();
     let document = layout("<p>alpha</p>", &mut document_resources);
     let doc = (&document).render_view(&document_resources);
-    assert!(semantic_queries::render_semantics_view_contains(
-        semantic_queries::render_view_semantics(doc),
-        layout_state::box_id_new(0),
-        layout_state::box_id_new(0)
-    ));
+    assert!((doc.semantics()).contains(layout_state::box_id_new(0), layout_state::box_id_new(0)));
 }
 
 #[test]
@@ -413,22 +347,22 @@ fn heading_prefixes_cover_every_level() {
     let doc = (&document).render_view(&document_resources);
     let boxes = doc.boxes();
     let tagged = |want: &str| {
-        (0..box_queries::len(boxes))
+        (0..boxes.len())
             .map(layout_state::box_id_new)
-            .find(|&i| box_queries::tag(boxes, i).is_some_and(|t| t.eq_ignore_ascii_case(want)))
+            .find(|&i| boxes.tag(i).is_some_and(|t| t.eq_ignore_ascii_case(want)))
             .expect("tag present")
     };
 
     assert_eq!(
-        export_queries::render_export_view_markdown_for_box(doc.export(), tagged("h1")).as_deref(),
+        (doc.export()).markdown_for_box(tagged("h1")).as_deref(),
         Some("# a")
     );
     assert_eq!(
-        export_queries::render_export_view_markdown_for_box(doc.export(), tagged("h3")).as_deref(),
+        (doc.export()).markdown_for_box(tagged("h3")).as_deref(),
         Some("### b")
     );
     assert_eq!(
-        export_queries::render_export_view_markdown_for_box(doc.export(), tagged("p")).as_deref(),
+        (doc.export()).markdown_for_box(tagged("p")).as_deref(),
         Some("c")
     );
 }
@@ -441,15 +375,11 @@ fn start_and_end_line_lookup_agree_on_a_single_line_document() {
     let document = layout("<p>alpha</p>", &mut document_resources);
     let doc = (&document).render_view(&document_resources);
     assert_eq!(
-        geometry_queries::render_geometry_view_start_spatial_rank_at(
-            geometry_queries::render_view_geometry(doc),
-            0.0,
-            0.1
-        ),
+        (doc.geometry()).start_spatial_rank_at(0.0, 0.1),
         0
     );
     assert_eq!(
-        text_paint::render_text_view_line_for_glyph(doc.text(), 0),
+        (doc.text()).line_for_glyph(0),
         Some(LineId::new(0))
     );
 }
@@ -460,23 +390,15 @@ fn line_lookup_on_an_empty_document_does_not_panic() {
     let document = layout("", &mut document_resources);
     let doc = (&document).render_view(&document_resources);
     assert_eq!(
-        geometry_queries::render_geometry_view_start_spatial_rank_at(
-            geometry_queries::render_view_geometry(doc),
-            0.0,
-            0.1
-        ),
+        (doc.geometry()).start_spatial_rank_at(0.0, 0.1),
         0
     );
     assert_eq!(
-        geometry_queries::render_geometry_view_end_spatial_rank_at(
-            geometry_queries::render_view_geometry(doc),
-            0.0,
-            0.1
-        ),
+        (doc.geometry()).end_spatial_rank_at(0.0, 0.1),
         None
     );
     assert_eq!(
-        text_paint::render_text_view_line_for_glyph(doc.text(), 0),
+        (doc.text()).line_for_glyph(0),
         None
     );
 }
@@ -490,25 +412,17 @@ fn start_line_advances_past_earlier_lines() {
     );
     let doc = (&document).render_view(&document_resources);
     let last = doc.text().lines().len() - 1;
-    let last_y = text_paint::render_lines_get(&doc.text().lines(), last)
+    let last_y = (doc.text().lines()).get(last)
         .expect("last line")
         .point()
         .y;
     assert_eq!(
-        geometry_queries::render_geometry_view_start_spatial_rank_at(
-            geometry_queries::render_view_geometry(doc),
-            last_y,
-            0.1
-        ),
+        (doc.geometry()).start_spatial_rank_at(last_y, 0.1),
         last,
         "an offset at the last line's top selects it"
     );
     assert_eq!(
-        geometry_queries::render_geometry_view_start_spatial_rank_at(
-            geometry_queries::render_view_geometry(doc),
-            0.0,
-            0.1
-        ),
+        (doc.geometry()).start_spatial_rank_at(0.0, 0.1),
         0
     );
 }
@@ -568,11 +482,7 @@ fn an_empty_query_matches_nothing() {
     let mut document_resources = GlyphResourceStore::default();
     let document = layout("<p>alpha</p>", &mut document_resources);
     assert!(
-        search_queries::render_text_view_find_matches(
-            (&document).render_view(&document_resources).text(),
-            "",
-            options().into()
-        )
+        ((&document).render_view(&document_resources).text()).find_matches("", options().into())
         .is_empty()
     );
 }
@@ -583,7 +493,7 @@ fn document_matching_returns_glyph_ranges_covering_the_query() {
     let document = layout("<p>alpha beta alpha</p>", &mut document_resources);
     let doc = (&document).render_view(&document_resources);
     let matches =
-        search_queries::render_text_view_find_matches(doc.text(), "alpha", options().into());
+        (doc.text()).find_matches("alpha", options().into());
 
     assert_eq!(matches.len(), 2, "both occurrences are found");
     for range in matches {
@@ -591,11 +501,7 @@ fn document_matching_returns_glyph_ranges_covering_the_query() {
         assert_eq!(end - start, 5, "each match spans the query length");
         let range = start..end;
         assert_eq!(
-            export_queries::render_export_view_text(
-                doc.export(),
-                range,
-                TextExportFormat::PlainAndMarkdown
-            )
+            (doc.export()).text(range, TextExportFormat::PlainAndMarkdown)
             .plain
             .unwrap_or_default()
             .to_lowercase(),
@@ -611,7 +517,7 @@ fn list_markers_are_excluded_from_search() {
     let document = layout("<ol><li>item</li></ol>", &mut document_resources);
     let doc = (&document).render_view(&document_resources);
     assert!(
-        search_queries::render_text_view_find_matches(doc.text(), "1", options().into()).is_empty(),
+        (doc.text()).find_matches("1", options().into()).is_empty(),
         "the generated list marker must not be searchable"
     );
 }

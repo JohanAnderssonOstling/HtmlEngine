@@ -1,4 +1,5 @@
 //! Compare fresh chapter factories with and without a book-owned CSS cache.
+use html_pipeline::engine::LayoutRequest;
 
 use html_pipeline::engine::GlyphResourceStore;
 use html_pipeline::engine::reader_style;
@@ -85,9 +86,8 @@ pub(super) fn run(manifest: &str, count: usize, detailed: bool, cache_counters: 
                 let mut shaped_resources = GlyphResourceStore::default();
                 let shaped = prepared.shape(&mut shaper, &mut shaped_resources).unwrap();
                 let document = shaped
-                    .layout_with_metrics_and_shaper(
-                        constraints,
-                        &inputs.image_metrics,
+                    .layout(
+                        LayoutRequest::new(constraints).with_image_metrics(&inputs.image_metrics),
                         &mut shaper,
                         &mut shaped_resources,
                     )

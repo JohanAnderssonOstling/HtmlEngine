@@ -18,7 +18,6 @@ pub struct Entry {
     pub exclusive_wall: Duration,
     pub inclusive_cpu: Duration,
     pub exclusive_cpu: Duration,
-    pub measurements: Vec<BTreeMap<&'static str, usize>>,
 }
 
 struct Frame {
@@ -33,7 +32,6 @@ struct Recorder {
     clock: fn() -> Duration,
     stack: Vec<Frame>,
     entries: BTreeMap<&'static str, Entry>,
-    measurements: bool,
 }
 
 thread_local! {
@@ -43,16 +41,6 @@ thread_local! {
 /// Capture only scopes executed synchronously by `operation` on this thread.
 /// Nesting captures is an error. A panic clears the recorder during unwinding.
 pub fn capture<R>(clock: fn() -> Duration, operation: impl FnOnce() -> R) -> (R, Vec<Entry>) {
-    capture_with_measurements(clock, false, operation)
-}
-
-/// Detailed counters are separately enabled so ordinary timing captures do
-/// not add bookkeeping to hot loops.
-pub fn capture_with_measurements<R>(
-    clock: fn() -> Duration,
-    measurements: bool,
-    operation: impl FnOnce() -> R,
-) -> (R, Vec<Entry>) {
     struct Reset;
     impl Drop for Reset {
         fn drop(&mut self) {
@@ -66,7 +54,6 @@ pub fn capture_with_measurements<R>(
             clock,
             stack: Vec::new(),
             entries: BTreeMap::new(),
-            measurements,
         });
     });
     let reset = Reset;
@@ -81,33 +68,6 @@ pub fn capture_with_measurements<R>(
     });
     drop(reset);
     (output, entries)
-}
-
-pub fn measurements_enabled() -> bool {
-    RECORDER.with(|state| {
-        state
-            .borrow()
-            .as_ref()
-            .is_some_and(|recorder| recorder.measurements)
-    })
-}
-
-pub fn record_measurement(name: &'static str, values: &[(&'static str, usize)]) {
-    RECORDER.with(|state| {
-        let mut state = state.borrow_mut();
-        let Some(recorder) = state.as_mut().filter(|recorder| recorder.measurements) else {
-            return;
-        };
-        recorder
-            .entries
-            .entry(name)
-            .or_insert_with(|| Entry {
-                name,
-                ..Entry::default()
-            })
-            .measurements
-            .push(values.iter().copied().collect());
-    });
 }
 
 /// A scope must be dropped on its originating thread, in stack order.
@@ -207,23 +167,6 @@ mod tests {
             entries.iter().map(|e| e.exclusive_cpu).sum::<Duration>(),
             Duration::from_nanos(100)
         );
-    }
-
-    #[test]
-    fn measurements_are_opt_in_and_do_not_change_scope_call_counts() {
-        let (_, entries) = capture(clock, || record_measurement("test", &[("value", 7)]));
-        assert!(entries.is_empty());
-        let (_, entries) = capture_with_measurements(clock, true, || {
-            let _scope = scope("test");
-            assert!(measurements_enabled());
-            record_measurement("test", &[("value", 7)]);
-            record_measurement("test", &[("value", 11)]);
-        });
-        assert_eq!(entries[0].calls, 1);
-        assert_eq!(entries[0].measurements.len(), 2);
-        assert_eq!(entries[0].measurements[0]["value"], 7);
-        assert_eq!(entries[0].measurements[1]["value"], 11);
-        assert!(!measurements_enabled());
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use super::{DocumentBuildError, MemoryUsage, MemoryUsageReport};
+use super::dom::HTML_NAMESPACE;
 use crate::storage::StringTable;
 use std::sync::Arc;
 
@@ -70,9 +71,12 @@ impl MemoryUsage for ImageResource {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct StringInterner {
     strings: StringTable,
+    // Stable IDs are append-only and document-local. Cache the HTML namespace
+    // at its first successful insertion, including through class interning.
+    pub(super) html_namespace: Option<u16>,
 }
 
 impl MemoryUsage for StringInterner {
@@ -94,12 +98,17 @@ impl StringInterner {
 
     /// A failed insertion leaves the string table unchanged.
     pub fn try_intern(&mut self, s: &str) -> Result<u16, DocumentBuildError> {
-        self.strings
+        let index = self.strings
             .try_intern(s, usize::from(u16::MAX))
             .map(|index| index as u16)
-            .ok_or(DocumentBuildError::TooManyStrings)
+            .ok_or(DocumentBuildError::TooManyStrings)?;
+        if self.html_namespace.is_none() && s == HTML_NAMESPACE {
+            self.html_namespace = Some(index);
+        }
+        Ok(index)
     }
 
+    #[inline]
     pub fn get(&self, idx: u16) -> &str {
         self.strings.get(idx as usize).expect("registered DOM string")
     }

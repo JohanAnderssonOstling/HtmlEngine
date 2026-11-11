@@ -1,11 +1,9 @@
 //! MathML is retained in the DOM and painted through the ordinary SVG image path.
 
 #[cfg(test)]
-use html_pipeline::engine::fragment_paint;
 #[cfg(test)]
 use html_dom as dom_values;
 use formulary::{Item, Layout, LayoutOptions, MathFont, layout, parse, svg};
-use html_dom::storage;
 use html_dom::{Document, ImageSource};
 use html_style_model::ComputedStyles;
 use quick_xml::{Reader, events::Event};
@@ -34,9 +32,9 @@ pub fn prepare(document: &mut Document, styles: &ComputedStyles) {
 
 pub fn prepare_with_undo(document: &mut Document, styles: &ComputedStyles) -> Vec<MathMlUndo> {
     let equations: Vec<_> = document
-        .node_ids()
+        .element_ids()
         .filter_map(|node| {
-            let image_idx = storage::image_idx(document.element_ref(node)?)?;
+            let image_idx = document.element_ref(node).image_idx()?;
             if !matches!(
                 document.image(image_idx)?.source,
                 ImageSource::MathMl { .. }
@@ -160,7 +158,7 @@ fn valid_layout(laid: &Layout) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use html_pipeline::engine::text_paint;
+    use html_pipeline::engine::LayoutRequest;
 
     use crate::GlyphResourceStore;
     use html_dom::ImageId;
@@ -174,11 +172,17 @@ mod tests {
         width: f64,
         resources: &mut GlyphResourceStore,
     ) -> crate::LaidOutDocument<'static> {
+        let mut resources_shaper = TestGlyphShaper::new();
+
         let prepared = DocumentFactory::new().parse_with_new_pipeline(source, None);
         prepared
-            .shape(&mut TestGlyphShaper::new(), resources)
+            .shape(&mut resources_shaper, resources)
             .unwrap()
-            .layout(LayoutConstraints::new(width, 24.0).unwrap(), resources)
+            .layout(
+                LayoutRequest::new(LayoutConstraints::new(width, 24.0).unwrap()),
+                &mut resources_shaper,
+                resources,
+            )
             .expect("layout requires the shaper-aware API for first-line styles")
     }
 
@@ -192,24 +196,24 @@ mod tests {
         );
         let view = document.render_view(&document_resources);
         assert!(
-            text_paint::render_view_image_mathml(&view, dom_values::image_id_new(0))
+            view.image_mathml(dom_values::image_id_new(0))
                 .unwrap()
                 .contains("<mfrac>")
         );
         assert!(
-            text_paint::render_view_image_mathml(&view, dom_values::image_id_new(0))
+            view.image_mathml(dom_values::image_id_new(0))
                 .unwrap()
                 .contains("http://www.w3.org/1998/Math/MathML")
         );
         assert_eq!(
-            fragment_paint::render_fragment_view_images(view.fragments()).len(),
+            (view.fragments()).images().len(),
             1
         );
         let text = view.text();
         assert!(
             !(0..text.glyph_count()).any(|index| {
-                text_paint::glyph_at(text, index)
-                    .and_then(|glyph| text_paint::glyph_metric(text, glyph))
+                text.glyph_at(index)
+                    .and_then(|glyph| text.glyph_metric(glyph))
                     .is_some_and(|metric| metric.ch() == 'x')
             }),
             "formula source is represented by an atomic image"
@@ -225,21 +229,21 @@ mod tests {
             &mut document_resources,
         );
         let view = document.render_view(&document_resources);
-        let images = fragment_paint::render_fragment_view_images(view.fragments());
+        let images = (view.fragments()).images();
         let image = images.iter().next().unwrap();
         assert!(
-            fragment_paint::render_image_fragment_size(&image).width <= 74.01,
+            image.size().width <= 74.01,
             "equation must fit inside body margins: {:?}",
-            fragment_paint::render_image_fragment_size(&image)
+            image.size()
         );
         let line = view
             .text()
-            .line(fragment_paint::render_image_fragment_line(&image))
+            .line(image.line())
             .unwrap();
-        let bottom = fragment_paint::render_image_fragment_offset(&image).y
-            + fragment_paint::render_image_fragment_size(&image).height;
+        let bottom = image.offset().y
+            + image.size().height;
         assert!(
-            fragment_paint::render_image_fragment_offset(&image).y < line.baseline()
+            image.offset().y < line.baseline()
                 && bottom > line.baseline()
         );
     }
@@ -254,7 +258,7 @@ mod tests {
         );
         let view = document.render_view(&document_resources);
         assert_eq!(
-            fragment_paint::render_fragment_view_images(view.fragments()).len(),
+            (view.fragments()).images().len(),
             1
         );
         assert!(view.text().lines().len() >= 3);
@@ -262,6 +266,8 @@ mod tests {
 
     #[test]
     fn namespaced_xhtml_mathml_keeps_source_and_reader_font_size() {
+        let mut document_resources_shaper = TestGlyphShaper::new();
+
         let source = r#"<html xmlns="http://www.w3.org/1999/xhtml" xmlns:m="http://www.w3.org/1998/Math/MathML"><body><m:math><m:mi>x</m:mi></m:math></body></html>"#;
         let mut widths = Vec::new();
         for size in [16.0, 32.0] {
@@ -272,20 +278,21 @@ mod tests {
             let prepared = crate::PreparedDocument::try_new(document, styles).unwrap();
             let mut document_resources = GlyphResourceStore::default();
             let document = prepared
-                .shape(&mut TestGlyphShaper::new(), &mut document_resources)
+                .shape(&mut document_resources_shaper, &mut document_resources)
                 .unwrap()
                 .layout(
-                    LayoutConstraints::new(400.0, 40.0).unwrap(),
-                    &document_resources,
+                    LayoutRequest::new(LayoutConstraints::new(400.0, 40.0).unwrap()),
+                    &mut document_resources_shaper,
+                    &mut document_resources,
                 )
                 .expect("layout requires the shaper-aware API for first-line styles");
             let view = document.render_view(&document_resources);
             assert!(
-                text_paint::render_view_image_mathml(&view, dom_values::image_id_new(0))
+                view.image_mathml(dom_values::image_id_new(0))
                     .unwrap()
                     .contains("<mi>x</mi>")
             );
-            widths.push(text_paint::render_view_images(&view)[0].width);
+            widths.push(view.images()[0].width);
         }
         assert!((widths[1] as i64 - 4 - 2 * (widths[0] as i64 - 4)).abs() <= 2);
     }
@@ -304,10 +311,16 @@ mod tests {
             prepared: &'a crate::PreparedDocument<'_>,
             resources: &mut GlyphResourceStore,
         ) -> crate::LaidOutDocument<'a> {
+            let mut resources_shaper = TestGlyphShaper::new();
+
             prepared
-                .shape_borrowed(&mut TestGlyphShaper::new(), resources)
+                .shape_borrowed(&mut resources_shaper, resources)
                 .unwrap()
-                .layout(LayoutConstraints::new(400.0, 24.0).unwrap(), resources)
+                .layout(
+                    LayoutRequest::new(LayoutConstraints::new(400.0, 24.0).unwrap()),
+                    &mut resources_shaper,
+                    resources,
+                )
                 .expect("layout requires the shaper-aware API for first-line styles")
         }
         let mut ordinary_resources = GlyphResourceStore::default();
@@ -316,7 +329,7 @@ mod tests {
         let themed = layout(&themed, &mut themed_resources);
         let view = themed.render_view(&themed_resources);
         assert_eq!(
-            fragment_paint::render_fragment_view_images(view.fragments())
+            (view.fragments()).images()
                 .iter()
                 .next()
                 .unwrap()
@@ -324,11 +337,11 @@ mod tests {
             0xeeeeeeff
         );
         let ImageSource::MathMl { svg: old, .. } =
-            &text_paint::render_view_images(&ordinary.render_view(&ordinary_resources))[0].source
+            &(ordinary.render_view(&ordinary_resources)).images()[0].source
         else {
             panic!("math source")
         };
-        let ImageSource::MathMl { svg: new, .. } = &text_paint::render_view_images(&view)[0].source
+        let ImageSource::MathMl { svg: new, .. } = &view.images()[0].source
         else {
             panic!("math source")
         };

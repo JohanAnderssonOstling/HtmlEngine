@@ -1,16 +1,22 @@
-use super::box_model::ResolvedBoxModel;
 use super::inline::{BreakKind, tokens::indent_for_line};
 use crate::flex_grid::TaffyContainerKind;
 use crate::layout::LayoutEngine;
-use crate::layout_model::{Children, InlineItemKind, LayoutMode};
+use html_engine_model::{Children, InlineItemKind, LayoutMode};
 use html_style_model::{Float, OverflowWrap, UsedPreferredSize as PreferredSize, WhiteSpace, WordBreak};
 use html_text::is_other_space_separator;
 use std::ops::Range;
 
+/// Single-threaded memoized values for one immutable layout pass.
+#[derive(Clone, Copy, Default)]
+pub(super) struct IntrinsicWidths {
+    outer: Option<(f64, f64)>,
+    content: Option<(f64, f64)>,
+}
+
 /// Shared intrinsic inline-size calculation for every formatting context.
 /// Container-specific algorithms contribute through the dispatch in
 /// `box_content_intrinsic_widths`; table track solving remains table-owned.
-pub fn box_intrinsic_widths(engine: &LayoutEngine<'_, '_>, box_idx: usize) -> (f64, f64) {
+pub fn box_intrinsic_widths(engine: &mut LayoutEngine<'_, '_>, box_idx: usize) -> (f64, f64) {
     box_intrinsic_widths_with_available(engine, box_idx, None)
 }
 
@@ -21,18 +27,11 @@ pub fn percentage_height_image_width(
     box_idx: usize,
     content_height: f64,
 ) -> Option<f64> {
-    let element = engine
-        .reader
-        .layout_tree()
-        .element_for_box(box_idx, engine.reader.document())?;
+    if engine.config.book_optimized_text() {
+        return None;
+    }
     let mut width: Option<f64> = None;
-    for child_id in element.children() {
-        let child_raw = child_id.raw();
-        let Some(child_box_idx) = (0..engine.reader.box_count())
-            .find(|&candidate| engine.reader.box_dom_element(candidate) == Some(child_raw))
-        else {
-            continue;
-        };
+    for &child_box_idx in engine.reader.percentage_height_image_children(box_idx) {
         let Some(intrinsic) = engine.reader.image_intrinsic(child_box_idx) else {
             continue;
         };
@@ -55,13 +54,30 @@ pub fn percentage_height_image_width(
 }
 
 fn box_intrinsic_widths_with_available(
-    engine: &LayoutEngine<'_, '_>,
+    engine: &mut LayoutEngine<'_, '_>,
+    box_idx: usize,
+    available_width: Option<f64>,
+) -> (f64, f64) {
+    if available_width.is_none() {
+        if let Some(widths) = engine.scratch.intrinsic_widths[box_idx].outer {
+            return widths;
+        }
+        let widths = calculate_box_intrinsic_widths(engine, box_idx, None);
+        engine.scratch.intrinsic_widths[box_idx].outer = Some(widths);
+        return widths;
+    }
+    calculate_box_intrinsic_widths(engine, box_idx, available_width)
+}
+
+fn calculate_box_intrinsic_widths(
+    engine: &mut LayoutEngine<'_, '_>,
     box_idx: usize,
     available_width: Option<f64>,
 ) -> (f64, f64) {
     // Intrinsic sizing: percentage padding/margin count as zero.
     let style = engine.reader.style(box_idx);
-    let mut box_model = ResolvedBoxModel::new(style, 0.0);
+    let sizes = engine.reader.sizes(box_idx);
+    let mut box_model = engine.reader.box_model(box_idx, 0.0);
     if engine.reader.is_table_box(box_idx)
         && matches!(
             style.border_collapse(),
@@ -88,7 +104,10 @@ fn box_intrinsic_widths_with_available(
     let outer_min = content_min + extras;
     let outer_max = content_max + extras;
     let intrinsic_value = |size: PreferredSize, auto: f64| match size {
-        PreferredSize::Auto | PreferredSize::Content | PreferredSize::Percent(_) | PreferredSize::Stretch => auto,
+        PreferredSize::Auto
+        | PreferredSize::Content
+        | PreferredSize::Percent(_)
+        | PreferredSize::Stretch => auto,
         PreferredSize::MinContent => outer_min,
         PreferredSize::MaxContent => outer_max,
         PreferredSize::FitContent => available_width.map_or(outer_max, |available| {
@@ -107,10 +126,10 @@ fn box_intrinsic_widths_with_available(
         }
     };
 
-    let mut preferred_min = intrinsic_value(style.width(), outer_min);
-    let mut preferred_max = intrinsic_value(style.width(), outer_max);
-    let minimum = intrinsic_value(style.min_width(), extras);
-    let maximum = intrinsic_value(style.max_width(), f64::INFINITY).max(minimum);
+    let mut preferred_min = intrinsic_value(sizes.width, outer_min);
+    let mut preferred_max = intrinsic_value(sizes.width, outer_max);
+    let minimum = intrinsic_value(sizes.min_width, extras);
+    let maximum = intrinsic_value(sizes.max_width, f64::INFINITY).max(minimum);
     preferred_min = preferred_min.clamp(minimum, maximum);
     preferred_max = preferred_max.clamp(minimum, maximum).max(preferred_min);
     if engine.reader.is_table_box(box_idx) {
@@ -125,7 +144,23 @@ fn box_intrinsic_widths_with_available(
 /// Intrinsic content contributions. A definite available inline size supplies
 /// the stretch-fit limit needed by `fit-content`; `None` keeps it indefinite.
 pub fn box_content_intrinsic_widths(
-    engine: &LayoutEngine<'_, '_>,
+    engine: &mut LayoutEngine<'_, '_>,
+    box_idx: usize,
+    available_width: Option<f64>,
+) -> (f64, f64) {
+    if available_width.is_none() {
+        if let Some(widths) = engine.scratch.intrinsic_widths[box_idx].content {
+            return widths;
+        }
+        let widths = calculate_content_intrinsic_widths(engine, box_idx, None);
+        engine.scratch.intrinsic_widths[box_idx].content = Some(widths);
+        return widths;
+    }
+    calculate_content_intrinsic_widths(engine, box_idx, available_width)
+}
+
+fn calculate_content_intrinsic_widths(
+    engine: &mut LayoutEngine<'_, '_>,
     box_idx: usize,
     available_width: Option<f64>,
 ) -> (f64, f64) {
@@ -208,12 +243,15 @@ pub fn contains_full_width_percentage_table(engine: &LayoutEngine<'_, '_>, box_i
 
     match engine.reader.box_layout_mode(box_idx) {
         Some(LayoutMode::Block(block)) => children_contain(&block.children),
-        Some(LayoutMode::Table(table)) => table
-            .rows
-            .iter()
-            .chain(&table.captions_top)
-            .chain(&table.captions_bottom)
-            .any(contains_box),
+        Some(LayoutMode::Table(_)) => {
+            let table = engine.reader.box_table(box_idx).expect("table payload");
+            table
+                .rows
+                .iter()
+                .chain(&table.captions_top)
+                .chain(&table.captions_bottom)
+                .any(contains_box)
+        }
         Some(LayoutMode::TableRow(row)) => row.cells.iter().any(contains_box),
         Some(LayoutMode::TableCell(cell)) => children_contain(&cell.children),
         Some(LayoutMode::Flex(container)) => container.children.iter().any(contains_box),
@@ -226,7 +264,7 @@ pub fn contains_full_width_percentage_table(engine: &LayoutEngine<'_, '_>, box_i
 }
 
 fn children_intrinsic_widths(
-    engine: &LayoutEngine<'_, '_>,
+    engine: &mut LayoutEngine<'_, '_>,
     children: &Children,
     container_box_idx: usize,
     available_width: Option<f64>,
@@ -324,12 +362,13 @@ impl IntrinsicWidth {
     }
 
     fn value(&self) -> f64 {
-        self.widest.max((self.current - self.trailing_removable).max(0.0))
+        self.widest
+            .max((self.current - self.trailing_removable).max(0.0))
     }
 }
 
 fn runs_intrinsic_widths(
-    engine: &LayoutEngine<'_, '_>,
+    engine: &mut LayoutEngine<'_, '_>,
     run_range: Range<u32>,
     container_box_idx: usize,
 ) -> (f64, f64) {
@@ -349,6 +388,7 @@ fn runs_intrinsic_widths(
     let mut pending_collapsible_space = 0.0f64;
     let mut preserved_space_break = false;
     let mut text_cursor = engine.text.cursor();
+    let text_inputs = engine.text_preparation_inputs();
 
     for run in &engine.text.inline_items()[run_range.start as usize..run_range.end as usize] {
         if !engine
@@ -363,7 +403,7 @@ fn runs_intrinsic_widths(
                 for glyph_idx in glyphs.clone() {
                     let white_space = style.white_space();
                     let (unit, cluster_boundary) = super::inline::canonical_text_unit(
-                        engine,
+                        &text_inputs,
                         &mut text_cursor,
                         glyph_idx,
                         run.box_idx as usize,
@@ -426,9 +466,7 @@ fn runs_intrinsic_widths(
                     } else {
                         unit.natural_advance
                     };
-                    if break_kind == BreakKind::Discretionary
-                        && cluster_boundary
-                    {
+                    if break_kind == BreakKind::Discretionary && cluster_boundary {
                         minimum.finish(soft_indent);
                         if c == '\u{200b}' {
                             continue;
@@ -453,7 +491,9 @@ fn runs_intrinsic_widths(
                             // internal spaces while excluding a hanging suffix.
                             minimum.add_removable(advance);
                         }
-                        if maximum.current > 0.0 { pending_collapsible_space = advance; }
+                        if maximum.current > 0.0 {
+                            pending_collapsible_space = advance;
+                        }
                         continue;
                     }
                     if break_kind == BreakKind::Soft {

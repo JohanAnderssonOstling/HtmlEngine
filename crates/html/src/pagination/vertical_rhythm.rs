@@ -1,8 +1,7 @@
-use html_pipeline::engine::pagination_queries;
 use super::PagePositions;
 use super::{Paginator, VerticalRhythmScratch};
 use crate::pagination::PaginationTarget;
-use html_pipeline::engine::fragment_paint;
+use html_engine_model::page_placements;
 
 const MAX_GAP_STRETCH: f64 = 2.0;
 const MAX_COLUMN_STRETCH: f64 = 12.0;
@@ -18,7 +17,7 @@ impl Paginator<'_> {
         page: &mut PagePositions,
         scratch: &mut VerticalRhythmScratch,
     ) {
-        let lines = pagination_queries::render_view_pagination(self.doc);
+        let lines = self.pagination();
         let layout = self.layout;
         scratch.visible.clear();
         scratch.visible.extend(page.positions.iter());
@@ -89,7 +88,7 @@ impl Paginator<'_> {
                     || scratch.rigid_ranges.iter().any(|(top, bottom)| {
                         trigger > *top + EPSILON && trigger < *bottom - EPSILON
                     })
-                    || fragment_paint::has_unbroken_border(self.doc.fragments(), *next_idx, trigger)
+                    || (self.doc.fragments()).has_unbroken_border(*next_idx, trigger)
                 {
                     continue;
                 }
@@ -112,11 +111,15 @@ impl Paginator<'_> {
                 cumulative += per_gap;
                 let mut after_gap = false;
                 for (line_id, screen) in
-                    html_engine_model::page_placements::line_positions_mut(&mut page.positions)
+                    page_placements::line_positions_mut(&mut page.positions)
                 {
                     after_gap |= line_id == next_idx;
                     if after_gap && screen.col_index == column {
                         screen.point.y += per_gap;
+                        if let Some((top, bottom)) = screen.visible_y.as_mut() {
+                            *top += per_gap;
+                            *bottom += per_gap;
+                        }
                     }
                 }
                 let base_offset = scratch

@@ -2,12 +2,8 @@
 //!
 //! A selection borrows an engine render view. Applications own gestures, screen
 //! projection, highlight colors, and clipboard access.
-use html_pipeline::engine::text_paint;
 use html_engine_model::layout_state;
-use html_pipeline::engine::export_queries;
-use html_pipeline::engine::semantic_queries;
 use crate::export::{TextExport, TextExportFormat};
-use html_pipeline::engine::box_queries;
 
 use crate::layout::BoxId;
 use crate::layout::ContentRole;
@@ -22,8 +18,8 @@ mod state;
 mod controller;
 pub use controller::{
     SelectionController, SelectionExport, SelectionGeometry, SelectionHit, SelectionInput,
-    SelectionKind, SelectionLayout, SelectionOutcome, SelectionPaintScratch, SelectionUnit,
-};
+    SelectionKind, SelectionLayout, SelectionOutcome, SelectionPaintScratch, SelectionPaintStyle,
+    SelectionUnit};
 pub use state::{SelectionMode, TableHit};
 pub(crate) use state::{SelectionAnchor, SelectionState, TableCellRange, TableSelectionState};
 
@@ -72,24 +68,17 @@ impl<'a> Selection<'a> {
     /// Inline descendants stay part of their paragraph, heading, item or cell.
     /// The range covers the whole element, independent of viewport clipping.
     pub(crate) fn containing_element(view: RenderView<'a>, glyph: u32) -> Option<Self> {
-        let run = text_paint::render_text_view_visible_source_runs(view.text())
+        let run = (view.text()).visible_source_runs()
             .find(|run| run.glyphs().contains(&glyph))?;
         let boxes = view.boxes();
-        let element = once(text_paint::render_text_run_box_id(&run))
-            .chain(box_queries::ancestors(
-                boxes,
-                text_paint::render_text_run_box_id(&run),
-            ))
+        let element = once(run.box_id())
+            .chain(boxes.ancestors(run.box_id()))
             .find(|&index| {
-                box_queries::tag(boxes, index).is_some()
-                    && (box_queries::render_box_view_is_block_container(boxes, index)
-                        || box_queries::is_flex_or_grid_container(boxes, index))
+                boxes.tag(index).is_some()
+                    && (boxes.is_block_container(index)
+                        || boxes.is_flex_or_grid_container(index))
             })?;
-        let ranges = semantic_queries::render_semantics_view_text_ranges(
-            semantic_queries::render_view_semantics(view),
-            element,
-            false,
-        );
+        let ranges = (view.semantics()).text_ranges(element, false);
         let start = ranges.iter().map(|range| range.start).min()?;
         let end = ranges.iter().map(|range| range.end).max()?;
         (start < end).then(|| Self::new(view, start..end))
@@ -97,6 +86,11 @@ impl<'a> Selection<'a> {
 
     pub fn range(&self) -> Range<u32> {
         self.range.clone()
+    }
+
+    /// Source language at the beginning of the selected passage.
+    pub fn language(&self) -> Option<&'a str> {
+        self.view.addressing().language_at(self.range.start)
     }
 
     pub(crate) fn new(view: RenderView<'a>, range: Range<u32>) -> Self {
@@ -132,7 +126,7 @@ impl<'a> Selection<'a> {
                 markdown: self.semantic_markdown(self.range.start, self.range.end),
             }
         } else {
-            export_queries::render_export_view_text(self.view.export(), self.range.clone(), TextExportFormat::PlainAndMarkdown)
+            (self.view.export()).text(self.range.clone(), TextExportFormat::PlainAndMarkdown)
         }
     }
 
@@ -142,7 +136,7 @@ impl<'a> Selection<'a> {
         if !self.is_valid() {
             return None;
         }
-        export_queries::render_export_view_text(self.view.export(), self.range.clone(), TextExportFormat::Plain).plain
+        (self.view.export()).text(self.range.clone(), TextExportFormat::Plain).plain
     }
 
     /// Prepare Markdown only when a copy or export action requests it.
@@ -153,7 +147,7 @@ impl<'a> Selection<'a> {
         if self.semantic {
             self.semantic_markdown(self.range.start, self.range.end)
         } else {
-            export_queries::render_export_view_text(self.view.export(), self.range.clone(), TextExportFormat::Markdown).markdown
+            (self.view.export()).text(self.range.clone(), TextExportFormat::Markdown).markdown
         }
     }
 
@@ -228,44 +222,32 @@ impl<'a> Selection<'a> {
             return Vec::new();
         }
         let view = self.view;
-        let semantics = semantic_queries::render_view_semantics(view);
+        let semantics = view.semantics();
         let boxes = view.boxes();
         let mut list_items = HashSet::new();
         let mut code_blocks = HashSet::new();
-        for run in text_paint::render_text_view_visible_source_runs(view.text()) {
+        for run in (view.text()).visible_source_runs() {
             let glyphs = run.glyphs();
             if glyphs.start >= selection_end
                 || glyphs.end <= selection_start
-                || semantic_queries::render_semantics_view_nearest(
-                    semantics,
-                    text_paint::render_text_run_box_id(&run),
-                    ContentRole::Table,
-                )
+                || semantics.nearest(run.box_id(), ContentRole::Table)
                 .is_some()
             {
                 continue;
             }
-            if let Some(block) = semantic_queries::render_semantics_view_nearest(
-                semantics,
-                text_paint::render_text_run_box_id(&run),
-                ContentRole::CodeBlock,
-            ) {
+            if let Some(block) = semantics.nearest(run.box_id(), ContentRole::CodeBlock) {
                 code_blocks.insert(block);
-            } else if let Some(item) = semantic_queries::render_semantics_view_nearest(
-                semantics,
-                text_paint::render_text_run_box_id(&run),
-                ContentRole::ListItem,
-            ) {
+            } else if let Some(item) = semantics.nearest(run.box_id(), ContentRole::ListItem) {
                 list_items.insert(item);
             }
         }
         let selected_list_items = list_items.clone();
         list_items.retain(|item| {
-            !box_queries::ancestors(boxes, *item)
+            !boxes.ancestors(*item)
                 .any(|ancestor| selected_list_items.contains(&ancestor))
         });
         code_blocks.retain(|block| {
-            !box_queries::ancestors(boxes, *block).any(|ancestor| list_items.contains(&ancestor))
+            !boxes.ancestors(*block).any(|ancestor| list_items.contains(&ancestor))
         });
 
         let mut units = Vec::new();
@@ -274,11 +256,7 @@ impl<'a> Selection<'a> {
             .map(|item| (item, true))
             .chain(code_blocks.into_iter().map(|block| (block, false)))
         {
-            let ranges = semantic_queries::render_semantics_view_text_ranges(
-                semantics,
-                box_idx,
-                is_list_item,
-            );
+            let ranges = semantics.text_ranges(box_idx, is_list_item);
             if let (Some(start), Some(end)) = (
                 ranges.iter().map(|range| range.start).min(),
                 ranges.iter().map(|range| range.end).max(),
@@ -311,11 +289,11 @@ impl<'a> Selection<'a> {
         let view = self.view;
         let boxes = view.boxes();
         let mut selections = Vec::new();
-        for table_box in (0..box_queries::len(boxes))
+        for table_box in (0..boxes.len())
             .map(layout_state::box_id_new)
-            .filter(|&index| box_queries::is_table(boxes, index))
+            .filter(|&index| boxes.is_table(index))
         {
-            let Some(table) = box_queries::render_box_view_table(boxes, table_box) else {
+            let Some(table) = boxes.table(table_box) else {
                 continue;
             };
             let cells = table.cells();
@@ -369,7 +347,7 @@ impl<'a> Selection<'a> {
             .semantic_text_units(selection_start, selection_end)
             .into_iter()
             .filter_map(|unit| {
-                export_queries::render_export_view_markdown_for_box(export, unit.box_idx)
+                export.markdown_for_box(unit.box_idx)
                     .map(|markdown| (unit.glyph_start, unit.glyph_end, markdown))
             })
             .collect::<Vec<_>>();
@@ -385,7 +363,7 @@ impl<'a> Selection<'a> {
         );
         units.sort_by_key(|unit| unit.0);
         if units.is_empty() {
-            return export_queries::render_export_view_text(export, selection_start..selection_end, TextExportFormat::Markdown).markdown;
+            return export.text(selection_start..selection_end, TextExportFormat::Markdown).markdown;
         }
         let mut markdown = String::new();
         let mut cursor = selection_start;
@@ -401,7 +379,7 @@ impl<'a> Selection<'a> {
         for (start, end, value) in units {
             let ordinary_end = start.min(selection_end);
             if cursor < ordinary_end
-                && let Some(value) = export_queries::render_export_view_text(export, cursor..ordinary_end, TextExportFormat::Markdown).markdown
+                && let Some(value) = export.text(cursor..ordinary_end, TextExportFormat::Markdown).markdown
             {
                 append(&mut markdown, &value);
             }
@@ -409,7 +387,7 @@ impl<'a> Selection<'a> {
             cursor = cursor.max(end);
         }
         if cursor < selection_end
-            && let Some(value) = export_queries::render_export_view_text(export, cursor..selection_end, TextExportFormat::Markdown).markdown
+            && let Some(value) = export.text(cursor..selection_end, TextExportFormat::Markdown).markdown
         {
             append(&mut markdown, &value);
         }

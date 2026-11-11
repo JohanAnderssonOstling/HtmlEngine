@@ -53,13 +53,13 @@ pub struct TextChildPosition {
 impl Document {
     /// Element steps from the document root, with optional source ID assertions.
     pub fn element_source_path(&self, element: DomNodeId) -> Option<Vec<SourceElementStep<'_>>> {
-        self.element_ref(element)?;
+        self.try_element_ref(element)?;
         let mut path = Vec::new();
         let mut node = element;
-        while let Some(parent) = self.get_dom_parent(node) {
+        while let Some(parent) = self.node_ref(node).parent() {
             path.push(SourceElementStep {
                 step: self.get_element_step(node)?,
-                id: self.get_dom_id(node),
+                id: self.element_ref(node).id(),
             });
             node = parent;
         }
@@ -75,10 +75,10 @@ impl Document {
         parent: DomNodeId,
     ) -> impl Iterator<Item = (TextRef<'_>, usize)> + '_ {
         let mut element_count = 0;
-        self.element_ref(parent)
+        self.try_element_ref(parent)
             .into_iter()
             .flat_map(|element| element.children())
-            .filter_map(move |node| match self.node_ref(node)? {
+            .filter_map(move |node| match self.node_ref(node) {
                 NodeRef::Element(_) => {
                     element_count += 1;
                     None
@@ -120,7 +120,7 @@ impl Document {
         local_offset: usize,
         after_character: bool,
     ) -> Option<SourcePosition<'_>> {
-        let text = self.text_ref(node)?;
+        let text = self.try_text_ref(node)?;
         let parent = text.parent()?;
         let position = self
             .text_child_positions(parent)
@@ -167,8 +167,8 @@ mod tests {
             attribute_cache: DomElementAttributeCache::new(None, 0..0),
             image_idx: None,
         };
-        let (root, builder) = builder.append_dom_element(None, element()).unwrap();
-        let mut builder = builder.set_dom_root(root).unwrap();
+        let root = builder.append_dom_element(None, element()).unwrap();
+        builder.set_dom_root(root).unwrap();
         let astral = builder.append_dom_text(root, "😀").unwrap();
         let empty = builder.append_dom_text(root, "").unwrap();
         let adjacent = builder.append_dom_text(root, "b").unwrap();

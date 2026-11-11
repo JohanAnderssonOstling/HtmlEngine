@@ -1,5 +1,7 @@
 pub mod cfi;
 mod dom;
+mod columns;
+use columns::{Elements, Texts};
 mod memory;
 mod resources;
 mod source;
@@ -144,10 +146,8 @@ impl Document {
 
     pub fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
-        report.add_vec_storage("Document.dom_nodes.storage", &self.dom_nodes);
-        for node in &self.dom_nodes {
-            report.extend_prefixed("Document.dom_nodes", node.memory_usage_report());
-        }
+        report.extend_prefixed("Document.elements", self.elements.memory_usage_report());
+        report.extend_prefixed("Document.texts", self.texts.memory_usage_report());
         report.add_vec_storage("Document.images.storage", &self.images);
         for image in &self.images {
             report.extend_prefixed("Document.images", image.memory_usage_report());
@@ -164,13 +164,16 @@ impl Document {
     }
 }
 
+/// Clones preserve node identities; DOM structure is immutable after construction.
+#[derive(Clone)]
 pub struct Document {
     // Stable identity shared only with derived stage data. This makes it
     // impossible to accidentally pair styles from another parsed document.
     lineage: DocumentLineage,
 
     // DOM tree (phase 1: parsing)
-    dom_nodes: Vec<DomNode>,
+    elements: Elements,
+    texts: Texts,
     dom_root: Option<DomNodeId>,
     mode: DocumentMode,
 
@@ -191,7 +194,8 @@ impl Default for Document {
     fn default() -> Self {
         Self {
             lineage: DocumentLineage::new(),
-            dom_nodes: Vec::new(),
+            elements: Elements::default(),
+            texts: Texts::default(),
             dom_root: None,
             mode: DocumentMode::Html,
             images: Vec::new(),
@@ -206,7 +210,7 @@ impl Default for Document {
 
 #[cfg(test)]
 mod invariant_tests {
-    use super::RootFontSize;
+    use crate::root_font_size_new;
 
     #[test]
     fn root_font_size_rejects_values_that_poison_style_math() {

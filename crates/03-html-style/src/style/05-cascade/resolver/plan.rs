@@ -1,6 +1,8 @@
 //! Cascade ordering for one style target.
 
 use crate::style::compiled::{EffectiveRuleId, PreparedRuleSet};
+use crate::style::matching::dom::PseudoTarget;
+use html_dom::DomNodeId;
 use std::hash::Hash;
 
 /// Matched rule with specificity for cascade sorting
@@ -12,44 +14,67 @@ pub(super) struct MatchedRule {
 }
 
 /// One target's rules in normal and important cascade order.
+#[derive(Default)]
 pub(super) struct CascadePlan {
     pub(super) normal: Vec<MatchedRule>,
     pub(super) important: Vec<MatchedRule>,
 }
 
 impl CascadePlan {
-    pub(super) fn build(
-        mut normal: Vec<MatchedRule>,
-        important_scratch: &mut Vec<MatchedRule>,
-        prepared: &PreparedRuleSet<'_>,
-    ) -> Self {
-        // Preserve this buffer's capacity between elements. Cloning `normal`
-        // allocated and copied every matching rule even when only a small
-        // subset (usually none) carried important declarations.
-        let mut important = std::mem::take(important_scratch);
+    pub(super) fn build(&mut self, prepared: &PreparedRuleSet<'_>) {
+        let Self { normal, important } = self;
         important.clear();
-        important.extend(normal.iter().copied().filter(|matched| {
-            !prepared
-                .get(matched.id)
-                .style_rule()
-                .declarations
-                .important_declarations
-                .is_empty()
-        }));
-        normal.sort_by_key(|matched| {
-            prepared.get(matched.id).priority().order_key(
+        important.extend(normal.iter().copied().filter(|matched| prepared.has_important(matched.id)));
+        normal.sort_by_cached_key(|matched| {
+            prepared.priority(matched.id).order_key(
                 matched.specificity,
                 matched.scope_proximity,
                 false,
             )
         });
-        important.sort_by_key(|matched| {
-            prepared.get(matched.id).priority().order_key(
+        important.sort_by_cached_key(|matched| {
+            prepared.priority(matched.id).order_key(
                 matched.specificity,
                 matched.scope_proximity,
                 true,
             )
         });
-        Self { normal, important }
+    }
+}
+
+/// The target key and its ordered rule buffers form one cache entry.
+#[derive(Default)]
+pub(super) struct CachedRuleMatches {
+    pseudo: Option<(DomNodeId, PseudoTarget)>,
+    plan: CascadePlan,
+}
+
+impl CachedRuleMatches {
+    pub(super) fn begin_element(&mut self) -> &mut Vec<MatchedRule> {
+        self.pseudo = None;
+        self.plan.normal.clear();
+        &mut self.plan.normal
+    }
+
+    pub(super) fn begin_pseudo(
+        &mut self,
+        node: DomNodeId,
+        pseudo: PseudoTarget,
+    ) -> (bool, &mut Vec<MatchedRule>) {
+        let reuse = self.pseudo == Some((node, pseudo));
+        if !reuse {
+            self.plan.normal.clear();
+            self.plan.important.clear();
+            self.pseudo = Some((node, pseudo));
+        }
+        (reuse, &mut self.plan.normal)
+    }
+
+    pub(super) fn order(&mut self, prepared: &PreparedRuleSet<'_>) {
+        self.plan.build(prepared);
+    }
+
+    pub(super) fn plan(&self) -> &CascadePlan {
+        &self.plan
     }
 }

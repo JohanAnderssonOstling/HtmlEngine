@@ -1,4 +1,4 @@
-use crate::layout_model::{DecorationFragment, DecorationPattern, DecorationStore};
+use html_engine_model::{DecorationFragment, DecorationPattern, DecorationStore};
 use html_style_model::{BorderStyle, TextDecorationStyle, UsedStyleView};
 use kurbo::Rect;
 

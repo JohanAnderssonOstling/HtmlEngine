@@ -5,7 +5,8 @@
 //! feature this renderer does not implement.
 
 use crate::style::property_catalogue::PropertyKey;
-use crate::style::support::{PropertyCapability, PropertySyntax, UnsupportedStyleFeature};
+use crate::style::support::{PropertyCapability, UnsupportedStyleFeature};
+use crate::style::syntax::prepared_renderer::PreparedRendererValue;
 use crate::style::syntax::property_id::RendererPropertyId;
 use crate::style::syntax::renderer_owned::{list_style_type, outline_style, text_decoration_style};
 use crate::style::syntax::substitution::{contains_function, needs_substitution};
@@ -26,72 +27,50 @@ pub(crate) fn declaration_is_custom_property(property: &Property<'_>) -> bool {
     }
 }
 
-/// Target-independent eligibility, cached during preparation. Typed values need
-/// no serialization; the two native value fallbacks are checked once here.
-/// Other raw declarations retain the runtime fallback.
-pub(crate) fn declaration_renderer_eligibility(property: &Property<'_>) -> Option<bool> {
+/// Target-independent eligibility, evaluated during declaration preparation.
+/// Substituted declarations are checked again after their tokens resolve.
+pub(crate) fn declaration_is_renderer_eligible(property: &Property<'_>) -> bool {
     if !super::ast_validation::property_is_valid(property) {
-        return Some(false);
+        return false;
     }
     if declaration_is_custom_property(property) {
-        return Some(false);
+        return false;
     }
     if matches!(property, Property::All(_))
         || matches!(property, Property::Unparsed(value) if token_list_css_wide_keyword(&value.value).is_some() || needs_substitution(&value.value))
         || matches!(property, Property::Custom(value) if token_list_css_wide_keyword(&value.value).is_some() || needs_substitution(&value.value))
     {
-        return Some(true);
+        return true;
     }
     if property_uses_unsupported_text_decoration_style(property)
         || property_uses_unsupported_outline_style(property)
         || super::grid::native_value_is_unsupported(property)
+        || display_value_is_unsupported(property)
+        || list_style_value_is_unsupported(property)
+        || (matches!(property, Property::TextTransform(_))
+            && text_transform_value_is_unsupported(property))
+        || matches!(property, Property::Position(position) if !matches!(position, Position::Static | Position::Relative | Position::Absolute))
+        || matches!(property, Property::Visibility(Visibility::Collapse))
     {
-        return Some(false);
+        return false;
     }
     match property {
         Property::Unparsed(raw) if super::native_fallback::applies_to(&raw.property_id) => {
-            Some(super::native_fallback::parse(property).is_some())
+            super::native_fallback::parse(property).is_some()
         }
-        Property::Unparsed(_) => Some(false),
-        // The shared native-token checks above already validated these values.
-        // Cache supported declarations instead of revalidating every element;
-        // unsupported image/reversed-counter forms retain the raw fallback.
-        Property::Custom(raw)
-            if (raw.name.as_ref().eq_ignore_ascii_case("content")
-                || raw.name.as_ref().eq_ignore_ascii_case("counter-reset")
-                || raw.name.as_ref().eq_ignore_ascii_case("counter-increment"))
-                && parsed_declaration_capability(raw.name.as_ref(), Some(property))
-                    == PropertyCapability::Supported =>
-        {
-            Some(true)
-        }
-        Property::Custom(_) => None,
-        _ => Some(true),
+        Property::Unparsed(_) => false,
+        Property::Custom(_) => RendererPropertyId::raw(property).is_some_and(|(id, tokens)| {
+            if let Some(native) = id.native_property() {
+                super::value::token_list_to_css_string(tokens).is_some_and(|css| {
+                    super::value::parsed_property(native, &css)
+                        .is_some_and(|value| declaration_is_renderer_eligible(&value))
+                })
+            } else {
+                PreparedRendererValue::parse(id, tokens).is_some()
+            }
+        }),
+        _ => true,
     }
-}
-
-/// Complete predicate for inline, substituted, and raw declarations whose
-/// eligibility cannot be cached without allocating during preparation.
-pub(crate) fn declaration_is_renderer_eligible(property: &Property<'_>) -> bool {
-    if let Some(eligible) = declaration_renderer_eligibility(property) {
-        return eligible;
-    }
-    if let Some((id, tokens)) = RendererPropertyId::raw(property)
-        && let Some(native) = id.native_property()
-    {
-        return super::value::token_list_to_css_string(tokens)
-            .and_then(|css| {
-                super::value::parsed_property(native, &css)
-                    .map(|value| declaration_is_renderer_eligible(&value))
-            })
-            .unwrap_or(false);
-    }
-    if let Some((RendererPropertyId::Contain, tokens)) = RendererPropertyId::raw(property) {
-        return super::contain::parse_tokens(tokens).is_some();
-    }
-    parsed_declaration_capability(property.property_id().name(), Some(property))
-        == PropertyCapability::Supported
-        && super::validation::declaration_syntax_impl(Some(property)) != PropertySyntax::Invalid
 }
 
 pub(crate) fn is_supported_property_name(name: &str) -> bool {
@@ -316,7 +295,10 @@ fn display_value_is_unsupported(property: &Property<'_>) -> bool {
             if pair.is_list_item {
                 return !matches!(
                     (&pair.outside, &pair.inside),
-                    (DisplayOutside::Block, DisplayInside::Flow)
+                    (
+                        DisplayOutside::Block,
+                        DisplayInside::Flow | DisplayInside::FlowRoot
+                    )
                 );
             }
             !matches!(
@@ -402,15 +384,14 @@ fn image_uses_gradient(image: &Image<'_>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        declaration_capability, declaration_is_renderer_eligible, declaration_renderer_eligibility,
-        property_name_is_supported,
+        declaration_capability, declaration_is_renderer_eligible, property_name_is_supported,
     };
     use crate::{PropertyCapability, UnsupportedStyleFeature};
     use lightningcss::properties::{Property, PropertyId};
     use lightningcss::stylesheet::ParserOptions;
 
     #[test]
-    fn renderer_eligibility_caches_only_allocation_free_decisions() {
+    fn renderer_eligibility_rejects_unsupported_raw_values() {
         let color =
             Property::parse_string(PropertyId::from("color"), "red", ParserOptions::default())
                 .unwrap();
@@ -427,9 +408,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(declaration_renderer_eligibility(&color), Some(true));
-        assert_eq!(declaration_renderer_eligibility(&custom), Some(false));
-        assert_eq!(declaration_renderer_eligibility(&content), None);
+        assert!(declaration_is_renderer_eligible(&color));
+        assert!(!declaration_is_renderer_eligible(&custom));
         assert!(!declaration_is_renderer_eligible(&content));
     }
 

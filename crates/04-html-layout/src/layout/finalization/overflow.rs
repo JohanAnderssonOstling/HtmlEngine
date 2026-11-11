@@ -1,4 +1,4 @@
-use crate::layout_model::{BoxGeometry, OverflowClip};
+use html_engine_model::{BoxGeometry, OverflowClip};
 use kurbo::Rect;
 use std::ops::Range;
 

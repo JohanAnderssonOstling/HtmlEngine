@@ -10,6 +10,7 @@ use std::cmp::Ordering;
 use std::num::NonZeroU32;
 use std::ops::Deref;
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 /// Output of the layout phase: line boxes, glyph offsets, and paint fragments.
 /// Produced by the layout phase and consumed read-only by the renderer.
@@ -44,6 +45,100 @@ impl LineId {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct BoxId(u32);
 
+/// Tree and authored-break facts shared by page composition and geometry queries.
+#[derive(Clone, Debug, Default)]
+pub struct BoxPaginationFacts {
+    /// Rigid table/row fragment carrying this box, when supported.
+    pub table_fragment: Option<u32>,
+    pub subtree: Range<u32>,
+    pub independent: bool,
+    pub is_block_container: bool,
+    pub in_table: bool,
+    pub forced_break: bool,
+    pub avoid_inside: bool,
+    pub orphans: usize,
+    pub widows: usize,
+}
+
+#[derive(Default, Clone)]
+pub struct LineFragmentOwnership {
+    pub table_fragments: Vec<u32>,
+    /// Boxes whose own content includes this line (including inline/image carriers).
+    pub content: Vec<u32>,
+    /// Enclosing flows that can carry this line without crossing an independent flow.
+    pub flows: Vec<u32>,
+}
+
+/// Immutable vertical interval index, rebuilt with source layout.
+#[derive(Default, Clone)]
+pub struct SourceIntervals {
+    entries: Vec<(u32, f64, f64)>,
+    maxima: Vec<f64>,
+}
+
+impl SourceIntervals {
+    pub fn new(mut entries: Vec<(u32, f64, f64)>) -> Self {
+        entries.sort_by(|a, b| a.1.total_cmp(&b.1));
+        let mut index = Self { maxima: vec![f64::NEG_INFINITY; entries.len()], entries };
+        index.prepare(0, index.entries.len());
+        index
+    }
+
+    fn prepare(&mut self, start: usize, end: usize) -> f64 {
+        if start == end { return f64::NEG_INFINITY; }
+        let mid = start + (end - start) / 2;
+        let maximum = self.entries[mid].2.max(self.prepare(start, mid)).max(self.prepare(mid + 1, end));
+        self.maxima[mid] = maximum;
+        maximum
+    }
+
+    pub fn intersecting(&self, top: f64, bottom: f64, out: &mut Vec<u32>) {
+        self.visit(0, self.entries.len(), top, bottom, out);
+    }
+
+    fn visit(&self, start: usize, end: usize, top: f64, bottom: f64, out: &mut Vec<u32>) {
+        if start == end { return; }
+        let mid = start + (end - start) / 2;
+        if self.maxima[mid] < top || self.entries[start].1 > bottom { return; }
+        self.visit(start, mid, top, bottom, out);
+        let (id, y0, y1) = self.entries[mid];
+        if y0 <= bottom && y1 >= top { out.push(id); }
+        self.visit(mid + 1, end, top, bottom, out);
+    }
+}
+
+/// Prepared geometry and line coverage of a table or an independently placed row.
+#[derive(Clone)]
+pub struct TableFragmentSource {
+    pub bounds: Rect,
+    pub line_count: usize,
+}
+
+#[derive(Default, Clone)]
+pub struct PaginationOwnership {
+    /// Unique publication identity for pagination caches; clones share immutable inputs.
+    pub revision: u64,
+    pub box_intervals: SourceIntervals,
+    pub table_fragments: Vec<TableFragmentSource>,
+    pub boxes: Vec<BoxPaginationFacts>,
+    pub lines: Vec<LineFragmentOwnership>,
+    /// Enclosing flows for each box, paired with their distance.
+    /// Stored once per layout, never as a box-by-line matrix.
+    pub box_flows: Vec<Vec<(u32, usize)>>,
+}
+
+impl PaginationOwnership {
+    pub fn clear(&mut self) {
+        static NEXT_REVISION: AtomicU64 = AtomicU64::new(1);
+        self.revision = NEXT_REVISION.fetch_add(1, AtomicOrdering::Relaxed);
+        self.box_intervals = SourceIntervals::default();
+        self.table_fragments.clear();
+        self.boxes.clear();
+        self.lines.clear();
+        self.box_flows.clear();
+    }
+}
+
 #[derive(Default, Clone)]
 pub struct LineOutput {
     /// Emission-order storage. Its indexes are stable line IDs, not spatial ranks.
@@ -57,12 +152,28 @@ pub struct LineOutput {
     /// unrelated spatially interleaved lines retain independent membership.
     pub pagination_order: LineTraversal,
     pub pagination_groups: Vec<LinePaginationGroup>,
+    /// Inline-row and marker attachments independent of column-specific floats.
+    pub pagination_base_groups: Vec<LinePaginationGroup>,
     pub pagination_anchors: Vec<LinePaginationAnchor>,
+    /// Outer line and the emission-order range of its atomic inline's contents.
+    /// Multiple items on one line share that carrier, keeping the complete row.
+    pub atomic_inline_lines: Vec<(LineId, Range<usize>)>,
+    /// Optional keeps for floats and adjacent wrapped lines, sorted by trigger.
+    /// Oversized ranges remain fragmentable rather than becoming atomic groups.
+    pub pagination_float_keeps: Vec<FloatPaginationKeep>,
+    /// Column height used while placing floats and composing their exclusions.
+    pub pagination_fragment_height: Option<f64>,
+    /// Body rows with space already reserved for a repeated floated-table header.
+    pub pagination_header_rows: Vec<u32>,
     /// Group starts sorted by document-space origin for exact continuation lookup.
     pub pagination_origins: Vec<u32>,
+    /// Corresponding starts when only height-independent groups are used.
+    pub pagination_base_origins: Vec<u32>,
     /// Stable carrier-line bounds for each box and its descendants. Empty
     /// boxes use an empty range; images and inline spans retain their carriers.
     pub box_line_ranges: Vec<Range<u32>>,
+    /// Viewport-independent structure and fragment ownership, rebuilt with layout.
+    pub pagination_ownership: PaginationOwnership,
     /// Uncommon paint/inline data is retained only for lines that need it.
     pub line_details: Vec<LineDetails>,
     pub text_fragments: TextFragmentStore,
@@ -162,6 +273,12 @@ pub struct LinePaginationGroup {
 pub struct LinePaginationAnchor {
     pub marker: LineId,
     pub source: LineId,
+}
+
+#[derive(Clone)]
+pub struct FloatPaginationKeep {
+    pub trigger: u32,
+    pub bounds: Range<f64>,
 }
 
 #[derive(Default, Clone)]
@@ -272,9 +389,16 @@ impl LayoutState {
         self.line_output.spatial_order.clear();
         self.line_output.pagination_order.clear();
         self.line_output.pagination_groups.clear();
+        self.line_output.pagination_base_groups.clear();
+        self.line_output.pagination_float_keeps.clear();
+        self.line_output.pagination_fragment_height = None;
+        self.line_output.pagination_header_rows.clear();
         self.line_output.pagination_anchors.clear();
+        self.line_output.atomic_inline_lines.clear();
         self.line_output.pagination_origins.clear();
+        self.line_output.pagination_base_origins.clear();
         self.line_output.box_line_ranges.clear();
+        self.line_output.pagination_ownership.clear();
         self.line_output.line_details.clear();
         self.line_output.text_fragments.clear();
         self.line_output.paint_order_indices.clear();
@@ -344,16 +468,53 @@ impl LayoutState {
             &self.line_output.pagination_groups,
         );
         report.add_vec_storage(
+            "LayoutState.line_output.pagination_base_groups.storage",
+            &self.line_output.pagination_base_groups,
+        );
+        report.add_vec_storage(
+            "LayoutState.line_output.pagination_header_rows.storage",
+            &self.line_output.pagination_header_rows,
+        );
+        report.add_vec_storage(
+            "LayoutState.line_output.pagination_float_keeps.storage",
+            &self.line_output.pagination_float_keeps,
+        );
+        report.add_vec_storage(
             "LayoutState.line_output.pagination_anchors.storage",
             &self.line_output.pagination_anchors,
+        );
+        report.add_vec_storage(
+            "LayoutState.line_output.atomic_inline_lines.storage",
+            &self.line_output.atomic_inline_lines,
         );
         report.add_vec_storage(
             "LayoutState.line_output.pagination_origins.storage",
             &self.line_output.pagination_origins,
         );
         report.add_vec_storage(
+            "LayoutState.line_output.pagination_base_origins.storage",
+            &self.line_output.pagination_base_origins,
+        );
+        report.add_vec_storage(
             "LayoutState.line_output.box_line_ranges.storage",
             &self.line_output.box_line_ranges,
+        );
+        let ownership = &self.line_output.pagination_ownership;
+        report.add_vec_storage("LayoutState.pagination_ownership.table_fragments", &ownership.table_fragments);
+        report.add_vec_storage("LayoutState.pagination_ownership.boxes", &ownership.boxes);
+        report.add_vec_storage("LayoutState.pagination_ownership.box_intervals", &ownership.box_intervals.entries);
+        report.add_vec_storage("LayoutState.pagination_ownership.box_interval_maxima", &ownership.box_intervals.maxima);
+        report.add_vec_storage("LayoutState.pagination_ownership.lines", &ownership.lines);
+        report.add_vec_storage("LayoutState.pagination_ownership.flows", &ownership.box_flows);
+        report.add_slice_storage::<u32>(
+            "LayoutState.pagination_ownership.line_memberships",
+            ownership.lines.iter().map(|line| line.content.capacity() + line.flows.capacity() + line.table_fragments.capacity()).sum(),
+            ownership.lines.iter().map(|line| line.content.len() + line.flows.len() + line.table_fragments.len()).sum(),
+        );
+        report.add_slice_storage::<(u32, usize)>(
+            "LayoutState.pagination_ownership.flow_memberships",
+            ownership.box_flows.iter().map(Vec::capacity).sum(),
+            ownership.box_flows.iter().map(Vec::len).sum(),
         );
         report.add_vec_storage(
             "LayoutState.line_output.paint_order_indices.storage",

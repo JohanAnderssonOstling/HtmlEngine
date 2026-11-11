@@ -45,20 +45,19 @@ pub(crate) mod parser {
     }
 }
 
+mod request;
 #[path = "style/mod.rs"]
 mod style;
+pub use request::{StyleRequest, style_document};
 
-use html_dom::Document;
-
+pub use html_style_model::{FontFace, FontFaceDescriptor, FontFaceSource, FontFaceStyle};
 pub use style::DEFAULT_CSS;
 pub use style::document::{AuthorStylesheetInput, StyledDocument};
-pub use style::timings::StyleTimings;
-pub use html_style_model::{FontFace, FontFaceDescriptor, FontFaceSource, FontFaceStyle};
 pub use style::source::fonts::resolve_font_face_urls;
-pub use style::source::resource::{ResourceImport, ResourceStylesheet, ResourceStylesheetEntry};
 pub use style::source::imports::{
     ImportLayer, StylesheetEntry, StylesheetImport, stylesheet_entries,
 };
+pub use style::source::resource::{ResourceImport, ResourceStylesheet, ResourceStylesheetEntry};
 pub use style::support::{
     DeclarationSupport, PropertyCapability, PropertySyntax, PropertyValueSyntax,
     UnsupportedStyleFeature,
@@ -68,13 +67,11 @@ pub use style::syntax::validation::{
     declaration_support, declaration_syntax, property_value_syntax, selector_syntax_is_valid,
     stylesheet_syntax_is_valid,
 };
+pub use style::timings::StyleTimings;
 
 pub use style::environment::{MediaEnvironment, MediaMatchKey, MediaQuerySet, MediaType};
 pub use style::program::{
     StyleProgram, StyleProgramCache, StyleProgramCacheStats, resolve_document_with_program,
-    style_document_with_cached_program_and_reader_overrides,
-    style_document_with_cached_program_and_timings,
-    style_document_with_program_and_reader_overrides, style_document_with_program_and_timings,
 };
 
 #[cfg(test)]
@@ -137,72 +134,12 @@ mod allocation_test_support {
 static TEST_ALLOCATOR: allocation_test_support::TrackingAllocator =
     allocation_test_support::TrackingAllocator;
 
-/// Resolve the user-agent stylesheet and all author stylesheet chunks.
-///
-/// Invalid author chunks are skipped, matching the renderer's previous
-/// best-effort behavior. Lightning CSS values remain an implementation detail
-/// of this crate rather than leaking into the pipeline API.
-pub fn style_document(document: Document, css_chunks: &[&str]) -> StyledDocument {
-    style_document_with_timings(document, css_chunks).0
-}
-
-pub fn style_document_with_timings(
-    document: Document,
-    css_chunks: &[&str],
-) -> (StyledDocument, StyleTimings) {
-    let (styled, timings, _) = style_document_with_environment_and_timings(
-        document,
-        css_chunks,
-        MediaEnvironment::default(),
-    );
-    (styled, timings)
-}
-
-pub fn style_document_with_environment(
-    document: Document,
-    css_chunks: &[&str],
-    environment: MediaEnvironment,
-) -> (StyledDocument, MediaQuerySet) {
-    let (styled, _, media_queries) =
-        style_document_with_environment_and_timings(document, css_chunks, environment);
-    (styled, media_queries)
-}
-
-pub fn style_document_with_environment_and_timings(
-    document: Document,
-    css_chunks: &[&str],
-    environment: MediaEnvironment,
-) -> (StyledDocument, StyleTimings, MediaQuerySet) {
-    let root = document.dom_root();
-    let inputs = css_chunks
-        .iter()
-        .map(|css| AuthorStylesheetInput {
-            css,
-            implicit_scope_root: root,
-        })
-        .collect::<Vec<_>>();
-    style_document_with_author_stylesheets_and_environment_and_timings(
-        document,
-        &inputs,
-        environment,
-    )
-}
-
-pub fn style_document_with_author_stylesheets_and_environment_and_timings(
-    document: Document,
-    inputs: &[AuthorStylesheetInput<'_>],
-    environment: MediaEnvironment,
-) -> (StyledDocument, StyleTimings, MediaQuerySet) {
-    style::program::compile_and_apply(document, inputs, environment)
-}
-
 #[cfg(test)]
 mod boundary_tests {
     use super::{
         AuthorStylesheetInput, DeclarationSupport, MediaEnvironment, PropertyCapability,
         PropertySyntax, StyleProgramCache, UnsupportedStyleFeature, declaration_support,
-        selector_syntax_is_valid, style_document, style_document_with_cached_program_and_timings,
-        style_document_with_environment,
+        selector_syntax_is_valid, style_document,
     };
     use html_style_model::{
         LengthPct, PreferredSize, SizeComparison, TabSizeKind, WhiteSpace,
@@ -226,16 +163,19 @@ mod boundary_tests {
                 css,
                 implicit_scope_root: root,
             }];
-            let (styled, timings, _) = style_document_with_cached_program_and_timings(
-                &mut cache,
-                document,
-                &inputs,
-                MediaEnvironment::default(),
-            );
+            let (styled, timings, _) = crate::StyleRequest::new(document, &inputs)
+                .environment(MediaEnvironment::default())
+                .compile_cached(&mut cache);
             let paragraph = styled
                 .document()
                 .node_ids()
-                .find(|node| styled.document().get_dom_tag(*node) == Some("p"))
+                .find(|node| {
+                    styled
+                        .document()
+                        .try_element_ref(*node)
+                        .map(|element| element.tag())
+                        == Some("p")
+                })
                 .expect("paragraph");
             let style = styled.style_for_node(paragraph).expect("paragraph style");
             assert_eq!(
@@ -515,16 +455,18 @@ mod boundary_tests {
         let narrow_document = standards_document("<html><body><p>text</p></body></html>");
         let wide_document = standards_document("<html><body><p>text</p></body></html>");
 
-        let (narrow, _) = style_document_with_environment(
-            narrow_document,
-            &[css],
-            MediaEnvironment::screen(400.0, Some(800.0)).unwrap(),
-        );
-        let (wide, _) = style_document_with_environment(
-            wide_document,
-            &[css],
-            MediaEnvironment::screen(600.0, Some(800.0)).unwrap(),
-        );
+        let (narrow, _) = {
+            let (styled, _, queries) = crate::StyleRequest::from_css(narrow_document, &[css])
+                .environment(MediaEnvironment::screen(400.0, Some(800.0)).unwrap())
+                .compile();
+            (styled, queries)
+        };
+        let (wide, _) = {
+            let (styled, _, queries) = crate::StyleRequest::from_css(wide_document, &[css])
+                .environment(MediaEnvironment::screen(600.0, Some(800.0)).unwrap())
+                .compile();
+            (styled, queries)
+        };
 
         assert_eq!(paragraph_color(&narrow), 0x000000FF);
         assert_eq!(paragraph_color(&wide), 0x008000FF);
@@ -535,7 +477,12 @@ mod boundary_tests {
         let document = standards_document("<html><body><p>text</p></body></html>");
         let environment = MediaEnvironment::screen(800.0, Some(600.0)).unwrap();
         let css = "html { font-size: 10vw } p { font-size: 10vh; width: calc(25vw + 5px); height: 10vmin; margin-left: 10vmax; line-height: 5vh }";
-        let (styled, dependencies) = style_document_with_environment(document, &[css], environment);
+        let (styled, dependencies) = {
+            let (styled, _, queries) = crate::StyleRequest::from_css(document, &[css])
+                .environment(environment)
+                .compile();
+            (styled, queries)
+        };
         let root = styled.document().dom_root().expect("document element");
         let paragraph = paragraph_node(&styled);
         let paragraph_indices = styled.style_for_node(paragraph).expect("paragraph style");
@@ -582,7 +529,12 @@ mod boundary_tests {
         let document = standards_document("<html><body><p>text</p></body></html>");
         let environment = MediaEnvironment::screen(800.0, None).unwrap();
         let css = "p { font-size: 20px; font-size: 10vh; width: 123px; width: 10vmin; margin-left: 10vw }";
-        let (styled, dependencies) = style_document_with_environment(document, &[css], environment);
+        let (styled, dependencies) = {
+            let (styled, _, queries) = crate::StyleRequest::from_css(document, &[css])
+                .environment(environment)
+                .compile();
+            (styled, queries)
+        };
         let indices = styled
             .style_for_node(paragraph_node(&styled))
             .expect("paragraph style");
@@ -772,16 +724,18 @@ mod boundary_tests {
         let narrow_document = standards_document("<html><body><p>text</p></body></html>");
         let wide_document = standards_document("<html><body><p>text</p></body></html>");
 
-        let (narrow, _) = style_document_with_environment(
-            narrow_document,
-            &[css],
-            MediaEnvironment::screen(400.0, Some(800.0)).unwrap(),
-        );
-        let (wide, _) = style_document_with_environment(
-            wide_document,
-            &[css],
-            MediaEnvironment::screen(600.0, Some(800.0)).unwrap(),
-        );
+        let (narrow, _) = {
+            let (styled, _, queries) = crate::StyleRequest::from_css(narrow_document, &[css])
+                .environment(MediaEnvironment::screen(400.0, Some(800.0)).unwrap())
+                .compile();
+            (styled, queries)
+        };
+        let (wide, _) = {
+            let (styled, _, queries) = crate::StyleRequest::from_css(wide_document, &[css])
+                .environment(MediaEnvironment::screen(600.0, Some(800.0)).unwrap())
+                .compile();
+            (styled, queries)
+        };
 
         assert_eq!(paragraph_color(&narrow), 0x008000FF);
         assert_eq!(paragraph_color(&wide), 0xFF0000FF);

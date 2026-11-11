@@ -158,7 +158,10 @@ impl<'a> GeneratedContentResolver<'a> {
                 }
                 GeneratedContentItem::Attribute(id) => {
                     if let Some(name) = self.styles.string(id)
-                        && let Some(value) = self.document.get_dom_attr(origin, name)
+                        && let Some(value) = self
+                            .document
+                            .try_element_ref(origin)
+                            .and_then(|element| element.attr(name))
                     {
                         text.push_str(value);
                     }

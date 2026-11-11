@@ -1,5 +1,5 @@
 use super::*;
-use crate::GlyphId;
+use html_engine_model::GlyphId;
 use crate::layout::LayoutEngine;
 use crate::layout::inline::hyphenation::DeferredHyphenation;
 use crate::layout::inline::hanging;
@@ -453,7 +453,6 @@ fn break_lines_into_with<'input, S: TokenRead>(
     mut lines: Vec<BrokenLine>,
     mut deferred: Option<&mut DeferredHyphenation<'input, '_>>,
 ) -> Vec<BrokenLine> {
-    let timing_started = engine.start_timing();
     lines.clear();
     let mut start = 0usize;
     let mut starts_indented_line = paragraph.indent.first_line;
@@ -477,7 +476,6 @@ fn break_lines_into_with<'input, S: TokenRead>(
             start = previous_start.saturating_add(1);
         }
     }
-    engine.record_timing(|t| t.break_lines += timing_started.elapsed());
     lines
 }
 

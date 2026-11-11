@@ -1,16 +1,17 @@
 //! Renderer-neutral shaping contracts and measured font metrics.
 
-use crate::*;
 use crate::caret_positions::CaretStorage;
+use crate::glyph_adapter::NativePaintSource;
+use crate::*;
 use html_dom::MemoryUsageReport;
 use html_style_model::{
     ComputedStyles, FontFace, StyleIndices, StyleView, TextSpacing, UsedStyleView,
 };
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-/// Backend-owned immutable shaped-line identifier. It is only meaningful for
-/// the `GlyphShaper` instance that produced it.
+/// An opaque native-run key. Retained results receive document-local keys;
+/// borrowed results use the backend's resource-generation namespace.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TextRunId(pub u32);
@@ -29,19 +30,95 @@ pub struct ShapedTextRun {
 
 #[derive(Clone, Debug, PartialEq)]
 struct NativeRunGeometry {
-    run: TextRunId,
+    run: Option<TextRunId>,
     caret_stops: CaretPositions,
     ascent: f32,
 }
 
 impl ShapedTextRun {
-
     /// Share geometry with resource ledgers and layout without
     /// copying character arrays at adapter boundaries.
     pub(crate) fn shared_advances(&self) -> Arc<[f32]> {
         self.advances.clone()
     }
 
+    pub fn caret_stops(&self) -> Option<&CaretPositions> {
+        self.native.as_ref().map(|native| &native.caret_stops)
+    }
+
+    pub fn advances(&self) -> &[f32] {
+        &self.advances
+    }
+
+    /// The adapter supplies finite, non-negative advances and one more cluster
+    /// boundary than advances, with both outer boundaries enabled.
+
+    pub fn new(advances: Arc<[f32]>, cluster_boundaries: Arc<[bool]>) -> ShapedTextRun {
+        ShapedTextRun {
+            advances,
+            cluster_boundaries,
+            native: None,
+        }
+    }
+
+    pub fn cluster_boundaries(&self) -> &[bool] {
+        &self.cluster_boundaries
+    }
+
+    /// Native caret geometry without a paint key. Retained backends return this
+    /// with their native entry; engine registration assigns its document-local key.
+    /// Supply finite ascent and one caret per character boundary, all referring to
+    /// the same logical run. Shared arrays are retained without copying.
+
+    pub fn with_carets(
+        advances: Arc<[f32]>,
+        cluster_boundaries: Arc<[bool]>,
+        caret_stops: CaretPositions,
+        ascent: f32,
+    ) -> ShapedTextRun {
+        ShapedTextRun {
+            advances,
+            cluster_boundaries,
+            native: Some(NativeRunGeometry {
+                run: None,
+                caret_stops,
+                ascent,
+            }),
+        }
+    }
+
+    /// Native geometry with a borrowed backend paint key. Supply finite ascent and
+    /// one caret per character boundary, all referring to the same logical run.
+    /// Retained backends use [`ShapedTextRun::with_carets`] instead.
+
+    pub fn with_backend_run(
+        advances: Arc<[f32]>,
+        cluster_boundaries: Arc<[bool]>,
+        backend_run: TextRunId,
+        caret_stops: CaretPositions,
+        ascent: f32,
+    ) -> ShapedTextRun {
+        ShapedTextRun {
+            advances,
+            cluster_boundaries,
+            native: Some(NativeRunGeometry {
+                run: Some(backend_run),
+                caret_stops,
+                ascent,
+            }),
+        }
+    }
+
+    /// The registered engine key or borrowed backend key, when one is assigned.
+    /// Unregistered caret geometry has no paint key.
+
+    pub fn backend_run(&self) -> Option<TextRunId> {
+        self.native.as_ref()?.run
+    }
+
+    pub fn ascent(&self) -> f32 {
+        self.native.as_ref().map_or(0.0, |native| native.ascent)
+    }
 }
 
 /// Font extents measured from the faces that actually supplied each character.
@@ -52,25 +129,30 @@ pub enum RunFontMetrics {
 }
 
 /// A backend run result. The engine owns registration and layout
-/// glyph IDs; native paint handles belong to the backend's resource generation.
+/// glyph IDs. Native data can be retained by entry reference, or borrowed from
+/// a backend resource generation. Use one ownership mode per native backend.
 #[derive(Clone, Debug)]
 pub struct ShapedRun {
-    geometry: ShapedTextRun,
-    paint: Option<RunPaint>,
+    geometry: Option<ShapedTextRun>,
+    paint: RunPaint,
 }
 
 #[derive(Clone, Debug)]
-struct RunPaint {
-    first_handle: GlyphHandle,
-    metrics: RunFontMetrics,
+enum RunPaint {
+    Native {
+        source: NativePaintSource,
+        metrics: RunFontMetrics,
+    },
+    Character(ShapedGlyph),
+    Characters(Vec<(char, ShapedGlyph)>),
 }
 
 /// A request to shape one already-normalized, single-style logical run.
-/// CSS values have been resolved before this reaches the renderer backend.
+/// CSS geometry has been resolved before this reaches the renderer backend.
+/// Foreground colors belong to paint fragments and are absent from shaping requests.
 pub struct TextRunShapeRequest<'a> {
     text: &'a str,
     style: ShapingStyle<'a>,
-    paint_colors: Option<&'a [u32]>,
 }
 
 #[derive(Debug)]
@@ -79,8 +161,7 @@ pub struct ShapedTextGeometry {
     pub bidi: ResolvedBidi,
     pub mirrored_glyphs: FxHashMap<u32, GlyphId>,
     ranges: Vec<TextGeometryRange>,
-    runs: Vec<Option<TextGeometryRun>>,
-    unused_runs: Vec<usize>,
+    runs: Vec<TextGeometryRun>,
 }
 
 #[derive(Clone, Debug)]
@@ -95,9 +176,6 @@ pub(crate) struct TextGeometryRange {
 struct TextGeometryRun {
     geometry: ShapedTextRun,
     placement_required: bool,
-    /// Number of source ranges using this slot. Slots with no ranges are
-    /// released and reused; no references escape the owning geometry.
-    range_count: usize,
 }
 
 impl ShapedTextGeometry {
@@ -108,15 +186,11 @@ impl ShapedTextGeometry {
             mirrored_glyphs: FxHashMap::default(),
             ranges: Vec::new(),
             runs: Vec::new(),
-            unused_runs: Vec::new(),
         }
     }
 
     fn geometry(&self, range: &TextGeometryRange) -> &ShapedTextRun {
-        &self.runs[range.run]
-            .as_ref()
-            .expect("live geometry run")
-            .geometry
+        &self.runs[range.run].geometry
     }
 
     pub(crate) fn ranges(&self) -> &[TextGeometryRange] {
@@ -124,37 +198,25 @@ impl ShapedTextGeometry {
     }
 
     pub(crate) fn native_run(&self, range: &TextGeometryRange) -> Option<NativeRunView<'_>> {
-        let run = self.runs[range.run].as_ref().expect("live geometry run");
+        let run = &self.runs[range.run];
         let native = run.geometry.native.as_ref()?;
         Some(NativeRunView {
             source_range: range.source.clone(),
             run_offset: range.offset as u32,
-            backend_run: native.run,
+            backend_run: native.run?,
             caret_stops: &native.caret_stops,
             ascent: native.ascent,
             placement_required: run.placement_required,
         })
     }
 
-    fn store_run(
-        &mut self,
-        geometry: ShapedTextRun,
-        placement_required: bool,
-        range_count: usize,
-    ) -> usize {
-        let run = Some(TextGeometryRun {
+    fn store_run(&mut self, geometry: ShapedTextRun, placement_required: bool) -> usize {
+        let index = self.runs.len();
+        self.runs.push(TextGeometryRun {
             geometry,
             placement_required,
-            range_count,
         });
-        if let Some(index) = self.unused_runs.pop() {
-            self.runs[index] = run;
-            index
-        } else {
-            let index = self.runs.len();
-            self.runs.push(run);
-            index
-        }
+        index
     }
 
     fn range_at(&self, index: usize) -> Option<&TextGeometryRange> {
@@ -283,8 +345,7 @@ impl ShapedTextGeometry {
         if indices.peek().is_none() {
             return;
         }
-        let run = self.store_run(geometry, placement_required, 0);
-        let mut range_count = 0;
+        let run = self.store_run(geometry, placement_required);
         while let Some((offset, start)) = indices.next() {
             let mut end = start + 1;
             while indices.next_if(|&(_, index)| index == end).is_some() {
@@ -296,9 +357,7 @@ impl ShapedTextGeometry {
                 run,
                 apply_start_boundary: true,
             });
-            range_count += 1;
         }
-        self.runs[run].as_mut().unwrap().range_count = range_count;
     }
 
     pub fn finish_runs(&mut self) {
@@ -334,13 +393,6 @@ impl ShapedTextGeometry {
             }
             let keep_prefix = old.source.start < range.start;
             let keep_suffix = old.source.end > range.end;
-            let record = self.runs[old.run].as_mut().expect("live geometry run");
-            record.range_count =
-                record.range_count - 1 + usize::from(keep_prefix) + usize::from(keep_suffix);
-            if record.range_count == 0 {
-                self.runs[old.run] = None;
-                self.unused_runs.push(old.run);
-            }
             if keep_prefix {
                 ranges.push(TextGeometryRange {
                     source: old.source.start..range.start,
@@ -357,6 +409,26 @@ impl ShapedTextGeometry {
             }
         }
         self.ranges = ranges;
+        // Replacement is a separate editing path. Release dead geometry and
+        // remap surviving run IDs without maintaining a free list on append.
+        let mut remap = vec![usize::MAX; self.runs.len()];
+        for range in &self.ranges {
+            remap[range.run] = 0;
+        }
+        let mut old = 0;
+        let mut next = 0;
+        self.runs.retain(|_| {
+            let keep = remap[old] != usize::MAX;
+            if keep {
+                remap[old] = next;
+                next += 1;
+            }
+            old += 1;
+            keep
+        });
+        for range in &mut self.ranges {
+            range.run = remap[range.run];
+        }
         self.push_run_iter(indices, geometry, placement_required);
         self.finish_runs();
     }
@@ -380,19 +452,17 @@ impl ShapedTextGeometry {
         // Source ranges only hold IDs. Each live run owns its geometry handles
         // once, including the carets borrowed by native paint queries.
         self.ranges.capacity() * size_of::<TextGeometryRange>()
-            + self.runs.capacity() * size_of::<Option<TextGeometryRun>>()
-            + self.unused_runs.capacity() * size_of::<usize>()
+            + self.runs.capacity() * size_of::<TextGeometryRun>()
             + self.bidi.memory_usage_bytes()
             + self.mirrored_glyphs.capacity() * size_of::<(u32, GlyphId)>()
             + self
                 .runs
                 .iter()
-                .flatten()
                 .map(|run| {
                     allocation_bytes(&run.geometry.advances, seen)
                         + allocation_bytes(&run.geometry.cluster_boundaries, seen)
-                        + shaped_text_run_caret_stops(&run
-                            .geometry)
+                        + (run.geometry)
+                            .caret_stops()
                             .map_or(0, |stops| stops.memory_usage_bytes_with_shared(seen))
                 })
                 .sum::<usize>()
@@ -408,18 +478,18 @@ impl ShapedTextGeometry {
     pub fn update_range(&mut self, range: Range<u32>, shaped: &ShapedTextRun) -> bool {
         if range.start >= range.end
             || range.end as usize > self.len
-            || shaped_text_run_advances(&shaped).len() != (range.end - range.start) as usize
+            || shaped.advances().len() != (range.end - range.start) as usize
         {
             return false;
         }
         let mut cumulative_delta = 0.0f32;
-        let advances_changed = range.clone().zip(shaped_text_run_advances(&shaped)).any(|(index, new)| {
+        let advances_changed = range.clone().zip(shaped.advances()).any(|(index, new)| {
             cumulative_delta += new - self.advance(index as usize).unwrap_or(0.0);
             cumulative_delta.abs() > 0.01
         });
         let changed = advances_changed
             || (range.start..=range.end)
-                .zip(shaped_text_run_cluster_boundaries(&shaped))
+                .zip(shaped.cluster_boundaries())
                 .any(|(index, new)| self.is_cluster_boundary(index as usize) != *new);
         self.replace_range(range, shaped.clone(), false);
         changed
@@ -458,7 +528,7 @@ pub struct ObliqueAngle(u32);
 
 impl fmt::Debug for ObliqueAngle {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&oblique_angle_degrees(*self), formatter)
+        fmt::Debug::fmt(&(*self).degrees(), formatter)
     }
 }
 
@@ -707,7 +777,6 @@ pub struct ShapingStyle<'a> {
     /// Resolved font width as a percentage.
     pub font_stretch: f32,
     pub font_synthesis_style: FontSynthesisStyle,
-    pub color: u32,
     pub font_family: Option<&'a str>,
     pub cjk_font_family: Option<&'a str>,
     pub language: Option<&'a ContentLanguage>,
@@ -722,18 +791,6 @@ pub struct ShapingStyle<'a> {
 /// This module is intentionally absent from the application facade.
 pub mod shaping {
     use super::*;
-
-    /// Classify the engine-only first-line shaping requirement.
-    pub fn requires_first_line_shaper(error: &ShapeError) -> bool {
-        matches!(error.kind, ShapeErrorKind::FirstLineShaperRequired)
-    }
-
-    /// Report layout that needs its shaping backend for first-line styles.
-    pub fn first_line_shaper_required() -> ShapeError {
-        ShapeError {
-            kind: ShapeErrorKind::FirstLineShaperRequired,
-        }
-    }
 
     /// Report first-line refinement that did not reach a stable layout.
     pub fn first_line_refinement_did_not_converge() -> ShapeError {
@@ -803,7 +860,7 @@ pub mod shaping {
 
     pub fn preserve_graphemes(run: &mut ShapedTextRun, text: &str) {
         profile_scope!("shape.preserve_graphemes");
-        if text.is_ascii() && !text.as_bytes().contains(&b'\r') {
+        if run.advances.len() <= 1 || (text.is_ascii() && !text.as_bytes().contains(&b'\r')) {
             return;
         }
         let graphemes = crate::bidi::grapheme_boundaries(text, run.advances.len());
@@ -894,7 +951,6 @@ pub mod shaping {
         font_size: f32,
         font_weight: u16,
         font_slant: FontSlant,
-        color: u32,
         font_family: Option<&'a str>,
     ) -> ShapingStyle<'a> {
         // CSS permits zero-size text, which still needs character identities.
@@ -905,7 +961,6 @@ pub mod shaping {
             font_slant,
             font_stretch: 100.0,
             font_synthesis_style: FontSynthesisStyle::Auto,
-            color,
             font_family,
             cjk_font_family: None,
             language: None,
@@ -916,26 +971,13 @@ pub mod shaping {
     }
 
     #[inline]
-    pub fn glyph<'a>(character: char, style: &'a ShapingStyle<'a>) -> GlyphRequest<'a> {
-        GlyphRequest { character, style }
-    }
-
-    pub fn run<'a>(
-        text: &'a str,
-        style: ShapingStyle<'a>,
-        paint_colors: Option<&'a [u32]>,
-    ) -> TextRunShapeRequest<'a> {
-        TextRunShapeRequest {
-            text,
-            style,
-            paint_colors,
-        }
+    pub fn run<'a>(text: &'a str, style: ShapingStyle<'a>) -> TextRunShapeRequest<'a> {
+        TextRunShapeRequest { text, style }
     }
 }
 
-/// Shaping failure propagated by the engine or reported by a backend.
-/// Backends construct resource-capacity and unsupported-transaction errors;
-/// document lifecycle failures are constructed by the engine implementation.
+/// Engine registration, ownership or layout failure. Native shaping returns
+/// measurements and resources directly; it has no recoverable error channel.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ShapeError {
     kind: ShapeErrorKind,
@@ -945,19 +987,9 @@ pub struct ShapeError {
 enum ShapeErrorKind {
     RegistryCapacityExhausted { metrics_len: usize },
     FirstLineRefinementDidNotConverge,
-    FirstLineShaperRequired,
-    AppendTransactionUnsupported,
     ResourceGenerationMismatch,
     BorrowedDocument,
-}
-
-impl ShapeError {
-
-    pub(crate) fn append_transaction_unsupported() -> Self {
-        Self {
-            kind: ShapeErrorKind::AppendTransactionUnsupported,
-        }
-    }
+    MixedPaintOwnership,
 }
 
 impl fmt::Display for ShapeError {
@@ -969,13 +1001,8 @@ impl fmt::Display for ShapeError {
                     "glyph registry exceeded capacity after {metrics_len} registered metrics"
                 )
             }
-            ShapeErrorKind::FirstLineShaperRequired => formatter
-                .write_str("first-line styles require layout_with_shaper or relayout_with_shaper"),
             ShapeErrorKind::FirstLineRefinementDidNotConverge => {
                 formatter.write_str("first-line layout did not converge")
-            }
-            ShapeErrorKind::AppendTransactionUnsupported => {
-                formatter.write_str("glyph shaper does not support append rollback")
             }
             ShapeErrorKind::BorrowedDocument => formatter.write_str(
                 "repreparation requires the owning document; this stage borrows its preparation",
@@ -983,13 +1010,16 @@ impl fmt::Display for ShapeError {
             ShapeErrorKind::ResourceGenerationMismatch => {
                 formatter.write_str("glyph shaper resources do not belong to this document")
             }
+            ShapeErrorKind::MixedPaintOwnership => formatter.write_str(
+                "a native backend must consistently return retained entries or borrowed handles",
+            ),
         }
     }
 }
 
 impl std::error::Error for ShapeError {}
 
-/// Glyph metrics owned once by the pipeline session or standalone caller.
+/// Glyph metrics and native paint snapshots owned by the pipeline or caller.
 /// Shaping borrows the store mutably; layout and queries borrow its metrics.
 ///
 /// ```compile_fail
@@ -1010,10 +1040,18 @@ impl std::error::Error for ShapeError {}
 #[derive(Default)]
 pub struct GlyphResourceStore {
     metrics: GlyphMetrics,
+    id: GlyphResourceId,
     generation: GlyphResourceGeneration,
-    shaped_ids: FxHashMap<(GlyphHandle, char, u32, u32, u32), GlyphId>,
+    shaped_ids: FxHashMap<(GlyphPaintIdentity, char, u32, u32, u32), GlyphId>,
     paint_invalid: bool,
+    native_paint_resources: Option<NativePaintResources>,
     paint_lease: OnceLock<GlyphResourceLease>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum GlyphPaintIdentity {
+    Borrowed(GlyphHandle),
+    Retained(usize),
 }
 
 /// Validity of retained paint commands. Owning the lease does not keep a
@@ -1033,22 +1071,14 @@ impl Drop for GlyphResourceStore {
     }
 }
 
-/// An append-only ledger checkpoint. It owns no glyph data and can be consumed
-/// once to discard registrations made after it. Use only while this store has
-/// been appended to; document replacement and branching rollback invalidate it.
-#[derive(Debug)]
-pub struct GlyphResourceCheckpoint {
-    generation: GlyphResourceGeneration,
-    len: usize,
-}
+/// Identity of one engine ledger, independent of a caller's native namespace.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GlyphResourceId(u64);
 
-/// Backend-owned append boundary. Restoring it preserves the resource generation
-/// and every handle in its prefix; callers must first release appended views.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct NativeResourceCheckpoint {
-    pub generation: GlyphResourceGeneration,
-    pub glyph_count: usize,
-    pub run_count: usize,
+impl Default for GlyphResourceId {
+    fn default() -> Self {
+        Self(GlyphResourceGeneration::new().0)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1079,9 +1109,11 @@ impl GlyphResourceStore {
     pub fn new(generation: GlyphResourceGeneration) -> Self {
         Self {
             metrics: GlyphMetrics::default(),
+            id: GlyphResourceId::default(),
             generation,
             shaped_ids: FxHashMap::default(),
             paint_invalid: false,
+            native_paint_resources: None,
             paint_lease: OnceLock::new(),
         }
     }
@@ -1114,6 +1146,10 @@ impl GlyphResourceStore {
         }
     }
 
+    pub fn native_paint_resources(&self) -> Option<&NativePaintResources> {
+        self.native_paint_resources.as_ref()
+    }
+
     pub fn metrics(&self) -> &GlyphMetrics {
         &self.metrics
     }
@@ -1128,6 +1164,12 @@ impl GlyphResourceStore {
     ) -> MemoryUsageReport {
         let mut report = self.metrics.memory_usage_report_with_shared(seen);
         report.add_hash_map_storage("GlyphResourceStore.shaped_ids", &self.shaped_ids);
+        if let Some(resources) = &self.native_paint_resources {
+            report.extend_prefixed(
+                "native_entries",
+                resources.memory_usage_report_with_shared(seen),
+            );
+        }
         report
     }
 
@@ -1135,112 +1177,154 @@ impl GlyphResourceStore {
         *self = Self::default();
     }
 
+    pub fn id(&self) -> GlyphResourceId {
+        self.id
+    }
+
     pub fn generation(&self) -> GlyphResourceGeneration {
         self.generation
     }
 
-    pub fn checkpoint(&self) -> GlyphResourceCheckpoint {
-        GlyphResourceCheckpoint {
-            generation: self.generation,
-            len: self.len(),
+    /// Discard appended registrations, preserving the existing prefix.
+    /// Callers must retain the length only while exclusively borrowing this store
+    /// for append-only work; replacing or clearing it invalidates that length.
+    pub fn truncate(&mut self, len: usize) {
+        assert!(
+            len <= self.len(),
+            "glyph prefix must belong to the current store"
+        );
+        if len == self.len() {
+            return;
         }
+        self.metrics.truncate(len);
+        if len == 0 {
+            self.native_paint_resources = None;
+        } else if let Some(resources) = &mut self.native_paint_resources {
+            resources.truncate(len);
+        }
+        self.shaped_ids.retain(|_, id| (id.0 as usize) < len);
     }
 
-    /// Restore an append checkpoint without cloning the ledger or its arrays.
-    /// Returns false without changing this store if it belongs to another
-    /// generation or its prefix has already been discarded.
-    pub fn rollback_to(&mut self, checkpoint: GlyphResourceCheckpoint) -> bool {
-        if checkpoint.generation != self.generation || checkpoint.len > self.len() {
-            return false;
-        }
-        self.metrics.truncate(checkpoint.len);
-        self.shaped_ids
-            .retain(|_, id| (id.0 as usize) < checkpoint.len);
-        true
-    }
-
-    /// Ask the backend for native geometry and paint handles, then assign layout
-    /// IDs here. Backends never receive the engine's registry or glyph buffer.
+    /// Register geometry and native entry references or borrowed paint handles.
+    /// The engine assigns layout IDs and retained paint IDs; backends never
+    /// receive its registry or glyph buffer.
     pub fn shape_run(
         &mut self,
         shaper: &mut (impl GlyphShaper + ?Sized),
         request: TextRunShapeRequest<'_>,
         glyphs: &mut [GlyphId],
     ) -> Result<Option<ShapedTextRun>, ShapeError> {
-        let text = text_run_shape_request_text(&request);
-        let style = *text_run_shape_request_style(&request);
-        let shaped = shaper.shape_run(request)?;
-        if let Some(ShapedRun {
-            geometry,
-            paint:
-                Some(RunPaint {
-                    first_handle,
-                    metrics,
-                }),
-        }) = shaped
-        {
-            let range = self
-                .metrics
-                .register_run(text, geometry.shared_advances(), metrics, first_handle)
-                .map_err(|_| shape_error_registry_capacity_exhausted(self.len()))?;
-            for (slot, id) in glyphs.iter_mut().zip(range) {
-                *slot = GlyphId(id);
+        let text = request.text();
+        let ShapedRun {
+            mut geometry,
+            paint,
+        } = shaper.shape_run(request);
+        match paint {
+            RunPaint::Character(paint) => {
+                glyphs[0] =
+                    self.register_shaped(text.chars().next().expect("one-character run"), paint)?;
             }
-            return Ok(Some(geometry));
-        }
-        let mut ascii = [GlyphId(u32::MAX); 128];
-        let mut non_ascii = FxHashMap::<char, GlyphId>::default();
-        for (slot, character) in glyphs.iter_mut().zip(text.chars()) {
-            let cached = if character.is_ascii() {
-                ascii[character as usize]
-            } else {
-                non_ascii
-                    .get(&character)
-                    .copied()
-                    .unwrap_or(GlyphId(u32::MAX))
-            };
-            *slot = if cached != GlyphId(u32::MAX) {
-                cached
-            } else {
-                let id = self.shape_glyph(shaper, shaping::glyph(character, &style))?;
-                if character.is_ascii() {
-                    ascii[character as usize] = id;
-                } else {
-                    non_ascii.insert(character, id);
+            RunPaint::Characters(paints) => {
+                let mut ascii = [GlyphId(u32::MAX); 128];
+                let mut non_ascii = FxHashMap::default();
+                for (character, paint) in paints {
+                    let id = self.register_shaped(character, paint)?;
+                    if character.is_ascii() {
+                        ascii[character as usize] = id;
+                    } else {
+                        non_ascii.insert(character, id);
+                    }
                 }
-                id
-            };
+                for (slot, character) in glyphs.iter_mut().zip(text.chars()) {
+                    *slot = if character.is_ascii() {
+                        ascii[character as usize]
+                    } else {
+                        non_ascii[&character]
+                    };
+                }
+            }
+            RunPaint::Native { source, metrics } => {
+                self.ensure_paint_ownership(matches!(&source, NativePaintSource::Retained(_)))?;
+                let first_handle = match &source {
+                    NativePaintSource::Borrowed(handle) => *handle,
+                    NativePaintSource::Retained(_) => GlyphHandle(self.len() as u32),
+                };
+                // Repeated isolated runs reuse registrations as well as native cache entries.
+                let mut characters = text.chars();
+                if let Some(character) = characters.next()
+                    && characters.next().is_none()
+                    && let RunFontMetrics::Uniform(font_metrics) = &metrics
+                {
+                    let advance = (geometry.as_ref().expect("native run geometry")).advances()[0];
+                    let shaped = match source {
+                        NativePaintSource::Borrowed(handle) => {
+                            ShapedGlyph::new(handle, advance, *font_metrics)
+                        }
+                        NativePaintSource::Retained(resource) => {
+                            ShapedGlyph::retained(resource, advance, *font_metrics)
+                        }
+                    };
+                    let glyph = self.register_shaped(character, shaped)?;
+                    glyphs[0] = glyph;
+                    if let Some(native) = geometry
+                        .as_mut()
+                        .and_then(|geometry| geometry.native.as_mut())
+                        && let Some(resources) = &self.native_paint_resources
+                    {
+                        native.run = resources.run_for_glyph(glyph.0);
+                    }
+                } else {
+                    let range = self
+                        .metrics
+                        .register_run(
+                            text,
+                            geometry
+                                .as_ref()
+                                .expect("native run geometry")
+                                .shared_advances(),
+                            metrics,
+                            first_handle,
+                        )
+                        .map_err(|_| shape_error_registry_capacity_exhausted(self.len()))?;
+                    if let NativePaintSource::Retained(resource) = source
+                        && !range.is_empty()
+                    {
+                        let run = self
+                            .native_paint_resources
+                            .get_or_insert_with(NativePaintResources::default)
+                            .push(range.clone(), resource);
+                        if let Some(native) = geometry
+                            .as_mut()
+                            .and_then(|geometry| geometry.native.as_mut())
+                        {
+                            native.run = Some(run);
+                        }
+                    }
+                    for (slot, id) in glyphs.iter_mut().zip(range) {
+                        *slot = GlyphId(id);
+                    }
+                }
+            }
         }
-        Ok(shaped.map(shaped_run_into_geometry))
+        Ok(geometry)
     }
 
-    /// Shape and register each character independently, using the run's font
-    /// selection. Native contextual run shaping is left to the caller.
-    pub fn shape_characters(
+    /// Intern one paint entry supplied as part of a complete run result.
+    fn register_shaped(
         &mut self,
-        shaper: &mut (impl GlyphShaper + ?Sized),
-        request: &TextRunShapeRequest<'_>,
-        glyphs: &mut [GlyphId],
-    ) -> Result<(), ShapeError> {
-        debug_assert_eq!(text_run_shape_request_text(&request).chars().count(), glyphs.len());
-        let style = text_run_shape_request_style(&request);
-        for (slot, character) in glyphs.iter_mut().zip(text_run_shape_request_text(&request).chars()) {
-            *slot = self.shape_glyph(shaper, shaping::glyph(character, style))?;
-        }
-        Ok(())
-    }
-
-    /// Shape and intern a native result, assigning its layout ID here.
-    pub fn shape_glyph(
-        &mut self,
-        shaper: &mut (impl GlyphShaper + ?Sized),
-        request: GlyphRequest<'_>,
+        character: char,
+        shaped: ShapedGlyph,
     ) -> Result<GlyphId, ShapeError> {
-        let shaped = shaper.shape_glyph(request)?;
         let metrics = shaped.metrics();
+        let identity = match &shaped.source {
+            NativePaintSource::Borrowed(handle) => GlyphPaintIdentity::Borrowed(*handle),
+            NativePaintSource::Retained(resource) => {
+                GlyphPaintIdentity::Retained(resource.identity())
+            }
+        };
         let key = (
-            shaped.handle(),
-            request.character,
+            identity,
+            character,
             shaped.advance().to_bits(),
             metrics.ascent.to_bits(),
             metrics.descent.to_bits(),
@@ -1248,20 +1332,29 @@ impl GlyphResourceStore {
         if let Some(&id) = self.shaped_ids.get(&key) {
             return Ok(id);
         }
-        let id = self.register_shaped(request.character, shaped)?;
+        self.ensure_paint_ownership(matches!(&shaped.source, NativePaintSource::Retained(_)))?;
+        let id = self.register(GlyphMetric::from_shaped(character, &shaped))?;
+        match shaped.source {
+            NativePaintSource::Borrowed(handle) => self.metrics.set_paint_handle(id, handle),
+            NativePaintSource::Retained(resource) => {
+                self.metrics.set_paint_handle(id, GlyphHandle(id.0));
+                self.native_paint_resources
+                    .get_or_insert_with(NativePaintResources::default)
+                    .push(id.0..id.0 + 1, resource);
+            }
+        }
         self.shaped_ids.insert(key, id);
         Ok(id)
     }
 
-    /// Register a native single-character result without interning.
-    fn register_shaped(
-        &mut self,
-        character: char,
-        shaped: ShapedGlyph,
-    ) -> Result<GlyphId, ShapeError> {
-        let id = self.register(GlyphMetric::from_shaped(character, shaped))?;
-        self.metrics.set_paint_handle(id, shaped.handle());
-        Ok(id)
+    fn ensure_paint_ownership(&self, retained: bool) -> Result<(), ShapeError> {
+        if self.is_empty() || retained == self.native_paint_resources.is_some() {
+            Ok(())
+        } else {
+            Err(ShapeError {
+                kind: ShapeErrorKind::MixedPaintOwnership,
+            })
+        }
     }
 
     fn register(&mut self, metric: GlyphMetric) -> Result<GlyphId, ShapeError> {
@@ -1292,21 +1385,12 @@ impl GlyphResourceStore {
     }
 }
 
-/// Backend supplied by a renderer adapter for measuring styled characters
-/// and returning handles to its native paint resources. HtmlEngine assigns
-/// layout glyph IDs and stores the returned measurements.
-/// Basic adapters can use [`crate::ResourceShaper`] to supply a shaping callback
-/// with automatic native-resource lifecycle handling.
+/// Backend supplied by a renderer adapter for shaping styled text runs
+/// and returning its native paint resources. HtmlEngine assigns layout glyph
+/// IDs and reports its own registration and layout errors separately.
+/// Basic adapters can use [`crate::ResourceShaper`] for native storage and
+/// explicit reset support while borrowing a platform text system.
 pub trait GlyphShaper {
-    /// Optional reclamation of completed scope batches. Backends which support
-    /// this must preserve all prefix handles and retained painter snapshots.
-    fn resource_checkpoint(&self) -> Option<NativeResourceCheckpoint> {
-        None
-    }
-    fn restore_resource_checkpoint(&mut self, _checkpoint: NativeResourceCheckpoint) -> bool {
-        false
-    }
-
     /// Selects the publication `@font-face` declarations and reader font
     /// policy of the document about to be shaped. The engine calls this before
     /// every document and append shaping pass, so a backend's active faces
@@ -1316,65 +1400,30 @@ pub trait GlyphShaper {
     fn select_publication_fonts(&mut self, _faces: &[FontFace], _overrides: &ReaderStyleOverrides) {
     }
 
-    /// Identity of the backend's active paint resources. Reset must assign a
-    /// fresh generation; a failed document replacement restores the old one.
+    /// Identity of the backend's native resource namespace. Caller-controlled
+    /// invalidation must change it when borrowed handles stop being valid.
     fn resource_generation(&self) -> GlyphResourceGeneration;
 
-    fn reset(&mut self);
+    /// Begin reuse of temporary shaping results within one document/layout batch.
+    fn begin_shaping(&mut self) {}
 
-    /// Checkpoint active resources before an operation that appends glyphs.
-    /// The default rejects appends so failed shaping cannot leave native
-    /// resources ahead of the published glyph metrics. Resource-backed shapers should
-    /// restore all glyph and run resources in `rollback_append_shaping`.
-    fn begin_append_shaping(&mut self) -> Result<(), ShapeError> {
-        Err(ShapeError::append_transaction_unsupported())
-    }
+    /// Release temporary native scratch after a complete shaping/layout batch.
+    /// Called on success and engine/layout errors; published glyph resources remain valid.
+    fn finish_shaping(&mut self) {}
 
-    fn commit_append_shaping(&mut self) {}
-
-    fn rollback_append_shaping(&mut self) {}
-
-    /// Starts replacing the renderer-owned resources for a shaped document.
-    ///
-    /// Resource-backed implementations should retain the previous document's
-    /// resources until either [`GlyphShaper::commit_document_shaping`] or
-    /// [`GlyphShaper::rollback_document_shaping`] is called. Implementations
-    /// without renderer-owned resources can rely on this reset-only default;
-    /// `reset` must assign a fresh resource generation.
-    fn begin_document_shaping(&mut self) {
-        self.reset();
-    }
-
-    /// Commits resources produced since `begin_document_shaping`.
-    fn commit_document_shaping(&mut self) {}
-
-    /// Restores resources retained by `begin_document_shaping` after failure.
-    fn rollback_document_shaping(&mut self) {}
-
-    /// Resolve metrics for the selected primary font face. Backends without a
+    /// Resolve metrics for the selected primary font face, applying the supplied
+    /// font features to glyph advances such as `ch`. Backends without a
     /// metrics API use the CSS-defined 0.5em x-height fallback; layout derives
     /// missing vertical metrics from its shaped line geometry.
-    fn font_relative_metrics(
-        &mut self,
-        _style: &ShapingStyle<'_>,
-    ) -> Result<FontRelativeMetrics, ShapeError> {
-        Ok(FontRelativeMetrics::default())
+    fn font_relative_metrics(&mut self, _style: &ShapingStyle<'_>) -> FontRelativeMetrics {
+        FontRelativeMetrics::default()
     }
 
-    /// Shape one character using the native text system. Return its paint
-    /// handle, advance, and measured font extents; no metric registration is needed.
-    fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError>;
-
-    /// Shape a complete logical run using the supplied resolved style. Font
-    /// selection, supported feature translation and native caching belong to
-    /// the backend. Actual advances and cluster geometry drive engine layout.
-    /// Returning `None` selects the engine's per-character fallback.
-    fn shape_run(
-        &mut self,
-        _request: TextRunShapeRequest<'_>,
-    ) -> Result<Option<ShapedRun>, ShapeError> {
-        Ok(None)
-    }
+    /// Shape a complete logical run using resolved CSS properties. This includes
+    /// isolated inserted characters and isolated mandatory line breaks. Native
+    /// backends return contextual geometry; basic adapters return character paint
+    /// entries through [`ShapedRun::characters`]. Neither requires an engine fallback.
+    fn shape_run(&mut self, request: TextRunShapeRequest<'_>) -> ShapedRun;
 }
 
 #[cfg(test)]
@@ -1393,10 +1442,10 @@ mod geometry_tests {
             }),
             ..FontRelativeMetrics::default()
         };
-        assert_eq!(font_relative_metrics_line_box_extents(selected, 20.0), (20.0, 5.0));
-        assert_eq!(font_relative_metrics_line_box_extents(selected, 0.0), (0.0, 0.0));
+        assert_eq!(selected.line_box_extents(20.0), (20.0, 5.0));
+        assert_eq!(selected.line_box_extents(0.0), (0.0, 0.0));
         assert_eq!(
-            font_relative_metrics_line_box_extents(FontRelativeMetrics::default(), 20.0),
+            (FontRelativeMetrics::default()).line_box_extents(20.0),
             (16.0, 4.0)
         );
     }
@@ -1406,7 +1455,7 @@ mod geometry_tests {
         let mut resources = GlyphResourceStore::default();
         let generation = resources.generation();
         let advances: Arc<[f32]> = [2.0, 3.0].into();
-        let run = shaped_text_run_new(advances.clone(), vec![true; 3].into());
+        let run = ShapedTextRun::new(advances.clone(), vec![true; 3].into());
         resources
             .metrics
             .register_run(
@@ -1420,11 +1469,11 @@ mod geometry_tests {
             )
             .unwrap();
         let owners = Arc::strong_count(&advances);
-        let checkpoint = resources.checkpoint();
+        let checkpoint = resources.len();
         assert_eq!(Arc::strong_count(&advances), owners);
         let extra = GlyphMetric::new('x', 1.0, 8.0, 2.0);
         assert_eq!(resources.register(extra).unwrap(), GlyphId(2));
-        assert!(resources.rollback_to(checkpoint));
+        resources.truncate(checkpoint);
         assert_eq!(resources.generation(), generation);
         assert_eq!(resources.len(), 2);
         assert_eq!(resources.record_count(), 1);
@@ -1433,28 +1482,8 @@ mod geometry_tests {
         assert_eq!(resources.register(extra).unwrap(), GlyphId(2));
     }
 
-    #[test]
-    fn invalid_append_checkpoints_leave_the_active_ledger_unchanged() {
-        let mut resources = GlyphResourceStore::default();
-        let other = GlyphResourceStore::default().checkpoint();
-        let empty = resources.checkpoint();
-        let extra = GlyphMetric::new('x', 1.0, 8.0, 2.0);
-        resources.register(extra).unwrap();
-        assert!(!resources.rollback_to(other));
-        assert_eq!(resources.len(), 1);
-        let appended = resources.checkpoint();
-        assert!(resources.rollback_to(empty));
-        assert!(!resources.rollback_to(appended));
-        assert_eq!(resources.len(), 0);
-        let stale = resources.checkpoint();
-        resources.clear();
-        resources.register(extra).unwrap();
-        assert!(!resources.rollback_to(stale));
-        assert_eq!(resources.len(), 1);
-    }
-
     fn fallback(len: usize, advance: f32) -> ShapedTextRun {
-        shaped_text_run_new(vec![advance; len].into(), vec![true; len + 1].into())
+        ShapedTextRun::new(vec![advance; len].into(), vec![true; len + 1].into())
     }
 
     #[test]
@@ -1462,11 +1491,13 @@ mod geometry_tests {
         let advances: Arc<[f32]> = [1.0, 2.0, 3.0, 4.0].into();
         let boundaries: Arc<[bool]> = [true, false, true, false, true].into();
         let carets: Arc<[f32]> = [0.0, 1.0, 3.0, 6.0, 10.0].into();
-        let run = shaped_text_run_with_backend_run(advances.clone(),
+        let run = ShapedTextRun::with_backend_run(
+            advances.clone(),
             boundaries.clone(),
             TextRunId(7),
             carets.clone().into(),
-            8.0,);
+            8.0,
+        );
         let mut geometry = ShapedTextGeometry::with_len(10);
         geometry.push_run(&[4, 5, 8, 9], run, true);
         geometry.finish_runs();
@@ -1501,11 +1532,13 @@ mod geometry_tests {
     #[test]
     fn replacements_preserve_slices_and_release_runs_after_the_last_range() {
         let carets: Arc<[f32]> = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0].into();
-        let run = shaped_text_run_with_backend_run(vec![1.0; 6].into(),
+        let run = ShapedTextRun::with_backend_run(
+            vec![1.0; 6].into(),
             vec![true; 7].into(),
             TextRunId(3),
             carets.clone().into(),
-            8.0,);
+            8.0,
+        );
         let mut geometry = ShapedTextGeometry::with_len(6);
         geometry.push_run(&[0, 1, 2, 3, 4, 5], run, false);
         geometry.replace_range(2..4, fallback(2, 2.0), false);
@@ -1557,20 +1590,22 @@ mod geometry_tests {
         for (right_to_left, expected) in [(false, [0.0, 3.0, 5.5]), (true, [0.0, 1.0, 4.5])] {
             let advances: Arc<[f32]> = [2.0, 3.0].into();
             let carets: Arc<[f32]> = [0.0, 2.0, 5.0].into();
-            let mut run = shaped_text_run_with_backend_run(advances.clone(),
+            let mut run = ShapedTextRun::with_backend_run(
+                advances.clone(),
                 vec![true; 3].into(),
                 TextRunId(0),
                 carets.clone().into(),
-                8.0,);
+                8.0,
+            );
             run = shaping::apply_spacing(run, [0.0, 0.0].into_iter(), right_to_left);
-            assert_eq!(shaped_text_run_advances(&run).as_ptr(), advances.as_ptr());
+            assert_eq!(run.advances().as_ptr(), advances.as_ptr());
             assert_eq!(
-                shaped_text_run_caret_stops(&run).unwrap().to_dense().as_ptr(),
+                run.caret_stops().unwrap().to_dense().as_ptr(),
                 carets.as_ptr()
             );
             run = shaping::apply_spacing(run, [1.0, -0.5].into_iter(), right_to_left);
-            assert_eq!(shaped_text_run_advances(&run), [3.0, 2.5]);
-            assert_eq!(shaped_text_run_caret_stops(&run).unwrap().to_dense().as_ref(), expected);
+            assert_eq!(run.advances(), [3.0, 2.5]);
+            assert_eq!(run.caret_stops().unwrap().to_dense().as_ref(), expected);
             assert_eq!(&*advances, &[2.0, 3.0]);
             assert_eq!(&*carets, &[0.0, 2.0, 5.0]);
         }
@@ -1588,159 +1623,160 @@ mod geometry_tests {
     }
 }
 
-/// Geometry whose characters occupy consecutive native paint handles.
-/// The adapter supplies a representable handle range and either uniform
-/// extents or one font metric per character. Shared arrays are retained.
-pub fn shaped_run_painted(
-    geometry: ShapedTextRun,
-    first_handle: GlyphHandle,
-    metrics: RunFontMetrics,
-) -> ShapedRun {
-    ShapedRun {
-        geometry,
-        paint: Some(RunPaint {
-            first_handle,
-            metrics,
-        }),
+impl ShapedRun {
+    /// Geometry whose characters occupy consecutive native paint handles.
+    /// The adapter supplies a representable handle range and either uniform
+    /// extents or one font metric per character. Shared arrays are retained.
+
+    pub fn painted(
+        geometry: ShapedTextRun,
+        first_handle: GlyphHandle,
+        metrics: RunFontMetrics,
+    ) -> ShapedRun {
+        ShapedRun {
+            geometry: Some(geometry),
+            paint: RunPaint::Native {
+                source: NativePaintSource::Borrowed(first_handle),
+                metrics,
+            },
+        }
+    }
+
+    /// Return measurements together with a reference to a caller-owned native run.
+    /// The engine assigns document-local paint IDs when it registers the result.
+
+    pub fn retained(
+        geometry: ShapedTextRun,
+        resource: impl Into<NativePaintResource>,
+        metrics: RunFontMetrics,
+    ) -> ShapedRun {
+        ShapedRun {
+            geometry: Some(geometry),
+            paint: RunPaint::Native {
+                source: NativePaintSource::Retained(resource.into()),
+                metrics,
+            },
+        }
+    }
+
+    /// A complete run for adapters that paint individual characters. The callback
+    /// stays inside the adapter; repeated characters are measured once per run.
+    pub fn characters(
+        request: TextRunShapeRequest<'_>,
+        mut shape: impl FnMut(char, &ShapingStyle<'_>) -> ShapedGlyph,
+    ) -> ShapedRun {
+        let mut characters = request.text.chars();
+        if let Some(character) = characters.next()
+            && characters.next().is_none()
+        {
+            return ShapedRun {
+                geometry: None,
+                paint: RunPaint::Character(shape(character, &request.style)),
+            };
+        }
+        let mut ascii = [false; 128];
+        let mut non_ascii = FxHashSet::default();
+        let mut glyphs = Vec::new();
+        for character in request.text.chars() {
+            let fresh = if character.is_ascii() {
+                !std::mem::replace(&mut ascii[character as usize], true)
+            } else {
+                non_ascii.insert(character)
+            };
+            if fresh {
+                glyphs.push((character, shape(character, &request.style)));
+            }
+        }
+        ShapedRun {
+            geometry: None,
+            paint: RunPaint::Characters(glyphs),
+        }
+    }
+
+    /// Supply contextual geometry while retaining a complete run's paint entries.
+
+    pub fn with_geometry(mut self, geometry: ShapedTextRun) -> ShapedRun {
+        self.geometry = Some(geometry);
+        self
+    }
+
+    pub fn into_geometry(self) -> Option<ShapedTextRun> {
+        self.geometry
     }
 }
 
-pub fn shaped_text_run_caret_stops(value: &ShapedTextRun) -> Option<&CaretPositions> {
-    value.native.as_ref().map(|native| &native.caret_stops)
-}
+impl FontSlant {
+    /// The caller supplies a resolved CSS angle from -90 through 90 degrees.
 
-/// Native geometry with individual glyph painting supplied by `shape_glyph`.
-pub fn shaped_run_geometry(geometry: ShapedTextRun) -> ShapedRun {
-    ShapedRun {
-        geometry,
-        paint: None,
+    pub fn oblique(degrees: f32) -> FontSlant {
+        FontSlant::Oblique {
+            angle: ObliqueAngle(degrees.to_bits()),
+        }
     }
 }
 
-/// The caller supplies a resolved CSS angle from -90 through 90 degrees.
-pub fn font_slant_oblique(degrees: f32) -> FontSlant {
-    FontSlant::Oblique {
-        angle: ObliqueAngle(degrees.to_bits()),
+impl<'a> TextRunShapeRequest<'a> {
+    pub fn style(&self) -> &ShapingStyle<'a> {
+        &self.style
+    }
+
+    pub fn text(&self) -> &'a str {
+        self.text
     }
 }
 
-pub fn text_run_shape_request_style<'a, 's>(
-    value: &'s TextRunShapeRequest<'a>,
-) -> &'s ShapingStyle<'a> {
-    &value.style
-}
+impl CursiveJoining {
+    #[inline]
+    pub const fn connects_to_next(self) -> bool {
+        matches!(
+            self,
+            CursiveJoining::ConnectedToNext | CursiveJoining::ConnectedToBoth
+        )
+    }
 
-/// Per-character overrides. `None` means every character uses
-/// [`ShapingStyle::color`] from the shaping style.
-pub fn text_run_shape_request_paint_colors<'a>(
-    value: &TextRunShapeRequest<'a>,
-) -> Option<&'a [u32]> {
-    value.paint_colors
-}
-
-pub fn shaped_text_run_advances(value: &ShapedTextRun) -> &[f32] {
-    &value.advances
-}
-
-/// The adapter supplies finite, non-negative advances and one more cluster
-/// boundary than advances, with both outer boundaries enabled.
-pub fn shaped_text_run_new(advances: Arc<[f32]>, cluster_boundaries: Arc<[bool]>) -> ShapedTextRun {
-    ShapedTextRun {
-        advances,
-        cluster_boundaries,
-        native: None,
+    #[inline]
+    pub const fn connects_to_previous(self) -> bool {
+        matches!(
+            self,
+            CursiveJoining::ConnectedToPrevious | CursiveJoining::ConnectedToBoth
+        )
     }
 }
 
-#[inline]
-pub const fn cursive_joining_connects_to_next(value: CursiveJoining) -> bool {
-    matches!(
-        value,
-        CursiveJoining::ConnectedToNext | CursiveJoining::ConnectedToBoth
-    )
-}
+impl<'a> ShapingStyle<'a> {
+    /// Select a character's resolved family, including the reader's CJK override.
 
-pub fn shaped_text_run_cluster_boundaries(value: &ShapedTextRun) -> &[bool] {
-    &value.cluster_boundaries
-}
-
-/// The adapter also supplies finite ascent and caret positions, with one
-/// caret per character boundary. All arrays refer to the same logical run.
-pub fn shaped_text_run_with_backend_run(
-    advances: Arc<[f32]>,
-    cluster_boundaries: Arc<[bool]>,
-    backend_run: TextRunId,
-    caret_stops: CaretPositions,
-    ascent: f32,
-) -> ShapedTextRun {
-    ShapedTextRun {
-        advances,
-        cluster_boundaries,
-        native: Some(NativeRunGeometry {
-            run: backend_run,
-            caret_stops,
-            ascent,
-        }),
+    pub fn font_family_for_character(&self, character: char) -> Option<&'a str> {
+        self.cjk_font_family
+            .filter(|_| html_style_model::is_cjk_character(character))
+            .or(self.font_family)
     }
 }
 
-pub fn text_run_shape_request_text<'a>(value: &TextRunShapeRequest<'a>) -> &'a str {
-    value.text
+impl FontRelativeMetrics {
+    /// Font content extents at a CSS font size, before line-height leading.
+
+    pub fn line_box_extents(self, font_size: f64) -> (f64, f64) {
+        self.line_metrics.map_or_else(
+            || (font_size * 0.8, font_size * 0.2),
+            |metrics| {
+                (
+                    font_size * f64::from(metrics.ascent_ratio),
+                    font_size * f64::from(metrics.descent_ratio),
+                )
+            },
+        )
+    }
 }
 
-#[inline]
-pub const fn cursive_joining_connects_to_previous(value: CursiveJoining) -> bool {
-    matches!(
-        value,
-        CursiveJoining::ConnectedToPrevious | CursiveJoining::ConnectedToBoth
-    )
-}
-
-/// Select a character's resolved family, including the reader's CJK override.
-pub fn shaping_style_font_family_for_character<'a>(
-    value: &ShapingStyle<'a>,
-    character: char,
-) -> Option<&'a str> {
-    value
-        .cjk_font_family
-        .filter(|_| html_style_model::is_cjk_character(character))
-        .or(value.font_family)
-}
-
-/// Font content extents at a CSS font size, before line-height leading.
-pub fn font_relative_metrics_line_box_extents(
-    value: FontRelativeMetrics,
-    font_size: f64,
-) -> (f64, f64) {
-    value.line_metrics.map_or_else(
-        || (font_size * 0.8, font_size * 0.2),
-        |metrics| {
-            (
-                font_size * f64::from(metrics.ascent_ratio),
-                font_size * f64::from(metrics.descent_ratio),
-            )
-        },
-    )
-}
-
-pub fn shape_error_registry_capacity_exhausted(metrics_len: usize) -> ShapeError {
+pub(crate) fn shape_error_registry_capacity_exhausted(metrics_len: usize) -> ShapeError {
     ShapeError {
         kind: ShapeErrorKind::RegistryCapacityExhausted { metrics_len },
     }
 }
 
-pub fn oblique_angle_degrees(value: ObliqueAngle) -> f32 {
-    f32::from_bits(value.0)
-}
-
-pub fn shaped_text_run_backend_run(value: &ShapedTextRun) -> Option<TextRunId> {
-    value.native.as_ref().map(|native| native.run)
-}
-
-pub fn shaped_text_run_ascent(value: &ShapedTextRun) -> f32 {
-    value.native.as_ref().map_or(0.0, |native| native.ascent)
-}
-
-pub fn shaped_run_into_geometry(value: ShapedRun) -> ShapedTextRun {
-    value.geometry
+impl ObliqueAngle {
+    pub fn degrees(self) -> f32 {
+        f32::from_bits(self.0)
+    }
 }

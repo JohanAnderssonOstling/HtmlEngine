@@ -11,15 +11,15 @@ mod geometry;
 pub(super) mod ordering;
 #[path = "finalization/overflow.rs"]
 mod overflow;
+#[path = "finalization/ownership.rs"]
+mod ownership;
 #[path = "finalization/pagination.rs"]
 mod pagination;
 #[path = "finalization/text_paint.rs"]
 pub mod text_paint;
 
 use geometry::publish_inline_box_geometry;
-use ordering::{
-    build_line_traversals, rebuild_glyph_line_indices, rebuild_image_fragments_by_line,
-};
+use ordering::{build_line_traversals, rebuild_glyph_line_indices, rebuild_image_fragments_by_line};
 use overflow::rebuild_overflow_clips;
 
 #[derive(Default)]
@@ -30,8 +30,6 @@ pub(super) struct FinalizationScratch {
 
 impl LayoutEngine<'_, '_> {
     pub(super) fn finalize(&mut self) {
-        profile_scope!("layout.finalize");
-        let finalization_started = self.start_timing();
 
         // Recursive layout retains subtree placement transforms so moving a
         // container is independent of descendant count. Public layout output
@@ -39,9 +37,10 @@ impl LayoutEngine<'_, '_> {
         self.placement
             .publish_absolute(self.geometry, &mut self.fragments);
 
-        let start = self.start_timing();
+        // Published source layout is independent of pagination height.
+        self.fragments.state_mut().line_output.pagination_fragment_height = None;
+        self.fragments.state_mut().line_output.pagination_header_rows.clear();
         build_line_traversals(&self.reader, &mut self.fragments);
-        self.record_timing(|timings| timings.build_line_traversals += start.elapsed());
 
         rebuild_glyph_line_indices(self.text.glyphs().len(), &mut self.fragments);
 
@@ -49,15 +48,14 @@ impl LayoutEngine<'_, '_> {
             &self.reader,
             self.geometry,
             &self.fragments,
-            &mut self.finalization,
+            &mut self.scratch.finalization,
         );
 
-        let start = self.start_timing();
         rebuild_image_fragments_by_line(&mut self.fragments);
-        pagination::build_pagination_groups(&self.reader, &mut self.fragments);
-        self.record_timing(|timings| timings.rebuild_image_fragments_by_line += start.elapsed());
+        pagination::build_pagination_groups(&self.reader, self.geometry, &mut self.fragments);
+        pagination::build_float_keeps(&self.reader, self.geometry, &mut self.fragments);
 
+        ownership::prepare_ownership(&self.reader, self.geometry, &mut self.fragments);
         rebuild_overflow_clips(&self.reader, self.geometry, &mut self.fragments);
-        self.record_timing(|timings| timings.finalize_layout += finalization_started.elapsed());
     }
 }

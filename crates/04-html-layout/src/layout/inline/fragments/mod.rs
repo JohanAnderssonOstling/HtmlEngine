@@ -2,10 +2,10 @@
 //!
 //! This module consumes already-selected line ranges and never decides where
 //! the paragraph should wrap.
+use html_engine_model::{GlyphId, LineInlineBoxFragment, LineTextFragment, paragraph_unicode_bidi};
 
 use super::*;
 use crate::layout::LayoutReader;
-use crate::layout_model::{LineInlineBoxFragment, LineTextFragment, paragraph_unicode_bidi};
 use std::iter::successors;
 
 fn inline_ancestors<'a>(
@@ -198,11 +198,14 @@ pub(super) struct LineLayout {
     /// them a different share of the line's bounded glue adjustment.
     pub(super) punctuation_space_advances: Vec<(u32, f32)>,
     pub(super) optical_offset_x: f64,
-    pub(super) hyphen: Option<(crate::GlyphId, f64)>,
+    pub(super) hyphen: Option<(GlyphId, f64)>,
     pub(super) publish_empty: bool,
+    pub(super) publishes_line: bool,
+    pub(super) has_tabs: bool,
     /// Logical text uses implicit or streamed positions. Reordered text retains
     /// x coordinates; complex content shares vertical and relative offset runs.
     pub(super) placements: Option<LinePlacements>,
+    pub(super) fragments: Option<Box<emission::LineFragmentPlan>>,
 }
 
 /// Text presence and source ownership share one byte in the measured summary.
@@ -221,6 +224,7 @@ pub(super) struct TokenSpanSummary {
     pub(super) glyph_range: Range<u32>,
     pub(super) text_coverage: TextCoverage,
     pub(super) has_images: bool,
+    pub(super) has_tabs: bool,
     pub(super) has_baseline_relative_image: bool,
     pub(super) plain_text: bool,
     pub(super) justifiable_text: bool,
@@ -407,7 +411,8 @@ pub(super) fn prepare_line(
         tokens.features.no_bidi_separators(),
         &mut layout,
     );
-    let height = if line_publishes(engine, span, metrics, &tokens.replaced, &layout) {
+    layout.publishes_line = line_publishes(engine, span, metrics, &tokens.replaced, &layout);
+    let height = if layout.publishes_line {
         layout.line_height
     } else {
         0.0

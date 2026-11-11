@@ -4,9 +4,9 @@ use std::ops::Range;
 
 /// One source cell placed in a logical table grid.
 #[derive(Clone, Copy)]
-pub struct TableCellPlacement {
-    /// Identity supplied by the caller (for example a box or DOM node index).
-    pub cell_idx: usize,
+pub struct TableCellPlacement<Id = usize> {
+    /// Typed identity supplied by the caller (for example a box index or DOM ID).
+    pub cell_idx: Id,
     pub row: usize,
     pub col: usize,
     pub colspan: usize,
@@ -14,7 +14,7 @@ pub struct TableCellPlacement {
     pub rowspan: usize,
 }
 
-impl TableCellPlacement {
+impl<Id> TableCellPlacement<Id> {
     pub fn column_range(self, column_count: usize) -> Option<Range<usize>> {
         let start = self.col.min(column_count);
         let end = self.col.saturating_add(self.colspan).min(column_count);
@@ -23,15 +23,15 @@ impl TableCellPlacement {
 }
 
 /// Logical cell placements and the maximum column count across all rows.
-pub struct TableGrid {
-    pub placements: Vec<TableCellPlacement>,
+pub struct TableGrid<Id = usize> {
+    pub placements: Vec<TableCellPlacement<Id>>,
     pub column_count: usize,
 }
 
 /// Collect streamed table-cell placements into an owned grid.
-pub fn build_table_grid<Cells: IntoIterator<Item = (usize, usize, usize)>>(
+pub fn build_table_grid<Id, Cells: IntoIterator<Item = (Id, usize, usize)>>(
     rows: impl IntoIterator<Item = Cells>,
-) -> TableGrid {
+) -> TableGrid<Id> {
     let mut placements = Vec::new();
     let column_count = place_table_cells(rows, |placement| placements.push(placement));
     TableGrid {
@@ -44,9 +44,9 @@ pub fn build_table_grid<Cells: IntoIterator<Item = (usize, usize, usize)>>(
 /// returning the maximum column count without retaining a placement buffer.
 /// Overlapping spans preserve the longest remaining reservation in each column.
 /// Callers apply row-group limits and other stage-specific span policies first.
-pub fn place_table_cells<Cells: IntoIterator<Item = (usize, usize, usize)>>(
+pub fn place_table_cells<Id, Cells: IntoIterator<Item = (Id, usize, usize)>>(
     rows: impl IntoIterator<Item = Cells>,
-    mut visit: impl FnMut(TableCellPlacement),
+    mut visit: impl FnMut(TableCellPlacement<Id>),
 ) -> usize {
     let mut carry_rowspans: Vec<usize> = Vec::new();
     let mut max_columns = 0usize;

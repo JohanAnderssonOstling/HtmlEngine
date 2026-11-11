@@ -1,12 +1,7 @@
 //! Backend-neutral geometry execution over immutable prepared/shaped inputs.
 //! Document ownership and stage orchestration live in html-pipeline.
 #![cfg_attr(not(test), forbid(unsafe_code))]
-#[macro_use(profile_scope)]
-extern crate html_engine_model;
 
-use html_engine_model as layout_model;
-#[cfg(feature = "profiling")]
-pub use html_engine_model::profiling;
 pub use html_engine_model::*;
 mod layout;
 mod flex_grid;
@@ -17,8 +12,7 @@ pub use html_pipeline::engine::{
     ShapedDocument,
 };
 pub use layout::engine::{
-    LayoutInputs, LayoutOutputs, LayoutScratch, LayoutTimings, layout_with_timings, repaint,
-};
+    LayoutInputs, LayoutOutputs, LayoutScratch, compute_layout, repaint};
 pub use layout::{InlinePlanGeneration, PlacementState, prepare_text_paint};
 #[cfg(test)]
 mod parser {
@@ -26,9 +20,3 @@ mod parser {
 }
 #[cfg(test)]
 include!("../../../test-support/stage-fixtures.rs");
-
-/// Diagnostics for tests of pipeline-driven layout execution.
-#[cfg(feature = "testing")]
-pub mod testing {
-    pub use crate::layout::{observed_worker_count, reset_observed_workers};
-}

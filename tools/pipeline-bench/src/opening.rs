@@ -1,8 +1,9 @@
+use html_pipeline::engine::LayoutRequest;
 use crate::{Shaper, cpu_seconds, layout_fingerprint};
-use html_pipeline::parse_document;
+use html_pipeline::{DocumentFactory, PipelineInputs, ResourceContext, parse_document};
 use html::resources::FileSystemProvider;
 use html_style::StyleTimings;
-use html_pipeline::engine::GlyphResourceStore;
+use html_pipeline::engine::{GlyphResourceStore, LayoutConstraints, reader_style};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::hint::black_box;
@@ -31,56 +32,6 @@ pub(super) fn style_details(t: &StyleTimings) -> [(&'static str, Duration); 9] {
         ("selector_matching", t.selector_matching),
         ("cascade", t.cascade),
         ("style_store", t.style_store),
-    ]
-}
-
-fn layout_details(t: &LayoutTimings) -> [(&'static str, Duration); 25] {
-    [
-        ("clear_layout_output", t.clear_layout_output),
-        ("layout_tree_traversal", t.layout_tree_traversal),
-        ("root_box_layout", t.root_box_layout),
-        ("finalize_layout", t.finalize_layout),
-        ("build_line_traversals", t.build_line_traversals),
-        ("collect_inline_decorations", t.collect_inline_decorations),
-        (
-            "rebuild_image_fragments_by_line",
-            t.rebuild_image_fragments_by_line,
-        ),
-        ("layout_box_total", t.layout_box_total),
-        ("layout_block_children", t.layout_block_children),
-        ("layout_table", t.layout_table),
-        ("layout_table_row", t.layout_table_row),
-        ("layout_runs", t.layout_runs),
-        (
-            "layout_runs_around_float_exclusions",
-            t.layout_runs_around_float_exclusions,
-        ),
-        ("build_inline_tokens", t.build_inline_tokens),
-        (
-            "build_inline_tokens_from_runs",
-            t.build_inline_tokens_from_runs,
-        ),
-        ("break_lines", t.break_lines),
-        ("break_lines_knuth", t.break_lines_knuth),
-        ("emit_lines", t.emit_lines),
-        ("measure_line", t.measure_line),
-        ("write_line_fragments", t.write_line_fragments),
-        ("place_float_anchor", t.place_float_anchor),
-        ("layout_flex_grid", t.layout_flex_grid),
-        ("measure_flex_grid_item", t.measure_flex_grid_item),
-        // Deliberately recorded separately: nested timers are not additive.
-        (
-            "tree_outside_root",
-            t.layout_tree_traversal.saturating_sub(t.root_box_layout),
-        ),
-        (
-            "finalize_other",
-            t.finalize_layout.saturating_sub(
-                t.build_line_traversals
-                    + t.collect_inline_decorations
-                    + t.rebuild_image_fragments_by_line,
-            ),
-        ),
     ]
 }
 
@@ -120,9 +71,8 @@ pub fn run(path: &str, case: &str, count: usize, inputs: &PipelineInputs) {
             .unwrap();
         let shaped_at = Instant::now();
         let document = shaped
-            .layout_with_metrics_and_shaper(
-                constraints,
-                &inputs.image_metrics,
+            .layout(
+                LayoutRequest::new(constraints).with_image_metrics(&inputs.image_metrics),
                 &mut shaper,
                 &mut shaped_resources,
             )
@@ -132,29 +82,7 @@ pub fn run(path: &str, case: &str, count: usize, inputs: &PipelineInputs) {
         let total_cpu_ms = (cpu_seconds() - cpu) * 1000.0;
         black_box(&document);
 
-        // Detailed per-line timers perturb layout. Collect them in a second
-        // pass and check its output against the production layout entry point.
-        let mut detail_shaper = Shaper::default();
-        let mut detail_input_resources = GlyphResourceStore::default();
-        let detail_input = prepared
-            .shape_borrowed(&mut detail_shaper, &mut detail_input_resources)
-            .unwrap();
-        let detail_start = Instant::now();
-        let (detailed, layout) = detail_input
-            .layout_with_timings_and_metrics_and_shaper(
-                constraints,
-                &inputs.image_metrics,
-                &mut detail_shaper,
-                &mut detail_input_resources,
-            )
-            .expect("layout requires the shaper-aware API for first-line styles");
-        let detail_total = detail_start.elapsed();
         let fingerprint = layout_fingerprint(&document, &shaped_resources);
-        assert_eq!(
-            fingerprint,
-            layout_fingerprint(&detailed, &detail_input_resources),
-            "instrumented layout differs: {path}"
-        );
         if iteration >= 3 {
             let mut record = |name: &str, value: Duration| {
                 samples
@@ -174,15 +102,11 @@ pub fn run(path: &str, case: &str, count: usize, inputs: &PipelineInputs) {
                 ("prepare.stylesheets", preparation.stylesheets),
                 ("prepare.style", preparation.style),
                 ("prepare.box_tree", preparation.prepare),
-                ("detail_layout.total", detail_total),
             ] {
                 record(name, value);
             }
             for (name, value) in style_details(&preparation.style_details) {
                 record(&format!("style.{name}"), value);
-            }
-            for (name, value) in layout_details(&layout) {
-                record(&format!("detail_layout.{name}"), value);
             }
             samples
                 .entry("total_cpu".into())
@@ -200,7 +124,6 @@ pub fn run(path: &str, case: &str, count: usize, inputs: &PipelineInputs) {
                 "glyphs": document.render_view(&shaped_resources).text().glyph_count(),
                 "lines": document.render_view(&shaped_resources).text().line_count(),
                 "render_fingerprint": format!("{fingerprint:016x}"),
-                "detail_layout_matches": true,
             });
         }
     }

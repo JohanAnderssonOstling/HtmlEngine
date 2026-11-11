@@ -1,15 +1,7 @@
 use html_resources::resources::images::{decoded_image_dimensions, decoded_images_get};
-use html_pipeline::engine::pagination_queries;
-use html_pipeline::engine::reading_queries;
 use crate::pagination::PaginationTarget;
-use html_pipeline::engine::box_queries;
-use html_pipeline::engine::geometry_queries;
-use html_pipeline::engine::search_queries;
 use html_dom as dom_values;
 use html_engine_model::layout_state;
-use html_pipeline::engine::export_queries;
-use html_pipeline::engine::fragment_paint;
-use html_pipeline::engine::text_paint;
 use html_render_core as render_core;
 use crate::configuration::{DocumentUpdate, Update};
 
@@ -43,9 +35,8 @@ use crate::targets::ElementTarget;
 use crate::selection::{Selection, SelectionAnchor, SelectionInput, TableSelectionState};
 use crate::structure::{Structure, HeaderPolicy, TableGroupKind};
 use crate::text::{
-    GlyphRequest, GlyphResourceGeneration, GlyphShaper, ShapeError, FontMetrics, GlyphHandle,
-    ShapedGlyph, TextSearchOptions,
-};
+    GlyphResourceGeneration, GlyphShaper, FontMetrics, GlyphHandle, ShapedRun, TextRunShapeRequest,
+    ShapedGlyph, TextSearchOptions};
 use kurbo::{Point, Rect, Size, Vec2};
 use std::collections::HashMap;
 use std::io;
@@ -57,27 +48,22 @@ struct Shaper(GlyphResourceGeneration);
 
 impl GlyphShaper for Shaper {
     // Handles are character codes, so this fixture has no native append state.
-    fn begin_append_shaping(&mut self) -> Result<(), ShapeError> {
-        Ok(())
-    }
-
-    fn reset(&mut self) {
-        self.0 = GlyphResourceGeneration::default();
-    }
 
     fn resource_generation(&self) -> GlyphResourceGeneration {
         self.0
     }
 
-    fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
-        Ok(ShapedGlyph::new(
-            GlyphHandle(request.character as u32),
-            request.style.font_size / 2.0,
-            FontMetrics {
-                ascent: request.style.font_size,
-                descent: 0.0,
-            },
-        ))
+    fn shape_run(&mut self, request: TextRunShapeRequest<'_>) -> ShapedRun {
+        ShapedRun::characters(request, |character, style| {
+            ShapedGlyph::new(
+                GlyphHandle(character as u32),
+                style.font_size / 2.0,
+                FontMetrics {
+                    ascent: style.font_size,
+                    descent: 0.0,
+                },
+            )
+        })
     }
 }
 
@@ -137,10 +123,10 @@ fn load(source: &str) -> Document {
 }
 
 fn find(engine: &Document, text: &str) -> Range<u32> {
-    search_queries::render_text_view_find_matches(engine
+    (engine
         .render_view()
         .unwrap()
-        .text(), text, TextSearchOptions::default())[0]
+        .text()).find_matches(text, TextSearchOptions::default())[0]
         .clone()
 }
 
@@ -206,21 +192,18 @@ fn disjoint_line_export_deduplicates_and_preserves_source_structure() {
     let content = engine.render_view().unwrap().export();
     let one = find(&engine, "one");
     let three = find(&engine, "three");
-    let selected = export_queries::render_export_view_plain_text_ranges(
-        content,
-        [three.clone(), one.clone(), one],
-    )
+    let selected = content.plain_text_ranges([three.clone(), one.clone(), one])
     .unwrap();
     assert!(selected.starts_with("one") && selected.ends_with("three"));
     assert!(!selected.contains("skip") && selected.contains('\n'));
     let view = engine.render_view().unwrap();
-    let lines: Vec<_> = text_paint::render_text_view_spatial_order(view.text())
+    let lines: Vec<_> = (view.text()).spatial_order()
         .iter()
         .copied()
         .rev()
         .flat_map(|line| [line, line])
         .collect();
-    let all = export_queries::text_for_lines(content, lines).unwrap();
+    let all = content.text_for_lines(lines).unwrap();
     assert_eq!(all.matches("one").count(), 1);
     assert!(!all.contains("hidden") && !all.contains("1."));
 }
@@ -232,7 +215,7 @@ fn intrinsic_reading_regions_retain_cells_and_translate_without_columns() {
     );
     let view = engine.render_view().unwrap();
     let line =
-        text_paint::render_text_view_line_for_glyph(view.text(), find(&engine, "left").start)
+        (view.text()).line_for_glyph(find(&engine, "left").start)
             .unwrap();
     let geometry = engine.geometry().unwrap();
     let natural = geometry
@@ -259,7 +242,7 @@ fn intrinsic_reading_regions_retain_cells_and_translate_without_columns() {
     assert_eq!(translated.bounds, natural.bounds + delta);
     assert_eq!(translated.cell, natural.cell);
     assert_eq!(translated.glyphs, natural.glyphs);
-    for reading in text_paint::render_text_view_spatial_order(view.text())
+    for reading in (view.text()).spatial_order()
         .iter()
         .copied()
         .filter_map(|index| {
@@ -273,11 +256,7 @@ fn intrinsic_reading_regions_retain_cells_and_translate_without_columns() {
         })
     {
         assert!(
-            !export_queries::render_export_view_text(
-                view.export(),
-                reading.glyphs,
-                TextExportFormat::Plain
-            )
+            !(view.export()).text(reading.glyphs, TextExportFormat::Plain)
             .plain
             .unwrap_or_default()
             .contains("hidden")
@@ -381,7 +360,7 @@ fn word_hits_respect_ink_and_caller_selected_lines() {
             .is_none()
     );
     let text = engine.render_view().unwrap().text();
-    let line = text_paint::render_text_view_line_for_glyph(text, range.start).unwrap();
+    let line = text.line_for_glyph(range.start).unwrap();
     let placements = [LinePlacement {
         line,
         origin: text.line(line).unwrap().point(),
@@ -410,14 +389,14 @@ fn structural_selection_uses_the_same_cells_for_geometry_and_containment() {
     let selected = find(&engine, "span");
     let selection = engine.selection(selected).unwrap().with_semantics();
     let view = engine.render_view().unwrap();
-    let table = (0..box_queries::len(view.boxes()))
+    let table = (0..(view.boxes()).len())
         .map(layout_state::box_id_new)
-        .find_map(|index| box_queries::render_box_view_table(view.boxes(), index))
+        .find_map(|index| (view.boxes()).table(index))
         .unwrap();
     let cell_box = table.rows()[0].cells()[0].box_id();
     let cell_rect = Rect::from_origin_size(
-        box_queries::render_box_view_point(view.boxes(), cell_box).unwrap(),
-        box_queries::render_box_view_size(view.boxes(), cell_box).unwrap(),
+        (view.boxes()).point(cell_box).unwrap(),
+        (view.boxes()).size(cell_box).unwrap(),
     );
     let mut text_rects = Vec::new();
     let mut cells = Vec::new();
@@ -441,8 +420,8 @@ fn structural_selection_uses_the_same_cells_for_geometry_and_containment() {
         .iter()
         .map(|&(_, index)| {
             Rect::from_origin_size(
-                box_queries::render_box_view_point(view.boxes(), index).unwrap(),
-                box_queries::render_box_view_size(view.boxes(), index).unwrap(),
+                (view.boxes()).point(index).unwrap(),
+                (view.boxes()).size(index).unwrap(),
             )
         })
         .collect();
@@ -491,10 +470,10 @@ fn parse_only_search_exposes_unicode_source_addresses_and_explicit_statistics() 
         "parse-only search does not evaluate CSS"
     );
     assert!(
-        search_queries::render_text_view_find_matches(load(source)
+        (load(source)
             .render_view()
             .unwrap()
-            .text(), "hidden", TextSearchOptions::default())
+            .text()).find_matches("hidden", TextSearchOptions::default())
             .is_empty()
     );
     assert_eq!(
@@ -511,18 +490,18 @@ fn structural_boundaries_include_empty_elements_and_authored_constraints() {
     let view = engine.render_view().unwrap();
     let mut structure = Structure::default();
     let index = structure.for_lines(view, 0..view.text().line_count());
-    let empty = (0..box_queries::len(view.boxes()))
+    let empty = (0..(view.boxes()).len())
         .map(layout_state::box_id_new)
-        .find(|&box_idx| box_queries::attribute(view.boxes(), box_idx, "id") == Some("empty"))
+        .find(|&box_idx| (view.boxes()).attribute(box_idx, "id") == Some("empty"))
         .unwrap();
-    let flow = (0..box_queries::len(view.boxes()))
+    let flow = (0..(view.boxes()).len())
         .map(layout_state::box_id_new)
-        .find(|&box_idx| box_queries::attribute(view.boxes(), box_idx, "id") == Some("flow"))
+        .find(|&box_idx| (view.boxes()).attribute(box_idx, "id") == Some("flow"))
         .unwrap();
     let beta_line =
-        text_paint::render_text_view_line_for_glyph(view.text(), find(&engine, "beta").start)
+        (view.text()).line_for_glyph(find(&engine, "beta").start)
             .and_then(|line| {
-                pagination_queries::render_view_pagination(view)
+                view.pagination()
                     .locate(PaginationTarget::Line(line))
                     .map(|position| position.cursor)
             })
@@ -576,10 +555,10 @@ fn table_dependencies_expose_span_groups_and_keep_header_inference_optional() {
         .unwrap();
     assert!(body.bottom > body.top && body.bottom <= whole.bottom);
     let span_line =
-        text_paint::render_text_view_line_for_glyph(view.text(), find(&engine, "span").start)
+        (view.text()).line_for_glyph(find(&engine, "span").start)
             .unwrap();
     let two_line =
-        text_paint::render_text_view_line_for_glyph(view.text(), find(&engine, "two").start)
+        (view.text()).line_for_glyph(find(&engine, "two").start)
             .unwrap();
     assert!(body.top <= view.text().line(span_line).unwrap().point().y);
     assert!(
@@ -693,19 +672,19 @@ fn image_queries_painting_and_scene_extent_agree_on_object_fit_and_placement() {
             )
             .unwrap();
         let view = engine.render_view().unwrap();
-        let image = fragment_paint::render_fragment_view_images(view.fragments())
+        let image = (view.fragments()).images()
             .iter()
             .next()
             .unwrap();
         let line = view
             .text()
-            .line(fragment_paint::render_image_fragment_line(&image))
+            .line(image.line())
             .unwrap();
         let rect = Rect::from_origin_size(
-            line.point() + fragment_paint::render_image_fragment_offset(&image).to_vec2(),
-            fragment_paint::render_image_fragment_size(&image),
+            line.point() + image.offset().to_vec2(),
+            image.size(),
         );
-        let clip = fragment_paint::render_image_fragment_clip(&image) + line.point().to_vec2();
+        let clip = image.clip() + line.point().to_vec2();
         assert_eq!(rect.size(), fitted_size);
         let visible = rect.intersect(clip);
         let inside = visible.center();
@@ -774,25 +753,21 @@ fn hidden_source_does_not_promote_visible_content_during_semantic_selection() {
     let text = view.text();
     let source_text = |range: Range<u32>| {
         range
-            .map(|index| text_paint::render_text_view_character_at(text, index as usize).unwrap())
+            .map(|index| text.character_at(index as usize).unwrap())
             .collect::<String>()
     };
-    let hidden = text_paint::render_text_view_text_runs(text)
+    let hidden = text.text_runs()
         .find(|run| source_text(run.glyphs()) == "secret")
         .unwrap()
         .glyphs();
     let selection = engine.selection(hidden).unwrap().with_semantics();
     assert_eq!(selection.text(), TextExport::default());
-    let visible: Vec<_> = text_paint::render_text_view_visible_source_runs(text)
+    let visible: Vec<_> = text.visible_source_runs()
         .map(|run| source_text(run.glyphs()))
         .filter(|text| !text.is_empty())
         .collect();
     assert_eq!(visible, ["visible", "Restored"]);
-    let reading: String = reading_queries::reading_page(
-        engine.render_view().unwrap().addressing(),
-        0..text.glyph_count() as u32,
-        text.glyph_count() as u32,
-    )
+    let reading: String = (engine.render_view().unwrap().addressing()).reading_page(0..text.glyph_count() as u32, text.glyph_count() as u32)
     .fragments
     .into_iter()
     .map(|fragment| fragment.text)
@@ -810,9 +785,9 @@ fn fragments_tables_and_search_previews_share_unicode_whitespace_normalization()
     let engine = load(source);
     let view = engine.render_view().unwrap();
     let boxes = view.boxes();
-    let table = (0..box_queries::len(boxes))
+    let table = (0..boxes.len())
         .map(layout_state::box_id_new)
-        .find_map(|index| box_queries::render_box_view_table(boxes, index))
+        .find_map(|index| boxes.table(index))
         .unwrap();
     assert_eq!(table.rows()[0].cells()[0].text(), expected);
     let search = engine.render_view().unwrap().export();
@@ -832,7 +807,7 @@ fn document_search_excerpts_use_visible_source_and_unicode_character_ranges() {
     );
     let view = engine.render_view().unwrap();
     let search = view.export();
-    let results = search_queries::render_text_view_find_matches(view.text(), "cafe", TextSearchOptions::default());
+    let results = (view.text()).find_matches("cafe", TextSearchOptions::default());
     assert_eq!(results.len(), 2);
     let first = results.first().unwrap().clone();
     assert_eq!(
@@ -848,7 +823,7 @@ fn document_search_excerpts_use_visible_source_and_unicode_character_ranges() {
     );
     assert_eq!(search.excerpt(second, 0, 0).as_deref(), Some("Cafe\u{301}"));
     for query in ["secret", "concealed", "1"] {
-        assert!(search_queries::render_text_view_find_matches(view.text(), query, TextSearchOptions::default()).is_empty());
+        assert!((view.text()).find_matches(query, TextSearchOptions::default()).is_empty());
     }
     assert!(search.excerpt(10..2, 0, 0).is_none());
     assert!(search.excerpt(0..u32::MAX, 0, 0).is_none());
@@ -868,14 +843,14 @@ fn table_hit_testing_retains_spans_and_accepts_host_projection() {
     );
     let view = engine.render_view().unwrap();
     let boxes = view.boxes();
-    let table = (0..box_queries::len(boxes))
+    let table = (0..boxes.len())
         .map(layout_state::box_id_new)
-        .find_map(|index| box_queries::render_box_view_table(boxes, index))
+        .find_map(|index| boxes.table(index))
         .unwrap();
     let cell = &table.rows()[0].cells()[0];
     let rect = Rect::from_origin_size(
-        box_queries::render_box_view_point(boxes, cell.box_id()).unwrap(),
-        box_queries::render_box_view_size(boxes, cell.box_id()).unwrap(),
+        boxes.point(cell.box_id()).unwrap(),
+        boxes.size(cell.box_id()).unwrap(),
     );
     let geometry = engine.geometry().unwrap();
     let hit = geometry.content_at(rect.center()).unwrap().table.unwrap();
@@ -897,8 +872,8 @@ fn table_hit_testing_retains_spans_and_accepts_host_projection() {
         .iter()
         .map(|&((), index)| {
             Rect::from_origin_size(
-                box_queries::render_box_view_point(boxes, index).unwrap(),
-                box_queries::render_box_view_size(boxes, index).unwrap(),
+                boxes.point(index).unwrap(),
+                boxes.size(index).unwrap(),
             )
         })
         .collect();
@@ -972,7 +947,7 @@ fn resource_loading_preserves_transport_metadata_css_and_worker_preparation() {
             Some("Café")
         );
         assert_eq!(
-            text_paint::paint_color_at(engine.render_view().unwrap().text(), range.start),
+            (engine.render_view().unwrap().text()).paint_color_at(range.start),
             Some(0xff0000ff)
         );
         assert_eq!(engine.configuration().height(), None);
@@ -1227,9 +1202,9 @@ fn logical_selection_state_and_table_ranges_need_no_viewport() {
          <table><tr><td>other</td></tr></table>",
     );
     let view = engine.render_view().unwrap();
-    let tables: Vec<_> = (0..box_queries::len(view.boxes()))
+    let tables: Vec<_> = (0..(view.boxes()).len())
         .map(layout_state::box_id_new)
-        .filter_map(|index| box_queries::render_box_view_table(view.boxes(), index))
+        .filter_map(|index| (view.boxes()).table(index))
         .collect();
     let geometry = engine.geometry().unwrap();
     let first = geometry
@@ -1332,12 +1307,12 @@ fn document_resources_update_intrinsic_layout_and_drop_replaced_image_identity()
     );
     assert!(omitted.svgs.is_empty());
     assert_eq!(
-        fragment_paint::render_fragment_view_images(engine.render_view().unwrap().fragments())
+        (engine.render_view().unwrap().fragments()).images()
             .iter()
             .next()
             .map(|image| (
-                fragment_paint::render_image_fragment_size(&image).width as u32,
-                fragment_paint::render_image_fragment_size(&image).height as u32
+                image.size().width as u32,
+                image.size().height as u32
             )),
         Some((42, 31))
     );
@@ -1365,12 +1340,12 @@ fn document_resources_update_intrinsic_layout_and_drop_replaced_image_identity()
         .unwrap();
     assert!(!engine.resources_pending());
     assert_eq!(
-        fragment_paint::render_fragment_view_images(engine.render_view().unwrap().fragments())
+        (engine.render_view().unwrap().fragments()).images()
             .iter()
             .next()
             .map(|image| (
-                fragment_paint::render_image_fragment_size(&image).width as u32,
-                fragment_paint::render_image_fragment_size(&image).height as u32
+                image.size().width as u32,
+                image.size().height as u32
             )),
         Some((90, 31))
     );
@@ -1391,12 +1366,12 @@ fn document_resources_update_intrinsic_layout_and_drop_replaced_image_identity()
     engine.request_image_lines([], []);
     assert!(decoded_images_get(engine.images(), dom_values::image_id_new(0)).is_none());
     assert_eq!(
-        fragment_paint::render_fragment_view_images(engine.render_view().unwrap().fragments())
+        (engine.render_view().unwrap().fragments()).images()
             .iter()
             .next()
             .map(|image| (
-                fragment_paint::render_image_fragment_size(&image).width as u32,
-                fragment_paint::render_image_fragment_size(&image).height as u32
+                image.size().width as u32,
+                image.size().height as u32
             )),
         Some((90, 31))
     );
@@ -1433,12 +1408,12 @@ fn sparse_paint_candidates_restore_css_order_and_include_inline_decorations() {
     );
     let view = engine.render_view().unwrap();
     let mut blocks = Vec::new();
-    fragment_paint::block_decoration_indices_intersecting(view.fragments(), -1e6, 1e6, &mut blocks);
+    (view.fragments()).block_decoration_indices_intersecting(-1e6, 1e6, &mut blocks);
     blocks.reverse();
     blocks.extend_from_within(..);
     blocks.push(usize::MAX);
     let absent = LineId::new(u32::MAX as usize - 1);
-    let mut lines = text_paint::render_text_view_spatial_order(view.text())
+    let mut lines = (view.text()).spatial_order()
         .iter()
         .copied()
         .rev()
@@ -1449,39 +1424,35 @@ fn sparse_paint_candidates_restore_css_order_and_include_inline_decorations() {
         RenderPaintItem::Line(line) => format!("line:{line:?}"),
         RenderPaintItem::Decoration(decoration) => format!("decoration:{decoration:?}"),
     };
-    let full = fragment_paint::paint_order(view.fragments())
+    let full = (view.fragments()).paint_order()
         .map(signature)
         .collect::<Vec<_>>();
-    let selected = fragment_paint::paint_order_for(view.fragments(), &lines, &blocks);
+    let selected = (view.fragments()).paint_order_for(&lines, &blocks);
     drop(lines);
     drop(blocks);
     let selected = selected.map(signature).collect::<Vec<_>>();
     assert_eq!(selected, full);
-    let expected = fragment_paint::paint_order(view.fragments())
+    let expected = (view.fragments()).paint_order()
         .filter(|item| match item {
             RenderPaintItem::Line(line) => *line == LineId::new(0),
             RenderPaintItem::Decoration(decoration) => {
-                fragment_paint::render_decoration_line(&decoration) == Some(LineId::new(0))
+                decoration.line() == Some(LineId::new(0))
             }
         })
         .map(signature)
         .collect::<Vec<_>>();
-    let partial = fragment_paint::paint_order_for(
-        view.fragments(),
-        &[LineId::new(0), absent, LineId::new(0)],
-        &[],
-    )
+    let partial = (view.fragments()).paint_order_for(&[LineId::new(0), absent, LineId::new(0)], &[])
     .map(signature)
     .collect::<Vec<_>>();
     assert_eq!(partial, expected);
 
     assert!(
-        fragment_paint::paint_order_for(view.fragments(), &[], &[])
+        (view.fragments()).paint_order_for(&[], &[])
             .next()
             .is_none()
     );
     assert!(
-        fragment_paint::paint_order_for(view.fragments(), &[absent], &[usize::MAX])
+        (view.fragments()).paint_order_for(&[absent], &[usize::MAX])
             .next()
             .is_none()
     );
@@ -1509,7 +1480,7 @@ fn block_selection_and_clipped_hit_testing_use_visible_authored_lines() {
         "<html><body style='margin:0'><div style='height:20px;overflow:hidden'><p style='margin:0;line-height:20px'>Visible</p><p style='margin:0;line-height:20px'>Clipped</p></div><p style='margin:0;line-height:20px'>Last <em>paragraph</em></p></body></html>",
     );
     let view = engine.render_view().unwrap();
-    let geometry = geometry_queries::render_view_geometry(view);
+    let geometry = view.geometry();
     let hit = engine
         .geometry()
         .unwrap()
@@ -1517,7 +1488,7 @@ fn block_selection_and_clipped_hit_testing_use_visible_authored_lines() {
         .unwrap();
     let text = view.text();
     let clipped =
-        search_queries::render_text_view_find_matches(text, "Clipped", Default::default())[0]
+        text.find_matches("Clipped", Default::default())[0]
             .clone();
     assert!(
         engine
@@ -1528,7 +1499,7 @@ fn block_selection_and_clipped_hit_testing_use_visible_authored_lines() {
     );
     assert!(!clipped.contains(&hit.glyph));
     let last =
-        search_queries::render_text_view_find_matches(text, "Last", Default::default())[0].clone();
+        text.find_matches("Last", Default::default())[0].clone();
     let bounds = engine.geometry().unwrap().selection_bounds(last).unwrap();
     let range = engine
         .geometry()
@@ -1536,14 +1507,14 @@ fn block_selection_and_clipped_hit_testing_use_visible_authored_lines() {
         .block_range_at(bounds.center())
         .unwrap();
     assert_eq!(
-        export_queries::render_export_view_text(view.export(), range, TextExportFormat::Plain)
+        (view.export()).text(range, TextExportFormat::Plain)
             .plain
             .as_deref(),
         Some("Last paragraph")
     );
     let all = 0..text.glyph_count() as u32;
     assert!(
-        geometry_queries::render_geometry_view_line_selection_rects(geometry, hit.line, all)
+        geometry.line_selection_rects(hit.line, all)
             .all(|rect| rect.height() > 0.0)
     );
 }
@@ -1554,17 +1525,17 @@ fn plain_text_block_separator_preserves_authored_breaks_and_unicode() {
     let view = engine.render_view().unwrap();
     let all = 0..view.text().glyph_count() as u32;
     let expected = Some("First & café\nnext line\nSecond paragraph");
-    assert_eq!(export_queries::render_export_view_text(view.export(), all.clone(), TextExportFormat::Plain).plain.as_deref(), expected);
+    assert_eq!((view.export()).text(all.clone(), TextExportFormat::Plain).plain.as_deref(), expected);
     assert_eq!(
-        export_queries::render_export_view_text(view.export(), all.clone(), TextExportFormat::PlainAndMarkdown).plain.as_deref(),
+        (view.export()).text(all.clone(), TextExportFormat::PlainAndMarkdown).plain.as_deref(),
         expected
     );
     assert_eq!(
-        export_queries::render_export_view_plain_text_ranges(view.export(), [all.clone()]).as_deref(),
+        (view.export()).plain_text_ranges([all.clone()]).as_deref(),
         expected
     );
     assert_eq!(
-        export_queries::render_export_view_text(view.export(), all, TextExportFormat::PlainWithParagraphBreaks).plain
+        (view.export()).text(all, TextExportFormat::PlainWithParagraphBreaks).plain
             .as_deref(),
         Some("First & café\nnext line\n\nSecond paragraph")
     );
@@ -1737,11 +1708,11 @@ mod document_operations {
             .lines()
             .iter()
             .find_map(|line| {
-                fragment_paint::render_fragment_view_images_for_line(view.fragments(), line.id())
+                (view.fragments()).images_for_line(line.id())
                     .iter()
                     .next()
                     .map(|image| {
-                        (fragment_paint::render_image_fragment_visible_rect(&image)
+                        (image.visible_rect()
                             + line.point().to_vec2())
                         .center()
                     })
@@ -1793,13 +1764,13 @@ mod document_operations {
             .lines()
             .iter()
             .find_map(|line| {
-                fragment_paint::render_fragment_view_images_for_line(view.fragments(), line.id())
+                (view.fragments()).images_for_line(line.id())
                     .iter()
                     .next()
                     .map(|image| {
                         (
                             line.id(),
-                            fragment_paint::render_image_fragment_visible_rect(&image)
+                            image.visible_rect()
                                 + line.point().to_vec2(),
                         )
                     })
@@ -1884,9 +1855,9 @@ mod document_operations {
         assert_eq!(plain, "Some bold text.");
         assert!(markdown.contains("**bold**"));
         let view = engine.render_view().unwrap();
-        let table = (0..box_queries::len(view.boxes()))
+        let table = (0..(view.boxes()).len())
             .map(layout_state::box_id_new)
-            .find_map(|index| box_queries::render_box_view_table(view.boxes(), index))
+            .find_map(|index| (view.boxes()).table(index))
             .unwrap();
         for format in [
             TableExportFormat::Markdown,
@@ -1911,10 +1882,7 @@ mod document_operations {
         let text = cells.markdown(&table).unwrap();
         assert!(text.contains('C') && text.contains('D') && !text.contains('A'));
         assert!(
-            box_queries::render_box_view_table(
-                view.boxes(),
-                layout_state::box_id_new(u32::MAX as usize),
-            )
+            (view.boxes()).table(layout_state::box_id_new(u32::MAX as usize))
             .and_then(|table| table.export(TableExportRequest::Whole(TableExportFormat::Html)))
             .is_none()
         );
@@ -1961,11 +1929,11 @@ mod document_operations {
             .lines()
             .iter()
             .find_map(|line| {
-                fragment_paint::render_fragment_view_images_for_line(view.fragments(), line.id())
+                (view.fragments()).images_for_line(line.id())
                     .iter()
                     .find(|image| image.image() == dom_values::image_id_new(1))
                     .map(|image| {
-                        (fragment_paint::render_image_fragment_visible_rect(&image)
+                        (image.visible_rect()
                             + line.point().to_vec2())
                         .center()
                     })
@@ -2058,7 +2026,7 @@ mod document_refinement {
             ("duplicate", first.clone()),
             ("empty", 2..2),
         ];
-        let placements: Vec<_> = text_paint::render_text_view_spatial_order(text)
+        let placements: Vec<_> = text.spatial_order()
             .iter()
             .copied()
             .rev()
@@ -2134,11 +2102,11 @@ mod document_refinement {
         ));
         let view = engine.render_view().unwrap();
         let fragments = view.fragments();
-        let images: Vec<_> = fragment_paint::render_fragment_view_images(fragments)
+        let images: Vec<_> = fragments.images()
             .iter()
             .collect();
         let first = &images[0];
-        let first_line = fragment_paint::render_image_fragment_line(first);
+        let first_line = first.line();
         engine.request_image_lines(
             [first_line, first_line, LineId::new(u32::MAX as usize - 1)],
             [],
@@ -2153,10 +2121,10 @@ mod document_refinement {
 }
 
 mod selection_state_fixtures {
+    use html_pipeline::engine::LayoutRequest;
     use super::Shaper;
     use html_engine_model::layout_state;
     use crate::export::TableExportFormat;
-    use html_pipeline::engine::box_queries;
 
     use html_pipeline::engine::TableExportRequest;
     use crate::geometry::{Geometry, WordHit};
@@ -2294,15 +2262,16 @@ mod selection_state_fixtures {
         let shaped = prepared.shape(&mut shaper, &mut shaped_resources).unwrap();
         let document = shaped
             .layout(
-                LayoutConstraints::new(500.0, 20.0).unwrap(),
-                &shaped_resources,
+                LayoutRequest::new(LayoutConstraints::new(500.0, 20.0).unwrap()),
+                &mut shaper,
+                &mut shaped_resources,
             )
             .expect("test layout succeeds");
         let boxes = document.render_view(&shaped_resources).boxes();
-        let table = (0..box_queries::len(boxes))
+        let table = (0..boxes.len())
             .map(layout_state::box_id_new)
-            .find(|&index| box_queries::is_table(boxes, index))
-            .and_then(|index| box_queries::render_box_view_table(boxes, index))
+            .find(|&index| boxes.is_table(index))
+            .and_then(|index| boxes.table(index))
             .unwrap();
         assert_eq!(
             table

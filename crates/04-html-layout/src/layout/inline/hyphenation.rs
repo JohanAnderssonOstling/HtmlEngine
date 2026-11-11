@@ -1,4 +1,4 @@
-use super::{InlineItem, InlineItemKind};
+use super::{InlineItem, InlineItemKind, TextPreparationInputs};
 use crate::layout::LayoutEngine;
 use html_engine_model::WordSpan;
 use html_style_model::language::content_language_tag;
@@ -36,21 +36,25 @@ struct WordPolicy<'a> {
 }
 
 impl<'input> WordPolicy<'input> {
-    fn for_run(engine: &LayoutEngine<'input, '_>, run: &InlineItem) -> Self {
-        let styles = engine.reader.styles();
-        let style = engine.reader.style(run.box_idx as usize);
+    fn for_run(inputs: &TextPreparationInputs<'input>, run: &InlineItem) -> Self {
+        let styles = inputs.reader.styles();
+        let style = inputs.reader.style(run.box_idx as usize);
         let language = style.language().and_then(|id| styles.language(id));
         let fallback = styles.hyphenation_fallback_language();
-        let reader_selected_auto = engine.reader.layout_tree()
+        let reader_selected_auto = inputs
+            .reader
+            .layout_tree()
             .get_box_style_indices(run.box_idx as usize)
             .and_then(|indices| styles.view(indices))
             .is_some_and(|style| style.text.reader_hyphens == Some(Hyphens::Auto));
         // An unknown web-document language must not select an arbitrary
         // dictionary. Keep the reader's explicit/default English policy.
-        let dictionary = (language.is_some() || fallback.is_some()
-            || reader_selected_auto || engine.config.book_optimized_text())
-            .then(|| hyphenation_language(language, fallback))
-            .flatten();
+        let dictionary = (language.is_some()
+            || fallback.is_some()
+            || reader_selected_auto
+            || inputs.config.book_optimized_text())
+        .then(|| hyphenation_language(language, fallback))
+        .flatten();
         Self {
             language: language.or(fallback),
             dictionary,
@@ -58,7 +62,7 @@ impl<'input> WordPolicy<'input> {
                 && style.white_space().allows_wrap()
                 && style.word_break() != WordBreak::BreakAll
                 && style.line_break() != LineBreak::Anywhere
-                && engine.text.hyphen_glyph(run.box_idx as usize).is_some(),
+                && inputs.text.hyphen_glyph(run.box_idx as usize).is_some(),
         }
     }
 }
@@ -79,30 +83,35 @@ struct TextGroup<'a> {
 }
 
 impl TextGroup<'_> {
-    fn flush(&mut self, engine: &mut LayoutEngine<'_, '_>, breaks: &mut Vec<u32>) {
+    fn flush(
+        &mut self,
+        inputs: &TextPreparationInputs<'_>,
+        dictionary: &mut HyphenationDictionaryCache,
+        breaks: &mut Vec<u32>,
+    ) {
         let Some((first, last)) = self.source.first().zip(self.source.last()) else {
             return;
         };
         if self.indexable
-            && let Some(words) = engine
+            && let Some(words) = inputs
                 .text
                 .word_index()
                 .and_then(|words| words.contiguous_words(first.glyphs.start..last.glyphs.end))
         {
-            self.flush_indexed(engine, words, breaks);
+            self.flush_indexed(inputs, dictionary, words, breaks);
         } else {
             // Generated/hidden text and source gaps can give the reader index
             // different boundaries. Build UTF-8 and byte positions only here.
             for source in &mut self.source {
                 self.text.extend(
-                    engine.text.content().characters()
+                    inputs.text.content().characters()
                         [source.glyphs.start as usize..source.glyphs.end as usize]
                         .iter()
                         .copied(),
                 );
                 source.byte_end = self.text.len();
             }
-            self.flush_segmented(engine, breaks);
+            self.flush_segmented(inputs, dictionary, breaks);
         }
         self.text.clear();
         self.source.clear();
@@ -110,12 +119,17 @@ impl TextGroup<'_> {
 
     fn flush_indexed(
         &mut self,
-        engine: &mut LayoutEngine<'_, '_>,
+        inputs: &TextPreparationInputs<'_>,
+        dictionary: &mut HyphenationDictionaryCache,
         words: &[WordSpan],
         breaks: &mut Vec<u32>,
     ) {
         let mut first_run = 0;
-        let minimum_letters = if engine.config.hyphenation_quality() { 5 } else { 4 };
+        let minimum_letters = if inputs.config.hyphenation_quality() {
+            5
+        } else {
+            4
+        };
         for word in words {
             let source = word.range();
             // Each letter needs at least one source character. Short entries,
@@ -139,23 +153,35 @@ impl TextGroup<'_> {
             }
             self.text.clear();
             self.text.extend(
-                engine.text.content().characters()[source.start as usize..source.end as usize]
+                inputs.text.content().characters()[source.start as usize..source.end as usize]
                     .iter()
                     .copied(),
             );
-            for_each_word_break(engine, &self.text, source.start, language, |glyph| {
-                breaks.push(glyph);
-            });
+            for_each_word_break(
+                inputs,
+                dictionary,
+                &self.text,
+                source.start,
+                language,
+                |glyph| {
+                    breaks.push(glyph);
+                },
+            );
         }
     }
 
-    fn flush_segmented(&self, engine: &mut LayoutEngine<'_, '_>, breaks: &mut Vec<u32>) {
-        let text = engine.text;
+    fn flush_segmented(
+        &self,
+        inputs: &TextPreparationInputs<'_>,
+        dictionary: &mut HyphenationDictionaryCache,
+        breaks: &mut Vec<u32>,
+    ) {
+        let text = inputs.text;
         let mut source_index = 0;
         let mut source_byte = 0;
         let mut source_glyph = self.source.first().map_or(0, |run| run.glyphs.start);
         for (start, word) in self.text.unicode_word_indices() {
-            self.word_breaks(engine, start, word, |boundary| {
+            self.word_breaks(inputs, dictionary, start, word, |boundary| {
                 // Dictionary offsets and words arrive in increasing byte order.
                 // Skip whole source runs, then count only the unvisited UTF-8
                 // prefix. No per-character source or policy map is needed.
@@ -176,7 +202,8 @@ impl TextGroup<'_> {
 
     fn word_breaks(
         &self,
-        engine: &mut LayoutEngine<'_, '_>,
+        inputs: &TextPreparationInputs<'_>,
+        dictionary: &mut HyphenationDictionaryCache,
         start: usize,
         word: &str,
         mut emit: impl FnMut(usize),
@@ -198,7 +225,7 @@ impl TextGroup<'_> {
         if source.iter().any(|run| run.policy != *policy) {
             return;
         }
-        for_each_cached_word_break(engine, word, language, |offset| {
+        for_each_cached_word_break(inputs, dictionary, word, language, |offset| {
             emit(start + offset);
         });
     }
@@ -207,7 +234,7 @@ impl TextGroup<'_> {
 impl<'input> TextGroup<'input> {
     fn append_run(
         &mut self,
-        engine: &LayoutEngine<'input, '_>,
+        inputs: &TextPreparationInputs<'input>,
         run: &InlineItem,
         glyphs: Range<u32>,
     ) {
@@ -216,13 +243,13 @@ impl<'input> TextGroup<'input> {
         }
         let visible_dom = matches!(run.kind, InlineItemKind::Text { .. })
             && run.dom_text_node.is_some()
-            && engine.reader.style(run.box_idx as usize).visibility() == Visibility::Visible;
+            && inputs.reader.style(run.box_idx as usize).visibility() == Visibility::Visible;
         self.indexable = if let Some(previous) = self.source.last() {
             self.indexable && visible_dom && previous.glyphs.end == glyphs.start
         } else {
             visible_dom
         };
-        let policy = WordPolicy::for_run(engine, run);
+        let policy = WordPolicy::for_run(inputs, run);
         if let Some(previous) = self.source.last_mut()
             && previous.glyphs.end == glyphs.start
             && previous.policy == policy
@@ -242,22 +269,17 @@ impl<'input> TextGroup<'input> {
 /// Analyze adjacent text together, retaining original source positions across
 /// font/color/emphasis runs. Non-text content and formatting contexts separate
 /// words; inline decoration boundaries do not.
+/// The caller has already established that at least one run uses automatic hyphens.
 pub(super) fn automatic_hyphen_breaks(
-    engine: &mut LayoutEngine<'_, '_>,
+    inputs: &TextPreparationInputs<'_>,
+    dictionary: &mut HyphenationDictionaryCache,
     runs: &[InlineItem],
     container_box_idx: usize,
 ) -> Vec<u32> {
-    profile_scope!("tokens.hyphenation");
     let mut breaks = Vec::new();
-    if !runs
-        .iter()
-        .any(|run| engine.reader.style(run.box_idx as usize).hyphens() == Hyphens::Auto)
-    {
-        return breaks;
-    }
     let mut group = TextGroup::default();
     for run in runs {
-        if !engine
+        if !inputs
             .reader
             .inline_item_belongs_to_context(run, container_box_idx)
         {
@@ -271,19 +293,19 @@ pub(super) fn automatic_hyphen_breaks(
             | InlineItemKind::AbsoluteAnchor { .. }
             | InlineItemKind::FloatAnchor { .. } => continue,
             _ => {
-                group.flush(engine, &mut breaks);
+                group.flush(inputs, dictionary, &mut breaks);
                 continue;
             }
         };
         if marker {
-            group.flush(engine, &mut breaks);
+            group.flush(inputs, dictionary, &mut breaks);
         }
-        group.append_run(engine, run, glyphs.clone());
+        group.append_run(inputs, run, glyphs.clone());
         if marker {
-            group.flush(engine, &mut breaks);
+            group.flush(inputs, dictionary, &mut breaks);
         }
     }
-    group.flush(engine, &mut breaks);
+    group.flush(inputs, dictionary, &mut breaks);
     // Source groups can be visited out of order or share glyphs. Consumers
     // walk each source range forward and need the same unique membership.
     breaks.sort_unstable();
@@ -295,24 +317,23 @@ pub(super) fn automatic_hyphen_breaks(
 /// complete opportunity stream. The deferred path has one contiguous logical
 /// text group and uses greedy selection, including changing float intervals.
 pub(super) fn can_defer_hyphenation(
-    engine: &LayoutEngine<'_, '_>,
+    inputs: &TextPreparationInputs<'_>,
     runs: &[InlineItem],
     container: usize,
 ) -> bool {
-    let style = engine.reader.style(container);
-    if engine.config.book_optimized_text()
+    let style = inputs.reader.style(container);
+    if inputs.config.book_optimized_text()
         || style.text_wrap_style() == TextWrapStyle::Pretty
-        || engine.config.force_justify()
         || style.text_align() == TextAlign::Justify
         || style.direction() != TextDirection::Ltr
         || style.overflow_x().clips()
-        || !engine.text.is_resolved_default_ltr()
+        || !inputs.text.is_resolved_default_ltr()
     {
         return false;
     }
     let mut previous = None;
     runs.iter().all(|run| {
-        if !engine.reader.inline_item_belongs_to_context(run, container) {
+        if !inputs.reader.inline_item_belongs_to_context(run, container) {
             return false;
         }
         match &run.kind {
@@ -498,6 +519,7 @@ impl<'input, 'cache> DeferredHyphenation<'input, 'cache> {
         engine: &LayoutEngine<'input, '_>,
         source: &Range<u32>,
     ) -> Option<WordPolicy<'input>> {
+        let inputs = engine.text_preparation_inputs();
         let mut policy = None;
         for run in self.runs {
             let InlineItemKind::Text { glyphs } = &run.kind else {
@@ -509,7 +531,7 @@ impl<'input, 'cache> DeferredHyphenation<'input, 'cache> {
             if glyphs.end <= source.start || glyphs.is_empty() {
                 continue;
             }
-            let current = WordPolicy::for_run(engine, run);
+            let current = WordPolicy::for_run(&inputs, run);
             if !current.enabled
                 || current.dictionary.is_none()
                 || policy.as_ref().is_some_and(|previous| *previous != current)
@@ -532,7 +554,8 @@ impl<'input, 'cache> DeferredHyphenation<'input, 'cache> {
                 .copied(),
         );
         for_each_word_break(
-            engine,
+            &engine.text_preparation_inputs(),
+            &mut engine.scratch.hyphenation_dictionary,
             &self.word,
             source.start,
             policy.dictionary.unwrap(),
@@ -619,7 +642,8 @@ impl<'input, 'cache> DeferredHyphenation<'input, 'cache> {
 /// Translate dictionary byte offsets for one contiguous logical word. Both
 /// eager indexed matching and deferred matching keep native cluster checks.
 fn for_each_word_break(
-    engine: &mut LayoutEngine<'_, '_>,
+    inputs: &TextPreparationInputs<'_>,
+    dictionary: &mut HyphenationDictionaryCache,
     word: &str,
     start: u32,
     language: HyphenationLanguage,
@@ -628,8 +652,8 @@ fn for_each_word_break(
     let ascii = word.is_ascii();
     let mut previous_byte = 0;
     let mut glyph = start;
-    let text = engine.text;
-    for_each_cached_word_break(engine, word, language, |offset| {
+    let text = inputs.text;
+    for_each_cached_word_break(inputs, dictionary, word, language, |offset| {
         let after = if ascii {
             start + offset as u32
         } else {
@@ -643,7 +667,7 @@ fn for_each_word_break(
     });
 }
 
-/// Exact ASCII dictionary results shared only by one layout execution.
+/// Exact ASCII dictionary results retained across passes by layout scratch.
 /// Empty slots have a zero tag; eligible word lengths are always nonzero.
 #[derive(Clone, Copy, Default)]
 struct DictionaryEntry {
@@ -652,7 +676,7 @@ struct DictionaryEntry {
     tag: u16,
 }
 
-// The layout executor owns this lazy table and updates it exclusively.
+// Layout scratch owns this bounded lazy table; its active executor updates it exclusively.
 // Copy a hit's mask before emission; no table borrow crosses the callback.
 #[derive(Default)]
 pub(in crate::layout) struct HyphenationDictionaryCache {
@@ -660,12 +684,13 @@ pub(in crate::layout) struct HyphenationDictionaryCache {
 }
 
 fn for_each_cached_word_break(
-    engine: &mut LayoutEngine<'_, '_>,
+    inputs: &TextPreparationInputs<'_>,
+    dictionary: &mut HyphenationDictionaryCache,
     word: &str,
     language: HyphenationLanguage,
     mut emit: impl FnMut(usize),
 ) {
-    let quality = engine.config.hyphenation_quality();
+    let quality = inputs.config.hyphenation_quality();
     if !(5..=16).contains(&word.len()) || !word.is_ascii() {
         for offset in word_breaks(word, language, quality) {
             emit(offset);
@@ -685,8 +710,7 @@ fn for_each_cached_word_break(
         ^ (language as u64) << 48
         ^ u64::from(quality) << 63;
     let slot = (hash.wrapping_mul(0x9e3779b97f4a7c15) >> 56) as usize;
-    let entries = engine
-        .hyphenation_dictionary
+    let entries = dictionary
         .entries
         .get_or_insert_with(|| Box::new([DictionaryEntry::default(); 256]));
     let entry = &mut entries[slot];

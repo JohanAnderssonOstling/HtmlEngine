@@ -2,8 +2,9 @@
 
 use super::paragraph::ParagraphLayoutResult;
 use super::*;
-use crate::GlyphResourceGeneration;
+use html_engine_model::GlyphResourceGeneration;
 use crate::layout::LayoutEngine;
+use crate::layout::engine::LayoutPassKind;
 use html_dom::MemoryUsageReport;
 use rustc_data_structures::fx::FxHashMap;
 
@@ -24,7 +25,7 @@ impl ParagraphSlot {
             owner: input.container_box_idx as u32,
             start: input.run_range.start,
             end: input.run_range.end,
-            measurement: !engine.placement.retains_output(),
+            measurement: engine.pass_kind == LayoutPassKind::Probe,
             refined: !engine.text_style_ranges.is_empty(),
         }
     }
@@ -40,7 +41,6 @@ pub(super) struct ParagraphDependencies {
     first_letter_height: Option<f64>,
     book: bool,
     hyphenation_quality: bool,
-    force_justify: bool,
     generation: GlyphResourceGeneration,
     shaping: InlinePlanGeneration,
 }
@@ -61,7 +61,6 @@ impl ParagraphDependencies {
             first_letter_height,
             book: engine.config.book_optimized_text(),
             hyphenation_quality: engine.config.hyphenation_quality(),
-            force_justify: engine.config.force_justify(),
             generation: engine.resource_generation,
             shaping: engine.inline_plan_generation,
         }
@@ -263,7 +262,9 @@ impl ParagraphLayouts {
                 drop(self.remove(&ParagraphSlot { refined, ..slot }));
             }
         } else if let Some(entry) = self.remove(&slot) {
-            if &entry.dependencies == dependencies && entry.token_count == tokens.len() {
+            if &entry.dependencies == dependencies
+                && entry.token_count == tokens.len()
+            {
                 #[cfg(any(test, feature = "testing"))]
                 {
                     self.hits += 1;
@@ -392,7 +393,6 @@ mod tests {
             first_letter_height: None,
             book: false,
             hyphenation_quality: false,
-            force_justify: false,
             generation: GlyphResourceGeneration::UNBOUND,
             shaping,
         }

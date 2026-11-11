@@ -2,41 +2,40 @@ use crate::layout::{
     LayoutEngine, ResolvedBoxSizing, ResolvedTableBoxSizing, constrain_content_width,
     constrain_size, contains_full_width_percentage_table, resolve_vertical_size,
 };
-use crate::layout_model::TableBox;
+use html_engine_model::TableBox;
 use html_style_model::{
-    BorderCollapseMode, BoxSizing, TextDirection, UsedPreferredSize as PreferredSize,
-};
+    BorderCollapseMode, BoxSizing, TextDirection, UsedPreferredSize as PreferredSize};
 use kurbo::{Point, Rect, Size, Vec2};
 
 use super::backgrounds::emit_collapsed_table_background;
-use super::captions::{CaptionMeasurement, layout_caption_stack, measure_caption_stack};
-use super::column_sizing::{WidthMeasure, measure_table_columns, resolve_table_columns};
+use super::captions::{layout_caption_stack, measure_caption_stack};
+use super::s03_column_sizing::{WidthMeasure, measure_table_columns, resolve_table_columns};
 use super::columns::{row_group_range, span_extent};
-use super::grid::{PreparedTableGrid, prepare_table_grid};
-use super::intrinsic::intrinsic_sizes_for_grid;
-use super::placement::{defer_row_out_of_flow, publish_table_plan};
-use super::row_sizing::resolve_row_heights;
-use super::rows::prepare_cells;
+use super::s01_grid::{PreparedTableGrid, prepare_table_grid};
+use super::s02_intrinsic::intrinsic_sizes_for_grid;
+use super::s06_placement::{defer_row_out_of_flow, publish_table_plan};
+use super::s05_row_sizing::resolve_row_heights;
+use super::s04_rows::prepare_cells;
 use super::{ResolvedTablePlan, TableDimensionBasis, TableLayoutInput, TableStructure};
 
-fn resolve_table_input(
-    session: &mut LayoutEngine<'_, '_>,
+fn resolve_table_input<'tree>(
+    engine: &mut LayoutEngine<'_, '_>,
     resolved: &ResolvedBoxSizing,
-    rows: Vec<u32>,
+    rows: &'tree [u32],
     content_pos: Point,
     prepared: &PreparedTableGrid,
     measures: &[WidthMeasure],
-) -> TableLayoutInput {
+) -> TableLayoutInput<'tree> {
     let sizing = resolved.table_box_sizing();
     let uses_auto_intrinsic_width =
         !sizing.has_assigned_width && matches!(sizing.preferred_width, PreferredSize::Auto);
     let mut auto_grid_intrinsic = None;
     let content_width = if uses_auto_intrinsic_width {
-        let intrinsic = intrinsic_sizes_for_grid(session, sizing.box_idx, prepared, measures);
+        let intrinsic = intrinsic_sizes_for_grid(engine, sizing.box_idx, prepared, measures);
         let intrinsic_min = intrinsic.minimum;
         let mut intrinsic_max = intrinsic.maximum;
         let requires_available_width = intrinsic.full_width_percentage_grid
-            || contains_full_width_percentage_table(session, sizing.box_idx);
+            || contains_full_width_percentage_table(engine, sizing.box_idx);
         let mut auto_table_available = sizing.content_width;
         if requires_available_width {
             auto_table_available = (sizing.auto_width_limit.unwrap_or(sizing.available_width)
@@ -59,7 +58,7 @@ fn resolve_table_input(
     };
     let explicit_content_height = resolved_table_height(sizing);
     let collapsed_content_box = matches!(
-        session.reader.style(sizing.box_idx).border_collapse(),
+        engine.reader.style(sizing.box_idx).border_collapse(),
         BorderCollapseMode::Collapse
     ) && matches!(sizing.box_sizing, BoxSizing::ContentBox);
     let inline_basis = if collapsed_content_box
@@ -77,8 +76,25 @@ fn resolve_table_input(
         } else {
             TableDimensionBasis::UsedBorderBox
         };
+    // Reading columns are a hard inline limit. Apply it before captions and
+    // cells are laid out, including intrinsic and authored minimum widths.
+    let content_width = if engine.config.book_optimized_text() {
+        let grid_border = if inline_basis == TableDimensionBasis::AuthoredContentBox {
+            prepared.outer_borders.horizontal()
+        } else {
+            0.0
+        };
+        let available = sizing.auto_width_limit.unwrap_or(sizing.available_width)
+            - sizing.horizontal_margin_padding
+            - sizing.horizontal_border
+            - grid_border;
+        content_width.min(available.max(0.0))
+    } else {
+        content_width
+    };
     TableLayoutInput {
         table_box_idx: sizing.box_idx,
+        grid_insets: sizing.grid_insets,
         rows,
         content_pos,
         content_width,
@@ -101,63 +117,68 @@ fn resolved_table_height(sizing: ResolvedTableBoxSizing) -> Option<f64> {
 }
 
 fn layout_empty_table(
-    session: &mut LayoutEngine<'_, '_>,
-    input: &TableLayoutInput,
-    structure: &TableStructure,
+    engine: &mut LayoutEngine<'_, '_>,
+    input: &TableLayoutInput<'_>,
+    structure: &TableStructure<'_>,
     prepared: &PreparedTableGrid,
 ) -> Size {
+    let caption_width = input.content_width + input.grid_insets.horizontal();
+    let caption_origin = input.content_pos
+        - Vec2::new(input.grid_insets.left, input.grid_insets.top);
     let caption_top_height = layout_caption_stack(
-        session,
-        &structure.captions_top,
-        input.content_pos,
-        input.content_width,
+        engine,
+        structure.captions_top,
+        caption_origin,
+        caption_width,
         input.parent_content_height,
     );
     let measured_bottom_height = measure_caption_stack(
-        session,
-        &structure.captions_bottom,
-        input.content_width,
+        engine,
+        structure.captions_bottom,
+        caption_width,
         input.parent_content_height,
-        CaptionMeasurement::BorderBoxes,
     );
     let table_content_pos = input.content_pos + Vec2::new(0.0, caption_top_height);
     let caption_height = caption_top_height + measured_bottom_height;
     let grid_height = if input.rows.is_empty() {
         layout_empty_grid(
-            session,
+            engine,
             input,
-            &structure.row_groups,
+            structure.row_groups,
             table_content_pos,
             caption_height,
         )
     } else {
         layout_zero_column_grid(
-            session,
+            engine,
             input,
-            &structure.row_groups,
+            structure.row_groups,
             table_content_pos,
             caption_height,
             prepared,
         )
     };
     let caption_bottom_height = layout_caption_stack(
-        session,
-        &structure.captions_bottom,
-        table_content_pos + Vec2::new(0.0, grid_height),
-        input.content_width,
+        engine,
+        structure.captions_bottom,
+        Point::new(
+            caption_origin.x,
+            table_content_pos.y + grid_height + input.grid_insets.bottom,
+        ),
+        caption_width,
         input.parent_content_height,
     );
     let size = Size::new(
         input.content_width,
         caption_top_height + grid_height + caption_bottom_height,
     );
-    session.geometry.set_size(input.table_box_idx, size);
+    engine.geometry.set_size(input.table_box_idx, size);
     size
 }
 
 fn layout_empty_grid(
-    session: &mut LayoutEngine<'_, '_>,
-    input: &TableLayoutInput,
+    engine: &mut LayoutEngine<'_, '_>,
+    input: &TableLayoutInput<'_>,
     row_groups: &[u32],
     table_content_pos: Point,
     caption_height: f64,
@@ -166,7 +187,7 @@ fn layout_empty_grid(
         .iter()
         .map(|&group_idx| {
             resolve_vertical_size(
-                session.reader.style(group_idx as usize).height(),
+                engine.reader.style(group_idx as usize).height(),
                 input.explicit_content_height,
                 0.0,
             )
@@ -187,17 +208,18 @@ fn layout_empty_grid(
     }
     let mut group_y = 0.0;
     for (&group_idx, height) in row_groups.iter().zip(group_heights) {
-        session.geometry.set_point(
+        engine.placement.bind_box(group_idx as usize);
+        engine.geometry.set_point(
             group_idx as usize,
             table_content_pos + Vec2::new(0.0, group_y),
         );
-        session
+        engine
             .geometry
             .set_size(group_idx as usize, Size::new(input.content_width, height));
         group_y += height;
     }
     emit_collapsed_table_background(
-        session,
+        engine,
         input.table_box_idx,
         Rect::from_origin_size(
             table_content_pos,
@@ -208,21 +230,21 @@ fn layout_empty_grid(
 }
 
 fn layout_zero_column_grid(
-    session: &mut LayoutEngine<'_, '_>,
-    input: &TableLayoutInput,
+    engine: &mut LayoutEngine<'_, '_>,
+    input: &TableLayoutInput<'_>,
     row_groups: &[u32],
     table_content_pos: Point,
     caption_height: f64,
     prepared: &PreparedTableGrid,
 ) -> f64 {
     let spacing = prepared.vertical_spacing;
-    let rows = &input.rows;
+    let rows = input.rows;
     let collapsed_borders = matches!(
-        session.reader.style(input.table_box_idx).border_collapse(),
+        engine.reader.style(input.table_box_idx).border_collapse(),
         BorderCollapseMode::Collapse
     );
     let row_heights = resolve_row_heights(
-        session,
+        engine,
         prepared,
         rows,
         row_groups,
@@ -251,32 +273,34 @@ fn layout_zero_column_grid(
     for (row, &row_box_idx) in rows.iter().enumerate() {
         let row_box_idx = row_box_idx as usize;
         let point = Point::new(table_content_pos.x, table_content_pos.y + row_starts[row]);
-        session.geometry.set_point(row_box_idx, point);
-        session.geometry.set_size(
+        engine.placement.bind_box(row_box_idx);
+        engine.geometry.set_point(row_box_idx, point);
+        engine.geometry.set_size(
             row_box_idx,
             Size::new(input.content_width, row_heights[row]),
         );
-        defer_row_out_of_flow(session, row_box_idx, point);
+        defer_row_out_of_flow(engine, row_box_idx, point);
         if !collapsed_borders {
-            crate::layout::record_block_border_and_outline(session, row_box_idx);
+            crate::layout::record_block_border_and_outline(engine, row_box_idx);
         }
     }
 
     for &group_idx in row_groups {
-        let Some(range) = row_group_range(&session.reader, rows, group_idx as usize) else {
+        let Some(range) = row_group_range(&engine.reader, rows, group_idx as usize) else {
             continue;
         };
         let y = row_starts[range.start];
         let height = span_extent(&row_starts, &row_heights, range.start, range.len());
-        session.geometry.set_point(
+        engine.placement.bind_box(group_idx as usize);
+        engine.geometry.set_point(
             group_idx as usize,
             Point::new(table_content_pos.x, table_content_pos.y + y),
         );
-        session
+        engine
             .geometry
             .set_size(group_idx as usize, Size::new(input.content_width, height));
         if !collapsed_borders {
-            crate::layout::record_block_border_and_outline(session, group_idx as usize);
+            crate::layout::record_block_border_and_outline(engine, group_idx as usize);
         }
     }
 
@@ -284,12 +308,11 @@ fn layout_zero_column_grid(
 }
 
 pub fn layout_table(
-    session: &mut LayoutEngine<'_, '_>,
+    engine: &mut LayoutEngine<'_, '_>,
     resolved: &ResolvedBoxSizing,
-    table: TableBox,
+    table: &TableBox,
     content_pos: Point,
 ) -> Size {
-    let timing_started = session.start_timing();
     let TableBox {
         rows,
         row_groups,
@@ -302,38 +325,24 @@ pub fn layout_table(
         captions_top,
         captions_bottom,
     };
-    let prepared = prepare_table_grid(session, resolved.table_box_sizing().box_idx, &rows);
-    let measures = measure_table_columns(session, &prepared);
-    let input = resolve_table_input(session, resolved, rows, content_pos, &prepared, &measures);
+    let prepared = prepare_table_grid(engine, resolved.table_box_sizing().box_idx, rows);
+    let measures = measure_table_columns(engine, &prepared);
+    let input = resolve_table_input(engine, resolved, rows, content_pos, &prepared, &measures);
     if input.rows.is_empty() || prepared.grid.column_count == 0 {
-        return layout_empty_table(session, &input, &structure, &prepared);
+        return layout_empty_table(engine, &input, &structure, &prepared);
     }
-    let plan = resolve_table_plan(session, input, structure, prepared, measures);
-    let size = publish_table_plan(session, plan);
-    session.record_timing(|t| t.layout_table += timing_started.elapsed());
-    size
+    let plan = resolve_table_plan(engine, input, structure, prepared, measures);
+    publish_table_plan(engine, plan)
 }
 
-fn resolve_table_plan(
-    session: &mut LayoutEngine<'_, '_>,
-    input: TableLayoutInput,
-    structure: TableStructure,
-    prepared: PreparedTableGrid,
+fn resolve_table_plan<'tree>(
+    engine: &mut LayoutEngine<'_, '_>,
+    input: TableLayoutInput<'tree>,
+    structure: TableStructure<'tree>,
+    mut prepared: PreparedTableGrid,
     measures: Vec<WidthMeasure>,
-) -> ResolvedTablePlan {
-    let caption_top_height = measure_caption_stack(
-        session,
-        &structure.captions_top,
-        input.content_width,
-        input.parent_content_height,
-        CaptionMeasurement::MarginStack,
-    );
-    let table_content_pos = Point::new(
-        input.content_pos.x,
-        input.content_pos.y + caption_top_height,
-    );
+) -> ResolvedTablePlan<'tree> {
     let grid = &prepared.grid;
-    let h_spacing = prepared.horizontal_spacing;
     let v_spacing = prepared.vertical_spacing;
     let outer_borders = prepared.outer_borders;
     // The width entering table layout is the complete used table width for
@@ -352,9 +361,27 @@ fn resolve_table_plan(
         } else {
             target_outer_width
         };
+    let fit_to_width = engine.config.book_optimized_text();
+    let used_grid_outer_width = if fit_to_width {
+        used_grid_outer_width.min(target_outer_width)
+    } else {
+        used_grid_outer_width
+    };
     let grid_width = (used_grid_outer_width - outer_borders.horizontal()).max(0.0);
-    let mut columns = resolve_table_columns(measures, grid_width, h_spacing, prepared.fixed_mode);
-    columns.rtl = session.reader.style(input.table_box_idx).direction() == TextDirection::Rtl;
+    if fit_to_width {
+        prepared.horizontal_spacing = prepared
+            .horizontal_spacing
+            .min(grid_width / (grid.column_count as f64 + 1.0));
+    }
+    let h_spacing = prepared.horizontal_spacing;
+    let mut columns = resolve_table_columns(
+        measures,
+        grid_width,
+        h_spacing,
+        prepared.fixed_mode,
+        fit_to_width,
+    );
+    columns.rtl = engine.reader.style(input.table_box_idx).direction() == TextDirection::Rtl;
     for start in &mut columns.starts {
         *start += if columns.rtl {
             outer_borders.right
@@ -363,14 +390,31 @@ fn resolve_table_plan(
         };
     }
     columns.table_width += outer_borders.horizontal();
+    // Captions belong to the wrapper outside the table's padding and borders.
+    // Resolve the grid width first, then emit each top caption once at its
+    // final width so wrapping and page gaps determine the grid's start.
+    let caption_width = columns.table_width.max(input.content_width)
+        + input.grid_insets.horizontal();
+    let caption_origin = input.content_pos
+        - Vec2::new(input.grid_insets.left, input.grid_insets.top);
+    let caption_top_height = layout_caption_stack(
+        engine,
+        structure.captions_top,
+        caption_origin,
+        caption_width,
+        input.parent_content_height,
+    );
+    let table_content_pos = Point::new(
+        input.content_pos.x,
+        input.content_pos.y + caption_top_height,
+    );
     // Measure bottom captions in isolation so they do not emit paint before
     // their final position is known.
     let caption_bottom_height = measure_caption_stack(
-        session,
-        &structure.captions_bottom,
-        input.content_width,
+        engine,
+        structure.captions_bottom,
+        caption_width,
         input.parent_content_height,
-        CaptionMeasurement::BorderBoxes,
     );
     let explicit_grid_height = input.explicit_content_height.map(|height| {
         height
@@ -389,7 +433,7 @@ fn resolve_table_plan(
             .max(0.0)
     });
     let cells = prepare_cells(
-        session,
+        engine,
         &prepared,
         input.rows.len(),
         &columns,
@@ -398,10 +442,10 @@ fn resolve_table_plan(
         definite_row_area_height,
     );
     let row_heights = resolve_row_heights(
-        session,
+        engine,
         &prepared,
-        &input.rows,
-        &structure.row_groups,
+        input.rows,
+        structure.row_groups,
         &cells.cells,
         explicit_grid_height,
         caption_top_height + caption_bottom_height,
@@ -409,9 +453,11 @@ fn resolve_table_plan(
 
     let mut row_starts = vec![0.0f64; input.rows.len()];
     let mut cursor_y = v_spacing + outer_borders.top;
-    for i in 0..input.rows.len() {
-        row_starts[i] = cursor_y;
-        cursor_y += row_heights[i] + v_spacing;
+    // Row geometry is continuous. Page breaks and repeated headers belong to
+    // page composition and must never change the table's source coordinates.
+    for (start, &height) in row_starts.iter_mut().zip(&row_heights) {
+        *start = cursor_y;
+        cursor_y += height + v_spacing;
     }
     let table_height = cursor_y + outer_borders.bottom;
 

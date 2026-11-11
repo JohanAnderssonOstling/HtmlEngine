@@ -1,18 +1,63 @@
-use html_dom::storage;
 use crate::layout_model::{
-    BlockBox, Children, FlexBox, GridBox, LayoutMode, TableBox, TableCellBox, TableRowBox,
+    BlockBox, Children, FlexBox, GridBox, LayoutMode, TableCellBox, TableRowBox,
 };
 use html_dom::{DomNodeId, ElementRef};
 use html_style_model::{Clear, ComputedStyles, Display, Float, PositionMode, StyleIndices};
 use std::ops::Range;
 
+#[derive(Clone, Copy)]
+pub(super) struct ElementClassification {
+    pub(super) style: Option<StyleIndices>,
+    pub(super) display: Display,
+    pub(super) floated: bool,
+    pub(super) absolute: bool,
+    pub(super) clearing_break: bool,
+}
+
+impl ElementClassification {
+    pub(super) fn new(styles: &ComputedStyles, element: ElementRef<'_>) -> Self {
+        let style = styles.style_for_node(element.node_id());
+        let box_style = style.and_then(|style| styles.box_model_style(style));
+        let display = box_style.map_or(Display::Block, |style| style.display);
+        let display = resolved_display(element, display);
+        Self {
+            style,
+            display,
+            floated: box_style
+                .is_some_and(|style| matches!(style.float, Float::Left | Float::Right)),
+            absolute: style
+                .and_then(|style| styles.layout_style(style))
+                .is_some_and(|style| style.position == PositionMode::Absolute),
+            clearing_break: element.tag().eq_ignore_ascii_case("br")
+                && box_style.is_some_and(|style| style.clear != Clear::None),
+        }
+    }
+
+    pub(super) fn starts_block(self) -> bool {
+        self.display != Display::Contents
+            && (starts_new_block_child(self.display) || self.absolute || self.clearing_break)
+    }
+
+    pub(super) fn splits_inline(self) -> bool {
+        starts_new_block_child(self.display)
+            && !self.display.is_table_internal()
+            && !self.absolute
+            && !self.floated
+    }
+}
+
 pub(super) fn display_for_element(styles: &ComputedStyles, element: ElementRef<'_>) -> Display {
     let display = styles
         .style_for_node(element.node_id())
-        .map_or(Display::Block, |style| display_for_style(styles, style));
+        .and_then(|style| styles.box_model_style(style))
+        .map_or(Display::Block, |style| style.display);
+    resolved_display(element, display)
+}
+
+fn resolved_display(element: ElementRef<'_>, display: Display) -> Display {
     if display == Display::Contents && contents_computes_to_none(element) {
         Display::None
-    } else if storage::image_idx(element).is_some() && display.is_table_internal() {
+    } else if element.image_idx().is_some() && display.is_table_internal() {
         Display::Inline
     } else {
         display
@@ -20,10 +65,10 @@ pub(super) fn display_for_element(styles: &ComputedStyles, element: ElementRef<'
 }
 
 fn contents_computes_to_none(element: ElementRef<'_>) -> bool {
-    if storage::image_idx(element).is_some() {
+    if element.image_idx().is_some() {
         return true;
     }
-    storage::is_html_element_in_html_document(element)
+    element.is_html_element_in_html_document()
         && [
             "br", "wbr", "meter", "progress", "embed", "object", "audio", "img", "input",
             "textarea", "select",
@@ -55,7 +100,7 @@ pub(super) fn layout_mode_for_display(display: Display) -> Option<LayoutMode> {
         Display::Inline => LayoutMode::Inline(Range::default()),
         Display::Flex | Display::InlineFlex => LayoutMode::Flex(FlexBox::default()),
         Display::Grid | Display::InlineGrid => LayoutMode::Grid(GridBox::default()),
-        Display::Table | Display::InlineTable => LayoutMode::Table(TableBox::default()),
+        Display::Table | Display::InlineTable => LayoutMode::Table(Default::default()),
         Display::TableRow => LayoutMode::TableRow(TableRowBox::default()),
         Display::TableCell => LayoutMode::TableCell(TableCellBox::new(Children::Empty)),
         Display::Contents | Display::None => return None,
@@ -84,56 +129,6 @@ pub(super) fn starts_new_block_child(display: Display) -> bool {
             | Display::FlowRootListItem
             | Display::Table
     ) || display.is_table_internal()
-}
-
-/// Out-of-flow boxes are blockified for layout even when their authored
-/// display is `inline`. Parent formatting-context construction must make the
-/// same decision as the box itself, otherwise an absolutely positioned span
-/// is incorrectly flattened into the surrounding inline-item stream.
-pub(super) fn starts_new_block_child_for_element(
-    styles: &ComputedStyles,
-    element: ElementRef<'_>,
-) -> bool {
-    let display = display_for_element(styles, element);
-    if display == Display::Contents {
-        return false;
-    }
-    starts_new_block_child(display)
-        || is_absolutely_positioned(styles, element)
-        || is_clearing_break(styles, element)
-}
-
-pub(super) fn is_clearing_break(styles: &ComputedStyles, element: ElementRef<'_>) -> bool {
-    element.tag().eq_ignore_ascii_case("br")
-        && styles
-            .style_for_node(element.node_id())
-            .and_then(|style| styles.box_model_style(style))
-            .is_some_and(|style| style.clear != Clear::None)
-}
-
-/// Table-internal boxes remain inline candidates until anonymous-table fixup
-/// groups them. Ordinary block descendants and absolutely positioned boxes
-/// instead split an inline formatting context.
-pub(super) fn starts_inline_split_child(styles: &ComputedStyles, element: ElementRef<'_>) -> bool {
-    let display = display_for_element(styles, element);
-    starts_new_block_child(display)
-        && !display.is_table_internal()
-        && !is_absolutely_positioned(styles, element)
-        && !is_floated(styles, element)
-}
-
-pub(super) fn is_absolutely_positioned(styles: &ComputedStyles, element: ElementRef<'_>) -> bool {
-    styles
-        .style_for_node(element.node_id())
-        .and_then(|style| styles.layout_style(style))
-        .is_some_and(|style| style.position == PositionMode::Absolute)
-}
-
-pub(super) fn is_floated(styles: &ComputedStyles, element: ElementRef<'_>) -> bool {
-    styles
-        .style_for_node(element.node_id())
-        .and_then(|style| styles.box_model_style(style))
-        .is_some_and(|style| matches!(style.float, Float::Left | Float::Right))
 }
 
 pub(super) fn is_block_level_pseudo_display(display: Display) -> bool {
@@ -168,9 +163,12 @@ pub(super) fn pseudo_is_block_level(
     origin: DomNodeId,
     before: bool,
 ) -> bool {
-    styles.generated_pseudo_for_node(origin, before)
+    styles
+        .generated_pseudo_for_node(origin, before)
         .and_then(|(indices, _, _)| styles.view(indices))
-        .is_some_and(|style| style.layout.position != PositionMode::Absolute
-            && style.float() == Float::None
-            && is_block_level_pseudo_display(style.display()))
+        .is_some_and(|style| {
+            style.layout.position != PositionMode::Absolute
+                && style.float() == Float::None
+                && is_block_level_pseudo_display(style.display())
+        })
 }

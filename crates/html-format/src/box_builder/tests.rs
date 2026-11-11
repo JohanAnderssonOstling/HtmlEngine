@@ -379,7 +379,12 @@ mod tests {
 
         let rows = match document.box_at(table_idx) {
             Some(box_) => match box_.layout_mode() {
-                LayoutMode::Table(table) => table.rows.clone(),
+                LayoutMode::Table(table) => document
+                    .layout_tree()
+                    .table(*table)
+                    .expect("table payload")
+                    .rows
+                    .clone(),
                 _ => panic!("table should use LayoutMode::Table"),
             },
             None => panic!("table box should exist"),
@@ -434,7 +439,13 @@ mod tests {
             .find(|&i| document.get_tag(i).eq_ignore_ascii_case("table"))
             .expect("table box should exist");
         let rows = match document.box_at(table_idx).map(|box_| box_.layout_mode()) {
-            Some(LayoutMode::Table(table)) => &table.rows,
+            Some(LayoutMode::Table(table)) => {
+                &document
+                    .layout_tree()
+                    .table(*table)
+                    .expect("table payload")
+                    .rows
+            }
             _ => panic!("table should use table layout"),
         };
 
@@ -458,7 +469,13 @@ mod tests {
             .find(|&i| document.get_id(i) == Some("cell"))
             .expect("cell box should exist");
         let rows = match document.box_at(table_idx).map(|box_| box_.layout_mode()) {
-            Some(LayoutMode::Table(table)) => &table.rows,
+            Some(LayoutMode::Table(table)) => {
+                &document
+                    .layout_tree()
+                    .table(*table)
+                    .expect("table payload")
+                    .rows
+            }
             _ => panic!("table should use table layout"),
         };
 
@@ -484,7 +501,9 @@ mod tests {
             .find(|&i| document.get_id(i) == Some("table"))
             .expect("table box");
         let table = match document.box_at(table_idx).map(|box_| box_.layout_mode()) {
-            Some(LayoutMode::Table(table)) => table,
+            Some(LayoutMode::Table(table)) => {
+                document.layout_tree().table(*table).expect("table payload")
+            }
             _ => panic!("table layout mode"),
         };
         assert_eq!(table.rows.len(), 1);
@@ -513,7 +532,9 @@ mod tests {
             .find(|&i| document.get_id(i) == Some("table"))
             .expect("table box");
         let table = match document.box_at(table_idx).map(|box_| box_.layout_mode()) {
-            Some(LayoutMode::Table(table)) => table,
+            Some(LayoutMode::Table(table)) => {
+                document.layout_tree().table(*table).expect("table payload")
+            }
             _ => panic!("table layout mode"),
         };
         let row = match document
@@ -670,7 +691,12 @@ mod tests {
 
         let rows = match document.box_at(table_idx) {
             Some(box_) => match box_.layout_mode() {
-                LayoutMode::Table(table) => table.rows.clone(),
+                LayoutMode::Table(table) => document
+                    .layout_tree()
+                    .table(*table)
+                    .expect("table payload")
+                    .rows
+                    .clone(),
                 _ => panic!("inline-table should use LayoutMode::Table"),
             },
             None => panic!("table box should exist"),
@@ -686,7 +712,13 @@ mod tests {
             .find(|&idx| document.get_id(idx) == Some("table"))
             .expect("table box");
         let row_idx = match document.box_at(table_idx).map(|box_| box_.layout_mode()) {
-            Some(LayoutMode::Table(table)) => table.rows[0] as usize,
+            Some(LayoutMode::Table(table)) => {
+                document
+                    .layout_tree()
+                    .table(*table)
+                    .expect("table payload")
+                    .rows[0] as usize
+            }
             _ => panic!("display:table box must use table layout"),
         };
         let cell_idx = match document.box_at(row_idx).map(|box_| box_.layout_mode()) {
@@ -765,7 +797,10 @@ mod tests {
             .box_at(children[1] as usize)
             .map(|b| b.layout_mode())
         {
-            Some(LayoutMode::Table(table)) => *table
+            Some(LayoutMode::Table(table)) => *document
+                .layout_tree()
+                .table(*table)
+                .expect("table payload")
                 .rows
                 .first()
                 .expect("anonymous table should retain the row"),
@@ -804,7 +839,10 @@ mod tests {
             .box_at(children[1] as usize)
             .map(|b| b.layout_mode())
         {
-            Some(LayoutMode::Table(table)) => *table
+            Some(LayoutMode::Table(table)) => *document
+                .layout_tree()
+                .table(*table)
+                .expect("table payload")
                 .rows
                 .first()
                 .expect("anonymous table should contain a row"),
@@ -858,7 +896,14 @@ mod tests {
             .box_at(anonymous_table as usize)
             .map(|box_| box_.layout_mode())
         {
-            Some(LayoutMode::Table(table)) => assert_eq!(table.rows, vec![nested as u32]),
+            Some(LayoutMode::Table(table)) => assert_eq!(
+                document
+                    .layout_tree()
+                    .table(*table)
+                    .expect("table payload")
+                    .rows,
+                vec![nested as u32]
+            ),
             _ => panic!("nested row must be wrapped in an anonymous table"),
         }
     }
@@ -889,7 +934,9 @@ mod tests {
             .box_at(children[0] as usize)
             .map(|box_| box_.layout_mode())
         {
-            Some(LayoutMode::Table(table)) => table,
+            Some(LayoutMode::Table(table)) => {
+                document.layout_tree().table(*table).expect("table payload")
+            }
             _ => panic!("row groups should be wrapped by an anonymous table"),
         };
         assert_eq!(table.row_groups.len(), 3);
@@ -957,7 +1004,13 @@ mod tests {
             .box_at(table as usize)
             .map(|box_| box_.layout_mode())
         {
-            Some(LayoutMode::Table(table)) => table.rows[0],
+            Some(LayoutMode::Table(table)) => {
+                document
+                    .layout_tree()
+                    .table(*table)
+                    .expect("table payload")
+                    .rows[0]
+            }
             _ => panic!("atomic wrapper should use table layout"),
         };
         let cells = match document.box_at(row as usize).map(|box_| box_.layout_mode()) {
@@ -1437,6 +1490,7 @@ mod tests {
             else {
                 panic!("{display} should be wrapped by or itself establish a table");
             };
+            let table = document.layout_tree().table(*table).expect("table payload");
             let box_display = |index: usize| {
                 document
                     .box_at(index)
@@ -1654,11 +1708,13 @@ mod tests {
         assert!(!(0..document.box_count()).any(|index| {
             document.get_tag(index).eq_ignore_ascii_case("div")
                 && document.box_at(index).is_some_and(|box_| {
-                    box_.dom_element()
-                        .and_then(|raw| document.document().node_id_from_raw(raw))
-                        .is_some_and(|node| {
-                            document.document().get_dom_id(node) == Some("transparent")
-                        })
+                    box_.dom_element().is_some_and(|node| {
+                        document
+                            .document()
+                            .try_element_ref(node)
+                            .and_then(|element| element.id())
+                            == Some("transparent")
+                    })
                 })
         }));
     }

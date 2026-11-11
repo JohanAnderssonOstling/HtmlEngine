@@ -7,7 +7,7 @@ use kurbo::Point;
 use taffy::prelude::Layout;
 
 pub(super) fn place(
-    session: &mut LayoutEngine<'_, '_>,
+    engine: &mut LayoutEngine<'_, '_>,
     input: &FlexGridInput<'_>,
     policy: &FlexGridPolicy,
     items: Vec<(Layout, u32)>,
@@ -23,13 +23,13 @@ pub(super) fn place(
             input.content_origin.x + layout.location.x as f64,
             input.content_origin.y + layout.location.y as f64,
         );
-        session.geometry.set_point(child as usize, position);
+        engine.geometry.set_point(child as usize, position);
         let assigned = nonnegative_size(layout.size);
-        let child_layout = layout_style(session, child as usize);
-        let effective_cross_alignment = effective_align_self(session, child as usize);
+        let child_layout = layout_style(engine, child as usize);
+        let effective_cross_alignment = effective_align_self(engine, child as usize);
         let has_cross_axis_auto_margin =
             child_layout.margin_top_auto || child_layout.margin_bottom_auto;
-        let authored_height_is_definite = match session.reader.style(child as usize).height() {
+        let authored_height_is_definite = match engine.reader.style(child as usize).height() {
             PreferredSize::Px(_) => true,
             PreferredSize::Percent(_) | PreferredSize::Stretch => child_containing_height.is_some(),
             PreferredSize::Calc { .. } => child_containing_height.is_some(),
@@ -52,7 +52,7 @@ pub(super) fn place(
         } else {
             authored_height_is_definite || child_containing_height.is_some()
         };
-        let result = session.layout_box(BoxLayoutRequest::assigned(
+        let result = engine.layout_box(BoxLayoutRequest::assigned(
             child as usize,
             input.content_width,
             child_containing_height,

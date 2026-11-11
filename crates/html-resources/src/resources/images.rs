@@ -609,6 +609,7 @@ fn execute_image_job(
     }
     let state = &mut *locked;
     state.pending.remove(&key);
+    // Interrupted reads represent cancellation and remain retryable.
     if let Ok(decoded) = decoded {
         let byte_len = match &decoded {
             DecodedImage::Raster { byte_len, .. } => *byte_len,
@@ -630,7 +631,9 @@ fn execute_image_job(
         // the visible working set itself exceeds the cache budget, inactive
         // pipelines retrim it as soon as they release their pins.
         trim_decoded_cache(state, Some(&key));
-    } else if let Err(error) = decoded {
+    } else if let Err(error) = decoded
+        && !matches!(&error, ImageLoadError::Read(error) if error.kind() == io::ErrorKind::Interrupted)
+    {
         if state.failed.len() >= ImageService::MAX_FAILURES {
             let oldest = state
                 .failed

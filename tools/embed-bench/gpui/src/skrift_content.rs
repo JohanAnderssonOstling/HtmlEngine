@@ -1,18 +1,12 @@
-use html_pipeline::engine::box_queries;
 use html_dom as dom_values;
 use html_engine_model::layout_state;
-use html_pipeline::engine::geometry_queries;
 use html_render_core as render_core;
 use html_resources::resources::images as image_resources;
-use html_pipeline::engine::fragment_paint;
-use html_pipeline::engine::text_paint;
 use crate::common::Options;
 use anyhow::{Context as _, Result};
 use data_url::DataUrl;
 use gpui::{ContentMask, IntoElement, Window, canvas, div, prelude::*, px, rgb};
-use html::document::ImageId;
 use html_pipeline::MarkupSyntax;
-use html::layout::BoxId;
 use html::render::DocumentPainter;
 use html_pipeline::engine::LayoutConstraints;
 use html_pipeline::{
@@ -124,7 +118,7 @@ impl DocumentView {
         self.engine.attach(&mut self.shaper).update(inputs)?;
 
         let resources =
-            text_paint::render_view_images(&self.engine.render_view().context("missing document")?);
+            (self.engine.render_view().context("missing document")?).images();
         let desired = (0..resources.len() as u32)
             .map(dom_values::image_id_new)
             .collect::<HashSet<_>>();
@@ -139,9 +133,9 @@ impl DocumentView {
             .clone();
         for &index in &desired {
             let image = image_resources::decoded_images_get(decoded.decoded_images(), index)
-                .with_context(|| format!("image {} did not decode", index.raw()))?;
-            let (width, height) = image.dimensions();
-            image_metrics.set(index.raw(), width, height);
+                .with_context(|| format!("image {} did not decode", dom_values::image_id_raw(index)))?;
+            let (width, height) = image_resources::decoded_image_dimensions(image);
+            image_metrics.set(dom_values::image_id_raw(index), width, height);
         }
         if !desired.is_empty() {
             self.engine
@@ -163,14 +157,11 @@ impl DocumentView {
             .lines()
             .iter()
             .filter_map(|line| {
-                geometry_queries::render_geometry_view_line_vertical_bounds(
-                    geometry_queries::render_view_geometry(document),
-                    line.id(),
-                )
+                (document.geometry()).line_vertical_bounds(line.id())
             })
             .map(|bounds| bounds.end)
             .chain(
-                fragment_paint::decorations(document.fragments())
+                (document.fragments()).decorations()
                     .iter()
                     .map(|decoration| decoration.rect().y1),
             )
@@ -180,7 +171,7 @@ impl DocumentView {
         } else {
             f64::from(options.height)
         };
-        let mut painter = GpuiCommandPainter::new(&mut self.images, self.shaper.resources());
+        let mut painter = GpuiCommandPainter::new(&mut self.images);
         render_core::document_painter_paint_region(
             &DocumentPainter::new(document).with_images(decoded.decoded_images()),
             Rect::new(0.0, 0.0, f64::from(options.width), height),
@@ -223,36 +214,36 @@ impl DocumentView {
     pub(super) fn inspect(&self, full_layout: bool) -> serde_json::Value {
         let view = self.engine.render_view().expect("loaded document");
         let boxes = view.boxes();
-        let entries: Vec<_> = (0..if full_layout { box_queries::len(boxes) } else { box_queries::len(boxes).min(45) })
+        let entries: Vec<_> = (0..if full_layout { boxes.len() } else { boxes.len().min(45) })
             .map(|raw_index| {
                 let index = layout_state::box_id_new(raw_index);
-                let format = box_queries::text_format(boxes, index);
-                let point = box_queries::render_box_view_point(boxes, index);
-                let size = box_queries::render_box_view_size(boxes, index);
-                let lines = box_queries::content_line_range(boxes, index);
-                serde_json::json!({"index":raw_index,"tag":box_queries::tag(boxes, index),
-                "class":box_queries::attribute(boxes, index,"class"),"parent":box_queries::parent(boxes, index).map(layout_state::box_id_index),
+                let format = boxes.text_format(index);
+                let point = boxes.point(index);
+                let size = boxes.size(index);
+                let lines = boxes.content_line_range(index);
+                serde_json::json!({"index":raw_index,"tag":boxes.tag(index),
+                "class":boxes.attribute(index, "class"),"parent":boxes.parent(index).map(layout_state::box_id_index),
                 "x":point.map(|p|p.x),"y":point.map(|p|p.y),
                 "width":size.map(|s|s.width),"height":size.map(|s|s.height),
-                "lines":[lines.start.index(), lines.end.index()],
-                "table":box_queries::is_table(boxes, index),"font_size":format.font_size,
+                "lines":[layout_state::line_id_index(lines.start), layout_state::line_id_index(lines.end)],
+                "table":boxes.is_table(index),"font_size":format.font_size,
                 "font_weight":format.font_weight,"font_style":format!("{:?}",format.font_style),
                 "font_family":format.font_family})
             })
             .collect();
         let text = view.text();
         let lines = full_layout.then(|| text.lines().iter().map(|line| {
-            let value = text_paint::render_line_glyphs(&line).filter_map(|index| text_paint::render_text_view_character_at(text, index as usize)).collect::<String>();
-            let advances = text_paint::render_line_glyphs(&line).map(|index| text_paint::character_advance(text, index)
-                .or_else(|| text_paint::glyph_at(text, index as usize).and_then(|glyph| text_paint::glyph_metric(text, glyph)).map(|metric| metric.advance())))
+            let value = line.glyphs().filter_map(|index| text.character_at(index as usize)).collect::<String>();
+            let advances = line.glyphs().map(|index| text.character_advance(index)
+                .or_else(|| text.glyph_at(index as usize).and_then(|glyph| text.glyph_metric(glyph)).map(|metric| metric.advance())))
                 .collect::<Vec<_>>();
-            let font_extents = text_paint::render_line_glyphs(&line).map(|index| text_paint::glyph_at(text, index as usize)
-                .and_then(|glyph| text_paint::glyph_metric(text, glyph))
+            let font_extents = line.glyphs().map(|index| text.glyph_at(index as usize)
+                .and_then(|glyph| text.glyph_metric(glyph))
                 .map(|metric| [metric.ascent(), metric.descent()]))
                 .collect::<Vec<_>>();
-            serde_json::json!({"index":line.id().index(),"owner":line.owner_box().index(),
-                "x":line.point().x,"y":line.point().y,"height":line.height(),"baseline":text_paint::line_baseline(&line),
-                "text":value,"advances":advances,"font_extents":font_extents,"hyphen":text_paint::hyphen_for_line(text, line.id()).is_some()})
+            serde_json::json!({"index":layout_state::line_id_index(line.id()),"owner":layout_state::box_id_index(line.owner_box()),
+                "x":line.point().x,"y":line.point().y,"height":line.height(),"baseline":line.line_baseline(),
+                "text":value,"advances":advances,"font_extents":font_extents,"hyphen":text.hyphen_for_line(line.id()).is_some()})
         }).collect::<Vec<_>>());
         serde_json::json!({"boxes":entries,"line_count":text.lines().len(),"lines":lines})
     }

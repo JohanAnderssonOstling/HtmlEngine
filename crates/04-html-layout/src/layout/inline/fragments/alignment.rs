@@ -4,6 +4,27 @@ use super::*;
 use crate::layout::LayoutEngine;
 use std::ptr;
 
+/// Vertical extents depend on a text run's metrics, not its glyph payload.
+/// Visit one glyph/ellipsis representative per metrics run; retain every
+/// other token because controls and replaced content have different leading
+/// and alignment rules. This iterator is only for extent reductions, never
+/// source-position execution or horizontal placement.
+fn line_metric_representatives<'m>(
+    span: TokenSpan<'_>,
+    metrics: MetricsView<'m>,
+) -> impl Iterator<Item = (TokenMetadata, &'m InlineTokenMetrics)> {
+    let mut previous_text_metrics = None;
+    metrics.iter(span).filter(move |(token, metrics)| {
+        if matches!(token.kind(), InlineTokenKind::Glyph { .. } | InlineTokenKind::Ellipsis { .. }) {
+            if previous_text_metrics.is_some_and(|previous| ptr::eq(previous, *metrics)) {
+                return false;
+            }
+            previous_text_metrics = Some(*metrics);
+        }
+        true
+    })
+}
+
 /// Applies a token's own alignment and then the movement of each enclosing
 /// inline box. The property value itself is never inherited: an aligned parent
 /// moves its complete fragment, including descendants, as a unit.
@@ -38,8 +59,8 @@ fn hierarchical_vertical_align_offset(
             }
             _ => 0.0,
         };
-        let (parent_ascent, parent_descent) = if metrics.owner_box_idx == u32::MAX {
-            (ascent, descent)
+        let (parent_ascent, parent_descent, parent_x_height) = if metrics.owner_box_idx == u32::MAX {
+            (ascent, descent, f64::from(metrics.font_size) * 0.5)
         } else {
             parent_font_content_extents(engine, metrics.owner_box_idx as usize)
         };
@@ -54,6 +75,7 @@ fn hierarchical_vertical_align_offset(
             baseline,
             parent_ascent,
             parent_descent,
+            parent_x_height,
         )
     };
     if metrics.owner_box_idx == u32::MAX {
@@ -75,7 +97,8 @@ fn hierarchical_vertical_align_offset(
             let own_line_height = style.resolved_line_height();
             let ascent = own_line_height * 0.8;
             let descent = own_line_height - ascent;
-            let (parent_ascent, parent_descent) = parent_font_content_extents(engine, box_idx);
+            let (parent_ascent, parent_descent, parent_x_height) =
+                parent_font_content_extents(engine, box_idx);
             offset += vertical_align_metrics_offset(
                 value,
                 ascent,
@@ -87,6 +110,7 @@ fn hierarchical_vertical_align_offset(
                 baseline,
                 parent_ascent,
                 parent_descent,
+                parent_x_height,
             );
         }
     }
@@ -215,7 +239,7 @@ fn line_relative_groups(
         if tokens.len() > 1 && !metrics_may_have_line_relative_alignment(engine, metrics) {
             continue;
         }
-        for token in tokens.metadata_iter() {
+        for (token, metrics) in line_metric_representatives(tokens, MetricsView::Uniform(metrics)) {
             if !token_contributes_line_metrics(&token, metrics) {
                 continue;
             }
@@ -286,7 +310,7 @@ pub(super) fn adjusted_line_metrics(
         let container_strut = strut_for_inline_box(engine, container_box_idx);
         let mut adjusted_ascent = container_strut.ascent;
         let mut adjusted_descent = container_strut.descent;
-        for (token, metrics) in metrics_view.iter(span) {
+        for (token, metrics) in line_metric_representatives(span, metrics_view) {
             if !token_contributes_line_metrics(&token, metrics)
                 || line_relative_alignment_for_token(engine, &token, metrics).is_some()
             {
@@ -356,7 +380,7 @@ pub(super) fn adjusted_line_metrics(
     } else {
         f64::NEG_INFINITY
     };
-    for (token, metrics) in metrics_view.iter(span) {
+    for (token, metrics) in line_metric_representatives(span, metrics_view) {
         if !token_contributes_line_metrics(&token, metrics) {
             continue;
         }
@@ -386,8 +410,11 @@ pub(super) fn adjusted_line_metrics(
     if !adjusted_descent.is_finite() {
         adjusted_descent = 0.0;
     }
+    // Alignment can reduce the combined extents (for example, two middle-
+    // aligned boxes with different baselines). Keep the authored strut as the
+    // minimum, not the preliminary height measured before alignment.
     let (resolved_height, resolved_baseline) =
-        compute_baseline(adjusted_ascent, adjusted_descent, line_height);
+        compute_baseline(adjusted_ascent, adjusted_descent, container_strut.line_height);
     if resolved_height.abs() < 0.001 {
         (0.0, resolved_baseline)
     } else {
@@ -414,7 +441,8 @@ fn inline_strut_vertical_align_offset(
             } else {
                 strut_for_inline_box(engine, box_idx)
             };
-            let (parent_ascent, parent_descent) = parent_font_content_extents(engine, box_idx);
+            let (parent_ascent, parent_descent, parent_x_height) =
+                parent_font_content_extents(engine, box_idx);
             offset += vertical_align_metrics_offset(
                 value,
                 metrics.ascent,
@@ -426,6 +454,7 @@ fn inline_strut_vertical_align_offset(
                 baseline,
                 parent_ascent,
                 parent_descent,
+                parent_x_height,
             );
         }
         own = false;
@@ -445,7 +474,7 @@ pub(super) fn can_stream_text_placements(
         if !matches!(metrics.vertical_align, InlineVerticalAlign::Baseline)
             || (metrics.placement_required
                 && metrics.owner_box_idx != u32::MAX
-                && has_aligned_inline_ancestor(engine, metrics.owner_box_idx as usize))
+                && has_aligned_inline_ancestor(&engine.reader, metrics.owner_box_idx as usize))
         {
             return None;
         }
@@ -487,7 +516,7 @@ pub(super) fn build_token_placements(
         if tokens.len() > 1 && !metrics_may_have_line_relative_alignment(engine, metrics) {
             continue;
         }
-        for token in tokens.metadata_iter() {
+        for (token, metrics) in line_metric_representatives(tokens, MetricsView::Uniform(metrics)) {
             let Some((box_idx, alignment)) =
                 line_relative_alignment_for_ancestor(engine, &token, metrics)
             else {

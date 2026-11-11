@@ -12,78 +12,39 @@ pub(crate) fn canonical_property_id(id: PropertyId<'_>) -> PropertyId<'_> {
         .unwrap_or(id)
 }
 
-macro_rules! renderer_property_ids {
-    ($($variant:ident => $name:literal),+ $(,)?) => {
-        #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-        pub(crate) enum RendererPropertyId {
-            $($variant),+
-        }
+macro_rules! native_property_value {
+    () => {
+        None
+    };
+    ($native:ident) => {
+        Some(PropertyId::$native)
+    };
+}
 
+macro_rules! renderer_property_ids {
+    ($($key:ident => $name:literal, $inherited:literal, $phase:ident, [$($field:ident $(.$member:ident)*),* $(,)?], $copy:ident $(($($arg:tt)*))?, [$($renderer:ident => $renderer_name:literal $(=> $native:ident)?),*];)+) => {
+        #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+        pub(crate) enum RendererPropertyId { $($($renderer,)*)+ }
         impl RendererPropertyId {
-            /// Resolve a CSS name at the raw declaration boundary. Custom
-            /// properties retain their own case-sensitive identity.
             pub(crate) fn from_name(name: &str) -> Option<Self> {
                 match_ignore_ascii_case! { name,
-                    $($name => Some(Self::$variant),)+
+                    $($($renderer_name => Some(Self::$renderer),)*)+
                     _ => None,
                 }
             }
-
             pub(crate) fn name(self) -> &'static str {
-                match self {
-                    $(Self::$variant => $name),+
-                }
+                match self { $($(Self::$renderer => $renderer_name,)*)+ }
+            }
+            pub(crate) fn key(self) -> PropertyKey {
+                match self { $($(Self::$renderer => PropertyKey::$key,)*)+ }
+            }
+            pub(crate) fn native_property(self) -> Option<PropertyId<'static>> {
+                match self { $($(Self::$renderer => native_property_value!($($native)?),)*)+ }
             }
         }
     };
 }
-
-renderer_property_ids! {
-    FontWidth => "font-width",
-    LetterSpacing => "letter-spacing",
-    WordSpacing => "word-spacing",
-    Float => "float",
-    Clear => "clear",
-    ObjectFit => "object-fit",
-    ObjectPosition => "object-position",
-    OutlineOffset => "outline-offset",
-    TableLayout => "table-layout",
-    BorderCollapse => "border-collapse",
-    CaptionSide => "caption-side",
-    EmptyCells => "empty-cells",
-    FontKerning => "font-kerning",
-    FontFeatureSettings => "font-feature-settings",
-    FontSynthesis => "font-synthesis",
-    FontSynthesisStyle => "font-synthesis-style",
-    FontSynthesisSmallCaps => "font-synthesis-small-caps",
-    FontVariantNumeric => "font-variant-numeric",
-    FontVariant => "font-variant",
-    FontVariantLigatures => "font-variant-ligatures",
-    TextBox => "text-box",
-    WhiteSpaceCollapse => "white-space-collapse",
-    TextWrapMode => "text-wrap-mode",
-    TextWrapStyle => "text-wrap-style",
-    TextWrap => "text-wrap",
-    HangingPunctuation => "hanging-punctuation",
-    TextBoxTrim => "text-box-trim",
-    TextBoxEdge => "text-box-edge",
-    Contain => "contain",
-    BreakBefore => "break-before",
-    BreakAfter => "break-after",
-    BreakInside => "break-inside",
-    PageBreakBefore => "page-break-before",
-    PageBreakAfter => "page-break-after",
-    PageBreakInside => "page-break-inside",
-    Widows => "widows",
-    Orphans => "orphans",
-    Content => "content",
-    CounterReset => "counter-reset",
-    CounterIncrement => "counter-increment",
-    Quotes => "quotes",
-    GridGap => "grid-gap",
-    GridRowGap => "grid-row-gap",
-    GridColumnGap => "grid-column-gap",
-}
+crate::style::property_catalogue::property_catalogue!(renderer_property_ids);
 
 impl RendererPropertyId {
     pub(crate) fn from_lightning(id: &PropertyId<'_>) -> Option<Self> {
@@ -103,20 +64,6 @@ impl RendererPropertyId {
             Property::Unparsed(value) => {
                 Some((Self::from_lightning(&value.property_id)?, &value.value))
             }
-            _ => None,
-        }
-    }
-
-    pub(crate) fn key(self) -> PropertyKey {
-        PropertyKey::from_name(self.name()).expect("renderer property is catalogued")
-    }
-
-    pub(crate) fn native_property(self) -> Option<PropertyId<'static>> {
-        match self {
-            Self::FontWidth => Some(PropertyId::FontStretch),
-            Self::GridGap => Some(PropertyId::Gap),
-            Self::GridRowGap => Some(PropertyId::RowGap),
-            Self::GridColumnGap => Some(PropertyId::ColumnGap),
             _ => None,
         }
     }

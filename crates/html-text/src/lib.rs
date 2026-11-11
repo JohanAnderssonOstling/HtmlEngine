@@ -5,6 +5,8 @@
 //! result; this crate does not own font resources or computed box geometry.
 #![forbid(unsafe_code)]
 
+use html_dom::DomNodeId;
+
 mod chunks;
 mod content;
 mod first_letter;
@@ -24,7 +26,8 @@ pub use first_letter::{FirstLetterPart, FirstLetterSelection};
 pub use joining::{is_cursive_character, joins_cursively};
 pub use line_breaks::atomic_boundary_wraps;
 use html_style_model::StyleIndices;
-pub use normalization::{get_style, whitespace_context_root};
+pub use normalization::{
+    append_css_uppercase, get_style, greek_uppercase_mapping, whitespace_context_root};
 pub use prepared_text::{FirstLetterStyles, PreparedText, StyleOverrides};
 pub use pseudo_styles::PseudoStyles;
 pub use spacing::{
@@ -44,7 +47,7 @@ pub use pseudo_styles::{first_letter_overrides_with_characters, first_letter_sty
 pub trait TextStructure {
     fn get_box_parent(&self, context: usize) -> Option<usize>;
     fn get_box_style_indices(&self, context: usize) -> Option<StyleIndices>;
-    fn get_box_dom_element(&self, context: usize) -> Option<u32>;
+    fn get_box_dom_element(&self, context: usize) -> Option<DomNodeId>;
     fn is_inline(&self, context: usize) -> bool;
     fn is_flex_or_grid(&self, context: usize) -> bool;
 }

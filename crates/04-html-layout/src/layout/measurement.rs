@@ -1,44 +1,49 @@
-use super::preparation::execute_layout;
+use super::engine::LayoutPassKind;
+use super::s01_prepare::execute_layout;
 use super::{BoxLayoutRequest, BoxLayoutResult, LayoutEngine, ResolvedBoxSizing};
 use kurbo::Point;
+use std::mem::{swap, take};
 
-/// Run the ordinary layout algorithm against worker-owned temporary output.
+/// Run the ordinary layout algorithm against owned temporary output.
 /// The active pass's geometry, fragments, floats and placement are never replaced.
 pub fn with_isolated_measurement<T>(
     engine: &mut LayoutEngine<'_, '_>,
     measure: impl FnOnce(&mut LayoutEngine<'_, '_>) -> T,
 ) -> T {
-    let mut worker = engine.measurement.take().unwrap_or_default();
-    worker.scratch.inline_plans = std::mem::take(&mut engine.inline_plans);
+    let mut measurement = engine.scratch.measurement.take().unwrap_or_default();
+    measurement.scratch.inline_plans = take(&mut engine.scratch.inline_plans);
+    swap(&mut measurement.scratch.intrinsic_widths, &mut engine.scratch.intrinsic_widths);
+    swap(&mut measurement.scratch.flex_grid, &mut engine.scratch.flex_grid);
     let result = execute_layout(
         engine.measurement_context(),
-        worker.outputs(),
-        &mut engine.timings,
-        engine.fragmentation_suppression_depth,
+        measurement.outputs(),
+        LayoutPassKind::Probe,
         measure,
     );
-    engine.inline_plans = std::mem::take(&mut worker.scratch.inline_plans);
-    engine.measurement = Some(worker);
+    engine.scratch.inline_plans = take(&mut measurement.scratch.inline_plans);
+    swap(&mut measurement.scratch.intrinsic_widths, &mut engine.scratch.intrinsic_widths);
+    swap(&mut measurement.scratch.flex_grid, &mut engine.scratch.flex_grid);
+    engine.scratch.measurement = Some(measurement);
     result
 }
 
 /// Probes run the ordinary box pipeline against isolated storage and consume
 /// its result. Final layout consumes the same result's output ranges.
 pub fn measure_box_isolated(
-    session: &mut LayoutEngine<'_, '_>,
+    engine: &mut LayoutEngine<'_, '_>,
     request: BoxLayoutRequest,
 ) -> BoxLayoutResult<()> {
-    let resolved = session.resolve_box_sizing(request);
-    measure_resolved_box_isolated(session, resolved)
+    let resolved = engine.resolve_box_sizing(request);
+    measure_resolved_box_isolated(engine, resolved)
 }
 
 pub fn measure_resolved_box_isolated(
-    session: &mut LayoutEngine<'_, '_>,
+    engine: &mut LayoutEngine<'_, '_>,
     resolved: ResolvedBoxSizing,
 ) -> BoxLayoutResult<()> {
-    with_isolated_measurement(session, |session| {
-        session.geometry.set_point(resolved.box_idx(), Point::ZERO);
-        session.layout_resolved_box(resolved)
+    with_isolated_measurement(engine, |engine| {
+        engine.geometry.set_point(resolved.box_idx(), Point::ZERO);
+        engine.layout_resolved_box(resolved)
     })
     .without_output()
 }
@@ -47,22 +52,22 @@ pub fn measure_resolved_box_isolated(
 mod tests {
     use super::*;
     use crate::layout::engine::{LayoutInputs, LayoutOutputs, LayoutScratch};
-    use crate::layout::preparation::with_engine;
+    use crate::layout::engine::LayoutReadContext;
+    use crate::layout::read_context::PassContext;
     use crate::layout::block::{FloatBand, FloatSide};
     use crate::layout::{InlinePlanGeneration, PlacementState};
-    use crate::layout_model::{
+    use html_engine_model::{
         BoxFontMetrics, BoxGeometry, GlyphMetrics, GlyphSlice, ImageMetrics, InlineContent,
-        LayoutState, Line, PaintView, RequiredFontMetrics, ShapedFontMetrics,
-    };
+        LayoutState, Line, PaintView, RequiredFontMetrics, ShapedFontMetrics};
     use html_dom::Document;
     use html_style_model::{ComputedStylesBuilder, ReaderStyleOverrides};
     use rustc_data_structures::fx::FxHashMap;
 
     #[test]
-    fn nested_measurements_keep_active_output_and_reuse_their_worker() {
+    fn nested_measurements_keep_active_output_and_reuse_their_measurement() {
         let document = Document::default();
         let styles = ComputedStylesBuilder::new(&document).finish().unwrap();
-        let topology = crate::layout_model::LayoutTree::default();
+        let topology = html_engine_model::LayoutTree::default();
         let inline = InlineContent::default();
         let glyph_metrics = GlyphMetrics::default();
         let font_metrics = ShapedFontMetrics::new(
@@ -94,23 +99,28 @@ mod tests {
             image_metrics: &image_metrics,
             paint: PaintView::new(&overrides, &[], &[], &paint_map, &paint_map),
             text_style_ranges: &[],
-            resource_generation: crate::GlyphResourceGeneration::default(),
+            resource_generation: html_engine_model::GlyphResourceGeneration::default(),
         };
         let mut geometry = BoxGeometry::default();
         let mut state = LayoutState::default();
         let mut placement = PlacementState::default();
         let mut scratch = LayoutScratch::default();
-        with_engine(
+        let pass_context = PassContext::new(&inputs);
+        let read = LayoutReadContext::new(
             inputs,
+            html_engine_model::LayoutConstraints::new(100.0, 16.0).unwrap(),
+            &pass_context,
+        );
+        execute_layout(
+            read,
             LayoutOutputs {
                 geometry: &mut geometry,
                 state: &mut state,
                 placement: &mut placement,
                 scratch: &mut scratch,
             },
-            crate::LayoutConstraints::new(100.0, 16.0).unwrap(),
-            None,
-            |engine, _| {
+            LayoutPassKind::Final,
+            |engine| {
                 engine.geometry.reset(1);
                 let point = Point::new(13.0, 17.0);
                 engine.geometry.set_point(0, point);
@@ -120,8 +130,9 @@ mod tests {
                     .line_output
                     .lines
                     .push(Line::default());
-                engine.floats.reset();
+                engine.scratch.floats.reset();
                 engine
+                    .scratch
                     .floats
                     .current_float_context_mut()
                     .unwrap()
@@ -134,7 +145,14 @@ mod tests {
                     });
                 let probe = |probe: &mut LayoutEngine<'_, '_>| {
                     assert_eq!(probe.fragments.line_len(), 0);
-                    assert!(probe.floats.current_float_context().unwrap().is_empty());
+                    assert!(
+                        probe
+                            .scratch
+                            .floats
+                            .current_float_context()
+                            .unwrap()
+                            .is_empty()
+                    );
                     probe.geometry.reset(1);
                     probe.geometry.set_point(0, Point::new(99.0, 99.0));
                     probe
@@ -150,13 +168,21 @@ mod tests {
                     assert_eq!(probe.geometry.point(0), Point::new(99.0, 99.0));
                 };
                 with_isolated_measurement(engine, probe);
-                let worker = engine.measurement.as_deref().unwrap() as *const _;
+                let measurement = engine.scratch.measurement.as_deref().unwrap() as *const _;
                 with_isolated_measurement(engine, probe);
-                assert_eq!(worker, engine.measurement.as_deref().unwrap() as *const _);
+                assert_eq!(
+                    measurement,
+                    engine.scratch.measurement.as_deref().unwrap() as *const _
+                );
                 assert_eq!(engine.geometry.point(0), point);
                 assert_eq!(engine.fragments.line_len(), 1);
                 assert_eq!(
-                    engine.floats.current_float_context().unwrap().max_bottom(),
+                    engine
+                        .scratch
+                        .floats
+                        .current_float_context()
+                        .unwrap()
+                        .max_bottom(),
                     30.0
                 );
             },

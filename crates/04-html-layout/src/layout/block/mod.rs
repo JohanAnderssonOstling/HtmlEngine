@@ -1,32 +1,31 @@
-//! Per-child stages share one coordinator-owned sibling flow state.
-//! Margin, float, and fragmentation rules remain reusable helpers.
+//! Stage 00 repeats stages 01–03 for each child, sharing one sibling flow state.
+//! Margin and float rules operate on continuous source geometry.
+
+#[path = "00-flow.rs"]
+mod s00_flow;
+#[path = "01-prepare_child.rs"]
+mod s01_prepare_child;
+#[path = "02-layout_child.rs"]
+mod s02_layout_child;
+#[path = "03-finish_child.rs"]
+mod s03_finish_child;
 
 mod decorations;
-#[path = "03-finish_child.rs"]
-mod finish_child;
 mod floats;
-#[path = "00-flow.rs"]
-mod flow;
-mod fragmentation;
-#[path = "02-layout_child.rs"]
-mod layout_child;
 mod margin_cache;
 mod margins;
 mod paragraph_spacing;
-#[path = "01-prepare_child.rs"]
-mod prepare_child;
 pub(in crate::layout) use paragraph_spacing::ParagraphSpacing;
 
 pub(in crate::layout) use floats::FloatState;
 pub(in crate::layout) use floats::layout_float;
 pub use floats::{FloatBand, FloatSide};
-pub(in crate::layout) use flow::layout_block_children;
+pub(in crate::layout) use s00_flow::layout_flow_children;
 pub(in crate::layout) use margins::{
     MarginAnalysis, establishes_formatting_context, stretch_margin_inset,
 };
 
-use crate::layout::{BoxLayoutResult, PlacementId};
-use html_style_model::BreakBetween;
+use crate::layout::BoxLayoutResult;
 use floats::Clearance;
 use kurbo::Point;
 pub(crate) use margins::MarginStrut;
@@ -37,15 +36,8 @@ struct BlockFlowInput {
     available_width: f64,
     parent_cb_width: f64,
     parent_content_height: Option<f64>,
-    fragment_height: Option<f64>,
     position: Point,
     parent_ctx: ParentCollapseContext,
-}
-
-struct PreviousBlock {
-    top: f64,
-    placement: PlacementId,
-    break_after: BreakBetween,
 }
 
 /// State carried between siblings, owned only by the flow coordinator.
@@ -61,7 +53,6 @@ struct BlockFlowState {
     collapsed_parent_top_margin: MarginStrut,
     indent_remaining: f64,
     started_flow: bool,
-    previous_block: Option<PreviousBlock>,
     // Only the latest adjoining float source can trigger negative clearance.
     latest_adjoining_float_sides: u8,
 }

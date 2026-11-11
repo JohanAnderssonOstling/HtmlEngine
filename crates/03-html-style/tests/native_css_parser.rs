@@ -22,7 +22,7 @@ fn target(document: &StyledDocument) -> html_dom::DomNodeId {
     document
         .document()
         .node_ids()
-        .find(|&node| document.document().get_dom_id(node) == Some("target"))
+        .find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some("target"))
         .unwrap()
 }
 
@@ -555,7 +555,7 @@ fn resolved_declarations_survive_retries_and_reset_between_elements() {
         let node = document
             .document()
             .node_ids()
-            .find(|&node| document.document().get_dom_id(node) == Some(id))
+            .find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some(id))
             .unwrap();
         let style = document
             .style_view(document.style_for_node(node).unwrap())

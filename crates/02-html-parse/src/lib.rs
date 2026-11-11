@@ -1,11 +1,13 @@
 mod dom;
 mod encoding;
+mod html;
 mod metadata;
 mod parser;
 mod text;
 mod xml;
 
-pub use dom::{build_dom_document, parse_dom_document};
+pub use dom::{
+    ParsedDomDocument, build_dom_document, parse_dom_document, parse_dom_document_with_metadata};
 pub use encoding::{
     decode_html_bytes, encoding_for_label, parse_html_document_bytes, read_document_source,
 };

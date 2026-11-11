@@ -1,6 +1,5 @@
 //! Construction of inline tokens and measurement of atomic inline content.
 
-use html_engine_model::shaping_contracts;
 use super::*;
 use crate::layout::{BoxLayoutRequest, LayoutEngine, ResolvedBoxModel, measure_box_isolated};
 use html_dom::ImageSource;
@@ -37,7 +36,6 @@ fn create_image_token(
     containing_block_height: Option<f64>,
     standalone_image: Option<u32>,
 ) -> (InlineToken, InlineTokenMetrics, ReplacedToken) {
-    profile_scope!("tokens.image_metrics");
     let style = engine.reader.style(box_idx as usize);
     let self_owned_replaced = box_idx as usize == container_box_idx;
     let vertical_align = if self_owned_replaced {
@@ -159,6 +157,15 @@ fn create_image_token(
             },
         ),
     );
+    let content_size = engine.fit_image(
+        box_idx as usize,
+        content_size,
+        max_width,
+        Size::new(
+            margin_left + margin_right + horizontal_padding + horizontal_border,
+            margin_top + margin_bottom + vertical_padding + vertical_border,
+        ),
+    );
     let border_size = Size::new(
         content_size.width + horizontal_padding + horizontal_border,
         content_size.height + vertical_padding + vertical_border,
@@ -174,7 +181,7 @@ fn create_image_token(
         _ => 0.0,
     };
     let position_offset = if style.position() == PositionMode::Relative {
-        crate::layout::box_positioning::relative_position_offset(
+        crate::layout::box_s03_finish::relative_position_offset(
             &style,
             max_width,
             containing_block_height,
@@ -226,8 +233,12 @@ fn create_inline_boundary_token(
     vertical_align: VerticalAlignValue,
     max_width: f64,
 ) -> (InlineToken, InlineTokenMetrics, ReplacedToken) {
-    let parent_direction = engine.reader.get_parent(box_idx as usize)
-        .map_or(style.direction(), |parent| engine.reader.style(parent).direction());
+    let parent_direction = engine
+        .reader
+        .get_parent(box_idx as usize)
+        .map_or(style.direction(), |parent| {
+            engine.reader.style(parent).direction()
+        });
     let (inline_start, inline_end) = if parent_direction == TextDirection::Rtl {
         (inline_end, inline_start)
     } else { (inline_start, inline_end) };
@@ -257,9 +268,7 @@ fn create_inline_boundary_token(
     // therefore uses the selected font's ascent/descent plus half-leading,
     // exactly like text owned by that box. Basing edge boundaries on a fixed
     // 80/20 split made empty inlines disagree with otherwise identical text.
-    let (font_ascent, font_descent) = shaping_contracts::font_relative_metrics_line_box_extents(engine
-        .reader
-        .font_metrics(box_idx as usize), font_size);
+    let (font_ascent, font_descent) = (engine.reader.font_metrics(box_idx as usize)).line_box_extents(font_size);
     let half_leading = (line_height - font_ascent - font_descent) * 0.5;
     let (ascent, descent) = (font_ascent + half_leading, font_descent + half_leading);
     let token = InlineToken::new(
@@ -271,7 +280,13 @@ fn create_inline_boundary_token(
         TokenWrap::Normal,
         true,
     );
-    let metrics = box_token_metrics(box_idx, style, vertical_align, line_height, (ascent, descent));
+    let metrics = box_token_metrics(
+        box_idx,
+        style,
+        vertical_align,
+        line_height,
+        (ascent, descent),
+    );
     (
         token,
         metrics,
@@ -285,28 +300,47 @@ fn create_inline_boundary_token(
     )
 }
 
-/// Retained plans contain only text and markers, so replay cannot recurse
-/// into atomic inline boxes or place float anchors.
-pub(in crate::layout::inline) fn cached_inline_plan_key(
-    engine: &LayoutEngine<'_, '_>, run_range: &Range<u32>, container_box_idx: usize,
-) -> Option<PreparedInlinePlanKey> {
-    let plan_key = PreparedInlinePlanKey {
-        run_start: run_range.start,
-        run_end: run_range.end,
-        container_box_idx: u32::try_from(container_box_idx)
-            .expect("inline-plan box index exhausted"),
-        high_quality_hyphenation: engine.config.hyphenation_quality(),
-        book_optimized: engine.config.book_optimized_text(),
-    };
-    let source_runs = &engine.text.inline_items()[run_range.start as usize..run_range.end as usize];
-    let cacheable = !source_runs.is_empty()
-        && source_runs.iter().all(|run| {
-            matches!(
-                run.kind,
-                InlineItemKind::Text { .. } | InlineItemKind::Marker { .. }
-            )
-        });
-    cacheable.then_some(plan_key)
+/// An admitted text/marker context with the immutable inputs used to prepare it.
+/// Private fields keep the source range and cache identity tied to admission.
+#[derive(Clone, Copy)]
+pub(in crate::layout::inline) struct TextPreparationRequest<'a> {
+    inputs: TextPreparationInputs<'a>,
+    key: PreparedInlinePlanKey,
+}
+
+impl<'a> TextPreparationRequest<'a> {
+    pub(in crate::layout::inline) fn new(
+        inputs: TextPreparationInputs<'a>,
+        run_range: &Range<u32>,
+        container_box_idx: usize,
+    ) -> Option<Self> {
+        let runs = &inputs.text.inline_items()[run_range.start as usize..run_range.end as usize];
+        if runs.is_empty()
+            || !runs.iter().all(|run| {
+                matches!(
+                    run.kind,
+                    InlineItemKind::Text { .. } | InlineItemKind::Marker { .. }
+                )
+            })
+        {
+            return None;
+        }
+        Some(Self {
+            key: PreparedInlinePlanKey {
+                run_start: run_range.start,
+                run_end: run_range.end,
+                container_box_idx: u32::try_from(container_box_idx)
+                    .expect("inline-plan box index exhausted"),
+                high_quality_hyphenation: inputs.config.hyphenation_quality(),
+                book_optimized: inputs.config.book_optimized_text(),
+            },
+            inputs,
+        })
+    }
+
+    pub(in crate::layout::inline) fn cache_key(&self) -> PreparedInlinePlanKey {
+        self.key
+    }
 }
 
 /// Converts inline items into layout tokens.
@@ -320,24 +354,190 @@ pub(in crate::layout::inline) fn build_inline_tokens(
     max_width: f64,
     containing_block_height: Option<f64>,
 ) -> InlineTokens<'static> {
-    profile_scope!("tokens.build");
-    let timing_started = engine.start_timing();
     // Inline content is immutable throughout layout. Copy the reader so this
     // borrow stays independent of recursive mutations to the layout executor.
     let text = engine.text;
     let runs = &text.inline_items()[run_range.start as usize..run_range.end as usize];
     let standalone_image = standalone_inline_image(engine, runs, container_box_idx);
-    let tokens = build_inline_tokens_from_runs(
+    build_inline_tokens_from_runs(
         engine,
         runs,
         container_box_idx,
         max_width,
         containing_block_height,
         standalone_image,
-    );
-    // Nested timing is measured in build_inline_tokens_from_runs; this captures the outer wrapper.
-    engine.record_timing(|t| t.build_inline_tokens += timing_started.elapsed());
+    )
+}
+
+struct TokenPreparation {
+    tokens: InlineTokens<'static>,
+    hyphen_breaks: Vec<u32>,
+    default_ltr: bool,
+    prepare_bidi_clusters: bool,
+    glyph_capacity: usize,
+}
+
+fn prepare_token_buffer(
+    inputs: &TextPreparationInputs<'_>,
+    dictionary: &mut HyphenationDictionaryCache,
+    mut tokens: InlineTokens<'static>,
+    runs: &[InlineItem],
+    container_box_idx: usize,
+) -> TokenPreparation {
+    let mut glyph_capacity = 0;
+    let mut has_automatic_hyphens = false;
+    for run in runs {
+        glyph_capacity += match &run.kind {
+            InlineItemKind::Text { glyphs } | InlineItemKind::Marker { glyphs } => {
+                glyphs.end.saturating_sub(glyphs.start) as usize
+            }
+            _ => 1,
+        };
+        has_automatic_hyphens = has_automatic_hyphens
+            || inputs.reader.style(run.box_idx as usize).hyphens() == Hyphens::Auto;
+    }
+    let deferred = has_automatic_hyphens && can_defer_hyphenation(inputs, runs, container_box_idx);
+    let hyphen_breaks = if !has_automatic_hyphens || deferred {
+        Default::default()
+    } else {
+        automatic_hyphen_breaks(inputs, dictionary, runs, container_box_idx)
+    };
+    let default_ltr = inputs.text.is_resolved_default_ltr();
+    let content = inputs.text.content();
+    let mut previous_owner = None;
+    let mut owner_ranges = 0;
+    let direct_compact = default_ltr
+        && runs.iter().all(|run| {
+            let (InlineItemKind::Text { glyphs } | InlineItemKind::Marker { glyphs }) = &run.kind
+            else {
+                return false;
+            };
+            let style = inputs.reader.style(run.box_idx as usize);
+            let white_space = style.white_space();
+            if !glyphs.is_empty() && previous_owner != Some(run.box_idx) {
+                owner_ranges += 1;
+                previous_owner = Some(run.box_idx);
+            }
+            owner_ranges <= (glyph_capacity / 8).max(1)
+                && inputs
+                    .reader
+                    .inline_item_belongs_to_context(run, container_box_idx)
+                && !white_space.preserves_spaces()
+                && token_wrap(style, white_space) == TokenWrap::Normal
+                && (!content.has_unicode_wraps()
+                    || !content.has_unicode_wrap_opportunity(glyphs.start as usize..glyphs.end as usize))
+        });
+    if direct_compact {
+        tokens.metadata.reserve(glyph_capacity);
+        tokens.widths.reserve(glyph_capacity);
+        tokens.compact_defaults = Some(0);
+    } else {
+        tokens.dense.reserve(glyph_capacity);
+    }
     tokens
+        .summary_blocks
+        .reserve(glyph_capacity.div_ceil(INLINE_SUMMARY_BLOCK_TOKENS));
+    tokens.features.set_deferred_hyphenation(deferred);
+    // An RTL overflow ellipsis can introduce ordering even when source levels
+    // are default LTR, so keep its source glyphs ready for bidi clustering.
+    let prepare_bidi_clusters =
+        !default_ltr || inputs.reader.style(container_box_idx).direction() == TextDirection::Rtl;
+    tokens
+        .features
+        .set_no_bidi_glyph_separators(prepare_bidi_clusters);
+    TokenPreparation {
+        tokens,
+        hyphen_breaks,
+        default_ltr,
+        prepare_bidi_clusters,
+        glyph_capacity,
+    }
+}
+
+fn finish_text_tokens(
+    inputs: &TextPreparationInputs<'_>,
+    tokens: &mut InlineTokens<'_>,
+    has_preserved_space_breaks: bool,
+) {
+    if inputs.text.content().has_unicode_wraps() && tokens.features.has_unicode_breaks() {
+        tokens.insert_unicode_break_opportunities(inputs);
+    }
+    if has_preserved_space_breaks {
+        tokens.insert_preserved_space_break_opportunities(inputs);
+    }
+    if tokens.compact_defaults.is_some() {
+        tokens.classify_compact_space_glue(inputs);
+        tokens.rebuild_direct_summary_blocks();
+    } else {
+        tokens.classify_space_glue(inputs);
+        tokens.rebuild_summary_blocks();
+        tokens.compact();
+    }
+}
+
+impl TextPreparationRequest<'_> {
+    /// Prepare tokens without layout output or recursive box layout. The caller
+    /// supplies an owned working buffer and retains the result after composition.
+    pub(in crate::layout::inline) fn prepare(
+        self,
+        dictionary: &mut HyphenationDictionaryCache,
+        tokens: InlineTokens<'static>,
+    ) -> InlineTokens<'static> {
+        let inputs = &self.inputs;
+        let runs =
+            &inputs.text.inline_items()[self.key.run_start as usize..self.key.run_end as usize];
+        let container_box_idx = self.key.container_box_idx as usize;
+        let TokenPreparation {
+            mut tokens,
+            hyphen_breaks,
+            default_ltr,
+            prepare_bidi_clusters,
+            glyph_capacity,
+        } = prepare_token_buffer(inputs, dictionary, tokens, runs, container_box_idx);
+        let mut cursor = inputs.text.cursor();
+        let mut has_preserved_space_breaks = false;
+        for run in runs {
+            if !inputs
+                .reader
+                .inline_item_belongs_to_context(run, container_box_idx)
+            {
+                continue;
+            }
+            let (InlineItemKind::Text { glyphs } | InlineItemKind::Marker { glyphs }) = &run.kind
+            else {
+                unreachable!("text preparation requires text/marker admission");
+            };
+            let style = inputs.reader.style(run.box_idx as usize);
+            let white_space = style.white_space();
+            has_preserved_space_breaks |=
+                matches!(white_space, WhiteSpace::PreWrap | WhiteSpace::BreakSpaces);
+            let token_start = tokens.len();
+            append_text_tokens(
+                inputs,
+                &mut tokens,
+                &mut cursor,
+                glyphs.clone(),
+                run.box_idx as usize,
+                style,
+                white_space,
+                text_vertical_align(&inputs.reader, run.box_idx as usize),
+                &hyphen_breaks,
+                prepare_bidi_clusters,
+                glyph_capacity,
+            );
+            if !default_ltr {
+                for token in &mut tokens.dense[token_start..] {
+                    let level = match token.kind() {
+                        InlineTokenKind::Glyph { glyph_idx } => inputs.text.bidi_level(glyph_idx),
+                        _ => inputs.text.item_bidi_level(run),
+                    };
+                    token.set_bidi_level(level);
+                }
+            }
+        }
+        finish_text_tokens(inputs, &mut tokens, has_preserved_space_breaks);
+        tokens
+    }
 }
 
 pub(super) fn build_inline_tokens_from_runs(
@@ -348,65 +548,26 @@ pub(super) fn build_inline_tokens_from_runs(
     containing_block_height: Option<f64>,
     standalone_image: Option<u32>,
 ) -> InlineTokens<'static> {
-    profile_scope!("tokens.from_runs");
-    let timing_started = engine.start_timing();
-    let glyph_capacity: usize = runs
-        .iter()
-        .map(|run| match &run.kind {
-            InlineItemKind::Text { glyphs } | InlineItemKind::Marker { glyphs } => {
-                glyphs.end.saturating_sub(glyphs.start) as usize
-            }
-            _ => 1,
-        })
-        .sum();
-    let has_automatic_hyphens = runs
-        .iter()
-        .any(|run| engine.reader.style(run.box_idx as usize).hyphens() == Hyphens::Auto);
-    let deferred = has_automatic_hyphens && can_defer_hyphenation(engine, runs, container_box_idx);
-    let hyphen_breaks = if !has_automatic_hyphens || deferred {
-        Default::default()
-    } else {
-        automatic_hyphen_breaks(engine, runs, container_box_idx)
-    };
-    let default_ltr = engine.text.is_resolved_default_ltr();
-    let content = engine.text.content();
-    let mut previous_owner = None;
-    let mut owner_ranges = 0;
-    let direct_compact = default_ltr
-        && runs.iter().all(|run| {
-            let (InlineItemKind::Text { glyphs } | InlineItemKind::Marker { glyphs }) = &run.kind
-            else {
-                return false;
-            };
-            let style = engine.reader.style(run.box_idx as usize);
-            let white_space = style.white_space();
-            if !glyphs.is_empty() && previous_owner != Some(run.box_idx) {
-                owner_ranges += 1;
-                previous_owner = Some(run.box_idx);
-            }
-            owner_ranges <= (glyph_capacity / 8).max(1)
-                && engine
-                    .reader
-                    .inline_item_belongs_to_context(run, container_box_idx)
-                && !white_space.preserves_spaces()
-                && token_wrap(style, white_space) == TokenWrap::Normal
-                && (!content.has_unicode_wraps()
-                    || !content.has_unicode_wrap_opportunity(glyphs.start as usize..glyphs.end as usize))
-        });
-    let mut tokens = if direct_compact {
-        engine.inline_plans.working_compact_tokens(glyph_capacity)
-    } else {
-        engine.inline_plans.working_tokens(glyph_capacity)
-    };
-    tokens.features.set_deferred_hyphenation(deferred);
-    // An RTL overflow ellipsis can introduce ordering even when source levels
-    // are default LTR, so keep its source glyphs ready for bidi clustering.
-    let prepare_bidi_clusters = !default_ltr
-        || engine.reader.style(container_box_idx).direction() == TextDirection::Rtl;
-    tokens.features.set_no_bidi_glyph_separators(prepare_bidi_clusters);
+    let inputs = engine.text_preparation_inputs();
+    let working = engine.scratch.inline_plans.working_tokens(0);
+    let TokenPreparation {
+        mut tokens,
+        hyphen_breaks,
+        default_ltr,
+        prepare_bidi_clusters,
+        glyph_capacity,
+    } = prepare_token_buffer(
+        &inputs,
+        &mut engine.scratch.hyphenation_dictionary,
+        working,
+        runs,
+        container_box_idx,
+    );
     // Keep lookup hints across short styled runs. The reader borrows immutable
     // shaping input, independently of recursive layout-executor mutations.
     let mut text_cursor = engine.text.cursor();
+    let mut has_atomic = false;
+    let mut has_preserved_space_breaks = false;
     for run in runs {
         let token_start = tokens.len();
         if !engine.reader.inline_item_belongs_to_context(run, container_box_idx) {
@@ -415,11 +576,13 @@ pub(super) fn build_inline_tokens_from_runs(
         let style = engine.reader.style(run.box_idx as usize);
         let white_space = style.white_space();
         let vertical_align = style.vertical_align();
+        has_preserved_space_breaks |=
+            matches!(white_space, WhiteSpace::PreWrap | WhiteSpace::BreakSpaces);
         match &run.kind {
             InlineItemKind::Text { glyphs } | InlineItemKind::Marker { glyphs } => {
-                let vertical_align = text_vertical_align(engine, run.box_idx as usize);
+                let vertical_align = text_vertical_align(&inputs.reader, run.box_idx as usize);
                 append_text_tokens(
-                    engine,
+                    &inputs,
                     &mut tokens,
                     &mut text_cursor,
                     glyphs.clone(),
@@ -433,6 +596,7 @@ pub(super) fn build_inline_tokens_from_runs(
                 );
             }
             InlineItemKind::Image { image_idx } => {
+                has_atomic = true;
                 // A blockified replaced element is represented by a self-owned
                 // image run so it can reuse the image fragment pipeline. It is
                 // content of its own border box, not a baseline-aligned child.
@@ -459,6 +623,7 @@ pub(super) fn build_inline_tokens_from_runs(
                 );
             }
             InlineItemKind::AtomicBox { box_idx } => {
+                has_atomic = true;
                 let (token, metrics, payload) = create_atomic_box_token(
                     engine,
                     *box_idx,
@@ -535,20 +700,10 @@ pub(super) fn build_inline_tokens_from_runs(
             }
         }
     }
-    tokens.resolve_atomic_break_opportunities(engine);
-    if engine.text.content().has_unicode_wraps() {
-        tokens.insert_unicode_break_opportunities(engine);
+    if has_atomic {
+        tokens.resolve_atomic_break_opportunities(&inputs);
     }
-    tokens.insert_preserved_space_break_opportunities(engine);
-    if tokens.compact_defaults.is_some() {
-        tokens.classify_compact_space_glue(engine);
-        tokens.rebuild_direct_summary_blocks();
-    } else {
-        tokens.classify_space_glue(engine);
-        tokens.rebuild_summary_blocks();
-        tokens.compact();
-    }
-    engine.record_timing(|t| t.build_inline_tokens_from_runs += timing_started.elapsed());
+    finish_text_tokens(&inputs, &mut tokens, has_preserved_space_breaks);
     tokens
 }
 
@@ -598,7 +753,6 @@ fn create_atomic_box_token(
     max_width: f64,
     containing_block_height: Option<f64>,
 ) -> (InlineToken, InlineTokenMetrics, ReplacedToken) {
-    profile_scope!("tokens.atomic_box");
     let max_width = max_width.max(0.0);
     let model = ResolvedBoxModel::new(style, max_width).with_nonnegative_padding();
     // Anonymous inline tables carry an anonymous reset style whose computed
@@ -617,10 +771,19 @@ fn create_atomic_box_token(
                 containing_block_height,
             )
             .with_box_model(
-                model.margin_left + model.margin_right,
-                model.margin_top + model.margin_bottom,
+                model.horizontal_margin(),
+                model.vertical_margin(),
                 model.horizontal_padding_border(),
                 model.vertical_padding_border(),
+            ),
+        );
+        let content = engine.fit_image(
+            box_idx as usize,
+            content,
+            max_width,
+            Size::new(
+                model.horizontal_margin() + model.horizontal_padding_border(),
+                model.vertical_margin() + model.vertical_padding_border(),
             ),
         );
         (
@@ -642,9 +805,17 @@ fn create_atomic_box_token(
         // that grid instead of duplicating box sizing here.
         let measured = measure_box_isolated(
             engine,
-            BoxLayoutRequest::normal(box_idx as usize, max_width.max(0.0), containing_block_height),
+            BoxLayoutRequest::normal(
+                box_idx as usize,
+                max_width.max(0.0),
+                containing_block_height,
+            ),
         );
-        (measured.size, measured.first_baseline, measured.last_baseline)
+        (
+            measured.size,
+            measured.first_baseline,
+            measured.last_baseline,
+        )
     } else {
         // Atomic inline sizing needs the raw content contributions here. The
         // outer intrinsic helper already applies the box's preferred width;
@@ -657,7 +828,7 @@ fn create_atomic_box_token(
             (intrinsic_max + model.horizontal_padding_border()).max(min_border_width);
         let border_inset = model.horizontal_padding_border();
         let available_border_width =
-            (max_width - model.margin_left - model.margin_right).max(border_inset);
+            (max_width - model.horizontal_margin()).max(border_inset);
         let shrink_to_fit = max_border_width.min(available_border_width.max(min_border_width));
         let resolve_border_width = |size: PreferredSize, auto: f64| match size {
             PreferredSize::Auto => auto,
@@ -721,10 +892,14 @@ fn create_atomic_box_token(
                 containing_block_height,
             ),
         );
-        (measured.size, measured.first_baseline, measured.last_baseline)
+        (
+            measured.size,
+            measured.first_baseline,
+            measured.last_baseline,
+        )
     };
-    let outer_width = (border_size.width + model.margin_left + model.margin_right).max(0.0);
-    let outer_height = (border_size.height + model.margin_top + model.margin_bottom).max(0.0);
+    let outer_width = (border_size.width + model.horizontal_margin()).max(0.0);
+    let outer_height = (border_size.height + model.vertical_margin()).max(0.0);
     let is_inline_block = matches!(style.display(), html_style_model::Display::InlineBlock);
     let is_inline_flex_or_grid = engine.reader.is_flex_grid_box(box_idx as usize);
     let visible_overflow = !style.overflow_x().clips() && !style.overflow_y().clips();
@@ -742,7 +917,7 @@ fn create_atomic_box_token(
         None
     };
     let (ascent, descent) = if let Some(baseline) = propagated_baseline {
-        let ascent = model.margin_top + baseline;
+        let ascent = f64::from(model.margin_top) + baseline;
         (ascent, (outer_height - ascent).max(0.0))
     } else {
         (outer_height, 0.0)
@@ -762,14 +937,20 @@ fn create_atomic_box_token(
             TokenWrap::Normal,
             true,
         ),
-        box_token_metrics(box_idx, style, vertical_align, line_height, (ascent, descent)),
+        box_token_metrics(
+            box_idx,
+            style,
+            vertical_align,
+            line_height,
+            (ascent, descent),
+        ),
         ReplacedToken::AtomicBox {
             box_idx,
             border_size,
             containing_width: max_width,
             containing_height: containing_block_height,
-            margin_left: model.margin_left,
-            margin_top: model.margin_top,
+            margin_left: f64::from(model.margin_left),
+            margin_top: f64::from(model.margin_top),
         },
     )
 }

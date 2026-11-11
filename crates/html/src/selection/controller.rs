@@ -3,11 +3,14 @@
 use super::{
     Selection, SelectionAnchor, SelectionMode, SelectionState, TableHit, TableSelectionState,
 };
-use crate::export::{TableExportFormat, TableExportRequest};
+use crate::export::{TableExportFormat, TableExportRequest, TextExportFormat};
 use crate::geometry::{Geometry, SelectionHighlight, WordHit, WordHitPolicy};
 use crate::layout::{BoxId, RenderView};
+use crate::overlays::{OverlayPaintScratch, OverlayStyle, TextOverlay, paint_overlays};
 use crate::render::{LinePlacement, PaintFragment, PaintProjection, Painter};
-use html_pipeline::engine::box_queries;
+use crate::targets::LinkTarget;
+
+use html_dom::DomNodeId;
 use kurbo::{Point, Rect};
 use peniko::Color;
 use std::ops::Range;
@@ -36,6 +39,7 @@ pub enum SelectionKind {
 /// Platform-neutral input in the coordinates of the supplied placements.
 /// Hosts retain navigation, clipboard, focus and scrolling policy.
 pub enum SelectionInput {
+    PointerLeave,
     PointerDown {
         position: Point,
         mode: SelectionMode,
@@ -71,6 +75,8 @@ pub enum SelectionInput {
 
 #[derive(Default)]
 pub struct SelectionOutcome {
+    pub over_link: bool,
+    pub hover_changed: bool,
     pub handled: bool,
     pub changed: bool,
     /// Text selection completed or changed through a touch handle.
@@ -96,6 +102,8 @@ pub struct SelectionHit {
 }
 
 pub enum SelectionExport {
+    /// Plain text with authored paragraph breaks, for clipboard copying.
+    PlainText,
     Markdown,
     TableAt {
         position: Point,
@@ -111,9 +119,17 @@ enum Highlight {
     TableCell,
 }
 
+/// Selection and hover appearance for one view.
+#[derive(Clone, Copy)]
+pub struct SelectionPaintStyle {
+    pub selection: Color,
+    pub hover_foreground: Option<u32>,
+}
+
 /// Reusable buffers, independent of the lifetime of a document or a view.
 #[derive(Default)]
 pub struct SelectionPaintScratch {
+    hover: OverlayPaintScratch,
     rects: Vec<(Highlight, Rect)>,
     cells: Vec<(Highlight, BoxId)>,
     fragments: Vec<PaintFragment>,
@@ -126,9 +142,25 @@ pub struct SelectionController {
     text: SelectionState,
     table: TableSelectionState,
     touch: Option<SelectionAnchor>,
+    hovered_node: Option<DomNodeId>,
+    hovered_text: Option<Range<u32>>,
 }
 
 impl SelectionController {
+    pub(crate) fn is_dragging(&self) -> bool {
+        self.touch.is_some() || self.text.is_selecting() || self.table.is_dragging()
+    }
+
+    pub fn link_hovered(&self) -> bool {
+        self.hovered_node.is_some()
+    }
+
+    /// Resolve the hovered text link when the host needs to activate it.
+    pub fn hovered_link<'a>(&self, view: RenderView<'a>) -> Option<LinkTarget<'a>> {
+        view.addressing()
+            .link_for_glyph(self.hovered_text.as_ref()?.start)
+    }
+
     /// The selected text, for explicit copying and source addressing.
     pub fn selection<'a>(&self, view: RenderView<'a>) -> Option<Selection<'a>> {
         self.text.selection(view)
@@ -138,7 +170,7 @@ impl SelectionController {
     /// active interaction needs hit testing; idle pointer moves do no selection work.
     pub fn interact(
         &mut self,
-        layout: SelectionLayout<'_, impl IntoIterator<Item = LinePlacement>>,
+        layout: SelectionLayout<'_, impl IntoIterator<Item = LinePlacement> + Clone>,
         input: SelectionInput,
     ) -> SelectionOutcome {
         let mut outcome = SelectionOutcome::default();
@@ -148,8 +180,43 @@ impl SelectionController {
             projection,
         } = layout;
         let geometry = Geometry::new(view);
+        let hover = match &input {
+            SelectionInput::PointerMove { position, .. }
+            | SelectionInput::PointerDown { position, .. }
+            | SelectionInput::PointerUp { position, .. } => Some(Some(*position)),
+            SelectionInput::PointerLeave => Some(None),
+            _ => None,
+        };
+        if let Some(position) = hover {
+            let node = position.and_then(|point| {
+                // Link hover must respect paint clips; selection may still
+                // resolve the nearest text outside the visible column.
+                let mut projected = Vec::new();
+                let visible: Vec<_> = placements.clone().into_iter().filter(|placement| {
+                    let Some(line) = view.text().line(placement.line) else {
+                        return false;
+                    };
+                    projected.clear();
+                    projection.project_line(placement.line, line.point(), &mut projected);
+                    projected.iter().any(|line| {
+                        line.origin == placement.origin
+                            && line.clip.is_none_or(|clip| clip.contains(point))
+                    })
+                }).collect();
+                geometry.link_node_at_lines(point, visible.iter().copied())
+            });
+            outcome.hover_changed = node != self.hovered_node;
+            if outcome.hover_changed {
+                self.hovered_node = node;
+                self.hovered_text = node.and_then(|node| {
+                    (view.addressing()).link_text_range(node)
+                });
+            }
+        }
+        let hover_changed = outcome.hover_changed;
         let word_at = |position, policy| geometry.word_hit_at_lines(position, placements, policy);
         match input {
+            SelectionInput::PointerLeave => {}
             SelectionInput::PointerDown {
                 position,
                 mode,
@@ -307,8 +374,10 @@ impl SelectionController {
                 outcome.handled = true;
             }
         }
-        outcome.dragging =
-            self.touch.is_some() || self.text.is_selecting() || self.table.is_dragging();
+        outcome.hover_changed = hover_changed;
+        outcome.over_link = self.link_hovered();
+        outcome.changed |= hover_changed;
+        outcome.dragging = self.is_dragging();
         outcome
     }
 
@@ -367,13 +436,18 @@ impl SelectionController {
         }
     }
 
-    /// Copy is explicit and lazy. A selected table takes precedence over text.
-    pub(crate) fn export(
+    /// Copy is explicit and lazy. Markdown prefers a selected table over text.
+    pub fn export(
         &self,
         layout: SelectionLayout<'_, impl IntoIterator<Item = LinePlacement>>,
         request: SelectionExport,
     ) -> Option<String> {
         let range = match request {
+            SelectionExport::PlainText => {
+                let selection = self.text.selection(layout.view)?;
+                return (layout.view.export()).text(selection.range(), TextExportFormat::PlainWithParagraphBreaks)
+                .plain;
+            }
             SelectionExport::Markdown => {
                 if let Some(range) = self.table.range() {
                     range
@@ -383,24 +457,47 @@ impl SelectionController {
             }
             SelectionExport::TableAt { position, format } => {
                 let box_idx = table_at(layout.view, layout.projection, position)?.table_box();
-                return box_queries::render_box_view_table(layout.view.boxes(), box_idx)
+                return (layout.view.boxes()).table(box_idx)
                     .and_then(|table| table.export(TableExportRequest::Whole(format)));
             }
             SelectionExport::TableCellsMarkdown => self.table.range()?,
         };
-        box_queries::render_box_view_table(layout.view.boxes(), range.table_box())
+        (layout.view.boxes()).table(range.table_box())
             .and_then(|table| range.markdown(&table))
     }
 
     /// Paint text and cell selections using the same projection as the content.
-    /// Reuse scratch storage between frames. `color` is the text highlight color.
-    pub(crate) fn paint(
+    /// Reuse scratch storage between frames, including the link-hover underline.
+    pub fn paint(
         &self,
-        layout: SelectionLayout<'_, impl IntoIterator<Item = LinePlacement>>,
-        color: Color,
+        layout: SelectionLayout<'_, impl IntoIterator<Item = LinePlacement> + Clone>,
+        style: SelectionPaintStyle,
         painter: &mut impl Painter,
         scratch: &mut SelectionPaintScratch,
     ) {
+        if let Some(range) = &self.hovered_text {
+            let rgba = style
+                .hover_foreground
+                .or_else(|| (layout.view.text()).paint_color_at(range.start))
+                .unwrap_or(0x000000ff);
+            paint_overlays(
+                layout.view,
+                std::iter::once(TextOverlay {
+                    range: range.clone(),
+                    style: OverlayStyle::Underline,
+                    color: Color::rgba8(
+                        (rgba >> 24) as u8,
+                        (rgba >> 16) as u8,
+                        (rgba >> 8) as u8,
+                        rgba as u8,
+                    ),
+                }),
+                layout.placements.clone(),
+                painter,
+                &mut scratch.hover,
+            );
+        }
+        let color = style.selection;
         scratch.rects.clear();
         scratch.cells.clear();
         let selection = self

@@ -1,32 +1,28 @@
-use html_pipeline::engine::text_paint;
-use html_pipeline::engine::{FontMetrics, GlyphHandle, GlyphRequest, ShapedGlyph};
+use html_pipeline::engine::LayoutRequest;
+use html_pipeline::engine::{FontMetrics, GlyphHandle, ShapedRun, TextRunShapeRequest, ShapedGlyph};
 use html_pipeline::engine::{
     FormattingDocument, GlyphResourceGeneration, GlyphResourceStore, GlyphShaper,
-    LayoutConstraints, PreparedDocument, ShapeError,
-};
-use html_pipeline::engine::{GlyphRequest, FontMetrics, GlyphHandle, ShapedGlyph};
+    LayoutConstraints, PreparedDocument};
 
 #[derive(Default)]
 struct Shaper(GlyphResourceGeneration);
 
 impl GlyphShaper for Shaper {
-    fn reset(&mut self) {
-        self.0 = GlyphResourceGeneration::default();
-    }
-
     fn resource_generation(&self) -> GlyphResourceGeneration {
         self.0
     }
 
-    fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
-        Ok(ShapedGlyph::new(
-            GlyphHandle(request.character as u32),
-            request.style.font_size / 2.0,
-            FontMetrics {
-                ascent: request.style.font_size,
-                descent: 0.0,
-            },
-        ))
+    fn shape_run(&mut self, request: TextRunShapeRequest<'_>) -> ShapedRun {
+        ShapedRun::characters(request, |character, style| {
+            ShapedGlyph::new(
+                GlyphHandle(character as u32),
+                style.font_size / 2.0,
+                FontMetrics {
+                    ascent: style.font_size,
+                    descent: 0.0,
+                },
+            )
+        })
     }
 }
 
@@ -40,19 +36,22 @@ fn styled() -> (html_dom::Document, html_style_model::ComputedStyles) {
 }
 
 fn text(prepared: PreparedDocument<'_>) -> String {
+    let mut document_resources_shaper = Shaper::default();
+
     let mut document_resources = GlyphResourceStore::default();
     let document = prepared
-        .shape(&mut Shaper::default(), &mut document_resources)
+        .shape(&mut document_resources_shaper, &mut document_resources)
         .unwrap()
         .layout(
-            LayoutConstraints::new(600.0, 16.0).unwrap(),
-            &document_resources,
+            LayoutRequest::new(LayoutConstraints::new(600.0, 16.0).unwrap()),
+            &mut document_resources_shaper,
+            &mut document_resources,
         )
         .expect("layout requires the shaper-aware API for first-line styles");
     let view = document.render_view(&document_resources).text();
     (0..view.glyph_count())
         .map(|index| {
-            text_paint::glyph_metric(view, text_paint::glyph_at(view, index).unwrap())
+            view.glyph_metric(view.glyph_at(index).unwrap())
                 .unwrap()
                 .ch()
         })

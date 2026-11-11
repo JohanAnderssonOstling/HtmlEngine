@@ -1,16 +1,14 @@
-#[cfg(test)]
-use html_engine_model::shaping_contracts;
-use html_engine_model::{PaintColorRun, TextDirection, paint_color_at};
+use html_engine_model::{
+    GlyphAdvanceRun, GlyphOffsetRun, LayoutState, Line, LineDetails, PaintColorRun,
+    PreparedTextRunFragment, TextDirection, TextFragmentStore, TextRunId, paint_color_at};
 use std::ops::Range;
 
 use kurbo::Point;
 
 use crate::layout::fragment_writer::FragmentWriter;
 use crate::layout::inline_reader::InlineReader;
-use crate::layout_model::{GlyphAdvanceRun, GlyphOffsetRun, Line, LineDetails, PreparedTextRunFragment, TextFragmentStore};
 
 fn prepare_line_text_runs(text: &InlineReader<'_>, fragments: &mut FragmentWriter<'_>, colors: &[PaintColorRun]) {
-    profile_scope!("finalize.text_paint_runs");
     let output = &mut fragments.state_mut().line_output;
     output.prepared_text_run_fragments.clear();
     for line_idx in 0..output.lines.len() {
@@ -128,7 +126,11 @@ fn prepare_fragment(
     Some(())
 }
 
-fn flush_segment(run: crate::TextRunId, segment: &mut Option<(u32, u32, Point, Option<u32>)>, prepared: &mut Vec<PreparedTextRunFragment>) {
+fn flush_segment(
+    run: TextRunId,
+    segment: &mut Option<(u32, u32, Point, Option<u32>)>,
+    prepared: &mut Vec<PreparedTextRunFragment>,
+) {
     if let Some((start, end, offset, color)) = segment.take() {
         prepared.push(PreparedTextRunFragment { run, range: start..end, offset, color });
     }
@@ -136,20 +138,31 @@ fn flush_segment(run: crate::TextRunId, segment: &mut Option<(u32, u32, Point, O
 
 /// Prepare native paint slices after final geometry and palette resolution.
 /// Palette-only updates reuse the same path without rebuilding lines.
-pub fn prepare_text_paint(inputs: crate::layout::LayoutInputs<'_>, state: &mut crate::layout_model::LayoutState, colors: &[PaintColorRun]) {
-    let text = InlineReader::new(inputs.inline_content, inputs.first_letter_styles, inputs.glyphs, inputs.glyph_metrics, inputs.text_geometry, inputs.ellipsis_glyphs, inputs.hyphen_glyphs);
-    let mut fragments = FragmentWriter::new(state, Vec::new());
+pub fn prepare_text_paint(
+    inputs: crate::layout::LayoutInputs<'_>,
+    state: &mut LayoutState,
+    colors: &[PaintColorRun],
+) {
+    let text = InlineReader::new(
+        inputs.inline_content,
+        inputs.first_letter_styles,
+        inputs.glyphs,
+        inputs.glyph_metrics,
+        inputs.text_geometry,
+        inputs.ellipsis_glyphs,
+        inputs.hyphen_glyphs,
+    );
+    let mut fragments = FragmentWriter::new(state);
     prepare_line_text_runs(&text, &mut fragments, colors);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        shaping, GlyphRequest, GlyphWriter, FontMetrics, FontSlant, GlyphResourceStore,
-        ResourceShaper, ShapedGlyph, GlyphSlice, InlineContent, LayoutState, ShapedTextGeometry,
-        TextRunId, ShapedTextRun, TextGeometryView,
-    };
+    use html_engine_model::{
+        shaping, GlyphWriter, FontMetrics, FontSlant, GlyphId, GlyphResourceStore, ResourceShaper,
+        ShapedGlyph, GlyphSlice, InlineContent, LayoutState, ShapedTextGeometry, TextRunId,
+        ShapedTextRun, TextGeometryView};
 
     #[test]
     fn native_slices_keep_tracking_positions_around_conditional_characters() {
@@ -159,12 +172,12 @@ mod tests {
         ] {
             let mut content = InlineContent::default();
             let mut resources = GlyphResourceStore::default();
-            let mut shaper = ResourceShaper::new(
-                |request: GlyphRequest<'_>, native: &mut GlyphWriter<'_, ()>| {
-                    let handle = native.insert(())?;
-                    Ok(ShapedGlyph::new(
+            let mut shaper =
+                ResourceShaper::new(|character, style, native: &mut GlyphWriter<'_, ()>| {
+                    let handle = native.insert(());
+                    ShapedGlyph::new(
                         handle,
-                        if matches!(request.character, '\u{00ad}' | '\u{200e}') {
+                        if matches!(character, '\u{00ad}' | '\u{200e}') {
                             0.0
                         } else {
                             8.0
@@ -173,25 +186,35 @@ mod tests {
                             ascent: 12.0,
                             descent: 4.0,
                         },
-                    ))
+                    )
                 },
             );
-            let style = shaping::style(16.0, 400, FontSlant::Normal, 0, None);
+            let style = shaping::style(16.0, 400, FontSlant::Normal, None);
             let mut glyphs = Vec::new();
             for character in source.chars() {
                 content.push_character(character);
                 glyphs.push(
-                    resources
-                        .shape_glyph(&mut shaper, shaping::glyph(character, &style))
-                        .unwrap(),
+                    {
+                        let mut run_glyphs = [GlyphId(0)];
+                        resources
+                            .shape_run(
+                                &mut shaper,
+                                shaping::run(character.encode_utf8(&mut [0; 4]), style),
+                                &mut run_glyphs,
+                            )
+                            .map(|_| run_glyphs[0])
+                    }
+                    .unwrap(),
                 );
             }
             let metrics = resources.metrics();
-            let native = shaping_contracts::shaped_text_run_with_backend_run(vec![8.0, 8.0, 0.0, 8.0, 8.0].into(),
+            let native = ShapedTextRun::with_backend_run(
+                vec![8.0, 8.0, 0.0, 8.0, 8.0].into(),
                 vec![true; 6].into(),
                 TextRunId(0),
                 vec![0.0, 8.0, 16.0, 16.0, 24.0, 32.0].into(),
-                12.0,);
+                12.0,
+            );
             let mut geometry = ShapedTextGeometry::with_len(5);
             geometry.push_run(&[0, 1, 2, 3, 4], native, true);
             geometry.finish_runs();
@@ -207,9 +230,21 @@ mod tests {
                 &empty,
             );
             let mut state = LayoutState::default();
-            state.line_output.lines.push(Line { glyphs: 0..5, baseline: 12.0, letter_spacing: 2.0, ..Default::default() });
-            let mut writer = FragmentWriter::new(&mut state, Vec::new());
-            prepare_line_text_runs(&text, &mut writer, &[PaintColorRun { glyphs: 0..5, color: 0x008000ff }]);
+            state.line_output.lines.push(Line {
+                glyphs: 0..5,
+                baseline: 12.0,
+                letter_spacing: 2.0,
+                ..Default::default()
+            });
+            let mut writer = FragmentWriter::new(&mut state);
+            prepare_line_text_runs(
+                &text,
+                &mut writer,
+                &[PaintColorRun {
+                    glyphs: 0..5,
+                    color: 0x008000ff,
+                }],
+            );
             assert!(state.line_output.lines[0].native_text_runs_complete);
             let carets = [0.0, 8.0, 16.0, 16.0, 24.0];
             let positions_from_slices: Vec<_> = state.line_output.prepared_text_run_fragments.iter()

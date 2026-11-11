@@ -1,12 +1,13 @@
 //! Renderer-facing text, glyph, and line-layout queries.
 
-use html_engine_model::layout_state;
 use super::*;
 use crate::layout_model::paint_program::PaintLayers;
 use crate::layout_model::{
     LineCharacterPlacement, LineId, LineOutput, LineTextFragments, LineTextPlacement,
 };
 use crate::{GlyphHandle, GlyphMetric, PreparedTextRunFragment};
+use html_dom::DomNodeId;
+use html_engine_model::layout_state;
 use html_engine_model::paint_color_at as resolved_paint_color_at;
 use html_style_model::TextDirection;
 use html_text::{InlineTextKind as TextRunKind, suppresses_glyph};
@@ -76,6 +77,18 @@ impl RenderLineTextFragment {
 
     pub fn visible(&self) -> bool {
         self.visible
+    }
+
+    pub fn fragment_is_rtl(&self) -> bool {
+        self.rtl
+    }
+
+    pub fn fragment_offset_x(&self) -> f64 {
+        self.offset_x
+    }
+
+    pub fn fragment_paint_order(&self) -> u32 {
+        self.paint_order
     }
 }
 
@@ -150,6 +163,51 @@ impl RenderLine {
     pub fn height(&self) -> f64 {
         self.height
     }
+
+    pub fn line_baseline(&self) -> f64 {
+        self.baseline
+    }
+
+    pub fn line_word_spacing(&self) -> f64 {
+        self.word_spacing
+    }
+
+    pub fn line_letter_spacing(&self) -> f64 {
+        self.letter_spacing
+    }
+
+    /// Horizontal paint offset for optical margin alignment. Logical line
+    /// geometry remains anchored at [`RenderLine::point`].
+    pub fn line_optical_offset_x(&self) -> f64 {
+        self.optical_offset_x
+    }
+
+    /// A pseudo-element paint color for this line, when one was resolved
+    /// after line breaking (currently `::first-line`).
+    pub fn line_paint_color(&self) -> Option<u32> {
+        self.paint_color
+    }
+
+    pub fn line_is_in_positioned_layer(&self) -> bool {
+        self.paint_layers.is_positioned()
+    }
+
+    pub fn line_is_in_negative_positioned_layer(&self) -> bool {
+        self.paint_layers.is_negative()
+    }
+
+    pub fn line_is_in_independent_positioned_layer(&self) -> bool {
+        self.paint_layers.is_independent()
+    }
+
+    pub fn glyphs(&self) -> Range<u32> {
+        self.glyphs.clone()
+    }
+
+    /// Block box that emitted this line.
+    pub fn owner_box(&self) -> BoxId {
+        layout_state::box_id_new(self.owner_box_idx)
+    }
 }
 
 /// Spatially ordered line view. `get` takes a spatial rank; each returned
@@ -171,18 +229,23 @@ impl<'a> RenderLines<'a> {
     }
 
     pub fn first(&self) -> Option<RenderLine> {
-        render_lines_get(&self, 0)
+        self.get(0)
     }
     pub fn last(&self) -> Option<RenderLine> {
-        render_lines_get(&self, self.len().checked_sub(1)?)
+        self.get(self.len().checked_sub(1)?)
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = RenderLine> + 'a + use<'a> {
+    pub fn iter(&self) -> impl Iterator<Item = RenderLine> + Clone + 'a + use<'a> {
         let output = self.output;
         output
             .spatial_order
             .iter()
             .map(move |id| render_line(output, *id).expect("valid line identity"))
+    }
+
+    pub fn get(&self, rank: usize) -> Option<RenderLine> {
+        let id = *self.output.spatial_order.get(rank)?;
+        render_line(self.output, id)
     }
 }
 
@@ -362,18 +425,25 @@ impl<'a> RenderGlyphOffsetRuns<'a> {
 pub struct RenderTextRun {
     kind: TextRunKind,
     box_idx: usize,
-    dom_text_node: Option<u32>,
+    dom_text_node: Option<DomNodeId>,
     glyphs: Range<u32>,
 }
 
 impl RenderTextRun {
-
-    pub(super) fn dom_text_node(&self) -> Option<u32> {
+    pub(super) fn dom_text_node(&self) -> Option<DomNodeId> {
         self.dom_text_node
     }
 
     pub fn glyphs(&self) -> Range<u32> {
         self.glyphs.clone()
+    }
+
+    pub fn is_marker(&self) -> bool {
+        matches!(self.kind, TextRunKind::Marker)
+    }
+
+    pub fn box_id(&self) -> BoxId {
+        layout_state::box_id_new(self.box_idx)
     }
 }
 
@@ -446,13 +516,9 @@ impl RenderLinePlacement<'_> {
 }
 
 impl<'a> RenderTextView<'a> {
-
-
     pub fn glyph_count(self) -> usize {
         self.doc.shaped().glyphs.len()
     }
-
-
 
     pub(crate) fn glyph_slice(self, range: Range<u32>) -> Option<crate::shaping::GlyphSlice<'a>> {
         let start = usize::try_from(range.start).ok()?;
@@ -473,196 +539,236 @@ impl<'a> RenderTextView<'a> {
         render_line(&self.doc.layout_state.line_output, id)
     }
 
-
-
-
-
-
-}
-
-/// Native key consumed by a baseline-oriented painter.
-pub fn paint_handle(view: RenderTextView<'_>, glyph: GlyphId) -> Option<GlyphHandle> {
-    view.glyph_metrics.paint_handle(glyph)
-}
-
-/// Resolved advances, vertical offsets and paint glyphs for one line.
-/// The borrowed cursor allocates nothing and supports source-order reads
-/// across visually reordered fragments.
-pub fn line_placement<'a>(
-    view: RenderTextView<'a>,
-    line: LineId,
-) -> Option<RenderLinePlacement<'a>> {
-    let line_idx = layout_state::line_id_index(line);
-    let output = &view.doc.layout_state.line_output;
-    let line = output.lines.get(line_idx)?;
-    let shaped = view.doc.shaped();
-    Some(RenderLinePlacement {
-        cursor: LineTextPlacement::new(
-            view.doc.inputs.text.content(),
-            shaped.glyphs,
-            view.glyph_metrics,
-            Some(shaped.text_geometry),
-            line,
-            output.line_glyph_offsets.get(line_idx).unwrap_or(&[]),
-            output.line_glyph_advances.get(line_idx).unwrap_or(&[]),
-        ),
-    })
-}
-
-/// Stable line IDs in CSS paint order.
-pub fn paint_order<'a>(view: RenderTextView<'a>) -> &'a [LineId] {
-    &view.doc.layout_state.line_output.paint_order_indices
-}
-
-pub fn glyph_at(view: RenderTextView<'_>, glyph_idx: usize) -> Option<GlyphId> {
-    view.doc.shaped().glyphs.get(glyph_idx).copied()
-}
-
-/// Resolved source color, independent of the retained backend glyph/run.
-pub fn paint_color_at(view: RenderTextView<'_>, character_index: u32) -> Option<u32> {
-    resolved_paint_color_at(view.doc.paint_colors, character_index)
-}
-
-pub fn glyph_metric(view: RenderTextView<'_>, glyph: GlyphId) -> Option<GlyphMetric> {
-    view.glyph_metrics.get_checked(glyph)
-}
-
-/// Paint identity, including bidi mirroring, without changing logical text.
-/// Directional controls and discretionary hyphens have no ordinary ink.
-pub fn paint_glyph_at(view: RenderTextView<'_>, index: u32) -> Option<GlyphId> {
-    let glyph = glyph_at(view, index as usize)?;
-    let character = render_text_view_character_at(view, index as usize)?;
-    if suppresses_glyph(character) {
-        return None;
+    /// Native key consumed by a baseline-oriented painter.
+    pub fn paint_handle(self, glyph: GlyphId) -> Option<GlyphHandle> {
+        self.glyph_metrics.paint_handle(glyph)
     }
-    Some(view.doc.text_geometry().paint_glyph(index, glyph))
-}
 
-pub fn character_direction(view: RenderTextView<'_>, index: u32) -> TextDirection {
-    if view.doc.text_geometry().bidi().level(index) % 2 == 1 {
-        TextDirection::Rtl
-    } else {
-        TextDirection::Ltr
-    }
-}
-
-/// Natural shaped advance for one logical character.
-pub fn character_advance(view: RenderTextView<'_>, character_index: u32) -> Option<f32> {
-    view.doc.text_geometry().advance(character_index as usize)
-}
-
-pub fn is_character_cluster_boundary(
-    view: RenderTextView<'_>,
-    character_boundary: u32,
-) -> bool {
-    view.doc
-        .text_geometry()
-        .is_cluster_boundary(character_boundary as usize)
-}
-
-pub fn authoritative_runs<'a>(
-    view: RenderTextView<'a>,
-    requested: Range<u32>,
-) -> impl Iterator<Item = RenderAuthoritativeTextRun> + 'a {
-    view.doc
-        .text_geometry()
-        .authoritative_runs(requested)
-        .filter_map(move |run| {
-            let run_range = run.run_range();
-            let natural_offset =
-                run.natural_offset(character_direction(view, run.source_range.start))?;
-            Some(RenderAuthoritativeTextRun {
-                source_range: run.source_range,
-                run_range,
-                run: run.backend_run,
-                natural_offset,
-                ascent: run.ascent,
-                placement_required: run.placement_required,
-            })
+    /// Resolved advances, vertical offsets and paint glyphs for one line.
+    /// The borrowed cursor allocates nothing and supports source-order reads
+    /// across visually reordered fragments.
+    pub fn line_placement(self, line: LineId) -> Option<RenderLinePlacement<'a>> {
+        let line_idx = layout_state::line_id_index(line);
+        let output = &self.doc.layout_state.line_output;
+        let line = output.lines.get(line_idx)?;
+        let shaped = self.doc.shaped();
+        Some(RenderLinePlacement {
+            cursor: LineTextPlacement::new(
+                self.doc.inputs.text.content(),
+                shaped.glyphs,
+                self.glyph_metrics,
+                Some(shaped.text_geometry),
+                line,
+                output.line_glyph_offsets.get(line_idx).unwrap_or(&[]),
+                output.line_glyph_advances.get(line_idx).unwrap_or(&[]),
+            ),
         })
-}
-
-/// Retained, line-relative authoritative run slices prepared by layout.
-/// `None` means native-run coverage was incomplete for this line.
-pub fn prepared_text_runs<'a>(
-    view: RenderTextView<'a>,
-    line: LineId,
-) -> Option<&'a [PreparedTextRunFragment]> {
-    let output = &view.doc.layout_state.line_output;
-    let line = output.lines.get(layout_state::line_id_index(line))?;
-    if !line.native_text_runs_complete {
-        return None;
     }
-    output
-        .prepared_text_run_fragments
-        .get(line.prepared_text_runs.start as usize..line.prepared_text_runs.end as usize)
-}
 
-/// Resolved overflow clip for the line's formatting context.
-pub fn line_overflow_clip(
-    view: RenderTextView<'_>,
-    line: LineId,
-) -> Option<RenderOverflowClip> {
-    view.doc
-        .layout_state
-        .line_output
-        .line_clips
-        .get(layout_state::line_id_index(line))
-        .copied()
-        .flatten()
-        .map(RenderOverflowClip::from_clip)
-}
+    /// Stable line IDs in CSS paint order.
+    pub fn paint_order(self) -> &'a [LineId] {
+        &self.doc.layout_state.line_output.paint_order_indices
+    }
 
-pub fn line_glyph_offsets<'a>(
-    view: RenderTextView<'a>,
-    line: LineId,
-) -> Option<RenderGlyphOffsetRuns<'a>> {
-    view.doc
-        .layout_state
-        .line_output
-        .line_glyph_offsets
-        .get(layout_state::line_id_index(line))
-        .map(RenderGlyphOffsetRuns::new)
-}
+    pub fn glyph_at(self, glyph_idx: usize) -> Option<GlyphId> {
+        self.doc.shaped().glyphs.get(glyph_idx).copied()
+    }
 
-pub fn line_glyph_advances<'a>(
-    view: RenderTextView<'a>,
-    line: LineId,
-) -> Option<RenderGlyphAdvanceRuns<'a>> {
-    view.doc
-        .layout_state
-        .line_output
-        .line_glyph_advances
-        .get(layout_state::line_id_index(line))
-        .map(RenderGlyphAdvanceRuns::new)
-}
+    /// Resolved source color, independent of the retained backend glyph/run.
+    pub fn paint_color_at(self, character_index: u32) -> Option<u32> {
+        resolved_paint_color_at(self.doc.paint_colors, character_index)
+    }
 
-pub fn ellipsis_for_line(
-    view: RenderTextView<'_>,
-    line: LineId,
-) -> Option<RenderEllipsisFragment> {
-    let fragments = &view.doc.layout_state.line_output.ellipsis_fragments;
-    let idx = fragments
-        .binary_search_by_key(&layout_state::line_id_index(line), |fragment| fragment.line_idx)
-        .ok()?;
-    fragments
-        .get(idx)
-        .map(RenderEllipsisFragment::from_fragment)
-}
+    pub fn glyph_metric(self, glyph: GlyphId) -> Option<GlyphMetric> {
+        self.glyph_metrics.get_checked(glyph)
+    }
 
-pub fn hyphen_for_line(view: RenderTextView<'_>, line: LineId) -> Option<RenderHyphenFragment> {
-    let fragments = &view.doc.layout_state.line_output.hyphen_fragments;
-    let idx = fragments
-        .binary_search_by_key(&layout_state::line_id_index(line), |fragment| fragment.line_idx)
-        .ok()?;
-    fragments.get(idx).map(RenderHyphenFragment::from_fragment)
-}
+    /// Paint identity, including bidi mirroring, without changing logical text.
+    /// Directional controls and discretionary hyphens have no ordinary ink.
+    pub fn paint_glyph_at(self, index: u32) -> Option<GlyphId> {
+        let glyph = self.glyph_at(index as usize)?;
+        let character = self.character_at(index as usize)?;
+        if suppresses_glyph(character) {
+            return None;
+        }
+        Some(self.doc.text_geometry().paint_glyph(index, glyph))
+    }
 
-pub fn marker_runs<'a>(view: RenderTextView<'a>) -> RenderTextRuns<'a> {
-    RenderTextRuns::new(
-        view.doc.inputs.text.content().inline_items(),
-        TextRunKind::Marker,
-    )
+    pub fn character_direction(self, index: u32) -> TextDirection {
+        if self.doc.text_geometry().bidi().level(index) % 2 == 1 {
+            TextDirection::Rtl
+        } else {
+            TextDirection::Ltr
+        }
+    }
+
+    /// Natural shaped advance for one logical character.
+    pub fn character_advance(self, character_index: u32) -> Option<f32> {
+        self.doc.text_geometry().advance(character_index as usize)
+    }
+
+    pub fn is_character_cluster_boundary(self, character_boundary: u32) -> bool {
+        self.doc
+            .text_geometry()
+            .is_cluster_boundary(character_boundary as usize)
+    }
+
+    pub fn authoritative_runs(
+        self,
+        requested: Range<u32>,
+    ) -> impl Iterator<Item = RenderAuthoritativeTextRun> + 'a {
+        self.doc
+            .text_geometry()
+            .authoritative_runs(requested)
+            .filter_map(move |run| {
+                let run_range = run.run_range();
+                let natural_offset =
+                    run.natural_offset(self.character_direction(run.source_range.start))?;
+                Some(RenderAuthoritativeTextRun {
+                    source_range: run.source_range,
+                    run_range,
+                    run: run.backend_run,
+                    natural_offset,
+                    ascent: run.ascent,
+                    placement_required: run.placement_required,
+                })
+            })
+    }
+
+    /// Retained, line-relative authoritative run slices prepared by layout.
+    /// `None` means native-run coverage was incomplete for this line.
+    pub fn prepared_text_runs(self, line: LineId) -> Option<&'a [PreparedTextRunFragment]> {
+        let output = &self.doc.layout_state.line_output;
+        let line = output.lines.get(layout_state::line_id_index(line))?;
+        if !line.native_text_runs_complete {
+            return None;
+        }
+        output
+            .prepared_text_run_fragments
+            .get(line.prepared_text_runs.start as usize..line.prepared_text_runs.end as usize)
+    }
+
+    /// Resolved overflow clip for the line's formatting context.
+    pub fn line_overflow_clip(self, line: LineId) -> Option<RenderOverflowClip> {
+        self.doc
+            .layout_state
+            .line_output
+            .line_clips
+            .get(layout_state::line_id_index(line))
+            .copied()
+            .flatten()
+            .map(RenderOverflowClip::from_clip)
+    }
+
+    pub fn line_glyph_offsets(self, line: LineId) -> Option<RenderGlyphOffsetRuns<'a>> {
+        self.doc
+            .layout_state
+            .line_output
+            .line_glyph_offsets
+            .get(layout_state::line_id_index(line))
+            .map(RenderGlyphOffsetRuns::new)
+    }
+
+    pub fn line_glyph_advances(self, line: LineId) -> Option<RenderGlyphAdvanceRuns<'a>> {
+        self.doc
+            .layout_state
+            .line_output
+            .line_glyph_advances
+            .get(layout_state::line_id_index(line))
+            .map(RenderGlyphAdvanceRuns::new)
+    }
+
+    pub fn ellipsis_for_line(self, line: LineId) -> Option<RenderEllipsisFragment> {
+        let fragments = &self.doc.layout_state.line_output.ellipsis_fragments;
+        let idx = fragments
+            .binary_search_by_key(&layout_state::line_id_index(line), |fragment| {
+                fragment.line_idx
+            })
+            .ok()?;
+        fragments
+            .get(idx)
+            .map(RenderEllipsisFragment::from_fragment)
+    }
+
+    pub fn hyphen_for_line(self, line: LineId) -> Option<RenderHyphenFragment> {
+        let fragments = &self.doc.layout_state.line_output.hyphen_fragments;
+        let idx = fragments
+            .binary_search_by_key(&layout_state::line_id_index(line), |fragment| {
+                fragment.line_idx
+            })
+            .ok()?;
+        fragments.get(idx).map(RenderHyphenFragment::from_fragment)
+    }
+
+    pub fn marker_runs(self) -> RenderTextRuns<'a> {
+        RenderTextRuns::new(
+            self.doc.inputs.text.content().inline_items(),
+            TextRunKind::Marker,
+        )
+    }
+
+    pub fn spatial_rank(self, id: LineId) -> Option<usize> {
+        self.doc
+            .layout_state
+            .line_output
+            .spatial_order
+            .ranks()
+            .get(layout_state::line_id_index(id))
+            .map(|&rank| rank as usize)
+    }
+
+    /// Stable line IDs in spatial order. Geometry range queries return ranks
+    /// into this traversal, never ranges of line identities.
+    pub fn spatial_order(self) -> &'a [LineId] {
+        &self.doc.layout_state.line_output.spatial_order
+    }
+
+    pub fn text_runs(self) -> RenderTextRuns<'a> {
+        text_runs(self.doc.inputs.text.content().inline_items())
+    }
+
+    /// Returns the line that owns a source glyph.
+    #[inline]
+    pub fn line_for_glyph(self, glyph_idx: u32) -> Option<LineId> {
+        self.doc
+            .layout_state
+            .line_output
+            .glyph_line_indices
+            .get(glyph_idx as usize)
+            .map(LineId::new)
+    }
+
+    /// Source-backed text in logical order, excluding generated and hidden text.
+    /// Descendants with `visibility: visible` remain available under hidden parents.
+    pub fn visible_source_runs(self) -> impl Iterator<Item = RenderTextRun> + 'a {
+        self.text_runs().filter(move |run| {
+            run.dom_text_node().is_some()
+                && self
+                    .doc
+                    .box_is_visible(layout_state::box_id_index(run.box_id()))
+        })
+    }
+
+    /// Prepared logical character, including text transforms and generated
+    /// content. Bidi mirroring affects paint identity rather than this text.
+    pub fn character_at(self, index: usize) -> Option<char> {
+        self.doc.inputs.text.content().character_at(index)
+    }
+
+    pub fn line_text_fragments(self, line: LineId) -> Option<RenderLineTextFragments<'a>> {
+        let line = self
+            .doc
+            .layout_state
+            .line_output
+            .lines
+            .get(layout_state::line_id_index(line))?;
+        Some(RenderLineTextFragments {
+            fragments: line.text_fragments(
+                &self.doc.layout_state.line_output.line_details,
+                &self.doc.layout_state.line_output.text_fragments,
+            ),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -694,214 +800,69 @@ mod range_tests {
     }
 }
 
-pub fn line_baseline(item: &RenderLine) -> f64 {
-    item.baseline
-}
-
-pub fn line_word_spacing(item: &RenderLine) -> f64 {
-    item.word_spacing
-}
-
-pub fn line_letter_spacing(item: &RenderLine) -> f64 {
-    item.letter_spacing
-}
-
-/// Horizontal paint offset for optical margin alignment. Logical line
-/// geometry remains anchored at [`RenderLine::point`].
-pub fn line_optical_offset_x(item: &RenderLine) -> f64 {
-    item.optical_offset_x
-}
-
-/// A pseudo-element paint color for this line, when one was resolved
-/// after line breaking (currently `::first-line`).
-pub fn line_paint_color(item: &RenderLine) -> Option<u32> {
-    item.paint_color
-}
-
-pub fn line_is_in_positioned_layer(item: &RenderLine) -> bool {
-    item.paint_layers.is_positioned()
-}
-
-pub fn line_is_in_negative_positioned_layer(item: &RenderLine) -> bool {
-    item.paint_layers.is_negative()
-}
-
-pub fn line_is_in_independent_positioned_layer(item: &RenderLine) -> bool {
-    item.paint_layers.is_independent()
-}
-
-pub fn fragment_is_rtl(item: &RenderLineTextFragment) -> bool {
-    item.rtl
-}
-
-pub fn fragment_offset_x(item: &RenderLineTextFragment) -> f64 {
-    item.offset_x
-}
-
-pub fn fragment_paint_order(item: &RenderLineTextFragment) -> u32 {
-    item.paint_order
-}
-
-pub fn paint_resources_valid(view: RenderView<'_>) -> bool {
-    view.resources
-        .is_none_or(|resources| resources.paint_resources_valid())
-}
-
-pub fn retain_paint_resources(view: RenderView<'_>) -> Option<RenderResourceLease> {
-    Some(RenderResourceLease {
-        native: view.resources?.paint_lease(),
-        _scope: view.scope_lifetime.cloned(),
-    })
-}
-
-pub fn render_text_view_spatial_rank<'a>(value: RenderTextView<'a>, id: LineId) -> Option<usize> {
-    value
-        .doc
-        .layout_state
-        .line_output
-        .spatial_order
-        .ranks()
-        .get(layout_state::line_id_index(id))
-        .map(|&rank| rank as usize)
-}
-
-/// Stable line IDs in spatial order. Geometry range queries return ranks
-/// into this traversal, never ranges of line identities.
-pub fn render_text_view_spatial_order<'a>(value: RenderTextView<'a>) -> &'a [LineId] {
-    &value.doc.layout_state.line_output.spatial_order
-}
-
-pub fn render_view_image_uri<'a>(value: &RenderView<'a>, image: ImageId) -> Option<&'a str> {
-    match &render_view_images(&value)
-        .get(image.index())?
-        .source
-    {
-        ImageSource::Uri(uri) => Some(uri.as_str()),
-        ImageSource::InlineSvg { .. } | ImageSource::MathMl { .. } => None,
-    }
-}
-
-pub fn render_view_images<'a>(value: &RenderView<'a>) -> &'a [ImageResource] {
-    value.doc.inputs.document.images()
-}
-
-pub fn render_line_glyphs(value: &RenderLine) -> Range<u32> {
-    value.glyphs.clone()
-}
-
-pub fn render_lines_get<'a>(value: &RenderLines<'a>, rank: usize) -> Option<RenderLine> {
-    let id = *value.output.spatial_order.get(rank)?;
-    render_line(value.output, id)
-}
-
-/// The CSS canvas background color, after root/body propagation.
-///
-/// A root background suppresses body propagation even when its only
-/// drawable layer is an image that this renderer cannot paint yet.
-pub fn render_view_canvas_background_color<'a>(value: &RenderView<'a>) -> Option<u32> {
-    let background = |box_idx| {
-        let indices = value
-            .doc
-            .inputs
-            .layout_tree
-            .get_box_style_indices(box_idx)?;
-        let style = value.doc.inputs.styles.view(indices)?;
-        let color = value
-            .doc
-            .inputs
-            .paint
-            .box_colors(box_idx)
-            .map_or_else(|| style.background_color(), |paint| paint.background);
-        Some((style, color))
-    };
-    let (root, root_color) = background(value.doc.inputs.layout_tree.root_box()?)?;
-    if root.background_image_present() || root_color & 0xFF != 0 {
-        return (root.visibility() == Visibility::Visible && root_color & 0xFF != 0)
-            .then_some(root_color);
+impl<'a> RenderView<'a> {
+    pub fn paint_resources_valid(self) -> bool {
+        self.resources
+            .is_none_or(|resources| resources.paint_resources_valid())
     }
 
-    let (body, body_color) = background(value.doc.inputs.layout_tree.body_box()?)?;
-    (body.visibility() == Visibility::Visible && body_color & 0xFF != 0).then_some(body_color)
-}
-
-/// Preserved source for equation-specific actions; ordinary images return None.
-pub fn render_view_image_mathml<'a>(value: &RenderView<'a>, image: ImageId) -> Option<&'a str> {
-    match &render_view_images(&value)
-        .get(image.index())?
-        .source
-    {
-        ImageSource::MathMl { markup, .. } => Some(markup),
-        _ => None,
+    pub fn native_paint_resources(self) -> Option<&'a html_engine_model::NativePaintResources> {
+        self.native_paint_resources
     }
-}
 
-/// Block box that emitted this line.
-pub fn render_line_owner_box(value: &RenderLine) -> BoxId {
-    layout_state::box_id_new(value.owner_box_idx)
-}
+    pub fn retain_paint_resources(self) -> Option<RenderResourceLease> {
+        Some(RenderResourceLease {
+            native: self.resources?.paint_lease(),
+            parent: self
+                .parent_resources
+                .map(crate::GlyphResourceStore::paint_lease),
+            paint_resources: self.native_paint_resources.cloned(),
+            _scope: self.scope_resources.cloned(),
+        })
+    }
 
-pub fn render_text_run_is_marker(value: &RenderTextRun) -> bool {
-    matches!(value.kind, TextRunKind::Marker)
-}
+    pub fn image_uri(&self, image: ImageId) -> Option<&'a str> {
+        match &self.images().get(image.index())?.source {
+            ImageSource::Uri(uri) => Some(uri.as_str()),
+            ImageSource::InlineSvg { .. } | ImageSource::MathMl { .. } => None,
+        }
+    }
 
-pub fn render_text_run_box_id(value: &RenderTextRun) -> BoxId {
-    layout_state::box_id_new(value.box_idx)
-}
+    pub fn images(&self) -> &'a [ImageResource] {
+        self.doc.inputs.document.images()
+    }
 
-pub fn render_text_view_text_runs<'a>(value: RenderTextView<'a>) -> RenderTextRuns<'a> {
-    text_runs(value.doc.inputs.text.content().inline_items())
-}
-
-/// Returns the line that owns a source glyph.
-#[inline]
-pub fn render_text_view_line_for_glyph<'a>(
-    value: RenderTextView<'a>,
-    glyph_idx: u32,
-) -> Option<LineId> {
-    value
-        .doc
-        .layout_state
-        .line_output
-        .glyph_line_indices
-        .get(glyph_idx as usize)
-        .map(LineId::new)
-}
-
-/// Source-backed text in logical order, excluding generated and hidden text.
-/// Descendants with `visibility: visible` remain available under hidden parents.
-pub fn render_text_view_visible_source_runs<'a>(
-    value: RenderTextView<'a>,
-) -> impl Iterator<Item = RenderTextRun> + 'a {
-    render_text_view_text_runs(value).filter(move |run| {
-        run.dom_text_node().is_some()
-            && value
+    /// The CSS canvas background color, after root/body propagation.
+    ///
+    /// A root background suppresses body propagation even when its only
+    /// drawable layer is an image that this renderer cannot paint yet.
+    pub fn canvas_background_color(&self) -> Option<u32> {
+        let background = |box_idx| {
+            let indices = self.doc.inputs.layout_tree.get_box_style_indices(box_idx)?;
+            let style = self.doc.inputs.styles.view(indices)?;
+            let color = self
                 .doc
-                .box_is_visible(layout_state::box_id_index(render_text_run_box_id(&run)))
-    })
-}
+                .inputs
+                .paint
+                .box_colors(box_idx)
+                .map_or_else(|| style.background_color(), |paint| paint.background);
+            Some((style, color))
+        };
+        let (root, root_color) = background(self.doc.inputs.layout_tree.root_box()?)?;
+        if root.background_image_present() || root_color & 0xFF != 0 {
+            return (root.visibility() == Visibility::Visible && root_color & 0xFF != 0)
+                .then_some(root_color);
+        }
 
+        let (body, body_color) = background(self.doc.inputs.layout_tree.body_box()?)?;
+        (body.visibility() == Visibility::Visible && body_color & 0xFF != 0).then_some(body_color)
+    }
 
-
-/// Prepared logical character, including text transforms and generated
-/// content. Bidi mirroring affects paint identity rather than this text.
-pub fn render_text_view_character_at<'a>(value: RenderTextView<'a>, index: usize) -> Option<char> {
-    value.doc.inputs.text.content().character_at(index)
-}
-
-pub fn render_text_view_line_text_fragments<'a>(
-    value: RenderTextView<'a>,
-    line: LineId,
-) -> Option<RenderLineTextFragments<'a>> {
-    let line = value
-        .doc
-        .layout_state
-        .line_output
-        .lines
-        .get(layout_state::line_id_index(line))?;
-    Some(RenderLineTextFragments {
-        fragments: line.text_fragments(
-            &value.doc.layout_state.line_output.line_details,
-            &value.doc.layout_state.line_output.text_fragments,
-        ),
-    })
+    /// Preserved source for equation-specific actions; ordinary images return None.
+    pub fn image_mathml(&self, image: ImageId) -> Option<&'a str> {
+        match &self.images().get(image.index())?.source {
+            ImageSource::MathMl { markup, .. } => Some(markup),
+            _ => None,
+        }
+    }
 }

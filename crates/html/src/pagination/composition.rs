@@ -1,17 +1,15 @@
 //! Page composition from published layout, column geometry and preferences.
 
-
-use html_pipeline::engine::pagination_queries;
 use super::{PageAnchor, PageGeometry, PagePositions, PageRequest};
 use crate::layout::RenderView;
 use crate::pagination::PaginationTarget;
 use crate::reading::{ReadingFragment, ReadingOrigin};
-use html_pipeline::engine::fragment_paint;
-use html_pipeline::engine::reading_queries;
-#[cfg(test)]
 use html_engine_model::layout_state;
 use html_engine_model::{LineScreen, RepeatedTableHeader, VisibleLinePositions, page_placements};
-use std::collections::HashSet;
+use html_pipeline::engine::{Pagination, PaginationGroup};
+use html_engine_model::layout_state::SourceIntervals;
+use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 #[path = "semantic_keeps.rs"]
@@ -19,8 +17,132 @@ mod semantic_keeps;
 #[path = "vertical_rhythm.rs"]
 mod vertical_rhythm;
 
-use crate::layout::{ContentRole, LineId, RenderForcedBreak};
+
+use crate::layout::{BoxId, ContentRole, LineId, RenderForcedBreak};
 use kurbo::Point;
+
+/// Merge overlapping protected content spans once per oversized group. Carrier
+/// lines can cover whole galleries, so use actual text and image geometry.
+fn protected_spans(doc: RenderView<'_>, group: &PaginationGroup<'_>) -> Vec<Range<f64>> {
+    let mut spans = Vec::new();
+    for member in group.lines() {
+        if doc.text().line_text_fragments(member.id())
+            .is_some_and(|mut fragments| fragments.any(|fragment| fragment.visible() && !fragment.glyphs().is_empty()))
+        {
+            if let Some(line) = doc.text().line(member.id()) {
+                spans.push(line.point().y..line.point().y + line.height());
+            }
+        }
+        for image in doc.fragments().images_for_line(member.id()).iter() {
+            let rect = image.visible_rect();
+            spans.push(member.point().y + rect.y0..member.point().y + rect.y1);
+        }
+    }
+    spans.retain(|span| span.start.is_finite() && span.end.is_finite() && span.end > span.start);
+    spans.sort_by(|a, b| a.start.total_cmp(&b.start));
+    let mut merged: Vec<Range<f64>> = Vec::with_capacity(spans.len());
+    for span in spans {
+        if let Some(previous) = merged.last_mut()
+            && span.start < previous.end - 0.01
+        {
+            previous.end = previous.end.max(span.end);
+        } else {
+            merged.push(span);
+        }
+    }
+    merged
+}
+
+/// Prefer a content boundary; retain geometric slicing when an overlapping
+/// content span itself cannot fit in a column, guaranteeing forward progress.
+fn content_break(spans: &[Range<f64>], edge: f64, limit: f64, forward: bool) -> f64 {
+    let index = spans.partition_point(|span| span.end <= limit + 0.01);
+    if let Some(span) = spans.get(index)
+        && span.start < limit - 0.01
+    {
+        let boundary = if forward { span.start } else { span.end };
+        if (forward && boundary > edge + 0.01) || (!forward && boundary < edge - 0.01) {
+            return boundary;
+        }
+    }
+    limit
+}
+
+/// A single line or replaced element is monolithic, even when taller than a
+/// column. Only containers with separate content spans have continuation cuts.
+fn can_fragment(doc: RenderView<'_>, group: &PaginationGroup<'_>, height: f64) -> bool {
+    if group.height() <= height { return false; }
+    let mut first = None;
+    for (cursor, member) in group.cursors().zip(group.lines()) {
+        let Some(line) = doc.text().line(member.id()) else { continue };
+        if line.glyphs().is_empty()
+            || doc.pagination().source_line(cursor).is_some_and(|source| source.id() != member.id())
+        { continue; }
+        if first.is_some_and(|y: f64| (y - line.point().y).abs() > 0.01) {
+            return true;
+        }
+        first = Some(line.point().y);
+    }
+    protected_spans(doc, group).len() > 1
+}
+
+/// Source-only data shared by all fragments of an oversized group.
+struct GroupSlices {
+    spans: Vec<Range<f64>>,
+    members: SourceIntervals,
+}
+
+impl GroupSlices {
+    fn new(doc: RenderView<'_>, group: &PaginationGroup<'_>) -> Self {
+        let ownership = doc.boxes().pagination_ownership();
+        let mut table_carriers = HashSet::new();
+        let mut box_carriers = HashSet::new();
+        let mut entries = Vec::new();
+        for (cursor, member) in group.cursors().zip(group.lines()) {
+            let line = doc.text().line(member.id());
+            let top = line.as_ref().map_or(member.point().y, |line| line.point().y);
+            let bottom = line.as_ref().map_or(top, |line| top + line.height());
+            let mut bounds = top..bottom;
+            for image in doc.fragments().images_for_line(member.id()).iter() {
+                let rect = image.visible_rect();
+                bounds.start = bounds.start.min(member.point().y + rect.y0);
+                bounds.end = bounds.end.max(member.point().y + rect.y1);
+            }
+            entries.push((cursor as u32, bounds.start, bounds.end));
+            // Padding and otherwise empty portions of a row still need its
+            // structural mapping. Retain one carrier per table fragment,
+            // rather than every offscreen line in that row.
+            if let Some(membership) = ownership.lines.get(layout_state::line_id_index(member.id())) {
+                for &owner in membership.content.iter().chain(&membership.flows) {
+                    if box_carriers.insert(owner)
+                        && let Some(bounds) = doc.boxes().bounds(layout_state::box_id_new(owner as usize))
+                    {
+                        entries.push((cursor as u32, bounds.y0, bounds.y1));
+                    }
+                }
+                for &source in &membership.table_fragments {
+                    if table_carriers.insert(source) {
+                        let bounds = ownership.table_fragments[source as usize].bounds;
+                        entries.push((cursor as u32, bounds.y0, bounds.y1));
+                    }
+                }
+            }
+        }
+        Self { spans: protected_spans(doc, group), members: SourceIntervals::new(entries) }
+    }
+}
+
+#[derive(Default)]
+struct SliceCache {
+    groups: HashMap<usize, Arc<GroupSlices>>,
+}
+
+impl SliceCache {
+    fn group(&mut self, doc: RenderView<'_>, group: &PaginationGroup<'_>) -> Arc<GroupSlices> {
+        Arc::clone(self.groups.entry(group.cursors().start)
+            .or_insert_with(|| Arc::new(GroupSlices::new(doc, group))))
+    }
+}
 
 struct RenderState {
     y_offset: f64,
@@ -68,7 +190,8 @@ fn initial_render_state() -> RenderState {
     }
 }
 
-use crate::structure::{BlockFacts, HeaderPolicy, SiblingPair, Structure, StructureView};
+use crate::structure::{
+    BlockFacts, HeaderPolicy, SiblingPair, Structure, StructureView, TableHeader};
 use crate::structure::{
     TableGroup as TablePaginationEvent, TableGroupKind as TablePaginationEventKind,
 };
@@ -90,15 +213,32 @@ struct KeepRangeEvent {
 /// Shared bounded inputs for CSS and reader keep preferences.
 #[derive(Default)]
 struct KeepContext {
+    paragraph_lines: HashMap<BoxId, Vec<(usize, f64, f64)>>,
     lines_by_y: Vec<(f64, usize)>,
     blocks: Vec<BlockFacts>,
     siblings: Vec<SiblingPair>,
 }
 
 impl KeepContext {
-    fn prepare(&mut self, doc: RenderView<'_>, anchors: &StructureView<'_>) {
-        let root = doc;
-        let lines = pagination_queries::render_view_pagination(root);
+    fn prepare(&mut self, anchors: &StructureView<'_>, doc: RenderView<'_>) {
+        let lines = anchors.pagination();
+        self.paragraph_lines.clear();
+        // Preserve individual source lines for widows/orphans. Spatial overlap
+        // and pagination-group extents can include unrelated floating content.
+        for cursor in anchors.lines() {
+            let Some(position) = lines.locate(PaginationTarget::Cursor(cursor)) else { continue };
+            let Some(line) = doc.text().line(position.line.id()) else { continue };
+            if line.glyphs().is_empty() {
+                continue;
+            }
+            self.paragraph_lines.entry(line.owner_box()).or_default().push((
+                cursor, line.point().y, line.point().y + line.height(),
+            ));
+        }
+        for entries in self.paragraph_lines.values_mut() {
+            entries.sort_unstable_by_key(|&(cursor, _, _)| cursor);
+            entries.dedup_by_key(|entry| entry.0);
+        }
         self.lines_by_y.clear();
         self.lines_by_y.extend(
             anchors
@@ -204,8 +344,9 @@ fn apply_table_pagination_event(
         TablePaginationEventKind::WholeTable => (height <= fragment_height && crosses, None),
         // A forced break that already lands on a fragment boundary is
         // satisfied; advancing again would skip an entire column.
-        TablePaginationEventKind::RowGroup { forced, header } => (
-            (forced && local_top > 0.01) || (height <= fragment_height && crosses),
+        TablePaginationEventKind::RowGroup { forced, header, allow_content_break } => (
+            !header.is_some_and(|header| header.reserved)
+                && ((forced && local_top > 0.01) || ((!allow_content_break || header.is_some()) && height <= fragment_height && crosses)),
             header,
         ),
     };
@@ -220,7 +361,8 @@ fn apply_table_pagination_event(
     }
     let body_projected_top = pagination_top + render_state.y_offset - start_offset_y;
     let body_local_top = body_projected_top.rem_euclid(fragment_height);
-    let starts_continuation = move_to_fresh_fragment
+    let starts_continuation = header.reserved
+        || move_to_fresh_fragment
         || (body_local_top <= 0.01
             && (start_offset_y >= header.bottom - 0.01
                 || body_projected_top >= fragment_height - 0.01));
@@ -231,7 +373,9 @@ fn apply_table_pagination_event(
     if col_index < 0 || col_index as f64 >= layout.col_count {
         return None;
     }
-    render_state.y_offset += header_height;
+    if !header.reserved {
+        render_state.y_offset += header_height;
+    }
     Some(RepeatedTableHeader {
         source_left: header.left,
         source_right: header.right,
@@ -249,6 +393,23 @@ struct PaginationEvents {
     keeps: Vec<KeepRangeEvent>,
 }
 
+fn reserved_headers(
+    events: Option<&PaginationEvents>,
+    cursors: Range<usize>,
+) -> impl Iterator<Item = TableHeader> + '_ {
+    events
+        .into_iter()
+        .flat_map(|events| &events.tables)
+        .filter(move |event| cursors.contains(&event.trigger_line))
+        .filter_map(|event| match event.kind {
+            TablePaginationEventKind::RowGroup {
+                header: Some(header),
+                ..
+            } if header.reserved => Some(header),
+            _ => None,
+        })
+}
+
 #[derive(Default)]
 struct VerticalRhythmScratch {
     visible: Vec<(LineId, LineScreen)>,
@@ -258,11 +419,13 @@ struct VerticalRhythmScratch {
     original_breaks: Vec<(f64, f64)>,
 }
 
-/// Reusable transient storage for one paginator instance. It contains no
-/// document identity or page result and may be retained across documents,
-/// resizes, and navigation operations.
+/// Reusable pagination storage. Cached source data and cuts are invalidated
+/// automatically when the layout publication, geometry, or mode changes.
 #[derive(Default)]
 pub struct PaginationScratch {
+    cache_key: Option<(u64, [u64; 5], bool, bool)>,
+    slices: SliceCache,
+    continuation_cuts: HashMap<usize, Vec<f64>>,
     structure: Structure,
     events: PaginationEvents,
     probe_positions: Vec<LineScreen>,
@@ -296,6 +459,23 @@ pub struct Paginator<'a> {
 }
 
 impl<'a> Paginator<'a> {
+    fn prepare_cache(&self, scratch: &mut PaginationScratch) {
+        let key = (self.doc.boxes().pagination_ownership().revision,
+            [self.layout.size.width.to_bits(), self.layout.size.height.to_bits(),
+             self.layout.col_width.to_bits(), self.layout.col_count.to_bits(), self.layout.col_gap.to_bits()],
+            self.book_optimized, self.vertical_rhythm);
+        if scratch.cache_key != Some(key) {
+            scratch.slices.groups.clear();
+            scratch.continuation_cuts.clear();
+            scratch.cache_key = Some(key);
+        }
+    }
+
+    fn pagination(&self) -> Pagination<'a> {
+        (self.doc).pagination()
+            .for_page_height(self.layout.size.height)
+    }
+
     pub fn new(doc: RenderView<'a>, layout: PageGeometry, mode: PaginationMode) -> Self {
         Self {
             doc,
@@ -315,9 +495,13 @@ impl<'a> Paginator<'a> {
         if page.is_some_and(|page| page.reached_end) {
             return None;
         }
+        if let Some((_, offset_y)) = page.and_then(|page| page.continuation) {
+            return Some(PageAnchor { cursor: None, offset_y });
+        }
         if let Some(end) = page.and_then(|page| page.last_line) {
             let next = end.checked_add(1)?;
-            let group = pagination_queries::render_view_pagination(self.doc)
+            let group = self
+                .pagination()
                 .locate(PaginationTarget::Cursor(next))?
                 .group;
             return Some(PageAnchor {
@@ -340,6 +524,13 @@ impl<'a> Paginator<'a> {
         page: Option<&PagePositions>,
         start_offset_y: f64,
     ) -> Option<PageAnchor> {
+        if let Some(page) = page
+            && let Some(position) = self.pagination().locate(PaginationTarget::Cursor(page.start_line))
+            && page.paint_start_offset_y > position.group.point().y + 0.01
+            && can_fragment(self.doc, &position.group, self.layout.size.height)
+        {
+            return Some(PageAnchor { cursor: None, offset_y: page.paint_start_offset_y });
+        }
         let start = page.map(|page| page.start_line);
         if start.map_or(start_offset_y <= 0.0, |cursor| cursor == 0) {
             return None;
@@ -347,7 +538,7 @@ impl<'a> Paginator<'a> {
         let cursor = start.and_then(|cursor| cursor.checked_sub(1));
         let offset_y = cursor
             .and_then(|cursor| {
-                pagination_queries::render_view_pagination(self.doc)
+                self.pagination()
                     .locate(PaginationTarget::Cursor(cursor))
                     .map(|position| position.group)
             })
@@ -366,14 +557,26 @@ impl<'a> Paginator<'a> {
         positions: Vec<LineScreen>,
         scratch: &mut PaginationScratch,
     ) -> PagePositions {
+        self.prepare_cache(scratch);
+        if !self.layout.size.height.is_finite() || self.layout.size.height <= 0.0
+            || !self.layout.col_count.is_finite() || self.layout.col_count < 1.0
+        {
+            return PagePositions {
+                request,
+                geometry: self.layout,
+                positions: page_placements::with_buffer(0, positions),
+                reached_end: self.pagination().is_empty(),
+                ..PagePositions::default()
+            };
+        }
         match request {
             PageRequest::StartingAtOffset(start_offset_y) => {
-                let start_line = pagination_queries::render_view_pagination(self.doc)
-                    .start_at(start_offset_y, 0.1);
+                let start_line = self.oversized_at(start_offset_y, false)
+                    .map_or_else(|| self.pagination().start_at(start_offset_y, 0.1), |(cursor, _, _)| cursor);
                 self.page_from_line_at_with_scratch(start_line, start_offset_y, positions, scratch)
             }
             PageRequest::StartingAt(start_line) => {
-                let lines = pagination_queries::render_view_pagination(self.doc);
+                let lines = self.pagination();
                 let group = lines.groups(start_line..lines.len()).next();
                 let start_line = group
                     .as_ref()
@@ -385,14 +588,35 @@ impl<'a> Paginator<'a> {
                 page
             }
             PageRequest::EndingAtOffset(offset) => {
-                let request = pagination_queries::render_view_pagination(self.doc)
+                if let Some((cursor, _, _)) = self.oversized_at(offset, true) {
+                    let position = self.pagination().locate(PaginationTarget::Cursor(cursor))
+                        .expect("located oversized group");
+                    let start = self.continuation_start(&position.group, offset, scratch);
+                    let mut page = self.page_from_line_until_with_scratch(cursor, start, Some(offset), positions, scratch);
+                    page.request = PageRequest::EndingAtOffset(offset);
+                    return page;
+                }
+                let request = self
+                    .pagination()
                     .end_at(offset, 1e-6)
                     .map_or(PageRequest::StartingAtOffset(0.0), PageRequest::EndingAt);
                 self.compose(request, positions, scratch)
             }
             PageRequest::EndingAt(end_line) => {
-                let lines = pagination_queries::render_view_pagination(self.doc);
+                let lines = self.pagination();
                 let end_line = end_line.min(lines.len().saturating_sub(1));
+                if let Some(position) = lines.locate(PaginationTarget::Cursor(end_line))
+                    && can_fragment(self.doc, &position.group, self.layout.size.height)
+                {
+                    let top = position.group.point().y;
+                    let bottom = top + position.group.height();
+                    let offset = self.continuation_start(&position.group, bottom, scratch);
+                    let mut page = self.page_from_line_until_with_scratch(
+                        position.group.cursors().start, offset, Some(bottom), positions, scratch,
+                    );
+                    page.request = PageRequest::EndingAtOffset(bottom);
+                    return page;
+                }
                 if end_line == 0 {
                     return self.compose(PageRequest::StartingAtOffset(0.0), positions, scratch);
                 }
@@ -414,7 +638,10 @@ impl<'a> Paginator<'a> {
                     scratch,
                 );
                 scratch.events = events;
-                if page.start_line == 0 {
+                if page.start_line == 0
+                    && lines.locate(PaginationTarget::Cursor(0))
+                        .is_none_or(|position| page.paint_start_offset_y <= position.group.point().y + 0.01)
+                {
                     self.compose(
                         PageRequest::StartingAtOffset(0.0),
                         page.positions.into_buffer(),
@@ -425,6 +652,52 @@ impl<'a> Paginator<'a> {
                 }
             }
         }
+    }
+
+    fn continuation_start(
+        &self,
+        group: &PaginationGroup<'_>,
+        bottom: f64,
+        scratch: &mut PaginationScratch,
+    ) -> f64 {
+        // Reuse the actual forward cuts, including nested table/keep rules.
+        // An independent backwards estimate can start after an undisplayed
+        // interval when the forward compositor moves a nested row whole.
+        let cursor = group.cursors().start;
+        let cuts = scratch.continuation_cuts.entry(cursor)
+            .or_insert_with(|| vec![group.point().y]);
+        let index = cuts.partition_point(|top| *top < bottom - 0.01);
+        let mut top = cuts[index.saturating_sub(1)];
+        if index < cuts.len() { return top; }
+        let mut buffer = Vec::new();
+        loop {
+            // Replay only the previously unknown suffix, without producing paint.
+            let page = self.forward_page(cursor, top, None, buffer, scratch, false);
+            let next = page.next_start_offset_y;
+            if next > top + 0.01 && !page.reached_end {
+                let cuts = scratch.continuation_cuts.get_mut(&cursor).expect("group cuts");
+                if cuts.last().is_none_or(|last| next > *last + 0.01) { cuts.push(next); }
+            }
+            if page.reached_end || next >= bottom - 0.01 || next <= top + 0.01 {
+                return top;
+            }
+            top = next;
+            buffer = page.positions.into_buffer();
+        }
+    }
+
+    /// Restored offsets and continuations can address the interior of a group.
+    /// Ordinary cursor navigation avoids this geometric lookup entirely.
+    fn oversized_at(&self, offset: f64, include_end: bool) -> Option<(usize, f64, f64)> {
+        let lines = self.pagination();
+        lines.groups(0..lines.len()).find_map(|group| {
+            let top = group.point().y;
+            let bottom = top + group.height();
+            (offset > top + 0.01
+                && (if include_end { offset <= bottom + 0.01 } else { offset < bottom - 0.01 })
+                && can_fragment(self.doc, &group, self.layout.size.height))
+                .then_some((group.cursors().start, top, bottom))
+        })
     }
 
     /// Append reading fragments across successive pages, preserving whole words
@@ -445,12 +718,11 @@ impl<'a> Paginator<'a> {
         // reading remains available directly from the document's source range.
         if self.layout.size.height <= 0.0 || self.layout.col_count <= 0.0 {
             let end = range.end;
-            fragments.extend(reading_queries::reading_page(reading, range, end).fragments);
+            fragments.extend(reading.reading_page(range, end).fragments);
             return;
         }
-        let rendered_pagination = pagination_queries::render_view_pagination(self.doc);
         let mut scratch = PaginationScratch::default();
-        let (offset, mut cursor) = match origin {
+        let (mut offset, mut cursor) = match origin {
             ReadingOrigin::Document => (
                 text.lines()
                     .first()
@@ -462,7 +734,7 @@ impl<'a> Paginator<'a> {
             ReadingOrigin::Offset(offset) => (offset, None),
         };
         let mut consumed = range.start;
-        for _ in 0..text.lines().len().max(1) {
+        loop {
             let request = cursor.map_or(
                 PageRequest::StartingAtOffset(offset),
                 PageRequest::StartingAt,
@@ -474,19 +746,20 @@ impl<'a> Paginator<'a> {
                 .filter_map(|(index, _)| text.line(index).map(|line| line.end()))
                 .max()
                 .unwrap_or(consumed);
-            let result = reading_queries::reading_page(reading, consumed..range.end, end);
+            let result = reading.reading_page(consumed..range.end, end);
             fragments.extend(result.fragments);
             consumed = result.next;
             if consumed >= range.end || page.reached_end {
                 break;
             }
-            let Some(next) = page.last_line.and_then(|cursor| cursor.checked_add(1)) else {
+            let Some(next) = self.next_page_anchor(Some(&page), offset) else {
                 break;
             };
-            if next <= page.start_line || next >= rendered_pagination.len() {
+            if next.cursor == cursor && next.offset_y <= offset + 0.01 {
                 break;
             }
-            cursor = Some(next);
+            cursor = next.cursor;
+            offset = next.offset_y;
         }
     }
 
@@ -496,18 +769,24 @@ impl<'a> Paginator<'a> {
         end_line: usize,
         scratch: &mut PaginationScratch,
     ) {
-        let mut structure = scratch.structure.for_lines(
+        let mut structure = scratch.structure.for_page(
             self.doc,
             start_line.saturating_sub(1)..end_line.saturating_add(2),
+            self.layout.size.height,
         );
         scratch.events.tables.clear();
         if self.book_optimized {
             scratch.events.tables.extend_from_slice(
                 structure.table_dependencies(HeaderPolicy::InferLeadingHeaderCells),
             );
+        } else {
+            scratch.events.tables.extend(
+                structure.table_dependencies(HeaderPolicy::InferLeadingHeaderCells).iter().copied()
+                    .filter(|event| matches!(event.kind, TablePaginationEventKind::RowGroup { header: Some(header), .. } if header.reserved)),
+            );
         }
         scratch.events.forced_breaks.clear();
-        scratch.keep_context.prepare(self.doc, &structure);
+        scratch.keep_context.prepare(&structure, self.doc);
         self.forced_break_events(
             &structure,
             &scratch.keep_context,
@@ -516,6 +795,10 @@ impl<'a> Paginator<'a> {
             &mut scratch.merged_forced_breaks,
         );
         scratch.events.keeps.clear();
+        // Floats participate in the same source cuts as their wrapped text.
+        // Being floated is not an implicit break-inside:avoid constraint.
+        // Authored keeps, figure keeps and whole-table preferences are retained
+        // by the structural events below.
         self.automatic_keep_events(
             &mut scratch.events.keeps,
             &mut scratch.semantic_ranges,
@@ -531,28 +814,74 @@ impl<'a> Paginator<'a> {
         positions: Vec<LineScreen>,
         scratch: &mut PaginationScratch,
     ) -> PagePositions {
+        self.page_from_line_until_with_scratch(start_line, start_offset_y, None, positions, scratch)
+    }
+
+    fn page_from_line_until_with_scratch(
+        &self,
+        start_line: usize,
+        start_offset_y: f64,
+        end_offset_y: Option<f64>,
+        positions: Vec<LineScreen>,
+        scratch: &mut PaginationScratch,
+    ) -> PagePositions {
+        self.forward_page(start_line, start_offset_y, end_offset_y, positions, scratch, true)
+    }
+
+    fn forward_page(
+        &self,
+        start_line: usize,
+        start_offset_y: f64,
+        end_offset_y: Option<f64>,
+        positions: Vec<LineScreen>,
+        scratch: &mut PaginationScratch,
+        paint: bool,
+    ) -> PagePositions {
+        self.prepare_cache(scratch);
         let probe_buffer = std::mem::take(&mut scratch.probe_positions);
         let probe = self.build_forward_positions(
             start_line,
             start_offset_y,
+            end_offset_y,
             probe_buffer,
             &[],
             &[],
             &[],
             None,
+            &mut scratch.slices,
+            false,
         );
         let end_line = probe.last_line.unwrap_or(probe.start_line);
         scratch.probe_positions = probe.positions.into_buffer();
         self.events_for_lines(probe.start_line, end_line, scratch);
-        self.build_forward_positions(
+        let page = self.build_forward_positions(
             start_line,
             start_offset_y,
+            end_offset_y,
             positions,
             &scratch.events.tables,
             &scratch.events.forced_breaks,
             &scratch.events.keeps,
             Some(&mut scratch.vertical_rhythm),
-        )
+            &mut scratch.slices,
+            paint,
+        );
+        if end_offset_y.is_none()
+            && let Some((cursor, next)) = page.continuation
+            && cursor == start_line
+            && let Some(position) = self.pagination().locate(PaginationTarget::Cursor(cursor))
+        {
+            let cuts = scratch.continuation_cuts.entry(cursor)
+                .or_insert_with(|| vec![position.group.point().y]);
+            // Only extend a known chain. An arbitrary restored offset does
+            // not define the canonical cuts preceding it.
+            if cuts.last().is_some_and(|last| (*last - start_offset_y).abs() <= 0.01)
+                && next > start_offset_y + 0.01
+            {
+                cuts.push(next);
+            }
+        }
+        page
     }
 
     fn keep_range_event(
@@ -562,7 +891,8 @@ impl<'a> Paginator<'a> {
         bottom: f64,
     ) -> Option<KeepRangeEvent> {
         (bottom > top + 0.01).then_some(KeepRangeEvent {
-            trigger_line: pagination_queries::render_view_pagination(self.doc)
+            trigger_line: self
+                .pagination()
                 .groups(trigger_line..trigger_line.saturating_add(1))
                 .next()?
                 .cursors()
@@ -579,8 +909,7 @@ impl<'a> Paginator<'a> {
         context: &KeepContext,
         range_lines: &mut Vec<usize>,
     ) {
-        let root = self.doc;
-        let lines = pagination_queries::render_view_pagination(root);
+        let lines = self.pagination();
         for block in &context.blocks {
             let constraints = &block.constraints;
             let point = block.bounds.origin();
@@ -601,39 +930,27 @@ impl<'a> Paginator<'a> {
                 events.push(event);
             }
 
-            if constraints.owns_line_flow && range_lines.len() > 1 {
+            if constraints.owns_line_flow
+                && let Some(paragraph_lines) = context.paragraph_lines.get(&block.owner)
+                && paragraph_lines.len() > 1
+            {
                 for (count, from_end) in [(constraints.orphans, false), (constraints.widows, true)]
                 {
-                    let count = count.min(range_lines.len());
+                    let count = count.min(paragraph_lines.len());
                     if count <= 1 {
                         continue;
                     }
                     let selected = if from_end {
-                        &range_lines[range_lines.len() - count..]
+                        &paragraph_lines[paragraph_lines.len() - count..]
                     } else {
-                        &range_lines[..count]
+                        &paragraph_lines[..count]
                     };
-                    let group_top = selected
-                        .iter()
-                        .filter_map(|&line_idx| {
-                            lines
-                                .locate(PaginationTarget::Cursor(line_idx))
-                                .map(|position| position.line)
-                                .map(|line| line.point().y)
-                        })
+                    let group_top = selected.iter().map(|entry| entry.1)
                         .fold(f64::INFINITY, f64::min);
-                    let group_bottom = selected
-                        .iter()
-                        .filter_map(|&line_idx| {
-                            lines
-                                .locate(PaginationTarget::Cursor(line_idx))
-                                .map(|position| position.line)
-                                .map(|line| line.point().y + line.height())
-                        })
+                    let group_bottom = selected.iter().map(|entry| entry.2)
                         .fold(f64::NEG_INFINITY, f64::max);
-                    if let Some(&trigger_line) = selected.iter().min()
-                        && let Some(event) =
-                            self.keep_range_event(trigger_line, group_top, group_bottom)
+                    if let Some(&(trigger_line, _, _)) = selected.first()
+                        && let Some(event) = self.keep_range_event(trigger_line, group_top, group_bottom)
                     {
                         events.push(event);
                     }
@@ -682,7 +999,7 @@ impl<'a> Paginator<'a> {
         }
 
         if self.book_optimized {
-            semantic_keeps::semantic_keep_ranges(self.doc, semantic_ranges, context, range_lines);
+            semantic_keeps::semantic_keep_ranges(lines, semantic_ranges, context, range_lines);
             events.extend(
                 semantic_ranges
                     .iter()
@@ -797,18 +1114,14 @@ impl Paginator<'_> {
         indexes.clear();
         let mut candidates = Vec::new();
         for (top, bottom) in merged {
-            fragment_paint::block_decoration_indices_intersecting(
-                self.doc.fragments(),
-                top,
-                bottom,
-                &mut candidates,
-            );
+            (self.doc.fragments()).block_decoration_indices_intersecting(top, bottom, &mut candidates);
             indexes.extend_from_slice(&candidates);
         }
         // Scene replay restores CSS order after combining the source windows.
         indexes.sort_unstable();
         indexes.dedup();
     }
+
 
     fn build_backward_positions(
         &self,
@@ -818,7 +1131,8 @@ impl Paginator<'_> {
         events: Option<&PaginationEvents>,
         scratch: &mut PaginationScratch,
     ) -> PagePositions {
-        let lines = pagination_queries::render_view_pagination(self.doc);
+        self.prepare_cache(scratch);
+        let lines = self.pagination();
         let Some(end_data) = lines.groups(0..end_line.saturating_add(1)).next_back() else {
             return PagePositions {
                 request: PageRequest::StartingAtOffset(0.0),
@@ -830,8 +1144,11 @@ impl Paginator<'_> {
                 offset_breaks: Vec::new(),
                 repeated_table_headers: Vec::new(),
                 block_decoration_indices: Some(Vec::new()),
+                flow_placements: Default::default(),
+                table_fragments: Default::default(),
                 reached_end: true,
                 next_start_offset_y: 0.0,
+                continuation: None,
             };
         };
         let end_height = end_data.height();
@@ -839,6 +1156,7 @@ impl Paginator<'_> {
         let mut render_state = initial_render_state();
         let mut reversed = std::mem::take(&mut scratch.reverse_positions);
         reversed.clear();
+        let mut repeated_table_headers = Vec::new();
 
         let reverse_range = |top: f64, bottom: f64| (end_bottom - bottom, end_bottom - top);
         let range_trigger = |top: f64, bottom: f64| {
@@ -880,9 +1198,10 @@ impl Paginator<'_> {
                         TablePaginationEventKind::WholeTable => {
                             TablePaginationEventKind::WholeTable
                         }
-                        TablePaginationEventKind::RowGroup { forced, .. } => {
+                        TablePaginationEventKind::RowGroup { forced, allow_content_break, .. } => {
                             TablePaginationEventKind::RowGroup {
                                 forced,
+                                allow_content_break,
                                 header: None,
                             }
                         }
@@ -895,10 +1214,16 @@ impl Paginator<'_> {
             .groups(minimum_line..end_line.saturating_add(1))
             .rev()
             .peekable();
-        while let Some(line) = groups.next() {
+        let mut first_slice = None;
+        let mut reverse_breaks: Vec<(f64, f64)> = Vec::new();
+        'groups: while let Some(line) = groups.next() {
             let line_idx = line.cursors().end - 1;
             let effective_height = line.height();
             let reverse_y = (end_bottom - (line.point().y + effective_height)).max(0.0);
+            let oversized = scratch.slices.groups.contains_key(&line.cursors().start)
+                || can_fragment(self.doc, &line, self.layout.size.height);
+            render_state.y_offset = reverse_breaks.iter().filter(|(at, _)| *at <= reverse_y + 0.01)
+                .max_by(|a, b| a.0.total_cmp(&b.0)).map_or(0.0, |(_, offset)| *offset);
 
             if line_idx < end_line
                 && let Some(forced) = events.and_then(|events| {
@@ -921,30 +1246,90 @@ impl Paginator<'_> {
             }
             for event in reverse_keeps
                 .iter()
-                .filter(|event| event.trigger_line == line_idx)
+                .filter(|event| event.trigger_line == line_idx
+                    && (!oversized || event.top <= reverse_y + 0.01))
             {
                 apply_keep_range_event(&self.layout, *event, 0.0, &mut render_state);
             }
             for event in reverse_tables
                 .iter()
-                .filter(|event| event.trigger_line == line_idx)
+                .filter(|event| event.trigger_line == line_idx
+                    && (!oversized || event.top <= reverse_y + 0.01))
             {
                 let _ = apply_table_pagination_event(&self.layout, *event, 0.0, &mut render_state);
             }
 
-            let oversized = effective_height > self.layout.size.height;
-            let fit_height = if oversized {
-                self.layout.size.height
-            } else {
-                effective_height
-            };
-            // Positioned groups can overlap in source coordinates. A group
-            // fitted to a whole column must start in an unoccupied column.
-            if oversized && !reversed.is_empty() {
-                let projected = reverse_y + render_state.y_offset;
-                let next_column = (render_state.col_index + 1.0) * self.layout.size.height;
-                render_state.y_offset += (next_column - projected).max(0.0);
+            reverse_breaks.push((reverse_y, render_state.y_offset));
+            if oversized {
+                let source = scratch.slices.group(self.doc, &line);
+                let mut visible_members = Vec::new();
+                let mut slice_bottom = line.point().y + effective_height;
+                while slice_bottom > line.point().y + 0.01 {
+                    let reverse_top = end_bottom - slice_bottom;
+                    let mut limit = (reverse_top + self.layout.size.height).min(end_bottom - line.point().y);
+                    for (top, bottom) in reverse_keeps.iter().filter(|event| event.trigger_line == line_idx)
+                        .map(|event| (event.top, event.bottom))
+                        .chain(reverse_tables.iter().filter(|event| event.trigger_line == line_idx)
+                            .filter(|event| matches!(event.kind, TablePaginationEventKind::WholeTable
+                                | TablePaginationEventKind::RowGroup { allow_content_break: false, .. }))
+                            .map(|event| (event.top, event.bottom)))
+                    {
+                        if top > reverse_top + 0.01 && top < limit - 0.01
+                            && bottom > limit + 0.01 && bottom - top <= self.layout.size.height + 0.01
+                        { limit = top; }
+                    }
+                    if let Some(events) = events {
+                        for event in &events.forced_breaks {
+                            let at = end_bottom - event.top;
+                            if at > reverse_top + 0.01 && at < limit - 0.01 { limit = at; }
+                        }
+                    }
+                    let slice_top = content_break(&source.spans, slice_bottom, end_bottom - limit, false);
+                    let slice_height = slice_bottom - slice_top;
+                    let (reverse_point, next_state) = resolve_point_at(
+                        &self.layout,
+                        Point::new(line.point().x, end_bottom - slice_bottom),
+                        slice_height,
+                        render_state,
+                        0.0,
+                    );
+                    render_state = next_state;
+                    reverse_breaks.push((reverse_top, render_state.y_offset));
+                    let Some(reverse_point) = reverse_point else { break 'groups };
+                    let column = (self.layout.col_count as i32 - 1 - render_state.col_index as i32).max(0);
+                    let top = self.layout.size.height - reverse_point.y - slice_height;
+                    visible_members.clear();
+                    source.members.intersecting(slice_top, slice_bottom, &mut visible_members);
+                    visible_members.sort_unstable();
+                    visible_members.dedup();
+                    for &cursor in visible_members.iter().rev() {
+                        let cursor = cursor as usize;
+                        let Some(member) = lines.locate(PaginationTarget::Cursor(cursor)).map(|position| position.line) else { continue };
+                        reversed.push((cursor, LineScreen {
+                            point: Point::new(
+                                page_placements::col_x(&self.layout, column as f64, member.point().x),
+                                top + member.point().y - slice_top,
+                            ),
+                            col_index: column,
+                            visible_y: Some((top, top + slice_height)),
+                        }));
+                    }
+                    first_slice = Some((line.cursors().start, slice_top));
+                    slice_bottom = slice_top;
+                    if events.is_some_and(|events| events.forced_breaks.iter().any(|event|
+                        matches!(event.kind, RenderForcedBreak::Page)
+                            && (event.top - slice_bottom).abs() <= 0.01))
+                    {
+                        break 'groups;
+                    }
+                    if slice_bottom > line.point().y + 0.01 {
+                        render_state.y_offset += self.layout.size.height - reverse_point.y - slice_height;
+                        reverse_breaks.push((end_bottom - slice_bottom, render_state.y_offset));
+                    }
+                }
+                continue;
             }
+            let fit_height = effective_height.min(self.layout.size.height);
             let (reverse_point, next_state) = resolve_point_at(
                 &self.layout,
                 kurbo::Point::new(line.point().x, reverse_y),
@@ -953,6 +1338,7 @@ impl Paginator<'_> {
                 0.0,
             );
             render_state = next_state;
+            reverse_breaks.push((reverse_y, render_state.y_offset));
             let Some(reverse_point) = reverse_point else {
                 break;
             };
@@ -962,91 +1348,116 @@ impl Paginator<'_> {
                 page_placements::col_x(&self.layout, col_index as f64, line.point().x),
                 (self.layout.size.height - reverse_point.y - fit_height).max(0.0),
             );
+            for header in reserved_headers(events, line.cursors()) {
+                repeated_table_headers.push(RepeatedTableHeader {
+                    source_left: header.left,
+                    source_right: header.right,
+                    source_top: header.top,
+                    source_bottom: header.bottom,
+                    col_index,
+                });
+            }
             for (cursor, member) in line.cursors().rev().zip(line.lines().rev()) {
                 reversed.push((
                     cursor,
                     LineScreen {
                         point: point + (member.point() - line.point()),
                         col_index,
+                        visible_y: None,
                     },
                 ));
             }
-            if oversized {
-                if render_state.col_index + 1.0 >= self.layout.col_count {
-                    break;
-                }
-                let Some(previous_group) = groups.peek() else {
-                    break;
-                };
-                let gap = (line.point().y - (previous_group.point().y + previous_group.height()))
-                    .max(0.0);
-                let previous_y =
-                    (end_bottom - (previous_group.point().y + previous_group.height())).max(0.0);
-                render_state.y_offset =
-                    (render_state.col_index + 1.0) * self.layout.size.height + gap - previous_y;
-            }
+
         }
 
         reversed.reverse();
-        let start_line = reversed.first().map_or(end_line, |(line_idx, _)| *line_idx);
-        let paint_start_offset_y = lines
+        let start_line = reversed.first().map_or(end_line, |(line_idx, _)| {
+            lines.locate(PaginationTarget::Cursor(*line_idx))
+                .map_or(*line_idx, |position| position.group.cursors().start)
+        });
+        let mut paint_start_offset_y = lines
             .locate(PaginationTarget::Cursor(start_line))
-            .map(|position| position.line)
-            .map_or(0.0, |line| line.point().y);
+            .map_or(0.0, |position| position.group.point().y);
+        if let Some((cursor, top)) = first_slice
+            && cursor == start_line
+        {
+            paint_start_offset_y = top;
+        }
         let mut visible = page_placements::with_buffer(start_line, positions);
-        let mut offset_breaks = Vec::new();
+        let mut offset_breaks: Vec<(f64, f64)> = Vec::new();
         let mut previous_offset: Option<f64> = None;
         for (line_idx, screen) in reversed.drain(..) {
-            let line = lines
+            let position = lines
                 .locate(PaginationTarget::Cursor(line_idx))
-                .map(|position| position.line)
                 .expect("positioned reverse line must exist");
+            let group_y = position.group.point().y;
+            let line = position.line;
             let offset = screen.point.y
                 + screen.col_index as f64 * self.layout.size.height
                 + paint_start_offset_y
                 - line.point().y;
             if previous_offset.is_none_or(|previous| (previous - offset).abs() > 1e-6) {
-                offset_breaks.push((line.point().y, offset));
+                offset_breaks.push((group_y, offset));
                 previous_offset = Some(offset);
             }
-            page_placements::push(&mut visible, line.id(), screen);
+            page_placements::push_fragment(&mut visible, line.id(), screen);
         }
+        offset_breaks.sort_by(|left, right| left.0.total_cmp(&right.0));
         let mut block_decoration_indices = Vec::new();
-        self.prepare_visible_block_decorations(
-            paint_start_offset_y,
-            &visible,
-            &mut block_decoration_indices,
-        );
+        if events.is_some() {
+            self.prepare_visible_block_decorations(
+                paint_start_offset_y,
+                &visible,
+                &mut block_decoration_indices,
+            );
+        }
         scratch.reverse_positions = reversed;
         scratch.reverse_keeps = reverse_keeps;
         scratch.reverse_tables = reverse_tables;
         let next_group = lines.groups(end_line.saturating_add(1)..lines.len()).next();
-        PagePositions {
-            request: PageRequest::EndingAt(end_line),
+        let mut page = PagePositions {
+            request: if first_slice.is_some_and(|(cursor, top)| cursor == start_line
+                && lines.locate(PaginationTarget::Cursor(cursor))
+                    .is_some_and(|position| top > position.group.point().y + 0.01))
+            {
+                PageRequest::StartingAtOffset(paint_start_offset_y)
+            } else {
+                PageRequest::EndingAt(end_line)
+            },
             geometry: self.layout,
             paint_start_offset_y,
             start_line,
             last_line: (!visible.is_empty()).then_some(end_line),
             positions: visible,
             offset_breaks,
-            repeated_table_headers: Vec::new(),
+            repeated_table_headers,
             block_decoration_indices: Some(block_decoration_indices),
+            flow_placements: Default::default(),
+            table_fragments: Default::default(),
             reached_end: next_group.is_none(),
             next_start_offset_y: next_group.map_or(end_bottom, |group| group.point().y),
-        }
+            continuation: None,
+        };
+        if events.is_none() { return page; }
+        super::table_fragments::finish(self.doc, &mut page);
+        super::projection::compose_box_fragments(self.doc, &mut page);
+        page
     }
-
     fn build_forward_positions(
         &self,
         start_line: usize,
         start_offset_y: f64,
+        end_offset_y: Option<f64>,
         positions: Vec<LineScreen>,
         table_events: &[TablePaginationEvent],
         forced_break_events: &[ForcedBreakEvent],
         keep_events: &[KeepRangeEvent],
         rhythm_scratch: Option<&mut VerticalRhythmScratch>,
+        slices: &mut SliceCache,
+        paint: bool,
     ) -> PagePositions {
-        let lines = pagination_queries::render_view_pagination(self.doc);
+        let lines = self.pagination();
+        let requested_offset_y = start_offset_y;
         let mut table_event_idx =
             table_events.partition_point(|event| event.trigger_line < start_line);
         let mut forced_break_event_idx =
@@ -1054,21 +1465,47 @@ impl Paginator<'_> {
         let mut keep_event_idx =
             keep_events.partition_point(|event| event.trigger_line < start_line);
         let mut positions = page_placements::with_buffer(start_line, positions);
-        let mut offset_breaks = Vec::new();
+        let mut offset_breaks: Vec<(f64, f64)> = Vec::new();
         let mut repeated_table_headers = Vec::new();
         let mut render_state = initial_render_state();
         let mut last_line: Option<usize> = None;
         let mut next_start_offset_y = start_offset_y;
+        let mut continuation = None;
+        let mut sliced_content = false;
         let mut groups = lines.groups(start_line..lines.len()).peekable();
         while let Some(line) = groups.next() {
             let line_idx = line.cursors().start;
+            let header_start = repeated_table_headers.len();
+            let oversized = slices.groups.contains_key(&line.cursors().start)
+                || can_fragment(self.doc, &line, self.layout.size.height);
+            // A previously visited container can have scheduled cuts below
+            // this group's source origin. Those future offsets do not apply
+            // to parallel text beside the container.
+            render_state.y_offset = offset_breaks.iter()
+                .filter(|(at, _)| *at <= line.point().y.max(start_offset_y) + 0.01)
+                .max_by(|a, b| a.0.total_cmp(&b.0))
+                .map_or(0.0, |(_, offset)| *offset);
+
+            if line.point().y < start_offset_y - 0.01 && line.height() > self.layout.size.height {
+                // The group's start rules were applied on its first fragment.
+                forced_break_event_idx = forced_break_events.partition_point(|event| event.trigger_line <= line_idx);
+                keep_event_idx = keep_events.partition_point(|event| event.trigger_line <= line_idx);
+                table_event_idx = table_events.partition_point(|event| event.trigger_line <= line_idx);
+            }
             while forced_break_events
                 .get(forced_break_event_idx)
                 .is_some_and(|event| event.trigger_line == line_idx)
             {
+                // Nested constraints belong to their source boundary, not to
+                // the first cursor of the enclosing oversized group.
+                if oversized && forced_break_events[forced_break_event_idx].top > line.point().y + 0.01 {
+                    forced_break_event_idx += 1;
+                    continue;
+                }
                 let previous_offset = render_state.y_offset;
-                let previous_line =
-                    last_line.and_then(|line_idx| page_placements::at_cursor(&positions, line_idx));
+                let previous_line = last_line
+                    .and_then(|cursor| lines.locate(PaginationTarget::Cursor(cursor)))
+                    .and_then(|position| positions.fragments(position.line.id()).last());
                 apply_forced_break_event(
                     &self.layout,
                     forced_break_events[forced_break_event_idx],
@@ -1088,6 +1525,12 @@ impl Paginator<'_> {
                 .get(keep_event_idx)
                 .is_some_and(|event| event.trigger_line == line_idx)
             {
+                // Nested constraints belong to their source boundary, not to
+                // the first cursor of the enclosing oversized group.
+                if oversized && keep_events[keep_event_idx].top > line.point().y + 0.01 {
+                    keep_event_idx += 1;
+                    continue;
+                }
                 let previous_offset = render_state.y_offset;
                 apply_keep_range_event(
                     &self.layout,
@@ -1104,6 +1547,12 @@ impl Paginator<'_> {
                 .get(table_event_idx)
                 .is_some_and(|event| event.trigger_line == line_idx)
             {
+                // Nested constraints belong to their source boundary, not to
+                // the first cursor of the enclosing oversized group.
+                if oversized && table_events[table_event_idx].top > line.point().y + 0.01 {
+                    table_event_idx += 1;
+                    continue;
+                }
                 let previous_offset = render_state.y_offset;
                 if let Some(repeated_header) = apply_table_pagination_event(
                     &self.layout,
@@ -1119,24 +1568,99 @@ impl Paginator<'_> {
                 table_event_idx += 1;
             }
             let effective_height = line.height();
-            let oversized = effective_height > self.layout.size.height;
-            // An indivisible line taller than a column can never satisfy the
-            // normal fit check. Fit it as one column-high atomic item so a
-            // fresh page can always make progress; viewport clipping handles
-            // the excess paint below the column.
-            let fit_height = if oversized {
-                self.layout.size.height
-            } else {
-                effective_height
-            };
-            let previous_offset = render_state.y_offset;
-            // Positioned groups can overlap in source coordinates. A group
-            // fitted to a whole column must start in an unoccupied column.
-            if oversized && last_line.is_some() {
-                let projected = line.point().y + render_state.y_offset - start_offset_y;
-                let next_column = (render_state.col_index + 1.0) * self.layout.size.height;
-                render_state.y_offset += (next_column - projected).max(0.0);
+            if oversized {
+                sliced_content = true;
+                let group_bottom = line.point().y + effective_height;
+                let bottom = end_offset_y.map_or(group_bottom, |end| end.min(group_bottom));
+                let source = slices.group(self.doc, &line);
+                let mut visible_members = Vec::new();
+                let mut slice_top = line.point().y.max(start_offset_y);
+                while slice_top < bottom - 0.01 {
+                    let mut limit = (slice_top + self.layout.size.height).min(bottom);
+                    for event in forced_break_events.iter().filter(|event| event.trigger_line == line_idx) {
+                        if event.top > slice_top + 0.01 && event.top < limit - 0.01 { limit = event.top; }
+                    }
+                    for (top, end) in keep_events.iter().filter(|event| event.trigger_line == line_idx)
+                        .map(|event| (event.top, event.bottom))
+                        .chain(table_events.iter().filter(|event| event.trigger_line == line_idx)
+                            .filter(|event| matches!(event.kind, TablePaginationEventKind::WholeTable
+                                | TablePaginationEventKind::RowGroup { allow_content_break: false, .. }))
+                            .map(|event| (event.top, event.bottom)))
+                    {
+                        if top > slice_top + 0.01 && top < limit - 0.01
+                            && end > limit + 0.01 && end - top <= self.layout.size.height + 0.01
+                        { limit = top; }
+                    }
+                    let slice_bottom = content_break(&source.spans, slice_top, limit, true);
+                    let slice_height = slice_bottom - slice_top;
+                    let previous_offset = render_state.y_offset;
+                    let (point, next_state) = resolve_point_at(
+                        &self.layout,
+                        Point::new(line.point().x, slice_top),
+                        slice_height,
+                        render_state,
+                        start_offset_y,
+                    );
+                    render_state = next_state;
+                    let Some(point) = point else {
+                        continuation = Some((line_idx, slice_top));
+                        next_start_offset_y = slice_top;
+                        break;
+                    };
+                    if (render_state.y_offset - previous_offset).abs() > 1e-6 {
+                        offset_breaks.push((slice_top, render_state.y_offset));
+                    }
+                    // A source line can paint in several columns. Each mapping
+                    // is clipped to its column by the shared page projection.
+                    visible_members.clear();
+                    source.members.intersecting(slice_top, slice_bottom, &mut visible_members);
+                    visible_members.sort_unstable();
+                    visible_members.dedup();
+                    for &cursor in &visible_members {
+                        let Some(member) = lines.locate(PaginationTarget::Cursor(cursor as usize)).map(|position| position.line) else { continue };
+                        let screen = LineScreen {
+                            point: point + (member.point() - Point::new(line.point().x, slice_top)),
+                            col_index: render_state.col_index as i32,
+                            visible_y: Some((point.y, point.y + slice_height)),
+                        };
+                        page_placements::push_fragment(&mut positions, member.id(), screen);
+                    }
+                    last_line = line.cursors().end.checked_sub(1);
+                    slice_top += slice_height;
+                    let page_break = forced_break_events.iter().any(|event|
+                        event.trigger_line == line_idx
+                            && matches!(event.kind, RenderForcedBreak::Page)
+                            && (event.top - slice_top).abs() <= 0.01);
+                    if page_break {
+                        // A page break skips every remaining column, including
+                        // when the forced boundary coincides with a natural cut.
+                        render_state.y_offset = self.layout.col_count * self.layout.size.height
+                            + start_offset_y - slice_top;
+                        offset_breaks.push((slice_top, render_state.y_offset));
+                    } else if slice_top < bottom - 0.01 {
+                        render_state.y_offset += self.layout.size.height - point.y - slice_height;
+                        offset_breaks.push((slice_top, render_state.y_offset));
+                    }
+                }
+                if bottom < group_bottom - 0.01 && continuation.is_none() {
+                    continuation = Some((line_idx, bottom));
+                    next_start_offset_y = bottom;
+                    render_state.should_stop = true;
+                }
+                if continuation.is_some() {
+                    break;
+                }
+                if end_offset_y.is_some_and(|end| bottom >= end - 0.01) {
+                    if let Some(next) = groups.peek() {
+                        render_state.should_stop = true;
+                        next_start_offset_y = next.point().y;
+                    }
+                    break;
+                }
+                continue;
             }
+            let fit_height = effective_height.min(self.layout.size.height);
+            let previous_offset = render_state.y_offset;
             let (point, next_state) = resolve_point_at(
                 &self.layout,
                 line.point(),
@@ -1149,32 +1673,23 @@ impl Paginator<'_> {
                 offset_breaks.push((line.point().y, render_state.y_offset));
             }
             if let Some(point) = point {
+                for header in &mut repeated_table_headers[header_start..] {
+                    header.col_index = render_state.col_index as i32;
+                }
                 for member in line.lines() {
-                    page_placements::push(
-                        &mut positions,
-                        member.id(),
-                        LineScreen {
-                            point: point + (member.point() - line.point()),
-                            col_index: render_state.col_index as i32,
-                        },
-                    );
+                    let screen = LineScreen {
+                        point: point + (member.point() - line.point()),
+                        col_index: render_state.col_index as i32,
+                        visible_y: None,
+                    };
+                    page_placements::push(&mut positions, member.id(), screen);
                 }
                 last_line = line.cursors().end.checked_sub(1);
 
-                if oversized && let Some(next_line) = groups.peek() {
-                    let gap_after =
-                        (next_line.point().y - (line.point().y + effective_height)).max(0.0);
-                    let next_page_y =
-                        (render_state.col_index + 1.0) * self.layout.size.height + gap_after;
-                    render_state.y_offset = next_page_y + start_offset_y - next_line.point().y;
-                    if render_state.col_index + 1.0 >= self.layout.col_count {
-                        render_state.should_stop = true;
-                        next_start_offset_y = next_line.point().y;
-                        break;
-                    }
-                }
+
             }
             if render_state.should_stop {
+                repeated_table_headers.truncate(header_start);
                 next_start_offset_y = line.point().y;
                 break;
             }
@@ -1182,7 +1697,7 @@ impl Paginator<'_> {
         let reached_end = !render_state.should_stop;
         offset_breaks.sort_by(|left, right| left.0.total_cmp(&right.0));
         let mut page = PagePositions {
-            request: PageRequest::StartingAtOffset(start_offset_y),
+            request: PageRequest::StartingAtOffset(requested_offset_y),
             geometry: self.layout,
             paint_start_offset_y: start_offset_y,
             start_line,
@@ -1191,10 +1706,14 @@ impl Paginator<'_> {
             offset_breaks,
             repeated_table_headers,
             block_decoration_indices: Some(Vec::new()),
+            flow_placements: Default::default(),
+            table_fragments: Default::default(),
             reached_end,
             next_start_offset_y,
+            continuation,
         };
-        if self.vertical_rhythm
+        if !sliced_content
+            && self.vertical_rhythm
             && self.book_optimized
             && let Some(scratch) = rhythm_scratch
         {
@@ -1207,6 +1726,7 @@ impl Paginator<'_> {
             );
             self.apply_vertical_rhythm(&mut page, scratch);
         }
+        if !paint { return page; }
         self.prepare_visible_block_decorations(
             start_offset_y,
             &page.positions,
@@ -1214,17 +1734,21 @@ impl Paginator<'_> {
                 .as_mut()
                 .expect("composed page decorations"),
         );
+        super::table_fragments::finish(self.doc, &mut page);
+        super::projection::compose_box_fragments(self.doc, &mut page);
         page
     }
+
+
 }
 
 #[cfg(test)]
 mod tests {
-    use html_pipeline::engine::fragment_paint;
+    use html_pipeline::engine::LayoutRequest;
 
-    use html_pipeline::engine::{box_queries, text_paint};
 
-    use crate::text::{FontMetrics, GlyphRequest, ShapedGlyph};
+
+    use crate::text::{FontMetrics, ShapedRun, TextRunShapeRequest, ShapedGlyph};
 
     use super::*;
     use crate::text::{FontSlant, GlyphHandle, GlyphResourceGeneration, GlyphShaper};
@@ -1240,52 +1764,28 @@ mod tests {
     struct TestShaper {
         glyphs: HashMap<(char, u32), GlyphHandle>,
         generation: GlyphResourceGeneration,
-        append_checkpoint: Option<(HashMap<(char, u32), GlyphHandle>, GlyphResourceGeneration)>,
     }
 
     impl GlyphShaper for TestShaper {
-        fn reset(&mut self) {
-            self.glyphs.clear();
-            self.generation = GlyphResourceGeneration::default();
-        }
-
         fn resource_generation(&self) -> GlyphResourceGeneration {
             self.generation
         }
 
-        fn begin_append_shaping(&mut self) -> Result<(), crate::text::ShapeError> {
-            assert!(self.append_checkpoint.is_none());
-            self.append_checkpoint = Some((self.glyphs.clone(), self.generation.clone()));
-            Ok(())
-        }
-
-        fn commit_append_shaping(&mut self) {
-            self.append_checkpoint = None;
-        }
-
-        fn rollback_append_shaping(&mut self) {
-            if let Some((glyphs, glyph_store)) = self.append_checkpoint.take() {
-                self.glyphs = glyphs;
-                self.generation = glyph_store;
-            }
-        }
-
-        fn shape_glyph(
-            &mut self,
-            request: GlyphRequest<'_>,
-        ) -> Result<ShapedGlyph, crate::text::ShapeError> {
-            let key = (request.character, request.style.font_size.to_bits());
-            let advance = request.style.font_size * 0.5;
-            let metrics = FontMetrics {
-                ascent: request.style.font_size * 0.75,
-                descent: request.style.font_size * 0.25,
-            };
-            if let Some(&glyph) = self.glyphs.get(&key) {
-                return Ok(ShapedGlyph::new(glyph, advance, metrics));
-            }
-            let glyph = GlyphHandle(self.glyphs.len() as u32);
-            self.glyphs.insert(key, glyph);
-            Ok(ShapedGlyph::new(glyph, advance, metrics))
+        fn shape_run(&mut self, request: TextRunShapeRequest<'_>) -> ShapedRun {
+            ShapedRun::characters(request, |character, style| {
+                let key = (character, style.font_size.to_bits());
+                let advance = style.font_size * 0.5;
+                let metrics = FontMetrics {
+                    ascent: style.font_size * 0.75,
+                    descent: style.font_size * 0.25,
+                };
+                if let Some(&glyph) = self.glyphs.get(&key) {
+                    return ShapedGlyph::new(glyph, advance, metrics);
+                }
+                let glyph = GlyphHandle(self.glyphs.len() as u32);
+                self.glyphs.insert(key, glyph);
+                ShapedGlyph::new(glyph, advance, metrics)
+            })
         }
     }
 
@@ -1301,7 +1801,10 @@ mod tests {
             .shape(&mut shaper, resources)
             .expect("the test shaper registers every glyph")
             .layout(
-                LayoutConstraints::new(width, 16.0).expect("constraints must be valid"),
+                LayoutRequest::new(
+                    LayoutConstraints::new(width, 16.0).expect("constraints must be valid"),
+                ),
+                &mut shaper,
                 resources,
             )
             .expect("test layout succeeds")
@@ -1441,12 +1944,9 @@ mod tests {
                             line.point().x
                         )
                     );
-                    let content: String = text_paint::render_line_glyphs(&line)
+                    let content: String = line.glyphs()
                         .map(|glyph| {
-                            text_paint::glyph_metric(
-                                view.text(),
-                                text_paint::glyph_at(view.text(), glyph as usize).unwrap(),
-                            )
+                            (view.text()).glyph_metric((view.text()).glyph_at(glyph as usize).unwrap())
                             .unwrap()
                             .ch()
                         })
@@ -1522,22 +2022,22 @@ mod tests {
             );
             let view = document.render_view(&resources);
             let geometry = columns(200.0, 40.0, 1.0);
-            let item = (0..box_queries::len(view.boxes()))
+            let item = (0..(view.boxes()).len())
                 .map(layout_state::box_id_new)
-                .find(|&index| box_queries::tag(view.boxes(), index) == Some("li"))
+                .find(|&index| (view.boxes()).tag(index) == Some("li"))
                 .unwrap();
-            let marker_box = box_queries::list_marker(view.boxes(), item)
+            let marker_box = (view.boxes()).list_marker(item)
                 .unwrap()
                 .marker_box();
             let marker = view
                 .text()
                 .lines()
                 .iter()
-                .find(|line| text_paint::render_line_owner_box(&line) == marker_box)
+                .find(|line| line.owner_box() == marker_box)
                 .unwrap();
-            let source = pagination_queries::render_view_pagination(view)
+            let source = view.pagination()
                 .source_line(
-                    pagination_queries::render_view_pagination(view)
+                    view.pagination()
                         .locate(PaginationTarget::Line(marker.id()))
                         .map(|position| position.cursor)
                         .unwrap(),
@@ -1635,7 +2135,7 @@ mod tests {
             Vec::new(),
             &mut PaginationScratch::default(),
         );
-        let expected = text_paint::paint_order(document.render_view(&document_resources).text())
+        let expected = (document.render_view(&document_resources).text()).paint_order()
             .iter()
             .copied()
             .filter(|&line| page.positions.contains(line))
@@ -1669,26 +2169,22 @@ mod tests {
             &mut PaginationScratch::default(),
         );
         let fragments = document.render_view(&document_resources).fragments();
-        let expected = fragment_paint::block_decorations(fragments)
+        let expected = fragments.block_decorations()
             .iter()
             .filter(|decoration| decoration.rect().y0 < 100.0 && decoration.rect().y1 > 0.0)
             .map(|decoration| {
                 (
                     decoration.rect(),
-                    fragment_paint::decoration_color(&decoration),
+                    decoration.color(),
                 )
             })
             .collect::<Vec<_>>();
 
-        let actual = fragment_paint::paint_order_for(
-            fragments,
-            &[],
-            page.block_decoration_indices.as_deref().unwrap(),
-        )
+        let actual = fragments.paint_order_for(&[], page.block_decoration_indices.as_deref().unwrap())
         .filter_map(|item| match item {
             html_pipeline::engine::RenderPaintItem::Decoration(decoration) => Some((
                 decoration.rect(),
-                fragment_paint::decoration_color(&decoration),
+                decoration.color(),
             )),
             html_pipeline::engine::RenderPaintItem::Line(_) => None,
         })
@@ -1697,9 +2193,7 @@ mod tests {
         assert_eq!(actual, expected);
         assert!(
             actual.len()
-                < fragment_paint::render_decorations_len(&fragment_paint::block_decorations(
-                    fragments
-                )),
+                < (fragments.block_decorations()).len(),
             "off-page decorations stay out of the retained page traversal"
         );
     }
@@ -1950,7 +2444,7 @@ mod tests {
                 geometry,
                 PaginationMode::Book,
             );
-            let probe = paginator.build_forward_positions(0, 0.0, Vec::new(), &[], &[], &[], None);
+            let probe = paginator.build_forward_positions(0, 0.0, None, Vec::new(), &[], &[], &[], None, &mut super::SliceCache::default(), false);
             let mut structure = Structure::default();
             let anchors = structure.for_lines(
                 paginator.doc,

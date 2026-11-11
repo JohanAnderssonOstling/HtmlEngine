@@ -1,11 +1,11 @@
 //! Unicode/CSS wrap opportunities in logical source order. Preparation records
 //! decisions in retained wrap policies; layout still checks native clusters.
 
-use html_style_model::language;
 use super::get_style;
 use crate::{InlineContent, InlineItemKind, TextStructure, WhitespaceWrapOverride};
-use icu_segmenter::LineSegmenter;
+use html_style_model::language;
 use html_style_model::{ComputedStyles, ContentLanguage, LineBreak, StyleView, WordBreak};
+use icu_segmenter::LineSegmenter;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use unicode_linebreak::{BreakClass, break_property, linebreaks};
 use unicode_segmentation::UnicodeSegmentation;
@@ -28,14 +28,21 @@ pub fn is_cjk(character: char) -> bool {
 pub(super) fn needs_unicode_breaks(character: char) -> bool {
     is_cjk(character)
         || needs_contextual_breaks(character)
-        || (character != '\u{00ad}' && matches!(
-            break_property(character as u32),
-            BreakClass::BeforeAndAfter | BreakClass::After | BreakClass::Before
-                | BreakClass::Hyphen | BreakClass::WordJoiner
-                | BreakClass::NonBreakingGlue | BreakClass::ZeroWidthJoiner
-                | BreakClass::Symbol | BreakClass::RegionalIndicator
-                | BreakClass::EmojiBase | BreakClass::EmojiModifier
-        ))
+        || (character != '\u{00ad}'
+            && matches!(
+                break_property(character as u32),
+                BreakClass::BeforeAndAfter
+                    | BreakClass::After
+                    | BreakClass::Before
+                    | BreakClass::Hyphen
+                    | BreakClass::WordJoiner
+                    | BreakClass::NonBreakingGlue
+                    | BreakClass::ZeroWidthJoiner
+                    | BreakClass::Symbol
+                    | BreakClass::RegionalIndicator
+                    | BreakClass::EmojiBase
+                    | BreakClass::EmojiModifier
+            ))
 }
 
 /// UAX14 SA scripts require lexical analysis. Javanese's aksara rules were
@@ -108,23 +115,42 @@ impl Policy {
 }
 
 struct Character {
-    owner: usize,
+    run: usize,
     glyph: Option<usize>,
     byte: usize,
     character: char,
     class: BreakClass,
     letter: bool,
+}
+
+struct PolicyRun {
+    owner: usize,
     policy: Policy,
 }
 
 #[derive(Default)]
 struct Paragraph {
     text: String,
+    original: String,
     characters: Vec<Character>,
+    runs: Vec<PolicyRun>,
 }
 
 impl Paragraph {
-    fn push(&mut self, owner: usize, glyph: Option<usize>, character: char, policy: Policy) {
+    fn clear(&mut self) {
+        self.text.clear();
+        self.original.clear();
+        self.characters.clear();
+        self.runs.clear();
+    }
+
+    fn start_run(&mut self, owner: usize, policy: Policy) {
+        self.runs.push(PolicyRun { owner, policy });
+    }
+
+    fn push(&mut self, glyph: Option<usize>, character: char) {
+        let run = self.runs.len() - 1;
+        let policy = self.runs[run].policy;
         let class = class(character);
         let previous = self.characters.last();
         let letter = if matches!(
@@ -142,17 +168,22 @@ impl Paragraph {
                         | BreakClass::Ideographic
                 )
         };
-        let tailored = tailor(character, class, policy, previous);
+        let tailored = tailor(
+            character,
+            class,
+            policy,
+            previous.map(|entry| (entry, self.runs[entry.run].policy)),
+        );
         let byte = self.text.len();
         self.text.push(tailored);
+        self.original.push(character);
         self.characters.push(Character {
-            owner,
+            run,
             glyph,
             byte,
             character,
             class,
             letter,
-            policy,
         });
     }
 
@@ -164,22 +195,23 @@ impl Paragraph {
     ) {
         // Graphemes can span differently styled inline runs. Check the whole
         // logical paragraph as well as the backend's later cluster checks.
-        let original = self
-            .characters
-            .iter()
-            .map(|entry| entry.character)
-            .collect::<String>();
-        let mut graphemes = original.graphemes(true);
+        let mut graphemes = self.original.graphemes(true);
         let mut next_grapheme = 0;
         let mut opportunities = linebreaks(&self.text).peekable();
         // Construct the data-backed segmenter only for paragraphs containing
         // scripts that need it. This detects the script independently of lang,
         // so absent or incorrect language metadata cannot disable wrapping.
-        let contextual = self.characters.iter().any(|entry| needs_contextual_breaks(entry.character))
-            .then(|| LineSegmenter::new_auto(Default::default())
-                .segment_str(&self.text).collect::<FxHashSet<usize>>());
+        let segmenter = self
+            .characters
+            .iter()
+            .any(|entry| needs_contextual_breaks(entry.character))
+            .then(|| LineSegmenter::new_auto(Default::default()));
+        let mut contextual = segmenter
+            .as_ref()
+            .map(|segmenter| segmenter.segment_str(&self.text).peekable());
         let mut wrap_overrides = content.unicode_wrap_writer();
         for (index, current) in self.characters.iter().enumerate() {
+            let current_run = &self.runs[current.run];
             let boundary = index == next_grapheme;
             if boundary {
                 next_grapheme += graphemes
@@ -197,8 +229,8 @@ impl Paragraph {
                 current.character,
                 '\n' | '\u{200b}' | '\u{00ad}' | '\u{200c}' | '\u{200d}'
             ) || (matches!(current.character, ' ' | '\t')
-                && (current.policy.line_break != LineBreak::Anywhere
-                    || !current.policy.preserves_spaces))
+                && (current_run.policy.line_break != LineBreak::Anywhere
+                    || !current_run.policy.preserves_spaces))
             {
                 continue;
             }
@@ -206,21 +238,27 @@ impl Paragraph {
                 wrap_overrides.set(glyph, false);
                 continue;
             };
-            let anywhere = current.policy.line_break == LineBreak::Anywhere;
+            let previous_run = &self.runs[previous.run];
+            let anywhere = current_run.policy.line_break == LineBreak::Anywhere;
             let mut allowed = anywhere
-                || (previous.character != '\u{00ad}' && opportunities
-                    .peek()
-                    .is_some_and(|&(byte, _)| byte == current.byte));
+                || (previous.character != '\u{00ad}'
+                    && opportunities
+                        .peek()
+                        .is_some_and(|&(byte, _)| byte == current.byte));
             if !anywhere {
-                if current.policy.word_break != WordBreak::BreakAll
-                    && previous.policy.word_break != WordBreak::BreakAll
-                    && (needs_contextual_breaks(current.character) || needs_contextual_breaks(previous.character))
-                    && let Some(contextual) = &contextual
+                if current_run.policy.word_break != WordBreak::BreakAll
+                    && previous_run.policy.word_break != WordBreak::BreakAll
+                    && (needs_contextual_breaks(current.character)
+                        || needs_contextual_breaks(previous.character))
+                    && let Some(contextual) = &mut contextual
                 {
-                    allowed = contextual.contains(&current.byte);
+                    while contextual.peek().is_some_and(|&byte| byte < current.byte) {
+                        contextual.next();
+                    }
+                    allowed = contextual.peek() == Some(&current.byte);
                 }
-                if (current.policy.word_break == WordBreak::KeepAll
-                    || previous.policy.word_break == WordBreak::KeepAll)
+                if (current_run.policy.word_break == WordBreak::KeepAll
+                    || previous_run.policy.word_break == WordBreak::KeepAll)
                     && (is_cjk(current.character) || is_cjk(previous.character))
                     && current.letter
                     && previous.letter
@@ -230,31 +268,32 @@ impl Paragraph {
                 // Loose permits breaks *between* IN characters, rather than
                 // making an ellipsis generally eligible to start a line.
                 if current.class == BreakClass::Inseparable
-                    && current.policy.line_break == LineBreak::Loose
+                    && current_run.policy.line_break == LineBreak::Loose
                     && previous.class != BreakClass::Inseparable
                     && previous.class != BreakClass::Space
                 {
                     allowed = false;
                 }
             }
-            let supplied_by_space = previous.character == ' ' && !previous.policy.preserves_spaces;
+            let supplied_by_space =
+                previous.character == ' ' && !previous_run.policy.preserves_spaces;
             // A disappearing space supplies its own opportunity, controlled
             // by that space's style rather than the adjacent boxes' ancestor.
             let wraps = if supplied_by_space {
                 previous
                     .glyph
                     .is_some_and(|glyph| match wrap_overrides.get(glyph) {
-                        WhitespaceWrapOverride::Style => previous.policy.wraps,
+                        WhitespaceWrapOverride::Style => previous_run.policy.wraps,
                         WhitespaceWrapOverride::Allow | WhitespaceWrapOverride::UnicodeAllow => {
                             true
                         }
                         WhitespaceWrapOverride::Suppress
                         | WhitespaceWrapOverride::UnicodeSuppress => false,
                     })
-            } else if current.owner == previous.owner {
-                current.policy.wraps
+            } else if current_run.owner == previous_run.owner {
+                current_run.policy.wraps
             } else {
-                common_ancestor(tree, current.owner, previous.owner)
+                common_ancestor(tree, current_run.owner, previous_run.owner)
                     .is_some_and(|owner| get_style(styles, tree, owner).white_space().allows_wrap())
             };
             allowed &= boundary && wraps;
@@ -376,7 +415,7 @@ fn tailor(
     character: char,
     class: BreakClass,
     policy: Policy,
-    previous: Option<&Character>,
+    previous: Option<(&Character, Policy)>,
 ) -> char {
     let loose = policy.line_break == LineBreak::Loose;
     if iteration_mark(character) {
@@ -404,9 +443,9 @@ fn tailor(
             return '一';
         }
         if matches!(character, '\u{2010}' | '\u{2013}')
-            && previous.is_some_and(|previous| {
+            && previous.is_some_and(|(previous, previous_policy)| {
                 previous.class == BreakClass::Ideographic
-                    || (previous.policy.word_break == WordBreak::BreakAll && previous.letter)
+                    || (previous_policy.word_break == WordBreak::BreakAll && previous.letter)
             })
         {
             return '一';
@@ -439,29 +478,53 @@ pub fn resolve(
     if roots.is_empty() {
         return;
     }
-    let mut paragraphs = FxHashMap::<usize, Paragraph>::default();
-    for item in content.logical_flow_items() {
-        let owner = item.box_idx as usize;
+    // Retain only item indices per paragraph. Nested flows may interleave, so
+    // link their items before reusing one paragraph's character buffers.
+    let mut paragraphs = FxHashMap::<usize, (usize, usize)>::default();
+    let mut next = vec![None; content.inline_items().len()];
+    for (index, item) in content.inline_items().iter().enumerate() {
+        if matches!(
+            item.kind,
+            InlineItemKind::FloatAnchor { .. }
+                | InlineItemKind::AbsoluteAnchor { .. }
+                | InlineItemKind::InlineBoundary { .. }
+        ) {
+            continue;
+        }
         let root = item.paragraph_root(tree);
         if !roots.contains(&root) {
             continue;
         }
-        let paragraph = paragraphs.entry(root).or_default();
-        let policy = Policy::new(get_style(styles, tree, owner), styles);
-        match &item.kind {
-            InlineItemKind::Text { glyphs } | InlineItemKind::Marker { glyphs } => {
-                for glyph in glyphs.clone() {
-                    let character = content
-                        .character_at(glyph as usize)
-                        .unwrap_or('\u{fffd}');
-                    paragraph.push(owner, Some(glyph as usize), character, policy);
-                }
-            }
-            InlineItemKind::Break { .. } => paragraph.push(owner, None, '\n', policy),
-            _ => paragraph.push(owner, None, '\u{fffc}', policy),
-        }
+        paragraphs
+            .entry(root)
+            .and_modify(|(_, last)| {
+                next[*last] = Some(index);
+                *last = index;
+            })
+            .or_insert((index, index));
     }
-    for paragraph in paragraphs.values() {
+    let mut paragraph = Paragraph::default();
+    for (first, _) in paragraphs.into_values() {
+        paragraph.clear();
+        let mut cursor = Some(first);
+        while let Some(index) = cursor {
+            let item = &content.inline_items()[index];
+            let owner = item.box_idx as usize;
+            paragraph.start_run(owner, Policy::new(get_style(styles, tree, owner), styles));
+            match &item.kind {
+                InlineItemKind::Text { glyphs } | InlineItemKind::Marker { glyphs } => {
+                    for glyph in glyphs.clone() {
+                        paragraph.push(
+                            Some(glyph as usize),
+                            content.character_at(glyph as usize).unwrap_or('\u{fffd}'),
+                        );
+                    }
+                }
+                InlineItemKind::Break { .. } => paragraph.push(None, '\n'),
+                _ => paragraph.push(None, '\u{fffc}'),
+            }
+            cursor = next[index];
+        }
         paragraph.resolve(content, styles, tree);
     }
 }

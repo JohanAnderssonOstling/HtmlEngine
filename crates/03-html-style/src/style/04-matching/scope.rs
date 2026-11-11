@@ -9,13 +9,13 @@ pub(crate) struct ScopeMatch {
     pub(crate) proximity: u32,
 }
 
-pub(crate) fn scope_match(
-    prepared: &PreparedRuleSet<'_>,
+pub(crate) fn scope_match<'css>(
+    prepared: &PreparedRuleSet<'css>,
     scope: ScopeId,
     document: &Document,
     author_roots: &[Option<DomNodeId>],
     subject: DomNodeId,
-    siblings: &SiblingIndex<'_>,
+    siblings: &mut SiblingIndex<'_, '_, 'css>,
 ) -> Option<ScopeMatch> {
     if scope == ScopeId::NONE {
         return Some(ScopeMatch {
@@ -24,13 +24,22 @@ pub(crate) fn scope_match(
         });
     }
     let descriptor = prepared.scope_descriptor(scope);
-    let parent = scope_match(prepared, descriptor.parent, document, author_roots, subject, siblings)?;
-    let match_for_root = |root| {
+    let parent = scope_match(
+        prepared,
+        descriptor.parent,
+        document,
+        author_roots,
+        subject,
+        siblings,
+    )?;
+    let match_for_root = |root, siblings: &mut SiblingIndex<'_, '_, 'css>| {
         let mut proximity = 0u32;
         for candidate in std::iter::once(subject).chain(document.dom_ancestors(subject)) {
             if descriptor.end.as_ref().is_some_and(|end| {
                 end.0.iter().any(|selector| {
-                    selector_matches_dom_node_in_scope(selector, document, candidate, root, siblings)
+                    selector_matches_dom_node_in_scope(
+                        selector, document, candidate, root, siblings,
+                    )
                 })
             }) {
                 return None;
@@ -43,15 +52,24 @@ pub(crate) fn scope_match(
         None
     };
     if let Some(start) = &descriptor.start {
-        std::iter::once(subject)
-            .chain(document.dom_ancestors(subject))
-            .take_while(|candidate| document.dom_contains(parent.root, *candidate))
-            .filter(|candidate| {
-                start.0.iter().any(|selector| {
-                    selector_matches_dom_node_in_scope(selector, document, *candidate, parent.root, siblings)
-                })
-            })
-            .find_map(match_for_root)
+        for candidate in std::iter::once(subject).chain(document.dom_ancestors(subject)) {
+            if !document.dom_contains(parent.root, candidate) {
+                break;
+            }
+            if start.0.iter().any(|selector| {
+                selector_matches_dom_node_in_scope(
+                    selector,
+                    document,
+                    candidate,
+                    parent.root,
+                    siblings,
+                )
+            }) && let Some(matched) = match_for_root(candidate, siblings)
+            {
+                return Some(matched);
+            }
+        }
+        None
     } else {
         let root = author_roots
             .get(descriptor.implicit_root_index? as usize)
@@ -59,7 +77,7 @@ pub(crate) fn scope_match(
             .flatten()?;
         document
             .dom_contains(parent.root, root)
-            .then(|| match_for_root(root))
+            .then(|| match_for_root(root, siblings))
             .flatten()
     }
 }

@@ -1,5 +1,4 @@
 //! Grid conversion benchmark; pass `retry` to exercise an invalid later template.
-use html_style::style_document_with_timings;
 use std::{hint::black_box, time::Duration};
 
 fn main() {
@@ -22,7 +21,7 @@ fn main() {
     let mut samples = Vec::<Duration>::new();
     for i in 0..24 {
         let doc = html_parse::parse_dom_document(&html).unwrap();
-        let (styled, timings) = style_document_with_timings(doc, &[]);
+        let (styled, timings) = { let (styled, timings, _) = html_style::StyleRequest::from_css(doc, &[]).compile(); (styled, timings) };
         black_box(styled);
         if i >= 3 {
             samples.push(timings.cascade);

@@ -17,29 +17,28 @@ use taffy::geometry::Size as TaffySize;
 use taffy::prelude::AvailableSpace;
 
 pub(super) fn prepare(
-    session: &mut LayoutEngine<'_, '_>,
+    engine: &mut LayoutEngine<'_, '_>,
     input: &FlexGridInput<'_>,
 ) -> (FlexGridPolicy, PreparedFlexGrid) {
     let flex_row = matches!(
-        layout_style(session, input.container_idx).flex_direction,
+        layout_style(engine, input.container_idx).flex_direction,
         FlexDirection::Row | FlexDirection::RowReverse
     );
     let size_containment = input.kind == TaffyContainerKind::Grid
-        && session.reader.style(input.container_idx).size_containment();
-    let contained_auto_height = (size_containment && input.explicit_height.is_none())
-        .then(|| {
-            contained_grid_auto_height(
-                session,
-                input.container_idx,
-                input.content_width,
-                input.min_height,
-                input.max_height,
-            )
-        });
+        && engine.reader.style(input.container_idx).size_containment();
+    let contained_auto_height = (size_containment && input.explicit_height.is_none()).then(|| {
+        contained_grid_auto_height(
+            engine,
+            input.container_idx,
+            input.content_width,
+            input.min_height,
+            input.max_height,
+        )
+    });
     let rerun_indefinite_percentage_rows = input.kind == TaffyContainerKind::Grid
         && input.explicit_height.is_none()
         && template_tracks_use_percentage(
-            session
+            engine
                 .reader
                 .style(input.container_idx)
                 .grid_template_rows(),
@@ -55,7 +54,7 @@ pub(super) fn prepare(
     };
     let compatible_auto_column_height =
         if input.kind == TaffyContainerKind::Flex && !flex_row && input.explicit_height.is_none() {
-            fixed_basis_auto_column_height(session, input.children, input.content_width)
+            fixed_basis_auto_column_height(engine, input.children, input.content_width)
         } else {
             None
         };
@@ -68,13 +67,13 @@ pub(super) fn prepare(
     } else {
         input.explicit_height
     };
-    let ordered_children = ordered_children(session, input.children);
+    let ordered_children = ordered_children(engine, input.children);
 
     let mut child_styles = Vec::with_capacity(ordered_children.len().max(1));
     for &child in &ordered_children {
         let resolved_flex_basis = if input.kind == TaffyContainerKind::Flex {
             resolve_intrinsic_flex_basis(
-                session,
+                engine,
                 child as usize,
                 input.content_width,
                 child_containing_height,
@@ -83,7 +82,7 @@ pub(super) fn prepare(
         } else {
             None
         };
-        let child_style = session.reader.style(child as usize);
+        let child_style = engine.reader.style(child as usize);
         let needs_intrinsic_block_size = [
             child_style.height(),
             child_style.min_height(),
@@ -104,12 +103,12 @@ pub(super) fn prepare(
             // keywords at the container width would introduce wrapping
             // that `flex: none` never receives in the real flex pass.
             let measure_width = if input.kind == TaffyContainerKind::Flex && flex_row {
-                crate::layout::box_intrinsic_widths(session, child as usize).1
+                crate::layout::box_intrinsic_widths(engine, child as usize).1
             } else {
                 input.content_width
             };
             measure_box_isolated(
-                session,
+                engine,
                 BoxLayoutRequest::normal(child as usize, measure_width.max(0.0), None)
                     .for_intrinsic_block_measurement(),
             )
@@ -118,7 +117,7 @@ pub(super) fn prepare(
         });
         child_styles.push((
             taffy_item_style(
-                session,
+                engine,
                 child as usize,
                 input.content_width,
                 child_containing_height,
@@ -135,14 +134,14 @@ pub(super) fn prepare(
     // maximum. CSS instead floors that maximum when the definite outer
     // minimum is larger, which is equivalent to fit-content at this boundary.
     let floor_fixed_grid_column_maxima = grid_definite_inline_minimum_exceeds_track_limit(
-        session,
+        engine,
         input.container_idx,
         input.children,
         input.kind,
         input.content_width,
     );
     let root_style = taffy_container_style(
-        session,
+        engine,
         input.container_idx,
         input.content_width,
         root_layout_height,
@@ -177,14 +176,14 @@ pub(super) fn prepare(
 /// in-flow contents. The display:none sentinel makes Taffy run Grid track
 /// sizing for genuinely empty grids without creating an occupying item.
 fn contained_grid_auto_height(
-    session: &mut LayoutEngine<'_, '_>,
+    engine: &mut LayoutEngine<'_, '_>,
     container_idx: usize,
     content_width: f64,
     min_height: Option<f64>,
     max_height: Option<f64>,
 ) -> f64 {
     let root_style = taffy_container_style(
-        session,
+        engine,
         container_idx,
         content_width,
         None,
@@ -201,7 +200,7 @@ fn contained_grid_auto_height(
         height: AvailableSpace::MaxContent,
     };
     let mut taffy = TaffyLayoutTree::new(
-        MeasurementMode::Full(session),
+        MeasurementMode::Full(engine),
         TaffyContainerKind::Grid,
         root_style,
         child_styles,
@@ -215,15 +214,15 @@ fn contained_grid_auto_height(
 /// This is intentionally narrower than the general intrinsic main-size
 /// algorithm: uncertain content-based minimums remain Taffy-owned.
 fn fixed_basis_auto_column_height(
-    session: &LayoutEngine<'_, '_>,
+    engine: &LayoutEngine<'_, '_>,
     children: &[u32],
     containing_width: f64,
 ) -> Option<f64> {
     let parent = children
         .first()
-        .and_then(|child| session.reader.get_parent(*child as usize))?;
+        .and_then(|child| engine.reader.get_parent(*child as usize))?;
     if !matches!(
-        layout_style(session, parent).flex_wrap,
+        layout_style(engine, parent).flex_wrap,
         html_style_model::FlexWrap::NoWrap
     ) {
         return None;
@@ -232,7 +231,7 @@ fn fixed_basis_auto_column_height(
     let mut total = 0.0;
     for &child in children {
         let child_idx = child as usize;
-        let style = session.reader.style(child_idx);
+        let style = engine.reader.style(child_idx);
         if style.position() == html_style_model::PositionMode::Absolute {
             continue;
         }
@@ -262,7 +261,7 @@ fn fixed_basis_auto_column_height(
         item_count += 1;
     }
     if item_count > 1 {
-        total += session
+        total += engine
             .reader
             .style(parent)
             .row_gap()

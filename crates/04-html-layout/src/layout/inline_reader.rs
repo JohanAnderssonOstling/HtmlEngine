@@ -1,9 +1,7 @@
-use crate::layout_model::{
-    GlyphAdvanceRun, GlyphId, GlyphMetric, GlyphMetrics, GlyphOffsetRun, InlineContent, InlineItem,
-    Line,
-};
-use crate::layout_model::{GlyphSlice, LineTextPlacement, NativeRuns, TextGeometryView};
-use html_engine_model::{FontMetrics, GlyphDimensionsCursor, WordIndex};
+use html_engine_model::{
+    FontMetrics, GlyphAdvanceRun, GlyphDimensionsCursor, GlyphId, GlyphMetric, GlyphMetrics,
+    GlyphOffsetRun, GlyphSlice, InlineContent, InlineItem, Line, LineTextPlacement, NativeRuns,
+    TextGeometryView, WhitespaceWrapOverride, WordIndex};
 use html_style_model::{StyleIndices, TextDirection};
 use html_text::{FirstLetterStyles, tracking_boundary_after};
 use rustc_data_structures::fx::FxHashMap;
@@ -77,7 +75,7 @@ impl<'input> InlineReader<'input> {
         tracking_boundary_after(self.content, index, end, self.is_cluster_boundary(index as usize + 1))
     }
 
-    pub fn inline_items(&self) -> &[InlineItem] {
+    pub fn inline_items(&self) -> &'input [InlineItem] {
         self.content.inline_items()
     }
 
@@ -114,10 +112,7 @@ impl<'input> InlineReader<'input> {
         self.first_letter_styles.segment(start, end)
     }
 
-    pub fn whitespace_wrap_before(
-        &self,
-        glyph_idx: usize,
-    ) -> crate::layout_model::WhitespaceWrapOverride {
+    pub fn whitespace_wrap_before(&self, glyph_idx: usize) -> WhitespaceWrapOverride {
         self.content.whitespace_wrap_before(glyph_idx)
     }
 
@@ -172,7 +167,7 @@ impl<'input> InlineReader<'input> {
 }
 
 /// Per-traversal hints stay local to each layout operation; shared document
-/// snapshots remain immutable and parallel table measurement stays independent.
+/// snapshots remain immutable while isolated measurements update owned scratch.
 pub struct TextCursor<'input> {
     text: InlineReader<'input>,
     dimensions: GlyphDimensionsCursor<'input>,

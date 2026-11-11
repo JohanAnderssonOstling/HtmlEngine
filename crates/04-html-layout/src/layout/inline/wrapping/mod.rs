@@ -2,6 +2,7 @@
 //!
 //! Results contain token ranges and line constraints; fragment placement is a
 //! separate phase.
+use html_engine_model::{GlyphId};
 
 use super::justification::glue_capacities;
 use super::*;
@@ -45,29 +46,17 @@ impl KpPlan {
         metrics: MetricsView<'_>,
         punctuation_aware: bool,
     ) -> Self {
-        profile_scope!("lines.build_breakpoint_plan");
         let mut segments = Vec::new();
         let mut token_start = 0usize;
-        for index in 0..tokens.len() {
-            let token = tokens.metadata_at(index);
-            if token.break_kind() == BreakKind::Hard {
-                segments.push(KpSegmentPlan::build(
-                    tokens,
-                    metrics,
-                    token_start,
-                    index,
-                    punctuation_aware,
-                ));
-                token_start = index + 1;
+        loop {
+            let segment = KpSegmentPlan::build(tokens, metrics, token_start, punctuation_aware);
+            let token_end = segment.token_end;
+            segments.push(segment);
+            if token_end == tokens.len() {
+                break;
             }
+            token_start = token_end + 1;
         }
-        segments.push(KpSegmentPlan::build(
-            tokens,
-            metrics,
-            token_start,
-            tokens.len(),
-            punctuation_aware,
-        ));
         Self {
             segments: segments.into_boxed_slice(),
         }
@@ -88,9 +77,9 @@ impl KpSegmentPlan {
         tokens: S,
         metrics: MetricsView<'_>,
         mut token_start: usize,
-        token_end: usize,
         punctuation_aware: bool,
     ) -> Self {
+        let mut token_end = tokens.len();
         while token_start < token_end
             && tokens.metadata_at(token_start).break_kind() == BreakKind::Soft
             && !metrics
@@ -109,6 +98,12 @@ impl KpSegmentPlan {
         let mut content_end = token_start;
         while token_index < token_end {
             let token = tokens.metadata_at(token_index);
+            // Discover segment boundaries while accumulating candidates,
+            // without a preliminary scan over the paragraph.
+            if token.break_kind() == BreakKind::Hard {
+                token_end = token_index;
+                break;
+            }
             if token.break_kind() == BreakKind::Discretionary {
                 token_index += 1;
                 content_end = token_index;
@@ -242,7 +237,7 @@ pub(super) struct LineBreakResult {
 pub(super) struct BrokenLine {
     pub(super) start: usize,
     pub(super) end: usize,
-    pub(super) hyphen: Option<(crate::GlyphId, f32)>,
+    pub(super) hyphen: Option<(GlyphId, f32)>,
     /// Preserved source newline supplying the strut for an empty line.
     pub(super) empty_segment_break: Option<usize>,
     pub(super) indent: f64,

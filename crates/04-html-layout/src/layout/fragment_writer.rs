@@ -1,5 +1,5 @@
-use crate::layout_model::paint_program::PaintLayers;
-use crate::layout_model::{DecorationFragment, DecorationStore, LayoutState};
+use html_engine_model::{DecorationFragment, DecorationStore, LayoutState, LineInlineBoxFragment};
+use html_engine_model::paint_program::PaintLayers;
 use kurbo::{Point, Vec2};
 use std::ops::Range;
 
@@ -26,26 +26,22 @@ impl OutputRanges {
     }
 }
 
-/// Owns published line/fragment output and temporary decoration owners used
-/// while paint output is assembled.
+/// Writes published line, fragment and decoration-owner output.
 pub struct FragmentWriter<'out> {
     state: &'out mut LayoutState,
-    block_decoration_owners: Vec<u32>,
     last_inline_fragments: Vec<u32>,
 }
 
 impl<'out> FragmentWriter<'out> {
-    pub(super) fn new(state: &'out mut LayoutState, block_decoration_owners: Vec<u32>) -> Self {
+    pub(super) fn new(state: &'out mut LayoutState) -> Self {
         Self {
             state,
-            block_decoration_owners,
             last_inline_fragments: Vec::new(),
         }
     }
 
     /// Resets all published fragment state while retaining reusable allocation.
     pub fn reset(&mut self) {
-        self.block_decoration_owners.clear();
         self.last_inline_fragments.clear();
 
         self.state.clear();
@@ -174,7 +170,7 @@ impl<'out> FragmentWriter<'out> {
     /// adding per-line allocations.
     pub fn push_inline_box_fragments(
         &mut self,
-        fragments: Vec<crate::layout_model::LineInlineBoxFragment>,
+        fragments: impl IntoIterator<Item = LineInlineBoxFragment>,
         box_count: usize,
     ) -> Range<u32> {
         const NONE: u32 = u32::MAX;
@@ -187,8 +183,8 @@ impl<'out> FragmentWriter<'out> {
                 && (previous as usize) < self.state.line_output.inline_box_fragments.len()
             {
                 self.state.line_output.inline_box_fragments[previous as usize].flags &=
-                    !crate::layout_model::LineInlineBoxFragment::INLINE_END;
-                fragment.flags &= !crate::layout_model::LineInlineBoxFragment::INLINE_START;
+                    !LineInlineBoxFragment::INLINE_END;
+                fragment.flags &= !LineInlineBoxFragment::INLINE_START;
             }
             let current = u32::try_from(self.state.line_output.inline_box_fragments.len())
                 .expect("inline fragment arena exhausted");
@@ -202,7 +198,10 @@ impl<'out> FragmentWriter<'out> {
 
     pub(super) fn push_block_decoration(&mut self, owner: u32, decoration: DecorationFragment) {
         self.state.fragment_output.decorations.push(decoration);
-        self.block_decoration_owners.push(owner);
+        self.state
+            .fragment_output
+            .block_decoration_owners
+            .push(owner);
     }
 
     pub fn decoration_len(&self) -> usize {
@@ -222,7 +221,9 @@ impl<'out> FragmentWriter<'out> {
             .decoration_len()
             .checked_sub(start)
             .expect("decoration cursor must precede emitted output");
-        self.block_decoration_owners
+        self.state
+            .fragment_output
+            .block_decoration_owners
             .extend(std::iter::repeat_n(owner, added));
     }
 
@@ -268,28 +269,19 @@ impl<'out> FragmentWriter<'out> {
             .resize(end, u32::MAX);
         self.state.fragment_output.decoration_paint_orders[start..end].fill(paint_order);
     }
-
-    pub fn decoration_parts(&mut self) -> (&mut LayoutState, &mut Vec<u32>) {
-        (self.state, &mut self.block_decoration_owners)
-    }
-
-    pub fn take_decoration_owners(&mut self) -> Vec<u32> {
-        self.block_decoration_owners.clear();
-        std::mem::take(&mut self.block_decoration_owners)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout_model::Line;
-    use crate::layout_model::paint_program::PaintOperation;
+    use html_engine_model::Line;
+    use html_engine_model::paint_program::PaintOperation;
     use kurbo::Rect;
 
     #[test]
     fn nested_layers_survive_command_replay_and_late_inline_decorations() {
         let mut state = LayoutState::default();
-        let mut fragments = FragmentWriter::new(&mut state, Vec::new());
+        let mut fragments = FragmentWriter::new(&mut state);
         let mut placement = PlacementState::default();
         placement.reset(1);
         let owner = placement.begin_box(0, false);
@@ -346,7 +338,7 @@ mod tests {
                 ..Line::default()
             });
         }
-        let fragments = FragmentWriter::new(&mut state, Vec::new());
+        let fragments = FragmentWriter::new(&mut state);
         assert_eq!(
             fragments.baseline_offsets(0..5, 0.0),
             (Some(3.0), Some(12.0))

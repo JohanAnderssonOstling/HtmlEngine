@@ -1,5 +1,4 @@
 //! Per-line pseudo, overflow, and inline-strut preparation.
-use html_engine_model::shaping_contracts;
 use html_text::whitespace_context_root;
 use rustc_data_structures::fx::FxHashSet;
 
@@ -17,9 +16,9 @@ pub(super) fn strut_for_inline_box(
     } else {
         style.resolved_line_height()
     };
-    let (font_ascent, font_descent) = shaping_contracts::font_relative_metrics_line_box_extents(engine
+    let (font_ascent, font_descent) = (engine
         .reader
-        .font_metrics(box_idx), font_size);
+        .font_metrics(box_idx)).line_box_extents(font_size);
     let half_leading = (line_height - font_ascent - font_descent) * 0.5;
     InlineBoxStrut {
         box_idx,
@@ -33,13 +32,13 @@ pub(super) fn strut_for_inline_box(
 pub(super) fn parent_font_content_extents(
     engine: &LayoutEngine<'_, '_>,
     box_idx: usize,
-) -> (f64, f64) {
+) -> (f64, f64, f64) {
     let parent_idx = engine.reader.get_parent(box_idx).unwrap_or(box_idx);
     let style = engine.reader.style(parent_idx);
     let font_size = style.font_size() as f64;
-    shaping_contracts::font_relative_metrics_line_box_extents(engine
-        .reader
-        .font_metrics(parent_idx), font_size)
+    let metrics = engine.reader.font_metrics(parent_idx);
+    let (ascent, descent) = metrics.line_box_extents(font_size);
+    (ascent, descent, f64::from(metrics.x_height_ratio) * font_size)
 }
 
 pub(super) fn inline_box_struts(
@@ -132,9 +131,9 @@ pub(super) fn include_container_strut(
     if !summary.has_baseline_relative_image && summary.line_height + f64::EPSILON >= line_height {
         return;
     }
-    let (ascent, descent) = shaping_contracts::font_relative_metrics_line_box_extents(engine
+    let (ascent, descent) = (engine
         .reader
-        .font_metrics(container_box_idx), font_size);
+        .font_metrics(container_box_idx)).line_box_extents(font_size);
     let half_leading = (line_height - ascent - descent) / 2.0;
     let max_ascent = summary.baseline.max(ascent + half_leading);
     let max_descent = (summary.line_height - summary.baseline).max(descent + half_leading);
@@ -283,7 +282,7 @@ fn metrics_with_line_height(
     metrics.line_height = height as f32;
     if metrics.owner_box_idx != u32::MAX {
         metrics.vertical_align = InlineVerticalAlign::resolve(
-            text_vertical_align(engine, metrics.owner_box_idx as usize),
+            text_vertical_align(&engine.reader, metrics.owner_box_idx as usize),
             height,
             metrics.font_size,
         );

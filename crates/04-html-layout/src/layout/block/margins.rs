@@ -1,5 +1,5 @@
 use crate::layout::box_constraints::resolve_vertical_size;
-use crate::layout_model::{BoxType, Children};
+use html_engine_model::{BoxType, Children};
 use html_style_model::{
     BoxSizing, Clear, Display, Float, OverflowMode, PositionMode,
     UsedPreferredSize as PreferredSize,

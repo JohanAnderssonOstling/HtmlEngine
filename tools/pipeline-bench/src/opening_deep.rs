@@ -1,12 +1,8 @@
+use html_pipeline::engine::LayoutRequest;
 use crate::opening::{style_details, summary};
 use crate::{Shaper, cpu_seconds, layout_fingerprint};
-#[cfg(test)]
-use html_pipeline::profiling;
-use html_pipeline::engine::LayoutConstraints;
-use html::{
-    ::{capture, capture_with_measurements, scope},
-
-};
+use html_pipeline::profiling::{capture, scope};
+use html_pipeline::engine::{LayoutConstraints, reader_style};
 use html_pipeline::ResourceContext;
 use html_pipeline::{DocumentFactory, PipelineInputs};
 use html_pipeline::parse_document;
@@ -26,8 +22,7 @@ fn no_cpu_clock() -> Duration {
 
 pub(super) fn run(path: &str, case: &str, count: usize, inputs: &PipelineInputs) {
     assert!(count > 0);
-    let detailed = case == "open_solver_book";
-    let cpu_measured = !matches!(case, "open_deep_wall_book" | "open_solver_book");
+    let cpu_measured = case != "open_deep_wall_book";
     let clock = if cpu_measured {
         cpu_clock
     } else {
@@ -35,7 +30,6 @@ pub(super) fn run(path: &str, case: &str, count: usize, inputs: &PipelineInputs)
     };
     let mut samples = BTreeMap::<String, Vec<f64>>::new();
     let mut scopes = BTreeMap::<String, BTreeMap<&str, Vec<f64>>>::new();
-    let mut measurements = BTreeMap::<String, Vec<Vec<BTreeMap<&str, usize>>>>::new();
     let constraints = LayoutConstraints::new(600.0, 16.0)
         .unwrap()
         .with_text_composition_policy(inputs.layout.text_composition_policy());
@@ -48,63 +42,55 @@ pub(super) fn run(path: &str, case: &str, count: usize, inputs: &PipelineInputs)
         factory.set_media_environment(inputs.style_environment.media);
         let cpu = cpu_seconds();
         let wall = Instant::now();
-        let ((document, resources, preparation, source_bytes), entries) =
-            capture_with_measurements(clock, detailed, || {
-                let _total = scope("opening.total");
-                let source = {
-                    let _scope = scope("opening.source_read");
-                    std::fs::read_to_string(path).unwrap()
-                };
-                let parsed = {
-                    let _scope = scope("opening.parse");
-                    parse_document(&source, inputs.markup_syntax).unwrap()
-                };
-                let (base, preparation) = {
-                    let _scope = scope("opening.preparation");
-                    factory
-                        .with_resources(factory_resources)
-                        .build_pipeline_from_parsed_with_timings(&parsed, &[])
-                };
-                let prepared = {
-                    let _scope = scope("opening.paint_prepare");
-                    base.into_reader_paint_overrides(&inputs.reader_overrides)
-                        .unwrap()
-                };
-                let mut shaper = Shaper::default();
-                let mut resources = GlyphResourceStore::default();
-                let shaped = {
-                    let _scope = scope("opening.shape");
-                    prepared.shape(&mut shaper, &mut resources).unwrap()
-                };
-                let document = {
-                    let _scope = scope("opening.layout");
-                    shaped
-                        .layout_with_metrics_and_shaper(
-                            constraints,
-                            &inputs.image_metrics,
-                            &mut shaper,
-                            &mut resources,
-                        )
-                        .unwrap()
-                };
-                (document, resources, preparation, source.len())
-            });
+        let ((document, resources, preparation, source_bytes), entries) = capture(clock, || {
+            let _total = scope("opening.total");
+            let source = {
+                let _scope = scope("opening.source_read");
+                std::fs::read_to_string(path).unwrap()
+            };
+            let parsed = {
+                let _scope = scope("opening.parse");
+                parse_document(&source, inputs.markup_syntax).unwrap()
+            };
+            let (base, preparation) = {
+                let _scope = scope("opening.preparation");
+                factory
+                    .with_resources(factory_resources)
+                    .build_pipeline_from_parsed_with_timings(&parsed, &[])
+            };
+            let prepared = {
+                let _scope = scope("opening.paint_prepare");
+                base.into_reader_paint_overrides(&inputs.reader_overrides)
+                    .unwrap()
+            };
+            let mut shaper = Shaper::default();
+            let mut resources = GlyphResourceStore::default();
+            let shaped = {
+                let _scope = scope("opening.shape");
+                prepared.shape(&mut shaper, &mut resources).unwrap()
+            };
+            let document = {
+                let _scope = scope("opening.layout");
+                shaped
+                    .layout(
+                        LayoutRequest::new(constraints).with_image_metrics(&inputs.image_metrics),
+                        &mut shaper,
+                        &mut resources,
+                    )
+                    .unwrap()
+            };
+            (document, resources, preparation, source.len())
+        });
         let elapsed = wall.elapsed();
         let cpu_ms = (cpu_seconds() - cpu) * 1000.0;
         if iteration >= 3 {
-            // Absent scopes (e.g. hyphenation) contribute zero in each sample.
+            // Absent scopes contribute zero in each sample.
             for series in scopes.values_mut() {
                 for values in series.values_mut() {
                     values.push(0.0);
                 }
             }
             for entry in &entries {
-                if !entry.measurements.is_empty() {
-                    measurements
-                        .entry(entry.name.to_owned())
-                        .or_default()
-                        .push(entry.measurements.clone());
-                }
                 let series = scopes.entry(entry.name.to_owned()).or_default();
                 for (metric, value) in [
                     (
@@ -182,7 +168,6 @@ pub(super) fn run(path: &str, case: &str, count: usize, inputs: &PipelineInputs)
         .map(|(key, values)| (key.clone(), summary(values)))
         .collect::<serde_json::Map<_, _>>()
         .into();
-    output["measurements"] = json!(measurements);
     output["scopes"] = scopes
         .iter()
         .map(|(key, series)| {

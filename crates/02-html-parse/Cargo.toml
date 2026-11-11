@@ -23,6 +23,3 @@ html5ever.workspace = true
 quick-xml.workspace = true
 ego-tree.workspace = true
 encoding_rs.workspace = true
-
-[dev-dependencies]
-html-wpt-test-support = { path = "../../test-support/html-wpt" }

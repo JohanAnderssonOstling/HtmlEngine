@@ -155,7 +155,7 @@ fn decode(value: u16) -> u32 {
     }
 }
 
-pub use crate::document::element_storage::{
-    attr_value_idx_no_namespace, html_list_item_value, html_list_reversed, html_list_start,
-    html_state, id_idx, image_idx, is_html_element_in_html_document,
-};
+/// Selector-name fingerprint shared with compact DOM attribute storage.
+pub fn selector_name_mask(name: &str, ascii_insensitive: bool) -> u32 {
+    crate::document::name_filter_mask(name, ascii_insensitive)
+}

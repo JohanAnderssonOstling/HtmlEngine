@@ -59,7 +59,7 @@ mod tests {
             })
             .into_iter()
             .collect();
-        let (root, builder) = builder
+        let root = builder
             .append_dom_element(
                 None,
                 DomElementData {
@@ -73,8 +73,8 @@ mod tests {
             .expect("root append");
         builder
             .set_dom_root(root)
-            .expect("root set")
-            .finish()
+            .expect("root set");
+        builder.finish()
             .expect("document build")
     }
 
@@ -84,8 +84,8 @@ mod tests {
         let role = element(Some(("role", "doc-endnote")));
         let ordinary = element(None);
 
-        assert!(epub.node_ids().filter_map(|node| epub.element_ref(node)).any(element_is_note_target));
-        assert!(role.node_ids().filter_map(|node| role.element_ref(node)).any(element_is_note_target));
-        assert!(!ordinary.node_ids().filter_map(|node| ordinary.element_ref(node)).any(element_is_note_target));
+        assert!(epub.node_ids().filter_map(|node| epub.try_element_ref(node)).any(element_is_note_target));
+        assert!(role.node_ids().filter_map(|node| role.try_element_ref(node)).any(element_is_note_target));
+        assert!(!ordinary.node_ids().filter_map(|node| ordinary.try_element_ref(node)).any(element_is_note_target));
     }
 }

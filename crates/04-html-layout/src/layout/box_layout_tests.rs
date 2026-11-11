@@ -1,10 +1,7 @@
-use html_pipeline::engine::box_queries;
+use html_engine_model::{GlyphResourceStore, ImageMetrics, InlineItemKind, LayoutConstraints, LineId};
+use html_pipeline::engine::LayoutRequest;
 use html_engine_model::layout_state;
-use html_pipeline::engine::fragment_paint;
-use html_pipeline::engine::text_paint;
-use crate::GlyphResourceStore;
 use crate::LaidOutDocument;
-use crate::layout_model::LineId;
 use crate::parser::DocumentFactory;
 use crate::test_support::TestGlyphShaper as GlyphCache;
 use kurbo::{Size, Vec2};
@@ -21,7 +18,8 @@ fn layout_html(
         .shape(&mut glyph_cache, resources)
         .expect("test shaper must register every glyph")
         .layout(
-            crate::LayoutConstraints::new(width, 16.0).unwrap(),
+            LayoutRequest::new(LayoutConstraints::new(width, 16.0).unwrap()),
+            &mut glyph_cache,
             resources,
         )
         .expect("layout requires the shaper-aware API for first-line styles")
@@ -41,7 +39,8 @@ fn layout_html_with_font_relative_ratios(
         .shape(&mut glyph_cache, resources)
         .expect("test shaper must register every glyph")
         .layout(
-            crate::LayoutConstraints::new(width, 16.0).unwrap(),
+            LayoutRequest::new(LayoutConstraints::new(width, 16.0).unwrap()),
+            &mut glyph_cache,
             resources,
         )
         .expect("layout requires the shaper-aware API for first-line styles")
@@ -49,25 +48,28 @@ fn layout_html_with_font_relative_ratios(
 
 fn div_size(document: &LaidOutDocument, resources: &GlyphResourceStore) -> Size {
     let boxes = document.render_view(resources).boxes();
-    let div_idx = (0..box_queries::len(boxes))
+    let div_idx = (0..boxes.len())
         .map(layout_state::box_id_new)
         .find(|&idx| {
-            box_queries::tag(boxes, idx).is_some_and(|tag| tag.eq_ignore_ascii_case("div"))
+            (boxes)
+                .tag(idx)
+                .is_some_and(|tag| tag.eq_ignore_ascii_case("div"))
         })
         .expect("div box should exist");
-    box_queries::render_box_view_size(boxes, div_idx).expect("box index in range")
+    boxes.size(div_idx).expect("box index in range")
 }
 
 fn tag_size(document: &LaidOutDocument, tag: &str, resources: &GlyphResourceStore) -> Size {
     let boxes = document.render_view(resources).boxes();
-    let box_idx = (0..box_queries::len(boxes))
+    let box_idx = (0..boxes.len())
         .map(layout_state::box_id_new)
         .find(|&idx| {
-            box_queries::tag(boxes, idx)
+            (boxes)
+                .tag(idx)
                 .is_some_and(|candidate| candidate.eq_ignore_ascii_case(tag))
         })
         .unwrap_or_else(|| panic!("{tag} box should exist"));
-    box_queries::render_box_view_size(boxes, box_idx).expect("box index in range")
+    boxes.size(box_idx).expect("box index in range")
 }
 
 fn id_geometry(
@@ -76,13 +78,13 @@ fn id_geometry(
     resources: &GlyphResourceStore,
 ) -> (kurbo::Point, Size) {
     let view = document.render_view(resources);
-    let box_idx = (0..box_queries::len(view.boxes()))
+    let box_idx = (0..(view.boxes()).len())
         .map(layout_state::box_id_new)
-        .find(|&idx| box_queries::attribute(view.boxes(), idx, "id") == Some(id))
+        .find(|&idx| (view.boxes()).attribute(idx, "id") == Some(id))
         .unwrap_or_else(|| panic!("#{id} box should exist"));
     (
-        box_queries::render_box_view_point(view.boxes(), box_idx).expect("box index in range"),
-        box_queries::render_box_view_size(view.boxes(), box_idx).expect("box index in range"),
+        (view.boxes()).point(box_idx).expect("box index in range"),
+        (view.boxes()).size(box_idx).expect("box index in range"),
     )
 }
 
@@ -240,13 +242,14 @@ fn absolute_replaced_child_does_not_contribute_to_auto_containing_block_width() 
     let shaped = prepared
         .shape(&mut glyph_cache, &mut shaped_resources)
         .expect("test shaper must register every glyph");
-    let mut image_metrics = crate::ImageMetrics::default();
+    let mut image_metrics = ImageMetrics::default();
     image_metrics.set(0, 300, 50);
     let document = shaped
-        .layout_with_metrics(
-            crate::LayoutConstraints::new(800.0, 16.0).unwrap(),
-            &image_metrics,
-            &shaped_resources,
+        .layout(
+            LayoutRequest::new(LayoutConstraints::new(800.0, 16.0).unwrap())
+                .with_image_metrics(&image_metrics),
+            &mut glyph_cache,
+            &mut shaped_resources,
         )
         .expect("layout requires the shaper-aware API for first-line styles");
     let (parent_point, parent_size) = id_geometry(&document, "parent", &shaped_resources);
@@ -457,15 +460,15 @@ fn inline_block_padding_separates_nested_and_outer_borders() {
         "50px padding and the outer 10px border must follow the inner border"
     );
     let decorations =
-        fragment_paint::decorations(document.render_view(&document_resources).fragments());
+        (document.render_view(&document_resources).fragments()).decorations();
     let blues = decorations
         .iter()
-        .filter(|fragment| fragment_paint::decoration_color(&fragment) == 0x0000FFFF)
+        .filter(|fragment| fragment.color() == 0x0000FFFF)
         .map(|fragment| fragment.rect())
         .collect::<Vec<_>>();
     let oranges = decorations
         .iter()
-        .filter(|fragment| fragment_paint::decoration_color(&fragment) == 0xFFA500FF)
+        .filter(|fragment| fragment.color() == 0xFFA500FF)
         .map(|fragment| fragment.rect())
         .collect::<Vec<_>>();
     assert_eq!(
@@ -491,10 +494,10 @@ fn isolated_measurement_does_not_leak_deferred_absolute_boxes() {
         &mut document_resources,
     );
     let decorations =
-        fragment_paint::decorations(document.render_view(&document_resources).fragments());
+        (document.render_view(&document_resources).fragments()).decorations();
     let blue = decorations
         .iter()
-        .filter(|fragment| fragment_paint::decoration_color(&fragment) == 0x0000FFFF)
+        .filter(|fragment| fragment.color() == 0x0000FFFF)
         .collect::<Vec<_>>();
 
     assert_eq!(
@@ -540,7 +543,7 @@ fn inline_block_uses_an_empty_terminal_block_childs_bottom_baseline_before_own_p
         .text()
         .line(LineId::new(0))
         .expect("outer atomic box and following text share a line");
-    let baseline_in_outer = line.point().y + text_paint::line_baseline(&line) - outer_point.y;
+    let baseline_in_outer = line.point().y + line.line_baseline() - outer_point.y;
 
     assert!(
         (baseline_in_outer - 30.0).abs() < 0.001,
@@ -560,7 +563,7 @@ fn absolute_shrink_to_fit_honors_a_floated_descendants_em_max_width() {
         )
         .shape(&mut glyph_cache, &mut document_resources)
         .expect("test shaper must register every glyph")
-        .layout(crate::LayoutConstraints::new(800.0, 16.0).unwrap(), &document_resources).expect("layout requires the shaper-aware API for first-line styles");
+        .layout(LayoutRequest::new(LayoutConstraints::new(800.0, 16.0).unwrap()), &mut glyph_cache, &mut document_resources).expect("layout requires the shaper-aware API for first-line styles");
     let (_, outer_size) = id_geometry(&document, "outer", &document_resources);
     let (_, inner_size) = id_geometry(&document, "inner", &document_resources);
 
@@ -584,18 +587,17 @@ fn outside_list_marker_hangs_before_border_and_padding() {
     );
     let view = document.render_view(&document_resources);
     let boxes = view.boxes();
-    let item_idx = (0..box_queries::len(boxes))
+    let item_idx = (0..boxes.len())
         .map(layout_state::box_id_new)
-        .find(|&idx| box_queries::attribute(boxes, idx, "id") == Some("item"))
+        .find(|&idx| boxes.attribute(idx, "id") == Some("item"))
         .expect("list item box");
-    let marker_idx = box_queries::list_marker(boxes, item_idx)
+    let marker_idx = (boxes)
+        .list_marker(item_idx)
         .expect("outside marker")
         .marker_box();
-    let item_point =
-        box_queries::render_box_view_point(boxes, item_idx).expect("list item geometry");
-    let marker_point =
-        box_queries::render_box_view_point(boxes, marker_idx).expect("marker geometry");
-    let marker_size = box_queries::render_box_view_size(boxes, marker_idx).expect("marker size");
+    let item_point = boxes.point(item_idx).expect("list item geometry");
+    let marker_point = boxes.point(marker_idx).expect("marker geometry");
+    let marker_size = boxes.size(marker_idx).expect("marker size");
     let (child_point, _) = id_geometry(&document, "child", &document_resources);
 
     assert!(
@@ -634,9 +636,9 @@ fn relative_position_offsets_paint_without_consuming_flow_space() {
     let (first, _) = id_geometry(&document, "first", &document_resources);
     let (second, _) = id_geometry(&document, "second", &document_resources);
     let (third, _) = id_geometry(&document, "third", &document_resources);
-    let orange = fragment_paint::decorations(document.render_view(&document_resources).fragments())
+    let orange = (document.render_view(&document_resources).fragments()).decorations()
         .iter()
-        .find(|fragment| fragment_paint::decoration_color(&fragment) == 0xFFA500FF)
+        .find(|fragment| fragment.color() == 0xFFA500FF)
         .expect("relative box background");
 
     assert_eq!(second.x - first.x, 7.0);
@@ -668,7 +670,7 @@ fn relative_block_after_inline_replaced_content_keeps_ancestor_origin() {
             .inline_content()
             .inline_items()
             .iter()
-            .any(|run| matches!(run.kind, crate::layout_model::InlineItemKind::Image { .. })),
+            .any(|run| matches!(run.kind, InlineItemKind::Image { .. })),
         "inline SVG must remain an image run before a block sibling"
     );
     let mut glyph_cache = GlyphCache::new();
@@ -676,21 +678,22 @@ fn relative_block_after_inline_replaced_content_keeps_ancestor_origin() {
     let shaped = prepared
         .shape(&mut glyph_cache, &mut shaped_resources)
         .expect("test shaper must register every glyph");
-    let mut image_metrics = crate::ImageMetrics::default();
+    let mut image_metrics = ImageMetrics::default();
     image_metrics.set(0, 150, 150);
     let document = shaped
-        .layout_with_metrics(
-            crate::LayoutConstraints::new(800.0, 16.0).unwrap(),
-            &image_metrics,
-            &shaped_resources,
+        .layout(
+            LayoutRequest::new(LayoutConstraints::new(800.0, 16.0).unwrap())
+                .with_image_metrics(&image_metrics),
+            &mut glyph_cache,
+            &mut shaped_resources,
         )
         .expect("layout requires the shaper-aware API for first-line styles");
     let (parent, _) = id_geometry(&document, "parent", &shaped_resources);
     let (replaced, replaced_size) = id_geometry(&document, "replaced", &shaped_resources);
     let (overlay, _) = id_geometry(&document, "overlay", &shaped_resources);
-    let green = fragment_paint::decorations(document.render_view(&shaped_resources).fragments())
+    let green = (document.render_view(&shaped_resources).fragments()).decorations()
         .iter()
-        .find(|fragment| fragment_paint::decoration_color(&fragment) == 0x008000FF)
+        .find(|fragment| fragment.color() == 0x008000FF)
         .expect("relative overlay background");
 
     assert!(
@@ -720,16 +723,14 @@ fn block_after_baseline_inline_replaced_content_starts_after_the_line_descender(
     let (parent, _) = id_geometry(&document, "parent", &document_resources);
     let (image, image_size) = id_geometry(&document, "image", &document_resources);
     let (after, _) = id_geometry(&document, "after", &document_resources);
-    let fragment = fragment_paint::render_fragment_view_images(
-        document.render_view(&document_resources).fragments(),
-    )
+    let fragment = (document.render_view(&document_resources).fragments()).images()
     .iter()
     .next()
     .expect("inline image fragment");
     let line = document
         .render_view(&document_resources)
         .text()
-        .line(fragment_paint::render_image_fragment_line(&fragment))
+        .line(fragment.line())
         .expect("image line");
 
     assert_eq!(image_size.height, 50.0);
@@ -781,28 +782,27 @@ fn block_after_baseline_inline_svg_starts_after_the_line_descender() {
     let shaped = prepared
         .shape(&mut glyph_cache, &mut shaped_resources)
         .expect("test shaper must register every glyph");
-    let mut image_metrics = crate::ImageMetrics::default();
+    let mut image_metrics = ImageMetrics::default();
     image_metrics.set(0, 300, 50);
     let document = shaped
-        .layout_with_metrics(
-            crate::LayoutConstraints::new(800.0, 16.0).unwrap(),
-            &image_metrics,
-            &shaped_resources,
+        .layout(
+            LayoutRequest::new(LayoutConstraints::new(800.0, 16.0).unwrap())
+                .with_image_metrics(&image_metrics),
+            &mut glyph_cache,
+            &mut shaped_resources,
         )
         .expect("layout requires the shaper-aware API for first-line styles");
     let (parent, _) = id_geometry(&document, "parent", &shaped_resources);
     let (image, image_size) = id_geometry(&document, "image", &shaped_resources);
     let (after, _) = id_geometry(&document, "after", &shaped_resources);
-    let fragment = fragment_paint::render_fragment_view_images(
-        document.render_view(&shaped_resources).fragments(),
-    )
+    let fragment = (document.render_view(&shaped_resources).fragments()).images()
     .iter()
     .next()
     .expect("inline SVG fragment");
     let line = document
         .render_view(&shaped_resources)
         .text()
-        .line(fragment_paint::render_image_fragment_line(&fragment))
+        .line(fragment.line())
         .expect("SVG line");
 
     assert_eq!(image_size.height, 50.0);
@@ -923,14 +923,15 @@ fn flow_root_list_item_matches_equivalent_reference_geometry_after_float() {
     );
     let marker_point = |document: &LaidOutDocument, resources: &GlyphResourceStore| {
         let view = document.render_view(resources);
-        let item = (0..box_queries::len(view.boxes()))
+        let item = (0..(view.boxes()).len())
             .map(layout_state::box_id_new)
-            .find(|&idx| box_queries::attribute(view.boxes(), idx, "id") == Some("subject"))
+            .find(|&idx| (view.boxes()).attribute(idx, "id") == Some("subject"))
             .expect("list item");
-        let marker = box_queries::list_marker(view.boxes(), item)
+        let marker = (view.boxes())
+            .list_marker(item)
             .expect("outside marker")
             .marker_box();
-        box_queries::render_box_view_point(view.boxes(), marker).expect("marker geometry")
+        (view.boxes()).point(marker).expect("marker geometry")
     };
     assert_eq!(
         marker_point(&actual, &actual_resources),
@@ -1148,18 +1149,18 @@ fn blockified_absolute_inline_uses_authored_geometry_and_positioned_paint_layer(
     let (parent, _) = id_geometry(&document, "parent", &document_resources);
     let (absolute, size) = id_geometry(&document, "absolute", &document_resources);
     let decorations =
-        fragment_paint::decorations(document.render_view(&document_resources).fragments())
+        (document.render_view(&document_resources).fragments()).decorations()
             .iter()
             .collect::<Vec<_>>();
     let green = decorations
         .iter()
-        .find(|fragment| fragment_paint::decoration_color(&fragment) == 0x008000FF)
+        .find(|fragment| fragment.color() == 0x008000FF)
         .unwrap_or_else(|| {
             panic!(
                 "absolute background; colors={:?}",
                 decorations
                     .iter()
-                    .map(|fragment| fragment_paint::decoration_color(&fragment))
+                    .map(|fragment| fragment.color())
                     .collect::<Vec<_>>()
             )
         });
@@ -1167,12 +1168,10 @@ fn blockified_absolute_inline_uses_authored_geometry_and_positioned_paint_layer(
     assert_eq!(absolute, parent);
     assert_eq!(size, Size::new(300.0, 100.0));
     assert_eq!(green.rect(), kurbo::Rect::from_origin_size(parent, size));
-    assert!(fragment_paint::decoration_is_in_positioned_layer(&green));
-    assert!(!fragment_paint::decoration_is_in_negative_positioned_layer(
-        &green
-    ));
+    assert!(green.is_in_positioned_layer());
+    assert!(!green.is_in_negative_positioned_layer());
     assert!(
-        fragment_paint::render_decoration_line(&green).is_none(),
+        green.line().is_none(),
         "blockified absolute paint must be replayed by the global positioned pass"
     );
 }
@@ -1280,25 +1279,21 @@ fn nested_relative_split_ancestors_accumulate_offsets_and_negative_layers() {
         let document = layout_html(&html, 300.0, &mut resources);
         let (point, size) = id_geometry(&document, "block", &resources);
         let view = document.render_view(&resources);
-        let background = fragment_paint::decorations(view.fragments())
+        let background = (view.fragments()).decorations()
             .iter()
-            .find(|fragment| fragment_paint::decoration_color(&fragment) == 0x008000ff)
+            .find(|fragment| fragment.color() == 0x008000ff)
             .expect("block background");
         assert_eq!(
             background.rect(),
             kurbo::Rect::from_origin_size(point, size)
         );
-        assert!(fragment_paint::decoration_is_in_positioned_layer(
-            &background
-        ));
-        assert!(fragment_paint::decoration_is_in_negative_positioned_layer(
-            &background
-        ));
+        assert!(background.is_in_positioned_layer());
+        assert!(background.is_in_negative_positioned_layer());
         assert!(
             view.text()
                 .lines()
                 .iter()
-                .any(|line| text_paint::line_is_in_negative_positioned_layer(&line))
+                .any(|line| line.line_is_in_negative_positioned_layer())
         );
         points.push(point);
     }
@@ -1315,7 +1310,8 @@ fn z_index_orders_positioned_text_and_backgrounds_independently_of_dom_order() {
     let text = document.render_view(&document_resources).text();
     let lines = text.lines().iter().collect::<Vec<_>>();
     assert_eq!(lines.len(), 2, "positioned fixture lines: {lines:?}");
-    let painted_starts = text_paint::paint_order(text)
+    let painted_starts = (text)
+        .paint_order()
         .iter()
         .map(|&id| text.line(id).unwrap().start())
         .collect::<Vec<_>>();
@@ -1324,9 +1320,9 @@ fn z_index_orders_positioned_text_and_backgrounds_independently_of_dom_order() {
         "the later low-z line must paint before the earlier high-z line"
     );
 
-    let colors = fragment_paint::decorations(document.render_view(&document_resources).fragments())
+    let colors = (document.render_view(&document_resources).fragments()).decorations()
         .iter()
-        .map(|fragment| fragment_paint::decoration_color(&fragment))
+        .map(|fragment| fragment.color())
         .filter(|color| matches!(color, 0x008000FF | 0xFF0000FF))
         .collect::<Vec<_>>();
     assert_eq!(
@@ -1344,9 +1340,9 @@ fn later_relative_border_paints_above_earlier_absolute_background_at_auto_z() {
         100.0,
         &mut document_resources,
     );
-    let colors = fragment_paint::decorations(document.render_view(&document_resources).fragments())
+    let colors = (document.render_view(&document_resources).fragments()).decorations()
         .iter()
-        .map(|fragment| fragment_paint::decoration_color(&fragment))
+        .map(|fragment| fragment.color())
         .filter(|color| matches!(color, 0x0000ffff | 0xff0000ff))
         .collect::<Vec<_>>();
     assert_eq!(
@@ -1364,9 +1360,9 @@ fn inline_block_background_paints_above_a_later_overlapping_block_background() {
         100.0,
         &mut document_resources,
     );
-    let colors = fragment_paint::decorations(document.render_view(&document_resources).fragments())
+    let colors = (document.render_view(&document_resources).fragments()).decorations()
         .iter()
-        .map(|fragment| fragment_paint::decoration_color(&fragment))
+        .map(|fragment| fragment.color())
         .filter(|color| matches!(color, 0x008000FF | 0xFF0000FF))
         .collect::<Vec<_>>();
 
@@ -1385,9 +1381,9 @@ fn descendant_background_stays_in_its_inline_block_atomic_paint_group() {
         100.0,
         &mut document_resources,
     );
-    let colors = fragment_paint::decorations(document.render_view(&document_resources).fragments())
+    let colors = (document.render_view(&document_resources).fragments()).decorations()
         .iter()
-        .map(|fragment| fragment_paint::decoration_color(&fragment))
+        .map(|fragment| fragment.color())
         .filter(|color| matches!(color, 0x008000FF | 0xFF0000FF))
         .collect::<Vec<_>>();
 
@@ -1410,18 +1406,21 @@ fn later_inline_text_paints_after_earlier_inline_block_text() {
     let glyph_for = |target| {
         (0..text.glyph_count() as u32)
             .find(|index| {
-                text_paint::glyph_at(text, *index as usize)
-                    .and_then(|glyph| text_paint::glyph_metric(text, glyph))
+                (text)
+                    .glyph_at(*index as usize)
+                    .and_then(|glyph| text.glyph_metric(glyph))
                     .is_some_and(|metric| metric.ch() == target)
             })
             .expect("fixture glyph must exist")
     };
-    let earlier_atomic_line = text_paint::render_text_view_line_for_glyph(text, glyph_for('R'))
+    let earlier_atomic_line = (text)
+        .line_for_glyph(glyph_for('R'))
         .expect("inline-block text must own a line");
-    let later_inline_line = text_paint::render_text_view_line_for_glyph(text, glyph_for('G'))
+    let later_inline_line = (text)
+        .line_for_glyph(glyph_for('G'))
         .expect("later inline text must own a line");
 
-    let paint_order = text_paint::paint_order(text);
+    let paint_order = text.paint_order();
     let earlier_position = paint_order
         .iter()
         .position(|&line| line == earlier_atomic_line)
@@ -1444,9 +1443,9 @@ fn negative_z_child_of_auto_positioned_parent_paints_behind_parent_background() 
         100.0,
         &mut document_resources,
     );
-    let colors = fragment_paint::decorations(document.render_view(&document_resources).fragments())
+    let colors = (document.render_view(&document_resources).fragments()).decorations()
         .iter()
-        .map(|fragment| fragment_paint::decoration_color(&fragment))
+        .map(|fragment| fragment.color())
         .filter(|color| matches!(color, 0x008000FF | 0xFF0000FF))
         .collect::<Vec<_>>();
     assert_eq!(colors, vec![0xFF0000FF, 0x008000FF]);
@@ -1468,7 +1467,7 @@ fn negative_absolute_multiline_text_is_marked_for_the_negative_paint_pass() {
         .collect::<Vec<_>>();
     let negative = lines
         .iter()
-        .filter(|line| text_paint::line_is_in_negative_positioned_layer(&line))
+        .filter(|line| line.line_is_in_negative_positioned_layer())
         .count();
 
     assert_eq!(
@@ -1501,9 +1500,9 @@ fn float_backgrounds_paint_after_ordinary_in_flow_block_backgrounds() {
         100.0,
         &mut document_resources,
     );
-    let colors = fragment_paint::decorations(document.render_view(&document_resources).fragments())
+    let colors = (document.render_view(&document_resources).fragments()).decorations()
         .iter()
-        .map(|fragment| fragment_paint::decoration_color(&fragment))
+        .map(|fragment| fragment.color())
         .filter(|color| matches!(color, 0x008000FF | 0xFF0000FF))
         .collect::<Vec<_>>();
     assert_eq!(colors, vec![0xFF0000FF, 0x008000FF]);
@@ -1648,10 +1647,10 @@ fn blockified_absolute_table_cell_is_retained_as_row_out_of_flow_content() {
     assert_eq!(cell_point.x, 0.0);
     assert_eq!(cell_size, Size::new(20.0, 20.0));
     assert!(
-        fragment_paint::decorations(document.render_view(&document_resources).fragments())
+        (document.render_view(&document_resources).fragments()).decorations()
             .iter()
             .any(
-                |decoration| fragment_paint::decoration_color(&decoration) == 0x008000ff
+                |decoration| decoration.color() == 0x008000ff
                     && decoration.rect().origin() == cell_point
             )
     );
@@ -1680,14 +1679,14 @@ fn rtl_absolute_static_position_keeps_its_line_inside_the_shrink_to_fit_box() {
 
     assert_eq!(child_point.x + child_size.width, parent_point.x + 200.0);
     assert!(
-        text_paint::line_is_in_positioned_layer(&line),
+        line.line_is_in_positioned_layer(),
         "line layers: {:?}",
         lines
             .iter()
             .map(|line| (
                 line.point(),
                 line.height(),
-                text_paint::line_is_in_positioned_layer(&line)
+                line.line_is_in_positioned_layer()
             ))
             .collect::<Vec<_>>()
     );
@@ -1709,9 +1708,9 @@ fn inline_block_percentage_child_uses_max_height_constrained_basis() {
     let (parent_point, parent_size) = id_geometry(&document, "parent", &document_resources);
     let (child_point, child_size) = id_geometry(&document, "child", &document_resources);
     let decorations =
-        fragment_paint::decorations(document.render_view(&document_resources).fragments())
+        (document.render_view(&document_resources).fragments()).decorations()
             .iter()
-            .map(|fragment| (fragment_paint::decoration_color(&fragment), fragment.rect()))
+            .map(|fragment| (fragment.color(), fragment.rect()))
             .collect::<Vec<_>>();
 
     assert_eq!(parent_size, Size::new(100.0, 100.0));
@@ -1736,7 +1735,7 @@ fn block_percentage_child_uses_inline_block_content_height() {
         )
         .shape(&mut glyph_cache, &mut document_resources)
         .expect("test shaper must register every glyph")
-        .layout(crate::LayoutConstraints::new(300.0, 16.0).unwrap(), &document_resources).expect("layout requires the shaper-aware API for first-line styles");
+        .layout(LayoutRequest::new(LayoutConstraints::new(300.0, 16.0).unwrap()), &mut glyph_cache, &mut document_resources).expect("layout requires the shaper-aware API for first-line styles");
     let (parent_point, parent_size) = id_geometry(&document, "parent", &document_resources);
     let (child_point, child_size) = id_geometry(&document, "child", &document_resources);
 
@@ -1744,34 +1743,32 @@ fn block_percentage_child_uses_inline_block_content_height() {
     assert_eq!(child_point, parent_point);
     assert_eq!(child_size, parent_size);
     let decorations =
-        fragment_paint::decorations(document.render_view(&document_resources).fragments());
+        (document.render_view(&document_resources).fragments()).decorations();
     let parent_rect = decorations
         .iter()
-        .find(|decoration| fragment_paint::decoration_color(&decoration) == 0xff0000ff)
+        .find(|decoration| decoration.color() == 0xff0000ff)
         .expect("red parent background")
         .rect();
     let child_rect = decorations
         .iter()
-        .find(|decoration| fragment_paint::decoration_color(&decoration) == 0x008000ff)
+        .find(|decoration| decoration.color() == 0x008000ff)
         .expect("green child background")
         .rect();
     assert_eq!(child_rect, parent_rect);
     let view = document.render_view(&document_resources);
-    let line_idx = text_paint::render_text_view_spatial_order(view.text())
+    let line_idx = (view.text())
+        .spatial_order()
         .iter()
         .copied()
         .find(|&line_idx| {
-            fragment_paint::render_fragment_view_decorations_for_line(view.fragments(), line_idx)
+            (view.fragments()).decorations_for_line(line_idx)
                 .iter()
-                .any(|decoration| fragment_paint::decoration_color(&decoration) == 0xff0000ff)
+                .any(|decoration| decoration.color() == 0xff0000ff)
         })
         .expect("inline-block line");
-    let line_colors = fragment_paint::render_fragment_view_decorations_for_line(
-        document.render_view(&document_resources).fragments(),
-        line_idx,
-    )
+    let line_colors = (document.render_view(&document_resources).fragments()).decorations_for_line(line_idx)
     .iter()
-    .map(|decoration| fragment_paint::decoration_color(&decoration))
+    .map(|decoration| decoration.color())
     .collect::<Vec<_>>();
     let parent_background = line_colors
         .iter()

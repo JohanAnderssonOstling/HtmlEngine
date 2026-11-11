@@ -1,10 +1,10 @@
-#[cfg(test)]
-use html_engine_model::layout_state;
 use super::box_constraints::constrain_size;
 use super::placement::BoxPlacement;
 use super::{BoxLayoutResult, ContentLayoutResult, ResolvedBoxSizing};
 use super::{LayoutEngine, OutputRanges};
-use crate::layout_model::{Children, LayoutMode};
+use html_engine_model::{Children, LayoutMode};
+#[cfg(test)]
+use html_engine_model::layout_state;
 use html_style_model::{BorderCollapseMode, Float, PositionMode, TextDirection};
 use html_style_model::{BoxSizing, UsedPreferredSize as PreferredSize};
 use kurbo::{Rect, Size, Vec2};
@@ -28,10 +28,10 @@ pub(super) fn finish_resolved_box(
         engine.geometry.set_decoration_rect(
             request.box_idx,
             Rect::new(
-                rect.x0 - model.padding_left - model.border_left,
-                rect.y0 - model.padding_top - model.border_top,
-                rect.x1 + model.padding_right + model.border_right,
-                rect.y1 + model.padding_bottom + model.border_bottom,
+                rect.x0 - f64::from(model.padding_left + model.border_left),
+                rect.y0 - f64::from(model.padding_top + model.border_top),
+                rect.x1 + f64::from(model.padding_right + model.border_right),
+                rect.y1 + f64::from(model.padding_bottom + model.border_bottom),
             ),
         );
     }
@@ -55,14 +55,9 @@ pub(super) fn finish_resolved_box(
         .or_else(|| inline_table_first_row_bottom(engine, request.box_idx));
     let last_baseline =
         last_baseline.or_else(|| last_in_flow_block_child_bottom(engine, request.box_idx));
-    let after_margin = content.after_margin.unwrap_or_else(|| {
-        super::block::MarginStrut::from_margin(
-            engine
-                .reader
-                .vertical_margins(request.box_idx, request.available_width)
-                .1,
-        )
-    });
+    let after_margin = content
+        .after_margin
+        .unwrap_or_else(|| super::block::MarginStrut::from_margin(resolved.resolved_bottom_margin));
     BoxLayoutResult {
         size,
         natural_content_size: content.size,
@@ -71,6 +66,7 @@ pub(super) fn finish_resolved_box(
         after_margin,
         output,
         float_context_bottom: engine
+            .scratch
             .floats
             .current_float_context()
             .map_or(0.0, |context| context.max_bottom() - origin_y),
@@ -190,14 +186,13 @@ pub fn relative_position_offset(
 
 #[cfg(test)]
 mod tests {
-    use html_pipeline::engine::fragment_paint;
+    use html_pipeline::engine::LayoutRequest;
 
-    use html_pipeline::engine::box_queries;
 
-    use crate::GlyphResourceStore;
-    use crate::layout_model::BoxId;
+    use html_engine_model::GlyphResourceStore;
+    use html_engine_model::BoxId;
 
-    use crate::LayoutConstraints;
+    use html_engine_model::LayoutConstraints;
     use crate::parser::DocumentFactory;
     use crate::test_support::TestGlyphShaper;
 
@@ -212,24 +207,27 @@ mod tests {
             .shape(&mut shaper, &mut document_resources)
             .expect("test glyphs shape")
             .layout(
-                LayoutConstraints::new(300.0, 16.0).unwrap(),
-                &document_resources,
+                LayoutRequest::new(LayoutConstraints::new(300.0, 16.0).unwrap()),
+                &mut shaper,
+                &mut document_resources,
             )
             .expect("layout requires the shaper-aware API for first-line styles");
         let view = document.render_view(&document_resources);
         let box_by_id = |id| {
-            (0..box_queries::len(view.boxes()))
+            (0..(view.boxes()).len())
                 .map(layout_state::box_id_new)
-                .find(|&index| box_queries::attribute(view.boxes(), index, "id") == Some(id))
+                .find(|&index| (view.boxes()).attribute(index, "id") == Some(id))
                 .expect("box id exists")
         };
-        let cell = box_queries::render_box_view_point(view.boxes(), box_by_id("cell"))
+        let cell = (view.boxes())
+            .point(box_by_id("cell"))
             .expect("cell geometry");
-        let content = box_queries::render_box_view_point(view.boxes(), box_by_id("content"))
+        let content = (view.boxes())
+            .point(box_by_id("content"))
             .expect("content geometry");
-        let backgrounds: Vec<_> = fragment_paint::decorations(view.fragments())
+        let backgrounds: Vec<_> = (view.fragments()).decorations()
             .iter()
-            .filter(|fragment| fragment_paint::decoration_color(&fragment) == 0xff0000ff)
+            .filter(|fragment| fragment.color() == 0xff0000ff)
             .map(|fragment| fragment.rect())
             .collect();
 
@@ -243,7 +241,7 @@ mod tests {
     }
 }
 
-fn resolve_used_border_size(
+pub(super) fn resolve_used_border_size(
     engine: &LayoutEngine<'_, '_>,
     resolved: &ResolvedBoxSizing,
     content_size: Size,
@@ -342,8 +340,8 @@ fn resolve_used_border_size(
 /// supplies the synthesized baseline used by an enclosing inline-block. The
 /// baseline is its bottom border edge; padding after the child belongs to the
 /// enclosing box and must not move it.
-fn last_in_flow_block_child_bottom(session: &LayoutEngine<'_, '_>, box_idx: usize) -> Option<f64> {
-    let LayoutMode::Block(block) = session.reader.box_layout_mode(box_idx)? else {
+fn last_in_flow_block_child_bottom(engine: &LayoutEngine<'_, '_>, box_idx: usize) -> Option<f64> {
+    let LayoutMode::Block(block) = engine.reader.box_layout_mode(box_idx)? else {
         return None;
     };
     let Children::Blocks(children) = &block.children else {
@@ -354,19 +352,17 @@ fn last_in_flow_block_child_bottom(session: &LayoutEngine<'_, '_>, box_idx: usiz
         .rev()
         .map(|child| *child as usize)
         .find(|child| {
-            let style = session.reader.style(*child);
+            let style = engine.reader.style(*child);
             style.position() != PositionMode::Absolute && style.float() == Float::None
         })?;
-    let parent_y = session.geometry.point(box_idx).y;
-    let child_point = session.geometry.point(child_idx);
-    let child_size = session.geometry.size(child_idx);
+    let parent_y = engine.geometry.point(box_idx).y;
+    let child_point = engine.geometry.point(child_idx);
+    let child_size = engine.geometry.size(child_idx);
     Some(child_point.y + child_size.height - parent_y)
 }
 
 fn inline_table_first_row_bottom(engine: &LayoutEngine<'_, '_>, table_idx: usize) -> Option<f64> {
-    let LayoutMode::Table(table) = engine.reader.box_layout_mode(table_idx)? else {
-        return None;
-    };
+    let table = engine.reader.box_table(table_idx)?;
     let row_idx = *table.rows.first()? as usize;
     let table_y = engine.geometry.point(table_idx).y;
     let row_point = engine.geometry.point(row_idx);

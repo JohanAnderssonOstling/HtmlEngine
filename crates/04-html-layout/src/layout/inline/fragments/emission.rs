@@ -1,12 +1,13 @@
 //! Durable text, box, image, and glyph-fragment publication.
 
-use html_engine_model::shaping_contracts;
 use html_style_model::computed_style;
 use super::*;
+use crate::layout::engine::LayoutPassKind;
 use crate::layout::inline_reader::InlineReader;
 use crate::layout::{LayoutEngine, resolve_vertical_size};
-use crate::layout_model::{CompactTextFragments, GroupedArena, OwnedTextFragments};
+use html_engine_model::{CompactTextFragments, GroupedArena, LineId, OwnedTextFragments};
 use html_text::spaced_advance;
+use std::borrow::Cow;
 use std::ptr;
 
 /// Records independently positioned text fragments only for lines where
@@ -20,7 +21,6 @@ pub(super) fn positioned_text_fragments(
     metrics_view: MetricsView<'_>,
     plain_reordered: bool,
 ) -> Option<OwnedTextFragments> {
-    profile_scope!("fragments.positioned_text");
     if !needs_positioned_text_fragments(span, metrics_view, plain_reordered) {
         return None;
     }
@@ -354,7 +354,23 @@ fn positioned_sequential_text(
     line: &LineLayout,
     containing_width: f64,
 ) -> (Option<OwnedTextFragments>, Vec<LineInlineBoxFragment>) {
-    let text = needs_positioned_text_fragments(span, metrics, false).then(|| {
+    let needs_text = needs_positioned_text_fragments(span, metrics, false);
+    let has_owners = metrics.chunks(span).any(|(_, metrics)| {
+        let owner = metrics.owner_box_idx;
+        owner_has_inline_fragments(engine, (owner != u32::MAX).then_some(owner as usize))
+    });
+    if needs_text && has_owners {
+        return if span.len() <= 1 << 14 {
+            sequential_text_and_box_fragments::<CompactTextFragments>(
+                engine, container_box_idx, span, metrics, replaced, line, containing_width,
+            )
+        } else {
+            sequential_text_and_box_fragments::<LineTextFragment>(
+                engine, container_box_idx, span, metrics, replaced, line, containing_width,
+            )
+        };
+    }
+    let text = needs_text.then(|| {
         if span.len() <= 1 << 14 {
             regular_sequential_fragments(&engine.text, span, metrics, line).unwrap_or_else(|| {
                 sequential_text_fragments::<CompactTextFragments>(&engine.text, span, metrics, line)
@@ -362,10 +378,6 @@ fn positioned_sequential_text(
         } else {
             sequential_text_fragments::<LineTextFragment>(&engine.text, span, metrics, line)
         }
-    });
-    let has_owners = metrics.chunks(span).any(|(_, metrics)| {
-        let owner = metrics.owner_box_idx;
-        owner_has_inline_fragments(engine, (owner != u32::MAX).then_some(owner as usize))
     });
     let boxes = if has_owners {
         positioned_inline_box_fragments_from(
@@ -383,6 +395,43 @@ fn positioned_sequential_text(
         Vec::new()
     };
     (text, boxes)
+}
+
+/// Resolve source positions once and feed both publication consumers from
+/// that stream. Neither consumer materializes an intermediate placement array.
+fn sequential_text_and_box_fragments<R: TextFragmentRecord>(
+    engine: &LayoutEngine<'_, '_>,
+    container_box_idx: usize,
+    span: TokenSpan<'_>,
+    metrics: MetricsView<'_>,
+    replaced: &[ReplacedToken],
+    line: &LineLayout,
+    containing_width: f64,
+) -> (Option<OwnedTextFragments>, Vec<LineInlineBoxFragment>) {
+    let mut text = TextFragmentBuilder::<R> {
+        fragments: Default::default(),
+        has_fragment: false,
+        current_metrics: None,
+        current_level: None,
+        previous_end: 0.0,
+    };
+    let positions = sequential_text_positions(&engine.text, span, metrics, line)
+        .enumerate()
+        .map(|(index, (token, metrics, x, advance))| {
+            text.append(index, token, metrics, x, 0.0, || advance);
+            ((token, metrics), (x, advance, 0.0))
+        });
+    let boxes = positioned_inline_box_fragments_from(
+        engine,
+        container_box_idx,
+        positions,
+        false,
+        replaced,
+        line.line_height,
+        line.baseline,
+        containing_width,
+    );
+    (Some(R::finish(text.fragments)), boxes)
 }
 
 /// Reordered text without offsets or tabs can read its x column directly.
@@ -682,7 +731,6 @@ fn positioned_plain_inline_box_fragments(
     line: &LineLayout,
     containing_width: f64,
 ) -> Vec<LineInlineBoxFragment> {
-    profile_scope!("fragments.plain_inline_boxes");
     // Plain lines contain only glyphs, whose fragment owner is the metrics
     // owner. Uniform/ranged metrics can reject an undecorated line without
     // loading token metadata, widths, or source glyphs.
@@ -787,6 +835,8 @@ struct InlineFragmentAncestor {
     relative_offset: Vec2,
     baseline: f32,
     content_bounds: Option<(f32, f32)>,
+    // Logical-order fragments keep their slot throughout this line.
+    fragment_index: Option<usize>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -799,7 +849,6 @@ fn resolve_inline_fragment_ancestors(
     containing_width: f64,
     ancestors: &mut Vec<InlineFragmentAncestor>,
 ) {
-    profile_scope!("fragments.resolve_ancestors");
     ancestors.clear();
     let mut outside_formatting_context = false;
     while let Some(box_idx) = owner {
@@ -823,7 +872,7 @@ fn resolve_inline_fragment_ancestors(
                 let style = engine.reader.style(box_idx);
                 let font_size = style.font_size() as f64;
                 let font_metrics = engine.reader.font_metrics(box_idx);
-                let (ascent, descent) = shaping_contracts::font_relative_metrics_line_box_extents(font_metrics, font_size);
+                let (ascent, descent) = font_metrics.line_box_extents(font_size);
                 let mut top = fragment_baseline - ascent as f32;
                 let mut bottom = fragment_baseline + descent as f32;
                 let trim = style.text_box_trim();
@@ -853,6 +902,7 @@ fn resolve_inline_fragment_ancestors(
                 relative_offset,
                 baseline: fragment_baseline,
                 content_bounds,
+                fragment_index: None,
             });
         }
         if stops_text_decoration_propagation(engine, box_idx) {
@@ -876,19 +926,44 @@ fn positioned_inline_box_fragments_from<'m>(
     baseline: f64,
     containing_width: f64,
 ) -> Vec<LineInlineBoxFragment> {
-    profile_scope!("fragments.positioned_inline_boxes");
     // A line normally intersects only a handful of inline boxes. A compact
     // linear accumulator beats allocating a box-count-sized side table for
     // every line while still publishing one durable fragment per owner.
     let mut bounds = Vec::<LineInlineBoxFragment>::new();
     let mut cached_owner = None;
     let mut ancestors = Vec::new();
-    for (paint_order, ((token, metrics), (x, advance, y_offset))) in
-        placements.into_iter().enumerate()
+    let mut placements = placements.into_iter().enumerate().peekable();
+    while let Some((paint_order, ((token, metrics), (mut x, advance, y_offset)))) =
+        placements.next()
     {
         let paint_order = paint_order as u32;
         if advance <= 0.0 && !matches!(token.kind(), InlineTokenKind::InlineBoundary { .. }) {
             continue;
+        }
+        let mut end_x = x + advance;
+        // Logical glyph runs share all ancestor geometry and fragment flags.
+        // Reduce their horizontal extent before visiting the ancestor chain:
+        // O(glyphs + runs * depth), rather than O(glyphs * depth). Keep source
+        // paint order from the first glyph, and preserve each x + advance sum
+        // instead of reconstructing the endpoint from a combined advance.
+        if !bidi
+            && matches!(token.kind(), InlineTokenKind::Glyph { .. })
+            && x.is_finite()
+            && end_x.is_finite()
+        {
+            while let Some((_, ((_, _), (next_x, next_advance, _)))) =
+                placements.next_if(|(_, ((next, next_metrics), (next_x, next_advance, next_y)))| {
+                    matches!(next.kind(), InlineTokenKind::Glyph { .. })
+                        && ptr::eq(metrics, *next_metrics)
+                        && next_y.to_bits() == y_offset.to_bits()
+                        && *next_advance > 0.0
+                        && next_x.is_finite()
+                        && (next_x + next_advance).is_finite()
+                })
+            {
+                x = x.min(next_x);
+                end_x = end_x.max(next_x + next_advance);
+            }
         }
         let token_top = (baseline - metrics.ascent as f64 - y_offset as f64) as f32;
         let token_bottom = (baseline + metrics.descent as f64 - y_offset as f64) as f32;
@@ -957,7 +1032,15 @@ fn positioned_inline_box_fragments_from<'m>(
             );
             cached_owner = Some(owner);
         }
-        for ancestor in &ancestors {
+        // New fragments have monotonically increasing source positions. At
+        // the same position, append enclosing boxes before their descendants
+        // so logical-order lines already have their final paint order.
+        let mut ancestor_iter = ancestors.iter_mut();
+        while let Some(ancestor) = if bidi {
+            ancestor_iter.next()
+        } else {
+            ancestor_iter.next_back()
+        } {
             let box_idx = ancestor.box_idx;
             let relative_offset = ancestor.relative_offset;
             let fragment_baseline = ancestor.baseline;
@@ -966,14 +1049,24 @@ fn positioned_inline_box_fragments_from<'m>(
             let own_boundary = boundary.filter(|boundary| boundary.0 == box_idx);
             let fragment_start =
                 (own_boundary.map_or(x, |boundary| boundary.1) + relative_offset.x) as f32;
-            let fragment_end = (own_boundary.map_or(x + advance, |boundary| boundary.1)
+            let fragment_end = (own_boundary.map_or(end_x, |boundary| boundary.1)
                 + relative_offset.x) as f32;
-            if let Some(fragment) = bounds.iter_mut().find(|fragment| {
-                fragment.box_idx as usize == box_idx
-                    && (!bidi
-                        || (fragment.start_x <= fragment_end + 0.001
-                            && fragment.end_x >= fragment_start - 0.001))
-            }) {
+            // LTR bounds are never reordered or removed during accumulation.
+            // Resolve the slot once per owner transition, then update it directly.
+            // Bidi fragments can be disjoint, so their overlap search stays dynamic.
+            let fragment_index = ancestor.fragment_index.or_else(|| {
+                bounds.iter().position(|fragment| {
+                    fragment.box_idx as usize == box_idx
+                        && (!bidi
+                            || (fragment.start_x <= fragment_end + 0.001
+                                && fragment.end_x >= fragment_start - 0.001))
+                })
+            });
+            if let Some(index) = fragment_index {
+                if !bidi {
+                    ancestor.fragment_index = Some(index);
+                }
+                let fragment = &mut bounds[index];
                 fragment.paint_order = fragment.paint_order.min(paint_order);
                 fragment.start_x = fragment.start_x.min(fragment_start);
                 fragment.end_x = fragment.end_x.max(fragment_end);
@@ -1001,6 +1094,9 @@ fn positioned_inline_box_fragments_from<'m>(
                     },
                     |boundary| (boundary.2, boundary.3),
                 );
+                if !bidi {
+                    ancestor.fragment_index = Some(bounds.len());
+                }
                 bounds.push(LineInlineBoxFragment {
                     box_idx: box_idx as u32,
                     paint_order,
@@ -1052,18 +1148,18 @@ fn positioned_inline_box_fragments_from<'m>(
             }
         }
         bounds = merged;
+        // Visual merging groups by box and x coordinate, so restore source
+        // paint order here. Logical-order lines never need this sorting pass.
+        bounds.sort_by_key(|fragment| {
+            let mut depth = 0u32;
+            let mut parent = engine.reader.get_parent(fragment.box_idx as usize);
+            while let Some(parent_idx) = parent {
+                depth += 1;
+                parent = engine.reader.get_parent(parent_idx);
+            }
+            (fragment.paint_order, depth)
+        });
     }
-    // For the same source position, ancestor backgrounds/borders paint before
-    // descendant boxes. Token order remains the primary key across siblings.
-    bounds.sort_by_key(|fragment| {
-        let mut depth = 0u32;
-        let mut parent = engine.reader.get_parent(fragment.box_idx as usize);
-        while let Some(parent_idx) = parent {
-            depth += 1;
-            parent = engine.reader.get_parent(parent_idx);
-        }
-        (fragment.paint_order, depth)
-    });
     bounds
 }
 
@@ -1076,7 +1172,7 @@ pub(super) fn inline_relative_position_offset(
     for current_idx in inline_ancestors(&engine.reader, Some(box_idx)) {
         let style = engine.reader.style(current_idx);
         if style.position() == html_style_model::PositionMode::Relative {
-            offset += crate::layout::box_positioning::relative_position_offset(
+            offset += crate::layout::box_s03_finish::relative_position_offset(
                 &style,
                 containing_width,
                 None,
@@ -1103,11 +1199,11 @@ fn inline_fragment_vertical_align_offset(
         if !value.is_initial() {
             let own_line_height = style.resolved_line_height();
             let font_size = style.font_size() as f64;
-            let (ascent, descent) = shaping_contracts::font_relative_metrics_line_box_extents(engine
-                .reader
-                .font_metrics(current_idx), font_size);
+            let (ascent, descent) =
+                (engine.reader.font_metrics(current_idx)).line_box_extents(font_size);
             let half_leading = (own_line_height - ascent - descent) * 0.5;
-            let (parent_ascent, parent_descent) = parent_font_content_extents(engine, current_idx);
+            let (parent_ascent, parent_descent, parent_x_height) =
+                parent_font_content_extents(engine, current_idx);
             offset += vertical_align_metrics_offset(
                 value,
                 ascent,
@@ -1119,6 +1215,7 @@ fn inline_fragment_vertical_align_offset(
                 baseline,
                 parent_ascent,
                 parent_descent,
+                parent_x_height,
             );
         }
     }
@@ -1273,28 +1370,31 @@ pub(super) fn line_publishes(
             })
 }
 
-/// Writes fragments for one broken line using a precomputed line layout.
-///
-/// The write phase only mutates the document; all layout decisions have
-/// already been made by `break_lines` and `measure_line`.
-pub(in crate::layout::inline) fn write_line_fragments(
-    engine: &mut LayoutEngine<'_, '_>,
+/// Position-independent fragments retained with an immutable paragraph result.
+pub(in crate::layout::inline) struct LineFragmentPlan {
+    text: Option<OwnedTextFragments>,
+    boxes: Vec<LineInlineBoxFragment>,
+}
+
+impl LineFragmentPlan {
+    pub(in crate::layout::inline) fn storage_bytes(&self) -> usize {
+        size_of::<Self>()
+            + self.text.as_ref().map_or(0, OwnedTextFragments::storage_bytes)
+            + self.boxes.capacity() * size_of::<LineInlineBoxFragment>()
+    }
+}
+
+fn prepare_line_fragment_plan(
+    engine: &LayoutEngine<'_, '_>,
     container_box_idx: usize,
     span: TokenSpan<'_>,
     metrics_view: MetricsView<'_>,
     replaced: &[ReplacedToken],
-    origin: Point,
     line: &LineLayout,
-    paint_color: Option<u32>,
     containing_width: f64,
-    static_inline_start: f64,
-) -> f64 {
-    profile_scope!("fragments.write");
-    let timing_started = engine.start_timing();
-    let point = Point::new(origin.x + line.x_offset, origin.y);
-    let line_idx = engine.fragments.state().line_output.lines.len();
+) -> LineFragmentPlan {
     let plain = line.placements.is_none() && !line.glyph_range.is_empty();
-    let (text_fragments, inline_box_fragments) = if plain {
+    let (text, boxes) = if plain {
         let inline_box_fragments = positioned_plain_inline_box_fragments(
             engine,
             container_box_idx,
@@ -1309,7 +1409,7 @@ pub(in crate::layout::inline) fn write_line_fragments(
         line.placements,
         Some(LinePlacements::Sequential { publish: false, .. })
     ) || (matches!(line.placements, Some(LinePlacements::Sequential { .. }))
-        && !span.metadata_iter().any(|token| token.is_tab()))
+        && !line.has_tabs)
     {
         positioned_sequential_text(
             engine,
@@ -1408,14 +1508,68 @@ pub(in crate::layout::inline) fn write_line_fragments(
         };
         (text_fragments, inline_box_fragments)
     };
+    LineFragmentPlan { text, boxes }
+}
+
+/// Writes fragments for one broken line using a precomputed line layout.
+///
+/// The write phase only mutates the document; all layout decisions have
+/// already been made by `break_lines` and `measure_line`.
+pub(in crate::layout::inline) fn write_line_fragments(
+    engine: &mut LayoutEngine<'_, '_>,
+    container_box_idx: usize,
+    span: TokenSpan<'_>,
+    metrics_view: MetricsView<'_>,
+    replaced: &[ReplacedToken],
+    origin: Point,
+    line: &mut LineLayout,
+    retain_fragments: bool,
+    paint_color: Option<u32>,
+    containing_width: f64,
+    static_inline_start: f64,
+) -> f64 {
+    let point = Point::new(origin.x + line.x_offset, origin.y);
+    let line_idx = engine.fragments.state().line_output.lines.len();
+    let plain = line.placements.is_none() && !line.glyph_range.is_empty();
+    // Probes consume line geometry and baselines, but never painted fragment
+    // structure. Preserve the line and source-position execution below.
+    let publish_fragments = engine.pass_kind == LayoutPassKind::Final;
+    if publish_fragments && retain_fragments && line.fragments.is_none() {
+        line.fragments = Some(Box::new(prepare_line_fragment_plan(
+            engine,
+            container_box_idx,
+            span,
+            metrics_view,
+            replaced,
+            line,
+            containing_width,
+        )));
+    }
+    let (text_fragments, inline_box_fragments) = if !publish_fragments {
+        (None, Cow::Borrowed(&[][..]))
+    } else if let Some(plan) = &line.fragments {
+        (plan.text.clone(), Cow::Borrowed(plan.boxes.as_slice()))
+    } else {
+        let plan = prepare_line_fragment_plan(
+            engine,
+            container_box_idx,
+            span,
+            metrics_view,
+            replaced,
+            line,
+            containing_width,
+        );
+        (plan.text, Cow::Owned(plan.boxes))
+    };
     // Absolute/float anchors are executable source-position markers, not
     // line-box content. Keep processing them below, but do not publish the
     // zero-height carrier line that exists solely to trigger that work.
-    let publishes_line = plain || line_publishes(engine, span, metrics_view, replaced, line);
+    let publishes_line = line.publishes_line;
     if publishes_line {
-        let inline_box_fragments = engine
-            .fragments
-            .push_inline_box_fragments(inline_box_fragments, engine.reader.box_count());
+        let inline_box_fragments = engine.fragments.push_inline_box_fragments(
+            inline_box_fragments.iter().copied(),
+            engine.reader.box_count(),
+        );
         let layout = engine.fragments.state_mut();
         let details = layout.line_output.push_details(
             line.optical_offset_x,
@@ -1478,9 +1632,9 @@ pub(in crate::layout::inline) fn write_line_fragments(
         Some(LinePlacements::Positioned(plan)) => {
             !line.punctuation_space_advances.is_empty()
                 || plan.offsets.iter().any(|run| run.y != 0.0)
+                || line.has_tabs
                 || span.metadata_iter().any(|token| {
-                    token.is_tab()
-                        || matches!(
+                    matches!(
                             token.kind(),
                             InlineTokenKind::Image { .. }
                                 | InlineTokenKind::AtomicBox { .. }
@@ -1499,7 +1653,6 @@ pub(in crate::layout::inline) fn write_line_fragments(
         _ => false,
     };
     if !needs_publication {
-        engine.record_timing(|t| t.write_line_fragments += timing_started.elapsed());
         return if publishes_line {
             line.line_height
         } else {
@@ -1603,7 +1756,18 @@ pub(in crate::layout::inline) fn write_line_fragments(
                 *border_size,
                 authored_height_is_definite,
             );
+            let children_start = engine.fragments.state().line_output.lines.len();
+            // The outer line owns fragmentation. Its nested formatting context
+            // must not insert page gaps into the measured atomic item.
             let _ = engine.layout_box(request);
+            let output = &mut engine.fragments.state_mut().line_output;
+            let children_end = output.lines.len();
+            if children_start < children_end {
+                output.atomic_inline_lines.push((
+                    LineId::new(line_idx),
+                    children_start..children_end,
+                ));
+            }
             engine
                 .fragments
                 .state_mut()
@@ -1620,6 +1784,9 @@ pub(in crate::layout::inline) fn write_line_fragments(
                 .fragments
                 .record_decoration_paint_order_since(paint_order, decoration_start);
         } else if let InlineTokenKind::Glyph { glyph_idx } = token.kind() {
+            if !publish_fragments {
+                return;
+            }
             debug_assert!(publishes_line);
             let adjusted_space = matches!(engine.text.character(glyph_idx), ' ' | '\u{00a0}') && {
                 let style = engine.reader.style(metrics.owner_box_idx as usize);
@@ -1663,6 +1830,7 @@ pub(in crate::layout::inline) fn write_line_fragments(
                 });
         } else if let InlineTokenKind::AbsoluteAnchor { box_idx } = token.kind() {
             let static_y = engine
+                .scratch
                 .floats
                 .current_float_context()
                 .map_or(point.y, |context| {
@@ -1721,7 +1889,6 @@ pub(in crate::layout::inline) fn write_line_fragments(
         }
         _ => {}
     }
-    engine.record_timing(|t| t.write_line_fragments += timing_started.elapsed());
     if publishes_line {
         line.line_height
     } else {

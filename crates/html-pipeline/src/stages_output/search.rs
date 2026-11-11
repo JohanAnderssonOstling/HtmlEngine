@@ -1,6 +1,5 @@
 //! Unicode-aware text queries. Returned offsets are logical character indices.
 
-use crate::stages::text_paint;
 use super::RenderTextView;
 use aho_corasick::{BuildError, Input, automaton::Automaton, nfa::contiguous::NFA};
 use std::ops::Range;
@@ -154,22 +153,140 @@ impl TextPatternMatcher {
         let mut normalized = Vec::new();
         for (index, query) in queries.into_iter().enumerate() {
             let query = query.as_ref();
-            if query.contains('\0') { continue; }
+            if query.contains('\0') {
+                continue;
+            }
             let mut needle = String::new();
             normalize_into(query, options, |character| needle.push(character));
-            if needle.is_empty() { continue; }
+            if needle.is_empty() {
+                continue;
+            }
             patterns.push(index);
             normalized.push(needle);
         }
         // Own the compact automaton directly. Disabling the optional prefilter
         // also avoids its internal shared ownership.
-        let automaton = NFA::builder().prefilter(false).build(&normalized)
+        let automaton = NFA::builder()
+            .prefilter(false)
+            .build(&normalized)
             .map_err(|cause| TextPatternError { cause })?;
-        Ok(Self { automaton, patterns, options })
+        Ok(Self {
+            automaton,
+            patterns,
+            options,
+        })
     }
 
+    pub fn find_matches(&self, text: &str) -> Vec<TextPatternMatch> {
+        if self.patterns.is_empty() || text.is_empty() {
+            return Vec::new();
+        }
+        let mut boundaries = Vec::new();
+        if self.options.whole_word {
+            boundaries.resize(text.chars().count() + 1, false);
+            boundaries[0] = true;
+            let mut position = 0;
+            for segment in text.split_word_bounds() {
+                position += segment.chars().count();
+                boundaries[position] = true;
+            }
+        }
+        let mut normalized = String::with_capacity(text.len());
+        let mut source = Vec::with_capacity(text.len());
+        let mut position = 0;
+        for (byte, grapheme) in text.grapheme_indices(true) {
+            let start = position;
+            position += grapheme.chars().count();
+            normalize_into(grapheme, self.options, |character| {
+                normalized.push(character);
+                source.extend(std::iter::repeat_n(
+                    (start..position, byte..byte + grapheme.len()),
+                    character.len_utf8(),
+                ));
+            });
+        }
+        self.automaton
+            .try_find_overlapping_iter(Input::new(&normalized))
+            .expect("standard unanchored overlapping search")
+            .filter_map(|found| {
+                let first = &source[found.start()];
+                let last = &source[found.end() - 1];
+                let range = first.0.start..last.0.end;
+                if self.options.whole_word && (!boundaries[range.start] || !boundaries[range.end]) {
+                    return None;
+                }
+                Some(TextPatternMatch {
+                    pattern: self.patterns[found.pattern().as_usize()],
+                    range,
+                    byte_range: first.1.start..last.1.end,
+                })
+            })
+            .collect()
+    }
 
-
+    pub fn match_lines<'a>(
+        &self,
+        view: RenderTextView<'a>,
+        lines: impl IntoIterator<Item = super::LineId>,
+    ) -> SourceTextMatches<'a> {
+        if self.patterns.is_empty() {
+            return SourceTextMatches {
+                view,
+                text: String::new(),
+                glyphs: Vec::new(),
+                matches: Vec::new(),
+            };
+        }
+        let mut ranges = lines
+            .into_iter()
+            .flat_map(|line| view.line_text_fragments(line).into_iter().flatten())
+            .filter(|fragment| fragment.visible())
+            .map(|fragment| fragment.glyphs())
+            .collect::<Vec<_>>();
+        super::merge_text_ranges(&mut ranges);
+        let mut text = String::new();
+        let mut glyphs = Vec::new();
+        let mut source_runs = view.visible_source_runs().peekable();
+        for range in ranges {
+            text.push('\0');
+            glyphs.push(None);
+            if let Some(before) = range
+                .start
+                .checked_sub(1)
+                .and_then(|glyph| view.character_at(glyph as usize))
+            {
+                text.push(before);
+                glyphs.push(None);
+            }
+            for glyph in range.clone() {
+                let Some(character) = view.character_at(glyph as usize) else {
+                    continue;
+                };
+                while source_runs
+                    .peek()
+                    .is_some_and(|run| run.glyphs().end <= glyph)
+                {
+                    source_runs.next();
+                }
+                let source = source_runs
+                    .peek()
+                    .is_some_and(|run| run.glyphs().contains(&glyph));
+                text.push(if source { character } else { '\0' });
+                glyphs.push(source.then_some(glyph));
+            }
+            if let Some(after) = view.character_at(range.end as usize) {
+                text.push(after);
+                glyphs.push(None);
+            }
+        }
+        let matches = self.find_matches(&text);
+        SourceTextMatches {
+            view,
+            text,
+            glyphs,
+            matches,
+        }
+    }
 }
 /// Owns the extracted page text and native match offsets. Iteration resolves
 /// source endpoints and borrows matched text; no per-match text copies or
@@ -205,7 +322,6 @@ impl SourceTextMatches<'_> {
         })
     }
 }
-
 
 #[cfg(test)]
 mod multi_pattern_tests {
@@ -252,7 +368,7 @@ mod multi_pattern_tests {
                     };
                     let matcher = TextPatternMatcher::new(queries, options).unwrap();
                     for text in texts {
-                        let found = text_pattern_matcher_find_matches(&matcher, text);
+                        let found = matcher.find_matches(text);
                         for (pattern, query) in queries.iter().enumerate() {
                             let actual = found
                                 .iter()
@@ -279,12 +395,9 @@ mod multi_pattern_tests {
             }
         }
         assert!(
-            text_pattern_matcher_find_matches(
-                &TextPatternMatcher::new(Vec::<String>::new(), TextSearchOptions::default())
-                    .unwrap(),
-                "text"
-            )
-            .is_empty()
+            (TextPatternMatcher::new(Vec::<String>::new(), TextSearchOptions::default()).unwrap())
+                .find_matches("text")
+                .is_empty()
         );
     }
 }
@@ -293,7 +406,7 @@ impl<'a> RenderTextView<'a> {
     fn searchable_characters(self) -> Vec<char> {
         let content = self.doc.inputs.text.content();
         let mut characters = vec!['\0'; content.characters().len()];
-        for run in text_paint::render_text_view_visible_source_runs(self) {
+        for run in self.visible_source_runs() {
             for index in run.glyphs() {
                 if let Some(character) = content.character_at(index as usize) {
                     characters[index as usize] = character;
@@ -303,186 +416,52 @@ impl<'a> RenderTextView<'a> {
         characters
     }
 
-}
-
-/// Find visible source text without matching generated markers or hidden
-/// content. Case/diacritic normalization retains original range indices.
-pub fn render_text_view_find_matches<'a>(
-    value: RenderTextView<'a>,
-    query: &str,
-    options: TextSearchOptions,
-) -> Vec<Range<u32>> {
-    text_matches(
-        &value
-            .searchable_characters()
-            .into_iter()
-            .collect::<String>(),
-        query,
-        options,
-    )
-    .map(|(start, end)| start as u32..end as u32)
-    .collect()
-}
-
-/// Words intersecting a logical source range. Geometry determines which
-/// candidates are painted, including when overflow clips intervening text.
-pub fn render_text_view_word_ranges_in<'a>(
-    value: RenderTextView<'a>,
-    range: Range<u32>,
-) -> impl Iterator<Item = Range<u32>> + 'a {
-    value.doc.base_shaped.shared.words.in_range(range)
-}
-
-/// A Unicode word or grapheme at a source character, across inline runs
-/// and line wraps but bounded by its block container. Lookup allocates no
-/// text and uses the index retained by the shaped document.
-pub fn render_text_view_word_range_at<'a>(
-    value: RenderTextView<'a>,
-    glyph: u32,
-) -> Option<Range<u32>> {
-    value.doc.base_shaped.shared.words.range_at(glyph)
-}
-
-/// Locate a quoted passage using exact text and optional adjoining context.
-/// Publication ownership and annotation identifiers are deliberately absent.
-pub fn render_text_view_locate_quote<'a>(
-    value: RenderTextView<'a>,
-    exact: &str,
-    prefix: Option<&str>,
-    suffix: Option<&str>,
-) -> Option<Range<u32>> {
-    let document = value.searchable_characters();
-    let exact: Vec<char> = exact.chars().collect();
-    if exact.is_empty() || exact.contains(&'\0') || exact.len() > document.len() {
-        return None;
-    }
-    let prefix: Vec<char> = prefix.unwrap_or_default().chars().collect();
-    let suffix: Vec<char> = suffix.unwrap_or_default().chars().collect();
-    (0..=document.len() - exact.len()).find_map(|start| {
-        let end = start + exact.len();
-        (document[start..end] == exact
-            && (prefix.is_empty() || document[..start].ends_with(&prefix))
-            && (suffix.is_empty() || document[end..].starts_with(&suffix)))
-        .then_some(start as u32..end as u32)
-    })
-}
-
-pub fn text_pattern_matcher_find_matches(
-    value: &TextPatternMatcher,
-    text: &str,
-) -> Vec<TextPatternMatch> {
-    if value.patterns.is_empty() || text.is_empty() {
-        return Vec::new();
-    }
-    let mut boundaries = Vec::new();
-    if value.options.whole_word {
-        boundaries.resize(text.chars().count() + 1, false);
-        boundaries[0] = true;
-        let mut position = 0;
-        for segment in text.split_word_bounds() {
-            position += segment.chars().count();
-            boundaries[position] = true;
-        }
-    }
-    let mut normalized = String::with_capacity(text.len());
-    let mut source = Vec::with_capacity(text.len());
-    let mut position = 0;
-    for (byte, grapheme) in text.grapheme_indices(true) {
-        let start = position;
-        position += grapheme.chars().count();
-        normalize_into(grapheme, value.options, |character| {
-            normalized.push(character);
-            source.extend(std::iter::repeat_n(
-                (start..position, byte..byte + grapheme.len()),
-                character.len_utf8(),
-            ));
-        });
-    }
-    value
-        .automaton
-        .try_find_overlapping_iter(Input::new(&normalized))
-        .expect("standard unanchored overlapping search")
-        .filter_map(|found| {
-            let first = &source[found.start()];
-            let last = &source[found.end() - 1];
-            let range = first.0.start..last.0.end;
-            if value.options.whole_word && (!boundaries[range.start] || !boundaries[range.end]) {
-                return None;
-            }
-            Some(TextPatternMatch {
-                pattern: value.patterns[found.pattern().as_usize()],
-                range,
-                byte_range: first.1.start..last.1.end,
-            })
-        })
+    /// Find visible source text without matching generated markers or hidden
+    /// content. Case/diacritic normalization retains original range indices.
+    pub fn find_matches(self, query: &str, options: TextSearchOptions) -> Vec<Range<u32>> {
+        text_matches(
+            &self.searchable_characters().into_iter().collect::<String>(),
+            query,
+            options,
+        )
+        .map(|(start, end)| start as u32..end as u32)
         .collect()
-}
+    }
 
-pub fn match_lines<'a>(
-    matcher: &TextPatternMatcher,
-    view: RenderTextView<'a>,
-    lines: impl IntoIterator<Item = super::LineId>,
-) -> SourceTextMatches<'a> {
-    if matcher.patterns.is_empty() {
-        return SourceTextMatches {
-            view,
-            text: String::new(),
-            glyphs: Vec::new(),
-            matches: Vec::new(),
-        };
+    /// Words intersecting a logical source range. Geometry determines which
+    /// candidates are painted, including when overflow clips intervening text.
+    pub fn word_ranges_in(self, range: Range<u32>) -> impl Iterator<Item = Range<u32>> + 'a {
+        self.doc.inputs.indexes.words.in_range(range)
     }
-    let mut ranges = lines
-        .into_iter()
-        .flat_map(|line| {
-            text_paint::render_text_view_line_text_fragments(view, line)
-                .into_iter()
-                .flatten()
+
+    /// A Unicode word or grapheme at a source character, across inline runs
+    /// and line wraps but bounded by its block container. Lookup allocates no
+    /// text and uses the index retained by the shaped document.
+    pub fn word_range_at(self, glyph: u32) -> Option<Range<u32>> {
+        self.doc.inputs.indexes.words.range_at(glyph)
+    }
+
+    /// Locate a quoted passage using exact text and optional adjoining context.
+    /// Publication ownership and annotation identifiers are deliberately absent.
+    pub fn locate_quote(
+        self,
+        exact: &str,
+        prefix: Option<&str>,
+        suffix: Option<&str>,
+    ) -> Option<Range<u32>> {
+        let document = self.searchable_characters();
+        let exact: Vec<char> = exact.chars().collect();
+        if exact.is_empty() || exact.contains(&'\0') || exact.len() > document.len() {
+            return None;
+        }
+        let prefix: Vec<char> = prefix.unwrap_or_default().chars().collect();
+        let suffix: Vec<char> = suffix.unwrap_or_default().chars().collect();
+        (0..=document.len() - exact.len()).find_map(|start| {
+            let end = start + exact.len();
+            (document[start..end] == exact
+                && (prefix.is_empty() || document[..start].ends_with(&prefix))
+                && (suffix.is_empty() || document[end..].starts_with(&suffix)))
+            .then_some(start as u32..end as u32)
         })
-        .filter(|fragment| fragment.visible())
-        .map(|fragment| fragment.glyphs())
-        .collect::<Vec<_>>();
-    super::merge_text_ranges(&mut ranges);
-    let mut text = String::new();
-    let mut glyphs = Vec::new();
-    let mut source_runs = text_paint::render_text_view_visible_source_runs(view).peekable();
-    for range in ranges {
-        text.push('\0');
-        glyphs.push(None);
-        if let Some(before) = range
-            .start
-            .checked_sub(1)
-            .and_then(|glyph| text_paint::render_text_view_character_at(view, glyph as usize))
-        {
-            text.push(before);
-            glyphs.push(None);
-        }
-        for glyph in range.clone() {
-            let Some(character) = text_paint::render_text_view_character_at(view, glyph as usize)
-            else {
-                continue;
-            };
-            while source_runs
-                .peek()
-                .is_some_and(|run| run.glyphs().end <= glyph)
-            {
-                source_runs.next();
-            }
-            let source = source_runs
-                .peek()
-                .is_some_and(|run| run.glyphs().contains(&glyph));
-            text.push(if source { character } else { '\0' });
-            glyphs.push(source.then_some(glyph));
-        }
-        if let Some(after) = text_paint::render_text_view_character_at(view, range.end as usize) {
-            text.push(after);
-            glyphs.push(None);
-        }
-    }
-    let matches = text_pattern_matcher_find_matches(matcher, &text);
-    SourceTextMatches {
-        view,
-        text,
-        glyphs,
-        matches,
     }
 }

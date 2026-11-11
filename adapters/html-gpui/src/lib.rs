@@ -21,7 +21,7 @@ mod raster_theme;
 mod svg_theme;
 mod text;
 
-pub use fragment::HtmlFragmentElement;
+pub use fragment::{HtmlFragmentElement, HtmlFragmentResources};
 pub use text::TextShapeCacheStats;
 
 /// Shaping and painting shared with adapters that own document navigation.
@@ -32,7 +32,5 @@ pub mod backend {
     pub use html_fonts::configure_cache_directory;
     pub use crate::paint::{GpuiCommandPainter, GpuiScene, ImageCache};
     pub use crate::text::{
-        configure_font_loader, FontLoadRequest, FontLoader, GpuiTextCache,
-        GpuiTextResources,
-    };
+        configure_font_loader, FontLoadRequest, FontLoader, GpuiTextCache};
 }

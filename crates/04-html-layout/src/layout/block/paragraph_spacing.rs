@@ -1,5 +1,5 @@
 use html_dom as dom_values;
-use crate::layout_model::{Children, InlineContent, InlineItemKind, LayoutMode, LayoutTree};
+use html_engine_model::{Children, InlineContent, InlineItemKind, LayoutMode, LayoutTree};
 use html_dom::Document;
 use html_style_model::{
     ComputedStyles, Display, Float, PositionMode, TextAlign, UsedPreferredSize, UsedStyleView,
@@ -274,10 +274,11 @@ fn owns_run(topology: &LayoutTree, container: usize, mut owner: usize) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use crate::GlyphResourceStore;
+    use html_engine_model::GlyphResourceStore;
 
     use crate::test_support::TestGlyphShaper;
-    use crate::{LaidOutDocument, LayoutConstraints, PreparedDocument, ReaderStyleOverrides};
+    use html_engine_model::{LayoutConstraints, ReaderStyleOverrides};
+    use crate::{LaidOutDocument, PreparedDocument};
     use html_dom::RootFontSize;
 
     fn layout(

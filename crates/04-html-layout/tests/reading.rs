@@ -1,43 +1,46 @@
-use html_pipeline::engine::reading_queries;
-use html_pipeline::engine::{FontMetrics, GlyphHandle, GlyphRequest, ShapedGlyph};
+use html_pipeline::engine::LayoutRequest;
+use html_pipeline::engine::{FontMetrics, GlyphHandle, ShapedRun, TextRunShapeRequest, ShapedGlyph};
 use html_pipeline::engine::{
     GlyphResourceGeneration, GlyphResourceStore, GlyphShaper, LaidOutDocument, LayoutConstraints,
-    PreparedDocument, ReadingFragment, ShapeError,
-};
+    PreparedDocument, ReadingFragment};
 
 #[derive(Default)]
 struct TestShaper(GlyphResourceGeneration);
 
 impl GlyphShaper for TestShaper {
-    fn reset(&mut self) {
-        self.0 = GlyphResourceGeneration::default();
-    }
-
     fn resource_generation(&self) -> GlyphResourceGeneration {
         self.0
     }
 
-    fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
-        Ok(ShapedGlyph::new(
-            GlyphHandle(request.character as u32),
-            request.style.font_size / 2.0,
-            FontMetrics {
-                ascent: request.style.font_size,
-                descent: 0.0,
-            },
-        ))
+    fn shape_run(&mut self, request: TextRunShapeRequest<'_>) -> ShapedRun {
+        ShapedRun::characters(request, |character, style| {
+            ShapedGlyph::new(
+                GlyphHandle(character as u32),
+                style.font_size / 2.0,
+                FontMetrics {
+                    ascent: style.font_size,
+                    descent: 0.0,
+                },
+            )
+        })
     }
 }
 
 fn layout(body: &str, resources: &mut GlyphResourceStore) -> LaidOutDocument<'static> {
+    let mut resources_shaper = TestShaper::default();
+
     let source = format!("<!doctype html><html><body>{body}</body></html>");
     let document = html_parse::parse_dom_document(&source).unwrap();
     let (document, styles) = html_style::style_document(document, &[]).into_parts();
     let prepared = PreparedDocument::try_new(document, styles).unwrap();
     prepared
-        .shape(&mut TestShaper::default(), resources)
+        .shape(&mut resources_shaper, resources)
         .unwrap()
-        .layout(LayoutConstraints::new(600.0, 16.0).unwrap(), resources)
+        .layout(
+            LayoutRequest::new(LayoutConstraints::new(600.0, 16.0).unwrap()),
+            &mut resources_shaper,
+            resources,
+        )
         .expect("layout requires the shaper-aware API for first-line styles")
 }
 
@@ -53,7 +56,7 @@ fn text_for_ranges(
         .iter()
         .flat_map(|range| range.clone())
         .map(|index| {
-            text_paint::glyph_metric(text, text_paint::glyph_at(text, index as usize).unwrap())
+            text.glyph_metric(text.glyph_at(index as usize).unwrap())
                 .unwrap()
                 .ch()
         })
@@ -76,7 +79,7 @@ fn cjk_wrapping_and_segment_break_joining_preserve_utf16_source_positions() {
     );
     let view = document.render_view(&document_resources);
     let addressing = view.addressing();
-    let fragments = reading_queries::render_addressing_view_reading_fragments(addressing, 0);
+    let fragments = addressing.reading_fragments(0);
     assert_eq!(fragments.len(), 1);
     assert_eq!(fragments[0].text, "中𠀀が文");
     assert_eq!(
@@ -120,7 +123,7 @@ fn bidi_controls_and_collapsed_newlines_keep_source_positions_in_order() {
         let text = view.text();
         let actual: String = (0..text.glyph_count())
             .map(|index| {
-                text_paint::glyph_metric(text, text_paint::glyph_at(text, index).unwrap())
+                text.glyph_metric(text.glyph_at(index).unwrap())
                     .unwrap()
                     .ch()
             })
@@ -157,7 +160,7 @@ fn rtl_reading_and_source_positions_keep_logical_order() {
     );
     let view = document.render_view(&document_resources);
     let addressing = view.addressing();
-    let fragments = reading_queries::render_addressing_view_reading_fragments(addressing, 0);
+    let fragments = addressing.reading_fragments(0);
     assert_eq!(fragments.len(), 1);
     assert_eq!(fragments[0].text, "(אבג) abc 123");
     assert_eq!(
@@ -165,7 +168,7 @@ fn rtl_reading_and_source_positions_keep_logical_order() {
         "(אבג) abc 123"
     );
     assert_eq!(
-        reading_queries::render_addressing_view_reading_text(addressing, &fragments[0].target),
+        addressing.reading_text(&fragments[0].target),
         fragments[0].text
     );
     for range in &fragments[0].target.glyph_ranges {
@@ -193,7 +196,7 @@ fn hidden_text_is_excluded_from_fragments_and_chunks() {
         &mut document_resources,
     );
     let addressing = document.render_view(&document_resources).addressing();
-    let fragments = reading_queries::render_addressing_view_reading_fragments(addressing, 0);
+    let fragments = addressing.reading_fragments(0);
     assert_eq!(fragments.len(), 1);
     assert_eq!(fragments[0].text, "Visible text.");
     let (chunk, next) = addressing
@@ -202,7 +205,7 @@ fn hidden_text_is_excluded_from_fragments_and_chunks() {
     assert_eq!(chunk.text, "Visible text.");
     assert_eq!(next, None);
     assert!(!text_for_ranges(&document, &chunk, &document_resources).contains("SECRET"));
-    assert_eq!(reading_queries::render_addressing_view_reading_text(addressing, &chunk.target), chunk.text);
+    assert_eq!(addressing.reading_text(&chunk.target), chunk.text);
 }
 
 #[test]
@@ -212,9 +215,9 @@ fn visible_descendant_of_hidden_parent_remains_readable() {
         "<p style='visibility:hidden'>Hidden <span style='visibility:visible'>Readable</span> hidden</p>",
         &mut document_resources,
     );
-    let fragments = reading_queries::render_addressing_view_reading_fragments(document
+    let fragments = (document
         .render_view(&document_resources)
-        .addressing(), 0);
+        .addressing()).reading_fragments(0);
     assert_eq!(fragments.len(), 1);
     assert_eq!(fragments[0].text, "Readable");
 }
@@ -227,7 +230,7 @@ fn explicit_breaks_separate_words_without_creating_glyphs() {
         &mut document_resources,
     );
     let addressing = document.render_view(&document_resources).addressing();
-    let fragments = reading_queries::render_addressing_view_reading_fragments(addressing, 0);
+    let fragments = addressing.reading_fragments(0);
     assert_eq!(fragments.len(), 1);
     assert_eq!(fragments[0].text, "Hello world");
     let (chunk, next) = addressing
@@ -239,7 +242,7 @@ fn explicit_breaks_separate_words_without_creating_glyphs() {
         text_for_ranges(&document, &chunk, &document_resources),
         "Helloworld"
     );
-    assert_eq!(reading_queries::render_addressing_view_reading_text(addressing, &chunk.target), chunk.text);
+    assert_eq!(addressing.reading_text(&chunk.target), chunk.text);
 }
 
 #[test]
@@ -247,7 +250,7 @@ fn chunks_resume_correctly_before_and_after_a_break_separator() {
     let mut document_resources = GlyphResourceStore::default();
     let document = layout("<p>Hello<br>world</p>", &mut document_resources);
     let addressing = document.render_view(&document_resources).addressing();
-    let target = &reading_queries::render_addressing_view_reading_targets_in(addressing, 0..u32::MAX)[0];
+    let target = &addressing.reading_targets_in(0..u32::MAX)[0];
     for limit in [5, 6] {
         let (first, next) = addressing
             .reading_chunk(target, 0, limit, |text| {
@@ -272,7 +275,7 @@ fn chunks_resume_correctly_before_and_after_a_break_separator() {
         assert_eq!(second.text, "world");
         assert_eq!(next, None);
     }
-    assert_eq!(reading_queries::render_addressing_view_reading_fragments(addressing, 5)[0].text, "world");
+    assert_eq!(addressing.reading_fragments(5)[0].text, "world");
 }
 
 #[test]
@@ -284,11 +287,11 @@ fn inline_markup_does_not_insert_word_separators() {
     );
     let addressing = document.render_view(&document_resources).addressing();
     assert_eq!(
-        reading_queries::render_addressing_view_reading_fragments(addressing, 0)[0].text,
+        addressing.reading_fragments(0)[0].text,
         "Helloworld"
     );
     assert_eq!(
-        reading_queries::reading_page(addressing, 0..u32::MAX, 3).next,
+        addressing.reading_page(0..u32::MAX, 3).next,
         10
     );
 }
@@ -298,22 +301,22 @@ fn paragraph_boundaries_preserve_the_next_word() {
     let mut document_resources = GlyphResourceStore::default();
     let document = layout("<p>Hello</p><p>World again</p>", &mut document_resources);
     let addressing = document.render_view(&document_resources).addressing();
-    let fragments = reading_queries::render_addressing_view_reading_fragments(addressing, 0);
+    let fragments = addressing.reading_fragments(0);
     let second = fragments[1].target.glyph_ranges[0].start;
     assert_eq!(
-        reading_queries::reading_page(addressing, 0..u32::MAX, second).next,
+        addressing.reading_page(0..u32::MAX, second).next,
         second
     );
     assert_eq!(
-        reading_queries::render_addressing_view_reading_fragments(addressing, second)[0].text,
+        addressing.reading_fragments(second)[0].text,
         "World again"
     );
     assert_eq!(
-        reading_queries::reading_page(addressing, 0..u32::MAX, 2).next,
+        addressing.reading_page(0..u32::MAX, 2).next,
         second
     );
     assert_eq!(
-        reading_queries::reading_page(addressing, 0..u32::MAX, second + 2).next,
+        addressing.reading_page(0..u32::MAX, second + 2).next,
         second + 6
     );
 }
@@ -324,15 +327,15 @@ fn explicit_break_boundaries_preserve_the_next_word() {
     let document = layout("<p>Hello<br>world again</p>", &mut document_resources);
     let addressing = document.render_view(&document_resources).addressing();
     assert_eq!(
-        reading_queries::reading_page(addressing, 0..u32::MAX, 5).next,
+        addressing.reading_page(0..u32::MAX, 5).next,
         5
     );
     assert_eq!(
-        reading_queries::reading_page(addressing, 0..u32::MAX, 2).next,
+        addressing.reading_page(0..u32::MAX, 2).next,
         5
     );
     assert_eq!(
-        reading_queries::reading_page(addressing, 0..u32::MAX, 7).next,
+        addressing.reading_page(0..u32::MAX, 7).next,
         11
     );
 }
@@ -346,15 +349,15 @@ fn css_block_boundaries_also_separate_words() {
     );
     let addressing = document.render_view(&document_resources).addressing();
     assert_eq!(
-        reading_queries::render_addressing_view_reading_fragments(addressing, 0)[0].text,
+        addressing.reading_fragments(0)[0].text,
         "Hello world again"
     );
     assert_eq!(
-        reading_queries::reading_page(addressing, 0..u32::MAX, 5).next,
+        addressing.reading_page(0..u32::MAX, 5).next,
         5
     );
     assert_eq!(
-        reading_queries::reading_page(addressing, 0..u32::MAX, 2).next,
+        addressing.reading_page(0..u32::MAX, 2).next,
         5
     );
 }
@@ -367,9 +370,9 @@ fn unicode_chunks_and_note_gaps_preserve_source_ranges() {
         &mut document_resources,
     );
     let addressing = document.render_view(&document_resources).addressing();
-    let target = &reading_queries::render_addressing_view_reading_targets_in(addressing, 0..u32::MAX)[0];
+    let target = &addressing.reading_targets_in(0..u32::MAX)[0];
     let expected = "界界界 ångström cafés 界界界.";
-    assert_eq!(reading_queries::render_addressing_view_reading_text(addressing, target), expected);
+    assert_eq!(addressing.reading_text(target), expected);
     let mut cursor = 0;
     let mut reconstructed = String::new();
     loop {
@@ -384,7 +387,7 @@ fn unicode_chunks_and_note_gaps_preserve_source_ranges() {
                 )
             })
             .unwrap();
-        assert_eq!(reading_queries::render_addressing_view_reading_text(addressing, &chunk.target), chunk.text.trim());
+        assert_eq!(addressing.reading_text(&chunk.target), chunk.text.trim());
         reconstructed.push_str(&chunk.text);
         let Some(next) = next else { break };
         assert!(next > cursor);
@@ -410,10 +413,10 @@ fn legacy_footnotes_and_reference_markers_are_excluded() {
         &mut document_resources,
     );
     let addressing = document.render_view(&document_resources).addressing();
-    let items = reading_queries::render_addressing_view_reading_targets_in(addressing, 0..u32::MAX);
+    let items = addressing.reading_targets_in(0..u32::MAX);
     let text: Vec<_> = items
         .iter()
-        .map(|item| reading_queries::render_addressing_view_reading_text(addressing, item))
+        .map(|item| addressing.reading_text(item))
         .collect();
     assert_eq!(
         text,
@@ -429,7 +432,7 @@ fn legacy_footnotes_and_reference_markers_are_excluded() {
     assert_eq!(chunk.text, text[0]);
     assert_eq!(next, None);
     assert!(chunk.target.glyph_ranges.len() > 1);
-    assert_eq!(reading_queries::render_addressing_view_reading_text(addressing, &chunk.target), chunk.text);
+    assert_eq!(addressing.reading_text(&chunk.target), chunk.text);
 }
 
 #[test]
@@ -440,7 +443,7 @@ fn explicit_references_exclude_unmarked_local_note_bodies() {
         &mut document_resources,
     );
     let addressing = document.render_view(&document_resources).addressing();
-    let fragments = reading_queries::render_addressing_view_reading_fragments(addressing, 0);
+    let fragments = addressing.reading_fragments(0);
     assert_eq!(
         fragments
             .iter()
@@ -462,9 +465,9 @@ fn footnote_only_documents_have_no_readable_items() {
         &mut document_resources,
     );
     assert!(
-        reading_queries::render_addressing_view_reading_targets_in(document
+        (document
             .render_view(&document_resources)
-            .addressing(), 0..u32::MAX)
+            .addressing()).reading_targets_in(0..u32::MAX)
             .is_empty()
     );
 }
@@ -477,9 +480,9 @@ fn heading_titles_do_not_infer_narration_exclusions() {
         &mut document_resources,
     );
     assert_eq!(
-        reading_queries::render_addressing_view_reading_fragments(document
+        (document
             .render_view(&document_resources)
-            .addressing(), 0)
+            .addressing()).reading_fragments(0)
             .iter()
             .map(|fragment| fragment.text.as_str())
             .collect::<Vec<_>>(),
@@ -500,9 +503,9 @@ fn hidden_contents_heading_does_not_suppress_visible_prose() {
         &mut document_resources,
     );
     assert_eq!(
-        reading_queries::render_addressing_view_reading_fragments(document
+        (document
             .render_view(&document_resources)
-            .addressing(), 0)
+            .addressing()).reading_fragments(0)
             .iter()
             .map(|fragment| fragment.text.as_str())
             .collect::<Vec<_>>(),

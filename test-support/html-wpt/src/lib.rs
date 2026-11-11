@@ -4,7 +4,6 @@
 //! translate their public output contracts into the corresponding WPT form.
 
 use std::collections::BTreeMap;
-use std::fmt;
 use std::path::PathBuf;
 use cssparser::{
     AtRuleParser, CowRcStr, ParseError, Parser, ParserInput, ParserState, QualifiedRuleParser,
@@ -1930,153 +1929,11 @@ fn parse_js_string_literal(argument: &str) -> Option<String> {
     Some(output)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ScriptingMode {
-    Both,
-    Off,
-    On,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TreeConstructionCase {
-    pub data: String,
-    pub errors: Vec<String>,
-    pub new_errors: Vec<String>,
-    pub fragment_context: Option<String>,
-    pub scripting: ScriptingMode,
-    pub document: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TreeConstructionParseError {
-    pub case_index: usize,
-    pub message: String,
-}
-
-impl fmt::Display for TreeConstructionParseError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "WPT tree-construction case {}: {}", self.case_index, self.message)
-    }
-}
-
-impl std::error::Error for TreeConstructionParseError {}
-
-/// Parse the original html5lib/WPT tree-construction `.dat` format.
-///
-/// Test data and expected document dumps are retained verbatim apart from the
-/// section-terminating newline specified by the upstream format.
-pub fn parse_tree_construction_file(source: &str) -> Result<Vec<TreeConstructionCase>, TreeConstructionParseError> {
-    let lines: Vec<&str> = source.lines().collect();
-    let mut cursor = 0;
-    let mut cases = Vec::new();
-
-    while cursor < lines.len() {
-        while cursor < lines.len() && lines[cursor].is_empty() {
-            cursor += 1;
-        }
-        if cursor == lines.len() {
-            break;
-        }
-
-        let case_index = cases.len() + 1;
-        expect_marker(&lines, &mut cursor, "#data", case_index)?;
-        let data = collect_until(&lines, &mut cursor, "#errors", case_index)?.join("\n");
-        cursor += 1;
-
-        let mut errors = Vec::new();
-        while cursor < lines.len() && !is_control_marker(lines[cursor]) {
-            if !lines[cursor].is_empty() {
-                errors.push(lines[cursor].to_owned());
-            }
-            cursor += 1;
-        }
-        let mut new_errors = Vec::new();
-        if cursor < lines.len() && lines[cursor] == "#new-errors" {
-            cursor += 1;
-            while cursor < lines.len() && !is_control_marker(lines[cursor]) {
-                if !lines[cursor].is_empty() {
-                    new_errors.push(lines[cursor].to_owned());
-                }
-                cursor += 1;
-            }
-        }
-
-        let fragment_context = if cursor < lines.len() && lines[cursor] == "#document-fragment" {
-            cursor += 1;
-            let context = lines.get(cursor).ok_or_else(|| parse_error(case_index, "missing fragment context"))?.to_string();
-            cursor += 1;
-            Some(context)
-        } else {
-            None
-        };
-
-        let scripting = match lines.get(cursor).copied() {
-            Some("#script-off") => {
-                cursor += 1;
-                ScriptingMode::Off
-            }
-            Some("#script-on") => {
-                cursor += 1;
-                ScriptingMode::On
-            }
-            _ => ScriptingMode::Both,
-        };
-
-        expect_marker(&lines, &mut cursor, "#document", case_index)?;
-        let document_start = cursor;
-        while cursor < lines.len() && lines[cursor] != "#data" {
-            cursor += 1;
-        }
-        let mut document_end = cursor;
-        while document_end > document_start && lines[document_end - 1].is_empty() {
-            document_end -= 1;
-        }
-        if document_start == document_end {
-            return Err(parse_error(case_index, "missing expected document dump"));
-        }
-
-        cases.push(TreeConstructionCase { data, errors, new_errors, fragment_context, scripting, document: lines[document_start..document_end].join("\n") });
-    }
-
-    Ok(cases)
-}
-
-fn collect_until<'a>(lines: &'a [&str], cursor: &mut usize, marker: &str, case_index: usize) -> Result<Vec<&'a str>, TreeConstructionParseError> {
-    let start = *cursor;
-    while *cursor < lines.len() && lines[*cursor] != marker {
-        *cursor += 1;
-    }
-    if *cursor == lines.len() {
-        return Err(parse_error(case_index, &format!("missing {marker} section")));
-    }
-    Ok(lines[start..*cursor].to_vec())
-}
-
-fn expect_marker(lines: &[&str], cursor: &mut usize, marker: &str, case_index: usize) -> Result<(), TreeConstructionParseError> {
-    match lines.get(*cursor).copied() {
-        Some(actual) if actual == marker => {
-            *cursor += 1;
-            Ok(())
-        }
-        Some(actual) => Err(parse_error(case_index, &format!("expected {marker}, found {actual:?}"))),
-        None => Err(parse_error(case_index, &format!("expected {marker}, found end of file"))),
-    }
-}
-
-fn is_control_marker(line: &str) -> bool {
-    matches!(line, "#new-errors" | "#document-fragment" | "#script-off" | "#script-on" | "#document")
-}
-
-fn parse_error(case_index: usize, message: &str) -> TreeConstructionParseError {
-    TreeConstructionParseError { case_index, message: message.to_owned() }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        CssParsingTestKind, ReftestFuzzyTolerance, ReftestReference, ReftestRelation, ScriptingMode, extract_css_parsing_tests, extract_css_parsing_tests_with_prelude, extract_reftest_fuzzy_tolerances, extract_reftest_references,
-        parse_tree_construction_file, relative_script_references,
-    };
+        CssParsingTestKind, ReftestFuzzyTolerance, ReftestReference, ReftestRelation, extract_css_parsing_tests, extract_css_parsing_tests_with_prelude, extract_reftest_fuzzy_tolerances, extract_reftest_references,
+        relative_script_references};
 
     #[test]
     fn extracts_match_and_mismatch_references() {
@@ -2465,25 +2322,4 @@ mod tests {
         assert_eq!(invalid.tests[0].arguments, ["background-image", "radial-gradient(, red, blue)"]);
     }
 
-    #[test]
-    fn parses_multiple_cases_without_rewriting_payloads() {
-        let source = "#data\n<p>One<p>Two\n#errors\nold error\n#new-errors\nnew error\n#document\n| <html>\n|   <head>\n|   <body>\n|     <p>\n|       \"One\"\n\n#data\n<b>x\n#errors\n#document-fragment\nsvg svg\n#script-off\n#document\n| <b>\n|   \"x\"\n";
-        let cases = parse_tree_construction_file(source).unwrap();
-
-        assert_eq!(cases.len(), 2);
-        assert_eq!(cases[0].data, "<p>One<p>Two");
-        assert_eq!(cases[0].errors, ["old error"]);
-        assert_eq!(cases[0].new_errors, ["new error"]);
-        assert_eq!(cases[0].scripting, ScriptingMode::Both);
-        assert_eq!(cases[1].fragment_context.as_deref(), Some("svg svg"));
-        assert_eq!(cases[1].scripting, ScriptingMode::Off);
-        assert_eq!(cases[1].document, "| <b>\n|   \"x\"");
-    }
-
-    #[test]
-    fn reports_the_case_containing_a_malformed_section() {
-        let error = parse_tree_construction_file("#data\nx\n#document\n| <html>\n").unwrap_err();
-        assert_eq!(error.case_index, 1);
-        assert!(error.message.contains("#errors"));
-    }
 }

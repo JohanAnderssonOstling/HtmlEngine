@@ -1,14 +1,7 @@
 //! Document geometry without a viewport, columns, or a window system.
 
+use html_dom::DomNodeId;
 use html_engine_model::layout_state;
-use html_pipeline::engine::address_queries;
-use html_pipeline::engine::box_queries;
-use html_pipeline::engine::export_queries;
-use html_pipeline::engine::geometry_queries;
-use html_pipeline::engine::search_queries;
-use html_pipeline::engine::semantic_queries;
-use html_pipeline::engine::fragment_paint;
-use html_pipeline::engine::text_paint;
 use crate::document::ImageId;
 use crate::layout::{BoxId, CaretAffinity, LineId, RenderView};
 use crate::selection::{Selection, TableCellRange, TableHit};
@@ -94,11 +87,11 @@ pub(crate) struct Geometry<'a> {
 }
 
 impl<'a> Geometry<'a> {
-    fn point_placements(self, point: Point) -> impl Iterator<Item = LinePlacement> + 'a {
-        geometry_queries::render_geometry_view_lines_at_y(
-            geometry_queries::render_view_geometry(self.view),
-            point.y,
-        )
+    pub(crate) fn point_placements(
+        self,
+        point: Point,
+    ) -> impl Iterator<Item = LinePlacement> + Clone + 'a {
+        ((self.view).geometry()).lines_at_y(point.y)
         .filter_map(move |id| {
             let line = self.view.text().line(id)?;
             Some(LinePlacement {
@@ -109,16 +102,16 @@ impl<'a> Geometry<'a> {
     }
 
     fn paint_rank(self, line: LineId) -> u32 {
-        fragment_paint::line_paint_rank(self.view.fragments(), line).unwrap_or(0)
+        (self.view.fragments()).line_paint_rank(line).unwrap_or(0)
     }
 
     fn painted_hit(
         self,
         point: Point,
-        placements: &[LinePlacement],
+        placements: impl IntoIterator<Item = LinePlacement> + Clone,
     ) -> (Option<PaintedHit>, Option<ImageHit>) {
-        let text = self.ink_hit(point, placements);
-        let image = self.image_hit_at_lines(point, placements.iter().copied());
+        let text = self.ink_hit(point, placements.clone());
+        let image = self.image_hit_at_lines(point, placements);
         let foreground = match (text, image) {
             // Images paint before text on a shared carrier line.
             (Some(text), Some((_, _, image_line)))
@@ -142,8 +135,8 @@ impl<'a> Geometry<'a> {
 
     fn box_contains(self, index: BoxId, point: Point) -> bool {
         let boxes = self.view.boxes();
-        box_queries::render_box_view_point(boxes, index)
-            .zip(box_queries::render_box_view_size(boxes, index))
+        boxes.point(index)
+            .zip(boxes.size(index))
             .is_some_and(|(origin, size)| Rect::from_origin_size(origin, size).contains(point))
     }
 
@@ -294,7 +287,7 @@ impl<'a> Geometry<'a> {
         }
         if let Some((id, range)) = table {
             if let Some(table) =
-                box_queries::render_box_view_table(self.view.boxes(), range.table_box())
+                (self.view.boxes()).table(range.table_box())
             {
                 cells.extend(range.cells(&table).map(|cell| (id.clone(), cell.box_id())));
             }
@@ -323,21 +316,20 @@ impl<'a> Geometry<'a> {
     pub(crate) fn content_at_lines(
         self,
         point: Point,
-        placements: impl IntoIterator<Item = LinePlacement>,
+        placements: impl IntoIterator<Item = LinePlacement> + Clone,
         contains_box: impl FnMut(BoxId) -> bool,
     ) -> Option<ContentHit<'a>> {
         if !point.x.is_finite() || !point.y.is_finite() {
             return None;
         }
-        let placements: Vec<_> = placements.into_iter().collect();
-        let (hit, underlying_image) = self.painted_hit(point, &placements);
+        let (hit, underlying_image) = self.painted_hit(point, placements);
         let targets = self.view.addressing();
         let (text, image, link) = match hit {
             Some(PaintedHit::Text(text)) => (Some(text), None, targets.link_for_glyph(text.glyph)),
             Some(PaintedHit::Image { hit, box_idx }) => (
                 None,
                 Some(hit),
-                address_queries::render_addressing_view_link_for_box(targets, box_idx),
+                targets.link_for_box(box_idx),
             ),
             None => (None, None, None),
         };
@@ -355,24 +347,46 @@ impl<'a> Geometry<'a> {
     pub(crate) fn link_at_lines(
         self,
         point: Point,
-        placements: impl IntoIterator<Item = LinePlacement>,
+        placements: impl IntoIterator<Item = LinePlacement> + Clone,
     ) -> Option<LinkTarget<'a>> {
         if !point.x.is_finite() || !point.y.is_finite() {
             return None;
         }
-        let placements: Vec<_> = placements.into_iter().collect();
         let targets = self.view.addressing();
-        match self.painted_hit(point, &placements).0 {
+        match self.painted_hit(point, placements).0 {
             Some(PaintedHit::Text(text)) => targets.link_for_glyph(text.glyph),
             Some(PaintedHit::Image { box_idx, .. }) => {
-                address_queries::render_addressing_view_link_for_box(targets, box_idx)
+                targets.link_for_box(box_idx)
             }
             None => None,
         }
     }
 
-    fn ink_hit(self, point: Point, placements: &[LinePlacement]) -> Option<TextHit> {
-        self.hit_test_lines(point, placements.iter().copied())
+    pub(crate) fn link_node_at_lines(
+        self,
+        point: Point,
+        placements: impl IntoIterator<Item = LinePlacement> + Clone,
+    ) -> Option<DomNodeId> {
+        if !point.x.is_finite() || !point.y.is_finite() {
+            return None;
+        }
+        let targets = self.view.addressing();
+        match self.painted_hit(point, placements).0? {
+            PaintedHit::Text(text) => {
+                targets.link_node_for_glyph(text.glyph)
+            }
+            PaintedHit::Image { box_idx, .. } => {
+                targets.link_node_for_box(box_idx)
+            }
+        }
+    }
+
+    fn ink_hit(
+        self,
+        point: Point,
+        placements: impl IntoIterator<Item = LinePlacement> + Clone,
+    ) -> Option<TextHit> {
+        self.hit_test_lines(point, placements.clone())
             .and_then(|hit| {
                 [Some(hit.glyph), hit.glyph.checked_sub(1)]
                     .into_iter()
@@ -380,7 +394,7 @@ impl<'a> Geometry<'a> {
                     .find_map(|glyph| {
                         self.selection_bounds_lines(
                             glyph..glyph.saturating_add(1),
-                            placements.iter().copied(),
+                            placements.clone(),
                         )
                         .is_some_and(|bounds| bounds.contains(point))
                         .then_some(TextHit {
@@ -419,7 +433,7 @@ impl<'a> Geometry<'a> {
                 .is_some_and(|bounds| bounds.contains(point))
             {
                 if let Some(word) =
-                    search_queries::render_text_view_word_range_at(self.view.text(), glyph)
+                    (self.view.text()).word_range_at(glyph)
                 {
                     return Some(make_hit(word));
                 }
@@ -429,10 +443,7 @@ impl<'a> Geometry<'a> {
         if policy == WordHitPolicy::InkOnly {
             return None;
         }
-        search_queries::render_text_view_word_ranges_in(
-            self.view.text(),
-            text_paint::render_line_glyphs(&self.view.text().line(hit.line)?),
-        )
+        (self.view.text()).word_ranges_in((self.view.text().line(hit.line)?).glyphs())
         .filter_map(|word| {
             let bounds = self.selection_bounds_lines(
                 word.clone(),
@@ -463,7 +474,7 @@ impl<'a> Geometry<'a> {
             return None;
         }
         let delta = placement.origin - line.point();
-        let clip = text_paint::line_overflow_clip(text, placement.line).map(|clip| {
+        let clip = text.line_overflow_clip(placement.line).map(|clip| {
             clip.apply_to(Rect::new(
                 f64::NEG_INFINITY,
                 f64::NEG_INFINITY,
@@ -472,12 +483,12 @@ impl<'a> Geometry<'a> {
             )) + delta
         });
         let clipped = |rect: Rect| clip.map_or(rect, |clip| rect.intersect(clip));
-        let glyphs = text_paint::render_text_view_line_text_fragments(text, placement.line)?
+        let glyphs = text.line_text_fragments(placement.line)?
             .filter(|fragment| fragment.visible())
             .map(|fragment| fragment.glyphs())
             .filter(|range| !range.is_empty())
             .filter(|range| {
-                let Some((left, right)) = geometry_queries::render_view_geometry(self.view)
+                let Some((left, right)) = (self.view).geometry()
                     .caret_span(placement.line, range.clone())
                 else {
                     return false;
@@ -491,13 +502,13 @@ impl<'a> Geometry<'a> {
                 rect.width() > 0.0 && rect.height() > 0.0
             })
             .reduce(|left, right| left.start.min(right.start)..left.end.max(right.end))?;
-        let owner = text_paint::render_line_owner_box(&line);
+        let owner = line.owner_box();
         let cell = std::iter::once(owner)
-            .chain(box_queries::ancestors(boxes, owner))
-            .find(|&index| box_queries::is_table_cell(boxes, index));
+            .chain(boxes.ancestors(owner))
+            .find(|&index| boxes.is_table_cell(index));
         let region = cell.unwrap_or(owner);
-        let (x, width) = box_queries::render_box_view_point(boxes, region)
-            .zip(box_queries::render_box_view_size(boxes, region))
+        let (x, width) = boxes.point(region)
+            .zip(boxes.size(region))
             .filter(|(_, size)| size.width > 0.0)
             .map(|(origin, size)| (origin.x + delta.x, size.width))
             .unwrap_or((fallback.x0, fallback.width()));
@@ -545,12 +556,8 @@ impl<'a> Geometry<'a> {
         line: LineId,
         range: Range<u32>,
     ) -> impl Iterator<Item = Rect> + 'a {
-        let clip = text_paint::line_overflow_clip(self.view.text(), line);
-        geometry_queries::render_geometry_view_line_selection_rects(
-            geometry_queries::render_view_geometry(self.view),
-            line,
-            range,
-        )
+        let clip = (self.view.text()).line_overflow_clip(line);
+        ((self.view).geometry()).line_selection_rects(line, range)
         .map(move |rect| clip.map_or(rect, |clip| clip.apply_to(rect)))
         .filter(|rect| rect.width() > 0.0 && rect.height() > 0.0)
     }
@@ -588,13 +595,9 @@ impl<'a> Geometry<'a> {
         range: Range<u32>,
         placements: impl IntoIterator<Item = LinePlacement>,
     ) -> Option<Rect> {
-        geometry_queries::selection_bounds_lines(
-            geometry_queries::render_view_geometry(self.view),
-            range,
-            placements
+        ((self.view).geometry()).selection_bounds_lines(range, placements
                 .into_iter()
-                .map(|placement| (placement.line, placement.origin)),
-        )
+                .map(|placement| (placement.line, placement.origin)))
     }
 
     pub(crate) fn text_intersections(
@@ -602,11 +605,7 @@ impl<'a> Geometry<'a> {
         line: LineId,
         range: Range<u32>,
     ) -> impl Iterator<Item = Range<u32>> + 'a {
-        geometry_queries::text_intersections(
-            geometry_queries::render_view_geometry(self.view),
-            line,
-            range,
-        )
+        ((self.view).geometry()).text_intersections(line, range)
     }
 
     pub(crate) fn selection_endpoints_lines(
@@ -627,7 +626,7 @@ impl<'a> Geometry<'a> {
                 .next()
                 .is_some()
             {
-                leading = geometry_queries::render_view_geometry(self.view)
+                leading = (self.view).geometry()
                     .caret_x(placement.line, range.start, CaretAffinity::Leading)
                     .map(|x| {
                         Point::new(placement.origin.x + x, placement.origin.y + line.height())
@@ -638,7 +637,7 @@ impl<'a> Geometry<'a> {
                 .next()
                 .is_some()
             {
-                trailing = geometry_queries::render_view_geometry(self.view)
+                trailing = (self.view).geometry()
                     .caret_x(placement.line, range.end, CaretAffinity::Trailing)
                     .map(|x| {
                         Point::new(placement.origin.x + x, placement.origin.y + line.height())
@@ -668,11 +667,11 @@ impl<'a> Geometry<'a> {
             let Some(line) = self.view.text().line(placement.line) else {
                 continue;
             };
-            if text_paint::render_line_glyphs(&line).is_empty() {
+            if line.glyphs().is_empty() {
                 continue;
             }
             let nearest = self
-                .placed_selection_rects(placement, text_paint::render_line_glyphs(&line))
+                .placed_selection_rects(placement, line.glyphs())
                 .filter(|rect| rect.width() > 0.0 && rect.height() > 0.0)
                 .map(|rect| {
                     let dy = (rect.y0 - point.y).max(point.y - rect.y1).max(0.0);
@@ -693,11 +692,7 @@ impl<'a> Geometry<'a> {
             }
         }
         let (placement, x) = best?;
-        let glyph = geometry_queries::render_geometry_view_hit_test_line(
-            geometry_queries::render_view_geometry(self.view),
-            placement.line,
-            x - placement.origin.x,
-        )?;
+        let glyph = ((self.view).geometry()).hit_test_line(placement.line, x - placement.origin.x)?;
         Some(TextHit {
             line: placement.line,
             glyph,
@@ -708,12 +703,12 @@ impl<'a> Geometry<'a> {
     pub(crate) fn block_range_at(self, point: Point) -> Option<Range<u32>> {
         let hit = self.hit_test(point)?;
         let text = self.view.text();
-        let owner = text_paint::render_line_owner_box(&text.line(hit.line)?);
+        let owner = (text.line(hit.line)?).owner_box();
         text.lines()
             .iter()
-            .filter(|line| text_paint::render_line_owner_box(&line) == owner)
+            .filter(|line| line.owner_box() == owner)
             .filter_map(|line| {
-                self.text_intersections(line.id(), text_paint::render_line_glyphs(&line))
+                self.text_intersections(line.id(), line.glyphs())
                     .reduce(|a, b| a.start.min(b.start)..a.end.max(b.end))
             })
             .reduce(|a, b| a.start.min(b.start)..a.end.max(b.end))
@@ -727,21 +722,17 @@ impl<'a> Geometry<'a> {
     ) -> Option<TableHit> {
         let boxes = self.view.boxes();
         let mut hit: Option<(TableHit, BoxId)> = None;
-        for table_box in (0..box_queries::len(boxes))
+        for table_box in (0..boxes.len())
             .map(layout_state::box_id_new)
-            .filter(|&index| box_queries::is_table(boxes, index))
+            .filter(|&index| boxes.is_table(index))
         {
-            let Some(table) = box_queries::render_box_view_table(boxes, table_box) else {
+            let Some(table) = boxes.table(table_box) else {
                 continue;
             };
             for cell in table.cells() {
                 if contains_box(cell.box_id()) {
                     if hit.as_ref().is_none_or(|previous| {
-                        semantic_queries::render_semantics_view_contains(
-                            semantic_queries::render_view_semantics(self.view),
-                            previous.1,
-                            cell.box_id(),
-                        )
+                        ((self.view).semantics()).contains(previous.1, cell.box_id())
                     }) {
                         hit = Some((TableHit::from_cell(table_box, cell), cell.box_id()));
                     }
@@ -771,14 +762,11 @@ impl<'a> Geometry<'a> {
                 continue;
             };
             let delta = placement.origin - line.point();
-            let clip = text_paint::line_overflow_clip(self.view.text(), placement.line);
-            for image in fragment_paint::render_fragment_view_images_for_line(
-                self.view.fragments(),
-                placement.line,
-            )
+            let clip = (self.view.text()).line_overflow_clip(placement.line);
+            for image in (self.view.fragments()).images_for_line(placement.line)
             .iter()
             {
-                let visible = fragment_paint::render_image_fragment_visible_rect(&image)
+                let visible = image.visible_rect()
                     + placement.origin.to_vec2();
                 let visible = clip.map_or(visible, |clip| clip.apply_to(visible - delta) + delta);
                 if visible.width() > 0.0 && visible.height() > 0.0 && visible.contains(point) {
@@ -791,12 +779,9 @@ impl<'a> Geometry<'a> {
                     best = Some((
                         ImageHit {
                             image: index,
-                            is_equation: export_queries::render_export_view_is_equation(
-                                self.view.export(),
-                                index,
-                            ),
+                            is_equation: (self.view.export()).is_equation(index),
                         },
-                        fragment_paint::render_image_fragment_box_id(&image),
+                        image.box_id(),
                         placement.line,
                     ));
                 }

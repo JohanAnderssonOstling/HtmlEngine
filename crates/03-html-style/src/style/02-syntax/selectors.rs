@@ -215,21 +215,15 @@ fn component_is_supported(component: &Component<'_>) -> bool {
     }
 }
 
-pub(crate) fn selector_list_pseudo_mask(selectors: &SelectorList<'_>) -> u8 {
-    selectors.0.iter().fold(0, |mask, selector| {
-        selector
-            .iter_raw_match_order()
-            .fold(mask, |mask, component| {
-                mask | match component {
-                    Component::PseudoElement(PseudoElement::Before) => PSEUDO_BEFORE_MASK,
-                    Component::PseudoElement(PseudoElement::After) => PSEUDO_AFTER_MASK,
-                    Component::PseudoElement(PseudoElement::FirstLine) => PSEUDO_FIRST_LINE_MASK,
-                    Component::PseudoElement(PseudoElement::FirstLetter) => {
-                        PSEUDO_FIRST_LETTER_MASK
-                    }
-                    _ => 0,
-                }
-            })
+pub(crate) fn selector_pseudo_mask(selector: &Selector<'_>) -> u8 {
+    selector.iter_raw_match_order().fold(0, |mask, component| {
+        mask | match component {
+            Component::PseudoElement(PseudoElement::Before) => PSEUDO_BEFORE_MASK,
+            Component::PseudoElement(PseudoElement::After) => PSEUDO_AFTER_MASK,
+            Component::PseudoElement(PseudoElement::FirstLine) => PSEUDO_FIRST_LINE_MASK,
+            Component::PseudoElement(PseudoElement::FirstLetter) => PSEUDO_FIRST_LETTER_MASK,
+            _ => 0,
+        }
     })
 }
 
@@ -321,8 +315,9 @@ fn specificity_for_components(components: &[Component<'_>]) -> Specificity {
 }
 
 pub(crate) fn ancestor_hash(s: &str) -> u64 {
-    let h = s
-        .bytes()
-        .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
-    1u64 << (h % 64)
+    // Folding is conservative for XML and case-sensitive IDs/classes: it can
+    // only introduce false positives, never reject a valid match.
+    s.bytes().fold(0xcbf29ce484222325, |hash, byte| {
+        (hash ^ u64::from(byte.to_ascii_lowercase())).wrapping_mul(0x100000001b3)
+    })
 }

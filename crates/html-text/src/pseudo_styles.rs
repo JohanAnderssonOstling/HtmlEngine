@@ -60,7 +60,7 @@ impl PseudoStyles {
                 if let Some((owner, style, eligible)) =
                     pseudo_style_owner(document, styles, tree, root, PseudoStyleKind::FirstLine)
                 {
-                    if line_owners.insert(owner.raw()) && eligible {
+                    if line_owners.insert(owner) && eligible {
                         result.roots.entry(root).or_default().first_line = Some(style);
                     }
                 }
@@ -77,7 +77,7 @@ impl PseudoStyles {
                     root,
                     PseudoStyleKind::FirstLetter(&mut letter_owners),
                 ) {
-                    if letter_owners.insert(owner.raw()) && eligible {
+                    if letter_owners.insert(owner) && eligible {
                         result.roots.entry(root).or_default().first_letter = Some((owner, style));
                     }
                 }
@@ -186,7 +186,7 @@ pub(crate) fn prepare_first_letters(
 
 enum PseudoStyleKind<'a> {
     FirstLine,
-    FirstLetter(&'a mut FxHashSet<u32>),
+    FirstLetter(&'a mut FxHashSet<DomNodeId>),
 }
 
 /// Find the nearest originating element whose pseudo-element can apply to an
@@ -205,10 +205,7 @@ fn pseudo_style_owner(
         if nearest.is_some() && eligible {
             continue;
         }
-        let Some(node) = layout_tree
-            .get_box_dom_element(root)
-            .and_then(|raw| document.node_id_from_raw(raw))
-        else {
+        let Some(node) = layout_tree.get_box_dom_element(root) else {
             continue;
         };
         let style = match &mut kind {
@@ -218,7 +215,7 @@ fn pseudo_style_owner(
                 // Flex/grid containers block their own and ancestor letters.
                 // Consume every blocked owner so it cannot style a later sibling.
                 if !eligible && style.is_some() {
-                    consumed.insert(node.raw());
+                    consumed.insert(node);
                 }
                 style
             }

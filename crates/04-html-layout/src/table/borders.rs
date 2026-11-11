@@ -4,7 +4,7 @@ use crate::layout::{
     LayoutEngine, LayoutReader, PhysicalBorderEdge, UsedBorderInsets, border_pattern,
     collapsed_border_paint_key, physical_borders,
 };
-use crate::layout_model::{TableColumnGroupSpan, TableColumnTrack};
+use html_engine_model::{TableColumnGroupSpan, TableColumnTrack};
 use html_style_model::{BorderStyle, PositionMode, TextDirection, UsedStyleView, Visibility};
 use kurbo::{Point, Rect};
 use rustc_data_structures::fx::FxHashMap;
@@ -260,11 +260,12 @@ impl CollapsedBorderGrid {
 
     pub(super) fn emit(
         &self,
-        session: &mut LayoutEngine<'_, '_>,
+        engine: &mut LayoutEngine<'_, '_>,
         origin: Point,
         columns: &TableColumnLayout,
         row_starts: &[f64],
         row_heights: &[f64],
+        row_boxes: &[u32],
     ) {
         let table_width = columns.table_width;
         let column_starts = &columns.starts;
@@ -292,8 +293,9 @@ impl CollapsedBorderGrid {
                     (x - start_join, x + width + end_join)
                 };
                 emit_edge(
-                    session,
+                    engine,
                     self.paint_owners[edge.paint_rank as usize] as usize,
+                    row_boxes[boundary.saturating_sub(1)] as usize,
                     Rect::new(
                         origin.x + left,
                         origin.y + anchor - edge.width * 0.5,
@@ -324,8 +326,9 @@ impl CollapsedBorderGrid {
                 let start_join = self.horizontal_joint_width(row, boundary) * 0.5;
                 let end_join = self.horizontal_joint_width(row + 1, boundary) * 0.5;
                 emit_edge(
-                    session,
+                    engine,
                     self.paint_owners[edge.paint_rank as usize] as usize,
+                    row_boxes[row] as usize,
                     Rect::new(
                         origin.x + anchor - edge.width * 0.5,
                         origin.y + y - start_join,
@@ -474,8 +477,9 @@ fn boundary_anchor(starts: &[f64], sizes: &[f64], boundary: usize) -> Option<f64
 }
 
 fn emit_edge(
-    session: &mut LayoutEngine<'_, '_>,
+    engine: &mut LayoutEngine<'_, '_>,
     owner: usize,
+    fragment_owner: usize,
     rect: Rect,
     edge: CollapsedBorder,
     horizontal: bool,
@@ -487,8 +491,9 @@ fn emit_edge(
         return;
     };
     crate::layout::decorations::record_bound_border(
-        session,
+        engine,
         owner,
+        fragment_owner,
         rect,
         edge.source,
         edge.side,

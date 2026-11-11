@@ -3,7 +3,7 @@ use rustc_data_structures::fx::FxIndexSet;
 
 /// Insertion-ordered string storage with one allocation per distinct value.
 /// Domain wrappers assign their own ID types to the stable numeric indexes.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct StringTable {
     values: FxIndexSet<Box<str>>,
 }
@@ -31,6 +31,7 @@ impl StringTable {
         self.values.get_index_of(value)
     }
 
+    #[inline]
     pub fn get(&self, index: usize) -> Option<&str> {
         self.values.get_index(index).map(Box::as_ref)
     }

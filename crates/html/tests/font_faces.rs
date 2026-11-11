@@ -1,4 +1,4 @@
-use html_engine_model::shaping_contracts;
+use html_pipeline::engine::LayoutRequest;
 use html_pipeline::PipelineSession;
 use html_pipeline::{PipelineInputs, StyleEnvironment};
 use html_pipeline::MarkupSyntax;
@@ -39,9 +39,8 @@ fn independent_reader_fonts_reach_portable_shaping_for_mixed_text() {
     use html_pipeline::DocumentFactory;
 use crate::style::ReaderStyleOverrides;
     use crate::text::{
-        GlyphRequest, GlyphResourceGeneration, GlyphShaper, ShapeError, FontMetrics, GlyphHandle,
-        ShapedGlyph,
-    };
+        GlyphResourceGeneration, GlyphShaper, FontMetrics, GlyphHandle, ShapedRun,
+        TextRunShapeRequest, ShapedGlyph};
     use html_pipeline::engine::GlyphResourceStore;
 
     #[derive(Default)]
@@ -50,30 +49,23 @@ use crate::style::ReaderStyleOverrides;
         selected: Vec<(char, Option<String>)>,
     }
     impl GlyphShaper for Recorder {
-        fn reset(&mut self) {
-            self.generation = GlyphResourceGeneration::default();
-            self.selected.clear();
-        }
         fn resource_generation(&self) -> GlyphResourceGeneration {
             self.generation
         }
-        fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
-            self.selected.push((
-                request.character,
-                shaping_contracts::shaping_style_font_family_for_character(&request
-                    .style, request.character)
-                    .map(str::to_owned),
-            ));
-            let advance = request.style.font_size * 0.5;
-            let metrics = FontMetrics {
-                ascent: request.style.font_size * 0.8,
-                descent: request.style.font_size * 0.2,
-            };
-            Ok(ShapedGlyph::new(
-                GlyphHandle(request.character as u32),
-                advance,
-                metrics,
-            ))
+        fn shape_run(&mut self, request: TextRunShapeRequest<'_>) -> ShapedRun {
+            ShapedRun::characters(request, |character, style| {
+                self.selected.push((
+                    character,
+                    style.font_family_for_character(character)
+                        .map(str::to_owned),
+                ));
+                let advance = style.font_size * 0.5;
+                let metrics = FontMetrics {
+                    ascent: style.font_size * 0.8,
+                    descent: style.font_size * 0.2,
+                };
+                ShapedGlyph::new(GlyphHandle(character as u32), advance, metrics)
+            })
         }
     }
     for cjk in [None, Some("Selected CJK")] {
@@ -160,7 +152,6 @@ fn mirrored_cjk_glyphs_keep_selected_fonts_and_first_line_typography() {
     use html_pipeline::DocumentFactory;
 use crate::style::ReaderStyleOverrides;
     use crate::text::FontSlant;
-    use crate::text::GlyphRequest;
     use html_engine_model::GlyphWriter;
     use html_engine_model::ResourceShaper;
     use crate::text::FontMetrics;
@@ -170,22 +161,21 @@ use crate::style::ReaderStyleOverrides;
 
     type Selection = (char, f32, u16, FontSlant, Option<String>);
     let mut shaper = ResourceShaper::new(
-        |request: GlyphRequest<'_>, native: &mut GlyphWriter<'_, Selection>| {
+        |character, style, native: &mut GlyphWriter<'_, Selection>| {
             let handle = native.insert((
-                request.character,
-                request.style.font_size,
-                request.style.font_weight,
-                request.style.font_slant,
-                shaping_contracts::shaping_style_font_family_for_character(&request
-                    .style, request.character)
+                character,
+                style.font_size,
+                style.font_weight,
+                style.font_slant,
+                style.font_family_for_character(character)
                     .map(str::to_owned),
-            ))?;
-            let advance = request.style.font_size * 0.5;
+            ));
+            let advance = style.font_size * 0.5;
             let metrics = FontMetrics {
-                ascent: request.style.font_size * 0.8,
-                descent: request.style.font_size * 0.2,
+                ascent: style.font_size * 0.8,
+                descent: style.font_size * 0.2,
             };
-            Ok(ShapedGlyph::new(handle, advance, metrics))
+            ShapedGlyph::new(handle, advance, metrics)
         },
     );
     let mut factory = DocumentFactory::new();
@@ -214,8 +204,8 @@ use crate::style::ReaderStyleOverrides;
     };
     assert!(selected(&shaper, 16.0, 400, FontSlant::Normal));
     shaped
-        .layout_with_shaper(
-            LayoutConstraints::new(600.0, 16.0).unwrap(),
+        .layout(
+            LayoutRequest::new(LayoutConstraints::new(600.0, 16.0).unwrap()),
             &mut shaper,
             &mut resources,
         )

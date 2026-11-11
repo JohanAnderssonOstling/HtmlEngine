@@ -1,9 +1,9 @@
 //! Typed document meaning, independent of reader interaction and pagination policy.
 
-use html_engine_model::layout_state;
 use super::{BoxId, DocumentRead, RenderView};
-use super::{box_queries, text_paint};
+
 use html_dom::{element_is_note_reference, element_is_note_target};
+use html_engine_model::layout_state;
 use std::iter::once;
 use std::ops::Range;
 
@@ -115,6 +115,10 @@ impl ContentSemantics {
             }
         }
     }
+
+    pub fn heading_level(self) -> Option<u8> {
+        self.heading_level
+    }
 }
 
 /// Semantic queries use source structure without exposing tag or attribute rules.
@@ -129,10 +133,10 @@ impl RenderSemanticsView<'_> {
         let box_idx = layout_state::box_id_index(box_id);
         let boxes = self.doc.render_view(self.glyph_metrics).boxes();
         let mut result = ContentSemantics::default();
-        if box_queries::is_table(boxes, box_id) {
+        if boxes.is_table(box_id) {
             result.insert(ContentRole::Table);
         }
-        if box_queries::is_table_cell(boxes, box_id) {
+        if boxes.is_table_cell(box_id) {
             result.insert(ContentRole::TableCell);
         }
         let Some(element) = self.doc.element_for_box(box_idx) else {
@@ -166,9 +170,7 @@ impl RenderSemanticsView<'_> {
                 result.insert(role);
             }
         }
-        if tag.eq_ignore_ascii_case("code")
-            && box_queries::render_box_view_is_block_container(boxes, box_id)
-        {
+        if tag.eq_ignore_ascii_case("code") && boxes.is_block_container(box_id) {
             result.insert(ContentRole::CodeBlock);
         }
         if element_is_note_target(element) {
@@ -188,7 +190,6 @@ impl RenderSemanticsView<'_> {
         }
         result
     }
-
 }
 
 fn has_token<'a>(tokens: impl IntoIterator<Item = &'a str>, expected: &str) -> bool {
@@ -212,87 +213,66 @@ fn doc_role(token: &str) -> Option<&str> {
         .then(|| &token[4..])
 }
 
-/// Logical text ranges belonging to a box. Generated list markers are
-/// included only when requested for semantic-selection highlighting.
-pub fn render_semantics_view_text_ranges(
-    value: RenderSemanticsView<'_>,
-    box_id: BoxId,
-    include_marker: bool,
-) -> Vec<Range<u32>> {
-    let view = value.doc.render_view(value.glyph_metrics);
-    let mut ranges = text_paint::render_text_view_text_runs(view.text())
-        .filter(|run| {
-            render_semantics_view_contains(value, box_id, text_paint::render_text_run_box_id(&run))
-        })
-        .map(|run| run.glyphs())
-        .collect::<Vec<_>>();
-    if include_marker && let Some(marker) = box_queries::list_marker(view.boxes(), box_id) {
-        ranges.extend(
-            text_paint::marker_runs(view.text())
-                .only_box(marker.marker_box())
-                .map(|run| run.glyphs()),
-        );
+impl<'a> RenderSemanticsView<'a> {
+    /// Logical text ranges belonging to a box. Generated list markers are
+    /// included only when requested for semantic-selection highlighting.
+    pub fn text_ranges(self, box_id: BoxId, include_marker: bool) -> Vec<Range<u32>> {
+        let view = self.doc.render_view(self.glyph_metrics);
+        let mut ranges = (view.text())
+            .text_runs()
+            .filter(|run| self.contains(box_id, run.box_id()))
+            .map(|run| run.glyphs())
+            .collect::<Vec<_>>();
+        if include_marker && let Some(marker) = (view.boxes()).list_marker(box_id) {
+            ranges.extend(
+                (view.text())
+                    .marker_runs()
+                    .only_box(marker.marker_box())
+                    .map(|run| run.glyphs()),
+            );
+        }
+        ranges.sort_by_key(|range| range.start);
+        ranges
     }
-    ranges.sort_by_key(|range| range.start);
-    ranges
+
+    pub fn has_role(self, box_id: BoxId, role: ContentRole) -> bool {
+        self.content(box_id).has_role(role)
+    }
+
+    /// Whether `descendant` belongs to `ancestor`, including the box itself.
+    pub fn contains(self, ancestor_id: BoxId, descendant_id: BoxId) -> bool {
+        let ancestor = layout_state::box_id_index(ancestor_id);
+        let descendant = layout_state::box_id_index(descendant_id);
+        let boxes = self.doc.render_view(self.glyph_metrics).boxes();
+        if let (Some(parent), Some(child)) = (boxes.pagination_facts(ancestor_id), boxes.pagination_facts(descendant_id)) {
+            return parent.subtree.contains(&child.subtree.start);
+        }
+        ancestor < boxes.len()
+            && descendant < boxes.len()
+            && once(descendant_id).chain(boxes.ancestors(descendant_id)).any(|id| id == ancestor_id)
+    }
+
+    pub fn nearest(self, box_id: BoxId, role: ContentRole) -> Option<BoxId> {
+        let boxes = self.doc.render_view(self.glyph_metrics).boxes();
+        (layout_state::box_id_index(box_id) < boxes.len()).then_some(())?;
+        once(box_id)
+            .chain(boxes.ancestors(box_id))
+            .find(|&index| self.has_role(index, role))
+    }
+
+    pub fn block_container(self, box_id: BoxId) -> Option<BoxId> {
+        let boxes = self.doc.render_view(self.glyph_metrics).boxes();
+        (layout_state::box_id_index(box_id) < boxes.len()).then_some(())?;
+        let mut ancestors = once(box_id).chain(boxes.ancestors(box_id));
+        ancestors.find(|&index| boxes.is_block_container(index) || boxes.parent(index).is_none())
+    }
 }
 
-pub fn content_semantics_heading_level(value: ContentSemantics) -> Option<u8> {
-    value.heading_level
-}
-
-pub fn render_semantics_view_has_role(
-    value: RenderSemanticsView<'_>,
-    box_id: BoxId,
-    role: ContentRole,
-) -> bool {
-    value.content(box_id).has_role(role)
-}
-
-/// Whether `descendant` belongs to `ancestor`, including the box itself.
-pub fn render_semantics_view_contains(
-    value: RenderSemanticsView<'_>,
-    ancestor_id: BoxId,
-    descendant_id: BoxId,
-) -> bool {
-    let ancestor = layout_state::box_id_index(ancestor_id);
-    let descendant = layout_state::box_id_index(descendant_id);
-    let boxes = value.doc.render_view(value.glyph_metrics).boxes();
-    ancestor < box_queries::len(boxes)
-        && descendant < box_queries::len(boxes)
-        && once(descendant_id)
-            .chain(box_queries::ancestors(boxes, descendant_id))
-            .any(|id| id == ancestor_id)
-}
-
-pub fn render_semantics_view_nearest(
-    value: RenderSemanticsView<'_>,
-    box_id: BoxId,
-    role: ContentRole,
-) -> Option<BoxId> {
-    let boxes = value.doc.render_view(value.glyph_metrics).boxes();
-    (layout_state::box_id_index(box_id) < box_queries::len(boxes)).then_some(())?;
-    once(box_id)
-        .chain(box_queries::ancestors(boxes, box_id))
-        .find(|&index| render_semantics_view_has_role(value, index, role))
-}
-
-pub fn render_semantics_view_block_container<'a>(
-    value: RenderSemanticsView<'a>,
-    box_id: BoxId,
-) -> Option<BoxId> {
-    let boxes = value.doc.render_view(value.glyph_metrics).boxes();
-    (layout_state::box_id_index(box_id) < box_queries::len(boxes)).then_some(())?;
-    let mut ancestors = once(box_id).chain(box_queries::ancestors(boxes, box_id));
-    ancestors.find(|&index| {
-        box_queries::render_box_view_is_block_container(boxes, index)
-            || box_queries::parent(boxes, index).is_none()
-    })
-}
-
-pub fn render_view_semantics<'a>(value: RenderView<'a>) -> RenderSemanticsView<'a> {
-    RenderSemanticsView {
-        doc: value.doc,
-        glyph_metrics: value.glyph_metrics,
+impl<'a> RenderView<'a> {
+    pub fn semantics(self) -> RenderSemanticsView<'a> {
+        RenderSemanticsView {
+            doc: self.doc,
+            glyph_metrics: self.glyph_metrics,
+        }
     }
 }

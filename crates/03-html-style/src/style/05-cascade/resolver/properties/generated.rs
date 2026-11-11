@@ -1,143 +1,83 @@
-use crate::style::syntax::generated_content::{counter_arguments, for_each_counter_directive};
-use crate::style::syntax::value::{significant_tokens, token_ident};
-use cssparser::match_ignore_ascii_case;
+//! Materialize the shared generated-content grammar directly into document strings.
+use crate::style::syntax::prepared_generated::{
+    self, ContentBuilder, PreparedQuoteStyle, QuoteKind};
 use html_style_model::{
     ComputedStylesBuilder, CounterDirective, CounterStyle, GeneratedContent, GeneratedContentItem,
     QuoteStyle,
 };
-use lightningcss::properties::custom::{Token, TokenList, TokenOrValue};
+use lightningcss::properties::custom::TokenList;
 
-/// Convert native generated-content tokens into renderer-owned items.
-/// The outer `Option` distinguishes an invalid/unsupported declaration from
-/// a valid suppressing value (`normal` or `none`).
+struct ComputedContentBuilder<'a>(&'a mut ComputedStylesBuilder);
+impl ContentBuilder for ComputedContentBuilder<'_> {
+    type Item = GeneratedContentItem;
+    type Content = GeneratedContent;
+    type Directive = CounterDirective;
+    type Quotes = QuoteStyle;
+    fn text(&mut self, value: &str) -> Self::Item {
+        GeneratedContentItem::Text(self.0.intern_string(value))
+    }
+    fn attribute(&mut self, name: &str) -> Self::Item {
+        GeneratedContentItem::Attribute(self.0.intern_string(name))
+    }
+    fn counter(&mut self, name: &str, separator: Option<&str>, style: CounterStyle) -> Self::Item {
+        let name = self.0.intern_string(name);
+        match separator {
+            Some(separator) => GeneratedContentItem::Counters {
+                name,
+                separator: self.0.intern_string(separator),
+                style,
+            },
+            None => GeneratedContentItem::Counter { name, style },
+        }
+    }
+    fn quote(&mut self, kind: QuoteKind) -> Self::Item {
+        match kind {
+            QuoteKind::Open => GeneratedContentItem::OpenQuote,
+            QuoteKind::Close => GeneratedContentItem::CloseQuote,
+            QuoteKind::NoOpen => GeneratedContentItem::NoOpenQuote,
+            QuoteKind::NoClose => GeneratedContentItem::NoCloseQuote,
+        }
+    }
+    fn content(&mut self, items: Vec<Self::Item>) -> Self::Content {
+        GeneratedContent { items }
+    }
+    fn directive(&mut self, name: &str, value: i32) -> Self::Directive {
+        CounterDirective {
+            name: self.0.intern_string(name),
+            value,
+        }
+    }
+    fn quotes(&mut self, value: PreparedQuoteStyle) -> Self::Quotes {
+        match value {
+            PreparedQuoteStyle::Auto => QuoteStyle::Auto,
+            PreparedQuoteStyle::None => QuoteStyle::None,
+            PreparedQuoteStyle::Pairs(value) => QuoteStyle::Pairs(self.0.intern_string(&value)),
+        }
+    }
+}
+
 pub(super) fn parse_generated_content(
     styles: &mut ComputedStylesBuilder,
     tokens: &TokenList<'_>,
 ) -> Option<Option<GeneratedContent>> {
-    let significant = significant_tokens(tokens);
-    let first = significant.clone().next()?;
-    let count = significant.clone().count();
-    if count == 1
-        && let TokenOrValue::Token(Token::Ident(keyword)) = first
-    {
-        match_ignore_ascii_case! { keyword.as_ref(),
-            // `content` is not inherited; the originating element normally
-            // computes to `normal` when a pseudo-element explicitly inherits.
-            "normal" | "none" | "initial" | "unset" | "inherit" => return Some(None),
-            "revert" | "revert-layer" => return None,
-            _ => {},
-        }
-    }
-    let mut items = Vec::with_capacity(count);
-    for token in significant {
-        let item = match token {
-            TokenOrValue::Token(Token::String(value)) => {
-                GeneratedContentItem::Text(styles.intern_string(value.as_ref()))
-            }
-            TokenOrValue::Token(Token::Ident(value)) => {
-                match_ignore_ascii_case! { value.as_ref(),
-                    "open-quote" => GeneratedContentItem::OpenQuote,
-                    "close-quote" => GeneratedContentItem::CloseQuote,
-                    "no-open-quote" => GeneratedContentItem::NoOpenQuote,
-                    "no-close-quote" => GeneratedContentItem::NoCloseQuote,
-                    _ => return None,
-                }
-            }
-            TokenOrValue::Function(function)
-                if function.name.as_ref().eq_ignore_ascii_case("attr") =>
-            {
-                let name = function.arguments.0.iter().find_map(token_ident)?;
-                GeneratedContentItem::Attribute(styles.intern_string(name))
-            }
-            TokenOrValue::Function(function)
-                if function.name.as_ref().eq_ignore_ascii_case("counter")
-                    || function.name.as_ref().eq_ignore_ascii_case("counters") =>
-            {
-                let arguments = counter_arguments(function)?;
-                let style = match arguments.style {
-                    None => CounterStyle::Decimal,
-                    Some(token) => parse_counter_style(token_ident(token)?)?,
-                };
-                let name = styles.intern_string(arguments.name);
-                let separator = arguments.separator;
-                match separator {
-                    Some(separator) => GeneratedContentItem::Counters {
-                        name,
-                        separator: styles.intern_string(separator),
-                        style,
-                    },
-                    None => GeneratedContentItem::Counter { name, style },
-                }
-            }
-            // Generated replaced images require their own layout path and are
-            // deliberately not misrepresented as text here.
-            _ => return None,
-        };
-        items.push(item);
-    }
-    Some(Some(GeneratedContent { items }))
+    prepared_generated::parse_generated_content(tokens, &mut ComputedContentBuilder(styles))
 }
-
-fn parse_counter_style(value: &str) -> Option<CounterStyle> {
-    match_ignore_ascii_case! { value,
-        "decimal" => Some(CounterStyle::Decimal),
-        "decimal-leading-zero" => Some(CounterStyle::DecimalLeadingZero),
-        "lower-roman" => Some(CounterStyle::LowerRoman),
-        "upper-roman" => Some(CounterStyle::UpperRoman),
-        "lower-greek" => Some(CounterStyle::LowerGreek),
-        "lower-alpha" | "lower-latin" => Some(CounterStyle::LowerAlpha),
-        "upper-alpha" | "upper-latin" => Some(CounterStyle::UpperAlpha),
-        "armenian" => Some(CounterStyle::Armenian),
-        "georgian" => Some(CounterStyle::Georgian),
-        "disc" => Some(CounterStyle::Disc),
-        "circle" => Some(CounterStyle::Circle),
-        "square" => Some(CounterStyle::Square),
-        _ => None,
-    }
-}
-
 pub(super) fn parse_counter_directives(
     styles: &mut ComputedStylesBuilder,
     tokens: &TokenList<'_>,
     default_value: i32,
 ) -> Option<Vec<CounterDirective>> {
-    let mut directives = Vec::new();
-    for_each_counter_directive(tokens, default_value, |name, value| {
-        directives.push(CounterDirective {
-            name: styles.intern_string(name),
-            value,
-        });
-    })?;
-    Some(directives)
+    prepared_generated::parse_counter_directives(
+        tokens,
+        default_value,
+        &mut ComputedContentBuilder(styles),
+    )
 }
-
 pub(super) fn parse_quotes(
     styles: &mut ComputedStylesBuilder,
     tokens: &TokenList<'_>,
 ) -> Option<QuoteStyle> {
-    let mut tokens = significant_tokens(tokens);
-    match tokens.clone().count() {
-        1 => {
-            return match_ignore_ascii_case! { token_ident(tokens.next()?)?,
-                "auto" => Some(QuoteStyle::Auto),
-                "none" => Some(QuoteStyle::None),
-                _ => None,
-            };
-        }
-        count if count == 0 || count % 2 != 0 => return None,
-        _ => {}
-    }
-    let mut encoded = String::new();
-    for (index, token) in tokens.enumerate() {
-        let TokenOrValue::Token(Token::String(value)) = token else {
-            return None;
-        };
-        if index > 0 {
-            encoded.push('\0');
-        }
-        encoded.push_str(value.as_ref());
-    }
-    Some(QuoteStyle::Pairs(styles.intern_string(&encoded)))
+    prepared_generated::parse_quotes(tokens, &mut ComputedContentBuilder(styles))
 }
 
 #[cfg(test)]

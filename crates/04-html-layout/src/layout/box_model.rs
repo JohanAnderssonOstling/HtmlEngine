@@ -1,5 +1,5 @@
 use super::block::MarginStrut;
-use html_style_model::UsedStyleView;
+use html_style_model::{UsedLengthPct, UsedStyleView};
 use kurbo::Size;
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -25,46 +25,76 @@ impl UsedBorderInsets {
 /// Keeping these values together prevents each formatting algorithm from
 /// independently rebuilding padding, border, and margin sums. Callers still
 /// decide whether a CSS rule suppresses a value (for example table-cell
-/// margins) and which percentage basis applies.
-#[derive(Clone, Copy, Debug)]
+/// margins) and which percentage basis applies. Edge storage and resolution use
+/// `f32`; aggregate accessors promote values for the existing `f64` layout APIs.
+#[derive(Clone, Copy, Debug, Default)]
 pub struct ResolvedBoxModel {
-    pub margin_left: f64,
-    pub margin_right: f64,
-    pub margin_top: f64,
-    pub margin_bottom: f64,
-    pub padding_left: f64,
-    pub padding_right: f64,
-    pub padding_top: f64,
-    pub padding_bottom: f64,
-    pub border_left: f64,
-    pub border_right: f64,
-    pub border_top: f64,
-    pub border_bottom: f64,
+    pub margin_left: f32,
+    pub margin_right: f32,
+    pub margin_top: f32,
+    pub margin_bottom: f32,
+    pub padding_left: f32,
+    pub padding_right: f32,
+    pub padding_top: f32,
+    pub padding_bottom: f32,
+    pub border_left: f32,
+    pub border_right: f32,
+    pub border_top: f32,
+    pub border_bottom: f32,
 }
 
 impl ResolvedBoxModel {
     pub fn new(style: UsedStyleView<'_>, containing_width: f64) -> Self {
+        let containing_width = containing_width as f32;
+        let resolve = |value| match value {
+            UsedLengthPct::Px(px) => px,
+            UsedLengthPct::Pct(fraction) => containing_width * fraction,
+            UsedLengthPct::Calc {
+                absolute_px,
+                percentage,
+                ..
+            } => absolute_px + containing_width * percentage,
+        };
         Self {
-            margin_left: style.margin_left().resolve(containing_width),
-            margin_right: style.margin_right().resolve(containing_width),
-            margin_top: style.margin_top().resolve(containing_width),
-            margin_bottom: style.margin_bottom().resolve(containing_width),
-            padding_left: style.padding_left().resolve(containing_width),
-            padding_right: style.padding_right().resolve(containing_width),
-            padding_top: style.padding_top().resolve(containing_width),
-            padding_bottom: style.padding_bottom().resolve(containing_width),
-            border_left: style.border_left_width() as f64,
-            border_right: style.border_right_width() as f64,
-            border_top: style.border_top_width() as f64,
-            border_bottom: style.border_bottom_width() as f64,
+            margin_left: resolve(style.margin_left()),
+            margin_right: resolve(style.margin_right()),
+            margin_top: resolve(style.margin_top()),
+            margin_bottom: resolve(style.margin_bottom()),
+            padding_left: resolve(style.padding_left()),
+            padding_right: resolve(style.padding_right()),
+            padding_top: resolve(style.padding_top()),
+            padding_bottom: resolve(style.padding_bottom()),
+            border_left: style.border_left_width(),
+            border_right: style.border_right_width(),
+            border_top: style.border_top_width(),
+            border_bottom: style.border_bottom_width(),
         }
     }
 
+    pub(super) fn is_zero(self) -> bool {
+        [
+            self.margin_left,
+            self.margin_right,
+            self.margin_top,
+            self.margin_bottom,
+            self.padding_left,
+            self.padding_right,
+            self.padding_top,
+            self.padding_bottom,
+            self.border_left,
+            self.border_right,
+            self.border_top,
+            self.border_bottom,
+        ]
+        .into_iter()
+        .all(|value| value.to_bits() == 0)
+    }
+
     pub fn with_used_borders(mut self, borders: UsedBorderInsets) -> Self {
-        self.border_top = borders.top;
-        self.border_right = borders.right;
-        self.border_bottom = borders.bottom;
-        self.border_left = borders.left;
+        self.border_top = borders.top as f32;
+        self.border_right = borders.right as f32;
+        self.border_bottom = borders.bottom as f32;
+        self.border_left = borders.left as f32;
         self
     }
 
@@ -86,27 +116,27 @@ impl ResolvedBoxModel {
     }
 
     pub fn horizontal_margin(self) -> f64 {
-        self.margin_left + self.margin_right
+        f64::from(self.margin_left + self.margin_right)
     }
 
     pub fn vertical_margin(self) -> f64 {
-        self.margin_top + self.margin_bottom
+        f64::from(self.margin_top + self.margin_bottom)
     }
 
     pub(super) fn horizontal_padding(self) -> f64 {
-        self.padding_left + self.padding_right
+        f64::from(self.padding_left + self.padding_right)
     }
 
     pub(super) fn vertical_padding(self) -> f64 {
-        self.padding_top + self.padding_bottom
+        f64::from(self.padding_top + self.padding_bottom)
     }
 
     pub(super) fn horizontal_border(self) -> f64 {
-        self.border_left + self.border_right
+        f64::from(self.border_left + self.border_right)
     }
 
     pub(super) fn vertical_border(self) -> f64 {
-        self.border_top + self.border_bottom
+        f64::from(self.border_top + self.border_bottom)
     }
 
     pub fn horizontal_padding_border(self) -> f64 {

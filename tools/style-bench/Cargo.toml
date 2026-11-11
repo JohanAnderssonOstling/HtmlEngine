@@ -1,0 +1,11 @@
+[package]
+name = "style-bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+html-style = { package = "skrift-style", path = "../../crates/03-html-style" }
+html-parse = { package = "skrift-parse", path = "../../crates/02-html-parse" }

@@ -179,6 +179,14 @@ fn main() -> Result<()> {
     });
     gpui_platform::application().run(move |cx: &mut App| {
         let result = (|| -> Result<()> {
+            if let Some(path) = std::env::var_os("EMBED_BENCH_FALLBACK_FONT_FILE") {
+                let family = std::env::var("EMBED_BENCH_FALLBACK_FONT_FAMILY")
+                    .context("EMBED_BENCH_FALLBACK_FONT_FILE requires EMBED_BENCH_FALLBACK_FONT_FAMILY")?;
+                cx.text_system().add_font_file(&PathBuf::from(&path))?;
+                cx.text_system().set_fallback_font(family.clone())?;
+                emit(json!({"event":"font_configuration", "fallback_family":family,
+                    "fallback_file":PathBuf::from(path)}));
+            }
             let native_ready = Rc::new(Cell::new(false));
             let window = cx.open_window(WindowOptions {
                 window_bounds:Some(WindowBounds::Windowed(Bounds::centered(None,

@@ -1,32 +1,62 @@
 //! Process each child through preparation, layout, and finishing in source order.
 #[cfg(test)]
 use html_engine_model::layout_state;
-use super::finish_child::{finish_child, finish_flow};
-use super::layout_child::layout_child;
+use super::s03_finish_child::{finish_child, finish_flow};
+use super::s02_layout_child::layout_child;
 use super::margins::parent_collapse_context;
-use super::prepare_child::prepare_child;
+use super::s01_prepare_child::prepare_child;
 use super::{BlockFlowInput, BlockFlowState};
-use crate::layout::{ContentLayoutResult, LayoutEngine};
-use kurbo::Point;
+use crate::layout::{ContentLayoutResult, LayoutEngine, ResolvedBoxSizing};
+use crate::layout::inline::ResolvedTextIndent;
+use html_engine_model::Children;
+use kurbo::{Point, Size};
 
-/// Child percentages use `available_width`; box sizing resolves the used content origin.
-pub fn layout_block_children(
+pub(in crate::layout) fn layout_flow_children(
     engine: &mut LayoutEngine<'_, '_>,
-    parent_idx: usize,
-    children: &[u32],
+    resolved: &ResolvedBoxSizing,
+    children: &Children,
     content_pos: Point,
-    available_width: f64,
-    parent_cb_width: f64,
-    parent_content_height: Option<f64>,
     first_line_indent: f64,
 ) -> ContentLayoutResult {
-    let started = engine.start_timing();
+    match children {
+        Children::Blocks(indices) => {
+            layout_block_children(engine, resolved, indices, content_pos, first_line_indent)
+        }
+        Children::InlineItems(range) => {
+            let style = engine.reader.style(resolved.box_idx());
+            let indent = ResolvedTextIndent {
+                amount: first_line_indent,
+                hanging: style.text_indent_hanging(),
+                each_line: style.text_indent_each_line(),
+                first_line: true,
+            };
+            super::super::inline::layout_inline_box(
+                engine,
+                resolved,
+                range.clone(),
+                content_pos,
+                indent,
+            )
+            .into()
+        }
+        Children::Empty => Size::ZERO.into(),
+    }
+}
+
+/// Child percentages use `available_width`; box sizing resolves the used content origin.
+fn layout_block_children(
+    engine: &mut LayoutEngine<'_, '_>,
+    resolved: &ResolvedBoxSizing,
+    children: &[u32],
+    content_pos: Point,
+    first_line_indent: f64,
+) -> ContentLayoutResult {
+    let parent_idx = resolved.box_idx();
     let input = BlockFlowInput {
         parent_idx,
-        available_width,
-        parent_cb_width,
-        parent_content_height,
-        fragment_height: engine.fragment_height(),
+        available_width: resolved.horizontal.content,
+        parent_cb_width: resolved.request.available_width,
+        parent_content_height: resolved.vertical.descendant_basis,
         position: content_pos,
         parent_ctx: parent_collapse_context(&engine.reader, parent_idx),
     };
@@ -43,20 +73,18 @@ pub fn layout_block_children(
         };
         finish_child(engine, &input, &mut flow, laid_out);
     }
-    let size = finish_flow(engine, &input, &mut flow);
-    engine.record_timing(|t| t.layout_block_children += started.elapsed());
-    size
+    finish_flow(engine, &input, &mut flow)
 }
 
 #[cfg(test)]
 mod tests {
-    use html_pipeline::engine::fragment_paint;
+    use html_pipeline::engine::LayoutRequest;
 
-    use html_pipeline::engine::{box_queries, text_paint};
 
-    use crate::GlyphResourceStore;
-    use crate::layout_model::BoxId;
-    use crate::layout_model::LineId;
+
+    use html_engine_model::GlyphResourceStore;
+    use html_engine_model::BoxId;
+    use html_engine_model::LineId;
 
     use crate::LaidOutDocument;
     use crate::parser::DocumentFactory;
@@ -84,7 +112,8 @@ mod tests {
             .shape(&mut glyphs, resources)
             .expect("test glyphs shape")
             .layout(
-                crate::LayoutConstraints::new(300.0, 16.0).unwrap(),
+                LayoutRequest::new(html_engine_model::LayoutConstraints::new(300.0, 16.0).unwrap()),
+                &mut glyphs,
                 resources,
             )
             .expect("layout requires the shaper-aware API for first-line styles")
@@ -96,19 +125,21 @@ mod tests {
         resources: &GlyphResourceStore,
     ) -> (Point, Size) {
         let view = document.render_view(resources);
-        let box_idx = (0..box_queries::len(view.boxes()))
+        let box_idx = (0..(view.boxes()).len())
             .map(layout_state::box_id_new)
-            .find(|idx| box_queries::attribute(view.boxes(), *idx, "id") == Some(id))
+            .find(|idx| (view.boxes()).attribute(*idx, "id") == Some(id))
             .unwrap_or_else(|| panic!("missing box #{id}"));
         (
-            box_queries::render_box_view_point(view.boxes(), box_idx).expect("box index in range"),
-            box_queries::render_box_view_size(view.boxes(), box_idx).expect("box index in range"),
+            (view.boxes()).point(box_idx).expect("box index in range"),
+            (view.boxes()).size(box_idx).expect("box index in range"),
         )
     }
 
     #[test]
     fn fragmentation_moves_kept_subtrees_and_respects_book_composition() {
-        use crate::{LayoutConstraints, TextCompositionPolicy};
+        let mut resources_shaper = TestGlyphShaper::new();
+
+        use html_engine_model::{LayoutConstraints, TextCompositionPolicy};
 
         let html = "<html><body style='margin:0'>
             <div style='height:80px'></div>
@@ -137,15 +168,18 @@ mod tests {
             let mut factory = DocumentFactory::new();
             let document = factory
                 .parse_with_new_pipeline(html, None)
-                .shape(&mut TestGlyphShaper::new(), &mut resources)
+                .shape(&mut resources_shaper, &mut resources)
                 .unwrap()
                 .layout(
-                    LayoutConstraints::new(300.0, 16.0)
-                        .unwrap()
-                        .with_viewport_height(Some(100.0))
-                        .unwrap()
-                        .with_text_composition_policy(policy),
-                    &resources,
+                    LayoutRequest::new(
+                        LayoutConstraints::new(300.0, 16.0)
+                            .unwrap()
+                            .with_viewport_height(Some(100.0))
+                            .unwrap()
+                            .with_text_composition_policy(policy),
+                    ),
+                    &mut resources_shaper,
+                    &mut resources,
                 )
                 .unwrap();
             for (id, y) in ["keep", "following", "forced", "after", "avoid"]
@@ -163,9 +197,9 @@ mod tests {
                 view.text().line(LineId::new(0)).unwrap().point().y,
                 expected[0]
             );
-            let background = fragment_paint::decorations(view.fragments())
+            let background = (view.fragments()).decorations()
                 .iter()
-                .find(|decoration| fragment_paint::decoration_color(&decoration) == 0xff0000ff)
+                .find(|decoration| decoration.color() == 0xff0000ff)
                 .expect("kept background");
             assert_eq!(background.rect().y0, expected[0]);
         }
@@ -692,9 +726,9 @@ mod tests {
                 "width={width}: first={first:?}, second={second:?}"
             );
             let view = document.render_view(&resources);
-            let colors = fragment_paint::decorations(view.fragments())
+            let colors = (view.fragments()).decorations()
                 .iter()
-                .map(|decoration| fragment_paint::decoration_color(&decoration))
+                .map(|decoration| decoration.color())
                 .collect::<Vec<_>>();
             assert_eq!(
                 colors.iter().filter(|&&color| color == 0xff0000ff).count(),
@@ -726,7 +760,7 @@ mod tests {
         let painted_lines = text
             .lines()
             .iter()
-            .filter(|line| !text_paint::render_line_glyphs(&line).is_empty())
+            .filter(|line| !line.glyphs().is_empty())
             .collect::<Vec<_>>();
         assert_eq!(
             painted_lines.len(),
@@ -742,8 +776,11 @@ mod tests {
             line_bottoms.windows(2).all(|pair| pair[0] <= pair[1]),
             "spatial traversal must remain searchable: {line_bottoms:?}"
         );
-        let paint_order = text_paint::paint_order(text);
-        let mut covered = paint_order.iter().map(|id| layout_state::line_id_index(*id)).collect::<Vec<_>>();
+        let paint_order = text.paint_order();
+        let mut covered = paint_order
+            .iter()
+            .map(|id| layout_state::line_id_index(*id))
+            .collect::<Vec<_>>();
         covered.sort_unstable();
         assert_eq!(
             covered,

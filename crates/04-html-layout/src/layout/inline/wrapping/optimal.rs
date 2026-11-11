@@ -18,8 +18,6 @@ pub(in crate::layout::inline) fn break_lines_knuth(
     mut lines: Vec<BrokenLine>,
     scratch: &mut knuth_plass::CompactScratch,
 ) -> Vec<BrokenLine> {
-    profile_scope!("lines.knuth_dispatch");
-    let timing_started = engine.start_timing();
     use super::knuth_plass as kp;
     let fallback_plan;
     let plan = if let Some(plan) = cached_plan {
@@ -88,8 +86,7 @@ pub(in crate::layout::inline) fn break_lines_knuth(
         // Histories at one breakpoint often share the same token range.
         let mut tracking_index = None;
         let mut tracking_cache = None;
-        let tracking_allowed = paragraph.text_align == TextAlign::Justify
-            || (engine.config.force_justify() && paragraph.text_align == TextAlign::Left);
+        let tracking_allowed = paragraph.text_align == TextAlign::Justify;
         let mut admit_tracking = |start: u32, end: u32, width: f64, required: f64| {
             if hanging_end.is_some_and(|(index, hang)| end as usize > index && required <= hang) {
                 return true;
@@ -190,6 +187,5 @@ pub(in crate::layout::inline) fn break_lines_knuth(
         }
     }
 
-    engine.record_timing(|timings| timings.break_lines_knuth += timing_started.elapsed());
     lines
 }

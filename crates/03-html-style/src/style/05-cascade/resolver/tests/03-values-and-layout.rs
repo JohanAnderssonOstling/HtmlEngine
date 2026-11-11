@@ -13,7 +13,7 @@ fn content_languages_inherit_as_structured_tags_and_empty_values_reset_them() {
         let node = prepared
             .document()
             .node_ids()
-            .find(|&node| prepared.document().get_dom_id(node) == Some(id))
+            .find(|&node| prepared.document().try_element_ref(node).and_then(|element| element.id()) == Some(id))
             .unwrap();
         let style = prepared
             .styles()
@@ -75,7 +75,7 @@ fn xml_language_precedes_html_language_and_survives_reader_rebuilding() {
     let node = prepared
         .document()
         .node_ids()
-        .find(|&node| prepared.document().get_dom_id(node) == Some("target"))
+        .find(|&node| prepared.document().try_element_ref(node).and_then(|element| element.id()) == Some("target"))
         .unwrap();
     let language = prepared
         .styles()
@@ -113,7 +113,7 @@ fn xml_language_precedes_html_language_and_survives_reader_rebuilding() {
     let empty = prepared
         .document()
         .node_ids()
-        .find(|&node| prepared.document().get_dom_id(node) == Some("empty"))
+        .find(|&node| prepared.document().try_element_ref(node).and_then(|element| element.id()) == Some("empty"))
         .unwrap();
     assert!(
         prepared
@@ -144,7 +144,7 @@ fn cjk_line_break_values_inherit_and_honor_css_wide_keywords_and_variables() {
         ("normal", LineBreak::Normal),
     ] {
         let node = prepared.document().node_ids()
-            .find(|&node| prepared.document().get_dom_id(node) == Some(id)).unwrap();
+            .find(|&node| prepared.document().try_element_ref(node).and_then(|element| element.id()) == Some(id)).unwrap();
         let style = prepared.styles().view(prepared.style_for_node(node).unwrap()).unwrap();
         assert_eq!(style.line_break(), expected, "{id}");
     }
@@ -157,7 +157,7 @@ fn rtl_unicode_bidi_is_reset_and_css_wide_keywords_preserve_its_semantics() {
     let mut factory = DocumentFactory::new();
     let prepared = factory.parse_with_new_pipeline(html, None);
     let style = |id| {
-        let node = prepared.document().node_ids().find(|&node| prepared.document().get_dom_id(node) == Some(id)).unwrap();
+        let node = prepared.document().node_ids().find(|&node| prepared.document().try_element_ref(node).and_then(|element| element.id()) == Some(id)).unwrap();
         prepared.styles().view(prepared.style_for_node(node).unwrap()).unwrap()
     };
     assert_eq!(style("normal").unicode_bidi(), UnicodeBidi::Normal);
@@ -233,7 +233,7 @@ fn italic_and_oblique_remain_distinct_computed_font_styles() {
             .find(|&node| {
                 document
                     .document()
-                    .element_ref(node)
+                    .try_element_ref(node)
                     .and_then(|element| element.attr("id"))
                     == Some(id)
             })
@@ -254,7 +254,7 @@ fn positive_infinite_flex_factor_is_normalized_before_storage() {
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, None);
     let container = find_body(document.document()).children().next().expect("flex container");
-    let child = document.document().element_ref(container).expect("container element").children().next().expect("flex item");
+    let child = document.document().try_element_ref(container).expect("container element").children().next().expect("flex item");
     let indices = document.style_for_node(child).expect("computed style");
     let layout = document.styles().layout_style(indices).expect("layout style");
 
@@ -289,7 +289,7 @@ fn custom_property_wide_keywords_resolve_before_var_fallbacks() {
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, None);
     let color = |id| {
-        let node = document.document().node_ids().find(|&node| document.document().get_dom_id(node) == Some(id)).expect("element by id");
+        let node = document.document().node_ids().find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some(id)).expect("element by id");
         document.text_style(document.style_for_node(node).expect("computed style")).expect("text style").color
     };
 
@@ -305,7 +305,7 @@ fn css_wide_keywords_from_var_fallbacks_keep_their_semantics() {
     let css = "#outer { color: transparent; border-style: solid } #inner { color: var(--missing, initial); border-style: var(--missing, inherit) }";
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, Some(css));
-    let node = document.document().node_ids().find(|&node| document.document().get_dom_id(node) == Some("inner")).expect("inner");
+    let node = document.document().node_ids().find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some("inner")).expect("inner");
     let style = document.style_for_node(node).expect("computed style");
 
     assert_eq!(document.text_style(style).expect("text style").color, 0x000000FF);
@@ -376,7 +376,7 @@ fn logical_text_alignment_re_resolves_when_descendant_direction_changes() {
             .find(|&node| {
                 document
                     .document()
-                    .element_ref(node)
+                    .try_element_ref(node)
                     .and_then(|element| element.attr("id"))
                     == Some(id)
             })
@@ -497,7 +497,7 @@ fn html_dir_and_css_direction_inherit_for_logical_resolution() {
         .map(|parent| {
             let child = document
                 .document()
-                .element_ref(parent)
+                .try_element_ref(parent)
                 .expect("section")
                 .children()
                 .next()
@@ -623,7 +623,7 @@ fn legacy_grid_gap_aliases_share_the_canonical_computed_values() {
             .find(|&node| {
                 document
                     .document()
-                    .element_ref(node)
+                    .try_element_ref(node)
                     .and_then(|element| element.attr("id"))
                     == Some(id)
             })
@@ -645,7 +645,7 @@ fn legacy_grid_gap_aliases_share_the_canonical_computed_values() {
         .find(|&node| {
             document
                 .document()
-                .element_ref(node)
+                .try_element_ref(node)
                 .and_then(|element| element.attr("id"))
                 == Some("shorthand")
         })
@@ -696,7 +696,7 @@ fn unsupported_or_malformed_list_marker_does_not_override_valid_marker() {
     let list = find_body(document.document()).children().next().expect("list element");
     let markers = document
         .document()
-        .element_ref(list)
+        .try_element_ref(list)
         .expect("list node is an element")
         .children()
         .map(|node| {
@@ -811,7 +811,7 @@ fn later_font_shorthand_overrides_universal_inherit_shorthand() {
     let target = document
         .document()
         .node_ids()
-        .find(|&node| document.document().get_dom_id(node) == Some("target"))
+        .find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some("target"))
         .expect("target element");
     let style = document
         .style_for_node(target)
@@ -831,7 +831,7 @@ fn relative_font_shorthand_line_height_uses_its_resolved_font_size() {
     let target = document
         .document()
         .node_ids()
-        .find(|&node| document.document().get_dom_id(node) == Some("target"))
+        .find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some("target"))
         .expect("target element");
     let style = document
         .style_for_node(target)
@@ -860,7 +860,7 @@ fn relative_font_weights_resolve_from_the_parent_computed_weight() {
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, Some(css));
     let weight = |id| {
-        let node = document.document().node_ids().find(|&node| document.document().get_dom_id(node) == Some(id)).expect("weight test element");
+        let node = document.document().node_ids().find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some(id)).expect("weight test element");
         let style = document.style_for_node(node).expect("weight test style");
         document.font_style(style).expect("weight test font").font_weight
     };

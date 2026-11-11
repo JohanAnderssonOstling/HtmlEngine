@@ -1,7 +1,6 @@
 use super::finite_f32;
 use crate::layout::{
-    BoxLayoutRequest, LayoutEngine, ResolvedBoxModel, measure_box_isolated, preferred_aspect_ratio,
-};
+    BoxLayoutRequest, LayoutEngine, measure_box_isolated, preferred_aspect_ratio};
 use kurbo::Size;
 use rustc_data_structures::fx::FxHashMap;
 use taffy::geometry::Size as TaffySize;
@@ -14,16 +13,22 @@ pub struct FlexGridState {
     measure_cache: FxHashMap<TaffyMeasureKey, MeasuredItem>,
 }
 
+impl FlexGridState {
+    pub(crate) fn clear(&mut self) {
+        self.measure_cache.clear();
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct MeasuredItem {
     pub(super) size: TaffySize<f32>,
     pub(super) first_baseline: Option<f64>,
 }
 
-/// Intrinsic probes read the session; full measurement may update layout caches.
-pub(super) enum MeasurementMode<'session, 'input, 'out> {
-    Intrinsic(&'session LayoutEngine<'input, 'out>),
-    Full(&'session mut LayoutEngine<'input, 'out>),
+/// Both intrinsic probes and full measurements update explicitly owned caches.
+pub(super) enum MeasurementMode<'engine, 'input, 'out> {
+    Intrinsic(&'engine mut LayoutEngine<'input, 'out>),
+    Full(&'engine mut LayoutEngine<'input, 'out>),
     // Keeps the leaf-style allocation fixture independent of a document session.
     #[cfg(test)]
     Fixed {
@@ -40,11 +45,11 @@ impl MeasurementMode<'_, '_, '_> {
         available: TaffySize<AvailableSpace>,
     ) -> MeasuredItem {
         match self {
-            Self::Intrinsic(session) => MeasuredItem {
-                size: measure_intrinsic_item(session, box_idx, known, available),
+            Self::Intrinsic(engine) => MeasuredItem {
+                size: measure_intrinsic_item(engine, box_idx, known, available),
                 first_baseline: None,
             },
-            Self::Full(session) => measure_item_with_baseline(session, box_idx, known, available),
+            Self::Full(engine) => measure_item_with_baseline(engine, box_idx, known, available),
             #[cfg(test)]
             Self::Fixed {
                 box_idx: expected,
@@ -57,21 +62,13 @@ impl MeasurementMode<'_, '_, '_> {
     }
 }
 
-impl FlexGridState {
-    pub fn clear(&mut self) {
-        self.measure_cache.clear();
-    }
-}
-
 fn measure_item_with_baseline(
-    session: &mut LayoutEngine<'_, '_>,
+    engine: &mut LayoutEngine<'_, '_>,
     box_idx: usize,
     known: TaffySize<Option<f32>>,
     available: TaffySize<AvailableSpace>,
 ) -> MeasuredItem {
-    let timing_started = session.start_timing();
-    if let Some(size) = measure_replaced_item(session, box_idx, known, available) {
-        session.record_timing(|timings| timings.measure_flex_grid_item += timing_started.elapsed());
+    if let Some(size) = measure_replaced_item(engine, box_idx, known, available) {
         return MeasuredItem {
             size,
             first_baseline: None,
@@ -88,16 +85,16 @@ fn measure_item_with_baseline(
         available_height_tag,
         available_height_bits,
     );
-    if let Some(measured) = session.flex_grid.measure_cache.get(&key).copied() {
-        session.record_timing(|timings| timings.measure_flex_grid_item += timing_started.elapsed());
+    let cached = engine.scratch.flex_grid.measure_cache.get(&key).copied();
+    if let Some(measured) = cached {
         return measured;
     }
-    let style = session.reader.style(box_idx);
+    let style = engine.reader.style(box_idx);
     let ItemWidthBounds {
         minimum: min_width,
         maximum: max_width,
         horizontal_inset,
-    } = item_width_bounds(session, box_idx, known.height, available.height);
+    } = item_width_bounds(engine, box_idx, known.height, available.height);
     let width = known
         .width
         .map(f64::from)
@@ -108,7 +105,7 @@ fn measure_item_with_baseline(
         });
     let containing_width = width.max(0.0) + horizontal_inset;
     let measured = measure_box_isolated(
-        session,
+        engine,
         BoxLayoutRequest::normal(
             box_idx,
             containing_width.max(0.0),
@@ -132,8 +129,7 @@ fn measure_item_with_baseline(
         size: result,
         first_baseline: measured.first_baseline,
     };
-    session.flex_grid.measure_cache.insert(key, measured);
-    session.record_timing(|timings| timings.measure_flex_grid_item += timing_started.elapsed());
+    engine.scratch.flex_grid.measure_cache.insert(key, measured);
     measured
 }
 
@@ -146,19 +142,19 @@ fn available_space_key(value: AvailableSpace) -> (u32, u32) {
 }
 
 fn measure_intrinsic_item(
-    session: &LayoutEngine<'_, '_>,
+    engine: &mut LayoutEngine<'_, '_>,
     box_idx: usize,
     known: TaffySize<Option<f32>>,
     available: TaffySize<AvailableSpace>,
 ) -> TaffySize<f32> {
-    if let Some(size) = measure_replaced_item(session, box_idx, known, available) {
+    if let Some(size) = measure_replaced_item(engine, box_idx, known, available) {
         return size;
     }
     let ItemWidthBounds {
         minimum: min_width,
         maximum: max_width,
         ..
-    } = item_width_bounds(session, box_idx, known.height, available.height);
+    } = item_width_bounds(engine, box_idx, known.height, available.height);
     let width = known.width.unwrap_or_else(|| match available.width {
         AvailableSpace::Definite(value) => value,
         AvailableSpace::MinContent => finite_f32(min_width),
@@ -179,13 +175,16 @@ pub(super) struct ItemWidthBounds {
 }
 
 pub(super) fn item_width_bounds(
-    session: &LayoutEngine<'_, '_>,
+    engine: &mut LayoutEngine<'_, '_>,
     box_idx: usize,
     known_height: Option<f32>,
     available_height: AvailableSpace,
 ) -> ItemWidthBounds {
-    let model = ResolvedBoxModel::new(session.reader.style(box_idx), 0.0).with_nonnegative_padding();
-    let (outer_min_width, outer_max_width) = crate::layout::box_intrinsic_widths(session, box_idx);
+    let model = engine
+        .reader
+        .box_model(box_idx, 0.0)
+        .with_nonnegative_padding();
+    let (outer_min_width, outer_max_width) = crate::layout::box_intrinsic_widths(engine, box_idx);
     let horizontal_inset = model.horizontal_margin() + model.horizontal_padding_border();
     let mut min_width = (outer_min_width - horizontal_inset).max(0.0);
     let mut max_width = (outer_max_width - horizontal_inset).max(min_width);
@@ -197,7 +196,7 @@ pub(super) fn item_width_bounds(
         })
         .map(|value| finite_f32((f64::from(value) - vertical_inset).max(0.0)));
     if let Some(width) = available_height.and_then(|height| {
-        crate::layout::percentage_height_image_width(session, box_idx, f64::from(height))
+        crate::layout::percentage_height_image_width(engine, box_idx, f64::from(height))
     }) {
         min_width = width;
         max_width = width;
@@ -210,16 +209,16 @@ pub(super) fn item_width_bounds(
 }
 
 pub(super) fn measure_replaced_item(
-    session: &LayoutEngine<'_, '_>,
+    engine: &LayoutEngine<'_, '_>,
     box_idx: usize,
     known: TaffySize<Option<f32>>,
     available: TaffySize<AvailableSpace>,
 ) -> Option<TaffySize<f32>> {
-    let intrinsic = session.reader.image_intrinsic(box_idx)?;
+    let intrinsic = engine.reader.image_intrinsic(box_idx)?;
     Some(measure_replaced_content(
         intrinsic.size,
         preferred_aspect_ratio(
-            session.reader.style(box_idx).aspect_ratio(),
+            engine.reader.style(box_idx).aspect_ratio(),
             intrinsic.aspect_ratio,
         ),
         known,

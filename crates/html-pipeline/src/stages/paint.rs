@@ -27,9 +27,9 @@ pub(crate) struct PaintStyles<'a> {
 fn linked_nodes(document: &Document) -> Vec<u8> {
     // Memoize ancestry without assuming node IDs are in preorder. Each node
     // is visited once, including when the source DOM has been reparented.
-    let mut states = vec![0u8; document.node_count()];
+    let mut states = vec![0u8; document.element_count()];
     let mut path = Vec::new();
-    for node in document.node_ids() {
+    for node in document.element_ids() {
         path.clear();
         let mut current = node;
         let linked = loop {
@@ -37,12 +37,12 @@ fn linked_nodes(document: &Document) -> Vec<u8> {
                 break states[current.index()] == 2;
             }
             path.push(current.index());
-            if document.element_ref(current).is_some_and(|element| {
+            if document.try_element_ref(current).is_some_and(|element| {
                 element.tag().eq_ignore_ascii_case("a") && element.attr("href").is_some()
             }) {
                 break true;
             }
-            let Some(parent) = document.get_dom_parent(current) else {
+            let Some(parent) = document.node_ref(current).parent() else {
                 break false;
             };
             current = parent;
@@ -60,19 +60,17 @@ fn linked_nodes(document: &Document) -> Vec<u8> {
 fn box_contexts(document: &Document, tree: &LayoutTree, linked: &[u8]) -> Box<[u8]> {
     let mut contexts = vec![0; tree.box_count()];
     for index in 0..tree.box_count() {
-        let node = tree
-            .get_box_dom_element(index)
-            .and_then(|raw| document.node_id_from_raw(raw));
+        let node = tree.get_box_dom_element(index);
         let is_link = node.map_or_else(
             || {
                 tree.get_box_parent(index)
                     .is_some_and(|parent| contexts[parent] & LINK != 0)
             },
-            |node| linked[node.index()] != 0,
+            |node| !node.is_text() && linked[node.index()] != 0,
         );
         let is_root = (tree.root_box() == Some(index) || tree.body_box() == Some(index))
             && node
-                .and_then(|node| document.element_ref(node))
+                .and_then(|node| document.try_element_ref(node))
                 .is_some_and(|element| matches!(element.tag(), "html" | "body"));
         contexts[index] = if is_root { ROOT } else { 0 } | if is_link { LINK } else { 0 };
     }

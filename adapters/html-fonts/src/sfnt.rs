@@ -1,4 +1,3 @@
-use html_engine_model::shaping_contracts;
 use crate::{LoadedFontFace, PRIVATE_FAMILY_PREFIX};
 use html::text::FontFace;
 use html::text::FontSlant;
@@ -11,7 +10,7 @@ pub(crate) fn prepare(bytes: &[u8], declaration: &FontFace) -> Result<LoadedFont
     let slant = if face.is_italic() {
         FontSlant::Italic
     } else if face.is_oblique() {
-        shaping_contracts::font_slant_oblique(14.0)
+        FontSlant::oblique(14.0)
     } else {
         FontSlant::Normal
     };

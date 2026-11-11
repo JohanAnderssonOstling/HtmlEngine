@@ -11,6 +11,7 @@ pub struct FloatBand {
 pub struct FloatContext {
     bands: Vec<FloatBand>,
     source_position_floor: Option<f64>,
+    float_position_floor: Option<f64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -63,6 +64,9 @@ impl FloatContext {
         // margin boxes would not overlap vertically.
         let start_y = self
             .source_position_floor
+            .map_or(start_y, |floor| floor.max(start_y));
+        let start_y = self
+            .float_position_floor
             .map_or(start_y, |floor| floor.max(start_y));
         let y = self
             .bands
@@ -320,10 +324,10 @@ pub(in crate::layout) fn layout_float(
     engine.geometry.set_point(box_idx, initial_point);
     let layout = engine.layout_resolved_box(resolved);
     let size = layout.size;
-
     let margin_width = size.width + margins.x0 + margins.x1;
     let margin_height = size.height + margins.y0 + margins.y1;
     let source_y = engine
+        .scratch
         .floats
         .current_float_context()
         .map_or(origin.y, |context| {
@@ -341,23 +345,11 @@ pub(in crate::layout) fn layout_float(
             }
             candidate_y
         });
-    let placement = engine
-        .floats
-        .current_float_context()
-        .map(|context| {
-            context.place_margin_box(
-                source_y,
-                margin_width,
-                margin_height,
-                origin.x,
-                origin.x + available_width,
-            )
-        })
-        .unwrap_or(FloatPlacement {
-            y: source_y,
-            left: origin.x,
-            right: origin.x + available_width,
-        });
+    let placement = engine.scratch.floats.current_float_context().map_or(
+        FloatPlacement { y: source_y, left: origin.x, right: origin.x + available_width },
+        |context| context.place_margin_box(source_y, margin_width, margin_height,
+            origin.x, origin.x + available_width),
+    );
     let margin_y = placement.y;
     let final_x = if matches!(side, Float::Right) {
         placement.right - margin_width + margins.x0
@@ -369,7 +361,7 @@ pub(in crate::layout) fn layout_float(
     translate_laid_out_output(engine, &layout.output, final_point - initial_point);
     // Exclude the margin box: negative bottom margins let text resume before
     // the border-box bottom, as required for floated drop caps.
-    if let Some(context) = engine.floats.current_float_context_mut() {
+    if let Some(context) = engine.scratch.floats.current_float_context_mut() {
         context.add_band(FloatBand {
             left: final_x - margins.x0,
             right: final_x + size.width + margins.x1,
@@ -381,6 +373,7 @@ pub(in crate::layout) fn layout_float(
                 FloatSide::Left
             },
         });
+
     }
     size
 }
@@ -533,6 +526,7 @@ mod tests {
     }
 }
 use super::margins::MarginStrut;
-use crate::layout::{LayoutEngine, ResolvedBoxSizing, translate_laid_out_output};
+use crate::layout::{
+    LayoutEngine, ResolvedBoxSizing, translate_laid_out_output};
 use html_style_model::{Clear, Float};
 use kurbo::{Insets, Point, Size, Vec2};

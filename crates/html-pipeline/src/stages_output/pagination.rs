@@ -1,11 +1,10 @@
 //! Ordered pagination inputs, independent of spatial storage and paint order.
 //! Lines are addressed by cursors in pagination order; results are values.
 
-use html_engine_model::layout_state;
-use crate::stages::geometry_queries;
-use crate::stages::text_paint;
-use super::{LineId, RenderView};
+use super::{BoxId, LineId, RenderView};
 use crate::layout_model::{LineOutput, LinePaginationGroup};
+use html_engine_model::layout_state;
+use html_style_model::{Display, Float, PositionMode};
 use kurbo::Point;
 use std::ops::Range;
 
@@ -92,21 +91,32 @@ pub struct PaginationPosition<'a> {
 #[derive(Clone, Copy)]
 pub struct Pagination<'a> {
     pub(super) view: RenderView<'a>,
+    uses_float_groups: bool,
 }
 
 impl<'a> Pagination<'a> {
+    /// Use float groups only with the column height that produced their layout.
+    /// Other geometries retain inline-row and marker attachments without treating a
+    /// larger source-column band as an indivisible oversized line.
+    pub fn for_page_height(mut self, height: f64) -> Self {
+        self.uses_float_groups = self
+            .fragment_height()
+            .is_none_or(|source| (source - height).abs() <= 0.01);
+        self
+    }
+
     pub fn locate(self, target: PaginationTarget) -> Option<PaginationPosition<'a>> {
         let cursor = match target {
             PaginationTarget::Cursor(cursor) => cursor,
-            PaginationTarget::Line(id) => pagination_cursor(self, id)?,
+            PaginationTarget::Line(id) => self.cursor(id)?,
         };
-        let group = pagination_group(self, cursor)?;
+        let group = self.group(cursor)?;
         let line = self.view.text().line(*self.order().get(cursor)?)?;
         let line = PaginationLine {
             id: line.id(),
             point: line.point(),
             bounds: group.bounds.clone(),
-            glyphs: text_paint::render_line_glyphs(&line),
+            glyphs: line.glyphs(),
         };
         Some(PaginationPosition {
             cursor,
@@ -139,7 +149,11 @@ impl<'a> Pagination<'a> {
         }
     }
     fn data(self, cursor: usize) -> Option<&'a LinePaginationGroup> {
-        let groups = &self.output().pagination_groups;
+        let groups = if self.uses_float_groups {
+            &self.output().pagination_groups
+        } else {
+            &self.output().pagination_base_groups
+        };
         let index = groups.partition_point(|group| group.members.end as usize <= cursor);
         groups
             .get(index)
@@ -152,22 +166,74 @@ impl<'a> Pagination<'a> {
         self.len() == 0
     }
 
+    /// Column height used to resolve float placement and its line exclusions.
+    pub fn fragment_height(self) -> Option<f64> {
+        self.output().pagination_fragment_height
+    }
+
+    pub fn has_reserved_header(self, row: BoxId) -> bool {
+        self.uses_float_groups
+            && self
+                .output()
+                .pagination_header_rows
+                .binary_search(&(layout_state::box_id_index(row) as u32))
+                .is_ok()
+    }
+
+    /// Float breaks were applied independently during layout and must
+    /// not be replayed as breaks in the surrounding normal flow.
+    pub fn float_breaks_resolved(self, owner: BoxId) -> bool {
+        if !self.uses_float_groups || self.fragment_height().is_none() {
+            return false;
+        }
+        let owner = layout_state::box_id_index(owner);
+        let mut current = Some(owner);
+        let mut inside_float = false;
+        while let Some(index) = current {
+            let Some(style) = self.view.doc.box_used_style(index) else {
+                return false;
+            };
+            if style.position() == PositionMode::Absolute {
+                return false;
+            }
+            // Cells and atomic inline contents suppress fragmentation, even
+            // for nested floats. Check all ancestors before trusting a float.
+            if style.display() == Display::TableCell || style.display().is_atomic_inline() {
+                return false;
+            }
+            if matches!(style.float(), Float::Left | Float::Right) {
+                inside_float = true;
+            }
+            current = self.view.doc.inputs.layout_tree.get_box_parent(index);
+        }
+        inside_float
+    }
+
+    /// Float-content keeps triggered in this cursor interval. Surrounding
+    /// wrapped text remains independent. Callers may split oversized ranges.
+    pub fn float_keeps(
+        self,
+        interval: Range<usize>,
+    ) -> impl Iterator<Item = (usize, Range<f64>)> + 'a {
+        let keeps = &self.output().pagination_float_keeps;
+        let start = keeps.partition_point(|keep| (keep.trigger as usize) < interval.start);
+        let end = keeps.partition_point(|keep| (keep.trigger as usize) < interval.end);
+        keeps[start..end.max(start)]
+            .iter()
+            .map(|keep| (keep.trigger as usize, keep.bounds.clone()))
+    }
+
     fn line_at(self, id: LineId, cursor: usize) -> Option<PaginationLine> {
         let line = self.view.text().line(id)?;
         let bounds = self
             .data(cursor)
             .map(|group| group.bounds.clone())
-            .or_else(|| {
-                geometry_queries::render_geometry_view_line_vertical_bounds(
-                    geometry_queries::render_view_geometry(self.view),
-                    id,
-                )
-            })?;
+            .or_else(|| ((self.view).geometry()).line_vertical_bounds(id))?;
         Some(PaginationLine {
             id,
             point: line.point(),
             bounds,
-            glyphs: text_paint::render_line_glyphs(&line),
+            glyphs: line.glyphs(),
         })
     }
 
@@ -179,107 +245,93 @@ impl<'a> Pagination<'a> {
         while let Ok(index) = anchors.binary_search_by_key(&id, |anchor| anchor.marker) {
             id = anchors[index].source;
         }
-        pagination_by_id(self, id)
+        self.by_id(id)
     }
 
     pub fn start_at(self, offset_y: f64, epsilon: f64) -> usize {
         // A continuation starts at a group's exact source origin. Prefer that
         // group over an earlier oversized/overlapping group already consumed.
-        let origins = &self.output().pagination_origins;
+        let origins = if self.uses_float_groups {
+            self.output().pagination_origins.as_slice()
+        } else {
+            self.output().pagination_base_origins.as_slice()
+        };
         let index = origins.partition_point(|&cursor| {
-            pagination_group(self, cursor as usize).unwrap().point.y < offset_y - epsilon
+            self.group(cursor as usize).unwrap().point.y < offset_y - epsilon
         });
         if let Some(&cursor) = origins.get(index)
-            && pagination_group(self, cursor as usize).unwrap().point.y <= offset_y + epsilon
+            && self.group(cursor as usize).unwrap().point.y <= offset_y + epsilon
         {
             return cursor as usize;
         }
-        let spatial = geometry_queries::render_geometry_view_start_spatial_rank_at(
-            geometry_queries::render_view_geometry(self.view),
-            offset_y,
-            epsilon,
-        );
-        text_paint::render_text_view_spatial_order(self.view.text())
+        let spatial = ((self.view).geometry()).start_spatial_rank_at(offset_y, epsilon);
+        (self.view.text())
+            .spatial_order()
             .get(spatial)
-            .and_then(|&id| pagination_cursor(self, id))
-            .and_then(|cursor| pagination_group_start(self, cursor))
+            .and_then(|&id| self.cursor(id))
+            .and_then(|cursor| self.group_start(cursor))
             .unwrap_or(self.len())
     }
     pub fn end_at(self, offset_y: f64, epsilon: f64) -> Option<usize> {
-        let spatial = geometry_queries::render_geometry_view_end_spatial_rank_at(
-            geometry_queries::render_view_geometry(self.view),
-            offset_y,
-            epsilon,
-        )?;
-        let mut cursor = pagination_cursor(
-            self,
-            *text_paint::render_text_view_spatial_order(self.view.text()).get(spatial)?,
-        )?;
+        let spatial = ((self.view).geometry()).end_spatial_rank_at(offset_y, epsilon)?;
+        let mut cursor = self.cursor(*(self.view.text()).spatial_order().get(spatial)?)?;
         loop {
-            let group = pagination_group(self, cursor)?;
+            let group = self.group(cursor)?;
             if group.bounds.end <= offset_y + epsilon {
                 return group.cursors.end.checked_sub(1);
             }
             cursor = group.cursors.start.checked_sub(1)?;
         }
     }
+
+    pub fn at(self, cursor: usize) -> Option<PaginationLine> {
+        self.line_at(*self.order().get(cursor)?, cursor)
+    }
+
+    pub(crate) fn by_id(self, id: LineId) -> Option<PaginationLine> {
+        self.line_at(id, self.cursor(id)?)
+    }
+
+    pub(crate) fn cursor(self, id: LineId) -> Option<usize> {
+        let output = self.output();
+        let ranks = if output.pagination_order.ranks().len() == output.lines.len() {
+            &output.pagination_order.ranks()
+        } else {
+            &output.spatial_order.ranks()
+        };
+        ranks
+            .get(layout_state::line_id_index(id))
+            .map(|&rank| rank as usize)
+    }
+
+    pub(crate) fn group(self, cursor: usize) -> Option<PaginationGroup<'a>> {
+        let line = self.view.text().line(*self.order().get(cursor)?)?;
+        let (cursors, point, bounds) = if let Some(group) = self.data(cursor) {
+            (
+                group.members.start as usize..group.members.end as usize,
+                group.point,
+                group.bounds.clone(),
+            )
+        } else {
+            (
+                cursor..cursor + 1,
+                line.point(),
+                ((self.view).geometry()).line_vertical_bounds(line.id())?,
+            )
+        };
+        Some(PaginationGroup {
+            pagination: self,
+            members: &self.order()[cursors.clone()],
+            cursors,
+            point,
+            bounds,
+        })
+    }
+
+    pub fn group_start(self, cursor: usize) -> Option<usize> {
+        Some(self.group(cursor)?.cursors.start)
+    }
 }
-
-pub fn pagination_at<'a>(value: Pagination<'a>, cursor: usize) -> Option<PaginationLine> {
-    value.line_at(*value.order().get(cursor)?, cursor)
-}
-
-pub(crate) fn pagination_by_id<'a>(value: Pagination<'a>, id: LineId) -> Option<PaginationLine> {
-    value.line_at(id, pagination_cursor(value, id)?)
-}
-
-pub(crate) fn pagination_cursor<'a>(value: Pagination<'a>, id: LineId) -> Option<usize> {
-    let output = value.output();
-    let ranks = if output.pagination_order.ranks().len() == output.lines.len() {
-        &output.pagination_order.ranks()
-    } else {
-        &output.spatial_order.ranks()
-    };
-    ranks
-        .get(layout_state::line_id_index(id))
-        .map(|&rank| rank as usize)
-}
-
-pub(crate) fn pagination_group<'a>(
-    value: Pagination<'a>,
-    cursor: usize,
-) -> Option<PaginationGroup<'a>> {
-    let line = value.view.text().line(*value.order().get(cursor)?)?;
-    let (cursors, point, bounds) = if let Some(group) = value.data(cursor) {
-        (
-            group.members.start as usize..group.members.end as usize,
-            group.point,
-            group.bounds.clone(),
-        )
-    } else {
-        (
-            cursor..cursor + 1,
-            line.point(),
-            geometry_queries::render_geometry_view_line_vertical_bounds(
-                geometry_queries::render_view_geometry(value.view),
-                line.id(),
-            )?,
-        )
-    };
-    Some(PaginationGroup {
-        pagination: value,
-        members: &value.order()[cursors.clone()],
-        cursors,
-        point,
-        bounds,
-    })
-}
-
-pub fn pagination_group_start<'a>(value: Pagination<'a>, cursor: usize) -> Option<usize> {
-    Some(pagination_group(value, cursor)?.cursors.start)
-}
-
-
 
 struct Groups<'a> {
     pagination: Pagination<'a>,
@@ -292,7 +344,7 @@ impl<'a> Iterator for Groups<'a> {
         if self.remaining.start >= self.remaining.end {
             return None;
         }
-        let group = pagination_group(self.pagination, self.remaining.start)?;
+        let group = (self.pagination).group(self.remaining.start)?;
         self.remaining.start = group.cursors.end.min(self.remaining.end);
         Some(group)
     }
@@ -303,12 +355,17 @@ impl DoubleEndedIterator for Groups<'_> {
         if self.remaining.start >= self.remaining.end {
             return None;
         }
-        let group = pagination_group(self.pagination, self.remaining.end - 1)?;
+        let group = (self.pagination).group(self.remaining.end - 1)?;
         self.remaining.end = group.cursors.start.max(self.remaining.start);
         Some(group)
     }
 }
 
-pub fn render_view_pagination(value: RenderView<'_>) -> Pagination<'_> {
-    Pagination { view: value }
+impl<'a> RenderView<'a> {
+    pub fn pagination(self) -> Pagination<'a> {
+        Pagination {
+            view: self,
+            uses_float_groups: true,
+        }
+    }
 }

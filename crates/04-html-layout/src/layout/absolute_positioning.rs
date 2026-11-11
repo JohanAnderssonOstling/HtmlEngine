@@ -33,18 +33,21 @@ pub(super) fn defer(engine: &mut LayoutEngine<'_, '_>, box_idx: usize, static_po
         .layout_tree()
         .ancestors(box_idx)
         .find(|&ancestor| engine.reader.style(ancestor).position() != PositionMode::Static);
-    engine.absolute_positioning.push_back(PendingAbsoluteBox {
-        box_idx,
-        containing_block,
-        static_position,
-    });
+    engine
+        .scratch
+        .absolute_positioning
+        .push_back(PendingAbsoluteBox {
+            box_idx,
+            containing_block,
+            static_position,
+        });
 }
 
 /// Consume matching deferred boxes in source order, resolving their shared
 /// containing block only when the queue has work for it.
 pub(super) fn layout_pending(engine: &mut LayoutEngine<'_, '_>, target: Option<usize>) {
     let mut containing = None;
-    while let Some(pending) = take_for(&mut engine.absolute_positioning, target) {
+    while let Some(pending) = take_for(&mut engine.scratch.absolute_positioning, target) {
         let (origin, size) = *containing.get_or_insert_with(|| containing_block(engine, target));
         layout_one(engine, pending, origin, size);
     }
@@ -87,13 +90,13 @@ fn layout_one(
     let horizontal = AbsoluteAxis::new(
         containing_size.width,
         (style.inset_left(), style.inset_right()),
-        (model.margin_left, model.margin_right),
+        (f64::from(model.margin_left), f64::from(model.margin_right)),
         (style.margin_left_auto(), style.margin_right_auto()),
     );
     let vertical = AbsoluteAxis::new(
         containing_size.height,
         (style.inset_top(), style.inset_bottom()),
-        (model.margin_top, model.margin_bottom),
+        (f64::from(model.margin_top), f64::from(model.margin_bottom)),
         (style.margin_top_auto(), style.margin_bottom_auto()),
     );
 
@@ -144,9 +147,9 @@ fn layout_one(
         .get_parent(pending.box_idx)
         .is_some_and(|parent| engine.reader.style(parent).direction() == TextDirection::Rtl)
     {
-        pending.static_position.x - size.width - model.margin_right
+        pending.static_position.x - size.width - f64::from(model.margin_right)
     } else {
-        pending.static_position.x + model.margin_left
+        pending.static_position.x + f64::from(model.margin_left)
     };
     let horizontal_overflow = if style.direction() == TextDirection::Rtl {
         AutoMarginOverflow::Start
@@ -162,7 +165,7 @@ fn layout_one(
     let y = vertical.border_start(
         containing_origin.y,
         size.height,
-        pending.static_position.y + model.margin_top,
+        pending.static_position.y + f64::from(model.margin_top),
         AutoMarginOverflow::Split,
     );
     let offset = Point::new(x, y) - pending.static_position;

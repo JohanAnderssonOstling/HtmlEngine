@@ -1,16 +1,13 @@
 //! Structural relationships and authored constraints. These queries describe
 //! the document; callers choose whether and how to fragment or display it.
 
-use html_pipeline::engine::pagination_queries;
-use html_engine_model::layout_state;
-use html_pipeline::engine::semantic_queries;
-use html_pipeline::engine::text_paint;
+use crate::layout::ContentSemantics;
 use crate::layout::{BoxId, ContentRole, RenderForcedBreak, RenderView};
-use html_pipeline::engine::box_queries;
+use html_engine_model::layout_state;
+use html_pipeline::engine::Pagination;
+use kurbo::Rect;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
-use kurbo::Rect;
-use crate::layout::ContentSemantics;
 
 /// Reusable structural queries for bounded pagination. Retain this service
 /// across requests to reuse its indexing and table buffers.
@@ -24,6 +21,7 @@ pub(crate) struct Structure {
 /// Created by [`Structure::for_lines`]; its indexes cannot be supplied separately.
 pub(crate) struct StructureView<'a> {
     view: RenderView<'a>,
+    pagination: Pagination<'a>,
     index: &'a BoundaryIndex,
     tables: &'a mut TableScratch,
 }
@@ -35,9 +33,39 @@ impl Structure {
         view: RenderView<'a>,
         range: Range<usize>,
     ) -> StructureView<'a> {
-        index_lines(view, range, &mut self.index);
+        self.for_pagination(
+            view,
+            range,
+            view.pagination(),
+        )
+    }
+
+    pub(crate) fn for_page<'a>(
+        &'a mut self,
+        view: RenderView<'a>,
+        range: Range<usize>,
+        height: f64,
+    ) -> StructureView<'a> {
+        let pagination = view.pagination();
+        if pagination
+            .fragment_height()
+            .is_none_or(|source| (source - height).abs() <= 0.01)
+        {
+            return self.for_lines(view, range);
+        }
+        self.for_pagination(view, range, pagination.for_page_height(height))
+    }
+
+    fn for_pagination<'a>(
+        &'a mut self,
+        view: RenderView<'a>,
+        range: Range<usize>,
+        pagination: Pagination<'a>,
+    ) -> StructureView<'a> {
+        index_lines(view, range, &mut self.index, pagination);
         StructureView {
             view,
+            pagination,
             index: &self.index,
             tables: &mut self.tables,
         }
@@ -64,6 +92,7 @@ pub(crate) struct BlockConstraints {
 /// Complete document facts for a block in the bounded structural traversal.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct BlockFacts {
+    pub owner: BoxId,
     pub bounds: Rect,
     pub before: Option<usize>,
     pub constraints: BlockConstraints,
@@ -91,6 +120,7 @@ pub(crate) enum TableGroupKind {
     WholeTable,
     RowGroup {
         forced: bool,
+        allow_content_break: bool,
         header: Option<TableHeader>,
     },
 }
@@ -101,6 +131,7 @@ pub(crate) struct TableHeader {
     pub right: f64,
     pub top: f64,
     pub bottom: f64,
+    pub reserved: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -132,6 +163,8 @@ struct TableScratch {
 /// These positions are independent of the stable IDs used for painting.
 #[derive(Default)]
 struct BoundaryIndex {
+    forced_preorder: Vec<u32>,
+    block_parents: HashSet<BoxId>,
     first_line: HashMap<BoxId, usize>,
     next_line: HashMap<BoxId, usize>,
     candidates: HashSet<BoxId>,
@@ -142,6 +175,10 @@ struct BoundaryIndex {
 }
 
 impl StructureView<'_> {
+    pub(crate) fn pagination(&self) -> Pagination<'_> {
+        self.pagination
+    }
+
     pub(crate) fn first_line(&self, box_idx: BoxId) -> Option<usize> {
         self.index.first_line.get(&box_idx).copied()
     }
@@ -165,14 +202,12 @@ impl StructureView<'_> {
     pub(crate) fn blocks(&self) -> impl Iterator<Item = BlockFacts> + '_ {
         self.box_ids().filter_map(|id| {
             Some(BlockFacts {
+                owner: id,
                 bounds: self.view.boxes().bounds(id)?,
                 before: self.before(id),
                 constraints: self.constraints(id),
-                roles: semantic_queries::render_view_semantics(self.view).content(id),
-                is_block_container: box_queries::render_box_view_is_block_container(
-                    self.view.boxes(),
-                    id,
-                ),
+                roles: (self.view).semantics().content(id),
+                is_block_container: (self.view.boxes()).is_block_container(id),
             })
         })
     }
@@ -184,26 +219,28 @@ impl StructureView<'_> {
     pub(crate) fn authored_boundaries(&self) -> impl Iterator<Item = AuthoredBoundary> + '_ {
         let boxes = self.view.boxes();
         self.box_ids().flat_map(move |box_idx| {
+            let resolved = self.pagination.float_breaks_resolved(box_idx);
             let before = self
                 .before(box_idx)
-                .zip(box_queries::render_box_view_point(boxes, box_idx))
+                .zip(boxes.point(box_idx))
                 .map(|(trigger_line, point)| AuthoredBoundary {
                     trigger_line,
                     top: point.y,
-                    forced: box_queries::forced_break_before(boxes, box_idx),
-                    avoid: box_queries::avoids_break_before(boxes, box_idx),
+                    forced: (!resolved)
+                        .then(|| boxes.forced_break_before(box_idx))
+                        .flatten(),
+                    avoid: boxes.avoids_break_before(box_idx),
                 });
             let after = self.after(box_idx).and_then(|trigger_line| {
                 Some(AuthoredBoundary {
                     trigger_line,
-                    top: pagination_queries::pagination_at(
-                        pagination_queries::render_view_pagination(self.view),
-                        trigger_line,
-                    )?
-                    .point()
-                    .y,
-                    forced: box_queries::forced_break_after(boxes, box_idx),
-                    avoid: box_queries::avoids_break_after(boxes, box_idx),
+                    top: (self.pagination).at(trigger_line)?
+                        .point()
+                        .y,
+                    forced: (!resolved)
+                        .then(|| boxes.forced_break_after(box_idx))
+                        .flatten(),
+                    avoid: boxes.avoids_break_after(box_idx),
                 })
             });
             [before, after]
@@ -215,37 +252,23 @@ impl StructureView<'_> {
 
     pub(crate) fn constraints(&self, box_idx: BoxId) -> BlockConstraints {
         let boxes = self.view.boxes();
+        let facts = boxes.pagination_facts(box_idx).expect("published pagination structure");
+        let first = self.index.forced_preorder.partition_point(|&entry| entry <= facts.subtree.start);
         BlockConstraints {
-            avoid_inside: box_queries::avoids_break_inside(boxes, box_idx),
-            has_forced_descendant: self.box_ids().any(|descendant| {
-                descendant != box_idx
-                    && semantic_queries::render_semantics_view_contains(
-                        semantic_queries::render_view_semantics(self.view),
-                        box_idx,
-                        descendant,
-                    )
-                    && (box_queries::forces_break_before(boxes, descendant)
-                        || box_queries::forces_break_after(boxes, descendant))
-            }),
-            owns_line_flow: box_queries::render_box_view_is_block_container(boxes, box_idx)
-                && !self.box_ids().any(|child| {
-                    box_queries::parent(boxes, child) == Some(box_idx)
-                        && box_queries::render_box_view_is_block_container(boxes, child)
-                })
-                && !box_queries::is_table(boxes, box_idx)
-                && !box_queries::ancestors(boxes, box_idx)
-                    .any(|ancestor| box_queries::is_table(boxes, ancestor)),
-            orphans: box_queries::orphans(boxes, box_idx),
-            widows: box_queries::widows(boxes, box_idx),
+            avoid_inside: facts.avoid_inside,
+            has_forced_descendant: self.index.forced_preorder.get(first).is_some_and(|&entry| entry < facts.subtree.end),
+            owns_line_flow: facts.is_block_container && !facts.in_table && !self.index.block_parents.contains(&box_idx),
+            orphans: facts.orphans,
+            widows: facts.widows,
         }
     }
 
     pub(crate) fn sibling_pairs(&self) -> Vec<SiblingPair> {
         let boxes = self.view.boxes();
-        let semantics = semantic_queries::render_view_semantics(self.view);
+        let semantics = (self.view).semantics();
         let mut children: Vec<_> = self
             .box_ids()
-            .map(|box_idx| (box_queries::parent(boxes, box_idx), box_idx))
+            .map(|box_idx| (boxes.parent(box_idx), box_idx))
             .collect();
         children.sort_unstable();
         children
@@ -263,18 +286,14 @@ impl StructureView<'_> {
                     previous_bounds: boxes.bounds(*previous)?,
                     next_bounds: boxes.bounds(*next)?,
                     trigger_line: self.before(*previous),
-                    forced_boundary: box_queries::forces_break_after(boxes, *previous)
-                        || box_queries::forces_break_before(boxes, *next),
-                    avoid_boundary: box_queries::avoids_break_after(boxes, *previous)
-                        || box_queries::avoids_break_before(boxes, *next),
+                    forced_boundary: boxes.forces_break_after(*previous)
+                        || boxes.forces_break_before(*next),
+                    avoid_boundary: boxes.avoids_break_after(*previous)
+                        || boxes.avoids_break_before(*next),
                     definition_pair: previous_roles.has_role(ContentRole::DefinitionTerm)
                         && next_roles.has_role(ContentRole::DefinitionDescription),
                     statement_label_pair: parent.is_some_and(|parent| {
-                        semantic_queries::render_semantics_view_has_role(
-                            semantics,
-                            parent,
-                            ContentRole::Statement,
-                        )
+                        semantics.has_role(parent, ContentRole::Statement)
                     }) && previous_roles.has_role(ContentRole::Label),
                     caption_pair: previous_roles.has_role(ContentRole::Caption)
                         || next_roles.has_role(ContentRole::Caption),
@@ -298,22 +317,13 @@ impl StructureView<'_> {
         events.clear();
         let root = view;
         let boxes = root.boxes();
-        let first_local_line_in_range = |top: f64, bottom: f64| {
-            anchors.line_indices.iter().copied().find(|&line_idx| {
-                pagination_queries::pagination_at(
-                    pagination_queries::render_view_pagination(view),
-                    line_idx,
-                )
-                .is_some_and(|line| line.point().y >= top - 0.01 && line.point().y < bottom - 0.01)
-            })
-        };
         table_indices.clear();
         table_indices.extend(
             anchors
                 .candidates
                 .iter()
                 .copied()
-                .filter(|&box_idx| box_queries::is_table(boxes, box_idx)),
+                .filter(|&box_idx| boxes.is_table(box_idx)),
         );
         table_indices.sort_unstable();
         while rows_by_table.len() < table_indices.len() {
@@ -325,34 +335,34 @@ impl StructureView<'_> {
         }
         row_spans.clear();
         for box_idx in anchors.candidates.iter().copied() {
-            if box_queries::is_table_row(boxes, box_idx)
-                && let Some(table_idx) = box_queries::ancestors(boxes, box_idx)
-                    .find(|&ancestor| box_queries::is_table(boxes, ancestor))
+            if boxes.is_table_row(box_idx)
+                && let Some(table_idx) = boxes.ancestors(box_idx)
+                    .find(|&ancestor| boxes.is_table(ancestor))
                 && let Ok(table_slot) = table_indices.binary_search(&table_idx)
             {
                 rows_by_table[table_slot].1.push(box_idx);
-            } else if box_queries::is_table_cell(boxes, box_idx)
-                && let Some(row_idx) = box_queries::parent(boxes, box_idx)
+            } else if boxes.is_table_cell(box_idx)
+                && let Some(row_idx) = boxes.parent(box_idx)
             {
                 row_spans
                     .entry(row_idx)
                     .and_modify(|span| {
-                        *span = (*span).max(box_queries::table_cell_rowspan(boxes, box_idx))
+                        *span = (*span).max(boxes.table_cell_rowspan(box_idx))
                     })
-                    .or_insert_with(|| box_queries::table_cell_rowspan(boxes, box_idx));
+                    .or_insert_with(|| boxes.table_cell_rowspan(box_idx));
             }
         }
 
         for (table_idx, rows) in rows_by_table.iter_mut().take(table_indices.len()) {
             let table_idx = *table_idx;
             let (Some(table_point), Some(table_size)) = (
-                box_queries::render_box_view_point(boxes, table_idx),
-                box_queries::render_box_view_size(boxes, table_idx),
+                boxes.point(table_idx),
+                boxes.size(table_idx),
             ) else {
                 continue;
             };
             let table_bottom = table_point.y + table_size.height;
-            if let Some(trigger_line) = first_local_line_in_range(table_point.y, table_bottom) {
+            if let Some(&trigger_line) = anchors.first_line.get(&table_idx) {
                 events.push(TableGroup {
                     table_box: table_idx,
                     trigger_line,
@@ -363,8 +373,8 @@ impl StructureView<'_> {
             }
 
             rows.sort_by(|&a, &b| {
-                let ay = box_queries::render_box_view_point(boxes, a).map_or(0.0, |point| point.y);
-                let by = box_queries::render_box_view_point(boxes, b).map_or(0.0, |point| point.y);
+                let ay = boxes.point(a).map_or(0.0, |point| point.y);
+                let by = boxes.point(b).map_or(0.0, |point| point.y);
                 ay.total_cmp(&by).then_with(|| a.cmp(&b))
             });
 
@@ -374,35 +384,31 @@ impl StructureView<'_> {
             // affects this work.
             leading_headers.clear();
             let contains = |scan: usize| {
-                scan < box_queries::len(boxes)
-                    && semantic_queries::render_semantics_view_contains(
-                        semantic_queries::render_view_semantics(view),
-                        table_idx,
-                        layout_state::box_id_new(scan),
-                    )
+                scan < boxes.len()
+                    && (view.semantics()).contains(table_idx, layout_state::box_id_new(scan))
             };
             let mut scan = layout_state::box_id_index(table_idx) + 1;
             while contains(scan) {
-                if !box_queries::is_table_row(boxes, layout_state::box_id_new(scan)) {
+                if !boxes.is_table_row(layout_state::box_id_new(scan)) {
                     scan += 1;
                     continue;
                 }
                 let row = layout_state::box_id_new(scan);
-                let explicit_header = box_queries::ancestors(boxes, row)
+                let explicit_header = boxes.ancestors(row)
                     .take_while(|&ancestor| ancestor != table_idx)
-                    .any(|ancestor| box_queries::is_table_header_group(boxes, ancestor));
+                    .any(|ancestor| boxes.is_table_header_group(ancestor));
                 let mut cell_count = 0usize;
                 let mut header_cell_count = 0usize;
                 scan += 1;
                 while contains(scan)
-                    && !box_queries::is_table_row(boxes, layout_state::box_id_new(scan))
+                    && !boxes.is_table_row(layout_state::box_id_new(scan))
                 {
                     let cell = layout_state::box_id_new(scan);
-                    if box_queries::is_table_cell(boxes, cell)
-                        && box_queries::ancestors(boxes, cell).any(|ancestor| ancestor == row)
+                    if boxes.is_table_cell(cell)
+                        && boxes.ancestors(cell).any(|ancestor| ancestor == row)
                     {
                         cell_count += 1;
-                        if semantic_queries::render_view_semantics(view)
+                        if view.semantics()
                             .content(cell)
                             .has_role(ContentRole::TableHeaderCell)
                         {
@@ -425,14 +431,15 @@ impl StructureView<'_> {
                 .first()
                 .zip(leading_headers.last())
                 .and_then(|(&first, &last)| {
-                    let top = box_queries::render_box_view_point(boxes, first)?.y;
-                    let bottom = box_queries::render_box_view_point(boxes, last)?.y
-                        + box_queries::render_box_view_size(boxes, last)?.height;
+                    let top = boxes.point(first)?.y;
+                    let bottom = boxes.point(last)?.y
+                        + boxes.size(last)?.height;
                     (bottom > top + 0.01).then_some(TableHeader {
                         left: table_point.x,
                         right: table_point.x + table_size.width,
                         top,
                         bottom,
+                        reserved: false,
                     })
                 });
 
@@ -450,34 +457,36 @@ impl StructureView<'_> {
                 let first_row = rows[group_start];
                 let last_row = rows[group_end - 1];
                 let Some(group_top) =
-                    box_queries::render_box_view_point(boxes, first_row).map(|point| point.y)
+                    boxes.point(first_row).map(|point| point.y)
                 else {
                     group_start = group_end;
                     continue;
                 };
-                let mut group_bottom = box_queries::render_box_view_point(boxes, last_row)
-                    .zip(box_queries::render_box_view_size(boxes, last_row))
+                let mut group_bottom = boxes.point(last_row)
+                    .zip(boxes.size(last_row))
                     .map_or(group_top, |(point, size)| point.y + size.height);
                 if group_end == rows.len()
                     && anchors.line_indices.iter().copied().any(|line_idx| {
-                        pagination_queries::pagination_at(
-                            pagination_queries::render_view_pagination(view),
-                            line_idx,
-                        )
-                        .is_some_and(|line| {
-                            line.point().y >= group_bottom - 0.01
-                                && line.point().y < table_bottom - 0.01
-                        })
+                        self.pagination.at(line_idx)
+                            .and_then(|line| view.text().line(line.id()))
+                            .is_some_and(|line| {
+                                view.semantics().contains(table_idx, line.owner_box())
+                                    && line.point().y >= group_bottom - 0.01
+                                    && line.point().y < table_bottom - 0.01
+                            })
                     })
                 {
                     // A bottom caption is part of the table box but not of the
                     // last row. Include it in the final atomic group.
                     group_bottom = group_bottom.max(table_bottom);
                 }
-                let forced = box_queries::forces_break_before(boxes, first_row)
-                    || (group_start > 0
-                        && box_queries::forces_break_after(boxes, rows[group_start - 1]));
-                if let Some(trigger_line) = first_local_line_in_range(group_top, group_bottom) {
+                let forced = !self.pagination.float_breaks_resolved(first_row)
+                    && (boxes.forces_break_before(first_row)
+                        || (group_start > 0
+                            && boxes.forces_break_after(rows[group_start - 1])));
+                if let Some(trigger_line) = rows[group_start..group_end].iter()
+                    .filter_map(|row| anchors.first_line.get(row).copied()).min()
+                {
                     events.push(TableGroup {
                         table_box: table_idx,
                         trigger_line,
@@ -485,8 +494,15 @@ impl StructureView<'_> {
                         bottom: group_bottom,
                         kind: TableGroupKind::RowGroup {
                             forced,
+                            allow_content_break: group_end == group_start + 1
+                                && boxes.table_row_allows_content_break(first_row),
                             header: repeated_header
-                                .filter(|header| group_top >= header.bottom - 0.01),
+                                .filter(|header| group_top >= header.bottom - 0.01)
+                                .map(|mut header| {
+                                    header.reserved =
+                                        self.pagination.has_reserved_header(first_row);
+                                    header
+                                }),
                         },
                     });
                 }
@@ -503,9 +519,14 @@ impl StructureView<'_> {
     }
 }
 
-fn index_lines(view: RenderView<'_>, range: Range<usize>, anchors: &mut BoundaryIndex) {
+fn index_lines(
+    view: RenderView<'_>,
+    range: Range<usize>,
+    anchors: &mut BoundaryIndex,
+    pagination: Pagination<'_>,
+) {
     let boxes = view.boxes();
-    let line_count = pagination_queries::render_view_pagination(view).len();
+    let line_count = pagination.len();
     let local_start = range.start;
     let local_end = range
         .end
@@ -527,21 +548,16 @@ fn index_lines(view: RenderView<'_>, range: Range<usize>, anchors: &mut Boundary
     let line_owners = &mut anchors.line_owners;
 
     for line_idx in line_indices.iter().copied() {
-        let Some(line) = pagination_queries::pagination_at(
-            pagination_queries::render_view_pagination(view),
-            line_idx,
-        )
-        .and_then(|line| view.text().line(line.id())) else {
+        let Some(line) = pagination.at(line_idx)
+            .and_then(|line| view.text().line(line.id()))
+        else {
             continue;
         };
-        let owner = text_paint::render_line_owner_box(&line);
-        let line_idx = pagination_queries::pagination_group_start(
-            pagination_queries::render_view_pagination(view),
-            line_idx,
-        )
-        .unwrap_or(line_idx);
+        let owner = line.owner_box();
+        let line_idx =
+            pagination.group_start(line_idx).unwrap_or(line_idx);
         line_owners.push((line_idx, owner));
-        for box_idx in std::iter::once(owner).chain(box_queries::ancestors(boxes, owner)) {
+        for box_idx in std::iter::once(owner).chain(boxes.ancestors(owner)) {
             candidates.insert(box_idx);
             first_line
                 .entry(box_idx)
@@ -564,11 +580,22 @@ fn index_lines(view: RenderView<'_>, range: Range<usize>, anchors: &mut Boundary
             .map(layout_state::box_id_new)
         {
             candidates.insert(box_idx);
-            for ancestor in box_queries::ancestors(boxes, box_idx) {
+            for ancestor in boxes.ancestors(box_idx) {
                 candidates.insert(ancestor);
             }
         }
     }
+
+    anchors.forced_preorder.clear();
+    anchors.block_parents.clear();
+    for &owner in candidates.iter() {
+        let Some(facts) = boxes.pagination_facts(owner) else { continue };
+        if facts.forced_break { anchors.forced_preorder.push(facts.subtree.start); }
+        if facts.is_block_container && let Some(parent) = boxes.parent(owner) {
+            anchors.block_parents.insert(parent);
+        }
+    }
+    anchors.forced_preorder.sort_unstable();
 
     let next_line = &mut anchors.next_line;
     let by_owner = &mut anchors.next_owner_lines;

@@ -1,6 +1,5 @@
 //! Shared used advances and paint offsets over a published logical line.
 
-use crate::shaping_contracts;
 use crate::{GlyphAdvanceRun, GlyphOffsetRun, InlineContent, Line};
 use crate::{GlyphId, GlyphMetric, GlyphMetrics, GlyphSlice, TextGeometryView};
 use html_text::{spaced_advance, suppresses_glyph, tracking_boundary_after};
@@ -201,8 +200,7 @@ mod tests {
         let mut geometry = ShapedTextGeometry::with_len(glyphs.len());
         geometry.push_run(
             &[0, 1, 2],
-            shaping_contracts::shaped_text_run_new(vec![5.0, 0.0, 9.0].into(),
-                vec![true, false, true, true].into(),),
+            ShapedTextRun::new(vec![5.0, 0.0, 9.0].into(), vec![true, false, true, true].into()),
             false,
         );
         geometry.finish_runs();

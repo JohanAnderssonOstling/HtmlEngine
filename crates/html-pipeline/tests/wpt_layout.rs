@@ -1,6 +1,4 @@
-use crate::stages::box_queries;
 use html_engine_model::layout_state;
-use html_engine_model::shaping_contracts;
 use html_dom::{Document, ImageSource};
 use html_parse::HtmlQuirksMode;
 use html_pipeline::engine::GlyphResourceStore;
@@ -11,7 +9,7 @@ use html_pipeline::engine::{
 };
 use html_pipeline::engine::{LaidOutDocument, PreparedDocument};
 use html_pipeline::{DocumentFactory, parse_html_document};
-use html_pipeline::engine::{GlyphRequest, FontMetrics, ShapedGlyph};
+use html_pipeline::engine::{FontMetrics, ShapedRun, TextRunShapeRequest, ShapedGlyph};
 use html_resources::{ResourceProvider, probe_dimensions};
 use html_wpt_test_support::wpt_root;
 use std::borrow::Cow;
@@ -36,43 +34,14 @@ const WPT_LAYOUT_TOLERANCE: f64 = 1.0;
 struct DeterministicShaper {
     glyphs: HashMap<(char, u32, bool), GlyphHandle>,
     generation: html_pipeline::engine::GlyphResourceGeneration,
-    append_checkpoint: Option<(
-        HashMap<(char, u32, bool), GlyphHandle>,
-        html_pipeline::engine::GlyphResourceGeneration,
-    )>,
 }
 
 impl GlyphShaper for DeterministicShaper {
-    fn reset(&mut self) {
-        self.glyphs.clear();
-        self.generation = html_pipeline::engine::GlyphResourceGeneration::default();
-    }
-
     fn resource_generation(&self) -> html_pipeline::engine::GlyphResourceGeneration {
         self.generation
     }
 
-    fn begin_append_shaping(&mut self) -> Result<(), ShapeError> {
-        assert!(self.append_checkpoint.is_none());
-        self.append_checkpoint = Some((self.glyphs.clone(), self.generation.clone()));
-        Ok(())
-    }
-
-    fn commit_append_shaping(&mut self) {
-        self.append_checkpoint = None;
-    }
-
-    fn rollback_append_shaping(&mut self) {
-        if let Some((glyphs, glyph_store)) = self.append_checkpoint.take() {
-            self.glyphs = glyphs;
-            self.generation = glyph_store;
-        }
-    }
-
-    fn font_relative_metrics(
-        &mut self,
-        request: &ShapingStyle<'_>,
-    ) -> Result<FontRelativeMetrics, ShapeError> {
+    fn font_relative_metrics(&mut self, request: &ShapingStyle<'_>) -> FontRelativeMetrics {
         if request.font_family.is_some_and(|family| {
             family.split(',').next().is_some_and(|name| {
                 name.trim()
@@ -80,7 +49,7 @@ impl GlyphShaper for DeterministicShaper {
                     .eq_ignore_ascii_case("BaselineDiagnosticAlphabeticZero")
             })
         }) {
-            return Ok(FontRelativeMetrics {
+            return FontRelativeMetrics {
                 x_height_ratio: 0.25,
                 ch_advance_ratio: 0.5,
                 cap_height_ratio: 0.55,
@@ -89,38 +58,36 @@ impl GlyphShaper for DeterministicShaper {
                     descent_ratio: 0.2,
                 }),
                 ..FontRelativeMetrics::default()
-            });
+            };
         }
-        Ok(FontRelativeMetrics::default())
+        FontRelativeMetrics::default()
     }
 
-    fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
-        let is_ahem = shaping_contracts::shaping_style_font_family_for_character(&request
-            .style, request.character)
-            .and_then(|families| families.split(',').next())
-            .map(str::trim)
-            .map(|family| family.trim_matches(['\'', '"']))
-            .is_some_and(|family| family.eq_ignore_ascii_case("ahem"));
-        let key = (
-            request.character,
-            request.style.font_size.to_bits(),
-            is_ahem,
-        );
-        let advance = if is_ahem {
-            request.style.font_size
-        } else {
-            request.style.font_size * 0.5
-        };
-        let metrics = FontMetrics {
-            ascent: request.style.font_size * 0.75,
-            descent: request.style.font_size * 0.25,
-        };
-        if let Some(&glyph) = self.glyphs.get(&key) {
-            return Ok(ShapedGlyph::new(glyph, advance, metrics));
-        }
-        let glyph = GlyphHandle(self.glyphs.len() as u32);
-        self.glyphs.insert(key, glyph);
-        Ok(ShapedGlyph::new(glyph, advance, metrics))
+    fn shape_run(&mut self, request: TextRunShapeRequest<'_>) -> ShapedRun {
+        ShapedRun::characters(request, |character, style| {
+            let is_ahem =
+                style.font_family_for_character(character)
+                    .and_then(|families| families.split(',').next())
+                    .map(str::trim)
+                    .map(|family| family.trim_matches(['\'', '"']))
+                    .is_some_and(|family| family.eq_ignore_ascii_case("ahem"));
+            let key = (character, style.font_size.to_bits(), is_ahem);
+            let advance = if is_ahem {
+                style.font_size
+            } else {
+                style.font_size * 0.5
+            };
+            let metrics = FontMetrics {
+                ascent: style.font_size * 0.75,
+                descent: style.font_size * 0.25,
+            };
+            if let Some(&glyph) = self.glyphs.get(&key) {
+                return ShapedGlyph::new(glyph, advance, metrics);
+            }
+            let glyph = GlyphHandle(self.glyphs.len() as u32);
+            self.glyphs.insert(key, glyph);
+            ShapedGlyph::new(glyph, advance, metrics)
+        })
     }
 }
 
@@ -367,10 +334,10 @@ fn runs_pinned_noninteractive_wpt_layout_assertions() {
             panic!("failed to shape and lay out pinned WPT {relative}: {error}")
         });
         let boxes = document.render_view(&document_resources).boxes();
-        let boxes_by_dom_node = (0..box_queries::len(boxes))
+        let boxes_by_dom_node = (0..boxes.len())
             .map(layout_state::box_id_new)
             .filter_map(|box_idx| {
-                box_queries::dom_node(boxes, box_idx).map(|node| (node.raw() as usize, box_idx))
+                boxes.dom_node(box_idx).map(|node| (node.raw() as usize, box_idx))
             })
             .collect::<HashMap<_, _>>();
 
@@ -388,7 +355,7 @@ fn runs_pinned_noninteractive_wpt_layout_assertions() {
             if known.remove(&missing_box) {
                 unexpected_passes.push(missing_box);
             }
-            let size = box_queries::render_box_view_size(boxes, box_idx)
+            let size = boxes.size(box_idx)
                 .expect("a correlated box has geometry");
             if let Some(expected) = expectation.width {
                 let run_key = assertion_run_key(relative, &expectation, "width", expected);
@@ -396,7 +363,7 @@ fn runs_pinned_noninteractive_wpt_layout_assertions() {
                     eprintln!(
                         "layout assertion-run: {run_key}|actual={}|box={box_idx:?}|parent={:?}|class={:?}|style={:?}",
                         size.width,
-                        box_queries::parent(boxes, box_idx),
+                        boxes.parent(box_idx),
                         expectation.class,
                         expectation.style
                     );
@@ -420,7 +387,7 @@ fn runs_pinned_noninteractive_wpt_layout_assertions() {
                     eprintln!(
                         "layout assertion-run: {run_key}|actual={}|box={box_idx:?}|parent={:?}|class={:?}|style={:?}",
                         size.height,
-                        box_queries::parent(boxes, box_idx),
+                        boxes.parent(box_idx),
                         expectation.class,
                         expectation.style
                     );
@@ -590,7 +557,7 @@ fn skipped_unsupported_entries() -> BTreeMap<String, String> {
 fn unsupported_replaced_element_tags(document: &Document) -> Vec<String> {
     document
         .node_ids()
-        .filter_map(|node| document.element_ref(node))
+        .filter_map(|node| document.try_element_ref(node))
         .map(|element| element.tag())
         .filter(|tag| {
             matches!(
@@ -648,7 +615,7 @@ fn collect_expectations(
 ) -> Vec<LayoutExpectation> {
     let mut expectations = Vec::new();
     for node in document.node_ids() {
-        let Some(element) = document.element_ref(node) else {
+        let Some(element) = document.try_element_ref(node) else {
             continue;
         };
         let mut width = None;

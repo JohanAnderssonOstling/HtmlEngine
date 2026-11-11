@@ -1,5 +1,5 @@
 use html_engine_model::layout_state;
-use crate::layout_model::{LayoutMode, ScenePaintItem};
+use html_engine_model::{LayoutMode, ScenePaintItem};
 use html_style_model::{BorderCollapseMode, Float, PositionMode, UsedStyleView};
 use std::ops::Range;
 
@@ -21,7 +21,7 @@ fn paint_order_key(reader: &LayoutReader<'_>, box_idx: usize, ordinary_layer: u8
         let mut node = owner;
         while let Some(index) = current {
             if let Some(element) = reader.box_dom_element(index) {
-                node = element as usize;
+                node = element.index();
                 break;
             }
             current = reader.get_parent(index);
@@ -101,16 +101,17 @@ fn paint_order_key(reader: &LayoutReader<'_>, box_idx: usize, ordinary_layer: u8
         // block fragments stay inside the same original inline context.
         let split = reader.split_inline_position_ancestors(owner);
         if !split.is_empty() {
-            let mut node = reader
-                .box_dom_element(owner)
-                .and_then(|raw| reader.document().node_id_from_raw(raw))
-                .and_then(|node| reader.document().get_dom_parent(node));
+            let mut node = reader.box_dom_element(owner).and_then(|node| {
+                reader
+                    .document()
+                    .node_ref(node).parent()
+            });
             for &indices in split.iter().rev() {
                 let mut source = source_order(owner);
                 while let Some(ancestor) = node {
-                    node = reader.document().get_dom_parent(ancestor);
+                    node = reader.document().node_ref(ancestor).parent();
                     if reader.styles().style_for_node(ancestor) == Some(indices) {
-                        source = (ancestor.raw() as usize, owner);
+                        source = (ancestor.index(), owner);
                         break;
                     }
                 }
@@ -143,7 +144,8 @@ pub(in crate::layout) fn build_scene_paint_order(
     reader: &LayoutReader<'_>,
     fragments: &mut FragmentWriter<'_>,
 ) {
-    let (layout, owners) = fragments.decoration_parts();
+    let layout = fragments.state_mut();
+    let owners = &layout.fragment_output.block_decoration_owners;
     let mut items = Vec::with_capacity(
         layout.fragment_output.decorations.len() + layout.line_output.lines.len(),
     );
@@ -225,7 +227,6 @@ pub(in crate::layout) fn build_scene_paint_order(
 
 /// Build independent traversals over stable emission-order line storage.
 pub(super) fn build_line_traversals(reader: &LayoutReader<'_>, fragments: &mut FragmentWriter<'_>) {
-    profile_scope!("finalize.line_traversals");
     let output = &mut fragments.state_mut().line_output;
     output.line_glyph_offsets.freeze();
     output.line_glyph_advances.freeze();
@@ -274,16 +275,13 @@ pub(in crate::layout) fn build_block_decoration_traversal(
     fragments: &mut FragmentWriter<'_>,
     scratch: &mut FinalizationScratch,
 ) {
-    let (layout, owners) = fragments.decoration_parts();
+    let layout = fragments.state_mut();
+    let owners = &layout.fragment_output.block_decoration_owners;
     assert_eq!(
         owners.len(),
         layout.fragment_output.decorations.len(),
         "every block decoration must carry a paint-order owner"
     );
-    layout
-        .fragment_output
-        .block_decoration_owners
-        .clone_from(owners);
     layout.fragment_output.block_decoration_count = u32::try_from(owners.len())
         .expect("block decoration count exceeds traversal index capacity");
     layout.fragment_output.block_paint_ranges.clear();
@@ -386,7 +384,6 @@ pub(in crate::layout) fn build_block_decoration_traversal(
 }
 
 pub(super) fn rebuild_image_fragments_by_line(fragments: &mut FragmentWriter<'_>) {
-    profile_scope!("finalize.image_index");
     let layout = fragments.state_mut();
     let by_line = &mut layout.fragment_output.image_fragments_by_line;
     by_line.reset_groups(layout.line_output.lines.len());
@@ -471,7 +468,6 @@ pub(in crate::layout) fn rebuild_decoration_fragments_by_line(fragments: &mut Fr
 }
 
 pub(super) fn rebuild_glyph_line_indices(glyph_count: usize, fragments: &mut FragmentWriter<'_>) {
-    profile_scope!("finalize.glyph_line_index");
     let layout = fragments.state_mut();
     layout
         .line_output

@@ -10,8 +10,7 @@ use crate::render::SceneImagePolicy;
 use html_render_core::SceneOptions;
 use crate::selection::{
     Selection, SelectionController, SelectionInput, SelectionLayout, SelectionOutcome,
-    SelectionPaintScratch,
-};
+    SelectionPaintScratch, SelectionPaintStyle};
 use crate::render::{LinePlacement, Painter};
 use html_render_core::RegionProjection;
 use kurbo::{Point, Rect};
@@ -19,7 +18,8 @@ use peniko::Color;
 use html_pipeline::engine::{LayoutConstraints, NoteLayout};
 
 /// A subtree's layout and logical selection, sharing DOM, styles and native
-/// resources with its owner. Queries return `None` after owner replacement or
+/// entries with its owner. Engine registrations are owned by the scope.
+/// Queries return `None` after owner replacement or
 /// native resource invalidation. No publication identity or popup state is kept.
 pub struct ScopedContent {
     id: String,
@@ -30,7 +30,7 @@ pub struct ScopedContent {
 
 impl Document {
     /// Lay out any element with this ID, including a note excluded from flow.
-    /// Existing document paint resources remain valid while scope resources append.
+    /// The scope owns its registrations; the document ledger remains unchanged.
     /// An absent element returns `Ok(None)`; backend failures return `Err`.
     pub fn scope(
         &mut self,
@@ -88,6 +88,7 @@ impl ScopedContent {
             return Ok(false);
         };
         self.layout = layout;
+        self.interact(owner, SelectionInput::PointerLeave);
         Ok(true)
     }
 
@@ -114,6 +115,10 @@ impl ScopedContent {
         self.selection.selection(self.render_view(owner)?)
     }
 
+    pub fn link_hovered(&self) -> bool {
+        self.selection.link_hovered()
+    }
+
     pub fn interact(&mut self, owner: &Document, input: SelectionInput) -> SelectionOutcome {
         let Some(document) = owner.document() else {
             return SelectionOutcome::default();
@@ -121,10 +126,26 @@ impl ScopedContent {
         let Some(view) = self.layout.render_view(document, owner.glyph_resources()) else {
             return SelectionOutcome::default();
         };
-        let placements = view.text().lines().iter().map(|line| LinePlacement {
-            line: line.id(),
-            origin: line.point(),
-        });
+        let hover = match &input {
+            SelectionInput::PointerMove { position, .. } if !self.selection.is_dragging() => {
+                Some(*position)
+            }
+            _ => None,
+        };
+        let nearby = hover
+            .into_iter()
+            .flat_map(move |point| Geometry::new(view).point_placements(point));
+        let all = hover
+            .is_none()
+            .then_some(view)
+            .into_iter()
+            .flat_map(|view| {
+                view.text().lines().iter().map(|line| LinePlacement {
+                    line: line.id(),
+                    origin: line.point(),
+                })
+            });
+        let placements = nearby.chain(all);
         let projection = RegionProjection {
             source: Rect::new(0.0, 0.0, self.constraints.viewport_width(), f64::MAX),
             destination: Point::ZERO,
@@ -163,7 +184,10 @@ impl ScopedContent {
                 placements,
                 projection: &projection,
             },
-            color,
+            SelectionPaintStyle {
+                selection: color,
+                hover_foreground: None,
+            },
             painter,
             scratch,
         );

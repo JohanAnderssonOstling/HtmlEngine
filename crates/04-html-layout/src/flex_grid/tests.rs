@@ -2,15 +2,17 @@
 use html_engine_model::layout_state;
 #[cfg(test)]
 mod tests {
-    use html_pipeline::engine::{box_queries, text_paint};
+    use html_pipeline::engine::LayoutRequest;
 
-    use crate::GlyphResourceStore;
-    use crate::layout_model::BoxId;
+
+    use html_engine_model::GlyphResourceStore;
+    use html_engine_model::BoxId;
 
     // Integration coverage for the shared flex/grid implementation.
     use crate::parser::DocumentFactory;
     use crate::test_support::TestGlyphShaper;
-    use crate::{LaidOutDocument, LayoutConstraints};
+    use html_engine_model::{LayoutConstraints};
+    use crate::{LaidOutDocument};
     use kurbo::{Point, Size};
     use taffy::geometry::Size as TaffySize;
     use taffy::prelude::{AvailableSpace, Dimension, Style, TaffyTree};
@@ -27,7 +29,11 @@ mod tests {
             .parse_with_new_pipeline(html, None)
             .shape(&mut shaper, resources)
             .expect("test shaper registers every glyph")
-            .layout(LayoutConstraints::new(width, 16.0).unwrap(), resources)
+            .layout(
+                LayoutRequest::new(LayoutConstraints::new(width, 16.0).unwrap()),
+                &mut shaper,
+                resources,
+            )
             .expect("layout requires the shaper-aware API for first-line styles")
     }
 
@@ -43,15 +49,19 @@ mod tests {
             .parse_with_new_pipeline(html, Some(css))
             .shape(&mut shaper, resources)
             .expect("test shaper registers every glyph")
-            .layout(LayoutConstraints::new(width, 16.0).unwrap(), resources)
+            .layout(
+                LayoutRequest::new(LayoutConstraints::new(width, 16.0).unwrap()),
+                &mut shaper,
+                resources,
+            )
             .expect("layout requires the shaper-aware API for first-line styles")
     }
 
     fn box_index(document: &LaidOutDocument, id: &str, resources: &GlyphResourceStore) -> BoxId {
         let view = document.render_view(resources);
-        (0..box_queries::len(view.boxes()))
+        (0..(view.boxes()).len())
             .map(layout_state::box_id_new)
-            .find(|&idx| box_queries::attribute(view.boxes(), idx, "id") == Some(id))
+            .find(|&idx| (view.boxes()).attribute(idx, "id") == Some(id))
             .unwrap_or_else(|| panic!("missing box #{id}"))
     }
 
@@ -63,8 +73,8 @@ mod tests {
         let idx = box_index(document, id, resources);
         let boxes = document.render_view(resources).boxes();
         (
-            box_queries::render_box_view_point(boxes, idx).expect("box index in range"),
-            box_queries::render_box_view_size(boxes, idx).expect("box index in range"),
+            boxes.point(idx).expect("box index in range"),
+            boxes.size(idx).expect("box index in range"),
         )
     }
 
@@ -536,8 +546,9 @@ mod tests {
             .shape(&mut shaper, &mut document_resources)
             .expect("test shaper registers every glyph")
             .layout(
-                LayoutConstraints::new(800.0, 16.0).unwrap(),
-                &document_resources,
+                LayoutRequest::new(LayoutConstraints::new(800.0, 16.0).unwrap()),
+                &mut shaper,
+                &mut document_resources,
             )
             .expect("layout requires the shaper-aware API for first-line styles");
 
@@ -805,12 +816,12 @@ mod tests {
         let line_node = prepared
             .document()
             .node_ids()
-            .find(|&node| prepared.document().get_dom_id(node) == Some("line"))
+            .find(|&node| prepared.document().try_element_ref(node).and_then(|element| element.id()) == Some("line"))
             .expect("line element");
         let letter_node = prepared
             .document()
             .node_ids()
-            .find(|&node| prepared.document().get_dom_id(node) == Some("letter"))
+            .find(|&node| prepared.document().try_element_ref(node).and_then(|element| element.id()) == Some("letter"))
             .expect("letter element");
         let line_style = prepared
             .test_styles()
@@ -840,8 +851,8 @@ mod tests {
         let document = prepared
             .shape(&mut shaper, &mut document_resources)
             .expect("test shaper registers every glyph")
-            .layout_with_shaper(
-                LayoutConstraints::new(300.0, 16.0).unwrap(),
+            .layout(
+                LayoutRequest::new(LayoutConstraints::new(300.0, 16.0).unwrap()),
                 &mut shaper,
                 &mut document_resources,
             )
@@ -883,8 +894,9 @@ mod tests {
             .shape(&mut shaper, &mut document_resources)
             .expect("test shaper registers every glyph")
             .layout(
-                LayoutConstraints::new(300.0, 16.0).unwrap(),
-                &document_resources,
+                LayoutRequest::new(LayoutConstraints::new(300.0, 16.0).unwrap()),
+                &mut shaper,
+                &mut document_resources,
             )
             .expect("layout requires the shaper-aware API for first-line styles");
 
@@ -926,20 +938,18 @@ mod tests {
                     document
                         .render_view(&document_resources)
                         .text()
-                        .glyph_slice(text_paint::render_line_glyphs(&line))
+                        .glyph_slice(line.glyphs())
                         .expect("line glyph range")
                         .iter()
                         .any(|&glyph| {
-                            text_paint::glyph_metric(
-                                document.render_view(&document_resources).text(),
-                                glyph,
-                            )
-                            .expect("registered glyph")
-                            .ch()
+                            (document.render_view(&document_resources).text())
+                                .glyph_metric(glyph)
+                                .expect("registered glyph")
+                                .ch()
                                 == wanted
                         })
                 })
-                .map(|line| line.point().y + text_paint::line_baseline(&line))
+                .map(|line| line.point().y + line.line_baseline())
                 .unwrap_or_else(|| panic!("missing line for {wanted}"))
         };
         close(baseline_for('A'), baseline_for('B'));
@@ -977,20 +987,18 @@ mod tests {
                     document
                         .render_view(&document_resources)
                         .text()
-                        .glyph_slice(text_paint::render_line_glyphs(&line))
+                        .glyph_slice(line.glyphs())
                         .expect("line glyph range")
                         .iter()
                         .any(|&glyph| {
-                            text_paint::glyph_metric(
-                                document.render_view(&document_resources).text(),
-                                glyph,
-                            )
-                            .expect("registered glyph")
-                            .ch()
+                            (document.render_view(&document_resources).text())
+                                .glyph_metric(glyph)
+                                .expect("registered glyph")
+                                .ch()
                                 == wanted
                         })
                 })
-                .map(|line| line.point().y + text_paint::line_baseline(&line))
+                .map(|line| line.point().y + line.line_baseline())
                 .unwrap_or_else(|| panic!("missing line for {wanted}"))
         };
 
@@ -1020,20 +1028,18 @@ mod tests {
                     document
                         .render_view(&document_resources)
                         .text()
-                        .glyph_slice(text_paint::render_line_glyphs(&line))
+                        .glyph_slice(line.glyphs())
                         .expect("line glyph range")
                         .iter()
                         .any(|&glyph| {
-                            text_paint::glyph_metric(
-                                document.render_view(&document_resources).text(),
-                                glyph,
-                            )
-                            .expect("registered glyph")
-                            .ch()
+                            (document.render_view(&document_resources).text())
+                                .glyph_metric(glyph)
+                                .expect("registered glyph")
+                                .ch()
                                 == wanted
                         })
                 })
-                .map(|line| line.point().y + text_paint::line_baseline(&line))
+                .map(|line| line.point().y + line.line_baseline())
                 .unwrap_or_else(|| panic!("missing line for {wanted}"))
         };
 
@@ -2079,8 +2085,9 @@ mod tests {
             .shape(&mut shaper, &mut document_resources)
             .expect("test shaper registers every glyph")
             .layout(
-                LayoutConstraints::new(800.0, 16.0).unwrap(),
-                &document_resources,
+                LayoutRequest::new(LayoutConstraints::new(800.0, 16.0).unwrap()),
+                &mut shaper,
+                &mut document_resources,
             )
             .expect("layout requires the shaper-aware API for first-line styles");
 
@@ -2203,16 +2210,19 @@ mod tests {
     #[test]
     fn viewport_relayout_recomputes_flexible_item_allocations() {
         let mut document_resources = GlyphResourceStore::default();
-        let mut document = layout_html(
-            "<html><body style='margin:0'><div id='c' style='display:flex'><div id='a' style='flex:1;height:10px'></div><div id='b' style='flex:1;height:10px'></div></div></body></html>",
-            300.0,
-            &mut document_resources,
-        );
+        let mut shaper = TestGlyphShaper::new();
+        let mut document = DocumentFactory::new()
+            .parse_with_new_pipeline("<html><body style='margin:0'><div id='c' style='display:flex'><div id='a' style='flex:1;height:10px'></div><div id='b' style='flex:1;height:10px'></div></div></body></html>", None)
+            .shape(&mut shaper, &mut document_resources)
+            .unwrap()
+            .layout(LayoutRequest::new(LayoutConstraints::new(300.0, 16.0).unwrap()), &mut shaper, &mut document_resources)
+            .unwrap();
         let (_, wide_a) = geometry(&document, "a", &document_resources);
         document
             .relayout(
-                LayoutConstraints::new(200.0, 16.0).unwrap(),
-                &document_resources,
+                LayoutRequest::new(LayoutConstraints::new(200.0, 16.0).unwrap()),
+                &mut shaper,
+                &mut document_resources,
             )
             .expect("layout requires the shaper-aware API for first-line styles");
         let (_, narrow_a) = geometry(&document, "a", &document_resources);
@@ -2220,22 +2230,4 @@ mod tests {
         close(narrow_a.width, 100.0);
     }
 
-    #[test]
-    fn normal_flow_does_not_enter_taffy_or_its_measurement_path() {
-        let mut document_resources = GlyphResourceStore::default();
-        let mut document = layout_html(
-            "<html><body><p>ordinary document text</p></body></html>",
-            300.0,
-            &mut document_resources,
-        );
-        let timings = document
-            .relayout_with_timings(
-                LayoutConstraints::new(240.0, 16.0).unwrap(),
-                &document_resources,
-            )
-            .expect("layout requires the shaper-aware API for first-line styles");
-
-        assert!(timings.layout_flex_grid.is_zero());
-        assert!(timings.measure_flex_grid_item.is_zero());
-    }
 }

@@ -1,6 +1,5 @@
 //! Stress benchmark for a variable font shorthand spanning both cascade phases.
 //! Pass `retry` to also reject a later width declaration and retry the cascade.
-use html_style::style_document_with_timings;
 use std::{hint::black_box, time::Duration};
 fn main() {
     let retry = std::env::args().nth(1).as_deref() == Some("retry");
@@ -13,7 +12,7 @@ fn main() {
     let mut samples = Vec::<Duration>::new();
     for i in 0..24 {
         let doc = html_parse::parse_dom_document(&html).unwrap();
-        let (styled, timings) = style_document_with_timings(doc, &[]);
+        let (styled, timings) = { let (styled, timings, _) = html_style::StyleRequest::from_css(doc, &[]).compile(); (styled, timings) };
         black_box(styled);
         if i >= 3 {
             samples.push(timings.cascade);

@@ -5864,7 +5864,6 @@ version = "0.1.0"
 dependencies = [
  "hypher",
  "kurbo 0.11.3",
- "rayon",
  "rustc_data_structures",
  "skrift-dom",
  "skrift-engine-model",

@@ -7,7 +7,7 @@ use taffy::geometry::Size as TaffySize;
 use taffy::prelude::AvailableSpace;
 
 pub(super) fn solve(
-    session: &mut LayoutEngine<'_, '_>,
+    engine: &mut LayoutEngine<'_, '_>,
     input: &FlexGridInput<'_>,
     prepared: PreparedFlexGrid,
 ) -> SolvedFlexGrid {
@@ -18,7 +18,7 @@ pub(super) fn solve(
         rerun_indefinite_percentage_rows,
     } = prepared;
     let mut taffy = TaffyLayoutTree::new(
-        MeasurementMode::Full(session),
+        MeasurementMode::Full(engine),
         input.kind,
         root_style,
         child_styles,

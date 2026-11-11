@@ -1,5 +1,5 @@
 use super::columns::{TableCellPlacement, TableColumnLayout, span_extent};
-use super::grid::PreparedTableGrid;
+use super::s01_grid::PreparedTableGrid;
 use crate::layout::LayoutEngine;
 use crate::layout::decorations::record_bound_background;
 use crate::layout::paint_program::PaintStyleSource;
@@ -7,21 +7,21 @@ use html_style_model::{StyleIndices, Visibility};
 use kurbo::{Point, Rect};
 
 pub(super) fn emit_collapsed_table_background(
-    session: &mut LayoutEngine<'_, '_>,
+    engine: &mut LayoutEngine<'_, '_>,
     table_box_idx: usize,
     rect: Rect,
 ) {
     if rect.width() <= 0.0
         || rect.height() <= 0.0
         || !matches!(
-            session.reader.style(table_box_idx).border_collapse(),
+            engine.reader.style(table_box_idx).border_collapse(),
             html_style_model::BorderCollapseMode::Collapse
         )
     {
         return;
     }
     record_bound_background(
-        session,
+        engine,
         table_box_idx,
         rect,
         PaintStyleSource::Box(table_box_idx as u32),
@@ -29,7 +29,7 @@ pub(super) fn emit_collapsed_table_background(
 }
 
 pub(super) fn emit_table_layers(
-    session: &mut LayoutEngine<'_, '_>,
+    engine: &mut LayoutEngine<'_, '_>,
     table_box_idx: usize,
     table_content_pos: Point,
     table_height: f64,
@@ -52,13 +52,13 @@ pub(super) fn emit_table_layers(
     // Emit it here, before column, row, cell, and border layers. Separate
     // tables retain their ordinary full border-box background path because
     // their padding and border-spacing also belong to the background area.
-    emit_collapsed_table_background(session, table_box_idx, table_grid);
+    emit_collapsed_table_background(engine, table_box_idx, table_grid);
 
     // Column layers cover their originating cells, including spans, while
     // border-spacing remains part of the table's own background. Look up the
     // source per cell instead of scanning the grid separately for each column.
     emit_table_column_background(
-        session,
+        engine,
         table_box_idx,
         prepared,
         table_content_pos,
@@ -75,7 +75,7 @@ pub(super) fn emit_table_layers(
         },
     );
     emit_table_column_background(
-        session,
+        engine,
         table_box_idx,
         prepared,
         table_content_pos,
@@ -87,7 +87,7 @@ pub(super) fn emit_table_layers(
 }
 
 fn emit_table_column_background(
-    session: &mut LayoutEngine<'_, '_>,
+    engine: &mut LayoutEngine<'_, '_>,
     table_box_idx: usize,
     prepared: &PreparedTableGrid,
     table_content_pos: Point,
@@ -101,7 +101,7 @@ fn emit_table_column_background(
         let Some((part, style)) = style_for_cell(cell) else {
             continue;
         };
-        if session.reader.used_style(style).visibility() == Visibility::Hidden {
+        if engine.reader.used_style(style).visibility() == Visibility::Hidden {
             continue;
         }
         let Some(rect) =
@@ -121,7 +121,7 @@ fn emit_table_column_background(
                 continue;
             }
             record_bound_background(
-                session,
+                engine,
                 table_box_idx,
                 *previous,
                 PaintStyleSource::Style {
@@ -134,7 +134,7 @@ fn emit_table_column_background(
     }
     if let Some((_, style, rect)) = pending {
         record_bound_background(
-            session,
+            engine,
             table_box_idx,
             rect,
             PaintStyleSource::Style {
@@ -146,7 +146,7 @@ fn emit_table_column_background(
 }
 
 pub(super) fn emit_table_row_layer_background<'a>(
-    session: &mut LayoutEngine<'_, '_>,
+    engine: &mut LayoutEngine<'_, '_>,
     owner_box_idx: usize,
     placements: impl Iterator<Item = &'a TableCellPlacement>,
     table_content_pos: Point,
@@ -165,7 +165,7 @@ pub(super) fn emit_table_row_layer_background<'a>(
             continue;
         };
         record_bound_background(
-            session,
+            engine,
             owner_box_idx,
             rect,
             PaintStyleSource::Box(owner_box_idx as u32),

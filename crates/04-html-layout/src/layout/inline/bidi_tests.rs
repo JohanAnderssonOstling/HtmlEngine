@@ -1,41 +1,39 @@
-use html_pipeline::engine::box_queries;
+use html_engine_model::{
+    BoxId, GlyphResourceGeneration, GlyphResourceStore, GlyphShaper, ImageMetrics,
+    LayoutConstraints, LineId, ShapedRun, ShapedTextRun, TextDirection, TextRunId,
+    TextRunShapeRequest};
+use html_pipeline::engine::LayoutRequest;
 use html_engine_model::layout_state;
-use html_engine_model::shaping_contracts;
-use html_pipeline::engine::text_paint;
-use crate::layout_model::BoxId;
-use crate::layout_model::LineId;
 use crate::parser::DocumentFactory;
 use crate::test_support::TestGlyphShaper;
-use crate::{GlyphRequest, ShapedGlyph, ShapedRun};
-use crate::{
-    GlyphResourceGeneration, GlyphResourceStore, GlyphShaper, LaidOutDocument, LayoutConstraints,
-    ShapeError, ShapedTextRun, TextDirection, TextRunId, TextRunShapeRequest,
-};
+use crate::{LaidOutDocument};
 use std::sync::Arc;
 
 fn layout(html: &str, width: f64, resources: &mut GlyphResourceStore) -> LaidOutDocument<'static> {
+    let mut resources_shaper = TestGlyphShaper::new();
+
     DocumentFactory::new()
         .parse_with_new_pipeline(html, None)
-        .shape(&mut TestGlyphShaper::new(), resources)
+        .shape(&mut resources_shaper, resources)
         .unwrap()
-        .layout(LayoutConstraints::new(width, 16.0).unwrap(), resources)
+        .layout(
+            LayoutRequest::new(LayoutConstraints::new(width, 16.0).unwrap()),
+            &mut resources_shaper,
+            resources,
+        )
         .expect("layout requires the shaper-aware API for first-line styles")
 }
 
 fn visual_text(document: &LaidOutDocument, line: LineId, resources: &GlyphResourceStore) -> String {
     let text = document.render_view(resources).text();
-    let mut fragments: Vec<_> = text_paint::render_text_view_line_text_fragments(text, line)
-        .unwrap()
-        .collect();
-    fragments.sort_by(|a, b| {
-        text_paint::fragment_offset_x(&a).total_cmp(&text_paint::fragment_offset_x(&b))
-    });
+    let mut fragments: Vec<_> = text.line_text_fragments(line).unwrap().collect();
+    fragments.sort_by(|a, b| a.fragment_offset_x().total_cmp(&b.fragment_offset_x()));
     fragments
         .into_iter()
         .flat_map(|fragment| fragment.glyphs())
         .filter_map(|index| {
-            let glyph = text_paint::paint_glyph_at(text, index)?;
-            Some(text_paint::glyph_metric(text, glyph)?.ch())
+            let glyph = text.paint_glyph_at(index)?;
+            Some(text.glyph_metric(glyph)?.ch())
         })
         .collect()
 }
@@ -49,11 +47,11 @@ fn rtl_paragraph_reorders_text_without_changing_source_order() {
         &mut document_resources,
     );
     let text = document.render_view(&document_resources).text();
-    let logical: String = text_paint::render_line_glyphs(&text
-        .line(LineId::new(0))
-        .unwrap())
+    let logical: String = (text.line(LineId::new(0)).unwrap())
+        .glyphs()
         .map(|index| {
-            text_paint::glyph_metric(text, text_paint::glyph_at(text, index as usize).unwrap())
+            (text)
+                .glyph_metric(text.glyph_at(index as usize).unwrap())
                 .unwrap()
                 .ch()
         })
@@ -222,12 +220,14 @@ fn rtl_out_of_flow_anchors_do_not_split_visual_runs() {
         &mut document_resources,
     );
     let text = document.render_view(&document_resources).text();
-    let line = text_paint::render_text_view_spatial_order(text)
+    let line = (text)
+        .spatial_order()
         .iter()
         .copied()
         .find(|&line| {
-            text_paint::render_line_glyphs(&text.line(line).unwrap()).any(|index| {
-                text_paint::glyph_metric(text, text_paint::glyph_at(text, index as usize).unwrap())
+            (text.line(line).unwrap()).glyphs().any(|index| {
+                (text)
+                    .glyph_metric(text.glyph_at(index as usize).unwrap())
                     .unwrap()
                     .ch()
                     == 'א'
@@ -323,10 +323,11 @@ fn rtl_overflow_ellipsis_is_placed_at_the_left_end() {
             &mut document_resources,
         );
         let text = document.render_view(&document_resources).text();
-        let marker = text_paint::ellipsis_for_line(text, LineId::new(0)).unwrap();
-        let leftmost = text_paint::render_text_view_line_text_fragments(text, LineId::new(0))
+        let marker = text.ellipsis_for_line(LineId::new(0)).unwrap();
+        let leftmost = (text)
+            .line_text_fragments(LineId::new(0))
             .unwrap()
-            .map(|fragment| text_paint::fragment_offset_x(&fragment))
+            .map(|fragment| fragment.fragment_offset_x())
             .fold(f64::INFINITY, f64::min);
         assert!(marker.offset().x < leftmost, "{direction}");
     }
@@ -339,14 +340,11 @@ fn geometry(
 ) -> (kurbo::Point, kurbo::Size) {
     let view = document.render_view(resources);
     let boxes = view.boxes();
-    let index = (0..box_queries::len(boxes))
+    let index = (0..boxes.len())
         .map(layout_state::box_id_new)
-        .find(|&index| box_queries::attribute(boxes, index, "id") == Some(id))
+        .find(|&index| boxes.attribute(index, "id") == Some(id))
         .unwrap();
-    (
-        box_queries::render_box_view_point(boxes, index).unwrap(),
-        box_queries::render_box_view_size(boxes, index).unwrap(),
-    )
+    (boxes.point(index).unwrap(), boxes.size(index).unwrap())
 }
 
 #[test]
@@ -399,14 +397,16 @@ fn rtl_inline_padding_consumes_the_corresponding_physical_edges() {
         &mut document_resources,
     );
     let text = document.render_view(&document_resources).text();
-    let left = text_paint::render_text_view_line_text_fragments(text, LineId::new(0))
+    let left = (text)
+        .line_text_fragments(LineId::new(0))
         .unwrap()
-        .map(|fragment| text_paint::fragment_offset_x(&fragment))
+        .map(|fragment| fragment.fragment_offset_x())
         .fold(f64::INFINITY, f64::min);
     assert!((left - 5.0).abs() < 0.001, "physical left padding: {left}");
-    let right = text_paint::render_text_view_line_text_fragments(text, LineId::new(0))
+    let right = (text)
+        .line_text_fragments(LineId::new(0))
         .unwrap()
-        .map(|fragment| text_paint::fragment_offset_x(&fragment) + 8.0)
+        .map(|fragment| fragment.fragment_offset_x() + 8.0)
         .fold(0.0, f64::max);
     assert!((100.0 - (text.line(LineId::new(0)).unwrap().point().x + right) - 15.0).abs() < 0.001);
 }
@@ -442,13 +442,13 @@ fn rtl_outside_list_marker_hangs_to_the_right() {
     );
     let view = document.render_view(&document_resources);
     let boxes = view.boxes();
-    let item = (0..box_queries::len(boxes))
+    let item = (0..boxes.len())
         .map(layout_state::box_id_new)
-        .find(|&index| box_queries::attribute(boxes, index, "id") == Some("item"))
+        .find(|&index| boxes.attribute(index, "id") == Some("item"))
         .unwrap();
-    let marker = box_queries::list_marker(boxes, item).unwrap().marker_box();
+    let marker = boxes.list_marker(item).unwrap().marker_box();
     let (point, size) = geometry(&document, "item", &document_resources);
-    assert!(box_queries::render_box_view_point(boxes, marker).unwrap().x > point.x + size.width);
+    assert!(boxes.point(marker).unwrap().x > point.x + size.width);
 }
 
 #[derive(Default)]
@@ -459,41 +459,16 @@ struct DirectionalShaper {
 }
 
 impl GlyphShaper for DirectionalShaper {
-    fn reset(&mut self) {
-        self.fallback.reset();
-        self.requests.clear();
-        self.checkpoint = None;
-    }
-    fn begin_append_shaping(&mut self) -> Result<(), ShapeError> {
-        self.fallback.begin_append_shaping()?;
-        self.checkpoint = Some(self.requests.len());
-        Ok(())
-    }
-    fn commit_append_shaping(&mut self) {
-        self.fallback.commit_append_shaping();
-        self.checkpoint = None;
-    }
-    fn rollback_append_shaping(&mut self) {
-        self.fallback.rollback_append_shaping();
-        if let Some(checkpoint) = self.checkpoint.take() {
-            self.requests.truncate(checkpoint);
-        }
-    }
     fn resource_generation(&self) -> GlyphResourceGeneration {
         self.fallback.resource_generation()
     }
-    fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
-        self.fallback.shape_glyph(request)
-    }
-    fn shape_run(
-        &mut self,
-        request: TextRunShapeRequest<'_>,
-    ) -> Result<Option<ShapedRun>, ShapeError> {
-        let direction = shaping_contracts::text_run_shape_request_style(&request).direction;
-        let advance = shaping_contracts::text_run_shape_request_style(&request).font_size * 0.25;
+
+    fn shape_run(&mut self, request: TextRunShapeRequest<'_>) -> ShapedRun {
+        let direction = request.style().direction;
+        let advance = request.style().font_size * 0.25;
         let run = TextRunId(self.requests.len() as u32);
-        self.requests.push((shaping_contracts::text_run_shape_request_text(&request).to_owned(), direction));
-        let count = shaping_contracts::text_run_shape_request_text(&request).chars().count();
+        self.requests.push((request.text().to_owned(), direction));
+        let count = request.text().chars().count();
         let stops: Vec<_> = (0..=count)
             .map(|index| {
                 (if direction == TextDirection::Rtl {
@@ -504,11 +479,13 @@ impl GlyphShaper for DirectionalShaper {
                     * advance
             })
             .collect();
-        Ok(Some(shaping_contracts::shaped_run_geometry(shaping_contracts::shaped_text_run_with_backend_run(Arc::from(vec![advance; count]),
+        (self.fallback.shape_run(request)).with_geometry(ShapedTextRun::with_backend_run(
+            Arc::from(vec![advance; count]),
             Arc::from(vec![true; count + 1]),
             run,
             stops.into(),
-            12.0,))))
+            12.0,
+        ))
     }
 }
 
@@ -521,8 +498,9 @@ fn rtl_native_runs_receive_resolved_direction_and_share_the_correct_origin() {
         .shape(&mut shaper, &mut document_resources)
         .unwrap()
         .layout(
-            LayoutConstraints::new(300.0, 16.0).unwrap(),
-            &document_resources,
+            LayoutRequest::new(LayoutConstraints::new(300.0, 16.0).unwrap()),
+            &mut shaper,
+            &mut document_resources,
         )
         .expect("layout requires the shaper-aware API for first-line styles");
     assert!(
@@ -538,8 +516,9 @@ fn rtl_native_runs_receive_resolved_direction_and_share_the_correct_origin() {
             .any(|(text, direction)| text.contains("abc") && *direction == TextDirection::Ltr)
     );
     let text = document.render_view(&document_resources).text();
-    let fragments =
-        text_paint::prepared_text_runs(text, LineId::new(0)).expect("complete native coverage");
+    let fragments = (text)
+        .prepared_text_runs(LineId::new(0))
+        .expect("complete native coverage");
     let rtl_run = shaper
         .requests
         .iter()
@@ -574,24 +553,24 @@ fn rtl_first_line_refinement_preserves_native_coverage_of_later_lines() {
         .shape(&mut shaper, &mut shaped_resources)
         .unwrap();
     let document = shaped
-        .layout_with_metrics_and_shaper(
-            LayoutConstraints::new(35.0, 16.0).unwrap(),
-            &crate::ImageMetrics::default(),
+        .layout(
+            LayoutRequest::new(LayoutConstraints::new(35.0, 16.0).unwrap())
+                .with_image_metrics(&ImageMetrics::default()),
             &mut shaper,
             &mut shaped_resources,
         )
         .unwrap();
     let text = document.render_view(&shaped_resources).text();
     assert!(document.line_count() > 1);
-    for line in text_paint::render_text_view_spatial_order(text).iter().copied() {
+    for line in text.spatial_order().iter().copied() {
         assert!(
-            text_paint::prepared_text_runs(text, line).is_some(),
+            text.prepared_text_runs(line).is_some(),
             "native coverage for line {line:?}"
         );
     }
-    let last =
-        text_paint::prepared_text_runs(text, text_paint::render_text_view_spatial_order(text).iter().copied().last().unwrap())
-            .unwrap();
+    let last = (text)
+        .prepared_text_runs(text.spatial_order().iter().copied().last().unwrap())
+        .unwrap();
     assert!(
         last.iter()
             .any(|fragment| fragment.run == TextRunId(0) && fragment.range.start > 0)
@@ -610,25 +589,29 @@ fn rtl_native_runs_keep_offsets_across_out_of_flow_source_gaps() {
         .shape(&mut shaper, &mut document_resources)
         .unwrap()
         .layout(
-            LayoutConstraints::new(300.0, 16.0).unwrap(),
-            &document_resources,
+            LayoutRequest::new(LayoutConstraints::new(300.0, 16.0).unwrap()),
+            &mut shaper,
+            &mut document_resources,
         )
         .expect("layout requires the shaper-aware API for first-line styles");
     let text = document.render_view(&document_resources).text();
-    let line = text_paint::render_text_view_spatial_order(text)
+    let line = (text)
+        .spatial_order()
         .iter()
         .copied()
         .find(|&line| {
-            text_paint::render_line_glyphs(&text.line(line).unwrap()).any(|index| {
-                text_paint::glyph_metric(text, text_paint::glyph_at(text, index as usize).unwrap())
+            (text.line(line).unwrap()).glyphs().any(|index| {
+                (text)
+                    .glyph_metric(text.glyph_at(index as usize).unwrap())
                     .unwrap()
                     .ch()
                     == 'א'
             })
         })
         .unwrap();
-    let native =
-        text_paint::prepared_text_runs(text, line).expect("native coverage across a source gap");
+    let native = (text)
+        .prepared_text_runs(line)
+        .expect("native coverage across a source gap");
     let run = shaper
         .requests
         .iter()
@@ -653,8 +636,9 @@ fn rtl_arabic_shaping_keeps_joining_context_across_paint_styles() {
         .shape(&mut shaper, &mut document_resources)
         .unwrap()
         .layout(
-            LayoutConstraints::new(300.0, 16.0).unwrap(),
-            &document_resources,
+            LayoutRequest::new(LayoutConstraints::new(300.0, 16.0).unwrap()),
+            &mut shaper,
+            &mut document_resources,
         )
         .expect("layout requires the shaper-aware API for first-line styles");
     assert!(shaper.requests.iter().any(

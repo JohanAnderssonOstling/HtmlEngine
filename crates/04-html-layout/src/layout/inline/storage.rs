@@ -123,9 +123,6 @@ impl<T: Clone> TokenArena<T> {
         assert!(self.data.is_empty());
         self.data.reserve_exact(capacity);
     }
-    pub(super) fn shrink_to_fit(&mut self) {
-        self.data.shrink_to_fit();
-    }
     #[cfg(any(test, feature = "testing"))]
     pub(super) fn is_empty(&self) -> bool {
         self.data.is_empty()
@@ -285,17 +282,6 @@ impl WidthArena {
                 assert!(values.is_empty());
                 values.reserve_exact(capacity);
             }
-        }
-    }
-    pub(super) fn shrink_to_fit(&mut self) {
-        match &mut self.storage {
-            WidthStorage::Indexed {
-                indexes, lookup, ..
-            } => {
-                indexes.shrink_to_fit();
-                lookup.shrink_to_fit();
-            }
-            WidthStorage::Direct(values) => values.shrink_to_fit(),
         }
     }
     pub(super) fn storage_bytes(&self) -> usize {

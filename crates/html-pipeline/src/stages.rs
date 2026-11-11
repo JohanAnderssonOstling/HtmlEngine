@@ -4,7 +4,7 @@ use crate::layout_model::{
     LayoutMode, LayoutState, LayoutTree,
 };
 use crate::shaping::{GlyphPatch, GlyphSlice, ShapedTextGeometry, TextGeometryView};
-use crate::{GlyphResourceStore, GlyphShaper, LayoutTimings, ShapeError};
+use crate::{GlyphResourceStore, GlyphShaper, ShapeError};
 use html_dom::{Document, MemoryUsageReport};
 use html_engine_model::shaping::first_line_refinement_did_not_converge;
 use html_style_model::{ComputedStyles, StyleIndices};
@@ -16,11 +16,6 @@ use web_time::Instant;
 #[path = "stages_output/mod.rs"]
 mod output;
 use html_format::mathml;
-pub use output::{
-    DocumentTarget, ResolvedDestination, address_queries, box_queries, export_queries,
-    fragment_paint, geometry_queries, pagination_queries, reading_queries, search_queries,
-    semantic_queries, text_paint,
-};
 pub use output::{
     BoxTextFormat, CaretAffinity, ContentRole, ContentSemantics, ElementTarget, ImageMetrics,
     LinkTarget, Pagination, PaginationGroup, PaginationLine, PaginationPosition, PaginationTarget,
@@ -37,6 +32,7 @@ pub use output::{
     TextExportFormat, TextPatternError, TextPatternMatch, TextPatternMatcher, TextQuote,
     TextSearchOptions, find_text_matches, merge_text_ranges, text_matches,
 };
+pub use output::{DocumentTarget, ResolvedDestination};
 #[path = "stages/lifecycle.rs"]
 mod lifecycle;
 pub use html_engine_model::{
@@ -51,11 +47,11 @@ mod semantics;
 pub(crate) use html_dom::element_is_note_target;
 pub(crate) use html_engine_model::TextPaintRange;
 pub use lifecycle::{
-    DetachedLayout, FormattingDocument, LaidOutDocument, LayoutRequest, NoteLayout, PreparedDocument,
-    ShapeLayoutTimings, ShapedDocument,
+    DetachedLayout, FormattingDocument, LaidOutDocument, LayoutRequest, NoteLayout,
+    PreparedDocument, ShapeLayoutTimings, ShapedDocument,
 };
-pub(crate) use lifecycle::{FirstLineRefinement, PreparedInputs, ShapedText};
-use semantics::{LinkGlyphTarget, box_id, collect_glyph_targets};
+pub(crate) use lifecycle::{FirstLineRefinement, PreparedInputs, ResponsivePreparation, ShapedText};
+use semantics::{LinkGlyphTargets, box_id, collect_glyph_targets};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct FirstLineStyleRange {
@@ -138,7 +134,8 @@ fn first_line_style_ranges<'a>(
                 inputs.layout_tree.as_ref(),
                 run.box_idx as usize,
             );
-            let Some(first_line_style) = inputs.text.content().pseudo_styles().first_line(root) else {
+            let Some(first_line_style) = inputs.text.content().pseudo_styles().first_line(root)
+            else {
                 continue;
             };
             let base_style = inputs
@@ -280,7 +277,6 @@ fn layout_with_first_lines(
     constraints: LayoutConstraints,
     image_metrics: &ImageMetrics,
     glyph_shaper: &mut impl GlyphShaper,
-    mut timings: Option<&mut LayoutTimings>,
     layout_scratch: LayoutScratch,
     resources: &mut GlyphResourceStore,
     transaction: RefinementTransaction,
@@ -290,7 +286,6 @@ fn layout_with_first_lines(
         base_shaped,
         constraints,
         image_metrics,
-        timings.as_deref_mut(),
         layout_scratch,
         resources,
     );
@@ -312,14 +307,7 @@ fn layout_with_first_lines(
             // This document is still a private candidate. Reuse its layout
             // buffers while the first-line boundary converges, then publish it.
             laid_out.refinement = Some(shaped);
-            laid_out.relayout(
-                inputs,
-                base_shaped,
-                constraints,
-                image_metrics,
-                timings.as_deref_mut(),
-                resources,
-            );
+            laid_out.relayout(inputs, base_shaped, constraints, image_metrics, resources);
             let next_ranges = first_line_style_ranges(inputs, &laid_out.state, &mut text_runs);
             if next_ranges == ranges {
                 return Ok(laid_out);
@@ -340,5 +328,3 @@ fn layout_with_first_lines(
 }
 
 include!("stages_tests.rs");
-
-pub use output::source_queries;

@@ -1,6 +1,4 @@
-use crate::{
-    HtmlFragmentContext, HtmlParserOptions, HtmlSyntaxNode, ParsedHtml, parse_html_fragment,
-};
+use crate::ParsedHtml;
 use html_dom::{
     Document, DocumentBuildError, DomNodeId, NodeRef, TextChildPosition, collapse_whitespace,
 };
@@ -48,9 +46,9 @@ struct SourceTextRun {
 
 impl DocumentTextIndex {
     pub fn from_parsed(parsed: &ParsedHtml) -> Result<Self, DocumentBuildError> {
-        let document = parsed.build_dom_checked()?;
+        let document = parsed.document.as_ref().map_err(|error| *error)?;
         let mut builder = TextIndexBuilder {
-            document: &document,
+            document,
             text: String::new(),
             text_chars: 0,
             runs: Vec::new(),
@@ -149,8 +147,8 @@ struct TextIndexBuilder<'a> {
 impl TextIndexBuilder<'_> {
     fn visit(&mut self, node: DomNodeId) {
         match self.document.node_ref(node) {
-            Some(NodeRef::Text(text)) => self.push_text(node, text.text()),
-            Some(NodeRef::Element(element)) => {
+            NodeRef::Text(text) => self.push_text(node, text.text()),
+            NodeRef::Element(element) => {
                 let tag = element.tag();
                 if matches!(tag, "script" | "style" | "template" | "noscript" | "head")
                     || html_dom::element_is_note_target(element)
@@ -168,12 +166,11 @@ impl TextIndexBuilder<'_> {
                     self.pending_space = true;
                 }
             }
-            None => {}
         }
     }
 
     fn push_text(&mut self, node: DomNodeId, value: &str) {
-        let Some(parent) = self.document.get_dom_parent(node) else {
+        let Some(parent) = self.document.node_ref(node).parent() else {
             return;
         };
         if !self.text_offsets.contains_key(&node) {
@@ -245,44 +242,10 @@ impl TextIndexBuilder<'_> {
 }
 
 pub fn plain_text_from_fragment(html: &str) -> String {
-    let parsed = parse_html_fragment(
-        html,
-        &HtmlFragmentContext::html("div"),
-        HtmlParserOptions::default(),
-    );
-    let mut text = String::new();
-    append_plain_text(&parsed.document.nodes, &mut text);
-    collapse_whitespace(&text)
+    collapse_whitespace(&crate::html::fragment_text(html))
 }
 
-fn append_plain_text(nodes: &[HtmlSyntaxNode], output: &mut String) {
-    for node in nodes {
-        match node {
-            HtmlSyntaxNode::Text(text) => output.push_str(text),
-            HtmlSyntaxNode::Element(element)
-                if matches!(
-                    element.local_name.as_str(),
-                    "script" | "style" | "template" | "noscript" | "head"
-                ) => {}
-            HtmlSyntaxNode::Element(element) => {
-                let block = is_text_boundary_element(&element.local_name);
-                if block && !output.ends_with(char::is_whitespace) {
-                    output.push(' ');
-                }
-                append_plain_text(&element.children, output);
-                if block && !output.ends_with(char::is_whitespace) {
-                    output.push(' ');
-                }
-            }
-            HtmlSyntaxNode::TemplateContents(_)
-            | HtmlSyntaxNode::Doctype { .. }
-            | HtmlSyntaxNode::Comment(_)
-            | HtmlSyntaxNode::ProcessingInstruction { .. } => {}
-        }
-    }
-}
-
-fn is_text_boundary_element(name: &str) -> bool {
+pub(crate) fn is_text_boundary_element(name: &str) -> bool {
     matches!(
         name,
         "address"

@@ -1,11 +1,10 @@
-use html_dom::storage;
 use html_dom::{Document, DomNodeId, ElementRef};
 use html_style_model::{ComputedStyles, Display};
 use rustc_data_structures::fx::FxHashMap;
 
 use super::classification::display_for_element;
 
-/// Ordinals for rendered list-item boxes, indexed by DOM node.
+/// Ordinals for rendered list-item boxes, indexed by DOM element.
 ///
 /// This table is deliberately temporary: it removes the previous repeated
 /// sibling scans without adding retained data to `PreparedDocument`.
@@ -17,28 +16,28 @@ impl ListItemOrdinals {
     pub(super) fn new(document: &Document, styles: &ComputedStyles) -> Self {
         let mut groups = FxHashMap::<DomNodeId, Vec<DomNodeId>>::default();
         if let Some(root) = document.dom_root()
-            && let Some(root) = document.element_ref(root)
+            && let Some(root) = document.try_element_ref(root)
         {
             collect_rendered_list_items(styles, root, None, &mut groups);
         }
 
-        let mut values = vec![1; document.node_count()];
+        let mut values = vec![1; document.element_count()];
         for (owner, items) in groups {
             let owner = document
-                .element_ref(owner)
+                .try_element_ref(owner)
                 .expect("list ordinal owner must be an element");
             let ordered = owner.namespace() == Some("http://www.w3.org/1999/xhtml")
                 && owner.tag().eq_ignore_ascii_case("ol");
-            let reversed = ordered && storage::html_list_reversed(owner);
-            let start = ordered.then(|| storage::html_list_start(owner)).flatten();
+            let reversed = ordered && owner.html_list_reversed();
+            let start = ordered.then(|| owner.html_list_start()).flatten();
             let mut current = start.unwrap_or(if reversed { items.len() as i64 } else { 1 });
             let step = if reversed { -1 } else { 1 };
 
             for &item in &items {
                 if ordered
                     && let Some(value) = document
-                        .element_ref(item)
-                        .and_then(|element| storage::html_list_item_value(element))
+                        .try_element_ref(item)
+                        .and_then(|element| element.html_list_item_value())
                 {
                     current = value;
                 }
@@ -52,6 +51,9 @@ impl ListItemOrdinals {
     }
 
     pub(super) fn get(&self, item: DomNodeId) -> i64 {
+        if item.is_text() {
+            return 1;
+        }
         self.values.get(item.index()).copied().unwrap_or(1)
     }
 }
@@ -111,7 +113,12 @@ mod tests {
     fn node_with_id(document: &Document, id: &str) -> DomNodeId {
         document
             .node_ids()
-            .find(|&node| document.get_dom_id(node) == Some(id))
+            .find(|&node| {
+                document
+                    .try_element_ref(node)
+                    .and_then(|element| element.id())
+                    == Some(id)
+            })
             .unwrap_or_else(|| panic!("missing element #{id}"))
     }
 

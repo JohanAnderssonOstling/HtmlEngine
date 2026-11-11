@@ -1,7 +1,5 @@
 //! Framework-neutral clipboard/file payloads. Applications own clipboard access.
 
-#[cfg(feature = "math-export")]
-use html_pipeline::engine::text_paint;
 use html_resources::resources::images as image_resources;
 use crate::document::ImageId;
 use crate::layout::RenderView;
@@ -97,7 +95,7 @@ impl<'a> DocumentExport<'a> {
             ExportRequest::EquationLatex(index) => {
                 #[cfg(feature = "math-export")]
                 {
-                    let text = text_paint::render_view_image_mathml(&self.view, index)
+                    let text = (self.view).image_mathml(index)
                         .map(mathml::mathml_to_latex)
                         .transpose()?;
                     Ok(text.map(ExportPayload::Text))

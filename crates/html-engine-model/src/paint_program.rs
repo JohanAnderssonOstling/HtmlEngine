@@ -28,6 +28,8 @@ pub enum PaintOperation {
     },
     CollapsedBorder {
         owner: u32,
+        /// Row whose placement carries this edge, independently of paint order.
+        fragment_owner: u32,
         source: PaintStyleSource,
         side: u8,
         pattern: DecorationPattern,

@@ -1,43 +1,43 @@
-use crate::layout_model::{
-    BoxGeometry, GlyphId, GlyphMetrics, GlyphSlice, InlineContent, LayoutState, LayoutTree,
-    ShapedFontMetrics, TextGeometryView,
-};
+use html_engine_model::{
+    BoxGeometry, GlyphId, GlyphMetrics, GlyphResourceGeneration, GlyphSlice, ImageMetrics,
+    ImageSizingPolicy, InlineContent, LayoutConstraints, LayoutState, LayoutTree, PaintView,
+    ShapedFontMetrics, TextGeometryView, TextPaintRange, WordIndex};
 use html_dom::{Document, MemoryUsageReport};
-use html_engine_model::WordIndex;
 use html_style_model::ComputedStyles;
 use html_text::FirstLetterStyles;
-use kurbo::Point;
-use std::time::Duration;
-use web_time::Instant;
+use kurbo::{Point, Size};
 
 use super::fragment_writer::FragmentWriter;
-use super::inline::{HyphenationDictionaryCache, InlinePlanCache, InlinePlanGeneration};
+use super::inline::{
+    HyphenationDictionaryCache, InlinePlanCache, InlinePlanGeneration, ParagraphLayouts,
+    ParagraphScratch};
 use super::inline_reader::InlineReader;
 use super::placement::PlacementState;
-use super::read_context::{BoxStyleSnapshot, LayoutReader};
+use super::read_context::{PassContext, LayoutReader};
 use super::{
     absolute_positioning::AbsolutePositioningState,
     block::{FloatState, MarginAnalysis},
     config::LayoutConfig,
-    finalization::FinalizationScratch,
+    s03_finalize::FinalizationScratch,
 };
 
-pub use super::execution::{layout_with_timings, repaint};
+pub use super::s00_layout::{compute_layout, repaint};
 
 /// Allocation-owning state reused by successive layout passes. It is separate
 /// from published geometry so render consumers cannot observe or depend on it.
 #[derive(Default)]
 pub struct LayoutScratch {
-    floats: FloatState,
-    margins: MarginAnalysis,
-    absolute_positioning: AbsolutePositioningState,
-    flex_grid: crate::flex_grid::FlexGridState,
-    measurement: Option<Box<MeasurementWorker>>,
-    finalization: FinalizationScratch,
-    paragraphs: Vec<super::inline::ParagraphScratch>,
-    paragraph_layouts: super::inline::ParagraphLayouts,
+    pub(super) floats: FloatState,
+    pub(super) margins: MarginAnalysis,
+    pub(super) absolute_positioning: AbsolutePositioningState,
+    pub(super) measurement: Option<Box<MeasurementState>>,
+    pub(super) intrinsic_widths: Vec<super::intrinsic_sizing::IntrinsicWidths>,
+    pub(crate) flex_grid: crate::flex_grid::FlexGridState,
+    pub(super) finalization: FinalizationScratch,
+    pub(super) paragraphs: Vec<ParagraphScratch>,
+    pub(super) paragraph_layouts: ParagraphLayouts,
     pub(super) inline_plans: InlinePlanCache,
-    block_decoration_owners: Vec<u32>,
+    pub(super) hyphenation_dictionary: HyphenationDictionaryCache,
 }
 
 impl Clone for LayoutScratch {
@@ -67,7 +67,10 @@ impl LayoutScratch {
     }
     #[cfg(any(test, feature = "testing"))]
     pub fn paragraph_capacities(&self) -> Vec<(usize, (usize, usize, usize))> {
-        self.paragraphs.iter().map(super::inline::ParagraphScratch::capacities).collect()
+        self.paragraphs
+            .iter()
+            .map(ParagraphScratch::capacities)
+            .collect()
     }
 }
 
@@ -85,96 +88,45 @@ pub struct LayoutInputs<'a> {
     pub ellipsis_glyphs: &'a rustc_data_structures::fx::FxHashMap<u32, GlyphId>,
     pub hyphen_glyphs: &'a rustc_data_structures::fx::FxHashMap<u32, GlyphId>,
     pub inline_plan_generation: InlinePlanGeneration,
-    pub image_metrics: &'a crate::ImageMetrics,
-    pub paint: html_engine_model::PaintView<'a>,
-    pub text_style_ranges: &'a [html_engine_model::TextPaintRange],
-    pub resource_generation: crate::GlyphResourceGeneration,
+    pub image_metrics: &'a ImageMetrics,
+    pub paint: PaintView<'a>,
+    pub text_style_ranges: &'a [TextPaintRange],
+    pub resource_generation: GlyphResourceGeneration,
 }
 
-pub struct LayoutOutputs<'out, 'scratch> {
+pub struct LayoutOutputs<'out> {
     pub geometry: &'out mut BoxGeometry,
     pub state: &'out mut LayoutState,
-    pub placement: &'scratch mut PlacementState,
-    pub scratch: &'scratch mut LayoutScratch,
+    pub placement: &'out mut PlacementState,
+    pub scratch: &'out mut LayoutScratch,
 }
 
-#[derive(Default, Debug, Clone)]
-pub struct LayoutTimings {
-    pub clear_layout_output: Duration,
-    pub layout_tree_traversal: Duration,
-    /// Inclusive wall time for the root box and every descendant it lays out.
-    pub root_box_layout: Duration,
-    /// Inclusive wall time for line sorting, decoration collection, and image indexing.
-    pub finalize_layout: Duration,
-    pub build_line_traversals: Duration,
-    pub collect_inline_decorations: Duration,
-    pub rebuild_image_fragments_by_line: Duration,
-    pub layout_box_total: Duration,
-    pub layout_block_children: Duration,
-    pub layout_table: Duration,
-    pub layout_table_row: Duration,
-    pub layout_runs: Duration,
-    pub layout_runs_around_float_exclusions: Duration,
-    pub build_inline_tokens: Duration,
-    pub build_inline_tokens_from_runs: Duration,
-    pub break_lines: Duration,
-    pub break_lines_knuth: Duration,
-    pub emit_lines: Duration,
-    pub measure_line: Duration,
-    pub write_line_fragments: Duration,
-    /// Lines measured during this pass, including intrinsic probes.
-    pub measured_lines: usize,
-    /// Paragraph-local line layouts reused without measurement.
-    pub reused_lines: usize,
-    pub place_float_anchor: Duration,
-    pub layout_flex_grid: Duration,
-    pub measure_flex_grid_item: Duration,
-}
-
-/// Start time for optional layout telemetry.
-///
-/// Normal layout does not request [`LayoutTimings`], so keeping the absence in
-/// the token prevents hot layout paths from reading the system clock merely to
-/// discard the result.
-#[derive(Clone, Copy)]
-pub struct LayoutTimingStart(Option<Instant>);
-
-impl LayoutTimingStart {
-    pub fn elapsed(self) -> Duration {
-        self.0.map_or(Duration::ZERO, |started| started.elapsed())
-    }
+/// Selects publication behavior independently of temporary fragmentation suppression.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum LayoutPassKind {
+    Final,
+    Probe,
 }
 
 pub struct LayoutEngine<'a, 'out> {
-    pub(super) hyphenation_dictionary: HyphenationDictionaryCache,
     pub config: LayoutConfig,
-    pub(super) floats: FloatState,
-    pub(super) margins: MarginAnalysis,
-    pub(super) absolute_positioning: AbsolutePositioningState,
-    pub(super) inline_plans: InlinePlanCache,
     pub(super) inline_plan_generation: InlinePlanGeneration,
-    pub flex_grid: crate::flex_grid::FlexGridState,
-    pub(super) measurement: Option<Box<MeasurementWorker>>,
-    pub(super) finalization: FinalizationScratch,
-    pub(super) paragraphs: Vec<super::inline::ParagraphScratch>,
-    pub(super) paragraph_layouts: super::inline::ParagraphLayouts,
-    pub(super) text_style_ranges: &'a [html_engine_model::TextPaintRange],
-    pub(super) resource_generation: crate::GlyphResourceGeneration,
-    pub(super) fragmentation_suppression_depth: usize,
+    pub(super) text_style_ranges: &'a [TextPaintRange],
+    pub(super) resource_generation: GlyphResourceGeneration,
+    pub(super) pass_kind: LayoutPassKind,
     pub reader: LayoutReader<'a>,
     pub text: InlineReader<'a>,
     pub geometry: &'out mut BoxGeometry,
     pub fragments: FragmentWriter<'out>,
-    pub(crate) placement: PlacementState,
-    pub(super) timings: Option<LayoutTimings>,
+    pub(crate) placement: &'out mut PlacementState,
+    pub(crate) scratch: &'out mut LayoutScratch,
 }
 
 impl<'a, 'out> LayoutEngine<'a, 'out> {
     pub(super) fn new(
         read: LayoutReadContext<'a>,
-        outputs: LayoutOutputs<'out, '_>,
-        timings: Option<LayoutTimings>,
-        fragmentation_suppression_depth: usize,
+        outputs: LayoutOutputs<'out>,
+        pass_kind: LayoutPassKind,
     ) -> Self {
         let LayoutOutputs {
             geometry,
@@ -182,61 +134,41 @@ impl<'a, 'out> LayoutEngine<'a, 'out> {
             placement,
             scratch,
         } = outputs;
+        // These results depend on immutable inputs for this pass. Nested
+        // measurements borrow their owner's cache instead of resetting it.
+        if pass_kind == LayoutPassKind::Final {
+            scratch.intrinsic_widths.resize(read.reader.box_count(), Default::default());
+            scratch.intrinsic_widths.fill(Default::default());
+            scratch.flex_grid.clear();
+        }
         scratch
             .inline_plans
             .begin_generation(read.inline_plan_generation);
         scratch
             .inline_plans
             .set_compact_token_capacity_hint(read.text.glyphs().len());
+        let fragments = FragmentWriter::new(state);
         Self {
-            hyphenation_dictionary: HyphenationDictionaryCache::default(),
             config: read.config,
-            floats: std::mem::take(&mut scratch.floats),
-            margins: std::mem::take(&mut scratch.margins),
-            absolute_positioning: std::mem::take(&mut scratch.absolute_positioning),
-            flex_grid: std::mem::take(&mut scratch.flex_grid),
-            measurement: std::mem::take(&mut scratch.measurement),
-            finalization: std::mem::take(&mut scratch.finalization),
-            paragraphs: std::mem::take(&mut scratch.paragraphs),
-            paragraph_layouts: std::mem::take(&mut scratch.paragraph_layouts),
             text_style_ranges: read.text_style_ranges,
             resource_generation: read.resource_generation,
             reader: read.reader,
             text: read.text,
             geometry,
-            fragments: FragmentWriter::new(
-                state,
-                std::mem::take(&mut scratch.block_decoration_owners),
-            ),
-            placement: std::mem::take(placement),
-            inline_plans: std::mem::take(&mut scratch.inline_plans),
+            fragments,
+            placement,
+            scratch,
             inline_plan_generation: read.inline_plan_generation,
-            fragmentation_suppression_depth,
-            timings,
+            pass_kind,
         }
     }
 
-    pub(super) fn recycle_into(
-        &mut self,
-        placement: &mut PlacementState,
-        scratch: &mut LayoutScratch,
-    ) {
-        scratch.block_decoration_owners = self.fragments.take_decoration_owners();
-        *placement = std::mem::take(&mut self.placement);
-        scratch.floats = std::mem::take(&mut self.floats);
-        scratch.margins = std::mem::take(&mut self.margins);
-        scratch.absolute_positioning = std::mem::take(&mut self.absolute_positioning);
-        scratch.flex_grid = std::mem::take(&mut self.flex_grid);
-        scratch.measurement = std::mem::take(&mut self.measurement);
-        scratch.finalization = std::mem::take(&mut self.finalization);
-        scratch.paragraphs = std::mem::take(&mut self.paragraphs);
-        scratch.paragraph_layouts = std::mem::take(&mut self.paragraph_layouts);
-        self.inline_plans.trim();
-        scratch.inline_plans = std::mem::take(&mut self.inline_plans);
-    }
-
-    pub fn retain_measurement_plans(&mut self, measurement: ParallelBoxMeasurement) {
-        self.inline_plans.merge(measurement.inline_plans);
+    pub(super) fn finish_pass(self) {
+        // Measurement plans return to the parent executor. Compact shared
+        // arenas once after the complete layout, rather than after each probe.
+        if self.pass_kind == LayoutPassKind::Final {
+            self.scratch.inline_plans.trim();
+        }
     }
 
     pub fn measurement_context(&self) -> LayoutReadContext<'a> {
@@ -250,68 +182,69 @@ impl<'a, 'out> LayoutEngine<'a, 'out> {
         }
     }
 
-    pub fn start_timing(&self) -> LayoutTimingStart {
-        LayoutTimingStart(self.timings.as_ref().map(|_| Instant::now()))
-    }
-
-    /// Runs layout whose intrinsic geometry must not depend on page boundaries.
-    ///
-    /// Table cells are measured as continuous content. The paginator later
-    /// decides which complete rows fit in each fragment; allowing ordinary
-    /// block fragmentation here would insert page-sized gaps inside cells and
-    /// make row heights change when the viewport is resized.
-    pub fn without_fragmentation<R>(&mut self, layout: impl FnOnce(&mut Self) -> R) -> R {
-        self.fragmentation_suppression_depth += 1;
-        let result = layout(self);
-        self.fragmentation_suppression_depth =
-            self.fragmentation_suppression_depth.saturating_sub(1);
-        result
-    }
-
-    pub fn fragment_height(&self) -> Option<f64> {
-        (self.fragmentation_suppression_depth == 0 && !self.config.book_optimized_text())
-            .then(|| self.config.viewport_height())
-            .flatten()
-            .filter(|height| *height > 0.0)
-    }
-
-    pub fn record_timing(&mut self, f: impl FnOnce(&mut LayoutTimings)) {
-        if let Some(timings) = &mut self.timings {
-            f(timings);
+    /// Resolve reader image fitting before line breaking and float placement.
+    /// Images already inside the limits retain their exact resolved geometry.
+    pub(super) fn fit_image(
+        &self,
+        box_idx: usize,
+        size: Size,
+        available_width: f64,
+        outer: Size,
+    ) -> Size {
+        if self.config.image_sizing_policy() != ImageSizingPolicy::SmartStandalone
+            || size.width <= 0.0
+            || size.height <= 0.0
+        {
+            return size;
         }
+        let width = (available_width.min(self.config.viewport_width()) - outer.width).max(0.0);
+        let height = self
+            .config
+            .viewport_height()
+            .filter(|height| *height > 0.0)
+            .map_or(f64::INFINITY, |height| (height - outer.height).max(0.0));
+        if (size.width <= width && size.height <= height)
+            || self
+                .reader
+                .image_idx(box_idx)
+                .and_then(|index| self.reader.document().image(index))
+                .is_some_and(|image| matches!(image.source, html_dom::ImageSource::MathMl { .. }))
+        {
+            return size;
+        }
+        let scale = (width / size.width).min(height / size.height).min(1.0);
+        Size::new(size.width * scale, size.height * scale)
     }
 
     pub(super) fn clear_layout_output(&mut self) {
-        let measurement_output = self.geometry.uses_lazy_reset();
         self.geometry.reset(self.reader.box_count());
         self.fragments.reset();
-        if measurement_output {
-            self.placement.reset_for_measurement();
-        } else {
-            self.placement.reset(self.reader.box_count());
+        match self.pass_kind {
+            LayoutPassKind::Final => self.placement.reset(self.reader.box_count()),
+            LayoutPassKind::Probe => self.placement.reset_for_measurement(),
         }
     }
 }
 
-/// Immutable inputs shared by normal layout and table-cell measurement workers.
+/// Immutable inputs borrowed by normal layout and isolated measurements.
 #[derive(Clone, Copy)]
 pub struct LayoutReadContext<'a> {
     config: LayoutConfig,
     reader: LayoutReader<'a>,
     text: InlineReader<'a>,
     inline_plan_generation: InlinePlanGeneration,
-    text_style_ranges: &'a [html_engine_model::TextPaintRange],
-    resource_generation: crate::GlyphResourceGeneration,
+    text_style_ranges: &'a [TextPaintRange],
+    resource_generation: GlyphResourceGeneration,
 }
 
-pub struct MeasurementWorker {
+pub(super) struct MeasurementState {
     geometry: BoxGeometry,
     state: LayoutState,
     placement: PlacementState,
     pub(super) scratch: LayoutScratch,
 }
 
-impl Default for MeasurementWorker {
+impl Default for MeasurementState {
     fn default() -> Self {
         Self {
             geometry: BoxGeometry::lazy(),
@@ -322,8 +255,8 @@ impl Default for MeasurementWorker {
     }
 }
 
-impl MeasurementWorker {
-    pub(super) fn outputs(&mut self) -> LayoutOutputs<'_, '_> {
+impl MeasurementState {
+    pub(super) fn outputs(&mut self) -> LayoutOutputs<'_> {
         LayoutOutputs {
             geometry: &mut self.geometry,
             state: &mut self.state,
@@ -333,18 +266,13 @@ impl MeasurementWorker {
     }
 }
 
-pub struct ParallelBoxMeasurement {
-    pub layout: super::BoxLayoutResult<()>,
-    pub(super) inline_plans: InlinePlanCache,
-}
-
 impl<'a> LayoutReadContext<'a> {
     pub(super) fn new(
         inputs: LayoutInputs<'a>,
-        constraints: crate::LayoutConstraints,
-        box_styles: &'a BoxStyleSnapshot<'a>,
+        constraints: LayoutConstraints,
+        pass_context: &'a PassContext<'a>,
     ) -> Self {
-        let reader = LayoutReader::new(&inputs, box_styles);
+        let reader = LayoutReader::new(&inputs, pass_context);
         Self {
             config: LayoutConfig::new(constraints),
             reader,
@@ -361,27 +289,6 @@ impl<'a> LayoutReadContext<'a> {
             inline_plan_generation: inputs.inline_plan_generation,
             text_style_ranges: inputs.text_style_ranges,
             resource_generation: inputs.resource_generation,
-        }
-    }
-}
-
-impl LayoutReadContext<'_> {
-    pub fn measure_table_cell(
-        &self,
-        worker: &mut MeasurementWorker,
-        point: Point,
-        request: crate::layout::BoxLayoutRequest,
-    ) -> ParallelBoxMeasurement {
-        #[cfg(any(test, feature = "testing"))]
-        super::parallel::record_worker();
-        let layout =
-            super::preparation::execute_layout(*self, worker.outputs(), &mut None, 1, |engine| {
-                engine.geometry.set_point(request.box_idx, point);
-                engine.layout_box(request)
-            });
-        ParallelBoxMeasurement {
-            layout: layout.without_output(),
-            inline_plans: std::mem::take(&mut worker.scratch.inline_plans),
         }
     }
 }

@@ -1,7 +1,12 @@
-use super::composition::layout_prepared_tokens;
-use super::token_preparation::prepare_inline_tokens;
-use super::tokens::{cached_inline_plan_key, BreakKind};
-use super::{InlineFormattingInput, TokenMetadata, InlineTokenKind, InlineTokens, Size};
+use super::s02_compose::layout_prepared_tokens;
+use super::s01_tokenize::prepare_inline_tokens;
+use super::tokens::{BreakKind, TextPreparationRequest};
+use super::{
+    InlineFormattingInput, InlineLayoutArea, InlineTokenKind, InlineTokens, ParagraphLayout,
+    ResolvedTextIndent, Size, TokenMetadata};
+use crate::layout::{LayoutEngine, ResolvedBoxSizing};
+use kurbo::Point;
+use std::ops::Range;
 use std::mem::take;
 
 /// Lays out one inline-item range from start to finish.
@@ -10,43 +15,43 @@ use std::mem::take;
 /// breaks them into logical lines, and then emits fragments from those
 /// lines in a separate pass.
 pub(in crate::layout) fn layout_inline_content(
-    engine: &mut crate::layout::LayoutEngine<'_, '_>,
+    engine: &mut LayoutEngine<'_, '_>,
     input: InlineFormattingInput,
 ) -> Size {
-    profile_scope!("layout.inline_context");
-    let timing_started = engine.start_timing();
     let run_range = &input.run_range;
     if run_range.start >= run_range.end {
-        engine.record_timing(|t| t.layout_runs += timing_started.elapsed());
         return Size::ZERO;
     }
-    let cache_key = cached_inline_plan_key(engine, run_range, input.container_box_idx);
+    let preparation = TextPreparationRequest::new(
+        engine.text_preparation_inputs(),
+        run_range,
+        input.container_box_idx,
+    );
+    let cache_key = preparation.as_ref().map(TextPreparationRequest::cache_key);
     if let Some(key) = cache_key
-        && engine.inline_plans.contains(key)
+        && engine.scratch.inline_plans.contains(key)
     {
         // Keep the token owner outside the mutable executor while its slices
         // are borrowed. Text-only replay cannot enter recursive box layout.
-        let mut plans = take(&mut engine.inline_plans);
+        let mut plans = take(&mut engine.scratch.inline_plans);
         let has_float_exclusions = engine
+            .scratch
             .floats
             .current_float_context()
             .is_some_and(|context| !context.is_empty());
-        let token_started = engine.start_timing();
         let size = plans
             .with_plan(key, |tokens| {
-                engine.record_timing(|t| t.build_inline_tokens += token_started.elapsed());
                 execute_inline_tokens(engine, input, tokens, has_float_exclusions, true)
             })
             .expect("matching retained token plan");
         debug_assert!(
-            engine.inline_plans.is_empty(),
+            engine.scratch.inline_plans.is_empty(),
             "text-plan replay must not build nested token plans"
         );
-        engine.inline_plans = plans;
-        engine.record_timing(|t| t.layout_runs += timing_started.elapsed());
+        engine.scratch.inline_plans = plans;
         return size;
     }
-    let (mut tokens, has_float_exclusions) = prepare_inline_tokens(engine, &input);
+    let (mut tokens, has_float_exclusions) = prepare_inline_tokens(engine, &input, preparation);
     let size = execute_inline_tokens(
         engine,
         input,
@@ -54,13 +59,12 @@ pub(in crate::layout) fn layout_inline_content(
         has_float_exclusions,
         cache_key.is_some(),
     );
-    engine.inline_plans.restore(cache_key, tokens);
-    engine.record_timing(|t| t.layout_runs += timing_started.elapsed());
+    engine.scratch.inline_plans.restore(cache_key, tokens);
     size
 }
 
 fn execute_inline_tokens(
-    engine: &mut crate::layout::LayoutEngine<'_, '_>,
+    engine: &mut LayoutEngine<'_, '_>,
     input: InlineFormattingInput,
     tokens: &mut InlineTokens<'_>,
     has_float_exclusions: bool,
@@ -170,7 +174,7 @@ fn prose_separators(
 }
 
 fn layout_prose_paragraphs(
-    engine: &mut crate::layout::LayoutEngine<'_, '_>,
+    engine: &mut LayoutEngine<'_, '_>,
     mut input: InlineFormattingInput,
     tokens: &mut InlineTokens,
     separators: &[(usize, usize, f64)],
@@ -200,4 +204,55 @@ fn layout_prose_paragraphs(
         }
     }
     size
+}
+
+pub(in crate::layout) fn layout_inline_box(
+    engine: &mut LayoutEngine<'_, '_>,
+    resolved: &ResolvedBoxSizing,
+    run_range: Range<u32>,
+    content_pos: Point,
+    indent: ResolvedTextIndent,
+) -> Size {
+    let box_idx = resolved.box_idx();
+    let percentage_height_basis =
+        if engine.reader.is_inline_box(box_idx) || engine.reader.is_anonymous_box(box_idx) {
+            resolved
+                .replaced_size
+                .map(|size| size.height)
+                .or(resolved.vertical.descendant_basis)
+        } else {
+            resolved.vertical.descendant_basis
+        };
+    let style = engine.reader.style(box_idx);
+    let indent = engine
+        .reader
+        .reader_text_indent(box_idx)
+        .map_or(indent, |amount| ResolvedTextIndent {
+            amount,
+            hanging: false,
+            each_line: false,
+            first_line: true,
+        });
+    let paragraph = ParagraphLayout {
+        indent,
+        direction: style.direction(),
+        text_align: style.text_align(),
+        text_align_last: style.text_align_last(),
+        wrap_style: style.text_wrap_style(),
+        hanging_punctuation: style.hanging_punctuation(),
+    };
+    layout_inline_content(
+        engine,
+        InlineFormattingInput {
+            container_box_idx: box_idx,
+            starts_block: true,
+            run_range,
+            area: InlineLayoutArea {
+                origin: content_pos,
+                width: resolved.horizontal.content,
+                percentage_height_basis,
+            },
+            paragraph,
+        },
+    )
 }

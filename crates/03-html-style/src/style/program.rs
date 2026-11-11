@@ -4,12 +4,11 @@ use crate::style::compiled::CompiledStyles;
 use crate::style::document::{AuthorStylesheetInput, StyledDocument};
 use crate::style::environment::{MediaEnvironment, MediaQuerySet};
 use crate::style::rules::compiler;
-use crate::style::rules::prepared::PreparedStylesheetFragment;
-use html_style_model::FontFace;
 use crate::style::source::inline::{InlineStyles, ParsedInlineStyleCache, cached_entry};
 use crate::style::source::resource::{ResourceStylesheet, ResourceStylesheetEntry};
 use crate::style::timings::StyleTimings;
-use html_dom::Document;
+use html_dom::{Document, DomNodeId};
+use html_style_model::{ComputedStyles, FontFace, ReaderStyleOverrides};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use web_time::Instant;
@@ -35,7 +34,7 @@ pub struct StyleProgramCacheStats {
 }
 
 struct StyleProgramCacheKey {
-    css: Box<[Arc<str>]>,
+    sources: Box<[Option<u64>]>,
     environment: MediaEnvironment,
     initial_font_size: u32,
 }
@@ -45,10 +44,10 @@ struct CachedStyleProgram {
     program: Arc<StyleProgram>,
 }
 
-#[derive(Clone)]
-struct CachedParsedStylesheet {
+struct CachedSource {
     css: Arc<str>,
-    stylesheet: Option<Arc<PreparedStylesheetFragment<'static>>>,
+    complete: Option<Option<ResourceStylesheet>>,
+    entries: Option<Vec<ResourceStylesheetEntry>>,
 }
 
 /// Small in-process cache intended to live for the lifetime of an open book.
@@ -58,8 +57,7 @@ pub struct StyleProgramCache {
     capacity: usize,
     hits: u64,
     misses: u64,
-    parsed_entries: VecDeque<CachedParsedStylesheet>,
-    resource_sources: VecDeque<(Arc<str>, Vec<ResourceStylesheetEntry>)>,
+    resource_sources: VecDeque<CachedSource>,
     parsed_capacity: usize,
     parsed_hits: u64,
     parsed_misses: u64,
@@ -73,7 +71,6 @@ impl Default for StyleProgramCache {
             capacity: 8,
             hits: 0,
             misses: 0,
-            parsed_entries: VecDeque::new(),
             resource_sources: VecDeque::new(),
             parsed_capacity: 64,
             parsed_hits: 0,
@@ -88,11 +85,13 @@ impl StyleProgramCache {
         self.entries.clear();
         self.hits = 0;
         self.misses = 0;
-        self.parsed_entries.clear();
         self.resource_sources.clear();
         self.parsed_hits = 0;
         self.parsed_misses = 0;
-        self.inline_styles.lock().expect("inline style cache lock").clear();
+        self.inline_styles
+            .lock()
+            .expect("inline style cache lock")
+            .clear();
     }
 
     pub fn stats(&self) -> StyleProgramCacheStats {
@@ -105,7 +104,7 @@ impl StyleProgramCache {
             entries: self.entries.len(),
             hits: self.hits,
             misses: self.misses,
-            parsed_entries: self.parsed_entries.len(),
+            parsed_entries: self.resource_sources.len(),
             parsed_hits: self.parsed_hits,
             parsed_misses: self.parsed_misses,
             inline_entries,
@@ -114,46 +113,35 @@ impl StyleProgramCache {
         }
     }
 
-    fn get_or_prepare(
-        &mut self,
-        css: &str,
-        prepare: impl FnOnce() -> Option<Arc<PreparedStylesheetFragment<'static>>>,
-    ) -> CachedParsedStylesheet {
-        if let Some(entry) =
-            cached_entry(&mut self.parsed_entries, |entry| entry.css.as_ref() == css)
+    fn source(&mut self, css: &str) -> &mut CachedSource {
+        if let Some(index) = self
+            .resource_sources
+            .iter()
+            .position(|source| source.css.as_ref() == css)
         {
             self.parsed_hits += 1;
-            return entry.clone();
+            let source = self.resource_sources.remove(index).expect("source index");
+            self.resource_sources.push_back(source);
+        } else {
+            self.parsed_misses += 1;
+            if self.resource_sources.len() == self.parsed_capacity {
+                self.resource_sources.pop_front();
+            }
+            self.resource_sources.push_back(CachedSource {
+                css: Arc::from(css),
+                complete: None,
+                entries: None,
+            });
         }
-        self.parsed_misses += 1;
-        let stylesheet = prepare();
-        if self.parsed_entries.len() == self.parsed_capacity {
-            self.parsed_entries.pop_front();
-        }
-        let entry = CachedParsedStylesheet {
-            css: Arc::from(css),
-            stylesheet,
-        };
-        self.parsed_entries.push_back(entry.clone());
-        entry
+        self.resource_sources.back_mut().expect("cached source")
     }
 
     /// Reuse parser output before resolving resource-specific font URLs/imports.
     pub fn resource_entries(&mut self, css: &str) -> Vec<ResourceStylesheetEntry> {
-        if let Some((_, entries)) = self
-            .resource_sources
-            .iter()
-            .find(|(source, _)| source.as_ref() == css)
-        {
-            return entries.clone();
-        }
-        let entries = ResourceStylesheet::parse(css);
-        if self.resource_sources.len() == self.parsed_capacity {
-            self.resource_sources.pop_front();
-        }
-        self.resource_sources
-            .push_back((Arc::from(css), entries.clone()));
-        entries
+        self.source(css)
+            .entries
+            .get_or_insert_with(|| ResourceStylesheet::parse(css))
+            .clone()
     }
 
     pub fn get_or_compile(
@@ -162,11 +150,19 @@ impl StyleProgramCache {
         environment: MediaEnvironment,
         initial_font_size: f32,
     ) -> (Arc<StyleProgram>, StyleTimings) {
+        let sources: Vec<_> = inputs
+            .iter()
+            .map(|input| {
+                self.source(input.css)
+                    .complete
+                    .get_or_insert_with(|| ResourceStylesheet::parse_complete(input.css))
+                    .clone()
+            })
+            .collect();
         self.get_or_compile_with(
-            inputs.iter().map(|input| input.css),
+            sources.iter().map(Option::as_ref),
             environment,
             initial_font_size,
-            |_, css| compiler::parse_fragment(css),
         )
     }
 
@@ -178,53 +174,43 @@ impl StyleProgramCache {
         initial_font_size: f32,
     ) -> (Arc<StyleProgram>, StyleTimings) {
         self.get_or_compile_with(
-            sources.iter().map(|source| source.css()),
+            sources.iter().copied().map(Some),
             environment,
             initial_font_size,
-            |index, _| {
-                Some(Arc::new(PreparedStylesheetFragment::compile(
-                    sources[index].stylesheet(),
-                )))
-            },
         )
     }
 
     fn get_or_compile_with<'a>(
         &mut self,
-        inputs: impl ExactSizeIterator<Item = &'a str> + Clone,
+        inputs: impl ExactSizeIterator<Item = Option<&'a ResourceStylesheet>> + Clone,
         environment: MediaEnvironment,
         initial_font_size: f32,
-        mut prepare: impl FnMut(usize, &str) -> Option<Arc<PreparedStylesheetFragment<'static>>>,
     ) -> (Arc<StyleProgram>, StyleTimings) {
         let initial_font_size = initial_font_size.to_bits();
         if let Some(entry) = cached_entry(&mut self.entries, |entry| {
             entry.key.environment == environment
                 && entry.key.initial_font_size == initial_font_size
-                && entry
-                    .key
-                    .css
-                    .iter()
-                    .map(AsRef::as_ref)
-                    .eq(inputs.clone())
+                && entry.key.sources.iter().copied().eq(inputs
+                    .clone()
+                    .map(|source| source.map(ResourceStylesheet::id)))
         }) {
             self.hits += 1;
             return (entry.program.clone(), StyleTimings::default());
         }
         self.misses += 1;
         let input_count = inputs.len();
-        let mut css = Vec::with_capacity(input_count);
+        let mut sources = Vec::with_capacity(input_count);
         let mut stylesheets = Vec::with_capacity(input_count);
         let parse_started = Instant::now();
         for (index, input) in inputs.enumerate() {
-            let parsed = self.get_or_prepare(input, || prepare(index, input));
-            css.push(parsed.css);
-            if let Some(stylesheet) = parsed.stylesheet {
-                stylesheets.push((stylesheet, index));
+            sources.push(input.map(ResourceStylesheet::id));
+            if let Some(source) = input {
+                stylesheets.push((source.prepared(), index));
             }
         }
         let parse_author_css = parse_started.elapsed();
         let key = StyleProgramCacheKey {
-            css: css.into_boxed_slice(),
+            sources: sources.into_boxed_slice(),
             environment,
             initial_font_size,
         };
@@ -273,7 +259,7 @@ impl StyleProgram {
         Self::compile_with_timings(css_chunks.iter().copied(), environment, initial_font_size).0
     }
 
-    fn compile_with_timings<'a>(
+    pub(crate) fn compile_with_timings<'a>(
         css_chunks: impl ExactSizeIterator<Item = &'a str>,
         environment: MediaEnvironment,
         initial_font_size: f32,
@@ -289,64 +275,19 @@ impl StyleProgram {
     }
 }
 
-pub(crate) fn compile_and_apply(
-    document: Document,
-    inputs: &[AuthorStylesheetInput<'_>],
-    environment: MediaEnvironment,
-) -> (StyledDocument, StyleTimings, MediaQuerySet) {
-    let css = inputs.iter().map(|input| input.css);
-    let (program, timings) =
-        StyleProgram::compile_with_timings(css, environment, document.root_font_size());
-    apply(document, &program, inputs, timings, &html_style_model::ReaderStyleOverrides::default())
-}
-
-pub fn style_document_with_cached_program_and_timings(
-    cache: &mut StyleProgramCache,
-    document: Document,
-    inputs: &[AuthorStylesheetInput<'_>],
-    environment: MediaEnvironment,
-) -> (StyledDocument, StyleTimings, MediaQuerySet) {
-    style_document_with_cached_program_and_reader_overrides(cache, document, inputs, environment, &html_style_model::ReaderStyleOverrides::default())
-}
-
-pub fn style_document_with_cached_program_and_reader_overrides(
-    cache: &mut StyleProgramCache,
-    document: Document,
-    inputs: &[AuthorStylesheetInput<'_>],
-    environment: MediaEnvironment,
-    reader_overrides: &html_style_model::ReaderStyleOverrides,
-) -> (StyledDocument, StyleTimings, MediaQuerySet) {
-    let root_font_size = document.root_font_size();
-    let (program, timings) = cache.get_or_compile(inputs, environment, root_font_size);
-    apply(document, &program, inputs, timings, reader_overrides)
-}
-
-pub fn style_document_with_program_and_timings(
-    document: Document,
-    program: &StyleProgram,
-    inputs: &[AuthorStylesheetInput<'_>],
-) -> (StyledDocument, StyleTimings, MediaQuerySet) {
-    style_document_with_program_and_reader_overrides(document, program, inputs, &html_style_model::ReaderStyleOverrides::default())
-}
-
-pub fn style_document_with_program_and_reader_overrides(
-    document: Document,
-    program: &StyleProgram,
-    inputs: &[AuthorStylesheetInput<'_>],
-    reader_overrides: &html_style_model::ReaderStyleOverrides,
-) -> (StyledDocument, StyleTimings, MediaQuerySet) {
-    apply(document, program, inputs, StyleTimings::default(), reader_overrides)
-}
-
-fn apply(
+pub(crate) fn apply(
     document: Document,
     program: &StyleProgram,
     inputs: &[AuthorStylesheetInput<'_>],
     timings: StyleTimings,
-    reader_overrides: &html_style_model::ReaderStyleOverrides,
+    reader_overrides: &ReaderStyleOverrides,
 ) -> (StyledDocument, StyleTimings, MediaQuerySet) {
+    let author_roots = inputs
+        .iter()
+        .map(|input| input.implicit_scope_root)
+        .collect::<Vec<_>>();
     let (styles, timings, queries) =
-        resolve_document_with_program(&document, program, inputs, timings, reader_overrides);
+        resolve_document_with_program(&document, program, &author_roots, timings, reader_overrides);
     (
         StyledDocument {
             document,
@@ -362,23 +303,15 @@ fn apply(
 pub fn resolve_document_with_program(
     document: &Document,
     program: &StyleProgram,
-    inputs: &[AuthorStylesheetInput<'_>],
+    author_roots: &[Option<DomNodeId>],
     mut timings: StyleTimings,
-    reader_overrides: &html_style_model::ReaderStyleOverrides,
-) -> (
-    html_style_model::ComputedStyles,
-    StyleTimings,
-    MediaQuerySet,
-) {
+    reader_overrides: &ReaderStyleOverrides,
+) -> (ComputedStyles, StyleTimings, MediaQuerySet) {
     assert_eq!(
-        inputs.len(),
+        author_roots.len(),
         program.compiled.input_count,
         "style program inputs must correspond to its compiled stylesheet chunks"
     );
-    let author_roots = inputs
-        .iter()
-        .map(|input| input.implicit_scope_root)
-        .collect::<Vec<_>>();
     let started = Instant::now();
     let inline_styles = InlineStyles::parse(document, &program.inline_styles);
     let inline_time = started.elapsed();
@@ -386,7 +319,7 @@ pub fn resolve_document_with_program(
         crate::style::cascade::resolver::resolve_styles_for_dom_timed(
             document,
             &program.compiled,
-            &author_roots,
+            author_roots,
             &inline_styles,
             reader_overrides,
         );
@@ -400,8 +333,9 @@ pub fn resolve_document_with_program(
 
 #[cfg(test)]
 mod tests {
-    use super::{StyleProgram, StyleProgramCache, style_document_with_program_and_timings};
+    use super::{StyleProgram, StyleProgramCache};
     use crate::style::rules::compiler::default_stylesheet;
+
     use crate::{AuthorStylesheetInput, MediaEnvironment, StyleTimings};
     use html_style_model::Display;
     use std::ptr;
@@ -429,12 +363,9 @@ mod tests {
             ("<p>viewport again</p>", true),
         ] {
             let document = html_parse::parse_dom_document(source).unwrap();
-            let (_, _, queries) = super::style_document_with_cached_program_and_timings(
-                &mut cache,
-                document,
-                &inputs,
-                MediaEnvironment::default(),
-            );
+            let (_, _, queries) = crate::StyleRequest::new(document, &inputs)
+                .environment(MediaEnvironment::default())
+                .compile_cached(&mut cache);
             assert_eq!(queries.uses_viewport_units(), expected, "{source}");
         }
         assert_eq!((cache.stats().misses, cache.stats().hits), (1, 2));
@@ -456,22 +387,12 @@ mod tests {
                 16.0,
             );
             let key = &cache.entries.back().unwrap().key;
-            assert_eq!(key.css.len(), inputs.len());
-            assert!(Arc::ptr_eq(&key.css[0], &key.css[2]));
-            for source in &key.css {
-                let parsed = cache
-                    .parsed_entries
-                    .iter()
-                    .find(|entry| entry.css == *source)
-                    .unwrap();
-                assert!(Arc::ptr_eq(source, &parsed.css));
-            }
+            assert_eq!(key.sources.len(), inputs.len());
+            assert_eq!(key.sources[0], key.sources[2]);
             if let Some(previous) = &sources {
-                for (current, previous) in key.css.iter().zip(previous) {
-                    assert!(Arc::ptr_eq(current, previous));
-                }
+                assert_eq!(&key.sources, previous);
             }
-            sources = Some(key.css.clone());
+            sources = Some(key.sources.clone());
         }
         assert_eq!(
             (
@@ -482,14 +403,9 @@ mod tests {
             (2, 2, 4)
         );
         cache.clear();
-        assert_eq!(
-            sources
-                .unwrap()
-                .iter()
-                .map(AsRef::as_ref)
-                .collect::<Vec<&str>>(),
-            [css, "", css]
-        );
+        let sources = sources.unwrap();
+        assert_eq!(sources[0], sources[2]);
+        assert_eq!(sources.len(), inputs.len());
     }
 
     #[test]
@@ -504,7 +420,12 @@ mod tests {
             )).unwrap();
             let scope = document
                 .node_ids()
-                .find(|&node| document.get_dom_id(node) == Some("scope"))
+                .find(|&node| {
+                    document
+                        .try_element_ref(node)
+                        .and_then(|element| element.id())
+                        == Some("scope")
+                })
                 .unwrap();
             let inputs = [AuthorStylesheetInput {
                 css: "@scope { p { color:red } }",
@@ -514,13 +435,18 @@ mod tests {
             if let Some(previous) = previous {
                 assert!(Arc::ptr_eq(&program, &previous));
             }
-            let (styled, _, _) =
-                style_document_with_program_and_timings(document, &program, &inputs);
+            let (styled, _, _) = crate::StyleRequest::new(document, &inputs).resolve(&program);
             let style_for = |id| {
                 let node = styled
                     .document()
                     .node_ids()
-                    .find(|&node| styled.document().get_dom_id(node) == Some(id))
+                    .find(|&node| {
+                        styled
+                            .document()
+                            .try_element_ref(node)
+                            .and_then(|element| element.id())
+                            == Some(id)
+                    })
                     .unwrap();
                 styled
                     .style_view(styled.style_for_node(node).unwrap())
@@ -583,14 +509,18 @@ mod tests {
                     cache.clear();
                     let (program, timings) = cache.get_or_compile(&inputs, environment, 16.0);
                     (
-                        style_document_with_program_and_timings(document, &program, &inputs).0,
+                        crate::StyleRequest::new(document, &inputs)
+                            .resolve(&program)
+                            .0,
                         timings,
                     )
                 } else {
                     let (program, timings) =
                         StyleProgram::compile_with_timings([css].into_iter(), environment, 16.0);
                     (
-                        style_document_with_program_and_timings(document, &program, &inputs).0,
+                        crate::StyleRequest::new(document, &inputs)
+                            .resolve(&program)
+                            .0,
                         timings,
                     )
                 };
@@ -598,7 +528,13 @@ mod tests {
                 let paragraph = styled
                     .document()
                     .node_ids()
-                    .find(|&node| styled.document().get_dom_tag(node) == Some("p"))
+                    .find(|&node| {
+                        styled
+                            .document()
+                            .try_element_ref(node)
+                            .map(|element| element.tag())
+                            == Some("p")
+                    })
                     .unwrap();
                 let paragraph_style = styled.style_for_node(paragraph).unwrap();
                 assert_eq!(
@@ -612,7 +548,13 @@ mod tests {
                 let span = styled
                     .document()
                     .node_ids()
-                    .find(|&node| styled.document().get_dom_tag(node) == Some("span"))
+                    .find(|&node| {
+                        styled
+                            .document()
+                            .try_element_ref(node)
+                            .map(|element| element.tag())
+                            == Some("span")
+                    })
                     .unwrap();
                 assert_eq!(
                     styled
@@ -642,7 +584,12 @@ mod tests {
                 let node = |id| {
                     document
                         .node_ids()
-                        .find(|&node| document.get_dom_id(node) == Some(id))
+                        .find(|&node| {
+                            document
+                                .try_element_ref(node)
+                                .and_then(|element| element.id())
+                                == Some(id)
+                        })
                         .unwrap()
                 };
                 let inputs = [
@@ -669,13 +616,18 @@ mod tests {
                 } else {
                     Arc::new(StyleProgram::compile(&sheets, environment, 16.0))
                 };
-                let (styled, _, _) =
-                    style_document_with_program_and_timings(document, &program, &inputs);
+                let (styled, _, _) = crate::StyleRequest::new(document, &inputs).resolve(&program);
                 for id in ["one", "two", "outside"] {
                     let node = styled
                         .document()
                         .node_ids()
-                        .find(|&node| styled.document().get_dom_id(node) == Some(id))
+                        .find(|&node| {
+                            styled
+                                .document()
+                                .try_element_ref(node)
+                                .and_then(|element| element.id())
+                                == Some(id)
+                        })
                         .unwrap();
                     let style = styled
                         .style_view(styled.style_for_node(node).unwrap())
@@ -702,8 +654,9 @@ mod tests {
         }
         assert_eq!((cache.stats().misses, cache.stats().hits), (2, 1));
         assert_eq!(
+            // The text entry point resolves all four source identities on each load.
             (cache.stats().parsed_misses, cache.stats().parsed_hits),
-            (4, 4)
+            (4, 8)
         );
     }
 }

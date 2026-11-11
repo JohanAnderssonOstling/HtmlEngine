@@ -4,7 +4,7 @@ use crate::layout::LayoutEngine;
 use kurbo::{Size, Vec2};
 
 pub(super) fn align(
-    session: &mut LayoutEngine<'_, '_>,
+    engine: &mut LayoutEngine<'_, '_>,
     input: &FlexGridInput<'_>,
     size_containment: bool,
     mut items: Vec<BaselineItem>,
@@ -37,7 +37,7 @@ pub(super) fn align(
             let desired_y = baseline_origin + max_baseline - item.baseline;
             let delta = desired_y - item.original_y;
             if delta.abs() > f64::EPSILON {
-                session
+                engine
                     .placement
                     .translate(item.placement, Vec2::new(0.0, delta));
             }

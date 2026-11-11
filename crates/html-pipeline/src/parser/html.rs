@@ -4,14 +4,16 @@ use crate::engine::{FormattingDocument, PreparedDocument};
 use html_style_model::ComputedStyles;
 #[cfg(feature = "profiling")]
 use crate::engine::profiling::scope;
-use html_parse::{ParsedHtml, StylesheetReference, document_stylesheets, encoding_for_label};
+use html_parse::{
+    ParsedHtml, StylesheetReference, document_stylesheets, encoding_for_label,
+    parse_dom_document_with_metadata};
 use html_resources::{ResourceMetadata, ResourceProvider, media_type_essence, uri_path};
 use html_style::{
-    AuthorStylesheetInput, FontFace, ResourceStylesheet, ResourceStylesheetEntry,
-    StyleTimings,
-};
+    FontFace, ResourceStylesheet, ResourceStylesheetEntry,
+    StyleProgramCache, StyleProgramCacheStats, StyleTimings};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::mem::take;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -40,7 +42,8 @@ pub struct DocumentFactory {
     media_environment: html_style::MediaEnvironment,
     title: Option<String>,
     stylesheet_cache: Option<BookStylesheetCache>,
-    style_program_cache: html_style::StyleProgramCache,
+    style_program_cache: StyleProgramCache,
+    shared_style_program_cache: Option<StylesheetCache>,
     reader_overrides: crate::engine::ReaderStyleOverrides,
     note_flow: crate::engine::NoteFlow,
     font_faces: Arc<[FontFace]>,
@@ -75,10 +78,11 @@ impl ResourceDocumentFactory<'_> {
     }
 
     pub fn parse_to_dom(&mut self, source: &str) -> Document {
-        let parsed = parse_html_document(source);
-        let title = parsed.title();
-        self.factory
-            .configure_dom(parsed.into_dom(), title, Some(self.resources))
+        let (document, _) = parse_dom_document_with_metadata(source)
+            .expect("parsed markup must form a valid DOM")
+            .into_parts();
+        let title = document.title().map(str::to_owned);
+        self.factory.configure_dom(document, title, Some(self.resources))
     }
 
     pub fn parse_with_new_pipeline(&mut self, source: &str, css: Option<&str>) -> PreparedDocument<'static> {
@@ -86,7 +90,7 @@ impl ResourceDocumentFactory<'_> {
     }
 
     pub fn parse_with_new_pipeline_css_chunks(&mut self, source: &str, css: &[&str]) -> PreparedDocument<'static> {
-        self.build_pipeline_from_owned_parsed(parse_html_document(source), css).0
+        self.factory.parse_pipeline(source, css, Some(self.resources)).0
     }
 
     pub fn build_pipeline_from_parsed(&mut self, parsed: &ParsedHtml, css: &[&str]) -> PreparedDocument<'static> {
@@ -99,13 +103,27 @@ impl ResourceDocumentFactory<'_> {
         (prepared, timings)
     }
 
-    pub(crate) fn build_pipeline_from_owned_parsed(&mut self, parsed: ParsedHtml, css: &[impl AsRef<str>]) -> (PreparedDocument<'static>, html_style::MediaQuerySet) {
-        self.try_build_pipeline_from_owned_parsed(parsed, css)
-            .expect("parsed markup must form a valid DOM")
-    }
-
     pub(crate) fn try_build_pipeline_from_owned_parsed(&mut self, parsed: ParsedHtml, css: &[impl AsRef<str>]) -> Result<(PreparedDocument<'static>, html_style::MediaQuerySet), DocumentBuildError> {
         self.factory.try_build_pipeline_from_owned_parsed(parsed, css, Some(self.resources))
+    }
+
+    pub(crate) fn build_pipeline_from_dom(
+        &mut self,
+        document: Document,
+        encoding: Option<&str>,
+        css: &[impl AsRef<str>],
+    ) -> (PreparedDocument<'static>, html_style::MediaQuerySet) {
+        let title = document.title().map(str::to_owned);
+        let document = self
+            .factory
+            .configure_dom(document, title, Some(self.resources));
+        self.factory.build_pipeline_from_dom_instrumented(
+            document,
+            encoding,
+            css,
+            None,
+            Some(self.resources),
+        )
     }
 
     pub(crate) fn resolve_canonical_dom(&mut self, document: &Document, encoding: Option<&str>, css: &[impl AsRef<str>]) -> (ComputedStyles, html_style::MediaQuerySet) {
@@ -124,13 +142,36 @@ enum StylesheetEncoding {
     Fallback(&'static str),
 }
 
+/// Content-keyed, bounded CSS programs shared across independent documents.
+/// Resource bytes and their freshness remain owned by each provider.
+#[derive(Clone, Default)]
+pub struct StylesheetCache(Arc<Mutex<StyleProgramCache>>);
+
+impl fmt::Debug for StylesheetCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("StylesheetCache")
+            .field(&self.0.lock().expect("style program cache lock").stats())
+            .finish()
+    }
+}
+
+impl StylesheetCache {
+    /// Share import discovery with subsequent engine preparation.
+    pub fn resource_entries(&self, css: &str) -> Vec<ResourceStylesheetEntry> {
+        self.0
+            .lock()
+            .expect("style program cache lock")
+            .resource_entries(css)
+    }
+}
+
 /// Reuses decompressed external stylesheet text across document factories for
 /// one immutable book. Drop it when the book closes, or call `clear` after its
 /// stylesheet revision changes.
 #[derive(Clone, Default)]
 pub struct BookStylesheetCache {
     entries: Arc<Mutex<HashMap<(String, StylesheetEncoding), Arc<str>>>>,
-    programs: Arc<Mutex<html_style::StyleProgramCache>>,
+    programs: Arc<Mutex<StyleProgramCache>>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -206,12 +247,42 @@ impl DocumentFactory {
         self.stylesheet_cache = Some(cache);
     }
 
-    pub fn style_program_cache_stats(&self) -> html_style::StyleProgramCacheStats {
-        self.stylesheet_cache.as_ref().map_or_else(|| self.style_program_cache.stats(), |cache| cache.programs.lock().expect("style program cache lock").stats())
+    pub fn set_stylesheet_cache(&mut self, cache: StylesheetCache) {
+        self.shared_style_program_cache = Some(cache);
+    }
+
+    fn with_style_program_cache<T>(&mut self, f: impl FnOnce(&mut StyleProgramCache) -> T) -> T {
+        if let Some(cache) = &self.shared_style_program_cache {
+            f(&mut cache.0.lock().expect("style program cache lock"))
+        } else if let Some(cache) = &self.stylesheet_cache {
+            f(&mut cache.programs.lock().expect("style program cache lock"))
+        } else {
+            f(&mut self.style_program_cache)
+        }
+    }
+
+    pub fn style_program_cache_stats(&self) -> StyleProgramCacheStats {
+        if let Some(cache) = &self.shared_style_program_cache {
+            cache.0.lock().expect("style program cache lock").stats()
+        } else {
+            self.stylesheet_cache.as_ref().map_or_else(
+                || self.style_program_cache.stats(),
+                |cache| {
+                    cache
+                        .programs
+                        .lock()
+                        .expect("style program cache lock")
+                        .stats()
+                },
+            )
+        }
     }
 
     pub fn clear_style_program_cache(&mut self) {
         self.style_program_cache.clear();
+        if let Some(cache) = &self.shared_style_program_cache {
+            cache.0.lock().expect("style program cache lock").clear();
+        }
         if let Some(cache) = &self.stylesheet_cache {
             cache.programs.lock().expect("style program cache lock").clear();
         }
@@ -238,9 +309,11 @@ impl DocumentFactory {
     }
 
     pub fn parse_to_dom(&mut self, html: &str) -> Document {
-        let parsed = parse_html_document(html);
-        let title = parsed.title();
-        self.configure_dom(parsed.into_dom(), title, None)
+        let (document, _) = parse_dom_document_with_metadata(html)
+            .expect("parsed markup must form a valid DOM")
+            .into_parts();
+        let title = document.title().map(str::to_owned);
+        self.configure_dom(document, title, None)
     }
 
     pub fn parse_with_new_pipeline(&mut self, html: &str, css: Option<&str>) -> PreparedDocument<'static> {
@@ -248,8 +321,21 @@ impl DocumentFactory {
     }
 
     pub fn parse_with_new_pipeline_css_chunks(&mut self, html: &str, css_chunks: &[&str]) -> PreparedDocument<'static> {
-        let parsed_html = parse_html_document(html);
-        self.build_pipeline_from_owned_parsed(parsed_html, css_chunks, None).0
+        self.parse_pipeline(html, css_chunks, None).0
+    }
+
+    fn parse_pipeline(
+        &mut self,
+        html: &str,
+        css: &[impl AsRef<str>],
+        resources: Option<ResourceContext<'_>>,
+    ) -> (PreparedDocument<'static>, html_style::MediaQuerySet) {
+        let (document, encoding) = parse_dom_document_with_metadata(html)
+            .expect("parsed markup must form a valid DOM")
+            .into_parts();
+        let title = document.title().map(str::to_owned);
+        let document = self.configure_dom(document, title, resources);
+        self.build_pipeline_from_dom_instrumented(document, encoding.as_deref(), css, None, resources)
     }
 
     pub fn build_pipeline_from_parsed(&mut self, parsed_html: &ParsedHtml, css_chunks: &[&str]) -> PreparedDocument<'static> {
@@ -279,11 +365,6 @@ impl DocumentFactory {
             timings,
             resources,
         )
-    }
-
-    pub(crate) fn build_pipeline_from_owned_parsed(&mut self, parsed: ParsedHtml, css_chunks: &[impl AsRef<str>], resources: Option<ResourceContext<'_>>) -> (PreparedDocument<'static>, html_style::MediaQuerySet) {
-        self.try_build_pipeline_from_owned_parsed(parsed, css_chunks, resources)
-            .expect("parsed markup must form a valid DOM")
     }
 
     fn try_build_pipeline_from_owned_parsed(&mut self, parsed: ParsedHtml, css_chunks: &[impl AsRef<str>], resources: Option<ResourceContext<'_>>) -> Result<(PreparedDocument<'static>, html_style::MediaQuerySet), DocumentBuildError> {
@@ -411,18 +492,17 @@ impl DocumentFactory {
     }
 
     fn resolve_styles(&mut self, document: &Document, expanded: &[ExpandedStylesheet]) -> (ComputedStyles, StyleTimings, html_style::MediaQuerySet) {
-        let inputs: Vec<_> = expanded.iter().map(|sheet| AuthorStylesheetInput { css: sheet.source.css(), implicit_scope_root: sheet.implicit_scope_root }).collect();
+        let author_roots: Vec<_> = expanded.iter().map(|sheet| sheet.implicit_scope_root).collect();
         let sources = expanded.iter().map(|sheet| &sheet.source).collect::<Vec<_>>();
-        let (program, timings) = if let Some(cache) = &self.stylesheet_cache {
-            cache.programs.lock().expect("style program cache lock").get_or_compile_resources(&sources, self.media_environment, document.root_font_size())
-        } else {
-            self.style_program_cache.get_or_compile_resources(&sources, self.media_environment, document.root_font_size())
-        };
+        let environment = self.media_environment;
+        let (program, timings) = self.with_style_program_cache(|cache| {
+            cache.get_or_compile_resources(&sources, environment, document.root_font_size())
+        });
         self.font_faces = program.shared_font_faces();
         html_style::resolve_document_with_program(
             document,
             &program,
-            &inputs,
+            &author_roots,
             timings,
             &self.reader_overrides,
         )
@@ -463,11 +543,7 @@ impl DocumentFactory {
             return;
         }
 
-        let entries = if let Some(cache) = &self.stylesheet_cache {
-            cache.programs.lock().expect("stylesheet cache lock").resource_entries(css)
-        } else {
-            self.style_program_cache.resource_entries(css)
-        };
+        let entries = self.with_style_program_cache(|cache| cache.resource_entries(css));
         for entry in entries {
             match entry {
                 ResourceStylesheetEntry::Rules(source) => {
@@ -515,7 +591,7 @@ fn effective_document_base_uri(document: &Document, resources: &ResourceContext<
     const HTML_NAMESPACE: &str = "http://www.w3.org/1999/xhtml";
     let Some(href) = document
         .node_ids()
-        .filter_map(|node| document.element_ref(node))
+        .filter_map(|node| document.try_element_ref(node))
         .find(|element| element.namespace() == Some(HTML_NAMESPACE) && element.tag().eq_ignore_ascii_case("base") && element.attr("href").is_some())
         .and_then(|element| element.attr("href"))
     else {
@@ -760,7 +836,7 @@ mod tests {
 
         assert_eq!(children.len(), 3, "body should keep the space node");
 
-        let middle_text = document.text_ref(children[1]).expect("expected whitespace text node");
+        let middle_text = document.try_text_ref(children[1]).expect("expected whitespace text node");
 
         assert_eq!(middle_text.text(), " ");
     }
@@ -875,9 +951,9 @@ mod tests {
         let children: Vec<_> = p.children().collect();
 
         assert_eq!(children.len(), 1);
-        let anchor = document.element_ref(children[0]).expect("paragraph child should be an anchor");
+        let anchor = document.try_element_ref(children[0]).expect("paragraph child should be an anchor");
         assert_eq!(anchor.tag(), "a");
-        assert!(matches!(anchor.children().next().and_then(|node| document.node_ref(node)), Some(NodeRef::Text(text)) if text.text() == "After"));
+        assert!(matches!(anchor.children().next().map(|node| document.node_ref(node)), Some(NodeRef::Text(text)) if text.text() == "After"));
     }
 
     #[test]
@@ -1054,11 +1130,11 @@ mod tests {
 
     fn find_body(document: &Document) -> ElementRef<'_> {
         let html_idx = document.dom_root().expect("html root should exist");
-        let html = document.element_ref(html_idx).expect("html should be element");
+        let html = document.try_element_ref(html_idx).expect("html should be element");
         child_element_by_tag(document, html, "body")
     }
 
     fn child_element_by_tag<'a>(document: &'a Document, parent: ElementRef<'a>, tag: &str) -> ElementRef<'a> {
-        parent.children().find_map(|child_idx| document.element_ref(child_idx).filter(|element| element.tag() == tag)).expect("child element should exist")
+        parent.children().find_map(|child_idx| document.try_element_ref(child_idx).filter(|element| element.tag() == tag)).expect("child element should exist")
     }
 }

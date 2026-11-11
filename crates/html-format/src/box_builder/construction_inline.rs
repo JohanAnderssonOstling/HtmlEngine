@@ -1,7 +1,5 @@
 //! Materialization of inline runs, split inline boxes, and generated content.
 
-
-use html_dom::storage;
 use super::*;
 use html_dom::ElementRef;
 use html_style_model::Float;
@@ -9,54 +7,207 @@ use html_style_model::Float;
 impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
     pub(super) fn build_split_inline_child(
         &mut self,
-        elem_id: DomNodeId,
-        parent_box_idx: u32,
-        direct_children: &mut Vec<u32>,
+        node: DomNodeId,
+        parent: u32,
+        children: &mut Vec<u32>,
     ) {
-        for part in plan_split_inline(self.document, self.styles, elem_id) {
-            let (block, position_ancestors) = match part {
-                SplitInlinePart::Segment(events) => {
-                    direct_children
-                        .extend(self.materialize_split_inline_segment(events, parent_box_idx));
-                    continue;
-                }
-                SplitInlinePart::Block {
-                    node,
-                    position_ancestors,
-                } => (
-                    self.build_box_for_element(node, Some(parent_box_idx)),
-                    position_ancestors,
-                ),
-                SplitInlinePart::GeneratedBlock {
-                    origin,
-                    before,
-                    position_ancestors,
-                } => (
-                    self.build_generated_block_pseudo(origin, parent_box_idx, before),
-                    position_ancestors,
-                ),
+        let event_start = self.split_events.len();
+        let active_start = self.split_active.len();
+        self.walk_split_inline(node, parent, children, event_start, active_start);
+        self.flush_split_segment(event_start, parent, children);
+        debug_assert_eq!(self.split_active.len(), active_start);
+    }
+
+    fn walk_split_inline(
+        &mut self,
+        node: DomNodeId,
+        parent: u32,
+        children: &mut Vec<u32>,
+        event_start: usize,
+        active_start: usize,
+    ) {
+        let Some(element) = self.document.try_element_ref(node) else {
+            return;
+        };
+        let classification = ElementClassification::new(self.styles, element);
+        let contents = classification.display == Display::Contents;
+        let fragment = super::inline::plan_inline_fragment(self.styles, node, classification.style);
+        if contents {
+            self.split_events
+                .push(SplitInlineEvent::EnterContents(node));
+            self.walk_split_pseudo(node, true, parent, children, event_start, active_start);
+        } else {
+            self.split_active.push(fragment);
+            self.split_events.push(SplitInlineEvent::Open {
+                fragment,
+                first_fragment: true,
+            });
+        }
+        for child in element.children() {
+            let Some(element) = self.document.try_element_ref(child) else {
+                self.split_events.push(SplitInlineEvent::Node(child));
+                continue;
             };
-            if let Some(block_idx) = block {
-                self.output
-                    .set_split_inline_position_ancestors(block_idx, position_ancestors);
-                direct_children.push(block_idx);
+            let classification = ElementClassification::new(self.styles, element);
+            if classification.splits_inline() {
+                self.flush_split_before_block(event_start, active_start, parent, children);
+                let ancestors = self.split_position_ancestors(active_start);
+                if let Some(block) =
+                    self.build_classified_element(child, Some(parent), classification)
+                {
+                    self.output
+                        .set_split_inline_position_ancestors(block, ancestors);
+                    children.push(block);
+                }
+                self.reopen_split_fragments(active_start);
+            } else if matches!(classification.display, Display::Inline | Display::Contents)
+                && super::inline::has_inline_splitting_block_descendant(self.styles, element)
+            {
+                self.walk_split_inline(child, parent, children, event_start, active_start);
+            } else {
+                self.split_events.push(SplitInlineEvent::Node(child));
             }
         }
+        if contents {
+            self.walk_split_pseudo(node, false, parent, children, event_start, active_start);
+            self.split_events.push(SplitInlineEvent::ExitContents);
+        } else {
+            self.split_events.push(SplitInlineEvent::Close {
+                fragment,
+                last_fragment: true,
+            });
+            self.split_active.pop();
+        }
+    }
+
+    fn walk_split_pseudo(
+        &mut self,
+        origin: DomNodeId,
+        before: bool,
+        parent: u32,
+        children: &mut Vec<u32>,
+        event_start: usize,
+        active_start: usize,
+    ) {
+        if pseudo_display(self.styles, origin, before)
+            .is_none_or(|display| display == Display::None)
+        {
+            return;
+        }
+        if pseudo_is_block_level(self.styles, origin, before) {
+            self.flush_split_before_block(event_start, active_start, parent, children);
+            let ancestors = self.split_position_ancestors(active_start);
+            if let Some(block) = self.build_generated_block_pseudo(origin, parent, before) {
+                self.output
+                    .set_split_inline_position_ancestors(block, ancestors);
+                children.push(block);
+            }
+            self.reopen_split_fragments(active_start);
+        } else {
+            self.split_events
+                .push(SplitInlineEvent::GeneratedPseudo { origin, before });
+        }
+    }
+
+    fn split_position_ancestors(&self, start: usize) -> Vec<StyleIndices> {
+        self.split_active[start..]
+            .iter()
+            .filter_map(|fragment| fragment.style)
+            .filter(|&style| {
+                self.styles.layout_style(style).is_some_and(|layout| {
+                    layout.position == html_style_model::PositionMode::Relative
+                })
+            })
+            .collect()
+    }
+
+    fn flush_split_before_block(
+        &mut self,
+        event_start: usize,
+        active_start: usize,
+        parent: u32,
+        children: &mut Vec<u32>,
+    ) {
+        self.split_events
+            .extend(
+                self.split_active[active_start..]
+                    .iter()
+                    .rev()
+                    .copied()
+                    .map(|fragment| SplitInlineEvent::Close {
+                        fragment,
+                        last_fragment: false,
+                    }),
+            );
+        self.flush_split_segment(event_start, parent, children);
+    }
+
+    fn reopen_split_fragments(&mut self, active_start: usize) {
+        self.split_events
+            .extend(
+                self.split_active[active_start..]
+                    .iter()
+                    .copied()
+                    .map(|fragment| SplitInlineEvent::Open {
+                        fragment,
+                        first_fragment: false,
+                    }),
+            );
+    }
+
+    fn flush_split_segment(&mut self, start: usize, parent: u32, children: &mut Vec<u32>) {
+        let child = self.materialize_split_inline_segment(start, parent);
+        self.split_events.truncate(start);
+        children.extend(child);
     }
 
     pub(super) fn materialize_split_inline_segment(
         &mut self,
-        events: Vec<SplitInlineEvent>,
+        event_start: usize,
         parent_box_idx: u32,
     ) -> Option<u32> {
-        if events.is_empty() {
+        if self.split_events.len() == event_start {
             return None;
         }
         let (anonymous_idx, item_start) = self.output.push_anonymous_inline(parent_box_idx);
 
-        let mut fragments = Vec::<InlineFragmentFrame>::new();
-        for event in events {
-            let owner = fragments
+        let ignorable = |node| {
+            super::inline::node_is_ignorable_at_block_edge(
+                self.document,
+                self.styles,
+                node,
+                super::inline::style_for_dom_node(self.document, self.styles, node).white_space(),
+            )
+        };
+        let mut content = self.split_events[event_start..]
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| match event {
+                SplitInlineEvent::Node(node) if !ignorable(*node) => Some(index + event_start),
+                _ => None,
+            });
+        let first = content.next();
+        let last = content.next_back().or(first);
+        let frame_start = self.inline_frames.len();
+        let event_end = self.split_events.len();
+        for index in event_start..event_end {
+            let event = self.split_events[index];
+            if let SplitInlineEvent::Node(node) = event {
+                if first
+                    .zip(last)
+                    .is_none_or(|(first, last)| index < first || index > last)
+                    && super::inline::node_is_ignorable_at_block_edge(
+                        self.document,
+                        self.styles,
+                        node,
+                        super::inline::style_for_dom_node(self.document, self.styles, node)
+                            .white_space(),
+                    )
+                {
+                    continue;
+                }
+            }
+            let owner = self.inline_frames[frame_start..]
                 .last()
                 .map_or(anonymous_idx, |frame| frame.box_idx);
             match event {
@@ -66,7 +217,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
                 } => {
                     let element = self
                         .document
-                        .element_ref(fragment.node)
+                        .try_element_ref(fragment.node)
                         .expect("layout boxes are only created for element nodes");
                     let frame =
                         self.begin_inline_fragment(element, owner, fragment.style, first_fragment);
@@ -76,13 +227,13 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
                             self.output.push_inline_boundary(frame.box_idx, true, false);
                         }
                     }
-                    fragments.push(frame);
+                    self.inline_frames.push(frame);
                 }
                 SplitInlineEvent::Close {
                     fragment,
                     last_fragment,
                 } => {
-                    let Some(frame) = fragments.pop() else {
+                    let Some(frame) = self.inline_frames.pop() else {
                         continue;
                     };
                     debug_assert_eq!(frame.node, fragment.node);
@@ -111,7 +262,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
                 }
             }
         }
-        debug_assert!(fragments.is_empty());
+        debug_assert_eq!(self.inline_frames.len(), frame_start);
         self.output
             .finish_inline_box(anonymous_idx, item_start)
             .then_some(anonymous_idx)
@@ -120,7 +271,8 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
     pub(super) fn build_inline_children(&mut self, element: ElementRef<'_>, box_idx: u32) {
         let elem_id = element.node_id();
         let start = self.output.item_position();
-        let children: Vec<u32> = element.children().map(|idx| idx.raw()).collect();
+        let mut children = element.children().peekable();
+        let mut render_children = true;
 
         self.append_generated_inline_pseudo(elem_id, box_idx, true);
 
@@ -130,15 +282,39 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
         // generate a line box. This matters in particular when all intervening
         // element children compute to display:none (for example the unusual
         // HTML elements whose display:contents used value is none).
-        let children = if self.styles.before_style_for_node(elem_id).is_none()
+        if self.styles.before_style_for_node(elem_id).is_none()
             && self.styles.after_style_for_node(elem_id).is_none()
         {
             let white_space = self.output.style_for_box(box_idx as usize).white_space();
-            trim_inline_segment_nodes(self.document, self.styles, &children, white_space)
-        } else {
-            &children
-        };
-        self.process_inline_nodes(children.iter().copied(), box_idx);
+            while children.peek().is_some_and(|&node| {
+                super::inline::node_is_ignorable_at_block_edge(
+                    self.document,
+                    self.styles,
+                    node,
+                    white_space,
+                )
+            }) {
+                children.next();
+            }
+            while children.clone().next_back().is_some_and(|node| {
+                super::inline::node_is_ignorable_at_block_edge(
+                    self.document,
+                    self.styles,
+                    node,
+                    white_space,
+                )
+            }) {
+                children.next_back();
+            }
+            if !children.clone().any(|node| {
+                super::inline::node_has_renderable_inline_content(self.document, self.styles, node)
+            }) {
+                render_children = false;
+            }
+        }
+        if render_children {
+            self.process_inline_nodes(children, box_idx);
+        }
 
         if owns_floated_first_letter {
             self.finish_floated_first_letter();
@@ -208,7 +384,16 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
     }
 
     pub(super) fn process_inline_node(&mut self, node_id: DomNodeId, box_idx: u32) {
-        match plan_inline_node(self.document, self.styles, node_id) {
+        self.process_classified_inline_node(node_id, box_idx, None);
+    }
+
+    fn process_classified_inline_node(
+        &mut self,
+        node_id: DomNodeId,
+        box_idx: u32,
+        classification: Option<ElementClassification>,
+    ) {
+        match plan_inline_node(self.document, self.styles, node_id, classification) {
             InlineNodePlan::Ignore => {}
             InlineNodePlan::Text(node) => self.process_text_node_with_contents_style(node, box_idx),
             InlineNodePlan::Break { clear } => {
@@ -228,9 +413,14 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
                 self.append_generated_inline_pseudo(frame.node, frame.box_idx, false);
                 self.finish_inline_fragment(frame, true);
             }
-            InlineNodePlan::OutOfFlow { node, absolute } => {
-                if let Some(element_box) = self.build_box_for_element(node, Some(box_idx)) {
-                    let kind = if absolute {
+            InlineNodePlan::OutOfFlow {
+                node,
+                classification,
+            } => {
+                if let Some(element_box) =
+                    self.build_classified_element(node, Some(box_idx), classification)
+                {
+                    let kind = if classification.absolute {
                         InlineItemKind::AbsoluteAnchor {
                             box_idx: element_box,
                         }
@@ -242,8 +432,13 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
                     self.output.push_item(kind, box_idx, None);
                 }
             }
-            InlineNodePlan::Atomic(node) => {
-                if let Some(element_box) = self.build_box_for_element(node, Some(box_idx)) {
+            InlineNodePlan::Atomic {
+                node,
+                classification,
+            } => {
+                if let Some(element_box) =
+                    self.build_classified_element(node, Some(box_idx), classification)
+                {
                     self.output.push_item(
                         InlineItemKind::AtomicBox {
                             box_idx: element_box,
@@ -257,7 +452,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
                 let node = element.node_id();
                 self.generated.apply_for_node(node);
                 self.append_generated_inline_pseudo(node, box_idx, true);
-                self.process_inline_nodes(element.children().map(DomNodeId::raw), box_idx);
+                self.process_inline_nodes(element.children(), box_idx);
                 self.append_generated_inline_pseudo(node, box_idx, false);
             }
             InlineNodePlan::Element {
@@ -271,7 +466,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
                 element,
             } => {
                 let frame = self.begin_inline_fragment(element, box_idx, style, true);
-                if let Some(image_idx) = storage::image_idx(element) {
+                if let Some(image_idx) = element.image_idx() {
                     self.output
                         .push_item(InlineItemKind::Image { image_idx }, frame.box_idx, None);
                 } else {
@@ -290,7 +485,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
                             self.output.push_inline_boundary(frame.box_idx, true, false);
                         }
                         self.append_generated_inline_pseudo(node, frame.box_idx, true);
-                        self.process_inline_nodes(children.map(DomNodeId::raw), frame.box_idx);
+                        self.process_inline_nodes(children, frame.box_idx);
                         self.append_generated_inline_pseudo(node, frame.box_idx, false);
                         if end_edge {
                             self.output.push_inline_boundary(frame.box_idx, false, true);
@@ -304,48 +499,43 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
 
     pub(super) fn process_inline_nodes(
         &mut self,
-        nodes: impl IntoIterator<Item = u32>,
+        nodes: impl IntoIterator<Item = DomNodeId>,
         box_idx: u32,
     ) {
         let mut table_segment = Vec::new();
         let mut pending_table_whitespace = Vec::new();
         for raw in nodes {
-            let Some(node_id) = self.document.node_id_from_raw(raw) else {
-                continue;
-            };
-            let table_internal = self.document.element_ref(node_id).is_some_and(|element| {
-                display_for_element(self.styles, element).is_table_internal()
-            });
-            if table_internal {
+            let node_id = raw;
+            let classification = self
+                .document
+                .try_element_ref(node_id)
+                .map(|element| ElementClassification::new(self.styles, element));
+            if classification.is_some_and(|value| value.display.is_table_internal()) {
                 table_segment.append(&mut pending_table_whitespace);
                 table_segment.push(raw);
                 continue;
             }
             if !table_segment.is_empty()
-                && matches!(self.document.node_ref(node_id), Some(NodeRef::Text(text)) if text.text().chars().all(char::is_whitespace))
+                && matches!(self.document.node_ref(node_id), NodeRef::Text(text) if text.text().chars().all(char::is_whitespace))
             {
                 pending_table_whitespace.push(raw);
                 continue;
             }
             self.flush_inline_anonymous_table(&mut table_segment, box_idx);
             for whitespace in pending_table_whitespace.drain(..) {
-                if let Some(node) = self.document.node_id_from_raw(whitespace) {
-                    self.process_inline_node(node, box_idx);
-                }
+                self.process_inline_node(whitespace, box_idx);
             }
-            self.process_inline_node(node_id, box_idx);
+            self.process_classified_inline_node(node_id, box_idx, classification);
         }
         self.flush_inline_anonymous_table(&mut table_segment, box_idx);
         for whitespace in pending_table_whitespace {
-            if let Some(node) = self.document.node_id_from_raw(whitespace) {
-                self.process_inline_node(node, box_idx);
-            }
+            self.process_inline_node(whitespace, box_idx);
         }
     }
 
     pub(super) fn flush_inline_anonymous_table(
         &mut self,
-        nodes: &mut Vec<u32>,
+        nodes: &mut Vec<DomNodeId>,
         parent_box_idx: u32,
     ) {
         let Some(table_idx) = self.flush_anonymous_table_segment(nodes, parent_box_idx) else {
@@ -359,13 +549,11 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
     }
 
     pub(super) fn process_text_node(&mut self, node_id: DomNodeId, box_idx: u32) {
-        let Some(text_node) = self.document.text_ref(node_id) else {
-            return;
-        };
+        let text_node = self.document.text_ref(node_id);
         let text = text_node.text();
 
         if self.floated_first_letter.is_none() {
-            self.output.push_source_text(text, box_idx, node_id.raw());
+            self.output.push_source_text(text, box_idx, node_id);
             return;
         }
 
@@ -376,9 +564,10 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
             let target = self.first_letter_target_box(character, box_idx);
             if fragment_target.is_none()
                 && target == box_idx
-                && let Some(capture) = self.floated_first_letter.as_mut().filter(|capture| {
-                    capture.selection.is_done() && capture.item_end.is_none()
-                })
+                && let Some(capture) = self
+                    .floated_first_letter
+                    .as_mut()
+                    .filter(|capture| capture.selection.is_done() && capture.item_end.is_none())
             {
                 capture.item_end = Some(self.output.item_position());
             }
@@ -387,7 +576,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
                 self.output.push_source_text_fragment(
                     fragment,
                     previous,
-                    node_id.raw(),
+                    node_id,
                     source_utf16_offset,
                 );
                 if let Some(capture) = self
@@ -406,10 +595,28 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
             self.output.push_source_text_fragment(
                 &text[fragment_start..],
                 target,
-                node_id.raw(),
+                node_id,
                 source_utf16_offset,
             );
         }
+    }
+
+    /// Resolve the source parent's contents style when text is emitted. This
+    /// also covers text deferred by anonymous-table and flex item grouping.
+    pub(super) fn contents_text_style(&self, node: DomNodeId) -> Option<StyleIndices> {
+        let mut parent = self.document.text_ref(node).parent();
+        while let Some(node) = parent {
+            let element = self.document.element_ref(node);
+            let classification = ElementClassification::new(self.styles, element);
+            if classification.display != Display::Contents {
+                return None;
+            }
+            if let Some(style) = classification.style {
+                return Some(style);
+            }
+            parent = element.parent();
+        }
+        None
     }
 
     pub(super) fn process_text_node_with_contents_style(
@@ -417,7 +624,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
         node_id: DomNodeId,
         box_idx: u32,
     ) {
-        let Some(&style) = self.contents_text_styles.get(&node_id) else {
+        let Some(style) = self.contents_text_style(node_id) else {
             self.process_text_node(node_id, box_idx);
             return;
         };
@@ -550,7 +757,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
 
     pub(super) fn flush_inline_segment(
         &mut self,
-        nodes: &mut Vec<u32>,
+        nodes: &mut Vec<DomNodeId>,
         parent_box_idx: u32,
     ) -> Option<u32> {
         self.flush_inline_segment_with_generated_edges(nodes, parent_box_idx, None, None)
@@ -558,7 +765,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
 
     pub(super) fn flush_inline_segment_with_generated_edges(
         &mut self,
-        nodes: &mut Vec<u32>,
+        nodes: &mut Vec<DomNodeId>,
         parent_box_idx: u32,
         before: Option<DomNodeId>,
         after: Option<DomNodeId>,
@@ -583,9 +790,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
             self.append_generated_inline_pseudo(origin, anonymous_idx, true);
         }
         for &node_idx in segment {
-            let Some(node_id) = self.document.node_id_from_raw(node_idx) else {
-                continue;
-            };
+            let node_id = node_idx;
             self.process_inline_node(node_id, anonymous_idx);
         }
         if let Some(origin) = after {

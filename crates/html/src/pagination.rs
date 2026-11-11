@@ -5,11 +5,13 @@ pub use composition::{PaginationMode, PaginationScratch, Paginator};
 pub use html_engine_model::{
     LineScreen, PageGeometry, PagePositions, PageRequest, RepeatedTableHeader, VisibleLinePositions,
 };
+mod projection;
+mod table_fragments;
 mod position;
 pub use position::{DocumentPosition, ReflowAnchor, document_position};
 mod view;
-pub use view::{PageReadingLine, PageView};
 pub(crate) use html_pipeline::engine::PaginationTarget;
+pub use view::{PageReadingLine, PageView};
 
 /// A resolved page boundary in document coordinates. A cursor preserves group
 /// identity when multiple groups share an offset; an offset alone is available

@@ -26,7 +26,7 @@ for operations outside that boundary.
 | `selection` | Per-view interaction controller, selection painting, hit queries and lazy export. |
 | `geometry` | Queries over caller-supplied line placements. |
 | `search` | Source search, rendered-document search state and compiled visible-text matching. |
-| `scoped` | Independently laid-out content sharing its owner's resources. |
+| `scoped` | Independently laid-out content borrowing its owner's preparation. |
 | `render` | Painting callbacks, projections, document painting and recorded scenes. |
 | `export` | Image and equation requests and portable output payloads. |
 | `revisions`, `targets` | Published product versions, source targets and link resolution. |
@@ -79,6 +79,17 @@ context, and rejects matches across unpainted gaps.
 Readers format source addresses and choose annotation scope and appearance.
 
 `Paginator::new(view, geometry, mode)` creates a lightweight composition view.
+For float-aware pagination, set `DocumentUpdate::height(Some(column_height))`
+to the same height as the paginator's columns before composing. Layout resolves
+float destinations and wrapped text against that height; changing it triggers
+layout again. Changing only paginator geometry cannot
+recompute the text wrapping around floats. Use
+`DocumentUpdate::image_sizing_policy(ImageSizingPolicy::SmartStandalone)` to shrink
+oversized images proportionally to fit the column, including authored CSS heights
+and HTML dimensions. Fitting happens before wrapping, without a second layout
+pass. Images already within the limits keep their resolved size. `WebCompatible`
+retains CSS image sizing. Images stay whole between columns.
+
 `compose(request, positions_buffer, scratch)` accepts `PageRequest::StartingAt`
 for a pagination cursor, `StartingAtOffset` for initial/restored document geometry,
 or `EndingAt` for a final cursor. The request determines traversal; there is no
@@ -160,8 +171,10 @@ navigation; synthesis chunking and target queries remain available independently
 
 `Document::scope` lays out an element independently. `ScopedContent` provides a
 render view, recorded scene, `interact` and `paint_selection`. Scopes use the
-same controller and keep their own selection. They share their owner's
-resources and reject replaced or invalidated products. Resource polling reports
+same controller for selection, link hover and pointer leave. Each scope owns
+its glyph registrations, borrows its owner's preparation and rejects replaced
+or invalidated products. Recorded scope scenes keep their registrations alive
+and also track parent validity. Resource polling reports
 decoded changes separately from pending layout changes. `request_images` accepts
 an optional composed page, a page-sized lookahead count and owned scopes. The
 engine selects lines and discovers/deduplicates their images; hosts choose
@@ -170,16 +183,31 @@ prefetch timing, lookahead and scope ownership.
 ## Backend ownership
 
 `GlyphShaper` receives resolved properties through borrowed requests and returns
-native paint handles and measured geometry. Basic backends return
-`ShapedGlyph::new` with `FontMetrics`. Native adapters own font selection,
+native paint handles and measured geometry for complete text runs, including
+inserted single characters. Basic backends use `ShapedRun::characters` with
+`ShapedGlyph` paint entries and `FontMetrics`. Native adapters own font selection,
 OpenType conversion, run construction and caches; their implementation helpers
 are outside the facade.
 
 `Painter`, `PaintProjection` and `DocumentPainter` keep host placement separate
 from CSS interpretation and paint order. Recorded scenes retain resource
-validity and refuse to replay invalidated commands. Native resources and their
-append/replacement transactions retain rollback behavior without copying their
-buffers.
+validity and refuse to replay invalidated commands. Engine registrations have
+a ledger identity independent of the backend's native resource generation.
+Checkpoints validate both their ledger and surviving prefix; engine failures
+restore registrations without rewinding caller-owned caches. Borrowed native
+values remain the caller's responsibility until an explicit cache reset;
+retained entries stay alive through layout and scene references.
+
+`GlyphShaper` has five methods: publication font selection, native resource
+generation, scratch finalization, font-relative metrics and run shaping.
+Only generation and run shaping are required. Each run result supplies its
+paint entries; the engine never calls a separate character-shaping operation.
+The engine owns registration transactions; the backend owns cache eviction.
+
+Selection input and painting also handle link hover. `PointerLeave` clears the
+underline without ending a captured selection. Pages, scopes and native
+continuous fragments share this behavior; clipboard text is exported only on
+request.
 
 ## Implementation crates
 

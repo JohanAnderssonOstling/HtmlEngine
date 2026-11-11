@@ -260,6 +260,13 @@ impl Font {
 
     pub fn open_type_features(&self) -> Vec<OpenTypeFeature> {
         let mut merged = Vec::new();
+        self.append_open_type_features(&mut merged);
+        merged
+    }
+
+    /// Append merged settings without allocating a temporary feature vector.
+    pub fn append_open_type_features(&self, merged: &mut Vec<OpenTypeFeature>) {
+        let start = merged.len();
         for feature in self
             .font_variant_caps_features
             .iter()
@@ -269,16 +276,15 @@ impl Font {
             .chain(&self.font_feature_settings)
             .copied()
         {
-            if let Some(index) = merged
+            if let Some(index) = merged[start..]
                 .iter()
                 .position(|existing: &OpenTypeFeature| open_type::open_type_feature_tag_bytes(*existing) == open_type::open_type_feature_tag_bytes(feature))
             {
-                merged[index] = feature;
+                merged[start + index] = feature;
             } else {
                 merged.push(feature);
             }
         }
-        merged
     }
 }
 
@@ -995,6 +1001,30 @@ pub struct StyleIndices {
     bg_idx: u32,
 }
 
+/// A computed group can reuse an existing store entry without copying or
+/// hashing it. The builder checks that inherited handles belong to its store.
+#[derive(Debug)]
+pub enum ComputedStyleGroup<T> {
+    Inherited(StyleIndices),
+    Owned(T),
+}
+
+impl<T: Clone> Clone for ComputedStyleGroup<T> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Inherited(indices) => Self::Inherited(*indices),
+            Self::Owned(value) => Self::Owned(value.clone()),
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        match (self, source) {
+            (Self::Owned(value), Self::Owned(source)) => value.clone_from(source),
+            (target, source) => *target = source.clone(),
+        }
+    }
+}
+
 /// An opaque index into the string table owned by one computed-style result.
 ///
 /// CSS-created strings deliberately do not use the parsed document's string
@@ -1074,7 +1104,7 @@ pub struct GeneratedContent {
 
 #[derive(Clone, Debug)]
 struct GeneratedPseudoStyle {
-    node: u32,
+    node: DomNodeId,
     style: StyleIndices,
     content: GeneratedContent,
     counters: CounterDirectives,
@@ -1090,13 +1120,15 @@ pub struct ComputedStyles {
     reader_paragraph_spacing_em: Option<f32>,
     reader_first_line_indent_em: Option<f32>,
     document_lineage: DocumentLineage,
+    // Only elements carry styles; text inherits through its parent.
     node_styles: Vec<Option<StyleIndices>>,
-    first_line_styles: Vec<(u32, StyleIndices)>,
-    first_letter_styles: Vec<(u32, StyleIndices)>,
-    before_first_letter_styles: Vec<(u32, StyleIndices)>,
+    source_node_count: usize,
+    first_line_styles: Vec<(DomNodeId, StyleIndices)>,
+    first_letter_styles: Vec<(DomNodeId, StyleIndices)>,
+    before_first_letter_styles: Vec<(DomNodeId, StyleIndices)>,
     before_styles: Vec<GeneratedPseudoStyle>,
     after_styles: Vec<GeneratedPseudoStyle>,
-    counter_directives: Vec<(u32, CounterDirectives)>,
+    counter_directives: Vec<(DomNodeId, CounterDirectives)>,
     anonymous_box_styles: Vec<u32>,
     store: StyleStore,
     strings: Vec<Box<str>>,
@@ -1648,14 +1680,15 @@ pub struct ComputedStylesBuilder {
     reader_paragraph_spacing_em: Option<f32>,
     reader_first_line_indent_em: Option<f32>,
     document_lineage: DocumentLineage,
+    // Only elements carry styles; text inherits through its parent.
     node_styles: Vec<Option<StyleIndices>>,
-    first_line_styles: Vec<(u32, StyleIndices)>,
-    first_letter_styles: Vec<(u32, StyleIndices)>,
-    before_first_letter_styles: Vec<(u32, StyleIndices)>,
+    source_node_count: usize,
+    first_line_styles: Vec<(DomNodeId, StyleIndices)>,
+    first_letter_styles: Vec<(DomNodeId, StyleIndices)>,
+    before_first_letter_styles: Vec<(DomNodeId, StyleIndices)>,
     before_styles: Vec<GeneratedPseudoStyle>,
     after_styles: Vec<GeneratedPseudoStyle>,
-    counter_directives: Vec<(u32, CounterDirectives)>,
-    element_nodes: Vec<bool>,
+    counter_directives: Vec<(DomNodeId, CounterDirectives)>,
     store: StyleStore,
     strings: StringTable,
 }
@@ -2350,6 +2383,9 @@ impl ComputedStylesBuilder {
     }
 
     pub fn style_for_node(&self, node_idx: DomNodeId) -> Option<StyleIndices> {
+        if node_idx.is_text() {
+            return None;
+        }
         self.node_styles.get(node_idx.index()).copied().flatten()
     }
 
@@ -2388,22 +2424,18 @@ impl ComputedStylesBuilder {
     pub fn new(document: &Document) -> Self {
         let mut store = StyleStore::new(next_style_store_id());
         store.ensure_defaults();
-        let element_nodes = document
-            .nodes()
-            .map(|(_, node)| matches!(node, NodeRef::Element(_)))
-            .collect();
         Self {
             reader_paragraph_spacing_em: None,
             reader_first_line_indent_em: None,
             document_lineage: document.lineage().clone(),
-            node_styles: vec![None; document.node_count()],
+            node_styles: vec![None; document.element_count()],
+            source_node_count: document.node_count(),
             first_line_styles: Vec::new(),
             first_letter_styles: Vec::new(),
             before_first_letter_styles: Vec::new(),
             before_styles: Vec::new(),
             after_styles: Vec::new(),
             counter_directives: Vec::new(),
-            element_nodes,
             store,
             strings: StringTable::default(),
         }
@@ -2411,13 +2443,37 @@ impl ComputedStylesBuilder {
 
     /// Store a metric-relative computed length with its declaring font.
     /// The coefficients already include that element's computed font size.
-    pub fn font_relative_text_spacing(&mut self, font: Font, components: [f32; 4]) -> Option<TextSpacing> {
-        if !components.into_iter().all(f32::is_finite) { return None; }
+    pub fn font_relative_text_spacing(
+        &mut self,
+        font: Font,
+        components: [f32; 4],
+    ) -> Option<TextSpacing> {
+        self.font_relative_text_spacing_group(ComputedStyleGroup::Owned(font), components)
+    }
+
+    pub fn font_relative_text_spacing_group(
+        &mut self,
+        font: ComputedStyleGroup<Font>,
+        components: [f32; 4],
+    ) -> Option<TextSpacing> {
+        if !components.into_iter().all(f32::is_finite) {
+            return None;
+        }
         let [absolute_px, x_height_px, ch_advance_px, cap_height_px] = components;
         if x_height_px == 0.0 && ch_advance_px == 0.0 && cap_height_px == 0.0 {
             return TextSpacing::from_px(absolute_px);
         }
-        let font_idx = intern_style(&mut self.store.font_styles, &mut self.store.font_dedup, font);
+        let font_idx = match font {
+            ComputedStyleGroup::Inherited(indices) => {
+                self.store.font_style(indices)?;
+                indices.font_idx
+            }
+            ComputedStyleGroup::Owned(value) => intern_style(
+                &mut self.store.font_styles,
+                &mut self.store.font_dedup,
+                value,
+            ),
+        };
         Some(TextSpacing {
             absolute_px, x_height_px, ch_advance_px, cap_height_px,
             metric_origin: font_idx.checked_add(1)?,
@@ -2546,25 +2602,83 @@ impl ComputedStylesBuilder {
         layout: LayoutStyle,
         radii: BorderRadii,
     ) -> Result<StyleIndices, ComputedStyleValueError> {
-        font.validate(self.store.store_id)?;
-        text.validate(self.store.store_id)?;
+        self.push_with_inherited_groups(
+            ComputedStyleGroup::Owned(font),
+            ComputedStyleGroup::Owned(text),
+            box_model,
+            border,
+            background,
+            layout,
+            radii,
+        )
+    }
+
+    /// Retain inherited font/text IDs; only owned groups are hashed and interned.
+
+    pub fn push_with_inherited_groups(
+        &mut self,
+        font: ComputedStyleGroup<Font>,
+        text: ComputedStyleGroup<InheritedText>,
+        box_model: BoxModel,
+        border: Border,
+        background: Background,
+        layout: LayoutStyle,
+        radii: BorderRadii,
+    ) -> Result<StyleIndices, ComputedStyleValueError> {
+        match &font {
+            ComputedStyleGroup::Owned(value) => value.validate(self.store.store_id)?,
+            ComputedStyleGroup::Inherited(indices) if self.store.owns(*indices) => {}
+            _ => {
+                return Err(ComputedStyleValueError::InvalidStructure {
+                    property: "font",
+                    field: "inherited style",
+                });
+            }
+        }
+        match &text {
+            ComputedStyleGroup::Owned(value) => value.validate(self.store.store_id)?,
+            ComputedStyleGroup::Inherited(indices) if self.store.owns(*indices) => {}
+            _ => {
+                return Err(ComputedStyleValueError::InvalidStructure {
+                    property: "text",
+                    field: "inherited style",
+                });
+            }
+        }
         box_model.validate(self.store.store_id)?;
         border.validate(self.store.store_id)?;
         background.validate(self.store.store_id)?;
         layout.validate(self.store.store_id)?;
         radii.validate()?;
-
-        Ok(self
-            .store
-            .push(font, text, box_model, border, background, layout, radii))
+        let font_idx = match font {
+            ComputedStyleGroup::Inherited(indices) => indices.font_idx,
+            ComputedStyleGroup::Owned(value) => intern_style(
+                &mut self.store.font_styles,
+                &mut self.store.font_dedup,
+                value,
+            ),
+        };
+        let text_idx = match text {
+            ComputedStyleGroup::Inherited(indices) => indices.text_idx,
+            ComputedStyleGroup::Owned(value) => intern_style(
+                &mut self.store.text_styles,
+                &mut self.store.text_dedup,
+                value,
+            ),
+        };
+        Ok(self.store.push_groups(
+            font_idx, text_idx, box_model, border, background, layout, radii,
+        ))
     }
 
     fn element_node_index(&self, node_idx: DomNodeId) -> Result<usize, ComputedStylesBuildError> {
         let node = node_idx.index();
-        match self.element_nodes.get(node) {
-            Some(true) => Ok(node),
-            Some(false) => Err(ComputedStylesBuildError::TextNodeCannotHaveStyle { node }),
-            None => Err(ComputedStylesBuildError::NodeOutOfBounds { node }),
+        if node_idx.is_text() {
+            Err(ComputedStylesBuildError::TextNodeCannotHaveStyle { node })
+        } else if node < self.node_styles.len() {
+            Ok(node)
+        } else {
+            Err(ComputedStylesBuildError::NodeOutOfBounds { node })
         }
     }
 
@@ -2604,7 +2718,7 @@ impl ComputedStylesBuilder {
         if !self.store.contains(style) {
             return Err(ComputedStylesBuildError::InvalidStyleIndex { node });
         }
-        set_node_value(&mut self.before_first_letter_styles, node as u32, style);
+        set_node_value(&mut self.before_first_letter_styles, node_idx, style);
         Ok(())
     }
 
@@ -2645,20 +2759,19 @@ impl ComputedStylesBuilder {
         } else {
             &mut self.after_styles
         };
-        if let Some(existing) = target
-            .iter_mut()
-            .find(|candidate| candidate.node == node as u32)
-        {
-            existing.style = style;
-            existing.content = content;
-            existing.counters = counters;
+        let value = GeneratedPseudoStyle {
+            node: node_idx,
+            style,
+            content,
+            counters,
+        };
+        if target.last().is_none_or(|last| last.node < value.node) {
+            target.push(value);
         } else {
-            target.push(GeneratedPseudoStyle {
-                node: node as u32,
-                style,
-                content,
-                counters,
-            });
+            match target.binary_search_by_key(&value.node, |entry| entry.node) {
+                Ok(index) => target[index] = value,
+                Err(index) => target.insert(index, value),
+            }
         }
         Ok(())
     }
@@ -2668,8 +2781,8 @@ impl ComputedStylesBuilder {
         node_idx: DomNodeId,
         counters: CounterDirectives,
     ) -> Result<(), ComputedStylesBuildError> {
-        let node = self.element_node_index(node_idx)?;
-        set_node_value(&mut self.counter_directives, node as u32, counters);
+        self.element_node_index(node_idx)?;
+        set_node_value(&mut self.counter_directives, node_idx, counters);
         Ok(())
     }
 
@@ -2688,7 +2801,7 @@ impl ComputedStylesBuilder {
         } else {
             &mut self.first_letter_styles
         };
-        set_node_value(target, node as u32, style);
+        set_node_value(target, node_idx, style);
         Ok(())
     }
 
@@ -2711,7 +2824,7 @@ impl ComputedStylesBuilder {
             self.apply_reader_paragraph_overrides(document, overrides);
             return;
         }
-        debug_assert_eq!(self.node_styles.len(), document.node_count());
+        debug_assert_eq!(self.node_styles.len(), document.element_count());
 
         let families: Vec<_> = self
             .store
@@ -2758,13 +2871,11 @@ impl ComputedStylesBuilder {
         let mut sources = Vec::new();
         sources.push((default_style, false));
         for (node, node_ref) in document.nodes() {
-            if !matches!(node_ref, NodeRef::Element(_)) {
+            let NodeRef::Element(element) = node_ref else {
                 continue;
-            }
+            };
             if let Some(style) = self.node_styles[node.index()] {
-                let page_edge = document
-                    .element_ref(node)
-                    .is_some_and(|element| matches!(element.tag(), "html" | "body"));
+                let page_edge = matches!(element.tag(), "html" | "body");
                 sources.push((style, page_edge));
             }
         }
@@ -2850,13 +2961,11 @@ impl ComputedStylesBuilder {
             remapped.insert((original, page_edge), adjusted);
         }
         for (node, node_ref) in document.nodes() {
-            if !matches!(node_ref, NodeRef::Element(_)) {
+            let NodeRef::Element(element) = node_ref else {
                 continue;
-            }
+            };
             if let Some(style) = &mut self.node_styles[node.index()] {
-                let page_edge = document
-                    .element_ref(node)
-                    .is_some_and(|element| matches!(element.tag(), "html" | "body"));
+                let page_edge = matches!(element.tag(), "html" | "body");
                 *style = remapped[&(*style, page_edge)];
             }
         }
@@ -2892,14 +3001,13 @@ impl ComputedStylesBuilder {
 
     fn apply_link_foreground(&mut self, document: &Document, color: Option<u32>) {
         let Some(color) = color else { return };
-        let mut linked = vec![false; document.node_count()];
-        for (node, _) in document.nodes() {
+        let mut linked = vec![false; document.element_count()];
+        for node in document.element_ids() {
             linked[node.index()] = std::iter::once(node)
                 .chain(document.dom_ancestors(node))
                 .any(|ancestor| {
-                    document.element_ref(ancestor).is_some_and(|element| {
-                        element.tag().eq_ignore_ascii_case("a") && element.attr("href").is_some()
-                    })
+                    let element = document.element_ref(ancestor);
+                    element.tag().eq_ignore_ascii_case("a") && element.attr("href").is_some()
                 });
         }
         let store = &mut self.store;
@@ -2917,12 +3025,12 @@ impl ComputedStylesBuilder {
             .chain(self.first_letter_styles.iter_mut())
             .chain(self.before_first_letter_styles.iter_mut())
         {
-            if linked[*node as usize] {
+            if linked[node.index()] {
                 recolor(style);
             }
         }
         for pseudo in self.before_styles.iter_mut().chain(self.after_styles.iter_mut()) {
-            if linked[pseudo.node as usize] {
+            if linked[pseudo.node.index()] {
                 recolor(&mut pseudo.style);
             }
         }
@@ -2933,13 +3041,8 @@ impl ComputedStylesBuilder {
         self.store
             .validate_values()
             .map_err(ComputedStylesBuildError::InvalidStyleValue)?;
-        for (node, (&is_element, style)) in self
-            .element_nodes
-            .iter()
-            .zip(self.node_styles.iter().copied())
-            .enumerate()
-        {
-            if is_element && style.is_none() {
+        for (node, style) in self.node_styles.iter().copied().enumerate() {
+            if style.is_none() {
                 return Err(ComputedStylesBuildError::MissingElementStyle { node });
             }
             if let Some(indices) = style
@@ -2955,6 +3058,7 @@ impl ComputedStylesBuilder {
             reader_first_line_indent_em: self.reader_first_line_indent_em,
             document_lineage: self.document_lineage,
             node_styles: self.node_styles,
+            source_node_count: self.source_node_count,
             first_line_styles: self.first_line_styles,
             first_letter_styles: self.first_letter_styles,
             before_first_letter_styles: self.before_first_letter_styles,
@@ -2968,11 +3072,16 @@ impl ComputedStylesBuilder {
     }
 }
 
-fn set_node_value<T>(entries: &mut Vec<(u32, T)>, node: u32, value: T) {
-    if let Some((_, existing)) = entries.iter_mut().find(|(candidate, _)| *candidate == node) {
-        *existing = value;
-    } else {
+// Keep sparse node tables sorted during construction. Normal DOM-order writes
+// append directly; out-of-order writes insert or replace at the matching key.
+fn set_node_value<T>(entries: &mut Vec<(DomNodeId, T)>, node: DomNodeId, value: T) {
+    if entries.last().is_none_or(|last| last.0 < node) {
         entries.push((node, value));
+    } else {
+        match entries.binary_search_by_key(&node, |entry| entry.0) {
+            Ok(index) => entries[index].1 = value,
+            Err(index) => entries.insert(index, (node, value)),
+        }
     }
 }
 
@@ -3350,6 +3459,9 @@ impl ComputedStyles {
     }
 
     pub fn style_for_node(&self, node_idx: DomNodeId) -> Option<StyleIndices> {
+        if node_idx.is_text() {
+            return None;
+        }
         self.node_styles.get(node_idx.index()).copied().flatten()
     }
 
@@ -3400,15 +3512,13 @@ impl ComputedStyles {
         let overrides = &adjusted_overrides;
         let mut builder = ComputedStylesBuilder::new(document);
         for (node, node_ref) in document.nodes() {
-            if !matches!(node_ref, NodeRef::Element(_)) {
+            let NodeRef::Element(element) = node_ref else {
                 continue;
-            }
+            };
             let indices = self
                 .style_for_node(node)
                 .ok_or(ComputedStylesBuildError::MissingElementStyle { node: node.index() })?;
-            let override_background = document
-                .element_ref(node)
-                .is_some_and(|element| matches!(element.tag(), "html" | "body"));
+            let override_background = matches!(element.tag(), "html" | "body");
             let style = reintern_with_reader_overrides(
                 self,
                 &mut builder,
@@ -3422,36 +3532,23 @@ impl ComputedStyles {
                 builder.set_counter_directives(node, counters)?;
             }
         }
-        for &(raw, indices) in &self.first_line_styles {
-            let node = document
-                .node_id_from_raw(raw)
-                .ok_or(ComputedStylesBuildError::NodeOutOfBounds { node: raw as usize })?;
+        for &(node, indices) in &self.first_line_styles {
             let style =
                 reintern_with_reader_overrides(self, &mut builder, indices, overrides, false)?;
             builder.set_first_line_style(node, style)?;
         }
-        for &(raw, indices) in &self.first_letter_styles {
-            let node = document
-                .node_id_from_raw(raw)
-                .ok_or(ComputedStylesBuildError::NodeOutOfBounds { node: raw as usize })?;
+        for &(node, indices) in &self.first_letter_styles {
             let style =
                 reintern_with_reader_overrides(self, &mut builder, indices, overrides, false)?;
             builder.set_first_letter_style(node, style)?;
         }
-        for &(raw, indices) in &self.before_first_letter_styles {
-            let node = document
-                .node_id_from_raw(raw)
-                .ok_or(ComputedStylesBuildError::NodeOutOfBounds { node: raw as usize })?;
+        for &(node, indices) in &self.before_first_letter_styles {
             let style =
                 reintern_with_reader_overrides(self, &mut builder, indices, overrides, false)?;
             builder.set_before_first_letter_style(node, style)?;
         }
         for pseudo in &self.before_styles {
-            let node = document.node_id_from_raw(pseudo.node).ok_or(
-                ComputedStylesBuildError::NodeOutOfBounds {
-                    node: pseudo.node as usize,
-                },
-            )?;
+            let node = pseudo.node;
             let style =
                 reintern_with_reader_overrides(self, &mut builder, pseudo.style, overrides, false)?;
             let content = reintern_generated_content(self, &mut builder, &pseudo.content);
@@ -3459,11 +3556,7 @@ impl ComputedStyles {
             builder.set_before_style(node, style, content, counters)?;
         }
         for pseudo in &self.after_styles {
-            let node = document.node_id_from_raw(pseudo.node).ok_or(
-                ComputedStylesBuildError::NodeOutOfBounds {
-                    node: pseudo.node as usize,
-                },
-            )?;
+            let node = pseudo.node;
             let style =
                 reintern_with_reader_overrides(self, &mut builder, pseudo.style, overrides, false)?;
             let content = reintern_generated_content(self, &mut builder, &pseudo.content);
@@ -3500,7 +3593,7 @@ impl ComputedStyles {
     }
 
     pub fn node_count(&self) -> usize {
-        self.node_styles.len()
+        self.source_node_count
     }
 
     /// Whether a first-letter style can apply to publication or generated text.
@@ -3557,20 +3650,23 @@ impl ComputedStyles {
     }
     pub fn first_line_style_for_node(&self, node_idx: DomNodeId) -> Option<StyleIndices> {
         self.first_line_styles
-            .iter()
-            .find_map(|(node, style)| (*node == node_idx.raw()).then_some(*style))
+            .binary_search_by_key(&node_idx, |entry| entry.0)
+            .ok()
+            .map(|index| self.first_line_styles[index].1)
     }
 
     pub fn first_letter_style_for_node(&self, node_idx: DomNodeId) -> Option<StyleIndices> {
         self.first_letter_styles
-            .iter()
-            .find_map(|(node, style)| (*node == node_idx.raw()).then_some(*style))
+            .binary_search_by_key(&node_idx, |entry| entry.0)
+            .ok()
+            .map(|index| self.first_letter_styles[index].1)
     }
 
     pub fn before_first_letter_style_for_node(&self, node_idx: DomNodeId) -> Option<StyleIndices> {
         self.before_first_letter_styles
-            .iter()
-            .find_map(|(node, style)| (*node == node_idx.raw()).then_some(*style))
+            .binary_search_by_key(&node_idx, |entry| entry.0)
+            .ok()
+            .map(|index| self.before_first_letter_styles[index].1)
     }
 
     pub fn before_style_for_node(
@@ -3599,15 +3695,17 @@ impl ComputedStyles {
             &self.after_styles
         };
         pseudos
-            .iter()
-            .find(|pseudo| pseudo.node == node_idx.raw())
+            .binary_search_by_key(&node_idx, |pseudo| pseudo.node)
+            .ok()
+            .map(|index| &pseudos[index])
             .map(|pseudo| (pseudo.style, &pseudo.content, &pseudo.counters))
     }
 
     pub fn counter_directives_for_node(&self, node_idx: DomNodeId) -> Option<&CounterDirectives> {
         self.counter_directives
-            .iter()
-            .find_map(|(node, counters)| (*node == node_idx.raw()).then_some(counters))
+            .binary_search_by_key(&node_idx, |entry| entry.0)
+            .ok()
+            .map(|index| &self.counter_directives[index].1)
     }
 
     pub fn string(&self, id: StyleStringId) -> Option<&str> {
@@ -3645,19 +3743,21 @@ impl ComputedStyles {
         if !self.document_lineage.matches(document.lineage()) {
             return Err(ComputedStylesValidationError::WrongDocument);
         }
-        if self.node_styles.len() != document.node_count() {
+        if self.source_node_count != document.node_count()
+            || self.node_styles.len() != document.element_count()
+        {
             return Err(ComputedStylesValidationError::WrongNodeCount {
                 expected: document.node_count(),
-                actual: self.node_styles.len(),
+                actual: self.source_node_count,
             });
         }
-        for (node_id, style) in document.node_ids().zip(self.node_styles.iter().copied()) {
+        for (node_id, style) in document.element_ids().zip(self.node_styles.iter().copied()) {
             let node = node_id.index();
             match (document.node_ref(node_id), style) {
-                (Some(NodeRef::Element(_)), None) => {
+                (NodeRef::Element(_), None) => {
                     return Err(ComputedStylesValidationError::MissingElementStyle { node });
                 }
-                (Some(NodeRef::Text(_)), Some(_)) => {
+                (NodeRef::Text(_), Some(_)) => {
                     return Err(ComputedStylesValidationError::UnexpectedTextStyle { node });
                 }
                 (_, Some(indices)) if !self.store.contains(indices) => {
@@ -3666,18 +3766,13 @@ impl ComputedStyles {
                 _ => {}
             }
         }
-        for &(raw, indices) in self
+        for &(node_id, indices) in self
             .first_line_styles
             .iter()
             .chain(&self.first_letter_styles)
             .chain(&self.before_first_letter_styles)
         {
-            let Some(node_id) = document.node_id_from_raw(raw) else {
-                return Err(ComputedStylesValidationError::InvalidStyleIndex {
-                    node: raw as usize,
-                });
-            };
-            if !matches!(document.node_ref(node_id), Some(NodeRef::Element(_))) {
+            if !matches!(document.node_ref(node_id), NodeRef::Element(_)) {
                 return Err(ComputedStylesValidationError::UnexpectedTextStyle {
                     node: node_id.index(),
                 });
@@ -3689,12 +3784,8 @@ impl ComputedStyles {
             }
         }
         for pseudo in self.before_styles.iter().chain(&self.after_styles) {
-            let Some(node_id) = document.node_id_from_raw(pseudo.node) else {
-                return Err(ComputedStylesValidationError::InvalidStyleIndex {
-                    node: pseudo.node as usize,
-                });
-            };
-            if !matches!(document.node_ref(node_id), Some(NodeRef::Element(_))) {
+            let node_id = pseudo.node;
+            if !matches!(document.node_ref(node_id), NodeRef::Element(_)) {
                 return Err(ComputedStylesValidationError::UnexpectedTextStyle {
                     node: node_id.index(),
                 });
@@ -3971,12 +4062,11 @@ impl StyleStore {
         }
     }
 
-    /// Intern one computed style block, sharing each sub-style's index with an
-    /// identical existing one. Returns the indices that address it.
-    pub fn push(
+    /// Intern reset groups alongside already resolved inherited group indices.
+    fn push_groups(
         &mut self,
-        font: Font,
-        text: InheritedText,
+        font_idx: u32,
+        text_idx: u32,
         mut box_model: BoxModel,
         mut border: Border,
         background: Background,
@@ -3992,8 +4082,8 @@ impl StyleStore {
         );
         StyleIndices {
             store_id: self.store_id,
-            font_idx: intern_style(&mut self.font_styles, &mut self.font_dedup, font),
-            text_idx: intern_style(&mut self.text_styles, &mut self.text_dedup, text),
+            font_idx,
+            text_idx,
             box_idx: intern_style(&mut self.box_styles, &mut self.box_dedup, box_model),
             border_idx: intern_style(&mut self.border_styles, &mut self.border_dedup, border),
             bg_idx: intern_style(&mut self.bg_styles, &mut self.bg_dedup, background),

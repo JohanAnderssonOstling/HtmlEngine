@@ -2,30 +2,34 @@
 
 
 #[cfg(test)]
-use html_pipeline::engine::geometry_queries;
-#[cfg(test)]
-use html_pipeline::engine::text_paint;
 #[cfg(test)]
 use html_engine_model::layout_state;
 use std::panic::Location;
+use std::rc::Rc;
 use std::sync::Arc;
+use std::collections::HashSet;
 
 use gpui::{
-    App, AvailableSpace, Bounds, ClipboardItem, ContentMask, CursorStyle, Element, ElementId,
-    Entity, GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId, IntoElement,
-    KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    SharedString, Size, Style, Window, fill, point, px, relative, size,
-};
+    App, AvailableSpace, Bounds, ClipboardItem, ContentMask, Context, CursorStyle, Element,
+    ElementId, Entity, FocusHandle, GlobalElementId, Hitbox, HitboxBehavior, Hsla,
+    InspectorElementId, IntoElement, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
+    MouseExitEvent, MouseMoveEvent, MouseUpEvent, Pixels, ScrollHandle, SharedString, Size, Style,
+    Task, Window, point, px, relative, size};
 use html::layout::RenderView;
 use html::render::SceneImagePolicy;
-use html_pipeline::{PipelineChanges, PipelineError, PipelineInputs, PipelineSession, StyleEnvironment, MarkupSyntax, MediaEnvironment};
-use html_pipeline::engine::{LayoutConstraints, LayoutConstraintError};
+use html::targets::{DocumentTarget, ResolvedDestination, resolve_link};
+use html_pipeline::{
+    PipelineChanges, PipelineError, PipelineInputs, PipelineSession, StyleEnvironment,
+    MarkupSyntax, MediaEnvironment};
+use html_pipeline::engine::{
+    LayoutConstraints, LayoutConstraintError, root_font_size_new};
 use html::text::GlyphShaper;
 use html_resources::resources::provider::NoResources;
+use html_resources::{ResourceProvider, ImagePipeline, ImageService, BlockingJob, BlockingJobSpawner};
 use html_render_core::{self as render_core, RenderScene, SceneOptions};
 
 use crate::fragment_selection::FragmentSelection;
-use crate::paint::{GpuiCommandPainter, GpuiScene};
+use crate::paint::{GpuiCommandPainter, GpuiScene, ImageCache};
 use crate::text::GpuiTextCache;
 
 /// Natural-height HTML, with shaping and painting shared with the reader.
@@ -37,6 +41,9 @@ pub struct HtmlFragmentElement {
     styles: Vec<String>,
     text_color: Option<Hsla>,
     selection_color: Option<Hsla>,
+    on_link: Option<Rc<dyn Fn(&str, &mut Window, &mut App)>>,
+    resources: Option<Arc<HtmlFragmentResources>>,
+    scroll: Option<ScrollHandle>,
     state: Option<Entity<FragmentState>>,
 }
 
@@ -48,6 +55,9 @@ impl HtmlFragmentElement {
             styles: Vec::new(),
             text_color: None,
             selection_color: None,
+            on_link: None,
+            resources: None,
+            scroll: None,
             state: None,
         }
     }
@@ -72,6 +82,25 @@ impl HtmlFragmentElement {
         self
     }
 
+    /// Handle link activation, for example to resolve relative article links.
+    pub fn on_link(mut self, callback: impl Fn(&str, &mut Window, &mut App) + 'static) -> Self {
+        self.on_link = Some(Rc::new(callback));
+        self
+    }
+
+    /// Supply a document address, resource resolver and asynchronous image service.
+    /// The service's owner notifies its host when image jobs complete.
+    pub fn resources(mut self, resources: Arc<HtmlFragmentResources>) -> Self {
+        self.resources = Some(resources);
+        self
+    }
+
+    /// Enclosing scroll container used to reveal same-document link targets.
+    pub fn scroll_handle(mut self, scroll: &ScrollHandle) -> Self {
+        self.scroll = Some(scroll.clone());
+        self
+    }
+
     /// Justified paragraphs select Knuth–Plass in the HTML engine, including
     /// under its web-compatible composition policy.
     pub fn justify(self) -> Self {
@@ -79,10 +108,40 @@ impl HtmlFragmentElement {
     }
 }
 
+/// Caller-owned resource context shared across renders of one fragment.
+pub struct HtmlFragmentResources {
+    uri: String,
+    provider: Arc<dyn ResourceProvider>,
+    images: ImageService,
+}
+
+impl HtmlFragmentResources {
+    pub fn new(uri: String, provider: Arc<dyn ResourceProvider>, images: ImageService) -> Self {
+        Self {
+            uri,
+            provider,
+            images,
+        }
+    }
+}
+
+struct FragmentJobs(gpui::BackgroundExecutor);
+
+impl BlockingJobSpawner for FragmentJobs {
+    fn spawn(&self, job: BlockingJob) {
+        self.0
+            .spawn(async move {
+                job();
+            })
+            .detach();
+    }
+}
+
 #[derive(Clone, PartialEq)]
 struct FragmentLayoutKey {
     source: SharedString,
     width: f32,
+    font_size: f32,
     styles: Arc<[String]>,
 }
 
@@ -102,8 +161,14 @@ struct FragmentState {
     document: Option<PipelineSession>,
     shaper: GpuiTextCache,
     display: Option<FragmentDisplay>,
-    selection: Option<FragmentSelection>,
+    selection: FragmentSelection,
+    focus: Option<FocusHandle>,
     selection_key: Option<FragmentLayoutKey>,
+    resources: Option<Arc<HtmlFragmentResources>>,
+    images: ImagePipeline,
+    image_cache: ImageCache,
+    images_dirty: bool,
+    _image_notifications: Option<Task<()>>,
 }
 
 impl FragmentState {
@@ -112,8 +177,63 @@ impl FragmentState {
             document: None,
             shaper: GpuiTextCache::for_window(window, cx),
             display: None,
-            selection: None,
+            selection: FragmentSelection::default(),
+            focus: None,
             selection_key: None,
+            resources: None,
+            images: ImagePipeline::with_service(ImageService::with_job_spawner(
+                Arc::new(NoResources),
+                Arc::new(FragmentJobs(cx.background_executor().clone())),
+                16 * 1024 * 1024,
+            )),
+            image_cache: ImageCache::default(),
+            images_dirty: false,
+            _image_notifications: None,
+        }
+    }
+
+    fn set_resources(
+        &mut self,
+        resources: Option<Arc<HtmlFragmentResources>>,
+        cx: &mut Context<Self>,
+    ) {
+        let unchanged = match (&self.resources, &resources) {
+            (Some(previous), Some(next)) => Arc::ptr_eq(previous, next),
+            (None, None) => true,
+            _ => false,
+        };
+        if unchanged && (resources.is_some() || self._image_notifications.is_some()) {
+            return;
+        }
+        self._image_notifications = None;
+        let images = if let Some(resources) = &resources {
+            resources.images.clone()
+        } else {
+            let images = ImageService::with_job_spawner(
+                Arc::new(NoResources),
+                Arc::new(FragmentJobs(cx.background_executor().clone())),
+                16 * 1024 * 1024,
+            );
+            let (sender, receiver) = async_channel::bounded(1);
+            images.set_completion_waker(Some(Arc::new(move || {
+                let _ = sender.try_send(());
+            })));
+            self._image_notifications = Some(cx.spawn(async move |this, cx| {
+                while receiver.recv().await.is_ok() {
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        break;
+                    }
+                }
+            }));
+            images
+        };
+        self.images = ImagePipeline::with_service(images);
+        if !unchanged {
+            self.resources = resources;
+            self.document = None;
+            self.display = None;
+            self.selection_key = None;
+            self.selection.clear();
         }
     }
 
@@ -122,9 +242,7 @@ impl FragmentState {
         if result.is_err() {
             self.display = None;
             self.selection_key = None;
-            if let Some(selection) = &mut self.selection {
-                selection.clear();
-            }
+            self.selection.clear();
         }
         result
     }
@@ -133,6 +251,7 @@ impl FragmentState {
         let width = key.layout.width;
         if let Some(display) = &self.display
             && display.key == key
+            && !self.images_dirty
         {
             return Ok(size(px(width), px(display.height)));
         }
@@ -140,14 +259,20 @@ impl FragmentState {
         let document = match &mut self.document {
             Some(document) => {
                 if previous != Some(&key.layout) {
-                    let layout = LayoutConstraints::new(f64::from(width), 16.0)
-                        .map_err(|error| error.to_string())?;
+                    let layout =
+                        LayoutConstraints::new(f64::from(width), f64::from(key.layout.font_size))
+                            .map_err(|error| error.to_string())?;
                     let media = MediaEnvironment::screen(f64::from(width), None)
                         .ok_or("invalid fragment width")?;
                     let changes = PipelineChanges {
                         layout: Some(layout),
-                        style_environment: Some(StyleEnvironment { media, ..StyleEnvironment::default() }),
-                        source: previous.is_none_or(|old| old.source != key.layout.source)
+                        style_environment: Some(StyleEnvironment {
+                            media,
+                            root_font_size: root_font_size_new(key.layout.font_size)
+                                .map_err(|error| error.to_string())?,
+                        }),
+                        source: previous
+                            .is_none_or(|old| old.source != key.layout.source)
                             .then(|| key.layout.source.to_string()),
                         user_styles: previous.is_none_or(|old| old.styles != key.layout.styles)
                             .then(|| key.layout.styles.to_vec()),
@@ -158,13 +283,21 @@ impl FragmentState {
                 }
                 document
             }
-            None => self.document.insert(load_fragment(
-                key.layout.source.to_string(), f64::from(width),
-                key.layout.styles.to_vec(), &mut self.shaper,
-            ).map_err(|error| error.to_string())?),
+            None => self.document.insert(
+                load_fragment(
+                    key.layout.source.to_string(),
+                    f64::from(width),
+                    key.layout.styles.to_vec(),
+                    &mut self.shaper,
+                    key.layout.font_size,
+                    self.resources.as_deref(),
+                )
+                .map_err(|error| error.to_string())?,
+            ),
         };
-        let scene = fragment_scene(document).ok_or("fragment width must be positive")?;
-        let mut painter = GpuiCommandPainter::commands_only(self.shaper.resources());
+        let scene = fragment_scene(document, self.images.decoded_images())
+            .ok_or("fragment width must be positive")?;
+        let mut painter = GpuiCommandPainter::new(&mut self.image_cache);
         if let Some(previous) = self.display.take() {
             painter = painter.reusing(previous.scene);
         }
@@ -173,6 +306,7 @@ impl FragmentState {
         }
         scene.paint(&mut painter);
         let height = scene.content_height() as f32;
+        self.images_dirty = false;
         self.display = Some(FragmentDisplay {
             key,
             scene: painter.finish(),
@@ -181,24 +315,98 @@ impl FragmentState {
         Ok(size(px(width), px(height)))
     }
 
+    fn update_images(&mut self, bounds: Bounds<Pixels>, window: &mut Window) -> Result<(), String> {
+        let Some(document) = self.document.as_mut() else {
+            return Ok(());
+        };
+        let Some(view) = document.render_view() else {
+            return Ok(());
+        };
+        let clip = bounds.intersect(&window.content_mask().bounds);
+        let local = kurbo::Rect::new(
+            f64::from(clip.left() - bounds.left()),
+            f64::from(clip.top() - bounds.top()),
+            f64::from(clip.right() - bounds.left()),
+            f64::from(clip.bottom() - bounds.top()),
+        );
+        let desired = (view.fragments()).images()
+            .iter()
+            .filter(|image| {
+                image.visible_rect()
+                    .intersect(local)
+                    .area()
+                    > 0.0
+            })
+            .map(|image| image.image())
+            .collect::<HashSet<_>>();
+        let catalog = view.images();
+        self.images.update_resources(catalog);
+        self.images.ensure_window(catalog, &desired);
+        let poll = self.images.poll(catalog);
+        self.images_dirty |= poll.decoded;
+        if !poll.dimensions_changed.is_empty() {
+            let mut metrics = document
+                .inputs()
+                .ok_or("fragment inputs are missing")?
+                .image_metrics
+                .clone();
+            for image in poll.dimensions_changed {
+                if let Some((width, height)) = self.images.intrinsic_dimensions(image) {
+                    metrics.set(image.index() as u32, width, height);
+                }
+            }
+            document
+                .attach(&mut self.shaper)
+                .apply_changes(PipelineChanges {
+                    image_metrics: Some(metrics),
+                    ..PipelineChanges::default()
+                })
+                .map_err(|error| error.to_string())?;
+            self.images_dirty = true;
+            window.request_animation_frame();
+        }
+        Ok(())
+    }
+
+    fn anchor_offset(&self, href: &str) -> Option<f64> {
+        let (base, provider): (&str, &dyn ResourceProvider) = self
+            .resources
+            .as_ref()
+            .map_or(("fragment.xhtml", &NoResources), |resources| {
+                (resources.uri.as_str(), resources.provider.as_ref())
+            });
+        let link = resolve_link(provider, base, href);
+        if link.resource != base || !href.contains('#') {
+            return None;
+        }
+        let Some(fragment) = link.fragment else {
+            return Some(0.0);
+        };
+        match self
+            .document
+            .as_ref()?
+            .render_view()?
+            .addressing()
+            .destination(DocumentTarget::Element(&fragment))?
+        {
+            ResolvedDestination::Line { point, .. } => Some(point.y),
+            ResolvedDestination::Position { y } => Some(y),
+        }
+    }
+
     fn prepare_selection(&mut self) {
         // Flex layout can measure several widths before returning to the same
         // final width. Those probes must not clear an ongoing selection.
         let layout = self.display.as_ref().map(|display| &display.key.layout);
         if self.selection_key.as_ref() != layout {
-            if let Some(selection) = &mut self.selection {
-                selection.clear();
-                self.selection_key = layout.cloned();
-            }
+            self.selection.clear();
+            self.selection_key = layout.cloned();
         }
     }
 
     fn selection_context(&mut self) -> Option<(&mut FragmentSelection, RenderView<'_>)> {
         self.display.as_ref()?;
-        Some((
-            self.selection.as_mut()?,
-            self.document.as_ref()?.render_view()?,
-        ))
+        Some((&mut self.selection, self.document.as_ref()?.render_view()?))
     }
 }
 
@@ -209,25 +417,49 @@ pub(crate) fn load_fragment(
     width: f64,
     styles: Vec<String>,
     shaper: &mut impl GlyphShaper,
+    font_size: f32,
+    resources: Option<&HtmlFragmentResources>,
 ) -> Result<PipelineSession, PipelineError> {
     let media = MediaEnvironment::screen(width, None)
         .ok_or(LayoutConstraintError::InvalidViewportWidth)?;
     let mut inputs = PipelineInputs::new(
-        source, MarkupSyntax::Html, "fragment.xhtml".to_owned(),
-        StyleEnvironment { media, ..StyleEnvironment::default() },
-        LayoutConstraints::new(width, 16.0)?,
+        source,
+        MarkupSyntax::Html,
+        resources
+            .map_or("fragment.xhtml", |resources| resources.uri.as_str())
+            .to_owned(),
+        StyleEnvironment {
+            media,
+            root_font_size: root_font_size_new(font_size)?,
+        },
+        LayoutConstraints::new(width, f64::from(font_size))?,
     );
     inputs.user_styles = styles;
-    let mut document = PipelineSession::new(Arc::new(NoResources));
+    let provider = resources.map_or_else(
+        || Arc::new(NoResources) as Arc<dyn ResourceProvider>,
+        |resources| resources.provider.clone(),
+    );
+    let mut document = PipelineSession::new(provider);
     document.attach(shaper).update(inputs)?;
     Ok(document)
 }
 
-fn fragment_scene(document: &PipelineSession) -> Option<RenderScene> {
+fn fragment_scene(
+    document: &PipelineSession,
+    images: html_resources::DecodedImages<'_>,
+) -> Option<RenderScene> {
     let inputs = document.inputs()?;
-    let options = SceneOptions::new(inputs.layout.viewport_width(), inputs.layout.viewport_height())
-        .ok()?.with_image_policy(SceneImagePolicy::Omit);
-    Some(render_core::render_scene_for_view(document.render_view()?, &options))
+    let options = SceneOptions::new(
+        inputs.layout.viewport_width(),
+        inputs.layout.viewport_height(),
+    )
+    .ok()?
+    .with_image_policy(SceneImagePolicy::Reference);
+    Some(render_core::render_scene_for_view_with_images(
+        document.render_view()?,
+        &options,
+        images,
+    ))
 }
 
 impl IntoElement for HtmlFragmentElement {
@@ -261,8 +493,13 @@ impl Element for HtmlFragmentElement {
             FragmentState::new(window, cx)
         });
         state.update(cx, |state, cx| {
-            if self.selection_color.is_some() && state.selection.is_none() {
-                state.selection = Some(FragmentSelection::new(cx.focus_handle()));
+            state.set_resources(self.resources.clone(), cx);
+            if self.selection_color.is_some() {
+                state.focus.get_or_insert_with(|| cx.focus_handle());
+            } else if state.focus.take().is_some()
+                && let Some((selection, document)) = state.selection_context()
+            {
+                selection.clear_selection(document);
             }
         });
         self.state = Some(state.clone());
@@ -270,6 +507,7 @@ impl Element for HtmlFragmentElement {
         let source = self.source.clone();
         let styles: Arc<[String]> = self.styles.clone().into();
         let text_color = self.text_color;
+        let font_size = f32::from(window.rem_size());
         let mut style = Style::default();
         style.size.width = relative(1.0).into();
         style.flex_shrink = 0.0;
@@ -282,6 +520,7 @@ impl Element for HtmlFragmentElement {
                 layout: FragmentLayoutKey {
                     source: source.clone(),
                     width: f32::from(width).max(1.0),
+                    font_size,
                     styles: styles.clone(),
                 },
                 text_color,
@@ -312,18 +551,24 @@ impl Element for HtmlFragmentElement {
                     eprintln!("HTML fragment layout failed: {error}");
                 }
             }
-            if self.selection_color.is_some() {
-                state.prepare_selection();
+            if let Err(error) = state.update_images(bounds, window) {
+                eprintln!("HTML fragment images failed: {error}");
             }
+            if state.images_dirty {
+                if let Some(key) = state.display.as_ref().map(|display| display.key.clone()) {
+                    if let Err(error) = state.layout(key) {
+                        eprintln!("HTML fragment image layout failed: {error}");
+                    }
+                }
+            }
+            state.prepare_selection();
         });
+        let state = self.state.as_ref()?.read(cx);
+        state.display.as_ref()?;
         if self.selection_color.is_some() {
-            let state = self.state.as_ref()?.read(cx);
-            state.display.as_ref()?;
-            window.set_focus_handle(&state.selection.as_ref()?.focus, cx);
-            Some(window.insert_hitbox(bounds, HitboxBehavior::Normal))
-        } else {
-            None
+            window.set_focus_handle(state.focus.as_ref()?, cx);
         }
+        Some(window.insert_hitbox(bounds, HitboxBehavior::Normal))
     }
 
     fn paint(
@@ -351,32 +596,42 @@ impl Element for HtmlFragmentElement {
             scene.paint(bounds, window, cx)
         });
         let Some(hitbox) = hitbox else { return };
-        let Some(color) = self.selection_color else {
-            return;
-        };
+        let selectable = self.selection_color.is_some();
+        let rgba = self
+            .selection_color
+            .map(|color| u32::from(color.to_rgb()))
+            .unwrap_or(0);
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
-            let state = state.read(cx);
-            let Some(selection) = state.selection.as_ref() else {
-                return;
-            };
-            let Some(document) = state
-                .document
-                .as_ref()
-                .and_then(PipelineSession::render_view)
-            else {
-                return;
-            };
-            for rect in selection.rects(document) {
-                window.paint_quad(fill(
-                    Bounds::new(
-                        bounds.origin + point(px(rect.x0 as f32), px(rect.y0 as f32)),
-                        size(px(rect.width() as f32), px(rect.height() as f32)),
-                    ),
+            state.update(cx, |state, cx| {
+                let Some((selection, document)) = state.selection_context() else {
+                    return;
+                };
+                let color = peniko::Color::rgba8(
+                    (rgba >> 24) as u8,
+                    (rgba >> 16) as u8,
+                    (rgba >> 8) as u8,
+                    rgba as u8,
+                );
+                if let Some(scene) = selection.paint(
+                    document,
                     color,
-                ));
-            }
+                    self.text_color.map(|color| u32::from(color.to_rgb())),
+                ) {
+                    scene.paint(bounds, window, cx);
+                }
+            });
         });
-        window.set_cursor_style(CursorStyle::IBeam, hitbox);
+        let link_hovered = state.read(cx).selection.link_hovered();
+        if selectable || link_hovered {
+            window.set_cursor_style(
+                if link_hovered {
+                    CursorStyle::PointingHand
+                } else {
+                    CursorStyle::IBeam
+                },
+                hitbox,
+            );
+        }
 
         let target = state.clone();
         let hit = hitbox.clone();
@@ -389,26 +644,35 @@ impl Element for HtmlFragmentElement {
                     let Some((selection, document)) = state.selection_context() else {
                         return;
                     };
-                    if !selection.is_empty(document) || selection.dragging() {
+                    if !selection.is_empty(document) || selection.pointer_active() {
                         selection.clear();
                         cx.notify();
                     }
                 });
             } else if phase.bubble() && hit.is_hovered(window) {
                 target.update(cx, |state, cx| {
+                    if selectable && let Some(focus) = &state.focus {
+                        focus.focus(window, cx);
+                    }
                     let Some((selection, document)) = state.selection_context() else {
                         return;
                     };
-                    selection.begin(document, event.position - bounds.origin, event.click_count);
-                    selection.focus.focus(window, cx);
-                    window.prevent_default();
-                    cx.stop_propagation();
-                    cx.notify();
+                    if selection.pointer_down(
+                        document,
+                        event.position - bounds.origin,
+                        event.click_count,
+                        selectable,
+                    ) {
+                        window.prevent_default();
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
                 });
             }
         });
         let target = state.clone();
-        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+        let hit = hitbox.clone();
+        window.on_mouse_event(move |event: &MouseMoveEvent, phase, window, cx| {
             if !phase.bubble() {
                 return;
             }
@@ -416,19 +680,44 @@ impl Element for HtmlFragmentElement {
                 let Some((selection, document)) = state.selection_context() else {
                     return;
                 };
+                if selection.pointer_active() && event.pressed_button != Some(MouseButton::Left) {
+                    selection.finish(document);
+                    cx.notify();
+                }
+                let position = hit
+                    .is_hovered(window)
+                    .then_some(event.position - bounds.origin);
+                if selection.pointer_move(document, position) {
+                    cx.notify();
+                }
                 if selection.dragging() {
-                    if event.pressed_button == Some(MouseButton::Left) {
+                    if position.is_none() {
                         selection.extend(document, event.position - bounds.origin);
-                        cx.stop_propagation();
-                    } else {
-                        selection.finish(document);
+                        selection.pointer_move(document, None);
                     }
+                    cx.stop_propagation();
                     cx.notify();
                 }
             });
         });
         let target = state.clone();
-        window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+        window.on_mouse_event(move |_: &MouseExitEvent, phase, _, cx| {
+            if !phase.bubble() {
+                return;
+            }
+            target.update(cx, |state, cx| {
+                if let Some((selection, document)) = state.selection_context()
+                    && selection.pointer_move(document, None)
+                {
+                    cx.notify();
+                }
+            });
+        });
+        let target = state.clone();
+        let hit = hitbox.clone();
+        let on_link = self.on_link.clone();
+        let scroll = self.scroll.clone();
+        window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
             if !phase.bubble() || event.button != MouseButton::Left {
                 return;
             }
@@ -436,21 +725,45 @@ impl Element for HtmlFragmentElement {
                 let Some((selection, document)) = state.selection_context() else {
                     return;
                 };
-                if selection.dragging() {
-                    selection.extend(document, event.position - bounds.origin);
-                    selection.finish(document);
+                if selection.pointer_active() {
+                    if let Some(href) = selection.pointer_up(
+                        document,
+                        event.position - bounds.origin,
+                        hit.is_hovered(window),
+                    ) {
+                        let href = href.trim();
+                        if let Some((scroll, y)) = scroll
+                            .as_ref()
+                            .and_then(|scroll| state.anchor_offset(href).map(|y| (scroll, y)))
+                        {
+                            let offset = scroll.offset();
+                            scroll.set_offset(point(
+                                offset.x,
+                                offset.y + scroll.bounds().top() - bounds.top() - px(y as f32),
+                            ));
+                        } else if let Some(on_link) = &on_link {
+                            on_link(href, window, cx);
+                        } else if href.split_once(':').is_some_and(|(scheme, _)| {
+                            ["http", "https", "mailto", "tel"]
+                                .iter()
+                                .any(|external| scheme.eq_ignore_ascii_case(external))
+                        }) {
+                            cx.open_url(href);
+                        }
+                    }
                     cx.notify();
                     cx.stop_propagation();
                 }
             });
         });
         window.on_key_event(move |event: &KeyDownEvent, phase, window, cx| {
-            if !phase.bubble()
+            if !selectable
+                || !phase.bubble()
                 || !state
                     .read(cx)
-                    .selection
+                    .focus
                     .as_ref()
-                    .is_some_and(|selection| selection.focus.is_focused(window))
+                    .is_some_and(|focus| focus.is_focused(window))
             {
                 return;
             }
@@ -469,7 +782,7 @@ impl Element for HtmlFragmentElement {
                         ClipboardItem::new_string(selection.selected_text(document)),
                     ),
                     "a" if shortcut => selection.select_all(document),
-                    "escape" => selection.clear(),
+                    "escape" => selection.clear_selection(document),
                     _ => return,
                 }
                 cx.stop_propagation();
@@ -482,7 +795,6 @@ impl Element for HtmlFragmentElement {
 
 #[cfg(test)]
 mod tests {
-    use html_pipeline::engine::box_queries;
 
     use super::*;
     use html::layout::{BoxId, RenderView};
@@ -557,11 +869,10 @@ mod tests {
         window
             .update(cx, |_, window, cx| {
                 let mut state = FragmentState::new(window, cx);
-                state.selection = Some(FragmentSelection::new(cx.focus_handle()));
                 let source = "<p>First &amp; <em>café</em> Åsa</p><p>Second paragraph</p>";
                 state.layout(key(source.into(), 300.)).unwrap();
                 state.prepare_selection();
-                let selection = state.selection.as_mut().unwrap();
+                let selection = &mut state.selection;
                 let document = state
                     .document
                     .as_ref()
@@ -574,14 +885,11 @@ mod tests {
                 );
                 let glyph = (0..document.text().glyph_count() as u32)
                     .find(|&index| {
-                        text_paint::render_text_view_character_at(document.text(), index as usize)
+                        (document.text()).character_at(index as usize)
                             == Some('é')
                     })
                     .unwrap();
-                let rect = geometry_queries::selection_bounds_lines(
-                    geometry_queries::render_view_geometry(document),
-                    glyph..glyph + 1,
-                    document
+                let rect = (document.geometry()).selection_bounds_lines(glyph..glyph + 1, document
                         .text()
                         .lines()
                         .iter()
@@ -590,15 +898,14 @@ mod tests {
                             origin: line.point(),
                         })
                         .into_iter()
-                        .map(|placement| (placement.line, placement.origin)),
-                )
+                        .map(|placement| (placement.line, placement.origin)))
                 .unwrap();
                 let position = point(px(rect.center().x as f32), px(rect.center().y as f32));
                 assert!(selection.begin(document, position, 2));
                 assert_eq!(selection.selected_text(document), "café");
                 state.layout(key(source.into(), 110.)).unwrap();
                 state.prepare_selection();
-                let selection = state.selection.as_mut().unwrap();
+                let selection = &mut state.selection;
                 let document = state
                     .document
                     .as_ref()
@@ -619,7 +926,7 @@ mod tests {
                     .as_ref()
                     .and_then(PipelineSession::render_view)
                     .unwrap();
-                let selection = state.selection.as_mut().unwrap();
+                let selection = &mut state.selection;
                 selection.select_all(document);
                 assert_eq!(selection.selected_text(document), "Replacement");
             })
@@ -633,6 +940,7 @@ mod tests {
                 layout: FragmentLayoutKey {
                     source: source.to_owned().into(),
                     width: 300.0,
+                    font_size: 16.0,
                     styles: styles.into(),
                 },
                 text_color: None,
@@ -649,6 +957,7 @@ mod tests {
             layout: FragmentLayoutKey {
                 source,
                 width,
+                font_size: 16.0,
                 styles: element.styles.into(),
             },
             text_color: element.text_color,
@@ -699,7 +1008,11 @@ mod tests {
                 let mut state = FragmentState::new(window, cx);
                 let source = description();
                 state.layout(key(source, 240.0)).unwrap();
-                let scene = fragment_scene(state.document.as_ref().unwrap()).unwrap();
+                let scene = fragment_scene(
+                    state.document.as_ref().unwrap(),
+                    state.images.decoded_images(),
+                )
+                .unwrap();
                 assert!(!render_core::render_scene_is_clipped(&scene));
                 assert_eq!(scene.size().height, scene.content_height());
                 let document = state
@@ -712,7 +1025,7 @@ mod tests {
                         .text()
                         .lines()
                         .iter()
-                        .any(|line| text_paint::line_word_spacing(&line) != 0.0),
+                        .any(|line| line.line_word_spacing() != 0.0),
                     "justified paragraphs must distribute spacing between words"
                 );
                 assert!(document.text().lines().len() > 2);
@@ -729,14 +1042,14 @@ mod tests {
                 let styles = vec![":where(html) { color: #eeeeee; }".to_owned()];
                 let source = "<p id='default'>Default</p><p style='color:#008000'><span id='inherited'>Inherited green</span></p><p id='explicit' style='color:#ff0000'>Explicit red</p>";
                 let boxes = render(&mut state, source, styles.clone()).boxes();
-                let color = |id| box_queries::text_format(boxes, (0..box_queries::len(boxes)).map(layout_state::box_id_new).find(|&index| box_queries::attribute(boxes, index, "id") == Some(id)).unwrap()).color;
+                let color = |id| boxes.text_format((0..boxes.len()).map(layout_state::box_id_new).find(|&index| boxes.attribute(index, "id") == Some(id)).unwrap()).color;
                 assert_eq!(color("default"), 0xeeeeeeff);
                 assert_eq!(color("inherited"), 0x008000ff);
                 assert_eq!(color("explicit"), 0xff0000ff);
 
                 let boxes = render(&mut state, "<style>html {color:#123456}</style><p id='root'>Authored root color</p>", styles).boxes();
-                let paragraph = (0..box_queries::len(boxes)).map(layout_state::box_id_new).find(|&index| box_queries::attribute(boxes, index, "id") == Some("root")).unwrap();
-                assert_eq!(box_queries::text_format(boxes, paragraph).color, 0x123456ff);
+                let paragraph = (0..boxes.len()).map(layout_state::box_id_new).find(|&index| boxes.attribute(index, "id") == Some("root")).unwrap();
+                assert_eq!(boxes.text_format(paragraph).color, 0x123456ff);
             })
             .unwrap();
     }
@@ -749,7 +1062,7 @@ mod tests {
                 let mut state = FragmentState::new(window, cx);
                 let styles = vec![":where(body) { font-size:18px; line-height:1.5; }".to_owned()];
                 let boxes = render(&mut state, "<p id='default'>Default</p><p id='authored' style='font-size:24px;font-weight:bold;font-style:italic'>Publisher</p>", styles).boxes();
-                let format = |id| box_queries::text_format(boxes, (0..box_queries::len(boxes)).map(layout_state::box_id_new).find(|&index| box_queries::attribute(boxes, index, "id") == Some(id)).unwrap());
+                let format = |id| boxes.text_format((0..boxes.len()).map(layout_state::box_id_new).find(|&index| boxes.attribute(index, "id") == Some(id)).unwrap());
                 assert_eq!(format("default").font_size, 18.0);
                 assert_eq!(format("default").font_weight, 400);
                 assert_eq!(format("authored").font_size, 24.0);

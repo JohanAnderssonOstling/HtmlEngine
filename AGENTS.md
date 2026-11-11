@@ -1,6 +1,7 @@
 # Coding preferences
 
 - In Rust, prefer `use` imports for repeated types, traits, and functions rather than repeatedly writing fully qualified `::` paths inline. Keep qualified paths where they clarify ambiguous names or platform-specific code, and follow the surrounding code style.
+- Prefer a single pass when practical, and produce paint output in final paint order during traversal.
 
 # Tests
 

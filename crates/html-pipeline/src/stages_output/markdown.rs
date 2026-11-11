@@ -1,12 +1,11 @@
 //! Markdown clipboard payloads for logical text and box selections.
 
-use html_engine_model::layout_state;
-use crate::stages::text_paint;
-use html_style_model::computed_style;
 use super::text::{enclosing_text_range, text_runs};
 use super::{BoxId, DocumentRead, ImageId, LineId, RenderTable, merge_text_ranges};
 use crate::layout_model::parse_positive_span;
 use html_dom::{Document, DomNodeId, ElementRef, write_escaped_html_attribute};
+use html_engine_model::layout_state;
+use html_style_model::computed_style;
 use html_style_model::{ComputedStyles, Display, FontStyle, Visibility};
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use std::iter::repeat_n;
@@ -38,7 +37,10 @@ pub enum TableExportFormat {
 /// Export an owned table snapshot, including a bounded logical cell rectangle.
 pub enum TableExportRequest {
     Whole(TableExportFormat),
-    CellsMarkdown { rows: Range<usize>, columns: Range<usize> },
+    CellsMarkdown {
+        rows: Range<usize>,
+        columns: Range<usize>,
+    },
 }
 
 /// Read-only selection conversion. Applications own selection gestures and
@@ -50,7 +52,6 @@ pub struct RenderExportView<'a> {
 }
 
 impl<'a> RenderExportView<'a> {
-
     /// Build plain-text and Markdown versions of the same logical selection.
     /// The tuple contains `(plain_text, markdown)`; invalid or empty selections
     /// return `(None, None)`. Selection and clipboard state remain with callers.
@@ -58,7 +59,10 @@ impl<'a> RenderExportView<'a> {
         let Some((root, selected)) = self.selection(glyphs) else {
             return (None, None);
         };
-        (finish_plain_text(selected.plain(root)), selected.finish(root))
+        (
+            finish_plain_text(selected.plain(root)),
+            selected.finish(root),
+        )
     }
 
     /// Visible source text for a logical selection, without generating Markdown.
@@ -92,7 +96,6 @@ impl<'a> RenderExportView<'a> {
         Some(html_dom::collapse_whitespace(&text))
     }
 
-
     /// Convert a half-open logical glyph range to Markdown. These are the same
     /// indices used by `RenderTextRun::glyphs`, not UTF-8 byte offsets.
     /// Empty, reversed, and out-of-bounds ranges return `None`.
@@ -116,6 +119,67 @@ impl<'a> RenderExportView<'a> {
         Some((root, Markdown::new(self.doc, Some(glyphs), root)))
     }
 
+    /// Convert one range without preparing unrequested representations.
+    pub fn text(self, glyphs: Range<u32>, format: TextExportFormat) -> TextExport {
+        let (plain, markdown) = match format {
+            TextExportFormat::Plain => (self.plain_text(glyphs), None),
+            TextExportFormat::PlainWithParagraphBreaks => {
+                (self.plain_text_with_paragraph_breaks(glyphs), None)
+            }
+            TextExportFormat::Markdown => (None, self.markdown(glyphs)),
+            TextExportFormat::PlainAndMarkdown => self.selection_text(glyphs),
+        };
+        TextExport { plain, markdown }
+    }
+
+    /// Whether an image resource represents a retained mathematical formula.
+    pub fn is_equation(self, image: ImageId) -> bool {
+        (self.doc.render_view(self.glyph_metrics))
+            .image_mathml(image)
+            .is_some()
+    }
+
+    /// Export disjoint source ranges once in document order. Duplicates and
+    /// overlaps are merged; generated content and hidden text are excluded.
+    pub fn plain_text_ranges(self, ranges: impl IntoIterator<Item = Range<u32>>) -> Option<String> {
+        let count = self.doc.inputs.text.content().characters().len();
+        let mut ranges: Vec<_> = ranges.into_iter().collect();
+        if ranges
+            .iter()
+            .any(|range| range.start > range.end || range.end as usize > count)
+        {
+            return None;
+        }
+        merge_text_ranges(&mut ranges);
+        if ranges.is_empty() {
+            return None;
+        }
+        let root = self.doc.document().dom_root()?;
+        let selected = Markdown::new_ranges(self.doc, Some(&ranges), root);
+        finish_plain_text(selected.plain(root))
+    }
+
+    /// Convert a selected source-backed box, such as a table, code block, or
+    /// image. Invalid and synthetic boxes return `None`.
+    pub fn markdown_for_box(self, box_id: BoxId) -> Option<String> {
+        let box_idx = layout_state::box_id_index(box_id);
+        let document = self.doc.document();
+        let root = self.doc.box_dom_element_idx(box_idx)?;
+        Markdown::new(self.doc, None, root).finish(root)
+    }
+
+    pub fn text_for_lines(self, lines: impl IntoIterator<Item = LineId>) -> Option<String> {
+        let view = self.doc.render_view(self.glyph_metrics);
+        let text = view.text();
+        self.plain_text_ranges(lines.into_iter().flat_map(|line| {
+            (text)
+                .line_text_fragments(line)
+                .into_iter()
+                .flatten()
+                .filter(|fragment| fragment.visible())
+                .map(|fragment| fragment.glyphs())
+        }))
+    }
 }
 
 fn finish_plain_text(text: String) -> Option<String> {
@@ -165,9 +229,7 @@ impl<'a> Markdown<'a> {
         if selection.is_none() {
             for index in 0..doc.box_count() {
                 if doc.box_is_visible(index)
-                    && let Some(node) = doc
-                        .box_dom_element_idx(index)
-                        .and_then(|raw| document.node_id_from_raw(raw))
+                    && let Some(node) = doc.box_dom_element_idx(index)
                     && document.dom_contains(root, node)
                 {
                     result.visible.insert(node);
@@ -179,10 +241,7 @@ impl<'a> Markdown<'a> {
         let mut common_pre = None;
         for run in text_runs(content.inline_items()) {
             let glyphs = run.glyphs();
-            let Some(node) = run
-                .dom_text_node()
-                .and_then(|raw| document.node_id_from_raw(raw))
-            else {
+            let Some(node) = run.dom_text_node() else {
                 continue;
             };
             if !document.dom_contains(root, node) {
@@ -194,7 +253,7 @@ impl<'a> Markdown<'a> {
                     *range = enclosing_text_range(range.clone(), glyphs.clone());
                 })
                 .or_insert_with(|| glyphs.clone());
-            if !doc.box_is_visible(layout_state::box_id_index(text_paint::render_text_run_box_id(&run))) {
+            if !doc.box_is_visible(layout_state::box_id_index(run.box_id())) {
                 continue;
             }
             let complete = [glyphs.clone()];
@@ -209,9 +268,12 @@ impl<'a> Markdown<'a> {
                 if start >= end {
                     continue;
                 }
-                let pre = document
-                    .dom_ancestors(node)
-                    .find(|&ancestor| document.get_dom_tag(ancestor) == Some("pre"));
+                let pre = document.dom_ancestors(node).find(|&ancestor| {
+                    document
+                        .try_element_ref(ancestor)
+                        .map(|element| element.tag())
+                        == Some("pre")
+                });
                 common_pre = Some(match common_pre {
                     None => pre,
                     Some(previous) if previous == pre => pre,
@@ -246,7 +308,7 @@ impl<'a> Markdown<'a> {
             *cursor = range.end;
             return;
         }
-        let Some(element) = self.document.element_ref(node) else {
+        let Some(element) = self.document.try_element_ref(node) else {
             return;
         };
         let style = doc
@@ -276,7 +338,7 @@ impl<'a> Markdown<'a> {
 
     fn activate(&mut self, mut node: DomNodeId) {
         while self.active.insert(node) {
-            let Some(parent) = self.document.get_dom_parent(node) else {
+            let Some(parent) = self.document.node_ref(node).parent() else {
                 break;
             };
             node = parent;
@@ -303,7 +365,7 @@ impl<'a> Markdown<'a> {
         if let Some(text) = self.text.get(&node) {
             return escape_text(text);
         }
-        let Some(element) = self.document.element_ref(node) else {
+        let Some(element) = self.document.try_element_ref(node) else {
             return String::new();
         };
         let tag = element.tag();
@@ -353,14 +415,20 @@ impl<'a> Markdown<'a> {
             "li" => {
                 let parent = element
                     .parent()
-                    .and_then(|node| self.document.element_ref(node));
+                    .and_then(|node| self.document.try_element_ref(node));
                 let marker = if let Some(parent) = parent.filter(|parent| parent.tag() == "ol") {
                     let items = parent.child_elements().filter(|child| child.tag() == "li");
                     let step = if parent.has_attr("reversed") { -1 } else { 1 };
                     let mut number = parent
                         .attr("start")
                         .and_then(|value| value.parse::<i64>().ok())
-                        .unwrap_or_else(|| if step < 0 { items.clone().count() as i64 } else { 1 });
+                        .unwrap_or_else(|| {
+                            if step < 0 {
+                                items.clone().count() as i64
+                            } else {
+                                1
+                            }
+                        });
                     for item in items {
                         number = item
                             .attr("value")
@@ -372,10 +440,7 @@ impl<'a> Markdown<'a> {
                         number = number.saturating_add(step);
                     }
                     if !(0..=999_999_999).contains(&number) {
-                        return block(&format!(
-                            "<ol start=\"{number}\">{}</ol>",
-                            self.html(node)
-                        ));
+                        return block(&format!("<ol start=\"{number}\">{}</ol>", self.html(node)));
                     }
                     format!("{number}. ")
                 } else {
@@ -456,7 +521,9 @@ impl<'a> Markdown<'a> {
             content = inline(&content, "*");
         }
         if computed_style::text_decoration_lines_line_through(current.text_decoration_lines())
-            && parent.is_none_or(|parent| !computed_style::text_decoration_lines_line_through(parent.text_decoration_lines()))
+            && parent.is_none_or(|parent| {
+                !computed_style::text_decoration_lines_line_through(parent.text_decoration_lines())
+            })
             && !matches!(element.tag(), "s" | "del" | "strike")
         {
             content = inline(&content, "~~");
@@ -477,7 +544,7 @@ impl<'a> Markdown<'a> {
         if let Some(text) = self.text.get(&node) {
             return text.clone();
         }
-        let Some(element) = self.document.element_ref(node) else {
+        let Some(element) = self.document.try_element_ref(node) else {
             return String::new();
         };
         if !self.includes(node) || excluded(element.tag()) {
@@ -563,7 +630,7 @@ impl<'a> Markdown<'a> {
             let value = self.node(child);
             let nested = self
                 .document
-                .element_ref(child)
+                .try_element_ref(child)
                 .is_some_and(|child| matches!(child.tag(), "ul" | "ol"));
             if nested && !value.trim().is_empty() {
                 content.truncate(content.trim_end_matches('\n').len());
@@ -682,13 +749,11 @@ impl<'a> Markdown<'a> {
     }
 
     fn has_block_children(&self, element: ElementRef<'_>) -> bool {
-        element
-            .child_elements()
-            .any(|child| {
-                matches!(child.tag(), "table" | "pre" | "ul" | "ol" | "blockquote")
-                    || block_tag(child.tag())
-                    || self.has_block_children(child)
-            })
+        element.child_elements().any(|child| {
+            matches!(child.tag(), "table" | "pre" | "ul" | "ol" | "blockquote")
+                || block_tag(child.tag())
+                || self.has_block_children(child)
+        })
     }
 
     /// Structural HTML fallback uses selected text and a small attribute set;
@@ -704,7 +769,7 @@ impl<'a> Markdown<'a> {
             write_escaped_html_attribute(output, text);
             return;
         }
-        let Some(element) = self.document.element_ref(node) else {
+        let Some(element) = self.document.try_element_ref(node) else {
             return;
         };
         let tag = element.tag();
@@ -760,7 +825,7 @@ impl<'a> Markdown<'a> {
             let cell = tag == "tr"
                 && self
                     .document
-                    .element_ref(child)
+                    .try_element_ref(child)
                     .is_some_and(|child| matches!(child.tag(), "td" | "th"));
             self.write_html(child, cell, output);
         }
@@ -777,8 +842,9 @@ impl RenderTable {
         match request {
             TableExportRequest::Whole(TableExportFormat::Markdown) => self.markdown(),
             TableExportRequest::Whole(TableExportFormat::Html) => self.unstyled_html(),
-            TableExportRequest::Whole(TableExportFormat::AuthoredHtml) =>
-                (!self.authored_html().is_empty()).then(|| self.authored_html().to_owned()),
+            TableExportRequest::Whole(TableExportFormat::AuthoredHtml) => {
+                (!self.authored_html().is_empty()).then(|| self.authored_html().to_owned())
+            }
             TableExportRequest::CellsMarkdown { rows, columns } => self.markdown_in(rows, columns),
         }
     }
@@ -1057,7 +1123,7 @@ mod tests {
                 .node_ids()
                 .filter_map(|node| {
                     document
-                        .text_ref(node)
+                        .try_text_ref(node)
                         .map(|text| (node, text.text().to_owned()))
                 })
                 .collect(),
@@ -1113,80 +1179,4 @@ mod tests {
             assert_eq!(allocations, 0);
         }
     }
-}
-
-/// Convert one range without preparing unrequested representations.
-pub fn render_export_view_text<'a>(
-    value: RenderExportView<'a>,
-    glyphs: Range<u32>,
-    format: TextExportFormat,
-) -> TextExport {
-    let (plain, markdown) = match format {
-        TextExportFormat::Plain => (value.plain_text(glyphs), None),
-        TextExportFormat::PlainWithParagraphBreaks => {
-            (value.plain_text_with_paragraph_breaks(glyphs), None)
-        }
-        TextExportFormat::Markdown => (None, value.markdown(glyphs)),
-        TextExportFormat::PlainAndMarkdown => value.selection_text(glyphs),
-    };
-    TextExport { plain, markdown }
-}
-
-/// Whether an image resource represents a retained mathematical formula.
-pub fn render_export_view_is_equation<'a>(value: RenderExportView<'a>, image: ImageId) -> bool {
-    text_paint::render_view_image_mathml(&value.doc.render_view(value.glyph_metrics), image)
-        .is_some()
-}
-
-/// Export disjoint source ranges once in document order. Duplicates and
-/// overlaps are merged; generated content and hidden text are excluded.
-pub fn render_export_view_plain_text_ranges<'a>(
-    value: RenderExportView<'a>,
-    ranges: impl IntoIterator<Item = Range<u32>>,
-) -> Option<String> {
-    let count = value.doc.inputs.text.content().characters().len();
-    let mut ranges: Vec<_> = ranges.into_iter().collect();
-    if ranges
-        .iter()
-        .any(|range| range.start > range.end || range.end as usize > count)
-    {
-        return None;
-    }
-    merge_text_ranges(&mut ranges);
-    if ranges.is_empty() {
-        return None;
-    }
-    let root = value.doc.document().dom_root()?;
-    let selected = Markdown::new_ranges(value.doc, Some(&ranges), root);
-    finish_plain_text(selected.plain(root))
-}
-
-/// Convert a selected source-backed box, such as a table, code block, or
-/// image. Invalid and synthetic boxes return `None`.
-pub fn render_export_view_markdown_for_box<'a>(
-    value: RenderExportView<'a>,
-    box_id: BoxId,
-) -> Option<String> {
-    let box_idx = layout_state::box_id_index(box_id);
-    let document = value.doc.document();
-    let root = document.node_id_from_raw(value.doc.box_dom_element_idx(box_idx)?)?;
-    Markdown::new(value.doc, None, root).finish(root)
-}
-
-pub fn text_for_lines(
-    value: RenderExportView<'_>,
-    lines: impl IntoIterator<Item = LineId>,
-) -> Option<String> {
-    let view = value.doc.render_view(value.glyph_metrics);
-    let text = view.text();
-    render_export_view_plain_text_ranges(
-        value,
-        lines.into_iter().flat_map(|line| {
-            text_paint::render_text_view_line_text_fragments(text, line)
-                .into_iter()
-                .flatten()
-                .filter(|fragment| fragment.visible())
-                .map(|fragment| fragment.glyphs())
-        }),
-    )
 }

@@ -10,7 +10,6 @@
 //! generate no important declarations, or zero for the inline interval to
 //! generate no inline styles.
 
-use html_style::style_document_with_timings;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::hint::black_box;
@@ -185,7 +184,7 @@ fn main() {
 
     for _ in 0..3 {
         let document = html_parse::parse_dom_document(&html).expect("benchmark HTML parses");
-        black_box(style_document_with_timings(document, &[&css]));
+        black_box({ let (styled, timings, _) = html_style::StyleRequest::from_css(document, &[&css]).compile(); (styled, timings) });
     }
 
     let mut cascade = Vec::with_capacity(iterations);
@@ -198,7 +197,7 @@ fn main() {
             ALLOCATIONS.with(|count| count.set(Some(0)));
             ALLOCATION_BYTES.with(|bytes| bytes.set(Some((0, 0))));
         }
-        let (styled, timings) = style_document_with_timings(document, &[&css]);
+        let (styled, timings) = { let (styled, timings, _) = html_style::StyleRequest::from_css(document, &[&css]).compile(); (styled, timings) };
         if iteration == 0 {
             measured_allocations =
                 ALLOCATIONS.with(|count| count.take().expect("allocation counter enabled"));

@@ -1,14 +1,15 @@
+use std::any::TypeId;
 use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::Arc;
 use web_time::Instant;
 
-use gpui::{App, Bounds, ContentMask, Corners, Edges, Hsla, PaintGlyph, Pixels, RenderImage, SvgRenderer, Window, fill, point, px, rgba, size};
+use gpui::{App, Bounds, ContentMask, Corners, Edges, Hsla, LineLayout, PaintGlyph, Pixels, RenderImage, SvgRenderer, Window, fill, point, px, rgba, size};
 use gpui_image_eviction::track_image;
 use html_render_core::CornerRadii;
 use html::render::Painter;
 use html::style::ThemeAdaptation;
-use html_engine_model::PreparedTextRunFragment;
+use html_engine_model::{NativePaintResource, NativePaintResources, PreparedTextRunFragment};
 use html::text::GlyphHandle;
 use html_pipeline::engine::TextRunId;
 use image::Frame;
@@ -21,19 +22,15 @@ use smallvec::SmallVec;
 use crate::math_svg::themed_math_svg;
 use crate::raster_theme::{RasterClassifier, RasterKind, raster_buffer, raster_cache_key};
 use crate::svg_theme::{themed_svg, themed_svg_cache_key};
-use crate::text::{
-    GlyphStorage, GlyphStore, GpuiGlyph, GpuiPaintResources, GpuiTextResources, GpuiTextRun,
-    RunStore,
-};
+use crate::text::GpuiTextRun;
 
 #[cfg(test)]
 mod glyph_fragment_tests {
     use super::*;
     use crate::text::{CharacterBytes, GpuiFontSpan};
     use gpui::{FontId, GlyphId as NativeGlyphId, ShapedGlyph as NativeShapedGlyph};
-    use std::rc::Rc;
 
-    fn run(text: &str, glyphs: &[(usize, f32)], carets: &[f32], colors: Vec<(Range<usize>, Hsla)>) -> Arc<GpuiTextRun> {
+    fn run(text: &str, glyphs: &[(usize, f32)], carets: &[f32]) -> Arc<GpuiTextRun> {
         let glyphs = glyphs
             .iter()
             .enumerate()
@@ -41,26 +38,17 @@ mod glyph_fragment_tests {
             .collect::<Vec<_>>();
         let font_spans = if glyphs.is_empty() { Vec::new() } else { vec![GpuiFontSpan { glyphs: 0..glyphs.len(), font_id: FontId(0), font_size: px(19.0) }] };
         let bytes = CharacterBytes::new(text);
-        let run = GpuiTextRun::new(glyphs, font_spans.into(), px(14.0), px(5.0), bytes, colors.into(), carets.to_vec().into());
+        let run = GpuiTextRun::new(glyphs, font_spans.into(), px(14.0), px(5.0), bytes, carets.to_vec().into());
         Arc::new(run)
     }
 
-    fn paint_characters(run: &Arc<GpuiTextRun>, characters: &[u32], color: Option<u32>) -> Vec<PaintCommand> {
-        let mut glyphs = GlyphStorage::default();
-        glyphs.push_run(run.clone(), run.caret_stops.len() - 1);
-        // A retained glyph store must paint independently of the current run
-        // store, which may already belong to a different document.
-        let mut painter = GpuiCommandPainter::commands_only(
-            GpuiTextResources {
-                generation: html::text::GlyphResourceGeneration::UNBOUND,
-                glyphs: Rc::new(glyphs),
-                runs: Rc::new(Vec::new()),
-            },
-        );
+    fn paint_characters(run: &Arc<GpuiTextRun>, characters: &[u32], colors: &[u32], color: Option<u32>) -> Vec<PaintCommand> {
+        let resource = NativePaintResource::new(run.clone());
+        let mut painter = GpuiCommandPainter::commands_only();
         for &character in characters {
             let origin = Point::new(100.0 + f64::from(run.caret_stops.get(character as usize).unwrap()), 200.0);
-            let color = color.unwrap_or_else(|| u32::from(run.character_color(character).to_rgb()));
-            painter.draw_glyph(GlyphHandle(character), origin, color);
+            let color = color.unwrap_or(colors[character as usize]);
+            painter.push_glyph(resource.clone(), character, origin, Hsla::from(rgba(color)));
         }
         Arc::unwrap_or_clone(painter.finish().commands)
     }
@@ -75,18 +63,18 @@ mod glyph_fragment_tests {
     fn deferred_character_painting_preserves_ligatures_combining_marks_and_visual_order() {
         let red = Hsla::from(rgba(0xff0000ff));
         for (run, character, expected) in [
-            (run("office", &[(0, 0.0), (1, 10.0), (4, 40.0), (5, 50.0)], &[0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0], vec![(0..6, red)]), 1, vec![1..2]),
-            (run("a\u{301}b", &[(0, 0.0), (0, 2.0), (3, 10.0)], &[0.0, 5.0, 10.0, 20.0], vec![(0..4, red)]), 0, vec![0..2]),
-            (run("a\u{301}b", &[(0, 0.0), (0, 2.0), (3, 10.0)], &[0.0, 5.0, 10.0, 20.0], vec![(0..4, red)]), 1, vec![]),
-            (run("aבc", &[(0, 0.0), (3, 20.0), (1, 10.0)], &[0.0, 10.0, 20.0, 30.0], vec![(0..4, red)]), 2, vec![1..2]),
+            (run("office", &[(0, 0.0), (1, 10.0), (4, 40.0), (5, 50.0)], &[0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0]), 1, vec![1..2]),
+            (run("a\u{301}b", &[(0, 0.0), (0, 2.0), (3, 10.0)], &[0.0, 5.0, 10.0, 20.0]), 0, vec![0..2]),
+            (run("a\u{301}b", &[(0, 0.0), (0, 2.0), (3, 10.0)], &[0.0, 5.0, 10.0, 20.0]), 1, vec![]),
+            (run("aבc", &[(0, 0.0), (3, 20.0), (1, 10.0)], &[0.0, 10.0, 20.0, 30.0]), 2, vec![1..2]),
         ] {
-            let commands = paint_characters(&run, &[character], None);
+            let commands = paint_characters(&run, &[character], &[0xff0000ff; 6], None);
             let fragment = fragment(&commands);
             assert!(Arc::ptr_eq(&fragment.run, &run));
             assert_eq!(fragment.range, character..character + 1);
             assert_eq!(fragment.origin, Point::new(100.0, 200.0));
             assert_eq!(fragment.glyph_ranges.as_slice(), expected);
-            assert_eq!(fragment.color, Some(red));
+            assert_eq!(fragment.color, red);
         }
     }
 
@@ -94,25 +82,22 @@ mod glyph_fragment_tests {
     fn character_painting_reuses_utf8_colors_merges_fragments_and_honors_overrides() {
         let red = Hsla::from(rgba(0xff0000ff));
         let blue = Hsla::from(rgba(0x0000ffff));
-        let run = run("aבc", &[(0, 0.0), (3, 20.0), (1, 10.0)], &[0.0, 10.0, 20.0, 30.0], vec![(0..1, red), (1..4, blue)]);
-        assert_eq!(run.character_color(0), red);
-        assert_eq!(run.character_color(1), blue);
-        assert_eq!(run.character_color(2), blue);
+        let run = run("aבc", &[(0, 0.0), (3, 20.0), (1, 10.0)], &[0.0, 10.0, 20.0, 30.0]);
 
         for color in [None, Some(0x00ff00ff)] {
-            let commands = paint_characters(&run, &[0, 1, 2], color);
+            let commands = paint_characters(&run, &[0, 1, 2], &[0xff0000ff, 0x0000ffff, 0x0000ffff], color);
             let [PaintCommand::TextBatch { fragments }] = commands.as_slice() else { panic!("expected a text batch") };
             if let Some(color) = color {
                 assert_eq!(fragments.len(), 1);
                 assert_eq!(fragments[0].range, 0..3);
                 assert_eq!(fragments[0].glyph_ranges.as_slice(), &[0..3]);
-                assert_eq!(fragments[0].color, Some(Hsla::from(rgba(color))));
+                assert_eq!(fragments[0].color, Hsla::from(rgba(color)));
             } else {
                 assert_eq!(fragments.len(), 2);
                 assert_eq!(fragments[0].range, 0..1);
-                assert_eq!(fragments[0].color, Some(red));
+                assert_eq!(fragments[0].color, red);
                 assert_eq!(fragments[1].range, 1..3);
-                assert_eq!(fragments[1].color, Some(blue));
+                assert_eq!(fragments[1].color, blue);
             }
             assert!(fragments.iter().all(|fragment| fragment.origin == Point::new(100.0, 200.0)));
         }
@@ -136,10 +121,10 @@ mod color_override_tests {
                 let mut shaper = GpuiTextCache::new(window.text_system().clone());
                 let source =
                     "<style>p::before { content:'Intro'; color:orange !important; }</style><p style='background-color:#008000;color:red !important'>Body <span style='color:blue !important;font-size:24px;font-weight:bold'>Nested</span></p>";
-                let document = load_fragment(source.to_owned(), 300.0, Vec::new(), &mut shaper).unwrap();
+                let document = load_fragment(source.to_owned(), 300.0, Vec::new(), &mut shaper, 16.0, None).unwrap();
                 let scene = render_core::render_scene_for_view(document.render_view().unwrap(), &SceneOptions::new(300.0, None).unwrap().with_image_policy(SceneImagePolicy::default()));
                 for theme_color in [rgb(0xeeeeee).into(), rgb(0x222222).into()] {
-                    let mut painter = GpuiCommandPainter::commands_only(shaper.resources()).text_color(theme_color);
+                    let mut painter = GpuiCommandPainter::commands_only().text_color(theme_color);
                     scene.paint(&mut painter);
                     let commands = painter.finish().commands;
                     let mut text_fragments = 0;
@@ -151,7 +136,7 @@ mod color_override_tests {
                             }
                             PaintCommand::TextBatch { fragments } => {
                                 for fragment in fragments.iter() {
-                                    assert_eq!(fragment.color, Some(theme_color));
+                                    assert_eq!(fragment.color, theme_color);
                                     text_fragments += 1;
                                 }
                             }
@@ -219,6 +204,7 @@ impl ImageCache {
 
 #[derive(Clone)]
 pub(crate) enum PaintCommand {
+    Canvas { rect: Rect, color: Hsla },
     PushClip { rect: Rect },
     PopClip,
     Fill {
@@ -237,7 +223,7 @@ pub(crate) enum PaintCommand {
         color: Hsla,
     },
     Glyph {
-        glyph: GlyphHandle,
+        layout: Arc<LineLayout>,
         origin: Point,
         color: Hsla,
     },
@@ -256,11 +242,11 @@ pub struct GpuiTextRunFragment {
     range: Range<u32>,
     glyph_ranges: SmallVec<[Range<usize>; 2]>,
     origin: Point,
-    color: Option<Hsla>,
+    color: Hsla,
 }
 
 impl GpuiTextRunFragment {
-    fn new(run: Arc<GpuiTextRun>, range: Range<u32>, origin: Point, color: Option<Hsla>) -> Self {
+    fn new(run: Arc<GpuiTextRun>, range: Range<u32>, origin: Point, color: Hsla) -> Self {
         let glyph_ranges = run.glyph_ranges(range.clone());
         Self { run, range, glyph_ranges, origin, color }
     }
@@ -273,24 +259,27 @@ impl GpuiTextRunFragment {
 
 pub struct GpuiCommandPainter<'a> {
     images: Option<&'a mut ImageCache>,
-    glyphs: GlyphStore,
-    text_runs: RunStore,
+    text_resources: Option<NativePaintResources>,
     text_color: Option<Hsla>,
     image_theme: Option<ThemeAdaptation>,
     pub(crate) commands: Vec<PaintCommand>,
 }
 
-/// Recorded GPUI paint commands and the glyph storage they were recorded
-/// against. Replaying them together keeps every native glyph handle valid.
+/// Recorded GPUI paint commands owning every native resource needed for replay.
 #[derive(Clone)]
 pub struct GpuiScene {
     pub(crate) commands: Arc<Vec<PaintCommand>>,
-    resources: GpuiPaintResources,
 }
 
 impl GpuiScene {
     pub fn paint(&self, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App) {
-        paint_commands(&self.commands, &self.resources, bounds, window, cx);
+        paint_commands(&self.commands, bounds, 0.0, false, window, cx);
+    }
+
+    /// Replay retained column content at a new horizontal origin. The canvas
+    /// continues to cover the current viewport, independently of content.
+    pub fn paint_translated(&self, bounds: Bounds<Pixels>, offset_x: f32, window: &mut Window, cx: &mut App) {
+        paint_commands(&self.commands, bounds, offset_x, true, window, cx);
     }
 
     /// Number of recorded commands, for diagnostics.
@@ -312,18 +301,17 @@ impl GpuiScene {
 }
 
 impl<'a> GpuiCommandPainter<'a> {
-    pub fn new(images: &'a mut ImageCache, resources: GpuiTextResources) -> Self {
+    pub fn new(images: &'a mut ImageCache) -> Self {
         Self {
             images: Some(images),
-            ..Self::commands_only(resources)
+            ..Self::commands_only()
         }
     }
 
-    pub fn commands_only(resources: GpuiTextResources) -> Self {
+    pub fn commands_only() -> Self {
         Self {
             images: None,
-            glyphs: resources.glyphs,
-            text_runs: resources.runs,
+            text_resources: None,
             text_color: None,
             image_theme: None,
             commands: Vec::new(),
@@ -339,11 +327,10 @@ impl<'a> GpuiCommandPainter<'a> {
         self
     }
 
-    /// Finish recording, pairing the commands with the glyph storage they use.
+    /// Finish recording. Each text command retains its own native geometry.
     pub fn finish(self) -> GpuiScene {
         GpuiScene {
             commands: Arc::new(self.commands),
-            resources: GpuiPaintResources(self.glyphs),
         }
     }
 
@@ -404,19 +391,42 @@ impl<'a> GpuiCommandPainter<'a> {
         }
     }
 
-    fn push_glyph(&mut self, glyph: GlyphHandle, origin: Point, color: Hsla) {
-        let native = self.glyphs.get(glyph.0 as usize);
-        match native {
-            Some(GpuiGlyph::Empty) => {}
-            Some(GpuiGlyph::RunFragment { run, range }) => {
-                let (Some(start), Some(end)) = (run.caret_stops.get(range.start as usize), run.caret_stops.get(range.end as usize)) else {
+    fn push_glyph(
+        &mut self,
+        resource: NativePaintResource,
+        character: u32,
+        origin: Point,
+        color: Hsla,
+    ) {
+        let resource = match resource.downcast::<GpuiTextRun>() {
+            Ok(run) => {
+                let (Some(start), Some(end)) = (
+                    run.caret_stops.get(character as usize),
+                    run.caret_stops.get(character as usize + 1),
+                ) else {
                     return;
                 };
-                let natural_offset = start.min(end);
-                let origin = Point::new(origin.x - f64::from(natural_offset), origin.y);
-                self.push_text_fragment(GpuiTextRunFragment::new(run, range, origin, Some(color)));
+                let origin = Point::new(origin.x - f64::from(start.min(end)), origin.y);
+                self.push_text_fragment(GpuiTextRunFragment::new(
+                    run,
+                    character..character + 1,
+                    origin,
+                    color,
+                ));
+                return;
             }
-            Some(GpuiGlyph::Layout { .. }) | None => self.commands.push(PaintCommand::Glyph { glyph, origin, color }),
+            Err(resource) => resource,
+        };
+        match resource.downcast::<LineLayout>() {
+            Ok(layout) => self.commands.push(PaintCommand::Glyph {
+                layout,
+                origin,
+                color,
+            }),
+            Err(resource) => debug_assert!(
+                resource.get::<()>().is_some(),
+                "glyph belongs to another native backend"
+            ),
         }
     }
 }
@@ -487,12 +497,28 @@ fn svg_start_with_viewport(start: &BytesStart<'_>, width: u32, height: u32) -> O
 }
 
 impl Painter for GpuiCommandPainter<'_> {
+    fn bind_text_resources(&mut self, resources: &NativePaintResources) -> bool {
+        if !resources.contains_only(&[
+            TypeId::of::<GpuiTextRun>(),
+            TypeId::of::<LineLayout>(),
+            TypeId::of::<()>(),
+        ]) {
+            return false;
+        }
+        self.text_resources = Some(resources.clone());
+        true
+    }
+
     fn push_clip(&mut self, rect: Rect) {
         self.commands.push(PaintCommand::PushClip { rect });
     }
 
     fn pop_clip(&mut self) {
         self.commands.push(PaintCommand::PopClip);
+    }
+
+    fn fill_canvas(&mut self, rect: Rect, color: Color) {
+        self.commands.push(PaintCommand::Canvas { rect, color: gpui_color(color) });
     }
 
     fn fill_rect(&mut self, rect: Rect, color: Color) {
@@ -508,8 +534,18 @@ impl Painter for GpuiCommandPainter<'_> {
     }
 
     fn draw_glyph(&mut self, glyph: GlyphHandle, origin: Point, color: u32) {
+        let Some((resource, character)) = self
+            .text_resources
+            .as_ref()
+            .and_then(|resources| resources.glyph(glyph))
+        else {
+            debug_assert!(false, "renderer referenced a missing native glyph");
+            return;
+        };
+        let resource = resource.clone();
         self.push_glyph(
-            glyph,
+            resource,
+            character,
             origin,
             self.text_color.unwrap_or_else(|| Hsla::from(rgba(color))),
         );
@@ -526,17 +562,32 @@ impl Painter for GpuiCommandPainter<'_> {
         origin: Point,
         color: Option<u32>,
     ) {
-        let Some(run) = self.text_runs.get(run.0 as usize).cloned() else {
+        let Some(run) = self
+            .text_resources
+            .as_ref()
+            .and_then(|resources| resources.run(run))
+            .cloned()
+            .and_then(|resource| resource.downcast::<GpuiTextRun>().ok())
+        else {
             debug_assert!(false, "renderer referenced a missing shaped text run");
             return;
         };
-        self.push_text_fragment(GpuiTextRunFragment::new(run, range, origin, self.text_color.or_else(|| color.map(|color| Hsla::from(rgba(color))))));
+        let color = self
+            .text_color
+            .unwrap_or_else(|| Hsla::from(rgba(color.unwrap_or(0x000000ff))));
+        self.push_text_fragment(GpuiTextRunFragment::new(run, range, origin, color));
     }
 
     fn draw_prepared_text_run_batch(&mut self, fragments: &[PreparedTextRunFragment], line_origin: Point, scale: f64, color: Option<u32>) {
         let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
         for fragment in fragments {
-            let Some(run) = self.text_runs.get(fragment.run.0 as usize).cloned() else {
+            let Some(run) = self
+                .text_resources
+                .as_ref()
+                .and_then(|resources| resources.run(fragment.run))
+                .cloned()
+                .and_then(|resource| resource.downcast::<GpuiTextRun>().ok())
+            else {
                 debug_assert!(false, "renderer referenced a missing shaped text run");
                 continue;
             };
@@ -545,7 +596,8 @@ impl Painter for GpuiCommandPainter<'_> {
             // Fallback fonts can give adjacent runs different ascents.
             let baseline = ((line_origin.y + offset.y) * scale).round() / scale;
             let origin = Point::new(line_origin.x + offset.x, baseline);
-            self.push_text_fragment(GpuiTextRunFragment::new(run, fragment.range.clone(), origin, self.text_color.or_else(|| color.or(fragment.color).map(|color| Hsla::from(rgba(color))))));
+            let color = self.text_color.unwrap_or_else(|| Hsla::from(rgba(color.or(fragment.color).unwrap_or(0x000000ff))));
+            self.push_text_fragment(GpuiTextRunFragment::new(run, fragment.range.clone(), origin, color));
         }
     }
 
@@ -608,18 +660,21 @@ impl Painter for GpuiCommandPainter<'_> {
 
 fn paint_commands(
     commands: &[PaintCommand],
-    resources: &GpuiPaintResources,
     bounds: Bounds<Pixels>,
+    offset_x: f32,
+    resize_canvas: bool,
     window: &mut Window,
     cx: &mut App,
 ) {
     let started = Instant::now();
     let profile_enabled = std::env::var_os("BOKHEIM_PROFILE_RESIZE").is_some() || std::env::var_os("GPUI_KOBO_PROFILE").is_some();
     let mut profile = PaintProfile::default();
+    let mut content_bounds = bounds;
+    content_bounds.origin.x += px(offset_x);
     paint_commands_inner(
         commands,
-        &resources.0,
-        bounds,
+        content_bounds,
+        resize_canvas.then_some(bounds),
         window,
         cx,
         &mut profile,
@@ -628,14 +683,13 @@ fn paint_commands(
     let duration_ms = started.elapsed().as_millis();
     if profile_enabled {
         println!(
-            "HTML_GPUI_PAINT_DETAIL commands={} text_run_commands={} text_run_fragments={} standalone_glyph_commands={} glyphs={} text_run_us={} fragment_us={} layout_us={} fill_us={} image_us={} total_us={}",
+            "HTML_GPUI_PAINT_DETAIL commands={} text_run_commands={} text_run_fragments={} standalone_glyph_commands={} glyphs={} text_run_us={} layout_us={} fill_us={} image_us={} total_us={}",
             commands.len(),
             profile.text_run_commands,
             profile.text_run_fragments,
             profile.standalone_glyph_commands,
             profile.glyphs,
             profile.text_run_us,
-            profile.fragment_us,
             profile.layout_us,
             profile.fill_us,
             profile.image_us,
@@ -654,17 +708,23 @@ struct PaintProfile {
     standalone_glyph_commands: usize,
     glyphs: usize,
     text_run_us: u128,
-    fragment_us: u128,
     layout_us: u128,
     fill_us: u128,
     image_us: u128,
 }
 
-fn paint_commands_inner(commands: &[PaintCommand], glyphs: &GlyphStorage, bounds: Bounds<Pixels>, window: &mut Window, cx: &mut App, profile: &mut PaintProfile, profile_enabled: bool) {
+fn paint_commands_inner(commands: &[PaintCommand], bounds: Bounds<Pixels>, canvas_bounds: Option<Bounds<Pixels>>, window: &mut Window, cx: &mut App, profile: &mut PaintProfile, profile_enabled: bool) {
     let mut index = 0usize;
     while index < commands.len() {
         let command = &commands[index];
         match command {
+            PaintCommand::Canvas { rect, color } => {
+                let canvas = canvas_bounds.unwrap_or_else(|| Bounds {
+                    origin: point(bounds.origin.x + px(rect.x0 as f32), bounds.origin.y + px(rect.y0 as f32)),
+                    size: size(px(rect.width() as f32), px(rect.height() as f32)),
+                });
+                window.paint_quad(fill(canvas, *color));
+            }
             PaintCommand::PushClip { rect } => {
                 let mut depth = 1usize;
                 let mut end = index + 1;
@@ -679,7 +739,7 @@ fn paint_commands_inner(commands: &[PaintCommand], glyphs: &GlyphStorage, bounds
                 debug_assert_eq!(depth, 0, "paint clip commands must be balanced");
                 let inner_end = end.saturating_sub(1);
                 let clip_bounds = Bounds { origin: point(bounds.origin.x + px(rect.x0 as f32), bounds.origin.y + px(rect.y0 as f32)), size: size(px(rect.width().max(0.0) as f32), px(rect.height().max(0.0) as f32)) };
-                window.with_content_mask(Some(ContentMask { bounds: clip_bounds }), |window| paint_commands_inner(&commands[index + 1..inner_end], glyphs, bounds, window, cx, profile, profile_enabled));
+                window.with_content_mask(Some(ContentMask { bounds: clip_bounds }), |window| paint_commands_inner(&commands[index + 1..inner_end], bounds, canvas_bounds, window, cx, profile, profile_enabled));
                 index = end;
                 continue;
             }
@@ -711,63 +771,26 @@ fn paint_commands_inner(commands: &[PaintCommand], glyphs: &GlyphStorage, bounds
                     profile.fill_us += started.elapsed().as_micros();
                 }
             }
-            PaintCommand::Glyph { glyph, origin, color } => {
+            PaintCommand::Glyph { layout, origin, color } => {
                 profile.standalone_glyph_commands += 1;
-                let Some(glyph) = glyphs.get(glyph.0 as usize) else {
-                    debug_assert!(false, "paint command referenced a missing interned glyph");
-                    continue;
-                };
-                match glyph {
-                    GpuiGlyph::Empty => {}
-                    GpuiGlyph::Layout { layout } => {
-                        let operation_started = profile_enabled.then(Instant::now);
-                        let origin = point(bounds.origin.x + px(origin.x as f32), bounds.origin.y + px(origin.y as f32));
-                        for run in &layout.runs {
-                            profile.glyphs += run.glyphs.len();
-                            let paint_glyphs = run.glyphs.iter().map(|shaped_glyph| PaintGlyph {
-                                origin: point(origin.x + shaped_glyph.position.x, origin.y + shaped_glyph.position.y),
-                                font_id: run.font_id,
-                                glyph_id: shaped_glyph.id,
-                                font_size: layout.font_size,
-                                color: *color,
-                                is_emoji: shaped_glyph.is_emoji,
-                            });
-                            if let Err(error) = window.paint_glyphs(paint_glyphs) {
-                                eprintln!("failed to paint GPUI glyph batch: {error:#}");
-                            }
-                        }
-                        if let Some(started) = operation_started {
-                            profile.layout_us += started.elapsed().as_micros();
-                        }
+                let operation_started = profile_enabled.then(Instant::now);
+                let origin = point(bounds.origin.x + px(origin.x as f32), bounds.origin.y + px(origin.y as f32));
+                for run in &layout.runs {
+                    profile.glyphs += run.glyphs.len();
+                    let paint_glyphs = run.glyphs.iter().map(|shaped_glyph| PaintGlyph {
+                        origin: point(origin.x + shaped_glyph.position.x, origin.y + shaped_glyph.position.y),
+                        font_id: run.font_id,
+                        glyph_id: shaped_glyph.id,
+                        font_size: layout.font_size,
+                        color: *color,
+                        is_emoji: shaped_glyph.is_emoji,
+                    });
+                    if let Err(error) = window.paint_glyphs(paint_glyphs) {
+                        eprintln!("failed to paint GPUI glyph batch: {error:#}");
                     }
-                    GpuiGlyph::RunFragment { run, range } => {
-                        let operation_started = profile_enabled.then(Instant::now);
-                        let (Some(start), Some(end)) = (run.caret_stops.get(range.start as usize), run.caret_stops.get(range.end as usize)) else {
-                            continue;
-                        };
-                        let natural_offset = start.min(end);
-                        let glyph_ranges = run.glyph_ranges(range.clone());
-                        let baseline = point(bounds.origin.x + px(origin.x as f32), bounds.origin.y + px(origin.y as f32));
-                        let selected = glyph_ranges.iter().flat_map(|range| run.glyphs_in_range(range.clone()));
-                        let mut glyph_count = 0usize;
-                        let paint_glyphs = selected
-                            .map(|shaped_glyph| PaintGlyph {
-                                origin: point(baseline.x + shaped_glyph.position.x - px(natural_offset), baseline.y + shaped_glyph.position.y),
-                                font_id: shaped_glyph.font_id,
-                                glyph_id: shaped_glyph.glyph_id,
-                                font_size: shaped_glyph.font_size,
-                                color: *color,
-                                is_emoji: shaped_glyph.is_emoji,
-                            })
-                            .inspect(|_| glyph_count += 1);
-                        if let Err(error) = window.paint_glyphs(paint_glyphs) {
-                            eprintln!("failed to paint GPUI glyph batch: {error:#}");
-                        }
-                        profile.glyphs += glyph_count;
-                        if let Some(started) = operation_started {
-                            profile.fragment_us += started.elapsed().as_micros();
-                        }
-                    }
+                }
+                if let Some(started) = operation_started {
+                    profile.layout_us += started.elapsed().as_micros();
                 }
             }
             PaintCommand::TextBatch { fragments } => {
@@ -792,7 +815,7 @@ fn paint_commands_inner(commands: &[PaintCommand], glyphs: &GlyphStorage, bounds
                             font_id: glyph.font_id,
                             glyph_id: glyph.glyph_id,
                             font_size: glyph.font_size,
-                            color: fragment.color.unwrap_or_else(|| fragment.run.color_at(glyph.byte_index)),
+                            color: fragment.color,
                             is_emoji: glyph.is_emoji,
                         })
                     })

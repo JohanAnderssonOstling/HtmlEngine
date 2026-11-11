@@ -1,10 +1,11 @@
 //! Compile selector indices and compact match instructions from prepared rules.
 use crate::style::compiled::{
-    CompiledSelectors, Compound, EffectiveRuleId, FastTest, PreparedRuleSet, PreparedSelector,
-    Relation, SelectorIndex,
-};
-use crate::style::syntax::selectors::{ancestor_hash, selector_specificity};
-use lightningcss::selector::{Combinator, Component, Selector};
+    CandidateRange, CompiledSelectors, Compound, FastAlternative, FastAttribute, FastTest,
+    PreparedRuleSet, PreparedSelector, Relation, RuleSelectorRange, SelectorBuckets,
+    SelectorCandidate, SelectorIndex, SelectorState};
+use crate::style::matching::filter::SelectorFilter;
+use crate::style::syntax::selectors::{selector_pseudo_mask, selector_specificity};
+use lightningcss::selector::{Combinator, Component, PseudoClass, PseudoElement, Selector};
 use rustc_data_structures::fx::FxHashMap;
 use static_self::IntoOwned;
 
@@ -40,79 +41,292 @@ impl CompiledSelectors {
             compounds: Vec::with_capacity(fast_compound_count),
         };
         for (_, rule) in prepared.iter() {
-            output.rule_starts.push(
-                u32::try_from(output.selectors.len()).expect("prepared selector count fits in u32"),
-            );
+            let start =
+                u32::try_from(output.selectors.len()).expect("prepared selector count fits in u32");
+            let mut max_specificity = 0;
             for selector in &rule.style_rule().selectors.0 {
                 let fast = append_fast(selector, &mut output.tests, &mut output.compounds);
+                let specificity = selector_specificity(selector);
+                max_specificity = max_specificity.max(specificity);
                 output.selectors.push(PreparedSelector {
                     ancestor_requirements: ancestor_requirement_mask(selector),
-                    specificity: selector_specificity(selector),
+                    specificity,
                     fast_start: fast.map_or(0, |range| range.0),
                     fast_len: fast.map_or(0, |range| range.1),
+                    pseudo_mask: selector_pseudo_mask(selector),
+                    has_node_conditions: selector_has_node_conditions(selector),
+                    bucket_component: bucket_component(selector),
+                    bucket_test: fast.map_or(u16::MAX, |range| range.2),
                 });
             }
+            output.rule_starts.push(RuleSelectorRange {
+                start,
+                max_specificity,
+            });
         }
-        output.rule_starts.push(
-            u32::try_from(output.selectors.len()).expect("prepared selector count fits in u32"),
-        );
+        output.rule_starts.push(RuleSelectorRange {
+            start: u32::try_from(output.selectors.len())
+                .expect("prepared selector count fits in u32"),
+            max_specificity: 0,
+        });
         output
     }
 }
 
 impl SelectorIndex {
-    pub fn new() -> Self {
-        Self { by_tag: FxHashMap::default(), by_class: FxHashMap::default(), by_id: FxHashMap::default(), universal: Vec::new(), compiled: CompiledSelectors::empty() }
-    }
-
     /// Build an index only from rules admitted by stylesheet preparation.
     pub fn from_prepared(prepared: &PreparedRuleSet<'_>) -> Self {
-        let mut index = Self::new();
-        index.compiled = CompiledSelectors::from_prepared(prepared);
+        let mut index = SelectorBuckets::default();
         for (id, rule) in prepared.iter() {
-            for selector in &rule.style_rule().selectors.0 {
-                index.add_selector(selector, id);
+            for (selector_index, selector) in rule.style_rule().selectors.0.iter().enumerate() {
+                index.add_selector(
+                    selector,
+                    SelectorCandidate {
+                        rule: id,
+                        selector: u32::try_from(selector_index)
+                            .expect("rule selector count fits in u32"),
+                    },
+                );
             }
         }
-        index
+        index.finish(CompiledSelectors::from_prepared(prepared))
+    }
+}
+
+impl SelectorBuckets {
+    pub(crate) fn finish(self, compiled: CompiledSelectors) -> SelectorIndex {
+        let count = self
+            .by_tag
+            .values()
+            .chain(self.by_class.values())
+            .chain(self.by_id.values())
+            .chain(self.by_attribute.values())
+            .chain(self.by_namespace.values())
+            .chain(self.by_state.values())
+            .map(Vec::len)
+            .sum::<usize>()
+            + self.universal.len()
+            + self.root.len();
+        let mut candidates = Vec::with_capacity(count);
+        let mut append = |mut bucket: Vec<SelectorCandidate>| {
+            bucket.sort_unstable_by_key(|candidate| (candidate.rule.index(), candidate.selector));
+            bucket.dedup();
+            let range = CandidateRange {
+                start: u32::try_from(candidates.len()).expect("candidate pool fits u32"),
+                len: u32::try_from(bucket.len()).expect("candidate bucket fits u32"),
+            };
+            candidates.extend(bucket);
+            range
+        };
+        let by_tag = self
+            .by_tag
+            .into_iter()
+            .map(|(key, bucket)| (key, append(bucket)))
+            .collect();
+        let by_class = self
+            .by_class
+            .into_iter()
+            .map(|(key, bucket)| (key, append(bucket)))
+            .collect();
+        let by_id = self
+            .by_id
+            .into_iter()
+            .map(|(key, bucket)| (key, append(bucket)))
+            .collect();
+        let by_attribute = self
+            .by_attribute
+            .into_iter()
+            .map(|(key, bucket)| (key, append(bucket)))
+            .collect();
+        let by_namespace = self
+            .by_namespace
+            .into_iter()
+            .map(|(key, bucket)| (key, append(bucket)))
+            .collect();
+        let by_state = self
+            .by_state
+            .into_iter()
+            .map(|(key, bucket)| (key, append(bucket)))
+            .collect();
+        let root = append(self.root);
+        let universal = append(self.universal);
+        SelectorIndex {
+            by_tag,
+            by_class,
+            by_id,
+            by_attribute,
+            by_namespace,
+            by_state,
+            root,
+            universal,
+            candidates,
+            compiled,
+        }
     }
 
-    /// Add a selector to the index
-    fn add_selector(&mut self, selector: &Selector, rule_id: EffectiveRuleId) {
-        let mut indexed = false;
-
-        // Raw match order starts at the rightmost compound, which is the only
-        // compound guaranteed to match the element currently being resolved.
-        // Indexing ancestor compounds admits false candidates for every
-        // descendant selector and makes selector matching needlessly broad.
-        for component in selector.iter_raw_match_order() {
-            if component.is_combinator() {
-                break;
+    /// Prefer an ID, then a class, then a tag from the target compound.
+    /// A selector is admitted only by its own key, not another selector in
+    /// the same rule. Logical selectors without such a key stay universal.
+    fn add_selector(&mut self, selector: &Selector<'_>, candidate: SelectorCandidate) {
+        match target_key(selector).map(|(_, component)| component) {
+            Some(Component::ID(id)) => {
+                push_candidate(&mut self.by_id, id.as_ref(), candidate);
             }
-            let (index, key) = match component {
-                Component::LocalName(name) => (&mut self.by_tag, name.lower_name.0.as_ref()),
-                Component::Class(class) => (&mut self.by_class, class.0.as_ref()),
-                Component::ID(id) => (&mut self.by_id, id.0.as_ref()),
-                _ => continue,
-            };
-            index.entry(key.to_owned()).or_default().push(rule_id);
-            indexed = true;
+            Some(Component::Class(class)) => {
+                push_candidate(&mut self.by_class, class.as_ref(), candidate);
+            }
+            Some(Component::LocalName(tag)) => {
+                push_candidate(&mut self.by_tag, tag.lower_name.as_ref(), candidate);
+                // XML preserves case; a lower-case alias is only a candidate,
+                // so mixed-case type selectors cannot skip exact checking.
+                if tag.name != tag.lower_name {
+                    push_candidate(&mut self.by_tag, tag.name.as_ref(), candidate);
+                }
+            }
+            Some(Component::Is(alternatives) | Component::Where(alternatives)) => {
+                for alternative in alternatives.iter() {
+                    self.add_selector(alternative, candidate);
+                }
+            }
+            Some(
+                Component::AttributeInNoNamespaceExists { local_name, .. }
+                | Component::AttributeInNoNamespace { local_name, .. },
+            ) => {
+                self.add_attribute(local_name.as_ref(), candidate);
+            }
+            Some(Component::AttributeOther(attribute)) => {
+                self.add_attribute(attribute.local_name.as_ref(), candidate)
+            }
+            Some(Component::DefaultNamespace(namespace) | Component::Namespace(_, namespace)) => {
+                push_candidate(&mut self.by_namespace, namespace.as_ref(), candidate);
+            }
+            Some(Component::ExplicitNoNamespace) => {
+                push_candidate(&mut self.by_namespace, "", candidate)
+            }
+            Some(Component::Root) => self.root.push(candidate),
+            Some(Component::NonTSPseudoClass(pseudo)) => {
+                self.by_state
+                    .entry(
+                        selector_state(pseudo).expect("indexed state checked during key selection"),
+                    )
+                    .or_default()
+                    .push(candidate);
+            }
+            _ => self.universal.push(candidate),
         }
+    }
 
-        // Selectors without an indexable key remain universal candidates.
-        if !indexed {
-            self.universal.push(rule_id);
+    fn add_attribute(&mut self, name: &str, candidate: SelectorCandidate) {
+        push_candidate(&mut self.by_attribute, name, candidate);
+        if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            push_candidate(
+                &mut self.by_attribute,
+                &name.to_ascii_lowercase(),
+                candidate,
+            );
         }
     }
 }
 
-fn ancestor_requirement_mask(selector: &Selector<'_>) -> u64 {
+fn selector_state(pseudo: &PseudoClass<'_>) -> Option<SelectorState> {
+    match pseudo {
+        PseudoClass::Link | PseudoClass::AnyLink(_) => Some(SelectorState::Link),
+        PseudoClass::Enabled => Some(SelectorState::Enabled),
+        PseudoClass::Disabled => Some(SelectorState::Disabled),
+        PseudoClass::Checked => Some(SelectorState::Checked),
+        _ => None,
+    }
+}
+
+/// Allocate a key only for a new bucket, rather than for every selector.
+fn push_candidate(
+    buckets: &mut FxHashMap<String, Vec<SelectorCandidate>>,
+    key: &str,
+    candidate: SelectorCandidate,
+) {
+    if let Some(bucket) = buckets.get_mut(key) {
+        bucket.push(candidate);
+    } else {
+        buckets.insert(key.to_owned(), vec![candidate]);
+    }
+}
+
+/// Share key selection with proof metadata so the skipped predicate is
+/// exactly the one that admitted this selector into the candidate list.
+fn target_key<'a, 'css>(selector: &'a Selector<'css>) -> Option<(usize, &'a Component<'css>)> {
+    let mut tag = None;
+    let mut class = None;
+    let mut alternatives = None;
+    let mut attribute = None;
+    let mut state = None;
+    let mut namespace = None;
+    let mut root = None;
+    for (position, component) in selector.iter_raw_match_order().enumerate() {
+        match component {
+            Component::Combinator(Combinator::PseudoElement) => continue,
+            Component::Combinator(_) => break,
+            Component::ID(_) => return Some((position, component)),
+            Component::Class(_) => class = Some((position, component)),
+            Component::LocalName(_) => tag = Some((position, component)),
+            Component::AttributeInNoNamespaceExists { .. }
+            | Component::AttributeInNoNamespace { .. }
+            | Component::AttributeOther(_) => attribute = Some((position, component)),
+            Component::NonTSPseudoClass(pseudo) if selector_state(pseudo).is_some() => {
+                state = Some((position, component))
+            }
+            Component::DefaultNamespace(_)
+            | Component::Namespace(_, _)
+            | Component::ExplicitNoNamespace => namespace = Some((position, component)),
+            Component::Root => root = Some((position, component)),
+            Component::Is(selectors) | Component::Where(selectors)
+                if simple_alternatives(selectors) =>
+            {
+                alternatives = Some((position, component))
+            }
+            _ => {}
+        }
+    }
+    class
+        .or(tag)
+        .or(alternatives)
+        .or(attribute)
+        .or(state)
+        .or(root)
+        .or(namespace)
+}
+
+fn bucket_component(selector: &Selector<'_>) -> u16 {
+    let Some((position, component)) = target_key(selector) else {
+        return u16::MAX;
+    };
+    let proved = match component {
+        Component::ID(_) | Component::Class(_) => true,
+        Component::LocalName(name) => name.name == name.lower_name,
+        Component::Is(selectors) | Component::Where(selectors) => {
+            selectors
+                .iter()
+                .all(|selector| match simple_component(selector) {
+                    Some(Component::ID(_) | Component::Class(_)) => true,
+                    Some(Component::LocalName(name)) => name.name == name.lower_name,
+                    _ => false,
+                })
+        }
+        _ => false,
+    };
+    if proved {
+        u16::try_from(position).unwrap_or(u16::MAX)
+    } else {
+        u16::MAX
+    }
+}
+
+fn ancestor_requirement_mask(selector: &Selector<'_>) -> SelectorFilter {
     let mut iter = selector.iter();
     for _ in iter.by_ref() {}
-    let mut requirements = 0;
+    let mut requirements = SelectorFilter::default();
     while let Some(combinator) = iter.next_sequence() {
         if !matches!(combinator, Combinator::Child | Combinator::Descendant) {
-            return 0;
+            return SelectorFilter::default();
         }
         for component in iter.by_ref() {
             let value = match component {
@@ -122,7 +336,7 @@ fn ancestor_requirement_mask(selector: &Selector<'_>) -> u64 {
                 _ => None,
             };
             if let Some(value) = value {
-                requirements |= ancestor_hash(value)
+                requirements.insert(value)
             }
         }
     }
@@ -133,11 +347,17 @@ fn append_fast(
     selector: &Selector<'_>,
     tests: &mut Vec<FastTest>,
     compounds: &mut Vec<Compound>,
-) -> Option<(u32, u16)> {
+) -> Option<(u32, u16, u16)> {
     let tests_before = tests.len();
     let compounds_before = compounds.len();
     let mut test_start = tests.len();
-    for component in selector.iter_raw_match_order() {
+    let mut pseudo_seen = false;
+    let proven_component = bucket_component(selector);
+    let mut proven_test = u16::MAX;
+    for (position, component) in selector.iter_raw_match_order().enumerate() {
+        if position == usize::from(proven_component) && proven_component != u16::MAX {
+            proven_test = u16::try_from(tests.len() - tests_before).unwrap_or(u16::MAX);
+        }
         match component {
             Component::LocalName(name) => tests.push(FastTest::LocalName {
                 name: name.name.clone().into_owned(),
@@ -145,8 +365,76 @@ fn append_fast(
             }),
             Component::ID(id) => tests.push(FastTest::Id(id.clone().into_owned())),
             Component::Class(class) => tests.push(FastTest::Class(class.clone().into_owned())),
-            Component::ExplicitUniversalType => {}
-            Component::Combinator(combinator @ (Combinator::Child | Combinator::Descendant)) => {
+            Component::NonTSPseudoClass(pseudo) => {
+                tests.push(FastTest::PseudoClass(Box::new(pseudo.clone().into_owned())));
+            }
+            component @ (Component::AttributeInNoNamespaceExists { .. }
+            | Component::AttributeInNoNamespace { .. }) => {
+                tests.push(FastTest::Attribute(Box::new(fast_attribute(component))));
+            }
+            Component::Is(selectors) | Component::Where(selectors) => {
+                let alternatives = selectors
+                    .iter()
+                    .map(|selector| match simple_component(selector) {
+                        Some(Component::LocalName(name)) => Some(FastAlternative::LocalName {
+                            name: name.name.clone().into_owned(),
+                            lower_name: name.lower_name.clone().into_owned(),
+                        }),
+                        Some(Component::ID(id)) => {
+                            Some(FastAlternative::Id(id.clone().into_owned()))
+                        }
+                        Some(Component::Class(class)) => {
+                            Some(FastAlternative::Class(class.clone().into_owned()))
+                        }
+                        _ => None,
+                    })
+                    .collect::<Option<Box<[_]>>>();
+                let Some(alternatives) = alternatives else {
+                    return rollback(tests, compounds, tests_before, compounds_before);
+                };
+                tests.push(FastTest::Any(alternatives));
+            }
+            Component::Negation(selectors) => {
+                // :not(A, B) is !A && !B. Each argument must remain atomic;
+                // compounds and nested logical arguments keep exact general matching.
+                for selector in selectors {
+                    let test = match negatable_component(selector) {
+                        Some(Component::LocalName(name)) => FastTest::NotLocalName {
+                            name: name.name.clone().into_owned(),
+                            lower_name: name.lower_name.clone().into_owned(),
+                        },
+                        Some(Component::ID(id)) => FastTest::NotId(id.clone().into_owned()),
+                        Some(Component::Class(class)) => {
+                            FastTest::NotClass(class.clone().into_owned())
+                        }
+                        Some(
+                            component @ (Component::AttributeInNoNamespaceExists { .. }
+                            | Component::AttributeInNoNamespace { .. }),
+                        ) => FastTest::NotAttribute(Box::new(fast_attribute(component))),
+                        Some(Component::NonTSPseudoClass(pseudo)) => {
+                            FastTest::NotPseudoClass(Box::new(pseudo.clone().into_owned()))
+                        }
+                        _ => return rollback(tests, compounds, tests_before, compounds_before),
+                    };
+                    tests.push(test);
+                }
+            }
+            Component::PseudoElement(
+                PseudoElement::Before
+                | PseudoElement::After
+                | PseudoElement::FirstLine
+                | PseudoElement::FirstLetter,
+            ) => {
+                if pseudo_seen || compounds.len() != compounds_before {
+                    return rollback(tests, compounds, tests_before, compounds_before);
+                }
+                pseudo_seen = true;
+            }
+            Component::ExplicitUniversalType | Component::Combinator(Combinator::PseudoElement) => {
+            }
+            Component::Combinator(
+                combinator @ (Combinator::Child | Combinator::Descendant | Combinator::NextSibling),
+            ) => {
                 let Ok(test_len) = u16::try_from(tests.len() - test_start) else {
                     return rollback(tests, compounds, tests_before, compounds_before);
                 };
@@ -154,10 +442,11 @@ fn append_fast(
                     test_start: u32::try_from(test_start)
                         .expect("prepared selector tests fit in u32"),
                     test_len,
-                    relation: if *combinator == Combinator::Child {
-                        Relation::Parent
-                    } else {
-                        Relation::Ancestor
+                    relation: match combinator {
+                        Combinator::Child => Relation::Parent,
+                        Combinator::Descendant => Relation::Ancestor,
+                        Combinator::NextSibling => Relation::PreviousSibling,
+                        _ => unreachable!("compact relation checked above"),
                     },
                 });
                 test_start = tests.len();
@@ -179,7 +468,34 @@ fn append_fast(
     Some((
         u32::try_from(compounds_before).expect("prepared selector compounds fit in u32"),
         compound_len,
+        proven_test,
     ))
+}
+
+/// Shared by positive and negated unprefixed attribute predicates.
+fn fast_attribute(component: &Component<'_>) -> FastAttribute {
+    match component {
+        Component::AttributeInNoNamespaceExists {
+            local_name,
+            local_name_lower,
+        } => FastAttribute::Exists {
+            name: local_name.clone().into_owned(),
+            lower_name: local_name_lower.clone().into_owned(),
+        },
+        Component::AttributeInNoNamespace {
+            local_name,
+            operator,
+            value,
+            case_sensitivity,
+            ..
+        } => FastAttribute::Value {
+            operator: *operator,
+            name: local_name.clone().into_owned(),
+            value: value.clone().into_owned(),
+            case_sensitivity: *case_sensitivity,
+        },
+        _ => unreachable!("compact attribute predicate checked by the caller"),
+    }
 }
 
 fn rollback<T>(
@@ -187,7 +503,7 @@ fn rollback<T>(
     compounds: &mut Vec<Compound>,
     tests_before: usize,
     compounds_before: usize,
-) -> Option<(u32, u16)> {
+) -> Option<(u32, u16, u16)> {
     tests.truncate(tests_before);
     compounds.truncate(compounds_before);
     None
@@ -196,20 +512,104 @@ fn rollback<T>(
 fn fast_shape(selector: &Selector<'_>) -> Option<(usize, usize)> {
     let mut tests = 0;
     let mut compounds = 1;
+    let mut pseudo_seen = false;
     for component in selector.iter_raw_match_order() {
         match component {
-            Component::LocalName(_) | Component::ID(_) | Component::Class(_) => tests += 1,
-            Component::ExplicitUniversalType => {}
-            Component::Combinator(Combinator::Child | Combinator::Descendant) => compounds += 1,
+            Component::LocalName(_)
+            | Component::ID(_)
+            | Component::Class(_)
+            | Component::NonTSPseudoClass(_) => tests += 1,
+            Component::AttributeInNoNamespaceExists { .. }
+            | Component::AttributeInNoNamespace { .. } => tests += 1,
+            Component::Is(selectors) | Component::Where(selectors) => {
+                if !selectors
+                    .iter()
+                    .all(|selector| simple_component(selector).is_some())
+                {
+                    return None;
+                }
+                tests += 1;
+            }
+            Component::Negation(selectors) => {
+                if !selectors
+                    .iter()
+                    .all(|selector| negatable_component(selector).is_some())
+                {
+                    return None;
+                }
+                tests += selectors.len();
+            }
+            Component::PseudoElement(
+                PseudoElement::Before
+                | PseudoElement::After
+                | PseudoElement::FirstLine
+                | PseudoElement::FirstLetter,
+            ) => {
+                if pseudo_seen || compounds != 1 {
+                    return None;
+                }
+                pseudo_seen = true;
+            }
+            Component::ExplicitUniversalType | Component::Combinator(Combinator::PseudoElement) => {
+            }
+            Component::Combinator(
+                Combinator::Child | Combinator::Descendant | Combinator::NextSibling,
+            ) => compounds += 1,
             _ => return None,
         }
     }
     Some((tests, compounds))
 }
 
+fn simple_alternatives(selectors: &[Selector<'_>]) -> bool {
+    !selectors.is_empty()
+        && selectors
+            .iter()
+            .all(|selector| simple_component(selector).is_some())
+}
+
+fn selector_has_node_conditions(selector: &Selector<'_>) -> bool {
+    selector
+        .iter_raw_match_order()
+        .any(|component| match component {
+            Component::AttributeInNoNamespaceExists { .. }
+            | Component::AttributeInNoNamespace { .. }
+            | Component::AttributeOther(_)
+            | Component::NonTSPseudoClass(_) => true,
+            Component::Is(selectors)
+            | Component::Where(selectors)
+            | Component::Negation(selectors) => selectors.iter().any(selector_has_node_conditions),
+            _ => false,
+        })
+}
+
+fn negatable_component<'a, 'css>(selector: &'a Selector<'css>) -> Option<&'a Component<'css>> {
+    match selector.iter_raw_match_order().as_slice() {
+        [
+            component @ (Component::LocalName(_)
+            | Component::ID(_)
+            | Component::Class(_)
+            | Component::AttributeInNoNamespaceExists { .. }
+            | Component::AttributeInNoNamespace { .. }
+            | Component::NonTSPseudoClass(_)),
+        ] => Some(component),
+        _ => None,
+    }
+}
+
+fn simple_component<'a, 'css>(selector: &'a Selector<'css>) -> Option<&'a Component<'css>> {
+    match selector.iter_raw_match_order().as_slice() {
+        [component @ (Component::LocalName(_) | Component::ID(_) | Component::Class(_))] => {
+            Some(component)
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::style::compiled::EffectiveRuleId;
     use crate::style::matching::dom;
     use lightningcss::selector::SelectorList;
     use lightningcss::stylesheet::ParserOptions;
@@ -221,7 +621,7 @@ mod tests {
 
     #[test]
     fn index_keys_come_only_from_the_rightmost_compound() {
-        let mut index = SelectorIndex::new();
+        let mut index = SelectorBuckets::default();
         for (id, text) in [
             "SECTION.ancestor > P.note#target",
             ".ancestor *[title]",
@@ -233,35 +633,65 @@ mod tests {
         .enumerate()
         {
             let selectors = parsed(text);
-            index.add_selector(&selectors.0[0], EffectiveRuleId(id as u32));
+            index.add_selector(
+                &selectors.0[0],
+                SelectorCandidate {
+                    rule: EffectiveRuleId(id as u32),
+                    selector: 0,
+                },
+            );
         }
-        assert_eq!(index.by_tag["p"], [EffectiveRuleId(0)]);
-        assert_eq!(index.by_tag["item"], [EffectiveRuleId(4)]);
+        assert_eq!(index.by_tag["p"], [SelectorCandidate { rule: EffectiveRuleId(2), selector: 0 }]);
+        assert!(!index.by_tag.contains_key("item"));
         assert!(!index.by_tag.contains_key("section"));
         assert_eq!(
             index.by_class["note"],
-            [EffectiveRuleId(0), EffectiveRuleId(4)]
+            [SelectorCandidate {
+                rule: EffectiveRuleId(4),
+                selector: 0
+            }]
         );
         let mut peers = index.by_class["peer"].clone();
         peers.dedup();
-        assert_eq!(peers, [EffectiveRuleId(3)]);
+        assert_eq!(
+            peers,
+            [SelectorCandidate {
+                rule: EffectiveRuleId(3),
+                selector: 0
+            }]
+        );
         assert!(!index.by_class.contains_key("ancestor"));
-        assert_eq!(index.by_id["target"], [EffectiveRuleId(0)]);
+        assert_eq!(
+            index.by_id["target"],
+            [SelectorCandidate {
+                rule: EffectiveRuleId(0),
+                selector: 0
+            }]
+        );
         assert!(!index.by_id.contains_key("ancestor"));
-        assert_eq!(index.universal, [EffectiveRuleId(1), EffectiveRuleId(2)]);
+        assert_eq!(
+            index.by_attribute["title"],
+            [
+                SelectorCandidate {
+                    rule: EffectiveRuleId(1),
+                    selector: 0
+                },
+            ]
+        );
     }
 
-    fn prepared(
-        selector: &Selector<'_>,
-        compiled: &mut CompiledSelectors,
-    ) -> PreparedSelector {
-        let (fast_start, fast_len) =
+    fn prepared(selector: &Selector<'_>, compiled: &mut CompiledSelectors) -> PreparedSelector {
+        let (fast_start, fast_len, bucket_test) =
             append_fast(selector, &mut compiled.tests, &mut compiled.compounds).unwrap();
         PreparedSelector {
-            ancestor_requirements: 0,
+            ancestor_requirements: SelectorFilter::default(),
             specificity: 0,
             fast_start,
             fast_len,
+            pseudo_mask: selector_pseudo_mask(selector),
+            has_node_conditions: selector_has_node_conditions(selector),
+            bucket_component: bucket_component(selector),
+            bucket_test,
         }
     }
 
@@ -281,24 +711,19 @@ mod tests {
             let selector = &selectors.0[0];
             let mut compiled = CompiledSelectors::empty();
             let prepared = prepared(selector, &mut compiled);
+            let bound = compiled.bind(&document);
             for node in document
                 .node_ids()
-                .filter(|node| document.element_ref(*node).is_some())
+                .filter(|node| document.try_element_ref(*node).is_some())
             {
                 assert_eq!(
-                    compiled.matches(prepared, &document, node),
+                    bound.matches(prepared, node),
                     Some(dom::selector_matches_dom_node(selector, &document, node)),
                     "selector {text} at node {node:?}"
                 );
             }
         }
-        for text in [
-            "[data-x]",
-            "p + p",
-            "p:first-child",
-            ":is(p, div)",
-            "p::before",
-        ] {
+        for text in ["p:first-child"] {
             let selectors = parsed(text);
             let mut tests = Vec::new();
             let mut compounds = Vec::new();
@@ -315,12 +740,13 @@ mod tests {
         let selector = &selectors.0[0];
         let mut compiled = CompiledSelectors::empty();
         let prepared = prepared(selector, &mut compiled);
+        let bound = compiled.bind(&xml);
         for node in xml
             .node_ids()
-            .filter(|node| xml.element_ref(*node).is_some())
+            .filter(|node| xml.try_element_ref(*node).is_some())
         {
             assert_eq!(
-                compiled.matches(prepared, &xml, node),
+                bound.matches(prepared, node),
                 Some(dom::selector_matches_dom_node(selector, &xml, node))
             );
         }

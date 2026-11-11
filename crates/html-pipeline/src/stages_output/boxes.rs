@@ -1,15 +1,12 @@
 //! Renderer-facing box geometry, semantics, and table queries.
 
-use crate::stages::fragment_paint;
-use html_engine_model::layout_state;
-use crate::stages::semantic_queries;
-use crate::stages::text_paint;
 use super::text::enclosing_text_range;
 use super::*;
-use kurbo::Rect;
 use crate::layout_model::{parse_positive_span, place_table_cells};
 use html_dom::{DomNodeId, ElementRef, write_escaped_html_attribute, write_escaped_html_text};
-use html_style_model::{BreakBetween, Float, PositionMode};
+use html_engine_model::layout_state::{self, BoxPaginationFacts, PaginationOwnership};
+use html_style_model::{BreakBetween, BreakInside};
+use kurbo::Rect;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum RenderForcedBreak {
@@ -165,58 +162,22 @@ pub struct BoxTextFormat<'a> {
 }
 
 impl<'a> RenderBoxView<'a> {
+    /// Published structure belongs to this layout revision, not to a viewport.
+    pub fn pagination_facts(self, owner: BoxId) -> Option<&'a BoxPaginationFacts> {
+        self.doc.layout_state.line_output.pagination_ownership.boxes.get(layout_state::box_id_index(owner))
+    }
 
-    fn shared_flow_distance(self, box_id: BoxId, line_owner: BoxId) -> Option<usize> {
-        let contains = |ancestor| {
-            semantic_queries::render_semantics_view_contains(
-                semantic_queries::render_view_semantics(self.doc.render_view(self.glyph_metrics)),
-                ancestor,
-                line_owner,
-            )
-        };
-        let independent = |owner: BoxId| {
-            self.used_style(layout_state::box_id_index(owner))
-                .is_some_and(|style| {
-                    style.position() == PositionMode::Absolute
-                        || matches!(style.float(), Float::Left | Float::Right)
-                })
-        };
-        let mut ancestor = box_id;
-        let mut distance = 0;
-        loop {
-            if contains(ancestor) {
-                let mut carrier = line_owner;
-                while carrier != ancestor {
-                    if independent(carrier) {
-                        return None;
-                    }
-                    carrier = parent(self, carrier)?;
-                }
-                return Some(distance);
-            }
-            // A contentless decoration has no independently placed group;
-            // retain its enclosing flow's mapping even if it is positioned.
-            if independent(ancestor)
-                && (ancestor != box_id || !content_line_range(self, box_id).is_empty())
-            {
-                return None;
-            }
-            ancestor = parent(self, ancestor)?;
-            distance += 1;
-        }
+    pub fn pagination_ownership(self) -> &'a PaginationOwnership {
+        &self.doc.layout_state.line_output.pagination_ownership
     }
 
     /// Border-box geometry resolved together from the published layout.
     pub fn bounds(self, box_id: BoxId) -> Option<Rect> {
         Some(Rect::from_origin_size(
-            render_box_view_point(self, box_id)?,
-            render_box_view_size(self, box_id)?,
+            self.point(box_id)?,
+            self.size(box_id)?,
         ))
     }
-
-
-
-
 
     fn break_before(self, box_id: BoxId) -> BreakBetween {
         let box_idx = layout_state::box_id_index(box_id);
@@ -229,204 +190,390 @@ impl<'a> RenderBoxView<'a> {
             .map_or(BreakBetween::Auto, |style| style.break_after())
     }
 
-
-
     fn used_style(self, box_idx: usize) -> Option<html_style_model::UsedStyleView<'a>> {
         self.doc.box_used_style(box_idx)
     }
-}
 
-/// Whether a line carries content belonging to this box or a descendant.
-/// Replaced and inline content may use an ancestor's carrier line.
-fn contains_line(boxes: RenderBoxView<'_>, box_id: BoxId, line_id: LineId) -> bool {
-    if !content_line_range(boxes, box_id).contains(&line_id) {
-        return false;
+    /// Bounds in stable line storage for content carried by this box and its
+    /// descendants, including image carriers and split inline spans.
+    pub fn content_line_range(self, box_id: BoxId) -> Range<LineId> {
+        let box_idx = layout_state::box_id_index(box_id);
+        let empty = LineId::new(0);
+        self.doc
+            .layout_state
+            .line_output
+            .box_line_ranges
+            .get(box_idx)
+            .map_or(empty..empty, |range| {
+                LineId::new(range.start as usize)..LineId::new(range.end as usize)
+            })
     }
-    let view = boxes.doc.render_view(boxes.glyph_metrics);
-    let output = &boxes.doc.layout_state.line_output;
-    let Some(line) = output.lines.get(layout_state::line_id_index(line_id)) else {
-        return false;
-    };
-    let contains = |owner| {
-        semantic_queries::render_semantics_view_contains(
-            semantic_queries::render_view_semantics(view),
-            box_id,
-            owner,
+
+    pub fn len(self) -> usize {
+        self.doc.box_count()
+    }
+
+    pub fn tag(self, box_id: BoxId) -> Option<&'a str> {
+        let box_idx = layout_state::box_id_index(box_id);
+        self.doc
+            .element_for_box(box_idx)
+            .map(|element| element.tag())
+    }
+
+    pub fn attribute(self, box_id: BoxId, name: &str) -> Option<&'a str> {
+        let box_idx = layout_state::box_id_index(box_id);
+        self.doc
+            .element_for_box(box_idx)
+            .and_then(|element| element.attr(name))
+    }
+
+    /// Source identity in this document's canonical DOM.
+    pub fn dom_node(self, box_id: BoxId) -> Option<DomNodeId> {
+        self.doc
+            .element_for_box(layout_state::box_id_index(box_id))
+            .map(|element| element.node_id())
+    }
+
+    pub fn is_table(self, box_id: BoxId) -> bool {
+        let box_idx = layout_state::box_id_index(box_id);
+        matches!(
+            self.doc.box_layout_mode(box_idx),
+            Some(LayoutMode::Table(_))
         )
-    };
-    if contains(layout_state::box_id_new(line.owner_box_idx as usize)) {
-        return true;
     }
-    let inline = line.inline_box_fragments(&output.line_details);
-    output.inline_box_fragments[inline.start as usize..inline.end as usize]
-        .iter()
-        .any(|fragment| contains(layout_state::box_id_new(fragment.box_idx as usize)))
-        || fragment_paint::render_fragment_view_images_for_line(view.fragments(), line_id)
+
+    pub fn is_table_row(self, box_id: BoxId) -> bool {
+        let box_idx = layout_state::box_id_index(box_id);
+        matches!(
+            self.doc.box_layout_mode(box_idx),
+            Some(LayoutMode::TableRow(_))
+        )
+    }
+
+    /// A single non-spanning cell can continue in normal flow without
+    /// coordinating a common cut with neighbouring cells.
+    pub fn table_row_allows_content_break(self, box_id: BoxId) -> bool {
+        let row_index = layout_state::box_id_index(box_id);
+        let Some(LayoutMode::TableRow(row)) = self.doc.box_layout_mode(row_index) else {
+            return false;
+        };
+        let [cell] = row.cells.as_slice() else { return false };
+        let cell_id = layout_state::box_id_new(*cell as usize);
+        self.table_cell_rowspan(cell_id) == 1
+            && !self.avoids_break_inside(box_id)
+            && !self.avoids_break_inside(cell_id)
+    }
+
+    pub fn is_table_cell(self, box_id: BoxId) -> bool {
+        let box_idx = layout_state::box_id_index(box_id);
+        matches!(
+            self.doc.box_layout_mode(box_idx),
+            Some(LayoutMode::TableCell(_))
+        )
+    }
+
+    pub fn is_table_header_group(self, box_id: BoxId) -> bool {
+        let box_idx = layout_state::box_id_index(box_id);
+        self.used_style(box_idx)
+            .is_some_and(|style| style.display() == html_style_model::Display::TableHeaderGroup)
+    }
+
+    pub fn table_cell_rowspan(self, box_id: BoxId) -> usize {
+        let box_idx = layout_state::box_id_index(box_id);
+        match self.doc.box_layout_mode(box_idx) {
+            Some(LayoutMode::TableCell(cell)) => cell.rowspan.max(1),
+            _ => 1,
+        }
+    }
+
+    pub fn forces_break_before(self, box_id: BoxId) -> bool {
+        self.break_before(box_id).is_forced()
+    }
+
+    pub fn forces_break_after(self, box_id: BoxId) -> bool {
+        let box_idx = layout_state::box_id_index(box_id);
+        self.break_after(box_idx).is_forced()
+    }
+
+    pub fn avoids_break_before(self, box_id: BoxId) -> bool {
+        self.break_before(box_id) == BreakBetween::Avoid
+    }
+
+    pub fn avoids_break_after(self, box_id: BoxId) -> bool {
+        let box_idx = layout_state::box_id_index(box_id);
+        self.break_after(box_idx) == BreakBetween::Avoid
+    }
+
+    pub fn forced_break_before(self, box_id: BoxId) -> Option<RenderForcedBreak> {
+        render_forced_break(self.break_before(box_id))
+    }
+
+    pub fn forced_break_after(self, box_id: BoxId) -> Option<RenderForcedBreak> {
+        let box_idx = layout_state::box_id_index(box_id);
+        render_forced_break(self.break_after(box_idx))
+    }
+
+    pub fn avoids_break_inside(self, box_id: BoxId) -> bool {
+        let box_idx = layout_state::box_id_index(box_id);
+        self.used_style(box_idx)
+            .is_some_and(|style| style.break_inside() == BreakInside::Avoid)
+    }
+
+    pub fn widows(self, box_id: BoxId) -> usize {
+        let box_idx = layout_state::box_id_index(box_id);
+        self.used_style(box_idx)
+            .map_or(2, |style| style.widows() as usize)
+    }
+
+    pub fn orphans(self, box_id: BoxId) -> usize {
+        let box_idx = layout_state::box_id_index(box_id);
+        self.used_style(box_idx)
+            .map_or(2, |style| style.orphans() as usize)
+    }
+
+    pub fn parent(self, box_id: BoxId) -> Option<BoxId> {
+        let box_idx = layout_state::box_id_index(box_id);
+        self.doc
+            .inputs
+            .layout_tree
+            .get_box_parent(box_idx)
+            .map(layout_state::box_id_new)
+    }
+
+    pub fn text_format(self, box_id: BoxId) -> BoxTextFormat<'a> {
+        let box_idx = layout_state::box_id_index(box_id);
+        self.doc.box_text_format(box_idx)
+    }
+
+    pub fn list_marker(self, box_id: BoxId) -> Option<RenderListItemMarker> {
+        let box_idx = layout_state::box_id_index(box_id);
+        self.doc.list_marker(box_idx)
+    }
+
+    /// Flex and grid containers, including their inline display variants.
+    pub fn is_flex_or_grid_container(self, box_id: BoxId) -> bool {
+        let box_idx = layout_state::box_id_index(box_id);
+        matches!(
+            self.doc.inputs.layout_tree.get_box_layout_mode(box_idx),
+            Some(LayoutMode::Flex(_) | LayoutMode::Grid(_))
+        )
+    }
+
+    pub fn ancestors(self, box_id: BoxId) -> impl Iterator<Item = BoxId> + 'a {
+        let box_idx = layout_state::box_id_index(box_id);
+        self.doc
+            .inputs
+            .layout_tree
+            .ancestors(box_idx)
+            .map(layout_state::box_id_new)
+    }
+
+    /// Returns the source table's logical grid, retaining the laid-out box for
+    /// every origin cell so renderers can hit-test and paint selections.
+    pub fn table(self, box_id: BoxId) -> Option<RenderTable> {
+        let box_idx = layout_state::box_id_index(box_id);
+        if !self.is_table(box_id) {
+            return None;
+        }
+        let document = self.doc.document();
+        let table_element = self.doc.element_for_box(box_idx)?;
+        if !table_element.tag().eq_ignore_ascii_case("table") {
+            return None;
+        }
+
+        fn collect_rows<'dom>(element: ElementRef<'dom>, rows: &mut Vec<ElementRef<'dom>>) {
+            for child in element.child_elements() {
+                if child.tag().eq_ignore_ascii_case("table") {
+                    continue;
+                }
+                if child.tag().eq_ignore_ascii_case("tr") {
+                    rows.push(child);
+                } else {
+                    collect_rows(child, rows);
+                }
+            }
+        }
+
+        fn serialize_authored_html(document: &Document, node: DomNodeId, output: &mut String) {
+            match document.node_ref(node) {
+                NodeRef::Text(text) => write_escaped_html_text(output, text.text()),
+                NodeRef::Element(element) => {
+                    let tag = element.tag();
+                    output.push('<');
+                    output.push_str(tag);
+                    for attribute in element.attributes() {
+                        let name = attribute.name();
+                        // Event handlers are dropped: exported markup is data,
+                        // not behaviour.
+                        if name
+                            .get(..2)
+                            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("on"))
+                        {
+                            continue;
+                        }
+                        output.push(' ');
+                        output.push_str(name);
+                        output.push_str("=\"");
+                        write_escaped_html_attribute(output, attribute.value());
+                        output.push('"');
+                    }
+                    output.push('>');
+                    // HTML void elements have neither children nor closing tags.
+                    // In particular, </br> can be parsed as another line break.
+                    if matches!(tag, "area" | "base" | "br" | "col" | "embed" | "hr" | "img" | "input" | "link" | "meta" | "param" | "source" | "track" | "wbr") {
+                        return;
+                    }
+                    for child in element.children() {
+                        serialize_authored_html(document, child, output);
+                    }
+                    output.push_str("</");
+                    output.push_str(tag);
+                    output.push('>');
+                }
+            }
+        }
+
+        fn collect_text(document: &Document, node: DomNodeId, text: &mut String) {
+            match document.node_ref(node) {
+                NodeRef::Text(node_text) => {
+                    for word in node_text.text().split_whitespace() {
+                        if !text.is_empty() {
+                            text.push(' ');
+                        }
+                        text.push_str(word);
+                    }
+                }
+                NodeRef::Element(element) => {
+                    if element.tag().eq_ignore_ascii_case("table") {
+                        return;
+                    }
+                    for child in element.children() {
+                        collect_text(document, child, text);
+                    }
+                }
+            }
+        }
+
+        let mut box_for_node = FxHashMap::default();
+        for candidate in 0..self.len() {
+            if let Some(node) = self.dom_node(layout_state::box_id_new(candidate)) {
+                box_for_node.entry(node).or_insert(candidate);
+            }
+        }
+
+        let mut row_elements = Vec::new();
+        collect_rows(table_element, &mut row_elements);
+        let mut rows = vec![RenderTableRow { cells: Vec::new() }; row_elements.len()];
+        let source_rows = row_elements.into_iter().map(|row| {
+            row.child_elements()
+                .filter(|cell| {
+                    cell.tag().eq_ignore_ascii_case("th") || cell.tag().eq_ignore_ascii_case("td")
+                })
+                .map(|cell| {
+                    let rowspan = box_for_node
+                        .get(&cell.node_id())
+                        .and_then(|&box_idx| match self.doc.box_layout_mode(box_idx) {
+                            Some(LayoutMode::TableCell(cell)) => Some(cell.rowspan),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| parse_positive_span(cell.attr("rowspan")));
+                    (
+                        cell.node_id(),
+                        parse_positive_span(cell.attr("colspan")),
+                        rowspan,
+                    )
+                })
+        });
+        let column_count = place_table_cells(source_rows, |placement| {
+            let Some(&cell_box) = box_for_node.get(&placement.cell_idx) else {
+                return;
+            };
+            let cell_element = document.element_ref(placement.cell_idx);
+            let mut text = String::new();
+            for child in cell_element.children() {
+                collect_text(document, child, &mut text);
+            }
+            rows[placement.row].cells.push(RenderTableCell {
+                box_idx: cell_box,
+                row: placement.row,
+                column: placement.col,
+                rowspan: placement.rowspan,
+                colspan: placement.colspan,
+                header: cell_element.tag().eq_ignore_ascii_case("th"),
+                text,
+                glyphs: None,
+            });
+        });
+        // Resolve all cell intervals in one traversal rather than rescanning
+        // the document for every cell during semantic selection.
+        let cells = rows
             .iter()
-            .any(|image| contains(fragment_paint::render_image_fragment_box_id(&image)))
-}
-
-/// Bounds in stable line storage for content carried by this box and its
-/// descendants, including image carriers and split inline spans.
-pub fn content_line_range(view: RenderBoxView<'_>, box_id: BoxId) -> Range<LineId> {
-    let box_idx = layout_state::box_id_index(box_id);
-    let empty = LineId::new(0);
-    view.doc
-        .layout_state
-        .line_output
-        .box_line_ranges
-        .get(box_idx)
-        .map_or(empty..empty, |range| {
-            LineId::new(range.start as usize)..LineId::new(range.end as usize)
+            .enumerate()
+            .flat_map(|(row, data)| {
+                data.cells
+                    .iter()
+                    .enumerate()
+                    .map(move |(column, cell)| (cell.box_idx, (row, column)))
+            })
+            .collect::<FxHashMap<_, _>>();
+        for run in (self.doc.render_view(self.glyph_metrics).text()).text_runs() {
+            let mut owner = None;
+            for ancestor in std::iter::once(run.box_id()).chain(self.ancestors(run.box_id())) {
+                if let Some(&cell) = cells.get(&layout_state::box_id_index(ancestor)) {
+                    owner.get_or_insert(cell);
+                }
+                if self.is_table(ancestor) {
+                    if ancestor == box_id
+                        && let Some((row, column)) = owner
+                    {
+                        let glyphs = &mut rows[row].cells[column].glyphs;
+                        let range = run.glyphs();
+                        if let Some(existing) = glyphs {
+                            *existing = enclosing_text_range(existing.clone(), range);
+                        } else if !range.is_empty() {
+                            *glyphs = Some(range);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        let mut authored_html = String::new();
+        serialize_authored_html(document, table_element.node_id(), &mut authored_html);
+        (!rows.is_empty() && column_count > 0).then_some(RenderTable {
+            box_idx,
+            rows,
+            column_count,
+            authored_html,
         })
-}
-
-pub fn len(view: RenderBoxView<'_>) -> usize {
-    view.doc.box_count()
-}
-
-pub fn tag<'a>(view: RenderBoxView<'a>, box_id: BoxId) -> Option<&'a str> {
-    let box_idx = layout_state::box_id_index(box_id);
-    view.doc
-        .element_for_box(box_idx)
-        .map(|element| element.tag())
-}
-
-pub fn attribute<'a>(view: RenderBoxView<'a>, box_id: BoxId, name: &str) -> Option<&'a str> {
-    let box_idx = layout_state::box_id_index(box_id);
-    view.doc
-        .element_for_box(box_idx)
-        .and_then(|element| element.attr(name))
-}
-
-/// Source identity in this document's canonical DOM.
-pub fn dom_node(view: RenderBoxView<'_>, box_id: BoxId) -> Option<DomNodeId> {
-    view.doc
-        .element_for_box(layout_state::box_id_index(box_id))
-        .map(|element| element.node_id())
-}
-
-pub fn is_table(view: RenderBoxView<'_>, box_id: BoxId) -> bool {
-    let box_idx = layout_state::box_id_index(box_id);
-    matches!(
-        view.doc.box_layout_mode(box_idx),
-        Some(LayoutMode::Table(_))
-    )
-}
-
-pub fn is_table_row(view: RenderBoxView<'_>, box_id: BoxId) -> bool {
-    let box_idx = layout_state::box_id_index(box_id);
-    matches!(
-        view.doc.box_layout_mode(box_idx),
-        Some(LayoutMode::TableRow(_))
-    )
-}
-
-pub fn is_table_cell(view: RenderBoxView<'_>, box_id: BoxId) -> bool {
-    let box_idx = layout_state::box_id_index(box_id);
-    matches!(
-        view.doc.box_layout_mode(box_idx),
-        Some(LayoutMode::TableCell(_))
-    )
-}
-
-pub fn is_table_header_group(view: RenderBoxView<'_>, box_id: BoxId) -> bool {
-    let box_idx = layout_state::box_id_index(box_id);
-    view.used_style(box_idx)
-        .is_some_and(|style| style.display() == html_style_model::Display::TableHeaderGroup)
-}
-
-pub fn table_cell_rowspan(view: RenderBoxView<'_>, box_id: BoxId) -> usize {
-    let box_idx = layout_state::box_id_index(box_id);
-    match view.doc.box_layout_mode(box_idx) {
-        Some(LayoutMode::TableCell(cell)) => cell.rowspan.max(1),
-        _ => 1,
     }
-}
 
-pub fn forces_break_before(view: RenderBoxView<'_>, box_id: BoxId) -> bool {
-    view.break_before(box_id).is_forced()
-}
+    pub fn point(self, box_id: BoxId) -> Option<Point> {
+        let box_idx = layout_state::box_id_index(box_id);
+        (box_idx < self.doc.inputs.layout_tree.box_count())
+            .then(|| self.doc.geometry.point(box_idx))
+    }
 
-pub fn forces_break_after(view: RenderBoxView<'_>, box_id: BoxId) -> bool {
-    let box_idx = layout_state::box_id_index(box_id);
-    view.break_after(box_idx).is_forced()
-}
+    pub fn size(self, box_id: BoxId) -> Option<Size> {
+        let box_idx = layout_state::box_id_index(box_id);
+        (box_idx < self.doc.inputs.layout_tree.box_count()).then(|| self.doc.geometry.size(box_idx))
+    }
 
-pub fn avoids_break_before(view: RenderBoxView<'_>, box_id: BoxId) -> bool {
-    view.break_before(box_id) == BreakBetween::Avoid
-}
+    pub fn is_block_container(self, box_id: BoxId) -> bool {
+        let box_idx = layout_state::box_id_index(box_id);
+        self.doc.is_block_container_box(box_idx)
+    }
 
-pub fn avoids_break_after(view: RenderBoxView<'_>, box_id: BoxId) -> bool {
-    let box_idx = layout_state::box_id_index(box_id);
-    view.break_after(box_idx) == BreakBetween::Avoid
-}
-
-pub fn forced_break_before(
-    view: RenderBoxView<'_>,
-    box_id: BoxId,
-) -> Option<RenderForcedBreak> {
-    render_forced_break(view.break_before(box_id))
-}
-
-pub fn forced_break_after(view: RenderBoxView<'_>, box_id: BoxId) -> Option<RenderForcedBreak> {
-    let box_idx = layout_state::box_id_index(box_id);
-    render_forced_break(view.break_after(box_idx))
-}
-
-pub fn avoids_break_inside(view: RenderBoxView<'_>, box_id: BoxId) -> bool {
-    let box_idx = layout_state::box_id_index(box_id);
-    view.used_style(box_idx)
-        .is_some_and(|style| style.break_inside() == html_style_model::BreakInside::Avoid)
-}
-
-pub fn widows(view: RenderBoxView<'_>, box_id: BoxId) -> usize {
-    let box_idx = layout_state::box_id_index(box_id);
-    view.used_style(box_idx)
-        .map_or(2, |style| style.widows() as usize)
-}
-
-pub fn orphans(view: RenderBoxView<'_>, box_id: BoxId) -> usize {
-    let box_idx = layout_state::box_id_index(box_id);
-    view.used_style(box_idx)
-        .map_or(2, |style| style.orphans() as usize)
-}
-
-pub fn parent(view: RenderBoxView<'_>, box_id: BoxId) -> Option<BoxId> {
-    let box_idx = layout_state::box_id_index(box_id);
-    view.doc
-        .inputs
-        .layout_tree
-        .get_box_parent(box_idx)
-        .map(layout_state::box_id_new)
-}
-
-pub fn text_format<'a>(view: RenderBoxView<'a>, box_id: BoxId) -> BoxTextFormat<'a> {
-    let box_idx = layout_state::box_id_index(box_id);
-    view.doc.box_text_format(box_idx)
-}
-
-pub fn list_marker(view: RenderBoxView<'_>, box_id: BoxId) -> Option<RenderListItemMarker> {
-    let box_idx = layout_state::box_id_index(box_id);
-    view.doc.list_marker(box_idx)
-}
-
-/// Flex and grid containers, including their inline display variants.
-pub fn is_flex_or_grid_container(view: RenderBoxView<'_>, box_id: BoxId) -> bool {
-    let box_idx = layout_state::box_id_index(box_id);
-    matches!(
-        view.doc.inputs.layout_tree.get_box_layout_mode(box_idx),
-        Some(LayoutMode::Flex(_) | LayoutMode::Grid(_))
-    )
-}
-
-pub fn ancestors<'a>(view: RenderBoxView<'a>, box_id: BoxId) -> impl Iterator<Item = BoxId> + 'a {
-    let box_idx = layout_state::box_id_index(box_id);
-    view.doc
-        .inputs
-        .layout_tree
-        .ancestors(box_idx)
-        .map(layout_state::box_id_new)
+    pub fn fragmentation_distance(self, box_id: BoxId, line_idx: LineId) -> Option<usize> {
+        let ownership = self.pagination_ownership();
+        let owner = layout_state::box_id_index(box_id) as u32;
+        let line = ownership.lines.get(layout_state::line_id_index(line_idx))?;
+        if line.content.contains(&owner) {
+            return Some(0);
+        }
+        ownership.box_flows.get(owner as usize)?.iter()
+            .find_map(|&(flow, distance)| line.flows.contains(&flow).then_some(distance))
+    }
 }
 
 fn render_forced_break(value: BreakBetween) -> Option<RenderForcedBreak> {
@@ -434,230 +581,5 @@ fn render_forced_break(value: BreakBetween) -> Option<RenderForcedBreak> {
         BreakBetween::Column => Some(RenderForcedBreak::Column),
         BreakBetween::Page => Some(RenderForcedBreak::Page),
         BreakBetween::Auto | BreakBetween::Avoid => None,
-    }
-}
-
-/// Returns the source table's logical grid, retaining the laid-out box for
-/// every origin cell so renderers can hit-test and paint selections.
-pub fn render_box_view_table<'a>(value: RenderBoxView<'a>, box_id: BoxId) -> Option<RenderTable> {
-    let box_idx = layout_state::box_id_index(box_id);
-    if !is_table(value, box_id) {
-        return None;
-    }
-    let document = value.doc.document();
-    let table_element = value.doc.element_for_box(box_idx)?;
-    if !table_element.tag().eq_ignore_ascii_case("table") {
-        return None;
-    }
-
-    fn collect_rows<'dom>(element: ElementRef<'dom>, rows: &mut Vec<ElementRef<'dom>>) {
-        for child in element.child_elements() {
-            if child.tag().eq_ignore_ascii_case("table") {
-                continue;
-            }
-            if child.tag().eq_ignore_ascii_case("tr") {
-                rows.push(child);
-            } else {
-                collect_rows(child, rows);
-            }
-        }
-    }
-
-    fn serialize_authored_html(document: &Document, node: DomNodeId, output: &mut String) {
-        match document.node_ref(node) {
-            Some(NodeRef::Text(text)) => write_escaped_html_text(output, text.text()),
-            Some(NodeRef::Element(element)) => {
-                let tag = element.tag();
-                output.push('<');
-                output.push_str(tag);
-                for attribute in element.attributes() {
-                    let name = attribute.name();
-                    // Event handlers are dropped: exported markup is data,
-                    // not behaviour.
-                    if name
-                        .get(..2)
-                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("on"))
-                    {
-                        continue;
-                    }
-                    output.push(' ');
-                    output.push_str(name);
-                    output.push_str("=\"");
-                    write_escaped_html_attribute(output, attribute.value());
-                    output.push('"');
-                }
-                output.push('>');
-                for child in element.children() {
-                    serialize_authored_html(document, child, output);
-                }
-                output.push_str("</");
-                output.push_str(tag);
-                output.push('>');
-            }
-            None => {}
-        }
-    }
-
-    fn collect_text(document: &Document, node: DomNodeId, text: &mut String) {
-        match document.node_ref(node) {
-            Some(NodeRef::Text(value)) => {
-                for word in value.text().split_whitespace() {
-                    if !text.is_empty() {
-                        text.push(' ');
-                    }
-                    text.push_str(word);
-                }
-            }
-            Some(NodeRef::Element(element)) => {
-                if element.tag().eq_ignore_ascii_case("table") {
-                    return;
-                }
-                for child in element.children() {
-                    collect_text(document, child, text);
-                }
-            }
-            None => {}
-        }
-    }
-
-    let mut box_for_node = FxHashMap::default();
-    for candidate in 0..len(value) {
-        if let Some(node) = dom_node(value, layout_state::box_id_new(candidate)) {
-            box_for_node.entry(node.raw() as usize).or_insert(candidate);
-        }
-    }
-
-    let mut row_elements = Vec::new();
-    collect_rows(table_element, &mut row_elements);
-    let mut rows = vec![RenderTableRow { cells: Vec::new() }; row_elements.len()];
-    let source_rows = row_elements.into_iter().map(|row| {
-        row.child_elements()
-            .filter(|cell| {
-                cell.tag().eq_ignore_ascii_case("th") || cell.tag().eq_ignore_ascii_case("td")
-            })
-            .map(|cell| {
-                let rowspan = box_for_node
-                    .get(&cell.node_id().index())
-                    .and_then(|&box_idx| match value.doc.box_layout_mode(box_idx) {
-                        Some(LayoutMode::TableCell(cell)) => Some(cell.rowspan),
-                        _ => None,
-                    })
-                    .unwrap_or_else(|| parse_positive_span(cell.attr("rowspan")));
-                (
-                    cell.node_id().index(),
-                    parse_positive_span(cell.attr("colspan")),
-                    rowspan,
-                )
-            })
-    });
-    let column_count = place_table_cells(source_rows, |placement| {
-        let Some(&cell_box) = box_for_node.get(&placement.cell_idx) else {
-            return;
-        };
-        let cell_element = document
-            .node_id_from_raw(placement.cell_idx as u32)
-            .and_then(|node| document.element_ref(node))
-            .expect("grid cells originate from source table elements");
-        let mut text = String::new();
-        for child in cell_element.children() {
-            collect_text(document, child, &mut text);
-        }
-        rows[placement.row].cells.push(RenderTableCell {
-            box_idx: cell_box,
-            row: placement.row,
-            column: placement.col,
-            rowspan: placement.rowspan,
-            colspan: placement.colspan,
-            header: cell_element.tag().eq_ignore_ascii_case("th"),
-            text,
-            glyphs: None,
-        });
-    });
-    // Resolve all cell intervals in one traversal rather than rescanning
-    // the document for every cell during semantic selection.
-    let cells = rows
-        .iter()
-        .enumerate()
-        .flat_map(|(row, data)| {
-            data.cells
-                .iter()
-                .enumerate()
-                .map(move |(column, cell)| (cell.box_idx, (row, column)))
-        })
-        .collect::<FxHashMap<_, _>>();
-    for run in
-        text_paint::render_text_view_text_runs(value.doc.render_view(value.glyph_metrics).text())
-    {
-        let mut owner = None;
-        for ancestor in std::iter::once(text_paint::render_text_run_box_id(&run))
-            .chain(ancestors(value, text_paint::render_text_run_box_id(&run)))
-        {
-            if let Some(&cell) = cells.get(&layout_state::box_id_index(ancestor)) {
-                owner.get_or_insert(cell);
-            }
-            if is_table(value, ancestor) {
-                if ancestor == box_id
-                    && let Some((row, column)) = owner
-                {
-                    let glyphs = &mut rows[row].cells[column].glyphs;
-                    let range = run.glyphs();
-                    if let Some(existing) = glyphs {
-                        *existing = enclosing_text_range(existing.clone(), range);
-                    } else if !range.is_empty() {
-                        *glyphs = Some(range);
-                    }
-                }
-                break;
-            }
-        }
-    }
-    let mut authored_html = String::new();
-    serialize_authored_html(document, table_element.node_id(), &mut authored_html);
-    (!rows.is_empty() && column_count > 0).then_some(RenderTable {
-        box_idx,
-        rows,
-        column_count,
-        authored_html,
-    })
-}
-
-pub fn render_box_view_point<'a>(value: RenderBoxView<'a>, box_id: BoxId) -> Option<Point> {
-    let box_idx = layout_state::box_id_index(box_id);
-    (box_idx < value.doc.inputs.layout_tree.box_count()).then(|| value.doc.geometry.point(box_idx))
-}
-
-pub fn render_box_view_size<'a>(value: RenderBoxView<'a>, box_id: BoxId) -> Option<Size> {
-    let box_idx = layout_state::box_id_index(box_id);
-    (box_idx < value.doc.inputs.layout_tree.box_count()).then(|| value.doc.geometry.size(box_idx))
-}
-
-pub fn render_box_view_is_block_container<'a>(value: RenderBoxView<'a>, box_id: BoxId) -> bool {
-    let box_idx = layout_state::box_id_index(box_id);
-    value.doc.is_block_container_box(box_idx)
-}
-
-pub fn fragmentation_distance(
-    value: RenderBoxView<'_>,
-    box_id: BoxId,
-    line_idx: LineId,
-) -> Option<usize> {
-    if contains_line(value, box_id, line_idx) {
-        return Some(0);
-    }
-    let view = value.doc.render_view(value.glyph_metrics);
-    let line = view.text().line(line_idx)?;
-    let images = fragment_paint::render_fragment_view_images_for_line(view.fragments(), line_idx);
-    if text_paint::render_line_glyphs(&line).is_empty() && !images.is_empty() {
-        images
-            .iter()
-            .filter_map(|image| {
-                value.shared_flow_distance(
-                    box_id,
-                    fragment_paint::render_image_fragment_box_id(&image),
-                )
-            })
-            .min()
-    } else {
-        value.shared_flow_distance(box_id, text_paint::render_line_owner_box(&line))
     }
 }

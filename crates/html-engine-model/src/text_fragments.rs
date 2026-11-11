@@ -460,6 +460,7 @@ enum Storage {
 
 /// Positioned fragments produced in their selected retained format. Ordinary
 /// lines avoid an intermediate array of expanded records before publication.
+#[derive(Clone)]
 pub enum OwnedTextFragments {
     Compact(CompactTextFragments),
     Packed(Box<[PackedTextFragment]>),
@@ -467,6 +468,15 @@ pub enum OwnedTextFragments {
 }
 
 impl OwnedTextFragments {
+    /// Heap storage retained by a reusable line publication plan.
+    pub fn storage_bytes(&self) -> usize {
+        match self {
+            Self::Compact(records) => records.bytes(),
+            Self::Packed(records) => size_of_val(records.as_ref()),
+            Self::Wide(records) => size_of_val(records.as_ref()),
+        }
+    }
+
     fn len(&self) -> usize {
         match self {
             Self::Compact(records) => records.offsets.len(),

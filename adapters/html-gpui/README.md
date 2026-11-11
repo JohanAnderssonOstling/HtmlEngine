@@ -43,18 +43,56 @@ text shaping contract. `backend::GpuiCommandPainter` records engine paint output
 publication font registration and image caching. The host chooses document
 placement, scrolling or pagination.
 
-Capture `GpuiTextCache::resources()` and pass that `GpuiTextResources` snapshot
-to the command painter. Glyphs, native runs and their generation travel together;
-their registries stay private. `GpuiCommandPainter::finish` pairs the recorded
-commands with the glyph store they were recorded against, so a `GpuiScene`
-always replays with matching resources; recorded text batches own their runs.
-`reusing` records into a previous scene's buffer when no other owner retains it.
-Capturing and cloning snapshots and scenes shares the existing allocations.
+Native shaping returns shared references to individual glyph or run entries.
+The engine binds those entries to the command painter, and recorded text batches
+own the native runs they paint. `GpuiCommandPainter::finish` produces a
+`GpuiScene`; `reusing` records into a previous scene's buffer when no other owner
+retains it. Cloning entries and scenes shares the existing allocations.
+
+Each note owns an engine registration ledger independently of the parent page.
+Recorded note scenes retain that ledger and also track parent invalidation.
+Closing or refreshing notes releases their registrations when the last scene
+lets go; it does not append to or copy the parent's table. GPUI keeps its native
+cache independently and needs no checkpoint or restoration hooks.
+
+The one-character run cache holds at most 4,096 entries and evicts its older half
+on reaching the limit. Cached results share native data and geometry; repeated
+isolated runs reuse engine registrations. Keys distinguish fonts, features,
+direction, caps and cursive joining. Layouts and scenes retain their referenced
+entries across eviction. Explicit cache clearing belongs to the host:
+`GpuiTextCache::reset` clears cached runs and changes the native resource
+generation; the engine never calls it.
+
+Fragments use engine selection painting and plain-text export, reusing overlay
+scratch and command buffers. Unchanged overlays reuse their recorded scene;
+empty overlays record nothing. Their link hover follows the same controller as
+pages and notes, including clearing on pointer leave and window exit. Text
+selection remains optional. Disabling it clears text/table gestures and releases
+the focus handle while preserving link hover. Hover uses the engine's nearby
+line index without a temporary placement buffer; active drags keep nearest-text
+selection behavior. A missing button release is recovered before the next move
+can extend the old gesture. Single clicks on external HTTP(S), mail and telephone
+links open through GPUI's system URL handler, including when selection is disabled.
+Dragging or releasing outside does not activate links.
+
+Escape clears fragment selection while preserving link hover. Scope relayout
+clears stale hover while retaining the logical selection. Native paint-resource
+tables are bound lazily when text is painted.
+
+Publication font registration replaces changed content for the same declaration.
+After native registration, the adapter retains face metadata and decoded width
+capabilities, releasing its redundant font-byte reference.
 
 The optional `FontLoader` receives a borrowed `FontLoadRequest`: `Family`
 requests availability of a named family; `TextFallbacks` requests fonts needed
 by the supplied text. Return whether the family is available for `Family`, or
 whether new fonts were registered for `TextFallbacks`.
+
+Small-caps availability is queried from the actual font face's feature list,
+including CSS Unicode subsets and native fallback. Bounded caches retain face
+selection and font capabilities. Synthetic uppercase uses the same source-aware
+Greek mapping and scalar casing policy as text preparation; native caps avoid
+that mapping work.
 
 Typography defaults and CSS feature overrides are resolved by the engine.
 The adapter translates the supplied `FontFeatures` record into native OpenType
@@ -63,7 +101,8 @@ and cluster geometry drive engine layout, including the effects of kerning and
 ligatures; no separate capability report is needed.
 
 The adapter implements one run-shaping operation and returns geometry plus
-adapter-owned paint handles. Engine metric registration and layout glyph IDs
+native entry references. Returned caret geometry has no paint key; registration
+assigns its document-local run ID. Engine metric registration and layout glyph IDs
 stay inside the engine. Font keys and preparation are private to this adapter.
 Native runs supply painting resources across scripts without a second per-character
 shaping pass. Mixed-font vertical extents come from the retained native font spans.

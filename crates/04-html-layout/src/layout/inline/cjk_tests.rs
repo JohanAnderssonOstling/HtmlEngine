@@ -1,17 +1,13 @@
-use html_pipeline::engine::box_queries;
-use html_pipeline::engine::text_paint;
+use html_engine_model::{
+    BoxId, FontRelativeMetrics, GlyphResourceGeneration, GlyphResourceStore, GlyphShaper,
+    ImageMetrics, LayoutConstraints, ShapedRun, ShapedTextRun, ShapingStyle, TextCompositionPolicy,
+    TextDirection, TextRunShapeRequest};
+use html_pipeline::engine::LayoutRequest;
 use html_engine_model::layout_state;
-use html_engine_model::shaping_contracts;
 use html_style_model::language;
-use crate::layout_model::BoxId;
 use crate::parser::DocumentFactory;
 use crate::test_support::TestGlyphShaper;
-use crate::{
-    FontRelativeMetrics, GlyphResourceGeneration, GlyphResourceStore, GlyphShaper, LaidOutDocument,
-    LayoutConstraints, ShapeError, ShapedTextRun, ShapingStyle, TextCompositionPolicy,
-    TextRunShapeRequest,
-};
-use crate::{GlyphRequest, ShapedGlyph, ShapedRun};
+use crate::{LaidOutDocument};
 use std::sync::Arc;
 
 #[derive(Default)]
@@ -23,53 +19,36 @@ struct RecordingShaper {
 }
 
 impl GlyphShaper for RecordingShaper {
-    fn font_relative_metrics(
-        &mut self,
-        request: &ShapingStyle<'_>,
-    ) -> Result<FontRelativeMetrics, ShapeError> {
+    fn font_relative_metrics(&mut self, request: &ShapingStyle<'_>) -> FontRelativeMetrics {
         self.metric_languages.push(
             request
                 .language
                 .map(|language| language::content_language_as_str(&language).to_owned()),
         );
-        Ok(FontRelativeMetrics::default())
-    }
-    fn reset(&mut self) {
-        self.fallback.reset();
-    }
-    fn begin_append_shaping(&mut self) -> Result<(), ShapeError> {
-        self.fallback.begin_append_shaping()
-    }
-    fn commit_append_shaping(&mut self) {
-        self.fallback.commit_append_shaping();
-    }
-    fn rollback_append_shaping(&mut self) {
-        self.fallback.rollback_append_shaping();
+        FontRelativeMetrics::default()
     }
     fn resource_generation(&self) -> GlyphResourceGeneration {
         self.fallback.resource_generation()
     }
-    fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
-        self.fallback.shape_glyph(request)
-    }
-    fn shape_run(
-        &mut self,
-        request: TextRunShapeRequest<'_>,
-    ) -> Result<Option<ShapedRun>, ShapeError> {
+
+    fn shape_run(&mut self, request: TextRunShapeRequest<'_>) -> ShapedRun {
         self.languages.push((
-            shaping_contracts::text_run_shape_request_text(&request).to_owned(),
-            shaping_contracts::text_run_shape_request_style(&request)
+            request.text().to_owned(),
+            (request)
+                .style()
                 .language
                 .map(|language| language::content_language_as_str(&language).to_owned()),
         ));
-        if self.cluster_text == Some(shaping_contracts::text_run_shape_request_text(&request)) {
-            let count = shaping_contracts::text_run_shape_request_text(&request).chars().count();
+        if self.cluster_text == Some(request.text()) {
+            let count = request.text().chars().count();
             let mut boundaries = vec![true; count + 1];
             boundaries[1] = false;
-            return Ok(Some(shaping_contracts::shaped_run_geometry(shaping_contracts::shaped_text_run_new(Arc::from(vec![10.0; count]),
-                Arc::from(boundaries),))));
+            return (self.fallback.shape_run(request)).with_geometry(ShapedTextRun::new(
+                Arc::from(vec![10.0; count]),
+                Arc::from(boundaries),
+            ));
         }
-        Ok(None)
+        self.fallback.shape_run(request)
     }
 }
 
@@ -79,15 +58,20 @@ fn layout(
     policy: TextCompositionPolicy,
     resources: &mut GlyphResourceStore,
 ) -> LaidOutDocument<'static> {
+    let mut resources_shaper = TestGlyphShaper::new();
+
     let html = format!("<body style='margin:0;font-size:20px'>{body}</body>");
     DocumentFactory::new()
         .parse_with_new_pipeline(&html, None)
-        .shape(&mut TestGlyphShaper::new(), resources)
+        .shape(&mut resources_shaper, resources)
         .unwrap()
         .layout(
-            LayoutConstraints::new(width, 16.0)
-                .unwrap()
-                .with_text_composition_policy(policy),
+            LayoutRequest::new(
+                LayoutConstraints::new(width, 16.0)
+                    .unwrap()
+                    .with_text_composition_policy(policy),
+            ),
+            &mut resources_shaper,
             resources,
         )
         .expect("layout requires the shaper-aware API for first-line styles")
@@ -98,14 +82,13 @@ fn lines(document: &LaidOutDocument, resources: &GlyphResourceStore) -> Vec<Stri
     text.lines()
         .iter()
         .map(|line| {
-            text_paint::render_line_glyphs(&line)
+            (line)
+                .glyphs()
                 .map(|index| {
-                    text_paint::glyph_metric(
-                        text,
-                        text_paint::glyph_at(text, index as usize).unwrap(),
-                    )
-                    .unwrap()
-                    .ch()
+                    (text)
+                        .glyph_metric(text.glyph_at(index as usize).unwrap())
+                        .unwrap()
+                        .ch()
                 })
                 .collect()
         })
@@ -382,14 +365,12 @@ fn cjk_inline_boundary_min_content_uses_the_common_ancestors_white_space() {
             &mut document_resources,
         );
         let view = document.render_view(&document_resources);
-        let target = (0..box_queries::len(view.boxes()))
+        let target = (0..(view.boxes()).len())
             .map(layout_state::box_id_new)
-            .find(|&index| box_queries::attribute(view.boxes(), index, "id") == Some("target"))
+            .find(|&index| (view.boxes()).attribute(index, "id") == Some("target"))
             .unwrap();
         assert_eq!(
-            box_queries::render_box_view_size(view.boxes(), target)
-                .unwrap()
-                .width,
+            (view.boxes()).size(target).unwrap().width,
             expected,
             "{css}"
         );
@@ -423,19 +404,14 @@ fn cjk_intrinsic_min_content_uses_the_same_unicode_boundaries() {
             &mut document_resources,
         );
         let view = document.render_view(&document_resources);
-        let target = (0..box_queries::len(view.boxes()))
+        let target = (0..(view.boxes()).len())
             .map(layout_state::box_id_new)
-            .find(|&index| box_queries::attribute(view.boxes(), index, "id") == Some("target"))
+            .find(|&index| (view.boxes()).attribute(index, "id") == Some("target"))
             .unwrap();
         assert!(
-            (box_queries::render_box_view_size(view.boxes(), target)
-                .unwrap()
-                .width
-                - 10.0)
-                .abs()
-                < 0.01,
+            ((view.boxes()).size(target).unwrap().width - 10.0).abs() < 0.01,
             "{container}: {:?}",
-            box_queries::render_box_view_size(view.boxes(), target)
+            (view.boxes()).size(target)
         );
         // Inline-block carriers also publish a line containing the atomic
         // box; it has no source glyphs of its own.
@@ -486,21 +462,17 @@ fn cjk_native_clusters_are_respected_by_layout_and_intrinsic_sizing() {
             .shape(&mut shaper, &mut document_resources)
             .unwrap()
             .layout(
-                LayoutConstraints::new(10.0, 16.0).unwrap(),
-                &document_resources,
+                LayoutRequest::new(LayoutConstraints::new(10.0, 16.0).unwrap()),
+                &mut shaper,
+                &mut document_resources,
             )
             .expect("layout requires the shaper-aware API for first-line styles");
         let view = document.render_view(&document_resources);
-        let target = (0..box_queries::len(view.boxes()))
+        let target = (0..(view.boxes()).len())
             .map(layout_state::box_id_new)
-            .find(|&index| box_queries::attribute(view.boxes(), index, "id") == Some("target"))
+            .find(|&index| (view.boxes()).attribute(index, "id") == Some("target"))
             .unwrap();
-        assert_eq!(
-            box_queries::render_box_view_size(view.boxes(), target)
-                .unwrap()
-                .width,
-            20.0
-        );
+        assert_eq!((view.boxes()).size(target).unwrap().width, 20.0);
         assert_eq!(
             lines(&document, &document_resources)
                 .into_iter()
@@ -545,9 +517,9 @@ fn cjk_shaping_receives_language_for_each_region_and_first_line() {
     let document = prepared
         .shape(&mut shaper, &mut document_resources)
         .unwrap()
-        .layout_with_metrics_and_shaper(
-            LayoutConstraints::new(300.0, 16.0).unwrap(),
-            &crate::ImageMetrics::default(),
+        .layout(
+            LayoutRequest::new(LayoutConstraints::new(300.0, 16.0).unwrap())
+                .with_image_metrics(&ImageMetrics::default()),
             &mut shaper,
             &mut document_resources,
         )
@@ -696,14 +668,12 @@ fn cjk_min_content_keeps_punctuation_groups_and_max_content_remains_unwrapped() 
             &mut document_resources,
         );
         let view = document.render_view(&document_resources);
-        let target = (0..box_queries::len(view.boxes()))
+        let target = (0..(view.boxes()).len())
             .map(layout_state::box_id_new)
-            .find(|&index| box_queries::attribute(view.boxes(), index, "id") == Some("target"))
+            .find(|&index| (view.boxes()).attribute(index, "id") == Some("target"))
             .unwrap();
         assert_eq!(
-            box_queries::render_box_view_size(view.boxes(), target)
-                .unwrap()
-                .width,
+            (view.boxes()).size(target).unwrap().width,
             expected,
             "{css}, {text}"
         );
@@ -712,7 +682,7 @@ fn cjk_min_content_keeps_punctuation_groups_and_max_content_remains_unwrapped() 
 
 #[test]
 fn cjk_latin_preparation_keeps_the_existing_wrap_metadata_and_empty_unicode_path() {
-    use crate::layout_model::WhitespaceWrapOverride;
+    use html_engine_model::WhitespaceWrapOverride;
     for text in [
         "ordinary English text",
         "Français, español, svenska: café, naïve, Ångström",
@@ -775,16 +745,11 @@ fn cjk_breaks_inside_tables_and_around_atomic_inline_and_floated_content() {
         &mut document_resources,
     );
     let view = document.render_view(&document_resources);
-    let target = (0..box_queries::len(view.boxes()))
+    let target = (0..(view.boxes()).len())
         .map(layout_state::box_id_new)
-        .find(|&index| box_queries::attribute(view.boxes(), index, "id") == Some("target"))
+        .find(|&index| (view.boxes()).attribute(index, "id") == Some("target"))
         .unwrap();
-    assert_eq!(
-        box_queries::render_box_view_size(view.boxes(), target)
-            .unwrap()
-            .width,
-        10.0
-    );
+    assert_eq!((view.boxes()).size(target).unwrap().width, 10.0);
     assert_eq!(
         lines(&document, &document_resources),
         ["中", "文", "測", "試"]
@@ -825,12 +790,6 @@ fn cjk_bidi_wrapping_preserves_source_characters() {
         ["中文", "אבג", "測試"]
     );
     let text = document.render_view(&document_resources).text();
-    assert_eq!(
-        text_paint::character_direction(text, 0),
-        crate::TextDirection::Ltr
-    );
-    assert_eq!(
-        text_paint::character_direction(text, 2),
-        crate::TextDirection::Rtl
-    );
+    assert_eq!(text.character_direction(0), TextDirection::Ltr);
+    assert_eq!(text.character_direction(2), TextDirection::Rtl);
 }

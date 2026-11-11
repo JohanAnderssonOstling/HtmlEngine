@@ -5,33 +5,30 @@
 //! `revert` and `revert-layer` discard candidates from their cascade scope.
 
 use super::context::ResolvedDeclaration;
+use super::custom_properties::CustomPropertyScratch;
 use super::plan::MatchedRule;
-use crate::style::compiled::{CascadeOrigin, EffectiveRuleId, PreparedRuleSet, RulePriority};
+use super::runner::SubstitutionCache;
+use crate::style::cascade::resolver::prepared_native::PreparedNativeValue;
+use crate::style::compiled::{
+    CascadeOrigin, DeclarationId, EffectiveRuleId, PreparedRuleSet, RulePriority,
+};
 use crate::style::property_catalogue::PropertyKey;
+use crate::style::rules::prepared::PreparedDeclarationBlock;
+use crate::style::source::inline::PreparedInlineStyle;
 use crate::style::syntax::capabilities::declaration_is_custom_property;
-use crate::style::syntax::targets::compile_property_targets;
+use crate::style::syntax::prepared_renderer::PreparedRendererValue;
+use crate::style::syntax::wide_keywords::CssWideKeyword;
 use crate::style::syntax::wide_keywords::property_css_wide_keyword;
 use lightningcss::properties::Property;
-use lightningcss::stylesheet::StyleAttribute;
+use lightningcss::properties::custom::TokenOrValue;
 use rustc_data_structures::fx::FxHashMap;
 use std::hash::Hash;
-
-const ALWAYS_COMPUTABLE: u8 = 1 << 0;
-const ELIGIBILITY_KNOWN: u8 = 1 << 1;
-const RENDERER_ELIGIBLE: u8 = 1 << 2;
-
-fn declaration_flags(always_computable: bool, renderer_eligibility: Option<bool>) -> u8 {
-    u8::from(always_computable) * ALWAYS_COMPUTABLE
-        | u8::from(renderer_eligibility.is_some()) * ELIGIBILITY_KNOWN
-        | u8::from(renderer_eligibility == Some(true)) * RENDERER_ELIGIBLE
-}
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 pub(super) enum CascadeBoundary {
     Rule {
         priority: RulePriority,
         important: bool,
-        declaration_flags: u8,
         normal_rank: usize,
         layer_start: usize,
     },
@@ -114,82 +111,172 @@ impl CascadeBoundary {
     }
 }
 
-#[derive(Clone, Copy)]
-enum DeclarationSource<'sheet, 'css> {
-    Rule {
-        property: &'sheet Property<'css>,
-        targets: &'sheet [PropertyKey],
-    },
-    Inline {
-        important: bool,
-        index: u32,
-    },
-    Hint(u32),
-}
-
 /// Element-attached declarations share the same event and winner-selection path.
 #[derive(Clone, Copy, Default)]
 pub(super) struct ElementDeclarations<'a, 'css> {
-    pub(super) inline: Option<&'a StyleAttribute<'css>>,
+    pub(super) prepared: Option<&'a PreparedRuleSet<'css>>,
+    pub(super) inline: Option<&'a PreparedInlineStyle<'css>>,
     pub(super) hints: &'a [Property<'css>],
+    pub(super) hint_preparation: Option<&'a PreparedDeclarationBlock<'css>>,
 }
 
+/// Every declaration is a block/index handle. The boundary carries cascade
+/// semantics; element sources use the same prepared view as stylesheet blocks.
 #[derive(Clone, Copy)]
-pub(super) struct DeclarationEvent<'sheet, 'css> {
-    source: DeclarationSource<'sheet, 'css>,
+pub(super) struct DeclarationEvent {
+    block: u32,
+    index: u32,
     pub(super) boundary: CascadeBoundary,
 }
 
-impl<'sheet, 'css> DeclarationEvent<'sheet, 'css> {
-    pub(super) fn property<'a>(&self, element: ElementDeclarations<'a, 'css>) -> &'a Property<'css>
-    where
-        'sheet: 'a,
-    {
-        let (declarations, index) = match self.source {
-            DeclarationSource::Rule { property, .. } => return property,
-            DeclarationSource::Hint(index) => return &element.hints[index as usize],
-            DeclarationSource::Inline { important, index } => {
-                let declarations = &element
-                    .inline
-                    .expect("inline declaration events require their parsed style attribute")
-                    .declarations;
+struct DeclarationView<'a, 'css> {
+    property: &'a Property<'css>,
+    targets: &'a [PropertyKey],
+    longhands: Option<&'a [Property<'css>]>,
+    renderer: Option<&'a PreparedRendererValue>,
+    native: &'a [Option<PreparedNativeValue>],
+    eligible: bool,
+}
+
+impl DeclarationEvent {
+    fn view<'a, 'css>(&self, element: ElementDeclarations<'a, 'css>) -> DeclarationView<'a, 'css> {
+        let index = self.index as usize;
+        let (property, targets, longhands, renderer, native, eligible) = match self.boundary {
+            CascadeBoundary::Rule { important, .. } => {
+                let prepared = element.prepared.expect("stylesheet declaration blocks");
+                let id = EffectiveRuleId(self.block);
+                let rule = prepared.get(id).style_rule();
+                let property = if important {
+                    &rule.declarations.important_declarations[index]
+                } else {
+                    &rule.declarations.declarations[index]
+                };
+                let (targets, eligible) = prepared.declaration_metadata(id, important, index);
                 (
-                    if important {
-                        &declarations.important_declarations
-                    } else {
-                        &declarations.declarations
-                    },
-                    index,
+                    property,
+                    targets,
+                    prepared.declaration_longhands(id, important, index),
+                    prepared.renderer_value(id, important, index),
+                    prepared.native_values(id, important, index),
+                    eligible,
+                )
+            }
+            CascadeBoundary::Inline { important, .. } => {
+                let inline = element.inline.expect("inline declaration block");
+                let property = if important {
+                    &inline.declarations.important_declarations[index]
+                } else {
+                    &inline.declarations.declarations[index]
+                };
+                let (targets, eligible) = inline.metadata(important, index);
+                (
+                    property,
+                    targets,
+                    inline.longhands(important, index),
+                    inline.renderer_value(important, index),
+                    inline.native_values(important, index),
+                    eligible,
+                )
+            }
+            CascadeBoundary::Hints => {
+                let block = element.hint_preparation.expect("hint declaration block");
+                let (targets, eligible) = block.metadata(index);
+                (
+                    &element.hints[index],
+                    targets,
+                    block.longhands(index),
+                    block.renderer_value(index),
+                    block.native_values(index),
+                    eligible,
                 )
             }
         };
-        &declarations[index as usize]
-    }
-
-    fn prepared_targets(&self) -> Option<&'sheet [PropertyKey]> {
-        match self.source {
-            DeclarationSource::Rule { targets, .. } => Some(targets),
-            DeclarationSource::Inline { .. } | DeclarationSource::Hint(_) => None,
+        DeclarationView {
+            property,
+            targets,
+            longhands,
+            renderer,
+            native,
+            eligible,
         }
     }
 
-    pub(super) fn prepared_renderer_eligibility(&self) -> Option<bool> {
+    pub(super) fn rule_property<'a, 'css>(
+        &self,
+        element: ElementDeclarations<'a, 'css>,
+    ) -> Option<(DeclarationId, &'a Property<'css>)> {
+        let CascadeBoundary::Rule { important, .. } = self.boundary else {
+            return None;
+        };
+        let id = element
+            .prepared
+            .expect("stylesheet declaration blocks")
+            .declaration_id(EffectiveRuleId(self.block), important, self.index as usize);
+        Some((id, self.property(element)))
+    }
+
+    pub(super) fn property<'a, 'css>(
+        &self,
+        element: ElementDeclarations<'a, 'css>,
+    ) -> &'a Property<'css> {
+        self.view(element).property
+    }
+    pub(super) fn native_values<'a, 'css>(
+        &self,
+        element: ElementDeclarations<'a, 'css>,
+    ) -> &'a [Option<PreparedNativeValue>] {
+        self.view(element).native
+    }
+    pub(super) fn renderer_value<'a, 'css>(
+        &self,
+        element: ElementDeclarations<'a, 'css>,
+    ) -> Option<&'a PreparedRendererValue> {
+        self.view(element).renderer
+    }
+    pub(super) fn prepared_longhands<'a, 'css>(
+        &self,
+        element: ElementDeclarations<'a, 'css>,
+    ) -> Option<&'a [Property<'css>]> {
+        self.view(element).longhands
+    }
+    pub(super) fn prepared_targets<'a, 'css>(
+        &self,
+        element: ElementDeclarations<'a, 'css>,
+    ) -> &'a [PropertyKey] {
+        self.view(element).targets
+    }
+    pub(super) fn requires_viewport_height(&self, element: ElementDeclarations<'_, '_>) -> bool {
         match self.boundary {
-            CascadeBoundary::Rule {
-                declaration_flags, ..
-            } if declaration_flags & ELIGIBILITY_KNOWN != 0 => {
-                Some(declaration_flags & RENDERER_ELIGIBLE != 0)
-            }
-            CascadeBoundary::Rule { .. } => None,
-            CascadeBoundary::Inline { .. } => None,
-            CascadeBoundary::Hints => Some(true),
+            CascadeBoundary::Rule { important, .. } => element
+                .prepared
+                .expect("prepared rules")
+                .declaration_requires_viewport_height(
+                    EffectiveRuleId(self.block),
+                    important,
+                    self.index as usize,
+                ),
+            CascadeBoundary::Inline { important, .. } => element
+                .inline
+                .expect("prepared inline")
+                .requires_viewport_height(important, self.index as usize),
+            CascadeBoundary::Hints => element
+                .hint_preparation
+                .expect("prepared hints")
+                .requires_viewport_height(self.index as usize),
         }
+    }
+
+    pub(super) fn prepared_renderer_eligibility(
+        &self,
+        element: ElementDeclarations<'_, '_>,
+    ) -> bool {
+        self.view(element).eligible
     }
 }
 
 #[derive(Default)]
-pub(super) struct EventScratch<'sheet, 'css> {
-    pub(super) events: Vec<DeclarationEvent<'sheet, 'css>>,
+pub(super) struct EventScratch {
+    pub(super) events: Vec<DeclarationEvent>,
     normal_ranks: FxHashMap<EffectiveRuleId, usize>,
     layer_starts: Vec<usize>,
     skipped_rules: Vec<bool>,
@@ -206,12 +293,11 @@ fn mark_fully_shadowed_rules(
     skipped_rules.resize(rules.len(), false);
     let mut group_end = rules.len();
     while group_end != 0 {
-        let priority = prepared.get(rules[group_end - 1].id).priority();
+        let priority = prepared.priority(rules[group_end - 1].id);
         let mut group_start = group_end - 1;
         while group_start != 0
             && prepared
-                .get(rules[group_start - 1].id)
-                .priority()
+                .priority(rules[group_start - 1].id)
                 .same_origin_and_layer(priority)
         {
             group_start -= 1;
@@ -260,20 +346,24 @@ fn mark_fully_shadowed_rules(
 }
 
 #[derive(Default)]
-pub(super) struct CascadeScratch<'sheet, 'css> {
-    pub(super) events: EventScratch<'sheet, 'css>,
+pub(super) struct CascadeScratch<'css> {
+    pub(super) events: EventScratch,
     pub(super) hints: Vec<Property<'css>>,
-    pub(super) computation: CascadeComputation<'sheet, 'css>,
+    pub(super) hint_preparation: PreparedDeclarationBlock<'css>,
+    pub(super) custom_properties: CustomPropertyScratch<'css>,
+    pub(super) computation: CascadeComputation<'css>,
 }
 
 #[derive(Default)]
-pub(super) struct CascadeComputation<'sheet, 'css> {
-    pub(super) valid_events: Vec<DeclarationEvent<'sheet, 'css>>,
+pub(super) struct CascadeComputation<'css> {
+    pub(super) valid_events: Vec<DeclarationEvent>,
     pub(super) selection: SpecifiedSelection,
     // Retain each entry's native-value buffers between elements.
     pub(super) resolved: Vec<ResolvedDeclaration<'css>>,
     // Aligned with valid_events; usize::MAX denotes an unresolved declaration.
     pub(super) slots: Vec<usize>,
+    pub(super) substitution_tokens: Vec<TokenOrValue<'css>>,
+    pub(super) substitution_cache: SubstitutionCache<'css>,
 }
 
 pub(super) fn build_cascade_events<'prepared, 'css>(
@@ -281,7 +371,7 @@ pub(super) fn build_cascade_events<'prepared, 'css>(
     normal_rules: &[MatchedRule],
     important_rules: &[MatchedRule],
     element: ElementDeclarations<'_, 'css>,
-    scratch: &mut EventScratch<'prepared, 'css>,
+    scratch: &mut EventScratch,
 ) {
     let inline_capacity = element.inline.map_or(0, |inline| {
         inline.declarations.declarations.len() + inline.declarations.important_declarations.len()
@@ -318,9 +408,8 @@ pub(super) fn build_cascade_events<'prepared, 'css>(
         .iter()
         .enumerate()
         .map(|(index, _)| DeclarationEvent {
-            source: DeclarationSource::Hint(
-                u32::try_from(index).expect("HTML hint count fits in u32"),
-            ),
+            block: 0,
+            index: u32::try_from(index).expect("HTML hint count fits in u32"),
             boundary: CascadeBoundary::Hints,
         });
     let normal_ranks = &mut scratch.normal_ranks;
@@ -341,9 +430,8 @@ pub(super) fn build_cascade_events<'prepared, 'css>(
     for (rank, matched) in normal_rules.iter().enumerate() {
         if rank > 0
             && !prepared
-                .get(normal_rules[rank - 1].id)
-                .priority()
-                .same_origin_and_layer(prepared.get(matched.id).priority())
+                .priority(normal_rules[rank - 1].id)
+                .same_origin_and_layer(prepared.priority(matched.id))
         {
             layer_start = rank;
         }
@@ -367,8 +455,7 @@ pub(super) fn build_cascade_events<'prepared, 'css>(
             if scratch.skipped_rules[rule_index] {
                 continue;
             }
-            let rule = prepared.get(matched.id);
-            let priority = rule.priority();
+            let priority = prepared.priority(matched.id);
             if origin.is_some_and(|origin| priority.origin() != origin) {
                 continue;
             }
@@ -387,24 +474,19 @@ pub(super) fn build_cascade_events<'prepared, 'css>(
                 .get(normal_rank)
                 .copied()
                 .unwrap_or(normal_rank);
-            let declarations = &rule.style_rule().declarations;
+            let declarations = &prepared.get(matched.id).style_rule().declarations;
             let declarations = if important {
                 &declarations.important_declarations
             } else {
                 &declarations.declarations
             };
-            for (index, property) in declarations.iter().enumerate() {
-                let (targets, always_computable, renderer_eligibility) =
-                    prepared.declaration_metadata(matched.id, important, index);
+            for (index, _) in declarations.iter().enumerate() {
                 events.push(DeclarationEvent {
-                    source: DeclarationSource::Rule { property, targets },
+                    block: matched.id.0,
+                    index: u32::try_from(index).expect("declaration index"),
                     boundary: CascadeBoundary::Rule {
                         priority,
                         important,
-                        declaration_flags: declaration_flags(
-                            always_computable,
-                            renderer_eligibility,
-                        ),
                         normal_rank,
                         layer_start,
                     },
@@ -427,10 +509,8 @@ pub(super) fn build_cascade_events<'prepared, 'css>(
                     .iter()
                     .enumerate()
                     .map(|(index, _)| DeclarationEvent {
-                        source: DeclarationSource::Inline {
-                            important,
-                            index: u32::try_from(index).expect("declaration indices fit in u32"),
-                        },
+                        block: 0,
+                        index: u32::try_from(index).expect("declaration indices fit in u32"),
                         boundary: CascadeBoundary::Inline {
                             important,
                             normal_rank: normal_rules.len(),
@@ -468,7 +548,8 @@ pub(super) struct SelectedDeclaration {
 pub(super) struct SpecifiedSelection {
     pub(super) declarations: Vec<SelectedDeclaration>,
     targets: Vec<PropertyKey>,
-    inline_targets: Vec<PropertyKey>,
+    rollbacks: RollbackMap<PropertyKey>,
+    global_rollbacks: Vec<CascadeRollback>,
 }
 
 impl SpecifiedSelection {
@@ -491,6 +572,50 @@ impl CascadeRollback {
     pub(super) fn excludes(self, candidate: CascadeBoundary) -> bool {
         self.boundary
             .rollback_excludes(candidate, matches!(self.kind, RollbackKind::Layer))
+    }
+}
+
+/// Per-property rollback chains share one retained allocation.
+pub(super) struct RollbackMap<K> {
+    heads: FxHashMap<K, usize>,
+    entries: Vec<(CascadeRollback, Option<usize>)>,
+}
+
+impl<K> Default for RollbackMap<K> {
+    fn default() -> Self {
+        Self {
+            heads: FxHashMap::default(),
+            entries: Vec::new(),
+        }
+    }
+}
+
+impl<K: Eq + Hash> RollbackMap<K> {
+    pub(super) fn clear(&mut self) {
+        self.heads.clear();
+        self.entries.clear();
+    }
+
+    pub(super) fn push(&mut self, key: K, rollback: CascadeRollback) {
+        let previous = self.heads.insert(key, self.entries.len());
+        self.entries.push((rollback, previous));
+    }
+
+    pub(super) fn action(
+        &self,
+        key: K,
+        boundary: CascadeBoundary,
+        keyword: Option<RollbackKind>,
+    ) -> CandidateAction {
+        let mut next = self.heads.get(&key).copied();
+        while let Some(index) = next {
+            let (rollback, previous) = self.entries[index];
+            if rollback.excludes(boundary) {
+                return CandidateAction::Excluded;
+            }
+            next = previous;
+        }
+        keyword.map_or(CandidateAction::Select, CandidateAction::Rollback)
     }
 }
 
@@ -525,13 +650,11 @@ pub(super) enum RollbackKind {
     Layer,
 }
 
-pub(super) fn rollback_keyword(keyword: &str) -> Option<RollbackKind> {
-    if keyword.eq_ignore_ascii_case("revert") {
-        Some(RollbackKind::Origin)
-    } else if keyword.eq_ignore_ascii_case("revert-layer") {
-        Some(RollbackKind::Layer)
-    } else {
-        None
+pub(super) fn rollback_keyword(keyword: CssWideKeyword) -> Option<RollbackKind> {
+    match keyword {
+        CssWideKeyword::Revert => Some(RollbackKind::Origin),
+        CssWideKeyword::RevertLayer => Some(RollbackKind::Layer),
+        _ => None,
     }
 }
 
@@ -539,13 +662,15 @@ pub(super) fn rollback_keyword(keyword: &str) -> Option<RollbackKind> {
 /// restored to low-to-high order so computed-value conversion remains ordered
 /// for logical/physical aliases that share renderer storage.
 pub(super) fn select_specified_values<'sheet, 'css>(
-    events: &[DeclarationEvent<'sheet, 'css>],
+    events: &[DeclarationEvent],
     element: ElementDeclarations<'_, 'css>,
     selected: &mut SpecifiedSelection,
 ) {
     let mut claimed = PropertySet::default();
-    let mut rollbacks = FxHashMap::<PropertyKey, Vec<CascadeRollback>>::default();
-    let mut global_rollbacks = Vec::<CascadeRollback>::new();
+    let rollbacks = &mut selected.rollbacks;
+    rollbacks.clear();
+    let global_rollbacks = &mut selected.global_rollbacks;
+    global_rollbacks.clear();
     let mut all_claimed = false;
     selected.declarations.clear();
     selected.declarations.reserve(events.len());
@@ -557,12 +682,7 @@ pub(super) fn select_specified_values<'sheet, 'css>(
         if declaration_is_custom_property(property) {
             continue;
         }
-        let targets = if let Some(targets) = event.prepared_targets() {
-            targets
-        } else {
-            compile_property_targets(property, &mut selected.inline_targets);
-            &selected.inline_targets
-        };
+        let targets = event.prepared_targets(element);
         let is_all = matches!(property, Property::All(_));
 
         if is_all {
@@ -604,17 +724,14 @@ pub(super) fn select_specified_values<'sheet, 'css>(
             {
                 continue;
             }
-            match candidate_action(
-                rollbacks.get(&target).map_or(&[], Vec::as_slice),
+            match rollbacks.action(
+                target,
                 event.boundary,
                 property_css_wide_keyword(property).and_then(rollback_keyword),
             ) {
                 CandidateAction::Excluded => continue,
                 CandidateAction::Rollback(kind) => {
-                    rollbacks
-                        .entry(target)
-                        .or_default()
-                        .push(CascadeRollback::new(event.boundary, kind));
+                    rollbacks.push(target, CascadeRollback::new(event.boundary, kind));
                 }
                 CandidateAction::Select => {
                     claimed.insert(target);
@@ -645,6 +762,7 @@ mod tests {
     use crate::allocation_test_support::count_allocations;
     use crate::style::rules::prepared::prepare_stylesheets;
     use lightningcss::stylesheet::ParserOptions;
+    use lightningcss::stylesheet::StyleAttribute;
     use lightningcss::stylesheet::StyleSheet;
 
     #[test]
@@ -652,22 +770,19 @@ mod tests {
         let inline =
             StyleAttribute::parse("margin: 1px; margin-left: 2px", ParserOptions::default())
                 .unwrap();
+        let inline = crate::style::source::inline::PreparedInlineStyle::from(inline);
         let events = [
             DeclarationEvent {
-                source: DeclarationSource::Inline {
-                    important: false,
-                    index: 0,
-                },
+                block: 0,
+                index: 0,
                 boundary: CascadeBoundary::Inline {
                     important: false,
                     normal_rank: 0,
                 },
             },
             DeclarationEvent {
-                source: DeclarationSource::Inline {
-                    important: false,
-                    index: 1,
-                },
+                block: 0,
+                index: 1,
                 boundary: CascadeBoundary::Inline {
                     important: false,
                     normal_rank: 0,
@@ -678,8 +793,10 @@ mod tests {
         select_specified_values(
             &events,
             ElementDeclarations {
+                prepared: None,
                 inline: Some(&inline),
                 hints: &[],
+                hint_preparation: None,
             },
             &mut selected,
         );
@@ -704,16 +821,15 @@ mod tests {
             ParserOptions::default(),
         )
         .unwrap();
+        let inline = crate::style::source::inline::PreparedInlineStyle::from(inline);
         let events = inline
             .declarations
             .declarations
             .iter()
             .enumerate()
             .map(|(index, _)| DeclarationEvent {
-                source: DeclarationSource::Inline {
-                    important: false,
-                    index: index as u32,
-                },
+                block: 0,
+                index: index as u32,
                 boundary: CascadeBoundary::Inline {
                     important: false,
                     normal_rank: 0,
@@ -724,8 +840,10 @@ mod tests {
         select_specified_values(
             &events,
             ElementDeclarations {
+                prepared: None,
                 inline: Some(&inline),
                 hints: &[],
+                hint_preparation: None,
             },
             &mut selected,
         );
@@ -734,8 +852,10 @@ mod tests {
             select_specified_values(
                 &events,
                 ElementDeclarations {
+                    prepared: None,
                     inline: Some(&inline),
                     hints: &[],
+                    hint_preparation: None,
                 },
                 &mut selected,
             )
@@ -786,14 +906,23 @@ mod tests {
                 scope_proximity: u32::MAX,
             })
             .collect();
-        let plan = CascadePlan::build(matched, &mut Vec::new(), &prepared);
+        let mut plan = CascadePlan {
+            normal: matched,
+            important: Vec::new(),
+        };
+        plan.build(&prepared);
         let inline =
             StyleAttribute::parse("width:6px; width:16px!important", ParserOptions::default())
                 .unwrap();
+        let inline = crate::style::source::inline::PreparedInlineStyle::from(inline);
         let hints = StyleAttribute::parse("width:2.5px", ParserOptions::default()).unwrap();
+        let mut hint_preparation = PreparedDeclarationBlock::default();
+        hint_preparation.append(&hints.declarations.declarations);
         let element = ElementDeclarations {
+            prepared: Some(&prepared),
             inline: Some(&inline),
             hints: &hints.declarations.declarations,
+            hint_preparation: Some(&hint_preparation),
         };
         let mut scratch = EventScratch::default();
         build_cascade_events(
@@ -804,7 +933,7 @@ mod tests {
             &mut scratch,
         );
         let expected = StyleAttribute::parse(
-            "width:1px; width:2px; width:2.5px; width:3px; width:3.5px; width:4px; width:5px; width:6px; width:15px; width:14px; width:13px; width:13.5px; width:16px; width:12px; width:11px",
+            "width:1px; width:2px; width:2.5px; width:3.5px; width:4px; width:5px; width:6px; width:15px; width:14px; width:13.5px; width:16px; width:12px; width:11px",
             ParserOptions::default(),
         )
         .unwrap();
@@ -836,13 +965,11 @@ mod tests {
             [
                 (0, 0),
                 (1, 1),
-                (2, 2),
                 (3, 2),
                 (4, 4),
                 (5, 5),
                 (5, 5),
                 (4, 4),
-                (2, 2),
                 (3, 2),
                 (1, 1),
                 (0, 0)

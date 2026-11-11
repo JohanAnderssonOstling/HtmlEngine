@@ -46,7 +46,7 @@ fn rule_cascades_with_most_specific_matching_selector() {
 fn adjacent_replaced_element_can_be_floated() {
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline("<html><body><img src='a'/> <img src='b'/></body></html>", Some("img + img { float: right; }"));
-    let images = find_body(document.document()).children().filter(|&node| document.document().get_dom_tag(node) == Some("img")).collect::<Vec<_>>();
+    let images = find_body(document.document()).children().filter(|&node| document.document().try_element_ref(node).map(|element| element.tag()) == Some("img")).collect::<Vec<_>>();
 
     let first = document.box_model_style(document.style_for_node(images[0]).expect("first image style")).expect("box model");
     let second = document.box_model_style(document.style_for_node(images[1]).expect("second image style")).expect("box model");
@@ -80,9 +80,9 @@ fn only_anchors_with_href_get_link_styling() {
     let link = document.style_for_node(anchors[1]).expect("link style");
 
     assert_eq!(document.text_style(plain).expect("validated style handle").color, 0x000000FF, "href-less anchor must not be link-colored");
-    assert!(!document.background_style(plain).expect("validated style handle").text_decoration.lines.underline(), "href-less anchor must not be underlined");
+    assert!(!html_style_model::computed_style::text_decoration_lines_underline(document.background_style(plain).expect("validated style handle").text_decoration.lines), "href-less anchor must not be underlined");
     assert_eq!(document.text_style(link).expect("validated style handle").color, 0x0000FFFF);
-    assert!(document.background_style(link).expect("validated style handle").text_decoration.lines.underline(), "link should be underlined");
+    assert!(html_style_model::computed_style::text_decoration_lines_underline(document.background_style(link).expect("validated style handle").text_decoration.lines), "link should be underlined");
 }
 
 #[test]
@@ -113,7 +113,7 @@ fn authors_can_explicitly_style_note_reference_decorations() {
     let document = factory.parse_with_new_pipeline(html, Some("a { text-decoration: underline; }"));
     let anchor = find_body(document.document()).children().next().expect("note reference");
     let style = document.style_for_node(anchor).expect("anchor style");
-    assert!(document.background_style(style).expect("paint style").text_decoration.lines.underline(), "explicit author styling overrides the default");
+    assert!(html_style_model::computed_style::text_decoration_lines_underline(document.background_style(style).expect("paint style").text_decoration.lines), "explicit author styling overrides the default");
 }
 
 #[test]
@@ -127,9 +127,9 @@ fn vertical_align_inherit_propagates_tbody_middle_to_cells() {
     let mut node = find_body(doc).node_id();
     for _ in 0..4 {
         // table > tbody > tr > td
-        node = doc.element_ref(node).expect("element").children().find(|&child| doc.element_ref(child).is_some()).expect("child element");
+        node = doc.try_element_ref(node).expect("element").children().find(|&child| doc.try_element_ref(child).is_some()).expect("child element");
     }
-    let td = doc.element_ref(node).expect("td");
+    let td = doc.try_element_ref(node).expect("td");
     assert_eq!(td.tag(), "td");
     let style = document.style_for_node(node).expect("td style should exist");
 
@@ -237,7 +237,7 @@ fn list_item_keeps_inherited_text_align() {
 
     let doc = document.document();
     let ul_idx = find_body(doc).children().next().expect("ul should be child of body");
-    let li_idx = doc.element_ref(ul_idx).expect("ul element").children().next().expect("li should be child of ul");
+    let li_idx = doc.try_element_ref(ul_idx).expect("ul element").children().next().expect("li should be child of ul");
     let style = document.style_for_node(li_idx).expect("li style should exist");
 
     assert_eq!(document.text_style(style).expect("validated style handle").text_align, TextAlign::Justify);
@@ -290,7 +290,7 @@ fn current_color_on_color_computes_to_the_inherited_color() {
     let document = factory.parse_with_new_pipeline(html, None);
 
     let div = find_body(document.document()).children().next().expect("div should be child of body");
-    let paragraph = document.document().element_ref(div).expect("div element").children().next().expect("paragraph should be child of div");
+    let paragraph = document.document().try_element_ref(div).expect("div element").children().next().expect("paragraph should be child of div");
     let style = document.style_for_node(paragraph).expect("paragraph style should exist");
 
     assert_eq!(document.text_style(style).expect("validated style handle").color, 0x008000FF);

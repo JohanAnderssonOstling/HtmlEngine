@@ -32,14 +32,14 @@ fn parse_spine_position(spine_part: &str) -> Option<usize> {
 impl Document {
     /// Find which child index this node is in its parent's children list
     pub fn get_child_index(&self, node_id: DomNodeId) -> Option<usize> {
-        let parent = self.element_ref(self.get_dom_parent(node_id)?)?;
+        let parent = self.element_ref(self.node_ref(node_id).parent()?);
         parent.children().position(|child| child == node_id)
     }
 
     /// Get the CFI step number for this node (counting only element siblings before it)
     /// CFI uses step indirection: step = (element_index + 1) * 2
     pub fn get_element_step(&self, node_id: DomNodeId) -> Option<usize> {
-        let parent = self.element_ref(self.get_dom_parent(node_id)?)?;
+        let parent = self.element_ref(self.node_ref(node_id).parent()?);
 
         let mut element_count = 0;
         for child_idx in parent.children() {
@@ -58,7 +58,7 @@ impl Document {
     /// Returns the CFI odd step for a text node within its parent element.
     /// Step = 2 * (number of preceding element siblings) + 1.
     pub fn get_text_node_step(&self, text_node_id: DomNodeId) -> Option<usize> {
-        let parent = self.text_ref(text_node_id)?.parent()?;
+        let parent = self.try_text_ref(text_node_id)?.parent()?;
         self.text_children_with_steps(parent)
             .find(|(text, _)| text.node_id() == text_node_id)
             .map(|(_, step)| step)
@@ -96,7 +96,7 @@ impl Document {
         // Build path from node to root
         while let Some(idx) = current {
             path.push(idx);
-            current = self.dom_nodes.get(idx.index()).and_then(|n| n.parent());
+            current = self.node_ref(idx).parent();
         }
 
         // Reverse to get root-to-node order
@@ -114,7 +114,7 @@ impl Document {
                 return None;
             }
             current = self
-                .element_ref(current)?
+                .try_element_ref(current)?
                 .child_elements()
                 .nth(step / 2 - 1)?
                 .node_id();

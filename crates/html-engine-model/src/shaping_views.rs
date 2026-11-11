@@ -1,6 +1,5 @@
 //! Borrowed views over canonical shaping and range-local first-line changes.
 
-use crate::shaping_contracts;
 use crate::GlyphId;
 use crate::{CaretPositions, ResolvedBidi, ShapedTextGeometry, TextDirection, TextRunId};
 use std::ops::{Index, Range};
@@ -324,16 +323,8 @@ mod tests {
 
     #[test]
     fn geometry_overlays_split_native_runs_and_preserve_replacement_boundaries() {
-        let base_run = shaping_contracts::shaped_text_run_with_backend_run(Arc::from([1.0; 6]),
-            Arc::from([true, false, true, false, false, true, true]),
-            TextRunId(10),
-            [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0].into(),
-            8.0,);
-        let patch_run = shaping_contracts::shaped_text_run_with_backend_run(Arc::from([4.0; 2]),
-            Arc::from([true, false, true]),
-            TextRunId(20),
-            [0.0, 4.0, 8.0].into(),
-            12.0,);
+        let base_run = ShapedTextRun::with_backend_run(Arc::from([1.0; 6]), Arc::from([true, false, true, false, false, true, true]), TextRunId(10), [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0].into(), 8.0);
+        let patch_run = ShapedTextRun::with_backend_run(Arc::from([4.0; 2]), Arc::from([true, false, true]), TextRunId(20), [0.0, 4.0, 8.0].into(), 12.0);
         let mut base = ShapedTextGeometry::with_len(6);
         base.push_run(&[0, 1, 2, 3, 4, 5], base_run, true);
         let mut patch = ShapedTextGeometry::with_len(6);
@@ -382,7 +373,7 @@ mod tests {
         let mut fallback = ShapedTextGeometry::with_len(6);
         fallback.replace_range(
             2..4,
-            shaping_contracts::shaped_text_run_new(Arc::from([2.0; 2]), Arc::from([true; 3])),
+            ShapedTextRun::new(Arc::from([2.0; 2]), Arc::from([true; 3])),
             false,
         );
         let runs = TextGeometryView::new(&base, Some(&fallback))
@@ -413,16 +404,8 @@ mod tests {
                 [9.0, 0.0, 2.0],
             ),
         ] {
-            let base_run = shaping_contracts::shaped_text_run_with_backend_run(Arc::from([5.0, 4.0, 3.0, 2.0]),
-                Arc::from([true; 5]),
-                TextRunId(10),
-                base_carets.into(),
-                8.0,);
-            let patch_run = shaping_contracts::shaped_text_run_with_backend_run(Arc::from([7.0]),
-                Arc::from([true; 2]),
-                TextRunId(20),
-                patch_carets.into(),
-                12.0,);
+            let base_run = ShapedTextRun::with_backend_run(Arc::from([5.0, 4.0, 3.0, 2.0]), Arc::from([true; 5]), TextRunId(10), base_carets.into(), 8.0);
+            let patch_run = ShapedTextRun::with_backend_run(Arc::from([7.0]), Arc::from([true; 2]), TextRunId(20), patch_carets.into(), 12.0);
             let mut base = ShapedTextGeometry::with_len(6);
             // One backend run contributes two disjoint logical source ranges.
             base.push_run(&[0, 1, 4, 5], base_run, true);

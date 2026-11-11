@@ -7,9 +7,8 @@ use super::tracks::{
 };
 use super::{TaffyContainerKind, finite_f32, length_dimension};
 use crate::layout::{
-    LayoutEngine, ResolvedBoxModel, clamp_replaced_definite_size_by_intrinsic_constraints,
-    resolve_replaced_intrinsic_constraint,
-};
+    LayoutEngine, clamp_replaced_definite_size_by_intrinsic_constraints,
+    resolve_replaced_intrinsic_constraint};
 use html_style_model::{
     BoxSizing, FlexDirection, FlexWrap, GridAutoFlow, ItemAlignment, LayoutStyle, OverflowMode,
     PositionMode, TextDirection, UsedPreferredSize as PreferredSize,
@@ -24,28 +23,25 @@ use taffy::style::{
     Position as TaffyPosition,
 };
 
-pub(super) fn layout_style<'a>(session: &LayoutEngine<'a, '_>, box_idx: usize) -> &'a LayoutStyle {
-    session.reader.layout_style(box_idx)
+pub(super) fn layout_style<'a>(engine: &LayoutEngine<'a, '_>, box_idx: usize) -> &'a LayoutStyle {
+    engine.reader.layout_style(box_idx)
 }
 
-pub(super) fn effective_align_self(
-    session: &LayoutEngine<'_, '_>,
-    box_idx: usize,
-) -> ItemAlignment {
-    let alignment = layout_style(session, box_idx).align_self;
+pub(super) fn effective_align_self(engine: &LayoutEngine<'_, '_>, box_idx: usize) -> ItemAlignment {
+    let alignment = layout_style(engine, box_idx).align_self;
     if alignment != ItemAlignment::Auto {
         return alignment;
     }
-    session
+    engine
         .reader
         .get_parent(box_idx)
         .map_or(ItemAlignment::Normal, |parent| {
-            layout_style(session, parent).align_items
+            layout_style(engine, parent).align_items
         })
 }
 
 pub(super) fn taffy_container_style(
-    session: &LayoutEngine<'_, '_>,
+    engine: &LayoutEngine<'_, '_>,
     box_idx: usize,
     content_width: f64,
     explicit_height: Option<f64>,
@@ -55,8 +51,8 @@ pub(super) fn taffy_container_style(
     floor_fixed_grid_column_maxima: bool,
     intrinsic_inline_sizing: bool,
 ) -> Style {
-    let source = layout_style(session, box_idx);
-    let used = session.reader.style(box_idx);
+    let source = layout_style(engine, box_idx);
+    let used = engine.reader.style(box_idx);
     let rtl = used.direction() == TextDirection::Rtl;
     let inline_main = kind == TaffyContainerKind::Grid || matches!(source.flex_direction, FlexDirection::Row | FlexDirection::RowReverse);
     let grid_template_rows = used.grid_template_rows();
@@ -106,7 +102,7 @@ pub(super) fn taffy_container_style(
         grid_template_rows: grid_template_rows
             .map(|track| {
                 grid_template_track(
-                    session.reader.styles(),
+                    engine.reader.styles(),
                     &track,
                     false,
                     explicit_height,
@@ -117,7 +113,7 @@ pub(super) fn taffy_container_style(
         grid_template_columns: grid_template_columns
             .map(|track| {
                 grid_template_track(
-                    session.reader.styles(),
+                    engine.reader.styles(),
                     &track,
                     floor_fixed_grid_column_maxima,
                     (!intrinsic_inline_sizing).then_some(content_width),
@@ -126,11 +122,11 @@ pub(super) fn taffy_container_style(
             })
             .collect(),
         grid_template_row_names: grid_line_names(
-            session.reader.styles(),
+            engine.reader.styles(),
             &source.grid_template_row_names,
         ),
         grid_template_column_names: grid_line_names(
-            session.reader.styles(),
+            engine.reader.styles(),
             &source.grid_template_column_names,
         ),
         grid_template_areas: (source.grid_template_area_rows > 0
@@ -141,7 +137,7 @@ pub(super) fn taffy_container_style(
                     .iter()
                     .filter_map(|area| {
                         Some(TaffyGridTemplateArea {
-                            name: session.reader.styles().string(area.name)?.into(),
+                            name: engine.reader.styles().string(area.name)?.into(),
                             row_start: area.row_start,
                             row_end: area.row_end,
                             column_start: area.column_start,
@@ -180,7 +176,7 @@ pub(super) fn taffy_container_style(
 }
 
 pub(super) fn taffy_item_style(
-    session: &LayoutEngine<'_, '_>,
+    engine: &mut LayoutEngine<'_, '_>,
     box_idx: usize,
     containing_width: f64,
     containing_height: Option<f64>,
@@ -190,11 +186,14 @@ pub(super) fn taffy_item_style(
     stretch_height_basis: Option<f64>,
     intrinsic_inline_sizing: bool,
 ) -> Style {
-    let style = session.reader.style(box_idx);
-    let parent_rtl = session.reader.get_parent(box_idx).is_some_and(|parent| session.reader.style(parent).direction() == TextDirection::Rtl);
-    let box_model = ResolvedBoxModel::new(style, containing_width);
-    let layout = layout_style(session, box_idx);
-    let image_intrinsic = session.reader.image_intrinsic(box_idx);
+    let style = engine.reader.style(box_idx);
+    let parent_rtl = engine
+        .reader
+        .get_parent(box_idx)
+        .is_some_and(|parent| engine.reader.style(parent).direction() == TextDirection::Rtl);
+    let box_model = engine.reader.box_model(box_idx, containing_width);
+    let layout = layout_style(engine, box_idx);
+    let image_intrinsic = engine.reader.image_intrinsic(box_idx);
     let replaced_intrinsic = image_intrinsic.map(|intrinsic| intrinsic.size);
     let both_replaced_axes_auto = replaced_intrinsic.is_some()
         && matches!(style.width(), PreferredSize::Auto)
@@ -224,12 +223,12 @@ pub(super) fn taffy_item_style(
     } else {
         authored_aspect_ratio.preferred()
     };
-    let horizontal_main_axis = session
+    let horizontal_main_axis = engine
         .reader
         .get_parent(box_idx)
         .map(|parent| {
             matches!(
-                layout_style(session, parent).flex_direction,
+                layout_style(engine, parent).flex_direction,
                 FlexDirection::Row | FlexDirection::RowReverse
             )
         })
@@ -273,13 +272,13 @@ pub(super) fn taffy_item_style(
     let taffy_handles_absolute_item =
         taffy_handles_absolute_grid_item || taffy_handles_absolute_flex_item;
     let percentage_width_is_grid_area_stretch =
-        grid_percentage_width_is_stretch_equivalent(session, box_idx, kind)
+        grid_percentage_width_is_stretch_equivalent(engine, box_idx, kind)
             && (taffy_handles_absolute_grid_item
-                || grid_percentage_width_needs_intrinsic_track_workaround(session, box_idx));
+                || grid_percentage_width_needs_intrinsic_track_workaround(engine, box_idx));
     let absolute_percentage_width_is_grid_area_stretch =
         taffy_handles_absolute_grid_item && percentage_width_is_grid_area_stretch;
     let percentage_height_is_grid_area_stretch =
-        grid_percentage_height_is_stretch_equivalent(session, box_idx, kind);
+        grid_percentage_height_is_stretch_equivalent(engine, box_idx, kind);
     let width = if percentage_width_is_grid_area_stretch
         || (intrinsic_inline_sizing && style.width().percentage_dependent())
     {
@@ -297,7 +296,7 @@ pub(super) fn taffy_item_style(
         && matches!(style.width(), PreferredSize::Stretch)
         && containing_width > 0.0
     {
-        let intrinsic_outer = crate::layout::box_intrinsic_widths(session, box_idx).0;
+        let intrinsic_outer = crate::layout::box_intrinsic_widths(engine, box_idx).0;
         // If this item's intrinsic contribution established the column flex
         // container's min-content width, `stretch` is definite during the
         // measure pass. Leaving it auto makes Taffy establish the line from
@@ -311,7 +310,7 @@ pub(super) fn taffy_item_style(
         }
     } else {
         taffy_item_width_dimension(
-            session,
+            engine,
             box_idx,
             style.width(),
             containing_width,
@@ -333,15 +332,13 @@ pub(super) fn taffy_item_style(
     {
         length_dimension(
             flex_replaced_automatic_minimum(
-                session,
+                engine,
                 box_idx,
                 containing_width,
                 containing_height,
                 true,
             )
-            .unwrap_or_else(|| {
-                flex_automatic_min_content_width(session, box_idx, containing_width)
-            }),
+            .unwrap_or_else(|| flex_automatic_min_content_width(engine, box_idx, containing_width)),
         )
     } else if kind == TaffyContainerKind::Grid
         && matches!(style.width(), PreferredSize::FitContent)
@@ -351,7 +348,7 @@ pub(super) fn taffy_item_style(
         // the containing block. CSS Grid therefore uses the min-content
         // contribution, even when it exceeds a fixed track maximum.
         taffy_item_width_dimension(
-            session,
+            engine,
             box_idx,
             PreferredSize::MinContent,
             containing_width,
@@ -359,7 +356,7 @@ pub(super) fn taffy_item_style(
         )
     } else {
         taffy_item_width_dimension(
-            session,
+            engine,
             box_idx,
             style.min_width(),
             containing_width,
@@ -373,7 +370,7 @@ pub(super) fn taffy_item_style(
     {
         let item_cross_inset = box_model.vertical_padding_border();
         if let Some(width) = crate::layout::percentage_height_image_width(
-            session,
+            engine,
             box_idx,
             (containing_height - item_cross_inset).max(0.0),
         ) {
@@ -426,7 +423,7 @@ pub(super) fn taffy_item_style(
             Dimension::length(0.0)
         } else {
             flex_replaced_automatic_minimum(
-                session,
+                engine,
                 box_idx,
                 containing_width,
                 containing_height,
@@ -449,7 +446,7 @@ pub(super) fn taffy_item_style(
         }
     };
     let mut max_width = taffy_item_width_dimension(
-        session,
+        engine,
         box_idx,
         style.max_width(),
         containing_width,
@@ -469,7 +466,7 @@ pub(super) fn taffy_item_style(
             }
             value => dimension(value),
         });
-    let effective_alignment = effective_align_self(session, box_idx);
+    let effective_alignment = effective_align_self(engine, box_idx);
     let cross_auto_margins = if horizontal_main_axis {
         layout.margin_top_auto || layout.margin_bottom_auto
     } else {
@@ -546,7 +543,8 @@ pub(super) fn taffy_item_style(
         && style.width().percentage_dependent())
     .then(|| {
         let ratio = aspect_ratio?;
-        let (_, max_content_width) = crate::layout::box_content_intrinsic_widths(session, box_idx, None);
+        let (_, max_content_width) =
+            crate::layout::box_content_intrinsic_widths(engine, box_idx, None);
         (ratio > 0.0).then(|| length_dimension(max_content_width / f64::from(ratio)))
     })
     .flatten();
@@ -648,12 +646,12 @@ pub(super) fn taffy_item_style(
             item_alignment(layout.justify_self, parent_rtl)
         },
         grid_row: Line {
-            start: grid_placement(session.reader.styles(), layout.grid_row.start),
-            end: grid_placement(session.reader.styles(), layout.grid_row.end),
+            start: grid_placement(engine.reader.styles(), layout.grid_row.start),
+            end: grid_placement(engine.reader.styles(), layout.grid_row.end),
         },
         grid_column: Line {
-            start: grid_placement(session.reader.styles(), layout.grid_column.start),
-            end: grid_placement(session.reader.styles(), layout.grid_column.end),
+            start: grid_placement(engine.reader.styles(), layout.grid_column.start),
+            end: grid_placement(engine.reader.styles(), layout.grid_column.end),
         },
         ..Style::default()
     }

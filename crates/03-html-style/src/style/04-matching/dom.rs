@@ -1,50 +1,312 @@
-use html_dom::storage;
+use super::filter::SelectorFilter;
+use super::names::GeneralNames;
+use super::traversal::{StyleTraversal, SummaryTest};
 #[cfg(test)]
 use crate::style::syntax::selectors::selector_specificity;
 use crate::style::syntax::selectors::{
     PSEUDO_AFTER_MASK, PSEUDO_BEFORE_MASK, PSEUDO_FIRST_LETTER_MASK, PSEUDO_FIRST_LINE_MASK,
 };
-use html_dom::{Document, DomNodeId, NodeRef};
-use lightningcss::selector::{Combinator, Component, Direction, PseudoClass, PseudoElement, Selector};
-use parcel_selectors::attr::{AttrSelectorOperator, CaseSensitivity, NamespaceConstraint, ParsedAttrSelectorOperation, ParsedCaseSensitivity};
+use html_dom::{Document, DomNodeId, ElementRef, NodeRef};
+use lightningcss::selector::{
+    Combinator, Component, Direction, PseudoClass, PseudoElement, Selector,
+};
+use parcel_selectors::attr::{
+    AttrSelectorOperator, CaseSensitivity, NamespaceConstraint, ParsedAttrSelectorOperation,
+    ParsedCaseSensitivity,
+};
 use parcel_selectors::parser::{NthSelectorData, NthType};
-use std::cell::OnceCell;
+use rustc_data_structures::fx::{FxHashMap, FxHasher};
+use std::hash::{Hash, Hasher};
 
-/// Temporary, document-bound links shared by one style-resolution pass. Build
-/// them only when matching actually reaches a sibling combinator.
-pub(crate) struct SiblingIndex<'a> {
+/// Traversal facts shared by one style-resolution pass. Off-path searches
+/// retain lazy document-wide sibling links as an exact fallback.
+pub(crate) struct SiblingIndex<'context, 'a, 'css> {
     document: &'a Document,
-    previous: OnceCell<Vec<u32>>,
+    traversal: &'context mut StyleTraversal<'a>,
+    caches: &'context mut MatchCaches<'css>,
 }
 
-impl<'a> SiblingIndex<'a> {
-    pub(crate) fn new(document: &'a Document) -> Self {
-        Self { document, previous: OnceCell::new() }
+#[derive(Default)]
+pub(crate) struct MatchCaches<'css> {
+    previous: Option<Vec<DomNodeId>>,
+    search_scratch: Vec<DomNodeId>,
+    has_results: FxHashMap<(DomNodeId, usize), bool>,
+    names: GeneralNames,
+    selector_ids: SelectorIds<'css>,
+    nth_indices: FxHashMap<NthIndexKey, i32>,
+    relative_filters: FxHashMap<(DomNodeId, bool), Option<Box<SelectorFilter>>>,
+}
+
+/// Structural interning gives recursive selectors stable pass-local IDs.
+/// Hash collisions are checked against the complete selector list.
+#[derive(Default)]
+struct SelectorIds<'css> {
+    buckets: FxHashMap<u64, Vec<(Vec<Selector<'css>>, usize)>>,
+    next: usize,
+}
+
+impl<'css> SelectorIds<'css> {
+    fn intern(&mut self, selectors: &[Selector<'css>]) -> usize {
+        let mut hash = FxHasher::default();
+        selectors.hash(&mut hash);
+        let bucket = self.buckets.entry(hash.finish()).or_default();
+        if let Some((_, id)) = bucket
+            .iter()
+            .find(|(stored, _)| stored.as_slice() == selectors)
+        {
+            return *id;
+        }
+        let id = self.next;
+        self.next += 1;
+        bucket.push((selectors.to_vec(), id));
+        id
+    }
+}
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+struct NthIndexKey {
+    filter: usize,
+    scope: Option<DomNodeId>,
+    ancestor_floor: Option<DomNodeId>,
+    // This cache belongs to one document; indices are only opaque keys.
+    node: DomNodeId,
+    of_type: bool,
+    from_end: bool,
+}
+
+impl<'context, 'a, 'css> SiblingIndex<'context, 'a, 'css> {
+    pub(crate) fn new(
+        document: &'a Document,
+        traversal: &'context mut StyleTraversal<'a>,
+        caches: &'context mut MatchCaches<'css>,
+    ) -> Self {
+        Self {
+            document,
+            traversal,
+            caches,
+        }
     }
 
-    fn previous_element_sibling(&self, node: DomNodeId) -> Option<DomNodeId> {
-        self.document.element_ref(node)?;
-        let previous = self.previous.get_or_init(|| {
-            let mut previous = vec![u32::MAX; self.document.node_count()];
+    fn with_search_scratch<R>(&mut self, search: impl FnOnce(&mut Vec<DomNodeId>) -> R) -> R {
+        // Release the borrow before matching: nested logical selectors may
+        // themselves search. Retain the larger allocation when they finish.
+        let mut pending = std::mem::take(&mut self.caches.search_scratch);
+        let matched = search(&mut pending);
+        pending.clear();
+        let cached = &mut self.caches.search_scratch;
+        if pending.capacity() > cached.capacity() {
+            *cached = pending;
+        }
+        matched
+    }
+
+    pub(super) fn ancestor_matches(
+        &mut self,
+        node: DomNodeId,
+        test: SummaryTest<'_>,
+    ) -> Option<bool> {
+        self.traversal.ancestor_matches(node, test)
+    }
+
+    fn earlier_sibling_matches(&mut self, node: DomNodeId, test: SummaryTest<'_>) -> Option<bool> {
+        self.traversal.earlier_sibling_matches(node, test)
+    }
+
+    fn matches_nth_child(&mut self, nth: &NthSelectorData, node: DomNodeId) -> Option<bool> {
+        let from_end = nth.ty.is_from_end();
+        let (position, count) = self
+            .traversal
+            .sibling_position(node, from_end || nth.ty.is_only())?;
+        Some(if nth.ty.is_only() {
+            count == 1
+        } else {
+            let index = if from_end {
+                count - position + 1
+            } else {
+                position
+            };
+            nth_index_matches(nth.a, nth.b, index)
+        })
+    }
+
+    fn nth_index(
+        element: ElementRef<'_>,
+        selectors: &[Selector<'css>],
+        of_type: bool,
+        from_end: bool,
+        context: &mut MatchContext<'_, '_, '_, 'css>,
+    ) -> i32 {
+        let document = context
+            .siblings
+            .as_deref()
+            .expect("matching caches")
+            .document;
+        let key = NthIndexKey {
+            node: element.node_id(),
+            filter: context
+                .siblings
+                .as_deref_mut()
+                .expect("matching caches")
+                .caches
+                .selector_ids
+                .intern(selectors),
+            of_type,
+            from_end,
+            scope: if selectors.is_empty() {
+                None
+            } else {
+                context.scope
+            },
+            ancestor_floor: if selectors.is_empty() {
+                None
+            } else {
+                context.exclusive_ancestor_floor
+            },
+        };
+        if let Some(&index) = context
+            .siblings
+            .as_deref_mut()
+            .expect("matching caches")
+            .caches
+            .nth_indices
+            .get(&key)
+        {
+            return index;
+        }
+        let mut matches_filter = |element: ElementRef<'_>| {
+            selectors.is_empty()
+                || selectors.iter().any(|selector| {
+                    selector_matches_dom_node_with_context(
+                        selector,
+                        document,
+                        element.node_id(),
+                        context,
+                    )
+                })
+        };
+        let Some(parent) = element.parent().map(|parent| document.element_ref(parent)) else {
+            return i32::from(matches_filter(element));
+        };
+        let mut children = parent.children();
+        let mut position = 0;
+        let mut result = 0;
+        let mut entries = Vec::new();
+        // Populate the sibling group once. Release all cache borrows before
+        // evaluating a filter, since it may recursively use positional matching.
+        while let Some(child) = if from_end {
+            children.next_back()
+        } else {
+            children.next()
+        } {
+            let Some(child) = document.try_element_ref(child) else {
+                continue;
+            };
+            if of_type && (child.tag() != element.tag() || child.namespace() != element.namespace())
+            {
+                continue;
+            }
+            let index = if matches_filter(child) {
+                position += 1;
+                position
+            } else {
+                0
+            };
+            if child.node_id() == element.node_id() {
+                result = index;
+            }
+            entries.push((
+                NthIndexKey {
+                    node: child.node_id(),
+                    ..key.clone()
+                },
+                index,
+            ));
+        }
+        context
+            .siblings
+            .as_deref_mut()
+            .expect("matching caches")
+            .caches
+            .nth_indices
+            .extend(entries);
+        result
+    }
+
+    fn reject_relative_subtree(
+        &mut self,
+        components: &[Component<'_>],
+        anchor: DomNodeId,
+        children_only: bool,
+    ) -> bool {
+        let requirements = SelectorFilter::for_subject(components);
+        if requirements.is_empty() {
+            return false;
+        }
+        let key = (anchor, children_only);
+        {
+            let filters = &mut self.caches.relative_filters;
+            match filters.get(&key) {
+                Some(Some(filter)) => return !filter.contains(requirements),
+                Some(None) => {}
+                None => {
+                    // A one-off search should not pay to summarize its subtree.
+                    filters.insert(key, None);
+                    return false;
+                }
+            }
+        }
+        let filter = self.with_search_scratch(|pending| {
+            let mut filter = SelectorFilter::default();
+            if let Some(element) = self.document.try_element_ref(anchor) {
+                pending.extend(element.child_elements().map(|child| child.node_id()));
+            }
+            while let Some(node) = pending.pop() {
+                if let Some(element) = self.document.try_element_ref(node) {
+                    filter.insert_element(element);
+                    if !children_only {
+                        pending.extend(element.child_elements().map(|child| child.node_id()));
+                    }
+                }
+            }
+            filter
+        });
+        let rejected = !filter.contains(requirements);
+        self.caches
+            .relative_filters
+            .insert(key, Some(Box::new(filter)));
+        rejected
+    }
+
+    pub(super) fn effective_language(&mut self, node: DomNodeId) -> Option<Option<&'a str>> {
+        self.traversal.effective_language(node)
+    }
+
+    pub(super) fn previous_element_sibling(&mut self, node: DomNodeId) -> Option<DomNodeId> {
+        if self.caches.previous.as_ref().is_none() {
+            if let Some(previous) = self.traversal.previous_sibling(node) {
+                return previous;
+            }
+        }
+        self.document.try_element_ref(node)?;
+        let previous = self.caches.previous.get_or_insert_with(|| {
+            // A node cannot be its own previous sibling; self denotes absence.
+            let mut previous: Vec<_> = self.document.element_ids().collect();
             for (_, node) in self.document.nodes() {
-                let NodeRef::Element(parent) = node else { continue };
-                let mut sibling = u32::MAX;
+                let NodeRef::Element(parent) = node else {
+                    continue;
+                };
+                let mut sibling = None;
                 for child in parent.children() {
                     if self.document.is_element_node(child) {
-                        previous[child.index()] = sibling;
-                        sibling = child.index() as u32;
+                        previous[child.index()] = sibling.unwrap_or(child);
+                        sibling = Some(child);
                     }
                 }
             }
             previous
         });
         let sibling = previous[node.index()];
-        if sibling == u32::MAX {
-            return None;
-        }
-        // node_ids is a mapped range: nth performs a constant-time lookup and
-        // returns an identity branded by the borrowed source document.
-        self.document.node_ids().nth(sibling as usize)
+        (sibling != node).then_some(sibling)
     }
 }
 
@@ -73,36 +335,67 @@ impl PseudoTarget {
 }
 
 #[cfg(test)]
-pub fn selector_matches_dom_node(selector: &Selector, doc: &Document, node_idx: DomNodeId) -> bool {
-    match_from_position_dom(selector.iter_raw_match_order().as_slice(), doc, node_idx, None, MatchContext::default())
+pub fn selector_matches_dom_node<'css>(
+    selector: &Selector<'css>,
+    doc: &Document,
+    node_idx: DomNodeId,
+) -> bool {
+    match_from_position_dom(
+        selector.iter_raw_match_order().as_slice(),
+        doc,
+        node_idx,
+        None,
+        &mut MatchContext::default(),
+    ) == MatchResult::Matched
 }
 
-pub(crate) fn selector_matches_dom_node_in_scope(selector: &Selector, doc: &Document, node_idx: DomNodeId, scope: DomNodeId, siblings: &SiblingIndex<'_>) -> bool {
-    match_from_position_dom(selector.iter_raw_match_order().as_slice(), doc, node_idx, None, MatchContext { scope: Some(scope), exclusive_ancestor_floor: None, siblings: Some(siblings) })
+pub(crate) fn selector_matches_dom_node_in_scope<'css>(
+    selector: &Selector<'css>,
+    doc: &Document,
+    node_idx: DomNodeId,
+    scope: DomNodeId,
+    siblings: &mut SiblingIndex<'_, '_, 'css>,
+) -> bool {
+    match_from_position_dom(
+        selector.iter_raw_match_order().as_slice(),
+        doc,
+        node_idx,
+        None,
+        &mut MatchContext {
+            scope: Some(scope),
+            exclusive_ancestor_floor: None,
+            siblings: Some(siblings),
+        },
+    ) == MatchResult::Matched
 }
 
-pub(crate) fn selector_matches_dom_pseudo_in_scope(selector: &Selector, doc: &Document, node_idx: DomNodeId, pseudo: PseudoTarget, scope: DomNodeId, siblings: &SiblingIndex<'_>) -> bool {
-    selector_matches_dom_pseudo_with_context(selector, doc, node_idx, pseudo, MatchContext { scope: Some(scope), exclusive_ancestor_floor: None, siblings: Some(siblings) })
+/// Only candidate-index callers may supply a proved subject predicate.
+/// Pseudo callers also check the compiled pseudo-target mask first.
+pub(crate) fn selector_matches_indexed_in_scope<'css>(
+    selector: &Selector<'css>,
+    doc: &Document,
+    node_idx: DomNodeId,
+    pseudo: Option<PseudoTarget>,
+    scope: DomNodeId,
+    siblings: &mut SiblingIndex<'_, '_, 'css>,
+    bucket_component: u16,
+) -> bool {
+    match_from_position_dom_skipping(
+        selector.iter_raw_match_order().as_slice(),
+        doc,
+        node_idx,
+        pseudo,
+        &mut MatchContext {
+            scope: Some(scope),
+            exclusive_ancestor_floor: None,
+            siblings: Some(siblings),
+        },
+        (bucket_component != u16::MAX).then_some(usize::from(bucket_component)),
+    ) == MatchResult::Matched
 }
 
-fn selector_matches_dom_pseudo_with_context(selector: &Selector, doc: &Document, node_idx: DomNodeId, pseudo: PseudoTarget, context: MatchContext) -> bool {
-    let has_target = selector.iter_raw_match_order().any(|component| {
-        matches!(
-            (component, pseudo),
-            (Component::PseudoElement(PseudoElement::Before), PseudoTarget::Before)
-                | (Component::PseudoElement(PseudoElement::After), PseudoTarget::After)
-                | (Component::PseudoElement(PseudoElement::FirstLine), PseudoTarget::FirstLine)
-                | (Component::PseudoElement(PseudoElement::FirstLetter), PseudoTarget::FirstLetter)
-        )
-    });
-    if !has_target {
-        return false;
-    }
-    match_from_position_dom(selector.iter_raw_match_order().as_slice(), doc, node_idx, Some(pseudo), context)
-}
-
-#[derive(Clone, Copy, Default)]
-struct MatchContext<'a> {
+#[derive(Default)]
+struct MatchContext<'context, 'cache, 'dom, 'css> {
     /// The element represented by `:scope`. Outside relative selector
     /// matching, `:scope` defaults to the document element.
     scope: Option<DomNodeId>,
@@ -110,120 +403,208 @@ struct MatchContext<'a> {
     /// Ancestor combinators must not escape that subtree or match the anchor
     /// itself (the omitted leading combinator is `:scope `).
     exclusive_ancestor_floor: Option<DomNodeId>,
-    siblings: Option<&'a SiblingIndex<'a>>,
+    siblings: Option<&'context mut SiblingIndex<'cache, 'dom, 'css>>,
 }
 
-impl MatchContext<'_> {
-    fn previous_element_sibling(self, doc: &Document, node: DomNodeId) -> Option<DomNodeId> {
-        if let Some(siblings) = self.siblings {
+impl MatchContext<'_, '_, '_, '_> {
+    fn previous_element_sibling(&mut self, doc: &Document, node: DomNodeId) -> Option<DomNodeId> {
+        if let Some(siblings) = self.siblings.as_deref_mut() {
             siblings.previous_element_sibling(node)
         } else {
-            doc.element_ref(node)?.previous_element_sibling().map(|element| element.node_id())
+            doc.try_element_ref(node)?
+                .previous_element_sibling()
+                .map(|element| element.node_id())
         }
     }
 }
 
-/// Match selector components from a position against a DOM node
-fn match_from_position_dom<'i>(
-    components: &[Component<'i>],
+/// Failure describes the nearest combinator at which retrying may succeed.
+/// Ancestor exhaustion cannot be repaired by trying another sibling or a
+/// higher ancestor; missing siblings can still be repaired by moving upwards.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum MatchResult {
+    Matched,
+    RetrySibling,
+    RetryAncestor,
+    Failed,
+}
+
+/// Match selector components from a position against a DOM node.
+#[inline]
+fn match_from_position_dom<'css>(
+    components: &[Component<'css>],
     doc: &Document,
     node_idx: DomNodeId,
     pseudo: Option<PseudoTarget>,
-    context: MatchContext,
-) -> bool {
-    let mut pos = 0;
+    context: &mut MatchContext<'_, '_, '_, 'css>,
+) -> MatchResult {
+    match_from_position_dom_skipping(components, doc, node_idx, pseudo, context, None)
+}
 
-    // Match components in current sequence
-    while pos < components.len() {
-        match &components[pos] {
-            Component::Combinator(combinator) => {
-                // Found combinator, recurse with appropriate ancestor/sibling
-                let remaining = &components[pos + 1..];
-                return match combinator {
-                    // Parcel selectors inserts this internal boundary between
-                    // a pseudo-element and its originating element. Both are
-                    // matched against the same DOM node; only the pseudo side
-                    // receives the requested pseudo target.
-                    Combinator::PseudoElement => {
-                        match_from_position_dom(remaining, doc, node_idx, None, context)
-                    }
-                    Combinator::Child => doc
-                        .element_ref(node_idx)
-                        .and_then(|element| element.parent())
-                        .filter(|parent_idx| Some(*parent_idx) != context.exclusive_ancestor_floor)
-                        .is_some_and(|parent_idx| {
-                            match_from_position_dom(remaining, doc, parent_idx, pseudo, context)
-                        }),
-                    Combinator::Descendant => {
-                        for ancestor_idx in doc.dom_ancestors(node_idx) {
-                            if Some(ancestor_idx) == context.exclusive_ancestor_floor {
-                                break;
-                            }
-                            if match_from_position_dom(
-                                remaining,
-                                doc,
-                                ancestor_idx,
-                                pseudo,
-                                context,
-                            ) {
-                                return true;
-                            }
-                        }
-                        false
-                    }
-                    Combinator::NextSibling => context
-                        .previous_element_sibling(doc, node_idx)
-                        .is_some_and(|sibling| {
-                            match_from_position_dom(
-                                remaining,
-                                doc,
-                                sibling,
-                                pseudo,
-                                context,
-                            )
-                        }),
-                    Combinator::LaterSibling => {
-                        let mut current = context.previous_element_sibling(doc, node_idx);
-                        while let Some(sibling) = current {
-                            if match_from_position_dom(
-                                remaining,
-                                doc,
-                                sibling,
-                                pseudo,
-                                context,
-                            ) {
-                                return true;
-                            }
-                            current = context.previous_element_sibling(doc, sibling);
-                        }
-                        false
-                    }
-                    _ => false,
+fn match_from_position_dom_skipping<'css>(
+    components: &[Component<'css>],
+    doc: &Document,
+    node_idx: DomNodeId,
+    pseudo: Option<PseudoTarget>,
+    context: &mut MatchContext<'_, '_, '_, 'css>,
+    skip: Option<usize>,
+) -> MatchResult {
+    let element = doc.try_element_ref(node_idx);
+    let mut pos = 0;
+    let mut deferred = false;
+    while let Some(component) = components.get(pos) {
+        if component.is_combinator() {
+            break;
+        }
+        let Some(element) = element else {
+            return MatchResult::RetrySibling;
+        };
+        if Some(pos) == skip {
+            pos += 1;
+            continue;
+        }
+        if component_needs_search(component) {
+            deferred = true;
+        } else if !component_matches_dom(component, doc, element, pseudo, context) {
+            return MatchResult::RetrySibling;
+        }
+        pos += 1;
+    }
+    // Local tag/ID/class/attribute failures avoid logical and structural
+    // searches. Revisit metadata only when this compound deferred a search.
+    if deferred {
+        let Some(element) = element else {
+            return MatchResult::RetrySibling;
+        };
+        for (position, component) in components[..pos].iter().enumerate() {
+            if Some(position) != skip
+                && component_needs_search(component)
+                && !component_matches_dom(component, doc, element, pseudo, context)
+            {
+                return MatchResult::RetrySibling;
+            }
+        }
+    }
+    let Some(Component::Combinator(combinator)) = components.get(pos) else {
+        return MatchResult::Matched;
+    };
+    let remaining = &components[pos + 1..];
+    match combinator {
+        // Both sides of this internal boundary refer to the same DOM node.
+        Combinator::PseudoElement => {
+            // The originating element is still the subject. Every real DOM
+            // relation and every nested logical match uses the exact wrapper.
+            match_from_position_dom_skipping(
+                remaining,
+                doc,
+                node_idx,
+                None,
+                context,
+                skip.and_then(|position| position.checked_sub(pos + 1)),
+            )
+        }
+        Combinator::Child => {
+            let Some(parent) = element
+                .and_then(|element| element.parent())
+                .filter(|parent| Some(*parent) != context.exclusive_ancestor_floor)
+            else {
+                return MatchResult::Failed;
+            };
+            match match_from_position_dom(remaining, doc, parent, pseudo, context) {
+                result @ (MatchResult::Matched | MatchResult::Failed) => result,
+                // A different sibling has the same parent. Only an ancestor
+                // retry can change which element is tested as the parent.
+                _ => MatchResult::RetryAncestor,
+            }
+        }
+        Combinator::Descendant => {
+            if context.exclusive_ancestor_floor.is_none()
+                && let Some(test) = SummaryTest::from_components(remaining)
+                && let Some(matched) = context
+                    .siblings
+                    .as_deref_mut()
+                    .and_then(|state| state.ancestor_matches(node_idx, test))
+            {
+                return if matched {
+                    MatchResult::Matched
+                } else {
+                    MatchResult::Failed
                 };
             }
-            component => {
-                if !component_matches_dom(component, doc, node_idx, pseudo, context) {
-                    return false;
+            for ancestor in doc.dom_ancestors(node_idx) {
+                if Some(ancestor) == context.exclusive_ancestor_floor {
+                    break;
                 }
-                pos += 1;
+                match match_from_position_dom(remaining, doc, ancestor, pseudo, context) {
+                    result @ (MatchResult::Matched | MatchResult::Failed) => return result,
+                    _ => {}
+                }
             }
+            MatchResult::Failed
         }
+        Combinator::NextSibling => {
+            let Some(sibling) = context.previous_element_sibling(doc, node_idx) else {
+                return MatchResult::RetryAncestor;
+            };
+            match_from_position_dom(remaining, doc, sibling, pseudo, context)
+        }
+        Combinator::LaterSibling => {
+            if let Some(test) = SummaryTest::from_components(remaining)
+                && let Some(matched) = context
+                    .siblings
+                    .as_deref_mut()
+                    .and_then(|state| state.earlier_sibling_matches(node_idx, test))
+            {
+                return if matched {
+                    MatchResult::Matched
+                } else {
+                    MatchResult::RetryAncestor
+                };
+            }
+            let mut current = context.previous_element_sibling(doc, node_idx);
+            while let Some(sibling) = current {
+                match match_from_position_dom(remaining, doc, sibling, pseudo, context) {
+                    MatchResult::RetrySibling => {}
+                    result => return result,
+                }
+                current = context.previous_element_sibling(doc, sibling);
+            }
+            MatchResult::RetryAncestor
+        }
+        _ => MatchResult::RetrySibling,
     }
-
-    true // All components matched
 }
 
-/// Check if a single selector component matches a DOM node
-fn component_matches_dom(
-    component: &Component,
+fn component_needs_search(component: &Component<'_>) -> bool {
+    matches!(
+        component,
+        Component::Has(_)
+            | Component::Is(_)
+            | Component::Where(_)
+            | Component::Negation(_)
+            | Component::Nth(_)
+            | Component::NthOf(_)
+            | Component::NonTSPseudoClass(PseudoClass::Lang { .. })
+    )
+}
+
+/// Keep common local checks separate from structural searches so callers
+/// can inline them without the search helpers' larger stack frames.
+#[inline]
+fn component_matches_dom<'css>(
+    component: &Component<'css>,
     doc: &Document,
-    node_idx: DomNodeId,
+    element: ElementRef<'_>,
     pseudo: Option<PseudoTarget>,
-    context: MatchContext,
+    context: &mut MatchContext<'_, '_, '_, 'css>,
 ) -> bool {
-    let Some(element) = doc.element_ref(node_idx) else {
-        return false;
-    };
+    if let Some(matched) = context
+        .siblings
+        .as_deref_mut()
+        .and_then(|state| state.caches.names.matches(component, doc, element))
+    {
+        return matched;
+    }
     match component {
         Component::ExplicitAnyNamespace => true,
         Component::ExplicitNoNamespace => element.namespace().is_none(),
@@ -233,7 +614,7 @@ fn component_matches_dom(
         Component::ExplicitUniversalType => true,
 
         Component::LocalName(name) => {
-            let selector_name = if storage::is_html_element_in_html_document(element) {
+            let selector_name = if element.is_html_element_in_html_document() {
                 name.lower_name.0.as_ref()
             } else {
                 name.name.0.as_ref()
@@ -245,6 +626,19 @@ fn component_matches_dom(
 
         Component::Class(class_selector) => element.has_class(class_selector.0.as_ref()),
 
+        _ => component_matches_complex_dom(component, doc, element, pseudo, context),
+    }
+}
+
+fn component_matches_complex_dom<'css>(
+    component: &Component<'css>,
+    doc: &Document,
+    element: ElementRef<'_>,
+    pseudo: Option<PseudoTarget>,
+    context: &mut MatchContext<'_, '_, '_, 'css>,
+) -> bool {
+    let node_idx = element.node_id();
+    match component {
         Component::AttributeInNoNamespaceExists {
             local_name,
             local_name_lower,
@@ -252,7 +646,7 @@ fn component_matches_dom(
             let attr_name = local_name_string(
                 local_name,
                 local_name_lower,
-                storage::is_html_element_in_html_document(element),
+                element.is_html_element_in_html_document(),
             );
             element.has_attr(attr_name)
         }
@@ -267,7 +661,7 @@ fn component_matches_dom(
             let attr_name = local_name_string(
                 local_name,
                 local_name,
-                storage::is_html_element_in_html_document(element),
+                element.is_html_element_in_html_document(),
             );
             let Some(attr_value) = element.attr(attr_name) else {
                 return false;
@@ -279,7 +673,7 @@ fn component_matches_dom(
                 value.as_ref(),
                 parsed_case_sensitivity(
                     *case_sensitivity,
-                    storage::is_html_element_in_html_document(element),
+                    element.is_html_element_in_html_document(),
                     Some(attr_name),
                 ),
             )
@@ -315,7 +709,7 @@ fn component_matches_dom(
                         expected_value.as_ref(),
                         parsed_case_sensitivity(
                             *case_sensitivity,
-                            storage::is_html_element_in_html_document(element),
+                            element.is_html_element_in_html_document(),
                             html_attribute,
                         ),
                     )
@@ -323,7 +717,9 @@ fn component_matches_dom(
             }
         }
 
-        Component::NonTSPseudoClass(pseudo) => pseudo_matches_dom(pseudo, doc, element),
+        Component::NonTSPseudoClass(pseudo) => {
+            pseudo_matches_dom(pseudo, doc, element, context.siblings.as_deref_mut())
+        }
         Component::PseudoElement(PseudoElement::Before) => pseudo == Some(PseudoTarget::Before),
         Component::PseudoElement(PseudoElement::After) => pseudo == Some(PseudoTarget::After),
         Component::PseudoElement(PseudoElement::FirstLine) => {
@@ -338,7 +734,7 @@ fn component_matches_dom(
         Component::Scope => context.scope.or_else(|| doc.dom_root()) == Some(node_idx),
         // Selectors L3 `:empty`: no children at all (text nodes count as content).
         Component::Empty => element.children().next().is_none(),
-        Component::Nth(nth) => nth_matches_dom(nth, doc, element),
+        Component::Nth(nth) => nth_matches_dom(nth, doc, element, context),
         Component::NthOf(nth) => {
             nth_of_matches_dom(nth.nth_data(), nth.selectors(), doc, element, context)
         }
@@ -363,35 +759,192 @@ fn component_matches_dom(
     }
 }
 
-fn selector_matches_dom_node_with_context(selector: &Selector, doc: &Document, node_idx: DomNodeId, context: MatchContext) -> bool {
-    match_from_position_dom(selector.iter_raw_match_order().as_slice(), doc, node_idx, None, context)
+fn selector_matches_dom_node_with_context<'css>(
+    selector: &Selector<'css>,
+    doc: &Document,
+    node_idx: DomNodeId,
+    context: &mut MatchContext<'_, '_, '_, 'css>,
+) -> bool {
+    match_from_position_dom(
+        selector.iter_raw_match_order().as_slice(),
+        doc,
+        node_idx,
+        None,
+        context,
+    ) == MatchResult::Matched
 }
 
 /// Match a selector from `:has()` relative to its anchor element. Parcel
 /// represents an explicit leading combinator by appending `:scope` to the raw
 /// match-order components. Without one, the selector has an implicit
 /// descendant combinator and is limited to the anchor's descendant subtree.
-fn relative_selector_matches_dom_node(selector: &Selector, doc: &Document, anchor: DomNodeId, context: MatchContext<'_>) -> bool {
-    let explicitly_anchored = selector.iter_raw_match_order().any(|component| matches!(component, Component::Scope));
-    let context = MatchContext { scope: Some(anchor), exclusive_ancestor_floor: (!explicitly_anchored).then_some(anchor), ..context };
-
-    doc.nodes().any(|(candidate, node)| {
-        if !matches!(node, NodeRef::Element(_)) {
-            return false;
-        }
-        if !explicitly_anchored && !doc.dom_ancestors(candidate).any(|ancestor| ancestor == anchor) {
-            return false;
-        }
-        selector_matches_dom_node_with_context(selector, doc, candidate, context)
-    })
+fn relative_selector_matches_dom_node<'css>(
+    selector: &Selector<'css>,
+    doc: &Document,
+    anchor: DomNodeId,
+    context: &mut MatchContext<'_, '_, '_, 'css>,
+) -> bool {
+    let key = context.siblings.as_deref_mut().map(|state| {
+        (
+            anchor,
+            state
+                .caches
+                .selector_ids
+                .intern(std::slice::from_ref(selector)),
+        )
+    });
+    if let Some(state) = context.siblings.as_deref_mut()
+        && let Some(&matched) = state.caches.has_results.get(&key.expect("matching caches"))
+    {
+        return matched;
+    }
+    let matched = match_relative_selector_uncached(selector, doc, anchor, context);
+    if let Some(state) = context.siblings.as_deref_mut() {
+        state
+            .caches
+            .has_results
+            .insert(key.expect("matching caches"), matched);
+    }
+    matched
 }
 
-fn attribute_value_matches(operator: AttrSelectorOperator, attribute_value: &str, selector_value: &str, case_sensitivity: CaseSensitivity) -> bool {
+fn match_relative_selector_uncached<'css>(
+    selector: &Selector<'css>,
+    doc: &Document,
+    anchor: DomNodeId,
+    context: &mut MatchContext<'_, '_, '_, 'css>,
+) -> bool {
+    let components = selector.iter_raw_match_order().as_slice();
+    let explicitly_anchored = components
+        .iter()
+        .any(|component| matches!(component, Component::Scope));
+    let context = &mut MatchContext {
+        scope: Some(anchor),
+        exclusive_ancestor_floor: (!explicitly_anchored).then_some(anchor),
+        siblings: context.siblings.as_deref_mut(),
+    };
+    let (relation, single_relation, candidate_components) = match components {
+        [rest @ .., Component::Combinator(relation), Component::Scope] => {
+            let single = !rest.iter().any(|component| component.is_combinator());
+            // Traversal already guarantees this leading child/sibling relation.
+            // Match its compound directly instead of walking back to :scope.
+            let direct = single
+                && matches!(
+                    relation,
+                    Combinator::Descendant
+                        | Combinator::Child
+                        | Combinator::NextSibling
+                        | Combinator::LaterSibling
+                );
+            (*relation, single, if direct { rest } else { components })
+        }
+        _ if !explicitly_anchored => (
+            Combinator::Descendant,
+            !components.iter().any(|component| component.is_combinator()),
+            components,
+        ),
+        // Source-authored :scope without the parser's leading relation keeps
+        // its existing search semantics.
+        _ => {
+            return doc.nodes().any(|(node, value)| {
+                matches!(value, NodeRef::Element(_))
+                    && selector_matches_dom_node_with_context(selector, doc, node, context)
+            });
+        }
+    };
+    let following_siblings = matches!(relation, Combinator::NextSibling | Combinator::LaterSibling);
+    if !following_siblings
+        && let Some(state) = context.siblings.as_deref_mut()
+        && state.reject_relative_subtree(
+            candidate_components,
+            anchor,
+            relation == Combinator::Child && single_relation,
+        )
+    {
+        return false;
+    }
+    let Some(anchor_element) = doc.try_element_ref(anchor) else {
+        return false;
+    };
+    let root = if following_siblings {
+        let Some(parent) = anchor_element
+            .parent()
+            .map(|parent| doc.element_ref(parent))
+        else {
+            return false;
+        };
+        parent
+    } else {
+        anchor_element
+    };
+    // Chained sibling selectors may end in a following sibling's subtree.
+    let descend = relation == Combinator::Descendant || !single_relation;
+    let adjacent_only = relation == Combinator::NextSibling && single_relation;
+    let mut pending = context
+        .siblings
+        .as_deref_mut()
+        .map(|state| std::mem::take(&mut state.caches.search_scratch))
+        .unwrap_or_default();
+    let mut matches_candidate = |candidate| {
+        match_from_position_dom(candidate_components, doc, candidate, None, context)
+            == MatchResult::Matched
+    };
+    let mut search = |pending: &mut Vec<DomNodeId>| {
+        let mut after_anchor = !following_siblings;
+        for child in root.child_elements() {
+            if !after_anchor {
+                after_anchor = child.node_id() == anchor;
+                continue;
+            }
+            if matches_candidate(child.node_id()) {
+                return true;
+            }
+            if descend {
+                pending.extend(child.child_elements().map(|element| element.node_id()));
+                while let Some(node) = pending.pop() {
+                    if matches_candidate(node) {
+                        return true;
+                    }
+                    if let Some(element) = doc.try_element_ref(node) {
+                        pending.extend(element.child_elements().map(|element| element.node_id()));
+                    }
+                }
+            }
+            if adjacent_only {
+                return false;
+            }
+        }
+        false
+    };
+    let matched = search(&mut pending);
+    pending.clear();
+    if let Some(state) = context.siblings.as_deref_mut()
+        && pending.capacity() > state.caches.search_scratch.capacity()
+    {
+        state.caches.search_scratch = pending;
+    }
+    matched
+}
+
+pub(super) fn attribute_value_matches(
+    operator: AttrSelectorOperator,
+    attribute_value: &str,
+    selector_value: &str,
+    case_sensitivity: CaseSensitivity,
+) -> bool {
     // Selectors requires these four operators to match nothing when their
     // operand is empty. Parcel's generic string matcher intentionally does
     // not enforce that selector-level restriction (notably, splitting an
     // empty string for `~=` produces one empty token).
-    if selector_value.is_empty() && matches!(operator, AttrSelectorOperator::Includes | AttrSelectorOperator::Prefix | AttrSelectorOperator::Suffix | AttrSelectorOperator::Substring) {
+    if selector_value.is_empty()
+        && matches!(
+            operator,
+            AttrSelectorOperator::Includes
+                | AttrSelectorOperator::Prefix
+                | AttrSelectorOperator::Suffix
+                | AttrSelectorOperator::Substring
+        )
+    {
         return false;
     }
     operator.eval_str(attribute_value, selector_value, case_sensitivity)
@@ -406,15 +959,40 @@ mod tests {
 
     #[test]
     fn empty_attribute_selector_operands_match_nothing() {
-        for operator in [AttrSelectorOperator::Includes, AttrSelectorOperator::Prefix, AttrSelectorOperator::Suffix, AttrSelectorOperator::Substring] {
-            assert!(!attribute_value_matches(operator, "", "", CaseSensitivity::CaseSensitive));
-            assert!(!attribute_value_matches(operator, "value", "", CaseSensitivity::CaseSensitive));
+        for operator in [
+            AttrSelectorOperator::Includes,
+            AttrSelectorOperator::Prefix,
+            AttrSelectorOperator::Suffix,
+            AttrSelectorOperator::Substring,
+        ] {
+            assert!(!attribute_value_matches(
+                operator,
+                "",
+                "",
+                CaseSensitivity::CaseSensitive
+            ));
+            assert!(!attribute_value_matches(
+                operator,
+                "value",
+                "",
+                CaseSensitivity::CaseSensitive
+            ));
         }
 
         // Equality and dash matching retain their ordinary empty-string
         // semantics; the special rule applies only to the four operators above.
-        assert!(attribute_value_matches(AttrSelectorOperator::Equal, "", "", CaseSensitivity::CaseSensitive));
-        assert!(attribute_value_matches(AttrSelectorOperator::DashMatch, "", "", CaseSensitivity::CaseSensitive));
+        assert!(attribute_value_matches(
+            AttrSelectorOperator::Equal,
+            "",
+            "",
+            CaseSensitivity::CaseSensitive
+        ));
+        assert!(attribute_value_matches(
+            AttrSelectorOperator::DashMatch,
+            "",
+            "",
+            CaseSensitivity::CaseSensitive
+        ));
     }
 
     #[test]
@@ -461,7 +1039,10 @@ mod tests {
         assert!(language_range_matches("fr-Latn-FR-x-foobar", "fr-x-foobar"));
         assert!(language_range_matches("fr-Latn-FR-x-foobar", "*-x-foobar"));
         assert!(language_range_matches("en-GB-oed", "en-gb-oed"));
-        assert!(!language_range_matches("de-x-DE", "de-DE"), "a singleton starts an extension boundary that cannot be skipped");
+        assert!(
+            !language_range_matches("de-x-DE", "de-DE"),
+            "a singleton starts an extension boundary that cannot be skipped"
+        );
         assert!(!language_range_matches("english", "en"));
         assert!(!language_range_matches("", "*"));
         assert!(!language_range_matches("en-US", "en-"));
@@ -469,12 +1050,26 @@ mod tests {
 
     #[test]
     fn type_selectors_preserve_case_in_xml_documents() {
-        let parsed = html_parse::parse_xml_document("<root><Item/><item/></root>").expect("valid XML");
+        let parsed =
+            html_parse::parse_xml_document("<root><Item/><item/></root>").expect("valid XML");
         let document = parsed.build_dom();
-        let root = document.element_ref(document.dom_root().expect("root")).expect("root element");
-        let upper = root.children().find(|&node| document.get_dom_tag(node) == Some("Item")).expect("upper-case element");
-        let lower = root.children().find(|&node| document.get_dom_tag(node) == Some("item")).expect("lower-case element");
-        let selectors = SelectorList::parse_string_with_options("Item", ParserOptions::default()).expect("selector parses");
+        let root = document
+            .try_element_ref(document.dom_root().expect("root"))
+            .expect("root element");
+        let upper = root
+            .children()
+            .find(|&node| {
+                document.try_element_ref(node).map(|element| element.tag()) == Some("Item")
+            })
+            .expect("upper-case element");
+        let lower = root
+            .children()
+            .find(|&node| {
+                document.try_element_ref(node).map(|element| element.tag()) == Some("item")
+            })
+            .expect("lower-case element");
+        let selectors = SelectorList::parse_string_with_options("Item", ParserOptions::default())
+            .expect("selector parses");
         let selector = selectors.0.first().expect("one selector");
 
         assert!(selector_matches_dom_node(selector, &document, upper));
@@ -486,24 +1081,31 @@ mod tests {
         let parsed = html_parse::parse_xml_document("<html xmlns='http://www.w3.org/1999/xhtml'><body><div><div id='target'/></div></body></html>").expect("valid XHTML");
         let document = parsed.build_dom();
         let root = document
-            .element_ref(document.dom_root().expect("root"))
+            .try_element_ref(document.dom_root().expect("root"))
             .expect("root element");
         let body = root
             .children()
-            .find(|&node| document.get_dom_tag(node) == Some("body"))
+            .find(|&node| {
+                document.try_element_ref(node).map(|element| element.tag()) == Some("body")
+            })
             .expect("body");
         let outer = document
-            .element_ref(body)
+            .try_element_ref(body)
             .expect("body element")
             .children()
-            .find(|&node| document.get_dom_tag(node) == Some("div"))
+            .find(|&node| {
+                document.try_element_ref(node).map(|element| element.tag()) == Some("div")
+            })
             .expect("outer div");
         let target = document
-            .element_ref(outer)
+            .try_element_ref(outer)
             .expect("outer element")
             .children()
             .find(|&node| {
-                document.element_ref(node).and_then(|element| element.id()) == Some("target")
+                document
+                    .try_element_ref(node)
+                    .and_then(|element| element.id())
+                    == Some("target")
             })
             .expect("target div");
         let selectors =
@@ -516,11 +1118,29 @@ mod tests {
 
     #[test]
     fn adjacent_sibling_selectors_ignore_intervening_text_nodes() {
-        let parsed = html_parse::parse_html_document("<!doctype html><html><body><img/> <img/></body></html>");
+        let parsed = html_parse::parse_html_document(
+            "<!doctype html><html><body><img/> <img/></body></html>",
+        );
         let document = parsed.build_dom();
-        let body = document.element_ref(document.dom_root().expect("root")).expect("html").children().find(|&node| document.get_dom_tag(node) == Some("body")).expect("body");
-        let images = document.element_ref(body).expect("body element").children().filter(|&node| document.get_dom_tag(node) == Some("img")).collect::<Vec<_>>();
-        let selectors = SelectorList::parse_string_with_options("img + img", ParserOptions::default()).expect("selector parses");
+        let body = document
+            .try_element_ref(document.dom_root().expect("root"))
+            .expect("html")
+            .children()
+            .find(|&node| {
+                document.try_element_ref(node).map(|element| element.tag()) == Some("body")
+            })
+            .expect("body");
+        let images = document
+            .try_element_ref(body)
+            .expect("body element")
+            .children()
+            .filter(|&node| {
+                document.try_element_ref(node).map(|element| element.tag()) == Some("img")
+            })
+            .collect::<Vec<_>>();
+        let selectors =
+            SelectorList::parse_string_with_options("img + img", ParserOptions::default())
+                .expect("selector parses");
         let selector = selectors.0.first().expect("one selector");
 
         assert!(!selector_matches_dom_node(selector, &document, images[0]));
@@ -584,11 +1204,22 @@ mod tests {
 
     #[test]
     fn nth_child_of_requires_the_subject_to_match_its_filter() {
-        let document = html_parse::parse_dom_document("<!doctype html><div><p class='other' id='target'></p><p class='eligible'></p></div>").expect("valid standards HTML");
+        let document = html_parse::parse_dom_document(
+            "<!doctype html><div><p class='other' id='target'></p><p class='eligible'></p></div>",
+        )
+        .expect("valid standards HTML");
         let target = document.nodes().find_map(|(node, value)| matches!(value, html_dom::NodeRef::Element(element) if element.id() == Some("target")).then_some(node)).expect("target");
-        let selectors = SelectorList::parse_string_with_options("p:nth-child(1 of .eligible)", ParserOptions::default()).expect("selector parses");
+        let selectors = SelectorList::parse_string_with_options(
+            "p:nth-child(1 of .eligible)",
+            ParserOptions::default(),
+        )
+        .expect("selector parses");
 
-        assert!(!selector_matches_dom_node(selectors.0.first().expect("selector"), &document, target));
+        assert!(!selector_matches_dom_node(
+            selectors.0.first().expect("selector"),
+            &document,
+            target
+        ));
     }
 
     #[test]
@@ -630,9 +1261,17 @@ mod tests {
     fn has_does_not_match_descendants_outside_its_anchor() {
         let document = html_parse::parse_dom_document("<!doctype html><div class='outside'><section id='anchor'><span></span></section></div>").expect("valid standards HTML");
         let anchor = document.nodes().find_map(|(node, value)| matches!(value, html_dom::NodeRef::Element(element) if element.id() == Some("anchor")).then_some(node)).expect("anchor");
-        let selectors = SelectorList::parse_string_with_options(":has(.outside span)", ParserOptions::default()).expect("selector parses");
+        let selectors = SelectorList::parse_string_with_options(
+            ":has(.outside span)",
+            ParserOptions::default(),
+        )
+        .expect("selector parses");
 
-        assert!(!selector_matches_dom_node(selectors.0.first().expect("selector"), &document, anchor));
+        assert!(!selector_matches_dom_node(
+            selectors.0.first().expect("selector"),
+            &document,
+            anchor
+        ));
     }
 
     #[test]
@@ -712,7 +1351,8 @@ mod tests {
     #[test]
     fn relational_selector_specificity_composes_through_selector_lists() {
         let specificity = |text| {
-            let selectors = SelectorList::parse_string_with_options(text, ParserOptions::default()).expect("selector parses");
+            let selectors = SelectorList::parse_string_with_options(text, ParserOptions::default())
+                .expect("selector parses");
             selector_specificity(selectors.0.first().expect("selector"))
         };
 
@@ -720,23 +1360,53 @@ mod tests {
         assert_eq!(specificity(":is(:has(#target), .fallback)"), 1 << 20);
         assert_eq!(specificity(":not(:has(#target), .fallback)"), 1 << 20);
         assert_eq!(specificity(":where(:has(#target))"), 0);
-        assert_eq!(specificity(":nth-child(1 of :has(#target))"), (1 << 20) | (1 << 10));
+        assert_eq!(
+            specificity(":nth-child(1 of :has(#target))"),
+            (1 << 20) | (1 << 10)
+        );
     }
 
     #[test]
     fn scope_matches_the_document_element_without_an_explicit_scope() {
-        let document = html_parse::parse_dom_document("<!doctype html><html><body></body></html>").expect("valid standards HTML");
+        let document = html_parse::parse_dom_document("<!doctype html><html><body></body></html>")
+            .expect("valid standards HTML");
         let root = document.dom_root().expect("document element");
-        let body = document.element_ref(root).expect("html").children().find(|&node| document.get_dom_tag(node) == Some("body")).expect("body");
-        let selectors = SelectorList::parse_string_with_options(":scope", ParserOptions::default()).expect("selector parses");
+        let body = document
+            .try_element_ref(root)
+            .expect("html")
+            .children()
+            .find(|&node| {
+                document.try_element_ref(node).map(|element| element.tag()) == Some("body")
+            })
+            .expect("body");
+        let selectors = SelectorList::parse_string_with_options(":scope", ParserOptions::default())
+            .expect("selector parses");
 
-        assert!(selector_matches_dom_node(selectors.0.first().expect("selector"), &document, root));
-        assert!(!selector_matches_dom_node(selectors.0.first().expect("selector"), &document, body));
+        assert!(selector_matches_dom_node(
+            selectors.0.first().expect("selector"),
+            &document,
+            root
+        ));
+        assert!(!selector_matches_dom_node(
+            selectors.0.first().expect("selector"),
+            &document,
+            body
+        ));
     }
 
     fn selector_matches_id(document: &Document, id: &str, selector_text: &str) -> bool {
-        let node = document.node_ids().find(|node| document.get_dom_id(*node) == Some(id)).unwrap_or_else(|| panic!("missing fixture element #{id}"));
-        let selectors = SelectorList::parse_string_with_options(selector_text, ParserOptions::default()).expect("selector parses");
+        let node = document
+            .node_ids()
+            .find(|node| {
+                document
+                    .try_element_ref(*node)
+                    .and_then(|element| element.id())
+                    == Some(id)
+            })
+            .unwrap_or_else(|| panic!("missing fixture element #{id}"));
+        let selectors =
+            SelectorList::parse_string_with_options(selector_text, ParserOptions::default())
+                .expect("selector parses");
         selector_matches_dom_node(selectors.0.first().expect("selector"), document, node)
     }
 
@@ -747,8 +1417,18 @@ mod tests {
         )
         .expect("valid standards HTML");
 
-        for (id, selector) in [("required", ":required:enabled"), ("optional", ":optional:enabled"), ("checked", ":checked:default"), ("selected", ":checked:default"), ("readonly", ":read-only"), ("writable", ":read-write")] {
-            assert!(selector_matches_id(&document, id, selector), "{id} must match {selector}");
+        for (id, selector) in [
+            ("required", ":required:enabled"),
+            ("optional", ":optional:enabled"),
+            ("checked", ":checked:default"),
+            ("selected", ":checked:default"),
+            ("readonly", ":read-only"),
+            ("writable", ":read-write"),
+        ] {
+            assert!(
+                selector_matches_id(&document, id, selector),
+                "{id} must match {selector}"
+            );
         }
     }
 
@@ -761,8 +1441,16 @@ mod tests {
 
         assert!(selector_matches_id(&document, "legend-input", ":enabled"));
         assert!(selector_matches_id(&document, "second-legend", ":disabled"));
-        assert!(selector_matches_id(&document, "disabled-input", ":disabled"));
-        assert!(selector_matches_id(&document, "disabled-option", ":disabled"));
+        assert!(selector_matches_id(
+            &document,
+            "disabled-input",
+            ":disabled"
+        ));
+        assert!(selector_matches_id(
+            &document,
+            "disabled-option",
+            ":disabled"
+        ));
     }
 
     #[test]
@@ -779,7 +1467,11 @@ mod tests {
             html_parse::parse_dom_document("<!doctype html><main dir='rtl'><section id='owner'><span id='inherited'></span></section><details id='open' open></details><details id='closed'></details></main>").expect("valid standards HTML");
 
         assert!(selector_matches_id(&document, "inherited", ":dir(rtl)"));
-        assert!(selector_matches_id(&document, "owner", ":has(span:dir(rtl))"));
+        assert!(selector_matches_id(
+            &document,
+            "owner",
+            ":has(span:dir(rtl))"
+        ));
         assert!(selector_matches_id(&document, "open", ":open"));
         assert!(selector_matches_id(&document, "closed", ":closed"));
     }
@@ -807,89 +1499,128 @@ mod tests {
 
 /// Match the tree-structural `:first-child`/`:last-child`/`:only-child` and
 /// `:nth-*` selectors (all are `Component::Nth` with an `an+b` formula).
-fn nth_matches_dom(nth: &NthSelectorData, doc: &Document, element: html_dom::ElementRef<'_>) -> bool {
+fn nth_matches_dom<'css>(
+    nth: &NthSelectorData,
+    doc: &Document,
+    element: ElementRef<'_>,
+    context: &mut MatchContext<'_, '_, '_, 'css>,
+) -> bool {
     if matches!(nth.ty, NthType::Col | NthType::LastCol) {
         return false;
     }
-    let of_type = matches!(nth.ty, NthType::OfType | NthType::LastOfType | NthType::OnlyOfType);
-    let from_end = matches!(nth.ty, NthType::LastChild | NthType::LastOfType);
-
-    let (sibling_count, position) = match element.parent().and_then(|parent_idx| doc.element_ref(parent_idx)) {
-        Some(parent) => {
-            let mut sibling_count = 0;
-            let mut position = None;
-            for child_idx in parent.children() {
-                if sibling_counts(doc, child_idx, of_type, element.tag()) {
-                    sibling_count += 1;
-                    if child_idx == element.node_id() {
-                        position = Some(sibling_count);
-                    }
-                }
-            }
-            (sibling_count, position)
-        }
-        // The root element is its parent's only element child.
-        None => (1, Some(1)),
-    };
-    let Some(position) = position else {
-        return false;
-    };
-
-    if nth.ty.is_only() {
-        return sibling_count == 1;
+    if !nth.ty.is_of_type()
+        && let Some(matched) = context
+            .siblings
+            .as_deref_mut()
+            .and_then(|state| state.matches_nth_child(nth, element.node_id()))
+    {
+        return matched;
     }
-    let index = if from_end { sibling_count - position + 1 } else { position };
-    nth_index_matches(nth.a, nth.b, index)
+    if context.siblings.is_some() {
+        let from_end = nth.ty.is_from_end();
+        let index = SiblingIndex::nth_index(element, &[], nth.ty.is_of_type(), from_end, context);
+        return index > 0
+            && if nth.ty.is_only() {
+                index == 1
+                    && SiblingIndex::nth_index(
+                        element,
+                        &[],
+                        nth.ty.is_of_type(),
+                        !from_end,
+                        context,
+                    ) == 1
+            } else {
+                nth_index_matches(nth.a, nth.b, index)
+            };
+    }
+    let only = nth.ty.is_only();
+    let Some(parent) = element.parent().map(|parent| doc.element_ref(parent)) else {
+        // The root element is its parent's only element child.
+        return only || nth_index_matches(nth.a, nth.b, 1);
+    };
+    let of_type = matches!(
+        nth.ty,
+        NthType::OfType | NthType::LastOfType | NthType::OnlyOfType
+    );
+    let from_end = matches!(nth.ty, NthType::LastChild | NthType::LastOfType);
+    let tag = element.tag();
+    let mut children = parent.children();
+    let mut position = 0;
+    let mut found = false;
+    // Count from the end requested by the selector and stop at the subject.
+    // Only-child checks instead stop as soon as a second eligible child exists.
+    while let Some(child) = if from_end {
+        children.next_back()
+    } else {
+        children.next()
+    } {
+        if !sibling_counts(doc, child, of_type, tag, element.namespace()) {
+            continue;
+        }
+        position += 1;
+        if only && position > 1 {
+            return false;
+        }
+        if child == element.node_id() {
+            if !only {
+                return nth_index_matches(nth.a, nth.b, position);
+            }
+            found = true;
+        }
+    }
+    only && found && position == 1
 }
 
 /// Selectors 4 `:nth-child(An+B of S)` counts the subject only among element
 /// siblings matching the forgiving selector list `S`.
-fn nth_of_matches_dom(
+fn nth_of_matches_dom<'css>(
     nth: &NthSelectorData,
-    selectors: &[Selector<'_>],
+    selectors: &[Selector<'css>],
     doc: &Document,
-    element: html_dom::ElementRef<'_>,
-    context: MatchContext,
+    element: ElementRef<'_>,
+    context: &mut MatchContext<'_, '_, '_, 'css>,
 ) -> bool {
-    let matches_filter = |node| {
+    if context.siblings.is_some() {
+        let index =
+            SiblingIndex::nth_index(element, selectors, false, nth.ty.is_from_end(), context);
+        return index > 0 && nth_index_matches(nth.a, nth.b, index);
+    }
+    let mut matches_filter = |node| {
         selectors
             .iter()
             .any(|selector| selector_matches_dom_node_with_context(selector, doc, node, context))
     };
-    let (sibling_count, position) = match element
-        .parent()
-        .and_then(|parent_idx| doc.element_ref(parent_idx))
-    {
-        Some(parent) => {
-            let mut sibling_count = 0;
-            let mut position = None;
-            for child_idx in parent.children() {
-                if doc.element_ref(child_idx).is_some() && matches_filter(child_idx) {
-                    sibling_count += 1;
-                    if child_idx == element.node_id() {
-                        position = Some(sibling_count);
-                    }
-                }
-            }
-            (sibling_count, position)
-        }
-        None if matches_filter(element.node_id()) => (1, Some(1)),
-        None => (0, None),
+    let Some(parent) = element.parent().map(|parent| doc.element_ref(parent)) else {
+        return matches_filter(element.node_id()) && nth_index_matches(nth.a, nth.b, 1);
     };
-    let Some(position) = position else {
-        return false;
-    };
-    let index = if nth.ty == NthType::LastChild {
-        sibling_count - position + 1
+    let from_end = nth.ty == NthType::LastChild;
+    let mut children = parent.children();
+    let mut position = 0;
+    while let Some(child) = if from_end {
+        children.next_back()
     } else {
-        position
-    };
-    nth_index_matches(nth.a, nth.b, index)
+        children.next()
+    } {
+        let matches = doc.try_element_ref(child).is_some() && matches_filter(child);
+        if matches {
+            position += 1;
+        }
+        if child == element.node_id() {
+            return matches && nth_index_matches(nth.a, nth.b, position);
+        }
+    }
+    false
 }
 
-fn sibling_counts(doc: &Document, child_idx: DomNodeId, of_type: bool, tag: &str) -> bool {
-    match doc.element_ref(child_idx) {
-        Some(child) => !of_type || child.tag() == tag,
+fn sibling_counts(
+    doc: &Document,
+    child_idx: DomNodeId,
+    of_type: bool,
+    tag: &str,
+    namespace: Option<&str>,
+) -> bool {
+    match doc.try_element_ref(child_idx) {
+        Some(child) => !of_type || (child.tag() == tag && child.namespace() == namespace),
         None => false,
     }
 }
@@ -903,14 +1634,29 @@ fn nth_index_matches(a: i32, b: i32, index: i32) -> bool {
     diff % a == 0 && diff / a >= 0
 }
 
-fn local_name_string<'a>(name: &'a impl AsRef<str>, lower_name: &'a impl AsRef<str>, is_html_element_in_html_document: bool) -> &'a str {
+fn local_name_string<'a>(
+    name: &'a impl AsRef<str>,
+    lower_name: &'a impl AsRef<str>,
+    is_html_element_in_html_document: bool,
+) -> &'a str {
     let name = name.as_ref();
     let lower_name = lower_name.as_ref();
-    if is_html_element_in_html_document || name == lower_name { lower_name } else { name }
+    if is_html_element_in_html_document || name == lower_name {
+        lower_name
+    } else {
+        name
+    }
 }
 
-fn parsed_case_sensitivity(parsed: ParsedCaseSensitivity, is_html_element_in_html_document: bool, attribute_name: Option<&str>) -> parcel_selectors::attr::CaseSensitivity {
-    if is_html_element_in_html_document && matches!(parsed, ParsedCaseSensitivity::CaseSensitive) && attribute_name.is_some_and(html_attribute_value_is_ascii_case_insensitive) {
+pub(super) fn parsed_case_sensitivity(
+    parsed: ParsedCaseSensitivity,
+    is_html_element_in_html_document: bool,
+    attribute_name: Option<&str>,
+) -> CaseSensitivity {
+    if is_html_element_in_html_document
+        && matches!(parsed, ParsedCaseSensitivity::CaseSensitive)
+        && attribute_name.is_some_and(html_attribute_value_is_ascii_case_insensitive)
+    {
         return CaseSensitivity::AsciiCaseInsensitive;
     }
     parsed.to_unconditional(is_html_element_in_html_document)
@@ -974,7 +1720,9 @@ enum NamespaceMatch<'a> {
     Specific(&'a str),
 }
 
-fn namespace_match<'a>(namespace: Option<NamespaceConstraint<&'a lightningcss::values::string::CowArcStr<'a>>>) -> NamespaceMatch<'a> {
+fn namespace_match<'a>(
+    namespace: Option<NamespaceConstraint<&'a lightningcss::values::string::CowArcStr<'a>>>,
+) -> NamespaceMatch<'a> {
     match namespace {
         None => NamespaceMatch::None,
         Some(NamespaceConstraint::Any) => NamespaceMatch::Any,
@@ -983,7 +1731,11 @@ fn namespace_match<'a>(namespace: Option<NamespaceConstraint<&'a lightningcss::v
     }
 }
 
-fn get_attribute_in_namespace<'a>(element: html_dom::ElementRef<'a>, namespace: NamespaceMatch<'_>, local_name: &str) -> Option<&'a str> {
+fn get_attribute_in_namespace<'a>(
+    element: html_dom::ElementRef<'a>,
+    namespace: NamespaceMatch<'_>,
+    local_name: &str,
+) -> Option<&'a str> {
     match namespace {
         NamespaceMatch::None => element.attr(local_name),
         NamespaceMatch::Any => element.attr_in_any_namespace(local_name),
@@ -991,27 +1743,33 @@ fn get_attribute_in_namespace<'a>(element: html_dom::ElementRef<'a>, namespace: 
     }
 }
 
-fn attribute_exists_in_namespace(element: html_dom::ElementRef<'_>, namespace: NamespaceMatch<'_>, local_name: &str) -> bool {
+fn attribute_exists_in_namespace(
+    element: html_dom::ElementRef<'_>,
+    namespace: NamespaceMatch<'_>,
+    local_name: &str,
+) -> bool {
     get_attribute_in_namespace(element, namespace, local_name).is_some()
 }
 
 /// Check if pseudo-class matches DOM node
-fn pseudo_matches_dom(
+pub(super) fn pseudo_matches_dom(
     pseudo: &PseudoClass,
     doc: &Document,
     element: html_dom::ElementRef<'_>,
+    siblings: Option<&mut SiblingIndex<'_, '_, '_>>,
 ) -> bool {
-    let state = storage::html_state(element);
+    let state = element.html_state();
     match pseudo {
         PseudoClass::Link | PseudoClass::AnyLink(_) => state.is_link(),
         PseudoClass::Visited => false, // Don't match visited for privacy
-        PseudoClass::Lang { languages } => {
-            effective_language(doc, element).is_some_and(|language| {
+        PseudoClass::Lang { languages } => siblings
+            .and_then(|state| state.effective_language(element.node_id()))
+            .unwrap_or_else(|| effective_language(doc, element))
+            .is_some_and(|language| {
                 languages
                     .iter()
                     .any(|range| language_range_matches(language, range.as_ref()))
-            })
-        }
+            }),
         PseudoClass::Dir {
             direction: Direction::Ltr,
         } => !state.is_rtl(),
@@ -1037,14 +1795,20 @@ fn pseudo_matches_dom(
 
 const XML_NAMESPACE: &str = "http://www.w3.org/XML/1998/namespace";
 
+pub(super) fn element_language<'a>(element: ElementRef<'a>) -> Option<&'a str> {
+    element
+        .attr_expanded(Some(XML_NAMESPACE), "lang")
+        .or_else(|| element.attr("lang"))
+}
+
 /// Resolve the language of an element according to document semantics.  An
 /// explicitly empty language stops inheritance and intentionally matches no
 /// non-empty `:lang()` range.
 fn effective_language<'a>(doc: &'a Document, element: html_dom::ElementRef<'a>) -> Option<&'a str> {
     let mut current = Some(element.node_id());
     while let Some(node) = current {
-        let candidate = doc.element_ref(node)?;
-        if let Some(language) = candidate.attr_expanded(Some(XML_NAMESPACE), "lang").or_else(|| candidate.attr("lang")) {
+        let candidate = doc.try_element_ref(node)?;
+        if let Some(language) = element_language(candidate) {
             return Some(language);
         }
         current = candidate.parent();

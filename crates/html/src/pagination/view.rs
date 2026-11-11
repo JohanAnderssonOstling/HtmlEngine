@@ -1,10 +1,5 @@
 //! One composed page used consistently for painting and pointer interaction.
 
-
-use html_pipeline::engine::search_queries;
-use html_pipeline::engine::fragment_paint;
-use html_pipeline::engine::export_queries;
-use html_pipeline::engine::box_queries;
 use super::PagePositions;
 use crate::document::ImageId;
 use crate::geometry::{ContentHit, Geometry};
@@ -15,13 +10,12 @@ use crate::render::{
 };
 use crate::selection::{
     SelectionController, SelectionExport, SelectionGeometry, SelectionHit, SelectionInput,
-    SelectionLayout, SelectionOutcome, SelectionPaintScratch,
-};
+    SelectionLayout, SelectionOutcome, SelectionPaintScratch, SelectionPaintStyle};
 use crate::targets::{DocumentTarget, LinkTarget, ResolvedDestination};
 use crate::search::{SourceTextMatches, TextPatternMatcher};
 use html_engine_model::page_placements;
+
 use kurbo::{Point, Rect, Vec2};
-use peniko::Color;
 use std::ops::Range;
 
 /// A document and the engine-produced page that places its content. Pointer
@@ -40,13 +34,6 @@ pub struct PageReadingLine {
     pub column_bounds: Rect,
     pub column: i32,
     pub cell: Option<BoxId>,
-}
-
-struct BoxProjectionSpan {
-    column: i32,
-    translation: Vec2,
-    top: f64,
-    bottom: f64,
 }
 
 impl<'a> PageView<'a> {
@@ -68,13 +55,25 @@ impl<'a> PageView<'a> {
         out: &mut Vec<PaintFragment>,
     ) {
         if let Some(index) = line {
-            if let (Some(screen), Some(line)) =
-                (self.page.positions.get(index), self.doc.text().line(index))
+            for screen in self.page.positions.fragments(index)
             {
-                out.push(PaintFragment {
-                    source,
-                    destination: source.origin() + (screen.point - line.point()),
-                });
+                let Some(line) = self.doc.text().line(index) else { continue };
+                let translation = screen.point - line.point();
+                let column_x =
+                    page_placements::col_x(&self.page.geometry, f64::from(screen.col_index), 0.0);
+                let column = Rect::new(
+                    column_x,
+                    screen.visible_top(),
+                    column_x + self.page.geometry.col_width,
+                    screen.visible_bottom(self.page.geometry.size.height),
+                );
+                let clipped = source.intersect(column - translation);
+                if clipped.width() > 0.0 && clipped.height() > 0.0 {
+                    out.push(PaintFragment {
+                        source: clipped,
+                        destination: clipped.origin() + translation,
+                    });
+                }
             }
         } else {
             let height = self.page.geometry.size.height;
@@ -144,74 +143,15 @@ impl<'a> PageView<'a> {
         include_repeated_headers: bool,
         out: &mut Vec<PaintFragment>,
     ) {
-        let height = self.page.geometry.size.height;
-        if height <= 0.0 {
-            return;
-        }
-        if self.page.positions.is_empty() {
-            self.project_rect(source, None, include_repeated_headers, out);
-            return;
-        }
-        let boxes = self.doc.boxes();
-        let mut distances = vec![usize::MAX; self.page.geometry.col_count.ceil().max(0.0) as usize];
-        let mut candidates = Vec::new();
-        for (index, screen) in self.page.positions.iter() {
-            let Some(nearest) = distances.get_mut(screen.col_index as usize) else {
-                continue;
-            };
-            let Some(distance) = box_queries::fragmentation_distance(boxes, owner, index) else {
-                continue;
-            };
-            let Some(line) = self.doc.text().line(index) else {
-                continue;
-            };
-            let top = line.point().y - screen.point.y;
-            if source.y1 <= top || source.y0 >= top + height {
-                continue;
-            }
-            *nearest = (*nearest).min(distance);
-            candidates.push((line.point(), screen, distance));
-        }
-        let mut spans: Vec<BoxProjectionSpan> = Vec::new();
-        for (point, screen, distance) in candidates {
-            // Prefer the box's own content in each column, then the nearest
-            // enclosing fragment. This also carries tall cells through
-            // columns in which only another cell has text.
-            if distance != distances[screen.col_index as usize] {
-                continue;
-            }
-            let translation = screen.point - point;
-            let mut top = -translation.y;
-            let bottom = height - translation.y;
-            if let Some(previous) = spans.last_mut()
-                && previous.column == screen.col_index
-            {
-                if (previous.translation - translation).hypot() < 1e-6 {
-                    continue;
-                }
-                // Keep two offsets within one column from painting the same
-                // source band twice across a keep or rhythm adjustment.
-                previous.bottom = previous.bottom.min(point.y);
-                top = top.max(point.y);
-            }
-            spans.push(BoxProjectionSpan {
-                column: screen.col_index,
-                translation,
-                top,
-                bottom,
-            });
-        }
-        for span in spans {
-            let clipped = source.intersect(Rect::new(
-                source.x0,
-                span.top,
-                source.x1,
-                span.bottom.max(span.top),
-            ));
+        for band in super::projection::box_projection_bands(self.page, owner) {
+            let clipped = source.intersect(Rect::new(source.x0, band.top, source.x1, band.bottom));
             if clipped.width() > 0.0 && clipped.height() > 0.0 {
+                let column_x = page_placements::col_x(
+                    &self.page.geometry, f64::from(band.column), 0.0,
+                );
                 out.push(PaintFragment {
                     source: clipped,
-                    destination: clipped.origin() + span.translation,
+                    destination: clipped.origin() + band.translation + Vec2::new(column_x, 0.0),
                 });
             }
         }
@@ -244,7 +184,7 @@ impl<'a> PageView<'a> {
         }
     }
 
-    fn placements(&self) -> impl Iterator<Item = LinePlacement> + '_ {
+    fn placements(&self) -> impl Iterator<Item = LinePlacement> + Clone + '_ {
         self.page
             .positions
             .iter()
@@ -254,10 +194,12 @@ impl<'a> PageView<'a> {
             })
     }
 
-    // Select the page column before intrinsic hit testing.
-    fn column_placements(&self, point: Point) -> impl Iterator<Item = LinePlacement> + '_ {
+    // Keep nearest-column candidates for selection dragging through gaps.
+    fn column_placements(&self, point: Point) -> impl Iterator<Item = LinePlacement> + Clone + '_ {
         let count = self.page.geometry.col_count as i32;
-        let column = ((point.x / (self.page.geometry.col_width + self.page.geometry.col_gap))
+        let leading = page_placements::col_x(&self.page.geometry, 0.0, 0.0);
+        let column = (((point.x - leading)
+            / (self.page.geometry.col_width + self.page.geometry.col_gap))
             .floor() as i32)
             .clamp(0, (count - 1).max(0));
         self.page
@@ -270,14 +212,41 @@ impl<'a> PageView<'a> {
             })
     }
 
+    fn visible_column_placements(
+        &self,
+        point: Point,
+    ) -> impl Iterator<Item = LinePlacement> + Clone + '_ {
+        self.column_placements(point).filter(move |placement| {
+            self.page.positions.fragments(placement.line).any(|screen| {
+                let left =
+                    page_placements::col_x(&self.page.geometry, f64::from(screen.col_index), 0.0);
+                screen.point == placement.origin
+                    && Rect::new(
+                        left,
+                        screen.visible_top(),
+                        left + self.page.geometry.col_width,
+                        screen.visible_bottom(self.page.geometry.size.height),
+                    )
+                    .contains(point)
+            })
+        })
+    }
+
     pub fn glyph_range_bounds(&self, start: u32, end: u32) -> Option<Rect> {
-        self.document_geometry()
-            .selection_bounds_lines(start..end, self.placements())
+        self.page.positions.iter().filter_map(|(line, screen)| {
+            let bounds = self.document_geometry().selection_bounds_lines(
+                start..end,
+                std::iter::once(LinePlacement { line, origin: screen.point }),
+            )?;
+            let left = page_placements::col_x(&self.page.geometry, f64::from(screen.col_index), 0.0);
+            let clipped = bounds.intersect(Rect::new(left, screen.visible_top(), left + self.page.geometry.col_width, screen.visible_bottom(self.page.geometry.size.height)));
+            (clipped.width() > 0.0 && clipped.height() > 0.0).then_some(clipped)
+        }).reduce(|a, b| a.union(b))
     }
 
     pub fn hit_test_image(&self, point: Point) -> Option<ImageId> {
         self.document_geometry()
-            .image_at_lines(point, self.column_placements(point))
+            .image_at_lines(point, self.visible_column_placements(point))
     }
 
     /// Append the projected fragments of a box, including repeated headers.
@@ -309,13 +278,13 @@ impl<'a> PageView<'a> {
 
     pub fn link_at(&self, point: Point) -> Option<LinkTarget<'a>> {
         self.document_geometry()
-            .link_at_lines(point, self.column_placements(point))
+            .link_at_lines(point, self.visible_column_placements(point))
     }
 
     pub fn content_at(&self, point: Point) -> Option<ContentHit<'a>> {
         let mut fragments = Vec::new();
         self.document_geometry()
-            .content_at_lines(point, self.column_placements(point), |index| {
+            .content_at_lines(point, self.visible_column_placements(point), |index| {
                 self.projected_box_contains(index, point, &mut fragments)
             })
     }
@@ -344,12 +313,7 @@ impl PaintProjection for PageView<'_> {
                     })
                     .map(|line| line.id()),
             );
-            fragment_paint::block_decoration_indices_intersecting(
-                view.fragments(),
-                header.source_top,
-                header.source_bottom,
-                &mut header_decorations,
-            );
+            (view.fragments()).block_decoration_indices_intersecting(header.source_top, header.source_bottom, &mut header_decorations);
             candidates
                 .block_decorations
                 .extend_from_slice(&header_decorations);
@@ -366,10 +330,19 @@ impl PaintProjection for PageView<'_> {
     }
 
     fn project_line(&self, line: LineId, source: Point, out: &mut Vec<ProjectedLine>) {
-        if let Some(screen) = self.page.positions.get(line) {
+        for screen in self.page.positions.fragments(line) {
             out.push(ProjectedLine {
                 origin: screen.point,
-                clip: None,
+                clip: Some({
+                    let left =
+                        page_placements::col_x(&self.page.geometry, f64::from(screen.col_index), 0.0);
+                    Rect::new(
+                        left,
+                        screen.visible_top(),
+                        left + self.page.geometry.col_width,
+                        screen.visible_bottom(self.page.geometry.size.height),
+                    )
+                }),
             });
         }
         for header in &self.page.repeated_table_headers {
@@ -499,7 +472,7 @@ impl<'a> PageView<'a> {
     pub fn paint_selection(
         &self,
         state: &SelectionController,
-        color: Color,
+        style: SelectionPaintStyle,
         painter: &mut impl Painter,
         scratch: &mut SelectionPaintScratch,
     ) {
@@ -512,7 +485,7 @@ impl<'a> PageView<'a> {
                 placements: self.placements(),
                 projection: self,
             },
-            color,
+            style,
             painter,
             scratch,
         );
@@ -532,28 +505,32 @@ impl<'a> PageView<'a> {
 
     /// Export the source text represented by this page's placed lines.
     pub fn text(&self) -> String {
-        export_queries::text_for_lines(
-            self.doc.export(),
-            self.page.positions.iter().map(|(line, _)| line),
-        )
+        (self.doc.export()).text_for_lines(self.visible_line_ids())
         .unwrap_or_default()
     }
 
     /// Match patterns against visible source text without exposing line selection.
     pub fn match_text(&self, patterns: &TextPatternMatcher) -> SourceTextMatches<'a> {
-        search_queries::match_lines(
-            patterns,
-            self.doc.text(),
-            self.page.positions.iter().map(|(line, _)| line),
-        )
+        patterns.match_lines(self.doc.text(), self.visible_line_ids())
+    }
+
+    fn visible_line_ids(&self) -> impl Iterator<Item = LineId> + '_ {
+        self.page.positions.line_ids().filter(move |&id| {
+            self.doc.text().line(id).is_some_and(|line| {
+                self.page.positions.fragments(id).any(|screen| {
+                    screen.point.y < screen.visible_bottom(self.page.geometry.size.height)
+                        && screen.point.y + line.height() > screen.visible_top()
+                })
+            })
+        })
     }
 
     pub fn reading_start(&self) -> u32 {
         let text = self.doc.text();
-        self.page
-            .positions
-            .iter()
-            .filter_map(|(line, _)| text.line(line).map(|line| line.start()))
+        self.visible_line_ids()
+            .flat_map(|line| text.line_text_fragments(line).into_iter().flatten())
+            .filter(|fragment| fragment.visible() && !fragment.glyphs().is_empty())
+            .map(|fragment| fragment.glyphs().start)
             .min()
             .unwrap_or(0)
     }
@@ -563,7 +540,7 @@ impl<'a> PageView<'a> {
             .addressing()
             .destination(DocumentTarget::Glyph(glyph))
             .is_some_and(|target| match target {
-                ResolvedDestination::Line { line, .. } => self.page.positions.contains(line),
+                ResolvedDestination::Line { line, .. } => self.visible_line_ids().any(|id| id == line),
                 ResolvedDestination::Position { .. } => false,
             })
     }
@@ -575,13 +552,18 @@ impl<'a> PageView<'a> {
             .iter()
             .filter_map(move |(index, screen)| {
                 let line = self.doc.text().line(index)?;
+                if screen.point.y >= screen.visible_bottom(self.page.geometry.size.height)
+                    || screen.point.y + line.height() <= screen.visible_top()
+                {
+                    return None;
+                }
                 let column_x =
                     page_placements::col_x(&self.page.geometry, f64::from(screen.col_index), 0.0);
                 let column_bounds = Rect::new(
                     column_x,
-                    screen.point.y,
+                    screen.point.y.max(screen.visible_top()),
                     column_x + self.page.geometry.col_width,
-                    screen.point.y + line.height(),
+                    (screen.point.y + line.height()).min(screen.visible_bottom(self.page.geometry.size.height)),
                 );
                 let natural = self.document_geometry().placed_reading_line(
                     LinePlacement {

@@ -35,6 +35,11 @@ impl ParagraphLayoutResult {
                 .placements
                 .as_ref()
                 .map_or(0, |values| values.storage_bytes());
+            placements += line
+                .layout
+                .fragments
+                .as_ref()
+                .map_or(0, |plan| plan.storage_bytes());
             spacing += line.layout.punctuation_space_advances.capacity() * size_of::<(u32, f32)>();
         }
         [

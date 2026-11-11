@@ -5,7 +5,6 @@
 //! effects live in the host.
 
 
-use html_pipeline::engine::pagination_queries;
 mod engine_load;
 mod engine_resources;
 pub mod configuration;
@@ -27,7 +26,7 @@ pub use facade::{document, layout, render, resources, style, text};
 use html_pipeline as pipeline;
 
 pub use engine::Document;
-pub use engine_load::{DocumentOptions, LoadTimings, PreparedDocument};
+pub use engine_load::{DocumentOptions, LoadTimings, ParsedDocumentSource, PreparedDocument};
 pub use engine_resources::{ImageSourceRequest, ResourcePoll};
 use engine_resources::DocumentImages;
 pub use error::Error;
@@ -90,8 +89,8 @@ mod engine {
             self.revisions
         }
 
-        /// The session owns the committed source and configuration. Hosts can
-        /// borrow these values instead of retaining a second input snapshot.
+        /// The session owns the current source and configuration. A failed
+        /// replacement keeps its request without a published document.
         pub(crate) fn inputs(&self) -> Option<&PipelineInputs> {
             self.session.inputs()
         }
@@ -109,17 +108,6 @@ mod engine {
             }
             self.revisions.invalidate_from(stage);
             Ok(stage)
-        }
-
-        /// Prepares provider-backed HTML through parse and style without
-        /// borrowing a platform text system.
-        pub(crate) fn prepare_through_style(
-            &mut self,
-            inputs: PipelineInputs,
-        ) -> Result<(), PipelineError> {
-            self.session.prepare_through_style(inputs)?;
-            self.revisions.invalidate_from(EarliestStage::Parse);
-            Ok(())
         }
 
         /// Shared snapshot of active font declarations for the committed inputs.
@@ -149,10 +137,6 @@ mod engine {
             self.session.glyph_resources()
         }
 
-        /// Version of the native resources used by the published text.
-        pub fn glyph_resource_generation(&self) -> crate::text::GlyphResourceGeneration {
-            self.session.glyph_resources().generation()
-        }
 
         /// Select document content without creating a reader or a viewport.
         pub(crate) fn selection(&self, range: Range<u32>) -> Option<Selection<'_>> {

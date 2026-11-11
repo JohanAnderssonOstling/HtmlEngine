@@ -7,7 +7,6 @@ use kurbo::Point;
 impl LayoutEngine<'_, '_> {
     pub(super) fn layout_root(&mut self) {
         if let Some(root_box) = self.reader.root_box() {
-            let start = self.start_timing();
             // The root element establishes the initial block formatting
             // context, so its margins never collapse with its descendants.
             // Unlike ordinary boxes, it has no parent flow to consume those
@@ -32,13 +31,8 @@ impl LayoutEngine<'_, '_> {
                 ));
             }
             absolute_positioning::layout_pending(self, None);
-            let elapsed = start.elapsed();
-            self.record_timing(|t| t.layout_tree_traversal += elapsed);
-            self.record_timing(|t| t.root_box_layout += elapsed);
         }
 
-        let start = self.start_timing();
-        self.floats.clear();
-        self.record_timing(|t| t.layout_tree_traversal += start.elapsed());
+        self.scratch.floats.clear();
     }
 }

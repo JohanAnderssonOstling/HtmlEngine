@@ -1,25 +1,22 @@
 //! Prepared, shaped, and laid-out document lifecycle types.
 
-use html_dom as dom_values;
-use html_dom::storage;
 use super::mathml::{self, MathMlUndo};
 use super::output::{WordIndex, build_word_index};
 use super::paint::{NotePaint, PaintPalette, PaintStyles};
 use super::semantics::is_block_container;
 use super::*;
 use crate::layout::{InlinePlanGeneration, LayoutScratch, PlacementState, prepare_text_paint};
-use crate::{GlyphShaper, LayoutTimings, ReaderStyleOverrides, ShapeError};
-use html_dom::{ElementRef, NodeRef, RootFontSize};
-use html_engine_model::shaping::{
-    borrowed_document, first_line_shaper_required, resource_generation_mismatch,
-};
-use html_engine_model::{GlyphResourceCheckpoint, PaintColorRun, PaintView, TextPaintRange};
+use crate::{GlyphShaper, ReaderStyleOverrides, ShapeError};
+use html_dom as dom_values;
+use html_dom::{DomNodeId, ElementRef, NodeRef, RootFontSize};
+use html_engine_model::shaping::{borrowed_document, resource_generation_mismatch};
+use html_engine_model::{GlyphResourceId, PaintColorRun, PaintView, TextPaintRange};
 use html_style_model::{
     ContentLanguage, Display, FontFace, ObjectFit, UsedPreferredSize, Visibility,
 };
 use html_text::PreparedText;
 use std::iter::once;
-use std::mem::{replace, take};
+use std::mem::{replace, size_of, take};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -145,10 +142,7 @@ impl FormattingDocument {
         profile!("prepare.validate_styles", styles.validate_for(&document))
             .map_err(PrepareError::from)?;
         let mut document = document;
-        profile!(
-            "prepare.mathml",
-            mathml::prepare(&mut document, &styles)
-        );
+        profile!("prepare.mathml", mathml::prepare(&mut document, &styles));
         let mut layout_tree = LayoutTree::default();
         let mut inline_content = InlineContent::default();
         profile!(
@@ -193,6 +187,7 @@ impl FormattingDocument {
             publication_fonts,
         } = self;
         let text = prepare_logical_text(&document, &styles, &layout_tree, inline_content);
+        let indexes = PreparedIndexes::new(&document, &styles, &layout_tree, &text);
         let paint = profile!(
             "prepare.paint_bindings",
             PaintStyles::new(&document, &styles, &layout_tree)
@@ -204,6 +199,7 @@ impl FormattingDocument {
                 styles: Storage::owned(styles),
                 layout_tree: Storage::owned(layout_tree),
                 text: Storage::owned(text),
+                indexes: Storage::owned(indexes),
                 note_flow,
                 paint: Storage::owned(paint),
                 publication_fonts: Storage::owned(publication_fonts),
@@ -231,9 +227,84 @@ pub(crate) struct PreparedInputs<'a> {
     pub(super) styles: Storage<'a, ComputedStyles>,
     pub(super) layout_tree: Storage<'a, LayoutTree>,
     pub(super) text: Storage<'a, PreparedText>,
+    pub(super) indexes: Storage<'a, PreparedIndexes>,
     pub(super) note_flow: NoteFlow,
     pub(crate) paint: Storage<'a, PaintStyles<'a>>,
     pub(super) publication_fonts: Storage<'a, PublicationFonts>,
+}
+
+/// One inactive responsive preparation. The canonical DOM and glyph resources
+/// remain with the session; only immutable derived inputs are retained here.
+pub(crate) struct ResponsivePreparation<'a> {
+    generation: PreparationGeneration,
+    styles: Storage<'a, ComputedStyles>,
+    layout_tree: Storage<'a, LayoutTree>,
+    text: Storage<'a, PreparedText>,
+    indexes: Storage<'a, PreparedIndexes>,
+    note_flow: NoteFlow,
+    paint: Storage<'a, PaintStyles<'a>>,
+    publication_fonts: Storage<'a, PublicationFonts>,
+}
+
+impl<'a> ResponsivePreparation<'a> {
+    fn exchange(self, inputs: &mut PreparedInputs<'a>) -> Self {
+        Self {
+            generation: replace(&mut inputs.generation, self.generation),
+            styles: replace(&mut inputs.styles, self.styles),
+            layout_tree: replace(&mut inputs.layout_tree, self.layout_tree),
+            text: replace(&mut inputs.text, self.text),
+            indexes: replace(&mut inputs.indexes, self.indexes),
+            note_flow: replace(&mut inputs.note_flow, self.note_flow),
+            paint: replace(&mut inputs.paint, self.paint),
+            publication_fonts: replace(&mut inputs.publication_fonts, self.publication_fonts),
+        }
+    }
+
+    pub(crate) fn matches_document(&self, document: &Document) -> bool {
+        self.styles.validate_for(document).is_ok()
+    }
+}
+
+/// Semantic indexes depend on prepared source positions, never font resources.
+pub(super) struct PreparedIndexes {
+    pub(super) words: WordIndex,
+    link_glyph_targets: LinkGlyphTargets,
+    anchor_glyphs: FxHashMap<u16, u32>,
+}
+
+impl PreparedIndexes {
+    fn new(
+        document: &Document,
+        styles: &ComputedStyles,
+        tree: &LayoutTree,
+        text: &PreparedText,
+    ) -> Self {
+        let (link_glyph_targets, anchor_glyphs) = profile!(
+            "prepare.semantic_targets",
+            collect_glyph_targets(document, tree, text.content())
+        );
+        let words = profile!(
+            "prepare.words",
+            build_word_index(styles, tree, text.content())
+        );
+        Self {
+            words,
+            link_glyph_targets,
+            anchor_glyphs,
+        }
+    }
+
+    fn memory_usage_report(&self) -> MemoryUsageReport {
+        let mut report = self.words.memory_usage_report();
+        report.add("metadata", size_of::<Self>(), 1);
+        report.add(
+            "link_glyph_targets.storage",
+            self.link_glyph_targets.memory_usage_bytes(),
+            self.link_glyph_targets.len(),
+        );
+        report.add_hash_map_storage("anchor_glyphs.storage", &self.anchor_glyphs);
+        report
+    }
 }
 
 impl PreparedInputs<'_> {
@@ -253,6 +324,7 @@ impl PreparedInputs<'_> {
             (".document", self.document.memory_usage_report()),
             (".styles", self.styles.memory_usage_report()),
             (".layout_tree", self.layout_tree.memory_usage_report()),
+            (".indexes", self.indexes.memory_usage_report()),
         ] {
             report.extend_prefixed([prefix, suffix].concat(), usage);
         }
@@ -269,13 +341,6 @@ impl PreparedInputs<'_> {
         Ok(self.paint.owned_mut()?.replace_palette(paint))
     }
 
-    fn require_static_text(&self) -> Result<(), ShapeError> {
-        if self.styles.has_first_line_styles() {
-            return Err(first_line_shaper_required());
-        }
-        Ok(())
-    }
-
     fn borrowed(&self) -> PreparedInputs<'_> {
         PreparedInputs {
             generation: self.generation,
@@ -283,6 +348,7 @@ impl PreparedInputs<'_> {
             styles: Storage::Borrowed(&self.styles),
             layout_tree: Storage::Borrowed(&self.layout_tree),
             text: Storage::Borrowed(&self.text),
+            indexes: Storage::Borrowed(&self.indexes),
             note_flow: self.note_flow,
             paint: Storage::Borrowed(&self.paint),
             publication_fonts: Storage::Borrowed(&self.publication_fonts),
@@ -314,6 +380,7 @@ pub struct PreparedDocument<'a> {
 }
 
 pub(crate) struct ShapedText {
+    resource_id: GlyphResourceId,
     pub(super) resource_generation: crate::GlyphResourceGeneration,
     preparation: PreparationGeneration,
     geometry_box_count: usize,
@@ -325,12 +392,9 @@ pub(crate) struct ShapedText {
 
 /// Immutable shaping tables shared by the base shape and first-line variants.
 pub(super) struct SharedShapedData {
-    pub(super) words: WordIndex,
     pub(super) font_metrics: crate::shaping::ShapedFontMetrics,
     pub(super) ellipsis_glyphs: FxHashMap<u32, GlyphId>,
     pub(super) hyphen_glyphs: FxHashMap<u32, GlyphId>,
-    pub(super) link_glyph_targets: FxHashMap<u32, LinkGlyphTarget>,
-    pub(super) anchor_glyphs: FxHashMap<u16, u32>,
 }
 
 pub(crate) struct FirstLineRefinement {
@@ -419,11 +483,7 @@ impl ShapedText {
             self.glyphs.len(),
         );
         if seen.insert((&self.shared as *const SharedShapedData).cast()) {
-            report.add(
-                "shared_metadata",
-                std::mem::size_of::<SharedShapedData>(),
-                1,
-            );
+            report.add("shared_metadata", size_of::<SharedShapedData>(), 1);
             report.add(
                 "font_metrics",
                 self.shared.font_metrics.memory_usage_bytes(),
@@ -431,19 +491,13 @@ impl ShapedText {
             );
             report.add_hash_map_storage("ellipsis_glyphs.storage", &self.shared.ellipsis_glyphs);
             report.add_hash_map_storage("hyphen_glyphs.storage", &self.shared.hyphen_glyphs);
-            report.add_hash_map_storage(
-                "link_glyph_targets.storage",
-                &self.shared.link_glyph_targets,
-            );
-            report.add_hash_map_storage("anchor_glyphs.storage", &self.shared.anchor_glyphs);
-            report.extend_prefixed("words", self.shared.words.memory_usage_report());
         }
         report
     }
 }
 
-/// Retains the published ledger until native document replacement commits.
-/// Unfinished shaping restores native resources and metrics when dropped.
+/// Keep published engine registrations until a candidate layout succeeds.
+/// Native caches belong to the backend and retain their valid entries.
 struct DocumentShapingTransaction<'a, S: GlyphShaper> {
     glyph_shaper: &'a mut S,
     resources: &'a mut GlyphResourceStore,
@@ -452,7 +506,7 @@ struct DocumentShapingTransaction<'a, S: GlyphShaper> {
 
 impl<'a, S: GlyphShaper> DocumentShapingTransaction<'a, S> {
     fn begin(glyph_shaper: &'a mut S, resources: &'a mut GlyphResourceStore) -> Self {
-        glyph_shaper.begin_document_shaping();
+        glyph_shaper.begin_shaping();
         let previous_resources = replace(
             resources,
             GlyphResourceStore::new(glyph_shaper.resource_generation()),
@@ -465,7 +519,6 @@ impl<'a, S: GlyphShaper> DocumentShapingTransaction<'a, S> {
     }
 
     fn commit(mut self) {
-        self.glyph_shaper.commit_document_shaping();
         self.previous_resources = None;
     }
 }
@@ -473,9 +526,9 @@ impl<'a, S: GlyphShaper> DocumentShapingTransaction<'a, S> {
 impl<S: GlyphShaper> Drop for DocumentShapingTransaction<'_, S> {
     fn drop(&mut self) {
         if let Some(previous_resources) = self.previous_resources.take() {
-            self.glyph_shaper.rollback_document_shaping();
             *self.resources = previous_resources;
         }
+        self.glyph_shaper.finish_shaping();
     }
 }
 
@@ -483,7 +536,7 @@ impl<S: GlyphShaper> Drop for DocumentShapingTransaction<'_, S> {
 struct AppendShapingTransaction<'a, S: GlyphShaper> {
     glyph_shaper: &'a mut S,
     resources: &'a mut GlyphResourceStore,
-    checkpoint: Option<GlyphResourceCheckpoint>,
+    checkpoint: Option<usize>,
 }
 
 impl<'a, S: GlyphShaper> AppendShapingTransaction<'a, S> {
@@ -494,8 +547,8 @@ impl<'a, S: GlyphShaper> AppendShapingTransaction<'a, S> {
         if glyph_shaper.resource_generation() != resources.generation() {
             return Err(resource_generation_mismatch());
         }
-        glyph_shaper.begin_append_shaping()?;
-        let checkpoint = resources.checkpoint();
+        glyph_shaper.begin_shaping();
+        let checkpoint = resources.len();
         Ok(Self {
             glyph_shaper,
             resources,
@@ -504,7 +557,6 @@ impl<'a, S: GlyphShaper> AppendShapingTransaction<'a, S> {
     }
 
     fn commit(mut self) {
-        self.glyph_shaper.commit_append_shaping();
         self.checkpoint = None;
     }
 }
@@ -512,9 +564,9 @@ impl<'a, S: GlyphShaper> AppendShapingTransaction<'a, S> {
 impl<S: GlyphShaper> Drop for AppendShapingTransaction<'_, S> {
     fn drop(&mut self) {
         if let Some(checkpoint) = self.checkpoint.take() {
-            self.glyph_shaper.rollback_append_shaping();
-            assert!(self.resources.rollback_to(checkpoint));
+            self.resources.truncate(checkpoint);
         }
+        self.glyph_shaper.finish_shaping();
     }
 }
 
@@ -552,12 +604,13 @@ pub struct ShapeLayoutTimings {
     pub layout: Duration,
 }
 
-/// One coordinated layout request. Metrics and timing collection are optional;
-/// the coordinator handles first-line refinement and resource validity.
+/// Constraints and optional image metrics for coordinated layout.
+/// Initial layout derives omitted metrics from the document; relayout retains
+/// the last published image metrics. Both operations coordinate first-line
+/// refinement and validate the shaping resources.
 pub struct LayoutRequest<'a> {
     constraints: LayoutConstraints,
     metrics: Option<&'a ImageMetrics>,
-    timings: Option<&'a mut LayoutTimings>,
 }
 
 impl<'a> LayoutRequest<'a> {
@@ -566,16 +619,11 @@ impl<'a> LayoutRequest<'a> {
         Self {
             constraints,
             metrics: None,
-            timings: None,
         }
     }
     #[inline]
     pub fn with_image_metrics(mut self, metrics: &'a ImageMetrics) -> Self {
         self.metrics = Some(metrics);
-        self
-    }
-    pub fn with_timings(mut self, timings: &'a mut LayoutTimings) -> Self {
-        self.timings = Some(timings);
         self
     }
 }
@@ -614,7 +662,7 @@ fn reprepare_and_layout_candidate<'a>(
     image_metrics: &ImageMetrics,
     glyph_shaper: &mut impl GlyphShaper,
     resources: &mut GlyphResourceStore,
-) -> Result<(Box<ShapedText>, LayoutProducts), ShapeError> {
+) -> Result<(Box<ShapedText>, LayoutProducts, ResponsivePreparation<'a>), ShapeError> {
     // Exhaustive destructuring makes additions to preparation explicit here.
     let PreparedInputs {
         generation,
@@ -622,12 +670,14 @@ fn reprepare_and_layout_candidate<'a>(
         styles: published_styles,
         layout_tree,
         text: published_text,
+        indexes: published_indexes,
         note_flow: published_flow,
         paint: published_paint,
         publication_fonts: published_fonts,
     } = inputs;
     let document = document.owned_mut()?;
-    let old_font = dom_values::root_font_size_new(document.root_font_size()).expect("validated root font size");
+    let old_font = dom_values::root_font_size_new(document.root_font_size())
+        .expect("validated root font size");
     let mut update = DocumentPreparation {
         document,
         previous_font: Some(old_font),
@@ -644,6 +694,7 @@ fn reprepare_and_layout_candidate<'a>(
     let mut content = InlineContent::default();
     html_format::build_layout_inputs(update.document, &styles, &mut tree, &mut content, note_flow);
     let text = prepare_logical_text(update.document, &styles, &tree, content);
+    let indexes = PreparedIndexes::new(update.document, &styles, &tree, &text);
     let mut paint: PaintStyles<'a> = PaintStyles::new(update.document, &styles, &tree);
     let palette = paint
         .with_overrides(&styles, &tree, overrides)
@@ -656,6 +707,7 @@ fn reprepare_and_layout_candidate<'a>(
         styles: Storage::Borrowed(&styles),
         layout_tree: Storage::Borrowed(&tree),
         text: Storage::Borrowed(&text),
+        indexes: Storage::Borrowed(&indexes),
         note_flow,
         paint: Storage::Borrowed(&paint),
         publication_fonts: Storage::Borrowed(&fonts),
@@ -668,14 +720,17 @@ fn reprepare_and_layout_candidate<'a>(
         resources,
     )?;
     update.commit();
-    *generation = next_generation;
-    *published_styles = Storage::owned(styles);
-    *layout_tree = Storage::owned(tree);
-    *published_text = Storage::owned(text);
-    *published_paint = Storage::owned(paint);
-    *published_fonts = Storage::owned(fonts);
-    *published_flow = note_flow;
-    Ok(result)
+    let previous = ResponsivePreparation {
+        generation: replace(generation, next_generation),
+        styles: replace(published_styles, Storage::owned(styles)),
+        layout_tree: replace(layout_tree, Storage::owned(tree)),
+        text: replace(published_text, Storage::owned(text)),
+        indexes: replace(published_indexes, Storage::owned(indexes)),
+        paint: replace(published_paint, Storage::owned(paint)),
+        publication_fonts: replace(published_fonts, Storage::owned(fonts)),
+        note_flow: replace(published_flow, note_flow),
+    };
+    Ok((result.0, result.1, previous))
 }
 
 impl<'a> PreparedDocument<'a> {
@@ -709,7 +764,7 @@ impl<'a> PreparedDocument<'a> {
         glyph_shaper: &mut impl GlyphShaper,
         resources: &mut GlyphResourceStore,
     ) -> Result<LaidOutDocument<'_>, ShapeError> {
-        let (shaped, candidate) = reprepare_and_layout_candidate(
+        let (shaped, candidate, _) = reprepare_and_layout_candidate(
             &mut self.inputs,
             root_font_size,
             note_flow,
@@ -859,11 +914,11 @@ impl<'a> PreparedDocument<'a> {
     }
 
     pub fn get_id(&self, box_idx: usize) -> Option<&str> {
-        storage::id_idx(
-            self.inputs
-                .layout_tree
-                .element_for_box(box_idx, self.document())?,
-        )
+        (self
+            .inputs
+            .layout_tree
+            .element_for_box(box_idx, self.document())?)
+        .id_idx()
         .map(|id| self.document().string(id))
     }
 
@@ -933,9 +988,9 @@ impl<'a> PreparedDocument<'a> {
         )
     }
 
-    /// Shapes and lays out a document as one renderer-resource transaction.
-    /// A shaping or exact-line-refinement failure leaves the previous renderer
-    /// resources active.
+    /// Publish a complete engine layout, preserving its previous registrations
+    /// if engine registration or first-line refinement fails. Native cache
+    /// entries remain owned and managed by the backend.
     pub fn shape_and_layout_with_metrics_and_shaper(
         &self,
         constraints: LayoutConstraints,
@@ -953,7 +1008,6 @@ impl<'a> PreparedDocument<'a> {
                         constraints,
                         image_metrics,
                         glyph_shaper,
-                        None,
                         resources,
                         RefinementTransaction::Existing,
                     )
@@ -983,7 +1037,6 @@ impl<'a> PreparedDocument<'a> {
                     constraints,
                     image_metrics,
                     glyph_shaper,
-                    None,
                     resources,
                     RefinementTransaction::Existing,
                 )?;
@@ -994,43 +1047,6 @@ impl<'a> PreparedDocument<'a> {
                         layout: layout_started.elapsed(),
                     },
                 ))
-            },
-            resources,
-        )
-    }
-
-    /// Shapes and lays out a subtree of the document whose renderer resources
-    /// are already active, using a rollback-capable append transaction.
-    ///
-    /// A document shaping transaction *replaces* the shaper's glyphs and runs
-    /// on commit. That is right for a new document and wrong for a note, which
-    /// belongs to the document it was taken from: committing the note's
-    /// resources strands every glyph the page still refers to, and rolling
-    /// them back discards the note's own. An append transaction retains both
-    /// on success and restores the page's resources on failure.
-    ///
-    /// Glyph ids and metrics both append to the shaper's active resource
-    /// store. A failed append restores that store to the previous dense ID.
-    pub fn shape_and_layout_into_active_resources(
-        &self,
-        constraints: LayoutConstraints,
-        image_metrics: &ImageMetrics,
-        glyph_shaper: &mut impl GlyphShaper,
-        resources: &mut GlyphResourceStore,
-    ) -> Result<LaidOutDocument<'_>, ShapeError> {
-        with_append_shaping(
-            glyph_shaper,
-            &self.inputs.publication_fonts,
-            |glyph_shaper, resources| {
-                let shaped = self.inputs.shape_active_document(glyph_shaper, resources)?;
-                shaped.layout_coordinated(
-                    constraints,
-                    image_metrics,
-                    glyph_shaper,
-                    None,
-                    resources,
-                    RefinementTransaction::Existing,
-                )
             },
             resources,
         )
@@ -1053,35 +1069,32 @@ fn shape_text(
             .map(|&character| GlyphId(character as u32))
             .collect::<Vec<_>>()
     );
-    let (ellipsis_glyphs, hyphen_glyphs, text_geometry, font_metrics) =
-        crate::shaping::shape_document(
-            &inputs.styles,
-            &inputs.layout_tree,
-            inline_content,
-            &mut glyphs,
-            inputs.text.first_letter_styles(),
-            glyph_shaper,
-            resources,
-        )?;
-    let (link_glyph_targets, anchor_glyphs) = profile!(
-        "shape.semantic_targets",
-        collect_glyph_targets(&inputs.document, &inputs.layout_tree, inline_content)
-    );
+    let crate::shaping::DocumentShape {
+        ellipsis_glyphs,
+        hyphen_glyphs,
+        text_geometry,
+        font_metrics,
+    } = crate::shaping::shape_document(
+        &inputs.styles,
+        &inputs.layout_tree,
+        inline_content,
+        &mut glyphs,
+        inputs.text.first_letter_styles(),
+        glyph_shaper,
+        resources,
+    )?;
     let inline_plan_generation = InlinePlanGeneration::new();
-    let words = build_word_index(inputs, &font_metrics);
     Ok(Box::new(ShapedText {
+        resource_id: resources.id(),
         resource_generation: resources.generation(),
         preparation: inputs.generation,
         geometry_box_count: inputs.layout_tree.box_count(),
         glyphs,
         text_geometry,
         shared: SharedShapedData {
-            words,
             font_metrics,
             ellipsis_glyphs,
             hyphen_glyphs,
-            link_glyph_targets,
-            anchor_glyphs,
         },
         inline_plan_generation,
     }))
@@ -1105,7 +1118,6 @@ fn shape_and_layout_candidate(
                 constraints,
                 image_metrics,
                 glyph_shaper,
-                None,
                 LayoutScratch::default(),
                 resources,
                 RefinementTransaction::Existing,
@@ -1120,8 +1132,9 @@ fn shape_and_layout_candidate(
 /// Layout constraints can change without repeating parsing, styling, box-tree
 /// construction, or shaping.
 impl<'a> ShapedDocument<'a> {
-    /// Layout through the coordinator, including width-dependent pseudo text.
-    pub fn layout_with(
+    /// Lay out shaped text, refining width-dependent first-line styles when needed.
+    /// The shaper must match the supplied resources; ordinary text is not reshaped.
+    pub fn layout(
         self,
         request: LayoutRequest<'_>,
         shaper: &mut impl GlyphShaper,
@@ -1139,7 +1152,6 @@ impl<'a> ShapedDocument<'a> {
             request.constraints,
             metrics,
             shaper,
-            request.timings,
             resources,
             RefinementTransaction::Append,
         )
@@ -1154,7 +1166,7 @@ impl<'a> ShapedDocument<'a> {
 
     #[cfg(any(test, feature = "testing"))]
     pub fn glyph_metrics<'r>(&self, resources: &'r GlyphResourceStore) -> &'r GlyphMetrics {
-        assert_eq!(self.shaped.resource_generation, resources.generation());
+        assert_eq!(self.shaped.resource_id, resources.id());
         resources.metrics()
     }
 
@@ -1179,106 +1191,20 @@ impl<'a> ShapedDocument<'a> {
         report
     }
 
-    /// Lay out text whose styles do not require first-line reshaping.
-    /// Use layout_with_shaper when first-line styles are present.
-    #[doc(hidden)]
-    pub fn layout(
-        self,
-        constraints: LayoutConstraints,
-        resources: &GlyphResourceStore,
-    ) -> Result<LaidOutDocument<'a>, ShapeError> {
-        let image_metrics = ImageMetrics::from_document(self.inputs.document.as_ref());
-        self.layout_with_metrics(constraints, &image_metrics, resources)
-    }
-
-    #[doc(hidden)]
-    pub fn layout_with_timings(
-        self,
-        constraints: LayoutConstraints,
-        resources: &GlyphResourceStore,
-    ) -> Result<(LaidOutDocument<'a>, LayoutTimings), ShapeError> {
-        let image_metrics = ImageMetrics::from_document(self.inputs.document.as_ref());
-        self.layout_with_timings_and_metrics(constraints, &image_metrics, resources)
-    }
-
-    #[doc(hidden)]
-    pub fn layout_with_metrics(
-        self,
-        constraints: LayoutConstraints,
-        image_metrics: &ImageMetrics,
-        resources: &GlyphResourceStore,
-    ) -> Result<LaidOutDocument<'a>, ShapeError> {
-        self.layout_impl(constraints, image_metrics, None, resources)
-    }
-
-    /// Coordinate layout and any width-dependent first-line reshaping.
-    #[doc(hidden)]
-    pub fn layout_with_shaper(
-        self,
-        constraints: LayoutConstraints,
-        shaper: &mut impl GlyphShaper,
-        resources: &mut GlyphResourceStore,
-    ) -> Result<LaidOutDocument<'a>, ShapeError> {
-        let metrics = ImageMetrics::from_document(self.inputs.document.as_ref());
-        self.layout_with_metrics_and_shaper(constraints, &metrics, shaper, resources)
-    }
-
-    /// Compatibility entry point. Document shaping is authoritative, so width
-    /// changes only invoke the backend shaper for width-dependent pseudo text.
-    #[doc(hidden)]
-    pub fn layout_with_metrics_and_shaper(
-        self,
-        constraints: LayoutConstraints,
-        image_metrics: &ImageMetrics,
-        glyph_shaper: &mut impl GlyphShaper,
-        resources: &mut GlyphResourceStore,
-    ) -> Result<LaidOutDocument<'a>, ShapeError> {
-        self.layout_coordinated(
-            constraints,
-            image_metrics,
-            glyph_shaper,
-            None,
-            resources,
-            RefinementTransaction::Append,
-        )
-    }
-
-    /// Timed layout follows the same first-line coordination as ordinary layout.
-    #[doc(hidden)]
-    pub fn layout_with_timings_and_metrics_and_shaper(
-        self,
-        constraints: LayoutConstraints,
-        image_metrics: &ImageMetrics,
-        shaper: &mut impl GlyphShaper,
-        resources: &mut GlyphResourceStore,
-    ) -> Result<(LaidOutDocument<'a>, LayoutTimings), ShapeError> {
-        let mut timings = LayoutTimings::default();
-        let document = self.layout_coordinated(
-            constraints,
-            image_metrics,
-            shaper,
-            Some(&mut timings),
-            resources,
-            RefinementTransaction::Append,
-        )?;
-        Ok((document, timings))
-    }
-
     fn layout_coordinated(
         self,
         constraints: LayoutConstraints,
         image_metrics: &ImageMetrics,
         glyph_shaper: &mut impl GlyphShaper,
-        timings: Option<&mut LayoutTimings>,
         resources: &mut GlyphResourceStore,
         transaction: RefinementTransaction,
     ) -> Result<LaidOutDocument<'a>, ShapeError> {
         match transaction {
             RefinementTransaction::Existing => {
-                debug_assert_eq!(self.shaped.resource_generation, resources.generation());
+                debug_assert_eq!(self.shaped.resource_id, resources.id());
             }
             RefinementTransaction::Append => {
-                if self.shaped.resource_generation != resources.generation()
+                if self.shaped.resource_id != resources.id()
                     || glyph_shaper.resource_generation() != resources.generation()
                 {
                     return Err(resource_generation_mismatch());
@@ -1291,54 +1217,11 @@ impl<'a> ShapedDocument<'a> {
             constraints,
             image_metrics,
             glyph_shaper,
-            timings,
             LayoutScratch::default(),
             resources,
             transaction,
         )?;
         Ok(candidate.into_document(
-            self.inputs,
-            self.shaped,
-            constraints,
-            image_metrics,
-            resources,
-        ))
-    }
-
-    #[doc(hidden)]
-    pub fn layout_with_timings_and_metrics(
-        self,
-        constraints: LayoutConstraints,
-        image_metrics: &ImageMetrics,
-        resources: &GlyphResourceStore,
-    ) -> Result<(LaidOutDocument<'a>, LayoutTimings), ShapeError> {
-        let mut timings = LayoutTimings::default();
-        let document =
-            self.layout_impl(constraints, image_metrics, Some(&mut timings), resources)?;
-        Ok((document, timings))
-    }
-
-    fn layout_impl(
-        self,
-        constraints: LayoutConstraints,
-        image_metrics: &ImageMetrics,
-        timings: Option<&mut LayoutTimings>,
-        resources: &GlyphResourceStore,
-    ) -> Result<LaidOutDocument<'a>, ShapeError> {
-        self.inputs.require_static_text()?;
-        if self.shaped.resource_generation != resources.generation() {
-            return Err(resource_generation_mismatch());
-        }
-        Ok(LayoutProducts::new(
-            &self.inputs,
-            &self.shaped,
-            constraints,
-            image_metrics,
-            timings,
-            LayoutScratch::default(),
-            resources,
-        )
-        .into_document(
             self.inputs,
             self.shaped,
             constraints,
@@ -1365,7 +1248,6 @@ impl LayoutProducts {
         base: &ShapedText,
         constraints: LayoutConstraints,
         image_metrics: &ImageMetrics,
-        timings: Option<&mut LayoutTimings>,
         layout_scratch: LayoutScratch,
         resources: &GlyphResourceStore,
     ) -> Self {
@@ -1376,7 +1258,7 @@ impl LayoutProducts {
             state: LayoutState::default(),
             scratch: layout_scratch,
         };
-        candidate.relayout(inputs, base, constraints, image_metrics, timings, resources);
+        candidate.relayout(inputs, base, constraints, image_metrics, resources);
         candidate
     }
 
@@ -1386,10 +1268,9 @@ impl LayoutProducts {
         base: &ShapedText,
         constraints: LayoutConstraints,
         image_metrics: &ImageMetrics,
-        timings: Option<&mut LayoutTimings>,
         resources: &GlyphResourceStore,
     ) {
-        crate::layout::layout_with_timings(
+        crate::layout::compute_layout(
             layout_inputs(
                 inputs,
                 ShapedTextView::new(base, self.refinement.as_ref()),
@@ -1403,7 +1284,6 @@ impl LayoutProducts {
                 scratch: &mut self.scratch,
             },
             constraints,
-            timings,
         );
     }
 
@@ -1461,7 +1341,7 @@ fn layout_inputs<'a>(
         glyph_metrics: resources.metrics(),
         font_metrics: &shaped.shared.font_metrics,
         text_geometry: Some(shaped.text_geometry),
-        word_index: Some(&shaped.shared.words),
+        word_index: Some(&inputs.indexes.words),
         ellipsis_glyphs: &shaped.shared.ellipsis_glyphs,
         hyphen_glyphs: &shaped.shared.hyphen_glyphs,
         inline_plan_generation: shaped.inline_plan_generation,
@@ -1499,6 +1379,7 @@ pub(super) struct InputRefs<'a> {
     pub(super) styles: &'a ComputedStyles,
     pub(super) layout_tree: &'a LayoutTree,
     pub(super) text: &'a PreparedText,
+    pub(super) indexes: &'a PreparedIndexes,
     pub(super) paint: PaintView<'a>,
 }
 
@@ -1532,6 +1413,7 @@ impl PreparedInputs<'_> {
             styles: &self.styles,
             layout_tree: &self.layout_tree,
             text: &self.text,
+            indexes: &self.indexes,
             paint: self.paint.view(),
         }
     }
@@ -1546,10 +1428,12 @@ pub struct DetachedLayout {
 /// Scoped layout products. DOM and styles remain in the parent document.
 /// Querying requires that same preparation owner; replacing it invalidates the note.
 pub struct NoteLayout {
-    pub(crate) resource_lifetime: Option<Arc<()>>,
+    resources: Arc<GlyphResourceStore>,
+    owner_resources: GlyphResourceId,
     owner: PreparationGeneration,
     layout_tree: LayoutTree,
     text: PreparedText,
+    indexes: PreparedIndexes,
     paint: NotePaint,
     layout: DetachedLayout,
 }
@@ -1566,10 +1450,9 @@ impl NoteLayout {
         resources: &'a GlyphResourceStore,
     ) -> Option<RenderView<'a>> {
         if !resources.paint_resources_valid()
-            || self.layout.data.base_shaped.resource_generation != resources.generation()
+            || resources.id() != self.owner_resources
+            || owner.data.base_shaped.resource_id != self.owner_resources
             || !self.belongs_to(owner)
-            || self.layout.data.base_shaped.resource_generation
-                != owner.data.base_shaped.resource_generation
         {
             return None;
         }
@@ -1578,6 +1461,7 @@ impl NoteLayout {
             styles: &owner.inputs.styles,
             layout_tree: &self.layout_tree,
             text: &self.text,
+            indexes: &self.indexes,
             paint: self.paint.view(&owner.inputs.paint)?,
         });
         if doc.image_metrics_affect_layout(
@@ -1588,20 +1472,17 @@ impl NoteLayout {
             return None;
         }
         Some(RenderView {
-            resources: Some(resources),
-            scope_lifetime: self.resource_lifetime.as_ref(),
-            glyph_metrics: resources.metrics(),
+            resources: Some(self.resources.as_ref()),
+            parent_resources: Some(resources),
+            native_paint_resources: self.resources.native_paint_resources(),
+            scope_resources: Some(&self.resources),
+            glyph_metrics: self.resources.metrics(),
             doc,
         })
     }
 }
 
 impl<'a> LaidOutDocument<'a> {
-    pub(crate) fn shaping_generation(&self) -> InlinePlanGeneration {
-        ShapedTextView::new(&self.data.base_shaped, self.data.layout.refinement.as_ref())
-            .inline_plan_generation
-    }
-
     /// Only omit geometry work when resolved sizing proves it independent of
     /// changed natural dimensions. Intrinsic formatting contexts stay conservative.
     pub(crate) fn image_metrics_affect_layout(&self, next: &ImageMetrics) -> bool {
@@ -1617,7 +1498,11 @@ impl<'a> LaidOutDocument<'a> {
     }
 
     /// Detach scoped products while retaining only the parent's preparation identity.
-    pub fn into_note(self, owner: &LaidOutDocument<'_>) -> NoteLayout {
+    pub(crate) fn into_note(
+        self,
+        owner: &LaidOutDocument<'_>,
+        resources: GlyphResourceStore,
+    ) -> NoteLayout {
         assert!(std::ptr::eq(
             self.inputs.document.as_ref(),
             owner.inputs.document.as_ref()
@@ -1627,7 +1512,8 @@ impl<'a> LaidOutDocument<'a> {
             owner.inputs.styles.as_ref()
         ));
         NoteLayout {
-            resource_lifetime: None,
+            resources: Arc::new(resources),
+            owner_resources: owner.data.base_shaped.resource_id,
             owner: owner.inputs.generation,
             layout_tree: self
                 .inputs
@@ -1639,6 +1525,11 @@ impl<'a> LaidOutDocument<'a> {
                 .text
                 .into_owned()
                 .expect("scoped text has one owner"),
+            indexes: self
+                .inputs
+                .indexes
+                .into_owned()
+                .expect("scoped indexes have one owner"),
             paint: self
                 .inputs
                 .paint
@@ -1756,9 +1647,8 @@ impl<'a> LaidOutDocument<'a> {
                 resources,
             )
         } else {
-            self.relayout_with_metrics_and_shaper(
-                constraints,
-                image_metrics,
+            self.relayout(
+                LayoutRequest::new(constraints).with_image_metrics(image_metrics),
                 glyph_shaper,
                 resources,
             )
@@ -1780,7 +1670,24 @@ impl<'a> LaidOutDocument<'a> {
         glyph_shaper: &mut impl GlyphShaper,
         resources: &mut GlyphResourceStore,
     ) -> Result<(), ShapeError> {
-        let (shaped, candidate) = reprepare_and_layout_candidate(
+        self.reprepare_retaining_previous(
+            root_font_size, note_flow, overrides, resolve, constraints,
+            image_metrics, glyph_shaper, resources,
+        ).map(|_| ())
+    }
+
+    pub(crate) fn reprepare_retaining_previous(
+        &mut self,
+        root_font_size: RootFontSize,
+        note_flow: NoteFlow,
+        overrides: &ReaderStyleOverrides,
+        resolve: impl FnOnce(&Document) -> (ComputedStyles, Arc<[FontFace]>),
+        constraints: LayoutConstraints,
+        image_metrics: &ImageMetrics,
+        glyph_shaper: &mut impl GlyphShaper,
+        resources: &mut GlyphResourceStore,
+    ) -> Result<ResponsivePreparation<'a>, ShapeError> {
+        let (shaped, candidate, previous) = reprepare_and_layout_candidate(
             &mut self.inputs,
             root_font_size,
             note_flow,
@@ -1793,7 +1700,57 @@ impl<'a> LaidOutDocument<'a> {
         )?;
         self.data.base_shaped = shaped;
         candidate.publish(self, constraints, image_metrics, resources);
-        Ok(())
+        Ok(previous)
+    }
+
+    /// Lay out a cached CSS state privately; exchange ownership only after
+    /// shaping and layout succeed, preserving the published document on error.
+    pub(crate) fn restore_responsive_preparation(
+        &mut self,
+        mut preparation: ResponsivePreparation<'a>,
+        overrides: &ReaderStyleOverrides,
+        constraints: LayoutConstraints,
+        image_metrics: &ImageMetrics,
+        glyph_shaper: &mut impl GlyphShaper,
+        resources: &mut GlyphResourceStore,
+    ) -> Result<ResponsivePreparation<'a>, ShapeError> {
+        // Paint-only preferences are deliberately absent from preparation keys.
+        // Apply the current palette instead of reviving the cached colors.
+        let palette = preparation.paint.with_overrides(
+            &preparation.styles, &preparation.layout_tree, overrides,
+        ).into_palette();
+        preparation.paint.owned_mut()?.replace_palette(palette);
+        preparation.publication_fonts = Storage::owned(PublicationFonts::new(
+            Arc::clone(&preparation.publication_fonts.faces), overrides.clone(),
+        ));
+        let document = self.inputs.document.owned_mut()?;
+        let old_font = dom_values::root_font_size_new(document.root_font_size())
+            .expect("validated root font size");
+        let mut update = DocumentPreparation {
+            document, previous_font: Some(old_font), math_undo: Vec::new(),
+        };
+        preparation.styles.validate_for(update.document)
+            .expect("responsive preparation belongs to the canonical DOM");
+        update.math_undo = mathml::prepare_with_undo(update.document, &preparation.styles);
+        let candidate_inputs = PreparedInputs {
+            generation: preparation.generation,
+            document: Storage::Borrowed(update.document),
+            styles: Storage::Borrowed(&preparation.styles),
+            layout_tree: Storage::Borrowed(&preparation.layout_tree),
+            text: Storage::Borrowed(&preparation.text),
+            indexes: Storage::Borrowed(&preparation.indexes),
+            note_flow: preparation.note_flow,
+            paint: Storage::Borrowed(&preparation.paint),
+            publication_fonts: Storage::Borrowed(&preparation.publication_fonts),
+        };
+        let (shaped, candidate) = shape_and_layout_candidate(
+            &candidate_inputs, constraints, image_metrics, glyph_shaper, resources,
+        )?;
+        update.commit();
+        let previous = preparation.exchange(&mut self.inputs);
+        self.data.base_shaped = shaped;
+        candidate.publish(self, constraints, image_metrics, resources);
+        Ok(previous)
     }
 
     /// Resolve paint over retained geometry, including specialized formatting
@@ -1822,7 +1779,6 @@ impl<'a> LaidOutDocument<'a> {
             ),
             &self.data.layout.geometry,
             &mut self.data.layout.state,
-            self.data.last_constraints,
         );
     }
 
@@ -1859,9 +1815,8 @@ impl<'a> LaidOutDocument<'a> {
             prepared.inputs.generation
         );
         let previous_inputs = replace(&mut self.inputs, Box::new(prepared.inputs.borrowed()));
-        let result = self.relayout_with_metrics_and_shaper(
-            constraints,
-            image_metrics,
+        let result = self.relayout(
+            LayoutRequest::new(constraints).with_image_metrics(image_metrics),
             glyph_shaper,
             resources,
         );
@@ -1960,10 +1915,21 @@ impl<'a> LaidOutDocument<'a> {
         );
     }
 
+    /// Accept constraints after the session has established that only height
+    /// changed and neither CSS nor layout geometry depends on that height.
+    pub(crate) fn accept_height_without_relayout(&mut self, constraints: LayoutConstraints) {
+        self.data.last_constraints = constraints;
+    }
+
     /// Whether changing only the viewport height can alter document geometry.
     /// Viewport-relative style values are tracked by the style pipeline; this
-    /// covers layout-time dependencies that remain percentage based.
+    /// covers percentage sizing and reader image fitting.
     pub fn layout_depends_on_viewport_height(&self) -> bool {
+        if self.data.last_constraints.image_sizing_policy() == crate::ImageSizingPolicy::SmartStandalone
+            && !self.inputs.document.images().is_empty()
+        {
+            return true;
+        }
         (0..self.box_count()).any(|box_idx| {
             let Some(style) = self.box_used_style(box_idx) else {
                 return false;
@@ -1991,11 +1957,11 @@ impl<'a> LaidOutDocument<'a> {
     /// A view cannot outlive a mutation of its owning layout:
     ///
     /// ```compile_fail,E0502
-    /// use html_pipeline::engine::{GlyphResourceStore, LaidOutDocument, LayoutConstraints};
-    /// fn resize(document: &mut LaidOutDocument, constraints: LayoutConstraints,
-    ///           resources: &GlyphResourceStore) {
+    /// use html_pipeline::engine::{GlyphResourceStore, GlyphShaper, LaidOutDocument, LayoutRequest};
+    /// fn resize(document: &mut LaidOutDocument, request: LayoutRequest, shaper: &mut impl GlyphShaper,
+    ///           resources: &mut GlyphResourceStore) {
     ///     let view = document.render_view(resources);
-    ///     document.relayout(constraints, resources).unwrap();
+    ///     document.relayout(request, shaper, resources).unwrap();
     ///     let _ = view.text().line_count();
     /// }
     /// ```
@@ -2008,9 +1974,11 @@ impl<'a> LaidOutDocument<'a> {
         &'r self,
         resources: &'r GlyphResourceStore,
     ) -> Option<RenderView<'r>> {
-        (self.data.base_shaped.resource_generation == resources.generation()).then(|| RenderView {
+        (self.data.base_shaped.resource_id == resources.id()).then(|| RenderView {
             resources: Some(resources),
-            scope_lifetime: None,
+            parent_resources: None,
+            native_paint_resources: resources.native_paint_resources(),
+            scope_resources: None,
             doc: self.read(),
             glyph_metrics: resources.metrics(),
         })
@@ -2021,88 +1989,10 @@ impl<'a> LaidOutDocument<'a> {
         self.read().text_geometry()
     }
 
-    #[doc(hidden)]
-    pub fn relayout(
-        &mut self,
-        constraints: LayoutConstraints,
-        resources: &GlyphResourceStore,
-    ) -> Result<(), ShapeError> {
-        let image_metrics = ImageMetrics::from_document(self.document());
-        self.relayout_impl(constraints, image_metrics, None, resources)
-    }
-
-    #[doc(hidden)]
-    pub fn relayout_with_timings(
-        &mut self,
-        constraints: LayoutConstraints,
-        resources: &GlyphResourceStore,
-    ) -> Result<LayoutTimings, ShapeError> {
-        let mut timings = LayoutTimings::default();
-        let image_metrics = ImageMetrics::from_document(self.document());
-        self.relayout_impl(constraints, image_metrics, Some(&mut timings), resources)?;
-        Ok(timings)
-    }
-
-    #[doc(hidden)]
-    pub fn relayout_with_metrics(
-        &mut self,
-        constraints: LayoutConstraints,
-        image_metrics: &ImageMetrics,
-        resources: &GlyphResourceStore,
-    ) -> Result<(), ShapeError> {
-        self.relayout_impl(constraints, image_metrics.clone(), None, resources)
-    }
-
-    /// Resize through the coordinator, including first-line refinement.
-    #[doc(hidden)]
-    pub fn relayout_with_shaper(
-        &mut self,
-        constraints: LayoutConstraints,
-        shaper: &mut impl GlyphShaper,
-        resources: &mut GlyphResourceStore,
-    ) -> Result<(), ShapeError> {
-        let metrics = ImageMetrics::from_document(self.document());
-        self.relayout_with_metrics_and_shaper(constraints, &metrics, shaper, resources)
-    }
-
-    #[doc(hidden)]
-    pub fn relayout_with_metrics_and_shaper(
-        &mut self,
-        constraints: LayoutConstraints,
-        image_metrics: &ImageMetrics,
-        glyph_shaper: &mut impl GlyphShaper,
-        resources: &mut GlyphResourceStore,
-    ) -> Result<(), ShapeError> {
-        if self.data.base_shaped.resource_generation != resources.generation()
-            || glyph_shaper.resource_generation() != resources.generation()
-        {
-            return Err(resource_generation_mismatch());
-        }
-        if !self.inputs.styles.has_first_line_styles() {
-            // Ordinary resizing cannot fail during shaping. Retain geometry,
-            // line output, placement and scratch storage instead of allocating
-            // a private refinement candidate for every viewport change.
-            return self.relayout_with_metrics(constraints, image_metrics, resources);
-        }
-        let candidate = layout_with_first_lines(
-            &self.inputs,
-            &self.data.base_shaped,
-            constraints,
-            image_metrics,
-            glyph_shaper,
-            None,
-            take(&mut self.data.layout.scratch),
-            resources,
-            RefinementTransaction::Append,
-        )?;
-        candidate.publish(self, constraints, image_metrics, resources);
-        Ok(())
-    }
-
-    /// Change geometry through one coordinated entry point. Ordinary resizing
-    /// retains its allocation-reusing path; pseudo text is refined when needed.
+    /// Resize while reusing layout storage and authoritative shaped text.
+    /// First-line styles are refined with the supplied shaper when needed.
     #[inline]
-    pub fn relayout_with(
+    pub fn relayout(
         &mut self,
         request: LayoutRequest<'_>,
         glyph_shaper: &mut impl GlyphShaper,
@@ -2117,15 +2007,7 @@ impl<'a> LaidOutDocument<'a> {
             }
         };
         let constraints = request.constraints;
-        if request.timings.is_none() {
-            return self.relayout_with_metrics_and_shaper(
-                constraints,
-                image_metrics,
-                glyph_shaper,
-                resources,
-            );
-        }
-        if self.data.base_shaped.resource_generation != resources.generation()
+        if self.data.base_shaped.resource_id != resources.id()
             || glyph_shaper.resource_generation() != resources.generation()
         {
             return Err(resource_generation_mismatch());
@@ -2134,12 +2016,7 @@ impl<'a> LaidOutDocument<'a> {
             // Ordinary resizing cannot fail during shaping. Retain geometry,
             // line output, placement and scratch storage instead of allocating
             // a private refinement candidate for every viewport change.
-            return self.relayout_impl(
-                constraints,
-                image_metrics.clone(),
-                request.timings,
-                resources,
-            );
+            return self.relayout_impl(constraints, image_metrics.clone(), resources);
         }
         let candidate = layout_with_first_lines(
             &self.inputs,
@@ -2147,7 +2024,6 @@ impl<'a> LaidOutDocument<'a> {
             constraints,
             image_metrics,
             glyph_shaper,
-            request.timings,
             take(&mut self.data.layout.scratch),
             resources,
             RefinementTransaction::Append,
@@ -2156,32 +2032,13 @@ impl<'a> LaidOutDocument<'a> {
         Ok(())
     }
 
-    #[doc(hidden)]
-    pub fn relayout_with_metrics_and_timings(
-        &mut self,
-        constraints: LayoutConstraints,
-        image_metrics: &ImageMetrics,
-        resources: &GlyphResourceStore,
-    ) -> Result<LayoutTimings, ShapeError> {
-        let mut timings = LayoutTimings::default();
-        self.relayout_impl(
-            constraints,
-            image_metrics.clone(),
-            Some(&mut timings),
-            resources,
-        )?;
-        Ok(timings)
-    }
-
     fn relayout_impl(
         &mut self,
         constraints: LayoutConstraints,
         image_metrics: ImageMetrics,
-        timings: Option<&mut LayoutTimings>,
         resources: &GlyphResourceStore,
     ) -> Result<(), ShapeError> {
-        self.inputs.require_static_text()?;
-        if self.data.base_shaped.resource_generation != resources.generation() {
+        if self.data.base_shaped.resource_id != resources.id() {
             return Err(resource_generation_mismatch());
         }
         self.data.layout.relayout(
@@ -2189,7 +2046,6 @@ impl<'a> LaidOutDocument<'a> {
             &self.data.base_shaped,
             constraints,
             &image_metrics,
-            timings,
             resources,
         );
         self.rebuild_anchor_positions();
@@ -2202,7 +2058,7 @@ impl<'a> LaidOutDocument<'a> {
     fn rebuild_anchor_positions(&mut self) {
         let document = self.inputs.document.as_ref();
         let tree = self.inputs.layout_tree.as_ref();
-        let anchor_glyphs = &self.data.base_shaped.shared.anchor_glyphs;
+        let anchor_glyphs = &self.inputs.indexes.anchor_glyphs;
         let layout = &mut self.data.layout;
         let lines = &layout.state.line_output;
         let geometry = &layout.geometry;
@@ -2245,10 +2101,7 @@ impl<'a> LaidOutDocument<'a> {
 
     #[cfg(any(test, feature = "testing"))]
     pub fn glyph_metrics<'r>(&self, resources: &'r GlyphResourceStore) -> &'r GlyphMetrics {
-        assert_eq!(
-            self.data.base_shaped.resource_generation,
-            resources.generation()
-        );
+        assert_eq!(self.data.base_shaped.resource_id, resources.id());
         resources.metrics()
     }
 
@@ -2292,10 +2145,7 @@ impl<'a> LaidOutDocument<'a> {
         &self,
         resources: &GlyphResourceStore,
     ) -> MemoryUsageReport {
-        assert_eq!(
-            self.data.base_shaped.resource_generation,
-            resources.generation()
-        );
+        assert_eq!(self.data.base_shaped.resource_id, resources.id());
         let mut seen = FxHashSet::default();
         let mut report = self.memory_usage_report_with_shared(&mut seen);
         report.extend_prefixed(
@@ -2382,7 +2232,7 @@ fn visible_text_runs<'a>(
     std::iter::from_fn(move || {
         while let Some(node) = pending.pop() {
             match document.node_ref(node) {
-                Some(NodeRef::Element(element)) => {
+                NodeRef::Element(element) => {
                     if styles
                         .style_for_node(node)
                         .and_then(|style| styles.box_model_style(style))
@@ -2392,7 +2242,7 @@ fn visible_text_runs<'a>(
                     }
                     pending.extend(element.children().rev());
                 }
-                Some(NodeRef::Text(text)) => {
+                NodeRef::Text(text) => {
                     let Some(style) = text
                         .parent()
                         .and_then(|parent| styles.style_for_node(parent))
@@ -2408,7 +2258,6 @@ fn visible_text_runs<'a>(
                         .and_then(|language| styles.language(language));
                     return Some((text.text(), language));
                 }
-                None => {}
             }
         }
         None
@@ -2443,6 +2292,12 @@ fn scoped_to_element_id<'a>(
             .paint
             .for_tree(document, &inputs.styles, &layout_tree),
     );
+    let indexes = Storage::owned(PreparedIndexes::new(
+        document,
+        &inputs.styles,
+        &layout_tree,
+        &text,
+    ));
     Some(PreparedDocument {
         inputs: Box::new(PreparedInputs {
             generation: PreparationGeneration::new(),
@@ -2450,6 +2305,7 @@ fn scoped_to_element_id<'a>(
             styles: Storage::Borrowed(&inputs.styles),
             layout_tree: Storage::owned(layout_tree),
             text,
+            indexes,
             note_flow: NoteFlow::InFlow,
             paint,
             // A note is shaped with the declarations of the document it lives in.
@@ -2462,7 +2318,7 @@ fn note_ids<'a>(inputs: &'a PreparedInputs<'_>) -> Vec<&'a str> {
     let document = &inputs.document;
     document
         .node_ids()
-        .filter_map(|node| document.element_ref(node))
+        .filter_map(|node| document.try_element_ref(node))
         .filter(|element| element_is_note_target(*element))
         .filter_map(|element| element.id())
         .collect()
@@ -2532,7 +2388,9 @@ impl<'a> DocumentRead<'a> {
     pub(super) fn render_view(self, glyph_metrics: &'a GlyphMetrics) -> RenderView<'a> {
         RenderView {
             resources: None,
-            scope_lifetime: None,
+            parent_resources: None,
+            native_paint_resources: None,
+            scope_resources: None,
             doc: self,
             glyph_metrics,
         }
@@ -2542,7 +2400,7 @@ impl<'a> DocumentRead<'a> {
     }
 
     pub(crate) fn link_for_glyph(&self, glyph_idx: u32) -> Option<LinkTarget<'a>> {
-        let target = self.base_shaped.shared.link_glyph_targets.get(&glyph_idx)?;
+        let target = self.inputs.indexes.link_glyph_targets.get(glyph_idx)?;
         Some(LinkTarget {
             href: self.inputs.document.string(target.href),
             is_note_reference: target.note_reference,
@@ -2556,11 +2414,11 @@ impl<'a> DocumentRead<'a> {
     }
 
     pub fn anchor_glyph(&self, id_idx: u16) -> Option<u32> {
-        self.base_shaped.shared.anchor_glyphs.get(&id_idx).copied()
+        self.inputs.indexes.anchor_glyphs.get(&id_idx).copied()
     }
 
     pub(crate) fn anchor_glyphs(&self) -> &'a FxHashMap<u16, u32> {
-        &self.base_shaped.shared.anchor_glyphs
+        &self.inputs.indexes.anchor_glyphs
     }
 
     #[cfg(any(test, feature = "testing"))]
@@ -2575,7 +2433,7 @@ impl<'a> DocumentRead<'a> {
             .glyph_source_offset(glyph_idx as usize)
     }
 
-    pub(crate) fn box_dom_element_idx(&self, box_idx: usize) -> Option<u32> {
+    pub(crate) fn box_dom_element_idx(&self, box_idx: usize) -> Option<DomNodeId> {
         self.inputs.layout_tree.get_box_dom_element(box_idx)
     }
 

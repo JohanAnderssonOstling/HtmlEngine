@@ -1,16 +1,17 @@
+use html_engine_model::{
+    Children, FontRelativeMetrics, ImageMetrics, ImageSizingPolicy, InlineContent, InlineItem,
+    InlineItemKind, LayoutMode, LayoutTree, ListItemMarker, PaintView, ShapedFontMetrics, TableBox};
 use super::block::ParagraphSpacing;
+use super::box_model::ResolvedBoxModel;
 use super::engine::LayoutInputs;
-use crate::layout_model::{
-    Children, InlineContent, InlineItem, InlineItemKind, LayoutMode, LayoutTree,
-    ListItemMarker,
-};
-use crate::layout_model::{FontRelativeMetrics, ShapedFontMetrics};
-use html_dom::Document;
+use html_dom::{DomNodeId, Document};
+use html_text::{is_mandatory_line_break, suppresses_glyph};
 use html_style_model::{
     BoxSizing, ComputedStyles, Float, LayoutStyle, PositionMode, StyleIndices,
     UsedPreferredSize as PreferredSize, UsedStyleView,
 };
 use kurbo::Size;
+use rustc_data_structures::fx::FxHashMap;
 
 #[derive(Clone, Copy, Debug)]
 pub struct ImageIntrinsic {
@@ -27,29 +28,51 @@ pub struct LayoutReader<'input> {
     topology: &'input LayoutTree,
     inline_content: &'input InlineContent,
     font_metrics: &'input ShapedFontMetrics,
-    image_metrics: &'input crate::ImageMetrics,
-    box_styles: &'input [UsedStyleView<'input>],
+    image_metrics: &'input ImageMetrics,
+    pass_context: &'input PassContext<'input>,
     paragraph_spacing: &'input ParagraphSpacing,
     tracks_overflow_clips: bool,
-    paint: Option<html_engine_model::PaintView<'input>>,
+    has_floats: bool,
+    paint: Option<PaintView<'input>>,
 }
 
-/// Layout-ready styles for boxes in topology order.
-///
-/// Computed styles and selected font metrics are immutable for the lifetime of
-/// a shaped document. Joining them at every property read made the boundary
-/// between shaping and layout needlessly expensive. Build that join once when
-/// a layout session starts. This does not move value resolution: percentages
-/// and other containing-block-dependent values remain symbolic inside
-/// `UsedStyleView` until the owning layout algorithm supplies their basis.
-pub(super) struct BoxStyleSnapshot<'input> {
+/// Immutable style snapshots for one layout pass. Paint-only replay
+/// builds the style views and document flags without geometry caches or spacing.
+pub(super) struct PassContext<'input> {
     styles: Vec<UsedStyleView<'input>>,
+    box_models: Vec<ResolvedBoxModel>,
+    box_model_indices: Vec<u32>,
+    sizes: Vec<BoxSizeSnapshot>,
+    size_indices: Vec<u32>,
     paragraph_spacing: ParagraphSpacing,
+    tracking_spacing: Option<FxHashMap<u32, f32>>,
+    percentage_height_images: FxHashMap<DomNodeId, Vec<usize>>,
     tracks_overflow_clips: bool,
+    has_floats: bool,
 }
 
-impl<'input> BoxStyleSnapshot<'input> {
+/// Font-relative resolution is independent of containing-block dimensions.
+/// Shared by identical styles and font ratios, rather than copied per box.
+pub(crate) struct BoxSizeSnapshot {
+    pub width: PreferredSize,
+    pub height: PreferredSize,
+    pub min_width: PreferredSize,
+    pub min_height: PreferredSize,
+    pub max_width: PreferredSize,
+    pub max_height: PreferredSize,
+    pub flex_basis: PreferredSize,
+}
+
+impl<'input> PassContext<'input> {
     pub(super) fn new(inputs: &LayoutInputs<'input>) -> Self {
+        Self::build(inputs, true)
+    }
+
+    pub(super) fn for_paint(inputs: &LayoutInputs<'input>) -> Self {
+        Self::build(inputs, false)
+    }
+
+    fn build(inputs: &LayoutInputs<'input>, layout: bool) -> Self {
         let LayoutInputs {
             document,
             inline_content,
@@ -59,7 +82,19 @@ impl<'input> BoxStyleSnapshot<'input> {
             ..
         } = inputs;
         let mut resolved = Vec::with_capacity(topology.box_count());
+        let mut box_models = if layout {
+            vec![ResolvedBoxModel::default()]
+        } else {
+            Vec::new()
+        };
+        let mut box_model_indices =
+            Vec::with_capacity(if layout { topology.box_count() } else { 0 });
+        let mut sizes = Vec::new();
+        let mut size_indices = Vec::with_capacity(if layout { topology.box_count() } else { 0 });
+        let mut size_keys = FxHashMap::default();
         let mut tracks_overflow_clips = false;
+        let mut has_floats = false;
+        let mut percentage_height_images = FxHashMap::default();
         for box_idx in 0..topology.box_count() {
             let indices = topology
                 .get_box_style_indices(box_idx)
@@ -68,21 +103,210 @@ impl<'input> BoxStyleSnapshot<'input> {
                 .used_style(styles, indices, box_idx)
                 .expect("validated style handle");
             tracks_overflow_clips |= style.overflow_x().clips() || style.overflow_y().clips();
+            has_floats |= style.position() != PositionMode::Absolute
+                && matches!(style.float(), Float::Left | Float::Right);
             resolved.push(style);
+            if !layout {
+                continue;
+            }
+            if matches!(style.height(), PreferredSize::Percent(_))
+                && topology.get_box_image_idx(box_idx).is_some()
+                && let Some(node) = topology.get_box_dom_element(box_idx)
+            {
+                percentage_height_images.entry(node).or_insert(box_idx);
+            }
+            let metrics = font_metrics.for_box(box_idx);
+            let key = (
+                indices,
+                [
+                    metrics.x_height_ratio.to_bits(),
+                    metrics.ch_advance_ratio.to_bits(),
+                    metrics.cap_height_ratio.to_bits(),
+                ],
+            );
+            let (size_index, model_index) = *size_keys.entry(key).or_insert_with(|| {
+                let model = ResolvedBoxModel::new(style, 0.0);
+                let model_index = if model.is_zero() {
+                    0
+                } else {
+                    let index = u32::try_from(box_models.len()).expect("box model index fits u32");
+                    box_models.push(model);
+                    index
+                };
+
+                let index = u32::try_from(sizes.len()).expect("style size index fits u32");
+                sizes.push(BoxSizeSnapshot {
+                    width: style.width(),
+                    height: style.height(),
+                    min_width: style.min_width(),
+                    min_height: style.min_height(),
+                    max_width: style.max_width(),
+                    max_height: style.max_height(),
+                    flex_basis: style.flex_basis(),
+                });
+                (index, model_index)
+            });
+            size_indices.push(size_index);
+            box_model_indices.push(model_index);
         }
-        let paragraph_spacing = ParagraphSpacing::new(document, styles, topology, inline_content, &resolved);
+        let paragraph_spacing = if layout {
+            ParagraphSpacing::new(document, styles, topology, inline_content, &resolved)
+        } else {
+            ParagraphSpacing::default()
+        };
+        let tracking_spacing = if layout {
+            prepare_tracking_spacing(inputs, &resolved)
+        } else {
+            None
+        };
+        let percentage_height_images = prepare_percentage_height_images(
+            document, topology, &resolved, percentage_height_images,
+        );
         Self {
             styles: resolved,
+            box_models,
+            box_model_indices,
+            sizes,
+            size_indices,
             paragraph_spacing,
+            tracking_spacing,
+            percentage_height_images,
             tracks_overflow_clips,
+            has_floats,
         }
     }
+}
+
+fn prepare_percentage_height_images(
+    document: &Document,
+    topology: &LayoutTree,
+    styles: &[UsedStyleView<'_>],
+    mut candidates: FxHashMap<DomNodeId, usize>,
+) -> FxHashMap<DomNodeId, Vec<usize>> {
+    let mut children: FxHashMap<DomNodeId, Vec<usize>> = FxHashMap::default();
+    if candidates.is_empty() {
+        return children;
+    }
+    // A DOM element can generate multiple boxes. Preserve the previous query's
+    // first-box semantics, including when that first box is not an image.
+    for box_idx in 0..topology.box_count() {
+        if let Some(node) = topology.get_box_dom_element(box_idx)
+            && let Some(first) = candidates.get_mut(&node)
+        {
+            *first = (*first).min(box_idx);
+        }
+    }
+    for (node, box_idx) in candidates {
+        if topology.get_box_image_idx(box_idx).is_some()
+            && matches!(styles[box_idx].height(), PreferredSize::Percent(_))
+            && let Some(parent) = document.try_element_ref(node).and_then(|element| element.parent())
+        {
+            children.entry(parent).or_default().push(box_idx);
+        }
+    }
+    children
+}
+
+// Only exceptional boundaries need storage. Most documents need neither this
+// pass nor a map: all containing elements have zero letter-spacing.
+fn prepare_tracking_spacing(
+    inputs: &LayoutInputs<'_>,
+    styles: &[UsedStyleView<'_>],
+) -> Option<FxHashMap<u32, f32>> {
+    if styles.iter().all(|style| style.letter_spacing() == 0.0) {
+        return None;
+    }
+    let mut spacing = FxHashMap::default();
+    let content = inputs.inline_content;
+    let mut runs = content.text_runs().filter(|run| !run.glyphs.is_empty()).rev().peekable();
+    let level = |index| inputs.text_geometry.map_or(0, |geometry| geometry.bidi().level(index));
+    let mut next = content.characters().len() as u32;
+    let mut next_owner = None;
+    // Walking backwards carries the next visible character and its owner even
+    // through format controls, without looking up either position again.
+    for (index, &character) in content.characters().iter().enumerate().rev() {
+        let glyph = index as u32;
+        while runs.peek().is_some_and(|run| run.glyphs.start > glyph) {
+            runs.next();
+        }
+        let run = runs.peek().filter(|run| run.glyphs.contains(&glyph));
+        let owner = run.map(|run| run.box_idx as usize);
+        if !suppresses_glyph(character) {
+            if let Some(run) = run {
+                let owner = run.box_idx as usize;
+                let fragmented = level(glyph) != level(next);
+                let next_character = content.character_at(next as usize).unwrap_or('\0');
+                let hard_break = next_character == '\n' || is_mandatory_line_break(next_character);
+                if next >= run.glyphs.end || fragmented || hard_break {
+                    let value = next_owner.map_or(0.0, |other| {
+                        if hard_break {
+                            0.0
+                        } else {
+                            boundary_tracking_spacing(inputs.topology, styles, owner, other, fragmented)
+                        }
+                    });
+                    if value != styles[owner].letter_spacing() {
+                        spacing.insert(glyph, value);
+                    }
+                }
+            }
+        }
+        if !suppresses_glyph(character) || character == '\u{00ad}' {
+            next = glyph;
+            next_owner = owner;
+        }
+    }
+    Some(spacing)
+}
+
+// Cross-fragment gaps use the common containing element. A bidi level change
+// fragments intervening inlines, so its spacing comes from their block context.
+fn boundary_tracking_spacing(
+    topology: &LayoutTree,
+    styles: &[UsedStyleView<'_>],
+    owner: usize,
+    other: usize,
+    fragmented: bool,
+) -> f32 {
+    let context = |mut node| {
+        while matches!(topology.get_box_layout_mode(node), Some(LayoutMode::Inline(_))) {
+            let Some(parent) = topology.get_box_parent(node) else { break };
+            node = parent;
+        }
+        node
+    };
+    if context(owner) != context(other) {
+        return 0.0;
+    }
+    let mut left = owner;
+    let mut right = other;
+    let left_depth = topology.ancestors(left).count();
+    let right_depth = topology.ancestors(right).count();
+    for _ in right_depth..left_depth {
+        let Some(parent) = topology.get_box_parent(left) else { return styles[owner].letter_spacing() };
+        left = parent;
+    }
+    for _ in left_depth..right_depth {
+        let Some(parent) = topology.get_box_parent(right) else { return styles[owner].letter_spacing() };
+        right = parent;
+    }
+    while left != right {
+        let (Some(a), Some(b)) = (topology.get_box_parent(left), topology.get_box_parent(right)) else {
+            return styles[owner].letter_spacing();
+        };
+        left = a;
+        right = b;
+    }
+    if fragmented {
+        left = context(left);
+    }
+    styles[left].letter_spacing()
 }
 
 impl<'input> LayoutReader<'input> {
     pub(super) fn new(
         inputs: &LayoutInputs<'input>,
-        box_styles: &'input BoxStyleSnapshot<'input>,
+        pass_context: &'input PassContext<'input>,
     ) -> Self {
         Self {
             document: inputs.document,
@@ -91,14 +315,15 @@ impl<'input> LayoutReader<'input> {
             inline_content: inputs.inline_content,
             font_metrics: inputs.font_metrics,
             image_metrics: inputs.image_metrics,
-            box_styles: &box_styles.styles,
-            paragraph_spacing: &box_styles.paragraph_spacing,
-            tracks_overflow_clips: box_styles.tracks_overflow_clips,
+            pass_context,
+            paragraph_spacing: &pass_context.paragraph_spacing,
+            tracks_overflow_clips: pass_context.tracks_overflow_clips,
+            has_floats: pass_context.has_floats,
             paint: None,
         }
     }
 
-    pub fn with_paint(mut self, paint: html_engine_model::PaintView<'input>) -> Self {
+    pub fn with_paint(mut self, paint: PaintView<'input>) -> Self {
         self.paint = Some(paint);
         self
     }
@@ -109,7 +334,43 @@ impl<'input> LayoutReader<'input> {
 
     /// Geometry reads never consult the reader palette.
     pub fn style(&self, box_idx: usize) -> UsedStyleView<'input> {
-        self.box_styles[box_idx]
+        self.pass_context.styles[box_idx]
+    }
+
+    pub(super) fn has_tracking_spacing(&self) -> bool {
+        self.pass_context.tracking_spacing.is_some()
+    }
+
+    /// Boundary values are shared by intrinsic sizing and final token construction.
+    pub(super) fn tracking_spacing_after(&self, glyph: u32, owner: usize) -> f64 {
+        self.pass_context.tracking_spacing.as_ref().map_or(0.0, |spacing| {
+            f64::from(spacing.get(&glyph).copied().unwrap_or_else(|| self.style(owner).letter_spacing()))
+        })
+    }
+
+    pub(super) fn style_ref(&self, box_idx: usize) -> &'input UsedStyleView<'input> {
+        &self.pass_context.styles[box_idx]
+    }
+
+    pub(crate) fn sizes(&self, box_idx: usize) -> &'input BoxSizeSnapshot {
+        &self.pass_context.sizes[self.pass_context.size_indices[box_idx] as usize]
+    }
+
+    pub fn box_model(&self, box_idx: usize, containing_width: f64) -> ResolvedBoxModel {
+        if containing_width.to_bits() == 0 {
+            self.pass_context.box_models[self.pass_context.box_model_indices[box_idx] as usize]
+        } else {
+            ResolvedBoxModel::new(self.style(box_idx), containing_width)
+        }
+    }
+
+    pub(super) fn adjust_vertical_margins(
+        &self,
+        box_idx: usize,
+        top: f64,
+        bottom: f64,
+    ) -> (f64, f64) {
+        self.paragraph_spacing.resolve(box_idx, top, bottom)
     }
 
     pub fn reader_text_indent(&self, box_idx: usize) -> Option<f64> {
@@ -145,6 +406,10 @@ impl<'input> LayoutReader<'input> {
         self.tracks_overflow_clips
     }
 
+    pub fn has_floats(&self) -> bool {
+        self.has_floats
+    }
+
     pub fn used_style(&self, indices: StyleIndices) -> UsedStyleView<'input> {
         self.font_metrics.used_non_box_style(self.styles, indices).expect("validated style handle")
     }
@@ -170,7 +435,7 @@ impl<'input> LayoutReader<'input> {
         self.topology
     }
 
-    pub fn box_dom_element(&self, box_idx: usize) -> Option<u32> {
+    pub fn box_dom_element(&self, box_idx: usize) -> Option<DomNodeId> {
         self.topology.get_box_dom_element(box_idx)
     }
 
@@ -185,6 +450,12 @@ impl<'input> LayoutReader<'input> {
                 .image(image_idx)
                 .expect("image index should be valid"),
         )
+    }
+
+    pub(super) fn percentage_height_image_children(&self, box_idx: usize) -> &[usize] {
+        self.topology.get_box_dom_element(box_idx)
+            .and_then(|node| self.pass_context.percentage_height_images.get(&node))
+            .map_or(&[], Vec::as_slice)
     }
 
     pub fn image_intrinsic(&self, box_idx: usize) -> Option<ImageIntrinsic> {
@@ -223,7 +494,7 @@ impl<'input> LayoutReader<'input> {
     /// standalone image, capped so its outer height fits the viewport.
     pub fn smart_standalone_image_width(
         &self,
-        policy: crate::ImageSizingPolicy,
+        policy: ImageSizingPolicy,
         box_idx: usize,
         intrinsic: Size,
         available_width: f64,
@@ -240,7 +511,7 @@ impl<'input> LayoutReader<'input> {
             return None;
         }
 
-        if policy != crate::ImageSizingPolicy::SmartStandalone
+        if policy != ImageSizingPolicy::SmartStandalone
             || !standalone
             || intrinsic.width < MIN_SOURCE_WIDTH
         {
@@ -301,8 +572,12 @@ impl<'input> LayoutReader<'input> {
         self.topology.box_count()
     }
 
-    pub fn box_layout_mode(&self, box_idx: usize) -> Option<&LayoutMode> {
+    pub fn box_layout_mode(&self, box_idx: usize) -> Option<&'input LayoutMode> {
         self.topology.get_box_layout_mode(box_idx)
+    }
+
+    pub fn box_table(&self, box_idx: usize) -> Option<&'input TableBox> {
+        self.topology.get_box_table(box_idx)
     }
 
     /// Whether an inline-run child range creates an in-flow line box. Floats

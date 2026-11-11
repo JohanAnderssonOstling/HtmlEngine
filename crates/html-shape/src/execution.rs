@@ -1,15 +1,15 @@
 //! Document shaping execution and targeted pseudo-style reshaping.
 
-use html_engine_model::shaping_contracts;
-use html_style_model::computed_style;
-use html_style_model::open_type;
 use super::*;
+use crate::features::FeatureCache;
 #[cfg(feature = "profiling")]
 use crate::profiling::scope;
+use crate::spans::{ShapingSpans, split_line_breaks};
 use html_engine_model::{grapheme_boundaries, shaping};
 use html_style_model::StyleView;
+use html_style_model::computed_style;
+use html_style_model::open_type;
 use html_text::suppresses_glyph;
-use std::borrow::Cow;
 use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
@@ -18,7 +18,7 @@ fn font_slant(style: StyleView<'_>) -> FontSlant {
     match style.font_style() {
         FontStyle::Normal => FontSlant::Normal,
         FontStyle::Italic => FontSlant::Italic,
-        FontStyle::Oblique => shaping_contracts::font_slant_oblique(style.font.font_oblique_angle),
+        FontStyle::Oblique => FontSlant::oblique(style.font.font_oblique_angle),
     }
 }
 
@@ -36,53 +36,228 @@ fn visible_control(character: char) -> char {
     }
 }
 
-fn shaping_features<'a>(
-    style: StyleView<'_>,
+fn shaping_features<'a, 'font>(
+    style: StyleView<'font>,
     has_tracking: bool,
     storage: &'a mut Vec<OpenTypeFeature>,
+    cache: &mut FeatureCache<'font>,
 ) -> FontFeatures<'a> {
-    *storage = style.open_type_features();
+    storage.clear();
+    storage.extend_from_slice(cache.get(style.font));
     shaping::font_features(storage, &style.font.font_feature_settings, has_tracking)
+}
+
+/// All document-shaping products, independent of viewport width.
+pub struct DocumentShape {
+    pub ellipsis_glyphs: FxHashMap<u32, GlyphId>,
+    pub hyphen_glyphs: FxHashMap<u32, GlyphId>,
+    pub text_geometry: ShapedTextGeometry,
+    pub font_metrics: ShapedFontMetrics,
+}
+
+#[derive(Default)]
+struct SpanScratch {
+    characters: Vec<char>,
+    glyphs: Vec<GlyphId>,
+    text: String,
+}
+
+/// Both full shaping and first-line patches emit disjoint source positions.
+/// Buffers survive successive bidi runs, including filtered and scattered runs.
+fn shape_span(
+    content: &InlineContent,
+    indices: impl Iterator<Item = u32> + Clone,
+    contiguous: Option<Range<u32>>,
+    glyphs: &mut [GlyphId],
+    glyph_start: u32,
+    output: &mut ShapedTextGeometry,
+    style: ShapingStyle<'_>,
+    placement_required: bool,
+    letter_spacing_delta: f32,
+    word_spacing_delta: f32,
+    scratch: &mut SpanScratch,
+    shaper: &mut impl GlyphShaper,
+    resources: &mut GlyphResourceStore,
+) -> Result<(), ShapeError> {
+    let has_soft_hyphen = indices
+        .clone()
+        .any(|index| content.character_at(index as usize) == Some('\u{00ad}'));
+    let source = indices.clone().filter(|&index| {
+        !has_soft_hyphen || content.character_at(index as usize) != Some('\u{00ad}')
+    });
+    if has_soft_hyphen {
+        shape_soft_hyphen_slots(
+            indices.filter(|&index| content.character_at(index as usize) == Some('\u{00ad}')),
+            &style,
+            glyphs,
+            glyph_start,
+            output,
+            shaper,
+            resources,
+        )?;
+    }
+    if source.clone().next().is_none() {
+        return Ok(());
+    }
+    let contiguous = contiguous.filter(|_| !has_soft_hyphen);
+    let characters = if let Some(range) = &contiguous {
+        &content.characters()[range.start as usize..range.end as usize]
+    } else {
+        scratch.characters.clear();
+        scratch.characters.extend(
+            source
+                .clone()
+                .map(|index| content.character_at(index as usize).unwrap_or('?')),
+        );
+        &scratch.characters
+    };
+    scratch.text.clear();
+    scratch
+        .text
+        .extend(characters.iter().copied().map(visible_control));
+    let run_glyphs = if let Some(range) = &contiguous {
+        &mut glyphs[(range.start - glyph_start) as usize..(range.end - glyph_start) as usize]
+    } else {
+        scratch.glyphs.clear();
+        scratch.glyphs.extend(
+            source
+                .clone()
+                .map(|index| glyphs[(index - glyph_start) as usize]),
+        );
+        &mut scratch.glyphs
+    };
+    let native = profile!(
+        "shape.backend_and_registration",
+        resources.shape_run(shaper, shaping::run(&scratch.text, style), run_glyphs)
+    )?;
+    let rtl = style.direction == TextDirection::Rtl;
+    let mut geometry = resolve_run_geometry(
+        native,
+        &scratch.text,
+        characters,
+        run_glyphs.iter().copied(),
+        resources,
+        rtl,
+    );
+    if contiguous.is_none() {
+        for (index, &glyph) in source.clone().zip(&scratch.glyphs) {
+            glyphs[(index - glyph_start) as usize] = glyph;
+        }
+    }
+    if rtl {
+        shape_mirrored_glyphs(
+            source.clone().zip(characters.iter().copied()),
+            &style,
+            output,
+            shaper,
+            resources,
+        )?;
+    }
+    if letter_spacing_delta != 0.0 || word_spacing_delta != 0.0 {
+        geometry = shaping::apply_spacing(
+            geometry,
+            characters.iter().map(|&character| {
+                if suppresses_glyph(character) {
+                    0.0
+                } else {
+                    letter_spacing_delta
+                        + if character == ' ' {
+                            word_spacing_delta
+                        } else {
+                            0.0
+                        }
+                }
+            }),
+            rtl,
+        );
+    }
+    output.push_run_iter(source, geometry, placement_required);
+    Ok(())
 }
 
 /// Shapes prepared logical text without repeating whitespace or case conversion.
 /// The renderer supplies native run geometry when available; per-character
 /// metrics remain the renderer-independent fallback.
-pub fn shape_document(
-    styles: &ComputedStyles,
+pub fn shape_document<'styles>(
+    styles: &'styles ComputedStyles,
     layout_tree: &LayoutTree,
     inline_content: &InlineContent,
     glyphs: &mut [GlyphId],
     first_letter_styles: &FirstLetterStyles,
     glyph_shaper: &mut impl GlyphShaper,
     resources: &mut GlyphResourceStore,
-) -> Result<
-    (
-        FxHashMap<u32, GlyphId>,
-        FxHashMap<u32, GlyphId>,
-        ShapedTextGeometry,
-        ShapedFontMetrics,
-    ),
-    ShapeError,
-> {
+) -> Result<DocumentShape, ShapeError> {
     profile_scope!("shape.document");
+    let mut feature_cache = FeatureCache::default();
+    let mut feature_settings = Vec::new();
+    let (font_metrics, ellipsis_boxes, hyphen_boxes) = resolve_document_metrics(
+        styles,
+        layout_tree,
+        inline_content,
+        glyph_shaper,
+        &mut feature_settings,
+        &mut feature_cache,
+    );
+    let text_geometry = shape_document_spans(
+        styles,
+        layout_tree,
+        inline_content,
+        glyphs,
+        first_letter_styles,
+        &font_metrics,
+        glyph_shaper,
+        resources,
+        &mut feature_settings,
+        &mut feature_cache,
+    )?;
+    let (ellipsis_glyphs, hyphen_glyphs) = shape_synthetic_glyphs(
+        styles,
+        layout_tree,
+        &font_metrics,
+        ellipsis_boxes,
+        hyphen_boxes,
+        glyph_shaper,
+        resources,
+        &mut feature_settings,
+        &mut feature_cache,
+    )?;
+    Ok(DocumentShape {
+        ellipsis_glyphs,
+        hyphen_glyphs,
+        text_geometry,
+        font_metrics,
+    })
+}
+
+fn resolve_document_metrics<'styles>(
+    styles: &'styles ComputedStyles,
+    layout_tree: &LayoutTree,
+    inline_content: &InlineContent,
+    glyph_shaper: &mut impl GlyphShaper,
+    feature_settings: &mut Vec<OpenTypeFeature>,
+    feature_cache: &mut FeatureCache<'styles>,
+) -> (ShapedFontMetrics, Vec<usize>, Vec<usize>) {
     #[cfg(feature = "profiling")]
     let font_setup_scope = scope("shape.font_setup");
     let mut boxes_with_conditional_hyphens = vec![false; layout_tree.box_count()];
     let mut font_content_extents_required = vec![false; layout_tree.box_count()];
-    for run in inline_content.text_runs().filter(|run| !run.glyphs.is_empty()) {
+    for run in inline_content
+        .text_runs()
+        .filter(|run| !run.glyphs.is_empty())
+    {
         // Authored line-height needs the selected face's ascent and descent
         // even when no font-relative CSS length otherwise requests them.
         font_content_extents_required[run.box_idx as usize] = true;
-        boxes_with_conditional_hyphens[run.box_idx as usize] |= run.glyphs.clone().any(|glyph_idx| {
-            inline_content.character_at(glyph_idx as usize) == Some('\u{00ad}')
-        });
+        boxes_with_conditional_hyphens[run.box_idx as usize] |= run
+            .glyphs
+            .clone()
+            .any(|glyph_idx| inline_content.character_at(glyph_idx as usize) == Some('\u{00ad}'));
     }
     let mut ellipsis_boxes = Vec::new();
     let mut hyphen_boxes = Vec::new();
     let empty_inline_metrics_required = inline_content.inline_items().iter().any(|item| matches!(item.kind, InlineItemKind::InlineBoundary { inline_start, inline_end } if inline_start == inline_end));
-    let mut dense_box_metrics_required = empty_inline_metrics_required
-        || inline_content.characters().contains(&'\t');
+    let mut dense_box_metrics_required =
+        empty_inline_metrics_required || inline_content.characters().contains(&'\t');
     for idx in 0..layout_tree.box_count() {
         let style = get_style(styles, layout_tree, idx);
         let paints_inline_content_box = matches!(
@@ -98,9 +273,11 @@ pub fn shape_document(
         // A non-replaced inline's painted content box uses the selected
         // face's ascent and descent, independently of line-height. Request
         // those metrics even when no font-relative CSS length needs them.
-        dense_box_metrics_required |= style.requires_font_metrics() || style.line_height_is_normal();
+        dense_box_metrics_required |=
+            style.requires_font_metrics() || style.line_height_is_normal();
         font_content_extents_required[idx] |=
-            !computed_style::text_decoration_lines_is_empty(style.text_decoration_lines()) || paints_inline_content_box;
+            !computed_style::text_decoration_lines_is_empty(style.text_decoration_lines())
+                || paints_inline_content_box;
         if style.text_overflow() == TextOverflow::Ellipsis && style.overflow_x().clips() {
             ellipsis_boxes.push(idx);
         }
@@ -145,10 +322,11 @@ pub fn shape_document(
             html_style_model::FontSynthesisStyle,
             Option<&str>,
             Option<LanguageId>,
+            [&[OpenTypeFeature]; 5],
         ),
         FontRelativeMetrics,
     >::default();
-    let mut resolve_font_metrics = |style: StyleView<'_>| {
+    let mut resolve_font_metrics = |style: StyleView<'styles>| {
         let family = style.font_family().and_then(|id| styles.string(id));
         let key = (
             style.font_size().to_bits(),
@@ -158,33 +336,42 @@ pub fn shape_document(
             style.font.font_synthesis_style,
             family,
             style.language(),
+            [
+                style.font.font_variant_caps_features.as_slice(),
+                style.font.font_variant_numeric_features.as_slice(),
+                style.font.font_variant_ligature_features.as_slice(),
+                style.font.font_kerning_features.as_slice(),
+                style.font.font_feature_settings.as_slice(),
+            ],
         );
         if let Some(metrics) = font_metric_cache.get(&key).copied() {
-            return Ok::<_, ShapeError>(metrics);
+            return metrics;
         }
         let metrics = if style.font_size() > 0.0 && style.font_weight() > 0 {
+            // Metric probes contain isolated characters, so no tracking adjustment applies.
+            let features = shaping_features(style, false, feature_settings, feature_cache);
             let mut request = shaping::style(
                 style.font_size(),
                 style.font_weight(),
                 font_slant(style),
-                0,
                 family,
             );
             request.font_stretch = style.font.font_stretch;
             request.font_synthesis_style = style.font.font_synthesis_style;
             request.language = style.language().and_then(|id| styles.language(id));
-            glyph_shaper.font_relative_metrics(&request)?
+            request.font_features = &features;
+            glyph_shaper.font_relative_metrics(&request)
         } else {
             FontRelativeMetrics::default()
         };
         font_metric_cache.insert(key, metrics);
-        Ok(metrics)
+        metrics
     };
     let box_metrics = if dense_box_metrics_required {
         let mut metrics = Vec::with_capacity(layout_tree.box_count());
         for box_idx in 0..layout_tree.box_count() {
             let style = get_style(styles, layout_tree, box_idx);
-            metrics.push(resolve_font_metrics(style)?);
+            metrics.push(resolve_font_metrics(style));
         }
         BoxFontMetrics::Dense(metrics)
     } else if font_content_extents_required
@@ -193,11 +380,11 @@ pub fn shape_document(
     {
         let mut metric_ids = vec![0; layout_tree.box_count()];
         let mut distinct_metrics = Vec::<FontRelativeMetrics>::new();
-        for box_idx in (0..layout_tree.box_count())
-            .filter(|&box_idx| font_content_extents_required[box_idx])
+        for box_idx in
+            (0..layout_tree.box_count()).filter(|&box_idx| font_content_extents_required[box_idx])
         {
             let style = get_style(styles, layout_tree, box_idx);
-            let font_metrics = resolve_font_metrics(style)?;
+            let font_metrics = resolve_font_metrics(style);
             let metric_idx = distinct_metrics
                 .iter()
                 .position(|metrics| *metrics == font_metrics)
@@ -218,21 +405,24 @@ pub fn shape_document(
 
     // Text pseudo styles and table columns do not necessarily have their own
     // formatting box. Resolve their metrics before layout consumes used values.
-    let non_box_styles = || styles.text_pseudo_styles().chain(layout_tree.non_box_styles())
-        .chain(styles.text_spacing_origins());
+    let non_box_styles = || {
+        styles
+            .text_pseudo_styles()
+            .chain(layout_tree.non_box_styles())
+            .chain(styles.text_spacing_origins())
+    };
     // Pseudo text needs selected-face layout bounds just like ordinary text,
     // including styles with an authored line-height and no font-relative units.
     let non_box_metrics = if styles.text_pseudo_styles().next().is_some()
         || non_box_styles().any(|indices| {
             let style = styles.view(indices).expect("validated style handle");
             style.requires_font_metrics() || style.line_height_is_normal()
-        })
-    {
+        }) {
         let mut metrics = FxHashMap::default();
         for indices in non_box_styles() {
             if let Entry::Vacant(entry) = metrics.entry(indices) {
                 let style = styles.view(indices).expect("validated style handle");
-                entry.insert(resolve_font_metrics(style)?);
+                entry.insert(resolve_font_metrics(style));
             }
         }
         RequiredFontMetrics::Required(metrics)
@@ -280,6 +470,21 @@ pub fn shape_document(
 
     #[cfg(feature = "profiling")]
     drop(font_metrics_scope);
+    (font_metrics, ellipsis_boxes, hyphen_boxes)
+}
+
+fn shape_document_spans<'styles>(
+    styles: &'styles ComputedStyles,
+    layout_tree: &LayoutTree,
+    inline_content: &InlineContent,
+    glyphs: &mut [GlyphId],
+    first_letter_styles: &FirstLetterStyles,
+    font_metrics: &ShapedFontMetrics,
+    glyph_shaper: &mut impl GlyphShaper,
+    resources: &mut GlyphResourceStore,
+    feature_settings: &mut Vec<OpenTypeFeature>,
+    feature_cache: &mut FeatureCache<'styles>,
+) -> Result<ShapedTextGeometry, ShapeError> {
     let mut text_geometry = profile!(
         "shape.allocate_geometry",
         ShapedTextGeometry::with_len(inline_content.characters().len())
@@ -288,9 +493,7 @@ pub fn shape_document(
         "shape.resolve_bidi",
         ResolvedBidi::new(styles, layout_tree, inline_content)
     );
-    let mut scattered_characters = Vec::new();
-    let mut scattered_glyphs = Vec::new();
-    let mut normalized_text = String::new();
+    let mut scratch = SpanScratch::default();
     let spans = profile!(
         "shape.plan_spans",
         plan_shaping_spans(
@@ -302,141 +505,54 @@ pub fn shape_document(
             &bidi,
         )
     );
-    for (span, bidi_level) in spans.into_iter().flat_map(|span| span.split_bidi(&bidi)) {
-        #[cfg(feature = "profiling")]
-        let span_buffers_scope = scope("shape.span_buffers_and_styles");
-        let box_idx = span.shaping_box;
-        // Conditional hyphens are source break opportunities, not input to
-        // contextual shaping. Some native shapers give them advance or sever
-        // Arabic joining even when their own advance is later suppressed.
-        let has_soft_hyphen = span.character_indices().any(|index| {
-            inline_content.character_at(index as usize) == Some('\u{00ad}')
-        });
-        let source_indices = span.character_indices().filter(|&index| {
-            !has_soft_hyphen
-                || inline_content.character_at(index as usize) != Some('\u{00ad}')
-        });
-        let contiguous_range = if has_soft_hyphen { None } else { span.contiguous_range() };
-        let style = span.style(styles, layout_tree);
-        let font_size = font_metrics.resolved_font_size(style, box_idx);
-        let (paint_colors, placement_required) = span.paint_and_placement(styles, layout_tree, &font_metrics);
-        let paint_colors = paint_colors.map(|colors| {
-            if has_soft_hyphen {
-                span.character_indices().zip(colors).filter_map(|(index, color)| {
-                    (inline_content.character_at(index as usize) != Some('\u{00ad}'))
-                        .then_some(color)
-                }).collect()
-            } else {
-                colors
-            }
-        });
-        let has_tracking = span.has_tracking(styles, layout_tree, &font_metrics);
-        let mut feature_settings = Vec::new();
-        let font_features = shaping_features(style, has_tracking, &mut feature_settings);
-
-        if has_soft_hyphen {
-            let control_style =
+    let mut bidi_spans = ShapingSpans::default();
+    for planned_span in spans.iter() {
+        planned_span.split_bidi(&bidi, inline_content.characters(), &mut bidi_spans);
+        for (span, bidi_level) in bidi_spans.bidi_iter() {
+            let style = span.style(styles, layout_tree);
+            let font_size = font_metrics.resolved_font_size(style, span.shaping_box);
+            let (placement_required, has_tracking) =
+                span.spacing_flags(styles, layout_tree, font_metrics);
+            let font_features =
+                shaping_features(style, has_tracking, feature_settings, feature_cache);
+            let mut run_style =
                 resolve_shaping_style(styles, style, font_size, &font_features, bidi_level);
-            shape_soft_hyphen_slots(
-                span.character_indices().filter(|&index| {
-                    inline_content.character_at(index as usize) == Some('\u{00ad}')
-                }),
-                &control_style, glyphs, 0, &mut text_geometry, glyph_shaper, resources,
-            )?;
-            if source_indices.clone().next().is_none() {
-                continue;
-            }
-        }
-
-        // Out-of-flow descendants can interleave source indices. Gather those
-        // spans in reusable scratch; ordinary spans borrow prepared characters.
-        let characters: &[char] = if let Some(range) = &contiguous_range {
-            &inline_content.characters()[range.start as usize..range.end as usize]
-        } else {
-            scattered_characters.clear();
-            scattered_characters.extend(
-                source_indices
-                    .clone()
-                    .map(|index| inline_content.character_at(index as usize).unwrap_or('?')),
-            );
-            &scattered_characters
-        };
-        normalized_text.clear();
-        normalized_text.extend(characters.iter().copied().map(visible_control));
-
-        let mut run_style =
-            resolve_shaping_style(styles, style, font_size, &font_features, bidi_level);
-        run_style.cursive_joining = span.cursive_joining;
-        if contiguous_range.is_none() {
-            scattered_glyphs.clear();
-            scattered_glyphs.extend(source_indices.clone().map(|index| {
-                GlyphId(
-                    inline_content
-                        .character_at(index as usize)
-                        .unwrap_or_default() as u32,
-                )
-            }));
-        }
-        #[cfg(feature = "profiling")]
-        drop(span_buffers_scope);
-        let native_geometry = profile!(
-            "shape.backend_and_registration",
-            if !normalized_text.is_empty() {
-                let request = shaping::run(&normalized_text, run_style, paint_colors.as_deref());
-                let run_glyphs = if let Some(range) = &contiguous_range {
-                    &mut glyphs[range.start as usize..range.end as usize]
-                } else {
-                    scattered_glyphs.as_mut_slice()
-                };
-                let geometry = if characters.iter().any(|&ch| ch == '\n' || html_text::is_mandatory_line_break(ch)) {
-                    // Segment breaks terminate shaping runs. Asking a backend to
-                    // shape text and a newline together can change the preceding
-                    // line's ascent/baseline (and is invalid for several native
-                    // shaping APIs), so register these glyphs independently.
-                    resources.shape_characters(glyph_shaper, &request, run_glyphs)?;
-                    None
-                } else {
-                    resources.shape_run(glyph_shaper, request, run_glyphs)?
-                };
-                geometry
-            } else {
-                None
-            }
-        );
-        #[cfg(feature = "profiling")]
-        let geometry_scope = scope("shape.graphemes_and_geometry");
-        if contiguous_range.is_none() {
-            for (index, &glyph) in source_indices.clone().zip(&scattered_glyphs) {
-                glyphs[index as usize] = glyph;
-            }
-        }
-        let geometry = resolve_run_geometry(
-            native_geometry,
-            &normalized_text,
-            characters,
-            source_indices.clone().map(|index| glyphs[index as usize]),
-            resources,
-            bidi_level % 2 == 1,
-        );
-        if bidi_level % 2 == 1 {
-            shape_mirrored_glyphs(
-                source_indices.clone().zip(characters.iter().copied()),
-                &run_style,
+            run_style.cursive_joining = span.cursive_joining;
+            shape_span(
+                inline_content,
+                span.character_indices(),
+                span.contiguous_range(),
+                glyphs,
+                0,
                 &mut text_geometry,
+                run_style,
+                placement_required,
+                0.0,
+                0.0,
+                &mut scratch,
                 glyph_shaper,
                 resources,
             )?;
         }
-        #[cfg(feature = "profiling")]
-        drop(geometry_scope);
-        profile!("shape.retain_geometry", {
-            text_geometry.push_run_iter(source_indices, geometry, placement_required);
-        });
     }
 
     profile!("shape.finish_runs", text_geometry.finish_runs());
     text_geometry.bidi = bidi;
 
+    Ok(text_geometry)
+}
+
+fn shape_synthetic_glyphs<'styles>(
+    styles: &'styles ComputedStyles,
+    layout_tree: &LayoutTree,
+    font_metrics: &ShapedFontMetrics,
+    ellipsis_boxes: Vec<usize>,
+    hyphen_boxes: Vec<usize>,
+    glyph_shaper: &mut impl GlyphShaper,
+    resources: &mut GlyphResourceStore,
+    feature_settings: &mut Vec<OpenTypeFeature>,
+    feature_cache: &mut FeatureCache<'styles>,
+) -> Result<(FxHashMap<u32, GlyphId>, FxHashMap<u32, GlyphId>), ShapeError> {
     // Text-overflow markers are shaped once per applicable container so width
     // changes can relayout without calling the renderer's font backend again.
     // They are not inserted into InlineContent: synthetic paint must not become
@@ -453,24 +569,33 @@ pub fn shape_document(
     ] {
         for box_idx in boxes {
             let style = get_style(styles, layout_tree, box_idx);
-            let mut resolved = shaping::style(
+            let tracking = font_metrics.resolve_text_spacing(
+                styles,
+                style.text.letter_spacing,
                 font_metrics.resolved_font_size(style, box_idx),
-                style.font_weight(),
-                font_slant(style),
-                0,
-                style.font_family().and_then(|id| styles.string(id)),
+            ) != 0.0;
+            let features = shaping_features(style, tracking, feature_settings, feature_cache);
+            let level = u8::from(style.direction() == TextDirection::Rtl);
+            let resolved = resolve_shaping_style(
+                styles,
+                style,
+                font_metrics.resolved_font_size(style, box_idx),
+                &features,
+                level,
             );
-            resolved.font_stretch = style.font.font_stretch;
-            resolved.font_synthesis_style = style.font.font_synthesis_style;
-            let glyph =
-                resources.shape_glyph(glyph_shaper, shaping::glyph(character, &resolved))?;
-            output.insert(box_idx as u32, glyph);
+            let mut glyphs = [GlyphId(0)];
+            resources.shape_run(
+                glyph_shaper,
+                shaping::run(character.encode_utf8(&mut [0; 4]), resolved),
+                &mut glyphs,
+            )?;
+            output.insert(box_idx as u32, glyphs[0]);
         }
     }
 
     #[cfg(feature = "profiling")]
     drop(synthetic_scope);
-    Ok((ellipsis_glyphs, hyphen_glyphs, text_geometry, font_metrics))
+    Ok((ellipsis_glyphs, hyphen_glyphs))
 }
 
 fn resolve_shaping_style<'a>(
@@ -484,23 +609,24 @@ fn resolve_shaping_style<'a>(
         font_size,
         style.font_weight(),
         font_slant(style),
-        style.color(),
         style.font_family().and_then(|id| styles.string(id)),
     );
     resolved.font_stretch = style.font.font_stretch;
     resolved.font_synthesis_style = style.font.font_synthesis_style;
     resolved.font_features = font_features;
-    resolved.caps_synthesis =
-        if !style.font.font_synthesis_small_caps || !style.font_variant_small_caps() {
-            CapsSynthesis::None
-        } else if style.font.font_variant_caps_features.iter().any(|feature| {
-            open_type::open_type_feature_tag_bytes(*(feature)) == open_type::open_type_feature_kind_tag_bytes(OpenTypeFeatureKind::CapitalsToSmallCaps)
-                && open_type::open_type_feature_value(*(feature)) != 0
-        }) {
-            CapsSynthesis::AllSmallCaps
-        } else {
-            CapsSynthesis::SmallCaps
-        };
+    resolved.caps_synthesis = if !style.font.font_synthesis_small_caps
+        || !style.font_variant_small_caps()
+    {
+        CapsSynthesis::None
+    } else if style.font.font_variant_caps_features.iter().any(|feature| {
+        open_type::open_type_feature_tag_bytes(*(feature))
+            == open_type::open_type_feature_kind_tag_bytes(OpenTypeFeatureKind::CapitalsToSmallCaps)
+            && open_type::open_type_feature_value(*(feature)) != 0
+    }) {
+        CapsSynthesis::AllSmallCaps
+    } else {
+        CapsSynthesis::SmallCaps
+    };
     resolved.cjk_font_family = style.cjk_font_family().and_then(|id| styles.string(id));
     resolved.language = style.language().and_then(|id| styles.language(id));
     resolved.direction = if bidi_level % 2 == 1 {
@@ -522,8 +648,10 @@ fn shape_soft_hyphen_slots(
     glyph_shaper: &mut impl GlyphShaper,
     resources: &mut GlyphResourceStore,
 ) -> Result<(), ShapeError> {
-    let glyph = resources.shape_glyph(glyph_shaper, shaping::glyph('\u{00ad}', style))?;
-    let zero = shaping_contracts::shaped_text_run_new(Arc::from([0.0]), Arc::from([true, true]));
+    let mut paint = [GlyphId(0)];
+    resources.shape_run(glyph_shaper, shaping::run("\u{00ad}", *style), &mut paint)?;
+    let glyph = paint[0];
+    let zero = ShapedTextRun::new(Arc::from([0.0]), Arc::from([true, true]));
     for index in indices {
         glyphs[(index - glyph_start) as usize] = glyph;
         geometry.push_run_iter(std::iter::once(index), zero.clone(), false);
@@ -542,8 +670,15 @@ fn shape_mirrored_glyphs(
         let Some(mirrored) = unicode_bidi_mirroring::get_mirrored(character) else {
             continue;
         };
-        let glyph = resources.shape_glyph(glyph_shaper, shaping::glyph(mirrored, style))?;
-        geometry.mirrored_glyphs.insert(index, glyph);
+        let mut paint = [GlyphId(0)];
+        let mut replacement_style = *style;
+        replacement_style.direction = TextDirection::Ltr;
+        resources.shape_run(
+            glyph_shaper,
+            shaping::run(mirrored.encode_utf8(&mut [0; 4]), replacement_style),
+            &mut paint,
+        )?;
+        geometry.mirrored_glyphs.insert(index, paint[0]);
     }
     Ok(())
 }
@@ -574,7 +709,7 @@ fn resolve_run_geometry(
                 .collect::<Arc<[f32]>>();
             // Fallback boundaries are already canonical; only native geometry
             // needs its cluster boundaries intersected with Unicode graphemes.
-            shaping_contracts::shaped_text_run_new(advances, grapheme_boundaries(text, characters.len()))
+            ShapedTextRun::new(advances, grapheme_boundaries(text, characters.len()))
         });
     shaping::suppress_advances(
         &mut geometry,
@@ -632,103 +767,38 @@ pub fn reshape_range_with_style(
             base_style.text.word_spacing,
             base_style.font_size(),
         );
-    let mut feature_settings = Vec::new();
-    let font_features = shaping_features(style, letter_spacing != 0.0, &mut feature_settings);
+    let mut feature_settings = style.open_type_features();
+    let font_features = shaping::font_features(
+        &mut feature_settings,
+        &style.font.font_feature_settings,
+        letter_spacing != 0.0,
+    );
     let needs_placement = letter_spacing != 0.0
         || word_spacing != 0.0
         || letter_spacing_delta != 0.0
         || word_spacing_delta != 0.0;
-    for (range, level) in bidi.level_runs(range) {
-        let source_characters = &inline_content.characters()[range.start as usize..range.end as usize];
-        let has_soft_hyphen = source_characters.contains(&'\u{00ad}');
-        let source_indices = range.clone().filter(|&index| {
-            !has_soft_hyphen
-                || inline_content.character_at(index as usize) != Some('\u{00ad}')
-        });
-        let characters: Cow<'_, [char]> = if has_soft_hyphen {
-            Cow::Owned(source_characters.iter().copied().filter(|&ch| ch != '\u{00ad}').collect())
-        } else {
-            Cow::Borrowed(source_characters)
-        };
-        let text = characters
-            .iter()
-            .copied()
-            .map(visible_control)
-            .collect::<String>();
+    let mut scratch = SpanScratch::default();
+    for (range, level) in bidi.level_runs(range).flat_map(|(range, level)| {
+        split_line_breaks(range, inline_content.characters()).map(move |range| (range, level))
+    }) {
         let run_style =
             resolve_shaping_style(styles, style, style.font_size(), &font_features, level);
-        let start = (range.start - glyph_start) as usize;
-        let end = (range.end - glyph_start) as usize;
-        let mut scattered_glyphs = if has_soft_hyphen {
-            source_indices.clone().map(|index| glyphs[(index - glyph_start) as usize]).collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-        let run_glyphs = if has_soft_hyphen {
-            scattered_glyphs.as_mut_slice()
-        } else {
-            &mut glyphs[start..end]
-        };
-        let native = if text.is_empty() {
-            None
-        } else {
-            resources.shape_run(
-                glyph_shaper,
-                shaping::run(&text, run_style, None),
-                run_glyphs,
-            )?
-        };
-        let mut geometry = resolve_run_geometry(
-            native,
-            &text,
-            &characters,
-            run_glyphs.iter().copied(),
+        shape_span(
+            inline_content,
+            range.clone(),
+            Some(range),
+            glyphs,
+            glyph_start,
+            text_geometry,
+            run_style,
+            needs_placement,
+            letter_spacing_delta,
+            word_spacing_delta,
+            &mut scratch,
+            glyph_shaper,
             resources,
-            level % 2 == 1,
-        );
-        if has_soft_hyphen {
-            for (index, &glyph) in source_indices.clone().zip(&scattered_glyphs) {
-                glyphs[(index - glyph_start) as usize] = glyph;
-            }
-        }
-        if level % 2 == 1 {
-            shape_mirrored_glyphs(
-                source_indices.clone().zip(characters.iter().copied()),
-                &run_style,
-                text_geometry,
-                glyph_shaper,
-                resources,
-            )?;
-        }
-        if letter_spacing_delta != 0.0 || word_spacing_delta != 0.0 {
-            let spacing_deltas = characters.iter().map(|character| {
-                if suppresses_glyph(*character) {
-                    return 0.0;
-                }
-                letter_spacing_delta
-                    + if *character == ' ' {
-                        word_spacing_delta
-                    } else {
-                        0.0
-                    }
-            });
-            geometry = shaping::apply_spacing(geometry, spacing_deltas, level % 2 == 1);
-        }
-        text_geometry.replace_indexed_range(range.clone(), source_indices, geometry, needs_placement);
-        if has_soft_hyphen {
-            shape_soft_hyphen_slots(
-                range.filter(|&index| {
-                    inline_content.character_at(index as usize) == Some('\u{00ad}')
-                }),
-                &run_style,
-                glyphs,
-                glyph_start,
-                text_geometry,
-                glyph_shaper,
-                resources,
-            )?;
-            text_geometry.finish_runs();
-        }
+        )?;
     }
+    text_geometry.finish_runs();
     Ok(())
 }

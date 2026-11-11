@@ -208,24 +208,6 @@ fn resolve_preferred_content_width(
     }
 }
 
-pub(super) fn resolve_block_margin_left(
-    style: UsedStyleView<'_>,
-    containing_direction: TextDirection,
-    containing_width: f64,
-    border_width: f64,
-) -> f64 {
-    let left = style.margin_left().resolve(containing_width);
-    let left_auto = style.margin_left_auto();
-
-    // With an automatic width, the width absorbs the remaining inline space
-    // and automatic margins resolve to zero.
-    if matches!(style.width(), PreferredSize::Auto) {
-        return if left_auto { 0.0 } else { left };
-    }
-
-    resolve_margin_left_for_used_width(style, containing_direction, containing_width, containing_width, border_width)
-}
-
 /// Tables resolve automatic margins against their final intrinsic width,
 /// even when their authored width is `auto`.
 pub(super) fn resolve_margin_left_for_used_width(
@@ -240,6 +222,26 @@ pub(super) fn resolve_margin_left_for_used_width(
     let left_auto = style.margin_left_auto();
     let right_auto = style.margin_right_auto();
 
+    resolve_margin_left_from_edges(
+        left,
+        right,
+        left_auto,
+        right_auto,
+        containing_direction,
+        available_width,
+        border_width,
+    )
+}
+
+pub(super) fn resolve_margin_left_from_edges(
+    left: f64,
+    right: f64,
+    left_auto: bool,
+    right_auto: bool,
+    containing_direction: TextDirection,
+    available_width: f64,
+    border_width: f64,
+) -> f64 {
     // Floats can reduce the available inline space without changing the
     // containing block used to resolve percentage margins.
     let remaining = available_width

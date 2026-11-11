@@ -19,7 +19,7 @@ fn bound_style_handles_include_generated_text_and_both_text_pseudos() {
     let (document, styles) = styled.into_parts();
     let target = document
         .node_ids()
-        .find(|&node| document.get_dom_id(node) == Some("target"))
+        .find(|&node| document.try_element_ref(node).and_then(|element| element.id()) == Some("target"))
         .unwrap();
     let handles = styles.bound_styles().collect::<HashSet<_>>();
     for handle in [

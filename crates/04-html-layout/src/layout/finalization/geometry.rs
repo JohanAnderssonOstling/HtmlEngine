@@ -1,4 +1,4 @@
-use crate::layout_model::{BoxGeometry, LineInlineBoxFragment};
+use html_engine_model::{BoxGeometry, LineInlineBoxFragment};
 use kurbo::Rect;
 
 use super::{FinalizationScratch, FragmentWriter, LayoutReader};
@@ -9,7 +9,6 @@ pub(super) fn publish_inline_box_geometry(
     fragments: &FragmentWriter<'_>,
     scratch: &mut FinalizationScratch,
 ) {
-    profile_scope!("finalize.inline_geometry");
     let bounds = &mut scratch.inline_bounds;
     bounds.clear();
     bounds.resize(reader.box_count(), None);

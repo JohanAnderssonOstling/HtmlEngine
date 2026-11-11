@@ -1,12 +1,11 @@
 //! Own float-fit probes and recursive execution for one child.
 use super::floats::layout_float;
-use super::fragmentation::forced_break_offset;
 use super::margins::{FlowParticipation, MarginStrut, collapse_before_child};
 use super::{BlockFlowInput, BlockFlowState, LaidOutChild, PreparedChild};
 use crate::layout::box_constraints::resolve_margin_left_for_used_width;
-use crate::layout::box_positioning::translate_laid_out_output;
+use crate::layout::box_s03_finish::translate_laid_out_output;
 use crate::layout::{BoxLayoutRequest, LayoutEngine, measure_resolved_box_isolated};
-use crate::layout_model::BoxType;
+use html_engine_model::BoxType;
 use html_style_model::{Display, PositionMode};
 use kurbo::{Insets, Point, Size, Vec2};
 
@@ -81,7 +80,8 @@ pub(super) fn layout_child(
             {
                 0.0
             } else {
-                clearance_chain_leading_margin - engine.floats.hypothetical_clearance_rewind()
+                clearance_chain_leading_margin
+                    - engine.scratch.floats.hypothetical_clearance_rewind()
             };
             profile.before = MarginStrut::from_margin(profile.own_before);
             profile.after = MarginStrut::from_margin(profile.own_after);
@@ -114,16 +114,11 @@ pub(super) fn layout_child(
     // it must still start after that strut. For ordinary children the
     // strut was consumed and cleared above, so this expression reduces to
     // the already-resolved border position.
-    if let Some(context) = engine.floats.current_float_context_mut() {
+    if let Some(context) = engine.scratch.floats.current_float_context_mut() {
         context
             .note_source_position(input.position.y + flow.y_offset + flow.pending_margin.resolve());
     }
 
-    flow.y_offset += forced_break_offset(
-        child_style.break_before(),
-        input.position.y + flow.y_offset,
-        input.fragment_height,
-    );
 
     let child_indent = engine
         .reader
@@ -149,14 +144,17 @@ pub(super) fn layout_child(
         } else {
             0.0
         };
-    let inline_offset = crate::layout::box_sizing::block_inline_alignment_offset(engine, &resolved);
+    let inline_offset =
+        crate::layout::box_s01_sizing::block_inline_alignment_offset(engine, &resolved);
     let mut child_pos = input.position
         + Vec2::new(
             inline_offset,
             flow.y_offset + relative_collapse_through_offset,
         );
+
     if engine.reader.box_uses_float_context(child_idx)
         && let Some(float_context) = engine
+            .scratch
             .floats
             .current_float_context()
             .filter(|context| !context.is_empty())
@@ -170,6 +168,7 @@ pub(super) fn layout_child(
             .max(1.0);
         let mut selected = false;
         for _ in 0..float_context.band_count() + 2 {
+
             let (band_left, band_right) = float_context.available(
                 candidate_y,
                 probe_height,
@@ -258,10 +257,14 @@ pub(super) fn layout_child(
         && !flow.pending_margin.is_empty())
     .then_some(input.position.y + flow.y_offset + flow.pending_margin.resolve());
     if let Some(floor) = inherited_hypothetical_margin {
-        engine.floats.push_hypothetical_clearance_floor(floor);
+        engine
+            .scratch
+            .floats
+            .push_hypothetical_clearance_floor(floor);
     }
     if runtime_leading_clearance_rewind.abs() > 0.001 {
         engine
+            .scratch
             .floats
             .push_hypothetical_clearance_rewind(runtime_leading_clearance_rewind);
     }
@@ -269,11 +272,14 @@ pub(super) fn layout_child(
     if child_style.display() == Display::Table {
         // A table's intrinsic width is finalized by its formatting context,
         // after generic block sizing and float fitting have placed it.
-        let direction = engine.reader
+        let direction = engine
+            .reader
             .get_parent(child_idx)
             .map(|parent| engine.reader.style(parent).direction())
             .unwrap_or(child_style.direction());
-        let available_width = resolved.request.auto_width_limit
+        let available_width = resolved
+            .request
+            .auto_width_limit
             .unwrap_or(input.available_width);
         let used_left = resolve_margin_left_for_used_width(
             child_style,
@@ -287,10 +293,10 @@ pub(super) fn layout_child(
         child_pos += offset;
     }
     if runtime_leading_clearance_rewind.abs() > 0.001 {
-        engine.floats.pop_hypothetical_clearance_rewind();
+        engine.scratch.floats.pop_hypothetical_clearance_rewind();
     }
     if inherited_hypothetical_margin.is_some() {
-        engine.floats.pop_hypothetical_clearance_floor();
+        engine.scratch.floats.pop_hypothetical_clearance_floor();
     }
     Some(LaidOutChild {
         child_idx,

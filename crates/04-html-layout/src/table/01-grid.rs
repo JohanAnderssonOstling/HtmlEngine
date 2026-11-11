@@ -1,7 +1,5 @@
 use crate::layout::{LayoutEngine, UsedBorderInsets};
-use crate::layout_model::{
-    LayoutMode, TableColumnGroupSpan, TableColumnTrack, TableColumnWidthHint,
-};
+use html_engine_model::{LayoutMode, TableColumnGroupSpan, TableColumnTrack, TableColumnWidthHint};
 use html_style_model::{BorderCollapseMode, TableLayoutMode, UsedPreferredSize};
 
 use super::borders::CollapsedBorderGrid;
@@ -21,26 +19,25 @@ pub(super) struct PreparedTableGrid {
 }
 
 pub(super) fn prepare_table_grid(
-    session: &LayoutEngine<'_, '_>,
+    engine: &LayoutEngine<'_, '_>,
     table_box_idx: usize,
     rows: &[u32],
 ) -> PreparedTableGrid {
-    let style = session.reader.style(table_box_idx);
+    let style = engine.reader.style(table_box_idx);
     let fixed_mode = matches!(style.table_layout(), TableLayoutMode::Fixed)
         && !matches!(style.width(), UsedPreferredSize::Auto);
     let collapsed = matches!(style.border_collapse(), BorderCollapseMode::Collapse);
-    let (row_groups, columns, column_groups, hints) =
-        match session.reader.box_layout_mode(table_box_idx) {
-            Some(LayoutMode::Table(table)) => (
-                table.row_groups.as_slice(),
-                table.columns.as_slice(),
-                table.column_groups.as_slice(),
-                table.column_width_hints.as_slice(),
-            ),
-            _ => (&[][..], &[][..], &[][..], &[][..]),
-        };
+    let (row_groups, columns, column_groups, hints) = match engine.reader.box_table(table_box_idx) {
+        Some(table) => (
+            table.row_groups.as_slice(),
+            table.columns.as_slice(),
+            table.column_groups.as_slice(),
+            table.column_width_hints.as_slice(),
+        ),
+        _ => (&[][..], &[][..], &[][..], &[][..]),
+    };
     let (grid, track_sources, logical_to_effective) =
-        effective_table_grid(session, table_grid(session, rows), hints, fixed_mode);
+        effective_table_grid(engine, table_grid(engine, rows), hints, fixed_mode);
     let column_width_hints = track_sources
         .iter()
         .filter_map(|&source| hints.get(source).copied())
@@ -70,7 +67,7 @@ pub(super) fn prepare_table_grid(
         .collect::<Vec<_>>();
     let collapsed_borders = (collapsed && grid.column_count > 0).then(|| {
         CollapsedBorderGrid::build(
-            &session.reader,
+            &engine.reader,
             table_box_idx,
             rows,
             row_groups,
@@ -103,28 +100,28 @@ pub(super) fn prepare_table_grid(
     }
 }
 
-fn table_grid(session: &LayoutEngine<'_, '_>, rows: &[u32]) -> TableGrid {
+fn table_grid(engine: &LayoutEngine<'_, '_>, rows: &[u32]) -> TableGrid {
     let mut group_end = 0;
     build_table_grid(rows.iter().enumerate().map(|(row_position, &row_idx)| {
         // A cell cannot span beyond its row group. Clamp here so both track
         // placement and height distribution use the same effective rowspan.
         if row_position == group_end {
-            let row_parent = session.reader.get_parent(row_idx as usize);
+            let row_parent = engine.reader.get_parent(row_idx as usize);
             group_end += rows[row_position..]
                 .iter()
                 .take_while(|&&candidate| {
-                    session.reader.get_parent(candidate as usize) == row_parent
+                    engine.reader.get_parent(candidate as usize) == row_parent
                 })
                 .count();
         }
         let remaining_group_rows = group_end - row_position;
-        let cells = match session.reader.box_layout_mode(row_idx as usize) {
+        let cells = match engine.reader.box_layout_mode(row_idx as usize) {
             Some(LayoutMode::TableRow(row)) => row.cells.as_slice(),
             _ => &[],
         };
         cells.iter().map(move |&cell_idx| {
             let cell_idx = cell_idx as usize;
-            let (colspan, rowspan) = match session.reader.box_layout_mode(cell_idx) {
+            let (colspan, rowspan) = match engine.reader.box_layout_mode(cell_idx) {
                 Some(LayoutMode::TableCell(cell)) => (cell.colspan, cell.rowspan),
                 _ => (1, 1),
             };
@@ -134,7 +131,7 @@ fn table_grid(session: &LayoutEngine<'_, '_>, rows: &[u32]) -> TableGrid {
 }
 
 fn effective_table_grid(
-    session: &LayoutEngine<'_, '_>,
+    engine: &LayoutEngine<'_, '_>,
     mut grid: TableGrid,
     hints: &[TableColumnWidthHint],
     fixed_mode: bool,
@@ -162,7 +159,7 @@ fn effective_table_grid(
     for (column, effective) in logical_to_effective.iter_mut().enumerate() {
         if *effective == usize::MAX
             || hints.get(column).is_some_and(|hint| {
-                let (minimum, width) = column_width_constraints(&session.reader, *hint);
+                let (minimum, width) = column_width_constraints(&engine.reader, *hint);
                 minimum > 0.0 || width.is_some_and(|width| width > 0.0)
             })
         {

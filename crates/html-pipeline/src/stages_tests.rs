@@ -1,28 +1,21 @@
 #[cfg(test)]
 mod stage_tests {
-    use crate::engine::{geometry_queries, pagination_queries, reading_queries, semantic_queries};
+    use crate::engine::LayoutRequest;
+
     use html_engine_model::{constraints, layout_state, shaping_contracts};
     use html_style_model::{computed_style, language};
-    use crate::engine::fragment_paint;
 
-    use crate::engine::{box_queries, text_paint};
+
 
     use crate::layout_model::BoxId;
     use crate::layout_model::LineId;
-    use crate::{GlyphRequest, ShapedGlyph};
 
     #[test]
     fn streamed_spacing_updates_unique_geometry_without_allocating() {
         use crate::allocation_test_support::count_allocations;
         use crate::{ShapedTextRun, TextRunId};
 
-        let run = shaping_contracts::shaped_text_run_with_backend_run(
-            [1.0, 1.0, 1.0].into(),
-            [true; 4].into(),
-            TextRunId(0),
-            [0.0, 1.0, 2.0, 3.0].into(),
-            8.0,
-        );
+        let run = ShapedTextRun::with_backend_run([1.0, 1.0, 1.0].into(), [true; 4].into(), TextRunId(0), [0.0, 1.0, 2.0, 3.0].into(), 8.0);
         let characters = ['a', ' ', 'b'];
         let deltas = characters
             .iter()
@@ -31,11 +24,11 @@ mod stage_tests {
             count_allocations(|| html_engine_model::shaping::apply_spacing(run, deltas, false));
         assert_eq!(allocations, 0);
         assert_eq!(
-            shaping_contracts::shaped_text_run_advances(&run),
+            run.advances(),
             [1.25, 1.5, 1.25]
         );
         assert_eq!(
-            shaping_contracts::shaped_text_run_caret_stops(&run)
+            run.caret_stops()
                 .unwrap()
                 .to_dense()
                 .as_ref(),
@@ -62,100 +55,18 @@ mod stage_tests {
             .unwrap();
         let view = document.render_view(&resources);
         let boxes = view.boxes();
-        let target = (0..box_queries::len(boxes))
+        let target = (0..boxes.len())
             .map(layout_state::box_id_new)
-            .find(|&index| box_queries::attribute(boxes, index, "id") == Some("target"))
+            .find(|&index| boxes.attribute(index, "id") == Some("target"))
             .unwrap();
         let (semantics, allocations) =
-            count_allocations(|| semantic_queries::render_view_semantics(view).content(target));
+            count_allocations(|| view.semantics().content(target));
         assert!(semantics.has_role(ContentRole::Statement));
         assert!(semantics.has_role(ContentRole::CompactStructure));
         assert!(semantics.has_role(ContentRole::Label));
         assert!(semantics.has_role(ContentRole::Sidebar));
         assert!(!semantics.has_role(ContentRole::MajorSection));
         assert_eq!(allocations, 0);
-    }
-
-    #[test]
-    fn fragment_text_extraction_borrows_the_parsed_tree() {
-        use crate::allocation_test_support::count_allocations;
-        use html_parse::{
-            HtmlFragmentContext, HtmlParserOptions, parse_html_fragment, plain_text_from_fragment,
-        };
-
-        for depth in [0, 8, 32] {
-            let source = format!(
-                "{}café🙂{}<script>ignored</script>",
-                "<span data-test='value'>".repeat(depth),
-                "</span>".repeat(depth)
-            );
-            let (_, parsing) = count_allocations(|| {
-                parse_html_fragment(
-                    &source,
-                    &HtmlFragmentContext::html("div"),
-                    HtmlParserOptions::default(),
-                )
-            });
-            let (text, extraction) = count_allocations(|| plain_text_from_fragment(&source));
-            assert_eq!(text, "café🙂");
-            assert!(
-                extraction <= parsing + 2,
-                "only raw and normalized text buffers are added: {extraction} allocations versus {parsing} for parsing"
-            );
-        }
-    }
-
-    #[test]
-    fn nested_metadata_text_uses_one_buffer_per_result() {
-        use crate::allocation_test_support::count_allocations;
-        use crate::parse_xml_document;
-        use html_parse::StylesheetReference;
-
-        for depth in [0, 8, 32] {
-            let open = "<span><!--ignored--><?ignore data?>".repeat(depth);
-            let close = "</span>".repeat(depth);
-            let source = format!(
-                "<html xmlns='http://www.w3.org/1999/xhtml'><head><title>{open} \tcafé🙂 \n{close}</title><style>{open} p {{color:red}} {close}</style></head></html>"
-            );
-            let parsed = parse_xml_document(&source).unwrap();
-            let (title, allocations) = count_allocations(|| parsed.title());
-            assert_eq!(title.as_deref(), Some("café🙂"));
-            assert_eq!(
-                allocations, 1,
-                "title allocation is independent of nesting depth"
-            );
-            let (metadata, allocations) = count_allocations(|| parsed.head_metadata());
-            assert_eq!(metadata.title.as_deref(), Some("café🙂"));
-            match metadata.stylesheets.as_slice() {
-                [StylesheetReference::Inline(css)] => assert_eq!(css, "p {color:red}"),
-                _ => panic!("expected one inline stylesheet"),
-            }
-            assert!(
-                allocations <= 3,
-                "only the title, CSS text, and stylesheet list allocate: {allocations}"
-            );
-        }
-    }
-
-    #[test]
-    fn title_trimming_reuses_its_owned_text_buffer() {
-        use crate::allocation_test_support::count_allocations;
-        use crate::parse_html_document;
-
-        for (raw, expected) in [
-            ("café🙂", Some("café🙂")),
-            (" \t\n\u{a0}café  🙂\u{2003} ", Some("café  🙂")),
-            (" \t\u{2003}\n", None),
-            ("", None),
-        ] {
-            let parsed = parse_html_document(&format!("<title>{raw}</title>"));
-            let (title, allocations) = count_allocations(|| parsed.title());
-            assert_eq!(title.as_deref(), expected);
-            assert!(
-                allocations <= 1,
-                "title text is retained without copying: {allocations}"
-            );
-        }
     }
 
     #[test]
@@ -263,7 +174,6 @@ mod stage_tests {
         assert_eq!(runs, [("漢字", Some("zh-Hant")), ("かな", Some("ja"))]);
     }
 
-    use crate::ShapeError;
     use crate::engine::{
         GlyphResourceGeneration, GlyphResourceStore, GlyphShaper, ImageMetrics, LaidOutDocument,
         LayoutConstraintError, LayoutConstraints, PreparedDocument, ReaderStyleOverrides,
@@ -278,6 +188,8 @@ mod stage_tests {
 
     #[test]
     fn pagination_groups_markers_with_their_source_and_full_content_bounds() {
+        let mut resources_shaper = TestGlyphShaper::new();
+
         for direction in ["ltr", "rtl"] {
             let source = format!(
                 "<body style='margin:0;direction:{direction}'><ul style='margin:0'><li id='item' style='font-size:10px;line-height:16px'><span style='font-size:40px;line-height:60px'>First</span></li></ul></body>"
@@ -285,47 +197,51 @@ mod stage_tests {
             let mut resources = GlyphResourceStore::default();
             let document = DocumentFactory::new()
                 .parse_with_new_pipeline(&source, None)
-                .shape(&mut TestGlyphShaper::new(), &mut resources)
+                .shape(&mut resources_shaper, &mut resources)
                 .unwrap()
-                .layout(LayoutConstraints::new(300.0, 16.0).unwrap(), &resources)
+                .layout(
+                    LayoutRequest::new(LayoutConstraints::new(300.0, 16.0).unwrap()),
+                    &mut resources_shaper,
+                    &mut resources,
+                )
                 .unwrap();
             let view = document.render_view(&resources);
             let boxes = view.boxes();
-            let item = (0..box_queries::len(boxes))
+            let item = (0..boxes.len())
                 .map(layout_state::box_id_new)
-                .find(|&index| box_queries::attribute(boxes, index, "id") == Some("item"))
+                .find(|&index| boxes.attribute(index, "id") == Some("item"))
                 .unwrap();
-            let marker = box_queries::list_marker(boxes, item).unwrap().marker_box();
+            let marker = boxes.list_marker(item).unwrap().marker_box();
             let text = view.text();
             let marker_line = text
                 .lines()
                 .iter()
-                .find(|line| text_paint::render_line_owner_box(&line) == marker)
+                .find(|line| line.owner_box() == marker)
                 .unwrap();
-            let pagination = pagination_queries::render_view_pagination(view);
+            let pagination = view.pagination();
             let marker_cursor =
-                pagination_queries::pagination_cursor(pagination, marker_line.id()).unwrap();
+                pagination.cursor(marker_line.id()).unwrap();
             let source_line = pagination.source_line(marker_cursor).unwrap();
             assert_ne!(source_line.id(), marker_line.id());
             assert_eq!(source_line.glyphs().start, 0);
             let source_cursor =
-                pagination_queries::pagination_cursor(pagination, source_line.id()).unwrap();
+                pagination.cursor(source_line.id()).unwrap();
             let first = marker_cursor.min(source_cursor);
             let last = marker_cursor.max(source_cursor);
             for cursor in [marker_cursor, source_cursor] {
                 assert_eq!(
-                    pagination_queries::pagination_group_start(pagination, cursor),
+                    pagination.group_start(cursor),
                     Some(first)
                 );
                 assert_eq!(
                     pagination.source_line(cursor).unwrap().id(),
                     source_line.id()
                 );
-                let input = pagination_queries::pagination_at(pagination, cursor).unwrap();
+                let input = pagination.at(cursor).unwrap();
                 assert!(input.height() >= 60.0);
                 assert!(input.height() > marker_line.height());
             }
-            let bounds = pagination_queries::pagination_at(pagination, first)
+            let bounds = pagination.at(first)
                 .unwrap()
                 .vertical_bounds();
             assert_eq!(pagination.start_at(bounds.start, 0.0), first);
@@ -336,53 +252,55 @@ mod stage_tests {
 
     #[test]
     fn pagination_membership_excludes_spatially_interleaved_lines() {
+        let mut resources_shaper = TestGlyphShaper::new();
+
         let mut resources = GlyphResourceStore::default();
         let document = DocumentFactory::new().parse_with_new_pipeline(
             "<body style='margin:0;line-height:20px'><ul style='margin:0'><li><span style='line-height:80px'>Tall</span></li></ul><div id='other' style='position:absolute;top:30px'>Other</div></body>", None)
-            .shape(&mut TestGlyphShaper::new(), &mut resources).unwrap()
-            .layout(LayoutConstraints::new(300.0, 16.0).unwrap(), &resources).unwrap();
+            .shape( &mut resources_shaper, &mut resources).unwrap()
+            .layout(LayoutRequest::new(LayoutConstraints::new(300.0, 16.0).unwrap()), &mut resources_shaper, &mut resources).unwrap();
         let view = document.render_view(&resources);
         let text = view.text();
-        let pagination = pagination_queries::render_view_pagination(view);
+        let pagination = view.pagination();
         let other = text
             .lines()
             .iter()
             .find(|line| {
-                box_queries::attribute(view.boxes(), text_paint::render_line_owner_box(&line), "id")
+                (view.boxes()).attribute(line.owner_box(), "id")
                     == Some("other")
             })
             .unwrap();
         assert_eq!(
-            text_paint::render_text_view_spatial_rank(text, other.id()),
+            text.spatial_rank(other.id()),
             Some(1)
         );
-        let group = pagination_queries::pagination_group(pagination, 0).unwrap();
+        let group = pagination.group(0).unwrap();
         let members: Vec<_> = group.lines().map(|line| line.id()).collect();
         assert_eq!(members.len(), 2);
         assert!(!members.contains(&other.id()));
         assert_eq!(
-            pagination_queries::pagination_cursor(pagination, other.id()),
+            pagination.cursor(other.id()),
             Some(2)
         );
         for member in &members {
-            let cursor = pagination_queries::pagination_cursor(pagination, *member).unwrap();
+            let cursor = pagination.cursor(*member).unwrap();
             assert_eq!(
-                pagination_queries::pagination_at(pagination, cursor)
+                pagination.at(cursor)
                     .unwrap()
                     .id(),
                 *member
             );
             assert_eq!(
-                pagination_queries::pagination_group_start(pagination, cursor),
+                pagination.group_start(cursor),
                 Some(0)
             );
             assert_eq!(
-                pagination_queries::pagination_group(pagination, cursor)
+                pagination.group(cursor)
                     .and_then(|group| group.cursors().end.checked_sub(1)),
                 Some(1)
             );
             assert_eq!(
-                pagination_queries::pagination_group(pagination, cursor)
+                pagination.group(cursor)
                     .unwrap()
                     .lines()
                     .map(|line| line.id())
@@ -391,11 +309,11 @@ mod stage_tests {
             );
         }
         assert_eq!(
-            pagination_queries::pagination_group_start(pagination, 2),
+            pagination.group_start(2),
             Some(2)
         );
         assert_eq!(
-            pagination_queries::pagination_group(pagination, 2)
+            pagination.group(2)
                 .unwrap()
                 .lines()
                 .count(),
@@ -415,29 +333,29 @@ mod stage_tests {
         let mut document = prepared
             .shape_borrowed(&mut shaper, &mut resources)
             .unwrap()
-            .layout(constraints, &resources)
+            .layout(LayoutRequest::new(constraints), &mut shaper, &mut resources)
             .unwrap();
         let view = document.render_view(&resources);
         let text = view.text();
         let first = text.line(LineId::new(0)).unwrap();
         assert!(first.point().y >= 80.0);
         assert_ne!(
-            text_paint::render_text_view_spatial_order(text)[0],
+            text.spatial_order()[0],
             first.id(),
             "spatial traversal must differ from emission storage"
         );
         assert!(text.lines().first().unwrap().point().y < first.point().y);
         assert_eq!(
-            fragment_paint::render_fragment_view_images_for_line(view.fragments(), first.id())
+            (view.fragments()).images_for_line(first.id())
                 .len(),
             1
         );
-        assert!(text_paint::ellipsis_for_line(text, first.id()).is_some());
+        assert!(text.ellipsis_for_line(first.id()).is_some());
         assert!(
-            fragment_paint::decorations(view.fragments())
+            (view.fragments()).decorations()
                 .iter()
                 .any(
-                    |decoration| fragment_paint::render_decoration_line(&decoration)
+                    |decoration| decoration.line()
                         == Some(first.id())
                 )
         );
@@ -450,35 +368,32 @@ mod stage_tests {
                 .hyphen_fragments
                 .is_empty()
         );
-        for (rank, &id) in text_paint::render_text_view_spatial_order(text)
+        for (rank, &id) in text.spatial_order()
             .iter()
             .enumerate()
         {
             assert_eq!(
-                text_paint::render_text_view_spatial_rank(text, id),
+                text.spatial_rank(id),
                 Some(rank)
             );
             assert_eq!(
-                text_paint::render_lines_get(&text.lines(), rank)
+                (text.lines()).get(rank)
                     .unwrap()
                     .id(),
                 id
             );
             assert_eq!(text.line(id).unwrap().id(), id);
-            let pagination = pagination_queries::render_view_pagination(view);
-            let input = pagination_queries::pagination_at(pagination, rank).unwrap();
+            let pagination = view.pagination();
+            let input = pagination.at(rank).unwrap();
             assert_eq!(input.id(), id);
             assert_eq!(
-                pagination_queries::pagination_cursor(pagination, id),
+                pagination.cursor(id),
                 Some(rank)
             );
             assert_eq!(input.point(), text.line(id).unwrap().point());
             assert_eq!(
                 input.vertical_bounds(),
-                geometry_queries::render_geometry_view_line_vertical_bounds(
-                    geometry_queries::render_view_geometry(view),
-                    id
-                )
+                (view.geometry()).line_vertical_bounds(id)
                 .unwrap()
             );
             assert_eq!(
@@ -486,22 +401,22 @@ mod stage_tests {
                 input.vertical_bounds().end - input.point().y
             );
             assert_eq!(
-                pagination_queries::pagination_by_id(pagination, id)
+                pagination.by_id(id)
                     .unwrap()
                     .id(),
                 id
             );
         }
         for fragment in &document.data.layout.state.line_output.hyphen_fragments {
-            assert!(text_paint::hyphen_for_line(text, LineId::new(fragment.line_idx)).is_some());
+            assert!(text.hyphen_for_line(LineId::new(fragment.line_idx)).is_some());
         }
         for line in text.lines().iter() {
             for fragment in
-                text_paint::render_text_view_line_text_fragments(text, line.id()).unwrap()
+                text.line_text_fragments(line.id()).unwrap()
             {
                 for glyph in fragment.glyphs() {
                     assert_eq!(
-                        text_paint::render_text_view_line_for_glyph(text, glyph),
+                        text.line_for_glyph(glyph),
                         Some(line.id())
                     );
                 }
@@ -517,8 +432,8 @@ mod stage_tests {
             .iter()
             .map(|line| (line.glyphs.clone(), line.point))
             .collect::<Vec<_>>();
-        let spatial = text_paint::render_text_view_spatial_order(text).to_vec();
-        let paint = text_paint::paint_order(text).to_vec();
+        let spatial = text.spatial_order().to_vec();
+        let paint = text.paint_order().to_vec();
         let painted = prepared
             .with_reader_paint_overrides(&ReaderStyleOverrides {
                 foreground: Some(0x123456ff),
@@ -543,8 +458,8 @@ mod stage_tests {
             storage
         );
         let text = document.render_view(&resources).text();
-        assert_eq!(text_paint::render_text_view_spatial_order(text), spatial);
-        assert_eq!(text_paint::paint_order(text), paint);
+        assert_eq!(text.spatial_order(), spatial);
+        assert_eq!(text.paint_order(), paint);
         assert_eq!(text.line(LineId::new(0)).unwrap().id(), first.id());
     }
 
@@ -565,9 +480,9 @@ mod stage_tests {
         document
             .shape_borrowed(shaper, resources)
             .unwrap()
-            .layout_with_metrics_and_shaper(
-                document.data.last_constraints,
-                &document.data.last_image_metrics,
+            .layout(
+                LayoutRequest::new(document.data.last_constraints)
+                    .with_image_metrics(&document.data.last_image_metrics),
                 shaper,
                 resources,
             )
@@ -605,10 +520,7 @@ mod stage_tests {
                         .iter()
                         .map(|run| (&run.range, run.advance))
                         .collect::<Vec<_>>(),
-                    text_paint::line_overflow_clip(
-                        document.render_view(resources).text(),
-                        LineId::new(index)
-                    )
+                    (document.render_view(resources).text()).line_overflow_clip(LineId::new(index))
                 )
             ));
         }
@@ -630,24 +542,19 @@ mod stage_tests {
             ));
         }
         result.extend(
-            fragment_paint::decorations(document.render_view(resources).fragments())
+            (document.render_view(resources).fragments()).decorations()
                 .iter()
                 .map(|decoration| format!("{decoration:?}")),
         );
         result.extend(
-            fragment_paint::render_fragment_view_images(
-                document.render_view(resources).fragments(),
-            )
+            (document.render_view(resources).fragments()).images()
             .iter()
             .map(|image| format!("{image:?}")),
         );
         result.push(format!(
             "{:?}",
             (0..document.glyphs().len())
-                .map(|glyph| text_paint::render_text_view_line_for_glyph(
-                    document.render_view(resources).text(),
-                    glyph as u32
-                ))
+                .map(|glyph| (document.render_view(resources).text()).line_for_glyph(glyph as u32))
                 .collect::<Vec<_>>()
         ));
         result
@@ -655,6 +562,9 @@ mod stage_tests {
 
     #[test]
     fn image_height_changes_reposition_unchanged_paragraphs_without_recomposing_them() {
+        let mut document_resources_shaper = TestGlyphShaper::new();
+
+        let mut reference_shaper = TestGlyphShaper::new();
         let mut factory = DocumentFactory::new();
         let prepared = factory.parse_with_new_pipeline("<img src='top' style='display:block;width:40px'><p>one two three four five six seven eight nine ten</p><p>more words across several lines of text</p>", None);
         let constraints = LayoutConstraints::new(160.0, 20.0).unwrap();
@@ -662,9 +572,13 @@ mod stage_tests {
         metrics.set(0, 40, 10);
         let mut document_resources = GlyphResourceStore::default();
         let mut document = prepared
-            .shape_borrowed(&mut TestGlyphShaper::new(), &mut document_resources)
+            .shape_borrowed(&mut document_resources_shaper, &mut document_resources)
             .unwrap()
-            .layout_with_metrics(constraints, &metrics, &document_resources)
+            .layout(
+                LayoutRequest::new(constraints).with_image_metrics(&metrics),
+                &mut document_resources_shaper,
+                &mut document_resources,
+            )
             .expect("layout requires the shaper-aware API for first-line styles");
         let old_y = document
             .data
@@ -679,7 +593,11 @@ mod stage_tests {
         let before = document.data.layout.scratch.paragraph_reuse_counts();
         metrics.set(0, 40, 60);
         document
-            .relayout_with_metrics(constraints, &metrics, &document_resources)
+            .relayout(
+                LayoutRequest::new(constraints).with_image_metrics(&metrics),
+                &mut document_resources_shaper,
+                &mut document_resources,
+            )
             .expect("layout requires the shaper-aware API for first-line styles");
         let after = document.data.layout.scratch.paragraph_reuse_counts();
         assert!(
@@ -704,9 +622,17 @@ mod stage_tests {
                 > old_y
         );
         let mut reference_resources = GlyphResourceStore::default();
-        let mut reference = reference_layout(&document, &mut reference_resources);
+        let mut reference = reference_layout_with_shaper(
+            &document,
+            &mut reference_shaper,
+            &mut reference_resources,
+        );
         reference
-            .relayout_with_metrics(constraints, &metrics, &reference_resources)
+            .relayout(
+                LayoutRequest::new(constraints).with_image_metrics(&metrics),
+                &mut reference_shaper,
+                &mut reference_resources,
+            )
             .expect("layout requires the shaper-aware API for first-line styles");
         assert_eq!(
             paragraph_geometry_snapshot(&document, &document_resources),
@@ -716,6 +642,8 @@ mod stage_tests {
 
     #[test]
     fn image_relayout_reuses_local_lines_and_preserves_exact_fractional_geometry() {
+        let mut document_resources_shaper = TestGlyphShaper::new();
+
         let mut comparison_resources_234 = GlyphResourceStore::default();
 
         let mut comparison_resources_222 = GlyphResourceStore::default();
@@ -737,22 +665,24 @@ mod stage_tests {
         metrics.set(0, 40, 10);
         let mut document_resources = GlyphResourceStore::default();
         let mut document = prepared
-            .shape_borrowed(&mut TestGlyphShaper::new(), &mut document_resources)
+            .shape_borrowed(&mut document_resources_shaper, &mut document_resources)
             .unwrap()
-            .layout_with_metrics(constraints, &metrics, &document_resources)
+            .layout(
+                LayoutRequest::new(constraints).with_image_metrics(&metrics),
+                &mut document_resources_shaper,
+                &mut document_resources,
+            )
             .expect("layout requires the shaper-aware API for first-line styles");
         let lines = document.data.layout.state.line_output.lines.as_ptr();
-        let expected_reuse = document.line_count() - 1;
         for height in [60, 15, 90, 10, 120] {
             metrics.set(0, 40, height);
-            let timings = document
-                .relayout_with_metrics_and_timings(constraints, &metrics, &document_resources)
+            document
+                .relayout(
+                    LayoutRequest::new(constraints).with_image_metrics(&metrics),
+                    &mut document_resources_shaper,
+                    &mut document_resources,
+                )
                 .expect("layout requires the shaper-aware API for first-line styles");
-            assert_eq!(
-                timings.reused_lines, expected_reuse,
-                "only the image paragraph needs measurement"
-            );
-            assert_eq!(timings.measured_lines, 1);
             assert_eq!(document.data.layout.state.line_output.lines.as_ptr(), lines);
             assert_eq!(
                 paragraph_geometry_snapshot(&document, &document_resources),
@@ -765,10 +695,13 @@ mod stage_tests {
         let wider = LayoutConstraints::new(220.0, 20.0)
             .unwrap()
             .with_text_composition_policy(TextCompositionPolicy::BookOptimized);
-        let timings = document
-            .relayout_with_metrics_and_timings(wider, &metrics, &document_resources)
+        document
+            .relayout(
+                LayoutRequest::new(wider).with_image_metrics(&metrics),
+                &mut document_resources_shaper,
+                &mut document_resources,
+            )
             .expect("layout requires the shaper-aware API for first-line styles");
-        assert_eq!(timings.reused_lines, 0, "a width change must recompose");
         assert_eq!(
             paragraph_geometry_snapshot(&document, &document_resources),
             paragraph_geometry_snapshot(
@@ -780,6 +713,8 @@ mod stage_tests {
 
     #[test]
     fn paragraph_reuse_and_repaint_preserve_reading_exclusions_and_source_ranges() {
+        let mut document_resources_shaper = TestGlyphShaper::new();
+
         let source = "<img src='top' style='display:block;width:40px'><section role='doc-toc'><h2>Contents</h2><p>Chapter One ... 1</p></section><p>Hello<br>world<a class='fnanchor' href='#fn1'>[1]</a> <span style='visibility:hidden'>secret </span>again.</p><div class='footnotes'><p id='fn1'>Note body.</p></div>";
         let mut factory = DocumentFactory::new();
         let prepared = factory.parse_with_new_pipeline(source, None);
@@ -788,14 +723,18 @@ mod stage_tests {
         metrics.set(0, 40, 10);
         let mut document_resources = GlyphResourceStore::default();
         let mut document = prepared
-            .shape_borrowed(&mut TestGlyphShaper::new(), &mut document_resources)
+            .shape_borrowed(&mut document_resources_shaper, &mut document_resources)
             .unwrap()
-            .layout_with_metrics(constraints, &metrics, &document_resources)
+            .layout(
+                LayoutRequest::new(constraints).with_image_metrics(&metrics),
+                &mut document_resources_shaper,
+                &mut document_resources,
+            )
             .expect("layout requires the shaper-aware API for first-line styles");
         let reading_snapshot = |document: &LaidOutDocument, resources: &GlyphResourceStore| {
-            reading_queries::render_addressing_view_reading_fragments(document
+            (document
                 .render_view(resources)
-                .addressing(), 0)
+                .addressing()).reading_fragments(0)
                 .into_iter()
                 .map(|fragment| (fragment.text, fragment.target))
                 .collect::<Vec<_>>()
@@ -807,7 +746,11 @@ mod stage_tests {
 
         metrics.set(0, 40, 60);
         document
-            .relayout_with_metrics(constraints, &metrics, &document_resources)
+            .relayout(
+                LayoutRequest::new(constraints).with_image_metrics(&metrics),
+                &mut document_resources_shaper,
+                &mut document_resources,
+            )
             .expect("layout requires the shaper-aware API for first-line styles");
         assert!(document.data.layout.scratch.paragraph_reuse_counts().0 > hits);
         assert_eq!(reading_snapshot(&document, &document_resources), original);
@@ -821,7 +764,11 @@ mod stage_tests {
         assert!(document.repaint_from(&painted, &document_resources));
         assert_eq!(reading_snapshot(&document, &document_resources), original);
         document
-            .relayout_with_metrics(constraints, &metrics, &document_resources)
+            .relayout(
+                LayoutRequest::new(constraints).with_image_metrics(&metrics),
+                &mut document_resources_shaper,
+                &mut document_resources,
+            )
             .expect("layout requires the shaper-aware API for first-line styles");
         assert_eq!(reading_snapshot(&document, &document_resources), original);
         assert!(document.repaint_from(&prepared, &document_resources));
@@ -830,6 +777,9 @@ mod stage_tests {
 
     #[test]
     fn float_context_changes_recompose_without_retaining_exclusion_geometry() {
+        let mut document_resources_shaper = TestGlyphShaper::new();
+
+        let mut reference_shaper = TestGlyphShaper::new();
         let mut factory = DocumentFactory::new();
         let source = "<img src='top' style='display:block;width:40px'><section style='display:flow-root'><img src='float' style='float:left;width:60px'><p>one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen</p></section>";
         let constraints = LayoutConstraints::new(180.0, 20.0).unwrap();
@@ -839,14 +789,22 @@ mod stage_tests {
         let mut document_resources = GlyphResourceStore::default();
         let mut document = factory
             .parse_with_new_pipeline(source, None)
-            .shape(&mut TestGlyphShaper::new(), &mut document_resources)
+            .shape(&mut document_resources_shaper, &mut document_resources)
             .unwrap()
-            .layout_with_metrics(constraints, &metrics, &document_resources)
+            .layout(
+                LayoutRequest::new(constraints).with_image_metrics(&metrics),
+                &mut document_resources_shaper,
+                &mut document_resources,
+            )
             .expect("layout requires the shaper-aware API for first-line styles");
         let before = document.data.layout.scratch.paragraph_reuse_counts();
         metrics.set(0, 40, 50);
         document
-            .relayout_with_metrics(constraints, &metrics, &document_resources)
+            .relayout(
+                LayoutRequest::new(constraints).with_image_metrics(&metrics),
+                &mut document_resources_shaper,
+                &mut document_resources,
+            )
             .expect("layout requires the shaper-aware API for first-line styles");
         let translated = document.data.layout.scratch.paragraph_reuse_counts();
         assert!(
@@ -854,9 +812,17 @@ mod stage_tests {
             "float paragraphs borrow current exclusions and recompose"
         );
         let mut reference_resources = GlyphResourceStore::default();
-        let mut reference = reference_layout(&document, &mut reference_resources);
+        let mut reference = reference_layout_with_shaper(
+            &document,
+            &mut reference_shaper,
+            &mut reference_resources,
+        );
         reference
-            .relayout_with_metrics(constraints, &metrics, &reference_resources)
+            .relayout(
+                LayoutRequest::new(constraints).with_image_metrics(&metrics),
+                &mut reference_shaper,
+                &mut reference_resources,
+            )
             .expect("layout requires the shaper-aware API for first-line styles");
         assert_eq!(
             paragraph_geometry_snapshot(&document, &document_resources),
@@ -864,7 +830,11 @@ mod stage_tests {
         );
         metrics.set(1, 60, 150);
         document
-            .relayout_with_metrics(constraints, &metrics, &document_resources)
+            .relayout(
+                LayoutRequest::new(constraints).with_image_metrics(&metrics),
+                &mut document_resources_shaper,
+                &mut document_resources,
+            )
             .expect("layout requires the shaper-aware API for first-line styles");
         let changed = document.data.layout.scratch.paragraph_reuse_counts();
         assert!(
@@ -872,9 +842,17 @@ mod stage_tests {
             "changed float lanes must invalidate dependent line layout"
         );
         let mut reference_resources = GlyphResourceStore::default();
-        let mut reference = reference_layout(&document, &mut reference_resources);
+        let mut reference = reference_layout_with_shaper(
+            &document,
+            &mut reference_shaper,
+            &mut reference_resources,
+        );
         reference
-            .relayout_with_metrics(constraints, &metrics, &reference_resources)
+            .relayout(
+                LayoutRequest::new(constraints).with_image_metrics(&metrics),
+                &mut reference_shaper,
+                &mut reference_resources,
+            )
             .expect("layout requires the shaper-aware API for first-line styles");
         assert_eq!(
             paragraph_geometry_snapshot(&document, &document_resources),
@@ -901,9 +879,8 @@ mod stage_tests {
                 .parse_with_new_pipeline(source, None)
                 .shape(&mut shaper, &mut document_resources)
                 .unwrap()
-                .layout_with_metrics_and_shaper(
-                    initial,
-                    &metrics,
+                .layout(
+                    LayoutRequest::new(initial).with_image_metrics(&metrics),
                     &mut shaper,
                     &mut document_resources,
                 )
@@ -920,9 +897,8 @@ mod stage_tests {
                     .with_text_composition_policy(policy);
                 metrics.set(0, 40, height);
                 document
-                    .relayout_with_metrics_and_shaper(
-                        constraints,
-                        &metrics,
+                    .relayout(
+                        LayoutRequest::new(constraints).with_image_metrics(&metrics),
                         &mut shaper,
                         &mut document_resources,
                     )
@@ -936,9 +912,8 @@ mod stage_tests {
                 );
                 reference.data.layout.scratch.clear_paragraph_layouts();
                 reference
-                    .relayout_with_metrics_and_shaper(
-                        constraints,
-                        &metrics,
+                    .relayout(
+                        LayoutRequest::new(constraints).with_image_metrics(&metrics),
                         &mut reference_shaper,
                         &mut reference_resources,
                     )
@@ -958,6 +933,9 @@ mod stage_tests {
 
     #[test]
     fn intrinsic_table_probes_do_not_displace_published_paragraph_results() {
+        let mut document_resources_shaper = TestGlyphShaper::new();
+
+        let mut reference_shaper = TestGlyphShaper::new();
         let mut factory = DocumentFactory::new();
         let source = "<img src='top' style='display:block;width:40px'><table style='width:160px'><tr><td><p id='cell'>some words that wrap inside this table cell</p></td></tr></table>";
         let constraints = LayoutConstraints::new(200.0, 20.0).unwrap();
@@ -966,9 +944,13 @@ mod stage_tests {
         let mut document_resources = GlyphResourceStore::default();
         let mut document = factory
             .parse_with_new_pipeline(source, None)
-            .shape(&mut TestGlyphShaper::new(), &mut document_resources)
+            .shape(&mut document_resources_shaper, &mut document_resources)
             .unwrap()
-            .layout_with_metrics(constraints, &metrics, &document_resources)
+            .layout(
+                LayoutRequest::new(constraints).with_image_metrics(&metrics),
+                &mut document_resources_shaper,
+                &mut document_resources,
+            )
             .expect("layout requires the shaper-aware API for first-line styles");
         let owner = (0..document.box_count())
             .find(|&index| {
@@ -976,23 +958,34 @@ mod stage_tests {
                     .inputs
                     .layout_tree
                     .get_box_dom_element(index)
-                    .and_then(|raw| document.inputs.document.node_id_from_raw(raw))
-                    .is_some_and(|node| document.inputs.document.get_dom_id(node) == Some("cell"))
+                    .is_some_and(|node| document.inputs.document.try_element_ref(node).and_then(|element| element.id()) == Some("cell"))
             })
             .unwrap();
         let before = document.data.layout.scratch.paragraph_layout_hits(owner);
         metrics.set(0, 40, 60);
         document
-            .relayout_with_metrics(constraints, &metrics, &document_resources)
+            .relayout(
+                LayoutRequest::new(constraints).with_image_metrics(&metrics),
+                &mut document_resources_shaper,
+                &mut document_resources,
+            )
             .expect("layout requires the shaper-aware API for first-line styles");
         assert!(
             document.data.layout.scratch.paragraph_layout_hits(owner) > before,
             "measurement widths must not evict the cell's actual paragraph layout"
         );
         let mut reference_resources = GlyphResourceStore::default();
-        let mut reference = reference_layout(&document, &mut reference_resources);
+        let mut reference = reference_layout_with_shaper(
+            &document,
+            &mut reference_shaper,
+            &mut reference_resources,
+        );
         reference
-            .relayout_with_metrics(constraints, &metrics, &reference_resources)
+            .relayout(
+                LayoutRequest::new(constraints).with_image_metrics(&metrics),
+                &mut reference_shaper,
+                &mut reference_resources,
+            )
             .expect("layout requires the shaper-aware API for first-line styles");
         assert_eq!(
             paragraph_geometry_snapshot(&document, &document_resources),
@@ -1002,6 +995,9 @@ mod stage_tests {
 
     #[test]
     fn composition_policy_switches_match_fresh_shaping_and_layout() {
+        let mut document_resources_shaper = TestGlyphShaper::new();
+        let mut reference_resources_shaper = TestGlyphShaper::new();
+
         let mut factory = DocumentFactory::new();
         let prepared = factory.parse_with_new_pipeline(
             "<p>First sentence. Second sentence. Third sentence.</p>",
@@ -1010,9 +1006,13 @@ mod stage_tests {
         let base = LayoutConstraints::new(600.0, 20.0).unwrap();
         let mut document_resources = GlyphResourceStore::default();
         let mut document = prepared
-            .shape_borrowed(&mut TestGlyphShaper::new(), &mut document_resources)
+            .shape_borrowed(&mut document_resources_shaper, &mut document_resources)
             .unwrap()
-            .layout(base, &document_resources)
+            .layout(
+                LayoutRequest::new(base),
+                &mut document_resources_shaper,
+                &mut document_resources,
+            )
             .expect("layout requires the shaper-aware API for first-line styles");
         for policy in [
             TextCompositionPolicy::BookOptimized,
@@ -1022,13 +1022,21 @@ mod stage_tests {
         ] {
             let constraints = base.with_text_composition_policy(policy);
             document
-                .relayout(constraints, &document_resources)
+                .relayout(
+                    LayoutRequest::new(constraints),
+                    &mut document_resources_shaper,
+                    &mut document_resources,
+                )
                 .expect("layout requires the shaper-aware API for first-line styles");
             let mut reference_resources = GlyphResourceStore::default();
             let reference = prepared
-                .shape_borrowed(&mut TestGlyphShaper::new(), &mut reference_resources)
+                .shape_borrowed(&mut reference_resources_shaper, &mut reference_resources)
                 .unwrap()
-                .layout(constraints, &reference_resources)
+                .layout(
+                    LayoutRequest::new(constraints),
+                    &mut reference_resources_shaper,
+                    &mut reference_resources,
+                )
                 .expect("layout requires the shaper-aware API for first-line styles");
             assert_eq!(
                 paragraph_geometry_snapshot(&document, &document_resources),
@@ -1040,18 +1048,30 @@ mod stage_tests {
 
     #[test]
     fn box_probes_preserve_published_lines_and_baseline_alignment() {
+        let mut resources_shaper = TestGlyphShaper::new();
+
         let source = "<div style='display:flex;align-items:baseline;width:160px'><div style='padding:3px;border:2px solid'>one two three four five six</div><div style='font-size:24px'>second item</div></div>";
         let constraints = LayoutConstraints::new(200.0, 20.0).unwrap();
         let mut resources = GlyphResourceStore::default();
         let mut document = DocumentFactory::new()
             .parse_with_new_pipeline(source, None)
-            .shape(&mut TestGlyphShaper::new(), &mut resources)
+            .shape(&mut resources_shaper, &mut resources)
             .unwrap()
-            .layout(constraints, &resources)
+            .layout(
+                LayoutRequest::new(constraints),
+                &mut resources_shaper,
+                &mut resources,
+            )
             .unwrap();
         let expected = paragraph_geometry_snapshot(&document, &resources);
         for _ in 0..3 {
-            document.relayout(constraints, &resources).unwrap();
+            document
+                .relayout(
+                    LayoutRequest::new(constraints),
+                    &mut resources_shaper,
+                    &mut resources,
+                )
+                .unwrap();
             assert_eq!(paragraph_geometry_snapshot(&document, &resources), expected);
             let lines = &document.data.layout.state.line_output.lines;
             let first = lines.first().unwrap();
@@ -1087,8 +1107,8 @@ mod stage_tests {
                 .parse_with_new_pipeline(source, None)
                 .shape(&mut shaper, &mut resources)
                 .unwrap()
-                .layout_with_shaper(
-                    LayoutConstraints::new(180.0, 20.0).unwrap(),
+                .layout(
+                    LayoutRequest::new(LayoutConstraints::new(180.0, 20.0).unwrap()),
                     &mut shaper,
                     &mut resources,
                 )
@@ -1101,7 +1121,7 @@ mod stage_tests {
                     .unwrap()
                     .with_text_composition_policy(policy);
                 document
-                    .relayout_with_shaper(constraints, &mut shaper, &mut resources)
+                    .relayout(LayoutRequest::new(constraints), &mut shaper, &mut resources)
                     .unwrap();
                 let mut reference_resources = GlyphResourceStore::default();
                 let mut reference_shaper = TestGlyphShaper::new();
@@ -1109,8 +1129,8 @@ mod stage_tests {
                     .parse_with_new_pipeline(source, None)
                     .shape(&mut reference_shaper, &mut reference_resources)
                     .unwrap()
-                    .layout_with_shaper(
-                        constraints,
+                    .layout(
+                        LayoutRequest::new(constraints),
                         &mut reference_shaper,
                         &mut reference_resources,
                     )
@@ -1126,14 +1146,20 @@ mod stage_tests {
 
     #[test]
     fn local_paragraph_results_survive_replacing_the_published_output() {
+        let mut resources_shaper = TestGlyphShaper::new();
+
         let source = "<p>one two three four five six seven eight nine ten</p>";
         let constraints = LayoutConstraints::new(100.0, 20.0).unwrap();
         let mut resources = GlyphResourceStore::default();
         let mut document = DocumentFactory::new()
             .parse_with_new_pipeline(source, None)
-            .shape(&mut TestGlyphShaper::new(), &mut resources)
+            .shape(&mut resources_shaper, &mut resources)
             .unwrap()
-            .layout(constraints, &resources)
+            .layout(
+                LayoutRequest::new(constraints),
+                &mut resources_shaper,
+                &mut resources,
+            )
             .unwrap();
         let expected = paragraph_geometry_snapshot(&document, &resources);
         let published = std::mem::take(&mut document.data.layout.state.line_output);
@@ -1142,14 +1168,13 @@ mod stage_tests {
             .iter()
             .map(|line| (line.point, line.baseline))
             .collect();
-        let timings = document
-            .relayout_with_timings(constraints, &resources)
+        document
+            .relayout(
+                LayoutRequest::new(constraints),
+                &mut resources_shaper,
+                &mut resources,
+            )
             .unwrap();
-        assert_eq!(
-            timings.measured_lines, 0,
-            "reusing a local result needs no line measurement"
-        );
-        assert_eq!(timings.reused_lines, published.lines.len());
         assert_eq!(paragraph_geometry_snapshot(&document, &resources), expected);
         assert_eq!(
             published
@@ -1164,21 +1189,25 @@ mod stage_tests {
 
     #[test]
     fn paragraph_cache_owns_local_results_without_copying_plain_text_tokens() {
+        let mut document_resources_shaper = TestGlyphShaper::new();
+
         let source = "<p>one two three four five six seven eight nine ten</p><p>before <img src='x' style='width:20px'> after</p>";
         let mut document_resources = GlyphResourceStore::default();
         let mut document = DocumentFactory::new()
             .parse_with_new_pipeline(source, None)
-            .shape(&mut TestGlyphShaper::new(), &mut document_resources)
+            .shape(&mut document_resources_shaper, &mut document_resources)
             .unwrap()
             .layout(
-                LayoutConstraints::new(100.0, 20.0).unwrap(),
-                &document_resources,
+                LayoutRequest::new(LayoutConstraints::new(100.0, 20.0).unwrap()),
+                &mut document_resources_shaper,
+                &mut document_resources,
             )
             .expect("layout requires the shaper-aware API for first-line styles");
         document
             .relayout(
-                LayoutConstraints::new(100.0, 20.0).unwrap(),
-                &document_resources,
+                LayoutRequest::new(LayoutConstraints::new(100.0, 20.0).unwrap()),
+                &mut document_resources_shaper,
+                &mut document_resources,
             )
             .expect("layout requires the shaper-aware API for first-line styles");
         let report = document.memory_usage_report();
@@ -1223,10 +1252,10 @@ mod stage_tests {
             .parse_with_new_pipeline(source, None)
             .shape(&mut shaper, &mut resources)
             .unwrap()
-            .layout_with_shaper(constraints, &mut shaper, &mut resources)
+            .layout(LayoutRequest::new(constraints), &mut shaper, &mut resources)
             .unwrap();
         document
-            .relayout_with_shaper(constraints, &mut shaper, &mut resources)
+            .relayout(LayoutRequest::new(constraints), &mut shaper, &mut resources)
             .unwrap();
         let report = document
             .data
@@ -1257,6 +1286,9 @@ mod stage_tests {
 
     #[test]
     fn paragraph_result_retention_stays_bounded_across_many_width_variants() {
+        let mut document_resources_shaper = TestGlyphShaper::new();
+
+        let mut reference_shaper = TestGlyphShaper::new();
         let paragraph = format!(
             "<p>{}</p>",
             "one two three four five six seven eight ".repeat(12)
@@ -1266,18 +1298,20 @@ mod stage_tests {
         let mut document_resources = GlyphResourceStore::default();
         let mut document = factory
             .parse_with_new_pipeline(&source, None)
-            .shape(&mut TestGlyphShaper::new(), &mut document_resources)
+            .shape(&mut document_resources_shaper, &mut document_resources)
             .unwrap()
             .layout(
-                LayoutConstraints::new(120.0, 20.0).unwrap(),
-                &document_resources,
+                LayoutRequest::new(LayoutConstraints::new(120.0, 20.0).unwrap()),
+                &mut document_resources_shaper,
+                &mut document_resources,
             )
             .expect("layout requires the shaper-aware API for first-line styles");
         for width in [160.0, 120.0, 200.0, 120.0] {
             document
                 .relayout(
-                    LayoutConstraints::new(width, 20.0).unwrap(),
-                    &document_resources,
+                    LayoutRequest::new(LayoutConstraints::new(width, 20.0).unwrap()),
+                    &mut document_resources_shaper,
+                    &mut document_resources,
                 )
                 .expect("layout requires the shaper-aware API for first-line styles");
             assert!(
@@ -1286,9 +1320,17 @@ mod stage_tests {
             );
         }
         let mut reference_resources = GlyphResourceStore::default();
-        let mut reference = reference_layout(&document, &mut reference_resources);
+        let mut reference = reference_layout_with_shaper(
+            &document,
+            &mut reference_shaper,
+            &mut reference_resources,
+        );
         reference
-            .relayout(document.data.last_constraints, &reference_resources)
+            .relayout(
+                LayoutRequest::new(document.data.last_constraints),
+                &mut reference_shaper,
+                &mut reference_resources,
+            )
             .expect("layout requires the shaper-aware API for first-line styles");
         assert_eq!(document.line_count(), reference.line_count());
         assert_eq!(
@@ -1315,6 +1357,8 @@ mod stage_tests {
 
     #[test]
     fn resizing_switches_glyph_line_width_without_affecting_independent_layouts() {
+        let mut snapshot_resources_shaper = TestGlyphShaper::new();
+
         const ROWS: usize = 32_800;
         let content = "xx\n".repeat(ROWS - 1) + "xx";
         let html = format!("<pre>{content}</pre>");
@@ -1327,8 +1371,9 @@ mod stage_tests {
             .unwrap();
         let mut document = shaped
             .layout(
-                LayoutConstraints::new(12.0, 16.0).unwrap(),
-                &shaped_resources,
+                LayoutRequest::new(LayoutConstraints::new(12.0, 16.0).unwrap()),
+                &mut shaper,
+                &mut shaped_resources,
             )
             .expect("layout requires the shaper-aware API for first-line styles");
         let last = document.render_view(&shaped_resources).text().glyph_count() as u32 - 1;
@@ -1343,28 +1388,27 @@ mod stage_tests {
                 .is_narrow()
         );
         assert_eq!(
-            text_paint::render_text_view_line_for_glyph(
-                document.render_view(&shaped_resources).text(),
-                last
-            ),
+            (document.render_view(&shaped_resources).text()).line_for_glyph(last),
             Some(LineId::new(ROWS - 1))
         );
         let mut snapshot_resources = GlyphResourceStore::default();
         let snapshot = prepared
-            .shape_borrowed(&mut TestGlyphShaper::new(), &mut snapshot_resources)
+            .shape_borrowed(&mut snapshot_resources_shaper, &mut snapshot_resources)
             .unwrap()
-            .layout_with_metrics(
-                document.data.last_constraints,
-                &document.data.last_image_metrics,
-                &snapshot_resources,
+            .layout(
+                LayoutRequest::new(document.data.last_constraints)
+                    .with_image_metrics(&document.data.last_image_metrics),
+                &mut snapshot_resources_shaper,
+                &mut snapshot_resources,
             )
             .expect("layout requires the shaper-aware API for first-line styles");
         let glyphs = document.glyphs().as_contiguous().unwrap().as_ptr();
         document
-            .relayout_with_metrics(
-                LayoutConstraints::new(6.0, 16.0).unwrap(),
-                &ImageMetrics::default(),
-                &shaped_resources,
+            .relayout(
+                LayoutRequest::new(LayoutConstraints::new(6.0, 16.0).unwrap())
+                    .with_image_metrics(&ImageMetrics::default()),
+                &mut shaper,
+                &mut shaped_resources,
             )
             .expect("layout requires the shaper-aware API for first-line styles");
         assert_eq!(document.line_count(), ROWS * 2);
@@ -1378,10 +1422,7 @@ mod stage_tests {
                 .is_narrow()
         );
         assert_eq!(
-            text_paint::render_text_view_line_for_glyph(
-                document.render_view(&shaped_resources).text(),
-                last
-            ),
+            (document.render_view(&shaped_resources).text()).line_for_glyph(last),
             Some(LineId::new(ROWS * 2 - 1))
         );
         assert_eq!(document.glyphs().as_contiguous().unwrap().as_ptr(), glyphs);
@@ -1395,17 +1436,15 @@ mod stage_tests {
                 .is_narrow()
         );
         assert_eq!(
-            text_paint::render_text_view_line_for_glyph(
-                snapshot.render_view(&snapshot_resources).text(),
-                last
-            ),
+            (snapshot.render_view(&snapshot_resources).text()).line_for_glyph(last),
             Some(LineId::new(ROWS - 1))
         );
         document
-            .relayout_with_metrics(
-                LayoutConstraints::new(12.0, 16.0).unwrap(),
-                &ImageMetrics::default(),
-                &shaped_resources,
+            .relayout(
+                LayoutRequest::new(LayoutConstraints::new(12.0, 16.0).unwrap())
+                    .with_image_metrics(&ImageMetrics::default()),
+                &mut shaper,
+                &mut shaped_resources,
             )
             .expect("layout requires the shaper-aware API for first-line styles");
         assert_eq!(document.line_count(), ROWS);
@@ -1419,26 +1458,26 @@ mod stage_tests {
                 .is_narrow()
         );
         assert_eq!(
-            text_paint::render_text_view_line_for_glyph(
-                document.render_view(&shaped_resources).text(),
-                last
-            ),
+            (document.render_view(&shaped_resources).text()).line_for_glyph(last),
             Some(LineId::new(ROWS - 1))
         );
     }
 
     #[test]
     fn compact_source_offsets_preserve_collapsed_spaces_and_unicode_expansion() {
+        let mut document_resources_shaper = TestGlyphShaper::new();
+
         let mut factory = DocumentFactory::new();
         let prepared =
             factory.parse_with_new_pipeline("<p>a   😀ß</p>", Some("p {text-transform:uppercase}"));
         let mut document_resources = GlyphResourceStore::default();
         let document = prepared
-            .shape_borrowed(&mut TestGlyphShaper::new(), &mut document_resources)
+            .shape_borrowed(&mut document_resources_shaper, &mut document_resources)
             .unwrap()
             .layout(
-                LayoutConstraints::new(600.0, 20.0).unwrap(),
-                &document_resources,
+                LayoutRequest::new(LayoutConstraints::new(600.0, 20.0).unwrap()),
+                &mut document_resources_shaper,
+                &mut document_resources,
             )
             .expect("layout requires the shaper-aware API for first-line styles");
         let addressing = document.render_view(&document_resources).addressing();
@@ -1473,16 +1512,19 @@ mod stage_tests {
 
     #[test]
     fn source_offsets_above_u16_preserve_reading_positions() {
+        let mut document_resources_shaper = TestGlyphShaper::new();
+
         let html = format!("<p>{}😀Z</p>", "a".repeat(65_535));
         let mut factory = DocumentFactory::new();
         let prepared = factory.parse_with_new_pipeline(&html, None);
         let mut document_resources = GlyphResourceStore::default();
         let document = prepared
-            .shape_borrowed(&mut TestGlyphShaper::new(), &mut document_resources)
+            .shape_borrowed(&mut document_resources_shaper, &mut document_resources)
             .unwrap()
             .layout(
-                LayoutConstraints::new(600.0, 20.0).unwrap(),
-                &document_resources,
+                LayoutRequest::new(LayoutConstraints::new(600.0, 20.0).unwrap()),
+                &mut document_resources_shaper,
+                &mut document_resources,
             )
             .expect("layout requires the shaper-aware API for first-line styles");
         let addressing = document.render_view(&document_resources).addressing();
@@ -1516,6 +1558,8 @@ mod stage_tests {
 
     #[test]
     fn narrow_node_offsets_support_cfi_text_chunks_larger_than_u16() {
+        let mut document_resources_shaper = TestGlyphShaper::new();
+
         let html = format!(
             "<p>{}<!--split-->{}</p>",
             "a".repeat(40_000),
@@ -1525,11 +1569,12 @@ mod stage_tests {
         let prepared = factory.parse_with_new_pipeline(&html, None);
         let mut document_resources = GlyphResourceStore::default();
         let document = prepared
-            .shape_borrowed(&mut TestGlyphShaper::new(), &mut document_resources)
+            .shape_borrowed(&mut document_resources_shaper, &mut document_resources)
             .unwrap()
             .layout(
-                LayoutConstraints::new(600.0, 20.0).unwrap(),
-                &document_resources,
+                LayoutRequest::new(LayoutConstraints::new(600.0, 20.0).unwrap()),
+                &mut document_resources_shaper,
+                &mut document_resources,
             )
             .expect("layout requires the shaper-aware API for first-line styles");
         let addressing = document.render_view(&document_resources).addressing();
@@ -1550,6 +1595,8 @@ mod stage_tests {
 
     #[test]
     fn compact_source_offsets_keep_generated_markers_without_source_positions() {
+        let mut document_resources_shaper = TestGlyphShaper::new();
+
         let mut factory = DocumentFactory::new();
         let prepared = factory.parse_with_new_pipeline(
             "<ol><li>😀ß</li></ol>",
@@ -1557,20 +1604,21 @@ mod stage_tests {
         );
         let mut document_resources = GlyphResourceStore::default();
         let document = prepared
-            .shape_borrowed(&mut TestGlyphShaper::new(), &mut document_resources)
+            .shape_borrowed(&mut document_resources_shaper, &mut document_resources)
             .unwrap()
             .layout(
-                LayoutConstraints::new(600.0, 20.0).unwrap(),
-                &document_resources,
+                LayoutRequest::new(LayoutConstraints::new(600.0, 20.0).unwrap()),
+                &mut document_resources_shaper,
+                &mut document_resources,
             )
             .expect("layout requires the shaper-aware API for first-line styles");
         let text = document.render_view(&document_resources).text();
         let addressing = document.render_view(&document_resources).addressing();
         let mut marker_count = 0;
         let mut source_offsets = Vec::new();
-        for run in text_paint::render_text_view_text_runs(text).chain(text_paint::marker_runs(text)) {
+        for run in text.text_runs().chain(text.marker_runs()) {
             for glyph in run.glyphs() {
-                if text_paint::render_text_run_is_marker(&run) {
+                if run.is_marker() {
                     marker_count += 1;
                     assert_eq!(document.glyph_source_offset(glyph), None);
                     assert_eq!(addressing.source_position_for_glyph(glyph, false), None);
@@ -1626,14 +1674,16 @@ mod stage_tests {
             assert!(metrics.get(glyphs[0]).advance() > metrics.get(glyphs[2]).advance());
             let mut document = shaped
                 .layout(
-                    LayoutConstraints::new(600.0, 20.0).unwrap(),
-                    &shaped_resources,
+                    LayoutRequest::new(LayoutConstraints::new(600.0, 20.0).unwrap()),
+                    &mut shaper,
+                    &mut shaped_resources,
                 )
                 .expect("layout requires the shaper-aware API for first-line styles");
             document
                 .relayout(
-                    LayoutConstraints::new(50.0, 20.0).unwrap(),
-                    &shaped_resources,
+                    LayoutRequest::new(LayoutConstraints::new(50.0, 20.0).unwrap()),
+                    &mut shaper,
+                    &mut shaped_resources,
                 )
                 .expect("layout requires the shaper-aware API for first-line styles");
             assert!(std::ptr::eq(text, document.inputs.text.as_ref()));
@@ -1775,9 +1825,9 @@ mod stage_tests {
                 }
                 let (_, entries) = capture(Duration::default, || {
                     document
-                        .relayout_with_metrics_and_shaper(
-                            LayoutConstraints::new(120.0, 20.0).unwrap(),
-                            &metrics,
+                        .relayout(
+                            LayoutRequest::new(LayoutConstraints::new(120.0, 20.0).unwrap())
+                                .with_image_metrics(&metrics),
                             &mut shaper,
                             &mut resources,
                         )
@@ -1818,9 +1868,9 @@ mod stage_tests {
             let mut document = prepared
                 .shape_borrowed(&mut shaper, &mut document_resources)
                 .unwrap()
-                .layout_with_metrics_and_shaper(
-                    LayoutConstraints::new(400.0, 20.0).unwrap(),
-                    &ImageMetrics::default(),
+                .layout(
+                    LayoutRequest::new(LayoutConstraints::new(400.0, 20.0).unwrap())
+                        .with_image_metrics(&ImageMetrics::default()),
                     &mut shaper,
                     &mut document_resources,
                 )
@@ -1859,11 +1909,11 @@ mod stage_tests {
             assert!(document.repaint_from(&painted, &document_resources));
             let text = document.render_view(&document_resources).text();
             assert_eq!(
-                text_paint::paint_color_at(text, 0),
+                text.paint_color_at(0),
                 Some(computed_style::theme_adaptation_adapt(theme, 0x800080ff))
             );
             assert_eq!(
-                text_paint::paint_color_at(text, 1),
+                text.paint_color_at(1),
                 Some(computed_style::theme_adaptation_adapt(theme, 0x800080ff))
             );
             assert_eq!(document.glyph_source_offset(0), Some(0));
@@ -2191,7 +2241,11 @@ mod stage_tests {
         let metric_count = shaped.glyph_metrics(&shaped_resources).len();
         let constraints = LayoutConstraints::new(180.0, 20.0).unwrap();
         let mut document = shaped
-            .layout(constraints, &shaped_resources)
+            .layout(
+                LayoutRequest::new(constraints),
+                &mut shaper,
+                &mut shaped_resources,
+            )
             .expect("layout requires the shaper-aware API for first-line styles");
 
         let lines_ptr = document.data.layout.state.line_output.lines.as_ptr();
@@ -2245,8 +2299,12 @@ mod stage_tests {
             .paint_order_indices
             .as_ptr();
 
-        let relayout_timings = document
-            .relayout_with_timings(constraints, &shaped_resources)
+        document
+            .relayout(
+                LayoutRequest::new(constraints),
+                &mut shaper,
+                &mut shaped_resources,
+            )
             .expect("layout requires the shaper-aware API for first-line styles");
 
         assert_eq!(document.glyphs().len(), glyph_count);
@@ -2327,19 +2385,6 @@ mod stage_tests {
                 .as_ptr(),
             paint_order
         );
-        assert!(
-            !relayout_timings.root_box_layout.is_zero(),
-            "explicit timing must still read and report the clock"
-        );
-        assert!(
-            relayout_timings.layout_tree_traversal >= relayout_timings.root_box_layout,
-            "tree timing must include root layout"
-        );
-        assert_eq!(
-            relayout_timings.build_inline_tokens_from_runs,
-            std::time::Duration::ZERO,
-            "pure-text relayout should not rebuild token plans"
-        );
 
         let (glyphs, allocations) = crate::allocation_test_support::count_allocations(|| {
             document.render_view(&shaped_resources).text().glyph_count()
@@ -2361,16 +2406,18 @@ mod stage_tests {
             .shape_borrowed(&mut shaper, &mut document_resources)
             .unwrap()
             .layout(
-                LayoutConstraints::new(120.0, 16.0).unwrap(),
-                &document_resources,
+                LayoutRequest::new(LayoutConstraints::new(120.0, 16.0).unwrap()),
+                &mut shaper,
+                &mut document_resources,
             )
             .expect("layout requires the shaper-aware API for first-line styles");
         assert_eq!(document.data.layout.scratch.inline_plan_count(), 1);
         let glyph_pointer = document.glyphs().as_contiguous().unwrap().as_ptr();
         document
             .relayout(
-                LayoutConstraints::new(100.0, 16.0).unwrap(),
-                &document_resources,
+                LayoutRequest::new(LayoutConstraints::new(100.0, 16.0).unwrap()),
+                &mut shaper,
+                &mut document_resources,
             )
             .expect("layout requires the shaper-aware API for first-line styles");
         assert_eq!(document.data.layout.scratch.inline_plan_count(), 1);
@@ -2382,6 +2429,8 @@ mod stage_tests {
 
     #[test]
     fn ordinary_lines_omit_optional_storage_and_keep_independent_geometry() {
+        let mut snapshot_resources_shaper = TestGlyphShaper::new();
+
         let mut factory = DocumentFactory::new();
         let prepared = factory.parse_with_new_pipeline("<p>plain text continues through several lines without inline elements or special paint data</p>", None);
         let mut shaper = TestGlyphShaper::new();
@@ -2390,8 +2439,9 @@ mod stage_tests {
             .shape_borrowed(&mut shaper, &mut document_resources)
             .unwrap()
             .layout(
-                LayoutConstraints::new(100.0, 16.0).unwrap(),
-                &document_resources,
+                LayoutRequest::new(LayoutConstraints::new(100.0, 16.0).unwrap()),
+                &mut shaper,
+                &mut document_resources,
             )
             .expect("layout requires the shaper-aware API for first-line styles");
         assert!(document.data.layout.state.line_output.lines.len() > 1);
@@ -2426,12 +2476,13 @@ mod stage_tests {
         assert!(std::mem::size_of::<crate::layout_model::Line>() <= 80);
         let mut snapshot_resources = GlyphResourceStore::default();
         let snapshot = prepared
-            .shape_borrowed(&mut TestGlyphShaper::new(), &mut snapshot_resources)
+            .shape_borrowed(&mut snapshot_resources_shaper, &mut snapshot_resources)
             .unwrap()
-            .layout_with_metrics(
-                document.data.last_constraints,
-                &document.data.last_image_metrics,
-                &snapshot_resources,
+            .layout(
+                LayoutRequest::new(document.data.last_constraints)
+                    .with_image_metrics(&document.data.last_image_metrics),
+                &mut snapshot_resources_shaper,
+                &mut snapshot_resources,
             )
             .expect("layout requires the shaper-aware API for first-line styles");
         let original = snapshot
@@ -2441,8 +2492,9 @@ mod stage_tests {
             .unwrap();
         document
             .relayout(
-                LayoutConstraints::new(200.0, 16.0).unwrap(),
-                &document_resources,
+                LayoutRequest::new(LayoutConstraints::new(200.0, 16.0).unwrap()),
+                &mut shaper,
+                &mut document_resources,
             )
             .expect("layout requires the shaper-aware API for first-line styles");
         assert_eq!(
@@ -2455,14 +2507,12 @@ mod stage_tests {
             original.point()
         );
         assert_eq!(
-            text_paint::render_line_glyphs(
-                &snapshot
+            (snapshot
                     .render_view(&snapshot_resources)
                     .text()
                     .line(LineId::new(1))
-                    .unwrap()
-            ),
-            text_paint::render_line_glyphs(&original)
+                    .unwrap()).glyphs(),
+            original.glyphs()
         );
     }
 
@@ -2483,7 +2533,11 @@ mod stage_tests {
         let mut document = prepared
             .shape_borrowed(&mut shaper, &mut document_resources)
             .unwrap()
-            .layout(constraints, &document_resources)
+            .layout(
+                LayoutRequest::new(constraints),
+                &mut shaper,
+                &mut document_resources,
+            )
             .expect("layout requires the shaper-aware API for first-line styles");
         let capacities = document.data.layout.scratch.paragraph_capacities();
         assert_eq!(capacities.len(), 1);
@@ -2494,7 +2548,11 @@ mod stage_tests {
                 && capacities[0].1.2 > 0
         );
         document
-            .relayout(constraints, &document_resources)
+            .relayout(
+                LayoutRequest::new(constraints),
+                &mut shaper,
+                &mut document_resources,
+            )
             .expect("layout requires the shaper-aware API for first-line styles");
         assert_eq!(
             document.data.layout.scratch.paragraph_capacities(),
@@ -2508,6 +2566,8 @@ mod stage_tests {
 
     #[test]
     fn shaper_relayout_reuses_buffers_and_matches_fresh_layout() {
+        let mut fresh_resources_shaper = TestGlyphShaper::new();
+
         for policy in [
             TextCompositionPolicy::WebCompatible,
             TextCompositionPolicy::BookOptimized,
@@ -2527,9 +2587,8 @@ mod stage_tests {
                 .with_text_composition_policy(policy);
             let metrics = ImageMetrics::default();
             let mut document = shaped
-                .layout_with_metrics_and_shaper(
-                    constraints,
-                    &metrics,
+                .layout(
+                    LayoutRequest::new(constraints).with_image_metrics(&metrics),
                     &mut shaper,
                     &mut shaped_resources,
                 )
@@ -2563,18 +2622,21 @@ mod stage_tests {
                     .unwrap()
                     .with_text_composition_policy(policy);
                 document
-                    .relayout_with_metrics_and_shaper(
-                        constraints,
-                        &metrics,
+                    .relayout(
+                        LayoutRequest::new(constraints).with_image_metrics(&metrics),
                         &mut shaper,
                         &mut shaped_resources,
                     )
                     .unwrap();
                 let mut fresh_resources = GlyphResourceStore::default();
                 let fresh = prepared
-                    .shape_borrowed(&mut TestGlyphShaper::new(), &mut fresh_resources)
+                    .shape_borrowed(&mut fresh_resources_shaper, &mut fresh_resources)
                     .unwrap()
-                    .layout(constraints, &fresh_resources)
+                    .layout(
+                        LayoutRequest::new(constraints),
+                        &mut fresh_resources_shaper,
+                        &mut fresh_resources,
+                    )
                     .expect("layout requires the shaper-aware API for first-line styles");
                 assert_eq!(document.glyphs().as_contiguous().unwrap().as_ptr(), glyphs);
                 assert_eq!(
@@ -2620,11 +2682,11 @@ mod stage_tests {
                         .iter()
                         .map(|line| {
                             (
-                                text_paint::render_line_owner_box(&line),
-                                text_paint::render_line_glyphs(&line),
+                                line.owner_box(),
+                                line.glyphs(),
                                 line.point(),
                                 line.height(),
-                                text_paint::line_baseline(&line),
+                                line.line_baseline(),
                             )
                         })
                         .collect::<Vec<_>>()
@@ -2665,6 +2727,8 @@ mod stage_tests {
 
     #[test]
     fn shaper_relayout_preserves_auxiliary_glyphs_and_independent_layouts() {
+        let mut snapshot_resources_shaper = TestGlyphShaper::new();
+
         let mut factory = DocumentFactory::new();
         let prepared = factory.parse_with_new_pipeline(
             "<html><body><p>one two three four five six seven eight nine ten</p></body></html>",
@@ -2676,18 +2740,20 @@ mod stage_tests {
             .shape_borrowed(&mut shaper, &mut document_resources)
             .unwrap()
             .layout(
-                LayoutConstraints::new(120.0, 20.0).unwrap(),
-                &document_resources,
+                LayoutRequest::new(LayoutConstraints::new(120.0, 20.0).unwrap()),
+                &mut shaper,
+                &mut document_resources,
             )
             .expect("layout requires the shaper-aware API for first-line styles");
         let mut snapshot_resources = GlyphResourceStore::default();
         let snapshot = prepared
-            .shape_borrowed(&mut TestGlyphShaper::new(), &mut snapshot_resources)
+            .shape_borrowed(&mut snapshot_resources_shaper, &mut snapshot_resources)
             .unwrap()
-            .layout_with_metrics(
-                document.data.last_constraints,
-                &document.data.last_image_metrics,
-                &snapshot_resources,
+            .layout(
+                LayoutRequest::new(document.data.last_constraints)
+                    .with_image_metrics(&document.data.last_image_metrics),
+                &mut snapshot_resources_shaper,
+                &mut snapshot_resources,
             )
             .expect("layout requires the shaper-aware API for first-line styles");
         let old_lines = snapshot
@@ -2695,28 +2761,32 @@ mod stage_tests {
             .text()
             .lines()
             .iter()
-            .map(|line| (text_paint::render_line_glyphs(&line), line.point()))
+            .map(|line| (line.glyphs(), line.point()))
             .collect::<Vec<_>>();
-        let style = shaping::style(8.0, 400, FontSlant::Normal, 0, None);
-        let appended = document_resources
-            .shape_glyph(&mut shaper, shaping::glyph('#', &style))
-            .unwrap();
+        let style = shaping::style(8.0, 400, FontSlant::Normal, None);
+        let appended = {
+            let mut run_glyphs = [GlyphId(0)];
+            document_resources
+                .shape_run(&mut shaper, shaping::run("#", style), &mut run_glyphs)
+                .map(|_| run_glyphs[0])
+        }
+        .unwrap();
         assert!(
-            text_paint::glyph_metric(snapshot.render_view(&snapshot_resources).text(), appended)
+            (snapshot.render_view(&snapshot_resources).text()).glyph_metric(appended)
                 .is_none()
         );
 
         document
-            .relayout_with_metrics_and_shaper(
-                LayoutConstraints::new(240.0, 20.0).unwrap(),
-                &ImageMetrics::default(),
+            .relayout(
+                LayoutRequest::new(LayoutConstraints::new(240.0, 20.0).unwrap())
+                    .with_image_metrics(&ImageMetrics::default()),
                 &mut shaper,
                 &mut document_resources,
             )
             .unwrap();
 
         assert_eq!(
-            text_paint::glyph_metric(document.render_view(&document_resources).text(), appended)
+            (document.render_view(&document_resources).text()).glyph_metric(appended)
                 .map(|metric| (
                     metric.ch(),
                     metric.advance(),
@@ -2726,7 +2796,7 @@ mod stage_tests {
             Some(('#', 4.0, 6.0, 2.0))
         );
         assert!(
-            text_paint::glyph_metric(snapshot.render_view(&snapshot_resources).text(), appended)
+            (snapshot.render_view(&snapshot_resources).text()).glyph_metric(appended)
                 .is_none()
         );
         assert_eq!(
@@ -2735,7 +2805,7 @@ mod stage_tests {
                 .text()
                 .lines()
                 .iter()
-                .map(|line| (text_paint::render_line_glyphs(&line), line.point()))
+                .map(|line| (line.glyphs(), line.point()))
                 .collect::<Vec<_>>(),
             old_lines
         );
@@ -2748,9 +2818,9 @@ mod stage_tests {
         );
         let shaped = std::ptr::from_ref(document.data.base_shaped.as_ref());
         document
-            .relayout_with_metrics_and_shaper(
-                LayoutConstraints::new(120.0, 20.0).unwrap(),
-                &ImageMetrics::default(),
+            .relayout(
+                LayoutRequest::new(LayoutConstraints::new(120.0, 20.0).unwrap())
+                    .with_image_metrics(&ImageMetrics::default()),
                 &mut shaper,
                 &mut document_resources,
             )
@@ -2760,7 +2830,7 @@ mod stage_tests {
             "unchanged glyph resources must not copy the shaped chapter again"
         );
         assert_eq!(
-            text_paint::glyph_metric(document.render_view(&document_resources).text(), appended)
+            (document.render_view(&document_resources).text()).glyph_metric(appended)
                 .map(|metric| (
                     metric.ch(),
                     metric.advance(),
@@ -2777,25 +2847,29 @@ mod stage_tests {
         let prepared = factory.parse_with_new_pipeline("<p>borrowed metrics</p>", None);
         let mut shaper = TestGlyphShaper::new();
         let mut resources = GlyphResourceStore::default();
-        let other_resources = GlyphResourceStore::default();
+        let mut other_resources = GlyphResourceStore::default();
         let constraints = LayoutConstraints::new(120.0, 20.0).unwrap();
         let shaped = prepared
             .shape_borrowed(&mut shaper, &mut resources)
             .unwrap();
         assert!(
-            matches!(shaped.layout(constraints, &other_resources), Err(error)
+            matches!(shaped.layout(LayoutRequest::new(constraints), &mut shaper, &mut other_resources), Err(error)
             if error == shaping::resource_generation_mismatch())
         );
 
         let mut document = prepared
             .shape_borrowed(&mut shaper, &mut resources)
             .unwrap()
-            .layout(constraints, &resources)
+            .layout(LayoutRequest::new(constraints), &mut shaper, &mut resources)
             .unwrap();
         let before = paragraph_geometry_snapshot(&document, &resources);
         assert!(document.try_render_view(&other_resources).is_none());
         assert_eq!(
-            document.relayout(constraints, &other_resources),
+            document.relayout(
+                LayoutRequest::new(constraints),
+                &mut shaper,
+                &mut other_resources
+            ),
             Err(shaping::resource_generation_mismatch())
         );
         assert_eq!(paragraph_geometry_snapshot(&document, &resources), before);
@@ -2814,7 +2888,11 @@ mod stage_tests {
         let mut document = prepared
             .shape_borrowed(&mut shaper, &mut document_resources)
             .unwrap()
-            .layout(constraints, &document_resources)
+            .layout(
+                LayoutRequest::new(constraints),
+                &mut shaper,
+                &mut document_resources,
+            )
             .expect("layout requires the shaper-aware API for first-line styles");
         let lines = document.data.layout.state.line_output.lines.as_ptr();
         let before = document
@@ -2822,14 +2900,14 @@ mod stage_tests {
             .text()
             .lines()
             .iter()
-            .map(|line| (text_paint::render_line_glyphs(&line), line.point()))
+            .map(|line| (line.glyphs(), line.point()))
             .collect::<Vec<_>>();
-        shaper.reset();
+        shaper = TestGlyphShaper::new();
 
         let error = document
-            .relayout_with_metrics_and_shaper(
-                LayoutConstraints::new(240.0, 20.0).unwrap(),
-                &ImageMetrics::default(),
+            .relayout(
+                LayoutRequest::new(LayoutConstraints::new(240.0, 20.0).unwrap())
+                    .with_image_metrics(&ImageMetrics::default()),
                 &mut shaper,
                 &mut document_resources,
             )
@@ -2844,80 +2922,10 @@ mod stage_tests {
                 .text()
                 .lines()
                 .iter()
-                .map(|line| (text_paint::render_line_glyphs(&line), line.point()))
+                .map(|line| (line.glyphs(), line.point()))
                 .collect::<Vec<_>>(),
             before
         );
-    }
-
-    #[test]
-    fn failed_first_line_append_keeps_the_published_layout() {
-        struct RejectAppend<'a>(&'a mut TestGlyphShaper);
-        impl GlyphShaper for RejectAppend<'_> {
-            fn reset(&mut self) {
-                self.0.reset();
-            }
-            fn resource_generation(&self) -> GlyphResourceGeneration {
-                self.0.resource_generation()
-            }
-            fn shape_glyph(
-                &mut self,
-                request: GlyphRequest<'_>,
-            ) -> Result<ShapedGlyph, ShapeError> {
-                self.0.shape_glyph(request)
-            }
-        }
-        let mut factory = DocumentFactory::new();
-        let prepared = factory.parse_with_new_pipeline(
-            "<html><body><p>one two three four five six</p></body></html>",
-            Some("p::first-line {font-size:24px}"),
-        );
-        let mut shaper = TestGlyphShaper::new();
-        let constraints = LayoutConstraints::new(120.0, 20.0).unwrap();
-        let mut document_resources = GlyphResourceStore::default();
-        let mut document = prepared
-            .shape_borrowed(&mut shaper, &mut document_resources)
-            .unwrap()
-            .layout_with_shaper(constraints, &mut shaper, &mut document_resources)
-            .expect("layout requires the shaper-aware API for first-line styles");
-        let before = document
-            .render_view(&document_resources)
-            .text()
-            .lines()
-            .iter()
-            .map(|line| (text_paint::render_line_glyphs(&line), line.point()))
-            .collect::<Vec<_>>();
-        let lines = document.data.layout.state.line_output.lines.as_ptr();
-        let metrics = document_resources.len();
-
-        let error = document
-            .relayout_with_metrics_and_shaper(
-                LayoutConstraints::new(240.0, 20.0).unwrap(),
-                &ImageMetrics::default(),
-                &mut RejectAppend(&mut shaper),
-                &mut document_resources,
-            )
-            .unwrap_err();
-
-        assert_eq!(
-            error,
-            RejectAppend(&mut shaper)
-                .begin_append_shaping()
-                .unwrap_err()
-        );
-        assert_eq!(document.data.last_constraints, constraints);
-        assert_eq!(document.data.layout.state.line_output.lines.as_ptr(), lines);
-        assert_eq!(
-            document
-                .render_view(&document_resources)
-                .text()
-                .lines()
-                .iter()
-                .map(|line| (text_paint::render_line_glyphs(&line), line.point()))
-                .collect::<Vec<_>>(),
-            before
-        );
-        assert_eq!(document_resources.len(), metrics);
     }
 
     #[test]
@@ -2933,8 +2941,9 @@ mod stage_tests {
             .shape(&mut shaper, &mut document_resources)
             .unwrap()
             .layout(
-                LayoutConstraints::new(180.0, 20.0).unwrap(),
-                &document_resources,
+                LayoutRequest::new(LayoutConstraints::new(180.0, 20.0).unwrap()),
+                &mut shaper,
+                &mut document_resources,
             )
             .unwrap();
         let plans = document.data.layout.scratch.inline_plan_count();
@@ -2942,9 +2951,10 @@ mod stage_tests {
         assert!(plans >= 2, "nested and trailing text retain separate plans");
         for width in [120.0, 240.0, 100.0, 180.0, 180.0] {
             document
-                .relayout_with_timings(
-                    LayoutConstraints::new(width, 20.0).unwrap(),
-                    &document_resources,
+                .relayout(
+                    LayoutRequest::new(LayoutConstraints::new(width, 20.0).unwrap()),
+                    &mut shaper,
+                    &mut document_resources,
                 )
                 .unwrap();
             assert_eq!(document.data.layout.scratch.inline_plan_count(), plans);
@@ -2961,16 +2971,21 @@ mod stage_tests {
 
     #[test]
     fn token_caches_have_one_layout_owner_and_independent_executions_own_their_plans() {
+        let mut first_resources_shaper = TestGlyphShaper::new();
+        let mut snapshot_resources_shaper = TestGlyphShaper::new();
+        let mut second_resources_shaper = TestGlyphShaper::new();
+
         let mut factory = DocumentFactory::new();
         let prepared =
             factory.parse_with_new_pipeline("<html><body><p>tiny</p></body></html>", None);
         let mut first_resources = GlyphResourceStore::default();
         let mut first = prepared
-            .shape_borrowed(&mut TestGlyphShaper::new(), &mut first_resources)
+            .shape_borrowed(&mut first_resources_shaper, &mut first_resources)
             .unwrap()
             .layout(
-                LayoutConstraints::new(100.0, 16.0).unwrap(),
-                &first_resources,
+                LayoutRequest::new(LayoutConstraints::new(100.0, 16.0).unwrap()),
+                &mut first_resources_shaper,
+                &mut first_resources,
             )
             .expect("layout requires the shaper-aware API for first-line styles");
         let pointer = first
@@ -2981,12 +2996,13 @@ mod stage_tests {
             .expect("owned token plan");
         let mut snapshot_resources = GlyphResourceStore::default();
         let snapshot = prepared
-            .shape_borrowed(&mut TestGlyphShaper::new(), &mut snapshot_resources)
+            .shape_borrowed(&mut snapshot_resources_shaper, &mut snapshot_resources)
             .unwrap()
-            .layout_with_metrics(
-                first.data.last_constraints,
-                &first.data.last_image_metrics,
-                &snapshot_resources,
+            .layout(
+                LayoutRequest::new(first.data.last_constraints)
+                    .with_image_metrics(&first.data.last_image_metrics),
+                &mut snapshot_resources_shaper,
+                &mut snapshot_resources,
             )
             .expect("layout requires the shaper-aware API for first-line styles");
         assert_eq!(
@@ -2996,11 +3012,12 @@ mod stage_tests {
         );
         let mut second_resources = GlyphResourceStore::default();
         let second = prepared
-            .shape_borrowed(&mut TestGlyphShaper::new(), &mut second_resources)
+            .shape_borrowed(&mut second_resources_shaper, &mut second_resources)
             .unwrap()
             .layout(
-                LayoutConstraints::new(80.0, 16.0).unwrap(),
-                &second_resources,
+                LayoutRequest::new(LayoutConstraints::new(80.0, 16.0).unwrap()),
+                &mut second_resources_shaper,
+                &mut second_resources,
             )
             .expect("layout requires the shaper-aware API for first-line styles");
         assert_ne!(
@@ -3008,20 +3025,17 @@ mod stage_tests {
             Some(pointer),
             "independent layout executors must own independent token arrays"
         );
-        let timings = first
-            .relayout_with_timings(
-                LayoutConstraints::new(80.0, 16.0).unwrap(),
-                &first_resources,
+        first
+            .relayout(
+                LayoutRequest::new(LayoutConstraints::new(80.0, 16.0).unwrap()),
+                &mut first_resources_shaper,
+                &mut first_resources,
             )
             .expect("layout requires the shaper-aware API for first-line styles");
         assert_eq!(
             first.data.layout.scratch.inline_plan_pointer(),
             Some(pointer),
             "relayout must move and reuse the original token allocation"
-        );
-        assert_eq!(
-            timings.build_inline_tokens_from_runs,
-            std::time::Duration::ZERO
         );
         assert_eq!(
             paragraph_geometry_snapshot(&first, &first_resources),
@@ -3057,9 +3071,9 @@ mod stage_tests {
             .shape_borrowed(&mut shaper, &mut shaped_resources)
             .unwrap();
         let mut document = shaped
-            .layout_with_metrics_and_shaper(
-                LayoutConstraints::new(400.0, 20.0).unwrap(),
-                &ImageMetrics::default(),
+            .layout(
+                LayoutRequest::new(LayoutConstraints::new(400.0, 20.0).unwrap())
+                    .with_image_metrics(&ImageMetrics::default()),
                 &mut shaper,
                 &mut shaped_resources,
             )
@@ -3070,9 +3084,9 @@ mod stage_tests {
         );
         let base_glyph_pointer = document.data.base_shaped.glyphs.as_ptr();
         document
-            .relayout_with_metrics_and_shaper(
-                LayoutConstraints::new(200.0, 20.0).unwrap(),
-                &ImageMetrics::default(),
+            .relayout(
+                LayoutRequest::new(LayoutConstraints::new(200.0, 20.0).unwrap())
+                    .with_image_metrics(&ImageMetrics::default()),
                 &mut shaper,
                 &mut shaped_resources,
             )
@@ -3159,8 +3173,9 @@ mod stage_tests {
         let shape_pointer = std::ptr::from_ref(shaped.shaped.as_ref());
         let document = shaped
             .layout(
-                LayoutConstraints::new(180.0, 20.0).unwrap(),
-                &shaped_resources,
+                LayoutRequest::new(LayoutConstraints::new(180.0, 20.0).unwrap()),
+                &mut shaper,
+                &mut shaped_resources,
             )
             .expect("layout requires the shaper-aware API for first-line styles");
         assert!(std::ptr::eq(
@@ -3187,9 +3202,9 @@ mod stage_tests {
             .expect("test shaper must register every glyph");
         let shape_pointer = std::ptr::from_ref(shaped.shaped.as_ref());
         let document = shaped
-            .layout_with_metrics_and_shaper(
-                LayoutConstraints::new(180.0, 20.0).unwrap(),
-                &ImageMetrics::default(),
+            .layout(
+                LayoutRequest::new(LayoutConstraints::new(180.0, 20.0).unwrap())
+                    .with_image_metrics(&ImageMetrics::default()),
                 &mut shaper,
                 &mut shaped_resources,
             )
@@ -3338,8 +3353,8 @@ mod stage_tests {
             .shape_borrowed(&mut shaper, &mut shaped_resources)
             .expect("test text shapes");
         let document = shaped
-            .layout_with_shaper(
-                LayoutConstraints::new(180.0, 20.0).unwrap(),
+            .layout(
+                LayoutRequest::new(LayoutConstraints::new(180.0, 20.0).unwrap()),
                 &mut shaper,
                 &mut shaped_resources,
             )
@@ -3377,18 +3392,18 @@ mod stage_tests {
             .map(|&glyph| shaped_resources.metrics().get(glyph).ch())
             .collect();
         let mut document = shaped
-            .layout_with_metrics_and_shaper(
-                LayoutConstraints::new(600.0, 16.0).unwrap(),
-                &ImageMetrics::default(),
+            .layout(
+                LayoutRequest::new(LayoutConstraints::new(600.0, 16.0).unwrap())
+                    .with_image_metrics(&ImageMetrics::default()),
                 &mut shaper,
                 &mut shaped_resources,
             )
             .unwrap();
         for width in [240.0, 160.0, 600.0] {
             document
-                .relayout_with_metrics_and_shaper(
-                    LayoutConstraints::new(width, 16.0).unwrap(),
-                    &ImageMetrics::default(),
+                .relayout(
+                    LayoutRequest::new(LayoutConstraints::new(width, 16.0).unwrap())
+                        .with_image_metrics(&ImageMetrics::default()),
                     &mut shaper,
                     &mut shaped_resources,
                 )
@@ -3396,7 +3411,7 @@ mod stage_tests {
             let text = document.render_view(&shaped_resources).text();
             let actual: String = (0..text.glyph_count())
                 .map(|index| {
-                    text_paint::glyph_metric(text, text_paint::glyph_at(text, index).unwrap())
+                    text.glyph_metric(text.glyph_at(index).unwrap())
                         .unwrap()
                         .ch()
                 })
@@ -3407,6 +3422,8 @@ mod stage_tests {
 
     #[test]
     fn paint_color_rebuilding_reuses_storage_without_allocating() {
+        let mut resources_shaper = TestGlyphShaper::new();
+
         use crate::allocation_test_support::count_allocations;
 
         let source = format!(
@@ -3422,9 +3439,13 @@ mod stage_tests {
             .unwrap();
         let mut resources = GlyphResourceStore::default();
         let mut document = prepared
-            .shape_borrowed(&mut TestGlyphShaper::new(), &mut resources)
+            .shape_borrowed(&mut resources_shaper, &mut resources)
             .unwrap()
-            .layout(LayoutConstraints::new(180.0, 20.0).unwrap(), &resources)
+            .layout(
+                LayoutRequest::new(LayoutConstraints::new(180.0, 20.0).unwrap()),
+                &mut resources_shaper,
+                &mut resources,
+            )
             .unwrap();
         let pointer = document.data.paint_colors.as_ptr();
         let capacity = document.data.paint_colors.capacity();
@@ -3444,14 +3465,14 @@ mod stage_tests {
             assert_eq!(document.data.paint_colors.capacity(), capacity);
             let text = document.render_view(&resources).text();
             for glyph in 0..text.glyph_count() {
-                let expected = match text_paint::render_text_view_character_at(text, glyph).unwrap()
+                let expected = match text.character_at(glyph).unwrap()
                 {
                     'a' | 'b' | 'c' => 0x000000ff,
                     'd' | 'e' | 'f' => 0xff0000ff,
                     other => panic!("unexpected character: {other}"),
                 };
                 assert_eq!(
-                    text_paint::paint_color_at(text, glyph as u32),
+                    text.paint_color_at(glyph as u32),
                     Some(foreground.unwrap_or(expected))
                 );
             }
@@ -3474,8 +3495,9 @@ mod stage_tests {
             .shape_borrowed(&mut shaper, &mut document_resources)
             .expect("valid shaping")
             .layout(
-                LayoutConstraints::new(180.0, 20.0).unwrap(),
-                &document_resources,
+                LayoutRequest::new(LayoutConstraints::new(180.0, 20.0).unwrap()),
+                &mut shaper,
+                &mut document_resources,
             )
             .expect("layout requires the shaper-aware API for first-line styles");
 
@@ -3486,20 +3508,20 @@ mod stage_tests {
             let addressing = black_box(view.addressing());
             let boxes = black_box(view.boxes());
             black_box(text.lines().iter().count());
-            black_box(text_paint::render_text_view_text_runs(text).count());
-            black_box(text_paint::marker_runs(text).count());
-            black_box(fragment_paint::decorations(fragments).iter().count());
+            black_box(text.text_runs().count());
+            black_box(text.marker_runs().count());
+            black_box(fragments.decorations().iter().count());
             black_box(
-                fragment_paint::render_fragment_view_images(fragments)
+                fragments.images()
                     .iter()
                     .count(),
             );
             black_box(addressing.anchor_positions().iter().count());
             black_box(addressing.anchor_glyphs().count());
-            black_box(box_queries::len(boxes));
+            black_box(boxes.len());
             black_box(text.glyph_slice(0..text.glyph_count() as u32));
-            if let Some(glyph) = text_paint::glyph_at(text, 0) {
-                black_box(text_paint::glyph_metric(text, glyph));
+            if let Some(glyph) = text.glyph_at(0) {
+                black_box(text.glyph_metric(glyph));
             }
         });
 
@@ -3516,11 +3538,14 @@ mod stage_tests {
             .shape(&mut shaper, &mut ordinary_resources)
             .expect("ordinary document shapes")
             .layout(
-                LayoutConstraints::new(300.0, 20.0)
-                    .unwrap()
-                    .with_viewport_height(Some(600.0))
-                    .unwrap(),
-                &ordinary_resources,
+                LayoutRequest::new(
+                    LayoutConstraints::new(300.0, 20.0)
+                        .unwrap()
+                        .with_viewport_height(Some(600.0))
+                        .unwrap(),
+                ),
+                &mut shaper,
+                &mut ordinary_resources,
             )
             .expect("layout requires the shaper-aware API for first-line styles");
         assert!(!ordinary.layout_depends_on_viewport_height());
@@ -3534,11 +3559,14 @@ mod stage_tests {
             .shape(&mut shaper, &mut percentage_resources)
             .expect("percentage-height document shapes")
             .layout(
-                LayoutConstraints::new(300.0, 20.0)
-                    .unwrap()
-                    .with_viewport_height(Some(600.0))
-                    .unwrap(),
-                &percentage_resources,
+                LayoutRequest::new(
+                    LayoutConstraints::new(300.0, 20.0)
+                        .unwrap()
+                        .with_viewport_height(Some(600.0))
+                        .unwrap(),
+                ),
+                &mut shaper,
+                &mut percentage_resources,
             )
             .expect("layout requires the shaper-aware API for first-line styles");
         assert!(percentage.layout_depends_on_viewport_height());

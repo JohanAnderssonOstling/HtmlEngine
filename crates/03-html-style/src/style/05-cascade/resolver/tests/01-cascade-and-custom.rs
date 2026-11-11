@@ -17,7 +17,7 @@ fn style_sharing_keeps_parent_inheritance_in_the_cache_key() {
         let node = document
             .document()
             .node_ids()
-            .find(|&node| document.document().get_dom_id(node) == Some(id))
+            .find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some(id))
             .unwrap();
         document
             .text_style(document.style_for_node(node).unwrap())
@@ -41,7 +41,7 @@ fn style_sharing_keeps_structural_selector_results_distinct() {
         let node = document
             .document()
             .node_ids()
-            .find(|&node| document.document().get_dom_id(node) == Some(id))
+            .find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some(id))
             .unwrap();
         document
             .text_style(document.style_for_node(node).unwrap())
@@ -65,13 +65,13 @@ fn style_sharing_reuses_custom_maps_and_copies_counter_directives() {
         document
             .document()
             .node_ids()
-            .find(|&node| document.document().get_dom_id(node) == Some(id))
+            .find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some(id))
             .unwrap()
     });
     for node in nodes {
         let style = document.style_for_node(node).unwrap();
         assert_eq!(document.text_style(style).unwrap().color, 0x008000ff);
-        let parent = document.document().get_dom_parent(node).unwrap();
+        let parent = document.document().node_ref(node).parent().unwrap();
         let counters = document
             .styles()
             .counter_directives_for_node(parent)
@@ -106,7 +106,7 @@ fn has_selector_participates_in_candidate_lookup_and_cascade() {
         let node = document
             .document()
             .node_ids()
-            .find(|&node| document.document().get_dom_id(node) == Some(id))
+            .find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some(id))
             .expect("element by id");
         document
             .background_style(document.style_for_node(node).expect("computed style"))
@@ -124,7 +124,7 @@ fn revert_layer_restores_the_previous_normal_layer() {
     let css = "@layer base, theme; @layer base { #target { background-color: green } } @layer theme { #target { background-color: red; background-color: revert-layer } }";
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, Some(css));
-    let node = document.document().node_ids().find(|&node| document.document().get_dom_id(node) == Some("target")).expect("target");
+    let node = document.document().node_ids().find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some("target")).expect("target");
     let style = document.style_for_node(node).expect("computed style");
 
     assert_eq!(document.background_style(style).expect("background").background_color, 0x008000FF);
@@ -135,7 +135,7 @@ fn revert_restores_the_previous_cascade_origin() {
     let html = "<html><body><div id='target'></div></body></html>";
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, Some("#target { display: inline; display: revert }"));
-    let node = document.document().node_ids().find(|&node| document.document().get_dom_id(node) == Some("target")).expect("target");
+    let node = document.document().node_ids().find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some("target")).expect("target");
     let style = document.style_for_node(node).expect("computed style");
 
     assert_eq!(document.box_model_style(style).expect("box style").display, Display::Block);
@@ -146,7 +146,7 @@ fn inline_revert_discards_stylesheet_declarations_from_the_author_origin() {
     let html = "<html><body><div id='target' style='display: revert'></div></body></html>";
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, Some("#target { display: inline }"));
-    let node = document.document().node_ids().find(|&node| document.document().get_dom_id(node) == Some("target")).expect("target");
+    let node = document.document().node_ids().find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some("target")).expect("target");
     let style = document.style_for_node(node).expect("computed style");
 
     assert_eq!(document.box_model_style(style).expect("box style").display, Display::Block);
@@ -163,7 +163,7 @@ fn important_revert_uses_the_normal_previous_origin_boundary() {
     let node = document
         .document()
         .node_ids()
-        .find(|&node| document.document().get_dom_id(node) == Some("target"))
+        .find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some("target"))
         .expect("target");
     let style = document.style_for_node(node).expect("computed style");
 
@@ -181,7 +181,7 @@ fn custom_property_revert_restores_the_inherited_origin_value() {
     let node = document
         .document()
         .node_ids()
-        .find(|&node| document.document().get_dom_id(node) == Some("target"))
+        .find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some("target"))
         .expect("target");
     let style = document.style_for_node(node).expect("computed style");
 
@@ -199,7 +199,7 @@ fn self_referential_custom_property_is_invalid_even_with_an_inner_fallback() {
     let node = document
         .document()
         .node_ids()
-        .find(|&node| document.document().get_dom_id(node) == Some("target"))
+        .find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some("target"))
         .expect("target");
     let style = document.style_for_node(node).expect("computed style");
 
@@ -217,7 +217,7 @@ fn every_member_of_a_multi_property_cycle_becomes_invalid() {
     let node = document
         .document()
         .node_ids()
-        .find(|&node| document.document().get_dom_id(node) == Some("target"))
+        .find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some("target"))
         .expect("target");
     let style = document.style_for_node(node).expect("computed style");
 
@@ -235,7 +235,7 @@ fn acyclic_dependent_can_fallback_from_a_cyclic_property() {
     let node = document
         .document()
         .node_ids()
-        .find(|&node| document.document().get_dom_id(node) == Some("target"))
+        .find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some("target"))
         .expect("target");
     let style = document.style_for_node(node).expect("computed style");
 
@@ -252,7 +252,7 @@ fn unused_fallback_cycles_leave_acyclic_dependents_available() {
         let node = document
             .document()
             .node_ids()
-            .find(|&node| document.document().get_dom_id(node) == Some(id))
+            .find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some(id))
             .unwrap();
         let style = document.style_for_node(node).unwrap();
         assert_eq!(
@@ -269,7 +269,7 @@ fn child_declarations_do_not_revive_an_invalid_inherited_custom_property() {
     let css = "#parent { --tone: var(--missing) } #target { --missing: red; background-color: var(--tone, green) }";
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, Some(css));
-    let node = document.document().node_ids().find(|&node| document.document().get_dom_id(node) == Some("target")).expect("target");
+    let node = document.document().node_ids().find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some("target")).expect("target");
     let style = document.style_for_node(node).expect("computed style");
 
     assert_eq!(document.background_style(style).expect("background").background_color, 0x008000FF);
@@ -289,7 +289,7 @@ fn custom_property_cycle_and_inheritance_wpt_cases_resolve_to_green() {
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, Some(css));
     for id in ["multi", "invalid-inherited", "resolved-inherited"] {
-        let node = document.document().node_ids().find(|&node| document.document().get_dom_id(node) == Some(id)).expect("target");
+        let node = document.document().node_ids().find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some(id)).expect("target");
         let style = document.style_for_node(node).expect("computed style");
         assert_eq!(document.text_style(style).expect("text style").color, 0x008000FF, "{id}");
     }
@@ -301,7 +301,7 @@ fn substituted_inherit_is_finalized_before_dependent_custom_properties() {
     let css = "#parent { --a: green } #target { --a: var(--missing, inherit); --b: var(--a); background-color: var(--b) }";
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, Some(css));
-    let node = document.document().node_ids().find(|&node| document.document().get_dom_id(node) == Some("target")).expect("target");
+    let node = document.document().node_ids().find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some("target")).expect("target");
     let style = document.style_for_node(node).expect("computed style");
 
     assert_eq!(document.background_style(style).expect("background").background_color, 0x008000FF);
@@ -313,7 +313,7 @@ fn var_substitution_preserves_boundary_before_an_adjacent_identifier() {
     let css = "body { color: green } #target { color: red; --a: var(--b)red; --b: orange; color: var(--a) }";
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, Some(css));
-    let node = document.document().node_ids().find(|&node| document.document().get_dom_id(node) == Some("target")).expect("target");
+    let node = document.document().node_ids().find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some("target")).expect("target");
     let style = document.style_for_node(node).expect("computed style");
 
     assert_eq!(document.text_style(style).expect("text style").color, 0x008000FF);
@@ -325,7 +325,7 @@ fn adjacent_var_substitutions_remain_distinct_tokens() {
     let css = "body { color: green } #target { color: red; --a: orange; --b: red; color: var(--a)var(--b) }";
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, Some(css));
-    let node = document.document().node_ids().find(|&node| document.document().get_dom_id(node) == Some("target")).expect("target");
+    let node = document.document().node_ids().find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some("target")).expect("target");
     let style = document.style_for_node(node).expect("computed style");
 
     assert_eq!(document.text_style(style).expect("text style").color, 0x008000FF);
@@ -342,7 +342,7 @@ fn all_revert_restores_every_property_from_the_previous_origin() {
     let node = document
         .document()
         .node_ids()
-        .find(|&node| document.document().get_dom_id(node) == Some("target"))
+        .find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some("target"))
         .expect("target");
     let style = document.style_for_node(node).expect("computed style");
     let box_style = document.box_model_style(style).expect("box style");
@@ -357,7 +357,7 @@ fn all_initial_resets_supported_properties_but_preserves_direction() {
     let html = "<html><body><div id='target'></div></body></html>";
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, Some("#target { direction: rtl; display: block; width: 200px; color: red; background-color: red; all: initial }"));
-    let node = document.document().node_ids().find(|&node| document.document().get_dom_id(node) == Some("target")).expect("target");
+    let node = document.document().node_ids().find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some("target")).expect("target");
     let style = document.style_for_node(node).expect("computed style");
     let box_style = document.box_model_style(style).expect("box style");
 
@@ -374,7 +374,7 @@ fn all_inherit_copies_reset_and_inherited_properties_from_the_parent() {
     let css = "#parent { display: inline; width: 123px; color: green; background-color: green } #target { direction: rtl; all: inherit }";
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, Some(css));
-    let node = document.document().node_ids().find(|&node| document.document().get_dom_id(node) == Some("target")).expect("target");
+    let node = document.document().node_ids().find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some("target")).expect("target");
     let style = document.style_for_node(node).expect("computed style");
     let box_style = document.box_model_style(style).expect("box style");
 
@@ -391,7 +391,7 @@ fn all_inherit_uses_the_dom_parent_across_inline_block_nesting() {
     let css = "#parent { display: inline } #target { all: inherit }";
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, Some(css));
-    let node = document.document().node_ids().find(|&node| document.document().get_dom_id(node) == Some("target")).expect("target");
+    let node = document.document().node_ids().find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some("target")).expect("target");
     let style = document.style_for_node(node).expect("computed style");
 
     assert_eq!(document.box_model_style(style).expect("box style").display, Display::Inline);
@@ -403,7 +403,7 @@ fn all_unset_inherits_inherited_properties_and_initializes_reset_properties() {
     let css = "#parent { color: green; font-size: 20px; background-color: green } #target { display: block; width: 123px; background-color: red; all: unset }";
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, Some(css));
-    let node = document.document().node_ids().find(|&node| document.document().get_dom_id(node) == Some("target")).expect("target");
+    let node = document.document().node_ids().find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some("target")).expect("target");
     let style = document.style_for_node(node).expect("computed style");
     let box_style = document.box_model_style(style).expect("box style");
 
@@ -425,7 +425,7 @@ fn unlayered_revert_layer_falls_back_to_the_previous_origin() {
     let node = document
         .document()
         .node_ids()
-        .find(|&node| document.document().get_dom_id(node) == Some("target"))
+        .find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some("target"))
         .expect("target");
     let style = document.style_for_node(node).expect("computed style");
 
@@ -438,7 +438,7 @@ fn important_revert_layer_uses_the_corresponding_normal_layer_boundary() {
     let css = "@layer { #target { background-color: green } } @layer { #target { background-color: red !important; background-color: revert-layer !important } } @layer { #target { background-color: red !important } }";
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, Some(css));
-    let node = document.document().node_ids().find(|&node| document.document().get_dom_id(node) == Some("target")).expect("target");
+    let node = document.document().node_ids().find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some("target")).expect("target");
     let style = document.style_for_node(node).expect("computed style");
 
     assert_eq!(document.background_style(style).expect("background").background_color, 0x008000FF);
@@ -449,7 +449,7 @@ fn inline_revert_layer_restores_stylesheet_declarations() {
     let html = "<html><body><div id='target' style='background-color: red; background-color: revert-layer'></div></body></html>";
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, Some("#target { background-color: green }"));
-    let node = document.document().node_ids().find(|&node| document.document().get_dom_id(node) == Some("target")).expect("target");
+    let node = document.document().node_ids().find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some("target")).expect("target");
     let style = document.style_for_node(node).expect("computed style");
 
     assert_eq!(document.background_style(style).expect("background").background_color, 0x008000FF);
@@ -460,7 +460,7 @@ fn important_inline_revert_layer_keeps_author_stylesheet_rules() {
     let html = "<html><body><div id='target' style='background-color: red !important; background-color: revert-layer !important'></div></body></html>";
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, Some("#target { background-color: green !important }"));
-    let node = document.document().node_ids().find(|&node| document.document().get_dom_id(node) == Some("target")).expect("target");
+    let node = document.document().node_ids().find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some("target")).expect("target");
     let style = document.style_for_node(node).expect("computed style");
 
     assert_eq!(document.background_style(style).expect("background").background_color, 0x008000FF);
@@ -472,7 +472,7 @@ fn all_revert_layer_restores_every_property_from_the_previous_layer() {
     let css = "@layer { #target { width: 100px; height: 100px; background-color: green } } @layer { #target { width: 200px; height: 200px; background-color: red } #target { all: revert-layer } }";
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, Some(css));
-    let node = document.document().node_ids().find(|&node| document.document().get_dom_id(node) == Some("target")).expect("target");
+    let node = document.document().node_ids().find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some("target")).expect("target");
     let style = document.style_for_node(node).expect("computed style");
     let box_style = document.box_model_style(style).expect("box style");
 
@@ -487,7 +487,7 @@ fn custom_property_revert_layer_restores_the_previous_token_value() {
     let css = "@layer base, theme; @layer base { #target { --tone: green } } @layer theme { #target { --tone: red; --tone: revert-layer } } #target { background-color: var(--tone) }";
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, Some(css));
-    let node = document.document().node_ids().find(|&node| document.document().get_dom_id(node) == Some("target")).expect("target");
+    let node = document.document().node_ids().find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some("target")).expect("target");
     let style = document.style_for_node(node).expect("computed style");
 
     assert_eq!(document.background_style(style).expect("background").background_color, 0x008000FF);

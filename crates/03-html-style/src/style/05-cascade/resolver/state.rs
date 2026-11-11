@@ -1,18 +1,83 @@
-/// Owned computed groups shared by parent snapshots and cascade accumulators.
-/// Inherited groups (`font`, `text`) are cloned from the parent; reset groups
-/// start from their defaults. Declaration-local state is empty when loading
-/// a parent from the style store.
+/// Reset groups are owned by the current cascade. Inherited font/text groups
+/// remain store handles until a property actually writes to them.
 pub(super) struct WorkingStyle {
-    pub(super) font: Font,
-    pub(super) text: InheritedText,
+    font: ComputedStyleGroup<Font>,
+    text: ComputedStyleGroup<InheritedText>,
     pub(super) box_model: BoxModel,
     pub(super) border: Border,
     pub(super) radii: BorderRadii,
     pub(super) background: Background,
     pub(super) layout: LayoutStyle,
-    pub(super) line_height_spec: Option<CssLineHeight>,
+    pub(super) line_height_spec: Option<Arc<PreparedLineHeight>>,
     pub(super) generated_content: Option<GeneratedContent>,
     pub(super) counters: CounterDirectives,
+}
+
+/// Read-only projection; borrowing a stored parent never clones its groups.
+pub(super) struct StyleRef<'a> {
+    pub(super) font: &'a Font,
+    pub(super) text: &'a InheritedText,
+    pub(super) box_model: &'a BoxModel,
+    pub(super) border: &'a Border,
+    pub(super) radii: &'a BorderRadii,
+    pub(super) background: &'a Background,
+    pub(super) layout: &'a LayoutStyle,
+    pub(super) line_height_spec: &'a Option<Arc<PreparedLineHeight>>,
+    pub(super) generated_content: &'a Option<GeneratedContent>,
+    pub(super) counters: &'a CounterDirectives,
+}
+
+/// Resolve the handle only for the duration of a read, allowing the builder
+/// to keep interning values between parent accesses.
+#[derive(Clone, Copy)]
+pub(super) struct ParentStyle {
+    indices: Option<StyleIndices>,
+    root_font_size: f32,
+}
+
+impl ParentStyle {
+    pub(super) fn new(indices: Option<StyleIndices>, root_font_size: f32) -> Self {
+        Self {
+            indices,
+            root_font_size,
+        }
+    }
+
+    pub(super) fn with<R>(
+        &self,
+        styles: &ComputedStylesBuilder,
+        read: impl FnOnce(StyleRef<'_>) -> R,
+    ) -> R {
+        let Some(indices) = self.indices else {
+            return read(WorkingStyle::initial(self.root_font_size).view(styles));
+        };
+        read(StyleRef {
+            font: styles
+                .font_style(indices)
+                .expect("builder-issued style handle"),
+            text: styles
+                .text_style(indices)
+                .expect("builder-issued style handle"),
+            box_model: styles
+                .box_model_style(indices)
+                .expect("builder-issued style handle"),
+            border: styles
+                .border_style(indices)
+                .expect("builder-issued style handle"),
+            radii: styles
+                .border_radii_style(indices)
+                .expect("builder-issued style handle"),
+            background: styles
+                .background_style(indices)
+                .expect("builder-issued style handle"),
+            layout: styles
+                .layout_style(indices)
+                .expect("builder-issued style handle"),
+            line_height_spec: &None,
+            generated_content: &None,
+            counters: &CounterDirectives::default(),
+        })
+    }
 }
 
 pub(super) fn initial_box_model() -> BoxModel {
@@ -35,8 +100,8 @@ pub(super) fn initial_border() -> Border {
 impl Default for WorkingStyle {
     fn default() -> Self {
         Self {
-            font: Font::default(),
-            text: InheritedText::default(),
+            font: ComputedStyleGroup::Owned(Font::default()),
+            text: ComputedStyleGroup::Owned(InheritedText::default()),
             box_model: initial_box_model(),
             border: initial_border(),
             radii: BorderRadii::default(),
@@ -50,70 +115,88 @@ impl Default for WorkingStyle {
 }
 
 impl WorkingStyle {
-    #[inline]
-    pub(super) fn clone_from(&mut self, source: &Self) {
-        self.font.clone_from(&source.font);
-        self.text.clone_from(&source.text);
-        self.box_model.clone_from(&source.box_model);
-        self.border.clone_from(&source.border);
-        self.radii = source.radii;
-        self.background.clone_from(&source.background);
-        self.layout.clone_from(&source.layout);
-        self.line_height_spec.clone_from(&source.line_height_spec);
-        self.generated_content.clone_from(&source.generated_content);
-        self.counters.clone_from(&source.counters);
-    }
-
-    /// Load computed values without inheriting authored line-height expressions
-    /// or per-element generated-content and counter state.
-    pub(super) fn from_indices(styles: &ComputedStylesBuilder, indices: StyleIndices) -> Self {
-        Self {
-            font: styles
-                .font_style(indices)
-                .expect("builder-issued style handle")
-                .clone(),
-            text: styles
-                .text_style(indices)
-                .expect("builder-issued style handle")
-                .clone(),
-            box_model: styles
-                .box_model_style(indices)
-                .expect("builder-issued style handle")
-                .clone(),
-            border: styles
-                .border_style(indices)
-                .expect("builder-issued style handle")
-                .clone(),
-            radii: *styles
-                .border_radii_style(indices)
-                .expect("builder-issued style handle"),
-            background: styles
-                .background_style(indices)
-                .expect("builder-issued style handle")
-                .clone(),
-            layout: styles
-                .layout_style(indices)
-                .expect("builder-issued style handle")
-                .clone(),
-            ..Self::default()
+    pub(super) fn view<'a>(&'a self, styles: &'a ComputedStylesBuilder) -> StyleRef<'a> {
+        StyleRef {
+            font: self.font(styles),
+            text: self.text(styles),
+            box_model: &self.box_model,
+            border: &self.border,
+            radii: &self.radii,
+            background: &self.background,
+            layout: &self.layout,
+            line_height_spec: &self.line_height_spec,
+            generated_content: &self.generated_content,
+            counters: &self.counters,
         }
     }
 
     pub(super) fn initial(root_font_size: f32) -> Self {
         let mut style = Self::default();
-        style.font.font_size = root_font_size;
+        if let ComputedStyleGroup::Owned(font) = &mut style.font {
+            font.font_size = root_font_size;
+        }
         style
     }
 
     /// Inherit only the groups and box properties that CSS inherits by default.
-    pub(super) fn inherited(parent: &Self) -> Self {
-        let mut style = Self {
-            font: parent.font.clone(),
-            text: parent.text.clone(),
-            ..Self::default()
-        };
-        inherit_box_model_properties(&mut style.box_model, &parent.box_model);
+    pub(super) fn inherited(parent: &ParentStyle, styles: &ComputedStylesBuilder) -> Self {
+        let mut style = Self::default();
+        if let Some(indices) = parent.indices {
+            style.font = ComputedStyleGroup::Inherited(indices);
+            style.text = ComputedStyleGroup::Inherited(indices);
+        } else {
+            style = Self::initial(parent.root_font_size);
+        }
+        parent.with(styles, |parent| {
+            inherit_box_model_properties(&mut style.box_model, parent.box_model)
+        });
         style
+    }
+
+    pub(super) fn font<'a>(&'a self, styles: &'a ComputedStylesBuilder) -> &'a Font {
+        match &self.font {
+            ComputedStyleGroup::Inherited(indices) => {
+                styles.font_style(*indices).expect("inherited font")
+            }
+            ComputedStyleGroup::Owned(value) => value,
+        }
+    }
+
+    pub(super) fn text<'a>(&'a self, styles: &'a ComputedStylesBuilder) -> &'a InheritedText {
+        match &self.text {
+            ComputedStyleGroup::Inherited(indices) => {
+                styles.text_style(*indices).expect("inherited text")
+            }
+            ComputedStyleGroup::Owned(value) => value,
+        }
+    }
+
+    pub(super) fn font_group(&self) -> ComputedStyleGroup<Font> {
+        self.font.clone()
+    }
+
+    pub(super) fn font_mut(&mut self, styles: &ComputedStylesBuilder) -> &mut Font {
+        if let ComputedStyleGroup::Inherited(indices) = self.font {
+            self.font = ComputedStyleGroup::Owned(
+                styles.font_style(indices).expect("inherited font").clone(),
+            );
+        }
+        match &mut self.font {
+            ComputedStyleGroup::Owned(value) => value,
+            _ => unreachable!(),
+        }
+    }
+
+    pub(super) fn text_mut(&mut self, styles: &ComputedStylesBuilder) -> &mut InheritedText {
+        if let ComputedStyleGroup::Inherited(indices) = self.text {
+            self.text = ComputedStyleGroup::Owned(
+                styles.text_style(indices).expect("inherited text").clone(),
+            );
+        }
+        match &mut self.text {
+            ComputedStyleGroup::Owned(value) => value,
+            _ => unreachable!(),
+        }
     }
 
     /// Move the resolved sub-styles into the document's deduped style store.
@@ -122,9 +205,15 @@ impl WorkingStyle {
         styles: &mut ComputedStylesBuilder,
     ) -> Result<StyleIndices, ComputedStyleValueError> {
         self.layout.static_position_inline = self.layout.position == PositionMode::Absolute
-            && (self.layout.static_position_inline || matches!(self.box_model.display,
-                Display::Inline | Display::InlineBlock | Display::InlineTable
-                    | Display::InlineFlex | Display::InlineGrid));
+            && (self.layout.static_position_inline
+                || matches!(
+                    self.box_model.display,
+                    Display::Inline
+                        | Display::InlineBlock
+                        | Display::InlineTable
+                        | Display::InlineFlex
+                        | Display::InlineGrid
+                ));
         // Absolute positioning and floating both blockify the principal box
         // at the computed-style boundary (CSS 2.1 section 9.7). The box
         // builder still recognizes a floated descendant from its `float`
@@ -142,7 +231,7 @@ impl WorkingStyle {
             };
         }
         self.box_model.normalize_overflow_axes();
-        styles.push_with_layout_and_radii(
+        styles.push_with_inherited_groups(
             self.font,
             self.text,
             self.box_model,
@@ -153,12 +242,12 @@ impl WorkingStyle {
         )
     }
 }
+use super::prepared_native::typography::PreparedLineHeight;
 use html_style_model::{
-    Background, Border, BorderRadii, BoxModel, ComputedStyleValueError, ComputedStylesBuilder,
-    CounterDirectives, Display, Float, Font, FontRelativeLength, GeneratedContent, InheritedText,
-    LayoutStyle, PositionMode, StyleIndices,
+    Background, Border, BorderRadii, BoxModel, ComputedStyleGroup, ComputedStyleValueError,
+    ComputedStylesBuilder, CounterDirectives, Display, Float, Font, FontRelativeLength,
+    GeneratedContent, InheritedText, LayoutStyle, PositionMode, StyleIndices,
 };
-use lightningcss::properties::font::LineHeight as CssLineHeight;
 
 pub(super) fn inherit_box_model_properties(style: &mut BoxModel, parent: &BoxModel) {
     style.border_collapse = parent.border_collapse;
@@ -167,3 +256,5 @@ pub(super) fn inherit_box_model_properties(style: &mut BoxModel, parent: &BoxMod
     style.caption_side = parent.caption_side;
     style.empty_cells = parent.empty_cells;
 }
+
+use std::sync::Arc;

@@ -1,4 +1,5 @@
 //! Token-span measurement, optical margins, and justification.
+use html_engine_model::{GlyphMetric};
 
 use super::*;
 use crate::layout::inline::justification::{tracking_boundary_limit, tracking_width_limit};
@@ -17,9 +18,6 @@ pub(super) fn measure_line(
     containing_width: f64,
     direction: TextDirection,
 ) -> LineLayout {
-    profile_scope!("lines.measure");
-    engine.record_timing(|timings| timings.measured_lines += 1);
-    let timing_started = engine.start_timing();
     let hyphen =
         line.hyphen
             .map(|(glyph, width)| (glyph, f64::from(width)))
@@ -204,10 +202,12 @@ pub(super) fn measure_line(
         punctuation_space_advances,
         optical_offset_x,
         placements,
+        fragments: None,
         hyphen,
         publish_empty: empty_break_metrics.is_some(),
+        publishes_line: false,
+        has_tabs: summary.has_tabs,
     };
-    engine.record_timing(|t| t.measure_line += timing_started.elapsed());
     layout
 }
 
@@ -330,7 +330,7 @@ fn optical_margin_protrusion(
             summary.glyph_range.clone().rev().find_map(visible),
         )
     };
-    let protrusion = |entry: Option<(u32, crate::layout_model::GlyphMetric)>, start: bool| {
+    let protrusion = |entry: Option<(u32, GlyphMetric)>, start: bool| {
         let Some((index, metric)) = entry else {
             return 0.0;
         };
@@ -427,13 +427,13 @@ fn summarize_token_span_with<S: TokenRead>(
     tab_origin: f64,
     inline_struts: &[InlineBoxStrut],
 ) -> TokenSpanSummary {
-    profile_scope!("lines.summarize");
     let mut glyph_start = u32::MAX;
     let mut glyph_end = 0;
     let mut expected_glyph = None;
     let mut text_class = TextClass::Plain;
     let mut has_text = false;
     let mut has_images = false;
+    let mut has_tabs = false;
     let mut has_baseline_relative_image = false;
     let mut preserves_newlines = false;
     // A uniform reader's first level describes the entire span, including
@@ -538,6 +538,7 @@ fn summarize_token_span_with<S: TokenRead>(
         if S::MAY_HAVE_MIXED_BIDI_LEVELS {
             bidi.merge(InlineBidiSummary::from_level(token.bidi_level()));
         }
+        has_tabs |= token.is_tab();
         let kind = token.kind();
         let metrics = metrics_cursor.at(token_index, token);
         let ascent = metrics.ascent as f64;
@@ -660,6 +661,7 @@ fn summarize_token_span_with<S: TokenRead>(
             TextCoverage::Fragments
         },
         has_images,
+        has_tabs,
         has_baseline_relative_image,
         plain_text: text_class == TextClass::Plain && has_text,
         justifiable_text: text_class <= TextClass::Justifiable && has_text,
@@ -725,9 +727,7 @@ fn justification_spacing(
     is_last_line: bool,
     text_align: TextAlign,
 ) -> JustificationSpacing {
-    profile_scope!("lines.justification");
-    let should_justify = text_align == TextAlign::Justify
-        || (engine.config.force_justify() && text_align == TextAlign::Left);
+    let should_justify = text_align == TextAlign::Justify;
     if (is_last_line && text_align != TextAlign::Justify)
         || (summary.preserves_newlines && engine.config.book_optimized_text())
         || !should_justify

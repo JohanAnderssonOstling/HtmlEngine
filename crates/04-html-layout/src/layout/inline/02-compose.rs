@@ -2,15 +2,15 @@
 use super::fragments::{LineEmissionContext, prepare_line, pseudo_line_heights};
 use super::hyphenation::DeferredHyphenation;
 use super::paragraph::ParagraphLayoutResult;
-use super::publication::emit_prepared_paragraph;
+use super::s03_emit::emit_prepared_paragraph;
 use super::retained::{CachedParagraph, ParagraphDependencies, ParagraphLookup, ParagraphSlot};
 use super::text_tokens::{InlineOverflow, inline_overflow};
 use super::tokens::{INLINE_KP_CACHE_MIN_TOKENS, InlineTokenKind, InlineTokens, indent_for_line};
 use super::wrapping::{self, LineConstraints, break_lines_knuth, break_next_line};
 use super::{InlineFormattingInput, Size, TextAlign, TextDirection, TextWrapStyle};
 use crate::layout::block::layout_float;
-use crate::layout::{BoxLayoutRequest, LayoutEngine};
 use crate::layout::intrinsic_sizing::box_intrinsic_widths;
+use crate::layout::{BoxLayoutRequest, LayoutEngine};
 use kurbo::{Insets, Point};
 use std::mem::{swap, take};
 
@@ -23,7 +23,6 @@ pub(super) fn layout_prepared_tokens(
     has_float_exclusions: bool,
     immutable_text: bool,
 ) -> Size {
-    profile_scope!("layout.paragraph");
     if tokens.is_empty() {
         return Size::ZERO;
     }
@@ -43,14 +42,14 @@ pub(super) fn layout_prepared_tokens(
     );
     let slot = ParagraphSlot::new(engine, input);
     let mut paragraph = match engine
+        .scratch
         .paragraph_layouts
         .take(slot, &dependencies, tokens, cacheable)
     {
-        ParagraphLookup::Hit(cached) => {
-            emit_prepared_paragraph(engine, input, tokens, &cached.paragraph);
+        ParagraphLookup::Hit(mut cached) => {
+            emit_prepared_paragraph(engine, input, tokens, &mut cached.paragraph, true);
             let size = cached.paragraph.size;
-            engine.record_timing(|timings| timings.reused_lines += cached.paragraph.lines.len());
-            engine.paragraph_layouts.insert(slot, cached);
+            engine.scratch.paragraph_layouts.insert(slot, cached);
             return size;
         }
         ParagraphLookup::Miss { paragraph } => paragraph,
@@ -66,23 +65,21 @@ pub(super) fn layout_prepared_tokens(
             &mut paragraph,
         );
     } else {
-        let mut scratch = engine.paragraphs.pop().unwrap_or_default();
+        let mut scratch = engine.scratch.paragraphs.pop().unwrap_or_default();
         let ragged_knuth = (input.paragraph.wrap_style == TextWrapStyle::Pretty
             || (engine.config.book_optimized_text()
                 && input.paragraph.wrap_style == TextWrapStyle::Auto
                 && input.paragraph.text_align
-                == (if input.paragraph.direction == TextDirection::Rtl {
-                    TextAlign::Right
-                } else {
-                    TextAlign::Left
-                })))
-            && !engine.config.force_justify()
+                    == (if input.paragraph.direction == TextDirection::Rtl {
+                        TextAlign::Right
+                    } else {
+                        TextAlign::Left
+                    })))
             && !tokens.features.preserves_spaces;
         let use_knuth = !tokens.features.has_tabs
             && input.paragraph.wrap_style != TextWrapStyle::Stable
             && ((engine.config.book_optimized_text()
-                && (matches!(input.paragraph.text_align, TextAlign::Justify)
-                    || engine.config.force_justify()))
+                && matches!(input.paragraph.text_align, TextAlign::Justify))
                 || ragged_knuth);
         let break_storage = take(&mut scratch.lines);
         if use_knuth && immutable_text && tokens.len() >= INLINE_KP_CACHE_MIN_TOKENS {
@@ -163,19 +160,25 @@ pub(super) fn layout_prepared_tokens(
             first_line_height,
             first_letter_height,
         );
-        prepare_selected_paragraph(engine, &context, &lines, &mut paragraph);
+        prepare_selected_paragraph(
+            engine,
+            &context,
+            &lines,
+            input.area.origin.y,
+            &mut paragraph,
+        );
         scratch.lines = lines;
         scratch.lines.clear();
         // Publication can recurse into atomic content; line breaking is done,
         // so nested paragraphs can reuse its scratch immediately.
-        engine.paragraphs.push(scratch);
+        engine.scratch.paragraphs.push(scratch);
     }
-    emit_prepared_paragraph(engine, input, tokens, &paragraph);
+    emit_prepared_paragraph(engine, input, tokens, &mut paragraph, cacheable);
     let size = paragraph.size;
     if cacheable {
         paragraph.lines.shrink_to_fit();
         paragraph.adjustments.shrink_to_fit();
-        engine.paragraph_layouts.insert(
+        engine.scratch.paragraph_layouts.insert(
             slot,
             CachedParagraph::new(dependencies, tokens.len(), paragraph),
         );
@@ -188,6 +191,7 @@ fn prepare_selected_paragraph(
     engine: &mut LayoutEngine<'_, '_>,
     context: &LineEmissionContext<'_>,
     lines: &[wrapping::BrokenLine],
+    _origin_y: f64,
     paragraph: &mut ParagraphLayoutResult,
 ) {
     paragraph.lines.clear();
@@ -209,6 +213,7 @@ fn prepare_selected_paragraph(
             index,
             &mut paragraph.adjustments,
         );
+
         paragraph.lines.push(line);
         y += height;
         width = width.max(measured_width);
@@ -226,7 +231,6 @@ fn prepare_lines_around_float_exclusions(
     first_letter_height: Option<f64>,
     paragraph: &mut ParagraphLayoutResult,
 ) {
-    let timing_started = engine.start_timing();
     let mut deferred_cache = tokens.deferred_hyphens.take();
     let mut deferred = tokens.features.deferred_hyphenation().then(|| {
         DeferredHyphenation::new(
@@ -251,8 +255,10 @@ fn prepare_lines_around_float_exclusions(
     let mut starts_indented_line = input.paragraph.indent.first_line;
     let mut float_cursor = 0;
     let mut placed_boxes = Vec::new();
+    let mut probe_adjustments = Vec::new();
     while start < tokens.len() {
-        let (result, left) = loop {
+        let mut required_line_height = 0.0_f64;
+        let (result, prepared_line) = loop {
             let container_line_height = engine
                 .reader
                 .style(input.container_box_idx)
@@ -280,7 +286,9 @@ fn prepare_lines_around_float_exclusions(
                 } else {
                     container_line_height
                 })
-                .max(1.0);
+                .max(1.0)
+                .max(required_line_height);
+
             // A zero-width opportunity before an atomic inline must not turn into
             // an empty line that leaves the atomic item overflowing beside a
             // float. If the item fits the containing block but not the current
@@ -305,6 +313,7 @@ fn prepare_lines_around_float_exclusions(
                 if item_width <= input.area.width {
                     let current_y = input.area.origin.y + y;
                     if let Some(next_y) = engine
+                        .scratch
                         .floats
                         .current_float_context()
                         .map(|context| {
@@ -323,6 +332,7 @@ fn prepare_lines_around_float_exclusions(
                 }
             }
             let (left, right) = engine
+                .scratch
                 .floats
                 .current_float_context()
                 .map(|context| {
@@ -357,6 +367,27 @@ fn prepare_lines_around_float_exclusions(
                 constraints,
                 deferred.as_mut(),
             );
+            let mut prepared_line = None;
+            probe_adjustments.clear();
+            if let Some(line) = &result.line {
+                let (prepared, width, height) = prepare_line(
+                    engine,
+                    &emission,
+                    line,
+                    is_first_line,
+                    Point::new(left - input.area.origin.x, y),
+                    paragraph.lines.len(),
+                    &mut probe_adjustments,
+                );
+                prepared_line = Some((prepared, width, height));
+
+                // The actual row can be taller than its first token. Query
+                // exclusions again before accepting breaks at that height.
+                if height > probe_line_height + 0.001 {
+                    required_line_height = height;
+                    continue;
+                }
+            }
             // Inspect only the actual next line. A float changes that line's
             // available interval, so rebreak locally before publishing it.
             let scan_start = float_cursor.max(start).min(result.next_start);
@@ -442,12 +473,15 @@ fn prepare_lines_around_float_exclusions(
                     }
                 }
                 let source_y = input.area.origin.y + y;
-                let source_y = engine
-                    .floats
-                    .current_float_context()
-                    .map_or(source_y, |context| {
-                        context.clear_for(source_y, engine.reader.style(box_idx as usize).clear())
-                    });
+                let source_y =
+                    engine
+                        .scratch
+                        .floats
+                        .current_float_context()
+                        .map_or(source_y, |context| {
+                            context
+                                .clear_for(source_y, engine.reader.style(box_idx as usize).clear())
+                        });
                 place_float_anchor(
                     engine,
                     box_idx as usize,
@@ -463,21 +497,28 @@ fn prepare_lines_around_float_exclusions(
             // that run fits the containing block. Shared line measurement
             // excludes hanging preserved spaces from this fit decision.
             if right - left < input.area.width
-                && engine.reader.style(input.container_box_idx).white_space().allows_wrap()
-                && let Some(line) = &result.line
+                && engine
+                    .reader
+                    .style(input.container_box_idx)
+                    .white_space()
+                    .allows_wrap()
+                && let Some((_, width, height)) = &prepared_line
             {
-                let mut probe_adjustments = Vec::new();
-                let (_, width, height) = prepare_line(
-                    engine, &emission, line, is_first_line, Point::ORIGIN,
-                    paragraph.lines.len(), &mut probe_adjustments,
-                );
-                if width > right - left && width <= input.area.width {
+                if *width > right - left && *width <= input.area.width {
                     let current_y = input.area.origin.y + y;
-                    if let Some(next_y) = engine.floats.current_float_context()
-                        .map(|context| context.next_y_fitting(
-                            current_y, width, height.max(1.0), input.area.origin.x,
-                            input.area.origin.x + input.area.width,
-                        ))
+                    if let Some(next_y) = engine
+                        .scratch
+                        .floats
+                        .current_float_context()
+                        .map(|context| {
+                            context.next_y_fitting(
+                                current_y,
+                                *width,
+                                height.max(1.0),
+                                input.area.origin.x,
+                                input.area.origin.x + input.area.width,
+                            )
+                        })
                         .filter(|next_y| *next_y > current_y)
                     {
                         y = next_y - input.area.origin.y;
@@ -485,7 +526,8 @@ fn prepare_lines_around_float_exclusions(
                     }
                 }
             }
-            break (result, left);
+            paragraph.adjustments.append(&mut probe_adjustments);
+            break (result, prepared_line);
         };
         let previous_start = start;
         start = result.next_start;
@@ -505,17 +547,7 @@ fn prepare_lines_around_float_exclusions(
             })
             .flatten();
 
-        if let Some(line) = result.line {
-            let line_origin = Point::new(left - input.area.origin.x, y);
-            let (line, width, height) = prepare_line(
-                engine,
-                &emission,
-                &line,
-                is_first_line,
-                line_origin,
-                paragraph.lines.len(),
-                &mut paragraph.adjustments,
-            );
+        if let Some((line, width, height)) = prepared_line {
             paragraph.lines.push(line);
             max_width = max_width.max(width);
             y += height;
@@ -524,6 +556,7 @@ fn prepare_lines_around_float_exclusions(
         if let Some(clear) = forced_clear {
             let current_y = input.area.origin.y + y;
             if let Some(cleared_y) = engine
+                .scratch
                 .floats
                 .current_float_context()
                 .map(|context| context.clear_for(current_y, clear))
@@ -543,9 +576,6 @@ fn prepare_lines_around_float_exclusions(
     // incorrectly makes a paragraph as tall as a preceding sibling float.
     tokens.deferred_hyphens = deferred_cache;
     paragraph.size = Size::new(max_width, y);
-    engine.record_timing(|timing| {
-        timing.layout_runs_around_float_exclusions += timing_started.elapsed()
-    });
 }
 
 fn place_float_anchor(
@@ -556,7 +586,6 @@ fn place_float_anchor(
     containing_block_height: Option<f64>,
     preceding_line: Size,
 ) {
-    let timing_started = engine.start_timing();
     let style = engine.reader.style(box_idx);
     let margins = Insets::new(
         style.margin_left().resolve(available_width),
@@ -570,5 +599,4 @@ fn place_float_anchor(
         containing_block_height,
     ));
     layout_float(engine, resolved, position, margins, preceding_line);
-    engine.record_timing(|t| t.place_float_anchor += timing_started.elapsed());
 }

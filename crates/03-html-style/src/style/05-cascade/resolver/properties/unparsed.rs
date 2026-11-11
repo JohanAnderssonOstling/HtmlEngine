@@ -1,294 +1,262 @@
-use html_style_model::open_type;
+//! Apply renderer-owned values whose grammar was prepared independently of the element.
 use super::super::context::ResolutionContext;
-use super::super::custom_properties::token_list_to_css_string;
+use super::super::prepared_native::{length_pct, typography::evaluate};
 use super::super::state::WorkingStyle;
 use super::super::values::fonts::font_variant_caps_features;
-use super::super::values::lengths::{computed_length_pct, length_percentage_to_text_spacing};
-use super::generated::{parse_counter_directives, parse_generated_content, parse_quotes};
-use crate::style::compiled::PreparedTextSpacing;
-use crate::style::syntax::native_fallback;
+use crate::style::property_catalogue::PropertyKey;
+use crate::style::syntax::prepared_generated::{PreparedContentItem, PreparedQuoteStyle};
+use crate::style::syntax::prepared_renderer::PreparedRendererValue;
 use crate::style::syntax::property_id::RendererPropertyId;
-use crate::style::syntax::renderer_owned::OutlineOffset;
-use crate::style::syntax::value::parse_integer;
-use crate::style::syntax::{contain, font_features, renderer_owned};
 use html_style_model::{
-    ComputedStylesBuilder, LengthPct, ObjectPosition, ObjectPositionAxis, ObjectPositionOrigin,
+    ComputedStylesBuilder, CounterDirective, GeneratedContent, GeneratedContentItem,
+    ObjectPosition, ObjectPositionAxis, QuoteStyle, TextDirection,
 };
-use lightningcss::properties::custom::TokenList;
-use lightningcss::traits::Parse;
-use lightningcss::values::length::LengthPercentage;
 
-/// Convert renderer-owned raw values after declaration eligibility checking.
 pub(super) fn apply(
     styles: &mut ComputedStylesBuilder,
     style: &mut WorkingStyle,
     id: RendererPropertyId,
-    tokens: &TokenList<'_>,
     root_font_size: f32,
     resolution: &mut ResolutionContext,
-    text_spacing_values: Option<&PreparedTextSpacing>,
-) -> Option<()> {
-    match id {
-        RendererPropertyId::LetterSpacing | RendererPropertyId::WordSpacing => {
-            let parsed;
-            let cached =
-                text_spacing_values.and_then(|values| values.get(&(tokens as *const _ as usize)));
-            let value = if let Some(value) = cached {
-                value.as_ref()
-            } else {
-                // Inline and substituted values retain their element-local path.
-                parsed = native_fallback::text_spacing(tokens)?;
-                &parsed
-            };
-            let value = length_percentage_to_text_spacing(
+    prepared: &PreparedRendererValue,
+    selected: &impl Fn(PropertyKey) -> bool,
+) {
+    use PreparedRendererValue as Value;
+    use RendererPropertyId as Id;
+    if !matches!(
+        id,
+        Id::TextWrap | Id::FontVariant | Id::FontSynthesis | Id::TextBox
+    ) && !selected(id.key())
+    {
+        return;
+    }
+    let value = prepared;
+    match value {
+        Value::Spacing(value) => {
+            let c = evaluate(
                 value,
-                style.font.font_size,
+                style.font(styles).font_size,
                 root_font_size,
                 resolution,
-            )?;
-            *match id {
-                RendererPropertyId::LetterSpacing => &mut style.text.letter_spacing,
-                _ => &mut style.text.word_spacing,
+            );
+            let value =
+                html_style_model::TextSpacing::new(c[0], c[1]).expect("finite prepared spacing");
+            *if id == Id::LetterSpacing {
+                &mut style.text_mut(styles).letter_spacing
+            } else {
+                &mut style.text_mut(styles).word_spacing
             } = value;
         }
-        RendererPropertyId::WhiteSpaceCollapse => {
-            style.text.white_space = renderer_owned::white_space_collapse(tokens)?
-                .with_wrapping(style.text.white_space.allows_wrap());
+        Value::WhiteSpaceCollapse(value) => {
+            style.text_mut(styles).white_space =
+                value.with_wrapping(style.text(styles).white_space.allows_wrap())
         }
-        RendererPropertyId::TextWrapMode => {
-            style.text.white_space = style.text.white_space.with_wrapping(renderer_owned::text_wrap_mode(tokens)?);
+        Value::TextWrapMode(value) => {
+            style.text_mut(styles).white_space =
+                style.text(styles).white_space.with_wrapping(*value)
         }
-        RendererPropertyId::TextWrapStyle => {
-            style.text.text_wrap_style = renderer_owned::text_wrap_style(tokens)?;
-        }
-        RendererPropertyId::TextWrap => {
-            let (wraps, value) = renderer_owned::text_wrap(tokens)?;
-            style.text.white_space = style.text.white_space.with_wrapping(wraps);
-            style.text.text_wrap_style = value;
-        }
-        RendererPropertyId::HangingPunctuation => {
-            style.text.hanging_punctuation = renderer_owned::hanging_punctuation(tokens)?;
-        }
-        RendererPropertyId::FontVariant => {
-            let (caps, numeric, ligatures) = font_features::parse_variant(tokens)?;
-            style.font.font_variant_caps_features = font_variant_caps_features(&caps);
-            style.font.font_variant_numeric_features = numeric;
-            style.font.font_variant_ligature_features = ligatures;
-        }
-        RendererPropertyId::FontSynthesisStyle => {
-            style.font.font_synthesis_style = renderer_owned::font_synthesis_style(id, tokens)?;
-        }
-        RendererPropertyId::FontSynthesis | RendererPropertyId::FontSynthesisSmallCaps => {
-            style.font.font_synthesis_small_caps = renderer_owned::font_synthesis_small_caps(id, tokens)?;
-            if id == RendererPropertyId::FontSynthesis {
-                style.font.font_synthesis_style = renderer_owned::font_synthesis_style(id, tokens)?;
+        Value::TextWrapStyle(value) => style.text_mut(styles).text_wrap_style = *value,
+        Value::TextWrap(mode, value) => {
+            if selected(PropertyKey::TextWrapMode) {
+                style.text_mut(styles).white_space =
+                    style.text(styles).white_space.with_wrapping(*mode);
+            }
+            if selected(PropertyKey::TextWrapStyle) {
+                style.text_mut(styles).text_wrap_style = *value;
             }
         }
-        RendererPropertyId::ObjectFit => {
-            style.box_model.object_fit = renderer_owned::object_fit(tokens)?;
-        }
-        RendererPropertyId::ObjectPosition => {
-            style.box_model.object_position =
-                parse_object_position(tokens, style.font.font_size, root_font_size, resolution)?;
-        }
-        RendererPropertyId::OutlineOffset => {
-            match parse_outline_offset(tokens, style.font.font_size, root_font_size, resolution)? {
-                ParsedOutlineOffset::Length(value) => style.background.outline.set_offset(value),
-                ParsedOutlineOffset::Inset => style.background.outline.set_offset_inset(),
+        Value::HangingPunctuation(value) => style.text_mut(styles).hanging_punctuation = *value,
+        Value::FontVariant(caps, numeric, ligatures) => {
+            if selected(PropertyKey::FontVariantCaps) {
+                style.font_mut(styles).font_variant_caps_features =
+                    font_variant_caps_features(caps);
+            }
+            if selected(PropertyKey::FontVariantNumeric) {
+                style
+                    .font_mut(styles)
+                    .font_variant_numeric_features
+                    .clone_from(numeric);
+            }
+            if selected(PropertyKey::FontVariantLigatures) {
+                style
+                    .font_mut(styles)
+                    .font_variant_ligature_features
+                    .clone_from(ligatures);
             }
         }
-        RendererPropertyId::FontFeatureSettings => {
-            let mut features = font_features::parse_settings(tokens)?;
-            // Stable sorting after reversing keeps the last authored value per tag.
-            features.reverse();
-            features.sort_by_key(|feature| open_type::open_type_feature_tag_bytes(*(feature)));
-            features.dedup_by_key(|feature| open_type::open_type_feature_tag_bytes(*feature));
-            style.font.font_feature_settings = features;
+        Value::FontSynthesis {
+            small_caps,
+            style: synthesis_style,
+        } => {
+            if let Some(value) = small_caps
+                && selected(PropertyKey::FontSynthesisSmallCaps)
+            {
+                style.font_mut(styles).font_synthesis_small_caps = *value;
+            }
+            if let Some(value) = synthesis_style
+                && selected(PropertyKey::FontSynthesisStyle)
+            {
+                style.font_mut(styles).font_synthesis_style = *value;
+            }
         }
-        RendererPropertyId::FontKerning
-        | RendererPropertyId::FontVariantLigatures
-        | RendererPropertyId::FontVariantNumeric => {
-            *match id {
-                RendererPropertyId::FontKerning => &mut style.font.font_kerning_features,
-                RendererPropertyId::FontVariantLigatures => {
-                    &mut style.font.font_variant_ligature_features
+        Value::Features(values) => {
+            let target = match id {
+                Id::FontFeatureSettings => &mut style.font_mut(styles).font_feature_settings,
+                Id::FontKerning => &mut style.font_mut(styles).font_kerning_features,
+                Id::FontVariantLigatures => {
+                    &mut style.font_mut(styles).font_variant_ligature_features
                 }
-                RendererPropertyId::FontVariantNumeric => {
-                    &mut style.font.font_variant_numeric_features
-                }
-                _ => unreachable!(),
-            } = font_features::parse_tokens(id, tokens)?;
+                Id::FontVariantNumeric => &mut style.font_mut(styles).font_variant_numeric_features,
+                _ => unreachable!("prepared feature property"),
+            };
+            target.clone_from(values);
         }
-        RendererPropertyId::BreakBefore
-        | RendererPropertyId::PageBreakBefore
-        | RendererPropertyId::BreakAfter
-        | RendererPropertyId::PageBreakAfter => {
-            *match id {
-                RendererPropertyId::BreakBefore | RendererPropertyId::PageBreakBefore => {
-                    &mut style.layout.break_before
-                }
-                _ => &mut style.layout.break_after,
-            } = renderer_owned::break_between(id, tokens)?;
-        }
-        RendererPropertyId::BreakInside | RendererPropertyId::PageBreakInside => {
-            style.layout.break_inside = renderer_owned::break_inside(id, tokens)?;
-        }
-        RendererPropertyId::Widows | RendererPropertyId::Orphans => {
-            let value = token_list_to_css_string(tokens)
-                .and_then(|css| parse_integer(&css, 1))?
-                .min(u32::from(u8::MAX)) as u8;
-            *match id {
-                RendererPropertyId::Widows => &mut style.text.widows,
-                _ => &mut style.text.orphans,
-            } = value;
-        }
-        // These conversions have already been checked for renderer eligibility.
-        RendererPropertyId::Float => {
-            if let Some(value) = renderer_owned::float(tokens, style.text.direction) {
-                style.box_model.float = value;
-            }
-        }
-        RendererPropertyId::Clear => {
-            if let Some(value) = renderer_owned::clear(tokens, style.text.direction) {
-                style.box_model.clear = value;
-            }
-        }
-        RendererPropertyId::TableLayout => {
-            if let Some(value) = renderer_owned::table_layout(tokens) {
-                style.box_model.table_layout = value;
-            }
-        }
-        RendererPropertyId::BorderCollapse => {
-            if let Some(value) = renderer_owned::border_collapse(tokens) {
-                style.box_model.border_collapse = value;
-            }
-        }
-        RendererPropertyId::CaptionSide => {
-            if let Some(value) = renderer_owned::caption_side(tokens) {
-                style.box_model.caption_side = value;
-            }
-        }
-        RendererPropertyId::EmptyCells => {
-            if let Some(value) = renderer_owned::empty_cells(tokens) {
-                style.box_model.empty_cells = value;
-            }
-        }
-        RendererPropertyId::TextBoxTrim => {
-            if let Some(value) = renderer_owned::text_box_trim(tokens) {
-                style.box_model.text_box_trim = value;
-            }
-        }
-        RendererPropertyId::TextBoxEdge => {
-            if let Some(value) = renderer_owned::text_box_edge(tokens) {
-                style.text.text_box_edge = value;
-            }
-        }
-        RendererPropertyId::TextBox => {
-            if let Some((trim, edge)) = renderer_owned::text_box(tokens) {
-                style.box_model.text_box_trim = trim;
-                style.text.text_box_edge = edge;
-            }
-        }
-        RendererPropertyId::Contain => {
-            if let Some(value) = contain::parse_tokens(tokens) {
-                style.box_model.size_containment = value.size;
-            }
-        }
-        RendererPropertyId::Content => {
-            if let Some(value) = parse_generated_content(styles, tokens) {
-                style.generated_content = value;
-            }
-        }
-        RendererPropertyId::CounterReset => {
-            if let Some(value) = parse_counter_directives(styles, tokens, 0) {
-                style.counters.resets = value;
-            }
-        }
-        RendererPropertyId::CounterIncrement => {
-            if let Some(value) = parse_counter_directives(styles, tokens, 1) {
-                style.counters.increments = value;
-            }
-        }
-        RendererPropertyId::Quotes => {
-            if let Some(value) = parse_quotes(styles, tokens) {
-                style.text.quotes = value;
-            }
-        }
-        _ => {}
-    }
-    Some(())
-}
-
-fn parse_object_position(
-    tokens: &TokenList<'_>,
-    font_size: f32,
-    root_font_size: f32,
-    resolution: &mut ResolutionContext,
-) -> Option<ObjectPosition> {
-    use lightningcss::values::position::{
-        HorizontalPositionKeyword, PositionComponent, VerticalPositionKeyword,
-    };
-
-    let css = token_list_to_css_string(tokens)?;
-    let position = renderer_owned::parse_object_position(&css)?;
-    fn axis<S: Copy + PartialEq>(
-        component: PositionComponent<S>,
-        end: S,
-        resolve: impl FnOnce(&LengthPercentage) -> Option<LengthPct>,
-    ) -> Option<ObjectPositionAxis> {
-        let (origin, offset) = match component {
-            PositionComponent::Center => (ObjectPositionOrigin::Start, LengthPct::Pct(0.5)),
-            PositionComponent::Length(value) => (ObjectPositionOrigin::Start, resolve(&value)?),
-            PositionComponent::Side { side, offset } => (
-                if side == end {
-                    ObjectPositionOrigin::End
-                } else {
-                    ObjectPositionOrigin::Start
+        Value::ObjectFit(value) => style.box_model.object_fit = *value,
+        Value::ObjectPosition(value) => {
+            let x = length_pct(
+                &value.x.1,
+                evaluate(
+                    &value.x.1,
+                    style.font(styles).font_size,
+                    root_font_size,
+                    resolution,
+                ),
+                false,
+            );
+            let y = length_pct(
+                &value.y.1,
+                evaluate(
+                    &value.y.1,
+                    style.font(styles).font_size,
+                    root_font_size,
+                    resolution,
+                ),
+                false,
+            );
+            style.box_model.object_position = ObjectPosition {
+                x: ObjectPositionAxis {
+                    origin: value.x.0,
+                    offset: x,
                 },
-                offset.as_ref().map_or(Some(LengthPct::Px(0.0)), resolve)?,
-            ),
-        };
-        Some(ObjectPositionAxis { origin, offset })
-    }
-    let mut resolve = |value: &LengthPercentage| {
-        computed_length_pct(value, font_size, root_font_size, resolution)
-    };
-    Some(ObjectPosition {
-        x: axis(position.x, HorizontalPositionKeyword::Right, &mut resolve)?,
-        y: axis(position.y, VerticalPositionKeyword::Bottom, &mut resolve)?,
-    })
-}
+                y: ObjectPositionAxis {
+                    origin: value.y.0,
+                    offset: y,
+                },
+            };
+        }
+        Value::OutlineOffset(None) => style.background.outline.set_offset_inset(),
+        Value::OutlineOffset(Some(value)) => {
+            let c = evaluate(
+                value,
+                style.font(styles).font_size,
+                root_font_size,
+                resolution,
+            );
+            style
+                .background
+                .outline
+                .set_offset(length_pct(value, c, false));
+        }
 
-enum ParsedOutlineOffset {
-    Length(LengthPct),
-    Inset,
-}
-
-fn parse_outline_offset(
-    tokens: &TokenList<'_>,
-    font_size: f32,
-    root_font_size: f32,
-    resolution: &mut ResolutionContext,
-) -> Option<ParsedOutlineOffset> {
-    use lightningcss::values::length::Length;
-
-    let css = token_list_to_css_string(tokens)?;
-    let value = match renderer_owned::parse_outline_offset(&css)? {
-        OutlineOffset::Inset => return Some(ParsedOutlineOffset::Inset),
-        OutlineOffset::Length(Length::Value(value)) => LengthPercentage::Dimension(value),
-        OutlineOffset::Length(Length::Calc(_)) => LengthPercentage::parse_string(&css).ok()?,
-    };
-    match computed_length_pct(
-        &value,
-        font_size,
-        root_font_size,
-        resolution,
-    )? {
-        LengthPct::Pct(_)
-        | LengthPct::Calc {
-            percentage_dependent: true,
-            ..
-        } => None,
-        value => Some(ParsedOutlineOffset::Length(value)),
+        Value::BreakBetween(value) => {
+            *if matches!(id, Id::BreakBefore | Id::PageBreakBefore) {
+                &mut style.layout.break_before
+            } else {
+                &mut style.layout.break_after
+            } = *value
+        }
+        Value::BreakInside(value) => style.layout.break_inside = *value,
+        Value::LineCount(value) => {
+            *if id == Id::Widows {
+                &mut style.text_mut(styles).widows
+            } else {
+                &mut style.text_mut(styles).orphans
+            } = *value
+        }
+        Value::Float(ltr, rtl) => {
+            style.box_model.float = if style.text(styles).direction == TextDirection::Ltr {
+                *ltr
+            } else {
+                *rtl
+            }
+        }
+        Value::Clear(ltr, rtl) => {
+            style.box_model.clear = if style.text(styles).direction == TextDirection::Ltr {
+                *ltr
+            } else {
+                *rtl
+            }
+        }
+        Value::TableLayout(value) => style.box_model.table_layout = *value,
+        Value::BorderCollapse(value) => style.box_model.border_collapse = *value,
+        Value::CaptionSide(value) => style.box_model.caption_side = *value,
+        Value::EmptyCells(value) => style.box_model.empty_cells = *value,
+        Value::TextBoxTrim(value) => style.box_model.text_box_trim = *value,
+        Value::TextBoxEdge(value) => style.text_mut(styles).text_box_edge = *value,
+        Value::TextBox(trim, edge) => {
+            if selected(PropertyKey::TextBoxTrim) {
+                style.box_model.text_box_trim = *trim;
+            }
+            if selected(PropertyKey::TextBoxEdge) {
+                style.text_mut(styles).text_box_edge = *edge;
+            }
+        }
+        Value::Contain(value) => style.box_model.size_containment = *value,
+        Value::Content(value) => {
+            style.generated_content = value.as_ref().map(|content| GeneratedContent {
+                items: content
+                    .items
+                    .iter()
+                    .map(|item| match item {
+                        PreparedContentItem::Text(value) => {
+                            GeneratedContentItem::Text(styles.intern_string(value))
+                        }
+                        PreparedContentItem::Attribute(value) => {
+                            GeneratedContentItem::Attribute(styles.intern_string(value))
+                        }
+                        PreparedContentItem::Counter { name, style } => {
+                            GeneratedContentItem::Counter {
+                                name: styles.intern_string(name),
+                                style: *style,
+                            }
+                        }
+                        PreparedContentItem::Counters {
+                            name,
+                            separator,
+                            style,
+                        } => GeneratedContentItem::Counters {
+                            name: styles.intern_string(name),
+                            separator: styles.intern_string(separator),
+                            style: *style,
+                        },
+                        PreparedContentItem::OpenQuote => GeneratedContentItem::OpenQuote,
+                        PreparedContentItem::CloseQuote => GeneratedContentItem::CloseQuote,
+                        PreparedContentItem::NoOpenQuote => GeneratedContentItem::NoOpenQuote,
+                        PreparedContentItem::NoCloseQuote => GeneratedContentItem::NoCloseQuote,
+                    })
+                    .collect(),
+            })
+        }
+        Value::Counters(values) => {
+            let values = values
+                .iter()
+                .map(|value| CounterDirective {
+                    name: styles.intern_string(&value.name),
+                    value: value.value,
+                })
+                .collect();
+            if id == Id::CounterReset {
+                style.counters.resets = values;
+            } else {
+                style.counters.increments = values;
+            }
+        }
+        Value::Quotes(value) => {
+            style.text_mut(styles).quotes = match value {
+                PreparedQuoteStyle::Auto => QuoteStyle::Auto,
+                PreparedQuoteStyle::None => QuoteStyle::None,
+                PreparedQuoteStyle::Pairs(value) => QuoteStyle::Pairs(styles.intern_string(value)),
+            }
+        }
     }
 }

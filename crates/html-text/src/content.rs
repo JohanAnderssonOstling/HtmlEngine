@@ -1,8 +1,7 @@
 use crate::source_offsets::SourceOffsets;
 use crate::{PseudoStyles, TextStructure, whitespace_context_root};
-use html_dom::MemoryUsageReport;
+use html_dom::{DomNodeId, MemoryUsageReport};
 use std::ops::Range;
-use std::sync::OnceLock;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum WhitespaceWrapOverride {
@@ -26,12 +25,10 @@ impl WhitespaceWrapOverride {
 const _: () = assert!(std::mem::size_of::<WhitespaceWrapOverride>() == 1);
 
 /// Two policies share a byte; trailing default policies need no bytes.
-/// The legacy slice API expands lazily, while engine queries stay packed.
 #[derive(Default, Clone)]
 struct WrapPolicies {
     bytes: Vec<u8>,
     len: usize,
-    expanded: OnceLock<Vec<WhitespaceWrapOverride>>,
 }
 
 impl WrapPolicies {
@@ -51,7 +48,6 @@ impl WrapPolicies {
         }
     }
     fn push_default(&mut self) {
-        self.expanded.take();
         self.len += 1;
     }
     fn from_values(values: Vec<WhitespaceWrapOverride>) -> Self {
@@ -71,14 +67,10 @@ impl WrapPolicies {
             .collect();
         result
     }
-    fn as_slice(&self) -> &[WhitespaceWrapOverride] {
-        self.expanded
-            .get_or_init(|| (0..self.len).map(|index| self.get(index)).collect())
-    }
 }
 
-/// One preparation pass owns the policy buffer. Allocate and invalidate its
-/// expanded view once, then update byte-aligned fields directly.
+/// One preparation pass owns the policy buffer. Allocate its packed storage
+/// once, then update the policy fields directly.
 pub(crate) struct UnicodeWrapWriter<'a> {
     policies: &'a mut WrapPolicies,
     unicode_wraps: &'a mut bool,
@@ -141,9 +133,6 @@ impl InlineContent {
             self.whitespace_wrap_before.bytes.capacity(),
             self.whitespace_wrap_before.len,
         );
-        if let Some(expanded) = self.whitespace_wrap_before.expanded.get() {
-            report.add_vec_storage("InlineContent.whitespace_wrap_before.expanded", expanded);
-        }
         report.add_vec_storage("InlineContent.inline_items.storage", &self.inline_items);
         report
     }
@@ -168,17 +157,12 @@ impl InlineContent {
         self.glyph_source_offsets.get(glyph_idx).unwrap_or(u32::MAX)
     }
 
-    /// Prepared break policy in logical character order.
-    pub fn whitespace_wrap_overrides(&self) -> &[WhitespaceWrapOverride] {
-        self.whitespace_wrap_before.as_slice()
-    }
-
     #[inline]
     pub fn whitespace_wrap_before(&self, glyph_idx: usize) -> WhitespaceWrapOverride {
         self.whitespace_wrap_before.get(glyph_idx)
     }
 
-    /// Scan a validated source range without expanding the legacy slice view.
+    /// Scan a validated source range directly in packed policy storage.
     pub fn has_unicode_wrap_opportunity(&self, source: Range<usize>) -> bool {
         let policies = &self.whitespace_wrap_before;
         if source.start >= source.end || source.end > policies.len {
@@ -208,7 +192,6 @@ impl InlineContent {
 
     pub(crate) fn unicode_wrap_writer(&mut self) -> UnicodeWrapWriter<'_> {
         let policies = &mut self.whitespace_wrap_before;
-        policies.expanded.take();
         let bytes = policies.len.div_ceil(2);
         if policies.bytes.capacity() < bytes {
             policies.bytes.reserve_exact(bytes - policies.bytes.len());
@@ -288,7 +271,7 @@ impl InlineContent {
 pub struct InlineItem {
     pub kind: InlineItemKind,
     pub box_idx: u32,
-    pub dom_text_node: Option<u32>, // DOM text node that produced this item (None for synthetic/non-text items)
+    pub dom_text_node: Option<DomNodeId>, // DOM text node that produced this item (None for synthetic/non-text items)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -303,7 +286,7 @@ pub struct InlineTextRun<'a> {
     pub kind: InlineTextKind,
     pub glyphs: &'a Range<u32>,
     pub box_idx: u32,
-    pub dom_text_node: Option<u32>,
+    pub dom_text_node: Option<DomNodeId>,
 }
 
 impl InlineItem {
@@ -391,19 +374,27 @@ pub enum InlineItemKind {
 #[cfg(test)]
 mod tests {
     use super::{InlineContent, InlineItem, InlineItemKind, InlineTextKind};
+    use html_dom::{DocumentBuilder, DomElementData, DomElementAttributeCache};
     use html_style_model::Clear;
     use std::ptr;
 
     #[test]
     fn text_views_borrow_ranges_and_keep_empty_runs_markers_and_source_order() {
+        let mut dom = DocumentBuilder::new();
+        let tag = dom.try_intern_string("p").unwrap();
+        let root = dom.append_dom_element(None, DomElementData {
+            tag, namespace: None, attributes: Vec::new(),
+            attribute_cache: DomElementAttributeCache::new(None, 0..0), image_idx: None,
+        }).unwrap();
+        let node = dom.append_dom_text(root, "ab").unwrap();
         let mut content = InlineContent::default();
         for character in "ab•".chars() {
             content.push_character(character);
         }
         for (kind, box_idx, dom_text_node) in [
-            (InlineItemKind::Text { glyphs: 0..0 }, 1, Some(9)),
+            (InlineItemKind::Text { glyphs: 0..0 }, 1, Some(node)),
             (InlineItemKind::Image { image_idx: 0 }, 2, None),
-            (InlineItemKind::Text { glyphs: 0..2 }, 1, Some(9)),
+            (InlineItemKind::Text { glyphs: 0..2 }, 1, Some(node)),
             (InlineItemKind::Break { clear: Clear::None }, 1, None),
             (InlineItemKind::Marker { glyphs: 2..3 }, 3, None),
         ] {
@@ -419,8 +410,8 @@ mod tests {
                 .map(|run| (run.kind, run.glyphs.clone(), run.box_idx, run.dom_text_node))
                 .collect::<Vec<_>>(),
             [
-                (InlineTextKind::Text, 0..0, 1, Some(9)),
-                (InlineTextKind::Text, 0..2, 1, Some(9)),
+                (InlineTextKind::Text, 0..0, 1, Some(node)),
+                (InlineTextKind::Text, 0..2, 1, Some(node)),
                 (InlineTextKind::Marker, 2..3, 3, None),
             ]
         );

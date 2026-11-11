@@ -1,5 +1,6 @@
 //! Focused workloads for the clone/lock/Arc audit. Setup and integrity checks
 //! are outside the measured region; heap and timing builds run separately.
+use html_pipeline::engine::LayoutRequest;
 
 use html_dom as dom_values;
 use html_resources::resources::images as image_resources;
@@ -113,9 +114,9 @@ pub(super) fn run(path: &str, case: &str, count: usize) {
                 .unwrap()
                 .shape(&mut shaper, &mut result_resources)
                 .unwrap()
-                .layout_with_metrics_and_shaper(
-                    LayoutConstraints::new(600.0, 16.0).unwrap(),
-                    &Default::default(),
+                .layout(
+                    LayoutRequest::new(LayoutConstraints::new(600.0, 16.0).unwrap())
+                        .with_image_metrics(&Default::default()),
                     &mut shaper,
                     &mut result_resources,
                 )
@@ -140,9 +141,9 @@ pub(super) fn run(path: &str, case: &str, count: usize) {
                     prepared
                         .shape_borrowed(&mut shaper, &mut result_resources)
                         .unwrap()
-                        .layout_with_metrics_and_shaper(
-                            LayoutConstraints::new(600.0, 16.0).unwrap(),
-                            &Default::default(),
+                        .layout(
+                            LayoutRequest::new(LayoutConstraints::new(600.0, 16.0).unwrap())
+                                .with_image_metrics(&Default::default()),
                             &mut shaper,
                             &mut result_resources,
                         )
@@ -175,8 +176,8 @@ pub(super) fn run(path: &str, case: &str, count: usize) {
             });
             let document = shaped
                 .unwrap()
-                .layout_with_shaper(
-                    LayoutConstraints::new(600.0, 16.0).unwrap(),
+                .layout(
+                    LayoutRequest::new(LayoutConstraints::new(600.0, 16.0).unwrap()),
                     &mut shaper,
                     &mut result_resources,
                 )
@@ -216,9 +217,9 @@ pub(super) fn run(path: &str, case: &str, count: usize) {
             let document = prepared
                 .shape(&mut shaper, &mut result_resources)
                 .unwrap()
-                .layout_with_metrics_and_shaper(
-                    LayoutConstraints::new(600.0, 16.0).unwrap(),
-                    &Default::default(),
+                .layout(
+                    LayoutRequest::new(LayoutConstraints::new(600.0, 16.0).unwrap())
+                        .with_image_metrics(&Default::default()),
                     &mut shaper,
                     &mut result_resources,
                 )
@@ -228,49 +229,6 @@ pub(super) fn run(path: &str, case: &str, count: usize) {
                 layout_fingerprint(&document, &result_resources)
             ));
             result["workers"] = json!(4);
-            result
-        }
-        "access_parallel" => {
-            let parsed = parse_html_document(&source);
-            let mut factory = DocumentFactory::new();
-            let prepared = factory.build_pipeline_from_parsed(&parsed, &[]);
-            let mut shaper = Shaper::default();
-            let shaped = prepared
-                .shape_borrowed(&mut shaper, &mut result_resources)
-                .unwrap();
-            let constraints = LayoutConstraints::new(600.0, 16.0)
-                .unwrap()
-                .with_parallel_workers(4);
-            let mut document = Some(
-                shaped
-                    .layout_with_metrics_and_shaper(
-                        constraints,
-                        &Default::default(),
-                        &mut shaper,
-                        &mut result_resources,
-                    )
-                    .unwrap(),
-            );
-            let mut result = measure(count, || {
-                document = Some(black_box(
-                    document
-                        .take()
-                        .unwrap()
-                        .into_shaped()
-                        .layout_with_metrics_and_shaper(
-                            constraints,
-                            &Default::default(),
-                            &mut shaper,
-                            &mut result_resources,
-                        )
-                        .unwrap(),
-                ));
-            });
-            result["integrity"] = json!(format!(
-                "{:016x}",
-                layout_fingerprint(document.as_ref().unwrap(), &result_resources)
-            ));
-            result["workers"] = json!(constraints.parallel_workers());
             result
         }
         _ => panic!("unknown access workload"),

@@ -1,4 +1,3 @@
-use html_dom::storage;
 use crate::layout_model::{
     BlockBox, Children, InlineContent, InlineItemKind, LayoutMode, LayoutTree, TableBox,
     TableRowBox, parse_positive_span,
@@ -8,7 +7,6 @@ use html_dom::{Document, DomNodeId, NodeRef};
 use html_engine_model::NoteFlow;
 use html_style_model::{ComputedStyles, Display, StyleIndices};
 use html_text::{FirstLetterPart, FirstLetterSelection};
-use rustc_data_structures::fx::FxHashMap;
 use std::ops::Range;
 
 mod block;
@@ -22,16 +20,14 @@ mod lists;
 mod table;
 mod writer;
 
-use self::block::{BlockChildAction, plan_block_children};
 use self::classification::{
-    display_for_element, is_absolutely_positioned,
-    is_clearing_break, is_floated, layout_mode_for_display, pseudo_display, pseudo_is_block_level,
+    ElementClassification, display_for_element, layout_mode_for_display, pseudo_display,
+    pseudo_is_block_level,
 };
 use self::generated::GeneratedContentResolver;
 use self::inline::{
-    InlineFragmentPlan, InlineNodePlan, SplitInlineEvent, SplitInlinePart,
-    has_block_child, plan_generated_inline, plan_inline_node, plan_split_inline,
-    trim_inline_segment_nodes,
+    InlineFragmentPlan, InlineNodePlan, SplitInlineEvent, has_block_child, plan_generated_inline,
+    plan_inline_node, trim_inline_segment_nodes,
 };
 use self::lists::ListItemOrdinals;
 use self::table::{
@@ -48,7 +44,10 @@ struct LayoutTreeBuilder<'a, 'out> {
     generated: GeneratedContentResolver<'a>,
     list_item_ordinals: ListItemOrdinals,
     floated_first_letter: Option<FloatedFirstLetterCapture>,
-    contents_text_styles: FxHashMap<DomNodeId, StyleIndices>,
+    node_scratch: Vec<DomNodeId>,
+    split_events: Vec<SplitInlineEvent>,
+    split_active: Vec<InlineFragmentPlan>,
+    inline_frames: Vec<InlineFragmentFrame>,
     note_flow: NoteFlow,
 }
 
@@ -80,10 +79,6 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
         inline_content: &'out mut InlineContent,
         note_flow: NoteFlow,
     ) -> Self {
-        let mut contents_text_styles = FxHashMap::default();
-        if let Some(root) = document.dom_root() {
-            collect_contents_text_styles(document, styles, root, None, &mut contents_text_styles);
-        }
         Self {
             document,
             styles,
@@ -91,7 +86,10 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
             generated: GeneratedContentResolver::new(document, styles),
             list_item_ordinals: ListItemOrdinals::new(document, styles),
             floated_first_letter: None,
-            contents_text_styles,
+            node_scratch: Vec::new(),
+            split_events: Vec::new(),
+            split_active: Vec::new(),
+            inline_frames: Vec::new(),
             note_flow,
         }
     }
@@ -112,9 +110,20 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
         elem_id: DomNodeId,
         parent_box: Option<u32>,
     ) -> Option<u32> {
-        let element = self.document.element_ref(elem_id)?;
-        let style_indices = self.styles.style_for_node(element.node_id())?;
-        let mut display = display_for_element(self.styles, element);
+        let element = self.document.element_ref(elem_id);
+        let classification = ElementClassification::new(self.styles, element);
+        self.build_classified_element(elem_id, parent_box, classification)
+    }
+
+    fn build_classified_element(
+        &mut self,
+        elem_id: DomNodeId,
+        parent_box: Option<u32>,
+        classification: ElementClassification,
+    ) -> Option<u32> {
+        let element = self.document.element_ref(elem_id);
+        let style_indices = classification.style?;
+        let mut display = classification.display;
 
         // A note held back for the embedder's own presentation generates no
         // boxes, exactly as `display: none` would. The subtree stays in the DOM
@@ -142,7 +151,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
         self.generated.apply_for_node(elem_id);
 
         let mut layout_mode = layout_mode_for_display(display)?;
-        if is_clearing_break(self.styles, element) {
+        if classification.clearing_break {
             layout_mode = LayoutMode::Block(BlockBox::default());
         }
         if let LayoutMode::TableCell(cell) = &mut layout_mode {
@@ -155,7 +164,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
                 .min(65_534);
         }
         if let LayoutMode::Inline(_) = layout_mode
-            && (is_floated(self.styles, element) || is_absolutely_positioned(self.styles, element))
+            && (classification.floated || classification.absolute)
         {
             layout_mode = LayoutMode::Block(BlockBox::default());
         }
@@ -165,20 +174,17 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
 
         self.generated.enter_sibling_scope();
 
-        if let Some(image_idx) = storage::image_idx(element) {
+        if let Some(image_idx) = element.image_idx() {
             self.build_replaced_content(box_idx, image_idx);
         } else {
             match display {
-                Display::Table | Display::InlineTable => self.build_table_children_from_nodes(
-                    element.children().map(DomNodeId::raw),
-                    box_idx,
-                ),
+                Display::Table | Display::InlineTable => {
+                    self.build_table_children_from_nodes(element.children(), box_idx)
+                }
                 Display::TableRowGroup | Display::TableHeaderGroup | Display::TableFooterGroup => {
                     self.build_table_row_group_children(element, box_idx)
                 }
-                Display::TableRow => {
-                    self.build_row_children(element.children().map(DomNodeId::raw), box_idx)
-                }
+                Display::TableRow => self.build_row_children(element.children(), box_idx),
                 Display::Flex | Display::InlineFlex | Display::Grid | Display::InlineGrid => {
                     self.build_flex_grid_children(element, box_idx)
                 }
@@ -224,50 +230,9 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
             .set_box_children(box_idx, Children::Blocks(direct_children));
     }
 
-    fn append_block_children(
-        &mut self,
-        elem_id: DomNodeId,
-        box_idx: u32,
-        direct_children: &mut Vec<u32>,
-    ) {
-        for action in plan_block_children(self.document, self.styles, elem_id) {
-            let child = match action {
-                BlockChildAction::GeneratedPseudo { before } => {
-                    self.build_generated_block_pseudo(elem_id, box_idx, before)
-                }
-                BlockChildAction::InlineSegment {
-                    mut nodes,
-                    before,
-                    after,
-                } => self.flush_inline_segment_with_generated_edges(
-                    &mut nodes,
-                    box_idx,
-                    before.then_some(elem_id),
-                    after.then_some(elem_id),
-                ),
-                BlockChildAction::AnonymousTable(mut nodes) => {
-                    self.flush_anonymous_table_segment(&mut nodes, box_idx)
-                }
-                BlockChildAction::Principal(node) => {
-                    self.build_box_for_element(node, Some(box_idx))
-                }
-                BlockChildAction::SplitInline(node) => {
-                    self.build_split_inline_child(node, box_idx, direct_children);
-                    continue;
-                }
-                BlockChildAction::ContentsWithTableInternals(node) => {
-                    self.generated.apply_for_node(node);
-                    self.append_block_children(node, box_idx, direct_children);
-                    continue;
-                }
-            };
-            direct_children.extend(child);
-        }
-    }
-
     fn flush_anonymous_table_segment(
         &mut self,
-        nodes: &mut Vec<u32>,
+        nodes: &mut Vec<DomNodeId>,
         parent_box_idx: u32,
     ) -> Option<u32> {
         if nodes.is_empty() {
@@ -275,40 +240,9 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
         }
         let table_idx = self
             .output
-            .push_anonymous_child(parent_box_idx, LayoutMode::Table(TableBox::default()));
+            .push_anonymous_child(parent_box_idx, LayoutMode::Table(Default::default()));
         self.build_table_children_from_nodes(std::mem::take(nodes), table_idx);
         Some(table_idx)
-    }
-}
-
-fn collect_contents_text_styles(
-    document: &Document,
-    styles: &ComputedStyles,
-    node: DomNodeId,
-    inherited_from_contents: Option<StyleIndices>,
-    output: &mut FxHashMap<DomNodeId, StyleIndices>,
-) {
-    match document.node_ref(node) {
-        Some(NodeRef::Text(_)) => {
-            if let Some(style) = inherited_from_contents {
-                output.insert(node, style);
-            }
-        }
-        Some(NodeRef::Element(element)) => {
-            let display = display_for_element(styles, element);
-            if display == Display::None {
-                return;
-            }
-            let inherited = if display == Display::Contents {
-                styles.style_for_node(node).or(inherited_from_contents)
-            } else {
-                None
-            };
-            for child in element.children() {
-                collect_contents_text_styles(document, styles, child, inherited, output);
-            }
-        }
-        None => {}
     }
 }
 

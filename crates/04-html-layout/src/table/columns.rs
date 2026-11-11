@@ -1,6 +1,6 @@
 use crate::layout::{LayoutReader, resolve_definite_outer_inline_size};
-use crate::layout_model::TableColumnWidthHint;
-pub(super) use crate::layout_model::{TableCellPlacement, TableGrid, build_table_grid};
+use html_engine_model::TableColumnWidthHint;
+pub(super) use html_engine_model::{TableCellPlacement, TableGrid, build_table_grid};
 use html_style_model::{UsedPreferredSize, UsedStyleView};
 use std::ops::Range;
 

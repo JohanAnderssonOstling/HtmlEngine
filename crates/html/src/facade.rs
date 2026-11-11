@@ -20,14 +20,14 @@ pub mod resources {
 /// Reader preferences applied over the publication's authored stylesheets.
 pub mod style {
     pub use html_style_model::{ReaderStyleOverrides, ThemeAdaptation};
+    pub use html_pipeline::StylesheetCache;
 }
 
 pub mod text {
     pub use html_pipeline::engine::TextSearchOptions;
     pub use html_pipeline::engine::{
-        FontMetrics, FontSlant, GlyphHandle, GlyphRequest, GlyphResourceGeneration, GlyphShaper,
-        ShapeError, ShapedGlyph,
-    };
+        FontMetrics, FontSlant, GlyphHandle, GlyphResourceGeneration, GlyphShaper, ShapedRun,
+        TextRunShapeRequest, ShapedGlyph};
     pub use html_style_model::FontFace;
 }
 

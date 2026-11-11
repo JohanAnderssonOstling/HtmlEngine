@@ -1,8 +1,10 @@
 //! Dispatch one box into its formatting context.
-use super::formatting_context::{layout_flow_children, layout_inline_box, layout_taffy_container};
+use super::block::layout_flow_children;
+use super::inline::{layout_inline_box, ResolvedTextIndent};
+use super::box_constraints::constrain_content_width;
 use super::{BoxLayoutRequest, ContentLayoutResult, LayoutEngine, ResolvedBoxSizing};
-use crate::flex_grid::TaffyContainerKind;
-use crate::layout_model::{BoxType, InlineItemKind, LayoutMode, ListItemMarker};
+use crate::flex_grid::{FlexGridInput, TaffyContainerKind};
+use html_engine_model::{BoxType, InlineItemKind, LayoutMode, ListItemMarker};
 use html_style_model::{ListStylePosition, TextDirection, UsedPreferredSize as PreferredSize};
 use kurbo::Point;
 
@@ -28,17 +30,18 @@ pub(super) fn layout_box_contents(
     let box_idx = resolved.request.box_idx;
     let isolates_floats = engine.reader.box_uses_float_context(box_idx);
     if isolates_floats {
-        engine.floats.push_context();
+        engine.scratch.floats.push_context();
     }
     let mut result = dispatch_contents(engine, resolved, &placement);
     if isolates_floats {
         let float_height = engine
+            .scratch
             .floats
             .current_float_context()
             .map(|context| (context.max_bottom() - placement.content_point.y).max(0.0))
             .unwrap_or(0.0);
         result.size.height = result.size.height.max(float_height);
-        engine.floats.pop_context();
+        engine.scratch.floats.pop_context();
     }
     result
 }
@@ -50,8 +53,8 @@ fn resolve_box_placement(
     let box_idx = resolved.request.box_idx;
     let box_point = engine.geometry.point(box_idx);
     let content_point = Point::new(
-        box_point.x + resolved.box_model.padding_left + resolved.box_model.border_left,
-        box_point.y + resolved.box_model.padding_top + resolved.box_model.border_top,
+        box_point.x + f64::from(resolved.box_model.padding_left + resolved.box_model.border_left),
+        box_point.y + f64::from(resolved.box_model.padding_top + resolved.box_model.border_top),
     );
     let marker = engine.reader.list_marker(box_idx).map(|marker| {
         let width = measure_marker_width(engine, marker.marker_box as usize);
@@ -88,17 +91,14 @@ fn dispatch_contents(
     {
         LayoutMode::Block(block) => layout_flow_children(
             engine,
-            box_idx,
+            resolved,
             &block.children,
             placement.content_point,
-            resolved.horizontal.content,
-            request.available_width,
-            resolved.vertical.descendant_basis,
             resolved.text_indent + inside_marker_indent,
         ),
-        LayoutMode::Table(table) => {
-            crate::table::layout_table(engine, resolved, table.clone(), placement.content_point)
-                .into()
+        LayoutMode::Table(_) => {
+            let table = reader.box_table(box_idx).expect("table payload");
+            crate::table::layout_table(engine, resolved, table, placement.content_point).into()
         }
         LayoutMode::TableRow(row) => crate::table::layout_table_row(
             engine,
@@ -111,12 +111,9 @@ fn dispatch_contents(
         .into(),
         LayoutMode::TableCell(cell) => layout_flow_children(
             engine,
-            box_idx,
+            resolved,
             &cell.children,
             placement.content_point,
-            resolved.horizontal.content,
-            request.available_width,
-            resolved.vertical.descendant_basis,
             resolved.text_indent,
         ),
         LayoutMode::Flex(container) => layout_taffy_contents(
@@ -135,17 +132,22 @@ fn dispatch_contents(
         ),
         BoxType::Inline(range) | BoxType::Anonymous(range) => layout_inline_box(
             engine,
-            box_idx,
+            resolved,
             range.clone(),
             placement.content_point,
-            resolved.horizontal.content,
-            resolved.vertical.descendant_basis,
-            if engine.reader.get_parent(box_idx)
-                .is_some_and(|parent| engine.reader.is_flex_grid_box(parent))
-            {
-                resolved.text_indent
-            } else {
-                request.first_line_indent
+            ResolvedTextIndent {
+                amount: if engine
+                    .reader
+                    .get_parent(box_idx)
+                    .is_some_and(|parent| engine.reader.is_flex_grid_box(parent))
+                {
+                    resolved.text_indent
+                } else {
+                    request.first_line_indent
+                },
+                hanging: false,
+                each_line: false,
+                first_line: true,
             },
         )
         .into(),
@@ -158,8 +160,7 @@ fn dispatch_contents(
             if engine.reader.style(box_idx).direction() == TextDirection::Rtl {
                 placement.content_point.x
                     + resolved.horizontal.content
-                    + resolved.box_model.padding_right
-                    + resolved.box_model.border_right
+                    + f64::from(resolved.box_model.padding_right + resolved.box_model.border_right)
             } else {
                 placement.box_point.x
             },
@@ -223,20 +224,7 @@ fn layout_taffy_contents(
             }
             maximum
         } else {
-            let natural = super::with_isolated_measurement(engine, |engine| {
-                crate::flex_grid::layout(
-                    engine,
-                    request.box_idx,
-                    children,
-                    Point::ZERO,
-                    resolved.horizontal.content,
-                    None,
-                    None,
-                    None,
-                    kind,
-                )
-            });
-            natural.size.height.max(0.0)
+            measure_natural_taffy_height(engine, resolved, children, kind)
         };
         (
             resolved.vertical.min.resolve(Some(natural_height)),
@@ -257,39 +245,72 @@ fn layout_taffy_contents(
         // A ratio makes the preferred block size definite, but an automatic
         // minimum may still expand it to fit content. Measure that minimum
         // without the preferred height before sizing tracks or flex lines.
-        let natural = super::with_isolated_measurement(engine, |engine| {
-            crate::flex_grid::layout(
+        let natural_height = measure_natural_taffy_height(engine, resolved, children, kind);
+        let minimum = natural_height.min(max_height.unwrap_or(f64::INFINITY));
+        height_basis = Some(preferred_height.max(minimum));
+    }
+    let layout_width =
+        if resolved.is_float && matches!(resolved.horizontal.preferred, PreferredSize::Auto) {
+            let (min_content, max_content) = crate::flex_grid::intrinsic_widths(
                 engine,
                 request.box_idx,
                 children,
-                Point::ZERO,
-                resolved.horizontal.content,
-                None,
-                None,
-                None,
                 kind,
+                None,
+                height_basis,
+            );
+            let horizontal_noncontent =
+                resolved.horizontal.margin_padding + resolved.box_model.horizontal_border();
+            let available_content = (request.available_width - horizontal_noncontent).max(0.0);
+            constrain_content_width(
+                max_content.min(available_content.max(min_content)),
+                resolved.horizontal.min,
+                resolved.horizontal.max,
+                request.available_width,
+                resolved.horizontal.border_box_inset,
             )
-        });
-        let minimum = natural.size.height.max(0.0).min(max_height.unwrap_or(f64::INFINITY));
-        height_basis = Some(preferred_height.max(minimum));
-    }
-    layout_taffy_container(
+        } else {
+            resolved.horizontal.content
+        };
+    crate::flex_grid::layout(
         engine,
-        request.box_idx,
-        children,
-        kind,
-        content_point,
-        resolved.horizontal.content,
-        height_basis,
-        min_height,
-        max_height,
-        resolved.is_float && matches!(resolved.horizontal.preferred, PreferredSize::Auto),
-        request.available_width,
-        resolved.horizontal.margin_padding + resolved.box_model.horizontal_border(),
-        resolved.horizontal.min,
-        resolved.horizontal.max,
-        resolved.horizontal.border_box_inset,
+        FlexGridInput {
+            container_idx: request.box_idx,
+            children,
+            content_origin: content_point,
+            content_width: layout_width,
+            explicit_height: height_basis,
+            min_height,
+            max_height,
+            kind,
+        },
     )
+}
+
+fn measure_natural_taffy_height(
+    engine: &mut LayoutEngine<'_, '_>,
+    resolved: &ResolvedBoxSizing,
+    children: &[u32],
+    kind: TaffyContainerKind,
+) -> f64 {
+    super::with_isolated_measurement(engine, |engine| {
+        crate::flex_grid::layout(
+            engine,
+            FlexGridInput {
+                container_idx: resolved.box_idx(),
+                children,
+                content_origin: Point::ZERO,
+                content_width: resolved.horizontal.content,
+                explicit_height: None,
+                min_height: None,
+                max_height: None,
+                kind,
+            },
+        )
+        .size
+        .height
+        .max(0.0)
+    })
 }
 
 fn measure_marker_width(engine: &LayoutEngine<'_, '_>, marker_box: usize) -> f64 {
@@ -351,11 +372,11 @@ fn place_list_marker(
     // Marker glyphs are positioned relative to the list-item border edge;
     // descendant or adjoining floats must not reflow that already-positioned
     // marker as though it were ordinary inline content.
-    engine.floats.push_context();
+    engine.scratch.floats.push_context();
     let _ = engine.layout_box(BoxLayoutRequest::normal(
         marker.marker_box as usize,
         available,
         None,
     ));
-    engine.floats.pop_context();
+    engine.scratch.floats.pop_context();
 }

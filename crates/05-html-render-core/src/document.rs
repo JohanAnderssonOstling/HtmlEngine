@@ -1,11 +1,7 @@
 //! Paint document content through a caller-supplied geometric projection.
 //! CSS interpretation stays here; no pagination or scrolling policy lives here.
 
-use html_pipeline::engine::export_queries;
-use html_pipeline::engine::geometry_queries;
 use html_resources::resources::images as image_resources;
-use html_pipeline::engine::fragment_paint;
-use html_pipeline::engine::text_paint;
 use crate::{
     Painter, SceneImagePolicy, color_from_u32, paint_line_glyphs, paint_line_text_runs,
     paint_projected_decoration,
@@ -138,7 +134,12 @@ impl<'a> DocumentPainter<'a> {
     }
 
     pub fn paint(&self, projection: &impl PaintProjection, painter: &mut impl Painter) {
-        if !text_paint::paint_resources_valid(self.view) {
+        if !(self.view).paint_resources_valid() {
+            return;
+        }
+        if let Some(resources) = (self.view).native_paint_resources()
+            && !painter.bind_text_resources(resources)
+        {
             return;
         }
         let bounds = projection.bounds();
@@ -147,22 +148,18 @@ impl<'a> DocumentPainter<'a> {
         }
         if let Some(color) = self
             .background
-            .or_else(|| text_paint::render_view_canvas_background_color(&self.view))
+            .or_else(|| (self.view).canvas_background_color())
         {
-            painter.fill_rect(bounds, color_from_u32(color));
+            painter.fill_canvas(bounds, color_from_u32(color));
         }
         let fragments = self.view.fragments();
         let mut placements = Placements::default();
         if let Some(candidates) = projection.candidates(self.view) {
-            for item in fragment_paint::paint_order_for(
-                fragments,
-                &candidates.lines,
-                &candidates.block_decorations,
-            ) {
+            for item in fragments.paint_order_for(&candidates.lines, &candidates.block_decorations) {
                 self.paint_item(item, projection, &mut placements, painter);
             }
         } else {
-            for item in fragment_paint::paint_order(fragments) {
+            for item in fragments.paint_order() {
                 self.paint_item(item, projection, &mut placements, painter);
             }
         }
@@ -201,26 +198,22 @@ impl<'a> DocumentPainter<'a> {
         painter: &mut impl Painter,
     ) {
         let mut source = decoration.rect();
-        if let Some(overflow) = fragment_paint::decoration_overflow_clip(&decoration) {
+        if let Some(overflow) = decoration.overflow_clip() {
             source = overflow.apply_to(source);
         }
         if source.width() <= 0.0 || source.height() <= 0.0 {
             return;
         }
-        let owner = fragment_paint::render_decoration_line(&decoration).or_else(|| {
+        let owner = decoration.line().or_else(|| {
             decoration
                 .is_inline()
                 .then(|| {
-                    geometry_queries::render_geometry_view_line_intersecting_vertical_range(
-                        geometry_queries::render_view_geometry(self.view),
-                        source.y0,
-                        source.y1,
-                    )
+                    ((self.view).geometry()).line_intersecting_vertical_range(source.y0, source.y1)
                 })
                 .flatten()
         });
         if let Some(line) = owner.and_then(|index| self.view.text().line(index)) {
-            source = source + kurbo::Vec2::new(text_paint::line_optical_offset_x(&line), 0.0);
+            source = source + kurbo::Vec2::new(line.line_optical_offset_x(), 0.0);
         }
         fragments.clear();
         projection.project_decoration(decoration.owner_box(), source, owner, fragments);
@@ -229,7 +222,7 @@ impl<'a> DocumentPainter<'a> {
                 continue;
             }
             let rect = Rect::from_origin_size(fragment.destination, fragment.source.size());
-            let radii = fragment_paint::decoration_radii(&decoration).map(|mut radii| {
+            let radii = decoration.radii().map(|mut radii| {
                 if fragment.source.x0 > source.x0 {
                     radii.top_left = (0.0, 0.0);
                     radii.bottom_left = (0.0, 0.0);
@@ -264,10 +257,7 @@ impl<'a> DocumentPainter<'a> {
         };
         let clip = placement.clip.map(|clip| clip.intersect(bounds));
         if let Some(clip) = clip {
-            let vertical = geometry_queries::render_geometry_view_line_vertical_bounds(
-                geometry_queries::render_view_geometry(self.view),
-                index,
-            );
+            let vertical = ((self.view).geometry()).line_vertical_bounds(index);
             if vertical.is_some_and(|vertical| {
                 let offset = placement.origin.y - line.point().y;
                 vertical.end + offset <= clip.y0 || vertical.start + offset >= clip.y1
@@ -275,7 +265,7 @@ impl<'a> DocumentPainter<'a> {
                 return;
             }
         }
-        let overflow = text_paint::line_overflow_clip(self.view.text(), index).map(|overflow| {
+        let overflow = (self.view.text()).line_overflow_clip(index).map(|overflow| {
             let delta = placement.origin - line.point();
             overflow.apply_to(bounds - delta) + delta
         });
@@ -290,17 +280,17 @@ impl<'a> DocumentPainter<'a> {
             painter.push_clip(clip);
         }
         for image in
-            fragment_paint::render_fragment_view_images_for_line(self.view.fragments(), index)
+            (self.view.fragments()).images_for_line(index)
                 .iter()
         {
             if matches!(self.image_policy, SceneImagePolicy::Omit) {
                 continue;
             }
             let rect =
-                fragment_paint::render_image_fragment_rect(&image) + placement.origin.to_vec2();
+                image.rect() + placement.origin.to_vec2();
             let image_clip =
-                fragment_paint::render_image_fragment_clip(&image) + placement.origin.to_vec2();
-            let visible = fragment_paint::render_image_fragment_visible_rect(&image)
+                image.clip() + placement.origin.to_vec2();
+            let visible = image.visible_rect()
                 + placement.origin.to_vec2();
             if visible.is_zero_area() {
                 continue;
@@ -320,16 +310,13 @@ impl<'a> DocumentPainter<'a> {
                     height,
                 }) => {
                     let size = (*width, *height);
-                    if export_queries::render_export_view_is_equation(
-                        self.view.export(),
-                        image.image(),
-                    ) {
+                    if (self.view.export()).is_equation(image.image()) {
                         painter.draw_math_svg(
                             bytes,
                             hash,
                             size,
                             rect,
-                            fragment_paint::image_text_color(&image),
+                            image.text_color(),
                         );
                     } else {
                         painter.draw_svg(bytes, hash, size, rect);
@@ -342,7 +329,7 @@ impl<'a> DocumentPainter<'a> {
                     }
                     SceneImagePolicy::Reference => painter.draw_resource_image(
                         image.image(),
-                        text_paint::render_view_image_uri(&self.view, image.image()),
+                        (self.view).image_uri(image.image()),
                         rect,
                     ),
                 },
@@ -351,7 +338,7 @@ impl<'a> DocumentPainter<'a> {
         }
         let color = self
             .foreground
-            .or_else(|| text_paint::line_paint_color(&line));
+            .or_else(|| line.line_paint_color());
         if !paint_line_text_runs(
             self.view,
             index,

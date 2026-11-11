@@ -1,5 +1,4 @@
-use crate::style::matching::selectors::AncestorFilter;
-use html_dom::{Document, DomNodeId};
+use html_dom::Document;
 use html_style_model::ComputedStylesBuilder;
 
 /// `rem` on the root element uses the initial root size. Once that element has
@@ -13,24 +12,4 @@ pub(super) fn root_font_size_for_resolution(doc: &Document, styles: &ComputedSty
         .map(|font| font.font_size)
         .filter(|size| size.is_finite() && *size >= 0.0)
         .unwrap_or_else(|| doc.root_font_size())
-}
-
-/// Build ancestor filter for DOM nodes (optimization)
-pub(super) fn extend_ancestor_filter_dom(
-    doc: &Document,
-    node_idx: DomNodeId,
-    filter: &mut AncestorFilter,
-) {
-    let Some(element) = doc.element_ref(node_idx) else {
-        return;
-    };
-    filter.insert(element.tag());
-
-    if let Some(id) = element.id() {
-        filter.insert(id);
-    }
-
-    for class in element.classes() {
-        filter.insert(class);
-    }
 }

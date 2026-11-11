@@ -1,10 +1,12 @@
-use html_dom::storage;
 use crate::layout_model::{
     BlockBox, Children, InlineContent, InlineItem, InlineItemKind, LayoutBox, LayoutMode,
     LayoutTree, ListItemMarker, TableBox, TableCellBox, TableRowBox,
 };
-use html_dom::ElementRef;
-use html_style_model::{CaptionSide, ComputedStyles, Display, Float, ListStylePosition, PositionMode, StyleIndices, StyleView};
+use html_dom::{DomNodeId, ElementRef};
+use html_style_model::{
+    CaptionSide, ComputedStyles, Display, Float, ListStylePosition, PositionMode, StyleIndices,
+    StyleView,
+};
 use html_text::get_style;
 use std::ops::Range;
 
@@ -60,11 +62,11 @@ impl<'styles, 'out> BoxTreeWriter<'styles, 'out> {
     ) -> u32 {
         let box_idx = self.tree.push_box(LayoutBox {
             layout_mode,
-            dom_element: Some(element.node_id().raw()),
+            dom_element: Some(element.node_id()),
             parent,
             style,
         });
-        if let Some(image_idx) = storage::image_idx(element) {
+        if let Some(image_idx) = element.image_idx() {
             self.tree.set_box_image_idx(box_idx, image_idx);
         }
         if element.tag().eq_ignore_ascii_case("body") {
@@ -116,7 +118,7 @@ impl<'styles, 'out> BoxTreeWriter<'styles, 'out> {
         &mut self,
         kind: InlineItemKind,
         box_idx: u32,
-        dom_text_node: Option<u32>,
+        dom_text_node: Option<DomNodeId>,
     ) {
         self.inline.push_inline_item(InlineItem {
             kind,
@@ -141,7 +143,7 @@ impl<'styles, 'out> BoxTreeWriter<'styles, 'out> {
         );
     }
 
-    pub(super) fn push_source_text(&mut self, text: &str, box_idx: u32, dom_text_node: u32) {
+    pub(super) fn push_source_text(&mut self, text: &str, box_idx: u32, dom_text_node: DomNodeId) {
         self.push_source_text_fragment(text, box_idx, dom_text_node, 0);
     }
 
@@ -149,7 +151,7 @@ impl<'styles, 'out> BoxTreeWriter<'styles, 'out> {
         &mut self,
         text: &str,
         box_idx: u32,
-        dom_text_node: u32,
+        dom_text_node: DomNodeId,
         source_utf16_offset: u32,
     ) {
         if text.is_empty() {
@@ -259,7 +261,8 @@ impl<'styles, 'out> BoxTreeWriter<'styles, 'out> {
                 group_end += 1;
             }
             for (offset, &row_idx) in table.rows[group_start..group_end].iter().enumerate() {
-                let Some(LayoutMode::TableRow(row)) = self.tree.get_box_layout_mode(row_idx as usize)
+                let Some(LayoutMode::TableRow(row)) =
+                    self.tree.get_box_layout_mode(row_idx as usize)
                 else {
                     continue;
                 };
@@ -280,7 +283,7 @@ impl<'styles, 'out> BoxTreeWriter<'styles, 'out> {
             }
             group_start = group_end;
         }
-        if let Some(LayoutMode::Table(current)) = self.layout_mode_mut(table_idx) {
+        if let Some(current) = self.tree.get_box_table_mut(table_idx as usize) {
             *current = table;
         }
     }
@@ -322,21 +325,35 @@ impl<'styles, 'out> BoxTreeWriter<'styles, 'out> {
             start_edge,
             end_edge,
         } = plan;
-        let style = self.styles.view(content.style).expect("validated generated style");
+        let style = self
+            .styles
+            .view(content.style)
+            .expect("validated generated style");
         let absolute = style.layout.position == PositionMode::Absolute;
         if absolute || style.float() != Float::None {
             // Blockification does not put a positioned/floated pseudo into
             // normal block flow. Materialize its own principal box, then
             // retain the same zero-width source anchor as a real element.
             let pseudo_box = if matches!(content.display, Display::Table | Display::InlineTable) {
-                let Some(plan) = plan_generated_table_principal(self.styles, content) else { return; };
-                let Some(principal) = self.materialize_generated_table(parent, plan) else { return; };
+                let Some(plan) = plan_generated_table_principal(self.styles, content) else {
+                    return;
+                };
+                let Some(principal) = self.materialize_generated_table(parent, plan) else {
+                    return;
+                };
                 principal
             } else {
                 self.push_generated_text_box(parent, &content)
             };
-            let kind = if absolute { InlineItemKind::AbsoluteAnchor { box_idx: pseudo_box } }
-                else { InlineItemKind::FloatAnchor { box_idx: pseudo_box } };
+            let kind = if absolute {
+                InlineItemKind::AbsoluteAnchor {
+                    box_idx: pseudo_box,
+                }
+            } else {
+                InlineItemKind::FloatAnchor {
+                    box_idx: pseudo_box,
+                }
+            };
             self.push_item(kind, parent, None);
             return;
         }
@@ -463,8 +480,8 @@ impl<'styles, 'out> BoxTreeWriter<'styles, 'out> {
                 TableRole::Table => {}
                 TableRole::RowGroup | TableRole::Row | TableRole::Caption(_) => {
                     if let Some(table) = nearest_table(&boxes, planned.parent)
-                        && let Some(LayoutMode::Table(table)) =
-                            self.layout_mode_mut(box_indices[table])
+                        && let Some(table) =
+                            self.tree.get_box_table_mut(box_indices[table] as usize)
                     {
                         let children = match planned.role {
                             TableRole::RowGroup => &mut table.row_groups,

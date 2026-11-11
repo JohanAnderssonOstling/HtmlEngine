@@ -18,7 +18,7 @@ fn size_comparisons_keep_branch_order_limits_and_percentage_dependence() {
         let node = styled
             .document()
             .node_ids()
-            .find(|&node| styled.document().get_dom_tag(node) == Some("p"))
+            .find(|&node| styled.document().try_element_ref(node).map(|element| element.tag()) == Some("p"))
             .unwrap();
         let used = styled
             .styles()

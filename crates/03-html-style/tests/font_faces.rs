@@ -1,8 +1,6 @@
 use html_style::{
     AuthorStylesheetInput, FontFaceDescriptor, FontFaceSource, FontFaceStyle, MediaEnvironment,
-    MediaType, StyleProgram, StyleProgramCache, resolve_font_face_urls, style_document,
-    style_document_with_cached_program_and_timings, style_document_with_environment,
-};
+    MediaType, StyleProgram, StyleProgramCache, resolve_font_face_urls, style_document};
 
 fn document() -> html_dom::Document {
     html_parse::parse_dom_document("<!doctype html><html><body><p>Hello</p></body></html>")
@@ -152,8 +150,8 @@ fn font_only_media_rules_invalidate_style_and_respect_supports() {
             @font-face { font-family: Unsupported; src: url(no.ttf); }
         }
     "#;
-    let (small, queries) = style_document_with_environment(document(), &[css], environment(600.0));
-    let (large, _) = style_document_with_environment(document(), &[css], environment(800.0));
+    let (small, queries) = { let (styled, _, queries) = html_style::StyleRequest::from_css(document(), &[css]).environment(environment(600.0)).compile(); (styled, queries) };
+    let (large, _) = { let (styled, _, queries) = html_style::StyleRequest::from_css(document(), &[css]).environment(environment(800.0)).compile(); (styled, queries) };
     assert_eq!(
         small
             .font_faces()
@@ -187,20 +185,15 @@ fn font_faces_survive_both_program_cache_paths() {
     let program = StyleProgram::compile(&[css], environment(800.0), 16.0);
     let mut cache = StyleProgramCache::default();
     for width in [800.0, 600.0, 800.0] {
-        let (cached, _, _) = style_document_with_cached_program_and_timings(
-            &mut cache,
-            document(),
-            &inputs,
-            environment(width),
-        );
-        let (fresh, _) = style_document_with_environment(document(), &[css], environment(width));
+        let (cached, _, _) = html_style::StyleRequest::new(document(), &inputs).environment(environment(width)).compile_cached(&mut cache);
+        let (fresh, _) = { let (styled, _, queries) = html_style::StyleRequest::from_css(document(), &[css]).environment(environment(width)).compile(); (styled, queries) };
         assert_eq!(cached.font_faces(), fresh.font_faces());
         if width == 800.0 {
             assert_eq!(cached.font_faces(), program.font_faces());
         }
     }
     let stats = cache.stats();
-    assert_eq!((stats.hits, stats.misses, stats.parsed_hits), (1, 2, 1));
+    assert_eq!((stats.hits, stats.misses, stats.parsed_hits), (1, 2, 2));
 }
 
 #[test]

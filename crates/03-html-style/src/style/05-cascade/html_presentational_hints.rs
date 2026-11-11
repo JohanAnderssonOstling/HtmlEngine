@@ -2,7 +2,6 @@
 //! Native values and renderer keyword tokens enter ordinary winner selection;
 //! attribute values are never serialized to CSS text and reparsed.
 use super::values::colors::css_color_to_u32;
-use html_dom::storage;
 use html_dom::{Document, ElementRef};
 use html_style_model::PreferredSize;
 use lightningcss::properties::Property;
@@ -198,7 +197,7 @@ pub(super) fn collect<'css>(
     }
     let table_attr = |name| {
         doc.dom_ancestors(node)
-            .filter_map(|ancestor| doc.element_ref(ancestor))
+            .filter_map(|ancestor| doc.try_element_ref(ancestor))
             .filter(|&ancestor| is_html_tag(ancestor, "table"))
             .filter_map(move |ancestor| ancestor.attr(name))
     };
@@ -223,7 +222,7 @@ pub(super) fn collect<'css>(
 }
 
 fn html_direction(element: ElementRef<'_>) -> Direction {
-    if storage::html_state(element).is_rtl() {
+    if element.html_state().is_rtl() {
         Direction::Rtl
     } else {
         Direction::Ltr

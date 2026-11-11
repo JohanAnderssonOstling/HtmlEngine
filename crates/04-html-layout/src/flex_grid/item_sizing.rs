@@ -3,10 +3,9 @@
 use super::length_dimension;
 use super::style::{dimension, effective_align_self, layout_style};
 use crate::layout::{
-    BoxLayoutRequest, LayoutEngine, ReplacedMainAxis, ReplacedSizeInput, ResolvedBoxModel,
+    BoxLayoutRequest, LayoutEngine, ReplacedMainAxis, ReplacedSizeInput,
     box_content_intrinsic_widths, measure_box_isolated, preferred_aspect_ratio,
-    resolve_definite_content_size, resolve_replaced_flex_auto_min_main_size,
-};
+    resolve_definite_content_size, resolve_replaced_flex_auto_min_main_size};
 use html_style_model::{
     BoxSizing, FlexWrap, ItemAlignment, OverflowMode, UsedPreferredSize as PreferredSize,
 };
@@ -16,15 +15,15 @@ use taffy::prelude::Dimension;
 /// intrinsic sizing keywords therefore have to be resolved at the adapter
 /// boundary instead of being collapsed to `auto` (content/max-content).
 pub(super) fn resolve_intrinsic_flex_basis(
-    session: &mut LayoutEngine<'_, '_>,
+    engine: &mut LayoutEngine<'_, '_>,
     box_idx: usize,
     containing_width: f64,
     containing_height: Option<f64>,
     horizontal_main_axis: bool,
 ) -> Option<Dimension> {
-    let style = session.reader.style(box_idx);
-    let model = ResolvedBoxModel::new(style, containing_width).with_nonnegative_padding();
-    let mut basis = style.flex_basis();
+    let style = engine.reader.style(box_idx);
+    let sizes = engine.reader.sizes(box_idx);
+    let mut basis = sizes.flex_basis;
     if matches!(basis, PreferredSize::Stretch) {
         let available = if horizontal_main_axis {
             Some(containing_width)
@@ -32,6 +31,10 @@ pub(super) fn resolve_intrinsic_flex_basis(
             containing_height
         };
         if let Some(available) = available {
+            let model = engine
+                .reader
+                .box_model(box_idx, containing_width)
+                .with_nonnegative_padding();
             let (margin, inset) = if horizontal_main_axis {
                 (model.horizontal_margin(), model.horizontal_padding_border())
             } else {
@@ -50,7 +53,7 @@ pub(super) fn resolve_intrinsic_flex_basis(
     }
     if matches!(basis, PreferredSize::Content) {
         if let Some(value) = content_ratio_basis(
-            session,
+            engine,
             box_idx,
             containing_width,
             containing_height,
@@ -70,7 +73,7 @@ pub(super) fn resolve_intrinsic_flex_basis(
     }
     if horizontal_main_axis {
         return Some(taffy_item_width_dimension(
-            session,
+            engine,
             box_idx,
             if matches!(basis, PreferredSize::Content) {
                 PreferredSize::MaxContent
@@ -85,11 +88,15 @@ pub(super) fn resolve_intrinsic_flex_basis(
     // Intrinsic block-axis sizes are measured with the item's allocated
     // cross size. This is observable when content wraps at that width.
     let measured = measure_box_isolated(
-        session,
+        engine,
         BoxLayoutRequest::normal(box_idx, containing_width.max(0.0), None)
             .for_intrinsic_block_measurement(),
     )
     .size_with_floats();
+    let model = engine
+        .reader
+        .box_model(box_idx, containing_width)
+        .with_nonnegative_padding();
     let vertical_inset = model.vertical_padding_border();
     let basis = match style.box_sizing() {
         BoxSizing::ContentBox => (measured.height - vertical_inset).max(0.0),
@@ -99,23 +106,27 @@ pub(super) fn resolve_intrinsic_flex_basis(
 }
 
 fn content_ratio_basis(
-    session: &LayoutEngine<'_, '_>,
+    engine: &LayoutEngine<'_, '_>,
     box_idx: usize,
     containing_width: f64,
     containing_height: Option<f64>,
     horizontal_main_axis: bool,
 ) -> Option<Dimension> {
-    let style = session.reader.style(box_idx);
-    let model = ResolvedBoxModel::new(style, containing_width).with_nonnegative_padding();
-    let intrinsic_ratio = session
+    let style = engine.reader.style(box_idx);
+    let sizes = engine.reader.sizes(box_idx);
+    let intrinsic_ratio = engine
         .reader
         .image_intrinsic(box_idx)
         .and_then(|image| image.aspect_ratio);
     let authored = style.aspect_ratio();
     let ratio = preferred_aspect_ratio(authored, intrinsic_ratio)?;
+    let model = engine
+        .reader
+        .box_model(box_idx, containing_width)
+        .with_nonnegative_padding();
     let horizontal_inset = model.horizontal_padding_border();
     let vertical_inset = model.vertical_padding_border();
-    let layout = layout_style(session, box_idx);
+    let layout = layout_style(engine, box_idx);
     let (
         cross_size,
         cross_min,
@@ -127,9 +138,9 @@ fn content_ratio_basis(
         auto_margins,
     ) = if horizontal_main_axis {
         (
-            style.height(),
-            style.min_height(),
-            style.max_height(),
+            sizes.height,
+            sizes.min_height,
+            sizes.max_height,
             containing_height,
             model.vertical_margin(),
             vertical_inset,
@@ -138,9 +149,9 @@ fn content_ratio_basis(
         )
     } else {
         (
-            style.width(),
-            style.min_width(),
-            style.max_width(),
+            sizes.width,
+            sizes.min_width,
+            sizes.max_width,
             Some(containing_width),
             model.horizontal_margin(),
             horizontal_inset,
@@ -161,8 +172,8 @@ fn content_ratio_basis(
         if !matches!(cross_size, PreferredSize::Auto) || auto_margins {
             return None;
         }
-        let parent = layout_style(session, session.reader.get_parent(box_idx)?);
-        let align = effective_align_self(session, box_idx);
+        let parent = layout_style(engine, engine.reader.get_parent(box_idx)?);
+        let align = effective_align_self(engine, box_idx);
         (parent.flex_wrap == FlexWrap::NoWrap
             && matches!(align, ItemAlignment::Normal | ItemAlignment::Stretch))
         .then(|| resolve(PreferredSize::Stretch))
@@ -197,12 +208,12 @@ fn content_ratio_basis(
 /// minimum itself, which prevents empty fixed-size items from shrinking
 /// and gives percentage-sized tables no usable share of the flex line.
 pub(super) fn flex_automatic_min_content_width(
-    session: &LayoutEngine<'_, '_>,
+    engine: &mut LayoutEngine<'_, '_>,
     box_idx: usize,
     containing_width: f64,
 ) -> f64 {
-    let style = session.reader.style(box_idx);
-    let model = ResolvedBoxModel::new(style, containing_width).with_nonnegative_padding();
+    let style = engine.reader.style(box_idx);
+    let sizes = engine.reader.sizes(box_idx);
     if matches!(
         style.overflow_x(),
         OverflowMode::Hidden | OverflowMode::Scroll | OverflowMode::Auto
@@ -210,7 +221,11 @@ pub(super) fn flex_automatic_min_content_width(
         return 0.0;
     }
 
-    let (content_min, content_max) = box_content_intrinsic_widths(session, box_idx, None);
+    let model = engine
+        .reader
+        .box_model(box_idx, containing_width)
+        .with_nonnegative_padding();
+    let (content_min, content_max) = box_content_intrinsic_widths(engine, box_idx, None);
     let content_min = content_min.max(0.0);
     let padding_border = model.horizontal_padding_border();
     let horizontal_margin = model.horizontal_margin();
@@ -223,16 +238,16 @@ pub(super) fn flex_automatic_min_content_width(
             style.box_sizing(),
         )
     };
-    let preferred = match style.width() {
+    let preferred = match sizes.width {
         PreferredSize::MinContent => Some(content_min),
         PreferredSize::MaxContent | PreferredSize::FitContent => Some(content_max.max(content_min)),
         value => resolve_definite(value),
     };
     let mut automatic_min = preferred.map_or(content_min, |preferred| content_min.min(preferred));
     if matches!(
-        style.max_width(),
+        sizes.max_width,
         PreferredSize::Px(_) | PreferredSize::Percent(_) | PreferredSize::Stretch
-    ) && let Some(maximum) = resolve_definite(style.max_width())
+    ) && let Some(maximum) = resolve_definite(sizes.max_width)
     {
         automatic_min = automatic_min.min(maximum);
     }
@@ -244,17 +259,21 @@ pub(super) fn flex_automatic_min_content_width(
 /// first converts a definite (including stretched) cross size and cross
 /// min/max constraints through the preferred aspect ratio.
 pub(super) fn flex_replaced_automatic_minimum(
-    session: &LayoutEngine<'_, '_>,
+    engine: &LayoutEngine<'_, '_>,
     box_idx: usize,
     containing_width: f64,
     containing_height: Option<f64>,
     horizontal_main_axis: bool,
 ) -> Option<f64> {
-    let image_intrinsic = session.reader.image_intrinsic(box_idx)?;
+    let image_intrinsic = engine.reader.image_intrinsic(box_idx)?;
     let intrinsic = image_intrinsic.size;
-    let style = session.reader.style(box_idx);
-    let model = ResolvedBoxModel::new(style, containing_width).with_nonnegative_padding();
-    let layout = layout_style(session, box_idx);
+    let style = engine.reader.style(box_idx);
+    let sizes = engine.reader.sizes(box_idx);
+    let model = engine
+        .reader
+        .box_model(box_idx, containing_width)
+        .with_nonnegative_padding();
+    let layout = layout_style(engine, box_idx);
     let scrollable_main = if horizontal_main_axis {
         style.overflow_x()
     } else {
@@ -281,21 +300,21 @@ pub(super) fn flex_replaced_automatic_minimum(
     let (main_axis, cross_size, cross_basis, cross_auto_margins) = if horizontal_main_axis {
         (
             ReplacedMainAxis::Horizontal,
-            style.height(),
+            sizes.height,
             containing_height,
             layout.margin_top_auto || layout.margin_bottom_auto,
         )
     } else {
         (
             ReplacedMainAxis::Vertical,
-            style.width(),
+            sizes.width,
             Some(containing_width),
             layout.margin_left_auto || layout.margin_right_auto,
         )
     };
     let mut stretch_cross_size = false;
     if matches!(cross_size, PreferredSize::Auto) && !cross_auto_margins {
-        let effective_alignment = effective_align_self(session, box_idx);
+        let effective_alignment = effective_align_self(engine, box_idx);
         if matches!(
             effective_alignment,
             ItemAlignment::Normal | ItemAlignment::Stretch
@@ -311,7 +330,7 @@ pub(super) fn flex_replaced_automatic_minimum(
 }
 
 pub(super) fn taffy_item_width_dimension(
-    session: &LayoutEngine<'_, '_>,
+    engine: &mut LayoutEngine<'_, '_>,
     box_idx: usize,
     value: PreferredSize,
     containing_width: f64,
@@ -333,9 +352,12 @@ pub(super) fn taffy_item_width_dimension(
     ) {
         return dimension(value);
     }
-    let style = session.reader.style(box_idx);
-    let model = ResolvedBoxModel::new(style, containing_width).with_nonnegative_padding();
-    let (min, max) = box_content_intrinsic_widths(session, box_idx, None);
+    let style = engine.reader.style(box_idx);
+    let model = engine
+        .reader
+        .box_model(box_idx, containing_width)
+        .with_nonnegative_padding();
+    let (min, max) = box_content_intrinsic_widths(engine, box_idx, None);
     let available =
         (containing_width - model.horizontal_margin() - model.horizontal_padding_border()).max(0.0);
     let content = match value {
@@ -353,8 +375,8 @@ pub(super) fn taffy_item_width_dimension(
 }
 
 /// Stable sorting preserves source order for items with the same CSS order.
-pub(super) fn ordered_children(session: &LayoutEngine<'_, '_>, children: &[u32]) -> Vec<u32> {
+pub(super) fn ordered_children(engine: &LayoutEngine<'_, '_>, children: &[u32]) -> Vec<u32> {
     let mut ordered = children.to_vec();
-    ordered.sort_by_key(|&child| super::style::layout_style(session, child as usize).order);
+    ordered.sort_by_key(|&child| super::style::layout_style(engine, child as usize).order);
     ordered
 }

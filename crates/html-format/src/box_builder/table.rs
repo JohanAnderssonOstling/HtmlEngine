@@ -1,13 +1,11 @@
 use crate::layout_model::{
-    BlockBox, Children, LayoutMode, TableBox, TableCellBox, TableColumnGroupSpan, TableColumnTrack,
+    BlockBox, Children, LayoutMode, TableCellBox, TableColumnGroupSpan, TableColumnTrack,
     TableColumnWidthHint, TableRowBox, parse_positive_span,
 };
 use html_dom::{Document, DomNodeId, NodeRef};
 use html_style_model::{CaptionSide, ComputedStyles, Display, WhiteSpace};
 
-use super::classification::{
-    display_for_element, is_absolutely_positioned, starts_new_block_child,
-};
+use super::classification::{ElementClassification, display_for_element, starts_new_block_child};
 use super::generated::ResolvedGeneratedContent;
 use super::inline::{text_is_ignorable_at_block_edge, trim_node_edges};
 
@@ -19,8 +17,12 @@ pub(super) struct TableChildrenPlan {
 }
 
 pub(super) enum TableChildAction {
-    Anonymous(Vec<u32>),
-    Principal { node: DomNodeId, role: TableRole },
+    Anonymous(Vec<DomNodeId>),
+    Principal {
+        node: DomNodeId,
+        role: TableRole,
+        classification: ElementClassification,
+    },
 }
 
 pub(super) enum AnonymousTablePlan {
@@ -30,12 +32,12 @@ pub(super) enum AnonymousTablePlan {
 }
 
 pub(super) enum AnonymousCellPart {
-    Inline(Vec<u32>),
+    Inline(Vec<DomNodeId>),
     Block(DomNodeId),
 }
 
 pub(super) enum TableRowChildAction {
-    Anonymous(Vec<u32>),
+    Anonymous(Vec<DomNodeId>),
     Cell(DomNodeId),
     OutOfFlow(DomNodeId),
 }
@@ -52,7 +54,7 @@ pub(super) enum TableRole {
 impl TableRole {
     pub(super) fn layout_mode(self) -> LayoutMode {
         match self {
-            Self::Table => LayoutMode::Table(TableBox::default()),
+            Self::Table => LayoutMode::Table(Default::default()),
             Self::RowGroup | Self::Caption(_) => LayoutMode::Block(BlockBox::default()),
             Self::Row => LayoutMode::TableRow(TableRowBox::default()),
             Self::Cell => LayoutMode::TableCell(TableCellBox::new(Children::Empty)),
@@ -150,7 +152,7 @@ pub(super) fn nearest_table(
 pub(super) fn plan_table_children(
     document: &Document,
     styles: &ComputedStyles,
-    children: impl IntoIterator<Item = u32>,
+    children: impl IntoIterator<Item = DomNodeId>,
 ) -> TableChildrenPlan {
     let children = flattened_contents_children(document, styles, children);
     let mut actions = Vec::new();
@@ -160,15 +162,14 @@ pub(super) fn plan_table_children(
     let mut anonymous = Vec::new();
 
     for raw in children {
-        let Some(node) = document.node_id_from_raw(raw) else {
-            continue;
-        };
-        let Some(element) = document.element_ref(node) else {
+        let node = raw;
+        let Some(element) = document.try_element_ref(node) else {
             anonymous.push(raw);
             continue;
         };
-        let style = styles.style_for_node(element.node_id());
-        let display = display_for_element(styles, element);
+        let classification = ElementClassification::new(styles, element);
+        let style = classification.style;
+        let display = classification.display;
         match display {
             Display::TableCaption => {
                 flush_anonymous_action(&mut anonymous, &mut actions);
@@ -182,6 +183,7 @@ pub(super) fn plan_table_children(
                     .unwrap_or(CaptionSide::Top);
                 actions.push(TableChildAction::Principal {
                     node,
+                    classification,
                     role: TableRole::Caption(side),
                 });
             }
@@ -243,6 +245,7 @@ pub(super) fn plan_table_children(
                 flush_anonymous_action(&mut anonymous, &mut actions);
                 actions.push(TableChildAction::Principal {
                     node,
+                    classification,
                     role: TableRole::Row,
                 });
             }
@@ -250,6 +253,7 @@ pub(super) fn plan_table_children(
                 flush_anonymous_action(&mut anonymous, &mut actions);
                 actions.push(TableChildAction::Principal {
                     node,
+                    classification,
                     role: TableRole::RowGroup,
                 });
             }
@@ -269,14 +273,13 @@ pub(super) fn plan_table_children(
 pub(super) fn plan_anonymous_table_children(
     document: &Document,
     styles: &ComputedStyles,
-    nodes: &[u32],
+    nodes: &[DomNodeId],
     white_space: WhiteSpace,
 ) -> AnonymousTablePlan {
     let flattened;
     let nodes = if nodes.iter().any(|&raw| {
         document
-            .node_id_from_raw(raw)
-            .and_then(|node| document.element_ref(node))
+            .try_element_ref(raw)
             .is_some_and(|element| display_for_element(styles, element) == Display::Contents)
     }) {
         flattened = flattened_contents_children(document, styles, nodes.iter().copied());
@@ -287,8 +290,7 @@ pub(super) fn plan_anonymous_table_children(
     let whitespace_only = !nodes.is_empty()
         && nodes.iter().all(|&raw| {
             document
-                .node_id_from_raw(raw)
-                .and_then(|node| document.text_ref(node))
+                .try_text_ref(raw)
                 .is_some_and(|text| text.text().chars().all(char::is_whitespace))
         });
     if whitespace_only {
@@ -297,8 +299,7 @@ pub(super) fn plan_anonymous_table_children(
 
     let nodes = trim_node_edges(nodes, |raw| {
         document
-            .node_id_from_raw(raw)
-            .and_then(|node| document.text_ref(node))
+            .try_text_ref(raw)
             .is_some_and(|text| text_is_ignorable_at_block_edge(text.text(), white_space))
     });
     if nodes.is_empty() {
@@ -306,23 +307,18 @@ pub(super) fn plan_anonymous_table_children(
     }
 
     let only_cells_and_ignorable_text = nodes.iter().all(|&raw| {
-        let Some(node) = document.node_id_from_raw(raw) else {
-            return true;
-        };
+        let node = raw;
         match document.node_ref(node) {
-            Some(NodeRef::Element(element)) => {
-                display_for_element(styles, element) == Display::TableCell
-            }
-            Some(NodeRef::Text(text)) => text.text().chars().all(char::is_whitespace),
-            None => true,
+            NodeRef::Element(element) => display_for_element(styles, element) == Display::TableCell,
+            NodeRef::Text(text) => text.text().chars().all(char::is_whitespace),
         }
     });
     if only_cells_and_ignorable_text {
         return AnonymousTablePlan::Cells(
             nodes
                 .iter()
-                .filter_map(|&raw| document.node_id_from_raw(raw))
-                .filter(|&node| document.element_ref(node).is_some())
+                .copied()
+                .filter(|&node| document.try_element_ref(node).is_some())
                 .collect(),
         );
     }
@@ -330,11 +326,9 @@ pub(super) fn plan_anonymous_table_children(
     let mut parts = Vec::new();
     let mut inline = Vec::new();
     for &raw in nodes {
-        let Some(node) = document.node_id_from_raw(raw) else {
-            continue;
-        };
+        let node = raw;
         let is_block = document
-            .element_ref(node)
+            .try_element_ref(node)
             .is_some_and(|element| starts_new_block_child(display_for_element(styles, element)));
         if is_block {
             if !inline.is_empty() {
@@ -354,21 +348,20 @@ pub(super) fn plan_anonymous_table_children(
 pub(super) fn plan_table_row_children(
     document: &Document,
     styles: &ComputedStyles,
-    children: impl IntoIterator<Item = u32>,
+    children: impl IntoIterator<Item = DomNodeId>,
 ) -> Vec<TableRowChildAction> {
     let children = flattened_contents_children(document, styles, children);
     let mut actions = Vec::new();
     let mut anonymous = Vec::new();
     for raw in children {
-        let Some(node) = document.node_id_from_raw(raw) else {
-            continue;
-        };
-        let Some(element) = document.element_ref(node) else {
+        let node = raw;
+        let Some(element) = document.try_element_ref(node) else {
             anonymous.push(raw);
             continue;
         };
-        let display = display_for_element(styles, element);
-        let out_of_flow = is_absolutely_positioned(styles, element);
+        let classification = ElementClassification::new(styles, element);
+        let display = classification.display;
+        let out_of_flow = classification.absolute;
         if display == Display::TableCell {
             flush_anonymous_row_action(&mut anonymous, &mut actions);
             actions.push(TableRowChildAction::Cell(node));
@@ -386,13 +379,16 @@ pub(super) fn plan_table_row_children(
 fn flattened_contents_children(
     document: &Document,
     styles: &ComputedStyles,
-    children: impl IntoIterator<Item = u32>,
-) -> Vec<u32> {
-    fn append(document: &Document, styles: &ComputedStyles, raw: u32, output: &mut Vec<u32>) {
-        let Some(node) = document.node_id_from_raw(raw) else {
-            return;
-        };
-        let Some(element) = document.element_ref(node) else {
+    children: impl IntoIterator<Item = DomNodeId>,
+) -> Vec<DomNodeId> {
+    fn append(
+        document: &Document,
+        styles: &ComputedStyles,
+        raw: DomNodeId,
+        output: &mut Vec<DomNodeId>,
+    ) {
+        let node = raw;
+        let Some(element) = document.try_element_ref(node) else {
             output.push(raw);
             return;
         };
@@ -400,7 +396,7 @@ fn flattened_contents_children(
             Display::None => {}
             Display::Contents => {
                 for child in element.children() {
-                    append(document, styles, child.raw(), output);
+                    append(document, styles, child, output);
                 }
             }
             _ => output.push(raw),
@@ -435,13 +431,13 @@ fn append_columns(
     }
 }
 
-fn flush_anonymous_action(nodes: &mut Vec<u32>, actions: &mut Vec<TableChildAction>) {
+fn flush_anonymous_action(nodes: &mut Vec<DomNodeId>, actions: &mut Vec<TableChildAction>) {
     if !nodes.is_empty() {
         actions.push(TableChildAction::Anonymous(std::mem::take(nodes)));
     }
 }
 
-fn flush_anonymous_row_action(nodes: &mut Vec<u32>, actions: &mut Vec<TableRowChildAction>) {
+fn flush_anonymous_row_action(nodes: &mut Vec<DomNodeId>, actions: &mut Vec<TableRowChildAction>) {
     if !nodes.is_empty() {
         actions.push(TableRowChildAction::Anonymous(std::mem::take(nodes)));
     }

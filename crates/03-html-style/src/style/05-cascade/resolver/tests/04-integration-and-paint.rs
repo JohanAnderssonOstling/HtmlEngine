@@ -29,7 +29,7 @@ fn scope_limits_and_proximity_participate_in_matching_and_cascade() {
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, Some(css));
     let color_of = |id| {
-        let node = document.document().node_ids().find(|node| document.document().get_dom_id(*node) == Some(id)).expect("element by id");
+        let node = document.document().node_ids().find(|node| document.document().try_element_ref(*node).and_then(|element| element.id()) == Some(id)).expect("element by id");
         document.text_style(document.style_for_node(node).expect("computed style")).expect("text style").color
     };
 
@@ -70,7 +70,7 @@ fn xhtml_author_max_width_uses_the_inherited_font_size() {
     let document = crate::style_document(parsed.build_dom(), &[&css]);
     let body = find_body(document.document());
     let outer = body.children().find(|node| document.document().is_element_node(*node)).expect("outer div");
-    let inner = document.document().element_ref(outer).expect("outer element").children().find(|node| document.document().is_element_node(*node)).expect("inner div");
+    let inner = document.document().try_element_ref(outer).expect("outer element").children().find(|node| document.document().is_element_node(*node)).expect("inner div");
     let style = document.style_for_node(inner).expect("inner style");
 
     assert_eq!(document.font_style(style).expect("font style").font_size, 30.0);
@@ -89,7 +89,7 @@ fn wpt_unset_inherits_color_but_resets_non_inherited_margin() {
     let document = factory.parse_with_new_pipeline(html, None);
 
     let parent = find_body(document.document()).children().next().expect("parent div");
-    let child = document.document().element_ref(parent).expect("parent element").children().find(|node| document.document().is_element_node(*node)).expect("child span");
+    let child = document.document().try_element_ref(parent).expect("parent element").children().find(|node| document.document().is_element_node(*node)).expect("child span");
     let style = document.style_for_node(child).expect("child style");
 
     assert_eq!(document.text_style(style).expect("text style").color, 0xFF0000FF);
@@ -116,7 +116,7 @@ fn inherited_background_current_color_resolves_against_the_descendant_color() {
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, Some(css));
 
-    let target = document.document().node_ids().find(|&node| document.document().get_dom_id(node) == Some("target")).expect("target element");
+    let target = document.document().node_ids().find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some("target")).expect("target element");
     let style = document.style_for_node(target).expect("target style");
     let background = document.background_style(style).expect("background style");
 
@@ -156,7 +156,7 @@ fn descendant_rem_uses_the_computed_root_font_size() {
     let css = ":root { font-size: 25%; } #target { width: 25rem; height: 25rem; }";
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, Some(css));
-    let target = document.document().node_ids().find(|&node| document.document().get_dom_id(node) == Some("target")).expect("target");
+    let target = document.document().node_ids().find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some("target")).expect("target");
     let style = document.box_model_style(document.style_for_node(target).expect("target style")).expect("box style");
 
     assert_eq!(style.width, PreferredSize::Px(100.0));
@@ -168,7 +168,7 @@ fn root_font_units_remain_symbolic_until_root_metrics_are_available() {
     let html = "<html><body><div id='cap' style='font-size:1cap;width:2em'></div><div id='rch' style='font-size:1rch'></div><div id='rcap' style='font-size:1rcap'></div><div id='rlh' style='font-size:1rlh'></div></body></html>";
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, None);
-    let by_id = |id| document.document().node_ids().find(|&node| document.document().get_dom_id(node) == Some(id)).expect("target");
+    let by_id = |id| document.document().node_ids().find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some(id)).expect("target");
     let cap = document.style_for_node(by_id("cap")).expect("cap style");
     let rch = document.style_for_node(by_id("rch")).expect("rch style");
     let rcap = document.style_for_node(by_id("rcap")).expect("rcap style");
@@ -289,7 +289,7 @@ fn text_decoration_and_outline_cross_as_typed_paint_values() {
     let indices = document.style_for_node(node).expect("decorated style");
     let paint = document.background_style(indices).expect("paint style");
 
-    assert!(paint.text_decoration.lines.underline());
+    assert!(html_style_model::computed_style::text_decoration_lines_underline(paint.text_decoration.lines));
     assert_eq!(paint.text_decoration.style, TextDecorationStyle::Dashed);
     assert_eq!(paint.text_decoration.color, DecorationColor::Rgba(0x123456FF));
     assert_eq!(paint.text_decoration.thickness, crate::document::TextDecorationThickness::Length(LengthPct::Px(2.0)));
@@ -345,8 +345,8 @@ fn unsupported_decoration_and_outline_styles_preserve_atomic_fallbacks() {
     let indices = document.style_for_node(node).expect("decorated style");
     let paint = document.background_style(indices).expect("paint style");
 
-    assert!(paint.text_decoration.lines.underline());
-    assert!(!paint.text_decoration.lines.line_through());
+    assert!(html_style_model::computed_style::text_decoration_lines_underline(paint.text_decoration.lines));
+    assert!(!html_style_model::computed_style::text_decoration_lines_line_through(paint.text_decoration.lines));
     assert_eq!(paint.text_decoration.style, TextDecorationStyle::Solid);
     assert_eq!(paint.text_decoration.color, DecorationColor::Rgba(0xFF0000FF));
     assert_eq!(paint.outline.width(), FontRelativeLength::px(2.0).unwrap());

@@ -12,12 +12,11 @@ pub(super) fn emit_prepared_paragraph(
     engine: &mut crate::layout::LayoutEngine<'_, '_>,
     input: &InlineFormattingInput,
     tokens: &InlineTokens,
-    paragraph: &ParagraphLayoutResult,
+    paragraph: &mut ParagraphLayoutResult,
+    retain_fragments: bool,
 ) {
-    profile_scope!("lines.emit_paragraph");
-    let started = engine.start_timing();
     let mut adjustments = paragraph.adjustments.iter().peekable();
-    for (index, line) in paragraph.lines.iter().enumerate() {
+    for (index, line) in paragraph.lines.iter_mut().enumerate() {
         let adjustment = adjustments
             .peek()
             .filter(|entry| entry.line == index)
@@ -45,7 +44,8 @@ pub(super) fn emit_prepared_paragraph(
             metrics,
             &tokens.replaced,
             input.area.origin + line.origin.to_vec2(),
-            &line.layout,
+            &mut line.layout,
+            retain_fragments,
             color,
             input.area.width,
             input.area.origin.x + if input.paragraph.direction == TextDirection::Rtl {
@@ -58,5 +58,4 @@ pub(super) fn emit_prepared_paragraph(
             adjustments.next();
         }
     }
-    engine.record_timing(|timings| timings.emit_lines += started.elapsed());
 }

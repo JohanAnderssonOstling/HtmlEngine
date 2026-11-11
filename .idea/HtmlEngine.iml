@@ -25,6 +25,14 @@
       <sourceFolder url="file://$MODULE_DIR$/crates/03-html-style/tests" isTestSource="true" />
       <sourceFolder url="file://$MODULE_DIR$/crates/04-html-layout/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/05-html-render-core/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/04-html-layout/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/html-engine-model/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/html-format/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/html-shape/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/html-text/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/html-text/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/html/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/mathema/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>
     <orderEntry type="inheritedJdk" />

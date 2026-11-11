@@ -1,7 +1,6 @@
-use html_pipeline::engine::pagination_queries;
 use super::KeepContext;
-use crate::layout::RenderView;
 use crate::pagination::PaginationTarget;
+use html_pipeline::engine::Pagination;
 
 use crate::layout::ContentRole;
 
@@ -11,14 +10,12 @@ const EPSILON: f64 = 0.01;
 /// pagination preferences, not layout constraints: the normal keep event
 /// path discards any range taller than a fragmentainer.
 pub(super) fn semantic_keep_ranges(
-    doc: RenderView<'_>,
+    lines: Pagination<'_>,
     ranges: &mut Vec<(usize, f64, f64)>,
     context: &KeepContext,
     range_lines: &mut Vec<usize>,
 ) {
     ranges.clear();
-    let root = doc;
-    let lines = pagination_queries::render_view_pagination(root);
     for block in &context.blocks {
         let constraints = &block.constraints;
         let point = block.bounds.origin();

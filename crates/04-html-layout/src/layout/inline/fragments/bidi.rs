@@ -41,7 +41,6 @@ pub(super) fn place_visual_line(
     no_bidi_separators: bool,
     layout: &mut LineLayout,
 ) {
-    profile_scope!("lines.bidi_placement");
     let has_odd_level = bidi.has_odd_level;
     if direction == TextDirection::Rtl && line.align == TextAlign::Justify {
         layout.x_offset += (line.width_limit - layout.used_width).max(0.0);

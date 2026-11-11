@@ -1,5 +1,4 @@
 //! Per-reader CSS aliases over private platform font families.
-use html_engine_model::shaping_contracts;
 use gpui::{Font, FontFallbacks, FontStyle, FontVariations, FontWeight, WindowTextSystem, font};
 use html::style::ReaderStyleOverrides;
 use html::text::FontFace;
@@ -127,11 +126,16 @@ impl PublicationFonts {
     /// Returns whether a new face was loaded.
     pub(crate) fn register(
         &mut self,
-        loaded: LoadedFontFace,
+        mut loaded: LoadedFontFace,
         text_system: &WindowTextSystem,
     ) -> Result<bool, String> {
         let key = face_key(&loaded.declaration);
-        if self.loaded.contains_key(&key) {
+        if self.loaded.get(&key).is_some_and(|previous| {
+            previous.family == loaded.family
+                && previous.weight == loaded.weight
+                && previous.slant == loaded.slant
+                && previous.variable == loaded.variable
+        }) {
             return Ok(false);
         }
         if let Some(bytes) = &loaded.bytes
@@ -141,6 +145,7 @@ impl PublicationFonts {
             self.registered.insert(loaded.family.clone());
         }
         if let Some(range) = loaded.stretch_range() { self.native_widths.insert(loaded.family.clone(), range); }
+        loaded.bytes = None;
         self.loaded.insert(key, loaded);
         Ok(true)
     }
@@ -200,7 +205,7 @@ impl PublicationFonts {
                     let angle = match slant {
                         FontSlant::Normal => 0.0,
                         FontSlant::Italic => 14.0,
-                        FontSlant::Oblique { angle } => shaping_contracts::oblique_angle_degrees(angle),
+                        FontSlant::Oblique { angle } => angle.degrees(),
                     };
                     (
                         FontStyle::Oblique,
@@ -257,13 +262,13 @@ pub(crate) fn native_slant(slant: FontSlant) -> (FontStyle, Option<f32>) {
     match slant {
         FontSlant::Normal => (FontStyle::Normal, None),
         FontSlant::Italic => (FontStyle::Italic, None),
-        FontSlant::Oblique { angle } => (FontStyle::Oblique, Some(shaping_contracts::oblique_angle_degrees(angle))),
+        FontSlant::Oblique { angle } => (FontStyle::Oblique, Some(angle.degrees())),
     }
 }
 
 fn oblique_distance(style: &FontFaceStyle, slant: FontSlant) -> f32 {
     if let (FontSlant::Oblique { angle }, FontFaceStyle::Oblique(range)) = (slant, style) {
-        let angle = shaping_contracts::oblique_angle_degrees(angle);
+        let angle = angle.degrees();
         (angle - angle.clamp(*range.start(), *range.end())).abs()
     } else {
         0.0

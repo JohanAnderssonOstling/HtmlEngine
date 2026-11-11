@@ -2,12 +2,8 @@
 use html_engine_model::layout_state;
 #[cfg(test)]
 use html_style_model::computed_style;
-#[cfg(test)]
-use html_engine_model::shaping_contracts;
-use html_pipeline::engine::geometry_queries;
-use document::document_painter_paint_region;
-use html_pipeline::engine::fragment_paint;
-use html_pipeline::engine::{box_queries, text_paint};
+pub use document::document_painter_paint_region;
+
 mod document;
 pub use document::{
     DocumentPainter, LinePlacement, PaintCandidates, PaintFragment, PaintProjection, ProjectedLine,
@@ -20,6 +16,7 @@ use html_pipeline::engine::{
     TextRunId,
 };
 use html_resources::DecodedImages;
+use html_engine_model::NativePaintResources;
 use kurbo::{Point, Rect, Size};
 use peniko::{Color, Image};
 use std::ops::Range;
@@ -35,11 +32,21 @@ fn pixel_snapper(scale: f64) -> impl Fn(f64) -> f64 {
 }
 
 pub trait Painter {
+    /// Select the immutable native resources owned by this paint input.
+    /// Return false when the snapshot belongs to a different backend.
+    fn bind_text_resources(&mut self, _resources: &NativePaintResources) -> bool {
+        true
+    }
+
     /// Restricts subsequent paint operations until the matching `pop_clip`.
     /// Implementations must intersect nested clips and restore them on pop.
     fn push_clip(&mut self, rect: Rect);
     fn pop_clip(&mut self);
     fn fill_rect(&mut self, rect: Rect, color: Color);
+    /// Canvas background stays attached to the viewport when content is repositioned.
+    fn fill_canvas(&mut self, rect: Rect, color: Color) {
+        self.fill_rect(rect, color);
+    }
     /// Optional rounded primitive. Existing adapters intentionally get a safe
     /// square fallback, so adding CSS radius support is not a breaking change.
     fn fill_rounded_rect(&mut self, rect: Rect, _radii: CornerRadii, color: Color) {
@@ -251,6 +258,14 @@ impl RenderScene {
         if !render_scene_is_valid(&self) {
             return false;
         }
+        if let Some(resources) = self
+            .resources
+            .as_ref()
+            .and_then(|lease| lease.native_paint_resources())
+            && !painter.bind_text_resources(resources)
+        {
+            return false;
+        }
         for command in self.commands.iter() {
             match command {
                 RenderCommand::PushClip { rect } => painter.push_clip(*rect),
@@ -363,7 +378,7 @@ pub(crate) fn paint_line_glyphs<'a>(
     painter: &mut impl Painter,
 ) {
     let view = document.into();
-    for fragment in text_paint::render_text_view_line_text_fragments(view.text(), line_idx)
+    for fragment in (view.text()).line_text_fragments(line_idx)
         .into_iter()
         .flatten()
     {
@@ -384,7 +399,7 @@ pub(crate) fn paint_line_glyph_fragment<'a>(
     painter: &mut impl Painter,
 ) {
     let document = document.into();
-    if !text_paint::paint_resources_valid(document) || !fragment.visible() {
+    if !document.paint_resources_valid() || !fragment.visible() {
         return;
     }
     let text = document.text();
@@ -392,13 +407,13 @@ pub(crate) fn paint_line_glyph_fragment<'a>(
         return;
     };
     let snap = pixel_snapper(scale);
-    let baseline_y = origin.y + text_paint::line_baseline(&line);
-    let Some(mut placement) = text_paint::line_placement(text, line_idx) else {
+    let baseline_y = origin.y + line.line_baseline();
+    let Some(mut placement) = text.line_placement(line_idx) else {
         return;
     };
     let mut current_x = origin.x
-        + text_paint::line_optical_offset_x(&line)
-        + text_paint::fragment_offset_x(&fragment);
+        + line.line_optical_offset_x()
+        + fragment.fragment_offset_x();
     for index in fragment.glyphs() {
         let Some(character) = placement.at(index) else {
             continue;
@@ -408,10 +423,10 @@ pub(crate) fn paint_line_glyph_fragment<'a>(
         let draw_point = Point::new(current_x, snap(baseline_y - character.offset_y));
         if let Some(glyph) = character
             .paint_glyph
-            .and_then(|glyph| text_paint::paint_handle(text, glyph))
+            .and_then(|glyph| text.paint_handle(glyph))
         {
             let color = color
-                .or_else(|| text_paint::paint_color_at(text, index))
+                .or_else(|| text.paint_color_at(index))
                 .expect("painted text has a resolved foreground color");
             painter.draw_glyph(glyph, draw_point, color);
         }
@@ -433,10 +448,10 @@ pub(crate) fn paint_line_text_runs<'a>(
     painter: &mut impl Painter,
 ) -> bool {
     let document = document.into();
-    if !text_paint::paint_resources_valid(document) || !painter.supports_text_runs() {
+    if !document.paint_resources_valid() || !painter.supports_text_runs() {
         return false;
     }
-    let Some(fragments) = text_paint::prepared_text_runs(document.text(), line_idx) else {
+    let Some(fragments) = (document.text()).prepared_text_runs(line_idx) else {
         return false;
     };
     painter.draw_prepared_text_run_batch(fragments, origin, scale, color);
@@ -456,7 +471,7 @@ pub(crate) fn paint_line_ellipsis<'a>(
     painter: &mut impl Painter,
 ) {
     let document = document.into();
-    if !text_paint::paint_resources_valid(document) {
+    if !document.paint_resources_valid() {
         return;
     }
     let text = document.text();
@@ -464,30 +479,30 @@ pub(crate) fn paint_line_ellipsis<'a>(
         return;
     };
     let snap = pixel_snapper(scale);
-    let baseline_y = origin.y + text_paint::line_baseline(&line);
+    let baseline_y = origin.y + line.line_baseline();
     let mut paint = |glyph, offset: Point, source: Option<u32>| {
-        if let Some(glyph) = text_paint::paint_handle(text, glyph) {
+        if let Some(glyph) = text.paint_handle(glyph) {
             let point = Point::new(
                 // Synthetic text uses the same fractional inline origin as
                 // ordinary glyphs and shaped runs. Snapping its x coordinate
                 // changes the raster phase at discretionary hyphens.
-                origin.x + text_paint::line_optical_offset_x(&line) + offset.x,
+                origin.x + line.line_optical_offset_x() + offset.x,
                 snap(baseline_y - offset.y),
             );
             let color = color
-                .or_else(|| source.and_then(|index| text_paint::paint_color_at(text, index)))
+                .or_else(|| source.and_then(|index| text.paint_color_at(index)))
                 .unwrap_or_else(|| {
-                    box_queries::text_format(document.boxes(), text_paint::render_line_owner_box(&line)).color
+                    (document.boxes()).text_format(line.owner_box()).color
                 });
             painter.draw_glyph(glyph, point, color);
         }
     };
-    if let Some(ellipsis) = text_paint::ellipsis_for_line(text, line_idx)
+    if let Some(ellipsis) = text.ellipsis_for_line(line_idx)
         && ellipsis.visible()
     {
         paint(ellipsis.glyph(), ellipsis.offset(), None);
     }
-    if let Some(hyphen) = text_paint::hyphen_for_line(text, line_idx)
+    if let Some(hyphen) = text.hyphen_for_line(line_idx)
         && hyphen.visible()
     {
         paint(
@@ -509,14 +524,11 @@ fn build_fragment_view(
         .lines()
         .iter()
         .filter_map(|line| {
-            geometry_queries::render_geometry_view_line_vertical_bounds(
-                geometry_queries::render_view_geometry(view),
-                line.id(),
-            )
+            (view.geometry()).line_vertical_bounds(line.id())
         })
         .map(|bounds| bounds.end)
         .fold(0.0_f64, f64::max);
-    let natural_height = fragment_paint::decorations(fragments)
+    let natural_height = fragments.decorations()
         .iter()
         .map(|decoration| decoration.rect().y1)
         .fold(natural_height, f64::max);
@@ -537,7 +549,7 @@ fn build_fragment_view(
         content_height: natural_height,
         clipped: height < natural_height,
         commands: recorder.commands.into(),
-        resources: text_paint::retain_paint_resources(view),
+        resources: view.retain_paint_resources(),
     }
 }
 
@@ -561,13 +573,13 @@ pub(crate) fn paint_projected_decoration(
 ) {
     use html_pipeline::engine::RenderDecorationPattern;
 
-    let color = color_from_u32(fragment_paint::decoration_color(&decoration));
-    let (vertical, dash_units, gap_units) = match fragment_paint::decoration_pattern(&decoration) {
+    let color = color_from_u32(decoration.color());
+    let (vertical, dash_units, gap_units) = match decoration.pattern() {
         RenderDecorationPattern::Solid => {
             paint_decoration_style(
                 painter,
                 rect,
-                fragment_paint::decoration_color(&decoration),
+                decoration.color(),
                 radii,
                 decoration.border_width(),
             );
@@ -721,6 +733,7 @@ impl Painter for SceneRecorder {
 
 #[cfg(test)]
 mod tests {
+    use html_pipeline::engine::LayoutRequest;
     use super::*;
     use html_pipeline::engine::{
         GlyphResourceStore, GlyphShaper, LaidOutDocument, LayoutConstraints,
@@ -732,12 +745,10 @@ mod tests {
     use html_resources::ResourceProvider;
     use std::io;
     use html_pipeline::engine::GlyphResourceGeneration;
-    use html_pipeline::engine::GlyphRequest;
     use html_pipeline::engine::FontMetrics;
     use html_pipeline::engine::ShapedGlyph;
     use html_pipeline::engine::{
-        ShapeError, ShapedRun, ShapedTextRun, TextDirection, TextRunShapeRequest,
-    };
+        ShapedRun, ShapedTextRun, TextDirection, TextRunShapeRequest};
     use std::collections::HashMap;
 
     struct DenyResourceProvider;
@@ -835,49 +846,28 @@ mod tests {
     struct TestShaper {
         glyphs: HashMap<(char, u32), GlyphHandle>,
         generation: GlyphResourceGeneration,
-        append_checkpoint: Option<(HashMap<(char, u32), GlyphHandle>, GlyphResourceGeneration)>,
     }
 
     impl GlyphShaper for TestShaper {
-        fn reset(&mut self) {
-            self.glyphs.clear();
-            self.generation = GlyphResourceGeneration::default();
-        }
-
         fn resource_generation(&self) -> GlyphResourceGeneration {
             self.generation
         }
 
-        fn begin_append_shaping(&mut self) -> Result<(), ShapeError> {
-            assert!(self.append_checkpoint.is_none());
-            self.append_checkpoint = Some((self.glyphs.clone(), self.generation.clone()));
-            Ok(())
-        }
-
-        fn commit_append_shaping(&mut self) {
-            self.append_checkpoint = None;
-        }
-
-        fn rollback_append_shaping(&mut self) {
-            if let Some((glyphs, glyph_store)) = self.append_checkpoint.take() {
-                self.glyphs = glyphs;
-                self.generation = glyph_store;
-            }
-        }
-
-        fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
-            let key = (request.character, request.style.font_size.to_bits());
-            let advance = request.style.font_size * 0.5;
-            let metrics = FontMetrics {
-                ascent: request.style.font_size * 0.75,
-                descent: request.style.font_size * 0.25,
-            };
-            if let Some(glyph) = self.glyphs.get(&key) {
-                return Ok(ShapedGlyph::new(*glyph, advance, metrics));
-            }
-            let glyph = GlyphHandle(self.glyphs.len() as u32);
-            self.glyphs.insert(key, glyph);
-            Ok(ShapedGlyph::new(glyph, advance, metrics))
+        fn shape_run(&mut self, request: TextRunShapeRequest<'_>) -> ShapedRun {
+            ShapedRun::characters(request, |character, style| {
+                let key = (character, style.font_size.to_bits());
+                let advance = style.font_size * 0.5;
+                let metrics = FontMetrics {
+                    ascent: style.font_size * 0.75,
+                    descent: style.font_size * 0.25,
+                };
+                if let Some(glyph) = self.glyphs.get(&key) {
+                    return ShapedGlyph::new(*glyph, advance, metrics);
+                }
+                let glyph = GlyphHandle(self.glyphs.len() as u32);
+                self.glyphs.insert(key, glyph);
+                ShapedGlyph::new(glyph, advance, metrics)
+            })
         }
     }
 
@@ -890,21 +880,17 @@ mod tests {
             fn resource_generation(&self) -> GlyphResourceGeneration {
                 self.0
             }
-            fn reset(&mut self) {
-                self.0 = GlyphResourceGeneration::default();
-            }
-            fn shape_glyph(
-                &mut self,
-                _request: GlyphRequest<'_>,
-            ) -> Result<ShapedGlyph, ShapeError> {
-                Ok(ShapedGlyph::new(
-                    GlyphHandle(700),
-                    8.0,
-                    FontMetrics {
-                        ascent: 12.0,
-                        descent: 4.0,
-                    },
-                ))
+            fn shape_run(&mut self, request: TextRunShapeRequest<'_>) -> ShapedRun {
+                ShapedRun::characters(request, |character, style| {
+                    ShapedGlyph::new(
+                        GlyphHandle(700),
+                        8.0,
+                        FontMetrics {
+                            ascent: 12.0,
+                            descent: 4.0,
+                        },
+                    )
+                })
             }
         }
         let mut renderer = FragmentRenderer::new();
@@ -921,10 +907,10 @@ mod tests {
         let line = text
             .lines()
             .iter()
-            .find(|line| !text_paint::render_line_glyphs(&line).is_empty())
+            .find(|line| !line.glyphs().is_empty())
             .unwrap();
         assert_ne!(
-            text_paint::glyph_at(text, line.start() as usize).map(|id| id.0),
+            text.glyph_at(line.start() as usize).map(|id| id.0),
             Some(700)
         );
         let mut painter = RecordingPainter::default();
@@ -934,7 +920,7 @@ mod tests {
         assert_eq!(handle, GlyphHandle(700));
         assert_eq!(
             origin.y,
-            (line.point().y + text_paint::line_baseline(&line)).round()
+            (line.point().y + line.line_baseline()).round()
         );
     }
 
@@ -951,9 +937,9 @@ mod tests {
             .unwrap();
         let text = rendered.render_view().text();
         assert_eq!(text.glyph_count(), 2);
-        assert_eq!(text_paint::glyph_at(text, 0), text_paint::glyph_at(text, 1));
-        assert_eq!(text_paint::paint_color_at(text, 0), Some(0xff0000ff));
-        assert_eq!(text_paint::paint_color_at(text, 1), Some(0x0000ffff));
+        assert_eq!(text.glyph_at(0), text.glyph_at(1));
+        assert_eq!(text.paint_color_at(0), Some(0xff0000ff));
+        assert_eq!(text.paint_color_at(1), Some(0x0000ffff));
         let mut painter = RecordingPainter::default();
         rendered.scene().paint(&mut painter);
         assert_eq!(painter.glyphs[0].0, painter.glyphs[1].0);
@@ -977,96 +963,23 @@ mod tests {
             matches!(command, RenderCommand::Glyph { glyph, color, .. } if *glyph == handle && *color == 0x008000ff)));
     }
 
-    #[test]
-    fn standard_shaper_restores_native_resources_when_rendering_fails() {
-        use html_pipeline::engine::GlyphWriter;
-        use html_pipeline::engine::ResourceShaper;
-        let mut shaper = ResourceShaper::new(|request, resources: &mut GlyphWriter<'_, char>| {
-            if request.character == '!' {
-                return Err(shaping_contracts::shape_error_registry_capacity_exhausted(0));
-            }
-            let metrics = FontMetrics {
-                ascent: request.style.font_size * 0.75,
-                descent: request.style.font_size * 0.25,
-            };
-            let handle = resources.insert(request.character)?;
-            Ok(ShapedGlyph::new(
-                handle,
-                request.style.font_size * 0.5,
-                metrics,
-            ))
-        });
-        let mut renderer = FragmentRenderer::new();
-        let options = SceneOptions::new(200.0, None).unwrap();
-        // First-line refinement appends resources while replacement is pending.
-        let scene = renderer
-            .render(
-                "<style>p::first-line {font-size:24px}</style><p>x</p>",
-                &options,
-                &mut shaper,
-            )
-            .unwrap()
-            .into_scene();
-        let generation = shaper.resource_generation();
-        assert!(renderer.render("<p>y!</p>", &options, &mut shaper).is_err());
-        assert_eq!(shaper.resource_generation(), generation);
-        assert_eq!(renderer.render_view().unwrap().text().glyph_count(), 1);
-        let mut painter = RecordingPainter::default();
-        scene.paint(&mut painter);
-        assert!(!painter.glyphs.is_empty());
-        for (handle, _) in painter.glyphs {
-            assert_eq!(shaper.resources().get(handle), Some(&'x'));
-        }
-        renderer.render("<p>z</p>", &options, &mut shaper).unwrap();
-        assert_ne!(shaper.resource_generation(), generation);
-        assert_eq!(shaper.resources().get(GlyphHandle(0)), Some(&'z'));
-    }
 
     #[derive(Default)]
     struct NativeTestShaper {
         fallback: TestShaper,
         next_run: TextRunId,
-        append_checkpoint_run: Option<TextRunId>,
     }
 
     impl GlyphShaper for NativeTestShaper {
-        fn reset(&mut self) {
-            self.fallback.reset();
-            self.next_run = TextRunId(0);
-        }
-
         fn resource_generation(&self) -> GlyphResourceGeneration {
             self.fallback.resource_generation()
         }
 
-        fn begin_append_shaping(&mut self) -> Result<(), ShapeError> {
-            self.fallback.begin_append_shaping()?;
-            self.append_checkpoint_run = Some(self.next_run);
-            Ok(())
-        }
-
-        fn commit_append_shaping(&mut self) {
-            self.fallback.commit_append_shaping();
-            self.append_checkpoint_run = None;
-        }
-
-        fn rollback_append_shaping(&mut self) {
-            self.fallback.rollback_append_shaping();
-            if let Some(next_run) = self.append_checkpoint_run.take() {
-                self.next_run = next_run;
-            }
-        }
-
-        fn shape_glyph(&mut self, request: GlyphRequest<'_>) -> Result<ShapedGlyph, ShapeError> {
-            self.fallback.shape_glyph(request)
-        }
-
-        fn shape_run(
-            &mut self,
-            request: TextRunShapeRequest<'_>,
-        ) -> Result<Option<ShapedRun>, ShapeError> {
-            let count = shaping_contracts::text_run_shape_request_text(&request).chars().count();
-            let advances: Vec<f32> = shaping_contracts::text_run_shape_request_text(&request).chars().map(|character| {
+        fn shape_run(&mut self, request: TextRunShapeRequest<'_>) -> ShapedRun {
+            let count = request.text()
+                .chars()
+                .count();
+            let advances: Vec<f32> = request.text().chars().map(|character| {
                 if matches!(character, '\u{00ad}' | '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') { 0.0 } else { 8.0 }
             }).collect();
             let mut caret_stops = Vec::with_capacity(count + 1);
@@ -1076,18 +989,16 @@ mod tests {
                 x += advance;
                 caret_stops.push(x);
             }
-            if shaping_contracts::text_run_shape_request_style(&request).direction == TextDirection::Rtl {
+            if request.style().direction
+                == TextDirection::Rtl
+            {
                 for stop in &mut caret_stops {
                     *stop = x - *stop;
                 }
             }
             let run = self.next_run;
             self.next_run.0 += 1;
-            Ok(Some(shaping_contracts::shaped_run_geometry(shaping_contracts::shaped_text_run_with_backend_run(Arc::from(advances),
-                Arc::from(vec![true; count + 1]),
-                run,
-                caret_stops.into(),
-                12.0,))))
+            (self.fallback.shape_run(request)).with_geometry(ShapedTextRun::with_backend_run(Arc::from(advances), Arc::from(vec![true; count + 1]), run, caret_stops.into(), 12.0))
         }
     }
 
@@ -1131,7 +1042,7 @@ mod tests {
         let line = text
             .lines()
             .iter()
-            .find(|line| !text_paint::render_line_glyphs(&line).is_empty())
+            .find(|line| !line.glyphs().is_empty())
             .unwrap();
         let origin = Point::new(10.0, 20.25);
         let mut painter = BaselinePainter::default();
@@ -1144,7 +1055,7 @@ mod tests {
             &mut painter
         ));
         assert!(!painter.0.is_empty());
-        let expected_y = ((origin.y + text_paint::line_baseline(&line)) * 2.0).round() / 2.0;
+        let expected_y = ((origin.y + line.line_baseline()) * 2.0).round() / 2.0;
         assert!(painter.0.iter().all(|point| point.y == expected_y));
     }
 
@@ -1223,10 +1134,14 @@ mod tests {
         let mut document = base
             .shape_borrowed(&mut shaper, &mut document_resources)
             .unwrap()
-            .layout(constraints, &document_resources)
+            .layout(
+                LayoutRequest::new(constraints),
+                &mut shaper,
+                &mut document_resources,
+            )
             .expect("layout requires the shaper-aware API for first-line styles");
         let retained_color =
-            text_paint::paint_color_at(document.render_view(&document_resources).text(), 1);
+            (document.render_view(&document_resources).text()).paint_color_at(1);
         let run_count = shaper.next_run;
         let preferences = html_pipeline::engine::ReaderStyleOverrides {
             foreground: Some(0x008000ff),
@@ -1240,11 +1155,11 @@ mod tests {
         let line = text
             .lines()
             .iter()
-            .find(|line| !text_paint::render_line_glyphs(&line).is_empty())
+            .find(|line| !line.glyphs().is_empty())
             .unwrap()
             .id();
-        assert_eq!(text_paint::paint_color_at(text, 0), Some(0x008000ff));
-        assert_eq!(text_paint::paint_color_at(text, 1), Some(0xff0000ff));
+        assert_eq!(text.paint_color_at(0), Some(0x008000ff));
+        assert_eq!(text.paint_color_at(1), Some(0xff0000ff));
         assert_eq!(retained_color, Some(0x0000ffff));
         let mut native = ColorPainter {
             native: true,
@@ -1336,15 +1251,22 @@ mod tests {
         let mut document = painted
             .shape_borrowed(&mut shaper, &mut document_resources)
             .unwrap()
-            .layout(constraints, &document_resources)
+            .layout(
+                LayoutRequest::new(constraints),
+                &mut shaper,
+                &mut document_resources,
+            )
             .expect("layout requires the shaper-aware API for first-line styles");
         let run_count = shaper.next_run;
         for width in [200.0, 100.0, 240.0] {
             if width != 200.0 {
                 document
                     .relayout(
-                        html_pipeline::engine::LayoutConstraints::new(width, 16.0).unwrap(),
-                        &document_resources,
+                        LayoutRequest::new(
+                            html_pipeline::engine::LayoutConstraints::new(width, 16.0).unwrap(),
+                        ),
+                        &mut shaper,
+                        &mut document_resources,
                     )
                     .expect("layout requires the shaper-aware API for first-line styles");
             }
@@ -1353,7 +1275,7 @@ mod tests {
                 .lines()
                 .iter()
                 .flat_map(|line| {
-                    text_paint::prepared_text_runs(text, line.id())
+                    text.prepared_text_runs(line.id())
                         .expect("native coverage is published")
                 })
                 .map(|fragment| fragment.color)
@@ -1376,18 +1298,19 @@ mod tests {
         let mut document = base
             .shape_borrowed(&mut shaper, &mut document_resources)
             .unwrap()
-            .layout(constraints, &document_resources)
+            .layout(
+                LayoutRequest::new(constraints),
+                &mut shaper,
+                &mut document_resources,
+            )
             .expect("layout requires the shaper-aware API for first-line styles");
-        let clips: Vec<_> = text_paint::render_text_view_spatial_order(document
+        let clips: Vec<_> = (document
             .render_view(&document_resources)
-            .text())
+            .text()).spatial_order()
             .iter()
             .copied()
             .map(|index| {
-                text_paint::line_overflow_clip(
-                    document.render_view(&document_resources).text(),
-                    index,
-                )
+                (document.render_view(&document_resources).text()).line_overflow_clip(index)
             })
             .collect();
         assert!(clips.iter().any(Option::is_some));
@@ -1399,31 +1322,25 @@ mod tests {
             })
             .unwrap();
         assert!(document.repaint_from(&painted, &document_resources));
-        let repainted_clips: Vec<_> = text_paint::render_text_view_spatial_order(document
+        let repainted_clips: Vec<_> = (document
             .render_view(&document_resources)
-            .text())
+            .text()).spatial_order()
             .iter()
             .copied()
             .map(|index| {
-                text_paint::line_overflow_clip(
-                    document.render_view(&document_resources).text(),
-                    index,
-                )
+                (document.render_view(&document_resources).text()).line_overflow_clip(index)
             })
             .collect();
         assert_eq!(clips, repainted_clips);
         assert_eq!(shaper.next_run, run_count);
         assert!(document.repaint_from(&base, &document_resources));
-        let restored_clips: Vec<_> = text_paint::render_text_view_spatial_order(document
+        let restored_clips: Vec<_> = (document
             .render_view(&document_resources)
-            .text())
+            .text()).spatial_order()
             .iter()
             .copied()
             .map(|index| {
-                text_paint::line_overflow_clip(
-                    document.render_view(&document_resources).text(),
-                    index,
-                )
+                (document.render_view(&document_resources).text()).line_overflow_clip(index)
             })
             .collect();
         assert_eq!(clips, restored_clips);
@@ -1442,9 +1359,8 @@ mod tests {
         let mut document = base
             .shape_borrowed(&mut shaper, &mut document_resources)
             .unwrap()
-            .layout_with_metrics_and_shaper(
-                constraints,
-                &Default::default(),
+            .layout(
+                LayoutRequest::new(constraints).with_image_metrics(&Default::default()),
                 &mut shaper,
                 &mut document_resources,
             )
@@ -1462,27 +1378,29 @@ mod tests {
         assert!(document.repaint_from(&painted, &document_resources));
         let text = document.render_view(&document_resources).text();
         assert_eq!(
-            text_paint::paint_color_at(text, 0),
+            text.paint_color_at(0),
             Some(computed_style::theme_adaptation_adapt(theme, 0x800080ff))
         );
         assert_eq!(
-            text_paint::paint_color_at(text, 1),
+            text.paint_color_at(1),
             Some(computed_style::theme_adaptation_adapt(theme, 0x800080ff))
         );
         assert_eq!(
-            text_paint::line_paint_color(&text.line(LineId::new(0)).unwrap()),
+            (text.line(LineId::new(0)).unwrap()).line_paint_color(),
             Some(computed_style::theme_adaptation_adapt(theme, 0x0000ffff))
         );
         document
-            .relayout_with_metrics_and_shaper(
-                html_pipeline::engine::LayoutConstraints::new(200.0, 16.0).unwrap(),
-                &Default::default(),
+            .relayout(
+                LayoutRequest::new(
+                    html_pipeline::engine::LayoutConstraints::new(200.0, 16.0).unwrap(),
+                )
+                .with_image_metrics(&Default::default()),
                 &mut shaper,
                 &mut document_resources,
             )
             .unwrap();
         assert_eq!(
-            text_paint::paint_color_at(document.render_view(&document_resources).text(), 0),
+            (document.render_view(&document_resources).text()).paint_color_at(0),
             Some(computed_style::theme_adaptation_adapt(theme, 0x800080ff))
         );
     }
@@ -1503,22 +1421,25 @@ mod tests {
                 .shape_borrowed(&mut shaper, &mut document_resources)
                 .unwrap()
                 .layout(
-                    html_pipeline::engine::LayoutConstraints::new(32.12, 16.0).unwrap(),
-                    &document_resources,
+                    LayoutRequest::new(
+                        html_pipeline::engine::LayoutConstraints::new(32.12, 16.0).unwrap(),
+                    ),
+                    &mut shaper,
+                    &mut document_resources,
                 )
                 .unwrap();
             let view = document.render_view(&document_resources);
             let text = view.text();
             let line = text.line(LineId::new(0)).unwrap();
             assert!(
-                text_paint::line_letter_spacing(&line) > 0.0,
+                line.line_letter_spacing() > 0.0,
                 "fixture must exercise justified tracking"
             );
             let mut scalar = RecordingPainter::default();
             paint_line_glyphs(view, LineId::new(0), Point::ZERO, 1.0, None, &mut scalar);
             let mut separate = RecordingPainter::default();
             for fragment in
-                text_paint::render_text_view_line_text_fragments(text, LineId::new(0)).unwrap()
+                text.line_text_fragments(LineId::new(0)).unwrap()
             {
                 paint_line_glyph_fragment(
                     view,
@@ -1532,14 +1453,14 @@ mod tests {
             }
             assert_eq!(scalar.glyphs, separate.glyphs);
             for &(glyph, point) in &scalar.glyphs {
-                let index = text_paint::render_line_glyphs(&line)
+                let index = line.glyphs()
                     .find(|&index| {
-                        text_paint::paint_glyph_at(text, index)
-                            .and_then(|id| text_paint::paint_handle(text, id))
+                        text.paint_glyph_at(index)
+                            .and_then(|id| text.paint_handle(id))
                             == Some(glyph)
                     })
                     .unwrap();
-                let caret = geometry_queries::render_view_geometry(view)
+                let caret = view.geometry()
                     .caret_x(LineId::new(0), index, CaretAffinity::Leading)
                     .unwrap();
                 assert!(
@@ -1548,9 +1469,9 @@ mod tests {
                 );
             }
             let runs: Vec<_> =
-                text_paint::authoritative_runs(text, text_paint::render_line_glyphs(&line))
+                text.authoritative_runs(line.glyphs())
                     .collect();
-            for fragment in text_paint::prepared_text_runs(text, LineId::new(0))
+            for fragment in text.prepared_text_runs(LineId::new(0))
                 .expect("complete native coverage")
             {
                 let run = runs
@@ -1562,9 +1483,9 @@ mod tests {
                 let index = run.source_range().start + fragment.range.start - run.run_range().start;
                 let natural = f64::from(run.natural_offset())
                     + (run.source_range().start..index)
-                        .map(|index| f64::from(text_paint::character_advance(text, index).unwrap()))
+                        .map(|index| f64::from(text.character_advance(index).unwrap()))
                         .sum::<f64>();
-                let caret = geometry_queries::render_view_geometry(view)
+                let caret = view.geometry()
                     .caret_x(LineId::new(0), index, CaretAffinity::Leading)
                     .unwrap();
                 assert!(
@@ -1621,11 +1542,11 @@ mod tests {
         let line_idx = text
             .lines()
             .iter()
-            .find(|line| !text_paint::render_line_glyphs(&line).is_empty())
+            .find(|line| !line.glyphs().is_empty())
             .map(|line| line.id())
             .expect("fixture emits text");
         assert!(
-            text_paint::prepared_text_runs(text, line_idx).is_some(),
+            text.prepared_text_runs(line_idx).is_some(),
             "layout retains authoritative run slices"
         );
 
@@ -1786,9 +1707,9 @@ mod tests {
         let options = SceneOptions::new(240.0, None).unwrap();
         let rendered = renderer.render("<span style='text-decoration:line-through 2px dashed #ff0000'>patterned decoration</span>", &options, &mut shaper).unwrap();
 
-        let semantic = fragment_paint::decorations(rendered.render_view().fragments())
+        let semantic = (rendered.render_view().fragments()).decorations()
             .iter()
-            .filter(|decoration| fragment_paint::decoration_color(&decoration) == 0xff0000ff)
+            .filter(|decoration| decoration.color() == 0xff0000ff)
             .collect::<Vec<_>>();
         assert_eq!(
             semantic.len(),
@@ -1796,7 +1717,7 @@ mod tests {
             "layout publishes one semantic dashed span"
         );
         assert_eq!(
-            fragment_paint::decoration_pattern(&semantic[0]),
+            (semantic[0]).pattern(),
             html_pipeline::engine::RenderDecorationPattern::DashedHorizontal
         );
 
@@ -1816,7 +1737,7 @@ mod tests {
         let view = rendered.render_view();
         let text = view.text();
         assert_ne!(
-            layout_state::line_id_index(text_paint::render_text_view_spatial_order(text)[0]),
+            layout_state::line_id_index(text.spatial_order()[0]),
             0
         );
         let nominal_bottom = text
@@ -1824,14 +1745,11 @@ mod tests {
             .iter()
             .map(|line| line.point().y + line.height())
             .fold(0.0, f64::max);
-        let image = fragment_paint::render_fragment_view_images(view.fragments())
+        let image = (view.fragments()).images()
             .iter()
             .next()
             .unwrap();
-        let image_bottom = geometry_queries::render_geometry_view_line_vertical_bounds(
-            geometry_queries::render_view_geometry(view),
-            fragment_paint::render_image_fragment_line(&image),
-        )
+        let image_bottom = (view.geometry()).line_vertical_bounds(image.line())
         .unwrap()
         .end;
         assert!(

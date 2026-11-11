@@ -1,4 +1,4 @@
-use html_dom::{Document, DocumentBuilder};
+use html_dom::{DomNodeId, Document, DocumentBuilder, DomElementData, DomElementAttributeCache};
 use html_style_model::{
     ComputedStyles, ComputedStylesBuilder, InheritedText, StyleIndices, TextTransform, WordBreak,
 };
@@ -21,7 +21,7 @@ impl TextStructure for Structure {
     fn get_box_style_indices(&self, context: usize) -> Option<StyleIndices> {
         Some(self.0[context].style)
     }
-    fn get_box_dom_element(&self, _: usize) -> Option<u32> {
+    fn get_box_dom_element(&self, _: usize) -> Option<DomNodeId> {
         None
     }
     fn is_inline(&self, context: usize) -> bool {
@@ -33,7 +33,16 @@ impl TextStructure for Structure {
 }
 
 fn inputs(text_style: InheritedText) -> (Document, ComputedStyles, Structure) {
-    let document = DocumentBuilder::new().finish_without_root().unwrap();
+    let mut dom = DocumentBuilder::new();
+    let tag = dom.try_intern_string("div").unwrap();
+    let root = dom.append_dom_element(None, DomElementData {
+        tag, namespace: None, attributes: Vec::new(),
+        attribute_cache: DomElementAttributeCache::new(None, 0..0), image_idx: None,
+    }).unwrap();
+    dom.set_dom_root(root).unwrap();
+    dom.append_dom_text(root, "first").unwrap();
+    dom.append_dom_text(root, "second").unwrap();
+    let document = dom.finish().unwrap();
     let mut builder = ComputedStylesBuilder::new(&document);
     let style = builder
         .push(
@@ -44,6 +53,7 @@ fn inputs(text_style: InheritedText) -> (Document, ComputedStyles, Structure) {
             Default::default(),
         )
         .unwrap();
+    builder.set_node_style(root, style).unwrap();
     let styles = builder.finish().unwrap();
     let structure = Structure(vec![
         Context {
@@ -65,7 +75,7 @@ fn inputs(text_style: InheritedText) -> (Document, ComputedStyles, Structure) {
     (document, styles, structure)
 }
 
-fn append(content: &mut InlineContent, owner: u32, text: &str) {
+fn append(content: &mut InlineContent, document: &Document, owner: u32, text: &str) {
     let start = content.characters().len() as u32;
     let mut offset = 0;
     for character in text.chars() {
@@ -76,7 +86,7 @@ fn append(content: &mut InlineContent, owner: u32, text: &str) {
     content.push_inline_item(InlineItem {
         kind: InlineItemKind::Text { glyphs: start..end },
         box_idx: owner,
-        dom_text_node: Some(owner),
+        dom_text_node: document.node_ids().filter(|node| node.is_text()).nth(owner as usize - 1),
     });
 }
 
@@ -91,20 +101,21 @@ fn plain(text: &PreparedText) -> String {
 #[test]
 fn collapses_across_inline_owners_and_moves_source_items_without_copying() {
     // Every input except the owned source is dropped before the result is read.
-    let (text, original_items) = {
+    let (text, original_items, second_node) = {
         let (document, styles, structure) = inputs(InheritedText::default());
         let mut content = InlineContent::default();
-        append(&mut content, 1, "a ");
-        append(&mut content, 2, "  b");
+        append(&mut content, &document, 1, "a ");
+        append(&mut content, &document, 2, "  b");
         let original_items = content.inline_items().as_ptr();
         (
             PreparedText::new(&document, &styles, &structure, content),
             original_items,
+            document.node_ids().filter(|node| node.is_text()).nth(1),
         )
     };
     assert_eq!(plain(&text), "a b");
     assert_eq!(text.content().inline_items().as_ptr(), original_items);
-    assert_eq!(text.content().inline_items()[1].dom_text_node, Some(2));
+    assert_eq!(text.content().inline_items()[1].dom_text_node, second_node);
     assert_eq!(text.content().glyph_source_offset(2), Some(2));
 }
 
@@ -120,7 +131,7 @@ fn whitespace_remaps_empty_and_single_character_items() {
         let (document, styles, structure) = inputs(InheritedText::default());
         let mut content = InlineContent::default();
         for (index, part) in parts.iter().enumerate() {
-            append(&mut content, index as u32 + 1, part);
+            append(&mut content, &document, index as u32 + 1, part);
         }
         let text = PreparedText::new(&document, &styles, &structure, content);
         assert_eq!(plain(&text), expected, "{parts:?}");
@@ -169,7 +180,7 @@ fn case_expansion_preserves_utf16_source_correspondence() {
         });
         let mut content = InlineContent::default();
         for (owner, part) in [(1, "ß"), (1, ""), (2, "İ😀xß"), (2, "")] {
-            append(&mut content, owner, part);
+            append(&mut content, &document, owner, part);
         }
         let text = PreparedText::new(&document, &styles, &structure, content);
         assert_eq!(plain(&text), expected, "{transform:?}");
@@ -198,7 +209,7 @@ fn records_wrap_opportunities_without_splitting_combining_sequences() {
         ..Default::default()
     });
     let mut content = InlineContent::default();
-    append(&mut content, 1, "a\u{301}b");
+    append(&mut content, &document, 1, "a\u{301}b");
     let text = PreparedText::new(&document, &styles, &structure, content);
     assert_eq!(plain(&text), "a\u{301}b");
     assert_eq!(
@@ -217,8 +228,8 @@ fn separate_formatting_contexts_do_not_share_pending_spaces() {
     structure.0[2].parent = None;
     structure.0[2].inline = false;
     let mut content = InlineContent::default();
-    append(&mut content, 1, "A ");
-    append(&mut content, 2, " B");
+    append(&mut content, &document, 1, "A ");
+    append(&mut content, &document, 2, " B");
     let text = PreparedText::new(&document, &styles, &structure, content);
     assert_eq!(plain(&text), "AB");
 }

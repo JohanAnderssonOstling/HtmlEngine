@@ -42,7 +42,7 @@ fn node_by_id(document: &StyledDocument, id: &str) -> DomNodeId {
     document
         .document()
         .node_ids()
-        .find(|&node| document.document().get_dom_id(node) == Some(id))
+        .find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some(id))
         .unwrap_or_else(|| panic!("WPT element #{id}"))
 }
 
@@ -61,7 +61,7 @@ fn pinned_wpt_all_revert_allows_a_later_color() {
         .find(|&node| {
             document
                 .document()
-                .get_dom_classes(node)
+                .try_element_ref(node).into_iter().flat_map(|element| element.classes())
                 .any(|class| class == "inner")
         })
         .expect("WPT .inner element");
@@ -161,15 +161,15 @@ fn pinned_wpt_revert_layer_restores_presentational_hints() {
     for node in document.document().node_ids().filter(|&node| {
         document
             .document()
-            .get_dom_classes(node)
+            .try_element_ref(node).into_iter().flat_map(|element| element.classes())
             .any(|class| matches!(class, "revert-layer-1" | "revert-layer-2"))
     }) {
         let style = document.style_for_node(node).expect("computed WPT style");
         let box_model = document.box_model_style(style).expect("box style");
-        let tag = document.document().get_dom_tag(node).unwrap_or("unknown");
+        let tag = document.document().try_element_ref(node).map(|element| element.tag()).unwrap_or("unknown");
         let classes = document
             .document()
-            .get_dom_classes(node)
+            .try_element_ref(node).into_iter().flat_map(|element| element.classes())
             .collect::<Vec<_>>()
             .join(" ");
         assert_eq!(

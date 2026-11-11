@@ -17,7 +17,7 @@ documentation = "https://docs.rs/skrift-pipeline"
 name = "html_pipeline"
 
 [features]
-profiling = ["html-layout/profiling", "html-format/profiling", "html-shape/profiling"]
+profiling = ["html-format/profiling", "html-shape/profiling"]
 testing = ["html-layout/testing", "html-engine-model/testing", "html-text/testing"]
 
 [dependencies]

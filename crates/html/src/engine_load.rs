@@ -1,14 +1,15 @@
 //! Provider-backed loading for the public engine facade.
 
 use crate::configuration::{DocumentConfiguration, DocumentUpdate, normalized_font_size};
-use html_parse::read_document_source;
+use html_parse::{parse_dom_document_with_metadata, read_document_source};
+use html_pipeline::StylesheetCache;
+use html_dom::Document as DomDocument;
 use crate::{Document, Error};
 use crate::text::{FontFace, GlyphShaper};
 use crate::{
     layout::{ImageSizingPolicy, NoteFlow, TextCompositionPolicy},
-    pipeline::{PipelineInputs, StyleEnvironment},
-    style::ReaderStyleOverrides,
-};
+    pipeline::{EarliestStage, PipelineInputs, StyleEnvironment},
+    style::ReaderStyleOverrides};
 use html_parse::MarkupSyntax;
 use crate::resources::ResourceProvider;
 use html_style::MediaEnvironment;
@@ -48,6 +49,8 @@ pub struct DocumentOptions {
     pub image_sizing_policy: ImageSizingPolicy,
     pub text_composition_policy: TextCompositionPolicy,
     pub note_flow: NoteFlow,
+    /// Reuse content-keyed CSS compilation across independent documents.
+    pub stylesheet_cache: Option<StylesheetCache>,
 }
 
 impl DocumentOptions {
@@ -65,6 +68,7 @@ impl DocumentOptions {
             image_sizing_policy: ImageSizingPolicy::WebCompatible,
             text_composition_policy: TextCompositionPolicy::WebCompatible,
             note_flow: NoteFlow::InFlow,
+            stylesheet_cache: None,
         })
     }
 
@@ -110,6 +114,31 @@ impl DocumentOptions {
     }
 }
 
+/// An HTML source and its parsed DOM, kept together until preparation consumes them.
+/// Hosts can inspect the DOM to discover resources without parsing again.
+pub struct ParsedDocumentSource {
+    source: String,
+    document: DomDocument,
+    encoding: Option<String>,
+}
+
+impl ParsedDocumentSource {
+    pub fn html(source: String) -> Self {
+        let (document, encoding) = parse_dom_document_with_metadata(&source)
+            .expect("parsed markup must form a valid DOM")
+            .into_parts();
+        Self {
+            source,
+            document,
+            encoding,
+        }
+    }
+
+    pub fn document(&self) -> &DomDocument {
+        &self.document
+    }
+}
+
 /// Parsed and styled document inputs awaiting a host text backend.
 /// Load the declared fonts before consuming this value with [`Self::finish`].
 /// Document queries and resource loading become available on the returned engine.
@@ -140,6 +169,13 @@ impl PreparedDocument {
 }
 
 impl Document {
+    /// Suspend this document for reuse with the same or another text backend.
+    /// Completion checks backend generations and applies current inputs again.
+    pub fn into_preparation(mut self) -> PreparedDocument {
+        self.images = crate::DocumentImages::new(self.provider.clone());
+        PreparedDocument { engine: self }
+    }
+
     pub fn load_timed(
         provider: Arc<dyn ResourceProvider>,
         uri: &str,
@@ -147,11 +183,16 @@ impl Document {
         shaper: &mut impl GlyphShaper,
     ) -> Result<(Self, LoadTimings), Error> {
         let start = Instant::now();
+        let stylesheet_cache = options.stylesheet_cache.clone();
         let inputs = options.read(provider.as_ref(), uri)?;
         let resource = start.elapsed();
         let start = Instant::now();
         let mut engine = Self::new(provider);
-        engine.update(inputs, shaper)
+        if let Some(cache) = stylesheet_cache {
+            engine.session.set_stylesheet_cache(cache);
+        }
+        engine
+            .update(inputs, shaper)
             .map_err(|error| error.with_context(format!("failed to render document {uri}")))?;
         Ok((
             engine,
@@ -180,8 +221,12 @@ impl Document {
         options: DocumentOptions,
         shaper: &mut impl GlyphShaper,
     ) -> Result<Self, Error> {
+        let stylesheet_cache = options.stylesheet_cache.clone();
         let inputs = options.into_inputs(source, MarkupSyntax::Html, "fragment.xhtml".to_owned())?;
         let mut engine = Self::new(Arc::new(NoResources));
+        if let Some(cache) = stylesheet_cache {
+            engine.session.set_stylesheet_cache(cache);
+        }
         engine.update(inputs, shaper)?;
         Ok(engine)
     }
@@ -196,10 +241,47 @@ impl Document {
         uri: &str,
         options: DocumentOptions,
     ) -> Result<PreparedDocument, Error> {
+        let stylesheet_cache = options.stylesheet_cache.clone();
         let inputs = options.read(provider.as_ref(), uri)?;
+        Self::prepare_inputs(provider, uri, inputs, None, stylesheet_cache)
+    }
+
+    /// Prepare inspected HTML by moving its existing DOM into the engine.
+    pub fn prepare_parsed(
+        provider: Arc<dyn ResourceProvider>,
+        uri: &str,
+        source: ParsedDocumentSource,
+        options: DocumentOptions,
+    ) -> Result<PreparedDocument, Error> {
+        let stylesheet_cache = options.stylesheet_cache.clone();
+        let inputs = options.into_inputs(source.source, MarkupSyntax::Html, uri.to_owned())?;
+        Self::prepare_inputs(
+            provider,
+            uri,
+            inputs,
+            Some((source.document, source.encoding)),
+            stylesheet_cache,
+        )
+    }
+
+    fn prepare_inputs(
+        provider: Arc<dyn ResourceProvider>,
+        uri: &str,
+        inputs: PipelineInputs,
+        document: Option<(DomDocument, Option<String>)>,
+        stylesheet_cache: Option<StylesheetCache>,
+    ) -> Result<PreparedDocument, Error> {
         let mut engine = Self::new(provider);
-        engine.prepare_through_style(inputs)
-            .map_err(|error| error.with_context(format!("failed to prepare document {uri}")))?;
+        if let Some(cache) = stylesheet_cache {
+            engine.session.set_stylesheet_cache(cache);
+        }
+        engine
+            .session
+            .prepare_through_style_with_dom(inputs, document)
+            .map_err(|error| {
+                Error::from(error).with_context(format!("failed to prepare document {uri}"))
+            })?;
+        engine.revisions.invalidate_from(EarliestStage::Parse);
         Ok(PreparedDocument { engine })
     }
 }

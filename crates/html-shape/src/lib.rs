@@ -11,8 +11,9 @@ use html_text::{FirstLetterStyles, StyleOverrides, get_style};
 use rustc_data_structures::fx::FxHashMap;
 use std::ops::Range;
 mod execution;
+mod features;
 mod spans;
-pub use execution::{reshape_range_with_style, shape_document};
+pub use execution::{DocumentShape, reshape_range_with_style, shape_document};
 #[cfg(test)]
 pub use html_pipeline::engine::{LaidOutDocument, PreparedDocument, ShapedDocument};
 #[cfg(test)]

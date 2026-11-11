@@ -2,8 +2,8 @@ use super::columns::{
     TableColumnLayout, column_width_constraints, column_width_style, definite_width_constraints,
     percentage_component,
 };
-use super::grid::PreparedTableGrid;
-use crate::layout::{LayoutEngine, ResolvedBoxModel, UsedBorderInsets};
+use super::s01_grid::PreparedTableGrid;
+use crate::layout::{LayoutEngine, UsedBorderInsets};
 use html_style_model::BoxSizing;
 
 #[derive(Clone, Copy, Default)]
@@ -62,10 +62,11 @@ pub(super) fn resolve_table_columns(
     content_width: f64,
     spacing: f64,
     fixed_mode: bool,
+    fit_to_width: bool,
 ) -> TableColumnLayout {
     let column_count = measures.len();
     let usable_width = (content_width - spacing * (column_count as f64 + 1.0)).max(0.0);
-    let widths = if fixed_mode {
+    let mut widths = if fixed_mode {
         resolve_fixed_widths(
             &measures,
             usable_width.max(measures.iter().map(|column| column.minimum).sum::<f64>()),
@@ -73,13 +74,22 @@ pub(super) fn resolve_table_columns(
     } else {
         resolve_measured_widths(&measures, usable_width, true)
     };
-    let table_width = widths.iter().sum::<f64>() + spacing * (column_count as f64 + 1.0);
+    // Resolve proportions normally, then keep the assigned tracks inside the
+    // reading width. Cell layout consumes these widths and determines row height.
+    let total = widths.iter().sum::<f64>();
+    let scale = if fit_to_width && total > usable_width {
+        usable_width / total
+    } else {
+        1.0
+    };
     let mut starts = Vec::with_capacity(widths.len());
     let mut cursor = spacing;
-    for &width in &widths {
+    for width in &mut widths {
+        *width *= scale;
         starts.push(cursor);
-        cursor += width + spacing;
+        cursor += *width + spacing;
     }
+    let table_width = cursor;
     TableColumnLayout {
         rtl: false,
         widths,
@@ -89,7 +99,7 @@ pub(super) fn resolve_table_columns(
 }
 
 pub(super) fn measure_table_columns(
-    session: &LayoutEngine<'_, '_>,
+    engine: &mut LayoutEngine<'_, '_>,
     prepared: &PreparedTableGrid,
 ) -> Vec<WidthMeasure> {
     let placements = &prepared.grid.placements;
@@ -101,8 +111,8 @@ pub(super) fn measure_table_columns(
     let mut measures = vec![WidthMeasure::default(); column_count];
 
     for (column, hint) in hints.iter().copied().enumerate().take(column_count) {
-        let style = column_width_style(&session.reader, hint);
-        let (minimum, width) = column_width_constraints(&session.reader, hint);
+        let style = column_width_style(&engine.reader, hint);
+        let (minimum, width) = column_width_constraints(&engine.reader, hint);
         let column = &mut measures[column];
         column.minimum = column.minimum.max(minimum);
         if let Some(width) = width {
@@ -125,7 +135,7 @@ pub(super) fn measure_table_columns(
             continue;
         }
         let used_borders = collapsed_grid.map(|grid| grid.cell_insets(placement));
-        let cell = cell_measures(session, placement.cell_idx, used_borders, fixed_mode);
+        let cell = cell_measures(engine, placement.cell_idx, used_borders, fixed_mode);
         let column = &mut measures[placement.col];
         let track_is_constrained = column.constrained;
         if !fixed_mode || !track_is_constrained {
@@ -152,7 +162,7 @@ pub(super) fn measure_table_columns(
         };
         let internal_spacing = spacing * range.len().saturating_sub(1) as f64;
         let used_borders = collapsed_grid.map(|grid| grid.cell_insets(placement));
-        let cell = cell_measures(session, placement.cell_idx, used_borders, fixed_mode);
+        let cell = cell_measures(engine, placement.cell_idx, used_borders, fixed_mode);
         let required_minimum = (cell.minimum - internal_spacing).max(0.0);
         let required_maximum = (cell.maximum - internal_spacing).max(required_minimum);
         let span = &mut measures[range];
@@ -195,22 +205,27 @@ pub(super) fn measure_table_columns(
 }
 
 fn cell_measures(
-    session: &LayoutEngine<'_, '_>,
+    engine: &mut LayoutEngine<'_, '_>,
     cell_idx: usize,
     used_borders: Option<UsedBorderInsets>,
     fixed_mode: bool,
 ) -> WidthMeasure {
-    let style = session.reader.style(cell_idx);
+    let style = engine.reader.style(cell_idx);
     // Percentage cell padding is cyclic while column measures are computed,
     // so its intrinsic contribution is zero. It is resolved against the
     // final table width later when the cell contents are laid out.
     let box_model = used_borders.map_or_else(
-        || ResolvedBoxModel::new(style, 0.0),
-        |borders| ResolvedBoxModel::new(style, 0.0).with_used_borders(borders),
+        || engine.reader.box_model(cell_idx, 0.0),
+        |borders| {
+            engine
+                .reader
+                .box_model(cell_idx, 0.0)
+                .with_used_borders(borders)
+        },
     );
     let extras = box_model.horizontal_padding_border();
     let (content_minimum, content_maximum) =
-        crate::layout::box_content_intrinsic_widths(session, cell_idx, None);
+        crate::layout::box_content_intrinsic_widths(engine, cell_idx, None);
     let (lower, upper, definite_width) = definite_width_constraints(style, extras);
     let percentage = percentage_component(style.width()).unwrap_or(0.0).max(0.0);
     let percentage_offset =

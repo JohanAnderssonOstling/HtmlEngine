@@ -21,7 +21,7 @@ fn open_type_controls_resolve_to_normalized_feature_tags() {
         features
             .iter()
             .find(|feature| open_type::open_type_feature_tag_bytes(**feature) == tag)
-            .map(|feature| feature.value())
+            .map(|feature| open_type::open_type_feature_value(*feature))
     };
 
     assert_eq!(value(*b"smcp"), Some(1));
@@ -45,7 +45,7 @@ fn inherited_font_feature_settings_reach_inline_descendants() {
     let node = document
         .document()
         .node_ids()
-        .find(|&node| document.document().get_dom_id(node) == Some("target"))
+        .find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some("target"))
         .expect("target span");
     let indices = document.style_for_node(node).expect("computed style");
     let features = document
@@ -57,7 +57,7 @@ fn inherited_font_feature_settings_reach_inline_descendants() {
         features
             .iter()
             .find(|feature| open_type::open_type_feature_tag_bytes(**feature) == *b"kern")
-            .map(|feature| feature.value()),
+            .map(|feature| open_type::open_type_feature_value(*feature)),
         Some(0)
     );
 }
@@ -163,13 +163,13 @@ fn border_inherit_copies_the_parents_computed_current_color() {
         .expect("paragraph");
     let emphasis = document
         .document()
-        .element_ref(paragraph)
+        .try_element_ref(paragraph)
         .expect("paragraph element")
         .children()
         .find(|&child| {
             document
                 .document()
-                .element_ref(child)
+                .try_element_ref(child)
                 .is_some_and(|element| element.tag() == "em")
         })
         .expect("emphasis element");
@@ -197,7 +197,7 @@ fn logical_inheritance_copies_physical_parent_sides_and_computed_colors() {
         let node = document
             .document()
             .node_ids()
-            .find(|&node| document.document().get_dom_id(node) == Some("child"))
+            .find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some("child"))
             .expect("child");
         let indices = document.style_for_node(node).expect("computed child style");
         let border = document.border_style(indices).expect("border style");
@@ -338,7 +338,7 @@ fn padding_shorthand_expands_and_inherits_one_through_four_values() {
     for (parent, expected_sides) in parents.into_iter().zip(expected) {
         let child = document
             .document()
-            .element_ref(parent)
+            .try_element_ref(parent)
             .expect("padding parent")
             .children()
             .next()
@@ -381,7 +381,7 @@ fn image_dimension_attributes_are_presentational_hints_below_author_css() {
             .find(|&node| {
                 document
                     .document()
-                    .element_ref(node)
+                    .try_element_ref(node)
                     .and_then(|element| element.attr("id"))
                     == Some(id)
             })
@@ -436,7 +436,7 @@ fn visibility_inherits_and_descendants_can_become_visible_again() {
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, None);
     let visibility_for = |id| {
-        let node = document.document().node_ids().find(|&node| document.document().get_dom_id(node) == Some(id)).expect("element by id");
+        let node = document.document().node_ids().find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some(id)).expect("element by id");
         document.text_style(document.style_for_node(node).expect("computed style")).expect("text style").visibility
     };
 
@@ -450,7 +450,7 @@ fn outline_offset_accepts_signed_lengths_and_rejects_percentages() {
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, None);
     let offset_for = |id| {
-        let node = document.document().node_ids().find(|&node| document.document().get_dom_id(node) == Some(id)).expect("element by id");
+        let node = document.document().node_ids().find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some(id)).expect("element by id");
         document.background_style(document.style_for_node(node).expect("computed style")).expect("background style").outline.offset()
     };
 
@@ -482,7 +482,7 @@ fn image_spacing_attributes_preserve_pixel_and_percentage_margins() {
             .find(|&node| {
                 document
                     .document()
-                    .element_ref(node)
+                    .try_element_ref(node)
                     .and_then(|element| element.attr("id"))
                     == Some(id)
             })
@@ -506,7 +506,7 @@ fn hidden_attribute_is_a_cascading_html_presentational_hint() {
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, None);
     let display_for = |id| {
-        let node = document.document().node_ids().find(|&node| document.document().get_dom_id(node) == Some(id)).expect("element by id");
+        let node = document.document().node_ids().find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some(id)).expect("element by id");
         document.box_model_style(document.style_for_node(node).expect("computed style")).expect("box model").display
     };
 
@@ -519,7 +519,7 @@ fn hidden_attribute_is_a_cascading_html_presentational_hint() {
 fn html_presentational_hints_do_not_leak_into_foreign_xml_elements() {
     let parsed = html_parse::parse_xml_document("<root><div id='target' hidden=''/></root>").expect("valid XML");
     let document = crate::style_document(parsed.build_dom(), &[]);
-    let target = document.document().node_ids().find(|&node| document.document().get_dom_id(node) == Some("target")).expect("target element");
+    let target = document.document().node_ids().find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some("target")).expect("target element");
     let style = document.box_model_style(document.style_for_node(target).expect("computed style")).expect("box model");
 
     assert_eq!(style.display, Display::Block);
@@ -537,7 +537,7 @@ fn legacy_html_color_attributes_are_presentational_hints_below_author_css() {
             .find(|&node| {
                 document
                     .document()
-                    .element_ref(node)
+                    .try_element_ref(node)
                     .and_then(|element| element.attr("id"))
                     == Some(id)
             })
@@ -561,7 +561,7 @@ fn author_revert_also_rolls_back_the_presentational_hint_origin() {
     let html = "<html><body><table><tr><td id='target' bgcolor='red' style='background-color:revert'>Cell</td></tr></table></body></html>";
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, None);
-    let node = document.document().node_ids().find(|&node| document.document().get_dom_id(node) == Some("target")).expect("target");
+    let node = document.document().node_ids().find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some("target")).expect("target");
     let style = document.style_for_node(node).expect("computed style");
 
     assert_eq!(document.background_style(style).expect("background").background_color, 0x00000000);
@@ -572,7 +572,7 @@ fn revert_layer_can_expose_the_presentational_hint_origin() {
     let html = "<html><body><img id='target' width='123' style='width:revert-layer'></body></html>";
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, None);
-    let node = document.document().node_ids().find(|&node| document.document().get_dom_id(node) == Some("target")).expect("target");
+    let node = document.document().node_ids().find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some("target")).expect("target");
     let style = document.style_for_node(node).expect("computed style");
 
     assert_eq!(document.box_model_style(style).expect("box style").width, PreferredSize::Px(123.0));
@@ -594,7 +594,7 @@ fn hint_shorthands_and_keywords_share_longhand_selection_and_origin_rollback() {
         let node = document
             .document()
             .node_ids()
-            .find(|&node| document.document().get_dom_id(node) == Some(id))
+            .find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some(id))
             .unwrap();
         document.style_for_node(node).unwrap()
     };
@@ -642,7 +642,7 @@ fn all_revert_removes_hints_except_direction() {
     let html = "<html><body><table><tr><td id='target' dir='rtl' bgcolor='red' style='all:revert'>Cell</td></tr></table></body></html>";
     let mut factory = DocumentFactory::new();
     let document = factory.parse_with_new_pipeline(html, None);
-    let node = document.document().node_ids().find(|&node| document.document().get_dom_id(node) == Some("target")).expect("target");
+    let node = document.document().node_ids().find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some("target")).expect("target");
     let style = document.style_for_node(node).expect("computed style");
 
     assert_eq!(document.background_style(style).expect("background").background_color, 0x00000000);
@@ -661,7 +661,7 @@ fn legacy_table_spacing_and_padding_are_presentational_hints_below_author_css() 
             .find(|&node| {
                 document
                     .document()
-                    .element_ref(node)
+                    .try_element_ref(node)
                     .and_then(|element| element.attr("id"))
                     == Some(id)
             })
@@ -694,7 +694,7 @@ fn legacy_table_rules_and_frame_values_are_ascii_case_insensitive() {
             .find(|&node| {
                 document
                     .document()
-                    .element_ref(node)
+                    .try_element_ref(node)
                     .and_then(|element| element.attr("id"))
                     == Some(id)
             })
@@ -739,7 +739,7 @@ fn legacy_cell_nowrap_is_a_presentational_hint_below_author_css() {
             .find(|&node| {
                 document
                     .document()
-                    .element_ref(node)
+                    .try_element_ref(node)
                     .and_then(|element| element.attr("id"))
                     == Some(id)
             })
@@ -766,7 +766,7 @@ fn inherited_table_model_properties_cross_the_computed_style_boundary() {
             .find(|&node| {
                 document
                     .document()
-                    .element_ref(node)
+                    .try_element_ref(node)
                     .and_then(|element| element.attr("id"))
                     == Some(id)
             })
@@ -806,7 +806,7 @@ fn custom_represented_table_keywords_obey_the_normal_cascade() {
             .find(|&node| {
                 document
                     .document()
-                    .element_ref(node)
+                    .try_element_ref(node)
                     .and_then(|element| element.attr("id"))
                     == Some(id)
             })
@@ -840,7 +840,7 @@ fn table_layout_is_resolved_from_stylesheets_and_is_not_inherited_by_default() {
             .find(|&node| {
                 document
                     .document()
-                    .element_ref(node)
+                    .try_element_ref(node)
                     .and_then(|element| element.attr("id"))
                     == Some(id)
             })
@@ -870,7 +870,7 @@ fn renderer_owned_text_box_grammar_matches_computed_behavior() {
             .find(|&node| {
                 document
                     .document()
-                    .element_ref(node)
+                    .try_element_ref(node)
                     .and_then(|element| element.attr("id"))
                     == Some(id)
             })
@@ -907,7 +907,7 @@ fn size_containment_is_resolved_as_a_reset_property() {
             .find(|&node| {
                 document
                     .document()
-                    .element_ref(node)
+                    .try_element_ref(node)
                     .and_then(|element| element.attr("id"))
                     == Some(id)
             })
@@ -958,7 +958,7 @@ fn absolute_positioning_blockifies_table_internal_displays() {
             .find(|&node| {
                 document
                     .document()
-                    .element_ref(node)
+                    .try_element_ref(node)
                     .and_then(|element| element.attr("id"))
                     == Some(id.as_str())
             })
@@ -1007,7 +1007,7 @@ fn floating_blockifies_inline_and_table_internal_displays() {
             .find(|&node| {
                 document
                     .document()
-                    .element_ref(node)
+                    .try_element_ref(node)
                     .and_then(|element| element.attr("id"))
                     == Some(id.as_str())
             })
@@ -1035,7 +1035,7 @@ fn z_index_crosses_the_typed_style_boundary() {
             .find(|&node| {
                 document
                     .document()
-                    .element_ref(node)
+                    .try_element_ref(node)
                     .and_then(|element| element.attr("id"))
                     == Some(id)
             })
@@ -1062,7 +1062,7 @@ fn physical_padding_inherit_copies_the_parent_computed_value() {
             .find(|&node| {
                 document
                     .document()
-                    .element_ref(node)
+                    .try_element_ref(node)
                     .and_then(|element| element.attr("id"))
                     == Some(id)
             })
@@ -1086,7 +1086,7 @@ fn inherited_em_and_percentage_padding_keep_their_computed_semantics() {
             .find(|&node| {
                 document
                     .document()
-                    .element_ref(node)
+                    .try_element_ref(node)
                     .and_then(|element| element.attr("id"))
                     == Some(id)
             })

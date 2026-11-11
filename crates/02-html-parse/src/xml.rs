@@ -1,12 +1,17 @@
-use crate::{
-    HtmlQuirksMode, HtmlSyntaxAttribute, HtmlSyntaxElement, HtmlSyntaxNode, HtmlSyntaxTree,
-    MarkupSyntax, ParsedHtml, declared_source_encoding,
-};
+use crate::dom::{SourceAttribute, build_element_data};
+use crate::metadata::document_title;
+use crate::{HtmlQuirksMode, ParsedHtml, declared_source_encoding};
+use html_dom::{
+    Document, DocumentBuildError, DocumentBuilder, DocumentMode, DomElementData, DomNodeId,
+    ImageSource, write_escaped_xml};
 use quick_xml::XmlVersion;
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::name::ResolveResult;
 use quick_xml::reader::NsReader;
+use std::borrow::Cow;
+use std::collections::HashSet;
 use std::fmt;
+use std::mem;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct XmlParseError {
@@ -56,23 +61,30 @@ impl fmt::Display for XmlParseError {
 
 impl std::error::Error for XmlParseError {}
 pub fn parse_xml_document(xml: &str) -> Result<ParsedHtml, XmlParseError> {
-    let document = parse_xml_syntax_tree(xml).map_err(|mut error| {
+    let mut document = parse_xml_dom(xml).map_err(|mut error| {
         let prefix = &xml.as_bytes()[..(error.offset as usize).min(xml.len())];
         error.line = prefix.iter().filter(|&&byte| byte == b'\n').count() + 1;
-        let line_start = prefix.iter().rposition(|&byte| byte == b'\n').map_or(0, |index| index + 1);
-        error.column = prefix[line_start..].iter().filter(|&&byte| byte & 0xc0 != 0x80).count() + 1;
+        let line_start = prefix
+            .iter()
+            .rposition(|&byte| byte == b'\n')
+            .map_or(0, |index| index + 1);
+        error.column = prefix[line_start..]
+            .iter()
+            .filter(|&&byte| byte & 0xc0 != 0x80)
+            .count()
+            + 1;
         error
     })?;
+    document.set_title(document_title(&document));
     Ok(ParsedHtml {
-        document,
-        syntax: MarkupSyntax::Xml,
+        document: Ok(document),
         quirks_mode: HtmlQuirksMode::NoQuirks,
         errors: Vec::new(),
         source_encoding: declared_source_encoding(xml),
     })
 }
 
-fn parse_xml_syntax_tree(xml: &str) -> Result<HtmlSyntaxTree, XmlParseError> {
+fn parse_xml_dom(xml: &str) -> Result<Document, XmlParseError> {
     let mut reader = NsReader::from_str(xml);
     {
         let config = reader.config_mut();
@@ -86,8 +98,11 @@ fn parse_xml_syntax_tree(xml: &str) -> Result<HtmlSyntaxTree, XmlParseError> {
         config.trim_text(false);
     }
     let mut version = XmlVersion::Implicit1_0;
-    let mut nodes = Vec::new();
-    let mut elements = Vec::<HtmlSyntaxElement>::new();
+    let mut document = DocumentBuilder::new();
+    document.set_mode(DocumentMode::Xml);
+    let mut root = None;
+    let mut elements = Vec::<XmlFrame>::new();
+    let mut captures = Vec::<ForeignCapture>::new();
     let mut root_seen = false;
     let mut doctype_seen = false;
     let mut declaration_seen = false;
@@ -109,27 +124,69 @@ fn parse_xml_syntax_tree(xml: &str) -> Result<HtmlSyntaxTree, XmlParseError> {
             }
             root_seen = true;
         }
+        let empty_element = matches!(&event, Event::Empty(_));
+        let offset = reader.buffer_position();
+        let dom_error = |error: DocumentBuildError| XmlParseError::new(offset, error.to_string());
         match event {
-            Event::Start(start) => {
-                elements.push(xml_syntax_element(
-                    &reader,
-                    &start,
-                    version,
-                    xhtml_entities,
-                )?);
-            }
-            Event::Empty(start) => {
-                let element = xml_syntax_element(&reader, &start, version, xhtml_entities)?;
-                push_xml_node(&mut nodes, &mut elements, HtmlSyntaxNode::Element(element));
+            Event::Start(start) | Event::Empty(start) => {
+                flush_xml_text(&mut document, &mut elements, &mut captures)
+                    .map_err(dom_error)?;
+                let tag = xml_start_tag(&reader, &start, version, xhtml_entities)?;
+                let data = tag.element_data(&mut document).map_err(dom_error)?;
+                let foreign_image = tag.is_foreign_image().then_some(data.image_idx).flatten();
+                let node = document.append_dom_element(elements.last().map(|frame| frame.node), data)
+                    .map_err(dom_error)?;
+                root.get_or_insert(node);
+                let depth = elements.len() + 1;
+                if !captures.is_empty() {
+                    let inherited = elements
+                        .last()
+                        .and_then(|frame| frame.namespace.as_deref())
+                        .unwrap_or("");
+                    for capture in &mut captures {
+                        tag.write_start_markup(&mut capture.markup, inherited);
+                    }
+                }
+                if let Some(image) = foreign_image {
+                    let mut markup = String::new();
+                    tag.write_start_markup(&mut markup, "");
+                    captures.push(ForeignCapture {
+                        depth,
+                        image,
+                        markup,
+                    });
+                }
+                if empty_element {
+                    close_foreign_tag(&tag.local_name, &mut captures);
+                    finish_foreign_capture(
+                        &mut document,
+                        &mut captures,
+                        depth,
+                    );
+                } else {
+                    elements.push(XmlFrame {
+                        node,
+                        name: tag.local_name,
+                        namespace: tag.namespace,
+                        text: String::new(),
+                    });
+                }
             }
             Event::End(_) => {
-                let Some(element) = elements.pop() else {
+                flush_xml_text(&mut document, &mut elements, &mut captures)
+                    .map_err(dom_error)?;
+                let Some(frame) = elements.pop() else {
                     return Err(XmlParseError::new(
-                        reader.buffer_position(),
+                        offset,
                         "closing element has no open element",
                     ));
                 };
-                push_xml_node(&mut nodes, &mut elements, HtmlSyntaxNode::Element(element));
+                close_foreign_tag(&frame.name, &mut captures);
+                finish_foreign_capture(
+                    &mut document,
+                    &mut captures,
+                    elements.len() + 1,
+                );
             }
             Event::Text(text) => {
                 let text = text
@@ -146,7 +203,11 @@ fn parse_xml_syntax_tree(xml: &str) -> Result<HtmlSyntaxTree, XmlParseError> {
                         ));
                     }
                 } else {
-                    push_xml_text(&mut elements, text.as_ref());
+                    elements
+                        .last_mut()
+                        .expect("XML text parent")
+                        .text
+                        .push_str(text.as_ref());
                 }
             }
             Event::CData(text) => {
@@ -159,7 +220,11 @@ fn parse_xml_syntax_tree(xml: &str) -> Result<HtmlSyntaxTree, XmlParseError> {
                 let text = text
                     .xml_content(version)
                     .map_err(|error| xml_reader_error(&reader, error))?;
-                push_xml_text(&mut elements, text.as_ref());
+                elements
+                    .last_mut()
+                    .expect("XML text parent")
+                    .text
+                    .push_str(text.as_ref());
             }
             Event::GeneralRef(reference) => {
                 if elements.is_empty() {
@@ -186,7 +251,11 @@ fn parse_xml_syntax_tree(xml: &str) -> Result<HtmlSyntaxTree, XmlParseError> {
                         })?
                         .to_owned()
                 };
-                push_xml_text(&mut elements, &value);
+                elements
+                    .last_mut()
+                    .expect("XML text parent")
+                    .text
+                    .push_str(&value);
             }
             Event::Comment(comment) => {
                 if !declaration_seen {
@@ -196,7 +265,13 @@ fn parse_xml_syntax_tree(xml: &str) -> Result<HtmlSyntaxTree, XmlParseError> {
                     .xml_content(version)
                     .map_err(|error| xml_reader_error(&reader, error))?
                     .into_owned();
-                push_xml_node(&mut nodes, &mut elements, HtmlSyntaxNode::Comment(comment));
+                flush_xml_text(&mut document, &mut elements, &mut captures)
+                    .map_err(dom_error)?;
+                for capture in &mut captures {
+                    capture.markup.push_str("<!--");
+                    capture.markup.push_str(&comment);
+                    capture.markup.push_str("-->");
+                }
             }
             Event::PI(instruction) => {
                 if !declaration_seen {
@@ -215,11 +290,15 @@ fn parse_xml_syntax_tree(xml: &str) -> Result<HtmlSyntaxTree, XmlParseError> {
                 )?
                 .trim_start()
                 .to_owned();
-                push_xml_node(
-                    &mut nodes,
-                    &mut elements,
-                    HtmlSyntaxNode::ProcessingInstruction { target, data },
-                );
+                flush_xml_text(&mut document, &mut elements, &mut captures)
+                    .map_err(dom_error)?;
+                for capture in &mut captures {
+                    capture.markup.push_str("<?");
+                    capture.markup.push_str(&target);
+                    capture.markup.push(' ');
+                    capture.markup.push_str(&data);
+                    capture.markup.push_str("?>");
+                }
             }
             Event::DocType(doctype) => {
                 if !declaration_seen {
@@ -237,23 +316,9 @@ fn parse_xml_syntax_tree(xml: &str) -> Result<HtmlSyntaxTree, XmlParseError> {
                     .map_err(|error| xml_reader_error(&reader, error))?
                     .into_owned();
                 xhtml_entities = is_xhtml_doctype(&raw);
-                let name = raw
-                    .split_ascii_whitespace()
-                    .next()
-                    .unwrap_or_default()
-                    .to_owned();
-                nodes.push(HtmlSyntaxNode::Doctype {
-                    name,
-                    public_id: String::new(),
-                    system_id: String::new(),
-                });
             }
             Event::Decl(declaration) => {
-                if declaration_seen
-                    || content_seen_before_declaration
-                    || root_seen
-                    || doctype_seen
-                    || !nodes.is_empty()
+                if declaration_seen || content_seen_before_declaration || root_seen || doctype_seen
                 {
                     return Err(XmlParseError::new(
                         reader.buffer_position(),
@@ -294,22 +359,24 @@ fn parse_xml_syntax_tree(xml: &str) -> Result<HtmlSyntaxTree, XmlParseError> {
             "an XML document must have a root element",
         ));
     }
-    Ok(HtmlSyntaxTree { nodes })
+    document.set_dom_root(root.expect("XML root node"))
+        .and_then(|()| document.finish())
+        .map_err(|error| XmlParseError::new(reader.buffer_position(), error.to_string()))
 }
 
-fn xml_syntax_element(
+fn xml_start_tag(
     reader: &NsReader<&[u8]>,
     start: &BytesStart<'_>,
     version: XmlVersion,
     xhtml_entities: bool,
-) -> Result<HtmlSyntaxElement, XmlParseError> {
+) -> Result<XmlStartTag, XmlParseError> {
     let offset = reader.buffer_position();
     utf8_xml_bytes(start.name().as_ref(), offset, "element name")?;
     let (namespace, local_name) = reader.resolver().resolve_element(start.name());
     let namespace = resolved_namespace(namespace, offset)?;
     let local_name = utf8_xml_bytes(local_name.as_ref(), offset, "element local name")?.to_owned();
     let mut attributes = Vec::new();
-    let mut expanded_attribute_names = std::collections::HashSet::new();
+    let mut expanded_attribute_names = HashSet::new();
     for attribute in start.attributes().with_checks(true) {
         let attribute = attribute.map_err(|error| XmlParseError::new(offset, error.to_string()))?;
         let raw_attribute_name =
@@ -340,18 +407,17 @@ fn xml_syntax_element(
             })
             .map_err(|error| XmlParseError::new(offset, error.to_string()))?
             .into_owned();
-        attributes.push(HtmlSyntaxAttribute {
+        attributes.push(XmlAttribute {
             name: raw_attribute_name,
             local_name: attribute_local_name,
             namespace: attribute_namespace,
             value,
         });
     }
-    Ok(HtmlSyntaxElement {
+    Ok(XmlStartTag {
         local_name,
         namespace,
         attributes,
-        children: Vec::new(),
     })
 }
 
@@ -390,29 +456,6 @@ fn is_xhtml_doctype(doctype: &str) -> bool {
             || doctype.contains("xhtml11"))
 }
 
-fn push_xml_node(
-    nodes: &mut Vec<HtmlSyntaxNode>,
-    elements: &mut [HtmlSyntaxElement],
-    node: HtmlSyntaxNode,
-) {
-    if let Some(parent) = elements.last_mut() {
-        parent.children.push(node);
-    } else {
-        nodes.push(node);
-    }
-}
-
-fn push_xml_text(elements: &mut [HtmlSyntaxElement], text: &str) {
-    let Some(parent) = elements.last_mut() else {
-        return;
-    };
-    if let Some(HtmlSyntaxNode::Text(existing)) = parent.children.last_mut() {
-        existing.push_str(text);
-    } else if !text.is_empty() {
-        parent.children.push(HtmlSyntaxNode::Text(text.to_owned()));
-    }
-}
-
 fn utf8_xml_bytes<'a>(
     bytes: &'a [u8],
     offset: u64,
@@ -424,4 +467,154 @@ fn utf8_xml_bytes<'a>(
 
 fn xml_reader_error(reader: &NsReader<&[u8]>, error: impl fmt::Display) -> XmlParseError {
     XmlParseError::new(reader.error_position(), error.to_string())
+}
+
+// Only open elements and their pending text are retained during streaming XML parsing.
+struct XmlFrame {
+    node: DomNodeId,
+    name: String,
+    namespace: Option<String>,
+    text: String,
+}
+
+struct ForeignCapture {
+    depth: usize,
+    image: u32,
+    markup: String,
+}
+
+struct XmlAttribute {
+    name: String,
+    local_name: String,
+    namespace: Option<String>,
+    value: String,
+}
+
+struct XmlStartTag {
+    local_name: String,
+    namespace: Option<String>,
+    attributes: Vec<XmlAttribute>,
+}
+
+impl XmlStartTag {
+    fn element_data(
+        &self,
+        document: &mut DocumentBuilder,
+    ) -> Result<DomElementData, DocumentBuildError> {
+        build_element_data(
+            document,
+            &self.local_name,
+            self.namespace.as_deref(),
+            self.attributes.iter().map(|attribute| SourceAttribute {
+                name: Cow::Borrowed(&attribute.name),
+                local_name: &attribute.local_name,
+                namespace: attribute.namespace.as_deref(),
+                value: &attribute.value,
+            }),
+            String::new,
+        )
+    }
+
+    fn is_foreign_image(&self) -> bool {
+        (self.local_name == "svg"
+            && self.namespace.as_deref() == Some("http://www.w3.org/2000/svg"))
+            || (self.local_name == "math"
+                && self.namespace.as_deref() == Some("http://www.w3.org/1998/Math/MathML"))
+    }
+
+    fn write_start_markup(&self, output: &mut String, inherited_namespace: &str) {
+        fn attribute(output: &mut String, name: &str, value: &str) {
+            output.push(' ');
+            output.push_str(name);
+            output.push_str("=\"");
+            write_escaped_xml(output, value);
+            output.push('"');
+        }
+        output.push('<');
+        output.push_str(&self.local_name);
+        let namespace = self.namespace.as_deref().unwrap_or("");
+        if namespace != inherited_namespace {
+            attribute(output, "xmlns", namespace);
+        }
+        let mut declared_prefixes = Vec::new();
+        for entry in &self.attributes {
+            let Some(prefix) = entry.name.strip_prefix("xmlns:") else {
+                continue;
+            };
+            let conflict = self.attributes.iter().any(|other| {
+                other.name.split_once(':').is_some_and(|(used, _)| {
+                    used == prefix
+                        && other
+                            .namespace
+                            .as_deref()
+                            .is_some_and(|uri| uri != entry.value)
+                })
+            });
+            if !conflict && !declared_prefixes.contains(&prefix) {
+                attribute(output, &entry.name, &entry.value);
+                declared_prefixes.push(prefix);
+            }
+        }
+        for entry in &self.attributes {
+            if let Some((prefix, _)) = entry.name.split_once(':')
+                && prefix != "xmlns"
+                && prefix != "xml"
+                && !declared_prefixes.contains(&prefix)
+                && let Some(namespace) = entry.namespace.as_deref()
+            {
+                attribute(output, &format!("xmlns:{prefix}"), namespace);
+                declared_prefixes.push(prefix);
+            }
+        }
+        for entry in &self.attributes {
+            if entry.name == "xmlns" || entry.name.starts_with("xmlns:") {
+                continue;
+            }
+            attribute(output, &entry.name, &entry.value);
+        }
+        output.push('>');
+    }
+}
+
+fn flush_xml_text(
+    document: &mut DocumentBuilder,
+    elements: &mut [XmlFrame],
+    captures: &mut [ForeignCapture],
+) -> Result<(), DocumentBuildError> {
+    if let Some(frame) = elements.last_mut()
+        && !frame.text.is_empty()
+    {
+        let text = mem::take(&mut frame.text);
+        for capture in captures {
+            write_escaped_xml(&mut capture.markup, &text);
+        }
+        document.append_dom_text(frame.node, text)?;
+    }
+    Ok(())
+}
+
+fn close_foreign_tag(name: &str, captures: &mut [ForeignCapture]) {
+    for capture in captures {
+        capture.markup.push_str("</");
+        capture.markup.push_str(name);
+        capture.markup.push('>');
+    }
+}
+
+fn finish_foreign_capture(
+    document: &mut DocumentBuilder,
+    captures: &mut Vec<ForeignCapture>,
+    depth: usize,
+) {
+    if captures
+        .last()
+        .is_some_and(|capture| capture.depth == depth)
+    {
+        let capture = captures.pop().expect("foreign XML capture");
+        match &mut document.images_mut()[capture.image as usize].source {
+            ImageSource::InlineSvg { bytes, .. } => *bytes = capture.markup.into_bytes().into(),
+            ImageSource::MathMl { markup, .. } => *markup = capture.markup.into(),
+            _ => unreachable!("foreign XML capture must belong to SVG or MathML"),
+        }
+    }
 }

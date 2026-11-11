@@ -1,9 +1,7 @@
 use html_dom as dom_values;
 use html_dom::{DomNodeId, RootFontSize};
 use html_style::{
-    AuthorStylesheetInput, MediaEnvironment, StyleProgramCache, StyledDocument,
-    style_document_with_cached_program_and_reader_overrides,
-};
+    AuthorStylesheetInput, MediaEnvironment, StyleProgramCache, StyledDocument};
 use html_style_model::{LengthPct, PreferredSize, ReaderStyleOverrides, StyleIndices};
 
 fn styled(source: &str, desired: f32, canonical: Option<f32>) -> StyledDocument {
@@ -21,13 +19,7 @@ fn styled(source: &str, desired: f32, canonical: Option<f32>) -> StyledDocument 
         css,
         implicit_scope_root: None,
     }];
-    style_document_with_cached_program_and_reader_overrides(
-        &mut StyleProgramCache::default(),
-        document,
-        &inputs,
-        MediaEnvironment::default(),
-        &overrides,
-    )
+    html_style::StyleRequest::new(document, &inputs).environment(MediaEnvironment::default()).reader_overrides(&overrides).compile_cached(&mut StyleProgramCache::default())
     .0
 }
 
@@ -35,7 +27,7 @@ fn node(document: &StyledDocument, id: &str) -> DomNodeId {
     document
         .document()
         .node_ids()
-        .find(|&node| document.document().get_dom_id(node) == Some(id))
+        .find(|&node| document.document().try_element_ref(node).and_then(|element| element.id()) == Some(id))
         .unwrap()
 }
 
@@ -195,13 +187,7 @@ fn viewport_font_sizes_retain_their_resize_dependency() {
         canonical_font_size: Some(16.0),
         ..Default::default()
     };
-    let (document, _, queries) = style_document_with_cached_program_and_reader_overrides(
-        &mut StyleProgramCache::default(),
-        document,
-        &[],
-        MediaEnvironment::screen(600.0, None).unwrap(),
-        &overrides,
-    );
+    let (document, _, queries) = html_style::StyleRequest::new(document, &[]).environment(MediaEnvironment::screen(600.0, None).unwrap()).reader_overrides(&overrides).compile_cached(&mut StyleProgramCache::default());
     close(
         document
             .font_style(style(&document, "target"))

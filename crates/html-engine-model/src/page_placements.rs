@@ -1,7 +1,7 @@
 //! Positioned page content, shared by composition and host painting.
 
 use crate::LineId;
-use kurbo::{Point, Size};
+use kurbo::{Point, Size, Vec2};
 use std::collections::HashMap;
 
 /// Column geometry in unscaled layout coordinates. The host chooses viewport
@@ -19,6 +19,18 @@ pub struct PageGeometry {
 pub struct LineScreen {
     pub point: Point,
     pub col_index: i32,
+    /// Visible vertical band in page coordinates; absent for whole columns.
+    pub visible_y: Option<(f64, f64)>,
+}
+
+impl LineScreen {
+    pub fn visible_top(self) -> f64 {
+        self.visible_y.map_or(0.0, |band| band.0)
+    }
+
+    pub fn visible_bottom(self, height: f64) -> f64 {
+        self.visible_y.map_or(height, |band| band.1)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -50,6 +62,81 @@ impl Default for PageRequest {
     }
 }
 
+/// A prepared source band belonging to a box's content or enclosing flow.
+/// Horizontal translation excludes the column origin, so viewport repositioning
+/// does not invalidate this mapping. Source order is pagination order.
+#[derive(Clone, Copy, Debug)]
+pub struct BoxProjectionBand {
+    pub column: i32,
+    pub translation: Vec2,
+    pub source_y: f64,
+    pub top: f64,
+    pub bottom: f64,
+    pub distance: usize,
+}
+
+/// One placement shared by consecutive lines and all boxes they carry.
+#[derive(Clone, Copy, Debug)]
+pub struct FlowPlacement {
+    pub direct: BoxProjectionBand,
+    pub enclosing: Option<BoxProjectionBand>,
+}
+
+/// First source position at which an owner participates in a shared placement.
+#[derive(Clone, Copy, Debug)]
+pub struct PlacementMembership {
+    pub placement: usize,
+    pub order: usize,
+    pub source_y: f64,
+}
+
+/// Most owners participate in one span. Keep that membership inline rather
+/// than allocating a separate vector for every box and enclosing flow.
+pub struct PlacementMemberships {
+    pub first: PlacementMembership,
+    pub additional: Vec<PlacementMembership>,
+}
+
+impl PlacementMemberships {
+    pub fn iter(&self) -> impl Iterator<Item = &PlacementMembership> {
+        std::iter::once(&self.first).chain(self.additional.iter())
+    }
+
+    pub fn retain(&mut self, entry: PlacementMembership) {
+        let last = self.additional.last().unwrap_or(&self.first);
+        if last.placement != entry.placement {
+            self.additional.push(entry);
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct PageFlowPlacements {
+    /// Authoritative box fragments resolved during composition, shared by
+    /// decoration painting and geometry queries.
+    pub boxes: HashMap<u32, Vec<BoxProjectionBand>>,
+    pub prepared: bool,
+    pub spans: Vec<FlowPlacement>,
+    pub content: HashMap<u32, PlacementMemberships>,
+    pub flows: HashMap<u32, PlacementMemberships>,
+}
+
+impl PageFlowPlacements {
+    pub fn clear(&mut self) {
+        self.prepared = false;
+        self.boxes.clear();
+        self.spans.clear();
+        self.content.clear();
+        self.flows.clear();
+    }
+}
+
+/// All visible fragments of a table or row, including partial continuations.
+#[derive(Default)]
+pub struct TableFragmentPlacement {
+    pub bands: Vec<BoxProjectionBand>,
+}
+
 #[derive(Default)]
 pub struct PagePositions {
     /// Resolved request that reproduces this page, including normalization at
@@ -65,10 +152,16 @@ pub struct PagePositions {
     pub offset_breaks: Vec<(f64, f64)>,
     pub repeated_table_headers: Vec<RepeatedTableHeader>,
     pub block_decoration_indices: Option<Vec<usize>>,
+    pub flow_placements: PageFlowPlacements,
+    pub table_fragments: HashMap<u32, TableFragmentPlacement>,
     /// There is no following content, regardless of composition direction.
     pub reached_end: bool,
-    /// Geometric continuation; `last_line + 1` identifies the exact next group.
+    /// Geometric continuation. Use `continuation` before advancing to the next
+    /// cursor: the final placed group can still have undisplayed content.
     pub next_start_offset_y: f64,
+    /// The current group still has content below this page. Resume at this
+    /// source coordinate instead of advancing past its last line.
+    pub continuation: Option<(usize, f64)>,
 }
 
 impl PagePositions {
@@ -95,8 +188,11 @@ impl PagePositions {
         self.offset_breaks.clear();
         self.repeated_table_headers.clear();
         self.block_decoration_indices = None;
+        self.flow_placements.clear();
+        self.table_fragments.clear();
         self.reached_end = false;
         self.next_start_offset_y = 0.0;
+        self.continuation = None;
     }
 }
 
@@ -111,6 +207,8 @@ pub struct VisibleLinePositions {
     positions: Vec<LineScreen>,
     ids: Vec<LineId>,
     offsets: HashMap<LineId, usize>,
+    /// Additional column fragments of a line that exceeds one column's height.
+    continuations: Vec<(LineId, LineScreen)>,
 }
 
 impl VisibleLinePositions {
@@ -119,6 +217,17 @@ impl VisibleLinePositions {
     pub fn get(&self, line: LineId) -> Option<LineScreen> {
         let offset = *self.offsets.get(&line)?;
         self.positions.get(offset).copied()
+    }
+
+    pub fn fragments(&self, line: LineId) -> impl Iterator<Item = LineScreen> + '_ {
+        self.get(line).into_iter().chain(
+            self.continuations.iter()
+                .filter_map(move |(id, screen)| (*id == line).then_some(*screen)),
+        )
+    }
+
+    pub fn line_ids(&self) -> impl Iterator<Item = LineId> + Clone + '_ {
+        self.ids.iter().copied()
     }
 
     pub fn contains(&self, line: LineId) -> bool {
@@ -130,11 +239,12 @@ impl VisibleLinePositions {
     }
 
     /// Stable line identities and their placements, in pagination order.
-    pub fn iter(&self) -> impl Iterator<Item = (LineId, LineScreen)> + '_ {
+    pub fn iter(&self) -> impl Iterator<Item = (LineId, LineScreen)> + Clone + '_ {
         self.ids
             .iter()
             .zip(&self.positions)
             .map(|(id, screen)| (*id, *screen))
+            .chain(self.continuations.iter().copied())
     }
 
 
@@ -152,6 +262,7 @@ pub fn with_buffer(first_cursor: usize, mut positions: Vec<LineScreen>) -> Visib
         positions,
         ids: Vec::new(),
         offsets: HashMap::new(),
+        continuations: Vec::new(),
     }
 }
 
@@ -170,6 +281,15 @@ pub fn at_cursor(value: &VisibleLinePositions, cursor: usize) -> Option<LineScre
     value.positions.get(offset).copied()
 }
 
+/// Retain another clipped column fragment without changing cursor ownership.
+pub fn push_fragment(value: &mut VisibleLinePositions, id: LineId, screen: LineScreen) {
+    if value.contains(id) {
+        value.continuations.push((id, screen));
+    } else {
+        push(value, id, screen);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,6 +304,7 @@ mod tests {
                 LineScreen {
                     point: Point::new(x, 5.0),
                     col_index: 0,
+                    visible_y: None,
                 },
             );
         }
@@ -216,11 +337,9 @@ mod tests {
 
 /// Horizontal column placement used by engine page composition and projection.
 pub fn col_x(geometry: &PageGeometry, col_index: f64, local_x: f64) -> f64 {
-    let leading = if geometry.col_count == 1.0 {
-        ((geometry.size.width - geometry.col_width) / 2.0).max(0.0)
-    } else {
-        0.0
-    };
+    let content_width = geometry.col_count * geometry.col_width
+        + (geometry.col_count - 1.0).max(0.0) * geometry.col_gap;
+    let leading = ((geometry.size.width - content_width) / 2.0).max(0.0);
     leading + col_index * (geometry.col_width + geometry.col_gap) + local_x
 }
 
@@ -232,6 +351,7 @@ pub fn line_positions_mut(
         .iter()
         .zip(&mut value.positions)
         .map(|(id, screen)| (*id, screen))
+        .chain(value.continuations.iter_mut().map(|(id, screen)| (*id, screen)))
 }
 
 pub fn clear_line_positions(value: &mut VisibleLinePositions) {
@@ -239,4 +359,5 @@ pub fn clear_line_positions(value: &mut VisibleLinePositions) {
     value.positions.clear();
     value.ids.clear();
     value.offsets.clear();
+    value.continuations.clear();
 }

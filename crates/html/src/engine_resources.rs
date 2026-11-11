@@ -1,10 +1,7 @@
 //! Per-document resources and intrinsic-size invalidation, independent of
 //! which parts of the document a host chooses to display.
 
-use html_pipeline::engine::pagination_queries;
-use html_pipeline::engine::fragment_paint;
 use html_dom as dom_values;
-use html_pipeline::engine::text_paint;
 use crate::Document;
 use crate::export::SourceImage;
 use crate::layout::{LineId, RenderView};
@@ -102,7 +99,7 @@ impl DocumentImages {
         self.resource_revision = revision;
         if let Some(view) = view {
             self.pipeline
-                .update_resources(text_paint::render_view_images(&view));
+                .update_resources(view.images());
             let pipeline = &self.pipeline;
             self.pending
                 .retain(|&image| pipeline.intrinsic_dimensions(image).is_some());
@@ -114,7 +111,7 @@ impl DocumentImages {
     /// Shared-service invalidation discards dimensions no longer available.
     fn poll(&mut self, view: Option<RenderView<'_>>, committed: Option<&ImageMetrics>) -> bool {
         let poll = view
-            .map(|view| self.pipeline.poll(text_paint::render_view_images(&view)))
+            .map(|view| self.pipeline.poll(view.images()))
             .unwrap_or_default();
         let previous_pending = self.pending.len();
         let pipeline = &self.pipeline;
@@ -129,7 +126,7 @@ impl DocumentImages {
                     committed,
                     &self.pending,
                     |image| {
-                        text_paint::render_view_images(&view)
+                        view.images()
                             .get(image.index())
                             .map(|source| (source.width, source.height))
                     },
@@ -147,7 +144,7 @@ impl DocumentImages {
 impl Document {
     pub fn image_source_request(&self, image: ImageId) -> Option<ImageSourceRequest> {
         Some(ImageSourceRequest {
-            uri: text_paint::render_view_image_uri(&self.render_view()?, image)?.to_owned(),
+            uri: (self.render_view()?).image_uri(image)?.to_owned(),
             provider: self.provider.clone(),
         })
     }
@@ -182,7 +179,7 @@ impl Document {
         if let Some((view, page)) = self.session.render_view().zip(page)
             && let Some(end) = page.last_line
         {
-            let pagination = pagination_queries::render_view_pagination(view);
+            let pagination = view.pagination();
             let extra = end
                 .saturating_sub(page.start_line)
                 .saturating_add(1)
@@ -214,7 +211,7 @@ impl Document {
         let mut desired = HashSet::new();
         for line in lines {
             desired.extend(
-                fragment_paint::render_fragment_view_images_for_line(view.fragments(), line)
+                (view.fragments()).images_for_line(line)
                     .iter()
                     .map(|image| image.image()),
             );
@@ -222,7 +219,7 @@ impl Document {
         for scope in scopes {
             if let Some(scope) = scope.render_view(self) {
                 desired.extend(
-                    fragment_paint::render_fragment_view_images(scope.fragments())
+                    (scope.fragments()).images()
                         .iter()
                         .map(|image| image.image()),
                 );
@@ -230,7 +227,7 @@ impl Document {
         }
         self.images
             .pipeline
-            .ensure_window(text_paint::render_view_images(&view), &desired);
+            .ensure_window(view.images(), &desired);
     }
 
     pub(super) fn sync_resources(&mut self) {

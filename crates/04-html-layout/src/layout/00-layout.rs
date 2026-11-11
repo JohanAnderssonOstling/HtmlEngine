@@ -1,45 +1,39 @@
 //! Coordinate preparation, recursive geometry, finalization, and paint replay.
+use html_engine_model::{BoxGeometry, LayoutConstraints, LayoutState};
 use super::FragmentWriter;
-use super::engine::{LayoutInputs, LayoutOutputs, LayoutTimings};
-use super::finalization::FinalizationScratch;
-use super::preparation::with_engine;
-use super::read_context::{BoxStyleSnapshot, LayoutReader};
-use crate::layout_model::{BoxGeometry, LayoutState};
+use super::engine::{LayoutEngine, LayoutInputs, LayoutOutputs, LayoutPassKind, LayoutReadContext};
+use super::s03_finalize::FinalizationScratch;
+use super::read_context::{PassContext, LayoutReader};
 
-pub fn layout_with_timings(
+pub fn compute_layout(
     inputs: LayoutInputs<'_>,
-    outputs: LayoutOutputs<'_, '_>,
-    constraints: crate::LayoutConstraints,
-    timings: Option<&mut LayoutTimings>,
+    outputs: LayoutOutputs<'_>,
+    constraints: LayoutConstraints,
 ) {
-    profile_scope!("layout.engine");
-    with_engine(inputs, outputs, constraints, timings, |engine, paint| {
-        engine.layout_root();
-        engine.finalize();
-        let reader = engine.reader.with_paint(paint);
-        let started = engine.start_timing();
-        super::paint::replay(
-            &reader,
-            engine.text.content(),
-            engine.geometry,
-            &mut engine.fragments,
-            &mut engine.finalization,
-        );
-        engine.record_timing(|t| t.finalize_layout += started.elapsed());
-    });
+    let pass_context = PassContext::new(&inputs);
+    let paint = inputs.paint;
+    let read = LayoutReadContext::new(inputs, constraints, &pass_context);
+    let mut engine = LayoutEngine::new(read, outputs, LayoutPassKind::Final);
+    engine.prepare_layout_pass();
+    engine.layout_root();
+    engine.finalize();
+    let reader = engine.reader.with_paint(paint);
+    super::s04_paint::replay(
+        &reader,
+        engine.text.content(),
+        engine.geometry,
+        &mut engine.fragments,
+        &mut engine.scratch.finalization,
+    );
+    engine.finish_pass();
 }
 
 /// Paint-only updates retain all box and line geometry.
-pub fn repaint(
-    inputs: LayoutInputs<'_>,
-    geometry: &BoxGeometry,
-    state: &mut LayoutState,
-    _constraints: crate::LayoutConstraints,
-) {
-    let box_styles = BoxStyleSnapshot::new(&inputs);
-    let reader = LayoutReader::new(&inputs, &box_styles).with_paint(inputs.paint);
-    let mut fragments = FragmentWriter::new(state, Vec::new());
-    super::paint::replay(
+pub fn repaint(inputs: LayoutInputs<'_>, geometry: &BoxGeometry, state: &mut LayoutState) {
+    let pass_context = PassContext::for_paint(&inputs);
+    let reader = LayoutReader::new(&inputs, &pass_context).with_paint(inputs.paint);
+    let mut fragments = FragmentWriter::new(state);
+    super::s04_paint::replay(
         &reader,
         inputs.inline_content,
         geometry,

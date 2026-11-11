@@ -45,28 +45,37 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
     ) {
         for child_id in element.children() {
             match self.document.node_ref(child_id) {
-                Some(NodeRef::Text(_)) => inline_segment.push(FlexInlineSource::Node(child_id)),
-                Some(NodeRef::Element(child)) => {
-                    let display = display_for_element(self.styles, child);
+                NodeRef::Text(_) => inline_segment.push(FlexInlineSource::Node(child_id)),
+                NodeRef::Element(child) => {
+                    let classification = ElementClassification::new(self.styles, child);
+                    let display = classification.display;
                     if display == Display::Contents {
                         self.generated.apply_for_node(child_id);
                         self.append_flex_grid_pseudo(
-                            child_id, box_idx, true, items, inline_segment,
+                            child_id,
+                            box_idx,
+                            true,
+                            items,
+                            inline_segment,
                         );
                         self.build_flex_grid_items(child, box_idx, items, inline_segment);
                         self.append_flex_grid_pseudo(
-                            child_id, box_idx, false, items, inline_segment,
+                            child_id,
+                            box_idx,
+                            false,
+                            items,
+                            inline_segment,
                         );
                         continue;
                     }
                     items.extend(self.flush_flex_inline_sources(inline_segment, box_idx));
                     if display != Display::None
-                        && let Some(item) = self.build_box_for_element(child_id, Some(box_idx))
+                        && let Some(item) =
+                            self.build_classified_element(child_id, Some(box_idx), classification)
                     {
                         items.push(item);
                     }
                 }
-                None => {}
             }
         }
     }
@@ -80,13 +89,13 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
             return None;
         }
         if sources.iter().all(|source| match source {
-            FlexInlineSource::Node(node) => !self.contents_text_styles.contains_key(node),
+            FlexInlineSource::Node(node) => self.contents_text_style(*node).is_none(),
             FlexInlineSource::GeneratedPseudo { .. } => false,
         }) {
             let mut nodes = sources
                 .drain(..)
                 .map(|source| match source {
-                    FlexInlineSource::Node(node) => node.raw(),
+                    FlexInlineSource::Node(node) => node,
                     FlexInlineSource::GeneratedPseudo { .. } => unreachable!(),
                 })
                 .collect();
@@ -96,16 +105,16 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
         let whitespace_only = sources.iter().all(|source| match *source {
             FlexInlineSource::Node(node) => {
                 let collapsible = self
-                    .contents_text_styles
-                    .get(&node)
-                    .copied()
+                    .contents_text_style(node)
                     .and_then(|style| self.styles.view(style))
                     .is_none_or(|style| !style.white_space().preserves_spaces());
                 collapsible
                     && self
                         .document
                         .text_ref(node)
-                        .is_some_and(|text| text.text().chars().all(char::is_whitespace))
+                        .text()
+                        .chars()
+                        .all(char::is_whitespace)
             }
             FlexInlineSource::GeneratedPseudo { .. } => false,
         });

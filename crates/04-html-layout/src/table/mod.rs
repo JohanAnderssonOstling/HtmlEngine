@@ -1,20 +1,21 @@
-//! Reading order: coordinator (00), sizing stages (01–05), final placement (06).
-//! Shared stage contracts, helpers, and tests are unnumbered.
+//! Stage 00 coordinates grid preparation, intrinsic/column sizing, cells, rows, and placement.
+//! Intrinsic queries and cell probes can revisit earlier stages; numbering is a reading order.
+//! Shared stage contracts and helpers support each stage.
 
-#[path = "03-column_sizing.rs"]
-mod column_sizing;
-#[path = "01-grid.rs"]
-mod grid;
-#[path = "02-intrinsic.rs"]
-mod intrinsic;
 #[path = "00-layout.rs"]
-mod layout;
-#[path = "06-placement.rs"]
-mod placement;
-#[path = "05-row_sizing.rs"]
-mod row_sizing;
+mod s00_layout;
+#[path = "01-grid.rs"]
+mod s01_grid;
+#[path = "02-intrinsic.rs"]
+mod s02_intrinsic;
+#[path = "03-column_sizing.rs"]
+mod s03_column_sizing;
 #[path = "04-rows.rs"]
-mod rows;
+mod s04_rows;
+#[path = "05-row_sizing.rs"]
+mod s05_row_sizing;
+#[path = "06-placement.rs"]
+mod s06_placement;
 
 mod backgrounds;
 mod borders;
@@ -22,9 +23,10 @@ mod captions;
 mod columns;
 
 use columns::TableColumnLayout;
-use grid::PreparedTableGrid;
+use crate::layout::UsedBorderInsets;
+use s01_grid::PreparedTableGrid;
 use kurbo::Point;
-use rows::PreparedTableCells;
+use s04_rows::PreparedTableCells;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum TableDimensionBasis {
@@ -32,9 +34,10 @@ enum TableDimensionBasis {
     AuthoredContentBox,
 }
 
-struct TableLayoutInput {
+struct TableLayoutInput<'tree> {
     table_box_idx: usize,
-    rows: Vec<u32>,
+    grid_insets: UsedBorderInsets,
+    rows: &'tree [u32],
     content_pos: Point,
     content_width: f64,
     parent_content_height: Option<f64>,
@@ -44,10 +47,10 @@ struct TableLayoutInput {
     block_basis: TableDimensionBasis,
 }
 
-struct TableStructure {
-    row_groups: Vec<u32>,
-    captions_top: Vec<u32>,
-    captions_bottom: Vec<u32>,
+struct TableStructure<'tree> {
+    row_groups: &'tree [u32],
+    captions_top: &'tree [u32],
+    captions_bottom: &'tree [u32],
 }
 
 /// Complete resolved decision for a non-empty table grid.
@@ -56,9 +59,9 @@ struct TableStructure {
 /// while block-basis-dependent cells remain isolated probes. Publication
 /// consumes this value in one direction, applies final row transforms, and
 /// never recomputes ordinary cell layout.
-struct ResolvedTablePlan {
-    input: TableLayoutInput,
-    structure: TableStructure,
+struct ResolvedTablePlan<'tree> {
+    input: TableLayoutInput<'tree>,
+    structure: TableStructure<'tree>,
     prepared: PreparedTableGrid,
     columns: TableColumnLayout,
     cells: PreparedTableCells,
@@ -70,8 +73,8 @@ struct ResolvedTablePlan {
     table_height: f64,
 }
 
-pub use intrinsic::table_intrinsic_widths;
-pub use layout::layout_table;
-pub use rows::layout_table_row;
+pub use s02_intrinsic::table_intrinsic_widths;
+pub use s00_layout::layout_table;
+pub use s04_rows::layout_table_row;
 
 include!("tests.rs");

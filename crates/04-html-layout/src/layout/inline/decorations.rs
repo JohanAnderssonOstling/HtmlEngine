@@ -3,7 +3,7 @@ use super::super::border_geometry::{
     emit_horizontal_pattern, emit_outline_fragments, physical_borders,
 };
 use super::super::decorations::DecorationEmitter;
-use crate::layout_model::{Line, LineInlineBoxFragment};
+use html_engine_model::{Line, LineInlineBoxFragment};
 use html_style_model::BorderStyle;
 use kurbo::Rect;
 

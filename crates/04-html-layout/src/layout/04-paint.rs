@@ -1,14 +1,12 @@
 //! Replay retained commands using finalized geometry, without a layout executor.
 use super::decorations::DecorationEmitter;
-use super::finalization::{
+use super::s03_finalize::{
     FinalizationScratch,
     ordering::{
         build_block_decoration_traversal, build_scene_paint_order,
-        rebuild_decoration_fragments_by_line,
-    },
-};
+        rebuild_decoration_fragments_by_line}};
 use super::{FragmentWriter, LayoutReader};
-use crate::layout_model::{BoxGeometry, InlineContent};
+use html_engine_model::{BoxGeometry, InlineContent};
 
 pub(super) fn replay(
     reader: &LayoutReader<'_>,
@@ -17,10 +15,10 @@ pub(super) fn replay(
     fragments: &mut FragmentWriter<'_>,
     scratch: &mut FinalizationScratch,
 ) {
-    profile_scope!("layout.paint_replay");
     let commands = std::mem::take(&mut fragments.state_mut().paint_program.commands);
     let output = &mut fragments.state_mut().fragment_output;
     output.decorations.clear();
+    output.block_decoration_owners.clear();
     output.decoration_line_indices.clear();
     output.decoration_paint_orders.clear();
     output.decoration_paint_layers.clear();
@@ -41,7 +39,8 @@ pub(super) fn replay(
     rebuild_decoration_fragments_by_line(fragments);
     build_scene_paint_order(reader, fragments);
     if reader.tracks_overflow_clips() {
-        let (layout, owners) = fragments.decoration_parts();
+        let layout = fragments.state_mut();
+        let owners = &layout.fragment_output.block_decoration_owners;
         layout
             .fragment_output
             .decoration_clips
@@ -56,5 +55,11 @@ pub(super) fn replay(
                 })
             }));
     }
+    // Inline owners are needed for clipping during replay; the published
+    // owner index covers the block-decoration prefix only.
+    let output = &mut fragments.state_mut().fragment_output;
+    output
+        .block_decoration_owners
+        .truncate(output.block_decoration_count as usize);
     fragments.state_mut().paint_program.commands = commands;
 }

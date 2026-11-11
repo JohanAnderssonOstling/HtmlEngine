@@ -10,6 +10,7 @@ autobins = false
 
 [features]
 default = ["skrift"]
+reader-resize = ["skrift", "dep:html-view-gpui", "dep:skrift-column-paginator"]
 skrift = ["dep:html-dom", "dep:html-render-core", "dep:data-url", "dep:html", "dep:html-gpui", "dep:html-pipeline", "dep:html-resources", "dep:kurbo"]
 wry-in-gpui = ["dep:gtk", "dep:cairo-rs", "dep:webkit2gtk", "dep:wry", "dep:url", "dep:percent-encoding", "dep:raw-window-handle"]
 
@@ -28,16 +29,28 @@ name = "embed-bench-gpui-wry-size"
 path = "src/wry_size.rs"
 required-features = ["wry-in-gpui"]
 
+[[bin]]
+name = "gpui-pipeline-profile"
+path = "src/pipeline_profile.rs"
+required-features = ["skrift"]
+
+[[bin]]
+name = "gpui-reader-resize"
+path = "src/reader_resize.rs"
+required-features = ["reader-resize"]
+
 [dependencies]
+html-view-gpui = { path = "../../../../HtmlViewCore/adapters/html-view-gpui", optional = true }
+skrift-column-paginator = { path = "../../../../HtmlViewCore/crates/skrift-column-paginator", optional = true }
 html-dom = { version = "0.1.0", package = "skrift-dom", path = "../../../crates/html-dom", optional = true }
 html-render-core = { version = "0.1.0", package = "skrift-render-core", path = "../../../crates/05-html-render-core", optional = true }
 html-engine-model = { package = "skrift-engine-model", path = "../../../crates/html-engine-model" }
 anyhow = "1"
 async-channel = "2"
 data-url = { version = "0.3", optional = true }
-gpui = { path = "../../../../GPUI-Fork/crates/gpui", default-features = false, features = ["font-kit", "wayland", "x11", "snapshot", "windows-manifest"] }
+gpui = { path = "../../../../GPUI-Fork/crates/gpui", default-features = false, features = ["font-kit", "wayland", "x11", "windows-manifest"] }
 gpui_platform = { path = "../../../../GPUI-Fork/crates/gpui_platform", features = ["wayland", "x11"] }
-gpui_linux = { path = "../../../../GPUI-Fork/crates/gpui_linux", features = ["snapshot"] }
+gpui_linux = { path = "../../../../GPUI-Fork/crates/gpui_linux" }
 gpui_wgpu = { path = "../../../../GPUI-Fork/crates/gpui_wgpu", features = ["font-kit"] }
 html = { version = "0.1.0", package = "skrift", path = "../../../crates/html", optional = true }
 html-gpui = { path = "../../../adapters/html-gpui", optional = true }
@@ -57,3 +70,9 @@ raw-window-handle = { version = "0.6", optional = true }
 
 [patch."https://github.com/JohanAnderssonOstling/HtmlEngine"]
 skrift = { path = "../../../crates/html" }
+
+# Match the font stack used by the application and local GPUI fork.
+[patch.crates-io]
+cosmic-text = { path = "../../../../Html-Prototype/vendor/cosmic-text" }
+harfrust = { path = "../../../../Html-Prototype/vendor/harfrust" }
+swash = { path = "../../../../Html-Prototype/vendor/swash" }

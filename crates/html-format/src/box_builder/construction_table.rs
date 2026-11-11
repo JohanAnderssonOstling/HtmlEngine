@@ -6,10 +6,18 @@ use html_dom::ElementRef;
 impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
     pub(super) fn build_table_children_from_nodes(
         &mut self,
-        children: impl IntoIterator<Item = u32>,
+        children: impl IntoIterator<Item = DomNodeId>,
         table_box_idx: u32,
     ) {
         let plan = plan_table_children(self.document, self.styles, children);
+        self.materialize_table_plan(plan, table_box_idx);
+    }
+
+    pub(super) fn materialize_table_plan(
+        &mut self,
+        plan: super::table::TableChildrenPlan,
+        table_box_idx: u32,
+    ) {
         let mut header_rows = Vec::new();
         let mut body_rows = Vec::new();
         let mut footer_rows = Vec::new();
@@ -23,12 +31,15 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
                 TableChildAction::Anonymous(nodes) => {
                     self.materialize_anonymous_table_children(nodes, table_box_idx, &mut body_rows)
                 }
-                TableChildAction::Principal { node, role } => {
-                    let group_display = self
-                        .document
-                        .element_ref(node)
-                        .map(|element| display_for_element(self.styles, element));
-                    if let Some(box_idx) = self.build_box_for_element(node, Some(table_box_idx)) {
+                TableChildAction::Principal {
+                    node,
+                    role,
+                    classification,
+                } => {
+                    let group_display = classification.display;
+                    if let Some(box_idx) =
+                        self.build_classified_element(node, Some(table_box_idx), classification)
+                    {
                         match role {
                             TableRole::Caption(html_style_model::CaptionSide::Bottom) => {
                                 captions_bottom.push(box_idx)
@@ -39,10 +50,10 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
                             TableRole::Row => body_rows.push(box_idx),
                             TableRole::RowGroup => {
                                 let (rows, groups) = match group_display {
-                                    Some(Display::TableHeaderGroup) if header_groups.is_empty() => {
+                                    Display::TableHeaderGroup if header_groups.is_empty() => {
                                         (&mut header_rows, &mut header_groups)
                                     }
-                                    Some(Display::TableFooterGroup) if footer_groups.is_empty() => {
+                                    Display::TableFooterGroup if footer_groups.is_empty() => {
                                         (&mut footer_rows, &mut footer_groups)
                                     }
                                     _ => (&mut body_rows, &mut body_groups),
@@ -95,17 +106,14 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
     /// contributes to table intrinsic sizing instead of being dropped.
     pub(super) fn materialize_anonymous_table_children(
         &mut self,
-        nodes: Vec<u32>,
+        nodes: Vec<DomNodeId>,
         table_box_idx: u32,
         rows: &mut Vec<u32>,
     ) {
         if nodes.iter().any(|&raw| {
-            self.document
-                .node_id_from_raw(raw)
-                .and_then(|node| self.document.element_ref(node))
-                .is_some_and(|element| {
-                    display_for_element(self.styles, element) == Display::TableCell
-                })
+            self.document.try_element_ref(raw).is_some_and(|element| {
+                display_for_element(self.styles, element) == Display::TableCell
+            })
         }) {
             let row_idx = self.output.push_anonymous_row(table_box_idx);
             self.build_row_children(nodes, row_idx);
@@ -130,7 +138,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
 
     pub(super) fn build_row_children(
         &mut self,
-        nodes: impl IntoIterator<Item = u32>,
+        nodes: impl IntoIterator<Item = DomNodeId>,
         row_box_idx: u32,
     ) {
         let mut row = TableRowBox::default();
@@ -173,7 +181,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
         for node in element.children() {
             let display = self
                 .document
-                .element_ref(node)
+                .try_element_ref(node)
                 .map(|element| display_for_element(self.styles, element));
             match display {
                 Some(Display::TableRow) => {
@@ -185,7 +193,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
                     rows.extend(self.build_box_for_element(node, Some(group_box_idx)));
                 }
                 Some(Display::None) => {}
-                _ => anonymous.push(node.raw()),
+                _ => anonymous.push(node),
             }
         }
         self.materialize_anonymous_group_row(anonymous, group_box_idx, &mut rows);
@@ -195,15 +203,14 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
 
     pub(super) fn materialize_anonymous_group_row(
         &mut self,
-        nodes: Vec<u32>,
+        nodes: Vec<DomNodeId>,
         group_box_idx: u32,
         rows: &mut Vec<u32>,
     ) {
         if nodes.is_empty()
             || nodes.iter().all(|&raw| {
                 self.document
-                    .node_id_from_raw(raw)
-                    .and_then(|node| self.document.text_ref(node))
+                    .try_text_ref(raw)
                     .is_some_and(|text| text.text().chars().all(char::is_whitespace))
             })
         {
@@ -258,11 +265,11 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
                         }
                     }
                     AnonymousCellPart::Block(node)
-                        if self.document.element_ref(node).is_some_and(|element| {
+                        if self.document.try_element_ref(node).is_some_and(|element| {
                             display_for_element(self.styles, element).is_table_internal()
                         }) =>
                     {
-                        table_segment.push(node.raw());
+                        table_segment.push(node);
                     }
                     AnonymousCellPart::Block(node) => {
                         direct_children.extend(

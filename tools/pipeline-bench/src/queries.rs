@@ -2,12 +2,8 @@
 //! Run query_search, query_table, query_roles, and query_restore with the usual
 //! fixture/count arguments. Table mode uses a fixed 500-row, eight-column table.
 
-use html_pipeline::engine::search_queries;
-use html_pipeline::engine::text_paint;
 use html_engine_model::layout_state;
-use html_pipeline::engine::semantic_queries;
 use html_pipeline::engine::GlyphResourceStore;
-use html_pipeline::engine::box_queries;
 
 use crate::{Shaper, access::measure, layout_fingerprint};
 use html_pipeline::engine::LayoutConstraints;
@@ -51,29 +47,21 @@ pub(super) fn run(path: &str, case: &str, count: usize) {
     let mut observed = 0;
     let mut result = match case {
         "query_search" => measure(count, || {
-            observed = black_box(search_queries::render_text_view_find_matches(
-                view.text(),
-                black_box("the"),
-                TextSearchOptions {
+            observed = black_box((view.text()).find_matches(black_box("the"), TextSearchOptions {
                     whole_word: true,
                     ..Default::default()
-                },
-            ))
+                }))
             .len();
         }),
         "query_roles" => measure(count, || {
-            observed = text_paint::render_text_view_text_runs(view.text())
+            observed = (view.text()).text_runs()
                 .filter_map(|run| {
-                    black_box(semantic_queries::render_semantics_view_nearest(
-                        semantic_queries::render_view_semantics(view),
-                        black_box(text_paint::render_text_run_box_id(&run)),
-                        ContentRole::ListItem,
-                    ))
+                    black_box((view.semantics()).nearest(black_box(run.box_id()), ContentRole::ListItem))
                 })
                 .count();
         }),
         "query_restore" => {
-            let locations = text_paint::render_text_view_text_runs(view.text())
+            let locations = (view.text()).text_runs()
                 .step_by(100)
                 .filter_map(|run| {
                     view.addressing()
@@ -100,9 +88,9 @@ pub(super) fn run(path: &str, case: &str, count: usize) {
             })
         }
         "query_table" => {
-            let table = (0..box_queries::len(view.boxes()))
+            let table = (0..(view.boxes()).len())
                 .map(layout_state::box_id_new)
-                .find(|&index| box_queries::is_table(view.boxes(), index))
+                .find(|&index| (view.boxes()).is_table(index))
                 .unwrap();
             measure(count, || {
                 let table = view.boxes().table(black_box(table)).unwrap();

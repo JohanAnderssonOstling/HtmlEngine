@@ -2,19 +2,18 @@
 use html_engine_model::layout_state;
 #[cfg(test)]
 mod tests {
-    use html_pipeline::engine::fragment_paint;
+    use html_pipeline::engine::LayoutRequest;
 
-    use html_pipeline::engine::text_paint;
 
-    use html_pipeline::engine::box_queries;
 
-    use crate::GlyphResourceStore;
-    use crate::layout_model::BoxId;
+    use html_engine_model::GlyphResourceStore;
+    use html_engine_model::BoxId;
 
     use super::columns::build_table_grid;
     use crate::parser::DocumentFactory;
     use crate::test_support::TestGlyphShaper;
-    use crate::{LaidOutDocument, LayoutConstraints};
+    use html_engine_model::{LayoutConstraints};
+    use crate::{LaidOutDocument};
 
     fn layout_html(
         html: &str,
@@ -36,7 +35,11 @@ mod tests {
             .parse_with_new_pipeline(html, css)
             .shape(&mut glyphs, resources)
             .expect("test glyphs shape")
-            .layout(LayoutConstraints::new(width, 16.0).unwrap(), resources)
+            .layout(
+                LayoutRequest::new(LayoutConstraints::new(width, 16.0).unwrap()),
+                &mut glyphs,
+                resources,
+            )
             .expect("layout requires the shaper-aware API for first-line styles")
     }
 
@@ -56,7 +59,7 @@ mod tests {
             .parse_with_new_pipeline(html, None)
             .shape(&mut glyphs, resources)
             .expect("test glyphs shape")
-            .layout(constraints, resources)
+            .layout(LayoutRequest::new(constraints), &mut glyphs, resources)
             .expect("layout requires the shaper-aware API for first-line styles")
     }
 
@@ -72,7 +75,11 @@ mod tests {
             .parse_with_new_pipeline(html, None)
             .shape(&mut glyphs, resources)
             .expect("test glyphs shape")
-            .layout(LayoutConstraints::new(width, 16.0).unwrap(), resources)
+            .layout(
+                LayoutRequest::new(LayoutConstraints::new(width, 16.0).unwrap()),
+                &mut glyphs,
+                resources,
+            )
             .expect("layout requires the shaper-aware API for first-line styles")
     }
 
@@ -82,11 +89,11 @@ mod tests {
         resources: &GlyphResourceStore,
     ) -> kurbo::Size {
         let view = document.render_view(resources);
-        let index = (0..box_queries::len(view.boxes()))
+        let index = (0..(view.boxes()).len())
             .map(layout_state::box_id_new)
-            .find(|&index| box_queries::attribute(view.boxes(), index, "id") == Some(id))
+            .find(|&index| (view.boxes()).attribute(index, "id") == Some(id))
             .unwrap_or_else(|| panic!("layout box #{id} should exist"));
-        box_queries::render_box_view_size(view.boxes(), index).expect("box index in range")
+        (view.boxes()).size(index).expect("box index in range")
     }
 
     fn box_point_by_id(
@@ -95,11 +102,11 @@ mod tests {
         resources: &GlyphResourceStore,
     ) -> kurbo::Point {
         let view = document.render_view(resources);
-        let index = (0..box_queries::len(view.boxes()))
+        let index = (0..(view.boxes()).len())
             .map(layout_state::box_id_new)
-            .find(|&index| box_queries::attribute(view.boxes(), index, "id") == Some(id))
+            .find(|&index| (view.boxes()).attribute(index, "id") == Some(id))
             .unwrap_or_else(|| panic!("layout box #{id} should exist"));
-        box_queries::render_box_view_point(view.boxes(), index).expect("box index in range")
+        (view.boxes()).point(index).expect("box index in range")
     }
 
     fn decoration_rects_by_color(
@@ -107,9 +114,9 @@ mod tests {
         color: u32,
         resources: &GlyphResourceStore,
     ) -> Vec<kurbo::Rect> {
-        fragment_paint::decorations(document.render_view(resources).fragments())
+        (document.render_view(resources).fragments()).decorations()
             .iter()
-            .filter(|fragment| fragment_paint::decoration_color(&fragment) == color)
+            .filter(|fragment| fragment.color() == color)
             .map(|fragment| fragment.rect())
             .collect()
     }
@@ -119,161 +126,12 @@ mod tests {
         color: u32,
         resources: &GlyphResourceStore,
     ) -> Vec<usize> {
-        fragment_paint::decorations(document.render_view(resources).fragments())
+        (document.render_view(resources).fragments()).decorations()
             .iter()
             .enumerate()
-            .filter(|(_, fragment)| fragment_paint::decoration_color(&fragment) == color)
+            .filter(|(_, fragment)| fragment.color() == color)
             .map(|(index, _)| index)
             .collect()
-    }
-
-    #[test]
-    fn parallel_cell_measurement_matches_sequential_layout() {
-        let mut html = String::from(
-            "<html><body style='margin:0'><table style='width:320px;border-collapse:collapse'>",
-        );
-        for row in 0..4 {
-            html.push_str("<tr>");
-            for column in 0..2 {
-                html.push_str(&format!("<td id='cell-{row}-{column}' style='padding:3px;border:1px solid'><div style='height:50%;overflow:hidden'>"));
-                for word in 0..96 {
-                    html.push_str(&format!(" deterministic{word}"));
-                }
-                html.push_str("</div></td>");
-            }
-            html.push_str("</tr>");
-        }
-        html.push_str("</table></body></html>");
-        let mut factory = DocumentFactory::new();
-        let mut glyphs = TestGlyphShaper::new();
-        let prepared = factory.parse_with_new_pipeline(&html, None);
-        let mut sequential_resources = GlyphResourceStore::default();
-        let sequential = prepared
-            .shape_borrowed(&mut glyphs, &mut sequential_resources)
-            .expect("test glyphs shape")
-            .layout(
-                LayoutConstraints::new(360.0, 16.0).unwrap(),
-                &sequential_resources,
-            )
-            .expect("layout requires the shaper-aware API for first-line styles");
-        let workers = std::thread::available_parallelism()
-            .map_or(1, usize::from)
-            .min(4);
-        html_pipeline::layout_testing::reset_observed_workers();
-        let mut parallel_resources = GlyphResourceStore::default();
-        let parallel = prepared
-            .shape_borrowed(&mut TestGlyphShaper::new(), &mut parallel_resources)
-            .expect("test glyphs shape")
-            .layout(
-                LayoutConstraints::new(360.0, 16.0)
-                    .unwrap()
-                    .with_parallel_workers(workers),
-                &parallel_resources,
-            )
-            .expect("layout requires the shaper-aware API for first-line styles");
-        if workers > 1 {
-            assert!(
-                html_pipeline::layout_testing::observed_worker_count() > 1,
-                "measurement must execute on multiple worker threads"
-            );
-        }
-
-        let sequential_view = sequential.render_view(&sequential_resources);
-        let parallel_view = parallel.render_view(&parallel_resources);
-        assert_eq!(
-            box_queries::len(sequential_view.boxes()),
-            box_queries::len(parallel_view.boxes())
-        );
-        for box_idx in 0..box_queries::len(sequential_view.boxes()) {
-            assert_eq!(
-                box_queries::render_box_view_point(
-                    sequential_view.boxes(),
-                    layout_state::box_id_new(box_idx)
-                ),
-                box_queries::render_box_view_point(
-                    parallel_view.boxes(),
-                    layout_state::box_id_new(box_idx)
-                )
-            );
-            assert_eq!(
-                box_queries::render_box_view_size(
-                    sequential_view.boxes(),
-                    layout_state::box_id_new(box_idx)
-                ),
-                box_queries::render_box_view_size(
-                    parallel_view.boxes(),
-                    layout_state::box_id_new(box_idx)
-                )
-            );
-        }
-        let sequential_lines = sequential_view
-            .text()
-            .lines()
-            .iter()
-            .map(|line| {
-                (
-                    text_paint::render_line_owner_box(&line),
-                    text_paint::render_line_glyphs(&line),
-                    line.point(),
-                    line.height(),
-                    text_paint::line_baseline(&line),
-                )
-            })
-            .collect::<Vec<_>>();
-        let parallel_lines = parallel_view
-            .text()
-            .lines()
-            .iter()
-            .map(|line| {
-                (
-                    text_paint::render_line_owner_box(&line),
-                    text_paint::render_line_glyphs(&line),
-                    line.point(),
-                    line.height(),
-                    text_paint::line_baseline(&line),
-                )
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(sequential_lines, parallel_lines);
-        let sequential_decorations = fragment_paint::decorations(sequential_view.fragments())
-            .iter()
-            .map(|fragment| (fragment.rect(), fragment_paint::decoration_color(&fragment)))
-            .collect::<Vec<_>>();
-        let parallel_decorations = fragment_paint::decorations(parallel_view.fragments())
-            .iter()
-            .map(|fragment| (fragment.rect(), fragment_paint::decoration_color(&fragment)))
-            .collect::<Vec<_>>();
-        assert_eq!(sequential_decorations, parallel_decorations);
-    }
-
-    #[test]
-    fn small_cell_measurements_stay_sequential_below_the_work_threshold() {
-        let mut html = String::from("<html><body><table>");
-        for _ in 0..4 {
-            html.push_str("<tr><td><div style='height:50%;overflow:hidden'>a</div></td><td><div style='height:50%;overflow:hidden'>b</div></td></tr>");
-        }
-        html.push_str("</table></body></html>");
-        let mut factory = DocumentFactory::new();
-        let mut glyphs = TestGlyphShaper::new();
-        let mut shaped_resources = GlyphResourceStore::default();
-        let shaped = factory
-            .parse_with_new_pipeline(&html, None)
-            .shape(&mut glyphs, &mut shaped_resources)
-            .expect("test glyphs shape");
-        html_pipeline::layout_testing::reset_observed_workers();
-        let _ = shaped
-            .layout(
-                LayoutConstraints::new(360.0, 16.0)
-                    .unwrap()
-                    .with_parallel_workers(4),
-                &shaped_resources,
-            )
-            .expect("layout requires the shaper-aware API for first-line styles");
-        assert_eq!(
-            html_pipeline::layout_testing::observed_worker_count(),
-            0,
-            "small tables must avoid parallel dispatch overhead"
-        );
     }
 
     #[test]
@@ -1100,7 +958,7 @@ mod tests {
             .filter(|&index| {
                 matches!(
                     document.box_layout_mode(index),
-                    Some(crate::layout_model::LayoutMode::Table(_))
+                    Some(html_engine_model::LayoutMode::Table(_))
                 )
             })
             .collect::<Vec<_>>();
@@ -1111,14 +969,19 @@ mod tests {
         );
         let boxes = document.render_view(&document_resources).boxes();
         assert_eq!(
-            box_queries::render_box_view_size(boxes, layout_state::box_id_new(tables[0])),
-            box_queries::render_box_view_size(boxes, layout_state::box_id_new(tables[1])),
+            boxes.size(layout_state::box_id_new(tables[0])),
+            boxes.size(layout_state::box_id_new(tables[1])),
             "the inferred CSS table and equivalent native table must resolve the same used size"
         );
         let rows = tables
             .iter()
             .map(|&table| match document.box_layout_mode(table) {
-                Some(crate::layout_model::LayoutMode::Table(table)) => table.rows.clone(),
+                Some(html_engine_model::LayoutMode::Table(table)) => document
+                    .layout_tree()
+                    .table(*table)
+                    .expect("table payload")
+                    .rows
+                    .clone(),
                 _ => unreachable!(),
             })
             .collect::<Vec<_>>();
@@ -1126,45 +989,33 @@ mod tests {
         for row in 0..rows[0].len() {
             let cells = [rows[0][row], rows[1][row]].map(|row| {
                 match document.box_layout_mode(row as usize) {
-                    Some(crate::layout_model::LayoutMode::TableRow(row)) => row.cells.clone(),
+                    Some(html_engine_model::LayoutMode::TableRow(row)) => row.cells.clone(),
                     _ => panic!("table row should retain its cells"),
                 }
             });
             assert_eq!(cells[0].len(), cells[1].len());
             for column in 0..cells[0].len() {
                 assert_eq!(
-                    box_queries::render_box_view_size(
-                        boxes,
-                        layout_state::box_id_new(cells[0][column] as usize)
-                    ),
-                    box_queries::render_box_view_size(
-                        boxes,
-                        layout_state::box_id_new(cells[1][column] as usize)
-                    ),
+                    boxes.size(layout_state::box_id_new(cells[0][column] as usize)),
+                    boxes.size(layout_state::box_id_new(cells[1][column] as usize)),
                     "row {row}, column {column}"
                 );
-                let first_offset = box_queries::render_box_view_point(
-                    boxes,
-                    layout_state::box_id_new(cells[0][column] as usize),
-                )
-                .unwrap()
-                .y - box_queries::render_box_view_point(
-                    boxes,
-                    layout_state::box_id_new(tables[0]),
-                )
-                .unwrap()
-                .y;
-                let second_offset = box_queries::render_box_view_point(
-                    boxes,
-                    layout_state::box_id_new(cells[1][column] as usize),
-                )
-                .unwrap()
-                .y - box_queries::render_box_view_point(
-                    boxes,
-                    layout_state::box_id_new(tables[1]),
-                )
-                .unwrap()
-                .y;
+                let first_offset = (boxes)
+                    .point(layout_state::box_id_new(cells[0][column] as usize))
+                    .unwrap()
+                    .y
+                    - (boxes)
+                        .point(layout_state::box_id_new(tables[0]))
+                        .unwrap()
+                        .y;
+                let second_offset = (boxes)
+                    .point(layout_state::box_id_new(cells[1][column] as usize))
+                    .unwrap()
+                    .y
+                    - (boxes)
+                        .point(layout_state::box_id_new(tables[1]))
+                        .unwrap()
+                        .y;
                 assert!(
                     (first_offset - second_offset).abs() < 0.01,
                     "row {row}, column {column} vertical offset: {first_offset} vs {second_offset}"
@@ -2105,12 +1956,7 @@ mod tests {
             std::env::var("HTML_LAYOUT_BENCH_CASE").unwrap_or_else(|_| "ordinary".to_owned());
         let with_captions = case == "captioned";
         let dependent_cells = case == "dependent-cells";
-        let parallel_cells = case == "parallel-cells";
-        let workers = std::env::var("HTML_LAYOUT_BENCH_WORKERS")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(1)
-            .max(1);
+        let large_cells = case == "large-cells";
 
         let mut html = String::from("<html><body style='margin:0;font:16px monospace'>");
         for table in 0..16 {
@@ -2121,9 +1967,9 @@ mod tests {
             for row in 0..8 {
                 html.push_str("<tr>");
                 for column in 0..6 {
-                    if dependent_cells || parallel_cells {
+                    if dependent_cells || large_cells {
                         html.push_str(&format!("<td style='padding:2px;border:1px solid'><div style='height:50%;overflow:hidden'>T{table} R{row} C{column}"));
-                        if parallel_cells {
+                        if large_cells {
                             for word in 0..48 {
                                 html.push_str(&format!(" measurement{word}"));
                             }
@@ -2149,15 +1995,22 @@ mod tests {
         let constraints = |width| {
             LayoutConstraints::new(width, 16.0)
                 .unwrap()
-                .with_parallel_workers(workers)
         };
         let mut document = shaped
-            .layout(constraints(800.0), &shaped_resources)
+            .layout(
+                LayoutRequest::new(constraints(800.0)),
+                &mut glyphs,
+                &mut shaped_resources,
+            )
             .expect("layout requires the shaper-aware API for first-line styles");
         for iteration in 0..warmup {
             let width = if iteration % 2 == 0 { 800.0 } else { 801.0 };
             document
-                .relayout(constraints(width), &shaped_resources)
+                .relayout(
+                    LayoutRequest::new(constraints(width)),
+                    &mut glyphs,
+                    &mut shaped_resources,
+                )
                 .expect("layout requires the shaper-aware API for first-line styles");
         }
 
@@ -2165,22 +2018,23 @@ mod tests {
         for iteration in 0..iterations {
             let width = if iteration % 2 == 0 { 800.0 } else { 801.0 };
             document
-                .relayout(constraints(width), &shaped_resources)
+                .relayout(
+                    LayoutRequest::new(constraints(width)),
+                    &mut glyphs,
+                    &mut shaped_resources,
+                )
                 .expect("layout requires the shaper-aware API for first-line styles");
         }
         let elapsed = started.elapsed();
         let view = document.render_view(&shaped_resources);
-        let checksum = box_queries::len(view.boxes())
+        let checksum = (view.boxes()).len()
             + view.text().lines().len()
-            + fragment_paint::render_decorations_len(&fragment_paint::decorations(
-                view.fragments(),
-            ))
-            + fragment_paint::render_fragment_view_images(view.fragments()).len();
+            + ((view.fragments()).decorations()).len()
+            + (view.fragments()).images().len();
         std::hint::black_box(checksum);
         println!(
-            "TABLE_BENCH case={} workers={} iterations={} total_ns={} ns_per_relayout={} checksum={checksum}",
+            "TABLE_BENCH case={} iterations={} total_ns={} ns_per_relayout={} checksum={checksum}",
             case,
-            workers,
             iterations,
             elapsed.as_nanos(),
             elapsed.as_nanos() / iterations.max(1) as u128,

@@ -130,16 +130,6 @@ impl TokenArenas {
             deferred_hyphens: None,
         }
     }
-
-    fn shrink_to_fit(&mut self) {
-        self.dense.shrink_to_fit();
-        self.runs.shrink_to_fit();
-        self.summaries.shrink_to_fit();
-        self.replaced.shrink_to_fit();
-        self.metrics_ranges.shrink_to_fit();
-        self.metadata.shrink_to_fit();
-        self.widths.shrink_to_fit();
-    }
 }
 
 struct PreparedInlinePlan {
@@ -233,8 +223,7 @@ impl GenerationPlans {
             }
             self.needs_compaction = false;
         }
-        self.arenas.shrink_to_fit();
-        self.entries.shrink_to_fit();
+        // Keep spare capacity reusable across layouts.
         self.initial_token_capacity = 0;
     }
 }
@@ -266,17 +255,6 @@ impl InlinePlanCache {
                 ..Default::default()
             };
         }
-    }
-
-    pub(super) fn working_compact_tokens(&mut self, capacity: usize) -> InlineTokens<'static> {
-        let mut tokens = self.working.pop().unwrap_or_default();
-        tokens.metadata.reserve(capacity);
-        tokens.widths.reserve(capacity);
-        tokens
-            .summary_blocks
-            .reserve(capacity.div_ceil(INLINE_SUMMARY_BLOCK_TOKENS));
-        tokens.compact_defaults = Some(0);
-        tokens
     }
 
     pub(super) fn working_tokens(&mut self, capacity: usize) -> InlineTokens<'static> {
@@ -390,44 +368,6 @@ impl InlinePlanCache {
         // pass boundary so a single large/uncached paragraph is not retained
         // in addition to the retained arenas.
         self.working.clear();
-        self.working.shrink_to_fit();
-    }
-
-    pub(in crate::layout) fn merge(&mut self, mut worker: Self) {
-        for plans in [worker.active, worker.previous] {
-            let destination = if plans.generation == self.active.generation {
-                &mut self.active
-            } else if plans.generation == self.previous.generation {
-                &mut self.previous
-            } else {
-                continue;
-            };
-            if destination.entries.is_empty() {
-                *destination = plans;
-                continue;
-            }
-            for mut plan in plans.entries.into_iter().filter(|plan| plan.available) {
-                let mut tokens = plans.arenas.view(plan.ranges);
-                tokens.kp_plan = plan.kp_plan.take();
-                tokens.deferred_hyphens = plan.deferred_hyphens.take();
-                destination.insert(plan.key, &mut tokens);
-            }
-        }
-        // Worker count must not multiply idle working-buffer retention. Keep
-        // the largest useful buffer at each executor's existing nesting depth.
-        for tokens in worker.working.drain(..) {
-            if let Some(smallest) = self
-                .working
-                .iter_mut()
-                .min_by_key(|tokens| tokens.dense.capacity())
-            {
-                if tokens.dense.capacity() > smallest.dense.capacity() {
-                    *smallest = tokens;
-                }
-            } else {
-                self.working.push(tokens);
-            }
-        }
     }
 
     pub(in crate::layout) fn memory_usage_report(&self) -> MemoryUsageReport {
@@ -739,37 +679,6 @@ mod tests {
         });
         assert_eq!(allocations, 0);
         assert_eq!(cache.working.len(), 2);
-    }
-
-    #[test]
-    fn worker_transfer_rebases_ranges_and_generations_remain_bounded() {
-        let generation = InlinePlanGeneration::new();
-        let mut parent = InlinePlanCache::default();
-        parent.begin_generation(generation);
-        insert(&mut parent, 1, 7);
-        let mut worker = InlinePlanCache::default();
-        worker.begin_generation(generation);
-        insert(&mut worker, 2, 11);
-        parent.merge(worker);
-        assert_eq!(parent.len(), 2);
-        parent
-            .with_plan(key(2, false), |tokens| {
-                assert_eq!(tokens.dense.len(), 11);
-                assert_eq!(tokens.runs[0].owner_box_idx, 2);
-                assert_eq!(tokens.dense[0].run_idx(), 0);
-            })
-            .unwrap();
-        assert!(
-            parent.working.len() <= 1,
-            "workers must not multiply idle working buffers"
-        );
-        parent.begin_generation(InlinePlanGeneration::new());
-        insert(&mut parent, 3, 5);
-        parent.begin_generation(InlinePlanGeneration::new());
-        insert(&mut parent, 4, 9);
-        assert_eq!(parent.len(), 2, "only two shaping generations retain plans");
-        parent.begin_generation(generation);
-        assert!(parent.with_plan(key(1, false), |_| ()).is_none());
     }
 
     #[test]
