@@ -79,7 +79,7 @@ mod engine {
         ) -> Result<EarliestStage, PipelineError> {
             let stage = self.session.attach(glyph_shaper).update(inputs)?;
             self.sync_resources();
-            self.revisions.invalidate_from(stage);
+            crate::revisions::invalidate_from(&mut self.revisions, stage);
             Ok(stage)
         }
 
@@ -106,7 +106,7 @@ mod engine {
             if !was_published || stage <= EarliestStage::Prepare {
                 self.sync_resources();
             }
-            self.revisions.invalidate_from(stage);
+            crate::revisions::invalidate_from(&mut self.revisions, stage);
             Ok(stage)
         }
 

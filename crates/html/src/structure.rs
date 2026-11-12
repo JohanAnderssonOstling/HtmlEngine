@@ -105,6 +105,7 @@ pub(crate) struct BlockFacts {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SiblingPair {
     pub previous_bounds: Rect,
+    pub next_owner: BoxId,
     pub next_bounds: Rect,
     pub trigger_line: Option<usize>,
     pub forced_boundary: bool,
@@ -121,17 +122,7 @@ pub(crate) enum TableGroupKind {
     RowGroup {
         forced: bool,
         allow_content_break: bool,
-        header: Option<TableHeader>,
     },
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct TableHeader {
-    pub left: f64,
-    pub right: f64,
-    pub top: f64,
-    pub bottom: f64,
-    pub reserved: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -143,20 +134,18 @@ pub(crate) struct TableGroup {
     pub kind: TableGroupKind,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum HeaderPolicy {
-    #[default]
-    ExplicitOnly,
-    InferLeadingHeaderCells,
-}
-
 #[derive(Default)]
 struct TableScratch {
     groups: Vec<TableGroup>,
     table_indices: Vec<BoxId>,
     rows_by_table: Vec<(BoxId, Vec<BoxId>)>,
     row_spans: HashMap<BoxId, usize>,
-    leading_headers: Vec<BoxId>,
+}
+
+/// Inclusive cursor bounds for a box's indexed descendant lines.
+struct LineBounds {
+    first: usize,
+    last: usize,
 }
 
 /// Bounded structural anchors expressed as pagination traversal cursors.
@@ -165,11 +154,10 @@ struct TableScratch {
 struct BoundaryIndex {
     forced_preorder: Vec<u32>,
     block_parents: HashSet<BoxId>,
-    first_line: HashMap<BoxId, usize>,
+    line_bounds: HashMap<BoxId, LineBounds>,
     next_line: HashMap<BoxId, usize>,
     candidates: HashSet<BoxId>,
-    line_indices: Vec<usize>,
-    last_line: HashMap<BoxId, usize>,
+    line_range: Range<usize>,
     line_owners: Vec<(usize, BoxId)>,
     next_owner_lines: Vec<(BoxId, usize)>,
 }
@@ -180,14 +168,14 @@ impl StructureView<'_> {
     }
 
     pub(crate) fn first_line(&self, box_idx: BoxId) -> Option<usize> {
-        self.index.first_line.get(&box_idx).copied()
+        self.index.line_bounds.get(&box_idx).map(|bounds| bounds.first)
     }
 
     pub(crate) fn before(&self, box_idx: BoxId) -> Option<usize> {
         self.index
-            .first_line
+            .line_bounds
             .get(&box_idx)
-            .copied()
+            .map(|bounds| bounds.first)
             .or_else(|| self.index.next_line.get(&box_idx).copied())
     }
 
@@ -213,7 +201,7 @@ impl StructureView<'_> {
     }
 
     pub(crate) fn lines(&self) -> impl Iterator<Item = usize> + '_ {
-        self.index.line_indices.iter().copied()
+        self.index.line_range.clone()
     }
 
     pub(crate) fn authored_boundaries(&self) -> impl Iterator<Item = AuthoredBoundary> + '_ {
@@ -271,6 +259,8 @@ impl StructureView<'_> {
             .map(|box_idx| (boxes.parent(box_idx), box_idx))
             .collect();
         children.sort_unstable();
+        // The right sibling becomes the left sibling in the following pair.
+        let mut previous_roles: Option<(BoxId, ContentSemantics)> = None;
         children
             .windows(2)
             .filter_map(|pair| {
@@ -280,30 +270,35 @@ impl StructureView<'_> {
                 if parent != next_parent {
                     return None;
                 }
-                let previous_roles = semantics.content(*previous);
+                let left_roles = previous_roles
+                    .filter(|(owner, _)| owner == previous)
+                    .map_or_else(|| semantics.content(*previous), |(_, roles)| roles);
                 let next_roles = semantics.content(*next);
+                previous_roles = Some((*next, next_roles));
                 Some(SiblingPair {
                     previous_bounds: boxes.bounds(*previous)?,
+                    next_owner: *next,
                     next_bounds: boxes.bounds(*next)?,
                     trigger_line: self.before(*previous),
                     forced_boundary: boxes.forces_break_after(*previous)
                         || boxes.forces_break_before(*next),
                     avoid_boundary: boxes.avoids_break_after(*previous)
                         || boxes.avoids_break_before(*next),
-                    definition_pair: previous_roles.has_role(ContentRole::DefinitionTerm)
+                    definition_pair: left_roles.has_role(ContentRole::DefinitionTerm)
                         && next_roles.has_role(ContentRole::DefinitionDescription),
-                    statement_label_pair: parent.is_some_and(|parent| {
-                        semantics.has_role(parent, ContentRole::Statement)
-                    }) && previous_roles.has_role(ContentRole::Label),
-                    caption_pair: previous_roles.has_role(ContentRole::Caption)
+                    statement_label_pair: left_roles.has_role(ContentRole::Label)
+                        && parent.is_some_and(|parent| {
+                            semantics.has_role(parent, ContentRole::Statement)
+                        }),
+                    caption_pair: left_roles.has_role(ContentRole::Caption)
                         || next_roles.has_role(ContentRole::Caption),
-                    heading_following: previous_roles.has_role(ContentRole::Heading),
+                    heading_following: left_roles.has_role(ContentRole::Heading),
                 })
             })
             .collect()
     }
 
-    pub(crate) fn table_dependencies(&mut self, header_policy: HeaderPolicy) -> &[TableGroup] {
+    pub(crate) fn table_dependencies(&mut self) -> &[TableGroup] {
         let view = self.view;
         let anchors = self.index;
         let scratch = &mut *self.tables;
@@ -312,7 +307,6 @@ impl StructureView<'_> {
             table_indices,
             rows_by_table,
             row_spans,
-            leading_headers,
         } = scratch;
         events.clear();
         let root = view;
@@ -362,7 +356,8 @@ impl StructureView<'_> {
                 continue;
             };
             let table_bottom = table_point.y + table_size.height;
-            if let Some(&trigger_line) = anchors.first_line.get(&table_idx) {
+            if let Some(bounds) = anchors.line_bounds.get(&table_idx) {
+                let trigger_line = bounds.first;
                 events.push(TableGroup {
                     table_box: table_idx,
                     trigger_line,
@@ -377,71 +372,6 @@ impl StructureView<'_> {
                 let by = boxes.point(b).map_or(0.0, |point| point.y);
                 ay.total_cmp(&by).then_with(|| a.cmp(&b))
             });
-
-            // A repeated header is a visible dependency even when its source
-            // row is above this viewport. Inspect only the leading rows of the
-            // table and stop at its first body row; continuation depth never
-            // affects this work.
-            leading_headers.clear();
-            let contains = |scan: usize| {
-                scan < boxes.len()
-                    && (view.semantics()).contains(table_idx, layout_state::box_id_new(scan))
-            };
-            let mut scan = layout_state::box_id_index(table_idx) + 1;
-            while contains(scan) {
-                if !boxes.is_table_row(layout_state::box_id_new(scan)) {
-                    scan += 1;
-                    continue;
-                }
-                let row = layout_state::box_id_new(scan);
-                let explicit_header = boxes.ancestors(row)
-                    .take_while(|&ancestor| ancestor != table_idx)
-                    .any(|ancestor| boxes.is_table_header_group(ancestor));
-                let mut cell_count = 0usize;
-                let mut header_cell_count = 0usize;
-                scan += 1;
-                while contains(scan)
-                    && !boxes.is_table_row(layout_state::box_id_new(scan))
-                {
-                    let cell = layout_state::box_id_new(scan);
-                    if boxes.is_table_cell(cell)
-                        && boxes.ancestors(cell).any(|ancestor| ancestor == row)
-                    {
-                        cell_count += 1;
-                        if view.semantics()
-                            .content(cell)
-                            .has_role(ContentRole::TableHeaderCell)
-                        {
-                            header_cell_count += 1;
-                        }
-                    }
-                    scan += 1;
-                }
-                let inferred_header = header_policy == HeaderPolicy::InferLeadingHeaderCells
-                    && leading_headers.is_empty()
-                    && cell_count > 0
-                    && cell_count == header_cell_count;
-                if explicit_header || inferred_header {
-                    leading_headers.push(row);
-                } else {
-                    break;
-                }
-            }
-            let repeated_header = leading_headers
-                .first()
-                .zip(leading_headers.last())
-                .and_then(|(&first, &last)| {
-                    let top = boxes.point(first)?.y;
-                    let bottom = boxes.point(last)?.y
-                        + boxes.size(last)?.height;
-                    (bottom > top + 0.01).then_some(TableHeader {
-                        left: table_point.x,
-                        right: table_point.x + table_size.width,
-                        top,
-                        bottom,
-                        reserved: false,
-                    })
-                });
 
             let mut group_start = 0usize;
             while group_start < rows.len() {
@@ -466,7 +396,7 @@ impl StructureView<'_> {
                     .zip(boxes.size(last_row))
                     .map_or(group_top, |(point, size)| point.y + size.height);
                 if group_end == rows.len()
-                    && anchors.line_indices.iter().copied().any(|line_idx| {
+                    && anchors.line_range.clone().any(|line_idx| {
                         self.pagination.at(line_idx)
                             .and_then(|line| view.text().line(line.id()))
                             .is_some_and(|line| {
@@ -485,7 +415,7 @@ impl StructureView<'_> {
                         || (group_start > 0
                             && boxes.forces_break_after(rows[group_start - 1])));
                 if let Some(trigger_line) = rows[group_start..group_end].iter()
-                    .filter_map(|row| anchors.first_line.get(row).copied()).min()
+                    .filter_map(|row| anchors.line_bounds.get(row).map(|bounds| bounds.first)).min()
                 {
                     events.push(TableGroup {
                         table_box: table_idx,
@@ -496,13 +426,6 @@ impl StructureView<'_> {
                             forced,
                             allow_content_break: group_end == group_start + 1
                                 && boxes.table_row_allows_content_break(first_row),
-                            header: repeated_header
-                                .filter(|header| group_top >= header.bottom - 0.01)
-                                .map(|mut header| {
-                                    header.reserved =
-                                        self.pagination.has_reserved_header(first_row);
-                                    header
-                                }),
                         },
                     });
                 }
@@ -527,47 +450,52 @@ fn index_lines(
 ) {
     let boxes = view.boxes();
     let line_count = pagination.len();
-    let local_start = range.start;
-    let local_end = range
-        .end
-        .saturating_sub(1)
-        .min(line_count.saturating_sub(1));
-    anchors.first_line.clear();
+    let end = range.end.min(line_count);
+    anchors.line_range = range.start.min(end)..end;
+    anchors.line_bounds.clear();
     anchors.next_line.clear();
     anchors.candidates.clear();
-    anchors.line_indices.clear();
-    if line_count > 0 && range.start < range.end && range.start < line_count {
-        anchors.line_indices.extend(local_start..=local_end);
-    }
-    let line_indices = &anchors.line_indices;
     let candidates = &mut anchors.candidates;
-    let first_line = &mut anchors.first_line;
-    anchors.last_line.clear();
+    let line_bounds = &mut anchors.line_bounds;
     anchors.line_owners.clear();
-    let last_line = &mut anchors.last_line;
     let line_owners = &mut anchors.line_owners;
 
-    for line_idx in line_indices.iter().copied() {
-        let Some(line) = pagination.at(line_idx)
-            .and_then(|line| view.text().line(line.id()))
-        else {
-            continue;
-        };
-        let owner = line.owner_box();
-        let line_idx =
-            pagination.group_start(line_idx).unwrap_or(line_idx);
-        line_owners.push((line_idx, owner));
+    let mut retain_bounds = |owner, first: usize, last: usize| {
         for box_idx in std::iter::once(owner).chain(boxes.ancestors(owner)) {
             candidates.insert(box_idx);
-            first_line
+            line_bounds
                 .entry(box_idx)
-                .and_modify(|first: &mut usize| *first = (*first).min(line_idx))
-                .or_insert(line_idx);
-            last_line
-                .entry(box_idx)
-                .and_modify(|last: &mut usize| *last = (*last).max(line_idx))
-                .or_insert(line_idx);
+                .and_modify(|bounds| {
+                    bounds.first = bounds.first.min(first);
+                    bounds.last = bounds.last.max(last);
+                })
+                .or_insert(LineBounds { first, last });
         }
+    };
+    // Adjacent lines commonly share an owner. Their ancestor bounds need only
+    // one update per owner run; retain every line below for cursor lookups.
+    let mut pending: Option<(BoxId, usize, usize)> = None;
+    for line_idx in anchors.line_range.clone() {
+        let Some(owner) = pagination.line_owner(line_idx) else {
+            continue;
+        };
+        let line_idx = pagination.group_start(line_idx).unwrap_or(line_idx);
+        line_owners.push((line_idx, owner));
+        match &mut pending {
+            Some((previous, first, last)) if *previous == owner => {
+                *first = (*first).min(line_idx);
+                *last = (*last).max(line_idx);
+            }
+            _ => {
+                if let Some((owner, first, last)) = pending {
+                    retain_bounds(owner, first, last);
+                }
+                pending = Some((owner, line_idx, line_idx));
+            }
+        }
+    }
+    if let Some((owner, first, last)) = pending {
+        retain_bounds(owner, first, last);
     }
 
     // Empty boxes publish no line owner, but break-before/after on an empty
@@ -579,9 +507,12 @@ fn index_lines(
         for box_idx in (layout_state::box_id_index(start)..=layout_state::box_id_index(end))
             .map(layout_state::box_id_new)
         {
-            candidates.insert(box_idx);
-            for ancestor in boxes.ancestors(box_idx) {
-                candidates.insert(ancestor);
+            // Every retained candidate already includes its ancestor chain.
+            // Stop at the first existing member instead of re-inserting it all.
+            for owner in std::iter::once(box_idx).chain(boxes.ancestors(box_idx)) {
+                if !candidates.insert(owner) {
+                    break;
+                }
             }
         }
     }
@@ -601,10 +532,10 @@ fn index_lines(
     let by_owner = &mut anchors.next_owner_lines;
     by_owner.clear();
     for box_idx in candidates.iter().copied() {
-        let next = if let Some(last) = last_line.get(&box_idx).copied() {
-            // Every indexed descendant contributed to last_line, so the
+        let next = if let Some(bounds) = line_bounds.get(&box_idx) {
+            // Every indexed descendant contributed to these bounds, so the
             // first later cursor necessarily belongs outside this box.
-            let next = line_owners.partition_point(|&(cursor, _)| cursor <= last);
+            let next = line_owners.partition_point(|&(cursor, _)| cursor <= bounds.last);
             line_owners.get(next).map(|&(cursor, _)| cursor)
         } else {
             if by_owner.is_empty() && !line_owners.is_empty() {

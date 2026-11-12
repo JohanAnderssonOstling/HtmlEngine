@@ -6,13 +6,7 @@ use html_text::whitespace_context_root;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
-/// A reading unit with private source identity and document-local character ranges.
-/// Font shaping and pagination preserve its identity while text stays fixed.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReadingTarget {
-    element: DomNodeId,
-    pub glyph_ranges: Vec<Range<u32>>,
-}
+pub use html_engine_model::ReadingTarget;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReadingFragment {
@@ -117,13 +111,10 @@ impl<'a> RenderAddressingView<'a> {
             {
                 continue;
             }
-            if let Some(target) = targets.last_mut().filter(|target| target.element == owner) {
+            if let Some(target) = targets.last_mut().filter(|target| target.element() == owner) {
                 target.glyph_ranges.extend(glyph_ranges);
             } else {
-                targets.push(ReadingTarget {
-                    element: owner,
-                    glyph_ranges,
-                });
+                targets.push(ReadingTarget::new(owner, glyph_ranges));
             }
         }
         targets
@@ -397,16 +388,4 @@ fn excluded_element(element: ElementRef<'_>) -> bool {
                 "toc" | "landmarks" | "page-list" | "endnotes" | "rearnotes" | "backlink"
             )
         })
-}
-
-impl ReadingTarget {
-    /// Derive a passage or speech-chunk target while preserving its source identity.
-    /// Ranges belong to the same document; the caller's vector is moved without copying.
-    #[inline]
-    pub fn with_glyph_ranges(&self, glyph_ranges: Vec<Range<u32>>) -> ReadingTarget {
-        ReadingTarget {
-            element: self.element,
-            glyph_ranges,
-        }
-    }
 }

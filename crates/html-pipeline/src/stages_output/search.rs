@@ -7,13 +7,7 @@ use std::{error, fmt};
 use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 use unicode_segmentation::UnicodeSegmentation;
 
-/// Text matching options; publication scope and result navigation are UI policy.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct TextSearchOptions {
-    pub match_case: bool,
-    pub whole_word: bool,
-    pub match_diacritics: bool,
-}
+pub use html_engine_model::TextSearchOptions;
 
 fn normalize_into(text: &str, options: TextSearchOptions, mut emit: impl FnMut(char)) {
     let push = |character: char| {

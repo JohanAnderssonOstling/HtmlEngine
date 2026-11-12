@@ -37,7 +37,7 @@ mod layout_tree;
 mod paint;
 pub mod page_placements;
 pub use page_placements::{
-    LineScreen, PageGeometry, PagePositions, PageRequest, RepeatedTableHeader, VisibleLinePositions,
+    LineScreen, PageGeometry, PagePositions, PageRequest, VisibleLinePositions,
 };
 pub mod paint_program;
 #[cfg(feature = "profiling")]
@@ -90,3 +90,8 @@ pub fn parse_positive_span(value: Option<&str>) -> usize {
         .filter(|&value| value > 0)
         .unwrap_or(1)
 }
+
+mod reader_contracts;
+pub use reader_contracts::{OverlayStyle, PageAnchor, ReadingTarget, TextSearchOptions};
+mod revisions;
+pub use revisions::DocumentRevisions;

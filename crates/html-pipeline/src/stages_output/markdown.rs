@@ -52,6 +52,38 @@ pub struct RenderExportView<'a> {
 }
 
 impl<'a> RenderExportView<'a> {
+    /// Export a selection while omitting excluded source subtrees, including
+    /// images that have no glyph interval of their own. Keep ancestor boxes
+    /// enabled when selecting only a nested subtree.
+    pub fn text_with_box_filter(
+        self,
+        glyphs: Range<u32>,
+        format: TextExportFormat,
+        mut include: impl FnMut(BoxId) -> bool,
+    ) -> TextExport {
+        let Some((root, mut selected)) = self.selection(glyphs) else {
+            return TextExport::default();
+        };
+        for index in 0..self.doc.box_count() {
+            if !include(layout_state::box_id_new(index))
+                && let Some(node) = self.doc.box_dom_element_idx(index)
+            {
+                selected.active.remove(&node);
+                selected.visible.remove(&node);
+            }
+        }
+        let plain = match format {
+            TextExportFormat::Markdown => None,
+            TextExportFormat::PlainWithParagraphBreaks => {
+                finish_plain_text(selected.plain_separated(root, Some("\n\n")))
+            }
+            _ => finish_plain_text(selected.plain(root)),
+        };
+        let markdown = matches!(format, TextExportFormat::Markdown | TextExportFormat::PlainAndMarkdown)
+            .then(|| selected.finish(root)).flatten();
+        TextExport { plain, markdown }
+    }
+
     /// Build plain-text and Markdown versions of the same logical selection.
     /// The tuple contains `(plain_text, markdown)`; invalid or empty selections
     /// return `(None, None)`. Selection and clipboard state remain with callers.
@@ -361,6 +393,21 @@ impl<'a> Markdown<'a> {
         output
     }
 
+    // Authored inline tags can establish blocks (notably EPUB verse spans).
+    // Their boundaries survive copying even when fallback <br> tags are hidden.
+    fn is_css_block(&self, node: DomNodeId) -> bool {
+        if self.document.try_element_ref(node).is_none() {
+            return false;
+        }
+        self.styles
+            .style_for_node(node)
+            .and_then(|indices| self.styles.view(indices))
+            .is_some_and(|style| matches!(style.display(),
+                Display::Block | Display::FlowRoot | Display::Flex | Display::Grid
+                    | Display::ListItem | Display::FlowRootListItem | Display::Table
+            ))
+    }
+
     fn node(&self, node: DomNodeId) -> String {
         if let Some(text) = self.text.get(&node) {
             return escape_text(text);
@@ -558,12 +605,15 @@ impl<'a> Markdown<'a> {
             .map(|child| self.plain_separated(child, separator));
         let mut output = children.next().unwrap_or_default();
         for content in children {
-            if let Some(separator) = separator
-                && !separator.is_empty()
-                && output.ends_with(separator)
-                && content.starts_with(separator)
+            if separator.is_some()
+                && output.ends_with('\n')
+                && content.starts_with('\n')
             {
-                output.push_str(content.strip_prefix(separator).unwrap_or(&content));
+                // Adjacent block boundaries share a separator. Retain the
+                // larger boundary (paragraph or line), rather than adding both.
+                let trailing = output.len() - output.trim_end_matches('\n').len();
+                let leading = content.len() - content.trim_start_matches('\n').len();
+                output.push_str(&content[leading.min(trailing)..]);
             } else {
                 output.push_str(&content);
             }
@@ -587,6 +637,8 @@ impl<'a> Markdown<'a> {
             && !output.is_empty()
         {
             format!("{separator}{}{separator}", output.trim_matches('\n'))
+        } else if separator.is_some() && self.is_css_block(node) && !output.is_empty() {
+            format!("\n{}\n", output.trim_matches('\n'))
         } else {
             output
         }

@@ -10,10 +10,13 @@ pub(super) fn finish(doc: RenderView<'_>, page: &mut PagePositions) {
     page.table_fragments.clear();
     let boxes = doc.boxes();
     let ownership = boxes.pagination_ownership();
+    let mut table_cursor = 0;
     for (id, screen) in page.positions.iter() {
         let Some(line) = doc.text().line(id) else { continue };
-        let Some(membership) = ownership.lines.get(layout_state::line_id_index(id)) else { continue };
-        if membership.table_fragments.is_empty() {
+        let sources = ownership.table_line_index.sources_for_line(
+            layout_state::line_id_index(id) as u32, &mut table_cursor,
+        );
+        if sources.is_empty() {
             continue;
         }
         let mut translation = screen.point - line.point();
@@ -29,7 +32,13 @@ pub(super) fn finish(doc: RenderView<'_>, page: &mut PagePositions) {
         if band.column < 0 || f64::from(band.column) >= page.geometry.col_count || band.bottom <= band.top {
             continue;
         }
-        for &source in &membership.table_fragments {
+        // A visible row also carries the enclosing table's decoration. Its
+        // mapping must end at the page's source cut, rather than extending the
+        // table background through the space left by a deferred row.
+        let Some(band) = super::projection::clip_to_source_fragment(page, band) else {
+            continue;
+        };
+        for &source in sources {
             let placed = page.table_fragments.entry(source).or_insert_with(TableFragmentPlacement::default);
             if let Some(previous) = placed.bands.last_mut()
                 && previous.column == band.column && previous.translation == band.translation

@@ -23,6 +23,34 @@ pub use controller::{
 pub use state::{SelectionMode, TableHit};
 pub(crate) use state::{SelectionAnchor, SelectionState, TableCellRange, TableSelectionState};
 
+/// A pointer gesture stays in normal flow or in the float where it began.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SelectionFlow {
+    Body,
+    Float(BoxId),
+}
+
+impl SelectionFlow {
+    pub(crate) fn at(view: RenderView<'_>, glyph: u32) -> Option<Self> {
+        let owner = view.text().visible_source_runs()
+            .find(|run| run.glyphs().contains(&glyph))?.box_id();
+        let boxes = view.boxes();
+        // An outer float owns its nested content throughout the gesture.
+        Some(once(owner).chain(boxes.ancestors(owner))
+            .filter(|&index| boxes.is_floating(index))
+            .last().map_or(Self::Body, Self::Float))
+    }
+
+    pub(crate) fn contains(self, view: RenderView<'_>, owner: BoxId) -> bool {
+        let boxes = view.boxes();
+        let mut ancestors = once(owner).chain(boxes.ancestors(owner));
+        match self {
+            Self::Body => !ancestors.any(|index| boxes.is_floating(index)),
+            Self::Float(float) => ancestors.any(|index| index == float),
+        }
+    }
+}
+
 /// A logical, half-open character range in a laid-out document.
 ///
 /// Indices are the engine's logical glyph indices, not bytes or UTF-16 offsets.
@@ -32,6 +60,7 @@ pub struct Selection<'a> {
     view: RenderView<'a>,
     range: Range<u32>,
     semantic: bool,
+    flow: Option<SelectionFlow>,
 }
 
 /// Complete geometry interpretation shared by highlighting and hit testing.
@@ -98,7 +127,66 @@ impl<'a> Selection<'a> {
             view,
             range,
             semantic: false,
+            flow: None,
         }
+    }
+
+    pub(crate) fn with_flow(mut self, flow: Option<SelectionFlow>) -> Self {
+        self.flow = flow;
+        self
+    }
+
+    /// Keep the logical interval, excluding source text in other flows.
+    pub(crate) fn selected_ranges(&self) -> Vec<Range<u32>> {
+        self.restrict_to_flow(vec![self.range.clone()])
+    }
+
+    fn restrict_to_flow(&self, ranges: Vec<Range<u32>>) -> Vec<Range<u32>> {
+        let Some(flow) = self.flow else { return ranges };
+        let Some(first) = ranges.first() else { return ranges };
+        let start = first.start;
+        let end = ranges.last().map_or(start, |range| range.end);
+        let mut excluded: Vec<_> = self.view.text().visible_source_runs()
+            .filter(|run| run.glyphs().start < end && run.glyphs().end > start)
+            .filter(|run| !flow.contains(self.view, run.box_id()))
+            .map(|run| run.glyphs()).collect();
+        merge_text_ranges(&mut excluded);
+        let mut result = Vec::new();
+        let mut index = 0;
+        for range in ranges {
+            let mut start = range.start;
+            while index < excluded.len() && excluded[index].end <= start { index += 1; }
+            let mut cursor = index;
+            while let Some(skip) = excluded.get(cursor) {
+                if skip.start >= range.end { break; }
+                if skip.start > start { result.push(start..skip.start.min(range.end)); }
+                start = start.max(skip.end);
+                if start >= range.end { break; }
+                cursor += 1;
+            }
+            if start < range.end { result.push(start..range.end); }
+        }
+        result
+    }
+
+    /// Semantic promotion must not reintroduce another flow through a parent.
+    fn whole_box_in_flow(&self, owner: BoxId) -> bool {
+        self.flow.is_none_or(|flow| {
+            flow.contains(self.view, owner)
+                && self.view.text().visible_source_runs().all(|run| {
+                    !self.view.semantics().contains(owner, run.box_id())
+                        || flow.contains(self.view, run.box_id())
+                })
+        })
+    }
+
+    fn export_range(&self, range: Range<u32>, format: TextExportFormat) -> TextExport {
+        let Some(flow) = self.flow else { return self.view.export().text(range, format) };
+        self.view.export().text_with_box_filter(range, format, |owner| {
+            flow.contains(self.view, owner)
+                || matches!(flow, SelectionFlow::Float(float)
+                    if self.view.semantics().contains(owner, float))
+        })
     }
 
     /// Include complete touched list items and rectangular table selections.
@@ -120,6 +208,9 @@ impl<'a> Selection<'a> {
         if !self.is_valid() {
             return TextExport::default();
         }
+        if self.flow.is_some() {
+            return TextExport { plain: self.plain_text(), markdown: self.markdown() };
+        }
         if self.semantic {
             TextExport {
                 plain: self.plain_text(),
@@ -133,16 +224,32 @@ impl<'a> Selection<'a> {
     /// Read the selected source text only when an action needs it.
     /// Semantic promotion affects Markdown, not the selected passage.
     pub fn plain_text(&self) -> Option<String> {
+        self.plain_text_with_format(TextExportFormat::Plain)
+    }
+
+    pub(crate) fn plain_text_with_format(&self, format: TextExportFormat) -> Option<String> {
         if !self.is_valid() {
             return None;
         }
-        (self.view.export()).text(self.range.clone(), TextExportFormat::Plain).plain
+        let parts: Vec<_> = self.selected_ranges().into_iter()
+            .filter_map(|range| self.export_range(range, format).plain).collect();
+        (!parts.is_empty()).then(|| parts.join("\n"))
     }
 
     /// Prepare Markdown only when a copy or export action requests it.
     pub fn markdown(&self) -> Option<String> {
         if !self.is_valid() {
             return None;
+        }
+        if self.flow.is_some() {
+            let parts: Vec<_> = self.selected_ranges().into_iter().filter_map(|range| {
+                if self.semantic {
+                    self.semantic_markdown(range.start, range.end)
+                } else {
+                    self.export_range(range, TextExportFormat::Markdown).markdown
+                }
+            }).collect();
+            return (!parts.is_empty()).then(|| parts.join("\n\n"));
         }
         if self.semantic {
             self.semantic_markdown(self.range.start, self.range.end)
@@ -167,6 +274,7 @@ impl<'a> Selection<'a> {
         let mut ranges = vec![self.range.clone()];
         ranges.extend(self.promoted_glyph_ranges());
         merge_text_ranges(&mut ranges);
+        let ranges = self.restrict_to_flow(ranges);
         let tables = self.semantic_table_selections(self.range.start, self.range.end);
         let cell_boxes = tables
             .iter()
@@ -256,6 +364,7 @@ impl<'a> Selection<'a> {
             .map(|item| (item, true))
             .chain(code_blocks.into_iter().map(|block| (block, false)))
         {
+            if !self.whole_box_in_flow(box_idx) { continue; }
             let ranges = semantics.text_ranges(box_idx, is_list_item);
             if let (Some(start), Some(end)) = (
                 ranges.iter().map(|range| range.start).min(),
@@ -309,6 +418,7 @@ impl<'a> Selection<'a> {
             else {
                 continue;
             };
+            if !self.whole_box_in_flow(table_box) { continue; }
             let cell_glyph_ranges = cells
                 .filter(|cell| range.intersects(cell))
                 .filter_map(|cell| cell.glyphs())
@@ -363,7 +473,7 @@ impl<'a> Selection<'a> {
         );
         units.sort_by_key(|unit| unit.0);
         if units.is_empty() {
-            return export.text(selection_start..selection_end, TextExportFormat::Markdown).markdown;
+            return self.export_range(selection_start..selection_end, TextExportFormat::Markdown).markdown;
         }
         let mut markdown = String::new();
         let mut cursor = selection_start;
@@ -379,7 +489,7 @@ impl<'a> Selection<'a> {
         for (start, end, value) in units {
             let ordinary_end = start.min(selection_end);
             if cursor < ordinary_end
-                && let Some(value) = export.text(cursor..ordinary_end, TextExportFormat::Markdown).markdown
+                && let Some(value) = self.export_range(cursor..ordinary_end, TextExportFormat::Markdown).markdown
             {
                 append(&mut markdown, &value);
             }
@@ -387,7 +497,7 @@ impl<'a> Selection<'a> {
             cursor = cursor.max(end);
         }
         if cursor < selection_end
-            && let Some(value) = export.text(cursor..selection_end, TextExportFormat::Markdown).markdown
+            && let Some(value) = self.export_range(cursor..selection_end, TextExportFormat::Markdown).markdown
         {
             append(&mut markdown, &value);
         }

@@ -1,6 +1,6 @@
 //! Logical selection transitions. Hosts translate their input into character
 //! positions and decide how selections are displayed or placed on a clipboard.
-use super::Selection;
+use super::{Selection, SelectionFlow};
 use crate::export::TableExportRequest;
 use crate::geometry::WordHit;
 use crate::layout::BoxId;
@@ -51,6 +51,7 @@ impl SelectionAnchor {
 #[derive(Clone, Default)]
 pub(crate) struct SelectionState {
     phase: TextSelectionPhase,
+    pub(super) flow: Option<SelectionFlow>,
 }
 
 #[derive(Clone, Default)]
@@ -94,7 +95,7 @@ impl SelectionState {
 
     pub(crate) fn selection<'a>(&self, view: RenderView<'a>) -> Option<Selection<'a>> {
         let endpoints = self.phase.endpoints()?;
-        let selection = Selection::new(view, endpoints.range()?);
+        let selection = Selection::new(view, endpoints.range()?).with_flow(self.flow);
         Some(if endpoints.mode.is_semantic() {
             selection.with_semantics()
         } else {
@@ -120,8 +121,8 @@ impl SelectionState {
         };
     }
 
-    /// Select the initial word immediately and keep it anchored while dragging,
-    /// as when a double-click begins a word selection.
+    /// Select the initial word or element immediately and retain that complete
+    /// interval as the anchor while dragging and releasing the pointer.
     pub(crate) fn begin_selected_word(&mut self, hit: WordHit, mode: SelectionMode) {
         self.phase = TextSelectionPhase::Dragging {
             endpoints: SelectionEndpoints {
@@ -181,6 +182,7 @@ impl SelectionState {
     /// Replaces the logical range outside a pointer gesture, for example when
     /// search or another semantic command creates a selection.
     pub(crate) fn select_range(&mut self, anchor: u32, active: u32, mode: SelectionMode) {
+        self.flow = None;
         self.phase = TextSelectionPhase::Positioned(SelectionEndpoints {
             anchor,
             active,

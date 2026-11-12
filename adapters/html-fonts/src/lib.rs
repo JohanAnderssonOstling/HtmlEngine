@@ -22,9 +22,9 @@ mod prepare;
 use prepare::{FontData, FontLoadFuture, FontSourceLoader, prepare_face};
 #[cfg(test)]
 use html_resources::fonts::decode;
-use html::resources::ResourceProvider;
-use html::text::FontFace;
-use html::text::FontSlant;
+use html_resources::ResourceProvider;
+use html_style_model::FontFace;
+use html_engine_model::FontSlant;
 use std::sync::Arc;
 
 #[cfg(not(target_arch = "wasm32"))]

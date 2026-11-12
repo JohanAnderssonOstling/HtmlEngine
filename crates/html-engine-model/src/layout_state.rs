@@ -62,11 +62,8 @@ pub struct BoxPaginationFacts {
 
 #[derive(Default, Clone)]
 pub struct LineFragmentOwnership {
-    pub table_fragments: Vec<u32>,
     /// Boxes whose own content includes this line (including inline/image carriers).
     pub content: Vec<u32>,
-    /// Enclosing flows that can carry this line without crossing an independent flow.
-    pub flows: Vec<u32>,
 }
 
 /// Immutable vertical interval index, rebuilt with source layout.
@@ -107,10 +104,74 @@ impl SourceIntervals {
     }
 }
 
+/// Reverse lookup shared by all lines between consecutive span boundaries.
+/// Queries cache their current interval but also support arbitrary line order.
+#[derive(Default, Clone)]
+pub struct LineMembershipIndex {
+    starts: Vec<u32>,
+    ranges: Vec<Range<u32>>,
+    sources: Vec<u32>,
+}
+
+impl LineMembershipIndex {
+    pub fn new<'a>(
+        sources: impl IntoIterator<Item = (u32, &'a [Range<u32>])>,
+        span_count: usize,
+    ) -> Self {
+        let mut events = Vec::with_capacity(span_count * 2);
+        for (source, spans) in sources {
+            for lines in spans {
+                events.push((lines.start, source, true));
+                events.push((lines.end, source, false));
+            }
+        }
+        events.sort_unstable_by_key(|event| event.0);
+        let mut index = Self::default();
+        let mut active = Vec::new();
+        let mut event = 0;
+        while event < events.len() {
+            let at = events[event].0;
+            while event < events.len() && events[event].0 == at {
+                let (_, source, entering) = events[event];
+                match active.binary_search(&source) {
+                    Ok(position) if !entering => { active.remove(position); }
+                    Err(position) if entering => active.insert(position, source),
+                    _ => {}
+                }
+                event += 1;
+            }
+            let start = index.sources.len() as u32;
+            index.sources.extend_from_slice(&active);
+            index.starts.push(at);
+            index.ranges.push(start..index.sources.len() as u32);
+        }
+        // These immutable arrays are replaced, not grown, on the next layout.
+        index.starts.shrink_to_fit();
+        index.ranges.shrink_to_fit();
+        index.sources.shrink_to_fit();
+        index
+    }
+
+    pub fn sources_for_line(&self, line: u32, cursor: &mut usize) -> &[u32] {
+        if self.starts.is_empty() || line < self.starts[0] {
+            return &[];
+        }
+        if self.starts.get(*cursor).is_none_or(|&start| line < start)
+            || self.starts.get(*cursor + 1).is_some_and(|&end| line >= end)
+        {
+            *cursor = self.starts.partition_point(|&start| start <= line) - 1;
+        }
+        let range = &self.ranges[*cursor];
+        &self.sources[range.start as usize..range.end as usize]
+    }
+}
+
 /// Prepared geometry and line coverage of a table or an independently placed row.
 #[derive(Clone)]
 pub struct TableFragmentSource {
     pub bounds: Rect,
+    /// Exact spans in PaginationOwnership::table_line_spans.
+    pub lines: Range<u32>,
     pub line_count: usize,
 }
 
@@ -120,22 +181,36 @@ pub struct PaginationOwnership {
     pub revision: u64,
     pub box_intervals: SourceIntervals,
     pub table_fragments: Vec<TableFragmentSource>,
+    pub table_line_spans: Vec<Range<u32>>,
+    pub table_line_index: LineMembershipIndex,
+    /// Per-flow ranges into the flat exact line-span arena.
+    pub flow_line_ranges: Vec<Range<u32>>,
+    pub flow_line_spans: Vec<Range<u32>>,
+    pub flow_line_index: LineMembershipIndex,
     pub boxes: Vec<BoxPaginationFacts>,
     pub lines: Vec<LineFragmentOwnership>,
-    /// Enclosing flows for each box, paired with their distance.
-    /// Stored once per layout, never as a box-by-line matrix.
-    pub box_flows: Vec<Vec<(u32, usize)>>,
 }
 
 impl PaginationOwnership {
+    pub fn flow_contains_line(&self, flow: u32, line: u32) -> bool {
+        let Some(range) = self.flow_line_ranges.get(flow as usize) else { return false };
+        let spans = &self.flow_line_spans[range.start as usize..range.end as usize];
+        let index = spans.partition_point(|span| span.end <= line);
+        spans.get(index).is_some_and(|span| span.start <= line)
+    }
+
     pub fn clear(&mut self) {
         static NEXT_REVISION: AtomicU64 = AtomicU64::new(1);
         self.revision = NEXT_REVISION.fetch_add(1, AtomicOrdering::Relaxed);
         self.box_intervals = SourceIntervals::default();
         self.table_fragments.clear();
+        self.table_line_spans.clear();
+        self.table_line_index = LineMembershipIndex::default();
+        self.flow_line_ranges.clear();
+        self.flow_line_spans.clear();
+        self.flow_line_index = LineMembershipIndex::default();
         self.boxes.clear();
         self.lines.clear();
-        self.box_flows.clear();
     }
 }
 
@@ -163,8 +238,6 @@ pub struct LineOutput {
     pub pagination_float_keeps: Vec<FloatPaginationKeep>,
     /// Column height used while placing floats and composing their exclusions.
     pub pagination_fragment_height: Option<f64>,
-    /// Body rows with space already reserved for a repeated floated-table header.
-    pub pagination_header_rows: Vec<u32>,
     /// Group starts sorted by document-space origin for exact continuation lookup.
     pub pagination_origins: Vec<u32>,
     /// Corresponding starts when only height-independent groups are used.
@@ -392,7 +465,6 @@ impl LayoutState {
         self.line_output.pagination_base_groups.clear();
         self.line_output.pagination_float_keeps.clear();
         self.line_output.pagination_fragment_height = None;
-        self.line_output.pagination_header_rows.clear();
         self.line_output.pagination_anchors.clear();
         self.line_output.atomic_inline_lines.clear();
         self.line_output.pagination_origins.clear();
@@ -472,10 +544,6 @@ impl LayoutState {
             &self.line_output.pagination_base_groups,
         );
         report.add_vec_storage(
-            "LayoutState.line_output.pagination_header_rows.storage",
-            &self.line_output.pagination_header_rows,
-        );
-        report.add_vec_storage(
             "LayoutState.line_output.pagination_float_keeps.storage",
             &self.line_output.pagination_float_keeps,
         );
@@ -501,20 +569,23 @@ impl LayoutState {
         );
         let ownership = &self.line_output.pagination_ownership;
         report.add_vec_storage("LayoutState.pagination_ownership.table_fragments", &ownership.table_fragments);
+        report.add_vec_storage("LayoutState.pagination_ownership.table_line_spans", &ownership.table_line_spans);
+        report.add_vec_storage("LayoutState.pagination_ownership.table_line_starts", &ownership.table_line_index.starts);
+        report.add_vec_storage("LayoutState.pagination_ownership.table_line_ranges", &ownership.table_line_index.ranges);
+        report.add_vec_storage("LayoutState.pagination_ownership.table_line_sources", &ownership.table_line_index.sources);
+        report.add_vec_storage("LayoutState.pagination_ownership.flow_line_ranges", &ownership.flow_line_ranges);
+        report.add_vec_storage("LayoutState.pagination_ownership.flow_line_spans", &ownership.flow_line_spans);
+        report.add_vec_storage("LayoutState.pagination_ownership.flow_index_starts", &ownership.flow_line_index.starts);
+        report.add_vec_storage("LayoutState.pagination_ownership.flow_index_ranges", &ownership.flow_line_index.ranges);
+        report.add_vec_storage("LayoutState.pagination_ownership.flow_index_sources", &ownership.flow_line_index.sources);
         report.add_vec_storage("LayoutState.pagination_ownership.boxes", &ownership.boxes);
         report.add_vec_storage("LayoutState.pagination_ownership.box_intervals", &ownership.box_intervals.entries);
         report.add_vec_storage("LayoutState.pagination_ownership.box_interval_maxima", &ownership.box_intervals.maxima);
         report.add_vec_storage("LayoutState.pagination_ownership.lines", &ownership.lines);
-        report.add_vec_storage("LayoutState.pagination_ownership.flows", &ownership.box_flows);
         report.add_slice_storage::<u32>(
             "LayoutState.pagination_ownership.line_memberships",
-            ownership.lines.iter().map(|line| line.content.capacity() + line.flows.capacity() + line.table_fragments.capacity()).sum(),
-            ownership.lines.iter().map(|line| line.content.len() + line.flows.len() + line.table_fragments.len()).sum(),
-        );
-        report.add_slice_storage::<(u32, usize)>(
-            "LayoutState.pagination_ownership.flow_memberships",
-            ownership.box_flows.iter().map(Vec::capacity).sum(),
-            ownership.box_flows.iter().map(Vec::len).sum(),
+            ownership.lines.iter().map(|line| line.content.capacity()).sum(),
+            ownership.lines.iter().map(|line| line.content.len()).sum(),
         );
         report.add_vec_storage(
             "LayoutState.line_output.paint_order_indices.storage",

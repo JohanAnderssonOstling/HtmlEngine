@@ -59,8 +59,8 @@ Navigation, publication identity and persistent address formats belong to the re
 
 `PageView::new(document.render_view(), &page)` borrows a complete engine page.
 Its hit queries and `interact` consume page-local coordinates; the engine owns
-column choice and document-to-page projection, including fragmented boxes and
-repeated header regions. The host removes its view origin and outer display
+column choice and document-to-page projection, including fragmented boxes.
+The host removes its view origin and outer display
 scale before passing a pointer position.
 
 `PageView` implements the existing `PaintProjection` contract. Pass it directly
@@ -98,7 +98,8 @@ page's `positions.into_buffer()` to preserve existing buffer reuse.
 
 The returned `PagePositions` contains stable line identities and placements,
 start/end cursor anchors, column geometry, paint origin, geometric continuation,
-repeated table headers and paint dependencies. Its `request` reproduces the
+and paint dependencies. Table headers appear only at their source position.
+Its `request` reproduces the
 resolved page, including first-page normalization, and `reached_end` always means
 the document end, regardless of traversal direction. Use `next_page_anchor` and
 `previous_page_anchor` for page turns; the engine resolves boundaries and preserves

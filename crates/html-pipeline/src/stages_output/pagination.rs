@@ -171,15 +171,6 @@ impl<'a> Pagination<'a> {
         self.output().pagination_fragment_height
     }
 
-    pub fn has_reserved_header(self, row: BoxId) -> bool {
-        self.uses_float_groups
-            && self
-                .output()
-                .pagination_header_rows
-                .binary_search(&(layout_state::box_id_index(row) as u32))
-                .is_ok()
-    }
-
     /// Float breaks were applied independently during layout and must
     /// not be replayed as breaks in the surrounding normal flow.
     pub fn float_breaks_resolved(self, owner: BoxId) -> bool {
@@ -284,6 +275,13 @@ impl<'a> Pagination<'a> {
         }
     }
 
+    /// Structural ownership without constructing line or fragment geometry.
+    pub fn line_owner(self, cursor: usize) -> Option<BoxId> {
+        let id = *self.order().get(cursor)?;
+        let line = self.output().lines.get(layout_state::line_id_index(id))?;
+        Some(layout_state::box_id_new(line.owner_box_idx as usize))
+    }
+
     pub fn at(self, cursor: usize) -> Option<PaginationLine> {
         self.line_at(*self.order().get(cursor)?, cursor)
     }
@@ -329,7 +327,10 @@ impl<'a> Pagination<'a> {
     }
 
     pub fn group_start(self, cursor: usize) -> Option<usize> {
-        Some(self.group(cursor)?.cursors.start)
+        // Published traversal entries refer to valid laid-out lines. The
+        // group start depends only on cursor membership, not its geometry.
+        self.order().get(cursor)?;
+        Some(self.data(cursor).map_or(cursor, |group| group.members.start as usize))
     }
 }
 

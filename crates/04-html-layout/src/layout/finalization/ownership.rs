@@ -2,11 +2,12 @@
 
 use super::{FragmentWriter, LayoutReader};
 use html_engine_model::layout_state::{
-    BoxPaginationFacts, LineFragmentOwnership, SourceIntervals, TableFragmentSource,
+    BoxPaginationFacts, LineFragmentOwnership, SourceIntervals, TableFragmentSource, LineMembershipIndex,
 };
 use html_engine_model::{BoxGeometry, LayoutMode};
 use html_style_model::{BreakBetween, BreakInside, Float, PositionMode};
 use kurbo::Rect;
+use std::ops::Range;
 
 pub(super) fn prepare_ownership(
     reader: &LayoutReader<'_>,
@@ -23,7 +24,6 @@ pub(super) fn prepare_ownership(
         (owner as u32, top, top + geometry.size(owner).height)
     }).collect());
     ownership.boxes.resize(count, BoxPaginationFacts::default());
-    ownership.box_flows.resize_with(count, Vec::new);
     let mut children = vec![Vec::new(); count];
     let mut roots = Vec::new();
     for owner in 0..count {
@@ -78,22 +78,6 @@ pub(super) fn prepare_ownership(
                 .map(|&child| (child, false, in_table || is_table)),
         );
     }
-    // Retain flow membership once, including currently undecorated boxes: a
-    // paint-only style update can add a background without changing layout.
-    for owner in 0..count {
-        let mut ancestor = Some(owner);
-        let mut distance = 0;
-        while let Some(flow) = ancestor {
-            ownership.box_flows[owner].push((flow as u32, distance));
-            if ownership.boxes[flow].independent
-                && (flow != owner || !output.box_line_ranges[owner].is_empty())
-            {
-                break;
-            }
-            ancestor = reader.get_parent(flow);
-            distance += 1;
-        }
-    }
     // Rows containing a spanning cell are handled by the whole-table source.
     // Split/partial tables retain the general projection path.
     let mut sources = vec![None; count];
@@ -111,6 +95,7 @@ pub(super) fn prepare_ownership(
                 bounds: geometry.decoration_rect(owner).unwrap_or_else(|| {
                     Rect::from_origin_size(geometry.point(owner), geometry.size(owner))
                 }),
+                lines: 0..0,
                 line_count: 0,
             });
         }
@@ -133,7 +118,11 @@ pub(super) fn prepare_ownership(
             ancestor = reader.get_parent(current);
         }
     }
+    let mut table_spans: Vec<Vec<Range<u32>>> = vec![Vec::new(); ownership.table_fragments.len()];
     let mut content_marks = vec![usize::MAX; count];
+    let mut flow_spans: Vec<(u32, Range<u32>)> = Vec::new();
+    let mut last_flow_span = vec![u32::MAX; count];
+    ownership.flow_line_ranges.resize(count, 0..0);
     let mut flow_marks = vec![usize::MAX; count];
     let mut carriers = Vec::new();
     for (index, line) in output.lines.iter().enumerate() {
@@ -165,6 +154,17 @@ pub(super) fn prepare_ownership(
                 content_marks[owner] = index;
                 if output.box_line_ranges[owner].contains(&(index as u32)) {
                     line_ownership.content.push(owner as u32);
+                    if let Some(source) = sources[owner as usize] {
+                        ownership.table_fragments[source as usize].line_count += 1;
+                        let spans = &mut table_spans[source as usize];
+                        if let Some(previous) = spans.last_mut()
+                            && previous.end == index as u32
+                        {
+                            previous.end += 1;
+                        } else {
+                            spans.push(index as u32..index as u32 + 1);
+                        }
+                    }
                 }
                 ancestor = reader.get_parent(owner);
             }
@@ -186,19 +186,57 @@ pub(super) fn prepare_ownership(
                     break;
                 }
                 flow_marks[owner] = index;
-                line_ownership.flows.push(owner as u32);
+                let previous = last_flow_span[owner];
+                if previous != u32::MAX && flow_spans[previous as usize].1.end == index as u32 {
+                    flow_spans[previous as usize].1.end += 1;
+                } else {
+                    last_flow_span[owner] = flow_spans.len() as u32;
+                    flow_spans.push((owner as u32, index as u32..index as u32 + 1));
+                    ownership.flow_line_ranges[owner].end += 1;
+                }
                 if ownership.boxes[owner].independent {
                     break;
                 }
                 ancestor = reader.get_parent(owner);
             }
         }
-        for &owner in &line_ownership.content {
-            if let Some(source) = sources[owner as usize] {
-                ownership.table_fragments[source as usize].line_count += 1;
-                line_ownership.table_fragments.push(source);
-            }
-        }
         ownership.lines.push(line_ownership);
     }
+    ownership.table_line_spans.reserve(table_spans.iter().map(Vec::len).sum());
+    for (source, spans) in ownership.table_fragments.iter_mut().zip(table_spans) {
+        let start = ownership.table_line_spans.len() as u32;
+        ownership.table_line_spans.extend(spans);
+        source.lines = start..ownership.table_line_spans.len() as u32;
+    }
+    ownership.table_line_index = LineMembershipIndex::new(
+        ownership.table_fragments.iter().enumerate().map(|(source, fragment)| {
+            (source as u32, &ownership.table_line_spans[fragment.lines.start as usize..fragment.lines.end as usize])
+        }),
+        ownership.table_line_spans.len(),
+    );
+    // Counted spans become disjoint output slices. Scatter the construction
+    // records in encounter order, preserving sorted spans within each flow.
+    let mut offset = 0;
+    for range in &mut ownership.flow_line_ranges {
+        let end = offset + range.end;
+        *range = offset..end;
+        offset = end;
+    }
+    ownership.flow_line_spans.resize(flow_spans.len(), 0..0);
+    for (owner, span) in flow_spans {
+        let range = &mut ownership.flow_line_ranges[owner as usize];
+        ownership.flow_line_spans[range.start as usize] = span;
+        range.start += 1;
+    }
+    let mut start = 0;
+    for range in &mut ownership.flow_line_ranges {
+        range.start = start;
+        start = range.end;
+    }
+    ownership.flow_line_index = LineMembershipIndex::new(
+        ownership.flow_line_ranges.iter().enumerate().map(|(source, range)| {
+            (source as u32, &ownership.flow_line_spans[range.start as usize..range.end as usize])
+        }),
+        ownership.flow_line_spans.len(),
+    );
 }

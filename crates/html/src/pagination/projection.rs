@@ -5,26 +5,22 @@ use crate::layout::{BoxId, RenderView};
 use html_engine_model::page_placements::{
     self, BoxProjectionBand, FlowPlacement, PlacementMembership, PlacementMemberships,
 };
-use html_engine_model::{LineScreen, layout_state};
+use html_engine_model::{LineId, LineScreen, layout_state};
 use kurbo::{Point, Rect};
 use std::borrow::Cow;
-use std::collections::hash_map::Entry;
-use std::slice;
+use std::collections::{HashMap, hash_map::Entry};
 
 pub(super) fn compose_box_fragments(doc: RenderView<'_>, page: &mut PagePositions) {
     page.flow_placements.clear();
     let boxes = doc.boxes();
     let ownership = boxes.pagination_ownership();
+    let mut positioned = Vec::new();
     for (order, (index, screen)) in page.positions.iter().enumerate() {
-        let Some(line) = doc.text().line(index) else {
+        let Some(line) = doc.text().line(index) else { continue };
+        if ownership.lines.get(layout_state::line_id_index(index)).is_none() {
             continue;
-        };
-        let Some(membership) = ownership.lines.get(layout_state::line_id_index(index)) else {
-            continue;
-        };
-        let Some(direct) = projection_band(page, screen, line.point(), 0) else {
-            continue;
-        };
+        }
+        let Some(direct) = projection_band(page, screen, line.point(), 0) else { continue };
         let enclosing = enclosing_band(page, direct, 1);
         let placements = &mut page.flow_placements;
         let same = placements.spans.last().is_some_and(|previous| {
@@ -38,23 +34,29 @@ pub(super) fn compose_box_fragments(doc: RenderView<'_>, page: &mut PagePosition
         if !same {
             placements.spans.push(FlowPlacement { direct, enclosing });
         }
-        let placement = placements.spans.len() - 1;
-        let entry = PlacementMembership {
-            placement,
+        positioned.push((index, PlacementMembership {
+            placement: placements.spans.len() - 1,
             order,
             source_y: line.point().y,
-        };
-        for &owner in &membership.content {
-            if ownership.boxes[owner as usize]
-                .table_fragment
-                .is_some_and(|id| page.table_fragments.contains_key(&id))
-            {
-                continue;
+        }));
+    }
+    if page.flow_placements.spans.len() != 1 {
+        let mut flow_cursor = 0;
+        for &(index, entry) in &positioned {
+            let membership = &ownership.lines[layout_state::line_id_index(index)];
+            for &owner in &membership.content {
+                if ownership.boxes[owner as usize].table_fragment
+                    .is_some_and(|id| page.table_fragments.contains_key(&id))
+                {
+                    continue;
+                }
+                retain_membership(page.flow_placements.content.entry(owner), entry);
             }
-            retain_membership(placements.content.entry(owner), entry);
-        }
-        for &flow in &membership.flows {
-            retain_membership(placements.flows.entry(flow), entry);
+            for &flow in ownership.flow_line_index.sources_for_line(
+                layout_state::line_id_index(index) as u32, &mut flow_cursor,
+            ) {
+                retain_membership(page.flow_placements.flows.entry(flow), entry);
+            }
         }
     }
     page.flow_placements.prepared = true;
@@ -82,6 +84,11 @@ pub(super) fn compose_box_fragments(doc: RenderView<'_>, page: &mut PagePosition
     }
     candidates.sort_unstable();
     candidates.dedup();
+    if let [placement] = page.flow_placements.spans.as_slice() {
+        let placement = *placement;
+        compose_single_placement(doc, page, &candidates, &positioned, placement);
+        return;
+    }
     for index in candidates.into_iter().map(|index| index as usize) {
         let owner = layout_state::box_id_new(index);
         let Some(bounds) = boxes.bounds(owner) else { continue };
@@ -93,6 +100,125 @@ pub(super) fn compose_box_fragments(doc: RenderView<'_>, page: &mut PagePosition
         let fragments = resolve_box_bands(candidates, bounds, page.geometry.col_count);
         if !fragments.is_empty() {
             page.flow_placements.boxes.insert(index as u32, fragments);
+        }
+    }
+}
+
+/// A page-local closure of candidates and direct carriers. Masks are in one
+/// flat arena; no document-sized scratch or per-line ancestor lists are built.
+struct ProjectionNode {
+    owner: BoxId,
+    parent: Option<usize>,
+    flow: bool,
+    inherited_flow: bool,
+    candidate: bool,
+}
+
+fn compose_single_placement(
+    doc: RenderView<'_>,
+    page: &mut PagePositions,
+    candidates: &[u32],
+    positioned: &[(LineId, PlacementMembership)],
+    placement: FlowPlacement,
+) {
+    let boxes = doc.boxes();
+    let facts = &boxes.pagination_ownership().boxes;
+    // Only presence matters for one shared mapping. Stable-ID order makes a
+    // box's content range a contiguous interval of bits, even for continuations.
+    let mut lines: Vec<_> = positioned.iter().map(|&(line, _)| line).collect();
+    lines.sort_unstable();
+    lines.dedup();
+    let words = lines.len().div_ceil(64);
+    let mut indices = HashMap::with_capacity(candidates.len());
+    let mut nodes: Vec<ProjectionNode> = Vec::with_capacity(candidates.len());
+    let mut masks = Vec::new();
+    let mut pending = Vec::new();
+    let mut add = |owner: BoxId, seed: Option<(usize, bool)>| {
+        let mut current = Some(owner);
+        let mut parent = None;
+        while let Some(owner) = current {
+            if let Some(&index) = indices.get(&owner) {
+                parent = Some(index);
+                break;
+            }
+            pending.push(owner);
+            current = boxes.parent(owner);
+        }
+        // Insert ancestors first. Arena order is then already topological:
+        // reverse order aggregates children, forward order inherits providers.
+        while let Some(owner) = pending.pop() {
+            let index = nodes.len();
+            indices.insert(owner, index);
+            nodes.push(ProjectionNode {
+                owner, parent, flow: false, inherited_flow: false, candidate: false,
+            });
+            masks.resize(masks.len() + words, 0u64);
+            parent = Some(index);
+        }
+        let index = parent.expect("a carrier or candidate has a box");
+        if let Some((bit, flow)) = seed {
+            masks[index * words + bit / 64] |= 1 << (bit % 64);
+            nodes[index].flow |= flow;
+        } else {
+            nodes[index].candidate = true;
+        }
+    };
+    for (bit, &line) in lines.iter().enumerate() {
+        doc.text().visit_line_carriers(line, |owner, flow| {
+            add(owner, Some((bit, flow)));
+        });
+    }
+    for &owner in candidates {
+        add(layout_state::box_id_new(owner as usize), None);
+    }
+    for index in (0..nodes.len()).rev() {
+        if let Some(parent) = nodes[index].parent {
+            for word in 0..words {
+                masks[parent * words + word] |= masks[index * words + word];
+            }
+            if !facts[layout_state::box_id_index(nodes[index].owner)].independent {
+                nodes[parent].flow |= nodes[index].flow;
+            }
+        }
+    }
+    for index in 0..nodes.len() {
+        let node = &nodes[index];
+        let owner = node.owner;
+        let independent = facts[layout_state::box_id_index(owner)].independent;
+        let range = boxes.content_line_range(owner);
+        let incoming = node.parent.is_some_and(|parent| nodes[parent].inherited_flow);
+        let direct_flow = node.flow;
+        // Empty independent boxes may inherit for themselves, but do not pass
+        // that inherited provider to descendants.
+        let inherited = incoming && (!independent || range.is_empty());
+        let candidate = node.candidate;
+        nodes[index].inherited_flow = direct_flow || (incoming && !independent);
+        if !candidate { continue }
+        let Some(bounds) = boxes.bounds(owner) else { continue };
+        let fragments = if let Some(bands) = super::table_fragments::bands(doc, page, owner) {
+            resolve_box_bands(bands.to_vec(), bounds, page.geometry.col_count)
+        } else {
+            let start = lines.partition_point(|&line| line < range.start);
+            let end = lines.partition_point(|&line| line < range.end);
+            let content = (start / 64..end.div_ceil(64)).any(|word| {
+                let lo = start.saturating_sub(word * 64);
+                let hi = (end - word * 64).min(64);
+                let mask = (u64::MAX << lo) & (u64::MAX >> (64 - hi));
+                masks[index * words + word] & mask != 0
+            });
+            let band = if content || direct_flow {
+                Some(placement.direct)
+            } else if inherited {
+                placement.enclosing
+            } else {
+                None
+            };
+            // A single band has no competing distance or overlap to resolve.
+            band.filter(|band| bounds.y1 >= band.top && bounds.y0 <= band.bottom
+                && band.bottom > band.top).into_iter().collect()
+        };
+        if !fragments.is_empty() {
+            page.flow_placements.boxes.insert(layout_state::box_id_index(owner) as u32, fragments);
         }
     }
 }
@@ -122,7 +248,6 @@ fn shared_box_bands(
 ) -> Vec<BoxProjectionBand> {
     let placements = &page.flow_placements;
     let boxes = doc.boxes();
-    let ownership = boxes.pagination_ownership();
     let owner = layout_state::box_id_index(owner);
     let mut selected: Vec<(usize, usize, BoxProjectionBand)> = Vec::new();
     let mut add = |entries: &PlacementMemberships, distance: usize| {
@@ -157,16 +282,14 @@ fn shared_box_bands(
     if let Some(entries) = placements.content.get(&(owner as u32)) {
         complete = add(entries, 0);
     }
-    if let Some(flows) = ownership.box_flows.get(owner) {
-        for &(flow, distance) in flows {
-            // Distances increase along the retained ancestor chain. Still
-            // visit distance zero to resolve source-order ties with content.
-            if complete && distance > 0 {
-                break;
-            }
-            if let Some(entries) = placements.flows.get(&flow) {
-                complete = add(entries, distance);
-            }
+    for (flow, distance) in boxes.flow_ancestors(layout_state::box_id_new(owner)) {
+        // Distances increase along the ancestor chain. Still visit distance
+        // zero to resolve source-order ties with content.
+        if complete && distance > 0 {
+            break;
+        }
+        if let Some(entries) = placements.flows.get(&flow) {
+            complete = add(entries, distance);
         }
     }
     selected.into_iter().map(|(_, _, band)| band).collect()
@@ -187,27 +310,6 @@ fn inferred_box_bands<'a>(
         .and_then(|facts| facts.table_fragment)
         .is_some_and(|id| page.table_fragments.contains_key(&id));
     if placements.prepared && !explicit_table {
-        // An unfragmented page shares its placement directly: no per-box
-        // mapping allocation, sorting, or compaction is needed during paint.
-        if let [placement] = placements.spans.as_slice() {
-            let index = layout_state::box_id_index(owner);
-            if placements.content.contains_key(&(index as u32)) {
-                return Cow::Borrowed(slice::from_ref(&placement.direct));
-            }
-            if let Some(flows) = doc.boxes().pagination_ownership().box_flows.get(index) {
-                for &(flow, distance) in flows {
-                    if placements.flows.contains_key(&flow) {
-                        let band = if distance == 0 {
-                            Some(&placement.direct)
-                        } else {
-                            placement.enclosing.as_ref()
-                        };
-                        return Cow::Borrowed(band.map_or(&[], slice::from_ref));
-                    }
-                }
-            }
-            return Cow::Borrowed(&[]);
-        }
         return Cow::Owned(shared_box_bands(doc, page, owner));
     }
     let boxes = doc.boxes();
@@ -298,11 +400,11 @@ fn projection_band(
         bottom,
         distance,
     };
-    if distance == 0 {
-        Some(band)
-    } else {
-        enclosing_band(page, band, distance)
-    }
+    // Direct content can carry an entire decorated box, not only its own
+    // line. A continued caption must not project the earlier image region
+    // through its new translation, so direct and enclosing carriers share
+    // the same source-fragment limits.
+    clip_to_source_fragment(page, band)
 }
 
 fn enclosing_band(
@@ -310,16 +412,30 @@ fn enclosing_band(
     mut band: BoxProjectionBand,
     distance: usize,
 ) -> Option<BoxProjectionBand> {
+    band.distance = distance;
+    clip_to_source_fragment(page, band)
+}
+
+/// Decorations must stop where pagination changes the source translation,
+/// including when the following content was deferred to another column.
+pub(super) fn clip_to_source_fragment(
+    page: &PagePositions,
+    mut band: BoxProjectionBand,
+) -> Option<BoxProjectionBand> {
+    // A fresh page does not retain the preceding page's offset breaks.
+    // Its source start is still a hard boundary for continued decorations.
+    band.top = band.top.max(page.paint_start_offset_y);
+    // A split carrier can originate above its current visible fragment.
+    let source_y = band.source_y.max(band.top);
     let index = page
         .offset_breaks
-        .partition_point(|(at, _)| *at <= band.source_y);
+        .partition_point(|(at, _)| *at <= source_y);
     if let Some(previous) = index.checked_sub(1) {
         band.top = band.top.max(page.offset_breaks[previous].0);
     }
     if let Some((next, _)) = page.offset_breaks.get(index) {
         band.bottom = band.bottom.min(*next);
     }
-    band.distance = distance;
     (band.bottom > band.top).then_some(band)
 }
 

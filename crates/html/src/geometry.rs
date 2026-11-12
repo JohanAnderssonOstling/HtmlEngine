@@ -4,12 +4,13 @@ use html_dom::DomNodeId;
 use html_engine_model::layout_state;
 use crate::document::ImageId;
 use crate::layout::{BoxId, CaretAffinity, LineId, RenderView};
-use crate::selection::{Selection, TableCellRange, TableHit};
+use crate::selection::{Selection, SelectionFlow, TableCellRange, TableHit};
 use crate::targets::LinkTarget;
 use kurbo::{Point, Rect};
+use std::collections::HashMap;
 use std::ops::Range;
 
-use crate::render::LinePlacement;
+use crate::render::{LinePlacement, PaintProjection};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TextHit {
@@ -406,7 +407,7 @@ impl<'a> Geometry<'a> {
     }
 
     pub(crate) fn word_hit_at(self, point: Point, policy: WordHitPolicy) -> Option<WordHit> {
-        self.word_hit_at_lines(point, self.line_placements(), policy)
+        self.word_hit_at_lines(point, self.line_placements(), policy, None, None)
     }
 
     /// Resolve caret affinity and word geometry in one hit test. Nearest-word
@@ -416,9 +417,11 @@ impl<'a> Geometry<'a> {
         point: Point,
         placements: impl IntoIterator<Item = LinePlacement>,
         policy: WordHitPolicy,
+        projection: Option<&dyn PaintProjection>,
+        flow: Option<SelectionFlow>,
     ) -> Option<WordHit> {
         let placements: Vec<_> = placements.into_iter().collect();
-        let hit = self.hit_test_lines(point, placements.iter().copied())?;
+        let hit = self.hit_test_lines_in_regions(point, placements.iter().copied(), projection, flow)?;
         let make_hit = |word| WordHit {
             caret: hit.glyph,
             word,
@@ -658,11 +661,25 @@ impl<'a> Geometry<'a> {
         point: Point,
         placements: impl IntoIterator<Item = LinePlacement>,
     ) -> Option<TextHit> {
+        self.hit_test_lines_in_regions(point, placements, None, None)
+    }
+
+    fn hit_test_lines_in_regions(
+        self,
+        point: Point,
+        placements: impl IntoIterator<Item = LinePlacement>,
+        projection: Option<&dyn PaintProjection>,
+        flow: Option<SelectionFlow>,
+    ) -> Option<TextHit> {
         if !point.x.is_finite() || !point.y.is_finite() {
             return None;
         }
+        let boxes = self.view.boxes();
+        let mut float_owners = HashMap::new();
+        let mut float_hits = HashMap::new();
+        let mut fragments = Vec::new();
         let mut best = None;
-        let mut distance = (f64::INFINITY, f64::INFINITY);
+        let mut distance = (true, f64::INFINITY, f64::INFINITY);
         for placement in placements {
             let Some(line) = self.view.text().line(placement.line) else {
                 continue;
@@ -670,13 +687,44 @@ impl<'a> Geometry<'a> {
             if line.glyphs().is_empty() {
                 continue;
             }
+            let owner = line.owner_box();
+            if flow.is_some_and(|flow| !flow.contains(self.view, owner)) {
+                continue;
+            }
+            let float = *float_owners.entry(owner).or_insert_with(|| {
+                std::iter::once(owner).chain(boxes.ancestors(owner))
+                    .find(|&ancestor| boxes.is_floating(ancestor))
+            });
+            if flow.is_none() && let Some(float) = float {
+                let contains = if let Some(projection) = projection {
+                    *float_hits.entry(float).or_insert_with(|| {
+                        fragments.clear();
+                        if let Some(bounds) = boxes.bounds(float) {
+                            projection.project_decoration(Some(float), bounds, None, &mut fragments);
+                        }
+                        fragments.iter().any(|fragment| {
+                            Rect::from_origin_size(fragment.destination, fragment.source.size())
+                                .contains(point)
+                        })
+                    })
+                } else {
+                    boxes.bounds(float).is_some_and(|bounds| {
+                        (bounds + (placement.origin - line.point())).contains(point)
+                    })
+                };
+                if !contains {
+                    continue;
+                }
+            }
             let nearest = self
                 .placed_selection_rects(placement, line.glyphs())
                 .filter(|rect| rect.width() > 0.0 && rect.height() > 0.0)
                 .map(|rect| {
                     let dy = (rect.y0 - point.y).max(point.y - rect.y1).max(0.0);
                     let dx = (rect.x0 - point.x).max(point.x - rect.x1).max(0.0);
-                    ((dy, dx), point.x.clamp(rect.x0, rect.x1))
+                    // Select the float region before comparing nearby lines.
+                    // Outside it, its captions cannot attract a body-text drag.
+                    ((flow.is_none() && float.is_none(), dy, dx), point.x.clamp(rect.x0, rect.x1))
                 })
                 .min_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
             if let Some((candidate, x)) = nearest {

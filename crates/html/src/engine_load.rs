@@ -281,7 +281,7 @@ impl Document {
             .map_err(|error| {
                 Error::from(error).with_context(format!("failed to prepare document {uri}"))
             })?;
-        engine.revisions.invalidate_from(EarliestStage::Parse);
+        crate::revisions::invalidate_from(&mut engine.revisions, EarliestStage::Parse);
         Ok(PreparedDocument { engine })
     }
 }

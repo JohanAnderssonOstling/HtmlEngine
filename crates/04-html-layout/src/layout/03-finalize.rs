@@ -39,7 +39,6 @@ impl LayoutEngine<'_, '_> {
 
         // Published source layout is independent of pagination height.
         self.fragments.state_mut().line_output.pagination_fragment_height = None;
-        self.fragments.state_mut().line_output.pagination_header_rows.clear();
         build_line_traversals(&self.reader, &mut self.fragments);
 
         rebuild_glyph_line_indices(self.text.glyphs().len(), &mut self.fragments);

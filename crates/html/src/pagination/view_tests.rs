@@ -11,7 +11,7 @@ use super::*;
 use crate::text::TextSearchOptions as Opts;
 use crate::text::{FontSlant, GlyphHandle, GlyphResourceGeneration, GlyphShaper};
 use html_engine_model::{
-    LineScreen, RepeatedTableHeader, VisibleLinePositions, layout_state, page_placements,
+    LineScreen, VisibleLinePositions, layout_state, page_placements,
 };
 use html_pipeline::DocumentFactory;
 use html_pipeline::engine::GlyphResourceStore;
@@ -87,7 +87,7 @@ fn glyph_of(doc: RenderView<'_>, wanted: char) -> u32 {
 }
 
 #[test]
-fn rectangles_cross_offset_breaks_and_optionally_repeat_in_headers() {
+fn rectangles_cross_offset_breaks() {
     let mut resources = GlyphResourceStore::default();
     let document = layout("<p>text</p>", &mut resources);
     let page = PagePositions {
@@ -99,19 +99,12 @@ fn rectangles_cross_offset_breaks_and_optionally_repeat_in_headers() {
         },
         positions: VisibleLinePositions::default(),
         offset_breaks: vec![(90.0, 10.0)],
-        repeated_table_headers: vec![RepeatedTableHeader {
-            source_left: 0.0,
-            source_right: 50.0,
-            source_top: 80.0,
-            source_bottom: 90.0,
-            col_index: 1,
-        }],
         ..PagePositions::default()
     };
     let geometry = PageView::new(document.render_view(&resources), &page);
     let source = Rect::new(5.0, 80.0, 25.0, 120.0);
     let mut projected = Vec::new();
-    geometry.project_rect(source, None, false, &mut projected);
+    geometry.project_rect(source, None, &mut projected);
     let fragments: Vec<_> = projected
         .iter()
         .map(|fragment| (fragment.source, fragment.destination))
@@ -122,17 +115,6 @@ fn rectangles_cross_offset_breaks_and_optionally_repeat_in_headers() {
             (Rect::new(5.0, 80.0, 25.0, 90.0), Point::new(5.0, 80.0)),
             (Rect::new(5.0, 90.0, 25.0, 120.0), Point::new(115.0, 0.0)),
         ]
-    );
-    projected.clear();
-    geometry.project_rect(source, None, true, &mut projected);
-    let repeated: Vec<_> = projected
-        .iter()
-        .map(|fragment| (fragment.source, fragment.destination))
-        .collect();
-    assert_eq!(&repeated[..2], fragments.as_slice());
-    assert_eq!(
-        repeated[2],
-        (Rect::new(5.0, 80.0, 25.0, 90.0), Point::new(115.0, 0.0))
     );
 }
 
@@ -166,7 +148,7 @@ fn line_rectangles_follow_recorded_inline_placement() {
     let geometry = PageView::new(doc, &page);
     let rect = Rect::from_origin_size(source + (2.0, 3.0), kurbo::Size::new(10.0, 20.0));
     let mut projected = Vec::new();
-    geometry.project_rect(rect, Some(LineId::new(0)), false, &mut projected);
+    geometry.project_rect(rect, Some(LineId::new(0)), &mut projected);
     let fragments: Vec<_> = projected
         .iter()
         .map(|fragment| (fragment.source, fragment.destination))

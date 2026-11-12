@@ -33,15 +33,6 @@ impl LineScreen {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct RepeatedTableHeader {
-    pub source_left: f64,
-    pub source_right: f64,
-    pub source_top: f64,
-    pub source_bottom: f64,
-    pub col_index: i32,
-}
-
 /// The anchor determines how to compose the page; no direction flag is needed.
 #[derive(Clone, Copy, Debug)]
 pub enum PageRequest {
@@ -150,7 +141,6 @@ pub struct PagePositions {
     pub last_line: Option<usize>,
     pub positions: VisibleLinePositions,
     pub offset_breaks: Vec<(f64, f64)>,
-    pub repeated_table_headers: Vec<RepeatedTableHeader>,
     pub block_decoration_indices: Option<Vec<usize>>,
     pub flow_placements: PageFlowPlacements,
     pub table_fragments: HashMap<u32, TableFragmentPlacement>,
@@ -186,7 +176,6 @@ impl PagePositions {
         self.paint_start_offset_y = 0.0;
         self.geometry = PageGeometry::default();
         self.offset_breaks.clear();
-        self.repeated_table_headers.clear();
         self.block_decoration_indices = None;
         self.flow_placements.clear();
         self.table_fragments.clear();

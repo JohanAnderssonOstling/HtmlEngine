@@ -453,7 +453,7 @@ fn resolve_table_plan<'tree>(
 
     let mut row_starts = vec![0.0f64; input.rows.len()];
     let mut cursor_y = v_spacing + outer_borders.top;
-    // Row geometry is continuous. Page breaks and repeated headers belong to
+    // Row geometry is continuous. Page breaks belong to
     // page composition and must never change the table's source coordinates.
     for (start, &height) in row_starts.iter_mut().zip(&row_heights) {
         *start = cursor_y;

@@ -8,7 +8,6 @@ publish = false
 html-style-model = { package = "skrift-style-model", path = "../../crates/html-style-model" }
 html-engine-model = { package = "skrift-engine-model", path = "../../crates/html-engine-model" }
 data-url = "0.3"
-html.workspace = true
 html-resources = { package = "skrift-resources", path = "../../crates/html-resources", features = ["font-data"] }
 blake3.workspace = true
 ttf-parser = "0.25"

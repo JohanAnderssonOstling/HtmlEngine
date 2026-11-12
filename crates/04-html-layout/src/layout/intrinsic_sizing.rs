@@ -2,9 +2,11 @@ use super::inline::{BreakKind, tokens::indent_for_line};
 use crate::flex_grid::TaffyContainerKind;
 use crate::layout::LayoutEngine;
 use html_engine_model::{Children, InlineItemKind, LayoutMode};
-use html_style_model::{Float, OverflowWrap, UsedPreferredSize as PreferredSize, WhiteSpace, WordBreak};
+use html_style_model::{
+    Clear, Float, OverflowWrap, UsedPreferredSize as PreferredSize, WhiteSpace, WordBreak,
+};
 use html_text::is_other_space_separator;
-use std::ops::Range;
+use std::{mem::take, ops::Range};
 
 /// Single-threaded memoized values for one immutable layout pass.
 #[derive(Clone, Copy, Default)]
@@ -263,6 +265,39 @@ pub fn contains_full_width_percentage_table(engine: &LayoutEngine<'_, '_>, box_i
     }
 }
 
+/// Floats on a cleared side occupy an earlier row and must not widen the
+/// next row. Keep the opposite side because clearance need not pass it.
+#[derive(Default)]
+struct IntrinsicFloats {
+    left: f64,
+    right: f64,
+}
+
+impl IntrinsicFloats {
+    fn clear(&mut self, clear: Clear) -> f64 {
+        let mut removed = 0.0;
+        if matches!(clear, Clear::Left | Clear::Both) {
+            removed += take(&mut self.left);
+        }
+        if matches!(clear, Clear::Right | Clear::Both) {
+            removed += take(&mut self.right);
+        }
+        removed
+    }
+
+    fn add(&mut self, side: Float, width: f64) {
+        match side {
+            Float::Left => self.left += width,
+            Float::Right => self.right += width,
+            Float::None => {}
+        }
+    }
+
+    fn width(&self) -> f64 {
+        self.left + self.right
+    }
+}
+
 fn children_intrinsic_widths(
     engine: &mut LayoutEngine<'_, '_>,
     children: &Children,
@@ -276,7 +311,7 @@ fn children_intrinsic_widths(
         Children::Blocks(indices) => {
             let mut min_w = 0.0f64;
             let mut max_w = 0.0f64;
-            let mut float_line_max = 0.0f64;
+            let mut floats = IntrinsicFloats::default();
             for &child_idx in indices {
                 // Blockification makes an absolutely positioned inline child
                 // a direct block-tree child, but it remains out of flow and
@@ -294,17 +329,16 @@ fn children_intrinsic_widths(
                     available_width,
                 );
                 min_w = min_w.max(child_min);
-                if matches!(
-                    engine.reader.style(child_idx as usize).float(),
-                    Float::Left | Float::Right
-                ) {
-                    float_line_max += child_max;
+                let child_style = engine.reader.style(child_idx as usize);
+                if matches!(child_style.float(), Float::Left | Float::Right) {
+                    floats.clear(child_style.clear());
+                    floats.add(child_style.float(), child_max);
+                    max_w = max_w.max(floats.width());
                 } else {
-                    max_w = max_w.max(float_line_max).max(child_max);
-                    float_line_max = 0.0;
+                    max_w = max_w.max(child_max);
+                    floats = IntrinsicFloats::default();
                 }
             }
-            max_w = max_w.max(float_line_max);
             (min_w, max_w)
         }
         Children::Empty => (0.0, 0.0),
@@ -385,6 +419,7 @@ fn runs_intrinsic_widths(
     // soft opportunities. Each accumulator consumes its own pending indent.
     let mut minimum = IntrinsicWidth::new(first_indent);
     let mut maximum = IntrinsicWidth::new(first_indent);
+    let mut floats = IntrinsicFloats::default();
     let mut pending_collapsible_space = 0.0f64;
     let mut preserved_space_break = false;
     let mut text_cursor = engine.text.cursor();
@@ -424,6 +459,7 @@ fn runs_intrinsic_widths(
                         }
                         minimum.finish(hard_indent);
                         maximum.finish(hard_indent);
+                        floats = IntrinsicFloats::default();
                         pending_collapsible_space = 0.0;
                         preserved_space_break = false;
                         continue;
@@ -551,13 +587,17 @@ fn runs_intrinsic_widths(
             InlineItemKind::Break { .. } => {
                 minimum.finish(hard_indent);
                 maximum.finish(hard_indent);
+                floats = IntrinsicFloats::default();
                 pending_collapsible_space = 0.0;
             }
             InlineItemKind::FloatAnchor { box_idx } => {
                 let (float_min, float_max) = box_intrinsic_widths(engine, *box_idx as usize);
-                // Consecutive floats may share a line at max-content size,
-                // while the min-content contribution only needs room for
-                // the widest individual float.
+                let float_style = engine.reader.style(*box_idx as usize);
+                // Preserve the earlier row's width before removing floats
+                // that this anchor clears. Uncleared floats can share a row.
+                maximum.widest = maximum.value();
+                maximum.current -= floats.clear(float_style.clear());
+                floats.add(float_style.float(), float_max);
                 minimum.widest = minimum.widest.max(float_min);
                 maximum.current += pending_collapsible_space + float_max;
                 pending_collapsible_space = 0.0;

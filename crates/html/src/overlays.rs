@@ -6,13 +6,7 @@ use kurbo::Rect;
 use peniko::Color;
 use std::ops::Range;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum OverlayStyle {
-    Highlight,
-    Underline,
-    Squiggly,
-    Strikethrough,
-}
+pub use html_engine_model::OverlayStyle;
 
 /// Appearance and logical range supplied by the host. The engine chooses
 /// intrinsic clipping and draws the resulting projected rectangles.

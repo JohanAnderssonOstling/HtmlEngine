@@ -539,6 +539,25 @@ impl<'a> RenderTextView<'a> {
         render_line(&self.doc.layout_state.line_output, id)
     }
 
+    /// Direct content carriers, with whether each also seeds enclosing flow.
+    /// Ancestor membership is deliberately left to the caller's traversal.
+    pub fn visit_line_carriers(self, id: LineId, mut visit: impl FnMut(BoxId, bool)) {
+        let index = layout_state::line_id_index(id);
+        let output = &self.doc.layout_state.line_output;
+        let Some(line) = output.lines.get(index) else { return };
+        let fragments = &self.doc.layout_state.fragment_output;
+        let images = fragments.image_fragments_by_line.get(index).unwrap_or(&[]);
+        let image_flow = line.glyphs.is_empty() && !images.is_empty();
+        visit(layout_state::box_id_new(line.owner_box_idx as usize), !image_flow);
+        let inline = line.inline_box_fragments(&output.line_details);
+        for fragment in &output.inline_box_fragments[inline.start as usize..inline.end as usize] {
+            visit(layout_state::box_id_new(fragment.box_idx as usize), false);
+        }
+        for &image in images {
+            visit(layout_state::box_id_new(fragments.image_fragments[image].box_idx as usize), image_flow);
+        }
+    }
+
     /// Native key consumed by a baseline-oriented painter.
     pub fn paint_handle(self, glyph: GlyphId) -> Option<GlyphHandle> {
         self.glyph_metrics.paint_handle(glyph)

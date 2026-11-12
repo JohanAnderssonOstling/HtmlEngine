@@ -20,6 +20,8 @@ pub(crate) struct FragmentSelection {
     scene: Option<GpuiScene>,
     paint_style: Option<(Color, Option<u32>)>,
     pressed_link: Option<(DocumentPoint, String)>,
+    /// Retain the press through release, including clicks consumed by dismissal.
+    pressed_selectable: Option<bool>,
 }
 
 fn document_point(point: Point<Pixels>) -> DocumentPoint {
@@ -44,9 +46,11 @@ impl FragmentSelection {
         self.interaction = SelectionOutcome::default();
         self.paint_style = None;
         self.pressed_link = None;
+        self.pressed_selectable = None;
     }
     pub fn clear_selection(&mut self, view: RenderView<'_>) {
         self.pressed_link = None;
+        self.pressed_selectable = None;
         self.interact(view, SelectionInput::Clear(SelectionKind::Text));
         self.interact(view, SelectionInput::Clear(SelectionKind::Table));
     }
@@ -58,10 +62,11 @@ impl FragmentSelection {
         self.interaction.dragging
     }
     pub fn pointer_active(&self) -> bool {
-        self.dragging() || self.pressed_link.is_some()
+        self.pressed_selectable.is_some() || self.dragging() || self.pressed_link.is_some()
     }
     pub fn finish(&mut self, view: RenderView<'_>) {
         self.pressed_link = None;
+        self.pressed_selectable = None;
         self.interact(view, SelectionInput::Finish);
     }
 
@@ -73,18 +78,21 @@ impl FragmentSelection {
         selectable: bool,
     ) -> bool {
         self.pressed_link = None;
-        if selectable {
-            self.begin(view, position, clicks);
+        let handled = if selectable {
+            self.begin(view, position, clicks)
         } else {
             self.pointer_move(view, Some(position));
-        }
-        if clicks == 1 {
+            false
+        };
+        if clicks == 1 && (!selectable || self.dragging()) {
             self.pressed_link = self
                 .logical
                 .hovered_link(view)
                 .map(|link| (document_point(position), link.href.to_owned()));
         }
-        selectable || self.pressed_link.is_some()
+        let handled = handled || self.pressed_link.is_some();
+        self.pressed_selectable = handled.then_some(selectable);
+        handled
     }
 
     pub fn pointer_up(
@@ -94,6 +102,7 @@ impl FragmentSelection {
         hovered: bool,
     ) -> Option<String> {
         let pressed = self.pressed_link.take();
+        let selectable = self.pressed_selectable.take().unwrap_or(false);
         let position = document_point(position);
         self.interact(
             view,
@@ -105,6 +114,11 @@ impl FragmentSelection {
         );
         if !hovered {
             self.pointer_move(view, None);
+            return None;
+        }
+        // The shared controller decides whether this was an activating click,
+        // a dismissal, or a drag. Nonselectable fragments only track links.
+        if selectable && self.interaction.click.is_none() {
             return None;
         }
         let (start, href) = pressed?;
@@ -241,16 +255,19 @@ impl FragmentSelection {
     }
 
     pub fn begin(&mut self, view: RenderView<'_>, position: Point<Pixels>, clicks: usize) -> bool {
-        self.clear();
-        self.interact(
+        self.pressed_link = None;
+        let handled = self.interact(
             view,
             SelectionInput::PointerDown {
                 position: document_point(position),
                 mode: SelectionMode::Plain,
                 select_text: true,
+                click_action: false,
                 clicks,
             },
-        )
+        );
+        self.pressed_selectable = handled.then_some(true);
+        handled
     }
 
     pub fn extend(&mut self, view: RenderView<'_>, position: Point<Pixels>) {

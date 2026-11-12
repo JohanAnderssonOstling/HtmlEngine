@@ -1,6 +1,6 @@
 use crate::{LoadedFontFace, PRIVATE_FAMILY_PREFIX};
-use html::text::FontFace;
-use html::text::FontSlant;
+use html_style_model::FontFace;
+use html_engine_model::FontSlant;
 use std::collections::BTreeMap;
 
 pub(crate) fn prepare(bytes: &[u8], declaration: &FontFace) -> Result<LoadedFontFace, String> {

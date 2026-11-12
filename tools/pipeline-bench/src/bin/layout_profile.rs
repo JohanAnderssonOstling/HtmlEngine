@@ -406,9 +406,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })).collect::<Vec<_>>()
             }).collect();
             pages.push(json!({"start": page.paint_start_offset_y, "next": page.next_start_offset_y,
-                "end": page.reached_end, "lines": positioned, "cuts": page.offset_breaks, "decorations": decorations,
-                "headers": page.repeated_table_headers.iter().map(|header|
-                    json!([header.source_left, header.source_top, header.source_right, header.source_bottom])).collect::<Vec<_>>() }));
+                "end": page.reached_end, "lines": positioned, "cuts": page.offset_breaks, "decorations": decorations }));
             let Some(next) = paginator.next_page_anchor(Some(&page), page.paint_start_offset_y) else { break };
             if next.offset_y <= page.paint_start_offset_y || pages.len() > view.text().line_count().max(1) * 4 {
                 return Err(format!("pagination failed to advance: page={} start={} cursor={} last={:?} next={:?} end={} lines={} cuts={:?} group={:?}",

@@ -9,7 +9,7 @@ use crate::render::{
     ProjectedLine, TextOverlay, paint_overlays,
 };
 use crate::selection::{
-    SelectionController, SelectionExport, SelectionGeometry, SelectionHit, SelectionInput,
+    SelectionController, SelectionExport, SelectionFlow, SelectionGeometry, SelectionHit, SelectionInput,
     SelectionLayout, SelectionOutcome, SelectionPaintScratch, SelectionPaintStyle};
 use crate::targets::{DocumentTarget, LinkTarget, ResolvedDestination};
 use crate::search::{SourceTextMatches, TextPatternMatcher};
@@ -51,7 +51,6 @@ impl<'a> PageView<'a> {
         &self,
         source: Rect,
         line: Option<LineId>,
-        include_repeated_headers: bool,
         out: &mut Vec<PaintFragment>,
     ) {
         if let Some(index) = line {
@@ -129,9 +128,6 @@ impl<'a> PageView<'a> {
                 }
             }
         }
-        if include_repeated_headers {
-            self.project_repeated_headers(source, out);
-        }
     }
 
     /// Projects a box through its content and enclosing flow fragments.
@@ -140,7 +136,6 @@ impl<'a> PageView<'a> {
         &self,
         source: Rect,
         owner: BoxId,
-        include_repeated_headers: bool,
         out: &mut Vec<PaintFragment>,
     ) {
         for band in super::projection::box_projection_bands(self.page, owner) {
@@ -152,33 +147,6 @@ impl<'a> PageView<'a> {
                 out.push(PaintFragment {
                     source: clipped,
                     destination: clipped.origin() + band.translation + Vec2::new(column_x, 0.0),
-                });
-            }
-        }
-        if include_repeated_headers {
-            self.project_repeated_headers(source, out);
-        }
-    }
-
-    fn project_repeated_headers(&self, source: Rect, out: &mut Vec<PaintFragment>) {
-        for header in &self.page.repeated_table_headers {
-            let clipped = source.intersect(Rect::new(
-                header.source_left,
-                header.source_top,
-                header.source_right,
-                header.source_bottom,
-            ));
-            if clipped.width() > 0.0 && clipped.height() > 0.0 {
-                out.push(PaintFragment {
-                    source: clipped,
-                    destination: Point::new(
-                        page_placements::col_x(
-                            &self.page.geometry,
-                            header.col_index as f64,
-                            clipped.x0,
-                        ),
-                        clipped.y0 - header.source_top,
-                    ),
                 });
             }
         }
@@ -249,7 +217,7 @@ impl<'a> PageView<'a> {
             .image_at_lines(point, self.visible_column_placements(point))
     }
 
-    /// Append the projected fragments of a box, including repeated headers.
+    /// Append the projected fragments of a box.
     fn project_box(&self, box_idx: BoxId, out: &mut Vec<PaintFragment>) {
         let boxes = self.doc.boxes();
         let Some(rect) = boxes.bounds(box_idx) else {
@@ -258,7 +226,7 @@ impl<'a> PageView<'a> {
         if rect.width() <= 0.0 || rect.height() <= 0.0 || self.page.geometry.size.height <= 0.0 {
             return;
         }
-        self.project_box_rect(rect, box_idx, true, out);
+        self.project_box_rect(rect, box_idx, out);
     }
 
     /// Whether any projected fragment of the box contains `point`. The
@@ -291,33 +259,13 @@ impl<'a> PageView<'a> {
 }
 
 impl PaintProjection for PageView<'_> {
-    fn candidates(&self, view: RenderView<'_>) -> Option<PaintCandidates> {
+    fn candidates(&self, _view: RenderView<'_>) -> Option<PaintCandidates> {
         let blocks = self.page.block_decoration_indices.as_deref()?;
         let mut candidates = PaintCandidates::default();
         candidates
             .lines
             .extend(self.page.positions.iter().map(|(line, _)| line));
         candidates.block_decorations.extend_from_slice(blocks);
-        let mut header_decorations = Vec::new();
-        for header in &self.page.repeated_table_headers {
-            candidates.lines.extend(
-                view.text()
-                    .lines()
-                    .iter()
-                    .filter(|line| {
-                        let source = line.point();
-                        source.x >= header.source_left - 0.01
-                            && source.x < header.source_right + 0.01
-                            && source.y >= header.source_top - 0.01
-                            && source.y < header.source_bottom - 0.01
-                    })
-                    .map(|line| line.id()),
-            );
-            (view.fragments()).block_decoration_indices_intersecting(header.source_top, header.source_bottom, &mut header_decorations);
-            candidates
-                .block_decorations
-                .extend_from_slice(&header_decorations);
-        }
         Some(candidates)
     }
     fn bounds(&self) -> Rect {
@@ -329,7 +277,7 @@ impl PaintProjection for PageView<'_> {
         )
     }
 
-    fn project_line(&self, line: LineId, source: Point, out: &mut Vec<ProjectedLine>) {
+    fn project_line(&self, line: LineId, _source: Point, out: &mut Vec<ProjectedLine>) {
         for screen in self.page.positions.fragments(line) {
             out.push(ProjectedLine {
                 origin: screen.point,
@@ -345,38 +293,6 @@ impl PaintProjection for PageView<'_> {
                 }),
             });
         }
-        for header in &self.page.repeated_table_headers {
-            if source.x >= header.source_left - 0.01
-                && source.x < header.source_right + 0.01
-                && source.y >= header.source_top - 0.01
-                && source.y < header.source_bottom - 0.01
-            {
-                out.push(ProjectedLine {
-                    origin: Point::new(
-                        page_placements::col_x(
-                            &self.page.geometry,
-                            header.col_index as f64,
-                            source.x,
-                        ),
-                        source.y - header.source_top,
-                    ),
-                    clip: Some(Rect::new(
-                        page_placements::col_x(
-                            &self.page.geometry,
-                            header.col_index as f64,
-                            header.source_left,
-                        ),
-                        0.0,
-                        page_placements::col_x(
-                            &self.page.geometry,
-                            header.col_index as f64,
-                            header.source_right,
-                        ),
-                        header.source_bottom - header.source_top,
-                    )),
-                });
-            }
-        }
     }
 
     fn project_decoration(
@@ -389,14 +305,14 @@ impl PaintProjection for PageView<'_> {
         if line.is_none()
             && let Some(owner) = owner
         {
-            self.project_box_rect(source, owner, true, out);
+            self.project_box_rect(source, owner, out);
         } else {
-            self.project_rect(source, line, true, out);
+            self.project_rect(source, line, out);
         }
     }
 
     fn project_rect(&self, source: Rect, line: Option<LineId>, out: &mut Vec<PaintFragment>) {
-        self.project_rect(source, line, true, out);
+        self.project_rect(source, line, out);
     }
 }
 
@@ -415,10 +331,28 @@ impl<'a> PageView<'a> {
             _ => None,
         };
         if let Some(position) = position {
+            // Leaving a float's column must clamp within that float rather than
+            // losing all candidates or selecting a neighbouring text flow.
+            let mut column_point = position;
+            if matches!(&input, SelectionInput::PointerMove { .. } | SelectionInput::PointerUp { .. })
+                && let Some(flow @ SelectionFlow::Float(_)) = state.drag_flow()
+            {
+                let nearest = self.page.positions.iter().filter_map(|(id, screen)| {
+                    let line = self.doc.text().line(id)?;
+                    if line.glyphs().is_empty() || !flow.contains(self.doc, line.owner_box()) {
+                        return None;
+                    }
+                    let left = page_placements::col_x(&self.page.geometry, f64::from(screen.col_index), 0.0);
+                    let right = left + self.page.geometry.col_width;
+                    let distance = (left - position.x).max(position.x - right).max(0.0);
+                    Some((distance, (left + right) * 0.5))
+                }).min_by(|a, b| a.0.total_cmp(&b.0));
+                if let Some((_, x)) = nearest { column_point.x = x; }
+            }
             state.interact(
                 SelectionLayout {
                     view: self.doc,
-                    placements: self.column_placements(position),
+                    placements: self.column_placements(column_point),
                     projection: self,
                 },
                 input,

@@ -1,7 +1,7 @@
 //! Per-view selection interaction and painting through host-supplied geometry.
 
 use super::{
-    Selection, SelectionAnchor, SelectionMode, SelectionState, TableHit, TableSelectionState,
+    Selection, SelectionAnchor, SelectionFlow, SelectionMode, SelectionState, TableHit, TableSelectionState,
 };
 use crate::export::{TableExportFormat, TableExportRequest, TextExportFormat};
 use crate::geometry::{Geometry, SelectionHighlight, WordHit, WordHitPolicy};
@@ -46,6 +46,9 @@ pub enum SelectionInput {
         /// An existing table selection gets first refusal. A host handling an
         /// image or another action can suppress starting a text gesture.
         select_text: bool,
+        /// A host-owned action, such as an annotation, takes precedence over
+        /// immediate word selection. Moving the pointer still starts a drag.
+        click_action: bool,
         clicks: usize,
     },
     PointerMove {
@@ -144,11 +147,16 @@ pub struct SelectionController {
     touch: Option<SelectionAnchor>,
     hovered_node: Option<DomNodeId>,
     hovered_text: Option<Range<u32>>,
+    dismissed_click: bool,
 }
 
 impl SelectionController {
     pub(crate) fn is_dragging(&self) -> bool {
         self.touch.is_some() || self.text.is_selecting() || self.table.is_dragging()
+    }
+
+    pub(crate) fn drag_flow(&self) -> Option<SelectionFlow> {
+        self.is_dragging().then_some(self.text.flow).flatten()
     }
 
     pub fn link_hovered(&self) -> bool {
@@ -214,17 +222,33 @@ impl SelectionController {
             }
         }
         let hover_changed = outcome.hover_changed;
-        let word_at = |position, policy| geometry.word_hit_at_lines(position, placements, policy);
+        let flow = if matches!(&input, SelectionInput::PointerMove { .. } | SelectionInput::PointerUp { .. })
+            && (self.touch.is_some() || self.text.is_selecting())
+        {
+            self.text.flow
+        } else {
+            None
+        };
+        let word_at = |position, policy| {
+            geometry.word_hit_at_lines(position, placements, policy, Some(projection), flow)
+        };
         match input {
             SelectionInput::PointerLeave => {}
             SelectionInput::PointerDown {
                 position,
                 mode,
                 select_text,
+                click_action,
                 clicks,
             } => {
                 self.touch = None;
-                if self.table.is_active() {
+                self.dismissed_click = clicks == 1 && self.text.range().is_some();
+                if self.dismissed_click {
+                    self.text = SelectionState::default();
+                    outcome.handled = true;
+                    outcome.changed = true;
+                }
+                if !outcome.handled && self.table.is_active() {
                     if let Some(hit) = table_at(view, projection, position)
                         && self.table.begin_drag(hit)
                     {
@@ -235,26 +259,28 @@ impl SelectionController {
                         outcome.changed = self.table.clear();
                     }
                 }
-                if !outcome.handled
-                    && select_text
-                    && let Some(hit) = word_at(position, WordHitPolicy::Nearest)
-                {
-                    if clicks >= 3 {
-                        if let Some(selection) = Selection::containing_element(view, hit.word.start)
-                        {
-                            let range = selection.range();
-                            self.text.select_range(range.start, range.end, mode);
-                            outcome.handled = true;
-                        }
-                    } else {
-                        if clicks == 2 {
+                if !outcome.handled && select_text {
+                    if let Some(mut hit) = word_at(position, WordHitPolicy::InkOnly) {
+                        let flow = SelectionFlow::at(view, hit.word.start);
+                        if clicks >= 2 {
+                            if let Some(selection) = Selection::containing_element(view, hit.word.start) {
+                                hit.word = selection.range();
+                            }
                             self.text.begin_selected_word(hit, mode);
-                        } else {
+                        } else if click_action || self.hovered_node.is_some() {
+                            // Actions retain click activation; dragging still selects words.
                             self.text.begin_at_word(hit, mode);
+                        } else {
+                            self.text.begin_selected_word(hit, mode);
                         }
+                        self.text.flow = flow;
                         outcome.handled = true;
+                        outcome.changed = true;
+                    } else {
+                        outcome.changed |= self.text.range().is_some() || self.text.is_selecting();
+                        self.text = SelectionState::default();
+                        outcome.handled |= outcome.changed;
                     }
-                    outcome.changed |= outcome.handled;
                 }
             }
             SelectionInput::PointerMove {
@@ -284,7 +310,9 @@ impl SelectionController {
                 mode,
                 drag_distance,
             } => {
-                if self.touch.is_some() {
+                if std::mem::take(&mut self.dismissed_click) {
+                    outcome.handled = true;
+                } else if self.touch.is_some() {
                     outcome = self.extend_touch(word_at(position, WordHitPolicy::Nearest));
                     self.touch = None;
                     outcome.handled = self.text.range().is_some();
@@ -320,6 +348,7 @@ impl SelectionController {
             }
             SelectionInput::SelectAt { position, unit } => {
                 if let Some(hit) = word_at(position, WordHitPolicy::InkOnly) {
+                    let flow = SelectionFlow::at(view, hit.word.start);
                     let range = match unit {
                         SelectionUnit::Word => Some(hit.word),
                         SelectionUnit::Element => {
@@ -333,6 +362,7 @@ impl SelectionController {
                             .then(|| SelectionAnchor::new(range.clone()));
                         self.text
                             .select_range(range.start, range.end, SelectionMode::Plain);
+                        self.text.flow = flow;
                         self.table.clear();
                         outcome.handled = true;
                         outcome.changed = true;
@@ -348,6 +378,7 @@ impl SelectionController {
                 }
             }
             SelectionInput::Finish => {
+                self.dismissed_click = false;
                 self.touch = None;
                 if self.table.finish_drag() {
                     outcome.handled = true;
@@ -386,22 +417,25 @@ impl SelectionController {
         &self,
         layout: SelectionLayout<'_, impl IntoIterator<Item = LinePlacement>>,
     ) -> SelectionGeometry {
-        let Some(range) = self.text.range() else {
+        let Some(selection) = self.text.selection(layout.view) else {
             return SelectionGeometry::default();
         };
+        let ranges = selection.selected_ranges();
         let geometry = Geometry::new(layout.view);
         let mut result = SelectionGeometry::default();
         for placement in layout.placements {
-            for bounds in geometry.placed_selection_rects(placement, range.clone()) {
-                result.bounds = Some(
-                    result
-                        .bounds
-                        .map_or(bounds, |previous| previous.union(bounds)),
-                );
+            for range in &ranges {
+                for bounds in geometry.placed_selection_rects(placement, range.clone()) {
+                    result.bounds = Some(
+                        result
+                            .bounds
+                            .map_or(bounds, |previous| previous.union(bounds)),
+                    );
+                }
+                let (start, end) = geometry.selection_endpoints_lines(range.clone(), [placement]);
+                result.endpoints.0 = start.or(result.endpoints.0);
+                result.endpoints.1 = end.or(result.endpoints.1);
             }
-            let (start, end) = geometry.selection_endpoints_lines(range.clone(), [placement]);
-            result.endpoints.0 = start.or(result.endpoints.0);
-            result.endpoints.1 = end.or(result.endpoints.1);
         }
         result.bounds = result
             .bounds
@@ -445,8 +479,7 @@ impl SelectionController {
         let range = match request {
             SelectionExport::PlainText => {
                 let selection = self.text.selection(layout.view)?;
-                return (layout.view.export()).text(selection.range(), TextExportFormat::PlainWithParagraphBreaks)
-                .plain;
+                return selection.plain_text_with_format(TextExportFormat::PlainWithParagraphBreaks);
             }
             SelectionExport::Markdown => {
                 if let Some(range) = self.table.range() {
@@ -549,8 +582,10 @@ impl SelectionController {
             let range = anchor.extend_to(hit.word);
             outcome.changed = self.text.range().as_ref() != Some(&range);
             if outcome.changed {
+                let flow = self.text.flow;
                 self.text
                     .select_range(range.start, range.end, SelectionMode::Plain);
+                self.text.flow = flow;
                 self.table.clear();
                 outcome.finished = true;
                 outcome.handled = true;

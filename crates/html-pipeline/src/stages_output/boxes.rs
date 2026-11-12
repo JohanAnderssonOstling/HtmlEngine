@@ -5,7 +5,7 @@ use super::*;
 use crate::layout_model::{parse_positive_span, place_table_cells};
 use html_dom::{DomNodeId, ElementRef, write_escaped_html_attribute, write_escaped_html_text};
 use html_engine_model::layout_state::{self, BoxPaginationFacts, PaginationOwnership};
-use html_style_model::{BreakBetween, BreakInside};
+use html_style_model::{BreakBetween, BreakInside, Float, LayoutStyle, PositionMode};
 use kurbo::Rect;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -179,15 +179,30 @@ impl<'a> RenderBoxView<'a> {
         ))
     }
 
+    /// Whether this box participates in float layout rather than normal flow.
+    pub fn is_floating(self, box_id: BoxId) -> bool {
+        self.used_style(layout_state::box_id_index(box_id)).is_some_and(|style| {
+            style.position() != PositionMode::Absolute
+                && matches!(style.float(), Float::Left | Float::Right)
+        })
+    }
+
     fn break_before(self, box_id: BoxId) -> BreakBetween {
         let box_idx = layout_state::box_id_index(box_id);
-        self.used_style(box_idx)
-            .map_or(BreakBetween::Auto, |style| style.break_before())
+        self.layout_style(box_idx)
+            .map_or(BreakBetween::Auto, |style| style.break_before)
     }
 
     fn break_after(self, box_idx: usize) -> BreakBetween {
-        self.used_style(box_idx)
-            .map_or(BreakBetween::Auto, |style| style.break_after())
+        self.layout_style(box_idx)
+            .map_or(BreakBetween::Auto, |style| style.break_after)
+    }
+
+    /// Break policies are stored values; they need no font-relative resolution.
+    fn layout_style(self, box_idx: usize) -> Option<&'a LayoutStyle> {
+        let indices = self.doc.box_style_indices(box_idx)
+            .unwrap_or_else(|| self.doc.inputs.styles.default_indices());
+        self.doc.inputs.styles.layout_style(indices)
     }
 
     fn used_style(self, box_idx: usize) -> Option<html_style_model::UsedStyleView<'a>> {
@@ -272,12 +287,6 @@ impl<'a> RenderBoxView<'a> {
         )
     }
 
-    pub fn is_table_header_group(self, box_id: BoxId) -> bool {
-        let box_idx = layout_state::box_id_index(box_id);
-        self.used_style(box_idx)
-            .is_some_and(|style| style.display() == html_style_model::Display::TableHeaderGroup)
-    }
-
     pub fn table_cell_rowspan(self, box_id: BoxId) -> usize {
         let box_idx = layout_state::box_id_index(box_id);
         match self.doc.box_layout_mode(box_idx) {
@@ -315,8 +324,8 @@ impl<'a> RenderBoxView<'a> {
 
     pub fn avoids_break_inside(self, box_id: BoxId) -> bool {
         let box_idx = layout_state::box_id_index(box_id);
-        self.used_style(box_idx)
-            .is_some_and(|style| style.break_inside() == BreakInside::Avoid)
+        self.layout_style(box_idx)
+            .is_some_and(|style| style.break_inside == BreakInside::Avoid)
     }
 
     pub fn widows(self, box_id: BoxId) -> usize {
@@ -564,6 +573,25 @@ impl<'a> RenderBoxView<'a> {
         self.doc.is_block_container_box(box_idx)
     }
 
+    /// Enclosing flows in nearest-first order, including the box at distance zero.
+    /// Empty independent boxes may inherit their parent's placement; other
+    /// independent flows terminate the chain after including themselves.
+    pub fn flow_ancestors(self, owner: BoxId) -> impl Iterator<Item = (u32, usize)> + 'a {
+        let mut current = Some(owner);
+        let mut distance = 0;
+        std::iter::from_fn(move || {
+            let box_id = current?;
+            let index = layout_state::box_id_index(box_id);
+            let facts = self.pagination_ownership().boxes.get(index)?;
+            let stop = facts.independent
+                && (distance != 0 || !self.content_line_range(owner).is_empty());
+            current = if stop { None } else { self.parent(box_id) };
+            let entry = (index as u32, distance);
+            distance += 1;
+            Some(entry)
+        })
+    }
+
     pub fn fragmentation_distance(self, box_id: BoxId, line_idx: LineId) -> Option<usize> {
         let ownership = self.pagination_ownership();
         let owner = layout_state::box_id_index(box_id) as u32;
@@ -571,8 +599,11 @@ impl<'a> RenderBoxView<'a> {
         if line.content.contains(&owner) {
             return Some(0);
         }
-        ownership.box_flows.get(owner as usize)?.iter()
-            .find_map(|&(flow, distance)| line.flows.contains(&flow).then_some(distance))
+        self.flow_ancestors(box_id)
+            .find_map(|(flow, distance)| {
+                ownership.flow_contains_line(flow, layout_state::line_id_index(line_idx) as u32)
+                    .then_some(distance)
+            })
     }
 }
 

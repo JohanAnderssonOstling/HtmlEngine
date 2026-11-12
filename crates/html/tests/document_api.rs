@@ -33,7 +33,7 @@ use crate::resources::ResourceProvider;
 use crate::search::SearchIndex;
 use crate::targets::ElementTarget;
 use crate::selection::{Selection, SelectionAnchor, SelectionInput, TableSelectionState};
-use crate::structure::{Structure, HeaderPolicy, TableGroupKind};
+use crate::structure::{Structure, TableGroupKind};
 use crate::text::{
     GlyphResourceGeneration, GlyphShaper, FontMetrics, GlyphHandle, ShapedRun, TextRunShapeRequest,
     ShapedGlyph, TextSearchOptions};
@@ -520,22 +520,14 @@ fn structural_boundaries_include_empty_elements_and_authored_constraints() {
 }
 
 #[test]
-fn table_dependencies_expose_span_groups_and_keep_header_inference_optional() {
+fn table_dependencies_expose_span_groups() {
     let engine = load(
         "<table><caption>caption</caption><tr><th>head</th><th>title</th></tr><tr><td rowspan='2'>span</td><td>one</td></tr><tr><td>two</td></tr></table>",
     );
     let view = engine.render_view().unwrap();
     let mut structure = Structure::default();
     let mut index = structure.for_lines(view, 0..view.text().line_count());
-    let explicit = index.table_dependencies(HeaderPolicy::ExplicitOnly);
-    assert!(explicit.iter().all(|group| !matches!(
-        group.kind,
-        TableGroupKind::RowGroup {
-            header: Some(_),
-            ..
-        }
-    )));
-    let groups = index.table_dependencies(HeaderPolicy::InferLeadingHeaderCells);
+    let groups = index.table_dependencies();
     let whole = groups
         .iter()
         .find(|group| matches!(group.kind, TableGroupKind::WholeTable))
@@ -543,15 +535,8 @@ fn table_dependencies_expose_span_groups_and_keep_header_inference_optional() {
 
     let body = groups
         .iter()
-        .find(|group| {
-            matches!(
-                group.kind,
-                TableGroupKind::RowGroup {
-                    header: Some(_),
-                    ..
-                }
-            )
-        })
+        .filter(|group| matches!(group.kind, TableGroupKind::RowGroup { .. }))
+        .last()
         .unwrap();
     assert!(body.bottom > body.top && body.bottom <= whole.bottom);
     let span_line =
@@ -1576,6 +1561,7 @@ mod document_operations {
                         position: first,
                         mode: SelectionMode::Plain,
                         select_text: true,
+                        click_action: false,
                         clicks: 1
                     }
                 )

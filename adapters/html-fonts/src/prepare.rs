@@ -1,7 +1,7 @@
 //! Prepare authored font sources using host-provided I/O and local discovery.
 //! Hosts register the prepared result in their native text backend; rejecting a
 //! source continues through the remaining authored alternatives.
-use html::text::FontFace;
+use html_style_model::FontFace;
 use html_style_model::FontFaceSource;
 use html_resources::fonts::decode;
 use std::future::Future;

@@ -40,7 +40,7 @@ pub struct PaintCandidates {
 }
 
 /// A geometry-only contract. A source item may be omitted or placed more than
-/// once (for example a repeated header). Implementations never choose CSS order.
+/// once (for example across page fragments). Implementations never choose CSS order.
 /// Projections append their placements to `out`; the engine clears and reuses
 /// the buffer between items.
 pub trait PaintProjection {
