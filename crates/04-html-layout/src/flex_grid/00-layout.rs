@@ -1,6 +1,6 @@
 //! Pass prepared inputs through solving, child placement, and alignment.
-use super::{FlexGridInput, s04_align, s03_place, s01_prepare, s02_solve};
-use crate::layout::{ContentLayoutResult, LayoutEngine};
+use super::{FlexGridInput, s01_prepare, s02_solve, s03_place, s04_align};
+use crate::{ContentLayoutResult, LayoutEngine};
 
 pub(crate) fn layout(
     engine: &mut LayoutEngine<'_, '_>,

@@ -49,8 +49,11 @@ pub(super) enum StyleSharingProbe {
     Miss(StyleSharingSignature),
 }
 
-pub(super) fn element_is_shareable(element: ElementRef<'_>, has_inline_style: bool) -> bool {
-    if has_inline_style {
+pub(super) fn element_is_shareable(
+    element: ElementRef<'_>,
+    has_element_declarations: bool,
+) -> bool {
+    if has_element_declarations {
         return false;
     }
     // Cell hints can inherit border and padding from an ancestor table, an
@@ -58,56 +61,23 @@ pub(super) fn element_is_shareable(element: ElementRef<'_>, has_inline_style: bo
     if element.tag().eq_ignore_ascii_case("td") || element.tag().eq_ignore_ascii_case("th") {
         return false;
     }
-    // Selector-visible attributes are already represented by the exact
-    // matched-rule list. Exclude only attributes consumed outside selector
-    // matching by the current style pipeline.
-    const OUT_OF_BAND_ATTRIBUTES: &[&str] = &[
-        "style",
-        "lang",
-        "dir",
-        "hidden",
-        "text",
-        "color",
-        "size",
-        "width",
-        "height",
-        "bgcolor",
-        "align",
-        "valign",
-        "border",
-        "bordercolor",
-        "type",
-        "clear",
-        "hspace",
-        "vspace",
-        "marginwidth",
-        "marginheight",
-        "topmargin",
-        "rightmargin",
-        "bottommargin",
-        "leftmargin",
-        "cellspacing",
-        "cellpadding",
-        "nowrap",
-        "noshade",
-    ];
-    !element.attributes().any(|attribute| {
-        OUT_OF_BAND_ATTRIBUTES
-            .iter()
-            .any(|name| attribute.local_name().eq_ignore_ascii_case(name))
-    })
+    // Hint declarations are collected before either sharing cache is consulted.
+    // Language is the remaining attribute consumed directly by the cascade.
+    !element
+        .attributes()
+        .any(|attribute| attribute.local_name().eq_ignore_ascii_case("lang"))
 }
 
 impl StyleSharingCache {
     pub(super) fn probe(
         &mut self,
         element: ElementRef<'_>,
-        has_inline_style: bool,
+        has_element_declarations: bool,
         parent_style: Option<StyleIndices>,
         parent_custom_map_id: u32,
         matched_rules: &[MatchedRule],
     ) -> StyleSharingProbe {
-        if !element_is_shareable(element, has_inline_style) {
+        if !element_is_shareable(element, has_element_declarations) {
             return StyleSharingProbe::Uncacheable;
         }
         let mut hasher = FxHasher::default();
@@ -204,7 +174,7 @@ mod tests {
             StyleSharingProbe::Uncacheable
         ));
         assert!(matches!(
-            cache.probe(paragraphs[2], false, Some(style), 0, &[]),
+            cache.probe(paragraphs[2], true, Some(style), 0, &[]),
             StyleSharingProbe::Uncacheable
         ));
         assert!(matches!(

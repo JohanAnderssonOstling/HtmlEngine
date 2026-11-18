@@ -1,5 +1,5 @@
-use html_style_model::language;
 use super::*;
+use html_style_model::language;
 
 #[test]
 fn content_languages_inherit_as_structured_tags_and_empty_values_reset_them() {
@@ -13,7 +13,13 @@ fn content_languages_inherit_as_structured_tags_and_empty_values_reset_them() {
         let node = prepared
             .document()
             .node_ids()
-            .find(|&node| prepared.document().try_element_ref(node).and_then(|element| element.id()) == Some(id))
+            .find(|&node| {
+                prepared
+                    .document()
+                    .try_element_ref(node)
+                    .and_then(|element| element.id())
+                    == Some(id)
+            })
             .unwrap();
         let style = prepared
             .styles()
@@ -22,11 +28,13 @@ fn content_languages_inherit_as_structured_tags_and_empty_values_reset_them() {
         style.language()
     };
     assert_eq!(language("parent"), language("inherited"));
-    let tag = language::content_language_tag(&prepared
-        .styles()
-        .language(language("inherited").unwrap())
-        .unwrap())
-        .unwrap();
+    let tag = language::content_language_tag(
+        &prepared
+            .styles()
+            .language(language("inherited").unwrap())
+            .unwrap(),
+    )
+    .unwrap();
     assert_eq!(tag.script(), Some("Hant"));
     assert_eq!(tag.region(), Some("TW"));
     assert!(language("empty").is_none());
@@ -87,16 +95,21 @@ fn xml_language_precedes_html_language_and_survives_reader_rebuilding() {
     assert_eq!(tag.primary_language(), "zh");
     assert_eq!(tag.script(), Some("Hant"));
     assert_eq!(tag.region(), Some("TW"));
-    let rebuilt = prepared
-        .styles()
-        .with_reader_overrides(
-            prepared.document(),
-            &ReaderStyleOverrides {
-                font_family: Some("reader serif".into()),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    let rebuilt = crate::resolve_document_with_program(
+        prepared.document(),
+        &crate::StyleProgram::compile(
+            &[],
+            Default::default(),
+            prepared.document().root_font_size(),
+        ),
+        &[],
+        Default::default(),
+        &ReaderStyleOverrides {
+            font_family: Some("reader serif".into()),
+            ..Default::default()
+        },
+    )
+    .0;
     let new_id = rebuilt
         .view(rebuilt.style_for_node(node).unwrap())
         .unwrap()

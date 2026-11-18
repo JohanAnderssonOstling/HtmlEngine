@@ -1,6 +1,7 @@
 //! Execute compact selector instructions against document nodes.
 use super::dom::{
-    SiblingIndex, attribute_value_matches, parsed_case_sensitivity, pseudo_matches_dom,
+    PseudoTarget, TraversalContext, attribute_value_matches, parsed_case_sensitivity,
+    pseudo_matches_dom, selector_matches_indexed_in_scope,
 };
 use super::traversal::SummaryTest;
 use crate::style::compiled::{
@@ -9,7 +10,7 @@ use crate::style::compiled::{
 };
 use html_dom::storage;
 use html_dom::{Document, DomNodeId, ElementRef};
-use lightningcss::selector::PseudoClass;
+use lightningcss::selector::{PseudoClass, Selector};
 
 impl CompiledSelectors {
     pub(crate) fn for_rule(&self, id: EffectiveRuleId) -> &[PreparedSelector] {
@@ -183,7 +184,7 @@ impl<'a> BoundTest<'a> {
 
 struct BoundMatcher<'a, 'cache, 'dom, 'css> {
     bound: &'a BoundSelectors<'dom>,
-    siblings: Option<&'a mut SiblingIndex<'cache, 'dom, 'css>>,
+    traversal: &'a mut TraversalContext<'cache, 'dom, 'css>,
 }
 
 impl<'dom> std::ops::Deref for BoundMatcher<'_, '_, 'dom, '_> {
@@ -194,35 +195,49 @@ impl<'dom> std::ops::Deref for BoundMatcher<'_, '_, 'dom, '_> {
 }
 
 impl<'dom> BoundSelectors<'dom> {
-    pub(crate) fn matches(&self, selector: PreparedSelector, node: DomNodeId) -> Option<bool> {
+    pub(crate) fn matches(
+        &self,
+        selector: PreparedSelector,
+        node: DomNodeId,
+        traversal: &mut TraversalContext<'_, 'dom, '_>,
+    ) -> Option<bool> {
         BoundMatcher {
             bound: self,
-            siblings: None,
+            traversal,
         }
         .matches(selector, node)
     }
-    pub(crate) fn matches_indexed(
+
+    /// Match a prepared candidate, keeping compact/AST dispatch inside matching.
+    pub(crate) fn matches_selector<'css>(
         &self,
         selector: PreparedSelector,
+        source: &Selector<'css>,
         node: DomNodeId,
-    ) -> Option<bool> {
+        pseudo: Option<PseudoTarget>,
+        scope: Option<DomNodeId>,
+        traversal: &mut TraversalContext<'_, 'dom, 'css>,
+    ) -> bool {
         BoundMatcher {
             bound: self,
-            siblings: None,
+            traversal: &mut *traversal,
         }
-        .matches_indexed(selector, node)
-    }
-    pub(crate) fn matches_indexed_in_traversal(
-        &self,
-        selector: PreparedSelector,
-        node: DomNodeId,
-        traversal: &mut SiblingIndex<'_, 'dom, '_>,
-    ) -> Option<bool> {
-        BoundMatcher {
-            bound: self,
-            siblings: Some(traversal),
-        }
-        .matches_indexed_in_traversal(selector, node)
+        .matches_candidate(selector, node)
+        .unwrap_or_else(|| {
+            scope
+                .or_else(|| self.document.dom_root())
+                .is_some_and(|scope| {
+                    selector_matches_indexed_in_scope(
+                        source,
+                        self.document,
+                        node,
+                        pseudo,
+                        scope,
+                        traversal,
+                        selector.bucket_component,
+                    )
+                })
+        })
     }
 }
 
@@ -236,33 +251,9 @@ impl BoundMatcher<'_, '_, '_, '_> {
         }
     }
 
-    /// The candidate index already proved one predicate in the subject.
-    #[inline]
-    pub(crate) fn matches_indexed(
-        &mut self,
-        selector: PreparedSelector,
-        node: DomNodeId,
-    ) -> Option<bool> {
-        if selector.bucket_test == u16::MAX {
-            return self.matches(selector, node);
-        }
-        let start = selector.fast_start as usize;
-        if selector.fast_len == 1 && self.compiled.compounds[start].test_len == 1 {
-            return Some(true);
-        }
-        Some(
-            self.matches_compound_skipping(start, node, selector.bucket_test)
-                && (selector.fast_len == 1 || self.matches_relation(start, node)),
-        )
-    }
-
     /// A single local ancestor predicate can be answered from traversal facts.
     /// Longer chains and compound conjunctions retain exact matching.
-    pub(crate) fn matches_indexed_in_traversal(
-        &mut self,
-        selector: PreparedSelector,
-        node: DomNodeId,
-    ) -> Option<bool> {
+    fn matches_candidate(&mut self, selector: PreparedSelector, node: DomNodeId) -> Option<bool> {
         if selector.fast_len == 2 {
             let start = selector.fast_start as usize;
             let first = self.compiled.compounds[start];
@@ -281,17 +272,23 @@ impl BoundMatcher<'_, '_, '_, '_> {
                     if !self.matches_compound_skipping(start, node, selector.bucket_test) {
                         return Some(false);
                     }
-                    if let Some(matched) = self
-                        .siblings
-                        .as_deref_mut()
-                        .and_then(|traversal| traversal.ancestor_matches(node, test))
-                    {
+                    if let Some(matched) = self.traversal.ancestor_matches(node, test) {
                         return Some(matched);
                     }
                 }
             }
         }
-        self.matches_indexed(selector, node)
+        if selector.bucket_test == u16::MAX {
+            return self.matches(selector, node);
+        }
+        let start = selector.fast_start as usize;
+        if selector.fast_len == 1 && self.compiled.compounds[start].test_len == 1 {
+            return Some(true);
+        }
+        Some(
+            self.matches_compound_skipping(start, node, selector.bucket_test)
+                && (selector.fast_len == 1 || self.matches_relation(start, node)),
+        )
     }
 
     #[inline]
@@ -327,8 +324,7 @@ impl BoundMatcher<'_, '_, '_, '_> {
     fn matches_test(&mut self, test: &BoundTest<'_>, element: ElementRef<'_>) -> bool {
         match test {
             BoundTest::PseudoClass { pseudo, negated } => {
-                pseudo_matches_dom(pseudo, self.document, element, self.siblings.as_deref_mut())
-                    != *negated
+                pseudo_matches_dom(pseudo, self.document, element, &mut *self.traversal) != *negated
             }
             BoundTest::LocalName { name, lower_name } => {
                 Self::matches_name(*name, *lower_name, element)
@@ -428,12 +424,7 @@ impl BoundMatcher<'_, '_, '_, '_> {
                 .dom_ancestors(node)
                 .any(|ancestor| self.matches_from(compound_index + 1, ancestor)),
             Relation::PreviousSibling => {
-                let previous = match self.siblings.as_deref_mut() {
-                    Some(siblings) => siblings.previous_element_sibling(node),
-                    None => element
-                        .previous_element_sibling()
-                        .map(|element| element.node_id()),
-                };
+                let previous = self.traversal.previous_element_sibling(node);
                 previous.is_some_and(|sibling| self.matches_from(compound_index + 1, sibling))
             }
         }

@@ -4,9 +4,10 @@ use html_style_model::language;
 use super::line_breaks::{CjkWritingSystem, is_unspaced_cjk};
 use crate::source_offsets::SourceOffsets;
 use crate::{
-    InlineContent, InlineItemKind, TextStructure, WhitespaceWrapOverride, is_bidi_control,
+    FirstLetterStyles, InlineContent, InlineItemKind, TextStructure, WhitespaceWrapOverride,
+    is_bidi_control,
 };
-use html_style_model::{ComputedStyles, LanguageId, StyleIndices, StyleView, TextTransform};
+use html_style_model::{ComputedStyles, LanguageId, StyleView, TextTransform};
 use html_style_model::{LineBreak, WordBreak};
 use icu_casemap::{
     CaseMapper,
@@ -17,7 +18,6 @@ use icu_properties::{
     props::{Cased, CaseIgnorable, EastAsianWidth, Emoji},
 };
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
-use std::mem::size_of;
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_categories::UnicodeCategories;
@@ -48,115 +48,17 @@ fn is_transparent_to_collapsing(character: char) -> bool {
 
 struct PendingSpace {
     run: usize,
-    source: usize,
     offset: u32,
     wrap_before: WhitespaceWrapOverride,
     segment_break: bool,
-}
-
-struct PendingControl {
-    run: u32,
-    source: u32,
-}
-
-enum NormalizationMap {
-    Characters {
-        remap: Vec<u32>,
-        pending_controls: Vec<usize>,
-    },
-    Runs {
-        ranges: Vec<Range<u32>>,
-        pending_controls: Vec<PendingControl>,
-    },
-}
-
-impl NormalizationMap {
-    fn new(characters: usize, runs: usize) -> Self {
-        // Only run endpoints survive normalization. Keep the dense form for
-        // unusually fragmented input. Compact control entries must also fit
-        // the original source-only queue's element size on this target.
-        if runs <= characters / 2
-            && u32::try_from(runs).is_ok()
-            && size_of::<PendingControl>() <= size_of::<usize>()
-        {
-            Self::Runs {
-                ranges: vec![0..0; runs],
-                pending_controls: Vec::new(),
-            }
-        } else {
-            Self::Characters {
-                remap: vec![u32::MAX; characters],
-                pending_controls: Vec::new(),
-            }
-        }
-    }
-
-    fn record(&mut self, run: usize, source: usize, destination: u32) {
-        match self {
-            Self::Characters { remap, .. } => remap[source] = destination,
-            Self::Runs { ranges, .. } => {
-                let range = &mut ranges[run];
-                if range.is_empty() {
-                    range.start = destination;
-                }
-                range.end = destination + 1;
-            }
-        }
-    }
-
-    fn range(&self, run: usize, source: Range<u32>) -> Range<u32> {
-        match self {
-            Self::Runs { ranges, .. } => ranges[run].clone(),
-            Self::Characters { remap, .. } => {
-                let mut mapped = source.filter_map(|index| {
-                    remap
-                        .get(index as usize)
-                        .copied()
-                        .filter(|mapped| *mapped != u32::MAX)
-                });
-                match mapped.next() {
-                    Some(start) => start..mapped.next_back().unwrap_or(start) + 1,
-                    None => 0..0,
-                }
-            }
-        }
-    }
-
-    fn defer_control(&mut self, run: usize, source: usize) {
-        match self {
-            Self::Characters { pending_controls, .. } => pending_controls.push(source),
-            Self::Runs { pending_controls, .. } => pending_controls.push(PendingControl {
-                run: u32::try_from(run).expect("compact mapping checked the run count"),
-                source: u32::try_from(source).expect("source index comes from a u32 glyph range"),
-            }),
-        }
-    }
-
-    fn pending_control(&self, index: usize) -> Option<(usize, usize)> {
-        match self {
-            // Dense mapping uses only the source position; record ignores run.
-            Self::Characters { pending_controls, .. } => {
-                pending_controls.get(index).map(|&source| (0, source))
-            }
-            Self::Runs { pending_controls, .. } => pending_controls
-                .get(index)
-                .map(|control| (control.run as usize, control.source as usize)),
-        }
-    }
-
-    fn clear_pending_controls(&mut self) {
-        match self {
-            Self::Characters { pending_controls, .. } => pending_controls.clear(),
-            Self::Runs { pending_controls, .. } => pending_controls.clear(),
-        }
-    }
 }
 
 struct NormalizedText {
     glyphs: Vec<char>,
     source_offsets: SourceOffsets,
     wraps: Vec<WhitespaceWrapOverride>,
-    remap: NormalizationMap,
+    ranges: Vec<Range<u32>>,
+    pending_controls: Vec<(usize, usize)>,
 }
 
 impl NormalizedText {
@@ -165,19 +67,22 @@ impl NormalizedText {
             glyphs: Vec::with_capacity(capacity),
             source_offsets: SourceOffsets::with_capacity(capacity),
             wraps: Vec::with_capacity(capacity),
-            remap: NormalizationMap::new(capacity, runs),
+            ranges: vec![0..0; runs],
+            pending_controls: Vec::new(),
         }
     }
 
     fn push(
         &mut self,
         run: usize,
-        source: usize,
         character: char,
         offset: u32,
         wrap: WhitespaceWrapOverride,
     ) {
-        self.remap.record(run, source, self.glyphs.len() as u32);
+        if self.ranges[run].is_empty() {
+            self.ranges[run].start = self.glyphs.len() as u32;
+        }
+        self.ranges[run].end = self.glyphs.len() as u32 + 1;
         self.glyphs.push(character);
         self.source_offsets.push(offset);
         self.wraps.push(wrap);
@@ -185,20 +90,13 @@ impl NormalizedText {
 
     fn finish_pending(&mut self, pending: PendingSpace, keep_space: bool, content: &InlineContent) {
         if keep_space {
-            self.push(
-                pending.run,
-                pending.source,
-                ' ',
-                pending.offset,
-                pending.wrap_before,
-            );
+            self.push(pending.run, ' ', pending.offset, pending.wrap_before);
         }
         // Retain source order whether the preceding space survives or not.
         let mut index = 0;
-        while let Some((run, source)) = self.remap.pending_control(index) {
+        while let Some((run, source)) = self.pending_controls.get(index).copied() {
             self.push(
                 run,
-                source,
                 content.character_at(source).expect("pending control glyph"),
                 content.raw_glyph_source_offset(source),
                 WhitespaceWrapOverride::Style,
@@ -206,7 +104,7 @@ impl NormalizedText {
             index += 1;
         }
         // Retain capacity for later pending-whitespace sequences.
-        self.remap.clear_pending_controls();
+        self.pending_controls.clear();
     }
 }
 
@@ -310,9 +208,9 @@ pub fn collapse_whitespace(
             // transparent to whitespace collapsing, line starts and joining.
             if character_bits >= 0x00ad && is_transparent_to_collapsing(character) {
                 if pending_space.is_some() {
-                    output.remap.defer_control(run_index, i);
+                    output.pending_controls.push((run_index, i));
                 } else {
-                    output.push(run_index, i, character, offset, WhitespaceWrapOverride::Style);
+                    output.push(run_index, character, offset, WhitespaceWrapOverride::Style);
                 }
                 continue;
             }
@@ -325,14 +223,13 @@ pub fn collapse_whitespace(
                 if let Some(pending) = pending_space.take() {
                     output.finish_pending(pending, false, inline_content);
                 }
-                output.push(run_index, i, character, offset, WhitespaceWrapOverride::Style);
+                output.push(run_index, character, offset, WhitespaceWrapOverride::Style);
                 at_line_start = true;
                 context_start = output.glyphs.len();
             } else if character == '\n' || is_css_collapsible_space(character) {
                 if collapse && !at_line_start {
                     let pending = pending_space.get_or_insert(PendingSpace {
                         run: run_index,
-                        source: i,
                         offset,
                         wrap_before: WhitespaceWrapOverride::Style,
                         segment_break: false,
@@ -348,7 +245,7 @@ pub fn collapse_whitespace(
                         pending.wrap_before = WhitespaceWrapOverride::Suppress;
                         output.finish_pending(pending, true, inline_content);
                     }
-                    output.push(run_index, i, character, offset, WhitespaceWrapOverride::Style);
+                    output.push(run_index, character, offset, WhitespaceWrapOverride::Style);
                     at_line_start = false;
                 }
             } else {
@@ -365,7 +262,7 @@ pub fn collapse_whitespace(
                                 && previous.is_some_and(|previous| joins_east_asian_punctuation(previous, character))));
                     output.finish_pending(pending, !join, inline_content);
                 }
-                output.push(run_index, i, character, offset, WhitespaceWrapOverride::Style);
+                output.push(run_index, character, offset, WhitespaceWrapOverride::Style);
                 at_line_start = false;
             }
         }
@@ -380,11 +277,24 @@ pub fn collapse_whitespace(
         else {
             continue;
         };
-        *glyphs = output.remap.range(run_index, glyphs.clone());
+        *glyphs = output.ranges[run_index].clone();
         run_index += 1;
     }
     inline_content.replace_characters(output.glyphs, output.source_offsets, output.wraps);
     unicode_roots
+}
+
+struct CaseRun {
+    glyphs: Range<usize>,
+    transform: TextTransform,
+    language: Option<LanguageId>,
+}
+
+impl CaseRun {
+    fn at(runs: &[Self], glyph: usize) -> Option<&Self> {
+        runs.get(runs.partition_point(|run| run.glyphs.end <= glyph))
+            .filter(|run| run.glyphs.start <= glyph)
+    }
 }
 
 /// Applies CSS case conversion to the normalized character stream before any
@@ -395,65 +305,75 @@ pub fn transform_text(
     styles: &ComputedStyles,
     layout_tree: &(impl TextStructure + ?Sized),
     inline_content: &mut InlineContent,
-    first_letter_styles: &mut Vec<Option<StyleIndices>>,
+    first_letter_styles: &mut FirstLetterStyles,
 ) {
     let has_transform = inline_content.text_runs().any(|run| {
         !run.glyphs.is_empty()
             && get_style(styles, layout_tree, run.box_idx as usize).text_transform()
                 != TextTransform::None
-    }) || first_letter_styles.iter().flatten().any(|&indices| {
+    }) || first_letter_styles.runs.iter().any(|run| {
         styles
-            .view(indices)
+            .view(run.style)
             .is_some_and(|style| style.text_transform() != TextTransform::None)
     });
     if !has_transform {
         return;
     }
     let old_len = inline_content.characters().len();
-    let mut transforms = vec![TextTransform::None; old_len];
-    let mut languages = vec![None; old_len];
+    let mut case_runs = Vec::new();
     for run in inline_content.text_runs() {
         let base_style = get_style(styles, layout_tree, run.box_idx as usize);
-        for glyph_idx in run.glyphs.clone() {
-            let index = glyph_idx as usize;
-            let style = first_letter_styles
-                .get(index)
-                .copied()
-                .flatten()
+        let mut start = run.glyphs.start;
+        while start < run.glyphs.end {
+            let (override_style, end) = first_letter_styles.segment(start, run.glyphs.end);
+            let style = override_style
                 .and_then(|indices| styles.view(indices))
                 .unwrap_or(base_style);
-            transforms[index] = style.text_transform();
-            languages[index] = style.language();
+            case_runs.push(CaseRun {
+                glyphs: start as usize..end as usize,
+                transform: style.text_transform(),
+                language: style.language(),
+            });
+            start = end;
         }
     }
-    if transforms
+    if case_runs
         .iter()
-        .all(|transform| *transform == TextTransform::None)
+        .all(|run| run.transform == TextTransform::None)
     {
         return;
     }
 
-    let (capitalize_starts, final_sigmas) = (transforms.contains(&TextTransform::Capitalize)
+    case_runs.sort_unstable_by_key(|run| run.glyphs.start);
+    let (capitalize_starts, final_sigmas) = (case_runs
+        .iter()
+        .any(|run| run.transform == TextTransform::Capitalize)
         || inline_content.characters().contains(&'Σ'))
-        .then(|| casing_context(styles, layout_tree, inline_content, &languages))
-        .unwrap_or_default();
+    .then(|| casing_context(styles, layout_tree, inline_content, &case_runs))
+    .unwrap_or_default();
     let mut new_glyphs = Vec::with_capacity(old_len);
     let mut new_source_offsets = SourceOffsets::with_capacity(old_len);
     let mut new_whitespace_wrap_before = Vec::with_capacity(old_len);
-    let has_first_letter_styles = !first_letter_styles.is_empty();
-    let mut new_first_letter_styles =
-        Vec::with_capacity(if has_first_letter_styles { old_len } else { 0 });
     let mut glyph_boundaries = Vec::with_capacity(old_len + 1);
     glyph_boundaries.push(0);
 
-    let contextual_uppercase = greek_uppercase_mappings(
-        styles, layout_tree, inline_content, &transforms, &languages,
-    );
-    for (index, transform) in transforms.into_iter().enumerate() {
+    let contextual_uppercase =
+        greek_uppercase_mappings(styles, layout_tree, inline_content, &case_runs);
+    let mut remaining_runs = case_runs.as_slice();
+    for index in 0..old_len {
+        while remaining_runs
+            .first()
+            .is_some_and(|run| run.glyphs.end <= index)
+        {
+            remaining_runs = &remaining_runs[1..];
+        }
+        let transform = remaining_runs
+            .first()
+            .filter(|run| run.glyphs.start <= index)
+            .map_or(TextTransform::None, |run| run.transform);
         let character = inline_content.character_at(index).unwrap_or('?');
         let source_offset = inline_content.raw_glyph_source_offset(index);
         let wrap_override = inline_content.whitespace_wrap_before(index);
-        let first_letter_style = first_letter_styles.get(index).copied().flatten();
         let mut first_output = true;
         let mut append = |transformed: char| {
             new_glyphs.push(transformed);
@@ -463,9 +383,6 @@ pub fn transform_text(
             } else {
                 WhitespaceWrapOverride::Style
             });
-            if has_first_letter_styles {
-                new_first_letter_styles.push(first_letter_style);
-            }
             first_output = false;
         };
 
@@ -501,7 +418,12 @@ pub fn transform_text(
         *glyphs = glyph_boundaries[old_start]..glyph_boundaries[old_end];
     }
     inline_content.replace_characters(new_glyphs, new_source_offsets, new_whitespace_wrap_before);
-    *first_letter_styles = new_first_letter_styles;
+    let mut overrides = std::mem::take(&mut first_letter_styles.runs).into_vec();
+    for run in &mut overrides {
+        run.glyphs =
+            glyph_boundaries[run.glyphs.start as usize]..glyph_boundaries[run.glyphs.end as usize];
+    }
+    *first_letter_styles = FirstLetterStyles::new(overrides);
 }
 
 /// Greek uppercase tailoring can remove accents and add a diaeresis based on
@@ -512,16 +434,17 @@ fn greek_uppercase_mappings(
     styles: &ComputedStyles,
     tree: &(impl TextStructure + ?Sized),
     content: &InlineContent,
-    transforms: &[TextTransform],
-    languages: &[Option<LanguageId>],
+    case_runs: &[CaseRun],
 ) -> FxHashMap<usize, Vec<char>> {
-    let greek = |index: usize| {
-        languages[index]
-            .and_then(|id| styles.language(id))
-            .and_then(|language| language::content_language_tag(&language))
-            .is_some_and(|tag| tag.primary_language() == "el")
+    let greek = |run: &CaseRun| {
+        run.transform == TextTransform::Uppercase
+            && run
+                .language
+                .and_then(|id| styles.language(id))
+                .and_then(|language| language::content_language_tag(&language))
+                .is_some_and(|tag| tag.primary_language() == "el")
     };
-    if !(0..transforms.len()).any(|index| transforms[index] == TextTransform::Uppercase && greek(index)) {
+    if !case_runs.iter().any(greek) {
         return FxHashMap::default();
     }
     fn publish(text: &mut String, sources: &mut Vec<usize>, mappings: &mut FxHashMap<usize, Vec<char>>) {
@@ -545,7 +468,7 @@ fn greek_uppercase_mappings(
         match &item.kind {
             InlineItemKind::Text { glyphs } | InlineItemKind::Marker { glyphs } => {
                 for index in glyphs.clone().map(|index| index as usize) {
-                    if transforms[index] == TextTransform::Uppercase && greek(index) {
+                    if CaseRun::at(case_runs, index).is_some_and(greek) {
                         sources.push(index);
                         text.push(content.character_at(index).expect("source glyph"));
                     } else {
@@ -633,7 +556,7 @@ fn casing_context(
     styles: &ComputedStyles,
     layout_tree: &(impl TextStructure + ?Sized),
     inline_content: &InlineContent,
-    languages: &[Option<LanguageId>],
+    case_runs: &[CaseRun],
 ) -> (FxHashSet<usize>, FxHashSet<usize>) {
     fn publish(
         text: &mut String,
@@ -641,7 +564,7 @@ fn casing_context(
         starts: &mut FxHashSet<usize>,
         final_sigmas: &mut FxHashSet<usize>,
         styles: &ComputedStyles,
-        languages: &[Option<LanguageId>],
+        case_runs: &[CaseRun],
     ) {
         for (word_start, word) in text.unicode_word_indices() {
             let Some((relative, _)) = word
@@ -656,7 +579,8 @@ fn casing_context(
             {
                 starts.insert(glyphs_by_byte[position].1);
                 let source = glyphs_by_byte[position].1;
-                let dutch = languages[source]
+                let dutch = CaseRun::at(case_runs, source)
+                    .and_then(|run| run.language)
                     .and_then(|id| styles.language(id))
                     .and_then(|language| language::content_language_tag(&language))
                     .is_some_and(|tag| tag.primary_language() == "nl");
@@ -708,7 +632,7 @@ fn casing_context(
                 &mut starts,
                 &mut final_sigmas,
                 styles,
-                languages,
+                case_runs,
             );
             current_context = Some(context);
         }
@@ -738,7 +662,7 @@ fn casing_context(
         &mut starts,
         &mut final_sigmas,
         styles,
-        languages,
+        case_runs,
     );
     (starts, final_sigmas)
 }
@@ -749,19 +673,6 @@ fn casing_context(
 /// visible under `white-space: normal`.
 pub fn is_css_collapsible_space(character: char) -> bool {
     matches!(character, ' ' | '\t')
-}
-
-pub fn whitespace_context_root(
-    layout_tree: &(impl TextStructure + ?Sized),
-    mut box_idx: usize,
-) -> usize {
-    while layout_tree.is_inline(box_idx) {
-        let Some(parent) = layout_tree.get_box_parent(box_idx) else {
-            break;
-        };
-        box_idx = parent;
-    }
-    box_idx
 }
 
 fn layout_box_is_descendant_of(

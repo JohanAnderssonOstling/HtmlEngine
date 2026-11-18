@@ -1,0 +1,282 @@
+use super::tokens::{InlineTokenKind, InlineTokenMetrics, ReplacedToken, TokenMetadata};
+use html_engine_model::{
+    FontMetrics, GlyphAdvanceRun, GlyphDimensionsCursor, GlyphId, GlyphMetric, GlyphMetrics,
+    GlyphOffsetRun, GlyphSlice, InlineContent, InlineItem, InlineItemKind, Line, LineTextPlacement,
+    NativeRuns, TextGeometryView, WhitespaceWrapOverride, WordIndex,
+};
+use html_style_model::{StyleIndices, TextDirection};
+use html_text::{FirstLetterStyles, tracking_boundary_after};
+use rustc_data_structures::fx::FxHashMap;
+
+/// Immutable shaped-text input used by inline layout and intrinsic sizing.
+/// Keeping it separate from the token cache makes the distinction between
+/// source data and mutable inline layout state explicit.
+#[derive(Clone, Copy)]
+pub struct InlineReader<'input> {
+    content: &'input InlineContent,
+    first_letter_styles: &'input FirstLetterStyles,
+    glyphs: GlyphSlice<'input>,
+    glyph_metrics: &'input GlyphMetrics,
+    text_geometry: Option<TextGeometryView<'input>>,
+    word_index: Option<&'input WordIndex>,
+    ellipsis_glyphs: &'input FxHashMap<u32, GlyphId>,
+    hyphen_glyphs: &'input FxHashMap<u32, GlyphId>,
+}
+
+impl<'input> InlineReader<'input> {
+    pub(crate) fn from_inputs(inputs: &crate::LayoutInputs<'input>) -> Self {
+        Self::new(
+            inputs.inline_content,
+            inputs.first_letter_styles,
+            inputs.glyphs,
+            inputs.glyph_metrics,
+            inputs.text_geometry,
+            inputs.ellipsis_glyphs,
+            inputs.hyphen_glyphs,
+        )
+        .with_word_index(inputs.word_index)
+    }
+
+    pub fn new(
+        content: &'input InlineContent,
+        first_letter_styles: &'input FirstLetterStyles,
+        glyphs: GlyphSlice<'input>,
+        glyph_metrics: &'input GlyphMetrics,
+        text_geometry: Option<TextGeometryView<'input>>,
+        ellipsis_glyphs: &'input FxHashMap<u32, GlyphId>,
+        hyphen_glyphs: &'input FxHashMap<u32, GlyphId>,
+    ) -> Self {
+        debug_assert_eq!(content.characters().len(), glyphs.len());
+        Self {
+            content,
+            first_letter_styles,
+            glyphs,
+            glyph_metrics,
+            text_geometry,
+            word_index: None,
+            ellipsis_glyphs,
+            hyphen_glyphs,
+        }
+    }
+
+    pub fn with_word_index(mut self, words: Option<&'input WordIndex>) -> Self {
+        self.word_index = words;
+        self
+    }
+
+    pub fn word_index(&self) -> Option<&'input WordIndex> {
+        self.word_index
+    }
+
+    pub fn cursor(self) -> TextCursor<'input> {
+        TextCursor {
+            text: self,
+            dimensions: self.glyph_metrics.dimensions_cursor(),
+            geometry_hint: 0,
+        }
+    }
+
+    pub(crate) fn line_placement<'a>(
+        self,
+        line: &'a Line,
+        offsets: &'a [GlyphOffsetRun],
+        advances: &'a [GlyphAdvanceRun],
+    ) -> LineTextPlacement<'a>
+    where
+        'input: 'a,
+    {
+        LineTextPlacement::new(
+            self.content,
+            self.glyphs,
+            self.glyph_metrics,
+            self.text_geometry,
+            line,
+            offsets,
+            advances,
+        )
+    }
+
+    pub(super) fn has_tracking_boundary_after(&self, index: u32, end: u32) -> bool {
+        tracking_boundary_after(
+            self.content,
+            index,
+            end,
+            self.is_cluster_boundary(index as usize + 1),
+        )
+    }
+
+    pub fn inline_items(&self) -> &'input [InlineItem] {
+        self.content.inline_items()
+    }
+
+    pub fn content(&self) -> &'input InlineContent {
+        self.content
+    }
+
+    pub fn inline_item(&self, run_idx: usize) -> Option<&InlineItem> {
+        self.content.inline_item(run_idx)
+    }
+
+    pub fn glyphs(&self) -> GlyphSlice<'input> {
+        self.glyphs
+    }
+
+    pub fn glyph_at(&self, glyph_idx: usize) -> Option<GlyphId> {
+        self.glyphs.get(glyph_idx).copied()
+    }
+
+    /// Prepared logical character at a retained text position.
+    pub fn character(&self, index: u32) -> char {
+        self.content.characters()[index as usize]
+    }
+
+    pub fn first_letter_style(&self, glyph: u32) -> Option<StyleIndices> {
+        self.first_letter_style_segment(glyph, glyph + 1).0
+    }
+
+    pub(super) fn first_letter_style_segment(
+        &self,
+        start: u32,
+        end: u32,
+    ) -> (Option<StyleIndices>, u32) {
+        self.first_letter_styles.segment(start, end)
+    }
+
+    pub fn whitespace_wrap_before(&self, glyph_idx: usize) -> WhitespaceWrapOverride {
+        self.content.whitespace_wrap_before(glyph_idx)
+    }
+
+    pub fn glyph(&self, glyph_idx: u32) -> Option<GlyphId> {
+        self.glyph_at(glyph_idx as usize)
+    }
+
+    pub fn glyph_metric(&self, glyph: GlyphId) -> GlyphMetric {
+        self.glyph_metrics.get(glyph)
+    }
+
+    pub fn authoritative_runs(&self, range: std::ops::Range<u32>) -> Option<NativeRuns<'input>> {
+        self.text_geometry
+            .map(|geometry| geometry.authoritative_runs(range))
+    }
+
+    pub fn text_advance(&self, character_index: usize, fallback: f32) -> f32 {
+        self.text_geometry
+            .and_then(|geometry| geometry.advance(character_index))
+            .unwrap_or(fallback)
+    }
+
+    pub fn is_cluster_boundary(&self, character_boundary: usize) -> bool {
+        self.text_geometry
+            .is_none_or(|geometry| geometry.is_cluster_boundary(character_boundary))
+    }
+
+    /// Missing geometry cannot prove that bidi preparation is unnecessary.
+    pub(super) fn is_resolved_default_ltr(&self) -> bool {
+        self.text_geometry
+            .is_some_and(|geometry| geometry.bidi().is_default_ltr())
+    }
+
+    pub fn bidi_level(&self, index: u32) -> u8 {
+        self.text_geometry
+            .map_or(0, |geometry| geometry.bidi().level(index))
+    }
+
+    pub fn item_bidi_level(&self, item: &InlineItem) -> u8 {
+        self.text_geometry
+            .map_or(0, |geometry| geometry.bidi().item_level(item))
+    }
+
+    /// Resolve source levels without retaining a second copy in token storage.
+    /// Synthetic markers inherit their visual level during line placement.
+    pub(super) fn token_bidi_level(
+        &self,
+        token: TokenMetadata,
+        metrics: &InlineTokenMetrics,
+        replaced: &[ReplacedToken],
+    ) -> u8 {
+        let kind = match token.kind() {
+            InlineTokenKind::SourceItem { .. } => {
+                unreachable!("source items have no placed bidi level")
+            }
+            InlineTokenKind::InlineBoundary { payload_idx } => {
+                let ReplacedToken::InlineBoundary {
+                    inline_start,
+                    inline_end,
+                    ..
+                } = &replaced[payload_idx as usize]
+                else {
+                    unreachable!("inline boundary payload")
+                };
+                InlineItemKind::InlineBoundary {
+                    inline_start: *inline_start,
+                    inline_end: *inline_end,
+                }
+            }
+            InlineTokenKind::Image { payload_idx } => {
+                let ReplacedToken::Image { image_idx, .. } = &replaced[payload_idx as usize] else {
+                    unreachable!("image payload")
+                };
+                InlineItemKind::Image {
+                    image_idx: *image_idx,
+                }
+            }
+            InlineTokenKind::AtomicBox { .. } => InlineItemKind::AtomicBox {
+                box_idx: metrics.owner_box_idx,
+            },
+            InlineTokenKind::Break { clear } => InlineItemKind::Break { clear },
+            InlineTokenKind::FloatAnchor { box_idx } => InlineItemKind::FloatAnchor { box_idx },
+            InlineTokenKind::AbsoluteAnchor { box_idx } => {
+                InlineItemKind::AbsoluteAnchor { box_idx }
+            }
+            InlineTokenKind::Ellipsis { .. }
+            | InlineTokenKind::Discretionary { .. }
+            | InlineTokenKind::ZeroWidthBreak => return 0,
+            InlineTokenKind::Glyph { glyph_idx } => return self.bidi_level(glyph_idx),
+        };
+        self.item_bidi_level(&InlineItem {
+            kind,
+            box_idx: metrics.owner_box_idx,
+            dom_text_node: None,
+        })
+    }
+
+    pub fn paragraph_direction(&self, index: u32) -> TextDirection {
+        self.text_geometry.map_or(TextDirection::Ltr, |geometry| {
+            geometry.bidi().paragraph_direction(index)
+        })
+    }
+
+    pub fn ellipsis_glyph(&self, box_idx: usize) -> Option<GlyphId> {
+        self.ellipsis_glyphs.get(&(box_idx as u32)).copied()
+    }
+
+    pub fn hyphen_glyph(&self, box_idx: usize) -> Option<GlyphId> {
+        self.hyphen_glyphs.get(&(box_idx as u32)).copied()
+    }
+}
+
+/// Per-traversal hints stay local to each layout operation; shared document
+/// snapshots remain immutable while isolated measurements update owned scratch.
+pub struct TextCursor<'input> {
+    text: InlineReader<'input>,
+    dimensions: GlyphDimensionsCursor<'input>,
+    geometry_hint: usize,
+}
+
+impl TextCursor<'_> {
+    #[inline]
+    pub fn character_geometry(&mut self, index: usize, fallback: f32) -> (f32, bool) {
+        self.text
+            .text_geometry
+            .map_or((fallback, true), |geometry| {
+                let (advance, boundary) =
+                    geometry.character_geometry_with_hint(index, &mut self.geometry_hint);
+                (advance.unwrap_or(fallback), boundary)
+            })
+    }
+
+    #[inline]
+    pub fn glyph_dimensions(&mut self, glyph: GlyphId) -> Option<(f32, FontMetrics)> {
+        self.dimensions.get(glyph)
+    }
+}

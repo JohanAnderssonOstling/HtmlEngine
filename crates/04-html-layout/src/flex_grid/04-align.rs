@@ -1,6 +1,6 @@
 //! Finish baseline alignment without re-entering the solver.
 use super::{BaselineItem, FlexGridInput};
-use crate::layout::LayoutEngine;
+use crate::LayoutEngine;
 use kurbo::{Size, Vec2};
 
 pub(super) fn align(

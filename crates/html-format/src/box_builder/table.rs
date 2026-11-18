@@ -1,19 +1,18 @@
 use crate::layout_model::{
-    BlockBox, Children, LayoutMode, TableCellBox, TableColumnGroupSpan, TableColumnTrack,
-    TableColumnWidthHint, TableRowBox, parse_positive_span,
+    Children, LayoutMode, TableCellBox, TableColumnGroupSpan, TableColumnTrack, TableRowBox,
+    parse_positive_span,
 };
 use html_dom::{Document, DomNodeId, NodeRef};
-use html_style_model::{CaptionSide, ComputedStyles, Display, WhiteSpace};
+use html_style_model::{CaptionSide, ComputedStyles, Display, StyleIndices, WhiteSpace};
 
-use super::classification::{ElementClassification, display_for_element, starts_new_block_child};
+use super::classification::{BoxClassification, BoxClassifications, starts_new_block_child};
 use super::generated::ResolvedGeneratedContent;
-use super::inline::{text_is_ignorable_at_block_edge, trim_node_edges};
+use super::inline::{text_is_ignorable_at_block_edge, trimmed_node_range};
 
 pub(super) struct TableChildrenPlan {
     pub(super) actions: Vec<TableChildAction>,
     pub(super) columns: Vec<TableColumnTrack>,
     pub(super) column_groups: Vec<TableColumnGroupSpan>,
-    pub(super) column_width_hints: Vec<TableColumnWidthHint>,
 }
 
 pub(super) enum TableChildAction {
@@ -21,7 +20,7 @@ pub(super) enum TableChildAction {
     Principal {
         node: DomNodeId,
         role: TableRole,
-        classification: ElementClassification,
+        classification: BoxClassification,
     },
 }
 
@@ -55,7 +54,7 @@ impl TableRole {
     pub(super) fn layout_mode(self) -> LayoutMode {
         match self {
             Self::Table => LayoutMode::Table(Default::default()),
-            Self::RowGroup | Self::Caption(_) => LayoutMode::Block(BlockBox::default()),
+            Self::RowGroup | Self::Caption(_) => LayoutMode::Block(Children::default()),
             Self::Row => LayoutMode::TableRow(TableRowBox::default()),
             Self::Cell => LayoutMode::TableCell(TableCellBox::new(Children::Empty)),
         }
@@ -152,13 +151,13 @@ pub(super) fn nearest_table(
 pub(super) fn plan_table_children(
     document: &Document,
     styles: &ComputedStyles,
+    classifications: &BoxClassifications,
     children: impl IntoIterator<Item = DomNodeId>,
 ) -> TableChildrenPlan {
-    let children = flattened_contents_children(document, styles, children);
+    let children = flattened_contents_children(document, classifications, children);
     let mut actions = Vec::new();
     let mut columns = Vec::new();
     let mut column_groups = Vec::new();
-    let mut column_width_hints = Vec::new();
     let mut anonymous = Vec::new();
 
     for raw in children {
@@ -167,7 +166,7 @@ pub(super) fn plan_table_children(
             anonymous.push(raw);
             continue;
         };
-        let classification = ElementClassification::new(styles, element);
+        let classification = classifications.get(element);
         let style = classification.style;
         let display = classification.display;
         match display {
@@ -192,10 +191,9 @@ pub(super) fn plan_table_children(
                 let style = style.unwrap_or_else(|| styles.default_indices());
                 append_columns(
                     &mut columns,
-                    &mut column_width_hints,
                     style,
                     parse_positive_span(element.attr("span")),
-                    Some(style),
+                    true,
                     None,
                 );
             }
@@ -205,33 +203,19 @@ pub(super) fn plan_table_children(
                 let start = columns.len();
                 let mut group_span = 0;
                 for child in element.child_elements() {
-                    if display_for_element(styles, child) != Display::TableColumn {
+                    if classifications.get(child).display != Display::TableColumn {
                         continue;
                     }
                     let style = styles
                         .style_for_node(child.node_id())
                         .unwrap_or_else(|| styles.default_indices());
                     let span = parse_positive_span(child.attr("span"));
-                    append_columns(
-                        &mut columns,
-                        &mut column_width_hints,
-                        style,
-                        span,
-                        Some(style),
-                        Some(group_style),
-                    );
+                    append_columns(&mut columns, style, span, true, Some(group_style));
                     group_span += span;
                 }
                 if group_span == 0 {
                     group_span = parse_positive_span(element.attr("span"));
-                    append_columns(
-                        &mut columns,
-                        &mut column_width_hints,
-                        group_style,
-                        group_span,
-                        None,
-                        None,
-                    );
+                    append_columns(&mut columns, group_style, group_span, false, None);
                 }
                 if group_span > 0 {
                     column_groups.push(TableColumnGroupSpan {
@@ -266,13 +250,12 @@ pub(super) fn plan_table_children(
         actions,
         columns,
         column_groups,
-        column_width_hints,
     }
 }
 
 pub(super) fn plan_anonymous_table_children(
     document: &Document,
-    styles: &ComputedStyles,
+    classifications: &BoxClassifications,
     nodes: &[DomNodeId],
     white_space: WhiteSpace,
 ) -> AnonymousTablePlan {
@@ -280,9 +263,9 @@ pub(super) fn plan_anonymous_table_children(
     let nodes = if nodes.iter().any(|&raw| {
         document
             .try_element_ref(raw)
-            .is_some_and(|element| display_for_element(styles, element) == Display::Contents)
+            .is_some_and(|element| classifications.get(element).display == Display::Contents)
     }) {
-        flattened = flattened_contents_children(document, styles, nodes.iter().copied());
+        flattened = flattened_contents_children(document, classifications, nodes.iter().copied());
         flattened.as_slice()
     } else {
         nodes
@@ -297,11 +280,11 @@ pub(super) fn plan_anonymous_table_children(
         return AnonymousTablePlan::Empty;
     }
 
-    let nodes = trim_node_edges(nodes, |raw| {
+    let nodes = &nodes[trimmed_node_range(nodes, |raw| {
         document
             .try_text_ref(raw)
             .is_some_and(|text| text_is_ignorable_at_block_edge(text.text(), white_space))
-    });
+    })];
     if nodes.is_empty() {
         return AnonymousTablePlan::Empty;
     }
@@ -309,7 +292,7 @@ pub(super) fn plan_anonymous_table_children(
     let only_cells_and_ignorable_text = nodes.iter().all(|&raw| {
         let node = raw;
         match document.node_ref(node) {
-            NodeRef::Element(element) => display_for_element(styles, element) == Display::TableCell,
+            NodeRef::Element(element) => classifications.get(element).display == Display::TableCell,
             NodeRef::Text(text) => text.text().chars().all(char::is_whitespace),
         }
     });
@@ -329,7 +312,7 @@ pub(super) fn plan_anonymous_table_children(
         let node = raw;
         let is_block = document
             .try_element_ref(node)
-            .is_some_and(|element| starts_new_block_child(display_for_element(styles, element)));
+            .is_some_and(|element| starts_new_block_child(classifications.get(element).display));
         if is_block {
             if !inline.is_empty() {
                 parts.push(AnonymousCellPart::Inline(std::mem::take(&mut inline)));
@@ -347,10 +330,10 @@ pub(super) fn plan_anonymous_table_children(
 
 pub(super) fn plan_table_row_children(
     document: &Document,
-    styles: &ComputedStyles,
+    classifications: &BoxClassifications,
     children: impl IntoIterator<Item = DomNodeId>,
 ) -> Vec<TableRowChildAction> {
-    let children = flattened_contents_children(document, styles, children);
+    let children = flattened_contents_children(document, classifications, children);
     let mut actions = Vec::new();
     let mut anonymous = Vec::new();
     for raw in children {
@@ -359,7 +342,7 @@ pub(super) fn plan_table_row_children(
             anonymous.push(raw);
             continue;
         };
-        let classification = ElementClassification::new(styles, element);
+        let classification = classifications.get(element);
         let display = classification.display;
         let out_of_flow = classification.absolute;
         if display == Display::TableCell {
@@ -378,12 +361,12 @@ pub(super) fn plan_table_row_children(
 
 fn flattened_contents_children(
     document: &Document,
-    styles: &ComputedStyles,
+    classifications: &BoxClassifications,
     children: impl IntoIterator<Item = DomNodeId>,
 ) -> Vec<DomNodeId> {
     fn append(
         document: &Document,
-        styles: &ComputedStyles,
+        classifications: &BoxClassifications,
         raw: DomNodeId,
         output: &mut Vec<DomNodeId>,
     ) {
@@ -392,11 +375,11 @@ fn flattened_contents_children(
             output.push(raw);
             return;
         };
-        match display_for_element(styles, element) {
+        match classifications.get(element).display {
             Display::None => {}
             Display::Contents => {
                 for child in element.children() {
-                    append(document, styles, child, output);
+                    append(document, classifications, child, output);
                 }
             }
             _ => output.push(raw),
@@ -406,27 +389,23 @@ fn flattened_contents_children(
     let children = children.into_iter();
     let mut flattened = Vec::with_capacity(children.size_hint().0);
     for raw in children {
-        append(document, styles, raw, &mut flattened);
+        append(document, classifications, raw, &mut flattened);
     }
     flattened
 }
 
 fn append_columns(
     columns: &mut Vec<TableColumnTrack>,
-    hints: &mut Vec<TableColumnWidthHint>,
-    width_style: html_style_model::StyleIndices,
+    width_style: StyleIndices,
     span: usize,
-    background_style: Option<html_style_model::StyleIndices>,
-    fallback_style: Option<html_style_model::StyleIndices>,
+    paints_background: bool,
+    fallback_style: Option<StyleIndices>,
 ) {
     for _ in 0..span {
         columns.push(TableColumnTrack {
             width_style,
-            background_style,
-        });
-        hints.push(TableColumnWidthHint {
-            style: width_style,
             fallback_style,
+            paints_background,
         });
     }
 }

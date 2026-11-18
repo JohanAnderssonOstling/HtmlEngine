@@ -1,8 +1,6 @@
 //! Cascade ordering for one style target.
 
 use crate::style::compiled::{EffectiveRuleId, PreparedRuleSet};
-use crate::style::matching::dom::PseudoTarget;
-use html_dom::DomNodeId;
 use std::hash::Hash;
 
 /// Matched rule with specificity for cascade sorting
@@ -39,42 +37,5 @@ impl CascadePlan {
                 true,
             )
         });
-    }
-}
-
-/// The target key and its ordered rule buffers form one cache entry.
-#[derive(Default)]
-pub(super) struct CachedRuleMatches {
-    pseudo: Option<(DomNodeId, PseudoTarget)>,
-    plan: CascadePlan,
-}
-
-impl CachedRuleMatches {
-    pub(super) fn begin_element(&mut self) -> &mut Vec<MatchedRule> {
-        self.pseudo = None;
-        self.plan.normal.clear();
-        &mut self.plan.normal
-    }
-
-    pub(super) fn begin_pseudo(
-        &mut self,
-        node: DomNodeId,
-        pseudo: PseudoTarget,
-    ) -> (bool, &mut Vec<MatchedRule>) {
-        let reuse = self.pseudo == Some((node, pseudo));
-        if !reuse {
-            self.plan.normal.clear();
-            self.plan.important.clear();
-            self.pseudo = Some((node, pseudo));
-        }
-        (reuse, &mut self.plan.normal)
-    }
-
-    pub(super) fn order(&mut self, prepared: &PreparedRuleSet<'_>) {
-        self.plan.build(prepared);
-    }
-
-    pub(super) fn plan(&self) -> &CascadePlan {
-        &self.plan
     }
 }

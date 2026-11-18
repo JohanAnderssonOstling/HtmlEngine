@@ -1,8 +1,11 @@
 //! Custom-property collection, cycle detection, inheritance, and substitution.
 
+use super::cache_index::CacheIndex;
 use super::specified::{
     CandidateAction, CascadeBoundary, CascadeRollback, DeclarationEvent, ElementDeclarations,
-    RollbackMap, rollback_keyword};
+    RollbackMap, rollback_keyword,
+};
+use crate::style::compiled::DeclarationId;
 use crate::style::syntax::wide_keywords::CssWideKeyword;
 use crate::style::syntax::wide_keywords::token_list_css_wide_keyword;
 use lightningcss::properties::custom::{
@@ -190,7 +193,7 @@ pub(super) struct CustomPropertyScratch<'css> {
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
 struct CustomDeclarationIdentity {
-    property_address: usize,
+    declaration: DeclarationId,
     boundary: CascadeBoundary,
 }
 
@@ -209,7 +212,7 @@ struct CustomCascadeCacheEntry {
 
 #[derive(Default)]
 pub(super) struct CustomCascadeCache {
-    buckets: FxHashMap<u64, usize>,
+    index: CacheIndex,
     entries: Vec<CustomCascadeCacheEntry>,
     declarations: Vec<CustomDeclarationIdentity>,
 }
@@ -242,7 +245,7 @@ impl CustomCascadeCache {
             let property = event.property(element);
             custom_declaration(property)?;
             Some(CustomDeclarationIdentity {
-                property_address: property as *const Property<'css> as usize,
+                declaration: event.declaration_id(element),
                 boundary: event.boundary,
             })
         });
@@ -256,7 +259,7 @@ impl CustomCascadeCache {
         declaration_count.hash(&mut hasher);
         let hash = hasher.finish();
 
-        let mut next = self.buckets.get(&hash).copied();
+        let mut next = self.index.first(hash);
         while let Some(index) = next {
             let entry = &self.entries[index];
             if entry.parent_map_id == parent_map_id
@@ -284,7 +287,7 @@ impl CustomCascadeCache {
     }
 
     pub(super) fn insert(&mut self, signature: CustomCascadeSignature, map_id: u32) {
-        let next = self.buckets.insert(signature.hash, self.entries.len());
+        let next = self.index.insert(signature.hash, self.entries.len());
         self.entries.push(CustomCascadeCacheEntry {
             next,
             parent_map_id: signature.parent_map_id,

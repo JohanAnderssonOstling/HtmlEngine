@@ -1,4 +1,5 @@
-use crate::layout::{BoxLayoutRequest, LayoutEngine, ResolvedBoxModel, measure_box_isolated};
+use crate::measurement::measure_box_isolated;
+use crate::{BoxLayoutRequest, LayoutEngine, ResolvedBoxModel};
 use kurbo::Point;
 
 pub(super) fn measure_caption_stack(
@@ -34,7 +35,7 @@ pub(super) fn layout_caption_stack(
     let mut height = 0.0;
     for &caption_idx in captions {
         let caption_idx = caption_idx as usize;
-        let box_model = ResolvedBoxModel::new(engine.reader.style(caption_idx), content_width);
+        let box_model = ResolvedBoxModel::new(engine.read.reader.style(caption_idx), content_width);
         engine.geometry.set_point(
             caption_idx,
             Point::new(
@@ -52,16 +53,4 @@ pub(super) fn layout_caption_stack(
         height += box_model.vertical_margin() + caption_size.height;
     }
     height
-}
-
-pub(super) fn minimum_width(
-    engine: &mut LayoutEngine<'_, '_>,
-    captions_top: &[u32],
-    captions_bottom: &[u32],
-) -> f64 {
-    captions_top
-        .iter()
-        .chain(captions_bottom)
-        .map(|&caption| crate::layout::box_intrinsic_widths(engine, caption as usize).0)
-        .fold(0.0, f64::max)
 }

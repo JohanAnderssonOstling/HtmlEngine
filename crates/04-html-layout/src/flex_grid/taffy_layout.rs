@@ -1,5 +1,5 @@
-use super::measurement::MeasurementMode;
-use super::{TaffyContainerKind, finite_f32};
+use super::measurement::{MeasuredItem, MeasurementMode};
+use super::{SolvedFlexGrid, TaffyContainerKind, finite_f32, nonnegative_size};
 use std::iter::Map;
 use std::ops::Range;
 use taffy::geometry::Size;
@@ -31,11 +31,12 @@ pub(super) struct TaffyLayoutTree<'session, 'input, 'out> {
 }
 
 impl<'session, 'input, 'out> TaffyLayoutTree<'session, 'input, 'out> {
-    pub(super) fn new(
+    pub(super) fn solve(
         measurement: MeasurementMode<'session, 'input, 'out>,
         kind: TaffyContainerKind,
         root_style: Style,
         child_styles: Vec<(Style, Option<u32>)>,
+        available: Size<AvailableSpace>,
     ) -> Self {
         let nodes: Vec<_> = std::iter::once((root_style, None))
             .chain(child_styles)
@@ -45,12 +46,14 @@ impl<'session, 'input, 'out> TaffyLayoutTree<'session, 'input, 'out> {
                 layout: Layout::new(),
             })
             .collect();
-        Self {
+        let mut tree = Self {
             measurement,
             kind,
             nodes,
             root_first_baseline: None,
-        }
+        };
+        tree.compute(available);
+        tree
     }
 
     pub(super) fn compute(&mut self, available_space: Size<AvailableSpace>) {
@@ -70,14 +73,45 @@ impl<'session, 'input, 'out> TaffyLayoutTree<'session, 'input, 'out> {
         self.nodes[0].layout
     }
 
-    pub(super) fn root_first_baseline(&self) -> Option<f32> {
-        self.root_first_baseline
+    pub(super) fn into_result(self) -> SolvedFlexGrid {
+        SolvedFlexGrid {
+            first_baseline: self.root_first_baseline.map(f64::from),
+            size: nonnegative_size(self.root_layout().size),
+            items: self
+                .nodes
+                .into_iter()
+                .filter_map(|node| node.context.map(|box_idx| (node.layout, box_idx)))
+                .collect(),
+        }
     }
+}
 
-    pub(super) fn item_layouts(&self) -> impl Iterator<Item = (Layout, u32)> + '_ {
-        self.nodes
-            .iter()
-            .filter_map(|node| node.context.map(|box_idx| (node.layout, box_idx)))
+impl Node {
+    fn layout_leaf(
+        &self,
+        inputs: LayoutInput,
+        mut measure: impl FnMut(usize, Size<Option<f32>>, Size<AvailableSpace>) -> MeasuredItem,
+    ) -> LayoutOutput {
+        if self.style.display == taffy::style::Display::None {
+            return LayoutOutput::HIDDEN;
+        }
+
+        let mut first_baseline = None;
+        let mut output = compute_leaf_layout(
+            inputs,
+            &self.style,
+            |_, _| 0.0,
+            |known, available| {
+                let Some(box_idx) = self.context else {
+                    return Size::ZERO;
+                };
+                let measured = measure(box_idx as usize, known, available);
+                first_baseline = measured.first_baseline;
+                measured.size
+            },
+        );
+        output.first_baselines.y = first_baseline.map(finite_f32);
+        output
     }
 }
 
@@ -124,35 +158,16 @@ impl LayoutPartialTree for TaffyLayoutTree<'_, '_, '_> {
 
     fn compute_child_layout(&mut self, node_id: NodeId, inputs: LayoutInput) -> LayoutOutput {
         let index = usize::from(node_id);
-        if index == 0 && self.nodes.len() > 1 {
-            let output = match self.kind {
+        let output = if index == 0 && self.nodes.len() > 1 {
+            match self.kind {
                 TaffyContainerKind::Flex => compute_flexbox_layout(self, node_id, inputs),
                 TaffyContainerKind::Grid => compute_grid_layout(self, node_id, inputs),
-            };
-            self.root_first_baseline = output.first_baselines.y;
-            return output;
-        }
-        if self.nodes[index].style.display == taffy::style::Display::None {
-            return LayoutOutput::HIDDEN;
-        }
-
-        let style = &self.nodes[index].style;
-        let context = self.nodes[index].context;
-        let mut first_baseline = None;
-        let mut output = compute_leaf_layout(
-            inputs,
-            style,
-            |_, _| 0.0,
-            |known, available| {
-                let Some(box_idx) = context else {
-                    return Size::ZERO;
-                };
-                let measured = self.measurement.measure(box_idx as usize, known, available);
-                first_baseline = measured.first_baseline;
-                measured.size
-            },
-        );
-        output.first_baselines.y = first_baseline.map(finite_f32);
+            }
+        } else {
+            self.nodes[index].layout_leaf(inputs, |owner, known, available| {
+                self.measurement.measure(owner, known, available)
+            })
+        };
         if index == 0 {
             self.root_first_baseline = output.first_baselines.y;
         }
@@ -212,27 +227,26 @@ mod tests {
             grid_template_row_names: vec![vec!["row".to_owned()]],
             ..Style::default()
         };
-        let mut tree = TaffyLayoutTree::new(
-            MeasurementMode::Fixed {
-                box_idx: 7,
-                result: MeasuredItem {
-                    size: Size {
-                        width: 20.0,
-                        height: 30.0,
-                    },
-                    first_baseline: Some(17.0),
-                },
-            },
-            TaffyContainerKind::Flex,
-            Style::default(),
-            vec![(leaf_style, Some(7))],
-        );
+        let leaf = Node {
+            style: leaf_style,
+            context: Some(7),
+            layout: Layout::new(),
+        };
         let (output, allocations) = count_allocations(|| {
-            tree.compute_child_layout(
-                NodeId::from(1usize),
+            leaf.layout_leaf(
                 LayoutInput {
                     run_mode: RunMode::ComputeSize,
                     ..LayoutInput::HIDDEN
+                },
+                |box_idx, _, _| {
+                    assert_eq!(box_idx, 7);
+                    MeasuredItem {
+                        size: Size {
+                            width: 20.0,
+                            height: 30.0,
+                        },
+                        first_baseline: Some(17.0),
+                    }
                 },
             )
         });

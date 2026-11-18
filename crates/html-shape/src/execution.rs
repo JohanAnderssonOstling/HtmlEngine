@@ -256,7 +256,7 @@ fn resolve_document_metrics<'styles>(
     let mut ellipsis_boxes = Vec::new();
     let mut hyphen_boxes = Vec::new();
     let empty_inline_metrics_required = inline_content.inline_items().iter().any(|item| matches!(item.kind, InlineItemKind::InlineBoundary { inline_start, inline_end } if inline_start == inline_end));
-    let mut dense_box_metrics_required =
+    let mut all_box_metrics_required =
         empty_inline_metrics_required || inline_content.characters().contains(&'\t');
     for idx in 0..layout_tree.box_count() {
         let style = get_style(styles, layout_tree, idx);
@@ -273,7 +273,7 @@ fn resolve_document_metrics<'styles>(
         // A non-replaced inline's painted content box uses the selected
         // face's ascent and descent, independently of line-height. Request
         // those metrics even when no font-relative CSS length needs them.
-        dense_box_metrics_required |=
+        all_box_metrics_required |=
             style.requires_font_metrics() || style.line_height_is_normal();
         font_content_extents_required[idx] |=
             !computed_style::text_decoration_lines_is_empty(style.text_decoration_lines())
@@ -324,8 +324,9 @@ fn resolve_document_metrics<'styles>(
             Option<LanguageId>,
             [&[OpenTypeFeature]; 5],
         ),
-        FontRelativeMetrics,
+        u32,
     >::default();
+    let mut distinct_metrics = Vec::new();
     let mut resolve_font_metrics = |style: StyleView<'styles>| {
         let family = style.font_family().and_then(|id| styles.string(id));
         let key = (
@@ -364,43 +365,27 @@ fn resolve_document_metrics<'styles>(
         } else {
             FontRelativeMetrics::default()
         };
-        font_metric_cache.insert(key, metrics);
-        metrics
+        distinct_metrics.push(metrics);
+        let id =
+            u32::try_from(distinct_metrics.len()).expect("too many distinct shaped font metrics");
+        font_metric_cache.insert(key, id);
+        id
     };
-    let box_metrics = if dense_box_metrics_required {
-        let mut metrics = Vec::with_capacity(layout_tree.box_count());
-        for box_idx in 0..layout_tree.box_count() {
-            let style = get_style(styles, layout_tree, box_idx);
-            metrics.push(resolve_font_metrics(style));
-        }
-        BoxFontMetrics::Dense(metrics)
-    } else if font_content_extents_required
-        .iter()
-        .any(|required| *required)
+    let metric_ids = if all_box_metrics_required
+        || font_content_extents_required
+            .iter()
+            .any(|required| *required)
     {
         let mut metric_ids = vec![0; layout_tree.box_count()];
-        let mut distinct_metrics = Vec::<FontRelativeMetrics>::new();
-        for box_idx in
-            (0..layout_tree.box_count()).filter(|&box_idx| font_content_extents_required[box_idx])
+        for box_idx in (0..layout_tree.box_count())
+            .filter(|&box_idx| all_box_metrics_required || font_content_extents_required[box_idx])
         {
             let style = get_style(styles, layout_tree, box_idx);
-            let font_metrics = resolve_font_metrics(style);
-            let metric_idx = distinct_metrics
-                .iter()
-                .position(|metrics| *metrics == font_metrics)
-                .unwrap_or_else(|| {
-                    distinct_metrics.push(font_metrics);
-                    distinct_metrics.len() - 1
-                });
-            metric_ids[box_idx] =
-                u32::try_from(metric_idx + 1).expect("too many distinct shaped font metrics");
+            metric_ids[box_idx] = resolve_font_metrics(style);
         }
-        BoxFontMetrics::Indexed {
-            metric_ids,
-            metrics: distinct_metrics,
-        }
+        metric_ids
     } else {
-        BoxFontMetrics::NotRequired
+        Vec::new()
     };
 
     // Text pseudo styles and table columns do not necessarily have their own
@@ -425,9 +410,13 @@ fn resolve_document_metrics<'styles>(
                 entry.insert(resolve_font_metrics(style));
             }
         }
-        RequiredFontMetrics::Required(metrics)
+        metrics
     } else {
-        RequiredFontMetrics::NotRequired
+        FxHashMap::default()
+    };
+    let box_metrics = BoxFontMetrics {
+        metric_ids,
+        metrics: distinct_metrics,
     };
     let (root_ch_px, root_cap_height_px, root_line_height_px) = layout_tree
         .root_box()

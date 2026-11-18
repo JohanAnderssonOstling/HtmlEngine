@@ -73,10 +73,7 @@ impl PreparedText {
         }
         Self {
             content,
-            first_letter_styles: {
-                let _scope = observe("prepare.compact_first_letter");
-                FirstLetterStyles::new(&first_letter_styles)
-            },
+            first_letter_styles,
         }
     }
 
@@ -107,39 +104,32 @@ pub trait StyleOverrides {
 
 #[derive(Default)]
 pub struct FirstLetterStyles {
-    runs: Box<[StyleOverrideRun]>,
+    pub(crate) runs: Box<[StyleOverrideRun]>,
 }
 
-struct StyleOverrideRun {
-    glyphs: Range<u32>,
-    style: StyleIndices,
+pub(crate) struct StyleOverrideRun {
+    pub(crate) glyphs: Range<u32>,
+    pub(crate) style: StyleIndices,
 }
 
 impl FirstLetterStyles {
-    pub fn segment(&self, start: u32, end: u32) -> (Option<StyleIndices>, u32) {
-        self.segment_at(start, end)
+    pub(crate) fn new(mut runs: Vec<StyleOverrideRun>) -> Self {
+        runs.retain(|run| !run.glyphs.is_empty());
+        runs.dedup_by(|next, previous| {
+            if previous.glyphs.end == next.glyphs.start && previous.style == next.style {
+                previous.glyphs.end = next.glyphs.end;
+                true
+            } else {
+                false
+            }
+        });
+        Self {
+            runs: runs.into_boxed_slice(),
+        }
     }
 
-    fn new(dense: &[Option<StyleIndices>]) -> Self {
-        let mut runs: Vec<StyleOverrideRun> = Vec::new();
-        for (index, &style) in dense.iter().enumerate() {
-            let Some(style) = style else {
-                continue;
-            };
-            let index = index as u32;
-            if let Some(last) = runs
-                .last_mut()
-                .filter(|last| last.glyphs.end == index && last.style == style)
-            {
-                last.glyphs.end += 1;
-            } else {
-                runs.push(StyleOverrideRun {
-                    glyphs: index..index + 1,
-                    style,
-                });
-            }
-        }
-        Self { runs: runs.into() }
+    pub fn segment(&self, start: u32, end: u32) -> (Option<StyleIndices>, u32) {
+        self.segment_at(start, end)
     }
 
     #[cfg(any(test, feature = "testing"))]

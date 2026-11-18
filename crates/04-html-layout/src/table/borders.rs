@@ -1,83 +1,36 @@
-use super::columns::{TableCellPlacement, TableColumnLayout, row_group_range};
-use crate::layout::paint_program::PaintStyleSource;
-use crate::layout::{
-    LayoutEngine, LayoutReader, PhysicalBorderEdge, UsedBorderInsets, border_pattern,
-    collapsed_border_paint_key, physical_borders,
-};
+use super::geometry::TableGeometry;
+use super::grid::TableCellPlacement;
+use crate::decorations::{PhysicalBorderEdge, border_pattern, physical_borders};
+use crate::paint::{PaintItem, PaintOrderCache};
+use crate::paint_program::PaintStyleSource;
+use crate::{LayoutEngine, LayoutReader, UsedBorderInsets};
+use html_engine_model::paint_program::BorderSide;
 use html_engine_model::{TableColumnGroupSpan, TableColumnTrack};
 use html_style_model::{BorderStyle, PositionMode, TextDirection, UsedStyleView, Visibility};
-use kurbo::{Point, Rect};
+use kurbo::Rect;
 use rustc_data_structures::fx::FxHashMap;
 use std::{cmp::Reverse, mem::swap, ops::Range};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum BorderOrigin {
+    Table,
+    ColumnGroup,
+    Column,
+    RowGroup,
+    Row,
+    Cell,
+}
 
 #[derive(Clone, Copy, Debug)]
 struct CollapsedBorder {
     style: BorderStyle,
     width: f64,
     source: PaintStyleSource,
-    side: u8,
-    source_priority: u8,
+    side: BorderSide,
+    source_priority: BorderOrigin,
     order: u32,
     visible: bool,
     paint_rank: u32,
-}
-
-impl CollapsedBorder {
-    fn from_edge(
-        edge: PhysicalBorderEdge,
-        source_priority: u8,
-        order: u32,
-        visible: bool,
-        source: PaintStyleSource,
-        paint_rank: u32,
-    ) -> Self {
-        Self {
-            style: edge.style,
-            width: if edge.style == BorderStyle::None {
-                0.0
-            } else {
-                edge.width
-            },
-            source,
-            side: edge.side,
-            source_priority,
-            order,
-            visible,
-            paint_rank,
-        }
-    }
-
-    fn style_priority(self) -> u8 {
-        match self.style {
-            BorderStyle::Hidden => u8::MAX,
-            BorderStyle::Solid => 5,
-            BorderStyle::Dashed => 4,
-            BorderStyle::Dotted => 3,
-            BorderStyle::Groove => 1,
-            BorderStyle::Ridge => 2,
-            BorderStyle::None => 0,
-        }
-    }
-
-    fn wins_over(self, current: Self) -> bool {
-        if self.style == BorderStyle::Hidden {
-            return true;
-        }
-        if current.style == BorderStyle::Hidden {
-            return false;
-        }
-        let precedence = |edge: Self| {
-            (
-                edge.width,
-                edge.style_priority(),
-                edge.source_priority,
-                // Registration follows logical columns and rows, so the
-                // earliest source is furthest toward inline-start or the top.
-                Reverse(edge.order),
-            )
-        };
-        precedence(self) >= precedence(current)
-    }
 }
 
 /// The authoritative collapsed-border result for one table. Horizontal edges
@@ -98,22 +51,18 @@ impl CollapsedBorderGrid {
         reader: &LayoutReader<'_>,
         table_box_idx: usize,
         row_boxes: &[u32],
-        row_groups: &[u32],
+        row_groups: &[(u32, Range<usize>)],
+        column_count: usize,
         placements: &[TableCellPlacement],
         columns: &[TableColumnTrack],
         column_groups: &[TableColumnGroupSpan],
     ) -> Self {
-        let column_count = placements
-            .iter()
-            .map(|placement| placement.col.saturating_add(placement.colspan))
-            .max()
-            .unwrap_or(0);
         // Border appearance and paint context are independent: a shared edge
         // must follow the backgrounds of both adjoining positioned parts.
         let parts = row_groups
             .iter()
-            .chain(row_boxes)
-            .copied()
+            .map(|(group, _)| *group)
+            .chain(row_boxes.iter().copied())
             .chain(placements.iter().map(|cell| cell.cell_idx as u32));
         let mut paint_owners = vec![table_box_idx as u32];
         let paint_ranks = if parts
@@ -121,8 +70,10 @@ impl CollapsedBorderGrid {
             .any(|owner| reader.style(owner as usize).position() != PositionMode::Static)
         {
             paint_owners.extend(parts);
-            paint_owners
-                .sort_by_cached_key(|&owner| collapsed_border_paint_key(reader, owner as usize));
+            let mut order = PaintOrderCache::default();
+            paint_owners.sort_by_cached_key(|&owner| {
+                order.key(reader, owner as usize, PaintItem::CollapsedBorder)
+            });
             paint_owners
                 .iter()
                 .enumerate()
@@ -148,7 +99,7 @@ impl CollapsedBorderGrid {
             reader.style(table_box_idx),
             0..row_boxes.len(),
             0..column_count,
-            1,
+            BorderOrigin::Table,
             PaintStyleSource::Box(table_box_idx as u32),
         );
         for group in column_groups {
@@ -157,7 +108,7 @@ impl CollapsedBorderGrid {
                 reader.used_style(group.style),
                 0..row_boxes.len(),
                 group.start..group.start.saturating_add(group.span),
-                2,
+                BorderOrigin::ColumnGroup,
                 PaintStyleSource::Style {
                     indices: group.style,
                     context: table_box_idx as u32,
@@ -170,24 +121,22 @@ impl CollapsedBorderGrid {
                 reader.used_style(track.width_style),
                 0..row_boxes.len(),
                 column..column + 1,
-                3,
+                BorderOrigin::Column,
                 PaintStyleSource::Style {
                     indices: track.width_style,
                     context: table_box_idx as u32,
                 },
             );
         }
-        for &group_idx in row_groups {
-            if let Some(range) = row_group_range(reader, row_boxes, group_idx as usize) {
-                grid.register_area(
-                    &paint_ranks,
-                    reader.style(group_idx as usize),
-                    range,
-                    0..column_count,
-                    4,
-                    PaintStyleSource::Box(group_idx),
-                );
-            }
+        for (group_idx, range) in row_groups {
+            grid.register_area(
+                &paint_ranks,
+                reader.style(*group_idx as usize),
+                range.clone(),
+                0..column_count,
+                BorderOrigin::RowGroup,
+                PaintStyleSource::Box(*group_idx),
+            );
         }
         for (row, &row_idx) in row_boxes.iter().enumerate() {
             grid.register_area(
@@ -195,7 +144,7 @@ impl CollapsedBorderGrid {
                 reader.style(row_idx as usize),
                 row..row + 1,
                 0..column_count,
-                5,
+                BorderOrigin::Row,
                 PaintStyleSource::Box(row_idx),
             );
         }
@@ -205,7 +154,7 @@ impl CollapsedBorderGrid {
                 reader.style(placement.cell_idx),
                 placement.row..placement.row.saturating_add(placement.rowspan),
                 placement.col..placement.col.saturating_add(placement.colspan),
-                6,
+                BorderOrigin::Cell,
                 PaintStyleSource::Box(placement.cell_idx as u32),
             );
         }
@@ -261,24 +210,24 @@ impl CollapsedBorderGrid {
     pub(super) fn emit(
         &self,
         engine: &mut LayoutEngine<'_, '_>,
-        origin: Point,
-        columns: &TableColumnLayout,
-        row_starts: &[f64],
-        row_heights: &[f64],
+        geometry: &TableGeometry,
         row_boxes: &[u32],
     ) {
-        let table_width = columns.table_width;
-        let column_starts = &columns.starts;
-        let column_widths = &columns.widths;
         for boundary in 0..=self.rows {
-            let Some(anchor) = boundary_anchor(row_starts, row_heights, boundary) else {
+            let Some(anchor) =
+                boundary_anchor(&geometry.rows.starts, &geometry.rows.heights, boundary)
+            else {
                 continue;
             };
             for column in 0..self.columns {
                 let Some(edge) = self.horizontal_at(boundary, column) else {
                     continue;
                 };
-                let Some((&x, &width)) = column_starts.get(column).zip(column_widths.get(column))
+                let Some((&x, &width)) = geometry
+                    .columns
+                    .starts
+                    .get(column)
+                    .zip(geometry.columns.widths.get(column))
                 else {
                     continue;
                 };
@@ -286,8 +235,8 @@ impl CollapsedBorderGrid {
                 let end_join = self.vertical_joint_width(boundary, column + 1) * 0.5;
                 let (left, right) = if self.rtl {
                     (
-                        table_width - x - width - end_join,
-                        table_width - x + start_join,
+                        geometry.columns.table_width - x - width - end_join,
+                        geometry.columns.table_width - x + start_join,
                     )
                 } else {
                     (x - start_join, x + width + end_join)
@@ -297,10 +246,10 @@ impl CollapsedBorderGrid {
                     self.paint_owners[edge.paint_rank as usize] as usize,
                     row_boxes[boundary.saturating_sub(1)] as usize,
                     Rect::new(
-                        origin.x + left,
-                        origin.y + anchor - edge.width * 0.5,
-                        origin.x + right,
-                        origin.y + anchor + edge.width * 0.5,
+                        geometry.origin.x + left,
+                        geometry.origin.y + anchor - edge.width * 0.5,
+                        geometry.origin.x + right,
+                        geometry.origin.y + anchor + edge.width * 0.5,
                     ),
                     edge,
                     true,
@@ -308,18 +257,25 @@ impl CollapsedBorderGrid {
             }
         }
         for row in 0..self.rows {
-            let Some((&y, &height)) = row_starts.get(row).zip(row_heights.get(row)) else {
+            let Some((&y, &height)) = geometry
+                .rows
+                .starts
+                .get(row)
+                .zip(geometry.rows.heights.get(row))
+            else {
                 continue;
             };
             for boundary in 0..=self.columns {
                 let Some(edge) = self.vertical_at(row, boundary) else {
                     continue;
                 };
-                let Some(anchor) = boundary_anchor(column_starts, column_widths, boundary) else {
+                let Some(anchor) =
+                    boundary_anchor(&geometry.columns.starts, &geometry.columns.widths, boundary)
+                else {
                     continue;
                 };
                 let anchor = if self.rtl {
-                    table_width - anchor
+                    geometry.columns.table_width - anchor
                 } else {
                     anchor
                 };
@@ -330,10 +286,10 @@ impl CollapsedBorderGrid {
                     self.paint_owners[edge.paint_rank as usize] as usize,
                     row_boxes[row] as usize,
                     Rect::new(
-                        origin.x + anchor - edge.width * 0.5,
-                        origin.y + y - start_join,
-                        origin.x + anchor + edge.width * 0.5,
-                        origin.y + y + height + end_join,
+                        geometry.origin.x + anchor - edge.width * 0.5,
+                        geometry.origin.y + y - start_join,
+                        geometry.origin.x + anchor + edge.width * 0.5,
+                        geometry.origin.y + y + height + end_join,
                     ),
                     edge,
                     false,
@@ -349,7 +305,7 @@ impl CollapsedBorderGrid {
         style: UsedStyleView<'_>,
         rows: Range<usize>,
         columns: Range<usize>,
-        priority: u8,
+        priority: BorderOrigin,
         source: PaintStyleSource,
     ) {
         let rows = rows.start.min(self.rows)..rows.end.min(self.rows);
@@ -451,6 +407,64 @@ impl CollapsedBorderGrid {
     }
 }
 
+impl CollapsedBorder {
+    fn from_edge(
+        edge: PhysicalBorderEdge,
+        source_priority: BorderOrigin,
+        order: u32,
+        visible: bool,
+        source: PaintStyleSource,
+        paint_rank: u32,
+    ) -> Self {
+        Self {
+            style: edge.style,
+            width: if edge.style == BorderStyle::None {
+                0.0
+            } else {
+                edge.width
+            },
+            source,
+            side: edge.side,
+            source_priority,
+            order,
+            visible,
+            paint_rank,
+        }
+    }
+
+    fn style_priority(self) -> u8 {
+        match self.style {
+            BorderStyle::Hidden => u8::MAX,
+            BorderStyle::Solid => 5,
+            BorderStyle::Dashed => 4,
+            BorderStyle::Dotted => 3,
+            BorderStyle::Groove => 1,
+            BorderStyle::Ridge => 2,
+            BorderStyle::None => 0,
+        }
+    }
+
+    fn wins_over(self, current: Self) -> bool {
+        if self.style == BorderStyle::Hidden {
+            return true;
+        }
+        if current.style == BorderStyle::Hidden {
+            return false;
+        }
+        let precedence = |edge: Self| {
+            (
+                edge.width,
+                edge.style_priority(),
+                edge.source_priority,
+                // Registration follows logical columns and rows, so the
+                // earliest source is furthest toward inline-start or the top.
+                Reverse(edge.order),
+            )
+        };
+        precedence(self) >= precedence(current)
+    }
+}
+
 fn register(slot: &mut Option<CollapsedBorder>, candidate: CollapsedBorder) {
     if let Some(current) = slot {
         let paint_rank = current.paint_rank.max(candidate.paint_rank);
@@ -490,7 +504,7 @@ fn emit_edge(
     let Some(pattern) = border_pattern(edge.style, horizontal) else {
         return;
     };
-    crate::layout::decorations::record_bound_border(
+    crate::decorations::record_bound_border(
         engine,
         owner,
         fragment_owner,

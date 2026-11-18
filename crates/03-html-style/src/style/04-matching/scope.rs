@@ -1,6 +1,6 @@
 //! Match compiled scope boundaries against a document.
 use crate::style::compiled::{PreparedRuleSet, ScopeId};
-use crate::style::matching::dom::{SiblingIndex, selector_matches_dom_node_in_scope};
+use crate::style::matching::dom::{TraversalContext, selector_matches_dom_node_in_scope};
 use html_dom::{Document, DomNodeId};
 
 #[derive(Clone, Copy)]
@@ -15,7 +15,7 @@ pub(crate) fn scope_match<'css>(
     document: &Document,
     author_roots: &[Option<DomNodeId>],
     subject: DomNodeId,
-    siblings: &mut SiblingIndex<'_, '_, 'css>,
+    siblings: &mut TraversalContext<'_, '_, 'css>,
 ) -> Option<ScopeMatch> {
     if scope == ScopeId::NONE {
         return Some(ScopeMatch {
@@ -32,7 +32,7 @@ pub(crate) fn scope_match<'css>(
         subject,
         siblings,
     )?;
-    let match_for_root = |root, siblings: &mut SiblingIndex<'_, '_, 'css>| {
+    let match_for_root = |root, siblings: &mut TraversalContext<'_, '_, 'css>| {
         let mut proximity = 0u32;
         for candidate in std::iter::once(subject).chain(document.dom_ancestors(subject)) {
             if descriptor.end.as_ref().is_some_and(|end| {

@@ -1,60 +1,97 @@
 //! Parsed renderer values retained independently of elements and style interners.
-use super::prepared_generated::{
-    self, PreparedContent, PreparedContentBuilder, PreparedCounterDirective, PreparedQuoteStyle,
-};
+use crate::style::cascade::resolver::prepared_native::PreparedValue;
+use super::prepared_generated::{self, PreparedContentBuilder};
 use super::prepared_length::{LengthMode, PreparedLength};
 use super::property_id::RendererPropertyId;
-use super::value::{parse_integer, token_list_to_css_string};
+use crate::style::property_catalogue::PropertyKey;
+use super::substitution::{contains_function, needs_substitution};
+use crate::style::support::{PreparationError, UnsupportedStyleFeature};
+use super::wide_keywords::property_css_wide_keyword;
+use super::value::{significant_tokens, token_list_to_css_string};
 use super::{contain, font_features, native_fallback, renderer_owned};
 use html_style_model::ObjectPositionOrigin;
-use html_style_model::{
-    BorderCollapseMode, BreakBetween, BreakInside, CaptionSide, Clear, EmptyCellsMode, Float,
-    FontSynthesisStyle, HangingPunctuation, ObjectFit, OpenTypeFeature, TableLayoutMode,
-    TextBoxEdge, TextBoxTrim, TextDirection, TextWrapStyle, WhiteSpace, open_type,
-};
-use lightningcss::properties::custom::TokenList;
-use lightningcss::properties::font::FontVariantCaps;
+use html_style_model::{TextDirection, open_type};
+use lightningcss::properties::{Property, PropertyId};
+use lightningcss::properties::custom::{Token, TokenList, TokenOrValue};
 use lightningcss::values::length::LengthPercentage;
 use lightningcss::values::position::Position;
 
-pub(crate) enum PreparedRendererValue {
-    Spacing(PreparedLength),
-    WhiteSpaceCollapse(WhiteSpace),
-    TextWrapMode(bool),
-    TextWrapStyle(TextWrapStyle),
-    TextWrap(bool, TextWrapStyle),
-    HangingPunctuation(HangingPunctuation),
-    FontVariant(FontVariantCaps, Vec<OpenTypeFeature>, Vec<OpenTypeFeature>),
-    FontSynthesis {
-        small_caps: Option<bool>,
-        style: Option<FontSynthesisStyle>,
-    },
-    Features(Vec<OpenTypeFeature>),
-    ObjectFit(ObjectFit),
-    ObjectPosition(PreparedPosition),
-    OutlineOffset(Option<PreparedLength>),
-    BreakBetween(BreakBetween),
-    BreakInside(BreakInside),
-    LineCount(u8),
-    Float(Float, Float),
-    Clear(Clear, Clear),
-    TableLayout(TableLayoutMode),
-    BorderCollapse(BorderCollapseMode),
-    CaptionSide(CaptionSide),
-    EmptyCells(EmptyCellsMode),
-    TextBoxTrim(TextBoxTrim),
-    TextBoxEdge(TextBoxEdge),
-    TextBox(TextBoxTrim, TextBoxEdge),
-    Contain(bool),
-    Content(Option<PreparedContent>),
-    Counters(Vec<PreparedCounterDirective>),
-    Quotes(PreparedQuoteStyle),
-}
+impl PreparedValue {
+    /// Validate admission and prepare raw values once. Native values are
+    /// converted separately after shorthand expansion.
+    pub(crate) fn prepare_renderer(
+        property: &Property<'_>,
+        emit: impl FnMut(PropertyKey, Self),
+    ) -> Result<bool, PreparationError> {
+        use PreparationError::{InvalidSyntax, Unsupported};
+        if !super::ast_validation::property_is_valid(property) {
+            return Err(InvalidSyntax);
+        }
+        if super::capabilities::declaration_is_custom_property(property) {
+            return Err(Unsupported(UnsupportedStyleFeature::Property));
+        }
+        if property_css_wide_keyword(property).is_some()
+            || matches!(property, Property::Unparsed(value) if needs_substitution(&value.value))
+            || matches!(property, Property::Custom(value) if needs_substitution(&value.value))
+        {
+            return Ok(false);
+        }
+        if let Some((id, tokens)) = RendererPropertyId::raw(property) {
+            return Self::parse_renderer(id, tokens, emit).map(|()| true).ok_or_else(|| {
+                if matches!(
+                    id,
+                    RendererPropertyId::ObjectPosition | RendererPropertyId::OutlineOffset
+                ) {
+                    let syntax_valid = token_list_to_css_string(tokens).is_some_and(|css| {
+                        if id == RendererPropertyId::ObjectPosition {
+                            renderer_owned::parse_object_position(&css).is_some()
+                        } else {
+                            renderer_owned::parse_outline_offset(&css).is_some()
+                        }
+                    });
+                    if syntax_valid {
+                        Unsupported(UnsupportedStyleFeature::Value)
+                    } else {
+                        InvalidSyntax
+                    }
+                } else if matches!(
+                    id,
+                    RendererPropertyId::Content
+                        | RendererPropertyId::CounterReset
+                        | RendererPropertyId::CounterIncrement
+                ) && (tokens.0.iter().any(|token| {
+                    matches!(
+                        token,
+                        TokenOrValue::Url(_) | TokenOrValue::Token(Token::Delim('/'))
+                    )
+                }) || contains_function(tokens, |name| {
+                    name.eq_ignore_ascii_case("reversed")
+                })) {
+                    Unsupported(UnsupportedStyleFeature::GeneratedContent)
+                } else {
+                    Unsupported(UnsupportedStyleFeature::Value)
+                }
+            });
+        }
+        match property {
+            Property::Unparsed(raw) if native_fallback::applies_to(&raw.property_id) => Ok(false),
+            Property::Unparsed(raw) if matches!(raw.property_id, PropertyId::FontStretch) => {
+                Err(Unsupported(UnsupportedStyleFeature::Value))
+            }
+            Property::Unparsed(_) => Err(InvalidSyntax),
+            Property::Custom(_) => Err(Unsupported(UnsupportedStyleFeature::Property)),
+            _ => Ok(false),
+        }
+    }
 
-impl PreparedRendererValue {
-    pub(crate) fn parse(id: RendererPropertyId, tokens: &TokenList<'_>) -> Option<Self> {
+    pub(crate) fn parse_renderer(
+        id: RendererPropertyId,
+        tokens: &TokenList<'_>,
+        mut emit: impl FnMut(PropertyKey, Self),
+    ) -> Option<()> {
         use RendererPropertyId as Id;
-        Some(match id {
+        use PropertyKey as Key;
+        let value = match id {
             Id::LetterSpacing | Id::WordSpacing => Self::Spacing(PreparedLength::percentage(
                 &native_fallback::text_spacing(tokens)?,
                 LengthMode::Scalar,
@@ -66,28 +103,38 @@ impl PreparedRendererValue {
             Id::TextWrapStyle => Self::TextWrapStyle(renderer_owned::text_wrap_style(tokens)?),
             Id::TextWrap => {
                 let (mode, style) = renderer_owned::text_wrap(tokens)?;
-                Self::TextWrap(mode, style)
+                emit(Key::TextWrapMode, Self::TextWrapMode(mode));
+                emit(Key::TextWrapStyle, Self::TextWrapStyle(style));
+                return Some(());
             }
             Id::HangingPunctuation => {
                 Self::HangingPunctuation(renderer_owned::hanging_punctuation(tokens)?)
             }
             Id::FontVariant => {
                 let (caps, numeric, ligatures) = font_features::parse_variant(tokens)?;
-                Self::FontVariant(caps, numeric, ligatures)
+                emit(
+                    Key::FontVariantCaps,
+                    Self::Features(font_features::caps_features(&caps)),
+                );
+                emit(Key::FontVariantNumeric, Self::Features(numeric));
+                emit(Key::FontVariantLigatures, Self::Features(ligatures));
+                return Some(());
             }
-            Id::FontSynthesis | Id::FontSynthesisStyle | Id::FontSynthesisSmallCaps => {
-                Self::FontSynthesis {
-                    small_caps: if id == Id::FontSynthesisStyle {
-                        None
-                    } else {
-                        Some(renderer_owned::font_synthesis_small_caps(id, tokens)?)
-                    },
-                    style: if id == Id::FontSynthesisSmallCaps {
-                        None
-                    } else {
-                        Some(renderer_owned::font_synthesis_style(id, tokens)?)
-                    },
-                }
+            Id::FontSynthesis => {
+                let caps = renderer_owned::font_synthesis_small_caps(id, tokens)?;
+                let style = renderer_owned::font_synthesis_style(id, tokens)?;
+                emit(
+                    Key::FontSynthesisSmallCaps,
+                    Self::FontSynthesisSmallCaps(caps),
+                );
+                emit(Key::FontSynthesisStyle, Self::FontSynthesisStyle(style));
+                return Some(());
+            }
+            Id::FontSynthesisSmallCaps => {
+                Self::FontSynthesisSmallCaps(renderer_owned::font_synthesis_small_caps(id, tokens)?)
+            }
+            Id::FontSynthesisStyle => {
+                Self::FontSynthesisStyle(renderer_owned::font_synthesis_style(id, tokens)?)
             }
             Id::ObjectFit => Self::ObjectFit(renderer_owned::object_fit(tokens)?),
             Id::ObjectPosition => Self::ObjectPosition(PreparedPosition::prepare(
@@ -119,9 +166,20 @@ impl PreparedRendererValue {
             Id::BreakInside | Id::PageBreakInside => {
                 Self::BreakInside(renderer_owned::break_inside(id, tokens)?)
             }
-            Id::Widows | Id::Orphans => Self::LineCount(
-                parse_integer(&token_list_to_css_string(tokens)?, 1)?.min(u32::from(u8::MAX)) as u8,
-            ),
+            Id::Widows | Id::Orphans => {
+                let mut tokens = significant_tokens(tokens);
+                let TokenOrValue::Token(Token::Number {
+                    int_value: Some(value),
+                    ..
+                }) = tokens.next()?
+                else {
+                    return None;
+                };
+                if *value <= 0 || tokens.next().is_some() {
+                    return None;
+                }
+                Self::LineCount((*value).min(i32::from(u8::MAX)) as u8)
+            }
             Id::Float => Self::Float(
                 renderer_owned::float(tokens, TextDirection::Ltr)?,
                 renderer_owned::float(tokens, TextDirection::Rtl)?,
@@ -138,9 +196,11 @@ impl PreparedRendererValue {
             Id::TextBoxEdge => Self::TextBoxEdge(renderer_owned::text_box_edge(tokens)?),
             Id::TextBox => {
                 let (trim, edge) = renderer_owned::text_box(tokens)?;
-                Self::TextBox(trim, edge)
+                emit(Key::TextBoxTrim, Self::TextBoxTrim(trim));
+                emit(Key::TextBoxEdge, Self::TextBoxEdge(edge));
+                return Some(());
             }
-            Id::Contain => Self::Contain(contain::parse_tokens(tokens)?.size),
+            Id::Contain => Self::Contain(contain::parse_tokens(tokens)?),
             Id::Content => Self::Content(prepared_generated::parse_generated_content(
                 tokens,
                 &mut PreparedContentBuilder,
@@ -158,7 +218,9 @@ impl PreparedRendererValue {
             )?),
             // These aliases are canonicalized to native properties before preparation.
             Id::FontWidth | Id::GridGap | Id::GridRowGap | Id::GridColumnGap => return None,
-        })
+        };
+        emit(id.key(), value);
+        Some(())
     }
 }
 
@@ -206,14 +268,5 @@ impl PreparedPosition {
             x: axis(&value.x, HorizontalPositionKeyword::Right)?,
             y: axis(&value.y, VerticalPositionKeyword::Bottom)?,
         })
-    }
-}
-impl PreparedRendererValue {
-    pub(crate) fn requires_viewport_height(&self) -> bool {
-        match self {
-            Self::Spacing(v) | Self::OutlineOffset(Some(v)) => v.viewport_height,
-            Self::ObjectPosition(v) => v.x.1.viewport_height || v.y.1.viewport_height,
-            _ => false,
-        }
     }
 }

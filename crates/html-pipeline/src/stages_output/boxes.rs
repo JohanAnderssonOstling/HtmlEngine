@@ -2,10 +2,11 @@
 
 use super::text::enclosing_text_range;
 use super::*;
-use crate::layout_model::{parse_positive_span, place_table_cells};
+use crate::layout_model::parse_positive_span;
 use html_dom::{DomNodeId, ElementRef, write_escaped_html_attribute, write_escaped_html_text};
 use html_engine_model::layout_state::{self, BoxPaginationFacts, PaginationOwnership};
-use html_style_model::{BreakBetween, BreakInside, Float, LayoutStyle, PositionMode};
+use html_layout::place_table_cells;
+use html_style_model::{BreakBetween, BreakInside, Float, LayoutStyle};
 use kurbo::Rect;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -181,10 +182,13 @@ impl<'a> RenderBoxView<'a> {
 
     /// Whether this box participates in float layout rather than normal flow.
     pub fn is_floating(self, box_id: BoxId) -> bool {
-        self.used_style(layout_state::box_id_index(box_id)).is_some_and(|style| {
-            style.position() != PositionMode::Absolute
-                && matches!(style.float(), Float::Left | Float::Right)
-        })
+        self.doc
+            .inputs
+            .layout_tree
+            .box_at(layout_state::box_id_index(box_id))
+            .is_some_and(|layout_box| {
+                !layout_box.facts.absolute && layout_box.facts.float != Float::None
+            })
     }
 
     fn break_before(self, box_id: BoxId) -> BreakBetween {

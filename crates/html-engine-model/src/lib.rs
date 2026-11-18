@@ -44,7 +44,6 @@ pub mod paint_program;
 pub mod profiling;
 pub mod shaping_contracts;
 mod shaping_views;
-mod table_grid;
 mod text_fragments;
 mod text_placement;
 mod word_index;
@@ -76,7 +75,6 @@ pub use caret_positions::{CaretCursor, CaretIter, CaretPositions, CaretPositions
 pub use shaping_contracts::*;
 pub use shaping_views::*;
 use std::{fmt, ops::Range, sync::Arc};
-pub use table_grid::{TableCellPlacement, TableGrid, build_table_grid, place_table_cells};
 pub use text_fragments::{
     CompactTextFragments, LineTextFragments, OwnedTextFragments, PackedTextFragment, TextFragmentStore,
 };

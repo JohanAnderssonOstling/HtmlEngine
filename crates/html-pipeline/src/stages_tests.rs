@@ -955,8 +955,7 @@ mod stage_tests {
         let owner = (0..document.box_count())
             .find(|&index| {
                 document
-                    .inputs
-                    .layout_tree
+                    .inputs.state.layout_tree
                     .get_box_dom_element(index)
                     .is_some_and(|node| document.inputs.document.try_element_ref(node).and_then(|element| element.id()) == Some("cell"))
             })
@@ -1638,7 +1637,7 @@ mod stage_tests {
             "<p>  ß😀  a</p>",
             Some("p {text-transform:uppercase} p::first-letter {font-size:32px}"),
         );
-        let text = prepared.inputs.text.as_ref();
+        let text = prepared.inputs.state.text.as_ref();
         let characters: String = text
             .content()
             .characters()
@@ -1659,7 +1658,7 @@ mod stage_tests {
             let shaped = prepared
                 .shape_borrowed(&mut shaper, &mut shaped_resources)
                 .unwrap();
-            assert!(std::ptr::eq(text, shaped.inputs.text.as_ref()));
+            assert!(std::ptr::eq(text, shaped.inputs.state.text.as_ref()));
             let generation = shaper.resource_generation();
             if let Some(previous) = first_generation.as_ref() {
                 assert_ne!(previous, &generation);
@@ -1686,7 +1685,7 @@ mod stage_tests {
                     &mut shaped_resources,
                 )
                 .expect("layout requires the shaper-aware API for first-line styles");
-            assert!(std::ptr::eq(text, document.inputs.text.as_ref()));
+            assert!(std::ptr::eq(text, document.inputs.state.text.as_ref()));
             let offsets: Vec<_> = (0..5)
                 .map(|glyph| document.glyph_source_offset(glyph))
                 .collect();
@@ -1739,22 +1738,21 @@ mod stage_tests {
                 })
                 .unwrap();
             assert!(std::ptr::eq(
-                prepared.inputs.text.content(),
-                themed.inputs.text.content()
+                prepared.inputs.state.text.content(),
+                themed.inputs.state.text.content()
             ));
             let first = themed
-                .inputs
-                .text
+                .inputs.state.text
                 .first_letter_styles()
                 .style_at(0)
                 .unwrap();
             assert!(
-                themed.inputs.styles.view(first).is_some(),
+                themed.inputs.state.styles.view(first).is_some(),
                 "cached pseudo style belongs to the new paint store"
             );
             assert_eq!(
                 Some(first),
-                themed.inputs.text.first_letter_styles().style_at(1)
+                themed.inputs.state.text.first_letter_styles().style_at(1)
             );
             let mut shaped_resources = GlyphResourceStore::default();
             let shaped = themed
@@ -1849,13 +1847,13 @@ mod stage_tests {
             "<div id='outer'><p style='white-space:pre'>   </p><p>Apple</p></div>",
             Some("#outer::first-letter{color:red;font-size:32px}"),
         );
-        let text = prepared.inputs.text.content();
+        let text = prepared.inputs.state.text.content();
         let letter = text.characters().iter().position(|&character| character == 'A').unwrap() as u32;
-        let style = prepared.inputs.text.first_letter_styles().style_at(letter).expect("ancestor styles the first actual letter");
+        let style = prepared.inputs.state.text.first_letter_styles().style_at(letter).expect("ancestor styles the first actual letter");
         let item = text.inline_items().iter().find(|item| item.text_run().is_some_and(|run| run.glyphs.contains(&letter))).unwrap();
-        let root = item.flow_root(prepared.inputs.layout_tree.as_ref());
+        let root = item.flow_root(prepared.inputs.state.layout_tree.as_ref());
         assert_eq!(text.pseudo_styles().first_letter(root), Some(style));
-        assert_eq!(prepared.inputs.styles.view(style).unwrap().color(), 0xff0000ff);
+        assert_eq!(prepared.inputs.state.styles.view(style).unwrap().color(), 0xff0000ff);
     }
 
     #[test]
@@ -3060,7 +3058,7 @@ mod stage_tests {
             ),
             Some("p{text-transform:uppercase} .target::first-line{font-size:24px}"),
         );
-        let source = prepared.inputs.text.content();
+        let source = prepared.inputs.state.text.content();
         let characters = source.characters().to_vec();
         let offsets: Vec<_> = (0..characters.len())
             .map(|i| source.raw_glyph_source_offset(i))
@@ -3093,10 +3091,10 @@ mod stage_tests {
             .unwrap();
 
         for inputs in [&*prepared.inputs, &*document.inputs] {
-            assert!(std::ptr::eq(source, inputs.text.content()));
-            assert_eq!(inputs.text.content().characters(), characters);
+            assert!(std::ptr::eq(source, inputs.state.text.content()));
+            assert_eq!(inputs.state.text.content().characters(), characters);
             assert_eq!(
-                inputs.text.content().inline_items().as_ptr(),
+                inputs.state.text.content().inline_items().as_ptr(),
                 source.inline_items().as_ptr()
             );
         }

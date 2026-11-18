@@ -1,5 +1,5 @@
 use crate::source_offsets::SourceOffsets;
-use crate::{PseudoStyles, TextStructure, whitespace_context_root};
+use crate::{PseudoStyles, TextStructure};
 use html_dom::{DomNodeId, MemoryUsageReport};
 use std::ops::Range;
 
@@ -302,7 +302,7 @@ impl InlineItem {
     }
 
     pub fn flow_root(&self, tree: &(impl TextStructure + ?Sized)) -> usize {
-        whitespace_context_root(tree, self.context_owner(tree))
+        tree.flow_root(self.context_owner(tree))
     }
 
     /// Markers form independent Unicode paragraphs beside their principal box.

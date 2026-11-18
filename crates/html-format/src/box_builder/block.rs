@@ -1,23 +1,7 @@
 //! Build block children in source order, buffering only the current segment.
 
-use super::classification::has_table_internal_descendant;
 use super::*;
 use html_dom::ElementRef;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum GeneratedEdge {
-    None,
-    Inline,
-    Block,
-}
-
-fn generated_edge(styles: &ComputedStyles, origin: DomNodeId, before: bool) -> GeneratedEdge {
-    match pseudo_display(styles, origin, before) {
-        None => GeneratedEdge::None,
-        Some(_) if pseudo_is_block_level(styles, origin, before) => GeneratedEdge::Block,
-        Some(_) => GeneratedEdge::Inline,
-    }
-}
 
 struct BlockSegment {
     start: usize,
@@ -37,19 +21,32 @@ impl LayoutTreeBuilder<'_, '_> {
             return;
         };
         let wrap_tables = !matches!(
-            display_for_element(self.styles, element),
+            self.classifications.get(element).display,
             Display::TableRowGroup | Display::TableHeaderGroup | Display::TableFooterGroup
         );
-        let before = generated_edge(self.styles, node, true);
-        let after = generated_edge(self.styles, node, false);
+        let before = self.classify_source(BoxSource::GeneratedPseudo {
+            origin: node,
+            before: true,
+        });
+        let after = self.classify_source(BoxSource::GeneratedPseudo {
+            origin: node,
+            before: false,
+        });
         let mut segment = BlockSegment {
             start: self.node_scratch.len(),
             table: false,
-            before: before == GeneratedEdge::Inline,
+            before: before.is_some_and(|value| !value.splits_inline()),
             origin: node,
         };
-        if before == GeneratedEdge::Block {
-            children.extend(self.build_generated_block_pseudo(node, parent, true));
+        if let Some(classification) = before.filter(|value| value.splits_inline()) {
+            children.extend(self.build_source(
+                BoxSource::GeneratedPseudo {
+                    origin: node,
+                    before: true,
+                },
+                parent,
+                classification,
+            ));
         }
         self.append_block_nodes(element, parent, wrap_tables, &mut segment, children);
         if segment.table {
@@ -58,11 +55,18 @@ impl LayoutTreeBuilder<'_, '_> {
         self.flush_block_segment(
             &mut segment,
             parent,
-            after == GeneratedEdge::Inline,
+            after.is_some_and(|value| !value.splits_inline()),
             children,
         );
-        if after == GeneratedEdge::Block {
-            children.extend(self.build_generated_block_pseudo(node, parent, false));
+        if let Some(classification) = after.filter(|value| value.splits_inline()) {
+            children.extend(self.build_source(
+                BoxSource::GeneratedPseudo {
+                    origin: node,
+                    before: false,
+                },
+                parent,
+                classification,
+            ));
         }
         debug_assert_eq!(self.node_scratch.len(), segment.start);
     }
@@ -80,9 +84,9 @@ impl LayoutTreeBuilder<'_, '_> {
                 self.node_scratch.push(node);
                 continue;
             };
-            let classification = ElementClassification::new(self.styles, child);
+            let classification = self.classifications.get(child);
             let display = classification.display;
-            if display == Display::Contents && has_table_internal_descendant(self.styles, child) {
+            if display == Display::Contents && classification.table_internal_descendant {
                 let has_pseudos = self.styles.before_style_for_node(node).is_some()
                     || self.styles.after_style_for_node(node).is_some();
                 if !has_pseudos && self.styles.counter_directives_for_node(node).is_none() {
@@ -109,7 +113,7 @@ impl LayoutTreeBuilder<'_, '_> {
                 self.flush_block_segment(segment, parent, false, children);
                 children.extend(self.build_classified_element(node, Some(parent), classification));
             } else if matches!(display, Display::Inline | Display::Contents)
-                && has_block_child(self.styles, child)
+                && classification.has_block_child
             {
                 self.flush_block_segment(segment, parent, false, children);
                 self.build_split_inline_child(node, parent, children);
@@ -130,6 +134,7 @@ impl LayoutTreeBuilder<'_, '_> {
             let plan = plan_table_children(
                 self.document,
                 self.styles,
+                &self.classifications,
                 self.node_scratch[segment.start..].iter().copied(),
             );
             self.node_scratch.truncate(segment.start);
@@ -143,12 +148,7 @@ impl LayoutTreeBuilder<'_, '_> {
         }
         let white_space = self.output.style_for_box(parent as usize).white_space();
         let nodes = &self.node_scratch[segment.start..];
-        let range = super::inline::trim_inline_segment_range(
-            self.document,
-            self.styles,
-            nodes,
-            white_space,
-        );
+        let range = self.trim_inline_segment_range(nodes, white_space);
         let start = segment.start + range.start;
         let end = segment.start + range.end;
         let before = std::mem::take(&mut segment.before);

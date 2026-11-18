@@ -45,7 +45,7 @@ pub enum NoteFlow {
 /// Selects browser-compatible first-fit wrapping or paragraph-wide book
 /// composition. Web-compatible wrapping remains the public default so layout
 /// tests and embedders do not silently acquire different line breaks.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum TextCompositionPolicy {
     #[default]
     WebCompatible,
@@ -64,7 +64,6 @@ impl TextCompositionPolicy {
             Self::BookOptimized | Self::BookOptimizedUnrestrictedHyphenation
         )
     }
-
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -154,6 +153,13 @@ impl LayoutConstraints {
         self.text_composition_policy
     }
 
+    pub fn book_optimized_text(self) -> bool {
+        self.text_composition_policy.is_book_optimized()
+    }
+
+    pub fn hyphenation_quality(self) -> bool {
+        text_composition_policy_uses_hyphenation_quality(self.text_composition_policy)
+    }
 }
 
 impl fmt::Display for LayoutConstraintError {

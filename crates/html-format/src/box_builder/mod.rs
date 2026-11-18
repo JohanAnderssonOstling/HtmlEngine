@@ -1,6 +1,6 @@
 use crate::layout_model::{
-    BlockBox, Children, InlineContent, InlineItemKind, LayoutMode, LayoutTree, TableBox,
-    TableRowBox, parse_positive_span,
+    Children, InlineContent, InlineItemKind, LayoutMode, LayoutTree, TableBox, TableRowBox,
+    parse_positive_span,
 };
 use html_dom::element_is_note_target;
 use html_dom::{Document, DomNodeId, NodeRef};
@@ -21,14 +21,10 @@ mod table;
 mod writer;
 
 use self::classification::{
-    ElementClassification, display_for_element, layout_mode_for_display, pseudo_display,
-    pseudo_is_block_level,
+    BoxClassification, BoxClassifications, layout_mode_for_display, pseudo_display,
 };
 use self::generated::GeneratedContentResolver;
-use self::inline::{
-    InlineFragmentPlan, InlineNodePlan, SplitInlineEvent, has_block_child, plan_generated_inline,
-    plan_inline_node, trim_inline_segment_nodes,
-};
+use self::inline::{InlineFragmentPlan, InlineNodePlan, SplitInlineEvent};
 use self::lists::ListItemOrdinals;
 use self::table::{
     AnonymousCellPart, AnonymousTablePlan, TableChildAction, TableRole, TableRowChildAction,
@@ -40,6 +36,7 @@ use self::writer::BoxTreeWriter;
 struct LayoutTreeBuilder<'a, 'out> {
     document: &'a Document,
     styles: &'a ComputedStyles,
+    classifications: BoxClassifications,
     output: BoxTreeWriter<'a, 'out>,
     generated: GeneratedContentResolver<'a>,
     list_item_ordinals: ListItemOrdinals,
@@ -66,7 +63,7 @@ struct FloatedFirstLetterCapture {
 }
 
 #[derive(Clone, Copy)]
-enum FlexInlineSource {
+enum BoxSource {
     Node(DomNodeId),
     GeneratedPseudo { origin: DomNodeId, before: bool },
 }
@@ -82,6 +79,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
         Self {
             document,
             styles,
+            classifications: BoxClassifications::new(document, styles),
             output: BoxTreeWriter::new(styles, layout_tree, inline_content),
             generated: GeneratedContentResolver::new(document, styles),
             list_item_ordinals: ListItemOrdinals::new(document, styles),
@@ -102,7 +100,67 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
 
     fn build_from(&mut self, root: DomNodeId) {
         let root_box = self.build_box_for_element(root, None);
-        self.output.set_root_box(root_box);
+        self.output.finish(root_box);
+    }
+
+    fn classify_source(&self, source: BoxSource) -> Option<BoxClassification> {
+        match source {
+            BoxSource::Node(node) => self
+                .document
+                .try_element_ref(node)
+                .map(|element| self.classifications.get(element)),
+            BoxSource::GeneratedPseudo { origin, before } => {
+                BoxClassification::pseudo(self.styles, origin, before)
+            }
+        }
+    }
+
+    fn build_source(
+        &mut self,
+        source: BoxSource,
+        parent: u32,
+        classification: BoxClassification,
+    ) -> Option<u32> {
+        let (origin, before) = match source {
+            BoxSource::Node(node) => {
+                return self.build_classified_element(node, Some(parent), classification);
+            }
+            BoxSource::GeneratedPseudo { origin, before } => (origin, before),
+        };
+        if matches!(
+            classification.display,
+            Display::None | Display::TableColumn | Display::TableColumnGroup
+        ) {
+            return None;
+        }
+        let content = self.generated.resolve_pseudo(origin, before)?;
+        if classification.splits_inline()
+            && (content.display.is_table_internal() || content.display == Display::Table)
+        {
+            return self.output.materialize_generated_table(
+                parent,
+                plan_generated_table_principal(self.styles, content)?,
+            );
+        }
+        let box_idx = self.output.push_generated_text_box(parent, &content);
+        if classification.splits_inline()
+            && matches!(
+                content.display,
+                Display::ListItem | Display::FlowRootListItem
+            )
+        {
+            self.build_list_marker(box_idx, content.style, 1);
+        }
+        Some(box_idx)
+    }
+
+    fn process_inline_source(&mut self, source: BoxSource, parent: u32) {
+        match source {
+            BoxSource::Node(node) => self.process_inline_node(node, parent),
+            BoxSource::GeneratedPseudo { origin, before } => {
+                self.append_generated_inline_pseudo(origin, parent, before)
+            }
+        }
     }
 
     fn build_box_for_element(
@@ -111,7 +169,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
         parent_box: Option<u32>,
     ) -> Option<u32> {
         let element = self.document.element_ref(elem_id);
-        let classification = ElementClassification::new(self.styles, element);
+        let classification = self.classifications.get(element);
         self.build_classified_element(elem_id, parent_box, classification)
     }
 
@@ -119,7 +177,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
         &mut self,
         elem_id: DomNodeId,
         parent_box: Option<u32>,
-        classification: ElementClassification,
+        classification: BoxClassification,
     ) -> Option<u32> {
         let element = self.document.element_ref(elem_id);
         let style_indices = classification.style?;
@@ -152,7 +210,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
 
         let mut layout_mode = layout_mode_for_display(display)?;
         if classification.clearing_break {
-            layout_mode = LayoutMode::Block(BlockBox::default());
+            layout_mode = LayoutMode::Block(Children::default());
         }
         if let LayoutMode::TableCell(cell) = &mut layout_mode {
             cell.colspan = parse_positive_span(element.attr("colspan"));
@@ -166,11 +224,16 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
         if let LayoutMode::Inline(_) = layout_mode
             && (classification.floated || classification.absolute)
         {
-            layout_mode = LayoutMode::Block(BlockBox::default());
+            display = Display::Block;
+            layout_mode = LayoutMode::Block(Children::default());
         }
-        let box_idx =
-            self.output
-                .push_dom_box(element, parent_box, Some(style_indices), layout_mode);
+        let box_idx = self.output.push_dom_box(
+            element,
+            display,
+            parent_box,
+            Some(style_indices),
+            layout_mode,
+        );
 
         self.generated.enter_sibling_scope();
 
@@ -189,7 +252,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
                     self.build_flex_grid_children(element, box_idx)
                 }
                 _ => {
-                    if has_block_child(self.styles, element) {
+                    if classification.has_block_child {
                         self.build_block_children(elem_id, box_idx);
                     } else {
                         self.build_inline_children(element, box_idx);
@@ -226,8 +289,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
     fn build_block_children(&mut self, elem_id: DomNodeId, box_idx: u32) {
         let mut direct_children = Vec::new();
         self.append_block_children(elem_id, box_idx, &mut direct_children);
-        self.output
-            .set_box_children(box_idx, Children::Blocks(direct_children));
+        self.output.set_child_boxes(box_idx, direct_children);
     }
 
     fn flush_anonymous_table_segment(

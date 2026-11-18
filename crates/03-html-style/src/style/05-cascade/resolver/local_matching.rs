@@ -6,12 +6,10 @@
 
 use super::cache_index::CacheIndex;
 use super::style_sharing::{SharedElementStyle, element_is_shareable};
-use crate::style::compiled::{
-    CompiledSelectors, PreparedRuleSet, ScopeId, SelectorCandidate, SelectorIndex};
+use crate::style::compiled::{CompiledSelectors, SelectorCandidate, SelectorIndex};
 use crate::style::matching::dom::PseudoTarget;
 use html_dom::{Document, DomNodeId, ElementRef};
 use html_style_model::{CounterDirectives, StyleIndices};
-use lightningcss::selector::{Combinator, Component, Selector};
 use rustc_data_structures::fx::FxHasher;
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
@@ -211,16 +209,13 @@ impl LocalMatchCache {
         &self,
         doc: &Document,
         element: ElementRef<'_>,
-        has_inline_style: bool,
+        has_element_declarations: bool,
     ) -> Option<SharedElementStyle> {
-        if has_inline_style {
-            return None;
-        }
         let entry = &self.entries[self.last_entry?];
         let (representative, style) = entry.early_style.as_ref()?;
         // Attribute differences can now be ignored, so check the subject for
         // presentational hints too, after ruling out cache entries without a style.
-        if !element_is_shareable(element, false) {
+        if !element_is_shareable(element, has_element_declarations) {
             return None;
         }
         let representative = doc.try_element_ref(*representative)?;
@@ -270,8 +265,8 @@ impl LocalMatchCache {
     pub(super) fn remember_style(
         &mut self,
         element: ElementRef<'_>,
-        has_inline_style: bool,
-        prepared: &PreparedRuleSet<'_>,
+        has_element_declarations: bool,
+        compiled: &CompiledSelectors,
         style: StyleIndices,
         custom_map_id: u32,
         counters: &CounterDirectives,
@@ -283,7 +278,7 @@ impl LocalMatchCache {
         if entry.early_shareable == Some(false) {
             return;
         }
-        if !element_is_shareable(element, has_inline_style) {
+        if !element_is_shareable(element, has_element_declarations) {
             return;
         }
         if entry.early_shareable.is_none() {
@@ -291,13 +286,14 @@ impl LocalMatchCache {
             let eligible = self.candidates[entry.candidates.clone()]
                 .iter()
                 .all(|candidate| {
-                    let rule = prepared.get(candidate.rule);
-                    let selector = &rule.style_rule().selectors.0[candidate.selector as usize];
-                    // Pseudos are matched independently for every originating
-                    // element, including when its normal style is shared.
-                    selector.has_pseudo_element()
-                        || (rule.scope() == ScopeId::NONE
-                            && sibling_invariant(selector, &mut attributes))
+                    let selector = compiled.for_rule(candidate.rule)[candidate.selector as usize];
+                    let Some((start, end)) = selector.sibling_attributes else {
+                        return false;
+                    };
+                    attributes.extend_from_slice(
+                        &compiled.sibling_attributes[start as usize..end as usize],
+                    );
+                    true
                 });
             attributes.sort_unstable();
             attributes.dedup();
@@ -320,37 +316,6 @@ impl LocalMatchCache {
     pub(super) fn hit_count(&self) -> usize {
         self.hit_count
     }
-}
-
-/// Record attributes read by safe selectors. Siblings agreeing on these and
-/// normalized HTML state share all ancestors. Reject positional, subtree,
-/// scope or unknown dependencies, including nested logical selectors.
-fn sibling_invariant(selector: &Selector<'_>, attributes: &mut Vec<String>) -> bool {
-    selector
-        .iter_raw_match_order()
-        .all(|component| match component {
-        Component::ExplicitAnyNamespace | Component::ExplicitNoNamespace
-        | Component::DefaultNamespace(_) | Component::Namespace(_, _)
-        | Component::ExplicitUniversalType | Component::LocalName(_)
-        | Component::ID(_) | Component::Class(_)
-        // Current non-tree pseudo-classes use normalized HTML state or
-        // effective language, whose inherited source is the shared parent.
-        | Component::NonTSPseudoClass(_)
-        | Component::Combinator(Combinator::Child | Combinator::Descendant) => true,
-        Component::AttributeInNoNamespaceExists { local_name, .. }
-        | Component::AttributeInNoNamespace { local_name, .. } => {
-            attributes.push(local_name.as_ref().to_ascii_lowercase());
-            true
-        }
-        Component::AttributeOther(attribute) => {
-            attributes.push(attribute.local_name.as_ref().to_ascii_lowercase());
-            true
-        }
-        Component::Is(selectors) | Component::Where(selectors) | Component::Negation(selectors) => {
-            selectors.iter().all(|selector| sibling_invariant(selector, attributes))
-        }
-        _ => false,
-    })
 }
 
 fn candidate_states(element: ElementRef<'_>) -> (bool, bool, bool, bool) {

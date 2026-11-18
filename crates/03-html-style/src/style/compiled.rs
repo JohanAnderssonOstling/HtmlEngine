@@ -1,14 +1,10 @@
 //! Document-independent compiled style data shared by compilation and resolution.
 //! This module contains records, ordering, and accessors; it never parses CSS,
 //! matches DOM nodes, manages caches, or invokes the coordinator.
-use crate::style::cascade::resolver::prepared_native::PreparedNativeValue;
 use crate::style::environment::{MediaEnvironment, MediaQuerySet};
-use crate::style::matching::filter::SelectorFilter;
 use crate::style::property_catalogue::PropertyKey;
-use crate::style::rules::prepared::PreparedStylesheetFragment;
-use crate::style::syntax::prepared_renderer::PreparedRendererValue;
+use crate::style::rules::prepared::{PreparedDeclarationBlock, PreparedStylesheetFragment};
 use html_style_model::FontFace;
-use lightningcss::properties::Property;
 use lightningcss::rules::style::StyleRule;
 use lightningcss::selector::{PseudoClass, SelectorList};
 use lightningcss::values::ident::Ident;
@@ -95,9 +91,9 @@ impl RulePriority {
 
 /// Stable within a compiled program, independent of parser allocation addresses.
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
-pub(crate) struct DeclarationId {
-    fragment: usize,
-    declaration: usize,
+pub(crate) enum DeclarationId {
+    Rule { fragment: usize, declaration: usize },
+    Inline { block: usize, declaration: usize },
 }
 
 /// Dense, compact identifier issued only by `PreparedRuleSet`.
@@ -144,30 +140,9 @@ pub(crate) struct PreparedTargetRange {
     pub(super) len_and_flags: u32,
 }
 
-/// A range into a stylesheet's shared longhand pool. No per-declaration allocation.
-#[derive(Clone, Copy)]
-pub(crate) struct PreparedExpansion {
-    pub(super) start: u32,
-    pub(super) len: u32,
-}
-
-impl PreparedExpansion {
-    pub(super) const NONE: Self = Self {
-        start: 0,
-        len: u32::MAX,
-    };
-
-    pub(super) fn values<'a, 'css>(
-        self,
-        pool: &'a [Property<'css>],
-    ) -> Option<&'a [Property<'css>]> {
-        (self.len != u32::MAX)
-            .then(|| &pool[self.start as usize..self.start as usize + self.len as usize])
-    }
-}
-
 #[derive(Clone, Copy)]
 pub(crate) struct PreparedRuleDeclarations {
+    pub(super) valid_selectors: bool,
     pub(super) normal_start: u32,
     pub(super) important_start: u32,
     pub(super) normal_shadow_mask: u64,
@@ -259,7 +234,7 @@ impl<'css> PreparedRuleSet<'css> {
     ) -> DeclarationId {
         let (fragment, local_rule) = self.rule_sources[id.index()];
         let starts = self.fragments[fragment].rule_declarations[local_rule];
-        DeclarationId {
+        DeclarationId::Rule {
             fragment,
             declaration: index
                 + if important {
@@ -270,12 +245,12 @@ impl<'css> PreparedRuleSet<'css> {
         }
     }
 
-    pub(crate) fn native_values(
+    pub(crate) fn declaration_block(
         &self,
         id: EffectiveRuleId,
         important: bool,
         index: usize,
-    ) -> &[Option<PreparedNativeValue>] {
+    ) -> (&PreparedDeclarationBlock<'css>, usize) {
         let (fragment, local_rule) = self.rule_source(id);
         let starts = fragment.rule_declarations[local_rule];
         let start = if important {
@@ -283,23 +258,7 @@ impl<'css> PreparedRuleSet<'css> {
         } else {
             starts.normal_start
         };
-        fragment.declarations.native_values(start as usize + index)
-    }
-
-    pub(crate) fn renderer_value(
-        &self,
-        id: EffectiveRuleId,
-        important: bool,
-        index: usize,
-    ) -> Option<&PreparedRendererValue> {
-        let (fragment, local_rule) = self.rule_source(id);
-        let starts = fragment.rule_declarations[local_rule];
-        let start = if important {
-            starts.important_start
-        } else {
-            starts.normal_start
-        };
-        fragment.declarations.renderer_value(start as usize + index)
+        (&fragment.declarations, start as usize + index)
     }
 
     pub(crate) fn font_faces(&self) -> &Arc<[FontFace]> {
@@ -350,23 +309,6 @@ impl<'css> PreparedRuleSet<'css> {
         }
     }
 
-    pub(crate) fn declaration_longhands(
-        &self,
-        id: EffectiveRuleId,
-        important: bool,
-        index: usize,
-    ) -> Option<&[Property<'css>]> {
-        let (fragment, local_rule) = self.rule_source(id);
-        let starts = fragment.rule_declarations[local_rule];
-        let start = if important {
-            starts.important_start
-        } else {
-            starts.normal_start
-        };
-        fragment.declarations.declaration_expansions[start as usize + index]
-            .values(&fragment.declarations.longhands)
-    }
-
     pub(crate) fn declaration_targets(
         &self,
         id: EffectiveRuleId,
@@ -376,44 +318,14 @@ impl<'css> PreparedRuleSet<'css> {
         self.declaration_metadata(id, important, index).0
     }
 
-    pub(crate) fn declaration_requires_viewport_height(
-        &self,
-        id: EffectiveRuleId,
-        important: bool,
-        index: usize,
-    ) -> bool {
-        let (fragment, local) = self.rule_sources[id.index()];
-        let fragment = &self.fragments[fragment];
-        let declarations = fragment.rule_declarations[local];
-        let offset = if important {
-            declarations.important_start
-        } else {
-            declarations.normal_start
-        };
-        fragment
-            .declarations
-            .requires_viewport_height(offset as usize + index)
-    }
-
     pub(crate) fn declaration_metadata(
         &self,
         id: EffectiveRuleId,
         important: bool,
         index: usize,
     ) -> (&[PropertyKey], bool) {
-        let (fragment, local_rule) = self.rule_source(id);
-        let starts = fragment.rule_declarations[local_rule];
-        let ranges_start = if important {
-            starts.important_start
-        } else {
-            starts.normal_start
-        } as usize;
-        let range = fragment.declarations.declaration_target_ranges[ranges_start + index];
-        (
-            &fragment.declarations.property_targets
-                [range.start as usize..range.start as usize + range.len()],
-            range.renderer_eligibility(),
-        )
+        let (block, index) = self.declaration_block(id, important, index);
+        block.metadata(index)
     }
 
     pub(crate) fn rule_shadow_declarations(
@@ -441,7 +353,9 @@ impl<'css> PreparedRuleSet<'css> {
 
 #[derive(Clone, Copy)]
 pub(crate) struct PreparedSelector {
-    pub(crate) ancestor_requirements: SelectorFilter,
+    pub(crate) ancestor_requirements: (u32, u32),
+    /// Attribute range for safe sibling sharing; None marks context-sensitive selectors.
+    pub(super) sibling_attributes: Option<(u32, u32)>,
     pub(super) specificity: u32,
     pub(super) fast_start: u32,
     pub(super) fast_len: u16,
@@ -546,6 +460,8 @@ pub(crate) struct RuleSelectorRange {
 pub(crate) struct CompiledSelectors {
     pub(super) rule_starts: Vec<RuleSelectorRange>,
     pub(super) selectors: Vec<PreparedSelector>,
+    pub(super) sibling_attributes: Vec<String>,
+    pub(super) ancestor_tests: Vec<FastAlternative>,
     pub(super) tests: Vec<FastTest>,
     pub(super) compounds: Vec<Compound>,
 }

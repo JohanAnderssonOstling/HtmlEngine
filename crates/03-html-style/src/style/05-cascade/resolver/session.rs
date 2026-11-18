@@ -1,7 +1,7 @@
 //! Per-document resolver state. Helpers depend on this record, never on orchestration.
 use super::context::ResolutionContext;
 use super::local_matching::{LocalMatchCache, PseudoCandidates};
-use super::plan::CachedRuleMatches;
+use super::plan::CascadePlan;
 use super::specified;
 use super::style_sharing::StyleSharingCache;
 use crate::style::compiled::{PreparedRuleSet, SelectorCandidate, SelectorIndex};
@@ -32,7 +32,7 @@ pub(super) struct StyleResolverContext<'a, 'css> {
     pub(super) pseudo_candidate_scratch: PseudoCandidates,
     pub(super) local_specificity_scratch: Vec<Option<u32>>,
     pub(super) local_match_cache: LocalMatchCache,
-    pub(super) matched_rules: CachedRuleMatches,
+    pub(super) matched_rules: CascadePlan,
     pub(super) cascade_scratch: specified::CascadeScratch<'css>,
     pub(super) style_sharing_cache: StyleSharingCache,
     pub(super) resolution: &'a mut ResolutionContext,

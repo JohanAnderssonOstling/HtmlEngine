@@ -1,5 +1,8 @@
-use html_dom::{DomNodeId, Document, ElementRef, MemoryUsageReport};
-use html_style_model::{ListStylePosition, StyleIndices};
+use crate::GroupedArena;
+use html_dom::{Document, DomNodeId, ElementRef, MemoryUsageReport};
+use html_style_model::{
+    ComputedStyles, Display, Float, ListStylePosition, OverflowMode, PositionMode, StyleIndices,
+};
 use rustc_data_structures::fx::FxHashMap;
 use std::iter::{once, successors};
 use std::num::NonZeroU32;
@@ -21,10 +24,14 @@ pub struct ListItemMarker {
 #[derive(Default, Clone)]
 pub struct LayoutTree {
     pub boxes: Vec<LayoutBox>,
+    /// Ordered direct-child IDs. Content ranges are views into this same arena.
+    child_indices: Vec<u32>,
     /// Cold table payloads, addressed by compact handles in layout boxes.
     tables: Vec<TableBox>,
     pub root_box: Option<u32>,
     pub body_box: Option<u32>,
+    pub has_floats: bool,
+    pub tracks_overflow_clips: bool,
     /// Generated markers keyed by their list-item box index.
     pub list_markers: FxHashMap<u32, ListItemMarker>,
     /// Decoded images keyed by their principal layout box index.
@@ -47,14 +54,8 @@ impl LayoutTree {
                 table
                     .columns
                     .iter()
-                    .flat_map(|column| once(column.width_style).chain(column.background_style))
+                    .flat_map(|column| once(column.width_style).chain(column.fallback_style))
                     .chain(table.column_groups.iter().map(|group| group.style))
-                    .chain(
-                        table
-                            .column_width_hints
-                            .iter()
-                            .flat_map(|hint| once(hint.style).chain(hint.fallback_style)),
-                    )
             })
             .chain(
                 self.split_inline_position_ancestors
@@ -66,6 +67,7 @@ impl LayoutTree {
     pub fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
         report.add_vec_storage("LayoutTree.boxes.storage", &self.boxes);
+        report.add_vec_storage("LayoutTree.child_indices.storage", &self.child_indices);
         report.add_vec_storage("LayoutTree.tables.storage", &self.tables);
         for table in &self.tables {
             report.extend_prefixed("LayoutTree.tables", table.memory_usage_report());
@@ -147,6 +149,62 @@ impl LayoutTree {
         self.boxes.get(box_idx)?.parent().map(|p| p as usize)
     }
 
+    /// All direct formatting children, including generated markers.
+    pub fn children(&self, box_idx: usize) -> &[u32] {
+        self.child_slice(&self.boxes[box_idx].children)
+    }
+
+    /// A layout-role view into the same child arena (for example block content).
+    pub fn child_slice(&self, range: &Range<u32>) -> &[u32] {
+        &self.child_indices[range.start as usize..range.end as usize]
+    }
+
+    /// Record construction-defined content order before publishing topology.
+    pub fn store_children(&mut self, children: impl IntoIterator<Item = u32>) -> Range<u32> {
+        let start =
+            u32::try_from(self.child_indices.len()).expect("child arena exceeds u32 capacity");
+        self.child_indices.extend(children);
+        start..u32::try_from(self.child_indices.len()).expect("child arena exceeds u32 capacity")
+    }
+
+    /// Publish one entry per parent-child relationship after construction.
+    /// Explicit content order comes first; remaining structural children follow
+    /// in construction order. Content views exclude those additional children.
+    pub fn publish_children(&mut self) {
+        let mut children = GroupedArena::default();
+        children.reset_groups(self.boxes.len());
+        let mut included = vec![false; self.boxes.len()];
+        for (owner, layout_box) in self.boxes.iter_mut().enumerate() {
+            if let Some(content) = layout_box.layout_mode.content_children_mut() {
+                for &child in &self.child_indices[content.start as usize..content.end as usize] {
+                    assert!(!included[child as usize], "duplicate content child");
+                    included[child as usize] = true;
+                    children.push_to(owner, child);
+                }
+            }
+        }
+        for (child, layout_box) in self.boxes.iter().enumerate() {
+            if let Some(parent) = layout_box.parent
+                && !included[child]
+            {
+                children.push_to(parent as usize, child as u32);
+            }
+        }
+        let (indices, ranges) = children.into_parts();
+        self.child_indices = indices;
+        for (layout_box, range) in self.boxes.iter_mut().zip(ranges) {
+            if let Some(content) = layout_box.layout_mode.content_children_mut() {
+                *content = range.start..range.start + (content.end - content.start);
+            }
+            layout_box.children = range;
+        }
+        debug_assert!(self.boxes.iter().enumerate().all(|(owner, _)| {
+            self.children(owner)
+                .iter()
+                .all(|&child| self.boxes[child as usize].parent == Some(owner as u32))
+        }));
+    }
+
     /// Formatting ancestors, starting with the immediate parent and ending at
     /// the root. Anonymous and generated boxes follow their formatting parents.
     pub fn ancestors(&self, box_idx: usize) -> impl Iterator<Item = usize> + Clone + '_ {
@@ -180,7 +238,7 @@ impl LayoutTree {
         self.tables.get_mut(index)
     }
 
-    pub fn push_box(&mut self, mut layout_box: LayoutBox) -> u32 {
+    pub fn push_box(&mut self, mut layout_box: LayoutBox, styles: &ComputedStyles) -> u32 {
         if let LayoutMode::Table(id) = &mut layout_box.layout_mode {
             // A default handle requests an empty table. Existing handles remain
             // valid when a box is moved within this tree.
@@ -195,6 +253,54 @@ impl LayoutTree {
             }
         }
         let idx = self.boxes.len() as u32;
+        let style = styles
+            .view(layout_box.style.unwrap_or_else(|| styles.default_indices()))
+            .expect("validated style handle");
+        if layout_box.dom_element.is_none() {
+            layout_box.facts.display = style.display();
+        }
+        layout_box.facts.float = style.float();
+        layout_box.facts.absolute = style.layout.position == PositionMode::Absolute;
+        layout_box.facts.flex_grid_item = layout_box.parent.is_some_and(|parent| {
+            matches!(
+                self.boxes[parent as usize].layout_mode,
+                LayoutMode::Flex(_) | LayoutMode::Grid(_)
+            )
+        });
+        layout_box.facts.overflow = (style.overflow_x(), style.overflow_y());
+        // Body overflow propagated to the viewport does not clip the body or
+        // establish its formatting context. The root is inserted before it.
+        if self.body_box == Some(idx)
+            && self.root_box.is_some_and(|root| {
+                self.boxes[root as usize].facts.overflow
+                    == (OverflowMode::Visible, OverflowMode::Visible)
+            })
+        {
+            layout_box.facts.overflow = (OverflowMode::Visible, OverflowMode::Visible);
+        }
+        layout_box.facts.atomic_inline = layout_box.facts.display.is_atomic_inline();
+        layout_box.facts.formatting_context = layout_box.parent.is_none()
+            || layout_box.facts.absolute
+            || layout_box.facts.float != Float::None
+            || layout_box.facts.flex_grid_item
+            || matches!(layout_box.layout_mode, LayoutMode::TableCell(_))
+            || layout_box
+                .facts
+                .display
+                .establishes_formatting_context(layout_box.facts.overflow);
+        layout_box.facts.flow_root = if matches!(layout_box.layout_mode, LayoutMode::Inline(_)) {
+            layout_box
+                .parent
+                .map_or(idx, |parent| self.boxes[parent as usize].facts.flow_root)
+        } else {
+            idx
+        };
+        self.has_floats |= !layout_box.facts.absolute && layout_box.facts.float != Float::None;
+        self.tracks_overflow_clips |=
+            layout_box.facts.overflow.0.clips() || layout_box.facts.overflow.1.clips();
+        if layout_box.parent.is_none() {
+            self.root_box = Some(idx);
+        }
         self.boxes.push(layout_box);
         idx
     }
@@ -247,8 +353,22 @@ impl LayoutTree {
     }
 }
 
+/// Stable box-construction facts shared by shaping, layout, and paint.
+#[derive(Clone, Copy, Default)]
+pub struct BoxFacts {
+    pub display: Display,
+    pub float: Float,
+    pub absolute: bool,
+    pub formatting_context: bool,
+    pub flex_grid_item: bool,
+    pub atomic_inline: bool,
+    pub overflow: (OverflowMode, OverflowMode),
+    pub flow_root: u32,
+}
+
 #[derive(Clone)]
 pub struct LayoutBox {
+    pub facts: BoxFacts,
     pub layout_mode: LayoutMode,
 
     // DOM node backing this box (None for anonymous boxes). Element identity
@@ -256,7 +376,8 @@ pub struct LayoutBox {
     pub dom_element: Option<DomNodeId>,
 
     // Tree structure (layout tree)
-    pub parent: Option<u32>, // index of parent box
+    pub parent: Option<u32>,  // index of parent box
+    pub children: Range<u32>, // structural direct children in the shared arena
 
     // Style indices into split style vecs
     pub style: Option<StyleIndices>,
@@ -279,17 +400,18 @@ pub type BoxType = LayoutMode;
 impl LayoutBox {
     pub fn new_anonymous_box(range: Range<u32>, parent: Option<u32>) -> Self {
         Self {
+            facts: BoxFacts::default(),
             layout_mode: LayoutMode::Anonymous(range),
             dom_element: None, // anonymous boxes have no DOM element
             parent,
+            children: 0..0,
             style: None,
         }
     }
 
     /// Get element data from DOM tree
     pub fn get_element<'a>(&self, doc: &'a Document) -> Option<ElementRef<'a>> {
-        self.dom_element
-            .map(|node_id| doc.element_ref(node_id))
+        self.dom_element.map(|node_id| doc.element_ref(node_id))
     }
 
     pub fn layout_mode(&self) -> &LayoutMode {
@@ -324,80 +446,40 @@ pub struct TableId(Option<NonZeroU32>);
 
 #[derive(Clone)]
 pub enum LayoutMode {
-    Block(BlockBox),
+    Block(Children),
     Table(TableId),
     TableRow(TableRowBox),
     TableCell(TableCellBox),
-    Flex(FlexBox),
-    Grid(GridBox),
+    Flex(Range<u32>),
+    Grid(Range<u32>),
     Inline(Range<u32>), // range of inline items
     Anonymous(Range<u32>), // range of inline items (no element)
                         // Future layout modes (not yet implemented)
-                        // InlineBlock(BlockBox),
+                        // InlineBlock(Children),
                         // Replaced(ReplacedBox),
 }
 
 impl LayoutMode {
+    fn content_children_mut(&mut self) -> Option<&mut Range<u32>> {
+        match self {
+            Self::Block(Children::Blocks(range))
+            | Self::TableCell(TableCellBox {
+                children: Children::Blocks(range),
+                ..
+            })
+            | Self::Flex(range)
+            | Self::Grid(range) => Some(range),
+            _ => None,
+        }
+    }
+
     pub fn memory_usage_report(&self) -> MemoryUsageReport {
         let mut report = MemoryUsageReport::new();
-        match self {
-            LayoutMode::Block(block) => {
-                report.extend_prefixed("LayoutMode::Block", block.memory_usage_report())
-            }
-            LayoutMode::Table(_) => {} // Payloads are counted by LayoutTree.
-            LayoutMode::TableRow(row) => {
-                report.extend_prefixed("LayoutMode::TableRow", row.memory_usage_report())
-            }
-            LayoutMode::TableCell(cell) => {
-                report.extend_prefixed("LayoutMode::TableCell", cell.memory_usage_report())
-            }
-            LayoutMode::Flex(container) => {
-                report.extend_prefixed("LayoutMode::Flex", container.memory_usage_report())
-            }
-            LayoutMode::Grid(container) => {
-                report.extend_prefixed("LayoutMode::Grid", container.memory_usage_report())
-            }
-            LayoutMode::Inline(_) => {}
-            LayoutMode::Anonymous(_) => {}
+        // Other modes contain only ranges or handles into LayoutTree storage.
+        if let Self::TableRow(row) = self {
+            report.extend_prefixed("LayoutMode::TableRow", row.memory_usage_report());
         }
         report
-    }
-}
-
-#[derive(Clone, Default)]
-pub struct FlexBox {
-    pub children: Vec<u32>,
-}
-
-impl FlexBox {
-    pub fn memory_usage_report(&self) -> MemoryUsageReport {
-        let mut report = MemoryUsageReport::new();
-        report.add_vec_storage("FlexBox.children.storage", &self.children);
-        report
-    }
-}
-
-#[derive(Clone, Default)]
-pub struct GridBox {
-    pub children: Vec<u32>,
-}
-
-impl GridBox {
-    pub fn memory_usage_report(&self) -> MemoryUsageReport {
-        let mut report = MemoryUsageReport::new();
-        report.add_vec_storage("GridBox.children.storage", &self.children);
-        report
-    }
-}
-
-#[derive(Clone, Default)]
-pub struct BlockBox {
-    pub children: Children,
-}
-
-impl BlockBox {
-    pub fn memory_usage_report(&self) -> MemoryUsageReport {
-        self.children.memory_usage_report()
     }
 }
 
@@ -409,15 +491,16 @@ pub struct TableBox {
     pub captions_bottom: Vec<u32>,
     pub columns: Vec<TableColumnTrack>,
     pub column_groups: Vec<TableColumnGroupSpan>,
-    pub column_width_hints: Vec<TableColumnWidthHint>,
 }
 
 #[derive(Clone)]
 pub struct TableColumnTrack {
     // Style used for column width resolution (explicit width / min / max hints).
     pub width_style: StyleIndices,
-    // Style used for column background layering, if authored by <col>.
-    pub background_style: Option<StyleIndices>,
+    // Group width fallback when the column width is auto.
+    pub fallback_style: Option<StyleIndices>,
+    // Explicit columns paint their own style; group-only tracks do not.
+    pub paints_background: bool,
 }
 
 #[derive(Clone)]
@@ -425,14 +508,6 @@ pub struct TableColumnGroupSpan {
     pub style: StyleIndices,
     pub start: usize,
     pub span: usize,
-}
-
-/// A table column does not generate a layout box, so retain the opaque style
-/// handle needed to turn its computed width into a shaped, used width.
-#[derive(Clone, Copy)]
-pub struct TableColumnWidthHint {
-    pub style: StyleIndices,
-    pub fallback_style: Option<StyleIndices>,
 }
 
 impl TableBox {
@@ -444,10 +519,6 @@ impl TableBox {
         report.add_vec_storage("TableBox.captions_bottom.storage", &self.captions_bottom);
         report.add_vec_storage("TableBox.columns.storage", &self.columns);
         report.add_vec_storage("TableBox.column_groups.storage", &self.column_groups);
-        report.add_vec_storage(
-            "TableBox.column_width_hints.storage",
-            &self.column_width_hints,
-        );
         report
     }
 }
@@ -484,31 +555,22 @@ impl TableCellBox {
             rowspan: 1,
         }
     }
-
-    pub fn memory_usage_report(&self) -> MemoryUsageReport {
-        self.children.memory_usage_report()
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum Children {
-    Blocks(Vec<u32>),
+    Blocks(Range<u32>),
     InlineItems(Range<u32>),
     #[default]
     Empty,
 }
 
-impl Children {
-    pub fn memory_usage_report(&self) -> MemoryUsageReport {
-        let mut report = MemoryUsageReport::new();
-        if let Children::Blocks(children) = self {
-            report.add_vec_storage("Children::Blocks.storage", children);
-        }
-        report
-    }
-}
-
 impl html_text::TextStructure for LayoutTree {
+    fn flow_root(&self, context: usize) -> usize {
+        self.box_at(context)
+            .map_or(context, |layout_box| layout_box.facts.flow_root as usize)
+    }
+
     fn get_box_parent(&self, context: usize) -> Option<usize> {
         self.get_box_parent(context)
     }

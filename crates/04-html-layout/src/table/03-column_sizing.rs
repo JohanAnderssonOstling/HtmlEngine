@@ -1,9 +1,13 @@
+//! Resolve column geometry and collect the width constraints used by the solvers.
+
+use super::weighted_share;
+
 use super::columns::{
-    TableColumnLayout, column_width_constraints, column_width_style, definite_width_constraints,
-    percentage_component,
+    column_width_constraints, column_width_style, definite_width_constraints, percentage_component,
 };
+use super::geometry::TableColumnLayout;
 use super::s01_grid::PreparedTableGrid;
-use crate::layout::{LayoutEngine, UsedBorderInsets};
+use crate::{LayoutEngine, UsedBorderInsets};
 use html_style_model::BoxSizing;
 
 #[derive(Clone, Copy, Default)]
@@ -15,58 +19,23 @@ pub(super) struct WidthMeasure {
     constrained: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum FixedColumnKind {
-    Percentage,
-    Fixed,
-    Zero,
-    Auto,
-}
-
-impl WidthMeasure {
-    fn fixed_kind(&self) -> FixedColumnKind {
-        match (self.percentage > 0.0, self.constrained, self.maximum) {
-            (true, _, _) => FixedColumnKind::Percentage,
-            (_, true, width) if width > 0.0 => FixedColumnKind::Fixed,
-            (_, true, 0.0) => FixedColumnKind::Zero,
-            _ => FixedColumnKind::Auto,
-        }
-    }
-
-    /// Minimum, percentage, specified, and maximum guesses for auto layout.
-    fn guesses(&self, target: f64) -> [f64; 4] {
-        let percentage = if self.percentage > 0.0 {
-            self.minimum
-                .max(target * self.percentage + self.percentage_offset)
-        } else {
-            self.minimum
-        };
-        let specified = if self.percentage > 0.0 {
-            percentage
-        } else if self.constrained {
-            self.maximum
-        } else {
-            self.minimum
-        };
-        let maximum = if self.percentage > 0.0 {
-            percentage
-        } else {
-            self.maximum.max(specified)
-        };
-        [self.minimum, percentage, specified, maximum]
-    }
-}
-
 pub(super) fn resolve_table_columns(
     measures: Vec<WidthMeasure>,
     content_width: f64,
-    spacing: f64,
-    fixed_mode: bool,
+    prepared: &PreparedTableGrid,
     fit_to_width: bool,
+    rtl: bool,
 ) -> TableColumnLayout {
+    let spacing = if fit_to_width {
+        prepared
+            .horizontal_spacing
+            .min(content_width / (measures.len() as f64 + 1.0))
+    } else {
+        prepared.horizontal_spacing
+    };
     let column_count = measures.len();
     let usable_width = (content_width - spacing * (column_count as f64 + 1.0)).max(0.0);
-    let mut widths = if fixed_mode {
+    let mut widths = if prepared.fixed_mode {
         resolve_fixed_widths(
             &measures,
             usable_width.max(measures.iter().map(|column| column.minimum).sum::<f64>()),
@@ -83,15 +52,26 @@ pub(super) fn resolve_table_columns(
         1.0
     };
     let mut starts = Vec::with_capacity(widths.len());
-    let mut cursor = spacing;
+    let mut cursor = spacing
+        + if rtl {
+            prepared.outer_borders.right
+        } else {
+            prepared.outer_borders.left
+        };
     for width in &mut widths {
         *width *= scale;
         starts.push(cursor);
         cursor += *width + spacing;
     }
-    let table_width = cursor;
+    let table_width = cursor
+        + if rtl {
+            prepared.outer_borders.left
+        } else {
+            prepared.outer_borders.right
+        };
     TableColumnLayout {
-        rtl: false,
+        rtl,
+        spacing,
         widths,
         starts,
         table_width,
@@ -104,15 +84,14 @@ pub(super) fn measure_table_columns(
 ) -> Vec<WidthMeasure> {
     let placements = &prepared.grid.placements;
     let column_count = prepared.grid.column_count;
-    let hints = &prepared.column_width_hints;
     let spacing = prepared.horizontal_spacing;
     let collapsed_grid = prepared.collapsed_borders.as_ref();
     let fixed_mode = prepared.fixed_mode;
     let mut measures = vec![WidthMeasure::default(); column_count];
 
-    for (column, hint) in hints.iter().copied().enumerate().take(column_count) {
-        let style = column_width_style(&engine.reader, hint);
-        let (minimum, width) = column_width_constraints(&engine.reader, hint);
+    for (column, track) in prepared.columns.iter().enumerate().take(column_count) {
+        let style = column_width_style(&engine.read.reader, track);
+        let (minimum, width) = column_width_constraints(&engine.read.reader, track);
         let column = &mut measures[column];
         column.minimum = column.minimum.max(minimum);
         if let Some(width) = width {
@@ -180,12 +159,8 @@ pub(super) fn measure_table_columns(
             remaining_percentage = (remaining_percentage - column.percentage).max(0.0);
         }
     }
-    for column in &mut measures {
-        column.maximum = column.maximum.max(column.minimum);
-    }
-
-    if let Some(grid) = collapsed_grid {
-        for (index, column) in measures.iter_mut().enumerate() {
+    for (index, column) in measures.iter_mut().enumerate() {
+        if let Some(grid) = collapsed_grid {
             let left = if index > 0 {
                 grid.vertical_boundary_max(index) * 0.5
             } else {
@@ -196,12 +171,53 @@ pub(super) fn measure_table_columns(
             } else {
                 0.0
             };
-            let border_floor = left + right;
-            column.minimum = column.minimum.max(border_floor);
-            column.maximum = column.maximum.max(column.minimum);
+            column.minimum = column.minimum.max(left + right);
         }
+        column.maximum = column.maximum.max(column.minimum);
     }
     measures
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FixedColumnKind {
+    Percentage,
+    Fixed,
+    Zero,
+    Auto,
+}
+
+impl WidthMeasure {
+    fn fixed_kind(&self) -> FixedColumnKind {
+        match (self.percentage > 0.0, self.constrained, self.maximum) {
+            (true, _, _) => FixedColumnKind::Percentage,
+            (_, true, width) if width > 0.0 => FixedColumnKind::Fixed,
+            (_, true, 0.0) => FixedColumnKind::Zero,
+            _ => FixedColumnKind::Auto,
+        }
+    }
+
+    /// Minimum, percentage, specified, and maximum guesses for auto layout.
+    fn guesses(&self, target: f64) -> [f64; 4] {
+        let percentage = if self.percentage > 0.0 {
+            self.minimum
+                .max(target * self.percentage + self.percentage_offset)
+        } else {
+            self.minimum
+        };
+        let specified = if self.percentage > 0.0 {
+            percentage
+        } else if self.constrained {
+            self.maximum
+        } else {
+            self.minimum
+        };
+        let maximum = if self.percentage > 0.0 {
+            percentage
+        } else {
+            self.maximum.max(specified)
+        };
+        [self.minimum, percentage, specified, maximum]
+    }
 }
 
 fn cell_measures(
@@ -210,22 +226,17 @@ fn cell_measures(
     used_borders: Option<UsedBorderInsets>,
     fixed_mode: bool,
 ) -> WidthMeasure {
-    let style = engine.reader.style(cell_idx);
+    let style = engine.read.reader.style(cell_idx);
     // Percentage cell padding is cyclic while column measures are computed,
     // so its intrinsic contribution is zero. It is resolved against the
     // final table width later when the cell contents are laid out.
-    let box_model = used_borders.map_or_else(
-        || engine.reader.box_model(cell_idx, 0.0),
-        |borders| {
-            engine
-                .reader
-                .box_model(cell_idx, 0.0)
-                .with_used_borders(borders)
-        },
-    );
+    let mut box_model = engine.read.reader.box_model(cell_idx, 0.0);
+    if let Some(borders) = used_borders {
+        box_model = box_model.with_used_borders(borders);
+    }
     let extras = box_model.horizontal_padding_border();
     let (content_minimum, content_maximum) =
-        crate::layout::box_content_intrinsic_widths(engine, cell_idx, None);
+        crate::measurement::box_content_intrinsic_widths(engine, cell_idx, None);
     let (lower, upper, definite_width) = definite_width_constraints(style, extras);
     let percentage = percentage_component(style.width()).unwrap_or(0.0).max(0.0);
     let percentage_offset =
@@ -249,7 +260,7 @@ fn cell_measures(
 
     WidthMeasure {
         minimum,
-        maximum: maximum.max(minimum),
+        maximum,
         percentage,
         percentage_offset,
         constrained: definite_width.is_some(),
@@ -302,11 +313,7 @@ fn distribute_spanning_percentage(measures: &mut [WidthMeasure], percentage: f64
             .iter_mut()
             .filter(|column| column.percentage == 0.0)
         {
-            let share = if weight_sum > 0.0 {
-                column.maximum / weight_sum
-            } else {
-                1.0 / count as f64
-            };
+            let share = weighted_share(column.maximum, weight_sum, count);
             column.percentage = residual * share;
         }
     }
@@ -334,7 +341,7 @@ fn distribute_auto_span(
 
     let maximums = resolve_measured_widths(span, required_maximum, cell.constrained);
     for (column, maximum) in span.iter_mut().zip(maximums) {
-        column.maximum = column.maximum.max(maximum).max(column.minimum);
+        column.maximum = column.maximum.max(maximum);
     }
 }
 
@@ -346,12 +353,12 @@ fn resolve_measured_widths(
     if measures.is_empty() {
         return Vec::new();
     }
-    let totals: [f64; 4] = std::array::from_fn(|stage| {
-        measures
-            .iter()
-            .map(|column| column.guesses(target)[stage])
-            .sum()
-    });
+    let mut totals = [0.0; 4];
+    for column in measures {
+        for (total, guess) in totals.iter_mut().zip(column.guesses(target)) {
+            *total += guess;
+        }
+    }
     if target <= totals[0] {
         return measures.iter().map(|column| column.minimum).collect();
     }
@@ -390,18 +397,26 @@ fn resolve_fixed_widths(measures: &[WidthMeasure], target: f64) -> Vec<f64> {
         return Vec::new();
     }
     let columns = |kind| (0..count).filter(move |&column| measures[column].fixed_kind() == kind);
-    let auto_count = columns(Auto).count();
+    let mut counts = [0; 4];
+    let mut total_percent = 0.0;
+    let mut total_fixed = 0.0;
     let percentage_size =
         |column: usize| target * measures[column].percentage + measures[column].percentage_offset;
-    let total_percent = columns(Percentage).map(percentage_size).sum::<f64>();
-    let total_fixed = columns(Fixed)
-        .map(|column| measures[column].maximum)
-        .sum::<f64>();
+    for (index, column) in measures.iter().enumerate() {
+        let kind = column.fixed_kind();
+        counts[kind as usize] += 1;
+        match kind {
+            Percentage => total_percent += percentage_size(index),
+            Fixed => total_fixed += column.maximum,
+            _ => {}
+        }
+    }
     let mut widths = vec![0.0; count];
     let mut assigned = 0.0;
 
     let target_fixed = (target - total_percent).max(0.0);
-    let scale = if ((total_fixed < target_fixed && auto_count == 0) || total_fixed > target)
+    let scale = if ((total_fixed < target_fixed && counts[Auto as usize] == 0)
+        || total_fixed > target)
         && total_fixed > 0.0
     {
         target_fixed / total_fixed
@@ -417,7 +432,7 @@ fn resolve_fixed_widths(measures: &[WidthMeasure], target: f64) -> Vec<f64> {
     }
 
     let available = target - assigned;
-    let scale_up = total_percent < available && auto_count == 0;
+    let scale_up = total_percent < available && counts[Auto as usize] == 0;
     let scale_down = total_percent > available;
     let scale = if (scale_up || scale_down) && total_percent > 0.0 {
         available / total_percent
@@ -430,13 +445,13 @@ fn resolve_fixed_widths(measures: &[WidthMeasure], target: f64) -> Vec<f64> {
     }
 
     let remaining = (target - assigned).max(0.0);
-    let kind = if columns(Zero).count() == count {
+    let kind = if counts[Zero as usize] == count {
         Zero
     } else {
         Auto
     };
     let recipients = columns(kind);
-    let recipient_count = recipients.clone().count();
+    let recipient_count = counts[kind as usize];
     if recipient_count > 0 {
         let share = remaining / recipient_count as f64;
         for column in recipients {
@@ -445,16 +460,13 @@ fn resolve_fixed_widths(measures: &[WidthMeasure], target: f64) -> Vec<f64> {
     } else if assigned < target {
         // With no auto columns, preserve the proportions of fixed columns
         // first, or percentage columns when there are no fixed ones.
-        let recipients = columns(if total_fixed > 0.0 { Fixed } else { Percentage });
-        let recipient_count = recipients.clone().count();
+        let kind = if total_fixed > 0.0 { Fixed } else { Percentage };
+        let recipients = columns(kind);
+        let recipient_count = counts[kind as usize];
         let weight_sum = recipients.clone().map(|column| widths[column]).sum::<f64>();
         for column in recipients {
-            widths[column] += (target - assigned)
-                * if weight_sum > 0.0 {
-                    widths[column] / weight_sum
-                } else {
-                    1.0 / recipient_count as f64
-                };
+            widths[column] +=
+                (target - assigned) * weighted_share(widths[column], weight_sum, recipient_count);
         }
     }
     widths
@@ -497,11 +509,7 @@ fn distribute_excess_width(
     };
     let weight_sum = recipients.clone().map(weight).sum::<f64>();
     for column in recipients {
-        let share = if weight_sum > 0.0 {
-            weight(column) / weight_sum
-        } else {
-            1.0 / count as f64
-        };
+        let share = weighted_share(weight(column), weight_sum, count);
         widths[column] += extra * share;
     }
 }

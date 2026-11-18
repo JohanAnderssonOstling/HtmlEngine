@@ -2,20 +2,15 @@
 
 use super::context::ResolutionContext;
 use super::state::WorkingStyle;
-use colors::css_color_to_u32;
 use html_style_model::computed_style;
 use html_style_model::{
-    BorderStyle, ComputedStylesBuilder, ContentAlignment, CornerRadius, DecorationColor,
-    FlexDirection, FlexWrap, FontRelativeLength, InheritedText, ItemAlignment, LengthPct,
-    LogicalTextAlign, OverflowMode, StyleStringId, TextAlign, TextDecorationLines, TextDirection,
+    BorderStyle, ComputedStylesBuilder, ContentAlignment, CornerRadius, FlexDirection, FlexWrap,
+    FontRelativeLength, InheritedText, ItemAlignment, LengthPct, LogicalTextAlign, OverflowMode,
+    TextAlign, TextDecorationLines, TextDirection,
 };
 
-use lightningcss::printer::{Printer, PrinterOptions};
 use lightningcss::properties::align::{ContentDistribution, ContentPosition};
-use lightningcss::properties::font::FontFamily;
 use lightningcss::properties::overflow::OverflowKeyword;
-use lightningcss::traits::ToCss;
-use lightningcss::values::color::CssColor;
 
 pub(in crate::style::cascade::resolver) mod colors;
 pub(in crate::style::cascade::resolver) mod fonts;
@@ -198,22 +193,6 @@ pub(super) fn set_border_color(style: &mut WorkingStyle, side: usize, value: u32
     }
 }
 
-pub(super) fn set_border_css_color(
-    style: &mut WorkingStyle,
-    styles: &ComputedStylesBuilder,
-    side: usize,
-    value: &CssColor,
-) {
-    let color = css_color_to_u32(value, style.text(styles).color);
-    set_border_color(style, side, color);
-    let bit = 1 << side;
-    if matches!(value, CssColor::CurrentColor) {
-        style.border.current_color_sides |= bit;
-    } else {
-        style.border.current_color_sides &= !bit;
-    }
-}
-
 fn content_distribution(value: &ContentDistribution) -> ContentAlignment {
     match value {
         ContentDistribution::SpaceBetween => ContentAlignment::SpaceBetween,
@@ -354,29 +333,4 @@ pub(super) fn text_decoration_lines(
         line.contains(CssLine::Overline),
         line.contains(CssLine::LineThrough),
     )
-}
-
-pub(super) fn decoration_color(color: &CssColor, current_color: u32) -> DecorationColor {
-    if matches!(color, CssColor::CurrentColor) {
-        DecorationColor::CurrentColor
-    } else {
-        DecorationColor::Rgba(css_color_to_u32(color, current_color))
-    }
-}
-
-// ============================================================================
-// Conversion helpers
-// ============================================================================
-pub(super) fn intern_font_family(
-    styles: &mut ComputedStylesBuilder,
-    families: &[FontFamily],
-) -> StyleStringId {
-    let mut out = String::new();
-    for (i, family) in families.iter().enumerate() {
-        if i > 0 {
-            out.push_str(", ");
-        }
-        let _ = family.to_css(&mut Printer::new(&mut out, PrinterOptions::default()));
-    }
-    styles.intern_string(&out)
 }

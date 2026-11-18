@@ -9,7 +9,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
         children: impl IntoIterator<Item = DomNodeId>,
         table_box_idx: u32,
     ) {
-        let plan = plan_table_children(self.document, self.styles, children);
+        let plan = plan_table_children(self.document, self.styles, &self.classifications, children);
         self.materialize_table_plan(plan, table_box_idx);
     }
 
@@ -95,7 +95,6 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
                 captions_bottom,
                 columns: plan.columns,
                 column_groups: plan.column_groups,
-                column_width_hints: plan.column_width_hints,
             },
         );
     }
@@ -112,7 +111,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
     ) {
         if nodes.iter().any(|&raw| {
             self.document.try_element_ref(raw).is_some_and(|element| {
-                display_for_element(self.styles, element) == Display::TableCell
+                self.classifications.get(element).display == Display::TableCell
             })
         }) {
             let row_idx = self.output.push_anonymous_row(table_box_idx);
@@ -125,7 +124,12 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
             .output
             .style_for_box(table_box_idx as usize)
             .white_space();
-        let plan = plan_anonymous_table_children(self.document, self.styles, &nodes, white_space);
+        let plan = plan_anonymous_table_children(
+            self.document,
+            &self.classifications,
+            &nodes,
+            white_space,
+        );
         if matches!(plan, AnonymousTablePlan::Empty) {
             return;
         }
@@ -142,7 +146,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
         row_box_idx: u32,
     ) {
         let mut row = TableRowBox::default();
-        for action in plan_table_row_children(self.document, self.styles, nodes) {
+        for action in plan_table_row_children(self.document, &self.classifications, nodes) {
             match action {
                 TableRowChildAction::Anonymous(nodes) => {
                     let white_space = self
@@ -151,7 +155,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
                         .white_space();
                     let plan = plan_anonymous_table_children(
                         self.document,
-                        self.styles,
+                        &self.classifications,
                         &nodes,
                         white_space,
                     );
@@ -182,7 +186,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
             let display = self
                 .document
                 .try_element_ref(node)
-                .map(|element| display_for_element(self.styles, element));
+                .map(|element| self.classifications.get(element).display);
             match display {
                 Some(Display::TableRow) => {
                     self.materialize_anonymous_group_row(
@@ -197,8 +201,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
             }
         }
         self.materialize_anonymous_group_row(anonymous, group_box_idx, &mut rows);
-        self.output
-            .set_box_children(group_box_idx, Children::Blocks(rows));
+        self.output.set_child_boxes(group_box_idx, rows);
     }
 
     pub(super) fn materialize_anonymous_group_row(
@@ -266,7 +269,10 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
                     }
                     AnonymousCellPart::Block(node)
                         if self.document.try_element_ref(node).is_some_and(|element| {
-                            display_for_element(self.styles, element).is_table_internal()
+                            self.classifications
+                                .get(element)
+                                .display
+                                .is_table_internal()
                         }) =>
                     {
                         table_segment.push(node);
@@ -281,8 +287,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
             }
             direct_children
                 .extend(self.flush_anonymous_table_segment(&mut table_segment, cell_idx));
-            self.output
-                .set_box_children(cell_idx, Children::Blocks(direct_children));
+            self.output.set_child_boxes(cell_idx, direct_children);
         } else {
             let start = self.output.item_position();
             for part in parts {

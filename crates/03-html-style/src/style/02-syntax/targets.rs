@@ -4,6 +4,13 @@ use crate::style::syntax::capabilities::{declaration_is_custom_property, propert
 use crate::style::syntax::property_id::RendererPropertyId;
 use lightningcss::properties::{Property, PropertyId};
 
+pub(crate) const FONT_RESET_TARGETS: [PropertyKey; 4] = [
+    PropertyKey::FontKerning,
+    PropertyKey::FontFeatureSettings,
+    PropertyKey::FontVariantNumeric,
+    PropertyKey::FontVariantLigatures,
+];
+
 pub(crate) fn append_property_targets(property: &Property<'_>, output: &mut Vec<PropertyKey>) {
     if declaration_is_custom_property(property) {
         return;
@@ -34,12 +41,7 @@ pub(crate) fn append_property_targets(property: &Property<'_>, output: &mut Vec<
         return;
     }
     if matches!(id, PropertyId::Font) {
-        output.extend([
-            PropertyKey::FontKerning,
-            PropertyKey::FontFeatureSettings,
-            PropertyKey::FontVariantNumeric,
-            PropertyKey::FontVariantLigatures,
-        ]);
+        output.extend(FONT_RESET_TARGETS);
     }
     if property_uses_gradient(property) {
         output.push(PropertyKey::BackgroundImage);

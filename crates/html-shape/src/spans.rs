@@ -3,7 +3,7 @@
 use super::*;
 use crate::features::FeatureCache;
 use html_style_model::{StyleView, UnicodeBidi};
-use html_text::{joins_cursively, whitespace_context_root};
+use html_text::{TextStructure, joins_cursively};
 
 #[derive(Debug)]
 struct ShapingPaintSpan {
@@ -574,7 +574,7 @@ fn append_shaping_range<'font>(
     if characters.start >= characters.end {
         return previous_span.unwrap_or(result.records.len());
     }
-    let formatting_root = whitespace_context_root(layout_tree, box_idx);
+    let formatting_root = layout_tree.flow_root(box_idx);
     let paint_span = ShapingPaintSpan {
         characters,
         box_idx,

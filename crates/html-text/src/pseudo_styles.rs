@@ -1,6 +1,7 @@
 //! First-line and first-letter style selection.
 
 use crate::first_letter::{FirstLetterPart, FirstLetterSelection};
+use crate::prepared_text::{FirstLetterStyles, StyleOverrideRun};
 use crate::{InlineContent, InlineItemKind, TextStructure};
 use html_dom::{Document, DomNodeId, MemoryUsageReport};
 use html_style_model::{ComputedStyles, StyleIndices};
@@ -112,7 +113,7 @@ pub fn first_letter_style_overrides(
     styles: &ComputedStyles,
     layout_tree: &(impl TextStructure + ?Sized),
     inline_content: &InlineContent,
-) -> Vec<Option<StyleIndices>> {
+) -> FirstLetterStyles {
     first_letter_overrides_with_characters(document, styles, layout_tree, inline_content, |index| {
         inline_content.character_at(index as usize).unwrap_or('?')
     })
@@ -125,7 +126,7 @@ pub fn first_letter_overrides_with_characters(
     layout_tree: &(impl TextStructure + ?Sized),
     inline_content: &InlineContent,
     character_at: impl Fn(u32) -> char,
-) -> Vec<Option<StyleIndices>> {
+) -> FirstLetterStyles {
     let pseudos = PseudoStyles::new(document, styles, layout_tree, inline_content);
     prepare_first_letters(styles, layout_tree, inline_content, &pseudos, character_at)
 }
@@ -136,14 +137,13 @@ pub(crate) fn prepare_first_letters(
     inline_content: &InlineContent,
     pseudos: &PseudoStyles,
     character_at: impl Fn(u32) -> char,
-) -> Vec<Option<StyleIndices>> {
-    // An empty override vector denotes the absence of first-letter styles.
+) -> FirstLetterStyles {
     if !styles.has_first_letter_styles() {
-        return Vec::new();
+        return FirstLetterStyles::default();
     }
     // Selection state survives source runs without retaining their characters.
     let mut selections = FxHashMap::<usize, FirstLetterSelection>::default();
-    let mut overrides = vec![None; inline_content.characters().len()];
+    let mut overrides: Vec<StyleOverrideRun> = Vec::new();
     for run in inline_content.inline_items() {
         let InlineItemKind::Text { glyphs } = &run.kind else {
             continue;
@@ -176,12 +176,27 @@ pub(crate) fn prepare_first_letters(
         for glyph_idx in glyphs.clone() {
             match selection.push(character_at(glyph_idx)) {
                 FirstLetterPart::LeadingSpace => {}
-                FirstLetterPart::Selected => overrides[glyph_idx as usize] = Some(selected_style),
+                FirstLetterPart::Selected => {
+                    if let Some(last) = overrides
+                        .last_mut()
+                        .filter(|last| last.glyphs.end == glyph_idx && last.style == selected_style)
+                    {
+                        last.glyphs.end += 1;
+                    } else {
+                        overrides.push(StyleOverrideRun {
+                            glyphs: glyph_idx..glyph_idx + 1,
+                            style: selected_style,
+                        });
+                    }
+                }
                 FirstLetterPart::After => break,
             }
         }
     }
-    overrides
+    // The item arena can place atomic descendants before their carrier;
+    // normalized character order is independent of that storage order.
+    overrides.sort_unstable_by_key(|run| run.glyphs.start);
+    FirstLetterStyles::new(overrides)
 }
 
 enum PseudoStyleKind<'a> {

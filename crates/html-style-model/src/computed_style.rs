@@ -5,15 +5,15 @@ mod paint;
 pub use paint::StylePaintColors;
 use unicode_script::{Script, UnicodeScript};
 
-use html_dom::{Document, DocumentLineage, DomNodeId, MemoryUsageReport, NodeRef};
+use crate::{ContentLanguage, LanguageId, OpenTypeFeature};
 use html_dom::storage::StringTable;
+use html_dom::{Document, DocumentLineage, DomNodeId, MemoryUsageReport, NodeRef};
 use kurbo::Vec2;
 use rustc_data_structures::fx::{FxHashMap, FxHasher};
 use std::hash::{Hash, Hasher};
 use std::num::{NonZeroI16, NonZeroU16, NonZeroU32};
-use std::sync::atomic::{AtomicU32, Ordering};
-use crate::{ContentLanguage, LanguageId, OpenTypeFeature};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Implement bitwise `PartialEq`/`Eq`/`Hash` for a style sub-struct so it can be
 /// deduplicated in `StyleStore`. Float fields are compared and hashed by their
@@ -1339,13 +1339,30 @@ mod custom_font_tests {
     use super::*;
 
     #[test]
-    fn publication_hyphenation_language_survives_reader_style_updates() {
+    fn publication_hyphenation_language_attaches_to_reader_adjusted_styles() {
         let document = Document::new();
-        let styles = ComputedStylesBuilder::new(&document).finish().unwrap()
+        let mut builder = ComputedStylesBuilder::new(&document);
+        builder.apply_reader_overrides(
+            &document,
+            &ReaderStyleOverrides {
+                hyphens: Some(Hyphens::Auto),
+                ..Default::default()
+            },
+        );
+        let updated = builder
+            .finish()
+            .unwrap()
             .with_hyphenation_fallback_language(Some("sv"));
-        let updated = styles.with_reader_overrides(&document, &ReaderStyleOverrides { hyphens: Some(Hyphens::Auto), ..Default::default() }).unwrap();
-        assert_eq!(updated.hyphenation_fallback_language().unwrap().as_str(), "sv");
-        assert!(updated.with_hyphenation_fallback_language(None).hyphenation_fallback_language().is_none());
+        assert_eq!(
+            updated.hyphenation_fallback_language().unwrap().as_str(),
+            "sv"
+        );
+        assert!(
+            updated
+                .with_hyphenation_fallback_language(None)
+                .hyphenation_fallback_language()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1465,18 +1482,25 @@ mod custom_font_tests {
             let document = Document::new();
             let mut builder = ComputedStylesBuilder::new(&document);
             let family = builder.intern_string("Publisher, serif");
-            let indices = builder.push(Font { font_family: Some(family), ..Default::default() }, InheritedText::default(), Default::default(), Default::default(), Default::default()).unwrap();
-            let raw = builder.finish().unwrap();
-            let overrides = ReaderStyleOverrides { font_family: Some("Selected Latin".into()), cjk_font_family: cjk.map(str::to_owned), cjk_font_fallback: Some("Embedded".into()), ..Default::default() };
-            let mut target = ComputedStylesBuilder::new(&document);
-            let updated = reintern_with_reader_overrides(&raw, &mut target, indices, &overrides, false).unwrap();
-            let font = target.font_style(updated).unwrap();
-            assert_eq!(font.font_family.and_then(|id| target.string(id)), Some("Selected Latin"));
+            let indices = builder
+                .push(
+                    Font {
+                        font_family: Some(family),
+                        ..Default::default()
+                    },
+                    InheritedText::default(),
+                    Default::default(),
+                    Default::default(),
+                    Default::default(),
+                )
+                .unwrap();
+            let overrides = ReaderStyleOverrides {
+                font_family: Some("Selected Latin".into()),
+                cjk_font_family: cjk.map(str::to_owned),
+                cjk_font_fallback: Some("Embedded".into()),
+                ..Default::default()
+            };
             let expected = format!("{}, Embedded", cjk.unwrap_or("Publisher, serif"));
-            assert_eq!(font.cjk_font_family.and_then(|id| target.string(id)), Some(expected.as_str()));
-            let mut builder = ComputedStylesBuilder::new(&document);
-            let family = builder.intern_string("Publisher, serif");
-            let indices = builder.push(Font { font_family: Some(family), ..Default::default() }, InheritedText::default(), Default::default(), Default::default(), Default::default()).unwrap();
             builder.apply_reader_overrides(&document, &overrides);
             let font = builder.font_style(indices).unwrap();
             assert_eq!(
@@ -3085,149 +3109,6 @@ fn set_node_value<T>(entries: &mut Vec<(DomNodeId, T)>, node: DomNodeId, value: 
     }
 }
 
-fn reintern_style_string(
-    source: &ComputedStyles,
-    builder: &mut ComputedStylesBuilder,
-    id: StyleStringId,
-) -> StyleStringId {
-    builder.intern_string(
-        source
-            .string(id)
-            .expect("validated style string belongs to the source store"),
-    )
-}
-
-fn reintern_generated_content(
-    source: &ComputedStyles,
-    builder: &mut ComputedStylesBuilder,
-    content: &GeneratedContent,
-) -> GeneratedContent {
-    GeneratedContent {
-        items: content
-            .items
-            .iter()
-            .map(|item| match *item {
-                GeneratedContentItem::Text(id) => {
-                    GeneratedContentItem::Text(reintern_style_string(source, builder, id))
-                }
-                GeneratedContentItem::Attribute(id) => {
-                    GeneratedContentItem::Attribute(reintern_style_string(source, builder, id))
-                }
-                GeneratedContentItem::Counter { name, style } => GeneratedContentItem::Counter {
-                    name: reintern_style_string(source, builder, name),
-                    style,
-                },
-                GeneratedContentItem::Counters {
-                    name,
-                    separator,
-                    style,
-                } => GeneratedContentItem::Counters {
-                    name: reintern_style_string(source, builder, name),
-                    separator: reintern_style_string(source, builder, separator),
-                    style,
-                },
-                other => other,
-            })
-            .collect(),
-    }
-}
-
-fn reintern_counter_directives(
-    source: &ComputedStyles,
-    builder: &mut ComputedStylesBuilder,
-    counters: &CounterDirectives,
-) -> CounterDirectives {
-    let reintern =
-        |directive: &CounterDirective, builder: &mut ComputedStylesBuilder| CounterDirective {
-            name: reintern_style_string(source, builder, directive.name),
-            value: directive.value,
-        };
-    CounterDirectives {
-        resets: counters
-            .resets
-            .iter()
-            .map(|directive| reintern(directive, builder))
-            .collect(),
-        increments: counters
-            .increments
-            .iter()
-            .map(|directive| reintern(directive, builder))
-            .collect(),
-    }
-}
-
-fn reintern_line_names(
-    source: &ComputedStyles,
-    builder: &mut ComputedStylesBuilder,
-    line_names: &mut [Vec<StyleStringId>],
-) {
-    for names in line_names {
-        for name in names {
-            *name = reintern_style_string(source, builder, *name);
-        }
-    }
-}
-
-fn reintern_placement(
-    source: &ComputedStyles,
-    builder: &mut ComputedStylesBuilder,
-    placement: &mut GridPlacement,
-) {
-    match placement {
-        GridPlacement::NamedLine { name, .. } | GridPlacement::NamedSpan { name, .. } => {
-            *name = reintern_style_string(source, builder, *name)
-        }
-        GridPlacement::Auto | GridPlacement::Line(_) | GridPlacement::Span(_) => {}
-    }
-}
-
-fn reintern_layout_strings(
-    source: &ComputedStyles,
-    builder: &mut ComputedStylesBuilder,
-    layout: &mut LayoutStyle,
-) {
-    reintern_line_names(source, builder, &mut layout.grid_template_row_names);
-    reintern_line_names(source, builder, &mut layout.grid_template_column_names);
-    for track in layout
-        .grid_template_rows
-        .iter_mut()
-        .chain(layout.grid_template_columns.iter_mut())
-    {
-        if let GridTemplateTrack::Repeat { line_names, .. } = track {
-            reintern_line_names(source, builder, line_names);
-        }
-    }
-    for area in &mut layout.grid_template_areas {
-        area.name = reintern_style_string(source, builder, area.name);
-    }
-    reintern_placement(source, builder, &mut layout.grid_row.start);
-    reintern_placement(source, builder, &mut layout.grid_row.end);
-    reintern_placement(source, builder, &mut layout.grid_column.start);
-    reintern_placement(source, builder, &mut layout.grid_column.end);
-}
-
-fn reintern_preferred_size(
-    source: &ComputedStyles,
-    builder: &mut ComputedStylesBuilder,
-    size: &mut PreferredSize,
-) {
-    let PreferredSize::Comparison(id) = *size else {
-        return;
-    };
-    let Some(expression) = source
-        .store
-        .size_expressions
-        .get(id.index as usize)
-        .copied()
-    else {
-        *size = PreferredSize::Auto;
-        return;
-    };
-    *size = builder
-        .intern_size_comparison(expression.kind, expression.values, expression.count)
-        .unwrap_or(PreferredSize::Auto);
-}
-
 fn apply_reader_font(font: &mut Font, family: Option<StyleStringId>, minimum: Option<f32>) -> f32 {
     let original_size = font.font_size;
     if let Some(family) = family {
@@ -3352,107 +3233,6 @@ fn reader_line_height(font_size: f32, multiplier: f32) -> f32 {
     (f64::from(font_size) * f64::from(multiplier)).min(f64::from(f32::MAX)) as f32
 }
 
-fn reintern_with_reader_overrides(
-    source: &ComputedStyles,
-    builder: &mut ComputedStylesBuilder,
-    indices: StyleIndices,
-    overrides: &ReaderStyleOverrides,
-    override_background: bool,
-) -> Result<StyleIndices, ComputedStylesBuildError> {
-    let mut font = source
-        .font_style(indices)
-        .expect("validated font style")
-        .clone();
-    font.cjk_font_family = overrides
-        .cjk_family_for(font.font_family.and_then(|id| source.string(id)))
-        .or_else(|| {
-            font.cjk_font_family
-                .and_then(|id| source.string(id))
-                .map(str::to_owned)
-        })
-        .as_deref()
-        .map(|family| builder.intern_string(family));
-    font.font_family = match overrides.family_for(font.font_family.and_then(|id| source.string(id)))
-    {
-        Some(family) => Some(builder.intern_string(family)),
-        None => font
-            .font_family
-            .and_then(|id| source.string(id))
-            .map(|value| builder.intern_string(value)),
-    };
-    let original_font_size = apply_reader_font(&mut font, None, overrides.minimum_font_size);
-    apply_reader_weight(&mut font, overrides.font_weight_adjustment);
-    let mut text = source
-        .text_style(indices)
-        .expect("validated text style")
-        .clone();
-    apply_reader_text(&mut text, font.font_size, original_font_size, overrides);
-    for spacing in [&mut text.letter_spacing, &mut text.word_spacing] {
-        if let Some(origin) = source.text_spacing_origin(*spacing) {
-            let mapped = reintern_with_reader_overrides(source, builder, origin, overrides, false)?;
-            spacing.metric_origin = mapped.font_idx + 1;
-        }
-    }
-    text.list_style_image = text
-        .list_style_image
-        .map(|id| reintern_style_string(source, builder, id));
-    text.language = text.language.and_then(|id| {
-        builder.intern_language(language::content_language_as_str(&source.language(id).expect("validated language handle")))
-    });
-    if let QuoteStyle::Pairs(pairs) = text.quotes {
-        text.quotes = QuoteStyle::Pairs(reintern_style_string(source, builder, pairs));
-    }
-    let mut background = source
-        .background_style(indices)
-        .expect("validated background style")
-        .clone();
-    let mut border = source
-        .border_style(indices)
-        .expect("validated border style")
-        .clone();
-    apply_reader_background(&mut background, overrides.theme);
-    apply_reader_border(&mut border, text.color, overrides);
-    if override_background {
-        apply_reader_root_background(&mut background, overrides.background);
-    }
-    let mut layout = source
-        .layout_style(indices)
-        .expect("validated layout style")
-        .clone();
-    reintern_layout_strings(source, builder, &mut layout);
-    reintern_preferred_size(source, builder, &mut layout.flex_basis);
-    let mut box_model = source
-        .box_model_style(indices)
-        .expect("validated box style")
-        .clone();
-    for size in [
-        &mut box_model.width,
-        &mut box_model.height,
-        &mut box_model.min_width,
-        &mut box_model.min_height,
-        &mut box_model.max_width,
-        &mut box_model.max_height,
-    ] {
-        reintern_preferred_size(source, builder, size);
-    }
-    if override_background && overrides.strip_root_spacing {
-        apply_reader_root_spacing(&mut box_model, &mut layout);
-    }
-    builder
-        .push_with_layout_and_radii(
-            font,
-            text,
-            box_model,
-            border,
-            background,
-            layout,
-            *source
-                .border_radii_style(indices)
-                .expect("validated radius style"),
-        )
-        .map_err(ComputedStylesBuildError::InvalidStyleValue)
-}
-
 impl ComputedStyles {
     pub fn default_indices(&self) -> StyleIndices {
         self.store.default_indices()
@@ -3495,79 +3275,6 @@ impl ComputedStyles {
 
     pub fn layout_style(&self, indices: StyleIndices) -> Option<&LayoutStyle> {
         self.store.layout_style(indices)
-    }
-
-    /// Apply preferences to existing computed styles. Changing
-    /// `canonical_font_size` requires resolving the cascade again, since it
-    /// also changes inherited values and font-relative box dimensions.
-    pub fn with_reader_overrides(
-        &self,
-        document: &Document,
-        overrides: &ReaderStyleOverrides,
-    ) -> Result<Self, ComputedStylesBuildError> {
-        let mut adjusted_overrides = overrides.clone();
-        adjusted_overrides.font_weight_adjustment = reader_weight_adjustment(
-            self.store.font_styles.iter().map(|font| font.font_weight), overrides.font_weight_adjustment,
-        );
-        let overrides = &adjusted_overrides;
-        let mut builder = ComputedStylesBuilder::new(document);
-        for (node, node_ref) in document.nodes() {
-            let NodeRef::Element(element) = node_ref else {
-                continue;
-            };
-            let indices = self
-                .style_for_node(node)
-                .ok_or(ComputedStylesBuildError::MissingElementStyle { node: node.index() })?;
-            let override_background = matches!(element.tag(), "html" | "body");
-            let style = reintern_with_reader_overrides(
-                self,
-                &mut builder,
-                indices,
-                overrides,
-                override_background,
-            )?;
-            builder.set_node_style(node, style)?;
-            if let Some(counters) = self.counter_directives_for_node(node) {
-                let counters = reintern_counter_directives(self, &mut builder, counters);
-                builder.set_counter_directives(node, counters)?;
-            }
-        }
-        for &(node, indices) in &self.first_line_styles {
-            let style =
-                reintern_with_reader_overrides(self, &mut builder, indices, overrides, false)?;
-            builder.set_first_line_style(node, style)?;
-        }
-        for &(node, indices) in &self.first_letter_styles {
-            let style =
-                reintern_with_reader_overrides(self, &mut builder, indices, overrides, false)?;
-            builder.set_first_letter_style(node, style)?;
-        }
-        for &(node, indices) in &self.before_first_letter_styles {
-            let style =
-                reintern_with_reader_overrides(self, &mut builder, indices, overrides, false)?;
-            builder.set_before_first_letter_style(node, style)?;
-        }
-        for pseudo in &self.before_styles {
-            let node = pseudo.node;
-            let style =
-                reintern_with_reader_overrides(self, &mut builder, pseudo.style, overrides, false)?;
-            let content = reintern_generated_content(self, &mut builder, &pseudo.content);
-            let counters = reintern_counter_directives(self, &mut builder, &pseudo.counters);
-            builder.set_before_style(node, style, content, counters)?;
-        }
-        for pseudo in &self.after_styles {
-            let node = pseudo.node;
-            let style =
-                reintern_with_reader_overrides(self, &mut builder, pseudo.style, overrides, false)?;
-            let content = reintern_generated_content(self, &mut builder, &pseudo.content);
-            let counters = reintern_counter_directives(self, &mut builder, &pseudo.counters);
-            builder.set_after_style(node, style, content, counters)?;
-        }
-        builder.apply_link_foreground(document, overrides.link_foreground);
-        builder.apply_reader_paragraph_overrides(document, overrides);
-        let mut styles = builder.finish()?;
-        styles.hyphenation_fallback_language = self.hyphenation_fallback_language.clone();
-        Ok(styles)
     }
 
     /// Supply a publication language for hyphenation without changing the
@@ -4927,7 +4634,6 @@ impl<'a> UsedStyleView<'a> {
             + self.computed.text.line_height_x_height_px * self.font_relative.x_height
     }
     /// Line-box height with normal leading and font-relative units resolved.
-    /// Font-specific conformance policies (such as Ahem) remain in layout.
     pub fn resolved_line_height(&self) -> f64 {
         if self.line_height_is_normal()
             && let Some(ratio) = self.normal_line_height_ratio
@@ -6246,6 +5952,11 @@ pub enum OverflowMode {
 }
 
 impl OverflowMode {
+    /// Scrollable overflow modes, including hidden but excluding clip.
+    pub fn is_scrollable(self) -> bool {
+        matches!(self, Self::Hidden | Self::Scroll | Self::Auto)
+    }
+
     /// Whether inline overflow is visually confined to the box in a static
     /// rendering. Scrollable modes also confine their viewport even though this
     /// renderer does not expose interactive scrolling controls.
@@ -6372,6 +6083,18 @@ pub enum Display {
 }
 
 impl Display {
+    /// Context established by display and used overflow, before considering
+    /// root, positioning, float, or flex/grid-item participation.
+    pub fn establishes_formatting_context(self, overflow: (OverflowMode, OverflowMode)) -> bool {
+        self.is_atomic_inline()
+            || matches!(
+                self,
+                Self::FlowRoot | Self::FlowRootListItem | Self::Flex | Self::Grid
+            )
+            || overflow.0.is_scrollable()
+            || overflow.1.is_scrollable()
+    }
+
     /// Inline-level formatting roots that participate as atomic inline boxes.
     pub fn is_atomic_inline(self) -> bool {
         matches!(
@@ -7012,6 +6735,32 @@ pub enum UsedPreferredSize {
 }
 
 impl UsedPreferredSize {
+    /// Resolve a numeric size when its required percentage basis is available.
+    /// Formatting-context keywords remain unresolved.
+    pub fn resolve_definite(self, percentage_basis: Option<f64>) -> Option<f64> {
+        match self {
+            Self::Auto
+            | Self::Content
+            | Self::MinContent
+            | Self::MaxContent
+            | Self::FitContent
+            | Self::Stretch => None,
+            _ => {
+                let basis = if self.percentage_dependent() {
+                    percentage_basis?
+                } else {
+                    0.0
+                };
+                Some(resolve_used_preferred_size(self, 0.0, basis))
+            }
+        }
+    }
+
+    /// Content-based sizing keywords, excluding `auto`, `content` and `stretch`.
+    pub fn is_intrinsic_keyword(self) -> bool {
+        matches!(self, Self::MinContent | Self::MaxContent | Self::FitContent)
+    }
+
     pub fn percentage_dependent(self) -> bool {
         match self {
             Self::Percent(_) => true,

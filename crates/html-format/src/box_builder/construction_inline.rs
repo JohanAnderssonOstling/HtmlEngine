@@ -29,13 +29,22 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
         let Some(element) = self.document.try_element_ref(node) else {
             return;
         };
-        let classification = ElementClassification::new(self.styles, element);
+        let classification = self.classifications.get(element);
         let contents = classification.display == Display::Contents;
         let fragment = super::inline::plan_inline_fragment(self.styles, node, classification.style);
         if contents {
             self.split_events
                 .push(SplitInlineEvent::EnterContents(node));
-            self.walk_split_pseudo(node, true, parent, children, event_start, active_start);
+            self.walk_split_source(
+                BoxSource::GeneratedPseudo {
+                    origin: node,
+                    before: true,
+                },
+                parent,
+                children,
+                event_start,
+                active_start,
+            );
         } else {
             self.split_active.push(fragment);
             self.split_events.push(SplitInlineEvent::Open {
@@ -44,32 +53,25 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
             });
         }
         for child in element.children() {
-            let Some(element) = self.document.try_element_ref(child) else {
-                self.split_events.push(SplitInlineEvent::Node(child));
-                continue;
-            };
-            let classification = ElementClassification::new(self.styles, element);
-            if classification.splits_inline() {
-                self.flush_split_before_block(event_start, active_start, parent, children);
-                let ancestors = self.split_position_ancestors(active_start);
-                if let Some(block) =
-                    self.build_classified_element(child, Some(parent), classification)
-                {
-                    self.output
-                        .set_split_inline_position_ancestors(block, ancestors);
-                    children.push(block);
-                }
-                self.reopen_split_fragments(active_start);
-            } else if matches!(classification.display, Display::Inline | Display::Contents)
-                && super::inline::has_inline_splitting_block_descendant(self.styles, element)
-            {
-                self.walk_split_inline(child, parent, children, event_start, active_start);
-            } else {
-                self.split_events.push(SplitInlineEvent::Node(child));
-            }
+            self.walk_split_source(
+                BoxSource::Node(child),
+                parent,
+                children,
+                event_start,
+                active_start,
+            );
         }
         if contents {
-            self.walk_split_pseudo(node, false, parent, children, event_start, active_start);
+            self.walk_split_source(
+                BoxSource::GeneratedPseudo {
+                    origin: node,
+                    before: false,
+                },
+                parent,
+                children,
+                event_start,
+                active_start,
+            );
             self.split_events.push(SplitInlineEvent::ExitContents);
         } else {
             self.split_events.push(SplitInlineEvent::Close {
@@ -80,32 +82,39 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
         }
     }
 
-    fn walk_split_pseudo(
+    fn walk_split_source(
         &mut self,
-        origin: DomNodeId,
-        before: bool,
+        source: BoxSource,
         parent: u32,
         children: &mut Vec<u32>,
         event_start: usize,
         active_start: usize,
     ) {
-        if pseudo_display(self.styles, origin, before)
-            .is_none_or(|display| display == Display::None)
-        {
+        let Some(classification) = self.classify_source(source) else {
+            if matches!(source, BoxSource::Node(_)) {
+                self.split_events.push(SplitInlineEvent::Source(source));
+            }
+            return;
+        };
+        if classification.display == Display::None {
             return;
         }
-        if pseudo_is_block_level(self.styles, origin, before) {
+        if classification.splits_inline() {
             self.flush_split_before_block(event_start, active_start, parent, children);
             let ancestors = self.split_position_ancestors(active_start);
-            if let Some(block) = self.build_generated_block_pseudo(origin, parent, before) {
+            if let Some(block) = self.build_source(source, parent, classification) {
                 self.output
                     .set_split_inline_position_ancestors(block, ancestors);
                 children.push(block);
             }
             self.reopen_split_fragments(active_start);
+        } else if let BoxSource::Node(node) = source
+            && matches!(classification.display, Display::Inline | Display::Contents)
+            && classification.splits_inline_descendant
+        {
+            self.walk_split_inline(node, parent, children, event_start, active_start);
         } else {
-            self.split_events
-                .push(SplitInlineEvent::GeneratedPseudo { origin, before });
+            self.split_events.push(SplitInlineEvent::Source(source));
         }
     }
 
@@ -172,9 +181,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
         let (anonymous_idx, item_start) = self.output.push_anonymous_inline(parent_box_idx);
 
         let ignorable = |node| {
-            super::inline::node_is_ignorable_at_block_edge(
-                self.document,
-                self.styles,
+            self.node_is_ignorable_at_block_edge(
                 node,
                 super::inline::style_for_dom_node(self.document, self.styles, node).white_space(),
             )
@@ -183,7 +190,9 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
             .iter()
             .enumerate()
             .filter_map(|(index, event)| match event {
-                SplitInlineEvent::Node(node) if !ignorable(*node) => Some(index + event_start),
+                SplitInlineEvent::Source(BoxSource::Node(node)) if !ignorable(*node) => {
+                    Some(index + event_start)
+                }
                 _ => None,
             });
         let first = content.next();
@@ -192,13 +201,11 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
         let event_end = self.split_events.len();
         for index in event_start..event_end {
             let event = self.split_events[index];
-            if let SplitInlineEvent::Node(node) = event {
+            if let SplitInlineEvent::Source(BoxSource::Node(node)) = event {
                 if first
                     .zip(last)
                     .is_none_or(|(first, last)| index < first || index > last)
-                    && super::inline::node_is_ignorable_at_block_edge(
-                        self.document,
-                        self.styles,
+                    && self.node_is_ignorable_at_block_edge(
                         node,
                         super::inline::style_for_dom_node(self.document, self.styles, node)
                             .white_space(),
@@ -250,16 +257,11 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
                     );
                     self.finish_inline_fragment(frame, last_fragment);
                 }
-                SplitInlineEvent::Node(node) => {
-                    self.process_inline_node(node, owner);
-                }
+                SplitInlineEvent::Source(source) => self.process_inline_source(source, owner),
                 SplitInlineEvent::EnterContents(node) => {
                     self.generated.apply_for_node(node);
                 }
                 SplitInlineEvent::ExitContents => {}
-                SplitInlineEvent::GeneratedPseudo { origin, before } => {
-                    self.append_generated_inline_pseudo(origin, owner, before);
-                }
             }
         }
         debug_assert_eq!(self.inline_frames.len(), frame_start);
@@ -286,29 +288,23 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
             && self.styles.after_style_for_node(elem_id).is_none()
         {
             let white_space = self.output.style_for_box(box_idx as usize).white_space();
-            while children.peek().is_some_and(|&node| {
-                super::inline::node_is_ignorable_at_block_edge(
-                    self.document,
-                    self.styles,
-                    node,
-                    white_space,
-                )
-            }) {
+            while children
+                .peek()
+                .is_some_and(|&node| self.node_is_ignorable_at_block_edge(node, white_space))
+            {
                 children.next();
             }
-            while children.clone().next_back().is_some_and(|node| {
-                super::inline::node_is_ignorable_at_block_edge(
-                    self.document,
-                    self.styles,
-                    node,
-                    white_space,
-                )
-            }) {
+            while children
+                .clone()
+                .next_back()
+                .is_some_and(|node| self.node_is_ignorable_at_block_edge(node, white_space))
+            {
                 children.next_back();
             }
-            if !children.clone().any(|node| {
-                super::inline::node_has_renderable_inline_content(self.document, self.styles, node)
-            }) {
+            if !children
+                .clone()
+                .any(|node| self.node_has_renderable_inline_content(node))
+            {
                 render_children = false;
             }
         }
@@ -359,6 +355,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
         let item_start = self.output.item_position();
         let box_idx = self.output.push_dom_box(
             element,
+            Display::Inline,
             Some(parent),
             style,
             LayoutMode::Inline(Range::default()),
@@ -384,16 +381,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
     }
 
     pub(super) fn process_inline_node(&mut self, node_id: DomNodeId, box_idx: u32) {
-        self.process_classified_inline_node(node_id, box_idx, None);
-    }
-
-    fn process_classified_inline_node(
-        &mut self,
-        node_id: DomNodeId,
-        box_idx: u32,
-        classification: Option<ElementClassification>,
-    ) {
-        match plan_inline_node(self.document, self.styles, node_id, classification) {
+        match self.plan_inline_node(node_id) {
             InlineNodePlan::Ignore => {}
             InlineNodePlan::Text(node) => self.process_text_node_with_contents_style(node, box_idx),
             InlineNodePlan::Break { clear } => {
@@ -509,7 +497,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
             let classification = self
                 .document
                 .try_element_ref(node_id)
-                .map(|element| ElementClassification::new(self.styles, element));
+                .map(|element| self.classifications.get(element));
             if classification.is_some_and(|value| value.display.is_table_internal()) {
                 table_segment.append(&mut pending_table_whitespace);
                 table_segment.push(raw);
@@ -525,7 +513,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
             for whitespace in pending_table_whitespace.drain(..) {
                 self.process_inline_node(whitespace, box_idx);
             }
-            self.process_classified_inline_node(node_id, box_idx, classification);
+            self.process_inline_node(node_id, box_idx);
         }
         self.flush_inline_anonymous_table(&mut table_segment, box_idx);
         for whitespace in pending_table_whitespace {
@@ -607,7 +595,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
         let mut parent = self.document.text_ref(node).parent();
         while let Some(node) = parent {
             let element = self.document.element_ref(node);
-            let classification = ElementClassification::new(self.styles, element);
+            let classification = self.classifications.get(element);
             if classification.display != Display::Contents {
                 return None;
             }
@@ -654,7 +642,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
         let pseudo_box = self.output.push_synthetic_box(
             parent_box,
             Some(style),
-            LayoutMode::Block(BlockBox::default()),
+            LayoutMode::Block(Children::default()),
         );
         self.output.push_item(
             InlineItemKind::FloatAnchor {
@@ -705,11 +693,13 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
         parent_box: u32,
         before: bool,
     ) {
-        let Some(display) = pseudo_display(self.styles, origin, before) else {
+        let Some(classification) =
+            self.classify_source(BoxSource::GeneratedPseudo { origin, before })
+        else {
             return;
         };
         if matches!(
-            display,
+            classification.display,
             Display::None | Display::TableColumn | Display::TableColumnGroup
         ) {
             return;
@@ -719,40 +709,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
             .resolve_pseudo(origin, before)
             .expect("pseudo existence was checked above");
         self.output
-            .emit_generated_inline(parent_box, plan_generated_inline(self.styles, resolved));
-    }
-
-    /// Build a generated principal box that participates in block flow.  A
-    /// pseudo-element is an actual CSS box, not merely a text run: its own
-    /// margins, borders, sizing, display, and list marker all belong to this
-    /// synthetic box just inside the originating element.
-    pub(super) fn build_generated_block_pseudo(
-        &mut self,
-        origin: DomNodeId,
-        parent_box: u32,
-        before: bool,
-    ) -> Option<u32> {
-        if !pseudo_is_block_level(self.styles, origin, before) {
-            return None;
-        }
-        let resolved = self.generated.resolve_pseudo(origin, before)?;
-        match resolved.display {
-            Display::Block | Display::FlowRoot | Display::ListItem | Display::FlowRootListItem => {
-                let style = resolved.style;
-                let pseudo_box = self.output.push_generated_text_box(parent_box, &resolved);
-                if matches!(
-                    resolved.display,
-                    Display::ListItem | Display::FlowRootListItem
-                ) {
-                    self.build_list_marker(pseudo_box, style, 1);
-                }
-                Some(pseudo_box)
-            }
-            _ => self.output.materialize_generated_table(
-                parent_box,
-                plan_generated_table_principal(self.styles, resolved)?,
-            ),
-        }
+            .emit_generated_inline(parent_box, resolved, classification);
     }
 
     pub(super) fn flush_inline_segment(
@@ -778,9 +735,8 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
             .output
             .style_for_box(parent_box_idx as usize)
             .white_space();
-        let segment =
-            trim_inline_segment_nodes(self.document, self.styles, nodes.as_slice(), white_space);
-        if segment.is_empty() && before.is_none() && after.is_none() {
+        let range = self.trim_inline_segment_range(nodes.as_slice(), white_space);
+        if range.is_empty() && before.is_none() && after.is_none() {
             nodes.clear();
             return None;
         }
@@ -789,7 +745,7 @@ impl<'a, 'out> LayoutTreeBuilder<'a, 'out> {
         if let Some(origin) = before {
             self.append_generated_inline_pseudo(origin, anonymous_idx, true);
         }
-        for &node_idx in segment {
+        for &node_idx in &nodes[range] {
             let node_id = node_idx;
             self.process_inline_node(node_id, anonymous_idx);
         }

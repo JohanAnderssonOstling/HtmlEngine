@@ -1,13 +1,14 @@
-use super::super::context::{PropertyContext, ResolutionContext};
-use super::super::values;
-use super::{components, length_pct};
+use super::super::context::ResolutionContext;
+use super::PreparedValue;
 use crate::style::syntax::prepared_length::{Basis, LengthMode, PreparedLength, finite};
 use crate::style::syntax::renderer_owned;
 use html_style_model::{
-    BorderStyle, ListStyleType, TabSize, TextDecorationStyle, TextDecorationThickness, TextSpacing,
+    BorderStyle, ListStyleType, TextAlign, TextDecorationStyle, TextDecorationThickness,
     VerticalAlignValue,
 };
+use lightningcss::printer::{Printer, PrinterOptions};
 use lightningcss::properties::Property;
+use lightningcss::traits::ToCss;
 use lightningcss::properties::font::{FontSize, LineHeight, VerticalAlign};
 use lightningcss::values::length::{LengthOrNumber, LengthPercentage, LengthValue};
 use std::sync::Arc;
@@ -56,7 +57,7 @@ impl PreparedLineHeight {
             finite(f64::from(ex) * f64::from(scale)),
         )
     }
-    fn needs_height(&self) -> bool {
+    pub(super) fn needs_height(&self) -> bool {
         matches!(self,Self::Length(v) if v.viewport_height)
     }
 }
@@ -67,24 +68,59 @@ pub(crate) enum PreparedFontSize {
     Relative(f32),
     RootMetric(usize, f32),
 }
-#[derive(Clone, Debug)]
-pub(crate) enum PreparedTypography {
-    FontSize(PreparedFontSize),
-    LineHeight(Arc<PreparedLineHeight>),
-    TabSpaces(f32),
-    TabLength(PreparedLength),
-    Spacing(PreparedLength),
-    Vertical(VerticalAlignValue),
-    VerticalLength(PreparedLength),
-    Thickness(TextDecorationThickness),
-    ThicknessLength(PreparedLength),
-    OutlineStyle(BorderStyle),
-    DecorationStyle(TextDecorationStyle),
-    ListStyle(ListStyleType),
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum PreparedTextAlign {
+    Physical(TextAlign),
+    Start,
+    End,
+    MatchParent,
+    Auto,
+    Unspecified,
 }
-impl PreparedTypography {
-    pub(crate) fn prepare(property: &Property<'_>) -> Result<Option<Self>, ()> {
+
+impl PreparedValue {
+    pub(crate) fn prepare_typography(property: &Property<'_>) -> Result<Option<Self>, ()> {
         Ok(Some(match property {
+            Property::TextAlign(value) => {
+                use lightningcss::properties::text::TextAlign as Css;
+                Self::TextAlign(
+                    match value {
+                        Css::Left => PreparedTextAlign::Physical(TextAlign::Left),
+                        Css::Right => PreparedTextAlign::Physical(TextAlign::Right),
+                        Css::Center => PreparedTextAlign::Physical(TextAlign::Center),
+                        Css::Justify | Css::JustifyAll => {
+                            PreparedTextAlign::Physical(TextAlign::Justify)
+                        }
+                        Css::Start => PreparedTextAlign::Start,
+                        Css::End => PreparedTextAlign::End,
+                        Css::MatchParent => PreparedTextAlign::MatchParent,
+                    },
+                    matches!(value, Css::JustifyAll),
+                )
+            }
+            Property::TextAlignLast(value, _) => {
+                use lightningcss::properties::text::TextAlignLast as Css;
+                Self::TextAlignLast(match value {
+                    Css::Auto => PreparedTextAlign::Auto,
+                    Css::Left => PreparedTextAlign::Physical(TextAlign::Left),
+                    Css::Right => PreparedTextAlign::Physical(TextAlign::Right),
+                    Css::Center => PreparedTextAlign::Physical(TextAlign::Center),
+                    Css::Justify => PreparedTextAlign::Physical(TextAlign::Justify),
+                    Css::Start => PreparedTextAlign::Start,
+                    Css::End => PreparedTextAlign::End,
+                    _ => PreparedTextAlign::Unspecified,
+                })
+            }
+            Property::FontFamily(families) => {
+                let mut out = String::new();
+                for (i, family) in families.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    let _ = family.to_css(&mut Printer::new(&mut out, PrinterOptions::default()));
+                }
+                Self::FontFamily(out.into_boxed_str())
+            }
             Property::FontSize(v) => Self::FontSize(match v {
                 FontSize::Absolute(v) => {
                     use lightningcss::properties::font::AbsoluteFontSize::*;
@@ -137,12 +173,6 @@ impl PreparedTypography {
             Property::TabSize(LengthOrNumber::Length(v), _) => {
                 Self::TabLength(PreparedLength::length(v, LengthMode::Scalar).ok_or(())?)
             }
-            Property::LetterSpacing(v) | Property::WordSpacing(v) => Self::Spacing(match v {
-                lightningcss::properties::text::Spacing::Normal => PreparedLength::zero(),
-                lightningcss::properties::text::Spacing::Length(v) => {
-                    PreparedLength::length(v, LengthMode::Spacing).ok_or(())?
-                }
-            }),
             Property::VerticalAlign(VerticalAlign::Length(v)) => {
                 Self::VerticalLength(PreparedLength::percentage(v, LengthMode::Ex).ok_or(())?)
             }
@@ -181,159 +211,8 @@ impl PreparedTypography {
             _ => return Ok(None),
         }))
     }
-    pub(crate) fn requires_viewport_height(&self) -> bool {
-        match self {
-            Self::FontSize(PreparedFontSize::Length(v))
-            | Self::TabLength(v)
-            | Self::Spacing(v)
-            | Self::VerticalLength(v)
-            | Self::ThicknessLength(v) => v.viewport_height,
-            Self::LineHeight(v) => v.needs_height(),
-            _ => false,
-        }
-    }
-    pub(in crate::style::cascade::resolver) fn apply(
-        &self,
-        property: &Property<'_>,
-        context: &mut PropertyContext<'_>,
-    ) {
-        match self {
-            Self::FontSize(value) => {
-                let scale = context.resolution.font_size_scale;
-                let parent = finite(
-                    f64::from(context.parent.with(context.styles, |p| p.font.font_size))
-                        / f64::from(scale),
-                );
-                let inherited = finite(
-                    f64::from(context.style.font(context.styles).font_size) / f64::from(scale),
-                );
-                let root = finite(f64::from(context.root_font_size) / f64::from(scale));
-                let mut c =
-                    context
-                        .resolution
-                        .with_canonical_font_sizes(|resolution| match value {
-                            PreparedFontSize::Absolute(v) => [*v, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-                            PreparedFontSize::Relative(v) => [
-                                finite(f64::from(*v) * f64::from(parent)),
-                                0.0,
-                                0.0,
-                                0.0,
-                                0.0,
-                                0.0,
-                                0.0,
-                            ],
-                            PreparedFontSize::RootMetric(axis, v) => {
-                                let mut c = [0.0; 7];
-                                c[*axis] = *v;
-                                c
-                            }
-                            PreparedFontSize::Length(v) => {
-                                let basis = if v.literal_axis == Some(0) {
-                                    parent
-                                } else {
-                                    inherited
-                                };
-                                let c = evaluate(v, basis, root, resolution);
-                                [
-                                    finite(f64::from(c[0]) + f64::from(c[1]) * f64::from(parent))
-                                        .max(0.0),
-                                    c[2],
-                                    c[3],
-                                    c[4],
-                                    0.0,
-                                    0.0,
-                                    0.0,
-                                ]
-                            }
-                        });
-                for v in &mut c[..4] {
-                    *v = finite(f64::from(*v) * f64::from(scale));
-                }
-                let font = context.style.font_mut(context.styles);
-                [
-                    font.font_size,
-                    font.font_size_x_height_px,
-                    font.font_size_ch_advance_px,
-                    font.font_size_cap_height_px,
-                    font.font_size_root_ch,
-                    font.font_size_root_cap_height,
-                    font.font_size_root_line_height,
-                ] = c;
-                values::rebind_line_height(
-                    context.style,
-                    context.styles,
-                    || context.root_font_size,
-                    context.resolution,
-                );
-            }
-            Self::LineHeight(value) => {
-                let (px, ex) = value.evaluate(
-                    context.style.font(context.styles).font_size,
-                    context.root_font_size,
-                    context.resolution,
-                );
-                context.style.line_height_spec = Some(value.clone());
-                let text = context.style.text_mut(context.styles);
-                text.line_height = px;
-                text.line_height_x_height_px = ex;
-                text.line_height_number = match value.as_ref() {
-                    PreparedLineHeight::Number(v) => *v,
-                    _ => 0.0,
-                };
-                text.line_height_normal = matches!(value.as_ref(), PreparedLineHeight::Normal);
-            }
-            Self::TabSpaces(v) => {
-                context.style.text_mut(context.styles).tab_size =
-                    TabSize::spaces(*v).expect("finite prepared tab count")
-            }
-            Self::TabLength(v) => {
-                let c = components(v, context);
-                context.style.text_mut(context.styles).tab_size =
-                    TabSize::length_px(c[0].max(0.0)).expect("finite prepared tab length");
-            }
-            Self::Spacing(v) => {
-                let c = components(v, context);
-                let spacing = if c[2..].iter().all(|v| *v == 0.0) {
-                    TextSpacing::from_px(c[0])
-                } else {
-                    context.styles.font_relative_text_spacing_group(
-                        context.style.font_group(),
-                        [c[0], c[2], c[3], c[4]],
-                    )
-                }
-                .expect("finite prepared spacing");
-                if matches!(property, Property::LetterSpacing(_)) {
-                    context.style.text_mut(context.styles).letter_spacing = spacing;
-                } else {
-                    context.style.text_mut(context.styles).word_spacing = spacing;
-                }
-            }
-            Self::Vertical(v) => context.style.box_model.vertical_align = *v,
-            Self::VerticalLength(v) => {
-                let c = components(v, context);
-                context.style.box_model.vertical_align = match v.literal_axis {
-                    Some(0) => VerticalAlignValue::Length(c[0]),
-                    Some(1) => VerticalAlignValue::Percent(c[1]),
-                    _ => VerticalAlignValue::Calc {
-                        absolute_px: c[0],
-                        line_height_fraction: c[1],
-                        x_height_px: c[2],
-                    },
-                };
-            }
-            Self::Thickness(v) => context.style.background.text_decoration.thickness = *v,
-            Self::ThicknessLength(v) => {
-                let c = components(v, context);
-                context.style.background.text_decoration.thickness =
-                    TextDecorationThickness::length(length_pct(v, c, true))
-                        .expect("finite prepared thickness");
-            }
-            Self::OutlineStyle(v) => context.style.background.outline.style = *v,
-            Self::DecorationStyle(v) => context.style.background.text_decoration.style = *v,
-            Self::ListStyle(v) => context.style.text_mut(context.styles).list_style_type = *v,
-        }
-    }
 }
+
 pub(in crate::style::cascade::resolver) fn evaluate(
     value: &PreparedLength,
     font: f32,

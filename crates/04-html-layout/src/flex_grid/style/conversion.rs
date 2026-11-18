@@ -1,4 +1,4 @@
-use crate::layout::resolve_definite_size_value;
+use html_style_model::{BoxSizing, FlexDirection, FlexWrap, GridAutoFlow, TextDirection};
 use html_style_model::{
     ContentAlignment, ItemAlignment, OverflowMode, UsedLengthPct,
     UsedPreferredSize as PreferredSize,
@@ -6,6 +6,10 @@ use html_style_model::{
 use taffy::prelude::{Dimension, LengthPercentageAuto};
 use taffy::style::{
     AlignContent as TaffyAlignContent, AlignItems as TaffyAlignItems, Overflow as TaffyOverflow,
+};
+use taffy::style::{
+    BoxSizing as TaffyBoxSizing, Direction as TaffyDirection, FlexDirection as TaffyFlexDirection,
+    FlexWrap as TaffyFlexWrap, GridAutoFlow as TaffyGridAutoFlow,
 };
 
 use super::super::TaffyContainerKind;
@@ -16,19 +20,11 @@ pub fn dimension(value: PreferredSize) -> Dimension {
         // Percentages remain symbolic for Taffy. Stretch participates through
         // alignment, so it must not become a percentage of an indefinite size.
         PreferredSize::Percent(value) => Dimension::percent(value.max(0.0)),
-        PreferredSize::Auto
-        | PreferredSize::Content
-        | PreferredSize::MinContent
-        | PreferredSize::MaxContent
-        | PreferredSize::FitContent
-        | PreferredSize::Stretch => Dimension::auto(),
-        // Callers with a definite basis resolve percentage-dependent sizes
-        // before this fallback; use the shared numeric resolver otherwise.
-        PreferredSize::Px(_) | PreferredSize::Calc { .. } | PreferredSize::Comparison { .. } => {
-            resolve_definite_size_value(value, None).map_or_else(Dimension::auto, |value| {
+        _ => value
+            .resolve_definite(None)
+            .map_or_else(Dimension::auto, |value| {
                 Dimension::length(value.max(0.0) as f32)
-            })
-        }
+            }),
     }
 }
 
@@ -69,8 +65,20 @@ pub(super) fn content_alignment(
         ContentAlignment::Normal | ContentAlignment::Stretch => TaffyAlignContent::STRETCH,
         ContentAlignment::Start => TaffyAlignContent::START,
         ContentAlignment::End => TaffyAlignContent::END,
-        ContentAlignment::Left => if rtl { TaffyAlignContent::END } else { TaffyAlignContent::START },
-        ContentAlignment::Right => if rtl { TaffyAlignContent::START } else { TaffyAlignContent::END },
+        ContentAlignment::Left => {
+            if rtl {
+                TaffyAlignContent::END
+            } else {
+                TaffyAlignContent::START
+            }
+        }
+        ContentAlignment::Right => {
+            if rtl {
+                TaffyAlignContent::START
+            } else {
+                TaffyAlignContent::END
+            }
+        }
         ContentAlignment::FlexStart => TaffyAlignContent::FLEX_START,
         ContentAlignment::FlexEnd => TaffyAlignContent::FLEX_END,
         ContentAlignment::Center => TaffyAlignContent::CENTER,
@@ -107,4 +115,40 @@ pub(super) fn item_alignment(value: ItemAlignment, rtl: bool) -> Option<TaffyAli
         ItemAlignment::Center | ItemAlignment::LegacyCenter => TaffyAlignItems::CENTER,
         ItemAlignment::Baseline => TaffyAlignItems::BASELINE,
     })
+}
+
+pub(super) fn direction(value: TextDirection) -> TaffyDirection {
+    match value {
+        TextDirection::Ltr => TaffyDirection::Ltr,
+        TextDirection::Rtl => TaffyDirection::Rtl,
+    }
+}
+pub(super) fn flex_direction(value: FlexDirection) -> TaffyFlexDirection {
+    match value {
+        FlexDirection::Row => TaffyFlexDirection::Row,
+        FlexDirection::RowReverse => TaffyFlexDirection::RowReverse,
+        FlexDirection::Column => TaffyFlexDirection::Column,
+        FlexDirection::ColumnReverse => TaffyFlexDirection::ColumnReverse,
+    }
+}
+pub(super) fn flex_wrap(value: FlexWrap) -> TaffyFlexWrap {
+    match value {
+        FlexWrap::NoWrap => TaffyFlexWrap::NoWrap,
+        FlexWrap::Wrap => TaffyFlexWrap::Wrap,
+        FlexWrap::WrapReverse => TaffyFlexWrap::WrapReverse,
+    }
+}
+pub(super) fn grid_auto_flow(value: GridAutoFlow) -> TaffyGridAutoFlow {
+    match value {
+        GridAutoFlow::Row => TaffyGridAutoFlow::Row,
+        GridAutoFlow::Column => TaffyGridAutoFlow::Column,
+        GridAutoFlow::RowDense => TaffyGridAutoFlow::RowDense,
+        GridAutoFlow::ColumnDense => TaffyGridAutoFlow::ColumnDense,
+    }
+}
+pub(super) fn box_sizing(value: BoxSizing) -> TaffyBoxSizing {
+    match value {
+        BoxSizing::ContentBox => TaffyBoxSizing::ContentBox,
+        BoxSizing::BorderBox => TaffyBoxSizing::BorderBox,
+    }
 }

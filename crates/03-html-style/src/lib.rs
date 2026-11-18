@@ -45,10 +45,8 @@ pub(crate) mod parser {
     }
 }
 
-mod request;
 #[path = "style/mod.rs"]
 mod style;
-pub use request::{StyleRequest, style_document};
 
 pub use html_style_model::{FontFace, FontFaceDescriptor, FontFaceSource, FontFaceStyle};
 pub use style::DEFAULT_CSS;
@@ -71,7 +69,8 @@ pub use style::timings::StyleTimings;
 
 pub use style::environment::{MediaEnvironment, MediaMatchKey, MediaQuerySet, MediaType};
 pub use style::program::{
-    StyleProgram, StyleProgramCache, StyleProgramCacheStats, resolve_document_with_program,
+    StyleProgram, StyleProgramCache, StyleProgramCacheStats, StyleRequest,
+    resolve_document_with_program, style_document,
 };
 
 #[cfg(test)]

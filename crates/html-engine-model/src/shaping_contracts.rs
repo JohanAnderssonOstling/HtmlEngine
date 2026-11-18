@@ -569,50 +569,34 @@ impl Default for FontRelativeMetrics {
 #[derive(Clone)]
 pub struct ShapedFontMetrics {
     box_metrics: BoxFontMetrics,
-    non_box_metrics: RequiredFontMetrics<FxHashMap<StyleIndices, FontRelativeMetrics>>,
+    non_box_metrics: FxHashMap<StyleIndices, u32>,
     root_ch_px: f32,
     root_cap_height_px: f32,
     root_line_height_px: f32,
 }
 
-#[derive(Clone)]
-pub enum BoxFontMetrics {
-    NotRequired,
-    Dense(Vec<FontRelativeMetrics>),
+#[derive(Clone, Default)]
+pub struct BoxFontMetrics {
     /// Zero is the fallback metric; positive IDs index `metrics` plus one.
-    /// This keeps painted-inline support to four bytes per layout box while
-    /// sharing each distinct selected-face metric tuple.
-    Indexed {
-        metric_ids: Vec<u32>,
-        metrics: Vec<FontRelativeMetrics>,
-    },
+    pub metric_ids: Vec<u32>,
+    pub metrics: Vec<FontRelativeMetrics>,
 }
 
 impl BoxFontMetrics {
     pub fn for_box(&self, box_idx: usize) -> FontRelativeMetrics {
-        match self {
-            Self::NotRequired => FontRelativeMetrics::default(),
-            Self::Dense(values) => values[box_idx],
-            Self::Indexed {
-                metric_ids,
-                metrics,
-            } => metric_ids[box_idx]
-                .checked_sub(1)
-                .map_or_else(FontRelativeMetrics::default, |id| metrics[id as usize]),
-        }
+        self.metric_ids
+            .get(box_idx)
+            .copied()
+            .unwrap_or(0)
+            .checked_sub(1)
+            .map_or_else(FontRelativeMetrics::default, |id| self.metrics[id as usize])
     }
-}
-
-#[derive(Clone)]
-pub enum RequiredFontMetrics<T> {
-    NotRequired,
-    Required(T),
 }
 
 impl ShapedFontMetrics {
     pub fn new(
         box_metrics: BoxFontMetrics,
-        non_box_metrics: RequiredFontMetrics<FxHashMap<StyleIndices, FontRelativeMetrics>>,
+        non_box_metrics: FxHashMap<StyleIndices, u32>,
         root_ch_px: f32,
         root_cap_height_px: f32,
         root_line_height_px: f32,
@@ -630,11 +614,21 @@ impl ShapedFontMetrics {
         self.box_metrics.for_box(box_idx)
     }
 
+    /// Identity within this metrics table; zero denotes fallback metrics.
+    pub fn box_metric_id(&self, box_idx: usize) -> u32 {
+        self.box_metrics
+            .metric_ids
+            .get(box_idx)
+            .copied()
+            .unwrap_or(0)
+    }
+
     pub fn for_non_box_style(&self, indices: StyleIndices) -> FontRelativeMetrics {
-        match &self.non_box_metrics {
-            RequiredFontMetrics::NotRequired => FontRelativeMetrics::default(),
-            RequiredFontMetrics::Required(values) => values[&indices],
-        }
+        self.non_box_metrics
+            .get(&indices)
+            .map_or_else(FontRelativeMetrics::default, |id| {
+                self.box_metrics.metrics[*id as usize - 1]
+            })
     }
 
     pub fn used_style<'styles>(
@@ -718,26 +712,9 @@ impl ShapedFontMetrics {
     }
 
     pub fn memory_usage_bytes(&self) -> usize {
-        let boxes = match &self.box_metrics {
-            BoxFontMetrics::NotRequired => 0,
-            BoxFontMetrics::Dense(values) => {
-                values.capacity() * std::mem::size_of::<FontRelativeMetrics>()
-            }
-            BoxFontMetrics::Indexed {
-                metric_ids,
-                metrics,
-            } => {
-                metric_ids.capacity() * std::mem::size_of::<u32>()
-                    + metrics.capacity() * std::mem::size_of::<FontRelativeMetrics>()
-            }
-        };
-        let non_boxes = match &self.non_box_metrics {
-            RequiredFontMetrics::NotRequired => 0,
-            RequiredFontMetrics::Required(values) => {
-                values.capacity() * std::mem::size_of::<(StyleIndices, FontRelativeMetrics)>()
-            }
-        };
-        boxes + non_boxes
+        self.box_metrics.metric_ids.capacity() * std::mem::size_of::<u32>()
+            + self.box_metrics.metrics.capacity() * std::mem::size_of::<FontRelativeMetrics>()
+            + self.non_box_metrics.capacity() * std::mem::size_of::<(StyleIndices, u32)>()
     }
 }
 
