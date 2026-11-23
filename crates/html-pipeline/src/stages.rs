@@ -8,6 +8,7 @@ use crate::{GlyphResourceStore, GlyphShaper, ShapeError};
 use html_dom::{Document, MemoryUsageReport};
 use html_engine_model::shaping::first_line_refinement_did_not_converge;
 use html_style_model::{ComputedStyles, StyleIndices};
+use html_text::TextStructure;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use std::ops::Range;
 use std::time::Duration;
@@ -50,7 +51,7 @@ pub use lifecycle::{
     DetachedLayout, FormattingDocument, LaidOutDocument, LayoutRequest, NoteLayout,
     PreparedDocument, ShapeLayoutTimings, ShapedDocument,
 };
-pub(crate) use lifecycle::{FirstLineRefinement, PreparedInputs, ResponsivePreparation, ShapedText};
+pub(crate) use lifecycle::{FirstLineRefinement, PreparedInputs, PreparedState, ShapedText};
 use semantics::{LinkGlyphTargets, box_id, collect_glyph_targets};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -111,18 +112,19 @@ fn first_line_style_ranges<'a>(
     layout_state: &LayoutState,
     text_runs: &mut Option<FirstLineTextRuns<'a>>,
 ) -> Vec<FirstLineStyleRange> {
-    if !inputs.styles.has_first_line_styles() {
+    if !inputs.state.styles.has_first_line_styles() {
         return Vec::new();
     }
-    let first_letter = inputs.text.first_letter_styles();
+    let first_letter = inputs.state.text.first_letter_styles();
     let mut result = Vec::new();
     for line in layout_state.line_output.lines.iter().filter(|line| {
         line.paint_color(&layout_state.line_output.line_details)
             .is_some()
     }) {
         let line_result_start = result.len();
-        let text_runs = text_runs
-            .get_or_insert_with(|| FirstLineTextRuns::new(inputs.text.content().inline_items()));
+        let text_runs = text_runs.get_or_insert_with(|| {
+            FirstLineTextRuns::new(inputs.state.text.content().inline_items())
+        });
         for run in text_runs.overlapping(line.glyphs.clone()) {
             let glyphs = run.glyphs;
             let start = glyphs.start.max(line.glyphs.start);
@@ -130,18 +132,17 @@ fn first_line_style_ranges<'a>(
             if start >= end {
                 continue;
             }
-            let root = html_text::whitespace_context_root(
-                inputs.layout_tree.as_ref(),
-                run.box_idx as usize,
-            );
-            let Some(first_line_style) = inputs.text.content().pseudo_styles().first_line(root)
+            let root = inputs.state.layout_tree.flow_root(run.box_idx as usize);
+            let Some(first_line_style) =
+                inputs.state.text.content().pseudo_styles().first_line(root)
             else {
                 continue;
             };
             let base_style = inputs
+                .state
                 .layout_tree
                 .get_box_style_indices(run.box_idx as usize)
-                .unwrap_or_else(|| inputs.styles.default_indices());
+                .unwrap_or_else(|| inputs.state.styles.default_indices());
             let mut segment_start = start;
             let (style, mut glyph) = first_letter.segment(start, end);
             let mut segment_style = style.unwrap_or(first_line_style);
@@ -150,7 +151,7 @@ fn first_line_style_ranges<'a>(
                 let style = style.unwrap_or(first_line_style);
                 if style != segment_style {
                     append_first_line_style_range(
-                        &inputs.styles,
+                        &inputs.state.styles,
                         &mut result,
                         FirstLineStyleRange {
                             glyphs: segment_start..glyph,
@@ -166,7 +167,7 @@ fn first_line_style_ranges<'a>(
                 glyph = next;
             }
             append_first_line_style_range(
-                &inputs.styles,
+                &inputs.state.styles,
                 &mut result,
                 FirstLineStyleRange {
                     glyphs: segment_start..end,
@@ -240,9 +241,9 @@ fn shape_first_line_ranges(
         let original = &base.glyphs[source.start as usize..source.end as usize];
         let mut glyphs = original.to_vec();
         crate::shaping::reshape_range_with_style(
-            &inputs.styles,
+            &inputs.state.styles,
             &base.shared.font_metrics,
-            inputs.text.content(),
+            inputs.state.text.content(),
             &mut glyphs,
             source.start,
             &base.text_geometry.bidi,
@@ -321,9 +322,12 @@ fn layout_with_first_lines(
     };
     match transaction {
         RefinementTransaction::Existing => refine(glyph_shaper, resources),
-        RefinementTransaction::Append => {
-            with_append_shaping(glyph_shaper, &inputs.publication_fonts, refine, resources)
-        }
+        RefinementTransaction::Append => with_append_shaping(
+            glyph_shaper,
+            &inputs.state.publication_fonts,
+            refine,
+            resources,
+        ),
     }
 }
 

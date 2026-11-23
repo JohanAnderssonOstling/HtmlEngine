@@ -10,6 +10,38 @@ use lightningcss::properties::font::FontVariantCaps;
 use lightningcss::traits::Parse;
 use std::iter::once;
 
+pub(crate) fn caps_features(value: &FontVariantCaps) -> Vec<OpenTypeFeature> {
+    match value {
+        FontVariantCaps::Normal => Vec::new(),
+        FontVariantCaps::SmallCaps => vec![open_type::open_type_feature_new(
+            OpenTypeFeatureKind::SmallCaps,
+            1,
+        )],
+        FontVariantCaps::AllSmallCaps => vec![
+            open_type::open_type_feature_new(OpenTypeFeatureKind::SmallCaps, 1),
+            open_type::open_type_feature_new(OpenTypeFeatureKind::CapitalsToSmallCaps, 1),
+        ],
+        FontVariantCaps::PetiteCaps => {
+            vec![open_type::open_type_feature_new(
+                OpenTypeFeatureKind::PetiteCaps,
+                1,
+            )]
+        }
+        FontVariantCaps::AllPetiteCaps => vec![
+            open_type::open_type_feature_new(OpenTypeFeatureKind::PetiteCaps, 1),
+            open_type::open_type_feature_new(OpenTypeFeatureKind::CapitalsToPetiteCaps, 1),
+        ],
+        FontVariantCaps::Unicase => vec![open_type::open_type_feature_new(
+            OpenTypeFeatureKind::Unicase,
+            1,
+        )],
+        FontVariantCaps::TitlingCaps => vec![open_type::open_type_feature_new(
+            OpenTypeFeatureKind::TitlingCapitals,
+            1,
+        )],
+    }
+}
+
 /// The supported caps, numeric and ligature portions of `font-variant`.
 /// Unknown or conflicting components invalidate the complete declaration.
 pub(crate) fn parse_variant(

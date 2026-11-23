@@ -1,17 +1,16 @@
 use crate::layout_model::{
-    BlockBox, Children, InlineContent, InlineItem, InlineItemKind, LayoutBox, LayoutMode,
+    BoxFacts, Children, InlineContent, InlineItem, InlineItemKind, LayoutBox, LayoutMode,
     LayoutTree, ListItemMarker, TableBox, TableCellBox, TableRowBox,
 };
 use html_dom::{DomNodeId, ElementRef};
 use html_style_model::{
-    CaptionSide, ComputedStyles, Display, Float, ListStylePosition, PositionMode, StyleIndices,
-    StyleView,
+    CaptionSide, ComputedStyles, Display, ListStylePosition, StyleIndices, StyleView,
 };
 use html_text::get_style;
 use std::ops::Range;
 
+use super::classification::BoxClassification;
 use super::generated::ResolvedGeneratedContent;
-use super::inline::GeneratedInlinePlan;
 use super::table::{GeneratedTablePlan, TableRole, nearest_table, plan_generated_table_principal};
 
 /// Owns the invariant-sensitive construction of the two box-building outputs.
@@ -35,8 +34,9 @@ impl<'styles, 'out> BoxTreeWriter<'styles, 'out> {
         }
     }
 
-    pub(super) fn set_root_box(&mut self, root: Option<u32>) {
+    pub(super) fn finish(&mut self, root: Option<u32>) {
         self.tree.set_root_box(root);
+        self.tree.publish_children();
     }
 
     pub(super) fn item_position(&self) -> u32 {
@@ -56,21 +56,30 @@ impl<'styles, 'out> BoxTreeWriter<'styles, 'out> {
     pub(super) fn push_dom_box(
         &mut self,
         element: ElementRef<'_>,
+        display: Display,
         parent: Option<u32>,
         style: Option<StyleIndices>,
         layout_mode: LayoutMode,
     ) -> u32 {
-        let box_idx = self.tree.push_box(LayoutBox {
-            layout_mode,
-            dom_element: Some(element.node_id()),
-            parent,
-            style,
-        });
+        if element.tag().eq_ignore_ascii_case("body") {
+            self.tree.set_body_box(self.tree.box_count() as u32);
+        }
+        let box_idx = self.tree.push_box(
+            LayoutBox {
+                facts: BoxFacts {
+                    display,
+                    ..BoxFacts::default()
+                },
+                layout_mode,
+                dom_element: Some(element.node_id()),
+                parent,
+                children: 0..0,
+                style,
+            },
+            self.styles,
+        );
         if let Some(image_idx) = element.image_idx() {
             self.tree.set_box_image_idx(box_idx, image_idx);
-        }
-        if element.tag().eq_ignore_ascii_case("body") {
-            self.tree.set_body_box(box_idx);
         }
         box_idx
     }
@@ -220,30 +229,44 @@ impl<'styles, 'out> BoxTreeWriter<'styles, 'out> {
 
     pub(super) fn set_box_children(&mut self, box_idx: u32, children: Children) {
         match self.layout_mode_mut(box_idx) {
-            Some(LayoutMode::Block(block)) => block.children = children,
+            Some(LayoutMode::Block(block)) => *block = children,
             Some(LayoutMode::TableCell(cell)) => cell.children = children,
             _ => {}
         }
     }
 
-    pub(super) fn set_flex_grid_children(&mut self, box_idx: u32, children: Vec<u32>) {
+    pub(super) fn set_child_boxes(
+        &mut self,
+        box_idx: u32,
+        children: impl IntoIterator<Item = u32>,
+    ) {
+        let range = self.tree.store_children(children);
         match self.layout_mode_mut(box_idx) {
-            Some(LayoutMode::Flex(container)) => container.children = children,
-            Some(LayoutMode::Grid(container)) => container.children = children,
-            _ => unreachable!("flex/grid child construction requires a flex/grid layout mode"),
+            Some(LayoutMode::Block(children))
+            | Some(LayoutMode::TableCell(TableCellBox { children, .. })) => {
+                *children = Children::Blocks(range);
+            }
+            Some(LayoutMode::Flex(children) | LayoutMode::Grid(children)) => *children = range,
+            _ => unreachable!("box content requires a block, cell, flex, or grid container"),
         }
     }
 
     pub(super) fn extend_with_group_rows(&self, group_idx: u32, rows: &mut Vec<u32>) {
         if let Some(LayoutMode::Block(group)) = self.tree.get_box_layout_mode(group_idx as usize)
-            && let Children::Blocks(group_rows) = &group.children
+            && let Children::Blocks(group_rows) = group
         {
-            rows.extend(group_rows.iter().copied().filter(|&row| {
-                matches!(
-                    self.tree.get_box_layout_mode(row as usize),
-                    Some(LayoutMode::TableRow(_))
-                )
-            }));
+            rows.extend(
+                self.tree
+                    .child_slice(group_rows)
+                    .iter()
+                    .copied()
+                    .filter(|&row| {
+                        matches!(
+                            self.tree.get_box_layout_mode(row as usize),
+                            Some(LayoutMode::TableRow(_))
+                        )
+                    }),
+            );
         }
     }
 
@@ -319,18 +342,22 @@ impl<'styles, 'out> BoxTreeWriter<'styles, 'out> {
         );
     }
 
-    pub(super) fn emit_generated_inline(&mut self, parent: u32, plan: GeneratedInlinePlan) {
-        let GeneratedInlinePlan {
-            content,
-            start_edge,
-            end_edge,
-        } = plan;
+    pub(super) fn emit_generated_inline(
+        &mut self,
+        parent: u32,
+        content: ResolvedGeneratedContent,
+        classification: BoxClassification,
+    ) {
         let style = self
             .styles
             .view(content.style)
             .expect("validated generated style");
-        let absolute = style.layout.position == PositionMode::Absolute;
-        if absolute || style.float() != Float::None {
+        let (start_edge, end_edge) = if content.display == Display::Contents {
+            (false, false)
+        } else {
+            style.inline_edges()
+        };
+        if classification.absolute || classification.floated {
             // Blockification does not put a positioned/floated pseudo into
             // normal block flow. Materialize its own principal box, then
             // retain the same zero-width source anchor as a real element.
@@ -345,7 +372,7 @@ impl<'styles, 'out> BoxTreeWriter<'styles, 'out> {
             } else {
                 self.push_generated_text_box(parent, &content)
             };
-            let kind = if absolute {
+            let kind = if classification.absolute {
                 InlineItemKind::AbsoluteAnchor {
                     box_idx: pseudo_box,
                 }
@@ -395,12 +422,17 @@ impl<'styles, 'out> BoxTreeWriter<'styles, 'out> {
         style: Option<StyleIndices>,
         layout_mode: LayoutMode,
     ) -> u32 {
-        self.tree.push_box(LayoutBox {
-            layout_mode,
-            dom_element: None,
-            parent: Some(parent),
-            style,
-        })
+        self.tree.push_box(
+            LayoutBox {
+                facts: BoxFacts::default(),
+                layout_mode,
+                dom_element: None,
+                parent: Some(parent),
+                children: 0..0,
+                style,
+            },
+            self.styles,
+        )
     }
 
     fn push_anonymous_box(
@@ -421,7 +453,7 @@ impl<'styles, 'out> BoxTreeWriter<'styles, 'out> {
         let box_idx = self.push_synthetic_box(
             parent,
             Some(content.style),
-            LayoutMode::Block(BlockBox::default()),
+            LayoutMode::Block(Children::default()),
         );
         self.set_generated_text_children(box_idx, content.style, &content.text, false);
         box_idx
@@ -496,18 +528,9 @@ impl<'styles, 'out> BoxTreeWriter<'styles, 'out> {
                         && let Some(group) = planned
                             .parent
                             .filter(|parent| matches!(boxes[*parent].role, TableRole::RowGroup))
-                        && let Some(LayoutMode::Block(group)) =
-                            self.layout_mode_mut(box_indices[group])
                     {
-                        match &mut group.children {
-                            children @ Children::Empty => {
-                                *children = Children::Blocks(vec![box_idx])
-                            }
-                            Children::Blocks(rows) => rows.push(box_idx),
-                            Children::InlineItems(_) => {
-                                unreachable!("planned table row groups cannot contain inline items")
-                            }
-                        }
+                        // Generated row groups contain a single generated row.
+                        self.set_child_boxes(box_indices[group], [box_idx]);
                     }
                 }
                 TableRole::Cell => {

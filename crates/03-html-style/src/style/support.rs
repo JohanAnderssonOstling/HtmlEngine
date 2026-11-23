@@ -53,3 +53,25 @@ pub struct DeclarationSupport {
     pub syntax: PropertySyntax,
     pub capability: PropertyCapability,
 }
+
+/// Shared failure classification for value preparation and feature queries.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PreparationError {
+    InvalidSyntax,
+    Unsupported(UnsupportedStyleFeature),
+}
+
+impl From<PreparationError> for DeclarationSupport {
+    fn from(error: PreparationError) -> Self {
+        match error {
+            PreparationError::InvalidSyntax => Self {
+                syntax: PropertySyntax::Invalid,
+                capability: PropertyCapability::Supported,
+            },
+            PreparationError::Unsupported(reason) => Self {
+                syntax: PropertySyntax::Unsupported,
+                capability: PropertyCapability::Unsupported(reason),
+            },
+        }
+    }
+}

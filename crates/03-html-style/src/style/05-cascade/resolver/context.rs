@@ -1,9 +1,8 @@
 //! Inputs and dependency phases shared by computed-value conversion.
 use super::state::{ParentStyle, WorkingStyle};
-use crate::style::cascade::resolver::prepared_native::PreparedNativeValue;
+use crate::style::cascade::resolver::prepared_native::PreparedLonghand;
 use crate::style::environment::MediaEnvironment;
 use crate::style::syntax::prepared_length::finite;
-use crate::style::syntax::prepared_renderer::PreparedRendererValue;
 use crate::style::syntax::wide_keywords::CssWideKeyword;
 use html_style_model::ComputedStylesBuilder;
 use lightningcss::properties::Property;
@@ -57,12 +56,6 @@ impl ResolutionContext {
 
 pub(super) use crate::style::property_catalogue::CascadePhase;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum ApplyResult {
-    Applied,
-    Unhandled,
-}
-
 pub(super) struct PropertyContext<'a> {
     pub(super) is_root: bool,
     pub(super) resolution: &'a mut ResolutionContext,
@@ -79,8 +72,7 @@ pub(super) struct PropertyContext<'a> {
 pub(super) struct ResolvedDeclaration<'css> {
     pub(super) value: Option<Box<Property<'css>>>,
     pub(super) longhands: Vec<Property<'css>>,
-    pub(super) native_values: Vec<Option<PreparedNativeValue>>,
-    pub(super) renderer_value: Option<Box<PreparedRendererValue>>,
+    pub(super) values: Vec<PreparedLonghand>,
     keyword: Option<CssWideKeyword>,
     pub(super) requires_viewport_height: bool,
     state: u8,
@@ -88,17 +80,14 @@ pub(super) struct ResolvedDeclaration<'css> {
 
 impl<'css> ResolvedDeclaration<'css> {
     const OWNS_VALUE: u8 = 1;
-    const EXPANDED: u8 = 2;
-    const SUBSTITUTED: u8 = 4;
-    const VALID: u8 = 8;
+    const VALID: u8 = 4;
 
     pub(super) fn reset(&mut self) {
         self.state = 0;
         self.keyword = None;
         self.requires_viewport_height = false;
         self.longhands.clear();
-        self.native_values.clear();
-        self.renderer_value = None;
+        self.values.clear();
     }
 
     pub(super) fn keyword(&self) -> Option<CssWideKeyword> {
@@ -111,22 +100,6 @@ impl<'css> ResolvedDeclaration<'css> {
 
     pub(super) fn owns_value(&self) -> bool {
         self.state & Self::OWNS_VALUE != 0
-    }
-
-    pub(super) fn expanded(&self) -> bool {
-        self.state & Self::EXPANDED != 0
-    }
-
-    pub(super) fn set_expanded(&mut self, value: bool) {
-        self.state = (self.state & !Self::EXPANDED) | (u8::from(value) * Self::EXPANDED);
-    }
-
-    pub(super) fn substituted(&self) -> bool {
-        self.state & Self::SUBSTITUTED != 0
-    }
-
-    pub(super) fn set_substituted(&mut self, value: bool) {
-        self.state = (self.state & !Self::SUBSTITUTED) | (u8::from(value) * Self::SUBSTITUTED);
     }
 
     pub(super) fn valid(&self) -> bool {

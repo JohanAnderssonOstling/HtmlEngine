@@ -1,3 +1,4 @@
+use super::sizing::SizingPass;
 use html_style_model::{
     ComputedStyles, GridPlacement, GridRepeatCount, UsedGridTemplateTrack, UsedGridTrackBreadth,
     UsedGridTrackSize, UsedLengthPct,
@@ -29,14 +30,14 @@ pub(super) fn template_track(
     source: &UsedGridTemplateTrack<'_>,
     floor_fixed_auto_maximum: bool,
     percentage_basis: Option<f64>,
-    cyclic_calc_is_auto: bool,
+    pass: SizingPass,
 ) -> TaffyGridTemplateComponent<String> {
     match source {
         UsedGridTemplateTrack::Single(size) => TaffyGridTemplateComponent::Single(track_size(
             size,
             floor_fixed_auto_maximum,
             percentage_basis,
-            cyclic_calc_is_auto,
+            pass,
         )),
         UsedGridTemplateTrack::Repeat {
             count,
@@ -59,15 +60,10 @@ pub(super) fn template_track(
                                 &track,
                                 floor_fixed_auto_maximum,
                                 percentage_basis,
-                                cyclic_calc_is_auto,
+                                pass,
                             )
                         } else {
-                            track_size(
-                                &track,
-                                floor_fixed_auto_maximum,
-                                percentage_basis,
-                                cyclic_calc_is_auto,
-                            )
+                            track_size(&track, floor_fixed_auto_maximum, percentage_basis, pass)
                         }
                     })
                     .collect(),
@@ -81,7 +77,7 @@ fn auto_repeat_track(
     source: &UsedGridTrackSize,
     floor_fixed_auto_maximum: bool,
     percentage_basis: Option<f64>,
-    cyclic_calc_is_auto: bool,
+    pass: SizingPass,
 ) -> TrackSizingFunction {
     // CSS Grid floors an auto-repeat track to a small UA-defined size when
     // counting repetitions. Supplying the suggested 1px floor keeps Taffy's
@@ -97,40 +93,28 @@ fn auto_repeat_track(
         } if value.is_zero() => UsedGridTrackSize::MinMax { min: floor, max },
         source => source,
     };
-    track_size(
-        &source,
-        floor_fixed_auto_maximum,
-        percentage_basis,
-        cyclic_calc_is_auto,
-    )
+    track_size(&source, floor_fixed_auto_maximum, percentage_basis, pass)
 }
 
 pub(super) fn track_size(
     source: &UsedGridTrackSize,
     floor_fixed_auto_maximum: bool,
     percentage_basis: Option<f64>,
-    cyclic_calc_is_auto: bool,
+    pass: SizingPass,
 ) -> TrackSizingFunction {
     match source {
         UsedGridTrackSize::Auto => TrackSizingFunction::AUTO,
-        UsedGridTrackSize::Breadth(value) => {
-            breadth_pair(*value, percentage_basis, cyclic_calc_is_auto)
-        }
+        UsedGridTrackSize::Breadth(value) => breadth_pair(*value, percentage_basis, pass),
         UsedGridTrackSize::MinMax { min, max } => TrackSizingFunction {
-            min: max_breadth(*min, percentage_basis, cyclic_calc_is_auto).into(),
+            min: max_breadth(*min, percentage_basis, pass).into(),
             max: if floor_fixed_auto_maximum {
-                max_breadth_with_auto_minimum_floor(
-                    *min,
-                    *max,
-                    percentage_basis,
-                    cyclic_calc_is_auto,
-                )
+                max_breadth_with_auto_minimum_floor(*min, *max, percentage_basis, pass)
             } else {
-                max_breadth(*max, percentage_basis, cyclic_calc_is_auto)
+                max_breadth(*max, percentage_basis, pass)
             },
         },
         UsedGridTrackSize::FitContent(value) => {
-            if cyclic_calc_is_auto
+            if pass.is_intrinsic()
                 && percentage_basis.is_none()
                 && matches!(value, UsedLengthPct::Calc { percentage, .. } if *percentage != 0.0)
             {
@@ -204,9 +188,9 @@ pub(super) fn fixed_auto_track_limit<'a>(
 fn breadth_pair(
     value: UsedGridTrackBreadth,
     percentage_basis: Option<f64>,
-    cyclic_calc_is_auto: bool,
+    pass: SizingPass,
 ) -> TrackSizingFunction {
-    let max = max_breadth(value, percentage_basis, cyclic_calc_is_auto);
+    let max = max_breadth(value, percentage_basis, pass);
     TrackSizingFunction {
         min: max.into(),
         max,
@@ -216,7 +200,7 @@ fn breadth_pair(
 fn max_breadth(
     value: UsedGridTrackBreadth,
     percentage_basis: Option<f64>,
-    cyclic_calc_is_auto: bool,
+    pass: SizingPass,
 ) -> MaxTrackSizingFunction {
     match value {
         UsedGridTrackBreadth::Length(UsedLengthPct::Px(value)) => {
@@ -226,7 +210,7 @@ fn max_breadth(
             MaxTrackSizingFunction::percent(value)
         }
         UsedGridTrackBreadth::Length(UsedLengthPct::Calc { percentage, .. })
-            if cyclic_calc_is_auto && percentage_basis.is_none() && percentage != 0.0 =>
+            if pass.is_intrinsic() && percentage_basis.is_none() && percentage != 0.0 =>
         {
             MaxTrackSizingFunction::auto()
         }
@@ -248,7 +232,7 @@ fn max_breadth_with_auto_minimum_floor(
     min: UsedGridTrackBreadth,
     max: UsedGridTrackBreadth,
     percentage_basis: Option<f64>,
-    cyclic_calc_is_auto: bool,
+    pass: SizingPass,
 ) -> MaxTrackSizingFunction {
     match (min, max) {
         (
@@ -257,7 +241,7 @@ fn max_breadth_with_auto_minimum_floor(
             | UsedGridTrackBreadth::MaxContent,
             UsedGridTrackBreadth::Length(value),
         ) => fit_content_breadth(value, percentage_basis),
-        (_, max) => max_breadth(max, percentage_basis, cyclic_calc_is_auto),
+        (_, max) => max_breadth(max, percentage_basis, pass),
     }
 }
 
@@ -363,7 +347,11 @@ mod tests {
 
     #[test]
     fn flexible_tracks_keep_an_auto_minimum() {
-        let track = breadth_pair(UsedGridTrackBreadth::Flex(2.0), None, false);
+        let track = breadth_pair(
+            UsedGridTrackBreadth::Flex(2.0),
+            None,
+            SizingPass::Final(0.0),
+        );
         assert_eq!(track.min, MinTrackSizingFunction::auto());
         assert_eq!(track.max, MaxTrackSizingFunction::fr(2.0));
     }
@@ -375,10 +363,10 @@ mod tests {
             percentage: 0.5,
             percentage_dependent: true,
         });
-        let unresolved = breadth_pair(breadth, None, true);
+        let unresolved = breadth_pair(breadth, None, SizingPass::Intrinsic);
         assert_eq!(unresolved.min, MinTrackSizingFunction::auto());
         assert_eq!(unresolved.max, MaxTrackSizingFunction::auto());
-        let resolved = breadth_pair(breadth, Some(100.0), true);
+        let resolved = breadth_pair(breadth, Some(100.0), SizingPass::Intrinsic);
         assert_eq!(resolved.min, MinTrackSizingFunction::length(60.0));
         assert_eq!(resolved.max, MaxTrackSizingFunction::length(60.0));
     }

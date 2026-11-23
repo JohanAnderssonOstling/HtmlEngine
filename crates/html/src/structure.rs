@@ -152,7 +152,7 @@ struct LineBounds {
 /// These positions are independent of the stable IDs used for painting.
 #[derive(Default)]
 struct BoundaryIndex {
-    forced_preorder: Vec<u32>,
+    forced_descendant: HashSet<BoxId>,
     block_parents: HashSet<BoxId>,
     line_bounds: HashMap<BoxId, LineBounds>,
     next_line: HashMap<BoxId, usize>,
@@ -241,10 +241,9 @@ impl StructureView<'_> {
     pub(crate) fn constraints(&self, box_idx: BoxId) -> BlockConstraints {
         let boxes = self.view.boxes();
         let facts = boxes.pagination_facts(box_idx).expect("published pagination structure");
-        let first = self.index.forced_preorder.partition_point(|&entry| entry <= facts.subtree.start);
         BlockConstraints {
             avoid_inside: facts.avoid_inside,
-            has_forced_descendant: self.index.forced_preorder.get(first).is_some_and(|&entry| entry < facts.subtree.end),
+            has_forced_descendant: self.index.forced_descendant.contains(&box_idx),
             owns_line_flow: facts.is_block_container && !facts.in_table && !self.index.block_parents.contains(&box_idx),
             orphans: facts.orphans,
             widows: facts.widows,
@@ -517,16 +516,23 @@ fn index_lines(
         }
     }
 
-    anchors.forced_preorder.clear();
+    anchors.forced_descendant.clear();
     anchors.block_parents.clear();
     for &owner in candidates.iter() {
         let Some(facts) = boxes.pagination_facts(owner) else { continue };
-        if facts.forced_break { anchors.forced_preorder.push(facts.subtree.start); }
+        if facts.forced_break {
+            // Mark strict ancestors of relevant candidates, excluding the box's
+            // own break. An existing mark means its ancestors are marked too.
+            for ancestor in boxes.ancestors(owner) {
+                if !anchors.forced_descendant.insert(ancestor) {
+                    break;
+                }
+            }
+        }
         if facts.is_block_container && let Some(parent) = boxes.parent(owner) {
             anchors.block_parents.insert(parent);
         }
     }
-    anchors.forced_preorder.sort_unstable();
 
     let next_line = &mut anchors.next_line;
     let by_owner = &mut anchors.next_owner_lines;

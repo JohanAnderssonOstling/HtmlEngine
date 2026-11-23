@@ -1,9 +1,9 @@
 //! Compile selector indices and compact match instructions from prepared rules.
 use crate::style::compiled::{
     CandidateRange, CompiledSelectors, Compound, FastAlternative, FastAttribute, FastTest,
-    PreparedRuleSet, PreparedSelector, Relation, RuleSelectorRange, SelectorBuckets,
-    SelectorCandidate, SelectorIndex, SelectorState};
-use crate::style::matching::filter::SelectorFilter;
+    PreparedRuleSet, PreparedSelector, Relation, RuleSelectorRange, ScopeId, SelectorBuckets,
+    SelectorCandidate, SelectorIndex, SelectorState,
+};
 use crate::style::syntax::selectors::{selector_pseudo_mask, selector_specificity};
 use lightningcss::selector::{Combinator, Component, PseudoClass, PseudoElement, Selector};
 use rustc_data_structures::fx::FxHashMap;
@@ -14,6 +14,8 @@ impl CompiledSelectors {
         Self {
             rule_starts: Vec::new(),
             selectors: Vec::new(),
+            sibling_attributes: Vec::new(),
+            ancestor_tests: Vec::new(),
             tests: Vec::new(),
             compounds: Vec::new(),
         }
@@ -37,6 +39,8 @@ impl CompiledSelectors {
         let mut output = Self {
             rule_starts: Vec::with_capacity(rule_count + 1),
             selectors: Vec::with_capacity(selector_count),
+            sibling_attributes: Vec::new(),
+            ancestor_tests: Vec::new(),
             tests: Vec::with_capacity(fast_test_count),
             compounds: Vec::with_capacity(fast_compound_count),
         };
@@ -48,8 +52,27 @@ impl CompiledSelectors {
                 let fast = append_fast(selector, &mut output.tests, &mut output.compounds);
                 let specificity = selector_specificity(selector);
                 max_specificity = max_specificity.max(specificity);
+                let start = output.sibling_attributes.len();
+                // Pseudos are matched separately even when the normal style is shared.
+                let shareable = selector.has_pseudo_element()
+                    || (rule.scope() == ScopeId::NONE
+                        && sibling_invariant(selector, &mut output.sibling_attributes));
+                if !shareable {
+                    output.sibling_attributes.truncate(start);
+                }
+                let sibling_attributes = shareable.then(|| {
+                    (
+                        u32::try_from(start).expect("selector attributes fit in u32"),
+                        u32::try_from(output.sibling_attributes.len())
+                            .expect("selector attributes fit in u32"),
+                    )
+                });
                 output.selectors.push(PreparedSelector {
-                    ancestor_requirements: ancestor_requirement_mask(selector),
+                    sibling_attributes,
+                    ancestor_requirements: append_ancestor_requirements(
+                        selector,
+                        &mut output.ancestor_tests,
+                    ),
                     specificity,
                     fast_start: fast.map_or(0, |range| range.0),
                     fast_len: fast.map_or(0, |range| range.1),
@@ -71,6 +94,37 @@ impl CompiledSelectors {
         });
         output
     }
+}
+
+/// Record attributes read by safe selectors. Siblings agreeing on these and
+/// normalized HTML state share all ancestors. Reject positional, subtree,
+/// scope or unknown dependencies, including nested logical selectors.
+fn sibling_invariant(selector: &Selector<'_>, attributes: &mut Vec<String>) -> bool {
+    selector
+        .iter_raw_match_order()
+        .all(|component| match component {
+        Component::ExplicitAnyNamespace | Component::ExplicitNoNamespace
+        | Component::DefaultNamespace(_) | Component::Namespace(_, _)
+        | Component::ExplicitUniversalType | Component::LocalName(_)
+        | Component::ID(_) | Component::Class(_)
+        // Current non-tree pseudo-classes use normalized HTML state or
+        // effective language, whose inherited source is the shared parent.
+        | Component::NonTSPseudoClass(_)
+        | Component::Combinator(Combinator::Child | Combinator::Descendant) => true,
+        Component::AttributeInNoNamespaceExists { local_name, .. }
+        | Component::AttributeInNoNamespace { local_name, .. } => {
+            attributes.push(local_name.as_ref().to_ascii_lowercase());
+            true
+        }
+        Component::AttributeOther(attribute) => {
+            attributes.push(attribute.local_name.as_ref().to_ascii_lowercase());
+            true
+        }
+        Component::Is(selectors) | Component::Where(selectors) | Component::Negation(selectors) => {
+            selectors.iter().all(|selector| sibling_invariant(selector, attributes))
+        }
+        _ => false,
+    })
 }
 
 impl SelectorIndex {
@@ -320,27 +374,34 @@ fn bucket_component(selector: &Selector<'_>) -> u16 {
     }
 }
 
-fn ancestor_requirement_mask(selector: &Selector<'_>) -> SelectorFilter {
+fn append_ancestor_requirements(
+    selector: &Selector<'_>,
+    requirements: &mut Vec<FastAlternative>,
+) -> (u32, u32) {
+    let start = requirements.len();
     let mut iter = selector.iter();
     for _ in iter.by_ref() {}
-    let mut requirements = SelectorFilter::default();
     while let Some(combinator) = iter.next_sequence() {
         if !matches!(combinator, Combinator::Child | Combinator::Descendant) {
-            return SelectorFilter::default();
+            requirements.truncate(start);
+            break;
         }
         for component in iter.by_ref() {
-            let value = match component {
-                Component::LocalName(name) => Some(name.lower_name.0.as_ref()),
-                Component::Class(class) => Some(class.0.as_ref()),
-                Component::ID(id) => Some(id.0.as_ref()),
-                _ => None,
-            };
-            if let Some(value) = value {
-                requirements.insert(value)
-            }
+            requirements.push(match component {
+                Component::LocalName(name) => FastAlternative::LocalName {
+                    name: name.name.clone().into_owned(),
+                    lower_name: name.lower_name.clone().into_owned(),
+                },
+                Component::Class(class) => FastAlternative::Class(class.clone().into_owned()),
+                Component::ID(id) => FastAlternative::Id(id.clone().into_owned()),
+                _ => continue,
+            });
         }
     }
-    requirements
+    (
+        u32::try_from(start).expect("ancestor requirements fit in u32"),
+        u32::try_from(requirements.len()).expect("ancestor requirements fit in u32"),
+    )
 }
 
 fn append_fast(
@@ -610,7 +671,8 @@ fn simple_component<'a, 'css>(selector: &'a Selector<'css>) -> Option<&'a Compon
 mod tests {
     use super::*;
     use crate::style::compiled::EffectiveRuleId;
-    use crate::style::matching::dom;
+    use crate::style::matching::dom::{self, MatchCaches, TraversalContext};
+    use crate::style::matching::traversal::StyleTraversal;
     use lightningcss::selector::SelectorList;
     use lightningcss::stylesheet::ParserOptions;
     use lightningcss::traits::ParseWithOptions;
@@ -684,7 +746,8 @@ mod tests {
         let (fast_start, fast_len, bucket_test) =
             append_fast(selector, &mut compiled.tests, &mut compiled.compounds).unwrap();
         PreparedSelector {
-            ancestor_requirements: SelectorFilter::default(),
+            ancestor_requirements: (0, 0),
+            sibling_attributes: None,
             specificity: 0,
             fast_start,
             fast_len,
@@ -712,12 +775,13 @@ mod tests {
             let mut compiled = CompiledSelectors::empty();
             let prepared = prepared(selector, &mut compiled);
             let bound = compiled.bind(&document);
-            for node in document
-                .node_ids()
-                .filter(|node| document.try_element_ref(*node).is_some())
-            {
+            let mut traversal = StyleTraversal::new(&document);
+            let mut caches = MatchCaches::default();
+            while let Some(element) = traversal.next() {
+                let node = element.node_id();
+                let mut context = TraversalContext::new(&document, &mut traversal, &mut caches);
                 assert_eq!(
-                    bound.matches(prepared, node),
+                    bound.matches(prepared, node, &mut context),
                     Some(dom::selector_matches_dom_node(selector, &document, node)),
                     "selector {text} at node {node:?}"
                 );
@@ -741,12 +805,13 @@ mod tests {
         let mut compiled = CompiledSelectors::empty();
         let prepared = prepared(selector, &mut compiled);
         let bound = compiled.bind(&xml);
-        for node in xml
-            .node_ids()
-            .filter(|node| xml.try_element_ref(*node).is_some())
-        {
+        let mut traversal = StyleTraversal::new(&xml);
+        let mut caches = MatchCaches::default();
+        while let Some(element) = traversal.next() {
+            let node = element.node_id();
+            let mut context = TraversalContext::new(&xml, &mut traversal, &mut caches);
             assert_eq!(
-                bound.matches(prepared, node),
+                bound.matches(prepared, node, &mut context),
                 Some(dom::selector_matches_dom_node(selector, &xml, node))
             );
         }

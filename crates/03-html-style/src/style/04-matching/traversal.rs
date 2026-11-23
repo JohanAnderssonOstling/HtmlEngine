@@ -1,7 +1,6 @@
 //! Facts accumulated during the depth-first style pass. Summaries are built
 //! lazily when a matcher first needs them and updated as frames enter/leave.
 use super::dom::element_language;
-use super::selectors::AncestorFilter;
 use crate::style::compiled::{FastAlternative, FastTest};
 use html_dom::{Document, DomNodeId, ElementRef};
 use lightningcss::selector::Component;
@@ -97,7 +96,6 @@ struct Frame<'a> {
     child_position: i32,
     visited_children: i32,
     previous_child: Option<DomNodeId>,
-    filter: AncestorFilter,
     active_ancestor: bool,
     earlier_siblings: Option<Facts<'a>>,
     child_count: Option<i32>,
@@ -105,14 +103,13 @@ struct Frame<'a> {
 }
 
 impl<'a> Frame<'a> {
-    fn new(element: ElementRef<'a>, child_position: i32, filter: AncestorFilter) -> Self {
+    fn new(element: ElementRef<'a>, child_position: i32) -> Self {
         Self {
             element,
             next_child: 0,
             child_position,
             visited_children: 0,
             previous_child: None,
-            filter,
             active_ancestor: false,
             earlier_siblings: None,
             child_count: None,
@@ -138,13 +135,12 @@ impl<'a> StyleTraversal<'a> {
         }
     }
 
-    pub(crate) fn next(&mut self) -> Option<(ElementRef<'a>, AncestorFilter)> {
+    pub(crate) fn next(&mut self) -> Option<ElementRef<'a>> {
         if self.root_pending {
             self.root_pending = false;
             let root = self.document.element_ref(self.document.dom_root()?);
-            self.frames
-                .push(Frame::new(root, 1, AncestorFilter::default()));
-            return Some((root, AncestorFilter::default()));
+            self.frames.push(Frame::new(root, 1));
+            return Some(root);
         }
         while let Some(parent) = self.frames.last_mut() {
             // children() wraps a slice iterator, whose nth is constant-time.
@@ -155,22 +151,14 @@ impl<'a> StyleTraversal<'a> {
                 };
                 parent.visited_children += 1;
                 if !parent.active_ancestor {
-                    parent.filter.insert(parent.element.tag());
-                    if let Some(id) = parent.element.id() {
-                        parent.filter.insert(id);
-                    }
-                    for class in parent.element.classes() {
-                        parent.filter.insert(class);
-                    }
                     if let Some(facts) = self.ancestors.as_mut() {
                         facts.update(parent.element, true);
                     }
                     parent.active_ancestor = true;
                 }
-                let filter = parent.filter;
                 let position = parent.visited_children;
-                self.frames.push(Frame::new(child, position, filter));
-                return Some((child, filter));
+                self.frames.push(Frame::new(child, position));
+                return Some(child);
             }
             let finished = self.frames.pop().expect("current traversal frame");
             if finished.active_ancestor {

@@ -1,10 +1,10 @@
 //! Resolve reader paint independently of the computed typography tables.
 
-use crate::computed_style;
 use super::{
     ComputedStyles, ReaderStyleOverrides, StyleIndices, apply_reader_background,
     apply_reader_border, apply_reader_root_background,
 };
+use crate::computed_style;
 
 /// Paint values for one retained publication style. These contain no font,
 /// text-flow, box, or resource ownership and may change without invalidating
@@ -71,17 +71,36 @@ impl ComputedStyles {
 
 #[cfg(test)]
 mod tests {
-    use super::super::reintern_with_reader_overrides;
     use super::StylePaintColors;
     use crate::{
         Background, Border, BoxModel, ComputedStylesBuilder, DecorationColor, Font, InheritedText,
         LayoutStyle, ReaderStyleOverrides, ThemeAdaptation,
     };
-    use html_dom::Document;
+    use html_dom::{Document, DocumentBuilder, DomElementAttributeCache, DomElementData};
 
     #[test]
-    fn paint_values_match_full_style_reinterning_for_alpha_and_current_color() {
-        let document = Document::default();
+    fn paint_values_match_builder_overrides_for_alpha_and_current_color() {
+        let mut document = DocumentBuilder::new();
+        let mut nodes = Vec::new();
+        for tag in ["html", "div"] {
+            let tag = document.intern_string(tag);
+            nodes.push(
+                document
+                    .append_dom_element(
+                        nodes.first().copied(),
+                        DomElementData {
+                            tag,
+                            namespace: None,
+                            attributes: Vec::new(),
+                            attribute_cache: DomElementAttributeCache::new(None, 0..0),
+                            image_idx: None,
+                        },
+                    )
+                    .unwrap(),
+            );
+        }
+        document.set_dom_root(nodes[0]).unwrap();
+        let document = document.finish().unwrap();
         for authored in [0x123456ff, 0x12345680, 0x12345600] {
             for current_background in [false, true] {
                 let mut builder = ComputedStylesBuilder::new(&document);
@@ -110,6 +129,9 @@ mod tests {
                         LayoutStyle::default(),
                     )
                     .unwrap();
+                for &node in &nodes {
+                    builder.set_node_style(node, indices).unwrap();
+                }
                 let source = builder.finish().unwrap();
                 for theme in [
                     None,
@@ -127,16 +149,24 @@ mod tests {
                                 ..Default::default()
                             };
                             let mut builder = ComputedStylesBuilder::new(&document);
-                            let expected = reintern_with_reader_overrides(
-                                &source,
-                                &mut builder,
-                                indices,
-                                &overrides,
-                                root,
-                            )
-                            .unwrap();
+                            let expected = builder
+                                .push_with_layout(
+                                    source.font_style(indices).unwrap().clone(),
+                                    source.text_style(indices).unwrap().clone(),
+                                    source.box_model_style(indices).unwrap().clone(),
+                                    source.border_style(indices).unwrap().clone(),
+                                    source.background_style(indices).unwrap().clone(),
+                                    source.layout_style(indices).unwrap().clone(),
+                                )
+                                .unwrap();
+                            for &node in &nodes {
+                                builder.set_node_style(node, expected).unwrap();
+                            }
+                            builder.apply_reader_overrides(&document, &overrides);
                             let reference = builder.finish().unwrap();
-                            let style = reference.view(expected).unwrap();
+                            let style = reference
+                                .view(reference.style_for_node(nodes[usize::from(!root)]).unwrap())
+                                .unwrap();
                             let expected = StylePaintColors {
                                 foreground: style.color(),
                                 background: style.background_color(),

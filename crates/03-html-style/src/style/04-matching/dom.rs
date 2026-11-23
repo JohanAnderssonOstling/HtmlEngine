@@ -7,9 +7,7 @@ use crate::style::syntax::selectors::{
     PSEUDO_AFTER_MASK, PSEUDO_BEFORE_MASK, PSEUDO_FIRST_LETTER_MASK, PSEUDO_FIRST_LINE_MASK,
 };
 use html_dom::{Document, DomNodeId, ElementRef, NodeRef};
-use lightningcss::selector::{
-    Combinator, Component, Direction, PseudoClass, PseudoElement, Selector,
-};
+use lightningcss::selector::{Combinator, Component, Direction, PseudoClass, PseudoElement, Selector};
 use parcel_selectors::attr::{
     AttrSelectorOperator, CaseSensitivity, NamespaceConstraint, ParsedAttrSelectorOperation,
     ParsedCaseSensitivity,
@@ -20,7 +18,7 @@ use std::hash::{Hash, Hasher};
 
 /// Traversal facts shared by one style-resolution pass. Off-path searches
 /// retain lazy document-wide sibling links as an exact fallback.
-pub(crate) struct SiblingIndex<'context, 'a, 'css> {
+pub(crate) struct TraversalContext<'context, 'a, 'css> {
     document: &'a Document,
     traversal: &'context mut StyleTraversal<'a>,
     caches: &'context mut MatchCaches<'css>,
@@ -74,7 +72,7 @@ struct NthIndexKey {
     from_end: bool,
 }
 
-impl<'context, 'a, 'css> SiblingIndex<'context, 'a, 'css> {
+impl<'context, 'a, 'css> TraversalContext<'context, 'a, 'css> {
     pub(crate) fn new(
         document: &'a Document,
         traversal: &'context mut StyleTraversal<'a>,
@@ -136,20 +134,10 @@ impl<'context, 'a, 'css> SiblingIndex<'context, 'a, 'css> {
         from_end: bool,
         context: &mut MatchContext<'_, '_, '_, 'css>,
     ) -> i32 {
-        let document = context
-            .siblings
-            .as_deref()
-            .expect("matching caches")
-            .document;
+        let document = context.siblings.document;
         let key = NthIndexKey {
             node: element.node_id(),
-            filter: context
-                .siblings
-                .as_deref_mut()
-                .expect("matching caches")
-                .caches
-                .selector_ids
-                .intern(selectors),
+            filter: context.siblings.caches.selector_ids.intern(selectors),
             of_type,
             from_end,
             scope: if selectors.is_empty() {
@@ -163,14 +151,7 @@ impl<'context, 'a, 'css> SiblingIndex<'context, 'a, 'css> {
                 context.exclusive_ancestor_floor
             },
         };
-        if let Some(&index) = context
-            .siblings
-            .as_deref_mut()
-            .expect("matching caches")
-            .caches
-            .nth_indices
-            .get(&key)
-        {
+        if let Some(&index) = context.siblings.caches.nth_indices.get(&key) {
             return index;
         }
         let mut matches_filter = |element: ElementRef<'_>| {
@@ -222,13 +203,7 @@ impl<'context, 'a, 'css> SiblingIndex<'context, 'a, 'css> {
                 index,
             ));
         }
-        context
-            .siblings
-            .as_deref_mut()
-            .expect("matching caches")
-            .caches
-            .nth_indices
-            .extend(entries);
+        context.siblings.caches.nth_indices.extend(entries);
         result
     }
 
@@ -340,12 +315,19 @@ pub fn selector_matches_dom_node<'css>(
     doc: &Document,
     node_idx: DomNodeId,
 ) -> bool {
+    let mut traversal = StyleTraversal::new(doc);
+    let mut caches = MatchCaches::default();
+    let mut siblings = TraversalContext::new(doc, &mut traversal, &mut caches);
     match_from_position_dom(
         selector.iter_raw_match_order().as_slice(),
         doc,
         node_idx,
         None,
-        &mut MatchContext::default(),
+        &mut MatchContext {
+            scope: None,
+            exclusive_ancestor_floor: None,
+            siblings: &mut siblings,
+        },
     ) == MatchResult::Matched
 }
 
@@ -354,19 +336,9 @@ pub(crate) fn selector_matches_dom_node_in_scope<'css>(
     doc: &Document,
     node_idx: DomNodeId,
     scope: DomNodeId,
-    siblings: &mut SiblingIndex<'_, '_, 'css>,
+    siblings: &mut TraversalContext<'_, '_, 'css>,
 ) -> bool {
-    match_from_position_dom(
-        selector.iter_raw_match_order().as_slice(),
-        doc,
-        node_idx,
-        None,
-        &mut MatchContext {
-            scope: Some(scope),
-            exclusive_ancestor_floor: None,
-            siblings: Some(siblings),
-        },
-    ) == MatchResult::Matched
+    selector_matches_indexed_in_scope(selector, doc, node_idx, None, scope, siblings, u16::MAX)
 }
 
 /// Only candidate-index callers may supply a proved subject predicate.
@@ -377,7 +349,7 @@ pub(crate) fn selector_matches_indexed_in_scope<'css>(
     node_idx: DomNodeId,
     pseudo: Option<PseudoTarget>,
     scope: DomNodeId,
-    siblings: &mut SiblingIndex<'_, '_, 'css>,
+    siblings: &mut TraversalContext<'_, '_, 'css>,
     bucket_component: u16,
 ) -> bool {
     match_from_position_dom_skipping(
@@ -388,13 +360,12 @@ pub(crate) fn selector_matches_indexed_in_scope<'css>(
         &mut MatchContext {
             scope: Some(scope),
             exclusive_ancestor_floor: None,
-            siblings: Some(siblings),
+            siblings,
         },
         (bucket_component != u16::MAX).then_some(usize::from(bucket_component)),
     ) == MatchResult::Matched
 }
 
-#[derive(Default)]
 struct MatchContext<'context, 'cache, 'dom, 'css> {
     /// The element represented by `:scope`. Outside relative selector
     /// matching, `:scope` defaults to the document element.
@@ -403,19 +374,7 @@ struct MatchContext<'context, 'cache, 'dom, 'css> {
     /// Ancestor combinators must not escape that subtree or match the anchor
     /// itself (the omitted leading combinator is `:scope `).
     exclusive_ancestor_floor: Option<DomNodeId>,
-    siblings: Option<&'context mut SiblingIndex<'cache, 'dom, 'css>>,
-}
-
-impl MatchContext<'_, '_, '_, '_> {
-    fn previous_element_sibling(&mut self, doc: &Document, node: DomNodeId) -> Option<DomNodeId> {
-        if let Some(siblings) = self.siblings.as_deref_mut() {
-            siblings.previous_element_sibling(node)
-        } else {
-            doc.try_element_ref(node)?
-                .previous_element_sibling()
-                .map(|element| element.node_id())
-        }
-    }
+    siblings: &'context mut TraversalContext<'cache, 'dom, 'css>,
 }
 
 /// Failure describes the nearest combinator at which retrying may succeed.
@@ -520,10 +479,7 @@ fn match_from_position_dom_skipping<'css>(
         Combinator::Descendant => {
             if context.exclusive_ancestor_floor.is_none()
                 && let Some(test) = SummaryTest::from_components(remaining)
-                && let Some(matched) = context
-                    .siblings
-                    .as_deref_mut()
-                    .and_then(|state| state.ancestor_matches(node_idx, test))
+                && let Some(matched) = context.siblings.ancestor_matches(node_idx, test)
             {
                 return if matched {
                     MatchResult::Matched
@@ -543,17 +499,14 @@ fn match_from_position_dom_skipping<'css>(
             MatchResult::Failed
         }
         Combinator::NextSibling => {
-            let Some(sibling) = context.previous_element_sibling(doc, node_idx) else {
+            let Some(sibling) = context.siblings.previous_element_sibling(node_idx) else {
                 return MatchResult::RetryAncestor;
             };
             match_from_position_dom(remaining, doc, sibling, pseudo, context)
         }
         Combinator::LaterSibling => {
             if let Some(test) = SummaryTest::from_components(remaining)
-                && let Some(matched) = context
-                    .siblings
-                    .as_deref_mut()
-                    .and_then(|state| state.earlier_sibling_matches(node_idx, test))
+                && let Some(matched) = context.siblings.earlier_sibling_matches(node_idx, test)
             {
                 return if matched {
                     MatchResult::Matched
@@ -561,13 +514,13 @@ fn match_from_position_dom_skipping<'css>(
                     MatchResult::RetryAncestor
                 };
             }
-            let mut current = context.previous_element_sibling(doc, node_idx);
+            let mut current = context.siblings.previous_element_sibling(node_idx);
             while let Some(sibling) = current {
                 match match_from_position_dom(remaining, doc, sibling, pseudo, context) {
                     MatchResult::RetrySibling => {}
                     result => return result,
                 }
-                current = context.previous_element_sibling(doc, sibling);
+                current = context.siblings.previous_element_sibling(sibling);
             }
             MatchResult::RetryAncestor
         }
@@ -600,8 +553,9 @@ fn component_matches_dom<'css>(
 ) -> bool {
     if let Some(matched) = context
         .siblings
-        .as_deref_mut()
-        .and_then(|state| state.caches.names.matches(component, doc, element))
+        .caches
+        .names
+        .matches(component, doc, element)
     {
         return matched;
     }
@@ -718,7 +672,7 @@ fn component_matches_complex_dom<'css>(
         }
 
         Component::NonTSPseudoClass(pseudo) => {
-            pseudo_matches_dom(pseudo, doc, element, context.siblings.as_deref_mut())
+            pseudo_matches_dom(pseudo, doc, element, &mut *context.siblings)
         }
         Component::PseudoElement(PseudoElement::Before) => pseudo == Some(PseudoTarget::Before),
         Component::PseudoElement(PseudoElement::After) => pseudo == Some(PseudoTarget::After),
@@ -734,9 +688,9 @@ fn component_matches_complex_dom<'css>(
         Component::Scope => context.scope.or_else(|| doc.dom_root()) == Some(node_idx),
         // Selectors L3 `:empty`: no children at all (text nodes count as content).
         Component::Empty => element.children().next().is_none(),
-        Component::Nth(nth) => nth_matches_dom(nth, doc, element, context),
+        Component::Nth(nth) => nth_matches_dom(nth, element, context),
         Component::NthOf(nth) => {
-            nth_of_matches_dom(nth.nth_data(), nth.selectors(), doc, element, context)
+            nth_of_matches_dom(nth.nth_data(), nth.selectors(), element, context)
         }
 
         // Forgiving (`:is()`) and non-specificity (`:where()`) matching: the
@@ -784,27 +738,19 @@ fn relative_selector_matches_dom_node<'css>(
     anchor: DomNodeId,
     context: &mut MatchContext<'_, '_, '_, 'css>,
 ) -> bool {
-    let key = context.siblings.as_deref_mut().map(|state| {
-        (
-            anchor,
-            state
-                .caches
-                .selector_ids
-                .intern(std::slice::from_ref(selector)),
-        )
-    });
-    if let Some(state) = context.siblings.as_deref_mut()
-        && let Some(&matched) = state.caches.has_results.get(&key.expect("matching caches"))
-    {
+    let key = (
+        anchor,
+        context
+            .siblings
+            .caches
+            .selector_ids
+            .intern(std::slice::from_ref(selector)),
+    );
+    if let Some(&matched) = context.siblings.caches.has_results.get(&key) {
         return matched;
     }
     let matched = match_relative_selector_uncached(selector, doc, anchor, context);
-    if let Some(state) = context.siblings.as_deref_mut() {
-        state
-            .caches
-            .has_results
-            .insert(key.expect("matching caches"), matched);
-    }
+    context.siblings.caches.has_results.insert(key, matched);
     matched
 }
 
@@ -821,7 +767,7 @@ fn match_relative_selector_uncached<'css>(
     let context = &mut MatchContext {
         scope: Some(anchor),
         exclusive_ancestor_floor: (!explicitly_anchored).then_some(anchor),
-        siblings: context.siblings.as_deref_mut(),
+        siblings: &mut *context.siblings,
     };
     let (relation, single_relation, candidate_components) = match components {
         [rest @ .., Component::Combinator(relation), Component::Scope] => {
@@ -854,8 +800,7 @@ fn match_relative_selector_uncached<'css>(
     };
     let following_siblings = matches!(relation, Combinator::NextSibling | Combinator::LaterSibling);
     if !following_siblings
-        && let Some(state) = context.siblings.as_deref_mut()
-        && state.reject_relative_subtree(
+        && context.siblings.reject_relative_subtree(
             candidate_components,
             anchor,
             relation == Combinator::Child && single_relation,
@@ -880,11 +825,7 @@ fn match_relative_selector_uncached<'css>(
     // Chained sibling selectors may end in a following sibling's subtree.
     let descend = relation == Combinator::Descendant || !single_relation;
     let adjacent_only = relation == Combinator::NextSibling && single_relation;
-    let mut pending = context
-        .siblings
-        .as_deref_mut()
-        .map(|state| std::mem::take(&mut state.caches.search_scratch))
-        .unwrap_or_default();
+    let mut pending = std::mem::take(&mut context.siblings.caches.search_scratch);
     let mut matches_candidate = |candidate| {
         match_from_position_dom(candidate_components, doc, candidate, None, context)
             == MatchResult::Matched
@@ -918,10 +859,8 @@ fn match_relative_selector_uncached<'css>(
     };
     let matched = search(&mut pending);
     pending.clear();
-    if let Some(state) = context.siblings.as_deref_mut()
-        && pending.capacity() > state.caches.search_scratch.capacity()
-    {
-        state.caches.search_scratch = pending;
+    if pending.capacity() > context.siblings.caches.search_scratch.capacity() {
+        context.siblings.caches.search_scratch = pending;
     }
     matched
 }
@@ -1501,7 +1440,6 @@ mod tests {
 /// `:nth-*` selectors (all are `Component::Nth` with an `an+b` formula).
 fn nth_matches_dom<'css>(
     nth: &NthSelectorData,
-    doc: &Document,
     element: ElementRef<'_>,
     context: &mut MatchContext<'_, '_, '_, 'css>,
 ) -> bool {
@@ -1509,66 +1447,25 @@ fn nth_matches_dom<'css>(
         return false;
     }
     if !nth.ty.is_of_type()
-        && let Some(matched) = context
-            .siblings
-            .as_deref_mut()
-            .and_then(|state| state.matches_nth_child(nth, element.node_id()))
+        && let Some(matched) = context.siblings.matches_nth_child(nth, element.node_id())
     {
         return matched;
     }
-    if context.siblings.is_some() {
-        let from_end = nth.ty.is_from_end();
-        let index = SiblingIndex::nth_index(element, &[], nth.ty.is_of_type(), from_end, context);
-        return index > 0
-            && if nth.ty.is_only() {
-                index == 1
-                    && SiblingIndex::nth_index(
-                        element,
-                        &[],
-                        nth.ty.is_of_type(),
-                        !from_end,
-                        context,
-                    ) == 1
-            } else {
-                nth_index_matches(nth.a, nth.b, index)
-            };
-    }
-    let only = nth.ty.is_only();
-    let Some(parent) = element.parent().map(|parent| doc.element_ref(parent)) else {
-        // The root element is its parent's only element child.
-        return only || nth_index_matches(nth.a, nth.b, 1);
-    };
-    let of_type = matches!(
-        nth.ty,
-        NthType::OfType | NthType::LastOfType | NthType::OnlyOfType
-    );
-    let from_end = matches!(nth.ty, NthType::LastChild | NthType::LastOfType);
-    let tag = element.tag();
-    let mut children = parent.children();
-    let mut position = 0;
-    let mut found = false;
-    // Count from the end requested by the selector and stop at the subject.
-    // Only-child checks instead stop as soon as a second eligible child exists.
-    while let Some(child) = if from_end {
-        children.next_back()
-    } else {
-        children.next()
-    } {
-        if !sibling_counts(doc, child, of_type, tag, element.namespace()) {
-            continue;
+    let from_end = nth.ty.is_from_end();
+    let index = TraversalContext::nth_index(element, &[], nth.ty.is_of_type(), from_end, context);
+    index > 0
+        && if nth.ty.is_only() {
+            index == 1
+                && TraversalContext::nth_index(
+                    element,
+                    &[],
+                    nth.ty.is_of_type(),
+                    !from_end,
+                    context,
+                ) == 1
+        } else {
+            nth_index_matches(nth.a, nth.b, index)
         }
-        position += 1;
-        if only && position > 1 {
-            return false;
-        }
-        if child == element.node_id() {
-            if !only {
-                return nth_index_matches(nth.a, nth.b, position);
-            }
-            found = true;
-        }
-    }
-    only && found && position == 1
 }
 
 /// Selectors 4 `:nth-child(An+B of S)` counts the subject only among element
@@ -1576,53 +1473,12 @@ fn nth_matches_dom<'css>(
 fn nth_of_matches_dom<'css>(
     nth: &NthSelectorData,
     selectors: &[Selector<'css>],
-    doc: &Document,
     element: ElementRef<'_>,
     context: &mut MatchContext<'_, '_, '_, 'css>,
 ) -> bool {
-    if context.siblings.is_some() {
-        let index =
-            SiblingIndex::nth_index(element, selectors, false, nth.ty.is_from_end(), context);
-        return index > 0 && nth_index_matches(nth.a, nth.b, index);
-    }
-    let mut matches_filter = |node| {
-        selectors
-            .iter()
-            .any(|selector| selector_matches_dom_node_with_context(selector, doc, node, context))
-    };
-    let Some(parent) = element.parent().map(|parent| doc.element_ref(parent)) else {
-        return matches_filter(element.node_id()) && nth_index_matches(nth.a, nth.b, 1);
-    };
-    let from_end = nth.ty == NthType::LastChild;
-    let mut children = parent.children();
-    let mut position = 0;
-    while let Some(child) = if from_end {
-        children.next_back()
-    } else {
-        children.next()
-    } {
-        let matches = doc.try_element_ref(child).is_some() && matches_filter(child);
-        if matches {
-            position += 1;
-        }
-        if child == element.node_id() {
-            return matches && nth_index_matches(nth.a, nth.b, position);
-        }
-    }
-    false
-}
-
-fn sibling_counts(
-    doc: &Document,
-    child_idx: DomNodeId,
-    of_type: bool,
-    tag: &str,
-    namespace: Option<&str>,
-) -> bool {
-    match doc.try_element_ref(child_idx) {
-        Some(child) => !of_type || (child.tag() == tag && child.namespace() == namespace),
-        None => false,
-    }
+    let index =
+        TraversalContext::nth_index(element, selectors, false, nth.ty.is_from_end(), context);
+    index > 0 && nth_index_matches(nth.a, nth.b, index)
 }
 
 /// True if the 1-based `index` is in the set `{ a*k + b | integer k >= 0 }`.
@@ -1756,14 +1612,14 @@ pub(super) fn pseudo_matches_dom(
     pseudo: &PseudoClass,
     doc: &Document,
     element: html_dom::ElementRef<'_>,
-    siblings: Option<&mut SiblingIndex<'_, '_, '_>>,
+    siblings: &mut TraversalContext<'_, '_, '_>,
 ) -> bool {
     let state = element.html_state();
     match pseudo {
         PseudoClass::Link | PseudoClass::AnyLink(_) => state.is_link(),
         PseudoClass::Visited => false, // Don't match visited for privacy
         PseudoClass::Lang { languages } => siblings
-            .and_then(|state| state.effective_language(element.node_id()))
+            .effective_language(element.node_id())
             .unwrap_or_else(|| effective_language(doc, element))
             .is_some_and(|language| {
                 languages

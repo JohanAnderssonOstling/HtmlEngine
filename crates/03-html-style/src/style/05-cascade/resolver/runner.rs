@@ -7,20 +7,16 @@ use super::custom_properties::{
 };
 use super::properties;
 use super::specified::{
-    CascadeComputation, DeclarationEvent, ElementDeclarations, select_specified_values,
+    CascadeComputation, DeclarationEvent, DeclarationView, ElementDeclarations,
+    select_specified_values,
 };
 use super::state::{ParentStyle, WorkingStyle};
-use super::traversal::root_font_size_for_resolution;
-use super::values::rebind_line_height;
 use super::wide_keywords::apply_css_wide_keyword_in_phase;
-use crate::style::cascade::resolver::prepared_native::{PreparedNativeValue, prepare_declaration};
+use crate::style::cascade::resolver::prepared_native::PreparedDeclarationValues;
 use crate::style::compiled::DeclarationId;
 use crate::style::property_catalogue::PropertyKey;
-use crate::style::syntax::capabilities::declaration_is_renderer_eligible;
-use crate::style::syntax::prepared_renderer::PreparedRendererValue;
 use crate::style::syntax::property_id::RendererPropertyId;
 use crate::style::syntax::substitution::needs_substitution;
-use crate::style::syntax::targets::expand_declaration;
 use crate::style::syntax::wide_keywords::{CssWideKeyword, property_css_wide_keyword};
 use html_dom::Document;
 use html_style_model::{ComputedStylesBuilder, ReaderStyleOverrides};
@@ -68,14 +64,9 @@ impl<'css> SubstitutionCache<'css> {
         let mut entry = ResolvedDeclaration::default();
         // Keep failures too: substituted-invalid declarations must still use
         // the existing unset behavior. Computed conversion stays per element.
-        let valid = resolve_declaration(
-            property,
-            custom_properties,
-            &mut entry,
-            substitution_tokens,
-            false,
-        )
-        .is_ok();
+        let valid =
+            resolve_declaration(property, custom_properties, &mut entry, substitution_tokens)
+                .is_ok();
         entry.set_valid(valid);
         let index = self.entries.len();
         self.entries.push(entry);
@@ -119,28 +110,13 @@ impl<'a> CascadeResolver<'a> {
         style.font_mut(self.styles).font_size_root_ch = 0.0;
         style.font_mut(self.styles).font_size_root_cap_height = 0.0;
         style.font_mut(self.styles).font_size_root_line_height = 0.0;
-        rebind_line_height(
-            style,
-            self.styles,
-            || root_font_size_for_resolution(self.doc, self.styles),
-            self.resolution,
-        );
-        if style.line_height_spec.is_none() && style.text(self.styles).line_height_number != 0.0 {
-            // Keep the reader override's finite cap for inherited unitless values.
-            style.text_mut(self.styles).line_height = (f64::from(minimum)
-                * f64::from(style.text(self.styles).line_height_number))
-            .min(f64::from(f32::MAX)) as f32;
-        }
     }
 
     fn apply_selected_declaration<'css>(
         &mut self,
         style: &mut WorkingStyle,
-        property: &Property<'css>,
+        prepared: DeclarationView<'_, 'css>,
         resolved: &ResolvedDeclaration<'css>,
-        prepared_longhands: Option<&[Property<'css>]>,
-        prepared_renderer: Option<&PreparedRendererValue>,
-        prepared_native: &[Option<PreparedNativeValue>],
         targets: &[PropertyKey],
         phase: CascadePhase,
         parent: &ParentStyle,
@@ -157,19 +133,15 @@ impl<'a> CascadeResolver<'a> {
                 self.doc,
                 self.styles,
                 style,
-                property,
-                resolved,
-                prepared_longhands,
+                if resolved.owns_value() {
+                    &resolved.values
+                } else {
+                    prepared.values
+                },
+                targets,
                 parent,
                 self.resolution,
-                resolved.renderer_value.as_deref().or(prepared_renderer),
-                targets,
                 phase,
-                if resolved.owns_value() {
-                    &resolved.native_values
-                } else {
-                    prepared_native
-                },
             );
         }
         // Invalid substitution or unavailable environment inputs mean unset.
@@ -214,8 +186,9 @@ impl<'a> CascadeResolver<'a> {
         valid_events.clear();
         valid_events.reserve(events.len());
         for event in events.iter().copied() {
-            if event.prepared_renderer_eligibility(element) {
-                if event.requires_viewport_height(element)
+            let prepared = event.view(element);
+            if prepared.eligible {
+                if prepared.requires_viewport_height
                     && self.resolution.environment.viewport_height().is_none()
                 {
                     self.resolution.uses_viewport_units = true;
@@ -236,18 +209,14 @@ impl<'a> CascadeResolver<'a> {
                     .iter()
                     .any(|&target| target == PropertyKey::All || target.phase() == phase)
                 {
-                    if phase == CascadePhase::Prerequisites {
-                        self.enforce_reader_minimum(style);
-                    }
                     continue;
                 }
                 let event = valid_events[declaration.sequence];
-                let property = event.property(element);
-                let prepared_longhands = event.prepared_longhands(element);
-                let cached = match (cache_substitutions, event.rule_property(element)) {
-                    (true, Some((id, property))) => substitution_cache.resolve(
+                let prepared = event.view(element);
+                let cached = match (cache_substitutions, event.rule_id(element)) {
+                    (true, Some(id)) => substitution_cache.resolve(
                         id,
-                        property,
+                        prepared.property,
                         custom_properties,
                         substitution_tokens,
                     ),
@@ -265,11 +234,10 @@ impl<'a> CascadeResolver<'a> {
                         }
                         let entry = &mut resolved[*slot];
                         let valid = resolve_declaration(
-                            property,
+                            prepared.property,
                             custom_properties,
                             entry,
                             substitution_tokens,
-                            prepared_longhands.is_some(),
                         )
                         .is_ok();
                         entry.set_valid(valid);
@@ -278,18 +246,12 @@ impl<'a> CascadeResolver<'a> {
                 };
                 self.apply_selected_declaration(
                     style,
-                    property,
+                    prepared,
                     resolved_entry,
-                    prepared_longhands,
-                    event.renderer_value(element),
-                    event.native_values(element),
                     targets,
                     phase,
                     parent,
                 );
-                if phase == CascadePhase::Prerequisites {
-                    self.enforce_reader_minimum(style);
-                }
             }
             if phase == CascadePhase::Prerequisites {
                 self.enforce_reader_minimum(style);
@@ -310,32 +272,27 @@ fn resolve_declaration<'vars, 'css>(
     custom_properties: &'vars CustomProperties<'vars, 'css>,
     resolved: &mut ResolvedDeclaration<'css>,
     substitution_tokens: &mut Vec<TokenOrValue<'css>>,
-    expansion_prepared: bool,
 ) -> Result<(), ()> {
     resolved.reset();
     let substitute =
         |tokens: &mut TokenList<'css>| substitute_property_tokens(tokens, custom_properties);
     let owned = match property {
-        Property::Unparsed(value) if needs_substitution(&value.value) => {
-            resolved.set_substituted(true);
-            Some(
-                resolve_single_var_property(value, custom_properties)
-                    .or_else(|| {
-                        let mut tokens = TokenList(std::mem::take(substitution_tokens));
-                        tokens.0.clone_from(&value.value.0);
-                        let result = substitute(&mut tokens)
-                            .then(|| parse_property_tokens(&value.property_id, &tokens))
-                            .flatten();
-                        *substitution_tokens = tokens.0;
-                        result
-                    })
-                    .ok_or(())?,
-            )
-        }
+        Property::Unparsed(value) if needs_substitution(&value.value) => Some(
+            resolve_single_var_property(value, custom_properties)
+                .or_else(|| {
+                    let mut tokens = TokenList(std::mem::take(substitution_tokens));
+                    tokens.0.clone_from(&value.value.0);
+                    let result = substitute(&mut tokens)
+                        .then(|| parse_property_tokens(&value.property_id, &tokens))
+                        .flatten();
+                    *substitution_tokens = tokens.0;
+                    result
+                })
+                .ok_or(())?,
+        ),
         Property::Custom(value)
             if !value.name.as_ref().starts_with("--") && needs_substitution(&value.value) =>
         {
-            resolved.set_substituted(true);
             let mut value = value.clone();
             if !substitute(&mut value.value) {
                 return Err(());
@@ -349,9 +306,9 @@ fn resolve_declaration<'vars, 'css>(
     }
     resolved.set_keyword(property_css_wide_keyword(resolved.property(property)));
     let value = resolved.property(property);
-    if resolved.substituted()
+    if resolved.owns_value()
         && resolved.keyword().is_none()
-        && (matches!(value, Property::Unparsed(_)) || !declaration_is_renderer_eligible(value))
+        && matches!(value, Property::Unparsed(_))
     {
         return Err(());
     }
@@ -369,36 +326,11 @@ fn resolve_declaration<'vars, 'css>(
     } else {
         property
     };
-    if resolved.owns_value()
-        && let Some((id, tokens)) = RendererPropertyId::raw(value)
-    {
-        resolved.renderer_value = Some(Box::new(
-            PreparedRendererValue::parse(id, tokens).ok_or(())?,
-        ));
-    }
-    if !expansion_prepared {
-        let expanded = expand_declaration(value, &mut resolved.longhands)?;
-        resolved.set_expanded(expanded);
-    }
     if resolved.owns_value() {
-        let native = prepare_declaration(
-            resolved
-                .expanded()
-                .then_some(resolved.longhands.as_slice())
-                .unwrap_or(std::slice::from_ref(resolved.property(property))),
-        )?;
-        resolved.native_values = native;
-    }
-    if resolved.owns_value() {
-        resolved.requires_viewport_height = resolved
-            .native_values
-            .iter()
-            .flatten()
-            .any(PreparedNativeValue::requires_viewport_height)
-            || resolved
-                .renderer_value
-                .as_deref()
-                .is_some_and(PreparedRendererValue::requires_viewport_height);
+        let prepared =
+            PreparedDeclarationValues::prepare(value, &mut resolved.longhands).map_err(|_| ())?;
+        resolved.requires_viewport_height = prepared.requires_viewport_height();
+        resolved.values = prepared.values;
     }
     Ok(())
 }

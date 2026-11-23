@@ -1,14 +1,14 @@
 //! Intrinsic item dimensions and flex automatic minimum sizing.
 
 use super::length_dimension;
-use super::style::{dimension, effective_align_self, layout_style};
-use crate::layout::{
-    BoxLayoutRequest, LayoutEngine, ReplacedMainAxis, ReplacedSizeInput,
-    box_content_intrinsic_widths, measure_box_isolated, preferred_aspect_ratio,
-    resolve_definite_content_size, resolve_replaced_flex_auto_min_main_size};
-use html_style_model::{
-    BoxSizing, FlexWrap, ItemAlignment, OverflowMode, UsedPreferredSize as PreferredSize,
+use super::sizing::{ContainerFacts, SizingPass, border_to_specified, content_to_specified};
+use super::style::dimension;
+use crate::measurement::{box_content_intrinsic_widths, measure_box_isolated};
+use crate::{
+    BoxLayoutRequest, LayoutEngine, ReplacedMainAxis, ReplacedSizeInput, preferred_aspect_ratio,
+    resolve_definite_content_size, resolve_replaced_flex_auto_min_main_size,
 };
+use html_style_model::{BoxSizing, FlexWrap, UsedPreferredSize as PreferredSize};
 use taffy::prelude::Dimension;
 
 /// Taffy represents `flex-basis` as only auto, length, or percentage. CSS
@@ -19,32 +19,26 @@ pub(super) fn resolve_intrinsic_flex_basis(
     box_idx: usize,
     containing_width: f64,
     containing_height: Option<f64>,
-    horizontal_main_axis: bool,
+    container: ContainerFacts,
 ) -> Option<Dimension> {
-    let style = engine.reader.style(box_idx);
-    let sizes = engine.reader.sizes(box_idx);
+    let style = engine.read.reader.style(box_idx);
+    let sizes = engine.read.reader.sizes(box_idx);
     let mut basis = sizes.flex_basis;
     if matches!(basis, PreferredSize::Stretch) {
-        let available = if horizontal_main_axis {
+        let available = if container.flex_row() {
             Some(containing_width)
         } else {
             containing_height
         };
         if let Some(available) = available {
             let model = engine
+                .read
                 .reader
                 .box_model(box_idx, containing_width)
                 .with_nonnegative_padding();
-            let (margin, inset) = if horizontal_main_axis {
-                (model.horizontal_margin(), model.horizontal_padding_border())
-            } else {
-                (model.vertical_margin(), model.vertical_padding_border())
-            };
-            let border_box = (available - margin).max(inset);
-            let value = match style.box_sizing() {
-                BoxSizing::ContentBox => border_box - inset,
-                BoxSizing::BorderBox => border_box,
-            };
+            let value = container
+                .main_axis
+                .stretch(Some(available), model, style.box_sizing())?;
             return Some(length_dimension(value));
         }
         // An indefinite stretch basis resolves to content rather than using
@@ -57,31 +51,21 @@ pub(super) fn resolve_intrinsic_flex_basis(
             box_idx,
             containing_width,
             containing_height,
-            horizontal_main_axis,
+            container,
         ) {
             return Some(value);
         }
+        basis = PreferredSize::MaxContent;
     }
-    if !matches!(
-        basis,
-        PreferredSize::Content
-            | PreferredSize::MinContent
-            | PreferredSize::MaxContent
-            | PreferredSize::FitContent
-    ) {
+    if !basis.is_intrinsic_keyword() {
         return None;
     }
-    if horizontal_main_axis {
+    if container.flex_row() {
         return Some(taffy_item_width_dimension(
             engine,
             box_idx,
-            if matches!(basis, PreferredSize::Content) {
-                PreferredSize::MaxContent
-            } else {
-                basis
-            },
-            containing_width,
-            false,
+            basis,
+            SizingPass::Final(containing_width),
         ));
     }
 
@@ -94,14 +78,12 @@ pub(super) fn resolve_intrinsic_flex_basis(
     )
     .size_with_floats();
     let model = engine
+        .read
         .reader
         .box_model(box_idx, containing_width)
         .with_nonnegative_padding();
     let vertical_inset = model.vertical_padding_border();
-    let basis = match style.box_sizing() {
-        BoxSizing::ContentBox => (measured.height - vertical_inset).max(0.0),
-        BoxSizing::BorderBox => measured.height.max(vertical_inset),
-    };
+    let basis = border_to_specified(measured.height, vertical_inset, style.box_sizing());
     Some(length_dimension(basis))
 }
 
@@ -110,95 +92,61 @@ fn content_ratio_basis(
     box_idx: usize,
     containing_width: f64,
     containing_height: Option<f64>,
-    horizontal_main_axis: bool,
+    container: ContainerFacts,
 ) -> Option<Dimension> {
-    let style = engine.reader.style(box_idx);
-    let sizes = engine.reader.sizes(box_idx);
+    let style = engine.read.reader.style(box_idx);
+    let sizes = engine.read.reader.sizes(box_idx);
     let intrinsic_ratio = engine
+        .read
         .reader
         .image_intrinsic(box_idx)
         .and_then(|image| image.aspect_ratio);
     let authored = style.aspect_ratio();
     let ratio = preferred_aspect_ratio(authored, intrinsic_ratio)?;
     let model = engine
+        .read
         .reader
         .box_model(box_idx, containing_width)
         .with_nonnegative_padding();
-    let horizontal_inset = model.horizontal_padding_border();
-    let vertical_inset = model.vertical_padding_border();
-    let layout = layout_style(engine, box_idx);
-    let (
-        cross_size,
-        cross_min,
-        cross_max,
-        cross_basis,
-        cross_margin,
-        cross_inset,
-        main_inset,
-        auto_margins,
-    ) = if horizontal_main_axis {
-        (
-            sizes.height,
-            sizes.min_height,
-            sizes.max_height,
-            containing_height,
-            model.vertical_margin(),
-            vertical_inset,
-            horizontal_inset,
-            layout.margin_top_auto || layout.margin_bottom_auto,
-        )
-    } else {
-        (
-            sizes.width,
-            sizes.min_width,
-            sizes.max_width,
-            Some(containing_width),
-            model.horizontal_margin(),
-            horizontal_inset,
-            vertical_inset,
-            layout.margin_left_auto || layout.margin_right_auto,
-        )
-    };
+    let layout = engine.read.reader.layout_style(box_idx);
+    let cross_axis = container.main_axis.cross();
+    let cross_size = cross_axis.select(sizes.width, sizes.height);
+    let cross_basis = cross_axis.select(Some(containing_width), containing_height);
+    let cross_inset = cross_axis.inset(model);
+    let main_inset = container.main_axis.inset(model);
     let resolve = |size| {
         resolve_definite_content_size(
             size,
             cross_basis,
-            cross_margin,
+            cross_axis.margin(model),
             cross_inset,
             style.box_sizing(),
         )
     };
     let mut cross = resolve(cross_size).or_else(|| {
-        if !matches!(cross_size, PreferredSize::Auto) || auto_margins {
-            return None;
-        }
-        let parent = layout_style(engine, engine.reader.get_parent(box_idx)?);
-        let align = effective_align_self(engine, box_idx);
-        (parent.flex_wrap == FlexWrap::NoWrap
-            && matches!(align, ItemAlignment::Normal | ItemAlignment::Stretch))
+        (matches!(cross_size, PreferredSize::Auto)
+            && container.wrap == FlexWrap::NoWrap
+            && container.cross_axis_stretches(layout))
         .then(|| resolve(PreferredSize::Stretch))
         .flatten()
     })?;
-    let minimum = resolve(cross_min).unwrap_or(0.0);
-    let maximum = resolve(cross_max).unwrap_or(f64::INFINITY).max(minimum);
+    let minimum = resolve(cross_axis.select(sizes.min_width, sizes.min_height)).unwrap_or(0.0);
+    let maximum = resolve(cross_axis.select(sizes.max_width, sizes.max_height))
+        .unwrap_or(f64::INFINITY)
+        .max(minimum);
     cross = cross.clamp(minimum, maximum);
     // Intrinsic image ratios refer to the content box; an authored ratio
     // follows box-sizing, including border-box ratios on ordinary elements.
     let border_ratio = style.box_sizing() == BoxSizing::BorderBox
         && !(authored.uses_intrinsic() && intrinsic_ratio.is_some());
     let cross = cross + if border_ratio { cross_inset } else { 0.0 };
-    let main = if horizontal_main_axis {
+    let main = if container.flex_row() {
         cross * ratio
     } else {
         cross / ratio
     };
     let content = (main - if border_ratio { main_inset } else { 0.0 }).max(0.0);
-    let basis = content
-        + if style.box_sizing() == BoxSizing::BorderBox {
-            main_inset
-        } else {
-            0.0
-        };
+    let basis = content_to_specified(content, main_inset, style.box_sizing());
     Some(length_dimension(basis))
 }
 
@@ -212,16 +160,14 @@ pub(super) fn flex_automatic_min_content_width(
     box_idx: usize,
     containing_width: f64,
 ) -> f64 {
-    let style = engine.reader.style(box_idx);
-    let sizes = engine.reader.sizes(box_idx);
-    if matches!(
-        style.overflow_x(),
-        OverflowMode::Hidden | OverflowMode::Scroll | OverflowMode::Auto
-    ) {
+    let style = engine.read.reader.style(box_idx);
+    let sizes = engine.read.reader.sizes(box_idx);
+    if style.overflow_x().is_scrollable() {
         return 0.0;
     }
 
     let model = engine
+        .read
         .reader
         .box_model(box_idx, containing_width)
         .with_nonnegative_padding();
@@ -263,26 +209,24 @@ pub(super) fn flex_replaced_automatic_minimum(
     box_idx: usize,
     containing_width: f64,
     containing_height: Option<f64>,
-    horizontal_main_axis: bool,
+    container: ContainerFacts,
 ) -> Option<f64> {
-    let image_intrinsic = engine.reader.image_intrinsic(box_idx)?;
+    let image_intrinsic = engine.read.reader.image_intrinsic(box_idx)?;
     let intrinsic = image_intrinsic.size;
-    let style = engine.reader.style(box_idx);
-    let sizes = engine.reader.sizes(box_idx);
+    let style = engine.read.reader.style(box_idx);
+    let sizes = engine.read.reader.sizes(box_idx);
     let model = engine
+        .read
         .reader
         .box_model(box_idx, containing_width)
         .with_nonnegative_padding();
-    let layout = layout_style(engine, box_idx);
-    let scrollable_main = if horizontal_main_axis {
+    let layout = engine.read.reader.layout_style(box_idx);
+    let scrollable_main = if container.flex_row() {
         style.overflow_x()
     } else {
         style.overflow_y()
     };
-    if matches!(
-        scrollable_main,
-        OverflowMode::Hidden | OverflowMode::Scroll | OverflowMode::Auto
-    ) {
+    if scrollable_main.is_scrollable() {
         return Some(0.0);
     }
 
@@ -297,34 +241,17 @@ pub(super) fn flex_replaced_automatic_minimum(
                 model.horizontal_padding_border(),
                 model.vertical_padding_border(),
             );
-    let (main_axis, cross_size, cross_basis, cross_auto_margins) = if horizontal_main_axis {
-        (
-            ReplacedMainAxis::Horizontal,
-            sizes.height,
-            containing_height,
-            layout.margin_top_auto || layout.margin_bottom_auto,
-        )
-    } else {
-        (
-            ReplacedMainAxis::Vertical,
-            sizes.width,
-            Some(containing_width),
-            layout.margin_left_auto || layout.margin_right_auto,
-        )
-    };
-    let mut stretch_cross_size = false;
-    if matches!(cross_size, PreferredSize::Auto) && !cross_auto_margins {
-        let effective_alignment = effective_align_self(engine, box_idx);
-        if matches!(
-            effective_alignment,
-            ItemAlignment::Normal | ItemAlignment::Stretch
-        ) {
-            stretch_cross_size = cross_basis.is_some();
-        }
-    }
+    let cross_axis = container.main_axis.cross();
+    let cross_size = cross_axis.select(sizes.width, sizes.height);
+    let cross_basis = cross_axis.select(Some(containing_width), containing_height);
+    let stretch_cross_size = matches!(cross_size, PreferredSize::Auto)
+        && container.cross_axis_stretches(layout)
+        && cross_basis.is_some();
     Some(resolve_replaced_flex_auto_min_main_size(
         input,
-        main_axis,
+        container
+            .main_axis
+            .select(ReplacedMainAxis::Horizontal, ReplacedMainAxis::Vertical),
         stretch_cross_size,
     ))
 }
@@ -333,8 +260,7 @@ pub(super) fn taffy_item_width_dimension(
     engine: &mut LayoutEngine<'_, '_>,
     box_idx: usize,
     value: PreferredSize,
-    containing_width: f64,
-    intrinsic_inline_sizing: bool,
+    pass: SizingPass,
 ) -> Dimension {
     if let PreferredSize::Calc {
         absolute_px,
@@ -342,41 +268,37 @@ pub(super) fn taffy_item_width_dimension(
         ..
     } = value
     {
-        return length_dimension(
-            (absolute_px as f64 + containing_width * percentage as f64).max(0.0),
-        );
+        return length_dimension((absolute_px as f64 + pass.width() * percentage as f64).max(0.0));
     }
-    if !matches!(
-        value,
-        PreferredSize::MinContent | PreferredSize::MaxContent | PreferredSize::FitContent
-    ) {
+    if !value.is_intrinsic_keyword() {
         return dimension(value);
     }
-    let style = engine.reader.style(box_idx);
+    let style = engine.read.reader.style(box_idx);
     let model = engine
+        .read
         .reader
-        .box_model(box_idx, containing_width)
+        .box_model(box_idx, pass.width())
         .with_nonnegative_padding();
     let (min, max) = box_content_intrinsic_widths(engine, box_idx, None);
     let available =
-        (containing_width - model.horizontal_margin() - model.horizontal_padding_border()).max(0.0);
+        (pass.width() - model.horizontal_margin() - model.horizontal_padding_border()).max(0.0);
     let content = match value {
         PreferredSize::MinContent => min,
         PreferredSize::MaxContent => max,
-        PreferredSize::FitContent if intrinsic_inline_sizing => max,
+        PreferredSize::FitContent if pass.is_intrinsic() => max,
         PreferredSize::FitContent => max.min(available.max(min)),
         _ => unreachable!(),
     };
-    let border_box_inset = match style.box_sizing() {
-        BoxSizing::ContentBox => 0.0,
-        BoxSizing::BorderBox => model.horizontal_padding_border(),
-    };
-    length_dimension(content + border_box_inset)
+    length_dimension(content_to_specified(
+        content,
+        model.horizontal_padding_border(),
+        style.box_sizing(),
+    ))
 }
 
 /// Stable sorting preserves source order for items with the same CSS order.
 pub(super) fn ordered_children(engine: &LayoutEngine<'_, '_>, children: &[u32]) -> Vec<u32> {
     let mut ordered = children.to_vec();
-    ordered.sort_by_key(|&child| super::style::layout_style(engine, child as usize).order);
+    ordered.sort_by_key(|&child| engine.read.reader.layout_style(child as usize).order);
     ordered
 }

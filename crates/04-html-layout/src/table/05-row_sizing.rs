@@ -1,7 +1,12 @@
-use super::columns::{TableCellPlacement, percentage_component, row_group_range};
+//! Resolve row heights from cell measurements, spanning cells, and authored heights.
+
+use super::weighted_share;
+
+use super::columns::percentage_component;
+use super::grid::TableCellPlacement;
 use super::s01_grid::PreparedTableGrid;
 use super::s04_rows::PreparedCell;
-use crate::layout::{LayoutEngine, resolve_vertical_size};
+use crate::{LayoutEngine, resolve_vertical_size};
 use html_style_model::UsedPreferredSize as PreferredSize;
 use std::cmp::Ordering;
 
@@ -20,25 +25,16 @@ struct RowspanRequirement {
     minimum: f64,
 }
 
-impl RowspanRequirement {
-    fn end(self) -> usize {
-        self.start + self.count
-    }
-}
-
 pub(super) fn resolve_row_heights(
     engine: &LayoutEngine<'_, '_>,
     prepared: &PreparedTableGrid,
-    rows: &[u32],
-    row_groups: &[u32],
     cells: &[PreparedCell],
     explicit_table_height: Option<f64>,
-    caption_height: f64,
+    definite_row_area_height: Option<f64>,
 ) -> Vec<f64> {
     let placements = &prepared.grid.placements;
     let spacing = prepared.vertical_spacing;
-    let outer_border_height = prepared.outer_borders.vertical();
-    let mut measures = initial_row_measures(engine, rows, placements, cells);
+    let mut measures = initial_row_measures(engine, prepared.rows, placements, cells);
 
     let mut spanning = placements
         .iter()
@@ -47,7 +43,7 @@ pub(super) fn resolve_row_heights(
         .filter_map(|(placement, cell)| {
             let count = placement
                 .rowspan
-                .min(rows.len().saturating_sub(placement.row));
+                .min(prepared.rows.len().saturating_sub(placement.row));
             (count > 1).then_some(RowspanRequirement {
                 start: placement.row,
                 count,
@@ -57,54 +53,45 @@ pub(super) fn resolve_row_heights(
         .collect::<Vec<_>>();
     spanning.sort_by(compare_rowspan_requirements);
     for requirement in spanning {
-        distribute_excess(
-            &mut measures,
-            requirement.start,
-            requirement.count,
+        distribute_rowspan(
+            &mut measures[requirement.start..requirement.end()],
             requirement.minimum,
             spacing,
-            None,
-            true,
         );
     }
 
-    for &group_idx in row_groups {
+    for (group_idx, range) in &prepared.row_groups {
         let Some(group_height) = resolve_vertical_size(
-            engine.reader.style(group_idx as usize).height(),
+            engine.read.reader.style(*group_idx as usize).height(),
             explicit_table_height,
             0.0,
         ) else {
             continue;
         };
-        let Some(range) = row_group_range(&engine.reader, rows, group_idx as usize) else {
-            continue;
-        };
-        distribute_excess(
-            &mut measures,
-            range.start,
-            range.len(),
+        distribute_sized_area(
+            &mut measures[range.clone()],
             group_height,
             spacing,
-            Some(group_height),
-            false,
+            group_height,
         );
     }
 
-    if let Some(explicit_height) = explicit_table_height {
-        let target_grid_height = (explicit_height - caption_height).max(0.0);
-        let row_area_height = (target_grid_height - outer_border_height - 2.0 * spacing).max(0.0);
-        distribute_excess(
+    if let Some(row_area_height) = definite_row_area_height {
+        distribute_sized_area(
             &mut measures,
-            0,
-            rows.len(),
             row_area_height,
             spacing,
-            Some(explicit_height),
-            false,
+            explicit_table_height.unwrap(),
         );
     }
 
     measures.into_iter().map(|row| row.block_size).collect()
+}
+
+impl RowspanRequirement {
+    fn end(self) -> usize {
+        self.start + self.count
+    }
 }
 
 fn initial_row_measures(
@@ -115,7 +102,7 @@ fn initial_row_measures(
 ) -> Vec<RowMeasure> {
     let mut measures = vec![RowMeasure::default(); rows.len()];
     for (row, &row_box_idx) in rows.iter().enumerate() {
-        let height = engine.reader.style(row_box_idx as usize).height();
+        let height = engine.read.reader.style(row_box_idx as usize).height();
         if let Some(minimum) = resolve_vertical_size(height, None, 0.0) {
             measures[row].block_size = minimum;
         }
@@ -134,7 +121,7 @@ fn initial_row_measures(
         measures[placement.row].block_size = measures[placement.row]
             .block_size
             .max(cells.get(index).map_or(0.0, |cell| cell.height));
-        let height = engine.reader.style(placement.cell_idx).height();
+        let height = engine.read.reader.style(placement.cell_idx).height();
         measures[placement.row].percent = max_option(
             measures[placement.row].percent,
             percentage_component(height).map(|percent| percent.max(0.0)),
@@ -157,84 +144,72 @@ fn compare_rowspan_requirements(left: &RowspanRequirement, right: &RowspanRequir
     }
 }
 
-fn distribute_excess(
-    rows: &mut [RowMeasure],
-    start: usize,
-    count: usize,
-    desired_size: f64,
-    spacing: f64,
-    percentage_basis: Option<f64>,
-    rowspan_distribution: bool,
-) {
-    if count == 0 || start >= rows.len() {
+fn row_surplus(rows: &[RowMeasure], desired_size: f64, spacing: f64) -> f64 {
+    desired_size
+        - spacing * rows.len().saturating_sub(1) as f64
+        - rows.iter().map(|row| row.block_size).sum::<f64>()
+}
+
+fn distribute_rowspan(rows: &mut [RowMeasure], desired_size: f64, spacing: f64) {
+    let extra = row_surplus(rows, desired_size, spacing);
+    if rows.is_empty() || extra <= 0.0 {
         return;
     }
-    let end = start.saturating_add(count).min(rows.len());
-    let rows = &mut rows[start..end];
-    let count = end - start;
-    let total_size = rows.iter().map(|row| row.block_size).sum::<f64>();
-    let mut extra = desired_size - spacing * count.saturating_sub(1) as f64 - total_size;
-    if extra <= 0.0 {
-        return;
-    }
-
-    if let Some(basis) = percentage_basis {
-        let deficit = |row: &RowMeasure| {
-            let deficit = (basis * row.percent? - row.block_size).max(0.0);
-            (deficit > 0.0).then_some(deficit)
-        };
-        let total_deficit = rows.iter().filter_map(deficit).sum::<f64>();
-        if total_deficit > 0.0 {
-            let distributed = extra.min(total_deficit);
-            distribute_weighted(rows, distributed, deficit);
-            extra -= distributed;
-            if extra <= 0.0 {
-                return;
-            }
-        }
-    }
-
-    if rowspan_distribution
-        && distribute_weighted(&mut rows[1..], extra, |row| {
-            row.has_rowspan_start.then_some(1.0)
-        })
-    {
-        return;
-    }
-
-    let is_constrained =
-        |row: &RowMeasure| row.constrained && (row.percent.is_none() || percentage_basis.is_some());
-    if distribute_weighted(rows, extra, |row| {
-        (row.block_size > 0.0 && !is_constrained(row)).then_some(row.block_size)
+    if distribute_weighted(&mut rows[1..], extra, |row| {
+        row.has_rowspan_start.then_some(1.0)
+    }) || distribute_weighted(rows, extra, |row| {
+        (row.block_size > 0.0 && (!row.constrained || row.percent.is_some()))
+            .then_some(row.block_size)
     }) {
         return;
     }
+    if rows.iter().all(|row| row.block_size == 0.0) {
+        rows.last_mut().unwrap().block_size += extra;
+    } else {
+        distribute_weighted(rows, extra, |row| {
+            (row.block_size > 0.0).then_some(row.block_size)
+        });
+    }
+}
 
-    let empty_count = rows.iter().filter(|row| row.block_size == 0.0).count();
-    if rowspan_distribution && empty_count == count {
-        rows[count - 1].block_size += extra;
+fn distribute_sized_area(rows: &mut [RowMeasure], desired_size: f64, spacing: f64, basis: f64) {
+    let mut extra = row_surplus(rows, desired_size, spacing);
+    if rows.is_empty() || extra <= 0.0 {
         return;
     }
-    if !rowspan_distribution {
-        let constrained_nonempty = rows
-            .iter()
-            .filter(|row| row.block_size > 0.0 && is_constrained(row))
-            .count();
-        if empty_count == count || empty_count + constrained_nonempty == count {
-            let has_unconstrained_empty = rows
-                .iter()
-                .any(|row| row.block_size == 0.0 && !is_constrained(row));
-            distribute_weighted(rows, extra, |row| {
-                (row.block_size == 0.0 && (!has_unconstrained_empty || !is_constrained(row)))
-                    .then_some(1.0)
-            });
+    let deficit = |row: &RowMeasure| {
+        let deficit = (basis * row.percent? - row.block_size).max(0.0);
+        (deficit > 0.0).then_some(deficit)
+    };
+    let total_deficit = rows.iter().filter_map(deficit).sum::<f64>();
+    if total_deficit > 0.0 {
+        let distributed = extra.min(total_deficit);
+        distribute_weighted(rows, distributed, deficit);
+        extra -= distributed;
+        if extra <= 0.0 {
             return;
         }
     }
-
-    distribute_weighted(rows, extra, |row| {
-        (row.block_size > 0.0).then_some(row.block_size)
-    });
+    if distribute_weighted(rows, extra, |row| {
+        (row.block_size > 0.0 && !row.constrained).then_some(row.block_size)
+    }) {
+        return;
+    }
+    if rows
+        .iter()
+        .all(|row| row.block_size == 0.0 || row.constrained)
+    {
+        let has_unconstrained_empty = rows
+            .iter()
+            .any(|row| row.block_size == 0.0 && !row.constrained);
+        distribute_weighted(rows, extra, |row| {
+            (row.block_size == 0.0 && (!has_unconstrained_empty || !row.constrained)).then_some(1.0)
+        });
+    } else {
+        distribute_weighted(rows, extra, |row| {
+            (row.block_size > 0.0).then_some(row.block_size)
+        });
+    }
 }
 
 /// `None` excludes a row; selected rows share the excess by nonnegative weight.
@@ -259,11 +234,7 @@ fn distribute_weighted(
     }
     for row in rows {
         if let Some(weight) = weight(row) {
-            row.block_size += if total_weight <= 0.0 {
-                extra / count as f64
-            } else {
-                extra * weight.max(0.0) / total_weight
-            };
+            row.block_size += extra * weighted_share(weight.max(0.0), total_weight, count);
         }
     }
     true
@@ -289,7 +260,10 @@ fn max_option(left: Option<f64>, right: Option<f64>) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RowMeasure, RowspanRequirement, compare_rowspan_requirements, distribute_excess};
+    use super::{
+        RowMeasure, RowspanRequirement, compare_rowspan_requirements, distribute_rowspan,
+        distribute_sized_area,
+    };
 
     fn row(size: f64, constrained: bool) -> RowMeasure {
         RowMeasure {
@@ -306,28 +280,28 @@ mod tests {
     #[test]
     fn rowspan_grows_nonempty_auto_rows_proportionally() {
         let mut rows = [row(45.0, false), row(15.0, false)];
-        distribute_excess(&mut rows, 0, 2, 100.0, 0.0, None, true);
+        distribute_rowspan(&mut rows, 100.0, 0.0);
         assert_eq!(sizes(&rows), vec![75.0, 25.0]);
     }
 
     #[test]
     fn rowspan_preserves_constrained_rows_when_an_auto_row_can_grow() {
         let mut rows = [row(30.0, true), row(20.0, false)];
-        distribute_excess(&mut rows, 0, 2, 100.0, 0.0, None, true);
+        distribute_rowspan(&mut rows, 100.0, 0.0);
         assert_eq!(sizes(&rows), vec![30.0, 70.0]);
     }
 
     #[test]
     fn rowspan_grows_constrained_rows_proportionally_as_fallback() {
         let mut rows = [row(20.0, true), row(20.0, true), row(40.0, true)];
-        distribute_excess(&mut rows, 0, 3, 100.0, 0.0, None, true);
+        distribute_rowspan(&mut rows, 100.0, 0.0);
         assert_eq!(sizes(&rows), vec![25.0, 25.0, 50.0]);
     }
 
     #[test]
     fn rowspan_gives_an_all_empty_deficit_to_the_last_row() {
         let mut rows = [row(0.0, false), row(0.0, false), row(0.0, false)];
-        distribute_excess(&mut rows, 0, 3, 99.0, 0.0, None, true);
+        distribute_rowspan(&mut rows, 99.0, 0.0);
         assert_eq!(sizes(&rows), vec![0.0, 0.0, 99.0]);
     }
 
@@ -339,7 +313,7 @@ mod tests {
             row(0.0, false),
             row(0.0, false),
         ];
-        distribute_excess(&mut rows, 0, 4, 60.0, 20.0, None, true);
+        distribute_rowspan(&mut rows, 60.0, 20.0);
         assert_eq!(sizes(&rows), vec![0.0; 4]);
     }
 
@@ -354,7 +328,7 @@ mod tests {
             },
             row(340.0, false),
         ];
-        distribute_excess(&mut rows, 0, 2, 460.0, 0.0, Some(460.0), false);
+        distribute_sized_area(&mut rows, 460.0, 0.0, 460.0);
         assert_eq!(sizes(&rows), vec![120.0, 340.0]);
     }
 

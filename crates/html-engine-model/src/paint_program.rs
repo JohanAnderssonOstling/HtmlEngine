@@ -6,6 +6,22 @@ use html_style_model::StyleIndices;
 use kurbo::{Rect, Vec2};
 
 #[derive(Clone, Copy, Debug)]
+#[repr(u8)]
+pub enum BorderSide {
+    Top,
+    Right,
+    Bottom,
+    Left,
+}
+
+impl BorderSide {
+    pub const ALL: [Self; 4] = [Self::Top, Self::Right, Self::Bottom, Self::Left];
+    pub fn horizontal(self) -> bool {
+        matches!(self, Self::Top | Self::Bottom)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 pub enum PaintStyleSource {
     Box(u32),
     Style { indices: StyleIndices, context: u32 },
@@ -31,7 +47,7 @@ pub enum PaintOperation {
         /// Row whose placement carries this edge, independently of paint order.
         fragment_owner: u32,
         source: PaintStyleSource,
-        side: u8,
+        side: BorderSide,
         pattern: DecorationPattern,
         rect: Rect,
     },

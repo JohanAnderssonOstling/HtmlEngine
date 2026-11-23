@@ -143,18 +143,7 @@ impl FormattingDocument {
             .map_err(PrepareError::from)?;
         let mut document = document;
         profile!("prepare.mathml", mathml::prepare(&mut document, &styles));
-        let mut layout_tree = LayoutTree::default();
-        let mut inline_content = InlineContent::default();
-        profile!(
-            "prepare.build_box_tree",
-            html_format::build_layout_inputs(
-                &document,
-                &styles,
-                &mut layout_tree,
-                &mut inline_content,
-                note_flow
-            )
-        );
+        let (layout_tree, inline_content) = build_formatting(&document, &styles, note_flow);
         Ok(Self {
             document,
             styles,
@@ -186,26 +175,41 @@ impl FormattingDocument {
             note_flow,
             publication_fonts,
         } = self;
-        let text = prepare_logical_text(&document, &styles, &layout_tree, inline_content);
-        let indexes = PreparedIndexes::new(&document, &styles, &layout_tree, &text);
-        let paint = profile!(
-            "prepare.paint_bindings",
-            PaintStyles::new(&document, &styles, &layout_tree)
+        let state = PreparedState::prepare(
+            &document,
+            styles,
+            layout_tree,
+            inline_content,
+            note_flow,
+            publication_fonts,
         );
         PreparedDocument {
             inputs: Box::new(PreparedInputs {
-                generation: PreparationGeneration::new(),
                 document: Storage::owned(document),
-                styles: Storage::owned(styles),
-                layout_tree: Storage::owned(layout_tree),
-                text: Storage::owned(text),
-                indexes: Storage::owned(indexes),
-                note_flow,
-                paint: Storage::owned(paint),
-                publication_fonts: Storage::owned(publication_fonts),
+                state,
             }),
         }
     }
+}
+
+fn build_formatting(
+    document: &Document,
+    styles: &ComputedStyles,
+    note_flow: NoteFlow,
+) -> (LayoutTree, InlineContent) {
+    let mut layout_tree = LayoutTree::default();
+    let mut inline_content = InlineContent::default();
+    profile!(
+        "prepare.build_box_tree",
+        html_format::build_layout_inputs(
+            document,
+            styles,
+            &mut layout_tree,
+            &mut inline_content,
+            note_flow
+        )
+    );
+    (layout_tree, inline_content)
 }
 
 fn prepare_logical_text(
@@ -222,8 +226,14 @@ fn prepare_logical_text(
 }
 
 pub(crate) struct PreparedInputs<'a> {
-    generation: PreparationGeneration,
     pub(super) document: Storage<'a, Document>,
+    pub(super) state: PreparedState<'a>,
+}
+
+/// Derived preparation shared by active and cached responsive states.
+/// The canonical DOM and glyph resources remain with the session.
+pub(crate) struct PreparedState<'a> {
+    generation: PreparationGeneration,
     pub(super) styles: Storage<'a, ComputedStyles>,
     pub(super) layout_tree: Storage<'a, LayoutTree>,
     pub(super) text: Storage<'a, PreparedText>,
@@ -233,35 +243,52 @@ pub(crate) struct PreparedInputs<'a> {
     pub(super) publication_fonts: Storage<'a, PublicationFonts>,
 }
 
-/// One inactive responsive preparation. The canonical DOM and glyph resources
-/// remain with the session; only immutable derived inputs are retained here.
-pub(crate) struct ResponsivePreparation<'a> {
-    generation: PreparationGeneration,
-    styles: Storage<'a, ComputedStyles>,
-    layout_tree: Storage<'a, LayoutTree>,
-    text: Storage<'a, PreparedText>,
-    indexes: Storage<'a, PreparedIndexes>,
-    note_flow: NoteFlow,
-    paint: Storage<'a, PaintStyles<'a>>,
-    publication_fonts: Storage<'a, PublicationFonts>,
-}
-
-impl<'a> ResponsivePreparation<'a> {
-    fn exchange(self, inputs: &mut PreparedInputs<'a>) -> Self {
+impl PreparedState<'_> {
+    fn prepare(
+        document: &Document,
+        styles: ComputedStyles,
+        layout_tree: LayoutTree,
+        content: InlineContent,
+        note_flow: NoteFlow,
+        publication_fonts: PublicationFonts,
+    ) -> Self {
+        let text = prepare_logical_text(document, &styles, &layout_tree, content);
+        let indexes = PreparedIndexes::new(document, &styles, &layout_tree, &text);
+        let mut paint = profile!(
+            "prepare.paint_bindings",
+            PaintStyles::new(document, &styles, &layout_tree)
+        );
+        let palette = paint
+            .with_overrides(&styles, &layout_tree, &publication_fonts.overrides)
+            .into_palette();
+        paint.replace_palette(palette);
         Self {
-            generation: replace(&mut inputs.generation, self.generation),
-            styles: replace(&mut inputs.styles, self.styles),
-            layout_tree: replace(&mut inputs.layout_tree, self.layout_tree),
-            text: replace(&mut inputs.text, self.text),
-            indexes: replace(&mut inputs.indexes, self.indexes),
-            note_flow: replace(&mut inputs.note_flow, self.note_flow),
-            paint: replace(&mut inputs.paint, self.paint),
-            publication_fonts: replace(&mut inputs.publication_fonts, self.publication_fonts),
+            generation: PreparationGeneration::new(),
+            styles: Storage::owned(styles),
+            layout_tree: Storage::owned(layout_tree),
+            text: Storage::owned(text),
+            indexes: Storage::owned(indexes),
+            note_flow,
+            paint: Storage::owned(paint),
+            publication_fonts: Storage::owned(publication_fonts),
         }
     }
 
     pub(crate) fn matches_document(&self, document: &Document) -> bool {
         self.styles.validate_for(document).is_ok()
+    }
+
+    fn borrowed(&self) -> PreparedState<'_> {
+        PreparedState {
+            generation: self.generation,
+            styles: Storage::Borrowed(&self.styles),
+            layout_tree: Storage::Borrowed(&self.layout_tree),
+            text: Storage::Borrowed(&self.text),
+            indexes: Storage::Borrowed(&self.indexes),
+            note_flow: self.note_flow,
+            paint: Storage::Borrowed(&self.paint),
+            publication_fonts: Storage::Borrowed(&self.publication_fonts),
+        }
     }
 }
 
@@ -322,9 +349,9 @@ impl PreparedInputs<'_> {
     fn report_structure_memory(&self, report: &mut MemoryUsageReport, prefix: &str) {
         for (suffix, usage) in [
             (".document", self.document.memory_usage_report()),
-            (".styles", self.styles.memory_usage_report()),
-            (".layout_tree", self.layout_tree.memory_usage_report()),
-            (".indexes", self.indexes.memory_usage_report()),
+            (".styles", self.state.styles.memory_usage_report()),
+            (".layout_tree", self.state.layout_tree.memory_usage_report()),
+            (".indexes", self.state.indexes.memory_usage_report()),
         ] {
             report.extend_prefixed([prefix, suffix].concat(), usage);
         }
@@ -335,23 +362,17 @@ impl PreparedInputs<'_> {
         overrides: &ReaderStyleOverrides,
     ) -> Result<PaintPalette, ShapeError> {
         let paint = self
+            .state
             .paint
-            .with_overrides(&self.styles, &self.layout_tree, overrides)
+            .with_overrides(&self.state.styles, &self.state.layout_tree, overrides)
             .into_palette();
-        Ok(self.paint.owned_mut()?.replace_palette(paint))
+        Ok(self.state.paint.owned_mut()?.replace_palette(paint))
     }
 
     fn borrowed(&self) -> PreparedInputs<'_> {
         PreparedInputs {
-            generation: self.generation,
             document: Storage::Borrowed(&self.document),
-            styles: Storage::Borrowed(&self.styles),
-            layout_tree: Storage::Borrowed(&self.layout_tree),
-            text: Storage::Borrowed(&self.text),
-            indexes: Storage::Borrowed(&self.indexes),
-            note_flow: self.note_flow,
-            paint: Storage::Borrowed(&self.paint),
-            publication_fonts: Storage::Borrowed(&self.publication_fonts),
+            state: self.state.borrowed(),
         }
     }
 }
@@ -662,19 +683,8 @@ fn reprepare_and_layout_candidate<'a>(
     image_metrics: &ImageMetrics,
     glyph_shaper: &mut impl GlyphShaper,
     resources: &mut GlyphResourceStore,
-) -> Result<(Box<ShapedText>, LayoutProducts, ResponsivePreparation<'a>), ShapeError> {
-    // Exhaustive destructuring makes additions to preparation explicit here.
-    let PreparedInputs {
-        generation,
-        document,
-        styles: published_styles,
-        layout_tree,
-        text: published_text,
-        indexes: published_indexes,
-        note_flow: published_flow,
-        paint: published_paint,
-        publication_fonts: published_fonts,
-    } = inputs;
+) -> Result<(Box<ShapedText>, LayoutProducts, PreparedState<'a>), ShapeError> {
+    let PreparedInputs { document, state } = inputs;
     let document = document.owned_mut()?;
     let old_font = dom_values::root_font_size_new(document.root_font_size())
         .expect("validated root font size");
@@ -690,27 +700,11 @@ fn reprepare_and_layout_candidate<'a>(
         .validate_for(update.document)
         .expect("resolver styles must belong to the canonical DOM");
     update.math_undo = mathml::prepare_with_undo(update.document, &styles);
-    let mut tree = LayoutTree::default();
-    let mut content = InlineContent::default();
-    html_format::build_layout_inputs(update.document, &styles, &mut tree, &mut content, note_flow);
-    let text = prepare_logical_text(update.document, &styles, &tree, content);
-    let indexes = PreparedIndexes::new(update.document, &styles, &tree, &text);
-    let mut paint: PaintStyles<'a> = PaintStyles::new(update.document, &styles, &tree);
-    let palette = paint
-        .with_overrides(&styles, &tree, overrides)
-        .into_palette();
-    paint.replace_palette(palette);
-    let next_generation = PreparationGeneration::new();
+    let (tree, content) = build_formatting(update.document, &styles, note_flow);
+    let next = PreparedState::prepare(update.document, styles, tree, content, note_flow, fonts);
     let candidate = PreparedInputs {
-        generation: next_generation,
         document: Storage::Borrowed(update.document),
-        styles: Storage::Borrowed(&styles),
-        layout_tree: Storage::Borrowed(&tree),
-        text: Storage::Borrowed(&text),
-        indexes: Storage::Borrowed(&indexes),
-        note_flow,
-        paint: Storage::Borrowed(&paint),
-        publication_fonts: Storage::Borrowed(&fonts),
+        state: next.borrowed(),
     };
     let result = shape_and_layout_candidate(
         &candidate,
@@ -720,16 +714,7 @@ fn reprepare_and_layout_candidate<'a>(
         resources,
     )?;
     update.commit();
-    let previous = ResponsivePreparation {
-        generation: replace(generation, next_generation),
-        styles: replace(published_styles, Storage::owned(styles)),
-        layout_tree: replace(layout_tree, Storage::owned(tree)),
-        text: replace(published_text, Storage::owned(text)),
-        indexes: replace(published_indexes, Storage::owned(indexes)),
-        paint: replace(published_paint, Storage::owned(paint)),
-        publication_fonts: replace(published_fonts, Storage::owned(fonts)),
-        note_flow: replace(published_flow, note_flow),
-    };
+    let previous = replace(state, next);
     Ok((result.0, result.1, previous))
 }
 
@@ -813,13 +798,13 @@ impl<'a> PreparedDocument<'a> {
         &self,
         overrides: &ReaderStyleOverrides,
     ) -> Result<PreparedDocument<'_>, PrepareError> {
-        let paint = self.inputs.paint.with_overrides(
-            &self.inputs.styles,
-            &self.inputs.layout_tree,
+        let paint = self.inputs.state.paint.with_overrides(
+            &self.inputs.state.styles,
+            &self.inputs.state.layout_tree,
             overrides,
         );
         let mut inputs = self.inputs.borrowed();
-        inputs.paint = Storage::owned(paint);
+        inputs.state.paint = Storage::owned(paint);
         Ok(PreparedDocument {
             inputs: Box::new(inputs),
         })
@@ -855,12 +840,13 @@ impl<'a> PreparedDocument<'a> {
 
     #[cfg(any(test, feature = "testing"))]
     pub(crate) fn styles(&self) -> &ComputedStyles {
-        self.inputs.styles.as_ref()
+        self.inputs.state.styles.as_ref()
     }
 
     #[cfg(any(test, feature = "testing"))]
     pub fn style_view(&self, indices: StyleIndices) -> html_style_model::StyleView<'_> {
         self.inputs
+            .state
             .styles
             .view(indices)
             .expect("validated style handle")
@@ -868,16 +854,16 @@ impl<'a> PreparedDocument<'a> {
 
     #[cfg(any(test, feature = "testing"))]
     pub fn layout_tree(&self) -> &LayoutTree {
-        self.inputs.layout_tree.as_ref()
+        self.inputs.state.layout_tree.as_ref()
     }
 
     #[cfg(any(test, feature = "testing"))]
     pub fn inline_content(&self) -> &InlineContent {
-        self.inputs.text.content()
+        self.inputs.state.text.content()
     }
 
     pub fn box_count(&self) -> usize {
-        self.inputs.layout_tree.box_count()
+        self.inputs.state.layout_tree.box_count()
     }
 
     /// Estimate bytes retained for the prepared stage cache.
@@ -890,24 +876,25 @@ impl<'a> PreparedDocument<'a> {
         let mut report = MemoryUsageReport::new();
         report.extend_prefixed(
             "PreparedDocument.paint",
-            self.inputs.paint.memory_usage_report(),
+            self.inputs.state.paint.memory_usage_report(),
         );
         self.inputs
             .report_structure_memory(&mut report, "PreparedDocument");
         report.extend_prefixed(
             "PreparedDocument.inline_content",
-            self.inputs.text.memory_usage_report(),
+            self.inputs.state.text.memory_usage_report(),
         );
         report
     }
 
     #[cfg(any(test, feature = "testing"))]
     pub fn box_at(&self, box_idx: usize) -> Option<&crate::layout_model::LayoutBox> {
-        self.inputs.layout_tree.box_at(box_idx)
+        self.inputs.state.layout_tree.box_at(box_idx)
     }
 
     pub fn get_tag(&self, box_idx: usize) -> &str {
         self.inputs
+            .state
             .layout_tree
             .element_for_box(box_idx, self.document())
             .map_or("", |element| element.tag())
@@ -916,6 +903,7 @@ impl<'a> PreparedDocument<'a> {
     pub fn get_id(&self, box_idx: usize) -> Option<&str> {
         (self
             .inputs
+            .state
             .layout_tree
             .element_for_box(box_idx, self.document())?)
         .id_idx()
@@ -923,15 +911,16 @@ impl<'a> PreparedDocument<'a> {
     }
 
     pub fn box_style_indices(&self, box_idx: usize) -> Option<StyleIndices> {
-        self.inputs.layout_tree.get_box_style_indices(box_idx)
+        self.inputs.state.layout_tree.get_box_style_indices(box_idx)
     }
 
     pub fn box_text_color(&self, box_idx: usize) -> Option<u32> {
         let indices = self.box_style_indices(box_idx)?;
         Some(
             self.inputs
+                .state
                 .paint
-                .resolve(&self.inputs.styles, indices, box_idx)
+                .resolve(&self.inputs.state.styles, indices, box_idx)
                 .foreground,
         )
     }
@@ -944,7 +933,7 @@ impl<'a> PreparedDocument<'a> {
     ) -> Result<ShapedDocument<'a>, ShapeError> {
         // The closure takes ownership of the inputs, so the selection is
         // cloned once for this pass.
-        let fonts = PublicationFonts::clone(&self.inputs.publication_fonts);
+        let fonts = PublicationFonts::clone(&self.inputs.state.publication_fonts);
         with_document_shaping(
             shaper,
             &fonts,
@@ -961,9 +950,13 @@ impl<'a> PreparedDocument<'a> {
 
     /// Attach a completed layout to its sole preparation owner.
     pub fn with_layout(mut self, layout: DetachedLayout) -> LaidOutDocument<'a> {
-        assert_eq!(self.inputs.generation, layout.data.base_shaped.preparation);
+        assert_eq!(
+            self.inputs.state.generation,
+            layout.data.base_shaped.preparation
+        );
         if let Some(paint) = layout.paint {
             self.inputs
+                .state
                 .paint
                 .owned_mut()
                 .expect("canonical paint owner")
@@ -982,7 +975,7 @@ impl<'a> PreparedDocument<'a> {
     ) -> Result<ShapedDocument<'_>, ShapeError> {
         with_document_shaping(
             glyph_shaper,
-            &self.inputs.publication_fonts,
+            &self.inputs.state.publication_fonts,
             |glyph_shaper, resources| self.inputs.shape_active_document(glyph_shaper, resources),
             resources,
         )
@@ -998,26 +991,16 @@ impl<'a> PreparedDocument<'a> {
         glyph_shaper: &mut impl GlyphShaper,
         resources: &mut GlyphResourceStore,
     ) -> Result<LaidOutDocument<'_>, ShapeError> {
-        with_document_shaping(
+        self.shape_and_layout_with_metrics_and_shaper_timed(
+            constraints,
+            image_metrics,
             glyph_shaper,
-            &self.inputs.publication_fonts,
-            |glyph_shaper, resources| {
-                self.inputs
-                    .shape_active_document(glyph_shaper, resources)?
-                    .layout_coordinated(
-                        constraints,
-                        image_metrics,
-                        glyph_shaper,
-                        resources,
-                        RefinementTransaction::Existing,
-                    )
-            },
             resources,
         )
+        .map(|(document, _)| document)
     }
 
-    /// Timed form of [`Self::shape_and_layout_with_metrics_and_shaper`]. Clock
-    /// reads are kept out of the ordinary layout API.
+    /// Return the shape and layout timings from the shared layout path.
     pub fn shape_and_layout_with_metrics_and_shaper_timed(
         &self,
         constraints: LayoutConstraints,
@@ -1027,7 +1010,7 @@ impl<'a> PreparedDocument<'a> {
     ) -> Result<(LaidOutDocument<'_>, ShapeLayoutTimings), ShapeError> {
         with_document_shaping(
             glyph_shaper,
-            &self.inputs.publication_fonts,
+            &self.inputs.state.publication_fonts,
             |glyph_shaper, resources| {
                 let shape_started = Instant::now();
                 let shaped = self.inputs.shape_active_document(glyph_shaper, resources)?;
@@ -1060,7 +1043,7 @@ fn shape_text(
 ) -> Result<Box<ShapedText>, ShapeError> {
     profile_scope!("shape.total");
 
-    let inline_content = inputs.text.content();
+    let inline_content = inputs.state.text.content();
     let mut glyphs = profile!(
         "shape.allocate_glyphs",
         inline_content
@@ -1075,11 +1058,11 @@ fn shape_text(
         text_geometry,
         font_metrics,
     } = crate::shaping::shape_document(
-        &inputs.styles,
-        &inputs.layout_tree,
+        &inputs.state.styles,
+        &inputs.state.layout_tree,
         inline_content,
         &mut glyphs,
-        inputs.text.first_letter_styles(),
+        inputs.state.text.first_letter_styles(),
         glyph_shaper,
         resources,
     )?;
@@ -1087,8 +1070,8 @@ fn shape_text(
     Ok(Box::new(ShapedText {
         resource_id: resources.id(),
         resource_generation: resources.generation(),
-        preparation: inputs.generation,
-        geometry_box_count: inputs.layout_tree.box_count(),
+        preparation: inputs.state.generation,
+        geometry_box_count: inputs.state.layout_tree.box_count(),
         glyphs,
         text_geometry,
         shared: SharedShapedData {
@@ -1109,7 +1092,7 @@ fn shape_and_layout_candidate(
 ) -> Result<(Box<ShapedText>, LayoutProducts), ShapeError> {
     with_document_shaping(
         glyph_shaper,
-        &inputs.publication_fonts,
+        &inputs.state.publication_fonts,
         |glyph_shaper, resources| {
             let shaped = shape_text(inputs, glyph_shaper, resources)?;
             let candidate = layout_with_first_lines(
@@ -1182,7 +1165,7 @@ impl<'a> ShapedDocument<'a> {
             .report_structure_memory(&mut report, "ShapedDocument");
         report.extend_prefixed(
             "ShapedDocument.inline_content",
-            self.inputs.text.memory_usage_report(),
+            self.inputs.state.text.memory_usage_report(),
         );
         report.extend_prefixed(
             "ShapedDocument",
@@ -1333,20 +1316,20 @@ fn layout_inputs<'a>(
 ) -> crate::layout::LayoutInputs<'a> {
     crate::layout::LayoutInputs {
         document: &inputs.document,
-        styles: &inputs.styles,
-        topology: &inputs.layout_tree,
-        inline_content: inputs.text.content(),
-        first_letter_styles: inputs.text.first_letter_styles(),
+        styles: &inputs.state.styles,
+        topology: &inputs.state.layout_tree,
+        inline_content: inputs.state.text.content(),
+        first_letter_styles: inputs.state.text.first_letter_styles(),
         glyphs: shaped.glyphs,
         glyph_metrics: resources.metrics(),
         font_metrics: &shaped.shared.font_metrics,
         text_geometry: Some(shaped.text_geometry),
-        word_index: Some(&inputs.indexes.words),
+        word_index: Some(&inputs.state.indexes.words),
         ellipsis_glyphs: &shaped.shared.ellipsis_glyphs,
         hyphen_glyphs: &shaped.shared.hyphen_glyphs,
         inline_plan_generation: shaped.inline_plan_generation,
         image_metrics,
-        paint: inputs.paint.view(),
+        paint: inputs.state.paint.view(),
         text_style_ranges: shaped.paint_ranges,
         resource_generation: shaped.resource_generation,
     }
@@ -1410,11 +1393,11 @@ impl PreparedInputs<'_> {
     fn refs(&self) -> InputRefs<'_> {
         InputRefs {
             document: &self.document,
-            styles: &self.styles,
-            layout_tree: &self.layout_tree,
-            text: &self.text,
-            indexes: &self.indexes,
-            paint: self.paint.view(),
+            styles: &self.state.styles,
+            layout_tree: &self.state.layout_tree,
+            text: &self.state.text,
+            indexes: &self.state.indexes,
+            paint: self.state.paint.view(),
         }
     }
 }
@@ -1441,7 +1424,7 @@ pub struct NoteLayout {
 impl NoteLayout {
     /// Whether this scope still belongs to the owner's canonical preparation.
     pub fn belongs_to(&self, owner: &LaidOutDocument<'_>) -> bool {
-        self.owner == owner.inputs.generation
+        self.owner == owner.inputs.state.generation
     }
 
     pub fn render_view<'a>(
@@ -1458,11 +1441,11 @@ impl NoteLayout {
         }
         let doc = self.layout.data.read(InputRefs {
             document: &owner.inputs.document,
-            styles: &owner.inputs.styles,
+            styles: &owner.inputs.state.styles,
             layout_tree: &self.layout_tree,
             text: &self.text,
             indexes: &self.indexes,
-            paint: self.paint.view(&owner.inputs.paint)?,
+            paint: self.paint.view(&owner.inputs.state.paint)?,
         });
         if doc.image_metrics_affect_layout(
             &self.layout.data.last_image_metrics,
@@ -1508,30 +1491,34 @@ impl<'a> LaidOutDocument<'a> {
             owner.inputs.document.as_ref()
         ));
         assert!(std::ptr::eq(
-            self.inputs.styles.as_ref(),
-            owner.inputs.styles.as_ref()
+            self.inputs.state.styles.as_ref(),
+            owner.inputs.state.styles.as_ref()
         ));
         NoteLayout {
             resources: Arc::new(resources),
             owner_resources: owner.data.base_shaped.resource_id,
-            owner: owner.inputs.generation,
+            owner: owner.inputs.state.generation,
             layout_tree: self
                 .inputs
+                .state
                 .layout_tree
                 .into_owned()
                 .expect("scoped tree has one owner"),
             text: self
                 .inputs
+                .state
                 .text
                 .into_owned()
                 .expect("scoped text has one owner"),
             indexes: self
                 .inputs
+                .state
                 .indexes
                 .into_owned()
                 .expect("scoped indexes have one owner"),
             paint: self
                 .inputs
+                .state
                 .paint
                 .into_owned()
                 .expect("scoped paint has one owner")
@@ -1555,7 +1542,7 @@ impl<'a> LaidOutDocument<'a> {
     ) -> Result<ShapedDocument<'_>, ShapeError> {
         with_document_shaping(
             shaper,
-            &self.inputs.publication_fonts,
+            &self.inputs.state.publication_fonts,
             |shaper, resources| self.inputs.shape_active_document(shaper, resources),
             resources,
         )
@@ -1565,6 +1552,7 @@ impl<'a> LaidOutDocument<'a> {
         DetachedLayout {
             paint: self
                 .inputs
+                .state
                 .paint
                 .into_owned()
                 .map(PaintStyles::into_palette),
@@ -1654,7 +1642,11 @@ impl<'a> LaidOutDocument<'a> {
             )
         };
         if result.is_err() {
-            self.inputs.paint.owned_mut()?.replace_palette(previous);
+            self.inputs
+                .state
+                .paint
+                .owned_mut()?
+                .replace_palette(previous);
         }
         result
     }
@@ -1686,7 +1678,7 @@ impl<'a> LaidOutDocument<'a> {
         image_metrics: &ImageMetrics,
         glyph_shaper: &mut impl GlyphShaper,
         resources: &mut GlyphResourceStore,
-    ) -> Result<ResponsivePreparation<'a>, ShapeError> {
+    ) -> Result<PreparedState<'a>, ShapeError> {
         let (shaped, candidate, previous) = reprepare_and_layout_candidate(
             &mut self.inputs,
             root_font_size,
@@ -1707,13 +1699,13 @@ impl<'a> LaidOutDocument<'a> {
     /// shaping and layout succeed, preserving the published document on error.
     pub(crate) fn restore_responsive_preparation(
         &mut self,
-        mut preparation: ResponsivePreparation<'a>,
+        mut preparation: PreparedState<'a>,
         overrides: &ReaderStyleOverrides,
         constraints: LayoutConstraints,
         image_metrics: &ImageMetrics,
         glyph_shaper: &mut impl GlyphShaper,
         resources: &mut GlyphResourceStore,
-    ) -> Result<ResponsivePreparation<'a>, ShapeError> {
+    ) -> Result<PreparedState<'a>, ShapeError> {
         // Paint-only preferences are deliberately absent from preparation keys.
         // Apply the current palette instead of reviving the cached colors.
         let palette = preparation.paint.with_overrides(
@@ -1733,21 +1725,14 @@ impl<'a> LaidOutDocument<'a> {
             .expect("responsive preparation belongs to the canonical DOM");
         update.math_undo = mathml::prepare_with_undo(update.document, &preparation.styles);
         let candidate_inputs = PreparedInputs {
-            generation: preparation.generation,
             document: Storage::Borrowed(update.document),
-            styles: Storage::Borrowed(&preparation.styles),
-            layout_tree: Storage::Borrowed(&preparation.layout_tree),
-            text: Storage::Borrowed(&preparation.text),
-            indexes: Storage::Borrowed(&preparation.indexes),
-            note_flow: preparation.note_flow,
-            paint: Storage::Borrowed(&preparation.paint),
-            publication_fonts: Storage::Borrowed(&preparation.publication_fonts),
+            state: preparation.borrowed(),
         };
         let (shaped, candidate) = shape_and_layout_candidate(
             &candidate_inputs, constraints, image_metrics, glyph_shaper, resources,
         )?;
         update.commit();
-        let previous = preparation.exchange(&mut self.inputs);
+        let previous = replace(&mut self.inputs.state, preparation);
         self.data.base_shaped = shaped;
         candidate.publish(self, constraints, image_metrics, resources);
         Ok(previous)
@@ -1760,7 +1745,7 @@ impl<'a> LaidOutDocument<'a> {
         prepared: &'a PreparedDocument,
         resources: &GlyphResourceStore,
     ) -> bool {
-        if self.data.base_shaped.preparation != prepared.inputs.generation {
+        if self.data.base_shaped.preparation != prepared.inputs.state.generation {
             return false;
         }
         *self.inputs = prepared.inputs.borrowed();
@@ -1777,7 +1762,6 @@ impl<'a> LaidOutDocument<'a> {
                 &self.data.last_image_metrics,
                 resources,
             ),
-            &self.data.layout.geometry,
             &mut self.data.layout.state,
         );
     }
@@ -1812,7 +1796,7 @@ impl<'a> LaidOutDocument<'a> {
     ) -> Result<(), ShapeError> {
         assert_eq!(
             self.data.base_shaped.preparation,
-            prepared.inputs.generation
+            prepared.inputs.state.generation
         );
         let previous_inputs = replace(&mut self.inputs, Box::new(prepared.inputs.borrowed()));
         let result = self.relayout(
@@ -1828,10 +1812,10 @@ impl<'a> LaidOutDocument<'a> {
 
     pub(super) fn rebuild_paint_colors(&mut self, resources: &GlyphResourceStore) {
         let inputs = self.inputs.as_ref();
-        let tree = inputs.layout_tree.as_ref();
-        let styles = inputs.styles.as_ref();
-        let text = inputs.text.as_ref();
-        let paint = inputs.paint.as_ref();
+        let tree = inputs.state.layout_tree.as_ref();
+        let styles = inputs.state.styles.as_ref();
+        let text = inputs.state.text.as_ref();
+        let paint = inputs.state.paint.as_ref();
         let line_output = &mut self.data.layout.state.line_output;
         for line in &line_output.lines {
             let Some(detail_idx) = line.details else {
@@ -1839,7 +1823,7 @@ impl<'a> LaidOutDocument<'a> {
             };
             let details = &mut line_output.line_details[detail_idx.get() as usize - 1];
             if details.paint_color.is_some() {
-                let root = html_text::whitespace_context_root(tree, line.owner_box_idx as usize);
+                let root = tree.flow_root(line.owner_box_idx as usize);
                 details.paint_color = text
                     .content()
                     .pseudo_styles()
@@ -1907,7 +1891,7 @@ impl<'a> LaidOutDocument<'a> {
             ),
             &mut self.data.layout.state,
             // Native runs retain authored colors; only palette overrides replace them.
-            if self.inputs.paint.is_default() {
+            if self.inputs.state.paint.is_default() {
                 &[]
             } else {
                 &self.data.paint_colors
@@ -2012,7 +1996,7 @@ impl<'a> LaidOutDocument<'a> {
         {
             return Err(resource_generation_mismatch());
         }
-        if !self.inputs.styles.has_first_line_styles() {
+        if !self.inputs.state.styles.has_first_line_styles() {
             // Ordinary resizing cannot fail during shaping. Retain geometry,
             // line output, placement and scratch storage instead of allocating
             // a private refinement candidate for every viewport change.
@@ -2057,8 +2041,8 @@ impl<'a> LaidOutDocument<'a> {
 
     fn rebuild_anchor_positions(&mut self) {
         let document = self.inputs.document.as_ref();
-        let tree = self.inputs.layout_tree.as_ref();
-        let anchor_glyphs = &self.inputs.indexes.anchor_glyphs;
+        let tree = self.inputs.state.layout_tree.as_ref();
+        let anchor_glyphs = &self.inputs.state.indexes.anchor_glyphs;
         let layout = &mut self.data.layout;
         let lines = &layout.state.line_output;
         let geometry = &layout.geometry;
@@ -2166,7 +2150,7 @@ impl<'a> LaidOutDocument<'a> {
         let mut report = MemoryUsageReport::new();
         report.extend_prefixed(
             "LaidOutDocument.paint",
-            self.inputs.paint.memory_usage_report(),
+            self.inputs.state.paint.memory_usage_report(),
         );
         self.inputs
             .report_structure_memory(&mut report, "LaidOutDocument");
@@ -2181,7 +2165,7 @@ impl<'a> LaidOutDocument<'a> {
         );
         report.extend_prefixed(
             "LaidOutDocument.inline_content",
-            self.inputs.text.memory_usage_report(),
+            self.inputs.state.text.memory_usage_report(),
         );
         report.extend_prefixed(
             "LaidOutDocument.layout_state",
@@ -2227,7 +2211,7 @@ fn visible_text_runs<'a>(
     inputs: &'a PreparedInputs<'_>,
 ) -> impl Iterator<Item = (&'a str, Option<&'a ContentLanguage>)> {
     let document = inputs.document.as_ref();
-    let styles = inputs.styles.as_ref();
+    let styles = inputs.state.styles.as_ref();
     let mut pending: Vec<_> = document.dom_root().into_iter().collect();
     std::iter::from_fn(move || {
         while let Some(node) = pending.pop() {
@@ -2275,7 +2259,7 @@ fn scoped_to_element_id<'a>(
     let mut inline_content = InlineContent::default();
     html_format::build_layout_inputs_from(
         document,
-        &inputs.styles,
+        &inputs.state.styles,
         &mut layout_tree,
         &mut inline_content,
         NoteFlow::InFlow,
@@ -2283,33 +2267,35 @@ fn scoped_to_element_id<'a>(
     );
     let text = Storage::owned(PreparedText::new(
         document,
-        &inputs.styles,
+        &inputs.state.styles,
         &layout_tree,
         inline_content,
     ));
-    let paint = Storage::owned(
-        inputs
-            .paint
-            .for_tree(document, &inputs.styles, &layout_tree),
-    );
+    let paint = Storage::owned(inputs.state.paint.for_tree(
+        document,
+        &inputs.state.styles,
+        &layout_tree,
+    ));
     let indexes = Storage::owned(PreparedIndexes::new(
         document,
-        &inputs.styles,
+        &inputs.state.styles,
         &layout_tree,
         &text,
     ));
     Some(PreparedDocument {
         inputs: Box::new(PreparedInputs {
-            generation: PreparationGeneration::new(),
             document: Storage::Borrowed(&inputs.document),
-            styles: Storage::Borrowed(&inputs.styles),
-            layout_tree: Storage::owned(layout_tree),
-            text,
-            indexes,
-            note_flow: NoteFlow::InFlow,
-            paint,
-            // A note is shaped with the declarations of the document it lives in.
-            publication_fonts: Storage::Borrowed(&inputs.publication_fonts),
+            state: PreparedState {
+                generation: PreparationGeneration::new(),
+                styles: Storage::Borrowed(&inputs.state.styles),
+                layout_tree: Storage::owned(layout_tree),
+                text,
+                indexes,
+                note_flow: NoteFlow::InFlow,
+                paint,
+                // A note is shaped with the declarations of the document it lives in.
+                publication_fonts: Storage::Borrowed(&inputs.state.publication_fonts),
+            },
         }),
     })
 }

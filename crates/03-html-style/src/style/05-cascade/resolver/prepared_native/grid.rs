@@ -1,10 +1,10 @@
 use super::super::context::PropertyContext;
-use super::{components, length_pct};
-use crate::style::syntax::grid::auto_repeat_is_supported;
+use super::{PreparedValue, components, length_pct};
+use crate::style::syntax::grid::{auto_repeat_is_supported, reserved_name};
 use crate::style::syntax::prepared_length::{LengthMode, PreparedLength};
 use html_style_model::{
-    ComputedStylesBuilder, GridPlacement, GridRepeatCount, GridTemplateArea, GridTemplateTrack,
-    GridTrackBreadth, GridTrackSize, StyleStringId,
+    ComputedStylesBuilder, GridRepeatCount, GridTemplateArea, GridTrackBreadth, GridTrackSize,
+    StyleStringId,
 };
 use lightningcss::properties::Property;
 use lightningcss::properties::grid::{
@@ -14,7 +14,7 @@ use lightningcss::values::ident::CustomIdentList;
 use std::num::{NonZeroI16, NonZeroU16};
 
 #[derive(Clone, Debug)]
-enum Breadth {
+pub(crate) enum Breadth {
     Length(PreparedLength),
     Flex(f32),
     MinContent,
@@ -22,18 +22,18 @@ enum Breadth {
     Auto,
 }
 #[derive(Clone, Debug)]
-enum Track {
+pub(crate) enum Track {
     Breadth(Breadth),
     MinMax(Breadth, Breadth),
     FitContent(PreparedLength),
 }
 #[derive(Clone, Debug)]
-enum TemplateTrack {
+pub(crate) enum TemplateTrack {
     Single(Track),
     Repeat(GridRepeatCount, Vec<Track>, Vec<Vec<Box<str>>>),
 }
 #[derive(Clone, Debug)]
-enum Placement {
+pub(crate) enum Placement {
     Auto,
     Line(NonZeroI16),
     Span(NonZeroU16),
@@ -41,21 +41,11 @@ enum Placement {
     NamedSpan(Box<str>, NonZeroU16),
 }
 #[derive(Clone, Debug)]
-struct Area {
+pub(crate) struct Area {
     name: Box<str>,
     rows: [u16; 2],
     columns: [u16; 2],
 }
-#[derive(Clone, Debug)]
-pub(crate) struct PreparedGrid(GridValue);
-#[derive(Clone, Debug)]
-enum GridValue {
-    Template(Vec<TemplateTrack>, Vec<Vec<Box<str>>>),
-    Auto(Vec<Track>),
-    Placement(Placement),
-    Areas(Vec<Area>, u16, u16),
-}
-
 impl Breadth {
     fn prepare(value: &TrackBreadth) -> Option<Self> {
         Some(match value {
@@ -70,7 +60,7 @@ impl Breadth {
             TrackBreadth::Auto => Self::Auto,
         })
     }
-    fn evaluate(&self, context: &mut PropertyContext<'_>) -> GridTrackBreadth {
+    pub(super) fn evaluate(&self, context: &mut PropertyContext<'_>) -> GridTrackBreadth {
         match self {
             Self::Length(v) => {
                 GridTrackBreadth::Length(length_pct(v, components(v, context), true))
@@ -81,7 +71,7 @@ impl Breadth {
             Self::Auto => GridTrackBreadth::Auto,
         }
     }
-    fn needs_height(&self) -> bool {
+    pub(super) fn needs_height(&self) -> bool {
         matches!(self,Self::Length(v) if v.viewport_height)
     }
 }
@@ -98,7 +88,7 @@ impl Track {
             )?),
         })
     }
-    fn evaluate(&self, context: &mut PropertyContext<'_>) -> GridTrackSize {
+    pub(super) fn evaluate(&self, context: &mut PropertyContext<'_>) -> GridTrackSize {
         match self {
             Self::Breadth(v) => GridTrackSize::Breadth(v.evaluate(context)),
             Self::MinMax(min, max) => GridTrackSize::MinMax {
@@ -110,7 +100,7 @@ impl Track {
             }
         }
     }
-    fn needs_height(&self) -> bool {
+    pub(super) fn needs_height(&self) -> bool {
         match self {
             Self::Breadth(v) => v.needs_height(),
             Self::MinMax(a, b) => a.needs_height() || b.needs_height(),
@@ -127,7 +117,7 @@ fn names(sets: &[CustomIdentList<'_>]) -> Vec<Vec<Box<str>>> {
         })
         .collect()
 }
-fn intern_names(
+pub(super) fn intern_names(
     sets: &[Vec<Box<str>>],
     styles: &mut ComputedStylesBuilder,
 ) -> Vec<Vec<StyleStringId>> {
@@ -135,12 +125,12 @@ fn intern_names(
         .map(|set| set.iter().map(|name| styles.intern_string(name)).collect())
         .collect()
 }
-impl PreparedGrid {
-    pub(crate) fn prepare(property: &Property<'_>) -> Result<Option<Self>, ()> {
+impl PreparedValue {
+    pub(crate) fn prepare_grid(property: &Property<'_>) -> Result<Option<Self>, ()> {
         let value = match property {
             Property::GridTemplateRows(v) | Property::GridTemplateColumns(v) => {
                 let TrackSizing::TrackList(list) = v else {
-                    return Ok(Some(Self(GridValue::Template(Vec::new(), Vec::new()))));
+                    return Ok(Some(Self::GridTemplate(Vec::new(), Vec::new())));
                 };
                 if list.items.is_empty() || !auto_repeat_is_supported(list) {
                     return Err(());
@@ -174,9 +164,9 @@ impl PreparedGrid {
                         }
                     });
                 }
-                GridValue::Template(tracks, names(&list.line_names))
+                PreparedValue::GridTemplate(tracks, names(&list.line_names))
             }
-            Property::GridAutoRows(v) | Property::GridAutoColumns(v) => GridValue::Auto(
+            Property::GridAutoRows(v) | Property::GridAutoColumns(v) => PreparedValue::GridAuto(
                 v.0.iter()
                     .map(Track::prepare)
                     .collect::<Option<Vec<_>>>()
@@ -185,7 +175,15 @@ impl PreparedGrid {
             Property::GridRowStart(v)
             | Property::GridRowEnd(v)
             | Property::GridColumnStart(v)
-            | Property::GridColumnEnd(v) => GridValue::Placement(match v {
+            | Property::GridColumnEnd(v) => PreparedValue::GridPlacement(match v {
+                GridLine::Area { name }
+                | GridLine::Line { name: Some(name), .. }
+                | GridLine::Span { name: Some(name), .. }
+                    if reserved_name(name.0.as_ref()) =>
+                {
+                    return Err(());
+                }
+                GridLine::Line { index: 0, .. } => return Err(()),
                 GridLine::Auto => Placement::Auto,
                 GridLine::Area { name } => Placement::NamedLine(Box::from(name.0.as_ref()), 0),
                 GridLine::Line { index, name: None } => Placement::Line(
@@ -211,7 +209,7 @@ impl PreparedGrid {
             }),
             Property::GridTemplateAreas(v) => {
                 let GridTemplateAreas::Areas { columns, areas } = v else {
-                    return Ok(Some(Self(GridValue::Areas(Vec::new(), 0, 0))));
+                    return Ok(Some(Self::GridAreas(Vec::new(), 0, 0)));
                 };
                 let columns = usize::try_from(*columns).map_err(|_| ())?;
                 if columns == 0 || areas.len() % columns != 0 {
@@ -253,7 +251,7 @@ impl PreparedGrid {
                         ],
                     });
                 }
-                GridValue::Areas(
+                PreparedValue::GridAreas(
                     output,
                     u16::try_from(rows).map_err(|_| ())?,
                     u16::try_from(columns).map_err(|_| ())?,
@@ -261,84 +259,11 @@ impl PreparedGrid {
             }
             _ => return Ok(None),
         };
-        Ok(Some(Self(value)))
-    }
-    pub(crate) fn requires_viewport_height(&self) -> bool {
-        match &self.0 {
-            GridValue::Template(tracks, _) => tracks.iter().any(|track| match track {
-                TemplateTrack::Single(v) => v.needs_height(),
-                TemplateTrack::Repeat(_, v, _) => v.iter().any(Track::needs_height),
-            }),
-            GridValue::Auto(v) => v.iter().any(Track::needs_height),
-            _ => false,
-        }
-    }
-    pub(in crate::style::cascade::resolver) fn apply(
-        &self,
-        property: &Property<'_>,
-        context: &mut PropertyContext<'_>,
-    ) {
-        match &self.0 {
-            GridValue::Template(tracks, names) => {
-                let names = intern_names(names, context.styles);
-                let tracks = tracks
-                    .iter()
-                    .map(|track| match track {
-                        TemplateTrack::Single(v) => GridTemplateTrack::Single(v.evaluate(context)),
-                        TemplateTrack::Repeat(count, tracks, names) => GridTemplateTrack::Repeat {
-                            count: *count,
-                            tracks: tracks.iter().map(|v| v.evaluate(context)).collect(),
-                            line_names: intern_names(names, context.styles),
-                        },
-                    })
-                    .collect();
-                if matches!(property, Property::GridTemplateRows(_)) {
-                    context.style.layout.grid_template_rows = tracks;
-                    context.style.layout.grid_template_row_names = names;
-                } else {
-                    context.style.layout.grid_template_columns = tracks;
-                    context.style.layout.grid_template_column_names = names;
-                }
-            }
-            GridValue::Auto(tracks) => {
-                let tracks = tracks.iter().map(|v| v.evaluate(context)).collect();
-                if matches!(property, Property::GridAutoRows(_)) {
-                    context.style.layout.grid_auto_rows = tracks;
-                } else {
-                    context.style.layout.grid_auto_columns = tracks;
-                }
-            }
-            GridValue::Placement(v) => {
-                let value = match v {
-                    Placement::Auto => GridPlacement::Auto,
-                    Placement::Line(v) => GridPlacement::Line(*v),
-                    Placement::Span(v) => GridPlacement::Span(*v),
-                    Placement::NamedLine(name, index) => GridPlacement::NamedLine {
-                        name: context.styles.intern_string(name),
-                        index: *index,
-                    },
-                    Placement::NamedSpan(name, count) => GridPlacement::NamedSpan {
-                        name: context.styles.intern_string(name),
-                        count: *count,
-                    },
-                };
-                *match property {
-                    Property::GridRowStart(_) => &mut context.style.layout.grid_row.start,
-                    Property::GridRowEnd(_) => &mut context.style.layout.grid_row.end,
-                    Property::GridColumnStart(_) => &mut context.style.layout.grid_column.start,
-                    _ => &mut context.style.layout.grid_column.end,
-                } = value;
-            }
-            GridValue::Areas(areas, rows, columns) => {
-                context.style.layout.grid_template_areas = intern_areas(areas, context.styles);
-                context.style.layout.grid_template_area_rows = *rows;
-                context.style.layout.grid_template_area_columns = *columns;
-            }
-        }
+        Ok(Some(value))
     }
 }
 
-fn intern_areas(areas: &[Area], styles: &mut ComputedStylesBuilder) -> Vec<GridTemplateArea> {
+pub(super) fn intern_areas(areas: &[Area], styles: &mut ComputedStylesBuilder) -> Vec<GridTemplateArea> {
     areas
         .iter()
         .map(|area| GridTemplateArea {
@@ -382,10 +307,10 @@ mod tests {
         .collect();
         let input: GridTemplateAreas =
             Parse::parse_string("'head head head' 'side main main' 'foot foot foot'").unwrap();
-        let prepared = PreparedGrid::prepare(&Property::GridTemplateAreas(input))
+        let prepared = PreparedValue::prepare_grid(&Property::GridTemplateAreas(input))
             .unwrap()
             .unwrap();
-        let GridValue::Areas(areas, rows, columns) = &prepared.0 else {
+        let PreparedValue::GridAreas(areas, rows, columns) = &prepared else {
             panic!("prepared areas");
         };
         let (actual, allocations) = count_allocations(|| intern_areas(areas, &mut styles));
@@ -405,7 +330,7 @@ mod tests {
         ] {
             let input: GridTemplateAreas = Parse::parse_string(css).unwrap();
             assert!(
-                PreparedGrid::prepare(&Property::GridTemplateAreas(input)).is_err(),
+                PreparedValue::prepare_grid(&Property::GridTemplateAreas(input)).is_err(),
                 "{css}"
             );
         }
@@ -416,10 +341,10 @@ mod tests {
             ("'. . .' '. a a' '. a a'", 1, 3, 3),
         ] {
             let input: GridTemplateAreas = Parse::parse_string(css).unwrap();
-            let prepared = PreparedGrid::prepare(&Property::GridTemplateAreas(input))
+            let prepared = PreparedValue::prepare_grid(&Property::GridTemplateAreas(input))
                 .unwrap()
                 .unwrap();
-            let GridValue::Areas(areas, actual_rows, actual_columns) = prepared.0 else {
+            let PreparedValue::GridAreas(areas, actual_rows, actual_columns) = prepared else {
                 panic!("prepared areas");
             };
             assert_eq!(

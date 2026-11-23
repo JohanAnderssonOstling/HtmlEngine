@@ -2,7 +2,7 @@
 use super::RenderAddressingView;
 use crate::layout_model::InlineItemKind;
 use html_dom::{DomNodeId, ElementRef, element_is_note_reference, element_is_note_target};
-use html_text::whitespace_context_root;
+use html_text::TextStructure;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
@@ -308,7 +308,7 @@ impl RenderAddressingView<'_> {
                 if glyphs.is_empty() {
                     return None;
                 }
-                let context = whitespace_context_root(tree, item.box_idx as usize);
+                let context = tree.flow_root(item.box_idx as usize);
                 let separate =
                     explicit_break || previous_context.is_some_and(|previous| previous != context);
                 previous_context = Some(context);

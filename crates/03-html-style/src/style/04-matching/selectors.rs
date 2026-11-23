@@ -1,8 +1,10 @@
 //! Runtime selector candidate collection and ancestor filtering.
-pub use super::filter::SelectorFilter as AncestorFilter;
+use super::dom::TraversalContext;
+use super::traversal::SummaryTest;
 use crate::style::compiled::{
-    CandidateRange, PreparedSelector, SelectorCandidate, SelectorIndex, SelectorState};
-use html_dom::{ElementRef};
+    CandidateRange, PreparedSelector, SelectorCandidate, SelectorIndex, SelectorState,
+};
+use html_dom::{DomNodeId, ElementRef};
 
 // ============================================================================
 // Selector candidate lookup
@@ -13,9 +15,17 @@ impl SelectorIndex {
     pub(crate) fn selector_might_match(
         &self,
         selector: PreparedSelector,
-        ancestor_filter: &AncestorFilter,
+        node: DomNodeId,
+        context: &mut TraversalContext<'_, '_, '_>,
     ) -> bool {
-        ancestor_filter.contains(selector.ancestor_requirements)
+        let (start, end) = selector.ancestor_requirements;
+        self.compiled.ancestor_tests[start as usize..end as usize]
+            .iter()
+            .all(|test| {
+                context
+                    .ancestor_matches(node, SummaryTest::Any(std::slice::from_ref(test)))
+                    .unwrap_or(true)
+            })
     }
 
     /// Merge the sorted target-key buckets without allocating merge state.

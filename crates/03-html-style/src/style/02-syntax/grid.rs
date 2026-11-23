@@ -1,9 +1,9 @@
 //! Limits of the renderer's native grid AST conversion.
 use lightningcss::properties::Property;
 use lightningcss::properties::grid::{
-    GridLine, RepeatCount, TrackBreadth, TrackList, TrackListItem, TrackSize, TrackSizing,
+    RepeatCount, TrackBreadth, TrackList, TrackListItem, TrackSize, TrackSizing,
 };
-fn reserved_name(name: &str) -> bool {
+pub(crate) fn reserved_name(name: &str) -> bool {
     name.eq_ignore_ascii_case("span") || name.eq_ignore_ascii_case("auto")
 }
 
@@ -38,62 +38,6 @@ fn tracks_are_valid(value: &TrackSizing<'_>) -> bool {
             _ => true,
         })
         && auto_repeat_count(list) <= 1
-}
-
-pub(crate) fn native_value_is_unsupported(property: &Property<'_>) -> bool {
-    let bad = |line: &GridLine<'_>| match line {
-        GridLine::Auto => false,
-        GridLine::Area { name } => reserved_name(name.0.as_ref()),
-        GridLine::Line { index, name } => {
-            *index == 0
-                || i16::try_from(*index).is_err()
-                || name
-                    .as_ref()
-                    .is_some_and(|name| reserved_name(name.0.as_ref()))
-        }
-        GridLine::Span { index, name } => {
-            *index <= 0
-                || u16::try_from(*index).is_err()
-                || name
-                    .as_ref()
-                    .is_some_and(|name| reserved_name(name.0.as_ref()))
-        }
-    };
-    match property {
-        Property::GridTemplateRows(tracks) | Property::GridTemplateColumns(tracks) => {
-            unsupported_tracks(tracks)
-        }
-        Property::GridTemplate(value) => {
-            unsupported_tracks(&value.rows) || unsupported_tracks(&value.columns)
-        }
-        Property::Grid(value) => {
-            unsupported_tracks(&value.rows) || unsupported_tracks(&value.columns)
-        }
-        Property::GridRowStart(line)
-        | Property::GridRowEnd(line)
-        | Property::GridColumnStart(line)
-        | Property::GridColumnEnd(line) => bad(line),
-        Property::GridRow(value) => bad(&value.start) || bad(&value.end),
-        Property::GridColumn(value) => bad(&value.start) || bad(&value.end),
-        Property::GridArea(value) => {
-            bad(&value.row_start)
-                || bad(&value.row_end)
-                || bad(&value.column_start)
-                || bad(&value.column_end)
-        }
-        _ => false,
-    }
-}
-
-fn unsupported_tracks(value: &TrackSizing<'_>) -> bool {
-    let TrackSizing::TrackList(list) = value else {
-        return false;
-    };
-    list.items.iter().any(|item| {
-        matches!(item, TrackListItem::TrackRepeat(repeat)
-            if matches!(repeat.count, RepeatCount::AutoFill | RepeatCount::AutoFit)
-                && !repeat.track_sizes.iter().all(native_fixed_size))
-    })
 }
 
 /// Check the complete auto-repeat shape before committing converted tracks.

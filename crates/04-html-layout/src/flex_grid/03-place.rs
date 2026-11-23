@@ -1,7 +1,7 @@
 //! Execute final child boxes at solver-assigned dimensions.
-use super::style::{effective_align_self, layout_style};
+use super::sizing::Axis;
 use super::{BaselineItem, FlexGridInput, FlexGridPolicy, TaffyContainerKind, nonnegative_size};
-use crate::layout::{BoxLayoutRequest, LayoutEngine};
+use crate::{BoxLayoutRequest, LayoutEngine};
 use html_style_model::{ItemAlignment, UsedPreferredSize as PreferredSize};
 use kurbo::Point;
 use taffy::prelude::Layout;
@@ -12,11 +12,6 @@ pub(super) fn place(
     policy: &FlexGridPolicy,
     items: Vec<(Layout, u32)>,
 ) -> Vec<BaselineItem> {
-    let &FlexGridPolicy {
-        flex_row,
-        child_containing_height,
-        ..
-    } = policy;
     let mut baseline_items = Vec::new();
     for (layout, child) in items {
         let position = Point::new(
@@ -25,42 +20,37 @@ pub(super) fn place(
         );
         engine.geometry.set_point(child as usize, position);
         let assigned = nonnegative_size(layout.size);
-        let child_layout = layout_style(engine, child as usize);
-        let effective_cross_alignment = effective_align_self(engine, child as usize);
-        let has_cross_axis_auto_margin =
-            child_layout.margin_top_auto || child_layout.margin_bottom_auto;
-        let authored_height_is_definite = match engine.reader.style(child as usize).height() {
+        let child_layout = engine.read.reader.layout_style(child as usize);
+        let effective_cross_alignment = input.container.alignment(child_layout);
+        let has_cross_axis_auto_margin = Axis::Vertical.auto_margin(child_layout);
+        let authored_height_is_definite = match engine.read.reader.style(child as usize).height() {
             PreferredSize::Px(_) => true,
-            PreferredSize::Percent(_) | PreferredSize::Stretch => child_containing_height.is_some(),
-            PreferredSize::Calc { .. } => child_containing_height.is_some(),
-            PreferredSize::Comparison { .. } => child_containing_height.is_some(),
+            PreferredSize::Percent(_)
+            | PreferredSize::Stretch
+            | PreferredSize::Calc { .. }
+            | PreferredSize::Comparison { .. } => policy.child_containing_height.is_some(),
             PreferredSize::Auto
             | PreferredSize::Content
             | PreferredSize::MinContent
             | PreferredSize::MaxContent
             | PreferredSize::FitContent => false,
         };
-        let assigned_height_is_definite = if input.kind == TaffyContainerKind::Grid {
+        let assigned_height_is_definite = if input.container.kind == TaffyContainerKind::Grid {
             true
-        } else if flex_row {
-            authored_height_is_definite
-                || (!has_cross_axis_auto_margin
-                    && matches!(
-                        effective_cross_alignment,
-                        ItemAlignment::Normal | ItemAlignment::Stretch
-                    ))
+        } else if input.container.flex_row() {
+            authored_height_is_definite || input.container.cross_axis_stretches(child_layout)
         } else {
-            authored_height_is_definite || child_containing_height.is_some()
+            authored_height_is_definite || policy.child_containing_height.is_some()
         };
         let result = engine.layout_box(BoxLayoutRequest::assigned(
             child as usize,
             input.content_width,
-            child_containing_height,
+            policy.child_containing_height,
             assigned,
             assigned_height_is_definite,
         ));
         if !has_cross_axis_auto_margin
-            && (input.kind == TaffyContainerKind::Grid || flex_row)
+            && (input.container.kind == TaffyContainerKind::Grid || input.container.flex_row())
             && effective_cross_alignment == ItemAlignment::Baseline
         {
             baseline_items.push(BaselineItem {

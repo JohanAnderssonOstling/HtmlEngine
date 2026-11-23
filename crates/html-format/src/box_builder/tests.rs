@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::layout_model::{BlockBox, Children, InlineItemKind, LayoutMode};
+    use crate::layout_model::{Children, InlineItemKind, LayoutMode};
     use crate::parser::DocumentFactory;
 
     #[test]
@@ -134,7 +134,7 @@ mod tests {
         let LayoutMode::Block(block) = box_.layout_mode() else {
             panic!("first-letter float must be blockified")
         };
-        let Children::InlineItems(runs) = &block.children else {
+        let Children::InlineItems(runs) = block else {
             panic!("first-letter float needs inline source children")
         };
         let selected = document.inline_content().inline_items()
@@ -205,7 +205,7 @@ mod tests {
             .find(|&idx| document.get_tag(idx).eq_ignore_ascii_case("svg"))
             .expect("SVG replaced box");
         assert!(
-            matches!(document.box_at(svg_idx).map(|box_| box_.layout_mode()), Some(LayoutMode::Block(block)) if matches!(block.children, Children::InlineItems(_)))
+            matches!(document.box_at(svg_idx).map(|box_| box_.layout_mode()), Some(LayoutMode::Block(block)) if matches!(block, Children::InlineItems(_)))
         );
         assert!(
             document.layout_tree().get_box_image_idx(svg_idx).is_some(),
@@ -282,12 +282,13 @@ mod tests {
             .expect("outer div box");
         let Children::Blocks(children) =
             (match document.box_at(outer).map(|box_| box_.layout_mode()) {
-                Some(LayoutMode::Block(block)) => &block.children,
+                Some(LayoutMode::Block(block)) => block,
                 _ => panic!("outer div must establish block flow for its nested block descendant"),
             })
         else {
             panic!("split inline must become block-flow siblings")
         };
+        let children = document.layout_tree().child_slice(children);
         assert_eq!(
             children.len(),
             2,
@@ -306,11 +307,12 @@ mod tests {
             .expect("host div box");
         let Children::Blocks(children) = (match document.box_at(host).map(|box_| box_.layout_mode())
         {
-            Some(LayoutMode::Block(block)) => &block.children,
+            Some(LayoutMode::Block(block)) => block,
             _ => panic!("host must establish block flow around the nested paragraph"),
         }) else {
             panic!("nested block-in-inline fixup must produce block-flow siblings")
         };
+        let children = document.layout_tree().child_slice(children);
         assert_eq!(
             children.len(),
             3,
@@ -568,7 +570,7 @@ mod tests {
 
         let children = match document.box_at(section_idx) {
             Some(box_) => match box_.layout_mode() {
-                LayoutMode::Block(block) => &block.children,
+                LayoutMode::Block(block) => block,
                 _ => panic!("section should use LayoutMode::Block"),
             },
             None => panic!("section box should exist"),
@@ -577,6 +579,8 @@ mod tests {
         let Children::Blocks(children) = children else {
             panic!("section should contain block children");
         };
+
+        let children = document.layout_tree().child_slice(children);
 
         assert_eq!(
             children.len(),
@@ -597,7 +601,7 @@ mod tests {
 
         let children = match document.box_at(section_idx) {
             Some(box_) => match box_.layout_mode() {
-                LayoutMode::Block(block) => &block.children,
+                LayoutMode::Block(block) => block,
                 _ => panic!("section should use LayoutMode::Block"),
             },
             None => panic!("section box should exist"),
@@ -606,6 +610,8 @@ mod tests {
         let Children::Blocks(children) = children else {
             panic!("section should contain block children");
         };
+
+        let children = document.layout_tree().child_slice(children);
 
         assert_eq!(
             children.len(),
@@ -772,7 +778,7 @@ mod tests {
 
         let children = match document.box_at(div_idx) {
             Some(box_) => match box_.layout_mode() {
-                LayoutMode::Block(block) => &block.children,
+                LayoutMode::Block(block) => block,
                 _ => panic!("div should use LayoutMode::Block"),
             },
             None => panic!("div box should exist"),
@@ -781,6 +787,8 @@ mod tests {
         let Children::Blocks(children) = children else {
             panic!("div should contain block children");
         };
+
+        let children = document.layout_tree().child_slice(children);
 
         assert_eq!(
             children.len(),
@@ -824,7 +832,7 @@ mod tests {
 
         let children = match document.box_at(div_idx) {
             Some(box_) => match box_.layout_mode() {
-                LayoutMode::Block(block) => &block.children,
+                LayoutMode::Block(block) => block,
                 _ => panic!("div should use LayoutMode::Block"),
             },
             None => panic!("div box should exist"),
@@ -833,6 +841,8 @@ mod tests {
         let Children::Blocks(children) = children else {
             panic!("div should contain block children");
         };
+
+        let children = document.layout_tree().child_slice(children);
 
         assert_eq!(children.len(), 2);
         let row = match document
@@ -885,7 +895,9 @@ mod tests {
             .map(|box_| box_.layout_mode())
         {
             Some(LayoutMode::TableCell(cell)) => match &cell.children {
-                Children::Blocks(children) => *children
+                Children::Blocks(children) => *document
+                    .layout_tree()
+                    .child_slice(children)
                     .first()
                     .expect("anonymous cell should contain a corrected table root"),
                 _ => panic!("anonymous cell should establish block flow around the nested table"),
@@ -918,8 +930,8 @@ mod tests {
             .find(|&i| document.get_id(i) == Some("host"))
             .expect("host box should exist");
         let children = match document.box_at(host).map(|box_| box_.layout_mode()) {
-            Some(LayoutMode::Block(block)) => match &block.children {
-                Children::Blocks(children) => children,
+            Some(LayoutMode::Block(block)) => match block {
+                Children::Blocks(children) => document.layout_tree().child_slice(children),
                 _ => panic!("host should use block children"),
             },
             _ => panic!("host should be a block"),
@@ -961,8 +973,10 @@ mod tests {
             .find(|&i| document.get_id(i) == Some("host"))
             .expect("host box should exist");
         let table = match document.box_at(host).map(|box_| box_.layout_mode()) {
-            Some(LayoutMode::Block(block)) => match &block.children {
-                Children::Blocks(children) => children[0] as usize,
+            Some(LayoutMode::Block(block)) => match block {
+                Children::Blocks(children) => {
+                    document.layout_tree().child_slice(children)[0] as usize
+                }
                 _ => panic!("host should use block children"),
             },
             _ => panic!("host should be a block"),
@@ -1391,13 +1405,14 @@ mod tests {
         let Children::Blocks(children) = &document
             .box_at(target)
             .and_then(|box_| match box_.layout_mode() {
-                LayoutMode::Block(block) => Some(&block.children),
+                LayoutMode::Block(block) => Some(block),
                 _ => None,
             })
             .expect("target should establish block flow")
         else {
             panic!("generated block pseudos should split the target into block children");
         };
+        let children = document.layout_tree().child_slice(children);
 
         assert_eq!(
             children.len(),
@@ -1470,13 +1485,14 @@ mod tests {
             let Children::Blocks(children) = &document
                 .box_at(target)
                 .and_then(|box_| match box_.layout_mode() {
-                    LayoutMode::Block(block) => Some(&block.children),
+                    LayoutMode::Block(block) => Some(block),
                     _ => None,
                 })
                 .expect("generated table principal should enter block flow")
             else {
                 panic!("generated table principal should be a block child");
             };
+            let children = document.layout_tree().child_slice(children);
             assert_eq!(
                 children.len(),
                 1,
@@ -1645,8 +1661,9 @@ mod tests {
         else {
             panic!("expected flex layout")
         };
-        assert_eq!(layout.children.len(), 2);
-        assert!(layout.children.iter().all(|&child| {
+        let layout = document.layout_tree().child_slice(layout);
+        assert_eq!(layout.len(), 2);
+        assert!(layout.iter().all(|&child| {
             document
                 .box_at(child as usize)
                 .is_some_and(|box_| box_.parent() == Some(flex as u32))
@@ -1694,9 +1711,10 @@ mod tests {
         else {
             panic!("main should be a block")
         };
-        let Children::Blocks(children) = &block.children else {
+        let Children::Blocks(children) = block else {
             panic!("table internals should make block children")
         };
+        let children = document.layout_tree().child_slice(children);
         assert!(children.iter().any(|&child| {
             matches!(
                 document
@@ -1798,9 +1816,7 @@ mod tests {
             .expect("div box");
         assert!(matches!(
             document.box_at(div).map(|box_| box_.layout_mode()),
-            Some(LayoutMode::Block(BlockBox {
-                children: Children::Empty
-            }))
+            Some(LayoutMode::Block(Children::Empty))
         ));
     }
 
@@ -1817,8 +1833,9 @@ mod tests {
         else {
             panic!("expected flex layout")
         };
+        let layout = document.layout_tree().child_slice(layout);
         assert_eq!(
-            layout.children.len(),
+            layout.len(),
             1,
             "contiguous boxless generated text belongs to one anonymous flex item"
         );

@@ -15,8 +15,11 @@ mod s04_align;
 use kurbo::{Point, Size};
 use taffy::geometry::Size as TaffySize;
 use taffy::prelude::{AvailableSpace, Dimension, Layout, Style};
-use taffy::style::Display as TaffyDisplay;
 
+mod compatibility;
+mod container;
+mod sizing;
+use compatibility::ensure_grid_algorithm_root;
 mod intrinsic;
 mod item_sizing;
 mod measurement;
@@ -31,6 +34,7 @@ pub enum TaffyContainerKind {
     Grid,
 }
 
+pub(crate) use container::layout_container;
 pub(crate) use s00_layout::layout;
 
 pub(crate) struct FlexGridInput<'a> {
@@ -41,11 +45,10 @@ pub(crate) struct FlexGridInput<'a> {
     pub(crate) explicit_height: Option<f64>,
     pub(crate) min_height: Option<f64>,
     pub(crate) max_height: Option<f64>,
-    pub(crate) kind: TaffyContainerKind,
+    pub(super) container: sizing::ContainerFacts,
 }
 
 struct FlexGridPolicy {
-    flex_row: bool,
     size_containment: bool,
     child_containing_height: Option<f64>,
 }
@@ -68,7 +71,7 @@ struct BaselineItem {
     original_y: f64,
     height: f64,
     baseline: f64,
-    placement: crate::layout::PlacementId,
+    placement: crate::PlacementId,
 }
 
 fn finite_f32(value: f64) -> f32 {
@@ -83,19 +86,5 @@ fn nonnegative_size(size: TaffySize<f32>) -> Size {
     Size::new(size.width.max(0.0) as f64, size.height.max(0.0) as f64)
 }
 
-/// Taffy dispatches every childless node through generic leaf layout even
-/// when its display mode is Grid. A non-generated sentinel keeps empty grids
-/// on the Grid path without occupying an auto-fit track.
-fn ensure_grid_algorithm_root(children: &mut Vec<(Style, Option<u32>)>, kind: TaffyContainerKind) {
-    if kind == TaffyContainerKind::Grid && children.is_empty() {
-        children.push((
-            Style {
-                display: TaffyDisplay::None,
-                ..Style::default()
-            },
-            None,
-        ));
-    }
-}
-
-include!("tests.rs");
+#[cfg(test)]
+mod tests;

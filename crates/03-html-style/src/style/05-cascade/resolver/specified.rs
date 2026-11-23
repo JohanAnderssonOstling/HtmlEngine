@@ -8,7 +8,7 @@ use super::context::ResolvedDeclaration;
 use super::custom_properties::CustomPropertyScratch;
 use super::plan::MatchedRule;
 use super::runner::SubstitutionCache;
-use crate::style::cascade::resolver::prepared_native::PreparedNativeValue;
+use crate::style::cascade::resolver::prepared_native::PreparedLonghand;
 use crate::style::compiled::{
     CascadeOrigin, DeclarationId, EffectiveRuleId, PreparedRuleSet, RulePriority,
 };
@@ -16,7 +16,6 @@ use crate::style::property_catalogue::PropertyKey;
 use crate::style::rules::prepared::PreparedDeclarationBlock;
 use crate::style::source::inline::PreparedInlineStyle;
 use crate::style::syntax::capabilities::declaration_is_custom_property;
-use crate::style::syntax::prepared_renderer::PreparedRendererValue;
 use crate::style::syntax::wide_keywords::CssWideKeyword;
 use crate::style::syntax::wide_keywords::property_css_wide_keyword;
 use lightningcss::properties::Property;
@@ -129,19 +128,35 @@ pub(super) struct DeclarationEvent {
     pub(super) boundary: CascadeBoundary,
 }
 
-struct DeclarationView<'a, 'css> {
-    property: &'a Property<'css>,
-    targets: &'a [PropertyKey],
-    longhands: Option<&'a [Property<'css>]>,
-    renderer: Option<&'a PreparedRendererValue>,
-    native: &'a [Option<PreparedNativeValue>],
-    eligible: bool,
+pub(super) struct DeclarationView<'a, 'css> {
+    pub(super) property: &'a Property<'css>,
+    pub(super) targets: &'a [PropertyKey],
+    pub(super) values: &'a [PreparedLonghand],
+    pub(super) eligible: bool,
+    pub(super) requires_viewport_height: bool,
 }
 
 impl DeclarationEvent {
-    fn view<'a, 'css>(&self, element: ElementDeclarations<'a, 'css>) -> DeclarationView<'a, 'css> {
+    pub(super) fn declaration_id(&self, element: ElementDeclarations<'_, '_>) -> DeclarationId {
+        match self.boundary {
+            CascadeBoundary::Rule { important, .. } => element
+                .prepared
+                .expect("stylesheet declaration blocks")
+                .declaration_id(EffectiveRuleId(self.block), important, self.index as usize),
+            CascadeBoundary::Inline { important, .. } => element
+                .inline
+                .expect("inline declaration block")
+                .declaration_id(important, self.index as usize),
+            CascadeBoundary::Hints => unreachable!("HTML hints do not declare custom properties"),
+        }
+    }
+
+    pub(super) fn view<'a, 'css>(
+        &self,
+        element: ElementDeclarations<'a, 'css>,
+    ) -> DeclarationView<'a, 'css> {
         let index = self.index as usize;
-        let (property, targets, longhands, renderer, native, eligible) = match self.boundary {
+        let (property, (block, index)) = match self.boundary {
             CascadeBoundary::Rule { important, .. } => {
                 let prepared = element.prepared.expect("stylesheet declaration blocks");
                 let id = EffectiveRuleId(self.block);
@@ -151,15 +166,7 @@ impl DeclarationEvent {
                 } else {
                     &rule.declarations.declarations[index]
                 };
-                let (targets, eligible) = prepared.declaration_metadata(id, important, index);
-                (
-                    property,
-                    targets,
-                    prepared.declaration_longhands(id, important, index),
-                    prepared.renderer_value(id, important, index),
-                    prepared.native_values(id, important, index),
-                    eligible,
-                )
+                (property, prepared.declaration_block(id, important, index))
             }
             CascadeBoundary::Inline { important, .. } => {
                 let inline = element.inline.expect("inline declaration block");
@@ -168,51 +175,28 @@ impl DeclarationEvent {
                 } else {
                     &inline.declarations.declarations[index]
                 };
-                let (targets, eligible) = inline.metadata(important, index);
-                (
-                    property,
-                    targets,
-                    inline.longhands(important, index),
-                    inline.renderer_value(important, index),
-                    inline.native_values(important, index),
-                    eligible,
-                )
+                (property, inline.declaration_block(important, index))
             }
-            CascadeBoundary::Hints => {
-                let block = element.hint_preparation.expect("hint declaration block");
-                let (targets, eligible) = block.metadata(index);
+            CascadeBoundary::Hints => (
+                &element.hints[index],
                 (
-                    &element.hints[index],
-                    targets,
-                    block.longhands(index),
-                    block.renderer_value(index),
-                    block.native_values(index),
-                    eligible,
-                )
-            }
+                    element.hint_preparation.expect("hint declaration block"),
+                    index,
+                ),
+            ),
         };
+        let (targets, eligible) = block.metadata(index);
         DeclarationView {
             property,
             targets,
-            longhands,
-            renderer,
-            native,
+            values: block.values(index),
             eligible,
+            requires_viewport_height: block.requires_viewport_height(index),
         }
     }
 
-    pub(super) fn rule_property<'a, 'css>(
-        &self,
-        element: ElementDeclarations<'a, 'css>,
-    ) -> Option<(DeclarationId, &'a Property<'css>)> {
-        let CascadeBoundary::Rule { important, .. } = self.boundary else {
-            return None;
-        };
-        let id = element
-            .prepared
-            .expect("stylesheet declaration blocks")
-            .declaration_id(EffectiveRuleId(self.block), important, self.index as usize);
-        Some((id, self.property(element)))
+    pub(super) fn rule_id(&self, element: ElementDeclarations<'_, '_>) -> Option<DeclarationId> {
+        matches!(self.boundary, CascadeBoundary::Rule { .. }).then(|| self.declaration_id(element))
     }
 
     pub(super) fn property<'a, 'css>(
@@ -220,57 +204,6 @@ impl DeclarationEvent {
         element: ElementDeclarations<'a, 'css>,
     ) -> &'a Property<'css> {
         self.view(element).property
-    }
-    pub(super) fn native_values<'a, 'css>(
-        &self,
-        element: ElementDeclarations<'a, 'css>,
-    ) -> &'a [Option<PreparedNativeValue>] {
-        self.view(element).native
-    }
-    pub(super) fn renderer_value<'a, 'css>(
-        &self,
-        element: ElementDeclarations<'a, 'css>,
-    ) -> Option<&'a PreparedRendererValue> {
-        self.view(element).renderer
-    }
-    pub(super) fn prepared_longhands<'a, 'css>(
-        &self,
-        element: ElementDeclarations<'a, 'css>,
-    ) -> Option<&'a [Property<'css>]> {
-        self.view(element).longhands
-    }
-    pub(super) fn prepared_targets<'a, 'css>(
-        &self,
-        element: ElementDeclarations<'a, 'css>,
-    ) -> &'a [PropertyKey] {
-        self.view(element).targets
-    }
-    pub(super) fn requires_viewport_height(&self, element: ElementDeclarations<'_, '_>) -> bool {
-        match self.boundary {
-            CascadeBoundary::Rule { important, .. } => element
-                .prepared
-                .expect("prepared rules")
-                .declaration_requires_viewport_height(
-                    EffectiveRuleId(self.block),
-                    important,
-                    self.index as usize,
-                ),
-            CascadeBoundary::Inline { important, .. } => element
-                .inline
-                .expect("prepared inline")
-                .requires_viewport_height(important, self.index as usize),
-            CascadeBoundary::Hints => element
-                .hint_preparation
-                .expect("prepared hints")
-                .requires_viewport_height(self.index as usize),
-        }
-    }
-
-    pub(super) fn prepared_renderer_eligibility(
-        &self,
-        element: ElementDeclarations<'_, '_>,
-    ) -> bool {
-        self.view(element).eligible
     }
 }
 
@@ -358,7 +291,7 @@ pub(super) struct CascadeScratch<'css> {
 pub(super) struct CascadeComputation<'css> {
     pub(super) valid_events: Vec<DeclarationEvent>,
     pub(super) selection: SpecifiedSelection,
-    // Retain each entry's native-value buffers between elements.
+    // Retain each entry's values-value buffers between elements.
     pub(super) resolved: Vec<ResolvedDeclaration<'css>>,
     // Aligned with valid_events; usize::MAX denotes an unresolved declaration.
     pub(super) slots: Vec<usize>,
@@ -678,18 +611,17 @@ pub(super) fn select_specified_values<'sheet, 'css>(
     selected.targets.reserve(events.len());
 
     for (sequence, event) in events.iter().enumerate().rev() {
-        let property = event.property(element);
-        if declaration_is_custom_property(property) {
+        let prepared = event.view(element);
+        if declaration_is_custom_property(prepared.property) {
             continue;
         }
-        let targets = event.prepared_targets(element);
-        let is_all = matches!(property, Property::All(_));
+        let is_all = matches!(prepared.property, Property::All(_));
 
         if is_all {
             match candidate_action(
                 &global_rollbacks,
                 event.boundary,
-                property_css_wide_keyword(property).and_then(rollback_keyword),
+                property_css_wide_keyword(prepared.property).and_then(rollback_keyword),
             ) {
                 CandidateAction::Excluded => continue,
                 CandidateAction::Rollback(kind) => {
@@ -697,10 +629,10 @@ pub(super) fn select_specified_values<'sheet, 'css>(
                 }
                 CandidateAction::Select if !all_claimed => {
                     let target_start = selected.targets.len();
-                    selected.targets.extend_from_slice(targets);
+                    selected.targets.extend_from_slice(prepared.targets);
                     selected.declarations.push(SelectedDeclaration {
                         target_start,
-                        target_len: targets.len(),
+                        target_len: prepared.targets.len(),
                         sequence,
                     });
                     all_claimed = true;
@@ -711,7 +643,7 @@ pub(super) fn select_specified_values<'sheet, 'css>(
         }
 
         let target_start = selected.targets.len();
-        for &target in targets {
+        for &target in prepared.targets {
             // `all` deliberately excludes direction and custom properties.
             if (target.affected_by_all() && all_claimed) || claimed.contains(target) {
                 continue;
@@ -727,7 +659,7 @@ pub(super) fn select_specified_values<'sheet, 'css>(
             match rollbacks.action(
                 target,
                 event.boundary,
-                property_css_wide_keyword(property).and_then(rollback_keyword),
+                property_css_wide_keyword(prepared.property).and_then(rollback_keyword),
             ) {
                 CandidateAction::Excluded => continue,
                 CandidateAction::Rollback(kind) => {

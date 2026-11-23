@@ -1,4 +1,3 @@
-use html_style_model::{OpenTypeFeature, OpenTypeFeatureKind, open_type};
 use lightningcss::properties::font::{AbsoluteFontWeight, FontWeight};
 
 pub(in crate::style::cascade::resolver) fn checked_font_weight(
@@ -40,39 +39,4 @@ pub(in crate::style::cascade::resolver) fn computed_flex_factor(value: f32) -> f
     // Source validation rejects negative literals. Calculated results clamp
     // at computed-value time; NaN is censored to zero.
     value.max(0.0).min(MAX_COMPUTED_FLEX_FACTOR)
-}
-
-pub(in crate::style::cascade::resolver) fn font_variant_caps_features(
-    value: &lightningcss::properties::font::FontVariantCaps,
-) -> Vec<OpenTypeFeature> {
-    use lightningcss::properties::font::FontVariantCaps;
-    match value {
-        FontVariantCaps::Normal => Vec::new(),
-        FontVariantCaps::SmallCaps => vec![open_type::open_type_feature_new(
-            OpenTypeFeatureKind::SmallCaps,
-            1,
-        )],
-        FontVariantCaps::AllSmallCaps => vec![
-            open_type::open_type_feature_new(OpenTypeFeatureKind::SmallCaps, 1),
-            open_type::open_type_feature_new(OpenTypeFeatureKind::CapitalsToSmallCaps, 1),
-        ],
-        FontVariantCaps::PetiteCaps => {
-            vec![open_type::open_type_feature_new(
-                OpenTypeFeatureKind::PetiteCaps,
-                1,
-            )]
-        }
-        FontVariantCaps::AllPetiteCaps => vec![
-            open_type::open_type_feature_new(OpenTypeFeatureKind::PetiteCaps, 1),
-            open_type::open_type_feature_new(OpenTypeFeatureKind::CapitalsToPetiteCaps, 1),
-        ],
-        FontVariantCaps::Unicase => vec![open_type::open_type_feature_new(
-            OpenTypeFeatureKind::Unicase,
-            1,
-        )],
-        FontVariantCaps::TitlingCaps => vec![open_type::open_type_feature_new(
-            OpenTypeFeatureKind::TitlingCapitals,
-            1,
-        )],
-    }
 }

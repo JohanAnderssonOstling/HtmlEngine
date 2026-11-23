@@ -4,19 +4,36 @@ pub(in crate::style::cascade::resolver) fn css_color_to_u32(
     color: &CssColor,
     current_color: u32,
 ) -> u32 {
-    match color {
-        CssColor::RGBA(rgba) => rgba_to_u32(rgba),
-        CssColor::CurrentColor => current_color,
-        CssColor::System(system) => system_color_to_u32(system),
-        // This renderer has a fixed light color scheme. Conversion is paid
-        // only for authored non-sRGB colors; the common RGBA path above stays
-        // a direct integer pack.
-        CssColor::LightDark(light, _) => css_color_to_u32(light, current_color),
-        other => match other.to_rgb() {
-            Ok(CssColor::RGBA(rgba)) => rgba_to_u32(&rgba),
-            Ok(CssColor::LightDark(light, _)) => css_color_to_u32(&light, current_color),
-            _ => 0x000000FF,
-        },
+    PreparedColor::new(color).resolve(current_color)
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PreparedColor {
+    rgba: Option<u32>,
+    pub(crate) current_color: bool,
+}
+
+impl PreparedColor {
+    pub(crate) fn new(color: &CssColor) -> Self {
+        let rgba = match color {
+            CssColor::RGBA(rgba) => Some(rgba_to_u32(rgba)),
+            CssColor::CurrentColor => None,
+            CssColor::System(system) => Some(system_color_to_u32(system)),
+            CssColor::LightDark(light, _) => Self::new(light).rgba,
+            other => match other.to_rgb() {
+                Ok(CssColor::RGBA(rgba)) => Some(rgba_to_u32(&rgba)),
+                Ok(CssColor::LightDark(light, _)) => Self::new(&light).rgba,
+                _ => Some(0x000000FF),
+            },
+        };
+        Self {
+            rgba,
+            current_color: matches!(color, CssColor::CurrentColor),
+        }
+    }
+
+    pub(crate) fn resolve(self, current_color: u32) -> u32 {
+        self.rgba.unwrap_or(current_color)
     }
 }
 

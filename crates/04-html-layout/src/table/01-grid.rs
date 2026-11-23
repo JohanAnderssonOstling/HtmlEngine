@@ -1,16 +1,20 @@
-use crate::layout::{LayoutEngine, UsedBorderInsets};
-use html_engine_model::{LayoutMode, TableColumnGroupSpan, TableColumnTrack, TableColumnWidthHint};
+//! Prepare cell placements, effective columns, borders, and spacing for sizing and layout.
+
+use crate::{LayoutEngine, UsedBorderInsets};
+use html_engine_model::{LayoutMode, TableBox, TableColumnGroupSpan, TableColumnTrack};
 use html_style_model::{BorderCollapseMode, TableLayoutMode, UsedPreferredSize};
 
 use super::borders::CollapsedBorderGrid;
-use super::columns::{TableGrid, build_table_grid, column_width_constraints};
+use super::columns::column_width_constraints;
+use super::grid::{TableGrid, build_table_grid};
 
 /// Shared grid preparation for intrinsic sizing and final table layout.
-pub(super) struct PreparedTableGrid {
+pub(super) struct PreparedTableGrid<'tree> {
+    pub(super) rows: &'tree [u32],
+    pub(super) row_groups: Vec<(u32, std::ops::Range<usize>)>,
     pub(super) grid: TableGrid,
     pub(super) columns: Vec<TableColumnTrack>,
     pub(super) column_groups: Vec<TableColumnGroupSpan>,
-    pub(super) column_width_hints: Vec<TableColumnWidthHint>,
     pub(super) collapsed_borders: Option<CollapsedBorderGrid>,
     pub(super) outer_borders: UsedBorderInsets,
     pub(super) horizontal_spacing: f64,
@@ -18,35 +22,48 @@ pub(super) struct PreparedTableGrid {
     pub(super) fixed_mode: bool,
 }
 
-pub(super) fn prepare_table_grid(
+pub(super) fn prepare_table_grid<'tree>(
     engine: &LayoutEngine<'_, '_>,
     table_box_idx: usize,
-    rows: &[u32],
-) -> PreparedTableGrid {
-    let style = engine.reader.style(table_box_idx);
+    table: &'tree TableBox,
+) -> PreparedTableGrid<'tree> {
+    let style = engine.read.reader.style(table_box_idx);
     let fixed_mode = matches!(style.table_layout(), TableLayoutMode::Fixed)
         && !matches!(style.width(), UsedPreferredSize::Auto);
     let collapsed = matches!(style.border_collapse(), BorderCollapseMode::Collapse);
-    let (row_groups, columns, column_groups, hints) = match engine.reader.box_table(table_box_idx) {
-        Some(table) => (
-            table.row_groups.as_slice(),
-            table.columns.as_slice(),
-            table.column_groups.as_slice(),
-            table.column_width_hints.as_slice(),
-        ),
-        _ => (&[][..], &[][..], &[][..], &[][..]),
+    let (grid, track_sources, logical_to_effective) = effective_table_grid(
+        engine,
+        table_grid(engine, &table.rows),
+        &table.columns,
+        fixed_mode,
+    );
+    let rows = if grid.placements.is_empty() {
+        &[][..]
+    } else {
+        table.rows.as_slice()
     };
-    let (grid, track_sources, logical_to_effective) =
-        effective_table_grid(engine, table_grid(engine, rows), hints, fixed_mode);
-    let column_width_hints = track_sources
+    let mut parent_ranges = rustc_data_structures::fx::FxHashMap::default();
+    for (row, &row_idx) in rows.iter().enumerate() {
+        if let Some(parent) = engine.read.reader.get_parent(row_idx as usize) {
+            parent_ranges.entry(parent).or_insert(row..row + 1).end = row + 1;
+        }
+    }
+    let row_groups = table
+        .row_groups
         .iter()
-        .filter_map(|&source| hints.get(source).copied())
-        .collect();
+        .filter_map(|&group| {
+            parent_ranges
+                .get(&(group as usize))
+                .cloned()
+                .map(|range| (group, range))
+        })
+        .collect::<Vec<_>>();
     let columns = track_sources
         .iter()
-        .filter_map(|&source| columns.get(source).cloned())
+        .filter_map(|&source| table.columns.get(source).cloned())
         .collect::<Vec<_>>();
-    let column_groups = column_groups
+    let column_groups = table
+        .column_groups
         .iter()
         .filter_map(|group| {
             let logical_end = group
@@ -67,10 +84,11 @@ pub(super) fn prepare_table_grid(
         .collect::<Vec<_>>();
     let collapsed_borders = (collapsed && grid.column_count > 0).then(|| {
         CollapsedBorderGrid::build(
-            &engine.reader,
+            &engine.read.reader,
             table_box_idx,
             rows,
-            row_groups,
+            &row_groups,
+            grid.column_count,
             &grid.placements,
             &columns,
             &column_groups,
@@ -80,18 +98,19 @@ pub(super) fn prepare_table_grid(
         .as_ref()
         .map_or_else(UsedBorderInsets::default, CollapsedBorderGrid::outer_insets);
     PreparedTableGrid {
+        rows,
+        row_groups,
         grid,
         columns,
         column_groups,
-        column_width_hints,
         collapsed_borders,
         outer_borders,
-        horizontal_spacing: if collapsed {
+        horizontal_spacing: if collapsed || rows.is_empty() {
             0.0
         } else {
             style.border_spacing_horizontal().max(0.0) as f64
         },
-        vertical_spacing: if collapsed {
+        vertical_spacing: if collapsed || rows.is_empty() {
             0.0
         } else {
             style.border_spacing_vertical().max(0.0) as f64
@@ -106,22 +125,16 @@ fn table_grid(engine: &LayoutEngine<'_, '_>, rows: &[u32]) -> TableGrid {
         // A cell cannot span beyond its row group. Clamp here so both track
         // placement and height distribution use the same effective rowspan.
         if row_position == group_end {
-            let row_parent = engine.reader.get_parent(row_idx as usize);
-            group_end += rows[row_position..]
-                .iter()
-                .take_while(|&&candidate| {
-                    engine.reader.get_parent(candidate as usize) == row_parent
-                })
-                .count();
+            group_end = super::row_group_end(&engine.read.reader, rows, row_position);
         }
         let remaining_group_rows = group_end - row_position;
-        let cells = match engine.reader.box_layout_mode(row_idx as usize) {
+        let cells = match engine.read.reader.box_layout_mode(row_idx as usize) {
             Some(LayoutMode::TableRow(row)) => row.cells.as_slice(),
             _ => &[],
         };
         cells.iter().map(move |&cell_idx| {
             let cell_idx = cell_idx as usize;
-            let (colspan, rowspan) = match engine.reader.box_layout_mode(cell_idx) {
+            let (colspan, rowspan) = match engine.read.reader.box_layout_mode(cell_idx) {
                 Some(LayoutMode::TableCell(cell)) => (cell.colspan, cell.rowspan),
                 _ => (1, 1),
             };
@@ -133,10 +146,14 @@ fn table_grid(engine: &LayoutEngine<'_, '_>, rows: &[u32]) -> TableGrid {
 fn effective_table_grid(
     engine: &LayoutEngine<'_, '_>,
     mut grid: TableGrid,
-    hints: &[TableColumnWidthHint],
+    columns: &[TableColumnTrack],
     fixed_mode: bool,
 ) -> (TableGrid, Vec<usize>, Vec<usize>) {
-    let logical_count = grid.column_count.max(hints.len());
+    if grid.placements.is_empty() {
+        grid.column_count = 0;
+        return (grid, Vec::new(), Vec::new());
+    }
+    let logical_count = grid.column_count.max(columns.len());
     if logical_count == 0 {
         return (grid, Vec::new(), Vec::new());
     }
@@ -158,8 +175,8 @@ fn effective_table_grid(
     let mut retained = Vec::new();
     for (column, effective) in logical_to_effective.iter_mut().enumerate() {
         if *effective == usize::MAX
-            || hints.get(column).is_some_and(|hint| {
-                let (minimum, width) = column_width_constraints(&engine.reader, *hint);
+            || columns.get(column).is_some_and(|track| {
+                let (minimum, width) = column_width_constraints(&engine.read.reader, track);
                 minimum > 0.0 || width.is_some_and(|width| width > 0.0)
             })
         {

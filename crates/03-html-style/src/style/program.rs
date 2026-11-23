@@ -9,6 +9,7 @@ use crate::style::source::resource::{ResourceStylesheet, ResourceStylesheetEntry
 use crate::style::timings::StyleTimings;
 use html_dom::{Document, DomNodeId};
 use html_style_model::{ComputedStyles, FontFace, ReaderStyleOverrides};
+use rustc_data_structures::fx::FxHashMap;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use web_time::Instant;
@@ -45,7 +46,7 @@ struct CachedStyleProgram {
 }
 
 struct CachedSource {
-    css: Arc<str>,
+    last_used: u64,
     complete: Option<Option<ResourceStylesheet>>,
     entries: Option<Vec<ResourceStylesheetEntry>>,
 }
@@ -57,7 +58,7 @@ pub struct StyleProgramCache {
     capacity: usize,
     hits: u64,
     misses: u64,
-    resource_sources: VecDeque<CachedSource>,
+    resource_sources: FxHashMap<Arc<str>, CachedSource>,
     parsed_capacity: usize,
     parsed_hits: u64,
     parsed_misses: u64,
@@ -71,7 +72,7 @@ impl Default for StyleProgramCache {
             capacity: 8,
             hits: 0,
             misses: 0,
-            resource_sources: VecDeque::new(),
+            resource_sources: FxHashMap::default(),
             parsed_capacity: 64,
             parsed_hits: 0,
             parsed_misses: 0,
@@ -114,26 +115,32 @@ impl StyleProgramCache {
     }
 
     fn source(&mut self, css: &str) -> &mut CachedSource {
-        if let Some(index) = self
-            .resource_sources
-            .iter()
-            .position(|source| source.css.as_ref() == css)
-        {
+        let last_used = self.parsed_hits + self.parsed_misses;
+        if self.resource_sources.contains_key(css) {
             self.parsed_hits += 1;
-            let source = self.resource_sources.remove(index).expect("source index");
-            self.resource_sources.push_back(source);
         } else {
             self.parsed_misses += 1;
             if self.resource_sources.len() == self.parsed_capacity {
-                self.resource_sources.pop_front();
+                let oldest = self
+                    .resource_sources
+                    .iter()
+                    .min_by_key(|(_, source)| source.last_used)
+                    .map(|(css, _)| css.clone())
+                    .expect("full source cache");
+                self.resource_sources.remove(&oldest);
             }
-            self.resource_sources.push_back(CachedSource {
-                css: Arc::from(css),
-                complete: None,
-                entries: None,
-            });
+            self.resource_sources.insert(
+                Arc::from(css),
+                CachedSource {
+                    last_used,
+                    complete: None,
+                    entries: None,
+                },
+            );
         }
-        self.resource_sources.back_mut().expect("cached source")
+        let source = self.resource_sources.get_mut(css).expect("cached source");
+        source.last_used = last_used;
+        source
     }
 
     /// Reuse parser output before resolving resource-specific font URLs/imports.
@@ -275,28 +282,110 @@ impl StyleProgram {
     }
 }
 
-pub(crate) fn apply(
+/// A document's stylesheet bindings and resolution options.
+/// Compilation can be fresh, cached, or supplied by the caller.
+pub struct StyleRequest<'a> {
     document: Document,
-    program: &StyleProgram,
-    inputs: &[AuthorStylesheetInput<'_>],
-    timings: StyleTimings,
-    reader_overrides: &ReaderStyleOverrides,
-) -> (StyledDocument, StyleTimings, MediaQuerySet) {
-    let author_roots = inputs
-        .iter()
-        .map(|input| input.implicit_scope_root)
-        .collect::<Vec<_>>();
-    let (styles, timings, queries) =
-        resolve_document_with_program(&document, program, &author_roots, timings, reader_overrides);
-    (
-        StyledDocument {
+    inputs: Vec<AuthorStylesheetInput<'a>>,
+    environment: MediaEnvironment,
+    reader_overrides: Option<&'a ReaderStyleOverrides>,
+}
+
+impl<'a> StyleRequest<'a> {
+    pub fn new(document: Document, inputs: &[AuthorStylesheetInput<'a>]) -> Self {
+        Self {
             document,
-            styles,
-            font_faces: program.compiled.rules.font_faces().clone(),
-        },
-        timings,
-        queries,
-    )
+            inputs: inputs.to_vec(),
+            environment: MediaEnvironment::default(),
+            reader_overrides: None,
+        }
+    }
+
+    pub fn from_css(document: Document, css: &[&'a str]) -> Self {
+        let root = document.dom_root();
+        Self {
+            document,
+            inputs: css
+                .iter()
+                .map(|css| AuthorStylesheetInput {
+                    css,
+                    implicit_scope_root: root,
+                })
+                .collect(),
+            environment: MediaEnvironment::default(),
+            reader_overrides: None,
+        }
+    }
+
+    pub fn environment(mut self, environment: MediaEnvironment) -> Self {
+        self.environment = environment;
+        self
+    }
+
+    pub fn reader_overrides(mut self, overrides: &'a ReaderStyleOverrides) -> Self {
+        self.reader_overrides = Some(overrides);
+        self
+    }
+
+    pub fn compile(self) -> (StyledDocument, StyleTimings, MediaQuerySet) {
+        let (program, timings) = StyleProgram::compile_with_timings(
+            self.inputs.iter().map(|input| input.css),
+            self.environment,
+            self.document.root_font_size(),
+        );
+        self.apply(&program, timings)
+    }
+
+    pub fn compile_cached(
+        self,
+        cache: &mut StyleProgramCache,
+    ) -> (StyledDocument, StyleTimings, MediaQuerySet) {
+        let (program, timings) = cache.get_or_compile(
+            &self.inputs,
+            self.environment,
+            self.document.root_font_size(),
+        );
+        self.apply(&program, timings)
+    }
+
+    /// Resolve using the supplied program's already compiled environment.
+    pub fn resolve(self, program: &StyleProgram) -> (StyledDocument, StyleTimings, MediaQuerySet) {
+        self.apply(program, StyleTimings::default())
+    }
+
+    fn apply(
+        self,
+        program: &StyleProgram,
+        timings: StyleTimings,
+    ) -> (StyledDocument, StyleTimings, MediaQuerySet) {
+        let author_roots = self
+            .inputs
+            .iter()
+            .map(|input| input.implicit_scope_root)
+            .collect::<Vec<_>>();
+        let (styles, timings, queries) = resolve_document_with_program(
+            &self.document,
+            program,
+            &author_roots,
+            timings,
+            self.reader_overrides
+                .unwrap_or(&ReaderStyleOverrides::default()),
+        );
+        (
+            StyledDocument {
+                document: self.document,
+                styles,
+                font_faces: program.compiled.rules.font_faces().clone(),
+            },
+            timings,
+            queries,
+        )
+    }
+}
+
+/// Resolve ordinary author CSS with default environment and reader options.
+pub fn style_document(document: Document, css: &[&str]) -> StyledDocument {
+    StyleRequest::from_css(document, css).compile().0
 }
 
 /// Resolve a new cascade while borrowing the canonical DOM owned by the session.

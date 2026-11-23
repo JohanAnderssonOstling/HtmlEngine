@@ -1,14 +1,9 @@
 //! Public native-parser adapters and renderer capability queries.
 use crate::style::support::{
-    DeclarationSupport, PropertyCapability, PropertySyntax, PropertyValueSyntax,
+    DeclarationSupport, PreparationError, PropertyCapability, PropertySyntax, PropertyValueSyntax,
 };
-use crate::style::syntax::capabilities::{
-    parsed_declaration_capability, property_name_is_supported,
-};
-use crate::style::syntax::property_id::{RendererPropertyId, canonical_property_id};
-use crate::style::syntax::renderer_owned::{parse_object_position, parse_outline_offset};
-use crate::style::syntax::value::token_list_to_css_string;
-use crate::style::syntax::wide_keywords::property_css_wide_keyword;
+use crate::style::syntax::capabilities::{prepare_support, property_name_is_supported};
+use crate::style::syntax::property_id::canonical_property_id;
 use cssparser::{Delimiter, Parser, ParserInput, parse_important};
 use lightningcss::properties::{Property, PropertyId};
 use lightningcss::selector::SelectorList;
@@ -17,30 +12,11 @@ use lightningcss::traits::ParseWithOptions;
 
 pub fn declaration_support(property_name: &str, value: &str) -> DeclarationSupport {
     let normalized_name = property_name.to_ascii_lowercase();
-    let capability = parsed_declaration_capability(&normalized_name, None);
-    if capability != PropertyCapability::Supported {
-        return DeclarationSupport {
-            syntax: PropertySyntax::Unsupported,
-            capability,
-        };
+    if let Err(error) = prepare_support(&normalized_name, None) {
+        return error.into();
     }
     let parsed = super::value::parsed_property(PropertyId::from(normalized_name.as_str()), value);
-    if parsed
-        .as_ref()
-        .is_some_and(|property| !super::ast_validation::property_is_valid(property))
-    {
-        return DeclarationSupport {
-            syntax: PropertySyntax::Invalid,
-            capability: PropertyCapability::Supported,
-        };
-    }
-    let capability = parsed_declaration_capability(&normalized_name, parsed.as_ref());
-    let syntax = if capability == PropertyCapability::Supported {
-        declaration_syntax_impl(parsed.as_ref())
-    } else {
-        PropertySyntax::Unsupported
-    };
-    DeclarationSupport { syntax, capability }
+    parsed_declaration_support(&normalized_name, parsed.as_ref())
 }
 
 pub fn declaration_syntax(property_name: &str, value: &str) -> PropertySyntax {
@@ -58,53 +34,21 @@ pub fn property_value_syntax(property_name: &str, value: &str) -> PropertyValueS
     }
 }
 
-pub(crate) fn declaration_syntax_impl(property: Option<&Property<'_>>) -> PropertySyntax {
-    if property.is_some_and(|property| !super::ast_validation::property_is_valid(property)) {
-        return PropertySyntax::Invalid;
-    }
-    if property.and_then(property_css_wide_keyword).is_some() {
-        return PropertySyntax::Valid;
-    }
-    match property {
-        Some(property @ Property::Unparsed(raw))
-            if super::native_fallback::applies_to(&raw.property_id)
-                && super::native_fallback::parse(property).is_some() => PropertySyntax::Valid,
-        Some(Property::Unparsed(raw)) if !super::substitution::needs_substitution(&raw.value) => {
-            PropertySyntax::Invalid
-        }
-        Some(Property::Custom(raw)) if !super::substitution::needs_substitution(&raw.value) => {
-            if let Some(id) = RendererPropertyId::from_name(raw.name.as_ref())
-                .and_then(RendererPropertyId::native_property)
-            {
-                return token_list_to_css_string(&raw.value)
-                    .map(|css| {
-                        declaration_syntax_impl(super::value::parsed_property(id, &css).as_ref())
-                    })
-                    .unwrap_or(PropertySyntax::Invalid);
-            }
-            let valid = match RendererPropertyId::from_name(raw.name.as_ref()) {
-                Some(RendererPropertyId::ObjectPosition) => token_list_to_css_string(&raw.value)
-                    .and_then(|css| parse_object_position(&css))
-                    .is_some(),
-                Some(RendererPropertyId::OutlineOffset) => token_list_to_css_string(&raw.value)
-                    .and_then(|css| parse_outline_offset(&css))
-                    .is_some(),
-                _ => true,
-            };
-            if valid {
-                PropertySyntax::Valid
-            } else {
-                PropertySyntax::Invalid
-            }
-        }
-        Some(_) => PropertySyntax::Valid,
-        None => PropertySyntax::Invalid,
-    }
+/// Both callers canonicalize aliases before parsing. Keep syntax and renderer
+/// preparation results identical for public queries and CSS feature queries.
+fn parsed_declaration_support(name: &str, property: Option<&Property<'_>>) -> DeclarationSupport {
+    property
+        .ok_or(PreparationError::InvalidSyntax)
+        .and_then(|property| prepare_support(name, Some(property)))
+        .map_or_else(DeclarationSupport::from, |()| DeclarationSupport {
+            syntax: PropertySyntax::Valid,
+            capability: PropertyCapability::Supported,
+        })
 }
 
 /// Let the native declaration parser handle comments, escapes, and priority.
 pub(crate) fn supports_declaration_is_supported(id: &PropertyId<'_>, value: &str) -> bool {
-    if parsed_declaration_capability(id.name(), None) != PropertyCapability::Supported {
+    if prepare_support(id.name(), None).is_err() {
         return false;
     }
     let id = canonical_property_id(id.clone());
@@ -121,9 +65,8 @@ pub(crate) fn supports_declaration_is_supported(id: &PropertyId<'_>, value: &str
     if parser.expect_exhausted().is_err() {
         return false;
     }
-    parsed_declaration_capability(property.property_id().name(), Some(&property))
-        == PropertyCapability::Supported
-        && declaration_syntax_impl(Some(&property)) == PropertySyntax::Valid
+    parsed_declaration_support(property.property_id().name(), Some(&property)).syntax
+        == PropertySyntax::Valid
 }
 
 /// Check selector syntax accepted by Lightning CSS.

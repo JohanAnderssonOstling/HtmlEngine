@@ -99,6 +99,12 @@ impl<T> GroupedArena<T> {
         self.frozen = true;
     }
 
+    /// Finish construction and transfer the packed storage to its permanent owner.
+    pub fn into_parts(mut self) -> (Vec<T>, Vec<Range<u32>>) {
+        self.freeze();
+        (self.items, self.ranges)
+    }
+
     pub fn get(&self, group: usize) -> Option<&[T]> {
         assert!(self.frozen);
         let range = self.ranges.get(group)?;

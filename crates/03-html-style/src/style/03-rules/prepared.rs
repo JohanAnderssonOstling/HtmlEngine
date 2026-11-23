@@ -1,20 +1,18 @@
 //! Compile parser output into document-independent effective rules.
 
-use crate::style::cascade::resolver::prepared_native::{PreparedNativeValue, prepare_declaration};
+use crate::style::cascade::resolver::prepared_native::{PreparedLonghand, PreparedDeclarationValues};
 use crate::style::compiled::{
-    ALL_DECLARATIONS_SHADOWABLE, CascadeOrigin, LayerOrder, PreparedExpansion,
-    PreparedRuleDeclarations, PreparedRuleMetadata, PreparedRuleSet, PreparedTargetRange,
-    RulePriority, ScopeDescriptor, ScopeId,
+    ALL_DECLARATIONS_SHADOWABLE, CascadeOrigin, LayerOrder, PreparedRuleDeclarations,
+    PreparedRuleMetadata, PreparedRuleSet, PreparedTargetRange, RulePriority, ScopeDescriptor,
+    ScopeId,
 };
 use crate::style::environment::{MediaEnvironment, MediaQuerySet, evaluate_media_list};
 use crate::style::property_catalogue::PropertyKey;
 use crate::style::source::fonts::font_face_from_rule;
-use crate::style::syntax::capabilities::declaration_is_renderer_eligible;
-use crate::style::syntax::prepared_renderer::PreparedRendererValue;
 use crate::style::syntax::property_id::RendererPropertyId;
 use crate::style::syntax::selectors::{SelectorValidation, selector_list_is_web_valid_for_scope};
 use crate::style::syntax::substitution::needs_substitution;
-use crate::style::syntax::targets::{append_property_targets, expand_declaration};
+use crate::style::syntax::targets::append_property_targets;
 use crate::style::syntax::validation::{
     supports_declaration_is_supported, supports_selector_syntax_is_valid,
 };
@@ -106,70 +104,93 @@ struct PendingRule {
 /// Linking still evaluates media, layers, scopes, and source order globally.
 pub(crate) struct PreparedStylesheetFragment<'css> {
     stylesheet: StyleSheet<'css>,
+    // Supports and scope validity in the same preorder used by RuleWalk.
+    conditions: Vec<bool>,
     pub(crate) style_rules: Vec<Arc<StyleRule<'css>>>,
     pub(crate) rule_declarations: Vec<PreparedRuleDeclarations>,
     pub(crate) declarations: PreparedDeclarationBlock<'css>,
 }
 
+/// One declaration's metadata; variable-length values remain in shared pools.
+struct PreparedDeclaration {
+    targets: PreparedTargetRange,
+    values: Box<[PreparedLonghand]>,
+}
+
 /// Context-independent metadata shared by stylesheet and element declarations.
 #[derive(Default)]
 pub(crate) struct PreparedDeclarationBlock<'css> {
-    pub(crate) declaration_target_ranges: Vec<PreparedTargetRange>,
-    pub(crate) property_targets: Vec<PropertyKey>,
-    pub(crate) declaration_expansions: Vec<PreparedExpansion>,
-    pub(crate) longhands: Vec<Property<'css>>,
-    renderer_values: Vec<PreparedRendererValue>,
-    renderer_value_indices: Vec<u32>,
-    native_values: Vec<Box<[Option<PreparedNativeValue>]>>,
+    declarations: Vec<PreparedDeclaration>,
+    property_targets: Vec<PropertyKey>,
+    longhands: Vec<Property<'css>>,
 }
 
 impl<'css> PreparedDeclarationBlock<'css> {
     pub(crate) fn clear(&mut self) {
-        self.declaration_target_ranges.clear();
+        self.declarations.clear();
         self.property_targets.clear();
-        self.declaration_expansions.clear();
         self.longhands.clear();
-        self.renderer_values.clear();
-        self.native_values.clear();
-        self.renderer_value_indices.clear();
     }
 
     pub(crate) fn append(&mut self, declarations: &[Property<'css>]) -> (u32, u64) {
-        append_fragment_declarations(
-            declarations,
-            &mut self.property_targets,
-            &mut self.declaration_target_ranges,
-            &mut self.renderer_values,
-            &mut self.renderer_value_indices,
-            &mut self.declaration_expansions,
-            &mut self.longhands,
-            &mut self.native_values,
-        )
+        let first = u32::try_from(self.declarations.len())
+            .expect("prepared declaration target ranges fit in u32");
+        // One flag plus 63 declaration bits keeps the hot rule metadata inline.
+        // Larger rules retain per-declaration bits without whole-rule pruning.
+        let mut shadow_mask = if declarations.len() < 63 {
+            ALL_DECLARATIONS_SHADOWABLE
+        } else {
+            0
+        };
+        for (index, property) in declarations.iter().enumerate() {
+            let start = u32::try_from(self.property_targets.len())
+                .expect("prepared property targets fit in u32");
+            append_property_targets(property, &mut self.property_targets);
+            let len = u32::try_from(self.property_targets.len() - start as usize)
+                .expect("one declaration's property targets fit in u32");
+            let prepared = PreparedDeclarationValues::prepare(property, &mut self.longhands);
+            self.longhands.clear();
+            let eligible = prepared.is_ok();
+            let prepared = prepared.unwrap_or_default();
+            let needs_height = prepared.requires_viewport_height();
+            self.declarations.push(PreparedDeclaration {
+                targets: PreparedTargetRange::new(start, len, needs_height, eligible),
+                values: prepared.values.into_boxed_slice(),
+            });
+            // Only unconditional values may prune lower declarations before the
+            // environment and rollback boundaries are considered.
+            if eligible
+                && !needs_height
+                && property_css_wide_keyword(property).is_none()
+                && !matches!(
+                    property,
+                    Property::All(_) | Property::Custom(_) | Property::Unparsed(_)
+                )
+            {
+                if index < 63 {
+                    shadow_mask |= 1 << index;
+                }
+            } else {
+                shadow_mask &= !ALL_DECLARATIONS_SHADOWABLE;
+            }
+        }
+        (first, shadow_mask)
     }
 
-    pub(crate) fn native_values(&self, index: usize) -> &[Option<PreparedNativeValue>] {
-        &self.native_values[index]
-    }
-
-    pub(crate) fn renderer_value(&self, index: usize) -> Option<&PreparedRendererValue> {
-        self.renderer_values
-            .get(self.renderer_value_indices[index] as usize)
+    pub(crate) fn values(&self, index: usize) -> &[PreparedLonghand] {
+        &self.declarations[index].values
     }
 
     pub(crate) fn requires_viewport_height(&self, index: usize) -> bool {
-        self.declaration_target_ranges[index].requires_viewport_height()
+        self.declarations[index].targets.requires_viewport_height()
     }
 
     pub(crate) fn metadata(&self, index: usize) -> (&[PropertyKey], bool) {
-        let range = self.declaration_target_ranges[index];
+        let range = self.declarations[index].targets;
         (
             &self.property_targets[range.start as usize..range.start as usize + range.len()],
             range.renderer_eligibility(),
         )
-    }
-
-    pub(crate) fn longhands(&self, index: usize) -> Option<&[Property<'css>]> {
-        self.declaration_expansions[index].values(&self.longhands)
     }
 }
 
@@ -200,15 +221,18 @@ impl<'css> PreparedStylesheetFragment<'css> {
 
     pub(crate) fn compile(mut stylesheet: StyleSheet<'css>) -> Self {
         let mut style_rules = Vec::with_capacity(stylesheet.rules.0.len());
-        take_all_style_rules(&mut stylesheet.rules, &mut style_rules);
+        let mut conditions = Vec::new();
+        take_all_style_rules(&mut stylesheet.rules, &mut style_rules, &mut conditions);
         let mut declarations = PreparedDeclarationBlock::default();
         let mut rule_declarations = Vec::with_capacity(style_rules.len());
+        let mut selector_validation = SelectorValidation::default();
         for rule in &style_rules {
             let (normal_start, normal_shadow_mask) =
                 declarations.append(&rule.declarations.declarations);
             let (important_start, important_shadow_mask) =
                 declarations.append(&rule.declarations.important_declarations);
             rule_declarations.push(PreparedRuleDeclarations {
+                valid_selectors: selector_validation.selector_list_is_web_valid(&rule.selectors),
                 normal_start,
                 important_start,
                 normal_shadow_mask,
@@ -217,6 +241,7 @@ impl<'css> PreparedStylesheetFragment<'css> {
         }
         Self {
             stylesheet,
+            conditions,
             style_rules,
             rule_declarations,
             declarations,
@@ -224,127 +249,21 @@ impl<'css> PreparedStylesheetFragment<'css> {
     }
 }
 
-fn append_fragment_declarations<'css>(
-    declarations: &[Property<'css>],
-    targets: &mut Vec<PropertyKey>,
-    ranges: &mut Vec<PreparedTargetRange>,
-    renderer_values: &mut Vec<PreparedRendererValue>,
-    renderer_value_indices: &mut Vec<u32>,
-    expansions: &mut Vec<PreparedExpansion>,
-    longhands: &mut Vec<Property<'css>>,
-    native_values: &mut Vec<Box<[Option<PreparedNativeValue>]>>,
-) -> (u32, u64) {
-    let first = u32::try_from(ranges.len()).expect("prepared declaration target ranges fit in u32");
-    // One flag plus 63 declaration bits keeps the hot rule metadata inline.
-    // Larger rules retain per-declaration bits without whole-rule pruning.
-    let mut shadow_mask = if declarations.len() < 63 {
-        ALL_DECLARATIONS_SHADOWABLE
-    } else {
-        0
-    };
-    for (index, property) in declarations.iter().enumerate() {
-        let start = u32::try_from(targets.len()).expect("prepared property targets fit in u32");
-        append_property_targets(property, targets);
-        let len = u32::try_from(targets.len() - start as usize)
-            .expect("one declaration's property targets fit in u32");
-        let prepared_renderer = RendererPropertyId::raw(property).and_then(|(id, tokens)| {
-            if needs_substitution(tokens) || property_css_wide_keyword(property).is_some() {
-                None
-            } else {
-                Some(PreparedRendererValue::parse(id, tokens))
-            }
-        });
-        let renderer_eligibility = prepared_renderer.as_ref().map_or_else(
-            || declaration_is_renderer_eligible(property),
-            |value| value.is_some(),
-        );
-        renderer_value_indices.push(if let Some(value) = prepared_renderer.flatten() {
-            let index =
-                u32::try_from(renderer_values.len()).expect("prepared renderer values fit in u32");
-            assert_ne!(index, u32::MAX, "reserved absent renderer value");
-            renderer_values.push(value);
-            index
-        } else {
-            u32::MAX
-        });
-        let expansion_start = longhands.len();
-        // Prepare and validate every component, including losing longhands.
-        let expansion_result = if renderer_eligibility
-            && !matches!(property, Property::Unparsed(_) | Property::Custom(_))
-            && property_css_wide_keyword(property).is_none()
-        {
-            expand_declaration(property, longhands)
-        } else {
-            Ok(false)
-        };
-        let expansion = if expansion_result == Ok(true) {
-            PreparedExpansion {
-                start: u32::try_from(expansion_start).expect("prepared longhands fit in u32"),
-                len: u32::try_from(longhands.len() - expansion_start)
-                    .expect("shorthand longhands fit in u32"),
-            }
-        } else {
-            longhands.truncate(expansion_start);
-            PreparedExpansion::NONE
-        };
-        expansions.push(expansion);
-        let native = prepare_declaration(
-            expansion
-                .values(longhands)
-                .unwrap_or(std::slice::from_ref(property)),
-        );
-        let native_valid = native.is_ok();
-        let native = native.unwrap_or_default().into_boxed_slice();
-        let native_height = native
-            .iter()
-            .flatten()
-            .any(PreparedNativeValue::requires_viewport_height);
-        native_values.push(native);
-        let eligible = renderer_eligibility && expansion_result.is_ok() && native_valid;
-        let needs_height = native_height
-            || renderer_values
-                .get(*renderer_value_indices.last().unwrap() as usize)
-                .is_some_and(PreparedRendererValue::requires_viewport_height);
-        let range = PreparedTargetRange::new(start, len, needs_height, eligible);
-        ranges.push(range);
-        // Only unconditional values may prune lower declarations before the
-        // environment and rollback boundaries are considered.
-        if eligible
-            && !needs_height
-            && property_css_wide_keyword(property).is_none()
-            && !matches!(
-                property,
-                Property::All(_) | Property::Custom(_) | Property::Unparsed(_)
-            )
-        {
-            if index < 63 {
-                shadow_mask |= 1 << index;
-            }
-        } else {
-            shadow_mask &= !ALL_DECLARATIONS_SHADOWABLE;
-        }
-    }
-    (first, shadow_mask)
-}
-
-/// Canonicalize raw aliases once, retaining contextual/unsupported values verbatim.
+/// Canonicalize raw aliases once; preparation validates the resulting values value.
 pub(crate) fn prepare_constant_value(property: &mut Property<'_>) {
     let Some((id, tokens)) = RendererPropertyId::raw(property) else {
         return;
     };
-    let Some(native) = id.native_property() else {
+    let Some(values) = id.native_property() else {
         return;
     };
-    if needs_substitution(tokens)
-        || property_css_wide_keyword(property).is_some()
-        || !declaration_is_renderer_eligible(property)
-    {
+    if needs_substitution(tokens) || property_css_wide_keyword(property).is_some() {
         return;
     }
     let Some(css) = token_list_to_css_string(tokens) else {
         return;
     };
-    if let Some(parsed) = parsed_property(native, &css)
+    if let Some(parsed) = parsed_property(values, &css)
         && !matches!(parsed, Property::Unparsed(_) | Property::Custom(_))
     {
         *property = parsed.into_owned();
@@ -354,9 +273,10 @@ pub(crate) fn prepare_constant_value(property: &mut Property<'_>) {
 fn take_all_style_rules<'css>(
     rules: &mut CssRuleList<'css>,
     output: &mut Vec<Arc<StyleRule<'css>>>,
+    conditions: &mut Vec<bool>,
 ) {
     for rule in &mut rules.0 {
-        match rule {
+        let nested = match rule {
             CssRule::Style(style) => {
                 let placeholder = StyleRule {
                     selectors: SelectorList::new(Default::default()),
@@ -375,13 +295,26 @@ fn take_all_style_rules<'css>(
                     prepare_constant_value(property);
                 }
                 output.push(Arc::new(style));
+                continue;
             }
-            CssRule::Media(media) => take_all_style_rules(&mut media.rules, output),
-            CssRule::Supports(supports) => take_all_style_rules(&mut supports.rules, output),
-            CssRule::LayerBlock(layer) => take_all_style_rules(&mut layer.rules, output),
-            CssRule::Scope(scope) => take_all_style_rules(&mut scope.rules, output),
-            _ => {}
-        }
+            CssRule::Media(media) => &mut media.rules,
+            CssRule::Supports(supports) => {
+                conditions.push(supports_condition_applies(&supports.condition));
+                &mut supports.rules
+            }
+            CssRule::LayerBlock(layer) => &mut layer.rules,
+            CssRule::Scope(scope) => {
+                conditions.push(
+                    [scope.scope_start.as_ref(), scope.scope_end.as_ref()]
+                        .into_iter()
+                        .flatten()
+                        .all(selector_list_is_web_valid_for_scope),
+                );
+                &mut scope.rules
+            }
+            _ => continue,
+        };
+        take_all_style_rules(nested, output, conditions);
     }
 }
 
@@ -408,7 +341,6 @@ pub(crate) fn prepare<'css>(
         initial_font_size,
         media_queries: MediaQuerySet::default(),
         media_path: Vec::new(),
-        selector_validation: SelectorValidation::default(),
     };
     walk.prepare_origin(
         std::iter::once((0, user_agent.as_ref(), None)),
@@ -462,9 +394,10 @@ struct FragmentCursor<'fragment, 'css> {
     fragment_index: usize,
     fragment: &'fragment PreparedStylesheetFragment<'css>,
     next_style_rule: usize,
+    conditions: std::slice::Iter<'fragment, bool>,
 }
 
-struct RuleWalk<'fragment, 'css> {
+struct RuleWalk<'css> {
     origin: CascadeOrigin,
     layers: LayerRegistry,
     output: Vec<PendingRule>,
@@ -475,11 +408,10 @@ struct RuleWalk<'fragment, 'css> {
     initial_font_size: f64,
     media_queries: MediaQuerySet,
     media_path: Vec<u32>,
-    selector_validation: SelectorValidation<'fragment, 'css>,
 }
 
-impl<'fragment, 'css: 'fragment> RuleWalk<'fragment, 'css> {
-    fn prepare_origin(
+impl<'css> RuleWalk<'css> {
+    fn prepare_origin<'fragment>(
         &mut self,
         stylesheets: impl IntoIterator<
             Item = (
@@ -489,7 +421,9 @@ impl<'fragment, 'css: 'fragment> RuleWalk<'fragment, 'css> {
             ),
         >,
         origin: CascadeOrigin,
-    ) {
+    ) where
+        'css: 'fragment,
+    {
         self.origin = origin;
         self.layers = LayerRegistry::default();
         let first_rule = self.output.len();
@@ -498,6 +432,7 @@ impl<'fragment, 'css: 'fragment> RuleWalk<'fragment, 'css> {
                 fragment_index,
                 fragment,
                 next_style_rule: 0,
+                conditions: fragment.conditions.iter(),
             };
             self.visit(
                 &fragment.stylesheet.rules,
@@ -508,6 +443,7 @@ impl<'fragment, 'css: 'fragment> RuleWalk<'fragment, 'css> {
                 RuleWalkMode::Active,
             );
             debug_assert_eq!(cursor.next_style_rule, fragment.rule_declarations.len());
+            debug_assert!(cursor.conditions.next().is_none());
         }
         let ranks = self.layers.ranks();
         for rule in &mut self.output[first_rule..] {
@@ -520,7 +456,7 @@ impl<'fragment, 'css: 'fragment> RuleWalk<'fragment, 'css> {
     fn visit(
         &mut self,
         rules: &CssRuleList<'css>,
-        cursor: &mut FragmentCursor<'fragment, 'css>,
+        cursor: &mut FragmentCursor<'_, 'css>,
         current_layer: Option<LayerId>,
         current_scope: ScopeId,
         implicit_root_index: Option<u32>,
@@ -536,16 +472,12 @@ impl<'fragment, 'css: 'fragment> RuleWalk<'fragment, 'css> {
                 CssRule::Style(_) => {
                     let fragment_rule_index = cursor.next_style_rule;
                     cursor.next_style_rule += 1;
-                    if skipped {
-                        continue;
-                    }
-                    let effective_rule = &cursor.fragment.style_rules[fragment_rule_index];
-                    if !self
-                        .selector_validation
-                        .selector_list_is_web_valid(&effective_rule.selectors)
+                    if skipped
+                        || !cursor.fragment.rule_declarations[fragment_rule_index].valid_selectors
                     {
                         continue;
                     }
+                    let effective_rule = &cursor.fragment.style_rules[fragment_rule_index];
                     self.media_queries.record_dependency(&self.media_path);
                     if active {
                         let layer =
@@ -609,8 +541,8 @@ impl<'fragment, 'css: 'fragment> RuleWalk<'fragment, 'css> {
                     }
                 }
                 CssRule::Supports(supports) => {
-                    let child_mode = if skipped || !supports_condition_applies(&supports.condition)
-                    {
+                    let applies = *cursor.conditions.next().expect("supports condition slot");
+                    let child_mode = if skipped || !applies {
                         RuleWalkMode::Skip
                     } else {
                         mode
@@ -658,16 +590,9 @@ impl<'fragment, 'css: 'fragment> RuleWalk<'fragment, 'css> {
                 CssRule::Scope(scope) => {
                     let mut child_scope = current_scope;
                     let mut child_mode = mode;
+                    let valid = *cursor.conditions.next().expect("scope condition slot");
                     if active {
-                        let start_valid = scope
-                            .scope_start
-                            .as_ref()
-                            .is_none_or(selector_list_is_web_valid_for_scope);
-                        let end_valid = scope
-                            .scope_end
-                            .as_ref()
-                            .is_none_or(selector_list_is_web_valid_for_scope);
-                        if start_valid && end_valid {
+                        if valid {
                             child_scope = ScopeId(
                                 u32::try_from(self.scopes.len()).expect("scope IDs fit in u32"),
                             );
@@ -826,11 +751,11 @@ mod tests {
                     bits(count + 1) | all(count + 1 < 63)
                 );
                 assert_eq!(
-                    fragment.declarations.declaration_target_ranges.len(),
+                    fragment.declarations.declarations.len(),
                     normal_count + count + 1
                 );
-                for range in fragment.declarations.declaration_target_ranges.iter() {
-                    assert!(range.renderer_eligibility());
+                for declaration in &fragment.declarations.declarations {
+                    assert!(declaration.targets.renderer_eligibility());
                 }
             }
         }

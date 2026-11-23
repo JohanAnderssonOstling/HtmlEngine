@@ -1,5 +1,5 @@
 use crate::engine::LayoutRequest;
-use crate::stages::ResponsivePreparation;
+use crate::stages::PreparedState;
 #[cfg(test)]
 use html_dom as dom_values;
 #[cfg(test)]
@@ -23,9 +23,7 @@ use html_resources::ResourceProvider;
 use html_style::{FontFace, MediaMatchKey, MediaQuerySet};
 
 use crate::parser::{DocumentFactory, ResourceContext, StylesheetCache};
-use crate::types::{
-    LayoutCacheKey, ParsedCacheKey, PreparedCacheKey, ShapedCacheKey,
-};
+use crate::types::{LayoutCacheKey, ParsedCacheKey, PreparedCacheKey, ShapedCacheKey};
 use crate::types::{LayoutConstraints, ResourceRevision, StylesheetRevision};
 use crate::{
     EarliestStage, MediaEnvironment, PipelineChanges, PipelineError, PipelineErrorKind,
@@ -43,7 +41,7 @@ struct PipelineCacheState {
     /// Active declarations shared with the compiled style program.
     font_faces: Arc<[FontFace]>,
     /// One inactive CSS state; never duplicates the canonical DOM or resources.
-    responsive: Option<CachedResponsivePreparation>,
+    responsive: Option<CachedPreparedState>,
     /// Shaping validity and its backend generation are published together;
     /// glyph data has exactly one document owner.
     shaped: Option<CacheEntry<ShapedCacheKey, GlyphResourceGeneration>>,
@@ -55,9 +53,9 @@ struct ResponsiveKey {
     font_faces: Arc<[FontFace]>,
 }
 
-struct CachedResponsivePreparation {
+struct CachedPreparedState {
     key: ResponsiveKey,
-    preparation: ResponsivePreparation<'static>,
+    preparation: PreparedState<'static>,
 }
 
 /// Preparation and published layout share one document owner. A worker result
@@ -624,10 +622,7 @@ impl PipelineSession {
                 .publish_layout_key(layout_key.clone(), resource_generation);
         }
 
-        if stage <= EarliestStage::Prepare
-            && cache_matches(self.cache.parsed.as_ref(), parsed_key)
-            && source_matches
-        {
+        if matches!(stage, EarliestStage::Style | EarliestStage::Prepare) {
             return self.restyle_cached(
                 requested_inputs,
                 layout_key,
@@ -638,11 +633,10 @@ impl PipelineSession {
         }
 
         if stage <= EarliestStage::Layout {
-            let parsed_reused = stage != EarliestStage::Parse;
-            let prepared_reused = stage > EarliestStage::Prepare;
-            let shaped_reused = stage == EarliestStage::Layout;
             let mut queries = None;
-            if shaped_reused || (prepared_reused && self.cache.document.prepared().is_none()) {
+            if stage == EarliestStage::Layout
+                || (stage == EarliestStage::Shape && self.cache.document.prepared().is_none())
+            {
                 let layout = &mut self
                     .cache
                     .document
@@ -654,16 +648,16 @@ impl PipelineSession {
                         &requested_inputs.reader_overrides,
                         constraints,
                         &requested_inputs.image_metrics,
-                        !shaped_reused,
+                        stage == EarliestStage::Shape,
                         glyph_shaper,
                         &mut self.glyph_resources,
                     )
-                } else if shaped_reused && height_only {
+                } else if stage == EarliestStage::Layout && height_only {
                     // Still report a layout update so callers discard page
                     // placements, but preserve height-independent geometry.
                     layout.accept_height_without_relayout(constraints);
                     Ok(())
-                } else if shaped_reused {
+                } else if stage == EarliestStage::Layout {
                     layout.relayout(
                         LayoutRequest::new(constraints)
                             .with_image_metrics(&requested_inputs.image_metrics),
@@ -680,19 +674,19 @@ impl PipelineSession {
                 };
                 result.map_err(PipelineError::from)?;
             } else {
-                let fresh = if prepared_reused {
-                    None
-                } else {
+                let fresh = if stage == EarliestStage::Parse {
                     let (prepared, encoding, media) = self.prepare_document(requested_inputs)?;
                     queries = Some(media);
                     Some((prepared, encoding))
+                } else {
+                    None
                 };
                 let prepared = fresh
                     .as_ref()
                     .map(|(prepared, _)| prepared)
                     .or_else(|| self.cache.document.prepared())
                     .expect("preparation has a document owner");
-                let painted = if prepared_reused && color_preferences_changed {
+                let painted = if stage == EarliestStage::Shape && color_preferences_changed {
                     Some(
                         prepared
                             .with_reader_paint_overrides(&requested_inputs.reader_overrides)
@@ -701,7 +695,7 @@ impl PipelineSession {
                 } else {
                     None
                 };
-                let metrics = if !parsed_reused
+                let metrics = if stage == EarliestStage::Parse
                     && previous.is_some_and(|previous| previous.inherited_image_metrics)
                 {
                     self.replacement_image_metrics(prepared, requested_inputs)
@@ -725,7 +719,7 @@ impl PipelineSession {
                         key: layout_key.clone(),
                         value: prepared.with_layout(laid_out),
                     });
-                    if !parsed_reused {
+                    if stage == EarliestStage::Parse {
                         self.cache.parsed = Some(CacheEntry {
                             key: parsed_key.clone(),
                             value: encoding,
@@ -827,8 +821,9 @@ impl PipelineSession {
                     cached.preparation, &inputs.reader_overrides, constraints,
                     &inputs.image_metrics, shaper, &mut self.glyph_resources,
                 )?;
-            self.cache.responsive = previous_key.map(|key| CachedResponsivePreparation {
-                key, preparation: previous,
+            self.cache.responsive = previous_key.map(|key| CachedPreparedState {
+                key,
+                preparation: previous,
             });
             self.cache.publish_layout_key(layout_key.clone(), shaper.resource_generation());
             self.cache.media = Some(cached.key.media);
@@ -892,8 +887,9 @@ impl PipelineSession {
         };
         match result {
             Ok(layout) => {
-                self.cache.responsive = previous_key.zip(previous_preparation)
-                    .map(|(key, preparation)| CachedResponsivePreparation { key, preparation });
+                self.cache.responsive = previous_key
+                    .zip(previous_preparation)
+                    .map(|(key, preparation)| CachedPreparedState { key, preparation });
                 if let Some(layout) = layout {
                     self.cache
                         .document

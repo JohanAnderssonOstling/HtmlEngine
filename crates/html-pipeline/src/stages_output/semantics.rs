@@ -244,9 +244,6 @@ impl<'a> RenderSemanticsView<'a> {
         let ancestor = layout_state::box_id_index(ancestor_id);
         let descendant = layout_state::box_id_index(descendant_id);
         let boxes = self.doc.render_view(self.glyph_metrics).boxes();
-        if let (Some(parent), Some(child)) = (boxes.pagination_facts(ancestor_id), boxes.pagination_facts(descendant_id)) {
-            return parent.subtree.contains(&child.subtree.start);
-        }
         ancestor < boxes.len()
             && descendant < boxes.len()
             && once(descendant_id).chain(boxes.ancestors(descendant_id)).any(|id| id == ancestor_id)

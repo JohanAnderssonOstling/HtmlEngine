@@ -7,7 +7,7 @@ mod tests {
     use crate::{ShapedRun};
 
     use super::{
-        BoxFontMetrics, FontSlant, RequiredFontMetrics, ResolvedBidi, ShapedFontMetrics,
+        BoxFontMetrics, FontSlant, ResolvedBidi, ShapedFontMetrics,
         ShapedTextGeometry, TextRunId, ShapedTextRun, TextRunShapeRequest, collapse_whitespace,
         first_letter_overrides_with_characters, first_letter_style_overrides,
         is_css_collapsible_space, plan_shaping_spans, transform_text,
@@ -23,8 +23,8 @@ mod tests {
         collapse_whitespace(prepared.test_styles(), prepared.layout_tree(), &mut content);
         let overrides = vec![None; content.characters().len()];
         let metrics = ShapedFontMetrics::new(
-            BoxFontMetrics::NotRequired,
-            RequiredFontMetrics::NotRequired,
+            BoxFontMetrics::default(),
+            Default::default(),
             0.0,
             0.0,
             0.0,
@@ -93,8 +93,7 @@ mod tests {
             prepared.inline_content(),
             |_| panic!("first-letter scan must be skipped"),
         );
-        assert!(overrides.is_empty());
-        assert_eq!(overrides.capacity(), 0);
+        assert_eq!(overrides.segment(0, u32::MAX), (None, u32::MAX));
     }
 
     #[test]
@@ -123,8 +122,10 @@ mod tests {
             let selected: String = content
                 .characters()
                 .iter()
-                .zip(overrides)
-                .filter_map(|(&character, style)| style.map(|_| character))
+                .enumerate()
+                .filter_map(|(index, &character)| {
+                    overrides.style_at(index as u32).map(|_| character)
+                })
                 .collect();
             assert_eq!(selected, "“A!\u{301}B");
             assert!(
@@ -159,8 +160,8 @@ mod tests {
             let mut content = prepared.inline_content().clone();
             collapse_whitespace(prepared.test_styles(), prepared.layout_tree(), &mut content);
             let metrics = ShapedFontMetrics::new(
-                BoxFontMetrics::NotRequired,
-                RequiredFontMetrics::NotRequired,
+                BoxFontMetrics::default(),
+                Default::default(),
                 0.0,
                 0.0,
                 0.0,
@@ -193,7 +194,7 @@ mod tests {
     }
 
     #[test]
-    fn text_transforms_preserve_empty_first_letter_overrides_and_source_mapping() {
+    fn text_transforms_preserve_empty_first_letter_shaping_spans() {
         for html in [
             "<p style='text-transform:uppercase'>Straße <em>ß</em> a\u{301}</p>",
             "<p style='text-transform:lowercase'>İSTANBUL</p>",
@@ -208,37 +209,18 @@ mod tests {
                 prepared.layout_tree(),
                 &mut empty_content,
             );
-            let mut dense_content = empty_content.clone();
-            let mut empty_overrides = Vec::new();
-            let mut dense_overrides = vec![None; dense_content.characters().len()];
+            let mut empty_overrides = html_text::FirstLetterStyles::default();
             transform_text(
                 prepared.test_styles(),
                 prepared.layout_tree(),
                 &mut empty_content,
                 &mut empty_overrides,
             );
-            transform_text(
-                prepared.test_styles(),
-                prepared.layout_tree(),
-                &mut dense_content,
-                &mut dense_overrides,
-            );
-            assert!(empty_overrides.is_empty(), "{html}");
-            assert_eq!(empty_overrides.capacity(), 0);
-            assert_eq!(empty_content.characters(), dense_content.characters());
-            for index in 0..empty_content.characters().len() {
-                assert_eq!(
-                    empty_content.raw_glyph_source_offset(index),
-                    dense_content.raw_glyph_source_offset(index)
-                );
-                assert_eq!(
-                    empty_content.whitespace_wrap_before(index),
-                    dense_content.whitespace_wrap_before(index)
-                );
-            }
+            assert_eq!(empty_overrides.segment(0, u32::MAX), (None, u32::MAX));
+            let dense_overrides = vec![None; empty_content.characters().len()];
             let metrics = ShapedFontMetrics::new(
-                BoxFontMetrics::NotRequired,
-                RequiredFontMetrics::NotRequired,
+                BoxFontMetrics::default(),
+                Default::default(),
                 0.0,
                 0.0,
                 0.0,
@@ -254,49 +236,16 @@ mod tests {
             let dense = plan_shaping_spans(
                 prepared.test_styles(),
                 prepared.layout_tree(),
-                &dense_content,
+                &empty_content,
                 &dense_overrides,
                 &metrics,
-                &ResolvedBidi::new(prepared.test_styles(), prepared.layout_tree(), &dense_content),
+                &ResolvedBidi::new(
+                    prepared.test_styles(),
+                    prepared.layout_tree(),
+                    &empty_content,
+                ),
             );
             assert_eq!(format!("{empty:?}"), format!("{dense:?}"), "{html}");
-        }
-    }
-
-    #[test]
-    fn present_first_letter_styles_keep_dense_override_selection() {
-        for (html, css) in [
-            (
-                "<p>“Apple” a\u{301}</p>",
-                "p::first-letter {font-size:2em; color:purple}",
-            ),
-            (
-                "<div><p>Apple</p></div>",
-                "div::first-letter {font-size:2em}",
-            ),
-            (
-                "<p>Apple</p>",
-                "p::before {content:'“Hello” '} p::first-letter {font-size:2em}",
-            ),
-            (
-                "<p>Apple</p>",
-                "p::first-letter {float:left; font-size:2em}",
-            ),
-        ] {
-            let mut factory = DocumentFactory::new();
-            let prepared = factory.parse_with_new_pipeline(html, Some(css));
-            assert!(prepared.test_styles().has_first_letter_styles(), "{css}");
-            let overrides = first_letter_style_overrides(
-                prepared.document(),
-                prepared.test_styles(),
-                prepared.layout_tree(),
-                prepared.inline_content(),
-            );
-            assert_eq!(
-                overrides.len(),
-                prepared.inline_content().characters().len(),
-                "{css}"
-            );
         }
     }
 

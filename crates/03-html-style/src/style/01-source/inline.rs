@@ -1,14 +1,12 @@
 //! Parse and cache inline declarations before document resolution.
-use crate::style::cascade::resolver::prepared_native::PreparedNativeValue;
-use crate::style::property_catalogue::PropertyKey;
+use crate::style::compiled::DeclarationId;
 use crate::style::rules::prepared::{PreparedDeclarationBlock, prepare_constant_value};
-use crate::style::syntax::prepared_renderer::PreparedRendererValue;
 use html_dom::{Document, DomNodeId};
-use lightningcss::properties::Property;
 use lightningcss::stylesheet::{ParserOptions, StyleAttribute};
 use rustc_data_structures::fx::FxHashMap;
 use static_self::IntoOwned;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Borrow the matching entry after promoting it to the most recently used end.
@@ -28,6 +26,7 @@ pub(crate) struct PreparedInlineStyle<'css> {
     pub(crate) style: StyleAttribute<'css>,
     pub(crate) prepared: PreparedDeclarationBlock<'css>,
     important_start: usize,
+    id: usize,
 }
 
 impl<'css> From<StyleAttribute<'css>> for PreparedInlineStyle<'css> {
@@ -43,7 +42,9 @@ impl<'css> From<StyleAttribute<'css>> for PreparedInlineStyle<'css> {
         let mut prepared = PreparedDeclarationBlock::default();
         prepared.append(&style.declarations.declarations);
         let (important_start, _) = prepared.append(&style.declarations.important_declarations);
+        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
         Self {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             style,
             prepared,
             important_start: important_start as usize,
@@ -52,40 +53,22 @@ impl<'css> From<StyleAttribute<'css>> for PreparedInlineStyle<'css> {
 }
 
 impl<'css> PreparedInlineStyle<'css> {
-    pub(crate) fn native_values(
+    pub(crate) fn declaration_id(&self, important: bool, index: usize) -> DeclarationId {
+        DeclarationId::Inline {
+            block: self.id,
+            declaration: index + if important { self.important_start } else { 0 },
+        }
+    }
+
+    pub(crate) fn declaration_block(
         &self,
         important: bool,
         index: usize,
-    ) -> &[Option<PreparedNativeValue>] {
-        self.prepared
-            .native_values(index + if important { self.important_start } else { 0 })
-    }
-
-    pub(crate) fn renderer_value(
-        &self,
-        important: bool,
-        index: usize,
-    ) -> Option<&PreparedRendererValue> {
-        self.prepared
-            .renderer_value(index + if important { self.important_start } else { 0 })
-    }
-
-    pub(crate) fn requires_viewport_height(&self, important: bool, index: usize) -> bool {
-        self.prepared.requires_viewport_height(if important {
-            self.declarations.declarations.len() + index
-        } else {
-            index
-        })
-    }
-
-    pub(crate) fn metadata(&self, important: bool, index: usize) -> (&[PropertyKey], bool) {
-        self.prepared
-            .metadata(index + if important { self.important_start } else { 0 })
-    }
-
-    pub(crate) fn longhands(&self, important: bool, index: usize) -> Option<&[Property<'css>]> {
-        self.prepared
-            .longhands(index + if important { self.important_start } else { 0 })
+    ) -> (&PreparedDeclarationBlock<'css>, usize) {
+        (
+            &self.prepared,
+            index + if important { self.important_start } else { 0 },
+        )
     }
 }
 
@@ -97,12 +80,12 @@ impl<'css> std::ops::Deref for PreparedInlineStyle<'css> {
 }
 
 struct CachedInlineStyle {
-    css: String,
+    last_used: u64,
     style: Option<Arc<PreparedInlineStyle<'static>>>,
 }
 
 pub(crate) struct ParsedInlineStyleCache {
-    entries: VecDeque<CachedInlineStyle>,
+    entries: FxHashMap<Arc<str>, CachedInlineStyle>,
     capacity: usize,
     hits: u64,
     misses: u64,
@@ -112,7 +95,7 @@ pub(crate) struct ParsedInlineStyleCache {
 impl Default for ParsedInlineStyleCache {
     fn default() -> Self {
         Self {
-            entries: VecDeque::new(),
+            entries: FxHashMap::default(),
             capacity: 256,
             hits: 0,
             misses: 0,
@@ -127,7 +110,10 @@ impl ParsedInlineStyleCache {
     }
 
     fn lookup(&mut self, css: &str) -> Option<Option<Arc<PreparedInlineStyle<'static>>>> {
-        cached_entry(&mut self.entries, |entry| entry.css == css).map(|entry| entry.style.clone())
+        let entry = self.entries.get_mut(css)?;
+        self.revision = self.revision.wrapping_add(1);
+        entry.last_used = self.revision;
+        Some(entry.style.clone())
     }
 
     /// Resolve the document's distinct inline sources with at most two locks.
@@ -179,13 +165,23 @@ impl ParsedInlineStyleCache {
                 continue;
             }
             if cache.entries.len() == cache.capacity {
-                cache.entries.pop_front();
+                let oldest = cache
+                    .entries
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.last_used)
+                    .map(|(css, _)| css.clone())
+                    .expect("full inline cache");
+                cache.entries.remove(&oldest);
             }
-            cache.entries.push_back(CachedInlineStyle {
-                css: sources[index].to_owned(),
-                style: styles[index].clone(),
-            });
             cache.revision = cache.revision.wrapping_add(1);
+            let last_used = cache.revision;
+            cache.entries.insert(
+                Arc::from(sources[index]),
+                CachedInlineStyle {
+                    last_used,
+                    style: styles[index].clone(),
+                },
+            );
         }
         drop(cache);
         drop(discarded);

@@ -4,7 +4,7 @@
 use super::{BoxId, LineId, RenderView};
 use crate::layout_model::{LineOutput, LinePaginationGroup};
 use html_engine_model::layout_state;
-use html_style_model::{Display, Float, PositionMode};
+use html_style_model::{Display, Float};
 use kurbo::Point;
 use std::ops::Range;
 
@@ -181,18 +181,18 @@ impl<'a> Pagination<'a> {
         let mut current = Some(owner);
         let mut inside_float = false;
         while let Some(index) = current {
-            let Some(style) = self.view.doc.box_used_style(index) else {
+            let Some(layout_box) = self.view.doc.inputs.layout_tree.box_at(index) else {
                 return false;
             };
-            if style.position() == PositionMode::Absolute {
+            if layout_box.facts.absolute {
                 return false;
             }
             // Cells and atomic inline contents suppress fragmentation, even
             // for nested floats. Check all ancestors before trusting a float.
-            if style.display() == Display::TableCell || style.display().is_atomic_inline() {
+            if layout_box.facts.display == Display::TableCell || layout_box.facts.atomic_inline {
                 return false;
             }
-            if matches!(style.float(), Float::Left | Float::Right) {
+            if layout_box.facts.float != Float::None {
                 inside_float = true;
             }
             current = self.view.doc.inputs.layout_tree.get_box_parent(index);

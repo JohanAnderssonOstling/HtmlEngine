@@ -50,7 +50,6 @@ pub struct BoxId(u32);
 pub struct BoxPaginationFacts {
     /// Rigid table/row fragment carrying this box, when supported.
     pub table_fragment: Option<u32>,
-    pub subtree: Range<u32>,
     pub independent: bool,
     pub is_block_container: bool,
     pub in_table: bool,
@@ -767,6 +766,8 @@ pub struct Line {
 
 #[derive(Clone, Default)]
 pub struct LineDetails {
+    /// Containing-block width used to resolve inline percentage padding.
+    pub inline_containing_width: f64,
     /// Paint-only optical margin shift, excluded from logical line breaking.
     pub optical_offset_x: f64,
     /// First-line pseudo color and refinement marker. Ordinary lines use the
@@ -841,6 +842,7 @@ impl LineOutput {
             .and_then(NonZeroU32::new)
             .expect("line detail capacity exhausted");
         self.line_details.push(LineDetails {
+            inline_containing_width: 0.0,
             optical_offset_x,
             paint_color,
             text_fragments,

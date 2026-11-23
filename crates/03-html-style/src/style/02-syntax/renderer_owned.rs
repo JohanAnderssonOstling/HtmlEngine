@@ -395,53 +395,6 @@ pub(crate) fn break_inside(id: RendererPropertyId, tokens: &TokenList<'_>) -> Op
 }
 
 /// Whether the existing raw-token conversion can represent this value.
-pub(crate) fn tokens_are_supported(id: RendererPropertyId, tokens: &TokenList<'_>) -> bool {
-    match id {
-        RendererPropertyId::WhiteSpaceCollapse => white_space_collapse(tokens).is_some(),
-        RendererPropertyId::TextWrapMode => text_wrap_mode(tokens).is_some(),
-        RendererPropertyId::TextWrapStyle => text_wrap_style(tokens).is_some(),
-        RendererPropertyId::TextWrap => text_wrap(tokens).is_some(),
-        RendererPropertyId::HangingPunctuation => hanging_punctuation(tokens).is_some(),
-        RendererPropertyId::FontVariant => super::font_features::parse_variant(tokens).is_some(),
-        RendererPropertyId::FontSynthesisStyle => font_synthesis_style(id, tokens).is_some(),
-        RendererPropertyId::FontSynthesis | RendererPropertyId::FontSynthesisSmallCaps => {
-            font_synthesis_small_caps(id, tokens).is_some()
-        }
-        RendererPropertyId::Float => float(tokens, TextDirection::Ltr).is_some(),
-        RendererPropertyId::Clear => clear(tokens, TextDirection::Ltr).is_some(),
-        RendererPropertyId::ObjectFit => object_fit(tokens).is_some(),
-        RendererPropertyId::TableLayout => table_layout(tokens).is_some(),
-        RendererPropertyId::BorderCollapse => border_collapse(tokens).is_some(),
-        RendererPropertyId::CaptionSide => caption_side(tokens).is_some(),
-        RendererPropertyId::EmptyCells => empty_cells(tokens).is_some(),
-        RendererPropertyId::TextBox => text_box(tokens).is_some(),
-        RendererPropertyId::TextBoxTrim => text_box_trim(tokens).is_some(),
-        RendererPropertyId::TextBoxEdge => text_box_edge(tokens).is_some(),
-        RendererPropertyId::FontFeatureSettings => {
-            super::font_features::parse_settings(tokens).is_some()
-        }
-        RendererPropertyId::FontKerning
-        | RendererPropertyId::FontVariantNumeric
-        | RendererPropertyId::FontVariantLigatures => {
-            super::font_features::parse_tokens(id, tokens).is_some()
-        }
-        RendererPropertyId::BreakBefore
-        | RendererPropertyId::BreakAfter
-        | RendererPropertyId::PageBreakBefore
-        | RendererPropertyId::PageBreakAfter => break_between(id, tokens).is_some(),
-        RendererPropertyId::BreakInside | RendererPropertyId::PageBreakInside => {
-            break_inside(id, tokens).is_some()
-        }
-        RendererPropertyId::Widows | RendererPropertyId::Orphans => {
-            let mut tokens = significant_tokens(tokens);
-            matches!(tokens.next(), Some(TokenOrValue::Token(Token::Number { int_value: Some(value), .. })) if *value > 0)
-                && tokens.next().is_none()
-        }
-        RendererPropertyId::Contain => super::contain::parse_tokens(tokens).is_some(),
-        _ => true,
-    }
-}
-
 pub(crate) fn font_synthesis_style(
     id: RendererPropertyId,
     tokens: &TokenList<'_>,
@@ -521,6 +474,7 @@ mod tests {
     #[test]
     fn bounded_values_keep_native_keyword_and_integer_rules_without_scratch_allocations() {
         use crate::allocation_test_support::count_allocations;
+        use crate::style::cascade::resolver::prepared_native::PreparedValue;
         use RendererPropertyId::{ObjectFit, Orphans, TextBox, TextBoxEdge, Widows};
         use lightningcss::traits::ParseWithOptions;
 
@@ -551,7 +505,9 @@ mod tests {
         ] {
             let tokens =
                 TokenList::parse_string_with_options(css, ParserOptions::default()).unwrap();
-            let (supported, allocations) = count_allocations(|| tokens_are_supported(id, &tokens));
+            let (supported, allocations) = count_allocations(|| {
+                PreparedValue::parse_renderer(id, &tokens, |_, _| {}).is_some()
+            });
             assert_eq!(supported, expected, "{id:?}: {css}");
             assert_eq!(allocations, 0, "{id:?}: {css}");
         }
